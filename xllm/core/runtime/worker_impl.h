@@ -52,6 +52,9 @@ class WorkerImpl {
   virtual bool allocate_kv_cache(
       const std::vector<std::vector<int64_t>>& kv_cache_shape);
 
+  virtual bool allocate_host_kv_cache(
+      const std::vector<std::vector<int64_t>>& kv_cache_shape);
+
   virtual bool allocate_kv_cache_with_transfer(
       uint64_t kv_cache_size,
       const std::vector<std::vector<int64_t>>& kv_cache_shape);
@@ -170,6 +173,7 @@ class WorkerImpl {
 
   // kv caches
   std::vector<xllm::KVCache> kv_caches_;
+  std::vector<xllm::KVCache> host_kv_caches_;
 
   // causal LM model
   std::unique_ptr<CausalLM> model_;
