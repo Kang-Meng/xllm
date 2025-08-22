@@ -423,7 +423,7 @@ void GraphOperation::ExecuteSingleNode(size_t nodeId)
         ExecuteNode *executeNode = &node;
         at_npu::native::OpCommand cmd;
         cmd.Name(opName_);
-        cmd.SetCustomHandler([=]() {
+        cmd.SetCustomHandler([=, this]() {
             ATB_SPEED_LOG_DEBUG(opName_ << " nodes[" << nodeId << "] atb operation execute start");
             atb::Status st = executeNode->atbOperation->Execute(
                 executeNode->variantPack, (uint8_t *)executeNode->workspace, executeNode->workspaceSize, atbContext);

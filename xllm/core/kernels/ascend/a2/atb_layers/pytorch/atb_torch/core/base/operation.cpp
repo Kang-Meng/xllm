@@ -218,7 +218,7 @@ void Operation::ExecuteAsync(atb::VariantPack &variantPack,
     ATB_SPEED_LOG_DEBUG(opName_ << " push atb operation execute task to task queue");
     at_npu::native::OpCommand cmd;
     cmd.Name(opName_);
-    cmd.SetCustomHandler([=]() {
+    cmd.SetCustomHandler([=, this]() {
         ATB_SPEED_LOG_DEBUG(opName_ << " atb operation execute start");
         atb::Status st = atbOperation_->Execute(variantPack, workspace, workspaceSize, atbContext);
         if (st == 0) {

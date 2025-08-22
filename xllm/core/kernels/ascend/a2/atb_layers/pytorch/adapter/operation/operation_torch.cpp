@@ -200,7 +200,7 @@ atb::Status OperationTorch::ExecutePlan()
 void OperationTorch::ExecutePlanASync()
 {
     if (runTaskFunc_) {
-        runTaskFunc_(name_, [=]() {
+        runTaskFunc_(name_, [=, this]() {
             return ExecutePlan();
         });
     }
