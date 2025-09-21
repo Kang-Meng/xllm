@@ -15,6 +15,8 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.h>
     $<$<BOOL:${USE_NPU}>:spec_kv_cache_transfer.h>
     kv_cache_store.h
+    kv_cache_store_mooncake.h
+    kv_cache_store_memcache.h
   SRCS
     embedding_allocator.cpp
     $<$<BOOL:${USE_NPU}>:hccl_kv_cache_transfer.cpp>
@@ -23,6 +25,8 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.cpp>
     $<$<BOOL:${USE_NPU}>:spec_kv_cache_transfer.cpp>
     kv_cache_store.cpp
+    kv_cache_store_mooncake.cpp
+    kv_cache_store_memcache.cpp
   DEPS
     :common
     $<$<BOOL:${USE_NPU}>:graph>
@@ -31,4 +35,5 @@ cc_library(
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
     mooncake_store
+    mf_memcache
 )

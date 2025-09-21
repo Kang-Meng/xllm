@@ -160,12 +160,19 @@ bool WorkerImpl::allocate_host_kv_cache(
 
   if (options_.enable_kvcache_store()) {
     StoreConfig config;
+    config.store_type = "memcache";
     config.protocol = options_.store_protocol();
     config.metadata_connstring = options_.store_metadata_connstring();
     config.master_server_entry = options_.store_master_server_entry();
     config.tp_rank = options_.node_rank() % options_.dp_size();
+    config.device_idx = device_.index();
+    config.host_kv_caches = &host_kv_caches_;
+    config.device_kv_caches = &kv_caches_;
 
-    kv_cache_store_ = std::make_shared<KVCacheStore>(config, &host_kv_caches_);
+    kv_cache_store_ = KVCacheStore::CreateKVCacheStore(config);
+    if (kv_cache_store_ == nullptr) {
+      LOG(FATAL) << "CreateKVCacheStore fail!";
+    }
   }
 
   status_ = Status::READY;

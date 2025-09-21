@@ -104,6 +104,34 @@ set(CMAKE_CXX_EXTENSIONS ON)
 if(USE_NPU)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
   add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
+
+
+  if(DEFINED ENV{MEMCACHE_ROOT})
+    message(STATUS "MEMCACHE_ROOT is set to: $ENV{MEMCACHE_ROOT}")
+    set(MEMCACHE_ROOT $ENV{MEMCACHE_ROOT})
+  else()
+    message(FATAL_ERROR "MEMCACHE_ROOT is not set")
+  endif()
+
+  set(MEMCACHE_INCLUDE_DIR ${MEMCACHE_ROOT}/include)
+  set(MEMCACHE_LIB_DIR ${MEMCACHE_ROOT}/lib64)
+  message(STATUS "MEMCACHE_INCLUDE_DIR is set to: ${MEMCACHE_INCLUDE_DIR}")
+  message(STATUS "MEMCACHE_LIB_DIR is set to: ${MEMCACHE_LIB_DIR}")
+
+  find_library(MEMCACHE 
+    NAMES mf_memcache
+    PATHS ${MEMCACHE_LIB_DIR}
+    NO_DEFAULT_PATH
+  )
+
+  if(NOT MEMCACHE)
+      message(FATAL_ERROR "mf_memcache not found in ${MEMCACHE_LIB_DIR}")
+  endif()
+
+  link_directories(${MEMCACHE_LIB_DIR})
+  include_directories(${MEMCACHE_INCLUDE_DIR})
+
+
 elseif(USE_MLU)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
   add_definitions(-D_GLIBCXX_USE_CXX11_ABI=1)
