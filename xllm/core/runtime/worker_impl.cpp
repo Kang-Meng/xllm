@@ -50,6 +50,8 @@ limitations under the License.
 #include "util/timer.h"
 #include "util/utils.h"
 
+#define USE_ASYNC true
+
 namespace xllm {
 
 #if defined(USE_NPU)
@@ -151,10 +153,12 @@ bool WorkerImpl::allocate_host_kv_cache(
   kv_caches_.reserve(num_layers);
   for (int64_t i = 0; i < num_layers; ++i) {
     torch::Tensor key_cache, value_cache;
-    key_cache = torch::empty(host_kv_cache_shape[0],
-                             torch::dtype(dtype_).device(torch::kCPU));
-    value_cache = torch::empty(host_kv_cache_shape[1],
-                               torch::dtype(dtype_).device(torch::kCPU));
+    key_cache = torch::empty(
+        host_kv_cache_shape[0],
+        torch::dtype(dtype_).device(torch::kCPU).pinned_memory(true));
+    value_cache = torch::empty(
+        host_kv_cache_shape[1],
+        torch::dtype(dtype_).device(torch::kCPU).pinned_memory(true));
     host_kv_caches_.emplace_back(key_cache, value_cache);
   }
 
@@ -381,15 +385,15 @@ void WorkerImpl::prepare_work_before_execute(
 
         for (auto block_info : input_params.copy_out_blocks) {
           host_k_cache[block_info.host_block_id].copy_(
-              key_cache[block_info.device_block_id]);
+              key_cache[block_info.device_block_id], USE_ASYNC);
           host_v_cache[block_info.host_block_id].copy_(
-              value_cache[block_info.device_block_id]);
+              value_cache[block_info.device_block_id], USE_ASYNC);
         }
         for (auto block_info : input_params.copy_in_blocks) {
           key_cache[block_info.device_block_id].copy_(
-              host_k_cache[block_info.host_block_id]);
+              host_k_cache[block_info.host_block_id], USE_ASYNC);
           value_cache[block_info.device_block_id].copy_(
-              host_v_cache[block_info.host_block_id]);
+              host_v_cache[block_info.host_block_id], USE_ASYNC);
         }
       }
 
@@ -473,9 +477,9 @@ folly::SemiFuture<bool> WorkerImpl::copy_out_blocks_async(
 
         for (auto block_info : input_params.async_copy_out_blocks) {
           host_k_cache[block_info.host_block_id].copy_(
-              key_cache[block_info.device_block_id]);
+              key_cache[block_info.device_block_id], USE_ASYNC);
           host_v_cache[block_info.host_block_id].copy_(
-              value_cache[block_info.device_block_id]);
+              value_cache[block_info.device_block_id], USE_ASYNC);
         }
       }
 
