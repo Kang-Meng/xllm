@@ -8,6 +8,7 @@
 #include "common/macros.h"
 #include "framework/model/model_input_params.h"
 #include "kv_cache.h"
+#include "util/slice.h"
 
 namespace xllm {
 
@@ -26,11 +27,11 @@ class KVCacheStore {
                std::vector<xllm::KVCache>* host_kv_caches);
   ~KVCacheStore();
 
-  uint64_t batch_put(const std::vector<CacheBlockInfo>& cache_block_info);
+  uint64_t batch_put(const Slice<CacheBlockInfo>& cache_block_info);
 
-  uint64_t batch_get(const std::vector<CacheBlockInfo>& cache_block_info);
+  uint64_t batch_get(const Slice<CacheBlockInfo>& cache_block_info);
 
-  uint64_t batch_remove(const std::vector<CacheBlockInfo>& cache_block_info);
+  uint64_t batch_remove(const Slice<CacheBlockInfo>& cache_block_info);
 
  private:
   StoreConfig config_;

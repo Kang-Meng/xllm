@@ -40,6 +40,7 @@ limitations under the License.
 #include "framework/xtensor/xtensor.h"
 #include "options.h"
 #include "platform/device.h"
+#include "util/slice.h"
 #include "util/threadpool.h"
 
 namespace xllm {
@@ -146,13 +147,19 @@ class WorkerImpl {
       const std::vector<uint64_t>& dst_blocks);
 
   virtual folly::SemiFuture<uint32_t> load_kv_blocks_from_store_async(
-      const std::vector<CacheBlockInfo>& cache_block_info);
+      const std::vector<CacheBlockInfo>& cache_block_info) {
+    Slice<CacheBlockInfo> cache_block_slice{cache_block_info};
+    return load_kv_blocks_from_store_async(cache_block_slice);
+  }
+
+  virtual folly::SemiFuture<uint32_t> load_kv_blocks_from_store_async(
+      Slice<CacheBlockInfo>& cache_block_info);
 
   virtual uint32_t offload_kv_blocks_to_store(
-      const std::vector<CacheBlockInfo>& cache_block_info);
+      Slice<CacheBlockInfo>& cache_block_info);
 
   virtual folly::SemiFuture<uint32_t> offload_kv_blocks_to_store_async(
-      const std::vector<CacheBlockInfo>& cache_block_info);
+      Slice<CacheBlockInfo>& cache_block_info);
 
   // Run the model on the given input. async call
   // the future returns a successfull status with no meaningful value
@@ -181,10 +188,16 @@ class WorkerImpl {
 
   Status get_status() const { return status_; }
 
-  folly::SemiFuture<bool> copy_out_blocks_async(ModelInputParams& input_params);
+  std::vector<folly::SemiFuture<bool>> copy_async_blocks(
+      const ModelInputParams& input_params);
+  std::vector<folly::SemiFuture<bool>> copy_sync_blocks(
+      const ModelInputParams& input_params);
 
  private:
   void update_last_step_output(const std::optional<ForwardOutput>& output);
+
+  bool d2h_batch_copy(const Slice<CacheBlockInfo>& cache_block_infos);
+  bool h2d_batch_copy(const Slice<CacheBlockInfo>& cache_block_infos);
 
  protected:
   // runtime options
@@ -200,9 +213,11 @@ class WorkerImpl {
   // the task queue, step need to be executed one-by-one
   ThreadPool threadpool_;
 
-  // general working thread
-  // do some overlap work with model execute
-  ThreadPool general_threadpool_;
+  // working thread for data copy
+  ThreadPool copy_threadpool_{5};
+  // copy streams
+  // only can be used in copy_threadpool_
+  std::unordered_map<std::thread::id, std::unique_ptr<Stream>> copy_stream_;
 
   // dtype of the model
   torch::ScalarType dtype_;
@@ -211,7 +226,6 @@ class WorkerImpl {
   Device device_;
 
   std::unique_ptr<Stream> prepare_stream_;
-  std::unique_ptr<Stream> copy_out_stream_;
 
   // parallel args of current instance
   ParallelArgs parallel_args_;
@@ -244,9 +258,14 @@ class WorkerImpl {
 
 #if defined(USE_NPU)
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
+  aclrtMemcpyBatchAttr h2d_attrs_;
+  aclrtMemcpyBatchAttr d2h_attrs_;
 #endif
 
   std::shared_ptr<KVCacheStore> kv_cache_store_;
+
+  uint64_t key_cache_size_per_layer_;
+  uint64_t value_cache_size_per_layer_;
 
   bool is_spec_draft_ = false;
 

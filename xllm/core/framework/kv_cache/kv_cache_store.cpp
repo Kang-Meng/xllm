@@ -93,13 +93,16 @@ KVCacheStore::~KVCacheStore() {
 }
 
 uint64_t KVCacheStore::batch_put(
-    const std::vector<CacheBlockInfo>& cache_block_info) {
+    const Slice<CacheBlockInfo>& cache_block_info) {
   std::vector<std::string> str_keys;
   std::vector<std::vector<mooncake::Slice>> slices;
 
   str_keys.reserve(cache_block_info.size());
   slices.reserve(cache_block_info.size());
   for (auto block_info : cache_block_info) {
+    if (block_info.hash_key == nullptr) {
+      continue;
+    }
     std::string str_key(reinterpret_cast<const char*>(block_info.hash_key),
                         MURMUR_HASH3_VALUE_LEN);
 
@@ -150,7 +153,7 @@ uint64_t KVCacheStore::batch_put(
 }
 
 uint64_t KVCacheStore::batch_get(
-    const std::vector<CacheBlockInfo>& cache_block_info) {
+    const Slice<CacheBlockInfo>& cache_block_info) {
   std::unordered_map<std::string, std::vector<mooncake::Slice>> slices;
   std::vector<std::string> str_keys;
 
@@ -205,7 +208,7 @@ uint64_t KVCacheStore::batch_get(
 }
 
 uint64_t KVCacheStore::batch_remove(
-    const std::vector<CacheBlockInfo>& cache_block_info) {
+    const Slice<CacheBlockInfo>& cache_block_info) {
   uint64_t success_cnt = 0;
   for (auto block_info : cache_block_info) {
     std::string str_key(reinterpret_cast<const char*>(block_info.hash_key),

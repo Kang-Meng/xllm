@@ -349,9 +349,7 @@ void BlockManagerPool::cache_host(Sequence* sequence) {
         host_blocks_ptr->at(i).id(),
         host_blocks_ptr->at(i).get_immutable_hash_value());
   }
-
-  host_block_managers_[dp_rank]->cache(
-      sequence->tokens(), *sequence->host_kv_state().mutable_kv_blocks());
+  host_block_managers_[dp_rank]->cache(sequence->tokens(), *host_blocks_ptr);
 }
 
 void BlockManagerPool::get_merged_kvcache_event(KvCacheEvent* event) const {
