@@ -11,9 +11,11 @@
 
 namespace xllm {
 
-KVCacheStore::KVCacheStore(const StoreConfig& config,
-                           std::vector<xllm::KVCache>* host_kv_caches)
-    : config_(config), host_kv_caches_(host_kv_caches) {
+bool KVCacheStore::init(const StoreConfig& config,
+                        std::vector<xllm::KVCache>* host_kv_caches) {
+  CHECK(!is_initialized_) << "KVCacheStore is initialized.";
+  config_ = config;
+  host_kv_caches_ = host_kv_caches;
   if (config_.protocol == "rdma") {
     if (getenv("DEVICE_NAME")) {
       auto name = getenv("DEVICE_NAME");
@@ -37,7 +39,7 @@ KVCacheStore::KVCacheStore(const StoreConfig& config,
 
   if (!client_opt.has_value()) {
     LOG(FATAL) << "mooncake::Client::Create fail!";
-    return;
+    return false;
   }
   client_ptr_ = client_opt.value();
 
@@ -68,7 +70,7 @@ KVCacheStore::KVCacheStore(const StoreConfig& config,
       if (!register_k_result.has_value()) {
         LOG(ERROR) << "Failed to register local memory for key cache: "
                    << toString(register_k_result.error());
-        return;
+        return false;
       }
 
       void* value_cache = static_cast<char*>(
@@ -80,10 +82,12 @@ KVCacheStore::KVCacheStore(const StoreConfig& config,
       if (!register_v_result.has_value()) {
         LOG(ERROR) << "Failed to register local memory for value cache: "
                    << toString(register_v_result.error());
-        return;
+        return false;
       }
     }
   }
+  is_initialized_ = true;
+  return true;
 }
 
 KVCacheStore::~KVCacheStore() {
@@ -93,13 +97,23 @@ KVCacheStore::~KVCacheStore() {
 }
 
 uint64_t KVCacheStore::batch_put(
-    const std::vector<CacheBlockInfo>& cache_block_info) {
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  if (!is_initialized_) {
+    return 0;
+  }
+  CHECK(!block_transfer_info.empty()) << "Batch put BlockTransferInfo empty.";
+  CHECK(block_transfer_info[0].transfer_type == TransferType::D2G &&
+        block_transfer_info[0].dst_block_id != -1)
+      << "Expect TransferType " << uint8_t(TransferType::D2G)
+      << " and dst_block_id != -1, got TransferType: "
+      << uint8_t(block_transfer_info[0].transfer_type)
+      << " and dst_block_id:" << block_transfer_info[0].dst_block_id << ";";
   std::vector<std::string> str_keys;
   std::vector<std::vector<mooncake::Slice>> slices;
 
-  str_keys.reserve(cache_block_info.size());
-  slices.reserve(cache_block_info.size());
-  for (auto block_info : cache_block_info) {
+  str_keys.reserve(block_transfer_info.size());
+  slices.reserve(block_transfer_info.size());
+  for (auto block_info : block_transfer_info) {
     std::string str_key(reinterpret_cast<const char*>(block_info.hash_key),
                         MURMUR_HASH3_VALUE_LEN);
 
@@ -118,13 +132,13 @@ uint64_t KVCacheStore::batch_put(
       void* key_cache =
           static_cast<char*>(
               host_kv_caches_->at(layer).get_k_cache().data_ptr()) +
-          block_info.host_block_id * key_cache_size_per_layer_;
+          block_info.dst_block_id * key_cache_size_per_layer_;
       slice.emplace_back(mooncake::Slice{key_cache, key_cache_size_per_layer_});
 
       void* value_cache =
           static_cast<char*>(
               host_kv_caches_->at(layer).get_v_cache().data_ptr()) +
-          block_info.host_block_id * value_cache_size_per_layer_;
+          block_info.dst_block_id * value_cache_size_per_layer_;
       slice.emplace_back(
           mooncake::Slice{value_cache, value_cache_size_per_layer_});
     }
@@ -132,7 +146,7 @@ uint64_t KVCacheStore::batch_put(
   }
 
   if (str_keys.size() == 0) {
-    return cache_block_info.size();
+    return block_transfer_info.size();
   }
 
   uint64_t success_cnt = str_keys.size();
@@ -150,12 +164,15 @@ uint64_t KVCacheStore::batch_put(
 }
 
 uint64_t KVCacheStore::batch_get(
-    const std::vector<CacheBlockInfo>& cache_block_info) {
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  if (!is_initialized_) {
+    return 0;
+  }
   std::unordered_map<std::string, std::vector<mooncake::Slice>> slices;
   std::vector<std::string> str_keys;
 
-  str_keys.reserve(cache_block_info.size());
-  for (auto block_info : cache_block_info) {
+  str_keys.reserve(block_transfer_info.size());
+  for (auto block_info : block_transfer_info) {
     std::string str_key(reinterpret_cast<const char*>(block_info.hash_key),
                         MURMUR_HASH3_VALUE_LEN);
 
@@ -174,14 +191,14 @@ uint64_t KVCacheStore::batch_get(
       void* key_cache =
           static_cast<char*>(
               host_kv_caches_->at(layer).get_k_cache().data_ptr()) +
-          block_info.host_block_id * key_cache_size_per_layer_;
+          block_info.dst_block_id * key_cache_size_per_layer_;
       slices[str_key].emplace_back(
           mooncake::Slice{key_cache, key_cache_size_per_layer_});
 
       void* value_cache =
           static_cast<char*>(
               host_kv_caches_->at(layer).get_v_cache().data_ptr()) +
-          block_info.host_block_id * value_cache_size_per_layer_;
+          block_info.dst_block_id * value_cache_size_per_layer_;
       slices[str_key].emplace_back(
           mooncake::Slice{value_cache, value_cache_size_per_layer_});
     }
@@ -205,9 +222,10 @@ uint64_t KVCacheStore::batch_get(
 }
 
 uint64_t KVCacheStore::batch_remove(
-    const std::vector<CacheBlockInfo>& cache_block_info) {
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  CHECK(is_initialized_) << "KVCacheStore is not initialized.";
   uint64_t success_cnt = 0;
-  for (auto block_info : cache_block_info) {
+  for (auto block_info : block_transfer_info) {
     std::string str_key(reinterpret_cast<const char*>(block_info.hash_key),
                         MURMUR_HASH3_VALUE_LEN);
     str_key.append(std::to_string(config_.tp_rank));
@@ -219,6 +237,21 @@ uint64_t KVCacheStore::batch_remove(
     }
   }
   return success_cnt;
+}
+
+uint64_t KVCacheStore::batch_exist(std::vector<std::string>&& keys) {
+  if (!is_initialized_) {
+    return 0;
+  }
+  auto exist_vec = client_ptr_->BatchIsExist(std::move(keys));
+  uint64_t ret = 0;
+  for (auto exist : exist_vec) {
+    if (!exist.has_value() || !exist.value()) {
+      break;
+    }
+    ret++;
+  }
+  return ret;
 }
 
 }  // namespace xllm

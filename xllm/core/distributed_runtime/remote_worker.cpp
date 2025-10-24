@@ -518,29 +518,46 @@ folly::SemiFuture<bool> RemoteWorker::pull_kv_blocks_async(
   return future;
 }
 
-folly::SemiFuture<uint32_t> RemoteWorker::load_kv_blocks_from_store_async(
-    const std::vector<CacheBlockInfo> cache_block_info) {
+folly::SemiFuture<uint32_t> RemoteWorker::transfer_kv_blocks(
+    const std::vector<BlockTransferInfo>& block_transfer_info) {
   folly::Promise<uint32_t> promise;
   auto future = promise.getSemiFuture();
-  general_threadpool_.schedule([this,
-                                cache_block_info = std::move(cache_block_info),
-                                promise = std::move(promise)]() mutable {
-    proto::CacheBlockInfos pb_cache_block_info;
-    if (!cache_block_info_to_proto(cache_block_info, &pb_cache_block_info)) {
-      promise.setValue(0);
-      return;
-    }
+  general_threadpool_.schedule(
+      [this,
+       block_transfer_info = std::move(block_transfer_info),
+       promise = std::move(promise)]() mutable {
+        proto::BlockTransferInfos pb_block_transfer_info;
+        if (!block_transfer_info_to_proto(
+                0x0, block_transfer_info, &pb_block_transfer_info)) {
+          promise.setValue(0);
+          return;
+        }
 
-    auto done = new LoadKVCacheFromStoreClosure();
-    done->promise = std::move(promise);
-    stub_->LoadKVCacheFromStore(
-        &done->cntl, &pb_cache_block_info, &done->response, done);
-  });
+        auto done = new TransferBlocksClosure();
+        done->promise = std::move(promise);
+        stub_->TransferBlocks(
+            &done->cntl, &pb_block_transfer_info, &done->response, done);
+      });
   return future;
 }
 
-void LoadKVCacheFromStoreClosure::Run() {
-  std::unique_ptr<LoadKVCacheFromStoreClosure> self_guard(this);
+void RemoteWorker::transfer_kv_blocks(
+    const uint64_t batch_id,
+    const std::vector<BlockTransferInfo>& block_transfer_info) {
+  folly::Promise<uint32_t> promise;
+  auto future = promise.getSemiFuture();
+  proto::BlockTransferInfos pb_block_transfer_info;
+  if (!block_transfer_info_to_proto(
+          batch_id, block_transfer_info, &pb_block_transfer_info)) {
+    return;
+  }
+  brpc::Controller cntl;
+  proto::TransferStatus response;
+  stub_->TransferBlocks(&cntl, &pb_block_transfer_info, &response, nullptr);
+}
+
+void TransferBlocksClosure::Run() {
+  std::unique_ptr<TransferBlocksClosure> self_guard(this);
 
   bool success = !cntl.Failed();
   if (!success) {
