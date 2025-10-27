@@ -275,6 +275,12 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
       } else {
         LOG(INFO) << "layer_synchronizer is nullptr";
       }
+      if (input_params.layer_wise_load_synchronizer != nullptr) {
+        if (!input_params.layer_wise_load_synchronizer->synchronize_layer(i)) {
+          return torch::Tensor();
+        }
+      }
+
       auto& layer = layers_[i];
       layer(h,
             cos_pos,
