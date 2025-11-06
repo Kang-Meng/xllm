@@ -151,18 +151,9 @@ bool WorkerImpl::allocate_host_kv_cache(
   host_kv_cache_shape[1][0] = num_layers;
 
   // create a KVCache shape: block_size * [layers, token, head, dim]
-  host_kv_caches_.reserve(host_bolck_size);
+  aligned_tensor_creater_ = std::make_unique<AlignedTensorCreater>(
+      host_kv_cache_shape, dtype_, host_bolck_size, &host_kv_caches_);
 
-  for (int64_t i = 0; i < host_bolck_size; ++i) {
-    torch::Tensor key_cache, value_cache;
-    key_cache = torch::empty(host_kv_cache_shape[0],
-                             torch::dtype(dtype_).device(torch::kCPU))
-                    .pin_memory();
-    value_cache = torch::empty(host_kv_cache_shape[1],
-                               torch::dtype(dtype_).device(torch::kCPU))
-                      .pin_memory();
-    host_kv_caches_.emplace_back(key_cache, value_cache);
-  }
   LOG(INFO) << "Initializing host kv block size: " << host_bolck_size;
 
   int32_t device_id = device_.index();
@@ -187,6 +178,8 @@ bool WorkerImpl::allocate_host_kv_cache(
     config.tp_rank = options_.dp_size() > 1
                          ? options_.node_rank() % options_.dp_size()
                          : options_.node_rank();
+    config.total_size = aligned_tensor_creater_->get_total_size();
+    config.tensor_data = aligned_tensor_creater_->get_base_ptr();
 
     if (!KVCacheStore::get_instance().init(config, &host_kv_caches_)) {
       LOG(ERROR) << "Init KVCacheStore fail!";
@@ -1023,6 +1016,70 @@ uint32_t WorkerImpl::prefetch_from_storage(
         }
       })
       .get();
+}
+
+AlignedTensorCreater::AlignedTensorCreater(
+    const std::vector<std::vector<int64_t>>& tensor_shapes,
+    const torch::ScalarType dtype,
+    const uint32_t num_tensors,
+    std::vector<xllm::KVCache>* tensors) {
+  CHECK(tensor_shapes.size() == 2)
+      << "tensor_shapes.size() must equal to 2, but got "
+      << tensor_shapes.size();
+
+  int64_t elements_per_k_tensor = 1;
+  int64_t elements_per_v_tensor = 1;
+
+  for (auto dim : tensor_shapes[0]) {
+    elements_per_k_tensor *= dim;
+  }
+  for (auto dim : tensor_shapes[1]) {
+    elements_per_v_tensor *= dim;
+  }
+
+  size_t element_size = torch::elementSize(dtype);
+  size_t bytes_per_k_tensor = elements_per_k_tensor * element_size;
+  size_t bytes_per_v_tensor = elements_per_v_tensor * element_size;
+  size_t page_size = sysconf(_SC_PAGESIZE);
+  total_size_ = num_tensors * (bytes_per_k_tensor + bytes_per_v_tensor);
+  total_size_ = ((total_size_ + page_size - 1) / page_size) * page_size;
+
+  base_ptr_ = mmap(nullptr,
+                   total_size_,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1,
+                   0);
+
+  if (base_ptr_ == MAP_FAILED) {
+    LOG(FATAL) << "Failed to allocate aligned memory pool!";
+  }
+
+  if (mlock(base_ptr_, total_size_) != 0) {
+    munmap(base_ptr_, total_size_);
+    LOG(FATAL) << "Failed to lock memory pool!";
+  }
+
+  size_t current_offset = 0;
+  auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+  tensors->reserve(num_tensors);
+
+  for (size_t i = 0; i < num_tensors; ++i) {
+    void* k_tensor_ptr = static_cast<char*>(base_ptr_) + current_offset;
+    torch::Tensor k_tensor =
+        torch::from_blob(k_tensor_ptr, tensor_shapes[0], options);
+    current_offset += bytes_per_k_tensor;
+
+    void* v_tensor_ptr = static_cast<char*>(base_ptr_) + current_offset;
+    torch::Tensor v_tensor =
+        torch::from_blob(v_tensor_ptr, tensor_shapes[1], options);
+    current_offset += bytes_per_v_tensor;
+
+    tensors->emplace_back(k_tensor, v_tensor);
+  }
+
+  LOG(INFO) << "Page aligned: "
+            << ((uintptr_t)base_ptr_ % page_size == 0 ? "YES" : "NO");
 }
 
 }  // namespace xllm

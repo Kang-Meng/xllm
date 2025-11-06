@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <folly/futures/Future.h>
+#include <sys/mman.h>
 #include <torch/torch.h>
 
 #include <memory>
@@ -44,6 +45,8 @@ limitations under the License.
 #include "util/threadpool.h"
 
 namespace xllm {
+
+class AlignedTensorCreater;
 
 class WorkerImpl {
  public:
@@ -237,6 +240,7 @@ class WorkerImpl {
   // kv caches
   std::vector<xllm::KVCache> kv_caches_;
   std::vector<xllm::KVCache> host_kv_caches_;
+  std::unique_ptr<AlignedTensorCreater> aligned_tensor_creater_;
 
   // causal LM model
   std::unique_ptr<CausalLM> model_;
@@ -275,6 +279,28 @@ class WorkerImpl {
   mutable std::mutex mutex_;
   std::unordered_map<uint64_t, std::shared_ptr<NPULayerSynchronizerImpl>>
       layer_wise_load_synchronizer_;
+};
+
+class AlignedTensorCreater {
+ private:
+  void* base_ptr_;
+  size_t total_size_;
+
+ public:
+  AlignedTensorCreater(const std::vector<std::vector<int64_t>>& tensor_shapes,
+                       const torch::ScalarType dtype,
+                       const uint32_t num_tensors,
+                       std::vector<xllm::KVCache>* tensors);
+
+  ~AlignedTensorCreater() {
+    if (base_ptr_ != nullptr) {
+      munlock(base_ptr_, total_size_);
+      munmap(base_ptr_, total_size_);
+    }
+  }
+
+  void* get_base_ptr() const { return base_ptr_; }
+  size_t get_total_size() const { return total_size_; }
 };
 
 }  // namespace xllm
