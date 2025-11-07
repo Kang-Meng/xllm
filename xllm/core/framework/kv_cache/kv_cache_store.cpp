@@ -69,13 +69,41 @@ bool KVCacheStore::init(const StoreConfig& config,
                  << ", and data ptr: " << uint64_t(config_.tensor_data);
     }
   }
+
+  if (config_.segment_size != 0) {
+    global_segment_ptr_ =
+        mooncake::allocate_buffer_allocator_memory(config_.segment_size);
+    if (global_segment_ptr_ == nullptr) {
+      LOG(FATAL) << "allocate_buffer_allocator_memory " << config_.segment_size
+                 << " bytes failed!";
+    }
+    auto mount_result =
+        client_ptr_->MountSegment(global_segment_ptr_, config_.segment_size);
+    if (!mount_result.has_value()) {
+      LOG(ERROR) << "Failed to mount segment: "
+                 << toString(mount_result.error());
+    }
+    LOG(INFO) << "Segment mounted successfully";
+  }
+
   is_initialized_ = true;
   return true;
 }
 
 KVCacheStore::~KVCacheStore() {
+  if (client_ptr_ && global_segment_ptr_) {
+    if (!client_ptr_->UnmountSegment(global_segment_ptr_, config_.segment_size)
+             .has_value()) {
+      LOG(ERROR) << "Failed to unmount segment";
+    }
+  }
+
   if (client_ptr_) {
     client_ptr_.reset();
+  }
+
+  if (global_segment_ptr_) {
+    free(global_segment_ptr_);
   }
 }
 

@@ -19,6 +19,7 @@ struct StoreConfig {
   std::string master_server_address = "";
   int replica_num = 1;
   uint32_t tp_rank = 0;
+  size_t segment_size = 0;
   size_t total_size = 0;
   void* tensor_data = nullptr;
 };
@@ -75,6 +76,8 @@ class KVCacheStore {
   uint64_t v_cache_size_per_block_;
 
   std::shared_ptr<mooncake::Client> client_ptr_;
+
+  void* global_segment_ptr_ = nullptr;
 };
 
 }  // namespace xllm

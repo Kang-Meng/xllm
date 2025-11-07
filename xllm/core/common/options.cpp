@@ -56,6 +56,7 @@ std::string Options::to_string() const {
      << ", store_master_server_address: " << store_master_server_address()
      << ", store_metadata_server: " << store_metadata_server()
      << ", store_local_hostname: " << store_local_hostname()
+     << ", store_segment_size: " << store_segment_size()
      << ", enable_multi_stream_parallel: " << enable_multi_stream_parallel()
      << ", enable_continuous_kvcache: " << enable_continuous_kvcache()
      << ", disable_ttft_profiling: " << disable_ttft_profiling()

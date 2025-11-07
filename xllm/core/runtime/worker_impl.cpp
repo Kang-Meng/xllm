@@ -178,6 +178,7 @@ bool WorkerImpl::allocate_host_kv_cache(
     config.tp_rank = options_.dp_size() > 1
                          ? options_.node_rank() % options_.dp_size()
                          : options_.node_rank();
+    config.segment_size = options_.store_segment_size();
     config.total_size = aligned_tensor_creater_->get_total_size();
     config.tensor_data = aligned_tensor_creater_->get_base_ptr();
 

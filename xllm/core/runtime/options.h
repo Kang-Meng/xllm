@@ -155,6 +155,9 @@ struct Options {
   //  value used if port is not included)
   PROPERTY(std::string, store_local_hostname) = "";
 
+  //  the contributed memory to kv cache store
+  PROPERTY(uint64_t, store_segment_size) = 0;
+
   // dit
   // max requests per batch
   PROPERTY(int, max_requests_per_batch) = 0;

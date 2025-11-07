@@ -165,6 +165,8 @@ DECLARE_string(store_metadata_server);
 
 DECLARE_string(store_local_hostname);
 
+DECLARE_uint64(store_segment_size);
+
 DECLARE_bool(enable_multi_stream_parallel);
 
 DECLARE_int32(micro_batch_num);

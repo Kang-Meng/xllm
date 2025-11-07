@@ -344,6 +344,10 @@ DEFINE_string(store_local_hostname,
               "",
               "The local host name of the kv cache store client.");
 
+DEFINE_uint64(store_segment_size,
+              0,
+              "The contributed memory to kv cache store.");
+
 // --- computation communication parallel config ---
 
 DEFINE_bool(

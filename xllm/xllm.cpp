@@ -171,6 +171,7 @@ int run() {
       .store_master_server_address(FLAGS_store_master_server_address)
       .store_metadata_server(FLAGS_store_metadata_server)
       .store_local_hostname(FLAGS_store_local_hostname)
+      .store_segment_size(FLAGS_store_segment_size)
       .enable_multi_stream_parallel(FLAGS_enable_multi_stream_parallel)
       .enable_profile_step_time(FLAGS_enable_profile_step_time)
       .enable_profile_token_budget(FLAGS_enable_profile_token_budget)
