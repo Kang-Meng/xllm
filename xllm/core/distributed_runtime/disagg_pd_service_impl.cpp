@@ -88,7 +88,10 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
                          req.skip_special_tokens(),
                          scheduler_->enable_schedule_overlap(),
                          output_callback,
-                         batch_output_callback);
+                         batch_output_callback,
+                         "",
+                         std::nullopt,
+                         req.offload_batch());
 
   auto new_request = std::make_shared<Request>(
       req.req_id(),

@@ -80,6 +80,8 @@ struct SequenceParams {
   // stopping checker
   // reference from request
   StoppingChecker* stopping_checker;  // not owned
+
+  uint32_t offload_batch = UINT32_MAX;
 };
 
 class Sequence final {
@@ -252,7 +254,7 @@ class Sequence final {
     return &prefetch_results_;
   }
 
-  bool update_prefetch_result(uint32_t timeout, uint32_t& success_cnt);
+  bool update_prefetch_result(const uint32_t timeout, uint32_t& success_cnt);
 
   void reset();
 
@@ -271,6 +273,8 @@ class Sequence final {
   void set_cancel() { cancelled_.store(true, std::memory_order_relaxed); }
 
   bool cancelled() const { return cancelled_.load(std::memory_order_relaxed); }
+
+  uint32_t get_offload_batch() { return sequence_params_.offload_batch; }
 
  private:
   // the index of the sequence in the request

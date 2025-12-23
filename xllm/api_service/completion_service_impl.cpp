@@ -195,6 +195,7 @@ void CompletionServiceImpl::process_async_impl(
 
     request_params.decode_address = rpc_request.routing().decode_name();
   }
+  request_params.offload_batch = rpc_request.offload_batch();
 
   auto saved_streaming = request_params.streaming;
   auto saved_request_id = request_params.request_id;

@@ -146,6 +146,8 @@ struct RequestParams {
   bool add_special_tokens = false;
 
   nlohmann::json chat_template_kwargs = nlohmann::json::object();
+
+  uint32_t offload_batch = UINT32_MAX;
 };
 
 }  // namespace xllm

@@ -26,7 +26,7 @@ message ChatMessage {
 }
 
 
-// Next Id: 30
+// Next Id: 37
 message ChatRequest {
   // ID of the model to use. You can use the ListModels endpoint to list available models.
   string model = 1;
@@ -132,6 +132,8 @@ message ChatRequest {
   optional bool add_special_tokens = 34;
 
   optional google.protobuf.Struct chat_template_kwargs = 35;
+
+  optional uint32 offload_batch = 36;
 }
 
 message ChatLogProbData {

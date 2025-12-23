@@ -411,7 +411,8 @@ std::shared_ptr<Request> LLMMaster::generate_request(
                          callback,
                          nullptr,
                          sp.decode_address,
-                         call);
+                         call,
+                         sp.offload_batch);
 
   auto request = std::make_shared<Request>(sp.request_id,
                                            sp.x_request_id,

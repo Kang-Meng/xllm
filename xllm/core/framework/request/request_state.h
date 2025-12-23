@@ -55,7 +55,8 @@ struct RequestState final {
                const OutputFunc& output_func,
                const OutputsFunc& outputs_func,
                const std::string& decode_address = "",
-               std::optional<Call*> call = std::nullopt);
+               std::optional<Call*> call = std::nullopt,
+               const uint32_t offload_batch = UINT32_MAX);
 
   RequestState(const std::string& prompt,
                const std::vector<int32_t>& prompt_tokens,
@@ -72,7 +73,8 @@ struct RequestState final {
                bool enable_schedule_overlap,
                const OutputFunc& output_func,
                const OutputsFunc& outputs_func,
-               const std::string& decode_address = "");
+               const std::string& decode_address = "",
+               const uint32_t offload_batch = UINT32_MAX);
 
   RequestState(const std::string& prompt,
                const std::vector<int32_t>& prompt_tokens,
@@ -89,7 +91,8 @@ struct RequestState final {
                bool enable_schedule_overlap,
                const OutputFunc& output_func,
                const OutputsFunc& outputs_func,
-               const std::string& decode_address = "");
+               const std::string& decode_address = "",
+               const uint32_t offload_batch = UINT32_MAX);
 
   // for profiling run, only provide prompt tokens
   RequestState(const std::vector<int32_t>& prompt_tokens);
@@ -148,6 +151,8 @@ struct RequestState final {
   bool handle_last_token_done = false;
 
   std::optional<Call*> call_;
+
+  uint32_t offload_batch = UINT32_MAX;
 };
 
 }  // namespace xllm

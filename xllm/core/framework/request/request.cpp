@@ -58,6 +58,7 @@ void Request::create_sequences_group() {
   sequence_params.enable_schedule_overlap = state_.enable_schedule_overlap;
   sequence_params.sampling_param = &(state_.sampling_param);
   sequence_params.stopping_checker = &(state_.stopping_checker);
+  sequence_params.offload_batch = state_.offload_batch;
   sequences_group_ = std::make_unique<SequencesGroup>(state_.prompt,
                                                       state_.prompt_tokens,
                                                       state_.input_embedding,

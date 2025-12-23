@@ -256,7 +256,8 @@ std::shared_ptr<Request> RecMaster::generate_request(
                          options_.enable_schedule_overlap(),
                          callback,
                          nullptr,
-                         sp.decode_address);
+                         sp.decode_address,
+                         sp.offload_batch);
   // TODO. add following when next pr (add is_rec_model and bos_token_id to
   // RequestState). req_state.is_rec_model = true; req_state.bos_token_id =
   // model_args_.bos_token_id();

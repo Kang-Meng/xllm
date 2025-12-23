@@ -165,6 +165,7 @@ void RecCompletionServiceImpl::process_async_impl(
 
     request_params.decode_address = rpc_request.routing().decode_name();
   }
+  request_params.offload_batch = rpc_request.offload_batch();
 
   const auto& rpc_request_ref = call->request();
   std::optional<MMData> mm_data = std::nullopt;

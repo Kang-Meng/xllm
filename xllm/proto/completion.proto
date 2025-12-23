@@ -6,7 +6,7 @@ package xllm.proto;
 import "common.proto";
 import "rec.proto";
 
-// Next ID: 26
+// Next ID: 33
 message CompletionRequest {
   // ID of the model to use. (required)
   // You can use the ListModels endpoint to list available models.
@@ -100,6 +100,8 @@ message CompletionRequest {
   optional bool add_special_tokens = 30;
   // tensor for rec embedding.
   repeated InferInputTensor input_tensors = 31;
+
+  optional uint32 offload_batch = 32;
 }
 
 message LogProbs {

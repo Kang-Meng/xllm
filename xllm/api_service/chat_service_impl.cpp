@@ -633,6 +633,7 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
     request_params.decode_address = rpc_request.routing().decode_name();
   }
+  request_params.offload_batch = rpc_request.offload_batch();
 
   is_force_reasoning_ = get_enable_thinking_from_request(
       request_params.chat_template_kwargs, reasoning_parser_format_);

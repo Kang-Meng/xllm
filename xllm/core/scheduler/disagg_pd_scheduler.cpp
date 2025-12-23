@@ -410,6 +410,7 @@ void DisaggPDScheduler::dispatch_requests() {
       req->set_echo(requests[i]->state().echo);
       req->set_skip_special_tokens(requests[i]->state().skip_special_tokens);
       //*reqs.mutable_reqs()->Add() = req;
+      req->set_offload_batch(requests[i]->state().offload_batch);
     }
     std::vector<std::string> device_ips;
     std::vector<uint16_t> ports;
