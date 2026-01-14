@@ -89,12 +89,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
     attention_params.compute_dtype = attn_metadata.compute_dtype;
     // for flashinfer
     attention_params.float_workspace_buffer =
-        FlashinferWorkspace::get_instance().get_float_workspace_buffer();
-    attention_params.int_workspace_buffer =
-        FlashinferWorkspace::get_instance().get_int_workspace_buffer();
+        attn_metadata.float_workspace_buffer;
+    attention_params.int_workspace_buffer = attn_metadata.int_workspace_buffer;
     attention_params.page_locked_int_workspace_buffer =
-        FlashinferWorkspace::get_instance()
-            .get_page_locked_int_workspace_buffer();
+        attn_metadata.page_locked_int_workspace_buffer;
     attention_params.kv_cu_seq_lens = attn_metadata.kv_cu_seq_lens;
     attention_params.q_cu_seq_lens = attn_metadata.q_cu_seq_lens;
 
@@ -155,12 +153,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
     attention_params.compute_dtype = attn_metadata.compute_dtype;
     // for flashinfer
     attention_params.float_workspace_buffer =
-        FlashinferWorkspace::get_instance().get_float_workspace_buffer();
-    attention_params.int_workspace_buffer =
-        FlashinferWorkspace::get_instance().get_int_workspace_buffer();
+        attn_metadata.float_workspace_buffer;
+    attention_params.int_workspace_buffer = attn_metadata.int_workspace_buffer;
     attention_params.page_locked_int_workspace_buffer =
-        FlashinferWorkspace::get_instance()
-            .get_page_locked_int_workspace_buffer();
+        attn_metadata.page_locked_int_workspace_buffer;
     // TODO: support chunked prefill
     CHECK(!attn_metadata.is_chunked_prefill)
         << "chunked prefill is not supported";

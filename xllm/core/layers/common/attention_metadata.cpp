@@ -78,6 +78,11 @@ AttentionMetadata AttentionMetadata::build(
     attn_metadata.naive_block_table = params.naive_block_table;
   }
 
+  attn_metadata.float_workspace_buffer = params.float_workspace_buffer;
+  attn_metadata.int_workspace_buffer = params.int_workspace_buffer;
+  attn_metadata.page_locked_int_workspace_buffer =
+      params.page_locked_int_workspace_buffer;
+
   return attn_metadata;
 }
 
