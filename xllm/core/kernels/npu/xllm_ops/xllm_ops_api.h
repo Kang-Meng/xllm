@@ -32,4 +32,9 @@ void top_k_top_p(torch::Tensor& logits,
 
 void replace_token(torch::Tensor& dst, torch::Tensor& src);
 
+at::Tensor hc_post(const at::Tensor& x,
+                   const at::Tensor& residual,
+                   const at::Tensor& post,
+                   const at::Tensor& comb);
+
 }  // namespace xllm::kernel::npu
