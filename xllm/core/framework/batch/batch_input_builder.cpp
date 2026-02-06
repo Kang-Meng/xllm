@@ -574,6 +574,13 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   input_params.block_tables =
       create_2d_tensor(state_.block_tables_vec, torch::kInt);
 
+  // Setup multi block tables for DeepSeek V4
+  for (auto& mgr_tables : state_.multi_block_tables_vec) {
+    util::pad_2d_vector(mgr_tables, /*pad_value=*/-1);
+    input_params.multi_block_tables.push_back(
+        create_2d_tensor(mgr_tables, torch::kInt));
+  }
+
   if (input_embeddings_vec_.size() != 0) {
     input_params.input_embedding = torch::cat(input_embeddings_vec_);
   }
@@ -651,6 +658,8 @@ RawForwardInput BatchInputBuilder::state_to_raw_forward_input() {
   raw_forward_input.new_token_slot_ids = std::move(state_.new_token_slot_ids);
   util::pad_2d_vector(state_.block_tables_vec, /*pad_value=*/0);
   raw_forward_input.block_tables_vec = std::move(state_.block_tables_vec);
+  raw_forward_input.multi_block_tables_vec =
+      std::move(state_.multi_block_tables_vec);
   raw_forward_input.num_sequences = num_sequences_;
   // raw_forward_input.dp_global_token_nums = ;
   raw_forward_input.transfer_kv_infos = std::move(state_.transfer_kv_infos);
