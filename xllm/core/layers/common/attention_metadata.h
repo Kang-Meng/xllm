@@ -25,6 +25,10 @@ namespace ffi = tvm::ffi;
 #include <memory>
 #include <string>
 
+namespace xllm {
+struct DSACacheInfo;  // forward declaration (defined in deepseek_v4.h)
+}  // namespace xllm
+
 namespace xllm::layer {
 
 #if defined(USE_CUDA) || defined(USE_MUSA)
@@ -120,6 +124,33 @@ struct AttentionMetadata {
   torch::Tensor dsa_c128_cos;
   torch::Tensor dsa_c128_sin;
   torch::Tensor dsa_start_pos;
+
+  // DeepSeek V4 multi-manager block tables and slot mappings
+  // Indexed as [layer_id][cache_idx] after expansion by build_forward_context.
+  // Same-group caches share the same underlying tensor (no copy).
+  std::vector<std::vector<torch::Tensor>> dsa_block_tables;
+  std::vector<std::vector<torch::Tensor>> dsa_slot_mappings;
+
+  // DeepSeek V4 DSA sequence length metadata
+  // actual_seq_lengths_kv: (batch_size,) — per-seq kv context length
+  torch::Tensor dsa_actual_seq_lengths_kv;
+  // actual_seq_lengths_query: (batch_size+1,) — cumsum of per-seq query lengths
+  //   prefill: pad(cumsum(context_length), (1,0), 0)
+  //   decode:  pad(cumsum(ones(batch_size)), (1,0), 0)
+  torch::Tensor dsa_actual_seq_lengths_query;
+
+  // DeepSeek V4 DSA compressed positions
+  // input_positions: (total_tokens,) — token position IDs
+  torch::Tensor dsa_input_positions;
+  // c4_pad_positions: positions for C4 compressed RoPE
+  torch::Tensor dsa_c4_pad_positions;
+  // c128_pad_positions: positions for C128 compressed RoPE
+  torch::Tensor dsa_c128_pad_positions;
+
+  // DeepSeek V4 DSA cache spec per layer
+  // dsa_caches_info[layer_id][cache_idx] = {group_id, type, ratio, block_size}
+  // Points to model-owned data; valid for the lifetime of the model.
+  const std::vector<std::vector<xllm::DSACacheInfo>>* dsa_caches_info = nullptr;
 };
 
 }  // namespace xllm::layer
