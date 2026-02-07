@@ -20,6 +20,8 @@ limitations under the License.
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
+
+#include <cstdint>
 #if defined(USE_NPU)
 #include "acl/acl.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -93,50 +95,155 @@ bool WorkerImpl::allocate_kv_cache(
   const int64_t num_layers = get_num_layers();
   const bool enable_lighting_indexer =
       context_.get_model_args().index_n_heads() > 0;
+  const bool is_dsv4 =
+      context_.get_model_args().model_type() == "deepseek_v4" &&
+      kv_cache_shape.size() >= 1 && kv_cache_shape[0].size() >= 3;
   kv_caches_.reserve(num_layers);
-  for (int64_t i = 0; i < num_layers; ++i) {
-    torch::Tensor key_cache, value_cache, index_cache;
+
+  if (is_dsv4) {
+    // DSV4: per-layer caches by compress_ratio (1 / 4 / 128), align with
+    // MindIE ModelCachePool / SFA get_cache_spec()
+    const auto& args = context_.get_model_args();
+    const int64_t swa_count = kv_cache_shape[0][0];
+    const int64_t c4_count = kv_cache_shape[0][1];
+    const int64_t c128_count = kv_cache_shape[0][2];
+    const int32_t block_size = 128;
+    const int32_t window_size = std::max(args.window_size(), 1);
+    const int64_t n_heads = args.n_kv_heads().value_or(args.n_heads());
+    const int64_t head_dim = args.head_dim();
+    const int32_t index_n_heads = std::max(args.index_n_heads(), 1);
+    const int32_t index_head_dim = std::max(args.index_head_dim(), 1);
+    const auto& compress_ratios = args.compress_ratios();
+
+    const auto cache_options = torch::dtype(dtype_).device(device_);
+    const auto index_options = torch::dtype(torch::kInt8).device(device_);
+    // MindIE uses float32 for compress_kv_state / compress_score_state
+    const auto state_options = torch::dtype(torch::kFloat32).device(device_);
+    const auto scale_options = torch::dtype(torch::kFloat16).device(device_);
+
+    aclFormat npu_format_type = ACL_FORMAT_ND;  // TODO(DSV4)
+
+    for (int64_t i = 0; i < num_layers; ++i) {
+      const int32_t cr = (i < static_cast<int64_t>(compress_ratios.size()))
+                             ? compress_ratios[static_cast<size_t>(i)]
+                             : 1;
+      torch::Tensor key_cache, value_cache, index_cache, indexer_cache_scale,
+          swa_cache, compress_kv_state, compress_score_state,
+          compress_index_kv_state, compress_index_score_state;
+
+      if (cr == 1) {
+        // MindIE: (num_blocks, window_size, 1, head_dim)
+        swa_cache = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, window_size, n_heads, head_dim},
+                         cache_options),
+            npu_format_type);
+      } else if (cr == 4) {
+        key_cache = at_npu::native::npu_format_cast(
+            torch::empty({c4_count, block_size, n_heads, head_dim},
+                         cache_options),
+            npu_format_type);
+        index_cache = at_npu::native::npu_format_cast(
+            torch::empty({c4_count, block_size, index_n_heads, index_head_dim},
+                         index_options),
+            npu_format_type);
+        indexer_cache_scale = at_npu::native::npu_format_cast(
+            torch::empty({c4_count, block_size, 1}, scale_options),
+            npu_format_type);
+        // MindIE: (num_blocks, window_size, 1, head_dim)
+        swa_cache = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, window_size, n_heads, head_dim},
+                         cache_options),
+            npu_format_type);
+        // MindIE: (num_blocks, 128, 2*head_dim), not (..., n_heads, 2*head_dim)
+        compress_kv_state = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, block_size, 2 * head_dim}, state_options),
+            npu_format_type);
+        compress_score_state = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, block_size, 2 * head_dim}, state_options),
+            npu_format_type);
+        compress_index_kv_state = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, block_size, 2 * index_head_dim},
+                         state_options),
+            npu_format_type);
+        compress_index_score_state = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, block_size, 2 * index_head_dim},
+                         state_options),
+            npu_format_type);
+      } else if (cr == 128) {
+        key_cache = at_npu::native::npu_format_cast(
+            torch::empty({c128_count, block_size, n_heads, head_dim},
+                         cache_options),
+            npu_format_type);
+        // MindIE: (num_blocks, window_size, 1, head_dim)
+        swa_cache = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, window_size, n_heads, head_dim},
+                         cache_options),
+            npu_format_type);
+        // MindIE cr==128: (compress_ratio, head_dim) = (128, head_dim), no 2*
+        compress_kv_state = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, block_size, head_dim}, state_options),
+            npu_format_type);
+        compress_score_state = at_npu::native::npu_format_cast(
+            torch::empty({swa_count, block_size, head_dim}, state_options),
+            npu_format_type);
+      }
+
+      kv_caches_.emplace_back(key_cache,
+                              value_cache,
+                              index_cache,
+                              indexer_cache_scale,
+                              swa_cache,
+                              compress_kv_state,
+                              compress_score_state,
+                              compress_index_kv_state,
+                              compress_index_score_state);
+    }
+  } else {
+    for (int64_t i = 0; i < num_layers; ++i) {
+      torch::Tensor key_cache, value_cache, index_cache;
 #if defined(USE_NPU)
-    aclFormat npu_format_type =
-        context_.get_model_args().model_type() == "deepseek_v3" &&
-                FLAGS_enable_prefix_cache
-            ? ACL_FORMAT_FRACTAL_NZ
-            : ACL_FORMAT_ND;
-    key_cache = at_npu::native::npu_format_cast(
-        torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_)),
-        npu_format_type);
-    value_cache = at_npu::native::npu_format_cast(
-        torch::empty(kv_cache_shape[1], torch::dtype(dtype_).device(device_)),
-        npu_format_type);
-    if (enable_lighting_indexer) {
-      index_cache = at_npu::native::npu_format_cast(
-          torch::empty(kv_cache_shape[2], torch::dtype(dtype_).device(device_)),
+      aclFormat npu_format_type =
+          context_.get_model_args().model_type() == "deepseek_v3" &&
+                  FLAGS_enable_prefix_cache
+              ? ACL_FORMAT_FRACTAL_NZ
+              : ACL_FORMAT_ND;
+      key_cache = at_npu::native::npu_format_cast(
+          torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_)),
           npu_format_type);
-    }
+      value_cache = at_npu::native::npu_format_cast(
+          torch::empty(kv_cache_shape[1], torch::dtype(dtype_).device(device_)),
+          npu_format_type);
+      if (enable_lighting_indexer) {
+        index_cache = at_npu::native::npu_format_cast(
+            torch::empty(kv_cache_shape[2],
+                         torch::dtype(dtype_).device(device_)),
+            npu_format_type);
+      }
 #elif defined(USE_ILU) || defined(USE_MLU)
-    key_cache =
-        torch::zeros(kv_cache_shape[0], torch::dtype(dtype_).device(device_));
-    if (!kv_cache_shape[1].empty()) {
-      value_cache =
-          torch::zeros(kv_cache_shape[1], torch::dtype(dtype_).device(device_));
-    }
-    if (enable_lighting_indexer) {
-      index_cache =
-          torch::zeros(kv_cache_shape[2], torch::dtype(dtype_).device(device_));
-    }
+      key_cache =
+          torch::zeros(kv_cache_shape[0], torch::dtype(dtype_).device(device_));
+      if (!kv_cache_shape[1].empty()) {
+        value_cache = torch::zeros(kv_cache_shape[1],
+                                   torch::dtype(dtype_).device(device_));
+      }
+      if (enable_lighting_indexer) {
+        index_cache = torch::zeros(kv_cache_shape[2],
+                                   torch::dtype(dtype_).device(device_));
+      }
 #else
-    key_cache =
-        torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_));
-    if (!kv_cache_shape[1].empty()) {
-      value_cache =
-          torch::empty(kv_cache_shape[1], torch::dtype(dtype_).device(device_));
-    }
-    if (enable_lighting_indexer) {
-      index_cache =
-          torch::empty(kv_cache_shape[2], torch::dtype(dtype_).device(device_));
-    }
+      key_cache =
+          torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_));
+      if (!kv_cache_shape[1].empty()) {
+        value_cache = torch::empty(kv_cache_shape[1],
+                                   torch::dtype(dtype_).device(device_));
+      }
+      if (enable_lighting_indexer) {
+        index_cache = torch::empty(kv_cache_shape[2],
+                                   torch::dtype(dtype_).device(device_));
+      }
 #endif
-    kv_caches_.emplace_back(key_cache, value_cache, index_cache);
+      kv_caches_.emplace_back(key_cache, value_cache, index_cache);
+    }
   }
 
   init_hierarchy_kv_cache_transfer();

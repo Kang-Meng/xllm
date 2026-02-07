@@ -27,6 +27,25 @@ KVCache::KVCache(torch::Tensor key_cache,
       value_cache_(std::move(value_cache)),
       index_cache_(std::move(index_cache)) {}
 
+KVCache::KVCache(torch::Tensor key_cache,
+                 torch::Tensor value_cache,
+                 torch::Tensor index_cache,
+                 torch::Tensor indexer_cache_scale,
+                 torch::Tensor swa_cache,
+                 torch::Tensor compress_kv_state,
+                 torch::Tensor compress_score_state,
+                 torch::Tensor compress_index_kv_state,
+                 torch::Tensor compress_index_score_state)
+    : key_cache_(std::move(key_cache)),
+      value_cache_(std::move(value_cache)),
+      index_cache_(std::move(index_cache)),
+      indexer_cache_scale_(std::move(indexer_cache_scale)),
+      swa_cache_(std::move(swa_cache)),
+      compress_kv_state_(std::move(compress_kv_state)),
+      compress_score_state_(std::move(compress_score_state)),
+      compress_index_kv_state_(std::move(compress_index_kv_state)),
+      compress_index_score_state_(std::move(compress_index_score_state)) {}
+
 KVCache::KVCache(std::shared_ptr<XTensor> key_xtensor,
                  std::shared_ptr<XTensor> value_xtensor)
     : key_xtensor_(key_xtensor), value_xtensor_(value_xtensor) {}

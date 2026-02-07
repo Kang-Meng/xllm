@@ -12,12 +12,16 @@ cc_library(
     block_manager_impl.h
     concurrent_block_manager_impl.h
     hierarchy_block_manager_pool.h
+    sliding_window_block_manager.h
+    composite_block_manager.h
   SRCS 
     block.cpp
     block_manager_pool.cpp
     concurrent_block_manager_impl.cpp
     block_manager_impl.cpp
     hierarchy_block_manager_pool.cpp
+    sliding_window_block_manager.cpp
+    composite_block_manager.cpp
   DEPS
     $<$<BOOL:${USE_NPU}>:torch_npu>
     $<$<BOOL:${USE_NPU}>:graph>

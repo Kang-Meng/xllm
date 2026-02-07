@@ -417,6 +417,20 @@ void BatchInputBuilder::setup_kv_cache_info(
   seq_len += offset;
   n_kv_cache_tokens += offset;
   const auto blocks = sequence->kv_state().kv_blocks();
+  const auto composite_blocks = sequence->kv_state().composite_blocks();
+  if (!composite_blocks.empty()) {
+    std::vector<std::vector<int32_t>> composite_block_ids;
+    for (const auto& composite_block : composite_blocks) {
+      std::vector<int32_t> block_ids;
+      for (const auto& block : composite_block) {
+        block_ids.push_back(block.id());
+      }
+      composite_block_ids.push_back(block_ids);
+    }
+    state.multi_block_tables_vec.emplace_back(std::move(composite_block_ids));
+    return;
+  }
+
   const auto slot_ids =
       sequence->kv_state().kv_cache_slots(n_kv_cache_tokens, seq_len);
   state.new_token_slot_ids.insert(

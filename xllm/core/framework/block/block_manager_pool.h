@@ -33,6 +33,12 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(bool, enable_disagg_pd) = false;
     PROPERTY(bool, enable_cache_upload) = false;
     PROPERTY(bool, enable_kvcache_store) = false;
+    // For SlidingWindowBlockManager.
+    PROPERTY(uint32_t, window_size) = 0;
+    // For CompositeBlockManager.
+    PROPERTY(std::vector<uint32_t>, manager_types) = {};
+    PROPERTY(std::vector<uint32_t>, compress_ratios) = {};
+    PROPERTY(uint32_t, max_seqs_per_batch) = 0;
   };
 
   explicit BlockManagerPool(const Options& options, int32_t dp_size = 1);

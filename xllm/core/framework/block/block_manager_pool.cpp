@@ -16,6 +16,7 @@ limitations under the License.
 #include "block_manager_pool.h"
 
 #include "block_manager_impl.h"
+#include "composite_block_manager.h"
 #include "concurrent_block_manager_impl.h"
 
 namespace xllm {
@@ -32,10 +33,16 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_cache_upload(options_.host_num_blocks() > 0
                                ? false
-                               : options_.enable_cache_upload());
+                               : options_.enable_cache_upload())
+      .manager_types(options_.manager_types())
+      .compress_ratios(options_.compress_ratios())
+      .max_seqs_per_batch(options_.max_seqs_per_batch());
 
   for (int32_t i = 0; i < dp_size; ++i) {
-    if (options.enable_disagg_pd() || options_.enable_kvcache_store()) {
+    if (!options_.manager_types().empty()) {
+      block_managers_.emplace_back(
+          std::make_unique<CompositeBlockManager>(npu_options));
+    } else if (options.enable_disagg_pd() || options_.enable_kvcache_store()) {
       block_managers_.emplace_back(
           std::make_unique<ConcurrentBlockManagerImpl>(npu_options));
     } else {
@@ -90,8 +97,16 @@ void BlockManagerPool::deallocate(std::vector<Sequence*>& sequences) {
 
 void BlockManagerPool::deallocate(Sequence* sequence) {
   DCHECK(sequence != nullptr);
-  // add blocks to the prefix cache
   int32_t dp_rank = get_dp_rank(sequence);
+
+  if (block_managers_[dp_rank]->is_composite()) {
+    // TODO: not supporte prefix cache for composite manager yet.
+    block_managers_[dp_rank]->deallocate_sequence(sequence);
+    sequence->reset();
+    return;
+  }
+
+  // add blocks to the prefix cache
   cache(sequence);
   block_managers_[dp_rank]->deallocate(sequence->kv_state().kv_blocks());
   // release the blocks after prefix cache insertion
@@ -128,6 +143,14 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
   AUTO_COUNTER(allocate_blocks_latency_seconds);
   DCHECK(sequence != nullptr);
 
+  int32_t dp_rank = get_dp_rank(sequence);
+
+  if (block_managers_[dp_rank]->is_composite()) {
+    // TODO: not supporte prefix cache for composite manager yet.
+    return block_managers_[dp_rank]->allocate_for_sequence(sequence,
+                                                           num_tokens);
+  }
+
   // first try to allocate shared blocks
   if (sequence->kv_state().num_kv_blocks() == 0) {
     BlockManagerPool::allocate_shared(sequence);
@@ -144,7 +167,6 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
 
   const uint32_t num_additional_blocks = num_blocks_needed - num_blocks;
 
-  int32_t dp_rank = get_dp_rank(sequence);
   const auto blocks = block_managers_[dp_rank]->allocate(num_additional_blocks);
   if (blocks.size() != num_additional_blocks) {
     // LOG(ERROR) << " Fail to allocate " << num_additional_blocks << "
@@ -163,6 +185,7 @@ bool BlockManagerPool::allocate(Sequence* sequence,
   LOG(FATAL)
       << "allocate(Sequence* sequence, size_t num_tokens, size_t "
          "needed_copy_in_blocks_num) is not implemented in BlockManagerPool.";
+  return false;
 }
 
 std::vector<Block> BlockManagerPool::allocate(size_t num_tokens,
@@ -175,6 +198,8 @@ std::vector<Block> BlockManagerPool::allocate(size_t num_tokens,
 
 bool BlockManagerPool::try_allocate(Sequence* sequence) {
   int32_t dp_rank = get_dp_rank(sequence);
+  DCHECK(!block_managers_[dp_rank].get()->is_composite())
+      << "Composite manager does not support try_allocate yet.";
 
   std::vector<Block> shared_blocks;
   size_t shared_num = 0;
@@ -318,6 +343,9 @@ double BlockManagerPool::kv_cache_utilization() const {
 void BlockManagerPool::deallocate_without_cache(Sequence* sequence) {
   DCHECK(sequence != nullptr);
   int32_t dp_rank = get_dp_rank(sequence);
+  DCHECK(!block_managers_[dp_rank].get()->is_composite())
+      << "Composite manager does not support deallocate_without_cache yet.";
+
   block_managers_[dp_rank]->deallocate(sequence->kv_state().kv_blocks());
   sequence->reset();
 }

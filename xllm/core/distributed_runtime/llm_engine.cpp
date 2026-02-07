@@ -296,14 +296,100 @@ Engine::KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   }
 #endif
 
+  // DeepSeek V4: compute swa_count (from max_seqs_per_batch), then subtract
+  // all swa-related cache size from cache_size_in_bytes, then compute
+  // c4_count / c128_count (c4_count = 32 * c128_count).
+  // cache_size_in_bytes is already the full available device memory.
+  if (args_.model_type() == "deepseek_v4") {
+    const int64_t max_seqs =
+        static_cast<int64_t>(std::max(options_.max_seqs_per_batch(), 1));
+    kv_cache_cap.swa_count = 12 * max_seqs + 2;
+
+    const int32_t block_size = 128;
+    const int64_t head_dim = args_.head_dim();
+    const int32_t index_head_dim = std::max(args_.index_head_dim(), 1);
+    const int32_t window_size = std::max(args_.window_size(), 1);
+    const auto& compress_ratios = args_.compress_ratios();
+    const int64_t float32_size = 4;
+
+    int n_c1_layers = 0;
+    int n_c4_layers = 0;
+    int n_c128_layers = 0;
+    for (size_t i = 0; i < compress_ratios.size(); ++i) {
+      if (compress_ratios[i] == 1) {
+        ++n_c1_layers;
+      } else if (compress_ratios[i] == 4) {
+        ++n_c4_layers;
+      } else if (compress_ratios[i] == 128) {
+        ++n_c128_layers;
+      }
+    }
+
+    // 1) Size of all caches that use swa_count (tied to max_seqs_per_batch).
+    // c1 layer: 1 cache — swa (swa_count, window_size, 1, head_dim)
+    // c4 layer: 5 caches use swa — swa_cache, compress_kv_state,
+    // compress_score_state,
+    //           compress_index_kv_state, compress_index_score_state (shapes
+    //           with 128, float32)
+    // c128 layer: 3 caches use swa — swa_cache, compress_kv_state,
+    // compress_score_state
+    const int64_t swa_bytes_per_c1_layer =
+        kv_cache_cap.swa_count * window_size * head_dim * dtype_size;
+    const int64_t swa_bytes_per_c4_layer =
+        kv_cache_cap.swa_count *
+        (window_size * head_dim * dtype_size +
+         block_size * (2 * head_dim * float32_size) *
+             2 +  // kv_state + score_state
+         block_size * (2 * index_head_dim * float32_size) *
+             2);  // index_kv + index_score
+    const int64_t swa_bytes_per_c128_layer =
+        kv_cache_cap.swa_count *
+        (window_size * head_dim * dtype_size +
+         block_size * head_dim * float32_size * 2);  // kv_state + score_state
+
+    const int64_t constant_swa_bytes = n_c1_layers * swa_bytes_per_c1_layer +
+                                       n_c4_layers * swa_bytes_per_c4_layer +
+                                       n_c128_layers * swa_bytes_per_c128_layer;
+
+    // 2) Remainder is for token pools (c4_count / c128_count).
+    const int64_t token_mem = std::max(
+        int64_t(0), kv_cache_cap.cache_size_in_bytes - constant_swa_bytes);
+
+    // 3) bytes per token block (per layer): c4 = key+index+scale; c128 = key
+    // only
+    const int64_t bytes_per_c4_block =
+        block_size *
+        (head_dim * dtype_size + index_head_dim * 1 + 2 * 2);  // scale float16
+    const int64_t bytes_per_c128_block = block_size * head_dim * dtype_size;
+
+    const int64_t denom = 32 * n_c4_layers * bytes_per_c4_block +
+                          n_c128_layers * bytes_per_c128_block;
+    if (denom > 0 && token_mem > 0) {
+      kv_cache_cap.c128_count = token_mem / denom;
+      kv_cache_cap.c4_count = 32 * kv_cache_cap.c128_count;
+    } else {
+      kv_cache_cap.c128_count = 0;
+      kv_cache_cap.c4_count = 0;
+    }
+    CHECK_GT(kv_cache_cap.swa_count, 0) << "DSV4 swa_count must be > 0";
+    CHECK_GT(kv_cache_cap.c128_count, 0)
+        << "DSV4 c128_count must be > 0 (insufficient memory or no c4/c128 "
+           "layers)";
+
+    kv_cache_cap.n_blocks =
+        1;  // not used for DSV4; satisfy CHECK in allocate_kv_cache
+  }
+
   if (!FLAGS_enable_continuous_kvcache) {
-    // compute kv cache n_blocks
-    const int32_t block_size = options_.block_size();
-    const int64_t block_size_in_bytes =
-        block_size * (slot_size + index_slot_size);
-    kv_cache_cap.n_blocks = kv_cache_cap.cache_size_in_bytes /
-                            (kv_cache_cap.n_layers * block_size_in_bytes);
-    CHECK_GT(kv_cache_cap.n_blocks, 0) << "no n_blocks for kv cache";
+    // compute kv cache n_blocks (skipped for DSV4, already set n_blocks=1)
+    if (args_.model_type() != "deepseek_v4") {
+      const int32_t block_size = options_.block_size();
+      const int64_t block_size_in_bytes =
+          block_size * (slot_size + index_slot_size);
+      kv_cache_cap.n_blocks = kv_cache_cap.cache_size_in_bytes /
+                              (kv_cache_cap.n_layers * block_size_in_bytes);
+      CHECK_GT(kv_cache_cap.n_blocks, 0) << "no n_blocks for kv cache";
+    }
   } else {
     int32_t n_pages =
         kv_cache_cap.cache_size_in_bytes / FLAGS_phy_page_granularity_size;
@@ -332,7 +418,15 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
   // init kv cache for each worker
   std::vector<std::vector<int64_t>> kv_cache_shape;
   kv_cache_shape.reserve(2);
-  if (FLAGS_enable_mla) {
+  if (args_.model_type() == "deepseek_v4") {
+    kv_cache_shape.emplace_back(std::vector<int64_t>{kv_cache_cap.swa_count,
+                                                     kv_cache_cap.c4_count,
+                                                     kv_cache_cap.c128_count});
+    LOG(INFO) << "Initializing DSV4 kv cache with shape: [swa_count="
+              << kv_cache_cap.swa_count
+              << ", c4_count=" << kv_cache_cap.c4_count
+              << ", c128_count=" << kv_cache_cap.c128_count << "]";
+  } else if (FLAGS_enable_mla) {
 #if defined(USE_NPU)
     if (args_.model_type() == "deepseek_v3" && FLAGS_enable_prefix_cache) {
       kv_cache_shape.emplace_back(
@@ -363,31 +457,36 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
   }
-  if (enable_lighting_indexer) {
+  if (enable_lighting_indexer && args_.model_type() != "deepseek_v4") {
     kv_cache_shape.emplace_back(std::vector<int64_t>{
         kv_cache_cap.n_blocks, block_size, 1, args_.index_head_dim()});
   }
 #if defined(USE_MLU)
-  // transpose kv_cache layout for mlu
-  // default layout: [n_blocks, block_size, n_head, head_dim]
-  // => mlu layout: [n_blocks, n_head, block_size, head_dim]
-  for (auto& shape : kv_cache_shape) {
-    std::swap(shape[1], shape[2]);
-  }
-  if (FLAGS_enable_mla) {
-    kv_cache_shape[0][3] = args_.kv_lora_rank() + args_.qk_rope_head_dim();
-    kv_cache_shape[1] = std::vector<int64_t>{};
+  // transpose kv_cache layout for mlu (skip for DSV4: shape is 3D counts)
+  if (args_.model_type() != "deepseek_v4") {
+    for (auto& shape : kv_cache_shape) {
+      std::swap(shape[1], shape[2]);
+    }
+    if (FLAGS_enable_mla) {
+      kv_cache_shape[0][3] = args_.kv_lora_rank() + args_.qk_rope_head_dim();
+      kv_cache_shape[1] = std::vector<int64_t>{};
+    }
   }
 #endif
 
 #if defined(USE_ILU)
-  for (auto& shape : kv_cache_shape) {
-    std::swap(shape[1], shape[2]);
+  if (args_.model_type() != "deepseek_v4") {
+    for (auto& shape : kv_cache_shape) {
+      std::swap(shape[1], shape[2]);
+    }
   }
 #endif
   LOG(INFO) << "Initializing k cache with shape: [" << kv_cache_shape[0] << "]";
-  LOG(INFO) << "Initializing v cache with shape: [" << kv_cache_shape[1] << "]";
-  if (enable_lighting_indexer) {
+  if (kv_cache_shape.size() > 1) {
+    LOG(INFO) << "Initializing v cache with shape: [" << kv_cache_shape[1]
+              << "]";
+  }
+  if (enable_lighting_indexer && kv_cache_shape.size() > 2) {
     LOG(INFO) << "Initializing indexer cache with shape: [" << kv_cache_shape[2]
               << "]";
   }
@@ -401,6 +500,13 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_cache_upload(options_.enable_cache_upload())
       .enable_kvcache_store(options_.enable_kvcache_store());
+  if (args_.model_type() == "deepseek_v4") {
+    options.window_size(args_.window_size())
+        .manager_types({0, 1, 1})
+        .compress_ratios({1, 4, 128})  // TODO(DSV4): add DSV4 compress ratios
+        .max_seqs_per_batch(options_.max_seqs_per_batch());
+  }
+
   if (options_.host_blocks_factor() > 1.0 || options_.enable_kvcache_store()) {
     kv_cache_manager_ =
         std::make_unique<HierarchyBlockManagerPool>(options, this, dp_size_);
