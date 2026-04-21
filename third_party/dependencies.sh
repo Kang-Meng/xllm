@@ -22,8 +22,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPS_ROOT_DIR="${HOME}/xllm_deps"
 GOVER="1.23.8"
 
-YALANTING_INSTALL_PREFIX="/usr/local/yalantinglibs"
-YALANTING_CONFIG_FILE="${YALANTING_INSTALL_PREFIX}/lib/cmake/yalantinglibs/config.cmake"
+YALANTING_CONFIG_DIR="/usr/local/lib/cmake/yalantinglibs"
+YALANTING_CONFIG_FILE="${YALANTING_CONFIG_DIR}/config.cmake"
 YALANTING_REPO_URL="https://gitcode.com/gh_mirrors/ya/yalantinglibs.git"
 YALANTING_SOURCE_DIR="${DEPS_ROOT_DIR}/yalantinglibs"
 YALANTING_BUILD_DIR="${YALANTING_SOURCE_DIR}/build"
@@ -346,16 +346,14 @@ install_yalantinglibs() {
 
     local thirdparties_dir
     thirdparties_dir="$(dirname "${YALANTING_SOURCE_DIR}")"
-    local yalanting_easylog_header="${YALANTING_SOURCE_DIR}/include/ylt/easylog.hpp"
+    local yalanting_easylog_header="/usr/local/include/ylt/easylog.hpp"
 
-    run_or_die "Failed to create install dir ${YALANTING_INSTALL_PREFIX}" mkdir -p "${YALANTING_INSTALL_PREFIX}"
     run_or_die "Failed to create thirdparties dir ${thirdparties_dir}" mkdir -p "${thirdparties_dir}"
     run_or_die "Failed to remove old yalantinglibs source" rm -rf "${YALANTING_SOURCE_DIR}"
 
     run_or_die "Failed to clone yalantinglibs" git clone "${YALANTING_REPO_URL}" "${YALANTING_SOURCE_DIR}"
     run_or_die "Failed to checkout yalantinglibs version 0.5.5" git -C "${YALANTING_SOURCE_DIR}" checkout 0.5.5
 
-    patch_yalantinglibs_easylog "${yalanting_easylog_header}"
     run_or_die "Failed to create yalantinglibs build dir" mkdir -p "${YALANTING_BUILD_DIR}"
 
     run_or_die \
@@ -363,7 +361,6 @@ install_yalantinglibs() {
         cmake \
         -S "${YALANTING_SOURCE_DIR}" \
         -B "${YALANTING_BUILD_DIR}" \
-        -DCMAKE_INSTALL_PREFIX="${YALANTING_INSTALL_PREFIX}" \
         -DBUILD_EXAMPLES=OFF \
         -DBUILD_BENCHMARK=OFF \
         -DBUILD_UNIT_TESTS=OFF \
@@ -373,6 +370,7 @@ install_yalantinglibs() {
     run_or_die "Failed to install yalantinglibs" cmake --install "${YALANTING_BUILD_DIR}"
 
     patch_yalantinglibs_config "${YALANTING_CONFIG_FILE}"
+    patch_yalantinglibs_easylog "${yalanting_easylog_header}"
     [ -f "${YALANTING_CONFIG_FILE}" ] || print_error "yalantinglibs config not found after install: ${YALANTING_CONFIG_FILE}"
     print_success "yalantinglibs installed successfully"
 }
@@ -455,7 +453,6 @@ install_mooncake() {
     if [ "${DEVICE}" = "npu" ]; then
         cmake_args+=(-DUSE_UB=ON)
     fi
-    cmake_args+=("-Dyalantinglibs_DIR=${YALANTING_INSTALL_PREFIX}/lib/cmake/yalantinglibs")
 
     set +e
     (
