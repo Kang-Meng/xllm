@@ -143,6 +143,7 @@ cc_test(
     torch
     glog::glog
     proto::xllm_proto
+    xxHash
     GTest::gtest_main
 )
 
