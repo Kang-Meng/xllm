@@ -34,7 +34,7 @@ MOONCAKE_INSTALL_DIR="/usr/local/lib/python3.11/site-packages/mooncake"
 
 MEMFABRIC_REPO_URL="https://gitcode.com/xLLM-AI/memfabric_hybrid.git"
 MEMFABRIC_REPO_DIR="${DEPS_ROOT_DIR}/memfabric_hybrid"
-MEMFABRIC_TARGET_COMMIT="4d98aa921d4d2d606f5c73359471d3881a824461"
+MEMFABRIC_TARGET_COMMIT="dcc6d3a19a815eabc4703b5d52692babcdb09f8c"
 MEMFABRIC_INSTALL_DIR="/usr/local/memfabric_hybrid"
 MEMFABRIC_INSTALLER="output/memfabric_hybrid-1.1.0_linux_aarch64.run"
 
@@ -431,16 +431,6 @@ install_mooncake() {
 
     [ -f "${MOONCAKE_CMAKE_FILE}" ] || print_error "Mooncake CMakeLists not found: ${MOONCAKE_CMAKE_FILE}"
 
-    local mooncake_cmake_changed=0
-    if grep -Fq '#add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)' "${MOONCAKE_CMAKE_FILE}"; then
-        run_or_die \
-            "Failed to un-comment pybind11 in ${MOONCAKE_CMAKE_FILE}" \
-            sed -i \
-            's|#add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)|add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)|' \
-            "${MOONCAKE_CMAKE_FILE}"
-        mooncake_cmake_changed=1
-    fi
-
     local build_dir="${MOONCAKE_REPO_DIR}/build"
     run_or_die "Failed to create Mooncake build dir" mkdir -p "${build_dir}"
 
@@ -477,13 +467,6 @@ install_mooncake() {
     local build_status=$?
     set -e
 
-    if [ "${mooncake_cmake_changed}" -eq 1 ]; then
-        run_or_die \
-            "Failed to restore ${MOONCAKE_CMAKE_FILE}" \
-            sed -i \
-            's|add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)|#add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)|' \
-            "${MOONCAKE_CMAKE_FILE}"
-    fi
     [ "${build_status}" -eq 0 ] || print_error "Failed to build/install Mooncake"
 
     if [ "${ENABLE_HA}" = "true" ]; then

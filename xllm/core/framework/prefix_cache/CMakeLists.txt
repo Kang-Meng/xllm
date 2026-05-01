@@ -24,7 +24,9 @@ cc_library(
     :kv_cache
 )
 
- target_link_libraries(prefix_cache PRIVATE mooncake_store)
+if(ENABLE_MOONCAKE)
+  target_link_libraries(prefix_cache PRIVATE mooncake_store)
+endif()
 
 
 cc_test(

@@ -23,6 +23,7 @@ limitations under the License.
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <unordered_set>
 
 #include "api_service/api_service.h"
@@ -54,6 +55,10 @@ static const std::unordered_set<std::string> prefill_sp_supported_model_set = {
 namespace {
 
 void fix_mlu_disagg_pd_flags() {
+#if !defined(ENABLE_MOONCAKE)
+  LOG(FATAL) << "MLU disaggregated PD requires Mooncake support, but "
+             << "ENABLE_MOONCAKE=OFF.";
+#endif
   if (FLAGS_kv_cache_transfer_type != "Mooncake") {
     LOG(WARNING) << "MLU disaggregated PD requires "
                  << "kv_cache_transfer_type=Mooncake; forcing from "
@@ -106,6 +111,14 @@ void validate_flags(const std::string& model_type) {
     LOG(FATAL) << "enable_prefill_sp is not supported for model_type="
                << model_type;
   }
+#if !defined(ENABLE_MOONCAKE)
+  if (FLAGS_enable_kvcache_store) {
+    LOG(FATAL) << "enable_kvcache_store requires ENABLE_MOONCAKE=ON.";
+  }
+  if (FLAGS_host_blocks_factor > 1.0) {
+    LOG(FATAL) << "host_blocks_factor > 1.0 requires ENABLE_MOONCAKE=ON.";
+  }
+#endif
 #if defined(USE_MLU)
   // Disable enable_schedule_overlap for VLM models on MLU backend
   if (FLAGS_enable_schedule_overlap && FLAGS_backend == "vlm") {

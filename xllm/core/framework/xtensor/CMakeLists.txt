@@ -34,7 +34,7 @@ cc_library(
     :minja
     Folly::folly
     :common
-    mooncake_store
+    $<$<BOOL:${ENABLE_MOONCAKE}>:mooncake_store>
     glog::glog
     proto::xllm_proto
     :collective_service

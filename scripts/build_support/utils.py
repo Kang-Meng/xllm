@@ -315,10 +315,19 @@ def _ensure_xllm_ops_rebuild_on_missing_marker() -> None:
         print("✅ Cleared XLLM_OPS_GIT_HEAD_CACHED from CMake cache to trigger xllm_ops rebuild.")
         return
 
-def pre_build(device: Optional[str] = None, enable_ha: bool = False) -> None:
+def pre_build(
+    device: Optional[str] = None,
+    enable_ha: bool = False,
+    enable_mooncake: bool = True,
+) -> None:
     script_path = get_base_dir()
     normalized_device = (device or "").lower()
 
+    if enable_ha and not enable_mooncake:
+        print("❌ ENABLE_HA requires ENABLE_MOONCAKE to be enabled.")
+        exit(1)
+
+    _upsert_cmake_bool_option("ENABLE_MOONCAKE", enable_mooncake)
     _upsert_cmake_bool_option("ENABLE_HA", enable_ha)
     _validate_submodules_or_exit(script_path)
     _ensure_xllm_ops_rebuild_on_missing_marker()

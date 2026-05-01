@@ -25,7 +25,9 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#if defined(ENABLE_MOONCAKE)
 #include "kv_cache_transfer/kv_cache_store.h"
+#endif
 
 namespace xllm {
 
@@ -325,6 +327,10 @@ uint32_t PrefixCache::compute_hash_keys(const Slice<int32_t>& token_ids,
 
 uint32_t PrefixCache::match_in_kvcache_store(
     const std::vector<uint8_t*>& keys) {
+#if !defined(ENABLE_MOONCAKE)
+  static_cast<void>(keys);
+  return 0;
+#else
   std::vector<std::string> str_keys;
   for (auto key : keys) {
     std::string str_key(reinterpret_cast<const char*>(key),
@@ -332,6 +338,7 @@ uint32_t PrefixCache::match_in_kvcache_store(
     str_keys.emplace_back(str_key);
   }
   return KVCacheStore::get_instance().batch_exist(str_keys);
+#endif
 }
 
 }  // namespace xllm

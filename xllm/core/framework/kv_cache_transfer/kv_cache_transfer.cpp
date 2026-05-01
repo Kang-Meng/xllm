@@ -27,7 +27,7 @@ limitations under the License.
 #include "framework/kv_cache_transfer/llm_data_dist_transfer.h"
 #endif
 
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(ENABLE_MOONCAKE) && (defined(USE_NPU) || defined(USE_MLU))
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
 
@@ -269,7 +269,9 @@ std::shared_ptr<KVCacheTransfer> KVCacheTransferFactory::create(
 #else
     LOG(FATAL) << "LlmDataDist is not supported on MLU backend.";
 #endif
-  } else if (transfer_type == "Mooncake") {
+  }
+#if defined(ENABLE_MOONCAKE)
+  else if (transfer_type == "Mooncake") {
     std::shared_ptr<MooncakeKVCacheTransferBase> mooncake_transfer;
 #if defined(USE_NPU)
     if (FLAGS_enable_xtensor) {
@@ -297,7 +299,15 @@ std::shared_ptr<KVCacheTransfer> KVCacheTransferFactory::create(
     mooncake_transfer->register_kv_cache(kv_caches, kv_cache_shape, dtype);
 
     transfer = mooncake_transfer;
-  } else {
+  }
+#else
+  else if (transfer_type == "Mooncake") {
+    LOG(FATAL)
+        << "Mooncake KV cache transfer support is disabled at build time "
+        << "(ENABLE_MOONCAKE=OFF).";
+  }
+#endif
+  else {
     LOG(FATAL) << "Unsupported KVCacheTransfer type : " << transfer_type;
   }
 #endif

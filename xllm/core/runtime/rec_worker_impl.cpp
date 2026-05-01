@@ -44,6 +44,9 @@ limitations under the License.
 #include "platform/npu/device_capture_lock.h"
 #endif
 #include "common/version_singleton.h"
+#if defined(ENABLE_MOONCAKE)
+#include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
+#endif
 #include "framework/model_loader.h"
 #include "framework/sampling/rec_constrained_decoding.h"
 #include "framework/sampling/rec_sampler.h"
@@ -1658,10 +1661,12 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
         work_pipelines_[index]->prepare_work_before_execute(input,
                                                             input_on_device);
 
+#if defined(ENABLE_MOONCAKE)
         if (hierarchy_kv_cache_transfer_ != nullptr) {
           hierarchy_kv_cache_transfer_->set_layer_synchronizer(
               input_on_device.input_params);
         }
+#endif
 
         const auto output = work_pipelines_[index]->step(input_on_device);
         promise.setValue(output);

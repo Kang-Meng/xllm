@@ -571,6 +571,14 @@ def parse_arguments() -> dict[str, Any]:
         default='false',
         help='Whether to enable Mooncake HA(high availability) build flags'
     )
+
+    parser.add_argument(
+        '--enable-mooncake',
+        type=str.lower,
+        choices=['true', 'false', '1', '0', 'yes', 'no', 'y', 'n', 'on', 'off'],
+        default='true',
+        help='Whether to enable Mooncake support in the xllm build'
+    )
     
     parser.add_argument(
         '--test-name',
@@ -585,11 +593,13 @@ def parse_arguments() -> dict[str, Any]:
     
     generate_so = args.generate_so.lower() in ('true', '1', 'yes', 'y', 'on')
     enable_ha = args.enable_ha.lower() in ('true', '1', 'yes', 'y', 'on')
+    enable_mooncake = args.enable_mooncake.lower() in ('true', '1', 'yes', 'y', 'on')
 
     return {
         'device': args.device,
         'generate_so': generate_so,
         'enable_ha': enable_ha,
+        'enable_mooncake': enable_mooncake,
         'test_name': args.test_name,
     }
 
@@ -601,9 +611,10 @@ if __name__ == "__main__":
     if device == 'auto':
         device = get_device_type()
     enable_ha = config.get('enable_ha', False)
-    print(f"🚀 Build xllm with CPU arch: {arch}, target device: {device}, enable_ha: {enable_ha}")
+    enable_mooncake = config.get('enable_mooncake', True)
+    print(f"🚀 Build xllm with CPU arch: {arch}, target device: {device}, enable_ha: {enable_ha}, enable_mooncake: {enable_mooncake}")
 
-    pre_build(device, enable_ha)
+    pre_build(device, enable_ha, enable_mooncake)
 
     generate_so = config['generate_so']
     test_name = config.get('test_name')

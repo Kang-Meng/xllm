@@ -26,8 +26,6 @@ limitations under the License.
 #include "forward_params.h"
 #include "framework/eplb/eplb_executor.h"
 #include "framework/kv_cache/kv_cache_shape.h"
-#include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
-#include "framework/kv_cache_transfer/kv_cache_store.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/model/causal_lm.h"
 #include "framework/model/model_input_params.h"
@@ -42,11 +40,17 @@ limitations under the License.
 #include "platform/device.h"
 #include "util/threadpool.h"
 #if defined(USE_NPU)
-#include "framework/kv_cache_transfer/mooncake_weight_transfer.h"
 #include "layers/npu/loader/rolling_load_manager.h"
 #endif
 
 namespace xllm {
+
+#if defined(ENABLE_MOONCAKE)
+class HierarchyKVCacheTransfer;
+#endif
+#if defined(USE_NPU) && defined(ENABLE_MOONCAKE)
+class MooncakeWeightTransfer;
+#endif
 
 class WorkerImpl {
  public:
@@ -283,14 +287,18 @@ class WorkerImpl {
   InstanceRole instance_role_ = InstanceRole::DEFAULT;
 
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
+#if defined(ENABLE_MOONCAKE)
   std::unique_ptr<HierarchyKVCacheTransfer> hierarchy_kv_cache_transfer_;
+#endif
 
 #if defined(USE_CUDA)
   CudaBlockCopyRuntimeState cuda_block_copy_runtime_state_;
 #endif
 
-#if defined(USE_NPU)
+#if defined(USE_NPU) && defined(ENABLE_MOONCAKE)
   std::unique_ptr<MooncakeWeightTransfer> weight_transfer_;
+  std::unique_ptr<Stream> load_stream_;
+#elif defined(USE_NPU)
   std::unique_ptr<Stream> load_stream_;
 #endif
 

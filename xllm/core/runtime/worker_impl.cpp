@@ -51,12 +51,18 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/model_loader.h"
+#if defined(ENABLE_MOONCAKE)
+#include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
+#endif
 #include "framework/parallel_state/npu_cp_ep_padding.h"
 #include "framework/sampling/sampler.h"
 #include "framework/state_dict/state_dict.h"
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
 #if defined(USE_NPU)
+#if defined(ENABLE_MOONCAKE)
+#include "framework/kv_cache_transfer/mooncake_weight_transfer.h"
+#endif
 #include "layers/npu/loader/rolling_weight_buffer.h"
 #endif
 #include "util/net.h"
@@ -150,7 +156,7 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
   }
 #endif
 
-#if defined(USE_NPU)
+#if defined(USE_NPU) && defined(ENABLE_MOONCAKE)
   if (FLAGS_enable_xtensor) {
     if (!weight_transfer_) {
       weight_transfer_ = std::make_unique<MooncakeWeightTransfer>(
@@ -163,6 +169,10 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
       LOG(ERROR) << "Failed to register GlobalXTensor";
     }
   }
+  if (FLAGS_enable_rolling_load) {
+    load_stream_ = device_.get_stream_from_pool();
+  }
+#elif defined(USE_NPU)
   if (FLAGS_enable_rolling_load) {
     load_stream_ = device_.get_stream_from_pool();
   }
@@ -337,26 +347,36 @@ bool WorkerImpl::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
 }
 
 bool WorkerImpl::link_d2d(const std::string& remote_addr) {
-#if defined(USE_NPU)
+#if defined(USE_NPU) && defined(ENABLE_MOONCAKE)
   if (!weight_transfer_) {
     LOG(ERROR) << "MooncakeWeightTransfer not initialized";
     return false;
   }
   return weight_transfer_->link_d2d(remote_addr);
+#elif defined(USE_NPU)
+  static_cast<void>(remote_addr);
+  LOG(ERROR) << "link_d2d requires ENABLE_MOONCAKE=ON in NPU builds";
+  return false;
 #else
+  static_cast<void>(remote_addr);
   LOG(ERROR) << "link_d2d requires USE_NPU build";
   return false;
 #endif
 }
 
 bool WorkerImpl::unlink_d2d(const std::string& remote_addr) {
-#if defined(USE_NPU)
+#if defined(USE_NPU) && defined(ENABLE_MOONCAKE)
   if (!weight_transfer_) {
     LOG(ERROR) << "MooncakeWeightTransfer not initialized";
     return false;
   }
   return weight_transfer_->unlink_d2d(remote_addr);
+#elif defined(USE_NPU)
+  static_cast<void>(remote_addr);
+  LOG(ERROR) << "unlink_d2d requires ENABLE_MOONCAKE=ON in NPU builds";
+  return false;
 #else
+  static_cast<void>(remote_addr);
   LOG(ERROR) << "unlink_d2d requires USE_NPU build";
   return false;
 #endif
@@ -667,9 +687,11 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
   threadpool_.schedule([this,
                         input = std::move(input_on_device),
                         promise = std::move(promise)]() mutable {
+#if defined(ENABLE_MOONCAKE)
     if (hierarchy_kv_cache_transfer_ != nullptr) {
       hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
     }
+#endif
 
     // run the model on the given input in working thread
     if (!enable_schedule_overlap()) {
@@ -802,6 +824,11 @@ bool WorkerImpl::wakeup_local(const WakeupOptions& options) {
 
 #if defined(USE_NPU)
 bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
+#if !defined(ENABLE_MOONCAKE)
+  static_cast<void>(options);
+  LOG(ERROR) << "Remote weight wakeup requires ENABLE_MOONCAKE=ON";
+  return false;
+#else
   // Prefer segment-based transfer if available, fallback to legacy offsets.
   if (FLAGS_enable_rolling_load) {
     LOG(ERROR)
@@ -867,6 +894,7 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
 
   model_->reload_model_weights_from_device();
   return true;
+#endif
 }
 #endif
 
@@ -1100,15 +1128,37 @@ folly::SemiFuture<bool> WorkerImpl::pull_kv_blocks_async(
 uint32_t WorkerImpl::transfer_kv_blocks(
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
+#if !defined(ENABLE_MOONCAKE)
+  static_cast<void>(batch_id);
+  static_cast<void>(block_transfer_info);
+  LOG(ERROR) << "Hierarchy KV cache transfer requires ENABLE_MOONCAKE=ON";
+  return 0;
+#else
+  if (hierarchy_kv_cache_transfer_ == nullptr) {
+    LOG(ERROR) << "Hierarchy KV cache transfer is not initialized";
+    return 0;
+  }
   return hierarchy_kv_cache_transfer_->transfer_kv_blocks(
       batch_id, std::move(block_transfer_info));
+#endif
 }
 
 uint32_t WorkerImpl::transfer_kv_blocks(
     const uint64_t batch_id,
     Slice<BlockTransferInfo>& block_transfer_info) {
+#if !defined(ENABLE_MOONCAKE)
+  static_cast<void>(batch_id);
+  static_cast<void>(block_transfer_info);
+  LOG(ERROR) << "Hierarchy KV cache transfer requires ENABLE_MOONCAKE=ON";
+  return 0;
+#else
+  if (hierarchy_kv_cache_transfer_ == nullptr) {
+    LOG(ERROR) << "Hierarchy KV cache transfer is not initialized";
+    return 0;
+  }
   return hierarchy_kv_cache_transfer_->transfer_kv_blocks(batch_id,
                                                           block_transfer_info);
+#endif
 }
 
 int64_t WorkerImpl::get_active_activation_memory() {
@@ -1119,6 +1169,10 @@ int64_t WorkerImpl::get_active_activation_memory() {
 
 void WorkerImpl::init_hierarchy_kv_cache_transfer() {
   if (options_.host_blocks_factor() > 1.0 || options_.enable_kvcache_store()) {
+#if !defined(ENABLE_MOONCAKE)
+    LOG(FATAL) << "host_blocks_factor/enable_kvcache_store requires "
+               << "ENABLE_MOONCAKE=ON";
+#else
     CHECK(kv_caches_.size() > 0) << "kv_caches is not initialized.";
     HierarchyKVCacheTransfer::Options transfer_options;
     transfer_options
@@ -1137,8 +1191,10 @@ void WorkerImpl::init_hierarchy_kv_cache_transfer() {
         .store_local_hostname(options_.store_local_hostname());
     hierarchy_kv_cache_transfer_ = std::make_unique<HierarchyKVCacheTransfer>(
         transfer_options, device_, &kv_caches_);
+#endif
   }
 }
+
 void WorkerImpl::prepare_mla_prefixcache_inputs(
     ModelInputParams& input_params) {
   int32_t sum_prefix = input_params.kv_cache_tokens_nums.sum().item<int>();
