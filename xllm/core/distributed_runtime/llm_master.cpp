@@ -69,9 +69,9 @@ LLMMaster::LLMMaster(const Options& options)
     if (!xservice_client_->init(options_.etcd_addr().value_or(""),
                                 options_.instance_name().value_or(""),
                                 engine_->block_manager_pool(),
-                                options_.etcd_namespace().value_or("")),
-        options_.offload_batch_size().value_or(
-            std::numeric_limits<uint32_t>::max())) {
+                                options_.etcd_namespace().value_or(""),
+                                options_.offload_batch_size().value_or(
+                                    std::numeric_limits<uint32_t>::max()))) {
       LOG(FATAL) << "XServiceClient init fail!";
       return;
     }

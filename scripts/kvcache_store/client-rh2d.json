@@ -8,8 +8,9 @@
     "ub_protocol_env": {
         "MF_USE_LOCAL_HOST": false,
         "MF_OP_TYPE": "device_sdma",
-        "MF_STORE_URL": "127.0.0.1:7777",
+        "MF_STORE_URL": "tcp://127.0.0.1:7777",
         "MF_DRAM_SIZE": 128849018880,
-        "MF_MAX_DRAM_SIZE": 128849018880
+        "MF_MAX_DRAM_SIZE": 128849018880,
+        "MF_ENABLE_56_BITS_GVA": "TRUE"
     }
 }

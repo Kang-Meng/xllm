@@ -83,9 +83,7 @@ def apply_ub_protocol_env(config: Dict[str, Any]) -> None:
     ub_env = config.get("ub_protocol_env", {})
     for key, value in ub_env.items():
         os.environ[str(key)] = _to_env_value(value)
-
-    if ub_env:
-        print(f"[INFO] Applied {len(ub_env)} env vars from ub_protocol_env.")
+        print(f"[INFO] Applied {key}={value} env vars from ub_protocol_env.")
 
 
 def start_provider(config_path: Optional[str] = None) -> None:

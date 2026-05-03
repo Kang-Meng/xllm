@@ -94,7 +94,7 @@ dependency_name:
   all
 
 device:
-  a2/a3/auto (optional when dependency_name != mooncake)
+  npu/auto (optional when dependency_name != mooncake)
 
 enable_ha:
   true/false (optional, default: false)
@@ -452,7 +452,7 @@ install_mooncake() {
             -DSTORE_USE_ETCD=OFF
         )
     fi
-    if [ "${DEVICE}" = "a2" ] || [ "${DEVICE}" = "a3" ]; then
+    if [ "${DEVICE}" = "npu" ]; then
         cmake_args+=(-DUSE_UB=ON)
     fi
     cmake_args+=("-Dyalantinglibs_DIR=${YALANTING_INSTALL_PREFIX}/lib/cmake/yalantinglibs")
@@ -481,8 +481,8 @@ install_mooncake() {
 install_memfabric() {
     ensure_deps_root_dir
 
-    if [ "${DEVICE}" != "a2" ] && [ "${DEVICE}" != "a3" ]; then
-        print_warning "Skip memfabric_hybrid install for device=${DEVICE:-unknown}; only a2/a3 require memfabric"
+    if [ "${DEVICE}" != "npu" ]; then
+        print_warning "Skip memfabric_hybrid install for device=${DEVICE:-unknown}; only npu require memfabric"
         return
     fi
 
