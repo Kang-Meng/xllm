@@ -34,7 +34,7 @@ MOONCAKE_INSTALL_DIR="/usr/local/lib/python3.11/site-packages/mooncake"
 
 MEMFABRIC_REPO_URL="https://gitcode.com/xLLM-AI/memfabric_hybrid.git"
 MEMFABRIC_REPO_DIR="${DEPS_ROOT_DIR}/memfabric_hybrid"
-MEMFABRIC_TARGET_COMMIT="dcc6d3a19a815eabc4703b5d52692babcdb09f8c"
+MEMFABRIC_TARGET_COMMIT="3a5cc8ad7a85be696ed5c91e038794a20e360665"
 MEMFABRIC_INSTALL_DIR="/usr/local/memfabric_hybrid"
 MEMFABRIC_INSTALLER="output/memfabric_hybrid-1.1.0_linux_aarch64.run"
 
