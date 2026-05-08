@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/framework/xtensor/global_xtensor.h"
 #include "core/framework/xtensor/options.h"
 #include "core/framework/xtensor/xtensor_allocator.h"
+#include "core/runtime/xservice_client.h"
 #include "core/util/device_name_utils.h"
 #include "core/util/net.h"
 #include "core/util/utils.h"
@@ -397,12 +398,20 @@ int run() {
         std::make_unique<APIService>(master.get(), model_names, model_versions);
     auto xllm_server =
         ServerRegistry::get_instance().register_server("HttpServer");
+    if (FLAGS_enable_service_routing) {
+      xllm_server->set_shutdown_hook(
+          []() { XServiceClient::get_instance()->shutdown(); });
+    }
 
     // start brpc server
     if (!xllm_server->start(std::move(api_service))) {
       LOG(ERROR) << "Failed to start brpc server on port " << FLAGS_port;
       return -1;
     }
+  }
+
+  if (FLAGS_enable_service_routing) {
+    XServiceClient::get_instance()->shutdown();
   }
 
   return 0;
