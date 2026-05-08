@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/common/metrics.h"
 #include "core/common/options.h"
 #include "core/common/types.h"
+#include "core/common/xservice_shutdown_policy.h"
 #include "core/distributed_runtime/dit_master.h"
 #include "core/distributed_runtime/master.h"
 #include "core/framework/xtensor/global_xtensor.h"
@@ -300,14 +301,15 @@ int run() {
       .etcd_addr(FLAGS_etcd_addr)
       .etcd_namespace(FLAGS_etcd_namespace)
       .offload_batch_size(std::optional<uint32_t>(FLAGS_offload_batch_size))
-      .enable_service_routing(FLAGS_enable_service_routing ||
-                              FLAGS_enable_disagg_pd)
+      .enable_service_routing(should_enable_xservice_shutdown(
+          FLAGS_enable_service_routing, FLAGS_enable_disagg_pd))
       .tool_call_parser(FLAGS_tool_call_parser)
       .reasoning_parser(FLAGS_reasoning_parser)
       .priority_strategy(FLAGS_priority_strategy)
       .enable_online_preempt_offline(FLAGS_enable_online_preempt_offline)
       .enable_cache_upload(
-          (FLAGS_enable_service_routing || FLAGS_enable_disagg_pd) &&
+          should_enable_xservice_shutdown(FLAGS_enable_service_routing,
+                                          FLAGS_enable_disagg_pd) &&
           FLAGS_enable_prefix_cache && FLAGS_enable_cache_upload)
       .host_blocks_factor(FLAGS_host_blocks_factor)
       .enable_kvcache_store(FLAGS_enable_kvcache_store &&
@@ -398,7 +400,7 @@ int run() {
         std::make_unique<APIService>(master.get(), model_names, model_versions);
     auto xllm_server =
         ServerRegistry::get_instance().register_server("HttpServer");
-    if (FLAGS_enable_service_routing) {
+    if (options.enable_service_routing()) {
       xllm_server->set_shutdown_hook(
           []() { XServiceClient::get_instance()->shutdown(); });
     }
@@ -410,7 +412,7 @@ int run() {
     }
   }
 
-  if (FLAGS_enable_service_routing) {
+  if (options.enable_service_routing()) {
     XServiceClient::get_instance()->shutdown();
   }
 

@@ -47,6 +47,7 @@ limitations under the License.
 #include "runtime/forward_params.h"
 #include "runtime/worker.h"
 #include "server/xllm_server_registry.h"
+#include "signal_policy.h"
 #include "util/net.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
@@ -311,9 +312,14 @@ WorkerServer::WorkerServer(int local_worker_idx,
                           worker_type);
       return;
     } else {
-      // worker process should handle SIGTREM and SIGINT signals.
-      signal(SIGINT, handle_signal);
-      signal(SIGTERM, handle_signal);
+      if (should_install_worker_exit_signal_handler(options)) {
+        // Worker-only processes can exit immediately on SIGINT/SIGTERM.
+        signal(SIGINT, handle_signal);
+        signal(SIGTERM, handle_signal);
+      } else {
+        LOG(INFO) << "Skip WorkerServer exit signal handler because "
+                  << "service routing requires graceful master shutdown.";
+      }
 
       std::unique_ptr<ForwardSharedMemoryManager> input_shm_manager = nullptr;
       std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager = nullptr;

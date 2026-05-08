@@ -18,6 +18,7 @@ cc_library(
     types.h
     device_monitor.h
     version_singleton.h
+    xservice_shutdown_policy.h
   SRCS
     etcd_client.cpp
     global_flags.cpp
@@ -64,6 +65,15 @@ cc_test(
     GTest::gtest_main
     gflags::gflags
     glog::glog
+)
+
+cc_test(
+  NAME
+    xservice_shutdown_policy_test
+  SRCS
+    xservice_shutdown_policy_test.cpp
+  DEPS
+    GTest::gtest_main
 )
 target_link_libraries(common PRIVATE OpenSSL::SSL OpenSSL::Crypto protobuf::libprotobuf)
 add_dependencies(common brpc-static)

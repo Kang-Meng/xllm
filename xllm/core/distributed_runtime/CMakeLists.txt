@@ -1,4 +1,5 @@
 include(cc_library)
+include(cc_test)
 
 if(USE_NPU OR USE_CUDA)
   include_directories(
@@ -14,6 +15,7 @@ cc_library(
   HDRS
     engine.h
     master.h
+    signal_policy.h
     dit_engine.h
     dit_master.h
     llm_engine.h
@@ -122,4 +124,15 @@ cc_library(
     :chat_template
     glog::glog
     $<$<BOOL:${USE_MLU}>:torch_mlu>
+)
+
+cc_test(
+  NAME
+    signal_policy_test
+  SRCS
+    signal_policy_test.cpp
+  DEPS
+    :runtime
+    GTest::gtest_main
+    torch
 )
