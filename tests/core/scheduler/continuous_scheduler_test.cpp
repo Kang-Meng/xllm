@@ -12,6 +12,7 @@
 #include "distributed_runtime/engine.h"
 #include "prefill_only_scheduler.h"
 #include "request_priority_queue.h"
+#include "scheduler/step_trace_utils.h"
 #include "scheduler_factory.h"
 #include "util/utils.h"
 
@@ -767,6 +768,76 @@ TEST(BlockManagerPoolTest, AllocateFailureRollsBackSharedPrefixBlocks) {
   EXPECT_EQ(later_sequence->kv_state().num_kv_blocks(), 1);
 
   (void)engine.release();
+}
+
+TEST(StepTraceQlenTest, UsesPromptTokenSumForChunkedPrefill) {
+  auto requests = generate_request({10, 12},
+                                   {8, 8},
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   1024);
+  set_chunk_kv(requests[0], 4);
+  set_chunk_kv(requests[1], 3);
+
+  std::vector<Sequence*> sequences;
+  std::vector<size_t> budgets;
+  for (const auto& request : requests) {
+    sequences.emplace_back(request->sequences()[0].get());
+  }
+  budgets.push_back(5);
+  budgets.push_back(4);
+
+  const int64_t qlen =
+      compute_step_qlen(sequences, budgets, BatchForwardType::CHUNKED_PREFILL);
+  EXPECT_EQ(qlen, 9);
+}
+
+TEST(StepTraceQlenTest, UsesSequenceCountForDecode) {
+  auto requests = generate_request({10, 12, 14},
+                                   {8, 8, 8},
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   1024);
+  for (const auto& request : requests) {
+    make_request_decode_ready(request);
+  }
+
+  std::vector<Sequence*> sequences;
+  std::vector<size_t> budgets;
+  for (const auto& request : requests) {
+    sequences.emplace_back(request->sequences()[0].get());
+    budgets.push_back(1);
+  }
+
+  const int64_t qlen =
+      compute_step_qlen(sequences, budgets, BatchForwardType::DECODE);
+  EXPECT_EQ(qlen, 3);
+}
+
+TEST(StepTraceQlenTest, UsesBatchAllowedTokensForChunkedPrefill) {
+  Batch batch;
+  auto requests = generate_request({10, 12},
+                                   {8, 8},
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   1024);
+  set_chunk_kv(requests[0], 4);
+  set_chunk_kv(requests[1], 3);
+
+  batch.add(requests[0]->sequences()[0].get(), 5);
+  batch.add(requests[1]->sequences()[0].get(), 4);
+  std::vector<Batch> batches;
+  batches.emplace_back(batch);
+
+  const int64_t qlen =
+      compute_step_qlen(batches, BatchForwardType::CHUNKED_PREFILL);
+  EXPECT_EQ(qlen, 9);
 }
 
 }  // namespace xllm

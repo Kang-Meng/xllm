@@ -20,6 +20,8 @@ cc_library(
     prefill_only_scheduler.h
     scheduler_factory.h
     request_priority_queue.h
+    step_trace_dumper.h
+    step_trace_utils.h
     perf_model.h
     fixed_steps_scheduler.h
   SRCS
@@ -34,6 +36,8 @@ cc_library(
     dit_scheduler.cpp
     prefill_only_scheduler.cpp
     scheduler_factory.cpp
+    step_trace_dumper.cpp
+    step_trace_utils.cpp
     perf_model.cpp
     fixed_steps_scheduler.cpp
   DEPS

@@ -272,6 +272,27 @@ DEFINE_bool(enable_forward_interruption,
             false,
             "Whether to enable forward interruption.");
 
+DEFINE_bool(enable_step_trace_dump,
+            false,
+            "Whether to enable scheduler step trace dumping.");
+
+DEFINE_string(step_trace_dump_file,
+              "",
+              "TSV file path for scheduler step trace dumping.");
+
+DEFINE_int32(step_trace_dump_queue_size,
+             65536,
+             "Queue size for scheduler step trace dumping.");
+
+DEFINE_int32(
+    step_trace_dump_flush_interval_ms,
+    1000,
+    "Flush interval in milliseconds for scheduler step trace dumping.");
+
+DEFINE_int32(step_trace_dump_flush_batch_size,
+             1024,
+             "Flush batch size for scheduler step trace dumping.");
+
 DEFINE_int32(max_global_ttft_ms,
              std::numeric_limits<int32_t>::max(),
              "all requests use single global ttft");

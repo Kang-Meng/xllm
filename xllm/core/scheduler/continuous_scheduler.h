@@ -35,6 +35,7 @@ limitations under the License.
 #include "scheduler.h"
 #include "scheduler/profile/profile_manager.h"
 #include "scheduler/request_priority_queue.h"
+#include "scheduler/step_trace_dumper.h"
 
 namespace xllm {
 class Engine;
@@ -248,6 +249,8 @@ class ContinuousScheduler : public Scheduler {
 
   int32_t min_speculative_tokens_required_ = 0;
 
+  std::unique_ptr<StepTraceDumper> step_trace_dumper_;
+
   virtual void handle_prefill_requests(
       double& latency_budget,
       double& estimate_latency,
@@ -320,6 +323,11 @@ class ContinuousScheduler : public Scheduler {
   void step_with_schedule_overlap(const absl::Duration& timeout);
 
   void step_with_pd_ooc(std::vector<Batch>& batch);
+
+  void maybe_dump_step_trace(const std::vector<Batch>& batch,
+                             const BatchForwardType& batch_forward_type,
+                             int64_t step_start_ts_us,
+                             double step_latency_ms);
 
   void refresh_sequences_from_requests(
       const std::vector<std::shared_ptr<Request>>& requests,

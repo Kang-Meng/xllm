@@ -233,6 +233,16 @@ DECLARE_bool(disable_ttft_profiling);
 
 DECLARE_bool(enable_forward_interruption);
 
+DECLARE_bool(enable_step_trace_dump);
+
+DECLARE_string(step_trace_dump_file);
+
+DECLARE_int32(step_trace_dump_queue_size);
+
+DECLARE_int32(step_trace_dump_flush_interval_ms);
+
+DECLARE_int32(step_trace_dump_flush_batch_size);
+
 DECLARE_int32(max_global_ttft_ms);
 
 DECLARE_int32(max_global_tpot_ms);

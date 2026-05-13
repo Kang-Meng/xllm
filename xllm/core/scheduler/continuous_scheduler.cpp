@@ -38,6 +38,7 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
 #include "scheduler/request_priority_queue.h"
+#include "scheduler/step_trace_utils.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -150,6 +151,14 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
     min_speculative_tokens_required_ = options_.num_speculative_tokens() * 2;
   } else {
     min_speculative_tokens_required_ = options_.num_speculative_tokens();
+  }
+
+  if (FLAGS_enable_step_trace_dump && !FLAGS_step_trace_dump_file.empty()) {
+    step_trace_dumper_ = std::make_unique<StepTraceDumper>(
+        FLAGS_step_trace_dump_file,
+        FLAGS_step_trace_dump_queue_size,
+        FLAGS_step_trace_dump_flush_interval_ms,
+        FLAGS_step_trace_dump_flush_batch_size);
   }
 }
 
@@ -1192,10 +1201,30 @@ void ContinuousScheduler::step(const absl::Duration& timeout) {
       return;
     }
 
+    BatchForwardType batch_forward_type = BatchForwardType::EMPTY;
+    for (const Batch& one_batch : batch) {
+      if (!one_batch.empty()) {
+        batch_forward_type = one_batch.batch_forward_type();
+        break;
+      }
+    }
+
     if (!options_.enable_pd_ooc()) {
+      const int64_t step_start_ts_us = absl::ToUnixMicros(absl::Now());
+      Timer timer;
       engine_->step(batch);
+      maybe_dump_step_trace(batch,
+                            batch_forward_type,
+                            step_start_ts_us,
+                            timer.elapsed_milliseconds());
     } else {
+      const int64_t step_start_ts_us = absl::ToUnixMicros(absl::Now());
+      Timer timer;
       step_with_pd_ooc(batch);
+      maybe_dump_step_trace(batch,
+                            batch_forward_type,
+                            step_start_ts_us,
+                            timer.elapsed_milliseconds());
     }
 
     // process request output in batch
@@ -1221,8 +1250,22 @@ void ContinuousScheduler::step_with_schedule_overlap(
     return;
   }
 
+  BatchForwardType batch_forward_type = BatchForwardType::EMPTY;
+  for (const Batch& one_batch : batch) {
+    if (!one_batch.empty()) {
+      batch_forward_type = one_batch.batch_forward_type();
+      break;
+    }
+  }
+
   if (!cur_batch_all_empty) {
+    const int64_t step_start_ts_us = absl::ToUnixMicros(absl::Now());
+    Timer timer;
     engine_->step(batch);
+    maybe_dump_step_trace(batch,
+                          batch_forward_type,
+                          step_start_ts_us,
+                          timer.elapsed_milliseconds());
   }
 
   // producer-consumer mode, make sure only one step is scheduled in advance
@@ -1434,22 +1477,23 @@ void ContinuousScheduler::step_with_pd_ooc(std::vector<Batch>& batch) {
     }
   }
 
-  auto start = std::chrono::high_resolution_clock::now();
   engine_->step(batch);
-  auto end = std::chrono::high_resolution_clock::now();
-  double duration_ms =
-      std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-          .count() /
-      1000.0;
+}
 
-  std::stringstream ss;
-  ss << "bs=" << last_batch_lengths_.size() << " - [";
-  for (size_t i = 0; i < last_batch_lengths_.size(); ++i) {
-    ss << last_batch_lengths_[i];
-    if (i != last_batch_lengths_.size() - 1) ss << ", ";
+void ContinuousScheduler::maybe_dump_step_trace(
+    const std::vector<Batch>& batch,
+    const BatchForwardType& batch_forward_type,
+    int64_t step_start_ts_us,
+    double step_latency_ms) {
+  if (step_trace_dumper_ == nullptr || batch_forward_type.is_empty()) {
+    return;
   }
-  ss << "]";
-  VLOG(1) << "PERF - " << ss.str() << " - " << std::fixed
-          << std::setprecision(3) << duration_ms << " ms";
+
+  StepTraceRecord record;
+  record.ts_us = step_start_ts_us;
+  record.batch_forward_type = batch_forward_type;
+  record.qlen = compute_step_qlen(batch, batch_forward_type);
+  record.step_latency_ms = step_latency_ms;
+  step_trace_dumper_->try_enqueue(record);
 }
 }  // namespace xllm
