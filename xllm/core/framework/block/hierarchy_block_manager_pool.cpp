@@ -134,24 +134,30 @@ void HierarchyBlockManagerPool::offload_direct(Sequence* sequence,
     return;
   }
 
-  size_t cached_block_num = sequence->kv_state().shared_kv_blocks_num();
+  size_t offloaded_block_num = sequence->offloaded_kv_blocks_num();
 
   size_t full_block_num = token_ids.size() / options_.block_size();
 
-  uint32_t need_offload_num = full_block_num - cached_block_num;
+  DCHECK(offloaded_block_num <= full_block_num);
+
+  size_t need_offload_num = full_block_num - offloaded_block_num;
 
   if (need_offload_num < sequence->get_offload_batch_size() && !finish) {
     return;
   }
 
-  sequence->kv_state().incr_shared_kv_blocks_num(need_offload_num);
-
-  for (size_t i = cached_block_num; i < full_block_num; i++) {
+  size_t queued_offload_num = 0;
+  for (size_t i = offloaded_block_num; i < full_block_num; i++) {
     if (blocks->at(i).ref_count() != 2) {
-      continue;
+      break;
     }
     auto block_pair = std::make_shared<OffloadBlockPair>(blocks->at(i));
     offload_block_pair_queues_[dp_rank].enqueue(std::move(block_pair));
+    ++queued_offload_num;
+  }
+
+  if (queued_offload_num > 0) {
+    sequence->incr_offloaded_kv_blocks_num(queued_offload_num);
   }
 
   if (finish) {
@@ -225,13 +231,13 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   switch (stage) {
     case SequenceStage::PREFILL:
-    case SequenceStage::CHUNKED_PREFILL:
       if (options_.enable_host_blocks()) {
         load_via_host(sequence, num_tokens);
       } else {
         load_direct(sequence, num_tokens);
       }
       break;
+    case SequenceStage::CHUNKED_PREFILL:
     case SequenceStage::DECODE:
       if (options_.enable_host_blocks()) {
         offload_via_host(sequence, false);
@@ -278,7 +284,7 @@ void HierarchyBlockManagerPool::load_direct(Sequence* sequence,
   auto blocks = sequence->kv_state().mutable_kv_blocks();
   const auto& store_matched_blocks = sequence->host_kv_state().kv_blocks();
   uint32_t store_shared_num = 0;
-  if (!store_matched_blocks.empty()) {
+  if (sequence->is_matched_in_store()) {
     // only for chunked prefill, shared blocks in store are already checked in
     // allocate_shared -> allocate_direct_shared, and stored in
     // sequence->host_kv_state().kv_blocks()
@@ -321,6 +327,7 @@ void HierarchyBlockManagerPool::load_direct(Sequence* sequence,
                                                   options_.block_size());
     BlockManagerPool::cache(sequence);
     sequence->kv_state().incr_shared_kv_blocks_num(store_shared_num);
+    sequence->set_offloaded_kv_blocks_num(store_shared_num);
   }
 }
 
@@ -353,22 +360,19 @@ void HierarchyBlockManagerPool::allocate_host_shared(Sequence* sequence) {
 }
 
 void HierarchyBlockManagerPool::allocate_direct_shared(Sequence* sequence) {
-  if (sequence->host_kv_state().num_kv_blocks() == 0 &&
+  // each sequence should only be called once
+  if (!sequence->is_matched_in_store() &&
       sequence->stage() != SequenceStage::DECODE) {
+    sequence->matched_in_store();
     size_t token_size = sequence->tokens().size();
     size_t block_num =
         (token_size + options_.block_size() - 1) / options_.block_size() - 1;
-    auto shared_blocks_num = sequence->kv_state().shared_kv_blocks_num();
-    if (shared_blocks_num + 1 >= block_num) {
-      return;
-    }
     std::vector<Block> blocks(block_num, Block(options_.block_size()));
 
-    uint32_t unshared_count =
-        PrefixCache::compute_hash_keys(sequence->tokens(), blocks, 0);
+    PrefixCache::compute_hash_keys(sequence->tokens(), blocks, 0);
 
     std::vector<uint8_t*> keys;
-    keys.reserve(unshared_count);
+    keys.reserve(block_num);
     for (int i = 0; i < block_num; i++) {
       keys.emplace_back(blocks[i].get_mutable_hash_value());
     }
@@ -385,6 +389,7 @@ void HierarchyBlockManagerPool::allocate_direct_shared(Sequence* sequence) {
       sequence->host_kv_state().incr_shared_kv_blocks_num(store_shared_num);
       sequence->host_kv_state().incr_kv_cache_tokens_num(store_shared_num *
                                                          options_.block_size());
+      sequence->set_offloaded_kv_blocks_num(store_shared_num);
     }
 
     int64_t int_rate_percent =

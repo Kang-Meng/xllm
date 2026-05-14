@@ -408,6 +408,16 @@ class Sequence final {
     offload_batch_size_ = offload_batch_size;
   }
   uint32_t get_offload_batch_size() { return offload_batch_size_; }
+  size_t offloaded_kv_blocks_num() const { return offloaded_kv_blocks_num_; }
+  void set_offloaded_kv_blocks_num(size_t offloaded_kv_blocks_num) {
+    offloaded_kv_blocks_num_ = offloaded_kv_blocks_num;
+  }
+  void incr_offloaded_kv_blocks_num(size_t num) {
+    offloaded_kv_blocks_num_ += num;
+  }
+
+  void matched_in_store() { is_matched_in_store_ = true; }
+  bool is_matched_in_store() { return is_matched_in_store_; }
 
  private:
   void record_first_token(const Token& token);
@@ -558,6 +568,9 @@ class Sequence final {
   bool updated_since_last_beam_search_ = false;
 
   uint32_t offload_batch_size_ = std::numeric_limits<uint32_t>::max();
+  size_t offloaded_kv_blocks_num_ = 0;
+
+  bool is_matched_in_store_ = false;
 };
 
 }  // namespace xllm

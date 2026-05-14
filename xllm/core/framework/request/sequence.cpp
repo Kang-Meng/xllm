@@ -291,6 +291,9 @@ Sequence::Sequence(const Sequence& other)
       first_token_(other.first_token_),
       is_pre_scheduled_step_prefill_(other.is_pre_scheduled_step_prefill_),
       updated_since_last_beam_search_(other.updated_since_last_beam_search_),
+      offload_batch_size_(other.offload_batch_size_),
+      is_matched_in_store_(other.is_matched_in_store_),
+      offloaded_kv_blocks_num_(other.offloaded_kv_blocks_num_),
       termination_flag_(std::make_shared<std::atomic<int32_t>>(INT32_MAX)) {
   logprob_state_ = std::make_unique<LogprobState>(*other.logprob_state_);
 }
@@ -687,6 +690,8 @@ void Sequence::reset() {
   is_timeout_set_ = false;
   volatile_num_prompt_tokens_ = num_tokens_;
   single_block_ = Block();
+  offloaded_kv_blocks_num_ = 0;
+  is_matched_in_store_ = false;
 }
 
 void Sequence::add_shared_kv_blocks(std::vector<Block>&& blocks) {

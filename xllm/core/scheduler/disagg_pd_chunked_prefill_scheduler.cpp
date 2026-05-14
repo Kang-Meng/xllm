@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "common/global_flags.h"
 #include "framework/batch/batch_factory.h"
 #include "util/utils.h"
 
@@ -61,9 +62,33 @@ PDChunkBudget pick_pd_chunk_budget(size_t kv_tokens,
 DisaggPDChunkedPrefillScheduler::DisaggPDChunkedPrefillScheduler(
     Engine* engine,
     const Options& options)
-    : DisaggPDScheduler(engine, options) {
-  CHECK(!enable_prefix_cache_)
-      << "disagg pd chunked prefill scheduler does not support prefix cache";
+    : DisaggPDScheduler(engine, options) {}
+
+void DisaggPDChunkedPrefillScheduler::allocate_shared_blocks_for(
+    Sequence* sequence) {
+  if (sequence->kv_state().num_kv_blocks() == 0) {
+    kv_cache_manager_->allocate_shared(sequence);
+    return;
+  }
+  if (sequence->is_chunked_prefill_stage()) {
+    const size_t max_tokens_per_chunk_for_prefill =
+        std::max(options_.max_tokens_per_chunk_for_prefill(), 64);
+    size_t total_chunked_size =
+        (sequence->num_tokens() + max_tokens_per_chunk_for_prefill - 1) /
+        max_tokens_per_chunk_for_prefill;
+    if (total_chunked_size < FLAGS_chunked_match_frequency) {
+      kv_cache_manager_->allocate_shared(sequence);
+      return;
+    }
+    size_t prefix_cache_interval =
+        (total_chunked_size + FLAGS_chunked_match_frequency - 1) /
+        FLAGS_chunked_match_frequency;
+    size_t cur_chunked_index = sequence->kv_state().kv_cache_tokens_num() /
+                               max_tokens_per_chunk_for_prefill;
+    if (cur_chunked_index % prefix_cache_interval == 0) {
+      kv_cache_manager_->allocate_shared(sequence);
+    }
+  }
 }
 
 bool DisaggPDChunkedPrefillScheduler::alloc_chunk(Sequence* sequence,
@@ -71,6 +96,8 @@ bool DisaggPDChunkedPrefillScheduler::alloc_chunk(Sequence* sequence,
                                                   size_t* actual_tokens) {
   CHECK(sequence != nullptr);
   CHECK(actual_tokens != nullptr);
+
+  allocate_shared_blocks_for(sequence);
 
   const size_t kv_tokens = sequence->kv_cache_tokens_num();
   const PDChunkBudget budget = pick_pd_chunk_budget(
@@ -216,12 +243,26 @@ std::vector<Batch> DisaggPDChunkedPrefillScheduler::prepare_batch() {
   }
 
   if (running_sequences_.empty()) {
+    kv_cache_manager_->transfer_blocks();
     return {};
   }
 
-  return BatchFactory::get_instance(options_.dp_size())
-      ->create_batches(
-          running_requests_, running_sequences_, running_sequences_budgets_);
+  std::vector<Batch> batches = BatchFactory::get_instance(options_.dp_size())
+                                   ->create_batches(running_requests_,
+                                                    running_sequences_,
+                                                    running_sequences_budgets_);
+
+  bool is_batches_empty =
+      std::all_of(batches.begin(), batches.end(), [](const Batch& batch) {
+        return batch.empty();
+      });
+  if (!is_batches_empty) {
+    kv_cache_manager_->transfer_blocks(batches);
+  } else {
+    kv_cache_manager_->transfer_blocks();
+  }
+
+  return batches;
 }
 
 }  // namespace xllm

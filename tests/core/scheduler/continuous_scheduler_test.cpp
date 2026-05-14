@@ -1,14 +1,18 @@
 #include "continuous_scheduler.h"
 
 #include <absl/time/clock.h>
+#include <google/protobuf/service.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <optional>
 
 #include "chunked_prefill_scheduler.h"
 #include "core/common/global_flags.h"
+#include "disagg_pd_scheduler.h"
 #include "distributed_runtime/engine.h"
 #include "prefill_only_scheduler.h"
 #include "request_priority_queue.h"
@@ -19,6 +23,16 @@
 namespace xllm {
 
 namespace {
+bool wait_until(const std::function<bool()>& predicate) {
+  for (int32_t i = 0; i < 100; ++i) {
+    if (predicate()) {
+      return true;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  return predicate();
+}
+
 class FakeTokenizer : public Tokenizer {
  public:
   bool encode(const std::string_view& text,
@@ -68,6 +82,119 @@ class FakeEngine : public Engine {
  private:
   std::unique_ptr<Tokenizer> fake_tokenizer_;
   std::unique_ptr<BlockManagerPool> fake_block_manager_;
+};
+
+BlockManagerPool::Options make_counting_block_manager_options() {
+  BlockManagerPool::Options options;
+  options.num_blocks(16).host_num_blocks(0).block_size(4).enable_prefix_cache(
+      true);
+  return options;
+}
+
+class CountingBlockManagerPool final : public BlockManagerPool {
+ public:
+  CountingBlockManagerPool()
+      : BlockManagerPool(make_counting_block_manager_options(),
+                         /*dp_size=*/1) {}
+
+  void cache(Sequence* sequence) override {
+    CHECK(sequence != nullptr);
+    cache_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void deallocate(Request* request) override {
+    CHECK(request != nullptr);
+    request_deallocate_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  int32_t cache_count() const {
+    return cache_count_.load(std::memory_order_relaxed);
+  }
+
+  int32_t request_deallocate_count() const {
+    return request_deallocate_count_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<int32_t> cache_count_{0};
+  std::atomic<int32_t> request_deallocate_count_{0};
+};
+
+class CountingEngine final : public Engine {
+ public:
+  CountingEngine() {
+    fake_tokenizer_ = std::make_unique<FakeTokenizer>();
+    fake_block_manager_ = std::make_unique<CountingBlockManagerPool>();
+  }
+
+  ForwardOutput step(std::vector<Batch>& batch) override { NOT_IMPLEMENTED(); }
+  void update_last_step_result(std::vector<Batch>& batch) override {
+    NOT_IMPLEMENTED();
+  }
+  const Tokenizer* tokenizer() const override { return fake_tokenizer_.get(); }
+  BlockManagerPool* block_manager_pool() const override {
+    return fake_block_manager_.get();
+  }
+  const ModelArgs& model_args() const override { NOT_IMPLEMENTED(); }
+  const TokenizerArgs& tokenizer_args() const override { NOT_IMPLEMENTED(); }
+  std::vector<int64_t> get_active_activation_memory() const override {
+    NOT_IMPLEMENTED();
+  }
+  bool init() override { return true; }
+
+  CountingBlockManagerPool* counting_block_manager() const {
+    return fake_block_manager_.get();
+  }
+
+ private:
+  std::unique_ptr<Tokenizer> fake_tokenizer_;
+  std::unique_ptr<CountingBlockManagerPool> fake_block_manager_;
+};
+
+class CountingRpcChannel final : public google::protobuf::RpcChannel {
+ public:
+  void CallMethod(const google::protobuf::MethodDescriptor* method,
+                  google::protobuf::RpcController* controller,
+                  const google::protobuf::Message* request,
+                  google::protobuf::Message* response,
+                  google::protobuf::Closure* done) override {
+    (void)controller;
+    (void)request;
+    CHECK(method != nullptr);
+    if (method->name() == "FirstGeneration") {
+      first_generation_calls_.fetch_add(1, std::memory_order_relaxed);
+    }
+    auto* status = static_cast<proto::Status*>(response);
+    status->set_ok(true);
+    if (done != nullptr) {
+      done->Run();
+    }
+  }
+
+  int32_t first_generation_calls() const {
+    return first_generation_calls_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<int32_t> first_generation_calls_{0};
+};
+
+class TestableDisaggPDScheduler final : public DisaggPDScheduler {
+ public:
+  TestableDisaggPDScheduler(Engine* engine, const Options& options)
+      : DisaggPDScheduler(engine, options) {}
+
+  void set_running_request(const std::shared_ptr<Request>& request,
+                           proto::DisaggPDService_Stub* stub) {
+    CHECK(request != nullptr);
+    CHECK(stub != nullptr);
+    running_requests_.push_back(request);
+    running_sequences_.push_back(request->sequences()[0].get());
+    running_sequences_budgets_.push_back(1);
+
+    std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
+    req_to_channel_map_[request->request_id()] = stub;
+  }
 };
 
 class ScopedBoolFlagValue {
@@ -375,6 +502,50 @@ TEST(SchedulerFactoryTest, DisaggPDOOCKeepsPDOOCKind) {
   opt.enable_chunked_prefill() = true;
 
   EXPECT_EQ(select_scheduler_kind(opt), SchedulerKind::PD_OOC);
+}
+
+TEST(DisaggPDSchedulerTest,
+     PrefillSendFirstGenerationLeavesPrefixCacheToDeallocate) {
+  ScopedBoolFlagValue enable_disagg_pd(FLAGS_enable_disagg_pd, true);
+  ScopedBoolFlagValue enable_prefix_cache(FLAGS_enable_prefix_cache, true);
+
+  ContinuousScheduler::Options options =
+      create_scheduler_options(16, 4, 0, 1024, 1);
+  options.enable_disagg_pd() = true;
+  options.enable_pd_ooc() = true;
+  options.enable_schedule_overlap() = false;
+  options.instance_role() = InstanceRole::PREFILL;
+
+  CountingEngine engine;
+  TestableDisaggPDScheduler scheduler(&engine, options);
+
+  auto request = generate_request_with_prompt_tokens(
+      /*prompt_token_ids=*/{1, 2, 3, 4},
+      /*max_tokens=*/2,
+      /*max_context_len=*/16);
+  request->state().stream = true;
+  auto& sequence = request->sequences()[0];
+  int32_t dp_rank = sequence->dp_rank();
+  sequence->add_kv_blocks(engine.counting_block_manager()->allocate(
+      sequence->num_prompt_tokens(), dp_rank));
+  sequence->set_dp_rank(dp_rank);
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  sequence->append_token(Token(5));
+  ASSERT_EQ(sequence->num_generated_tokens(), 1u);
+  ASSERT_TRUE(sequence->first_token().has_value());
+
+  auto channel = std::make_unique<CountingRpcChannel>();
+  proto::DisaggPDService_Stub stub(channel.get());
+  scheduler.set_running_request(request, &stub);
+
+  scheduler.prefill_send_first_generation();
+
+  ASSERT_TRUE(wait_until([&engine]() {
+    return engine.counting_block_manager()->request_deallocate_count() == 1;
+  }));
+  EXPECT_EQ(channel->first_generation_calls(), 1);
+  EXPECT_EQ(engine.counting_block_manager()->request_deallocate_count(), 1);
+  EXPECT_EQ(engine.counting_block_manager()->cache_count(), 0);
 }
 
 // TEST-1:

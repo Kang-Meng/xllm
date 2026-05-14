@@ -20,6 +20,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -43,11 +44,14 @@ class BatchInputBuilderTestPeer final {
   static TransferKVInfo build_step_transfer_info(
       const TransferKVInfo& full_info,
       const std::vector<uint64_t>& local_block_ids,
-      uint32_t n_kv_cache_tokens,
-      uint32_t seq_len,
+      uint32_t transfer_begin_tokens,
+      uint32_t transfer_end_tokens,
       uint32_t block_size) {
-    return BatchInputBuilder::build_step_transfer_info(
-        full_info, local_block_ids, n_kv_cache_tokens, seq_len, block_size);
+    return BatchInputBuilder::build_step_transfer_info(full_info,
+                                                       local_block_ids,
+                                                       transfer_begin_tokens,
+                                                       transfer_end_tokens,
+                                                       block_size);
   }
 };
 
@@ -190,6 +194,36 @@ TEST(BatchInputBuilderTest, SharedPrefixSlicesXTensorOffsets) {
             (std::vector<uint64_t>{3000, 3001}));
   EXPECT_EQ(info.dst_xtensor_layer_offsets[1].v_offsets,
             (std::vector<uint64_t>{4000, 4001}));
+}
+
+TEST(BatchInputBuilderTest, TransferCursorPushesPrefillMatchedBlocks) {
+  TransferKVInfo full_info = make_info({102, 103, 104});
+  full_info.local_blocks_ids = {0, 0, 0, 0, 0};
+
+  const TransferKVInfo info =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info,
+          /*local_block_ids=*/{10, 11, 12, 13, 14},
+          /*transfer_begin_tokens=*/32,
+          /*transfer_end_tokens=*/64,
+          /*block_size=*/16);
+
+  expect_blocks(info, {12, 13}, {102, 103});
+}
+
+TEST(BatchInputBuilderTest, TransferCursorSkipsDecodeSharedPrefix) {
+  TransferKVInfo full_info = make_info({104});
+  full_info.local_blocks_ids = {0, 0, 0, 0, 0};
+
+  const TransferKVInfo info =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info,
+          /*local_block_ids=*/{10, 11, 12, 13},
+          /*transfer_begin_tokens=*/32,
+          /*transfer_end_tokens=*/64,
+          /*block_size=*/16);
+
+  expect_blocks(info, {}, {});
 }
 
 TEST(BatchInputBuilderTest, PartialBoundaryRepeatsXTensorOffsets) {
@@ -516,6 +550,73 @@ TEST(BatchTest, ChunkedPDTransferUsesStepWindow) {
             (std::vector<uint64_t>{1, 2}));
   EXPECT_EQ(input.transfer_kv_infos[0].remote_blocks_ids,
             (std::vector<uint64_t>{100, 101}));
+}
+
+TEST(BatchTest, ChunkedPDTransferUsesIndependentTransferCursor) {
+  torch::Device device(Device::type_torch(), 0);
+  const uint32_t n_blocks = 8;
+  const uint32_t block_size = 16;
+  BlockManager::Options options;
+  options.num_blocks(n_blocks).block_size(block_size);
+  BlockManagerImpl manager(options);
+
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(4);
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 96;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.skip_special_tokens = true;
+  seq_params.echo = false;
+  seq_params.logprobs = false;
+  seq_params.enable_schedule_overlap = false;
+  seq_params.request_id = "req-2";
+
+  std::vector<int32_t> tokens(80);
+  std::iota(tokens.begin(), tokens.end(), 1);
+
+  torch::Tensor input_embedding;
+  MMData mm_data;
+  IncrementalDecoder decoder("", 1, false, false);
+  Sequence seq(/*index=*/0,
+               tokens,
+               input_embedding,
+               mm_data,
+               std::move(decoder),
+               seq_params);
+  seq.add_kv_blocks(manager.allocate(5));
+  seq.kv_state().set_kv_cache_tokens_num(64);
+
+  TransferKVInfo info;
+  info.request_id = "req-2";
+  info.local_blocks_ids.resize(5);
+  info.remote_blocks_ids = {102, 103, 104};
+  info.transfer_cursor_tokens = 32;
+  info.dp_rank = 0;
+  info.remote_instance_info.dp_size = 1;
+  seq.kv_state().set_transfer_kv_info(std::move(info));
+
+  std::vector<Sequence*> sequences = {&seq};
+  std::vector<uint32_t> budgets = {16};
+  BatchInputBuilder builder(sequences,
+                            budgets,
+                            {},
+                            {},
+                            nullptr,
+                            0,
+                            nullptr,
+                            BatchForwardType::PREFILL);
+
+  RawForwardInput input = builder.build_raw_forward_input();
+
+  ASSERT_EQ(input.transfer_kv_infos.size(), 1u);
+  EXPECT_EQ(input.transfer_kv_infos[0].local_blocks_ids,
+            (std::vector<uint64_t>{3, 4, 5}));
+  EXPECT_EQ(input.transfer_kv_infos[0].remote_blocks_ids,
+            (std::vector<uint64_t>{102, 103, 104}));
+  ASSERT_TRUE(seq.kv_state().transfer_kv_info().has_value());
+  EXPECT_EQ(seq.kv_state().transfer_kv_info()->transfer_cursor_tokens, 80u);
 }
 
 TEST(BatchTest, KVCacheEmptySupportsLinearOnlyAndFullOnlyLayouts) {

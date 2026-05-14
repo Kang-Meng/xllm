@@ -45,6 +45,8 @@ class DisaggPDChunkedPrefillScheduler final : public DisaggPDScheduler {
   std::vector<Batch> prepare_batch() override;
 
  private:
+  void allocate_shared_blocks_for(Sequence* sequence);
+
   bool alloc_chunk(Sequence* sequence,
                    size_t token_budget,
                    size_t* actual_tokens);

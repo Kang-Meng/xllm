@@ -21,6 +21,7 @@ limitations under the License.
 #include <brpc/server.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <random>
 
 #include "common/global_flags.h"
@@ -513,6 +514,18 @@ void DisaggPDScheduler::dispatch_requests() {
                kv_cache_manager_->block_size() - 1) /
               kv_cache_manager_->block_size();
           info.local_blocks_ids.resize(prompt_blocks);
+          const size_t remote_blocks = info.remote_blocks_ids.size();
+          const size_t d_shared_blocks =
+              prompt_blocks > remote_blocks ? prompt_blocks - remote_blocks : 0;
+          const size_t prompt_tokens =
+              requests[i]->state().prompt_tokens.size();
+          info.transfer_cursor_tokens =
+              remote_blocks == 0
+                  ? prompt_tokens
+                  : std::min(
+                        prompt_tokens,
+                        d_shared_blocks * static_cast<size_t>(
+                                              kv_cache_manager_->block_size()));
           info.dp_rank = resps.resps()[i].dp_rank();
           // TODO: remote_instances_info_ is not multi-thread safe.
           info.remote_instance_info = remote_instances_info_[selected_instance];
