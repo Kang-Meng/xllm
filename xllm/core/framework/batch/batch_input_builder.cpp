@@ -540,6 +540,16 @@ void BatchInputBuilder::setup_kv_cache_info(
   std::unordered_set<int32_t>& write_block_ids =
       write_block_ids_ptr ? *write_block_ids_ptr : write_block_ids_;
 
+  const size_t kv_before = sequence->kv_state().kv_cache_tokens_num();
+  size_t transfer_cursor_before = 0;
+  bool has_transfer_info = false;
+  const auto& transfer_info_before = sequence->kv_state().transfer_kv_info();
+  if (transfer_info_before.has_value()) {
+    has_transfer_info = true;
+    transfer_cursor_before =
+        transfer_info_before.value().transfer_cursor_tokens;
+  }
+
   sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/q_seq_len);
 
   const auto blocks = sequence->kv_state().kv_blocks();
@@ -592,6 +602,10 @@ void BatchInputBuilder::setup_kv_cache_info(
                  static_cast<size_t>(transfer_end_tokens));
   }
 
+  size_t transfer_cursor_after = 0;
+  if (transfer_kv_info.has_value()) {
+    transfer_cursor_after = transfer_kv_info.value().transfer_cursor_tokens;
+  }
   state.block_tables_vec.emplace_back(std::move(block_ids));
 }
 

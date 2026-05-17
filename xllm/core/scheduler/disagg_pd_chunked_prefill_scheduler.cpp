@@ -229,10 +229,19 @@ std::vector<Batch> DisaggPDChunkedPrefillScheduler::prepare_batch() {
   running_requests_.reserve(max_seq_budget);
   running_sequences_.reserve(max_seq_budget);
   running_sequences_budgets_.reserve(max_seq_budget);
+  double latency_budget = options_.max_global_ttft_ms();
+  if (options_.priority_strategy() == "urgency_density") {
+    get_latency_budget_and_request_order(
+        waiting_priority_queue_.get(), latency_budget, true);
+  }
   schedule_waiting_prefill(waiting_priority_queue_.get(),
                            remaining_token_budget,
                            remaining_seq_budget,
                            done);
+  if (options_.priority_strategy() == "urgency_density") {
+    get_latency_budget_and_request_order(
+        waiting_priority_queue_offline_.get(), latency_budget, true);
+  }
   schedule_waiting_prefill(waiting_priority_queue_offline_.get(),
                            remaining_token_budget,
                            remaining_seq_budget,
