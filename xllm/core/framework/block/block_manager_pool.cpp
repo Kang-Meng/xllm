@@ -61,7 +61,8 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
                                                     page_size,
                                                     /*dp_rank=*/i,
                                                     options_.model_id()));
-    } else if (options.enable_disagg_pd() || options_.enable_kvcache_store()) {
+    } else if (options.enable_disagg_pd() || options_.enable_kvcache_store() ||
+               options_.host_num_blocks() > 0) {
       block_managers_.emplace_back(
           std::make_unique<ConcurrentBlockManagerImpl>(block_options));
     } else {
@@ -72,7 +73,7 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
     // pool. Worker-side embedding and linear-state caches remain physically
     // separate and are addressed via transport fields.
     single_block_managers_.emplace_back(std::make_unique<SingleBlockManager>(
-        /*num_blocks=*/FLAGS_max_seqs_per_batch + 2,
+        /*num_blocks=*/FLAGS_max_concurrent_requests + 2,
         /*resource_name=*/"single block",
         /*exhaustion_message=*/"No more single-block ids available"));
   }
@@ -196,7 +197,7 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
 
   // first try to allocate shared blocks
   if (started_empty) {
-    BlockManagerPool::allocate_shared(sequence);
+    allocate_shared(sequence);
   }
 
   const size_t num_blocks = sequence->kv_state().num_kv_blocks();

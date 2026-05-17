@@ -66,8 +66,8 @@ class BatchInputBuilder {
   static TransferKVInfo build_step_transfer_info(
       const TransferKVInfo& full_info,
       const std::vector<uint64_t>& local_block_ids,
-      uint32_t n_kv_cache_tokens,
-      uint32_t seq_len,
+      uint32_t transfer_begin_tokens,
+      uint32_t transfer_end_tokens,
       uint32_t block_size);
 
   void process_swap_block_infos(RawForwardInput& raw_forward_input);
@@ -143,6 +143,7 @@ class BatchInputBuilder {
   void setup_kv_cache_info(
       Sequence* sequence,
       uint32_t n_kv_cache_tokens,
+      uint32_t logical_seq_len,
       uint32_t seq_len,
       uint32_t q_seq_len,
       BuilderState* state_ptr = nullptr,

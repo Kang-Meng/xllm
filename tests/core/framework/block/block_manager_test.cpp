@@ -16,6 +16,8 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -23,6 +25,7 @@ limitations under the License.
 #include "block_manager_pool.h"
 #include "common/global_flags.h"
 #include "framework/request/incremental_decoder.h"
+#include "hierarchy_block_manager_pool.h"
 
 namespace xllm {
 
@@ -126,6 +129,32 @@ Sequence MakeSequence(size_t index, const std::vector<int32_t>& prompt_tokens) {
                   decoder,
                   params);
 }
+
+class ReadyTransferEngine final : public Engine {
+ public:
+  ForwardOutput step(std::vector<Batch>&) override { return {}; }
+
+  void update_last_step_result(std::vector<Batch>&) override {}
+
+  std::vector<int64_t> get_active_activation_memory() const override {
+    return {};
+  }
+
+  std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
+      const uint32_t,
+      const std::vector<BlockTransferInfo>& block_transfer_info) override {
+    transferred_blocks_ += block_transfer_info.size();
+    std::vector<folly::SemiFuture<uint32_t>> futures;
+    futures.emplace_back(folly::makeSemiFuture<uint32_t>(
+        static_cast<uint32_t>(block_transfer_info.size())));
+    return futures;
+  }
+
+  size_t transferred_blocks() const { return transferred_blocks_; }
+
+ private:
+  size_t transferred_blocks_ = 0;
+};
 
 }  // namespace
 
@@ -323,6 +352,52 @@ TEST(BlockManagerPoolTest, SequenceCopyDoesNotReuseSingleBlockSlot) {
   ASSERT_TRUE(pool.allocate(&clone));
   EXPECT_TRUE(HasSingleBlockIdOrFail(clone));
   EXPECT_NE(GetSingleBlockIdOrFail(clone), GetSingleBlockIdOrFail(src));
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     ChunkedPrefillOffloadUsesIndependentCursor) {
+  ScopedValue<int32_t> max_seqs_guard(&FLAGS_max_seqs_per_batch, 0);
+
+  BlockManagerPool::Options options;
+  options.num_blocks(16)
+      .host_num_blocks(0)
+      .block_size(4)
+      .enable_prefix_cache(true)
+      .enable_kvcache_store(true);
+  ReadyTransferEngine engine;
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+
+  Sequence seq = MakeSequence(0, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8});
+  seq.set_offload_batch_size(1);
+
+  ASSERT_TRUE(pool.allocate(&seq, /*num_tokens=*/4));
+  seq.kv_state().incr_kv_cache_tokens_num(4);
+  ASSERT_TRUE(seq.is_chunked_prefill_stage());
+  EXPECT_EQ(seq.offloaded_kv_blocks_num(), 0u);
+
+  ASSERT_TRUE(pool.allocate(&seq, /*num_tokens=*/8));
+  EXPECT_EQ(seq.offloaded_kv_blocks_num(), 1u);
+
+  pool.transfer_blocks();
+  EXPECT_EQ(engine.transferred_blocks(), 1u);
+  pool.deallocate(&seq);
+
+  std::vector<int32_t> cleanup_tokens(60);
+  for (size_t i = 0; i < cleanup_tokens.size(); ++i) {
+    cleanup_tokens[i] = static_cast<int32_t>(1000 + i);
+  }
+  Sequence cleanup_seq = MakeSequence(1, cleanup_tokens);
+
+  bool cleanup_allocated = false;
+  for (int i = 0; i < 1000; ++i) {
+    if (pool.allocate(&cleanup_seq, cleanup_seq.num_tokens())) {
+      cleanup_allocated = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(cleanup_allocated);
+  pool.deallocate_without_cache(&cleanup_seq);
 }
 
 }  // namespace xllm

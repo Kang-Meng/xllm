@@ -208,18 +208,21 @@ void CompletionServiceImpl::process_async_rpc_impl(
 
   // Check if the request is being rate-limited.
   if (unlikely(master_->get_rate_limiter()->is_limited())) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.",
+    RequestOutput req_output(
+        Status{StatusCode::RESOURCE_EXHAUSTED,
+               "The number of concurrent requests has reached the limit."},
         service_request_id,
         target_xservice_addr);
+    req_output.log_request_status();
+    master_->handle_rpc_response(req_output);
     return;
   }
-
+  auto rate_limit_guard = master_->get_rate_limiter()->make_request_guard();
   // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
   if (unlikely(!models_.contains(model))) {
+    rate_limit_guard.dismiss();
     CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
                         "Model not supported",
                         service_request_id,
@@ -246,6 +249,7 @@ void CompletionServiceImpl::process_async_rpc_impl(
                           std::move(request_params),
                           std::nullopt,
                           callback);
+  rate_limit_guard.dismiss();
 }
 
 // complete_async for brpc

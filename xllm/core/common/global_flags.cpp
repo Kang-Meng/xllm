@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "global_flags.h"
 
+#include <cstdint>
 #include <limits>
 
 #include "brpc/reloadable_flags.h"
@@ -271,6 +272,27 @@ DEFINE_bool(enable_forward_interruption,
             false,
             "Whether to enable forward interruption.");
 
+DEFINE_bool(enable_step_trace_dump,
+            false,
+            "Whether to enable scheduler step trace dumping.");
+
+DEFINE_string(step_trace_dump_file,
+              "",
+              "TSV file path for scheduler step trace dumping.");
+
+DEFINE_int32(step_trace_dump_queue_size,
+             65536,
+             "Queue size for scheduler step trace dumping.");
+
+DEFINE_int32(
+    step_trace_dump_flush_interval_ms,
+    1000,
+    "Flush interval in milliseconds for scheduler step trace dumping.");
+
+DEFINE_int32(step_trace_dump_flush_batch_size,
+             1024,
+             "Flush batch size for scheduler step trace dumping.");
+
 DEFINE_int32(max_global_ttft_ms,
              std::numeric_limits<int32_t>::max(),
              "all requests use single global ttft");
@@ -431,6 +453,12 @@ DEFINE_bool(enable_service_routing,
 DEFINE_double(heart_beat_interval, 0.5, "Heart beat interval.");
 
 DEFINE_int32(etcd_ttl, 3, "Time to live for etcd.");
+
+// Trigger offload when there are offload_batch_size blocks not yet offloaded to
+// kvcache store.
+DEFINE_uint32(offload_batch_size,
+              std::numeric_limits<uint32_t>::max(),
+              "Offload batch for disaggregated prefill-decode.");
 
 // --- kvcache store config ---
 

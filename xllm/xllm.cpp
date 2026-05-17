@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <csignal>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <unordered_set>
@@ -36,6 +37,7 @@ limitations under the License.
 #include "core/framework/xtensor/global_xtensor.h"
 #include "core/framework/xtensor/options.h"
 #include "core/framework/xtensor/xtensor_allocator.h"
+#include "core/runtime/xservice_client.h"
 #include "core/util/device_name_utils.h"
 #include "core/util/net.h"
 #include "core/util/utils.h"
@@ -284,6 +286,7 @@ int run() {
       .kv_cache_transfer_mode(FLAGS_kv_cache_transfer_mode)
       .etcd_addr(FLAGS_etcd_addr)
       .etcd_namespace(FLAGS_etcd_namespace)
+      .offload_batch_size(std::optional<uint32_t>(FLAGS_offload_batch_size))
       .enable_service_routing(FLAGS_enable_service_routing ||
                               FLAGS_enable_disagg_pd)
       .tool_call_parser(FLAGS_tool_call_parser)
@@ -295,8 +298,7 @@ int run() {
           FLAGS_enable_prefix_cache && FLAGS_enable_cache_upload)
       .host_blocks_factor(FLAGS_host_blocks_factor)
       .enable_kvcache_store(FLAGS_enable_kvcache_store &&
-                            FLAGS_enable_prefix_cache &&
-                            (FLAGS_host_blocks_factor > 1.0))
+                            FLAGS_enable_prefix_cache)
       .prefetch_timeout(FLAGS_prefetch_timeout)
       .prefetch_bacth_size(FLAGS_prefetch_bacth_size)
       .layers_wise_copy_batchs(FLAGS_layers_wise_copy_batchs)
@@ -383,12 +385,20 @@ int run() {
         std::make_unique<APIService>(master.get(), model_names, model_versions);
     auto xllm_server =
         ServerRegistry::get_instance().register_server("HttpServer");
+    if (options.enable_service_routing()) {
+      xllm_server->set_shutdown_hook(
+          []() { XServiceClient::get_instance()->shutdown(); });
+    }
 
     // start brpc server
     if (!xllm_server->start(std::move(api_service))) {
       LOG(ERROR) << "Failed to start brpc server on port " << FLAGS_port;
       return -1;
     }
+  }
+
+  if (options.enable_service_routing()) {
+    XServiceClient::get_instance()->shutdown();
   }
 
   return 0;

@@ -31,6 +31,11 @@ limitations under the License.
 
 namespace xllm {
 
+bool finished_on_prefill_instance_for_stream_response(Request& request) {
+  return !request.sequences().empty() &&
+         request.sequences()[0]->num_generated_tokens() == 1;
+}
+
 AsyncResponseProcessor::AsyncResponseProcessor(
     const Tokenizer* tokenizer,
     const std::optional<InstanceRole>& role,
@@ -284,6 +289,9 @@ void AsyncResponseProcessor::batch_process_stream_requests(
             req_output->finished_on_prefill_instance = true;
           }
         }
+      }
+      if (finished_on_prefill_instance_for_stream_response(*request)) {
+        req_output->finished_on_prefill_instance = true;
       }
       counter->decrement_count();
     };
