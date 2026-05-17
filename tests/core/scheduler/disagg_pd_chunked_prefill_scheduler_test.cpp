@@ -24,6 +24,7 @@ limitations under the License.
 #undef protected
 
 #include "distributed_runtime/engine.h"
+#include "scheduler/async_response_processor.h"
 
 namespace xllm {
 
@@ -114,7 +115,8 @@ ContinuousScheduler::Options make_prefill_scheduler_options() {
   return options;
 }
 
-std::shared_ptr<Request> make_request(const size_t prompt_len) {
+std::shared_ptr<Request> make_request(const size_t prompt_len,
+                                      bool stream = false) {
   std::vector<int32_t> prompt_token_ids(prompt_len, 1);
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
@@ -133,7 +135,7 @@ std::shared_ptr<Request> make_request(const size_t prompt_len) {
                              1,
                              1,
                              false,
-                             false,
+                             stream,
                              false,
                              false,
                              false,
@@ -162,6 +164,17 @@ TEST(DisaggPDChunkedPrefillSchedulerTest, EmptyBudgetRejectsSchedule) {
   const PDChunkBudget budget = pick_pd_chunk_budget(32, 96, 40, 0);
   EXPECT_EQ(budget.next_tokens, 0);
   EXPECT_EQ(budget.max_tokens, 32);
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     StreamPrefillCompletionDoesNotDependOnNonEmptyDeltaText) {
+  std::shared_ptr<Request> request =
+      make_request(/*prompt_len=*/4, /*stream=*/true);
+  auto& sequence = request->sequences()[0];
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  sequence->append_token(10);
+
+  EXPECT_TRUE(finished_on_prefill_instance_for_stream_response(*request));
 }
 
 TEST(DisaggPDChunkedPrefillSchedulerTest,

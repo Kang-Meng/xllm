@@ -238,6 +238,13 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
       }
       break;
     case SequenceStage::CHUNKED_PREFILL:
+      if (options_.enable_host_blocks()) {
+        load_via_host(sequence, num_tokens);
+        offload_via_host(sequence, false);
+      } else {
+        load_direct(sequence, num_tokens);
+        offload_direct(sequence, false);
+      }
     case SequenceStage::DECODE:
       if (options_.enable_host_blocks()) {
         offload_via_host(sequence, false);
@@ -312,6 +319,7 @@ void HierarchyBlockManagerPool::load_direct(Sequence* sequence,
     }
 
     store_shared_num = PrefixCache::match_in_kvcache_store(keys);
+    store_shared_num = store_shared_num - shared_num;
   }
 
   if (store_shared_num > 0) {

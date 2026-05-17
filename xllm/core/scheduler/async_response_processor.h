@@ -26,6 +26,9 @@ class BlockManager;
 class Request;
 class Sequence;
 class Tokenizer;
+
+bool finished_on_prefill_instance_for_stream_response(Request& request);
+
 class AsyncResponseProcessor final {
  public:
   AsyncResponseProcessor(const Tokenizer* tokenizer,
