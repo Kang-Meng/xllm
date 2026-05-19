@@ -166,6 +166,8 @@ DECLARE_string(etcd_namespace);
 
 DECLARE_uint32(offload_batch_size);
 
+DECLARE_uint32(offload_timeout_seconds);
+
 DECLARE_bool(enable_service_routing);
 
 DECLARE_double(heart_beat_interval);

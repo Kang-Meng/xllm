@@ -260,7 +260,7 @@ void LLMMaster::run() {
 
   running_.store(true, std::memory_order_relaxed);
   loop_thread_ = std::thread([this]() {
-    const auto timeout = absl::Milliseconds(500);
+    const auto timeout = absl::Milliseconds(100);
     while (!stoped_.load(std::memory_order_relaxed)) {
       scheduler_->step(timeout);
     }

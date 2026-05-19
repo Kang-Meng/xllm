@@ -131,6 +131,10 @@ void HierarchyBlockManagerPool::offload_direct(Sequence* sequence,
   auto* blocks = sequence->kv_state().mutable_kv_blocks();
 
   if (blocks->size() == 0) {
+    if (finish) {
+      deallocate_single_block(sequence, dp_rank);
+      sequence->reset();
+    }
     return;
   }
 
@@ -336,7 +340,7 @@ void HierarchyBlockManagerPool::load_direct(Sequence* sequence,
                                                   options_.block_size());
     BlockManagerPool::cache(sequence);
     sequence->kv_state().incr_shared_kv_blocks_num(store_shared_num);
-    sequence->set_offloaded_kv_blocks_num(store_shared_num);
+    sequence->set_offloaded_kv_blocks_num(shared_num + store_shared_num);
   }
 }
 
@@ -541,36 +545,54 @@ void HierarchyBlockManagerPool::transfer_blocks() {
 
       if (!transfer_infos.empty()) {
         offload_block_num += transfer_infos.size();
+        auto shared_device_blocks =
+            std::make_shared<std::vector<Block>>(std::move(src_blocks));
+        auto shared_host_blocks =
+            std::make_shared<std::vector<Block>>(std::move(dst_blocks));
         folly::collectAll(std::move(engine_->transfer_kv_blocks(
                               i, std::move(transfer_infos))))
             .via(folly::getGlobalCPUExecutor())
-            .thenValue(
-                [device_blocks = std::move(src_blocks),
-                 host_blocks = std::move(dst_blocks),
-                 device_block_mgr_ptr = block_managers_[i].get(),
-                 host_block_mgr_ptr = host_block_managers_[i].get()](
-                    std::vector<folly::Try<uint32_t>>&& results) mutable {
-                  bool offload_success = true;
-                  for (auto&& result : results) {
-                    if (result.value() != host_blocks.size()) {
-                      LOG(ERROR)
-                          << "Offload copy fail, expected "
-                          << host_blocks.size() << ", got " << result.value();
-                      offload_success = false;
-                    }
+            .within(std::chrono::seconds(FLAGS_offload_timeout_seconds))
+            .thenTry([shared_device_blocks,
+                      shared_host_blocks,
+                      device_block_mgr_ptr = block_managers_[i].get(),
+                      host_block_mgr_ptr = host_block_managers_[i].get()](
+                         folly::Try<std::vector<folly::Try<uint32_t>>>&&
+                             outer) mutable {
+              bool offload_success = false;
+              if (outer.hasException()) {
+                LOG(ERROR) << "Offload via host failed: "
+                           << outer.exception().what()
+                           << ", skip cache, release blocks";
+              } else {
+                offload_success = true;
+                for (auto&& result : outer.value()) {
+                  if (result.hasException()) {
+                    LOG(ERROR) << "Offload copy exception: "
+                               << result.exception().what();
+                    offload_success = false;
+                    continue;
                   }
-
-                  device_block_mgr_ptr->deallocate({device_blocks});
-                  device_blocks.clear();
-
-                  if (offload_success) {
-                    host_block_mgr_ptr->cache(host_blocks);
+                  if (result.value() != shared_host_blocks->size()) {
+                    LOG(ERROR) << "Offload copy fail, expected "
+                               << shared_host_blocks->size() << ", got "
+                               << result.value();
+                    offload_success = false;
                   }
-                  host_block_mgr_ptr->deallocate({host_blocks});
-                  host_blocks.clear();
+                }
+              }
 
-                  return 0;
-                });
+              device_block_mgr_ptr->deallocate({*shared_device_blocks});
+              shared_device_blocks->clear();
+
+              if (offload_success) {
+                host_block_mgr_ptr->cache(*shared_host_blocks);
+              }
+              host_block_mgr_ptr->deallocate({*shared_host_blocks});
+              shared_host_blocks->clear();
+
+              return 0;
+            });
       }
     } else {
       std::shared_ptr<OffloadBlockPair> block_pair;
@@ -586,25 +608,39 @@ void HierarchyBlockManagerPool::transfer_blocks() {
 
       if (!transfer_infos.empty()) {
         offload_block_num += transfer_infos.size();
+        auto shared_blocks =
+            std::make_shared<std::vector<Block>>(std::move(src_blocks));
         folly::collectAll(std::move(engine_->transfer_kv_blocks(
                               i, std::move(transfer_infos))))
             .via(folly::getGlobalCPUExecutor())
-            .thenValue(
-                [device_blocks = std::move(src_blocks),
-                 device_block_mgr_ptr = block_managers_[i].get()](
-                    std::vector<folly::Try<uint32_t>>&& results) mutable {
-                  for (auto&& result : results) {
-                    if (result.value() != device_blocks.size()) {
-                      LOG(ERROR)
-                          << "Offload direct to store fail, expected "
-                          << device_blocks.size() << ", got " << result.value();
-                    }
+            .within(std::chrono::seconds(FLAGS_offload_timeout_seconds))
+            .thenTry([shared_blocks,
+                      device_block_mgr_ptr = block_managers_[i].get()](
+                         folly::Try<std::vector<folly::Try<uint32_t>>>&&
+                             outer) mutable {
+              if (outer.hasException()) {
+                LOG(ERROR) << "Offload direct to store failed: "
+                           << outer.exception().what()
+                           << ", skip cache, release blocks";
+              } else {
+                for (auto&& result : outer.value()) {
+                  if (result.hasException()) {
+                    LOG(ERROR) << "Offload direct exception: "
+                               << result.exception().what();
+                    continue;
                   }
+                  if (result.value() != shared_blocks->size()) {
+                    LOG(ERROR)
+                        << "Offload direct to store fail, expected "
+                        << shared_blocks->size() << ", got " << result.value();
+                  }
+                }
+              }
 
-                  device_block_mgr_ptr->deallocate({device_blocks});
-                  device_blocks.clear();
-                  return 0;
-                });
+              device_block_mgr_ptr->deallocate({*shared_blocks});
+              shared_blocks->clear();
+              return 0;
+            });
       }
     }
   }

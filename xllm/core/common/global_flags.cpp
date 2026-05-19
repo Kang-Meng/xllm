@@ -460,6 +460,11 @@ DEFINE_uint32(offload_batch_size,
               std::numeric_limits<uint32_t>::max(),
               "Offload batch for disaggregated prefill-decode.");
 
+DEFINE_uint32(offload_timeout_seconds,
+              30,
+              "Timeout in seconds for D2G/D2H2G offload transfer. "
+              "On timeout, blocks are released without caching to store.");
+
 // --- kvcache store config ---
 
 DEFINE_uint32(prefetch_timeout,
