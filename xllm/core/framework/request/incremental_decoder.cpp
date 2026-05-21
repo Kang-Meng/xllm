@@ -58,7 +58,17 @@ std::string IncrementalDecoder::decode(const Slice<int32_t>& token_ids,
     const auto prefill_token_text =
         tokenizer.decode(token_ids.slice(output_offset_, output_offset_ + 1),
                          skip_special_tokens_);
-    if (!absl::EndsWith(prefill_token_text, "�")) {
+    // Only skip past the prefill token when it actually produced visible text
+    // that prefill already streamed to the client. Empty-text tokens (e.g.
+    // special / control ids whose detokenization is the empty string) must NOT
+    // advance output_offset_: prefill emitted no text for them, and advancing
+    // here would push every subsequent streaming-output frame's token_ids
+    // slice past T0. Combined with the "delta empty -> drop frame" path
+    // upstream, the very first prefill-sampled token can then never reach the
+    // service, breaking the mooncake KV-cache prefix-hash chain at the
+    // prompt/output boundary on failover replay.
+    if (!prefill_token_text.empty() &&
+        !absl::EndsWith(prefill_token_text, "�")) {
       output_offset_ += 1;
     }
     checking_prefill_token_ = false;
