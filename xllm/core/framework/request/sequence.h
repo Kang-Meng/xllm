@@ -40,6 +40,7 @@ limitations under the License.
 #include "sequence_kv_state.h"
 #include "sequence_logprob_state.h"
 #include "stopping_checker.h"
+#include "time_trace.h"
 #include "util/timer.h"
 
 namespace xllm {
@@ -91,6 +92,9 @@ struct SequenceParams {
 
   // request id for suffix-decoding request identity
   std::string request_id;
+
+  // request-level timing trace shared with the parent request
+  std::vector<TimeTraceEntry>* time_trace = nullptr;
 
   const std::vector<SampleSlot>* sample_slots = nullptr;
 
@@ -144,6 +148,9 @@ class Sequence final {
   // whether the new added token is the first token
   bool is_first_token() const { return is_first_token_; }
   std::optional<RemoteToken>& first_token() { return first_token_; }
+  std::vector<TimeTraceEntry>* time_trace() const {
+    return sequence_params_.time_trace;
+  }
   // get the total number of tokens
   size_t num_tokens() const { return num_tokens_; }
   // get the number of prompt tokens

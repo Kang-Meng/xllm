@@ -245,6 +245,8 @@ DECLARE_int32(step_trace_dump_flush_interval_ms);
 
 DECLARE_int32(step_trace_dump_flush_batch_size);
 
+DECLARE_uint64(debug_sigterm_on_first_batch_id_gt);
+
 DECLARE_int32(max_global_ttft_ms);
 
 DECLARE_int32(max_global_tpot_ms);

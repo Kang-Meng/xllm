@@ -35,7 +35,6 @@ namespace xllm {
 
 struct ModelArgs;
 
-static uint64_t batch_counter_ = 1;
 constexpr uint64_t UNINITIALIZED_BATCH_ID = 0x0;
 
 class Batch {
@@ -63,15 +62,7 @@ class Batch {
     swap_block_transfer_infos_ = std::move(swap_block_transfer_infos);
   }
 
-  void set_batch_id() {
-    if (batch_id_ == UNINITIALIZED_BATCH_ID) {
-      batch_id_ = batch_counter_;
-      batch_counter_++;
-      if (batch_counter_ == UINT64_MAX) {
-        batch_counter_ = 1;
-      }
-    }
-  }
+  void set_batch_id();
 
   uint64_t batch_id() const { return batch_id_; }
 

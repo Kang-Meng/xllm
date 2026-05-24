@@ -324,6 +324,12 @@ class ContinuousScheduler : public Scheduler {
 
   void step_with_pd_ooc(std::vector<Batch>& batch);
 
+  void record_prefill_schedule_trace_for_running_requests(
+      const std::vector<Batch>& batch);
+
+  void record_prefill_finish_trace_for_requests(
+      const std::vector<std::shared_ptr<Request>>& requests);
+
   void maybe_dump_step_trace(const std::vector<Batch>& batch,
                              const BatchForwardType& batch_forward_type,
                              int64_t step_start_ts_us,

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "scheduler/step_trace_dumper.h"
 
+#include <absl/strings/str_join.h>
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -25,7 +26,8 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-constexpr char kStepTraceHeader[] = "ts_us\tstep_kind\tqlen\tstep_latency_ms\n";
+constexpr char kStepTraceHeader[] =
+    "ts_us\tstep_kind\tqlen\tbatch_ids\tstep_latency_ms\n";
 
 std::string to_step_kind(const BatchForwardType& batch_forward_type) {
   switch (batch_forward_type.value()) {
@@ -64,8 +66,8 @@ StepTraceDumper::~StepTraceDumper() {
   }
 }
 
-bool StepTraceDumper::try_enqueue(const StepTraceRecord& record) {
-  const bool written = queue_->write(record);
+bool StepTraceDumper::try_enqueue(StepTraceRecord record) {
+  const bool written = queue_->write(std::move(record));
   if (!written) {
     dropped_records_.fetch_add(1, std::memory_order_relaxed);
   }
@@ -77,22 +79,19 @@ std::string StepTraceDumper::format_record_tsv(const StepTraceRecord& record) {
   os.setf(std::ios::fixed);
   os.precision(3);
   os << record.ts_us << '\t' << to_step_kind(record.batch_forward_type) << '\t'
-     << record.qlen << '\t' << record.step_latency_ms << '\n';
+     << record.qlen << '\t' << record.batch_ids << '\t'
+     << record.step_latency_ms << '\n';
   return os.str();
 }
 
 void StepTraceDumper::run() {
-  file_ = fopen(file_path_.c_str(), "ab+");
+  file_ = fopen(file_path_.c_str(), "wb");
   if (file_ == nullptr) {
     LOG(ERROR) << "Failed to open step trace dump file: " << file_path_;
     return;
   }
 
-  fseek(file_, 0, SEEK_END);
-  const int64_t file_size = static_cast<int64_t>(ftell(file_));
-  if (file_size == 0) {
-    fwrite(kStepTraceHeader, 1, sizeof(kStepTraceHeader) - 1, file_);
-  }
+  fwrite(kStepTraceHeader, 1, sizeof(kStepTraceHeader) - 1, file_);
 
   const auto flush_interval = std::chrono::milliseconds(flush_interval_ms_);
   auto next_flush_deadline = std::chrono::steady_clock::now() + flush_interval;

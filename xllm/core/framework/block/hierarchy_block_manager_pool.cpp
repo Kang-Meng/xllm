@@ -409,6 +409,9 @@ void HierarchyBlockManagerPool::allocate_direct_shared(Sequence* sequence) {
         static_cast<int64_t>(store_shared_num * 100.0 / (block_num + 1));
     HISTOGRAM_OBSERVE(store_prefix_cache_block_matched_rate, int_rate_percent);
     HISTOGRAM_OBSERVE(store_prefix_cache_block_matched_num, store_shared_num);
+
+    LOG(INFO) << "request id: " << sequence->request_id()
+              << ", match rate: " << store_shared_num << "/" << block_num;
   }
 }
 

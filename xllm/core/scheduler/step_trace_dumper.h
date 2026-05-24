@@ -32,6 +32,7 @@ struct StepTraceRecord {
   int64_t ts_us = 0;
   BatchForwardType batch_forward_type;
   int64_t qlen = 0;
+  std::string batch_ids;
   double step_latency_ms = 0.0;
 };
 
@@ -43,7 +44,7 @@ class StepTraceDumper final {
                   int32_t flush_batch_size);
   ~StepTraceDumper();
 
-  bool try_enqueue(const StepTraceRecord& record);
+  bool try_enqueue(StepTraceRecord record);
 
   uint64_t dropped_records() const {
     return dropped_records_.load(std::memory_order_relaxed);

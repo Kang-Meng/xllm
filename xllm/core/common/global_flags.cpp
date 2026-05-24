@@ -293,6 +293,11 @@ DEFINE_int32(step_trace_dump_flush_batch_size,
              1024,
              "Flush batch size for scheduler step trace dumping.");
 
+DEFINE_uint64(debug_sigterm_on_first_batch_id_gt,
+              0,
+              "Debug only. If non-zero, raise SIGTERM once when the first "
+              "newly assigned batch_id is greater than this threshold.");
+
 DEFINE_int32(max_global_ttft_ms,
              std::numeric_limits<int32_t>::max(),
              "all requests use single global ttft");

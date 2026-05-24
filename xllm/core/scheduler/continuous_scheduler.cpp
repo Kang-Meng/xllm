@@ -28,6 +28,7 @@ limitations under the License.
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #include "common/global_flags.h"
@@ -1201,6 +1202,8 @@ void ContinuousScheduler::step(const absl::Duration& timeout) {
       return;
     }
 
+    record_prefill_schedule_trace_for_running_requests(batch);
+
     BatchForwardType batch_forward_type = BatchForwardType::EMPTY;
     for (const Batch& one_batch : batch) {
       if (!one_batch.empty()) {
@@ -1248,6 +1251,10 @@ void ContinuousScheduler::step_with_schedule_overlap(
       });
   if (cur_batch_all_empty && last_batch_all_empty) {
     return;
+  }
+
+  if (!cur_batch_all_empty) {
+    record_prefill_schedule_trace_for_running_requests(batch);
   }
 
   BatchForwardType batch_forward_type = BatchForwardType::EMPTY;
@@ -1368,6 +1375,65 @@ void ContinuousScheduler::process_batch_output(bool enable_schedule_overlap) {
   }
   if (!stream_requests.empty()) {
     response_processor_->process_stream_requests(stream_requests);
+  }
+
+  if (!options_.instance_role().has_value() ||
+      options_.instance_role().value() != InstanceRole::DECODE) {
+    record_prefill_finish_trace_for_requests(to_be_processed_requests);
+  }
+}
+
+void ContinuousScheduler::record_prefill_schedule_trace_for_running_requests(
+    const std::vector<Batch>& batch) {
+  const size_t upper =
+      std::min(running_sequences_.size(), running_sequences_budgets_.size());
+  if (upper == 0) {
+    return;
+  }
+
+  std::unordered_map<std::string, Request*> request_by_id;
+  request_by_id.reserve(running_requests_.size());
+  for (const auto& request : running_requests_) {
+    if (request != nullptr) {
+      request_by_id.emplace(request->request_id(), request.get());
+    }
+  }
+
+  for (size_t i = 0; i < upper; ++i) {
+    Sequence* sequence = running_sequences_[i];
+    if (sequence == nullptr || !sequence->is_prefill_stage()) {
+      continue;
+    }
+    const int32_t dp_rank = sequence->dp_rank();
+    if (dp_rank < 0 || static_cast<size_t>(dp_rank) >= batch.size()) {
+      continue;
+    }
+    const uint64_t batch_id = batch[dp_rank].batch_id();
+
+    auto it = request_by_id.find(sequence->request_id());
+    if (it == request_by_id.end() || it->second == nullptr) {
+      continue;
+    }
+
+    it->second->record_prefill_batch_schedule(
+        static_cast<int32_t>(running_sequences_budgets_[i]), batch_id);
+  }
+}
+
+void ContinuousScheduler::record_prefill_finish_trace_for_requests(
+    const std::vector<std::shared_ptr<Request>>& requests) {
+  for (const auto& request : requests) {
+    if (request == nullptr || request->sequences().empty()) {
+      continue;
+    }
+    Sequence* sequence = request->sequences()[0].get();
+    if (sequence == nullptr) {
+      continue;
+    }
+    if (sequence->is_first_token() && sequence->num_generated_tokens() == 1) {
+      request->record_prefill_finished();
+      request->maybe_log_time_trace_summary();
+    }
   }
 }
 
@@ -1493,6 +1559,14 @@ void ContinuousScheduler::maybe_dump_step_trace(
   record.ts_us = step_start_ts_us;
   record.batch_forward_type = batch_forward_type;
   record.qlen = compute_step_qlen(batch, batch_forward_type);
+  std::vector<uint64_t> batch_ids;
+  batch_ids.reserve(batch.size());
+  for (const Batch& one_batch : batch) {
+    if (!one_batch.empty() && one_batch.batch_id() != UNINITIALIZED_BATCH_ID) {
+      batch_ids.push_back(one_batch.batch_id());
+    }
+  }
+  record.batch_ids = absl::StrJoin(batch_ids, ",");
   record.step_latency_ms = step_latency_ms;
   step_trace_dumper_->try_enqueue(record);
 }

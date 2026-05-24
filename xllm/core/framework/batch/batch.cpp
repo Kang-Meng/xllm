@@ -20,6 +20,8 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <vector>
 
 #include "batch_input_builder.h"
@@ -39,6 +41,18 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+std::atomic<uint64_t> g_batch_counter{1};
+std::atomic<bool> g_debug_sigterm_sent{false};
+
+uint64_t next_batch_id() {
+  uint64_t batch_id = g_batch_counter.fetch_add(1, std::memory_order_relaxed);
+  if (batch_id == 0 || batch_id == UINT64_MAX) {
+    g_batch_counter.store(1, std::memory_order_relaxed);
+    batch_id = g_batch_counter.fetch_add(1, std::memory_order_relaxed);
+  }
+  return batch_id;
+}
 
 uint32_t get_sample_source_position(const SampleSlot& sample_slot) {
   if (sample_slot.token_position == 0) {
@@ -68,6 +82,20 @@ Token make_empty_logprob_placeholder(const Sequence& seq) {
 
 Batch::Batch(Sequence* sequence) { add(sequence); }
 Batch::Batch(const std::vector<Sequence*>& sequences) { add(sequences); }
+
+void Batch::set_batch_id() {
+  if (batch_id_ == UNINITIALIZED_BATCH_ID) {
+    batch_id_ = next_batch_id();
+    const uint64_t threshold = FLAGS_debug_sigterm_on_first_batch_id_gt;
+    if (threshold != 0 && batch_id_ > threshold &&
+        !g_debug_sigterm_sent.exchange(true, std::memory_order_acq_rel)) {
+      LOG(ERROR) << "Raise SIGTERM for debug because first assigned batch_id "
+                 << "greater than threshold was observed: batch_id="
+                 << batch_id_ << ", threshold=" << threshold;
+      raise(SIGTERM);
+    }
+  }
+}
 
 void Batch::add(Sequence* sequence, uint32_t allowed_max_token) {
   CHECK(sequence != nullptr);
