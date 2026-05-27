@@ -23,4 +23,33 @@ TEST(RequestLimiterTest, Basic) {
   EXPECT_EQ(rate_limiter.is_limited(), false);
 }
 
+TEST(RequestLimiterTest, RequestGuardReleasesAcquiredRequestOnScopeExit) {
+  FLAGS_max_concurrent_requests = 1;
+  RateLimiter rate_limiter;
+
+  ASSERT_FALSE(rate_limiter.is_limited());
+  {
+    auto guard = rate_limiter.make_request_guard();
+    EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
+  }
+
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+  EXPECT_FALSE(rate_limiter.is_limited());
+}
+
+TEST(RequestLimiterTest, DismissedRequestGuardTransfersReleaseResponsibility) {
+  FLAGS_max_concurrent_requests = 1;
+  RateLimiter rate_limiter;
+
+  ASSERT_FALSE(rate_limiter.is_limited());
+  {
+    auto guard = rate_limiter.make_request_guard();
+    guard.dismiss();
+  }
+
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
+  rate_limiter.decrease_one_request();
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+}
+
 }  // namespace xllm

@@ -21,6 +21,43 @@ namespace xllm {
 
 class RateLimiter final {
  public:
+  class RequestGuard final {
+   public:
+    explicit RequestGuard(RateLimiter* rate_limiter)
+        : rate_limiter_(rate_limiter) {}
+
+    RequestGuard(const RequestGuard&) = delete;
+    RequestGuard& operator=(const RequestGuard&) = delete;
+
+    RequestGuard(RequestGuard&& other) noexcept
+        : rate_limiter_(other.rate_limiter_) {
+      other.rate_limiter_ = nullptr;
+    }
+
+    RequestGuard& operator=(RequestGuard&& other) noexcept {
+      if (this != &other) {
+        reset();
+        rate_limiter_ = other.rate_limiter_;
+        other.rate_limiter_ = nullptr;
+      }
+      return *this;
+    }
+
+    ~RequestGuard() { reset(); }
+
+    void dismiss() noexcept { rate_limiter_ = nullptr; }
+
+    void reset() noexcept {
+      if (rate_limiter_ != nullptr) {
+        rate_limiter_->decrease_one_request();
+        rate_limiter_ = nullptr;
+      }
+    }
+
+   private:
+    RateLimiter* rate_limiter_ = nullptr;
+  };
+
   // Special value indicating sleep state.
   static constexpr int32_t kSleeping = INT32_MIN;
 
@@ -31,6 +68,8 @@ class RateLimiter final {
   // Returns true if request is rate-limited or sleeping.
   // If not limited and not sleeping, increments the counter.
   bool is_limited();
+
+  RequestGuard make_request_guard() { return RequestGuard(this); }
 
   void decrease_one_request();
 

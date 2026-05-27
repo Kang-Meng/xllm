@@ -40,6 +40,7 @@ limitations under the License.
 #include "sequence_kv_state.h"
 #include "sequence_logprob_state.h"
 #include "stopping_checker.h"
+#include "time_trace.h"
 #include "util/timer.h"
 
 namespace xllm {
@@ -91,6 +92,9 @@ struct SequenceParams {
 
   // request id for suffix-decoding request identity
   std::string request_id;
+
+  // request-level timing trace shared with the parent request
+  std::vector<TimeTraceEntry>* time_trace = nullptr;
 
   const std::vector<SampleSlot>* sample_slots = nullptr;
 
@@ -144,6 +148,9 @@ class Sequence final {
   // whether the new added token is the first token
   bool is_first_token() const { return is_first_token_; }
   std::optional<RemoteToken>& first_token() { return first_token_; }
+  std::vector<TimeTraceEntry>* time_trace() const {
+    return sequence_params_.time_trace;
+  }
   // get the total number of tokens
   size_t num_tokens() const { return num_tokens_; }
   // get the number of prompt tokens
@@ -299,7 +306,7 @@ class Sequence final {
     return &prefetch_results_;
   }
 
-  bool update_prefetch_result(uint32_t timeout, uint32_t& success_cnt);
+  bool update_prefetch_result(const uint32_t timeout, uint32_t& success_cnt);
 
   void reset();
 
@@ -403,6 +410,21 @@ class Sequence final {
   bool last_token_handled() const {
     return last_token_handled_.load(std::memory_order_relaxed);
   }
+
+  void set_offload_batch_size(uint32_t offload_batch_size) {
+    offload_batch_size_ = offload_batch_size;
+  }
+  uint32_t get_offload_batch_size() { return offload_batch_size_; }
+  size_t offloaded_kv_blocks_num() const { return offloaded_kv_blocks_num_; }
+  void set_offloaded_kv_blocks_num(size_t offloaded_kv_blocks_num) {
+    offloaded_kv_blocks_num_ = offloaded_kv_blocks_num;
+  }
+  void incr_offloaded_kv_blocks_num(size_t num) {
+    offloaded_kv_blocks_num_ += num;
+  }
+
+  void matched_in_store() { is_matched_in_store_ = true; }
+  bool is_matched_in_store() { return is_matched_in_store_; }
 
  private:
   void record_first_token(const Token& token);
@@ -551,6 +573,11 @@ class Sequence final {
   // 1) beams that were already finished before current step and
   // 2) beams that just became finished in current step.
   bool updated_since_last_beam_search_ = false;
+
+  uint32_t offload_batch_size_ = std::numeric_limits<uint32_t>::max();
+  size_t offloaded_kv_blocks_num_ = 0;
+
+  bool is_matched_in_store_ = false;
 };
 
 }  // namespace xllm

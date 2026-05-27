@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/request/rec_type.h"
 #include "core/framework/request/request_params.h"
+#include "core/util/scope_guard.h"
 #include "core/util/utils.h"
 #include "core/util/uuid.h"
 #include "mm_service_utils.h"
@@ -650,18 +651,21 @@ void ChatServiceImpl::process_async_rpc_impl(
   // Check if the request is being rate-limited.
   CHECK(master_ != nullptr);
   if (master_->get_rate_limiter()->is_limited()) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.",
+    RequestOutput req_output(
+        Status{StatusCode::RESOURCE_EXHAUSTED,
+               "The number of concurrent requests has reached the limit."},
         service_request_id,
         target_xservice_addr);
+    req_output.log_request_status();
+    master_->handle_rpc_response(req_output);
     return;
   }
-
+  auto rate_limit_guard = master_->get_rate_limiter()->make_request_guard();
   // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
   if (unlikely(!models_.contains(model))) {
+    rate_limit_guard.dismiss();
     CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
                         "Model not supported",
                         service_request_id,
@@ -721,6 +725,7 @@ void ChatServiceImpl::process_async_rpc_impl(
                           std::move(request_params),
                           std::nullopt,
                           callback);
+  rate_limit_guard.dismiss();
 }
 
 // chat_async for brpc
@@ -908,6 +913,9 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
         "The number of concurrent requests has reached the limit.");
     return;
   }
+  ScopeGuard rate_limit_guard([master = master_] {
+    master->get_rate_limiter()->decrease_one_request();
+  });
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
@@ -974,6 +982,7 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
         return send_result_to_client_brpc(
             call, request_id, created_time, model, req_output);
       });
+  rate_limit_guard.dismiss();
 }
 
 }  // namespace xllm

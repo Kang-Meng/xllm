@@ -47,6 +47,7 @@ message KvCacheEvent {
 message LoadMetrics {
   uint64 waiting_requests_num = 1;
   float gpu_cache_usage_perc = 2;
+  uint32 offload_batch_size = 3;
 }
 
 message LatencyMetrics {
@@ -83,6 +84,11 @@ message HeartbeatRequest {
   string incarnation_id = 6;
 }
 
+message FailoverSessionRequest {
+  string name = 1;
+  string incarnation_id = 2;
+}
+
 message InstanceID {
   string name = 1;
 }
@@ -95,6 +101,7 @@ service XllmRpcService {
   rpc RegisterInstance(InstanceMetaInfo) returns (StatusCode) {}
   rpc GetInstanceInfo(InstanceID) returns (InstanceMetaInfo) {}
   rpc Heartbeat(HeartbeatRequest) returns (Status) {}
+  rpc OpenFailoverSession(FailoverSessionRequest) returns (Status) {}
   rpc GetStaticDecodeList(InstanceID) returns (InstanceIDs) {}
   rpc GetStaticPrefillList(InstanceID) returns (InstanceIDs) {}
   // xllm service receive response from decode instance directly in disagg pd mode.

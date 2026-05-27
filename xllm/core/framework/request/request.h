@@ -29,6 +29,7 @@ limitations under the License.
 #include "request_state.h"
 #include "sequences_group.h"
 #include "stopping_checker.h"
+#include "time_trace.h"
 #include "util/threadpool.h"
 
 namespace xllm {
@@ -80,6 +81,10 @@ class Request : public RequestBase {
   void log_error_statistic(Status status);
 
   absl::Time created_time() const { return created_time_; }
+
+  void update_created_time(const absl::Time& created_time) {
+    created_time_ = created_time;
+  }
 
   int32_t get_deadline_ms() const { return deadline_ms_; }
 
@@ -161,6 +166,19 @@ class Request : public RequestBase {
     return sequences_group_->is_chunked_prefill_stage();
   }
 
+  bool should_trace_ttft_800() const { return ttft_slo_ms() == 800; }
+
+  void record_prefill_batch_schedule(int32_t token_budget, uint64_t batch_id);
+
+  void record_prefill_finished();
+
+  void maybe_log_time_trace_summary();
+
+  const std::vector<TimeTraceEntry>& time_trace() const { return time_trace_; }
+  const std::vector<uint64_t>& prefill_batch_ids() const {
+    return batch_id_vec_;
+  }
+
  private:
   RequestState state_;
   // list of sequences to generate completions for the prompt
@@ -178,8 +196,16 @@ class Request : public RequestBase {
 
   bool starved_ = false;
 
+  std::vector<TimeTraceEntry> time_trace_;
+  std::vector<uint64_t> batch_id_vec_;
+  bool time_trace_logged_ = false;
+  bool first_prefill_batch_recorded_ = false;
+  int32_t prefill_chunk_index_ = 0;
+
  private:
   void create_sequences_group();
+  void append_time_trace_entry(const std::string& stage,
+                               int32_t token_budget = 0);
 };
 
 }  // namespace xllm

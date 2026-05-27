@@ -70,6 +70,7 @@ std::vector<Batch> BatchFactory::create_batches(
     if (batches[i].empty()) {
       continue;
     }
+    batches[i].set_batch_id();
     if (swap_block_transfer_infos != nullptr &&
         swap_block_transfer_infos->size() == dp_size_) {
       batches[i].set_swap_block_transfer_infos(

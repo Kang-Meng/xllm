@@ -163,10 +163,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       auto results =
           folly::collectAll(futures).within(std::chrono::seconds(60)).get();
       for (const auto& result : results) {
-        // TODO: Add error handling
         if (!result.value()) {
-          LOG(ERROR) << "kv_cache_transfer_ failed";
-          break;
+          LOG(FATAL) << "kv_cache_transfer_ failed";
         }
       }
     }
@@ -225,10 +223,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     auto results =
         folly::collectAll(futures).within(std::chrono::seconds(60)).get();
     for (const auto& result : results) {
-      // TODO: Add error handling
       if (!result.value()) {
-        LOG(ERROR) << "kv_cache_transfer_ failed";
-        break;
+        LOG(FATAL) << "kv_cache_transfer_ failed";
       }
     }
   }

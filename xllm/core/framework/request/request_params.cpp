@@ -52,6 +52,12 @@ std::string generate_anthropic_chat_request_id() {
          short_uuid.random();
 }
 
+void use_service_request_id(RequestParams& params) {
+  if (!params.service_request_id.empty()) {
+    params.request_id = params.service_request_id;
+  }
+}
+
 // Handle tool_choice conversion from Anthropic format to internal format
 std::string handle_tool_choice(
     const proto::AnthropicMessagesRequest& rpc_request) {
@@ -118,7 +124,9 @@ std::vector<JsonTool> handle_tools(
 RequestParams::RequestParams(const proto::CompletionRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
-  request_id = generate_completion_request_id();
+  if (request.has_request_id()) {
+    request_id = request.request_id();
+  }
   x_request_id = x_rid;
   x_request_time = x_rtime;
   if (x_request_id.empty() && request.has_x_request_id()) {
@@ -158,6 +166,10 @@ RequestParams::RequestParams(const proto::CompletionRequest& request,
 
   if (request.has_service_request_id()) {
     service_request_id = request.service_request_id();
+  }
+  use_service_request_id(*this);
+  if (request_id.empty()) {
+    request_id = generate_completion_request_id();
   }
   if (request.has_source_xservice_addr()) {
     source_xservice_addr = request.source_xservice_addr();
@@ -342,6 +354,7 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
   if (request.has_service_request_id()) {
     params.service_request_id = request.service_request_id();
   }
+  use_service_request_id(params);
   if (request.has_source_xservice_addr()) {
     params.source_xservice_addr = request.source_xservice_addr();
   }
@@ -437,7 +450,6 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
 RequestParams::RequestParams(const proto::ChatRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
-  request_id = generate_chat_request_id();
   x_request_id = x_rid;
   x_request_time = x_rtime;
   if (x_request_id.empty() && request.has_x_request_id()) {
@@ -448,24 +460,32 @@ RequestParams::RequestParams(const proto::ChatRequest& request,
   }
 
   init_from_chat_request(*this, request);
+  if (request_id.empty()) {
+    request_id = generate_chat_request_id();
+  }
 }
 
 RequestParams::RequestParams(const proto::MMChatRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
-  request_id = generate_chat_request_id();
   x_request_id = x_rid;
   x_request_time = x_rtime;
 
   init_from_chat_request(*this, request);
+  if (request_id.empty()) {
+    request_id = generate_chat_request_id();
+  }
 }
 
 RequestParams::RequestParams(const proto::EmbeddingRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
-  request_id = generate_embedding_request_id();
   if (request.has_service_request_id()) {
     service_request_id = request.service_request_id();
+  }
+  use_service_request_id(*this);
+  if (request_id.empty()) {
+    request_id = generate_embedding_request_id();
   }
   if (request.has_add_special_tokens()) {
     add_special_tokens = request.add_special_tokens();
@@ -484,6 +504,10 @@ RequestParams::RequestParams(const proto::MMEmbeddingRequest& request,
   if (request.has_service_request_id()) {
     service_request_id = request.service_request_id();
   }
+  use_service_request_id(*this);
+  if (request_id.empty()) {
+    request_id = generate_embedding_request_id();
+  }
   x_request_id = x_rid;
   x_request_time = x_rtime;
   is_embeddings = true;
@@ -494,9 +518,12 @@ RequestParams::RequestParams(const proto::MMEmbeddingRequest& request,
 RequestParams::RequestParams(const proto::RerankRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
-  request_id = generate_rerank_request_id();
   if (request.has_service_request_id()) {
     service_request_id = request.service_request_id();
+  }
+  use_service_request_id(*this);
+  if (request_id.empty()) {
+    request_id = generate_rerank_request_id();
   }
   x_request_id = x_rid;
   x_request_time = x_rtime;

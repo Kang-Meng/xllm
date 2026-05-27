@@ -16,11 +16,15 @@ limitations under the License.
 
 #include "request.h"
 
+#include <absl/strings/str_cat.h>
+#include <absl/strings/str_join.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <glog/logging.h>
 
 #include <cstdint>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -29,6 +33,15 @@ limitations under the License.
 #include "util/timer.h"
 
 namespace xllm {
+
+namespace {
+
+std::string format_timestamp_ms(const absl::Time& timestamp) {
+  return absl::FormatTime(
+      "%Y-%m-%d %H:%M:%E3S", timestamp, absl::LocalTimeZone());
+}
+
+}  // namespace
 
 Request::Request(const std::string& request_id,
                  const std::string& x_request_id,
@@ -42,6 +55,9 @@ Request::Request(const std::string& request_id,
                   service_request_id,
                   source_xservice_addr),
       state_(std::move(state)) {
+  if (should_trace_ttft_800()) {
+    append_time_trace_entry("request_arrived");
+  }
   create_sequences_group();
 }
 
@@ -58,6 +74,7 @@ void Request::create_sequences_group() {
   sequence_params.rec_type = state_.rec_type;
   sequence_params.bos_token_id = state_.bos_token_id;
   sequence_params.request_id = request_id_;
+  sequence_params.time_trace = &time_trace_;
   sequence_params.sample_slots = &(state_.sample_slots);
   sequence_params.sampling_param = &(state_.sampling_param);
   sequence_params.stopping_checker = &(state_.stopping_checker);
@@ -72,6 +89,90 @@ bool Request::finished() const { return sequences_group_->finished(); }
 
 bool Request::expand_sequences(bool share_prefix) {
   return sequences_group_->expand_sequences(share_prefix);
+}
+
+void Request::append_time_trace_entry(const std::string& stage,
+                                      int32_t token_budget) {
+  if (!should_trace_ttft_800()) {
+    return;
+  }
+  TimeTraceEntry entry;
+  entry.stage = stage;
+  entry.timestamp = absl::Now();
+  entry.token_budget = token_budget;
+  time_trace_.push_back(std::move(entry));
+}
+
+void Request::record_prefill_batch_schedule(int32_t token_budget,
+                                            uint64_t batch_id) {
+  if (batch_id != 0 &&
+      (batch_id_vec_.empty() || batch_id_vec_.back() != batch_id)) {
+    batch_id_vec_.push_back(batch_id);
+  }
+
+  if (!should_trace_ttft_800() || time_trace_logged_) {
+    return;
+  }
+
+  if (!first_prefill_batch_recorded_) {
+    append_time_trace_entry("sequence_scheduled");
+    first_prefill_batch_recorded_ = true;
+  }
+
+  ++prefill_chunk_index_;
+  append_time_trace_entry(
+      absl::StrCat("prefill_chunk_", prefill_chunk_index_, "_scheduled"),
+      token_budget);
+}
+
+void Request::record_prefill_finished() {
+  if (!should_trace_ttft_800() || time_trace_logged_) {
+    return;
+  }
+  append_time_trace_entry("prefill_finished");
+}
+
+void Request::maybe_log_time_trace_summary() {
+  if (!should_trace_ttft_800() || time_trace_logged_ || time_trace_.empty()) {
+    return;
+  }
+
+  std::vector<std::string> stage_items;
+  stage_items.reserve(time_trace_.size());
+  for (const auto& entry : time_trace_) {
+    std::string item =
+        absl::StrCat(entry.stage, "@", format_timestamp_ms(entry.timestamp));
+    if (entry.token_budget > 0) {
+      absl::StrAppend(&item, "(tokens=", entry.token_budget, ")");
+    }
+    stage_items.emplace_back(std::move(item));
+  }
+
+  std::vector<std::string> duration_items;
+  duration_items.reserve(time_trace_.size());
+  for (size_t i = 1; i < time_trace_.size(); ++i) {
+    const int64_t delta_ms = absl::ToInt64Milliseconds(
+        time_trace_[i].timestamp - time_trace_[i - 1].timestamp);
+    duration_items.emplace_back(absl::StrCat(time_trace_[i - 1].stage,
+                                             "->",
+                                             time_trace_[i].stage,
+                                             "=",
+                                             delta_ms,
+                                             "ms"));
+  }
+
+  const int64_t total_ms =
+      time_trace_.size() > 1
+          ? absl::ToInt64Milliseconds(time_trace_.back().timestamp -
+                                      time_trace_.front().timestamp)
+          : 0;
+
+  LOG(INFO) << "TTFT800 time_trace request_id=" << request_id_
+            << " x_request_id=" << x_request_id_ << " stages=["
+            << absl::StrJoin(stage_items, ", ") << "]"
+            << " durations=[" << absl::StrJoin(duration_items, ", ") << "]"
+            << " total_prefill_ms=" << total_ms;
+  time_trace_logged_ = true;
 }
 
 void Request::log_statistic(double total_latency) {
@@ -89,21 +190,27 @@ void Request::log_statistic(double total_latency) {
       tpot = (generation_latency * 1000.0) / (gen_tokens - 1);
       gen_speed = gen_tokens / generation_latency;
     }
-    LOG(INFO) << "x-request-id: " << x_request_id_ << ", "
-              << "x-request-time: " << x_request_time_ << ", "
-              << "request_id: " << request_id_ << ", "
-              << "sequence " << idx++ << ", "
-              << "max_tokens: "
-              << seq->stopping_checker()->get_max_generated_tokens() << ", "
-              << "temperature: " << seq->sampling_param()->temperature << ", "
-              << "finish_reason: "
-              << seq->finish_reason().to_string().value_or("") << ", "
-              << "prompt_tokens: " << seq->num_prompt_tokens() << ", "
-              << "generated_tokens: " << gen_tokens << ", " << std::fixed
-              << std::setprecision(1) << "ttft: " << ttft * 1000 << "ms, "
-              << "total_latency: " << total_latency * 1000 << "ms, "
-              << "avg tpot: " << tpot << "ms, "
-              << "generation speed: " << gen_speed << " tokens/s";
+    std::ostringstream stat_stream;
+    stat_stream << "x-request-id: " << x_request_id_ << ", "
+                << "x-request-time: " << x_request_time_ << ", "
+                << "request_id: " << request_id_ << ", "
+                << "sequence " << idx++ << ", "
+                << "max_tokens: "
+                << seq->stopping_checker()->get_max_generated_tokens() << ", "
+                << "temperature: " << seq->sampling_param()->temperature << ", "
+                << "finish_reason: "
+                << seq->finish_reason().to_string().value_or("") << ", "
+                << "prompt_tokens: " << seq->num_prompt_tokens() << ", "
+                << "generated_tokens: " << gen_tokens << ", " << std::fixed
+                << std::setprecision(1) << "ttft: " << ttft * 1000 << "ms, "
+                << "total_latency: " << total_latency * 1000 << "ms, "
+                << "avg tpot: " << tpot << "ms, "
+                << "generation speed: " << gen_speed << " tokens/s";
+    if (!batch_id_vec_.empty()) {
+      stat_stream << ", prefill_batch_ids=["
+                  << absl::StrJoin(batch_id_vec_, ", ") << "]";
+    }
+    LOG(INFO) << stat_stream.str();
     // only log once when beam search is enabled
     if (check_beam_search()) {
       break;

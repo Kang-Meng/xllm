@@ -8,6 +8,7 @@ cc_test(
     disagg_pd_chunked_prefill_scheduler_test.cpp
     continuous_scheduler_test.cpp
     fixed_steps_scheduler_test.cpp
+    step_trace_dumper_test.cpp
   DEPS
     :scheduler
     :xllm_server
