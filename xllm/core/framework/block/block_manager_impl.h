@@ -19,7 +19,6 @@ limitations under the License.
 #include <mutex>
 
 #include "block_manager.h"
-#include "framework/kv_cache/kv_cache_event.h"
 
 namespace xllm {
 
@@ -51,8 +50,6 @@ class BlockManagerImpl : public BlockManager {
              const MMData& mm_data = MMData(),
              const Slice<XXH3Key>& block_hashes = {}) override;
   void cache(const std::vector<Block>& blocks) override;
-
-  void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
   size_t num_blocks_in_prefix_cache() const override {
     if (options_.enable_prefix_cache()) {
