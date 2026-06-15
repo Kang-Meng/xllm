@@ -105,6 +105,15 @@ class GroupCompositeBlockManager {
   // Free blocks of the allocator backing `state_id`; 0 when absent.
   virtual size_t group_free_blocks(CacheStateId state_id) const;
 
+  // Allocate `num_blocks` raw blocks from the leaf allocator backing
+  // `state_id`, for callers that grow a group out-of-band of the policy. The
+  // only such caller is the beam-search COW swap on the C1 attention group: a
+  // beam that overwrites its shared last block needs a private copy block but
+  // no policy-driven token growth. Returns fewer than requested (possibly
+  // empty) when the leaf pool is exhausted; never touches per-sequence state.
+  virtual std::vector<Block> allocate_blocks(CacheStateId state_id,
+                                             size_t num_blocks);
+
   // Blocks currently held out of the free list, summed across all group
   // allocators -- the composite's contribution to pool-level memory accounting.
   virtual size_t num_used_blocks() const;
@@ -120,6 +129,14 @@ class GroupCompositeBlockManager {
 
   // Fraction of owned blocks currently in use, in [0, 1]; 0 when empty.
   virtual double kv_cache_utilization() const;
+
+  // Reserve the xtensor padding block (block id 0) on the C1 group's leaf when
+  // that leaf is an XTensorBlockManagerImpl; a no-op for every other shape.
+  // Must run once after the KV tensors are created (the engine drives this
+  // through BlockManagerPool::reserve_xtensor_padding_blocks). This is the only
+  // place outside the constructor where the composite is xtensor-aware -- it
+  // keeps the leaf type hidden from the pool.
+  virtual void reserve_xtensor_padding_blocks();
 
  private:
   // Lazily size `kv_state`'s per-group state vector to match runtimes_,

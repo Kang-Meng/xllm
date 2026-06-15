@@ -58,6 +58,14 @@ struct ModelCacheGroupConfig {
   // Engine-level prefix-cache switch. Even for the normal shape, C1 is only
   // prefix-cacheable when this is set (and has_linear_state is not).
   bool enable_prefix_cache = true;
+
+  // xtensor C1-only model: back the C1 group's leaf with an
+  // XTensorBlockManagerImpl instead of the default BlockManagerImpl. Mutually
+  // exclusive with DSV4 and linear-state shapes, and forces C1 non-cacheable
+  // (xtensor does not support prefix cache). xtensor_params supplies the extra
+  // VMM construction arguments; read only when c1_leaf_xtensor is set.
+  bool c1_leaf_xtensor = false;
+  XTensorLeafParams xtensor_params;
 };
 
 // Build the ordered cache-group specs for a model in worker export order.

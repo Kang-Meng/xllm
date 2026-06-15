@@ -68,6 +68,13 @@ class ConcurrentCompositeBlockManager final
 
   size_t group_free_blocks(CacheStateId state_id) const override;
 
+  // The leaf allocators backing each group are plain (non-locking) pools, so
+  // the out-of-band beam COW allocation must serialize under the same lock as
+  // allocate/deallocate. The base method does not self-call a wrapped accessor,
+  // so a plain mutex stays deadlock-free here.
+  std::vector<Block> allocate_blocks(CacheStateId state_id,
+                                     size_t num_blocks) override;
+
   size_t num_used_blocks() const override;
 
   size_t num_total_blocks() const override;
@@ -75,6 +82,12 @@ class ConcurrentCompositeBlockManager final
   size_t num_blocks_in_prefix_cache() const override;
 
   double kv_cache_utilization() const override;
+
+  // Reserve the xtensor padding block under the same lock as the other
+  // sequence-level entries. Runs once at init; the base implementation only
+  // calls down into the leaf allocator, never back into a wrapped accessor, so
+  // a plain mutex stays deadlock-free here.
+  void reserve_xtensor_padding_blocks() override;
 
  private:
   // Serializes sequence-level allocate/deallocate across worker threads.

@@ -52,6 +52,13 @@ size_t ConcurrentCompositeBlockManager::group_free_blocks(
   return GroupCompositeBlockManager::group_free_blocks(state_id);
 }
 
+std::vector<Block> ConcurrentCompositeBlockManager::allocate_blocks(
+    CacheStateId state_id,
+    size_t num_blocks) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return GroupCompositeBlockManager::allocate_blocks(state_id, num_blocks);
+}
+
 size_t ConcurrentCompositeBlockManager::num_used_blocks() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return GroupCompositeBlockManager::num_used_blocks();
@@ -70,6 +77,11 @@ size_t ConcurrentCompositeBlockManager::num_blocks_in_prefix_cache() const {
 double ConcurrentCompositeBlockManager::kv_cache_utilization() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return GroupCompositeBlockManager::kv_cache_utilization();
+}
+
+void ConcurrentCompositeBlockManager::reserve_xtensor_padding_blocks() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  GroupCompositeBlockManager::reserve_xtensor_padding_blocks();
 }
 
 }  // namespace xllm

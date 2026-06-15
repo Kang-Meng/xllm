@@ -39,15 +39,37 @@ namespace {
 // linear-attention model (enable_linear_state) must never expose a cacheable
 // C1, because a prefix hit that skips prefill strands the unrecoverable
 // recurrent state. The builder CHECK-fails on any violation.
+//
+// xtensor is just another form of the C1 group: when enable_xtensor is set the
+// C1 leaf is an XTensorBlockManagerImpl (VMM page allocator) instead of the
+// default BlockManagerImpl, prefix cache is forced off, and only the C1-only
+// shape is allowed. `dp_rank` is the per-rank index the xtensor leaf needs for
+// its page allocator; ignored for the non-xtensor leaf.
 std::vector<CacheGroupSpec> make_normal_composite_specs(
     const BlockManagerPool::Options& options,
-    uint32_t single_res_num_blocks) {
+    uint32_t single_res_num_blocks,
+    int32_t dp_rank) {
   ModelCacheGroupConfig config;
   config.base_block_size = static_cast<uint32_t>(options.block_size());
   config.c1_num_blocks = options.num_blocks();
   config.single_res_num_blocks = single_res_num_blocks;
   config.has_linear_state = options.enable_linear_state();
   config.enable_prefix_cache = options.enable_prefix_cache();
+  if (options.enable_xtensor()) {
+    CHECK_GT(options.num_layers(), 0)
+        << "num_layers must be set when enable_xtensor is true";
+    CHECK_GT(options.slot_size(), 0)
+        << "slot_size must be set when enable_xtensor is true";
+    config.c1_leaf_xtensor = true;
+    config.xtensor_params.num_layers = options.num_layers();
+    // K and V share one slot size, so halve it for a single side's block.
+    config.xtensor_params.block_mem_size =
+        static_cast<size_t>(options.block_size()) * options.slot_size() / 2;
+    config.xtensor_params.page_size =
+        ::xllm::KVCacheConfig::get_instance().phy_page_granularity_size();
+    config.xtensor_params.dp_rank = dp_rank;
+    config.xtensor_params.model_id = options.model_id();
+  }
   return build_cache_group_specs(config);
 }
 
@@ -157,19 +179,23 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
   CHECK_GT(num_single_blocks, 0u) << "num_single_blocks must be positive";
 
   // The cache-group composite is the only device-side allocation architecture.
-  // The remaining non-composite islands are xtensor (page-allocator semantics)
-  // and the hierarchy host modes (host blocks / kvcache store), which keep the
+  // xtensor is folded in as a C1 group whose leaf is an XTensorBlockManagerImpl
+  // (see make_normal_composite_specs); the sole remaining non-composite island
+  // is the hierarchy host modes (host blocks / kvcache store), which keep the
   // monolithic managers until the hierarchy refactor (design doc steps 8-10)
   // lands. DSV4 (selected by a non-empty manager_types) supports neither
-  // island.
+  // xtensor nor the hierarchy island.
   const bool is_dsv4 = !options_.manager_types().empty();
   const bool hierarchy_mode = options_.enable_host_blocks() ||
                               options_.host_num_blocks() > 0 ||
                               options_.enable_kvcache_store();
-  composite_ = !options_.enable_xtensor() && !hierarchy_mode;
+  composite_ = !hierarchy_mode;
   CHECK(!is_dsv4 || composite_)
-      << "DSV4 requires the composite path: xtensor and hierarchy host modes "
+      << "DSV4 requires the composite path: the hierarchy host modes "
          "do not support SWA/compressed cache groups";
+  CHECK(!options_.enable_xtensor() || composite_)
+      << "xtensor requires the composite path: it is a C1-only leaf and does "
+         "not support the hierarchy host modes";
   if (composite_) {
     composite_managers_.reserve(dp_size);
   } else {
@@ -183,12 +209,15 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
   for (int32_t i = 0; i < dp_size; ++i) {
     if (composite_) {
       // One composite manager per DP rank: DSV4 SWA/C4/C128 + SINGLE_RES, or
-      // the normal/Qwen C1 + SINGLE_RES. Only disagg-PD enters sequence-level
-      // calls from off-scheduler threads (prefill threadpool cache/deallocate,
-      // decode-side handlers), so only that mode pays for the locked subclass.
+      // the normal/Qwen/xtensor C1 + SINGLE_RES. Only disagg-PD enters
+      // sequence-level calls from off-scheduler threads (prefill threadpool
+      // cache/deallocate, decode-side handlers), so only that mode pays for the
+      // locked subclass.
       const std::vector<CacheGroupSpec> specs =
-          is_dsv4 ? make_dsv4_composite_specs(options_, num_single_blocks)
-                  : make_normal_composite_specs(options_, num_single_blocks);
+          is_dsv4
+              ? make_dsv4_composite_specs(options_, num_single_blocks)
+              : make_normal_composite_specs(
+                    options_, num_single_blocks, /*dp_rank=*/i);
       if (options_.enable_disagg_pd()) {
         composite_managers_.emplace_back(
             std::make_unique<ConcurrentCompositeBlockManager>(specs));
@@ -198,31 +227,10 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       }
       continue;
     }
-    if (options_.enable_xtensor()) {
-      // Use XTensorBlockManagerImpl for xtensor mode.
-      CHECK_GT(options_.num_layers(), 0)
-          << "num_layers must be set when enable_xtensor is true";
-      CHECK_GT(options_.slot_size(), 0)
-          << "slot_size must be set when enable_xtensor is true";
-      size_t page_size =
-          ::xllm::KVCacheConfig::get_instance().phy_page_granularity_size();
-      // In the current implementation, K and V must be the same size, so we
-      // divide by 2.
-      size_t block_mem_size =
-          static_cast<size_t>(options_.block_size()) * options_.slot_size() / 2;
-      block_managers_.emplace_back(
-          std::make_unique<XTensorBlockManagerImpl>(block_options,
-                                                    options_.num_layers(),
-                                                    block_mem_size,
-                                                    page_size,
-                                                    /*dp_rank=*/i,
-                                                    options_.model_id()));
-    } else {
-      // Hierarchy host modes (host blocks / kvcache store) on the monolithic
-      // manager, until design doc steps 8-10 (composed device/host pools).
-      block_managers_.emplace_back(
-          std::make_unique<ConcurrentBlockManagerImpl>(block_options));
-    }
+    // Hierarchy host modes (host blocks / kvcache store) on the monolithic
+    // manager, until design doc steps 8-10 (composed device/host pools).
+    block_managers_.emplace_back(
+        std::make_unique<ConcurrentBlockManagerImpl>(block_options));
     // Scheduler-side per-sequence resources share one logical single-block
     // pool. Worker-side embedding and linear-state caches remain physically
     // separate and are addressed via transport fields.
@@ -323,8 +331,13 @@ void BlockManagerPool::deallocate(Sequence* sequence) {
   if (composite_) {
     // The composite inserts the final completed blocks into the prefix cache
     // from inside deallocate (the context carries the token view + hash chain),
-    // then releases every group -- SINGLE_RES included.
-    BlockManagerContext context = make_device_context(sequence, dp_rank);
+    // then releases every group -- SINGLE_RES included. A beam sequence skips
+    // that final insert (bare context): its decode blocks carry rewritten-token
+    // content that does not match the token hash, matching the allocate path.
+    BlockManagerContext context =
+        sequence->check_beam_search()
+            ? make_bare_device_context(sequence, dp_rank)
+            : make_device_context(sequence, dp_rank);
     composite_managers_[dp_rank]->deallocate(&context);
     sequence->reset();
     return;
@@ -371,7 +384,22 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
       // allocate, so the scheduler never drives a separate flush.
       composite_match_shared(sequence, dp_rank);
     }
-    BlockManagerContext context = make_device_context(sequence, dp_rank);
+    // Beam fork/COW adopts the scored source beam into the C1 group before the
+    // composite grows it. A no-op for non-beam sequences and for the beam
+    // prefill (no source blocks yet); fails only when the COW swap block is
+    // unavailable, which an in-flight decode treats as a preempt-on-next signal.
+    if (!composite_process_beam_search(sequence, dp_rank, num_tokens)) {
+      return false;
+    }
+    // A beam sequence must never lazy-flush into the prefix cache: after the
+    // per-beam swap/COW the block content no longer matches the token hash, so
+    // a bare context (no token view / hash chain) keeps the composite's
+    // internal insert from corrupting the cache. Prefix matching on first
+    // prefill still ran above (read-only, against the original prompt tokens).
+    BlockManagerContext context =
+        sequence->check_beam_search()
+            ? make_bare_device_context(sequence, dp_rank)
+            : make_device_context(sequence, dp_rank);
     if (!composite_managers_[dp_rank]->allocate(&context, num_tokens)) {
       // Only a fresh sequence is fully unwound; an in-flight decode keeps its
       // existing blocks for the scheduler to preempt (matches the legacy path).
@@ -530,6 +558,51 @@ bool BlockManagerPool::process_beam_search(Sequence* sequence, bool need_swap) {
     sequence->kv_state().process_beam_search(new_blocks[0]);
   } else {
     sequence->kv_state().process_beam_search(std::nullopt);
+  }
+  return true;
+}
+
+bool BlockManagerPool::composite_process_beam_search(Sequence* sequence,
+                                                     int32_t dp_rank,
+                                                     size_t num_tokens) {
+  if (!sequence->check_beam_search()) {
+    return true;
+  }
+
+  KVCacheState& kv_state = sequence->kv_state();
+  const Slice<Block> src_blocks = kv_state.src_blocks();
+  if (src_blocks.size() == 0) {
+    return true;
+  }
+
+  // Phase-1 scope: beam fork/COW is defined only over the C1 incremental
+  // attention group. DSV4 (no C1) and SWA reject beam upstream; this guards the
+  // contract instead of silently writing the disconnected flat block table.
+  CHECK(kv_state.group_state(CacheStateId::C1) != nullptr)
+      << "beam search on the composite path requires a C1 attention group";
+
+  // Copy-on-write the shared last block only when this step does NOT cross a
+  // block boundary: the new token then overwrites the (shared) last block in
+  // place, so a beam sharing it needs a private copy. When the step grows, the
+  // new token lands in the fresh block the composite allocate appends below, so
+  // the now-full last block stays safely shared (mirrors the legacy need_swap
+  // gate, which is true only in the no-growth branch).
+  const size_t block_size = static_cast<size_t>(options_.block_size());
+  const size_t num_blocks_needed = (num_tokens + block_size - 1) / block_size;
+  const bool no_growth = num_blocks_needed <= src_blocks.size();
+
+  if (no_growth && kv_state.need_swap()) {
+    std::vector<Block> new_blocks =
+        composite_managers_[dp_rank]->allocate_blocks(CacheStateId::C1,
+                                                      /*num_blocks=*/1);
+    if (new_blocks.empty()) {
+      return false;
+    }
+    swap_block_transfer_infos_[dp_rank].emplace_back(src_blocks.back().id(),
+                                                     new_blocks[0].id());
+    kv_state.process_beam_search(new_blocks[0]);
+  } else {
+    kv_state.process_beam_search(std::nullopt);
   }
   return true;
 }
@@ -734,12 +807,22 @@ void BlockManagerPool::reserve_xtensor_padding_blocks() {
     return;
   }
 
-  // Reserve padding block on each XTensorBlockManagerImpl.
-  for (auto& manager : block_managers_) {
-    auto* xtensor_manager =
-        dynamic_cast<XTensorBlockManagerImpl*>(manager.get());
-    if (xtensor_manager) {
-      xtensor_manager->reserve_xtensor_padding_blocks();
+  if (composite_) {
+    // xtensor is folded into the composite as a C1 leaf; each composite manager
+    // reserves the padding block on its own C1 group (no-op when that leaf is
+    // not xtensor). The leaf type stays hidden behind the composite.
+    for (auto& manager : composite_managers_) {
+      manager->reserve_xtensor_padding_blocks();
+    }
+  } else {
+    // TODO(phase-D): the hierarchy island still uses the monolithic managers;
+    // remove this branch once hierarchy migrates to the composite path.
+    for (auto& manager : block_managers_) {
+      auto* xtensor_manager =
+          dynamic_cast<XTensorBlockManagerImpl*>(manager.get());
+      if (xtensor_manager) {
+        xtensor_manager->reserve_xtensor_padding_blocks();
+      }
     }
   }
 

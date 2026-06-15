@@ -42,7 +42,9 @@ CacheGroupSpec make_single_res_spec(uint32_t num_blocks) {
 
 CacheGroupSpec make_c1_spec(uint32_t base_block_size,
                             uint32_t num_blocks,
-                            bool prefix_cacheable) {
+                            bool prefix_cacheable,
+                            LeafAllocatorKind leaf_kind,
+                            const XTensorLeafParams& xtensor_params) {
   CacheGroupSpec spec;
   spec.state_id = CacheStateId::C1;
   spec.policy_type = CachePolicyType::INCREMENTAL_APPEND;
@@ -54,6 +56,19 @@ CacheGroupSpec make_c1_spec(uint32_t base_block_size,
   spec.prefix_cacheable = prefix_cacheable;
   spec.export_targets = {WorkerExportTarget::BLOCK_TABLES};
   spec.export_index = -1;
+  spec.leaf_kind = leaf_kind;
+  if (leaf_kind == LeafAllocatorKind::XTENSOR) {
+    CHECK(!prefix_cacheable)
+        << "xtensor C1 leaf must not be prefix-cacheable (xtensor does not "
+           "support prefix cache)";
+    CHECK_GT(xtensor_params.num_layers, 0)
+        << "xtensor C1 leaf requires num_layers > 0";
+    CHECK_GT(xtensor_params.block_mem_size, 0u)
+        << "xtensor C1 leaf requires block_mem_size > 0";
+    CHECK_GT(xtensor_params.page_size, 0u)
+        << "xtensor C1 leaf requires page_size > 0";
+    spec.xtensor_params = xtensor_params;
+  }
   return spec;
 }
 
@@ -118,6 +133,14 @@ std::vector<CacheGroupSpec> build_cache_group_specs(
   const bool is_dsv4 =
       config.swa_window_blocks > 0 || !config.compress_ratios.empty();
 
+  if (config.c1_leaf_xtensor) {
+    CHECK(!is_dsv4)
+        << "xtensor C1 leaf supports C1-only models, not the DSV4 "
+           "(SWA/compressed) shape";
+    CHECK(!config.has_linear_state)
+        << "xtensor C1 leaf and linear-state shapes are mutually exclusive";
+  }
+
   std::vector<CacheGroupSpec> specs;
   if (is_dsv4) {
     CHECK(!config.has_linear_state)
@@ -142,11 +165,19 @@ std::vector<CacheGroupSpec> build_cache_group_specs(
     // Normal and Qwen3.5+ share the C1 + SINGLE_RES shape; they differ only in
     // whether C1 participates in prefix caching. A linear-state model must
     // never cache: a C1 hit that skips prefill strands the unrecoverable
-    // recurrent state.
+    // recurrent state. An xtensor C1 leaf also never caches (no prefix cache
+    // support) and swaps in the VMM allocator.
+    const bool c1_prefix_cacheable = config.enable_prefix_cache &&
+                                     !config.has_linear_state &&
+                                     !config.c1_leaf_xtensor;
+    const LeafAllocatorKind c1_leaf_kind = config.c1_leaf_xtensor
+                                               ? LeafAllocatorKind::XTENSOR
+                                               : LeafAllocatorKind::BLOCK_MANAGER;
     specs.push_back(make_c1_spec(config.base_block_size,
                                  config.c1_num_blocks,
-                                 /*prefix_cacheable=*/config.enable_prefix_cache &&
-                                     !config.has_linear_state));
+                                 c1_prefix_cacheable,
+                                 c1_leaf_kind,
+                                 config.xtensor_params));
   }
 
   specs.push_back(make_single_res_spec(config.single_res_num_blocks));

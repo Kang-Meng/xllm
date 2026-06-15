@@ -105,6 +105,20 @@ class BlockManagerPool : public KVCacheManager {
   int32_t get_dp_rank(Sequence* sequence) const;
 
   bool process_beam_search(Sequence* sequence, bool need_swap = false);
+
+  // Composite-path counterpart of process_beam_search: adopt the scored source
+  // beam's KV blocks into this sequence's C1 attention group, allocating one
+  // C1 swap block (and recording the COW transfer) when the shared last block
+  // must be copied in place (the no-growth step). `num_tokens` is the step's
+  // target committed length, used to tell a growing step (new token in a fresh
+  // block, no COW) from an in-place step. Mirrors the legacy need_swap logic
+  // but operates on the C1 group instead of the flat block table. Returns false
+  // only when the swap block cannot be allocated; a no-op (returns true) for
+  // non-beam sequences and beam sequences with no pending source blocks.
+  bool composite_process_beam_search(Sequence* sequence,
+                                     int32_t dp_rank,
+                                     size_t num_tokens);
+
   bool allocate_single_block(Sequence* sequence, int32_t dp_rank);
   void deallocate_single_block(Sequence* sequence, int32_t dp_rank);
 

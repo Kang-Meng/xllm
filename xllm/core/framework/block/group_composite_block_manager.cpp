@@ -25,6 +25,7 @@ limitations under the License.
 #include "framework/prefix_cache/prefix_cache.h"
 #include "framework/prefix_cache/prefix_hash_state.h"
 #include "framework/request/sequence_kv_state.h"
+#include "framework/xtensor/xtensor_block_manager_impl.h"
 
 namespace xllm {
 namespace {
@@ -38,7 +39,24 @@ std::unique_ptr<BlockManager> create_group_allocator(
       // policy and a separate group-local PrefixCache; the leaf allocator runs
       // as a pure block pool, accounting shared blocks purely via ref counts.
       .enable_prefix_cache(false);
-  return std::make_unique<BlockManagerImpl>(options);
+  switch (spec.leaf_kind) {
+    case LeafAllocatorKind::BLOCK_MANAGER:
+      return std::make_unique<BlockManagerImpl>(options);
+    case LeafAllocatorKind::XTENSOR: {
+      // xtensor is just another C1 leaf: same block-pool contract (its prefix
+      // methods are no-ops, matching enable_prefix_cache(false)), with extra
+      // VMM construction args carried on the spec.
+      const XTensorLeafParams& p = spec.xtensor_params;
+      return std::make_unique<XTensorBlockManagerImpl>(options,
+                                                       p.num_layers,
+                                                       p.block_mem_size,
+                                                       p.page_size,
+                                                       p.dp_rank,
+                                                       p.model_id);
+    }
+  }
+  LOG(FATAL) << "unknown leaf allocator kind " << to_string(spec.leaf_kind);
+  return nullptr;
 }
 
 }  // namespace
@@ -256,6 +274,19 @@ size_t GroupCompositeBlockManager::group_free_blocks(
   return 0;
 }
 
+std::vector<Block> GroupCompositeBlockManager::allocate_blocks(
+    CacheStateId state_id,
+    size_t num_blocks) {
+  for (CacheGroupRuntime& runtime : runtimes_) {
+    if (runtime.spec.state_id == state_id) {
+      return runtime.allocator->allocate(num_blocks);
+    }
+  }
+  LOG(FATAL) << "composite manager has no cache group for state "
+             << to_string(state_id);
+  return {};
+}
+
 size_t GroupCompositeBlockManager::num_used_blocks() const {
   // Mirror num_free_blocks()'s group selection so the accounting trio stays
   // consistent: count only the schedulable token-linear KV pool. C1 is that
@@ -318,6 +349,22 @@ double GroupCompositeBlockManager::kv_cache_utilization() const {
   }
   return static_cast<double>(GroupCompositeBlockManager::num_used_blocks()) /
          static_cast<double>(total);
+}
+
+void GroupCompositeBlockManager::reserve_xtensor_padding_blocks() {
+  // Only an xtensor-backed C1 leaf needs the id-0 padding reservation; every
+  // other leaf kind is a no-op. The dynamic_cast keeps the xtensor type out of
+  // the composite's general code path -- the manager stays xtensor-aware only
+  // here and in create_group_allocator.
+  for (CacheGroupRuntime& runtime : runtimes_) {
+    if (runtime.spec.state_id != CacheStateId::C1) {
+      continue;
+    }
+    if (auto* xtensor =
+            dynamic_cast<XTensorBlockManagerImpl*>(runtime.allocator.get())) {
+      xtensor->reserve_xtensor_padding_blocks();
+    }
+  }
 }
 
 }  // namespace xllm

@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "framework/block/block.h"
@@ -46,6 +47,29 @@ enum class CacheStateId : int8_t {
 enum class CacheStorageRole : int8_t {
   DEVICE = 0,
   HOST = 1,
+};
+
+// Which concrete BlockManager backs a cache group's leaf block pool. The
+// default normal/Qwen/DSV4 groups use a plain BlockManagerImpl pool; an xtensor
+// C1-only model swaps just the C1 group's leaf for an XTensorBlockManagerImpl
+// (virtual-memory page allocator). The composite is xtensor-aware only when
+// building this leaf -- every other code path treats the group as a normal C1.
+enum class LeafAllocatorKind : int8_t {
+  BLOCK_MANAGER = 0,
+  XTENSOR = 1,
+};
+
+// Construction parameters an XTensor leaf needs beyond the shared
+// BlockManager::Options. Read only when leaf_kind == XTENSOR; left default for
+// every other group so it never disturbs the common path.
+struct XTensorLeafParams {
+  int64_t num_layers = 0;
+  // block_size * slot_size / 2 (K and V share one slot size).
+  size_t block_mem_size = 0;
+  // KVCacheConfig::phy_page_granularity_size().
+  size_t page_size = 0;
+  int32_t dp_rank = 0;
+  std::string model_id;
 };
 
 // Which worker-side input a cache state's block list is exported to.
@@ -95,6 +119,16 @@ constexpr const char* to_string(CacheStorageRole role) {
   return "unknown";
 }
 
+constexpr const char* to_string(LeafAllocatorKind kind) {
+  switch (kind) {
+    case LeafAllocatorKind::BLOCK_MANAGER:
+      return "block_manager";
+    case LeafAllocatorKind::XTENSOR:
+      return "xtensor";
+  }
+  return "unknown";
+}
+
 constexpr const char* to_string(WorkerExportTarget target) {
   switch (target) {
     case WorkerExportTarget::NONE:
@@ -128,6 +162,11 @@ struct CacheGroupSpec {
   // SINGLE_RES-like states export to several worker inputs, hence a list.
   std::vector<WorkerExportTarget> export_targets;
   int32_t export_index = -1;
+  // Which concrete BlockManager backs this group's leaf pool. Only the C1 group
+  // of an xtensor model differs from the default; xtensor_params is read solely
+  // when leaf_kind == XTENSOR.
+  LeafAllocatorKind leaf_kind = LeafAllocatorKind::BLOCK_MANAGER;
+  XTensorLeafParams xtensor_params;
 };
 
 // One ring-slot replacement produced by RollingWindowPolicy. The old block is
