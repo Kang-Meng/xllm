@@ -22,23 +22,19 @@ namespace xllm {
 
 namespace {
 void try_replace_unique_blocks(std::vector<Block>&& matched_shared_blocks,
-                               uint32_t* num_owned_shared_blocks,
-                               std::vector<Block>* owned_blocks) {
+                               CacheGroupState* c1) {
   uint32_t num_matched_shared_blocks = matched_shared_blocks.size();
-  if (*num_owned_shared_blocks < num_matched_shared_blocks) {
-    CHECK_GE(owned_blocks->size(), num_matched_shared_blocks);
+  if (c1->shared_blocks_num < num_matched_shared_blocks) {
+    CHECK_GE(c1->blocks.size(), num_matched_shared_blocks);
     std::move(matched_shared_blocks.begin(),
               matched_shared_blocks.begin() + num_matched_shared_blocks,
-              owned_blocks->begin());
-    *num_owned_shared_blocks = num_matched_shared_blocks;
+              c1->blocks.begin());
+    c1->shared_blocks_num = num_matched_shared_blocks;
   }
 }
 }  // namespace
 
 const CacheGroupState* KVCacheState::c1_view_group() const {
-  if (groups_.empty()) {
-    return nullptr;
-  }
   for (const CacheGroupState& group : groups_) {
     if (group.state_id == CacheStateId::C1) {
       return &group;
@@ -47,11 +43,23 @@ const CacheGroupState* KVCacheState::c1_view_group() const {
   return nullptr;
 }
 
+CacheGroupState* KVCacheState::mutable_c1_group() {
+  for (CacheGroupState& group : groups_) {
+    if (group.state_id == CacheStateId::C1) {
+      return &group;
+    }
+  }
+  CacheGroupState c1;
+  c1.state_id = CacheStateId::C1;
+  groups_.emplace_back(std::move(c1));
+  return &groups_.back();
+}
+
 size_t KVCacheState::shared_kv_blocks_num() const {
   if (const CacheGroupState* c1 = c1_view_group()) {
     return c1->shared_blocks_num;
   }
-  return num_owned_shared_blocks_;
+  return 0;
 }
 
 CacheGroupState* KVCacheState::group_state(CacheStateId state_id) {
@@ -89,16 +97,11 @@ std::vector<const CacheGroupState*> KVCacheState::multi_block_table_groups()
 }
 
 size_t KVCacheState::shared_kv_tokens_num() const {
-  if (const CacheGroupState* c1 = c1_view_group()) {
-    if (c1->blocks.empty() || c1->shared_blocks_num == 0) {
-      return 0;
-    }
-    return c1->shared_blocks_num * c1->blocks[0].size();
-  }
-  if (blocks_.empty() || num_owned_shared_blocks_ == 0) {
+  const CacheGroupState* c1 = c1_view_group();
+  if (c1 == nullptr || c1->blocks.empty() || c1->shared_blocks_num == 0) {
     return 0;
   }
-  return num_owned_shared_blocks_ * blocks_[0].size();
+  return c1->shared_blocks_num * c1->blocks[0].size();
 }
 
 size_t KVCacheState::kv_cache_tokens_num() const {
@@ -115,41 +118,46 @@ void KVCacheState::incr_kv_cache_tokens_num(size_t num) {
 }
 
 void KVCacheState::add_kv_blocks(const std::vector<Block>& new_blocks) {
-  // hierarchy-only; delete in Phase D. Grows the flat blocks_ vector; the
-  // composite path grows blocks through its per-group policies instead.
-  blocks_.insert(blocks_.end(), new_blocks.begin(), new_blocks.end());
+  // Append to the C1 attention group, creating it on demand. Used by the test
+  // seeding helpers and any path that grows attention KV outside the composite
+  // manager's own per-group policies.
+  CacheGroupState* c1 = mutable_c1_group();
+  c1->blocks.insert(c1->blocks.end(), new_blocks.begin(), new_blocks.end());
 }
 
 void KVCacheState::incr_shared_kv_blocks_num(size_t num) {
-  // hierarchy-only; delete in Phase D. Tracks shared blocks on the flat path;
-  // the composite path tracks this per group in CacheGroupState.
-  CHECK(num_owned_shared_blocks_ + num <= num_kv_blocks());
-  num_owned_shared_blocks_ += num;
+  // Bump the C1 group's shared-block count. The decode path (disagg PD) treats
+  // the whole prefilled prompt as a prefix-cache hit; prefetch results land
+  // here too. Only C1 is handled for now -- SINGLE_RES / compressed groups need
+  // finer accounting once prefetch returns matched tokens instead of blocks.
+  CacheGroupState* c1 = mutable_c1_group();
+  CHECK(c1->shared_blocks_num + num <= c1->blocks.size());
+  c1->shared_blocks_num += num;
 }
 
 void KVCacheState::add_shared_kv_blocks(std::vector<Block>&& blocks,
                                         size_t current_total_num_tokens) {
-  // hierarchy-only; delete in Phase D. Operates on the flat blocks_ vector; the
-  // composite path attaches shared blocks via composite_match_shared.
+  // Attach matched prefix-cache blocks to the C1 attention group, creating it
+  // on demand.
   if (blocks.empty()) {
     return;
   }
+  CacheGroupState* c1 = mutable_c1_group();
   // The number of matched blocks may be fewer than the number of blocks held by
   // the sequence itself. In this case, try to replace the blocks computed by
   // the sequence with blocks from the prefix_cache and release the computed
   // blocks to save kv_cache as much as possible.
-  if (blocks.size() <= blocks_.size()) {
-    try_replace_unique_blocks(
-        std::move(blocks), &num_owned_shared_blocks_, &blocks_);
+  if (blocks.size() <= c1->blocks.size()) {
+    try_replace_unique_blocks(std::move(blocks), c1);
     return;
   }
 
-  blocks_.clear();
-  num_owned_shared_blocks_ = blocks.size();
-  blocks_ = std::move(blocks);
+  c1->blocks.clear();
+  c1->shared_blocks_num = blocks.size();
+  c1->blocks = std::move(blocks);
 
   // update the kv cache position
-  size_t num_shared_tokens = blocks_.size() * blocks_[0].size();
+  size_t num_shared_tokens = c1->blocks.size() * c1->blocks[0].size();
   // It is possible that num_shared_tokens == current_total_num_tokens,
   // indicating that the exact same prompt has been received again. In this
   // case, it becomes necessary to adjust the kv cache position to the
@@ -157,13 +165,13 @@ void KVCacheState::add_shared_kv_blocks(std::vector<Block>&& blocks,
   // should be immutable ideally, but it remains safe to regenerate the kv
   // cache in this context, given the utiliztion of the exact same token.
   if (num_shared_tokens == current_total_num_tokens) {
-    size_t block_size = blocks_[0].size();
+    size_t block_size = c1->blocks[0].size();
     CHECK_GT(block_size, 0);
     num_shared_tokens =
         ((current_total_num_tokens - 1) / block_size) * block_size;
-    if (num_owned_shared_blocks_ > 0) {
-      num_owned_shared_blocks_--;
-      blocks_.pop_back();
+    if (c1->shared_blocks_num > 0) {
+      c1->shared_blocks_num--;
+      c1->blocks.pop_back();
     }
   }
   CHECK_LT(num_shared_tokens, current_total_num_tokens);
@@ -199,11 +207,6 @@ size_t KVCacheState::current_max_tokens_capacity() const {
     }
     return has_compressed ? capacity : 0;
   }
-  if (!blocks_.empty()) {
-    // all blocks have the same size
-    const size_t block_size = blocks_[0].size();
-    return blocks_.size() * block_size;
-  }
   return 0;
 }
 
@@ -212,19 +215,15 @@ Slice<Block> KVCacheState::kv_blocks() const {
   if (const CacheGroupState* c1 = c1_view_group()) {
     return c1->blocks;
   }
-  return blocks_;
+  return {};
 }
-
-// hierarchy-only; delete in Phase D. Returns &blocks_ with no C1 read-through,
-// so it is meaningful only on the non-composite (hierarchy) path.
-std::vector<Block>* KVCacheState::mutable_kv_blocks() { return &blocks_; }
 
 // get the number of blocks
 size_t KVCacheState::num_kv_blocks() const {
   if (const CacheGroupState* c1 = c1_view_group()) {
     return c1->blocks.size();
   }
-  return blocks_.size();
+  return 0;
 }
 
 std::vector<int32_t> KVCacheState::kv_cache_slots(int32_t pos_start,
@@ -266,9 +265,7 @@ void KVCacheState::advance_transfer_block_idx(size_t idx) {
 
 void KVCacheState::reset() {
   kv_cache_tokens_num_ = 0;
-  num_owned_shared_blocks_ = 0;
   pushed_local_block_count_ = 0;
-  blocks_.clear();
   groups_.clear();
   transfer_kv_info_.reset();
   next_transfer_block_idx_ = 0;
@@ -283,28 +280,17 @@ void KVCacheState::reset_single_resource_group() {
 }
 
 void KVCacheState::process_beam_search(std::optional<Block> new_block) {
-  // Adopt the scored source beam's KV blocks as this sequence's own. On the
-  // composite path the live attention view is the C1 group, so the swap targets
-  // c1->blocks; the legacy flat blocks_ is retarget-ed only off the composite
-  // path. When new_block is set (need_swap COW) the shared last block is
-  // replaced by the freshly allocated copy so the new token does not overwrite
-  // a block another beam still reads.
-  if (CacheGroupState* c1 = group_state(CacheStateId::C1)) {
-    c1->blocks.clear();
-    c1->blocks = std::move(src_blocks_);
-    if (new_block.has_value()) {
-      c1->blocks.pop_back();
-      c1->blocks.emplace_back(new_block.value());
-    }
-    return;
-  }
-
-  blocks_.clear();
-  blocks_ = std::move(src_blocks_);
-
+  // Adopt the scored source beam's KV blocks as this sequence's own. The live
+  // attention view is the C1 group, so the swap targets c1->blocks, creating
+  // the group on demand. When new_block is set (need_swap COW) the shared last
+  // block is replaced by the freshly allocated copy so the new token does not
+  // overwrite a block another beam still reads.
+  CacheGroupState* c1 = mutable_c1_group();
+  c1->blocks.clear();
+  c1->blocks = std::move(src_blocks_);
   if (new_block.has_value()) {
-    blocks_.pop_back();
-    blocks_.emplace_back(new_block.value());
+    c1->blocks.pop_back();
+    c1->blocks.emplace_back(new_block.value());
   }
 }
 

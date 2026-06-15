@@ -36,23 +36,22 @@ class KVCacheState {
   size_t shared_kv_blocks_num() const;
   size_t shared_kv_tokens_num() const;
 
-  // hierarchy-only; delete in Phase D. These append/replace the flat blocks_
-  // vector directly and are reached only on the non-composite (hierarchy) path;
-  // the composite path grows blocks through its per-group policies instead.
+  // Append attention KV blocks to the C1 group (created on demand). Used by the
+  // test seeding helpers and any path that grows attention KV outside the
+  // composite manager's own per-group policies.
   void add_kv_blocks(const std::vector<Block>& new_blocks);
   void add_shared_kv_blocks(std::vector<Block>&& blocks,
                             size_t current_total_num_tokens);
+  // Bump the C1 group's shared-block count (the decode / prefetch prefix-hit
+  // accounting). Only C1 is handled; compressed / SINGLE_RES groups need finer
+  // accounting once prefetch returns matched tokens instead of blocks.
   void incr_shared_kv_blocks_num(size_t num);
 
   size_t current_max_tokens_capacity() const;
 
-  // Dual-use bridge: reads through to the C1 group on the composite path and
-  // falls back to the flat blocks_ on the hierarchy path. Collapses to a
-  // groups_-only read in Phase D, when blocks_ is removed.
+  // Allocated attention KV blocks, read through the C1 group; empty when this
+  // sequence holds no C1 group (e.g. DSV4).
   Slice<Block> kv_blocks() const;
-  // hierarchy-only; delete in Phase D. Returns &blocks_ unconditionally (no C1
-  // read-through), so it is meaningful only on the non-composite path.
-  std::vector<Block>* mutable_kv_blocks();
 
   Slice<Block> src_blocks() const { return src_blocks_; };
 
@@ -69,9 +68,9 @@ class KVCacheState {
   std::vector<int32_t> kv_cache_slots(int32_t pos_start, int32_t pos_end);
 
   // Per-cache-group runtime state, index-aligned with the owning composite
-  // manager's CacheGroupRuntime entries. This is the CompositeKVState role of
-  // the block-manager refactor; the legacy flat blocks_ view above is retained
-  // for the monolithic (non-composite) path.
+  // manager's CacheGroupRuntime entries. This is the sole KV storage: the flat
+  // read views above (kv_blocks / shared counts / capacity) project the C1
+  // attention group out of this vector.
   const std::vector<CacheGroupState>& groups() const { return groups_; }
   std::vector<CacheGroupState>* mutable_groups() { return &groups_; }
   // Returns the group state for `state_id`, or nullptr when this sequence holds
@@ -87,8 +86,8 @@ class KVCacheState {
   std::vector<const CacheGroupState*> multi_block_table_groups() const;
 
   // True once this sequence is managed by the group-composite manager (its
-  // per-group state vector has been materialized). The legacy flat views below
-  // then read through to the C1 attention group instead of `blocks_`.
+  // per-group state vector has been materialized). The flat views above then
+  // read through to the C1 attention group.
   bool on_composite_path() const { return !groups_.empty(); }
 
   void set_transfer_kv_info(TransferKVInfo&& info);
@@ -119,23 +118,21 @@ class KVCacheState {
   void process_beam_search(std::optional<Block> new_block = std::nullopt);
 
  private:
-  // The C1 attention group when this sequence is on the composite path, else
-  // nullptr. Backs the legacy flat views (kv_blocks / num_kv_blocks /
-  // kv_cache_slots / capacity / shared counts) for normal and Qwen3.5+ models.
-  // Dual-use bridge: once blocks_ is deleted in Phase D the flat fallbacks go
-  // away and these views read groups_ exclusively.
+  // The C1 attention group when this sequence holds one, else nullptr. Backs the
+  // flat read views (kv_blocks / num_kv_blocks / kv_cache_slots / capacity /
+  // shared counts) for normal and Qwen3.5+ models.
   const CacheGroupState* c1_view_group() const;
+
+  // The C1 attention group, created on demand if this sequence holds none.
+  // Backs the write paths (add_kv_blocks / add_shared_kv_blocks /
+  // incr_shared_kv_blocks_num / process_beam_search).
+  CacheGroupState* mutable_c1_group();
 
   // number of tokens in kv cache
   size_t kv_cache_tokens_num_ = 0;
 
-  // hierarchy-only; delete in Phase D. Flat KV-block vector for the
-  // non-composite (hierarchy host-mode) path. Empty on the composite path,
-  // where blocks live in groups_ instead.
-  std::vector<Block> blocks_;
-
-  // source kv cache blocks for swap (dual-use: beam fork/COW reads this on both
-  // the composite and hierarchy paths).
+  // source kv cache blocks for swap (beam fork / COW reads this to retarget the
+  // C1 group to the scored source beam's blocks).
   std::vector<Block> src_blocks_;
 
   // if need to swap last block
@@ -146,10 +143,6 @@ class KVCacheState {
 
   // next logical prompt block index that needs PD PUSH transfer.
   size_t next_transfer_block_idx_ = 0;
-
-  // hierarchy-only; delete in Phase D. Shared-block count for the flat blocks_
-  // path; the composite path tracks this per group in CacheGroupState instead.
-  uint32_t num_owned_shared_blocks_ = 0;
 
   // Per-cache-group runtime state for the CacheGroupRuntime-based composite
   // manager. Index-aligned with the manager's states_ (worker export order).

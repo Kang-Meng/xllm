@@ -22,7 +22,6 @@ limitations under the License.
 #include "framework/block/block_manager_context.h"
 #include "framework/block/concurrent_composite_block_manager.h"
 #include "framework/block/kv_cache_manager.h"
-#include "framework/block/single_block_manager.h"
 
 namespace xllm {
 
@@ -104,26 +103,19 @@ class BlockManagerPool : public KVCacheManager {
   int32_t get_manager_with_max_free_blocks() const;
   int32_t get_dp_rank(Sequence* sequence) const;
 
-  bool process_beam_search(Sequence* sequence, bool need_swap = false);
-
-  // Composite-path counterpart of process_beam_search: adopt the scored source
-  // beam's KV blocks into this sequence's C1 attention group, allocating one
-  // C1 swap block (and recording the COW transfer) when the shared last block
-  // must be copied in place (the no-growth step). `num_tokens` is the step's
-  // target committed length, used to tell a growing step (new token in a fresh
-  // block, no COW) from an in-place step. Mirrors the legacy need_swap logic
-  // but operates on the C1 group instead of the flat block table. Returns false
-  // only when the swap block cannot be allocated; a no-op (returns true) for
-  // non-beam sequences and beam sequences with no pending source blocks.
+  // Composite-path beam fork/COW: adopt the scored source beam's KV blocks into
+  // this sequence's C1 attention group, allocating one C1 swap block (and
+  // recording the COW transfer) when the shared last block must be copied in
+  // place (the no-growth step). `num_tokens` is the step's target committed
+  // length, used to tell a growing step (new token in a fresh block, no COW)
+  // from an in-place step. Returns false only when the swap block cannot be
+  // allocated; a no-op (returns true) for non-beam sequences and beam sequences
+  // with no pending source blocks.
   bool composite_process_beam_search(Sequence* sequence,
                                      int32_t dp_rank,
                                      size_t num_tokens);
 
-  bool allocate_single_block(Sequence* sequence, int32_t dp_rank);
-  void deallocate_single_block(Sequence* sequence, int32_t dp_rank);
-
-  // Number of per-DP managers backing the selected path: composite_managers_
-  // on the normal composite path, block_managers_ otherwise.
+  // Number of per-DP composite managers backing the pool.
   size_t manager_count() const;
 
   // Composite-path prefix match: attaches the C1 group's shared blocks to the
@@ -137,31 +129,19 @@ class BlockManagerPool : public KVCacheManager {
 
  private:
   std::vector<std::vector<BlockTransferInfo>> swap_block_transfer_infos_;
-  // hierarchy-only; delete in Phase D. Per-sequence resource ids for the
-  // hierarchy host modes (host blocks / kvcache store). On the composite path
-  // -- which now includes xtensor -- the same resource is the SINGLE_RES cache
-  // group inside each composite manager, so this stays empty.
-  std::vector<std::unique_ptr<SingleBlockManager>> single_block_managers_;
 
  protected:
   // the options for the block manager
   Options options_;
-  // hierarchy-only; delete in Phase D. The monolithic per-DP managers, used
-  // only by the hierarchy host-mode island (the sole non-composite path). Empty
-  // on every composite path (normal / Qwen / DSV4 / xtensor).
-  std::vector<std::unique_ptr<BlockManager>> block_managers_;
 
-  // Cache-group composite path (block-manager refactor): when true,
-  // block_managers_ stays empty and each DP rank is served by a composite
-  // manager (the locked ConcurrentCompositeBlockManager subclass under
-  // disagg-PD, the lock-free base otherwise). The normal model uses
-  // C1 + SINGLE_RES groups; DSV4 (selected by a non-empty manager_types) uses
-  // SWA + compressed C4/C128 + SINGLE_RES; xtensor uses C1 (with an
-  // XTensorBlockManagerImpl leaf) + SINGLE_RES. The only remaining
-  // non-composite island is the hierarchy host modes (host blocks / kvcache
-  // store), which keep using block_managers_ until the hierarchy refactor
-  // lands; composite_ and all of block_managers_ go away in Phase D.
-  bool composite_ = false;
+  // Cache-group composite path: each DP rank is served by a composite manager
+  // (the locked ConcurrentCompositeBlockManager subclass under disagg-PD, the
+  // lock-free base otherwise). The normal model uses C1 + SINGLE_RES groups;
+  // DSV4 (selected by a non-empty manager_types) uses SWA + compressed C4/C128 +
+  // SINGLE_RES; xtensor uses C1 (with an XTensorBlockManagerImpl leaf) +
+  // SINGLE_RES. The hierarchy host modes (host blocks / kvcache store) are
+  // temporarily disabled during the block-manager refactor and rebuilt in
+  // Phase C'.
   std::vector<std::unique_ptr<GroupCompositeBlockManager>> composite_managers_;
 };
 

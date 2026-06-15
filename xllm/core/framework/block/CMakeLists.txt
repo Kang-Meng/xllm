@@ -41,7 +41,11 @@ cc_library(
     block_manager_pool.cpp
     concurrent_block_manager_impl.cpp
     block_manager_impl.cpp
-    hierarchy_block_manager_pool.cpp
+    # hierarchy_block_manager_pool.cpp -- temporarily NOT compiled during the
+    # block-manager refactor. B5 shell-disabled it (ctor LOG(FATAL)); D' deleted
+    # the flat KVCacheState surfaces it still calls. The file is kept on disk as
+    # the reference implementation for the Phase C' hierarchy rebuild and is
+    # re-added here when C' restores host-offload / kvcache-store.
   DEPS
     :block_utils
     $<$<BOOL:${USE_NPU}>:torch_npu>
