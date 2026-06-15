@@ -27,6 +27,15 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
     Engine* engine,
     int32_t dp_size)
     : engine_(engine), BlockManagerPool(options, dp_size) {
+  // hierarchy temporarily disabled during the block-manager refactor. The
+  // device + host dual KVCacheState below still depends on the flat blocks_
+  // path that Phase D' removes; Phase C' rebuilds this pool on the groups_-only
+  // composite base. Until then construction fails loudly through any path (the
+  // primary selection guard lives in llm_engine.cpp). See
+  // docs/zh/design/hierarchy_composite_migration_design.md.
+  LOG(FATAL) << "HierarchyBlockManagerPool is temporarily disabled during the "
+                "block-manager refactor (hierarchy rebuild in progress). "
+                "Disable --host_blocks_factor and --enable_kvcache_store.";
   CHECK(dp_size > 0) << "dp_size must be greater than 0";
   host_block_managers_.reserve(dp_size);
 

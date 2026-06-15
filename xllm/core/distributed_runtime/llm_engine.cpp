@@ -565,11 +565,18 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   }
 
   if (options_.host_blocks_factor() > 1.0 || options_.enable_kvcache_store()) {
-    kv_cache_manager_ =
-        std::make_unique<HierarchyBlockManagerPool>(options, this, dp_size_);
-  } else {
-    kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
+    // hierarchy temporarily disabled during the block-manager refactor.
+    // host-offload / kvcache-store route the device + host dual KVCacheState
+    // through the flat blocks_ path, which Phase D' removes. Phase C' rebuilds
+    // hierarchy on the groups_-only composite base (see
+    // docs/zh/design/hierarchy_composite_migration_design.md). Until then this
+    // path fails loudly rather than silently degrading to a device-only pool.
+    LOG(FATAL) << "host-offload / kvcache-store is temporarily disabled during "
+                  "the block-manager refactor (hierarchy rebuild in progress). "
+                  "Please disable --host_blocks_factor and --enable_kvcache_store "
+                  "for now.";
   }
+  kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
   // init kv cache for each worker in parallel
   std::vector<folly::SemiFuture<bool>> futures;
