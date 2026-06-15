@@ -121,6 +121,87 @@ TEST(CacheGroupSpecBuilderTest, LinearStateModelDisablesPrefixCaching) {
   }
 }
 
+// The default (non-xtensor) C1 group keeps the BLOCK_MANAGER leaf and an empty
+// xtensor_params -- a regression guard for the leaf_kind field added to route
+// xtensor through the composite path.
+TEST(CacheGroupSpecBuilderTest, NormalC1UsesBlockManagerLeaf) {
+  ModelCacheGroupConfig config;
+  config.base_block_size = 16;
+  config.c1_num_blocks = 100;
+  config.single_res_num_blocks = 50;
+
+  std::vector<CacheGroupSpec> specs = build_cache_group_specs(config);
+
+  const CacheGroupSpec* c1 = find_spec(specs, CacheStateId::C1);
+  ASSERT_NE(c1, nullptr);
+  EXPECT_EQ(c1->leaf_kind, LeafAllocatorKind::BLOCK_MANAGER);
+  EXPECT_EQ(c1->xtensor_params.num_layers, 0);
+  EXPECT_EQ(c1->xtensor_params.block_mem_size, 0u);
+  EXPECT_EQ(c1->xtensor_params.page_size, 0u);
+}
+
+// xtensor C1-only model: the C1 group's leaf is an XTensor allocator carrying
+// the VMM construction params, the group is forced non-cacheable (xtensor has
+// no prefix cache), and SINGLE_RES is still appended with the default
+// BLOCK_MANAGER leaf -- the per-sequence resource never lives in xtensor.
+TEST(CacheGroupSpecBuilderTest, XTensorC1LeafEmitsNonCacheableXtensorGroup) {
+  ModelCacheGroupConfig config;
+  config.base_block_size = 16;
+  config.c1_num_blocks = 100;
+  config.single_res_num_blocks = 50;
+  config.c1_leaf_xtensor = true;
+  config.xtensor_params.num_layers = 32;
+  config.xtensor_params.block_mem_size = 4096;
+  config.xtensor_params.page_size = 2 * 1024 * 1024;
+  config.xtensor_params.dp_rank = 1;
+  config.xtensor_params.model_id = "xtensor-model";
+
+  std::vector<CacheGroupSpec> specs = build_cache_group_specs(config);
+
+  ASSERT_EQ(specs.size(), 2u);
+  EXPECT_EQ(specs[0].state_id, CacheStateId::C1);
+  EXPECT_EQ(specs[1].state_id, CacheStateId::SINGLE_RES);
+
+  const CacheGroupSpec& c1 = specs[0];
+  EXPECT_EQ(c1.leaf_kind, LeafAllocatorKind::XTENSOR);
+  EXPECT_EQ(c1.policy_type, CachePolicyType::INCREMENTAL_APPEND);
+  // xtensor never participates in prefix caching.
+  EXPECT_FALSE(c1.prefix_cacheable);
+  EXPECT_EQ(c1.prefix_group, PrefixCacheGroup::INVALID);
+  EXPECT_EQ(c1.xtensor_params.num_layers, 32);
+  EXPECT_EQ(c1.xtensor_params.block_mem_size, 4096u);
+  EXPECT_EQ(c1.xtensor_params.page_size, 2u * 1024u * 1024u);
+  EXPECT_EQ(c1.xtensor_params.dp_rank, 1);
+  EXPECT_EQ(c1.xtensor_params.model_id, "xtensor-model");
+
+  // The per-sequence resource group is never an xtensor leaf.
+  const CacheGroupSpec& single_res = specs[1];
+  EXPECT_EQ(single_res.leaf_kind, LeafAllocatorKind::BLOCK_MANAGER);
+}
+
+// The engine prefix-cache switch is irrelevant for an xtensor C1 leaf: even
+// with prefix cache enabled the xtensor group stays non-cacheable, because the
+// allocator has no prefix-cache support at all.
+TEST(CacheGroupSpecBuilderTest, XTensorC1LeafStaysNonCacheableEvenWithPrefixOn) {
+  ModelCacheGroupConfig config;
+  config.base_block_size = 16;
+  config.c1_num_blocks = 100;
+  config.single_res_num_blocks = 50;
+  config.enable_prefix_cache = true;
+  config.c1_leaf_xtensor = true;
+  config.xtensor_params.num_layers = 8;
+  config.xtensor_params.block_mem_size = 1024;
+  config.xtensor_params.page_size = 4096;
+
+  std::vector<CacheGroupSpec> specs = build_cache_group_specs(config);
+
+  const CacheGroupSpec* c1 = find_spec(specs, CacheStateId::C1);
+  ASSERT_NE(c1, nullptr);
+  EXPECT_EQ(c1->leaf_kind, LeafAllocatorKind::XTENSOR);
+  EXPECT_FALSE(c1->prefix_cacheable);
+  EXPECT_EQ(c1->prefix_group, PrefixCacheGroup::INVALID);
+}
+
 // DSV4: SWA (rolling window) then compressed C4/C128 in multi_block_tables
 // export order, then SINGLE_RES. No C1, nothing cacheable in phase 1.
 TEST(CacheGroupSpecBuilderTest, Dsv4EmitsSwaAndCompressedGroupsInExportOrder) {
