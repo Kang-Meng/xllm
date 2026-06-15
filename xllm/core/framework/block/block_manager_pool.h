@@ -137,14 +137,18 @@ class BlockManagerPool : public KVCacheManager {
 
  private:
   std::vector<std::vector<BlockTransferInfo>> swap_block_transfer_infos_;
-  // Per-sequence resource ids for the non-composite islands only (xtensor,
-  // hierarchy host modes). On the composite path the same resource is the
-  // SINGLE_RES cache group inside each composite manager.
+  // hierarchy-only; delete in Phase D. Per-sequence resource ids for the
+  // hierarchy host modes (host blocks / kvcache store). On the composite path
+  // -- which now includes xtensor -- the same resource is the SINGLE_RES cache
+  // group inside each composite manager, so this stays empty.
   std::vector<std::unique_ptr<SingleBlockManager>> single_block_managers_;
 
  protected:
   // the options for the block manager
   Options options_;
+  // hierarchy-only; delete in Phase D. The monolithic per-DP managers, used
+  // only by the hierarchy host-mode island (the sole non-composite path). Empty
+  // on every composite path (normal / Qwen / DSV4 / xtensor).
   std::vector<std::unique_ptr<BlockManager>> block_managers_;
 
   // Cache-group composite path (block-manager refactor): when true,
@@ -152,9 +156,11 @@ class BlockManagerPool : public KVCacheManager {
   // manager (the locked ConcurrentCompositeBlockManager subclass under
   // disagg-PD, the lock-free base otherwise). The normal model uses
   // C1 + SINGLE_RES groups; DSV4 (selected by a non-empty manager_types) uses
-  // SWA + compressed C4/C128 + SINGLE_RES. The only non-composite islands are
-  // xtensor and the hierarchy host modes (host blocks / kvcache store), which
-  // keep using block_managers_ until the hierarchy refactor lands.
+  // SWA + compressed C4/C128 + SINGLE_RES; xtensor uses C1 (with an
+  // XTensorBlockManagerImpl leaf) + SINGLE_RES. The only remaining
+  // non-composite island is the hierarchy host modes (host blocks / kvcache
+  // store), which keep using block_managers_ until the hierarchy refactor
+  // lands; composite_ and all of block_managers_ go away in Phase D.
   bool composite_ = false;
   std::vector<std::unique_ptr<GroupCompositeBlockManager>> composite_managers_;
 };

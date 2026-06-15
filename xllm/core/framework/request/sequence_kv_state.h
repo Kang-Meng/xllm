@@ -36,6 +36,9 @@ class KVCacheState {
   size_t shared_kv_blocks_num() const;
   size_t shared_kv_tokens_num() const;
 
+  // hierarchy-only; delete in Phase D. These append/replace the flat blocks_
+  // vector directly and are reached only on the non-composite (hierarchy) path;
+  // the composite path grows blocks through its per-group policies instead.
   void add_kv_blocks(const std::vector<Block>& new_blocks);
   void add_shared_kv_blocks(std::vector<Block>&& blocks,
                             size_t current_total_num_tokens);
@@ -43,8 +46,12 @@ class KVCacheState {
 
   size_t current_max_tokens_capacity() const;
 
-  // returns allocated cache blocks
+  // Dual-use bridge: reads through to the C1 group on the composite path and
+  // falls back to the flat blocks_ on the hierarchy path. Collapses to a
+  // groups_-only read in Phase D, when blocks_ is removed.
   Slice<Block> kv_blocks() const;
+  // hierarchy-only; delete in Phase D. Returns &blocks_ unconditionally (no C1
+  // read-through), so it is meaningful only on the non-composite path.
   std::vector<Block>* mutable_kv_blocks();
 
   Slice<Block> src_blocks() const { return src_blocks_; };
@@ -115,15 +122,20 @@ class KVCacheState {
   // The C1 attention group when this sequence is on the composite path, else
   // nullptr. Backs the legacy flat views (kv_blocks / num_kv_blocks /
   // kv_cache_slots / capacity / shared counts) for normal and Qwen3.5+ models.
+  // Dual-use bridge: once blocks_ is deleted in Phase D the flat fallbacks go
+  // away and these views read groups_ exclusively.
   const CacheGroupState* c1_view_group() const;
 
   // number of tokens in kv cache
   size_t kv_cache_tokens_num_ = 0;
 
-  // kv cache blocks.
+  // hierarchy-only; delete in Phase D. Flat KV-block vector for the
+  // non-composite (hierarchy host-mode) path. Empty on the composite path,
+  // where blocks live in groups_ instead.
   std::vector<Block> blocks_;
 
-  // source kv cache blocks for swap
+  // source kv cache blocks for swap (dual-use: beam fork/COW reads this on both
+  // the composite and hierarchy paths).
   std::vector<Block> src_blocks_;
 
   // if need to swap last block
@@ -135,7 +147,8 @@ class KVCacheState {
   // next logical prompt block index that needs PD PUSH transfer.
   size_t next_transfer_block_idx_ = 0;
 
-  // shared blocks number of the sequence.
+  // hierarchy-only; delete in Phase D. Shared-block count for the flat blocks_
+  // path; the composite path tracks this per group in CacheGroupState instead.
   uint32_t num_owned_shared_blocks_ = 0;
 
   // Per-cache-group runtime state for the CacheGroupRuntime-based composite

@@ -115,16 +115,22 @@ void KVCacheState::incr_kv_cache_tokens_num(size_t num) {
 }
 
 void KVCacheState::add_kv_blocks(const std::vector<Block>& new_blocks) {
+  // hierarchy-only; delete in Phase D. Grows the flat blocks_ vector; the
+  // composite path grows blocks through its per-group policies instead.
   blocks_.insert(blocks_.end(), new_blocks.begin(), new_blocks.end());
 }
 
 void KVCacheState::incr_shared_kv_blocks_num(size_t num) {
+  // hierarchy-only; delete in Phase D. Tracks shared blocks on the flat path;
+  // the composite path tracks this per group in CacheGroupState.
   CHECK(num_owned_shared_blocks_ + num <= num_kv_blocks());
   num_owned_shared_blocks_ += num;
 }
 
 void KVCacheState::add_shared_kv_blocks(std::vector<Block>&& blocks,
                                         size_t current_total_num_tokens) {
+  // hierarchy-only; delete in Phase D. Operates on the flat blocks_ vector; the
+  // composite path attaches shared blocks via composite_match_shared.
   if (blocks.empty()) {
     return;
   }
@@ -209,6 +215,8 @@ Slice<Block> KVCacheState::kv_blocks() const {
   return blocks_;
 }
 
+// hierarchy-only; delete in Phase D. Returns &blocks_ with no C1 read-through,
+// so it is meaningful only on the non-composite (hierarchy) path.
 std::vector<Block>* KVCacheState::mutable_kv_blocks() { return &blocks_; }
 
 // get the number of blocks
@@ -275,6 +283,22 @@ void KVCacheState::reset_single_resource_group() {
 }
 
 void KVCacheState::process_beam_search(std::optional<Block> new_block) {
+  // Adopt the scored source beam's KV blocks as this sequence's own. On the
+  // composite path the live attention view is the C1 group, so the swap targets
+  // c1->blocks; the legacy flat blocks_ is retarget-ed only off the composite
+  // path. When new_block is set (need_swap COW) the shared last block is
+  // replaced by the freshly allocated copy so the new token does not overwrite
+  // a block another beam still reads.
+  if (CacheGroupState* c1 = group_state(CacheStateId::C1)) {
+    c1->blocks.clear();
+    c1->blocks = std::move(src_blocks_);
+    if (new_block.has_value()) {
+      c1->blocks.pop_back();
+      c1->blocks.emplace_back(new_block.value());
+    }
+    return;
+  }
+
   blocks_.clear();
   blocks_ = std::move(src_blocks_);
 

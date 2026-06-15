@@ -283,6 +283,9 @@ int32_t BlockManagerPool::get_dp_rank(Sequence* sequence) const {
 
 bool BlockManagerPool::allocate_single_block(Sequence* sequence,
                                              int32_t dp_rank) {
+  // hierarchy-only; delete in Phase D. The composite path provides the
+  // per-sequence resource as a SINGLE_RES cache group, so this standalone
+  // single-block pool is reached only on the non-composite (hierarchy) path.
   CHECK(sequence != nullptr);
   CHECK_GE(dp_rank, 0);
   CHECK_LT(static_cast<size_t>(dp_rank), single_block_managers_.size());
@@ -307,6 +310,9 @@ bool BlockManagerPool::allocate_single_block(Sequence* sequence,
 
 void BlockManagerPool::deallocate_single_block(Sequence* sequence,
                                                int32_t dp_rank) {
+  // hierarchy-only; delete in Phase D. Pairs with allocate_single_block; the
+  // composite path releases the SINGLE_RES group inside the composite
+  // deallocate instead.
   DCHECK(sequence != nullptr);
   CHECK_GE(dp_rank, 0);
   CHECK_LT(static_cast<size_t>(dp_rank), single_block_managers_.size());
@@ -536,6 +542,8 @@ bool BlockManagerPool::try_allocate(Sequence* sequence) {
 }
 
 bool BlockManagerPool::process_beam_search(Sequence* sequence, bool need_swap) {
+  // hierarchy-only; delete in Phase D. The flat-block-table beam swap; the
+  // composite path uses composite_process_beam_search on the C1 group instead.
   if (!sequence->check_beam_search()) {
     return true;
   }
@@ -815,8 +823,10 @@ void BlockManagerPool::reserve_xtensor_padding_blocks() {
       manager->reserve_xtensor_padding_blocks();
     }
   } else {
-    // TODO(phase-D): the hierarchy island still uses the monolithic managers;
-    // remove this branch once hierarchy migrates to the composite path.
+    // TODO(phase-D): dead branch -- xtensor now always takes the composite path
+    // (the constructor CHECK enforces enable_xtensor => composite_), so the
+    // monolithic block_managers_ never hold an XTensorBlockManagerImpl. Kept
+    // only until the hierarchy island migrates and block_managers_ is deleted.
     for (auto& manager : block_managers_) {
       auto* xtensor_manager =
           dynamic_cast<XTensorBlockManagerImpl*>(manager.get());
