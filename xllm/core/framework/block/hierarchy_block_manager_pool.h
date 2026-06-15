@@ -24,10 +24,10 @@ namespace xllm {
 class Engine;
 
 struct OffloadBlockPair {
-  OffloadBlockPair(Block& s, Block& d) : src(s), dst(d) {}
-
   OffloadBlockPair(Block&& s, Block&& d)
       : src(std::move(s)), dst(std::move(d)) {}
+
+  OffloadBlockPair(Block& s, Block&& d) : src(s), dst(std::move(d)) {}
 
   OffloadBlockPair(Block& s) : src(s) {}
 
@@ -65,8 +65,6 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
 
   bool update_prefetch_result(std::shared_ptr<Request>& request,
                               const uint32_t timeout) override;
-
-  void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
  private:
   void allocate_host_shared(Sequence* sequence);

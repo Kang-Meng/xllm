@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,22 +14,24 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
-#include <unordered_set>
 
-#include "util/hash_util.h"
+#include <cstdint>
+#include <memory>
 
 namespace xllm {
 
-struct KvCacheEvent {
-  std::unordered_set<XXH3Key, FixedStringKeyHash, FixedStringKeyEqual>
-      stored_cache;
-  std::unordered_set<XXH3Key, FixedStringKeyHash, FixedStringKeyEqual>
-      removed_cache;
+class Stream;
 
-  void clear() {
-    stored_cache.clear();
-    removed_cache.clear();
-  }
+class LayerSynchronizer {
+ public:
+  virtual ~LayerSynchronizer() = default;
+
+  virtual bool synchronize_layer(int64_t layer_index) = 0;
+  virtual bool record_stream(int64_t layer_index, Stream* stream) = 0;
+  virtual uint32_t size() const = 0;
 };
+
+std::shared_ptr<LayerSynchronizer> create_layer_synchronizer(
+    int64_t num_layers);
 
 }  // namespace xllm

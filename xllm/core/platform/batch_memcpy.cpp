@@ -13,21 +13,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#pragma once
+#include "platform/batch_memcpy.h"
 
-#include "block_manager_impl.h"
+#if defined(USE_NPU)
+#include "platform/npu/npu_batch_memcpy.h"
+#endif
+
+#include <glog/logging.h>
+
+#include "platform/device.h"
 
 namespace xllm {
 
-// Sliding-window sub-manager used by CompositeBlockManager.
-class SlidingWindowBlockManager : public BlockManagerImpl {
- public:
-  explicit SlidingWindowBlockManager(const Options& options);
-  ~SlidingWindowBlockManager() override = default;
-
-  std::vector<Block> allocate(size_t num_blocks) override;
-
-  uint32_t swa_blocks_per_seq() const { return options_.swa_blocks_per_seq(); }
-};
+std::unique_ptr<BatchMemcpy> create_batch_memcpy(const Device& device) {
+  CHECK_EQ(Device::type_str(), "npu")
+      << "BatchMemcpy currently only supports NPU, but got backend "
+      << Device::type_str();
+#if defined(USE_NPU)
+  auto batch_memcpy = std::make_unique<npu::NPUBatchMemcpy>();
+  batch_memcpy->init(device.index());
+  return batch_memcpy;
+#else
+  LOG(FATAL) << "BatchMemcpy requires USE_NPU.";
+  return nullptr;
+#endif
+}
 
 }  // namespace xllm

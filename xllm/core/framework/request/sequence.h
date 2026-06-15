@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/util/slice.h"
 #include "finish_reason.h"
 #include "framework/block/block.h"
+#include "framework/prefix_cache/prefix_hash_state.h"
 #include "incremental_decoder.h"
 #include "rec_type.h"
 #include "request_output.h"
@@ -200,9 +201,18 @@ class Sequence final {
   void clear_mtp_bootstrap_embedding() {
     mtp_bootstrap_embedding_ = torch::Tensor();
   }
-  bool has_single_block_id() const { return single_block_.is_valid(); }
+  // The per-sequence resource block id exported as linear_state_ids /
+  // embedding_ids. On the composite path it lives in the SINGLE_RES cache
+  // group (PerSequenceOnce policy); the flat single_block_ member only backs
+  // the remaining legacy paths (xtensor, hierarchy host modes).
+  bool has_single_block_id() const { return get_single_block_id() >= 0; }
   int32_t get_single_block_id() const {
-    return has_single_block_id() ? single_block_.id() : -1;
+    const Slice<Block> single_res =
+        kv_state_.group_blocks(CacheStateId::SINGLE_RES);
+    if (!single_res.empty()) {
+      return single_res[0].id();
+    }
+    return single_block_.is_valid() ? single_block_.id() : -1;
   }
   void set_single_block(Block&& single_block) {
     single_block_ = std::move(single_block);
@@ -303,6 +313,12 @@ class Sequence final {
 
   KVCacheState& host_kv_state() { return host_kv_state_; }
 
+  // Incremental per-group prefix-hash chain, consumed by the composite
+  // manager's flush path so prefix-cache inserts never recompute the hash from
+  // token 0. Pure function of the sequence tokens, so it survives reset()
+  // unchanged.
+  PrefixHashState& prefix_hash_state() { return prefix_hash_state_; }
+
   // for generated tokens
   float get_acc_logprob();
   // Returns the beam base score: accumulated logprob excluding last token.
@@ -320,7 +336,7 @@ class Sequence final {
     return &prefetch_results_;
   }
 
-  bool update_prefetch_result(uint32_t timeout, uint32_t& success_cnt);
+  bool update_prefetch_result(const uint32_t timeout, uint32_t& success_cnt);
 
   void reset();
 
@@ -462,6 +478,9 @@ class Sequence final {
   KVCacheState kv_state_;
 
   KVCacheState host_kv_state_;
+
+  // Per-sequence incremental prefix-hash chain (see prefix_hash_state()).
+  PrefixHashState prefix_hash_state_;
 
   std::unique_ptr<LogprobState> logprob_state_;
 

@@ -6,24 +6,26 @@ cc_library(
     prefix_cache
   HDRS
     block_hasher.h
+    prefix_hash_state.h
     prefix_cache.h
-    prefix_cache_with_upload.h
     prefix_cache_factory.h
   SRCS
     block_hasher.cpp
+    prefix_hash_state.cpp
     prefix_cache.cpp
-    prefix_cache_with_upload.cpp
     prefix_cache_factory.cpp
   DEPS
     $<$<BOOL:${USE_NPU}>:torch_npu>
     $<$<BOOL:${USE_NPU}>:graph>
-    :request
     :common
     glog::glog
     Boost::serialization
     SMHasherSupport
     torch
+    :kv_cache
 )
+
+ target_link_libraries(prefix_cache PRIVATE mooncake_store)
 
 
 

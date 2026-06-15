@@ -19,8 +19,9 @@ limitations under the License.
 #include <vector>
 
 #include "block_manager.h"
+#include "framework/block/block_manager_context.h"
+#include "framework/block/concurrent_composite_block_manager.h"
 #include "framework/block/kv_cache_manager.h"
-#include "framework/block/single_block_manager.h"
 
 namespace xllm {
 
@@ -33,19 +34,22 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(bool, enable_linear_state) = false;
     PROPERTY(bool, enable_prefix_cache) = true;
     PROPERTY(bool, enable_disagg_pd) = false;
-    PROPERTY(bool, enable_cache_upload) = false;
+    PROPERTY(bool, enable_host_blocks) = false;
     PROPERTY(bool, enable_kvcache_store) = false;
     PROPERTY(bool, enable_xtensor) = false;
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
     PROPERTY(int64_t, slot_size) = 0;   // Memory size per slot (for xtensor)
     PROPERTY(std::string, model_id);    // Model ID for multi-model support
-    // Token-level sliding window size for CompositeBlockManager.
+    // Token-level sliding window size for the DSV4 SWA group.
     PROPERTY(uint32_t, sliding_window_size) = 0;
-    // Base SWA/cache-state block rows retained per sequence.
+    // SWA ring blocks retained per sequence (== the DSV4 rolling-window size).
     PROPERTY(uint32_t, swa_blocks_per_seq) = 0;
     // Scheduler token budget used to size the shared SWA burst pool.
     PROPERTY(uint32_t, max_tokens_per_batch) = 0;
-    // For CompositeBlockManager.
+    // DSV4 selector: non-empty marks a DeepSeek-V4 model, routing the pool to
+    // make_dsv4_composite_specs. The legacy per-entry numeric meaning is gone;
+    // only emptiness is read now (compress_ratios carries the real C4/C128
+    // ratios, with a leading 0 placeholder for the SWA slot).
     PROPERTY(std::vector<uint32_t>, manager_types) = {};
     PROPERTY(std::vector<uint32_t>, compress_ratios) = {};
     PROPERTY(uint32_t, max_seqs_per_batch) = 0;
@@ -60,21 +64,14 @@ class BlockManagerPool : public KVCacheManager {
   ~BlockManagerPool() = default;
 
   virtual bool allocate(Sequence* sequence) override;
-  virtual bool allocate(std::vector<Sequence*>& sequences) override;
   virtual bool allocate(Sequence* sequence, size_t num_tokens) override;
   virtual bool allocate(Sequence* sequence,
                         size_t num_tokens,
                         size_t needed_copy_in_blocks_num) override;
 
-  // Try to allocate blocks with num_tokens,
-  // return {} if not enough blocks
-  virtual std::vector<Block> allocate(size_t num_tokens,
-                                      int32_t& dp_rank) override;
-
   virtual bool try_allocate(Sequence* sequence) override;
 
   virtual void deallocate(Request* request) override;
-  virtual void deallocate(std::vector<Sequence*>& sequences) override;
   virtual void deallocate(Sequence* sequence) override;
 
   void deallocate_without_cache(Sequence* sequence);
@@ -86,7 +83,6 @@ class BlockManagerPool : public KVCacheManager {
   virtual std::vector<std::vector<BlockTransferInfo>>*
   get_swap_block_transfer_infos() override;
 
-  virtual void get_merged_kvcache_event(KvCacheEvent* event) const;
   virtual float get_gpu_cache_usage_perc() const;
 
   virtual uint32_t num_blocks() const override;
@@ -107,18 +103,46 @@ class BlockManagerPool : public KVCacheManager {
   int32_t get_manager_with_max_free_blocks() const;
   int32_t get_dp_rank(Sequence* sequence) const;
 
-  bool process_beam_search(Sequence* sequence, bool need_swap = false);
-  bool allocate_single_block(Sequence* sequence, int32_t dp_rank);
-  void deallocate_single_block(Sequence* sequence, int32_t dp_rank);
+  // Composite-path beam fork/COW: adopt the scored source beam's KV blocks into
+  // this sequence's C1 attention group, allocating one C1 swap block (and
+  // recording the COW transfer) when the shared last block must be copied in
+  // place (the no-growth step). `num_tokens` is the step's target committed
+  // length, used to tell a growing step (new token in a fresh block, no COW)
+  // from an in-place step. Returns false only when the swap block cannot be
+  // allocated; a no-op (returns true) for non-beam sequences and beam sequences
+  // with no pending source blocks.
+  bool composite_process_beam_search(Sequence* sequence,
+                                     int32_t dp_rank,
+                                     size_t num_tokens);
+
+  // Number of per-DP composite managers backing the pool.
+  size_t manager_count() const;
+
+  // Composite-path prefix match: attaches the C1 group's shared blocks to the
+  // sequence and seeds kv_cache_tokens_num_, mirroring add_shared_kv_blocks --
+  // including the whole-prompt-hit back-off that leaves one block to recompute.
+  void composite_match_shared(Sequence* sequence, int32_t dp_rank);
+
+  // True until the sequence has been handed any composite resource: prefix
+  // match is only legal on this first scheduling (no mid-stream re-match).
+  bool is_first_schedule(Sequence* sequence) const;
 
  private:
   std::vector<std::vector<BlockTransferInfo>> swap_block_transfer_infos_;
-  std::vector<std::unique_ptr<SingleBlockManager>> single_block_managers_;
 
  protected:
   // the options for the block manager
   Options options_;
-  std::vector<std::unique_ptr<BlockManager>> block_managers_;
+
+  // Cache-group composite path: each DP rank is served by a composite manager
+  // (the locked ConcurrentCompositeBlockManager subclass under disagg-PD, the
+  // lock-free base otherwise). The normal model uses C1 + SINGLE_RES groups;
+  // DSV4 (selected by a non-empty manager_types) uses SWA + compressed C4/C128 +
+  // SINGLE_RES; xtensor uses C1 (with an XTensorBlockManagerImpl leaf) +
+  // SINGLE_RES. The hierarchy host modes (host blocks / kvcache store) are
+  // temporarily disabled during the block-manager refactor and rebuilt in
+  // Phase C'.
+  std::vector<std::unique_ptr<GroupCompositeBlockManager>> composite_managers_;
 };
 
 }  // namespace xllm

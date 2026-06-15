@@ -13,18 +13,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "sliding_window_block_manager.h"
+#include "platform/layer_synchronizer.h"
+
+#if defined(USE_NPU)
+#include "platform/npu/npu_layer_synchronizer.h"
+#endif
+
+#include <glog/logging.h>
+
+#include "platform/device.h"
 
 namespace xllm {
 
-SlidingWindowBlockManager::SlidingWindowBlockManager(const Options& options)
-    : BlockManagerImpl(options) {
-  CHECK_GT(options_.swa_blocks_per_seq(), 0u)
-      << "swa_blocks_per_seq must be positive";
-}
-
-std::vector<Block> SlidingWindowBlockManager::allocate(size_t num_blocks) {
-  return BlockManagerImpl::allocate(num_blocks);
+std::shared_ptr<LayerSynchronizer> create_layer_synchronizer(
+    int64_t num_layers) {
+  CHECK_EQ(Device::type_str(), "npu")
+      << "LayerSynchronizer currently only supports NPU, but got backend "
+      << Device::type_str();
+#if defined(USE_NPU)
+  return std::make_shared<NPULayerSynchronizerImpl>(num_layers);
+#else
+  LOG(FATAL) << "LayerSynchronizer requires USE_NPU.";
+  return nullptr;
+#endif
 }
 
 }  // namespace xllm

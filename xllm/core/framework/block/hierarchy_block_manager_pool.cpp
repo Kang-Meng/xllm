@@ -27,6 +27,15 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
     Engine* engine,
     int32_t dp_size)
     : engine_(engine), BlockManagerPool(options, dp_size) {
+  // hierarchy temporarily disabled during the block-manager refactor. The
+  // device + host dual KVCacheState below still depends on the flat blocks_
+  // path that Phase D' removes; Phase C' rebuilds this pool on the groups_-only
+  // composite base. Until then construction fails loudly through any path (the
+  // primary selection guard lives in llm_engine.cpp). See
+  // docs/zh/design/hierarchy_composite_migration_design.md.
+  LOG(FATAL) << "HierarchyBlockManagerPool is temporarily disabled during the "
+                "block-manager refactor (hierarchy rebuild in progress). "
+                "Disable --host_blocks_factor and --enable_kvcache_store.";
   CHECK(dp_size > 0) << "dp_size must be greater than 0";
   host_block_managers_.reserve(dp_size);
 
@@ -36,7 +45,6 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .num_blocks(options_.host_num_blocks())
-      .enable_cache_upload(options_.enable_cache_upload())
       .hasher_type(options_.hasher_type());
 
   for (int32_t i = 0; i < dp_size; ++i) {
@@ -359,17 +367,6 @@ void HierarchyBlockManagerPool::transfer_blocks() {
 
             return 0;
           });
-    }
-  }
-}
-
-void HierarchyBlockManagerPool::get_merged_kvcache_event(
-    KvCacheEvent* event) const {
-  if (host_block_managers_.empty()) {
-    BlockManagerPool::get_merged_kvcache_event(event);
-  } else {
-    for (int32_t i = 0; i < host_block_managers_.size(); ++i) {
-      host_block_managers_[i]->get_merged_kvcache_event(event);
     }
   }
 }

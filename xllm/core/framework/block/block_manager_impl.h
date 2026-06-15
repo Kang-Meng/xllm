@@ -16,8 +16,9 @@ limitations under the License.
 
 #pragma once
 
+#include <mutex>
+
 #include "block_manager.h"
-#include "framework/kv_cache/kv_cache_event.h"
 
 namespace xllm {
 
@@ -49,8 +50,6 @@ class BlockManagerImpl : public BlockManager {
              const MMData& mm_data = MMData(),
              const Slice<XXH3Key>& block_hashes = {}) override;
   void cache(const std::vector<Block>& blocks) override;
-
-  void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
   size_t num_blocks_in_prefix_cache() const override {
     if (options_.enable_prefix_cache()) {
@@ -109,6 +108,13 @@ class BlockManagerImpl : public BlockManager {
 
   // Whether a block is already counted in num_used_blocks_.
   std::vector<uint8_t> usage_accounted_ids_;
+
+  // Leaf lock guarding free_blocks_/usage_accounted_ids_ mutation. free() is
+  // re-entered from Block destructors on non-scheduler threads (hierarchy
+  // offload callback, disagg PD threadpool), so the free list must be safe
+  // without the upper concurrent wrapper. Never call out (prefix cache,
+  // composite layer) while holding it.
+  mutable std::mutex free_mutex_;
 };
 
 }  // namespace xllm
