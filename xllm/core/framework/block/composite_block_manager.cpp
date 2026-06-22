@@ -46,7 +46,6 @@ CompositeBlockManager::CompositeBlockManager(
   CHECK_GT(n, 0u) << "CompositeBlockManager requires at least one sub-manager";
 
   sub_managers_.reserve(n);
-  sub_manager_types_.reserve(n);
 
   for (size_t i = 0; i < n; ++i) {
     const uint32_t type = options_.manager_types()[i];
@@ -58,13 +57,12 @@ CompositeBlockManager::CompositeBlockManager(
                       compress_ratio);
       opts.num_blocks(static_cast<uint32_t>(options_.num_blocks()) /
                       compress_ratio);
-      sub_managers_.push_back(std::make_unique<BlockManagerImpl>(opts));
       // Compressed incremental groups are keyed by their compression ratio.
       CHECK(compress_ratio == 4 || compress_ratio == 128)
           << "unexpected compress_ratio " << compress_ratio
           << " for composite BlockManagerImpl sub-manager";
-      sub_manager_types_.push_back(compress_ratio == 4 ? BlockType::C4
-                                                       : BlockType::C128);
+      opts.block_type(compress_ratio == 4 ? BlockType::C4 : BlockType::C128);
+      sub_managers_.push_back(std::make_unique<BlockManagerImpl>(opts));
     } else if (type == kManagerTypeSlidingWindowBlockManager) {
       const uint32_t swa_blocks_per_seq = options_.swa_blocks_per_seq();
       CHECK_GT(swa_blocks_per_seq, 0u) << "swa_blocks_per_seq must be positive";
@@ -90,9 +88,9 @@ CompositeBlockManager::CompositeBlockManager(
           << ", total_blocks=" << swa_total_blocks << ", max_seqs=" << max_seqs
           << ". SWA blocks outside the sliding window are returned to the "
              "physical SW cache pool.";
+      // SlidingWindowBlockManager forces BlockType::SWA in its ctor.
       sub_managers_.push_back(
           std::make_unique<SlidingWindowBlockManager>(opts));
-      sub_manager_types_.push_back(BlockType::SWA);
     } else {
       LOG(FATAL) << "Unknown manager_type " << type;
     }
@@ -106,11 +104,11 @@ bool CompositeBlockManager::allocate_for_sequence(Sequence* seq,
   }
   KVCacheState& kv_state = seq->kv_state();
   // Per sub-manager block list (keyed by its BlockType), created on demand. The
-  // index i stays aligned with sub_managers_[i] / sub_manager_types_[i].
+  // index i stays aligned with sub_managers_[i].
   std::vector<std::vector<Block>*> manager_blocks(sub_managers_.size());
   std::vector<size_t> original_sizes(sub_managers_.size(), 0);
   for (size_t i = 0; i < sub_managers_.size(); ++i) {
-    manager_blocks[i] = kv_state.mutable_blocks_of(sub_manager_types_[i]);
+    manager_blocks[i] = kv_state.mutable_blocks(sub_managers_[i]->block_type());
     original_sizes[i] = manager_blocks[i]->size();
   }
   // Truncate every sub-manager list back to its pre-allocation size, dropping
@@ -214,9 +212,10 @@ void CompositeBlockManager::deallocate_sequence(Sequence* seq) {
   }
   KVCacheState& kv_state = seq->kv_state();
   for (size_t i = 0; i < sub_managers_.size(); ++i) {
-    const Slice<Block> blocks = kv_state.blocks_of(sub_manager_types_[i]);
-    if (!blocks.empty()) {
-      sub_managers_[i]->deallocate(blocks);
+    const Slice<Block> group_blocks =
+        kv_state.blocks(sub_managers_[i]->block_type());
+    if (!group_blocks.empty()) {
+      sub_managers_[i]->deallocate(group_blocks);
     }
   }
 }
