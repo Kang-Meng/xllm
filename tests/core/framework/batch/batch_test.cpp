@@ -2056,7 +2056,7 @@ TEST(BatchTest, OverlapMTPReplacementKeepsCompositeKvBlocks) {
       .max_seqs_per_batch(max_seqs_per_batch)
       .manager_types({1, 0, 0})
       .compress_ratios({0, 4, 128});
-  CompositeBlockManager manager(build_composite_leaves(options));
+  CompositeBlockManager manager(build_composite_leaves(options, /*dp_rank=*/0));
 
   RequestSamplingParam sampling_param;
   StoppingChecker stopping_checker;

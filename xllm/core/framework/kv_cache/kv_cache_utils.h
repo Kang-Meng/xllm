@@ -19,6 +19,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -52,6 +53,7 @@ struct KVCacheCreateOptions {
   PROPERTY(torch::ScalarType, dtype) = torch::kBFloat16;
   // ssm dtype for linear attention layers
   PROPERTY(torch::ScalarType, ssm_dtype) = torch::kBFloat16;
+  PROPERTY(double, host_blocks_factor) = 0.0;
   PROPERTY(int64_t, num_layers) = 0;
   // full attention interval for linear attention layers
   PROPERTY(int64_t, full_attention_interval) = 1;
@@ -108,6 +110,21 @@ struct KVCacheTensor {
   torch::Tensor tensor;
   int32_t group_id = cache_group_id(BlockType::KV);
   bool sequence_scoped = false;
+};
+
+using BlockTypeTensorMap = std::map<KVCacheTensorRole::Value, torch::Tensor>;
+
+struct HostPageAlignedRegion {
+  void* base_ptr = nullptr;
+  size_t total_bytes = 0;
+
+  HostPageAlignedRegion() = default;
+  explicit HostPageAlignedRegion(size_t bytes);
+  HostPageAlignedRegion(const HostPageAlignedRegion&) = delete;
+  HostPageAlignedRegion& operator=(const HostPageAlignedRegion&) = delete;
+  HostPageAlignedRegion(HostPageAlignedRegion&& other) noexcept;
+  HostPageAlignedRegion& operator=(HostPageAlignedRegion&& other) noexcept;
+  ~HostPageAlignedRegion();
 };
 
 struct DeepSeekV4KVCacheTensors {

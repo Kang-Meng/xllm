@@ -395,7 +395,7 @@ HostPageAlignedRegion::HostPageAlignedRegion(size_t bytes) {
   CHECK(base_ptr != MAP_FAILED)
       << "Failed to mmap host memory, size=" << total_bytes;
   if (mlock(base_ptr, total_bytes) != 0) {
-    const int err = errno;
+    const int32_t err = errno;
     munmap(base_ptr, total_bytes);
     base_ptr = nullptr;
     total_bytes = 0;
