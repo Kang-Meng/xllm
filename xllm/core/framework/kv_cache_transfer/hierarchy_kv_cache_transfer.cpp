@@ -25,10 +25,73 @@ limitations under the License.
 #include "framework/kv_cache_transfer/kv_cache_store.h"
 namespace xllm {
 
-constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
-constexpr uint32_t BATCH_COPY_MAX_SIZE = 4096;
-constexpr uint32_t TIMEOUT_S = 60;      // second
-constexpr uint32_t TIMEOUT_MS = 60000;  // millisecond
+bool has_tensor(const torch::Tensor& tensor) {
+  return tensor.defined() && tensor.numel() > 0;
+}
+
+BlockTypeTensorMap build_block_type_tensor_map(const KVCache& kv_cache,
+                                               BlockType type) {
+  BlockTypeTensorMap map;
+
+  const torch::Tensor key_cache = kv_cache.get_k_cache();
+  const torch::Tensor value_cache = kv_cache.get_v_cache();
+  const torch::Tensor index_cache = kv_cache.get_index_cache();
+  const torch::Tensor conv_cache = kv_cache.get_conv_cache();
+  const torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
+  const torch::Tensor swa_cache = kv_cache.get_swa_cache();
+
+  switch (type) {
+    case BlockType::KV:
+      if (has_tensor(conv_cache) || has_tensor(ssm_cache) ||
+          has_tensor(swa_cache)) {
+        return {};
+      }
+      if (has_tensor(key_cache)) {
+        map.emplace(KVCacheTensorRole::KEY, key_cache);
+      }
+      if (has_tensor(value_cache)) {
+        map.emplace(KVCacheTensorRole::VALUE, value_cache);
+      }
+      if (has_tensor(index_cache)) {
+        map.emplace(KVCacheTensorRole::INDEX, index_cache);
+      }
+      return map;
+    case BlockType::SINGLE:
+      if (has_tensor(conv_cache)) {
+        map.emplace(KVCacheTensorRole::CONV, conv_cache);
+      }
+      if (has_tensor(ssm_cache)) {
+        map.emplace(KVCacheTensorRole::SSM, ssm_cache);
+      }
+      return map;
+    case BlockType::SWA:
+      if (has_tensor(swa_cache)) {
+        map.emplace(KVCacheTensorRole::SWA, swa_cache);
+      }
+      return map;
+    case BlockType::C4:
+      // DSV4 compress-ratio-4 layer: has swa + key + index (no value).
+      if (!has_tensor(swa_cache) || has_tensor(value_cache) ||
+          !has_tensor(key_cache) || !has_tensor(index_cache)) {
+        return {};
+      }
+      map.emplace(KVCacheTensorRole::KEY, key_cache);
+      map.emplace(KVCacheTensorRole::INDEX, index_cache);
+      return map;
+    case BlockType::C128:
+      // DSV4 compress-ratio-128 layer: has swa + key, but no index/value.
+      if (!has_tensor(swa_cache) || has_tensor(value_cache) ||
+          !has_tensor(key_cache) || has_tensor(index_cache)) {
+        return {};
+      }
+      map.emplace(KVCacheTensorRole::KEY, key_cache);
+      return map;
+    default:
+      return {};
+  }
+}
+
+}  // namespace
 
 HierarchyKVCacheTransfer::HierarchyKVCacheTransfer(
     const Options& options,
@@ -50,24 +113,55 @@ HierarchyKVCacheTransfer::HierarchyKVCacheTransfer(
   for (int i = 0; i < h2d_threadpool_->size() + d2h_threadpool_->size(); i++) {
     copy_stream_.enqueue(device_.get_stream_from_pool(TIMEOUT_MS));
   }
+}
 
-  if (options_.host_blocks_factor() > 1) {
-    create_page_aligned_host_cache();
-  }
+void HierarchyKVCacheTransfer::build_device_block_type_map() {
+  device_kv_caches_.clear();
+  device_block_type_layer_ids_.clear();
 
-  if (options_.enable_kvcache_store()) {
-    KVCacheStoreInitConfig config;
-    config.localhost_name = options_.store_local_hostname();
-    config.protocol = options_.store_protocol();
-    config.metadata_server = options_.store_metadata_server();
-    config.master_server_address = options_.store_master_server_address();
-    config.tp_rank = options_.tp_rank();
-    config.total_size = page_aligned_data_size_;
-    config.tensor_data = page_aligned_data_;
+  const std::vector<BlockType> kBlockTypes = {BlockType::KV,
+                                              BlockType::SINGLE,
+                                              BlockType::SWA,
+                                              BlockType::C4,
+                                              BlockType::C128};
 
-    if (!KVCacheStore::get_instance().init(config, &host_kv_caches_)) {
-      LOG(FATAL) << "Init KVCacheStore fail!";
+  for (int64_t layer_id = 0;
+       layer_id < static_cast<int64_t>(kv_caches_ptr_->size());
+       ++layer_id) {
+    KVCache& kv_cache = kv_caches_ptr_->at(static_cast<size_t>(layer_id));
+    for (BlockType type : kBlockTypes) {
+      BlockTypeTensorMap tensor_map =
+          build_block_type_tensor_map(kv_cache, type);
+      if (!tensor_map.empty()) {
+        device_kv_caches_[type].push_back(&kv_cache);
+        device_block_type_layer_ids_[type].push_back(layer_id);
+      }
     }
+  }
+}
+
+void HierarchyKVCacheTransfer::create_host_cache() {
+  CHECK(!device_kv_caches_.empty())
+      << "device block type caches must not be empty.";
+
+  for (const auto& [block_type, group_caches] : device_kv_caches_) {
+    if (group_caches.empty()) {
+      continue;
+    }
+
+    const int64_t layer_count = static_cast<int64_t>(group_caches.size());
+
+    KVCacheCreateOptions host_opts = create_options_;
+    host_opts.device(torch::Device(torch::kCPU))
+        .enable_xtensor(false)
+        .enable_raw_device_allocator(false)
+        .host_blocks_factor(options_.host_blocks_factor());
+#if defined(USE_NPU)
+    host_opts.enable_kv_cache_huge_page_allocator(false);
+#endif
+
+    host_kv_caches_[block_type] = std::make_unique<KVCache>(
+        kv_cache_shape_, host_opts, block_type, layer_count);
   }
 }
 
@@ -79,6 +173,82 @@ HierarchyKVCacheTransfer::~HierarchyKVCacheTransfer() {
     munlock(page_aligned_data_, page_aligned_data_size_);
     munmap(page_aligned_data_, page_aligned_data_size_);
   }
+
+  const TransferType transfer_type = block_transfer_info.front().transfer_type;
+
+  for (const auto& info : block_transfer_info) {
+    BlockType type = info.block_type;
+    auto device_it = device_kv_caches_.find(type);
+    auto layer_ids_it = device_block_type_layer_ids_.find(type);
+    auto host_it = host_kv_caches_.find(type);
+    if (device_it == device_kv_caches_.end() ||
+        layer_ids_it == device_block_type_layer_ids_.end() ||
+        host_it == host_kv_caches_.end()) {
+      continue;
+    }
+
+    const auto& group_caches = device_it->second;
+    const auto& layer_ids = layer_ids_it->second;
+    const KVCache* host_cache = host_it->second.get();
+    CHECK(host_cache != nullptr) << "host cache instance must not be null.";
+    const BlockTypeTensorMap host_tensors =
+        host_cache->get_block_type_tensors(type);
+
+    int32_t host_block_id = -1;
+    int32_t device_block_id = -1;
+    switch (transfer_type) {
+      case TransferType::H2D:
+        host_block_id = info.src_block_id;
+        device_block_id = info.dst_block_id;
+        break;
+      case TransferType::D2H2G:
+        host_block_id = info.dst_block_id;
+        device_block_id = info.src_block_id;
+        break;
+      default:
+        LOG(FATAL) << "Unsupported transfer type for copy plan: "
+                   << static_cast<uint32_t>(transfer_type);
+    }
+
+    CHECK_GE(host_block_id, 0) << "host block id must be non-negative.";
+
+    for (size_t layer_slot = 0; layer_slot < group_caches.size();
+         ++layer_slot) {
+      const int64_t absolute_layer_id = layer_ids[layer_slot];
+      if (absolute_layer_id < layer_batch_range.begin_layer ||
+          absolute_layer_id >= layer_batch_range.end_layer) {
+        continue;
+      }
+
+      BlockTypeTensorMap device_tensors =
+          build_block_type_tensor_map(*group_caches[layer_slot], type);
+      for (const auto& [role, device_tensor] : device_tensors) {
+        auto host_tensor_it = host_tensors.find(role);
+        if (host_tensor_it == host_tensors.end()) {
+          continue;
+        }
+
+        // device_tensor shape: [num_blocks, ...per_block_dims]
+        // host_tensor shape: [num_host_blocks, num_layers, ...per_block_dims]
+        const torch::Tensor& host_tensor = host_tensor_it->second;
+        CHECK_LT(host_block_id, host_tensor.size(0))
+            << "host block id out of range.";
+        torch::Tensor device_block = device_tensor[device_block_id];
+        torch::Tensor host_block_layer =
+            host_tensor[host_block_id][static_cast<int64_t>(layer_slot)];
+
+        if (transfer_type == TransferType::H2D) {
+          plan.src_tensors.emplace_back(host_block_layer);
+          plan.dst_tensors.emplace_back(device_block);
+        } else {
+          plan.src_tensors.emplace_back(device_block);
+          plan.dst_tensors.emplace_back(host_block_layer);
+        }
+      }
+    }
+  }
+
+  return plan;
 }
 
 uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
