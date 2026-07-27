@@ -552,6 +552,7 @@ void DisaggPDScheduler::dispatch_requests() {
             for (const auto& resp_group : resp.kv_block_groups()) {
               KVBlockTransferGroup group;
               group.group_id = resp_group.group_id();
+              group.remote_shared_num = resp_group.remote_shared_num();
               group.remote_blocks_ids.reserve(resp_group.block_ids_size());
               for (const int32_t block_id : resp_group.block_ids()) {
                 group.remote_blocks_ids.emplace_back(
@@ -560,13 +561,11 @@ void DisaggPDScheduler::dispatch_requests() {
               info.block_transfer_groups.emplace_back(std::move(group));
             }
           } else {
-            const size_t prefix_blocks =
-                static_cast<size_t>(resp.num_prefix_blocks());
-            info.remote_blocks_ids.resize(prefix_blocks, 0);
             for (const int32_t block_id : resp.blocks_ids()) {
               info.remote_blocks_ids.emplace_back(
                   static_cast<uint64_t>(block_id));
             }
+            info.remote_shared_num = resp.remote_shared_num();
           }
           if (resp.linear_state_id() >= 0) {
             info.remote_linear_state_ids.emplace_back(resp.linear_state_id());
@@ -599,12 +598,39 @@ void DisaggPDScheduler::dispatch_requests() {
                     << ", num_layers=" << info.dst_xtensor_layer_offsets.size();
           }
 
-          const int32_t num_prefix_blocks = resp.num_prefix_blocks();
-          if (num_prefix_blocks > 0) {
-            sequence->kv_state().set_next_transfer_block_idx(
-                static_cast<size_t>(num_prefix_blocks));
-          }
           sequence->kv_state().set_transfer_kv_info(std::move(info));
+
+          // Compress per-group transfer cursors to the D-side shared count.
+          // advance_group_transfer_block_idx is monotonic max, so this is a
+          // no-op if the group's remote_shared_num is 0 (SWA / LINEAR under
+          // DECODE, or D that got no prefix cache hit); when it is >0, P
+          // starts pushing at the first block D actually needs, skipping the
+          // shared prefix without touching P's own local shared_num.
+          const auto& groups =
+              sequence->kv_state().transfer_kv_info()->block_transfer_groups;
+          for (const auto& g : groups) {
+            if (g.remote_shared_num == 0) {
+              continue;
+            }
+            const std::optional<BlockType> block_type =
+                block_type_from_cache_group_id(g.group_id);
+            if (!block_type.has_value()) {
+              LOG(ERROR) << "Unknown KV cache transfer group_id: "
+                         << g.group_id;
+              continue;
+            }
+            sequence->kv_state().advance_group_transfer_block_idx(
+                block_type.value(), static_cast<size_t>(g.remote_shared_num));
+          }
+          // Flat KV counterpart: the flat response ships block_ids starting
+          // from D's shared_num. Advance the flat transfer cursor to the same
+          // origin so build_step_transfer_info indexes remote_blocks_ids from
+          // 0 instead of from local_idx 0 (which would demand D returned
+          // every prompt block).
+          if (!has_grouped_cache && resp.remote_shared_num() > 0) {
+            sequence->kv_state().advance_transfer_block_idx(
+                static_cast<size_t>(resp.remote_shared_num()));
+          }
         }
 
         // Push to request_queue_; it will be executed by the engine.
@@ -718,8 +744,12 @@ void DisaggPDScheduler::prefill_send_first_generation() {
           block_ids.push_back(block.id());
         }
         ADD_VECTOR_TO_PROTO(gen->mutable_block_ids(), block_ids);
+        // Advertise the recurrent-state slot the D side should pull from.
+        // Prefer the dedicated LINEAR slot (Qwen3.5 GDN); fall back to
+        // SINGLE for legacy models where the CONV/SSM caches still live in
+        // the SINGLE slot. Must match the D-side response helper.
         gen->set_linear_state_id(
-            request->sequences()[0]->get_single_block_id());
+            request->sequences()[0]->get_recurrent_state_slot_id());
         gen->set_dp_size(instance_info_.dp_size);
         gen->set_dp_rank(request->sequences()[0]->dp_rank());
       }
@@ -929,9 +959,15 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     }
     std::vector<uint64_t> src_linear_state_ids;
     std::vector<uint64_t> dst_linear_state_ids;
-    if (src_linear_state_id >= 0 && sequence->get_single_block_id() >= 0) {
+    // Resolve the destination recurrent-state slot with the same helper the
+    // sender used to advertise src_linear_state_id (LINEAR for Qwen3.5 GDN,
+    // SINGLE otherwise), so PULL writes the pulled state into the slot the
+    // decode forward actually reads (see
+    // Sequence::get_recurrent_state_slot_id).
+    const int32_t dst_linear_state_id = sequence->get_recurrent_state_slot_id();
+    if (src_linear_state_id >= 0 && dst_linear_state_id >= 0) {
       src_linear_state_ids.emplace_back(src_linear_state_id);
-      dst_linear_state_ids.emplace_back(sequence->get_single_block_id());
+      dst_linear_state_ids.emplace_back(dst_linear_state_id);
     }
 
     int32_t dst_dp_rank = sequence->dp_rank();

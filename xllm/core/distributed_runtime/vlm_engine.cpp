@@ -339,7 +339,11 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .hasher_type(BlockHasherType::MM)
-      .max_seqs_per_batch(options_.max_seqs_per_batch());
+      .max_seqs_per_batch(options_.max_seqs_per_batch())
+      // DECODE-side prefix cache participation is per-leaf and gated by the
+      // predicate in composite_block_manager.cpp; mirror llm_engine so a
+      // linear-attention VLM decode instance disables the LINEAR prefix cache.
+      .instance_is_decode(options_.instance_role() == InstanceRole::DECODE);
   if (enable_linear_attention) {
     // The unified linear-state slot pool spans all physical slots [0, N);
     // id 0 is reserved as padding and ids [1, N) serve live and checkpoint
