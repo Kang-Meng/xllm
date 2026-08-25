@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <functional>
 #include <future>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "common/macros.h"
@@ -80,6 +82,11 @@ class Master {
   RateLimiter rate_limiter_;
   MasterStatus master_status_{MasterStatus::WAKEUP};
 };
+
+std::optional<std::string> validate_model_cp(const Options& options,
+                                             EngineType engine_type,
+                                             const std::string& model_type,
+                                             int32_t global_world_size);
 
 std::unique_ptr<Master> create_master(const std::string& backend,
                                       const Options& options);
