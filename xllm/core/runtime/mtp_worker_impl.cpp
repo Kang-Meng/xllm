@@ -26,6 +26,8 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <future>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -506,6 +508,30 @@ uint32_t validate_paired_transfer_counts(uint32_t target_transferred,
   return target_transferred;
 }
 
+uint32_t transfer_draft_hierarchy_blocks(
+    const std::shared_ptr<HierarchyKVCacheTransfer>& draft_transfer,
+    uint64_t batch_id,
+    const std::vector<BlockTransferInfo>& block_transfer_info) {
+  std::vector<BlockTransferInfo> draft_transfer_info;
+  draft_transfer_info.reserve(block_transfer_info.size());
+  std::copy_if(block_transfer_info.begin(),
+               block_transfer_info.end(),
+               std::back_inserter(draft_transfer_info),
+               [&draft_transfer](const BlockTransferInfo& info) {
+                 return draft_transfer->supports_block_type(info.block_type);
+               });
+  if (draft_transfer_info.empty()) {
+    return static_cast<uint32_t>(block_transfer_info.size());
+  }
+
+  const uint32_t transferred =
+      draft_transfer->transfer_kv_blocks(batch_id, draft_transfer_info);
+  if (transferred != static_cast<uint32_t>(draft_transfer_info.size())) {
+    return 0;
+  }
+  return static_cast<uint32_t>(block_transfer_info.size());
+}
+
 }  // namespace
 
 using adaptive_pruning::apply_pruned_prefix_lengths;
@@ -811,14 +837,24 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
   draft_impl_ = std::make_unique<LLMWorkerImpl>(
       MTPDraftParallelArgs(parallel_args, options),
       device,
-      mtp_draft_options(draft_options));
+      mtp_draft_options(draft_options),
+      HierarchyTransferCreationMode::COMPOSITE_OWNER);
   if (enable_adaptive_speculative_decode) {
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
   }
 }
 
-MTPWorkerImpl::~MTPWorkerImpl() = default;
+MTPWorkerImpl::~MTPWorkerImpl() {
+  if (impl_ != nullptr) {
+    impl_->clear_hierarchy_kv_cache_transfer();
+  }
+  if (draft_impl_ != nullptr) {
+    draft_impl_->clear_hierarchy_kv_cache_transfer();
+  }
+  draft_transfer_owner_.reset();
+  clear_hierarchy_kv_cache_transfer();
+}
 
 bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
                                int32_t random_seed,
@@ -1140,7 +1176,42 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
 
-  return target_allocated && draft_allocated;
+  const bool allocated = target_allocated && draft_allocated;
+  if (allocated) {
+    initialize_hierarchy_kv_cache_transfers();
+  }
+  return allocated;
+}
+
+void MTPWorkerImpl::initialize_hierarchy_kv_cache_transfers() {
+  if (options_.host_blocks_factor() <= 1.0) {
+    return;
+  }
+
+  CHECK(impl_ != nullptr);
+  CHECK(draft_impl_ != nullptr);
+  std::shared_ptr<HierarchyKVCacheTransfer> target_transfer =
+      impl_->get_hierarchy_kv_cache_transfer();
+  CHECK(target_transfer != nullptr)
+      << "MTP target hierarchy KV cache transfer is not initialized.";
+  if (hierarchy_kv_cache_transfer_ == nullptr) {
+    set_hierarchy_kv_cache_transfer(target_transfer);
+  } else {
+    CHECK_EQ(hierarchy_kv_cache_transfer_.get(), target_transfer.get())
+        << "MTP target hierarchy KV cache transfer changed unexpectedly.";
+  }
+
+  if (draft_transfer_owner_ == nullptr) {
+    CHECK(draft_impl_->get_hierarchy_kv_cache_transfer() == nullptr)
+        << "MTP draft hierarchy KV cache transfer must be parent-owned.";
+    draft_transfer_owner_ =
+        draft_impl_->create_hierarchy_kv_cache_transfer(compute_stream_.get());
+    draft_impl_->set_hierarchy_kv_cache_transfer(draft_transfer_owner_);
+  } else {
+    CHECK_EQ(draft_impl_->get_hierarchy_kv_cache_transfer().get(),
+             draft_transfer_owner_.get())
+        << "MTP draft hierarchy KV cache transfer changed unexpectedly.";
+  }
 }
 
 uint32_t MTPWorkerImpl::transfer_kv_blocks(
@@ -1148,6 +1219,40 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
     const std::vector<BlockTransferInfo>& block_transfer_info) {
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
+
+  std::shared_ptr<HierarchyKVCacheTransfer> target_transfer =
+      hierarchy_kv_cache_transfer_;
+  std::shared_ptr<HierarchyKVCacheTransfer> draft_transfer =
+      draft_transfer_owner_;
+  if (target_transfer != nullptr || draft_transfer != nullptr) {
+    CHECK(target_transfer != nullptr);
+    CHECK(draft_transfer != nullptr);
+
+    const auto transfer_pair =
+        [target_transfer, draft_transfer, batch_id, block_transfer_info]() {
+          const uint32_t target_transferred =
+              target_transfer->transfer_kv_blocks(batch_id,
+                                                  block_transfer_info);
+          const uint32_t draft_transferred = transfer_draft_hierarchy_blocks(
+              draft_transfer, batch_id, block_transfer_info);
+          return validate_paired_transfer_counts(target_transferred,
+                                                 draft_transferred);
+        };
+    if (!block_transfer_info.empty() &&
+        block_transfer_info.front().transfer_type == TransferType::D2H2G) {
+      auto result = std::make_shared<std::promise<uint32_t>>();
+      std::future<uint32_t> future = result->get_future();
+      threadpool_.schedule([transfer_pair, result]() mutable {
+        try {
+          result->set_value(transfer_pair());
+        } catch (...) {
+          result->set_exception(std::current_exception());
+        }
+      });
+      return future.get();
+    }
+    return transfer_pair();
+  }
 
   const uint32_t target_transferred =
       impl_->transfer_kv_blocks(batch_id, block_transfer_info);
@@ -1162,11 +1267,30 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
+  if (hierarchy_kv_cache_transfer_ != nullptr ||
+      draft_transfer_owner_ != nullptr) {
+    CHECK(hierarchy_kv_cache_transfer_ != nullptr);
+    CHECK(draft_transfer_owner_ != nullptr);
+    const uint32_t target_transferred =
+        hierarchy_kv_cache_transfer_->transfer_kv_blocks(batch_id,
+                                                         block_transfer_info);
+    const uint32_t draft_transferred =
+        draft_transfer_owner_->transfer_kv_blocks(batch_id,
+                                                  block_transfer_info);
+    return validate_paired_transfer_counts(target_transferred,
+                                           draft_transferred);
+  }
+
   const uint32_t target_transferred =
       impl_->transfer_kv_blocks(batch_id, block_transfer_info);
   const uint32_t draft_transferred =
       draft_impl_->transfer_kv_blocks(batch_id, block_transfer_info);
   return validate_paired_transfer_counts(target_transferred, draft_transferred);
+}
+
+std::vector<uint8_t> MTPWorkerImpl::prefetch_kv_blocks(
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
 }
 
 #if defined(USE_NPU) || defined(USE_MLU)
@@ -1228,7 +1352,11 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
           torch::zeros({size}, torch::dtype(dtype_).device(device_)));
     }
   }
-  return target_allocated && draft_allocated;
+  const bool allocated = target_allocated && draft_allocated;
+  if (allocated) {
+    initialize_hierarchy_kv_cache_transfers();
+  }
+  return allocated;
 }
 #endif
 
@@ -1247,7 +1375,7 @@ MTPWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
 
 void MTPWorkerImpl::prepare_work_before_execute(const ForwardInput& input,
                                                 ForwardInput& processed_input) {
-  // Composite skips CP prepare; leaves run it in run_worker_no_sync_impl.
+  // Composite skips CP prepare; leaves run it on their execution streams.
   SpeculativeWorkerImpl::prepare_work_before_execute(input, processed_input);
 }
 
@@ -3241,10 +3369,10 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
 
   if (!use_explicit_spec_verify_replay_update) {
     specBuilder::set_token_position_tensors(validate_input,
-                                             buf.out_token_ids,
-                                             buf.out_positions,
-                                             token_options,
-                                             position_options);
+                                            buf.out_token_ids,
+                                            buf.out_positions,
+                                            token_options,
+                                            position_options);
   }
   if (!use_atb_spec_kernel) {
     input_params.meta.num_sequences = total_num_val_tokens;
@@ -3645,12 +3773,11 @@ void MTPWorkerImpl::prepare_validate_inputs(
   CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
       << "validate positions/tokens mismatch";
 
-  specBuilder::set_token_position_tensors(
-      validate_input,
-      buf.out_token_ids,
-      buf.out_positions,
-      token_options,
-      position_options);
+  specBuilder::set_token_position_tensors(validate_input,
+                                          buf.out_token_ids,
+                                          buf.out_positions,
+                                          token_options,
+                                          position_options);
   if (!use_atb_spec_kernel) {
     input_params.meta.num_sequences = total_num_val_tokens;
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
@@ -3904,16 +4031,14 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())
       << "draft extend slots/positions mismatch";
-  CHECK_EQ(expanded_embeddings.size(),
-           buf.out_positions.size())
+  CHECK_EQ(expanded_embeddings.size(), buf.out_positions.size())
       << "draft extend embeddings/positions mismatch";
 
-  specBuilder::set_token_position_tensors(
-      extend_input,
-      buf.out_token_ids,
-      buf.out_positions,
-      token_options,
-      position_options);
+  specBuilder::set_token_position_tensors(extend_input,
+                                          buf.out_token_ids,
+                                          buf.out_positions,
+                                          token_options,
+                                          position_options);
   if (use_chunked_prefill) {
     input_params.meta.num_sequences = num_sequences;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
@@ -3984,9 +4109,9 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       CHECK_EQ(input_params.parallel.dp_global_token_nums.size(),
                static_cast<size_t>(parallel_args_.dp_size()))
           << "dp token counts should be available for every DP rank";
-      torch::Tensor local_rows = torch::tensor(
-          {static_cast<int32_t>(buf.out_positions.size())},
-          torch::dtype(torch::kInt).device(device_));
+      torch::Tensor local_rows =
+          torch::tensor({static_cast<int32_t>(buf.out_positions.size())},
+                        torch::dtype(torch::kInt).device(device_));
       torch::Tensor gathered_rows = local_rows;
       if (dp_row_count_group != nullptr) {
         gathered_rows = dp_row_count_group->allgather_base_sync(local_rows);

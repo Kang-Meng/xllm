@@ -394,6 +394,10 @@ std::vector<uint8_t> HierarchyKVCacheTransfer::prefetch_kv_blocks(
   return hits;
 }
 
+bool HierarchyKVCacheTransfer::supports_block_type(BlockType block_type) const {
+  return host_kv_caches_.find(block_type) != host_kv_caches_.end();
+}
+
 uint32_t HierarchyKVCacheTransfer::offload(
     const std::vector<BlockTransferInfo>& block_transfer_info) {
   if (host_kv_transfer_ == nullptr) {

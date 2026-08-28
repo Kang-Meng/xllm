@@ -405,10 +405,15 @@ void disable_layerwise_split_for_draft(ParallelArgs* parallel_args) {
 
 }  // namespace
 
-WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
-                       const torch::Device& device,
-                       const runtime::Options& options)
-    : options_(options), device_(device), parallel_args_(parallel_args) {
+WorkerImpl::WorkerImpl(
+    const ParallelArgs& parallel_args,
+    const torch::Device& device,
+    const runtime::Options& options,
+    HierarchyTransferCreationMode hierarchy_transfer_creation_mode)
+    : options_(options),
+      device_(device),
+      parallel_args_(parallel_args),
+      hierarchy_transfer_creation_mode_(hierarchy_transfer_creation_mode) {
   if (options_.enable_speculative_decode() &&
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
@@ -2397,7 +2402,9 @@ void WorkerImpl::init_hierarchy_kv_cache_transfer(
     CHECK_GT(options_.host_blocks_factor(), 1.0)
         << "KV cache Store requires Host cache blocks.";
   }
-  if (options_.host_blocks_factor() > 1.0) {
+  if (options_.host_blocks_factor() > 1.0 &&
+      hierarchy_transfer_creation_mode_ ==
+          HierarchyTransferCreationMode::SELF) {
     set_hierarchy_kv_cache_transfer(
         create_hierarchy_kv_cache_transfer(compute_stream_.get()));
   }

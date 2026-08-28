@@ -54,6 +54,11 @@ namespace xllm {
 
 class WorkerRendezvous;
 
+enum class HierarchyTransferCreationMode : uint8_t {
+  SELF = 0,
+  COMPOSITE_OWNER,
+};
+
 class WorkerImpl {
  public:
   enum Status : int8_t {
@@ -64,7 +69,9 @@ class WorkerImpl {
 
   WorkerImpl(const ParallelArgs& parallel_args,
              const torch::Device& device,
-             const runtime::Options& options);
+             const runtime::Options& options,
+             HierarchyTransferCreationMode hierarchy_transfer_creation_mode =
+                 HierarchyTransferCreationMode::SELF);
 
   virtual ~WorkerImpl();
 
@@ -453,6 +460,8 @@ class WorkerImpl {
   InstanceRole instance_role_ = InstanceRole::DEFAULT;
 
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
+  HierarchyTransferCreationMode hierarchy_transfer_creation_mode_ =
+      HierarchyTransferCreationMode::SELF;
   std::optional<HierarchyKVCacheTransferContext>
       hierarchy_kv_cache_transfer_context_;
   std::shared_ptr<HierarchyKVCacheTransfer> hierarchy_kv_cache_transfer_;
