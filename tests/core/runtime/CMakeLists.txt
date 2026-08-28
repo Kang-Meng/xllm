@@ -109,6 +109,20 @@ cc_test(
     GTest::gtest_main
 )
 
+if(USE_NPU OR USE_MLU)
+  cc_test(
+    NAME
+      worker_hierarchy_kv_cache_transfer_test
+    SRCS
+      worker_hierarchy_kv_cache_transfer_test.cpp
+    DEPS
+      :runtime
+      :kv_cache
+      :platform
+      GTest::gtest_main
+  )
+endif()
+
 if(USE_MLU)
   cc_test(
     NAME
