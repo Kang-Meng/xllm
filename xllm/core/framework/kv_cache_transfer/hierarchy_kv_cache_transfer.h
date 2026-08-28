@@ -72,6 +72,7 @@ class HierarchyKVCacheTransfer final {
   std::vector<uint8_t> prefetch_kv_blocks(
       Slice<BlockTransferInfo>& block_transfer_info);
   void set_layer_synchronizer(ModelInputParams& params);
+  [[nodiscard]] bool supports_block_type(BlockType block_type) const;
 
  private:
   GroupedCaches build_device_groups(
