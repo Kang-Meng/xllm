@@ -294,7 +294,6 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
  protected:
   // Draft model worker
   std::unique_ptr<LLMWorkerImpl> draft_impl_;
-  std::shared_ptr<HierarchyKVCacheTransfer> draft_transfer_owner_;
 
   // Embedding cache for speculative decoding
   std::shared_ptr<EmbeddingCache> embedding_cache_;

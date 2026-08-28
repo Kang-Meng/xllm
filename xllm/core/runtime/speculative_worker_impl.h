@@ -61,11 +61,14 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   // `options` is passed to WorkerImpl (preserves enable_schedule_overlap etc.),
   // `target_options` is used to create impl_ (target model worker).
   // Each algorithm subclass decides its own target_options.
-  SpeculativeWorkerImpl(const ParallelArgs& parallel_args,
-                        const torch::Device& device,
-                        const runtime::Options& options,
-                        const runtime::Options& target_options,
-                        WorkerType worker_type = WorkerType::LLM);
+  SpeculativeWorkerImpl(
+      const ParallelArgs& parallel_args,
+      const torch::Device& device,
+      const runtime::Options& options,
+      const runtime::Options& target_options,
+      WorkerType worker_type = WorkerType::LLM,
+      HierarchyTransferCreationMode hierarchy_transfer_creation_mode =
+          HierarchyTransferCreationMode::SELF);
 
  public:
   // initialize model, cache manager. blocking call

@@ -508,30 +508,6 @@ uint32_t validate_paired_transfer_counts(uint32_t target_transferred,
   return target_transferred;
 }
 
-uint32_t transfer_draft_hierarchy_blocks(
-    const std::shared_ptr<HierarchyKVCacheTransfer>& draft_transfer,
-    uint64_t batch_id,
-    const std::vector<BlockTransferInfo>& block_transfer_info) {
-  std::vector<BlockTransferInfo> draft_transfer_info;
-  draft_transfer_info.reserve(block_transfer_info.size());
-  std::copy_if(block_transfer_info.begin(),
-               block_transfer_info.end(),
-               std::back_inserter(draft_transfer_info),
-               [&draft_transfer](const BlockTransferInfo& info) {
-                 return draft_transfer->supports_block_type(info.block_type);
-               });
-  if (draft_transfer_info.empty()) {
-    return static_cast<uint32_t>(block_transfer_info.size());
-  }
-
-  const uint32_t transferred =
-      draft_transfer->transfer_kv_blocks(batch_id, draft_transfer_info);
-  if (transferred != static_cast<uint32_t>(draft_transfer_info.size())) {
-    return 0;
-  }
-  return static_cast<uint32_t>(block_transfer_info.size());
-}
-
 }  // namespace
 
 using adaptive_pruning::apply_pruned_prefix_lengths;
@@ -833,7 +809,8 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                             device,
                             options,
                             target_options,
-                            worker_type) {
+                            worker_type,
+                            HierarchyTransferCreationMode::COMPOSITE_OWNER) {
   draft_impl_ = std::make_unique<LLMWorkerImpl>(
       MTPDraftParallelArgs(parallel_args, options),
       device,
@@ -852,7 +829,6 @@ MTPWorkerImpl::~MTPWorkerImpl() {
   if (draft_impl_ != nullptr) {
     draft_impl_->clear_hierarchy_kv_cache_transfer();
   }
-  draft_transfer_owner_.reset();
   clear_hierarchy_kv_cache_transfer();
 }
 
@@ -1190,27 +1166,28 @@ void MTPWorkerImpl::initialize_hierarchy_kv_cache_transfers() {
 
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
-  std::shared_ptr<HierarchyKVCacheTransfer> target_transfer =
-      impl_->get_hierarchy_kv_cache_transfer();
-  CHECK(target_transfer != nullptr)
-      << "MTP target hierarchy KV cache transfer is not initialized.";
   if (hierarchy_kv_cache_transfer_ == nullptr) {
-    set_hierarchy_kv_cache_transfer(target_transfer);
-  } else {
-    CHECK_EQ(hierarchy_kv_cache_transfer_.get(), target_transfer.get())
-        << "MTP target hierarchy KV cache transfer changed unexpectedly.";
-  }
-
-  if (draft_transfer_owner_ == nullptr) {
+    CHECK(impl_->get_hierarchy_kv_cache_transfer() == nullptr)
+        << "MTP target hierarchy KV cache transfer must be parent-owned.";
     CHECK(draft_impl_->get_hierarchy_kv_cache_transfer() == nullptr)
         << "MTP draft hierarchy KV cache transfer must be parent-owned.";
-    draft_transfer_owner_ =
-        draft_impl_->create_hierarchy_kv_cache_transfer(compute_stream_.get());
-    draft_impl_->set_hierarchy_kv_cache_transfer(draft_transfer_owner_);
+
+    std::shared_ptr<HierarchyKVCacheTransfer> unified_transfer =
+        impl_->create_hierarchy_kv_cache_transfer(
+            compute_stream_.get(), /*finalize_registration=*/false);
+    draft_impl_->register_hierarchy_kv_cache(
+        *unified_transfer,
+        HierarchyKVCacheTransfer::CacheRole::DRAFT,
+        compute_stream_.get());
+    CHECK(unified_transfer->finalize_registration());
+    impl_->set_hierarchy_kv_cache_transfer(unified_transfer);
+    set_hierarchy_kv_cache_transfer(std::move(unified_transfer));
   } else {
-    CHECK_EQ(draft_impl_->get_hierarchy_kv_cache_transfer().get(),
-             draft_transfer_owner_.get())
-        << "MTP draft hierarchy KV cache transfer changed unexpectedly.";
+    CHECK_EQ(impl_->get_hierarchy_kv_cache_transfer().get(),
+             hierarchy_kv_cache_transfer_.get())
+        << "MTP unified hierarchy KV cache transfer changed unexpectedly.";
+    CHECK(draft_impl_->get_hierarchy_kv_cache_transfer() == nullptr)
+        << "MTP draft worker must not bind the unified transfer.";
   }
 }
 
@@ -1220,38 +1197,25 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
-  std::shared_ptr<HierarchyKVCacheTransfer> target_transfer =
-      hierarchy_kv_cache_transfer_;
-  std::shared_ptr<HierarchyKVCacheTransfer> draft_transfer =
-      draft_transfer_owner_;
-  if (target_transfer != nullptr || draft_transfer != nullptr) {
-    CHECK(target_transfer != nullptr);
-    CHECK(draft_transfer != nullptr);
-
-    const auto transfer_pair =
-        [target_transfer, draft_transfer, batch_id, block_transfer_info]() {
-          const uint32_t target_transferred =
-              target_transfer->transfer_kv_blocks(batch_id,
-                                                  block_transfer_info);
-          const uint32_t draft_transferred = transfer_draft_hierarchy_blocks(
-              draft_transfer, batch_id, block_transfer_info);
-          return validate_paired_transfer_counts(target_transferred,
-                                                 draft_transferred);
-        };
+  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    WorkerImpl* target_worker = impl_.get();
+    const auto transfer = [target_worker, batch_id, block_transfer_info]() {
+      return target_worker->transfer_kv_blocks(batch_id, block_transfer_info);
+    };
     if (!block_transfer_info.empty() &&
         block_transfer_info.front().transfer_type == TransferType::D2H2G) {
       auto result = std::make_shared<std::promise<uint32_t>>();
       std::future<uint32_t> future = result->get_future();
-      threadpool_.schedule([transfer_pair, result]() mutable {
+      threadpool_.schedule([transfer, result]() mutable {
         try {
-          result->set_value(transfer_pair());
+          result->set_value(transfer());
         } catch (...) {
           result->set_exception(std::current_exception());
         }
       });
       return future.get();
     }
-    return transfer_pair();
+    return transfer();
   }
 
   const uint32_t target_transferred =
@@ -1267,18 +1231,8 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
-  if (hierarchy_kv_cache_transfer_ != nullptr ||
-      draft_transfer_owner_ != nullptr) {
-    CHECK(hierarchy_kv_cache_transfer_ != nullptr);
-    CHECK(draft_transfer_owner_ != nullptr);
-    const uint32_t target_transferred =
-        hierarchy_kv_cache_transfer_->transfer_kv_blocks(batch_id,
-                                                         block_transfer_info);
-    const uint32_t draft_transferred =
-        draft_transfer_owner_->transfer_kv_blocks(batch_id,
-                                                  block_transfer_info);
-    return validate_paired_transfer_counts(target_transferred,
-                                           draft_transferred);
+  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    return impl_->transfer_kv_blocks(batch_id, block_transfer_info);
   }
 
   const uint32_t target_transferred =

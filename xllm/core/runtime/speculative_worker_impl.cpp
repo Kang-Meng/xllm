@@ -181,13 +181,16 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
     const torch::Device& device,
     const runtime::Options& options,
     const runtime::Options& target_options,
-    WorkerType worker_type)
+    WorkerType worker_type,
+    HierarchyTransferCreationMode hierarchy_transfer_creation_mode)
     : WorkerImpl(parallel_args, device, options),
       draft_sampling_mode_(
           parse_draft_sampling_mode(options.draft_sampling_mode())) {
   if (worker_type == WorkerType::LLM) {
-    impl_ =
-        std::make_unique<LLMWorkerImpl>(parallel_args, device, target_options);
+    impl_ = std::make_unique<LLMWorkerImpl>(parallel_args,
+                                            device,
+                                            target_options,
+                                            hierarchy_transfer_creation_mode);
   } else if (worker_type == WorkerType::VLM) {
     impl_ =
         std::make_unique<VLMWorkerImpl>(parallel_args, device, target_options);

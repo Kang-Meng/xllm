@@ -210,7 +210,12 @@ class WorkerImpl {
       Slice<BlockTransferInfo>& block_transfer_info);
 
   std::shared_ptr<HierarchyKVCacheTransfer> create_hierarchy_kv_cache_transfer(
-      const Stream* compute_stream);
+      const Stream* compute_stream,
+      bool finalize_registration = true);
+
+  void register_hierarchy_kv_cache(HierarchyKVCacheTransfer& transfer,
+                                   HierarchyKVCacheTransfer::CacheRole role,
+                                   const Stream* producer_stream);
 
   void set_hierarchy_kv_cache_transfer(
       std::shared_ptr<HierarchyKVCacheTransfer> transfer);
