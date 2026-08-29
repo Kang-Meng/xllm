@@ -154,7 +154,7 @@ TEST(HostKVTransferUtilsTest, GroupsInOrderAndPreservesMappingOrder) {
   const HostKVRequest request{
       {HostKVMapping{7, 3, 1}, HostKVMapping{3, 4, 0}, HostKVMapping{7, 2, 0}}};
 
-  const GroupedHostKVMappings grouped = group_mappings(request);
+  const GroupedHostKVMappings grouped = group_mappings(request.mappings);
 
   ASSERT_EQ(grouped.size(), 2U);
   auto group_it = grouped.begin();

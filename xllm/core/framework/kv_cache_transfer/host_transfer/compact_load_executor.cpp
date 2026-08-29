@@ -55,12 +55,14 @@ CompactLoadExecutor::CompactLoadExecutor(const HostKVLayout& layout,
                                          const Device& device,
                                          uint32_t layer_copy_batches,
                                          BatchMemcpy& batch_memcpy,
-                                         size_t target_bytes)
+                                         size_t target_bytes,
+                                         bool record_completion_event)
     : device_(device),
       target_bytes_(target_bytes),
       layers_per_event_(
           get_layers_per_event(layout.num_layers(), layer_copy_batches)),
       ranges_(build_layer_ranges(layout.num_layers(), layers_per_event_)),
+      record_completion_event_(record_completion_event),
       batch_memcpy_(batch_memcpy) {
   CHECK_GT(target_bytes_, static_cast<size_t>(0))
       << "compact H2D target bytes must be positive.";
@@ -74,7 +76,8 @@ bool CompactLoadExecutor::execute(
     const HostKVRequest& request,
     const std::shared_ptr<LayerSynchronizer>& synchronizer) {
   std::lock_guard<std::mutex> lock(mutex_);
-  const GroupedHostKVMappings mappings_by_group = group_mappings(request);
+  const GroupedHostKVMappings mappings_by_group =
+      group_mappings(request.mappings);
   for (size_t range_index = 0; range_index < ranges_.size(); ++range_index) {
     for (const auto& [group_id, mappings] : mappings_by_group) {
       if (!submit_range(
@@ -89,6 +92,23 @@ bool CompactLoadExecutor::execute(
       return false;
     }
   }
+  const GroupedHostKVMappings completion_mappings_by_group =
+      group_mappings(request.completion_mappings);
+  for (size_t range_index = 0; range_index < ranges_.size(); ++range_index) {
+    for (const auto& [group_id, mappings] : completion_mappings_by_group) {
+      if (!submit_range(
+              group_id, groups_.at(group_id), range_index, mappings)) {
+        drain_or_die("completion H2D submission failed");
+        return false;
+      }
+    }
+  }
+  if (record_completion_event_ &&
+      !synchronizer->record_stream(static_cast<int64_t>(ranges_.size()),
+                                   copy_stream_.get())) {
+    drain_or_die("completion event recording failed");
+    return false;
+  }
   return true;
 }
 
@@ -102,7 +122,8 @@ void CompactLoadExecutor::drain() {
 }
 
 uint32_t CompactLoadExecutor::event_count() const {
-  return static_cast<uint32_t>(ranges_.size());
+  return static_cast<uint32_t>(ranges_.size()) +
+         static_cast<uint32_t>(record_completion_event_);
 }
 
 uint32_t CompactLoadExecutor::layers_per_event() const {

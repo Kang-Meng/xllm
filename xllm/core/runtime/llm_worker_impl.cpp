@@ -180,6 +180,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
     bool record_ready_event) {
   const ForwardSyncPolicy sync_policy = ForwardSyncPolicy::NO_SYNC;
   c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+  CHECK(input.input_params.synchronize_kv_load_completion())
+      << "Failed to wait for Host KV load completion.";
   if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
 #if defined(USE_NPU)
     if (!enable_schedule_overlap() && options_.backend() == "llm") {

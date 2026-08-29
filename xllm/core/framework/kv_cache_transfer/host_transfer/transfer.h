@@ -29,6 +29,8 @@ class Stream;
 struct HostKVLoadHandle {
   std::shared_ptr<LayerSynchronizer> synchronizer;
   uint32_t layers_per_event = 1;
+  uint32_t primary_event_count = 0;
+  uint32_t completion_event_index = 0;
 };
 
 enum class HostKVTransferMode : uint8_t {
@@ -38,6 +40,7 @@ enum class HostKVTransferMode : uint8_t {
 
 struct HostKVTransferConfig {
   uint32_t layer_copy_batches = 1;
+  bool record_completion_event = false;
   HostKVTransferMode mode = HostKVTransferMode::AUTO;
 };
 

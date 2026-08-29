@@ -292,13 +292,19 @@ std::optional<ForwardOutput> run_worker_no_sync_impl(
     const ForwardInput& input,
     Stream& prepare_stream,
     Stream& compute_stream,
-    ForwardInput& processed_input) {
+    ForwardInput& processed_input,
+    KVCacheLoadWaitPolicy wait_policy) {
   worker.prepare_work_before_execute_on_stream(
       input,
       processed_input,
       prepare_stream,
       /*record_ready_event=*/&prepare_stream != &compute_stream);
   worker.set_hierarchy_layer_synchronizer(processed_input.input_params);
+  if (processed_input.input_params.parallel.layer_wise_load_synchronizer !=
+      nullptr) {
+    processed_input.input_params.parallel.kv_cache_load_wait_policy =
+        wait_policy;
+  }
   if (auto* llm_worker = dynamic_cast<LLMWorkerImpl*>(&worker);
       llm_worker != nullptr) {
     return llm_worker->execute_no_sync_on_stream(
@@ -1016,7 +1022,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
     const ForwardInput& input,
     ForwardInput& processed_input) {
   std::optional<ForwardOutput> output = run_worker_no_sync_impl(
-      worker, input, *prepare_stream_, *compute_stream_, processed_input);
+      worker,
+      input,
+      *prepare_stream_,
+      *compute_stream_,
+      processed_input,
+      &worker == draft_impl_.get() ? KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION
+                                   : KVCacheLoadWaitPolicy::LAYER_WISE);
   synchronize_embedded_eagle3_forward();
   if (uses_embedded_eagle3_draft()) {
     clear_mla_prefixcache_workspace(processed_input);
@@ -1392,12 +1404,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
       draft_extend_prepared = std::move(pending_draft_context_.prepared_input);
       pending_draft_context_ = PendingDraftContext();
     } else {
-      draft_outputs.emplace_back(run_worker_no_sync_impl(*draft_impl_,
-                                                         new_input,
-                                                         *prepare_stream_,
-                                                         *compute_stream_,
-                                                         draft_extend_prepared)
-                                     .value());
+      draft_outputs.emplace_back(
+          run_worker_no_sync_impl(*draft_impl_,
+                                  new_input,
+                                  *prepare_stream_,
+                                  *compute_stream_,
+                                  draft_extend_prepared,
+                                  KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION)
+              .value());
     }
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
@@ -1880,11 +1894,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         draft_output_opt = run_worker_no_sync(
             *draft_impl_, current_draft_input, draft_prepared[draft_idx]);
       } else {
-        draft_output_opt = run_worker_no_sync_impl(*draft_impl_,
-                                                   current_draft_input,
-                                                   *compute_stream_,
-                                                   *compute_stream_,
-                                                   draft_prepared[draft_idx]);
+        draft_output_opt =
+            run_worker_no_sync_impl(*draft_impl_,
+                                    current_draft_input,
+                                    *compute_stream_,
+                                    *compute_stream_,
+                                    draft_prepared[draft_idx],
+                                    KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION);
       }
     }
 
@@ -2412,7 +2428,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                                             validate_input,
                                             *compute_stream_,
                                             *compute_stream_,
-                                            target_prepared)
+                                            target_prepared,
+                                            KVCacheLoadWaitPolicy::LAYER_WISE)
                         .value();
   }
   const double target_latency_ms = timer.elapsed_milliseconds();
@@ -3021,7 +3038,8 @@ void MTPWorkerImpl::submit_pending_first_draft(
                               draft_input,
                               *compute_stream_,
                               *compute_stream_,
-                              pending_draft_context_.prepared_input);
+                              pending_draft_context_.prepared_input,
+                              KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION);
   CHECK(pending_draft_context_.output.has_value())
       << "failed to prelaunch next MTP first draft";
 }

@@ -173,10 +173,10 @@ class MtpModelImplBase : public torch::nn::Module {
 
     prepare_legacy_expert_array(h, input_params);
 
-    // TODO(liangzhiwei20): MTP need more support for layer wise copy.
-    if (input_params.parallel.layer_wise_load_synchronizer != nullptr) {
-      LOG(FATAL) << "MTP not support layer wise copy!";
-    }
+    CHECK(input_params.parallel.layer_wise_load_synchronizer == nullptr ||
+          input_params.parallel.kv_cache_load_wait_policy ==
+              KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION)
+        << "MTP does not support layer-wise Host KV load waits.";
 
     torch::Tensor prev_topk_indices;
     if (input_params.mtp_topk_state != nullptr) {

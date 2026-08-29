@@ -73,32 +73,44 @@ bool HostKVTransfer::offload(const HostKVRequest& request) {
 
 bool HostKVTransfer::valid_request(const HostKVRequest& request,
                                    bool is_load) const {
-  if (request.mappings.empty()) {
+  if (request.mappings.empty() && request.completion_mappings.empty()) {
     LOG(ERROR) << "Host KV request must not be empty.";
+    return false;
+  }
+  if (!is_load && !request.completion_mappings.empty()) {
+    LOG(ERROR) << "Host KV offload does not accept completion mappings.";
     return false;
   }
 
   std::unordered_set<BlockKey, BlockKeyHash> destinations;
-  destinations.reserve(request.mappings.size());
-  for (const HostKVMapping& mapping : request.mappings) {
-    const HostKVGroupLayout* group = layout_.find_group(mapping.group_id);
-    if (group == nullptr || mapping.host_block_id < 0 ||
-        mapping.host_block_id >= layout_.host_block_count(mapping.group_id) ||
-        mapping.device_block_id < 0 ||
-        mapping.device_block_id >=
-            layout_.device_block_count(mapping.group_id)) {
-      LOG(ERROR) << "Host KV request contains an unknown group or block.";
-      return false;
-    }
+  destinations.reserve(request.mappings.size() +
+                       request.completion_mappings.size());
+  const auto validate_mappings =
+      [this, is_load, &destinations](
+          const std::vector<HostKVMapping>& mappings) {
+        for (const HostKVMapping& mapping : mappings) {
+          const HostKVGroupLayout* group = layout_.find_group(mapping.group_id);
+          if (group == nullptr || mapping.host_block_id < 0 ||
+              mapping.host_block_id >=
+                  layout_.host_block_count(mapping.group_id) ||
+              mapping.device_block_id < 0 ||
+              mapping.device_block_id >=
+                  layout_.device_block_count(mapping.group_id)) {
+            LOG(ERROR) << "Host KV request contains an unknown group or block.";
+            return false;
+          }
 
-    const int64_t destination =
-        is_load ? mapping.device_block_id : mapping.host_block_id;
-    if (!destinations.emplace(mapping.group_id, destination).second) {
-      LOG(ERROR) << "Host KV request contains a duplicate destination.";
-      return false;
-    }
-  }
-  return true;
+          const int64_t destination =
+              is_load ? mapping.device_block_id : mapping.host_block_id;
+          if (!destinations.emplace(mapping.group_id, destination).second) {
+            LOG(ERROR) << "Host KV request contains a duplicate destination.";
+            return false;
+          }
+        }
+        return true;
+      };
+  return validate_mappings(request.mappings) &&
+         validate_mappings(request.completion_mappings);
 }
 
 bool HostKVTransfer::valid_handle(const HostKVLoadHandle& handle) const {
@@ -122,10 +134,20 @@ std::unique_ptr<HostKVTransfer> create_host_kv_transfer(
   if (config.mode == HostKVTransferMode::AUTO &&
       Platform::supports_compact_host_kv_transfer()) {
     return std::make_unique<CompactHostKVTransfer>(
-        std::move(layout), device, compute_stream, config.layer_copy_batches);
+        std::move(layout),
+        device,
+        compute_stream,
+        config.layer_copy_batches,
+        /*batch_memcpy=*/nullptr,
+        CompactTransferConfig{},
+        config.record_completion_event);
   }
-  return std::make_unique<BasicHostKVTransfer>(
-      std::move(layout), device, compute_stream, config.layer_copy_batches);
+  return std::make_unique<BasicHostKVTransfer>(std::move(layout),
+                                               device,
+                                               compute_stream,
+                                               config.layer_copy_batches,
+                                               /*batch_memcpy=*/nullptr,
+                                               config.record_completion_event);
 }
 
 }  // namespace xllm

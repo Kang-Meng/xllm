@@ -46,6 +46,7 @@ struct HostKVMapping {
 
 struct HostKVRequest {
   std::vector<HostKVMapping> mappings;
+  std::vector<HostKVMapping> completion_mappings;
 };
 
 struct HostKVLayoutInput {

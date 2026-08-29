@@ -849,6 +849,11 @@ struct MultiModalInput {
   }
 };
 
+enum class KVCacheLoadWaitPolicy : uint8_t {
+  LAYER_WISE,
+  EXPLICIT_COMPLETION,
+};
+
 struct ParallelInput {
   // num tokens of all workers, mainly used for dp case
   std::vector<int32_t> dp_global_token_nums;
@@ -876,6 +881,9 @@ struct ParallelInput {
   std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer = nullptr;
 #endif
   uint32_t layers_per_event = std::numeric_limits<uint32_t>::max();
+  uint32_t completion_event_index = 0;
+  KVCacheLoadWaitPolicy kv_cache_load_wait_policy =
+      KVCacheLoadWaitPolicy::LAYER_WISE;
   std::shared_ptr<LayerSynchronizer> layer_wise_load_synchronizer = nullptr;
 #if defined(USE_NPU) || defined(USE_MUSA)
   std::vector<int64_t> query_start_loc;
@@ -894,6 +902,8 @@ struct ParallelInput {
     out.layer_synchronizer = layer_synchronizer;
 #endif
     out.layers_per_event = layers_per_event;
+    out.completion_event_index = completion_event_index;
+    out.kv_cache_load_wait_policy = kv_cache_load_wait_policy;
     out.layer_wise_load_synchronizer = layer_wise_load_synchronizer;
 #if defined(USE_NPU) || defined(USE_MUSA)
     out.query_start_loc = query_start_loc;
@@ -1112,11 +1122,23 @@ struct ModelInputParams {
 
   bool synchronize_layer(uint32_t layer_idx) const {
     if (parallel.layer_wise_load_synchronizer != nullptr &&
+        parallel.kv_cache_load_wait_policy ==
+            KVCacheLoadWaitPolicy::LAYER_WISE &&
         layer_idx % parallel.layers_per_event == 0) {
       if (!parallel.layer_wise_load_synchronizer->synchronize_layer(
               layer_idx / parallel.layers_per_event)) {
         return false;
       }
+    }
+    return true;
+  }
+
+  bool synchronize_kv_load_completion() const {
+    if (parallel.layer_wise_load_synchronizer != nullptr &&
+        parallel.kv_cache_load_wait_policy ==
+            KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION) {
+      return parallel.layer_wise_load_synchronizer->synchronize_layer(
+          parallel.completion_event_index);
     }
     return true;
   }

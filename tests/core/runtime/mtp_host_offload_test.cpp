@@ -458,6 +458,9 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   HierarchyTransferTestWorker* draft_ptr = draft.get();
   worker.replace_transfer_workers(std::move(target), std::move(draft));
   worker.initialize_hierarchy_transfers();
+  std::shared_ptr<HierarchyKVCacheTransfer> unified_transfer =
+      worker.target_transfer_owner();
+  ASSERT_NE(unified_transfer, nullptr);
 
   target_ptr->fill_block(kSourceBlockId, /*value=*/3.0);
   draft_ptr->fill_block(kSourceBlockId, /*value=*/13.0);
@@ -479,8 +482,14 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   target_input_params.meta.batch_id = kBatchId;
   worker.set_hierarchy_layer_synchronizer(target_input_params);
   ASSERT_NE(target_input_params.parallel.layer_wise_load_synchronizer, nullptr);
+  EXPECT_EQ(target_input_params.parallel.kv_cache_load_wait_policy,
+            KVCacheLoadWaitPolicy::LAYER_WISE);
+  EXPECT_EQ(target_input_params.parallel.completion_event_index, 1U);
+  EXPECT_FALSE(unified_transfer->take_load_handle(kBatchId).has_value());
 
   ModelInputParams draft_input_params = target_input_params;
+  draft_input_params.parallel.kv_cache_load_wait_policy =
+      KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION;
   draft_ptr->set_hierarchy_layer_synchronizer(draft_input_params);
   ASSERT_NE(draft_input_params.parallel.layer_wise_load_synchronizer, nullptr);
   EXPECT_EQ(target_input_params.parallel.layer_wise_load_synchronizer.get(),
@@ -488,10 +497,11 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   EXPECT_EQ(target_input_params.parallel.layers_per_event, 2U);
   EXPECT_EQ(draft_input_params.parallel.layers_per_event, 2U);
 
-  ASSERT_TRUE(draft_input_params.synchronize_layer(/*layer_idx=*/0));
   for (uint32_t layer_index = 0; layer_index < 2; ++layer_index) {
     ASSERT_TRUE(target_input_params.synchronize_layer(layer_index));
   }
+  ASSERT_TRUE(draft_input_params.synchronize_layer(/*layer_idx=*/0));
+  ASSERT_TRUE(draft_input_params.synchronize_kv_load_completion());
   EXPECT_TRUE(target_ptr->blocks_equal(kSourceBlockId, kDestinationBlockId));
   EXPECT_TRUE(draft_ptr->blocks_equal(kSourceBlockId, kDestinationBlockId));
 }
@@ -582,12 +592,16 @@ TEST_F(MTPHostOffloadTest, Dsv4DraftSkipsUnsupportedCompressedBlockTypes) {
   ModelInputParams target_input_params;
   target_input_params.meta.batch_id = kBatchId;
   worker.set_hierarchy_layer_synchronizer(target_input_params);
+  target_input_params.parallel.kv_cache_load_wait_policy =
+      KVCacheLoadWaitPolicy::LAYER_WISE;
   for (uint32_t layer_index = 0; layer_index < 3; ++layer_index) {
     ASSERT_TRUE(target_input_params.synchronize_layer(layer_index));
   }
   ModelInputParams draft_input_params = target_input_params;
+  draft_input_params.parallel.kv_cache_load_wait_policy =
+      KVCacheLoadWaitPolicy::EXPLICIT_COMPLETION;
   draft_ptr->set_hierarchy_layer_synchronizer(draft_input_params);
-  ASSERT_TRUE(draft_input_params.synchronize_layer(/*layer_idx=*/0));
+  ASSERT_TRUE(draft_input_params.synchronize_kv_load_completion());
 
   for (BlockType block_type : block_types) {
     EXPECT_TRUE(target_ptr->blocks_equal(

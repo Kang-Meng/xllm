@@ -35,9 +35,11 @@ CompactHostKVTransfer::CompactHostKVTransfer(
     const Stream& compute_stream,
     uint32_t layer_copy_batches,
     std::unique_ptr<BatchMemcpy> batch_memcpy,
-    CompactTransferConfig config)
+    CompactTransferConfig config,
+    bool record_completion_event)
     : HostKVTransfer(std::move(layout)),
       compute_stream_(compute_stream),
+      record_completion_event_(record_completion_event),
       batch_memcpy_(std::move(batch_memcpy)) {
   if (batch_memcpy_ == nullptr) {
     batch_memcpy_ = create_batch_memcpy(device);
@@ -50,7 +52,8 @@ CompactHostKVTransfer::CompactHostKVTransfer(
                                             device,
                                             layer_copy_batches,
                                             *batch_memcpy_,
-                                            config.load_target_bytes);
+                                            config.load_target_bytes,
+                                            record_completion_event);
   offload_executor_ = std::make_unique<CompactOffloadExecutor>(
       this->layout(), device, *batch_memcpy_, config.offload_target_bytes);
 }
@@ -58,8 +61,13 @@ CompactHostKVTransfer::CompactHostKVTransfer(
 CompactHostKVTransfer::~CompactHostKVTransfer() { drain(); }
 
 HostKVLoadHandle CompactHostKVTransfer::prepare_load() {
-  return {create_layer_synchronizer(load_executor_->event_count()),
-          load_executor_->layers_per_event()};
+  const uint32_t event_count = load_executor_->event_count();
+  const uint32_t primary_event_count =
+      event_count - static_cast<uint32_t>(record_completion_event_);
+  return {create_layer_synchronizer(event_count),
+          load_executor_->layers_per_event(),
+          primary_event_count,
+          event_count - 1};
 }
 
 void CompactHostKVTransfer::drain() {

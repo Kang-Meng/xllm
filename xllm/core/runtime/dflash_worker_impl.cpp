@@ -1303,6 +1303,8 @@ void DFlashWorkerImpl::write_context_kv(
   // on compute_stream_, so no explicit event dance is needed — the stream
   // orders them. Model methods below use torch ops on the same stream.
   c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  CHECK(input.input_params.synchronize_kv_load_completion())
+      << "Failed to wait for Draft Host KV load completion.";
 
 #if defined(USE_NPU)
   // PD PUSH: the draft context-KV scattered below is not covered by the target
