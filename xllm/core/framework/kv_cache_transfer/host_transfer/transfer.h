@@ -38,6 +38,7 @@ enum class HostKVTransferMode : uint8_t {
 
 struct HostKVTransferConfig {
   uint32_t layer_copy_batches = 1;
+  bool record_draft_cache_completion_event = false;
   HostKVTransferMode mode = HostKVTransferMode::AUTO;
 };
 

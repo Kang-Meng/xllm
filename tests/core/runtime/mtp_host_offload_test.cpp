@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
+#include "core/runtime/dflash_worker_impl.h"
 #include "core/runtime/llm_worker_impl.h"
 #include "core/runtime/mtp_worker_impl.h"
 #include "core/runtime/options.h"
@@ -169,6 +170,14 @@ class HierarchyTransferTestWorker final : public LLMWorkerImpl {
     init_hierarchy_kv_cache_transfer(cache_shape, create_options);
   }
 
+  void mark_loaded() { status_ = WorkerImpl::Status::LOADED; }
+
+  bool allocate_kv_cache(const KVCacheShape& cache_shape) override {
+    initialize_hierarchy_cache(cache_shape);
+    status_ = WorkerImpl::Status::READY;
+    return true;
+  }
+
   void fill_block(int64_t block_id, double value) {
     for (size_t layer_index = 0; layer_index < kv_caches_.size();
          ++layer_index) {
@@ -253,6 +262,32 @@ class TestMTPWorker final : public MTPWorkerImpl {
   }
 
   std::shared_ptr<HierarchyKVCacheTransfer> target_transfer_owner() const {
+    return get_hierarchy_kv_cache_transfer();
+  }
+
+  std::shared_ptr<HierarchyKVCacheTransfer> target_worker_transfer() const {
+    return impl_->get_hierarchy_kv_cache_transfer();
+  }
+
+  std::shared_ptr<HierarchyKVCacheTransfer> draft_worker_transfer() const {
+    return draft_impl_->get_hierarchy_kv_cache_transfer();
+  }
+};
+
+class TestDFlashWorker final : public DFlashWorkerImpl {
+ public:
+  TestDFlashWorker(const ParallelArgs& parallel_args,
+                   const torch::Device& device,
+                   const runtime::Options& options)
+      : DFlashWorkerImpl(parallel_args, device, options) {}
+
+  void replace_transfer_workers(std::unique_ptr<LLMWorkerImpl> target,
+                                std::unique_ptr<LLMWorkerImpl> draft) {
+    impl_ = std::move(target);
+    draft_impl_ = std::move(draft);
+  }
+
+  std::shared_ptr<HierarchyKVCacheTransfer> transfer_owner() const {
     return get_hierarchy_kv_cache_transfer();
   }
 
@@ -428,6 +463,47 @@ TEST_F(MTPHostOffloadTest, BindsAndReleasesUnifiedTransferOwner) {
   EXPECT_TRUE(transfer_lifetime.expired());
 }
 
+TEST_F(MTPHostOffloadTest, DFlashUsesSpeculativeHierarchyTransferLifecycle) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options = make_runtime_options(2.0);
+  options.speculative_algorithm("DFlash");
+  const ModelArgs model_args =
+      make_model_args("test_dflash", /*layer_count=*/2, /*head_dim=*/8);
+  const KVCacheShape cache_shape = make_cache_shape(model_args);
+  std::weak_ptr<HierarchyKVCacheTransfer> transfer_lifetime;
+
+  {
+    auto worker = std::make_unique<TestDFlashWorker>(
+        parallel_args, device.unwrap(), options);
+    auto target = std::make_unique<HierarchyTransferTestWorker>(
+        parallel_args, device.unwrap(), options, model_args);
+    auto draft = std::make_unique<HierarchyTransferTestWorker>(
+        parallel_args, device.unwrap(), options, model_args);
+    target->mark_loaded();
+    draft->mark_loaded();
+    worker->replace_transfer_workers(std::move(target), std::move(draft));
+
+    ASSERT_TRUE(worker->allocate_kv_cache(cache_shape));
+    std::shared_ptr<HierarchyKVCacheTransfer> transfer =
+        worker->transfer_owner();
+    ASSERT_NE(transfer, nullptr);
+    EXPECT_EQ(transfer.get(), worker->target_worker_transfer().get());
+    EXPECT_EQ(transfer.get(), worker->draft_worker_transfer().get());
+    EXPECT_TRUE(transfer->registration_finalized());
+    EXPECT_TRUE(transfer->supports_block_type(
+        HierarchyKVCacheTransfer::CacheRole::TARGET, BlockType::KV));
+    EXPECT_TRUE(transfer->supports_block_type(
+        HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::KV));
+    transfer_lifetime = transfer;
+  }
+
+  EXPECT_TRUE(transfer_lifetime.expired());
+}
+
 TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   constexpr uint64_t kBatchId = 91;
   constexpr int64_t kSourceBlockId = 0;
@@ -456,6 +532,9 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   target_ptr->initialize_hierarchy_cache(target_shape);
   draft_ptr->initialize_hierarchy_cache(draft_shape);
   worker.finalize_hierarchy_transfers();
+  std::shared_ptr<HierarchyKVCacheTransfer> unified_transfer =
+      worker.target_transfer_owner();
+  ASSERT_NE(unified_transfer, nullptr);
 
   target_ptr->fill_block(kSourceBlockId, /*value=*/3.0);
   draft_ptr->fill_block(kSourceBlockId, /*value=*/13.0);
@@ -477,6 +556,7 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   target_input_params.meta.batch_id = kBatchId;
   worker.set_hierarchy_layer_synchronizer(target_input_params);
   ASSERT_NE(target_input_params.parallel.layer_wise_load_synchronizer, nullptr);
+  EXPECT_FALSE(unified_transfer->take_load_handle(kBatchId).has_value());
 
   ModelInputParams draft_input_params = target_input_params;
   draft_ptr->set_hierarchy_layer_synchronizer(draft_input_params);
@@ -489,7 +569,7 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   for (uint32_t layer_index = 0; layer_index < 2; ++layer_index) {
     ASSERT_TRUE(target_input_params.synchronize_layer(layer_index));
   }
-  ASSERT_TRUE(draft_input_params.synchronize_layer(/*layer_idx=*/0));
+  ASSERT_TRUE(draft_input_params.synchronize_layer(/*layer_idx=*/-1));
   EXPECT_TRUE(target_ptr->blocks_equal(kSourceBlockId, kDestinationBlockId));
   EXPECT_TRUE(draft_ptr->blocks_equal(kSourceBlockId, kDestinationBlockId));
 }
@@ -578,7 +658,7 @@ TEST_F(MTPHostOffloadTest, Dsv4DraftSkipsUnsupportedCompressedBlockTypes) {
   }
   ModelInputParams draft_input_params = target_input_params;
   draft_ptr->set_hierarchy_layer_synchronizer(draft_input_params);
-  ASSERT_TRUE(draft_input_params.synchronize_layer(/*layer_idx=*/0));
+  ASSERT_TRUE(draft_input_params.synchronize_layer(/*layer_idx=*/-1));
 
   for (BlockType block_type : block_types) {
     EXPECT_TRUE(target_ptr->blocks_equal(

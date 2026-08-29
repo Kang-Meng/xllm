@@ -16,6 +16,8 @@ limitations under the License.
 #include "speculative_worker_impl.h"
 
 #include <algorithm>
+#include <exception>
+#include <future>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -51,6 +53,17 @@ namespace {
 
 Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
   return {tensor.data_ptr<int32_t>(), static_cast<size_t>(tensor.numel())};
+}
+
+uint32_t validate_paired_transfer_counts(uint32_t target_transferred,
+                                         uint32_t draft_transferred) {
+  if (target_transferred != draft_transferred) {
+    LOG(ERROR) << "Speculative target/draft KV block transfer count mismatch: "
+               << "target=" << target_transferred
+               << ", draft=" << draft_transferred;
+    return 0;
+  }
+  return target_transferred;
 }
 
 KVCacheEstimateOptions make_kv_cache_estimate_options(
@@ -197,6 +210,16 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
   }
 }
 
+SpeculativeWorkerImpl::~SpeculativeWorkerImpl() {
+  if (impl_ != nullptr) {
+    impl_->clear_hierarchy_kv_cache_transfer();
+  }
+  if (draft_impl_ != nullptr) {
+    draft_impl_->clear_hierarchy_kv_cache_transfer();
+  }
+  clear_hierarchy_kv_cache_transfer();
+}
+
 bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
                                        int32_t random_seed,
                                        MasterStatus master_status) {
@@ -261,6 +284,132 @@ bool SpeculativeWorkerImpl::allocate_kv_cache(
   return impl_->allocate_kv_cache(kv_cache_shape);
 }
 
+void SpeculativeWorkerImpl::prepare_hierarchy_kv_cache_transfers() {
+  if (options_.host_blocks_factor() <= 1.0 || draft_impl_ == nullptr) {
+    return;
+  }
+
+  CHECK(impl_ != nullptr);
+  std::shared_ptr<HierarchyKVCacheTransfer> unified_transfer =
+      hierarchy_kv_cache_transfer_;
+  if (unified_transfer == nullptr) {
+    unified_transfer = impl_->get_hierarchy_kv_cache_transfer();
+  }
+  if (unified_transfer == nullptr) {
+    unified_transfer = draft_impl_->get_hierarchy_kv_cache_transfer();
+  }
+  if (unified_transfer == nullptr) {
+    unified_transfer = impl_->create_hierarchy_kv_cache_transfer();
+  }
+
+  if (impl_->get_hierarchy_kv_cache_transfer() == nullptr) {
+    impl_->bind_hierarchy_kv_cache_transfer(
+        unified_transfer,
+        HierarchyKVCacheTransfer::CacheRole::TARGET,
+        compute_stream_.get());
+  } else {
+    CHECK_EQ(impl_->get_hierarchy_kv_cache_transfer().get(),
+             unified_transfer.get())
+        << "Speculative target worker hierarchy KV cache transfer changed "
+           "unexpectedly.";
+  }
+
+  if (draft_impl_->get_hierarchy_kv_cache_transfer() == nullptr) {
+    draft_impl_->bind_hierarchy_kv_cache_transfer(
+        unified_transfer,
+        HierarchyKVCacheTransfer::CacheRole::DRAFT,
+        compute_stream_.get());
+  } else {
+    CHECK_EQ(draft_impl_->get_hierarchy_kv_cache_transfer().get(),
+             unified_transfer.get())
+        << "Speculative draft worker hierarchy KV cache transfer changed "
+           "unexpectedly.";
+  }
+
+  if (hierarchy_kv_cache_transfer_ == nullptr) {
+    set_hierarchy_kv_cache_transfer(std::move(unified_transfer));
+  }
+}
+
+void SpeculativeWorkerImpl::finalize_hierarchy_kv_cache_transfers() {
+  if (options_.host_blocks_factor() <= 1.0 || draft_impl_ == nullptr) {
+    return;
+  }
+
+  CHECK(hierarchy_kv_cache_transfer_ != nullptr)
+      << "Speculative hierarchy KV cache transfer is not prepared.";
+  if (!hierarchy_kv_cache_transfer_->registration_finalized()) {
+    CHECK(hierarchy_kv_cache_transfer_->finalize_registration());
+  }
+}
+
+uint32_t SpeculativeWorkerImpl::transfer_kv_blocks(
+    uint64_t batch_id,
+    const std::vector<BlockTransferInfo>& block_transfer_info) {
+  CHECK(impl_ != nullptr);
+  if (draft_impl_ == nullptr) {
+    return impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+  }
+
+  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    std::shared_ptr<HierarchyKVCacheTransfer> unified_transfer =
+        hierarchy_kv_cache_transfer_;
+    const auto transfer = [unified_transfer, batch_id, block_transfer_info]() {
+      return unified_transfer->transfer_kv_blocks(batch_id,
+                                                  block_transfer_info);
+    };
+    if (!block_transfer_info.empty() &&
+        block_transfer_info.front().transfer_type == TransferType::D2H2G) {
+      auto result = std::make_shared<std::promise<uint32_t>>();
+      std::future<uint32_t> future = result->get_future();
+      threadpool_.schedule([transfer, result]() mutable {
+        try {
+          result->set_value(transfer());
+        } catch (...) {
+          result->set_exception(std::current_exception());
+        }
+      });
+      return future.get();
+    }
+    return transfer();
+  }
+
+  const uint32_t target_transferred =
+      impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+  const uint32_t draft_transferred =
+      draft_impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+  return validate_paired_transfer_counts(target_transferred, draft_transferred);
+}
+
+uint32_t SpeculativeWorkerImpl::transfer_kv_blocks(
+    uint64_t batch_id,
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  CHECK(impl_ != nullptr);
+  if (draft_impl_ == nullptr) {
+    return impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+  }
+
+  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    return hierarchy_kv_cache_transfer_->transfer_kv_blocks(
+        batch_id, block_transfer_info);
+  }
+
+  const uint32_t target_transferred =
+      impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+  const uint32_t draft_transferred =
+      draft_impl_->transfer_kv_blocks(batch_id, block_transfer_info);
+  return validate_paired_transfer_counts(target_transferred, draft_transferred);
+}
+
+std::vector<uint8_t> SpeculativeWorkerImpl::prefetch_kv_blocks(
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  CHECK(impl_ != nullptr);
+  if (draft_impl_ == nullptr) {
+    return impl_->prefetch_kv_blocks(block_transfer_info);
+  }
+  return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
+}
+
 #if defined(USE_NPU)
 bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
@@ -269,7 +418,9 @@ bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
 #endif
 
 std::optional<ForwardOutput> SpeculativeWorkerImpl::step(
-    const ForwardInput& input) {
+    const ForwardInput& raw_input) {
+  ForwardInput input = raw_input;
+  set_hierarchy_layer_synchronizer(input.input_params);
   const bool run_speculative_decode =
       should_run_speculative_decode(input.input_params);
   if (input.input_params.meta.num_sequences == 0 ||

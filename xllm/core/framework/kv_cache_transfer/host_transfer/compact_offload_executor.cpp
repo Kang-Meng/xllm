@@ -91,7 +91,14 @@ CompactOffloadExecutor::~CompactOffloadExecutor() { drain(); }
 void CompactOffloadExecutor::execute(const HostKVRequest& request,
                                      const Stream& compute_stream) {
   std::lock_guard<std::mutex> lock(mutex_);
-  GroupedHostKVMappings request_groups = group_mappings(request);
+  GroupedHostKVMappings request_groups =
+      group_mappings(request.target_mappings);
+  GroupedHostKVMappings draft_groups = group_mappings(request.draft_mappings);
+  for (auto& [group_id, mappings] : draft_groups) {
+    std::vector<HostKVMapping>& request_mappings = request_groups[group_id];
+    request_mappings.insert(
+        request_mappings.end(), mappings.begin(), mappings.end());
+  }
   for (auto& [group_id, mappings] : request_groups) {
     (void)group_id;
     std::sort(mappings.begin(), mappings.end(), mapping_less);

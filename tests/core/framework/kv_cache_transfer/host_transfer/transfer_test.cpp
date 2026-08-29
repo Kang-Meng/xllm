@@ -154,7 +154,7 @@ TEST(HostKVTransferUtilsTest, GroupsInOrderAndPreservesMappingOrder) {
   const HostKVRequest request{
       {HostKVMapping{7, 3, 1}, HostKVMapping{3, 4, 0}, HostKVMapping{7, 2, 0}}};
 
-  const GroupedHostKVMappings grouped = group_mappings(request);
+  const GroupedHostKVMappings grouped = group_mappings(request.target_mappings);
 
   ASSERT_EQ(grouped.size(), 2U);
   auto group_it = grouped.begin();
@@ -177,8 +177,8 @@ TEST(HostKVTransferTest, EnforcesDirectionScopedDestinations) {
   EXPECT_FALSE(transfer.offload(
       HostKVRequest{{HostKVMapping{3, 1, 0}, HostKVMapping{3, 1, 1}}}));
 
-  const HostKVRequest distinct_groups{
-      {HostKVMapping{3, 0, 1}, HostKVMapping{7, 0, 1}}};
+  const HostKVRequest distinct_groups{{HostKVMapping{3, 0, 1}},
+                                      {HostKVMapping{7, 0, 1}}};
   EXPECT_TRUE(transfer.load(distinct_groups, handle));
   EXPECT_TRUE(transfer.offload(distinct_groups));
   EXPECT_EQ(transfer.load_calls(), 1U);

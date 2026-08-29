@@ -1121,13 +1121,21 @@ struct ModelInputParams {
 #endif
   }
 
-  bool synchronize_layer(uint32_t layer_idx) const {
-    if (parallel.layer_wise_load_synchronizer != nullptr &&
-        layer_idx % parallel.layers_per_event == 0) {
-      if (!parallel.layer_wise_load_synchronizer->synchronize_layer(
-              layer_idx / parallel.layers_per_event)) {
-        return false;
-      }
+  bool synchronize_layer(int64_t layer_idx) const {
+    if (parallel.layer_wise_load_synchronizer == nullptr) {
+      return true;
+    }
+    CHECK_GE(layer_idx, -1) << "Layer index must be -1 or non-negative.";
+    if (layer_idx == -1) {
+      const uint32_t event_count =
+          parallel.layer_wise_load_synchronizer->size();
+      CHECK_GT(event_count, 0U) << "Layer synchronizer must contain events.";
+      return parallel.layer_wise_load_synchronizer->synchronize_layer(
+          event_count - 1);
+    }
+    if (static_cast<uint64_t>(layer_idx) % parallel.layers_per_event == 0) {
+      return parallel.layer_wise_load_synchronizer->synchronize_layer(
+          layer_idx / parallel.layers_per_event);
     }
     return true;
   }

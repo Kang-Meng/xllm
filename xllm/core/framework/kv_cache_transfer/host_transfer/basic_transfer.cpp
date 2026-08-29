@@ -75,15 +75,15 @@ class CopyStreamLease final {
 };
 
 CopyPlan build_plan(const HostKVLayout& layout,
-                    const HostKVRequest& request,
+                    const std::vector<HostKVMapping>& mappings,
                     const LayerRange& range,
                     bool is_load) {
   CopyPlan plan;
   const size_t estimated_copies =
-      request.mappings.size() * static_cast<size_t>(range.end - range.begin);
+      mappings.size() * static_cast<size_t>(range.end - range.begin);
   plan.src_tensors.reserve(estimated_copies);
   plan.dst_tensors.reserve(estimated_copies);
-  for (const HostKVMapping& mapping : request.mappings) {
+  for (const HostKVMapping& mapping : mappings) {
     const HostKVGroupLayout& group = layout.group(mapping.group_id);
     for (const HostKVLayerLayout& layer : group.layers) {
       if (layer.absolute_layer_id < range.begin ||
@@ -119,6 +119,7 @@ class BasicHostKVTransfer::Impl final {
        const Device& device,
        const Stream& compute_stream,
        uint32_t layer_copy_batches,
+       bool record_draft_cache_completion_event,
        std::unique_ptr<BatchMemcpy> batch_memcpy)
       : layout_(layout),
         device_(device),
@@ -126,6 +127,8 @@ class BasicHostKVTransfer::Impl final {
         layers_per_event_(
             get_layers_per_event(layout.num_layers(), layer_copy_batches)),
         ranges_(build_layer_ranges(layout.num_layers(), layers_per_event_)),
+        record_draft_cache_completion_event_(
+            record_draft_cache_completion_event),
         batch_memcpy_(std::move(batch_memcpy)) {
     if (batch_memcpy_ == nullptr) {
       batch_memcpy_ = create_batch_memcpy(device_);
@@ -139,11 +142,13 @@ class BasicHostKVTransfer::Impl final {
   }
 
   HostKVLoadHandle prepare_load() const {
-    return {create_layer_synchronizer(static_cast<int64_t>(ranges_.size())),
-            layers_per_event()};
+    return {create_layer_synchronizer(event_count()), layers_per_event()};
   }
 
-  uint32_t event_count() const { return static_cast<uint32_t>(ranges_.size()); }
+  uint32_t event_count() const {
+    return static_cast<uint32_t>(ranges_.size()) +
+           static_cast<uint32_t>(record_draft_cache_completion_event_);
+  }
 
   uint32_t layers_per_event() const { return layers_per_event_; }
 
@@ -151,8 +156,8 @@ class BasicHostKVTransfer::Impl final {
     CopyStreamLease stream(&streams_);
     bool stream_has_work = false;
     for (size_t index = 0; index < ranges_.size(); ++index) {
-      CopyPlan plan =
-          build_plan(layout_, request, ranges_[index], /*is_load=*/true);
+      CopyPlan plan = build_plan(
+          layout_, request.target_mappings, ranges_[index], /*is_load=*/true);
       if (!plan.src_tensors.empty()) {
         if (!batch_memcpy_->submit_h2d(
                 plan.src_tensors, plan.dst_tensors, stream.get())) {
@@ -168,21 +173,48 @@ class BasicHostKVTransfer::Impl final {
         return false;
       }
     }
+    for (const LayerRange& range : ranges_) {
+      CopyPlan plan =
+          build_plan(layout_, request.draft_mappings, range, /*is_load=*/true);
+      if (!plan.src_tensors.empty() &&
+          !batch_memcpy_->submit_h2d(
+              plan.src_tensors, plan.dst_tensors, stream.get())) {
+        if (stream_has_work) {
+          stream.drain_or_die("draft cache copy submission failed");
+        }
+        return false;
+      }
+      stream_has_work = stream_has_work || !plan.src_tensors.empty();
+    }
+    if (record_draft_cache_completion_event_ &&
+        !handle.synchronizer->record_stream(
+            static_cast<int64_t>(ranges_.size()), stream.get())) {
+      if (stream_has_work) {
+        stream.drain_or_die("draft cache completion event recording failed");
+      }
+      return false;
+    }
     return true;
   }
 
   bool offload(const HostKVRequest& request) {
     CopyStreamLease stream(&streams_);
     stream.get()->wait_stream(compute_stream_);
-    for (const LayerRange& range : ranges_) {
-      CopyPlan plan = build_plan(layout_, request, range, /*is_load=*/false);
-      if (!plan.src_tensors.empty() &&
-          !batch_memcpy_->copy_d2h(
-              plan.src_tensors, plan.dst_tensors, stream.get())) {
-        return false;
-      }
-    }
-    return true;
+    const auto offload_mappings =
+        [this, &stream](const std::vector<HostKVMapping>& mappings) {
+          for (const LayerRange& range : ranges_) {
+            CopyPlan plan =
+                build_plan(layout_, mappings, range, /*is_load=*/false);
+            if (!plan.src_tensors.empty() &&
+                !batch_memcpy_->copy_d2h(
+                    plan.src_tensors, plan.dst_tensors, stream.get())) {
+              return false;
+            }
+          }
+          return true;
+        };
+    return offload_mappings(request.target_mappings) &&
+           offload_mappings(request.draft_mappings);
   }
 
   void drain() {
@@ -204,6 +236,7 @@ class BasicHostKVTransfer::Impl final {
   const Stream& compute_stream_;
   uint32_t layers_per_event_ = 1;
   std::vector<LayerRange> ranges_;
+  bool record_draft_cache_completion_event_ = false;
   std::unique_ptr<BatchMemcpy> batch_memcpy_;
   CopyStreamQueue streams_;
   bool drained_ = false;
@@ -214,12 +247,14 @@ BasicHostKVTransfer::BasicHostKVTransfer(
     const Device& device,
     const Stream& compute_stream,
     uint32_t layer_copy_batches,
-    std::unique_ptr<BatchMemcpy> batch_memcpy)
+    std::unique_ptr<BatchMemcpy> batch_memcpy,
+    bool record_draft_cache_completion_event)
     : HostKVTransfer(std::move(layout)),
       impl_(std::make_unique<Impl>(this->layout(),
                                    device,
                                    compute_stream,
                                    layer_copy_batches,
+                                   record_draft_cache_completion_event,
                                    std::move(batch_memcpy))) {}
 
 BasicHostKVTransfer::~BasicHostKVTransfer() { drain(); }

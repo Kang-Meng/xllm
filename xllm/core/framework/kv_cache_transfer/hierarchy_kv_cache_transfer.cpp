@@ -248,6 +248,10 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
 
     HostKVTransferConfig config;
     config.layer_copy_batches = options_.layers_wise_copy_batchs();
+    config.record_draft_cache_completion_event = std::any_of(
+        cache_domains_.begin(), cache_domains_.end(), [](const auto& domain) {
+          return domain.role == CacheRole::DRAFT;
+        });
     config.mode = options_.enable_kvcache_store() ? HostKVTransferMode::BASIC
                                                   : HostKVTransferMode::AUTO;
     host_kv_transfer_ = create_host_kv_transfer(
@@ -405,7 +409,8 @@ HostKVRequest HierarchyKVCacheTransfer::make_request(
     const std::vector<BlockTransferInfo>& block_transfer_info,
     TransferType transfer_type) const {
   HostKVRequest request;
-  request.mappings.reserve(block_transfer_info.size() * cache_domains_.size());
+  request.target_mappings.reserve(block_transfer_info.size());
+  request.draft_mappings.reserve(block_transfer_info.size());
   for (const BlockTransferInfo& info : block_transfer_info) {
     CHECK(info.transfer_type == transfer_type)
         << "Host KV batch contains mixed transfer types.";
@@ -417,7 +422,10 @@ HostKVRequest HierarchyKVCacheTransfer::make_request(
         continue;
       }
       has_participating_domain = true;
-      request.mappings.emplace_back(
+      std::vector<HostKVMapping>& mappings = domain.role == CacheRole::DRAFT
+                                                 ? request.draft_mappings
+                                                 : request.target_mappings;
+      mappings.emplace_back(
           HostKVMapping{domain_group_id(domain.handle, info.block_type),
                         is_load ? info.src_block_id : info.dst_block_id,
                         is_load ? info.dst_block_id : info.src_block_id});
@@ -452,9 +460,11 @@ uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
           << "Failed to create Host KV load synchronizer.";
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (load_handles_.find(batch_id) != load_handles_.end()) {
+        auto existing = load_handles_.find(batch_id);
+        if (existing != load_handles_.end()) {
           LOG(ERROR) << "Host KV load handle collision at batch_id=" << batch_id
                      << "; replacing the unconsumed handle.";
+          existing->second.synchronizer->abort();
         }
         load_handles_[batch_id] = handle;
       }
@@ -564,17 +574,28 @@ bool HierarchyKVCacheTransfer::load_from_host(const HostKVRequest& request,
 
 void HierarchyKVCacheTransfer::set_layer_synchronizer(
     ModelInputParams& params) {
+  std::optional<HostKVLoadHandle> handle =
+      take_load_handle(params.meta.batch_id);
+  if (!handle.has_value()) {
+    return;
+  }
+  params.parallel.layer_wise_load_synchronizer = handle->synchronizer;
+  params.parallel.layers_per_event = handle->layers_per_event;
+}
+
+std::optional<HostKVLoadHandle> HierarchyKVCacheTransfer::take_load_handle(
+    uint64_t batch_id) {
   CHECK(registration_finalized_)
       << "Hierarchy KV cache registration is not finalized.";
   CHECK(!shutdown_) << "Hierarchy KV cache transfer is shut down.";
   std::lock_guard<std::mutex> lock(mutex_);
-  auto it = load_handles_.find(params.meta.batch_id);
+  auto it = load_handles_.find(batch_id);
   if (it == load_handles_.end()) {
-    return;
+    return std::nullopt;
   }
-  params.parallel.layer_wise_load_synchronizer = it->second.synchronizer;
-  params.parallel.layers_per_event = it->second.layers_per_event;
+  HostKVLoadHandle handle = std::move(it->second);
   load_handles_.erase(it);
+  return handle;
 }
 
 }  // namespace xllm

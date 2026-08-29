@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
+#include "core/framework/speculative/embedding_cache.h"
 #include "framework/sampling/draft_sampling_mode.h"
 #include "framework/sampling/rejection_sampler.h"
 #include "runtime/options.h"
@@ -55,7 +56,7 @@ SpeculativeOutputStats calculate_speculative_output_stats(
 // draft generation and validation (MTP, Eagle3, Suffix, DFlash, etc.).
 class SpeculativeWorkerImpl : public WorkerImpl {
  public:
-  ~SpeculativeWorkerImpl() override = default;
+  ~SpeculativeWorkerImpl() override;
 
  protected:
   // `options` is passed to WorkerImpl (preserves enable_schedule_overlap etc.),
@@ -96,6 +97,17 @@ class SpeculativeWorkerImpl : public WorkerImpl {
 
   // allocate kv cache. blocking call
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
+
+  uint32_t transfer_kv_blocks(
+      uint64_t batch_id,
+      const std::vector<BlockTransferInfo>& block_transfer_info) override;
+
+  uint32_t transfer_kv_blocks(
+      uint64_t batch_id,
+      Slice<BlockTransferInfo>& block_transfer_info) override;
+
+  std::vector<uint8_t> prefetch_kv_blocks(
+      Slice<BlockTransferInfo>& block_transfer_info) override;
 
 #if defined(USE_NPU)
   bool allocate_kv_cache_with_transfer(
@@ -186,9 +198,18 @@ class SpeculativeWorkerImpl : public WorkerImpl {
       const runtime::Options& target_options,
       const runtime::Options& draft_options);
 
+  void prepare_hierarchy_kv_cache_transfers();
+  void finalize_hierarchy_kv_cache_transfers();
+
  protected:
   // Target model worker
   std::unique_ptr<WorkerImpl> impl_;
+
+  // Optional draft model worker. Suffix decoding does not use one.
+  std::unique_ptr<LLMWorkerImpl> draft_impl_;
+
+  // Shared target/draft state for model-based speculative decoding.
+  std::shared_ptr<EmbeddingCache> embedding_cache_;
 
   // Optional adaptive pruning controller. Subclasses create it in their ctor
   // when the algorithm supports adaptive per-seq validate pruning (MTP,
