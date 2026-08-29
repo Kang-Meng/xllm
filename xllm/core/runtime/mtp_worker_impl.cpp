@@ -1274,9 +1274,25 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
     const uint32_t target_transferred =
         hierarchy_kv_cache_transfer_->transfer_kv_blocks(batch_id,
                                                          block_transfer_info);
-    const uint32_t draft_transferred =
-        draft_transfer_owner_->transfer_kv_blocks(batch_id,
-                                                  block_transfer_info);
+    std::vector<BlockTransferInfo> draft_transfer_info;
+    draft_transfer_info.reserve(block_transfer_info.size());
+    std::copy_if(
+        block_transfer_info.begin(),
+        block_transfer_info.end(),
+        std::back_inserter(draft_transfer_info),
+        [this](const BlockTransferInfo& info) {
+          return draft_transfer_owner_->supports_block_type(info.block_type);
+        });
+    uint32_t draft_transferred =
+        static_cast<uint32_t>(block_transfer_info.size());
+    if (!draft_transfer_info.empty()) {
+      Slice<BlockTransferInfo> draft_transfer_slice(draft_transfer_info);
+      const uint32_t transferred = draft_transfer_owner_->transfer_kv_blocks(
+          batch_id, draft_transfer_slice);
+      if (transferred != static_cast<uint32_t>(draft_transfer_info.size())) {
+        draft_transferred = 0;
+      }
+    }
     return validate_paired_transfer_counts(target_transferred,
                                            draft_transferred);
   }
