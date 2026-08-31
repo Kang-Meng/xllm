@@ -31,7 +31,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed import ProcessGroup
 
-_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp"))
+_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise"))
 # ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
 # ``moe_ep`` and ``cp`` stride across those blocks. Both layouts follow from how
 # the caller derives a rank within each group, so a group's full membership is
@@ -39,9 +39,10 @@ _GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp"))
 # ``cp`` strides by the attention TP size: ranks sharing a (dp, tp) slot but
 # holding different sequence shards form one CP group, matching the C++
 # compute_cp_group_ranks layout (rank = dp*cp*tp + cp_rank*tp + tp_rank).
-_CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp"))
+_CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp", "layerwise"))
 
 _groups = {}
+_group_ranks = {}
 _stores = {}
 _world_topology = None
 _symm_eligible = {}
@@ -199,6 +200,7 @@ def init_process_group(
 
     assert own_ranks is not None
     _groups[group_key] = own
+    _group_ranks[group_key] = tuple(own_ranks)
     _symm_eligible[group_key] = _supports_symmetric_memory(device_obj, own_ranks)
     return own
 
@@ -253,6 +255,12 @@ def cp_world_size(device: torch.device | str) -> int:
     """
     group = _groups.get(("cp", str(torch.device(device))))
     return group.size() if group is not None else 1
+
+
+def layerwise_rank(device: torch.device | str) -> int:
+    """Rank in the layerwise split group, or zero when disabled."""
+    group = _groups.get(("layerwise", str(torch.device(device))))
+    return group.rank() if group is not None else 0
 
 
 # A one-shot symmetric-memory reduction is an ordinary kernel on the current
@@ -310,6 +318,23 @@ def all_reduce_(x: torch.Tensor, group_name: str = "tp") -> None:
     flat = x.view(-1)
     buffer.copy_(flat)
     torch.ops.symm_mem.one_shot_all_reduce_out(buffer, "sum", group.group_name, flat)
+
+
+@torch.library.custom_op("xllm_ops::broadcast_", mutates_args={"x"})
+def broadcast_(x: torch.Tensor, src: int, group_name: str = "tp") -> None:
+    group = _require_group(x, group_name)
+    if not 0 <= src < group.size():
+        raise RuntimeError(f"invalid {group_name} source rank {src}")
+    ranks = _group_ranks.get((group_name, str(x.device)))
+    if ranks is None:
+        raise RuntimeError(f"{group_name} group rank map is unavailable")
+    dist.broadcast(x, src=ranks[src], group=group)
+
+
+@broadcast_.register_fake
+def _(x: torch.Tensor, src: int, group_name: str = "tp") -> None:
+    del src, group_name
+    return None
 
 
 @all_reduce_.register_fake
@@ -389,7 +414,9 @@ __all__ = [
     "tp_rank",
     "cp_rank",
     "cp_world_size",
+    "layerwise_rank",
     "all_reduce_",
+    "broadcast_",
     "all_gather",
     "all_gather_variable",
 ]

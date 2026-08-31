@@ -20,10 +20,12 @@ from xllm.python.distributed.collectives import (
     all_gather,
     all_gather_variable,
     all_reduce_,
+    broadcast_,
     cp_rank,
     cp_world_size,
     init_process_group,
     init_tp_group,
+    layerwise_rank,
     tp_rank,
 )
 
@@ -33,6 +35,8 @@ __all__ = [
     "tp_rank",
     "cp_rank",
     "cp_world_size",
+    "layerwise_rank",
+    "broadcast_",
     "all_reduce_",
     "all_gather",
     "all_gather_variable",

@@ -111,6 +111,8 @@ class MlaIndexContext:
     index_cache_scale: torch.Tensor | None
     get_quant_indexer_metadata: Callable[[int, int, int, int], torch.Tensor]
     update_index_cache: Callable[[torch.Tensor, torch.Tensor | None], None]
+    # Optional model-side CP plan for packed local query segments.
+    cp_context: object | None = None
 
 
 @dataclass(frozen=True)

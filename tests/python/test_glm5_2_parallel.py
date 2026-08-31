@@ -96,6 +96,30 @@ def test_glm_parallel_world_size_includes_context_parallel() -> None:
     assert cfg.cp_rank == 1
 
 
+def test_glm_layerwise_split_rank_is_validated() -> None:
+    cfg = Glm52Config.from_dict(_config(layerwise_split_size=2, layerwise_split_rank=1))
+    cfg.validate()
+    assert cfg.layerwise_split_rank == 1
+
+    invalid = Glm52Config.from_dict(_config(layerwise_split_size=2, layerwise_split_rank=2))
+    with pytest.raises(ValueError, match="layerwise_split_rank"):
+        invalid.validate()
+
+
+def test_glm_layerwise_split_cannot_overlap_context_parallel() -> None:
+    cfg = Glm52Config.from_dict(
+        _config(
+            cp_size=2,
+            cp_rank=0,
+            world_size=8,
+            ep_size=8,
+            layerwise_split_size=2,
+        )
+    )
+    with pytest.raises(ValueError, match="CP and layerwise"):
+        cfg.validate()
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

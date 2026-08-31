@@ -57,7 +57,7 @@ class EagerRunner(BaseRunner):
         self.attention_backend.prepare(metadata)
 
         cp_context = None
-        if self.cp_size > 1 and metadata.is_prefill:
+        if self.cp_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             seq_lens = _per_seq_lens_from_metadata(metadata)
             if seq_lens is not None:
                 cp_context = build_cp_context(seq_lens, self.cp_size, self.cp_rank, self.device)

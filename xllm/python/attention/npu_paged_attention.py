@@ -421,6 +421,20 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if self._block_table_i32 is None:
             raise RuntimeError("MLA requires a block table")
 
+        cp_context = get_forward_context().cp_context
+        if cp_context is not None:
+            return self._execute_mla_cp(
+                q_latent,
+                q_pe,
+                k_latent_3d,
+                k_pe_3d,
+                topk,
+                layer,
+                cp_context,
+                nope_cache,
+                rope_cache,
+            )
+
         if not cache_is_preprocessed:
             if k_latent_3d is None or k_pe_3d is None:
                 raise RuntimeError("MLA cache inputs are required")
@@ -449,6 +463,60 @@ class NpuPagedAttentionBackend(AttentionBackend):
             self._block_table_i32,
             layer_id,
         )
+
+    def _execute_mla_cp(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_latent: torch.Tensor | None,
+        k_pe: torch.Tensor | None,
+        topk: torch.Tensor | None,
+        layer: Attention,
+        cp_context: object,
+        nope_cache: torch.Tensor,
+        rope_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run MLA for CP-owned query segments and keep a full KV cache."""
+        if k_latent is None or k_pe is None:
+            raise RuntimeError("CP MLA prefill requires local KV inputs")
+        from xllm.python.model_executor.cp_utils import cp_gather_kv
+
+        # Fuse latent and RoPE payloads into one CP collective; both tensors
+        # have identical token layout and a second all-gather only adds HCCL
+        # launch latency on every MLA layer.
+        local_kv = torch.cat((k_latent, k_pe), dim=-1)
+        global_kv = cp_gather_kv(local_kv, cp_context).contiguous()
+        latent_width = k_latent.shape[-1]
+        global_k = global_kv[..., :latent_width]
+        global_rope = global_kv[..., latent_width:]
+        torch.ops.xllm_ops.reshape_paged_cache(
+            self._metadata.slot_mapping,
+            global_k,
+            global_rope,
+            nope_cache,
+            rope_cache,
+        )
+        local_tokens = q_latent.shape[0]
+        query_index = cp_context.query_index
+        if query_index.numel() == 0:
+            return q_latent.new_zeros(local_tokens, self.num_heads, self.head_dim)
+        q_real = q_latent.index_select(0, query_index).contiguous()
+        q_pe_real = q_pe.index_select(0, query_index).contiguous()
+        block_table = self._block_table_i32.index_select(0, cp_context.segment_seq_indices)
+        output = self._mla_sparse(
+            q_real,
+            q_pe_real,
+            nope_cache,
+            rope_cache,
+            topk,
+            block_table,
+            layer.layer_id,
+            actual_seq_q=cp_context.q_cu_seqlens,
+            actual_seq_kv=cp_context.kv_cu_seqlens,
+        )
+        out_local = q_latent.new_zeros(local_tokens, self.num_heads, self.head_dim)
+        out_local.index_copy_(0, query_index, output)
+        return out_local
 
     def mla_preprocess_context(
         self,
@@ -502,6 +570,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 values,
                 scales,
             ),
+            cp_context=get_forward_context().cp_context,
         )
 
     def _get_quant_indexer_metadata(
@@ -559,7 +628,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
         topk: torch.Tensor,
         block_table: torch.Tensor,
         layer_id: int,
+        actual_seq_q: torch.Tensor | list[int] | None = None,
+        actual_seq_kv: torch.Tensor | list[int] | None = None,
     ) -> torch.Tensor:
+        if actual_seq_q is None:
+            actual_seq_q = self._mla_actual_seq_q
+        if actual_seq_kv is None:
+            actual_seq_kv = self._mla_actual_seq_kv
         out = get_execution_buffer(
             ("SFA_OUTPUT", layer_id) + tuple(q_latent.shape),
             lambda: torch.empty_like(q_latent),
@@ -570,8 +645,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
             nope_cache,
             topk,
             block_table,
-            self._mla_actual_seq_q,
-            self._mla_actual_seq_kv,
+            actual_seq_q,
+            actual_seq_kv,
             q_pe,
             rope_cache,
             self.scale,

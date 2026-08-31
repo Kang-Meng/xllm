@@ -105,10 +105,19 @@ class ModelExecutor:
         # stays on the non-CP path (CP is prefill-only, eager-only in v1).
         self.eager_runner.cp_size = int(config.get("cp_size", 1))
         self.eager_runner.cp_rank = int(config.get("cp_rank", 0))
+        self.layerwise_split_size = int(config.get("layerwise_split_size", 1))
+        self.layerwise_split_rank = int(config.get("layerwise_split_rank", 0))
+        if self.layerwise_split_size > 1 and config.get("model_type") != "glm_moe_dsa":
+            raise NotImplementedError("Python layerwise split is supported only for GLM5.2")
         self.decode_graph_runner = None
         self.inductor_runner = None
 
         graph_backend = _resolve_graph_backend(config)
+        if self.layerwise_split_size > 1 and graph_backend not in ("", "off", "none", "0"):
+            raise NotImplementedError(
+                "Python GLM5.2 layerwise split requires eager execution; "
+                f"graph backend '{graph_backend}' is not supported."
+            )
         dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
@@ -165,6 +174,11 @@ class ModelExecutor:
                 num_decoding_tokens,
             )
         else:
+            if self.layerwise_split_size > 1:
+                raise NotImplementedError(
+                    "Python layerwise split requires eager execution; graph "
+                    f"backend '{graph_backend}' is not supported."
+                )
             if self.eager_runner.cp_size > 1:
                 # CP is prefill-only and lives on eager_runner; a compile
                 # backend serves prefill through InductorRunner, which carries
@@ -215,6 +229,8 @@ class ModelExecutor:
     ) -> torch.Tensor:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
+        if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
+            raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
         graph_runner = self.decode_graph_runner
         if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding):

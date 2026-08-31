@@ -46,6 +46,12 @@ from xllm.python.layers import (
     HiddenParallelEmbedding,
     RMSNorm,
 )
+from xllm.python.model_executor.cp_utils import (
+    cp_gather_kv,
+    cp_merge_rows,
+    cp_shard_positions,
+    cp_shard_rows,
+)
 from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
@@ -117,6 +123,8 @@ class Glm52Config:
     dp_rank: int = 0
     cp_size: int = 1
     cp_rank: int = 0
+    layerwise_split_size: int = 1
+    layerwise_split_rank: int = 0
     moe_tp_size: int = 1
     moe_tp_rank: int = 0
     world_size: int = 1
@@ -217,6 +225,8 @@ class Glm52Config:
             dp_rank=int(pick("dp_rank", default=0)),
             cp_size=cp_size,
             cp_rank=int(pick("cp_rank", default=0)),
+            layerwise_split_size=int(pick("layerwise_split_size", default=1)),
+            layerwise_split_rank=int(pick("layerwise_split_rank", default=0)),
             moe_tp_size=int(pick("moe_tp_size", default=1)),
             moe_tp_rank=int(pick("moe_tp_rank", default=0)),
             world_size=world_size,
@@ -259,6 +269,12 @@ class Glm52Config:
             raise ValueError("ep_rank must be in [0, ep_size)")
         if not 0 <= self.moe_tp_rank < self.moe_tp_size:
             raise ValueError("moe_tp_rank must be in [0, moe_tp_size)")
+        if self.layerwise_split_size <= 0 or self.tp_size % self.layerwise_split_size:
+            raise ValueError("layerwise_split_size must be a positive divisor of tp_size")
+        if not 0 <= self.layerwise_split_rank < self.layerwise_split_size:
+            raise ValueError("layerwise_split_rank must be in [0, layerwise_split_size)")
+        if self.layerwise_split_size > 1 and self.cp_size > 1:
+            raise ValueError("GLM5.2 Python does not support CP and layerwise split together")
 
     def _resolve_indexer_types(self) -> None:
         """Derive per-layer indexer mode (full/shared)."""
@@ -384,10 +400,42 @@ class Glm52MLAAttention(Attention):
         num_tokens = hidden.shape[0]
         q_a = self.q_a_proj(hidden)
         q_c = self.q_a_layernorm(q_a)
-        backend = get_forward_context().attention_backend
+        forward_ctx = get_forward_context()
+        backend = forward_ctx.attention_backend
+        cp_context = forward_ctx.cp_context
+        layerwise = self.cfg.layerwise_split_size > 1 and not (
+            forward_ctx.metadata.is_prefill or forward_ctx.metadata.is_chunked_prefill
+        )
+        layer_owner = self.layer_id % self.cfg.layerwise_split_size
+        owns_layer_cache = self.cfg.layerwise_split_rank == layer_owner
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
-            topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
+            if layerwise:
+                if owns_layer_cache:
+                    topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
+                else:
+                    topk = torch.empty(
+                        (num_tokens, ctx.index_cache.size(2), self.cfg.index_topk),
+                        dtype=torch.int32,
+                        device=hidden.device,
+                    )
+                distributed.broadcast_(topk, layer_owner, "layerwise")
+            elif cp_context is None:
+                topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
+            else:
+                # Indexer queries are packed to real CP-owned rows.  The key
+                # side is all-gathered inside the indexer so the paged index
+                # cache remains globally addressable.
+                query_index = cp_context.query_index
+                topk = self.indexer.select_qli(
+                    hidden.index_select(0, query_index),
+                    q_c.index_select(0, query_index),
+                    positions.index_select(0, query_index),
+                    ctx,
+                    cos_sin_cache,
+                    cache_hidden=hidden,
+                    cache_positions=positions,
+                )
         else:
             if prev_topk_indices is None:
                 raise ValueError(
@@ -412,7 +460,33 @@ class Glm52MLAAttention(Attention):
         k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)
         k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
 
-        attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
+        if layerwise:
+            local_query = torch.cat((q_latent, q_pe), dim=-1)
+            gathered_query = distributed.all_gather(
+                local_query,
+                dim=1,
+                world_size=self.cfg.layerwise_split_size,
+                group_name="layerwise",
+            )
+            latent_width = q_latent.shape[-1]
+            gathered_q_latent = gathered_query[..., :latent_width]
+            gathered_q_pe = gathered_query[..., latent_width:]
+            if owns_layer_cache:
+                gathered_attn_out = backend.execute_mla(
+                    gathered_q_latent,
+                    gathered_q_pe,
+                    k_latent_3d,
+                    k_pe_3d,
+                    self,
+                    topk=topk,
+                )
+            else:
+                gathered_attn_out = torch.empty_like(gathered_q_latent)
+            distributed.broadcast_(gathered_attn_out, layer_owner, "layerwise")
+            head_offset = self.cfg.layerwise_split_rank * self.num_heads_local
+            attn_out = gathered_attn_out.narrow(1, head_offset, self.num_heads_local)
+        else:
+            attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
         v_full = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
         v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
@@ -446,29 +520,43 @@ class Glm52Indexer(nn.Module):
         positions: torch.Tensor,
         ctx: MlaIndexContext,
         cos_sin_cache: torch.Tensor,
+        cache_hidden: torch.Tensor | None = None,
+        cache_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         index_cache = ctx.index_cache
         slot_mapping = ctx.slot_mapping
         actual_seq_q = ctx.actual_seq_q
         actual_seq_kv = ctx.actual_seq_kv
         block_table = ctx.block_table
+        cp_context = ctx.cp_context
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        k = self.wk(hidden)
+        cache_hidden = hidden if cache_hidden is None else cache_hidden
+        cache_positions = positions if cache_positions is None else cache_positions
+        k = self.wk(cache_hidden)
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         if self.indexer_rope_interleave:
             cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
             q_pe = _interleave_rope_with(q_pe, cos, sin)
-            k_pe = _interleave_rope_with(k_pe.unsqueeze(1), cos, sin).squeeze(1)
+            k_cos, k_sin = _gather_interleave_cos_sin(cos_sin_cache, cache_positions)
+            k_pe = _interleave_rope_with(k_pe.unsqueeze(1), k_cos, k_sin).squeeze(1)
         else:
             q_pe = _apply_half_rope(cos_sin_cache, q_pe, positions)
-            k_pe = _apply_half_rope(k_pe.unsqueeze(1), cos_sin_cache, positions).squeeze(1)
+            k_pe = _apply_half_rope(k_pe.unsqueeze(1), cos_sin_cache, cache_positions).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
+        if cp_context is not None:
+            valid = cp_context.shard_valid_mask.view(-1, 1).to(k.dtype)
+            k = k * valid
+            k = cp_gather_kv(k, cp_context)
+            actual_seq_q = torch.tensor(ctx.cp_context.q_cu_seqlens, dtype=torch.int32, device=q.device)
+            actual_seq_kv = torch.tensor(ctx.cp_context.kv_cu_seqlens, dtype=torch.int32, device=q.device)
+            block_table = block_table.index_select(0, cp_context.segment_seq_indices)
         if index_cache is not None and slot_mapping is not None:
             ctx.update_index_cache(k, None)
-        weights = self.weights_proj(hidden.to(torch.float32)).to(torch.bfloat16)
+        weight_hidden = hidden if cp_context is None else hidden.index_select(0, cp_context.query_index)
+        weights = self.weights_proj(weight_hidden.to(torch.float32)).to(torch.bfloat16)
         topk = kernels.lightning_indexer(
             q,
             index_cache,
@@ -560,12 +648,18 @@ class Glm52Model(nn.Module):
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
+        cp_context = get_forward_context().cp_context
+        if cp_context is not None:
+            hidden = cp_shard_rows(hidden, cp_context)
+            positions = cp_shard_positions(positions, cp_context).contiguous()
         cos_sin_cache = self.rotary.cos_sin_cache
         residual: torch.Tensor | None = None
         prev_topk: torch.Tensor | None = None
         for layer in self.layers:
             hidden, residual, prev_topk = layer(hidden, residual, positions, cos_sin_cache, prev_topk)
         hidden, last_hidden = self.norm(hidden, residual)
+        if cp_context is not None:
+            hidden = cp_merge_rows(hidden, cp_context)
         return hidden
 
 
@@ -583,6 +677,8 @@ class Glm52ForCausalLM(PyModelBase):
         self.cfg.dp_rank = int(config.get("dp_rank", 0))
         self.cfg.cp_size = int(config.get("cp_size", 1))
         self.cfg.cp_rank = int(config.get("cp_rank", 0))
+        self.cfg.layerwise_split_size = int(config.get("layerwise_split_size", 1))
+        self.cfg.layerwise_split_rank = int(config.get("layerwise_split_rank", 0))
         self.cfg.moe_tp_size = int(config.get("moe_tp_size", 1))
         self.cfg.moe_tp_rank = int(config.get("moe_tp_rank", 0))
         self.cfg.world_size = int(config.get("world_size", self.cfg.tp_size * self.cfg.dp_size * self.cfg.cp_size))

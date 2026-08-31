@@ -48,6 +48,7 @@ class _FakeGroup:
 def _clear_collective_state():
     def reset():
         collectives._groups.clear()
+        collectives._group_ranks.clear()
         collectives._stores.clear()
         collectives._symm_eligible.clear()
         collectives._symm_buffers.clear()

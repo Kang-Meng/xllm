@@ -75,6 +75,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
   tp_group_ = parallel_args.tp_group_;
   cp_size_ = parallel_args.cp_size();
   cp_rank_ = parallel_args.cp_rank();
+  layerwise_split_size_ = parallel_args.layerwise_split_size();
   // tp_group_ and cp_group_ are already the final, orthogonally-split groups:
   // the collective communicator narrows tp_group_ to world/(dp*cp) and builds a
   // separate cp_group_ over the cp-strided ranks. Read each dimension from its
@@ -170,6 +171,23 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
                        global_world_size,
                        cp_group_index);
   }
+  if (layerwise_split_size_ > 1) {
+    CHECK_EQ(tp_size_ % layerwise_split_size_, 0)
+        << "layerwise_split_size must divide Python attention TP size";
+    const int32_t layerwise_group_index =
+        (global_rank / tp_size_) * (tp_size_ / layerwise_split_size_) +
+        tp_rank_ / layerwise_split_size_;
+    layerwise_split_rank_ = tp_rank_ % layerwise_split_size_;
+    init_process_group("layerwise",
+                       parallel_args.python_rendezvous_host_,
+                       parallel_args.python_rendezvous_port_,
+                       layerwise_split_rank_,
+                       layerwise_split_size_,
+                       c10::str(device_),
+                       global_rank,
+                       global_world_size,
+                       layerwise_group_index);
+  }
   const std::string module_name = context.get_model_args().model_type().empty()
                                       ? std::string("Qwen3ForCausalLM")
                                       : context.get_model_args().model_type();
@@ -205,6 +223,7 @@ py::dict PyCausalLM::build_config_dict(
   // cp_size is a reflected ParallelArgs PROPERTY (already in d), but cp_rank is
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
+  d["layerwise_split_rank"] = layerwise_split_rank_;
   d["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
   d["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();

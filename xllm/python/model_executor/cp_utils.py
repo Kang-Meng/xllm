@@ -93,6 +93,9 @@ class CpContext:
     # cumulative. prefix_len == segment_start + query_count, so with
     # sparse_mode=3 query row i attends KV [0, segment_start + i] exactly.
     kv_cu_seqlens: list[int]
+    # Original sequence row for each packed query/KV segment. MLA's paged
+    # indexer needs the block-table row alongside the segment lengths.
+    segment_seq_indices: torch.Tensor
 
 
 def build_cp_context(
@@ -121,6 +124,16 @@ def build_cp_context(
         total_local,
     ) = torch.ops.xllm_ops.build_cp_context([int(length) for length in seq_lens], cp_size, cp_rank, device)
 
+    segment_seq_indices = []
+    for seq_index, length in enumerate(seq_lens):
+        padded = ((int(length) + 2 * cp_size - 1) // (2 * cp_size)) * (2 * cp_size)
+        chunk_len = padded // (2 * cp_size)
+        if chunk_len == 0:
+            continue
+        for chunk_id in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            if max(0, min(chunk_len, int(length) - chunk_id * chunk_len)):
+                segment_seq_indices.append(seq_index)
+
     return CpContext(
         cp_size=cp_size,
         cp_rank=cp_rank,
@@ -133,6 +146,7 @@ def build_cp_context(
         q_cu_seqlens=q_cu_seqlens,
         kv_gather_index=kv_gather_index,
         kv_cu_seqlens=kv_cu_seqlens,
+        segment_seq_indices=torch.tensor(segment_seq_indices, dtype=torch.int64, device=device),
     )
 
 
