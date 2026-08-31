@@ -64,15 +64,10 @@ StreamEventPtr record_current_stream_event(const Device& device) {
 
 }  // namespace
 
-LLMWorkerImpl::LLMWorkerImpl(
-    const ParallelArgs& parallel_args,
-    const torch::Device& device,
-    const runtime::Options& options,
-    HierarchyTransferCreationMode hierarchy_transfer_creation_mode)
-    : WorkerImpl(parallel_args,
-                 device,
-                 options,
-                 hierarchy_transfer_creation_mode) {
+LLMWorkerImpl::LLMWorkerImpl(const ParallelArgs& parallel_args,
+                             const torch::Device& device,
+                             const runtime::Options& options)
+    : WorkerImpl(parallel_args, device, options) {
   device_.set_device();
 #if defined(USE_CUDA) || defined(USE_MUSA)
   const auto& model_config = ModelConfig::get_instance();

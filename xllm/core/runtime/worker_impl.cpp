@@ -403,15 +403,10 @@ void disable_layerwise_split_for_draft(ParallelArgs* parallel_args) {
 
 }  // namespace
 
-WorkerImpl::WorkerImpl(
-    const ParallelArgs& parallel_args,
-    const torch::Device& device,
-    const runtime::Options& options,
-    HierarchyTransferCreationMode hierarchy_transfer_creation_mode)
-    : options_(options),
-      device_(device),
-      parallel_args_(parallel_args),
-      hierarchy_transfer_creation_mode_(hierarchy_transfer_creation_mode) {
+WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
+                       const torch::Device& device,
+                       const runtime::Options& options)
+    : options_(options), device_(device), parallel_args_(parallel_args) {
   if (options_.enable_speculative_decode() &&
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
@@ -2286,13 +2281,9 @@ uint32_t WorkerImpl::transfer_kv_blocks(
 }
 
 std::shared_ptr<HierarchyKVCacheTransfer>
-WorkerImpl::create_hierarchy_kv_cache_transfer(const Stream* compute_stream) {
-  CHECK(hierarchy_kv_cache_transfer_context_.has_value())
-      << "Hierarchy KV cache transfer context is not initialized.";
-  CHECK(compute_stream != nullptr) << "Compute stream must not be null.";
+WorkerImpl::create_hierarchy_kv_cache_transfer() {
   CHECK_GT(options_.host_blocks_factor(), 1.0)
       << "Hierarchy KV cache transfer requires Host cache blocks.";
-  CHECK(!kv_caches_.empty()) << "kv_caches is not initialized.";
   CHECK_GT(options_.dp_size(), 0u);
   CHECK_EQ(options_.world_size() % options_.dp_size(), 0u);
   CHECK_GT(options_.cp_size(), 0u);
@@ -2322,13 +2313,39 @@ WorkerImpl::create_hierarchy_kv_cache_transfer(const Stream* compute_stream) {
       .store_local_hostname(options_.store_local_hostname())
       .store_namespace(options_.model_id())
       .store_worker_id(worker_id);
-  return std::make_shared<HierarchyKVCacheTransfer>(
-      transfer_options,
-      device_,
-      compute_stream,
-      &kv_caches_,
-      hierarchy_kv_cache_transfer_context_->kv_cache_shape,
-      hierarchy_kv_cache_transfer_context_->create_options);
+  return std::make_shared<HierarchyKVCacheTransfer>(transfer_options, device_);
+}
+
+void WorkerImpl::bind_hierarchy_kv_cache_transfer(
+    std::shared_ptr<HierarchyKVCacheTransfer> transfer,
+    HierarchyKVCacheTransfer::CacheRole role,
+    const Stream* producer_stream) {
+  CHECK(producer_stream != nullptr) << "Producer stream must not be null.";
+  set_hierarchy_kv_cache_transfer(std::move(transfer));
+  hierarchy_kv_cache_role_ = role;
+  hierarchy_kv_cache_producer_stream_ = producer_stream;
+}
+
+void WorkerImpl::register_hierarchy_kv_cache(
+    HierarchyKVCacheTransfer& transfer,
+    HierarchyKVCacheTransfer::CacheRole role,
+    const Stream* producer_stream) {
+  CHECK(hierarchy_kv_cache_transfer_context_.has_value())
+      << "Hierarchy KV cache transfer context is not initialized.";
+  CHECK(producer_stream != nullptr) << "Producer stream must not be null.";
+  CHECK(!kv_caches_.empty()) << "kv_caches is not initialized.";
+
+  HierarchyKVCacheTransfer::CacheRegistration registration;
+  registration.role = role;
+  registration.device_kv_caches = &kv_caches_;
+  registration.kv_cache_shape =
+      hierarchy_kv_cache_transfer_context_->kv_cache_shape;
+  registration.create_options =
+      hierarchy_kv_cache_transfer_context_->create_options;
+  registration.producer_stream = producer_stream;
+  registration.store_key_component =
+      role == HierarchyKVCacheTransfer::CacheRole::TARGET ? "main" : "draft";
+  transfer.register_cache(std::move(registration));
 }
 
 void WorkerImpl::set_hierarchy_kv_cache_transfer(
@@ -2346,6 +2363,8 @@ WorkerImpl::get_hierarchy_kv_cache_transfer() const {
 
 void WorkerImpl::clear_hierarchy_kv_cache_transfer() {
   hierarchy_kv_cache_transfer_.reset();
+  hierarchy_kv_cache_role_.reset();
+  hierarchy_kv_cache_producer_stream_ = nullptr;
 }
 
 void WorkerImpl::set_hierarchy_layer_synchronizer(
@@ -2401,12 +2420,28 @@ void WorkerImpl::init_hierarchy_kv_cache_transfer(
     CHECK_GT(options_.host_blocks_factor(), 1.0)
         << "KV cache Store requires Host cache blocks.";
   }
-  if (options_.host_blocks_factor() > 1.0 &&
-      hierarchy_transfer_creation_mode_ ==
-          HierarchyTransferCreationMode::SELF) {
-    set_hierarchy_kv_cache_transfer(
-        create_hierarchy_kv_cache_transfer(compute_stream_.get()));
+  if (options_.host_blocks_factor() <= 1.0) {
+    return;
   }
+
+  if (hierarchy_kv_cache_transfer_ == nullptr) {
+    std::shared_ptr<HierarchyKVCacheTransfer> transfer =
+        create_hierarchy_kv_cache_transfer();
+    register_hierarchy_kv_cache(*transfer,
+                                HierarchyKVCacheTransfer::CacheRole::TARGET,
+                                compute_stream_.get());
+    CHECK(transfer->finalize_registration());
+    set_hierarchy_kv_cache_transfer(std::move(transfer));
+    return;
+  }
+
+  CHECK(hierarchy_kv_cache_role_.has_value())
+      << "Pre-bound hierarchy KV cache transfer is missing a cache role.";
+  CHECK(hierarchy_kv_cache_producer_stream_ != nullptr)
+      << "Pre-bound hierarchy KV cache transfer is missing a producer stream.";
+  register_hierarchy_kv_cache(*hierarchy_kv_cache_transfer_,
+                              hierarchy_kv_cache_role_.value(),
+                              hierarchy_kv_cache_producer_stream_);
 }
 void WorkerImpl::prepare_mla_prefixcache_inputs(
     ModelInputParams& input_params) {

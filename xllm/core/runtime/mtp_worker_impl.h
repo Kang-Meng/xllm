@@ -97,7 +97,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // MTP composite: leaves own model-specific NPU input preparation.
   bool owns_npu_parallel_input_prepare() const override;
 
-  void initialize_hierarchy_kv_cache_transfers();
+  void prepare_hierarchy_kv_cache_transfers();
+  void finalize_hierarchy_kv_cache_transfers();
 
   std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
   std::optional<ForwardOutput> step_decode(const ForwardInput& inputs) override;

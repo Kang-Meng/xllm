@@ -148,16 +148,11 @@ class RecordingTransferWorker final : public LLMWorkerImpl {
 
 class HierarchyTransferTestWorker final : public LLMWorkerImpl {
  public:
-  HierarchyTransferTestWorker(
-      const ParallelArgs& parallel_args,
-      const torch::Device& device,
-      const runtime::Options& options,
-      const ModelArgs& model_args,
-      HierarchyTransferCreationMode hierarchy_transfer_creation_mode)
-      : LLMWorkerImpl(parallel_args,
-                      device,
-                      options,
-                      hierarchy_transfer_creation_mode) {
+  HierarchyTransferTestWorker(const ParallelArgs& parallel_args,
+                              const torch::Device& device,
+                              const runtime::Options& options,
+                              const ModelArgs& model_args)
+      : LLMWorkerImpl(parallel_args, device, options) {
     dtype_ = torch::kFloat32;
     context_ =
         ModelContext(parallel_args,
@@ -251,8 +246,10 @@ class TestMTPWorker final : public MTPWorkerImpl {
     draft_impl_ = std::move(draft);
   }
 
-  void initialize_hierarchy_transfers() {
-    initialize_hierarchy_kv_cache_transfers();
+  void prepare_hierarchy_transfers() { prepare_hierarchy_kv_cache_transfers(); }
+
+  void finalize_hierarchy_transfers() {
+    finalize_hierarchy_kv_cache_transfers();
   }
 
   std::shared_ptr<HierarchyKVCacheTransfer> target_transfer_owner() const {
@@ -390,24 +387,31 @@ TEST_F(MTPHostOffloadTest, BindsAndReleasesTargetAndDraftTransferOwners) {
     auto worker = std::make_unique<TestMTPWorker>(
         parallel_args, device.unwrap(), options);
     auto target = std::make_unique<HierarchyTransferTestWorker>(
-        parallel_args,
-        device.unwrap(),
-        options,
-        target_model_args,
-        HierarchyTransferCreationMode::SELF);
+        parallel_args, device.unwrap(), options, target_model_args);
     auto draft = std::make_unique<HierarchyTransferTestWorker>(
-        parallel_args,
-        device.unwrap(),
-        options,
-        draft_model_args,
-        HierarchyTransferCreationMode::COMPOSITE_OWNER);
-    target->initialize_hierarchy_cache(target_shape);
-    draft->initialize_hierarchy_cache(draft_shape);
-    ASSERT_NE(target->get_hierarchy_kv_cache_transfer(), nullptr);
-    ASSERT_EQ(draft->get_hierarchy_kv_cache_transfer(), nullptr);
+        parallel_args, device.unwrap(), options, draft_model_args);
+    HierarchyTransferTestWorker* target_ptr = target.get();
+    HierarchyTransferTestWorker* draft_ptr = draft.get();
 
     worker->replace_transfer_workers(std::move(target), std::move(draft));
-    worker->initialize_hierarchy_transfers();
+    worker->prepare_hierarchy_transfers();
+    worker->prepare_hierarchy_transfers();
+
+    ASSERT_NE(target_ptr->get_hierarchy_kv_cache_transfer(), nullptr);
+    ASSERT_NE(draft_ptr->get_hierarchy_kv_cache_transfer(), nullptr);
+    EXPECT_FALSE(target_ptr->get_hierarchy_kv_cache_transfer()
+                     ->registration_finalized());
+    EXPECT_FALSE(
+        draft_ptr->get_hierarchy_kv_cache_transfer()->registration_finalized());
+
+    target_ptr->initialize_hierarchy_cache(target_shape);
+    draft_ptr->initialize_hierarchy_cache(draft_shape);
+    EXPECT_FALSE(target_ptr->get_hierarchy_kv_cache_transfer()
+                     ->registration_finalized());
+    EXPECT_FALSE(
+        draft_ptr->get_hierarchy_kv_cache_transfer()->registration_finalized());
+    worker->finalize_hierarchy_transfers();
+    worker->finalize_hierarchy_transfers();
 
     std::shared_ptr<HierarchyKVCacheTransfer> target_owner =
         worker->target_transfer_owner();
@@ -422,6 +426,8 @@ TEST_F(MTPHostOffloadTest, BindsAndReleasesTargetAndDraftTransferOwners) {
     EXPECT_EQ(target_owner.get(), target_worker_transfer.get());
     EXPECT_EQ(draft_owner.get(), draft_worker_transfer.get());
     EXPECT_NE(target_owner.get(), draft_owner.get());
+    EXPECT_TRUE(target_owner->registration_finalized());
+    EXPECT_TRUE(draft_owner->registration_finalized());
     target_lifetime = target_owner;
     draft_lifetime = draft_owner;
   }
@@ -448,23 +454,16 @@ TEST_F(MTPHostOffloadTest, DualTransferRoundTripUsesIndependentSynchronizers) {
   const KVCacheShape draft_shape = make_cache_shape(draft_model_args);
   TestMTPWorker worker(parallel_args, device.unwrap(), options);
   auto target = std::make_unique<HierarchyTransferTestWorker>(
-      parallel_args,
-      device.unwrap(),
-      options,
-      target_model_args,
-      HierarchyTransferCreationMode::SELF);
+      parallel_args, device.unwrap(), options, target_model_args);
   auto draft = std::make_unique<HierarchyTransferTestWorker>(
-      parallel_args,
-      device.unwrap(),
-      options,
-      draft_model_args,
-      HierarchyTransferCreationMode::COMPOSITE_OWNER);
-  target->initialize_hierarchy_cache(target_shape);
-  draft->initialize_hierarchy_cache(draft_shape);
+      parallel_args, device.unwrap(), options, draft_model_args);
   HierarchyTransferTestWorker* target_ptr = target.get();
   HierarchyTransferTestWorker* draft_ptr = draft.get();
   worker.replace_transfer_workers(std::move(target), std::move(draft));
-  worker.initialize_hierarchy_transfers();
+  worker.prepare_hierarchy_transfers();
+  target_ptr->initialize_hierarchy_cache(target_shape);
+  draft_ptr->initialize_hierarchy_cache(draft_shape);
+  worker.finalize_hierarchy_transfers();
 
   target_ptr->fill_block(kSourceBlockId, /*value=*/3.0);
   draft_ptr->fill_block(kSourceBlockId, /*value=*/13.0);
@@ -531,23 +530,16 @@ TEST_F(MTPHostOffloadTest, Dsv4DraftSkipsUnsupportedCompressedBlockTypes) {
 
   TestMTPWorker worker(parallel_args, device.unwrap(), options);
   auto target = std::make_unique<HierarchyTransferTestWorker>(
-      parallel_args,
-      device.unwrap(),
-      options,
-      target_model_args,
-      HierarchyTransferCreationMode::SELF);
+      parallel_args, device.unwrap(), options, target_model_args);
   auto draft = std::make_unique<HierarchyTransferTestWorker>(
-      parallel_args,
-      device.unwrap(),
-      options,
-      draft_model_args,
-      HierarchyTransferCreationMode::COMPOSITE_OWNER);
-  target->initialize_hierarchy_cache(target_shape);
-  draft->initialize_hierarchy_cache(draft_shape);
+      parallel_args, device.unwrap(), options, draft_model_args);
   HierarchyTransferTestWorker* target_ptr = target.get();
   HierarchyTransferTestWorker* draft_ptr = draft.get();
   worker.replace_transfer_workers(std::move(target), std::move(draft));
-  worker.initialize_hierarchy_transfers();
+  worker.prepare_hierarchy_transfers();
+  target_ptr->initialize_hierarchy_cache(target_shape);
+  draft_ptr->initialize_hierarchy_cache(draft_shape);
+  worker.finalize_hierarchy_transfers();
 
   ASSERT_TRUE(
       worker.draft_transfer_owner()->supports_block_type(BlockType::SWA));

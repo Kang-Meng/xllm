@@ -93,7 +93,13 @@ class TestHierarchyWorker final : public LLMWorkerImpl {
   }
 
   std::shared_ptr<HierarchyKVCacheTransfer> recreate_hierarchy_transfer() {
-    return create_hierarchy_kv_cache_transfer(compute_stream_.get());
+    std::shared_ptr<HierarchyKVCacheTransfer> transfer =
+        create_hierarchy_kv_cache_transfer();
+    register_hierarchy_kv_cache(*transfer,
+                                HierarchyKVCacheTransfer::CacheRole::TARGET,
+                                compute_stream_.get());
+    EXPECT_TRUE(transfer->finalize_registration());
+    return transfer;
   }
 };
 

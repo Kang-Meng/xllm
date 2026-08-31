@@ -39,9 +39,7 @@ class LLMWorkerImpl : public WorkerImpl {
 
   LLMWorkerImpl(const ParallelArgs& parallel_args,
                 const torch::Device& device,
-                const runtime::Options& options,
-                HierarchyTransferCreationMode hierarchy_transfer_creation_mode =
-                    HierarchyTransferCreationMode::SELF);
+                const runtime::Options& options);
 
   ~LLMWorkerImpl() override = default;
 

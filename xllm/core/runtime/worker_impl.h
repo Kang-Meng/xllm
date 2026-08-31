@@ -54,11 +54,6 @@ namespace xllm {
 
 class WorkerRendezvous;
 
-enum class HierarchyTransferCreationMode : uint8_t {
-  SELF = 0,
-  COMPOSITE_OWNER,
-};
-
 class WorkerImpl {
  public:
   enum Status : int8_t {
@@ -69,9 +64,7 @@ class WorkerImpl {
 
   WorkerImpl(const ParallelArgs& parallel_args,
              const torch::Device& device,
-             const runtime::Options& options,
-             HierarchyTransferCreationMode hierarchy_transfer_creation_mode =
-                 HierarchyTransferCreationMode::SELF);
+             const runtime::Options& options);
 
   virtual ~WorkerImpl();
 
@@ -209,8 +202,17 @@ class WorkerImpl {
       const uint64_t batch_id,
       Slice<BlockTransferInfo>& block_transfer_info);
 
-  std::shared_ptr<HierarchyKVCacheTransfer> create_hierarchy_kv_cache_transfer(
-      const Stream* compute_stream);
+  std::shared_ptr<HierarchyKVCacheTransfer>
+  create_hierarchy_kv_cache_transfer();
+
+  void bind_hierarchy_kv_cache_transfer(
+      std::shared_ptr<HierarchyKVCacheTransfer> transfer,
+      HierarchyKVCacheTransfer::CacheRole role,
+      const Stream* producer_stream);
+
+  void register_hierarchy_kv_cache(HierarchyKVCacheTransfer& transfer,
+                                   HierarchyKVCacheTransfer::CacheRole role,
+                                   const Stream* producer_stream);
 
   void set_hierarchy_kv_cache_transfer(
       std::shared_ptr<HierarchyKVCacheTransfer> transfer);
@@ -460,8 +462,8 @@ class WorkerImpl {
   InstanceRole instance_role_ = InstanceRole::DEFAULT;
 
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
-  HierarchyTransferCreationMode hierarchy_transfer_creation_mode_ =
-      HierarchyTransferCreationMode::SELF;
+  std::optional<HierarchyKVCacheTransfer::CacheRole> hierarchy_kv_cache_role_;
+  const Stream* hierarchy_kv_cache_producer_stream_ = nullptr;
   std::optional<HierarchyKVCacheTransferContext>
       hierarchy_kv_cache_transfer_context_;
   std::shared_ptr<HierarchyKVCacheTransfer> hierarchy_kv_cache_transfer_;

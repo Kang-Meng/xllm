@@ -837,8 +837,7 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
   draft_impl_ = std::make_unique<LLMWorkerImpl>(
       MTPDraftParallelArgs(parallel_args, options),
       device,
-      mtp_draft_options(draft_options),
-      HierarchyTransferCreationMode::COMPOSITE_OWNER);
+      mtp_draft_options(draft_options));
   if (enable_adaptive_speculative_decode) {
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
@@ -1146,6 +1145,7 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   }
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
+  prepare_hierarchy_kv_cache_transfers();
 
   bool target_allocated = true;
   const auto target_status = impl_->get_status();
@@ -1178,12 +1178,12 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 
   const bool allocated = target_allocated && draft_allocated;
   if (allocated) {
-    initialize_hierarchy_kv_cache_transfers();
+    finalize_hierarchy_kv_cache_transfers();
   }
   return allocated;
 }
 
-void MTPWorkerImpl::initialize_hierarchy_kv_cache_transfers() {
+void MTPWorkerImpl::prepare_hierarchy_kv_cache_transfers() {
   if (options_.host_blocks_factor() <= 1.0) {
     return;
   }
@@ -1191,26 +1191,66 @@ void MTPWorkerImpl::initialize_hierarchy_kv_cache_transfers() {
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
   std::shared_ptr<HierarchyKVCacheTransfer> target_transfer =
-      impl_->get_hierarchy_kv_cache_transfer();
-  CHECK(target_transfer != nullptr)
-      << "MTP target hierarchy KV cache transfer is not initialized.";
+      hierarchy_kv_cache_transfer_;
+  if (target_transfer == nullptr) {
+    target_transfer = impl_->get_hierarchy_kv_cache_transfer();
+  }
+  if (target_transfer == nullptr) {
+    target_transfer = impl_->create_hierarchy_kv_cache_transfer();
+  }
+  if (impl_->get_hierarchy_kv_cache_transfer() == nullptr) {
+    impl_->bind_hierarchy_kv_cache_transfer(
+        target_transfer,
+        HierarchyKVCacheTransfer::CacheRole::TARGET,
+        compute_stream_.get());
+  } else {
+    CHECK_EQ(impl_->get_hierarchy_kv_cache_transfer().get(),
+             target_transfer.get())
+        << "MTP target worker hierarchy KV cache transfer changed "
+           "unexpectedly.";
+  }
   if (hierarchy_kv_cache_transfer_ == nullptr) {
     set_hierarchy_kv_cache_transfer(target_transfer);
-  } else {
-    CHECK_EQ(hierarchy_kv_cache_transfer_.get(), target_transfer.get())
-        << "MTP target hierarchy KV cache transfer changed unexpectedly.";
   }
 
-  if (draft_transfer_owner_ == nullptr) {
-    CHECK(draft_impl_->get_hierarchy_kv_cache_transfer() == nullptr)
-        << "MTP draft hierarchy KV cache transfer must be parent-owned.";
-    draft_transfer_owner_ =
-        draft_impl_->create_hierarchy_kv_cache_transfer(compute_stream_.get());
-    draft_impl_->set_hierarchy_kv_cache_transfer(draft_transfer_owner_);
+  std::shared_ptr<HierarchyKVCacheTransfer> draft_transfer =
+      draft_transfer_owner_;
+  if (draft_transfer == nullptr) {
+    draft_transfer = draft_impl_->get_hierarchy_kv_cache_transfer();
+  }
+  if (draft_transfer == nullptr) {
+    draft_transfer = draft_impl_->create_hierarchy_kv_cache_transfer();
+  }
+  if (draft_impl_->get_hierarchy_kv_cache_transfer() == nullptr) {
+    draft_impl_->bind_hierarchy_kv_cache_transfer(
+        draft_transfer,
+        HierarchyKVCacheTransfer::CacheRole::DRAFT,
+        compute_stream_.get());
   } else {
     CHECK_EQ(draft_impl_->get_hierarchy_kv_cache_transfer().get(),
-             draft_transfer_owner_.get())
-        << "MTP draft hierarchy KV cache transfer changed unexpectedly.";
+             draft_transfer.get())
+        << "MTP draft worker hierarchy KV cache transfer changed "
+           "unexpectedly.";
+  }
+  if (draft_transfer_owner_ == nullptr) {
+    draft_transfer_owner_ = std::move(draft_transfer);
+  }
+}
+
+void MTPWorkerImpl::finalize_hierarchy_kv_cache_transfers() {
+  if (options_.host_blocks_factor() <= 1.0) {
+    return;
+  }
+
+  CHECK(hierarchy_kv_cache_transfer_ != nullptr)
+      << "MTP target hierarchy KV cache transfer is not prepared.";
+  CHECK(draft_transfer_owner_ != nullptr)
+      << "MTP draft hierarchy KV cache transfer is not prepared.";
+  if (!hierarchy_kv_cache_transfer_->registration_finalized()) {
+    CHECK(hierarchy_kv_cache_transfer_->finalize_registration());
+  }
+  if (!draft_transfer_owner_->registration_finalized()) {
+    CHECK(draft_transfer_owner_->finalize_registration());
   }
 }
 
@@ -1315,6 +1355,7 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
+  prepare_hierarchy_kv_cache_transfers();
 
   if (kv_cache_transfer_ == nullptr) {
     kv_cache_transfer_ = std::make_shared<MooncakeKVCacheTransferDefault>(
@@ -1370,7 +1411,7 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   }
   const bool allocated = target_allocated && draft_allocated;
   if (allocated) {
-    initialize_hierarchy_kv_cache_transfers();
+    finalize_hierarchy_kv_cache_transfers();
   }
   return allocated;
 }
