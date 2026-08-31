@@ -194,6 +194,24 @@ TEST(DecodeGraphWarmupPlanTest, UsesLocalDpBatchesAndKeepsPartialBatch) {
   EXPECT_EQ(plan.batch_sizes, (std::vector<int32_t>{4, 8, 12, 20, 36, 52, 66}));
 }
 
+TEST(DecodeGraphWarmupPlanTest, Dp32C64UsesLocalGraphBuckets) {
+  if (!Platform::supports_mtp_decode_graph_warmup()) {
+    GTEST_SKIP() << "MTP decode graph warmup is not supported.";
+  }
+
+  const runtime::DecodeGraphExecutionShape execution_shape =
+      make_decode_graph_execution_shape(
+          /*num_decoding_tokens=*/4,
+          /*num_speculative_tokens=*/3,
+          /*enable_no_padding=*/false);
+  const DecodeGraphWarmupPlan plan = build_decode_graph_warmup_plan(
+      execution_shape, /*max_global_batch_size=*/64, /*dp_size=*/32);
+
+  // The scheduler batch is global, while graph shapes are keyed by the
+  // largest local DP batch. C64 therefore needs the local-batch-2 bucket.
+  EXPECT_EQ(plan.batch_sizes, (std::vector<int32_t>{32, 64}));
+}
+
 TEST(DecodeGraphWarmupPlanTest,
      GraphLimitKeepsCppBatchSemanticsAndCoversMtpBuckets) {
   if (!Platform::supports_mtp_decode_graph_warmup()) {

@@ -20,6 +20,12 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(AclGraphBucketPolicyUnitTest, ConvertsLocalLimitToGlobalDpCapacity) {
+  EXPECT_EQ(npu::acl_graph_max_global_batch_size(3000, 64, 32), 2048);
+  EXPECT_EQ(npu::acl_graph_max_global_batch_size(64, 64, 32), 64);
+  EXPECT_EQ(npu::acl_graph_max_global_batch_size(3000, 16, 32), 512);
+}
+
 TEST(AclGraphBucketPolicyUnitTest, MapsGlobalWarmupBucketsToLocalDpBatches) {
   EXPECT_TRUE(npu::is_acl_graph_warmup_batch_size(1, 16, 4));
   EXPECT_TRUE(npu::is_acl_graph_warmup_batch_size(2, 16, 4));
