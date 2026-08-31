@@ -40,6 +40,7 @@ limitations under the License.
 #include "framework/batch/batch_factory.h"
 #include "framework/request/request_state.h"
 #include "platform/platform.h"
+#include "runtime/acl_graph_bucket_policy.h"
 #include "scheduler/profile/graph_warmup.h"
 #include "util/rec_model_utils.h"
 #include "util/utils.h"
@@ -76,12 +77,14 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
   if (Platform::is_npu()) {
-    const int32_t decode_batch_size_limit =
-        std::max<int32_t>(1,
-                          ::xllm::ExecutionConfig::get_instance()
-                              .acl_graph_decode_batch_size_limit());
     max_decode_batch_size =
-        std::min(max_decode_batch_size, decode_batch_size_limit);
+        static_cast<int32_t>(npu::acl_graph_max_global_batch_size(
+            static_cast<uint32_t>(std::max<int32_t>(1, max_decode_batch_size)),
+            static_cast<uint32_t>(
+                std::max<int32_t>(1,
+                                  ::xllm::ExecutionConfig::get_instance()
+                                      .acl_graph_decode_batch_size_limit())),
+            static_cast<uint32_t>(std::max<int32_t>(1, options_.dp_size()))));
   }
   decode_graph_warmup_plan_ =
       build_decode_graph_warmup_plan(engine_->decode_graph_execution_shape(),
@@ -1258,12 +1261,14 @@ void ProfileManager::warmup_decode_for_graph() {
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
   if (Platform::is_npu()) {
-    const int32_t decode_batch_size_limit =
-        std::max<int32_t>(1,
-                          ::xllm::ExecutionConfig::get_instance()
-                              .acl_graph_decode_batch_size_limit());
     max_decode_batch_size =
-        std::min(max_decode_batch_size, decode_batch_size_limit);
+        static_cast<int32_t>(npu::acl_graph_max_global_batch_size(
+            static_cast<uint32_t>(std::max<int32_t>(1, max_decode_batch_size)),
+            static_cast<uint32_t>(
+                std::max<int32_t>(1,
+                                  ::xllm::ExecutionConfig::get_instance()
+                                      .acl_graph_decode_batch_size_limit())),
+            static_cast<uint32_t>(std::max<int32_t>(1, options_.dp_size()))));
   }
   int32_t decode_seq_len = std::min(16, max_context_len);
 

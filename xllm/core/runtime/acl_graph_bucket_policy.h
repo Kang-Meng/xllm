@@ -19,6 +19,21 @@ limitations under the License.
 
 namespace xllm::npu {
 
+inline uint32_t acl_graph_max_global_batch_size(
+    uint32_t configured_max_batch_size,
+    uint32_t local_batch_size_limit,
+    uint32_t dp_size) {
+  if (configured_max_batch_size == 0 || local_batch_size_limit == 0 ||
+      dp_size == 0) {
+    return 0;
+  }
+  const uint64_t graph_capacity =
+      static_cast<uint64_t>(local_batch_size_limit) * dp_size;
+  return graph_capacity < configured_max_batch_size
+             ? static_cast<uint32_t>(graph_capacity)
+             : configured_max_batch_size;
+}
+
 inline bool is_acl_graph_warmup_batch_size(uint32_t batch_size,
                                            uint32_t max_batch_size,
                                            uint32_t dp_size) {

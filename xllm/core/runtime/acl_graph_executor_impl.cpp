@@ -955,7 +955,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                             .acl_graph_decode_batch_size_limit()));
   if (max_local_batch_size > decode_batch_size_limit) {
     LOG_FIRST_N(WARNING, 1)
-        << "Falling back to eager mode because decode batch_size (global="
+        << "Falling back to eager mode because decode local batch_size (max="
         << max_local_batch_size << ", local=" << local_batch_size << ") > "
         << decode_batch_size_limit
         << "; ACL graph is disabled for this request size to avoid OOM. "
@@ -1082,12 +1082,13 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   if (in_decoding_phase && ::xllm::ExecutionConfig::get_instance()
                                .enable_graph_mode_decode_no_padding()) {
-    const uint32_t max_graph_batch_size =
-        std::min(static_cast<uint32_t>(
-                     std::max<int32_t>(1, options_.max_seqs_per_batch())),
-                 decode_batch_size_limit);
     const uint32_t dp_size =
         static_cast<uint32_t>(std::max<int32_t>(1, options_.dp_size()));
+    const uint32_t max_graph_batch_size =
+        acl_graph_max_global_batch_size(static_cast<uint32_t>(std::max<int32_t>(
+                                            1, options_.max_seqs_per_batch())),
+                                        decode_batch_size_limit,
+                                        dp_size);
     if (!is_acl_graph_decode_capture_allowed(
             max_local_batch_size,
             max_graph_batch_size,
