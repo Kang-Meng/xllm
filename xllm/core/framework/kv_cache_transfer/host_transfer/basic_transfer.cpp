@@ -140,7 +140,12 @@ class BasicHostKVTransfer::Impl final {
 
   HostKVLoadHandle prepare_load(bool draft) const {
     const uint32_t count = event_count() + static_cast<uint32_t>(draft);
-    return {create_layer_synchronizer(count), layers_per_event()};
+    HostKVLoadHandle handle{create_layer_synchronizer(count),
+                            layers_per_event()};
+    if (draft) {
+      handle.draft_event_index = event_count();
+    }
+    return handle;
   }
 
   uint32_t event_count() const { return static_cast<uint32_t>(ranges_.size()); }

@@ -578,6 +578,7 @@ void HierarchyKVCacheTransfer::set_layer_synchronizer(
   }
   params.parallel.layer_wise_load_synchronizer = handle->synchronizer;
   params.parallel.layers_per_event = handle->layers_per_event;
+  params.parallel.draft_load_event_index = handle->draft_event_index;
 }
 
 std::optional<HostKVLoadHandle> HierarchyKVCacheTransfer::take_load_handle(

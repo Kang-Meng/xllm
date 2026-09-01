@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 #include "framework/kv_cache_transfer/host_transfer/layout.h"
 
@@ -29,6 +30,7 @@ class Stream;
 struct HostKVLoadHandle {
   std::shared_ptr<LayerSynchronizer> synchronizer;
   uint32_t layers_per_event = 1;
+  std::optional<uint32_t> draft_event_index;
 };
 
 enum class HostKVTransferMode : uint8_t {

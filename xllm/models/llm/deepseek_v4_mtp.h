@@ -299,7 +299,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     CHECK_GE(static_cast<int32_t>(kv_caches.size()),
              static_cast<int32_t>(mtp_layers_.size()))
         << "deepseek_v4_mtp requires kv_caches size >= mtp layer count";
-    if (!modified_input_params.synchronize_layer(/*layer_idx=*/-1)) {
+    if (!modified_input_params.synchronize_draft_layer()) {
       return ModelOutput();
     }
 

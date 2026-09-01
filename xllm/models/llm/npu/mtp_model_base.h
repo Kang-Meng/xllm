@@ -181,7 +181,7 @@ class MtpModelImplBase : public torch::nn::Module {
           << "NPU MTP model received an incompatible top-k state.";
       prev_topk_indices = state->topk_indices();
     }
-    if (!input_params.synchronize_layer(/*layer_idx=*/-1)) {
+    if (!input_params.synchronize_draft_layer()) {
       return ModelOutput();
     }
     for (size_t i = 0; i < layers_.size(); i++) {
