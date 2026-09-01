@@ -35,8 +35,7 @@ CompactHostKVTransfer::CompactHostKVTransfer(
     const Stream& compute_stream,
     uint32_t layer_copy_batches,
     std::unique_ptr<BatchMemcpy> batch_memcpy,
-    CompactTransferConfig config,
-    bool record_draft_cache_completion_event)
+    CompactTransferConfig config)
     : HostKVTransfer(std::move(layout)),
       compute_stream_(compute_stream),
       batch_memcpy_(std::move(batch_memcpy)) {
@@ -46,21 +45,21 @@ CompactHostKVTransfer::CompactHostKVTransfer(
     batch_memcpy_->init(device.index());
   }
   CHECK(batch_memcpy_ != nullptr) << "Host KV batch memcpy is unavailable.";
-  load_executor_ = std::make_unique<CompactLoadExecutor>(
-      this->layout(),
-      device,
-      layer_copy_batches,
-      *batch_memcpy_,
-      config.load_target_bytes,
-      record_draft_cache_completion_event);
+  load_executor_ =
+      std::make_unique<CompactLoadExecutor>(this->layout(),
+                                            device,
+                                            layer_copy_batches,
+                                            *batch_memcpy_,
+                                            config.load_target_bytes);
   offload_executor_ = std::make_unique<CompactOffloadExecutor>(
       this->layout(), device, *batch_memcpy_, config.offload_target_bytes);
 }
 
 CompactHostKVTransfer::~CompactHostKVTransfer() { drain(); }
 
-HostKVLoadHandle CompactHostKVTransfer::prepare_load() {
-  const uint32_t event_count = load_executor_->event_count();
+HostKVLoadHandle CompactHostKVTransfer::prepare_load(bool draft) {
+  const uint32_t event_count =
+      load_executor_->event_count() + static_cast<uint32_t>(draft);
   return {create_layer_synchronizer(event_count),
           load_executor_->layers_per_event()};
 }

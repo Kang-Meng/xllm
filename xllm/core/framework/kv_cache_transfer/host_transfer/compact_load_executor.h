@@ -43,8 +43,7 @@ class CompactLoadExecutor final {
                       const Device& device,
                       uint32_t layer_copy_batches,
                       BatchMemcpy& batch_memcpy,
-                      size_t target_bytes,
-                      bool record_draft_cache_completion_event = false);
+                      size_t target_bytes);
   ~CompactLoadExecutor();
 
   CompactLoadExecutor(const CompactLoadExecutor&) = delete;
@@ -127,7 +126,6 @@ class CompactLoadExecutor final {
   size_t target_bytes_ = 0;
   uint32_t layers_per_event_ = 1;
   std::vector<LayerRange> ranges_;
-  bool record_draft_cache_completion_event_ = false;
   BatchMemcpy& batch_memcpy_;
   std::map<int32_t, GroupState> groups_;
   std::array<SlotState, 2> slots_;

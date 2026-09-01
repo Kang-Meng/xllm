@@ -40,11 +40,10 @@ class CompactHostKVTransfer final : public HostKVTransfer {
                         const Stream& compute_stream,
                         uint32_t layer_copy_batches,
                         std::unique_ptr<BatchMemcpy> batch_memcpy = nullptr,
-                        CompactTransferConfig config = {},
-                        bool record_draft_cache_completion_event = false);
+                        CompactTransferConfig config = {});
   ~CompactHostKVTransfer() override;
 
-  HostKVLoadHandle prepare_load() override;
+  HostKVLoadHandle prepare_load(bool draft = false) override;
   void drain() override;
 
  protected:

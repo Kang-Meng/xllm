@@ -248,10 +248,6 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
 
     HostKVTransferConfig config;
     config.layer_copy_batches = options_.layers_wise_copy_batchs();
-    config.record_draft_cache_completion_event = std::any_of(
-        cache_domains_.begin(), cache_domains_.end(), [](const auto& domain) {
-          return domain.role == CacheRole::DRAFT;
-        });
     config.mode = options_.enable_kvcache_store() ? HostKVTransferMode::BASIC
                                                   : HostKVTransferMode::AUTO;
     host_kv_transfer_ = create_host_kv_transfer(
@@ -455,7 +451,8 @@ uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
       }
       HostKVRequest request =
           make_request(block_transfer_info, TransferType::H2D);
-      HostKVLoadHandle handle = host_kv_transfer_->prepare_load();
+      HostKVLoadHandle handle =
+          host_kv_transfer_->prepare_load(!request.draft_mappings.empty());
       CHECK(handle.synchronizer != nullptr)
           << "Failed to create Host KV load synchronizer.";
       {

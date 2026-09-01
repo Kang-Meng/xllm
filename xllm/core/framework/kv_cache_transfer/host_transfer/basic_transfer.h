@@ -33,11 +33,10 @@ class BasicHostKVTransfer final : public HostKVTransfer {
                       const Device& device,
                       const Stream& compute_stream,
                       uint32_t layer_copy_batches,
-                      std::unique_ptr<BatchMemcpy> batch_memcpy = nullptr,
-                      bool record_draft_cache_completion_event = false);
+                      std::unique_ptr<BatchMemcpy> batch_memcpy = nullptr);
   ~BasicHostKVTransfer() override;
 
-  HostKVLoadHandle prepare_load() override;
+  HostKVLoadHandle prepare_load(bool draft = false) override;
   void drain() override;
 
  protected:

@@ -82,10 +82,8 @@ TEST(BasicHostKVTransferTest, KeepsLayerBatchingEdgeSemantics) {
   BasicHostKVTransfer composite(make_layout(device, /*num_layers=*/4),
                                 device,
                                 *compute_stream,
-                                /*layer_copy_batches=*/4,
-                                /*batch_memcpy=*/nullptr,
-                                /*record_draft_cache_completion_event=*/true);
-  HostKVLoadHandle composite_handle = composite.prepare_load();
+                                /*layer_copy_batches=*/4);
+  HostKVLoadHandle composite_handle = composite.prepare_load(/*draft=*/true);
   EXPECT_EQ(composite_handle.synchronizer->size(), 5U);
   composite.drain();
 }

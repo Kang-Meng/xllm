@@ -38,7 +38,6 @@ enum class HostKVTransferMode : uint8_t {
 
 struct HostKVTransferConfig {
   uint32_t layer_copy_batches = 1;
-  bool record_draft_cache_completion_event = false;
   HostKVTransferMode mode = HostKVTransferMode::AUTO;
 };
 
@@ -46,7 +45,7 @@ class HostKVTransfer {
  public:
   virtual ~HostKVTransfer() = default;
 
-  virtual HostKVLoadHandle prepare_load() = 0;
+  virtual HostKVLoadHandle prepare_load(bool draft = false) = 0;
   // Success means all layer-ready events have been recorded.
   bool load(const HostKVRequest& request, const HostKVLoadHandle& handle);
   // Success means Host data is safe for CPU and Store access.
@@ -66,7 +65,8 @@ class HostKVTransfer {
 
  private:
   bool valid_request(const HostKVRequest& request, bool is_load) const;
-  bool valid_handle(const HostKVLoadHandle& handle) const;
+  bool valid_handle(const HostKVRequest& request,
+                    const HostKVLoadHandle& handle) const;
 
   const HostKVLayout layout_;
 };

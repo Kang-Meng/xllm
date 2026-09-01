@@ -51,7 +51,8 @@ HostKVTransfer::HostKVTransfer(HostKVLayout layout)
 
 bool HostKVTransfer::load(const HostKVRequest& request,
                           const HostKVLoadHandle& handle) {
-  if (!valid_request(request, /*is_load=*/true) || !valid_handle(handle)) {
+  if (!valid_request(request, /*is_load=*/true) ||
+      !valid_handle(request, handle)) {
     if (handle.synchronizer != nullptr) {
       handle.synchronizer->abort();
     }
@@ -109,12 +110,16 @@ bool HostKVTransfer::valid_request(const HostKVRequest& request,
          validate_mappings(request.draft_mappings);
 }
 
-bool HostKVTransfer::valid_handle(const HostKVLoadHandle& handle) const {
+bool HostKVTransfer::valid_handle(const HostKVRequest& request,
+                                  const HostKVLoadHandle& handle) const {
   if (handle.synchronizer == nullptr) {
     LOG(ERROR) << "Host KV load requires a synchronizer.";
     return false;
   }
-  if (handle.synchronizer->size() != load_event_count() ||
+  const uint32_t expected_event_count =
+      load_event_count() +
+      static_cast<uint32_t>(!request.draft_mappings.empty());
+  if (handle.synchronizer->size() != expected_event_count ||
       handle.layers_per_event != layers_per_event()) {
     LOG(ERROR) << "Host KV load handle does not match the transfer strategy.";
     return false;
@@ -129,22 +134,18 @@ std::unique_ptr<HostKVTransfer> create_host_kv_transfer(
     const HostKVTransferConfig& config) {
   if (config.mode == HostKVTransferMode::AUTO &&
       Platform::supports_compact_host_kv_transfer()) {
-    return std::make_unique<CompactHostKVTransfer>(
-        std::move(layout),
-        device,
-        compute_stream,
-        config.layer_copy_batches,
-        /*batch_memcpy=*/nullptr,
-        CompactTransferConfig{},
-        config.record_draft_cache_completion_event);
+    return std::make_unique<CompactHostKVTransfer>(std::move(layout),
+                                                   device,
+                                                   compute_stream,
+                                                   config.layer_copy_batches,
+                                                   /*batch_memcpy=*/nullptr,
+                                                   CompactTransferConfig{});
   }
-  return std::make_unique<BasicHostKVTransfer>(
-      std::move(layout),
-      device,
-      compute_stream,
-      config.layer_copy_batches,
-      /*batch_memcpy=*/nullptr,
-      config.record_draft_cache_completion_event);
+  return std::make_unique<BasicHostKVTransfer>(std::move(layout),
+                                               device,
+                                               compute_stream,
+                                               config.layer_copy_batches,
+                                               /*batch_memcpy=*/nullptr);
 }
 
 }  // namespace xllm

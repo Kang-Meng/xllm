@@ -119,7 +119,6 @@ class BasicHostKVTransfer::Impl final {
        const Device& device,
        const Stream& compute_stream,
        uint32_t layer_copy_batches,
-       bool record_draft_cache_completion_event,
        std::unique_ptr<BatchMemcpy> batch_memcpy)
       : layout_(layout),
         device_(device),
@@ -127,8 +126,6 @@ class BasicHostKVTransfer::Impl final {
         layers_per_event_(
             get_layers_per_event(layout.num_layers(), layer_copy_batches)),
         ranges_(build_layer_ranges(layout.num_layers(), layers_per_event_)),
-        record_draft_cache_completion_event_(
-            record_draft_cache_completion_event),
         batch_memcpy_(std::move(batch_memcpy)) {
     if (batch_memcpy_ == nullptr) {
       batch_memcpy_ = create_batch_memcpy(device_);
@@ -141,14 +138,12 @@ class BasicHostKVTransfer::Impl final {
     }
   }
 
-  HostKVLoadHandle prepare_load() const {
-    return {create_layer_synchronizer(event_count()), layers_per_event()};
+  HostKVLoadHandle prepare_load(bool draft) const {
+    const uint32_t count = event_count() + static_cast<uint32_t>(draft);
+    return {create_layer_synchronizer(count), layers_per_event()};
   }
 
-  uint32_t event_count() const {
-    return static_cast<uint32_t>(ranges_.size()) +
-           static_cast<uint32_t>(record_draft_cache_completion_event_);
-  }
+  uint32_t event_count() const { return static_cast<uint32_t>(ranges_.size()); }
 
   uint32_t layers_per_event() const { return layers_per_event_; }
 
@@ -186,7 +181,7 @@ class BasicHostKVTransfer::Impl final {
       }
       stream_has_work = stream_has_work || !plan.src_tensors.empty();
     }
-    if (record_draft_cache_completion_event_ &&
+    if (!request.draft_mappings.empty() &&
         !handle.synchronizer->record_stream(
             static_cast<int64_t>(ranges_.size()), stream.get())) {
       if (stream_has_work) {
@@ -236,7 +231,6 @@ class BasicHostKVTransfer::Impl final {
   const Stream& compute_stream_;
   uint32_t layers_per_event_ = 1;
   std::vector<LayerRange> ranges_;
-  bool record_draft_cache_completion_event_ = false;
   std::unique_ptr<BatchMemcpy> batch_memcpy_;
   CopyStreamQueue streams_;
   bool drained_ = false;
@@ -247,20 +241,18 @@ BasicHostKVTransfer::BasicHostKVTransfer(
     const Device& device,
     const Stream& compute_stream,
     uint32_t layer_copy_batches,
-    std::unique_ptr<BatchMemcpy> batch_memcpy,
-    bool record_draft_cache_completion_event)
+    std::unique_ptr<BatchMemcpy> batch_memcpy)
     : HostKVTransfer(std::move(layout)),
       impl_(std::make_unique<Impl>(this->layout(),
                                    device,
                                    compute_stream,
                                    layer_copy_batches,
-                                   record_draft_cache_completion_event,
                                    std::move(batch_memcpy))) {}
 
 BasicHostKVTransfer::~BasicHostKVTransfer() { drain(); }
 
-HostKVLoadHandle BasicHostKVTransfer::prepare_load() {
-  return impl_->prepare_load();
+HostKVLoadHandle BasicHostKVTransfer::prepare_load(bool draft) {
+  return impl_->prepare_load(draft);
 }
 
 void BasicHostKVTransfer::drain() { impl_->drain(); }

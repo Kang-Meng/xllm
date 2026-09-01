@@ -71,8 +71,9 @@ class TestHostKVTransfer final : public HostKVTransfer {
  public:
   TestHostKVTransfer() : HostKVTransfer(make_layout()) {}
 
-  HostKVLoadHandle prepare_load() override {
-    return {std::make_shared<TestSynchronizer>(/*size=*/1),
+  HostKVLoadHandle prepare_load(bool draft = false) override {
+    return {std::make_shared<TestSynchronizer>(
+                /*size=*/1 + static_cast<uint32_t>(draft)),
             /*layers_per_event=*/1};
   }
 
@@ -179,7 +180,15 @@ TEST(HostKVTransferTest, EnforcesDirectionScopedDestinations) {
 
   const HostKVRequest distinct_groups{{HostKVMapping{3, 0, 1}},
                                       {HostKVMapping{7, 0, 1}}};
-  EXPECT_TRUE(transfer.load(distinct_groups, handle));
+  HostKVLoadHandle incomplete_handle = transfer.prepare_load();
+  EXPECT_FALSE(transfer.load(distinct_groups, incomplete_handle));
+  const std::shared_ptr<TestSynchronizer> incomplete_synchronizer =
+      std::static_pointer_cast<TestSynchronizer>(
+          incomplete_handle.synchronizer);
+  EXPECT_TRUE(incomplete_synchronizer->aborted());
+
+  HostKVLoadHandle composite_handle = transfer.prepare_load(/*draft=*/true);
+  EXPECT_TRUE(transfer.load(distinct_groups, composite_handle));
   EXPECT_TRUE(transfer.offload(distinct_groups));
   EXPECT_EQ(transfer.load_calls(), 1U);
   EXPECT_EQ(transfer.offload_calls(), 1U);
