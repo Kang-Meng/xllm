@@ -63,6 +63,24 @@ int32_t decode_warmup_token_bucket(const DecodeGraphWarmupPlan& plan,
       plan.execution_shape.enable_graph_mode_decode_no_padding));
 }
 
+// The ACL graph batch limit bounds the largest DP-local decode batch that
+// enters graph mode: the executor compares the DP-local batch size against
+// the limit before replaying or capturing a graph. Warmup batches are
+// scheduler-global, so the ceiling must be scaled by the DP degree to keep
+// both views of the limit consistent.
+int32_t decode_warmup_global_batch_ceiling(int32_t max_global_batch_size,
+                                           int32_t dp_size) {
+  if (!Platform::is_npu()) {
+    return max_global_batch_size;
+  }
+  const int32_t decode_batch_size_limit =
+      std::max<int32_t>(1,
+                        ::xllm::ExecutionConfig::get_instance()
+                            .acl_graph_decode_batch_size_limit());
+  return std::min(max_global_batch_size,
+                  decode_batch_size_limit * std::max<int32_t>(1, dp_size));
+}
+
 }  // namespace
 
 ProfileManager::ProfileManager(Engine* engine, const Options& options)
@@ -75,14 +93,8 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
     max_decode_batch_size =
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
-  if (Platform::is_npu()) {
-    const int32_t decode_batch_size_limit =
-        std::max<int32_t>(1,
-                          ::xllm::ExecutionConfig::get_instance()
-                              .acl_graph_decode_batch_size_limit());
-    max_decode_batch_size =
-        std::min(max_decode_batch_size, decode_batch_size_limit);
-  }
+  max_decode_batch_size = decode_warmup_global_batch_ceiling(
+      max_decode_batch_size, options_.dp_size());
   decode_graph_warmup_plan_ =
       build_decode_graph_warmup_plan(engine_->decode_graph_execution_shape(),
                                      max_decode_batch_size,
@@ -1259,14 +1271,8 @@ void ProfileManager::warmup_decode_for_graph() {
     max_decode_batch_size =
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
-  if (Platform::is_npu()) {
-    const int32_t decode_batch_size_limit =
-        std::max<int32_t>(1,
-                          ::xllm::ExecutionConfig::get_instance()
-                              .acl_graph_decode_batch_size_limit());
-    max_decode_batch_size =
-        std::min(max_decode_batch_size, decode_batch_size_limit);
-  }
+  max_decode_batch_size = decode_warmup_global_batch_ceiling(
+      max_decode_batch_size, options_.dp_size());
   int32_t decode_seq_len = std::min(16, max_context_len);
 
   const int32_t allocatable_sequences =
