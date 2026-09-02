@@ -172,6 +172,21 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
                          global_world_size,
                          cp_group_index);
     }
+    const int32_t kv_split_size = parallel_args.kv_split_size_effective();
+    if (kv_split_size > 1) {
+      const int32_t dcp_rank = parallel_args.kv_split_rank();
+      const int32_t dcp_group_index =
+          global_rank % (global_world_size / kv_split_size);
+      init_process_group("dcp",
+                         parallel_args.python_rendezvous_host_,
+                         parallel_args.python_rendezvous_port_,
+                         dcp_rank,
+                         kv_split_size,
+                         c10::str(device_),
+                         global_rank,
+                         global_world_size,
+                         dcp_group_index);
+    }
   }
   const std::string module_name = context.get_model_args().model_type().empty()
                                       ? std::string("Qwen3ForCausalLM")
