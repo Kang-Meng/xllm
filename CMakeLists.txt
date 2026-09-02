@@ -307,6 +307,21 @@ if(USE_MUSA)
 elseif(USE_CUDA)
   project("xllm" LANGUAGES C CXX CUDA)
   find_package(CUDAToolkit REQUIRED)
+
+  # CMake has already selected the CUDA compiler at this point, so use its
+  # version to choose defaults instead of probing nvcc from setup.py.
+  if(NOT DEFINED TORCH_CUDA_ARCH_LIST OR "${TORCH_CUDA_ARCH_LIST}" STREQUAL "")
+    set(TORCH_CUDA_ARCH_LIST "8.0 8.6")
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
+      string(APPEND TORCH_CUDA_ARCH_LIST " 8.9")
+    endif()
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+      string(APPEND TORCH_CUDA_ARCH_LIST " 9.0a")
+    endif()
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+      string(APPEND TORCH_CUDA_ARCH_LIST " 10.0a 12.0a")
+    endif()
+  endif()
 elseif(USE_DCU)
   project("xllm" LANGUAGES C CXX HIP)
   if(DEFINED ENV{DCU_PATH} AND NOT "$ENV{DCU_PATH}" STREQUAL "")
@@ -712,10 +727,10 @@ elseif(USE_CUDA)
     " --use_fast_math"
     " -Xfatbin -compress-all")
 
-  # Parallel nvcc compilation: compile multiple GPU architectures simultaneously within each .cu
-  # file. --threads 0 = auto-detect CPU core count. Requires CUDA >= 11.2.
+  # Keep each nvcc invocation single-threaded to avoid multiplying the outer
+  # CMake/Ninja parallelism when compiling multiple GPU architectures.
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.2)
-    string(APPEND CMAKE_CUDA_FLAGS " --threads 0")
+    string(APPEND CMAKE_CUDA_FLAGS " --threads 1")
   endif()
 
   message(STATUS "CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")

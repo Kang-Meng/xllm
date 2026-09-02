@@ -412,11 +412,9 @@ class ExtBuild(build_ext):
             global BUILD_TEST_FILE
             BUILD_TEST_FILE = False
         elif self.device == "cuda":
-            torch_cuda_architectures = os.getenv("TORCH_CUDA_ARCH_LIST")
-            if not torch_cuda_architectures:
-                raise ValueError(
-                    'Please set TORCH_CUDA_ARCH_LIST environment variable, e.g. export TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0 10.0 12.0"'
-                )
+            # Let CMake choose a compiler-compatible default when the caller
+            # does not provide an explicit architecture list.
+            torch_cuda_architectures = os.getenv("TORCH_CUDA_ARCH_LIST", "")
             cmake_args += ["-DUSE_CUDA=ON", f"-DTORCH_CUDA_ARCH_LIST={torch_cuda_architectures}"]
             set_cuda_envs()
 
