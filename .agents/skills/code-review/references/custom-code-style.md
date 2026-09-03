@@ -270,6 +270,8 @@ try {
 
 ## 8. Code Style & Control Flow
 
+- **Always run clang-format 20.1.6** (`clang-format -i`) with the repo-root `.clang-format` on every edited C++ file (`.h`, `.hpp`, `.c`, `.cc`, `.cpp`, `.cu`) before considering the change done. Include order and wrapping are part of this step; do not wait for review to catch them.
+
 - **Always use braces `{}`** with `if`, `while`, `for`, even for single-line bodies.
 
 ```cpp
