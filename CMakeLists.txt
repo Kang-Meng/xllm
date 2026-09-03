@@ -388,10 +388,9 @@ find_package(pybind11 CONFIG REQUIRED)
 
 if (USE_CXX11_ABI)
   # only use jemalloc if using the new C++-11 ABI
-  find_package(Jemalloc)
-  if(Jemalloc_FOUND)
-    link_libraries(Jemalloc::jemalloc)
-  endif()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(JEMALLOC REQUIRED IMPORTED_TARGET jemalloc)
+  link_libraries(PkgConfig::JEMALLOC)
 endif()
 
 # Important Note: Always invoke find_package for other dependencies
