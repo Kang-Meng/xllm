@@ -41,14 +41,4 @@ static void request_out_metric(void* context) {
   }
 }
 
-static void device_info_metric() {
-  // TODO: get cpu device info
-  GAUGE_SET(xllm_cpu_num, 0);
-  GAUGE_SET(xllm_cpu_utilization, 0);
-
-  // TODO: get gpu device info
-  GAUGE_SET(xllm_gpu_num, 0);
-  GAUGE_SET(xllm_gpu_utilization, 0);
-}
-
 }  // namespace xllm

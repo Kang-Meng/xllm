@@ -25,6 +25,7 @@ limitations under the License.
 #include "api_service/chat_json_parser.h"
 #include "api_service/completion_json_parser.h"
 #include "api_service/request_id.h"
+#include "api_service/rpc_request_metrics.h"
 #include "api_service/service_impl_factory.h"
 #include "api_service/serving_mode.h"
 #include "call.h"
@@ -47,7 +48,6 @@ limitations under the License.
 #include "service_impl_factory.h"
 #include "text_generation.pb.h"
 #include "video_generation.pb.h"
-#include "xllm_metrics.h"
 namespace xllm {
 
 namespace {
