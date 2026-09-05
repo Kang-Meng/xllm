@@ -43,7 +43,6 @@ class Master {
   // binary when no HTTP server is started on a non-leader rank.
   void wait();
   virtual const Options& options() const { return options_; }
-  bool is_leader() const { return options_.node_rank() == 0; }
   EngineType engine_type() const { return engine_type_; }
 
   virtual bool sleep() { return false; }
@@ -83,6 +82,10 @@ class Master {
   RateLimiter* get_rate_limiter() { return &rate_limiter_; }
 
  protected:
+  // node_rank == 0. Only the base class and derived masters branch on this;
+  // no external caller needs it.
+  bool is_leader() const { return options_.node_rank() == 0; }
+
   Options options_;
   EngineType engine_type_ = EngineType::INVALID;
   std::unique_ptr<Engine> engine_;

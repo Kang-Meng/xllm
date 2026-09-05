@@ -21,16 +21,15 @@ limitations under the License.
 #include <functional>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
 #include "common/options.h"
 #include "common/rate_limiter.h"
 #include "framework/chat_template/chat_template.h"
+#include "framework/request/llm_request_factory.h"
 #include "framework/request/request_output.h"
 #include "framework/request/request_params.h"
-#include "framework/sampling/json_object_grammar.h"
 #include "llm_engine.h"
 #include "master.h"
 #include "scheduler/continuous_scheduler.h"
@@ -108,26 +107,6 @@ class LLMMaster : public Master {
   bool is_scheduler_paused() const;
 
  private:
-  std::shared_ptr<Request> generate_request(
-      std::string prompt,
-      std::optional<std::vector<int>> prompt_tokens,
-      const RequestParams& sp,
-      std::optional<Call*> call,
-      OutputCallback callback,
-      std::optional<ChatTemplateGenerationMode> generation_mode = std::nullopt);
-
-  std::shared_ptr<Request> generate_request(
-      const std::vector<Message>& messages,
-      std::optional<std::vector<int>> prompt_tokens,
-      const RequestParams& sp,
-      std::optional<Call*> call,
-      OutputCallback callback);
-
-  std::shared_ptr<const JsonObjectGrammar> get_json_object_grammar(
-      bool reasoning_enabled,
-      std::string* error);
-
- private:
   XServiceClient* xservice_client_ = nullptr;
 
   std::unique_ptr<Scheduler> scheduler_;
@@ -141,12 +120,12 @@ class LLMMaster : public Master {
   // we don't know if tokenizer is thread safe, so we create one for each thread
   // for now
   std::unique_ptr<Tokenizer> tokenizer_;
-  std::mutex json_object_grammar_mutex_;
-  std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;
-  std::shared_ptr<const JsonObjectGrammar> json_reasoning_grammar_;
 
   // chat template instance
   std::unique_ptr<ChatTemplate> chat_template_;
+
+  // builds Request aggregates from prompts/messages + RequestParams
+  std::unique_ptr<LLMRequestFactory> request_factory_;
 
   // thread for moving forward the scheduler
   std::thread loop_thread_;

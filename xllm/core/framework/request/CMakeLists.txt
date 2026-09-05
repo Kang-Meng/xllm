@@ -10,6 +10,7 @@ cc_library(
     incremental_decoder.h
     request_base.h
     request.h
+    llm_request_factory.h
     dit_request.h
     request_output.h
     usage.h
@@ -31,6 +32,7 @@ cc_library(
     incremental_decoder.cpp
     request.cpp
     request_base.cpp
+    llm_request_factory.cpp
     dit_request.cpp
     request_output.cpp
     dit_request_output.cpp
