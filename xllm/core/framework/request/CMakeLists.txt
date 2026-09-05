@@ -11,6 +11,7 @@ cc_library(
     request_base.h
     request.h
     llm_request_factory.h
+    vlm_request_factory.h
     dit_request.h
     request_output.h
     usage.h
@@ -33,6 +34,7 @@ cc_library(
     request.cpp
     request_base.cpp
     llm_request_factory.cpp
+    vlm_request_factory.cpp
     dit_request.cpp
     request_output.cpp
     dit_request_output.cpp

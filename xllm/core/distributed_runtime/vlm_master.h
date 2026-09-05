@@ -32,14 +32,13 @@ limitations under the License.
 #include "framework/chat_template/jinja_chat_template.h"
 #include "framework/request/request_output.h"
 #include "framework/request/request_params.h"
+#include "framework/request/vlm_request_factory.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "master.h"
 #include "scheduler/continuous_scheduler.h"
 #include "xllm/processors/multimodal_processor.h"
 
 namespace xllm {
-
-struct MMData;
 
 class VLMMaster : public Master {
  public:
@@ -86,33 +85,23 @@ class VLMMaster : public Master {
 
  private:
   using Task = folly::Function<void()>;
-  std::shared_ptr<Request> build_request(std::string prompt,
-                                         std::vector<int32_t> prompt_tokens,
-                                         MMData mm_data,
-                                         RequestParams sp,
-                                         OutputCallback callback);
-
-  std::shared_ptr<Request> generate_request(std::string prompt,
-                                            MMData mm_data,
-                                            RequestParams sp,
-                                            OutputCallback callback);
-
-  std::shared_ptr<Request> generate_request(std::vector<Message> messages,
-                                            RequestParams sp,
-                                            std::string payload,
-                                            OutputCallback callback);
 
   std::unique_ptr<Scheduler> scheduler_;
 
   // model args
   ModelArgs model_args_;
 
-  // thread pool for handling requests
+  // thread pool for handling requests. Its worker lambdas dereference
+  // request_factory_ and scheduler_, so the pool is explicitly reset
+  // (drained/joined) in ~VLMMaster before those members are destroyed.
   std::unique_ptr<ThreadPool> threadpool_;
 
   std::unique_ptr<JinjaChatTemplate> chat_template_;
   std::unique_ptr<MultimodalProcessorBase> processor_;
   std::shared_ptr<Tokenizer> tokenizer_;
+
+  // builds Request aggregates from prompts/messages + multimodal data
+  std::unique_ptr<VLMRequestFactory> request_factory_;
 
   // thread for moving forward the scheduler
   std::thread loop_thread_;
