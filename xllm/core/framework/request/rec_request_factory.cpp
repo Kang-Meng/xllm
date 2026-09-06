@@ -592,21 +592,9 @@ std::shared_ptr<Request> RecRequestFactory::build_request_common(
   }
   const size_t best_of = sp.best_of.value_or(sp.n);
 
-  RequestSamplingParam sampling_param;
-  sampling_param.frequency_penalty = sp.frequency_penalty;
-  sampling_param.presence_penalty = sp.presence_penalty;
-  sampling_param.repetition_penalty = sp.repetition_penalty;
-  sampling_param.temperature = sp.temperature;
-  sampling_param.top_p = sp.top_p;
-  sampling_param.top_k = sp.top_k;
-  sampling_param.logprobs = sp.logprobs;
-  sampling_param.top_logprobs = sp.top_logprobs;
-  sampling_param.is_embeddings = sp.is_embeddings;
+  RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
   sampling_param.beam_width = sp.beam_width;
   sampling_param.num_return_sequences = sp.num_return_sequences;
-  if (best_of > sp.n) {
-    sampling_param.logprobs = true;
-  }
 
   bool stream = sp.streaming;
   if (best_of != sp.n) {

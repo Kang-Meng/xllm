@@ -43,6 +43,13 @@ enum class ResponseFormatType : int8_t {
   JSON_OBJECT = 1,
 };
 
+// Defined in core/framework/sampling/sampling_params.h and
+// core/framework/request/request_state.h respectively. Forward-declared here so
+// the projection helpers below don't drag those (torch-heavy) headers into
+// every translation unit that only needs RequestParams.
+struct RequestSamplingParam;
+struct SchedulerParam;
+
 struct RequestParams {
   RequestParams() = default;
   RequestParams(const proto::CompletionRequest& request,
@@ -74,6 +81,21 @@ struct RequestParams {
   }
 
   bool verify_params(OutputCallback callback) const;
+
+  // Projects the shared sampling-related fields into a RequestSamplingParam.
+  // `best_of` is the effective best_of (== best_of.value_or(n)); when it
+  // exceeds `n`, logprobs are forced on so a per-sequence logprob can be
+  // produced. Model-specific fields/rules are intentionally left out and
+  // layered on by the individual request factories: json_object (LLM), and the
+  // beam-search fields beam_width/num_return_sequences plus their logprob
+  // normalization, which differ per model (LLM normalizes, REC copies both, VLM
+  // omits them).
+  RequestSamplingParam to_sampling_param(size_t best_of) const;
+
+  // Projects the scheduler-related fields into a SchedulerParam. SLO/priority
+  // weights are only meaningful for online requests, so they are left at their
+  // defaults when `offline` is set.
+  SchedulerParam to_scheduler_param() const;
 
   // request id
   std::string request_id;

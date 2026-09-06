@@ -118,7 +118,7 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   const size_t capacity = prompt_tokens.size() + max_tokens + 1;
   const size_t best_of = sp.best_of.value_or(sp.n);
 
-  RequestSamplingParam sampling_param = build_sampling_param(sp, best_of);
+  RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
 
   std::optional<StoppingChecker> stopping_checker =
       build_stopping_checker(sp, max_tokens, max_context_len, callback);
@@ -158,27 +158,6 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
                                    sp.service_request_id,
                                    sp.source_xservice_addr,
                                    rate_limiter_);
-}
-
-RequestSamplingParam VLMRequestFactory::build_sampling_param(
-    const RequestParams& sp,
-    size_t best_of) const {
-  RequestSamplingParam sampling_param;
-  sampling_param.frequency_penalty = sp.frequency_penalty;
-  sampling_param.presence_penalty = sp.presence_penalty;
-  sampling_param.repetition_penalty = sp.repetition_penalty;
-  sampling_param.temperature = sp.temperature;
-  sampling_param.top_p = sp.top_p;
-  sampling_param.top_k = sp.top_k;
-  sampling_param.logprobs = sp.logprobs;
-  sampling_param.top_logprobs = sp.top_logprobs;
-  sampling_param.is_embeddings = sp.is_embeddings;
-  if (best_of > sp.n) {
-    // enable logprobs for best_of to generate sequence logprob
-    sampling_param.logprobs = true;
-  }
-  // sampling_param.do_sample = sp.do_sample;
-  return sampling_param;
 }
 
 std::optional<StoppingChecker> VLMRequestFactory::build_stopping_checker(

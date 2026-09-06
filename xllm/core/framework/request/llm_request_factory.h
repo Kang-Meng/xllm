@@ -96,8 +96,6 @@ class LLMRequestFactory final {
   RequestSamplingParam build_sampling_param(const RequestParams& sp,
                                             size_t best_of) const;
 
-  SchedulerParam build_scheduler_param(const RequestParams& sp) const;
-
   // Builds the stopping checker, encoding any stop sequences. Returns
   // std::nullopt after firing an error callback when a stop sequence fails to
   // encode.

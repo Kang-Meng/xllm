@@ -166,24 +166,13 @@ std::optional<std::vector<int>> LLMRequestFactory::encode_and_validate_prompt(
 RequestSamplingParam LLMRequestFactory::build_sampling_param(
     const RequestParams& sp,
     size_t best_of) const {
-  RequestSamplingParam sampling_param;
-  sampling_param.frequency_penalty = sp.frequency_penalty;
-  sampling_param.presence_penalty = sp.presence_penalty;
-  sampling_param.repetition_penalty = sp.repetition_penalty;
-  sampling_param.temperature = sp.temperature;
-  sampling_param.top_p = sp.top_p;
-  sampling_param.top_k = sp.top_k;
-  sampling_param.logprobs = sp.logprobs;
-  sampling_param.top_logprobs = sp.top_logprobs;
-  sampling_param.is_embeddings = sp.is_embeddings;
+  // Shared field mapping (and the best_of > n logprobs rule) lives on
+  // RequestParams; layer the LLM-specific rules on top.
+  RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
   sampling_param.json_object =
       ServiceConfig::get_instance().enable_json_object_output() &&
       sp.response_format == ResponseFormatType::JSON_OBJECT;
   sampling_param.beam_width = sp.beam_width;
-  if (best_of > sp.n) {
-    // enable logprobs for best_of to generate sequence logprob
-    sampling_param.logprobs = true;
-  }
   if (sampling_param.beam_width > 1) {
     // beam search requires logprobs, and needs at least one top_logprob
     // candidate for beam expansion.
@@ -195,23 +184,6 @@ RequestSamplingParam LLMRequestFactory::build_sampling_param(
   }
   // sampling_param.do_sample = sp.do_sample;
   return sampling_param;
-}
-
-SchedulerParam LLMRequestFactory::build_scheduler_param(
-    const RequestParams& sp) const {
-  SchedulerParam scheduler_param;
-  scheduler_param.offline = sp.offline;
-  scheduler_param.priority = sp.priority;
-  if (!sp.offline) {
-    scheduler_param.ttft_slo_ms = sp.ttft_slo_ms;
-    scheduler_param.tpot_slo_ms = sp.tpot_slo_ms;
-    scheduler_param.ttlt_slo_ms = sp.ttlt_slo_ms;
-    scheduler_param.tpot_priority_weight = sp.tpot_priority_weight;
-    scheduler_param.ttft_priority_weight = sp.ttft_priority_weight;
-    scheduler_param.ttlt_priority_weight = sp.ttlt_priority_weight;
-    scheduler_param.priority_weight = sp.priority_weight;
-  }
-  return scheduler_param;
 }
 
 std::optional<StoppingChecker> LLMRequestFactory::build_stopping_checker(
@@ -356,7 +328,7 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   const size_t best_of = sp.best_of.value_or(sp.n);
   RequestSamplingParam sampling_param = build_sampling_param(sp, best_of);
   const bool json_object = sampling_param.json_object;
-  SchedulerParam scheduler_param = build_scheduler_param(sp);
+  SchedulerParam scheduler_param = sp.to_scheduler_param();
 
   std::optional<StoppingChecker> stopping_checker = build_stopping_checker(
       sp, effective_max_tokens, max_context_len, callback);

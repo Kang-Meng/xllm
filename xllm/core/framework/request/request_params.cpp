@@ -24,6 +24,9 @@ limitations under the License.
 #include "core/framework/config/service_config.h"
 #include "core/util/uuid.h"
 #include "request.h"
+// Pulls in RequestSamplingParam and SchedulerParam definitions for the
+// projection helpers below.
+#include "request_state.h"
 
 namespace xllm {
 namespace {
@@ -695,6 +698,44 @@ bool RequestParams::verify_params(OutputCallback callback) const {
     return false;
   }
   return true;
+}
+
+RequestSamplingParam RequestParams::to_sampling_param(size_t best_of) const {
+  RequestSamplingParam sampling_param;
+  sampling_param.frequency_penalty = frequency_penalty;
+  sampling_param.presence_penalty = presence_penalty;
+  sampling_param.repetition_penalty = repetition_penalty;
+  sampling_param.temperature = temperature;
+  sampling_param.top_p = top_p;
+  sampling_param.top_k = top_k;
+  sampling_param.logprobs = logprobs;
+  sampling_param.top_logprobs = top_logprobs;
+  sampling_param.is_embeddings = is_embeddings;
+  if (best_of > n) {
+    // enable logprobs for best_of to generate sequence logprob
+    sampling_param.logprobs = true;
+  }
+  // Beam-search fields (beam_width / num_return_sequences) are intentionally
+  // NOT mapped here: they are model-specific. LLM copies beam_width and then
+  // normalizes logprobs/top_logprobs for beam expansion, REC copies both
+  // fields, and VLM omits them entirely. Each factory layers them on as needed.
+  return sampling_param;
+}
+
+SchedulerParam RequestParams::to_scheduler_param() const {
+  SchedulerParam scheduler_param;
+  scheduler_param.offline = offline;
+  scheduler_param.priority = priority;
+  if (!offline) {
+    scheduler_param.ttft_slo_ms = ttft_slo_ms;
+    scheduler_param.tpot_slo_ms = tpot_slo_ms;
+    scheduler_param.ttlt_slo_ms = ttlt_slo_ms;
+    scheduler_param.tpot_priority_weight = tpot_priority_weight;
+    scheduler_param.ttft_priority_weight = ttft_priority_weight;
+    scheduler_param.ttlt_priority_weight = ttlt_priority_weight;
+    scheduler_param.priority_weight = priority_weight;
+  }
+  return scheduler_param;
 }
 
 }  // namespace xllm
