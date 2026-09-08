@@ -736,23 +736,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
         values: torch.Tensor,
         scales: torch.Tensor | None,
     ) -> None:
-        valid_rows = torch.nonzero(slot_mapping >= 0, as_tuple=False).flatten()
-        if valid_rows.numel() == 0:
-            return
         cache_view = index_cache.view(-1, index_cache.size(-1))
-        scatter_indices = slot_mapping.index_select(0, valid_rows).reshape(-1, 1)
+        scatter_indices = slot_mapping.reshape(-1, 1).clamp_min(0)
         kernels.scatter_nd_update(
             cache_view,
             scatter_indices,
-            values.index_select(0, valid_rows),
+            values,
         )
         if index_cache_scale is not None and scales is not None:
             scale_view = index_cache_scale.view(-1, index_cache_scale.size(-1))
-            kernels.scatter_nd_update(
-                scale_view,
-                scatter_indices,
-                scales.index_select(0, valid_rows),
-            )
+            kernels.scatter_nd_update(scale_view, scatter_indices, scales)
 
     def _materialize_cp_cache(
         self,
