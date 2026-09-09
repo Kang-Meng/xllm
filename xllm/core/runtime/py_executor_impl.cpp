@@ -16,6 +16,7 @@ limitations under the License.
 #include "core/runtime/py_executor_impl.h"
 
 #include <glog/logging.h>
+#include <pybind11/embed.h>
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
 
@@ -26,6 +27,8 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/kv_cache/kv_shard_layout.h"
+#include "core/framework/multimodal/mm_batch_data.h"
+#include "core/framework/multimodal/mm_data.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/kv_shard_batch_metadata.h"
@@ -45,6 +48,63 @@ namespace xllm {
 namespace {
 
 thread_local PyCausalLM* active_py_causal_lm = nullptr;
+
+// Slice per-modality embedding blocks to the in-chunk subrange recorded on each
+// scheduled multimodal item's schedule_data. Mirrors the C++ VLM path's
+// EncoderEmbeddingGatherVisitor so chunked prefill — where a chunk boundary
+// can land inside an item's token span — scatters only the features whose
+// placeholders are actually in `tokens`. `token_pos().length` equals the
+// item's feature count (1 token : 1 post-merge feature), and start_pos/end_pos
+// are the in-chunk subrange of that span, so the slice aligns features to the
+// placeholders present in this chunk. When the whole item is in the chunk
+// (start_pos=0, end_pos=length) the block is returned unchanged, so the
+// non-chunked case is a no-op.
+torch::Tensor slice_chunk_embeds(const MMBatchData& mm_data,
+                               const torch::Tensor& embeds,
+                               MMType modality) {
+  if (!embeds.defined() || embeds.dim() == 0 || embeds.size(0) == 0) {
+    return embeds;
+  }
+  std::vector<torch::Tensor> slices;
+  int64_t off = 0;
+  for (const auto& data : mm_data.mm_data_vec()) {
+    if (!data.hold<MMItemVec>()) {
+      continue;
+    }
+    for (const auto& item : data.items<MMItemVec>()) {
+      if (item.type() != modality || item.is_embedded()) {
+        continue;
+      }
+      const auto& state = item.state();
+      const int32_t len = state.token_pos().length;
+      if (len <= 0) {
+        continue;
+      }
+      int32_t start_pos = state.schedule_data().start_pos;
+      int32_t end_pos = state.schedule_data().end_pos;
+      const auto& mask = state.mm_token_mask();
+      if (mask.defined() && mask.numel() > 0) {
+        auto mask_cpu = mask.to(torch::kCPU);
+        start_pos = mask_cpu.slice(0, 0, start_pos).sum().item<int32_t>();
+        end_pos = mask_cpu.slice(0, 0, end_pos).sum().item<int32_t>();
+      }
+      if (end_pos > start_pos) {
+        slices.push_back(embeds.slice(0, off + start_pos, off + end_pos));
+      }
+      // Advance by the item's actual encoder-output row count
+      // (mm_token_num = mask.sum()), not the full token_pos span: video
+      // spans include non-mm frame markers/timestamps, so token_pos.length
+      // > mm_token_num and `off += len` would push later items' slices past
+      // their real embeds offset. Matches EncoderEmbeddingGatherVisitor.
+      off += state.mm_token_num();
+    }
+  }
+  torch::Tensor out;
+  if (slices.empty() || !safe_concat(slices, out)) {
+    return embeds;
+  }
+  return out;
+}
 
 void register_xllm_runtime_module(py::module_& m) {
   register_attention_metadata_views(m);
@@ -86,22 +146,9 @@ void register_xllm_runtime_module(py::module_& m) {
 #endif
 }
 
-void ensure_xllm_runtime_module() {
-  py::module_ sys = py::module_::import("sys");
-  py::dict modules = py::reinterpret_borrow<py::dict>(sys.attr("modules"));
-  const py::str module_name("xllm_runtime");
-  if (modules.contains(module_name)) {
-    return;
-  }
-
-  py::object module_object =
-      py::module_::import("types").attr("ModuleType")(module_name);
-  py::module_ module = py::reinterpret_borrow<py::module_>(module_object);
-  register_xllm_runtime_module(module);
-  modules[module_name] = module;
-}
-
 }  // namespace
+
+PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) { register_xllm_runtime_module(m); }
 
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                const ModelArgs& args,
@@ -115,7 +162,7 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   CHECK(py_causal_lm_ != nullptr) << "PyExecutorImpl requires PyCausalLM";
 
   py::gil_scoped_acquire gil;
-  ensure_xllm_runtime_module();
+  py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
   py_executor_ = executor_module.attr("ModelExecutor")(
@@ -239,15 +286,23 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
 
     if (pixel_values.defined() || pixel_values_videos.defined()) {
       py::object top_model = py_causal_lm_->python_model();
-      // encode() moves the tensors onto device internally.
+      // encode() moves the tensors onto device internally. Slice each block to
+      // the chunk's in-chunk subrange (see slice_chunk_embeds) so chunked prefill
+      // does not feed full image/video features into a partial placeholder
+      // span.
       py::object image_embeds = py::none();
       if (pixel_values.defined() && image_grid_thw.defined()) {
-        image_embeds = top_model.attr("encode")(pixel_values, image_grid_thw);
+        torch::Tensor raw =
+            top_model.attr("encode")(pixel_values, image_grid_thw)
+                .cast<torch::Tensor>();
+        image_embeds = py::cast(slice_chunk_embeds(mm_data, raw, MMType::IMAGE));
       }
       py::object video_embeds = py::none();
       if (pixel_values_videos.defined() && video_grid_thw.defined()) {
-        video_embeds =
-            top_model.attr("encode")(pixel_values_videos, video_grid_thw);
+        torch::Tensor raw =
+            top_model.attr("encode")(pixel_values_videos, video_grid_thw)
+                .cast<torch::Tensor>();
+        video_embeds = py::cast(slice_chunk_embeds(mm_data, raw, MMType::VIDEO));
       }
       // Sets top_model.model._inputs_embeds + deepstack_input_embeds.
       top_model.attr("get_input_embeddings")(
