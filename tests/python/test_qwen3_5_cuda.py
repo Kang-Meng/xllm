@@ -66,7 +66,7 @@ from xllm.python.layers.cuda.qwen3_5.moe import (  # noqa: E402
 )
 from xllm.python.layers.fused_moe import FusedMoE  # noqa: E402
 from xllm.python.layers.gated_mlp import GatedMLP  # noqa: E402
-from xllm.python.layers.qwen3_5_decoder_layer import (  # noqa: E402
+from xllm.python.layers.qwen3_5.decoder_layer import (  # noqa: E402
     get_qwen3_5_decoder_layer_class,
 )
 from xllm.python.model_executor.forward_context import forward_context  # noqa: E402
