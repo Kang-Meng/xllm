@@ -24,6 +24,8 @@ limitations under the License.
 #include <cstring>
 #include <limits>
 
+#include "core/util/binary_payload.h"
+
 namespace xllm {
 namespace util {
 
@@ -419,8 +421,12 @@ bool set_data_to_contents(proto::TensorContents* contents,
 }
 }  // namespace
 
-torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
-                             const std::string& binary_payload) {
+namespace {
+
+template <typename CopyFn>
+torch::Tensor binary_proto_to_torch(const proto::Tensor& proto_tensor,
+                                    size_t payload_size,
+                                    CopyFn copy_fn) {
   const auto& parameters = proto_tensor.parameters();
   auto binary_it = parameters.find("is_binary");
   const bool is_binary = binary_it != parameters.end() &&
@@ -447,8 +453,8 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
   }
   const size_t payload_offset = static_cast<size_t>(offset);
   const size_t payload_length = static_cast<size_t>(length);
-  if (payload_offset > binary_payload.size() ||
-      payload_length > binary_payload.size() - payload_offset) {
+  if (payload_offset > payload_size ||
+      payload_length > payload_size - payload_offset) {
     LOG(ERROR) << "Binary Tensor range exceeds request payload";
     return torch::Tensor();
   }
@@ -496,10 +502,34 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
 
   torch::Tensor tensor =
       torch::empty(shape, torch::TensorOptions().dtype(dtype));
-  std::memcpy(tensor.data_ptr(),
-              binary_payload.data() + payload_offset,
-              payload_length);
+  if (!copy_fn(payload_offset, payload_length, tensor.data_ptr())) {
+    LOG(ERROR) << "Failed to copy binary Tensor payload";
+    return torch::Tensor();
+  }
   return tensor;
+}
+
+}  // namespace
+
+torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
+                             const std::string& binary_payload) {
+  return binary_proto_to_torch(
+      proto_tensor,
+      binary_payload.size(),
+      [&binary_payload](size_t offset, size_t length, void* target) {
+        std::memcpy(target, binary_payload.data() + offset, length);
+        return true;
+      });
+}
+
+torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
+                             const BinaryPayload& binary_payload) {
+  return binary_proto_to_torch(
+      proto_tensor,
+      binary_payload.size(),
+      [&binary_payload](size_t offset, size_t length, void* target) {
+        return binary_payload.copy_to(offset, length, target);
+      });
 }
 
 torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
