@@ -367,12 +367,13 @@ def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> Non
     attention.kv_a_layernorm = nn.Identity()
     attention.o_proj = nn.Identity()
     attention.indexer = None
+    attention.layer_id = 0
     attention.num_heads_local = 1
     attention.qk_nope_head_dim = 1
     attention.qk_rope_head_dim = 1
     attention.kv_lora_rank = 1
     attention.v_head_dim = 2
-    attention.cfg = SimpleNamespace(tp_size=2)
+    attention.cfg = SimpleNamespace(tp_size=2, layerwise_split_size=1, layerwise_split_rank=0)
     attention.W_UK = torch.ones(1, 1, 1)
     attention.W_UV = torch.ones(1, 1, 2)
 
@@ -396,7 +397,7 @@ def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> Non
         patch.object(
             glm5_2,
             "get_forward_context",
-            return_value=SimpleNamespace(attention_backend=backend),
+            return_value=SimpleNamespace(attention_backend=backend, cp_context=None),
         ),
         patch.object(
             glm5_2,
