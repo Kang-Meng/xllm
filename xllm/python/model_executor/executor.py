@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -126,6 +128,15 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        # Diagnostic (XLLM_ACL_GRAPH_LAZY_CAPTURE=1): hold the decode graph
+        # runner back until the engine starts serving real requests (the C++
+        # graph warmup's synthetic decode steps then fall back to eager), so
+        # the first REAL decode lazily captures its bucket with real metadata
+        # — its capture-warmup forwards are then dumpable/comparable. The
+        # warmup runs exactly one prefill before its decode steps, so the
+        # second prefill marks the first real request.
+        self._lazy_graph_capture = os.environ.get("XLLM_ACL_GRAPH_LAZY_CAPTURE") == "1"
+        self._prefill_count = 0
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
         if not attention_layers:
@@ -213,27 +224,26 @@ class ModelExecutor:
                 DecodeAclGraphRunner,
             )
 
-            num_decoding_tokens = max(1, int(num_decoding_tokens))
-            decode_batch_size_limit = (
-                None if acl_graph_decode_batch_size_limit is None else max(1, int(acl_graph_decode_batch_size_limit))
-            )
-            graph_sequence_capacity = max_seqs_per_batch
-            if decode_batch_size_limit is not None:
-                graph_sequence_capacity = min(
-                    graph_sequence_capacity,
-                    decode_batch_size_limit,
-                )
-            max_graph_tokens = graph_sequence_capacity * num_decoding_tokens
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
                 device,
-                max_graph_tokens,
+                max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
                 dp_size,
                 dp_rank,
-                decode_batch_size_limit,
-                num_decoding_tokens,
+                acl_graph_decode_batch_size_limit,
+                # MTP spec-verify packs (num_speculative_tokens+1) token rows
+                # per logical sequence; the runner sizes its static paging
+                # buffer in token rows, so pass the row multiplier so capacity
+                # matches the captured expanded-verify graph (item 二). Take
+                # the max of the explicit ctor param and the config-derived
+                # width so a caller that passes num_decoding_tokens still wins
+                # (single source of truth, no param/config divergence).
+                num_decoding_tokens=max(
+                    int(num_decoding_tokens),
+                    int(config.get("num_speculative_tokens", 0)) + 1,
+                ),
             )
         else:
             if self.layerwise_split_size > 1:
@@ -280,6 +290,9 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         self._kv_bound = True
 
+    def _lazy_capture_blocked(self) -> bool:
+        return self._lazy_graph_capture and self._prefill_count < 2
+
     @torch.inference_mode()
     def execute(
         self,
@@ -294,8 +307,14 @@ class ModelExecutor:
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
+        if metadata.is_prefill or metadata.is_chunked_prefill:
+            self._prefill_count += 1
         graph_runner = self.decode_graph_runner
-        if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding):
+        if (
+            graph_runner is not None
+            and not self._lazy_capture_blocked()
+            and graph_runner.can_execute(input_ids, metadata, input_embedding)
+        ):
             graph_runner.warmup(
                 input_ids,
                 positions,

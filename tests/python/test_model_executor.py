@@ -442,16 +442,20 @@ class TestModelExecutorConstruction:
             acl_graph_decode_batch_size_limit=16,
         )
 
+        # PR3 passes max_seqs_per_batch (sequences) directly as the runner's
+        # max_batch capacity; the decode_batch_size_limit is enforced at
+        # runtime by can_execute (bucket > limit falls back to eager), not by
+        # folding it into max_batch at construction.
         mock_graph_runner.assert_called_once_with(
             model.model,
             mock_create.return_value,
             torch.device("cpu"),
-            64,
+            256,
             128,
             1,
             0,
             16,
-            4,
+            num_decoding_tokens=4,
         )
 
 
@@ -607,6 +611,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
     def test_decode_metadata_rebuilds_token_row_paging_metadata(self) -> None:
         metadata = self._metadata()
         metadata.expanded_decode_metadata = None
+        metadata.is_chunked_prefill = False
         metadata.slot_mapping = torch.arange(4, dtype=torch.int32)
         metadata.block_table = torch.tensor(
             [[10, 11], [10, 11], [20, 21], [20, 21]],
@@ -614,6 +619,12 @@ class TestDecodeAclGraphSpeculativeMetadata:
         )
         metadata.kv_seq_lens = torch.tensor([3, 4, 7, 8], dtype=torch.int32)
         metadata.kv_seq_lens_host_values = [3, 4, 7, 8]
+        # Mark this as a GENERIC (untyped) MTP verify batch: 4 token rows back
+        # 2 logical sequences (width=2). _is_untyped_spec_verify then admits
+        # it and _expanded_verify_view synthesizes the token-row expanded
+        # view, rebuilding the per-seq paging metadata per row.
+        metadata.linear_state_indices = torch.arange(2, dtype=torch.int32)
+        metadata.q_cu_seq_lens = None
         metadata.paged_kv_indptr = torch.tensor([0, 1, 3], dtype=torch.int32)
         metadata.paged_kv_indices = torch.tensor([10, 20, 21], dtype=torch.int32)
         metadata.paged_kv_last_page_len = torch.tensor([4, 4], dtype=torch.int32)
@@ -637,26 +648,48 @@ class TestDecodeAclGraphSpeculativeMetadata:
 
         assert runner.can_execute(input_ids, self._metadata())
 
-    def test_decode_batch_limit_uses_speculative_tokens_and_dp_global_max(
-        self,
-    ) -> None:
+    def test_decode_batch_limit_gates_dp_global_token_bucket(self) -> None:
+        # PR3 folded the decode-batch-limit check into can_execute's DP branch
+        # (runtime gate on the GLOBAL token bucket), removing the standalone
+        # _decode_batch_sizes helper. A DP step whose global-max token bucket
+        # exceeds decode_batch_size_limit falls back to eager; one within the
+        # limit is admitted.
         runner = DecodeAclGraphRunner(
             nn.Identity(),
             _PagedStubAttentionBackend(),
             torch.device("cpu"),
             max_batch=64,
             max_model_len=8,
+            dp_size=2,
+            dp_rank=0,
             decode_batch_size_limit=16,
             num_decoding_tokens=4,
         )
-        metadata = SimpleNamespace(
-            dp_execution_token_counts=(32, 64),
-        )
-
-        assert runner._decode_batch_sizes(
-            torch.zeros(32, dtype=torch.int32),
-            metadata,
-        ) == (8, 16)
+        with patch.object(
+            runner,
+            "_has_compatible_decode_metadata",
+            return_value=True,
+        ):
+            admitted = runner.can_execute(
+                torch.zeros(8, dtype=torch.int32),
+                SimpleNamespace(
+                    is_prefill=False,
+                    is_chunked_prefill=False,
+                    dp_execution_token_counts=(8, 8),
+                    dp_is_decode=(1, 1),
+                ),
+            )
+            assert admitted
+            rejected = runner.can_execute(
+                torch.zeros(8, dtype=torch.int32),
+                SimpleNamespace(
+                    is_prefill=False,
+                    is_chunked_prefill=False,
+                    dp_execution_token_counts=(8, 64),
+                    dp_is_decode=(1, 1),
+                ),
+            )
+            assert not rejected
 
     def test_mtp3_batch_eight_uses_32_row_graph_bucket(self) -> None:
         runner = DecodeAclGraphRunner(
@@ -668,10 +701,16 @@ class TestDecodeAclGraphSpeculativeMetadata:
             decode_batch_size_limit=16,
             num_decoding_tokens=4,
         )
+        # 8 logical sequences x 4 verify rows (mtp3) = 32 token rows. The
+        # graph admits on the SEQUENCE count (8, bucket 8 <= limit 16) while
+        # capturing/replaying at the full 32-row token bucket.
         metadata = SimpleNamespace(
             is_prefill=False,
             is_chunked_prefill=False,
-            dp_execution_token_counts=(),
+            kv_seq_lens=torch.full((32,), 8, dtype=torch.int32),
+            block_table=torch.zeros((32, 2), dtype=torch.int32),
+            linear_state_indices=torch.arange(8, dtype=torch.int32),
+            q_cu_seq_lens=None,
         )
 
         with patch.object(
@@ -684,29 +723,20 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 metadata,
             )
 
-    def test_warmup_captures_with_scheduler_metadata_once(self) -> None:
+    def test_warmup_validates_capacity_without_capturing(self) -> None:
+        # PR3 made warmup a capacity-validation no-op: graph capture is
+        # deferred to execute's first decode of each (bucket, expanded,
+        # embedding) key, so warmup must not allocate/capture on its own.
         runner = self._runner()
         input_ids = torch.arange(4, dtype=torch.int32)
         positions = torch.arange(4, dtype=torch.int32)
         metadata = self._metadata()
-        graph_key = runner._graph_key(
-            padded_batch_size=4,
-            is_expanded=True,
-            input_embedding=None,
-        )
 
-        with patch.object(runner, "_prepare_graph_entry") as prepare:
+        with patch.object(runner, "_allocate_entry") as allocate:
             runner.warmup(input_ids, positions, metadata)
-            prepare.assert_called_once_with(
-                input_ids,
-                positions,
-                metadata,
-                None,
-            )
-
-            runner._graphs[graph_key] = object()
+            allocate.assert_not_called()
             runner.warmup(input_ids, positions, metadata)
-            prepare.assert_called_once()
+            allocate.assert_not_called()
 
     @pytest.mark.parametrize(
         ("field", "value", "message"),
@@ -810,7 +840,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
             (
                 torch.arange(3, dtype=torch.int32),
                 torch.arange(4, dtype=torch.int32),
-                "input_ids must contain one token per metadata row",
+                "input_ids must contain one token per sequence",
             ),
             (
                 torch.arange(4, dtype=torch.int32),
@@ -830,7 +860,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 input_ids,
                 torch.arange(4, dtype=torch.int32),
                 slot_mapping,
-                metadata_row_count=4,
+                sequence_count=4,
             )
 
     def test_replay_returns_static_output_view(self) -> None:
@@ -868,11 +898,8 @@ class TestDecodeAclGraphSpeculativeMetadata:
 
         with (
             patch.object(torch, "npu", fake_npu, create=True),
-            patch.object(
-                runner,
-                "_prepare_graph_entry",
-                return_value=entry,
-            ),
+            patch.object(runner, "_fill_entry"),
+            patch.object(runner, "_update_graph_tasks"),
         ):
             output = runner.execute(
                 torch.arange(batch_size, dtype=torch.int32),
@@ -1195,6 +1222,8 @@ class TestExecuteRouting:
         executor.bind_kv_caches([kv])
 
         metadata = MagicMock(spec=AttentionMetadata)
+        metadata.is_prefill = False
+        metadata.is_chunked_prefill = False
         executor.eager_runner = MagicMock()
         grad_enabled = None
 
@@ -1225,6 +1254,8 @@ class TestExecuteRouting:
         executor.inductor_runner.execute.return_value = torch.ones(3)
 
         metadata = MagicMock(spec=AttentionMetadata)
+        metadata.is_prefill = False
+        metadata.is_chunked_prefill = False
         result = executor.execute(torch.zeros(1), torch.zeros(1), metadata)
         executor.inductor_runner.execute.assert_called_once()
         assert torch.equal(result, torch.ones(3))
@@ -1243,6 +1274,8 @@ class TestExecuteRouting:
         input_ids = torch.zeros(4, dtype=torch.int32)
         positions = torch.arange(4, dtype=torch.int32)
         metadata = MagicMock(spec=AttentionMetadata)
+        metadata.is_prefill = False
+        metadata.is_chunked_prefill = False
         graph_runner = MagicMock()
         graph_runner.can_execute.return_value = True
         graph_runner.execute.return_value = torch.ones(4)

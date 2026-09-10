@@ -351,7 +351,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
             real_batch = metadata.block_table.shape[0]
 
-            kv_host = metadata.kv_seq_lens_host
+            kv_host = getattr(metadata, "kv_seq_lens_host", None)
             if kv_host is not None:
                 kv_host = kv_host.cpu()
                 if kv_host.numel() == real_batch + 1:
@@ -988,7 +988,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if kv_seq_lens is not None:
             kv_lens = kv_seq_lens[:num_seqs].to(torch.int64)
         else:
-            kv_host = metadata.kv_seq_lens_host
+            kv_host = getattr(metadata, "kv_seq_lens_host", None)
             if kv_host is not None:
                 kl = kv_host.cpu()
                 if kl.numel() == num_seqs + 1:
