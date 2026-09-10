@@ -108,8 +108,6 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       engine_(engine),
       request_queue_(::xllm::RecConfig::get_instance().request_queue_size()) {
   CHECK(engine_ != nullptr);
-  prefetch_admission_limit_ = static_cast<size_t>(
-      ::xllm::RecConfig::get_instance().request_queue_size());
 
   kv_cache_manager_ = engine_->block_manager_pool();
   CHECK(kv_cache_manager_ != nullptr);
@@ -182,100 +180,46 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   }
 }
 
-ContinuousScheduler::~ContinuousScheduler() { running_requests_.clear(); }
+ContinuousScheduler::~ContinuousScheduler() {
+  CHECK_EQ(prefetching_requests_.load(std::memory_order_acquire), 0u)
+      << "ContinuousScheduler destroyed with pending prefetch callbacks";
+  running_requests_.clear();
+}
 
 bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
   CHECK(!request->sequences().empty());
 
-  {
-    std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
-    if (request_queue_.size() + prefetch_admission_slots_ >=
-        prefetch_admission_limit_) {
-      return false;
-    }
-    ++prefetch_admission_slots_;
+  const size_t pending_before_reservation =
+      prefetching_requests_.fetch_add(1, std::memory_order_relaxed);
+  const size_t queued_requests =
+      static_cast<size_t>(std::max<ssize_t>(request_queue_.size(), 0));
+  if (queued_requests + pending_before_reservation >=
+      request_queue_.capacity()) {
+    prefetching_requests_.fetch_sub(1, std::memory_order_relaxed);
+    return false;
   }
 
-  kv_cache_manager_->prefetch_from_storage(request);
-  if (kv_cache_manager_->update_prefetch_result(request,
-                                                options_.prefetch_timeout())) {
-    if (request->finished() || request->cancelled()) {
-      release_prefetch_admission_slot();
-      VLOG(1) << "[Mooncake][AdmissionCancelled] request="
-              << request->request_id();
-      return true;
-    }
-    if (!enqueue_ready_request(request)) {
-      std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
-      prefetch_admission_queue_.emplace_back(request);
-      return true;
-    }
-    release_prefetch_admission_slot();
-    return true;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
-    prefetch_admission_queue_.emplace_back(request);
-  }
+  kv_cache_manager_->prefetch_from_storage(
+      request, [this](std::shared_ptr<Request> completed) {
+        const bool cancelled = completed->finished() || completed->cancelled();
+        if (!cancelled) {
+          enqueue_ready_request(completed);
+        }
+        const size_t previous =
+            prefetching_requests_.fetch_sub(1, std::memory_order_relaxed);
+        CHECK_GT(previous, 0u);
+        VLOG(1) << (cancelled ? "[Mooncake][AdmissionCancelled] request="
+                              : "[Mooncake][AdmissionReady] request=")
+                << completed->request_id();
+      });
   VLOG(1) << "[Mooncake][AdmissionPending] request=" << request->request_id();
   return true;
 }
 
-bool ContinuousScheduler::enqueue_ready_request(
+void ContinuousScheduler::enqueue_ready_request(
     std::shared_ptr<Request> request) {
-  return request_queue_.write(std::move(request));
-}
-
-size_t ContinuousScheduler::num_prefetch_pending_requests() const {
-  std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
-  return prefetch_admission_slots_;
-}
-
-void ContinuousScheduler::release_prefetch_admission_slot() {
-  std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
-  CHECK_GT(prefetch_admission_slots_, 0u);
-  --prefetch_admission_slots_;
-}
-
-void ContinuousScheduler::drain_prefetched_requests() {
-  std::deque<std::shared_ptr<Request>> pending;
-  {
-    std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
-    pending.swap(prefetch_admission_queue_);
-  }
-
-  std::deque<std::shared_ptr<Request>> still_pending;
-  for (std::shared_ptr<Request>& request : pending) {
-    if (!kv_cache_manager_->update_prefetch_result(
-            request, options_.prefetch_timeout())) {
-      still_pending.emplace_back(std::move(request));
-      continue;
-    }
-
-    if (request->finished() || request->cancelled()) {
-      release_prefetch_admission_slot();
-      VLOG(1) << "[Mooncake][AdmissionCancelled] request="
-              << request->request_id();
-      continue;
-    }
-
-    if (!enqueue_ready_request(request)) {
-      still_pending.emplace_back(std::move(request));
-      continue;
-    }
-    release_prefetch_admission_slot();
-    VLOG(1) << "[Mooncake][AdmissionReady] request=" << request->request_id();
-  }
-
-  if (!still_pending.empty()) {
-    std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
-    prefetch_admission_queue_.insert(
-        prefetch_admission_queue_.end(),
-        std::make_move_iterator(still_pending.begin()),
-        std::make_move_iterator(still_pending.end()));
-  }
+  request_queue_.blockingWrite(std::move(request));
 }
 
 void ContinuousScheduler::create_queues(const Options& options) {
@@ -336,7 +280,6 @@ void ContinuousScheduler::drain_decode_restore_waiting(
 
 std::vector<Batch> ContinuousScheduler::prepare_batch() {
   Timer timer;
-  drain_prefetched_requests();
   auto state = make_state();
 
   // Common phases (strategy-independent)

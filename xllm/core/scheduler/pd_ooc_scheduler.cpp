@@ -347,7 +347,6 @@ void PDOOCScheduler::prefill_step(const absl::Duration& timeout) {
 
 std::vector<Batch> PDOOCScheduler::prepare_batch() {
   Timer timer;
-  drain_prefetched_requests();
   // propagate new requests to prefill_queue_
   // Include those requests that are preempted by others.
   std::shared_ptr<Request> request;

@@ -179,7 +179,6 @@ void FixedStepsScheduler::handle_prefill_requests(
 
 std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   Timer timer;
-  drain_prefetched_requests();
   // propagate new requests to prefill_queue_
   // Include those requests that are preempted by others.
   auto propagate_request = [this](std::shared_ptr<Request>& request) {

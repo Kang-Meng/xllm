@@ -169,9 +169,6 @@ class ContinuousScheduler : public Scheduler {
     // if the model supports multiple version or there are multiple models.
     PROPERTY(int64_t, server_idx) = 0;
 
-    // Prefetch timeout for prefetch from kv cache store
-    PROPERTY(uint32_t, prefetch_timeout) = 0;
-
     // max concurrency for rec worker
     PROPERTY(int32_t, rec_worker_max_concurrency) = 1;
   };
@@ -201,10 +198,9 @@ class ContinuousScheduler : public Scheduler {
 
   uint32_t get_waiting_requests_num() const override {
     return prefill_queue_->size() + chunk_queue_->size() +
-           decode_restore_waiting_.size() + num_prefetch_pending_requests();
+           decode_restore_waiting_.size() +
+           prefetching_requests_.load(std::memory_order_relaxed);
   }
-
-  size_t num_prefetch_pending_requests() const;
 
   // for test only
   std::vector<Batch> prepare_batch_test() { return prepare_batch(); }
@@ -296,9 +292,7 @@ class ContinuousScheduler : public Scheduler {
 
  protected:
   void clear_mtp_bootstrap(Request* request);
-  void drain_prefetched_requests();
-  void release_prefetch_admission_slot();
-  virtual bool enqueue_ready_request(std::shared_ptr<Request> request);
+  virtual void enqueue_ready_request(std::shared_ptr<Request> request);
 
   static int64_t microseconds_to_milliseconds(int64_t microseconds);
   // i.e. round(latency / num_tokens). num_tokens must be > 0.
@@ -323,12 +317,7 @@ class ContinuousScheduler : public Scheduler {
   // owns the requests and manages their lifetimes.
   folly::MPMCQueue<std::shared_ptr<Request>> request_queue_;
 
-  // Requests waiting for Mooncake prefetch completion. This is an admission
-  // barrier only; SchedulerPolicy never sees these requests.
-  mutable std::mutex prefetch_admission_mutex_;
-  std::deque<std::shared_ptr<Request>> prefetch_admission_queue_;
-  size_t prefetch_admission_slots_ = 0;
-  size_t prefetch_admission_limit_ = 0;
+  std::atomic<size_t> prefetching_requests_{0};
 
   // a batch of requests in running state, sorted by priority from high to low.
   // This may include decoding requests and prefill requests in chunked prefill
