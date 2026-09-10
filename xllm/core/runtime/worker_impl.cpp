@@ -535,8 +535,12 @@ bool WorkerImpl::allocate_kv_cache_storage(
 
   if (enable_kv_cache_quant) {
 #if !defined(USE_MLU)
-    LOG(FATAL) << "KV Cache quantization is only supported on MLU backend. "
-               << "Current backend does not support this feature.";
+    // GLM-5.2 SFA C8 is the only MLA path plumbed for packed int8 KV cache on
+    // non-MLU backends. Anything else on non-MLU still hard-fails.
+    if (!util::supports_mla_kv_cache_quant(args.model_type())) {
+      LOG(FATAL) << util::kNonMluKvCacheQuantRejectMsg << " got \""
+                 << args.model_type() << "\".";
+    }
 #endif
     // Check for unsupported scenarios
     if (options_.backend() == "vlm") {
@@ -1135,15 +1139,16 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
   if (speculative_target_graph_decode) {
     const int32_t max_token_size =
         *std::max_element(token_sizes.begin(), token_sizes.end());
-    graph_token_size = static_cast<int32_t>(runtime::get_decode_graph_token_bucket(
-        max_token_size,
-        ::xllm::ExecutionConfig::get_instance()
-            .enable_graph_mode_decode_no_padding()));
-    use_graph_padding = std::any_of(
-        token_sizes.begin(), token_sizes.end(),
-        [graph_token_size](int32_t token_count) {
-          return token_count != graph_token_size;
-        });
+    graph_token_size =
+        static_cast<int32_t>(runtime::get_decode_graph_token_bucket(
+            max_token_size,
+            ::xllm::ExecutionConfig::get_instance()
+                .enable_graph_mode_decode_no_padding()));
+    use_graph_padding = std::any_of(token_sizes.begin(),
+                                    token_sizes.end(),
+                                    [graph_token_size](int32_t token_count) {
+                                      return token_count != graph_token_size;
+                                    });
   }
   std::vector<int32_t> graph_padded_token_sizes;
   const std::vector<int32_t>* padded_token_sizes = &token_sizes;
