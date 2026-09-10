@@ -91,8 +91,7 @@ def alloc_pool_cache(index_cache: torch.Tensor, index_kpool: int) -> torch.Tenso
     bs = index_cache.shape[1]
     assert index_kpool > 0, "index_kpool must be > 0"
     assert bs % index_kpool == 0, (
-        f"block_size {bs} is not a multiple of index_kpool {index_kpool}, "
-        "pool addressing breaks"
+        f"block_size {bs} is not a multiple of index_kpool {index_kpool}, pool addressing breaks"
     )
     head_dim = (index_cache.shape[-1] - 1) // 2
     return torch.zeros(

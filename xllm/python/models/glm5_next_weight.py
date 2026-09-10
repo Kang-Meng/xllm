@@ -211,5 +211,3 @@ class W8A8WeightLoader:
         self.copy_in(mlp_pfx + "down_proj.weight", self.shard(self.load_tensor(mlp_pfx + "down_proj.weight"), dim=1))
         self.copy_in(mlp_pfx + "down_proj.weight_scale", self.load_tensor(mlp_pfx + "down_proj.weight_scale"))
         self.copy_in(mlp_pfx + "down_proj.weight_offset", self.load_tensor(mlp_pfx + "down_proj.weight_offset"))
-
-
