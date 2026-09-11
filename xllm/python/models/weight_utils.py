@@ -22,15 +22,13 @@ the model-specific per-layer loop stays in each model.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Mapping, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Mapping, Optional, Protocol, Sequence
 
 import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
-
-    from xllm.python.models.base import PyModelBase
 
 
 class MoeParallelConfig(Protocol):
@@ -41,15 +39,6 @@ class MoeParallelConfig(Protocol):
     tp_rank: int
     moe_tp_size: int
     moe_tp_rank: int
-
-
-def kv_replica_shard(n_kv_heads: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
-    """Per-rank ``(kv_world, kv_rank)`` for GQA K/V projections under TP head replication."""
-    if n_kv_heads >= tp_size:
-        return tp_size, tp_rank
-    if tp_size % n_kv_heads:
-        raise ValueError(f"tp_size {tp_size} not divisible by n_kv_heads {n_kv_heads}")
-    return n_kv_heads, tp_rank // (tp_size // n_kv_heads)
 
 
 def mla_head_split(n_heads: int, tp_size: int) -> tuple[int, int]:
@@ -259,59 +248,3 @@ class W8A8WeightLoader(WeightLoader):
             prefix + "down_proj.weight_offset",
             self.load_tensor(prefix + "down_proj.weight_offset"),
         )
-
-
-def load_own_weight(
-    model: PyModelBase,
-    state_dicts: list,
-    tp_rank: int,
-    tp_size: int,
-    weight_name: str,
-    attr: str,
-    make_layer: Callable[[], nn.Module],
-    shard_dim: int,
-) -> WeightLoader:
-    """Load a draft-owned weight when the checkpoint ships one, else leave the
-    attribute None so the C++ bridge shares the target's. Returns a loader the
-    caller can keep loading from."""
-    present = WeightLoader.state_dict_has(state_dicts, weight_name, ("", "model."))
-    if present:
-        setattr(model, attr, make_layer())
-    # Built after the optional setattr so the new param is in its snapshot.
-    loader = WeightLoader(model, state_dicts, tp_size, tp_rank, src_prefixes=("", "model."))
-    if present:
-        loader.copy_shard(weight_name, dim=shard_dim)
-    return loader
-
-
-def maybe_load_own_lm_head(
-    model: PyModelBase,
-    state_dicts: list,
-    tp_rank: int,
-    tp_size: int,
-) -> WeightLoader:
-    """Load the draft's own lm_head when the checkpoint ships one; otherwise
-    leave it None so the C++ bridge shares the target's. Returns a loader the
-    caller can keep loading from."""
-    # Imported lazily so this module stays torch-only at import time (the layers
-    # package needs the C++ runtime bootstrap; load_weights runs after it).
-    from xllm.python.layers import ColumnParallelLinear
-
-    cfg = model.cfg
-    return load_own_weight(
-        model,
-        state_dicts,
-        tp_rank,
-        tp_size,
-        "lm_head.weight",
-        "lm_head",
-        lambda: ColumnParallelLinear(
-            cfg.hidden_size,
-            cfg.vocab_size // tp_size,
-            tp_size,
-            gather_output=True,
-            dtype=model.dtype,
-            device=model.device,
-        ),
-        shard_dim=0,
-    )

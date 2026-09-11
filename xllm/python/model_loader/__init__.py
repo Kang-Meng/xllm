@@ -14,6 +14,10 @@
 
 """Public interfaces for Python model weight loading."""
 
+from .draft_weight_loaders import (
+    load_own_lm_head,
+    load_own_weight,
+)
 from .module_loaders import (
     load_causal_lm_weights,
     load_gqa_fused_attention,
@@ -26,6 +30,7 @@ from .scoped_weight_loader import (
 from .sharding import (
     gqa_head_split,
     gqa_qkv_shards,
+    shard_tensor,
 )
 
 __all__ = [
@@ -36,4 +41,7 @@ __all__ = [
     "gqa_qkv_shards",
     "load_causal_lm_weights",
     "load_gqa_fused_attention",
+    "load_own_lm_head",
+    "load_own_weight",
+    "shard_tensor",
 ]

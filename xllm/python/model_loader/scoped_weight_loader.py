@@ -74,13 +74,6 @@ class ScopedWeightLoader:
     def has(self, local_name: str) -> bool:
         return self._resolve(local_name) is not None
 
-    def first_present(self, local_names: Sequence[str]) -> str | None:
-        """First of ``local_names`` present in the checkpoint, or ``None``."""
-        for name in local_names:
-            if self.has(name):
-                return name
-        return None
-
     def bind_source_root(self, probe: str) -> ScopedWeightLoader:
         """Lock to the single ``src_prefix`` whose scope contains ``probe``.
 

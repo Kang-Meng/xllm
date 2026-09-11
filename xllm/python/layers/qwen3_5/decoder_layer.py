@@ -26,6 +26,8 @@ from xllm.python.layers.qwen3_5.common import (
     PartialRotaryEmbedding,
     Qwen3_5DecoderConfig,
 )
+from xllm.python.layers.qwen3_5.gated_delta_net import Qwen3_5GatedDeltaNetBase
+from xllm.python.layers.qwen3_5.moe import Qwen3_5SparseMoEBlockBase
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
 
 
@@ -38,8 +40,12 @@ class Qwen3_5DecoderLayer(nn.Module):
     """
 
     attention_cls: type[Qwen3_5Attention]
-    gated_delta_net_cls: type[nn.Module]
-    sparse_moe_cls: type[nn.Module]
+    gated_delta_net_cls: type[Qwen3_5GatedDeltaNetBase]
+    sparse_moe_cls: type[Qwen3_5SparseMoEBlockBase]
+
+    self_attn: Qwen3_5Attention
+    linear_attn: Qwen3_5GatedDeltaNetBase
+    mlp: Qwen3_5SparseMoEBlockBase | GatedMLP
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -106,35 +112,35 @@ class Qwen3_5DecoderLayer(nn.Module):
 
     def load_weights(
         self,
-        state: ScopedWeightLoader,
+        weights: ScopedWeightLoader,
         context: ParallelLoadContext,
     ) -> None:
-        state.load_tensor(
+        weights.load_tensor(
             self.input_layernorm.weight,
             "input_layernorm.weight",
         )
-        state.load_tensor(
+        weights.load_tensor(
             self.post_attention_layernorm.weight,
             "post_attention_layernorm.weight",
         )
         if self.layer_type == "full_attention":
             self.self_attn.load_weights(
-                state.with_prefix("self_attn."),
+                weights.with_prefix("self_attn."),
                 context,
             )
         else:
             self.linear_attn.load_weights(
-                state.with_prefix("linear_attn."),
+                weights.with_prefix("linear_attn."),
                 context,
             )
-        self.mlp.load_weights(state.with_prefix("mlp."), context)
+        self.mlp.load_weights(weights.with_prefix("mlp."), context)
 
     def forward(
         self,
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._prepare_forward()
         if residual is None:
             residual = hidden

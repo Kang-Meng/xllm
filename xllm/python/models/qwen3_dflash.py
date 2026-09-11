@@ -26,13 +26,16 @@ import torch.nn.functional as F
 from xllm.python import distributed, kernels
 from xllm.python.layers import HiddenParallelEmbedding, RMSNorm
 from xllm.python.model_executor.forward_context import LayerSynchronizer
-from xllm.python.models.base import PyModelBase
-from xllm.python.models.qwen3 import Qwen3Config, Qwen3Model, load_qwen3_backbone
-from xllm.python.models.weight_utils import (
-    kv_replica_shard,
+from xllm.python.model_loader import (
+    ParallelLoadContext,
+    ScopedWeightLoader,
+    load_causal_lm_weights,
+    load_own_lm_head,
     load_own_weight,
-    maybe_load_own_lm_head,
+    shard_tensor,
 )
+from xllm.python.models.base import PyModelBase
+from xllm.python.models.qwen3 import Qwen3Config, Qwen3Model
 
 
 def _load_reference_quarot_rotation(
@@ -108,15 +111,13 @@ class DFlashContextProjection(nn.Module):
         self.tp_size = tp_size
         self.weight = nn.Parameter(torch.empty(out_features // tp_size, 0, dtype=dtype, device=device))
 
+    def load_weights(self, weights: ScopedWeightLoader, context: ParallelLoadContext) -> None:
+        self.load_weight(weights.get_tensor("fc.weight"), context.tp_rank)
+
     def load_weight(self, weight: torch.Tensor, tp_rank: int) -> None:
         if weight.dim() != 2 or weight.size(0) != self.out_features:
             raise ValueError("DFlash fc.weight has an invalid shape")
-        local_out_features = self.out_features // self.tp_size
-        weight = weight.narrow(
-            0,
-            tp_rank * local_out_features,
-            local_out_features,
-        )
+        weight = shard_tensor(weight, 0, tp_rank, self.tp_size, name="fc.weight", contiguous=False)
         self.weight = nn.Parameter(weight.to(dtype=self.weight.dtype, device=self.weight.device).contiguous())
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -269,15 +270,17 @@ class DFlashQwen3Model(Qwen3Model):
                     return None
         return projected_hidden
 
-    def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
+    def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> ScopedWeightLoader:
         cfg = self.cfg
-        # Load the draft's own embed_tokens (trained mask-token row) when the
-        # checkpoint ships one; else None -> C++ bridge shares the target's.
-        loader = load_own_weight(
+        all_weights = ScopedWeightLoader(state_dicts, src_prefixes=("", "model."))
+        ctx = ParallelLoadContext(tp_rank, tp_size)
+        # Only decoder layers + norm single-root lock; draft-owned tensors below use all_weights.
+        load_causal_lm_weights(self, None, all_weights, ctx, tie_word_embeddings=False, load_embedding=False)
+        # embed_tokens holds the draft's trained mask-token row when present;
+        # else None -> C++ bridge shares the target's.
+        load_own_weight(
             self,
-            state_dicts,
-            tp_rank,
-            tp_size,
+            all_weights,
             "embed_tokens.weight",
             "embed_tokens",
             lambda: HiddenParallelEmbedding(
@@ -287,24 +290,14 @@ class DFlashQwen3Model(Qwen3Model):
                 dtype=self.dtype,
                 device=self.device,
             ),
+            context=ctx,
             shard_dim=1,
         )
-        kv_world, kv_rank = kv_replica_shard(cfg.n_kv_heads, tp_rank, tp_size)
 
-        self.fc.load_weight(loader.load_tensor("fc.weight"), tp_rank)
-        loader.copy_replicated("hidden_norm.weight")
-
-        load_qwen3_backbone(
-            loader,
-            self.layers,
-            kv_world=kv_world,
-            kv_rank=kv_rank,
-            attention_bias=cfg.attention_bias,
-            dst_prefix="",
-        )
-
-        loader.copy_replicated("norm.weight")
+        self.fc.load_weights(all_weights, ctx)
+        all_weights.load_tensor(self.hidden_norm.weight, "hidden_norm.weight")
         self._build_context_kv_buffers()
+        return all_weights
 
     def adapt_weights_for_reference_model(
         self,
@@ -316,18 +309,24 @@ class DFlashQwen3Model(Qwen3Model):
 
 
 class DFlashQwen3ForCausalLM(PyModelBase):
+    model: DFlashQwen3Model
+
     def __init__(self, config: dict) -> None:
         super().__init__()
         self.cfg = DFlashQwen3Config.from_dict(config)
         self.cfg.validate()
         self.dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         self.device = torch.device(config.get("device", "npu"))
-        self.model = DFlashQwen3Model(self.cfg, self.dtype, self.device)
-        self.lm_head: nn.Module | None = None
+        self.model = DFlashQwen3Model(self.cfg, self.dtype, self.device)  # pyright: ignore[reportIncompatibleVariableOverride]
+        self.lm_head: nn.Module | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
-        self.model.load_weights(state_dicts, tp_rank, tp_size)
-        maybe_load_own_lm_head(self, state_dicts, tp_rank, tp_size)
+        all_weights = self.model.load_weights(state_dicts, tp_rank, tp_size)
+        load_own_lm_head(
+            self,
+            all_weights,
+            context=ParallelLoadContext(tp_rank, tp_size),
+        )
 
     def adapt_weights_for_reference_model(
         self,
