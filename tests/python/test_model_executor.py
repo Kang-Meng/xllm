@@ -875,6 +875,8 @@ class TestDecodeAclGraphSpeculativeMetadata:
 
     def test_replay_returns_static_output_view(self) -> None:
         runner = self._runner()
+        refresh_dsa = MagicMock()
+        runner.attention_backend.refresh_dsa_metadata_for_graph_replay = refresh_dsa
         batch_size = 3
         padded_batch_size = 4
         static_output = torch.arange(12).reshape(padded_batch_size, 3)
@@ -924,6 +926,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
         replay_stream.wait_stream.assert_called_once_with(current_stream)
         current_stream.wait_stream.assert_called_once_with(replay_stream)
         graph.replay.assert_called_once_with()
+        refresh_dsa.assert_called_once_with(entry.static_metadata)
 
 
 # ---------------------------------------------------------------------------
