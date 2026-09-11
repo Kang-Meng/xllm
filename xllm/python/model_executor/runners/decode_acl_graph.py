@@ -43,6 +43,7 @@ from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
 )
+from xllm.python.attention.kda_constants import _KDA_VERIFY_V2, _KDA_VERIFY_V3
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
@@ -181,7 +182,16 @@ class DecodeAclGraphRunner(BaseRunner):
         # only fixes the graph-vs-eager admission decision.
         if is_expanded_spec_verify:
             lsi = getattr(metadata, "linear_state_indices", None)
-            seq_count = lsi.numel() if lsi is not None and lsi.numel() > 0 else batch_size
+            has_kda_layers = lsi is not None and lsi.numel() > 0
+            if has_kda_layers:
+                # KDA linear-attention layers need the V2 or V3 spec-verify
+                # protocol to advance their recurrent state across per-token
+                # rows; without it the graph reuses one linear_state_indices
+                # entry per token row and corrupts the KDA state. Refuse graph
+                # admission when both protocols are off (eager still works).
+                if not (_KDA_VERIFY_V2 or _KDA_VERIFY_V3):
+                    return False
+            seq_count = lsi.numel() if has_kda_layers else batch_size
             size_check_bs = seq_count
             # The captured bucket is a power of two (1/2/4/8/16k) but the
             # static expanded-verify metadata (per-row q_cu + per-group
@@ -294,13 +304,24 @@ class DecodeAclGraphRunner(BaseRunner):
         paged_kv_last_page_len = (
             expanded.paged_kv_last_page_len if expanded is not None else metadata.paged_kv_last_page_len
         )
-        if paged_kv_indptr is None or paged_kv_indices is None or paged_kv_last_page_len is None:
-            if expanded is None:
-                raise RuntimeError("decode graph requires paged KV metadata")
-            # Python-executor spec-verify packing provides the expanded kv
-            # lens / block tables but not the row-scoped paged metadata (the
-            # C++ graph executor derives it in acl_graph_persistent_param).
-            # Build it on-device like the C++ graph input builder.
+        # Rebuild the row-scoped paged metadata when it is missing OR when the
+        # C++ builder left it per-sequence while block_table/kv_seq_lens are
+        # per-token-row. Under MTP concurrency the batch is frequently MIXED
+        # (some sequences in verify with width>1, some in plain decode with
+        # width=1), so rows is not a uniform multiple of seqs and the
+        # _is_untyped_spec_verify uniform-width gate does not fire; the C++
+        # metadata builder expands bt/kv to token rows but leaves
+        # paged_kv_last_page_len/indptr per-sequence, yielding a numel mismatch
+        # that crashes _validate_decode_metadata_shapes. Rebuild from
+        # kv_seq_lens (per-token-row) so paging matches bt in every case.
+        _paged_missing = paged_kv_indptr is None or paged_kv_indices is None or paged_kv_last_page_len is None
+        _paged_mismatch = (not _paged_missing) and (
+            paged_kv_last_page_len.numel() != block_table.shape[0]
+            or paged_kv_indptr.numel() != block_table.shape[0] + 1
+        )
+        if _paged_missing and expanded is None:
+            raise RuntimeError("decode graph requires paged KV metadata")
+        if _paged_missing or _paged_mismatch:
             (
                 paged_kv_indptr,
                 paged_kv_indices,
@@ -348,12 +369,15 @@ class DecodeAclGraphRunner(BaseRunner):
         seqs = lsi.shape[0]
         if bt.shape[0] != rows or seqs <= 0 or rows <= seqs or rows % seqs != 0:
             return False
-        if q_cu is not None and q_cu.numel() != rows + 1:
+        # q_cu_seq_lens is per-token-row: graph mode packs it WITHOUT a
+        # leading zero (numel == rows), eager/typed paths WITH one
+        # (numel == rows + 1). Both are valid per-row cumulative layouts;
+        # rejecting numel == rows wrongly classifies a GENERIC-flow MTP
+        # verify batch as non-untyped, skipping _build_row_aligned_paged_kv
+        # and crashing on the C++ builder's per-sequence paged_kv_last_page_len.
+        if q_cu is not None and q_cu.numel() not in (rows, rows + 1):
             return False
-        return not (
-            getattr(metadata, "is_prefill", False)
-            or getattr(metadata, "is_chunked_prefill", False)
-        )
+        return not (getattr(metadata, "is_prefill", False) or getattr(metadata, "is_chunked_prefill", False))
 
     def _expanded_verify_view(self, metadata: AttentionMetadata) -> ExpandedDecodeMetadata | None:
         """Resolve the expanded (token-row) view of a spec-verify batch.
@@ -492,10 +516,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if not self._is_shape_compatible(input_ids, metadata):
             return False
         batch_size = input_ids.numel()
-        is_expanded = (
-            resolve_expanded_decode_metadata(metadata) is not None
-            or self._is_untyped_spec_verify(metadata)
-        )
+        is_expanded = resolve_expanded_decode_metadata(metadata) is not None or self._is_untyped_spec_verify(metadata)
         if not is_expanded and metadata.kv_cu_seq_lens is not None:
             if metadata.kv_cu_seq_lens.numel() not in (
                 batch_size,
@@ -601,11 +622,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if input_ids.dim() != 1 or input_ids.numel() != sequence_count:
             return False
         slot_mapping = metadata.slot_mapping
-        if (
-            slot_mapping is None
-            or slot_mapping.dim() != 1
-            or slot_mapping.numel() != sequence_count
-        ):
+        if slot_mapping is None or slot_mapping.dim() != 1 or slot_mapping.numel() != sequence_count:
             return False
         return True
 
@@ -887,11 +904,7 @@ class DecodeAclGraphRunner(BaseRunner):
             # spec_width stays 1 and q_seq_lens is built as N*w single-token
             # groups, breaking the KDA recurrent-state chain.
             expanded_view = self._expanded_verify_view(metadata)
-            expanded_kv = (
-                expanded_view.kv_seq_lens
-                if expanded_view is not None
-                else metadata.kv_seq_lens
-            )
+            expanded_kv = expanded_view.kv_seq_lens if expanded_view is not None else metadata.kv_seq_lens
             src_rows = expanded_kv.shape[0] if expanded_kv is not None else 0
             src_lsi = getattr(metadata, "linear_state_indices", None)
             src_seqs = src_lsi.shape[0] if src_lsi is not None else 0
@@ -960,10 +973,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # Use the cheap shape-only detectors (no on-device paging build) for
         # the boolean; _decode_metadata above already built paging once via
         # _expanded_verify_view — don't rebuild it just to discard the result.
-        is_expanded = (
-            resolve_expanded_decode_metadata(metadata) is not None
-            or self._is_untyped_spec_verify(metadata)
-        )
+        is_expanded = resolve_expanded_decode_metadata(metadata) is not None or self._is_untyped_spec_verify(metadata)
         cumulative_kv_seq_lens = self._cumulative_lengths(
             kv_seq_lens,
             None if is_expanded else metadata.kv_cu_seq_lens,
@@ -1064,11 +1074,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 # static buffer is per token ROW (N*width under MTP expanded
                 # verify); expand each sequence's mask across its spec rows
                 # before copying, otherwise copy_ hits a shape mismatch.
-                if (
-                    src_his.numel() < batch_size
-                    and src_his.numel() > 0
-                    and batch_size % src_his.numel() == 0
-                ):
+                if src_his.numel() < batch_size and src_his.numel() > 0 and batch_size % src_his.numel() == 0:
                     width = batch_size // src_his.numel()
                     src_his = src_his.repeat_interleave(width)
                 static_metadata.has_initial_state[:batch_size].copy_(src_his[:batch_size])

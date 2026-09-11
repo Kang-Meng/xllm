@@ -713,10 +713,20 @@ class TestDecodeAclGraphSpeculativeMetadata:
             q_cu_seq_lens=None,
         )
 
-        with patch.object(
-            runner,
-            "_has_compatible_decode_metadata",
-            return_value=True,
+        # linear_state_indices marks KDA layers, whose recurrent state only
+        # advances across per-token verify rows under the V2/V3 spec-verify
+        # protocol; with both off, graph admission is refused (eager fallback).
+        # Enable V2 so the seq-count bucketing path under test is reachable.
+        with (
+            patch(
+                "xllm.python.model_executor.runners.decode_acl_graph._KDA_VERIFY_V2",
+                True,
+            ),
+            patch.object(
+                runner,
+                "_has_compatible_decode_metadata",
+                return_value=True,
+            ),
         ):
             assert runner.can_execute(
                 torch.zeros(32, dtype=torch.int32),

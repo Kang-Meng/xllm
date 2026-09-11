@@ -317,6 +317,22 @@ torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
   return out.cast<torch::Tensor>();
 }
 
+torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& seleted_idxes,
+                                 torch::Tensor& out_hidden) {
+  // Expose the selected hidden rows for the speculative-decode (MTP) draft
+  // input, and project via lm_head on those already-selected rows so Python's
+  // compute_logits does not do the same index_select a second time.
+  if (seleted_idxes.defined()) {
+    torch::Tensor idxes = seleted_idxes.to(
+        torch::dtype(torch::kLong).device(hidden_states.device()));
+    out_hidden = hidden_states.index_select(/*dim=*/0, idxes);
+    return logits(out_hidden, /*seleted_idxes=*/torch::Tensor());
+  }
+  out_hidden = hidden_states;
+  return logits(hidden_states, seleted_idxes);
+}
+
 ModelOutput PyCausalLM::write_context_kv(
     const torch::Tensor& target_hidden,
     const torch::Tensor& positions,
