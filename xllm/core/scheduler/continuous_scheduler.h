@@ -293,6 +293,8 @@ class ContinuousScheduler : public Scheduler {
  protected:
   void clear_mtp_bootstrap(Request* request);
   virtual void enqueue_ready_request(std::shared_ptr<Request> request);
+  virtual void release_failed_request(const std::shared_ptr<Request>& request) {
+  }
 
   static int64_t microseconds_to_milliseconds(int64_t microseconds);
   // i.e. round(latency / num_tokens). num_tokens must be > 0.
