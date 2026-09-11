@@ -32,13 +32,6 @@ namespace {
 // MegaGdnDecode and MegaGdnMtpDecode accept at most 32 sequences per call.
 constexpr int64_t kMegaGdnMaxDecodeBatchSize = 32;
 
-struct MegaGdnPrefillIndices {
-  torch::Tensor conv_read;
-  torch::Tensor conv_write;
-  torch::Tensor ssm_read;
-  torch::Tensor ssm_write;
-};
-
 void check_tensor(const torch::Tensor& tensor,
                   const char* name,
                   torch::ScalarType dtype,
@@ -87,65 +80,6 @@ torch::Tensor graph_safe_indices(const torch::Tensor& indices,
   check_tensor(indices, name, torch::kInt, 1, device);
   CHECK_EQ(indices.numel(), batch_size) << name << " must be sequence-scoped.";
   CHECK(indices.is_contiguous()) << name << " must be contiguous.";
-  return indices;
-}
-
-MegaGdnPrefillIndices build_prefill_indices(
-    const std::vector<int32_t>& live_slots,
-    const std::vector<int64_t>& validity_mask,
-    const std::vector<LinearStateCacheOp>& cache_ops,
-    int64_t checkpoint_stride,
-    int64_t num_slots,
-    const torch::Device& device) {
-  const int64_t batch_size = static_cast<int64_t>(live_slots.size());
-  check_live_slots(live_slots, batch_size, num_slots);
-  CHECK_EQ(static_cast<int64_t>(validity_mask.size()), batch_size)
-      << "linear_state_validity_mask must be sequence-scoped.";
-  CHECK(cache_ops.empty() ||
-        static_cast<int64_t>(cache_ops.size()) == batch_size)
-      << "linear_state_cache_ops must be empty or sequence-scoped.";
-  CHECK_GT(checkpoint_stride, 0) << "checkpoint stride must be positive.";
-  CHECK_LE(checkpoint_stride,
-           static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
-      << "checkpoint stride does not fit the operator int32 ABI.";
-  CHECK_LE((num_slots - 1) * checkpoint_stride,
-           static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
-      << "SSM state index does not fit the operator int32 ABI.";
-
-  std::vector<int32_t> conv_read;
-  std::vector<int32_t> conv_write;
-  std::vector<int32_t> ssm_read;
-  std::vector<int32_t> ssm_write;
-  conv_read.reserve(batch_size);
-  conv_write.reserve(batch_size);
-  ssm_read.reserve(batch_size);
-  ssm_write.reserve(batch_size);
-  const int32_t stride = static_cast<int32_t>(checkpoint_stride);
-  for (int64_t i = 0; i < batch_size; ++i) {
-    CHECK(validity_mask[i] == 0 || validity_mask[i] == 1)
-        << "linear state validity must be 0 or 1.";
-    const int32_t live_slot = live_slots[i];
-    int32_t read_slot = validity_mask[i] == 0 ? -1 : live_slot;
-    if (!cache_ops.empty()) {
-      const LinearStateCacheOp& cache_op = cache_ops[i];
-      CHECK_EQ(cache_op.linear_state_id, live_slot)
-          << "linear state descriptor and live slots must stay aligned.";
-      if (!cache_op.restore_requested && cache_op.restore_src_slot_id >= 0) {
-        CHECK_LT(static_cast<int64_t>(cache_op.restore_src_slot_id), num_slots);
-        read_slot = cache_op.restore_src_slot_id;
-      }
-    }
-    conv_read.emplace_back(read_slot);
-    conv_write.emplace_back(live_slot);
-    ssm_read.emplace_back(read_slot < 0 ? -1 : read_slot * stride);
-    ssm_write.emplace_back(live_slot * stride);
-  }
-
-  MegaGdnPrefillIndices indices;
-  indices.conv_read = slots_to_device(conv_read, device);
-  indices.conv_write = slots_to_device(conv_write, device);
-  indices.ssm_read = slots_to_device(ssm_read, device);
-  indices.ssm_write = slots_to_device(ssm_write, device);
   return indices;
 }
 
@@ -199,6 +133,153 @@ int64_t compute_num_matrices(const std::vector<int32_t>& query_lengths,
 }
 
 }  // namespace
+
+namespace qwen3_5_gdn_internal {
+
+const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
+    const AttentionMetadata& attn_metadata,
+    const std::vector<int32_t>& live_slots,
+    const std::vector<int64_t>& validity_mask,
+    const std::vector<LinearStateCacheOp>& cache_ops,
+    int64_t checkpoint_stride,
+    int64_t num_slots,
+    const torch::Device& device) {
+  const int64_t batch_size = static_cast<int64_t>(live_slots.size());
+  check_live_slots(live_slots, batch_size, num_slots);
+  CHECK_EQ(static_cast<int64_t>(validity_mask.size()), batch_size)
+      << "linear_state_validity_mask must be sequence-scoped.";
+  CHECK(cache_ops.empty() ||
+        static_cast<int64_t>(cache_ops.size()) == batch_size)
+      << "linear_state_cache_ops must be empty or sequence-scoped.";
+  CHECK_GT(checkpoint_stride, 0) << "checkpoint stride must be positive.";
+  CHECK_LE(checkpoint_stride,
+           static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
+      << "checkpoint stride does not fit the operator int32 ABI.";
+  CHECK_LE(num_slots - 1,
+           static_cast<int64_t>(std::numeric_limits<int32_t>::max()) /
+               checkpoint_stride)
+      << "SSM state index does not fit the operator int32 ABI.";
+  for (const int64_t validity : validity_mask) {
+    CHECK(validity == 0 || validity == 1)
+        << "linear state validity must be 0 or 1.";
+  }
+
+  std::optional<MegaGdnPrefillIndicesCache>& cache =
+      attn_metadata.mega_gdn_prefill_indices;
+  if (cache.has_value()) {
+    const MegaGdnPrefillIndicesKey& key = cache->key;
+    CHECK_EQ(key.device, device)
+        << "MegaGdn Prefill indices cache device changed within one forward.";
+    CHECK_EQ(key.batch_size, batch_size)
+        << "MegaGdn Prefill indices cache batch size changed within one "
+           "forward.";
+    CHECK_EQ(key.num_slots, num_slots)
+        << "MegaGdn Prefill cache slot geometry changed within one forward.";
+    CHECK_EQ(key.checkpoint_stride, checkpoint_stride)
+        << "MegaGdn Prefill checkpoint stride changed within one forward.";
+    CHECK(key.linear_state_ids == live_slots)
+        << "MegaGdn Prefill linear state ids changed within one forward.";
+    CHECK(key.linear_state_validity_mask == validity_mask)
+        << "MegaGdn Prefill validity changed within one forward.";
+    CHECK_EQ(key.linear_state_cache_ops.size(), cache_ops.size())
+        << "MegaGdn Prefill linear state cache ops changed within one forward.";
+  }
+
+  std::vector<MegaGdnPrefillCacheOpKey> cache_op_keys;
+  if (!cache.has_value()) {
+    cache_op_keys.reserve(cache_ops.size());
+  }
+  for (int64_t i = 0; i < static_cast<int64_t>(cache_ops.size()); ++i) {
+    const LinearStateCacheOp& cache_op = cache_ops[i];
+    CHECK_EQ(cache_op.linear_state_id, live_slots[i])
+        << "linear state descriptor and live slots must stay aligned.";
+    CHECK(!(cache_op.reset_requested && cache_op.restore_requested))
+        << "linear-state reset and restore are mutually exclusive.";
+    if (cache_op.reset_requested) {
+      CHECK_LT(cache_op.restore_src_slot_id, 0)
+          << "linear-state reset must not carry a restore source.";
+      CHECK_EQ(validity_mask[i], 0)
+          << "linear-state reset row must remain cold after restore.";
+    } else if (cache_op.restore_requested) {
+      CHECK_GE(cache_op.restore_src_slot_id, 0)
+          << "linear-state restore requires a valid source slot.";
+      CHECK_EQ(validity_mask[i], 1)
+          << "linear-state restored row must be warm after restore.";
+    } else if (cache_op.restore_src_slot_id >= 0) {
+      CHECK_EQ(validity_mask[i], 1)
+          << "linear-state direct-read row must be warm after restore.";
+    }
+    if (cache_op.restore_src_slot_id >= 0) {
+      CHECK_GT(cache_op.restore_src_slot_id, kPaddingLinearStateId)
+          << "linear-state source must be a real non-padding slot.";
+      CHECK_LT(static_cast<int64_t>(cache_op.restore_src_slot_id), num_slots)
+          << "linear-state source exceeds cache capacity.";
+    }
+    const MegaGdnPrefillCacheOpKey cache_op_key{
+        .linear_state_id = cache_op.linear_state_id,
+        .reset_requested = cache_op.reset_requested,
+        .restore_requested = cache_op.restore_requested,
+        .restore_src_slot_id = cache_op.restore_src_slot_id};
+    if (cache.has_value()) {
+      CHECK(cache->key.linear_state_cache_ops[i] == cache_op_key)
+          << "MegaGdn Prefill linear state cache ops changed within one "
+             "forward.";
+    } else {
+      cache_op_keys.push_back(cache_op_key);
+    }
+  }
+  if (cache.has_value()) {
+    return cache.value();
+  }
+
+  std::vector<int32_t> conv_read;
+  std::vector<int32_t> conv_write;
+  std::vector<int32_t> ssm_read;
+  std::vector<int32_t> ssm_write;
+  conv_read.reserve(batch_size);
+  conv_write.reserve(batch_size);
+  ssm_read.reserve(batch_size);
+  ssm_write.reserve(batch_size);
+  const int32_t stride = static_cast<int32_t>(checkpoint_stride);
+  for (int64_t i = 0; i < batch_size; ++i) {
+    const int32_t live_slot = live_slots[i];
+    int32_t read_slot = validity_mask[i] == 0 ? -1 : live_slot;
+    if (!cache_ops.empty()) {
+      const LinearStateCacheOp& cache_op = cache_ops[i];
+      if (cache_op.is_direct_read()) {
+        read_slot = cache_op.restore_src_slot_id;
+      }
+    }
+    conv_read.emplace_back(read_slot);
+    conv_write.emplace_back(live_slot);
+    ssm_read.emplace_back(read_slot < 0 ? -1 : read_slot * stride);
+    ssm_write.emplace_back(live_slot * stride);
+  }
+
+  int64_t device_tensor_materializations = 0;
+  const auto materialize = [&](const std::vector<int32_t>& slots) {
+    torch::Tensor tensor = slots_to_device(slots, device);
+    ++device_tensor_materializations;
+    return tensor;
+  };
+  MegaGdnPrefillIndicesCache built{
+      .conv_read = materialize(conv_read),
+      .conv_write = materialize(conv_write),
+      .ssm_read = materialize(ssm_read),
+      .ssm_write = materialize(ssm_write),
+      .key = {.device = device,
+              .batch_size = batch_size,
+              .num_slots = num_slots,
+              .checkpoint_stride = checkpoint_stride,
+              .linear_state_ids = live_slots,
+              .linear_state_validity_mask = validity_mask,
+              .linear_state_cache_ops = std::move(cache_op_keys)},
+      .device_tensor_materializations = device_tensor_materializations};
+  cache.emplace(std::move(built));
+  return cache.value();
+}
+
+}  // namespace qwen3_5_gdn_internal
 
 Qwen3_5GatedDeltaNetImpl::Qwen3_5GatedDeltaNetImpl(
     const ModelArgs& args,
@@ -505,13 +586,15 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     CHECK_EQ(total_tokens, expected_tokens)
         << "packed prefill token count does not match host sequence lengths.";
 
-    MegaGdnPrefillIndices indices =
-        build_prefill_indices(live_slots,
-                              input_params.linear_state_validity_mask,
-                              input_params.linear_state_cache_ops,
-                              checkpoint_stride,
-                              num_slots,
-                              device);
+    const MegaGdnPrefillIndicesCache& indices =
+        qwen3_5_gdn_internal::get_or_build_prefill_indices(
+            attn_metadata,
+            live_slots,
+            input_params.linear_state_validity_mask,
+            input_params.linear_state_cache_ops,
+            checkpoint_stride,
+            num_slots,
+            device);
     xllm::kernel::MegaGdnPrefillParams params;
     params.mixed_qkv = packed_qkv.contiguous();
     params.b = packed_b.view({total_tokens, local_value_heads}).contiguous();

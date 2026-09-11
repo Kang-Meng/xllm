@@ -61,6 +61,35 @@ struct KPoolBatchMetadata {
   int64_t max_kv_len = 0;
 };
 
+#if defined(USE_NPU)
+struct MegaGdnPrefillCacheOpKey {
+  int32_t linear_state_id;
+  bool reset_requested;
+  bool restore_requested;
+  int32_t restore_src_slot_id;
+
+  bool operator==(const MegaGdnPrefillCacheOpKey&) const = default;
+};
+
+struct MegaGdnPrefillIndicesKey {
+  torch::Device device;
+  int64_t batch_size;
+  int64_t num_slots;
+  int64_t checkpoint_stride;
+  std::vector<int32_t> linear_state_ids;
+  std::vector<int64_t> linear_state_validity_mask;
+  std::vector<MegaGdnPrefillCacheOpKey> linear_state_cache_ops;
+};
+
+struct MegaGdnPrefillIndicesCache {
+  torch::Tensor conv_read;
+  torch::Tensor conv_write;
+  torch::Tensor ssm_read;
+  torch::Tensor ssm_write;
+  MegaGdnPrefillIndicesKey key;
+  int64_t device_tensor_materializations;
+};
+#endif
 #if defined(USE_CUDA) || defined(USE_MUSA)
 struct PlanInfo {
   int32_t layer_id = -1;
@@ -227,6 +256,10 @@ struct AttentionMetadata {
 #endif
 
 #if defined(USE_NPU)
+  // Lazily materialized by the first Qwen3.5 GDN Prefill layer and shared by
+  // subsequent GDN layers within this model forward.
+  mutable std::optional<MegaGdnPrefillIndicesCache> mega_gdn_prefill_indices;
+
   // for npu
   std::shared_ptr<npu::AclGraphTaskUpdateContext> acl_graph_task_update_context;
   torch::Tensor q_seq_lens_host;
