@@ -28,6 +28,7 @@ if TYPE_CHECKING:
         AttentionMetadata,
         LayerCache,
     )
+    from xllm.python.model_executor.cp_utils import CpContext
 
 
 class LayerSynchronizer(Protocol):
@@ -74,9 +75,8 @@ class ForwardContext:
     layer_synchronizer: LayerSynchronizer | None = None
     execution_state: AclGraphExecutionState | None = None
     # Context-Parallel sharding plan for this forward, or None when CP is off
-    # (cp_size <= 1) or the step is decode (CP is prefill-only). Typed as
-    # object to avoid a circular import with model_executor.cp_utils.CpContext.
-    cp_context: object | None = None
+    # (cp_size <= 1) or the step is decode (CP is prefill-only).
+    cp_context: CpContext | None = None
 
 
 _current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)
