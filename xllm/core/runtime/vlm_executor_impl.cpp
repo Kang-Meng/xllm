@@ -61,18 +61,28 @@ ModelOutput VlmExecutorImpl::run(const torch::Tensor& tokens,
   torch::NoGradGuard no_grad;
   auto& mm_data = params.multimodal.mm_data;
 
-  // Pure decode steps carry no multimodal data, so get_input_embeddings would
-  // just do a plain token lookup. Skipping the host-side embedding here lets
-  // the graph run embed_tokens on its persistent token buffer instead, which
-  // keeps the captured graph input address stable across double-buffered slots
-  // (a host-computed embedding tensor is reallocated every step and would make
-  // graph replay read a stale/mismatched buffer).
-  const bool decode_only =
-      params.meta.batch_forward_type.is_decode() && !mm_data.valid();
-  if (decode_only && llm_executor_) {
-    return llm_executor_->run(tokens, positions, kv_caches, params);
+  // Pure decode carries no multimodal data. Its mRoPE positions degenerate to
+  // identical rows, so they collapse to the 1-D vector ordinary rope and the
+  // graph's 1-D persistent positions buffer expect. We forward raw tokens
+  // instead of a host-computed embedding: the language model runs embed_tokens
+  // itself (identical to get_input_embeddings for a plain token lookup), and
+  // under graph mode it does so on the persistent token buffer, keeping the
+  // captured input address stable across double-buffered slots (a fresh host
+  // embedding tensor would be reallocated every step and make graph replay read
+  // a stale buffer).
+  if (params.meta.batch_forward_type.is_decode() && !mm_data.valid()) {
+    const torch::Tensor decode_positions =
+        collapse_mrope_decode_positions(positions);
+    if (llm_executor_) {
+      return llm_executor_->run(tokens, decode_positions, kv_caches, params);
+    }
+    return model_->forward(tokens, decode_positions, kv_caches, params);
   }
 
+  // Prefill / multimodal step: resolve encoder embeddings on the host (needed
+  // to merge vision tokens into the token stream) and keep the real
+  // [3, num_tokens] mRoPE rows. Under graph mode the executor demotes this
+  // non-decode batch to eager forward.
   if (encoder_cache_) {
     EncoderCacheLookupVisitor lookup(encoder_cache_.get());
     mm_data.foreach (lookup);
@@ -102,19 +112,11 @@ ModelOutput VlmExecutorImpl::run(const torch::Tensor& tokens,
   params.embedding.input_embedding =
       model_->get_input_embeddings(tokens, params);
 
-  // Decode mRoPE positions degenerate to identical rows; collapse to 1-D so
-  // decode runs ordinary rope. Prefill keeps the real [3, num_tokens] rows.
-  torch::Tensor fwd_positions = positions;
-  if (params.meta.batch_forward_type.is_decode() &&
-      args_.rope_scaling_rope_type() == "mrope") {
-    fwd_positions = positions[0].contiguous();
-  }
-
   if (llm_executor_) {
-    return llm_executor_->run(tokens, fwd_positions, kv_caches, params);
+    return llm_executor_->run(tokens, positions, kv_caches, params);
   }
 
-  return model_->forward(tokens, fwd_positions, kv_caches, params);
+  return model_->forward(tokens, positions, kv_caches, params);
 }
 
 void VlmExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
@@ -125,8 +127,24 @@ void VlmExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
   // executor built in enable_graph mode; multimodal prefill steps never reach
   // here because the worker gates this on decode-phase input params.
   if (llm_executor_) {
-    llm_executor_->prepare_graph_input(tokens, positions, kv_caches, params);
+    // Prewarm only runs on decode batches, so match the 1-D positions the
+    // graph's persistent buffer captures and replays; the worker otherwise
+    // hands us the raw [3, num_tokens] mRoPE rows.
+    llm_executor_->prepare_graph_input(
+        tokens, collapse_mrope_decode_positions(positions), kv_caches, params);
   }
+}
+
+torch::Tensor VlmExecutorImpl::collapse_mrope_decode_positions(
+    const torch::Tensor& positions) const {
+  // mRoPE builds positions as [3, num_tokens]; on decode the three rows are
+  // identical, so row 0 is the 1-D position vector ordinary rope and the
+  // graph's persistent buffer expect. Guard on the 2-D shape so already-1-D
+  // (non-mRoPE) positions pass through untouched.
+  if (args_.rope_scaling_rope_type() == "mrope" && positions.dim() == 2) {
+    return positions[0].contiguous();
+  }
+  return positions;
 }
 
 }  // namespace xllm

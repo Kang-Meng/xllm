@@ -63,6 +63,14 @@ class VlmExecutorImpl : public ExecutorImpl {
   runtime::Options options_;
   std::unique_ptr<ExecutorImpl> llm_executor_;
   std::unique_ptr<EncoderCache> encoder_cache_;
+
+ private:
+  // Collapse mRoPE decode positions from [3, num_tokens] to a 1-D [num_tokens]
+  // tensor. Decode rows are identical, so row 0 is what ordinary rope and the
+  // graph's 1-D persistent positions buffer expect. Only touches 2-D mRoPE
+  // positions; already-1-D or non-mRoPE positions are returned unchanged.
+  torch::Tensor collapse_mrope_decode_positions(
+      const torch::Tensor& positions) const;
 };
 // Q: backend device ?
 REGISTER_EXECUTOR("vlm", VlmExecutorImpl);
