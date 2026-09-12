@@ -32,6 +32,7 @@ from xllm.python.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4HyperConnection,
+    DeepseekV4Indexer,
     DeepseekV4Model,
     DeepseekV4MoE,
     DeepseekV4RotaryEmbedding,
@@ -164,6 +165,82 @@ def test_rotary_cache_shares_identical_descriptors() -> None:
 
     assert c4.cos_sin_cache.data_ptr() == c128.cos_sin_cache.data_ptr()
     assert c4.cos_sin_cache.data_ptr() != default.cos_sin_cache.data_ptr()
+
+
+def test_qli_decode_uses_request_shaped_rope_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    indexer = SimpleNamespace(
+        n_head=1,
+        head_dim=4,
+        rope_dim=2,
+        topk=1,
+        hadamard_scale=1.0,
+        wq_b=SimpleNamespace(
+            forward_quantized=MagicMock(return_value=torch.ones((1, 4))),
+        ),
+        weights_proj=MagicMock(return_value=torch.ones((1, 1))),
+        _get_hadamard=MagicMock(return_value=torch.empty(0)),
+        _indexer_compress_kv=MagicMock(return_value=None),
+    )
+    layer_cache = SimpleNamespace(
+        index=torch.zeros((1, 1, 4), dtype=torch.int8),
+        indexer_scale=torch.ones((1, 1, 1), dtype=torch.float16),
+    )
+    dsa = SimpleNamespace(
+        cos_table=torch.tensor([[0.25]]),
+        sin_table=torch.tensor([[0.5]]),
+        input_positions=torch.tensor([111]),
+        block_tables=[[torch.tensor([[0]], dtype=torch.int32)]],
+        actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor([112], dtype=torch.int32),
+        qli_metadata=torch.tensor([1], dtype=torch.int32),
+    )
+    mapping = SimpleNamespace(index_cache_idx=0)
+    rotary_mul = MagicMock()
+    expected_topk = torch.tensor([[0]], dtype=torch.int32)
+
+    def fake_dynamic_quant(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        quantized = torch.zeros_like(value, dtype=torch.int8)
+        scale = torch.ones(value.shape[:-1], dtype=torch.float32)
+        return quantized, scale
+
+    monkeypatch.setattr(
+        deepseek_v4.kernels,
+        "npu_inplace_partial_rotary_mul",
+        rotary_mul,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepseek_v4.kernels,
+        "dynamic_quant",
+        fake_dynamic_quant,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepseek_v4.kernels,
+        "quant_lightning_indexer",
+        MagicMock(return_value=expected_topk),
+        raising=False,
+    )
+
+    output = DeepseekV4Indexer.select_qli_dsv4(
+        indexer,
+        layer_id=0,
+        layer_cache=layer_cache,
+        dsa=dsa,
+        mapping=mapping,
+        q=torch.empty(0),
+        qr=torch.ones((1, 1)),
+        qr_pertoken_scale=torch.ones(1),
+        hidden=torch.ones((1, 4)),
+    )
+
+    assert output is expected_topk
+    rotary_mul.assert_called_once()
+    _, cos, sin, rope_start_dim, rope_dim = rotary_mul.call_args.args
+    torch.testing.assert_close(cos, torch.tensor([[0.25, 0.25]]))
+    torch.testing.assert_close(sin, torch.tensor([[0.5, 0.5]]))
+    assert rope_start_dim == 2
+    assert rope_dim == 2
 
 
 def test_registry_resolves_deepseek_v4() -> None:

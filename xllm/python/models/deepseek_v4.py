@@ -935,11 +935,12 @@ class DeepseekV4Indexer(nn.Module):
         if cos_table is not None and sin_table is not None and self.rope_dim > 0:
             cos_v = cos_table.reshape(-1, cos_table.size(-1)) if cos_table.dim() > 2 else cos_table
             sin_v = sin_table.reshape(-1, sin_table.size(-1)) if sin_table.dim() > 2 else sin_table
-            # Per-token cos/sin indexed by positions: 2D [M, rope_dim/2] (Python
-            # DeepseekYarnRotaryEmbedding stores half-dim cos/sin, NOT interleaved).
-            pos = dsa.input_positions.to(device).reshape(-1).long()
-            cos_sel = cos_v.index_select(0, pos).to(q_idx.dtype)  # [M, rope_dim/2]
-            sin_sel = sin_v.index_select(0, pos).to(q_idx.dtype)
+            # DSAMetadata already stores request-shaped, per-token cos/sin.
+            # Match C++ select_qli by consuming those rows directly; indexing
+            # them again with absolute positions fails on decode (for example,
+            # position 111 against a one-row request-shaped table).
+            cos_sel = cos_v.to(q_idx.dtype)
+            sin_sel = sin_v.to(q_idx.dtype)
             # npu_inplace_partial_rotary_mul (interleave mode) expects cos/sin
             # [M, rope_dim] in C++ interleaved format: freqs.repeat_interleave(2)
             # (rotary_embedding_util.cpp:135-137). The half-dim cos/sin must be
