@@ -22,12 +22,11 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/embedding_cache.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/framework/speculative/mtp_json_object_state.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
-#include "runtime/speculative_worker_impl.h"
+#include "runtime/draft_model_spec_worker_impl.h"
 
 namespace xllm {
 
@@ -40,7 +39,7 @@ class NpuJsonDraftTokenHandoff;
 // MTP (Multi-Token Prediction) speculative worker.
 // Uses a draft model to generate proposals, then validates with target model.
 // Eagle3WorkerImpl inherits from this class.
-class MTPWorkerImpl : public SpeculativeWorkerImpl {
+class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
  public:
   MTPWorkerImpl(const ParallelArgs& parallel_args,
                 const torch::Device& device,
@@ -69,14 +68,6 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
 
   std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
 
-  bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
-
-#if defined(USE_NPU) || defined(USE_MLU)
-  bool allocate_kv_cache_with_transfer(
-      const KVCacheShape& kv_cache_shape) override;
-#endif
-
-  ForwardInput update_input_by_last_step_output(ForwardInput& inputs) override;
   ForwardInput update_input_by_last_step_output_for_schedule_overlap(
       ForwardInput& inputs) override;
   void prepare_work_before_execute(const ForwardInput& inputs,
@@ -154,7 +145,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
 
   // PD separation: placeholder size for empty embedding slot. Default: 1x
   // hidden_size. Eagle3 overrides to 3 * target_hidden_size.
-  virtual int64_t get_embedding_placeholder_size();
+  int64_t get_embedding_placeholder_size() const override;
   bool should_use_separate_draft_kv_cache_shape() const;
   KVCacheShape draft_kv_cache_shape(
       const KVCacheShape& target_kv_cache_shape) const override;
@@ -295,7 +286,6 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // before control returns to the scheduler.  The following scheduler turn
   // consumes this output and only submits draft steps 1..N-1.
   PendingDraftContext pending_draft_context_;
-  // adaptive_spec_controller_ now lives on SpeculativeWorkerImpl (base class).
 
   // Classified once when the corresponding models are loaded. Decode-path
   // decisions only read these closed policies.
@@ -303,6 +293,11 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       mtp_async::TargetSpecVerifyMode::GENERIC;
   mtp_async::CombinedDraftExecutionPath combined_draft_execution_path_ =
       mtp_async::CombinedDraftExecutionPath::UNSUPPORTED;
+
+  // Target hidden size captured when the target loads;
+  // get_embedding_placeholder_size() falls back to it for the placeholder width
+  // when impl_ is unavailable.
+  int32_t embedding_size_ = 0;
 
 #if defined(USE_NPU)
   // Stable-address sources consumed by the target ACL graph's leading input

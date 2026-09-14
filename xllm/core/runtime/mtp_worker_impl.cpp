@@ -48,6 +48,7 @@ limitations under the License.
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #endif
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
+#include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/mtp_async_input_builder.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/framework/speculative/spec_input_builder.h"
@@ -786,15 +787,18 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              const runtime::Options& draft_options,
                              WorkerType worker_type,
                              bool enable_adaptive_speculative_decode)
-    : SpeculativeWorkerImpl(parallel_args,
-                            device,
-                            options,
-                            target_options,
-                            worker_type) {
-  draft_impl_ = std::make_unique<LLMWorkerImpl>(
-      mtp_draft_parallel_args(parallel_args, options),
-      device,
-      mtp_draft_options(draft_options));
+    : DraftModelSpecWorkerImpl(
+          parallel_args,
+          device,
+          options,
+          target_options,
+          worker_type,
+          [&parallel_args, &device, &options, &draft_options] {
+            return std::make_unique<LLMWorkerImpl>(
+                mtp_draft_parallel_args(parallel_args, options),
+                device,
+                mtp_draft_options(draft_options));
+          }) {
   if (enable_adaptive_speculative_decode) {
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
@@ -813,6 +817,9 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
   if (loading_target) {
     result = SpeculativeWorkerImpl::init_model(
         model_weights_path, random_seed, master_status);
+    if (result) {
+      embedding_size_ = impl_->hidden_size();
+    }
   } else {
     CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::UNINITIALIZED);
     result = draft_impl_->WorkerImpl::init_model(
@@ -892,12 +899,11 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
 
 std::tuple<int64_t, int64_t> MTPWorkerImpl::estimate_kv_cache_capacity() {
   CHECK(impl_ != nullptr);
-  CHECK(draft_impl_ != nullptr);
-  return estimate_kv_cache_capacity_with_draft(
-      *draft_impl_, mtp_target_options(options_), mtp_draft_options(options_));
+  return estimate_kv_cache_capacity_with_draft(mtp_target_options(options_),
+                                               mtp_draft_options(options_));
 }
 
-int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
+int64_t MTPWorkerImpl::get_embedding_placeholder_size() const {
   // DeepSeek-V4 MTP stashes the pre-hc_head 3D hidden flattened to
   // [num_tokens, hc_mult*hidden], so the cache placeholder must cover
   // hc_mult*hidden per row.
@@ -1057,103 +1063,6 @@ bool MTPWorkerImpl::use_chunked_prefill_spec_verify_path() const {
   return target_spec_verify_mode_ ==
              mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
          supports_explicit_spec_verify_replay_update();
-}
-
-bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
-  // init_model() must run first so dtype_/embedding_size_ are initialized.
-  embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
-  if (embedding_cache_) {
-    int64_t size = get_embedding_placeholder_size();
-    if (size > 0) {
-      embedding_cache_->set_placeholder(
-          torch::zeros({size}, torch::dtype(dtype_).device(device_)));
-    }
-  }
-  CHECK(impl_ != nullptr);
-  CHECK(draft_impl_ != nullptr);
-  prepare_hierarchy_kv_cache_transfers();
-
-  bool target_allocated = true;
-  const auto target_status = impl_->get_status();
-  if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache(kv_cache_shape);
-  } else {
-    CHECK_EQ(target_status, WorkerImpl::Status::READY);
-  }
-
-  bool draft_allocated = true;
-  const auto draft_status = draft_impl_->get_status();
-  if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated =
-        draft_impl_->allocate_kv_cache(draft_kv_cache_shape(kv_cache_shape));
-  } else {
-    CHECK_EQ(draft_status, WorkerImpl::Status::READY);
-  }
-
-  const bool allocated = target_allocated && draft_allocated;
-  if (allocated) {
-    finalize_hierarchy_kv_cache_transfers();
-  }
-  return allocated;
-}
-
-#if defined(USE_NPU) || defined(USE_MLU)
-bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
-    const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
-  CHECK(impl_ != nullptr);
-  CHECK(draft_impl_ != nullptr);
-  prepare_hierarchy_kv_cache_transfers();
-
-  if (kv_cache_transfer_ == nullptr) {
-    kv_cache_transfer_ = std::make_shared<MooncakeKVCacheTransferDefault>(
-        device_.index(),
-        options_.transfer_listen_port(),
-        device_,
-        context_.get_model_args().model_type());
-
-    int32_t device_id = device_.index();
-    kv_cache_transfer_->initialize(device_id);
-  }
-
-  bool target_allocated = true;
-  const auto target_status = impl_->get_status();
-  if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
-  } else {
-    CHECK_EQ(target_status, WorkerImpl::Status::READY);
-  }
-
-  bool draft_allocated = true;
-  const auto draft_status = draft_impl_->get_status();
-  if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, draft_kv_cache_shape(kv_cache_shape));
-  } else {
-    CHECK_EQ(draft_status, WorkerImpl::Status::READY);
-  }
-
-  embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
-  if (embedding_cache_) {
-    int64_t size = get_embedding_placeholder_size();
-    if (size > 0) {
-      embedding_cache_->set_placeholder(
-          torch::zeros({size}, torch::dtype(dtype_).device(device_)));
-    }
-  }
-  const bool allocated = target_allocated && draft_allocated;
-  if (allocated) {
-    finalize_hierarchy_kv_cache_transfers();
-  }
-  return allocated;
-}
-#endif
-
-ForwardInput MTPWorkerImpl::update_input_by_last_step_output(
-    ForwardInput& inputs) {
-  return inputs;
 }
 
 ForwardInput

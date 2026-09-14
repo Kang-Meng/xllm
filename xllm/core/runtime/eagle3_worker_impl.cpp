@@ -101,7 +101,7 @@ bool Eagle3WorkerImpl::init_model(const std::string& model_weights_path,
   return result;
 }
 
-int64_t Eagle3WorkerImpl::get_embedding_placeholder_size() {
+int64_t Eagle3WorkerImpl::get_embedding_placeholder_size() const {
   const int64_t target_hidden = context_.get_model_args().hidden_size();
   return 3 * target_hidden;
 }

@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
+#include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/process_group.h"
@@ -356,23 +357,29 @@ std::vector<int64_t> build_accepted_context_rows(
 DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                                    const torch::Device& device,
                                    const runtime::Options& options)
-    : SpeculativeWorkerImpl(parallel_args,
-                            device,
-                            options,
-                            target_options(options),
-                            WorkerType::LLM) {
-  bool allow_cp = false;
-  if (parallel_args.cp_size() > 1 && Platform::is_npu()) {
-    allow_cp = util::is_deepseek_v4_model_type(
-        util::get_model_type(options.model_path(), options.backend()));
-  }
-  if (!allow_cp) {
-    CHECK_LE(parallel_args.cp_size(), 1)
-        << "Block-diffusion speculative decoding does not support context "
-           "parallelism (cp_size > 1).";
-  }
-  draft_impl_ = std::make_unique<LLMWorkerImpl>(
-      parallel_args, device, draft_options(options));
+    : DraftModelSpecWorkerImpl(
+          parallel_args,
+          device,
+          options,
+          target_options(options),
+          WorkerType::LLM,
+          [&parallel_args, &device, &options] {
+            // The draft consumes the target's aux hidden states, which the
+            // worker does not expose under CP; reject cp_size > 1 except
+            // DeepSeek-V4 on NPU.
+            bool allow_cp = false;
+            if (parallel_args.cp_size() > 1 && Platform::is_npu()) {
+              allow_cp = util::is_deepseek_v4_model_type(util::get_model_type(
+                  options.model_path(), options.backend()));
+            }
+            if (!allow_cp) {
+              CHECK_LE(parallel_args.cp_size(), 1)
+                  << "Block-diffusion speculative decoding does not support "
+                     "context parallelism (cp_size > 1).";
+            }
+            return std::make_unique<LLMWorkerImpl>(
+                parallel_args, device, draft_options(options));
+          }) {
   speculative_position_labels_.reserve(
       static_cast<size_t>(options.num_speculative_tokens()));
   for (int32_t position = 0; position < options.num_speculative_tokens();
@@ -542,91 +549,8 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
 
 std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
   CHECK(impl_ != nullptr);
-  CHECK(draft_impl_ != nullptr);
-  return estimate_kv_cache_capacity_with_draft(
-      *draft_impl_, target_options(options_), draft_options(options_));
-}
-
-bool DFlashWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
-  embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
-  CHECK(impl_ != nullptr);
-  CHECK(draft_impl_ != nullptr);
-  prepare_hierarchy_kv_cache_transfers();
-
-  bool target_allocated = true;
-  const WorkerImpl::Status target_status = impl_->get_status();
-  if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache(kv_cache_shape);
-  } else {
-    CHECK_EQ(target_status, WorkerImpl::Status::READY);
-  }
-
-  bool draft_allocated = true;
-  const WorkerImpl::Status draft_status = draft_impl_->get_status();
-  if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated =
-        draft_impl_->allocate_kv_cache(draft_kv_cache_shape(kv_cache_shape));
-  } else {
-    CHECK_EQ(draft_status, WorkerImpl::Status::READY);
-  }
-
-  const bool allocated = target_allocated && draft_allocated;
-  if (allocated) {
-    finalize_hierarchy_kv_cache_transfers();
-  }
-  return allocated;
-}
-
-#if defined(USE_NPU) || defined(USE_MLU)
-bool DFlashWorkerImpl::allocate_kv_cache_with_transfer(
-    const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
-  CHECK(impl_ != nullptr);
-  CHECK(draft_impl_ != nullptr);
-  prepare_hierarchy_kv_cache_transfers();
-
-  if (kv_cache_transfer_ == nullptr) {
-    kv_cache_transfer_ = std::make_shared<MooncakeKVCacheTransferDefault>(
-        device_.index(),
-        options_.transfer_listen_port(),
-        device_,
-        context_.get_model_args().model_type());
-
-    const int32_t device_id = device_.index();
-    kv_cache_transfer_->initialize(device_id);
-  }
-
-  bool target_allocated = true;
-  const WorkerImpl::Status target_status = impl_->get_status();
-  if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
-  } else {
-    CHECK_EQ(target_status, WorkerImpl::Status::READY);
-  }
-
-  bool draft_allocated = true;
-  const WorkerImpl::Status draft_status = draft_impl_->get_status();
-  if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, draft_kv_cache_shape(kv_cache_shape));
-  } else {
-    CHECK_EQ(draft_status, WorkerImpl::Status::READY);
-  }
-
-  embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
-  const bool allocated = target_allocated && draft_allocated;
-  if (allocated) {
-    finalize_hierarchy_kv_cache_transfers();
-  }
-  return allocated;
-}
-#endif
-
-ForwardInput DFlashWorkerImpl::update_input_by_last_step_output(
-    ForwardInput& inputs) {
-  return inputs;
+  return estimate_kv_cache_capacity_with_draft(target_options(options_),
+                                               draft_options(options_));
 }
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
