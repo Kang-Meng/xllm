@@ -26,6 +26,7 @@ import torch.nn as nn
 from xllm.python.layers import ColumnParallelLinear, GemmaRMSNorm, HiddenParallelEmbedding
 from xllm.python.layers.qwen3_5.common import PartialRotaryEmbedding
 from xllm.python.layers.qwen3_5.decoder_layer import Qwen3_5DecoderLayer, get_qwen3_5_decoder_layer_class
+from xllm.python.model_executor.forward_context import record_layer_event
 from xllm.python.model_loader import (
     ParallelLoadContext,
     ScopedWeightLoader,
@@ -225,8 +226,9 @@ class Qwen3_5Model(nn.Module):
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
             hidden, residual = layer(hidden, residual, positions)
+            record_layer_event(layer_id)
         hidden, _ = self.norm(hidden, residual)
         return hidden
 

@@ -34,9 +34,6 @@ from tests.python.qwen3_5_test_utils import (
     gemma_rms_norm as _gemma_rms_norm,
 )
 from tests.python.qwen3_5_test_utils import (
-    install_constant_gdn_projections as _install_constant_gdn_projections,
-)
-from tests.python.qwen3_5_test_utils import (
     make_config as _config,
 )
 from tests.python.qwen3_5_test_utils import (
@@ -46,6 +43,7 @@ from tests.python.qwen3_5_test_utils import (
     make_linear_config as _linear_config,
 )
 from xllm.python import distributed, kernels
+from xllm.python.attention.backend import LayerCache
 from xllm.python.kernels_npu.causal_conv1d import (
     causal_conv1d_decode as npu_causal_conv1d_decode,
 )
@@ -54,6 +52,9 @@ from xllm.python.layers.npu.qwen3_5.decoder_layer import (
 )
 from xllm.python.layers.npu.qwen3_5.gated_delta_net import (
     NpuQwen3_5GatedDeltaNet,
+    _build_mega_prefill_indices,
+    _compute_mega_prefill_num_matrices,
+    _get_or_build_mega_prefill_plan,
 )
 from xllm.python.layers.npu.qwen3_5.moe import (
     NpuQwen3_5SparseMoEBlock,
@@ -83,6 +84,61 @@ distributed.moe_ep_all_reduce = MagicMock()
 
 def test_npu_decoder_factory_selects_privateuseone_backend() -> None:
     assert get_qwen3_5_decoder_layer_class("privateuseone") is NpuQwen3_5DecoderLayer
+
+
+def test_npu_gdn_rejects_unsupported_rms_norm_epsilon() -> None:
+    cfg = _config(rms_norm_eps=1e-5)
+
+    with pytest.raises(NotImplementedError, match="fixed epsilon"):
+        NpuQwen3_5GatedDeltaNet(
+            cfg,
+            0,
+            torch.bfloat16,
+            torch.device("cpu"),
+        )
+
+
+def test_npu_gdn_accepts_float32_supported_rms_norm_epsilon() -> None:
+    float32_epsilon = float(torch.tensor(1e-6, dtype=torch.float32).item())
+    cfg = _config(rms_norm_eps=float32_epsilon)
+
+    layer = NpuQwen3_5GatedDeltaNet(
+        cfg,
+        0,
+        torch.bfloat16,
+        torch.device("cpu"),
+    )
+
+    assert layer.cfg.rms_norm_eps == float32_epsilon
+
+
+@pytest.mark.parametrize(
+    ("num_key_heads", "num_value_heads", "error"),
+    (
+        (3, 3, "power-of-two"),
+        (1, 6, "at most four"),
+    ),
+)
+def test_npu_gdn_rejects_geometry_unsupported_by_decode(
+    num_key_heads: int,
+    num_value_heads: int,
+    error: str,
+) -> None:
+    cfg = _config(
+        linear_num_key_heads=num_key_heads,
+        linear_num_value_heads=num_value_heads,
+        tp_size=1,
+        world_size=1,
+        moe_tp_size=1,
+    )
+
+    with pytest.raises(NotImplementedError, match=error):
+        NpuQwen3_5GatedDeltaNet(
+            cfg,
+            0,
+            torch.bfloat16,
+            torch.device("cpu"),
+        )
 
 
 def test_npu_gdn_loads_native_conv_weight_layout() -> None:
@@ -122,31 +178,196 @@ def test_npu_gdn_loads_native_conv_weight_layout() -> None:
     )
 
 
-def test_npu_decode_uses_npu_recurrent_kernel(monkeypatch) -> None:
-    conv = MagicMock(return_value=torch.zeros(1, 24))
-    recurrent = MagicMock(return_value=torch.zeros(1, 1, 2, 4))
-    rms = MagicMock(side_effect=lambda output, *_args: output)
-    monkeypatch.setattr(kernels, "causal_conv1d_decode", conv, raising=False)
-    monkeypatch.setattr(
-        kernels,
-        "fused_sigmoid_gating_delta_rule_decode",
-        recurrent,
-        raising=False,
+def test_npu_gdn_packs_rank_local_projection_weights() -> None:
+    cfg = _config(
+        hidden_size=8,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        shared_expert_intermediate_size=0,
+        tp_size=2,
+        tp_rank=1,
+        world_size=2,
+        moe_tp_size=2,
     )
-    monkeypatch.setattr(kernels, "rms_norm_gated", rms, raising=False)
+    layer = NpuQwen3_5GatedDeltaNet(
+        cfg,
+        0,
+        torch.float32,
+        torch.device("cpu"),
+    )
+    global_key_dim = 16
+    global_value_dim = 16
+    global_conv_dim = 2 * global_key_dim + global_value_dim
+    qkv = torch.arange(global_conv_dim * 8, dtype=torch.float32).view(
+        global_conv_dim,
+        8,
+    )
+    z = torch.arange(global_value_dim * 8, dtype=torch.float32).view(
+        global_value_dim,
+        8,
+    )
+    b = torch.arange(4 * 8, dtype=torch.float32).view(4, 8)
+    a = b + 1000
+    tensors = {
+        "linear_attn.in_proj_qkv.weight": qkv,
+        "linear_attn.in_proj_z.weight": z,
+        "linear_attn.in_proj_b.weight": b,
+        "linear_attn.in_proj_a.weight": a,
+        "linear_attn.conv1d.weight": torch.zeros(global_conv_dim, 1, 4),
+        "linear_attn.A_log": torch.zeros(4),
+        "linear_attn.dt_bias": torch.zeros(4),
+        "linear_attn.norm.weight": torch.zeros(4),
+        "linear_attn.out_proj.weight": torch.zeros(8, global_value_dim),
+    }
 
+    layer.load_weights(
+        ScopedWeightLoader([_StateDict(tensors)], "linear_attn."),
+        ParallelLoadContext(tp_rank=1, tp_size=2),
+    )
+
+    q, k, v = qkv.split((global_key_dim, global_key_dim, global_value_dim))
+    expected_qkv = torch.cat((q.chunk(2)[1], k.chunk(2)[1], v.chunk(2)[1]))
+    qkv_weight, z_weight, b_weight, a_weight = layer._input_projection_weight_views()
+    torch.testing.assert_close(qkv_weight, expected_qkv)
+    torch.testing.assert_close(z_weight, z.chunk(2)[1])
+    torch.testing.assert_close(b_weight, b.chunk(2)[1])
+    torch.testing.assert_close(a_weight, a.chunk(2)[1])
+    assert qkv_weight.is_contiguous()
+    assert z_weight.is_contiguous()
+    assert qkv_weight.untyped_storage().data_ptr() == z_weight.untyped_storage().data_ptr()
+    assert b_weight.untyped_storage().data_ptr() == a_weight.untyped_storage().data_ptr()
+
+
+def test_npu_gdn_prefill_uses_packed_weight_views(monkeypatch) -> None:
     layer = NpuQwen3_5GatedDeltaNet(
         _linear_config(),
         0,
         torch.float32,
         torch.device("cpu"),
     )
-    _install_constant_gdn_projections(layer)
+    with torch.no_grad():
+        layer.in_proj_qkvz.weight.copy_(
+            torch.arange(layer.in_proj_qkvz.weight.numel(), dtype=torch.float32).view_as(layer.in_proj_qkvz.weight)
+        )
+        layer.in_proj_ba.weight.copy_(
+            torch.arange(layer.in_proj_ba.weight.numel(), dtype=torch.float32).view_as(layer.in_proj_ba.weight)
+        )
+    qkvz_forward = MagicMock(wraps=layer.in_proj_qkvz.forward)
+    ba_forward = MagicMock(wraps=layer.in_proj_ba.forward)
+    monkeypatch.setattr(layer.in_proj_qkvz, "forward", qkvz_forward)
+    monkeypatch.setattr(layer.in_proj_ba, "forward", ba_forward)
 
-    with forward_context(_gdn_forward_context(is_prefill=False)):
-        assert layer(torch.zeros(1, 8)).shape == (1, 8)
+    prefill_outputs = layer._project_prefill_inputs(torch.ones(2, 8))
+    qkvz_forward.assert_not_called()
+    ba_forward.assert_not_called()
+    assert [tuple(output.shape) for output in prefill_outputs] == [
+        (2, 24),
+        (2, 2),
+        (2, 2),
+        (2, 2, 4),
+    ]
 
-    recurrent.assert_called_once()
+
+def test_npu_decode_uses_mega_fusion_boundary(monkeypatch) -> None:
+    batch_size = 33
+    calls = MagicMock()
+    mega = MagicMock(side_effect=lambda _qkv, z, *_args: torch.zeros_like(z))
+    rms = MagicMock(side_effect=lambda output, *_args: output)
+    calls.attach_mock(mega, "mega")
+    calls.attach_mock(rms, "rms")
+    monkeypatch.setattr(kernels, "mega_gdn_decode", mega, raising=False)
+    monkeypatch.setattr(kernels, "causal_conv1d_decode", MagicMock(), raising=False)
+    monkeypatch.setattr(kernels, "fused_sigmoid_gating_delta_rule_decode", MagicMock(), raising=False)
+    monkeypatch.setattr(kernels, "rms_norm_gated", rms, raising=False)
+
+    cfg = _config(
+        hidden_size=8,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        shared_expert_intermediate_size=0,
+        tp_size=1,
+        world_size=1,
+        moe_tp_size=1,
+    )
+    layer = NpuQwen3_5GatedDeltaNet(
+        cfg,
+        0,
+        torch.bfloat16,
+        torch.device("cpu"),
+    )
+    with torch.no_grad():
+        layer.in_proj_qkvz.weight.zero_()
+        layer.in_proj_ba.weight.zero_()
+    qkvz_forward = MagicMock(wraps=layer.in_proj_qkvz.forward)
+    ba_forward = MagicMock(wraps=layer.in_proj_ba.forward)
+    monkeypatch.setattr(layer.in_proj_qkvz, "forward", qkvz_forward)
+    monkeypatch.setattr(layer.in_proj_ba, "forward", ba_forward)
+    layer.out_proj = torch.nn.Identity()
+    state_indices = torch.arange(1, batch_size + 1, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        linear_state_indices=state_indices,
+        has_initial_state=None,
+        q_cu_seq_lens=None,
+        q_seq_lens_host=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+    )
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[
+            LayerCache(
+                key=None,
+                value=None,
+                conv=torch.zeros(
+                    batch_size + 1,
+                    3,
+                    384,
+                    dtype=torch.bfloat16,
+                ),
+                ssm=torch.zeros(
+                    batch_size + 1,
+                    1,
+                    128,
+                    128,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+
+    with forward_context(context):
+        assert layer(torch.zeros(batch_size, 8, dtype=torch.bfloat16)).shape == (
+            batch_size,
+            128,
+        )
+
+    assert [call[0] for call in calls.mock_calls] == ["mega", "mega"]
+    assert [call.args[0].shape[0] for call in mega.call_args_list] == [32, 1]
+    torch.testing.assert_close(mega.call_args_list[0].args[9], state_indices[:32])
+    torch.testing.assert_close(mega.call_args_list[0].args[10], state_indices[:32])
+    torch.testing.assert_close(mega.call_args_list[1].args[9], state_indices[32:])
+    torch.testing.assert_close(mega.call_args_list[1].args[10], state_indices[32:])
+    qkvz_forward.assert_called_once()
+    ba_forward.assert_called_once()
+    kernels.causal_conv1d_decode.assert_not_called()
+    kernels.fused_sigmoid_gating_delta_rule_decode.assert_not_called()
+    rms.assert_not_called()
 
 
 def test_npu_moe_loads_native_weight_order() -> None:
@@ -221,60 +442,147 @@ def test_npu_moe_loads_native_weight_order() -> None:
 
 def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch) -> None:
     calls = MagicMock()
-    conv_qkv = MagicMock(
-        return_value=(
-            torch.zeros(1, 1, 2, 4),
-            torch.zeros(1, 1, 2, 4),
-            torch.zeros(1, 1, 2, 4),
-        )
-    )
-    gating = MagicMock(
-        return_value=(
-            torch.zeros(1, 1, 2),
-            torch.zeros(1, 1, 2),
-        )
-    )
-    chunk = MagicMock(
-        return_value=(
-            torch.zeros(1, 2, 4),
-            torch.zeros(1, 2, 4, 4),
-        )
-    )
+    mega = MagicMock(return_value=torch.zeros(1, 1, 128, dtype=torch.bfloat16))
     rms = MagicMock(side_effect=lambda output, *_args: output)
-    for name, mock in (
-        ("conv_qkv", conv_qkv),
-        ("gating", gating),
-        ("chunk", chunk),
-        ("rms", rms),
-    ):
+    for name, mock in (("mega", mega), ("rms", rms)):
         calls.attach_mock(mock, name)
-    monkeypatch.setattr(
-        kernels,
-        "causal_conv1d_qkv_prefill",
-        conv_qkv,
-        raising=False,
-    )
-    monkeypatch.setattr(kernels, "fused_gdn_gating", gating, raising=False)
-    monkeypatch.setattr(kernels, "chunk_gated_delta_rule", chunk, raising=False)
+    monkeypatch.setattr(kernels, "mega_gdn_prefill", mega, raising=False)
     monkeypatch.setattr(kernels, "rms_norm_gated", rms, raising=False)
+    for old_kernel in (
+        "causal_conv1d_qkv_prefill",
+        "fused_gdn_gating",
+        "chunk_gated_delta_rule",
+    ):
+        monkeypatch.setattr(kernels, old_kernel, MagicMock(), raising=False)
 
+    cfg = _config(
+        hidden_size=8,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        shared_expert_intermediate_size=0,
+        tp_size=1,
+        world_size=1,
+        moe_tp_size=1,
+    )
     layer = NpuQwen3_5GatedDeltaNet(
-        _linear_config(),
+        cfg,
         0,
-        torch.float32,
+        torch.bfloat16,
         torch.device("cpu"),
     )
-    _install_constant_gdn_projections(layer)
-    with forward_context(_gdn_forward_context(is_prefill=True)):
-        output = layer(torch.zeros(1, 8))
+    with torch.no_grad():
+        layer.in_proj_qkvz.weight.zero_()
+        layer.in_proj_ba.weight.zero_()
+    layer.out_proj = torch.nn.Identity()
+    metadata = SimpleNamespace(
+        linear_state_indices=torch.tensor([2], dtype=torch.int32),
+        linear_state_read_indices=torch.tensor([1], dtype=torch.int32),
+        linear_state_write_indices=torch.tensor([2], dtype=torch.int32),
+        has_initial_state=torch.tensor([True], dtype=torch.bool),
+        q_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        is_prefill=True,
+        is_chunked_prefill=False,
+    )
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[
+            LayerCache(
+                key=None,
+                value=None,
+                conv=torch.zeros(3, 3, 384, dtype=torch.bfloat16),
+                ssm=torch.zeros(3, 1, 128, 128, dtype=torch.float32),
+            )
+        ],
+    )
+    with forward_context(context):
+        output = layer(torch.zeros(1, 8, dtype=torch.bfloat16))
 
-    assert output.shape == (1, 8)
-    assert [call[0] for call in calls.mock_calls] == [
-        "conv_qkv",
-        "gating",
-        "chunk",
-        "rms",
-    ]
+    assert output.shape == (1, 128)
+    assert [call[0] for call in calls.mock_calls] == ["mega"]
+    kernels.causal_conv1d_qkv_prefill.assert_not_called()
+    kernels.fused_gdn_gating.assert_not_called()
+    kernels.chunk_gated_delta_rule.assert_not_called()
+    args = mega.call_args.args
+    torch.testing.assert_close(args[8], torch.tensor([1], dtype=torch.int32))
+    torch.testing.assert_close(args[9], torch.tensor([2], dtype=torch.int32))
+    torch.testing.assert_close(args[10], torch.tensor([1], dtype=torch.int32))
+    torch.testing.assert_close(args[11], torch.tensor([2], dtype=torch.int32))
+    assert args[15] == 1
+
+
+def test_npu_mega_prefill_builds_checkpoint_indices() -> None:
+    conv_read, conv_write, ssm_read, ssm_write = _build_mega_prefill_indices(
+        torch.tensor([1, 3], dtype=torch.int32),
+        torch.tensor([2, 4], dtype=torch.int32),
+        torch.tensor([False, True]),
+        checkpoint_stride=2,
+    )
+
+    torch.testing.assert_close(conv_read, torch.tensor([-1, 3], dtype=torch.int32))
+    torch.testing.assert_close(conv_write, torch.tensor([2, 4], dtype=torch.int32))
+    torch.testing.assert_close(ssm_read, torch.tensor([-1, 6], dtype=torch.int32))
+    torch.testing.assert_close(ssm_write, torch.tensor([4, 8], dtype=torch.int32))
+
+
+def test_npu_mega_prefill_plan_is_shared_within_one_forward() -> None:
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=SimpleNamespace(),
+        layer_caches=[],
+    )
+    read_state_indices = torch.tensor([1, 3], dtype=torch.int32)
+    write_state_indices = torch.tensor([2, 4], dtype=torch.int32)
+    has_initial_state = torch.tensor([False, True])
+    query_lengths_host = torch.tensor([127, 129], dtype=torch.int32)
+
+    with forward_context(context):
+        first = _get_or_build_mega_prefill_plan(
+            read_state_indices,
+            write_state_indices,
+            has_initial_state,
+            query_lengths_host,
+            checkpoint_stride=2,
+            num_value_heads=3,
+        )
+        second = _get_or_build_mega_prefill_plan(
+            read_state_indices,
+            write_state_indices,
+            has_initial_state,
+            query_lengths_host,
+            checkpoint_stride=2,
+            num_value_heads=3,
+        )
+
+    assert first is second
+    assert first.num_sequences == 2
+    assert first.num_tokens == 256
+    assert first.num_matrices == 9
+
+
+@pytest.mark.parametrize(
+    ("query_lengths", "num_value_heads", "expected"),
+    (
+        ([1], 2, 2),
+        ([127, 128, 129], 3, 12),
+    ),
+)
+def test_npu_mega_prefill_num_matrices(
+    query_lengths: list[int],
+    num_value_heads: int,
+    expected: int,
+) -> None:
+    assert _compute_mega_prefill_num_matrices(query_lengths, num_value_heads) == expected
 
 
 def test_npu_decode_passes_native_weight_and_cache_to_tilelang(

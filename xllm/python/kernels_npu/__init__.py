@@ -39,6 +39,8 @@ _EXPORTS = {
         "chunk_gated_delta_rule",
         "fused_gdn_gating",
         "fused_sigmoid_gating_delta_rule_decode",
+        "mega_gdn_decode",
+        "mega_gdn_prefill",
     ),
     "linear": ("prepare_quant_weight", "prepare_row_parallel_weight"),
     "mla": (
@@ -175,6 +177,8 @@ __all__ = [
     "fused_gdn_gating",
     "fused_sigmoid_gating_delta_rule_decode",
     "chunk_gated_delta_rule",
+    "mega_gdn_decode",
+    "mega_gdn_prefill",
 ]
 _runtime_initialized = False
 

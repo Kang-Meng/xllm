@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -77,6 +77,10 @@ class ForwardContext:
     # Context-Parallel sharding plan for this forward, or None when CP is off
     # (cp_size <= 1) or the step is decode (CP is prefill-only).
     cp_context: CpContext | None = None
+    # Values derived from per-forward metadata that are shared by multiple
+    # layers. A new ForwardContext gets a new cache, so entries never leak
+    # across requests or graph executions.
+    layer_shared_cache: dict[object, object] = field(default_factory=dict)
 
 
 _current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)

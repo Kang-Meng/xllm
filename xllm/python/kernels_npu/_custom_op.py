@@ -98,6 +98,76 @@ def _chunk_gated_delta_rule_fake(
     return torch.empty_like(v), torch.empty_like(initial_state)
 
 
+def _mega_gdn_prefill_fake(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    z: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    conv_state_read_indices: torch.Tensor,
+    conv_state_write_indices: torch.Tensor,
+    ssm_state_read_indices: torch.Tensor,
+    ssm_state_write_indices: torch.Tensor,
+    ssm_cache: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    norm_weight: torch.Tensor,
+    num_matrices: int,
+) -> torch.Tensor:
+    del (
+        mixed_qkv,
+        b,
+        a,
+        conv_weight,
+        conv_state,
+        a_log,
+        dt_bias,
+        conv_state_read_indices,
+        conv_state_write_indices,
+        ssm_state_read_indices,
+        ssm_state_write_indices,
+        ssm_cache,
+        cu_seqlens,
+        norm_weight,
+        num_matrices,
+    )
+    return torch.empty_like(z)
+
+
+def _mega_gdn_decode_fake(
+    qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state: torch.Tensor,
+    read_state_indices: torch.Tensor,
+    write_state_indices: torch.Tensor,
+    norm_weight: torch.Tensor,
+    fla_ssm_state_layout: bool,
+) -> torch.Tensor:
+    del (
+        qkv,
+        b,
+        a,
+        conv_weight,
+        conv_state,
+        a_log,
+        dt_bias,
+        ssm_state,
+        read_state_indices,
+        write_state_indices,
+        norm_weight,
+        fla_ssm_state_layout,
+    )
+    return torch.empty_like(z)
+
+
 def _causal_conv1d_qkv_prefill_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1062,6 +1132,8 @@ register_fake("xllm_ops::rms_norm", _rms_norm_fake)
 register_fake("xllm_ops::rms_norm_gated", _rms_norm_gated_fake)
 register_fake("xllm_ops::l2_norm", _l2_norm_fake)
 register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)
+register_fake("xllm_ops::mega_gdn_prefill", _mega_gdn_prefill_fake)
+register_fake("xllm_ops::mega_gdn_decode", _mega_gdn_decode_fake)
 register_fake("xllm_ops::causal_conv1d_qkv_prefill", _causal_conv1d_qkv_prefill_fake)
 register_fake(
     "xllm_ops::fused_sigmoid_gating_delta_rule_decode",

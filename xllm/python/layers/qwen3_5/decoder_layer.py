@@ -26,8 +26,6 @@ from xllm.python.layers.qwen3_5.common import (
     PartialRotaryEmbedding,
     Qwen3_5DecoderConfig,
 )
-from xllm.python.layers.qwen3_5.gated_delta_net import Qwen3_5GatedDeltaNetBase
-from xllm.python.layers.qwen3_5.moe import Qwen3_5SparseMoEBlockBase
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
 
 
@@ -40,12 +38,8 @@ class Qwen3_5DecoderLayer(nn.Module):
     """
 
     attention_cls: type[Qwen3_5Attention]
-    gated_delta_net_cls: type[Qwen3_5GatedDeltaNetBase]
-    sparse_moe_cls: type[Qwen3_5SparseMoEBlockBase]
-
-    self_attn: Qwen3_5Attention
-    linear_attn: Qwen3_5GatedDeltaNetBase
-    mlp: Qwen3_5SparseMoEBlockBase | GatedMLP
+    gated_delta_net_cls: type[nn.Module]
+    sparse_moe_cls: type[nn.Module]
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)

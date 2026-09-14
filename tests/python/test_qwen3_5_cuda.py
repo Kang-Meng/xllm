@@ -205,6 +205,7 @@ def test_cuda_decode_uses_cuda_recurrent_kernel(monkeypatch) -> None:
         assert layer(torch.zeros(1, 8)).shape == (1, 8)
 
     recurrent.assert_called_once()
+    rms.assert_called_once()
 
 
 def test_cuda_moe_loads_native_weight_order() -> None:

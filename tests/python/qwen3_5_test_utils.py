@@ -119,6 +119,7 @@ def make_gdn_forward_context(*, is_prefill: bool) -> ForwardContext:
         linear_state_indices=torch.tensor([1], dtype=torch.int32),
         has_initial_state=(torch.tensor([False], dtype=torch.bool) if is_prefill else None),
         q_cu_seq_lens=(torch.tensor([0, 1], dtype=torch.int32) if is_prefill else None),
+        q_seq_lens_host=(torch.tensor([1], dtype=torch.int32) if is_prefill else None),
         is_prefill=is_prefill,
         is_chunked_prefill=False,
     )
