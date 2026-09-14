@@ -191,9 +191,7 @@ void restore_linear_state_slots(
           << "linear-state reset must not carry a restore source";
       continue;
     }
-    if (!cache_op.restore_requested) {
-      CHECK_LT(cache_op.restore_src_slot_id, 0)
-          << "linear-state source requires restore_requested=true";
+    if (!cache_op.restore_requested && cache_op.restore_src_slot_id < 0) {
       continue;
     }
     const int32_t src_slot_id = cache_op.restore_src_slot_id;
@@ -225,17 +223,22 @@ void restore_linear_state_slots(
       pending_reset_rows.push_back(i);
       continue;
     }
-    if (!cache_op.restore_requested) {
+    if (!cache_op.restore_requested && cache_op.restore_src_slot_id < 0) {
       continue;
     }
 
     flush_resets();
     const int32_t live_slot_id = cache_op.linear_state_id;
     const int32_t src_slot_id = cache_op.restore_src_slot_id;
-    copy_slot_across_layers(kv_caches, live_slot_id, src_slot_id);
+    if (cache_op.restore_requested) {
+      copy_slot_across_layers(kv_caches, live_slot_id, src_slot_id);
+      VLOG(1) << "linear state checkpoint restored; live_slot_id="
+              << live_slot_id << ", src_slot_id=" << src_slot_id;
+    } else {
+      VLOG(1) << "linear state checkpoint read directly; live_slot_id="
+              << live_slot_id << ", src_slot_id=" << src_slot_id;
+    }
     validity_mask[i] = 1;
-    VLOG(1) << "Qwen3.5 linear state checkpoint restored; live_slot_id="
-            << live_slot_id << ", src_slot_id=" << src_slot_id;
   }
   flush_resets();
 }

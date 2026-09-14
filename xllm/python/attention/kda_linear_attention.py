@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 
+from xllm.python.attention.backend import resolve_linear_state_io_indices
 from xllm.python.attention.kda_constants import (
     _KDA_NO_COORD,
     _KDA_SEQWISE,
@@ -176,8 +177,10 @@ class KdaLinearAttentionMixin:
         raw_mixed, raw_gate, raw_beta = mixed_qkv, gate, beta
         chain_seqs: dict = {}
 
-        idx = metadata.linear_state_indices
+        read_idx, idx = resolve_linear_state_io_indices(metadata)
+        is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
         num_seqs = idx.shape[0] if idx is not None else batch_size
+        merged_q_cu: Optional[torch.Tensor] = None
         # ACL-graph decode with a flattened batch: the model forward unsqueezes
         # the 1-D ``[num_seqs]`` decode input into ``[1, num_seqs]``, so
         # mixed_qkv arrives as ``[1, conv_dim, num_seqs]`` with idx
@@ -226,6 +229,8 @@ class KdaLinearAttentionMixin:
         else:
             if idx.dtype != torch.int64:
                 idx = idx.to(torch.int64)
+            if read_idx is not None and read_idx.dtype != torch.int64:
+                read_idx = read_idx.to(torch.int64)
             # MTP spec-verify expands one logical sequence into consecutive
             # batch rows (bonus + drafted tokens, e.g. q_cu=[0,1,2,3,4] for
             # two k=1 sequences, kv=[n,n+1,m,m+1] per row) while
@@ -238,7 +243,6 @@ class KdaLinearAttentionMixin:
             # position instead (rows==seqs) silently drops the tail rows of
             # every sequence past the first and corrupts the view/layout
             # downstream.
-            merged_q_cu: Optional[torch.Tensor] = None
             merged_row0: list = []
             q_cu_raw = metadata.q_cu_seq_lens
             if (
@@ -531,9 +535,13 @@ class KdaLinearAttentionMixin:
                     )
                     for _bi, (_lid, _sl) in enumerate(_b_scatter):
                         self._kv_caches[_lid].ssm[_sl] = _bst[_bi].to(self._kv_caches[_lid].ssm.dtype)
-            conv_i = conv_cache.index_select(0, idx)
+            # Direct read is only valid before any spec-verify row merge. Once
+            # merged_q_cu is set, idx has one slot per sequence while read_idx
+            # still describes the original per-row metadata.
+            state_read_idx = read_idx if is_prefill and merged_q_cu is None else idx
+            conv_i = conv_cache.index_select(0, state_read_idx)
             conv_i = conv_i.transpose(1, 2).contiguous()
-            ssm_i = ssm_cache.index_select(0, idx)
+            ssm_i = ssm_cache.index_select(0, state_read_idx)
             his = metadata.has_initial_state
             if his is not None and len(his) == num_seqs:
                 if not isinstance(his, torch.Tensor):
@@ -559,7 +567,6 @@ class KdaLinearAttentionMixin:
         # Route on metadata, not seq_len: MTP/spec decode can carry multiple
         # tokens per sequence (seq_len > 1) but is still a decode step; the
         # seq_len heuristic would wrongly send it to the chunked prefill path.
-        is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
         device = mixed_qkv.device
         # Spec-verify (merged same-slot rows) commits lazily via the
         # kv-delta scheme in the flattened branch; see the comments there.
