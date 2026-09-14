@@ -291,7 +291,7 @@ TEST(LinearStateRestoreTest, MissingRestoreSourceFailsClosed) {
 
   EXPECT_DEATH(
       restore_linear_state_slots(cache.kv_caches, {restore}, validity_mask),
-      "restore source must be a real non-padding slot");
+      "restore requires a valid source slot");
 }
 
 TEST(LinearStateRestoreTest, PaddingLiveSlotFailsClosed) {
@@ -316,7 +316,7 @@ TEST(LinearStateRestoreTest, PaddingRestoreSourceFailsClosed) {
 
   EXPECT_DEATH(
       restore_linear_state_slots(cache.kv_caches, {restore}, validity_mask),
-      "restore source must be a real non-padding slot");
+      "linear-state source must be a real non-padding slot");
 }
 
 TEST(LinearStateRestoreTest, OutOfRangeSlotFailsClosed) {

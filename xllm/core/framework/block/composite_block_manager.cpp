@@ -249,8 +249,10 @@ CompositeBlockManager::LeafMap build_composite_leaves(
   return leaves;
 }
 
-CompositeBlockManager::CompositeBlockManager(LeafMap leaves)
-    : BlockManager(BlockManager::Options()),
+CompositeBlockManager::CompositeBlockManager(
+    LeafMap leaves,
+    const BlockManager::Options& options)
+    : BlockManager(options),
       leaves_(std::move(leaves)),
       combination_(classify_leaf_combination(leaves_)) {
   CHECK(!leaves_.empty()) << "CompositeBlockManager requires at least one leaf";

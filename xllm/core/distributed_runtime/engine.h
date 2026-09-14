@@ -30,6 +30,7 @@ limitations under the License.
 #include "runtime/options.h"
 
 namespace xllm {
+
 class Engine {
  public:
   virtual ~Engine() = default;

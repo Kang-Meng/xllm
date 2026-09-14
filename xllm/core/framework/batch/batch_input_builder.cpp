@@ -32,6 +32,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -43,6 +44,7 @@ limitations under the License.
 #include "layers/common/attention_metadata.h"
 #endif
 #include "models/vlm/mposition/mposition.h"
+#include "platform/platform.h"
 #include "runtime/params_utils.h"
 #include "util/blocking_counter.h"
 #include "util/tensor_helper.h"
@@ -184,6 +186,18 @@ torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
                            .dtype(torch::kInt)
                            .device(torch::kCPU)
                            .pinned_memory(true));
+}
+
+// Native Qwen3.5 prefill on NPU can read the checkpoint slot directly without
+// a restore D2D copy when out-of-place linear state is enabled.
+bool should_read_linear_state_out_of_place(const ModelArgs* args,
+                                           const Sequence* sequence) {
+  return args != nullptr && sequence != nullptr &&
+         sequence->is_prefill_stage() && Platform::is_npu() &&
+         !ModelConfig::is_python_model_impl(
+             ModelConfig::get_instance().model_impl()) &&
+         is_qwen3_5_target_model_type(args->model_type()) &&
+         SchedulerConfig::get_instance().enable_linear_state_out_of_place();
 }
 
 // Save linear state only at a shared chunk and KV-block boundary.
@@ -911,9 +925,13 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
   linear_state_cache_op.reset_requested = n_kv_cache_tokens == 0;
   const int32_t chunk_stride = ::xllm::SchedulerConfig::get_instance()
                                    .max_tokens_per_chunk_for_prefill();
+  const bool has_restore_source = sequence->has_linear_restore_src_block();
   const bool needs_restore_hash =
-      sequence->has_linear_restore_src_block() &&
+      has_restore_source && sequence->is_prefill_stage() &&
       should_save_linear_checkpoint(sequence, n_kv_cache_tokens, chunk_stride);
+  const bool needs_restore =
+      has_restore_source &&
+      (needs_restore_hash || !sequence->is_prefill_stage());
   // Exit-boundary save: persist the live state only when this prefill step
   // lands on a chunk-end boundary, so the linear-state cache stays a sparse
   // per-chunk overlay on top of the per-block KV cache.
@@ -936,15 +954,18 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
   // then the owning Batch, which pins it until the worker result is consumed.
   std::optional<Block> mounted_restore_src =
       sequence->take_linear_restore_src_block();
-  if (needs_restore_hash) {
-    const size_t restore_chunk_idx =
-        static_cast<size_t>(n_kv_cache_tokens) / chunk_stride - 1;
-    CHECK_LT(restore_chunk_idx, linear_state_hashes.size())
-        << "mounted linear-state checkpoint must have a matching chunk hash";
+  if (needs_restore) {
+    if (needs_restore_hash) {
+      const size_t restore_chunk_idx =
+          static_cast<size_t>(n_kv_cache_tokens) / chunk_stride - 1;
+      CHECK_LT(restore_chunk_idx, linear_state_hashes.size())
+          << "mounted linear-state checkpoint must have a matching chunk hash";
+    }
     CHECK(mounted_restore_src.has_value())
         << "linear-state restore must resolve its checkpoint slot before "
            "building worker input";
-    linear_state_cache_op.restore_requested = true;
+    linear_state_cache_op.restore_requested =
+        !should_read_linear_state_out_of_place(args_, sequence);
     linear_state_cache_op.restore_src_slot_id = mounted_restore_src->id();
     state.linear_restore_src_blocks.emplace_back(
         std::move(*mounted_restore_src));

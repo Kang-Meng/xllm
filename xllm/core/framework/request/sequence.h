@@ -263,7 +263,7 @@ class Sequence final {
   bool has_pending_linear_save() const {
     return kv_state_.has_pending_linear_save();
   }
-  void set_linear_restore_src_block(Block&& block) {
+  void set_linear_restore_src_block(Block block) {
     kv_state_.set_linear_restore_src_block(std::move(block));
   }
   bool has_linear_restore_src_block() const {

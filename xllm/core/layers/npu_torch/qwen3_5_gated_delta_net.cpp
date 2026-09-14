@@ -93,6 +93,7 @@ torch::Tensor graph_safe_indices(const torch::Tensor& indices,
 MegaGdnPrefillIndices build_prefill_indices(
     const std::vector<int32_t>& live_slots,
     const std::vector<int64_t>& validity_mask,
+    const std::vector<LinearStateCacheOp>& cache_ops,
     int64_t checkpoint_stride,
     int64_t num_slots,
     const torch::Device& device) {
@@ -100,6 +101,9 @@ MegaGdnPrefillIndices build_prefill_indices(
   check_live_slots(live_slots, batch_size, num_slots);
   CHECK_EQ(static_cast<int64_t>(validity_mask.size()), batch_size)
       << "linear_state_validity_mask must be sequence-scoped.";
+  CHECK(cache_ops.empty() ||
+        static_cast<int64_t>(cache_ops.size()) == batch_size)
+      << "linear_state_cache_ops must be empty or sequence-scoped.";
   CHECK_GT(checkpoint_stride, 0) << "checkpoint stride must be positive.";
   CHECK_LE(checkpoint_stride,
            static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
@@ -121,7 +125,16 @@ MegaGdnPrefillIndices build_prefill_indices(
     CHECK(validity_mask[i] == 0 || validity_mask[i] == 1)
         << "linear state validity must be 0 or 1.";
     const int32_t live_slot = live_slots[i];
-    const int32_t read_slot = validity_mask[i] == 0 ? -1 : live_slot;
+    int32_t read_slot = validity_mask[i] == 0 ? -1 : live_slot;
+    if (!cache_ops.empty()) {
+      const LinearStateCacheOp& cache_op = cache_ops[i];
+      CHECK_EQ(cache_op.linear_state_id, live_slot)
+          << "linear state descriptor and live slots must stay aligned.";
+      if (!cache_op.restore_requested && cache_op.restore_src_slot_id >= 0) {
+        CHECK_LT(static_cast<int64_t>(cache_op.restore_src_slot_id), num_slots);
+        read_slot = cache_op.restore_src_slot_id;
+      }
+    }
     conv_read.emplace_back(read_slot);
     conv_write.emplace_back(live_slot);
     ssm_read.emplace_back(read_slot < 0 ? -1 : read_slot * stride);
@@ -495,6 +508,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     MegaGdnPrefillIndices indices =
         build_prefill_indices(live_slots,
                               input_params.linear_state_validity_mask,
+                              input_params.linear_state_cache_ops,
                               checkpoint_stride,
                               num_slots,
                               device);
