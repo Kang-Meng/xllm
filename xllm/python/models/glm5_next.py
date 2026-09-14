@@ -671,21 +671,41 @@ class Glm5NextForgetGate(nn.Module):
         self.A_log = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.safe_gate_lower_bound = cfg.linear_lower_bound
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_shape = (*hidden_states.shape[:2], -1, self.head_dim)
-        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states))
-        g = (forget_gate.float() + self.dt_bias.float().view(1, 1, -1)).view(hidden_shape)
-        decay_rate = torch.exp(self.A_log.float().view(1, 1, self.num_heads, 1))
+    def raw_projection(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Pre-gate forget projection ``f_b(f_a(x))`` (no dt_bias, no sigmoid).
 
+        Fed to ``recurrent_kda``/``chunk_kda_fwd`` with ``use_gate_in_kernel=True``
+        so the kernel computes the safe-gate ``lower_bound * sigmoid(exp(A_log) *
+        (raw + dt_bias))`` internally (bit-exact to :meth:`gate_from_raw`,
+        verified on NPU). The MTP verify / cross-layer paths still need the
+        materialized gate (:meth:`gate_from_raw`).
+
+        Returned in the same ``[B, S, num_heads, head_dim]`` layout as the
+        materialized gate so the backend can treat it identically to ``gate``.
+        """
+        hidden_shape = (*hidden_states.shape[:2], -1, self.head_dim)
+        return self.f_b_proj(self.f_a_proj(hidden_states)).view(hidden_shape)
+
+    def gate_from_raw(self, raw: torch.Tensor) -> torch.Tensor:
+        """Materialize the safe-gate from the raw projection (:meth:`raw_projection`).
+
+        ``raw`` is ``[B, S, num_heads, head_dim]``; ``dt_bias`` is flat
+        ``[num_heads*head_dim]`` so it broadcasts over the same head-major
+        layout the raw view already carries.
+        """
+        g = raw.float() + self.dt_bias.float().view(1, 1, self.num_heads, self.head_dim)
+        decay_rate = torch.exp(self.A_log.float().view(1, 1, self.num_heads, 1))
         # Safe lower bound decay (reference Glm5NextTextForgetGate): when a bound
         # is set, the gate is `-bound * sigmoid(decay_rate * g)` instead of the
         # softplus form. For the default config linear_lower_bound=-5.0 -> this
         # branch is taken.
         if self.safe_gate_lower_bound is not None:
             return self.safe_gate_lower_bound * torch.sigmoid(decay_rate * g)
-
         g_softplus = torch.where(g > 20.0, g, torch.log(1.0 + torch.exp(g)))
         return -decay_rate * g_softplus
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.gate_from_raw(self.raw_projection(hidden_states))
 
 
 class Glm5NextKdaAttention(Attention):
@@ -786,7 +806,13 @@ class Glm5NextKdaAttention(Attention):
             dim=-1,
         ).transpose(1, 2)  # [B, 3*qkv_dim, S]
 
-        g = self.forget_gate(hidden_states)
+        # Compute the raw forget-gate projection once and hand it to the
+        # backend. The plain decode/prefill kernels fuse the safe-gate from the
+        # raw in-kernel (no python-side gate materialization); the MTP verify /
+        # cross-layer / mask paths materialize the gate from the same raw inside
+        # the backend, only when they actually need it (bit-exact, no second
+        # f_a/f_b GEMM).
+        g_raw = self.forget_gate.raw_projection(hidden_states)
         beta = torch.sigmoid(self.b_proj(hidden_states))
 
         # KDA conv1d + delta-rule + conv/ssm state is owned by the backend
@@ -798,7 +824,7 @@ class Glm5NextKdaAttention(Attention):
             raise RuntimeError(
                 "Glm5NextKdaAttention requires an attention backend with execute_linear; run inside the engine."
             )
-        core_attn_out = backend.execute_linear(mixed_qkv, g, beta, self)
+        core_attn_out = backend.execute_linear(mixed_qkv, beta, self, raw_gate_proj=g_raw)
 
         gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(hidden_shape)
         output = self.o_norm(core_attn_out, gate).reshape(batch_size, seq_len, -1)
