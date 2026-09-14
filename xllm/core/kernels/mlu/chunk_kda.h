@@ -22,8 +22,8 @@ limitations under the License.
 
 namespace xllm::kernel::mlu {
 
-// Returns the chunk size used by the KDA prefill kernel. The default is 16;
-// XLLM_MLU_KDA_CHUNK_SIZE may select 64.
+// Returns the chunk size used by the KDA prefill kernel. The default is 64;
+// XLLM_MLU_KDA_CHUNK_SIZE may select 16.
 int64_t kda_prefill_chunk_size(int64_t num_heads, bool use_qk_l2norm);
 
 // Inference-only, variable-length KDA prefill. The implementation follows the
@@ -31,7 +31,7 @@ int64_t kda_prefill_chunk_size(int64_t num_heads, bool use_qk_l2norm);
 // per-key log gate and V-first recurrent-state layout explicit.
 class ChunkKDAImpl final : public torch::nn::Module {
  public:
-  static constexpr int64_t kDefaultChunkSize = 16;
+  static constexpr int64_t kDefaultChunkSize = 64;
 
   explicit ChunkKDAImpl(int64_t num_heads);
   ~ChunkKDAImpl() override = default;

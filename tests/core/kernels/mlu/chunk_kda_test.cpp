@@ -71,10 +71,10 @@ torch::Tensor make_scaled_identity_states(const torch::Tensor& state_scales,
          state_scales.view({num_sequences, kNumHeads, 1, 1});
 }
 
-TEST(ChunkKDAConfigTest, ChunkSizeDefaultsTo16AndSupports64Override) {
+TEST(ChunkKDAConfigTest, ChunkSizeDefaultsTo64AndSupports16Override) {
   const char* configured_chunk_size = std::getenv("XLLM_MLU_KDA_CHUNK_SIZE");
   const int64_t expected_chunk_size = configured_chunk_size == nullptr
-                                          ? 16
+                                          ? 64
                                           : std::strtoll(configured_chunk_size,
                                                          /*str_end=*/nullptr,
                                                          /*base=*/10);

@@ -349,6 +349,9 @@ using RecModelInputParams = std::variant<std::monostate,
                                          LlmRecMultiRoundParams>;
 
 struct AttentionHostInput {
+  // Worker-local request spans retained when MTP expands attention into token
+  // rows. Generated after transport; normal scheduler inputs leave this empty.
+  std::vector<int32_t> kpool_query_lens;
   std::vector<int32_t> q_seq_lens;
   std::vector<int32_t> q_cu_seq_lens;
   std::vector<int32_t> kv_seq_lens;

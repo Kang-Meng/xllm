@@ -82,6 +82,10 @@ std::string serialize_key(const SpecList& specs,
   s += std::to_string(cfg.num_warps);
   s += "|s";
   s += std::to_string(cfg.num_stages);
+  if (!cfg.bottleneck.empty()) {
+    s += "|b";
+    s += cfg.bottleneck;
+  }
   s += "|d";
   s += std::to_string(device);
   return s;

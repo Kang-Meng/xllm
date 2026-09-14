@@ -53,6 +53,10 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
       eps_(args.rms_norm_eps()),
       interleaved_(true) {
   has_indexer_ = enable_lighting_indexer_ && enable_indexer;
+  use_kpool_indexer_ = has_indexer_ && args.index_kpool_compress();
+  if (use_kpool_indexer_) {
+    index_topk_ += args.index_kpool() - 1;
+  }
   kv_split_size_ = parallel_args.kv_split_size_effective();
   kv_split_rank_ = parallel_args.kv_split_rank();
   tp_group_ = parallel_args.tp_group_;
@@ -96,6 +100,8 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
           ? parallel_args.single_rank_group_
           : parallel_args.tp_group_;
   const LinearExtraArgs attention_linear_extra_args("none", false);
+  const QuantArgs attention_quant_args =
+      quant_args.only_expert_per_group() ? QuantArgs() : quant_args;
 
   if (q_lora_rank_ > 0) {
     q_a_proj_ = register_module(
@@ -110,7 +116,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                              full_heads().proj_width(qk_head_dim_),
                              false,
                              false,
-                             quant_args,
+                             attention_quant_args,
                              weight_group,
                              options,
                              attention_linear_extra_args));
@@ -121,7 +127,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                              full_heads().proj_width(qk_head_dim_),
                              false,
                              false,
-                             quant_args,
+                             attention_quant_args,
                              weight_group,
                              options,
                              attention_linear_extra_args));
@@ -154,13 +160,15 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
   w_kc_ = weights.slice(1, 0, qk_nope_head_dim_);
   w_vc_ = weights.slice(1, qk_nope_head_dim_, qk_nope_head_dim_ + v_head_dim_);
 
-  rotary_emb_ =
-      register_module("rotary_emb",
-                      create_mla_rotary_embedding(args,
-                                                  qk_rope_head_dim_,
-                                                  max_position_embeddings,
-                                                  interleaved_,
-                                                  options));
+  if (qk_rope_head_dim_ > 0) {
+    rotary_emb_ =
+        register_module("rotary_emb",
+                        create_mla_rotary_embedding(args,
+                                                    qk_rope_head_dim_,
+                                                    max_position_embeddings,
+                                                    interleaved_,
+                                                    options));
+  }
 
   if (args.rope_scaling_rope_type() == "deepseek_yarn") {
     float mscale = layer::rotary::yarn_get_mscale(
@@ -169,30 +177,48 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
   }
 
   if (has_indexer_) {
-    indexer_rotary_emb_ = register_module(
-        "indexer_rotary_emb",
-        create_mla_rotary_embedding(args,
-                                    qk_rope_head_dim_,
-                                    max_position_embeddings,
-                                    args.indexer_rope_interleave(),
-                                    options));
-    indexer_ =
-        register_module("indexer",
-                        Indexer(hidden_size,
-                                args.index_n_heads(),
-                                args.index_head_dim(),
-                                qk_rope_head_dim_,
-                                args.index_topk(),
-                                q_lora_rank_,
-                                optimization_config.enable_fused_indexer_qk,
-                                indexer_rotary_emb_,
-                                quant_args,
-                                parallel_args,
-                                options));
+    if (qk_rope_head_dim_ > 0) {
+      indexer_rotary_emb_ = register_module(
+          "indexer_rotary_emb",
+          create_mla_rotary_embedding(args,
+                                      qk_rope_head_dim_,
+                                      max_position_embeddings,
+                                      args.indexer_rope_interleave(),
+                                      options));
+    }
+    if (use_kpool_indexer_) {
+      glm5_next_kpool_indexer_ =
+          register_module("indexer",
+                          Glm5NextKPoolIndexer(args,
+                                               attention_quant_args,
+                                               parallel_args,
+                                               indexer_rotary_emb_,
+                                               options));
+    } else {
+      CHECK(indexer_rotary_emb_ != nullptr)
+          << "Token-level DSA indexer requires qk_rope_head_dim > 0.";
+      indexer_ =
+          register_module("indexer",
+                          Indexer(hidden_size,
+                                  args.index_n_heads(),
+                                  args.index_head_dim(),
+                                  qk_rope_head_dim_,
+                                  args.index_topk(),
+                                  q_lora_rank_,
+                                  optimization_config.enable_fused_indexer_qk,
+                                  indexer_rotary_emb_,
+                                  quant_args,
+                                  parallel_args,
+                                  options));
+    }
   }
 
-  use_fused_mla_qkv_ = optimization_config.enable_fused_mla_kernel;
-  if (has_indexer_ &&
+  // GLM5-Next MLA is NoPE (qk_rope_head_dim == 0). The fused MLA kernels
+  // unconditionally consume RoPE caches, so keep the explicit NoPE path on the
+  // unfused projection/cache implementation.
+  use_fused_mla_qkv_ =
+      optimization_config.enable_fused_mla_kernel && qk_rope_head_dim_ > 0;
+  if (has_indexer_ && !use_kpool_indexer_ &&
       ::xllm::KVCacheConfig::get_instance().indexer_cache_dtype() == "int8") {
     CHECK(optimization_config.enable_fused_indexer_qk)
         << "Indexer cache INT8 requires fused indexer Q/K.";
@@ -229,7 +255,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                                         false,
                                         /*input_is_parallelized=*/true,
                                         /*reduce=*/false,
-                                        quant_args,
+                                        attention_quant_args,
                                         weight_group,
                                         options,
                                         attention_linear_extra_args));
@@ -266,12 +292,15 @@ void DeepseekV2AttentionImpl::fill_q_input(
   auto q_input_slice = q_input.slice(dim, 0, kv_lora_rank_).transpose(0, 1);
   torch::Tensor w_kc_for_runtime = w_kc_;
   torch::bmm_out(q_input_slice, q_nope_transposed, w_kc_for_runtime);
-  rotary_emb_->forward(q_pe,
-                       positions,
-                       attn_metadata.q_cu_seq_lens,
-                       attn_metadata.max_query_len,
-                       use_prompt_rope);
-  q_input.slice(dim, kv_lora_rank_) = q_pe;
+  if (qk_rope_head_dim_ > 0) {
+    CHECK(rotary_emb_ != nullptr);
+    rotary_emb_->forward(q_pe,
+                         positions,
+                         attn_metadata.q_cu_seq_lens,
+                         attn_metadata.max_query_len,
+                         use_prompt_rope);
+    q_input.slice(dim, kv_lora_rank_) = q_pe;
+  }
 }
 
 void DeepseekV2AttentionImpl::decode_kv_pre_base(
@@ -285,12 +314,15 @@ void DeepseekV2AttentionImpl::decode_kv_pre_base(
   v_input = std::get<0>(kv_a_layernorm_(v_input,
                                         /*residual=*/std::nullopt,
                                         v_input));
-  auto k_pe = latent_cache.slice(-1, kv_lora_rank_).unsqueeze(1);
-  rotary_emb_->forward(k_pe,
-                       positions,
-                       attn_metadata.q_cu_seq_lens,
-                       attn_metadata.max_query_len,
-                       use_prompt_rope);
+  if (qk_rope_head_dim_ > 0) {
+    CHECK(rotary_emb_ != nullptr);
+    auto k_pe = latent_cache.slice(-1, kv_lora_rank_).unsqueeze(1);
+    rotary_emb_->forward(k_pe,
+                         positions,
+                         attn_metadata.q_cu_seq_lens,
+                         attn_metadata.max_query_len,
+                         use_prompt_rope);
+  }
 }
 
 void DeepseekV2AttentionImpl::decode_qkv_pre_fused(
@@ -303,6 +335,10 @@ void DeepseekV2AttentionImpl::decode_qkv_pre_fused(
     const torch::Tensor& positions,
     const AttentionMetadata& attn_metadata,
     bool use_prompt_rope) {
+  CHECK_GT(qk_rope_head_dim_, 0)
+      << "Fused MLA QKV does not implement the NoPE path.";
+  CHECK(rotary_emb_ != nullptr);
+
   // forward_decoder_fused_mla_q
   // fused_mla_q: q_a_layernorm + q_b_proj + split + bmm + rotary_emb
   if (q_lora_rank_ > 0) {
@@ -443,16 +479,26 @@ std::optional<DsaTopkState> DeepseekV2AttentionImpl::resolve_dsa_topk_state(
     topk_state = *external_topk;
   } else if (has_indexer_) {
     torch::Tensor index_cache = kv_cache.get_index_cache();
-    std::optional<torch::Tensor> index_cache_scale =
-        kv_cache.get_indexer_cache_scale();
-    auto [block_tables, context_lens] = indexer_(hidden_states,
-                                                 q_norm,
-                                                 positions,
-                                                 index_cache,
-                                                 attn_metadata,
-                                                 is_prefill_phase,
-                                                 index_cache_scale,
-                                                 std::nullopt);
+    std::tuple<torch::Tensor, torch::Tensor> selected;
+    if (use_kpool_indexer_) {
+      torch::Tensor tail_cache = kv_cache.get_kpool_tail();
+      selected = glm5_next_kpool_indexer_->forward(hidden_states,
+                                                   q_norm,
+                                                   positions,
+                                                   index_cache,
+                                                   tail_cache,
+                                                   attn_metadata);
+    } else {
+      selected = indexer_(hidden_states,
+                          q_norm,
+                          positions,
+                          index_cache,
+                          attn_metadata,
+                          is_prefill_phase,
+                          kv_cache.get_indexer_cache_scale(),
+                          std::nullopt);
+    }
+    auto [block_tables, context_lens] = std::move(selected);
     topk_state.emplace(block_tables, context_lens);
   } else {
     CHECK(!enable_lighting_indexer_)
@@ -623,7 +669,12 @@ void DeepseekV2AttentionImpl::load_state_dict(const StateDict& state_dict) {
 
   // load indexer weights
   if (has_indexer_) {
-    indexer_->load_state_dict(state_dict.get_dict_with_prefix("indexer."));
+    StateDict indexer_state = state_dict.get_dict_with_prefix("indexer.");
+    if (use_kpool_indexer_) {
+      glm5_next_kpool_indexer_->load_state_dict(indexer_state);
+    } else {
+      indexer_->load_state_dict(indexer_state);
+    }
   }
 
   // load o proj weights
