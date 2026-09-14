@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn as nn
 
@@ -128,15 +126,6 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
-        # Diagnostic (XLLM_ACL_GRAPH_LAZY_CAPTURE=1): hold the decode graph
-        # runner back until the engine starts serving real requests (the C++
-        # graph warmup's synthetic decode steps then fall back to eager), so
-        # the first REAL decode lazily captures its bucket with real metadata
-        # — its capture-warmup forwards are then dumpable/comparable. The
-        # warmup runs exactly one prefill before its decode steps, so the
-        # second prefill marks the first real request.
-        self._lazy_graph_capture = os.environ.get("XLLM_ACL_GRAPH_LAZY_CAPTURE") == "1"
-        self._prefill_count = 0
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
         if not attention_layers:
@@ -290,9 +279,6 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         self._kv_bound = True
 
-    def _lazy_capture_blocked(self) -> bool:
-        return self._lazy_graph_capture and self._prefill_count < 2
-
     @torch.inference_mode()
     def execute(
         self,
@@ -307,14 +293,8 @@ class ModelExecutor:
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
-        if metadata.is_prefill or metadata.is_chunked_prefill:
-            self._prefill_count += 1
         graph_runner = self.decode_graph_runner
-        if (
-            graph_runner is not None
-            and not self._lazy_capture_blocked()
-            and graph_runner.can_execute(input_ids, metadata, input_embedding)
-        ):
+        if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding):
             graph_runner.warmup(
                 input_ids,
                 positions,

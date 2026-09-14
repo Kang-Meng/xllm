@@ -37,7 +37,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from scripts.logger import logger
 from xllm.python import kernels
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
 from xllm.python.attention.dsa_metadata import DSA_CACHE_TOKEN
@@ -107,7 +106,6 @@ class _StaticAttentionMetadata:
 class _DecodeGraphEntry:
     __slots__ = (
         "batch_size",
-        "spec_width",
         "graph",
         "static_output",
         "static_input_ids",
@@ -559,7 +557,8 @@ class DecodeAclGraphRunner(BaseRunner):
         # gather instead of capturing/replaying a too-small graph.
         if any(getattr(cache, "index", None) is not None for cache in self.layer_caches):
             max_kv_cap = getattr(self.attention_backend, "graph_index_history_max_kv", None)
-            effective_bt = self._effective_block_table(metadata)
+            expanded = resolve_expanded_decode_metadata(metadata)
+            effective_bt = expanded.block_table if expanded is not None else metadata.block_table
             if (
                 max_kv_cap is not None
                 and effective_bt is not None
@@ -567,13 +566,6 @@ class DecodeAclGraphRunner(BaseRunner):
             ):
                 return False
         return True
-
-    def _effective_block_table(self, metadata: AttentionMetadata) -> torch.Tensor | None:
-        """Return the per-row block table without building on-device paging."""
-        expanded = resolve_expanded_decode_metadata(metadata)
-        if expanded is not None:
-            return expanded.block_table
-        return metadata.block_table
 
     def _is_shape_compatible(
         self,
@@ -762,10 +754,6 @@ class DecodeAclGraphRunner(BaseRunner):
             self._update_stream = torch.npu.Stream(device=input_ids.device, priority=-1)
             self._replay_done_event = torch.npu.Event()
 
-        assert self._stream is not None
-        assert self._update_stream is not None
-        assert self._replay_done_event is not None
-
         self._fill_entry(entry, input_ids, positions, metadata, batch_size, input_embedding)
 
         prepare_context = ForwardContext(
@@ -862,7 +850,6 @@ class DecodeAclGraphRunner(BaseRunner):
 
         entry = _DecodeGraphEntry()
         entry.batch_size = padded_batch_size
-        entry.spec_width = 1
         entry.graph = None
         entry.static_output = None
         entry.graph_tasks = []
@@ -892,8 +879,10 @@ class DecodeAclGraphRunner(BaseRunner):
                 dtype=torch.int32,
                 device=device,
             ),
-            paged_kv_indptr_host=torch.zeros(padded_batch_size + 1, dtype=torch.int32, device="cpu"),
-            paged_kv_last_page_len_host=torch.ones(padded_batch_size, dtype=torch.int32, device="cpu"),
+            # paged_kv_indptr_host / paged_kv_last_page_len_host are consumed
+            # only by the CUDA flashinfer backend (see attention/flashinfer.py);
+            # the ACL decode path never reads them, so leaving them None keeps
+            # capture allocation-only overhead off the CPU.
             kv_seq_lens_host_values=[1] * padded_batch_size,
             block_table=static_block_table,
             # KDA (linear-attention) decode reads per-sequence conv/ssm state
@@ -907,7 +896,12 @@ class DecodeAclGraphRunner(BaseRunner):
             dp_is_decode=tuple([1] * self.dp_size) if self.dp_size > 1 else (),
         )
         entry.static_metadata.q_cu_host_values = [0] * (padded_batch_size + 1)
-        is_expanded = self._expanded_verify_view(metadata) is not None
+        # One resolve for both the boolean and the row-count read below;
+        # _expanded_verify_view runs an on-device paging build for the
+        # untyped-verify branch, so calling it twice per bucket capture
+        # duplicates a masked_select + cumsum for no benefit.
+        expanded_view = self._expanded_verify_view(metadata)
+        is_expanded = expanded_view is not None
         entry.kv_seq_lens_delta = torch.empty(padded_batch_size, dtype=torch.int32, device=device)
         # The graph metadata update writes per-sequence KV lengths into this
         # buffer.  MLA/SFA consumes the same stable buffer as its key lengths.
@@ -921,14 +915,14 @@ class DecodeAclGraphRunner(BaseRunner):
             # sequence count (N) for typed expanded verify — otherwise
             # spec_width stays 1 and q_seq_lens is built as N*w single-token
             # groups, breaking the KDA recurrent-state chain.
-            expanded_view = self._expanded_verify_view(metadata)
-            expanded_kv = expanded_view.kv_seq_lens if expanded_view is not None else metadata.kv_seq_lens
+            expanded_kv = expanded_view.kv_seq_lens
             src_rows = expanded_kv.shape[0] if expanded_kv is not None else 0
             src_lsi = getattr(metadata, "linear_state_indices", None)
             src_seqs = src_lsi.shape[0] if src_lsi is not None else 0
+            spec_width = 1
             if src_seqs > 0 and src_rows > src_seqs and src_rows % src_seqs == 0:
-                entry.spec_width = src_rows // src_seqs
-            w = max(1, entry.spec_width)
+                spec_width = src_rows // src_seqs
+            w = spec_width
             if padded_batch_size % w == 0:
                 # q_cu stays PER-ROW (the eager verify layout the attention
                 # backends consume); the per-SEQENCE group count rides on

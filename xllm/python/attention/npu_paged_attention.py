@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +35,9 @@ from xllm.python.attention.backend import (
     LayerCache,
     MlaIndexContext,
     MlaPreprocessContext,
+)
+from xllm.python.attention.expanded_decode_metadata import (
+    resolve_expanded_decode_metadata,
 )
 from xllm.python.model_executor.cp_utils import cp_gather_kv
 from xllm.python.model_executor.forward_context import (
@@ -1215,10 +1218,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # flow exposes [kv-1, kv] pairs per sequence on the expanded
         # metadata; the plain eager flow keeps per-row kv_seq_lens. Both
         # give one value per flattened row.
-        from xllm.python.attention.expanded_decode_metadata import (
-            resolve_expanded_decode_metadata,
-        )
-
         expanded = resolve_expanded_decode_metadata(metadata)
         kv_src = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         # Per-step hoist: kv_rows/base_now/m are layer-independent (same
@@ -1481,10 +1480,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # mis-select the conv/ssm boundary slot and diverge output under
         # temp=0 + HCCL_DETERMINISTIC. The cost is a handful of cheap host->dev
         # + index_select ops per step.
-        from xllm.python.attention.expanded_decode_metadata import (
-            resolve_expanded_decode_metadata,
-        )
-
         expanded = resolve_expanded_decode_metadata(metadata)
         kv_src = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         kv_rows = kv_src.to(device=device, dtype=torch.int64)

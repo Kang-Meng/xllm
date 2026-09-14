@@ -124,14 +124,6 @@ def capturing_acl_graph() -> bool:
     return ctx is not None and ctx.acl_graph is not None
 
 
-def use_acl_graph(config: dict) -> bool:
-    """Whether this run captures decode ACL graphs (mirrors deepseek_v32)."""
-    graph_backend = str(config.get("python_graph_backend", "off")).lower()
-    if graph_backend == "aclgraph":
-        return True
-    return graph_backend in ("", "off", "none", "0") and bool(config.get("enable_graph", False))
-
-
 def record_layer_event(layer_id: int) -> None:
     ctx = _current_context.get()
     if ctx is not None and ctx.layer_synchronizer is not None:
