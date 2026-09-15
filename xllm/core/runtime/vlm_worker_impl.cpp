@@ -292,6 +292,9 @@ VLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
   c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
   CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
       << "failed to wait last step output ready event";
+  // Order replace_token's in-place token_ids rewrite after the async H2D that
+  // fills token_ids on prepare_stream_.
+  wait_input_ready_events(input, *compute_stream_);
   return update_input_by_last_step_output(input);
 }
 
