@@ -188,26 +188,30 @@ torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
                            .pinned_memory(true));
 }
 
-// Native Qwen3.5 prefill on NPU can read the checkpoint slot directly without
-// a restore D2D copy when out-of-place linear state is enabled.
+// Pick the direct-read path for NPU prefill when out-of-place linear state is
+// enabled. Native Qwen3.5 kernels support per-row selection in mixed batches;
+// Python glm5_next requires the whole batch to contain no decode rows, matching
+// the batch-level invariant enforced while building Python attention metadata.
 bool should_read_linear_state_out_of_place(const ModelArgs* args,
+                                           const BatchForwardType& forward_type,
                                            const Sequence* sequence) {
-  return args != nullptr && sequence != nullptr &&
-         sequence->is_prefill_stage() && Platform::is_npu() &&
-         !ModelConfig::is_python_model_impl(
-             ModelConfig::get_instance().model_impl()) &&
-         is_qwen3_5_target_model_type(args->model_type()) &&
-         SchedulerConfig::get_instance().enable_linear_state_out_of_place();
-}
-
-// Save linear state only at a shared chunk and KV-block boundary.
-bool should_save_linear_checkpoint(Sequence* sequence,
-                                   uint32_t boundary_tokens,
-                                   uint32_t chunk_stride) {
-  if (sequence == nullptr || !sequence->is_prefill_stage()) {
+  if (args == nullptr || sequence == nullptr || !sequence->is_prefill_stage() ||
+      !Platform::is_npu() ||
+      !SchedulerConfig::get_instance().enable_linear_state_out_of_place()) {
     return false;
   }
-  if (boundary_tokens == 0 || chunk_stride == 0) {
+
+  const bool is_python_model = ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl());
+  return (is_python_model && args->model_type() == "glm5_next" &&
+          forward_type.no_decode()) ||
+         (!is_python_model && is_qwen3_5_target_model_type(args->model_type()));
+}
+
+bool is_linear_checkpoint_boundary(Sequence* sequence,
+                                   uint32_t boundary_tokens,
+                                   uint32_t chunk_stride) {
+  if (sequence == nullptr || boundary_tokens == 0 || chunk_stride == 0) {
     return false;
   }
   if (boundary_tokens % chunk_stride != 0) {
@@ -219,6 +223,15 @@ bool should_save_linear_checkpoint(Sequence* sequence,
     return true;
   }
   return boundary_tokens % kv_blocks.front().size() == 0;
+}
+
+// Save linear state only at a shared chunk and KV-block boundary during
+// prefill.
+bool should_save_linear_checkpoint(Sequence* sequence,
+                                   uint32_t boundary_tokens,
+                                   uint32_t chunk_stride) {
+  return sequence != nullptr && sequence->is_prefill_stage() &&
+         is_linear_checkpoint_boundary(sequence, boundary_tokens, chunk_stride);
 }
 
 }  // namespace
@@ -928,7 +941,7 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
   const bool has_restore_source = sequence->has_linear_restore_src_block();
   const bool needs_restore_hash =
       has_restore_source && sequence->is_prefill_stage() &&
-      should_save_linear_checkpoint(sequence, n_kv_cache_tokens, chunk_stride);
+      is_linear_checkpoint_boundary(sequence, n_kv_cache_tokens, chunk_stride);
   const bool needs_restore =
       has_restore_source &&
       (needs_restore_hash || !sequence->is_prefill_stage());
@@ -965,7 +978,8 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
         << "linear-state restore must resolve its checkpoint slot before "
            "building worker input";
     linear_state_cache_op.restore_requested =
-        !should_read_linear_state_out_of_place(args_, sequence);
+        !should_read_linear_state_out_of_place(
+            args_, state.batch_forward_type, sequence);
     linear_state_cache_op.restore_src_slot_id = mounted_restore_src->id();
     state.linear_restore_src_blocks.emplace_back(
         std::move(*mounted_restore_src));
