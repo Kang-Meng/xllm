@@ -654,25 +654,31 @@ class Glm5NextConfig:
 # ---------------------------------------------------------------------------
 # KDA (Kimi Delta Attention) linear-attention layer
 # ---------------------------------------------------------------------------
+_KDA_IN_PROJ = (
+    ("q_proj", "qkv_dim", 0),
+    ("k_proj", "qkv_dim", 0),
+    ("v_proj", "qkv_dim", 0),
+    ("b_proj", "num_heads_local", 0),
+    ("forget_gate.f_a_proj", "head_dim", None),
+    ("g_a_proj", "head_dim", None),
+)
+
+
 class Glm5NextForgetGate(nn.Module):
-    """forget gate: g = -exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)."""
+    """Forget gate consuming the f_a latent from the merged input projection."""
 
     def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.head_dim = cfg.kda_head_dim
-        # Head-sharded TP (mirrors DSA): each rank owns kda_num_heads//tp heads.
-        # f_b_proj / A_log / dt_bias are per-head (column-parallel, dim 0);
-        # f_a_proj feeds the shared head_dim latent so it stays replicated.
         self.num_heads = cfg.kda_num_heads // cfg.tp_size  # local per-rank
         self.qkv_dim = self.head_dim * self.num_heads
-        self.f_a_proj = nn.Linear(cfg.hidden_size, self.head_dim, bias=False)
         self.f_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
         self.dt_bias = nn.Parameter(torch.zeros(self.qkv_dim, dtype=torch.float32))
         self.A_log = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.safe_gate_lower_bound = cfg.linear_lower_bound
 
-    def raw_projection(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Pre-gate forget projection ``f_b(f_a(x))`` (no dt_bias, no sigmoid).
+    def raw_projection(self, forget_latent: torch.Tensor) -> torch.Tensor:
+        """Project the replicated f_a latent through f_b, without applying the gate.
 
         Fed to ``recurrent_kda``/``chunk_kda_fwd`` with ``use_gate_in_kernel=True``
         so the kernel computes the safe-gate ``lower_bound * sigmoid(exp(A_log) *
@@ -683,8 +689,8 @@ class Glm5NextForgetGate(nn.Module):
         Returned in the same ``[B, S, num_heads, head_dim]`` layout as the
         materialized gate so the backend can treat it identically to ``gate``.
         """
-        hidden_shape = (*hidden_states.shape[:2], -1, self.head_dim)
-        return self.f_b_proj(self.f_a_proj(hidden_states)).view(hidden_shape)
+        hidden_shape = (*forget_latent.shape[:2], -1, self.head_dim)
+        return self.f_b_proj(forget_latent).view(hidden_shape)
 
     def gate_from_raw(self, raw: torch.Tensor) -> torch.Tensor:
         """Materialize the safe-gate from the raw projection (:meth:`raw_projection`).
@@ -704,8 +710,8 @@ class Glm5NextForgetGate(nn.Module):
         g_softplus = torch.where(g > 20.0, g, torch.log(1.0 + torch.exp(g)))
         return -decay_rate * g_softplus
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.gate_from_raw(self.raw_projection(hidden_states))
+    def forward(self, forget_latent: torch.Tensor) -> torch.Tensor:
+        return self.gate_from_raw(self.raw_projection(forget_latent))
 
 
 class Glm5NextKdaAttention(Attention):
@@ -756,11 +762,10 @@ class Glm5NextKdaAttention(Attention):
         self.activation = cfg.hidden_act
         self.eps = cfg.rms_norm_eps
 
-        # q/k/v: column-parallel (per-head, dim 0) — each rank produces its
-        # head-subset's qkv_dim_local channels.
-        self.q_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
+        projection_sizes = tuple(getattr(self, size_attr) for _, size_attr, _ in _KDA_IN_PROJ)
+        # Follow checkpoint row order; equal-sized f_a/g_a blocks must not be exchanged.
+        self.input_projection_sizes = (sum(projection_sizes[:3]), *projection_sizes[3:])
+        self.in_proj_qkvbfg_a = nn.Linear(self.hidden_size, sum(self.input_projection_sizes), bias=False)
         # conv1d: depthwise over the LOCAL conv_dim (groups=conv_dim_local); the
         # loader shards each of q/k/v_conv1d by head then cats so the channel
         # order [q_loc|k_loc|v_loc] matches mixed_qkv. fp32 in transformers.
@@ -774,8 +779,6 @@ class Glm5NextKdaAttention(Attention):
         )
         self.conv1d.weight = nn.Parameter(self.conv1d.weight.detach().to(torch.float32))
         self.forget_gate = Glm5NextForgetGate(cfg, dtype, device)
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads_local, bias=False)
-        self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
         self.o_norm = _RMSNormGated(self.head_dim, self.eps, dtype, device)
         # o_proj: row-parallel + all_reduce. With KDA now head-sharded, each
@@ -801,10 +804,9 @@ class Glm5NextKdaAttention(Attention):
         batch_size, seq_len = hidden_states.shape[:2]
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
 
-        mixed_qkv = torch.cat(
-            [self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)],
-            dim=-1,
-        ).transpose(1, 2)  # [B, 3*qkv_dim, S]
+        projected = self.in_proj_qkvbfg_a(hidden_states)
+        mixed_qkv, beta_raw, forget_latent, output_latent = projected.split(self.input_projection_sizes, dim=-1)
+        mixed_qkv = mixed_qkv.transpose(1, 2)
 
         # Compute the raw forget-gate projection once and hand it to the
         # backend. The plain decode/prefill kernels fuse the safe-gate from the
@@ -812,8 +814,8 @@ class Glm5NextKdaAttention(Attention):
         # cross-layer / mask paths materialize the gate from the same raw inside
         # the backend, only when they actually need it (bit-exact, no second
         # f_a/f_b GEMM).
-        g_raw = self.forget_gate.raw_projection(hidden_states)
-        beta = torch.sigmoid(self.b_proj(hidden_states))
+        g_raw = self.forget_gate.raw_projection(forget_latent)
+        beta = torch.sigmoid(beta_raw)
 
         # KDA conv1d + delta-rule + conv/ssm state is owned by the backend
         # (NpuPagedAttentionBackend.execute_linear). No self-contained fallback
@@ -826,7 +828,7 @@ class Glm5NextKdaAttention(Attention):
             )
         core_attn_out = backend.execute_linear(mixed_qkv, beta, self, raw_gate_proj=g_raw)
 
-        gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(hidden_shape)
+        gate = self.g_b_proj(output_latent).view(hidden_shape)
         output = self.o_norm(core_attn_out, gate).reshape(batch_size, seq_len, -1)
         # KDA is head-sharded: each rank's o_proj (row-parallel, input
         # qkv_dim_local) yields a partial hidden summed over its head-subset;
@@ -2340,17 +2342,19 @@ class Glm5NextForCausalLM(PyModelBase):
         _call_process_weights_after_loading(self.model.layers[i].self_attn)
 
     def _load_kda_attn(self, L, attn: str, i: int) -> None:
-        # KDA is head-sharded (mirrors DSA). q/k/v/b/g_b are per-head projections
-        # -> column-parallel (shard dim 0, the head/output dim); g_a_proj feeds
-        # the shared head_dim latent -> replicated. The loader's shard() narrows
-        # to this rank's contiguous head block, matching the framework's
-        # head-sharded conv/ssm slots (kv_cache_shape.cpp divides
-        # linear_num_key_heads by world_size).
-        L.load_fp(attn + "q_proj.weight", dim=0)
-        L.load_fp(attn + "k_proj.weight", dim=0)
-        L.load_fp(attn + "v_proj.weight", dim=0)
-        L.load_fp(attn + "b_proj.weight", dim=0)
-        L.load_fp(attn + "g_a_proj.weight")  # replicated (head_dim)
+        """Load floating-point KDA inputs; per-projection W8A8 is not supported here."""
+        input_weights = []
+        for projection, _, shard_dim in _KDA_IN_PROJ:
+            weight = L.load_tensor(attn + projection + ".weight")
+            if not weight.is_floating_point() or L.probe_quant(attn, projection):
+                raise ValueError(
+                    f"KDA input projection {attn}{projection} requires floating-point weights "
+                    f"without W8A8 metadata, got {weight.dtype}"
+                )
+            if shard_dim is not None:
+                weight = L.shard(weight, dim=shard_dim)
+            input_weights.append(weight)
+        L.copy_in(attn + "in_proj_qkvbfg_a.weight", torch.cat(input_weights, dim=0))
         L.load_fp(attn + "g_b_proj.weight", dim=0)
         # conv1d: depthwise over [q|k|v] (conv_dim = 3*qkv_dim). The model holds
         # the LOCAL conv_dim (3*qkv_dim_local); to shard by head each of q/k/v
@@ -2375,8 +2379,6 @@ class Glm5NextForCausalLM(PyModelBase):
         # forget_gate: model nests under forget_gate.*, real ckpt is flat
         # (self_attn.f_a_proj / f_b_proj / dt_bias / A_log). load_tensor goes
         # through the alias wrapper, so the bare name resolves to the flat key.
-        # f_a_proj replicated (head_dim); f_b_proj/dt_bias/A_log per-head (dim 0).
-        L.load_fp(attn + "forget_gate.f_a_proj.weight")
         L.load_fp(attn + "forget_gate.f_b_proj.weight", dim=0)
         L.load_fp(attn + "forget_gate.dt_bias", dim=0)
         L.load_fp(attn + "forget_gate.A_log", dim=0)
