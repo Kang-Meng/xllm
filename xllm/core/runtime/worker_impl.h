@@ -318,9 +318,22 @@ class WorkerImpl {
   bool can_use_last_step_output_for_schedule_overlap(
       const ForwardInput& input) const;
   virtual std::optional<ForwardOutput> step_for_schedule_overlap(
-      const ForwardInput& input);
+      ForwardInput& input);
   virtual ForwardInput update_input_by_last_step_output_for_schedule_overlap(
       ForwardInput& input);
+  // Restore recurrent-state slots for linear-attention models on the current
+  // stream. No-op when the model has no linear-attention layers OR this worker
+  // owns no recurrent kv_cache (e.g., MTP outer worker carrying target args).
+  // The caller must install the desired stream (compute_stream_ in the
+  // schedule-overlap path, prepare_stream_ in the non-overlap path) before
+  // invoking; ordering between the previous chunk's forward and this restore
+  // then falls out of the stream FIFO.
+  void try_restore_linear_state_slots(ModelInputParams& params);
+  // True when this worker holds a linear-attention recurrent cache. A composite
+  // worker (e.g. SpeculativeWorkerImpl / MTPWorkerImpl) carries the TARGET
+  // model args but never allocates its own kv_caches_, so it reports false and
+  // stays off the recurrent-restore path.
+  bool owns_recurrent_cache() const;
   // Only used for deepseek chunked prefill ops on npu device
   void prepare_mla_prefixcache_inputs(ModelInputParams& input_params);
 
