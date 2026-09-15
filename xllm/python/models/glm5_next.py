@@ -1290,6 +1290,8 @@ class Glm5NextIndexer(nn.Module):
                 elif max_kv_cap is not None:
                     # Same static cap the dense gather used, so the graph
                     # runner's eager-fallback condition stays consistent.
+                    # ``ctx.block_table`` is the indexer-facing table
+                    # (DCP-expanded when the backend is SFA DCP).
                     page_size = ctx.index_cache.shape[1]
                     max_kv = min(ctx.block_table.shape[1] * page_size, max_kv_cap)
                 else:

@@ -19,6 +19,15 @@ from __future__ import annotations
 import torch
 
 
+def has_rope_dim(tensor: torch.Tensor | None) -> bool:
+    """Whether an MLA rope operand carries a rope dimension.
+
+    NoPE models (``qk_rope_head_dim == 0``) surface the rope operand as ``None``
+    or as a zero-width tensor; both mean "skip the rope path".
+    """
+    return tensor is not None and tensor.shape[-1] > 0
+
+
 class KVShardLayout:
     """Maps a logical paged-KV coordinate onto one rank's physical cache."""
 
@@ -77,6 +86,25 @@ class KVShardLayout:
             local_slots,
             torch.full_like(local_slots, self.INVALID_SLOT),
         )
+
+    def pack_owned_slots(self, logical_slots: torch.Tensor) -> torch.Tensor:
+        """Map logical slots onto this rank and pack every owned slot to the front.
+
+        SFA walks ``sparse_indices`` until the first ``INVALID_SLOT``, so all slots
+        this rank owns must form one leading run. A kPool indexer appends tail
+        columns next to the top-k ones; packing the whole row keeps that tail in
+        the same run instead of leaving it behind the ``-1`` padding.
+        """
+        localized = self.localize_slots(logical_slots)
+        width = int(localized.shape[-1])
+        original_order = torch.arange(
+            width,
+            dtype=torch.float32,
+            device=localized.device,
+        ).expand_as(localized)
+        pack_keys = original_order + (localized < 0).to(torch.float32) * width
+        _, pack_order = torch.sort(pack_keys, dim=-1)
+        return torch.gather(localized, dim=-1, index=pack_order.to(torch.int32))
 
     def expand_indexer_block_table(
         self,

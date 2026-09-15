@@ -39,6 +39,7 @@ from xllm.python.attention.backend import (
 from xllm.python.attention.expanded_decode_metadata import (
     resolve_expanded_decode_metadata,
 )
+from xllm.python.attention.kv_shard_layout import has_rope_dim
 from xllm.python.model_executor.cp_utils import cp_gather_kv
 from xllm.python.model_executor.forward_context import (
     AclGraphTask,
@@ -180,6 +181,38 @@ def _causal_conv1d_graph_multi(
     return out.to(cin.dtype)
 
 
+def write_mla_paged_cache(
+    slot_mapping: torch.Tensor,
+    k_latent_3d: torch.Tensor,
+    k_pe_3d: torch.Tensor | None,
+    nope_cache: torch.Tensor,
+    rope_cache: torch.Tensor | None,
+) -> None:
+    """Scatter MLA KV into paged caches.
+
+    ATB ``ReshapeAndCache`` rejects a 0-width rope/value tensor. NoPE therefore
+    writes the latent into both key and value operands against ``nope_cache``.
+    """
+    if has_rope_dim(k_pe_3d):
+        if not has_rope_dim(rope_cache):
+            raise RuntimeError("MLA rope cache is missing for a non-empty k_pe")
+        torch.ops.xllm_ops.reshape_paged_cache(
+            slot_mapping,
+            k_latent_3d,
+            k_pe_3d,
+            nope_cache,
+            rope_cache,
+        )
+        return
+    torch.ops.xllm_ops.reshape_paged_cache(
+        slot_mapping,
+        k_latent_3d,
+        k_latent_3d,
+        nope_cache,
+        nope_cache,
+    )
+
+
 class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     """NPU attention backend dispatching to npu_fused_infer_attention_score."""
 
@@ -257,6 +290,26 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if self._page_size is None:
             raise RuntimeError("full-attention KV caches are not bound")
         return self._page_size
+
+    def indexer_block_table_or_none(self) -> torch.Tensor | None:
+        """Block table addressing the paged index cache, or ``None`` if unpaged.
+
+        Returns the engine table (one column per ``page_size`` tokens) cast to
+        int32. DCP backends override this with the physical-page expansion.
+        """
+        if self._block_table_i32 is not None:
+            return self._block_table_i32
+        metadata = self._metadata
+        if metadata is None:
+            return None
+        return metadata.block_table
+
+    def indexer_block_table(self) -> torch.Tensor:
+        """Same as :meth:`indexer_block_table_or_none`, but requires a table."""
+        block_table = self.indexer_block_table_or_none()
+        if block_table is None:
+            raise RuntimeError("indexer_block_table needs a paged block_table")
+        return block_table
 
     @property
     def graph_index_history_max_kv(self) -> int:
@@ -666,8 +719,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                             nope_cache,
                         )
                     else:
-                        torch.ops.xllm_ops.reshape_paged_cache(
-                            metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
+                        write_mla_paged_cache(
+                            metadata.slot_mapping,
+                            k_latent_3d,
+                            k_pe_3d,
+                            nope_cache,
+                            rope_cache,
                         )
                 # Dense absorbed MLA (indexer disabled, topk is None): fall back to
                 # FIA v2 full attention over the paged latent cache. This is the
@@ -708,8 +765,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if not cache_is_preprocessed:
                 if k_latent_3d is None:
                     raise RuntimeError("MLA cache inputs are required")
-                torch.ops.xllm_ops.reshape_paged_cache(
-                    metadata.slot_mapping, k_latent_3d, k_latent_3d, nope_cache, nope_cache
+                write_mla_paged_cache(
+                    metadata.slot_mapping,
+                    k_latent_3d,
+                    k_pe_3d,
+                    nope_cache,
+                    rope_cache,
                 )
             return self._mla_sparse(
                 q_latent,
@@ -891,7 +952,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=slot_mapping,
-            block_table=self._block_table_i32,
+            # Optional by contract: the indexer skips its pool path without a table.
+            block_table=self.indexer_block_table_or_none(),
             actual_seq_q=self._mla_actual_seq_q,
             actual_seq_kv=self._mla_actual_seq_kv,
             index_cache_scale=index_cache_scale,
@@ -1053,10 +1115,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         assert metadata is not None, "gather_index_history called before prepare()"
         index_cache = self._kv_caches[layer.layer_id].index
         assert index_cache is not None, "gather_index_history requires a paged index cache"
-        block_table = metadata.block_table
-        if block_table is None:
-            # No paged view (standalone): caller should not reach here.
-            raise RuntimeError("gather_index_history needs a paged block_table")
+        block_table = self.indexer_block_table()
         block_size = index_cache.shape[1]
         width = index_cache.shape[3]
         device = index_cache.device
