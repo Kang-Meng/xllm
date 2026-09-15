@@ -31,7 +31,10 @@ class CudaQwen3_5SparseMoEBlock(Qwen3_5SparseMoEBlockBase):
         cfg: Qwen3_5MoEConfig,
         dtype: torch.dtype,
         device: torch.device,
+        *,
+        layer_id: int = 0,
     ) -> None:
+        del layer_id
         super().__init__(cfg, dtype, device)
         self.experts = FusedMoE(
             hidden_size=cfg.hidden_size,

@@ -124,6 +124,7 @@ class AttentionMetadata(Protocol):
     linear_state_write_indices: torch.Tensor | None
     has_initial_state: torch.Tensor | None
     dp_execution_token_counts: Sequence[int]
+    mega_moe_token_mask: torch.Tensor | None
     dp_is_decode: Sequence[int]
     q_seq_lens: torch.Tensor | None
     expanded_decode_metadata: ExpandedDecodeMetadataLike

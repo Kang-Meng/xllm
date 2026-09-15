@@ -74,6 +74,10 @@ class Qwen3_5Config:
     moe_tp_rank: int
     ep_size: int
     ep_rank: int
+    enable_mega_moe: bool
+    mega_moe_context: torch.Tensor | None
+    mega_moe_ccl_buffer_size: int
+    mega_moe_num_max_tokens_per_rank: int
 
     @classmethod
     def from_dict(cls, d: dict) -> Qwen3_5Config:
@@ -134,6 +138,10 @@ class Qwen3_5Config:
             moe_tp_rank=int(pick("moe_tp_rank", default=0)),
             ep_size=ep_size,
             ep_rank=int(pick("ep_rank", default=0)),
+            enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
+            mega_moe_context=pick("mega_moe_context", default=None),
+            mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
+            mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
         )
 
     def validate(self) -> None:
@@ -183,6 +191,15 @@ class Qwen3_5Config:
                 raise ValueError("shared_expert_intermediate_size must be positive for Qwen3.5 MoE")
             if self.shared_expert_intermediate_size % self.tp_size:
                 raise ValueError("shared_expert_intermediate_size must be divisible by tp_size")
+        if self.enable_mega_moe:
+            if self.tp_size <= 1 or self.dp_size <= 1:
+                raise ValueError("MegaMoe token ownership requires TP > 1 and DP > 1")
+            if self.moe_tp_size != 1 or self.ep_size != self.world_size:
+                raise ValueError("MegaMoe token ownership requires MoE-TP = 1 and EP = world_size")
+            if self.mega_moe_context is None:
+                raise ValueError("MegaMoe token ownership requires a communication context")
+            if self.mega_moe_ccl_buffer_size <= 0 or self.mega_moe_num_max_tokens_per_rank <= 0:
+                raise ValueError("MegaMoe token ownership requires positive communication capacities")
 
     def is_moe_layer(self, layer_id: int) -> bool:
         return (

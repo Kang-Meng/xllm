@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
@@ -24,12 +25,15 @@ from xllm.python.attention.backend import (
     AttentionMetadata,
     LayerCache,
 )
+from xllm.python.model_executor.execution_context import ExecutionContextProvider
 from xllm.python.model_executor.forward_context import LayerSynchronizer
 
 ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 class BaseRunner(ABC):
+    execution_context_providers: tuple[ExecutionContextProvider, ...] = ()
+
     def __init__(
         self,
         model: nn.Module,
@@ -40,9 +44,16 @@ class BaseRunner(ABC):
         self.attention_backend = attention_backend
         self.device = device
         self.layer_caches: list[LayerCache] = []
+        self.execution_context_providers = ()
 
     def bind_layer_caches(self, layer_caches: list[LayerCache]) -> None:
         self.layer_caches = layer_caches
+
+    def bind_execution_context_providers(
+        self,
+        providers: Sequence[ExecutionContextProvider],
+    ) -> None:
+        self.execution_context_providers = tuple(providers)
 
     @abstractmethod
     def execute(

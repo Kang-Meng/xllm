@@ -327,6 +327,7 @@ device_ops = (
     "hc_pre",
     "hc_post",
     "compressor",
+    "mega_moe",
     "sparse_attn_sharedkv",
     "quant_lightning_indexer",
 )

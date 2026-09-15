@@ -91,7 +91,12 @@ class Qwen3_5DecoderLayer(nn.Module):
             device=device,
         )
         if cfg.is_moe_layer(layer_id):
-            self.mlp = self.sparse_moe_cls(cfg, dtype, device)
+            self.mlp = self.sparse_moe_cls(
+                cfg,
+                dtype,
+                device,
+                layer_id=layer_id,
+            )
         else:
             self.mlp = GatedMLP(
                 cfg.hidden_size,

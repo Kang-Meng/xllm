@@ -25,6 +25,9 @@ from xllm.python.attention.backend import (
     normalize_layer_caches,
 )
 from xllm.python.layers.attention import Attention
+from xllm.python.layers.npu.mega_moe_context_provider import (
+    create_token_owner_mega_moe_context_provider,
+)
 from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
@@ -183,6 +186,11 @@ class ModelExecutor:
         dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
+        token_owner_mega_moe_provider = create_token_owner_mega_moe_context_provider(execution_model)
+        execution_context_providers = (
+            (token_owner_mega_moe_provider,) if token_owner_mega_moe_provider is not None else ()
+        )
+        self.eager_runner.bind_execution_context_providers(execution_context_providers)
         if dp_size > 1 and graph_backend not in (
             "",
             "off",
@@ -233,7 +241,9 @@ class ModelExecutor:
                     int(num_decoding_tokens),
                     int(config.get("num_speculative_tokens", 0)) + 1,
                 ),
-                enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
+                enable_mega_moe_token_mask=bool(
+                    config.get("enable_mega_moe", False) and token_owner_mega_moe_provider is None
+                ),
             )
         else:
             if self.layerwise_split_size > 1:
@@ -254,6 +264,9 @@ class ModelExecutor:
             from xllm.python.model_executor.runners.inductor import InductorRunner
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
+
+        if self.decode_graph_runner is not None:
+            self.decode_graph_runner.bind_execution_context_providers(execution_context_providers)
 
     @staticmethod
     def _attention_config(layer: Attention) -> tuple[int, int, int, float, int]:

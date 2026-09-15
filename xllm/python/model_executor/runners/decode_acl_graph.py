@@ -45,6 +45,10 @@ from xllm.python.attention.expanded_decode_metadata import (
     resolve_expanded_decode_metadata,
 )
 from xllm.python.attention.kda_constants import _KDA_VERIFY_V2, _KDA_VERIFY_V3
+from xllm.python.model_executor.execution_context import (
+    allocate_graph_execution_contexts,
+    update_graph_execution_contexts,
+)
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
@@ -121,6 +125,7 @@ class _DecodeGraphEntry:
         "kv_seq_lens_delta",
         "graph_tasks",
         "execution_state",
+        "execution_contexts",
     )
 
 
@@ -779,6 +784,7 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_metadata,
             self.layer_caches,
             execution_state=entry.execution_state,
+            execution_contexts=entry.execution_contexts,
         )
         with forward_context(prepare_context):
             self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
@@ -871,6 +877,12 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.static_output = None
         entry.graph_tasks = []
         entry.execution_state = AclGraphExecutionState({})
+        entry.execution_contexts = allocate_graph_execution_contexts(
+            self.execution_context_providers,
+            padded_batch_size,
+            device,
+            metadata,
+        )
         entry.static_input_ids = torch.zeros(padded_batch_size, dtype=input_ids.dtype, device=device)
         entry.static_positions = torch.zeros(padded_batch_size, dtype=torch.int32, device=device)
         entry.static_input_embedding = None
@@ -1176,6 +1188,12 @@ class DecodeAclGraphRunner(BaseRunner):
             batch_size,
         )
         self._fill_mega_moe_token_mask(entry, metadata, batch_size)
+        update_graph_execution_contexts(
+            self.execution_context_providers,
+            entry.execution_contexts,
+            metadata,
+            batch_size,
+        )
 
     def _fill_dsa_block_tables(
         self,
@@ -1319,6 +1337,7 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_metadata,
             self.layer_caches,
             execution_state=entry.execution_state,
+            execution_contexts=entry.execution_contexts,
         )
         # The snapshots above (linear/v2/v3) read conv/ssm state on the
         # current (default) stream, while the warmup forward below advances
@@ -1340,6 +1359,7 @@ class DecodeAclGraphRunner(BaseRunner):
             self.layer_caches,
             acl_graph=capture_context,
             execution_state=entry.execution_state,
+            execution_contexts=entry.execution_contexts,
         )
         with forward_context(context), torch.npu.graph(entry.graph, stream=self._stream):
             entry.static_output = self._forward_static(entry)

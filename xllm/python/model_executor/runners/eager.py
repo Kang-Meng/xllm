@@ -18,6 +18,9 @@ import torch
 
 from xllm.python.attention.backend import AttentionMetadata
 from xllm.python.model_executor.cp_utils import build_cp_context
+from xllm.python.model_executor.execution_context import (
+    build_eager_execution_contexts,
+)
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
     LayerSynchronizer,
@@ -85,6 +88,12 @@ class EagerRunner(BaseRunner):
                     self.device,
                 )
 
+        execution_contexts = build_eager_execution_contexts(
+            self.execution_context_providers,
+            input_ids,
+            metadata,
+        )
+
         # Admission and context construction must finish before prepare(). A
         # sharded MLA backend enters CP collectives during prepare, so rejecting
         # unsupported batches afterwards could leave peer ranks deadlocked.
@@ -98,6 +107,7 @@ class EagerRunner(BaseRunner):
                 self.layer_caches,
                 layer_synchronizer=layer_synchronizer,
                 cp_context=cp_context,
+                execution_contexts=execution_contexts,
             )
         ):
             # Draft-MTP steps carry the target's (or previous draft step's)

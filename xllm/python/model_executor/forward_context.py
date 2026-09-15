@@ -18,7 +18,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 import torch
 
@@ -74,6 +74,7 @@ class ForwardContext:
     acl_graph: AclGraphCaptureContext | None = None
     layer_synchronizer: LayerSynchronizer | None = None
     execution_state: AclGraphExecutionState | None = None
+    execution_contexts: dict[type[object], object] = field(default_factory=dict)
     # Context-Parallel sharding plan for this forward, or None when CP is off
     # (cp_size <= 1) or the step is decode (CP is prefill-only).
     cp_context: CpContext | None = None
@@ -109,6 +110,17 @@ def get_forward_context_or_none() -> ForwardContext | None:
     align path) use this to read per-step metadata without hard-failing.
     """
     return _current_context.get()
+
+
+_ExecutionContextT = TypeVar("_ExecutionContextT")
+
+
+def get_execution_context(context_type: type[_ExecutionContextT]) -> _ExecutionContextT | None:
+    """Return a typed optional feature context for the active forward."""
+    context = get_forward_context().execution_contexts.get(context_type)
+    if context is None:
+        return None
+    return cast(_ExecutionContextT, context)
 
 
 def in_acl_graph() -> bool:
