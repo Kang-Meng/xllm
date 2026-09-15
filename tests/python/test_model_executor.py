@@ -55,6 +55,7 @@ from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
 )
 from xllm.python.model_executor.runners.decode_cuda_graph import (  # noqa: E402
     DecodeCudaGraphRunner,
+    _decode_bucket,
     _decode_graph_buckets,
 )
 from xllm.python.model_executor.runners.eager import EagerRunner  # noqa: E402
@@ -456,6 +457,69 @@ class TestModelExecutorConstruction:
             0,
             16,
             num_decoding_tokens=4,
+            enable_mega_moe_token_mask=False,
+        )
+
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_acl_graph_mega_moe_enables_token_mask(
+        self,
+        mock_create,
+        mock_graph_runner,
+    ):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+
+        ModelExecutor(
+            model,
+            {
+                "enable_mega_moe": True,
+                "max_position_embeddings": 128,
+                "python_graph_backend": "aclgraph",
+            },
+            max_seqs_per_batch=4,
+        )
+
+        assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is True
+
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_acl_graph_data_parallel_passes_global_token_budget(
+        self,
+        mock_create,
+        mock_graph_runner,
+    ):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+
+        ModelExecutor(
+            model,
+            {
+                "dp_size": 16,
+                "dp_rank": 0,
+                "enable_mega_moe": True,
+                "max_position_embeddings": 128,
+                "python_graph_backend": "aclgraph",
+            },
+            max_seqs_per_batch=17,
+            num_decoding_tokens=4,
+        )
+
+        # PR3 passes max_seqs_per_batch (sequences) directly as the runner's
+        # max_batch capacity; the runner derives its local DP capacity with
+        # ceil-div internally.
+        assert mock_create.call_args.args[4] == 17
+        mock_graph_runner.assert_called_once_with(
+            model.model,
+            mock_create.return_value,
+            torch.device("cpu"),
+            17,
+            128,
+            16,
+            0,
+            None,
+            num_decoding_tokens=4,
+            enable_mega_moe_token_mask=True,
         )
 
 
@@ -584,6 +648,27 @@ class TestDecodeAclGraphSpeculativeMetadata:
             ),
             is_prefill=False,
             is_chunked_prefill=True,
+        )
+
+    @staticmethod
+    def _decode_metadata(
+        batch_size: int,
+        *,
+        dp_execution_token_counts: tuple[int, ...] = (),
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            slot_mapping=torch.arange(batch_size, dtype=torch.int32),
+            paged_kv_indptr=torch.arange(batch_size + 1, dtype=torch.int32),
+            paged_kv_indices=torch.arange(batch_size, dtype=torch.int32),
+            paged_kv_last_page_len=torch.ones(batch_size, dtype=torch.int32),
+            kv_cu_seq_lens=torch.arange(batch_size + 1, dtype=torch.int32),
+            kv_seq_lens_host_values=[1] * batch_size,
+            block_table=torch.arange(batch_size, dtype=torch.int32).view(-1, 1),
+            kv_seq_lens=torch.ones(batch_size, dtype=torch.int32),
+            expanded_decode_metadata=None,
+            dp_execution_token_counts=dp_execution_token_counts,
+            is_prefill=False,
+            is_chunked_prefill=False,
         )
 
     def test_expanded_metadata_selects_matching_paged_kv_rows(self) -> None:
@@ -927,6 +1012,93 @@ class TestDecodeAclGraphSpeculativeMetadata:
         current_stream.wait_stream.assert_called_once_with(replay_stream)
         graph.replay.assert_called_once_with()
         refresh_dsa.assert_called_once_with(entry.static_metadata)
+
+    def test_graph_token_mask_updates_in_place_for_reused_bucket(self) -> None:
+        runner = self._runner()
+        runner._enable_mega_moe_token_mask = True
+        metadata = self._decode_metadata(4)
+        entry = runner._allocate_entry(
+            4,
+            torch.arange(4, dtype=torch.int32),
+            torch.arange(4, dtype=torch.int32),
+            metadata,
+        )
+        mask = entry.static_metadata.mega_moe_token_mask
+        assert mask is not None
+        data_ptr = mask.data_ptr()
+
+        runner._fill_mega_moe_token_mask(entry, metadata, batch_size=4)
+        assert mask.tolist() == [1, 1, 1, 1]
+
+        runner._fill_mega_moe_token_mask(
+            entry,
+            self._decode_metadata(3),
+            batch_size=3,
+        )
+        assert mask.data_ptr() == data_ptr
+        assert mask.tolist() == [1, 1, 1, 0]
+
+    def test_non_mega_moe_graph_does_not_allocate_token_mask(self) -> None:
+        runner = self._runner()
+        metadata = self._decode_metadata(4)
+        entry = runner._allocate_entry(
+            4,
+            torch.arange(4, dtype=torch.int32),
+            torch.arange(4, dtype=torch.int32),
+            metadata,
+        )
+
+        assert entry.static_metadata.mega_moe_token_mask is None
+
+    def test_mega_moe_buckets_decode_shapes(self) -> None:
+        assert _decode_bucket(1) == 1
+        assert _decode_bucket(2) == 2
+        assert _decode_bucket(4) == 4
+        assert _decode_bucket(5) == 8
+
+    def test_mega_moe_dp_uses_ceil_divided_local_graph_capacity(self) -> None:
+        runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            _PagedStubAttentionBackend(),
+            torch.device("cpu"),
+            max_batch=68,
+            max_model_len=8,
+            dp_size=16,
+            enable_mega_moe_token_mask=True,
+        )
+
+        assert runner.max_batch == 5
+        assert _decode_bucket(1) == 1
+        assert _decode_bucket(5) == 8
+        assert _decode_bucket(6) == 8
+
+    def test_graph_token_mask_uses_real_data_parallel_counts(self) -> None:
+        # dp_execution_token_counts floors an empty DP rank to 1 (its
+        # worker-materialized dummy row), so a rank contributing exactly 1
+        # here also covers the empty-rank case: MegaMoe dispatches that row
+        # like a real token, and the mask marks it active accordingly.
+        runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            _PagedStubAttentionBackend(),
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=8,
+            dp_size=2,
+            enable_mega_moe_token_mask=True,
+        )
+        metadata = self._decode_metadata(3, dp_execution_token_counts=(3, 1))
+        entry = runner._allocate_entry(
+            4,
+            torch.arange(3, dtype=torch.int32),
+            torch.arange(3, dtype=torch.int32),
+            metadata,
+        )
+
+        runner._fill_mega_moe_token_mask(entry, metadata, batch_size=3)
+
+        mask = entry.static_metadata.mega_moe_token_mask
+        assert mask is not None
+        assert mask.tolist() == [1, 1, 1, 0, 1, 0, 0, 0]
 
 
 # ---------------------------------------------------------------------------

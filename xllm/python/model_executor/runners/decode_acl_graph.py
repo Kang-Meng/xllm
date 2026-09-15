@@ -59,6 +59,11 @@ from xllm.python.model_executor.runners.decode_cuda_graph import (
 )
 
 
+def _require_positive_execution_counts(execution_counts: Sequence[int]) -> None:
+    if any(count <= 0 for count in execution_counts):
+        raise RuntimeError(f"DP execution token counts must be positive, got {execution_counts}")
+
+
 @dataclass(slots=True)
 class _StaticAttentionMetadata:
     slot_mapping: torch.Tensor
@@ -87,6 +92,7 @@ class _StaticAttentionMetadata:
     expanded_decode_metadata: ExpandedDecodeMetadata | None = None
     is_prefill: bool = False
     is_chunked_prefill: bool = False
+    mega_moe_token_mask: torch.Tensor | None = None
     is_mixed: bool = False
     is_spec_verify: bool = False
     local_slot_mapping: torch.Tensor | None = None
@@ -141,6 +147,7 @@ class DecodeAclGraphRunner(BaseRunner):
         dp_rank: int = 0,
         decode_batch_size_limit: int | None = None,
         num_decoding_tokens: int = 1,
+        enable_mega_moe_token_mask: bool = False,
     ) -> None:
         super().__init__(model, attention_backend, device)
         self.dp_size = dp_size
@@ -155,6 +162,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # eager instead of capturing ever-larger graphs (0 disables).
         self.decode_batch_size_limit = int(decode_batch_size_limit or 0)
         self.max_model_len = max_model_len
+        self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
@@ -233,11 +241,20 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"(got {execution_counts!r}, "
                     f"expected length {self.dp_size}). All DP ranks must use the same graph shape."
                 )
-            if any(count <= 0 for count in execution_counts):
-                raise RuntimeError(f"DP execution token counts must be positive, got {execution_counts}")
+            _require_positive_execution_counts(execution_counts)
             dp_is_decode = getattr(metadata, "dp_is_decode", None)
             if dp_is_decode is not None and not all(dp_is_decode):
                 return False
+            # MegaMoe shares one fixed graph shape across DP ranks, so the
+            # local rows must equal this rank's advertised execution count;
+            # a mismatch would dispatch the wrong shape and desync the EP
+            # collective rather than silently fall back to eager.
+            if execution_counts[self.dp_rank] != input_ids.shape[0]:
+                raise RuntimeError(
+                    "DP execution token count does not match the local input: "
+                    f"rank={self.dp_rank}, rows={input_ids.shape[0]}, "
+                    f"counts={execution_counts}"
+                )
             # dp_execution_token_counts are TOKEN rows while max_batch is in SEQS (see
             # the seq-vs-token note above); fold expanded verify rows down to
             # sequences so both units agree before the bucket comparison.
@@ -894,6 +911,18 @@ class DecodeAclGraphRunner(BaseRunner):
             # variable per-rank counts cannot be baked into a graph.
             dp_execution_token_counts=(padded_batch_size,) * self.dp_size if self.dp_size > 1 else (),
             dp_is_decode=tuple([1] * self.dp_size) if self.dp_size > 1 else (),
+            # One mask slot per padded row across all DP ranks. aclnnMegaMoe
+            # dispatches the fixed graph shape over EP, so padded lanes must be
+            # marked inactive or they are routed as real tokens.
+            mega_moe_token_mask=(
+                torch.zeros(
+                    padded_batch_size * self.dp_size,
+                    dtype=torch.int8,
+                    device=device,
+                )
+                if self._enable_mega_moe_token_mask
+                else None
+            ),
         )
         entry.static_metadata.q_cu_host_values = [0] * (padded_batch_size + 1)
         # One resolve for both the boolean and the row-count read below;
@@ -1146,6 +1175,7 @@ class DecodeAclGraphRunner(BaseRunner):
             block_table,
             batch_size,
         )
+        self._fill_mega_moe_token_mask(entry, metadata, batch_size)
 
     def _fill_dsa_block_tables(
         self,
@@ -1206,6 +1236,33 @@ class DecodeAclGraphRunner(BaseRunner):
         static_metadata.dsa_positions[:copy_count].copy_(graph_positions[:copy_count])
         if padded_batch_size > copy_count:
             static_metadata.dsa_positions[copy_count:].zero_()
+
+    def _fill_mega_moe_token_mask(
+        self,
+        entry: _DecodeGraphEntry,
+        metadata: AttentionMetadata,
+        batch_size: int,
+    ) -> None:
+        mask = entry.static_metadata.mega_moe_token_mask
+        if mask is None:
+            return
+        mask.zero_()
+        if self.dp_size == 1:
+            mask[:batch_size].fill_(1)
+            return
+
+        token_counts = tuple(int(count) for count in metadata.dp_execution_token_counts)
+        if len(token_counts) != self.dp_size:
+            raise RuntimeError(f"DP decode step requires {self.dp_size} token counts, got {len(token_counts)}")
+        padded_batch_size = entry.batch_size
+        if any(count < 0 or count > padded_batch_size for count in token_counts):
+            raise RuntimeError(
+                "DP token counts must fit the ACL graph batch bucket: "
+                f"counts={token_counts}, bucket={padded_batch_size}"
+            )
+        for rank, count in enumerate(token_counts):
+            start = rank * padded_batch_size
+            mask[start : start + count].fill_(1)
 
     def _fill_host_metadata(
         self,

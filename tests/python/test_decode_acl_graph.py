@@ -101,6 +101,43 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
 
 
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_fill_entry_refreshes_mega_moe_mask_in_place(dp_size: int) -> None:
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=4, is_mla=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+        dp_size=dp_size,
+        enable_mega_moe_token_mask=True,
+    )
+    input_ids = torch.arange(4, dtype=torch.int32)
+    positions = torch.arange(4, dtype=torch.int32)
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    entry = runner._allocate_entry(
+        padded_batch_size=8,
+        input_ids=input_ids,
+        positions=positions,
+        metadata=metadata,
+    )
+    mask = entry.static_metadata.mega_moe_token_mask
+    data_ptr = mask.data_ptr()
+
+    with patch(
+        "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+        create=True,
+    ):
+        for remote_count in (3, 1):
+            metadata.dp_execution_token_counts = (4, remote_count)[:dp_size]
+            runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
+            expected = [True] * 4 + [False] * 4
+            if dp_size == 2:
+                expected += [True] * remote_count + [False] * (8 - remote_count)
+            assert mask.tolist() == expected
+            assert entry.static_metadata.mega_moe_token_mask.data_ptr() == data_ptr
+
+
 def test_dsa_graph_tables_use_compressed_block_counts() -> None:
     _, group_infos = build_cache_specs([1, 4, 128], 128, 3)
     attention_backend = SimpleNamespace(

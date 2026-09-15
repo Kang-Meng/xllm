@@ -233,6 +233,7 @@ class ModelExecutor:
                     int(num_decoding_tokens),
                     int(config.get("num_speculative_tokens", 0)) + 1,
                 ),
+                enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
             )
         else:
             if self.layerwise_split_size > 1:

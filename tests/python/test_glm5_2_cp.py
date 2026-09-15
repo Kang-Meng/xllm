@@ -255,7 +255,7 @@ def test_glm_ep1_moe_reduces_only_on_ordinary_tp_group() -> None:
     shared = torch.tensor([[10.0], [20.0]])
 
     with patch.object(glm5_2.distributed, "all_reduce_", create=True) as reduce:
-        output = moe._combine_expert_outputs(routed, shared)
+        output = moe._combine_expert_outputs(routed, shared, False)
 
     reduce.assert_called_once_with(output, "tp")
     torch.testing.assert_close(output, routed + shared)
@@ -274,9 +274,9 @@ def test_glm_ep_moe_preserves_parent_combine_behavior() -> None:
         "_combine_expert_outputs",
         return_value=expected,
     ) as parent_combine:
-        output = moe._combine_expert_outputs(routed, shared)
+        output = moe._combine_expert_outputs(routed, shared, False)
 
-    parent_combine.assert_called_once_with(routed, shared)
+    parent_combine.assert_called_once_with(routed, shared, False)
     assert output is expected
 
 

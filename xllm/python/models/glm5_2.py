@@ -148,6 +148,12 @@ class Glm52Config:
     num_nextn_predict_layers: int = 0
     index_share_for_mtp_iteration: bool = False
     layers_to_capture: tuple[int, ...] = ()
+    enable_mega_moe: bool = False
+    expert_parallel_degree: int = 0
+    enable_eplb: bool = False
+    mega_moe_context: torch.Tensor | None = None
+    mega_moe_ccl_buffer_size: int = 0
+    mega_moe_num_max_tokens_per_rank: int = 0
 
     @classmethod
     def from_dict(cls, d: dict) -> Glm52Config:
@@ -251,6 +257,12 @@ class Glm52Config:
             num_nextn_predict_layers=int(pick("num_nextn_predict_layers", default=0)),
             index_share_for_mtp_iteration=bool(pick("index_share_for_mtp_iteration", default=False)),
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
+            enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
+            expert_parallel_degree=int(pick("expert_parallel_degree", default=0)),
+            enable_eplb=bool(pick("enable_eplb", default=False)),
+            mega_moe_context=pick("mega_moe_context", default=None),
+            mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
+            mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
         )
         cfg._resolve_indexer_types()
         cfg._resolve_mlp_layer_types()
@@ -711,9 +723,10 @@ class Glm52MoE(DeepseekV3MoE):
         self,
         routed: torch.Tensor,
         shared: torch.Tensor,
+        use_mega_moe: bool,
     ) -> torch.Tensor:
         if self.ep_size > 1:
-            return super()._combine_expert_outputs(routed, shared)
+            return super()._combine_expert_outputs(routed, shared, use_mega_moe)
 
         final = routed + shared
         if self.cfg.tp_size > 1:

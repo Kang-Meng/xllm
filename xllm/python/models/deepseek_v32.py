@@ -1127,6 +1127,16 @@ class DeepseekV3MoE(nn.Module):
             ),
             persistent=False,
         )
+        self.register_buffer(
+            "mega_moe_w13_scale",
+            torch.empty(0, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "mega_moe_w2_scale",
+            torch.empty(0, dtype=torch.int64, device=device),
+            persistent=False,
+        )
         shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
         self.shared_experts = DeepseekV3MLP(
             cfg,
@@ -1145,6 +1155,38 @@ class DeepseekV3MoE(nn.Module):
         self._shared_expert_done_event: torch.npu.Event | None = None
         self._before_dispatch_event: torch.npu.Event | None = None
         self._before_gmm2_event: torch.npu.Event | None = None
+        self._mega_moe_enabled = self._can_enable_mega_moe(cfg, device)
+        self._mega_moe_ccl_buffer_size = int(getattr(cfg, "mega_moe_ccl_buffer_size", 0))
+        self._mega_moe_num_max_tokens_per_rank = int(getattr(cfg, "mega_moe_num_max_tokens_per_rank", 0))
+        if self._mega_moe_enabled:
+            context = getattr(cfg, "mega_moe_context", None)
+            if context is None:
+                raise ValueError("Python MegaMoe requires mega_moe_context.")
+            if self._mega_moe_ccl_buffer_size <= 0:
+                raise ValueError("Python MegaMoe requires mega_moe_ccl_buffer_size > 0.")
+            if self._mega_moe_num_max_tokens_per_rank <= 0:
+                raise ValueError("Python MegaMoe requires mega_moe_num_max_tokens_per_rank > 0.")
+            self.register_buffer("mega_moe_context", context, persistent=False)
+            self._gate_overlap_enabled = False
+            self._fine_overlap_enabled = False
+        else:
+            self.register_buffer(
+                "mega_moe_context",
+                torch.empty(0, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+
+    @staticmethod
+    def _can_enable_mega_moe(cfg: object, device: torch.device) -> bool:
+        model_type = str(getattr(cfg, "model_type", ""))
+        return (
+            bool(getattr(cfg, "enable_mega_moe", False))
+            and model_type == "glm_moe_dsa"
+            and cfg.ep_size > 1
+            and getattr(cfg, "expert_parallel_degree", 0) == 2
+            and not getattr(cfg, "enable_eplb", False)
+            and device.type in ("npu", "privateuseone")
+        )
 
     def allocate_experts_w13_for_loading(self) -> None:
         assert self.experts_w13.numel() == 0, "experts_w13 is already loaded"
@@ -1193,7 +1235,7 @@ class DeepseekV3MoE(nn.Module):
         Staging keeps peak load memory at one raw int8 expert buffer, not two.
         The grouped-MoE path keeps no per-expert offset buffer, so each expert's
         symmetric-int8 (zero ``weight_offset``) invariant is asserted here while
-        its shard is warm.
+        its shard is warm. MegaMoe encodes the retained scales with zero offsets.
         """
         self.allocate_experts_w13_for_loading()
         for idx, j in enumerate(range(self.local_expert_start, self.local_expert_end)):
@@ -1203,15 +1245,39 @@ class DeepseekV3MoE(nn.Module):
             s = loader.pack_gate_up(src, "weight_scale", world=world, rank=rank)
             self.experts_w13.data[idx].copy_(w)
             self.experts_w13_scale.data[idx].copy_(s.reshape(-1))
+        if self._mega_moe_enabled:
+            self.mega_moe_w13_scale = kernels.encode_mega_moe_scale(
+                self.experts_w13_scale,
+                torch.zeros_like(self.experts_w13_scale),
+            )
         self.process_experts_w13_after_loading()
+
         self.allocate_experts_w2_for_loading()
+        mega_moe_w2_scale = (
+            torch.empty(
+                self.num_local_experts,
+                self.hidden,
+                dtype=torch.float32,
+                device=self.experts_w2_scale_compute.device,
+            )
+            if self._mega_moe_enabled
+            else None
+        )
         for idx, j in enumerate(range(self.local_expert_start, self.local_expert_end)):
             src = f"{src_prefix}{j}."
             loader.assert_symmetric_int8(src, ("down_proj",))
             w, s = loader.load_w8a8_down(src, world=world, rank=rank)
             self.experts_w2.data[idx].copy_(w)
             # GMM2 needs bf16 scales; compute buffer holds the cast.
-            self.experts_w2_scale_compute.data[idx].copy_(s.reshape(-1))
+            scale = s.reshape(-1)
+            self.experts_w2_scale_compute.data[idx].copy_(scale)
+            if mega_moe_w2_scale is not None:
+                mega_moe_w2_scale[idx].copy_(scale)
+        if mega_moe_w2_scale is not None:
+            self.mega_moe_w2_scale = kernels.encode_mega_moe_scale(
+                mega_moe_w2_scale,
+                torch.zeros_like(mega_moe_w2_scale),
+            )
         self.process_experts_w2_after_loading()
 
     def load_from_checkpoint(self, loader: W8A8WeightLoader, mlp_prefix: str) -> None:
@@ -1225,7 +1291,7 @@ class DeepseekV3MoE(nn.Module):
         )
         self.shared_experts.load_from_checkpoint(loader, mlp_prefix + "shared_experts.", world=world, rank=rank)
 
-    def _run_routed_experts(self, hidden: torch.Tensor) -> torch.Tensor:
+    def _run_grouped_moe(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self.gate(hidden.to(torch.float32))
         return kernels.grouped_moe(
             hidden,
@@ -1243,6 +1309,70 @@ class DeepseekV3MoE(nn.Module):
             [self.local_expert_start, self.local_expert_end],
         )
 
+    def _all_dp_ranks_are_decode(self, metadata: object) -> bool:
+        if self.dp_size <= 1:
+            return True
+        dp_is_decode = getattr(metadata, "dp_is_decode", None)
+        if dp_is_decode is None:
+            return False
+        return len(dp_is_decode) == self.dp_size and all(dp_is_decode)
+
+    def _should_use_mega_moe(self) -> bool:
+        if not self._mega_moe_enabled:
+            return False
+        metadata = get_forward_context().metadata
+        if not self._all_dp_ranks_are_decode(metadata):
+            return False
+        expanded = getattr(metadata, "expanded_decode_metadata", None)
+        if expanded is not None and bool(getattr(expanded, "enabled", True)):
+            return True
+        return not (metadata.is_prefill or metadata.is_chunked_prefill)
+
+    def _mega_moe_token_mask(self, hidden: torch.Tensor) -> torch.Tensor | None:
+        if hidden.shape[0] == 0:
+            return None
+        ctx = get_forward_context()
+        graph_mask = getattr(ctx.metadata, "mega_moe_token_mask", None)
+        if graph_mask is not None:
+            if graph_mask.dim() != 1 or graph_mask.numel() != hidden.shape[0]:
+                raise RuntimeError("MegaMoe graph token mask must contain one value per token")
+            return graph_mask
+        return None
+
+    def _run_routed_experts(self, hidden: torch.Tensor, use_mega_moe: bool) -> torch.Tensor:
+        if not use_mega_moe:
+            return self._run_grouped_moe(hidden)
+        if hidden.shape[0] > self._mega_moe_num_max_tokens_per_rank:
+            raise RuntimeError(
+                "MegaMoe token count exceeds the communication cap: "
+                f"{hidden.shape[0]} > {self._mega_moe_num_max_tokens_per_rank}"
+            )
+        logits = self.gate(hidden.to(torch.float32))
+        topk_weights, topk_ids = kernels.moe_gate_routing(
+            logits,
+            self.e_score_correction_bias,
+            self.topk,
+            self.topk_group,
+            self.n_group,
+            self.cfg.norm_topk_prob,
+            self.routed_scaling,
+        )
+        return kernels.mega_moe(
+            self.mega_moe_context,
+            hidden.contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
+            topk_weights.to(torch.float32).contiguous(),
+            self.experts_w13,
+            self.experts_w2,
+            self.mega_moe_w13_scale,
+            self.mega_moe_w2_scale,
+            self.num_experts,
+            self.ep_size,
+            self._mega_moe_ccl_buffer_size,
+            self._mega_moe_num_max_tokens_per_rank,
+            self._mega_moe_token_mask(hidden),
+        )
+
     def _run_shared_experts(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._fuse_shared_expert:
             return self.shared_experts.forward_dequant_swiglu_quant(hidden)
@@ -1252,8 +1382,9 @@ class DeepseekV3MoE(nn.Module):
         self,
         routed: torch.Tensor,
         shared: torch.Tensor,
+        use_mega_moe: bool,
     ) -> torch.Tensor:
-        if self.ep_size > 1:
+        if self.ep_size > 1 and not use_mega_moe:
             distributed.all_reduce_(routed, "moe_ep")
 
         final = routed + shared
@@ -1274,7 +1405,7 @@ class DeepseekV3MoE(nn.Module):
             self._before_dispatch_event = torch.npu.Event()
             self._before_gmm2_event = torch.npu.Event()
 
-    def _forward_parallel(self, hidden: torch.Tensor) -> torch.Tensor:
+    def _forward_parallel(self, hidden: torch.Tensor, use_mega_moe: bool) -> torch.Tensor:
         self._ensure_expert_parallel_resources()
         shared_stream = _shared_expert_stream(hidden.device)
         start_event = self._shared_expert_start_event
@@ -1326,12 +1457,12 @@ class DeepseekV3MoE(nn.Module):
             with torch.npu.stream(shared_stream):
                 shared = self._run_shared_experts(hidden)
                 shared_done_event.record(shared_stream)
-            routed = self._run_routed_experts(hidden)
+            routed = self._run_routed_experts(hidden, use_mega_moe)
             current_stream.wait_event(shared_done_event)
 
-        return self._combine_expert_outputs(routed, shared)
+        return self._combine_expert_outputs(routed, shared, use_mega_moe)
 
-    def _forward_fine_grained_parallel(self, hidden: torch.Tensor) -> torch.Tensor:
+    def _forward_fine_grained_parallel(self, hidden: torch.Tensor, use_mega_moe: bool) -> torch.Tensor:
         self._ensure_expert_parallel_resources()
         shared_stream = _shared_expert_stream(hidden.device)
         gate_stream = _gate_stream(hidden.device)
@@ -1392,12 +1523,13 @@ class DeepseekV3MoE(nn.Module):
             shared = self.shared_experts.project_down(act_int8, act_scale)
 
         current_stream.wait_stream(shared_stream)
-        return self._combine_expert_outputs(routed, shared)
+        return self._combine_expert_outputs(routed, shared, use_mega_moe)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         local_tokens: int = 0
         padded_tokens: int = 0
         use_compact_gather: bool = False
+        use_mega_moe = self._should_use_mega_moe()
         if self.dp_size > 1:
             ctx = get_forward_context()
             execution_token_counts = list(ctx.metadata.dp_execution_token_counts)
@@ -1422,13 +1554,13 @@ class DeepseekV3MoE(nn.Module):
                 )
 
         if self._fine_overlap_enabled:
-            final = self._forward_fine_grained_parallel(hidden)
+            final = self._forward_fine_grained_parallel(hidden, use_mega_moe)
         elif self._expert_parallel_enabled:
-            final = self._forward_parallel(hidden)
+            final = self._forward_parallel(hidden, use_mega_moe)
         else:
-            routed = self._run_routed_experts(hidden)
+            routed = self._run_routed_experts(hidden, use_mega_moe)
             shared = self._run_shared_experts(hidden)
-            final = self._combine_expert_outputs(routed, shared)
+            final = self._combine_expert_outputs(routed, shared, use_mega_moe)
 
         if use_compact_gather:
             offset = sum(execution_token_counts[: self.dp_rank])

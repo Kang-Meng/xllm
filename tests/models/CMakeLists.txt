@@ -17,4 +17,20 @@ if(USE_NPU)
                                $<$<BOOL:${USE_NPU}>:hccl>
                                $<$<BOOL:${USE_NPU}>:c_sec>
                                $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+  cc_test(
+    NAME
+      py_causal_lm_test
+    SRCS
+      py_causal_lm_test.cpp
+    DEPS
+      models
+      GTest::gtest_main
+  )
+  target_link_libraries(py_causal_lm_test
+                        PUBLIC Python::Python
+                               ascendcl
+                               hccl
+                               c_sec
+                               nnopbase)
 endif()
