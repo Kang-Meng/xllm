@@ -36,7 +36,7 @@ python MTP scheme (``deepseek_v32_mtp.py``):
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
@@ -51,6 +51,41 @@ from xllm.python.models.glm5_next import (
     Glm5NextMoE,
     Glm5NextRMSNorm,
 )
+
+if TYPE_CHECKING:
+    from xllm.python.model_loader import StateDictLike
+
+
+class _MtpStateDict:
+    def __init__(self, state_dict: StateDictLike, prefix: str) -> None:
+        self._state_dict = state_dict
+        self._prefix = prefix
+
+    def _checkpoint_name(self, name: str) -> str:
+        for source, destination in (
+            ("model.layers.0.", ""),
+            ("model.norm.", "shared_head.norm."),
+            ("lm_head.", "shared_head.head."),
+            ("model.", ""),
+        ):
+            if name.startswith(source):
+                return self._prefix + destination + name[len(source) :]
+        raise ValueError(f"Unsupported GLM MTP parameter: {name}")
+
+    def has(self, name: str) -> bool:
+        return self._state_dict.has(self._checkpoint_name(name))
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        return self._state_dict.get_tensor(self._checkpoint_name(name))
+
+
+def _get_mtp_state_dicts(state_dicts: list[StateDictLike], start_layer: int) -> list[StateDictLike]:
+    if start_layer < 0:
+        return state_dicts
+    for prefix in (f"model.language_model.layers.{start_layer}.", f"model.layers.{start_layer}."):
+        if any(state_dict.has(prefix + "enorm.weight") for state_dict in state_dicts):
+            return [_MtpStateDict(state_dict, prefix) for state_dict in state_dicts]
+    raise ValueError(f"GLM MTP checkpoint is missing appended layer {start_layer}")
 
 
 class Glm5NextMtpDecoderLayer(nn.Module):
@@ -187,6 +222,7 @@ class Glm5NextMtpForCausalLM(Glm5NextForCausalLM):
         # composer: initialize nn.Module directly.
         nn.Module.__init__(self)
         self.cfg = Glm5NextConfig.from_dict(config)
+        self._mtp_start_layer_idx = int(config.get("mtp_start_layer_idx", -1))
         self.cfg.tp_size = int(config.get("tp_size", 1))
         self.cfg.tp_rank = int(config.get("tp_rank", 0))
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
@@ -206,14 +242,8 @@ class Glm5NextMtpForCausalLM(Glm5NextForCausalLM):
         self.to(device=device, dtype=dtype)
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
-        """Load the exported MTP draft checkpoint (loader-native key names).
-
-        The exporter (tools/export_mtp.py) remaps the appended checkpoint layer
-        ``model.language_model.layers.<n>`` to ``model.layers.0`` plus top-level
-        ``model.{enorm,hnorm,eh_proj}``, ``model.norm`` (shared_head.norm),
-        ``model.embed_tokens`` and ``lm_head``, so no real-checkpoint aliasing
-        is needed here.
-        """
+        """Load exported keys or a lazy view of the original appended MTP layer."""
+        state_dicts = _get_mtp_state_dicts(state_dicts, self._mtp_start_layer_idx)
         L = QLinearWeightLoader(self, state_dicts, tp_size, tp_rank)
         # embed_tokens: HiddenParallelEmbedding — shard the hidden dim.
         L.load_fp("model.embed_tokens.weight", dim=1)

@@ -75,6 +75,7 @@ limitations under the License.
 #include "platform/cuda_profiler.h"
 #endif
 #include "core/distributed_runtime/master.h"
+#include "core/framework/model/mtp_utils.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/eplb/eplb_utils.h"
@@ -1981,6 +1982,13 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   model_weights_path_ = std::move(model_weights_path);
 
   auto args = model_loader->model_args();
+#if defined(USE_NPU)
+  if (configure_glm5_next_mtp_args(
+          args, options_.speculative_algorithm(), options_.is_draft_engine())) {
+    LOG(INFO) << "Loading GLM MTP directly from " << model_weights_path
+              << ", appended layer " << args.mtp_start_layer_idx();
+  }
+#endif
   auto quant_args = model_loader->quant_args();
   const bool embedding_mode = options_.task_type() == "embed";
   args.embedding_mode(embedding_mode);

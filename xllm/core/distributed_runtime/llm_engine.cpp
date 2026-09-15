@@ -51,6 +51,7 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
+#include "framework/model/mtp_utils.h"
 #include "framework/model_loader.h"
 #include "framework/xtensor/page_allocator.h"
 #include "framework/xtensor/phy_page_pool.h"
@@ -236,6 +237,10 @@ bool LLMEngine::init_model(MasterStatus master_status) {
   LOG(INFO) << "Initializing model from: " << model_path;
 
   args_ = model_loader->model_args();
+#if defined(USE_NPU)
+  configure_glm5_next_mtp_args(
+      args_, options_.speculative_algorithm(), options_.is_draft_engine());
+#endif
   quant_args_ = model_loader->quant_args();
 
   // A draft engine is fed token ids and detokenized by the target, so it
