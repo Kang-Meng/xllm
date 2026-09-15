@@ -343,11 +343,11 @@ The scheduler supports both `PUSH` and `PULL` through `kv_cache_transfer_mode`. 
 - Build or install the Mooncake Store `mooncake_master` and `mooncake_client` binaries.
 - Reserve enough Host memory. Mooncake Store requires `--enable_prefix_cache=true` and `--host_blocks_factor > 1`.
 
-For Mooncake's etcd-backed high availability mode, install Go first and explicitly enable the HA backends when building xLLM and the bundled Mooncake binaries:
+Mooncake's etcd-backed high availability backends are enabled by default when building xLLM and the bundled Mooncake binaries:
 
 ```bash
 MAX_JOBS=32 SKIP_EXPORT=1 \
-  python setup.py build --device npu --enable-ha true
+  python setup.py build --device npu
 cmake --build build/cmake.linux-aarch64-cpython-311 \
   --target mooncake_master mooncake_client -j32
 ```

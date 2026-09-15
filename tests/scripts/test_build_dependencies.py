@@ -53,33 +53,143 @@ class BuildDependenciesTest(unittest.TestCase):
         self.assertNotIn("xxhash-header", missing)
         self.assertIn("xxhash-library", missing)
 
-    def test_yalantinglibs_prefix_can_be_overridden(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {"YALANTINGLIBS_PREFIX": "/opt/xllm/yalantinglibs"},
-        ):
-            dependencies = utils._get_required_dependency_files()
+    def test_yalantinglibs_uses_mooncake_install_prefix(self) -> None:
+        dependencies = utils._get_required_dependency_files()
 
         self.assertEqual(
             dependencies["yalantinglibs"],
-            ["/opt/xllm/yalantinglibs/lib/cmake/yalantinglibs/config.cmake"],
+            ["/usr/local/lib/cmake/yalantinglibs/config.cmake"],
         )
 
-    def test_ha_prebuild_installs_go(self) -> None:
+    def test_missing_dependencies_run_mooncake_dependencies(self) -> None:
+        with mock.patch.object(utils, "_run_shell_command", return_value=True) as run:
+            utils._run_dependencies_script_or_exit("/repo")
+
+        run.assert_called_once_with(
+            "bash dependencies.sh -y",
+            cwd="/repo/third_party/Mooncake",
+            passthrough_output=True,
+        )
+
+    def test_prebuild_skips_installed_mooncake_dependencies(self) -> None:
         with (
-            mock.patch.object(utils, "_run_shell_command", return_value=True) as run,
+            mock.patch.object(utils, "_run_shell_command") as run,
             mock.patch.object(utils, "_get_required_dependency_files", return_value={}),
+            mock.patch.object(utils, "_export_mooncake_go_path"),
+            mock.patch.object(utils, "_is_mooncake_go_ready", return_value=True),
             mock.patch.object(utils, "_export_cmake_prefix_paths"),
         ):
             utils._ensure_prebuild_dependencies_installed(
                 "/repo",
-                enable_ha=True,
+            )
+
+        run.assert_not_called()
+
+    def test_prebuild_installs_missing_go_toolchain(self) -> None:
+        with (
+            mock.patch.object(utils, "_run_shell_command", return_value=True) as run,
+            mock.patch.object(utils, "_get_required_dependency_files", return_value={}),
+            mock.patch.object(utils, "_export_mooncake_go_path"),
+            mock.patch.object(utils, "_is_mooncake_go_ready", side_effect=[False, True]),
+            mock.patch.object(utils, "_export_cmake_prefix_paths"),
+        ):
+            utils._ensure_prebuild_dependencies_installed(
+                "/repo",
             )
 
         run.assert_called_once_with(
-            "bash third_party/dependencies.sh --ensure-go",
-            cwd="/repo",
+            "bash dependencies.sh -y",
+            cwd="/repo/third_party/Mooncake",
             passthrough_output=True,
+        )
+
+    def test_prebuild_exports_newly_installed_go_toolchain(self) -> None:
+        with (
+            mock.patch.object(utils, "_get_required_dependency_files", return_value={}),
+            mock.patch.object(utils, "_is_mooncake_go_ready", side_effect=[False, True]),
+            mock.patch.object(utils, "_run_dependencies_script_or_exit"),
+            mock.patch.object(utils, "_export_mooncake_go_path") as export_go_path,
+            mock.patch.object(utils, "_export_cmake_prefix_paths"),
+        ):
+            utils._ensure_prebuild_dependencies_installed("/repo")
+
+        self.assertEqual(export_go_path.call_count, 2)
+
+    def test_export_mooncake_go_path_prepends_install_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            go_binary = os.path.join(temp_dir, "go")
+            open(go_binary, "w", encoding="utf-8").close()
+            os.chmod(go_binary, 0o755)
+
+            with (
+                mock.patch.object(utils, "_MOONCAKE_GO_BIN_DIR", temp_dir),
+                mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}),
+            ):
+                utils._export_mooncake_go_path()
+
+                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], temp_dir)
+
+    def test_prebuild_force_installs_mooncake_dependencies(self) -> None:
+        with (
+            mock.patch.object(utils, "_run_shell_command", return_value=True) as run,
+            mock.patch.object(utils, "_get_required_dependency_files", return_value={}),
+            mock.patch.object(utils, "_export_mooncake_go_path"),
+            mock.patch.object(utils, "_is_mooncake_go_ready", return_value=True),
+            mock.patch.object(utils, "_export_cmake_prefix_paths"),
+        ):
+            utils._ensure_prebuild_dependencies_installed(
+                "/repo",
+                force_install=True,
+            )
+
+        run.assert_called_once_with(
+            "bash dependencies.sh -y",
+            cwd="/repo/third_party/Mooncake",
+            passthrough_output=True,
+        )
+
+    def test_mooncake_safe_directory_is_added_once(self) -> None:
+        with mock.patch.object(
+            utils,
+            "_run_command",
+            side_effect=[
+                (True, "/repo\n", ""),
+                (True, "", ""),
+            ],
+        ) as run:
+            utils._ensure_git_safe_directory_or_exit("/repo/third_party/Mooncake")
+
+        run.assert_has_calls(
+            [
+                mock.call(
+                    ["git", "config", "--global", "--get-all", "safe.directory"],
+                    check=False,
+                ),
+                mock.call(
+                    [
+                        "git",
+                        "config",
+                        "--global",
+                        "--add",
+                        "safe.directory",
+                        "/repo/third_party/Mooncake",
+                    ],
+                    check=True,
+                ),
+            ]
+        )
+
+    def test_existing_mooncake_safe_directory_is_not_added_again(self) -> None:
+        with mock.patch.object(
+            utils,
+            "_run_command",
+            return_value=(True, "/repo/third_party/Mooncake\n", ""),
+        ) as run:
+            utils._ensure_git_safe_directory_or_exit("/repo/third_party/Mooncake")
+
+        run.assert_called_once_with(
+            ["git", "config", "--global", "--get-all", "safe.directory"],
+            check=False,
         )
 
 
