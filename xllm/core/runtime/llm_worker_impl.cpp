@@ -16,8 +16,6 @@ limitations under the License.
 #include "llm_worker_impl.h"
 
 #include <c10/core/DeviceGuard.h>
-#include <folly/Unit.h>
-#include <folly/futures/Future.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 
@@ -154,14 +152,6 @@ bool LLMWorkerImpl::prepare_static_mtp_graph_tasks(
 }
 #endif
 
-std::optional<ForwardOutput> LLMWorkerImpl::step_no_sync(
-    const ForwardInput& input) {
-  ForwardInput input_on_device;
-  prepare_work_before_execute(input, input_on_device);
-  std::unique_ptr<Stream> current_stream = device_.current_stream();
-  return execute_no_sync_on_stream(input_on_device, *current_stream);
-}
-
 std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
     const ForwardInput& input,
     Stream& compute_stream) {
@@ -219,30 +209,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& input) {
   std::unique_ptr<Stream> stream = device_.current_stream();
   wait_input_ready_events(input, *stream);
   return step_internal(input, ForwardSyncPolicy::LEGACY);
-}
-
-folly::SemiFuture<std::optional<ForwardOutput>>
-LLMWorkerImpl::step_async_no_sync(const ForwardInput& input) {
-  CHECK(!enable_schedule_overlap())
-      << "step_async_no_sync is only supported for non-overlap workers";
-  ForwardInput input_on_device;
-
-  prepare_work_before_execute(input, input_on_device);
-
-  folly::Promise<std::optional<ForwardOutput>> promise;
-  auto future = promise.getSemiFuture();
-  threadpool_.schedule([this,
-                        input = std::move(input_on_device),
-                        promise = std::move(promise)]() mutable {
-    // hierarchy temporarily disabled during the block-manager refactor
-    // if (hierarchy_kv_cache_transfer_ != nullptr) {
-    //   hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
-    // }
-
-    const auto output = this->step_no_sync(input);
-    promise.setValue(output);
-  });
-  return future;
 }
 
 std::optional<ForwardOutput> LLMWorkerImpl::step_for_schedule_overlap(

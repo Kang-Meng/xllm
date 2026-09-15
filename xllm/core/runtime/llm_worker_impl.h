@@ -15,7 +15,6 @@ limitations under the License.
 
 #pragma once
 
-#include <folly/futures/Future.h>
 #include <torch/torch.h>
 
 #include "executor.h"
@@ -48,7 +47,6 @@ class LLMWorkerImpl : public WorkerImpl {
 
   std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
-  std::optional<ForwardOutput> step_no_sync(const ForwardInput& input);
   virtual std::optional<ForwardOutput> execute_no_sync_on_stream(
       const ForwardInput& input,
       Stream& compute_stream) override;
@@ -57,9 +55,6 @@ class LLMWorkerImpl : public WorkerImpl {
       const ForwardInput& input,
       Stream& compute_stream,
       bool record_ready_event);
-
-  folly::SemiFuture<std::optional<ForwardOutput>> step_async_no_sync(
-      const ForwardInput& input);
 
   std::optional<ForwardOutput> step_internal(
       const ForwardInput& input,
