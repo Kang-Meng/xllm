@@ -1726,7 +1726,7 @@ class DeepseekV4Model(nn.Module):
             if graph_mode:
                 metadata.dsa_graph_mode = True
         cp_ctx = None
-        if metadata.is_prefill or metadata.is_chunked_prefill:
+        if not getattr(metadata, "is_dummy", False) and (metadata.is_prefill or metadata.is_chunked_prefill):
             # DeepSeek-V4 prefill CP uses a contiguous row split per sequence
             # (the framework's zigzag CpContext is for FIA/Qwen3). The C++
             # no_decode() gate covers full and chunked prefill. Decode stays

@@ -249,6 +249,7 @@ class DsaMetadataBuilder:
         dsa_cos_sin: torch.Tensor | None,
         is_prefill: bool,
         is_chunked_prefill: bool,
+        new_cache_slots: Sequence[int] | None = None,
         enable_graph: bool = False,
         graph_block_table_capacity_cols: int = 0,
         max_query_len: int = 0,
@@ -287,6 +288,7 @@ class DsaMetadataBuilder:
             positions,
             enable_graph,
             graph_block_table_capacity_cols,
+            new_cache_slots,
             dsa,
         )
         return dsa
@@ -393,6 +395,7 @@ class DsaMetadataBuilder:
         positions: torch.Tensor,
         enable_graph: bool,
         graph_block_table_capacity_cols: int,
+        new_cache_slots: Sequence[int] | None,
         dsa: DsaMetadata,
     ) -> None:
         if not multi_block_tables or not self.caches_info:
@@ -443,6 +446,7 @@ class DsaMetadataBuilder:
                 total_tokens,
                 graph_slot_capacity,
                 graph_block_table_capacity_cols,
+                new_cache_slots,
             )
 
         n_layers = len(self.caches_info)
@@ -470,6 +474,7 @@ class DsaMetadataBuilder:
         total_tokens: int,
         graph_slot_capacity: int,
         graph_block_table_capacity_cols: int,
+        new_cache_slots: Sequence[int] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if gi.cache_type == DSA_CACHE_TOKEN:
             return self._process_token_group(
@@ -491,6 +496,7 @@ class DsaMetadataBuilder:
                 batch_size,
                 graph_slot_capacity,
                 graph_block_table_capacity_cols,
+                new_cache_slots,
             )
         # SEQUENCE: expand the whole context.
         return self._expand_blocks_to_slots(raw_bt, gi, ctx_lens, batch_size, total_tokens)
@@ -564,6 +570,7 @@ class DsaMetadataBuilder:
         batch_size: int,
         graph_slot_capacity: int,
         graph_block_table_capacity_cols: int,
+        new_cache_slots: Sequence[int] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         query_total_tokens = 0
         for seq in range(batch_size):
@@ -585,16 +592,20 @@ class DsaMetadataBuilder:
 
         write_idx = 0
         slots_list = out_slots.tolist()
-        for seq in range(batch_size):
-            ctx_len = int(ctx_lens[seq])
-            q_len = max(0, min(int(q_lens[seq]), ctx_len))
-            if seq >= raw_bt.size(0):
-                write_idx += q_len
-                continue
-            q_start = ctx_len - q_len
-            for i in range(q_len):
-                slots_list[write_idx] = slot_for_position(seq, q_start + i)
-                write_idx += 1
+        if new_cache_slots is not None and len(new_cache_slots) == query_total_tokens:
+            slots_list[:query_total_tokens] = [int(slot) for slot in new_cache_slots]
+            write_idx = query_total_tokens
+        else:
+            for seq in range(batch_size):
+                ctx_len = int(ctx_lens[seq])
+                q_len = max(0, min(int(q_lens[seq]), ctx_len))
+                if seq >= raw_bt.size(0):
+                    write_idx += q_len
+                    continue
+                q_start = ctx_len - q_len
+                for i in range(q_len):
+                    slots_list[write_idx] = slot_for_position(seq, q_start + i)
+                    write_idx += 1
         out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
         # Rebuild the read-side block table: keep only the SWA window columns,

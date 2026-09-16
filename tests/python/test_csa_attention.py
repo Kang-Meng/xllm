@@ -197,6 +197,176 @@ def test_prepare_binds_compressed_metadata_to_current_forward(monkeypatch) -> No
     assert prefill.dsa_metadata is prefill_compressed_metadata
 
 
+def test_prepare_clamps_target_block_tables_to_draft_groups(monkeypatch) -> None:
+    """An MTP draft backend consumes only its registered SWA manager table."""
+    backend = CsaAttentionBackend(
+        compress_ratios=[1],
+        window_size=128,
+        n_layers=1,
+        num_heads=8,
+        attn_head_dim=512,
+        index_topk=512,
+        index_n_heads=64,
+        index_head_dim=128,
+        rope_head_dim=64,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    metadata = SimpleNamespace(
+        multi_block_tables=[
+            torch.tensor([[10]], dtype=torch.int32),
+            torch.tensor([[20]], dtype=torch.int32),
+            torch.tensor([[30]], dtype=torch.int32),
+        ],
+        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        new_cache_slots_host_values=[1280],
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_dummy=False,
+        dsa_positions=torch.tensor([0], dtype=torch.int64),
+        dsa_cos_sin=None,
+        dsa_graph_block_table_cols=0,
+        dsa_graph_mode=False,
+    )
+
+    dsa = backend._build_dsa_metadata_for_forward(metadata)
+
+    assert dsa.block_tables[0][0].tolist() == [[10]]
+    assert dsa.slot_mappings[0][0].tolist() == [1280]
+
+
+@pytest.mark.parametrize(
+    ("index_topk", "expected_c4_columns", "expected_c128_slot"),
+    [
+        (512, 1, 3),
+        (1024, 2, 7),
+        (2048, 4, 15),
+    ],
+)
+def test_empty_dp_metadata_uses_safe_lengths_and_cache_tables(
+    monkeypatch,
+    index_topk: int,
+    expected_c4_columns: int,
+    expected_c128_slot: int,
+) -> None:
+    backend = _make_backend()
+    backend.index_topk = index_topk
+    backend.bind_kv_caches(
+        [
+            LayerCache(key=None, value=None, swa=torch.empty((2, 128, 1, 1))),
+            LayerCache(
+                key=torch.empty((4, 128, 1, 1)),
+                value=None,
+                swa=torch.empty((2, 128, 1, 1)),
+            ),
+            LayerCache(
+                key=torch.empty((1, 128, 1, 1)),
+                value=None,
+                swa=torch.empty((2, 128, 1, 1)),
+            ),
+        ]
+    )
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    metadata = SimpleNamespace(
+        multi_block_tables=[],
+        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_dummy=True,
+        dsa_metadata=None,
+        dsa_positions=torch.tensor([0], dtype=torch.int64),
+        dsa_cos_sin=None,
+        dsa_c4_cos_sin=None,
+        dsa_c128_cos_sin=None,
+        dsa_graph_mode=False,
+        dsa_graph_block_table_cols=0,
+    )
+
+    dsa = backend._build_dsa_metadata_for_forward(metadata)
+
+    assert dsa.seq_lens.tolist() == [index_topk]
+    assert dsa.seq_lens_q.tolist() == [1]
+    assert dsa.max_seq_len == index_topk
+    assert dsa.max_query_len == 1
+    assert tuple(dsa.block_tables[1][0].shape) == (1, expected_c4_columns)
+    assert dsa.slot_mappings[0][0].tolist() == [127]
+    assert dsa.slot_mappings[1][0].tolist() == [127]
+    assert dsa.slot_mappings[2][0].tolist() == [expected_c128_slot]
+
+
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+def test_empty_dp_graph_metadata_preserves_bucket_rows(monkeypatch, index_topk: int) -> None:
+    backend = _make_backend()
+    backend.index_topk = index_topk
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    graph_block_table_cols = max(8, index_topk // 128)
+    metadata = SimpleNamespace(
+        multi_block_tables=[
+            torch.full((4, graph_block_table_cols), -1, dtype=torch.int32),
+            torch.full((4, graph_block_table_cols), -1, dtype=torch.int32),
+            torch.full((4, graph_block_table_cols), -1, dtype=torch.int32),
+        ],
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=[1, 0, 0, 0],
+        q_seq_lens_host=None,
+        q_seq_lens=torch.ones(4, dtype=torch.int32),
+        is_prefill=False,
+        is_chunked_prefill=False,
+        is_dummy=True,
+        dsa_metadata=None,
+        dsa_positions=torch.zeros(4, dtype=torch.int64),
+        dsa_cos_sin=None,
+        dsa_c4_cos_sin=None,
+        dsa_c128_cos_sin=None,
+        dsa_graph_mode=True,
+        dsa_graph_block_table_cols=graph_block_table_cols,
+    )
+    dummy_tables = backend._build_empty_dp_block_tables(
+        list(metadata.multi_block_tables),
+        4,
+        index_topk,
+        torch.device("cpu"),
+        graph_mode=True,
+        graph_block_table_capacity_cols=graph_block_table_cols,
+    )
+
+    dsa = backend._build_dsa_metadata_for_forward(metadata)
+
+    assert tuple(dummy_tables[0].shape) == (4, 1)
+    assert dsa.seq_lens.tolist() == [index_topk] * 4
+    assert dsa.seq_lens_q.tolist() == [1, 1, 1, 1]
+    assert tuple(dsa.block_tables[0][0].shape) == (4, graph_block_table_cols)
+    expected_swa_column = index_topk // 128 - 1
+    assert dsa.block_tables[0][0][:, expected_swa_column].tolist() == [0, 0, 0, 0]
+    assert tuple(dsa.block_tables[1][0].shape) == (4, graph_block_table_cols)
+    assert dsa.block_tables[1][0][:, 0].tolist() == [0, 0, 0, 0]
+    assert dsa.slot_mappings[0][0][:4].tolist() == [127, 127, 127, 127]
+    assert dsa.slot_mappings[1][0][:4].tolist() == [127, 127, 127, 127]
+    expected_c128_slot = index_topk // 128 - 1
+    assert dsa.slot_mappings[2][0][:4].tolist() == [expected_c128_slot] * 4
+
+
+def test_empty_dp_graph_rejects_insufficient_swa_capacity() -> None:
+    backend = _make_backend()
+    block_tables = [torch.full((4, 8), -1, dtype=torch.int32) for _ in range(3)]
+
+    with pytest.raises(ValueError, match="SWA block table capacity is too small"):
+        backend._build_empty_dp_block_tables(
+            block_tables,
+            4,
+            2048,
+            torch.device("cpu"),
+            graph_mode=True,
+            graph_block_table_capacity_cols=8,
+        )
+
+
 def test_prepare_clears_previous_forward_state() -> None:
     backend = _make_backend()
     metadata = SimpleNamespace(

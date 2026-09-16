@@ -841,7 +841,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
             dp_size=2,
             dp_rank=0,
             decode_batch_size_limit=16,
-            num_decoding_tokens=4,
+            num_decoding_tokens=1,
         )
         with patch.object(
             runner,
@@ -1527,6 +1527,26 @@ def test_eager_runner_preserves_qwen_pure_prefill_cp_context_contract() -> None:
         2,
         torch.device("cpu"),
     )
+
+
+def test_eager_runner_skips_cp_for_empty_rank() -> None:
+    runner = _make_eager_runner()
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        is_dummy=True,
+        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+    )
+
+    with patch("xllm.python.model_executor.runners.eager.build_cp_context") as build_context:
+        runner.execute(torch.ones(1), torch.zeros(1), metadata)
+
+    build_context.assert_not_called()
+    assert runner.attention_backend._prepared
+    runner.model.assert_called_once()
 
 
 def test_eager_runner_preserves_qwen_missing_length_fallback() -> None:

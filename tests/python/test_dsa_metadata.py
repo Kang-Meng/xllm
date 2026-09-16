@@ -218,6 +218,25 @@ def test_build_swa_group_slot_query_tokens_only() -> None:
     assert swa_slot[0].item() == 10 * 128 + 7
 
 
+def test_build_swa_group_uses_scheduler_resolved_slots_for_expanded_decode() -> None:
+    """Expanded MTP decode preserves the scheduler's ring-buffer slot order."""
+    builder, _, _ = _make_builder()
+    swa_bt = torch.tensor([[10], [11]], dtype=torch.int32)
+    token4_bt = torch.tensor([[20], [21]], dtype=torch.int32)
+    dsa = builder.build(
+        multi_block_tables=[swa_bt, token4_bt],
+        kv_seq_lens=[8, 8],
+        q_seq_lens=[2, 2],
+        positions=torch.tensor([6, 7, 6, 7], dtype=torch.int64),
+        dsa_cos_sin=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        new_cache_slots=[301, 302, 401, 402],
+    )
+
+    assert dsa.slot_mappings[0][0].tolist() == [301, 302, 401, 402]
+
+
 def test_build_block_tables_shared_within_group() -> None:
     """Caches in the same group share the same underlying tensor."""
     builder, _, _ = _make_builder()

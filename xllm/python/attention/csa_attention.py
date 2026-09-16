@@ -202,6 +202,12 @@ class DsaAttentionBackend(AttentionBackend):
     ) -> DsaMetadata:
         """Build one request's complete DSA metadata without publishing it."""
         multi_block_tables = list(metadata.multi_block_tables)
+        # Speculative draft inputs inherit the target model's SWA/C4/C128
+        # manager tables.  A draft model can register only the SWA group, so
+        # keep the prefix consumed by this backend, matching the C++ model's
+        # deepseek_v4_clamp_multi_block_tables behavior.
+        if len(multi_block_tables) > len(self.group_infos):
+            multi_block_tables = multi_block_tables[: len(self.group_infos)]
         kv_seq_lens_host = getattr(metadata, "kv_seq_lens_host", None)
         if kv_seq_lens_host is not None and kv_seq_lens_host.numel() > 0:
             kv_seq_lens = kv_seq_lens_host.cpu().tolist()
@@ -217,6 +223,9 @@ class DsaAttentionBackend(AttentionBackend):
                 if q_seq_lens_tensor is not None and q_seq_lens_tensor.numel() > 0
                 else None
             )
+        new_cache_slots = getattr(metadata, "new_cache_slots_host_values", None)
+        if new_cache_slots is not None:
+            new_cache_slots = list(new_cache_slots)
         # The dsa_* fields are legacy C++/pybind contract names. Their tensors
         # are model-owned and scoped to the current forward.
         positions = getattr(metadata, "dsa_positions", None)
@@ -225,14 +234,35 @@ class DsaAttentionBackend(AttentionBackend):
         base_cos_sin = getattr(metadata, "dsa_cos_sin", None)
         enable_graph = bool(getattr(metadata, "dsa_graph_mode", False))
         graph_capacity_cols = int(getattr(metadata, "dsa_graph_block_table_cols", 0))
+        is_dummy = bool(getattr(metadata, "is_dummy", False))
+        if is_dummy:
+            row_count = max(
+                len(kv_seq_lens),
+                len(q_seq_lens or ()),
+                int(positions.numel()),
+                1,
+            )
+            dummy_kv_len = max(self.index_topk, self.window_size, 1)
+            kv_seq_lens = [dummy_kv_len] * row_count
+            q_seq_lens = [1] * row_count
+            host_device = kv_seq_lens_host.device if kv_seq_lens_host is not None else torch.device("cpu")
+            multi_block_tables = self._build_empty_dp_block_tables(
+                multi_block_tables,
+                row_count,
+                dummy_kv_len,
+                host_device,
+                graph_mode=enable_graph,
+                graph_block_table_capacity_cols=graph_capacity_cols,
+            )
         compressed_metadata = self._builder.build(
             multi_block_tables=multi_block_tables,
             kv_seq_lens=kv_seq_lens,
             q_seq_lens=q_seq_lens,
             positions=positions,
             dsa_cos_sin=base_cos_sin,
-            is_prefill=metadata.is_prefill,
+            is_prefill=metadata.is_prefill and not is_dummy,
             is_chunked_prefill=metadata.is_chunked_prefill,
+            new_cache_slots=new_cache_slots,
             enable_graph=enable_graph,
             graph_block_table_capacity_cols=graph_capacity_cols,
         )
@@ -246,6 +276,65 @@ class DsaAttentionBackend(AttentionBackend):
         self._move_metadata_to_device(compressed_metadata)
         self._build_precomputed_metadata(compressed_metadata, metadata)
         return compressed_metadata
+
+    def _build_empty_dp_block_tables(
+        self,
+        block_tables: list[torch.Tensor],
+        batch_size: int,
+        dummy_kv_len: int,
+        fallback_device: torch.device,
+        *,
+        graph_mode: bool,
+        graph_block_table_capacity_cols: int,
+    ) -> list[torch.Tensor]:
+        """Build safe DSA manager tables for an empty DP rank.
+
+        Empty ranks still execute one dummy row so DP/EP collectives use the
+        same shapes on every rank. The dummy points at reserved cache block 0.
+        TOKEN groups retain their captured semantic capacity, while SWA keeps
+        one ring-buffer column and lets the builder pad its graph storage.
+        """
+        normalized: list[torch.Tensor] = []
+        for group_id, group_info in enumerate(self.group_infos):
+            if group_info.cache_type == DSA_CACHE_TOKEN:
+                cache_slot_count = dummy_kv_len // group_info.ratio
+            elif group_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
+                cache_slot_count = group_info.block_size
+            else:
+                cache_slot_count = dummy_kv_len
+            required_columns = max(
+                (cache_slot_count + group_info.block_size - 1) // group_info.block_size,
+                1,
+            )
+
+            device = fallback_device
+            captured_columns = 0
+            if graph_mode and group_id < len(block_tables):
+                table = block_tables[group_id]
+                device = table.device
+                captured_columns = int(table.size(1))
+            if group_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
+                required_storage_columns = max(
+                    (dummy_kv_len + group_info.block_size - 1) // group_info.block_size,
+                    1,
+                )
+                if graph_mode and graph_block_table_capacity_cols < required_storage_columns:
+                    raise ValueError(
+                        "ACL graph SWA block table capacity is too small for "
+                        f"empty-DP history: requires {required_storage_columns} "
+                        f"columns, capacity is {graph_block_table_capacity_cols}"
+                    )
+                block_count = required_columns
+            else:
+                block_count = max(required_columns, captured_columns)
+            normalized.append(
+                torch.zeros(
+                    (batch_size, block_count),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            )
+        return normalized
 
     def refresh_dsa_metadata_for_graph_replay(
         self,
@@ -689,7 +778,8 @@ class DsaAttentionBackend(AttentionBackend):
         attention_type = _attention_type_for_compress_ratio(compress_ratio)
         mapping = self._resolve_cache_mapping(layer_id, compress_ratio)
         layer_cache = self._kv_caches[layer_id]
-        is_prefill = metadata.is_prefill
+        is_dummy = bool(getattr(metadata, "is_dummy", False))
+        is_prefill = metadata.is_prefill and not is_dummy
         is_chunked_prefill = metadata.is_chunked_prefill
         use_temporary_prefill_kv = is_prefill and not is_chunked_prefill
         # 1) Prepare ori_kv for attention (mirrors C++ :790-816).
@@ -1208,13 +1298,15 @@ def _scatter_by_slot(
 
         slots_slice = slots[:update_rows]
         safe_slots = slots_slice.clamp_min(0)
-        valid_mask = slots_slice.ge(0).unsqueeze(1)
-        old_values = cache_2d.index_select(0, safe_slots)
-        safe_values = torch.where(
-            valid_mask,
-            value_2d[:update_rows].to(cache.dtype),
-            old_values,
-        )
+        updates = value_2d[:update_rows].to(cache.dtype)
+        if get_forward_context().acl_graph is not None:
+            # Graph padding maps to reserved block 0. Avoid IndexSelect in the
+            # captured path; it is not reliably capturable on NPU.
+            safe_values = updates
+        else:
+            valid_mask = slots_slice.ge(0).unsqueeze(1)
+            old_values = cache_2d.index_select(0, safe_slots)
+            safe_values = torch.where(valid_mask, updates, old_values)
         kernels.scatter_nd_update(
             cache_2d,
             safe_slots.reshape(-1, 1),

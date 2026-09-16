@@ -103,6 +103,7 @@ class AttentionMetadata(Protocol):
     kv_cu_seq_lens: torch.Tensor | None
     kv_seq_lens_host: torch.Tensor | None
     kv_seq_lens_host_values: list[int] | None
+    new_cache_slots_host_values: list[int] | None
     q_seq_lens_host: torch.Tensor | None
     paged_kv_indptr_host: torch.Tensor | None
     paged_kv_last_page_len_host: torch.Tensor | None
@@ -132,6 +133,7 @@ class AttentionMetadata(Protocol):
     is_chunked_prefill: bool
     is_mixed: bool
     is_spec_verify: bool
+    is_dummy: bool
     local_slot_mapping: torch.Tensor | None
     kv_split_size: int
     kv_split_rank: int

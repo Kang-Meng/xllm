@@ -79,6 +79,7 @@ class _StaticAttentionMetadata:
     kv_cu_seq_lens: torch.Tensor | None = None
     kv_seq_lens_host: torch.Tensor | None = None
     kv_seq_lens_host_values: list[int] | None = None
+    new_cache_slots_host_values: list[int] | None = None
     paged_kv_indptr_host: torch.Tensor | None = None
     paged_kv_last_page_len_host: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
@@ -99,6 +100,7 @@ class _StaticAttentionMetadata:
     mega_moe_token_mask: torch.Tensor | None = None
     is_mixed: bool = False
     is_spec_verify: bool = False
+    is_dummy: bool = False
     local_slot_mapping: torch.Tensor | None = None
     kv_split_size: int = 1
     kv_split_rank: int = 0
@@ -182,6 +184,14 @@ class DecodeAclGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
     ) -> bool:
         if input_ids.dim() != 1:
+            return False
+        if self.dp_size > 1 and self.num_decoding_tokens > 1:
+            # Target validation metadata differs between active and empty DP
+            # ranks, so local graph-admission checks cannot guarantee that the
+            # whole group selects the same runner. Keep the target executor on
+            # eager until the scheduler publishes one group-wide admission
+            # decision. Draft executors use num_decoding_tokens=1 and remain
+            # graphable.
             return False
         batch_size = input_ids.numel()
         is_expanded_spec_verify = resolve_expanded_decode_metadata(
@@ -301,7 +311,7 @@ class DecodeAclGraphRunner(BaseRunner):
     ]:
         """Return per-row KV and paging metadata for decode graph replay."""
         expanded = self._expanded_verify_view(metadata)
-        block_table = expanded.block_table if expanded is not None else metadata.block_table
+        block_table = expanded.block_table if expanded is not None else self._effective_block_table(metadata)
         kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         kv_seq_lens_host_values = (
             expanded.kv_seq_lens_host_values
@@ -310,8 +320,11 @@ class DecodeAclGraphRunner(BaseRunner):
         )
         if block_table is None or kv_seq_lens is None:
             raise RuntimeError("decode graph requires block and KV metadata")
-        block_table = block_table.to(torch.int32)
         kv_seq_lens = kv_seq_lens.to(torch.int32)
+        block_table = block_table.to(
+            device=kv_seq_lens.device,
+            dtype=torch.int32,
+        ).contiguous()
         is_mla = getattr(self.attention_backend, "is_mla", False)
         requires_host_kv_lengths = not is_mla or getattr(
             self.attention_backend,
@@ -559,6 +572,18 @@ class DecodeAclGraphRunner(BaseRunner):
                 batch_size + 1,
             ):
                 return False
+        has_initial_state = getattr(metadata, "has_initial_state", None)
+        if has_initial_state is not None:
+            state_count = has_initial_state.numel()
+            if state_count != batch_size and not (is_expanded and state_count > 0 and batch_size % state_count == 0):
+                return False
+        linear_idx = getattr(metadata, "linear_state_indices", None)
+        if (
+            linear_idx is not None
+            and linear_idx.numel() != batch_size
+            and not (is_expanded and linear_idx.numel() > 0 and batch_size % linear_idx.numel() == 0)
+        ):
+            return False
         # Linear-attention (KDA) layers read per-sequence conv/ssm state via
         # linear_state_indices; without it the captured graph would index
         # state slots with a None buffer. A spec-verify batch may carry one
@@ -566,12 +591,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # per token row.
         needs_linear_state = any(getattr(cache, "conv", None) is not None for cache in self.layer_caches)
         if needs_linear_state:
-            linear_idx = getattr(metadata, "linear_state_indices", None)
             if linear_idx is None:
-                return False
-            if linear_idx.numel() != batch_size and not (
-                is_expanded and batch_size % linear_idx.numel() == 0 and linear_idx.numel() > 0
-            ):
                 return False
         # The kPool indexer's graph gather densifies each sequence to a
         # static max_kv (graph_index_history_max_kv). A sequence whose block
@@ -579,8 +599,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # gather instead of capturing/replaying a too-small graph.
         if any(getattr(cache, "index", None) is not None for cache in self.layer_caches):
             max_kv_cap = getattr(self.attention_backend, "graph_index_history_max_kv", None)
-            expanded = resolve_expanded_decode_metadata(metadata)
-            effective_bt = expanded.block_table if expanded is not None else metadata.block_table
+            effective_bt = self._effective_block_table(metadata)
             if (
                 max_kv_cap is not None
                 and effective_bt is not None
@@ -588,6 +607,43 @@ class DecodeAclGraphRunner(BaseRunner):
             ):
                 return False
         return True
+
+    @staticmethod
+    def _effective_block_table(metadata: AttentionMetadata) -> torch.Tensor | None:
+        """Return the primary per-row table used by DSV4 decode."""
+        expanded = resolve_expanded_decode_metadata(metadata)
+        if expanded is not None:
+            return expanded.block_table
+        if metadata.block_table is not None:
+            return metadata.block_table
+        multi_block_tables = tuple(getattr(metadata, "multi_block_tables", ()) or ())
+        return multi_block_tables[0] if multi_block_tables else None
+
+    @staticmethod
+    def _has_effective_slot_mapping(
+        metadata: AttentionMetadata,
+        token_count: int,
+    ) -> bool:
+        slot_mapping = getattr(metadata, "slot_mapping", None)
+        if slot_mapping is not None and slot_mapping.dim() == 1 and slot_mapping.numel() == token_count:
+            return True
+        host_slots = getattr(metadata, "new_cache_slots_host_values", None)
+        return host_slots is not None and len(host_slots) == token_count
+
+    @staticmethod
+    def _effective_slot_mapping(
+        metadata: AttentionMetadata,
+        token_count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Resolve scheduler cache slots when DSV4 omits the top-level tensor."""
+        slot_mapping = getattr(metadata, "slot_mapping", None)
+        if slot_mapping is not None and slot_mapping.dim() == 1 and slot_mapping.numel() == token_count:
+            return slot_mapping.to(device=device, dtype=torch.int32).contiguous()
+        host_slots = getattr(metadata, "new_cache_slots_host_values", None)
+        if host_slots is None or len(host_slots) != token_count:
+            raise RuntimeError("ACL graph decode requires one scheduler cache slot per token")
+        return torch.tensor(host_slots, dtype=torch.int32, device=device)
 
     def _is_shape_compatible(
         self,
@@ -602,7 +658,7 @@ class DecodeAclGraphRunner(BaseRunner):
         any state this does not cover raises later (let-it-crash, §7) instead
         of being silently swallowed. No on-device paging construction.
         """
-        block_table = metadata.block_table
+        block_table = self._effective_block_table(metadata)
         kv_seq_lens = metadata.kv_seq_lens
         expanded = resolve_expanded_decode_metadata(metadata)
         if expanded is not None:
@@ -645,8 +701,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # One-token-per-sequence (per-row) contract.
         if input_ids.dim() != 1 or input_ids.numel() != sequence_count:
             return False
-        slot_mapping = metadata.slot_mapping
-        if slot_mapping is None or slot_mapping.dim() != 1 or slot_mapping.numel() != sequence_count:
+        if not self._has_effective_slot_mapping(metadata, sequence_count):
             return False
         return True
 
@@ -889,7 +944,7 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.static_metadata = _StaticAttentionMetadata(
             slot_mapping=torch.zeros(
                 padded_batch_size,
-                dtype=metadata.slot_mapping.dtype,
+                dtype=torch.int32,
                 device=device,
             ),
             paged_kv_indptr=torch.zeros(
@@ -913,6 +968,8 @@ class DecodeAclGraphRunner(BaseRunner):
             # the ACL decode path never reads them, so leaving them None keeps
             # capture allocation-only overhead off the CPU.
             kv_seq_lens_host_values=[1] * padded_batch_size,
+            # DSA consumes live scheduler slots on the host before capture.
+            new_cache_slots_host_values=[],
             block_table=static_block_table,
             # KDA (linear-attention) decode reads per-sequence conv/ssm state
             # slots from these buffers.  Static so the captured graph indexes a
@@ -1012,7 +1069,8 @@ class DecodeAclGraphRunner(BaseRunner):
         Keep every manager's dimensions (and therefore its packed DSA metadata
         views) fixed across decodes of the same bucket. The first manager uses
         the runner-wide maximum block column count; compressed managers use the
-        ``max_model_len``-derived upper bound. Unused entries stay at -1.
+        ``max_model_len``-derived upper bound. Unused entries point at reserved
+        block 0.
         """
         max_swa_cols = self._max_blocks_per_sequence
         group_infos = getattr(self.attention_backend, "group_infos", None)
@@ -1034,9 +1092,8 @@ class DecodeAclGraphRunner(BaseRunner):
             else:
                 max_cols = max_swa_cols
             tables.append(
-                torch.full(
+                torch.zeros(
                     (padded_batch_size, max_cols),
-                    -1,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1054,6 +1111,7 @@ class DecodeAclGraphRunner(BaseRunner):
     ) -> None:
         padded_batch_size = entry.batch_size
         static_metadata = entry.static_metadata
+        static_metadata.is_dummy = bool(getattr(metadata, "is_dummy", False))
         (
             block_table,
             kv_seq_lens,
@@ -1065,10 +1123,15 @@ class DecodeAclGraphRunner(BaseRunner):
         self._fill_graph_dsa_positions(entry, positions)
         if batch_size != block_table.shape[0]:
             raise RuntimeError("ACL graph decode batch size must match metadata sequences")
+        slot_mapping = self._effective_slot_mapping(
+            metadata,
+            block_table.shape[0],
+            input_ids.device,
+        )
         self._validate_decode_token_layout(
             input_ids,
             positions,
-            metadata.slot_mapping,
+            slot_mapping,
             block_table.shape[0],
         )
         # Use the cheap shape-only detectors (no on-device paging build) for
@@ -1083,7 +1146,7 @@ class DecodeAclGraphRunner(BaseRunner):
         kernels.update_decode_graph_metadata(
             input_ids,
             graph_positions,
-            metadata.slot_mapping,
+            slot_mapping,
             cumulative_kv_seq_lens,
             paged_kv_indptr,
             paged_kv_indices,
@@ -1102,6 +1165,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # repeat_interleave slice path), together with has_initial_state, so
         # there is no first redundant fill here.
         self._fill_host_metadata(entry, kv_seq_lens_host_values, batch_size)
+        self._fill_new_cache_slots_host_metadata(entry, metadata, batch_size)
 
         if input_embedding is not None:
             if input_embedding.shape[0] != batch_size:
@@ -1208,14 +1272,23 @@ class DecodeAclGraphRunner(BaseRunner):
             return
         source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
         if not source_tables:
+            if getattr(metadata, "is_dummy", False):
+                for target in static_tables:
+                    target.zero_()
+                return
             if getattr(self.attention_backend, "group_infos", None) is not None:
                 raise RuntimeError("DeepSeek-V4 ACL graph requires all DSA manager block tables")
             source_tables = [block_table]
-        if len(source_tables) != len(static_tables):
+        if len(source_tables) < len(static_tables):
             raise RuntimeError(f"ACL graph DSA manager count changed: {len(source_tables)} != {len(static_tables)}")
+        if len(source_tables) > len(static_tables):
+            # MTP draft inputs inherit the target's SWA/C4/C128 tables, while
+            # the draft graph registers only its own SWA prefix.
+            source_tables = source_tables[: len(static_tables)]
 
         for manager_id, (target, source) in enumerate(zip(static_tables, source_tables, strict=True)):
-            target.fill_(-1)
+            # Every graph padding row points at permanently reserved block 0.
+            target.zero_()
             if source is None:
                 continue
             if source.dim() != 2:
@@ -1306,8 +1379,33 @@ class DecodeAclGraphRunner(BaseRunner):
             raise RuntimeError("decode ACL graph host KV buffer is missing")
         static_kv_seq_lens[:batch_size] = kv_seq_lens
         if padded_batch_size > batch_size:
-            padding_kv_len = 0 if getattr(self.attention_backend, "group_infos", None) is not None else 1
-            static_kv_seq_lens[batch_size:] = [padding_kv_len] * (padded_batch_size - batch_size)
+            static_kv_seq_lens[batch_size:] = [1] * (padded_batch_size - batch_size)
+
+    @staticmethod
+    def _fill_new_cache_slots_host_metadata(
+        entry: _DecodeGraphEntry,
+        metadata: AttentionMetadata,
+        batch_size: int,
+    ) -> None:
+        """Copy scheduler-resolved physical DSA slots into graph metadata."""
+        source_slots = getattr(metadata, "new_cache_slots_host_values", None)
+        target_slots = entry.static_metadata.new_cache_slots_host_values
+        if target_slots is None:
+            return
+        if source_slots is None:
+            entry.static_metadata.new_cache_slots_host_values = []
+            return
+        if not source_slots and getattr(metadata, "is_dummy", False):
+            # Empty-DP dummy rows have no scheduler-owned cache slot. Their
+            # DSA tables point entirely at reserved block 0, so let the DSA
+            # builder derive a safe slot from that table.
+            entry.static_metadata.new_cache_slots_host_values = []
+            return
+        if len(source_slots) < batch_size:
+            raise RuntimeError("decode ACL graph requires one host cache slot per token")
+        real_slots = [int(slot) for slot in source_slots[:batch_size]]
+        padding_slots = [0] * (entry.batch_size - batch_size)
+        entry.static_metadata.new_cache_slots_host_values = real_slots + padding_slots
 
     def _capture(self, entry: _DecodeGraphEntry) -> None:
         # The pre-capture warmup forwards execute for real. KV/index-cache
