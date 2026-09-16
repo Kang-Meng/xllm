@@ -20,11 +20,33 @@ import sys
 import types
 from pathlib import Path
 
+import torch
+
 _PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
+
+
+def _rms_norm_sigmoid_gated(
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """CPU reference for kernels_npu rms_norm_sigmoid_gated.
+
+    Matches the Triton kernel contract: RMSNorm over the last dim, scaled by
+    ``weight`` and gated by ``sigmoid(gate)``. Used by pure-Python model
+    tests (glm5_next KDA o_norm) that cannot link the NPU kernels.
+    """
+    input_dtype = value.dtype
+    x = value.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    return (x * weight.to(torch.float32) * gate.sigmoid()).to(input_dtype)
 
 
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
+    kernels.rms_norm_sigmoid_gated = _rms_norm_sigmoid_gated
     kernels_npu = types.ModuleType("xllm.python.kernels_npu")
     kernels_npu.__path__ = [str(_PYTHON_ROOT / "kernels_npu")]
     distributed = types.ModuleType("xllm.python.distributed")
