@@ -25,6 +25,18 @@ import torch
 _PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
 
 
+def _rms_norm(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """CPU reference for weighted RMSNorm over the last dimension."""
+    value_fp32 = value.float()
+    variance = value_fp32.square().mean(dim=-1, keepdim=True)
+    normalized = value_fp32 * torch.rsqrt(variance + eps)
+    return (normalized * weight.float()).to(value.dtype)
+
+
 def _rms_norm_sigmoid_gated(
     value: torch.Tensor,
     gate: torch.Tensor,
@@ -46,6 +58,7 @@ def _rms_norm_sigmoid_gated(
 
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
+    kernels.rms_norm = _rms_norm
     kernels.rms_norm_sigmoid_gated = _rms_norm_sigmoid_gated
     kernels_npu = types.ModuleType("xllm.python.kernels_npu")
     kernels_npu.__path__ = [str(_PYTHON_ROOT / "kernels_npu")]

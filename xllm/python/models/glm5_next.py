@@ -836,6 +836,7 @@ class Glm5NextIndexer(nn.Module):
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim, bias=False)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(cfg.hidden_size, self.n_heads, bias=False)
+        self.register_buffer("_wk_weights_weight", None, persistent=False)
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=dtype, device=device)
         )
@@ -847,6 +848,22 @@ class Glm5NextIndexer(nn.Module):
         # Paged pool cache per DSA layer (lazily allocated on first eager
         # forward, before graph capture): layer_id -> [blocks, bs//index_kpool, 1, D].
         self._pool_caches: dict[int, torch.Tensor] = {}
+
+    def process_weights_after_loading(self) -> None:
+        prev_weight = self._wk_weights_weight
+        self._wk_weights_weight = None
+        if self.wk.weight.dtype != self.weights_proj.weight.dtype:
+            return
+        packed = torch.cat((self.wk.weight.detach(), self.weights_proj.weight.detach()), dim=0)
+        self._wk_weights_weight = _stable_pack(prev_weight, packed)
+        self.wk.weight.data = self._wk_weights_weight[: self.head_dim]
+        self.weights_proj.weight.data = self._wk_weights_weight[self.head_dim :]
+
+    def _project_key_weights(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._wk_weights_weight is None:
+            return self.wk(hidden_states), self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype))
+        projected = F.linear(hidden_states, self._wk_weights_weight)
+        return projected.split((self.head_dim, self.n_heads), dim=-1)
 
     def get_pooled_states(self, packed_states: torch.Tensor, key_valid: torch.Tensor):
         pool_keys, pool_indices, pool_valid = _kpool_pooled_states(
@@ -868,10 +885,13 @@ class Glm5NextIndexer(nn.Module):
         keep = pool_valid.any(0)
         return pool_keys[:, keep], pool_indices[:, keep], pool_valid[:, keep]
 
-    def get_packed_states(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def get_packed_states(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, key: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Per-token indexer cache row ``[B, S, head_dim*2+1]`` =
         [k(128), gate(128), valid(1)]. NoPE: no RoPE applied to k."""
-        k = self.k_norm(self.wk(hidden_states)).view(hidden_states.shape[0], hidden_states.shape[1], -1, self.head_dim)
+        key = self.wk(hidden_states) if key is None else key
+        k = self.k_norm(key).view(hidden_states.shape[0], hidden_states.shape[1], -1, self.head_dim)
         k = k.squeeze(2)
         gate_scores = F.linear(hidden_states, self.index_kpool_compress_gate)
         valid_channel = attention_mask.to(k.dtype).unsqueeze(-1)
@@ -884,7 +904,8 @@ class Glm5NextIndexer(nn.Module):
         # Single-call path (fresh prefill / standalone align): the current
         # tokens' packed states ARE the full index history. Build them here and
         # delegate to select_topk so both paths share one pooling/selection body.
-        packed_states = self.get_packed_states(hidden_states, attention_mask)
+        key, weights = self._project_key_weights(hidden_states)
+        packed_states = self.get_packed_states(hidden_states, attention_mask, key)
         return self.select_topk(
             q_resid,
             hidden_states,
@@ -892,6 +913,7 @@ class Glm5NextIndexer(nn.Module):
             kv_len=kv_len,
             current_length=kv_len,
             packed_states=packed_states,
+            projected_weights=weights,
         )
 
     def _select_topk_fused_pa(
@@ -943,6 +965,7 @@ class Glm5NextIndexer(nn.Module):
         pool_block_table: torch.Tensor | None = None,
         pool_cache: torch.Tensor | None = None,
         kv_seq_lens: torch.Tensor | None = None,
+        projected_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Top-k pool selection over the FULL packed index history.
 
@@ -986,7 +1009,11 @@ class Glm5NextIndexer(nn.Module):
                 else:
                     key_valid = packed_states[..., -1].gt(0)
 
-        weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype))
+        weights = (
+            self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype))
+            if projected_weights is None
+            else projected_weights
+        )
         if (
             self.index_kpool_compress
             and q.device.type == "npu"
@@ -1167,17 +1194,14 @@ class Glm5NextIndexer(nn.Module):
         """
         batch_size, seq_len = hidden_states.shape[:2]
         num_tokens = batch_size * seq_len
+        key, weights = self._project_key_weights(hidden_states)
         if self.index_kpool_compress:
-            packed = self.get_packed_states(hidden_states, attention_mask)
+            packed = self.get_packed_states(hidden_states, attention_mask, key)
         else:
             # The non-compressed cache stores one raw K per token. This is the
             # original small-operator path (index_kpool=1), so no gate/valid
             # channels are written to the narrower cache.
-            packed = (
-                self.k_norm(self.wk(hidden_states))
-                .view(hidden_states.shape[0], hidden_states.shape[1], -1, self.head_dim)
-                .squeeze(2)
-            )
+            packed = self.k_norm(key).view(hidden_states.shape[0], hidden_states.shape[1], -1, self.head_dim).squeeze(2)
         if ctx.index_cache is not None and ctx.slot_mapping is not None:
             # kPool index cache is unquantized (no scale side-channel).
             ctx.update_index_cache(packed.reshape(num_tokens, -1), None)
@@ -1212,16 +1236,16 @@ class Glm5NextIndexer(nn.Module):
             if num_tokens == n_seqs:
                 # Decode (graph or eager): one token per sequence; static
                 # per-seq slices keep graph capture host-sync free.
-                for s in range(n_seqs):
-                    compress_completed_pools(
-                        ctx.index_cache,
-                        pool_cache,
-                        ctx.block_table[s : s + 1],
-                        pos_flat[s : s + 1],
-                        self.index_kpool_compress_ape,
-                        self.head_dim,
-                        self.index_kpool,
-                    )
+                compress_completed_pools(
+                    ctx.index_cache,
+                    pool_cache,
+                    ctx.block_table,
+                    pos_flat,
+                    self.index_kpool_compress_ape,
+                    self.head_dim,
+                    self.index_kpool,
+                    batched=True,
+                )
             else:
                 # Prefill chunk (eager): per-seq position slices from the
                 # host-side query lengths.
@@ -1280,6 +1304,7 @@ class Glm5NextIndexer(nn.Module):
                         kv_seq_lens=kv_lens_t.clamp(max=kv_len),
                         pool_cache=pool_cache,
                         pool_block_table=ctx.block_table,
+                        projected_weights=weights.view(n_seqs, 1, self.n_heads),
                     )
                     return topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
 
@@ -1300,6 +1325,7 @@ class Glm5NextIndexer(nn.Module):
             qr_bsd = qr.view(num_seqs, max_q, -1)
             hidden_bsd = hidden_states.view(num_seqs, max_q, -1)
             mask_bsd = attention_mask.view(num_seqs, max_q)
+            weights_bsd = weights.view(num_seqs, max_q, self.n_heads)
         else:
             # Varlen batch (unequal prompts prefilled together): the engine
             # flattens the batch to [1, T, D]; scatter tokens to a padded
@@ -1319,6 +1345,7 @@ class Glm5NextIndexer(nn.Module):
             qr_bsd = qr.index_select(0, src_flat).view(num_seqs, max_q, -1)
             hidden_bsd = hidden_states.reshape(num_tokens, -1).index_select(0, src_flat).view(num_seqs, max_q, -1)
             mask_bsd = attention_mask.reshape(-1).index_select(0, src_flat).view(num_seqs, max_q) & valid
+            weights_bsd = weights.reshape(num_tokens, self.n_heads).index_select(0, src_flat).view(num_seqs, max_q, -1)
         kv_len = packed_history.shape[1]
         history_key_valid = None
         if not self.index_kpool_compress:
@@ -1333,6 +1360,7 @@ class Glm5NextIndexer(nn.Module):
             kv_len=kv_len,
             current_length=kv_len,
             packed_states=packed_history,
+            projected_weights=weights_bsd,
             key_valid=history_key_valid,
             pool_cache=pool_cache,
             pool_block_table=ctx.block_table,
@@ -1482,6 +1510,8 @@ class Glm5NextMlaAttention(Attention):
         w_uk, w_uv = w.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         self.W_UK.copy_(w_uk.contiguous())
         self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
+        if self.indexer is not None:
+            self.indexer.process_weights_after_loading()
 
     def _project_qkv_a(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Reuse the shared-input Q/KV-A linear layout used by vLLM-Ascend."""
