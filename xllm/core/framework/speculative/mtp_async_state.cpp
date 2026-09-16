@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "core/framework/model/model_args.h"
@@ -47,7 +48,8 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
   if (is_qwen3_5_target_model_type(model_type)) {
     return TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
   }
-  if (model_type == "deepseek_v32") {
+  if (model_type == "deepseek_v32" || model_type == "deepseek_v4" ||
+      model_type == "deepseek_v4_dspark") {
     return TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY;
   }
   if (model_type == "mimo") {
@@ -61,6 +63,38 @@ int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,
   CHECK_GT(max_position_embeddings, 0);
   CHECK_GT(block_size, 0);
   return (max_position_embeddings + block_size - 1) / block_size + 1;
+}
+
+bool has_speculative_verify_block_table_layout(
+    const torch::Tensor& block_tables,
+    const std::vector<torch::Tensor>& multi_block_tables,
+    int64_t num_sequences) {
+  if (num_sequences <= 0) {
+    return false;
+  }
+  const auto is_compatible = [num_sequences](const torch::Tensor& table) {
+    return table.defined() && table.dim() == 2 &&
+           table.size(0) == num_sequences && table.size(1) > 0 &&
+           table.scalar_type() == torch::kInt32;
+  };
+  if (block_tables.defined()) {
+    return is_compatible(block_tables);
+  }
+  return !multi_block_tables.empty() && std::all_of(multi_block_tables.begin(),
+                                                    multi_block_tables.end(),
+                                                    is_compatible);
+}
+
+torch::Tensor make_speculative_verify_control_block_table(
+    int64_t num_sequences,
+    int64_t block_table_capacity) {
+  CHECK_GT(num_sequences, 0);
+  CHECK_GT(block_table_capacity, 0);
+  return torch::zeros({num_sequences, block_table_capacity},
+                      torch::TensorOptions()
+                          .dtype(torch::kInt32)
+                          .device(torch::kCPU)
+                          .pinned_memory(true));
 }
 
 CombinedDraftExecutionPath classify_combined_draft_execution_path(

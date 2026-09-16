@@ -40,6 +40,21 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,
                                                 int64_t block_size);
 
+// Expanded verify needs a primary block-table tensor for its generic graph
+// metadata. Model-managed cache layouts instead carry every real cache table
+// in multi_block_tables, so the primary table may be intentionally absent.
+bool has_speculative_verify_block_table_layout(
+    const torch::Tensor& block_tables,
+    const std::vector<torch::Tensor>& multi_block_tables,
+    int64_t num_sequences);
+
+// Build the zero-filled primary control table used only by generic expanded
+// metadata when the model owns its real cache layout through
+// multi_block_tables.
+torch::Tensor make_speculative_verify_control_block_table(
+    int64_t num_sequences,
+    int64_t block_table_capacity);
+
 enum class CombinedDraftExecutionPath {
   UNSUPPORTED,
   QWEN3_5_PAGED_ATTENTION,

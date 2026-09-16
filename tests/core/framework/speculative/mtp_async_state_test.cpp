@@ -30,6 +30,9 @@ TEST(MtpAsyncStateTest, ClassifiesClosedTargetSpecVerifyPolicy) {
       {"qwen3_5_text", TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY},
       {"qwen3_5_moe_text", TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY},
       {"deepseek_v32", TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY},
+      {"deepseek_v4", TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY},
+      {"deepseek_v4_dspark",
+       TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY},
       {"mimo", TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL},
       {"qwen3_next", TargetSpecVerifyMode::GENERIC},
       {"qwen3_5_mtp", TargetSpecVerifyMode::GENERIC},
@@ -114,6 +117,45 @@ TEST(MtpAsyncStateTest, ComputesSharedSpecVerifyBlockTableCapacity) {
   EXPECT_EQ(speculative_verify_block_table_capacity(262144, 128), 2049);
   EXPECT_EQ(speculative_verify_block_table_capacity(300000, 128), 2345);
 }
+
+TEST(MtpAsyncStateTest, AcceptsPrimaryOrModelManagedBlockTableLayouts) {
+  const torch::Tensor primary = torch::zeros({2, 4}, torch::kInt32);
+  const std::vector<torch::Tensor> model_managed = {
+      torch::zeros({2, 3}, torch::kInt32),
+      torch::zeros({2, 2}, torch::kInt32),
+  };
+
+  EXPECT_TRUE(has_speculative_verify_block_table_layout(
+      primary, /*multi_block_tables=*/{}, /*num_sequences=*/2));
+  EXPECT_TRUE(has_speculative_verify_block_table_layout(
+      torch::Tensor(), model_managed, /*num_sequences=*/2));
+  EXPECT_FALSE(has_speculative_verify_block_table_layout(
+      torch::Tensor(), /*multi_block_tables=*/{}, /*num_sequences=*/2));
+  EXPECT_FALSE(has_speculative_verify_block_table_layout(
+      torch::Tensor(),
+      {torch::zeros({1, 3}, torch::kInt32)},
+      /*num_sequences=*/2));
+  EXPECT_FALSE(has_speculative_verify_block_table_layout(
+      torch::zeros({2, 4}, torch::kInt64),
+      model_managed,
+      /*num_sequences=*/2));
+}
+
+#if defined(USE_NPU)
+TEST(MtpAsyncStateTest, BuildsPinnedZeroFilledSpecVerifyControlBlockTable) {
+  const torch::Tensor control =
+      make_speculative_verify_control_block_table(/*num_sequences=*/3,
+                                                  /*block_table_capacity=*/17);
+
+  EXPECT_TRUE(control.device().is_cpu());
+  EXPECT_TRUE(control.is_pinned());
+  EXPECT_EQ(control.scalar_type(), torch::kInt32);
+  EXPECT_EQ(control.dim(), 2);
+  EXPECT_EQ(control.size(0), 3);
+  EXPECT_EQ(control.size(1), 17);
+  EXPECT_EQ(control.count_nonzero().item<int64_t>(), 0);
+}
+#endif
 
 TEST(MtpAsyncStateTest, MaterializesDraftColumnsForEagerFallback) {
   torch::Tensor verify_tokens =
