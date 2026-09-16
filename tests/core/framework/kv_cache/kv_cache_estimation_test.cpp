@@ -175,10 +175,37 @@ TEST(KVCacheEstimationTest, ReservesLinearAttentionState) {
 
   EXPECT_EQ(capacity.num_full_attention_layers(), 2);
   EXPECT_EQ(capacity.num_linear_attention_layers(), 2);
-  EXPECT_EQ(capacity.num_linear_state_blocks(), 10);
+  EXPECT_EQ(capacity.num_linear_state_blocks(), 229);
   EXPECT_EQ(capacity.linear_slot_size(), 256);
-  EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 5120);
-  EXPECT_EQ(capacity.n_blocks(), 254);
+  EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 117248);
+  EXPECT_EQ(capacity.n_blocks(), 227);
+}
+
+TEST(KVCacheEstimationTest, LinearStateCapacityDoesNotDependOnPrefixCache) {
+  const ModelArgs model_args = make_linear_attention_args(1);
+  for (const int64_t explicit_slots : {0, 32}) {
+    KVCacheEstimateOptions options = make_linear_attention_options();
+    options.block_size = 1;
+    options.n_local_kv_heads = 1;
+    options.max_concurrent_requests = 1;
+    options.max_linear_state_cache_slots = explicit_slots;
+    options.enable_prefix_cache = false;
+    const KVCacheCapacity disabled =
+        estimate_kv_cache_capacity(model_args, options);
+    options.enable_prefix_cache = true;
+    const KVCacheCapacity enabled =
+        estimate_kv_cache_capacity(model_args, options);
+    EXPECT_EQ(disabled.num_linear_state_blocks(),
+              enabled.num_linear_state_blocks());
+    EXPECT_EQ(disabled.n_blocks(), enabled.n_blocks());
+    EXPECT_EQ(disabled.linear_cache_size_in_bytes(),
+              enabled.linear_cache_size_in_bytes());
+    EXPECT_EQ(disabled.num_linear_state_blocks(),
+              explicit_slots > 0 ? 34 : 970);
+    EXPECT_GT(disabled.n_blocks(), 0);
+    EXPECT_LE(disabled.linear_cache_size_in_bytes(),
+              options.cache_size_in_bytes);
+  }
 }
 
 #if defined(USE_MLU)
@@ -258,7 +285,7 @@ TEST(KVCacheEstimationTest, LinearStateCapacityVariants) {
        /*max_linear_state_cache_slots=*/0,
        /*expected_num_linear_state_blocks=*/229,
        /*min_num_linear_state_blocks=*/-1},
-      {"UnlimitedConcurrencyFallsBackToPaddingSlots",
+      {"UnlimitedConcurrencyUsesLinearStateMemoryRatio",
        /*head_dim=*/16,
        /*cache_size_in_bytes=*/1024 * 1024,
        /*block_size=*/16,
@@ -266,7 +293,7 @@ TEST(KVCacheEstimationTest, LinearStateCapacityVariants) {
        /*max_seqs_per_batch=*/0,
        /*enable_prefix_cache=*/false,
        /*max_linear_state_cache_slots=*/0,
-       /*expected_num_linear_state_blocks=*/2,
+       /*expected_num_linear_state_blocks=*/229,
        /*min_num_linear_state_blocks=*/-1},
       {"ExplicitLinearStateSlotsOverrideAutoSizing",
        /*head_dim=*/16,
@@ -350,7 +377,7 @@ TEST(KVCacheEstimationTest, Qwen35MtpExpandsConvStateLen) {
   EXPECT_EQ(capacity.linear_conv_state_len(), 3);
   EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 2);
   EXPECT_EQ(capacity.linear_slot_size(), 448);
-  EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 8960);
+  EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 189056);
 }
 
 TEST(KVCacheEstimationTest, Qwen35TextMtpUsesSsmCheckpointStride) {
@@ -372,7 +399,7 @@ TEST(KVCacheEstimationTest, Qwen35TextMtpUsesSsmCheckpointStride) {
   EXPECT_EQ(capacity.linear_conv_state_len(), 3);
   EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 2);
   EXPECT_EQ(capacity.linear_slot_size(), 448);
-  EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 8960);
+  EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 189056);
 }
 
 TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
