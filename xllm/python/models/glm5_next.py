@@ -643,6 +643,20 @@ class Glm5NextForgetGate(nn.Module):
         return self.gate_from_raw(self.raw_projection(forget_latent))
 
 
+def _stable_pack(dst: torch.Tensor | None, packed: torch.Tensor) -> torch.Tensor:
+    """Keep a packed weight buffer at a stable storage address across reloads.
+
+    A captured decode ACL graph records the buffer's address, so a plain
+    reallocation on every ``process_weights_after_loading`` (e.g. weight
+    hot-reload) leaves the graph replaying stale weights. Mirror the W_UK/W_UV
+    discipline: allocate once, then copy in place when the layout is unchanged.
+    """
+    if dst is None or dst.shape != packed.shape or dst.dtype != packed.dtype:
+        return packed
+    dst.copy_(packed)
+    return dst
+
+
 class Glm5NextKdaAttention(Attention):
     """KDA linear-attention layer (conv1d + delta-rule + gated norm + o_proj).
 
@@ -693,7 +707,7 @@ class Glm5NextKdaAttention(Attention):
 
         projection_sizes = tuple(getattr(self, size_attr) for _, size_attr, _ in _KDA_IN_PROJ)
         # Follow checkpoint row order; equal-sized f_a/g_a blocks must not be exchanged.
-        self.input_projection_sizes = (sum(projection_sizes[:3]), *projection_sizes[3:])
+        self.input_projection_sizes = (sum(projection_sizes[:3]), projection_sizes[3], sum(projection_sizes[4:]))
         self.in_proj_qkvbfg_a = nn.Linear(self.hidden_size, sum(self.input_projection_sizes), bias=False)
         # conv1d: depthwise over the LOCAL conv_dim (groups=conv_dim_local); the
         # loader shards each of q/k/v_conv1d by head then cats so the channel
@@ -709,6 +723,7 @@ class Glm5NextKdaAttention(Attention):
         self.conv1d.weight = nn.Parameter(self.conv1d.weight.detach().to(torch.float32))
         self.forget_gate = Glm5NextForgetGate(cfg, dtype, device)
         self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
+        self.register_buffer("_fg_b_weight", None, persistent=False)
         self.o_norm = _RMSNormGated(self.head_dim, self.eps, dtype, device)
         # o_proj: row-parallel + all_reduce. With KDA now head-sharded, each
         # rank's attention output is its head-subset's partial sum over
@@ -723,6 +738,21 @@ class Glm5NextKdaAttention(Attention):
             row_parallel=True,
         )
 
+    def process_weights_after_loading(self) -> None:
+        packed = torch.stack((self.forget_gate.f_b_proj.weight.detach(), self.g_b_proj.weight.detach()))
+        self._fg_b_weight = _stable_pack(self._fg_b_weight, packed)
+        self.forget_gate.f_b_proj.weight.data = self._fg_b_weight[0]
+        self.g_b_proj.weight.data = self._fg_b_weight[1]
+
+    def _project_fg(self, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batch the two distinct F/G inputs as in SGLang's batched linear."""
+        hidden_shape = (*latents.shape[:2], self.num_heads_local, self.head_dim)
+        if self._fg_b_weight is None:
+            forget_latent, output_latent = latents.split(self.head_dim, dim=-1)
+            return self.forget_gate.raw_projection(forget_latent), self.g_b_proj(output_latent).view(hidden_shape)
+        projected = torch.bmm(latents.view(-1, 2, self.head_dim).transpose(0, 1), self._fg_b_weight.transpose(-1, -2))
+        return projected[0].view(hidden_shape), projected[1].view(hidden_shape)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -731,10 +761,8 @@ class Glm5NextKdaAttention(Attention):
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len = hidden_states.shape[:2]
-        hidden_shape = (batch_size, seq_len, -1, self.head_dim)
-
         projected = self.in_proj_qkvbfg_a(hidden_states)
-        mixed_qkv, beta_raw, forget_latent, output_latent = projected.split(self.input_projection_sizes, dim=-1)
+        mixed_qkv, beta_raw, fg_latents = projected.split(self.input_projection_sizes, dim=-1)
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         # Compute the raw forget-gate projection once and hand it to the
@@ -743,7 +771,7 @@ class Glm5NextKdaAttention(Attention):
         # cross-layer / mask paths materialize the gate from the same raw inside
         # the backend, only when they actually need it (bit-exact, no second
         # f_a/f_b GEMM).
-        g_raw = self.forget_gate.raw_projection(forget_latent)
+        g_raw, gate = self._project_fg(fg_latents)
         beta = torch.sigmoid(beta_raw)
 
         # KDA conv1d + delta-rule + conv/ssm state is owned by the backend
@@ -757,7 +785,6 @@ class Glm5NextKdaAttention(Attention):
             )
         core_attn_out = backend.execute_linear(mixed_qkv, beta, self, raw_gate_proj=g_raw)
 
-        gate = self.g_b_proj(output_latent).view(hidden_shape)
         output = self.o_norm(core_attn_out, gate).reshape(batch_size, seq_len, -1)
         # KDA is head-sharded: each rank's o_proj (row-parallel, input
         # qkv_dim_local) yields a partial hidden summed over its head-subset;
@@ -871,7 +898,7 @@ class Glm5NextIndexer(nn.Module):
         self,
         query: torch.Tensor,
         weights: torch.Tensor,
-        key_valid: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
         attention_mask: torch.Tensor,
         pool_cache: torch.Tensor,
         pool_block_table: torch.Tensor,
@@ -882,7 +909,7 @@ class Glm5NextIndexer(nn.Module):
         if not in_acl_graph() and not bool(attention_mask.all().item()):
             return None
 
-        token_count = key_valid.to(torch.int32).sum(-1)
+        token_count = kv_seq_lens.reshape(-1).to(torch.int32)
         # PA_BBND addresses complete pooled keys and uses pool_tail_k for the
         # remaining tokens in the current tail pool.
         pool_tail_k = torch.remainder(token_count, self.index_kpool).to(torch.int32).contiguous()
@@ -915,6 +942,7 @@ class Glm5NextIndexer(nn.Module):
         key_valid: torch.Tensor | None = None,
         pool_block_table: torch.Tensor | None = None,
         pool_cache: torch.Tensor | None = None,
+        kv_seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Top-k pool selection over the FULL packed index history.
 
@@ -924,7 +952,11 @@ class Glm5NextIndexer(nn.Module):
         ``hidden_states`` are the CURRENT query tokens ``[B, S_q, ...]``.
         Alternatively, pass ``pool_data``/``key_valid`` from the paged pool
         cache (read_pools) to skip both the dense gather and the per-step
-        re-pooling. Returns absolute kv-position top-k indices
+        re-pooling. Paged decode can pass ``kv_seq_lens`` instead of a dense
+        ``key_valid`` mask; only the non-fused fallback materializes that mask,
+        so ``kv_seq_lens`` is a decode-only (seq_len=1) input — passing it on a
+        long-kv prefill would rebuild a dense ``[B, kv_len]`` mask every step.
+        Returns absolute kv-position top-k indices
         ``[B, S_q, topk]`` (int64, -1 = invalid), matching the reference
         indexer output.
         """
@@ -943,7 +975,7 @@ class Glm5NextIndexer(nn.Module):
             # mirroring gather_index_history's row_valid.
             pool_keys, pool_indices, pool_valid = pool_data
         else:
-            if key_valid is None:
+            if key_valid is None and kv_seq_lens is None:
                 if raw_key_cache:
                     key_valid = torch.ones(
                         batch_size,
@@ -953,13 +985,6 @@ class Glm5NextIndexer(nn.Module):
                     )
                 else:
                     key_valid = packed_states[..., -1].gt(0)
-
-        # Absolute position of each query token. The causal visibility
-        # ``pos <= q_pos`` is evaluated directly at the gathered kv positions
-        # (pool starts, selected indices) instead of materializing the dense
-        # ``[B, seq_len, kv_len]`` mask, whose ~GiB bool slab OOMs mid-prefill
-        # once kv_len passes ~300k at seq_len=8192.
-        q_pos = current_length - seq_len + torch.arange(seq_len, device=device)
 
         weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype))
         if (
@@ -974,7 +999,7 @@ class Glm5NextIndexer(nn.Module):
                 fused_indices = self._select_topk_fused_pa(
                     q,
                     scaled_weights,
-                    key_valid,
+                    kv_seq_lens if kv_seq_lens is not None else key_valid.to(torch.int32).sum(-1),
                     attention_mask,
                     pool_cache,
                     pool_block_table,
@@ -983,9 +1008,22 @@ class Glm5NextIndexer(nn.Module):
                     return fused_indices
             except NotImplementedError:
                 pass
+        if key_valid is None:
+            # kv_len is padded to a whole number of pools by the decode caller;
+            # a narrower mask would misalign the gather at pool_start below and
+            # silently drop the tail pool's validity bit.
+            assert kv_len % self.index_kpool == 0, (
+                f"kv_len {kv_len} must be a multiple of index_kpool {self.index_kpool}"
+            )
+            # This dense [B, kv_len] mask scales with kv_len and is rebuilt each
+            # step; only decode (seq_len=1) reaches here with kv_seq_lens, so it
+            # stays cheap. Long-kv prefill takes the fused / pool_data paths above
+            # rather than materializing this mask.
+            key_valid = torch.arange(kv_len, device=device)[None] < kv_seq_lens.reshape(-1, 1)
+        q_pos = current_length - seq_len + torch.arange(seq_len, device=device)
         if pool_data is None:
             if pool_cache is not None and pool_block_table is not None:
-                kv_lens = key_valid.to(torch.int64).sum(-1)
+                kv_lens = kv_seq_lens if kv_seq_lens is not None else key_valid.to(torch.int64).sum(-1)
                 n_pools = (kv_len + self.index_kpool - 1) // self.index_kpool
                 pool_keys, pool_indices, pool_valid = read_pools(
                     pool_cache,
@@ -1229,9 +1267,6 @@ class Glm5NextIndexer(nn.Module):
                     max_kv = None
                 if max_kv is not None:
                     n_pools = (max_kv + self.index_kpool - 1) // self.index_kpool
-                    key_valid = torch.arange(n_pools * self.index_kpool, device=pool_cache.device)[
-                        None, :
-                    ] < kv_lens_t.reshape(-1, 1)
                     kv_len = n_pools * self.index_kpool
                     qr_bsd = qr.view(n_seqs, 1, -1)
                     hidden_bsd = hidden_states.view(n_seqs, 1, -1)
@@ -1242,7 +1277,7 @@ class Glm5NextIndexer(nn.Module):
                         mask_bsd,
                         kv_len=kv_len,
                         current_length=kv_len,
-                        key_valid=key_valid,
+                        kv_seq_lens=kv_lens_t.clamp(max=kv_len),
                         pool_cache=pool_cache,
                         pool_block_table=ctx.block_table,
                     )
@@ -1372,6 +1407,8 @@ class Glm5NextMlaAttention(Attention):
             bias=cfg.attention_bias,
         )
         self.kv_a_layernorm = Glm5NextRMSNorm(self.kv_lora_rank, self.eps, dtype, device)
+        self.register_buffer("_qkv_a_weight", None, persistent=False)
+        self.register_buffer("_qkv_a_bias", None, persistent=False)
         # kv_b: column-parallel fp (absorbed split reads .weight; stays fp, see
         # design §3)
         self.kv_b_proj = ColumnParallelLinear(
@@ -1420,6 +1457,19 @@ class Glm5NextMlaAttention(Attention):
         )
 
     def process_weights_after_loading(self) -> None:
+        prev_weight, prev_bias = self._qkv_a_weight, self._qkv_a_bias
+        self._qkv_a_weight = None
+        self._qkv_a_bias = None
+        if self.q_a_proj.use_w8a8 is False and self.kv_a_proj_with_mqa.use_w8a8 is False:
+            packed = torch.cat((self.q_a_proj.weight.detach(), self.kv_a_proj_with_mqa.weight.detach()), dim=0)
+            self._qkv_a_weight = _stable_pack(prev_weight, packed)
+            self.q_a_proj.weight.data = self._qkv_a_weight[: self.q_lora_rank]
+            self.kv_a_proj_with_mqa.weight.data = self._qkv_a_weight[self.q_lora_rank :]
+            if self.cfg.attention_bias:
+                packed_bias = torch.cat((self.q_a_proj.bias.detach(), self.kv_a_proj_with_mqa.bias.detach()), dim=0)
+                self._qkv_a_bias = _stable_pack(prev_bias, packed_bias)
+                self.q_a_proj.bias.data = self._qkv_a_bias[: self.q_lora_rank]
+                self.kv_a_proj_with_mqa.bias.data = self._qkv_a_bias[self.q_lora_rank :]
         # Split kv_b_proj.weight into absorbed W_UK / W_UV (mirrors
         # deepseek_v32.process_weights_after_loading split). glm5_next is NoPE
         # (qk_rope_head_dim=0), so qk_head_dim == qk_nope_head_dim.
@@ -1432,6 +1482,15 @@ class Glm5NextMlaAttention(Attention):
         w_uk, w_uv = w.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         self.W_UK.copy_(w_uk.contiguous())
         self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
+
+    def _project_qkv_a(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse the shared-input Q/KV-A linear layout used by vLLM-Ascend."""
+        # W8A8 can't fuse: each QLinear owns a per-tensor act scale and a repacked
+        # int8 weight, so only the float path cats into the single GEMM below.
+        if self._qkv_a_weight is None:
+            return self.q_a_proj(hidden), self.kv_a_proj_with_mqa(hidden)
+        projected = F.linear(hidden, self._qkv_a_weight, self._qkv_a_bias)
+        return projected.split((self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim), dim=-1)
 
     def forward(
         self,
@@ -1450,7 +1509,7 @@ class Glm5NextMlaAttention(Attention):
         """
         num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
         hidden = hidden_states.view(num_tokens, -1)
-        q_a = self.q_a_proj(hidden)
+        q_a, kv = self._project_qkv_a(hidden)
         q_c = self.q_a_layernorm(q_a)
         backend = get_forward_context().attention_backend
         topk = None
@@ -1469,7 +1528,6 @@ class Glm5NextMlaAttention(Attention):
         # NoPE: qk_rope_head_dim == 0 -> q_rope/k_rope are empty -> q_pe/k_pe None.
         q_pe = None
 
-        kv = self.kv_a_proj_with_mqa(hidden)
         k_latent_raw, k_rope_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_latent = self.kv_a_layernorm(k_latent_raw)
         k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)

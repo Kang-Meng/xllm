@@ -866,7 +866,16 @@ class TestUT(Command):
                 logger.info(f"Running tests in parallel (excluding: {', '.join(self.SEQUENTIAL_TESTS)})...")
                 logger.info("=" * 80)
                 run_subprocess_with_streaming(
-                    ["ctest", "--parallel", test_parallel, "--repeat", "until-pass:5", "-E", exclude_pattern],
+                    [
+                        "ctest",
+                        "--output-on-failure",
+                        "--parallel",
+                        test_parallel,
+                        "--repeat",
+                        "until-pass:5",
+                        "-E",
+                        exclude_pattern,
+                    ],
                     "Parallel tests failed.",
                 )
             else:
@@ -874,7 +883,8 @@ class TestUT(Command):
                 logger.info("Running all tests in parallel...")
                 logger.info("=" * 80)
                 run_subprocess_with_streaming(
-                    ["ctest", "--parallel", test_parallel, "--repeat", "until-pass:5"], "Parallel tests failed."
+                    ["ctest", "--output-on-failure", "--parallel", test_parallel, "--repeat", "until-pass:5"],
+                    "Parallel tests failed.",
                 )
 
             # Step 2: Run sequential tests one by one
@@ -885,7 +895,7 @@ class TestUT(Command):
                 # Use pattern matching to include all test cases under the test class
                 # e.g., ReduceScatterMultiDeviceTest matches ReduceScatterMultiDeviceTest.BasicTest, etc.
                 run_subprocess_with_streaming(
-                    ["ctest", "--repeat", "until-pass:5", "-R", test_name],
+                    ["ctest", "--output-on-failure", "--repeat", "until-pass:5", "-R", test_name],
                     f"Sequential test {test_name} failed.",
                     warn_if_no_tests=True,
                 )
