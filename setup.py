@@ -300,7 +300,6 @@ class ExtBuild(build_ext):
         ("device=", None, "target device type (npu or mlu or cuda or ilu or musa or maca)"),
         ("arch=", None, "target arch type (x86 or arm)"),
         ("generate-so=", None, "generate so or binary"),
-        ("enable-ha=", None, "enable Mooncake etcd high availability"),
         ("tilelang-jobs=", None, "maximum parallel TileLang compile workers"),
     ]
 
@@ -310,7 +309,6 @@ class ExtBuild(build_ext):
         self.device: str | None = None
         self.arch: str | None = None
         self.generate_so: bool = False
-        self.enable_ha: bool = False
         self.tilelang_jobs: int | str | None = None
 
     def finalize_options(self) -> None:
@@ -384,9 +382,8 @@ class ExtBuild(build_ext):
             "-DBUILD_SHARED_LIBS=OFF",
             f"-DDEVICE_TYPE=USE_{self.device.upper()}",
             f"-DDEVICE_ARCH={self.arch.upper()}",
-            f"-DENABLE_HA={'ON' if self.enable_ha else 'OFF'}",
-            f"-DUSE_ETCD={'ON' if self.enable_ha else 'OFF'}",
-            f"-DSTORE_USE_ETCD={'ON' if self.enable_ha else 'OFF'}",
+            "-DUSE_ETCD=ON",
+            "-DSTORE_USE_ETCD=ON",
             f"-DXLLM_ATB_LAYERS_SOURCE_DIR={os.path.join(self.base_dir, 'third_party', 'xllm_atb_layers')}",
             f"-DCMAKE_JOB_POOLS=archive={archive_jobs}",
         ]
@@ -525,9 +522,7 @@ class ExtBuild(build_ext):
         base_build_args = build_args
         # Build every native executable shipped in the wheel so stale Mooncake
         # binaries cannot be reused from a previous build directory.
-        build_targets = [ext.name, "mooncake_master", "mooncake_client"]
-        if self.enable_ha:
-            build_targets.append("stage_mooncake_ha_runtime")
+        build_targets = [ext.name, "mooncake_master", "mooncake_client", "stage_mooncake_etcd_runtime"]
         build_args += ["--target", *build_targets]
         subprocess.check_call([cmake_cmd, "--build", ".", "--verbose"] + build_args, cwd=cmake_dir)
 
@@ -537,11 +532,10 @@ class ExtBuild(build_ext):
             os.path.join(extdir, product),
             server_output_dir,
         )
-        if self.enable_ha:
-            etcd_wrapper = os.path.join(extdir, "libetcd_wrapper.so")
-            if not os.path.isfile(etcd_wrapper):
-                raise RuntimeError(f"Mooncake HA runtime library was not staged: {etcd_wrapper}")
-            shutil.copy(etcd_wrapper, server_output_dir)
+        etcd_wrapper = os.path.join(extdir, "libetcd_wrapper.so")
+        if not os.path.isfile(etcd_wrapper):
+            raise RuntimeError(f"Mooncake etcd runtime library was not staged: {etcd_wrapper}")
+        shutil.copy(etcd_wrapper, server_output_dir)
 
         # Stage the Python model-executor package into the wheel as the
         # ``xllm.python`` subpackage (xllm/python/...). The installed ``xllm``
@@ -665,7 +659,6 @@ class BuildDistWheel(bdist_wheel):
     user_options = bdist_wheel.user_options + [
         ("device=", None, "target device type (npu or mlu or cuda or ilu or musa)"),
         ("arch=", None, "target arch type (x86 or arm)"),
-        ("enable-ha=", None, "enable Mooncake etcd high availability"),
         ("tilelang-jobs=", None, "maximum parallel TileLang compile workers"),
     ]
 
@@ -673,7 +666,6 @@ class BuildDistWheel(bdist_wheel):
         super().initialize_options()
         self.device: str | None = None
         self.arch: str | None = None
-        self.enable_ha: bool = False
         self.tilelang_jobs: int | str | None = None
         # Cache the original dist name early so finalize_options is idempotent
         # and so name changes are visible to egg_info/metadata generation.
@@ -703,7 +695,6 @@ class BuildDistWheel(bdist_wheel):
         build_ext_cmd = self.get_finalized_command("build_ext")
         build_ext_cmd.device = self.device
         build_ext_cmd.arch = self.arch
-        build_ext_cmd.enable_ha = self.enable_ha
         build_ext_cmd.tilelang_jobs = self.tilelang_jobs
 
         logger.info("🔨 build project...")
@@ -922,7 +913,6 @@ class SingleTest(Command):
         ("device=", None, "target device type (npu or mlu or cuda or ilu)"),
         ("arch=", None, "target arch type (x86 or arm)"),
         ("generate-so=", None, "generate so or binary"),
-        ("enable-ha=", None, "enable Mooncake etcd high availability"),
         ("tilelang-jobs=", None, "maximum parallel TileLang compile workers"),
     ]
 
@@ -931,7 +921,6 @@ class SingleTest(Command):
         self.device: str | None = None
         self.arch: str | None = None
         self.generate_so: bool = False
-        self.enable_ha: bool = False
         self.tilelang_jobs: int | str | None = None
 
     def finalize_options(self) -> None:
@@ -946,7 +935,6 @@ class SingleTest(Command):
         build_ext.device = self.device
         build_ext.arch = self.arch
         build_ext.generate_so = self.generate_so
-        build_ext.enable_ha = self.enable_ha
         build_ext.tilelang_jobs = self.tilelang_jobs
         build_ext.finalize_options()
 
@@ -984,13 +972,10 @@ def parse_arguments() -> dict[str, Any]:
         help="Whether to generate so or binary",
     )
     parser.add_argument(
-        "--enable-ha",
-        type=str.lower,
-        choices=["true", "false", "1", "0", "yes", "no", "y", "n", "on", "off"],
-        default="false",
-        help="Whether to enable Mooncake etcd high availability support",
+        "--deps",
+        action="store_true",
+        help="Force installation of Mooncake build dependencies",
     )
-
     parser.add_argument(
         "--test-name",
         type=str,
@@ -1009,12 +994,10 @@ def parse_arguments() -> dict[str, Any]:
     sys.argv = [sys.argv[0]] + args.setup_args
 
     generate_so = args.generate_so.lower() in ("true", "1", "yes", "y", "on")
-    enable_ha = args.enable_ha.lower() in ("true", "1", "yes", "y", "on")
-
     return {
         "device": args.device,
+        "force_dependencies": args.deps,
         "generate_so": generate_so,
-        "enable_ha": enable_ha,
         "test_name": args.test_name,
         "tilelang_jobs": args.tilelang_jobs,
     }
@@ -1027,9 +1010,8 @@ if __name__ == "__main__":
     device = config["device"]
     if device == "auto":
         device = get_device_type()
-    enable_ha = config["enable_ha"]
-    logger.info(f"🚀 Build xllm with CPU arch: {arch}, target device: {device}, enable_ha: {enable_ha}")
-    pre_build(device, enable_ha)
+    logger.info(f"🚀 Build xllm with CPU arch: {arch}, target device: {device}")
+    pre_build(device, force_dependencies=config["force_dependencies"])
 
     generate_so = config["generate_so"]
     test_name = config.get("test_name")
@@ -1051,13 +1033,11 @@ if __name__ == "__main__":
             "device": device,
             "arch": arch,
             "generate_so": generate_so,
-            "enable_ha": enable_ha,
             "tilelang_jobs": tilelang_jobs,
         },
         "bdist_wheel": {
             "device": device,
             "arch": arch,
-            "enable_ha": enable_ha,
             "tilelang_jobs": tilelang_jobs,
         },
     }
@@ -1066,7 +1046,6 @@ if __name__ == "__main__":
             "device": device,
             "arch": arch,
             "generate_so": generate_so,
-            "enable_ha": enable_ha,
             "test_name": test_name,
             "tilelang_jobs": tilelang_jobs,
         }

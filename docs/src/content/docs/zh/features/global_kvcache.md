@@ -343,11 +343,11 @@ sequenceDiagram
 - 编译或安装 Mooncake Store 的 `mooncake_master` 和 `mooncake_client`。
 - 预留足够的 Host 内存。Mooncake Store 要求 `--enable_prefix_cache=true` 且 `--host_blocks_factor > 1`。
 
-使用 Mooncake etcd 高可用模式时，需要先安装 Go，然后在构建 xLLM 和随仓库提供的 Mooncake 二进制时显式开启 HA 后端：
+构建 xLLM 和随仓库提供的 Mooncake 二进制时，默认启用 Mooncake etcd 高可用后端：
 
 ```bash
 MAX_JOBS=32 SKIP_EXPORT=1 \
-  python setup.py build --device npu --enable-ha true
+  python setup.py build --device npu
 cmake --build build/cmake.linux-aarch64-cpython-311 \
   --target mooncake_master mooncake_client -j32
 ```
