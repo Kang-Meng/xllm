@@ -102,11 +102,6 @@ class HierarchyPoolTestPeer final {
       }
     }
   }
-
-  static bool should_probe_prefix_cache(const HierarchyBlockManagerPool& pool,
-                                        Sequence* sequence) {
-    return pool.should_probe_prefix_cache(sequence);
-  }
 };
 
 namespace {
@@ -404,6 +399,7 @@ TEST(HierarchyBlockManagerPoolTest, DecodeTypedLayoutProbesOnlyDeviceC4C128) {
   Sequence sequence = make_test_sequence(/*index=*/0, tokens);
   sequence.kv_state().set_kv_cache_tokens_num(kPromptTokens);
   ASSERT_EQ(sequence.stage(), SequenceStage::DECODE);
+  EXPECT_TRUE(pool.needs_shared_reprobe(&sequence));
   pool.allocate_shared(&sequence);
 
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::SWA), 0u);
@@ -644,13 +640,13 @@ TEST(HierarchyBlockManagerPoolTest,
   ASSERT_EQ(sequence.kv_state().kv_cache_tokens_num(), kSharedTokens);
   ASSERT_EQ(sequence.kv_state().shared_tokens_num(), kSharedTokens);
 
+  sequence.host_kv_state().set_prefix_cache_matched();
+  EXPECT_FALSE(pool.needs_shared_reprobe(&sequence));
   sequence.host_kv_state().set_prefix_cache_matched(false);
-  EXPECT_TRUE(
-      HierarchyPoolTestPeer::should_probe_prefix_cache(pool, &sequence));
+  EXPECT_TRUE(pool.needs_shared_reprobe(&sequence));
 
   sequence.kv_state().set_kv_cache_tokens_num(kSharedTokens + 1);
-  EXPECT_FALSE(
-      HierarchyPoolTestPeer::should_probe_prefix_cache(pool, &sequence));
+  EXPECT_FALSE(pool.needs_shared_reprobe(&sequence));
 
   pool.deallocate(&sequence);
 }

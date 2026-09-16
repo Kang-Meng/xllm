@@ -13,14 +13,77 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "block_hasher.h"
+#include "core/framework/prefix_cache/block_hasher.h"
 
 #include <string.h>
 #include <xxHash/xxhash.h>
 
+#include <algorithm>
+#include <utility>
+
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/speculative_config.h"
 
 namespace xllm {
+
+namespace {
+
+class MtpBlockHasher final : public BlockHasher {
+ public:
+  explicit MtpBlockHasher(std::unique_ptr<BlockHasher> hasher)
+      : hasher_(std::move(hasher)) {}
+
+  void compute(const Slice<int32_t>& token_ids,
+               int32_t start_token_idx,
+               int32_t end_token_idx,
+               const uint8_t* pre_hash_value,
+               XXH3Key& hash_key) override {
+    CHECK_LT(static_cast<size_t>(end_token_idx), token_ids.size());
+    hasher_->compute(token_ids,
+                     start_token_idx,
+                     end_token_idx + 1,
+                     pre_hash_value,
+                     hash_key);
+  }
+
+ private:
+  std::unique_ptr<BlockHasher> hasher_;
+};
+
+}  // namespace
+
+BlockHasherType mtp_hasher_type(BlockHasherType base,
+                                int32_t num_speculative_tokens,
+                                std::string_view algorithm) {
+  if (num_speculative_tokens <= 0 ||
+      !SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+    return base;
+  }
+  switch (base) {
+    case BlockHasherType::TEXT:
+      return BlockHasherType::MTP_TEXT;
+    case BlockHasherType::MM:
+      return BlockHasherType::MTP_MM;
+    default:
+      return base;
+  }
+}
+
+size_t block_hash_lookahead(BlockHasherType type) {
+  return type == BlockHasherType::MTP_TEXT || type == BlockHasherType::MTP_MM
+             ? 1
+             : 0;
+}
+
+size_t num_hash_blocks(BlockHasherType type,
+                       size_t num_tokens,
+                       size_t block_size) {
+  const size_t lookahead = block_hash_lookahead(type);
+  if (block_size == 0 || num_tokens <= lookahead) {
+    return 0;
+  }
+  return (num_tokens - lookahead) / block_size;
+}
 
 void xxh3_128bits_hash(const uint8_t* pre_hash_value,
                        const Slice<int32_t>& token_ids,
@@ -85,10 +148,9 @@ void extend_prefix_hashes(BlockHasherType type,
                           size_t block_size,
                           size_t boundary_blocks,
                           std::vector<XXH3Key>& hashes) {
+  boundary_blocks = std::min(
+      boundary_blocks, num_hash_blocks(type, token_ids.size(), block_size));
   if (block_size == 0 || boundary_blocks <= hashes.size()) {
-    return;
-  }
-  if (boundary_blocks * block_size > token_ids.size()) {
     return;
   }
   const size_t start_block = hashes.size();
@@ -122,6 +184,13 @@ void extend_prefix_hashes(BlockHasherType type,
 std::unique_ptr<BlockHasher> BlockHasher::create(BlockHasherType type,
                                                  const MMData& mm_data,
                                                  int32_t start_token_idx) {
+  if (type == BlockHasherType::MTP_TEXT || type == BlockHasherType::MTP_MM) {
+    const BlockHasherType base_type = type == BlockHasherType::MTP_TEXT
+                                          ? BlockHasherType::TEXT
+                                          : BlockHasherType::MM;
+    return std::make_unique<MtpBlockHasher>(
+        create(base_type, mm_data, start_token_idx));
+  }
   if (type == BlockHasherType::MM) {
     return std::make_unique<MMBlockHasher>(mm_data, start_token_idx);
   }
@@ -176,24 +245,28 @@ std::vector<const uint8_t*> MMBlockHasher::get_block_mm_hash_values(
   const auto& mm_items = mm_data_.items<MMItemVec>();
   std::vector<const uint8_t*> mm_hash_values;
   const int32_t num_mm_items = mm_data_.size();
-  while (next_item_idx_ < num_mm_items) {
-    const auto& pos = mm_items[next_item_idx_].state().token_pos();
+  mm_hash_values.reserve(num_mm_items - next_item_idx_);
+  int32_t item_idx = next_item_idx_;
+  while (item_idx < num_mm_items) {
+    const auto& pos = mm_items[item_idx].state().token_pos();
     const int32_t item_start_token_idx = pos.offset;
     const int32_t item_end_token_idx = item_start_token_idx + pos.length;
     if (end_token_idx <= item_start_token_idx) {
       break;
     }
     if (start_token_idx >= item_end_token_idx) {
-      ++next_item_idx_;
+      next_item_idx_ = ++item_idx;
       continue;
     }
-    const auto& schedule_data =
-        mm_items[next_item_idx_].state().schedule_data();
-    mm_hash_values.push_back(schedule_data.key.data);
+    const auto& schedule_data = mm_items[item_idx].state().schedule_data();
+    mm_hash_values.emplace_back(schedule_data.key.data);
     if (item_end_token_idx > end_token_idx) {
       break;
     }
-    ++next_item_idx_;
+    // Retire an item only when the next block starts past it. MTP blocks
+    // overlap by one token, so consuming through end_token_idx here would
+    // drop the boundary item's identity from the following block.
+    ++item_idx;
   }
   return mm_hash_values;
 }
