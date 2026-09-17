@@ -533,18 +533,19 @@ class DeepseekV4Base {
     for (int32_t group_id = 0;
          group_id < static_cast<int32_t>(group_infos_.size());
          ++group_id) {
-      if (group_infos_[static_cast<size_t>(group_id)].type ==
-              DSACacheType::TOKEN &&
-          group_infos_[static_cast<size_t>(group_id)].ratio == 128) {
-        c128_physical_dim =
-            group_infos_[static_cast<size_t>(group_id)].block_size;
+      const auto& group_info = group_infos_[static_cast<size_t>(group_id)];
+      if (group_info.type == DSACacheType::TOKEN && group_info.ratio == 128) {
+        c128_physical_dim = group_info.block_size;
       }
 
       // Create block_table buffer with maximum shape
-      int32_t block_size =
-          group_infos_[static_cast<size_t>(group_id)].block_size;
-      int64_t max_blocks_per_seq =
-          (max_position_embeddings_ + block_size + 1) / block_size + 1;
+      const int64_t block_token_size =
+          static_cast<int64_t>(group_info.block_size) *
+          (group_info.type == DSACacheType::TOKEN ? group_info.ratio : 1);
+      CHECK_GT(block_token_size, 0);
+      const int64_t max_blocks_per_seq =
+          (max_position_embeddings_ + block_token_size + 1) / block_token_size +
+          1;
       persistent.block_tables_by_group[group_id] =
           torch::full({num_tokens, max_blocks_per_seq}, -1, int_options);
 
