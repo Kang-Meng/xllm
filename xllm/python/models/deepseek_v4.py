@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -78,6 +78,37 @@ def _pick(d: dict, *keys: str, default: Any = None) -> Any:
         if k in d and d[k] is not None:
             return d[k]
     return default
+
+
+def _find_checkpoint_key(loader: W8A8WeightLoader, candidates: Sequence[str]) -> str | None:
+    """Return the first checkpoint key present in compatibility order."""
+    return next((name for name in candidates if loader.has(name)), None)
+
+
+def _require_checkpoint_key(
+    loader: W8A8WeightLoader,
+    candidates: Sequence[str],
+    description: str,
+) -> str:
+    key = _find_checkpoint_key(loader, candidates)
+    if key is None:
+        expected = ", ".join(candidates)
+        raise KeyError(f"{description} not found; expected one of: {expected}")
+    return key
+
+
+def _resolve_mlp_projection_names(loader: W8A8WeightLoader, checkpoint_prefix: str) -> tuple[str, str, str]:
+    """Resolve native ``gate/up/down`` and legacy ``w1/w3/w2`` names."""
+    for names in (
+        ("gate_proj", "up_proj", "down_proj"),
+        ("w1", "w3", "w2"),
+    ):
+        if all(loader.has(checkpoint_prefix + name + ".weight") for name in names):
+            return names
+    raise KeyError(
+        f"DeepSeek-V4 MLP projections not found under {checkpoint_prefix}; "
+        "expected gate_proj/up_proj/down_proj or w1/w3/w2"
+    )
 
 
 def _expand_half_rope_cos_sin(
@@ -1837,7 +1868,13 @@ class DeepseekV4ForCausalLM(PyModelBase):
 
     def load_weights(self, state_dicts, tp_rank: int, tp_size: int) -> None:
         cfg = self.cfg
-        loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
+        loader = W8A8WeightLoader(
+            self,
+            state_dicts,
+            cfg.tp_size,
+            cfg.tp_rank,
+            src_prefixes=("", "model."),
+        )
 
         def _has(name: str) -> bool:
             return loader.has(name)
@@ -1984,20 +2021,14 @@ class DeepseekV4ForCausalLM(PyModelBase):
         loader.copy_in("model.hc_head_scale", loader.load_tensor("hc_head_scale"))
         # Match LlmForCausalLMImplBase's non-tied output-head lookup order.  The
         # Flash checkpoint uses ``head.weight`` rather than ``lm_head.weight``.
-        lm_head_key = next(
+        lm_head_key = _require_checkpoint_key(
+            loader,
             (
-                name
-                for name in (
-                    "lm_head.weight",
-                    "model.lm_head.weight",
-                    "model.head.weight",
-                    "head.weight",
-                )
-                if _has(name)
+                "lm_head.weight",
+                "head.weight",
             ),
-            None,
+            "checkpoint output-head weight",
         )
-        assert lm_head_key is not None, "checkpoint output-head weight not found"
         loader.copy_in(
             "lm_head.weight",
             loader.shard(loader.load_tensor(lm_head_key), dim=0),
@@ -2010,17 +2041,27 @@ class DeepseekV4ForCausalLM(PyModelBase):
         parameter_prefix: str,
         mlp: DeepseekV3MLP,
     ) -> None:
-        """Load DSV4 ``w1/w3/w2`` tensors into a fused dense W8A8 MLP."""
+        """Load DSV4 dense projection tensors into a fused W8A8 MLP."""
         gate_up_prefix = parameter_prefix + "mlp.gate_up_proj."
         down_prefix = parameter_prefix + "mlp.down_proj."
+        gate_name, up_name, down_name = _resolve_mlp_projection_names(
+            loader,
+            checkpoint_prefix + "ffn.",
+        )
         for suffix in ("weight", "weight_scale", "weight_offset"):
-            w1 = loader.shard(loader.load_tensor(checkpoint_prefix + "ffn.w1." + suffix), dim=0)
-            w3 = loader.shard(loader.load_tensor(checkpoint_prefix + "ffn.w3." + suffix), dim=0)
-            loader.copy_in(gate_up_prefix + suffix, torch.cat([w1, w3], dim=0))
-            w2 = loader.load_tensor(checkpoint_prefix + "ffn.w2." + suffix)
+            gate = loader.shard(
+                loader.load_tensor(checkpoint_prefix + "ffn." + gate_name + "." + suffix),
+                dim=0,
+            )
+            up = loader.shard(
+                loader.load_tensor(checkpoint_prefix + "ffn." + up_name + "." + suffix),
+                dim=0,
+            )
+            loader.copy_in(gate_up_prefix + suffix, torch.cat([gate, up], dim=0))
+            down = loader.load_tensor(checkpoint_prefix + "ffn." + down_name + "." + suffix)
             if suffix == "weight":
-                w2 = loader.shard(w2, dim=1)
-            loader.copy_in(down_prefix + suffix, w2)
+                down = loader.shard(down, dim=1)
+            loader.copy_in(down_prefix + suffix, down)
         mlp.process_weights_after_loading()
 
     def _load_dsv4_moe(self, loader, ck: str, pm: str, layer_id: int) -> None:
