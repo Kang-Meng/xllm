@@ -217,12 +217,9 @@ CompositeBlockManager::LeafMap build_composite_leaves(
           << " for composite BlockManagerImpl sub-manager";
       const BlockType key =
           compress_ratio == 4 ? BlockType::C4 : BlockType::C128;
-      const int64_t physical_block_size = dsv4_compressed_physical_block_size(
-          static_cast<int32_t>(compress_ratio));
-      CHECK_GT(physical_block_size, 0);
-      const int64_t logical_block_size =
-          physical_block_size * static_cast<int64_t>(compress_ratio);
-      CHECK_EQ(logical_block_size, kDsv4CompressedBlockTokenSpan);
+      const Dsv4CacheGeometry& geometry =
+          KVCacheConfig::get_instance().dsv4_cache_geometry();
+      const int64_t logical_block_size = geometry.compressed_block_token_size();
       uint32_t typed_num_blocks = key == BlockType::C4
                                       ? options.c4_num_blocks()
                                       : options.c128_num_blocks();
@@ -230,8 +227,8 @@ CompositeBlockManager::LeafMap build_composite_leaves(
         CHECK_GT(options.block_size(), 0);
         const int64_t base_token_capacity =
             static_cast<int64_t>(options.num_blocks()) * options.block_size();
-        typed_num_blocks = static_cast<uint32_t>(base_token_capacity /
-                                                 kDsv4CompressedBlockTokenSpan);
+        typed_num_blocks = static_cast<uint32_t>(
+            base_token_capacity / geometry.compressed_block_token_size());
       }
       CHECK_GT(typed_num_blocks, 0u)
           << "missing DSV4 compressed block count for ratio " << compress_ratio;

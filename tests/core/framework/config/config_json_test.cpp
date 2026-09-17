@@ -540,7 +540,8 @@ TEST(ConfigPrecedenceTest, CommandLineFlagOverridesJson) {
   google::SetCommandLineOption("max_tokens_per_batch", "2048");
   google::SetCommandLineOption("model_impl", "native");
 
-  // kInlineConfig sets block_size=16, max_tokens_per_batch=8192,
+  // kInlineConfig sets block_size=16, compressed block tokens=4096,
+  // max_tokens_per_batch=8192,
   // model_impl="py": all conflict with the command-line values above.
   const JsonReader json = config::parse_json_string(kInlineConfig);
 

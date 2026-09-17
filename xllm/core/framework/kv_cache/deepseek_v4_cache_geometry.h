@@ -21,18 +21,34 @@ namespace xllm {
 
 constexpr int32_t kDsv4C4CompressRatio = 4;
 constexpr int32_t kDsv4C128CompressRatio = 128;
-constexpr int64_t kDsv4C4PhysicalBlockSize = 512;
-constexpr int64_t kDsv4C128PhysicalBlockSize = 16;
-constexpr int64_t kDsv4CompressedBlockTokenSpan = 2048;
+#if defined(USE_MLU)
+constexpr int64_t kDsv4CompressedBlockTokenSize = 128;
+#else
+constexpr int64_t kDsv4CompressedBlockTokenSize = 2048;
+#endif
 
-constexpr int64_t dsv4_compressed_physical_block_size(int32_t compress_ratio) {
-  if (compress_ratio == kDsv4C4CompressRatio) {
-    return kDsv4C4PhysicalBlockSize;
+class Dsv4CacheGeometry final {
+ public:
+  [[nodiscard]] constexpr int64_t compressed_block_token_size() const {
+    return kDsv4CompressedBlockTokenSize;
   }
-  if (compress_ratio == kDsv4C128CompressRatio) {
-    return kDsv4C128PhysicalBlockSize;
+
+  [[nodiscard]] constexpr int64_t compressed_physical_dim(
+      int32_t compress_ratio) const {
+    if ((compress_ratio != kDsv4C4CompressRatio &&
+         compress_ratio != kDsv4C128CompressRatio)) {
+      return 0;
+    }
+    return kDsv4CompressedBlockTokenSize / compress_ratio;
   }
-  return 0;
-}
+
+  [[nodiscard]] constexpr int64_t c4_physical_dim() const {
+    return compressed_physical_dim(kDsv4C4CompressRatio);
+  }
+
+  [[nodiscard]] constexpr int64_t c128_physical_dim() const {
+    return compressed_physical_dim(kDsv4C128CompressRatio);
+  }
+};
 
 }  // namespace xllm

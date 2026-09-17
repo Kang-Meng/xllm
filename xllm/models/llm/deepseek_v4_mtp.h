@@ -458,10 +458,15 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     if (group_infos_.size() >= 3) {
       return;
     }
-
+    const Dsv4CacheGeometry& geometry =
+        KVCacheConfig::get_instance().dsv4_cache_geometry();
+    const int32_t c4_physical_dim =
+        static_cast<int32_t>(geometry.c4_physical_dim());
+    const int32_t c128_physical_dim =
+        static_cast<int32_t>(geometry.c128_physical_dim());
     group_infos_ = {{DSACacheType::SLIDING_WINDOW, 1, window_size},
-                    {DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
-                    {DSACacheType::TOKEN, 128, kDsv4C128PhysicalBlockSize}};
+                    {DSACacheType::TOKEN, 4, c4_physical_dim},
+                    {DSACacheType::TOKEN, 128, c128_physical_dim}};
     caches_info_.assign(static_cast<size_t>(model_args_.n_layers()), {});
     for (int32_t layer_id = 0; layer_id < model_args_.n_layers(); ++layer_id) {
       const int32_t cr = deepseek_v4_normalize_compress_ratio(
@@ -470,17 +475,17 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
               : 1);
       if (cr == 4) {
         caches_info_[static_cast<size_t>(layer_id)] = {
-            {1, DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
-            {1, DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
+            {1, DSACacheType::TOKEN, 4, c4_physical_dim},
+            {1, DSACacheType::TOKEN, 4, c4_physical_dim},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {1, DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize}};
+            {1, DSACacheType::TOKEN, 4, c4_physical_dim}};
       } else if (cr == 128) {
         caches_info_[static_cast<size_t>(layer_id)] = {
-            {2, DSACacheType::TOKEN, 128, kDsv4C128PhysicalBlockSize},
+            {2, DSACacheType::TOKEN, 128, c128_physical_dim},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size}};
