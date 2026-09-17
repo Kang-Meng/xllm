@@ -500,6 +500,7 @@ class ExtBuild(build_ext):
 
         env: dict[str, str] = os.environ.copy()
         env["VCPKG_MAX_CONCURRENCY"] = str(max_jobs)
+        env.setdefault("GOPROXY", "https://goproxy.cn,https://goproxy.io,direct")
         logger.info(f"CMake Args: {cmake_args}")
         logger.info(f"Env: {env}")
 
@@ -524,7 +525,7 @@ class ExtBuild(build_ext):
         # binaries cannot be reused from a previous build directory.
         build_targets = [ext.name, "mooncake_master", "mooncake_client", "stage_mooncake_etcd_runtime"]
         build_args += ["--target", *build_targets]
-        subprocess.check_call([cmake_cmd, "--build", ".", "--verbose"] + build_args, cwd=cmake_dir)
+        subprocess.check_call([cmake_cmd, "--build", ".", "--verbose"] + build_args, cwd=cmake_dir, env=env)
 
         server_output_dir = os.path.join(os.path.dirname(cmake_dir), "xllm/core/server/")
         os.makedirs(server_output_dir, exist_ok=True)

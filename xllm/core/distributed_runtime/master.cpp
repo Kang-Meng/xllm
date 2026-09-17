@@ -535,6 +535,10 @@ Master::Master(const Options& options, EngineType type)
     eplb_config.eplb_min_peak_load_improvement(
         options.eplb_min_peak_load_improvement().value());
   }
+  CHECK(!eplb_config.enable_eplb() ||
+        (type != EngineType::VLM && type != EngineType::VLMSSM))
+      << "EPLB does not support VLM engines because VLMEngine has no EPLB "
+         "control plane.";
   resolve_npu_kernel_backend_for_options(&options_);
 #endif
   if (native_qwen_dcp_requested) {

@@ -113,6 +113,9 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly(
           "dp_execution_token_counts",
           &PyAttentionMetadataView::dp_execution_token_counts)
+      .def_property_readonly(
+          "raw_dp_execution_token_counts",
+          &PyAttentionMetadataView::raw_dp_execution_token_counts)
       .def_property_readonly("dp_is_decode",
                              &PyAttentionMetadataView::dp_is_decode)
       .def_property_readonly("q_seq_lens", &PyAttentionMetadataView::q_seq_lens)
@@ -241,6 +244,10 @@ PyAttentionMetadataView::PyAttentionMetadataView(
         torch::tensor(read_ids, torch::TensorOptions().dtype(torch::kInt32))
             .to(linear_state_indices_.device());
   }
+  raw_dp_execution_token_counts_ =
+      params.parallel.raw_dp_global_token_nums.empty()
+          ? params.parallel.dp_global_token_nums
+          : params.parallel.raw_dp_global_token_nums;
   // Python model kernels consume materialized execution rows. Empty DP ranks
   // therefore contribute the worker-created dummy row instead of zero rows.
   dp_execution_token_counts_ = params.parallel.dp_global_token_nums;
@@ -347,6 +354,11 @@ py::object PyAttentionMetadataView::has_initial_state() const {
 const std::vector<int32_t>& PyAttentionMetadataView::dp_execution_token_counts()
     const {
   return dp_execution_token_counts_;
+}
+
+const std::vector<int32_t>&
+PyAttentionMetadataView::raw_dp_execution_token_counts() const {
+  return raw_dp_execution_token_counts_;
 }
 
 const std::vector<int32_t>& PyAttentionMetadataView::dp_is_decode() const {

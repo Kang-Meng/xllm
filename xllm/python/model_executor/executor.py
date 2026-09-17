@@ -28,7 +28,7 @@ from xllm.python.layers.attention import Attention
 from xllm.python.layers.npu.mega_moe_context_provider import (
     create_token_owner_mega_moe_context_provider,
 )
-from xllm.python.model_executor.forward_context import LayerSynchronizer
+from xllm.python.model_executor.forward_context import EplbRuntimeState, LayerSynchronizer
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.platform import current_platform
@@ -302,21 +302,41 @@ class ModelExecutor:
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
+        expert_load_data: torch.Tensor | None = None,
+        eplb_decode_token_mask: torch.Tensor | None = None,
+        is_graph_warmup: bool = False,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
+        eplb = None
+        if expert_load_data is not None:
+            eplb = EplbRuntimeState(
+                expert_load_data=expert_load_data,
+                decode_token_mask=eplb_decode_token_mask,
+                is_graph_warmup=is_graph_warmup,
+            )
         graph_runner = self.decode_graph_runner
-        if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding):
+        if (
+            graph_runner is not None
+            and (eplb is None or current_platform.is_npu())
+            and graph_runner.can_execute(input_ids, metadata, input_embedding)
+        ):
             graph_runner.warmup(
                 input_ids,
                 positions,
                 metadata,
                 input_embedding,
             )
-            return graph_runner.execute(input_ids, positions, metadata, input_embedding)
+            return graph_runner.execute(
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+                eplb=eplb,
+            )
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(
                 input_ids,
@@ -324,6 +344,7 @@ class ModelExecutor:
                 metadata,
                 input_embedding,
                 layer_synchronizer,
+                eplb,
             )
         return self.eager_runner.execute(
             input_ids,
@@ -331,4 +352,5 @@ class ModelExecutor:
             metadata,
             input_embedding,
             layer_synchronizer,
+            eplb,
         )

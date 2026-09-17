@@ -52,7 +52,9 @@ from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
     AclGraphTask,
+    EplbRuntimeState,
     ForwardContext,
+    LayerSynchronizer,
     forward_context,
 )
 from xllm.python.model_executor.runners.base import BaseRunner
@@ -65,6 +67,22 @@ from xllm.python.model_executor.runners.decode_cuda_graph import (
 def _require_positive_execution_counts(execution_counts: Sequence[int]) -> None:
     if any(count <= 0 for count in execution_counts):
         raise RuntimeError(f"DP execution token counts must be positive, got {execution_counts}")
+
+
+def _padded_rank_slices(
+    token_counts: Sequence[int],
+    dp_size: int,
+    per_rank_stride: int,
+) -> list[tuple[int, int]]:
+    """Validate per-rank counts and return offsets into a padded DP buffer."""
+    counts = tuple(int(count) for count in token_counts)
+    if len(counts) != dp_size:
+        raise RuntimeError(f"DP decode step requires {dp_size} token counts, got {len(counts)}")
+    if any(count < 0 or count > per_rank_stride for count in counts):
+        raise RuntimeError(
+            f"DP token counts must fit the ACL graph batch bucket: counts={counts}, bucket={per_rank_stride}"
+        )
+    return [(rank * per_rank_stride, count) for rank, count in enumerate(counts)]
 
 
 @dataclass(slots=True)
@@ -126,6 +144,7 @@ class _DecodeGraphEntry:
         "kv_seq_lens_delta",
         "graph_tasks",
         "execution_state",
+        "eplb",
         "execution_contexts",
     )
 
@@ -766,6 +785,8 @@ class DecodeAclGraphRunner(BaseRunner):
         positions: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
+        layer_synchronizer: LayerSynchronizer | None = None,
+        eplb: EplbRuntimeState | None = None,
     ) -> torch.Tensor:
         batch_size = input_ids.shape[0]
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None or self._is_untyped_spec_verify(metadata)
@@ -815,7 +836,18 @@ class DecodeAclGraphRunner(BaseRunner):
         first_capture = entry is None
         if first_capture:
             entry = self._allocate_entry(padded_batch_size, input_ids, positions, metadata)
+            entry.eplb = self._allocate_graph_eplb_state(eplb, padded_batch_size)
             self._graphs[graph_key] = entry
+        entry_eplb = getattr(entry, "eplb", None)
+        if not first_capture and (entry_eplb is None) != (eplb is None):
+            raise RuntimeError("EPLB state changed after ACL graph capture")
+        if not first_capture and eplb is not None and entry_eplb is not None:
+            if entry_eplb.expert_load_data.data_ptr() != eplb.expert_load_data.data_ptr():
+                raise RuntimeError("EPLB expert-load tensor changed after ACL graph capture")
+            if (entry_eplb.decode_token_mask is None) != (eplb.decode_token_mask is None):
+                raise RuntimeError("EPLB decode-mask availability changed after ACL graph capture")
+            entry_eplb.is_graph_warmup = eplb.is_graph_warmup
+        self._fill_graph_eplb_decode_mask(entry, eplb, metadata)
 
         if self._stream is None:
             self._stream = torch.npu.Stream(device=input_ids.device)
@@ -830,6 +862,7 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_metadata,
             self.layer_caches,
             execution_state=entry.execution_state,
+            eplb=entry_eplb,
             execution_contexts=entry.execution_contexts,
         )
         with forward_context(prepare_context):
@@ -862,6 +895,58 @@ class DecodeAclGraphRunner(BaseRunner):
 
         torch.npu.current_stream().wait_stream(self._stream)
         return output
+
+    def _allocate_graph_eplb_state(
+        self,
+        eplb: EplbRuntimeState | None,
+        padded_batch_size: int,
+    ) -> EplbRuntimeState | None:
+        if eplb is None:
+            return None
+        decode_token_mask = None
+        if eplb.decode_token_mask is not None:
+            decode_token_mask = torch.zeros(
+                padded_batch_size * self.dp_size,
+                dtype=eplb.decode_token_mask.dtype,
+                device=eplb.decode_token_mask.device,
+            )
+        return EplbRuntimeState(
+            expert_load_data=eplb.expert_load_data,
+            decode_token_mask=decode_token_mask,
+            is_graph_warmup=eplb.is_graph_warmup,
+        )
+
+    def _fill_graph_eplb_decode_mask(
+        self,
+        entry: _DecodeGraphEntry,
+        eplb: EplbRuntimeState | None,
+        metadata: AttentionMetadata,
+    ) -> None:
+        entry_eplb = getattr(entry, "eplb", None)
+        if entry_eplb is None or entry_eplb.decode_token_mask is None:
+            return
+        if eplb is None or eplb.decode_token_mask is None:
+            raise RuntimeError("EPLB decode-mask state is missing for a captured graph")
+
+        destination = entry_eplb.decode_token_mask
+        source = eplb.decode_token_mask.reshape(-1)
+        destination.zero_()
+        if self.dp_size == 1:
+            if source.numel() > entry.batch_size:
+                raise RuntimeError("EPLB decode mask exceeds graph bucket capacity")
+            destination[: source.numel()].copy_(source)
+            return
+
+        raw_counts = tuple(metadata.raw_dp_execution_token_counts)
+        destination_slices = _padded_rank_slices(raw_counts, self.dp_size, entry.batch_size)
+        if source.numel() != sum(raw_counts):
+            raise RuntimeError("EPLB decode mask does not match DP token counts")
+        source_begin = 0
+        for destination_begin, count in destination_slices:
+            destination[destination_begin : destination_begin + count].copy_(
+                source[source_begin : source_begin + count]
+            )
+            source_begin += count
 
     @staticmethod
     def _graph_key(
@@ -1333,17 +1418,13 @@ class DecodeAclGraphRunner(BaseRunner):
             mask[:batch_size].fill_(1)
             return
 
-        token_counts = tuple(int(count) for count in metadata.dp_execution_token_counts)
-        if len(token_counts) != self.dp_size:
-            raise RuntimeError(f"DP decode step requires {self.dp_size} token counts, got {len(token_counts)}")
         padded_batch_size = entry.batch_size
-        if any(count < 0 or count > padded_batch_size for count in token_counts):
-            raise RuntimeError(
-                "DP token counts must fit the ACL graph batch bucket: "
-                f"counts={token_counts}, bucket={padded_batch_size}"
-            )
-        for rank, count in enumerate(token_counts):
-            start = rank * padded_batch_size
+        rank_slices = _padded_rank_slices(
+            metadata.dp_execution_token_counts,
+            self.dp_size,
+            padded_batch_size,
+        )
+        for start, count in rank_slices:
             mask[start : start + count].fill_(1)
 
     def _fill_host_metadata(
@@ -1418,6 +1499,7 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_metadata,
             self.layer_caches,
             execution_state=entry.execution_state,
+            eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
         )
         # The snapshots above (linear/v3) read conv/ssm state on the
@@ -1440,6 +1522,7 @@ class DecodeAclGraphRunner(BaseRunner):
             self.layer_caches,
             acl_graph=capture_context,
             execution_state=entry.execution_state,
+            eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
         )
         with forward_context(context), torch.npu.graph(entry.graph, stream=self._stream):

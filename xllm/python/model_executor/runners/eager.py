@@ -22,6 +22,7 @@ from xllm.python.model_executor.execution_context import (
     build_eager_execution_contexts,
 )
 from xllm.python.model_executor.forward_context import (
+    EplbRuntimeState,
     ForwardContext,
     LayerSynchronizer,
     forward_context,
@@ -61,6 +62,7 @@ class EagerRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
+        eplb: EplbRuntimeState | None = None,
     ) -> ModelExecutionOutput:
         cp_context = None
         is_mla = self.attention_backend.is_mla
@@ -112,6 +114,7 @@ class EagerRunner(BaseRunner):
                 self.layer_caches,
                 layer_synchronizer=layer_synchronizer,
                 cp_context=cp_context,
+                eplb=eplb,
                 execution_contexts=execution_contexts,
             )
         ):

@@ -18,6 +18,7 @@ import torch
 
 from xllm.python.attention.backend import AttentionMetadata
 from xllm.python.model_executor.forward_context import (
+    EplbRuntimeState,
     ForwardContext,
     LayerSynchronizer,
     forward_context,
@@ -37,6 +38,7 @@ class InductorRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
+        eplb: EplbRuntimeState | None = None,
     ) -> torch.Tensor:
         self.attention_backend.prepare(metadata)
         with forward_context(
@@ -46,6 +48,7 @@ class InductorRunner(BaseRunner):
                 metadata,
                 self.layer_caches,
                 layer_synchronizer=layer_synchronizer,
+                eplb=eplb,
             )
         ):
             if input_embedding is None:

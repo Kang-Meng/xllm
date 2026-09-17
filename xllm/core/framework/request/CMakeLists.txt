@@ -58,7 +58,7 @@ cc_library(
   DEPS
     :config
     :kv_cache
-    :prefix_cache
+    :block_hasher
     :encoder_cache
     :block
     :tokenizer

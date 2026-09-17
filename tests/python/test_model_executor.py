@@ -720,6 +720,19 @@ class TestDecodeCudaGraphDataParallelKeys:
         runner._graphs[graph_key] = object()
         assert runner.can_execute(input_ids, metadata)
 
+    def test_execute_accepts_base_runner_context_keywords(self):
+        runner = self._runner()
+        runner._graph_key = MagicMock(return_value=None)
+
+        with pytest.raises(ValueError, match="decode batch exceeds CUDA graph capacity"):
+            runner.execute(
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                self._metadata([1, 1]),
+                layer_synchronizer=MagicMock(),
+                eplb=MagicMock(),
+            )
+
     @pytest.mark.parametrize("token_counts", ([3], [3, -1], [3, 2]))
     def test_graph_key_rejects_invalid_data_parallel_metadata(self, token_counts):
         runner = self._runner(dp_rank=1)
@@ -859,6 +872,18 @@ class TestDecodeAclGraphSpeculativeMetadata:
         input_ids = torch.arange(4, dtype=torch.int32)
 
         assert runner.can_execute(input_ids, self._metadata())
+
+    def test_execute_accepts_base_runner_context_keywords(self) -> None:
+        runner = self._runner()
+
+        with pytest.raises(ValueError, match="decode batch exceeds ACL graph capacity"):
+            runner.execute(
+                torch.zeros(5, dtype=torch.int32),
+                torch.zeros(5, dtype=torch.int32),
+                self._decode_metadata(5),
+                layer_synchronizer=MagicMock(),
+                eplb=MagicMock(),
+            )
 
     def test_decode_batch_limit_gates_dp_global_token_bucket(self) -> None:
         # PR3 folded the decode-batch-limit check into can_execute's DP branch
@@ -1817,5 +1842,6 @@ class TestExecuteRouting:
             positions,
             metadata,
             None,
+            eplb=None,
         )
         assert torch.equal(result, torch.ones(4))

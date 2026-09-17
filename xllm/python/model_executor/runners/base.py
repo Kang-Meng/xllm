@@ -26,7 +26,7 @@ from xllm.python.attention.backend import (
     LayerCache,
 )
 from xllm.python.model_executor.execution_context import ExecutionContextProvider
-from xllm.python.model_executor.forward_context import LayerSynchronizer
+from xllm.python.model_executor.forward_context import EplbRuntimeState, LayerSynchronizer
 
 ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
@@ -63,5 +63,6 @@ class BaseRunner(ABC):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
+        eplb: EplbRuntimeState | None = None,
     ) -> ModelExecutionOutput:
         pass
