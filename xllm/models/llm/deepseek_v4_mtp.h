@@ -454,15 +454,14 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
   void align_cache_specs_to_dsv4_managers() {
     // TODO: Remove this hardcoded DSV4 group_infos once the draft can
     // share editable model args with the target through a standard path.
-    constexpr int32_t kBaseBlockSize = 128;
     const int32_t window_size = static_cast<int32_t>(window_size_);
     if (group_infos_.size() >= 3) {
       return;
     }
 
     group_infos_ = {{DSACacheType::SLIDING_WINDOW, 1, window_size},
-                    {DSACacheType::TOKEN, 4, kBaseBlockSize},
-                    {DSACacheType::TOKEN, 128, kBaseBlockSize}};
+                    {DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
+                    {DSACacheType::TOKEN, 128, kDsv4C128PhysicalBlockSize}};
     caches_info_.assign(static_cast<size_t>(model_args_.n_layers()), {});
     for (int32_t layer_id = 0; layer_id < model_args_.n_layers(); ++layer_id) {
       const int32_t cr = deepseek_v4_normalize_compress_ratio(
@@ -471,17 +470,17 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
               : 1);
       if (cr == 4) {
         caches_info_[static_cast<size_t>(layer_id)] = {
-            {1, DSACacheType::TOKEN, 4, kBaseBlockSize},
-            {1, DSACacheType::TOKEN, 4, kBaseBlockSize},
+            {1, DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
+            {1, DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {1, DSACacheType::TOKEN, 4, kBaseBlockSize}};
+            {1, DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize}};
       } else if (cr == 128) {
         caches_info_[static_cast<size_t>(layer_id)] = {
-            {2, DSACacheType::TOKEN, 128, kBaseBlockSize},
+            {2, DSACacheType::TOKEN, 128, kDsv4C128PhysicalBlockSize},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
             {0, DSACacheType::SLIDING_WINDOW, 1, window_size}};

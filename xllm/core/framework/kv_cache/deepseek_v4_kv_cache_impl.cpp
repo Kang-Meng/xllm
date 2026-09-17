@@ -31,6 +31,7 @@ limitations under the License.
 #endif
 #endif
 
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -192,45 +193,55 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
 
   // Host tensor shape: device per-block dims with a layer dimension inserted at
   // index 1, i.e. [host_block_count, layer_count, ...per_block_dims].
-  auto host_group_shape = [&](int64_t block_count, int64_t heads, int64_t dim) {
+  auto host_group_shape = [&](int64_t block_count,
+                              int64_t group_block_size,
+                              int64_t heads,
+                              int64_t dim) {
     std::vector<int64_t> shape =
-        dsv4_block_shape(block_count, block_size, heads, dim);
+        dsv4_block_shape(block_count, group_block_size, heads, dim);
     shape.insert(shape.begin() + 1, layer_count);
     return shape;
   };
 
-  // Host H2D resumes only at a C128 boundary. Compressor/index state represents
-  // partial compression within the current C4/C128 group and is regenerated
-  // after such a boundary, so the SWA host group stores the persistent window
-  // for every DSV4 layer but no compressor scratch tensors.
+  // Host H2D resumes only at a complete compressed-cache boundary.
+  // Compressor/index state represents partial compression within the current
+  // C4/C128 group and is regenerated after such a boundary, so the SWA host
+  // group stores the persistent window for every DSV4 layer but no compressor
+  // scratch tensors.
   switch (type) {
     case BlockType::SWA: {
       const int64_t host_swa_count =
           scale_host_block_count(pool_counts[0], factor);
       host_page_aligned_regions_.reserve(1);
-      create_host_tensor(host_group_shape(host_swa_count, n_heads, head_dim),
-                         create_options.dtype(),
-                         &swa_cache_,
-                         nullptr);
+      create_host_tensor(
+          host_group_shape(host_swa_count, block_size, n_heads, head_dim),
+          create_options.dtype(),
+          &swa_cache_,
+          nullptr);
       break;
     }
     case BlockType::C4: {
       const int64_t host_c4_count =
           scale_host_block_count(pool_counts[1], factor);
       host_page_aligned_regions_.reserve(3);
-      create_host_tensor(host_group_shape(host_c4_count, n_heads, head_dim),
-                         create_options.dtype(),
-                         &key_cache_,
-                         nullptr);
       create_host_tensor(
-          host_group_shape(host_c4_count, index_n_heads, index_head_dim),
-          cache_policy.index_dtype,
-          &index_cache_,
+          host_group_shape(
+              host_c4_count, kDsv4C4PhysicalBlockSize, n_heads, head_dim),
+          create_options.dtype(),
+          &key_cache_,
           nullptr);
+      create_host_tensor(host_group_shape(host_c4_count,
+                                          kDsv4C4PhysicalBlockSize,
+                                          index_n_heads,
+                                          index_head_dim),
+                         cache_policy.index_dtype,
+                         &index_cache_,
+                         nullptr);
       // C4 indexer values are int8; the fp16 per-token scale must travel with
       // them for correct dequantization on H2D restore.
       if (cache_policy.has_indexer_cache_scale) {
-        std::vector<int64_t> scale_shape = {host_c4_count, block_size, 1};
+        std::vector<int64_t> scale_shape = {
+            host_c4_count, kDsv4C4PhysicalBlockSize, 1};
         scale_shape.insert(scale_shape.begin() + 1, layer_count);
         create_host_tensor(scale_shape,
                            cache_policy.scale_dtype,
@@ -243,10 +254,12 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
       const int64_t host_c128_count =
           scale_host_block_count(pool_counts[2], factor);
       host_page_aligned_regions_.reserve(1);
-      create_host_tensor(host_group_shape(host_c128_count, n_heads, head_dim),
-                         create_options.dtype(),
-                         &key_cache_,
-                         nullptr);
+      create_host_tensor(
+          host_group_shape(
+              host_c128_count, kDsv4C128PhysicalBlockSize, n_heads, head_dim),
+          create_options.dtype(),
+          &key_cache_,
+          nullptr);
       break;
     }
     default:
@@ -462,19 +475,22 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
         dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
         create_options.dtype());
   } else if (compress_ratio == 4) {
+    const int64_t compressed_block_size =
+        dsv4_compressed_physical_block_size(compress_ratio);
     tensors.compressed_block_type = BlockType::C4;
     tensors.key_cache = allocate_tensor(
         KVCacheTensorRole::KEY,
-        dsv4_block_shape(c4_count, block_size, n_heads, head_dim),
+        dsv4_block_shape(c4_count, compressed_block_size, n_heads, head_dim),
         create_options.dtype());
     tensors.index_cache = allocate_tensor(
         KVCacheTensorRole::INDEX,
-        dsv4_block_shape(c4_count, block_size, index_n_heads, index_head_dim),
+        dsv4_block_shape(
+            c4_count, compressed_block_size, index_n_heads, index_head_dim),
         cache_policy.index_dtype);
     if (cache_policy.has_indexer_cache_scale) {
       tensors.indexer_cache_scale =
           allocate_tensor(KVCacheTensorRole::INDEX_SCALE,
-                          {c4_count, block_size, 1},
+                          {c4_count, compressed_block_size, 1},
                           cache_policy.scale_dtype);
     }
     tensors.swa_cache = allocate_tensor(
@@ -523,10 +539,12 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
                         torch::kFloat32);
 #endif
   } else if (compress_ratio == 128) {
+    const int64_t compressed_block_size =
+        dsv4_compressed_physical_block_size(compress_ratio);
     tensors.compressed_block_type = BlockType::C128;
     tensors.key_cache = allocate_tensor(
         KVCacheTensorRole::KEY,
-        dsv4_block_shape(c128_count, block_size, n_heads, head_dim),
+        dsv4_block_shape(c128_count, compressed_block_size, n_heads, head_dim),
         create_options.dtype());
     tensors.swa_cache = allocate_tensor(
         KVCacheTensorRole::WINDOW,

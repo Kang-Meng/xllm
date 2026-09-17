@@ -29,6 +29,7 @@ limitations under the License.
 
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/deepseek_v4_rotary_embedding.h"
@@ -306,7 +307,10 @@ class DeepseekV4Base {
     for (const int32_t raw_ratio : compress_ratios) {
       const int32_t ratio = normalize_compress_ratio(raw_ratio);
       if (ratio == 4 || ratio == 128) {
-        register_group(DSACacheType::TOKEN, ratio, base_block_size);
+        register_group(
+            DSACacheType::TOKEN,
+            ratio,
+            static_cast<int32_t>(dsv4_compressed_physical_block_size(ratio)));
       }
     }
 
@@ -646,17 +650,17 @@ class DeepseekV4Base {
       return {{DSACacheType::SLIDING_WINDOW, 1, base_block_size}};
     }
     if (ratio == 4) {
-      return {{DSACacheType::TOKEN, 4, base_block_size},
-              {DSACacheType::TOKEN, 4, base_block_size},
+      return {{DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
+              {DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
-              {DSACacheType::TOKEN, 4, base_block_size}};
+              {DSACacheType::TOKEN, 4, kDsv4C4PhysicalBlockSize}};
     }
     if (ratio == 128) {
-      return {{DSACacheType::TOKEN, 128, base_block_size},
+      return {{DSACacheType::TOKEN, 128, kDsv4C128PhysicalBlockSize},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size}};

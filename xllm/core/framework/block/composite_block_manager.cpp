@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "embedding_block_manager.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
 #include "linear_state_block_manager.h"
 #include "sliding_window_block_manager.h"
@@ -229,15 +230,31 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     BlockManager::Options opts = options;
 
     if (type == kManagerTypeBlockManagerImpl) {
-      opts.block_size(static_cast<uint32_t>(options.block_size()) *
-                      compress_ratio);
-      opts.num_blocks(static_cast<uint32_t>(options.num_blocks()) /
-                      compress_ratio);
       CHECK(compress_ratio == 4 || compress_ratio == 128)
           << "unexpected compress_ratio " << compress_ratio
           << " for composite BlockManagerImpl sub-manager";
       const BlockType key =
           compress_ratio == 4 ? BlockType::C4 : BlockType::C128;
+      const int64_t physical_block_size = dsv4_compressed_physical_block_size(
+          static_cast<int32_t>(compress_ratio));
+      CHECK_GT(physical_block_size, 0);
+      const int64_t logical_block_size =
+          physical_block_size * static_cast<int64_t>(compress_ratio);
+      CHECK_EQ(logical_block_size, kDsv4CompressedBlockTokenSpan);
+      uint32_t typed_num_blocks = key == BlockType::C4
+                                      ? options.c4_num_blocks()
+                                      : options.c128_num_blocks();
+      if (typed_num_blocks == 0) {
+        CHECK_GT(options.block_size(), 0);
+        const int64_t base_token_capacity =
+            static_cast<int64_t>(options.num_blocks()) * options.block_size();
+        typed_num_blocks = static_cast<uint32_t>(base_token_capacity /
+                                                 kDsv4CompressedBlockTokenSpan);
+      }
+      CHECK_GT(typed_num_blocks, 0u)
+          << "missing DSV4 compressed block count for ratio " << compress_ratio;
+      opts.block_size(static_cast<int32_t>(logical_block_size))
+          .num_blocks(typed_num_blocks);
       const bool compressed_participates =
           key == BlockType::C4 ? c4_participates : c128_participates;
       const bool compressed_prefix_cache =
@@ -355,9 +372,9 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
     cache_unit_size = c128_leaf->block_size();
     CHECK_GT(cache_unit_size, 0u);
 
-    // A DSV4 prefix is restorable only at a complete C128 boundary. Cap the
-    // boundary by every participating leaf's allocated logical capacity so no
-    // partially allocated composite unit can become visible.
+    // A DSV4 prefix is restorable only at a complete compressed-cache unit.
+    // Cap the boundary by every participating leaf's allocated logical
+    // capacity so no partially allocated composite unit can become visible.
     for (const auto& [type, entry] : leaves_) {
       if (!entry.supports_prefix_cache || type == BlockType::EMBEDDING ||
           type == BlockType::LINEAR) {
@@ -366,7 +383,8 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
       const size_t block_size = entry.leaf->block_size();
       CHECK_GT(block_size, 0u);
       CHECK_EQ(cache_unit_size % block_size, 0u)
-          << "DSV4 cache leaf block size must divide the C128 cache unit";
+          << "DSV4 cache leaf block size must divide the compressed cache "
+             "unit";
       cacheable_tokens =
           std::min(cacheable_tokens, kv.num_blocks(type) * block_size);
     }
@@ -953,33 +971,32 @@ size_t CompositeBlockManager::num_blocks_in_prefix_cache() const {
   return total;
 }
 
-const CompositeBlockManager::LeafEntry* CompositeBlockManager::capacity_leaf()
-    const {
-  // Smallest block_size = finest granularity = closest to the base block the
-  // scheduler assumes. KV for normal models; C4 for DSV4.
-  const LeafEntry* chosen = nullptr;
+size_t CompositeBlockManager::num_free_blocks() const {
+  size_t free_blocks = std::numeric_limits<size_t>::max();
   for (const auto& [type, entry] : leaves_) {
     if (!entry.participates_in_admission) {
       continue;
     }
-    if (chosen == nullptr ||
-        entry.leaf->block_size() < chosen->leaf->block_size()) {
-      chosen = &entry;
-    }
+    CHECK_GT(options_.block_size(), 0);
+    CHECK_EQ(entry.leaf->block_size() % options_.block_size(), 0u);
+    const size_t scale = entry.leaf->block_size() / options_.block_size();
+    free_blocks = std::min(free_blocks, entry.leaf->num_free_blocks() * scale);
   }
-  return chosen;
-}
-
-size_t CompositeBlockManager::num_free_blocks() const {
-  // Reports one admission leaf's raw block count. Mixing leaves of different
-  // block_size would make num_free * block_size() meaningless.
-  const LeafEntry* leaf = capacity_leaf();
-  return leaf == nullptr ? 0 : leaf->leaf->num_free_blocks();
+  return free_blocks == std::numeric_limits<size_t>::max() ? 0 : free_blocks;
 }
 
 size_t CompositeBlockManager::num_used_blocks() const {
-  const LeafEntry* leaf = capacity_leaf();
-  return leaf == nullptr ? 0 : leaf->leaf->num_used_blocks();
+  size_t used_blocks = 0;
+  for (const auto& [type, entry] : leaves_) {
+    if (!entry.participates_in_admission) {
+      continue;
+    }
+    CHECK_GT(options_.block_size(), 0);
+    CHECK_EQ(entry.leaf->block_size() % options_.block_size(), 0u);
+    const size_t scale = entry.leaf->block_size() / options_.block_size();
+    used_blocks = std::max(used_blocks, entry.leaf->num_used_blocks() * scale);
+  }
+  return used_blocks;
 }
 
 double CompositeBlockManager::kv_cache_utilization() const {
@@ -1000,8 +1017,18 @@ Block CompositeBlockManager::allocate() {
 }
 
 size_t CompositeBlockManager::num_total_blocks() const {
-  const LeafEntry* leaf = capacity_leaf();
-  return leaf == nullptr ? 0 : leaf->leaf->num_total_blocks();
+  size_t total_blocks = std::numeric_limits<size_t>::max();
+  for (const auto& [type, entry] : leaves_) {
+    if (!entry.participates_in_admission) {
+      continue;
+    }
+    CHECK_GT(options_.block_size(), 0);
+    CHECK_EQ(entry.leaf->block_size() % options_.block_size(), 0u);
+    const size_t scale = entry.leaf->block_size() / options_.block_size();
+    total_blocks =
+        std::min(total_blocks, entry.leaf->num_total_blocks() * scale);
+  }
+  return total_blocks == std::numeric_limits<size_t>::max() ? 0 : total_blocks;
 }
 
 void CompositeBlockManager::reserve_xtensor_padding_blocks() {
