@@ -29,6 +29,11 @@ namespace xllm {
 
 bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args);
 
+// Normalizes a speculators-format Eagle3 draft config into the flat
+// qwen3_eagle3 layout (see hf_model_loader.cpp for the exact mapping).
+// No-op for non-speculators or non-eagle3 configs.
+void normalize_speculators_config(nlohmann::json* config);
+
 class HFModelLoader : public ModelLoader {
  public:
   HFModelLoader(const std::string& model_weights_path);

@@ -26,8 +26,9 @@ using namespace eagle3_decoder_constants;
 
 Eagle3DecoderLoader::Eagle3DecoderLoader(uint64_t weight_count,
                                          const ModelContext& context,
-                                         LoadMode mode)
-    : BaseLoader(weight_count, context, mode) {
+                                         LoadMode mode,
+                                         bool use_qk_norm)
+    : BaseLoader(weight_count, context, mode), use_qk_norm_(use_qk_norm) {
   auto options = context.get_tensor_options();
   device_id_ = options.device().index();
 
@@ -41,6 +42,13 @@ Eagle3DecoderLoader::Eagle3DecoderLoader(uint64_t weight_count,
     for (int i = 0; i < weight_count; ++i) {
       working_tensors()[i] = torch::zeros({1}).to(options);
     }
+  }
+}
+
+void Eagle3DecoderLoader::load_qk_norm_weights(const StateDict& state_dict,
+                                               bool to_host) {
+  for (const auto& [index, name] : QK_NORM_WEIGHT_MAPPING) {
+    set_weight(state_dict, name, index, to_host);
   }
 }
 
@@ -67,21 +75,24 @@ void Eagle3DecoderLoader::load_state_dict(const StateDict& state_dict) {
                                           w[IN_HIDDEN_NORM_WEIGHT].options());
     w[IN_SELFOUT_NORM_BIAS] = torch::zeros(w[IN_SELFOUT_NORM_WEIGHT].sizes(),
                                            w[IN_SELFOUT_NORM_WEIGHT].options());
-    return;
+  } else {
+    for (const auto& [index, name] : WEIGHT_MAPPING) {
+      if (WEIGHT_SHARD.find(index) != WEIGHT_SHARD.end()) {
+        set_weight(state_dict,
+                   name,
+                   index,
+                   WEIGHT_SHARD[index],
+                   dp_local_tp_rank_,
+                   dp_local_tp_size_,
+                   to_host);
+      } else {
+        set_weight(state_dict, name, index, to_host);
+      }
+    }
   }
 
-  for (const auto& [index, name] : WEIGHT_MAPPING) {
-    if (WEIGHT_SHARD.find(index) != WEIGHT_SHARD.end()) {
-      set_weight(state_dict,
-                 name,
-                 index,
-                 WEIGHT_SHARD[index],
-                 dp_local_tp_rank_,
-                 dp_local_tp_size_,
-                 to_host);
-    } else {
-      set_weight(state_dict, name, index, to_host);
-    }
+  if (use_qk_norm_) {
+    load_qk_norm_weights(state_dict, to_host);
   }
 }
 
@@ -162,6 +173,12 @@ void Eagle3DecoderLoader::verify_loaded_weights() const {
   for (const auto& [index, name] : WEIGHT_MAPPING) {
     CHECK(working_tensors()[index].sizes() != std::vector<int64_t>({1}))
         << "weight is not loaded for " << name;
+  }
+  if (use_qk_norm_) {
+    for (const auto& [index, name] : QK_NORM_WEIGHT_MAPPING) {
+      CHECK(working_tensors()[index].sizes() != std::vector<int64_t>({1}))
+          << "weight is not loaded for " << name;
+    }
   }
 }
 

@@ -82,6 +82,7 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 #include "framework/kv_cache/linear_state_restore.h"
+#include "framework/model/aux_hidden_capture.h"
 #include "framework/model/model_input_params.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/npu_cp_plan.h"
@@ -153,12 +154,19 @@ class ScopedAtenLoadThreads {
   bool active_ = false;
 };
 
+// Reads a draft config's target-side aux hidden capture layers as 0-based
+// post-layer indices: the legacy target-layer keys are already post-layer, the
+// speculators boundary-index keys are shifted. With `required` an empty result
+// is fatal; otherwise it is returned for the caller to default.
 std::vector<int32_t> read_capture_layer_ids(
-    const std::string& model_weights_path) {
+    const std::string& model_weights_path,
+    bool required = true) {
   JsonReader reader;
   const std::string config_path = model_weights_path + "/config.json";
-  CHECK(reader.parse(config_path))
-      << "Failed to parse block-diffusion draft config: " << config_path;
+  if (!reader.parse(config_path)) {
+    CHECK(!required) << "Failed to parse draft config: " << config_path;
+    return {};
+  }
 
   // Legacy xLLM/vLLM draft configs already use 0-based post-layer output
   // indices, which match ModelArgs::layers_to_capture directly.
@@ -172,14 +180,15 @@ std::vector<int32_t> read_capture_layer_ids(
     return capture_layer_ids;
   }
 
-  // Speculators uses hidden-state boundary indices (0=embedding, N=after
-  // decoder N-1); shift to xLLM's 0-based post-layer capture contract.
+  // Speculators-format keys are hidden-state boundary indices (0=embedding
+  // output, v=output of layer v-1); shift them to the post-layer contract.
   capture_layer_ids = reader.value_or<std::vector<int32_t>>(
-      "aux_hidden_state_layer_ids", std::vector<int32_t>{});
-  for (int32_t& layer_id : capture_layer_ids) {
-    --layer_id;
-  }
-  CHECK(!capture_layer_ids.empty())
+      std::vector<std::string>{"aux_hidden_state_layer_ids",
+                               "eagle_aux_hidden_state_layer_ids"},
+      std::vector<int32_t>{});
+  capture_layer_ids =
+      AuxHiddenCapture::boundary_to_post_layer_ids(capture_layer_ids);
+  CHECK(!required || !capture_layer_ids.empty())
       << "Block-diffusion draft config requires dspark_target_layer_ids, "
          "target_layer_ids, dflash_config.target_layer_ids, or "
          "aux_hidden_state_layer_ids: "
@@ -2143,9 +2152,20 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   if (options_.enable_speculative_decode() && !options_.is_draft_engine() &&
       SpeculativeConfig::requires_aux_hidden_capture(speculative_algorithm) &&
       args.layers_to_capture().empty()) {
-    const int32_t num_layers = static_cast<int32_t>(args.n_layers());
-    // EAGLE-3 low/mid/high default, as 0-based post-layer output indices.
-    args.layers_to_capture({1, num_layers / 2 - 1, num_layers - 4});
+    std::vector<int32_t> capture_layer_ids;
+    if (speculative_algorithm == "Eagle3" &&
+        options_.draft_model_path().has_value()) {
+      // Eagle3.1 drafts pin their aux capture layers in the draft config;
+      // legacy eagle3 configs omit them and fall back to the default below.
+      capture_layer_ids = read_capture_layer_ids(*options_.draft_model_path(),
+                                                 /*required=*/false);
+    }
+    if (capture_layer_ids.empty()) {
+      const int32_t num_layers = static_cast<int32_t>(args.n_layers());
+      capture_layer_ids =
+          AuxHiddenCapture::legacy_default_capture_layer_ids(num_layers);
+    }
+    args.layers_to_capture(std::move(capture_layer_ids));
   }
 #else
   if (options_.enable_speculative_decode()) {

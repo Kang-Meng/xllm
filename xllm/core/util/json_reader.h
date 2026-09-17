@@ -105,6 +105,11 @@ class JsonReader {
 
   nlohmann::json data() const { return data_; }
 
+  // Mutable access to the parsed document, for in-place rewrites that avoid a
+  // dump()/parse_text() round-trip. The reader keeps no derived state, so
+  // resolve()/value() see mutations immediately.
+  nlohmann::json& mutable_data() { return data_; }
+
  private:
   nlohmann::json data_;
 };

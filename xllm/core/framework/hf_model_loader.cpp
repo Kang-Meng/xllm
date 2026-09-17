@@ -87,16 +87,12 @@ void lift_speculators_config(nlohmann::json& config) {
   }
 }
 
-JsonReader normalize_config_torch_dtype(const JsonReader& reader) {
-  auto config = reader.data();
+void normalize_config_torch_dtype(JsonReader& reader) {
+  nlohmann::json& config = reader.mutable_data();
   if (!config.contains("torch_dtype") && config.contains("dtype")) {
     config["torch_dtype"] = config["dtype"];
   }
   lift_speculators_config(config);
-
-  JsonReader normalized_reader;
-  normalized_reader.parse_text(config.dump());
-  return normalized_reader;
 }
 
 bool is_compressed_tensors_fp8_scheme(const nlohmann::json& config) {
@@ -451,6 +447,31 @@ void check_safetensors_cleanup(::Status status,
 }
 
 }  // namespace
+
+// Rewrites a speculators-format Eagle3 draft config toward qwen3_eagle3: sets
+// model_type and resolves use_qk_norm (explicit value wins, else inferred from
+// the layer type). The backbone lift is left to normalize_config_torch_dtype.
+void normalize_speculators_config(nlohmann::json* config) {
+  // JsonReader treats null like a missing key; match that contract here so a
+  // config that explicitly writes "speculators_model_type": null parses
+  // instead of throwing nlohmann type_error.302 from json::value().
+  const auto spec_type_it = config->find("speculators_model_type");
+  if (spec_type_it == config->end() || !spec_type_it->is_string() ||
+      spec_type_it->get<std::string>() != "eagle3") {
+    return;
+  }
+  const auto layer_it = config->find("transformer_layer_config");
+  CHECK(layer_it != config->end() && layer_it->is_object())
+      << "speculators eagle3 draft config requires a "
+         "transformer_layer_config object";
+  const std::string layer_model_type = layer_it->value("model_type", "");
+  const bool layer_use_qk_norm =
+      layer_it->value("use_qk_norm", layer_model_type == "qwen3");
+  (*config)["model_type"] = "qwen3_eagle3";
+  if (!config->contains("use_qk_norm")) {
+    (*config)["use_qk_norm"] = layer_use_qk_norm;
+  }
+}
 
 bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
   if (!reader.contains("quantization_config") &&
@@ -853,6 +874,8 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
     return false;
   }
 
+  normalize_speculators_config(&reader.mutable_data());
+
   const std::string model_type =
       util::get_model_type(reader,
                            std::filesystem::path(model_weights_path),
@@ -873,8 +896,8 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
                << resolved_model_type;
     return false;
   }
-  const JsonReader config_reader = normalize_config_torch_dtype(reader);
-  model_args_loader(config_reader, &args_);
+  normalize_config_torch_dtype(reader);
+  model_args_loader(reader, &args_);
   args_.enable_mla(
       util::should_enable_mla(std::filesystem::path(model_weights_path),
                               ModelConfig::get_instance().backend()));
@@ -890,21 +913,19 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
     return false;
   }
 
-  const JsonReader config_reader = normalize_config_torch_dtype(reader);
+  normalize_config_torch_dtype(reader);
 
-  if (!load_quant_cfg(config_reader, quant_args_)) {
+  if (!load_quant_cfg(reader, quant_args_)) {
     return false;
   }
 
   // load quantization args for npu if exists
-  const bool has_config_quantize = config_reader.contains("quantize");
+  const bool has_config_quantize = reader.contains("quantize");
   if (has_config_quantize) {
-    quant_args_.quantize_type() =
-        config_reader.value_or<std::string>("quantize", "");
+    quant_args_.quantize_type() = reader.value_or<std::string>("quantize", "");
   }
-  if (config_reader.contains("torch_dtype")) {
-    quant_args_.torch_dtype() =
-        config_reader.value_or<std::string>("torch_dtype", "");
+  if (reader.contains("torch_dtype")) {
+    quant_args_.torch_dtype() = reader.value_or<std::string>("torch_dtype", "");
   }
   if (auto v = reader.value<std::string>("quantization_config.version")) {
     quant_args_.quant_version() = v.value();
