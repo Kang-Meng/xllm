@@ -44,6 +44,7 @@ bool has_data(const torch::Tensor& tensor) {
 IndexedKVCacheImpl::IndexedKVCacheImpl(const IndexedKVCacheTensors& tensors)
     : KVCacheImpl(tensors.kv_cache_tensors),
       index_cache_(tensors.index_cache),
+      kpool_tail_(tensors.kpool_tail),
       index_cache_scale_(tensors.index_cache_scale),
       key_cache_scale_(tensors.key_cache_scale),
       value_cache_scale_(tensors.value_cache_scale),
@@ -127,6 +128,8 @@ IndexedKVCacheImpl::IndexedKVCacheImpl(
   }
 }
 
+torch::Tensor IndexedKVCacheImpl::get_kpool_tail() const { return kpool_tail_; }
+
 torch::Tensor IndexedKVCacheImpl::get_index_cache() const {
   return index_cache_;
 }
@@ -159,6 +162,9 @@ std::optional<torch::Tensor> IndexedKVCacheImpl::get_indexer_cache_scale()
 BlockTypeTensorMap IndexedKVCacheImpl::get_block_type_tensors(
     BlockType type) const {
   BlockTypeTensorMap tensor_map = KVCacheImpl::get_block_type_tensors(type);
+  if (type == BlockType::LINEAR && has_data(kpool_tail_)) {
+    tensor_map.emplace(KVCacheTensorRole::KPOOL_TAIL, kpool_tail_);
+  }
   if (type != BlockType::KV) {
     return tensor_map;
   }
@@ -178,11 +184,14 @@ bool IndexedKVCacheImpl::empty() const {
 
 std::vector<std::vector<int64_t>> IndexedKVCacheImpl::get_shapes() const {
   std::vector<std::vector<int64_t>> shapes;
-  shapes.reserve(4);
+  shapes.reserve(5);
   shapes.emplace_back(key_cache_shape_);
   shapes.emplace_back(value_cache_shape_);
   shapes.emplace_back(index_cache_shape_);
   shapes.emplace_back(index_cache_scale_shape_);
+  if (kpool_tail_.defined()) {
+    shapes.emplace_back(kpool_tail_.sizes().vec());
+  }
   return shapes;
 }
 

@@ -225,7 +225,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_for_schedule_overlap(
   // below re-enters compute_stream_ inside execute_no_sync_on_stream (which
   // installs its own StreamGuard on the same stream), so the restore-time
   // guard scope is deliberately kept tight to the restore only.
-  if (has_linear_attention_layers(context_.get_model_args())) {
+  if (has_request_state_cache()) {
     c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
     try_restore_linear_state_slots(input.input_params);
   }

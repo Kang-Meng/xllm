@@ -13,6 +13,7 @@ cc_library(
   NAME
     kv_cache_estimation
   HDRS
+    cache_layout_types.h
     kv_cache_capacity.h
     kv_cache_estimation.h
   SRCS
@@ -32,7 +33,7 @@ cc_library(
     kv_cache
   HDRS
     cache_layout_builder.h
-    logical_cache_layout.h
+    cache_layout_types.h
     deepseek_v4_kv_cache_impl.h
     indexed_kv_cache_impl.h
     kv_cache.h

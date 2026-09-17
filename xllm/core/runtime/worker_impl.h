@@ -81,6 +81,9 @@ class WorkerImpl {
 
   virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
 
+  // Whether this worker owns recurrent request state.
+  bool has_request_state_cache() const;
+
   // allocate kv cache. blocking call
   virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
 

@@ -147,6 +147,10 @@ void append_q_seq_len(std::vector<int32_t>& q_seq_lens,
                       std::vector<int32_t>& q_cu_seq_lens,
                       int32_t len);
 
+// Sets the KPool metadata required by speculative verification.
+void set_kpool_verify_metadata(ModelInputParams& input_params,
+                               std::vector<int32_t> query_lens);
+
 // Appends kv_len into output vector and updates kv_max_seq_len.
 void update_kv_seq_lens_and_max(std::vector<int32_t>& kv_seq_lens_vec,
                                 int32_t kv_len,

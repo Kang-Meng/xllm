@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <utility>
 
 #include "framework/model/model_input_params.h"
 #include "framework/sampling/sampling_params.h"
@@ -255,6 +256,12 @@ void append_q_seq_len(std::vector<int32_t>& q_seq_lens,
   append_seq_len_by_layout(q_seq_lens, len);
   q_cu_seq_lens.emplace_back(
       (q_cu_seq_lens.empty() ? 0 : q_cu_seq_lens.back()) + len);
+}
+
+void set_kpool_verify_metadata(ModelInputParams& input_params,
+                               std::vector<int32_t> query_lens) {
+  input_params.attention.host.kpool_query_lens = std::move(query_lens);
+  input_params.is_spec_verify = true;
 }
 
 void update_kv_seq_lens_and_max(std::vector<int32_t>& kv_seq_lens_vec,

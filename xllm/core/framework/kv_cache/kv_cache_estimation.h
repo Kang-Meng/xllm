@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/types.h"
+#include "framework/kv_cache/cache_layout_types.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 
@@ -30,6 +31,7 @@ namespace xllm {
 class ModelArgs;
 
 struct KVCacheEstimateOptions {
+  KPoolCacheLayout kpool_layout = default_kpool_layout();
   torch::ScalarType dtype = torch::kBFloat16;
   std::string kv_cache_dtype = "auto";
   std::string indexer_cache_dtype = "auto";
@@ -94,5 +96,11 @@ int64_t estimate_layerwise_split_block_count(
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options);
+
+// Full-attention KPool drafts inherit the target's request-state slots/window.
+// Both capacities retain their own model's layer counts and page costs.
+int64_t estimate_shared_kpool_blocks(const KVCacheCapacity& target_cap,
+                                     const KVCacheCapacity& draft_cap,
+                                     const ModelArgs& draft_args);
 
 }  // namespace xllm

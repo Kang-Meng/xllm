@@ -191,6 +191,9 @@ void allocate_sleepable_kv_caches(std::vector<KVCache>& kv_caches,
         !create_options.enable_kv_cache_quant())
       << "Sleep mode does not support linear/indexer/quantized KV cache.";
 
+  CHECK(!kv_cache_shape.has_kpool_tail_shape() ||
+        create_options.layer_cache_owned().empty())
+      << "Compressed KPool requires owned layer caches.";
   const int64_t num_layers = create_options.num_layers();
   const std::vector<int64_t>& k_shape = kv_cache_shape.key_cache_shape();
   const std::vector<int64_t>& v_shape = kv_cache_shape.value_cache_shape();
@@ -291,6 +294,10 @@ torch::Tensor KVCache::get_kpool_tail() const {
   return impl_->get_kpool_tail();
 }
 
+bool KVCache::has_request_state() const {
+  return get_ssm_cache().defined() || get_kpool_tail().defined();
+}
+
 torch::Tensor KVCache::get_index_cache() const {
   return impl_->get_index_cache();
 }
@@ -373,6 +380,9 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
                         const KVCacheCreateOptions& create_options) {
   CHECK(kv_caches.empty()) << "KV caches are already initialized.";
 
+  CHECK(!kv_cache_shape.has_kpool_tail_shape() ||
+        create_options.layer_cache_owned().empty())
+      << "Compressed KPool requires owned layer caches.";
   const int64_t num_layers = create_options.num_layers();
   kv_caches.reserve(num_layers);
   const std::vector<bool>& layer_cache_owned =

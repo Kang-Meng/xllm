@@ -87,12 +87,18 @@ int64_t kv_slot_size(const ModelArgs& model_args,
 
 int64_t index_slot_size(const ModelArgs& model_args,
                         bool enable_indexer_cache_quantization,
-                        int64_t dtype_size) {
+                        int64_t dtype_size,
+                        KPoolCacheLayout kpool_layout) {
   if (model_args.index_n_heads() <= 0) {
     return 0;
   }
 
   const int64_t index_n_head = 1;
+  if (model_args.index_kpool_compress()) {
+    CHECK(!enable_indexer_cache_quantization)
+        << "KPool requires BF16 compressed index cache.";
+    CHECK_GT(model_args.index_kpool(), 0) << "KPool requires index_kpool > 0.";
+  }
   int64_t split_factor = 1;
   if (Platform::supports_dsa_indexer_cache_sharding() &&
       util::kv_split_size_effective() > 1) {
@@ -105,7 +111,17 @@ int64_t index_slot_size(const ModelArgs& model_args,
                                model_args.index_head_dim() +
                            static_cast<int64_t>(sizeof(float)));
   }
-  return split_factor * dtype_size * index_n_head * model_args.index_head_dim();
+  if (kpool_layout == KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
+      model_args.index_kpool_compress()) {
+    CHECK_EQ(model_args.index_head_dim() % model_args.index_kpool(), 0)
+        << "KPool index head dim must be divisible by index_kpool.";
+    return split_factor * dtype_size * index_n_head *
+           model_args.index_head_dim() / model_args.index_kpool();
+  }
+  return split_factor * dtype_size * index_n_head *
+         (model_args.index_kpool_compress()
+              ? 2 * model_args.index_head_dim() + 1
+              : model_args.index_head_dim());
 }
 
 int64_t scale_slot_size(const ModelArgs& model_args,
@@ -244,33 +260,28 @@ int64_t linear_slot_size(const ModelArgs& model_args,
 }
 
 int64_t max_linear_state_blocks(int64_t cache_size_in_bytes,
-                                int64_t num_linear_attention_layers,
-                                int64_t linear_slot_size,
+                                int64_t state_slot_bytes,
                                 int64_t full_cache_block_size_in_bytes) {
-  if (linear_slot_size <= 0 || num_linear_attention_layers <= 0) {
+  if (state_slot_bytes <= 0) {
     return kPaddingLinearStateBlocks;
   }
 
   CHECK_GT(cache_size_in_bytes, 0);
   CHECK_GT(full_cache_block_size_in_bytes, 0);
-  const int64_t linear_bytes_per_block =
-      num_linear_attention_layers * linear_slot_size;
-  CHECK_GT(linear_bytes_per_block, 0);
+  CHECK_GT(state_slot_bytes, 0);
 
-  int64_t max_linear_blocks =
-      (cache_size_in_bytes - 1) / linear_bytes_per_block;
+  int64_t max_linear_blocks = (cache_size_in_bytes - 1) / state_slot_bytes;
   const int64_t balanced_max_linear_blocks =
       (cache_size_in_bytes +
        kPaddingLinearStateBlocks * full_cache_block_size_in_bytes) /
-      (linear_bytes_per_block + full_cache_block_size_in_bytes);
+      (state_slot_bytes + full_cache_block_size_in_bytes);
   max_linear_blocks = std::min(max_linear_blocks, balanced_max_linear_blocks);
 
   return std::max<int64_t>(max_linear_blocks, kPaddingLinearStateBlocks);
 }
 
 int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
-                                      int64_t num_linear_attention_layers,
-                                      int64_t linear_slot_size,
+                                      int64_t state_slot_bytes,
                                       int64_t full_cache_block_size_in_bytes,
                                       int64_t max_seqs_per_batch,
                                       int64_t max_concurrent_requests,
@@ -278,14 +289,11 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
                                       bool enable_prefix_cache) {
   CHECK_GE(max_linear_state_cache_slots, 0)
       << "max_linear_state_cache_slots must be greater than or equal to 0.";
-  if (num_linear_attention_layers <= 0 || linear_slot_size <= 0) {
+  if (state_slot_bytes <= 0) {
     return kPaddingLinearStateBlocks;
   }
-  const int64_t max_blocks =
-      max_linear_state_blocks(cache_size_in_bytes,
-                              num_linear_attention_layers,
-                              linear_slot_size,
-                              full_cache_block_size_in_bytes);
+  const int64_t max_blocks = max_linear_state_blocks(
+      cache_size_in_bytes, state_slot_bytes, full_cache_block_size_in_bytes);
   if (max_linear_state_cache_slots > 0) {
     const int64_t requested_blocks =
         max_linear_state_cache_slots + kPaddingLinearStateBlocks;
@@ -313,17 +321,14 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
   // Auto-size: allocate ~47% of cache bytes to linear-state slots (ratio 0.9
   // means linear fraction = 0.9 / 1.9).
   constexpr double kLinearStateFullKvMemoryRatio = 0.9;
-  const int64_t linear_bytes_per_block =
-      num_linear_attention_layers * linear_slot_size;
   int64_t auto_blocks = kPaddingLinearStateBlocks;
-  if (linear_slot_size > 0 && num_linear_attention_layers > 0 &&
-      linear_bytes_per_block > 0) {
+  if (state_slot_bytes > 0) {
     const double linear_memory_fraction =
         kLinearStateFullKvMemoryRatio / (1.0 + kLinearStateFullKvMemoryRatio);
     const double linear_memory_bytes =
         static_cast<double>(cache_size_in_bytes) * linear_memory_fraction;
     auto_blocks = std::max<int64_t>(
-        static_cast<int64_t>(linear_memory_bytes / linear_bytes_per_block),
+        static_cast<int64_t>(linear_memory_bytes / state_slot_bytes),
         kPaddingLinearStateBlocks);
   }
   // Both bounds already sit at or above kPaddingLinearStateBlocks (auto_blocks
@@ -589,10 +594,14 @@ void init_standard_counts(const ModelArgs& model_args,
 
   const int64_t full_cache_block_size_in_bytes =
       standard_full_cache_block_size_in_bytes(*kv_cache_cap);
+  const int64_t gdn_state_bytes = kv_cache_cap->num_linear_attention_layers() *
+                                  kv_cache_cap->linear_slot_size();
+  const int64_t kpool_state_bytes =
+      kv_cache_cap->num_indexer_layers() * kv_cache_cap->kpool_tail_slot_size();
+  const int64_t total_state_bytes = gdn_state_bytes + kpool_state_bytes;
   int64_t num_linear_state_blocks =
       calculate_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
-                                    kv_cache_cap->num_linear_attention_layers(),
-                                    kv_cache_cap->linear_slot_size(),
+                                    total_state_bytes,
                                     full_cache_block_size_in_bytes,
                                     options.max_seqs_per_batch,
                                     options.max_concurrent_requests,
@@ -613,23 +622,18 @@ void init_standard_counts(const ModelArgs& model_args,
 #endif
   kv_cache_cap->num_linear_state_blocks(num_linear_state_blocks);
   kv_cache_cap->linear_cache_size_in_bytes(
-      kv_cache_cap->num_linear_attention_layers() *
-      kv_cache_cap->num_linear_state_blocks() *
-      kv_cache_cap->linear_slot_size());
+      kv_cache_cap->num_linear_state_blocks() * total_state_bytes);
   const int64_t available_full_cache_size_in_bytes =
       kv_cache_cap->cache_size_in_bytes() -
       kv_cache_cap->linear_cache_size_in_bytes();
-  if (kv_cache_cap->linear_slot_size() > 0) {
+  if (total_state_bytes > 0) {
     CHECK_GT(kv_cache_cap->cache_size_in_bytes(),
              kv_cache_cap->linear_cache_size_in_bytes())
         << "failed to reserve linear state cache for linear-attention "
            "layers: "
         << "max_seqs_per_batch (" << options.max_seqs_per_batch
         << ") is too large. Please reduce max_seqs_per_batch to less than "
-        << kv_cache_cap->cache_size_in_bytes() /
-                   (kv_cache_cap->num_linear_attention_layers() *
-                    kv_cache_cap->linear_slot_size()) -
-               2;
+        << kv_cache_cap->cache_size_in_bytes() / total_state_bytes - 2;
   }
   CHECK_GT(available_full_cache_size_in_bytes, 0)
       << "no memory left for full-attention kv cache after reserving linear "
@@ -650,13 +654,52 @@ void init_standard_counts(const ModelArgs& model_args,
 
 }  // namespace
 
+int64_t estimate_shared_kpool_blocks(const KVCacheCapacity& target_cap,
+                                     const KVCacheCapacity& draft_cap,
+                                     const ModelArgs& draft_args) {
+  CHECK_EQ(target_cap.block_size(), draft_cap.block_size());
+  CHECK_GT(target_cap.kpool_tail_slot_size(), 0);
+  CHECK_GT(draft_cap.kpool_tail_slot_size(), 0);
+  CHECK_EQ(draft_cap.num_linear_attention_layers(), 0);
+  // Draft request slots and the verify window are inherited from the target
+  // shape, rather than from the draft's standalone capacity estimate.
+  const int64_t draft_tail_len =
+      std::max<int64_t>(target_cap.kpool_tail_len(), draft_args.index_kpool());
+  const int64_t draft_state_bytes =
+      draft_cap.num_indexer_layers() * target_cap.num_linear_state_blocks() *
+      2 * static_cast<int64_t>(sizeof(uint16_t)) * draft_tail_len *
+      draft_args.index_head_dim();
+  const int64_t state_bytes =
+      target_cap.linear_cache_size_in_bytes() + draft_state_bytes;
+  const int64_t budget = std::min(target_cap.cache_size_in_bytes(),
+                                  draft_cap.cache_size_in_bytes());
+  CHECK_GT(budget, state_bytes)
+      << "no memory left after reserving target and draft KPool request state";
+  const int64_t block_bytes =
+      standard_full_cache_block_size_in_bytes(target_cap) +
+      standard_full_cache_block_size_in_bytes(draft_cap);
+  const int64_t n_blocks = (budget - state_bytes) / block_bytes;
+  CHECK_GT(n_blocks, 0) << "no memory for a shared KPool block";
+  return n_blocks;
+}
+
 std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,
     int64_t num_cache_layers) {
   if (!Platform::supports_dsa_indexer_cache_elision()) {
     return {};
   }
-  return layer::get_dsa_indexer_layer_mask(model_args, num_cache_layers);
+  std::vector<bool> layer_mask =
+      layer::get_dsa_indexer_layer_mask(model_args, num_cache_layers);
+  if (layer_mask.empty()) {
+    return layer_mask;
+  }
+  for (int64_t layer_id = 0; layer_id < num_cache_layers; ++layer_id) {
+    if (!is_full_attention_layer(model_args, layer_id)) {
+      layer_mask[static_cast<size_t>(layer_id)] = false;
+    }
+  }
+  return layer_mask;
 }
 
 std::vector<bool> build_layer_cache_owned(const ModelArgs& model_args,
@@ -718,8 +761,11 @@ KVCacheCapacity estimate_kv_cache_capacity(
                                  model_args.model_type());
 
   kv_cache_cap.slot_size(kv_slot_size(model_args, options, cache_dtype_size))
-      .index_slot_size(index_slot_size(
-          model_args, enable_indexer_cache_quantization, dtype_size))
+      .index_slot_size(index_slot_size(model_args,
+                                       enable_indexer_cache_quantization,
+                                       dtype_size,
+                                       options.kpool_layout))
+      .kpool_layout(options.kpool_layout)
       .enable_indexer_cache_quant(enable_indexer_cache_quantization)
       .enable_mla_kv_cache_quant(enable_mla_kv_cache_quantization)
       .scale_slot_size(scale_slot_size(model_args, options))
@@ -735,6 +781,24 @@ KVCacheCapacity estimate_kv_cache_capacity(
   kv_cache_cap.linear_ssm_checkpoint_stride(num_speculative_tokens + 1);
   if (options.is_draft_engine && model_args.num_nextn_predict_layers() > 0) {
     kv_cache_cap.n_layers(model_args.num_nextn_predict_layers());
+  }
+
+  if (model_args.index_kpool_compress() &&
+      options.kpool_layout == KPoolCacheLayout::COMPRESSED_WITH_TAIL) {
+    CHECK_EQ(options.layerwise_split_size, 1)
+        << "Compressed KPool requires owned layer caches.";
+    CHECK_EQ(options.dtype, torch::kBFloat16);
+    CHECK_EQ(options.block_size % model_args.index_kpool(), 0);
+    CHECK_GE(options.num_speculative_tokens, 0);
+    // One verify window includes its base token. Reserve a second window for
+    // the asynchronous next-first-draft handoff before the commit is observed.
+    const int64_t window = options.num_speculative_tokens > 0
+                               ? 2 * (options.num_speculative_tokens + 1)
+                               : 0;
+    kv_cache_cap.kpool_tail_len(model_args.index_kpool() + window);
+    kv_cache_cap.kpool_tail_slot_size(2 * sizeof(uint16_t) *
+                                      kv_cache_cap.kpool_tail_len() *
+                                      model_args.index_head_dim());
   }
 
   if (enable_dsv4_estimation) {

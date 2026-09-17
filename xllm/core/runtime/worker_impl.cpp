@@ -342,7 +342,11 @@ LinearStateInputRows get_mlu_linear_state_rows(ModelInputParams& input_params) {
   const std::vector<int32_t>& host_q_seq_lens =
       input_params.attention.host.q_seq_lens;
   const int64_t sequence_rows = static_cast<int64_t>(cached_tokens.size());
-  const int64_t active_rows = static_cast<int64_t>(host_q_seq_lens.size()) - 1;
+  const int64_t active_rows =
+      input_params.attention.host.kpool_query_lens.empty()
+          ? static_cast<int64_t>(host_q_seq_lens.size()) - 1
+          : static_cast<int64_t>(
+                input_params.attention.host.kpool_query_lens.size());
   const int64_t cache_op_rows =
       static_cast<int64_t>(input_params.linear_state_cache_ops.size());
 
@@ -485,6 +489,13 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
 
 WorkerImpl::~WorkerImpl() = default;
 
+bool WorkerImpl::has_request_state_cache() const {
+  return std::any_of(
+      kv_caches_.begin(), kv_caches_.end(), [](const KVCache& cache) {
+        return cache.has_request_state();
+      });
+}
+
 bool WorkerImpl::allocate_kv_cache_storage(
     const KVCacheShape& kv_cache_shape,
     bool use_huge_page_allocator,
@@ -502,7 +513,9 @@ bool WorkerImpl::allocate_kv_cache_storage(
         << "Grouped KV cache layout does not support XTensor cache.";
   }
   const auto& args = context_.get_model_args();
-  const bool enable_linear_attention = has_linear_attention_layers(args);
+  const KVCacheCreateOptions layout_options =
+      get_kv_cache_create_options(args, kv_cache_shape, is_spec_draft_);
+  const bool enable_linear_attention = layout_options.enable_linear_attention();
   const bool enable_lighting_indexer = args.index_n_heads() > 0;
   // A model may be BOTH linear-attention (KDA layers) AND have a lighting
   // indexer (DSA layers) — e.g. glm5_next. create_kv_cache_impl dispatches
@@ -521,6 +534,12 @@ bool WorkerImpl::allocate_kv_cache_storage(
   }
   std::vector<bool> indexer_cache_enabled_layers =
       resolve_indexer_cache_enabled_layers(args, num_layers);
+
+  if (kv_cache_shape.has_kpool_tail_shape() && is_spec_draft_) {
+    // GLM Next MTP layers are full indexers, independent of the target's
+    // hybrid layer schedule and shared-topk pattern.
+    indexer_cache_enabled_layers.assign(num_layers, true);
+  }
 
   // Check if KV cache quantization is enabled
   // "auto" (default): cache dtype aligns with model dtype (no quantization)
@@ -566,8 +585,8 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .dtype(dtype_)
       .ssm_dtype(ssm_dtype)
       .num_layers(num_layers)
-      .full_attention_interval(args.full_attention_interval())
-      .layer_types(args.layer_types())
+      .full_attention_interval(layout_options.full_attention_interval())
+      .layer_types(layout_options.layer_types())
       .model_id(options_.model_id())
       .model_type(args.model_type())
       .enable_xtensor(::xllm::KVCacheConfig::get_instance().enable_xtensor())
@@ -1382,8 +1401,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     // inner target worker (which owns the recurrent cache) perform preparation
     // and restore; attempting it here would treat target cache operations as
     // draft operations and fail discover_num_slots().
-    if (!kv_caches_.empty() &&
-        has_linear_attention_layers(context_.get_model_args())) {
+    if (has_request_state_cache()) {
       prepare_input_params_for_linear_attention(input_params);
       // Non-overlap path: restore on the current prepare_stream_ (installed
       // by the outer StreamGuard) so the restore copy is ordered with the

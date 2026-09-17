@@ -458,6 +458,10 @@ bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
     return true;
   }
 
+  const bool only_expert_per_group =
+      reader.value_or<bool>("quantization_config.only_expert_per_group", false);
+  quant_args.only_expert_per_group() = only_expert_per_group;
+
   if (auto v = reader.value<std::string>("quantization_config.quant_method")) {
     quant_args.quant_method() = v.value();
   }
@@ -507,12 +511,6 @@ bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
     quant_args.weight_block_size() =
         data["quantization_config"]["weight_block_size"]
             .get<std::vector<int64_t>>();
-  }
-
-  bool only_expert_per_group = false;
-  if (auto v =
-          reader.value<bool>("quantization_config.only_expert_per_group")) {
-    only_expert_per_group = v.value();
   }
 
   return validate_smoothquant_mixed_w4a8(

@@ -61,6 +61,9 @@ class Platform final {
     return is_mlu() || is_npu();
   }
 
+  // KPool stores compressed index pages with a separate per-request tail.
+  static constexpr bool uses_compressed_kpool_cache() { return is_mlu(); }
+
   // Indexer cache uses expanded block IDs under kv_split
   // (logical B -> [B*dcp, ..., B*dcp+dcp-1]).
   static constexpr bool supports_dsa_indexer_cache_sharding() {

@@ -30,6 +30,7 @@ class IndexedKVCacheImpl final : public KVCacheImpl {
                      int64_t layer_count);
 
   torch::Tensor get_index_cache() const override;
+  torch::Tensor get_kpool_tail() const override;
   std::optional<torch::Tensor> get_k_cache_scale() const override;
   std::optional<torch::Tensor> get_v_cache_scale() const override;
   std::optional<torch::Tensor> get_indexer_cache_scale() const override;
@@ -45,6 +46,7 @@ class IndexedKVCacheImpl final : public KVCacheImpl {
 
  private:
   torch::Tensor index_cache_;
+  torch::Tensor kpool_tail_;
   std::optional<torch::Tensor> index_cache_scale_;
   std::optional<torch::Tensor> key_cache_scale_;
   std::optional<torch::Tensor> value_cache_scale_;

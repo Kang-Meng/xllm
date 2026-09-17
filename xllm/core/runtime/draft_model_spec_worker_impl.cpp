@@ -166,6 +166,12 @@ KVCacheShape build_speculative_draft_kv_cache_shape(
   draft_capacity.n_blocks(target_kv_cache_shape.key_cache_shape()[0])
       .block_size(block_size)
       .enable_mla_kv_cache_quant(draft_mla_packed_c8);
+  draft_capacity.kpool_layout(target_kv_cache_shape.kpool_layout());
+  if (target_kv_cache_shape.has_kpool_tail_shape()) {
+    draft_capacity
+        .num_linear_state_blocks(target_kv_cache_shape.kpool_tail_shape()[0])
+        .kpool_tail_len(target_kv_cache_shape.kpool_tail_shape()[2]);
+  }
   return KVCacheShape(draft_capacity, draft_model_args, draft_world_size);
 }
 

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,18 +19,25 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "platform/platform.h"
+
 namespace xllm {
+
+// Selected once by the backend, then carried with capacity and shape metadata.
+enum class KPoolCacheLayout : int8_t { PACKED = 0, COMPRESSED_WITH_TAIL = 1 };
+
+constexpr KPoolCacheLayout default_kpool_layout() {
+  return Platform::uses_compressed_kpool_cache()
+             ? KPoolCacheLayout::COMPRESSED_WITH_TAIL
+             : KPoolCacheLayout::PACKED;
+}
 
 enum class LogicalShardKind : int8_t {
   REPLICATED = 0,
   SHARDED = 1,
   COMPOSITE = 2,
 };
-
-enum class CacheResourceScope : int8_t {
-  BLOCK = 0,
-  SEQUENCE = 1,
-};
+enum class CacheResourceScope : int8_t { BLOCK = 0, SEQUENCE = 1 };
 
 // Describes a compact mapping from canonical logical bytes to bytes within one
 // cache resource (one block or one sequence slot). A repeated span represents
@@ -63,6 +70,8 @@ struct CacheTensorLayoutContext {
   int32_t tp_rank = 0;
   int32_t tp_size = 1;
   int64_t block_token_capacity = 0;
+  // Physical pool entries per INDEX block; zero uses block_token_capacity.
+  int64_t index_block_capacity = 0;
   int64_t kv_head_count = 0;
   int64_t index_head_count = 0;
   int64_t linear_key_head_count = 0;

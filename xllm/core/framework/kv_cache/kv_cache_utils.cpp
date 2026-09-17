@@ -244,6 +244,14 @@ IndexedKVCacheTensors create_indexed_kv_cache_tensors(
   CHECK(kv_cache_shape.has_index_cache_shape())
       << "index_cache_shape must be initialized.";
   IndexedKVCacheTensors tensors;
+  if (kv_cache_shape.has_kpool_tail_shape()) {
+    CHECK(!create_options.enable_indexer_cache_quant());
+    CHECK_EQ(create_options.dtype(), torch::kBFloat16);
+    tensors.kpool_tail = alloc_cache_tensor(KVCacheTensorRole::KPOOL_TAIL,
+                                            kv_cache_shape.kpool_tail_shape(),
+                                            torch::kBFloat16,
+                                            create_options);
+  }
   const bool mla_packed_c8 = create_options.mla_packed_c8();
   if (create_options.enable_kv_cache_quant() && !mla_packed_c8) {
     QuantizedKVCacheTensors quantized_tensors =
