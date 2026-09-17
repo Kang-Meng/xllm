@@ -870,6 +870,11 @@ struct ParallelInput {
 
   DpEpPaddingData dp_ep_padding_data;
   NpuCpPlan cp_plan;
+  // int8 active-token mask for aclnnMegaMoe, length = padded token count.
+  // Only set by the ACL graph executor (persistent buffer) so captured
+  // mega graphs can replay with per-step real token counts; eager mode
+  // leaves it undefined and FusedMoE builds its own mask.
+  torch::Tensor mega_active_mask;
 
 #if defined(USE_MLU)
   std::shared_ptr<MLULayerSynchronizerImpl> layer_synchronizer = nullptr;
@@ -893,6 +898,7 @@ struct ParallelInput {
     out.dp_global_kv_max_seq_lens = dp_global_kv_max_seq_lens;
     out.dp_is_decode = dp_is_decode;
     out.dp_ep_padding_data = dp_ep_padding_data;
+    out.mega_active_mask = mega_active_mask;
     out.cp_plan = cp_plan.to(device);
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
     out.layer_synchronizer = layer_synchronizer;

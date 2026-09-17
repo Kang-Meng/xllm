@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/common/constants.h"
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
@@ -259,6 +260,10 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   // Create persistent tensors with max_tokens_per_batch as first dimension
   persistent_tokens_ = torch::zeros({max_tokens_per_batch},
                                     torch::dtype(torch::kInt).device(device));
+  if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {
+    persistent_mega_active_mask_ = torch::zeros(
+        {max_graph_tokens}, torch::dtype(torch::kInt8).device(device));
+  }
   persistent_positions_ = torch::zeros(
       {max_tokens_per_batch}, torch::dtype(torch::kInt).device(device));
   persistent_new_cache_slots_ = torch::zeros(
@@ -441,6 +446,22 @@ int64_t get_graph_lm_head_index_length(
       src.size(0), graph_mode_decode_no_padding_enabled());
 }
 }  // namespace
+
+void GraphPersistentParam::update_persistent_mega_active_mask(
+    uint32_t actual_tokens,
+    uint32_t padded_tokens) {
+  const int64_t capacity = persistent_mega_active_mask_.size(0);
+  if (padded_tokens == 0 || static_cast<int64_t>(padded_tokens) > capacity) {
+    return;
+  }
+  const uint32_t active_tokens = std::min(actual_tokens, padded_tokens);
+  auto mask = persistent_mega_active_mask_.slice(
+      /*dim=*/0, /*start=*/0, /*end=*/static_cast<int64_t>(padded_tokens));
+  mask.fill_(0);
+  mask.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/static_cast<int64_t>(active_tokens))
+      .fill_(1);
+}
 
 void GraphPersistentParam::update_persistent_dp_ep_padding(
     const DpEpPaddingData& src,
@@ -1334,6 +1355,14 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                                   dp_layout_size);
   update_persistent_cp_ep_meta(params.parallel.cp_plan.cp_ep_meta(),
                                padded_num_tokens);
+  if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {
+    // Empty DP shards are padded with one fake token by the worker so graph
+    // capture sees a non-empty batch; the mega mask must mark that row
+    // inactive so the kernel excludes it from dispatch/combine.
+    const uint32_t mega_real_tokens =
+        params.meta.num_sequences == 0 ? 0 : actual_num_tokens;
+    update_persistent_mega_active_mask(mega_real_tokens, padded_num_tokens);
+  }
 
   // Return ModelInputParams with persistent buffer references if requested.
   // Capture uses bucketed DeepSeekV2-family MLA host lengths to size ATB
@@ -1489,6 +1518,13 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
         padded_num_tokens,
         dp_layout_size,
         graph_params->parallel.dp_ep_padding_data);
+    if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {
+      // The mega active mask must come from the persistent buffer so captured
+      // graphs read per-step mask content at a stable address on replay.
+      graph_params->parallel.mega_active_mask =
+          persistent_mega_active_mask_.slice(
+              /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens);
+    }
     CpEpMeta capture_cp_ep_meta = params.parallel.cp_plan.cp_ep_meta();
     replace_capture_cp_ep_meta(params.parallel.cp_plan.cp_ep_meta(),
                                capture_cp_ep_meta);

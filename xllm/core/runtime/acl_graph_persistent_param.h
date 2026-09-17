@@ -341,6 +341,11 @@ class GraphPersistentParam final {
   DpEpPaddingData persistent_dp_ep_padding_;
   CpEpMeta persistent_cp_ep_meta_;
 
+  // Persistent int8 mega_moe active-token mask. Pre-allocated with max
+  // decode graph token capacity; capture records its address so replays can
+  // mark real rows via the mask without recapturing the graph.
+  torch::Tensor persistent_mega_active_mask_;
+
   // Copy src padding data into pre-allocated persistent buffers.
   void update_persistent_dp_ep_padding(const DpEpPaddingData& src,
                                        uint32_t padded_tokens,
@@ -353,6 +358,10 @@ class GraphPersistentParam final {
       int32_t dp_layout_size,
       DpEpPaddingData& dst) const;
   void replace_capture_cp_ep_meta(const CpEpMeta& src, CpEpMeta& dst) const;
+  // Refresh the persistent mega active mask: first |actual_tokens| rows are
+  // marked active, the rest of the |padded_tokens| prefix stays zero.
+  void update_persistent_mega_active_mask(uint32_t actual_tokens,
+                                          uint32_t padded_tokens);
 };
 
 }  // namespace xllm::npu
