@@ -313,8 +313,10 @@ void BlockManagerPool::allocate_shared(Sequence* sequence) {
   int32_t dp_rank = get_dp_rank(sequence);
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
-  if (composite->leaf_combination() ==
-          CompositeBlockManager::LeafCombination::SWA_COMPRESSED &&
+  if ((composite->leaf_combination() ==
+           CompositeBlockManager::LeafCombination::SWA_COMPRESSED ||
+       composite->leaf_combination() ==
+           CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR) &&
       sequence->kv_state().prefix_cache_matched()) {
     return;
   }

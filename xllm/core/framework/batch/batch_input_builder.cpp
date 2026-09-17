@@ -208,32 +208,6 @@ bool should_read_linear_state_out_of_place(const ModelArgs* args,
          (!is_python_model && is_qwen3_5_target_model_type(args->model_type()));
 }
 
-bool is_linear_checkpoint_boundary(Sequence* sequence,
-                                   uint32_t boundary_tokens,
-                                   uint32_t chunk_stride) {
-  if (sequence == nullptr || boundary_tokens == 0 || chunk_stride == 0) {
-    return false;
-  }
-  if (boundary_tokens % chunk_stride != 0) {
-    return false;
-  }
-
-  const Slice<Block> kv_blocks = sequence->kv_state().blocks(BlockType::KV);
-  if (kv_blocks.empty() || !kv_blocks.front().is_valid()) {
-    return true;
-  }
-  return boundary_tokens % kv_blocks.front().size() == 0;
-}
-
-// Save linear state only at a shared chunk and KV-block boundary during
-// prefill.
-bool should_save_linear_checkpoint(Sequence* sequence,
-                                   uint32_t boundary_tokens,
-                                   uint32_t chunk_stride) {
-  return sequence != nullptr && sequence->is_prefill_stage() &&
-         is_linear_checkpoint_boundary(sequence, boundary_tokens, chunk_stride);
-}
-
 }  // namespace
 
 BatchInputBuilder::BatchInputBuilder(
@@ -876,7 +850,7 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
     }
   }
 
-  append_linear_state_row(sequence, n_kv_cache_tokens, seq_len, state);
+  append_linear_state_row(sequence, state);
 
   // Add extra token id
   int32_t extra_token_id = -1;
@@ -918,8 +892,6 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
 }
 
 void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
-                                                uint32_t n_kv_cache_tokens,
-                                                uint32_t seq_len,
                                                 BuilderState& state) {
   // linear_state_ids must stay aligned with logical batch rows even when the
   // model has no linear-attention layers, because downstream consumers index by
@@ -936,66 +908,22 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
 
   LinearStateCacheOp linear_state_cache_op;
   linear_state_cache_op.linear_state_id = state.linear_state_ids.back();
-  linear_state_cache_op.reset_requested = n_kv_cache_tokens == 0;
-  const int32_t chunk_stride = ::xllm::SchedulerConfig::get_instance()
-                                   .max_tokens_per_chunk_for_prefill();
-  const bool has_restore_source = sequence->has_linear_restore_src_block();
-  const bool needs_restore_hash =
-      has_restore_source && sequence->is_prefill_stage() &&
-      is_linear_checkpoint_boundary(sequence, n_kv_cache_tokens, chunk_stride);
-  const bool needs_restore =
-      has_restore_source &&
-      (needs_restore_hash || !sequence->is_prefill_stage());
-  // Exit-boundary save: persist the live state only when this prefill step
-  // lands on a chunk-end boundary, so the linear-state cache stays a sparse
-  // per-chunk overlay on top of the per-block KV cache.
-  const bool needs_save_hash =
-      should_save_linear_checkpoint(sequence, seq_len, chunk_stride);
-  // Refresh the sequence's cached chunk hashes to cover this step's deepest
-  // boundary, then read them back. The cache is chained and incremental, so
-  // this only hashes chunks not seen on a previous step; the match probe and
-  // this builder now share the one hash source instead of each recomputing.
-  Slice<XXH3Key> linear_state_hashes;
-  if (needs_restore_hash || needs_save_hash) {
-    sequence->update_linear_state_hashes(static_cast<uint32_t>(chunk_stride));
-    linear_state_hashes = sequence->linear_state_hashes();
-  }
-  // Restore source (block-carried): allocate_shared_for_sequence mounts the
-  // deepest-hit checkpoint at admission (class A); allocate_for_sequence
-  // mounts the slot it just checkpointed at the previous step's save-rotation
-  // (class B). Take it unconditionally so unused matches are released in this
-  // build. A source used by a restore descriptor moves into builder state and
-  // then the owning Batch, which pins it until the worker result is consumed.
-  std::optional<Block> mounted_restore_src =
-      sequence->take_linear_restore_src_block();
-  if (needs_restore) {
-    if (needs_restore_hash) {
-      const size_t restore_chunk_idx =
-          static_cast<size_t>(n_kv_cache_tokens) / chunk_stride - 1;
-      CHECK_LT(restore_chunk_idx, linear_state_hashes.size())
-          << "mounted linear-state checkpoint must have a matching chunk hash";
-    }
-    CHECK(mounted_restore_src.has_value())
-        << "linear-state restore must resolve its checkpoint slot before "
-           "building worker input";
+  const bool is_prefill = sequence->is_prefill_stage();
+  const Slice<Block> linear_blocks =
+      sequence->kv_state().blocks(BlockType::LINEAR);
+  CHECK(!linear_blocks.empty());
+  CHECK(linear_blocks.back().is_valid());
+  linear_state_cache_op.reset_requested =
+      is_prefill && linear_blocks.size() == 1;
+  if (is_prefill && !linear_state_cache_op.reset_requested) {
+    Block source = sequence->kv_state().copy_linear_state_source();
+    CHECK(source.is_valid());
+    CHECK_NE(source.id(), linear_state_cache_op.linear_state_id);
     linear_state_cache_op.restore_requested =
         !should_read_linear_state_out_of_place(
             args_, state.batch_forward_type, sequence);
-    linear_state_cache_op.restore_src_slot_id = mounted_restore_src->id();
-    state.linear_restore_src_blocks.emplace_back(
-        std::move(*mounted_restore_src));
-  }
-  if (needs_save_hash) {
-    const size_t save_chunk_idx =
-        static_cast<size_t>(seq_len) / chunk_stride - 1;
-    if (save_chunk_idx < linear_state_hashes.size()) {
-      // Record the boundary hash on the sequence. The LINEAR leaf executes
-      // the save at the next step's allocate_for_sequence, after this step's
-      // forward writes the boundary state into the live slot. Writing only
-      // the sequence's own pending-save field keeps this safe inside the
-      // parallel build loop.
-      sequence->set_pending_linear_save(linear_state_hashes[save_chunk_idx]);
-    }
+    linear_state_cache_op.restore_src_slot_id = source.id();
+    state.linear_restore_src_blocks.emplace_back(std::move(source));
   }
   state.linear_state_cache_ops.emplace_back(std::move(linear_state_cache_op));
 }

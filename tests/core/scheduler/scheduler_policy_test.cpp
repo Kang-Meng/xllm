@@ -66,12 +66,18 @@ class FakeEngine : public Engine {
  public:
   FakeEngine(int32_t num_blocks,
              int32_t block_size,
-             bool enable_prefix_cache = false) {
+             bool enable_prefix_cache = false,
+             bool enable_linear_attention = false) {
     BlockManagerPool::Options opt;
     opt.num_blocks_ = num_blocks;
     opt.block_size_ = block_size;
     opt.max_seqs_per_batch_ = 1024;
     opt.enable_prefix_cache_ = enable_prefix_cache;
+    opt.enable_linear_state_ = enable_linear_attention;
+    if (enable_linear_attention) {
+      opt.linear_state_num_slots_ = 64;
+      model_args_.layer_types({"linear_attention"});
+    }
     fake_tokenizer_ = std::make_unique<FakeTokenizer>();
     fake_block_manager_ = std::make_unique<BlockManagerPool>(opt, 1);
   }
@@ -346,6 +352,8 @@ class RestorePriorityBlockManagerPool final : public BlockManagerPool {
 
 class TestUnifiedPolicy final : public UnifiedPolicy {
  public:
+  using SchedulerPolicy::allocate_for_prefill;
+  using SchedulerPolicy::compute_prefill_target;
   using UnifiedPolicy::UnifiedPolicy;
 
   void allocate_shared_blocks_for_test(Sequence* sequence,
@@ -545,6 +553,153 @@ TEST(SchedulerPolicyTest, UnifiedPrefixHitIncludesScheduledSuffixCapacity) {
   EXPECT_EQ(batches[0].get_allowed_max_tokens()[0], kChunkTokens);
   EXPECT_GE(hit_sequence->kv_state().current_max_tokens_capacity(),
             kPrefixTokens + kChunkTokens);
+}
+
+TEST(SchedulerPolicyTest, LinearPrefillTargetsOneChunkRegardlessOfPrefixCache) {
+  ContinuousScheduler::Options options =
+      create_scheduler_options(1024, 16, 0, 256, 1);
+  BatchMode mode{
+      .enable_mix_batch = true,
+      .enable_chunked_prefill = true,
+      .priority_strategy = "fcfs",
+  };
+  TestUnifiedPolicy policy(mode, options);
+  FakeEngine engine(64, 128);
+  auto requests =
+      generate_request({777}, {1}, std::nullopt, std::nullopt, 10000);
+  Sequence* sequence = requests.front()->sequences().front().get();
+  DequeQueue prefill_queue;
+  DequeQueue chunk_queue;
+  DequeQueue decode_queue;
+  std::list<std::shared_ptr<Request>> unified_queue;
+  std::deque<DecodeRestoreEntry> decode_restore_waiting;
+  std::vector<std::shared_ptr<Request>> running_requests;
+  std::vector<Sequence*> running_sequences;
+  std::vector<size_t> running_sequence_budgets;
+  bool last_step_prefill = false;
+  ModelArgs model_args;
+  SchedulerState state{
+      .prefill_queue = prefill_queue,
+      .chunk_queue = chunk_queue,
+      .decode_queue = decode_queue,
+      .unified_queue = unified_queue,
+      .decode_restore_waiting = decode_restore_waiting,
+      .running_requests = running_requests,
+      .running_sequences = running_sequences,
+      .running_sequences_budgets = running_sequence_budgets,
+      .kv_cache_manager = engine.block_manager_pool(),
+      .profile_manager = nullptr,
+      .response_processor = nullptr,
+      .model_args = model_args,
+      .last_step_prefill = last_step_prefill,
+      .options = options,
+      .min_speculative_tokens_required = 0,
+      .enable_prefix_cache = false,
+      .has_linear_attention_layers = true,
+  };
+  for (const bool enable_prefix_cache : {false, true}) {
+    state.enable_prefix_cache = enable_prefix_cache;
+    EXPECT_EQ(policy.compute_prefill_target(sequence, 0, 128, state), 0u);
+    EXPECT_EQ(policy.compute_prefill_target(sequence, 0, 1024, state), 256u);
+    EXPECT_EQ(policy.compute_prefill_target(sequence, 256, 1024, state), 512u);
+    EXPECT_EQ(policy.compute_prefill_target(sequence, 512, 300, state), 768u);
+    EXPECT_EQ(policy.compute_prefill_target(sequence, 768, 8, state), 768u);
+    EXPECT_EQ(policy.compute_prefill_target(sequence, 768, 256, state), 777u);
+    size_t actual_tokens = 0;
+    ASSERT_FALSE(policy.allocate_for_prefill(
+        sequence, 128, &actual_tokens, state, true));
+    EXPECT_EQ(actual_tokens, 0u);
+    ASSERT_TRUE(policy.allocate_for_prefill(
+        sequence, 256, &actual_tokens, state, true));
+    EXPECT_EQ(actual_tokens, 256u);
+    const size_t num_blocks = sequence->kv_state().num_blocks(BlockType::KV);
+    ASSERT_TRUE(policy.allocate_for_prefill(
+        sequence, 1024, &actual_tokens, state, true));
+    EXPECT_EQ(actual_tokens, 256u);
+    EXPECT_EQ(sequence->kv_state().num_blocks(BlockType::KV), num_blocks);
+  }
+  engine.block_manager_pool()->deallocate(sequence);
+}
+
+TEST(SchedulerPolicyTest, LinearSchedulingKeepsOneChunkAcrossPolicies) {
+  ScopedConfigValue<bool> chunked_guard(
+      SchedulerConfig::get_instance().enable_chunked_prefill(), true);
+  ScopedConfigValue<int32_t> stride_guard(
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 256);
+  for (const bool prefix_cache : {false, true}) {
+    ScopedConfigValue<bool> cache_guard(
+        KVCacheConfig::get_instance().enable_prefix_cache(), prefix_cache);
+    for (const std::string strategy : {"fcfs", "multi_slo_and_prio"}) {
+      for (const bool mix_batch : {false, true}) {
+        ScopedConfigValue<bool> mix_guard(
+            SchedulerConfig::get_instance().enable_mix_batch(), mix_batch);
+        ContinuousScheduler::Options options =
+            create_scheduler_options(1024, 16, 0, 256, 1, strategy);
+        FakeEngine engine(128, 128, prefix_cache, true);
+        ContinuousScheduler scheduler(&engine, options);
+        auto requests =
+            generate_request({777}, {1}, std::nullopt, std::nullopt, 10000);
+        Sequence* sequence = requests.front()->sequences().front().get();
+        scheduler.add_request(requests.front());
+        size_t cached_tokens = 0;
+        for (const size_t expected_tokens : {256, 256, 256, 9}) {
+          auto batches = scheduler.prepare_batch_test();
+          ASSERT_EQ(batches.size(), 1u);
+          ASSERT_EQ(batches.front().size(), 1u);
+          EXPECT_EQ(batches.front().get_allowed_max_tokens().front(),
+                    expected_tokens);
+          EXPECT_EQ(sequence->kv_state().num_blocks(BlockType::LINEAR),
+                    cached_tokens / 256 + 1);
+          cached_tokens += expected_tokens;
+          sequence->kv_state().set_kv_cache_tokens_num(cached_tokens);
+        }
+      }
+    }
+  }
+}
+
+TEST(SchedulerPolicyTest, LinearLatencySchedulingRespectsRemainingTokenBudget) {
+  ScopedConfigValue<bool> chunked_guard(
+      SchedulerConfig::get_instance().enable_chunked_prefill(), true);
+  ScopedConfigValue<int32_t> stride_guard(
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 256);
+  for (const bool prefix_cache : {false, true}) {
+    ScopedConfigValue<bool> cache_guard(
+        KVCacheConfig::get_instance().enable_prefix_cache(), prefix_cache);
+    for (const bool mix_batch : {false, true}) {
+      ScopedConfigValue<bool> mix_guard(
+          SchedulerConfig::get_instance().enable_mix_batch(), mix_batch);
+      ContinuousScheduler::Options options = create_scheduler_options(
+          /*max_tokens_per_batch=*/384,
+          /*max_seqs_per_batch=*/16,
+          /*num_speculative_tokens=*/0,
+          /*max_tokens_per_chunk_for_prefill=*/256,
+          /*dp_size=*/1,
+          /*priority_strategy=*/"multi_slo_and_prio",
+          /*enable_profile_kv_blocks=*/false,
+          /*enable_latency_aware_schedule=*/true,
+          /*max_global_ttft_ms=*/1000000,
+          /*max_global_tpot_ms=*/1000000);
+      FakeEngine engine(128, 128, prefix_cache, true);
+      ContinuousScheduler scheduler(&engine, options);
+      scheduler.get_profile_manager()->train_prefill_time_predictor(
+          std::vector<std::pair<int32_t, double>>{
+              {64, 8}, {128, 24}, {256, 80}, {512, 288}});
+      auto requests = generate_request(
+          {777, 777}, {1, 1}, std::nullopt, std::nullopt, 10000);
+      for (auto& request : requests) {
+        scheduler.add_request(request);
+      }
+
+      auto batches = scheduler.prepare_batch_test();
+
+      ASSERT_EQ(batches.size(), 1u);
+      ASSERT_EQ(batches.front().size(), 1u);
+      EXPECT_EQ(batches.front().get_allowed_max_tokens(),
+                (std::vector<uint32_t>{256}));
+      EXPECT_EQ(scheduler.get_running_requests().size(), 1u);
+    }
+  }
 }
 
 TEST(SchedulerPolicyTest, KvlessCompositeReprobesAfterPartialAllocation) {

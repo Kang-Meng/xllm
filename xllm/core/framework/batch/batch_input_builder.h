@@ -161,11 +161,8 @@ class BatchInputBuilder {
                                     BuilderState* state_ptr = nullptr);
   // Append this batch row's linear-state transport fields: the live slot id
   // (always, so rows stay aligned) plus a LinearStateCacheOp carrying the
-  // resolved restore/save plan for linear-attention models.
-  void append_linear_state_row(Sequence* sequence,
-                               uint32_t n_kv_cache_tokens,
-                               uint32_t seq_len,
-                               BuilderState& state);
+  // resolved reset/restore plan for linear-attention models.
+  void append_linear_state_row(Sequence* sequence, BuilderState& state);
   torch::Tensor get_mrope_positions(Sequence* sequence,
                                     uint32_t start,
                                     uint32_t end);

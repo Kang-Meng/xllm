@@ -159,28 +159,32 @@ void expect_mapping(const TransferKVInfo& info,
   EXPECT_EQ(info.dp_rank, 3);
 }
 
-LinearStatePrefixHash compute_linear_state_prefix_hash_for_test(
-    const std::vector<int32_t>& token_ids,
-    size_t hash_stride,
-    size_t boundary_tokens) {
-  LinearStatePrefixHash hash{};
-  if (hash_stride == 0 || boundary_tokens % hash_stride != 0) {
-    return hash;
+void mount_linear_source_for_test(Sequence& sequence,
+                                  Block source,
+                                  BlockManagerImpl& manager) {
+  const size_t chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const size_t output_index = sequence.kv_cache_tokens_num() / chunk_stride;
+  CHECK_GT(output_index, 0u);
+  CHECK_EQ(sequence.kv_cache_tokens_num() % chunk_stride, 0u);
+  Block output = sequence.copy_block(BlockType::LINEAR);
+  if (!output.is_valid()) {
+    std::vector<Block> allocated = manager.allocate(1);
+    CHECK_EQ(allocated.size(), 1u);
+    output = std::move(allocated.front());
   }
-  const size_t boundary_chunks = boundary_tokens / hash_stride;
-  if (boundary_chunks == 0 || boundary_tokens > token_ids.size()) {
-    return hash;
-  }
-  const uint8_t* previous_hash = nullptr;
-  for (size_t chunk_idx = 0; chunk_idx < boundary_chunks; ++chunk_idx) {
-    xxh3_128bits_hash(
-        previous_hash,
-        Slice<int32_t>(token_ids).slice(chunk_idx * hash_stride,
-                                        (chunk_idx + 1) * hash_stride),
-        hash.data());
-    previous_hash = hash.data();
-  }
-  return hash;
+  std::vector<Block> blocks(output_index + 1);
+  blocks[output_index - 1] = std::move(source);
+  blocks[output_index] = std::move(output);
+  sequence.kv_state().replace_composite_blocks(
+      BlockType::LINEAR, std::move(blocks), 0, 0);
+}
+
+void release_linear_source_for_test(Sequence& sequence) {
+  std::vector<Block>* blocks =
+      sequence.kv_state().mutable_blocks(BlockType::LINEAR);
+  CHECK_GE(blocks->size(), 2u);
+  (*blocks)[blocks->size() - 2] = Block();
 }
 
 Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids,
@@ -2307,132 +2311,40 @@ TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {
 }
 
 TEST(BatchTest, LinearRestoreSourceStaysPinnedForBatchLifetime) {
-  // A checkpoint is usable only when the chunk and KV block boundaries match.
-  ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
+  ScopedPrefillChunkStride chunk_stride(4);
+  ScopedLinearStateOutOfPlace out_of_place(true);
   ScopedModelImpl model_impl("native");
-
-  torch::Device device(Platform::type_torch(), 0);
-  const uint32_t n_blocks = 22;
-  const uint32_t block_size = 8;
   BlockManager::Options options;
-  options.num_blocks(n_blocks).block_size(block_size);
+  options.num_blocks(6).block_size(4);
   BlockManagerImpl manager(options);
-
-  RequestSamplingParam sampling_param;
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(4);
-  SequenceParams seq_params;
-  seq_params.seq_capacity = 32;
-  seq_params.stopping_checker = &stopping_checker;
-  seq_params.sampling_param = &sampling_param;
-  seq_params.skip_special_tokens = true;
-  seq_params.echo = false;
-  seq_params.logprobs = false;
-  seq_params.enable_schedule_overlap = false;
-
-  torch::Tensor input_embedding;
-  MMData mm_data;
-  const std::vector<int32_t> aligned_tokens = {
-      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
-  IncrementalDecoder aligned_decoder("", 20, false, false);
-  Sequence aligned_seq(/*index=*/0,
-                       aligned_tokens,
-                       input_embedding,
-                       mm_data,
-                       std::move(aligned_decoder),
-                       seq_params);
-  std::vector<Block> aligned_blocks = manager.allocate(5);
-  aligned_seq.add_blocks(BlockType::KV, aligned_blocks);
-
-  IncrementalDecoder restore_decoder("", 20, false, false);
-  Sequence restore_seq(/*index=*/1,
-                       aligned_tokens,
-                       input_embedding,
-                       mm_data,
-                       std::move(restore_decoder),
-                       seq_params);
-  std::vector<Block> restore_blocks = manager.allocate(5);
-  restore_seq.add_blocks(BlockType::KV, restore_blocks);
-  restore_seq.kv_state().incr_kv_cache_tokens_num(/*size=*/16);
-  // A sequence that restores at a chunk boundary carries a mounted restore
-  // source: production mounts it in allocate_shared_for_sequence (class A) when
-  // the reused KV prefix maps onto a committed linear-state checkpoint. This
-  // hand-built sequence bypasses the block manager, so mount an explicit source
-  // slot to reproduce that invariant -- the builder keys the restore emission
-  // off its presence.
-  std::vector<Block> restore_src_blocks = manager.allocate(1);
-  restore_seq.set_linear_restore_src_block(std::move(restore_src_blocks[0]));
-
-  const std::vector<int32_t> off_boundary_tokens = {21, 22, 23, 24, 25, 26, 27,
-                                                    28, 29, 30, 31, 32, 33, 34,
-                                                    35, 36, 37, 38, 39, 40};
-  IncrementalDecoder off_boundary_decoder("", 20, false, false);
-  Sequence off_boundary_seq(/*index=*/2,
-                            off_boundary_tokens,
-                            input_embedding,
-                            mm_data,
-                            std::move(off_boundary_decoder),
-                            seq_params);
-  off_boundary_seq.add_blocks(BlockType::KV, manager.allocate(5));
-
-  const std::vector<int32_t> decode_tokens = {
-      41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56};
-  IncrementalDecoder decode_decoder("", 16, false, false);
-  Sequence decode_seq(/*index=*/3,
-                      decode_tokens,
-                      input_embedding,
-                      mm_data,
-                      std::move(decode_decoder),
-                      seq_params);
-  decode_seq.add_blocks(BlockType::KV, manager.allocate(5));
-  decode_seq.kv_state().incr_kv_cache_tokens_num(/*size=*/16);
-  decode_seq.append_token(57);
-
+  Sequence sequence = make_basic_sequence({1, 2, 3, 4, 5, 6, 7, 8, 9});
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  sequence.kv_state().set_kv_cache_tokens_num(4);
+  std::vector<Block> source = manager.allocate(1);
+  ASSERT_EQ(source.size(), 1u);
+  const int32_t source_id = source.front().id();
+  mount_linear_source_for_test(sequence, std::move(source.front()), manager);
+  const int32_t output_id = sequence.get_linear_state_slot_id();
   std::optional<Batch> batch;
   batch.emplace();
-  batch->add(&aligned_seq, /*allowed_max_token=*/16);
-  batch->add(&restore_seq, /*allowed_max_token=*/4);
-  batch->add(&off_boundary_seq, /*allowed_max_token=*/15);
-  batch->add(&decode_seq, /*allowed_max_token=*/1);
-
+  batch->add(&sequence, 4);
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
-  ForwardInput forward_input = batch->prepare_forward_input(
-      /*num_decoding_tokens=*/1, /*min_decoding_bach_size=*/0, args);
-
-  const auto& cache_ops = forward_input.input_params.linear_state_cache_ops;
-  ASSERT_EQ(cache_ops.size(), 4u);
-  // The save decision now lands on the sequence (pending save), not the cache
-  // op; the LINEAR leaf executes it at the next step. The restore no longer
-  // rides a hash on the cache op: the builder resolves the checkpoint to a
-  // source slot and chooses direct read only for the supported native Qwen3.5
-  // NPU prefill path.
-  const LinearStatePrefixHash aligned_save_expected =
-      compute_linear_state_prefix_hash_for_test(
-          aligned_tokens, /*hash_stride=*/4, /*boundary_tokens=*/16);
-  EXPECT_FALSE(is_zero_prefix_hash(aligned_save_expected));
-  std::optional<XXH3Key> aligned_save = aligned_seq.take_pending_linear_save();
-  ASSERT_TRUE(aligned_save.has_value());
-  EXPECT_EQ(*aligned_save, XXH3Key(aligned_save_expected.data()));
-
-  // restore_seq restores at boundary 16, but cannot save at the non-KV
-  // boundary 20. Native Qwen3.5 prefill reads the source directly on NPU;
-  // other platforms keep the D2D restore fallback.
-  EXPECT_EQ(cache_ops[1].restore_requested, !Platform::is_npu());
-  EXPECT_GE(cache_ops[1].restore_src_slot_id, 0);
-  EXPECT_FALSE(restore_seq.has_pending_linear_save());
-
-  // off_boundary_seq and decode_seq neither restore nor save.
-  EXPECT_FALSE(cache_ops[2].restore_requested);
-  EXPECT_FALSE(off_boundary_seq.has_pending_linear_save());
-  EXPECT_FALSE(cache_ops[3].restore_requested);
-  EXPECT_FALSE(decode_seq.has_pending_linear_save());
-
-  // The host Block handle, not device state, keeps the full pool pinned.
+  ForwardInput input = batch->prepare_forward_input(0, 0, args);
+  ASSERT_EQ(input.input_params.linear_state_cache_ops.size(), 1u);
+  const LinearStateCacheOp& cache_op =
+      input.input_params.linear_state_cache_ops.front();
+  EXPECT_FALSE(cache_op.reset_requested);
+  EXPECT_EQ(cache_op.restore_requested, !Platform::is_npu());
+  EXPECT_EQ(cache_op.restore_src_slot_id, source_id);
+  EXPECT_EQ(cache_op.linear_state_id, output_id);
+  EXPECT_EQ(sequence.kv_state().copy_linear_state_source().id(), source_id);
+  release_linear_source_for_test(sequence);
   EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
-  EXPECT_EQ(manager.allocate(1).size(), 1u);
+  std::vector<Block> reclaimed = manager.allocate(1);
+  ASSERT_EQ(reclaimed.size(), 1u);
+  EXPECT_EQ(reclaimed.front().id(), source_id);
 }
 
 #if defined(USE_NPU)
@@ -2455,7 +2367,8 @@ TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
   std::vector<Block> restore_sources = manager.allocate(1);
   ASSERT_EQ(restore_sources.size(), 1u);
   const int32_t source_id = restore_sources[0].id();
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
+  mount_linear_source_for_test(
+      sequence, std::move(restore_sources[0]), manager);
 
   std::optional<Batch> batch;
   batch.emplace();
@@ -2477,6 +2390,8 @@ TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
   std::vector<Block> remaining = manager.allocate(1);
   ASSERT_EQ(remaining.size(), 1u);
   EXPECT_TRUE(manager.allocate(1).empty());
+  release_linear_source_for_test(sequence);
+  EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
   EXPECT_EQ(manager.allocate(1).size(), 1u);
 }
@@ -2497,7 +2412,8 @@ TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DWhenDisabled) {
   std::vector<Block> restore_sources = manager.allocate(1);
   ASSERT_EQ(restore_sources.size(), 1u);
   const int32_t source_id = restore_sources[0].id();
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
+  mount_linear_source_for_test(
+      sequence, std::move(restore_sources[0]), manager);
 
   Batch batch;
   batch.add(&sequence, /*allowed_max_token=*/4);
@@ -2530,7 +2446,8 @@ TEST(BatchTest, Glm53MixedBatchKeepsPrefillCheckpointRestoreD2D) {
   std::vector<Block> prefill_restore_sources = manager.allocate(1);
   ASSERT_EQ(prefill_restore_sources.size(), 1u);
   const int32_t prefill_source_id = prefill_restore_sources[0].id();
-  prefill.set_linear_restore_src_block(std::move(prefill_restore_sources[0]));
+  mount_linear_source_for_test(
+      prefill, std::move(prefill_restore_sources[0]), manager);
 
   Sequence decode =
       make_basic_sequence({9, 10, 11, 12, 13, 14, 15, 16}, /*index=*/1);
@@ -2571,7 +2488,8 @@ TEST(BatchTest, Glm53NativeExecutorKeepsCheckpointRestoreD2D) {
   sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
   std::vector<Block> restore_sources = manager.allocate(1);
   ASSERT_EQ(restore_sources.size(), 1u);
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
+  mount_linear_source_for_test(
+      sequence, std::move(restore_sources[0]), manager);
 
   Batch batch;
   batch.add(&sequence, /*allowed_max_token=*/4);
@@ -2601,7 +2519,8 @@ TEST(BatchTest, OtherLinearModelKeepsCheckpointRestoreD2D) {
   sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
   std::vector<Block> restore_sources = manager.allocate(1);
   ASSERT_EQ(restore_sources.size(), 1u);
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
+  mount_linear_source_for_test(
+      sequence, std::move(restore_sources[0]), manager);
 
   std::optional<Batch> batch;
   batch.emplace();
@@ -2617,7 +2536,7 @@ TEST(BatchTest, OtherLinearModelKeepsCheckpointRestoreD2D) {
       forward_input.input_params.linear_state_cache_ops[0].restore_requested);
 }
 
-TEST(BatchTest, Glm53DecodeKeepsCheckpointRestoreD2D) {
+TEST(BatchTest, Glm53DecodeUpdatesExistingTailWithoutRestore) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
   ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
   ScopedModelImpl model_impl("python");
@@ -2645,10 +2564,6 @@ TEST(BatchTest, Glm53DecodeKeepsCheckpointRestoreD2D) {
   sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
   sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/8);
   sequence.append_token(9);
-  std::vector<Block> restore_sources = manager.allocate(1);
-  ASSERT_EQ(restore_sources.size(), 1u);
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
-
   std::optional<Batch> batch;
   batch.emplace();
   batch->add(&sequence, /*allowed_max_token=*/1);
@@ -2659,8 +2574,13 @@ TEST(BatchTest, Glm53DecodeKeepsCheckpointRestoreD2D) {
       /*num_decoding_tokens=*/1, /*min_decoding_bach_size=*/0, args);
 
   ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
-  EXPECT_TRUE(
+  EXPECT_FALSE(
       forward_input.input_params.linear_state_cache_ops[0].restore_requested);
+  EXPECT_FALSE(
+      forward_input.input_params.linear_state_cache_ops[0].reset_requested);
+  EXPECT_EQ(
+      forward_input.input_params.linear_state_cache_ops[0].restore_src_slot_id,
+      -1);
 }
 #else
 TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DOutsideNpu) {
@@ -2678,7 +2598,8 @@ TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DOutsideNpu) {
   sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
   std::vector<Block> restore_sources = manager.allocate(1);
   ASSERT_EQ(restore_sources.size(), 1u);
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
+  mount_linear_source_for_test(
+      sequence, std::move(restore_sources[0]), manager);
 
   Batch batch;
   batch.add(&sequence, /*allowed_max_token=*/4);
@@ -2694,104 +2615,75 @@ TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DOutsideNpu) {
 }
 #endif
 
-TEST(BatchTest, UnusedLinearRestoreSourceIsReleasedDuringBuild) {
-  ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-
+TEST(BatchTest, ColdPrefillResetsButShortPromptDecodeDoesNotReset) {
+  ScopedPrefillChunkStride chunk_stride(4);
   BlockManager::Options options;
-  options.num_blocks(/*num_blocks=*/3).block_size(/*block_size=*/4);
+  options.num_blocks(3).block_size(4);
   BlockManagerImpl manager(options);
-
-  RequestSamplingParam sampling_param;
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(1);
-  SequenceParams seq_params;
-  seq_params.seq_capacity = 4;
-  seq_params.stopping_checker = &stopping_checker;
-  seq_params.sampling_param = &sampling_param;
-
-  IncrementalDecoder decoder("", 3, false, false);
-  Sequence sequence(/*index=*/0,
-                    /*token_ids=*/{1, 2, 3},
-                    /*input_embedding=*/torch::Tensor(),
-                    /*mm_data=*/MMData(),
-                    std::move(decoder),
-                    seq_params);
+  Sequence sequence = make_basic_sequence({1, 2, 3});
   sequence.add_blocks(BlockType::KV, manager.allocate(1));
-  sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/2);
-  std::vector<Block> restore_sources = manager.allocate(1);
-  ASSERT_EQ(restore_sources.size(), 1u);
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
-
-  std::optional<Batch> batch;
-  batch.emplace();
-  batch->add(&sequence, /*allowed_max_token=*/1);
-  ModelArgs args;
-  args.layer_types({"linear_attention"});
-  ForwardInput forward_input = batch->prepare_forward_input(
-      /*num_decoding_tokens=*/0, /*min_decoding_bach_size=*/0, args);
-
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
-  EXPECT_FALSE(
-      forward_input.input_params.linear_state_cache_ops[0].restore_requested);
-  EXPECT_EQ(manager.allocate(1).size(), 1u);
-}
-
-TEST(BatchTest, DecodeConsumesRestoreSourceWithD2DCopy) {
-  ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
-  ScopedModelImpl model_impl("native");
-
-  BlockManager::Options options;
-  options.num_blocks(/*num_blocks=*/4).block_size(/*block_size=*/4);
-  BlockManagerImpl manager(options);
-
-  RequestSamplingParam sampling_param;
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(20);
-  SequenceParams seq_params;
-  seq_params.seq_capacity = 32;
-  seq_params.stopping_checker = &stopping_checker;
-  seq_params.sampling_param = &sampling_param;
-
-  IncrementalDecoder decoder("", 4, false, false);
-  Sequence sequence(/*index=*/0,
-                    /*token_ids=*/{1, 2, 3, 4},
-                    /*input_embedding=*/torch::Tensor(),
-                    /*mm_data=*/MMData(),
-                    std::move(decoder),
-                    seq_params);
-  sequence.add_blocks(BlockType::KV, manager.allocate(2));
-  sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
-  sequence.append_token(5);
-  std::vector<Block> restore_sources = manager.allocate(1);
-  ASSERT_EQ(restore_sources.size(), 1u);
-  const int32_t restore_src_slot_id = restore_sources[0].id();
-  sequence.set_linear_restore_src_block(std::move(restore_sources[0]));
-
-  std::optional<Batch> batch;
-  batch.emplace();
-  batch->add(&sequence, /*allowed_max_token=*/1);
+  sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
+  const int32_t output_id = sequence.get_linear_state_slot_id();
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
-  ForwardInput forward_input = batch->prepare_forward_input(
-      /*num_decoding_tokens=*/1, /*min_decoding_bach_size=*/0, args);
+  Batch prefill;
+  prefill.add(&sequence, 3);
+  ForwardInput prefill_input = prefill.prepare_forward_input(0, 0, args);
+  ASSERT_EQ(prefill_input.input_params.linear_state_cache_ops.size(), 1u);
+  const LinearStateCacheOp& cold_op =
+      prefill_input.input_params.linear_state_cache_ops.front();
+  EXPECT_TRUE(cold_op.reset_requested);
+  EXPECT_FALSE(cold_op.restore_requested);
+  EXPECT_EQ(cold_op.restore_src_slot_id, -1);
+  sequence.append_token(4);
+  Batch decode;
+  decode.add(&sequence, 1);
+  ForwardInput decode_input = decode.prepare_forward_input(1, 0, args);
+  ASSERT_EQ(decode_input.input_params.linear_state_cache_ops.size(), 1u);
+  const LinearStateCacheOp& decode_op =
+      decode_input.input_params.linear_state_cache_ops.front();
+  EXPECT_FALSE(decode_op.reset_requested);
+  EXPECT_FALSE(decode_op.restore_requested);
+  EXPECT_EQ(decode_op.restore_src_slot_id, -1);
+  EXPECT_EQ(decode_op.linear_state_id, output_id);
+}
 
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
+TEST(BatchTest, DecodeKeepsSparseTailWithoutRestore) {
+  ScopedPrefillChunkStride chunk_stride(4);
+  BlockManager::Options options;
+  options.num_blocks(5).block_size(4);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_basic_sequence({1, 2, 3, 4, 5, 6, 7, 8});
+  sequence.add_blocks(BlockType::KV, manager.allocate(3));
+  std::vector<Block> blocks(2);
+  std::vector<Block> output = manager.allocate(1);
+  blocks.back() = std::move(output.front());
+  sequence.add_blocks(BlockType::LINEAR, std::move(blocks));
+  sequence.kv_state().set_kv_cache_tokens_num(8);
+  sequence.append_token(9);
+  Batch batch;
+  batch.add(&sequence, 1);
+  ModelArgs args;
+  args.model_type("qwen3_5").layer_types({"linear_attention"});
+  ForwardInput input = batch.prepare_forward_input(1, 0, args);
+  ASSERT_EQ(input.input_params.linear_state_cache_ops.size(), 1u);
   const LinearStateCacheOp& cache_op =
-      forward_input.input_params.linear_state_cache_ops[0];
-  EXPECT_TRUE(cache_op.restore_requested);
-  EXPECT_EQ(cache_op.restore_src_slot_id, restore_src_slot_id);
+      input.input_params.linear_state_cache_ops.front();
+  EXPECT_FALSE(cache_op.reset_requested);
+  EXPECT_FALSE(cache_op.restore_requested);
+  EXPECT_EQ(cache_op.restore_src_slot_id, -1);
+  EXPECT_EQ(cache_op.linear_state_id, sequence.get_linear_state_slot_id());
 }
 
 TEST(BatchTest, ThreadedBatchPinsEveryLinearRestoreSourceUntilRelease) {
-  ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
+  ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/32768);
 
   constexpr size_t kQueryTokensPerSequence = 32768;
-  constexpr size_t kCachedTokensPerSequence = 32772;
+  constexpr size_t kCachedTokensPerSequence = 32768;
   const size_t sequence_tokens =
       kQueryTokensPerSequence + kCachedTokensPerSequence;
   BlockManager::Options options;
-  options.num_blocks(/*num_blocks=*/7)
+  options.num_blocks(/*num_blocks=*/9)
       .block_size(static_cast<uint32_t>(kCachedTokensPerSequence));
   BlockManagerImpl manager(options);
 
@@ -2830,10 +2722,10 @@ TEST(BatchTest, ThreadedBatchPinsEveryLinearRestoreSourceUntilRelease) {
   std::vector<Block> second_restore_source = manager.allocate(1);
   ASSERT_EQ(first_restore_source.size(), 1u);
   ASSERT_EQ(second_restore_source.size(), 1u);
-  first_sequence.set_linear_restore_src_block(
-      std::move(first_restore_source[0]));
-  second_sequence.set_linear_restore_src_block(
-      std::move(second_restore_source[0]));
+  mount_linear_source_for_test(
+      first_sequence, std::move(first_restore_source[0]), manager);
+  mount_linear_source_for_test(
+      second_sequence, std::move(second_restore_source[0]), manager);
 
   std::optional<Batch> batch;
   batch.emplace();
@@ -2848,6 +2740,9 @@ TEST(BatchTest, ThreadedBatchPinsEveryLinearRestoreSourceUntilRelease) {
   ASSERT_EQ(cache_ops.size(), 2u);
   EXPECT_TRUE(cache_ops[0].restore_requested);
   EXPECT_TRUE(cache_ops[1].restore_requested);
+  EXPECT_TRUE(manager.allocate(1).empty());
+  release_linear_source_for_test(first_sequence);
+  release_linear_source_for_test(second_sequence);
   EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
   EXPECT_EQ(manager.allocate(2).size(), 2u);

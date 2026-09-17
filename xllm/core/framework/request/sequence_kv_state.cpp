@@ -153,10 +153,6 @@ void KVCacheState::erase_blocks(BlockType type) {
   block_sizes_.erase(type);
   num_owned_shared_blocks_.erase(type);
   num_cached_blocks_.erase(type);
-  if (type == BlockType::LINEAR) {
-    pending_linear_save_hash_.reset();
-    linear_restore_src_block_.reset();
-  }
 }
 
 std::vector<Block> KVCacheState::take_blocks(BlockType type) {
@@ -177,12 +173,21 @@ std::vector<Block> KVCacheState::take_blocks(BlockType type) {
 
 Block KVCacheState::copy_block(BlockType type) const {
   DCHECK(type == BlockType::EMBEDDING || type == BlockType::LINEAR)
-      << "copy_block is for singleton block types only";
+      << "copy_block requires an embedding or linear-state block";
   auto it = composite_blocks_.find(type);
   if (it == composite_blocks_.end() || it->second.empty()) {
     return Block();
   }
-  return it->second[0];
+  return type == BlockType::LINEAR ? it->second.back() : it->second.front();
+}
+
+Block KVCacheState::copy_linear_state_source() const {
+  const Slice<Block> linear_blocks = blocks(BlockType::LINEAR);
+  if (linear_blocks.size() < 2) {
+    return Block();
+  }
+  CHECK(linear_blocks[linear_blocks.size() - 2].is_valid());
+  return linear_blocks[linear_blocks.size() - 2];
 }
 
 size_t KVCacheState::shared_blocks_num(BlockType type) const {
@@ -387,12 +392,10 @@ int32_t KVCacheState::get_embedding_block_id() const {
 }
 
 int32_t KVCacheState::get_linear_block_id() const {
-  const auto it = composite_blocks_.find(BlockType::LINEAR);
-  if (it == composite_blocks_.end() || it->second.empty() ||
-      !it->second[0].is_valid()) {
-    return -1;
-  }
-  return it->second[0].id();
+  const Slice<Block> linear_blocks = blocks(BlockType::LINEAR);
+  return linear_blocks.empty() || !linear_blocks.back().is_valid()
+             ? -1
+             : linear_blocks.back().id();
 }
 
 void KVCacheState::set_transfer_kv_info(TransferKVInfo&& info) {
@@ -438,8 +441,6 @@ void KVCacheState::reset() {
   need_swap_ = false;
   transfer_kv_info_.reset();
   next_transfer_block_idx_ = 0;
-  pending_linear_save_hash_.reset();
-  linear_restore_src_block_.reset();
   next_group_transfer_block_idxes_.clear();
 }
 
