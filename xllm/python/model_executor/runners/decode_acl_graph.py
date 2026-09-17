@@ -1056,6 +1056,7 @@ class DecodeAclGraphRunner(BaseRunner):
             # variable per-rank counts cannot be baked into a graph.
             dp_execution_token_counts=(padded_batch_size,) * self.dp_size if self.dp_size > 1 else (),
             dp_is_decode=tuple([1] * self.dp_size) if self.dp_size > 1 else (),
+            is_dummy=bool(getattr(metadata, "is_dummy", False)),
             # One mask slot per padded row across all DP ranks. aclnnMegaMoe
             # dispatches the fixed graph shape over EP, so padded lanes must be
             # marked inactive or they are routed as real tokens.

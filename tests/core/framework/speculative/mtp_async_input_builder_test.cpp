@@ -216,6 +216,7 @@ TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
 
   auto metadata = std::make_shared<layer::AttentionMetadata>();
   metadata->is_prefill = true;
+  metadata->is_dummy = true;
 
   ModelInputParams params;
   params.embedding.linear_state_ids = {3, 7};
@@ -240,6 +241,7 @@ TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
   EXPECT_TRUE(torch::equal(
       py_metadata.attr("linear_state_read_indices").cast<torch::Tensor>(),
       torch::tensor({2, 7}, torch::kInt)));
+  EXPECT_TRUE(py_metadata.attr("is_dummy").cast<bool>());
 }
 
 TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
