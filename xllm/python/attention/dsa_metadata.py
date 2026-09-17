@@ -41,6 +41,7 @@ import torch
 DSA_CACHE_TOKEN = 0
 DSA_CACHE_SEQUENCE = 1
 DSA_CACHE_SLIDING_WINDOW = 2
+DSV4_COMPRESSED_BLOCK_TOKEN_SIZE = 2048
 
 
 @dataclass
@@ -165,7 +166,7 @@ def build_cache_specs(
     (sliding-window) group; TOKEN groups for ratios {4, 128} are registered in
     the order they first appear.
     """
-    compressed_block_sizes = {4: 512, 128: 16}
+    compressed_block_sizes = {ratio: DSV4_COMPRESSED_BLOCK_TOKEN_SIZE // ratio for ratio in (4, 128)}
     group_infos: list[DSAGroupInfo] = []
     group_key_map: dict[tuple[int, int, int], int] = {}
 

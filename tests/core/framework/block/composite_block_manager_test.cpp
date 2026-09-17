@@ -36,9 +36,10 @@ namespace {
 constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
 constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
 constexpr uint32_t kMaxTokensPerBatch = 1280;
+constexpr uint32_t kCompressedBlockTokenSize = kDsv4CompressedBlockTokenSize;
 
-// Base block_size = 128. C4 and C128 both cover 2048 original tokens per
-// logical block, so a base token capacity maps to equal typed block counts.
+// C4 and C128 cover the same number of original tokens per logical block, so
+// a base token capacity maps to equal typed block counts.
 BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
                                            uint32_t block_size,
                                            uint32_t window_size,
@@ -50,7 +51,7 @@ BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
   const uint32_t swa_num_blocks = swa_blocks_per_seq * max_seqs_per_batch +
                                   burst_blocks + max_seqs_per_batch + 2;
   const uint32_t compressed_num_blocks =
-      base_num_blocks * block_size / kDsv4CompressedBlockTokenSpan;
+      base_num_blocks * block_size / kCompressedBlockTokenSize;
   BlockManager::Options opts;
   opts.num_blocks(base_num_blocks)
       .block_size(block_size)
@@ -83,8 +84,8 @@ void set_swa_capacity_for_token_budget(BlockManager::Options* options,
 }
 
 constexpr uint32_t kBaseBlockSize = 128;
-constexpr uint32_t kBlockSizeRatio4 = kDsv4CompressedBlockTokenSpan;
-constexpr uint32_t kBlockSizeRatio128 = kDsv4CompressedBlockTokenSpan;
+constexpr uint32_t kBlockSizeRatio4 = kCompressedBlockTokenSize;
+constexpr uint32_t kBlockSizeRatio128 = kCompressedBlockTokenSize;
 
 inline size_t CeilBlocks(size_t num_tokens, size_t block_size) {
   return (num_tokens + block_size - 1) / block_size;
@@ -632,7 +633,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheEvictsAtC128Capacity) {
   // C128 has four physical blocks and each prompt consumes two. The third
   // distinct prompt must evict the first prompt from both compressed leaves.
   const uint32_t base_num_blocks =
-      4 * kDsv4CompressedBlockTokenSpan / kBaseBlockSize;
+      4 * kCompressedBlockTokenSize / kBaseBlockSize;
   const uint32_t window_size = 4 * kBaseBlockSize;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, /*max_seqs_per_batch=*/1);

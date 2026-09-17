@@ -120,7 +120,11 @@ class DsaAttentionBackend(AttentionBackend):
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        self.caches_info, self.group_infos = build_cache_specs(compress_ratios, window_size, n_layers)
+        self.caches_info, self.group_infos = build_cache_specs(
+            compress_ratios,
+            window_size,
+            n_layers,
+        )
         self._builder = DsaMetadataBuilder(self.caches_info, self.group_infos)
         self.window_size = window_size
         self.index_topk = index_topk

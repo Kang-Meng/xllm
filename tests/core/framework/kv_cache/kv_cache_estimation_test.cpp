@@ -711,10 +711,13 @@ TEST(KVCacheEstimationTest,
       get_dsv4_cache_policy(target_options.dtype);
   const int64_t scale_bytes =
       cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
+  const Dsv4CacheGeometry geometry;
+  const int64_t c4_physical_dim = geometry.c4_physical_dim();
+  const int64_t c128_physical_dim = geometry.c128_physical_dim();
   const int64_t c4_block_bytes =
-      kDsv4C4PhysicalBlockSize *
+      c4_physical_dim *
       (16 * 4 + 8 * cache_policy.index_dtype_size + scale_bytes);
-  const int64_t c128_block_bytes = kDsv4C128PhysicalBlockSize * 16 * 4;
+  const int64_t c128_block_bytes = c128_physical_dim * 16 * 4;
   const int64_t compressed_unit_bytes = c4_block_bytes + c128_block_bytes;
   constexpr int64_t kTargetSwaBytes = 35 * 90112;
   constexpr int64_t kDraftSwaBytes =

@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
+#include "framework/config/kv_cache_config.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_shape.h"
@@ -365,6 +366,12 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
   const int64_t float32_size = 4;
   const int64_t dtype_size =
       static_cast<int64_t>(torch::elementSize(options.dtype));
+  const Dsv4CacheGeometry& geometry =
+      KVCacheConfig::get_instance().dsv4_cache_geometry();
+  const int64_t compressed_block_token_size =
+      geometry.compressed_block_token_size();
+  const int64_t c4_physical_dim = geometry.c4_physical_dim();
+  const int64_t c128_physical_dim = geometry.c128_physical_dim();
 
   Dsv4KVCacheEstimateCost cache_cost;
   const int64_t swa_blocks_per_seq =
@@ -430,15 +437,13 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
   const int64_t scale_bytes =
       cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
   const int64_t bytes_per_c4_block =
-      kDsv4C4PhysicalBlockSize *
+      c4_physical_dim *
       (head_dim * dtype_size + index_head_dim * cache_policy.index_dtype_size +
        scale_bytes);
   const int64_t bytes_per_c128_block =
-      kDsv4C128PhysicalBlockSize * head_dim * dtype_size;
-  CHECK_EQ(kDsv4CompressedBlockTokenSpan % block_size, 0)
-      << "DSV4 compressed token span must be divisible by base block_size";
+      c128_physical_dim * head_dim * dtype_size;
   const int64_t manager_blocks_per_compressed_block =
-      kDsv4CompressedBlockTokenSpan / block_size;
+      compressed_block_token_size / block_size;
 
   if (cache_cost.n_c4_layers > 0 && cache_cost.n_c128_layers > 0) {
     cache_cost.token_unit_bytes =
