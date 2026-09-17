@@ -12,6 +12,8 @@ from scripts.logger import logger
 
 _MOONCAKE_DEPENDENCIES_COMMAND = "bash dependencies.sh -y"
 _MOONCAKE_GO_BIN_DIR = "/usr/local/go/bin"
+_GO_DEFAULT_PROXY = "https://proxy.golang.org,direct"
+_MOONCAKE_GO_PROXY = "https://goproxy.cn|https://goproxy.io|direct"
 
 
 def _b64(s: str) -> str:
@@ -362,6 +364,21 @@ def _export_mooncake_go_path(mooncake_source_dir: str) -> None:
     logger.info(f"✅ Export Mooncake Go toolchain to PATH: {_MOONCAKE_GO_BIN_DIR}")
 
 
+def _export_mooncake_go_proxy() -> None:
+    if os.environ.get("GOPROXY"):
+        return
+
+    ok, go_proxy, error = _run_command(["go", "env", "GOPROXY"], check=False)
+    if not ok:
+        logger.error(f"Failed to read Mooncake Go proxy configuration: {error}")
+        exit(1)
+    if go_proxy and go_proxy != _GO_DEFAULT_PROXY:
+        return
+
+    os.environ["GOPROXY"] = _MOONCAKE_GO_PROXY
+    logger.info(f"Export Mooncake GOPROXY to environment: {_MOONCAKE_GO_PROXY}")
+
+
 def _is_mooncake_go_ready(mooncake_source_dir: str) -> bool:
     required_version = _get_mooncake_go_version(mooncake_source_dir)
     return required_version is not None and _get_installed_go_version() == required_version
@@ -532,6 +549,7 @@ def _ensure_prebuild_dependencies_installed(
             _print_manual_check_commands(manual_commands)
             exit(1)
 
+    _export_mooncake_go_proxy()
     _export_cmake_prefix_paths([_get_yalantinglibs_prefix()])
 
 

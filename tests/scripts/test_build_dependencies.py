@@ -73,6 +73,8 @@ class BuildDependenciesTest(unittest.TestCase):
 
     def test_prebuild_skips_installed_mooncake_dependencies(self) -> None:
         with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(utils, "_run_command", return_value=(True, utils._GO_DEFAULT_PROXY, "")),
             mock.patch.object(utils, "_run_shell_command") as run,
             mock.patch.object(utils, "_get_required_dependency_files", return_value={}),
             mock.patch.object(utils, "_export_mooncake_go_path"),
@@ -82,6 +84,7 @@ class BuildDependenciesTest(unittest.TestCase):
             utils._ensure_prebuild_dependencies_installed(
                 "/repo",
             )
+            self.assertEqual(os.environ["GOPROXY"], utils._MOONCAKE_GO_PROXY)
 
         run.assert_not_called()
 
@@ -90,6 +93,7 @@ class BuildDependenciesTest(unittest.TestCase):
             mock.patch.object(utils, "_run_shell_command", return_value=True) as run,
             mock.patch.object(utils, "_get_required_dependency_files", return_value={}),
             mock.patch.object(utils, "_export_mooncake_go_path"),
+            mock.patch.object(utils, "_export_mooncake_go_proxy"),
             mock.patch.object(utils, "_is_mooncake_go_ready", side_effect=[False, True]),
             mock.patch.object(utils, "_export_cmake_prefix_paths"),
         ):
@@ -109,11 +113,13 @@ class BuildDependenciesTest(unittest.TestCase):
             mock.patch.object(utils, "_is_mooncake_go_ready", side_effect=[False, True]),
             mock.patch.object(utils, "_run_dependencies_script_or_exit"),
             mock.patch.object(utils, "_export_mooncake_go_path") as export_go_path,
+            mock.patch.object(utils, "_export_mooncake_go_proxy") as export_go_proxy,
             mock.patch.object(utils, "_export_cmake_prefix_paths"),
         ):
             utils._ensure_prebuild_dependencies_installed("/repo")
 
         self.assertEqual(export_go_path.call_count, 2)
+        export_go_proxy.assert_called_once_with()
 
     def test_export_mooncake_go_path_prepends_install_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -163,11 +169,59 @@ class BuildDependenciesTest(unittest.TestCase):
 
                 self.assertEqual(os.environ["PATH"], original_path)
 
+    def test_export_mooncake_go_proxy_replaces_default_proxy(self) -> None:
+        for environment in ({}, {"GOPROXY": ""}):
+            with (
+                self.subTest(environment=environment),
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(
+                    utils, "_run_command", return_value=(True, "https://proxy.golang.org,direct", "")
+                ) as run,
+            ):
+                utils._export_mooncake_go_proxy()
+
+                self.assertEqual(os.environ["GOPROXY"], "https://goproxy.cn|https://goproxy.io|direct")
+                run.assert_called_once_with(["go", "env", "GOPROXY"], check=False)
+
+    def test_export_mooncake_go_proxy_preserves_environment(self) -> None:
+        for proxy in ("https://proxy.example.com", "https://proxy.golang.org,direct", "direct", "off"):
+            with (
+                self.subTest(proxy=proxy),
+                mock.patch.dict(os.environ, {"GOPROXY": proxy}, clear=True),
+                mock.patch.object(utils, "_run_command") as run,
+            ):
+                utils._export_mooncake_go_proxy()
+
+                self.assertEqual(os.environ["GOPROXY"], proxy)
+                run.assert_not_called()
+
+    def test_export_mooncake_go_proxy_preserves_saved_configuration(self) -> None:
+        for proxy in ("https://proxy.example.com", "direct", "off"):
+            with (
+                self.subTest(proxy=proxy),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(utils, "_run_command", return_value=(True, proxy, "")),
+            ):
+                utils._export_mooncake_go_proxy()
+
+                self.assertNotIn("GOPROXY", os.environ)
+
+    def test_export_mooncake_go_proxy_reports_configuration_errors(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(utils, "_run_command", return_value=(False, "", "go env failed")),
+            self.assertRaises(SystemExit) as error,
+        ):
+            utils._export_mooncake_go_proxy()
+
+        self.assertEqual(error.exception.code, 1)
+
     def test_prebuild_force_installs_mooncake_dependencies(self) -> None:
         with (
             mock.patch.object(utils, "_run_shell_command", return_value=True) as run,
             mock.patch.object(utils, "_get_required_dependency_files", return_value={}),
             mock.patch.object(utils, "_export_mooncake_go_path"),
+            mock.patch.object(utils, "_export_mooncake_go_proxy"),
             mock.patch.object(utils, "_is_mooncake_go_ready", return_value=True),
             mock.patch.object(utils, "_export_cmake_prefix_paths"),
         ):
