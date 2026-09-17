@@ -125,9 +125,9 @@ void register_xllm_runtime_module(py::module_& m) {
   m.def("dp_all_gather",
         [](torch::Tensor tensor,
            const std::vector<int32_t>& execution_token_counts) {
-          if (active_py_causal_lm != nullptr) {
-            return active_py_causal_lm->dp_all_gather(tensor,
-                                                      execution_token_counts);
+          PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
+          if (py_causal_lm != nullptr) {
+            return py_causal_lm->dp_all_gather(tensor, execution_token_counts);
           }
           return tensor;
         });
