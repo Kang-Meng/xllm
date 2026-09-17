@@ -23,6 +23,8 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
+#include "framework/config/kv_cache_config.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/model/model_args.h"
@@ -345,12 +347,10 @@ void set_dsv4_compressed_counts(const Dsv4KVCacheEstimateCost& cache_cost,
                                 int64_t token_unit_count,
                                 KVCacheCapacity* kv_cache_cap) {
   CHECK(kv_cache_cap != nullptr);
-  if (cache_cost.n_c4_layers > 0 && cache_cost.n_c128_layers > 0) {
-    kv_cache_cap->c128_count(token_unit_count);
-    kv_cache_cap->c4_count(32 * token_unit_count);
-  } else if (cache_cost.n_c4_layers > 0) {
+  if (cache_cost.n_c4_layers > 0) {
     kv_cache_cap->c4_count(token_unit_count);
-  } else if (cache_cost.n_c128_layers > 0) {
+  }
+  if (cache_cost.n_c128_layers > 0) {
     kv_cache_cap->c128_count(token_unit_count);
   }
 }
@@ -366,6 +366,12 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
   const int64_t float32_size = 4;
   const int64_t dtype_size =
       static_cast<int64_t>(torch::elementSize(options.dtype));
+  const Dsv4CacheGeometry& geometry =
+      KVCacheConfig::get_instance().dsv4_cache_geometry();
+  const int64_t compressed_block_token_size =
+      geometry.compressed_block_token_size();
+  const int64_t c4_physical_dim = geometry.c4_physical_dim();
+  const int64_t c128_physical_dim = geometry.c128_physical_dim();
 
   Dsv4KVCacheEstimateCost cache_cost;
   const int64_t swa_blocks_per_seq =
@@ -431,23 +437,26 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
   const int64_t scale_bytes =
       cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
   const int64_t bytes_per_c4_block =
-      block_size *
+      c4_physical_dim *
       (head_dim * dtype_size + index_head_dim * cache_policy.index_dtype_size +
        scale_bytes);
-  const int64_t bytes_per_c128_block = block_size * head_dim * dtype_size;
+  const int64_t bytes_per_c128_block =
+      c128_physical_dim * head_dim * dtype_size;
+  const int64_t manager_blocks_per_compressed_block =
+      compressed_block_token_size / block_size;
 
   if (cache_cost.n_c4_layers > 0 && cache_cost.n_c128_layers > 0) {
     cache_cost.token_unit_bytes =
-        32 * cache_cost.n_c4_layers * bytes_per_c4_block +
+        cache_cost.n_c4_layers * bytes_per_c4_block +
         cache_cost.n_c128_layers * bytes_per_c128_block;
-    cache_cost.manager_blocks_per_unit = 128;
+    cache_cost.manager_blocks_per_unit = manager_blocks_per_compressed_block;
   } else if (cache_cost.n_c4_layers > 0) {
     cache_cost.token_unit_bytes = cache_cost.n_c4_layers * bytes_per_c4_block;
-    cache_cost.manager_blocks_per_unit = 4;
+    cache_cost.manager_blocks_per_unit = manager_blocks_per_compressed_block;
   } else if (cache_cost.n_c128_layers > 0) {
     cache_cost.token_unit_bytes =
         cache_cost.n_c128_layers * bytes_per_c128_block;
-    cache_cost.manager_blocks_per_unit = 128;
+    cache_cost.manager_blocks_per_unit = manager_blocks_per_compressed_block;
   }
   return cache_cost;
 }
@@ -555,11 +564,13 @@ void init_dsv4_counts(const ModelArgs& model_args,
   int64_t manager_base_blocks = 0;
   if (cache_cost.n_c4_layers > 0) {
     manager_base_blocks =
-        std::max(manager_base_blocks, kv_cache_cap->c4_count() * 4);
+        std::max(manager_base_blocks,
+                 kv_cache_cap->c4_count() * cache_cost.manager_blocks_per_unit);
   }
   if (cache_cost.n_c128_layers > 0) {
-    manager_base_blocks =
-        std::max(manager_base_blocks, kv_cache_cap->c128_count() * 128);
+    manager_base_blocks = std::max(
+        manager_base_blocks,
+        kv_cache_cap->c128_count() * cache_cost.manager_blocks_per_unit);
   }
   kv_cache_cap->n_blocks(std::max<int64_t>(manager_base_blocks, 1));
 }

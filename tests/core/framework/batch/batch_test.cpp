@@ -3490,6 +3490,8 @@ TEST(BatchTest, OverlapMTPReplacementKeepsCompositeKvBlocks) {
       .swa_blocks_per_seq(static_cast<uint32_t>(
           get_swa_blocks_per_seq(window_size, base_block_size)))
       .swa_num_blocks(20)
+      .c4_num_blocks(256)
+      .c128_num_blocks(256)
       .max_tokens_per_batch(1280)
       .max_seqs_per_batch(max_seqs_per_batch)
       .manager_types({1, 0, 0})

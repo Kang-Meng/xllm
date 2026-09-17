@@ -162,7 +162,7 @@ def test_dsa_graph_tables_use_compressed_block_counts() -> None:
 
     tables = runner._build_static_multi_block_tables(4, torch.device("cpu"))
 
-    assert [tuple(table.shape) for table in tables] == [(4, 256), (4, 64), (4, 2)]
+    assert [tuple(table.shape) for table in tables] == [(4, 256), (4, 16), (4, 16)]
     assert all(torch.all(table == 0) for table in tables)
 
 
