@@ -596,16 +596,15 @@ def test_dp_mtp_target_active_and_empty_ranks_use_eager() -> None:
 
 
 @pytest.mark.parametrize(
-    ("width", "kda_verify_v2", "disable_verify_graph"),
+    ("width", "disable_verify_graph"),
     [
-        pytest.param(4, False, False, id="kda-verify-disabled"),
-        pytest.param(4, True, True, id="verify-graph-disabled"),
-        pytest.param(3, True, False, id="unsupported-verify-width"),
+        pytest.param(4, False, id="kda-verify-default"),
+        pytest.param(4, True, id="verify-graph-disabled"),
+        pytest.param(3, False, id="unsupported-verify-width"),
     ],
 )
 def test_dp_mtp_target_fallback_is_group_wide(
     width: int,
-    kda_verify_v2: bool,
     disable_verify_graph: bool,
 ) -> None:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False)
@@ -639,14 +638,6 @@ def test_dp_mtp_target_fallback_is_group_wide(
     empty_metadata.is_dummy = True
 
     with (
-        patch(
-            "xllm.python.model_executor.runners.decode_acl_graph._KDA_VERIFY_V2",
-            kda_verify_v2,
-        ),
-        patch(
-            "xllm.python.model_executor.runners.decode_acl_graph._KDA_VERIFY_V3",
-            False,
-        ),
         patch.dict(
             os.environ,
             {"XLLM_NO_VERIFY_GRAPH": "1" if disable_verify_graph else "0"},
@@ -670,6 +661,18 @@ def test_dp_mtp_target_fallback_is_group_wide(
             torch.zeros(1, dtype=torch.int32),
             empty_metadata,
         )
+
+
+def test_kda_verify_graph_is_enabled_by_default() -> None:
+    runner = _runner()
+    metadata = _metadata(torch.tensor([1, 3], dtype=torch.int32))
+    metadata.q_cu_seq_lens = torch.arange(5, dtype=torch.int32)
+    metadata.kv_seq_lens = torch.tensor([5, 6, 9, 10], dtype=torch.int32)
+    with (
+        patch.dict(os.environ, {"XLLM_NO_VERIFY_GRAPH": "0"}),
+        patch.object(runner, "_has_compatible_decode_metadata", return_value=True),
+    ):
+        assert runner.can_execute(torch.zeros(4, dtype=torch.int32), metadata)
 
 
 def test_dp_mixed_step_does_not_enter_acl_decode_graph() -> None:

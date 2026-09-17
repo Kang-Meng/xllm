@@ -53,17 +53,6 @@ if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
     from xllm.python.model_executor.cp_utils import CpContext
 
-# KDA / MTP spec-verify configuration constants + the KDA linear-attention
-# mixin live in separate modules so the backend file is not bloated by the
-# ~1k-line delta-rule state machine and the mixin can share the constants
-# without a circular import.
-from xllm.python.attention.kda_constants import (
-    _KDA_NO_COORD,
-    _KDA_SEQWISE,
-    _KDA_VERIFY_V2,
-    _KDA_VERIFY_V3,
-    _MTP_FULL_COMMIT,
-)
 from xllm.python.attention.kda_linear_attention import (
     KdaLinearAttentionMixin,
 )
@@ -154,14 +143,14 @@ def _causal_conv1d_graph_multi(
     out_rows: int,
     activation: str = "silu",
 ) -> torch.Tensor:
-    """Graph-capturable multi-row twin of the eager V2 depthwise conv.
+    """Graph-capturable multi-row twin of the eager depthwise conv.
 
     ``cin`` is ``[B, conv_dim, state_len + R]`` (boundary tail + the R
     current rows); the causal outputs for the R rows are the K-wide windows
     STARTING at ``[0, R)``. F.conv1d lowers to an aclop NPUGraph cannot
     capture, so the conv is unrolled into the per-tap multiply-add contract
     of ``_causal_conv1d_update_graph`` — bit-compatible with that plain-decode
-    path and the eager F.conv1d path the V2 code keeps.
+    path and the eager F.conv1d path.
 
     Mirrors _causal_conv1d_update_graph's numeric contract exactly: operands
     cast to fp32, per-tap products exact in fp32, ascending accumulation,
@@ -226,6 +215,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         is_mla: bool,
         device: torch.device,
         dtype: torch.dtype,
+        num_decoding_tokens: int = 1,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -237,6 +227,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._use_fia_v2 = _HAS_FIA_V2
         self._is_mla = is_mla
         self._uses_sparse_mla = False
+        self._kda_verify_width = num_decoding_tokens
 
         self._kv_caches: list[LayerCache] = []
         self._num_kv_blocks: int | None = None
@@ -1200,260 +1191,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             out[b, :kl] = packed
         return out
 
-    def _spec_verify_v2(
-        self,
-        mixed_qkv: torch.Tensor,
-        gate: torch.Tensor,
-        beta: torch.Tensor,
-        layer: Attention,
-        idx: torch.Tensor,
-        metadata,
-        conv_cache,
-        ssm_cache,
-        recurrent_kda,
-    ) -> torch.Tensor:
-        """Graph-shaped MTP spec-verify / plain-step path for KDA layers.
-
-        Selected by ``GLM5_KDA_VERIFY_V2=1`` for every non-prefill batch once
-        this backend has seen its first spec-verify batch (plain steps before
-        that keep the exact pre-MTP simple-path behavior). Semantics match the
-        eager lazy-advance protocol bit-for-bit in op-call shapes; only the
-        bookkeeping moves from host dicts to fixed-shape device tensors so the
-        same code is ACL-graph capturable:
-
-        - ``m`` (committed rows of the previous step = kv growth) stays on
-          device; row selection becomes masking: a gate=0/beta=0 row is a
-          bit-exact state no-op for ``recurrent_kda``, so the advance is
-          always the fixed [2 rows/seq] varlen call with row1 masked by
-          ``(m == 2)``.
-        - The stash stores the previous step's CHAIN conv outputs — the eager
-          advance's conv window ([boundary, stash rows]) is identical to the
-          chain's window, so the conv is precomputed once and the advance
-          degenerates to a single recurrent call.
-        - Conv state is staged as dual tails ``[after-b, after-bd]`` per slot;
-          the next step gathers the tail indexed by ``m - 1``.
-        - The stash lives in persistent SLOT-keyed buffers (one row per linear
-          state slot) read via ``index_select`` and written via
-          ``index_copy_``, so a captured graph records their fixed addresses
-          and replay sees the per-step contents. A never-armed slot's stash
-          rows are all-zero, which the mask property already makes a state
-          no-op; the per-slot ``armed`` flag only selects the boundary source
-          (fresh cache row vs staged tail). A plain (rejection-bootstrap) step
-          writes its single row zero-padded to [2], so the next verify's
-          masked advance stays correct at a fixed [B, 2] shape.
-        - In-graph the depthwise conv uses the capture-safe per-tap mul-add
-          (F.conv1d lowers to an aclop NPUGraph cannot capture); eager keeps
-          the F.conv1d original bit-for-bit.
-        """
-        device = mixed_qkv.device
-        num_seqs = idx.shape[0]
-        rows_per_seq = mixed_qkv.shape[2] // num_seqs  # 2 verify, 1 plain
-        head_dim = layer.head_dim
-        nh = layer.num_heads_local
-        qkv_dim = layer.qkv_dim
-        conv_dim = layer.conv_dim
-        conv_state_len = layer.conv_kernel_size - 1
-        scale = 1.0 / (head_dim**0.5)
-        conv_weight = layer.conv1d.weight.squeeze(1)
-        silu = layer.activation == "silu"
-        in_graph = in_acl_graph()
-
-        st = self.__dict__.setdefault("_kda_v2", {}).setdefault(layer.layer_id, {})
-        if "armed_buf" not in st:
-            # Persistent slot-keyed stash. Allocated on the first V2 call
-            # (which happens during the graph warmup runs, i.e. before
-            # torch.npu.graph capture) so the captured region records these
-            # fixed addresses.
-            nslots = conv_cache.shape[0]
-            st["conv_out"] = torch.zeros(nslots, conv_dim, 2, dtype=mixed_qkv.dtype, device=device)
-            st["g_raw"] = torch.zeros(nslots, 2, nh, head_dim, dtype=mixed_qkv.dtype, device=device)
-            st["b_raw"] = torch.zeros(nslots, 2, nh, dtype=mixed_qkv.dtype, device=device)
-            st["tails"] = torch.zeros(2, nslots, conv_dim, conv_state_len, dtype=mixed_qkv.dtype, device=device)
-            st["kv_prev"] = torch.zeros(nslots, dtype=torch.int64, device=device)
-            st["armed_buf"] = torch.zeros(nslots, dtype=torch.bool, device=device)
-            st["ever_armed"] = False
-
-        # Tokenwise per-row KV lengths. The chunked-typed (expanded) verify
-        # flow exposes [kv-1, kv] pairs per sequence on the expanded
-        # metadata; the plain eager flow keeps per-row kv_seq_lens. Both
-        # give one value per flattened row.
-        expanded = resolve_expanded_decode_metadata(metadata)
-        kv_src = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
-        # Per-step hoist: kv_rows/base_now/m are layer-independent (same
-        # metadata tensor across layers of the step); recompute only when the
-        # source buffer changes.
-        hoist = getattr(self, "_v2_kv_hoist", None)
-        if hoist is not None and hoist[0] == kv_src.data_ptr() and hoist[1] == num_seqs:
-            base_now, m = hoist[2], hoist[3]
-        else:
-            kv_rows = kv_src.to(device=device, dtype=torch.int64)
-            # Per-sequence committed base = kv length of each group's row 0.
-            base_now = kv_rows.view(num_seqs, -1)[:, 0].contiguous()
-            armed_h = st["armed_buf"].index_select(0, idx)
-            kv_prev_h = st["kv_prev"].index_select(0, idx)
-            m = torch.where(armed_h, (base_now - kv_prev_h).clamp(min=1, max=2), torch.ones_like(base_now))
-            self._v2_kv_hoist = (kv_src.data_ptr(), num_seqs, base_now, m)
-
-        stash_g = st["g_raw"].index_select(0, idx)  # [B, 2, nh, hd]
-        tails_all = st["tails"].index_select(1, idx)  # [2, B, C, K-1]
-
-        # ---- 1) boundary conv state + current-row conv chain ----
-        # conv cache rows are [Ks, C]; restore the [C, Ks] compute layout.
-        cache_boundary = conv_cache.index_select(0, idx).transpose(1, 2).contiguous()
-        # Dual-tail selection by m (m=1 -> after-b, m=2 -> after-bd), then
-        # the armed fallback to the live cache row. Two [B, 1, 1]-cond wheres
-        # replace the materialized-index gather (3 kernels -> 2).
-        m2 = (m == 2).view(num_seqs, 1, 1)
-        boundary = torch.where(m2, tails_all[1], tails_all[0])
-        boundary = torch.where(st["armed_buf"].index_select(0, idx).view(num_seqs, 1, 1), boundary, cache_boundary)
-        # Cold-start masking mirrors the eager entry: has_initial_state == 0
-        # means the slot's cached state is invalid, so chain from zeros.
-        his = getattr(metadata, "has_initial_state", None)
-        warm = None
-        if his is not None:
-            if isinstance(his, torch.Tensor):
-                warm = his.to(device=device, dtype=torch.bool)
-            else:
-                warm = torch.tensor(his, dtype=torch.bool, device=device)
-            if warm.numel() == num_seqs * rows_per_seq:
-                warm = warm.view(num_seqs, rows_per_seq)[:, 0].contiguous()
-        if warm is not None:
-            boundary = torch.where(warm.view(num_seqs, 1, 1), boundary, torch.zeros_like(boundary))
-        # mixed_qkv arrives as the packed [1, conv_dim, T] layout; regroup to
-        # [B, conv_dim, rows_per_seq] (reshape+permute — a direct view is not
-        # stride-compatible with the channel-major packing).
-        x = mixed_qkv.reshape(conv_dim, num_seqs, rows_per_seq).permute(1, 0, 2).contiguous()
-        cin = torch.cat([boundary.to(x.dtype), x], dim=-1)
-        if in_graph:
-            conv_out = _causal_conv1d_graph_multi(cin, conv_weight, rows_per_seq, layer.activation)
-        else:
-            # Depthwise conv on NPU: the padding=0 + tail-slice form is
-            # rejected ("non-positive stride"); the proven eager convention
-            # is padding = W-1 then keep the causal segment outputs
-            # result[Ks : Ks + R] (result[i] spans [i-p, i]).
-            _cin_c = cin.to(conv_weight.dtype).contiguous()
-            _cw = conv_weight.unsqueeze(1).contiguous()
-            conv_out = torch.nn.functional.conv1d(
-                _cin_c,
-                _cw,
-                bias=None,
-                padding=conv_state_len,
-                groups=conv_dim,
-            )[..., conv_state_len : conv_state_len + rows_per_seq]
-            if silu:
-                conv_out = torch.nn.functional.silu(conv_out)
-            conv_out = conv_out.to(x.dtype)
-        # Dual tails: window ending after row0 / after the full group.
-        tail_b = cin[..., 1 : 1 + conv_state_len]
-        tail_full = cin[..., -conv_state_len:]
-        if rows_per_seq == 2:
-            tails_new = torch.stack([tail_b, tail_full], dim=0)
-        else:
-            tails_new = torch.stack([tail_full, tail_full], dim=0)
-
-        # ---- 2) advance the live ssm state by the stashed rows ----
-        # Always the fixed [B, 2] call: row0 advances unless the slot was
-        # never armed (all-zero stash rows — a no-op by the mask property);
-        # row1 only when m == 2 (a gate=0/beta=0 row is a bit-exact state
-        # no-op — the verified property that keeps this fixed-shape call
-        # correct for both acceptance outcomes and for plain steps, whose
-        # row1 is written zero).
-        row_mask = st.setdefault("row_mask_buf", {}).get(num_seqs)
-        if row_mask is None:
-            row_mask = torch.ones(num_seqs, 2, 1, 1, device=device, dtype=stash_g.dtype)
-            st.setdefault("row_mask_buf", {})[num_seqs] = row_mask
-        row_mask[:, 0].fill_(1.0)
-        row_mask[:, 1] = (m == 2).view(-1, 1, 1).to(row_mask.dtype)
-        a_g = stash_g * row_mask
-        a_b = st["b_raw"].index_select(0, idx) * row_mask[..., 0]
-        a_split = st["conv_out"].index_select(0, idx).transpose(1, 2).split(qkv_dim, dim=-1)
-        aq = a_split[0].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        ak = a_split[1].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        av = a_split[2].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        a_cu = torch.arange(num_seqs + 1, dtype=torch.int32, device=device) * 2
-        _, st_adv = recurrent_kda(
-            aq,
-            ak,
-            av,
-            a_g.reshape(-1, nh, head_dim).to(torch.float32),
-            a_b.reshape(-1, nh).to(torch.float32),
-            initial_state=ssm_cache.index_select(0, idx),
-            cu_seqlens=a_cu,
-            layout="TND",
-            scale=scale,
-            output_final_state=True,
-            inplace_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=False,
-            use_beta_sigmoid_in_kernel=False,
-            state_v_first=True,
-        )
-        if isinstance(st_adv, tuple):
-            st_adv = st_adv[1] if st_adv[1] is not None else st_adv[0]
-        ssm_post = st_adv.to(ssm_cache.dtype)
-        ssm_cache.index_copy_(0, idx, ssm_post.contiguous())
-        # Every layer persists its own conv boundary (the advance leaves the
-        # live conv state at the boundary; the chain rows do not commit).
-        conv_cache.index_copy_(0, idx, boundary.transpose(1, 2).contiguous())
-
-        # ---- 3) read-only chain of the current rows for the outputs ----
-        c_split = conv_out.transpose(1, 2).split(qkv_dim, dim=-1)
-        cq = c_split[0].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        ck = c_split[1].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        cv = c_split[2].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        if gate.dim() == 3:
-            gate = gate.view(num_seqs, rows_per_seq, nh * head_dim)
-        cur_g = gate.view(num_seqs, rows_per_seq, nh, head_dim)
-        cur_b = beta.view(num_seqs, rows_per_seq, nh)
-        v_cu = torch.arange(num_seqs + 1, dtype=torch.int32, device=device) * rows_per_seq
-        _g_flat = cur_g.reshape(-1, nh, head_dim).to(torch.float32)
-        _b_flat = cur_b.reshape(-1, nh).to(torch.float32)
-        chain_init = ssm_cache.index_select(0, idx)
-        if warm is not None:
-            chain_init = torch.where(warm.view(num_seqs, 1, 1, 1), chain_init, torch.zeros_like(chain_init))
-        core_out = recurrent_kda(
-            cq,
-            ck,
-            cv,
-            _g_flat,
-            _b_flat,
-            initial_state=chain_init,
-            cu_seqlens=v_cu,
-            layout="TND",
-            scale=scale,
-            output_final_state=False,
-            inplace_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=False,
-            use_beta_sigmoid_in_kernel=False,
-            state_v_first=True,
-        )
-        if isinstance(core_out, tuple):
-            core_out = core_out[0]
-
-        # ---- 4) stash the current group for the next step's advance ----
-        if rows_per_seq == 2:
-            stash_c = conv_out
-            stash_g_new = cur_g
-            stash_b_new = cur_b
-        else:
-            # Plain step: zero-pad row1 so the next verify's [B, 2] masked
-            # advance stays correct at the fixed shape.
-            stash_c = torch.cat([conv_out, torch.zeros_like(conv_out)], -1)
-            stash_g_new = torch.cat([cur_g, torch.zeros_like(cur_g)], dim=1)
-            stash_b_new = torch.cat([cur_b, torch.zeros_like(cur_b)], dim=1)
-        st["conv_out"].index_copy_(0, idx, stash_c.to(st["conv_out"].dtype).contiguous())
-        st["g_raw"].index_copy_(0, idx, stash_g_new.to(st["g_raw"].dtype).contiguous())
-        st["b_raw"].index_copy_(0, idx, stash_b_new.to(st["b_raw"].dtype).contiguous())
-        st["tails"].index_copy_(1, idx, tails_new.to(st["tails"].dtype).contiguous())
-        st["kv_prev"].index_copy_(0, idx, base_now)
-        st["armed_buf"].index_fill_(0, idx, True)
-        st["ever_armed"] = True
-
-        # [T, nh, hd] packed rows back to the [1, S, nh, hd] flat layout the
-        # model layer expects (matches the eager branch's reshape).
-        return core_out.view(1, num_seqs * rows_per_seq, nh, head_dim)
-
     def _spec_verify_v3(
         self,
         mixed_qkv: torch.Tensor,
@@ -1468,9 +1205,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     ) -> torch.Tensor:
         """Fused multi-slot MTP spec-verify / plain-step path for KDA layers.
 
-        Selected by ``GLM5_KDA_VERIFY_V3=1``. Replaces V2's host ``m`` state
-        machine + 6-buffer slot stash with the vllm-ascend fused in-kernel-spec
-        contract: a persistent per-layer combined ``[base | draft]`` state pool
+        The default KDA verify path uses the fused in-kernel-spec contract:
+        a persistent per-layer combined ``[base | draft]`` state pool
         and a single ``recurrent_kda`` call per layer that advances BOTH the
         confirmed (base) and draft (draft) tokens in one multi-token pass,
         writing each token's resulting state to its own slot so both outcomes
@@ -1487,8 +1223,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         - ``num_accepted_tokens=1`` always resumes from the base slot, which
           holds the *selected* running state (after-b from a rejection, or
           after-d copied base<-draft when the previous draft was accepted).
-          The selection is a fixed-shape ``where`` on device tensors, not a
-          host branch.
+          The selection uses device-side slot gathers independently of the
+          current step's width, not a host branch.
+        - Pools use the configured maximum decoding width so changing widths
+          never reallocates storage referenced by captured graphs. Cumulative
+          lengths are cached by both sequence count and current width.
         - The C++ conv/ssm pools remain the source of truth for plain/prefill
           steps: at verify entry the committed running state is copied into
           the combined base region; at exit after-b (always accepted) is
@@ -1500,6 +1239,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         device = mixed_qkv.device
         num_seqs = idx.shape[0]
         rows_per_seq = mixed_qkv.shape[2] // num_seqs  # 2 verify, 1 plain
+        if not 1 <= rows_per_seq <= self._kda_verify_width:
+            raise ValueError(
+                f"KDA verify width {rows_per_seq} exceeds configured decoding width {self._kda_verify_width}"
+            )
         head_dim = layer.head_dim
         nh = layer.num_heads_local
         qkv_dim = layer.qkv_dim
@@ -1512,20 +1255,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
         st = self.__dict__.setdefault("_kda_v3", {}).setdefault(layer.layer_id, {})
         if "armed_buf" not in st:
-            # Persistent combined [base | draft0 | ... | draft{R-1}] pools.
-            # Slot j = idx + j*nslots (base at 0, draft_j at j*nslots). Sized
-            # for rows_per_seq slots so MTP>1 (R = num_speculative_tokens+1) is
-            # supported: the first call is always a verify step (plain reject
-            # steps only enter via the ever_armed gate after a verify armed the
-            # slots), so rows_per_seq here is the fixed verify expansion.
-            pool_slots = rows_per_seq * nslots
+            pool_slots = self._kda_verify_width * nslots
             st["combined_conv"] = torch.zeros(
                 pool_slots, conv_state_len, conv_dim, dtype=conv_cache.dtype, device=device
             )
             st["combined_ssm"] = torch.zeros(pool_slots, nh, head_dim, head_dim, dtype=ssm_cache.dtype, device=device)
             st["kv_prev"] = torch.zeros(nslots, dtype=torch.int64, device=device)
             st["armed_buf"] = torch.zeros(nslots, dtype=torch.bool, device=device)
-            st["ever_armed"] = False
         combined_conv = st["combined_conv"]
         combined_ssm = st["combined_ssm"]
         kv_prev = st["kv_prev"]
@@ -1545,7 +1281,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         base_now = kv_rows.view(num_seqs, -1)[:, 0].contiguous()
         armed_h = armed_buf.index_select(0, idx)
         kv_prev_h = kv_prev.index_select(0, idx)
-        m = torch.where(armed_h, (base_now - kv_prev_h).clamp(min=1, max=rows_per_seq), torch.ones_like(base_now))
+        accepted_counts = torch.where(
+            armed_h,
+            (base_now - kv_prev_h).clamp(min=1, max=self._kda_verify_width),
+            torch.ones_like(base_now),
+        )
 
         idx64 = idx if idx.dtype == torch.int64 else idx.to(torch.int64)
         idx32 = idx64.to(torch.int32)
@@ -1554,27 +1294,21 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         combined_conv[:nslots].index_copy_(0, idx64, conv_cache.index_select(0, idx64))
         combined_ssm[:nslots].index_copy_(0, idx64, ssm_cache.index_select(0, idx64))
 
-        # ssm_state_indices: packed 1D [base, d0, ..., d{R-1}] per seq, where
-        # slot j = idx + j*nslots. Length = num_seqs*rows_per_seq = total_tokens,
-        # so it satisfies the kernel's packed-1D (>= total_tokens) check for
-        # any MTP depth. The kernel reads the initial slot at index (m-1) per
-        # seq (ResolveInitialStateSlot) and writes each token's state to its own
-        # slot (CopyOutState) — see recurrent_kda.h. This stays on the packed-1D
-        # path; the 2D speculative mode is an upstream-bug mode
-        # (docs/mtp_graph_verify_design.md B8) and is NOT used here.
         slot_offsets = torch.arange(rows_per_seq, dtype=torch.int32, device=device) * nslots
         ssm_state_indices = (idx32.view(-1, 1) + slot_offsets.view(1, -1)).reshape(-1)
-        qsl_buf = st.setdefault("qsl_buf", {}).get(num_seqs)
+        qsl_key = (num_seqs, rows_per_seq)
+        qsl_buf = st.setdefault("qsl_buf", {}).get(qsl_key)
         if qsl_buf is None:
             qsl_buf = torch.arange(num_seqs + 1, dtype=torch.int32, device=device) * rows_per_seq
-            st["qsl_buf"][num_seqs] = qsl_buf
+            st["qsl_buf"][qsl_key] = qsl_buf
 
         # ---- 2) conv-boundary select (slot m-1: prev last-accepted state) ----
         # Boundary = running conv state after the previous step's last accepted
         # token = slot (m-1) per seq (0=base/reject, 1=draft0 accept, ...,
         # R-1=all-accepted). Generalizes the legacy 2-way where(m2, draft, base).
-        boundary_slot = idx64 + (m.to(torch.int64) - 1) * nslots  # [S]
+        boundary_slot = idx64 + (accepted_counts - 1) * nslots
         sel_conv = combined_conv.index_select(0, boundary_slot)  # [S, Ks, C]
+        combined_ssm.index_copy_(0, idx64, combined_ssm.index_select(0, boundary_slot))
 
         # ---- 3) conv (per-tap, bit-exact, graph-capturable) ----
         cache_boundary = sel_conv.transpose(1, 2).contiguous()  # [S, C, Ks]
@@ -1616,11 +1350,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         b_flat = cur_b.reshape(-1, nh).to(torch.float32)
 
         # ---- 5) fused multi-slot recurrent: advance [b, d0, ..., d{R-1}] ----
-        # ssm_state_indices 1D packed [b0, d0_0, ..., base1, ...]; per-seq
-        # num_accepted_tokens (m = prev accepted count, 1..R) drives the
-        # in-kernel initial-state slot selection (slot m-1) -- no python ssm
-        # select. inplace writes each token's state to its own slot
-        # (after-b->base, after-dj->draft_j).
         ret = recurrent_kda(
             q,
             k,
@@ -1630,7 +1359,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             initial_state=combined_ssm,
             cu_seqlens=qsl_buf,
             ssm_state_indices=ssm_state_indices,
-            num_accepted_tokens=m.to(torch.int32),
+            num_accepted_tokens=torch.ones_like(idx32),
             layout="TND",
             scale=scale,
             output_final_state=True,
@@ -1649,7 +1378,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # ---- 8) bookkeeping for next step's m ----
         kv_prev.index_copy_(0, idx64, base_now)
         armed_buf.index_fill_(0, idx64, True)
-        st["ever_armed"] = True
         return core_out.view(1, num_seqs * rows_per_seq, nh, head_dim)
 
     def _mla_sparse(

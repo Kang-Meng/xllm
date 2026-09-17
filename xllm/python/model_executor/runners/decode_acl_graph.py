@@ -44,7 +44,6 @@ from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
 )
-from xllm.python.attention.kda_constants import _KDA_VERIFY_V2, _KDA_VERIFY_V3
 from xllm.python.model_executor.execution_context import (
     allocate_graph_execution_contexts,
     update_graph_execution_contexts,
@@ -214,14 +213,6 @@ class DecodeAclGraphRunner(BaseRunner):
         if is_expanded_spec_verify:
             lsi = getattr(metadata, "linear_state_indices", None)
             has_kda_layers = lsi is not None and lsi.numel() > 0
-            if has_kda_layers:
-                # KDA linear-attention layers need the V2 or V3 spec-verify
-                # protocol to advance their recurrent state across per-token
-                # rows; without it the graph reuses one linear_state_indices
-                # entry per token row and corrupts the KDA state. Refuse graph
-                # admission when both protocols are off (eager still works).
-                if not (_KDA_VERIFY_V2 or _KDA_VERIFY_V3):
-                    return False
             seq_count = lsi.numel() if has_kda_layers else batch_size
             size_check_bs = seq_count
             # The captured bucket is a power of two (1/2/4/8/16k) but the
@@ -1414,14 +1405,6 @@ class DecodeAclGraphRunner(BaseRunner):
         # would leave each sequence's recurrent state several steps ahead.
         # Snapshot the touched state slots and restore them after capture.
         linear_snapshot = self._snapshot_linear_state(entry)
-        # The spec-verify V2 stash (backend-owned persistent buffers) follows
-        # the same lifecycle: the warmup/capture runs consume and rewrite it,
-        # so restore the entry contents or the first replay would advance
-        # from a stash several steps stale.
-        v2_snapshot = None
-        v2_snap_fn = getattr(self.attention_backend, "snapshot_kda_v2_state", None)
-        if v2_snap_fn is not None and entry.static_metadata.linear_state_indices is not None:
-            v2_snapshot = v2_snap_fn(entry.static_metadata.linear_state_indices)
         # V3 combined [base|draft0|...|draft{R-1}] pools follow the same
         # lifecycle (warmup + capture advance them); restore entry contents or
         # the first replay resumes from a state several steps stale.
@@ -1437,7 +1420,7 @@ class DecodeAclGraphRunner(BaseRunner):
             execution_state=entry.execution_state,
             execution_contexts=entry.execution_contexts,
         )
-        # The snapshots above (linear/v2/v3) read conv/ssm state on the
+        # The snapshots above (linear/v3) read conv/ssm state on the
         # current (default) stream, while the warmup forward below advances
         # that state on self._stream. NPU cross-stream accesses to the same
         # memory are not auto-serialized, so make the warmup stream wait for
@@ -1463,10 +1446,6 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
         self._restore_linear_state(entry, linear_snapshot)
-        if v2_snapshot is not None:
-            restore_fn = getattr(self.attention_backend, "restore_kda_v2_state", None)
-            if restore_fn is not None:
-                restore_fn(v2_snapshot)
         if v3_snapshot is not None:
             v3_restore_fn = getattr(self.attention_backend, "restore_kda_v3_state", None)
             if v3_restore_fn is not None:

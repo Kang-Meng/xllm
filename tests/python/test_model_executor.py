@@ -242,19 +242,22 @@ class TestCreateAttentionBackend:
         "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
         StubAttentionBackend,
     )
-    def test_npu_device_creates_npu_backend(self, _mock_is_npu):
+    @pytest.mark.parametrize("num_decoding_tokens", [1, 4])
+    def test_npu_device_creates_npu_backend(self, _mock_is_npu: MagicMock, num_decoding_tokens: int) -> None:
         attn = _make_attention_layer(num_kv_heads=1, head_dim=256)
         backend = _create_attention_backend(
             attn,
             torch.device("npu"),
             torch.float16,
             {"enable_mla": False},
+            num_decoding_tokens=num_decoding_tokens,
         )
         assert isinstance(backend, StubAttentionBackend)
         assert backend.init_kwargs["num_heads"] == 8
         assert backend.init_kwargs["num_kv_heads"] == 1
         assert backend.init_kwargs["head_dim"] == 256
         assert backend.init_kwargs["is_mla"] is False
+        assert backend.init_kwargs["num_decoding_tokens"] == num_decoding_tokens
 
     @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
@@ -345,6 +348,37 @@ class TestCreateAttentionBackend:
 
 
 class TestModelExecutorConstruction:
+    @pytest.mark.parametrize("graph_backend", ["off", "aclgraph"])
+    @pytest.mark.parametrize("explicit_width,config_depth,expected_width", [(1, 0, 1), (1, 3, 4), (4, 1, 4)])
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_decoding_width_reaches_backend_and_graph_runner(
+        self,
+        mock_create: MagicMock,
+        mock_graph_runner: MagicMock,
+        graph_backend: str,
+        explicit_width: int,
+        config_depth: int,
+        expected_width: int,
+    ) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        ModelExecutor(
+            _FakeModel(num_layers=1),
+            {
+                "python_graph_backend": graph_backend,
+                "num_speculative_tokens": config_depth,
+                "max_position_embeddings": 128,
+            },
+            max_seqs_per_batch=4,
+            num_decoding_tokens=explicit_width,
+        )
+
+        assert mock_create.call_args.kwargs["num_decoding_tokens"] == expected_width
+        if graph_backend == "aclgraph":
+            assert mock_graph_runner.call_args.kwargs["num_decoding_tokens"] == expected_width
+        else:
+            mock_graph_runner.assert_not_called()
+
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
         return_value=StubAttentionBackend(),
@@ -891,20 +925,10 @@ class TestDecodeAclGraphSpeculativeMetadata:
             q_cu_seq_lens=None,
         )
 
-        # linear_state_indices marks KDA layers, whose recurrent state only
-        # advances across per-token verify rows under the V2/V3 spec-verify
-        # protocol; with both off, graph admission is refused (eager fallback).
-        # Enable V2 so the seq-count bucketing path under test is reachable.
-        with (
-            patch(
-                "xllm.python.model_executor.runners.decode_acl_graph._KDA_VERIFY_V2",
-                True,
-            ),
-            patch.object(
-                runner,
-                "_has_compatible_decode_metadata",
-                return_value=True,
-            ),
+        with patch.object(
+            runner,
+            "_has_compatible_decode_metadata",
+            return_value=True,
         ):
             assert runner.can_execute(
                 torch.zeros(32, dtype=torch.int32),

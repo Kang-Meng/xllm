@@ -49,6 +49,7 @@ def _create_attention_backend(
     dtype: torch.dtype,
     config: dict | None = None,
     max_num_reqs: int = 1,
+    num_decoding_tokens: int = 1,
 ) -> AttentionBackend:
     config = config or {}
     model_type = config.get("model_type", "")
@@ -102,6 +103,7 @@ def _create_attention_backend(
             is_mla=bool(config.get("enable_mla", False)),
             device=device,
             dtype=dtype,
+            num_decoding_tokens=num_decoding_tokens,
         )
     if current_platform.is_cuda():
         from xllm.python.attention.flashinfer import FlashInferBackend
@@ -156,12 +158,14 @@ class ModelExecutor:
         first_parameter = next(model.parameters())
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
+        num_decoding_tokens = max(int(num_decoding_tokens), int(config.get("num_speculative_tokens", 0)) + 1)
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
             first_parameter.dtype,
             config,
             max_seqs_per_batch,
+            num_decoding_tokens=num_decoding_tokens,
         )
 
         execution_model = model.model
@@ -237,10 +241,7 @@ class ModelExecutor:
                 # the max of the explicit ctor param and the config-derived
                 # width so a caller that passes num_decoding_tokens still wins
                 # (single source of truth, no param/config divergence).
-                num_decoding_tokens=max(
-                    int(num_decoding_tokens),
-                    int(config.get("num_speculative_tokens", 0)) + 1,
-                ),
+                num_decoding_tokens=num_decoding_tokens,
                 enable_mega_moe_token_mask=bool(
                     config.get("enable_mega_moe", False) and token_owner_mega_moe_provider is None
                 ),
