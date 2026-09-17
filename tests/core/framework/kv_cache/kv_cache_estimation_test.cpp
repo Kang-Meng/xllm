@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/parallel_config.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/model/model_args.h"
 
@@ -545,15 +546,9 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
   KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
 
   EXPECT_EQ(capacity.swa_count(), 35);
-#if defined(USE_MLU)
-  EXPECT_EQ(capacity.c4_count(), 64);
-  EXPECT_EQ(capacity.c128_count(), 2);
-  EXPECT_EQ(capacity.n_blocks(), 256);
-#else
-  EXPECT_EQ(capacity.c4_count(), 96);
-  EXPECT_EQ(capacity.c128_count(), 3);
-  EXPECT_EQ(capacity.n_blocks(), 384);
-#endif
+  EXPECT_GT(capacity.c4_count(), 0);
+  EXPECT_EQ(capacity.c4_count(), capacity.c128_count());
+  EXPECT_EQ(capacity.n_blocks(), capacity.c4_count() * 16);
 }
 
 TEST(KVCacheEstimationTest, DeepSeekV4RejectsBudgetWithoutCompressedCacheUnit) {
@@ -733,10 +728,10 @@ TEST(KVCacheEstimationTest, DeepSeekV4FlashPrefillSwaRingMatchesShippedShape) {
       .index_head_dim(128)
       .index_n_heads(64)
       .window_size(128)
-      .compress_ratios({0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-                        4, 0, 0, 0});
+      .compress_ratios({0, 0,   4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 0,   0, 0});
 
   KVCacheEstimateOptions options;
   options.dtype = torch::kBFloat16;
@@ -846,7 +841,7 @@ TEST(KVCacheEstimationTest, DeepSeekV4PrefixCacheKeepsOperationalSwaPool) {
       estimate_kv_cache_capacity(model_args, options);
 
   ASSERT_GT(capacity.c128_count(), 0);
-  EXPECT_EQ(capacity.c4_count(), 32 * capacity.c128_count());
+  EXPECT_EQ(capacity.c4_count(), capacity.c128_count());
   EXPECT_EQ(capacity.swa_count(), 22);
 }
 
@@ -884,7 +879,7 @@ TEST(KVCacheEstimationTest,
   EXPECT_EQ(capacity.swa_count(), 102);
   EXPECT_GT(capacity.c4_count(), 0);
   EXPECT_GT(capacity.c128_count(), 0);
-  EXPECT_EQ(capacity.c4_count(), 32 * capacity.c128_count());
+  EXPECT_EQ(capacity.c4_count(), capacity.c128_count());
 }
 
 TEST(KVCacheEstimationTest, DeepSeekV4DecodeKeepsOperationalSwaPool) {
@@ -995,9 +990,10 @@ TEST(KVCacheEstimationTest,
   const int64_t scale_bytes =
       cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
   const int64_t c4_block_bytes =
-      128 * (16 * 4 + 8 * cache_policy.index_dtype_size + scale_bytes);
-  const int64_t c128_block_bytes = 128 * 16 * 4;
-  const int64_t compressed_unit_bytes = 32 * c4_block_bytes + c128_block_bytes;
+      kDsv4C4PhysicalBlockSize *
+      (16 * 4 + 8 * cache_policy.index_dtype_size + scale_bytes);
+  const int64_t c128_block_bytes = kDsv4C128PhysicalBlockSize * 16 * 4;
+  const int64_t compressed_unit_bytes = c4_block_bytes + c128_block_bytes;
   constexpr int64_t kTargetSwaBytes = 35 * 90112;
   constexpr int64_t kDraftSwaBytes =
       /*layers=*/3 * /*swa_count=*/35 * /*block_size=*/128 *
@@ -1024,11 +1020,11 @@ TEST(KVCacheEstimationTest,
   EXPECT_LE(capacity.cache_size_in_bytes() + kDraftSwaBytes,
             target_options.cache_size_in_bytes);
   EXPECT_EQ(capacity.swa_count(), 35);
-  EXPECT_EQ(capacity.c4_count(), 64);
+  EXPECT_EQ(capacity.c4_count(), 2);
   EXPECT_EQ(capacity.c128_count(), 2);
   EXPECT_EQ(capacity.swa_count(), target_only_capacity.swa_count());
-  EXPECT_EQ(capacity.c4_count() + 64, target_only_capacity.c4_count());
-  EXPECT_EQ(capacity.c128_count() + 2, target_only_capacity.c128_count());
+  EXPECT_GT(target_only_capacity.c4_count(), capacity.c4_count());
+  EXPECT_EQ(target_only_capacity.c4_count(), target_only_capacity.c128_count());
   EXPECT_LT(capacity.n_blocks(), target_only_capacity.n_blocks());
 }
 

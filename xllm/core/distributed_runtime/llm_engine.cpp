@@ -720,10 +720,19 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
              static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
         << "DSV4 swa_count exceeds uint32_t range: "
         << kv_cache_cap.swa_count();
+    CHECK_LE(kv_cache_cap.c4_count(),
+             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+        << "DSV4 c4_count exceeds uint32_t range: " << kv_cache_cap.c4_count();
+    CHECK_LE(kv_cache_cap.c128_count(),
+             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+        << "DSV4 c128_count exceeds uint32_t range: "
+        << kv_cache_cap.c128_count();
 
     options.sliding_window_size(static_cast<uint32_t>(effective_window))
         .swa_blocks_per_seq(swa_blocks_per_seq)
         .swa_num_blocks(static_cast<uint32_t>(kv_cache_cap.swa_count()))
+        .c4_num_blocks(static_cast<uint32_t>(kv_cache_cap.c4_count()))
+        .c128_num_blocks(static_cast<uint32_t>(kv_cache_cap.c128_count()))
         .max_tokens_per_batch(options_.max_tokens_per_batch())
         .manager_types(std::move(manager_types))
         .compress_ratios(std::move(manager_compress_ratios));

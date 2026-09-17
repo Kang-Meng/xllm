@@ -147,12 +147,15 @@ BlockManagerPool::Options typed_hierarchy_options() {
       .manager_types({1u, 0u, 0u})
       .compress_ratios({0u, 4u, 128u})
       .swa_num_blocks(256)
+      .c4_num_blocks(256)
+      .c128_num_blocks(256)
       .swa_blocks_per_seq(2)
       .sliding_window_size(16)
       .max_tokens_per_batch(4096)
       .max_seqs_per_batch(1)
-      .host_num_blocks_by_type(
-          {{BlockType::SWA, 512}, {BlockType::C4, 128}, {BlockType::C128, 16}});
+      .host_num_blocks_by_type({{BlockType::SWA, 512},
+                                {BlockType::C4, 512},
+                                {BlockType::C128, 512}});
   return options;
 }
 
@@ -459,7 +462,7 @@ TEST(TypedMtpPrefixCacheTest, CompressedCheckpointRequiresNextToken) {
   ASSERT_EQ(sequence.hash_tokens(BlockHasherType::MTP_TEXT).size(), 2049u);
   manager.cache_full_blocks_for_sequence(&sequence);
   EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C128), 1u);
-  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C4), 32u);
+  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C4), 1u);
   EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::SWA), 128u);
   std::vector<int32_t> confirmed = tokens;
   confirmed.reserve(tokens.size() + 1);
@@ -618,8 +621,8 @@ TEST(TypedMtpPrefixCacheTest, StoreQueriesOnlyCompleteDependencyUnits) {
     EXPECT_EQ(completed, ready);
     ready_done = true;
   });
-  // One C128 checkpoint, 32 C4 blocks, and its two-block SWA window.
-  ASSERT_EQ(engine.queries().size(), 35u);
+  // One C128 checkpoint, one C4 block, and its two-block SWA window.
+  ASSERT_EQ(engine.queries().size(), 4u);
   EXPECT_FALSE(ready_done);
   engine.finish_prefetch();
   ASSERT_TRUE(ready_done);

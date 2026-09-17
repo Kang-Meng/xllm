@@ -138,7 +138,7 @@ class CompositeBlockManager : public BlockManager {
   // RL sleep/wakeup: fan out to every leaf (non-prefix leaves are a no-op).
   void reset_prefix_cache() override;
 
-  // Stats reported from the single capacity leaf (see capacity_leaf()).
+  // Stats are normalized to the composite's base scheduler block size.
   size_t num_blocks_in_prefix_cache() const override;
   size_t num_free_blocks() const override;
   size_t num_used_blocks() const override;
@@ -155,11 +155,6 @@ class CompositeBlockManager : public BlockManager {
   friend class BlockManagerPoolTestPeer;
 
   BlockManager* leaf_of(BlockType type) const;
-
-  // The admission leaf whose raw block count defines the pool's
-  // scheduler-facing capacity unit. Picks the finest-grained admission leaf
-  // (smallest block_size): KV for flat layouts, C4 for compressed layouts.
-  const LeafEntry* capacity_leaf() const;
 
   static LeafCombination classify_leaf_combination(const LeafMap& leaves);
 
