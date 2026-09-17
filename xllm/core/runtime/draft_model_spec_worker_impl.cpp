@@ -326,17 +326,9 @@ void DraftModelSpecWorkerImpl::init_embedding_cache(int64_t num_blocks) {
   }
 }
 
-bool DraftModelSpecWorkerImpl::allocate_kv_cache(
-    const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
-  init_embedding_cache(num_blocks);
-  CHECK(impl_ != nullptr);
-  CHECK(draft_impl_ != nullptr);
-  prepare_hierarchy_kv_cache_transfers();
-
-  const auto allocate = [](WorkerImpl& worker, const KVCacheShape& shape) {
-    return worker.allocate_kv_cache(shape);
-  };
+bool DraftModelSpecWorkerImpl::allocate_pools(
+    const KVCacheShape& kv_cache_shape,
+    const AllocateFn& allocate) {
   const bool target_allocated = allocate_pool_if_loaded(
       *impl_,
       [&]() -> const KVCacheShape& { return kv_cache_shape; },
@@ -346,6 +338,7 @@ bool DraftModelSpecWorkerImpl::allocate_kv_cache(
       [&] { return draft_kv_cache_shape(kv_cache_shape); },
       allocate);
 
+  init_embedding_cache(kv_cache_shape.key_cache_shape()[0]);
   const bool allocated = target_allocated && draft_allocated;
   if (allocated) {
     finalize_hierarchy_kv_cache_transfers();
@@ -353,10 +346,21 @@ bool DraftModelSpecWorkerImpl::allocate_kv_cache(
   return allocated;
 }
 
+bool DraftModelSpecWorkerImpl::allocate_kv_cache(
+    const KVCacheShape& kv_cache_shape) {
+  CHECK(impl_ != nullptr);
+  CHECK(draft_impl_ != nullptr);
+  prepare_hierarchy_kv_cache_transfers();
+
+  return allocate_pools(kv_cache_shape,
+                        [](WorkerImpl& worker, const KVCacheShape& shape) {
+                          return worker.allocate_kv_cache(shape);
+                        });
+}
+
 #if defined(USE_NPU) || defined(USE_MLU)
 bool DraftModelSpecWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
   prepare_hierarchy_kv_cache_transfers();
@@ -372,24 +376,11 @@ bool DraftModelSpecWorkerImpl::allocate_kv_cache_with_transfer(
     kv_cache_transfer_->initialize(device_id);
   }
 
-  const auto allocate = [this](WorkerImpl& worker, const KVCacheShape& shape) {
-    return worker.allocate_kv_cache_with_transfer(kv_cache_transfer_, shape);
-  };
-  const bool target_allocated = allocate_pool_if_loaded(
-      *impl_,
-      [&]() -> const KVCacheShape& { return kv_cache_shape; },
-      allocate);
-  const bool draft_allocated = allocate_pool_if_loaded(
-      *draft_impl_,
-      [&] { return draft_kv_cache_shape(kv_cache_shape); },
-      allocate);
-
-  init_embedding_cache(num_blocks);
-  const bool allocated = target_allocated && draft_allocated;
-  if (allocated) {
-    finalize_hierarchy_kv_cache_transfers();
-  }
-  return allocated;
+  return allocate_pools(kv_cache_shape,
+                        [this](WorkerImpl& worker, const KVCacheShape& shape) {
+                          return worker.allocate_kv_cache_with_transfer(
+                              kv_cache_transfer_, shape);
+                        });
 }
 #endif
 

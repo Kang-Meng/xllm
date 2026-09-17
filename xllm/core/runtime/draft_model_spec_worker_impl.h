@@ -101,6 +101,12 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl {
     CHECK_EQ(status, WorkerImpl::Status::READY);
     return true;
   }
+  using AllocateFn = std::function<bool(WorkerImpl&, const KVCacheShape&)>;
+  // Allocates both KV pools via `allocate`, then unconditionally (re)builds the
+  // draft embedding cache. The hierarchy transfer is finalized only when both
+  // pools succeed.
+  bool allocate_pools(const KVCacheShape& kv_cache_shape,
+                      const AllocateFn& allocate);
 
   // Target-side cache budget after reserving storage for the colocated draft.
   // DeepSeek-V4's fixed SWA pools require both geometries to participate.
