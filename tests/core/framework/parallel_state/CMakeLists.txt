@@ -10,6 +10,18 @@ cc_test(
     GTest::gtest_main
 )
 
+cc_test(
+  NAME
+    collective_communicator_policy_test
+  SRCS
+    collective_communicator_policy_test.cpp
+  DEPS
+    parallel_state
+    $<$<BOOL:${USE_NPU}>:atb>
+    $<$<BOOL:${USE_NPU}>:c_sec>
+    GTest::gtest_main
+)
+
 if(USE_NPU)
   cc_test(
     NAME

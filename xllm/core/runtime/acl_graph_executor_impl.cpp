@@ -81,6 +81,7 @@ bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
   const int64_t batch_size = params.meta.num_sequences;
   const int64_t spec_width = params.meta.q_max_seq_len;
   return params.is_spec_verify &&
+         !ExecutionConfig::get_instance().enable_fia_decode() &&
          params.meta.batch_forward_type.is_chunked_prefill() &&
          params.graph.use_expanded_decode_for_spec_verify_attention &&
          params.graph.spec_verify_source_addresses_stable &&
@@ -102,6 +103,20 @@ uint64_t mix_graph_key(uint64_t hash, uint64_t value) {
   value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
   value ^= value >> 31;
   return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+}
+
+// Single source for the speculative-verify base graph key: FIA refreshes
+// dynamic host parameters before every replay, so the PA-only plan class must
+// not create equivalent FIA graph variants. Capture/replay and static MTP
+// task preparation must share this contract so their keys cannot drift.
+uint64_t spec_verify_base_graph_key(uint64_t packed_key,
+                                    uint64_t attention_plan_class,
+                                    std::string_view model_type,
+                                    bool fia_enabled) {
+  if (fia_enabled && is_qwen3_5_target_model_type(model_type)) {
+    return packed_key;
+  }
+  return mix_graph_key(packed_key, attention_plan_class);
 }
 
 bool has_non_uniform_positive_dp_token_counts(
@@ -1522,6 +1537,13 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
 bool AclGraphExecutorImpl::prepare_static_mtp_graph_tasks(
     const SpecVerifyGraphTaskSignal& signal,
     const Stream& signal_stream) {
+  // FIA disables the static MTP graph-task variant entirely (see
+  // uses_static_mtp_graph_task_variant), so stored graphs never carry a
+  // signature-wrapped key and the lookup below is a guaranteed miss. Mirror
+  // the same contract explicitly and skip the pointless computation.
+  if (::xllm::ExecutionConfig::get_instance().enable_fia_decode()) {
+    return false;
+  }
   if (!model_->is_hybrid_linear_attention() || graph_slot_count_ != 1 ||
       !kernel::npu::tilelang::has_spec_verify_graph_update_specialization(
           signal.spec_width, options_.block_size()) ||
@@ -1543,8 +1565,11 @@ bool AclGraphExecutorImpl::prepare_static_mtp_graph_tasks(
   if (!attention_plan_class.has_value()) {
     return false;
   }
-  const uint64_t base_key =
-      mix_graph_key(packed_key, attention_plan_class.value());
+  const uint64_t base_key = spec_verify_base_graph_key(
+      packed_key,
+      attention_plan_class.value(),
+      args_.model_type(),
+      ::xllm::ExecutionConfig::get_instance().enable_fia_decode());
   const uint64_t graph_key = static_mtp_graph_task_key(
       base_key, make_static_graph_task_signature(signal));
   std::shared_ptr<AclGraph> graph;
@@ -1628,7 +1653,11 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
       CHECK_NE(attention_plan_class, 0)
           << "stable speculative-verify graph requires an attention plan "
              "class";
-      const uint64_t base_key = mix_graph_key(packed_key, attention_plan_class);
+      const uint64_t base_key = spec_verify_base_graph_key(
+          packed_key,
+          attention_plan_class,
+          args_.model_type(),
+          ::xllm::ExecutionConfig::get_instance().enable_fia_decode());
       if (uses_static_mtp_graph_task_variant(
               params, bucket_num_tokens, options_.block_size())) {
         const auto signature = make_static_graph_task_signature(params);

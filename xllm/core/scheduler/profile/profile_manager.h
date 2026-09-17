@@ -32,6 +32,16 @@ limitations under the License.
 
 namespace xllm {
 class Engine;
+
+std::vector<int32_t> build_step_time_profile_batch_sizes(
+    int32_t max_seqs_per_batch);
+
+// Returns the decode sequence length bound used to measure graph-mode decode
+// capacity during warmup. FIA decode replays refresh dynamic host parameters,
+// so the FIA path measures with the larger FIA warmup bound instead of the
+// default 16 to keep measured memory aligned with real captures.
+int32_t warmup_decode_seq_len(bool fia_enabled, int32_t max_context_len);
+
 class ProfileManager {
  public:
   struct Options {

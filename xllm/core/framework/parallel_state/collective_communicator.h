@@ -19,6 +19,21 @@ limitations under the License.
 
 namespace xllm {
 
+bool can_reuse_tp_group_for_moe(int32_t dp_size,
+                                int32_t tp_size,
+                                int32_t moe_tp_size);
+
+// Selects the communicator that MoE TP collectives use for the given layout.
+// DP1 with an equivalent TP rank set reuses the TP communicator so dense and
+// MoE all-reduces share one resource; every other layout keeps the world
+// process group. Only selects between the two passed pointers and never
+// creates a new communicator.
+ProcessGroup* select_moe_tp_group(ProcessGroup* tp_group,
+                                  ProcessGroup* process_group,
+                                  int32_t dp_size,
+                                  int32_t tp_size,
+                                  int32_t moe_tp_size);
+
 class CollectiveCommunicator : public CollectiveCommunicatorBase {
  public:
   CollectiveCommunicator(int global_rank,
