@@ -29,7 +29,6 @@ limitations under the License.
 
 namespace xllm {
 
-// Buffers the residual stream of selected layers into a
 // [tokens, hidden * num_captured] tensor for a spec draft (Eagle3,
 // DFlash/DSpark) to consume. A non-empty layers_to_capture is the sole capture
 // signal.

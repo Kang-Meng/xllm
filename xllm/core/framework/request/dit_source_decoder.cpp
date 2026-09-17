@@ -19,6 +19,7 @@ limitations under the License.
 #include <utility>
 
 #include "butil/base64.h"
+#include "core/framework/multimodal/mm_codec.h"
 #include "core/util/threadpool.h"
 
 namespace xllm {
@@ -34,12 +35,21 @@ ThreadPool& DiTSourceDecoder::thread_pool() {
 }
 
 bool DiTSourceDecoder::add_source(const proto::MediaSource& source,
-                                  std::string default_name,
                                   Status& status) {
   Input input;
-  input.name = !source.has_name() || source.name().empty()
-                   ? std::move(default_name)
-                   : source.name();
+  if (source.name().empty() || source.modality().empty()) {
+    status = Status(StatusCode::INVALID_ARGUMENT,
+                    "media source name and modality must not be empty");
+    return false;
+  }
+  input.name = source.name();
+  input.modality = source.modality();
+  if (source.modality() != "image" && source.modality() != "video" &&
+      source.modality() != "audio") {
+    status = Status(StatusCode::INVALID_ARGUMENT,
+                    "modality must be image, video, or audio");
+    return false;
+  }
   if (source.type() == "base64") {
     input.encoded_data = source.base64();
   } else if (source.type() == "binary" && source.has_binary()) {
@@ -63,11 +73,10 @@ bool DiTSourceDecoder::add_source(const proto::MediaSource& source,
 
 bool DiTSourceDecoder::add_sources(
     const google::protobuf::RepeatedPtrField<proto::MediaSource>& sources,
-    std::string_view default_name,
     Status& status) {
   inputs_.reserve(inputs_.size() + sources.size());
   for (const proto::MediaSource& source : sources) {
-    if (!add_source(source, std::string(default_name), status)) {
+    if (!add_source(source, status)) {
       return false;
     }
   }
@@ -79,19 +88,80 @@ void DiTSourceDecoder::add_sources(
     std::string_view default_name) {
   inputs_.reserve(inputs_.size() + sources.size());
   for (const std::string& source : sources) {
-    inputs_.emplace_back(
-        Input{.name = std::string(default_name), .encoded_data = source});
+    inputs_.emplace_back(Input{.name = std::string(default_name),
+                               .modality = "image",
+                               .encoded_data = source});
   }
 }
 
-bool DiTSourceDecoder::decode(const DecodeFn& decode_fn,
-                              std::vector<NamedTensor>& outputs,
-                              Status& status) const {
+bool DiTSourceDecoder::decode(std::vector<MediaNamedTensor>& outputs,
+                              Status& status,
+                              int32_t audio_channels,
+                              int64_t audio_sampling_rate) const {
+  std::vector<torch::Tensor> prompt_audio_in_videos(inputs_.size());
+  const IndexedDecodeFn decode_media = [&](size_t index,
+                                           std::string_view modality,
+                                           std::string_view raw_bytes,
+                                           torch::Tensor& tensor,
+                                           TensorParameters& parameters) {
+    if (modality == "audio") {
+      FFmpegAudioDecoder decoder;
+      AudioMetadata metadata;
+      return decoder.decode(
+          raw_bytes, tensor, metadata, audio_sampling_rate, audio_channels);
+    }
+    if (modality == "video") {
+      FFmpegVideoDecoder decoder;
+      VideoMetadata metadata;
+      if (!decoder.decode(raw_bytes, tensor, metadata)) {
+        return false;
+      }
+      parameters.emplace("prompt_video_fps", metadata.fps);
+
+      FFmpegAudioDecoder audio_decoder;
+      AudioMetadata audio_metadata;
+      if (!audio_decoder.decode(raw_bytes,
+                                prompt_audio_in_videos[index],
+                                audio_metadata,
+                                audio_sampling_rate,
+                                audio_channels)) {
+        prompt_audio_in_videos[index] = torch::Tensor();
+      }
+      return true;
+    }
+    if (modality == "image") {
+      OpenCVImageDecoder decoder;
+      return decoder.decode(raw_bytes, tensor);
+    }
+    return false;
+  };
+
+  std::vector<MediaNamedTensor> decoded_sources;
+  if (!decode_inputs(decode_media, decoded_sources, status)) {
+    return false;
+  }
+  outputs.reserve(outputs.size() + decoded_sources.size() + inputs_.size());
+  for (size_t index = 0; index < decoded_sources.size(); ++index) {
+    outputs.emplace_back(std::move(decoded_sources[index]));
+    if (prompt_audio_in_videos[index].defined()) {
+      outputs.emplace_back(
+          MediaNamedTensor{.name = "prompt_audio_in_video",
+                           .modality = "audio",
+                           .tensor = std::move(prompt_audio_in_videos[index])});
+    }
+  }
+  return true;
+}
+
+bool DiTSourceDecoder::decode_inputs(const IndexedDecodeFn& decode_fn,
+                                     std::vector<MediaNamedTensor>& outputs,
+                                     Status& status) const {
   if (inputs_.empty()) {
     return true;
   }
 
   std::vector<torch::Tensor> tensors(inputs_.size());
+  std::vector<TensorParameters> parameters(inputs_.size());
   std::vector<uint8_t> decoded(inputs_.size(), 0);
   const auto decode_one = [&](size_t index) {
     const Input& input = inputs_[index];
@@ -111,7 +181,11 @@ bool DiTSourceDecoder::decode(const DecodeFn& decode_fn,
       }
       raw_bytes = decoded_bytes;
     }
-    if (decode_fn(raw_bytes, tensors[index])) {
+    if (decode_fn(index,
+                  input.modality,
+                  raw_bytes,
+                  tensors[index],
+                  parameters[index])) {
       decoded[index] = 1;
     }
   };
@@ -137,8 +211,11 @@ bool DiTSourceDecoder::decode(const DecodeFn& decode_fn,
   }
   outputs.reserve(outputs.size() + inputs_.size());
   for (size_t index = 0; index < inputs_.size(); ++index) {
-    outputs.emplace_back(NamedTensor{.name = inputs_[index].name,
-                                     .tensor = std::move(tensors[index])});
+    outputs.emplace_back(
+        MediaNamedTensor{.name = inputs_[index].name,
+                         .modality = inputs_[index].modality,
+                         .tensor = std::move(tensors[index]),
+                         .parameters = std::move(parameters[index])});
   }
   return true;
 }

@@ -23,6 +23,7 @@ limitations under the License.
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <variant>
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/eplb_config.h"
@@ -76,6 +77,15 @@ constexpr size_t swap_block_info_fixed_size() {
 constexpr std::uintptr_t kCudaZeroCopyAlignment = 16;
 constexpr uint64_t kRawInputTensorArenaAlignment =
     static_cast<uint64_t>(kCudaZeroCopyAlignment);
+
+enum class TensorParameterType : uint8_t {
+  kBool,
+  kInt64,
+  kString,
+  kDouble,
+  kUint64,
+  kInt64Tensor,
+};
 
 inline uint64_t align_up(uint64_t value, uint64_t alignment) {
   if (alignment == 0) {
@@ -369,6 +379,28 @@ inline size_t get_dit_generation_params_size(
          + get_string_size(params.audio_guidance_method);
 }
 
+inline size_t get_tensor_parameters_size(const TensorParameters& parameters) {
+  size_t size = type_size<uint64_t>;
+  for (const auto& [name, value] : parameters) {
+    size += get_string_size(name) + type_size<TensorParameterType>;
+    if (std::holds_alternative<bool>(value)) {
+      size += type_size<bool>;
+    } else if (std::holds_alternative<int64_t>(value)) {
+      size += type_size<int64_t>;
+    } else if (std::holds_alternative<std::string>(value)) {
+      size += get_string_size(std::get<std::string>(value));
+    } else if (std::holds_alternative<double>(value)) {
+      size += type_size<double>;
+    } else if (std::holds_alternative<uint64_t>(value)) {
+      size += type_size<uint64_t>;
+    } else {
+      size += type_size<uint64_t>;
+      size += std::get<std::vector<int64_t>>(value).size() * type_size<int64_t>;
+    }
+  }
+  return size;
+}
+
 inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
   size_t size = type_size<int>;  // batch_size
 
@@ -380,14 +412,17 @@ inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
 
   // Tensors
   size += type_size<size_t>;
-  for (const NamedTensor& source : input.image_sources.entries()) {
+  for (const MediaNamedTensor& source : input.media_sources.entries()) {
     size += get_string_size(source.name);
+    size += get_string_size(source.modality);
     size += get_tensor_size(source.tensor);
+    size += get_tensor_parameters_size(source.parameters);
   }
   size += type_size<size_t>;
   for (const NamedTensor& tensor_input : input.tensor_sources.entries()) {
     size += get_string_size(tensor_input.name);
     size += get_tensor_size(tensor_input.tensor);
+    size += get_tensor_parameters_size(tensor_input.parameters);
   }
   size += get_string_size(input.audio_prompt_text);
 
@@ -399,7 +434,8 @@ inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
 
 inline size_t get_dit_forward_output_size(const DiTForwardOutput& output) {
   return get_vector_tensor_size(output.tensors) +
-         get_string_vector_size(output.text_output);
+         get_string_vector_size(output.text_output) +
+         get_vector_tensor_size(output.audio_tensors);
 }
 
 template <typename T>
@@ -486,6 +522,40 @@ inline void write_string_vector(RawInputSectionCursor& cursor,
   write_data(cursor, size);
   for (const auto& str : vec) {
     write_string(cursor, str);
+  }
+}
+
+template <typename Cursor>
+inline void write_tensor_parameters(Cursor& cursor,
+                                    const TensorParameters& parameters) {
+  write_data(cursor, static_cast<uint64_t>(parameters.size()));
+  for (const auto& [name, value] : parameters) {
+    write_string(cursor, name);
+    if (const bool* typed_value = std::get_if<bool>(&value)) {
+      write_data(cursor, TensorParameterType::kBool);
+      write_data(cursor, *typed_value);
+    } else if (const int64_t* typed_value = std::get_if<int64_t>(&value)) {
+      write_data(cursor, TensorParameterType::kInt64);
+      write_data(cursor, *typed_value);
+    } else if (const std::string* typed_value =
+                   std::get_if<std::string>(&value)) {
+      write_data(cursor, TensorParameterType::kString);
+      write_string(cursor, *typed_value);
+    } else if (const double* typed_value = std::get_if<double>(&value)) {
+      write_data(cursor, TensorParameterType::kDouble);
+      write_data(cursor, *typed_value);
+    } else if (const uint64_t* typed_value = std::get_if<uint64_t>(&value)) {
+      write_data(cursor, TensorParameterType::kUint64);
+      write_data(cursor, *typed_value);
+    } else {
+      const std::vector<int64_t>& int64_tensor =
+          std::get<std::vector<int64_t>>(value);
+      write_data(cursor, TensorParameterType::kInt64Tensor);
+      write_data(cursor, static_cast<uint64_t>(int64_tensor.size()));
+      for (const int64_t item : int64_tensor) {
+        write_data(cursor, item);
+      }
+    }
   }
 }
 
@@ -1123,15 +1193,18 @@ inline void write_dit_forward_input(char*& buffer,
   write_string_vector(buffer, input.negative_prompts);
   write_string_vector(buffer, input.negative_prompts_2);
 
-  write_data(buffer, input.image_sources.size());
-  for (const NamedTensor& source : input.image_sources.entries()) {
+  write_data(buffer, input.media_sources.size());
+  for (const MediaNamedTensor& source : input.media_sources.entries()) {
     write_string(buffer, source.name);
+    write_string(buffer, source.modality);
     write_tensor(buffer, source.tensor);
+    write_tensor_parameters(buffer, source.parameters);
   }
   write_data(buffer, input.tensor_sources.size());
   for (const NamedTensor& tensor_input : input.tensor_sources.entries()) {
     write_string(buffer, tensor_input.name);
     write_tensor(buffer, tensor_input.tensor);
+    write_tensor_parameters(buffer, tensor_input.parameters);
   }
   write_string(buffer, input.audio_prompt_text);
 
@@ -1147,15 +1220,18 @@ inline void write_dit_forward_input(RawInputSerializeContext& context,
   write_string_vector(context.descriptor, input.negative_prompts);
   write_string_vector(context.descriptor, input.negative_prompts_2);
 
-  write_data(context.descriptor, input.image_sources.size());
-  for (const NamedTensor& source : input.image_sources.entries()) {
+  write_data(context.descriptor, input.media_sources.size());
+  for (const MediaNamedTensor& source : input.media_sources.entries()) {
     write_string(context.descriptor, source.name);
+    write_string(context.descriptor, source.modality);
     write_tensor(context, source.tensor);
+    write_tensor_parameters(context.descriptor, source.parameters);
   }
   write_data(context.descriptor, input.tensor_sources.size());
   for (const NamedTensor& tensor_input : input.tensor_sources.entries()) {
     write_string(context.descriptor, tensor_input.name);
     write_tensor(context, tensor_input.tensor);
+    write_tensor_parameters(context.descriptor, tensor_input.parameters);
   }
   write_string(context.descriptor, input.audio_prompt_text);
 
@@ -1166,6 +1242,7 @@ inline void write_dit_forward_output(char*& buffer,
                                      const DiTForwardOutput& output) {
   write_vector_tensor(buffer, output.tensors);
   write_string_vector(buffer, output.text_output);
+  write_vector_tensor(buffer, output.audio_tensors);
 }
 
 inline void safe_advance_buffer(const char*& buffer, size_t offset) {
@@ -2129,8 +2206,65 @@ inline void clone_tensor_if_defined(torch::Tensor& tensor) {
   }
 }
 
+template <typename Cursor>
+inline void read_tensor_parameters(Cursor& cursor,
+                                   TensorParameters& parameters) {
+  uint64_t parameter_count = 0;
+  read_data(cursor, parameter_count);
+  for (uint64_t index = 0; index < parameter_count; ++index) {
+    std::string name;
+    TensorParameterType type;
+    read_string(cursor, name);
+    read_data(cursor, type);
+    switch (type) {
+      case TensorParameterType::kBool: {
+        bool value = false;
+        read_data(cursor, value);
+        parameters.emplace(std::move(name), value);
+        break;
+      }
+      case TensorParameterType::kInt64: {
+        int64_t value = 0;
+        read_data(cursor, value);
+        parameters.emplace(std::move(name), value);
+        break;
+      }
+      case TensorParameterType::kString: {
+        std::string value;
+        read_string(cursor, value);
+        parameters.emplace(std::move(name), std::move(value));
+        break;
+      }
+      case TensorParameterType::kDouble: {
+        double value = 0.0;
+        read_data(cursor, value);
+        parameters.emplace(std::move(name), value);
+        break;
+      }
+      case TensorParameterType::kUint64: {
+        uint64_t value = 0;
+        read_data(cursor, value);
+        parameters.emplace(std::move(name), value);
+        break;
+      }
+      case TensorParameterType::kInt64Tensor: {
+        uint64_t value_count = 0;
+        read_data(cursor, value_count);
+        std::vector<int64_t> value(static_cast<size_t>(value_count));
+        for (int64_t& item : value) {
+          read_data(cursor, item);
+        }
+        parameters.emplace(std::move(name), std::move(value));
+        break;
+      }
+      default:
+        LOG(FATAL) << "Invalid tensor parameter type";
+    }
+  }
+}
+
 inline void stabilize_dit_forward_input_tensors(DiTForwardInput& input) {
-  for (NamedTensor& source : input.image_sources.entries()) {
+  for (MediaNamedTensor& source : input.media_sources.entries()) {
     clone_tensor_if_defined(source.tensor);
   }
   for (NamedTensor& tensor_input : input.tensor_sources.entries()) {
@@ -2148,23 +2282,33 @@ inline void read_dit_forward_input(const char*& buffer,
   read_string_vector(buffer, input.negative_prompts);
   read_string_vector(buffer, input.negative_prompts_2);
 
-  size_t image_source_count = 0;
-  read_data(buffer, image_source_count);
-  for (size_t index = 0; index < image_source_count; ++index) {
+  size_t media_source_count = 0;
+  read_data(buffer, media_source_count);
+  for (size_t index = 0; index < media_source_count; ++index) {
     std::string name;
+    std::string modality;
     torch::Tensor tensor;
+    TensorParameters parameters;
     read_string(buffer, name);
+    read_string(buffer, modality);
     read_tensor(buffer, tensor);
-    input.image_sources.add(std::move(name), std::move(tensor));
+    read_tensor_parameters(buffer, parameters);
+    input.media_sources.add(std::move(name),
+                            std::move(modality),
+                            std::move(tensor),
+                            std::move(parameters));
   }
   size_t tensor_input_count = 0;
   read_data(buffer, tensor_input_count);
   for (size_t index = 0; index < tensor_input_count; ++index) {
     std::string name;
     torch::Tensor tensor;
+    TensorParameters parameters;
     read_string(buffer, name);
     read_tensor(buffer, tensor);
-    input.tensor_sources.add(std::move(name), std::move(tensor));
+    read_tensor_parameters(buffer, parameters);
+    input.tensor_sources.add(
+        std::move(name), std::move(tensor), std::move(parameters));
   }
   read_string(buffer, input.audio_prompt_text);
 
@@ -2184,29 +2328,39 @@ inline void read_dit_forward_input(ReadContext& context,
   read_string_vector(context, input.negative_prompts);
   read_string_vector(context, input.negative_prompts_2);
 
-  size_t image_source_count = 0;
-  read_data(context, image_source_count);
-  for (size_t index = 0; index < image_source_count; ++index) {
+  size_t media_source_count = 0;
+  read_data(context, media_source_count);
+  for (size_t index = 0; index < media_source_count; ++index) {
     std::string name;
+    std::string modality;
     torch::Tensor tensor;
+    TensorParameters parameters;
     read_string(context, name);
+    read_string(context, modality);
     read_tensor(context,
                 tensor,
                 /*stream=*/nullptr,
                 /*force_host_materialize=*/true);
-    input.image_sources.add(std::move(name), std::move(tensor));
+    read_tensor_parameters(context, parameters);
+    input.media_sources.add(std::move(name),
+                            std::move(modality),
+                            std::move(tensor),
+                            std::move(parameters));
   }
   size_t tensor_input_count = 0;
   read_data(context, tensor_input_count);
   for (size_t index = 0; index < tensor_input_count; ++index) {
     std::string name;
     torch::Tensor tensor;
+    TensorParameters parameters;
     read_string(context, name);
     read_tensor(context,
                 tensor,
                 /*stream=*/nullptr,
                 /*force_host_materialize=*/true);
-    input.tensor_sources.add(std::move(name), std::move(tensor));
+    read_tensor_parameters(context, parameters);
+    input.tensor_sources.add(
+        std::move(name), std::move(tensor), std::move(parameters));
   }
   read_string(context, input.audio_prompt_text);
 
@@ -2225,6 +2379,12 @@ inline void read_dit_forward_output(const char*& buffer,
     }
   }
   read_string_vector(buffer, output.text_output);
+  read_vector_tensor(buffer, output.audio_tensors);
+  for (torch::Tensor& tensor : output.audio_tensors) {
+    if (tensor.defined()) {
+      tensor = tensor.clone();
+    }
+  }
 }
 
 inline void initialize_device_buffer_session(ReadContext& context,
@@ -3038,6 +3198,7 @@ void convert_tensor_to_raw_output(
     const std::vector<std::vector<torch::Tensor>>& mm_embeddings,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    const std::vector<torch::Tensor>& dit_audio,
     const torch::Tensor& expert_load_data,
     int64_t prepared_token,
     const torch::Tensor& src_seq_idxes,
@@ -3085,6 +3246,7 @@ void convert_tensor_to_raw_output(
 
   raw_output.outputs.reserve(num_seqs);
   raw_output.dit_forward_output.tensors = dit_images;
+  raw_output.dit_forward_output.audio_tensors = dit_audio;
   raw_output.dit_forward_output.text_output = dit_text_output;
   for (int32_t output_idx = 0; output_idx < num_seqs; ++output_idx) {
     RawSampleOutput raw_sample_output;
@@ -3386,6 +3548,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
     const std::vector<SpeculativeTokenStats>& speculative_token_stats,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    const std::vector<torch::Tensor>& dit_audio,
     const torch::Tensor& expert_load_data,
     int64_t prepared_token,
     const torch::Tensor& src_seq_idxes,
@@ -3401,6 +3564,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
                                mm_embeddings,
                                dit_images,
                                dit_text_output,
+                               dit_audio,
                                expert_load_data,
                                prepared_token,
                                src_seq_idxes,

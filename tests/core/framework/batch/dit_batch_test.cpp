@@ -28,7 +28,7 @@ TEST(DiTBatchTest, SingleRequestSourcesUseBatchViews) {
       torch::arange(12, torch::dtype(torch::kUInt8)).reshape({3, 2, 2});
   torch::Tensor prompt_embed = torch::randn({4, 8});
   torch::Tensor prompt_audio = torch::randn({1, 32});
-  input_params.image_sources.add("image", image);
+  input_params.media_sources.add("image", "image", image);
   input_params.tensor_sources.add("prompt_embed", prompt_embed);
   input_params.tensor_sources.add("prompt_audio", prompt_audio);
 
@@ -46,7 +46,7 @@ TEST(DiTBatchTest, SingleRequestSourcesUseBatchViews) {
   batch.add(request);
   DiTForwardInput forward_input = batch.prepare_forward_input();
 
-  const torch::Tensor& batched_image = forward_input.image_sources.at(0).tensor;
+  const torch::Tensor& batched_image = forward_input.media_sources.at(0).tensor;
   const torch::Tensor batched_embed =
       *forward_input.tensor_sources.get("prompt_embed");
   const torch::Tensor batched_audio =

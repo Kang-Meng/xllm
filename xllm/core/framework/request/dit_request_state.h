@@ -149,7 +149,7 @@ struct DiTInputParams {
   // Secondary negative prompt to exclude additional unwanted features
   std::string negative_prompt_2;
 
-  DiTImageSources image_sources;
+  DiTMediaSources media_sources;
 
   DiTTensorSources tensor_sources;
 

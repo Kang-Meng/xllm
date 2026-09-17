@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/rec_config.h"
+#include "core/framework/model/model_args.h"
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/prefix_cache/block_hasher.h"
@@ -602,13 +603,37 @@ void Sequence::update_token(size_t index, const Token& token) {
   finish_status_invalidated_ = true;
 }
 
+torch::Tensor Sequence::generate_mm_embeddings_tags(
+    const ModelArgs& model_args) const {
+  const int32_t vision_start_token_id = model_args.vision_start_token_id();
+  const int32_t vision_end_token_id = model_args.vision_end_token_id();
+  const int32_t image_token_id = model_args.image_token_id();
+  const int32_t video_token_id = model_args.video_token_id();
+
+  std::vector<int64_t> modality_tags;
+  modality_tags.reserve(num_prompt_tokens_);
+  for (size_t index = 0; index < num_prompt_tokens_; ++index) {
+    const int32_t token_id = tokens_[index];
+    const bool is_vision_token =
+        token_id == vision_start_token_id || token_id == vision_end_token_id ||
+        token_id == image_token_id || token_id == video_token_id;
+    modality_tags.emplace_back(is_vision_token ? 0 : 1);
+  }
+  return torch::tensor(modality_tags, torch::kInt64);
+}
+
 void Sequence::update_mm_embeddings(
-    const std::vector<torch::Tensor>& mm_embeddings) {
+    const std::vector<torch::Tensor>& mm_embeddings,
+    OptionalModelArgsRef model_args) {
   // cannot update embeddings to a finished sequence
   if (finished_) {
     return;
   }
   output_mm_embeddings_ = mm_embeddings;
+  if (model_args.has_value() &&
+      ModelConfig::get_instance().enable_return_embedding_modality_tags()) {
+    output_mm_embeddings_tags_ = generate_mm_embeddings_tags(model_args->get());
+  }
   CHECK(sequence_params_.sampling_param->is_embeddings);
   // invalidate the finish status once a new token is appended
   finish_status_invalidated_ = false;
@@ -801,6 +826,10 @@ void Sequence::generate_mm_embeddings_output(SequenceOutput& output) {
     embedding_output.embedding = output_mm_embedding;
     for (const auto& [key, value] : metadata) {
       embedding_output.metadata[key] = value[emb_idx];
+    }
+    if (output_mm_embeddings_tags_.defined()) {
+      CHECK_EQ(output_mm_embedding.size(0), output_mm_embeddings_tags_.numel());
+      embedding_output.metadata["token_tags"] = output_mm_embeddings_tags_;
     }
     if (is_mm_embed) {
       const XXH3Key& hash_key =

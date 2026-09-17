@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -47,6 +48,11 @@ limitations under the License.
 #include "stopping_checker.h"
 
 namespace xllm {
+
+struct ModelArgs;
+
+using OptionalModelArgsRef =
+    std::optional<std::reference_wrapper<const ModelArgs>>;
 
 enum class SequenceOutputType : int8_t {
   TOKENS = 0,
@@ -224,7 +230,8 @@ class Sequence final {
   }
 
   // update mm embeddings to the sequence
-  void update_mm_embeddings(const std::vector<torch::Tensor>& mm_embeddings);
+  void update_mm_embeddings(const std::vector<torch::Tensor>& mm_embeddings,
+                            OptionalModelArgsRef model_args = std::nullopt);
   // update embeddings to the sequence
   void update_embeddings(const torch::Tensor& embedding);
   void update_mtp_bootstrap_embedding(const torch::Tensor& embedding);
@@ -559,6 +566,7 @@ class Sequence final {
   SequenceOutputType output_type();
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
+  torch::Tensor generate_mm_embeddings_tags(const ModelArgs& model_args) const;
 
   void init_onerec_sequence(const std::vector<int32_t>& prompt_token_ids,
                             torch::Tensor input_embedding);
@@ -637,6 +645,7 @@ class Sequence final {
 
   // mm embedding of the sequence
   std::vector<torch::Tensor> output_mm_embeddings_;
+  torch::Tensor output_mm_embeddings_tags_;
 
   // embeddings of the sequence
   torch::Tensor output_embedding_;

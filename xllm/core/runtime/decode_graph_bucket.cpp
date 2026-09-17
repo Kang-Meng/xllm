@@ -45,7 +45,8 @@ int64_t get_decode_graph_token_bucket(int64_t num_tokens,
 }
 
 std::vector<int32_t> get_decode_graph_dp_token_counts(
-    const std::vector<int32_t>& token_counts, int32_t graph_token_count) {
+    const std::vector<int32_t>& token_counts,
+    int32_t graph_token_count) {
   if (token_counts.empty()) {
     return {};
   }

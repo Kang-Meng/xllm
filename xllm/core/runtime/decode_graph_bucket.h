@@ -39,7 +39,8 @@ int64_t get_decode_graph_token_bucket(int64_t num_tokens,
 // shards use the graph execution width, while empty shards retain their
 // single fake row; raw token counts remain separate for lm-head indices.
 std::vector<int32_t> get_decode_graph_dp_token_counts(
-    const std::vector<int32_t>& token_counts, int32_t graph_token_count);
+    const std::vector<int32_t>& token_counts,
+    int32_t graph_token_count);
 
 // Returns the dense token layout consumed after DP padding.
 int64_t get_decode_graph_dp_layout_token_count(int32_t dp_size,

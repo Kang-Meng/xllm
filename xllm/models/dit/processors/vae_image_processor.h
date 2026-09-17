@@ -198,9 +198,16 @@ class VAEImageProcessorImpl : public torch::nn::Module {
                          .antialias(true)
                          .mode(torch::kBicubic);
       resized = torch::nn::functional::interpolate(image, options);
+    } else if (resize_mode == "bilinear") {
+      auto options = torch::nn::functional::InterpolateFuncOptions()
+                         .size(std::vector<int64_t>{height, width})
+                         .align_corners(false)
+                         .mode(torch::kBilinear);
+      resized = torch::nn::functional::interpolate(image, options);
     } else {
-      LOG(FATAL) << "Currently only support 'lanczos' and 'bicubic'"
-                 << ", but got: " << resize_mode;
+      LOG(FATAL) << "Currently only support 'lanczos', 'bicubic' and "
+                    "'bilinear', but got: "
+                 << resize_mode;
     }
 
     if (squeeze_batch) {

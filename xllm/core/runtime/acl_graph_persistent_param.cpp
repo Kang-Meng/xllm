@@ -426,10 +426,9 @@ torch::Tensor slice_like_source(const torch::Tensor& persistent,
   return persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/src.size(0));
 }
 
-int64_t get_graph_lm_head_index_length(
-    const torch::Tensor& src,
-    uint32_t padded_tokens,
-    int32_t dp_size) {
+int64_t get_graph_lm_head_index_length(const torch::Tensor& src,
+                                       uint32_t padded_tokens,
+                                       int32_t dp_size) {
   CHECK(src.defined());
   CHECK_GT(src.numel(), 0);
   if (dp_size > 1) {
@@ -486,15 +485,14 @@ void GraphPersistentParam::update_persistent_dp_ep_padding(
   if (src_lm_head_indices.defined() && src_lm_head_indices.numel() > 0) {
     torch::Tensor& persistent_lm_head_indices =
         persistent_dp_ep_padding_.lm_head_skip_padding_token_indices();
-    const int64_t graph_length =
-        get_graph_lm_head_index_length(src_lm_head_indices,
-                                       padded_tokens,
-                                       dp_layout_size);
+    const int64_t graph_length = get_graph_lm_head_index_length(
+        src_lm_head_indices, padded_tokens, dp_layout_size);
     CHECK_LE(graph_length, persistent_lm_head_indices.size(0))
         << "lm-head index graph bucket exceeds persistent capacity";
-    persistent_lm_head_indices.slice(/*dim=*/0,
-                                     /*start=*/0,
-                                     /*end=*/src_lm_head_indices.size(0))
+    persistent_lm_head_indices
+        .slice(/*dim=*/0,
+               /*start=*/0,
+               /*end=*/src_lm_head_indices.size(0))
         .copy_(src_lm_head_indices, /*non_blocking=*/true);
     if (graph_length > src_lm_head_indices.size(0)) {
       // The graph consumes the bucket-sized index tensor. Clear only the
@@ -575,9 +573,9 @@ void GraphPersistentParam::replace_capture_dp_ep_padding(
         persistent_dp_ep_padding_.lm_head_skip_padding_token_indices().slice(
             /*dim=*/0,
             /*start=*/0,
-            /*end=*/get_graph_lm_head_index_length(src_lm_head_indices,
-                                                    padded_tokens,
-                                                    dp_layout_size)));
+            /*end=*/
+            get_graph_lm_head_index_length(
+                src_lm_head_indices, padded_tokens, dp_layout_size)));
   }
   dst.gather_prenorm_idx(
       slice_like_source(persistent_dp_ep_padding_.gather_prenorm_idx(),
@@ -1350,9 +1348,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       is_decode && params.parallel.dp_global_token_nums.size() > 1
           ? std::max<int32_t>(options_.dp_size(), 1)
           : 1;
-  update_persistent_dp_ep_padding(params.parallel.dp_ep_padding_data,
-                                  padded_num_tokens,
-                                  dp_layout_size);
+  update_persistent_dp_ep_padding(
+      params.parallel.dp_ep_padding_data, padded_num_tokens, dp_layout_size);
   update_persistent_cp_ep_meta(params.parallel.cp_plan.cp_ep_meta(),
                                padded_num_tokens);
   if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {

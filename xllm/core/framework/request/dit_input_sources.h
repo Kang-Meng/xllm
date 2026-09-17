@@ -17,47 +17,80 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace xllm {
 
+using TensorParameterValue = std::
+    variant<bool, int64_t, std::string, double, uint64_t, std::vector<int64_t>>;
+using TensorParameters = std::unordered_map<std::string, TensorParameterValue>;
+
+template <typename ValueType>
+const ValueType* get_tensor_parameter(const TensorParameters& parameters,
+                                      std::string_view name) {
+  const auto iterator = parameters.find(std::string(name));
+  if (iterator == parameters.end()) {
+    return nullptr;
+  }
+  return std::get_if<ValueType>(&iterator->second);
+}
+
 struct NamedTensor {
   std::string name;
   torch::Tensor tensor;
+  TensorParameters parameters;
 };
 
-class DiTImageSources final {
+struct MediaNamedTensor {
+  std::string name;
+  std::string modality;
+  torch::Tensor tensor;
+  TensorParameters parameters;
+};
+
+class DiTMediaSources final {
  public:
-  void add(std::string name, torch::Tensor tensor);
+  void add(std::string name,
+           std::string modality,
+           torch::Tensor tensor,
+           TensorParameters parameters = {});
 
   std::vector<torch::Tensor> get(
       const std::vector<std::string>& names = {}) const;
 
-  NamedTensor& at(size_t index);
-  const NamedTensor& at(size_t index) const;
+  bool contains(std::string_view name) const;
 
-  std::vector<NamedTensor>& entries();
-  const std::vector<NamedTensor>& entries() const;
+  MediaNamedTensor& at(size_t index);
+  const MediaNamedTensor& at(size_t index) const;
+
+  std::vector<MediaNamedTensor>& entries();
+  const std::vector<MediaNamedTensor>& entries() const;
 
   size_t size() const;
   bool empty() const;
 
-  bool batch_signature_matches(const DiTImageSources& other) const;
-  DiTImageSources to(const torch::Device& device) const;
+  bool batch_signature_matches(const DiTMediaSources& other) const;
+  DiTMediaSources to(const torch::Device& device) const;
 
  private:
-  std::vector<NamedTensor> entries_;
+  std::vector<MediaNamedTensor> entries_;
 };
 
 class DiTTensorSources final {
  public:
-  void add(std::string name, torch::Tensor tensor);
+  void add(std::string name,
+           torch::Tensor tensor,
+           TensorParameters parameters = {});
 
   bool contains(std::string_view name) const;
   std::optional<torch::Tensor> get(std::string_view name) const;
+  std::optional<NamedTensor> get_namedtensor(std::string_view name) const;
 
   std::vector<NamedTensor>& entries();
   const std::vector<NamedTensor>& entries() const;

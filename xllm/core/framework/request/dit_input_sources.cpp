@@ -15,21 +15,24 @@ limitations under the License.
 
 #include "framework/request/dit_input_sources.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "core/util/tensor_helper.h"
 
 namespace xllm {
 
-void DiTImageSources::add(std::string name, torch::Tensor tensor) {
-  if (name.empty()) {
-    name = "unknown";
-  }
-  entries_.emplace_back(
-      NamedTensor{.name = std::move(name), .tensor = std::move(tensor)});
+void DiTMediaSources::add(std::string name,
+                          std::string modality,
+                          torch::Tensor tensor,
+                          TensorParameters parameters) {
+  entries_.emplace_back(MediaNamedTensor{.name = std::move(name),
+                                         .modality = std::move(modality),
+                                         .tensor = std::move(tensor),
+                                         .parameters = std::move(parameters)});
 }
 
-std::vector<torch::Tensor> DiTImageSources::get(
+std::vector<torch::Tensor> DiTMediaSources::get(
     const std::vector<std::string>& names) const {
   std::vector<torch::Tensor> tensors;
   tensors.reserve(entries_.size());
@@ -64,31 +67,41 @@ std::vector<torch::Tensor> DiTImageSources::get(
   return tensors;
 }
 
-NamedTensor& DiTImageSources::at(size_t index) { return entries_.at(index); }
+bool DiTMediaSources::contains(std::string_view name) const {
+  return std::any_of(
+      entries_.begin(), entries_.end(), [name](const MediaNamedTensor& source) {
+        return source.name == name;
+      });
+}
 
-const NamedTensor& DiTImageSources::at(size_t index) const {
+MediaNamedTensor& DiTMediaSources::at(size_t index) {
   return entries_.at(index);
 }
 
-std::vector<NamedTensor>& DiTImageSources::entries() { return entries_; }
+const MediaNamedTensor& DiTMediaSources::at(size_t index) const {
+  return entries_.at(index);
+}
 
-const std::vector<NamedTensor>& DiTImageSources::entries() const {
+std::vector<MediaNamedTensor>& DiTMediaSources::entries() { return entries_; }
+
+const std::vector<MediaNamedTensor>& DiTMediaSources::entries() const {
   return entries_;
 }
 
-size_t DiTImageSources::size() const { return entries_.size(); }
+size_t DiTMediaSources::size() const { return entries_.size(); }
 
-bool DiTImageSources::empty() const { return entries_.empty(); }
+bool DiTMediaSources::empty() const { return entries_.empty(); }
 
-bool DiTImageSources::batch_signature_matches(
-    const DiTImageSources& other) const {
+bool DiTMediaSources::batch_signature_matches(
+    const DiTMediaSources& other) const {
   if (entries_.size() != other.entries_.size()) {
     return false;
   }
   for (size_t index = 0; index < entries_.size(); ++index) {
-    const NamedTensor& lhs = entries_[index];
-    const NamedTensor& rhs = other.entries_[index];
-    if (lhs.name != rhs.name ||
+    const MediaNamedTensor& lhs = entries_[index];
+    const MediaNamedTensor& rhs = other.entries_[index];
+    if (lhs.name != rhs.name || lhs.modality != rhs.modality ||
+        lhs.parameters != rhs.parameters ||
         !tensor_batch_signature_matches(lhs.tensor, rhs.tensor)) {
       return false;
     }
@@ -96,18 +109,26 @@ bool DiTImageSources::batch_signature_matches(
   return true;
 }
 
-DiTImageSources DiTImageSources::to(const torch::Device& device) const {
-  DiTImageSources result;
+DiTMediaSources DiTMediaSources::to(const torch::Device& device) const {
+  DiTMediaSources result;
   result.entries_.reserve(entries_.size());
-  for (const NamedTensor& source : entries_) {
-    result.add(source.name, source.tensor.to(device, /*dtype=*/torch::kUInt8));
+  for (const MediaNamedTensor& source : entries_) {
+    const torch::ScalarType dtype =
+        source.modality == "audio" ? torch::kFloat32 : torch::kUInt8;
+    result.add(source.name,
+               source.modality,
+               source.tensor.to(device, dtype),
+               source.parameters);
   }
   return result;
 }
 
-void DiTTensorSources::add(std::string name, torch::Tensor tensor) {
-  entries_.emplace_back(
-      NamedTensor{.name = std::move(name), .tensor = std::move(tensor)});
+void DiTTensorSources::add(std::string name,
+                           torch::Tensor tensor,
+                           TensorParameters parameters) {
+  entries_.emplace_back(NamedTensor{.name = std::move(name),
+                                    .tensor = std::move(tensor),
+                                    .parameters = std::move(parameters)});
 }
 
 bool DiTTensorSources::contains(std::string_view name) const {
@@ -119,6 +140,16 @@ std::optional<torch::Tensor> DiTTensorSources::get(
   for (const NamedTensor& input : entries_) {
     if (input.name == name) {
       return input.tensor;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<NamedTensor> DiTTensorSources::get_namedtensor(
+    std::string_view name) const {
+  for (const NamedTensor& input : entries_) {
+    if (input.name == name) {
+      return input;
     }
   }
   return std::nullopt;
@@ -140,9 +171,10 @@ bool DiTTensorSources::batch_signature_matches(
     return false;
   }
   for (const NamedTensor& input : entries_) {
-    std::optional<torch::Tensor> other_tensor = other.get(input.name);
-    if (!other_tensor.has_value() ||
-        !tensor_batch_signature_matches(input.tensor, *other_tensor)) {
+    std::optional<NamedTensor> other_input = other.get_namedtensor(input.name);
+    if (!other_input.has_value() ||
+        input.parameters != other_input->parameters ||
+        !tensor_batch_signature_matches(input.tensor, other_input->tensor)) {
       return false;
     }
   }
@@ -154,9 +186,7 @@ DiTTensorSources DiTTensorSources::to(const torch::Device& device,
   DiTTensorSources result;
   result.entries_.reserve(entries_.size());
   for (const NamedTensor& input : entries_) {
-    const torch::ScalarType target_dtype =
-        input.name == "prompt_audio" ? torch::kFloat32 : dtype;
-    result.add(input.name, input.tensor.to(device, target_dtype));
+    result.add(input.name, input.tensor.to(device, dtype), input.parameters);
   }
   return result;
 }

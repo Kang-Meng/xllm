@@ -44,7 +44,8 @@ class DiTRequest : public RequestBase {
 
   bool finished() const;
 
-  void handle_forward_output(torch::Tensor output);
+  void handle_forward_output(torch::Tensor output,
+                             torch::Tensor audio_output = torch::Tensor());
 
   void handle_forward_text_output(const std::string& text);
 

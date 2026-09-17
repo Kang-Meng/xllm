@@ -69,9 +69,9 @@ class FluxControlPipelineImpl : public FluxPipelineBaseImpl {
                          ? std::nullopt
                          : std::make_optional(input.prompts_2);
 
-    torch::Tensor control_image = input.image_sources.empty()
+    torch::Tensor control_image = input.media_sources.empty()
                                       ? torch::Tensor()
-                                      : input.image_sources.at(0).tensor;
+                                      : input.media_sources.at(0).tensor;
 
     std::optional<torch::Tensor> latents = input.tensor_sources.get("latent");
     std::optional<torch::Tensor> prompt_embeds =

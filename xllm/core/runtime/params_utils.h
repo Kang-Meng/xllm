@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <optional>
+
 #include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/model/model_input_params.h"
 #include "framework/parallel_state/parallel_args.h"
@@ -63,6 +65,7 @@ void forward_output_to_proto(
     const torch::Tensor& out_logprobs,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    const std::vector<torch::Tensor>& dit_audio,
     const std::vector<JsonObjectOutputError>& json_object_errors,
     proto::ForwardOutput* pb_forward_output);
 
@@ -91,6 +94,9 @@ bool storage_prefetch_request_to_proto(const StoragePrefetchRequest& request,
 bool proto_to_storage_prefetch_request(
     const proto::PrefetchRequest& proto_request,
     StoragePrefetchRequest* request);
+
+std::optional<TensorParameters> proto_to_tensor_parameters(
+    const proto::Tensor& proto_tensor);
 
 bool dit_forward_input_to_proto(const DiTForwardInput& dit_inputs,
                                 proto::DiTForwardInput* pb_dit_inputs);

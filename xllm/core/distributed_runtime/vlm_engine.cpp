@@ -25,6 +25,7 @@ limitations under the License.
 #include <boost/algorithm/string.hpp>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -448,7 +449,8 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
         // if it's not enabled, process_sample_output will append the real
         // token, if it's enabled, this false here will append the fake token in
         // process_sample_output
-        batch[dp_rank].process_sample_output(result.value(), false);
+        batch[dp_rank].process_sample_output(
+            result.value(), /*replace_fake_token=*/false, std::cref(args_));
       } else {
         batch[dp_rank].process_beam_search_output(result.value(), false);
       }

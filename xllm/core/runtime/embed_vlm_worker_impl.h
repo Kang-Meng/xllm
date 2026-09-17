@@ -18,7 +18,8 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
-#include "core/common/global_flags.h"
+#include <optional>
+
 #include "executor.h"
 #include "forward_params.h"
 #include "framework/model/causal_vlm.h"
@@ -42,6 +43,9 @@ class EmbedVLMWorkerImpl : public WorkerImpl {
   bool init_model(ModelContext& context) override;
 
   std::optional<ForwardOutput> step(const ForwardInput& input) override;
+
+ private:
+  bool use_aux_hidden_states_ = false;
 };
 
 }  // namespace xllm

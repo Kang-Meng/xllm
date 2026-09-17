@@ -50,10 +50,9 @@ namespace xllm {
 // pixel_values_videos + video_grid_thw), which GLM4VPromptProcessor then
 // expands into video_start/video_token/video_end placeholders. The two
 // masks are disjoint, so image and video coexist in one batch.
-using Glm5NextVLMultimodalProcessor =
-    MultimodalProcessor<GLM4VPromptProcessor,
-                        Qwen2VLImageProcessor,
-                        Glm4VVideoProcessor>;
+using Glm5NextVLMultimodalProcessor = MultimodalProcessor<GLM4VPromptProcessor,
+                                                          Qwen2VLImageProcessor,
+                                                          Glm4VVideoProcessor>;
 
 REGISTER_MULTIMODAL_PROCESSOR(glm5_next, Glm5NextVLMultimodalProcessor);
 

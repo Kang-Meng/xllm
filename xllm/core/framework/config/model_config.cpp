@@ -53,6 +53,16 @@ DEFINE_bool(use_ctc,
             "one. The server renders the CTC chat-template region "
             "(context variable use_ctc, default off) only while this is "
             "on, so a client must not emit its own CTC segment.");
+DEFINE_int32(capture_hidden_state_layer,
+             -1,
+             "For embedding (VLM) workers: which hidden state layer to "
+             "return. -1 (default) uses the final hidden state and keeps the "
+             "legacy behavior; >=0 captures that layer's aux_hidden_states.");
+
+DEFINE_bool(enable_return_embedding_modality_tags,
+            false,
+            "For embedding (VLM) workers: append per-token modality tags to "
+            "full multimodal embedding outputs.");
 
 DEFINE_int32(limit_image_per_prompt,
              8,
@@ -135,6 +145,8 @@ void ModelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(backend);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(task);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_ctc);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(capture_hidden_state_layer);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_return_embedding_modality_tags);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(limit_image_per_prompt);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_encoder_cache_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_processor_cache_items);
@@ -187,6 +199,8 @@ void ModelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(backend);
   XLLM_CONFIG_ASSIGN_FROM_JSON(task);
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_ctc);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(capture_hidden_state_layer);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_return_embedding_modality_tags);
   XLLM_CONFIG_ASSIGN_FROM_JSON(limit_image_per_prompt);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_encoder_cache_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_processor_cache_items);
@@ -210,6 +224,10 @@ void ModelConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, backend);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, task);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, use_ctc);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, capture_hidden_state_layer);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_return_embedding_modality_tags);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, limit_image_per_prompt);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

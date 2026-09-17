@@ -116,17 +116,20 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
     input.negative_prompts_2.clear();
   }
 
-  const DiTImageSources& first_image_sources =
-      request_vec_[0]->state().input_params().image_sources;
-  for (size_t index = 0; index < first_image_sources.size(); ++index) {
+  const DiTMediaSources& first_media_sources =
+      request_vec_[0]->state().input_params().media_sources;
+  for (size_t index = 0; index < first_media_sources.size(); ++index) {
     std::vector<torch::Tensor> tensors;
     tensors.reserve(batch_size);
     for (const auto& request : request_vec_) {
       tensors.emplace_back(
-          request->state().input_params().image_sources.at(index).tensor);
+          request->state().input_params().media_sources.at(index).tensor);
     }
-    input.image_sources.add(first_image_sources.at(index).name,
-                            batch_tensors(tensors));
+    const MediaNamedTensor& source = first_media_sources.at(index);
+    input.media_sources.add(source.name,
+                            source.modality,
+                            batch_tensors(tensors),
+                            source.parameters);
   }
 
   const DiTTensorSources& first_tensor_sources =
@@ -140,7 +143,8 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
       CHECK(tensor.has_value());
       tensors.emplace_back(*tensor);
     }
-    input.tensor_sources.add(tensor_input.name, batch_tensors(tensors));
+    input.tensor_sources.add(
+        tensor_input.name, batch_tensors(tensors), tensor_input.parameters);
   }
 
   return input;
@@ -158,10 +162,15 @@ void DiTBatch::process_forward_output(const DiTForwardOutput& output) {
     return;
   }
   CHECK(request_vec_.size() == output.tensors.size());
+  CHECK(output.audio_tensors.empty() ||
+        output.audio_tensors.size() == output.tensors.size());
   for (int32_t idx = 0; idx < static_cast<int32_t>(request_vec_.size());
        ++idx) {
     auto& request = request_vec_[idx];
-    request->handle_forward_output(output.tensors[idx]);
+    torch::Tensor audio_output = output.audio_tensors.empty()
+                                     ? torch::Tensor()
+                                     : output.audio_tensors[idx];
+    request->handle_forward_output(output.tensors[idx], audio_output);
   }
 }
 

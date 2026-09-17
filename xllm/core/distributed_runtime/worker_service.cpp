@@ -429,6 +429,7 @@ void WorkerService::step(
     std::vector<SpeculativeTokenStats>& speculative_token_stats,
     std::vector<torch::Tensor>& dit_images,
     std::vector<std::string>& dit_text_output,
+    std::vector<torch::Tensor>& dit_audio,
     torch::Tensor& expert_load_data,
     int64_t& prepared_token,
     torch::Tensor& src_seq_idxes,
@@ -487,6 +488,12 @@ void WorkerService::step(
                 safe_to(dit_image, torch::kCPU, /*non_blocking=*/true));
           }
           dit_text_output = dit_forward_output.text_output;
+          dit_audio.clear();
+          dit_audio.reserve(dit_forward_output.audio_tensors.size());
+          for (auto audio : dit_forward_output.audio_tensors) {
+            dit_audio.emplace_back(
+                safe_to(audio, torch::kCPU, /*non_blocking=*/true));
+          }
 
           // [num_seq]
           next_tokens = safe_to(sample_output.next_tokens,
@@ -592,6 +599,7 @@ void WorkerService::create_polling_shm_thread(
           std::vector<SpeculativeTokenStats> speculative_token_stats;
           std::vector<torch::Tensor> dit_images;
           std::vector<std::string> dit_text_output;
+          std::vector<torch::Tensor> dit_audio;
           torch::Tensor expert_load_data;
           int64_t prepared_token = -1;
 
@@ -611,6 +619,7 @@ void WorkerService::create_polling_shm_thread(
                speculative_token_stats,
                dit_images,
                dit_text_output,
+               dit_audio,
                expert_load_data,
                prepared_token,
                src_seq_idxes,
@@ -628,6 +637,7 @@ void WorkerService::create_polling_shm_thread(
                                                    speculative_token_stats,
                                                    dit_images,
                                                    dit_text_output,
+                                                   dit_audio,
                                                    expert_load_data,
                                                    prepared_token,
                                                    src_seq_idxes,
@@ -1012,6 +1022,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         std::vector<SpeculativeTokenStats> speculative_token_stats;
         std::vector<torch::Tensor> dit_images;
         std::vector<std::string> dit_text_output;
+        std::vector<torch::Tensor> dit_audio;
         torch::Tensor expert_load_data;
         int64_t prepared_token = -1;
         // beam search kernel output
@@ -1030,6 +1041,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
              speculative_token_stats,
              dit_images,
              dit_text_output,
+             dit_audio,
              expert_load_data,
              prepared_token,
              src_seq_idxes,
@@ -1051,6 +1063,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                                 out_logprobs,
                                 dit_images,
                                 dit_text_output,
+                                dit_audio,
                                 json_object_errors,
                                 pb_forward_output);
         COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
@@ -1087,6 +1100,7 @@ void WorkerService::GetLastStepResult(
           std::vector<SpeculativeTokenStats> speculative_token_stats;
           std::vector<torch::Tensor> dit_images;
           std::vector<std::string> dit_text_output;
+          std::vector<torch::Tensor> dit_audio;
           auto copy_output_to_host = [&]() {
             if (options_.enable_schedule_overlap()) {
               CHECK(stream_->wait_event(forward_output.ready_event))
@@ -1111,6 +1125,11 @@ void WorkerService::GetLastStepResult(
             }
             dit_text_output =
                 forward_outputs.value().dit_forward_output.text_output;
+            dit_audio.reserve(
+                forward_output.dit_forward_output.audio_tensors.size());
+            for (auto audio : forward_output.dit_forward_output.audio_tensors) {
+              dit_audio.emplace_back(audio);
+            }
 
             // [num_seq]
             next_tokens = safe_to(sample_output.next_tokens,
@@ -1171,7 +1190,7 @@ void WorkerService::GetLastStepResult(
               forward_output.is_graph_warmup);
 
           if (next_tokens.defined() || !dit_images.empty() ||
-              !dit_text_output.empty() ||
+              !dit_text_output.empty() || !dit_audio.empty() ||
               ::xllm::EPLBConfig::get_instance().enable_eplb() ||
               !forward_output.json_object_errors.empty()) {
             const std::vector<std::vector<torch::Tensor>> mm_embeddings;
@@ -1189,6 +1208,7 @@ void WorkerService::GetLastStepResult(
                                     out_logprobs,
                                     dit_images,
                                     dit_text_output,
+                                    dit_audio,
                                     forward_output.json_object_errors,
                                     pb_forward_output);
           }

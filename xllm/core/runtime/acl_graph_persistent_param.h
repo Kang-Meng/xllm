@@ -352,11 +352,10 @@ class GraphPersistentParam final {
                                        int32_t dp_layout_size);
   void update_persistent_cp_ep_meta(const CpEpMeta& src,
                                     uint32_t padded_tokens);
-  void replace_capture_dp_ep_padding(
-      const DpEpPaddingData& src,
-      uint32_t padded_tokens,
-      int32_t dp_layout_size,
-      DpEpPaddingData& dst) const;
+  void replace_capture_dp_ep_padding(const DpEpPaddingData& src,
+                                     uint32_t padded_tokens,
+                                     int32_t dp_layout_size,
+                                     DpEpPaddingData& dst) const;
   void replace_capture_cp_ep_meta(const CpEpMeta& src, CpEpMeta& dst) const;
   // Refresh the persistent mega active mask: first |actual_tokens| rows are
   // marked active, the rest of the |padded_tokens| prefix stays zero.

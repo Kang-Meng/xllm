@@ -170,6 +170,7 @@ class WorkerService : public proto::DistributeWorker {
             std::vector<SpeculativeTokenStats>& speculative_token_stats,
             std::vector<torch::Tensor>& dit_images,
             std::vector<std::string>& dit_text_output,
+            std::vector<torch::Tensor>& dit_audio,
             torch::Tensor& expert_load_data,
             int64_t& prepared_token,
             torch::Tensor& src_seq_idxes,

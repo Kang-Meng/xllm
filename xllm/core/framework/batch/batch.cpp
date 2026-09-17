@@ -540,7 +540,8 @@ void Batch::refresh_onerec_prefill_output_targets() {
 }
 
 void Batch::process_sample_output(const RawForwardOutput& raw_output,
-                                  bool replace_fake_token) {
+                                  bool replace_fake_token,
+                                  OptionalModelArgsRef model_args) {
   const std::vector<Sequence*> sequences = get_sequences();
   const std::unordered_set<std::string> failed_request_ids =
       fail_json_object_requests(sequences, raw_output.json_object_errors);
@@ -562,7 +563,7 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
       const auto& seq_mm_embeddings =
           raw_output.outputs[output_idx].mm_embeddings;
       if (!seq_mm_embeddings.empty()) {
-        seq->update_mm_embeddings(seq_mm_embeddings);
+        seq->update_mm_embeddings(seq_mm_embeddings, model_args);
       }
     }
 

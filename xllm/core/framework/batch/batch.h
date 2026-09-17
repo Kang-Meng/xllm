@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "core/framework/multimodal/mm_data.h"
@@ -111,7 +112,8 @@ class Batch {
                              bool force_requested_beam_result_size = false);
 
   void process_sample_output(const RawForwardOutput& raw_output,
-                             bool replace_fake_token);
+                             bool replace_fake_token,
+                             OptionalModelArgsRef model_args = std::nullopt);
 
   // process output for beam search kernel
   void process_beam_search_output(const RawForwardOutput& raw_output,

@@ -218,13 +218,21 @@ TEST(BatchPackedInputTest, PackedProtoPreservesDiTGenerationParams) {
   ForwardInput input;
   DiTForwardInput& dit_input = input.input_params.dit_forward_input.emplace();
   dit_input.batch_size = 1;
-  dit_input.image_sources.add(
-      "unknown", torch::tensor({1, 2}, torch::dtype(torch::kUInt8)));
-  dit_input.image_sources.add(
-      "unknown", torch::tensor({3, 4}, torch::dtype(torch::kUInt8)));
-  dit_input.image_sources.add(
-      "mask_image", torch::tensor({5, 6}, torch::dtype(torch::kUInt8)));
-  dit_input.tensor_sources.add("prompt_embed", torch::tensor({1.5f, 2.5f}));
+  dit_input.media_sources.add(
+      "prompt_video",
+      "video",
+      torch::tensor({1, 2}, torch::dtype(torch::kUInt8)),
+      {{std::string("prompt_video_fps"), 24.0}});
+  dit_input.media_sources.add(
+      "image", "image", torch::tensor({3, 4}, torch::dtype(torch::kUInt8)));
+  dit_input.media_sources.add(
+      "mask_image",
+      "image",
+      torch::tensor({5, 6}, torch::dtype(torch::kUInt8)));
+  dit_input.tensor_sources.add(
+      "prompt_embed",
+      torch::tensor({1.5f, 2.5f}),
+      {{std::string("prompt_token_tags"), std::vector<int64_t>{0, 1}}});
   dit_input.tensor_sources.add("latent", torch::tensor({3.5f, 4.5f}));
   DiTGenerationParams& params = dit_input.generation_params;
   params.width = 640;
@@ -274,16 +282,23 @@ TEST(BatchPackedInputTest, PackedProtoPreservesDiTGenerationParams) {
   const DiTForwardInput& unpacked_dit_input =
       *unpacked_input.input_params.dit_forward_input;
   EXPECT_EQ(unpacked_dit_input.generation_params, params);
-  ASSERT_EQ(unpacked_dit_input.image_sources.size(), 3u);
-  EXPECT_EQ(unpacked_dit_input.image_sources.at(0).name, "unknown");
-  EXPECT_EQ(unpacked_dit_input.image_sources.at(1).name, "unknown");
-  EXPECT_EQ(unpacked_dit_input.image_sources.at(2).name, "mask_image");
-  EXPECT_TRUE(torch::equal(unpacked_dit_input.image_sources.at(0).tensor,
-                           dit_input.image_sources.at(0).tensor));
+  ASSERT_EQ(unpacked_dit_input.media_sources.size(), 3u);
+  EXPECT_EQ(unpacked_dit_input.media_sources.at(0).name, "prompt_video");
+  EXPECT_EQ(unpacked_dit_input.media_sources.at(0).modality, "video");
+  EXPECT_EQ(unpacked_dit_input.media_sources.at(1).name, "image");
+  EXPECT_EQ(unpacked_dit_input.media_sources.at(2).name, "mask_image");
+  EXPECT_TRUE(torch::equal(unpacked_dit_input.media_sources.at(0).tensor,
+                           dit_input.media_sources.at(0).tensor));
+  EXPECT_EQ(unpacked_dit_input.media_sources.at(0).parameters,
+            dit_input.media_sources.at(0).parameters);
   ASSERT_EQ(unpacked_dit_input.tensor_sources.size(), 2u);
   EXPECT_TRUE(
       torch::equal(*unpacked_dit_input.tensor_sources.get("prompt_embed"),
                    *dit_input.tensor_sources.get("prompt_embed")));
+  EXPECT_EQ(
+      unpacked_dit_input.tensor_sources.get_namedtensor("prompt_embed")
+          ->parameters,
+      dit_input.tensor_sources.get_namedtensor("prompt_embed")->parameters);
   EXPECT_TRUE(torch::equal(*unpacked_dit_input.tensor_sources.get("latent"),
                            *dit_input.tensor_sources.get("latent")));
 
@@ -291,13 +306,20 @@ TEST(BatchPackedInputTest, PackedProtoPreservesDiTGenerationParams) {
   ASSERT_TRUE(dit_forward_input_to_proto(dit_input, &proto_input));
   DiTForwardInput proto_input_round_trip;
   ASSERT_TRUE(proto_to_dit_forward_input(proto_input, proto_input_round_trip));
-  ASSERT_EQ(proto_input_round_trip.image_sources.size(), 3u);
-  EXPECT_EQ(proto_input_round_trip.image_sources.at(2).name, "mask_image");
-  EXPECT_TRUE(torch::equal(proto_input_round_trip.image_sources.at(1).tensor,
-                           dit_input.image_sources.at(1).tensor));
+  ASSERT_EQ(proto_input_round_trip.media_sources.size(), 3u);
+  EXPECT_EQ(proto_input_round_trip.media_sources.at(2).name, "mask_image");
+  EXPECT_EQ(proto_input_round_trip.media_sources.at(2).modality, "image");
+  EXPECT_TRUE(torch::equal(proto_input_round_trip.media_sources.at(1).tensor,
+                           dit_input.media_sources.at(1).tensor));
+  EXPECT_EQ(proto_input_round_trip.media_sources.at(0).parameters,
+            dit_input.media_sources.at(0).parameters);
   EXPECT_TRUE(
       torch::equal(*proto_input_round_trip.tensor_sources.get("prompt_embed"),
                    *dit_input.tensor_sources.get("prompt_embed")));
+  EXPECT_EQ(
+      proto_input_round_trip.tensor_sources.get_namedtensor("prompt_embed")
+          ->parameters,
+      dit_input.tensor_sources.get_namedtensor("prompt_embed")->parameters);
   EXPECT_TRUE(torch::equal(*proto_input_round_trip.tensor_sources.get("latent"),
                            *dit_input.tensor_sources.get("latent")));
 

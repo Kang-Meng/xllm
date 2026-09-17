@@ -278,6 +278,12 @@ message NamedTensor {
   Tensor tensor = 2;
 }
 
+message MediaNamedTensor {
+  string name = 1;
+  string modality = 2;
+  Tensor tensor = 3;
+}
+
 message DiTForwardInput {
   int32 batch_size = 1;
   
@@ -299,16 +305,17 @@ message DiTForwardInput {
 
   reserved 17;
 
-  reserved 19;
+  reserved 18, 19;
   optional string audio_prompt_text = 20;
 
-  repeated NamedTensor image_sources = 21;
+  repeated MediaNamedTensor media_sources = 21;
   repeated NamedTensor tensor_sources = 22;
 }
 
 message DiTForwardOutput {
   TensorList tensors = 1;
   repeated string text_output = 2;
+  TensorList audio_tensors = 3;
 }
 
 message DiTGenerationParams {

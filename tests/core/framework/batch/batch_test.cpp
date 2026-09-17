@@ -1531,6 +1531,7 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
                           undefined,
                           /*dit_images=*/{},
                           /*dit_text_output=*/{},
+                          /*dit_audio=*/{},
                           /*json_object_errors=*/{},
                           &proto_output);
   RawForwardOutput raw_output;
@@ -1915,6 +1916,7 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
                           undefined,
                           /*dit_images=*/{},
                           /*dit_text_output=*/{},
+                          /*dit_audio=*/{},
                           errors,
                           &proto_output);
 
@@ -1962,6 +1964,7 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
                                               speculative_token_stats,
                                               /*dit_images=*/{},
                                               /*dit_text_output=*/{},
+                                              /*dit_audio=*/{},
                                               undefined,
                                               /*prepared_layer_id=*/-1,
                                               undefined,

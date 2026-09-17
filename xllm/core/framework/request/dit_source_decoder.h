@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <google/protobuf/repeated_ptr_field.h>
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -33,29 +34,30 @@ class ThreadPool;
 
 class DiTSourceDecoder final {
  public:
-  using DecodeFn =
-      std::function<bool(std::string_view raw_bytes, torch::Tensor& tensor)>;
-
   explicit DiTSourceDecoder(const BinaryPayload& request_payload);
 
-  bool add_source(const proto::MediaSource& source,
-                  std::string default_name,
-                  Status& status);
+  bool add_source(const proto::MediaSource& source, Status& status);
 
   bool add_sources(
       const google::protobuf::RepeatedPtrField<proto::MediaSource>& sources,
-      std::string_view default_name,
       Status& status);
 
   void add_sources(
       const google::protobuf::RepeatedPtrField<std::string>& sources,
       std::string_view default_name);
 
-  bool decode(const DecodeFn& decode_fn,
-              std::vector<NamedTensor>& outputs,
-              Status& status) const;
+  bool decode(std::vector<MediaNamedTensor>& outputs,
+              Status& status,
+              int32_t audio_channels = 1,
+              int64_t audio_sampling_rate = 32000) const;
 
  private:
+  using IndexedDecodeFn = std::function<bool(size_t index,
+                                             std::string_view modality,
+                                             std::string_view raw_bytes,
+                                             torch::Tensor& tensor,
+                                             TensorParameters& parameters)>;
+
   enum class Encoding : uint8_t {
     BASE64,
     BINARY,
@@ -63,6 +65,7 @@ class DiTSourceDecoder final {
 
   struct Input {
     std::string name;
+    std::string modality;
     std::string_view encoded_data;
     size_t binary_offset = 0;
     size_t binary_length = 0;
@@ -70,6 +73,9 @@ class DiTSourceDecoder final {
   };
 
   static ThreadPool& thread_pool();
+  bool decode_inputs(const IndexedDecodeFn& decode_fn,
+                     std::vector<MediaNamedTensor>& outputs,
+                     Status& status) const;
 
   const BinaryPayload& request_payload_;
   std::vector<Input> inputs_;

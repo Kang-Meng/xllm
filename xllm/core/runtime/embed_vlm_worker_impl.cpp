@@ -45,6 +45,8 @@ bool EmbedVLMWorkerImpl::init_model(ModelContext& context) {
   CHECK(model_ == nullptr) << "Model is already initialized.";
 
   context.set_encoder_embedding_mode(false);
+  use_aux_hidden_states_ =
+      !context.get_model_args().layers_to_capture().empty();
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(
@@ -66,11 +68,18 @@ std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
   auto flatten_positions = input.positions.to(device_);
   auto params = input.input_params.to(device_);
   auto sampling_params = input.sampling_params.to(device_, dtype_);
-
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       flatten_tokens, flatten_positions, kv_caches_, params);
-  auto hidden_states = model_output.hidden_states;
+  torch::Tensor hidden_states;
+  if (use_aux_hidden_states_) {
+    CHECK(model_output.aux_hidden_states.defined())
+        << "Captured hidden states are required but the model did not return "
+           "aux_hidden_states";
+    hidden_states = model_output.aux_hidden_states;
+  } else {
+    hidden_states = model_output.hidden_states;
+  }
   ret = device_.synchronize_default_stream();
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
 
@@ -83,13 +92,12 @@ std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
   SampleOutput sample_output;
   if (sampling_params.selected_token_idxes.defined() &&
       input.sampling_params.is_embeddings) {
-    auto embeddings =
-        model_->pooler(hidden_states, sampling_params.selected_token_idxes);
     // split full embeddings and add them to mm_embeddings
     // so that the user could receive embeddings of images and texts
     if (::xllm::ModelConfig::get_instance()
             .enable_return_mm_full_embeddings()) {
       auto q_seq_len_vec = input.input_params.attention.host.q_seq_lens;
+      torch::Tensor embeddings = hidden_states;
       sample_output.mm_embeddings.reserve(q_seq_len_vec.size());
       int32_t token_start_idx = 0;
       for (auto seq_len : q_seq_len_vec) {
@@ -99,6 +107,8 @@ std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
         token_start_idx += seq_len;
       }
     } else {
+      torch::Tensor embeddings =
+          model_->pooler(hidden_states, sampling_params.selected_token_idxes);
       sample_output.embeddings = embeddings;
     }
     output.sample_output = sample_output;

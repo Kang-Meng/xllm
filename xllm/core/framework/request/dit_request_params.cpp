@@ -16,11 +16,13 @@ limitations under the License.
 
 #include "dit_request_params.h"
 
+#include <optional>
+
 #include "core/common/instance_name.h"
 #include "core/common/macros.h"
 #include "core/framework/config/dit_config.h"
-#include "core/framework/multimodal/mm_codec.h"
 #include "core/framework/request/dit_source_decoder.h"
+#include "core/runtime/params_utils.h"
 #include "core/util/utils.h"
 #include "core/util/uuid.h"
 #include "request.h"
@@ -52,7 +54,16 @@ bool decode_tensor_input(std::string_view name,
                                   "invalid " + std::string(name) + " tensor");
     return false;
   }
-  tensor_sources.add(std::string(name), std::move(tensor));
+  std::optional<TensorParameters> parameters =
+      proto_to_tensor_parameters(proto_tensor);
+  if (!parameters.has_value()) {
+    request_parse_status =
+        Status(StatusCode::INVALID_ARGUMENT,
+               "invalid " + std::string(name) + " tensor parameters");
+    return false;
+  }
+  tensor_sources.add(
+      std::string(name), std::move(tensor), std::move(*parameters));
   return true;
 }
 
@@ -173,26 +184,21 @@ DiTRequestParams::DiTRequestParams(const proto::ImageGenerationRequest& request,
       return;
     }
     DiTSourceDecoder image_decoder(request_payload);
-    if (!image_decoder.add_sources(input.image_sources(),
-                                   /*default_name=*/"unknown",
+    if (!image_decoder.add_sources(input.media_sources(),
                                    request_parse_status)) {
       return;
     }
     image_decoder.add_sources(input.images(),
                               /*default_name=*/"unknown");
-    std::vector<NamedTensor> decoded_images;
-    const auto decode_image = [](std::string_view raw_bytes,
-                                 torch::Tensor& tensor) {
-      OpenCVImageDecoder decoder;
-      return decoder.decode(raw_bytes, tensor);
-    };
-    if (!image_decoder.decode(
-            decode_image, decoded_images, request_parse_status)) {
+    std::vector<MediaNamedTensor> decoded_images;
+    if (!image_decoder.decode(decoded_images, request_parse_status)) {
       return;
     }
-    for (NamedTensor& image : decoded_images) {
-      input_params.image_sources.add(std::move(image.name),
-                                     std::move(image.tensor));
+    for (MediaNamedTensor& image : decoded_images) {
+      input_params.media_sources.add(std::move(image.name),
+                                     std::move(image.modality),
+                                     std::move(image.tensor),
+                                     std::move(image.parameters));
     }
   }
 
@@ -331,36 +337,21 @@ DiTRequestParams::DiTRequestParams(const proto::AudioGenerationRequest& request,
 
   if (input.has_prompt_audio()) {
     DiTSourceDecoder audio_decoder(request_payload);
-    if (!audio_decoder.add_source(input.prompt_audio(),
-                                  /*default_name=*/"prompt_audio",
-                                  request_parse_status)) {
+    if (!audio_decoder.add_source(input.prompt_audio(), request_parse_status)) {
       return;
     }
-    std::vector<NamedTensor> decoded_audio;
-    const int64_t sample_rate = generation_params.audio_sampling_rate;
-    const auto decode_audio = [sample_rate](std::string_view raw_bytes,
-                                            torch::Tensor& tensor) {
-      FFmpegAudioDecoder decoder;
-      AudioMetadata metadata;
-      torch::Tensor decoded;
-      if (!decoder.decode(raw_bytes, decoded, metadata, sample_rate)) {
-        LOG(ERROR) << "prompt_audio decode failed";
-        return false;
-      }
-      if (decoded.dim() == 1) {
-        decoded = decoded.unsqueeze(0);
-      } else if (decoded.dim() == 2 && decoded.size(0) > 1) {
-        decoded = decoded.mean(0, /*keepdim=*/true);
-      }
-      tensor = decoded.to(torch::kFloat32);
-      return true;
-    };
-    if (!audio_decoder.decode(
-            decode_audio, decoded_audio, request_parse_status)) {
+    std::vector<MediaNamedTensor> decoded_audio;
+    if (!audio_decoder.decode(decoded_audio,
+                              request_parse_status,
+                              /*audio_channels=*/1,
+                              generation_params.audio_sampling_rate)) {
       return;
     }
-    input_params.tensor_sources.add("prompt_audio",
-                                    std::move(decoded_audio.front().tensor));
+    MediaNamedTensor& audio = decoded_audio.front();
+    input_params.media_sources.add("prompt_audio",
+                                   std::move(audio.modality),
+                                   std::move(audio.tensor),
+                                   std::move(audio.parameters));
   }
   if (input.has_prompt_text()) {
     input_params.audio_prompt_text = input.prompt_text();
@@ -387,25 +378,27 @@ DiTRequestParams::DiTRequestParams(const proto::VideoGenerationRequest& request,
             input_params, input, request_payload, request_parse_status)) {
       return;
     }
-    DiTSourceDecoder image_decoder(request_payload);
-    if (!image_decoder.add_sources(input.image_sources(),
-                                   /*default_name=*/"unknown",
+    DiTSourceDecoder media_decoder(request_payload);
+    if (!media_decoder.add_sources(input.media_sources(),
                                    request_parse_status)) {
       return;
     }
-    std::vector<NamedTensor> decoded_images;
-    const auto decode_image = [](std::string_view raw_bytes,
-                                 torch::Tensor& tensor) {
-      OpenCVImageDecoder decoder;
-      return decoder.decode(raw_bytes, tensor);
-    };
-    if (!image_decoder.decode(
-            decode_image, decoded_images, request_parse_status)) {
+    const int64_t audio_sampling_rate =
+        request.has_parameters() && request.parameters().has_sampling_rate()
+            ? request.parameters().sampling_rate()
+            : 32000;
+    std::vector<MediaNamedTensor> decoded_sources;
+    if (!media_decoder.decode(decoded_sources,
+                              request_parse_status,
+                              /*audio_channels=*/2,
+                              audio_sampling_rate)) {
       return;
     }
-    for (NamedTensor& image : decoded_images) {
-      input_params.image_sources.add(std::move(image.name),
-                                     std::move(image.tensor));
+    for (MediaNamedTensor& source : decoded_sources) {
+      input_params.media_sources.add(std::move(source.name),
+                                     std::move(source.modality),
+                                     std::move(source.tensor),
+                                     std::move(source.parameters));
     }
   }
 
@@ -421,6 +414,9 @@ DiTRequestParams::DiTRequestParams(const proto::VideoGenerationRequest& request,
     }
     if (params.has_fps()) {
       generation_params.video_fps = params.fps();
+    }
+    if (params.has_sampling_rate()) {
+      generation_params.audio_sampling_rate = params.sampling_rate();
     }
     if (params.has_guidance_scale_2()) {
       generation_params.guidance_scale_2 = params.guidance_scale_2();

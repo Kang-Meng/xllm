@@ -580,6 +580,15 @@ struct ModelArgs {
   PROPERTY(int64_t, added_kv_proj_dim) = -1;
   PROPERTY(int64_t, pos_embed_seq_len) = -1;
 
+  // MiniMax-H3 DiT related args
+  PROPERTY(int64_t, num_refiner_layers) = 0;
+  PROPERTY(int64_t, audio_in_channels) = 0;
+  PROPERTY(int64_t, time_embed_hidden_dim) = 0;
+  PROPERTY(int64_t, time_embed_dim) = 0;
+  PROPERTY(int64_t, rope_freq_dim) = 0;
+  PROPERTY(float, qk_norm_eps) = 1e-5f;
+  PROPERTY(float, final_norm_eps) = 1e-5f;
+
   // cola-dlm dit related args
   PROPERTY(int64_t, txt_dim) = 0;
   PROPERTY(int64_t, txt_in_channels) = 0;
@@ -660,6 +669,25 @@ struct ModelArgs {
   PROPERTY(double, dropout) = 0;
   PROPERTY(std::vector<double>, latents_mean) = {};
   PROPERTY(std::vector<double>, latents_std) = {};
+
+  // MiniMax-H3 VAE related args
+  PROPERTY(std::vector<int64_t>, spatial_downsample_factors) = {};
+  PROPERTY(std::vector<int64_t>, temporal_downsample_factors) = {};
+  PROPERTY(std::string, spatial_padding_mode) = "reflect";
+  PROPERTY(int64_t, decoder_num_register_tokens) = 0;
+  PROPERTY(int64_t, decoder_ffn_mult) = 0;
+  PROPERTY(float, decoder_rope_theta) = 0.0f;
+  PROPERTY(float, decoder_rope_dim_ratio) = 0.0f;
+  PROPERTY(float, decoder_norm_eps) = 1e-5f;
+  PROPERTY(int64_t, encoder_dim) = 0;
+  PROPERTY(std::vector<int64_t>, encoder_rates) = {};
+  PROPERTY(int64_t, decoder_dim) = 0;
+  PROPERTY(std::vector<int64_t>, decoder_rates) = {};
+  PROPERTY(std::vector<int64_t>, decoder_kernel_sizes) = {};
+  PROPERTY(std::vector<int64_t>, resblock_kernel_sizes) = {};
+  PROPERTY(int64_t, sampling_rate) = 32000;
+  PROPERTY(int64_t, clip_length) = 0;
+  PROPERTY(int64_t, token_drop) = 0;
 
   // qwen_image_edit_2511 dit related args
   PROPERTY(bool, zero_cond_t) = false;

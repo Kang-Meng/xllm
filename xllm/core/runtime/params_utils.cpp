@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <variant>
+
 #include "common/global_flags.h"
 #include "common/macros.h"
 #include "common/metrics.h"
@@ -176,6 +178,7 @@ void forward_output_to_proto(
     const torch::Tensor& out_logprobs,
     const std::vector<torch::Tensor>& dit_images,
     const std::vector<std::string>& dit_text_output,
+    const std::vector<torch::Tensor>& dit_audio,
     const std::vector<JsonObjectOutputError>& json_object_errors,
     proto::ForwardOutput* pb_forward_output) {
   Timer timer;
@@ -363,6 +366,12 @@ void forward_output_to_proto(
       pb_dit_output->add_text_output(text);
     }
   }
+  if (!dit_audio.empty()) {
+    TORCH_TENSOR_VEC_TO_PROTO_TENSOR_LIST(
+        pb_forward_output->mutable_dit_forward_output()
+            ->mutable_audio_tensors(),
+        dit_audio);
+  }
   for (const JsonObjectOutputError& error : json_object_errors) {
     proto::JsonObjectOutputError* pb_error =
         pb_forward_output->add_json_object_errors();
@@ -506,6 +515,79 @@ bool proto_to_storage_prefetch_request(
   return request->valid();
 }
 
+namespace {
+
+bool tensor_parameters_to_proto(const TensorParameters& parameters,
+                                proto::Tensor* proto_tensor) {
+  auto* proto_parameters = proto_tensor->mutable_parameters();
+  for (const auto& [name, value] : parameters) {
+    proto::Parameter& proto_parameter = (*proto_parameters)[name];
+    if (const bool* typed_value = std::get_if<bool>(&value)) {
+      proto_parameter.set_bool_param(*typed_value);
+    } else if (const int64_t* typed_value = std::get_if<int64_t>(&value)) {
+      proto_parameter.set_int64_param(*typed_value);
+    } else if (const std::string* typed_value =
+                   std::get_if<std::string>(&value)) {
+      proto_parameter.set_string_param(*typed_value);
+    } else if (const double* typed_value = std::get_if<double>(&value)) {
+      proto_parameter.set_double_param(*typed_value);
+    } else if (const uint64_t* typed_value = std::get_if<uint64_t>(&value)) {
+      proto_parameter.set_uint64_param(*typed_value);
+    } else if (const std::vector<int64_t>* typed_value =
+                   std::get_if<std::vector<int64_t>>(&value)) {
+      proto_parameter.mutable_int64_tensor_param()->Reserve(
+          static_cast<int32_t>(typed_value->size()));
+      for (const int64_t item : *typed_value) {
+        proto_parameter.add_int64_tensor_param(item);
+      }
+    } else {
+      LOG(ERROR) << "Unsupported tensor parameter: " << name;
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+std::optional<TensorParameters> proto_to_tensor_parameters(
+    const proto::Tensor& proto_tensor) {
+  TensorParameters parameters;
+  for (const auto& [name, proto_parameter] : proto_tensor.parameters()) {
+    if (name == "is_binary" || name == "offset" || name == "len") {
+      continue;
+    }
+    const int32_t value_count =
+        static_cast<int32_t>(proto_parameter.has_bool_param()) +
+        static_cast<int32_t>(proto_parameter.has_int64_param()) +
+        static_cast<int32_t>(proto_parameter.has_string_param()) +
+        static_cast<int32_t>(proto_parameter.has_double_param()) +
+        static_cast<int32_t>(proto_parameter.has_uint64_param()) +
+        static_cast<int32_t>(proto_parameter.int64_tensor_param_size() > 0);
+    if (value_count != 1) {
+      LOG(ERROR) << "Tensor parameter must contain exactly one value: " << name;
+      return std::nullopt;
+    }
+    if (proto_parameter.has_bool_param()) {
+      parameters.emplace(name, proto_parameter.bool_param());
+    } else if (proto_parameter.has_int64_param()) {
+      parameters.emplace(name, proto_parameter.int64_param());
+    } else if (proto_parameter.has_string_param()) {
+      parameters.emplace(name, proto_parameter.string_param());
+    } else if (proto_parameter.has_double_param()) {
+      parameters.emplace(name, proto_parameter.double_param());
+    } else if (proto_parameter.has_uint64_param()) {
+      parameters.emplace(name, proto_parameter.uint64_param());
+    } else {
+      parameters.emplace(
+          name,
+          std::vector<int64_t>(proto_parameter.int64_tensor_param().begin(),
+                               proto_parameter.int64_tensor_param().end()));
+    }
+  }
+  return parameters;
+}
+
 bool dit_forward_input_to_proto(const DiTForwardInput& dit_inputs,
                                 proto::DiTForwardInput* pb_dit_inputs) {
   pb_dit_inputs->set_batch_size(dit_inputs.batch_size);
@@ -531,13 +613,33 @@ bool dit_forward_input_to_proto(const DiTForwardInput& dit_inputs,
             LOG(ERROR) << "Failed to serialize named tensor: " << source.name;
             return false;
           }
+          if (!tensor_parameters_to_proto(source.parameters,
+                                          pb_source->mutable_tensor())) {
+            return false;
+          }
         }
         return true;
       };
 
-  if (!serialize_named_tensors(dit_inputs.image_sources.entries(),
-                               pb_dit_inputs->mutable_image_sources()) ||
-      !serialize_named_tensors(dit_inputs.tensor_sources.entries(),
+  pb_dit_inputs->mutable_media_sources()->Reserve(
+      static_cast<int32_t>(dit_inputs.media_sources.size()));
+  for (const MediaNamedTensor& source : dit_inputs.media_sources.entries()) {
+    proto::MediaNamedTensor* pb_source =
+        pb_dit_inputs->mutable_media_sources()->Add();
+    pb_source->set_name(source.name);
+    pb_source->set_modality(source.modality);
+    if (!torch_tensor_to_proto_tensor(source.tensor,
+                                      pb_source->mutable_tensor())) {
+      LOG(ERROR) << "Failed to serialize media tensor: " << source.name;
+      return false;
+    }
+    if (!tensor_parameters_to_proto(source.parameters,
+                                    pb_source->mutable_tensor())) {
+      return false;
+    }
+  }
+
+  if (!serialize_named_tensors(dit_inputs.tensor_sources.entries(),
                                pb_dit_inputs->mutable_tensor_sources())) {
     return false;
   }
@@ -635,13 +737,22 @@ bool proto_to_dit_forward_input(const proto::DiTForwardInput& pb_dit_inputs,
 
   dit_inputs.negative_prompts_2 = std::move(negative_prompts_2);
 
-  for (const proto::NamedTensor& pb_source : pb_dit_inputs.image_sources()) {
+  for (const proto::MediaNamedTensor& pb_source :
+       pb_dit_inputs.media_sources()) {
     torch::Tensor tensor = util::proto_to_torch(pb_source.tensor());
     if (!tensor.defined()) {
-      LOG(ERROR) << "Failed to convert named image tensor";
+      LOG(ERROR) << "Failed to convert media tensor";
       return false;
     }
-    dit_inputs.image_sources.add(pb_source.name(), std::move(tensor));
+    std::optional<TensorParameters> parameters =
+        proto_to_tensor_parameters(pb_source.tensor());
+    if (!parameters.has_value()) {
+      return false;
+    }
+    dit_inputs.media_sources.add(pb_source.name(),
+                                 pb_source.modality(),
+                                 std::move(tensor),
+                                 std::move(*parameters));
   }
 
   for (const proto::NamedTensor& pb_source : pb_dit_inputs.tensor_sources()) {
@@ -650,7 +761,13 @@ bool proto_to_dit_forward_input(const proto::DiTForwardInput& pb_dit_inputs,
       LOG(ERROR) << "Failed to convert named Tensor: " << pb_source.name();
       return false;
     }
-    dit_inputs.tensor_sources.add(pb_source.name(), std::move(tensor));
+    std::optional<TensorParameters> parameters =
+        proto_to_tensor_parameters(pb_source.tensor());
+    if (!parameters.has_value()) {
+      return false;
+    }
+    dit_inputs.tensor_sources.add(
+        pb_source.name(), std::move(tensor), std::move(*parameters));
   }
 
   if (!proto_to_generation_params(pb_dit_inputs.generation_params(),
@@ -662,7 +779,6 @@ bool proto_to_dit_forward_input(const proto::DiTForwardInput& pb_dit_inputs,
   if (pb_dit_inputs.has_audio_prompt_text()) {
     dit_inputs.audio_prompt_text = pb_dit_inputs.audio_prompt_text();
   }
-
   return true;
 }
 
@@ -767,6 +883,17 @@ bool proto_to_dit_forward_output(const proto::DiTForwardOutput& pb_dit_outputs,
   // Deserialize text_output for text diffusion models
   dit_outputs.text_output.assign(pb_dit_outputs.text_output().begin(),
                                  pb_dit_outputs.text_output().end());
+
+  const auto& pb_audio_tensor_list = pb_dit_outputs.audio_tensors();
+  dit_outputs.audio_tensors.reserve(pb_audio_tensor_list.tensors_size());
+  for (const proto::Tensor& pb_tensor : pb_audio_tensor_list.tensors()) {
+    torch::Tensor tensor = util::proto_to_torch(pb_tensor);
+    if (!tensor.defined()) {
+      LOG(ERROR) << "Failed to convert audio Tensor list item";
+      return false;
+    }
+    dit_outputs.audio_tensors.emplace_back(std::move(tensor));
+  }
 
   return true;
 }

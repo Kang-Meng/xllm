@@ -55,6 +55,7 @@ limitations under the License.
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/profile_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -2207,6 +2208,11 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     }
   }
 #endif
+
+  if (ModelConfig::get_instance().capture_hidden_state_layer() >= 0) {
+    args.layers_to_capture(
+        {ModelConfig::get_instance().capture_hidden_state_layer()});
+  }
 
   setup_rl_sleep_weights();
 

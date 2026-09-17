@@ -56,6 +56,8 @@ class ModelConfig final {
          "backend",
          "task",
          "use_ctc",
+         "capture_hidden_state_layer",
+         "enable_return_embedding_modality_tags",
          "python_model_path",
          "limit_image_per_prompt",
          "max_encoder_cache_size",
@@ -84,6 +86,10 @@ class ModelConfig final {
   PROPERTY(std::string, task) = "generate";
 
   PROPERTY(bool, use_ctc) = false;
+
+  PROPERTY(int32_t, capture_hidden_state_layer) = -1;
+
+  PROPERTY(bool, enable_return_embedding_modality_tags) = false;
 
   PROPERTY(int32_t, limit_image_per_prompt) = 8;
 

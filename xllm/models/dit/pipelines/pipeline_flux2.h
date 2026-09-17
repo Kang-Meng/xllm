@@ -68,9 +68,9 @@ class Flux2PipelineImpl final : public Flux2PipelineBaseImpl {
     std::optional<torch::Tensor> prompt_embeds =
         input.tensor_sources.get("prompt_embed");
     std::optional<torch::Tensor> images =
-        input.image_sources.empty()
+        input.media_sources.empty()
             ? std::nullopt
-            : std::make_optional(input.image_sources.at(0).tensor);
+            : std::make_optional(input.media_sources.at(0).tensor);
 
     auto output = forward_impl(
         prompts,                                  // prompt
