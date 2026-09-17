@@ -42,6 +42,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "dit_master.h"
 #if defined(USE_NPU)
@@ -581,6 +582,15 @@ Master::Master(const Options& options, EngineType type)
     }
   }
 
+  if (options_.task_type() == "mm_embed") {
+    options_.enable_chunked_prefill(false);
+    options_.enable_prefix_cache(false);
+    SchedulerConfig::get_instance().enable_chunked_prefill(false);
+    KVCacheConfig::get_instance().enable_prefix_cache(false);
+    LOG(WARNING) << "Disabling chunked prefill and prefix cache for "
+                    "task=mm_embed to process all multimodal inputs.";
+  }
+
   if (type == EngineType::VLM) {
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
@@ -589,7 +599,7 @@ Master::Master(const Options& options, EngineType type)
         .block_size(options.block_size())
         .max_cache_size(options.max_cache_size())
         .max_memory_utilization(options.max_memory_utilization())
-        .enable_prefix_cache(options.enable_prefix_cache())
+        .enable_prefix_cache(options_.enable_prefix_cache())
         .max_encoder_cache_size(options.max_encoder_cache_size())
         .max_processor_cache_items(options.max_processor_cache_items())
         .max_linear_state_cache_slots(options.max_linear_state_cache_slots())

@@ -62,6 +62,7 @@ bool EmbeddingOutputBuilder::build_embedding_output(
     return false;
   }
 
+  out_embedding.set_hash_key(in_embedding.hash_key);
   auto* meta_map = out_embedding.mutable_metadata();
   for (const auto& [key, tensor] : in_embedding.metadata) {
     xllm::proto::Tensor metadata_tensor;
@@ -76,25 +77,4 @@ bool EmbeddingOutputBuilder::build_embedding_output(
   return true;
 };
 
-bool EmbeddingOutputBuilder::build_embedding_output(
-    const xllm::proto::Embedding& in_embedding,
-    const std::string& binary_payload,
-    EmbeddingOutput& out_embedding) {
-  out_embedding.embedding =
-      util::proto_to_torch(in_embedding.embedding(), binary_payload);
-  if (!out_embedding.embedding.defined()) {
-    return false;
-  }
-
-  out_embedding.metadata.clear();
-  for (const auto& [key, proto_tensor] : in_embedding.metadata()) {
-    torch::Tensor tensor = util::proto_to_torch(proto_tensor, binary_payload);
-    if (!tensor.defined()) {
-      return false;
-    }
-    out_embedding.metadata.emplace(key, std::move(tensor));
-  }
-
-  return true;
-}
 };  // namespace xllm
