@@ -60,6 +60,74 @@ torch::Tensor rms_norm_gated_npu(const torch::Tensor& input,
                                                  /*is_rms_norm=*/true);
 }
 
+std::tuple<torch::Tensor, torch::Tensor> fused_add_gemma_rms_norm_npu(
+    const torch::Tensor& input,
+    const torch::Tensor& residual,
+    const torch::Tensor& weight,
+    double eps) {
+  auto [normed, rstd, residual_sum] =
+      xllm::kernel::npu::gamma_add_rms_norm(input,
+                                            residual,
+                                            weight,
+                                            eps,
+                                            /*add_gamma_offset=*/true);
+  (void)rstd;
+  return std::make_tuple(normed, residual_sum);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> moe_gating_top_k_softmax_npu(
+    const torch::Tensor& input,
+    int64_t topk,
+    bool normalize) {
+  auto [topk_weights, topk_ids] =
+      xllm::kernel::npu::apply_moe_gating_topk_softmax(
+          input,
+          /*finished=*/std::nullopt,
+          static_cast<int>(topk),
+          normalize);
+  return std::make_tuple(topk_weights.contiguous(), topk_ids.contiguous());
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+split_qkv_rmsnorm_mrope_npu(const torch::Tensor& qkvg,
+                            const torch::Tensor& q_weight,
+                            const torch::Tensor& k_weight,
+                            const torch::Tensor& cos_sin,
+                            const torch::Tensor& gather_pattern,
+                            double eps,
+                            int64_t num_q_heads,
+                            int64_t num_kv_heads,
+                            int64_t head_size) {
+  return xllm::kernel::npu::tilelang::split_qkv_rmsnorm_mrope(
+      qkvg,
+      q_weight,
+      k_weight,
+      cos_sin,
+      gather_pattern,
+      static_cast<float>(eps),
+      num_q_heads,
+      num_kv_heads,
+      head_size);
+}
+
+bool has_split_qkv_rmsnorm_mrope_specialization_npu(int64_t num_q_heads,
+                                                    int64_t num_kv_heads,
+                                                    int64_t head_size) {
+  return xllm::kernel::npu::tilelang::
+      has_split_qkv_rmsnorm_mrope_specialization(
+          num_q_heads, num_kv_heads, head_size);
+}
+
+torch::Tensor build_split_qkv_rmsnorm_mrope_gather_pattern_npu(
+    int64_t rope_dim,
+    const std::vector<int64_t>& mrope_section,
+    bool is_interleaved,
+    c10::Device device) {
+  return xllm::kernel::npu::tilelang::
+      build_split_qkv_rmsnorm_mrope_gather_pattern(
+          rope_dim, mrope_section, is_interleaved, device);
+}
+
 torch::Tensor l2_norm_npu(torch::Tensor input, double eps) {
   return xllm::kernel::npu::npu_l2norm_last_dim(input, eps);
 }
@@ -598,7 +666,23 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "rms_norm_gated(Tensor input, Tensor gate, Tensor weight, float eps) -> "
       "Tensor");
+  m.def(
+      "fused_add_gemma_rms_norm(Tensor input, Tensor residual, Tensor weight, "
+      "float eps) -> (Tensor, Tensor)");
   m.def("l2_norm(Tensor input, float eps) -> Tensor");
+  m.def(
+      "moe_gating_top_k_softmax(Tensor input, int topk, bool normalize) -> "
+      "(Tensor, Tensor)");
+  m.def(
+      "split_qkv_rmsnorm_mrope(Tensor qkvg, Tensor q_weight, Tensor k_weight, "
+      "Tensor cos_sin, Tensor gather_pattern, float eps, int num_q_heads, int "
+      "num_kv_heads, int head_size) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.def(
+      "has_split_qkv_rmsnorm_mrope_specialization(int num_q_heads, int "
+      "num_kv_heads, int head_size) -> bool");
+  m.def(
+      "build_split_qkv_rmsnorm_mrope_gather_pattern(int rope_dim, int[] "
+      "mrope_section, bool is_interleaved, Device device) -> Tensor");
   m.def(
       "chunk_gated_delta_rule(Tensor q, Tensor k, Tensor v, Tensor g, "
       "Tensor beta, Tensor initial_state, Tensor cu_seqlens) -> "
@@ -822,7 +906,13 @@ TORCH_LIBRARY(xllm_ops, m) {
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("rms_norm", TORCH_FN(xllm::rms_norm_npu));
   m.impl("rms_norm_gated", TORCH_FN(xllm::rms_norm_gated_npu));
+  m.impl("fused_add_gemma_rms_norm",
+         TORCH_FN(xllm::fused_add_gemma_rms_norm_npu));
   m.impl("l2_norm", TORCH_FN(xllm::l2_norm_npu));
+  m.impl("moe_gating_top_k_softmax",
+         TORCH_FN(xllm::moe_gating_top_k_softmax_npu));
+  m.impl("split_qkv_rmsnorm_mrope",
+         TORCH_FN(xllm::split_qkv_rmsnorm_mrope_npu));
   m.impl("chunk_gated_delta_rule", TORCH_FN(xllm::chunk_gated_delta_rule_npu));
   m.impl("mega_gdn_prefill", TORCH_FN(xllm::mega_gdn_prefill_npu));
   m.impl("mega_gdn_decode", TORCH_FN(xllm::mega_gdn_decode_npu));
@@ -882,6 +972,10 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
 // decode graph capture is phase-disjoint.
 TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
   m.impl("build_cp_context", TORCH_FN(xllm::build_cp_context_npu));
+  m.impl("has_split_qkv_rmsnorm_mrope_specialization",
+         TORCH_FN(xllm::has_split_qkv_rmsnorm_mrope_specialization_npu));
+  m.impl("build_split_qkv_rmsnorm_mrope_gather_pattern",
+         TORCH_FN(xllm::build_split_qkv_rmsnorm_mrope_gather_pattern_npu));
   // These metadata factories allow every Tensor argument to be omitted, so
   // there may be no device key to dispatch on. Their implementations select
   // the output NPU device explicitly (or inherit it from an optional Tensor).

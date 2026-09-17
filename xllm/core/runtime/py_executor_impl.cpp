@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <pybind11/embed.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <torch/python.h>
 
 #include <memory>
@@ -60,8 +61,8 @@ thread_local PyCausalLM* active_py_causal_lm = nullptr;
 // (start_pos=0, end_pos=length) the block is returned unchanged, so the
 // non-chunked case is a no-op.
 torch::Tensor slice_chunk_embeds(const MMBatchData& mm_data,
-                               const torch::Tensor& embeds,
-                               MMType modality) {
+                                 const torch::Tensor& embeds,
+                                 MMType modality) {
   if (!embeds.defined() || embeds.dim() == 0 || embeds.size(0) == 0) {
     return embeds;
   }
@@ -121,6 +122,15 @@ void register_xllm_runtime_module(py::module_& m) {
     }
     return tensor;
   });
+  m.def("dp_all_gather",
+        [](torch::Tensor tensor,
+           const std::vector<int32_t>& execution_token_counts) {
+          if (active_py_causal_lm != nullptr) {
+            return active_py_causal_lm->dp_all_gather(tensor,
+                                                      execution_token_counts);
+          }
+          return tensor;
+        });
   m.def("moe_tp_all_reduce", [](torch::Tensor tensor) {
     if (active_py_causal_lm != nullptr) {
       active_py_causal_lm->moe_tp_all_reduce(tensor);
@@ -287,22 +297,24 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
     if (pixel_values.defined() || pixel_values_videos.defined()) {
       py::object top_model = py_causal_lm_->python_model();
       // encode() moves the tensors onto device internally. Slice each block to
-      // the chunk's in-chunk subrange (see slice_chunk_embeds) so chunked prefill
-      // does not feed full image/video features into a partial placeholder
-      // span.
+      // the chunk's in-chunk subrange (see slice_chunk_embeds) so chunked
+      // prefill does not feed full image/video features into a partial
+      // placeholder span.
       py::object image_embeds = py::none();
       if (pixel_values.defined() && image_grid_thw.defined()) {
         torch::Tensor raw =
             top_model.attr("encode")(pixel_values, image_grid_thw)
                 .cast<torch::Tensor>();
-        image_embeds = py::cast(slice_chunk_embeds(mm_data, raw, MMType::IMAGE));
+        image_embeds =
+            py::cast(slice_chunk_embeds(mm_data, raw, MMType::IMAGE));
       }
       py::object video_embeds = py::none();
       if (pixel_values_videos.defined() && video_grid_thw.defined()) {
         torch::Tensor raw =
             top_model.attr("encode")(pixel_values_videos, video_grid_thw)
                 .cast<torch::Tensor>();
-        video_embeds = py::cast(slice_chunk_embeds(mm_data, raw, MMType::VIDEO));
+        video_embeds =
+            py::cast(slice_chunk_embeds(mm_data, raw, MMType::VIDEO));
       }
       // Sets top_model.model._inputs_embeds + deepstack_input_embeds.
       top_model.attr("get_input_embeddings")(

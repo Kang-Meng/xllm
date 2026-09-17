@@ -36,6 +36,29 @@ def _load_npu_moe_module():
     return module
 
 
+def _load_npu_custom_op_module(monkeypatch: pytest.MonkeyPatch):
+    class RegisteredOpNamespace:
+        def __getattr__(self, _name: str) -> object:
+            return object()
+
+    def ignore_fake_registration(_qualname: str):
+        return lambda fake_impl: fake_impl
+
+    monkeypatch.setattr(
+        torch.ops,
+        "xllm_ops",
+        RegisteredOpNamespace(),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.library, "register_fake", ignore_fake_registration)
+    path = _REPO_ROOT / "xllm/python/kernels_npu/_custom_op.py"
+    spec = importlib.util.spec_from_file_location("pr5_npu_custom_op", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_selected_expert_moe_matches_native_call_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,21 +247,21 @@ def test_qwen35_bf16_grouped_moe_uses_native_layout(
     )
 
 
-@pytest.mark.parametrize(("renormalize", "expected_renorm"), ((False, 0), (True, 1)))
+@pytest.mark.parametrize("renormalize", (False, True))
 def test_npu_softmax_topk_uses_graph_safe_native_op(
     monkeypatch: pytest.MonkeyPatch,
     renormalize: bool,
-    expected_renorm: int,
 ) -> None:
     moe = _load_npu_moe_module()
     logits = torch.zeros(2, 4, dtype=torch.bfloat16)
     weights = torch.tensor([[0.3, 0.2], [0.4, 0.1]], dtype=torch.bfloat16)
     expert_ids = torch.tensor([[1, 3], [0, 2]], dtype=torch.int32)
-    native_topk = MagicMock(return_value=(weights, expert_ids, torch.empty_like(expert_ids)))
+    native_topk = MagicMock(return_value=(weights, expert_ids))
     monkeypatch.setattr(
-        moe.torch_npu,
-        "npu_moe_gating_top_k_softmax_v2",
+        torch.ops.xllm_ops,
+        "moe_gating_top_k_softmax",
         native_topk,
+        raising=False,
     )
 
     actual_weights, actual_ids = moe.moe_fused_topk(
@@ -248,15 +271,29 @@ def test_npu_softmax_topk_uses_graph_safe_native_op(
         "softmax",
     )
 
-    native_topk.assert_called_once_with(
-        logits,
-        k=2,
-        finished=None,
-        renorm=expected_renorm,
-        output_softmax=False,
-    )
+    native_topk.assert_called_once_with(logits, 2, renormalize)
     torch.testing.assert_close(actual_weights, weights)
     torch.testing.assert_close(actual_ids, expert_ids)
+
+
+def test_npu_softmax_topk_fake_preserves_bfloat16_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom_op = _load_npu_custom_op_module(monkeypatch)
+    logits = torch.empty((2, 4), dtype=torch.bfloat16, device="meta")
+
+    weights, expert_ids = custom_op._moe_gating_top_k_softmax_fake(
+        logits,
+        topk=2,
+        normalize=True,
+    )
+
+    assert weights.shape == (2, 2)
+    assert weights.dtype == torch.bfloat16
+    assert weights.device.type == "meta"
+    assert expert_ids.shape == (2, 2)
+    assert expert_ids.dtype == torch.int32
+    assert expert_ids.device.type == "meta"
 
 
 def test_grouped_matmul_swiglu_quant_v2_requests_int8_output(

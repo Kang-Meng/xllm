@@ -287,6 +287,24 @@ def tp_all_gather(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
     return all_gather(x, dim, world_size, "tp")
 
 
+def dp_all_gather(
+    x: torch.Tensor,
+    token_counts: list[int],
+    rank: int,
+) -> torch.Tensor:
+    op = _native_runtime_op("dp_all_gather")
+    if op is not None:
+        return op(x, token_counts)
+    if all(count == token_counts[0] for count in token_counts):
+        return all_gather(
+            x,
+            dim=0,
+            world_size=len(token_counts),
+            group_name="dp",
+        )
+    return all_gather_variable(x, token_counts, rank, "dp")
+
+
 def moe_tp_all_reduce(x: torch.Tensor) -> None:
     op = _native_runtime_op("moe_tp_all_reduce")
     if op is not None:
@@ -471,17 +489,7 @@ def gather_dp_execution_tokens(
             f"rank={rank}, rows={x.shape[0]}, token_counts={counts}"
         )
 
-    if all(count == counts[0] for count in counts):
-        gathered = all_gather(
-            x,
-            dim=0,
-            world_size=len(counts),
-            group_name="dp",
-        )
-        return gathered, rank * counts[0]
-
-    gathered = all_gather_variable(x, counts, rank, "dp")
-    return gathered, sum(counts[:rank])
+    return dp_all_gather(x, counts, rank), sum(counts[:rank])
 
 
 __all__ = [
@@ -496,5 +504,6 @@ __all__ = [
     "broadcast_",
     "all_gather",
     "all_gather_variable",
+    "dp_all_gather",
     "gather_dp_execution_tokens",
 ]
