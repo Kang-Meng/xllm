@@ -367,7 +367,10 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
   EXPECT_EQ(capacity.swa_count(), 35);
   EXPECT_GT(capacity.c4_count(), 0);
   EXPECT_EQ(capacity.c4_count(), capacity.c128_count());
-  EXPECT_EQ(capacity.n_blocks(), capacity.c4_count() * 16);
+  const Dsv4CacheGeometry geometry;
+  const int64_t manager_blocks_per_unit =
+      geometry.compressed_block_token_size() / options.block_size;
+  EXPECT_EQ(capacity.n_blocks(), capacity.c4_count() * manager_blocks_per_unit);
 }
 
 TEST(KVCacheEstimationTest, DeepSeekV4RejectsBudgetWithoutCompressedCacheUnit) {

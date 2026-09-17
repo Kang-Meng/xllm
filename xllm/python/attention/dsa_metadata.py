@@ -35,13 +35,15 @@ from typing import Sequence
 
 import torch
 
+from xllm.python.platform import current_platform
+
 # ---------------------------------------------------------------------------
 # Cache-type enum (mirrors ``DSACacheType`` in dsa_metadata.h).
 # ---------------------------------------------------------------------------
 DSA_CACHE_TOKEN = 0
 DSA_CACHE_SEQUENCE = 1
 DSA_CACHE_SLIDING_WINDOW = 2
-DSV4_COMPRESSED_BLOCK_TOKEN_SIZE = 2048
+DSV4_COMPRESSED_BLOCK_TOKEN_SIZE = 128 if current_platform.is_mlu() else 2048
 
 
 @dataclass
