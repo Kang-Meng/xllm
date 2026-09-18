@@ -118,20 +118,16 @@ bool resolve_model_registration(const std::string& model_type,
 
   std::string effective_backend = backend;
   if (backend == kAutoBackend) {
-    effective_backend = is_torch_only_model_type(model_type)
-                            ? kTorchBackend
-                            : kAtbBackend;
-  } else if (model_type == "qwen3" ||
-             model_type == "qwen3_moe" ||
-             model_type == "deepseek_v32" ||
-             model_type == "glm_moe_dsa" ||
-             model_type == "qwen3_vl" ||
-             model_type == "deepseek_v32_mtp" ||
-             model_type == "glm5_next") {
+    effective_backend =
+        is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
+  } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
+             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
+             model_type == "qwen3_vl" || model_type == "deepseek_v32_mtp" ||
+             model_type == "glm5_next" || model_type == "joyai_asr") {
     // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl/deepseek_v32_mtp/glm5_next
     // support both backends. glm5_next is served via --model_impl=python,
     // which forces npu_kernel_backend=TORCH; the python graph owns all
-    // attention.
+    // attention. joyai_asr likewise runs on the Python model executor.
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
@@ -153,17 +149,13 @@ bool resolve_model_registration(const std::string& model_type,
   }
   if (model_type == "qwen3" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_atb";
-  } else if (model_type == "qwen3_moe" &&
-             effective_backend == kAtbBackend) {
+  } else if (model_type == "qwen3_moe" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_moe_atb";
-  } else if (model_type == "qwen2" &&
-             effective_backend == kAtbBackend) {
+  } else if (model_type == "qwen2" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen2_atb";
-  } else if (model_type == "qwen2_5_vl" &&
-             effective_backend == kAtbBackend) {
+  } else if (model_type == "qwen2_5_vl" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen2_5_vl_atb";
-  } else if (model_type == "qwen3_vl" &&
-             effective_backend == kAtbBackend) {
+  } else if (model_type == "qwen3_vl" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_vl_atb";
   } else {
     *resolved_name = model_type;

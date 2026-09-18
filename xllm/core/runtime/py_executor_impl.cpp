@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_shard_layout.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/multimodal/mm_visitor.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/kv_shard_batch_metadata.h"
@@ -48,61 +49,21 @@ namespace py = pybind11;
 namespace xllm {
 namespace {
 
-// Slice per-modality embedding blocks to the in-chunk subrange recorded on each
-// scheduled multimodal item's schedule_data. Mirrors the C++ VLM path's
-// EncoderEmbeddingGatherVisitor so chunked prefill — where a chunk boundary
-// can land inside an item's token span — scatters only the features whose
-// placeholders are actually in `tokens`. `token_pos().length` equals the
-// item's feature count (1 token : 1 post-merge feature), and start_pos/end_pos
-// are the in-chunk subrange of that span, so the slice aligns features to the
-// placeholders present in this chunk. When the whole item is in the chunk
-// (start_pos=0, end_pos=length) the block is returned unchanged, so the
-// non-chunked case is a no-op.
-torch::Tensor slice_chunk_embeds(const MMBatchData& mm_data,
+// Slice each modality's embedding blocks to the in-chunk subrange on the
+// scheduled items (drives ChunkEmbedSliceVisitor, the host-side twin of the
+// C++ VLM path's gather visitor). Chunked prefill — where a chunk boundary
+// can land inside an item's span — then scatters only the features whose
+// placeholders are in `tokens`; fully scheduled items pass through unchanged,
+// so the non-chunked case is a no-op.
+torch::Tensor slice_chunk_embeds(MMBatchData& mm_data,
                                  const torch::Tensor& embeds,
                                  MMType modality) {
   if (!embeds.defined() || embeds.dim() == 0 || embeds.size(0) == 0) {
     return embeds;
   }
-  std::vector<torch::Tensor> slices;
-  int64_t off = 0;
-  for (const auto& data : mm_data.mm_data_vec()) {
-    if (!data.hold<MMItemVec>()) {
-      continue;
-    }
-    for (const auto& item : data.items<MMItemVec>()) {
-      if (item.type() != modality || item.is_embedded()) {
-        continue;
-      }
-      const auto& state = item.state();
-      const int32_t len = state.token_pos().length;
-      if (len <= 0) {
-        continue;
-      }
-      int32_t start_pos = state.schedule_data().start_pos;
-      int32_t end_pos = state.schedule_data().end_pos;
-      const auto& mask = state.mm_token_mask();
-      if (mask.defined() && mask.numel() > 0) {
-        auto mask_cpu = mask.to(torch::kCPU);
-        start_pos = mask_cpu.slice(0, 0, start_pos).sum().item<int32_t>();
-        end_pos = mask_cpu.slice(0, 0, end_pos).sum().item<int32_t>();
-      }
-      if (end_pos > start_pos) {
-        slices.push_back(embeds.slice(0, off + start_pos, off + end_pos));
-      }
-      // Advance by the item's actual encoder-output row count
-      // (mm_token_num = mask.sum()), not the full token_pos span: video
-      // spans include non-mm frame markers/timestamps, so token_pos.length
-      // > mm_token_num and `off += len` would push later items' slices past
-      // their real embeds offset. Matches EncoderEmbeddingGatherVisitor.
-      off += state.mm_token_num();
-    }
-  }
-  torch::Tensor out;
-  if (slices.empty() || !safe_concat(slices, out)) {
-    return embeds;
-  }
-  return out;
+  ChunkEmbedSliceVisitor visitor(embeds, modality);
+  CHECK(mm_data.foreach (visitor));
+  return visitor.finish();
 }
 
 void register_xllm_runtime_module(py::module_& m) {
@@ -291,6 +252,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // boundary can land inside an item's token span — needs item-level scatter
   // (reuse EncoderEmbeddingGatherVisitor + the NPU backend's paged mixed-batch
   // attention, both tracked for a follow-up PR).
+  //
+  // TODO: refactor the per-modality blocks below into a generic handoff.
   auto& mm_data = params.multimodal.mm_data;
   if (mm_data.valid()) {
     torch::Tensor pixel_values;
@@ -309,8 +272,19 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
     if (const auto& res = mm_data.get<torch::Tensor>("video_grid_thw")) {
       video_grid_thw = res.value();
     }
+    torch::Tensor input_features;
+    if (const auto& res = mm_data.get<torch::Tensor>("input_features")) {
+      input_features = res.value();
+    }
+    torch::Tensor speech_lengths;
+    if (const auto& res = mm_data.get<torch::Tensor>("speech_lengths")) {
+      speech_lengths = res.value();
+    }
+    CHECK(input_features.defined() == speech_lengths.defined())
+        << "input_features and speech_lengths must be provided together";
 
-    if (pixel_values.defined() || pixel_values_videos.defined()) {
+    if (pixel_values.defined() || pixel_values_videos.defined() ||
+        input_features.defined()) {
       py::object top_model = py_causal_lm_->python_model();
       // encode() moves the tensors onto device internally. Slice each block to
       // the chunk's in-chunk subrange (see slice_chunk_embeds) so chunked
@@ -332,9 +306,39 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         video_embeds =
             py::cast(slice_chunk_embeds(mm_data, raw, MMType::VIDEO));
       }
+      py::object audio_embeds = py::none();
+      py::object audio_mask = py::none();
+      if (input_features.defined() && speech_lengths.defined()) {
+        // Per-audio [hash, ctc_pad_num] rows, in item order.
+        torch::Tensor audio_meta;
+        if (const auto& res = mm_data.get<torch::Tensor>("audio_encode_meta")) {
+          audio_meta = res.value();
+        }
+        CHECK(audio_meta.defined() &&
+              audio_meta.size(0) == speech_lengths.numel())
+            << "audio_encode_meta missing or misaligned with speech_lengths";
+        torch::Tensor raw =
+            top_model.attr("encode")(input_features, speech_lengths, audio_meta)
+                .cast<torch::Tensor>();
+        audio_embeds =
+            py::cast(slice_chunk_embeds(mm_data, raw, MMType::AUDIO));
+        // Chunk replacement mask: the Python merge scatters the sliced rows
+        // at these positions (item state, not pad-id matching).
+        AudioScatterMaskVisitor mask_visitor(
+            /*seq_lens=*/params.attention.host.kv_seq_lens,
+            /*scheduled_seq_lens=*/params.attention.host.q_seq_lens,
+            tokens);
+        CHECK(mm_data.foreach (mask_visitor));
+        audio_mask = py::cast(mask_visitor.finish());
+      }
       // Sets top_model.model._inputs_embeds + deepstack_input_embeds.
-      top_model.attr("get_input_embeddings")(
-          tokens, image_embeds, video_embeds);
+      if (audio_embeds.is_none()) {
+        top_model.attr("get_input_embeddings")(
+            tokens, image_embeds, video_embeds);
+      } else {
+        top_model.attr("get_input_embeddings")(
+            tokens, image_embeds, video_embeds, audio_embeds, audio_mask);
+      }
     }
   }
 

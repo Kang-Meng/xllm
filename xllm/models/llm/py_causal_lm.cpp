@@ -371,6 +371,7 @@ py::dict PyCausalLM::build_config_dict(
   d["dtype"] = dtype_to_string(options_);
   d["device"] = c10::str(device_);
   d["enable_eplb"] = EPLBConfig::get_instance().enable_eplb();
+  d["use_ctc"] = ModelConfig::get_instance().use_ctc();
   d["redundant_experts_num"] =
       EPLBConfig::get_instance().redundant_experts_num();
   d["eplb_use_decode_only_load"] =
