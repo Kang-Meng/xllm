@@ -72,6 +72,32 @@ try:
 except Exception:  # pragma: no cover - kernels need the compiled lib
     kernels = None  # type: ignore[assignment]
 
+_DSV4_COMPRESSOR_WKV_ALIASES = (
+    "wkv.weight",
+    "wkv",
+    "wkv.linear.weight",
+    "wkv_proj.weight",
+    "kv_proj.weight",
+)
+_DSV4_COMPRESSOR_WK_ALIASES = ("wk.weight", "wk", "k_proj.weight")
+_DSV4_COMPRESSOR_WV_ALIASES = ("wv.weight", "wv", "v_proj.weight")
+_DSV4_COMPRESSOR_PARAMETER_ALIASES = {
+    "wgate.weight": (
+        "wgate.weight",
+        "wgate",
+        "wgate.linear.weight",
+        "gate.weight",
+        "score_proj.weight",
+    ),
+    "ape": ("ape", "ape.weight", "position_bias", "rope_bias"),
+    "norm.weight": (
+        "norm.weight",
+        "norm",
+        "layer_norm.weight",
+        "rms_norm.weight",
+    ),
+}
+
 
 def _pick(d: dict, *keys: str, default: Any = None) -> Any:
     for k in keys:
@@ -1982,39 +2008,28 @@ class DeepseekV4ForCausalLM(PyModelBase):
                 )
                 # Compressor sub-module: wkv (unquantized f32 fused wk+wv) +
                 # wgate + ape + norm (all f32, not W8A8).
-                loader.copy_in(
-                    pm + "self_attn.indexer.compressor_wkv.weight",
-                    loader.load_tensor(ck + "attn.indexer.compressor.wkv.weight"),
-                )
-                loader.copy_in(
-                    pm + "self_attn.indexer.compressor_wgate.weight",
-                    loader.load_tensor(ck + "attn.indexer.compressor.wgate.weight"),
-                )
-                loader.copy_in(
-                    pm + "self_attn.indexer.compressor_ape",
-                    loader.load_tensor(ck + "attn.indexer.compressor.ape"),
-                )
-                loader.copy_in(
-                    pm + "self_attn.indexer.compressor_norm.weight",
-                    loader.load_tensor(ck + "attn.indexer.compressor.norm.weight"),
+                self._load_dsv4_compressor_from_prefixes(
+                    loader,
+                    (
+                        ck + "attn.indexer.compressor.",
+                        ck + "attn.indexer.compress.",
+                    ),
+                    pm + "self_attn.indexer.compressor_",
+                    f"DeepSeek-V4 indexer compressor weights not found under {ck}attn.indexer",
                 )
             # Attention-level cmp_kv compressor (head_dim=512, separate from the
-            # indexer compressor at head_dim=128). Ckpt: attn.compressor.*.
+            # indexer compressor at head_dim=128). Ckpt: attn.compressor.* or
+            # attn.compress.*.
             # Mirrors C++ DSAttentionImpl compressor_ (compressor.cpp:590-597).
-            if hasattr(attn, "cmp_wkv") and _has(ck + "attn.compressor.wkv.weight"):
-                _w = loader.load_tensor(ck + "attn.compressor.wkv.weight")
-                loader.copy_in(pm + "self_attn.cmp_wkv.weight", _w)
-                loader.copy_in(
-                    pm + "self_attn.cmp_wgate.weight",
-                    loader.load_tensor(ck + "attn.compressor.wgate.weight"),
-                )
-                loader.copy_in(
-                    pm + "self_attn.cmp_ape",
-                    loader.load_tensor(ck + "attn.compressor.ape"),
-                )
-                loader.copy_in(
-                    pm + "self_attn.cmp_norm.weight",
-                    loader.load_tensor(ck + "attn.compressor.norm.weight"),
+            if hasattr(attn, "cmp_wkv"):
+                self._load_dsv4_compressor_from_prefixes(
+                    loader,
+                    (
+                        ck + "attn.compressor.",
+                        ck + "attn.compress.",
+                    ),
+                    pm + "self_attn.cmp_",
+                    f"DeepSeek-V4 attention compressor weights not found under {ck}attn",
                 )
             attn.process_weights_after_loading()
             # MoE / dense MLP weights. MoE layers use hash routing
@@ -2046,6 +2061,68 @@ class DeepseekV4ForCausalLM(PyModelBase):
             "lm_head.weight",
             loader.shard(loader.load_tensor(lm_head_key), dim=0),
         )
+
+    @staticmethod
+    def _load_dsv4_compressor_from_prefixes(
+        loader: W8A8WeightLoader,
+        checkpoint_prefixes: Sequence[str],
+        parameter_prefix: str,
+        missing_message: str,
+    ) -> None:
+        """Resolve a compressor prefix and load its compatible aliases."""
+        checkpoint_prefix = _find_checkpoint_prefix(
+            loader,
+            checkpoint_prefixes,
+            (*_DSV4_COMPRESSOR_WKV_ALIASES, *_DSV4_COMPRESSOR_WK_ALIASES),
+        )
+        if checkpoint_prefix is None:
+            raise KeyError(missing_message)
+        DeepseekV4ForCausalLM._load_dsv4_compressor(
+            loader,
+            checkpoint_prefix,
+            parameter_prefix,
+        )
+
+    @staticmethod
+    def _load_dsv4_compressor(
+        loader: W8A8WeightLoader,
+        checkpoint_prefix: str,
+        parameter_prefix: str,
+    ) -> None:
+        """Load compressor aliases accepted by the native implementation."""
+        wkv_key = _find_checkpoint_key(
+            loader,
+            tuple(checkpoint_prefix + suffix for suffix in _DSV4_COMPRESSOR_WKV_ALIASES),
+        )
+        if wkv_key is not None:
+            wkv = loader.load_tensor(wkv_key)
+        else:
+            wk_key = _require_checkpoint_key(
+                loader,
+                tuple(checkpoint_prefix + suffix for suffix in _DSV4_COMPRESSOR_WK_ALIASES),
+                "DeepSeek-V4 compressor K projection",
+            )
+            wv_key = _require_checkpoint_key(
+                loader,
+                tuple(checkpoint_prefix + suffix for suffix in _DSV4_COMPRESSOR_WV_ALIASES),
+                "DeepSeek-V4 compressor V projection",
+            )
+            wkv = torch.cat(
+                [loader.load_tensor(wk_key), loader.load_tensor(wv_key)],
+                dim=0,
+            )
+        loader.copy_in(parameter_prefix + "wkv.weight", wkv)
+
+        for parameter_suffix, source_suffixes in _DSV4_COMPRESSOR_PARAMETER_ALIASES.items():
+            source_key = _require_checkpoint_key(
+                loader,
+                tuple(checkpoint_prefix + suffix for suffix in source_suffixes),
+                f"DeepSeek-V4 compressor {parameter_suffix}",
+            )
+            loader.copy_in(
+                parameter_prefix + parameter_suffix,
+                loader.load_tensor(source_key),
+            )
 
     @staticmethod
     def _load_dsv4_dense_mlp(
