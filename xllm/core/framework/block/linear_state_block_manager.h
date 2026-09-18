@@ -31,13 +31,13 @@ class LinearStateBlockManager final : public BlockManagerImpl {
   explicit LinearStateBlockManager(uint32_t num_slots,
                                    int32_t chunk_stride,
                                    bool enable_prefix_cache = true,
-                                   bool instance_is_decode = false);
+                                   bool instance_is_decode = false,
+                                   uint32_t num_speculative_tokens = 0);
   ~LinearStateBlockManager() override = default;
 
   std::optional<std::vector<Block>> allocate_for_sequence(
       Sequence* seq,
       size_t num_tokens) override;
-  void release_out_of_window(Sequence* seq) override;
 
   using BlockManagerImpl::allocate;
   Block allocate() override;
@@ -55,6 +55,8 @@ class LinearStateBlockManager final : public BlockManagerImpl {
   using BlockManagerImpl::cache;
 
  private:
+  void trim_window(Sequence& seq, bool decode_window, size_t cached_tokens);
+
   friend class BlockManagerPoolTestPeer;
 };
 

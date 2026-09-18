@@ -22,7 +22,6 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <limits>
 #include <thread>
 #include <utility>
@@ -30,9 +29,9 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/framework/block/block.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/eplb_config.h"
-#include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -186,26 +185,6 @@ torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
                            .dtype(torch::kInt)
                            .device(torch::kCPU)
                            .pinned_memory(true));
-}
-
-// Pick the direct-read path for NPU prefill when out-of-place linear state is
-// enabled. Native Qwen3.5 kernels support per-row selection in mixed batches;
-// Python glm5_next requires the whole batch to contain no decode rows, matching
-// the batch-level invariant enforced while building Python attention metadata.
-bool should_read_linear_state_out_of_place(const ModelArgs* args,
-                                           const BatchForwardType& forward_type,
-                                           const Sequence* sequence) {
-  if (args == nullptr || sequence == nullptr || !sequence->is_prefill_stage() ||
-      !Platform::is_npu() ||
-      !SchedulerConfig::get_instance().enable_linear_state_out_of_place()) {
-    return false;
-  }
-
-  const bool is_python_model = ModelConfig::is_python_model_impl(
-      ModelConfig::get_instance().model_impl());
-  return (is_python_model && args->model_type() == "glm5_next" &&
-          forward_type.no_decode()) ||
-         (!is_python_model && is_qwen3_5_target_model_type(args->model_type()));
 }
 
 }  // namespace
@@ -485,7 +464,7 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 #endif
     thread_state.embedding_ids.reserve(sequences_per_thread);
     thread_state.linear_state_ids.reserve(sequences_per_thread);
-    thread_state.linear_restore_src_blocks.reserve(sequences_per_thread);
+    thread_state.linear_state_read_ids.reserve(sequences_per_thread);
     thread_state.request_ids.reserve(sequences_per_thread);
     thread_state.extra_token_ids.reserve(sequences_per_thread);
     thread_state.scheduled_mm_data_vec.reserve(sequences_per_thread);
@@ -537,13 +516,11 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   size_t total_seqs = 0;
   size_t total_slots = 0;
   size_t total_paged_indices = 0;
-  size_t total_linear_restore_sources = 0;
   for (const auto& state : thread_builder_states) {
     total_tokens += state.flatten_tokens_vec.size();
     total_seqs += state.block_tables_vec.size();
     total_slots += state.new_token_slot_ids.size();
     total_paged_indices += state.paged_kv_indices.size();
-    total_linear_restore_sources += state.linear_restore_src_blocks.size();
   }
   state_.flatten_tokens_vec.reserve(total_tokens);
   if (!use_mrope_) {
@@ -560,7 +537,7 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 #endif
   state_.embedding_ids.reserve(total_seqs);
   state_.linear_state_ids.reserve(total_seqs);
-  state_.linear_restore_src_blocks.reserve(total_linear_restore_sources);
+  state_.linear_state_read_ids.reserve(total_seqs);
   state_.request_ids.reserve(total_seqs);
   state_.extra_token_ids.reserve(total_seqs);
   state_.paged_kv_indices.reserve(total_paged_indices);
@@ -661,13 +638,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.linear_state_ids.insert(state_.linear_state_ids.end(),
                                    state.linear_state_ids.begin(),
                                    state.linear_state_ids.end());
-    state_.linear_state_cache_ops.insert(state_.linear_state_cache_ops.end(),
-                                         state.linear_state_cache_ops.begin(),
-                                         state.linear_state_cache_ops.end());
-    state_.linear_restore_src_blocks.insert(
-        state_.linear_restore_src_blocks.end(),
-        std::make_move_iterator(state.linear_restore_src_blocks.begin()),
-        std::make_move_iterator(state.linear_restore_src_blocks.end()));
+    state_.linear_state_read_ids.insert(state_.linear_state_read_ids.end(),
+                                        state.linear_state_read_ids.begin(),
+                                        state.linear_state_read_ids.end());
     state_.request_ids.insert(state_.request_ids.end(),
                               state.request_ids.begin(),
                               state.request_ids.end());
@@ -785,6 +758,8 @@ void BatchInputBuilder::process_single_sequence(
         sequence->stage() == SequenceStage::DECODE);
   }
 
+  append_linear_state_row(sequence, state);
+
   // Setup KV cache
   setup_kv_cache_info(sequence,
                       n_kv_cache_tokens,
@@ -850,8 +825,6 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
     }
   }
 
-  append_linear_state_row(sequence, state);
-
   // Add extra token id
   int32_t extra_token_id = -1;
   if (n_tokens == seq_len) {
@@ -902,30 +875,20 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
                 sequence->has_linear_state_slot());
   int32_t linear_state_id = sequence->get_linear_state_slot_id();
   state.linear_state_ids.emplace_back(linear_state_id);
+  state.linear_state_read_ids.emplace_back(linear_state_id);
   if (!has_linear_attention) {
     return;
   }
 
-  LinearStateCacheOp linear_state_cache_op;
-  linear_state_cache_op.linear_state_id = state.linear_state_ids.back();
-  const bool is_prefill = sequence->is_prefill_stage();
   const Slice<Block> linear_blocks =
       sequence->kv_state().blocks(BlockType::LINEAR);
   CHECK(!linear_blocks.empty());
+  CHECK_LE(linear_blocks.size(), 2u);
   CHECK(linear_blocks.back().is_valid());
-  linear_state_cache_op.reset_requested =
-      is_prefill && linear_blocks.size() == 1;
-  if (is_prefill && !linear_state_cache_op.reset_requested) {
-    Block source = sequence->kv_state().copy_linear_state_source();
-    CHECK(source.is_valid());
-    CHECK_NE(source.id(), linear_state_cache_op.linear_state_id);
-    linear_state_cache_op.restore_requested =
-        !should_read_linear_state_out_of_place(
-            args_, state.batch_forward_type, sequence);
-    linear_state_cache_op.restore_src_slot_id = source.id();
-    state.linear_restore_src_blocks.emplace_back(std::move(source));
+  if (linear_blocks.size() == 2) {
+    CHECK(linear_blocks.front().is_valid());
+    state.linear_state_read_ids.back() = linear_blocks.front().id();
   }
-  state.linear_state_cache_ops.emplace_back(std::move(linear_state_cache_op));
 }
 
 void BatchInputBuilder::handle_sampling_parameters(Sequence* sequence,
@@ -1251,11 +1214,13 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
 
   input_params.embedding.embedding_ids = std::move(state_.embedding_ids);
   input_params.embedding.linear_state_ids = std::move(state_.linear_state_ids);
-  input_params.linear_state_cache_ops =
-      std::move(state_.linear_state_cache_ops);
+  input_params.embedding.linear_state_read_ids =
+      std::move(state_.linear_state_read_ids);
   if (!input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         torch::tensor(input_params.embedding.linear_state_ids, torch::kInt);
+    input_params.embedding.linear_state_read_indices = torch::tensor(
+        input_params.embedding.linear_state_read_ids, torch::kInt);
   }
   input_params.embedding.request_ids = std::move(state_.request_ids);
   input_params.embedding.extra_token_ids = std::move(state_.extra_token_ids);

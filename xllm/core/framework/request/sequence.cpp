@@ -503,6 +503,7 @@ void Sequence::append_token(const Token& token) {
     finish_status_invalidated_ = true;
     return;
   }
+  kv_state_.set_last_confirmed_cached_tokens(cur_idx);
 
   // A real token was committed (overlap-fake placeholders returned above).
   ++generated_tokens_since_latency_;
@@ -575,6 +576,7 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
         sequence_params_.sampling_param->top_logprobs);
   }
   ++cur_generated_token_idx_;
+  kv_state_.set_last_confirmed_cached_tokens(cur_generated_token_idx_ - 1);
   finish_status_invalidated_ = true;
   updated_since_last_beam_search_ = true;
 }

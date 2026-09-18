@@ -64,14 +64,8 @@ void publish_blocks(Sequence* seq,
   std::vector<Block>* blocks = kv.mutable_blocks(type);
   CHECK(blocks != nullptr);
   CHECK_LE(end, blocks->size());
-  Slice<XXH3Key> hashes;
-  if (type == BlockType::LINEAR) {
-    seq->update_linear_state_hashes(static_cast<uint32_t>(block_size));
-    hashes = seq->linear_state_hashes();
-  } else {
-    seq->update_block_hashes(static_cast<uint32_t>(block_size), hasher_type);
-    hashes = seq->block_hashes();
-  }
+  seq->update_block_hashes(static_cast<uint32_t>(block_size), hasher_type);
+  const Slice<XXH3Key> hashes = seq->block_hashes();
   leaf.cache(seq->hash_tokens(hasher_type).slice(0, token_end),
              *blocks,
              begin,
@@ -186,7 +180,7 @@ CompositeBlockManager::LeafMap build_composite_leaves(
       CHECK_GT(chunk_stride, 0) << "max_tokens_per_chunk_for_prefill must be "
                                    "positive for linear state prefill";
     } else if (chunk_stride <= 0) {
-      chunk_stride = 1;
+      chunk_stride = 2048;
     }
     leaves.emplace(
         BlockType::LINEAR,
@@ -195,7 +189,8 @@ CompositeBlockManager::LeafMap build_composite_leaves(
                 static_cast<uint32_t>(options.linear_state_num_slots()),
                 chunk_stride,
                 linear_prefix_cache,
-                is_decode),
+                is_decode,
+                options.num_speculative_tokens()),
             /*participates_in_admission=*/false,
             /*supports_prefix_cache=*/linear_prefix_cache});
   }
@@ -340,7 +335,7 @@ BlockManager* CompositeBlockManager::leaf_of(BlockType type) const {
 }
 
 void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
-  if (seq == nullptr) {
+  if (seq == nullptr || seq->is_graph_warmup()) {
     return;
   }
   KVCacheState& kv = seq->kv_state();
@@ -374,8 +369,7 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
   }
 
   for (auto& [type, entry] : leaves_) {
-    if (type == BlockType::EMBEDDING ||
-        (type == BlockType::LINEAR && !seq->is_prefill_stage())) {
+    if (type == BlockType::EMBEDDING || type == BlockType::LINEAR) {
       continue;
     }
     if (!entry.supports_prefix_cache) {
@@ -394,9 +388,7 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
                                 ? cacheable_tokens / block_size
                                 : publishable_tokens(*seq, leaf) / block_size;
     size_t cached = kv.num_cached_blocks(type);
-    const size_t end = std::min(
-        num_full,
-        type == BlockType::LINEAR ? blocks->size() - 1 : blocks->size());
+    const size_t end = std::min(num_full, blocks->size());
     if (end <= cached) {
       continue;
     }
@@ -445,7 +437,6 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   // on failure). Stage keyed by BlockType; commit only after every leaf
   // succeeds so a failure rolls back cleanly.
   std::map<BlockType, std::vector<Block>> staged;
-
   auto release_staged = [&]() {
     for (auto& [type, blocks] : staged) {
       leaf_of(type)->deallocate(blocks);
@@ -454,8 +445,7 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   };
 
   for (auto& [type, entry] : leaves_) {
-    std::optional<std::vector<Block>> blocks =
-        entry.leaf->allocate_for_sequence(seq, num_tokens);
+    auto blocks = entry.leaf->allocate_for_sequence(seq, num_tokens);
     if (!blocks.has_value()) {
       release_staged();
       return false;
@@ -819,6 +809,7 @@ void CompositeBlockManager::allocate_shared_for_sequence(Sequence* seq) {
                                                std::move(probe.blocks));
       }
       seq->kv_state().set_kv_cache_tokens_num(trimmed.safe_hit_tokens);
+      seq->kv_state().set_last_confirmed_cached_tokens(trimmed.safe_hit_tokens);
       break;
     }
     case LeafCombination::UNSUPPORTED:
@@ -836,7 +827,8 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq,
   // Chunked-prefill mid-step: only KV needs a token-clamped flush now;
   // SWA / C4 / C128 get their flush from the pre-grow hook at the top of
   // the next allocate_sequence.
-  if (seq == nullptr || combination_ == LeafCombination::UNSUPPORTED) {
+  if (seq == nullptr || seq->is_graph_warmup() ||
+      combination_ == LeafCombination::UNSUPPORTED) {
     return;
   }
   switch (combination_) {

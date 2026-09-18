@@ -642,16 +642,26 @@ TEST(SchedulerPolicyTest, LinearSchedulingKeepsOneChunkAcrossPolicies) {
         Sequence* sequence = requests.front()->sequences().front().get();
         scheduler.add_request(requests.front());
         size_t cached_tokens = 0;
+        int32_t previous_output_id = -1;
         for (const size_t expected_tokens : {256, 256, 256, 9}) {
           auto batches = scheduler.prepare_batch_test();
           ASSERT_EQ(batches.size(), 1u);
           ASSERT_EQ(batches.front().size(), 1u);
           EXPECT_EQ(batches.front().get_allowed_max_tokens().front(),
                     expected_tokens);
-          EXPECT_EQ(sequence->kv_state().num_blocks(BlockType::LINEAR),
-                    cached_tokens / 256 + 1);
+          const Slice<Block> linear_blocks =
+              sequence->kv_state().blocks(BlockType::LINEAR);
+          ASSERT_EQ(linear_blocks.size(), cached_tokens == 0 ? 1u : 2u);
+          if (cached_tokens > 0) {
+            EXPECT_EQ(linear_blocks.front().id(), previous_output_id);
+          }
+          EXPECT_NE(linear_blocks.back().id(), previous_output_id);
+          previous_output_id = linear_blocks.back().id();
+          EXPECT_EQ(sequence->kv_state().last_confirmed_cached_tokens(),
+                    cached_tokens);
           cached_tokens += expected_tokens;
           sequence->kv_state().set_kv_cache_tokens_num(cached_tokens);
+          sequence->kv_state().set_last_confirmed_cached_tokens(cached_tokens);
         }
       }
     }

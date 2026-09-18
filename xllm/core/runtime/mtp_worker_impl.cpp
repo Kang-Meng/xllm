@@ -3316,6 +3316,14 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
           {&input_params.embedding.linear_state_ids,
            nullptr,
            &input_params.embedding.linear_state_indices});
+      if (input_params.embedding.linear_state_read_ids.empty()) {
+        input_params.embedding.linear_state_read_ids =
+            input_params.embedding.linear_state_ids;
+      }
+      extra_int_inputs.push_back(
+          {&input_params.embedding.linear_state_read_ids,
+           nullptr,
+           &input_params.embedding.linear_state_read_indices});
     }
     if (!input_params.num_accepted_tokens_host.empty()) {
       extra_int_inputs.push_back({&accepted_prefix_lengths,
@@ -3919,11 +3927,10 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
     input_params.is_spec_verify = false;
     // The first draft already restored its request slot. Subsequent drafts
     // append to that live state instead of replaying a prefix restore.
-    for (auto& op : input_params.linear_state_cache_ops) {
-      op.reset_requested = false;
-      op.restore_requested = false;
-      op.restore_src_slot_id = -1;
-    }
+    input_params.embedding.linear_state_read_ids =
+        input_params.embedding.linear_state_ids;
+    input_params.embedding.linear_state_read_indices =
+        input_params.embedding.linear_state_indices;
   }
   const int32_t logical_block_size =
       options_.block_size() * parallel_args_.kv_split_size_effective();

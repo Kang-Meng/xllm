@@ -27,10 +27,12 @@ namespace xllm {
 
 namespace {
 
-BlockManager::Options make_linear_state_options(uint32_t num_slots,
-                                                int32_t chunk_stride,
-                                                bool enable_prefix_cache,
-                                                bool instance_is_decode) {
+BlockManager::Options make_linear_state_options(
+    uint32_t num_slots,
+    int32_t chunk_stride,
+    bool enable_prefix_cache,
+    bool instance_is_decode,
+    uint32_t num_speculative_tokens) {
   BlockManager::Options options;
   options.num_blocks(num_slots);
   options.block_size(chunk_stride);
@@ -38,23 +40,30 @@ BlockManager::Options make_linear_state_options(uint32_t num_slots,
   options.enable_disagg_pd(false);
   options.block_type(BlockType::LINEAR);
   options.instance_is_decode(instance_is_decode);
+  options.num_speculative_tokens(num_speculative_tokens);
   return options;
 }
 
 }  // namespace
 
-LinearStateBlockManager::LinearStateBlockManager(uint32_t num_slots,
-                                                 int32_t chunk_stride,
-                                                 bool enable_prefix_cache,
-                                                 bool instance_is_decode)
+LinearStateBlockManager::LinearStateBlockManager(
+    uint32_t num_slots,
+    int32_t chunk_stride,
+    bool enable_prefix_cache,
+    bool instance_is_decode,
+    uint32_t num_speculative_tokens)
     : BlockManagerImpl(make_linear_state_options(num_slots,
                                                  chunk_stride,
                                                  enable_prefix_cache,
-                                                 instance_is_decode)) {
+                                                 instance_is_decode,
+                                                 num_speculative_tokens)) {
   CHECK_GT(num_slots, 1u)
       << "linear-state leaf needs at least one usable slot (plus padding)";
   CHECK_GT(chunk_stride, 0)
       << "linear-state leaf needs a positive chunk stride";
+  CHECK_LE(static_cast<uint64_t>(num_speculative_tokens) + 1,
+           static_cast<uint64_t>(chunk_stride))
+      << "linear-state checkpoint stride must cover one speculative step";
 }
 
 std::optional<std::vector<Block>>
@@ -63,58 +72,71 @@ LinearStateBlockManager::allocate_for_sequence(Sequence* seq,
   if (seq == nullptr) {
     return std::nullopt;
   }
-  const Slice<Block> blocks = seq->kv_state().blocks(BlockType::LINEAR);
-  if (options_.instance_is_decode()) {
-    if (!blocks.empty()) {
-      CHECK_EQ(blocks.size(), 1u);
-      CHECK(blocks.back().is_valid());
-      return std::vector<Block>{};
-    }
-  } else if (!seq->is_prefill_stage()) {
-    CHECK(!blocks.empty());
-    CHECK(blocks.back().is_valid());
-    return std::vector<Block>{};
-  } else {
+  KVCacheState& kv_state = seq->kv_state();
+  const bool decode_window =
+      options_.instance_is_decode() || !seq->is_prefill_stage();
+  const size_t chunk_stride = block_size();
+  if (!decode_window) {
     const size_t cached_tokens = seq->kv_cache_tokens_num();
-    const size_t chunk_stride = block_size();
     CHECK_GT(num_tokens, cached_tokens);
     CHECK_LE(num_tokens, seq->num_tokens());
     CHECK_EQ(cached_tokens % chunk_stride, 0u);
     CHECK_LE(num_tokens - cached_tokens, chunk_stride);
     CHECK(num_tokens == seq->num_tokens() || num_tokens % chunk_stride == 0);
-    const size_t output_index = cached_tokens / chunk_stride;
-    CHECK(blocks.size() == output_index || blocks.size() == output_index + 1);
-    if (output_index > 0) {
-      CHECK(blocks[output_index - 1].is_valid());
-    }
-    if (blocks.size() == output_index + 1) {
-      CHECK(blocks.back().is_valid());
-      return std::vector<Block>{};
-    }
+  }
+  const size_t current = kv_state.last_confirmed_cached_tokens();
+  const size_t max_step_tokens =
+      static_cast<size_t>(options_.num_speculative_tokens()) + 1;
+  const bool rotate = current % chunk_stride + max_step_tokens >= chunk_stride;
+  trim_window(*seq, decode_window, current);
+  std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::LINEAR);
+  if (!blocks->empty() && decode_window && !rotate) {
+    CHECK(blocks->back().is_valid());
+    return std::vector<Block>{};
   }
   Block slot = allocate();
   if (!slot.is_valid()) {
     return std::nullopt;
   }
-  std::vector<Block> allocated;
-  allocated.reserve(1);
-  allocated.emplace_back(std::move(slot));
+  std::vector<Block> allocated(1);
+  allocated.back() = std::move(slot);
+  if (decode_window || seq->is_graph_warmup() || prefix_cache_ == nullptr ||
+      blocks->empty()) {
+    return allocated;
+  }
+  CHECK_EQ(blocks->size(), 1u);
+  const size_t cached_tokens = seq->kv_cache_tokens_num();
+  const size_t checkpoint_index = cached_tokens / chunk_stride;
+  if (checkpoint_index <= kv_state.num_cached_blocks(BlockType::LINEAR)) {
+    return allocated;
+  }
+  CHECK(blocks->front().is_valid());
+  seq->update_linear_state_hashes(block_size());
+  const Slice<XXH3Key> hashes = seq->linear_state_hashes();
+  CHECK_GE(hashes.size(), checkpoint_index);
+  blocks->front().set_hash_value(hashes[checkpoint_index - 1].data);
+  Slice<Block> checkpoint = Slice<Block>(*blocks).slice(0, 1);
+  prefix_cache_->insert(checkpoint);
+  kv_state.set_num_cached_blocks(BlockType::LINEAR, checkpoint_index);
   return allocated;
 }
 
-void LinearStateBlockManager::release_out_of_window(Sequence* seq) {
-  if (seq == nullptr) {
+void LinearStateBlockManager::trim_window(Sequence& seq,
+                                          bool decode_window,
+                                          size_t cached_tokens) {
+  std::vector<Block>* blocks = seq.kv_state().mutable_blocks(BlockType::LINEAR);
+  if (blocks->empty()) {
     return;
   }
-  std::vector<Block>* blocks =
-      seq->kv_state().mutable_blocks(BlockType::LINEAR);
-  const size_t keep =
-      !options_.instance_is_decode() && seq->is_prefill_stage() ? 2 : 1;
-  if (blocks == nullptr || blocks->size() <= keep) {
-    return;
+  const size_t max_step_tokens =
+      static_cast<size_t>(options_.num_speculative_tokens()) + 1;
+  if (blocks->size() == 2 && decode_window && cached_tokens >= block_size() &&
+      cached_tokens % block_size() < max_step_tokens) {
+    // TODO: Publish the decode checkpoint before releasing the first block.
   }
-  Block released = std::move((*blocks)[blocks->size() - keep - 1]);
-  deallocate(Slice<Block>(&released, 1));
+  deallocate(Slice<Block>(*blocks).slice(0, blocks->size() - 1));
+  blocks->erase(blocks->begin(), blocks->end() - 1);
+  CHECK(blocks->back().is_valid());
 }
 
 Block LinearStateBlockManager::allocate() {

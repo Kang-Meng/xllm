@@ -173,18 +173,22 @@ void mount_linear_source_for_test(Sequence& sequence,
     CHECK_EQ(allocated.size(), 1u);
     output = std::move(allocated.front());
   }
-  std::vector<Block> blocks(output_index + 1);
-  blocks[output_index - 1] = std::move(source);
-  blocks[output_index] = std::move(output);
+  std::vector<Block> blocks;
+  blocks.reserve(1);
+  blocks.emplace_back(std::move(source));
   sequence.kv_state().replace_composite_blocks(
       BlockType::LINEAR, std::move(blocks), 0, 0);
+  std::vector<Block> output_blocks;
+  output_blocks.reserve(1);
+  output_blocks.emplace_back(std::move(output));
+  sequence.add_blocks(BlockType::LINEAR, std::move(output_blocks));
 }
 
 void release_linear_source_for_test(Sequence& sequence) {
   std::vector<Block>* blocks =
       sequence.kv_state().mutable_blocks(BlockType::LINEAR);
   CHECK_GE(blocks->size(), 2u);
-  (*blocks)[blocks->size() - 2] = Block();
+  blocks->erase(blocks->begin());
 }
 
 Sequence make_basic_sequence(const std::vector<int32_t>& prompt_token_ids,
@@ -240,22 +244,6 @@ Sequence make_overlap_sequence(const std::vector<int32_t>& prompt_token_ids,
                   decoder,
                   seq_params);
 }
-
-class ScopedLinearStateOutOfPlace final {
- public:
-  explicit ScopedLinearStateOutOfPlace(bool enabled)
-      : previous_(SchedulerConfig::get_instance()
-                      .enable_linear_state_out_of_place()) {
-    SchedulerConfig::get_instance().enable_linear_state_out_of_place(enabled);
-  }
-
-  ~ScopedLinearStateOutOfPlace() {
-    SchedulerConfig::get_instance().enable_linear_state_out_of_place(previous_);
-  }
-
- private:
-  bool previous_;
-};
 
 class ScopedModelImpl final {
  public:
@@ -2310,9 +2298,8 @@ TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {
             expected_linear_id);
 }
 
-TEST(BatchTest, LinearRestoreSourceStaysPinnedForBatchLifetime) {
+TEST(BatchTest, LinearReadWriteOwnershipStaysInSequence) {
   ScopedPrefillChunkStride chunk_stride(4);
-  ScopedLinearStateOutOfPlace out_of_place(true);
   ScopedModelImpl model_impl("native");
   BlockManager::Options options;
   options.num_blocks(6).block_size(4);
@@ -2331,26 +2318,32 @@ TEST(BatchTest, LinearRestoreSourceStaysPinnedForBatchLifetime) {
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
   ForwardInput input = batch->prepare_forward_input(0, 0, args);
-  ASSERT_EQ(input.input_params.linear_state_cache_ops.size(), 1u);
-  const LinearStateCacheOp& cache_op =
-      input.input_params.linear_state_cache_ops.front();
-  EXPECT_FALSE(cache_op.reset_requested);
-  EXPECT_EQ(cache_op.restore_requested, !Platform::is_npu());
-  EXPECT_EQ(cache_op.restore_src_slot_id, source_id);
-  EXPECT_EQ(cache_op.linear_state_id, output_id);
-  EXPECT_EQ(sequence.kv_state().copy_linear_state_source().id(), source_id);
-  release_linear_source_for_test(sequence);
+  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
+  EXPECT_FALSE(
+      (input.input_params.attention.host.kv_cache_tokens_nums.front() == 0 &&
+       input.input_params.embedding.linear_state_read_ids.front() ==
+           input.input_params.embedding.linear_state_ids.front()));
+  EXPECT_NE(input.input_params.embedding.linear_state_read_ids.front(),
+            input.input_params.embedding.linear_state_ids.front());
+  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids.front(),
+            source_id);
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
+  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[0].ref_count(), 1u);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[1].ref_count(), 1u);
   EXPECT_TRUE(manager.allocate(1).empty());
-  batch.reset();
+  release_linear_source_for_test(sequence);
   std::vector<Block> reclaimed = manager.allocate(1);
   ASSERT_EQ(reclaimed.size(), 1u);
   EXPECT_EQ(reclaimed.front().id(), source_id);
+  batch.reset();
+  EXPECT_EQ(reclaimed.front().ref_count(), 1u);
 }
 
 #if defined(USE_NPU)
 TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
   ScopedModelImpl model_impl("python");
 
   BlockManager::Options options;
@@ -2379,26 +2372,31 @@ TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
   ForwardInput forward_input = batch->prepare_forward_input(
       /*num_decoding_tokens=*/0, /*min_decoding_bach_size=*/0, args);
 
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
-  const LinearStateCacheOp& cache_op =
-      forward_input.input_params.linear_state_cache_ops[0];
-  EXPECT_FALSE(cache_op.reset_requested);
-  EXPECT_FALSE(cache_op.restore_requested);
-  EXPECT_EQ(cache_op.restore_src_slot_id, source_id);
-  EXPECT_EQ(cache_op.linear_state_id, live_id);
-  EXPECT_NE(cache_op.linear_state_id, source_id);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+  EXPECT_FALSE(
+      (forward_input.input_params.attention.host.kv_cache_tokens_nums[0] == 0 &&
+       forward_input.input_params.embedding.linear_state_read_ids[0] ==
+           forward_input.input_params.embedding.linear_state_ids[0]));
+
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[0],
+            source_id);
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_ids[0], live_id);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_ids[0],
+            source_id);
   std::vector<Block> remaining = manager.allocate(1);
   ASSERT_EQ(remaining.size(), 1u);
   EXPECT_TRUE(manager.allocate(1).empty());
   release_linear_source_for_test(sequence);
-  EXPECT_TRUE(manager.allocate(1).empty());
+  std::vector<Block> reclaimed = manager.allocate(1);
+  ASSERT_EQ(reclaimed.size(), 1u);
+  EXPECT_EQ(reclaimed.front().id(), source_id);
   batch.reset();
-  EXPECT_EQ(manager.allocate(1).size(), 1u);
+  EXPECT_EQ(reclaimed.front().ref_count(), 1u);
 }
 
-TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DWhenDisabled) {
+TEST(BatchTest, Glm53PrefillPreservesCheckpointReadIds) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/false);
   ScopedModelImpl model_impl("python");
 
   BlockManager::Options options;
@@ -2423,16 +2421,16 @@ TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DWhenDisabled) {
   ForwardInput forward_input = batch.prepare_forward_input(
       /*num_decoding_tokens=*/0, /*min_decoding_bach_size=*/0, args);
 
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
-  const LinearStateCacheOp& cache_op =
-      forward_input.input_params.linear_state_cache_ops[0];
-  EXPECT_TRUE(cache_op.restore_requested);
-  EXPECT_EQ(cache_op.restore_src_slot_id, source_id);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
+            forward_input.input_params.embedding.linear_state_ids[0]);
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[0],
+            source_id);
 }
 
-TEST(BatchTest, Glm53MixedBatchKeepsPrefillCheckpointRestoreD2D) {
+TEST(BatchTest, Glm53MixedBatchPreservesPrefillReadIds) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
   ScopedModelImpl model_impl("python");
 
   BlockManager::Options options;
@@ -2465,17 +2463,18 @@ TEST(BatchTest, Glm53MixedBatchKeepsPrefillCheckpointRestoreD2D) {
   ForwardInput forward_input = batch.prepare_forward_input(
       /*num_decoding_tokens=*/1, /*min_decoding_bach_size=*/0, args);
 
-  const auto& cache_ops = forward_input.input_params.linear_state_cache_ops;
-  ASSERT_EQ(cache_ops.size(), 2u);
-  EXPECT_EQ(cache_ops[0].restore_src_slot_id, prefill_source_id);
-  EXPECT_TRUE(cache_ops[0].restore_requested);
-  EXPECT_EQ(cache_ops[1].restore_src_slot_id, -1);
-  EXPECT_FALSE(cache_ops[1].restore_requested);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            2u);
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[0],
+            prefill_source_id);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
+            forward_input.input_params.embedding.linear_state_ids[0]);
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[1],
+            forward_input.input_params.embedding.linear_state_ids[1]);
 }
 
-TEST(BatchTest, Glm53NativeExecutorKeepsCheckpointRestoreD2D) {
+TEST(BatchTest, Glm53NativeExecutorPreservesCheckpointReadIds) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
   ScopedModelImpl model_impl("native");
 
   BlockManager::Options options;
@@ -2499,14 +2498,14 @@ TEST(BatchTest, Glm53NativeExecutorKeepsCheckpointRestoreD2D) {
   ForwardInput forward_input = batch.prepare_forward_input(
       /*num_decoding_tokens=*/0, /*min_decoding_bach_size=*/0, args);
 
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
-  EXPECT_TRUE(
-      forward_input.input_params.linear_state_cache_ops[0].restore_requested);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
+            forward_input.input_params.embedding.linear_state_ids[0]);
 }
 
-TEST(BatchTest, OtherLinearModelKeepsCheckpointRestoreD2D) {
+TEST(BatchTest, OtherLinearModelPreservesCheckpointReadIds) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
   ScopedModelImpl model_impl("python");
 
   BlockManager::Options options;
@@ -2531,14 +2530,14 @@ TEST(BatchTest, OtherLinearModelKeepsCheckpointRestoreD2D) {
   ForwardInput forward_input = batch->prepare_forward_input(
       /*num_decoding_tokens=*/0, /*min_decoding_bach_size=*/0, args);
 
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
-  EXPECT_TRUE(
-      forward_input.input_params.linear_state_cache_ops[0].restore_requested);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
+            forward_input.input_params.embedding.linear_state_ids[0]);
 }
 
 TEST(BatchTest, Glm53DecodeUpdatesExistingTailWithoutRestore) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
   ScopedModelImpl model_impl("python");
 
   BlockManager::Options options;
@@ -2573,19 +2572,19 @@ TEST(BatchTest, Glm53DecodeUpdatesExistingTailWithoutRestore) {
   ForwardInput forward_input = batch->prepare_forward_input(
       /*num_decoding_tokens=*/1, /*min_decoding_bach_size=*/0, args);
 
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+
   EXPECT_FALSE(
-      forward_input.input_params.linear_state_cache_ops[0].restore_requested);
-  EXPECT_FALSE(
-      forward_input.input_params.linear_state_cache_ops[0].reset_requested);
-  EXPECT_EQ(
-      forward_input.input_params.linear_state_cache_ops[0].restore_src_slot_id,
-      -1);
+      (forward_input.input_params.attention.host.kv_cache_tokens_nums[0] == 0 &&
+       forward_input.input_params.embedding.linear_state_read_ids[0] ==
+           forward_input.input_params.embedding.linear_state_ids[0]));
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[0],
+            forward_input.input_params.embedding.linear_state_ids[0]);
 }
 #else
-TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DOutsideNpu) {
+TEST(BatchTest, Glm53PrefillPreservesReadIdsOutsideNpu) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
-  ScopedLinearStateOutOfPlace out_of_place(/*enabled=*/true);
   ScopedModelImpl model_impl("python");
 
   BlockManager::Options options;
@@ -2609,9 +2608,10 @@ TEST(BatchTest, Glm53PrefillKeepsCheckpointRestoreD2DOutsideNpu) {
   ForwardInput forward_input = batch.prepare_forward_input(
       /*num_decoding_tokens=*/0, /*min_decoding_bach_size=*/0, args);
 
-  ASSERT_EQ(forward_input.input_params.linear_state_cache_ops.size(), 1u);
-  EXPECT_TRUE(
-      forward_input.input_params.linear_state_cache_ops[0].restore_requested);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
+            forward_input.input_params.embedding.linear_state_ids[0]);
 }
 #endif
 
@@ -2629,36 +2629,42 @@ TEST(BatchTest, ColdPrefillResetsButShortPromptDecodeDoesNotReset) {
   Batch prefill;
   prefill.add(&sequence, 3);
   ForwardInput prefill_input = prefill.prepare_forward_input(0, 0, args);
-  ASSERT_EQ(prefill_input.input_params.linear_state_cache_ops.size(), 1u);
-  const LinearStateCacheOp& cold_op =
-      prefill_input.input_params.linear_state_cache_ops.front();
-  EXPECT_TRUE(cold_op.reset_requested);
-  EXPECT_FALSE(cold_op.restore_requested);
-  EXPECT_EQ(cold_op.restore_src_slot_id, -1);
+  ASSERT_EQ(prefill_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+  EXPECT_TRUE(
+      (prefill_input.input_params.attention.host.kv_cache_tokens_nums.front() ==
+           0 &&
+       prefill_input.input_params.embedding.linear_state_read_ids.front() ==
+           prefill_input.input_params.embedding.linear_state_ids.front()));
+
+  EXPECT_EQ(prefill_input.input_params.embedding.linear_state_read_ids.front(),
+            prefill_input.input_params.embedding.linear_state_ids.front());
   sequence.append_token(4);
   Batch decode;
   decode.add(&sequence, 1);
   ForwardInput decode_input = decode.prepare_forward_input(1, 0, args);
-  ASSERT_EQ(decode_input.input_params.linear_state_cache_ops.size(), 1u);
-  const LinearStateCacheOp& decode_op =
-      decode_input.input_params.linear_state_cache_ops.front();
-  EXPECT_FALSE(decode_op.reset_requested);
-  EXPECT_FALSE(decode_op.restore_requested);
-  EXPECT_EQ(decode_op.restore_src_slot_id, -1);
-  EXPECT_EQ(decode_op.linear_state_id, output_id);
+  ASSERT_EQ(decode_input.input_params.embedding.linear_state_read_ids.size(),
+            1u);
+  EXPECT_FALSE(
+      (decode_input.input_params.attention.host.kv_cache_tokens_nums.front() ==
+           0 &&
+       decode_input.input_params.embedding.linear_state_read_ids.front() ==
+           decode_input.input_params.embedding.linear_state_ids.front()));
+
+  EXPECT_EQ(decode_input.input_params.embedding.linear_state_read_ids.front(),
+            decode_input.input_params.embedding.linear_state_ids.front());
+  EXPECT_EQ(decode_input.input_params.embedding.linear_state_ids.front(),
+            output_id);
 }
 
-TEST(BatchTest, DecodeKeepsSparseTailWithoutRestore) {
+TEST(BatchTest, DecodeKeepsSingleTailWithoutRestore) {
   ScopedPrefillChunkStride chunk_stride(4);
   BlockManager::Options options;
   options.num_blocks(5).block_size(4);
   BlockManagerImpl manager(options);
   Sequence sequence = make_basic_sequence({1, 2, 3, 4, 5, 6, 7, 8});
   sequence.add_blocks(BlockType::KV, manager.allocate(3));
-  std::vector<Block> blocks(2);
-  std::vector<Block> output = manager.allocate(1);
-  blocks.back() = std::move(output.front());
-  sequence.add_blocks(BlockType::LINEAR, std::move(blocks));
+  sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
   sequence.kv_state().set_kv_cache_tokens_num(8);
   sequence.append_token(9);
   Batch batch;
@@ -2666,16 +2672,343 @@ TEST(BatchTest, DecodeKeepsSparseTailWithoutRestore) {
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
   ForwardInput input = batch.prepare_forward_input(1, 0, args);
-  ASSERT_EQ(input.input_params.linear_state_cache_ops.size(), 1u);
-  const LinearStateCacheOp& cache_op =
-      input.input_params.linear_state_cache_ops.front();
-  EXPECT_FALSE(cache_op.reset_requested);
-  EXPECT_FALSE(cache_op.restore_requested);
-  EXPECT_EQ(cache_op.restore_src_slot_id, -1);
-  EXPECT_EQ(cache_op.linear_state_id, sequence.get_linear_state_slot_id());
+  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
+  EXPECT_FALSE(
+      (input.input_params.attention.host.kv_cache_tokens_nums.front() == 0 &&
+       input.input_params.embedding.linear_state_read_ids.front() ==
+           input.input_params.embedding.linear_state_ids.front()));
+
+  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids.front(),
+            input.input_params.embedding.linear_state_ids.front());
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(),
+            sequence.get_linear_state_slot_id());
 }
 
-TEST(BatchTest, ThreadedBatchPinsEveryLinearRestoreSourceUntilRelease) {
+TEST(BatchTest, DecodeDestinationOwnershipStaysInSequence) {
+  ScopedPrefillChunkStride chunk_stride(4);
+  BlockManager::Options options;
+  options.num_blocks(3).block_size(4);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_basic_sequence({1, 2, 3});
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
+  const int32_t output_id = sequence.get_linear_state_slot_id();
+  sequence.kv_state().set_kv_cache_tokens_num(3);
+  sequence.append_token(4);
+  std::optional<Batch> batch;
+  batch.emplace();
+  batch->add(&sequence, 1);
+  ModelArgs args;
+  args.model_type("qwen3_5").layer_types({"linear_attention"});
+  ForwardInput input = batch->prepare_forward_input(1, 0, args);
+  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+            1u);
+  EXPECT_TRUE(manager.allocate(1).empty());
+  sequence.kv_state().mutable_blocks(BlockType::LINEAR)->clear();
+  std::vector<Block> reclaimed = manager.allocate(1);
+  ASSERT_EQ(reclaimed.size(), 1u);
+  EXPECT_EQ(reclaimed.front().id(), output_id);
+  batch.reset();
+  EXPECT_EQ(reclaimed.front().ref_count(), 1u);
+}
+
+TEST(BatchTest, DecodeRotationSerializesIndependentReadAndWriteSlots) {
+  ScopedModelImpl model_impl("native");
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(8);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_basic_sequence({1, 2, 3});
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
+  sequence.kv_state().set_kv_cache_tokens_num(3);
+  sequence.append_token(4);
+  const int32_t source_id = sequence.get_linear_state_slot_id();
+  sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
+  const int32_t output_id = sequence.get_linear_state_slot_id();
+  std::optional<Batch> batch;
+  batch.emplace();
+  batch->add(&sequence, 1);
+  ModelArgs args;
+  args.model_type("qwen3_5").layer_types({"linear_attention"});
+  ForwardInput input = batch->prepare_forward_input(1, 0, args);
+  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
+  EXPECT_FALSE(
+      (input.input_params.attention.host.kv_cache_tokens_nums.front() == 0 &&
+       input.input_params.embedding.linear_state_read_ids.front() ==
+           input.input_params.embedding.linear_state_ids.front()));
+  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids.front(),
+            source_id);
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
+  EXPECT_NE(input.input_params.embedding.linear_state_read_ids.front(),
+            input.input_params.embedding.linear_state_ids.front());
+  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids,
+            std::vector<int32_t>({source_id}));
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids,
+            std::vector<int32_t>({output_id}));
+  EXPECT_TRUE(manager.allocate(1).empty());
+  sequence.kv_state().erase_blocks(BlockType::LINEAR);
+  std::vector<Block> reclaimed = manager.allocate(2);
+  ASSERT_EQ(reclaimed.size(), 2u);
+  batch.reset();
+  for (const Block& block : reclaimed) {
+    EXPECT_EQ(block.ref_count(), 1u);
+  }
+}
+
+TEST(BatchTest, OverlapRawAcceptanceConfirmsProgressBeforeNextAllocation) {
+  ScopedPrefillChunkStride chunk_stride(2048);
+  const bool previous_overlap =
+      SchedulerConfig::get_instance().enable_schedule_overlap();
+  SchedulerConfig::get_instance().enable_schedule_overlap(true);
+  BlockManager::Options options;
+  options.num_blocks(2048)
+      .block_size(2)
+      .enable_linear_state(true)
+      .linear_state_num_slots(8)
+      .num_speculative_tokens(3)
+      .enable_prefix_cache(false);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  RequestSamplingParam sampling;
+  StoppingChecker stopping;
+  stopping.set_max_generated_tokens(32);
+  Sequence sequence = make_overlap_sequence(
+      std::vector<int32_t>(2046, 7), 4096, &sampling, &stopping);
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, 2046));
+  ModelArgs args;
+  args.model_type("qwen3_5").layer_types({"linear_attention"});
+  RawForwardOutput fake;
+  fake.outputs.emplace_back(make_raw_sample_output(-1, std::nullopt));
+  RawForwardOutput first_token;
+  first_token.outputs.emplace_back(make_raw_sample_output(8, std::nullopt));
+  Batch prefill;
+  prefill.add(&sequence, 2046);
+  prefill.prepare_forward_input(1, 0, args);
+  prefill.process_sample_output(fake, false);
+  prefill.process_sample_output(first_token, true);
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
+  Batch first;
+  first.add(&sequence, 1);
+  first.prepare_forward_input(1, 0, args);
+  first.process_sample_output(fake, false);
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
+  Batch second;
+  second.add(&sequence, 1);
+  second.prepare_forward_input(1, 0, args);
+  second.process_sample_output(fake, false);
+  RawForwardOutput accepted;
+  RawSampleOutput accepted_row;
+  accepted_row.tokens.reserve(4);
+  for (int32_t token_id = 9; token_id < 13; ++token_id) {
+    RawSampleOutput token = make_raw_sample_output(token_id, std::nullopt);
+    accepted_row.tokens.emplace_back(std::move(token.tokens.front()));
+  }
+  accepted.outputs.emplace_back(std::move(accepted_row));
+  first.process_sample_output(accepted, true);
+  EXPECT_EQ(sequence.kv_cache_tokens_num(), 2051u);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 2050u);
+  const int32_t source_id = sequence.get_linear_state_slot_id();
+  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 2050u);
+  Batch third;
+  third.add(&sequence, 1);
+  ForwardInput third_input = third.prepare_forward_input(1, 0, args);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 2050u);
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_EQ(third_input.input_params.embedding.linear_state_read_ids.front(),
+            source_id);
+  EXPECT_EQ(third_input.input_params.embedding.linear_state_ids.front(),
+            source_id);
+  third.process_sample_output(fake, false);
+  accepted.outputs.front().tokens.resize(2);
+  second.process_sample_output(accepted, true);
+  ASSERT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 2052u);
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+            source_id);
+  SchedulerConfig::get_instance().enable_schedule_overlap(previous_overlap);
+}
+
+TEST(BatchTest, IntermediatePrefillAdvancesOnlyRawCacheProgress) {
+  ScopedModelImpl model_impl("native");
+  for (const bool overlap : {false, true}) {
+    for (const bool tensor_output : {false, true}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "overlap=" << overlap << ", tensor=" << tensor_output);
+      BlockManager::Options options;
+      options.num_blocks(4).block_size(16);
+      BlockManagerImpl manager(options);
+      RequestSamplingParam sampling;
+      StoppingChecker stopping;
+      Sequence sequence =
+          overlap ? make_overlap_sequence(
+                        std::vector<int32_t>(12, 7), 32, &sampling, &stopping)
+                  : make_basic_sequence(std::vector<int32_t>(12, 7));
+      sequence.add_blocks(BlockType::KV, manager.allocate(1));
+      RawForwardOutput raw_output;
+      SampleOutput sample_output;
+      sample_output.next_tokens = torch::empty({0}, torch::kInt64);
+      const auto complete = [&](Batch& batch, bool replace_fake_token) {
+        if (tensor_output) {
+          batch.process_sample_output(sample_output, replace_fake_token);
+        } else {
+          batch.process_sample_output(raw_output, replace_fake_token);
+        }
+      };
+      Batch first;
+      first.add(&sequence, 4);
+      first.prepare_forward_input(1, 0, ModelArgs());
+      EXPECT_EQ(sequence.kv_cache_tokens_num(), 4u);
+      EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+      complete(first, false);
+      EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+      Batch second;
+      second.add(&sequence, 4);
+      second.prepare_forward_input(1, 0, ModelArgs());
+      EXPECT_EQ(sequence.kv_cache_tokens_num(), 8u);
+      complete(second, false);
+      EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+      if (overlap) {
+        complete(first, true);
+        complete(second, true);
+      }
+      EXPECT_EQ(sequence.kv_cache_tokens_num(), 8u);
+      EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+    }
+  }
+}
+
+TEST(BatchTest, OverlapFirstDecodeWaitsForConfirmedPrefillProgress) {
+  ScopedModelImpl model_impl("native");
+  ScopedPrefillChunkStride chunk_stride(2048);
+  RequestSamplingParam sampling;
+  StoppingChecker stopping;
+  stopping.set_max_generated_tokens(32);
+  ModelArgs args;
+  args.model_type("qwen3_5").layer_types({"linear_attention"});
+  RawForwardOutput fake;
+  fake.outputs.emplace_back(make_raw_sample_output(-1, std::nullopt));
+  RawForwardOutput real;
+  real.outputs.emplace_back(make_raw_sample_output(8, std::nullopt));
+  RawForwardOutput empty;
+  for (const bool prefix_cache : {false, true}) {
+    for (const size_t intermediate_chunks : {0u, 2u}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "prefix_cache=" << prefix_cache
+                   << ", intermediate_chunks=" << intermediate_chunks);
+      BlockManager::Options options;
+      options.num_blocks(4096)
+          .block_size(2)
+          .enable_linear_state(true)
+          .linear_state_num_slots(8)
+          .num_speculative_tokens(3)
+          .enable_prefix_cache(prefix_cache);
+      CompositeBlockManager manager(build_composite_leaves(options), options);
+      const size_t prompt_tokens = intermediate_chunks * 2048 + 2046;
+      Sequence sequence = make_overlap_sequence(
+          std::vector<int32_t>(prompt_tokens, 7), 8192, &sampling, &stopping);
+      std::vector<Batch> prefills;
+      prefills.reserve(intermediate_chunks + 1);
+      for (size_t chunk_index = 0; chunk_index <= intermediate_chunks;
+           ++chunk_index) {
+        const uint32_t query_tokens =
+            chunk_index < intermediate_chunks ? 2048 : 2046;
+        ASSERT_TRUE(manager.allocate_sequence(
+            &sequence, sequence.kv_cache_tokens_num() + query_tokens));
+        Batch& prefill = prefills.emplace_back();
+        prefill.add(&sequence, query_tokens);
+        prefill.prepare_forward_input(1, 0, args);
+        prefill.process_sample_output(
+            chunk_index < intermediate_chunks ? empty : fake, false);
+        if (chunk_index > 0) {
+          prefills[chunk_index - 1].process_sample_output(empty, true);
+        }
+        EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+      }
+      EXPECT_EQ(sequence.kv_cache_tokens_num(), prompt_tokens);
+      const int32_t source_id = sequence.get_linear_state_slot_id();
+
+      ASSERT_TRUE(
+          manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
+      ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+      EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+      Batch first_decode;
+      first_decode.add(&sequence, 1);
+      first_decode.prepare_forward_input(1, 0, args);
+      first_decode.process_sample_output(fake, false);
+      EXPECT_EQ(sequence.kv_cache_tokens_num(), prompt_tokens + 1);
+      EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+      prefills.back().process_sample_output(real, true);
+      EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(),
+                prompt_tokens);
+      EXPECT_EQ(sequence.kv_cache_tokens_num(), prompt_tokens + 1);
+
+      ASSERT_TRUE(
+          manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
+      ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+      EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+                source_id);
+      EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
+      EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(),
+                prompt_tokens);
+      manager.deallocate_for_sequence(&sequence);
+    }
+  }
+}
+
+TEST(BatchTest, OverlapTensorAcceptanceConfirmsOnlyCompletedTokens) {
+  ScopedModelImpl model_impl("native");
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(16);
+  BlockManagerImpl manager(options);
+  RequestSamplingParam sampling;
+  StoppingChecker stopping;
+  stopping.set_max_generated_tokens(32);
+  Sequence sequence =
+      make_overlap_sequence({1, 2, 3}, 32, &sampling, &stopping);
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.kv_state().set_kv_cache_tokens_num(3);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+  sequence.append_token(-1);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+  sequence.update_last_step_token(Token(8));
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 3u);
+  SampleOutput fake;
+  fake.next_tokens = torch::tensor({-1}, torch::kInt64);
+  Batch first;
+  first.add(&sequence, 1);
+  first.prepare_forward_input(1, 0, ModelArgs());
+  first.process_sample_output(fake, false);
+  Batch second;
+  second.add(&sequence, 1);
+  second.prepare_forward_input(1, 0, ModelArgs());
+  second.process_sample_output(fake, false);
+  EXPECT_EQ(sequence.kv_cache_tokens_num(), 5u);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 3u);
+  SampleOutput accepted;
+  accepted.next_tokens = torch::tensor({{9, 10, 11, -1}}, torch::kInt64);
+  first.process_sample_output(accepted, true);
+  EXPECT_EQ(sequence.kv_cache_tokens_num(), 7u);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 6u);
+}
+
+TEST(SequenceTest, NonOverlapRealTokensConfirmCacheProgress) {
+  Sequence sequence = make_basic_sequence({1, 2, 3});
+  sequence.kv_state().set_kv_cache_tokens_num(3);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 0u);
+  sequence.append_token(8);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 3u);
+  sequence.kv_state().set_kv_cache_tokens_num(4);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 3u);
+  sequence.append_token(9);
+  EXPECT_EQ(sequence.kv_state().last_confirmed_cached_tokens(), 4u);
+}
+
+TEST(BatchTest, ThreadedInputBuildKeepsLinearOwnershipInSequences) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/32768);
 
   constexpr size_t kQueryTokensPerSequence = 32768;
@@ -2736,16 +3069,29 @@ TEST(BatchTest, ThreadedBatchPinsEveryLinearRestoreSourceUntilRelease) {
   args.layer_types({"linear_attention"});
   ForwardInput forward_input = batch->prepare_forward_input(args, &thread_pool);
 
-  const auto& cache_ops = forward_input.input_params.linear_state_cache_ops;
-  ASSERT_EQ(cache_ops.size(), 2u);
-  EXPECT_TRUE(cache_ops[0].restore_requested);
-  EXPECT_TRUE(cache_ops[1].restore_requested);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            2u);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
+            forward_input.input_params.embedding.linear_state_ids[0]);
+  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[1],
+            forward_input.input_params.embedding.linear_state_ids[1]);
   EXPECT_TRUE(manager.allocate(1).empty());
   release_linear_source_for_test(first_sequence);
   release_linear_source_for_test(second_sequence);
+  std::vector<Block> reclaimed_sources = manager.allocate(2);
+  ASSERT_EQ(reclaimed_sources.size(), 2u);
+  first_sequence.kv_state().erase_blocks(BlockType::LINEAR);
+  second_sequence.kv_state().erase_blocks(BlockType::LINEAR);
+  std::vector<Block> reclaimed_outputs = manager.allocate(2);
+  ASSERT_EQ(reclaimed_outputs.size(), 2u);
   EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
-  EXPECT_EQ(manager.allocate(2).size(), 2u);
+  for (const Block& block : reclaimed_sources) {
+    EXPECT_EQ(block.ref_count(), 1u);
+  }
+  for (const Block& block : reclaimed_outputs) {
+    EXPECT_EQ(block.ref_count(), 1u);
+  }
 }
 
 TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
@@ -3366,6 +3712,7 @@ TEST(BatchTest, OverlapMTPReplacementSkipsPreemptedSequenceWithoutKVBlocks) {
       batch.process_sample_output(real_output, /*replace_fake_token=*/true));
   EXPECT_EQ(seq.num_generated_tokens(), 1);
   EXPECT_EQ(seq.tokens()[seq.num_prompt_tokens()], 101);
+  EXPECT_EQ(seq.kv_state().last_confirmed_cached_tokens(), 0u);
 
   SchedulerConfig::get_instance().enable_schedule_overlap(
       old_enable_schedule_overlap);
@@ -3432,6 +3779,8 @@ TEST(BatchTest, OverlapMTPReplacementKeepsCompositeKvBlocks) {
   EXPECT_EQ(seq.tokens()[seq.num_prompt_tokens()], 101);
   EXPECT_EQ(seq.tokens()[seq.num_prompt_tokens() + 1], 102);
   EXPECT_EQ(seq.kv_state().kv_cache_tokens_num(), seq.num_prompt_tokens() + 1);
+  EXPECT_EQ(seq.kv_state().last_confirmed_cached_tokens(),
+            seq.num_prompt_tokens() + 1);
 
   SchedulerConfig::get_instance().enable_schedule_overlap(
       old_enable_schedule_overlap);

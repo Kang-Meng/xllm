@@ -48,6 +48,11 @@ size_t KVCacheState::kv_cache_tokens_num() const {
 
 void KVCacheState::set_kv_cache_tokens_num(size_t num) {
   kv_cache_tokens_num_ = num;
+  last_confirmed_cached_tokens_ = std::min(last_confirmed_cached_tokens_, num);
+}
+
+void KVCacheState::set_last_confirmed_cached_tokens(size_t num_tokens) {
+  last_confirmed_cached_tokens_ = std::min(kv_cache_tokens_num_, num_tokens);
 }
 
 void KVCacheState::incr_kv_cache_tokens_num(size_t num) {
@@ -181,15 +186,6 @@ Block KVCacheState::copy_block(BlockType type) const {
   return type == BlockType::LINEAR ? it->second.back() : it->second.front();
 }
 
-Block KVCacheState::copy_linear_state_source() const {
-  const Slice<Block> linear_blocks = blocks(BlockType::LINEAR);
-  if (linear_blocks.size() < 2) {
-    return Block();
-  }
-  CHECK(linear_blocks[linear_blocks.size() - 2].is_valid());
-  return linear_blocks[linear_blocks.size() - 2];
-}
-
 size_t KVCacheState::shared_blocks_num(BlockType type) const {
   const auto it = num_owned_shared_blocks_.find(type);
   return it == num_owned_shared_blocks_.end() ? 0 : it->second;
@@ -268,6 +264,7 @@ void KVCacheState::add_shared_blocks(BlockType type,
   num_cached_blocks_[type] = shared;
   // update the kv cache position
   kv_cache_tokens_num_ = num_shared_tokens;
+  last_confirmed_cached_tokens_ = num_shared_tokens;
 }
 
 void KVCacheState::mount_composite_shared(BlockType type,
@@ -430,6 +427,7 @@ void KVCacheState::advance_group_transfer_block_idx(BlockType type,
 }
 
 void KVCacheState::reset() {
+  last_confirmed_cached_tokens_ = 0;
   kv_cache_tokens_num_ = 0;
   prefix_cache_matched_ = false;
   num_owned_shared_blocks_.clear();

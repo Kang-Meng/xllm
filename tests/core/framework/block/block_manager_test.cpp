@@ -453,9 +453,7 @@ TEST(BlockManagerPoolTest, TryAllocateKvFailureRollsBackSingleBlock) {
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/1);
 
-  // This sequence needs far more KV blocks than available, forcing KV failure
-  // after embedding and linear ids are allocated.
-  std::vector<int32_t> huge_prompt(100, 1);
+  std::vector<int32_t> huge_prompt(4, 1);
   Sequence fail_seq = make_sequence(0, huge_prompt);
   EXPECT_FALSE(pool.try_allocate(&fail_seq));
   EXPECT_FALSE(fail_seq.get_embedding_block_id() >= 0);
@@ -800,7 +798,8 @@ TEST(BlockManagerPoolTest, PromptPastCheckpointReusesCheckpointBoundary) {
       make_sequence(1, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 9});
   ASSERT_TRUE(allocate_next_linear_chunk(pool, hit_seq));
   EXPECT_EQ(hit_seq.kv_state().shared_blocks_num(BlockType::KV), 2u);
-  EXPECT_TRUE(hit_seq.kv_state().copy_linear_state_source().is_valid());
+  ASSERT_EQ(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_TRUE(hit_seq.kv_state().blocks(BlockType::LINEAR)[0].is_valid());
   pool.deallocate_without_cache(&hit_seq);
 }
 
@@ -824,7 +823,8 @@ TEST(BlockManagerPoolTest, LinearAllocationEvictsOnlyUnpinnedCheckpoint) {
   ASSERT_TRUE(pinned.is_valid());
   ASSERT_TRUE(pool.allocate(&sequence, 8));
   EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
-  EXPECT_EQ(sequence.kv_state().copy_linear_state_source().id(), source_id);
+  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
   EXPECT_TRUE(
       BlockManagerPoolTestPeer::contains(leaf, XXH3Key(pinned_hash.data())));
   EXPECT_FALSE(
@@ -857,15 +857,15 @@ TEST(BlockManagerPoolTest, PrefixMountSurvivesOutputAllocationFailureAndRetry) {
   pool.allocate_shared(&consumer);
   ASSERT_EQ(consumer.kv_cache_tokens_num(), 8u);
   EXPECT_FALSE(pool.allocate(&consumer, 9));
-  EXPECT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
   pool.allocate_shared(&consumer);
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
   leaf->deallocate(occupied);
   occupied.clear();
   ASSERT_TRUE(pool.allocate(&consumer, 9));
-  EXPECT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 3u);
-  EXPECT_EQ(consumer.kv_state().copy_linear_state_source().id(), source_id);
+  ASSERT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_EQ(consumer.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
   pool.deallocate_without_cache(&consumer);
 }
 
@@ -920,8 +920,9 @@ TEST(BlockManagerPoolTest, PrefixUsesOnlyExactLinearStateCheckpoint) {
     if (expected_tokens == 0) {
       EXPECT_EQ(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 1u);
     } else {
-      EXPECT_EQ(hit_seq.kv_state().copy_linear_state_source().id(),
-                expected_slot);
+      const Slice<Block> blocks = hit_seq.kv_state().blocks(BlockType::LINEAR);
+      ASSERT_EQ(blocks.size(), 2u);
+      EXPECT_EQ(blocks.front().id(), expected_slot);
     }
     pool.deallocate_without_cache(&hit_seq);
   };

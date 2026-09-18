@@ -19,9 +19,13 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "core/framework/block/block_manager_pool.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/request/incremental_decoder.h"
 #include "core/framework/request/sequence.h"
@@ -122,24 +126,53 @@ runtime::DecodeGraphExecutionShape make_decode_graph_execution_shape(
 
 class RecordingProfileEngine final : public Engine {
  public:
-  RecordingProfileEngine() {
+  explicit RecordingProfileEngine(bool linear_attention = false,
+                                  InstanceRole role = InstanceRole::DEFAULT,
+                                  int32_t num_speculative_tokens = 0,
+                                  bool enable_prefix_cache = false)
+      : linear_attention_(linear_attention),
+        num_speculative_tokens_(num_speculative_tokens) {
     BlockManagerPool::Options options;
     options.num_blocks(/*num_blocks=*/64)
         .block_size(/*block_size=*/4)
-        .enable_prefix_cache(/*enable_prefix_cache=*/false)
-        .max_seqs_per_batch(/*max_seqs_per_batch=*/8);
+        .enable_prefix_cache(enable_prefix_cache)
+        .max_seqs_per_batch(/*max_seqs_per_batch=*/8)
+        .enable_linear_state(linear_attention)
+        .linear_state_num_slots(16)
+        .num_embedding_blocks(16)
+        .num_speculative_tokens(num_speculative_tokens)
+        .instance_is_decode(role == InstanceRole::DECODE);
     block_manager_ = std::make_unique<BlockManagerPool>(options, /*dp_size=*/1);
     model_args_.vocab_size(128)
         .eos_token_id(2)
         .max_position_embeddings(16)
         .hidden_size(8);
+    if (linear_attention) {
+      model_args_.model_type("qwen3_5_moe_text")
+          .layer_types({"linear_attention"})
+          .max_position_embeddings(64);
+    }
   }
 
   ForwardOutput step(std::vector<Batch>& batches) override {
     for (Batch& batch : batches) {
+      std::vector<int32_t> prefill_lengths;
+      prefill_lengths.reserve(batch.get_sequences().size());
       for (Sequence* sequence : batch.get_sequences()) {
         all_requests_marked_ =
             all_requests_marked_ && sequence->is_graph_warmup();
+        if (linear_attention_) {
+          EXPECT_GE(sequence->get_linear_state_slot_id(), 0);
+        }
+        if (sequence->is_prefill_stage()) {
+          prefill_lengths.emplace_back(
+              static_cast<int32_t>(sequence->num_tokens()));
+        } else {
+          ++decode_sequences_;
+        }
+      }
+      if (!prefill_lengths.empty()) {
+        prefill_batches_.emplace_back(std::move(prefill_lengths));
       }
     }
     return ForwardOutput();
@@ -155,6 +188,12 @@ class RecordingProfileEngine final : public Engine {
 
   const ModelArgs& model_args() const override { return model_args_; }
 
+  runtime::DecodeGraphExecutionShape decode_graph_execution_shape()
+      const override {
+    return make_decode_graph_execution_shape(
+        num_speculative_tokens_ + 1, num_speculative_tokens_, false);
+  }
+
   std::vector<int64_t> get_active_activation_memory() const override {
     return {};
   }
@@ -163,11 +202,113 @@ class RecordingProfileEngine final : public Engine {
 
   bool all_requests_marked() const { return all_requests_marked_; }
 
+  const std::vector<std::vector<int32_t>>& prefill_batches() const {
+    return prefill_batches_;
+  }
+
+  int32_t decode_sequences() const { return decode_sequences_; }
+
  private:
   std::unique_ptr<BlockManagerPool> block_manager_;
   ModelArgs model_args_;
   bool all_requests_marked_ = true;
+  bool linear_attention_ = false;
+  int32_t num_speculative_tokens_ = 0;
+  std::vector<std::vector<int32_t>> prefill_batches_;
+  int32_t decode_sequences_ = 0;
 };
+
+#if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
+class LinearProfileGraphWarmupTest
+    : public ::testing::TestWithParam<std::tuple<bool, int32_t>> {
+ protected:
+  void SetUp() override {
+    original_scheduler_ = SchedulerConfig::get_instance();
+    original_execution_ = ExecutionConfig::get_instance();
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() = 4;
+    SchedulerConfig::get_instance().enable_dp_fair_token_budget() = false;
+    ExecutionConfig::get_instance().enable_graph() = true;
+    ExecutionConfig::get_instance().disable_graph_warmup() = false;
+  }
+
+  void TearDown() override {
+    SchedulerConfig::get_instance() = original_scheduler_;
+    ExecutionConfig::get_instance() = original_execution_;
+  }
+
+  ProfileManager::Options options(InstanceRole role,
+                                  int32_t token_budget = 10,
+                                  int32_t sequence_budget = 4) const {
+    ProfileManager::Options options;
+    options.instance_role(role)
+        .max_tokens_per_batch(token_budget)
+        .max_seqs_per_batch(sequence_budget)
+        .enable_schedule_overlap(std::get<0>(GetParam()));
+    return options;
+  }
+
+ private:
+  SchedulerConfig original_scheduler_;
+  ExecutionConfig original_execution_;
+};
+
+TEST_P(LinearProfileGraphWarmupTest,
+       PrefillSplitsBudgetIntoChunksAndShortTail) {
+  RecordingProfileEngine engine(
+      true, InstanceRole::PREFILL, std::get<1>(GetParam()));
+  ProfileManager profile_manager(&engine, options(InstanceRole::PREFILL));
+
+  EXPECT_EQ(engine.prefill_batches(),
+            (std::vector<std::vector<int32_t>>{{4, 4, 2}}));
+  EXPECT_EQ(engine.decode_sequences(), 0);
+  EXPECT_TRUE(engine.all_requests_marked());
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(),
+            (std::vector<size_t>{0}));
+}
+
+TEST_P(LinearProfileGraphWarmupTest, PrefillRespectsSequenceLimit) {
+  RecordingProfileEngine engine(
+      true, InstanceRole::PREFILL, std::get<1>(GetParam()));
+  ProfileManager profile_manager(&engine,
+                                 options(InstanceRole::PREFILL, 10, 2));
+
+  EXPECT_EQ(engine.prefill_batches(),
+            (std::vector<std::vector<int32_t>>{{4, 4}}));
+}
+
+TEST_P(LinearProfileGraphWarmupTest, UnifiedWarmupSeedsDecodeSlots) {
+  RecordingProfileEngine engine(
+      true, InstanceRole::DEFAULT, std::get<1>(GetParam()), true);
+  ProfileManager profile_manager(&engine, options(InstanceRole::DEFAULT));
+
+  EXPECT_EQ(engine.prefill_batches(),
+            (std::vector<std::vector<int32_t>>{{4, 4, 2}}));
+  EXPECT_GT(engine.decode_sequences(), 0);
+  EXPECT_TRUE(engine.all_requests_marked());
+  EXPECT_EQ(engine.block_manager_pool()->num_blocks_in_prefix_cache(),
+            (std::vector<size_t>{0}));
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(),
+            (std::vector<size_t>{0}));
+}
+
+TEST_P(LinearProfileGraphWarmupTest, DecodeOnlyWarmupAllocatesWorkingSlots) {
+  RecordingProfileEngine engine(
+      true, InstanceRole::DECODE, std::get<1>(GetParam()));
+  ProfileManager profile_manager(&engine, options(InstanceRole::DECODE));
+
+  EXPECT_TRUE(engine.prefill_batches().empty());
+  EXPECT_GT(engine.decode_sequences(), 0);
+  EXPECT_TRUE(engine.all_requests_marked());
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(),
+            (std::vector<size_t>{0}));
+}
+
+INSTANTIATE_TEST_SUITE_P(OverlapAndSpeculation,
+                         LinearProfileGraphWarmupTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Values(0, 2)));
+
+#endif
 
 TEST(GraphWarmupTest, BuildsCanonicalBuckets) {
   const DecodeGraphWarmupPlan plan = get_compatibility_decode_graph_warmup_plan(

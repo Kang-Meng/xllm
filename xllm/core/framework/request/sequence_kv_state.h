@@ -148,7 +148,10 @@ class KVCacheState {
   // Linear-state live slot id (BlockType::LINEAR), or -1 when absent.
   int32_t get_linear_block_id() const;
 
-  Block copy_linear_state_source() const;
+  size_t last_confirmed_cached_tokens() const {
+    return last_confirmed_cached_tokens_;
+  }
+  void set_last_confirmed_cached_tokens(size_t num_tokens);
 
   Block copy_block(BlockType type) const;
 
@@ -175,6 +178,8 @@ class KVCacheState {
 
  private:
   void remember_block_size(BlockType type, const std::vector<Block>& blocks);
+
+  size_t last_confirmed_cached_tokens_ = 0;
 
   // number of tokens in kv cache
   size_t kv_cache_tokens_num_ = 0;

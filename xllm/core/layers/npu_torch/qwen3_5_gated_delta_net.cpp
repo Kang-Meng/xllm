@@ -140,7 +140,7 @@ const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
     const AttentionMetadata& attn_metadata,
     const std::vector<int32_t>& live_slots,
     const std::vector<int64_t>& validity_mask,
-    const std::vector<LinearStateCacheOp>& cache_ops,
+    const std::vector<int32_t>& read_slots,
     int64_t checkpoint_stride,
     int64_t num_slots,
     const torch::Device& device) {
@@ -148,9 +148,20 @@ const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
   check_live_slots(live_slots, batch_size, num_slots);
   CHECK_EQ(static_cast<int64_t>(validity_mask.size()), batch_size)
       << "linear_state_validity_mask must be sequence-scoped.";
-  CHECK(cache_ops.empty() ||
-        static_cast<int64_t>(cache_ops.size()) == batch_size)
-      << "linear_state_cache_ops must be empty or sequence-scoped.";
+  CHECK(read_slots.empty() ||
+        static_cast<int64_t>(read_slots.size()) == batch_size)
+      << "linear_state_read_ids must be empty or sequence-scoped.";
+  const auto& read_ids = read_slots.empty() ? live_slots : read_slots;
+  for (size_t row = 0; row < read_ids.size(); ++row) {
+    CHECK_GE(read_ids[row], kPaddingLinearStateId);
+    CHECK_LT(static_cast<int64_t>(read_ids[row]), num_slots)
+        << "linear-state source exceeds cache capacity.";
+    CHECK((read_ids[row] == kPaddingLinearStateId) ==
+          (live_slots[row] == kPaddingLinearStateId))
+        << "padding must not be used as a real linear-state source or target";
+    CHECK(read_ids[row] == live_slots[row] || validity_mask[row] == 1)
+        << "linear-state direct-read row must be warm.";
+  }
   CHECK_GT(checkpoint_stride, 0) << "checkpoint stride must be positive.";
   CHECK_LE(checkpoint_stride,
            static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
@@ -181,53 +192,10 @@ const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
         << "MegaGdn Prefill linear state ids changed within one forward.";
     CHECK(key.linear_state_validity_mask == validity_mask)
         << "MegaGdn Prefill validity changed within one forward.";
-    CHECK_EQ(key.linear_state_cache_ops.size(), cache_ops.size())
-        << "MegaGdn Prefill linear state cache ops changed within one forward.";
+    CHECK(key.linear_state_read_ids == read_ids)
+        << "MegaGdn Prefill read state ids changed within one forward.";
   }
 
-  std::vector<MegaGdnPrefillCacheOpKey> cache_op_keys;
-  if (!cache.has_value()) {
-    cache_op_keys.reserve(cache_ops.size());
-  }
-  for (int64_t i = 0; i < static_cast<int64_t>(cache_ops.size()); ++i) {
-    const LinearStateCacheOp& cache_op = cache_ops[i];
-    CHECK_EQ(cache_op.linear_state_id, live_slots[i])
-        << "linear state descriptor and live slots must stay aligned.";
-    CHECK(!(cache_op.reset_requested && cache_op.restore_requested))
-        << "linear-state reset and restore are mutually exclusive.";
-    if (cache_op.reset_requested) {
-      CHECK_LT(cache_op.restore_src_slot_id, 0)
-          << "linear-state reset must not carry a restore source.";
-      CHECK_EQ(validity_mask[i], 0)
-          << "linear-state reset row must remain cold after restore.";
-    } else if (cache_op.restore_requested) {
-      CHECK_GE(cache_op.restore_src_slot_id, 0)
-          << "linear-state restore requires a valid source slot.";
-      CHECK_EQ(validity_mask[i], 1)
-          << "linear-state restored row must be warm after restore.";
-    } else if (cache_op.restore_src_slot_id >= 0) {
-      CHECK_EQ(validity_mask[i], 1)
-          << "linear-state direct-read row must be warm after restore.";
-    }
-    if (cache_op.restore_src_slot_id >= 0) {
-      CHECK_GT(cache_op.restore_src_slot_id, kPaddingLinearStateId)
-          << "linear-state source must be a real non-padding slot.";
-      CHECK_LT(static_cast<int64_t>(cache_op.restore_src_slot_id), num_slots)
-          << "linear-state source exceeds cache capacity.";
-    }
-    const MegaGdnPrefillCacheOpKey cache_op_key{
-        .linear_state_id = cache_op.linear_state_id,
-        .reset_requested = cache_op.reset_requested,
-        .restore_requested = cache_op.restore_requested,
-        .restore_src_slot_id = cache_op.restore_src_slot_id};
-    if (cache.has_value()) {
-      CHECK(cache->key.linear_state_cache_ops[i] == cache_op_key)
-          << "MegaGdn Prefill linear state cache ops changed within one "
-             "forward.";
-    } else {
-      cache_op_keys.push_back(cache_op_key);
-    }
-  }
   if (cache.has_value()) {
     return cache.value();
   }
@@ -243,13 +211,7 @@ const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
   const int32_t stride = static_cast<int32_t>(checkpoint_stride);
   for (int64_t i = 0; i < batch_size; ++i) {
     const int32_t live_slot = live_slots[i];
-    int32_t read_slot = validity_mask[i] == 0 ? -1 : live_slot;
-    if (!cache_ops.empty()) {
-      const LinearStateCacheOp& cache_op = cache_ops[i];
-      if (cache_op.is_direct_read()) {
-        read_slot = cache_op.restore_src_slot_id;
-      }
-    }
+    const int32_t read_slot = validity_mask[i] == 0 ? -1 : read_ids[i];
     conv_read.emplace_back(read_slot);
     conv_write.emplace_back(live_slot);
     ssm_read.emplace_back(read_slot < 0 ? -1 : read_slot * stride);
@@ -273,7 +235,7 @@ const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
               .checkpoint_stride = checkpoint_stride,
               .linear_state_ids = live_slots,
               .linear_state_validity_mask = validity_mask,
-              .linear_state_cache_ops = std::move(cache_op_keys)},
+              .linear_state_read_ids = read_ids},
       .device_tensor_materializations = device_tensor_materializations};
   cache.emplace(std::move(built));
   return cache.value();
@@ -472,6 +434,9 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
   const torch::Tensor contiguous_norm_weight = norm_->weight().contiguous();
 
   torch::Tensor fused_norm_output;
+  const auto& read_slots = input_params.embedding.linear_state_read_ids.empty()
+                               ? live_slots
+                               : input_params.embedding.linear_state_read_ids;
   // Route order is semantic: spec verify is also decode-shaped and must win.
   if (use_spec_verify) {
     check_decode_head_geometry(local_key_heads, local_value_heads);
@@ -519,6 +484,12 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
                            batch_size,
                            device,
                            "num_accepted_tokens");
+    const torch::Tensor read_indices =
+        graph_safe_indices(input_params.embedding.linear_state_read_indices,
+                           read_slots,
+                           batch_size,
+                           device,
+                           "linear_state_read_indices");
     std::vector<torch::Tensor> chunk_outputs;
     chunk_outputs.reserve((batch_size + kMegaGdnMaxDecodeBatchSize - 1) /
                           kMegaGdnMaxDecodeBatchSize);
@@ -537,7 +508,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
       params.dt_bias = contiguous_dt_bias;
       params.ssm_state = ssm_cache;
       params.read_state_indices =
-          state_indices.slice(0, start, end).contiguous();
+          read_indices.slice(0, start, end).contiguous();
       params.write_state_indices =
           state_indices.slice(0, start, end).contiguous();
       params.num_accepted_tokens =
@@ -591,7 +562,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
             attn_metadata,
             live_slots,
             input_params.linear_state_validity_mask,
-            input_params.linear_state_cache_ops,
+            input_params.embedding.linear_state_read_ids,
             checkpoint_stride,
             num_slots,
             device);
@@ -633,6 +604,12 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
                            "linear_state_indices");
     const torch::Tensor decode_qkv =
         mixed_qkv.reshape({batch_size, local_conv_dim});
+    const torch::Tensor read_indices =
+        graph_safe_indices(input_params.embedding.linear_state_read_indices,
+                           read_slots,
+                           batch_size,
+                           device,
+                           "linear_state_read_indices");
     const torch::Tensor decode_z =
         z.reshape({batch_size, local_value_heads, head_v_dim_});
     const torch::Tensor decode_b = b.reshape({batch_size, local_value_heads});
@@ -655,7 +632,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
       params.dt_bias = contiguous_dt_bias;
       params.ssm_state = ssm_cache;
       params.read_state_indices =
-          state_indices.slice(0, start, end).contiguous();
+          read_indices.slice(0, start, end).contiguous();
       params.write_state_indices =
           state_indices.slice(0, start, end).contiguous();
       params.norm_weight = contiguous_norm_weight;
