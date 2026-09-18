@@ -17,6 +17,10 @@ if(USE_NPU OR USE_CUDA OR USE_ILU OR USE_DCU)
   endif()
 endif()
 
+if(USE_NPU)
+  add_subdirectory(npu)
+endif()
+
 if(USE_DCU)
   add_subdirectory(dcu)
 endif()
