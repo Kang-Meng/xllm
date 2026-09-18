@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 import torch_npu
 
 from xllm.python import distributed, kernels
@@ -135,39 +134,6 @@ def _build_stable_sfa_page_layout(
         block_table=stable_block_table,
         page_count=materialized_block_table.numel(),
     )
-
-
-def _causal_conv1d_graph_multi(
-    cin: torch.Tensor,
-    weight: torch.Tensor,
-    out_rows: int,
-    activation: str = "silu",
-) -> torch.Tensor:
-    """Graph-capturable multi-row twin of the eager depthwise conv.
-
-    ``cin`` is ``[B, conv_dim, state_len + R]`` (boundary tail + the R
-    current rows); the causal outputs for the R rows are the K-wide windows
-    STARTING at ``[0, R)``. F.conv1d lowers to an aclop NPUGraph cannot
-    capture, so the conv is unrolled into the per-tap multiply-add contract
-    of ``_causal_conv1d_update_graph`` — bit-compatible with that plain-decode
-    path and the eager F.conv1d path.
-
-    Mirrors _causal_conv1d_update_graph's numeric contract exactly: operands
-    cast to fp32, per-tap products exact in fp32, ascending accumulation,
-    one final round to the weight dtype. The RNE rounding to 11 mantissa bits
-    is a no-op for bf16 sources (7 mantissa bits), so it is skipped to avoid
-    RightShift/BitwiseAnd on AI_CPU (see commit 32760093).
-    """
-    h_r = cin.to(weight.dtype).float()
-    w_r = weight.float()
-    k_size = weight.shape[-1]
-    out = w_r[:, 0:1].unsqueeze(0) * h_r[:, :, 0:out_rows]
-    for k in range(1, k_size):
-        out = out + w_r[:, k : k + 1].unsqueeze(0) * h_r[:, :, k : k + out_rows]
-    out = out.to(weight.dtype)
-    if activation == "silu":
-        out = F.silu(out)
-    return out.to(cin.dtype)
 
 
 def write_mla_paged_cache(
@@ -1233,8 +1199,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
           the combined base region; at exit after-b (always accepted) is
           committed back, so a plain step sees the correct state.
         - Conv state is handled the same dual-slot way with the combined conv
-          pool; the conv itself reuses the proven bit-exact per-tap mul-add
-          (``_causal_conv1d_graph_multi``) — graph-capturable, no aclop conv.
+          pool; convolution and activation use the native CausalConv1d operator
+          for both eager execution and graph capture.
         """
         device = mixed_qkv.device
         num_seqs = idx.shape[0]
@@ -1249,8 +1215,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         conv_dim = layer.conv_dim
         conv_state_len = layer.conv_kernel_size - 1
         scale = 1.0 / (head_dim**0.5)
-        conv_weight = layer.conv1d.weight.squeeze(1)
-        in_graph = in_acl_graph()
         nslots = conv_cache.shape[0]  # C++ pool capacity
 
         st = self.__dict__.setdefault("_kda_v3", {}).setdefault(layer.layer_id, {})
@@ -1267,14 +1231,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         kv_prev = st["kv_prev"]
         armed_buf = st["armed_buf"]
 
-        # ---- per-step m (previous accepted count = kv growth) ----
-        # (base_now, m) is recomputed from the live kv_seq_lens on every call
-        # and must NOT be cached across steps: the scheduler reuses the same
-        # kv_seq_lens host buffer, so a (data_ptr, num_seqs) key repeats every
-        # step while the per-seq lengths GROW — a cached (base_now, m) would
-        # mis-select the conv/ssm boundary slot and diverge output under
-        # temp=0 + HCCL_DETERMINISTIC. The cost is a handful of cheap host->dev
-        # + index_select ops per step.
         expanded = resolve_expanded_decode_metadata(metadata)
         kv_src = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         kv_rows = kv_src.to(device=device, dtype=torch.int64)
@@ -1310,32 +1266,17 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         sel_conv = combined_conv.index_select(0, boundary_slot)  # [S, Ks, C]
         combined_ssm.index_copy_(0, idx64, combined_ssm.index_select(0, boundary_slot))
 
-        # ---- 3) conv (per-tap, bit-exact, graph-capturable) ----
         cache_boundary = sel_conv.transpose(1, 2).contiguous()  # [S, C, Ks]
         x = mixed_qkv.reshape(conv_dim, num_seqs, rows_per_seq).permute(1, 0, 2).contiguous()
         cin = torch.cat([cache_boundary.to(x.dtype), x], dim=-1)
-        if in_graph:
-            conv_out = _causal_conv1d_graph_multi(cin, conv_weight, rows_per_seq, layer.activation)
-        else:
-            _cin_c = cin.to(conv_weight.dtype).contiguous()
-            _cw = conv_weight.unsqueeze(1).contiguous()
-            conv_out = torch.nn.functional.conv1d(
-                _cin_c,
-                _cw,
-                bias=None,
-                padding=conv_state_len,
-                groups=conv_dim,
-            )[..., conv_state_len : conv_state_len + rows_per_seq]
-            if layer.activation == "silu":
-                conv_out = torch.nn.functional.silu(conv_out)
-            conv_out = conv_out.to(x.dtype)
+        conv_out = self._causal_conv1d(x, sel_conv, layer)
         # multi-tail conv_state: slot j (0=base ... R-1=last draft) <- window
         # ending after token j. For R==2 this is base<-tail_b / draft1<-tail_full
         # (== legacy dual-tail); for R==1 only base is written (a plain step's
         # next verify has m=1 -> base, so draft slots are never read).
-        for j in range(rows_per_seq):
-            tail_j = cin[..., (j + 1) : (j + 1) + conv_state_len].transpose(1, 2).contiguous()
-            combined_conv.index_copy_(0, idx64 + j * nslots, tail_j)
+        for proposal in range(rows_per_seq):
+            tail = cin[..., proposal + 1 : proposal + 1 + conv_state_len].transpose(1, 2).contiguous()
+            combined_conv.index_copy_(0, idx64 + proposal * nslots, tail)
 
         # ---- 4) split conv_out -> q/k/v; gate/beta -> g/b (TND, [T,nh,hd]) ----
         c_split = conv_out.transpose(1, 2).split(qkv_dim, dim=-1)

@@ -167,89 +167,6 @@ class _RMSNormGated(nn.Module):
         return kernels.rms_norm_sigmoid_gated(x, gate, self.weight, self.variance_epsilon)
 
 
-def _causal_conv1d_fn(mixed_qkv: torch.Tensor, weight: torch.Tensor, activation: str = "silu") -> torch.Tensor:
-    """Depthwise causal conv1d (left-pad K-1) + activation, fp32 weight."""
-    # mixed_qkv: [B, conv_dim, S]; weight: [conv_dim, K] (squeezed)
-    padding = weight.shape[-1] - 1
-    out = F.conv1d(
-        mixed_qkv.to(weight.dtype),
-        weight=weight.unsqueeze(1),
-        bias=None,
-        padding=padding,
-        groups=mixed_qkv.shape[1],
-    )[:, :, : mixed_qkv.shape[-1]]
-    if activation == "silu":
-        out = F.silu(out)
-    return out.to(mixed_qkv.dtype)
-
-
-def _causal_conv1d_update(
-    mixed_qkv: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor, activation: str = "silu"
-) -> torch.Tensor:
-    """Incremental depthwise causal conv1d + activation (single-token decode).
-
-    Faithful port of transformers ``causal_conv1d_update``: prepend the
-    ``conv_state`` (last K-1 conv inputs), run a width-0-pad conv over the
-    concatenation, slice the tail, and update ``conv_state`` in place.
-
-    Args:
-        mixed_qkv: [B, conv_dim, S] (S == 1 for decode).
-        conv_state: [B, conv_dim, K-1], updated in place to the last K-1 inputs.
-        weight: [conv_dim, K] (squeezed).
-    """
-    _, hidden_size, seq_len = mixed_qkv.shape
-    state_len = conv_state.shape[-1]
-    hidden_states_new = torch.cat([conv_state, mixed_qkv], dim=-1).to(weight.dtype)
-    conv_state.copy_(hidden_states_new[:, :, -state_len:])
-    out = F.conv1d(
-        hidden_states_new,
-        weight=weight.unsqueeze(1),
-        bias=None,
-        padding=0,
-        groups=hidden_size,
-    )[:, :, -seq_len:]
-    if activation == "silu":
-        out = F.silu(out)
-    return out.to(mixed_qkv.dtype)
-
-
-def _causal_conv1d_update_graph(
-    mixed_qkv: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor, activation: str = "silu"
-) -> torch.Tensor:
-    """Graph-capturable twin of ``_causal_conv1d_update`` (ACL-graph decode).
-
-    F.conv1d lowers to the aclop Conv2D, which NPUGraph cannot capture (and
-    ``allow_internal_format=False`` would break the MoE W8A8 NZ weights), so
-    the depthwise width-K conv is unrolled into elementwise multiply-adds
-    reproducing the aclop kernel's numeric contract bit for bit (see the
-    accumulate block below). Only called on the graph decode path; eager
-    keeps the F.conv1d original byte-for-byte. NOTE the engine's conv weight
-    is bf16 (checkpoint overrides the fp32 init), so the eager conv runs in
-    bf16 — emulating the fp32 conv contract here returns a wrong-SHAPE
-    tensor (bf16 view(int32) halves the last dim) and crashes capture.
-    """
-    _, hidden_size, seq_len = mixed_qkv.shape
-    state_len = conv_state.shape[-1]
-    hidden_states_new = torch.cat([conv_state, mixed_qkv], dim=-1).to(weight.dtype)
-    conv_state.copy_(hidden_states_new[:, :, -state_len:])
-    k_size = weight.shape[-1]
-    # Unified aclop conv contract (reverse-engineered bitwise on NPU): operands
-    # are rounded RNE to 11 explicit mantissa bits (a no-op for bf16/fp16
-    # sources). Since the engine's conv weight is always bf16 and hidden_states
-    # are cast to bf16 above, the RNE rounding is a no-op — float() alone
-    # preserves the exact bf16 value in fp32. We skip the RNE mantissa rounding
-    # to avoid RightShift/BitwiseAnd on AI_CPU (~7.4% of total decode time).
-    h_r = hidden_states_new.float()
-    w_r = weight.float()
-    out = w_r[:, 0:1].unsqueeze(0) * h_r[:, :, 0:seq_len]
-    for k in range(1, k_size):
-        out = out + w_r[:, k : k + 1].unsqueeze(0) * h_r[:, :, k : k + seq_len]
-    out = out.to(weight.dtype)
-    if activation == "silu":
-        out = F.silu(out)
-    return out.to(mixed_qkv.dtype)
-
-
 def fused_recurrent_kda(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -703,6 +620,8 @@ class Glm5NextKdaAttention(Attention):
         self.conv_kernel_size = cfg.short_conv_kernel_size
         self.conv_dim = self.qkv_dim * 3  # local conv_dim = 3 * qkv_dim_local
         self.activation = cfg.hidden_act
+        if self.activation not in ("identity", "silu"):
+            raise ValueError(f"Unsupported KDA convolution activation: {self.activation}")
         self.eps = cfg.rms_norm_eps
 
         projection_sizes = tuple(getattr(self, size_attr) for _, size_attr, _ in _KDA_IN_PROJ)
@@ -712,15 +631,8 @@ class Glm5NextKdaAttention(Attention):
         # conv1d: depthwise over the LOCAL conv_dim (groups=conv_dim_local); the
         # loader shards each of q/k/v_conv1d by head then cats so the channel
         # order [q_loc|k_loc|v_loc] matches mixed_qkv. fp32 in transformers.
-        self.conv1d = nn.Conv1d(
-            self.conv_dim,
-            self.conv_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.conv_dim,
-            bias=False,
-            padding=self.conv_kernel_size - 1,
-        )
-        self.conv1d.weight = nn.Parameter(self.conv1d.weight.detach().to(torch.float32))
+        self.conv_weight = nn.Parameter(torch.empty(self.conv_dim, 1, self.conv_kernel_size, dtype=torch.float32))
+        self.register_buffer("conv_weight_t", None, persistent=False)
         self.forget_gate = Glm5NextForgetGate(cfg, dtype, device)
         self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
         self.register_buffer("_fg_b_weight", None, persistent=False)
@@ -739,6 +651,8 @@ class Glm5NextKdaAttention(Attention):
         )
 
     def process_weights_after_loading(self) -> None:
+        conv_weight = self.conv_weight.squeeze(1).t().to(self.in_proj_qkvbfg_a.weight.dtype).contiguous()
+        self.conv_weight_t = _stable_pack(self.conv_weight_t, conv_weight)
         packed = torch.stack((self.forget_gate.f_b_proj.weight.detach(), self.g_b_proj.weight.detach()))
         self._fg_b_weight = _stable_pack(self._fg_b_weight, packed)
         self.forget_gate.f_b_proj.weight.data = self._fg_b_weight[0]
@@ -2240,7 +2154,7 @@ class Glm5NextForCausalLM(PyModelBase):
         # The layer projections are created without an explicit dtype (they
         # default to float32 on the target device); move AND cast the whole
         # graph to the target dtype/device so the engine matches the reference
-        # (which runs .to(bf16) over the model). The KDA conv1d is included in
+        # (which runs .to(bf16) over the model). The KDA conv weights are included in
         # this cast — the reference's conv1d is also bf16 after .to(dtype).
         self.to(device=device, dtype=dtype)
 
@@ -2390,7 +2304,7 @@ class Glm5NextForCausalLM(PyModelBase):
             if L.tp_size > 1:
                 parts = [L.shard(p, dim=0) for p in parts]
             conv = torch.cat(parts, dim=0)
-        L.copy_in(attn + "conv1d.weight", conv)
+        L.copy_in(attn + "conv_weight", conv)
         # o_proj: row-parallel QLinear — shard the INPUT dim (dim 1, qkv_dim) so
         # each rank's [hidden, qkv_dim_local] weight consumes its head-subset's
         # partial output; the forward all-reduces the partials.

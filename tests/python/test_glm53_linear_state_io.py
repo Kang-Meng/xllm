@@ -59,7 +59,6 @@ def _forget_gate(lower_bound: float | None = -5.0) -> SimpleNamespace:
 
 
 def _layer(lower_bound: float | None = -5.0) -> SimpleNamespace:
-    weight = torch.ones(6, 1, 3, dtype=torch.float32)
     return SimpleNamespace(
         layer_id=0,
         conv_kernel_size=3,
@@ -67,14 +66,14 @@ def _layer(lower_bound: float | None = -5.0) -> SimpleNamespace:
         num_heads_local=1,
         qkv_dim=2,
         conv_dim=6,
-        conv1d=SimpleNamespace(weight=weight),
+        conv_weight_t=torch.ones(3, 6, dtype=torch.bfloat16),
         activation="silu",
         forget_gate=_forget_gate(lower_bound),
     )
 
 
 @pytest.fixture
-def kda_test_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict]]:
+def kda_test_environment(monkeypatch: pytest.MonkeyPatch, causal_conv1d_reference: list[dict]) -> Iterator[list[dict]]:
     with monkeypatch.context() as context:
         kernel_calls = _install_kda_stubs(context)
         yield kernel_calls
@@ -118,8 +117,6 @@ def _install_kda_stubs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     monkeypatch.setitem(sys.modules, "fla_npu.ops.ascendc", ascendc)
 
     glm_module = types.ModuleType("xllm.python.models.glm5_next")
-    glm_module._causal_conv1d_fn = lambda conv_input, _weight, _activation: conv_input[:, :, 2:]
-    glm_module._causal_conv1d_update = lambda conv_input, _state, _weight, _activation: conv_input
     glm_module._l2norm = lambda value, **_kwargs: value
     monkeypatch.setitem(sys.modules, "xllm.python.models.glm5_next", glm_module)
 
@@ -189,7 +186,7 @@ def test_merged_spec_verify_uses_remapped_state_indices(
 def test_execute_linear_prefill_reads_source_and_writes_live(
     kda_test_environment: None,
 ) -> None:
-    conv_cache = torch.arange(4 * 2 * 6, dtype=torch.float32).reshape(4, 2, 6)
+    conv_cache = torch.arange(4 * 2 * 6, dtype=torch.bfloat16).reshape(4, 2, 6)
     ssm_cache = torch.arange(4 * 1 * 2 * 2, dtype=torch.float32).reshape(4, 1, 2, 2)
     original_conv = conv_cache.clone()
     original_ssm = ssm_cache.clone()
@@ -241,7 +238,7 @@ def test_plain_prefill_fuses_gate_in_kernel(kda_test_environment: list[dict]) ->
     # (use_gate_in_kernel=True + safe_gate + lower_bound) and receive the raw
     # projection verbatim — never a python-materialized gate (the double
     # safe-gate bug). The gate is not materialized on this path at all.
-    conv_cache = torch.zeros(4, 2, 6, dtype=torch.float32)
+    conv_cache = torch.zeros(4, 2, 6, dtype=torch.bfloat16)
     ssm_cache = torch.zeros(4, 1, 2, 2, dtype=torch.float32)
     backend = _backend_for_linear_cache(conv_cache, ssm_cache)
     backend._metadata = _plain_prefill_metadata()
@@ -270,7 +267,7 @@ def test_lower_bound_out_of_range_falls_back_to_python_gate(
     # AscendC safe_gate requires lower_bound in [-5, 0); an out-of-range config
     # must fall back to the materialized python gate (use_gate_in_kernel=False)
     # rather than passing an illegal lower_bound to the kernel.
-    conv_cache = torch.zeros(4, 2, 6, dtype=torch.float32)
+    conv_cache = torch.zeros(4, 2, 6, dtype=torch.bfloat16)
     ssm_cache = torch.zeros(4, 1, 2, 2, dtype=torch.float32)
     backend = _backend_for_linear_cache(conv_cache, ssm_cache)
     backend._metadata = _plain_prefill_metadata()
@@ -374,7 +371,7 @@ def test_spec_verify_uses_v3_without_environment_flags(
 
 
 def test_prefill_disarms_only_restarted_v3_slots(kda_test_environment: list[dict]) -> None:
-    backend = _backend_for_linear_cache(torch.zeros(4, 2, 6), torch.zeros(4, 1, 2, 2))
+    backend = _backend_for_linear_cache(torch.zeros(4, 2, 6, dtype=torch.bfloat16), torch.zeros(4, 1, 2, 2))
     armed_slots = torch.ones(4, dtype=torch.bool)
     backend._kda_v3 = {0: {"armed_buf": armed_slots}}
     backend._metadata = _plain_prefill_metadata()
@@ -439,7 +436,7 @@ def test_spec_verify_rejects_nonuniform_widths(kda_test_environment: list[dict])
 
 
 def test_plain_decode_keeps_fused_gate_without_verify_state(kda_test_environment: list[dict]) -> None:
-    backend = _backend_for_linear_cache(torch.zeros(4, 2, 6), torch.zeros(4, 1, 2, 2))
+    backend = _backend_for_linear_cache(torch.zeros(4, 2, 6, dtype=torch.bfloat16), torch.zeros(4, 1, 2, 2))
     backend._metadata = SimpleNamespace(
         linear_state_indices=torch.tensor([1, 3], dtype=torch.int32),
         linear_state_read_indices=None,
@@ -466,8 +463,10 @@ def test_plain_decode_keeps_fused_gate_without_verify_state(kda_test_environment
     assert kda_test_environment[0]["cu_seqlens"].tolist() == [0, 1, 2]
 
 
-def test_varlen_prefill_keeps_sequence_wise_dispatch(kda_test_environment: list[dict]) -> None:
-    backend = _backend_for_linear_cache(torch.zeros(4, 2, 6), torch.zeros(4, 1, 2, 2))
+def test_varlen_prefill_uses_one_native_convolution(
+    kda_test_environment: list[dict], causal_conv1d_reference: list[dict]
+) -> None:
+    backend = _backend_for_linear_cache(torch.zeros(4, 2, 6, dtype=torch.bfloat16), torch.zeros(4, 1, 2, 2))
     backend._metadata = SimpleNamespace(
         linear_state_indices=torch.tensor([0, 1, 3], dtype=torch.int32),
         linear_state_read_indices=None,
@@ -487,6 +486,9 @@ def test_varlen_prefill_keeps_sequence_wise_dispatch(kda_test_environment: list[
     )
 
     assert output.shape == (1, 6, 1, 2)
+    assert len(causal_conv1d_reference) == 1
+    assert causal_conv1d_reference[0]["query_start_loc"] == [0, 1, 3, 6]
+    assert causal_conv1d_reference[0]["run_mode"] == 0
     assert [call["op"] for call in kda_test_environment] == ["chunk"] * 3
     assert [call["cu_seqlens"].tolist() for call in kda_test_environment] == [[0, 1], [0, 2], [0, 3]]
 
