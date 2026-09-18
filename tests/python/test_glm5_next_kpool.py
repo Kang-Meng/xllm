@@ -188,6 +188,37 @@ def test_prefill_pool_compression_matches_ordered_token_writes(
     torch.testing.assert_close(pool_cache, expected, rtol=0, atol=0)
 
 
+@torch.inference_mode()
+def test_cpu_input_does_not_enter_triton_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CPU tensors stay on the torch path even when the Triton kernel is installed.
+
+    The fused Triton helper only accepts accelerator inputs; installing Triton
+    on an NPU dev host must not make these originally-fine CPU cases enter the
+    accelerator kernel (which would fail on CPU pointers / missing driver).
+    """
+    torch.manual_seed(42)
+    index_cache = torch.randn(4, 8, 1, 257, dtype=torch.bfloat16)  # CPU
+    pool_cache = torch.randn(4, 2, 1, 128, dtype=torch.bfloat16)
+    tables = torch.tensor([[1, 0], [2, 1], [3, 2], [3, 0]], dtype=torch.int64)
+    positions = torch.tensor([3, 7, 11, 15], dtype=torch.int64)
+    ape = torch.randn(4, 128, dtype=torch.bfloat16)
+
+    # If the fast path were taken, the monkeypatched helper would be invoked.
+    try:
+        import xllm.python.kernels_npu.triton.kpool_compress as triton_mod
+    except ImportError:
+        triton_mod = None
+
+    if triton_mod is not None:
+
+        def _unexpected_triton(*_args: object, **_kwargs: object) -> None:
+            pytest.fail("CPU input must not enter the Triton fast path")
+
+        monkeypatch.setattr(triton_mod, "compress_completed_pools_decode", _unexpected_triton, raising=False)
+
+    compress_completed_pools(index_cache, pool_cache, tables, positions, ape, 128, 4, batched=True)
+
+
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
 @pytest.mark.parametrize("table_dtype", [torch.int32, torch.int64])
 @torch.inference_mode()

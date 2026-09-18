@@ -134,6 +134,21 @@ def compress_completed_pools(
     flat = index_cache.reshape(-1, width)
     pool_flat = pool_cache.reshape(-1, head_dim)
     n_tok = positions.shape[0]
+
+    # Triton fused fast path for the decode batched branch (one token per
+    # block-table row). Only enabled for accelerator inputs (NPU); CPU tensors
+    # fall through to the torch implementation below.
+    if batched and block_table.shape[0] == n_tok and n_tok > 0 and positions.device.type in ("npu", "privateuseone"):
+        try:
+            from xllm.python.kernels_npu.triton.kpool_compress import (
+                compress_completed_pools_decode,
+            )
+        except ImportError:
+            pass
+        else:
+            compress_completed_pools_decode(index_cache, pool_cache, block_table, positions, ape, head_dim, rate)
+            return
+
     rate_off = torch.arange(rate, device=positions.device)
     # Each token is the last token of its pool: pool p = pos // rate
     pos = positions.reshape(-1, 1)
