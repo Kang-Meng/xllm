@@ -2075,9 +2075,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
              args.num_nextn_predict_layers() != 0) {
     const std::string& current_type = args.model_type();
     const char* mtp_model_type = nullptr;
-    if (current_type == "qwen3_5_text") {
+    if (current_type == "qwen3_5_text" || current_type == "qwen3_5") {
       mtp_model_type = "qwen3_5_mtp";
-    } else if (current_type == "qwen3_5_moe_text") {
+    } else if (current_type == "qwen3_5_moe_text" ||
+               current_type == "qwen3_5_moe") {
       mtp_model_type = "qwen3_5_moe_mtp";
     }
     if (mtp_model_type != nullptr) {
