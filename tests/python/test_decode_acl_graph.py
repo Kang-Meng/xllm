@@ -62,6 +62,17 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
     )
 
 
+def test_slice_output_preserves_aux_hidden_tuple() -> None:
+    hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    aux_hidden = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+    output = DecodeAclGraphRunner._slice_output((hidden, aux_hidden), 3)
+
+    assert isinstance(output, tuple)
+    torch.testing.assert_close(output[0], hidden[:3])
+    torch.testing.assert_close(output[1], aux_hidden[:3])
+
+
 def test_linear_state_indices_use_stable_graph_buffer() -> None:
     runner = _runner()
     input_ids = torch.arange(4, dtype=torch.int32)

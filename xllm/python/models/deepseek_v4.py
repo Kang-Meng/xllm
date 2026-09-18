@@ -53,6 +53,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     record_layer_event,
 )
+from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
     DeepseekV3MLP,
@@ -301,6 +302,8 @@ class DeepseekV4Config:
     cp_rank: int = 0
     dp_size: int = 1
     dp_rank: int = 0
+    layers_to_capture: tuple[int, ...] = ()
+    num_speculative_tokens: int = 0
 
     @classmethod
     def from_dict(cls, d: dict) -> DeepseekV4Config:
@@ -394,6 +397,8 @@ class DeepseekV4Config:
             cp_rank=int(d.get("cp_rank", 0)),
             dp_size=int(d.get("dp_size", 1)),
             dp_rank=int(d.get("dp_rank", 0)),
+            layers_to_capture=tuple(int(layer_id) for layer_id in d.get("layers_to_capture", [])),
+            num_speculative_tokens=int(d.get("num_speculative_tokens", 0)),
         )
 
     def head_split(self) -> tuple[int, int]:
@@ -1723,6 +1728,7 @@ class DeepseekV4Model(nn.Module):
             dtype=dtype,
             device=device,
         )
+        self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
 
     def attach_rope_tables_to_backend(
         self,
@@ -1766,7 +1772,9 @@ class DeepseekV4Model(nn.Module):
         y = (pre.unsqueeze(-1) * x_float).sum(-2)
         return y.to(x.dtype)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
         cos_sin_cache = self.rotary.cos_sin_cache
@@ -1846,6 +1854,7 @@ class DeepseekV4Model(nn.Module):
             # CP-gathered back in the decoder layer.
             hidden = cp_ctx.shard_rows(hidden)
             positions = cp_ctx.local_positions
+        aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         hidden = hidden.unsqueeze(1).expand(-1, self.cfg.hc_mult, -1).contiguous()
         residual: torch.Tensor | None = None
         for layer_id, layer in enumerate(self.layers):
@@ -1877,12 +1886,29 @@ class DeepseekV4Model(nn.Module):
                 layer_cos_sin_cache,
                 input_ids,
             )
+            if self.aux_hidden_capture.should_capture(layer_id):
+                captured = hidden.mean(dim=1) if hidden.dim() == 3 else hidden
+                self.aux_hidden_capture.capture_layer(
+                    layer_id,
+                    captured,
+                    None,
+                    aux_hidden_buffer,
+                )
             record_layer_event(layer_id)
         if cp_ctx is not None and cp_ctx.enabled():
             hidden = cp_ctx.gather_restore(hidden)
-        # hc_head: merge the hc_mult streams back into a single hidden vector.
+            if aux_hidden_buffer is not None:
+                aux_hidden_buffer = cp_ctx.gather_restore(aux_hidden_buffer)
+        pre_hc_head_hidden = None
+        if not self.aux_hidden_capture.enabled and self.cfg.num_speculative_tokens > 0:
+            pre_hc_head_hidden = hidden.flatten(1)
+        # hc_head: merge the hc_mult residual streams into one hidden vector.
         merged = self._hc_head(residual if residual is not None else hidden)
         hidden = self.norm(merged, None)
+        if self.aux_hidden_capture.enabled:
+            return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
+        if pre_hc_head_hidden is not None:
+            return hidden, pre_hc_head_hidden
         return hidden
 
 

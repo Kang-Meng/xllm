@@ -57,7 +57,7 @@ from xllm.python.model_executor.forward_context import (
     LayerSynchronizer,
     forward_context,
 )
-from xllm.python.model_executor.runners.base import BaseRunner
+from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 from xllm.python.model_executor.runners.decode_cuda_graph import (
     _CAPTURE_WARMUP_STEPS,
     _decode_bucket,
@@ -885,7 +885,7 @@ class DecodeAclGraphRunner(BaseRunner):
         self._stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self._stream):
             entry.graph.replay()
-            output = entry.static_output[:batch_size]
+            output = self._slice_output(entry.static_output, batch_size)
 
         with torch.npu.stream(self._update_stream):
             self._update_stream.wait_event(self._replay_done_event)
@@ -1571,7 +1571,7 @@ class DecodeAclGraphRunner(BaseRunner):
             ssm.index_copy_(0, idx, ssm_rows)
         torch.npu.synchronize()
 
-    def _forward_static(self, entry: _DecodeGraphEntry) -> torch.Tensor:
+    def _forward_static(self, entry: _DecodeGraphEntry) -> ModelExecutionOutput:
         if entry.static_input_embedding is None:
             return self.model(entry.static_input_ids, entry.static_positions)
         return self.model(
@@ -1579,6 +1579,12 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_positions,
             entry.static_input_embedding,
         )
+
+    @staticmethod
+    def _slice_output(output: ModelExecutionOutput, batch_size: int) -> ModelExecutionOutput:
+        if isinstance(output, tuple):
+            return output[0][:batch_size], output[1][:batch_size]
+        return output[:batch_size]
 
     @staticmethod
     def _update_graph_tasks(
