@@ -31,15 +31,15 @@ def _enable_internal_format() -> None:
 
 
 def encode_mega_moe_scale(scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
-    """Pack W8A8 weight scale/offset into the int64 encoding aclnnMegaMoe expects."""
+    """Pack caller-prepared FP32 scale/offset into aclnnMegaMoe's int64 encoding."""
     if scale.shape != offset.shape:
         raise ValueError(
             f"MegaMoE weight scale and offset shapes must match: {tuple(scale.shape)} != {tuple(offset.shape)}"
         )
     original_shape = scale.shape
     encoded = torch_npu.npu_trans_quant_param(
-        scale.to(torch.float32).contiguous().reshape(-1),
-        offset.to(torch.float32).contiguous().reshape(-1),
+        scale.contiguous().reshape(-1),
+        offset.contiguous().reshape(-1),
         round_mode=0,
     )
     if encoded.dtype != torch.int64:
@@ -203,8 +203,8 @@ def grouped_moe(
         gating_output: Router logits of shape ``[num_tokens, num_experts]``.
         w13: Quantized gate and up projections of every expert.
         w2: Quantized down projection of every expert.
-        w13_scale: Dequantization scales of ``w13``.
-        w2_scale: Dequantization scales of ``w2``.
+        w13_scale: FP32 dequantization scales of ``w13``, prepared by the caller.
+        w2_scale: BF16 dequantization scales of ``w2``, prepared by the caller.
         correction_bias: Router bias added before group selection.
         topk: Experts selected per token.
         topk_group: Groups selected per token.
@@ -237,7 +237,7 @@ def grouped_moe(
     expert_range = active_expert_range if active_expert_range is not None else [0, num_experts]
     sorted_hidden_i8, expanded_row_idx, group_list, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
         hidden_states,
-        topk_ids.to(torch.int32),
+        topk_ids,
         scale=None,
         active_num=num_tokens * topk,
         expert_num=num_experts,
@@ -250,7 +250,6 @@ def grouped_moe(
     num_local_experts = expert_range[1] - expert_range[0]
     if group_list.numel() > num_local_experts:
         group_list = group_list[:num_local_experts]
-    group_list = group_list.to(torch.int64)
     act_i8, act_pt = _grouped_matmul_swiglu_quant_v2(
         sorted_hidden_i8,
         w13,
@@ -262,7 +261,7 @@ def grouped_moe(
     output = torch.ops.npu.npu_grouped_matmul(
         x=[act_i8],
         weight=[w2],
-        scale=[w2_scale.to(torch.bfloat16)],
+        scale=[w2_scale],
         per_token_scale=[act_pt],
         split_item=2,
         group_list_type=group_list_type,
@@ -317,14 +316,14 @@ def grouped_moe_bf16(
     start_expert_id: int,
     num_experts_per_rank: int,
 ) -> torch.Tensor:
-    """Run Qwen3.5 BF16 experts with NPU routing and grouped matmuls."""
+    """Run Qwen3.5 BF16 experts with BF16 routing weights and INT32 expert IDs."""
     active_expert_range = [
         start_expert_id,
         start_expert_id + num_experts_per_rank,
     ]
     expanded_hidden, expanded_row_idx, group_list, _ = torch_npu.npu_moe_init_routing_v2(
         hidden_states,
-        topk_ids.to(torch.int32),
+        topk_ids,
         scale=None,
         active_num=hidden_states.shape[0] * topk_ids.shape[1],
         expert_num=num_total_experts,
@@ -333,7 +332,7 @@ def grouped_moe_bf16(
         active_expert_range=active_expert_range,
         quant_mode=-1,
     )
-    group_list = group_list[:num_experts_per_rank].to(torch.int64)
+    group_list = group_list[:num_experts_per_rank]
     gate_up = _group_gemm(
         x=expanded_hidden,
         weight=w13,
@@ -360,11 +359,11 @@ def grouped_moe_bf16(
         output_dtype=hidden_states.dtype,
     )
     local_expert_mask = (topk_ids >= active_expert_range[0]) & (topk_ids < active_expert_range[1])
-    local_topk_weights = topk_weights * local_expert_mask.to(topk_weights.dtype)
+    local_topk_weights = topk_weights * local_expert_mask
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=expert_output,
         sorted_indices=expanded_row_idx.abs(),
-        probs=local_topk_weights.to(expert_output.dtype),
+        probs=local_topk_weights,
     )
 
 
@@ -409,7 +408,9 @@ def _grouped_moe_with_selected_experts_impl(
     """Run grouped quantized experts with pre-computed routing (no gate).
 
     The routing and W8A8 grouped-matmul sequence mirrors the native NPU
-    ``FusedMoEImpl::select_experts`` and ``forward_expert`` paths.
+    ``FusedMoEImpl::select_experts`` and ``forward_expert`` paths. The caller
+    supplies BF16 hidden states, INT32 expert IDs, FP32 gate/up scales, and
+    BF16 down scales.
     """
     num_tokens = hidden_states.shape[0]
     expert_num = num_total_experts if num_total_experts > 0 else w13.shape[0]
@@ -421,7 +422,7 @@ def _grouped_moe_with_selected_experts_impl(
         raise ValueError("local expert count must match the first dimension of w13 and w2")
     expanded_hidden, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
         hidden_states,
-        topk_ids.to(torch.int32),
+        topk_ids,
         scale=None,
         active_num=num_tokens * topk_ids.size(-1),
         expert_num=expert_num,
@@ -437,7 +438,7 @@ def _grouped_moe_with_selected_experts_impl(
         raise RuntimeError("dynamic_quant did not return a per-token scale")
     if expert_tokens.numel() < local_expert_count:
         raise RuntimeError("npu_moe_init_routing_v2 returned fewer groups than local experts")
-    group_list = expert_tokens[:local_expert_count].to(torch.int64)
+    group_list = expert_tokens[:local_expert_count]
     gemm1_out = _group_gemm(
         x=sorted_hidden_i8,
         weight=w13,
@@ -468,7 +469,7 @@ def _grouped_moe_with_selected_experts_impl(
     output = _group_gemm(
         x=act_i8,
         weight=w2,
-        scale=w2_scale.to(hidden_states.dtype),
+        scale=w2_scale,
         per_token_scale=act_pt,
         group_list=group_list,
         split_item=2,
@@ -477,7 +478,7 @@ def _grouped_moe_with_selected_experts_impl(
         output_dtype=hidden_states.dtype,
     )
     local_mask = (topk_ids >= active_range[0]) & (topk_ids < active_range[1])
-    local_topk_weights = topk_weights * local_mask.to(topk_weights.dtype)
+    local_topk_weights = topk_weights * local_mask
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=output,
         sorted_indices=expanded_row_idx.abs(),
@@ -799,12 +800,16 @@ def moe_expert_compute(
     w2_scale: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Expert dispatch + grouped matmul + combine (gate-free)."""
+    """Dispatch, compute, and combine experts without gating.
+
+    The caller supplies INT32 expert IDs, FP32 gate/up scales, and BF16 down
+    scales. Routing weights are converted to BF16 only for the final combine.
+    """
     num_tokens = hidden_states.shape[0]
     num_experts = w13.shape[0]
     sorted_hidden_i8, expanded_row_idx, group_list, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
         hidden_states,
-        topk_ids.to(torch.int32),
+        topk_ids,
         scale=None,
         active_num=num_tokens * topk,
         expert_num=num_experts,
@@ -823,7 +828,7 @@ def moe_expert_compute(
     output = torch.ops.npu.npu_grouped_matmul(
         x=[act_i8],
         weight=[w2],
-        scale=[w2_scale.to(torch.bfloat16)],
+        scale=[w2_scale],
         per_token_scale=[act_pt],
         split_item=2,
         group_list_type=0,
@@ -859,10 +864,11 @@ def moe_token_dispatch(
     topk: int,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch tokens using caller-provided INT32 expert IDs."""
     num_tokens = hidden_states.shape[0]
     return torch_npu.npu_moe_init_routing_v2(
         hidden_states,
-        topk_ids.to(torch.int32),
+        topk_ids,
         scale=None,
         active_num=num_tokens * topk,
         expert_num=num_experts,
@@ -924,10 +930,11 @@ def moe_gmm2_combine(
     expanded_row_idx: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
+    """Run down projection with BF16 scales and combine with dynamic weights."""
     output = torch.ops.npu.npu_grouped_matmul(
         x=[act_i8],
         weight=[w2],
-        scale=[w2_scale.to(torch.bfloat16)],
+        scale=[w2_scale],
         per_token_scale=[act_pertoken_scale],
         split_item=2,
         group_list_type=0,

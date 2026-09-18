@@ -1216,7 +1216,7 @@ class DeepseekV4MoE(nn.Module):
         self.register_buffer("experts_w13_scale", torch.empty(0, dtype=torch.float32, device=device))
         self.register_buffer("experts_w13_scale_second", torch.empty(0, dtype=torch.float32, device=device))
         self.register_buffer("experts_w13_offset", torch.empty(0, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w2_scale", torch.empty(0, dtype=torch.float32, device=device))
+        self.register_buffer("experts_w2_scale", torch.empty(0, dtype=torch.bfloat16, device=device))
         self.register_buffer("experts_w2_scale_second", torch.empty(0, dtype=torch.float32, device=device))
         self.register_buffer("experts_w2_offset", torch.empty(0, dtype=torch.float32, device=device))
         self.register_buffer("experts_w13_scale_bias", torch.empty(0, dtype=torch.float32, device=device))
@@ -2156,9 +2156,9 @@ class DeepseekV4ForCausalLM(PyModelBase):
             w13.data = torch.empty(nepr, 2 * inter_local, cfg.hidden_size, dtype=torch.int8, device=device)
             w2.data = torch.empty(nepr, cfg.hidden_size, inter_local, dtype=torch.int8, device=device)
             w13_scale.data = torch.empty(nepr, 2 * inter_local, 1, dtype=torch.float32, device=device)
-            w2_scale.data = torch.empty(nepr, cfg.hidden_size, 1, dtype=torch.float32, device=device)
+            w2_scale.data = w2_scale.new_empty((nepr, cfg.hidden_size, 1))
             w13_offset.data = torch.zeros_like(w13_scale)
-            w2_offset.data = torch.zeros_like(w2_scale)
+            w2_offset.data = torch.zeros_like(w2_scale, dtype=torch.float32)
         for local_idx in range(nepr):
             global_id = start + local_idx
             e = ck + f"ffn.experts.{global_id}."
