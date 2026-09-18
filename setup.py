@@ -242,19 +242,47 @@ def _stage_triton_jit_scripts(base_dir: str, extdir: str) -> None:
     logger.info(f"Staged triton_jit compile script into {dest_dir}")
 
 
-def _stage_mooncake_runtime_binaries(cmake_dir: str, extdir: str) -> None:
-    """Stage the mooncake runtime shared library into the wheel.
+def _get_cmake_library(cmake_dir: str, variable: str) -> str:
+    cache_path = os.path.join(cmake_dir, "CMakeCache.txt")
+    try:
+        with open(cache_path, encoding="utf-8") as cache_file:
+            prefix = f"{variable}:FILEPATH="
+            for line in cache_file:
+                if line.startswith(prefix):
+                    library = line[len(prefix) :].strip()
+                    if library and not library.endswith("-NOTFOUND"):
+                        return library
+                    break
+    except OSError as error:
+        raise RuntimeError(f"Failed to read CMake cache {cache_path}: {error}") from error
 
-    The xllm binaries link against ``mooncake-common/libasio.so``, which only
-    exists in the build tree. Without staging it, the installed package
-    misses the shared object on machines without the build tree; with the
-    binaries' ``$ORIGIN`` rpath entry the copy placed next to them resolves.
+    raise RuntimeError(f"CMake did not resolve {variable} in {cache_path}")
+
+
+def _stage_mooncake_runtime_binaries(cmake_dir: str, extdir: str) -> None:
+    """Stage Mooncake's non-system runtime libraries into the wheel.
+
+    Mooncake Store links liburing when it is available during configuration.
+    The dependency installer makes it available in wheel builds, so the wheel
+    must carry its soname for deployment on images without liburing installed.
+    The binaries' ``$ORIGIN`` rpath resolves these copies beside them.
     """
-    source = os.path.join(cmake_dir, "mooncake-common", "libasio.so")
-    if not os.path.isfile(source):
-        raise RuntimeError(f"libasio.so was not built: {source}")
-    shutil.copy2(source, os.path.join(extdir, "libasio.so"))
-    logger.info("Staged mooncake runtime library libasio.so into extdir")
+    uring_library = _get_cmake_library(cmake_dir, "URING_LIB")
+    resolved_uring_library = os.path.realpath(uring_library)
+    if not os.path.basename(resolved_uring_library).startswith("liburing.so.2"):
+        raise RuntimeError(
+            f"Mooncake requires liburing.so.2, but CMake resolved an incompatible library: {uring_library}"
+        )
+
+    libraries = {
+        "libasio.so": os.path.join(cmake_dir, "mooncake-common", "libasio.so"),
+        "liburing.so.2": resolved_uring_library,
+    }
+    for soname, source in libraries.items():
+        if not os.path.isfile(source):
+            raise RuntimeError(f"Mooncake runtime library was not found: {source}")
+        shutil.copy2(source, os.path.join(extdir, soname))
+        logger.info(f"Staged Mooncake runtime library {soname} into extdir")
 
 
 def _stage_auto_tuning_config(base_dir: str, extdir: str) -> None:
