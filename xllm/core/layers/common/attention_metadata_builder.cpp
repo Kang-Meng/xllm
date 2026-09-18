@@ -607,4 +607,59 @@ AttentionMetadata AttentionMetadataBuilder::build(
       params, enable_mla, compute_dtype, device, attn_mask, build_options);
 }
 
+void AttentionMetadataBuilder::build_linear_prefill(
+    AttentionMetadata& attn_metadata,
+    int64_t block_size) {
+  if (!attn_metadata.is_prefill && !attn_metadata.is_chunked_prefill) {
+    return;
+  }
+
+  CHECK_GT(block_size, 0);
+  constexpr int64_t kPadSlotId = -1;
+  constexpr int64_t kDefaultMaxNumPrograms = 1024;
+  torch::Tensor sequence_lengths = attn_metadata.q_cu_seq_lens.diff();
+  torch::Tensor num_blocks =
+      ((sequence_lengths + block_size - 1) / block_size).to(torch::kInt64);
+  const int32_t total_blocks = num_blocks.sum().item<int32_t>();
+  torch::Tensor sequence_ids =
+      torch::arange(num_blocks.size(0), num_blocks.options());
+  torch::Tensor batch = torch::repeat_interleave(sequence_ids, num_blocks);
+  const int64_t schedule_size = batch.size(0);
+  const int64_t max_num_programs =
+      std::max(kDefaultMaxNumPrograms, schedule_size) * 2;
+  torch::Tensor batch_ptr = torch::full({max_num_programs},
+                                        kPadSlotId,
+                                        torch::TensorOptions()
+                                            .dtype(torch::kInt32)
+                                            .device(sequence_lengths.device()));
+  torch::Tensor token_block_offset_ptr =
+      torch::full({max_num_programs},
+                  kPadSlotId,
+                  torch::TensorOptions()
+                      .dtype(torch::kInt32)
+                      .device(sequence_lengths.device()));
+
+  std::vector<torch::Tensor> block_offsets;
+  block_offsets.reserve(static_cast<size_t>(num_blocks.size(0)));
+  for (int64_t sequence_id = 0; sequence_id < num_blocks.size(0);
+       ++sequence_id) {
+    block_offsets.emplace_back(torch::arange(
+        num_blocks[sequence_id].item<int64_t>(), num_blocks.options()));
+  }
+  torch::Tensor token_block_offsets =
+      torch::cat(block_offsets, /*dim=*/-1).to(torch::kInt32);
+  batch_ptr.narrow(/*dim=*/0, /*start=*/0, /*length=*/schedule_size)
+      .copy_(batch);
+  token_block_offset_ptr
+      .narrow(/*dim=*/0, /*start=*/0, /*length=*/schedule_size)
+      .copy_(token_block_offsets);
+
+  attn_metadata.chunk_indices =
+      torch::stack({batch.to(torch::kInt32), token_block_offsets}, /*dim=*/1)
+          .to(torch::kInt32);
+  attn_metadata.batch = std::move(batch_ptr);
+  attn_metadata.token_block_offset = std::move(token_block_offset_ptr);
+  attn_metadata.tot = total_blocks;
+}
+
 }  // namespace xllm::layer

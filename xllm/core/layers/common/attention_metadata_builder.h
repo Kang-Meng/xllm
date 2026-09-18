@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -37,6 +38,10 @@ struct AttentionMetadataBuildOptions {
 // allowing attention_metadata.h to not depend on model_input_params.h.
 class AttentionMetadataBuilder {
  public:
+  // Build convolution scheduling and chunk indices for linear attention.
+  static void build_linear_prefill(AttentionMetadata& attn_metadata,
+                                   int64_t block_size);
+
   // Build AttentionMetadata from ModelInputParams with default compute_dtype
   // ("float").
   static AttentionMetadata build(

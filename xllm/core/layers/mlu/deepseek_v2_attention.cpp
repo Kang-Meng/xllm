@@ -107,7 +107,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
     q_a_proj_ = register_module(
         "q_a_proj",
         ReplicatedLinear(
-            hidden_size, q_lora_rank_, false, QuantArgs(), options));
+            hidden_size, q_lora_rank_, false, attention_quant_args, options));
     q_a_layernorm_ =
         register_module("q_a_layernorm", RMSNorm(q_lora_rank_, eps_, options));
     q_b_proj_ = register_module(
@@ -138,7 +138,7 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
                       ReplicatedLinear(hidden_size,
                                        kv_lora_rank_ + qk_rope_head_dim_,
                                        false,
-                                       QuantArgs(),
+                                       attention_quant_args,
                                        options));
   kv_a_layernorm_ =
       register_module("kv_a_layernorm", RMSNorm(kv_lora_rank_, eps_, options));
