@@ -71,6 +71,16 @@ cc_test(
 
 cc_test(
   NAME
+    request_admission_test
+  SRCS
+    request_admission_test.cpp
+  DEPS
+    api_service
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     mm_service_utils_test
   SRCS
     mm_service_utils_test.cpp

@@ -787,9 +787,11 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
       Block& host_block = (*host_blocks)[i];
       Block& hbm_block = (*hbm_blocks)[i];
       if (i < hbm_matched_blocks || i >= host_matched_blocks ||
-          hbm_block.ref_count() != 2 || host_block.ref_count() != 2) {
+          !hbm_block.is_valid() || !host_block.is_valid()) {
         continue;
       }
+      // Shared Host sources can restore multiple private HBM destinations.
+      // Reference counts do not indicate whether a destination is initialized.
       host_block.set_hash_value(hbm_block.get_immutable_hash_value());
       load_infos.emplace_back(host_block.id(),
                               hbm_block.id(),

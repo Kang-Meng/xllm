@@ -98,15 +98,14 @@ bool build_messages(const google::protobuf::RepeatedPtrField<
   for (const auto& req_message : req_messages) {
     MMContentVec contents;
 
-    for (const auto& input : req_message.content()) {
-      auto& item = const_cast<::xllm::proto::MMInputData&>(input);
-
+    contents.reserve(req_message.content_size());
+    for (const auto& item : req_message.content()) {
       if (item.type() == "text") {
-        contents.emplace_back(item.type(), *item.release_text());
+        contents.emplace_back(item.type(), item.text());
 
       } else if (item.type() == "image_url") {
         ImageURL image_url;
-        image_url.url = std::move(*item.mutable_image_url()->release_url());
+        image_url.url = item.image_url().url();
         for (const auto& [k, v] : item.image_url().headers()) {
           image_url.headers[k] = v;
         }
@@ -114,7 +113,7 @@ bool build_messages(const google::protobuf::RepeatedPtrField<
 
       } else if (item.type() == "video_url") {
         VideoURL video_url;
-        video_url.url = std::move(*item.mutable_video_url()->release_url());
+        video_url.url = item.video_url().url();
         for (const auto& [k, v] : item.video_url().headers()) {
           video_url.headers[k] = v;
         }
@@ -122,7 +121,7 @@ bool build_messages(const google::protobuf::RepeatedPtrField<
 
       } else if (item.type() == "audio_url") {
         AudioURL audio_url;
-        audio_url.url = std::move(*item.mutable_audio_url()->release_url());
+        audio_url.url = item.audio_url().url();
         for (const auto& [k, v] : item.audio_url().headers()) {
           audio_url.headers[k] = v;
         }

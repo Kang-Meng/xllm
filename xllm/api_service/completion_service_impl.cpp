@@ -24,6 +24,7 @@ limitations under the License.
 #include <cstdint>
 #include <string>
 
+#include "api_service/request_admission.h"
 #include "common/instance_name.h"
 #include "completion.pb.h"
 #include "core/distributed_runtime/llm_master.h"
@@ -191,22 +192,13 @@ void CompletionServiceImpl::process_async_rpc_impl(
     return master->handle_rpc_response(req_output);
   };
 
-  // Check if the request is being rate-limited.
-  if (unlikely(master_->get_rate_limiter()->is_limited())) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.",
-        service_request_id,
-        target_xservice_addr);
-    return;
-  }
-
-  // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  if (unlikely(!models_.contains(model))) {
-    CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
-                        "Model not supported",
+  const Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (unlikely(!admission_status.ok())) {
+    CALLBACK_WITH_ERROR(admission_status.code(),
+                        admission_status.message(),
                         service_request_id,
                         target_xservice_addr);
     return;

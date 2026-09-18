@@ -29,6 +29,7 @@ limitations under the License.
 #include <string>
 #include <unordered_set>
 
+#include "api_service/request_admission.h"
 #include "api_service/stream_output_parser.h"
 #include "api_service/utils.h"
 #include "core/common/instance_name.h"
@@ -626,24 +627,14 @@ void ChatServiceImpl::process_async_rpc_impl(
     return master->handle_rpc_response(req_output);
   };
 
-  // LLMMaster path (existing logic)
-  // Check if the request is being rate-limited.
   CHECK(master_ != nullptr);
-  if (master_->get_rate_limiter()->is_limited()) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.",
-        service_request_id,
-        target_xservice_addr);
-    return;
-  }
-
-  // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  if (unlikely(!models_.contains(model))) {
-    CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
-                        "Model not supported",
+  const Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (unlikely(!admission_status.ok())) {
+    CALLBACK_WITH_ERROR(admission_status.code(),
+                        admission_status.message(),
                         service_request_id,
                         target_xservice_addr);
     return;
@@ -875,6 +866,12 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
     return;
   }
 
+  std::vector<Message> messages;
+  if (!mm_service_utils::build_messages<MMChatCall>(
+          req_messages, messages, call, master_->get_image_limit())) {
+    return;
+  }
+
   // Check if the request is being rate-limited.
   if (master_->get_rate_limiter()->is_limited()) {
     call->finish_with_error(
@@ -885,12 +882,6 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
-
-  std::vector<Message> messages;
-  if (!mm_service_utils::build_messages<MMChatCall>(
-          req_messages, messages, call, master_->get_image_limit())) {
-    return;
-  }
 
   bool include_usage = false;
   if (rpc_request.has_stream_options()) {

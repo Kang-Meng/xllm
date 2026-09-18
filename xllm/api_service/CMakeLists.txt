@@ -8,6 +8,7 @@ cc_library(
     api_service_impl.h
     call.h
     request_id.h
+    request_admission.h
     chat_json_parser.h
     completion_json_parser.h
     completion_service_impl.h
@@ -39,6 +40,7 @@ cc_library(
     service_impl_factory.cpp
     call.cpp
     request_id.cpp
+    request_admission.cpp
     completion_service_impl.cpp
     rec_completion_service_impl.cpp
     chat_service_impl.cpp
