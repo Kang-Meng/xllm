@@ -303,6 +303,10 @@ void UnifiedPolicy::schedule_from_unified_queue(
       break;
     }
 
+    if (state.kv_cache_manager->has_pending_async_block_release()) {
+      break;
+    }
+
     // Memory exhausted -- preempt lowest priority request.
     bool find_preempt = false;
     while (is_preempt_iterator_valid && preempt_iterator != unified.begin()) {

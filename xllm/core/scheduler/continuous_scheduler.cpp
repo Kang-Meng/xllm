@@ -116,9 +116,8 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
 
   enable_prefix_cache_ =
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
-  has_linear_attention_layers_ =
-      ::xllm::has_linear_attention_layers(engine_->model_args());
   enable_in_batch_prefix_cache_ =
+      enable_prefix_cache_ &&
       ::xllm::KVCacheConfig::get_instance().enable_in_batch_prefix_cache();
 
   last_batch_.resize(options_.dp_size());
@@ -191,6 +190,16 @@ ContinuousScheduler::~ContinuousScheduler() {
 bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
   CHECK(!request->sequences().empty());
+
+  if ((request->check_beam_search() || request->best_of() > 1) &&
+      has_linear_attention_layers(engine_->model_args())) {
+    response_processor_->process_failed_request(
+        request,
+        {StatusCode::INVALID_ARGUMENT,
+         "Beam search and best_of > 1 are not supported with LINEAR "
+         "attention."});
+    return true;
+  }
 
   const size_t pending_before_reservation =
       prefetching_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -378,7 +387,6 @@ SchedulerState ContinuousScheduler::make_state() {
       .options = options_,
       .min_speculative_tokens_required = min_speculative_tokens_required_,
       .enable_prefix_cache = enable_prefix_cache_,
-      .has_linear_attention_layers = has_linear_attention_layers_,
       .release_failed_request =
           [this](const std::shared_ptr<Request>& request) {
             release_failed_request(request);
@@ -398,6 +406,13 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
           return one_batch.empty();
         });
     if (!all_empty) {
+      return batch;
+    }
+
+    if (options_.enable_schedule_overlap() &&
+        std::any_of(last_batch_.begin(),
+                    last_batch_.end(),
+                    [](const Batch& pending) { return !pending.empty(); })) {
       return batch;
     }
 
@@ -554,7 +569,7 @@ void ContinuousScheduler::update_token_latency_metrics(
   const bool speculative_metrics_enabled =
       options_.num_speculative_tokens() > 0;
   for (Sequence* sequence : sequences) {
-    if (sequence->is_chunked_prefill_stage() ||
+    if (sequence->cancelled() || sequence->is_chunked_prefill_stage() ||
         sequence->last_token_handled()) {
       // skip chunked prefill stage
       continue;
@@ -601,12 +616,12 @@ void ContinuousScheduler::process_batch_output(bool enable_schedule_overlap) {
   std::vector<std::shared_ptr<Request>> stream_requests;
   // process request output in batch
   for (auto request : to_be_processed_requests) {
+    if (request->cancelled()) {
+      continue;
+    }
     // ignore cancelled/finished requests when enable_schedule_overlap.
     if (options_.enable_schedule_overlap()) {
       if (request->state().stream) {
-        if (request->cancelled()) {
-          continue;
-        }
         if (request->error_status().has_value()) {
           continue;
         }

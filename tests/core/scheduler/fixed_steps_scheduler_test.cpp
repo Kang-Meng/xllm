@@ -63,16 +63,26 @@ class FakeTokenizer : public Tokenizer {
 
 class FakeEngine : public Engine {
  public:
-  FakeEngine(int32_t num_blocks, int32_t block_size) {
+  FakeEngine(int32_t num_blocks,
+             int32_t block_size,
+             bool linear_state = false) {
     BlockManagerPool::Options opt;
     opt.num_blocks_ = num_blocks;
     opt.block_size_ = block_size;
     opt.enable_prefix_cache_ = false;
+    opt.enable_linear_state_ = linear_state;
+    opt.linear_state_num_slots_ = linear_state ? 8 : 0;
     fake_tokenizer_ = std::make_unique<FakeTokenizer>();
     fake_block_manager_ = std::make_unique<BlockManagerPool>(opt, 1);
   }
   ForwardOutput step(std::vector<Batch>& batch) override {
-    (void)batch;
+    for (Batch& item : batch) {
+      for (Sequence* sequence : item.get_sequences()) {
+        if (sequence->has_linear_state_slot()) {
+          EXPECT_EQ(sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
+        }
+      }
+    }
     return ForwardOutput();
   }
   void update_last_step_result(std::vector<Batch>& batch) override {
@@ -248,12 +258,17 @@ TEST(FixedStepsSchedulerTest, StepCompletesWithRequest) {
       SchedulerConfig::get_instance()
           .prefill_scheduling_memory_usage_threshold(),
       1.0);
-  auto engine = std::make_unique<FakeEngine>(64, 32);
-  auto opt = CreateOptions(10000, 256);
-  FixedStepsScheduler scheduler(engine.get(), opt);
-  auto requests = GenRequests({32}, {10}, RecType::kOneRec);
-  scheduler.add_request(requests[0]);
-  EXPECT_NO_THROW(scheduler.step(absl::Milliseconds(500)));
+  for (const RecType rec_type : {RecType::kOneRec, RecType::kLlmRec}) {
+    const bool linear_state = rec_type == RecType::kLlmRec;
+    auto engine = std::make_unique<FakeEngine>(64, 32, linear_state);
+    auto opt = CreateOptions(10000, 256);
+    FixedStepsScheduler scheduler(engine.get(), opt);
+    auto requests = GenRequests({32}, {10}, rec_type);
+    scheduler.add_request(requests[0]);
+    EXPECT_NO_THROW(scheduler.step(absl::Milliseconds(500)));
+    EXPECT_EQ(requests[0]->sequences()[0]->has_linear_state_slot(),
+              linear_state);
+  }
 }
 
 }  // namespace xllm

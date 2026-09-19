@@ -65,7 +65,7 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
   if (req.best_of() > 1 &&
       !::xllm::KVCacheConfig::get_instance().enable_prefix_cache()) {
     LOG(ERROR) << "best_of > 1 in disaggregated PD mode requires "
-               << "enable_prefix_cache=true on the decode instance, "
+               << "prefix caching enabled on the decode instance, "
                << "request_id=" << req.req_id()
                << ", best_of=" << req.best_of();
     return nullptr;

@@ -62,15 +62,6 @@ struct KPoolBatchMetadata {
 };
 
 #if defined(USE_NPU)
-struct MegaGdnPrefillCacheOpKey {
-  int32_t linear_state_id;
-  bool reset_requested;
-  bool restore_requested;
-  int32_t restore_src_slot_id;
-
-  bool operator==(const MegaGdnPrefillCacheOpKey&) const = default;
-};
-
 struct MegaGdnPrefillIndicesKey {
   torch::Device device;
   int64_t batch_size;
@@ -78,7 +69,7 @@ struct MegaGdnPrefillIndicesKey {
   int64_t checkpoint_stride;
   std::vector<int32_t> linear_state_ids;
   std::vector<int64_t> linear_state_validity_mask;
-  std::vector<MegaGdnPrefillCacheOpKey> linear_state_cache_ops;
+  std::vector<int32_t> linear_state_read_ids;
 };
 
 struct MegaGdnPrefillIndicesCache {

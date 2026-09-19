@@ -787,6 +787,8 @@ struct ModelEmbeddingInput {
 
   // IntTensor: [n_seq]
   torch::Tensor linear_state_indices;
+  std::vector<int32_t> linear_state_read_ids;
+  torch::Tensor linear_state_read_indices;
 
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
@@ -808,6 +810,9 @@ struct ModelEmbeddingInput {
     out.embedding_ids = embedding_ids;
     out.linear_state_ids = linear_state_ids;
     out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_read_ids = linear_state_read_ids;
+    out.linear_state_read_indices =
+        safe_to(linear_state_read_indices, device, true);
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -916,28 +921,6 @@ struct ParallelInput {
 using LinearStatePrefixHash = PrefixHash;
 using LinearStateValidityMask = std::vector<int64_t>;
 
-struct LinearStateCacheOp {
-  // Live slot the sequence advances its recurrent state in.
-  int32_t linear_state_id = -1;
-  // A newly admitted sequence has no recurrent history. The physical slot may
-  // have been used by an earlier request, so the worker must clear it before
-  // the first forward instead of relying on allocator contents.
-  bool reset_requested = false;
-  // Checkpoint source slot resolved by the scheduler. With
-  // `restore_requested=true`, the worker copies it into `linear_state_id`
-  // before forward. With `restore_requested=false`, a valid source denotes
-  // direct read: forward reads this checkpoint in place and writes the result
-  // to the live slot. A source-less row is a continued request/no-op. The
-  // source is invalid for cold-start reset rows and mandatory for physical
-  // restore rows.
-  bool restore_requested = false;
-  int32_t restore_src_slot_id = -1;
-
-  bool is_direct_read() const {
-    return restore_src_slot_id >= 0 && !restore_requested && !reset_requested;
-  }
-};
-
 struct ExpertInput {
   torch::Tensor expert_load_data;
   torch::Tensor expert_array;
@@ -1034,7 +1017,8 @@ struct ModelInputParams {
   void clear_linear_attention_state() {
     embedding.linear_state_ids.clear();
     embedding.linear_state_indices = torch::Tensor();
-    linear_state_cache_ops.clear();
+    embedding.linear_state_read_ids.clear();
+    embedding.linear_state_read_indices = torch::Tensor();
     linear_state_validity_mask.clear();
     pd_handoff_reset_mask.clear();
   }
@@ -1052,7 +1036,6 @@ struct ModelInputParams {
     if (dit_forward_input.has_value()) {
       params.dit_forward_input.emplace(dit_forward_input->to(device));
     }
-    params.linear_state_cache_ops = linear_state_cache_ops;
     params.linear_state_validity_mask = linear_state_validity_mask;
     params.pd_handoff_reset_mask = pd_handoff_reset_mask;
     params.is_spec_verify = is_spec_verify;
@@ -1073,6 +1056,16 @@ struct ModelInputParams {
       params.embedding.linear_state_indices =
           torch::tensor(params.embedding.linear_state_ids, torch::kInt)
               .to(device);
+    }
+    if (!params.embedding.linear_state_read_indices.defined() &&
+        !params.embedding.linear_state_ids.empty()) {
+      auto& read_ids = params.embedding.linear_state_read_ids;
+      if (read_ids.empty()) {
+        read_ids = params.embedding.linear_state_ids;
+      }
+      CHECK_EQ(read_ids.size(), params.embedding.linear_state_ids.size());
+      params.embedding.linear_state_read_indices =
+          torch::tensor(read_ids, torch::kInt).to(device);
     }
 
     // rec_params device conversion for both OneRec and LLM-Rec variants
@@ -1196,7 +1189,6 @@ struct ModelInputParams {
   torch::Tensor mtp_shifted_token_ids;
 
   // Structured per-row linear-state cache operations.
-  std::vector<LinearStateCacheOp> linear_state_cache_ops;
   // Worker-produced per-row result declaring whether the recurrent state is
   // valid for model-forward consumption after restore processing.
   LinearStateValidityMask linear_state_validity_mask;

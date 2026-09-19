@@ -245,6 +245,7 @@ bool LLMEngine::init_model(MasterStatus master_status) {
   configure_glm5_next_mtp_args(
       args_, options_.speculative_algorithm(), options_.is_draft_engine());
 #endif
+  configure_prefix_cache(options_);
   quant_args_ = model_loader->quant_args();
 
   if (options_.num_speculative_tokens() > 0 &&
@@ -535,10 +536,7 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   estimate_options.is_draft_engine = options_.is_draft_engine();
   estimate_options.enable_chunked_prefill = options_.enable_chunked_prefill();
   estimate_options.enable_schedule_overlap = options_.enable_schedule_overlap();
-  const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
-  estimate_options.enable_prefix_cache =
-      kv_cache_config.enable_prefix_cache() &&
-      !kv_cache_config.enable_xtensor();
+  estimate_options.enable_prefix_cache = options_.enable_prefix_cache();
   estimate_options.enable_disagg_pd = options_.enable_disagg_pd();
   estimate_options.instance_role = options_.instance_role();
   estimate_options.dp_size = options_.dp_size();
@@ -634,25 +632,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     LOG(FATAL) << *host_cache_error;
   }
 
-  // DECODE-side skips LINEAR prefix cache by role (see
-  // composite_block_manager.cpp::leaf_participates_in_prefix_cache), so the
-  // chunked-prefill + chunk-stride guards below are only meaningful for
-  // PREFILL / MIX. On DECODE the linear-state cache is disabled anyway and
-  // pd_launch.sh legitimately sets --enable_chunked_prefill=false.
-  const bool is_decode = options_.instance_role() == InstanceRole::DECODE;
-  if (options_.enable_prefix_cache() && enable_state_cache && !is_decode) {
-    const auto& scheduler_config = ::xllm::SchedulerConfig::get_instance();
-    CHECK(scheduler_config.enable_chunked_prefill())
-        << "GDN/KPool state prefix cache requires block-aligned chunked "
-           "prefill to save matching linear states. Please set "
-           "--enable_chunked_prefill=true in your config.";
-    CHECK(scheduler_config.max_tokens_per_chunk_for_prefill() % block_size == 0)
-        << "state-cache prefix cache saves checkpoints at "
-           "chunk-end boundaries, so max_tokens_per_chunk_for_prefill ("
-        << scheduler_config.max_tokens_per_chunk_for_prefill()
-        << ") must be a multiple of block_size (" << block_size << ").";
-  }
-
   // init kv cache for each worker
   kv_cache_shape.print_shapes();
 
@@ -668,9 +647,7 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
                                         : block_size)
       .host_num_blocks(kv_cache_cap.n_blocks() * options_.host_blocks_factor())
       .enable_linear_state(enable_state_cache)
-      .enable_prefix_cache(kv_cache_config.enable_xtensor()
-                               ? false
-                               : options_.enable_prefix_cache())
+      .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_kvcache_store(options_.enable_kvcache_store())
       .prefetch_batch_size(options_.prefetch_batch_size())
@@ -682,9 +659,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_speculative_tokens(options_.num_speculative_tokens())
       .num_embedding_blocks(
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
-      // DECODE-side prefix cache participation is per-leaf and gated by the
-      // predicate in composite_block_manager.cpp. P and MIX are treated
-      // identically (both admit prefix cache on every leaf).
       .instance_is_decode(options_.instance_role() == InstanceRole::DECODE);
   if (enable_state_cache) {
     // The unified state slot pool spans all physical slots [0, N); it can
@@ -745,9 +719,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       options_.is_draft_engine() &&
       SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
   if (is_mtp_draft_engine) {
-    // The speculative scheduler owns only the target engine BlockManager.
-    // Keep the draft engine's placeholder manager non-caching so a Draft
-    // model with only SWA tensors does not pretend to own logical prefixes.
     options.enable_prefix_cache(false);
   }
 

@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "framework/batch/batch_factory.h"
+#include "framework/model/model_args.h"
 #include "framework/request/priority_comparator.h"
 #include "util/timer.h"
 #include "util/utils.h"
@@ -491,8 +492,8 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
   // Linear-state block alignment: for models with linear attention layers +
   // prefix cache, chunk boundaries must align to chunk_stride so linear-state
   // checkpoints land at recoverable positions.
-  if (state.has_linear_attention_layers && state.enable_prefix_cache &&
-      seq->is_prefill_stage()) {
+  if (has_linear_attention_layers(state.model_args) &&
+      state.enable_prefix_cache && seq->is_prefill_stage()) {
     const size_t chunk_stride =
         static_cast<size_t>(::xllm::SchedulerConfig::get_instance()
                                 .max_tokens_per_chunk_for_prefill());
@@ -528,7 +529,8 @@ void SchedulerPolicy::allocate_shared_blocks_for(Sequence* seq,
     return;
   }
   if (seq->is_chunked_prefill_stage()) {
-    if (state.has_linear_attention_layers && state.enable_prefix_cache) {
+    if (has_linear_attention_layers(state.model_args) &&
+        state.enable_prefix_cache) {
       // Linear-state prefix cache can only resume at saved state checkpoints.
       // Re-match at every chunk boundary.
       state.kv_cache_manager->allocate_shared(seq);
@@ -931,6 +933,10 @@ void SchedulerPolicy::handle_unschedulable_head(
     std::vector<std::shared_ptr<Request>>& finished,
     bool budget_exhausted,
     bool blocks_exhausted) {
+  if (blocks_exhausted &&
+      state.kv_cache_manager->has_pending_async_block_release()) {
+    return;
+  }
   if (state.running_sequences.empty() && !queue->empty() &&
       state.decode_queue.empty()) {
     std::shared_ptr<Request> request(queue->top());

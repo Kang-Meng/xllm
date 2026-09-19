@@ -92,6 +92,7 @@ class FakeEngine final : public Engine {
   }
 
   std::function<ForwardOutput(std::vector<Batch>&)> forward;
+  std::function<void(std::vector<Batch>&)> complete_forward;
 
   ForwardOutput step(std::vector<Batch>& batch) override {
     if (forward) {
@@ -100,7 +101,11 @@ class FakeEngine final : public Engine {
     NOT_IMPLEMENTED();
   }
 
-  void update_last_step_result(std::vector<Batch>& /*batch*/) override {
+  void update_last_step_result(std::vector<Batch>& batch) override {
+    if (complete_forward) {
+      complete_forward(batch);
+      return;
+    }
     NOT_IMPLEMENTED();
   }
 
@@ -1206,7 +1211,8 @@ TEST_F(ReservationTest, UnacceptedLocalFailureSendsNoRelease) {
 class ChunkReservationTest : public ReservationTest,
                              public ::testing::WithParamInterface<bool> {};
 
-TEST_P(ChunkReservationTest, ChunkFailureWaitsForPriorPushCompletion) {
+TEST_P(ChunkReservationTest,
+       ChunkFailureReleasesAfterPushWithoutWaitingForOutput) {
   auto remote = reserve();
   FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
   auto options = make_options();
@@ -1240,6 +1246,16 @@ TEST_P(ChunkReservationTest, ChunkFailureWaitsForPriorPushCompletion) {
   ASSERT_TRUE(
       engine.block_manager_pool()->allocate(blocker->sequences()[0].get()));
   EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+  prefill.wait_notifications();
+  EXPECT_EQ(service_.released, 1);
+  EXPECT_TRUE(decode_.reservations_empty());
+  if (GetParam()) {
+    engine.complete_forward = [&](std::vector<Batch>&) {
+      EXPECT_EQ(service_.released, 1);
+    };
+    prefill.step(absl::ZeroDuration());
+    EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+  }
   prefill.wait_notifications();
   EXPECT_EQ(service_.released, 1);
   EXPECT_TRUE(decode_.reservations_empty());

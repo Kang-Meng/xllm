@@ -71,7 +71,7 @@ Token make_empty_logprob_placeholder(const Sequence& seq) {
 }
 
 void update_sequence_embedding(Sequence* seq, const torch::Tensor& embedding) {
-  if (!embedding.defined()) {
+  if (seq->cancelled() || !embedding.defined()) {
     return;
   }
   torch::Tensor cur_seq_embed = safe_to(embedding, torch::kFloat32);
@@ -120,7 +120,7 @@ std::unordered_set<std::string> fail_json_object_requests(
 
   for (Sequence* sequence : sequences) {
     const auto error_iter = request_errors.find(sequence->request_id());
-    if (error_iter != request_errors.end()) {
+    if (!sequence->cancelled() && error_iter != request_errors.end()) {
       sequence->fail(error_iter->second);
     }
   }
@@ -208,10 +208,8 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                             &args,
                             batch_forward_type_,
                             cp_size);
-  ForwardInput forward_input =
-      builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
-  linear_restore_src_blocks_ = builder.take_linear_restore_src_blocks();
-  return forward_input;
+  return builder.build_forward_input(num_decoding_tokens,
+                                     min_decoding_batch_size);
 }
 
 ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
@@ -431,7 +429,6 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
   ForwardInput forward_input =
       builder.build_forward_input(/*num_decoding_tokens=*/0,
                                   /*min_decoding_batch_size=*/0);
-  linear_restore_src_blocks_ = builder.take_linear_restore_src_blocks();
   if (has_partial_finished_beam_group()) {
     // Beam-search kernel assumes fixed beam width per group. When only part of
     // a group is active, fall back to software beam merge.
@@ -552,7 +549,7 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
     auto* seq = target.sequence;
     CHECK(seq != nullptr);
 
-    if (failed_request_ids.contains(seq->request_id()) ||
+    if (seq->cancelled() || failed_request_ids.contains(seq->request_id()) ||
         seq->error_status().has_value()) {
       continue;
     }
@@ -684,8 +681,10 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
     Sequence* seq = sequence_groups_.empty()
                         ? sequences[g]
                         : sequence_groups_[g]->sequences()[0].get();
-    seq->set_beam_result(
-        result_width, total_rounds, group_flat2d, last_logprobs);
+    if (!seq->cancelled()) {
+      seq->set_beam_result(
+          result_width, total_rounds, group_flat2d, last_logprobs);
+    }
   }
 }
 
@@ -746,7 +745,7 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
     const auto& target = output_targets_[output_idx];
     auto* seq = target.sequence;
     CHECK(seq != nullptr);
-    if (seq->error_status().has_value()) {
+    if (seq->cancelled() || seq->error_status().has_value()) {
       continue;
     }
 
@@ -884,6 +883,10 @@ void Batch::append_token_for_sequence(Sequence* seq,
 
 void Batch::process_beam_search(bool force_requested_result_size) {
   for (auto* sequence_group : sequence_groups_) {
+    const auto& sequences = sequence_group->sequences();
+    if (!sequences.empty() && sequences.front()->cancelled()) {
+      continue;
+    }
     sequence_group->process_beam_search(force_requested_result_size);
   }
 }
@@ -908,7 +911,8 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
     const auto& group_sequences =
         sequence_groups_[sequence_group_id]->sequences();
     CHECK(!group_sequences.empty());
-    if (failed_request_ids.contains(group_sequences[0]->request_id())) {
+    if (group_sequences[0]->cancelled() ||
+        failed_request_ids.contains(group_sequences[0]->request_id())) {
       return;
     }
 
