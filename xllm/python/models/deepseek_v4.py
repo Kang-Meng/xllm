@@ -1583,6 +1583,24 @@ class DeepseekV4MoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _hc_head_merge(
+    hidden: torch.Tensor,
+    hc_head_fn: torch.Tensor,
+    hc_head_base: torch.Tensor,
+    hc_head_scale: torch.Tensor,
+    rms_norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    """Merge HyperConnection streams with the shared target/draft algorithm."""
+    hidden_float = hidden.to(torch.float32)
+    flattened = hidden_float.flatten(-2, -1)
+    reciprocal_rms = torch.rsqrt(flattened.pow(2).mean(-1, keepdim=True) + rms_norm_eps)
+    mixes = torch.matmul(flattened, hc_head_fn.transpose(0, 1))
+    weights = torch.sigmoid(mixes * reciprocal_rms * hc_head_scale + hc_head_base)
+    weights = weights + hc_eps
+    return (weights.unsqueeze(-1) * hidden_float).sum(-2).to(hidden.dtype)
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     """DeepSeek-V4 decoder layer: HyperConnection(attn) + HyperConnection(ffn)."""
 
@@ -1685,6 +1703,15 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_fn = nn.Parameter(torch.empty(cfg.hc_mult, hc_dim, dtype=torch.float32, device=device))
         self.hc_head_base = nn.Parameter(torch.empty(cfg.hc_mult, dtype=torch.float32, device=device))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32, device=device))
+        self._build_rotary_tables(cfg, dtype, device)
+        self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
+
+    def _build_rotary_tables(
+        self,
+        cfg: DeepseekV4Config,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
         # Native C++ falls back to max_position_embeddings when the flat
         # rope_scaling_original_max_position_embeddings ModelArgs field is 0.
         # The DSV4 loader currently leaves that field at 0, so old_context_len
@@ -1728,7 +1755,6 @@ class DeepseekV4Model(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
 
     def attach_rope_tables_to_backend(
         self,
@@ -1763,14 +1789,14 @@ class DeepseekV4Model(nn.Module):
         hc_head_fn=[hc_mult, hc_mult*hidden], hc_head_base=[hc_mult], and
         hc_head_scale=[1].
         """
-        x_float = x.to(torch.float32)
-        x_flatten = x_float.flatten(-2, -1)
-        rsqrt = torch.rsqrt(x_flatten.pow(2).mean(-1, keepdim=True) + self.cfg.rms_norm_eps)
-        mixes = torch.matmul(x_flatten, self.hc_head_fn.transpose(0, 1))
-        mixes = mixes * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.cfg.hc_eps
-        y = (pre.unsqueeze(-1) * x_float).sum(-2)
-        return y.to(x.dtype)
+        return _hc_head_merge(
+            x,
+            self.hc_head_fn,
+            self.hc_head_base,
+            self.hc_head_scale,
+            self.cfg.rms_norm_eps,
+            self.cfg.hc_eps,
+        )
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor

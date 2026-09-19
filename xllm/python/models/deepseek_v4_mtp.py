@@ -26,7 +26,7 @@ from xllm.python.models.deepseek_v4 import (
     DeepseekV4Config,
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
-    DeepseekV4RotaryEmbedding,
+    _hc_head_merge,
 )
 
 
@@ -77,13 +77,14 @@ class DeepseekV4MtpLayer(DeepseekV4DecoderLayer):
         )
 
     def _merge_hc_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden_float = hidden.to(torch.float32)
-        flattened = hidden_float.flatten(-2, -1)
-        reciprocal_rms = torch.rsqrt(flattened.pow(2).mean(-1, keepdim=True) + self.cfg.rms_norm_eps)
-        mixes = torch.matmul(flattened, self.hc_head_fn.transpose(0, 1))
-        weights = torch.sigmoid(mixes * reciprocal_rms * self.hc_head_scale + self.hc_head_base)
-        weights = weights + self.cfg.hc_eps
-        return (weights.unsqueeze(-1) * hidden_float).sum(-2).to(hidden.dtype)
+        return _hc_head_merge(
+            hidden,
+            self.hc_head_fn,
+            self.hc_head_base,
+            self.hc_head_scale,
+            self.cfg.rms_norm_eps,
+            self.cfg.hc_eps,
+        )
 
     def forward(
         self,
@@ -123,40 +124,7 @@ class DeepseekV4MtpModel(DeepseekV4Model):
             [DeepseekV4MtpLayer(cfg, layer_id, dtype, device) for layer_id in range(cfg.n_layers)]
         )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
-        native_old_context_len = cfg.max_position_embeddings
-        self.rotary = DeepseekV4RotaryEmbedding(
-            cfg.qk_rope_head_dim,
-            cfg.max_position_embeddings,
-            cfg.rope_scaling_factor,
-            cfg.rope_theta,
-            cfg.rope_beta_fast,
-            cfg.rope_beta_slow,
-            native_old_context_len,
-            dtype=dtype,
-            device=device,
-        )
-        self.compress_rotary_c4 = DeepseekV4RotaryEmbedding(
-            cfg.qk_rope_head_dim,
-            cfg.max_position_embeddings,
-            cfg.rope_scaling_factor,
-            cfg.compress_rope_theta,
-            cfg.rope_beta_fast,
-            cfg.rope_beta_slow,
-            native_old_context_len,
-            dtype=dtype,
-            device=device,
-        )
-        self.compress_rotary_c128 = DeepseekV4RotaryEmbedding(
-            cfg.qk_rope_head_dim,
-            cfg.max_position_embeddings,
-            cfg.rope_scaling_factor,
-            cfg.compress_rope_theta,
-            cfg.rope_beta_fast,
-            cfg.rope_beta_slow,
-            native_old_context_len,
-            dtype=dtype,
-            device=device,
-        )
+        self._build_rotary_tables(cfg, dtype, device)
 
     def make_dummy_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Return a zero target-hidden row for an empty DP MTP shard."""

@@ -22,6 +22,8 @@ pytest.importorskip("torch_npu")
 
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.model_executor.runners.decode_acl_graph import _StaticAttentionMetadata
+from xllm.python.models import deepseek_v4, deepseek_v4_mtp
+from xllm.python.models.deepseek_v4 import DeepseekV4Model
 from xllm.python.models.deepseek_v4_mtp import DeepseekV4MtpLayer, DeepseekV4MtpModel
 
 
@@ -61,6 +63,85 @@ def test_mtp_fuses_target_hidden_layouts(
 def test_mtp_rejects_unknown_hidden_width() -> None:
     with pytest.raises(ValueError, match=r"hc_mult \* hidden_size \(4\), but got 3"):
         _fusion_layer()._fuse_hidden_states(torch.ones(1, 2), torch.ones(1, 3))
+
+
+def test_target_and_mtp_hc_merge_match_independent_reference() -> None:
+    cfg = SimpleNamespace(rms_norm_eps=1e-6, hc_eps=1e-6)
+    hidden = torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4)
+    head_fn = torch.arange(36, dtype=torch.float32).reshape(3, 12) / 32
+    head_base = torch.tensor([-0.25, 0.0, 0.25], dtype=torch.float32)
+    head_scale = torch.tensor([0.5], dtype=torch.float32)
+
+    target = DeepseekV4Model.__new__(DeepseekV4Model)
+    nn.Module.__init__(target)
+    target.cfg = cfg
+    target.hc_head_fn = nn.Parameter(head_fn.clone())
+    target.hc_head_base = nn.Parameter(head_base.clone())
+    target.hc_head_scale = nn.Parameter(head_scale.clone())
+
+    draft = DeepseekV4MtpLayer.__new__(DeepseekV4MtpLayer)
+    nn.Module.__init__(draft)
+    draft.cfg = cfg
+    draft.hc_head_fn = nn.Parameter(head_fn.clone())
+    draft.hc_head_base = nn.Parameter(head_base.clone())
+    draft.hc_head_scale = nn.Parameter(head_scale.clone())
+
+    hidden_float = hidden.to(torch.float32)
+    flattened = hidden_float.flatten(-2, -1)
+    reciprocal_rms = torch.rsqrt(flattened.square().mean(-1, keepdim=True) + cfg.rms_norm_eps)
+    mixes = flattened @ head_fn.transpose(0, 1)
+    weights = torch.sigmoid(mixes * reciprocal_rms * head_scale + head_base) + cfg.hc_eps
+    expected = (weights.unsqueeze(-1) * hidden_float).sum(-2).to(hidden.dtype)
+
+    torch.testing.assert_close(target._hc_head(hidden), expected)
+    torch.testing.assert_close(draft._merge_hc_hidden(hidden), expected)
+
+
+def test_mtp_model_reuses_target_rotary_table_builder(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, torch.dtype, torch.device]] = []
+    rotary_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    original_build_rotary_tables = DeepseekV4Model._build_rotary_tables
+
+    def build_rotary_tables(
+        self: DeepseekV4Model,
+        cfg: object,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        calls.append((cfg, dtype, device))
+        original_build_rotary_tables(self, cfg, dtype, device)
+
+    def rotary_embedding(*args: object, **kwargs: object) -> SimpleNamespace:
+        rotary_calls.append((args, kwargs))
+        return SimpleNamespace(cos_sin_cache=torch.empty(0))
+
+    monkeypatch.setattr(DeepseekV4Model, "_build_rotary_tables", build_rotary_tables)
+    monkeypatch.setattr(deepseek_v4, "DeepseekV4RotaryEmbedding", rotary_embedding)
+    monkeypatch.setattr(deepseek_v4_mtp, "HiddenParallelEmbedding", lambda *_args, **_kwargs: nn.Identity())
+    monkeypatch.setattr(deepseek_v4_mtp, "DeepseekV4MtpLayer", lambda *_args, **_kwargs: nn.Identity())
+    monkeypatch.setattr(deepseek_v4_mtp, "RMSNorm", lambda *_args, **_kwargs: nn.Identity())
+    cfg = SimpleNamespace(
+        tp_size=1,
+        vocab_size=8,
+        hidden_size=4,
+        n_layers=2,
+        rms_norm_eps=1e-6,
+        qk_rope_head_dim=4,
+        max_position_embeddings=16,
+        rope_scaling_factor=1.0,
+        rope_theta=10000.0,
+        rope_beta_fast=32,
+        rope_beta_slow=1,
+        compress_rope_theta=160000.0,
+    )
+    dtype = torch.float32
+    device = torch.device("cpu")
+
+    model = DeepseekV4MtpModel(cfg, dtype, device)
+
+    assert calls == [(cfg, dtype, device)]
+    assert len(rotary_calls) == 3
+    assert not hasattr(model, "aux_hidden_capture")
 
 
 def test_mtp_dummy_embedding_matches_target_hidden_width() -> None:
