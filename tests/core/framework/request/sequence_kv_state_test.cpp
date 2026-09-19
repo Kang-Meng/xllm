@@ -19,6 +19,69 @@ limitations under the License.
 
 namespace xllm {
 
+TEST(KVCacheStateTest, KvProgressDoesNotConfirmTokensOrChangeSource) {
+  KVCacheState state;
+  state.add_blocks(BlockType::LINEAR, {Block(1, nullptr)});
+  state.set_kv_cache_tokens_num(4);
+  state.set_last_confirmed_cached_tokens(4);
+  state.add_blocks(BlockType::LINEAR, {Block(2, nullptr)});
+  state.set_kv_cache_tokens_num(8);
+  ASSERT_EQ(state.num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_EQ(state.blocks(BlockType::LINEAR)[0].id(), 1);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 4u);
+  (*state.mutable_blocks(BlockType::LINEAR))[0] = Block();
+  EXPECT_FALSE(state.blocks(BlockType::LINEAR)[0].is_valid());
+  EXPECT_EQ(state.copy_block(BlockType::LINEAR).id(), 2);
+}
+
+TEST(KVCacheStateTest, LinearBlocksPreserveUnallocatedLogicalIntervals) {
+  KVCacheState state;
+  state.add_blocks(BlockType::LINEAR,
+                   {Block(1, nullptr), Block(), Block(), Block(2, nullptr)});
+  const Slice<Block> blocks = state.blocks(BlockType::LINEAR);
+  ASSERT_EQ(blocks.size(), 4u);
+  EXPECT_EQ(blocks[0].id(), 1);
+  EXPECT_FALSE(blocks[1].is_valid());
+  EXPECT_FALSE(blocks[2].is_valid());
+  EXPECT_EQ(state.copy_block(BlockType::LINEAR).id(), 2);
+}
+
+TEST(KVCacheStateTest, ResetDiscardsConfirmedProgress) {
+  KVCacheState state;
+  state.set_kv_cache_tokens_num(2050);
+  state.set_last_confirmed_cached_tokens(2046);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 2046u);
+  state.reset();
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 0u);
+}
+
+TEST(KVCacheStateTest, RemovingLinearBlocksPreservesConfirmedProgress) {
+  KVCacheState state;
+  state.add_blocks(BlockType::LINEAR, {Block(1, nullptr)});
+  state.set_kv_cache_tokens_num(2050);
+  state.set_last_confirmed_cached_tokens(2046);
+  auto blocks = state.take_blocks(BlockType::LINEAR);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 2046u);
+  state.add_blocks(BlockType::LINEAR, blocks);
+  state.set_last_confirmed_cached_tokens(2047);
+  state.erase_blocks(BlockType::LINEAR);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 2047u);
+}
+
+TEST(KVCacheStateTest, ConfirmationCannotExceedCurrentCacheProgress) {
+  KVCacheState state;
+  state.set_kv_cache_tokens_num(8);
+  state.set_last_confirmed_cached_tokens(9);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 8u);
+  state.set_kv_cache_tokens_num(4);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 4u);
+  state.set_kv_cache_tokens_num(12);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 4u);
+  state.reset();
+  state.set_last_confirmed_cached_tokens(8);
+  EXPECT_EQ(state.last_confirmed_cached_tokens(), 0u);
+}
+
 TEST(KVCacheStateTest, TransferCursorTracksAndResets) {
   KVCacheState state;
   EXPECT_EQ(state.next_transfer_block_idx(), 0u);

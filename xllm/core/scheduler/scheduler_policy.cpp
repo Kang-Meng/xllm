@@ -377,7 +377,8 @@ void SchedulerPolicy::schedule_prefill_from_queue(
       if (!allocate_for_prefill(
               prefill_sequence.get(), num_tokens, &actual_tokens, state)) {
         can_schedule = false;
-        blocks_exhausted = true;
+        budget_exhausted = actual_tokens == 0;
+        blocks_exhausted = actual_tokens != 0;
         break;
       }
 
@@ -462,6 +463,28 @@ size_t SchedulerPolicy::compute_prefill_tokens(Sequence* seq,
   return num_tokens;
 }
 
+size_t SchedulerPolicy::compute_prefill_target(
+    Sequence* seq,
+    size_t cached_tokens,
+    size_t token_budget,
+    const SchedulerState& state) const {
+  CHECK_LE(cached_tokens, seq->num_tokens());
+  size_t compute_tokens =
+      std::min(token_budget, seq->num_tokens() - cached_tokens);
+  if (!state.has_linear_attention_layers || !seq->is_prefill_stage()) {
+    return cached_tokens + compute_tokens;
+  }
+  CHECK(batch_mode_.enable_chunked_prefill);
+  CHECK_GT(options_.max_tokens_per_chunk_for_prefill(), 0);
+  const size_t chunk_stride =
+      static_cast<size_t>(options_.max_tokens_per_chunk_for_prefill());
+  CHECK_EQ(cached_tokens % chunk_stride, 0u);
+  compute_tokens = std::min(compute_tokens, chunk_stride);
+  const size_t target = cached_tokens + compute_tokens;
+  return target == seq->num_tokens() ? target
+                                     : target / chunk_stride * chunk_stride;
+}
+
 bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
                                            size_t token_budget,
                                            size_t* actual_tokens,
@@ -485,33 +508,12 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
   }
 
   const size_t kv_cache_tokens_num = seq->kv_cache_tokens_num();
-  size_t max_handle_num_tokens =
-      std::min(kv_cache_tokens_num + token_budget, seq->num_tokens());
-
-  // Linear-state block alignment: for models with linear attention layers +
-  // prefix cache, chunk boundaries must align to chunk_stride so linear-state
-  // checkpoints land at recoverable positions.
-  if (state.has_linear_attention_layers && state.enable_prefix_cache &&
-      seq->is_prefill_stage()) {
-    const size_t chunk_stride =
-        static_cast<size_t>(::xllm::SchedulerConfig::get_instance()
-                                .max_tokens_per_chunk_for_prefill());
-    const size_t aligned =
-        (max_handle_num_tokens / chunk_stride) * chunk_stride;
-    if (aligned <= kv_cache_tokens_num) {
-      if (max_handle_num_tokens == seq->num_tokens()) {
-        // Final chunk: allow unaligned to complete the sequence.
-      } else {
-        *actual_tokens = 0;
-        return false;
-      }
-    } else {
-      max_handle_num_tokens = aligned;
-    }
-  }
-
-  CHECK_GT(max_handle_num_tokens, kv_cache_tokens_num);
+  const size_t max_handle_num_tokens =
+      compute_prefill_target(seq, kv_cache_tokens_num, token_budget, state);
   *actual_tokens = max_handle_num_tokens - kv_cache_tokens_num;
+  if (*actual_tokens == 0) {
+    return false;
+  }
   return state.kv_cache_manager->allocate(seq, max_handle_num_tokens);
 }
 
@@ -698,6 +700,9 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
         }
 
         if (allocate_failed) {
+          if (state.has_inflight_linear_state) {
+            return;
+          }
           LOG(ERROR) << "Beam strict scheduling allocation failed. "
                      << "request_id=" << request->request_id()
                      << ", beam=" << request->check_beam_search();
@@ -795,7 +800,8 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
     // Blocks exhausted: wait for an in-flight async release before selecting
     // another victim. The released blocks remain unavailable until the
     // transfer completes.
-    if (state.kv_cache_manager->has_pending_async_block_release()) {
+    if (state.has_inflight_linear_state ||
+        state.kv_cache_manager->has_pending_async_block_release()) {
       return;
     }
 
@@ -931,6 +937,9 @@ void SchedulerPolicy::handle_unschedulable_head(
     std::vector<std::shared_ptr<Request>>& finished,
     bool budget_exhausted,
     bool blocks_exhausted) {
+  if (blocks_exhausted && state.has_inflight_linear_state) {
+    return;
+  }
   if (state.running_sequences.empty() && !queue->empty() &&
       state.decode_queue.empty()) {
     std::shared_ptr<Request> request(queue->top());

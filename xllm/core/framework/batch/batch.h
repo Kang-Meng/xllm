@@ -24,6 +24,7 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
+#include "core/framework/block/block.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "framework/batch/batch_forward_type.h"
 #include "framework/request/request.h"
@@ -152,6 +153,7 @@ class Batch {
   };
 
   void refresh_output_targets();
+  void retain_linear_state_blocks();
   void refresh_onerec_prefill_output_targets();
   bool update_sequence_state(Sequence* seq, bool replace_fake_token);
 
@@ -170,6 +172,7 @@ class Batch {
 
   std::vector<Sequence*> sequences_;
   std::vector<SequencesGroup*> sequence_groups_;
+  std::vector<Block> linear_state_blocks_;
   std::vector<BlockTransferInfo> swap_block_transfer_infos_;
 
   // max number of tokens to process for each sequence
@@ -180,9 +183,6 @@ class Batch {
 
   // mm_data in the batch
   std::vector<MMData> mm_data_vec_;
-
-  // Pins serialized restore sources until this batch's worker result returns.
-  std::vector<Block> linear_restore_src_blocks_;
 
   // Runtime sampling targets that were actually injected for the current
   // forward pass. Sample requests may contribute multiple targets per

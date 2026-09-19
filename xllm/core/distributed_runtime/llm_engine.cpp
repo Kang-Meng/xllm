@@ -629,23 +629,35 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     LOG(FATAL) << *host_cache_error;
   }
 
-  // DECODE-side skips LINEAR prefix cache by role (see
-  // composite_block_manager.cpp::leaf_participates_in_prefix_cache), so the
-  // chunked-prefill + chunk-stride guards below are only meaningful for
-  // PREFILL / MIX. On DECODE the linear-state cache is disabled anyway and
-  // pd_launch.sh legitimately sets --enable_chunked_prefill=false.
   const bool is_decode = options_.instance_role() == InstanceRole::DECODE;
-  if (options_.enable_prefix_cache() && enable_state_cache && !is_decode) {
+  if (enable_state_cache && !is_decode) {
     const auto& scheduler_config = ::xllm::SchedulerConfig::get_instance();
     CHECK(scheduler_config.enable_chunked_prefill())
-        << "GDN/KPool state prefix cache requires block-aligned chunked "
-           "prefill to save matching linear states. Please set "
-           "--enable_chunked_prefill=true in your config.";
-    CHECK(scheduler_config.max_tokens_per_chunk_for_prefill() % block_size == 0)
-        << "state-cache prefix cache saves checkpoints at "
-           "chunk-end boundaries, so max_tokens_per_chunk_for_prefill ("
-        << scheduler_config.max_tokens_per_chunk_for_prefill()
-        << ") must be a multiple of block_size (" << block_size << ").";
+        << "Linear-attention prefill requires --enable_chunked_prefill=true.";
+    const int32_t chunk_stride =
+        scheduler_config.max_tokens_per_chunk_for_prefill();
+    CHECK_GT(chunk_stride, 0)
+        << "Linear-attention prefill requires a positive chunk size.";
+    CHECK_GE(options_.max_tokens_per_batch(), chunk_stride)
+        << "Linear-attention token budget must fit one complete prefill chunk.";
+    CHECK(!options_.enable_pd_ooc())
+        << "Linear-attention prefill does not support PD-OOC scheduling.";
+    CHECK(options_.enable_disagg_pd() || !scheduler_config.use_zero_evict())
+        << "Linear-attention prefill does not support zero-eviction "
+           "scheduling.";
+    if (options_.enable_prefix_cache()) {
+      CHECK_EQ(chunk_stride % block_size, 0)
+          << "Linear-attention prefix cache requires chunk size to be a "
+             "multiple of block_size.";
+    }
+    const int32_t kv_split_size =
+        ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+    if (kv_split_size > 1) {
+      CHECK_EQ(static_cast<int64_t>(chunk_stride) %
+                   (static_cast<int64_t>(kv_split_size) * block_size),
+               0)
+          << "Linear-attention prefill chunk size must align to CP KV blocks.";
+    }
   }
 
   // init kv cache for each worker

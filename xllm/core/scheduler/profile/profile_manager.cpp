@@ -946,16 +946,46 @@ std::shared_ptr<Request> ProfileManager::try_generate_single_decode_request(
     CHECK_LT(dp_rank.value(), options_.dp_size());
     sequence->set_dp_rank(dp_rank.value());
   }
-  if (!block_manager_pool_->BlockManagerPool::allocate(sequence,
-                                                       seq_capacity)) {
-    return nullptr;
+  const bool needs_linear_prefill_slot =
+      has_linear_attention_layers(model_args) &&
+      options_.instance_role() != InstanceRole::DECODE;
+  if (needs_linear_prefill_slot) {
+    const int32_t chunk_stride =
+        SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+    CHECK_GT(chunk_stride, 0);
+    while (sequence->kv_cache_tokens_num() <
+           static_cast<size_t>(prompt_length)) {
+      const size_t cached_tokens = sequence->kv_cache_tokens_num();
+      const size_t target =
+          std::min(static_cast<size_t>(prompt_length),
+                   cached_tokens + static_cast<size_t>(chunk_stride));
+      if (!block_manager_pool_->BlockManagerPool::allocate(sequence, target)) {
+        block_manager_pool_->deallocate_without_cache(sequence);
+        return nullptr;
+      }
+      Block block = sequence->copy_block(BlockType::LINEAR);
+      block.manager()->release_out_of_window(sequence);
+      sequence->kv_state().incr_kv_cache_tokens_num(target - cached_tokens);
+    }
+  } else {
+    if (!block_manager_pool_->BlockManagerPool::allocate(sequence,
+                                                         seq_capacity)) {
+      return nullptr;
+    }
+    sequence->kv_state().incr_kv_cache_tokens_num(prompt_length);
   }
-  sequence->kv_state().incr_kv_cache_tokens_num(prompt_length);
 
   int32_t generated_token = dis(gen);
   generated_token =
       generated_token == eos_token_id ? generated_token + 1 : generated_token;
   sequence->append_token(generated_token);
+
+  if (needs_linear_prefill_slot &&
+      !block_manager_pool_->BlockManagerPool::allocate(sequence,
+                                                       seq_capacity)) {
+    block_manager_pool_->deallocate_without_cache(sequence);
+    return nullptr;
+  }
 
   // With MTP speculative decoding the worker's decode path requires a valid
   // decode state written via the MTP bootstrap channel before validating the
@@ -1030,11 +1060,12 @@ double ProfileManager::run_request(int32_t token_length,
   // maybe another sequence for extra token length (< token_length) for token
   // budget profiling
   if (extra_token_length > 0) {
-    std::shared_ptr<Request> request =
-        generate_single_request(token_length, prefix_length, is_graph_warmup);
+    CHECK_GT(extra_token_length, prefix_length);
+    std::shared_ptr<Request> request = generate_single_request(
+        extra_token_length, prefix_length, is_graph_warmup);
     requests.emplace_back(request);
     sequences.emplace_back(request->sequences()[0].get());
-    sequences_budget.emplace_back(token_length - prefix_length);
+    sequences_budget.emplace_back(extra_token_length - prefix_length);
   }
   // build batch
   auto batches = BatchFactory::get_instance(options_.dp_size())
@@ -1291,12 +1322,30 @@ void ProfileManager::warmup_prefill_for_graph() {
     }
     prefill_tokens = std::min(prefill_tokens, per_group_cap);
   }
+  int32_t prefill_batch_size = 1;
+  int32_t extra_token_length = 0;
+  if (has_linear_attention_layers(model_args)) {
+    const int32_t chunk_stride =
+        SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+    CHECK_GT(chunk_stride, 0);
+    CHECK_GT(prefill_tokens, 0);
+    CHECK_GT(options_.max_seqs_per_batch(), 0);
+    const int32_t sequence_tokens = std::min(prefill_tokens, chunk_stride);
+    prefill_batch_size = std::min(options_.max_seqs_per_batch(),
+                                  prefill_tokens / sequence_tokens);
+    if (prefill_batch_size < options_.max_seqs_per_batch()) {
+      extra_token_length = prefill_tokens % sequence_tokens;
+    }
+    prefill_tokens = sequence_tokens;
+  }
   double prefill_latency = run_request(prefill_tokens,
                                        /*prefix_length=*/0,
-                                       /*batch_size=*/1,
-                                       /*extra_token_length=*/0,
+                                       prefill_batch_size,
+                                       extra_token_length,
                                        /*is_graph_warmup=*/true);
   LOG(INFO) << "Prefill warmup completed: tokens=" << prefill_tokens
+            << ", batch_size=" << prefill_batch_size
+            << ", extra_token_length=" << extra_token_length
             << ", latency=" << prefill_latency << " ms";
 }
 

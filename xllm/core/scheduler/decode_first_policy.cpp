@@ -90,7 +90,7 @@ void DecodeFirstPolicy::schedule(
   }
 
   // Step 3: redistribute remaining budget to prefill sequences.
-  if (budget.remaining_token_budget > 0 &&
+  if (!state.has_linear_attention_layers && budget.remaining_token_budget > 0 &&
       budget.latency_budget > budget.estimate_latency) {
     std::vector<Sequence*> prefill_stage_sequences;
     for (size_t i = 0; i < state.running_sequences.size(); ++i) {

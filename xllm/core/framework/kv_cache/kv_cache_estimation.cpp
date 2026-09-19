@@ -283,10 +283,7 @@ int64_t max_linear_state_blocks(int64_t cache_size_in_bytes,
 int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
                                       int64_t state_slot_bytes,
                                       int64_t full_cache_block_size_in_bytes,
-                                      int64_t max_seqs_per_batch,
-                                      int64_t max_concurrent_requests,
-                                      int64_t max_linear_state_cache_slots,
-                                      bool enable_prefix_cache) {
+                                      int64_t max_linear_state_cache_slots) {
   CHECK_GE(max_linear_state_cache_slots, 0)
       << "max_linear_state_cache_slots must be greater than or equal to 0.";
   if (state_slot_bytes <= 0) {
@@ -302,20 +299,6 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
         << " linear-state blocks, but only " << max_blocks
         << " fit in the configured KV cache budget.";
     return requested_blocks;
-  }
-
-  if (!enable_prefix_cache) {
-    // Slots must cover every simultaneously running sequence, bounded by
-    // both the scheduler batch limit and the service concurrency cap.
-    int64_t running_seqs_upper_bound = max_seqs_per_batch;
-    if (max_concurrent_requests > 0) {
-      running_seqs_upper_bound =
-          std::min<int64_t>(running_seqs_upper_bound, max_concurrent_requests);
-    }
-    const int64_t live_slot_blocks =
-        running_seqs_upper_bound + kPaddingLinearStateBlocks;
-    return std::max<int64_t>(std::min<int64_t>(live_slot_blocks, max_blocks),
-                             kPaddingLinearStateBlocks);
   }
 
   // Auto-size: allocate ~47% of cache bytes to linear-state slots (ratio 0.9
@@ -603,10 +586,7 @@ void init_standard_counts(const ModelArgs& model_args,
       calculate_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
                                     total_state_bytes,
                                     full_cache_block_size_in_bytes,
-                                    options.max_seqs_per_batch,
-                                    options.max_concurrent_requests,
-                                    options.max_linear_state_cache_slots,
-                                    options.enable_prefix_cache);
+                                    options.max_linear_state_cache_slots);
 #if defined(USE_NPU)
   if (is_qwen3_5_target_model_type(model_args.model_type()) &&
       kv_cache_cap->num_linear_attention_layers() > 0) {

@@ -117,9 +117,6 @@ class SpeculativeWorkerImpl : public WorkerImpl {
     return impl_->prepare_inputs(batch);
   };
 
-  // prepare work before model execution
-  void prepare_work_before_execute(const ForwardInput& input,
-                                   ForwardInput& new_input) override;
   void restore_json_object_states(ForwardInput& input) override;
 
   // Common step dispatch: prefill / decode / empty

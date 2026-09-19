@@ -235,8 +235,22 @@ void UnifiedPolicy::schedule_from_unified_queue(
             static_cast<size_t>(options_.max_tokens_per_chunk_for_prefill());
         max_handle_num_tokens =
             std::min(max_handle_num_tokens, kv_cache_tokens_num + max_chunk);
+        max_handle_num_tokens = compute_prefill_target(
+            sequence.get(),
+            kv_cache_tokens_num,
+            state.has_linear_attention_layers
+                ? std::min(max_handle_num_tokens - kv_cache_tokens_num,
+                           budget.remaining_token_budget - allocated_tokens)
+                : max_handle_num_tokens - kv_cache_tokens_num,
+            state);
+        if (max_handle_num_tokens == kv_cache_tokens_num) {
+          budget_exhausted = true;
+          break;
+        }
       }
       if (options_.num_speculative_tokens() > 0 &&
+          !(state.has_linear_attention_layers &&
+            sequence->is_prefill_stage()) &&
           !sequence->is_chunked_prefill_stage() && kv_cache_tokens_num > 0) {
         max_handle_num_tokens += state.min_speculative_tokens_required;
       }
@@ -300,6 +314,10 @@ void UnifiedPolicy::schedule_from_unified_queue(
             {StatusCode::RESOURCE_EXHAUSTED,
              "No enough resource to schedule a single sequence"});
       }
+      break;
+    }
+
+    if (state.has_inflight_linear_state) {
       break;
     }
 

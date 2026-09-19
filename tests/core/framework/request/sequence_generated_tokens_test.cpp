@@ -17,9 +17,13 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "framework/request/incremental_decoder.h"
+#include "framework/request/request.h"
 #include "framework/request/sequence.h"
 
 namespace xllm {
@@ -58,6 +62,76 @@ Sequence make_decode_ready_sequence(bool enable_schedule_overlap) {
   sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
   return sequence;
 }
+
+class GeneratedTokenTokenizer final : public Tokenizer {
+ public:
+  std::string decode(const Slice<int32_t>& ids, bool) const override {
+    std::string text;
+    for (const int32_t token_id : ids) {
+      text.push_back(static_cast<char>(token_id));
+    }
+    return text;
+  }
+};
+
+class RequestGeneratedTokensTest
+    : public ::testing::TestWithParam<std::tuple<bool, size_t, size_t>> {};
+
+TEST_P(RequestGeneratedTokensTest, UsageCountsOnlyCommittedTokens) {
+  const auto [enable_overlap, committed_tokens, placeholder_tokens] =
+      GetParam();
+  const std::vector<int32_t> prompt_tokens = {'P'};
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  RequestState state(
+      "P",
+      prompt_tokens,
+      sampling_param,
+      SchedulerParam{},
+      stopping_checker,
+      32,
+      1,
+      1,
+      false,
+      false,
+      false,
+      true,
+      enable_overlap,
+      [](const RequestOutput&) { return true; },
+      OutputsFunc{});
+  Request request("generated-token-usage", "", "", std::move(state));
+  Sequence& sequence = *request.sequences()[0];
+  sequence.kv_state().set_kv_cache_tokens_num(prompt_tokens.size());
+  for (size_t index = 0; index < committed_tokens; ++index) {
+    if (enable_overlap) {
+      sequence.append_token(Token(-1));
+      sequence.update_last_step_token(Token('A'), 0);
+    } else {
+      sequence.append_token(Token('A'));
+    }
+  }
+  for (size_t index = 0; index < placeholder_tokens; ++index) {
+    sequence.append_token(Token(-1));
+  }
+  GeneratedTokenTokenizer tokenizer;
+  RequestOutput output = request.generate_output(tokenizer);
+  ASSERT_TRUE(output.usage.has_value());
+  EXPECT_EQ(output.usage->num_prompt_tokens, prompt_tokens.size());
+  EXPECT_EQ(output.usage->num_generated_tokens, committed_tokens);
+  EXPECT_EQ(output.usage->num_total_tokens,
+            prompt_tokens.size() + committed_tokens);
+}
+
+INSTANTIATE_TEST_SUITE_P(OverlapPadding,
+                         RequestGeneratedTokensTest,
+                         ::testing::Values(std::make_tuple(false, 0u, 0u),
+                                           std::make_tuple(false, 3u, 0u),
+                                           std::make_tuple(true, 0u, 0u),
+                                           std::make_tuple(true, 0u, 1u),
+                                           std::make_tuple(true, 0u, 2u),
+                                           std::make_tuple(true, 3u, 0u),
+                                           std::make_tuple(true, 3u, 1u),
+                                           std::make_tuple(true, 3u, 2u)));
 
 }  // namespace
 

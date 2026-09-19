@@ -199,6 +199,7 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
         num_decoding_tokens, min_decoding_batch_size, args);
   }
   refresh_output_targets();
+  retain_linear_state_blocks();
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,
                             input_embeddings_vec_,
@@ -208,10 +209,8 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                             &args,
                             batch_forward_type_,
                             cp_size);
-  ForwardInput forward_input =
-      builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
-  linear_restore_src_blocks_ = builder.take_linear_restore_src_blocks();
-  return forward_input;
+  return builder.build_forward_input(num_decoding_tokens,
+                                     min_decoding_batch_size);
 }
 
 ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
@@ -238,6 +237,7 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
     }
   }
 
+  retain_linear_state_blocks();
   auto builder = RecBatchInputBuilder::create(rec_type,
                                               sequence_groups_,
                                               allowed_max_tokens_,
@@ -418,6 +418,7 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
                                           int32_t cp_size) {
   dp_balance_shuffle_seqs();
   refresh_output_targets();
+  retain_linear_state_blocks();
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,
                             input_embeddings_vec_,
@@ -431,13 +432,23 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
   ForwardInput forward_input =
       builder.build_forward_input(/*num_decoding_tokens=*/0,
                                   /*min_decoding_batch_size=*/0);
-  linear_restore_src_blocks_ = builder.take_linear_restore_src_blocks();
   if (has_partial_finished_beam_group()) {
     // Beam-search kernel assumes fixed beam width per group. When only part of
     // a group is active, fall back to software beam merge.
     forward_input.sampling_params.acc_logprob = torch::Tensor();
   }
   return forward_input;
+}
+
+void Batch::retain_linear_state_blocks() {
+  linear_state_blocks_.clear();
+  const std::vector<Sequence*> sequences = get_sequences();
+  linear_state_blocks_.reserve(sequences.size() * 2);
+  for (Sequence* sequence : sequences) {
+    const auto& blocks = sequence->kv_state().blocks(BlockType::LINEAR);
+    linear_state_blocks_.insert(
+        linear_state_blocks_.end(), blocks.begin(), blocks.end());
+  }
 }
 
 void Batch::refresh_output_targets() {

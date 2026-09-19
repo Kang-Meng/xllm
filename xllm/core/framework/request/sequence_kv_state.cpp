@@ -48,6 +48,11 @@ size_t KVCacheState::kv_cache_tokens_num() const {
 
 void KVCacheState::set_kv_cache_tokens_num(size_t num) {
   kv_cache_tokens_num_ = num;
+  last_confirmed_cached_tokens_ = std::min(last_confirmed_cached_tokens_, num);
+}
+
+void KVCacheState::set_last_confirmed_cached_tokens(size_t num_tokens) {
+  last_confirmed_cached_tokens_ = std::min(kv_cache_tokens_num_, num_tokens);
 }
 
 void KVCacheState::incr_kv_cache_tokens_num(size_t num) {
@@ -153,10 +158,6 @@ void KVCacheState::erase_blocks(BlockType type) {
   block_sizes_.erase(type);
   num_owned_shared_blocks_.erase(type);
   num_cached_blocks_.erase(type);
-  if (type == BlockType::LINEAR) {
-    pending_linear_save_hash_.reset();
-    linear_restore_src_block_.reset();
-  }
 }
 
 std::vector<Block> KVCacheState::take_blocks(BlockType type) {
@@ -177,12 +178,12 @@ std::vector<Block> KVCacheState::take_blocks(BlockType type) {
 
 Block KVCacheState::copy_block(BlockType type) const {
   DCHECK(type == BlockType::EMBEDDING || type == BlockType::LINEAR)
-      << "copy_block is for singleton block types only";
+      << "copy_block requires an embedding or linear-state block";
   auto it = composite_blocks_.find(type);
   if (it == composite_blocks_.end() || it->second.empty()) {
     return Block();
   }
-  return it->second[0];
+  return type == BlockType::LINEAR ? it->second.back() : it->second.front();
 }
 
 size_t KVCacheState::shared_blocks_num(BlockType type) const {
@@ -263,6 +264,7 @@ void KVCacheState::add_shared_blocks(BlockType type,
   num_cached_blocks_[type] = shared;
   // update the kv cache position
   kv_cache_tokens_num_ = num_shared_tokens;
+  last_confirmed_cached_tokens_ = num_shared_tokens;
 }
 
 void KVCacheState::mount_composite_shared(BlockType type,
@@ -387,12 +389,10 @@ int32_t KVCacheState::get_embedding_block_id() const {
 }
 
 int32_t KVCacheState::get_linear_block_id() const {
-  const auto it = composite_blocks_.find(BlockType::LINEAR);
-  if (it == composite_blocks_.end() || it->second.empty() ||
-      !it->second[0].is_valid()) {
-    return -1;
-  }
-  return it->second[0].id();
+  const Slice<Block> linear_blocks = blocks(BlockType::LINEAR);
+  return linear_blocks.empty() || !linear_blocks.back().is_valid()
+             ? -1
+             : linear_blocks.back().id();
 }
 
 void KVCacheState::set_transfer_kv_info(TransferKVInfo&& info) {
@@ -427,6 +427,7 @@ void KVCacheState::advance_group_transfer_block_idx(BlockType type,
 }
 
 void KVCacheState::reset() {
+  last_confirmed_cached_tokens_ = 0;
   kv_cache_tokens_num_ = 0;
   prefix_cache_matched_ = false;
   num_owned_shared_blocks_.clear();
@@ -438,8 +439,6 @@ void KVCacheState::reset() {
   need_swap_ = false;
   transfer_kv_info_.reset();
   next_transfer_block_idx_ = 0;
-  pending_linear_save_hash_.reset();
-  linear_restore_src_block_.reset();
   next_group_transfer_block_idxes_.clear();
 }
 

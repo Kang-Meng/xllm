@@ -71,6 +71,7 @@ struct SchedulerState {
   int32_t min_speculative_tokens_required;
   bool enable_prefix_cache;
   bool has_linear_attention_layers;
+  bool has_inflight_linear_state = false;
   std::function<void(const std::shared_ptr<Request>&)> release_failed_request =
       {};
 };
@@ -174,6 +175,10 @@ class SchedulerPolicy {
                             size_t* actual_tokens,
                             SchedulerState& state,
                             bool skip_shared = false);
+  size_t compute_prefill_target(Sequence* seq,
+                                size_t cached_tokens,
+                                size_t token_budget,
+                                const SchedulerState& state) const;
   void allocate_shared_blocks_for(Sequence* seq, SchedulerState& state);
   void schedule_decode_restore(SchedulerState& state, ScheduleBudget& budget);
 
