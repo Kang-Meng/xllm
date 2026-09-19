@@ -2298,7 +2298,9 @@ TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {
             expected_linear_id);
 }
 
-TEST(BatchTest, LinearReadWriteOwnershipStaysInSequence) {
+class LinearBatchLifetimeTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(LinearBatchLifetimeTest, PinsReadAndWriteSlotsUntilBatchCompletion) {
   ScopedPrefillChunkStride chunk_stride(4);
   ScopedModelImpl model_impl("native");
   BlockManager::Options options;
@@ -2317,7 +2319,8 @@ TEST(BatchTest, LinearReadWriteOwnershipStaysInSequence) {
   batch->add(&sequence, 4);
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
-  ForwardInput input = batch->prepare_forward_input(0, 0, args);
+  ForwardInput input = GetParam() ? batch->prepare_forward_input(args, nullptr)
+                                  : batch->prepare_forward_input(0, 0, args);
   ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
   EXPECT_FALSE(
       (input.input_params.attention.host.kv_cache_tokens_nums.front() == 0 &&
@@ -2330,16 +2333,27 @@ TEST(BatchTest, LinearReadWriteOwnershipStaysInSequence) {
   EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
-  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[0].ref_count(), 1u);
-  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[1].ref_count(), 1u);
   EXPECT_TRUE(manager.allocate(1).empty());
   release_linear_source_for_test(sequence);
-  std::vector<Block> reclaimed = manager.allocate(1);
-  ASSERT_EQ(reclaimed.size(), 1u);
-  EXPECT_EQ(reclaimed.front().id(), source_id);
+  EXPECT_TRUE(manager.allocate(1).empty());
+  sequence.kv_state().mutable_blocks(BlockType::LINEAR)->clear();
+  EXPECT_TRUE(manager.allocate(1).empty());
+  std::optional<Batch> moved_batch(std::move(*batch));
   batch.reset();
-  EXPECT_EQ(reclaimed.front().ref_count(), 1u);
+  EXPECT_TRUE(manager.allocate(1).empty());
+  moved_batch.reset();
+  std::vector<Block> reclaimed = manager.allocate(2);
+  ASSERT_EQ(reclaimed.size(), 2u);
+  std::vector<int32_t> reclaimed_ids = {reclaimed[0].id(), reclaimed[1].id()};
+  std::sort(reclaimed_ids.begin(), reclaimed_ids.end());
+  std::vector<int32_t> expected_ids = {source_id, output_id};
+  std::sort(expected_ids.begin(), expected_ids.end());
+  EXPECT_EQ(reclaimed_ids, expected_ids);
 }
+
+INSTANTIATE_TEST_SUITE_P(ForwardInputPaths,
+                         LinearBatchLifetimeTest,
+                         ::testing::Bool());
 
 #if defined(USE_NPU)
 TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
@@ -2388,10 +2402,11 @@ TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
   ASSERT_EQ(remaining.size(), 1u);
   EXPECT_TRUE(manager.allocate(1).empty());
   release_linear_source_for_test(sequence);
+  EXPECT_TRUE(manager.allocate(1).empty());
+  batch.reset();
   std::vector<Block> reclaimed = manager.allocate(1);
   ASSERT_EQ(reclaimed.size(), 1u);
   EXPECT_EQ(reclaimed.front().id(), source_id);
-  batch.reset();
   EXPECT_EQ(reclaimed.front().ref_count(), 1u);
 }
 
@@ -2684,7 +2699,7 @@ TEST(BatchTest, DecodeKeepsSingleTailWithoutRestore) {
             sequence.get_linear_state_slot_id());
 }
 
-TEST(BatchTest, DecodeDestinationOwnershipStaysInSequence) {
+TEST(BatchTest, DecodeDestinationRemainsPinnedUntilBatchCompletion) {
   ScopedPrefillChunkStride chunk_stride(4);
   BlockManager::Options options;
   options.num_blocks(3).block_size(4);
@@ -2703,14 +2718,13 @@ TEST(BatchTest, DecodeDestinationOwnershipStaysInSequence) {
   ForwardInput input = batch->prepare_forward_input(1, 0, args);
   ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
   EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
-  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
-            1u);
   EXPECT_TRUE(manager.allocate(1).empty());
   sequence.kv_state().mutable_blocks(BlockType::LINEAR)->clear();
+  EXPECT_TRUE(manager.allocate(1).empty());
+  batch.reset();
   std::vector<Block> reclaimed = manager.allocate(1);
   ASSERT_EQ(reclaimed.size(), 1u);
   EXPECT_EQ(reclaimed.front().id(), output_id);
-  batch.reset();
   EXPECT_EQ(reclaimed.front().ref_count(), 1u);
 }
 
@@ -2749,9 +2763,10 @@ TEST(BatchTest, DecodeRotationSerializesIndependentReadAndWriteSlots) {
             std::vector<int32_t>({output_id}));
   EXPECT_TRUE(manager.allocate(1).empty());
   sequence.kv_state().erase_blocks(BlockType::LINEAR);
+  EXPECT_TRUE(manager.allocate(1).empty());
+  batch.reset();
   std::vector<Block> reclaimed = manager.allocate(2);
   ASSERT_EQ(reclaimed.size(), 2u);
-  batch.reset();
   for (const Block& block : reclaimed) {
     EXPECT_EQ(block.ref_count(), 1u);
   }
@@ -3078,18 +3093,14 @@ TEST(BatchTest, ThreadedInputBuildKeepsLinearOwnershipInSequences) {
   EXPECT_TRUE(manager.allocate(1).empty());
   release_linear_source_for_test(first_sequence);
   release_linear_source_for_test(second_sequence);
-  std::vector<Block> reclaimed_sources = manager.allocate(2);
-  ASSERT_EQ(reclaimed_sources.size(), 2u);
+  EXPECT_TRUE(manager.allocate(1).empty());
   first_sequence.kv_state().erase_blocks(BlockType::LINEAR);
   second_sequence.kv_state().erase_blocks(BlockType::LINEAR);
-  std::vector<Block> reclaimed_outputs = manager.allocate(2);
-  ASSERT_EQ(reclaimed_outputs.size(), 2u);
   EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
-  for (const Block& block : reclaimed_sources) {
-    EXPECT_EQ(block.ref_count(), 1u);
-  }
-  for (const Block& block : reclaimed_outputs) {
+  std::vector<Block> reclaimed = manager.allocate(4);
+  ASSERT_EQ(reclaimed.size(), 4u);
+  for (const Block& block : reclaimed) {
     EXPECT_EQ(block.ref_count(), 1u);
   }
 }

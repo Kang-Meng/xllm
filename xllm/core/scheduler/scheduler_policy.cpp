@@ -700,6 +700,9 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
         }
 
         if (allocate_failed) {
+          if (state.has_inflight_linear_state) {
+            return;
+          }
           LOG(ERROR) << "Beam strict scheduling allocation failed. "
                      << "request_id=" << request->request_id()
                      << ", beam=" << request->check_beam_search();
@@ -797,7 +800,8 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
     // Blocks exhausted: wait for an in-flight async release before selecting
     // another victim. The released blocks remain unavailable until the
     // transfer completes.
-    if (state.kv_cache_manager->has_pending_async_block_release()) {
+    if (state.has_inflight_linear_state ||
+        state.kv_cache_manager->has_pending_async_block_release()) {
       return;
     }
 
@@ -933,6 +937,9 @@ void SchedulerPolicy::handle_unschedulable_head(
     std::vector<std::shared_ptr<Request>>& finished,
     bool budget_exhausted,
     bool blocks_exhausted) {
+  if (blocks_exhausted && state.has_inflight_linear_state) {
+    return;
+  }
   if (state.running_sequences.empty() && !queue->empty() &&
       state.decode_queue.empty()) {
     std::shared_ptr<Request> request(queue->top());

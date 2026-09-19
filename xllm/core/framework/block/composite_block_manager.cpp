@@ -164,12 +164,6 @@ CompositeBlockManager::LeafMap build_composite_leaves(
   const bool kv_participates =
       leaf_participates_in_prefix_cache(BlockType::KV, is_decode);
 
-  // LINEAR resource leaf (Qwen3.5-Next GDN). Additive on top of the KV
-  // family: a GDN model holds both KV and LINEAR. Not an admission leaf
-  // (block_size==1 would misreport pool capacity). Scheduler-thread only, so
-  // no ConcurrentBlockManagerImpl wrap. supports_prefix_cache follows the
-  // role predicate; on DECODE it is off so probe_prefix_cache skips the
-  // leaf and the composite classifies FLAT_KV_LINEAR down to FLAT_KV.
   if (options.enable_linear_state()) {
     CHECK_GT(options.linear_state_num_slots(), 0)
         << "linear_state_num_slots must be set when linear state is enabled";
@@ -185,12 +179,14 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     leaves.emplace(
         BlockType::LINEAR,
         CompositeBlockManager::LeafEntry{
-            std::make_unique<LinearStateBlockManager>(
-                static_cast<uint32_t>(options.linear_state_num_slots()),
-                chunk_stride,
-                linear_prefix_cache,
-                is_decode,
-                options.num_speculative_tokens()),
+            maybe_concurrent(
+                std::make_unique<LinearStateBlockManager>(
+                    static_cast<uint32_t>(options.linear_state_num_slots()),
+                    chunk_stride,
+                    linear_prefix_cache,
+                    is_decode,
+                    options.num_speculative_tokens()),
+                options),
             /*participates_in_admission=*/false,
             /*supports_prefix_cache=*/linear_prefix_cache});
   }

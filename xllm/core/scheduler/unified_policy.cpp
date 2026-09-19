@@ -317,6 +317,10 @@ void UnifiedPolicy::schedule_from_unified_queue(
       break;
     }
 
+    if (state.has_inflight_linear_state) {
+      break;
+    }
+
     // Memory exhausted -- preempt lowest priority request.
     bool find_preempt = false;
     while (is_preempt_iterator_valid && preempt_iterator != unified.begin()) {

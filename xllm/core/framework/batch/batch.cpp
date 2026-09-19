@@ -199,6 +199,7 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
         num_decoding_tokens, min_decoding_batch_size, args);
   }
   refresh_output_targets();
+  retain_linear_state_blocks();
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,
                             input_embeddings_vec_,
@@ -236,6 +237,7 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
     }
   }
 
+  retain_linear_state_blocks();
   auto builder = RecBatchInputBuilder::create(rec_type,
                                               sequence_groups_,
                                               allowed_max_tokens_,
@@ -416,6 +418,7 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
                                           int32_t cp_size) {
   dp_balance_shuffle_seqs();
   refresh_output_targets();
+  retain_linear_state_blocks();
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,
                             input_embeddings_vec_,
@@ -435,6 +438,17 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
     forward_input.sampling_params.acc_logprob = torch::Tensor();
   }
   return forward_input;
+}
+
+void Batch::retain_linear_state_blocks() {
+  linear_state_blocks_.clear();
+  const std::vector<Sequence*> sequences = get_sequences();
+  linear_state_blocks_.reserve(sequences.size() * 2);
+  for (Sequence* sequence : sequences) {
+    const auto& blocks = sequence->kv_state().blocks(BlockType::LINEAR);
+    linear_state_blocks_.insert(
+        linear_state_blocks_.end(), blocks.begin(), blocks.end());
+  }
 }
 
 void Batch::refresh_output_targets() {

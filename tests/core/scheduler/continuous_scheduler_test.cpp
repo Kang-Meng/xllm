@@ -382,7 +382,60 @@ void set_chunk_kv(const std::shared_ptr<Request>& request, size_t kv_tokens) {
   }
 }
 
+class OverlapDrainEngine final : public FakeEngine {
+ public:
+  OverlapDrainEngine() : FakeEngine(32, 4) {}
+
+  void update_last_step_result(std::vector<Batch>& batch) override {
+    ++completed_batches_;
+  }
+
+  size_t completed_batches() const { return completed_batches_; }
+
+ private:
+  size_t completed_batches_ = 0;
+};
+
+class BlockedOverlapScheduler final : public ContinuousScheduler {
+ public:
+  BlockedOverlapScheduler(Engine* engine,
+                          const Options& options,
+                          Sequence* sequence)
+      : ContinuousScheduler(engine, options) {
+    last_batch_.emplace_back(sequence);
+    is_first_step_ = false;
+  }
+
+  size_t prepare_calls() const { return prepare_calls_; }
+
+ protected:
+  std::vector<Batch> prepare_batch() override {
+    ++prepare_calls_;
+    return std::vector<Batch>(1);
+  }
+
+  bool if_queue_not_empty() override { return prepare_calls_ < 3; }
+
+ private:
+  size_t prepare_calls_ = 0;
+};
+
 }  // namespace
+
+TEST(ContinuousSchedulerTest, DrainsInflightBatchBeforeRetryingBlockedQueue) {
+  auto request = generate_request_with_prompt_tokens({1, 2, 3, 4}, 4, 30000);
+  OverlapDrainEngine engine;
+  ContinuousScheduler::Options options =
+      create_scheduler_options(1024, 16, 0, 1024, 1);
+  options.enable_schedule_overlap(true);
+  BlockedOverlapScheduler scheduler(
+      &engine, options, request->sequences().front().get());
+
+  scheduler.step(absl::ZeroDuration());
+
+  EXPECT_EQ(scheduler.prepare_calls(), 1u);
+  EXPECT_EQ(engine.completed_batches(), 1u);
+}
 
 TEST(ContinuousSchedulerFactoryTest,
      ChunkedPrefillWithoutSPCreatesContinuousScheduler) {

@@ -379,6 +379,11 @@ SchedulerState ContinuousScheduler::make_state() {
       .min_speculative_tokens_required = min_speculative_tokens_required_,
       .enable_prefix_cache = enable_prefix_cache_,
       .has_linear_attention_layers = has_linear_attention_layers_,
+      .has_inflight_linear_state =
+          has_linear_attention_layers_ && options_.enable_schedule_overlap() &&
+          std::any_of(last_batch_.begin(),
+                      last_batch_.end(),
+                      [](const Batch& pending) { return !pending.empty(); }),
       .release_failed_request =
           [this](const std::shared_ptr<Request>& request) {
             release_failed_request(request);
@@ -398,6 +403,13 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
           return one_batch.empty();
         });
     if (!all_empty) {
+      return batch;
+    }
+
+    if (options_.enable_schedule_overlap() &&
+        std::any_of(last_batch_.begin(),
+                    last_batch_.end(),
+                    [](const Batch& pending) { return !pending.empty(); })) {
       return batch;
     }
 
