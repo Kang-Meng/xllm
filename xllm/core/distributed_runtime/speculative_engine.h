@@ -53,8 +53,7 @@ class SpeculativeEngineBase : public Engine {
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
       override;
 
-  runtime::DecodeGraphExecutionShape decode_graph_execution_shape()
-      const override;
+  runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const override;
 
   const TokenizerArgs& tokenizer_args() const override {
     return engine_->tokenizer_args();

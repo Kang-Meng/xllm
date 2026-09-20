@@ -58,8 +58,7 @@ class LLMEngine : public Engine {
 
   const runtime::Options& options() const { return options_; }
 
-  runtime::DecodeGraphExecutionShape decode_graph_execution_shape()
-      const override;
+  runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const override;
 
   bool init(MasterStatus master_status) override;
 

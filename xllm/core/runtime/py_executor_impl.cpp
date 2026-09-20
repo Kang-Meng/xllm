@@ -208,7 +208,7 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       // Slot order must match ``LayerCache`` on the Python side.
       // Keep this order synchronized with LayerCache/_LAYER_CACHE_SLOTS.
       // Generic caches use the first five entries; DeepSeek-V4 uses the
-      // trailing six entries returned by KVCache's DSV4 getters.
+      // next six, and GLM5 uses the final KPOOL_TAIL entry.
       kv_caches_py.append(
           py::make_tuple(optional_tensor(kv.get_k_cache()),
                          optional_tensor(kv.get_v_cache()),
@@ -220,7 +220,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                          optional_tensor(kv.get_compress_score_state()),
                          optional_tensor(kv.get_compress_index_kv_state()),
                          optional_tensor(kv.get_compress_index_score_state()),
-                         optional_tensor(kv.get_indexer_cache_scale())));
+                         optional_tensor(kv.get_indexer_cache_scale()),
+                         optional_tensor(kv.get_kpool_tail())));
     }
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
     kv_bound_ = true;

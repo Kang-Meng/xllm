@@ -45,6 +45,7 @@ limitations under the License.
 #include "framework/model/model_args.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "platform/platform.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/params_utils.h"
 #include "runtime/worker.h"
@@ -88,6 +89,20 @@ VLMEngine::VLMEngine(const runtime::Options& options,
       /*num_threads=*/16,
       /*cpu_binding=*/false,
       /*pool_name=*/"VLMEngine.forward_input");
+}
+
+runtime::DecodeGraphWarmupConfig VLMEngine::decode_graph_warmup_config() const {
+  if (!Platform::is_npu()) {
+    return {};
+  }
+  runtime::DecodeGraphWarmupConfig warmup_config;
+  warmup_config.num_decoding_tokens = options_.num_decoding_tokens();
+  warmup_config.num_speculative_tokens = options_.num_speculative_tokens();
+  warmup_config.enable_graph_mode_decode_no_padding =
+      options_.enable_graph_mode_decode_no_padding();
+  warmup_config.max_graph_batch_size =
+      ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit();
+  return warmup_config;
 }
 
 void VLMEngine::process_group_test() {
@@ -273,6 +288,10 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
       static_cast<int64_t>(options_.max_seqs_per_batch());
   estimate_options.max_concurrent_requests = static_cast<int64_t>(
       ::xllm::ServiceConfig::get_instance().max_concurrent_requests());
+  if (Platform::is_npu()) {
+    estimate_options.num_speculative_tokens =
+        static_cast<int64_t>(options_.num_speculative_tokens());
+  }
   estimate_options.max_tokens_per_batch =
       static_cast<int64_t>(options_.max_tokens_per_batch());
   estimate_options.max_tokens_per_chunk_for_prefill =

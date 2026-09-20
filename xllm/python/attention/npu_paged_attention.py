@@ -34,6 +34,7 @@ from xllm.python.attention.backend import (
     LayerCache,
     MlaIndexContext,
     MlaPreprocessContext,
+    resolve_linear_state_io_indices,
 )
 from xllm.python.attention.expanded_decode_metadata import (
     resolve_expanded_decode_metadata,
@@ -88,6 +89,30 @@ def _mla_graph_max_seqlen_k(
     if max_seqlen_k <= 0:
         raise RuntimeError("MLA graph block-table capacity must be positive")
     return max_seqlen_k
+
+
+def _is_compact_kpool_cache_compatible(cache: LayerCache) -> bool:
+    """Validate cache-only Triton invariants once when caches are bound."""
+    index_cache = cache.index
+    tail_cache = cache.kpool_tail
+    if index_cache is None or tail_cache is None:
+        return False
+    return (
+        index_cache.ndim == 4
+        and index_cache.shape[0] > 0
+        and index_cache.shape[1] > 0
+        and index_cache.shape[2] == 1
+        and index_cache.dtype == torch.bfloat16
+        and index_cache.is_contiguous()
+        and tail_cache.ndim == 4
+        and tail_cache.shape[0] > 1
+        and tail_cache.shape[1] == 2
+        and tail_cache.shape[3] == index_cache.shape[3]
+        and tail_cache.dtype == torch.bfloat16
+        and tail_cache.device == index_cache.device
+        and tail_cache.is_contiguous()
+        and index_cache.device.type in ("npu", "privateuseone")
+    )
 
 
 def _build_stable_sfa_page_layout(
@@ -196,6 +221,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._kda_verify_width = num_decoding_tokens
 
         self._kv_caches: list[LayerCache] = []
+        self._kpool_cache_triton_compatible: tuple[bool, ...] = ()
         self._num_kv_blocks: int | None = None
         self._page_size: int | None = None
         self._metadata: AttentionMetadata | None = None
@@ -306,6 +332,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             raise RuntimeError("full-attention layers use inconsistent KV block counts")
 
         self._kv_caches = kv_caches
+        self._kpool_cache_triton_compatible = tuple(_is_compact_kpool_cache_compatible(cache) for cache in kv_caches)
         self._page_size = page_sizes.pop()
         self._num_kv_blocks = num_kv_blocks.pop()
         has_sparse_index = any(cache.index is not None for cache in kv_caches)
@@ -906,6 +933,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         slot_mapping = metadata.local_slot_mapping if metadata.has_kv_shard else metadata.slot_mapping
         if slot_mapping is None:
             raise RuntimeError("MLA index cache requires a slot mapping")
+        kpool_tail_read_indices = None
+        kpool_tail_write_indices = None
+        if layer_cache.kpool_tail is not None:
+            kpool_tail_read_indices, kpool_tail_write_indices = resolve_linear_state_io_indices(metadata)
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=slot_mapping,
@@ -938,6 +969,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 get_forward_context().cp_context,
             ),
             cp_context=get_forward_context().cp_context,
+            kpool_tail=layer_cache.kpool_tail,
+            kpool_tail_read_indices=kpool_tail_read_indices,
+            kpool_tail_write_indices=kpool_tail_write_indices,
+            kpool_query_lens=tuple(getattr(metadata, "kpool_query_lens", ())),
+            kpool_query_lens_device=getattr(metadata, "kpool_query_lens_device", None),
+            kpool_cache_triton_compatible=self._kpool_cache_triton_compatible[layer.layer_id],
         )
 
     def _get_quant_indexer_metadata(

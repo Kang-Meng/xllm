@@ -87,9 +87,9 @@ SuffixSpeculativeEngine::SuffixSpeculativeEngine(
     : SpeculativeEngineBase<LLMEngine>(options, /*use_draft_engine=*/false) {}
 
 template <typename TargetEngine>
-runtime::DecodeGraphExecutionShape
-SpeculativeEngineBase<TargetEngine>::decode_graph_execution_shape() const {
-  return engine_->decode_graph_execution_shape();
+runtime::DecodeGraphWarmupConfig
+SpeculativeEngineBase<TargetEngine>::decode_graph_warmup_config() const {
+  return engine_->decode_graph_warmup_config();
 }
 
 template <typename TargetEngine>

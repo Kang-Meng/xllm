@@ -56,6 +56,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_verify.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
+#include "core/platform/platform.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
@@ -3650,6 +3651,11 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
+  const bool requires_uniform_rows =
+      Platform::is_npu() && is_glm5_next_target_model_type(
+                                impl_->context_.get_model_args().model_type());
+  const bool use_uniform_two_rows = should_use_uniform_two_draft_rows(
+      last_states, force_two_rows, dp_enabled, requires_uniform_rows);
 
   const int32_t logical_block_size =
       options_.block_size() * parallel_args_.kv_split_size_effective();
@@ -3738,12 +3744,9 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       selected_row_idx.emplace_back(2 * seq_id + 1);
       continue;
     }
-    // Keep DP draft-extend rows uniform. Empty DP ranks skip draft preparation,
-    // so this path must not depend on a row-count collective reached by only
-    // active ranks.
-    const bool use_two_rows =
-        force_two_rows || dp_enabled || state.all_draft_accepted;
-    if (use_two_rows) {
+    const bool sequence_uses_two_rows =
+        use_uniform_two_rows || state.all_draft_accepted;
+    if (sequence_uses_two_rows) {
       int32_t prev_token_id = state.prev_token_id;
       int32_t prev_position_offset = -1;
       torch::Tensor prev_embedding = state.prev_embedding;
@@ -3876,7 +3879,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       params.selected_token_idxes.defined()
           ? params.selected_token_idxes.options()
           : torch::dtype(torch::kInt).device(device_);
-  if (use_chunked_prefill || dp_enabled || force_two_rows) {
+  if (use_chunked_prefill || use_uniform_two_rows) {
     // These layouts always append two rows per sequence and select the second
     // row.  Build the tiny control tensor directly on device; copying a
     // temporary pinned CPU tensor forces its allocator to synchronize before
@@ -3900,6 +3903,22 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   }
   extend_input.device_tensors_ready = true;
   finish_metadata_prepare(*prepare_stream_, extend_input);
+}
+
+bool MTPWorkerImpl::should_use_uniform_two_draft_rows(
+    const std::vector<EmbeddingCache::DecodeState>& last_states,
+    bool force_two_rows,
+    bool dp_enabled,
+    bool requires_uniform_rows) {
+  if (force_two_rows || dp_enabled) {
+    return true;
+  }
+  return requires_uniform_rows &&
+         std::any_of(last_states.begin(),
+                     last_states.end(),
+                     [](const EmbeddingCache::DecodeState& state) {
+                       return state.all_draft_accepted;
+                     });
 }
 
 void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,

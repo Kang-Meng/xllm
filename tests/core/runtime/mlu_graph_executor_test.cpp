@@ -96,15 +96,15 @@ TEST(DecodeGraphBucketTest, MapsTokenBucketsWithAndWithoutPadding) {
             17);
 }
 
-TEST(DecodeGraphExecutionShapeTest, DefaultEngineUsesSingleTokenDecodeShape) {
+TEST(DecodeGraphWarmupConfigTest, DefaultEngineUsesSingleTokenDecodeConfig) {
   CompatibilityShapeEngine engine;
 
-  const runtime::DecodeGraphExecutionShape execution_shape =
-      engine.decode_graph_execution_shape();
+  const runtime::DecodeGraphWarmupConfig warmup_config =
+      engine.decode_graph_warmup_config();
 
-  EXPECT_EQ(execution_shape.num_decoding_tokens, 1);
-  EXPECT_EQ(execution_shape.num_speculative_tokens, 0);
-  EXPECT_FALSE(execution_shape.enable_graph_mode_decode_no_padding);
+  EXPECT_EQ(warmup_config.num_decoding_tokens, 1);
+  EXPECT_EQ(warmup_config.num_speculative_tokens, 0);
+  EXPECT_FALSE(warmup_config.enable_graph_mode_decode_no_padding);
 }
 
 }  // namespace

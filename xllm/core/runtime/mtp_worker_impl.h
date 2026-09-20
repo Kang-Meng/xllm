@@ -204,6 +204,12 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
       ForwardInput& input,
       const std::vector<EmbeddingCache::DecodeState>& last_states) const;
 
+  static bool should_use_uniform_two_draft_rows(
+      const std::vector<EmbeddingCache::DecodeState>& last_states,
+      bool force_two_rows,
+      bool dp_enabled,
+      bool requires_uniform_rows);
+
   // Build draft-side input from cached target context at decode step start.
   void prepare_draft_extend_inputs(
       const ForwardInput& base_input,

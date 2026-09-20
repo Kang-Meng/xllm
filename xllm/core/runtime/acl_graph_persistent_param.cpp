@@ -1463,6 +1463,26 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       graph_params->linear_state_validity_mask.resize(
           static_cast<size_t>(padded_batch_size), 0);
     }
+    if (!params.attention.host.kpool_query_lens.empty()) {
+      graph_params->attention.host.kpool_query_lens =
+          params.attention.host.kpool_query_lens;
+      int64_t covered_tokens =
+          std::accumulate(graph_params->attention.host.kpool_query_lens.begin(),
+                          graph_params->attention.host.kpool_query_lens.end(),
+                          int64_t{0});
+      CHECK_EQ(covered_tokens, actual_num_tokens)
+          << "KPool query spans must cover every graph input token";
+      while (covered_tokens < padded_num_tokens) {
+        const int32_t padding_span = static_cast<int32_t>(std::min<int64_t>(
+            q_max_seq_len, padded_num_tokens - covered_tokens));
+        graph_params->attention.host.kpool_query_lens.emplace_back(
+            padding_span);
+        covered_tokens += padding_span;
+      }
+      CHECK_EQ(graph_params->attention.host.kpool_query_lens.size(),
+               static_cast<size_t>(padded_batch_size))
+          << "KPool graph spans must align with padded state rows";
+    }
 
     // Keep the capture contract aligned with replay: the expanded decoder does
     // not consume graph.attn_mask, so do not capture a stale persistent mask.
@@ -1510,11 +1530,10 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     // dp ep and cp ep are mutually exclusive; when neither is enabled the
     // src fields are all undefined and we leave dst untouched so that the
     // captured graph behaves identically to eager mode.
-    replace_capture_dp_ep_padding(
-        params.parallel.dp_ep_padding_data,
-        padded_num_tokens,
-        dp_layout_size,
-        graph_params->parallel.dp_ep_padding_data);
+    replace_capture_dp_ep_padding(params.parallel.dp_ep_padding_data,
+                                  padded_num_tokens,
+                                  dp_layout_size,
+                                  graph_params->parallel.dp_ep_padding_data);
     if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {
       // The mega active mask must come from the persistent buffer so captured
       // graphs read per-step mask content at a stable address on replay.

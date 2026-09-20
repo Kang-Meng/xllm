@@ -106,6 +106,8 @@ class _StaticAttentionMetadata:
     dp_execution_token_counts: tuple[int, ...] = ()
     dp_is_decode: tuple[int, ...] = ()
     q_seq_lens: torch.Tensor | None = None
+    kpool_query_lens: tuple[int, ...] = ()
+    kpool_query_lens_device: torch.Tensor | None = None
     # Host-side copy of the (per-entry constant) q_cu for prepare()'s
     # sequence-lens read: a .cpu() on the device buffer would block the host
     # until the whole prior step's device queue drains, serializing the
@@ -155,6 +157,7 @@ _GraphKey = tuple[
     torch.dtype | None,
     torch.device | None,
     tuple[int, ...] | None,
+    tuple[int, ...],
 ]
 
 
@@ -247,6 +250,15 @@ class DecodeAclGraphRunner(BaseRunner):
                     return False
         else:
             size_check_bs = batch_size
+        kpool_query_lens = tuple(int(length) for length in getattr(metadata, "kpool_query_lens", ()))
+        if kpool_query_lens:
+            if any(length <= 0 for length in kpool_query_lens) or sum(kpool_query_lens) != batch_size:
+                return False
+            query_width = kpool_query_lens[0]
+            if any(length != query_width for length in kpool_query_lens[1:]):
+                return False
+            if _decode_bucket(batch_size) % query_width != 0:
+                return False
         if self.dp_size > 1:
             # Prefill-typed batches exit before the DP contract check below
             # (a prefill without DP counts falls back to eager, never raises).
@@ -328,6 +340,7 @@ class DecodeAclGraphRunner(BaseRunner):
             if expanded is not None
             else getattr(metadata, "kv_seq_lens_host_values", None)
         )
+        paging_kv_seq_lens_host_values = kv_seq_lens_host_values
         if block_table is None or kv_seq_lens is None:
             raise RuntimeError("decode graph requires block and KV metadata")
         kv_seq_lens = kv_seq_lens.to(torch.int32)
@@ -357,16 +370,10 @@ class DecodeAclGraphRunner(BaseRunner):
         paged_kv_last_page_len = (
             expanded.paged_kv_last_page_len if expanded is not None else metadata.paged_kv_last_page_len
         )
-        # Rebuild the row-scoped paged metadata when it is missing OR when the
-        # C++ builder left it per-sequence while block_table/kv_seq_lens are
-        # per-token-row. Under MTP concurrency the batch is frequently MIXED
-        # (some sequences in verify with width>1, some in plain decode with
-        # width=1), so rows is not a uniform multiple of seqs and the
-        # _is_untyped_spec_verify uniform-width gate does not fire; the C++
-        # metadata builder expands bt/kv to token rows but leaves
-        # paged_kv_last_page_len/indptr per-sequence, yielding a numel mismatch
-        # that crashes _validate_decode_metadata_shapes. Rebuild from
-        # kv_seq_lens (per-token-row) so paging matches bt in every case.
+        # Speculative row builders provide row-aligned paging through the
+        # regular attention metadata. Keep the fallback for older producers,
+        # but steady-state replay reuses the packed tensors without Python
+        # loops or extra H2D copies.
         _paged_missing = paged_kv_indptr is None or paged_kv_indices is None or paged_kv_last_page_len is None
         _paged_mismatch = (not _paged_missing) and (
             paged_kv_last_page_len.numel() != block_table.shape[0]
@@ -381,7 +388,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 paged_kv_last_page_len,
             ) = self._build_row_aligned_paged_kv_metadata(
                 block_table,
-                kv_seq_lens,
+                paging_kv_seq_lens_host_values,
             )
         self._validate_decode_metadata_shapes(
             block_table,
@@ -438,9 +445,9 @@ class DecodeAclGraphRunner(BaseRunner):
         Chunked-typed flows (Qwen3.5) carry the expanded metadata from C++;
         a GENERIC-flow MTP verify batch (e.g. GLM5-next KDA) instead arrives
         decode-typed with per-row kv lens and per-sequence block tables.
-        Synthesize the token-row expanded view for the latter — block table
-        rows duplicated per verify row, row-scoped paging built on-device —
-        so the same graph machinery captures both.
+        Synthesize the token-row expanded view for the latter from the row
+        metadata already produced by C++, so the same graph machinery captures
+        both without rebuilding paging on the replay path.
         """
         expanded = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
         if expanded is not None:
@@ -450,14 +457,23 @@ class DecodeAclGraphRunner(BaseRunner):
         kv_rows = metadata.kv_seq_lens.to(torch.int32)
         block_table_rows = metadata.block_table.to(torch.int32).contiguous()
         host_values = getattr(metadata, "kv_seq_lens_host_values", None)
-        (
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-        ) = self._build_row_aligned_paged_kv_metadata(
-            block_table_rows,
-            kv_rows,
+        paged_kv_indptr = metadata.paged_kv_indptr
+        paged_kv_indices = metadata.paged_kv_indices
+        paged_kv_last_page_len = metadata.paged_kv_last_page_len
+        paged_missing = paged_kv_indptr is None or paged_kv_indices is None or paged_kv_last_page_len is None
+        paged_mismatch = not paged_missing and (
+            paged_kv_indptr.numel() != block_table_rows.shape[0] + 1
+            or paged_kv_last_page_len.numel() != block_table_rows.shape[0]
         )
+        if paged_missing or paged_mismatch:
+            (
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+            ) = self._build_row_aligned_paged_kv_metadata(
+                block_table_rows,
+                host_values,
+            )
         synthesized = ExpandedDecodeMetadata(
             kv_seq_lens=kv_rows,
             block_table=block_table_rows,
@@ -473,40 +489,48 @@ class DecodeAclGraphRunner(BaseRunner):
     def _build_row_aligned_paged_kv_metadata(
         self,
         block_table: torch.Tensor,
-        kv_seq_lens: torch.Tensor,
+        kv_seq_lens_host_values: Sequence[int] | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build token-row paging metadata like the C++ graph input builder."""
+        """Build row paging metadata without dynamic-shape device operators."""
         page_size = int(self.attention_backend.page_size)
         if page_size <= 0:
             raise RuntimeError("decode graph page size must be positive")
+        if kv_seq_lens_host_values is None or len(kv_seq_lens_host_values) != block_table.shape[0]:
+            raise RuntimeError("row-aligned graph paging requires one host KV length per token row")
 
-        effective_kv_seq_lens = torch.clamp(kv_seq_lens, min=1)
-        page_counts = torch.div(
-            effective_kv_seq_lens + page_size - 1,
-            page_size,
-            rounding_mode="floor",
-        ).to(torch.int32)
-        paged_kv_indptr = torch.cat(
-            (
-                torch.zeros(
-                    1,
-                    dtype=torch.int32,
-                    device=block_table.device,
-                ),
-                torch.cumsum(page_counts, dim=0, dtype=torch.int32),
-            )
+        flat_page_indices: list[int] = []
+        paged_kv_indptr_values = [0]
+        paged_kv_last_page_len_values: list[int] = []
+        table_width = int(block_table.shape[1])
+        for row, kv_seq_len in enumerate(kv_seq_lens_host_values):
+            effective_kv_seq_len = max(int(kv_seq_len), 1)
+            page_count = (effective_kv_seq_len + page_size - 1) // page_size
+            if page_count > table_width:
+                raise RuntimeError(
+                    "row-aligned graph paging exceeds the block table width: "
+                    f"row={row}, pages={page_count}, capacity={table_width}"
+                )
+            paged_kv_indptr_values.append(paged_kv_indptr_values[-1] + page_count)
+            paged_kv_last_page_len_values.append((effective_kv_seq_len - 1) % page_size + 1)
+            row_offset = row * table_width
+            flat_page_indices.extend(row_offset + page for page in range(page_count))
+
+        flat_page_indices_tensor = torch.tensor(
+            flat_page_indices,
+            dtype=torch.int64,
+            device=block_table.device,
         )
-        page_offsets = torch.arange(
-            block_table.shape[1],
+        paged_kv_indices = block_table.reshape(-1).index_select(0, flat_page_indices_tensor).contiguous()
+        paged_kv_indptr = torch.tensor(
+            paged_kv_indptr_values,
             dtype=torch.int32,
             device=block_table.device,
         )
-        valid_pages = page_offsets.unsqueeze(0) < page_counts.unsqueeze(1)
-        # Callers (_decode_metadata / _expanded_verify_view) already cast
-        # block_table to int32; avoid a redundant full-tensor device copy on
-        # every paging build.
-        paged_kv_indices = block_table.masked_select(valid_pages).contiguous()
-        paged_kv_last_page_len = ((effective_kv_seq_lens - 1) % page_size + 1).to(torch.int32)
+        paged_kv_last_page_len = torch.tensor(
+            paged_kv_last_page_len_values,
+            dtype=torch.int32,
+            device=block_table.device,
+        )
         return (
             paged_kv_indptr.contiguous(),
             paged_kv_indices,
@@ -683,6 +707,11 @@ class DecodeAclGraphRunner(BaseRunner):
         sequence_count = block_table.shape[0]
         if kv_seq_lens.numel() != sequence_count:
             return False
+        host_values = (
+            expanded.kv_seq_lens_host_values
+            if expanded is not None
+            else getattr(metadata, "kv_seq_lens_host_values", None)
+        )
         # Host KV lengths are required for non-sparse-MLA backends; a missing
         # or mis-sized host list is an expected "not compatible" (→ eager).
         is_mla = getattr(self.attention_backend, "is_mla", False)
@@ -692,21 +721,25 @@ class DecodeAclGraphRunner(BaseRunner):
             False,
         )
         if requires_host:
-            host_values = (
-                expanded.kv_seq_lens_host_values
-                if expanded is not None
-                else getattr(metadata, "kv_seq_lens_host_values", None)
-            )
             if host_values is None or len(host_values) != sequence_count:
                 return False
-        # Paged KV metadata is only mandatory when the on-device builder will
-        # NOT synthesize it for an expanded/untyped spec-verify batch.
-        if expanded is None and not self._is_untyped_spec_verify(metadata):
-            if (
-                metadata.paged_kv_indptr is None
-                or metadata.paged_kv_indices is None
-                or metadata.paged_kv_last_page_len is None
-            ):
+        paged_kv_indptr = expanded.paged_kv_indptr if expanded is not None else metadata.paged_kv_indptr
+        paged_kv_indices = expanded.paged_kv_indices if expanded is not None else metadata.paged_kv_indices
+        paged_kv_last_page_len = (
+            expanded.paged_kv_last_page_len if expanded is not None else metadata.paged_kv_last_page_len
+        )
+        paged_missing = paged_kv_indptr is None or paged_kv_indices is None or paged_kv_last_page_len is None
+        paged_mismatch = (not paged_missing) and (
+            paged_kv_last_page_len.numel() != sequence_count or paged_kv_indptr.numel() != sequence_count + 1
+        )
+        if paged_missing or paged_mismatch:
+            if host_values is None or len(host_values) != sequence_count:
+                return False
+            page_size = int(self.attention_backend.page_size)
+            table_width = int(block_table.shape[1])
+            if page_size <= 0 or table_width <= 0:
+                return False
+            if any((max(int(kv_seq_len), 1) + page_size - 1) // page_size > table_width for kv_seq_len in host_values):
                 return False
         # One-token-per-sequence (per-row) contract.
         if input_ids.dim() != 1 or input_ids.numel() != sequence_count:
@@ -831,7 +864,17 @@ class DecodeAclGraphRunner(BaseRunner):
         if _decode_bucket(cap_bs) > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
 
-        graph_key = self._graph_key(padded_batch_size, is_expanded, input_embedding)
+        kpool_query_lens = self._padded_kpool_query_lens(
+            metadata,
+            batch_size,
+            padded_batch_size,
+        )
+        graph_key = self._graph_key(
+            padded_batch_size,
+            is_expanded,
+            input_embedding,
+            kpool_query_lens,
+        )
         entry = self._graphs.get(graph_key)
         first_capture = entry is None
         if first_capture:
@@ -953,17 +996,54 @@ class DecodeAclGraphRunner(BaseRunner):
         padded_batch_size: int,
         is_expanded: bool,
         input_embedding: torch.Tensor | None,
+        kpool_query_lens: tuple[int, ...] = (),
     ) -> _GraphKey:
         """Return the key for a shape- and metadata-specific graph."""
         if input_embedding is None:
-            return padded_batch_size, is_expanded, None, None, None
+            return padded_batch_size, is_expanded, None, None, None, kpool_query_lens
         return (
             padded_batch_size,
             is_expanded,
             input_embedding.dtype,
             input_embedding.device,
             tuple(input_embedding.shape[1:]),
+            kpool_query_lens,
         )
+
+    def _padded_kpool_query_lens(
+        self,
+        metadata: AttentionMetadata,
+        num_tokens: int,
+        padded_num_tokens: int,
+    ) -> tuple[int, ...]:
+        """Return uniform KPool request spans covering the graph bucket."""
+        query_lens = tuple(int(length) for length in getattr(metadata, "kpool_query_lens", ()))
+        if not query_lens:
+            uses_compressed_kpool_tail = any(
+                cache.kpool_tail is not None
+                and cache.kpool_tail.dim() == 4
+                and cache.kpool_tail.dtype == torch.bfloat16
+                for cache in self.layer_caches
+            )
+            if not uses_compressed_kpool_tail:
+                return ()
+            query_lens = (1,) * num_tokens
+        if any(length <= 0 for length in query_lens):
+            raise RuntimeError(f"KPool graph query spans must be positive: {query_lens}")
+        covered_tokens = sum(query_lens)
+        if covered_tokens != num_tokens:
+            raise RuntimeError(
+                f"KPool graph query spans must cover every input token: covered={covered_tokens}, tokens={num_tokens}"
+            )
+        query_width = query_lens[0]
+        if any(length != query_width for length in query_lens[1:]):
+            raise RuntimeError(f"KPool ACL graph requires uniform request spans: {query_lens}")
+        if padded_num_tokens % query_width != 0:
+            raise RuntimeError(
+                "KPool ACL graph token bucket must be divisible by its request width: "
+                f"bucket={padded_num_tokens}, width={query_width}"
+            )
+        return query_lens + (query_width,) * ((padded_num_tokens - num_tokens) // query_width)
 
     def _allocate_entry(
         self,
@@ -1017,6 +1097,11 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.static_input_ids = torch.zeros(padded_batch_size, dtype=input_ids.dtype, device=device)
         entry.static_positions = torch.zeros(padded_batch_size, dtype=torch.int32, device=device)
         entry.static_input_embedding = None
+        kpool_query_lens = self._padded_kpool_query_lens(
+            metadata,
+            input_ids.numel(),
+            padded_batch_size,
+        )
         entry.static_metadata = _StaticAttentionMetadata(
             slot_mapping=torch.zeros(
                 padded_batch_size,
@@ -1057,6 +1142,10 @@ class DecodeAclGraphRunner(BaseRunner):
             dp_execution_token_counts=(padded_batch_size,) * self.dp_size if self.dp_size > 1 else (),
             dp_is_decode=tuple([1] * self.dp_size) if self.dp_size > 1 else (),
             is_dummy=bool(getattr(metadata, "is_dummy", False)),
+            kpool_query_lens=kpool_query_lens,
+            kpool_query_lens_device=(
+                torch.tensor(kpool_query_lens, dtype=torch.int32, device=device) if kpool_query_lens else None
+            ),
             # One mask slot per padded row across all DP ranks. aclnnMegaMoe
             # dispatches the fixed graph shape over EP, so padded lanes must be
             # marked inactive or they are routed as real tokens.
@@ -1074,7 +1163,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # One resolve for both the boolean and the row-count read below;
         # _expanded_verify_view runs an on-device paging build for the
         # untyped-verify branch, so calling it twice per bucket capture
-        # duplicates a masked_select + cumsum for no benefit.
+        # duplicates the row-aligned paging construction for no benefit.
         expanded_view = self._expanded_verify_view(metadata)
         is_expanded = expanded_view is not None
         entry.kv_seq_lens_delta = torch.empty(padded_batch_size, dtype=torch.int32, device=device)
@@ -1189,6 +1278,16 @@ class DecodeAclGraphRunner(BaseRunner):
         padded_batch_size = entry.batch_size
         static_metadata = entry.static_metadata
         static_metadata.is_dummy = bool(getattr(metadata, "is_dummy", False))
+        kpool_query_lens = self._padded_kpool_query_lens(
+            metadata,
+            batch_size,
+            padded_batch_size,
+        )
+        if kpool_query_lens != static_metadata.kpool_query_lens:
+            raise RuntimeError(
+                "KPool query-span layout changed for an existing ACL graph: "
+                f"captured={static_metadata.kpool_query_lens}, current={kpool_query_lens}"
+            )
         (
             block_table,
             kv_seq_lens,

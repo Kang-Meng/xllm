@@ -133,6 +133,7 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        self._requires_framework_kpool_tail = bool(config.get("requires_framework_kpool_tail", False))
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
         if not attention_layers:
@@ -288,6 +289,10 @@ class ModelExecutor:
             raise ValueError("cache layer count does not match the model layer layout")
         if self._kv_bound:
             return
+        if self._requires_framework_kpool_tail:
+            indexed_caches = [cache for cache in layer_caches if cache.index is not None]
+            if not indexed_caches or any(cache.kpool_tail is None for cache in indexed_caches):
+                raise ValueError("model requires a framework-managed kPool tail for every indexer layer")
         self.attention_backend.bind_kv_caches(layer_caches)
         self.eager_runner.bind_layer_caches(layer_caches)
         if self.decode_graph_runner is not None:

@@ -64,8 +64,7 @@ class Engine {
     return false;
   }
 
-  virtual runtime::DecodeGraphExecutionShape decode_graph_execution_shape()
-      const {
+  virtual runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const {
     return {};
   }
 

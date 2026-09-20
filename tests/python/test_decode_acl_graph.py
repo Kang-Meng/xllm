@@ -78,6 +78,7 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     input_ids = torch.arange(4, dtype=torch.int32)
     positions = torch.arange(4, dtype=torch.int32)
     metadata = _metadata(torch.tensor([3, 7, 11, 15], dtype=torch.int32))
+    metadata.kpool_query_lens = [4]
     entry = runner._allocate_entry(
         padded_batch_size=8,
         input_ids=input_ids,
@@ -86,6 +87,14 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     )
     static_indices = entry.static_metadata.linear_state_indices
     data_ptr = static_indices.data_ptr()
+    assert entry.static_metadata.kpool_query_lens == (4, 4)
+    assert entry.static_metadata.kpool_query_lens_device.tolist() == [4, 4]
+    assert DecodeAclGraphRunner._graph_key(
+        8,
+        True,
+        None,
+        entry.static_metadata.kpool_query_lens,
+    ) != DecodeAclGraphRunner._graph_key(8, True, None, (2, 2, 2, 2))
 
     with patch(
         "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
@@ -116,6 +125,23 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
 
     assert static_indices.data_ptr() == data_ptr
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
+
+
+def test_untyped_verify_reuses_row_aligned_paging_metadata() -> None:
+    runner = _runner()
+    metadata = _metadata(torch.tensor([1, 2], dtype=torch.int32))
+
+    with patch.object(
+        runner,
+        "_build_row_aligned_paged_kv_metadata",
+        side_effect=AssertionError("row-aligned paging must come from C++"),
+    ):
+        expanded = runner._expanded_verify_view(metadata)
+
+    assert expanded is not None
+    assert expanded.paged_kv_indptr is metadata.paged_kv_indptr
+    assert expanded.paged_kv_indices is metadata.paged_kv_indices
+    assert expanded.paged_kv_last_page_len is metadata.paged_kv_last_page_len
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])
@@ -175,6 +201,21 @@ def test_dsa_graph_tables_use_compressed_block_counts() -> None:
 
     assert [tuple(table.shape) for table in tables] == [(4, 256), (4, 64), (4, 2)]
     assert all(torch.all(table == 0) for table in tables)
+
+    block_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+    indptr, indices, last_page_len = runner._build_row_aligned_paged_kv_metadata(
+        block_table,
+        [129, 132],
+    )
+    assert indptr.tolist() == [0, 2, 4]
+    assert indices.tolist() == [10, 11, 20, 21]
+    assert last_page_len.tolist() == [1, 4]
+
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.kv_seq_lens_host_values = None
+    metadata.paged_kv_indptr = torch.tensor([0, 1], dtype=torch.int32)
+    metadata.paged_kv_last_page_len = torch.tensor([1], dtype=torch.int32)
+    assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
 
 
 def test_dsa_graph_refreshes_every_manager_and_clears_tails() -> None:

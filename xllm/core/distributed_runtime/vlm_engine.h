@@ -46,6 +46,8 @@ class VLMEngine : public Engine {
 
   const runtime::Options& options() const { return options_; }
 
+  runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const override;
+
   bool init(MasterStatus master_status) override;
 
   void update_last_step_result(std::vector<Batch>& batch) override;

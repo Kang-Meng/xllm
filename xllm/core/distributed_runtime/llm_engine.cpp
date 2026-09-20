@@ -147,18 +147,17 @@ LLMEngine::LLMEngine(const runtime::Options& options,
       /*pool_name=*/"LLMEngine.forward_input");
 }
 
-runtime::DecodeGraphExecutionShape LLMEngine::decode_graph_execution_shape()
-    const {
-  runtime::DecodeGraphExecutionShape execution_shape;
-  execution_shape.num_decoding_tokens = options_.num_decoding_tokens();
-  execution_shape.num_speculative_tokens = options_.num_speculative_tokens();
-  execution_shape.enable_graph_mode_decode_no_padding =
+runtime::DecodeGraphWarmupConfig LLMEngine::decode_graph_warmup_config() const {
+  runtime::DecodeGraphWarmupConfig warmup_config;
+  warmup_config.num_decoding_tokens = options_.num_decoding_tokens();
+  warmup_config.num_speculative_tokens = options_.num_speculative_tokens();
+  warmup_config.enable_graph_mode_decode_no_padding =
       options_.enable_graph_mode_decode_no_padding();
   if (Platform::is_npu()) {
-    execution_shape.max_graph_batch_size =
+    warmup_config.max_graph_batch_size =
         ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit();
   }
-  return execution_shape;
+  return warmup_config;
 }
 
 void LLMEngine::process_group_test() {
