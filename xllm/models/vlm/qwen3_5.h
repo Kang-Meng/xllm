@@ -305,7 +305,7 @@ TORCH_MODULE(Qwen3_5ForConditionalGeneration);
   LOAD_ARG_OR(mm_patch_size, "vision_config.patch_size", 16);                  \
   LOAD_ARG_OR(mm_spatial_merge_size, "vision_config.spatial_merge_size", 2);   \
   LOAD_ARG_OR(mm_temporal_patch_size, "vision_config.temporal_patch_size", 2); \
-  LOAD_ARG_OR_FUNC(mm_head_dim, "head_dim", [&] {                              \
+  LOAD_ARG_OR_FUNC(mm_head_dim, "vision_config.head_dim", [&] {                \
     return args->mm_hidden_size() / args->mm_num_attention_heads();            \
   })
 
