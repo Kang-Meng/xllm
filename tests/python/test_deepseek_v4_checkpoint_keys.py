@@ -19,6 +19,7 @@ import pytest
 from xllm.python.models import deepseek_v4
 from xllm.python.models.deepseek_v4 import (
     _find_checkpoint_key,
+    _find_checkpoint_prefix,
     _require_checkpoint_key,
     _resolve_mlp_projection_names,
 )
@@ -40,6 +41,7 @@ def test_checkpoint_key_resolution_preserves_candidate_order() -> None:
     loader = _KeySet("model.head.weight", "head.weight")
 
     assert _find_checkpoint_key(loader, ("lm_head.weight", "model.head.weight", "head.weight")) == "model.head.weight"
+    assert _find_checkpoint_prefix(loader, ("model.", ""), ("head.weight",)) == "model."
 
 
 def test_required_checkpoint_key_reports_all_supported_names() -> None:

@@ -242,9 +242,6 @@ class DeepseekV4DSparkForCausalLM(
     ) -> None:
         """Load one draft decoder layer without requiring the target MTP model."""
 
-        def _has(name: str) -> bool:
-            return loader.has(name)
-
         def _w8a8(
             checkpoint_module: str,
             parameter_module: str,
@@ -270,8 +267,24 @@ class DeepseekV4DSparkForCausalLM(
         attention.process_weights_after_loading()
 
         mlp = self.model.layers[layer_id].mlp
-        if hasattr(mlp, "experts_w13") and _has(checkpoint_prefix + "ffn.experts.0.w1.weight"):
-            self._load_dsv4_moe(loader, checkpoint_prefix, parameter_prefix, layer_id)
+        moe_prefix = None
+        if hasattr(mlp, "experts_w13"):
+            moe_prefix = _find_checkpoint_prefix(
+                loader,
+                (
+                    checkpoint_prefix + "ffn.",
+                    checkpoint_prefix + "mlp.",
+                ),
+                ("experts.0.w1.weight",),
+            )
+        if moe_prefix is not None:
+            self._load_dsv4_moe(
+                loader,
+                checkpoint_prefix,
+                parameter_prefix,
+                layer_id,
+                moe_prefix,
+            )
             mlp.process_weights_after_loading()
         else:
             self._load_dsv4_dense_mlp(loader, checkpoint_prefix, parameter_prefix, mlp)

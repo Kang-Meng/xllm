@@ -355,3 +355,104 @@ def test_dspark_attention_loader_requires_weight_scale() -> None:
             "model.layers.0.",
             layer_id=0,
         )
+
+
+def test_dspark_moe_loader_receives_explicit_checkpoint_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
+    loader = _StateDict({"mtp.0.ffn.experts.0.w1.weight": torch.ones(1)})
+    attention = model.model.layers[0].self_attn
+    calls: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        model,
+        "_load_dsv4_attention",
+        lambda *args, **kwargs: (attention, None),
+    )
+    monkeypatch.setattr(attention, "process_weights_after_loading", lambda: None)
+    monkeypatch.setattr(
+        model.model.layers[0].mlp,
+        "process_weights_after_loading",
+        lambda: None,
+    )
+    monkeypatch.setattr(model, "_load_dsv4_moe", lambda *args: calls.append(args))
+
+    model._load_dsv4_decoder_layer(
+        loader,
+        "mtp.0.",
+        "model.layers.0.",
+        layer_id=0,
+    )
+
+    assert calls == [
+        (
+            loader,
+            "mtp.0.",
+            "model.layers.0.",
+            0,
+            "mtp.0.ffn.",
+        )
+    ]
+
+
+def test_dspark_loads_moe_from_mlp_checkpoint_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
+    source_prefix = "mtp.0.mlp."
+    tensors = {
+        source_prefix + "gate.weight": torch.arange(16, dtype=torch.float32).reshape(2, 8),
+        source_prefix + "gate.bias": torch.tensor([0.25, -0.5]),
+    }
+    for expert_id in range(2):
+        expert_prefix = source_prefix + f"experts.{expert_id}."
+        tensors.update(
+            {
+                expert_prefix + "w1.weight": torch.full((4, 8), expert_id + 1, dtype=torch.int8),
+                expert_prefix + "w3.weight": torch.full((4, 8), expert_id + 3, dtype=torch.int8),
+                expert_prefix + "w2.weight": torch.full((8, 4), expert_id + 5, dtype=torch.int8),
+            }
+        )
+    loader = deepseek_v4_dspark.W8A8WeightLoader(
+        model,
+        [_StateDict(tensors)],
+        tp_size=1,
+        tp_rank=0,
+        src_prefixes=("", "model."),
+    )
+    attention = model.model.layers[0].self_attn
+    mlp = model.model.layers[0].mlp
+    monkeypatch.setattr(
+        model,
+        "_load_dsv4_attention",
+        lambda *args, **kwargs: (attention, "mtp.0.attn."),
+    )
+    monkeypatch.setattr(attention, "process_weights_after_loading", lambda: None)
+    monkeypatch.setattr(mlp, "process_weights_after_loading", lambda: None)
+
+    model._load_dsv4_decoder_layer(
+        loader,
+        "mtp.0.",
+        "model.layers.0.",
+        layer_id=0,
+    )
+
+    torch.testing.assert_close(mlp.gate.weight, tensors[source_prefix + "gate.weight"])
+    torch.testing.assert_close(mlp.e_score_correction_bias, tensors[source_prefix + "gate.bias"])
+    for expert_id in range(2):
+        expert_prefix = source_prefix + f"experts.{expert_id}."
+        torch.testing.assert_close(
+            mlp.experts_w13[expert_id],
+            torch.cat(
+                [
+                    tensors[expert_prefix + "w1.weight"],
+                    tensors[expert_prefix + "w3.weight"],
+                ],
+                dim=0,
+            ),
+        )
+        torch.testing.assert_close(
+            mlp.experts_w2[expert_id],
+            tensors[expert_prefix + "w2.weight"],
+        )

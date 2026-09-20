@@ -2185,8 +2185,15 @@ class DeepseekV4ForCausalLM(PyModelBase):
             # (gate.weight + gate.tid2eid) and per-expert w1/w2/w3, while dense
             # layers use the fused W8A8 MLP loader below.
             mlp = self.model.layers[i].mlp
-            if hasattr(mlp, "experts_w13") and _has(ck + "ffn.experts.0.w1.weight"):
-                self._load_dsv4_moe(loader, ck, pm, i)
+            moe_prefix = None
+            if hasattr(mlp, "experts_w13"):
+                moe_prefix = _find_checkpoint_prefix(
+                    loader,
+                    (ck + "ffn.", ck + "mlp."),
+                    ("experts.0.w1.weight",),
+                )
+            if moe_prefix is not None:
+                self._load_dsv4_moe(loader, ck, pm, i, moe_prefix)
                 mlp.process_weights_after_loading()
             elif isinstance(mlp, DeepseekV3MLP):
                 self._load_dsv4_dense_mlp(loader, ck, pm, mlp)
@@ -2315,7 +2322,55 @@ class DeepseekV4ForCausalLM(PyModelBase):
             loader.copy_in(down_prefix + suffix, down)
         mlp.process_weights_after_loading()
 
-    def _load_dsv4_moe(self, loader, ck: str, pm: str, layer_id: int) -> None:
+    @staticmethod
+    def _load_dsv4_moe_routing(
+        loader: W8A8WeightLoader,
+        gate_prefix: str,
+        parameter_prefix: str,
+        mlp: DeepseekV4MoE,
+        layer_id: int,
+    ) -> None:
+        """Load the routed-expert gate and hash or score-correction metadata."""
+        loader.copy_in(
+            parameter_prefix + "mlp.gate.weight",
+            loader.load_tensor(gate_prefix + "weight"),
+        )
+        if mlp.hash_layer:
+            tid2eid_key = _require_checkpoint_key(
+                loader,
+                (
+                    gate_prefix + "tid2eid",
+                    gate_prefix + "tid2eid.weight",
+                ),
+                f"DeepSeek-V4 layer {layer_id} hash routing table",
+            )
+            loader.copy_in(
+                parameter_prefix + "mlp.tid2eid",
+                loader.load_tensor(tid2eid_key),
+            )
+            return
+
+        bias_key = _require_checkpoint_key(
+            loader,
+            (
+                gate_prefix + "bias",
+                gate_prefix + "e_score_correction_bias",
+            ),
+            f"DeepSeek-V4 layer {layer_id} routing correction bias",
+        )
+        loader.copy_in(
+            parameter_prefix + "mlp.e_score_correction_bias",
+            loader.load_tensor(bias_key),
+        )
+
+    def _load_dsv4_moe(
+        self,
+        loader: W8A8WeightLoader,
+        ck: str,
+        pm: str,
+        layer_id: int,
+        source_prefix: str,
+    ) -> None:
         """Stage DSV4 MoE weights for DeepseekV4MoE (hash routing + EP sharding).
 
         Loads gate.weight + tid2eid (hash layers) + per-expert w1/w2/w3
@@ -2328,28 +2383,17 @@ class DeepseekV4ForCausalLM(PyModelBase):
 
         cfg = self.cfg
         mlp = self.model.layers[layer_id].mlp
-        # Gate weight [n_total_experts, hidden] float32 (replicated, not EP-sharded).
-        loader.copy_in(pm + "mlp.gate.weight", loader.load_tensor(ck + "ffn.gate.weight"))
-        if mlp.hash_layer:
-            # C++ DeepseekV4GateImpl requires tid2eid for every hash layer.
-            tid2eid_key = ck + "ffn.gate.tid2eid"
-            if not _has(tid2eid_key):
-                tid2eid_key += ".weight"
-            assert _has(tid2eid_key), f"hash gate checkpoint tensor not found: {tid2eid_key}"
-            loader.copy_in(pm + "mlp.tid2eid", loader.load_tensor(tid2eid_key))
-        else:
-            # Match DeepseekV4GateImpl::load_state_dict: the correction bias is
-            # mandatory for non-hash routing, with the legacy key as fallback.
-            bias_key = ck + "ffn.gate.bias"
-            if not _has(bias_key):
-                bias_key = ck + "ffn.gate.e_score_correction_bias"
-            assert _has(bias_key), (
-                f"non-hash gate checkpoint tensor not found: {ck}ffn.gate.bias (or e_score_correction_bias)"
-            )
-            loader.copy_in(
-                pm + "mlp.e_score_correction_bias",
-                loader.load_tensor(bias_key),
-            )
+        gate_prefix = _find_checkpoint_prefix(
+            loader,
+            (
+                source_prefix + "gate.",
+                ck + "gate.",
+            ),
+            ("weight",),
+        )
+        if gate_prefix is None:
+            raise KeyError(f"DeepSeek-V4 layer {layer_id} routing gate weight not found")
+        self._load_dsv4_moe_routing(loader, gate_prefix, pm, mlp, layer_id)
         # Per-expert w1+w3 -> fused w13, w2 -> w2 (int8 + scale).
         # EP: only load local experts [start_expert_id, start_expert_id + num_experts_per_rank).
         tp = mlp.moe_tp_size
@@ -2374,7 +2418,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
                 second = loader.shard(second, dim=0, world=tp, rank=tp_rank)
             return torch.cat([first, second], dim=0)
 
-        probe = ck + f"ffn.experts.{start}."
+        probe = source_prefix + f"experts.{start}."
         probe_w1 = loader.load_tensor(probe + "w1.weight")
         # W4A8 stores two 4-bit output values per int8 row.  The checkpoint
         # therefore has half as many physical rows as the logical expert
@@ -2412,7 +2456,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
             w2_offset.data = torch.zeros_like(w2_scale, dtype=torch.float32)
         for local_idx in range(nepr):
             global_id = start + local_idx
-            e = ck + f"ffn.experts.{global_id}."
+            e = source_prefix + f"experts.{global_id}."
             w1 = probe_w1 if local_idx == 0 else loader.load_tensor(e + "w1.weight")
             w3 = loader.load_tensor(e + "w3.weight")
             w13_j = _shard_fused(w1, w3)
@@ -2457,19 +2501,18 @@ class DeepseekV4ForCausalLM(PyModelBase):
                     s2_bias = loader.shard(s2_bias, dim=1, world=tp, rank=tp_rank)
                 w2_scale_bias[local_idx].copy_(s2_bias)
         # Shared experts: checkpoint has w1/w2/w3 (W8A8 dynamic), fuse w1+w3 -> gate_up_proj.
-        se = ck + "ffn.shared_experts."
+        se = source_prefix + "shared_experts."
         shared_gate_keys = (
-            ck + "ffn.shared_expert_gate.weight",
-            ck + "ffn.shared_experts_gate.weight",
+            source_prefix + "shared_expert_gate.weight",
+            source_prefix + "shared_experts_gate.weight",
         )
-        for shared_gate_key in shared_gate_keys:
-            if _has(shared_gate_key):
-                loader.copy_in(
-                    pm + "mlp.shared_expert_gate.weight",
-                    loader.load_tensor(shared_gate_key),
-                )
-                mlp.shared_expert_gate_is_loaded = True
-                break
+        shared_gate_key = _find_checkpoint_key(loader, shared_gate_keys)
+        if shared_gate_key is not None:
+            loader.copy_in(
+                pm + "mlp.shared_expert_gate.weight",
+                loader.load_tensor(shared_gate_key),
+            )
+            mlp.shared_expert_gate_is_loaded = True
         if _has(se + "w1.weight"):
             se_w1 = loader.load_tensor(se + "w1.weight")
             se_w3 = loader.load_tensor(se + "w3.weight")
