@@ -38,6 +38,9 @@ from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.platform import current_platform
 from xllm.python.registry import get_execution_metadata_builder_classes
 
+# Backend strings that mean "no graph execution" (matched case-insensitively).
+_DISABLED_GRAPH_BACKENDS = ("", "off", "none", "0")
+
 
 def _is_deepseek_v4_model_type(model_type: str) -> bool:
     return model_type.startswith("deepseek_v4")
@@ -45,10 +48,8 @@ def _is_deepseek_v4_model_type(model_type: str) -> bool:
 
 def _resolve_graph_backend(config: dict) -> str:
     graph_backend = str(config.get("python_graph_backend", "off")).lower()
-    graph_disabled = graph_backend in ("", "off", "none", "0")
-    if graph_disabled and config.get("enable_graph", False):
-        if current_platform.is_npu():
-            return "aclgraph"
+    if graph_backend in _DISABLED_GRAPH_BACKENDS and config.get("enable_graph", False) and current_platform.is_npu():
+        return "aclgraph"
     return graph_backend
 
 
@@ -216,7 +217,7 @@ class ModelExecutor:
         self.eager_runner.bind_execution_metadata_builders(execution_metadata_builders)
 
         graph_backend = _resolve_graph_backend(config)
-        if self.layerwise_split_size > 1 and graph_backend not in ("", "off", "none", "0"):
+        if self.layerwise_split_size > 1 and graph_backend not in _DISABLED_GRAPH_BACKENDS:
             raise NotImplementedError(
                 "Python GLM5.2 layerwise split requires eager execution; "
                 f"graph backend '{graph_backend}' is not supported."
@@ -224,16 +225,9 @@ class ModelExecutor:
         dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
-        if dp_size > 1 and graph_backend not in (
-            "",
-            "off",
-            "none",
-            "0",
-            "cudagraphs",
-            "aclgraph",
-        ):
+        if dp_size > 1 and graph_backend not in (*_DISABLED_GRAPH_BACKENDS, "cudagraphs", "aclgraph"):
             raise NotImplementedError("Python data parallel graph execution supports cudagraphs and aclgraph only")
-        if graph_backend in ("", "off", "none", "0"):
+        if graph_backend in _DISABLED_GRAPH_BACKENDS:
             pass
         elif graph_backend == "cudagraphs":
             from xllm.python.model_executor.runners.decode_cuda_graph import (

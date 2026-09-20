@@ -56,6 +56,23 @@ class BaseRunner(ABC):
     ) -> None:
         self.execution_metadata_builders = tuple(builders)
 
+    @staticmethod
+    def _slice_output(
+        output: ModelExecutionOutput,
+        batch_size: int,
+        *,
+        clone: bool = False,
+    ) -> ModelExecutionOutput:
+        """Trim graph padding, optionally copying outputs out of graph storage."""
+
+        def _trim(tensor: torch.Tensor) -> torch.Tensor:
+            tensor = tensor[:batch_size]
+            return tensor.clone() if clone else tensor
+
+        if isinstance(output, tuple):
+            return _trim(output[0]), _trim(output[1])
+        return _trim(output)
+
     @abstractmethod
     def execute(
         self,

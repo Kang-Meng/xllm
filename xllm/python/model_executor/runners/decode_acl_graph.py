@@ -1699,12 +1699,6 @@ class DecodeAclGraphRunner(BaseRunner):
         )
 
     @staticmethod
-    def _slice_output(output: ModelExecutionOutput, batch_size: int) -> ModelExecutionOutput:
-        if isinstance(output, tuple):
-            return output[0][:batch_size], output[1][:batch_size]
-        return output[:batch_size]
-
-    @staticmethod
     def _update_graph_tasks(
         stream: torch.npu.Stream,
         graph_tasks: list[AclGraphTask],
