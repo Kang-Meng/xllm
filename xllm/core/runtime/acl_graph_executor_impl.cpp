@@ -75,6 +75,31 @@ void reset_capture_linear_state_to_padding(ModelInputParams& params) {
       params.embedding.linear_state_ids.size(), 0);
 }
 
+bool is_qwen3_5_dp_graph_step_supported(const ModelArgs& args,
+                                        const runtime::Options& options,
+                                        const ModelInputParams& params) {
+  const std::vector<int32_t>& dp_token_nums =
+      params.parallel.dp_global_token_nums;
+  if (!is_qwen3_5_target_model_type(args.model_type()) ||
+      dp_token_nums.size() <= 1) {
+    return true;
+  }
+
+  const std::vector<int32_t>& raw_dp_token_nums =
+      params.parallel.raw_dp_global_token_nums;
+  if (!raw_dp_token_nums.empty() &&
+      raw_dp_token_nums.size() != dp_token_nums.size()) {
+    return false;
+  }
+
+  const std::vector<int32_t>& graph_dp_token_nums =
+      raw_dp_token_nums.empty() ? dp_token_nums : raw_dp_token_nums;
+  const int32_t min_dp_token_num = util::min(graph_dp_token_nums);
+  const int32_t max_dp_token_num = util::max(graph_dp_token_nums);
+  return min_dp_token_num > 0 && min_dp_token_num == max_dp_token_num &&
+         !options.enable_graph_mode_decode_no_padding();
+}
+
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
                                         int64_t block_size) {
@@ -1155,35 +1180,22 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   const std::vector<int32_t>& dp_token_nums =
       params_single.parallel.dp_global_token_nums;
-  if (is_qwen3_5_target_model_type(args_.model_type()) &&
-      dp_token_nums.size() > 1) {
+  if (!is_qwen3_5_dp_graph_step_supported(args_, options_, params_single)) {
     const std::vector<int32_t>& raw_dp_token_nums =
         params_single.parallel.raw_dp_global_token_nums;
-    const bool raw_dp_metadata_complete =
-        raw_dp_token_nums.empty() ||
-        raw_dp_token_nums.size() == dp_token_nums.size();
-    const std::vector<int32_t>& graph_dp_token_nums =
-        raw_dp_token_nums.empty() ? dp_token_nums : raw_dp_token_nums;
-    const int32_t min_dp_token_num = util::min(graph_dp_token_nums);
-    const int32_t max_dp_token_num = util::max(graph_dp_token_nums);
-    const bool balanced_nonempty_dp = raw_dp_metadata_complete &&
-                                      min_dp_token_num > 0 &&
-                                      min_dp_token_num == max_dp_token_num;
     // Qwen3.5 DP graph is currently validated only with decode padding.
     // No-padding changes graph bucketing and MTP input updates, so a locally
     // prewarmed graph does not establish cross-rank replay compatibility.
     const bool decode_no_padding =
         options_.enable_graph_mode_decode_no_padding();
-    if (!balanced_nonempty_dp || decode_no_padding) {
-      LOG_FIRST_N(WARNING, 1)
-          << "Falling back to eager mode because DP ACL graph requires a "
-             "balanced, non-empty token distribution with decode padding. "
-             "dp_global_token_nums="
-          << dp_token_nums << ", raw_dp_global_token_nums=" << raw_dp_token_nums
-          << ", decode_no_padding=" << decode_no_padding;
-      COUNTER_INC(num_model_execution_total_eager);
-      return run_eager();
-    }
+    LOG_FIRST_N(WARNING, 1)
+        << "Falling back to eager mode because DP ACL graph requires a "
+           "balanced, non-empty token distribution with decode padding. "
+           "dp_global_token_nums="
+        << dp_token_nums << ", raw_dp_global_token_nums=" << raw_dp_token_nums
+        << ", decode_no_padding=" << decode_no_padding;
+    COUNTER_INC(num_model_execution_total_eager);
+    return run_eager();
   }
 
   if (in_decoding_phase && dp_token_nums.size() > 1) {
@@ -1463,6 +1475,9 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
       params.is_spec_verify &&
       params.meta.batch_forward_type.is_chunked_prefill();
   if ((!in_decoding_phase && !in_spec_verify_phase) || args_.n_layers() == 1) {
+    return;
+  }
+  if (!is_qwen3_5_dp_graph_step_supported(args_, options_, params)) {
     return;
   }
   if (model_->requires_graph_forward_metadata()) {

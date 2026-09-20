@@ -214,6 +214,9 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   [[nodiscard]] int32_t graph_slot_count_for_test() const {
     return graph_slot_count_;
   }
+  [[nodiscard]] bool graph_slot_prepared_for_test(int32_t slot_idx) const {
+    return graph_slots_.at(static_cast<size_t>(slot_idx)).is_prepared;
+  }
   size_t get_graph_count() const;
   size_t get_graph_memory_pool_count();
   size_t get_graph_capture_stream_count() const;
