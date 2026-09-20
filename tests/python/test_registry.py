@@ -28,3 +28,13 @@ def test_unsupported_model_fails_before_import(monkeypatch: pytest.MonkeyPatch) 
         registry.get_model_class("qwen3_vl")
 
     import_model.assert_not_called()
+
+
+def test_glm5_next_text_and_vl_registry_entries_are_distinct(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
+
+    text_cls = registry.get_model_class("glm5_next")
+    vl_cls = registry.get_model_class("glm5_next_vl")
+
+    assert text_cls.__name__ == "Glm5NextForCausalLM"
+    assert vl_cls.__name__ == "Glm5NextVLModel"

@@ -67,6 +67,11 @@ except ImportError:
 
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import MlaIndexContext
+from xllm.python.model_executor.cp_utils import (
+    cp_merge_rows,
+    cp_shard_positions,
+    cp_shard_rows,
+)
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
     get_forward_context_or_none,
@@ -776,8 +781,23 @@ class Glm5NextKdaAttention(Attention):
             raise RuntimeError(
                 "Glm5NextKdaAttention requires an attention backend with execute_linear; run inside the engine."
             )
+        cp_context = getattr(ctx, "cp_context", None)
+        if cp_context is not None:
+            mixed_qkv = cp_merge_rows(mixed_qkv.transpose(1, 2).reshape(-1, self.conv_dim), cp_context)
+            mixed_qkv = mixed_qkv.unsqueeze(0).transpose(1, 2).contiguous()
+            g_raw = cp_merge_rows(
+                g_raw.reshape(-1, self.num_heads_local, self.head_dim),
+                cp_context,
+            ).unsqueeze(0)
+            beta = cp_merge_rows(beta.reshape(-1, self.num_heads_local), cp_context).unsqueeze(0)
+
         core_attn_out = backend.execute_linear(mixed_qkv, beta, self, raw_gate_proj=g_raw)
 
+        if cp_context is not None:
+            core_attn_out = cp_shard_rows(
+                core_attn_out.reshape(-1, self.num_heads_local, self.head_dim),
+                cp_context,
+            ).unsqueeze(0)
         output = self.o_norm(core_attn_out, gate).reshape(batch_size, seq_len, -1)
         # KDA is head-sharded: each rank's o_proj (row-parallel, input
         # qkv_dim_local) yields a partial hidden summed over its head-subset;
@@ -786,6 +806,9 @@ class Glm5NextKdaAttention(Attention):
         o = self.o_proj(output)
         if self.tp > 1:
             distributed.all_reduce_(o)
+        if cp_context is not None:
+            mask_shape = [1, cp_context.total_local] + [1] * (o.dim() - 2)
+            o = o.masked_fill(~cp_context.shard_valid_mask.view(mask_shape), 0)
         return o
 
 
@@ -1715,6 +1738,31 @@ class Glm5NextMlaAttention(Attention):
         kPool indexer updates the selected cache layout, runs ``select_topk``,
         and adapts the result to the SFA op's ``sparse_indices`` contract.
         """
+        forward_context = get_forward_context()
+        cp_context = getattr(forward_context, "cp_context", None)
+        if cp_context is not None:
+            hidden_states = cp_merge_rows(
+                hidden_states.reshape(-1, self.hidden_size),
+                cp_context,
+            ).unsqueeze(0)
+            position_ids = cp_merge_rows(
+                position_ids.reshape(-1, 1),
+                cp_context,
+            ).reshape(1, -1)
+            attention_mask = torch.ones(
+                1,
+                hidden_states.shape[1],
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            # Only shared-indexer layers consume top-k rows produced on the
+            # preceding CP-sharded layer; full indexers compute their own rows.
+            if self.indexer is None and prev_topk_indices is not None:
+                prev_topk_indices = cp_merge_rows(
+                    prev_topk_indices.reshape(prev_topk_indices.shape[0], -1),
+                    cp_context,
+                )
+
         num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
         hidden = hidden_states.view(num_tokens, -1)
         q_a, kv = self._project_qkv_a(hidden)
@@ -1742,11 +1790,21 @@ class Glm5NextMlaAttention(Attention):
         k_pe = None
 
         attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe, self, topk=topk)
+        if cp_context is not None:
+            attn_out = cp_shard_rows(
+                attn_out.reshape(num_tokens, self.num_heads_local, self.kv_lora_rank),
+                cp_context,
+            )
+        local_num_tokens = attn_out.shape[0]
         v_full = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
-        v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
+        v_full = v_full.reshape(local_num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
         if self.cfg.tp_size > 1:
             distributed.all_reduce_(o)
+        if cp_context is not None:
+            mask_shape = [cp_context.total_local] + [1] * (o.dim() - 1)
+            o = o.masked_fill(~cp_context.shard_valid_mask.view(mask_shape), 0)
+            topk = cp_shard_rows(topk.reshape(num_tokens, -1), cp_context).view(cp_context.total_local, 1, -1)
         return o, topk
 
 
@@ -2334,6 +2392,15 @@ class Glm5NextModel(nn.Module):
         batch_size, seq_len = hidden.shape[:2]
         if attention_mask is None:
             attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=hidden.device)
+
+        forward_context = get_forward_context()
+        cp_context = getattr(forward_context, "cp_context", None)
+        if cp_context is not None:
+            hidden = cp_shard_rows(hidden.view(-1, self.cfg.hidden_size), cp_context).unsqueeze(0)
+            position_ids = cp_shard_positions(position_ids.reshape(-1), cp_context).unsqueeze(0).contiguous()
+            attention_mask = cp_context.shard_valid_mask.unsqueeze(0)
+            batch_size, seq_len = hidden.shape[:2]
+
         # Expand embedding to hc_mult residual streams (all streams start
         # identical — reference model forward, modeling line 1521). NoPE: no
         # position embeddings are computed or threaded (reference passes None).
@@ -2348,6 +2415,8 @@ class Glm5NextModel(nn.Module):
         # token ids in the flattened sequence, so a 3-D output would select the
         # wrong (batch) axis and gather out of range for multi-token prefill.
         h = self.norm(self.hc_head(hidden)).view(-1, self.cfg.hidden_size)
+        if cp_context is not None:
+            h = cp_merge_rows(h, cp_context)
         return h
 
 

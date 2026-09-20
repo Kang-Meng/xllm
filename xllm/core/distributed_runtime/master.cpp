@@ -228,11 +228,17 @@ std::optional<std::string> validate_model_cp(const Options& options,
       static const std::unordered_set<std::string> kPythonCpCapableModels = {
           "qwen3",
           "glm_moe_dsa",
+          "glm5_next",
       };
       if (kPythonCpCapableModels.find(model_type) ==
           kPythonCpCapableModels.end()) {
         return "Python model-side CP does not support model_type=" +
-               model_type + "; supported models are qwen3 and glm_moe_dsa.";
+               model_type +
+               "; supported models are qwen3, glm_moe_dsa, and glm5_next.";
+      }
+      if (model_type == "glm5_next" && engine_type == EngineType::SSM) {
+        return "Python GLM-5 Next CP does not support target-side speculative "
+               "verification; run speculation on a cp_size=1 Decode instance";
       }
       if (model_type == "glm_moe_dsa" && engine_type == EngineType::SSM &&
           SpeculativeConfig::is_mtp_algorithm(
@@ -256,6 +262,38 @@ std::optional<std::string> validate_model_cp(const Options& options,
       }
       const int32_t kv_split =
           ParallelConfig::get_instance().kv_split_size_effective();
+      if (model_type == "glm5_next") {
+        if (options.ep_size() != 1) {
+          return "Python GLM-5 Next CP initially requires ep_size == 1";
+        }
+        if (kv_split != 1) {
+          return "Python GLM-5 Next CP initially requires kv_split_size == 1";
+        }
+        const SchedulerConfig& scheduler_config =
+            SchedulerConfig::get_instance();
+        if (scheduler_config.enable_chunked_prefill()) {
+          return "Python GLM-5 Next CP initially requires "
+                 "enable_chunked_prefill=false";
+        }
+        if (scheduler_config.enable_mix_batch()) {
+          return "Python GLM-5 Next CP initially requires "
+                 "enable_mix_batch=false";
+        }
+        if (KVCacheConfig::get_instance().enable_prefix_cache()) {
+          return "Python GLM-5 Next CP initially requires "
+                 "enable_prefix_cache=false";
+        }
+        if (scheduler_config.enable_schedule_overlap()) {
+          return "Python GLM-5 Next CP initially requires "
+                 "enable_schedule_overlap=false";
+        }
+        if (options.enable_disagg_pd()) {
+          return "Python GLM-5 Next CP does not support disaggregated PD";
+        }
+        if (options.enable_pd_ooc()) {
+          return "Python GLM-5 Next CP initially requires enable_pd_ooc=false";
+        }
+      }
       if (kv_split < 1 || options.cp_size() % kv_split != 0) {
         return "Python CP requires kv_split_size effective value to be a "
                "positive divisor of cp_size";
