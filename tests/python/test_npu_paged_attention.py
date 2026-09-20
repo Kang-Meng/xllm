@@ -70,7 +70,7 @@ def test_kda_dense_conv_dispatches_fused_activation(
     monkeypatch: pytest.MonkeyPatch, width: int, activation: str, is_prefill: bool
 ) -> None:
     backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
-    value = torch.arange(2 * 12 * width, dtype=torch.bfloat16).view(2, 12, width)
+    value = torch.arange(2 * 12 * width, dtype=torch.bfloat16).view(2, 12, width).transpose(1, 2)
     weight = torch.ones(12, 1, 4, dtype=torch.float32)
     layer = SimpleNamespace(
         layer_id=0, activation=activation, conv_weight_t=weight.squeeze(1).t().to(value.dtype).contiguous()
@@ -93,13 +93,13 @@ def test_kda_dense_conv_dispatches_fused_activation(
         assert query_start_loc == []
         assert activation_mode == (1 if activation == "silu" else 0)
         assert run_mode == (0 if is_prefill else 1)
-        torch.testing.assert_close(inputs, value.transpose(1, 2))
+        torch.testing.assert_close(inputs, value)
         dense_state.fill_(7)
         return expected_conv.clone()
 
     monkeypatch.setattr(torch.ops.xllm_ops, "causal_conv1d", native_conv)
     output = backend._causal_conv1d(value, state, layer, is_prefill=is_prefill)
-    torch.testing.assert_close(output, expected_conv.transpose(1, 2), rtol=0, atol=0)
+    torch.testing.assert_close(output, expected_conv, rtol=0, atol=0)
     assert output.dtype == torch.bfloat16
     assert torch.all(state == 7)
 
@@ -127,7 +127,11 @@ def test_kda_verify_uses_native_conv_in_eager_and_graph(
         layer_id=0,
         conv_weight_t=torch.ones(kernel_width, 3, dtype=value_dtype),
     )
-    metadata = SimpleNamespace(expanded_decode_metadata=None, kv_seq_lens=torch.tensor([1]))
+    metadata = SimpleNamespace(
+        expanded_decode_metadata=None,
+        kv_seq_lens=torch.tensor([1]),
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32),
+    )
     monkeypatch.setattr(module, "in_acl_graph", lambda: in_graph)
 
     def recurrent(query: torch.Tensor, *arguments: object, **options: object) -> torch.Tensor:
@@ -179,7 +183,11 @@ def test_kda_conv_tails_preserve_each_proposal_state(
         layer_id=0,
         conv_weight_t=torch.ones(state_length + 1, conv_dim),
     )
-    metadata = SimpleNamespace(expanded_decode_metadata=None, kv_seq_lens=torch.ones(token_count))
+    metadata = SimpleNamespace(
+        expanded_decode_metadata=None,
+        kv_seq_lens=torch.ones(token_count),
+        num_accepted_tokens=torch.ones(sequence_count, dtype=torch.int32),
+    )
 
     def recurrent(
         query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *args: object, **kwargs: object
@@ -218,6 +226,7 @@ def _run_kda_verify_step(
     ssm_cache: torch.Tensor,
     metadata: SimpleNamespace | None = None,
     layer_id: int = 0,
+    accepted_counts: list[int] | None = None,
 ) -> torch.Tensor:
     sequence_count = len(base_lengths)
     token_count = sequence_count * width
@@ -236,6 +245,7 @@ def _run_kda_verify_step(
         metadata = SimpleNamespace(
             expanded_decode_metadata=None,
             kv_seq_lens=(torch.tensor(base_lengths)[:, None] + torch.arange(width)).flatten(),
+            num_accepted_tokens=torch.tensor(accepted_counts or [1] * sequence_count, dtype=torch.int32),
         )
 
     def recurrent_contract(
@@ -274,29 +284,104 @@ def _run_kda_verify_step(
     )
 
 
-def test_kda_verify_reads_live_kv_lengths_on_every_call() -> None:
+def test_kda_verify_uses_explicit_acceptance_not_length_delta() -> None:
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._kda_verify_width = 4
+    conv_cache = torch.zeros(4, 1, 3)
+    ssm_cache = torch.zeros(4, 1, 1, 1)
+    metadata = SimpleNamespace(
+        expanded_decode_metadata=None,
+        kv_seq_lens=torch.tensor([10, 11, 12, 13, 20, 21, 22, 23]),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+    )
+    _run_kda_verify_step(backend, 4, [10, 20], conv_cache, ssm_cache, metadata=metadata)
+    metadata.num_accepted_tokens.copy_(torch.tensor([4, 2]))
+    output = _run_kda_verify_step(backend, 1, [10, 20], conv_cache, ssm_cache, metadata=metadata)
+    torch.testing.assert_close(output.flatten(), torch.tensor([5.0, 3.0], dtype=output.dtype))
+    assert "kv_prev" not in backend._kda_v3[0]
+    assert "armed_buf" not in backend._kda_v3[0]
+
+
+@pytest.mark.parametrize("width", [2, 4])
+def test_kda_pd_handoff_clears_only_selected_checkpoints(width: int) -> None:
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._kda_verify_width = width
+    conv_cache = torch.zeros(4, 1, 3)
+    ssm_cache = torch.zeros(4, 1, 1, 1)
+    for layer_id in [0, 1]:
+        _run_kda_verify_step(backend, width, [10, 20], conv_cache, ssm_cache, layer_id=layer_id)
+    snapshots = {
+        layer_id: {name: value.clone() for name, value in state.items() if name.startswith("combined_")}
+        for layer_id, state in backend._kda_v3.items()
+    }
+    addresses = {
+        (layer_id, name): state[name].data_ptr()
+        for layer_id, state in backend._kda_v3.items()
+        for name in snapshots[layer_id]
+    }
+
+    backend.reset_kda_spec_slots(torch.tensor([0, 0], dtype=torch.int32))
+
+    for layer_id, state in backend._kda_v3.items():
+        for name, expected in snapshots[layer_id].items():
+            expected[::4].zero_()
+            torch.testing.assert_close(state[name], expected)
+            assert state[name].data_ptr() == addresses[layer_id, name]
+    ssm_cache[0].fill_(100)
+    output = _run_kda_verify_step(backend, width, [50, 20], conv_cache, ssm_cache, accepted_counts=[1, width])
+    torch.testing.assert_close(output.view(2, width)[0, 0], torch.tensor(101.0, dtype=output.dtype))
+    torch.testing.assert_close(
+        output.view(2, width)[1, 0],
+        snapshots[0]["combined_ssm"][2 + (width - 1) * 4].squeeze().to(output.dtype) + 1,
+    )
+
+
+def test_kda_pd_handoff_before_first_verify_does_not_allocate_state() -> None:
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._kda_verify_width = 4
+    backend.reset_kda_spec_slots(torch.empty(0, dtype=torch.int64))
+    backend.reset_kda_spec_slots(torch.tensor([0], dtype=torch.int32))
+    assert "_kda_v3" not in backend.__dict__
+
+
+def test_kda_verify_reused_slot_uses_prefill_state_after_acceptance_reset() -> None:
+    backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
+    backend._kda_verify_width = 4
+    conv_cache = torch.zeros(4, 1, 3)
+    ssm_cache = torch.zeros(4, 1, 1, 1)
+    _run_kda_verify_step(backend, 4, [10, 20], conv_cache, ssm_cache)
+    ssm_cache[0].fill_(100)
+    ssm_cache[2].fill_(200)
+    output = _run_kda_verify_step(backend, 4, [50, 60], conv_cache, ssm_cache, accepted_counts=[1, 1])
+    torch.testing.assert_close(output.view(2, 4)[:, 0], torch.tensor([101.0, 201.0], dtype=output.dtype))
+
+
+def test_kda_verify_reads_live_acceptance_on_every_call() -> None:
     backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
     backend._kda_verify_width = 4
     conv_cache = torch.zeros(4, 1, 3)
     ssm_cache = torch.zeros(4, 1, 1, 1)
     lengths = torch.tensor([10, 11, 12, 13, 20, 21, 22, 23], dtype=torch.int32)
-    metadata = SimpleNamespace(expanded_decode_metadata=None, kv_seq_lens=lengths)
+    metadata = SimpleNamespace(
+        expanded_decode_metadata=None, kv_seq_lens=lengths, num_accepted_tokens=torch.ones(2, dtype=torch.int32)
+    )
     device = torch.device("cpu")
     original_address = lengths.data_ptr()
     with forward_context(ForwardContext(backend, device, metadata, [])):
         _run_kda_verify_step(backend, 4, [10, 20], conv_cache, ssm_cache, metadata=metadata)
         lengths.view(2, 4).add_(torch.tensor([[3], [1]], dtype=torch.int32))
+        metadata.num_accepted_tokens.copy_(torch.tensor([3, 1]))
         assert lengths.data_ptr() == original_address
         output = _run_kda_verify_step(backend, 4, [13, 21], conv_cache, ssm_cache, metadata=metadata)
         torch.testing.assert_close(output.view(2, 4)[:, 0], torch.tensor([4.0, 2.0], dtype=output.dtype))
-        torch.testing.assert_close(backend._kda_v3[0]["kv_prev"][[0, 2]], torch.tensor([13, 21]))
     lengths.add_(1)
+    metadata.num_accepted_tokens.fill_(1)
     with forward_context(ForwardContext(backend, device, metadata, [])):
         output = _run_kda_verify_step(backend, 4, [14, 22], conv_cache, ssm_cache, metadata=metadata)
         torch.testing.assert_close(output.view(2, 4)[:, 0], torch.tensor([5.0, 3.0], dtype=output.dtype))
 
 
-def test_kda_verify_reads_expanded_lengths_and_sequence_layout() -> None:
+def test_kda_verify_keeps_acceptance_sequence_scoped_with_expanded_metadata() -> None:
     backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
     backend._kda_verify_width = 4
     conv_cache = torch.zeros(8, 1, 3)
@@ -316,17 +401,18 @@ def test_kda_verify_reads_expanded_lengths_and_sequence_layout() -> None:
         expanded_decode_metadata=expanded,
         kv_seq_lens=torch.tensor([1, 2]),
         slot_mapping=torch.arange(8),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
     )
     device = torch.device("cpu")
     with forward_context(ForwardContext(backend, device, metadata, [])):
         _run_kda_verify_step(backend, 4, [40, 60], conv_cache, ssm_cache, metadata=metadata)
-        torch.testing.assert_close(backend._kda_v3[0]["kv_prev"][[0, 2]], torch.tensor([40, 60]))
+        metadata.num_accepted_tokens = torch.ones(4, dtype=torch.int32)
         _run_kda_verify_step(backend, 2, [40, 42, 60, 62], conv_cache, ssm_cache, metadata=metadata)
-        torch.testing.assert_close(backend._kda_v3[0]["kv_prev"][[0, 2, 4, 6]], torch.tensor([40, 42, 60, 62]))
     expanded.kv_seq_lens.add_(4)
+    metadata.num_accepted_tokens = torch.tensor([4, 2], dtype=torch.int32)
     with forward_context(ForwardContext(backend, device, metadata, [])):
-        _run_kda_verify_step(backend, 4, [44, 64], conv_cache, ssm_cache, metadata=metadata)
-        torch.testing.assert_close(backend._kda_v3[0]["kv_prev"][[0, 2]], torch.tensor([44, 64]))
+        output = _run_kda_verify_step(backend, 4, [44, 64], conv_cache, ssm_cache, metadata=metadata)
+        torch.testing.assert_close(output.view(2, 4)[:, 0], torch.tensor([5.0, 4.0], dtype=output.dtype))
 
 
 def test_kda_verify_selects_boundaries_across_plain_and_verify_steps() -> None:
@@ -336,21 +422,25 @@ def test_kda_verify_selects_boundaries_across_plain_and_verify_steps() -> None:
     ssm_cache = torch.zeros(4, 1, 1, 1)
     _run_kda_verify_step(backend, 1, [10, 20], conv_cache, ssm_cache)
     _run_kda_verify_step(backend, 4, [11, 21], conv_cache, ssm_cache)
-    output = _run_kda_verify_step(backend, 1, [14, 25], conv_cache, ssm_cache)
+    output = _run_kda_verify_step(backend, 1, [14, 25], conv_cache, ssm_cache, accepted_counts=[3, 4])
     torch.testing.assert_close(output.flatten(), torch.tensor([5.0, 6.0], dtype=output.dtype))
     torch.testing.assert_close(ssm_cache[[0, 2]].flatten(), torch.tensor([5.0, 6.0]))
 
 
-def test_kda_shared_metadata_preserves_per_layer_accepted_boundaries() -> None:
+def test_kda_shared_metadata_uses_identical_acceptance_across_layers() -> None:
     backend = NpuPagedAttentionBackend.__new__(NpuPagedAttentionBackend)
     backend._kda_verify_width = 4
     conv_caches = [torch.zeros(4, 1, 3), torch.zeros(4, 1, 3)]
     ssm_caches = [torch.zeros(4, 1, 1, 1), torch.zeros(4, 1, 1, 1)]
     for layer_id, base_length in enumerate((10, 12)):
         _run_kda_verify_step(backend, 4, [base_length], conv_caches[layer_id], ssm_caches[layer_id], layer_id=layer_id)
-    metadata = SimpleNamespace(expanded_decode_metadata=None, kv_seq_lens=torch.arange(14, 18, dtype=torch.int32))
+    metadata = SimpleNamespace(
+        expanded_decode_metadata=None,
+        kv_seq_lens=torch.arange(14, 18, dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([4], dtype=torch.int32),
+    )
     with forward_context(ForwardContext(backend, torch.device("cpu"), metadata, [])):
-        for layer_id, expected in enumerate((5.0, 3.0)):
+        for layer_id, expected in enumerate((5.0, 5.0)):
             output = _run_kda_verify_step(
                 backend, 4, [14], conv_caches[layer_id], ssm_caches[layer_id], metadata=metadata, layer_id=layer_id
             )

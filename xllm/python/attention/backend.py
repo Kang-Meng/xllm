@@ -127,6 +127,7 @@ class AttentionMetadata(Protocol):
     linear_state_read_indices: torch.Tensor | None
     linear_state_write_indices: torch.Tensor | None
     kpool_query_lens: Sequence[int]
+    num_accepted_tokens: torch.Tensor | None
     has_initial_state: torch.Tensor | None
     pd_handoff_reset_mask: torch.Tensor | None
     dp_execution_token_counts: Sequence[int]

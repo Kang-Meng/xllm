@@ -41,8 +41,8 @@ class KdaLinearAttentionMixin:
         query_start_loc: list[int] | None = None,
         is_prefill: bool = False,
     ) -> torch.Tensor:
-        """Run native convolution and activation against staged channel-last states."""
-        inputs = value.transpose(1, 2).contiguous()
+        """Convolve [batch, tokens, channels] values and update channel-last states."""
+        inputs = value.contiguous()
         if query_start_loc is not None:
             inputs = inputs.reshape(-1, inputs.shape[-1])
         output = torch.ops.xllm_ops.causal_conv1d(
@@ -53,61 +53,43 @@ class KdaLinearAttentionMixin:
             1 if layer.activation == "silu" else 0,
             0 if is_prefill else 1,
         )
-        return output.reshape(value.shape[0], value.shape[2], value.shape[1]).transpose(1, 2)
-
-    def disarm_kda_v3_slots(self, idx: torch.Tensor) -> None:
-        """Mark slots' V3 combined-pool state invalid (prefill restart)."""
-        idx64 = idx if idx.dtype == torch.int64 else idx.to(torch.int64)
-        for st in self.__dict__.get("_kda_v3", {}).values():
-            if "armed_buf" in st:
-                st["armed_buf"].index_fill_(0, idx64, False)
+        return output.reshape(value.shape)
 
     def reset_kda_spec_slots(self, idx: torch.Tensor) -> None:
-        """Invalidate process-local speculative state after a PD handoff."""
+        """Clear local checkpoints on PD handoff without replacing graph buffers."""
         if idx is None or idx.numel() == 0:
             return
-        self.disarm_kda_v3_slots(idx)
+        idx64 = torch.unique(idx.to(torch.int64))
+        for state in self.__dict__.get("_kda_v3", {}).values():
+            nslots = state["combined_conv"].shape[0] // self._kda_verify_width
+            offsets = torch.arange(self._kda_verify_width, device=idx64.device) * nslots
+            slot_indices = (idx64[:, None] + offsets[None, :]).flatten()
+            state["combined_conv"].index_fill_(0, slot_indices, 0)
+            state["combined_ssm"].index_fill_(0, slot_indices, 0)
 
-    def snapshot_kda_v3_state(self, idx: torch.Tensor):
-        """Snapshot V3 combined-pool rows the graph warmup/capture mutates."""
-        # Expanded verification repeats a sequence slot for each token row.
-        # One saved copy per physical slot restores the same state.
+    def snapshot_kda_v3_state(self, idx: torch.Tensor) -> list[tuple]:
+        """Snapshot each touched base/draft row once before graph capture."""
         idx64 = torch.unique(idx.to(torch.int64))
         snap = []
         for st in self.__dict__.get("_kda_v3", {}).values():
-            if "armed_buf" not in st:
-                continue
-            # nslots is the C++ pool capacity (armed_buf/kv_prev are sized to
-            # it); the combined pool holds rows_per_seq = R slots per seq
-            # (base + R-1 drafts), so snapshot ALL R slots — graph capture
-            # mutates every slot's conv/ssm state.
-            nslots = st["armed_buf"].shape[0]
-            rslots = st["combined_conv"].shape[0] // nslots
-            slot_idx = [idx64 + j * nslots for j in range(rslots)]
+            nslots = st["combined_conv"].shape[0] // self._kda_verify_width
+            offsets = torch.arange(self._kda_verify_width, device=idx64.device) * nslots
+            slot_idx = (idx64[:, None] + offsets[None, :]).flatten()
             snap.append(
                 (
                     st,
-                    idx64,
-                    nslots,
-                    rslots,
-                    [st["combined_conv"].index_select(0, s).clone() for s in slot_idx],
-                    [st["combined_ssm"].index_select(0, s).clone() for s in slot_idx],
-                    st["kv_prev"].index_select(0, idx64).clone(),
-                    st["armed_buf"].index_select(0, idx64).clone(),
+                    slot_idx,
+                    st["combined_conv"].index_select(0, slot_idx),
+                    st["combined_ssm"].index_select(0, slot_idx),
                 )
             )
-        return snap or None
+        return snap
 
     @staticmethod
-    def restore_kda_v3_state(snap) -> None:
-        if not snap:
-            return
-        for st, idx64, nslots, rslots, conv_snaps, ssm_snaps, kv, ar in snap:
-            for j in range(rslots):
-                st["combined_conv"].index_copy_(0, idx64 + j * nslots, conv_snaps[j])
-                st["combined_ssm"].index_copy_(0, idx64 + j * nslots, ssm_snaps[j])
-            st["kv_prev"].index_copy_(0, idx64, kv)
-            st["armed_buf"].index_copy_(0, idx64, ar)
+    def restore_kda_v3_state(snap: list[tuple]) -> None:
+        for st, slot_idx, conv_snap, ssm_snap in snap:
+            st["combined_conv"].index_copy_(0, slot_idx, conv_snap)
+            st["combined_ssm"].index_copy_(0, slot_idx, ssm_snap)
 
     def execute_linear(
         self,
@@ -301,12 +283,9 @@ class KdaLinearAttentionMixin:
                     ssm_cache,
                     recurrent_kda,
                 )
-            # Hybrid targets label eager verification as CHUNKED_PREFILL, but
-            # each token still needs its own recoverable conv/SSM state slot.
-            if is_prefill and not is_spec_verify:
-                self.disarm_kda_v3_slots(idx)
-            elif (
-                self._kda_verify_width > 1
+            if (
+                (not is_prefill or is_spec_verify)
+                and self._kda_verify_width > 1
                 and idx.numel() > 0
                 and mixed_qkv.dim() == 3
                 and mixed_qkv.shape[2] >= idx.numel()
@@ -345,6 +324,7 @@ class KdaLinearAttentionMixin:
         # tokens per sequence (seq_len > 1) but is still a decode step; the
         # seq_len heuristic would wrongly send it to the chunked prefill path.
         device = mixed_qkv.device
+        mixed_qkv = mixed_qkv.transpose(1, 2)
         if num_seqs == batch_size:
             mixed_qkv = self._causal_conv1d(mixed_qkv, conv_state, layer, is_prefill=is_prefill)
         else:
@@ -359,7 +339,7 @@ class KdaLinearAttentionMixin:
             seq_len = int(q_cu_list[-1])
             hidden_shape = (1, seq_len, -1, head_dim)
 
-        query, key, value = torch.split(mixed_qkv.transpose(1, 2), [qkv_dim] * 3, dim=-1)
+        query, key, value = torch.split(mixed_qkv, [qkv_dim] * 3, dim=-1)
         query = query.view(hidden_shape)
         key = key.view(hidden_shape)
         value = value.view(hidden_shape)

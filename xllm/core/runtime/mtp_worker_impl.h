@@ -154,14 +154,14 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
   void prepare_prefill_inputs(const ForwardInput& inputs,
                               ForwardInput& prefill_inputs);
   void prepare_draft_sampling(SamplingParameters& sampling_params) const;
+  bool supports_expanded_spec_verify() const;
   bool supports_explicit_spec_verify_replay_update() const;
   bool should_use_explicit_spec_verify_replay_update(
       const ForwardInput& input) const;
   // Returns true when the target model's spec-verify kernel requires the
   // validate width (val_tokens) to be identical across every sequence in the
-  // batch. Currently Qwen3.5 GDN's FusedRecurrentGatedDeltaRule spec-verify
-  // path has this constraint; other paths accept per-seq variable widths.
-  // Kept separate from supports_explicit_spec_verify_replay_update() so the
+  // batch.
+  // Kept separate from supports_expanded_spec_verify() so the
   // two capabilities can diverge for future targets.
   bool requires_uniform_validate_width() const;
   int64_t spec_verify_block_table_width(

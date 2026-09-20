@@ -1006,11 +1006,23 @@ class TestDecodeAclGraphSpeculativeMetadata:
         # capturing/replaying at the full 32-row token bucket.
         metadata = SimpleNamespace(
             is_prefill=False,
-            is_chunked_prefill=False,
-            kv_seq_lens=torch.full((32,), 8, dtype=torch.int32),
-            block_table=torch.zeros((32, 2), dtype=torch.int32),
+            is_chunked_prefill=True,
+            is_spec_verify=True,
+            slot_mapping=torch.arange(32, dtype=torch.int32),
+            kv_seq_lens=torch.full((8,), 8, dtype=torch.int32),
+            block_table=torch.zeros((8, 2), dtype=torch.int32),
             linear_state_indices=torch.arange(8, dtype=torch.int32),
-            q_cu_seq_lens=None,
+            q_cu_seq_lens=torch.arange(0, 33, 4, dtype=torch.int32),
+            expanded_decode_metadata=SimpleNamespace(
+                kv_seq_lens=torch.full((32,), 8, dtype=torch.int32),
+                block_table=torch.zeros((32, 2), dtype=torch.int32),
+                paged_kv_indptr=None,
+                paged_kv_indices=None,
+                paged_kv_last_page_len=None,
+                paged_attention_tiling_data=None,
+                kv_seq_lens_host=None,
+                kv_seq_lens_host_values=None,
+            ),
         )
 
         with patch.object(

@@ -832,8 +832,7 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
     context_ = impl_->context_;
     target_spec_verify_mode_ = mtp_async::classify_target_spec_verify_mode(
         context_.get_model_args().model_type());
-    if (target_spec_verify_mode_ ==
-        mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY) {
+    if (requires_uniform_validate_width()) {
       adaptive_spec_controller_.reset();
     }
   }
@@ -891,9 +890,9 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
     }
   }
 #if defined(USE_NPU)
-  if (result && supports_explicit_spec_verify_replay_update()) {
+  if (result && supports_expanded_spec_verify()) {
     CHECK_EQ(::xllm::KernelConfig::get_instance().npu_kernel_backend(), "TORCH")
-        << "Qwen3.5 MTP only supports NPU Torch backend";
+        << "Expanded MTP verify requires the NPU Torch backend";
   }
 #endif
   return result;
@@ -990,27 +989,24 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
   return output;
 }
 
+bool MTPWorkerImpl::supports_expanded_spec_verify() const {
+  return mtp_async::supports_expanded_spec_verify(
+      target_spec_verify_mode_,
+      ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl()));
+}
+
 bool MTPWorkerImpl::supports_explicit_spec_verify_replay_update() const {
-  if (target_spec_verify_mode_ ==
-      mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY) {
-    return true;
-  }
-  // The Python NPU paged-attention runner consumes expanded metadata and can
-  // replay its ACL graph for DeepSeek MLA. The native target executor has no
-  // corresponding MLA spec-verify graph path yet, so it remains generic.
-  return target_spec_verify_mode_ ==
-             mtp_async::TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY &&
-         ModelConfig::is_python_model_impl(context_.get_model_impl());
+  return mtp_async::supports_native_spec_verify_replay_update(
+      target_spec_verify_mode_,
+      ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl()));
 }
 
 bool MTPWorkerImpl::requires_uniform_validate_width() const {
-  // Currently only Qwen3.5's GDN spec-verify kernel requires uniform width;
-  // this happens to coincide with the QWEN3_5_EXPANDED_VERIFY mode used by
-  // supports_explicit_spec_verify_replay_update, but the two are semantically
-  // distinct capabilities (graph-update capability vs. per-seq varlen kernel
-  // support).
-  return target_spec_verify_mode_ ==
-         mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
+  return supports_expanded_spec_verify() &&
+         mtp_async::requires_uniform_spec_verify(
+             context_.get_model_args().model_type());
 }
 
 bool MTPWorkerImpl::should_use_explicit_spec_verify_replay_update(
@@ -1110,7 +1106,7 @@ void MTPWorkerImpl::ensure_spec_verify_control_block_table(
 bool MTPWorkerImpl::use_chunked_prefill_spec_verify_path() const {
   return target_spec_verify_mode_ ==
              mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
-         supports_explicit_spec_verify_replay_update();
+         supports_expanded_spec_verify();
 }
 
 ForwardInput
@@ -1400,7 +1396,7 @@ void MTPWorkerImpl::prepare_draft_sampling(
     // Qwen3.5 derives adaptive probabilities from logits instead.
     sampling_params.return_probs =
         !sampling_params.all_greedy_sample ||
-        (adaptive_enabled() && !supports_explicit_spec_verify_replay_update());
+        (adaptive_enabled() && !supports_expanded_spec_verify());
   }
 }
 
@@ -2108,8 +2104,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_adaptive_validate(
   // clamping it would commit a stale checkpoint (see issue #2247). Read from
   // embedding_cache directly since input.num_accepted_tokens_host is populated
   // by prepare_validate_inputs which hasn't run yet here.
-  if (supports_explicit_spec_verify_replay_update() &&
-      embedding_cache_ != nullptr &&
+  if (supports_expanded_spec_verify() && embedding_cache_ != nullptr &&
       !input.input_params.embedding.embedding_ids.empty()) {
     std::vector<int32_t> nat = embedding_cache_->read_accepted_prefix_lengths(
         input.input_params.embedding.embedding_ids,
@@ -3388,11 +3383,11 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     input_params.graph.input_tokens_override = validate_input.token_ids;
     input_params.graph.spec_verify_source_addresses_stable = true;
   } else {
-    if (supports_explicit_spec_verify_replay_update()) {
+    if (supports_expanded_spec_verify()) {
       ensure_spec_verify_control_block_table(input_params, num_sequences);
     }
     input_params.attention.rebuild_device_buffer(device_);
-    if (supports_explicit_spec_verify_replay_update()) {
+    if (supports_expanded_spec_verify()) {
       build_expanded_spec_verify_graph_input(
           input_params, device_, options_.block_size());
     }
@@ -3629,13 +3624,13 @@ void MTPWorkerImpl::prepare_validate_inputs(
   }
 
 #if defined(USE_NPU)
-  if (supports_explicit_spec_verify_replay_update()) {
+  if (supports_expanded_spec_verify()) {
     ensure_spec_verify_control_block_table(input_params, num_sequences);
   }
 #endif
   input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
-  if (supports_explicit_spec_verify_replay_update()) {
+  if (supports_expanded_spec_verify()) {
     build_expanded_spec_verify_graph_input(
         input_params, device_, options_.block_size());
   }
@@ -3845,7 +3840,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                      std::move(buf.out_kv_seq_lens),
                                      /*update_block_tables=*/true);
   }
-  if (supports_explicit_spec_verify_replay_update()) {
+  if (supports_expanded_spec_verify()) {
     input_params.attention.host.q_cu_seq_lens.clear();
     input_params.attention.host.q_cu_seq_lens.reserve(
         input_params.meta.num_sequences + 1);
@@ -3996,7 +3991,7 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
       std::move(input_params.attention.host.q_cu_seq_lens),
       buf.meta.kv_max_seq_len,
       std::move(buf.out_kv_seq_lens));
-  if (supports_explicit_spec_verify_replay_update()) {
+  if (supports_expanded_spec_verify()) {
     input_params.attention.host.q_cu_seq_lens.clear();
     input_params.attention.host.q_cu_seq_lens.reserve(
         input_params.meta.num_sequences + 1);

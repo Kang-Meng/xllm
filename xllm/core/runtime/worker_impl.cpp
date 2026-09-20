@@ -1370,6 +1370,12 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
           torch::arange(dummy_token_count, position_options.device(device_));
       input_params.embedding.linear_state_indices =
           torch::zeros({1}, token_options.dtype(torch::kInt32).device(device_));
+      if (options_.num_decoding_tokens() > 1 &&
+          has_linear_attention_layers(context_.get_model_args())) {
+        input_params.num_accepted_tokens_host = {1};
+        input_params.num_accepted_tokens =
+            torch::ones_like(input_params.embedding.linear_state_indices);
+      }
       if (idle_block_input) {
         apply_idle_block_dummy_input(input_params, dummy_token_count, device_);
       }

@@ -26,14 +26,22 @@ namespace xllm::mtp_async {
 enum class TargetSpecVerifyMode {
   GENERIC,
   CAUSAL_CHUNKED_PREFILL,
-  QWEN3_5_EXPANDED_VERIFY,
-  DEEPSEEK_V32_EXPANDED_VERIFY,
+  EXPANDED_VERIFY,
+  PYTHON_EXPANDED_VERIFY,
 };
 
 // Keep target verification policy closed over model types with validated
 // layouts. Unknown models retain the generic path.
 TargetSpecVerifyMode classify_target_spec_verify_mode(
     std::string_view model_type);
+
+bool supports_expanded_spec_verify(TargetSpecVerifyMode mode,
+                                   bool is_python_model);
+
+bool supports_native_spec_verify_replay_update(TargetSpecVerifyMode mode,
+                                               bool is_python_model);
+
+bool requires_uniform_spec_verify(std::string_view model_type);
 
 // Shared allocation/launch width for target verification block tables. The
 // extra entry covers the speculative token that can cross a block boundary.

@@ -778,7 +778,7 @@ class Glm5NextKdaAttention(Attention):
         # the backend, only when they actually need it (bit-exact, no second
         # f_a/f_b GEMM).
         g_raw, gate = self._project_fg(fg_latents)
-        beta = torch.sigmoid(beta_raw)
+        beta = torch.sigmoid(beta_raw.float())
 
         # KDA conv1d + delta-rule + conv/ssm state is owned by the backend
         # (NpuPagedAttentionBackend.execute_linear). No self-contained fallback
@@ -2026,7 +2026,7 @@ class Glm5NextMoE(nn.Module):
         self.inter_local = self.moe_inter // tp
         self.use_w8a8: bool = False  # set in load_weights via probe_quant
 
-        self.gate = nn.Linear(cfg.hidden_size, cfg.n_routed_experts, bias=False, dtype=dtype, device=device)
+        self.gate = nn.Linear(cfg.hidden_size, cfg.n_routed_experts, bias=False, dtype=torch.float32, device=device)
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(cfg.n_routed_experts, dtype=torch.float32, device=device),
@@ -2130,7 +2130,7 @@ class Glm5NextMoE(nn.Module):
         orig_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden)
         flat, scatter_state = dp_gather_tokens(flat, self.cfg.dp_size, self.cfg.dp_rank)
-        logits = self.gate(flat)
+        logits = self.gate(flat.float())
         topk_weights, topk_ids = kernels.moe_gate_routing(
             logits,
             self.e_score_correction_bias,
@@ -2874,6 +2874,8 @@ class Glm5NextForCausalLM(PyModelBase):
     def _load_mlp(self, L, mlp: str, i: int) -> None:
         if self.cfg.is_moe(i):
             moe = self.model.layers[i].mlp
+            moe.gate.weight.data = moe.gate.weight.data.float()
+            moe.e_score_correction_bias.data = moe.e_score_correction_bias.data.float()
             # Router (FLOAT, shared by both branches).
             L.load_fp(mlp + "gate.weight")
             # e_score_correction_bias quirk: checkpoint key lives under

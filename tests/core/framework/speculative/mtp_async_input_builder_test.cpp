@@ -309,6 +309,17 @@ TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
       py_metadata.attr("linear_state_read_indices").cast<torch::Tensor>(),
       torch::tensor({2, 6}, torch::kInt)));
   EXPECT_TRUE(py_metadata.attr("is_dummy").cast<bool>());
+  EXPECT_TRUE(py_metadata.attr("num_accepted_tokens").is_none());
+
+  params.num_accepted_tokens = torch::tensor({4, 2}, torch::kInt);
+  py::object accepted_metadata =
+      py::cast(PyAttentionMetadataView(metadata, params));
+  torch::Tensor accepted_counts =
+      accepted_metadata.attr("num_accepted_tokens").cast<torch::Tensor>();
+  EXPECT_EQ(accepted_counts.data_ptr(), params.num_accepted_tokens.data_ptr());
+  EXPECT_TRUE(torch::equal(accepted_counts, params.num_accepted_tokens));
+  params.num_accepted_tokens.fill_(1);
+  EXPECT_TRUE(torch::equal(accepted_counts, torch::ones({2}, torch::kInt)));
 }
 
 TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {

@@ -1243,38 +1243,19 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         ssm_cache,
         recurrent_kda,
     ) -> torch.Tensor:
-        """Fused multi-slot MTP spec-verify / plain-step path for KDA layers.
+        """Advance native KDA with persistent per-token speculative checkpoints.
 
-        The default KDA verify path uses the fused in-kernel-spec contract:
-        a persistent per-layer combined ``[base | draft]`` state pool
-        and a single ``recurrent_kda`` call per layer that advances BOTH the
-        confirmed (base) and draft (draft) tokens in one multi-token pass,
-        writing each token's resulting state to its own slot so both outcomes
-        survive to the next step (no stash, no host selection, no per-tap conv
-        decomposition of the recurrent state).
+        Metadata carries the previous verification's accepted-token count,
+        including its always-accepted base token, for each logical sequence.
+        Select checkpoint count-1 without inferring or clamping the count from
+        KV lengths or the current verification width. The selected SSM state
+        is staged into the base row before calling recurrent_kda with count 1.
 
-        Correctness invariants (see docs/mtp_graph_verify_design.md / B8):
-        - The fla_npu ``aclnnRecurrentKda`` kernel writes each token ``seq_i``'s
-          state to ``ssm_state_indices[seq_i]`` (per-token-slot writeback,
-          recurrent_kda.h CopyOutState). With
-          ``ssm_state_indices = [base, base+N]`` (1D packed per seq), processing
-          ``[b, d]`` writes after-b -> base slot, after-d -> draft slot; after-b
-          is preserved so rejection (next-step num_accepted=1) resumes from it.
-        - ``num_accepted_tokens=1`` always resumes from the base slot, which
-          holds the *selected* running state (after-b from a rejection, or
-          after-d copied base<-draft when the previous draft was accepted).
-          The selection uses device-side slot gathers independently of the
-          current step's width, not a host branch.
-        - Pools use the configured maximum decoding width so changing widths
-          never reallocates storage referenced by captured graphs. Cumulative
-          lengths are cached by both sequence count and current width.
-        - The C++ conv/ssm pools remain the source of truth for plain/prefill
-          steps: at verify entry the committed running state is copied into
-          the combined base region; at exit after-b (always accepted) is
-          committed back, so a plain step sees the correct state.
-        - Conv state is handled the same dual-slot way with the combined conv
-          pool; convolution and activation use the native CausalConv1d operator
-          for both eager execution and graph capture.
+        Pools retain the configured maximum width so captured addresses remain
+        stable across width changes. The C++ cache supplies the base state and
+        receives the new after-base state; draft checkpoints stay in this pool
+        until the next verification selects one. Graph capture must restore
+        both pools, even though no per-layer acceptance history is retained.
         """
         device = mixed_qkv.device
         num_seqs = idx.shape[0]
@@ -1305,36 +1286,22 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         scale = 1.0 / (head_dim**0.5)
         nslots = conv_cache.shape[0]  # C++ pool capacity
 
+        accepted_counts = getattr(metadata, "num_accepted_tokens", None)
+        if accepted_counts is None:
+            raise RuntimeError("KDA speculative execution requires num_accepted_tokens metadata")
+        if accepted_counts.ndim != 1 or accepted_counts.numel() < num_seqs:
+            raise ValueError("KDA accepted-token metadata must cover every logical sequence")
+        accepted_counts = accepted_counts[:num_seqs].to(device=device, dtype=torch.int64)
+
         st = self.__dict__.setdefault("_kda_v3", {}).setdefault(layer.layer_id, {})
-        if "armed_buf" not in st:
+        if "combined_conv" not in st:
             pool_slots = self._kda_verify_width * nslots
             st["combined_conv"] = torch.zeros(
                 pool_slots, conv_state_len, conv_dim, dtype=conv_cache.dtype, device=device
             )
             st["combined_ssm"] = torch.zeros(pool_slots, nh, head_dim, head_dim, dtype=ssm_cache.dtype, device=device)
-            st["kv_prev"] = torch.zeros(nslots, dtype=torch.int64, device=device)
-            st["armed_buf"] = torch.zeros(nslots, dtype=torch.bool, device=device)
         combined_conv = st["combined_conv"]
         combined_ssm = st["combined_ssm"]
-        kv_prev = st["kv_prev"]
-        armed_buf = st["armed_buf"]
-
-        expanded = resolve_expanded_decode_metadata(metadata)
-        kv_src = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
-        kv_rows = kv_src.to(device=device, dtype=torch.int64)
-        base_now = kv_rows.view(num_seqs, -1)[:, 0].contiguous()
-        if expanded is None and kv_rows.numel() == num_seqs and rows_per_seq > 1:
-            # Sequence-scoped KV lengths include the entire query block. Use
-            # the first token's boundary, as in expanded metadata, so a change
-            # in verification width does not alter the previous accepted count.
-            base_now = base_now - (rows_per_seq - 1)
-        armed_h = armed_buf.index_select(0, idx)
-        kv_prev_h = kv_prev.index_select(0, idx)
-        accepted_counts = torch.where(
-            armed_h,
-            (base_now - kv_prev_h).clamp(min=1, max=self._kda_verify_width),
-            torch.ones_like(base_now),
-        )
 
         idx64 = idx if idx.dtype == torch.int64 else idx.to(torch.int64)
         idx32 = idx64.to(torch.int32)
@@ -1359,20 +1326,17 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         sel_conv = combined_conv.index_select(0, boundary_slot)  # [S, Ks, C]
         combined_ssm.index_copy_(0, idx64, combined_ssm.index_select(0, boundary_slot))
 
-        cache_boundary = sel_conv.transpose(1, 2).contiguous()  # [S, C, Ks]
-        x = mixed_qkv.reshape(conv_dim, num_seqs, rows_per_seq).permute(1, 0, 2).contiguous()
-        cin = torch.cat([cache_boundary.to(x.dtype), x], dim=-1)
-        conv_out = self._causal_conv1d(x, sel_conv, layer)
-        # multi-tail conv_state: slot j (0=base ... R-1=last draft) <- window
-        # ending after token j. For R==2 this is base<-tail_b / draft1<-tail_full
-        # (== legacy dual-tail); for R==1 only base is written (a plain step's
-        # next verify has m=1 -> base, so draft slots are never read).
-        for proposal in range(rows_per_seq):
-            tail = cin[..., proposal + 1 : proposal + 1 + conv_state_len].transpose(1, 2).contiguous()
-            combined_conv.index_copy_(0, idx64 + proposal * nslots, tail)
+        conv_input = mixed_qkv.reshape(conv_dim, num_seqs, rows_per_seq).permute(1, 2, 0).contiguous()
+        conv_history = torch.cat([sel_conv, conv_input], dim=1)
+        conv_out = self._causal_conv1d(conv_input, sel_conv, layer)
+        conv_checkpoints = torch.stack(
+            [conv_history[:, proposal + 1 : proposal + 1 + conv_state_len] for proposal in range(rows_per_seq)],
+            dim=1,
+        ).reshape(-1, conv_state_len, conv_dim)
+        combined_conv.index_copy_(0, ssm_state_indices.to(torch.int64), conv_checkpoints)
 
         # ---- 4) split conv_out -> q/k/v; gate/beta -> g/b (TND, [T,nh,hd]) ----
-        c_split = conv_out.transpose(1, 2).split(qkv_dim, dim=-1)
+        c_split = conv_out.split(qkv_dim, dim=-1)
         q = c_split[0].reshape(-1, nh, head_dim).to(torch.bfloat16)
         k = c_split[1].reshape(-1, nh, head_dim).to(torch.bfloat16)
         v = c_split[2].reshape(-1, nh, head_dim).to(torch.bfloat16)
@@ -1409,9 +1373,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         conv_cache.index_copy_(0, idx64, combined_conv[:nslots].index_select(0, idx64))
         ssm_cache.index_copy_(0, idx64, combined_ssm[:nslots].index_select(0, idx64))
 
-        # ---- 8) bookkeeping for next step's m ----
-        kv_prev.index_copy_(0, idx64, base_now)
-        armed_buf.index_fill_(0, idx64, True)
         return core_out.view(1, num_seqs * rows_per_seq, nh, head_dim)
 
     def _mla_sparse(

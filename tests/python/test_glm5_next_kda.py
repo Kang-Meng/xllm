@@ -263,14 +263,15 @@ def test_merged_input_rejects_quantized_checkpoint(projection: str, quantization
 
 @pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 1), (8, 7)])
 @pytest.mark.parametrize("batch_size,seq_len", [(1, 1), (1, 17), (3, 4)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_merged_input_forward_preserves_backend_arguments_and_output(
-    tp_size: int, tp_rank: int, batch_size: int, seq_len: int, monkeypatch: pytest.MonkeyPatch
+    tp_size: int, tp_rank: int, batch_size: int, seq_len: int, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     torch.manual_seed(42)
     model, tensors = _make_model(tp_size, tp_rank)
-    attention = model.model.layers[0].self_attn
-    hidden_states = torch.randn(batch_size, seq_len * 2, model.cfg.hidden_size)[:, ::2]
+    attention = model.model.layers[0].self_attn.to(dtype=dtype)
+    hidden_states = torch.randn(batch_size, seq_len * 2, model.cfg.hidden_size, dtype=dtype)[:, ::2]
     query, key, value, beta_raw, forget_latent, output_latent = _reference_projections(
         hidden_states, tensors, tp_size, tp_rank
     )
@@ -288,7 +289,8 @@ def test_merged_input_forward_preserves_backend_arguments_and_output(
     ) -> torch.Tensor:
         assert layer is attention
         torch.testing.assert_close(mixed_qkv, expected_qkv)
-        torch.testing.assert_close(beta, beta_raw.sigmoid())
+        assert beta.dtype == torch.float32
+        torch.testing.assert_close(beta, beta_raw.float().sigmoid())
         torch.testing.assert_close(raw_gate_proj, expected_raw)
         return core_output
 
@@ -331,13 +333,13 @@ def test_merged_qkv_strides_preserve_causal_conv_and_state(
     for seq_len in (17, 1, 4, 1):
         hidden_states = torch.randint(-4, 4, (batch_size, seq_len, model.cfg.hidden_size)).float() / 8
         projected = attention.in_proj_qkvbfg_a(hidden_states)
-        mixed_qkv = projected.split(attention.input_projection_sizes, dim=-1)[0].transpose(1, 2)
+        mixed_qkv = projected.split(attention.input_projection_sizes, dim=-1)[0]
         query, key, value, *_ = _reference_projections(hidden_states, tensors, tp_size, tp_rank)
-        reference_qkv = torch.cat((query, key, value), dim=-1).transpose(1, 2)
-        assert mixed_qkv.stride(-1) == sum(attention.input_projection_sizes)
-        assert reference_qkv.stride(-1) == attention.conv_dim
+        reference_qkv = torch.cat((query, key, value), dim=-1)
+        assert mixed_qkv.stride(1) == sum(attention.input_projection_sizes)
+        assert reference_qkv.stride(1) == attention.conv_dim
         torch.testing.assert_close(mixed_qkv, reference_qkv, rtol=0, atol=0)
-        expected_state = torch.cat((reference_state, reference_qkv.transpose(1, 2)), dim=1)[:, -conv_state.size(1) :]
+        expected_state = torch.cat((reference_state, reference_qkv), dim=1)[:, -conv_state.size(1) :]
         actual = backend._causal_conv1d(mixed_qkv, conv_state, attention, is_prefill=is_prefill)
         expected = backend._causal_conv1d(reference_qkv, reference_state, attention, is_prefill=is_prefill)
         assert causal_conv1d_reference[-2]["weight"] is attention.conv_weight_t
@@ -524,7 +526,7 @@ def test_real_kda_merged_projection_graph_replay(
             output_gate = attention.g_b_proj(output_latent).view(hidden_shape)
         return (
             mixed_qkv.transpose(1, 2),
-            beta_raw.sigmoid(),
+            beta_raw.float().sigmoid(),
             raw_gate,
             attention.forget_gate.gate_from_raw(raw_gate),
             output_gate,

@@ -46,16 +46,34 @@ torch::Tensor gather_sequence_rows(const torch::Tensor& values,
 TargetSpecVerifyMode classify_target_spec_verify_mode(
     std::string_view model_type) {
   if (is_qwen3_5_target_model_type(model_type)) {
-    return TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
+    return TargetSpecVerifyMode::EXPANDED_VERIFY;
   }
   if (model_type == "deepseek_v32" || model_type == "deepseek_v4" ||
-      model_type == "deepseek_v4_dspark") {
-    return TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY;
+      model_type == "deepseek_v4_dspark" ||
+      is_glm5_next_target_model_type(model_type)) {
+    return TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY;
   }
   if (model_type == "mimo") {
     return TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL;
   }
   return TargetSpecVerifyMode::GENERIC;
+}
+
+bool supports_expanded_spec_verify(TargetSpecVerifyMode mode,
+                                   bool is_python_model) {
+  return mode == TargetSpecVerifyMode::EXPANDED_VERIFY ||
+         (mode == TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY &&
+          is_python_model);
+}
+
+bool requires_uniform_spec_verify(std::string_view model_type) {
+  return is_qwen3_5_target_model_type(model_type) ||
+         is_glm5_next_target_model_type(model_type);
+}
+
+bool supports_native_spec_verify_replay_update(TargetSpecVerifyMode mode,
+                                               bool is_python_model) {
+  return !is_python_model && supports_expanded_spec_verify(mode, false);
 }
 
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,

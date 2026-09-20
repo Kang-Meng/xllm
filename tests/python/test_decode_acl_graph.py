@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
+from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadata
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
 )
@@ -60,6 +61,79 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
         is_prefill=False,
         is_chunked_prefill=False,
     )
+
+
+def test_accepted_tokens_use_live_per_sequence_graph_buffer() -> None:
+    runner = _runner()
+    input_ids = torch.arange(4, dtype=torch.int32)
+    positions = torch.arange(4, dtype=torch.int32)
+    metadata = _metadata(torch.tensor([3, 3, 7, 7], dtype=torch.int32))
+    metadata.num_accepted_tokens = torch.tensor([4, 2], dtype=torch.int32)
+    entry = runner._allocate_entry(8, input_ids, positions, metadata)
+    static_counts = entry.static_metadata.num_accepted_tokens
+    address = static_counts.data_ptr()
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
+        assert static_counts.tolist() == [4, 2, 1, 1, 1, 1, 1, 1]
+        metadata.num_accepted_tokens.copy_(torch.tensor([1, 3]))
+        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
+        assert static_counts.tolist() == [1, 3, 1, 1, 1, 1, 1, 1]
+        metadata.num_accepted_tokens = torch.tensor([2], dtype=torch.int32)
+        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
+        assert static_counts.tolist() == [2, 1, 1, 1, 1, 1, 1, 1]
+        metadata.num_accepted_tokens = None
+        metadata.is_dummy = True
+        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
+    assert static_counts.data_ptr() == address
+    assert static_counts.tolist() == [1] * 8
+
+
+def test_verify_graph_key_tracks_width_not_active_sequence_count() -> None:
+    runner = _runner()
+    captured_keys = []
+
+    def capture_key(key: tuple) -> None:
+        captured_keys.append(key)
+        raise LookupError("graph key recorded")
+
+    runner._graphs = SimpleNamespace(get=capture_key)
+    with patch(
+        "xllm.python.model_executor.runners.decode_acl_graph.resolve_expanded_decode_metadata",
+        return_value=object(),
+    ):
+        for sequence_count, width in ((3, 4), (4, 4), (8, 2)):
+            input_ids = torch.arange(sequence_count * width, dtype=torch.int32)
+            metadata = SimpleNamespace(linear_state_indices=torch.arange(sequence_count))
+            with pytest.raises(LookupError, match="graph key recorded"):
+                runner.execute(input_ids, input_ids, metadata)
+    assert captured_keys[0] == captured_keys[1]
+    assert captured_keys[1] != captured_keys[2]
+
+
+@pytest.mark.parametrize(
+    "accepted_counts,error_type",
+    [
+        (None, RuntimeError),
+        (torch.ones(2, 2, dtype=torch.int32), ValueError),
+        (torch.ones(0, dtype=torch.int32), ValueError),
+        (torch.ones(5, dtype=torch.int32), ValueError),
+    ],
+)
+def test_accepted_tokens_reject_missing_or_invalid_replay_metadata(
+    accepted_counts: torch.Tensor | None, error_type: type[Exception]
+) -> None:
+    runner = _runner()
+    input_ids = torch.arange(4, dtype=torch.int32)
+    positions = torch.arange(4, dtype=torch.int32)
+    metadata = _metadata(torch.tensor([3, 3, 7, 7], dtype=torch.int32))
+    metadata.num_accepted_tokens = torch.ones(2, dtype=torch.int32)
+    entry = runner._allocate_entry(8, input_ids, positions, metadata)
+    metadata.num_accepted_tokens = accepted_counts
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True),
+        pytest.raises(error_type, match="accepted-token metadata"),
+    ):
+        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
 
 
 def test_slice_output_preserves_aux_hidden_tuple() -> None:
@@ -127,21 +201,54 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
 
 
-def test_untyped_verify_reuses_row_aligned_paging_metadata() -> None:
+def test_explicit_verify_reuses_row_aligned_paging_metadata() -> None:
     runner = _runner()
     metadata = _metadata(torch.tensor([1, 2], dtype=torch.int32))
+    metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
+        kv_seq_lens=metadata.kv_seq_lens,
+        block_table=metadata.block_table,
+        paged_kv_indptr=metadata.paged_kv_indptr,
+        paged_kv_indices=metadata.paged_kv_indices,
+        paged_kv_last_page_len=metadata.paged_kv_last_page_len,
+        paged_attention_tiling_data=None,
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
+    )
+    metadata.is_spec_verify = True
+    metadata.is_chunked_prefill = True
+    metadata.num_accepted_tokens = torch.tensor([4, 2], dtype=torch.int32)
+    metadata.q_seq_lens = torch.tensor([2, 2], dtype=torch.int32)
+    metadata.q_cu_seq_lens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    metadata.kv_seq_lens = torch.tensor([2, 4], dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [2, 4]
+    metadata.kv_cu_seq_lens = torch.tensor([0, 2, 6], dtype=torch.int32)
+    metadata.block_table = metadata.block_table[1::2]
 
     with patch.object(
         runner,
         "_build_row_aligned_paged_kv_metadata",
         side_effect=AssertionError("row-aligned paging must come from C++"),
     ):
-        expanded = runner._expanded_verify_view(metadata)
+        resolved = runner._decode_metadata(metadata)
 
-    assert expanded is not None
-    assert expanded.paged_kv_indptr is metadata.paged_kv_indptr
-    assert expanded.paged_kv_indices is metadata.paged_kv_indices
-    assert expanded.paged_kv_last_page_len is metadata.paged_kv_last_page_len
+    assert resolved[3] is metadata.paged_kv_indptr
+    assert resolved[4] is metadata.paged_kv_indices
+    assert resolved[5] is metadata.paged_kv_last_page_len
+    input_ids = torch.arange(4, dtype=torch.int32)
+    assert runner.can_execute(input_ids, metadata)
+    entry = runner._allocate_entry(8, input_ids, input_ids, metadata)
+    assert entry.static_metadata.is_spec_verify
+    assert entry.static_metadata.q_seq_lens.tolist() == [2, 2, 2, 2]
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+    assert entry.static_metadata.num_accepted_tokens.tolist() == [4, 2, 1, 1, 1, 1, 1, 1]
+    assert entry.static_metadata.linear_state_indices.tolist() == [1, 1, 2, 2, 0, 0, 0, 0]
+
+
+def test_verify_graph_requires_explicit_metadata() -> None:
+    runner = _runner()
+    metadata = _metadata(torch.tensor([1, 2], dtype=torch.int32))
+    assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])

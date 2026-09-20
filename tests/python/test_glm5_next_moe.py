@@ -24,6 +24,7 @@ import pytest
 import torch
 from torch import nn
 
+from xllm.python.layers.qlinear import QLinearWeightLoader
 from xllm.python.models import glm5_next
 from xllm.python.models.glm5_next_weight import W8A8WeightLoader
 
@@ -528,6 +529,61 @@ def test_native_numerical_fixture_is_away_from_input_quantization_ties(rows: int
     assert not torch.equal(original["hidden"], case["hidden"])
 
 
+class _RouterStateDict:
+    def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
+        self.tensors = tensors
+
+    def has(self, name: str) -> bool:
+        return name in self.tensors
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        return self.tensors[name]
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_router_loading_preserves_fp32_weights_and_bias_after_model_cast(
+    monkeypatch: pytest.MonkeyPatch, quantized: bool
+) -> None:
+    config = glm5_next.Glm5NextConfig.from_dict(
+        dict(
+            hidden_size=8,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            n_layers=1,
+            first_k_dense_replace=0,
+        )
+    )
+    module = glm5_next.Glm5NextMoE(config, torch.bfloat16, torch.device("cpu")).bfloat16()
+    model = glm5_next.Glm5NextForCausalLM.__new__(glm5_next.Glm5NextForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.cfg = config
+    model.model = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.mlp = module
+    model.model.layers = torch.nn.ModuleList([layer])
+    prefix = "model.layers.0.mlp."
+    weight = torch.linspace(0.001, 0.2, 32).view(4, 8)
+    bias = torch.tensor([1.0001, 1.0002, 1.0003, 1.0004])
+    tensors = {prefix + "gate.weight": weight, prefix + "gate.e_score_correction_bias": bias}
+    if quantized:
+        tensors[prefix + "experts.0.gate_proj.weight_scale"] = torch.ones(1)
+    loader = QLinearWeightLoader(model, [_RouterStateDict(tensors)], 1, 0)
+    monkeypatch.setattr(model, "_load_experts_w8a8", lambda *_args: None)
+    monkeypatch.setattr(model, "_load_experts_bf16", lambda *_args: None)
+    monkeypatch.setattr(model, "_load_mlp_fp_or_w8a8", lambda *_args: None)
+    monkeypatch.setattr(module, "process_weights_after_loading", lambda: None)
+    model._load_mlp(loader, prefix, 0)
+    assert module.use_w8a8 == quantized
+    assert module.gate.weight.dtype == torch.float32
+    assert module.e_score_correction_bias.dtype == torch.float32
+    torch.testing.assert_close(module.gate.weight, weight, rtol=0, atol=0)
+    torch.testing.assert_close(module.e_score_correction_bias, bias, rtol=0, atol=0)
+    pointers = (module.gate.weight.data_ptr(), module.e_score_correction_bias.data_ptr())
+    model._load_mlp(loader, prefix, 0)
+    assert pointers == (module.gate.weight.data_ptr(), module.e_score_correction_bias.data_ptr())
+
+
 @pytest.mark.parametrize("shape", [(1, 8), (4, 8), (1, 4, 8)])
 def test_quantized_expert_scales_are_loaded_in_kernel_dtypes(
     monkeypatch: pytest.MonkeyPatch, shape: tuple[int, ...]
@@ -589,17 +645,24 @@ def test_quantized_expert_scales_are_loaded_in_kernel_dtypes(
         calls.append(args[5])
         return torch.zeros_like(hidden)
 
-    monkeypatch.setattr(glm5_next.kernels, "grouped_moe_with_selected_experts", grouped_moe, raising=False)
-    monkeypatch.setattr(
-        glm5_next.kernels,
-        "moe_gate_routing",
-        lambda logits, *args, **kwargs: (
+    hidden = torch.ones(shape, dtype=torch.bfloat16)
+
+    def route(
+        logits: torch.Tensor, bias: torch.Tensor, *args: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert logits.dtype == torch.float32
+        assert bias.dtype == torch.float32
+        assert bias is module.e_score_correction_bias
+        torch.testing.assert_close(
+            logits, torch.nn.functional.linear(hidden.reshape(-1, config.hidden_size).float(), module.gate.weight)
+        )
+        return (
             torch.ones(logits.shape[0], config.num_experts_per_tok),
             torch.zeros(logits.shape[0], config.num_experts_per_tok, dtype=torch.int32),
-        ),
-        raising=False,
-    )
-    hidden = torch.ones(shape, dtype=torch.bfloat16)
+        )
+
+    monkeypatch.setattr(glm5_next.kernels, "grouped_moe_with_selected_experts", grouped_moe, raising=False)
+    monkeypatch.setattr(glm5_next.kernels, "moe_gate_routing", route, raising=False)
     for _ in range(2):
         torch.testing.assert_close(module(hidden), hidden, rtol=0, atol=0)
     assert len(calls) == 2

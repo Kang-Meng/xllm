@@ -110,6 +110,8 @@ void register_attention_metadata_views(py::module_& module) {
           &PyAttentionMetadataView::linear_state_write_indices)
       .def_property_readonly("kpool_query_lens",
                              &PyAttentionMetadataView::kpool_query_lens)
+      .def_property_readonly("num_accepted_tokens",
+                             &PyAttentionMetadataView::num_accepted_tokens)
       .def_property_readonly("has_initial_state",
                              &PyAttentionMetadataView::has_initial_state)
       .def_property_readonly("pd_handoff_reset_mask",
@@ -225,6 +227,7 @@ PyAttentionMetadataView::PyAttentionMetadataView(
   new_cache_slots_host_values_ = params.attention.host.new_cache_slots;
   multi_block_tables_ = params.multi_block_tables;
   linear_state_indices_ = params.embedding.linear_state_indices;
+  num_accepted_tokens_ = params.num_accepted_tokens;
   if (!params.embedding.linear_state_read_ids.empty() &&
       (metadata_->is_prefill || metadata_->is_chunked_prefill) &&
       params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) {
@@ -335,6 +338,10 @@ py::object PyAttentionMetadataView::kv_seq_lens() const {
 
 py::object PyAttentionMetadataView::linear_state_indices() const {
   return optional_tensor(linear_state_indices_);
+}
+
+py::object PyAttentionMetadataView::num_accepted_tokens() const {
+  return optional_tensor(num_accepted_tokens_);
 }
 
 py::object PyAttentionMetadataView::linear_state_read_indices() const {
