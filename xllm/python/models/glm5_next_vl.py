@@ -833,9 +833,10 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         vcfg.tp_size = int(config.get("tp_size", 1))
         vcfg.tp_rank = int(config.get("tp_rank", 0))
 
-        tcfg = Glm5NextConfig.from_dict(text_cfg_dict)
-        tcfg.tp_size = int(config.get("tp_size", 1))
-        tcfg.tp_rank = int(config.get("tp_rank", 0))
+        # Merge runtime overrides before deriving MoE-TP defaults or validating
+        # the text configuration. Mutating attention TP afterwards leaves the
+        # derived MoE axes stale for nested text_config inputs.
+        tcfg = Glm5NextConfig.from_dict(config)
 
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "cuda"))

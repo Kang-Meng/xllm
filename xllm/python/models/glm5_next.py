@@ -110,6 +110,7 @@ def _compact_kpool_triton_query_len(
 _SCORES_SLAB_CAP_BYTES = int(1.5 * 1024**3)
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.linear import ColumnParallelLinear
+from xllm.python.layers.moe_dp import dp_gather_tokens, reduce_and_scatter
 from xllm.python.layers.qlinear import QLinear
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.glm5_next_kpool import (
@@ -401,6 +402,23 @@ class Glm5NextConfig:
     indexer_types: list = field(default_factory=list)  # "full" / "shared"
     tp_size: int = 1
     tp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+    dp_size: int = 1
+    dp_rank: int = 0
+    moe_tp_size: Optional[int] = None
+    moe_tp_rank: Optional[int] = None
+    expert_parallel_degree: int = 0
+    enable_mega_moe: bool = False
+    enable_fused_mc2: bool = False
+
+    def __post_init__(self) -> None:
+        # Preserve TP-only construction through both from_dict and the public
+        # dataclass constructor. Native EP callers supply the MoE group axes.
+        if self.moe_tp_size is None:
+            self.moe_tp_size = self.tp_size
+        if self.moe_tp_rank is None:
+            self.moe_tp_rank = self.tp_rank
 
     @classmethod
     def from_dict(cls, d: dict) -> Glm5NextConfig:
@@ -480,6 +498,15 @@ class Glm5NextConfig:
             index_kpool_always_select_tail=bool(pick("index_kpool_always_select_tail", default=False)),
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
+            ep_size=int(pick("ep_size", default=1)),
+            ep_rank=int(pick("ep_rank", default=0)),
+            dp_size=int(pick("dp_size", default=1)),
+            dp_rank=int(pick("dp_rank", default=0)),
+            moe_tp_size=int(pick("moe_tp_size", default=pick("tp_size", default=1))),
+            moe_tp_rank=int(pick("moe_tp_rank", default=pick("tp_rank", default=0))),
+            expert_parallel_degree=int(pick("expert_parallel_degree", default=0)),
+            enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
+            enable_fused_mc2=bool(pick("enable_fused_mc2", default=False)),
             # mHC fields: ModelArgs may emit a 0 default (un-plumbed); treat 0
             # /None as unset and fall back to the real 300B defaults.
             hc_mult=(int(pick("hc_mult", default=4)) or 4),
@@ -487,7 +514,30 @@ class Glm5NextConfig:
             hc_sinkhorn_iters=(int(pick("hc_sinkhorn_iters", default=20)) or 20),
         )
         cfg._resolve_schedules(full_attn_layers, d)
+        cfg._validate_moe_parallelism()
         return cfg
+
+    def _validate_moe_parallelism(self) -> None:
+        if self.expert_parallel_degree not in (0, 1):
+            raise ValueError("GLM-5.3-Flash supports ordinary EP level 1 only; expert_parallel_degree must be 0 or 1")
+        if self.enable_mega_moe:
+            raise ValueError("GLM-5.3-Flash ordinary EP does not support enable_mega_moe")
+        if self.enable_fused_mc2:
+            raise ValueError("GLM-5.3-Flash ordinary EP does not support enable_fused_mc2")
+        for name in ("tp", "ep", "dp", "moe_tp"):
+            size = getattr(self, f"{name}_size")
+            rank = getattr(self, f"{name}_rank")
+            if size <= 0 or not 0 <= rank < size:
+                raise ValueError(f"invalid {name} parallel size/rank: {size}/{rank}")
+        if self.n_routed_experts % self.ep_size:
+            raise ValueError("n_routed_experts must be divisible by ep_size")
+        if self.moe_intermediate_size % self.moe_tp_size:
+            raise ValueError("moe_intermediate_size must be divisible by moe_tp_size")
+        if self.ep_size == 1 and self.dp_size == 1:
+            if (self.moe_tp_size, self.moe_tp_rank) != (self.tp_size, self.tp_rank):
+                raise ValueError("TP-only MoE must use the attention TP size and rank")
+        elif self.ep_size * self.moe_tp_size != self.dp_size * self.tp_size:
+            raise ValueError("EP size times MoE-TP size must equal DP size times attention TP size")
 
     def _resolve_schedules(self, full_attn_layers: list, d: dict) -> None:
         n = self.n_layers
@@ -1764,27 +1814,28 @@ class Glm5NextMLP(nn.Module):
 
 
 class Glm5NextExperts(nn.Module):
-    """3D-stacked experts (SwiGLU) dispatched via one-hot mask + index_add_.
+    """Local EP experts with MoE-TP-sharded SwiGLU intermediates.
 
-    The 3D params are sized by the LOCAL (TP-sharded) intermediate so each rank
-    holds a column-slice of the expert weights; the per-expert matmul emits a
-    partial-sum along ``down_proj``'s output that the MoE's final all_reduce_
-    combines across ranks.
+    Global routing IDs select the rank-local expert range. The parent MoE
+    combines the partial down-projection outputs across the expert axes.
     """
 
     def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.num_experts = cfg.n_routed_experts
-        self.tp = cfg.tp_size
+        self.num_local_experts = cfg.n_routed_experts // cfg.ep_size
+        self.local_expert_start = cfg.ep_rank * self.num_local_experts
+        self.local_expert_end = self.local_expert_start + self.num_local_experts
+        self.tp = cfg.moe_tp_size
         self.swiglu_limit = cfg.swiglu_limit
         # Local shard of the expert intermediate (inter // tp).
-        self.intermediate_dim = cfg.moe_intermediate_size // cfg.tp_size
+        self.intermediate_dim = cfg.moe_intermediate_size // cfg.moe_tp_size
         self.hidden_dim = cfg.hidden_size
         self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim, dtype=dtype, device=device)
+            torch.empty(self.num_local_experts, 2 * self.intermediate_dim, self.hidden_dim, dtype=dtype, device=device)
         )
         self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim, dtype=dtype, device=device)
+            torch.empty(self.num_local_experts, self.hidden_dim, self.intermediate_dim, dtype=dtype, device=device)
         )
 
     def forward(
@@ -1817,6 +1868,8 @@ class Glm5NextExperts(nn.Module):
         final_f32 = torch.zeros(n_tokens, topk, hidden, dtype=torch.float32, device=hidden_states.device)
         with torch.no_grad():
             mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            if self.num_local_experts != self.num_experts:
+                mask = mask[self.local_expert_start : self.local_expert_end]
             hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in hit:
             expert_idx = expert_idx[0]
@@ -1850,6 +1903,11 @@ class Glm5NextExperts(nn.Module):
 
         flat_indices = top_k_index.flatten()  # [N]
         flat_weights = top_k_weights.flatten()  # [N]
+        if self.num_local_experts != self.num_experts:
+            flat_indices = flat_indices - self.local_expert_start
+            local_mask = (flat_indices >= 0) & (flat_indices < self.num_local_experts)
+            flat_indices = flat_indices.clamp(0, self.num_local_experts - 1)
+            flat_weights = flat_weights * local_mask
 
         # Repeat each token's hidden state for every expert slot it has.
         h = hidden_states.repeat_interleave(topk, dim=0)  # [N, hidden]
@@ -1886,8 +1944,12 @@ class Glm5NextMoE(nn.Module):
     def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
-        tp = cfg.tp_size
+        cfg._validate_moe_parallelism()
+        tp = cfg.moe_tp_size
         self.num_experts = cfg.n_routed_experts
+        self.num_local_experts = self.num_experts // cfg.ep_size
+        self.local_expert_start = cfg.ep_rank * self.num_local_experts
+        self.local_expert_end = self.local_expert_start + self.num_local_experts
         self.topk = cfg.num_experts_per_tok
         self.n_group = cfg.n_group
         self.topk_group = cfg.topk_group
@@ -1948,10 +2010,10 @@ class Glm5NextMoE(nn.Module):
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
             param.data = kernels.format_cast_nz(transposed)
             del transposed
-        self.experts_w13_scale.data = self.experts_w13_scale.data.view(self.num_experts, -1).contiguous()
-        self.experts_w13_offset.data = self.experts_w13_offset.data.view(self.num_experts, -1).contiguous()
-        self.experts_w2_scale.data = self.experts_w2_scale.data.view(self.num_experts, -1).contiguous()
-        self.experts_w2_offset.data = self.experts_w2_offset.data.view(self.num_experts, -1).contiguous()
+        self.experts_w13_scale.data = self.experts_w13_scale.data.view(self.num_local_experts, -1).contiguous()
+        self.experts_w13_offset.data = self.experts_w13_offset.data.view(self.num_local_experts, -1).contiguous()
+        self.experts_w2_scale.data = self.experts_w2_scale.data.view(self.num_local_experts, -1).contiguous()
+        self.experts_w2_offset.data = self.experts_w2_offset.data.view(self.num_local_experts, -1).contiguous()
         _call_process_weights_after_loading(self.shared_experts)
 
     def _topk(self, hidden_states: torch.Tensor):
@@ -1980,48 +2042,70 @@ class Glm5NextMoE(nn.Module):
         return router_logits, topk_weights, topk_indices
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_w8a8:
+            return self._forward_w8a8(hidden_states)
+        if self.cfg.ep_size > 1 or self.cfg.dp_size > 1:
+            raise NotImplementedError("GLM-5.3-Flash ordinary EP/DP supports W8A8 expert weights only, not BF16")
+        return self._forward_bf16_tp(hidden_states)
+
+    def _forward_bf16_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Retain the established BF16 TP-only expert and reduction path."""
         orig_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden)
-        if self.use_w8a8:
-            # W8A8: fused grouped_moe kernel does routing+quantized matmul
-            # (sigmoid + noaux_tc + norm_topk_prob, routed_scaling=1.0 inside).
-            # Mirrors DeepseekV3MoE.forward (deepseek_v32.py:830-850).
-            logits = self.gate(flat)
-            routed = kernels.grouped_moe(
-                flat,
-                logits,
-                self.experts_w13,
-                self.experts_w2,
-                self.experts_w13_scale,
-                self.experts_w2_scale,
-                self.e_score_correction_bias,
-                self.topk,
-                self.topk_group,
-                self.n_group,
-                self.cfg.norm_topk_prob,
-                # Kernel applies routed_scaling inside its fused top-k; pass
-                # 1.0 and keep the external multiply below (pre-graph
-                # behavior, numerically identical since scaling is linear).
-                routed_scaling_factor=1.0,
-                # GLM5.3 w8a8 MoE requires cumulative-offset routing metadata
-                # (type=1) on both the init-routing and grouped-matmul sides;
-                # the default (0) is the DeepSeek-V3.2 layout.
-                expert_tokens_num_type=1,
-                group_list_type=1,
-            )
-            routed = routed * self.routed_scaling
-            out = routed.view(*orig_shape)
-        else:
-            # bf16: existing _topk routing + Glm5NextExperts per-expert loop.
-            _, topk_weights, topk_indices = self._topk(hidden_states)
-            out = self.experts(flat, topk_indices, topk_weights).view(*orig_shape)
+        _, topk_weights, topk_indices = self._topk(hidden_states)
+        out = self.experts(flat, topk_indices, topk_weights).view(*orig_shape)
         final = out + self.shared_experts(hidden_states)
-        # Single TP all-reduce on the combined routed+shared output. shared_experts
-        # is built with skip_tp_reduce=True so its row-parallel reduce folds into
-        # this one call (matches deepseek_v32 DeepseekV3MoE).
         if self.cfg.tp_size > 1:
             distributed.all_reduce_(final)
         return final
+
+    def _forward_w8a8(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Use clamped local experts and joint reduction for every TP/EP/DP layout."""
+        orig_shape = hidden_states.shape
+        flat = hidden_states.view(-1, self.hidden)
+        flat, scatter_state = dp_gather_tokens(flat, self.cfg.dp_size, self.cfg.dp_rank)
+        logits = self.gate(flat)
+        topk_weights, topk_ids = kernels.moe_gate_routing(
+            logits,
+            self.e_score_correction_bias,
+            self.topk,
+            self.topk_group,
+            self.n_group,
+            self.cfg.norm_topk_prob,
+            routed_scaling_factor=1.0,
+        )
+        # The V2 provider consumes [gate | up] columns and retains GLM clamp.
+        out = kernels.grouped_moe_with_selected_experts(
+            flat,
+            topk_weights,
+            topk_ids,
+            self.experts_w13,
+            self.experts_w2,
+            self.experts_w13_scale,
+            self.experts_w2_scale,
+            num_total_experts=self.num_experts,
+            start_expert_id=self.local_expert_start,
+            num_experts_per_rank=self.num_local_experts,
+            swiglu_limit=self.cfg.swiglu_limit,
+        )
+        out = (out * self.routed_scaling).float()
+        # Shared weights remain attention-TP sharded. Each DP group evaluates
+        # only its own execution rows, contributing each shared shard once.
+        # Reuse the routed buffer's local view: no shared gather, replication
+        # factor, or separate TP reduction is needed. Graph capture supplies
+        # fixed padded DP execution counts through the same scatter state.
+        # Accumulate and reduce in FP32: adding BF16 routed/shared partials
+        # first otherwise amplifies rounding when those terms cancel.
+        shared = self.shared_experts(hidden_states).view(-1, self.hidden).float()
+        scatter_state.scatter(out).add_(shared)
+        out = reduce_and_scatter(
+            out,
+            scatter_state,
+            reduce_results=True,
+            moe_tp_size=self.cfg.moe_tp_size,
+            ep_size=self.cfg.ep_size,
+        )
+        return out.to(hidden_states.dtype).view(*orig_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -2572,7 +2656,7 @@ class Glm5NextForCausalLM(PyModelBase):
             )
             L.load_fp(mlp_pfx + "down_proj.weight", dim=1)
 
-    def _load_experts_w8a8(self, L, mlp: str, n: int) -> None:
+    def _load_experts_w8a8(self, L, mlp: str) -> None:
         """W8A8 expert load (mirrors DeepseekV3MoE loop, deepseek_v32.py:1018-1044).
 
         Per expert: gate+up cat after shard dim0 -> experts_w13[j]; down shard
@@ -2586,30 +2670,31 @@ class Glm5NextForCausalLM(PyModelBase):
         layer_idx = int(mlp.split("layers.")[1].split(".")[0])
         moe_mod = self.model.layers[layer_idx].mlp
         ref = moe_mod.gate.weight
-        num_experts, inter_local, hidden = (moe_mod.num_experts, moe_mod.inter_local, moe_mod.hidden)
+        num_local_experts, inter_local, hidden = (moe_mod.num_local_experts, moe_mod.inter_local, moe_mod.hidden)
         if not hasattr(moe_mod, "experts_w13"):
             moe_mod.experts_w13 = nn.Parameter(
-                torch.empty(num_experts, 2 * inter_local, hidden, dtype=torch.int8, device=ref.device),
+                torch.empty(num_local_experts, 2 * inter_local, hidden, dtype=torch.int8, device=ref.device),
                 requires_grad=False,
             )
             # Offsets must be zero: the int8-grouped path needs symmetric
             # experts (process_weights_after_loading asserts offset == 0).
             moe_mod.register_buffer(
                 "experts_w13_scale",
-                torch.empty(num_experts, 2 * inter_local, 1, dtype=torch.float32, device=ref.device),
+                torch.empty(num_local_experts, 2 * inter_local, 1, dtype=torch.float32, device=ref.device),
             )
             moe_mod.register_buffer(
                 "experts_w13_offset",
-                torch.zeros(num_experts, 2 * inter_local, 1, dtype=torch.float32, device=ref.device),
+                torch.zeros(num_local_experts, 2 * inter_local, 1, dtype=torch.float32, device=ref.device),
             )
             moe_mod.experts_w2 = nn.Parameter(
-                torch.empty(num_experts, hidden, inter_local, dtype=torch.int8, device=ref.device), requires_grad=False
+                torch.empty(num_local_experts, hidden, inter_local, dtype=torch.int8, device=ref.device),
+                requires_grad=False,
             )
             moe_mod.register_buffer(
-                "experts_w2_scale", torch.empty(num_experts, hidden, 1, dtype=torch.bfloat16, device=ref.device)
+                "experts_w2_scale", torch.empty(num_local_experts, hidden, 1, dtype=torch.bfloat16, device=ref.device)
             )
             moe_mod.register_buffer(
-                "experts_w2_offset", torch.zeros(num_experts, hidden, 1, dtype=torch.float32, device=ref.device)
+                "experts_w2_offset", torch.zeros(num_local_experts, hidden, 1, dtype=torch.float32, device=ref.device)
             )
         w13 = self.get_parameter(mlp + "experts_w13")
         w2 = self.get_parameter(mlp + "experts_w2")
@@ -2617,7 +2702,9 @@ class Glm5NextForCausalLM(PyModelBase):
         w13o = self.get_buffer(mlp + "experts_w13_offset")
         w2s = self.get_buffer(mlp + "experts_w2_scale")
         w2o = self.get_buffer(mlp + "experts_w2_offset")
-        for j in range(n):
+        shard_world = self.cfg.moe_tp_size
+        shard_rank = self.cfg.moe_tp_rank
+        for local_index, j in enumerate(range(moe_mod.local_expert_start, moe_mod.local_expert_end)):
             gw = L.load_tensor(se + f"{j}.gate_proj.weight")
             gs = L.load_tensor(se + f"{j}.gate_proj.weight_scale")
             go = L.load_tensor(se + f"{j}.gate_proj.weight_offset")
@@ -2627,14 +2714,20 @@ class Glm5NextForCausalLM(PyModelBase):
             dw = L.load_tensor(se + f"{j}.down_proj.weight")
             ds = L.load_tensor(se + f"{j}.down_proj.weight_scale")
             do_ = L.load_tensor(se + f"{j}.down_proj.weight_offset")
-            w13.data[j].copy_(torch.cat([L.shard(gw, 0), L.shard(uw, 0)], dim=0).contiguous())
-            w13s.data[j].copy_(torch.cat([L.shard(gs, 0), L.shard(us, 0)], dim=0).contiguous())
-            w13o.data[j].copy_(torch.cat([L.shard(go, 0), L.shard(uo, 0)], dim=0).contiguous())
-            w2.data[j].copy_(L.shard(dw, 1).contiguous())
-            w2s.data[j].copy_(ds.contiguous())
-            w2o.data[j].copy_(do_.contiguous())
+            w13.data[local_index].copy_(
+                torch.cat([L.shard(gw, 0, shard_world, shard_rank), L.shard(uw, 0, shard_world, shard_rank)], dim=0)
+            )
+            w13s.data[local_index].copy_(
+                torch.cat([L.shard(gs, 0, shard_world, shard_rank), L.shard(us, 0, shard_world, shard_rank)], dim=0)
+            )
+            w13o.data[local_index].copy_(
+                torch.cat([L.shard(go, 0, shard_world, shard_rank), L.shard(uo, 0, shard_world, shard_rank)], dim=0)
+            )
+            w2.data[local_index].copy_(L.shard(dw, 1, shard_world, shard_rank))
+            w2s.data[local_index].copy_(ds)
+            w2o.data[local_index].copy_(do_)
 
-    def _load_experts_bf16(self, L, mlp: str, n: int) -> None:
+    def _load_experts_bf16(self, L, mlp: str) -> None:
         """bf16 expert load (existing 3D cat-stack path, extracted from _load_mlp).
 
         Lazily constructs ``self.experts`` (Glm5NextExperts) — it is left unbuilt
@@ -2647,6 +2740,7 @@ class Glm5NextForCausalLM(PyModelBase):
         # from the already-built int8 expert param.
         layer_idx = int(mlp.split("layers.")[1].split(".")[0])
         moe_mod = self.model.layers[layer_idx].mlp
+        expert_start, expert_end = moe_mod.local_expert_start, moe_mod.local_expert_end
         if moe_mod.experts is None:
             # bf16 experts — dtype/device from the shared experts (the int8
             # params are lazily created only on the W8A8 path).
@@ -2657,24 +2751,35 @@ class Glm5NextForCausalLM(PyModelBase):
         # (see _load_mlp comment: a contiguous shard of the cat'd tensor crosses
         # the gate/up boundary). At tp==1 the shard is a no-op.
         if L.find(mlp + "experts.gate_up_proj") is not None:
-            gu = L.load_tensor(mlp + "experts.gate_up_proj")
+            gu = L.load_tensor(mlp + "experts.gate_up_proj")[expert_start:expert_end]
             gate_full, up_full = gu.split([gu.size(1) // 2, gu.size(1) // 2], dim=1)
         else:
-            gate_full = torch.stack([L.load_tensor(mlp + f"experts.{e}.gate_proj.weight") for e in range(n)], dim=0)
-            up_full = torch.stack([L.load_tensor(mlp + f"experts.{e}.up_proj.weight") for e in range(n)], dim=0)
-        gate = L.shard(gate_full, dim=1)
-        up = L.shard(up_full, dim=1)
+            gate_full = torch.stack(
+                [
+                    L.load_tensor(mlp + f"experts.{expert}.gate_proj.weight")
+                    for expert in range(expert_start, expert_end)
+                ]
+            )
+            up_full = torch.stack(
+                [L.load_tensor(mlp + f"experts.{expert}.up_proj.weight") for expert in range(expert_start, expert_end)]
+            )
+        gate = L.shard(gate_full, dim=1, world=self.cfg.moe_tp_size, rank=self.cfg.moe_tp_rank)
+        up = L.shard(up_full, dim=1, world=self.cfg.moe_tp_size, rank=self.cfg.moe_tp_rank)
         gu = torch.cat([gate, up], dim=1)
         L.copy_in(mlp + "experts.gate_up_proj", gu)
         if L.find(mlp + "experts.down_proj") is not None:
-            dn = L.load_tensor(mlp + "experts.down_proj")
+            dn = L.load_tensor(mlp + "experts.down_proj")[expert_start:expert_end]
         else:
-            dn = torch.stack([L.load_tensor(mlp + f"experts.{e}.down_proj.weight") for e in range(n)], dim=0)
-        L.copy_in(mlp + "experts.down_proj", L.shard(dn, dim=2))
+            dn = torch.stack(
+                [
+                    L.load_tensor(mlp + f"experts.{expert}.down_proj.weight")
+                    for expert in range(expert_start, expert_end)
+                ]
+            )
+        L.copy_in(mlp + "experts.down_proj", L.shard(dn, dim=2, world=self.cfg.moe_tp_size, rank=self.cfg.moe_tp_rank))
 
     def _load_mlp(self, L, mlp: str, i: int) -> None:
         if self.cfg.is_moe(i):
-            n = self.cfg.n_routed_experts
             moe = self.model.layers[i].mlp
             # Router (FLOAT, shared by both branches).
             L.load_fp(mlp + "gate.weight")
@@ -2685,11 +2790,13 @@ class Glm5NextForCausalLM(PyModelBase):
             # Expert branch: probe exp0's gate_proj for a weight_scale tensor.
             # Real W8A8 checkpoints carry weight_scale; bf16 checkpoints do not.
             is_w8a8 = L.find(mlp + "experts.0.gate_proj.weight_scale") is not None
+            if not is_w8a8 and (self.cfg.ep_size > 1 or self.cfg.dp_size > 1):
+                raise NotImplementedError("GLM-5.3-Flash ordinary EP/DP supports W8A8 expert weights only, not BF16")
             moe.use_w8a8 = is_w8a8
             if is_w8a8:
-                self._load_experts_w8a8(L, mlp, n)
+                self._load_experts_w8a8(L, mlp)
             else:
-                self._load_experts_bf16(L, mlp, n)
+                self._load_experts_bf16(L, mlp)
             self._load_mlp_fp_or_w8a8(L, mlp + "shared_experts.")
             _call_process_weights_after_loading(moe)
         else:
