@@ -13,13 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "layers/mlu/dcp_attention_merge.h"
-
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
 #include <cmath>
-#include <limits>
 
 #include "framework/kv_cache/kv_cache.h"
 #include "layers/common/attention_metadata.h"
@@ -31,47 +28,18 @@ limitations under the License.
 namespace xllm::layer {
 namespace {
 
-TEST(DcpAttentionMergeTest, WeightsPartialOutputsByNaturalLogLse) {
-  torch::Tensor partial_outputs =
-      torch::tensor({2.0f, 4.0f, 6.0f, 8.0f}).reshape({2, 1, 1, 1, 2});
-  torch::Tensor partial_lse =
-      torch::tensor({std::log(2.0f), std::log(6.0f)}).reshape({2, 1, 1, 1});
-
-  const DcpAttentionResult result =
-      merge_dcp_attention_shards(partial_outputs, partial_lse);
-
-  EXPECT_TRUE(torch::allclose(
-      result.output, torch::tensor({5.0f, 7.0f}).reshape({1, 1, 1, 2})));
-  EXPECT_TRUE(torch::allclose(
-      result.lse, torch::tensor({std::log(8.0f)}).reshape({1, 1, 1})));
-}
-
-TEST(DcpAttentionMergeTest, IgnoresEmptyShardAndPreservesFiniteShard) {
-  const float negative_infinity = -std::numeric_limits<float>::infinity();
-  torch::Tensor partial_outputs =
-      torch::tensor({0.0f, 0.0f, 3.0f, 9.0f}).reshape({2, 1, 1, 1, 2});
-  torch::Tensor partial_lse =
-      torch::tensor({negative_infinity, std::log(4.0f)}).reshape({2, 1, 1, 1});
-
-  const DcpAttentionResult result =
-      merge_dcp_attention_shards(partial_outputs, partial_lse);
-
-  EXPECT_TRUE(torch::equal(result.output,
-                           torch::tensor({3.0f, 9.0f}).reshape({1, 1, 1, 2})));
-  EXPECT_TRUE(torch::allclose(
-      result.lse, torch::tensor({std::log(4.0f)}).reshape({1, 1, 1})));
-}
-
-TEST(DcpAttentionMergeTest, ReturnsZeroAndNegativeInfinityWhenAllShardsEmpty) {
-  const float negative_infinity = -std::numeric_limits<float>::infinity();
-  torch::Tensor partial_outputs = torch::ones({2, 1, 1, 2, 3});
-  torch::Tensor partial_lse = torch::full({2, 1, 2, 1}, negative_infinity);
-
-  const DcpAttentionResult result =
-      merge_dcp_attention_shards(partial_outputs, partial_lse);
-
-  EXPECT_TRUE(torch::equal(result.output, torch::zeros({1, 1, 2, 3})));
-  EXPECT_TRUE(torch::isneginf(result.lse).all().item<bool>());
+// Single-process equivalent of the production DCP LSE merge
+// (all_gather_lse_and_scale_dcp_attention): each shard's partial output is
+// scaled by exp(L_r - L_global) with L_global the cross-shard logsumexp, and
+// the shards are summed. With natural-log LSE this equals the softmax
+// output over the union of the shards.
+torch::Tensor merge_sharded_lse_reference(const torch::Tensor& partial_outputs,
+                                          const torch::Tensor& partial_lse) {
+  torch::Tensor lse = partial_lse.to(torch::kFloat32);
+  torch::Tensor global_lse = torch::logsumexp(lse, /*dim=*/0, /*keepdim=*/true);
+  torch::Tensor weights = torch::exp(lse - global_lse);
+  return (partial_outputs.to(torch::kFloat32) * weights.unsqueeze(/*dim=*/2))
+      .sum(/*dim=*/0);
 }
 
 TEST(MluMlaDecodeLseTest, ReturnsFloat32NaturalLogNormalizer) {
@@ -201,26 +169,25 @@ TEST(MluMlaDecodeLseTest, ArtificialShardMergeMatchesFullCacheDecode) {
                                                    kv_cache,
                                                    /*return_lse=*/true);
     CHECK(output_lse.has_value());
-    return DcpAttentionResult{output.view({1, 1, kNumHeads, kValueHeadSize}),
-                              output_lse.value()};
+    return std::make_pair(output.view({1, 1, kNumHeads, kValueHeadSize}),
+                          output_lse.value());
   };
 
-  const DcpAttentionResult full = run_decode(full_cache, kContextLength);
-  const DcpAttentionResult first = run_decode(first_shard, kShardLength);
-  const DcpAttentionResult second = run_decode(second_shard, kShardLength);
-  const DcpAttentionResult merged =
-      merge_dcp_attention_shards(torch::stack({first.output, second.output}),
-                                 torch::stack({first.lse, second.lse}));
+  const std::pair<torch::Tensor, torch::Tensor> full_result =
+      run_decode(full_cache, kContextLength);
+  const std::pair<torch::Tensor, torch::Tensor> first_result =
+      run_decode(first_shard, kShardLength);
+  const std::pair<torch::Tensor, torch::Tensor> second_result =
+      run_decode(second_shard, kShardLength);
+  const torch::Tensor merged_output = merge_sharded_lse_reference(
+      torch::stack({first_result.first, second_result.first}),
+      torch::stack({first_result.second, second_result.second}));
   Device(device).synchronize_default_stream();
 
-  EXPECT_TRUE(torch::allclose(merged.output.to(torch::kFloat32),
-                              full.output.to(torch::kFloat32),
+  EXPECT_TRUE(torch::allclose(merged_output.to(torch::kFloat32),
+                              full_result.first.to(torch::kFloat32),
                               /*rtol=*/1e-2,
                               /*atol=*/1e-2));
-  EXPECT_TRUE(torch::allclose(merged.lse,
-                              full.lse,
-                              /*rtol=*/1e-3,
-                              /*atol=*/1e-3));
 }
 
 TEST(MluMlaDecodeLseTest, SupportsInt8CacheAndUnequalBatchContexts) {

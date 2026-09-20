@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "backend.h"
+#include "triton_jit/include/backend.h"
 
 #include <dlfcn.h>
 #include <pybind11/embed.h>
@@ -28,7 +28,7 @@ limitations under the License.
 #include <vector>
 
 #if defined(USE_MLU)
-#include "backends/mlu_backend.h"
+#include "triton_jit/include/backends/mlu_backend.h"
 #endif
 
 namespace py = pybind11;
@@ -336,6 +336,15 @@ std::string TritonBackend::compile(const std::string& path,
   py::dict options = options_to_py(compile_options_json());
   if (!cfg.bottleneck.empty()) {
     options["bottleneck"] = cfg.bottleneck;
+  }
+  if (cfg.enable_fp_fusion.has_value()) {
+    options["enable_fp_fusion"] = *cfg.enable_fp_fusion;
+  }
+  if (cfg.enable_soft_i64.has_value()) {
+    options["enable_soft_i64"] = *cfg.enable_soft_i64;
+  }
+  if (cfg.force_use_shared_memory.has_value()) {
+    options["force_use_shared_memory"] = *cfg.force_use_shared_memory;
   }
   py::object result = mod.attr("compile")(path,
                                           name,

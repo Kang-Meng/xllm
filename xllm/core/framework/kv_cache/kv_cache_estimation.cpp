@@ -104,28 +104,28 @@ int64_t index_slot_size(const ModelArgs& model_args,
         << "KPool cache layouts do not support indexer_cache_dtype=\"int8\".";
     CHECK_GT(model_args.index_kpool(), 0) << "KPool requires index_kpool > 0.";
   }
-  int64_t split_factor = 1;
-  if (Platform::supports_dsa_indexer_cache_sharding() &&
-      util::kv_split_size_effective() > 1) {
-    split_factor = util::kv_split_size_effective();
+  int64_t replication_factor = 1;
+  if (Platform::requires_dsa_indexer_cache_replication()) {
+    replication_factor = util::kv_split_size_effective();
   }
   if (enable_indexer_cache_quantization) {
     // int8 index cache: one byte per element, plus an independent per-token
     // fp32 scale (kept separate from the main-KV scale_slot_size path).
-    return split_factor * (static_cast<int64_t>(sizeof(int8_t)) * index_n_head *
-                               model_args.index_head_dim() +
-                           static_cast<int64_t>(sizeof(float)));
+    return replication_factor *
+           (static_cast<int64_t>(sizeof(int8_t)) * index_n_head *
+                model_args.index_head_dim() +
+            static_cast<int64_t>(sizeof(float)));
   }
   if (uses_compressed_tail) {
     CHECK_EQ(model_args.index_head_dim() % model_args.index_kpool(), 0)
         << "KPool index head dim must be divisible by index_kpool.";
-    return split_factor * dtype_size * index_n_head *
+    return replication_factor * dtype_size * index_n_head *
            model_args.index_head_dim() / model_args.index_kpool();
   }
   const int64_t index_width = uses_packed_kpool
                                   ? 2 * model_args.index_head_dim() + 1
                                   : model_args.index_head_dim();
-  return split_factor * dtype_size * index_n_head * index_width;
+  return replication_factor * dtype_size * index_n_head * index_width;
 }
 
 int64_t scale_slot_size(const ModelArgs& model_args,

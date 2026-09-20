@@ -81,9 +81,17 @@ void patch_torch_mlu_accelerator() {
   py::module_::import("torch_mlu");
   // Restore the real accelerator so later queries see the genuine backend.
   torch_accelerator.attr("current_accelerator") = origin_func;
+  torch.attr("mlu").attr("init")();
 }
 #endif
 }  // namespace
+
+void JITKernel::initialize_backend() {
+#if defined(USE_MLU)
+  static std::once_flag once;
+  std::call_once(once, []() { patch_torch_mlu_accelerator(); });
+#endif
+}
 
 JITKernel& JITKernel::get(std::string py_path, std::string fn_name) {
   static std::unordered_map<std::string, std::unique_ptr<JITKernel>> registry;
@@ -102,10 +110,7 @@ JITKernel& JITKernel::get(std::string py_path, std::string fn_name) {
 
 JITKernel::JITKernel(std::string py_path, std::string fn_name)
     : path_(std::move(py_path)), name_(std::move(fn_name)) {
-#if defined(USE_MLU)
-  static std::once_flag once;
-  std::call_once(once, []() { patch_torch_mlu_accelerator(); });
-#endif
+  initialize_backend();
 }
 
 void JITKernel::ensure_signature() {

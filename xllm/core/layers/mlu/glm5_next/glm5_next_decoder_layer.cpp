@@ -158,6 +158,12 @@ void Glm5NextDecoderLayerImpl::load_state_dict(const StateDict& state_dict) {
       get_hc_state(state_dict, "ffn_hc_pre.", "hc_ffn_"));
 }
 
+void Glm5NextDecoderLayerImpl::verify_loaded_weights() const {
+  if (dsa_) {
+    dsa_->verify_loaded_weights();
+  }
+}
+
 torch::Tensor Glm5NextDecoderLayerImpl::forward(
     torch::Tensor& hidden_states,
     std::optional<torch::Tensor>& residual,

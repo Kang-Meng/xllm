@@ -222,6 +222,18 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
     return lm_head_(h);
   }
 
+  virtual torch::Tensor logits(const torch::Tensor& hidden_states,
+                               const torch::Tensor& seleted_idxes,
+                               torch::Tensor& out_hidden) {
+    CHECK(!lm_head_.is_empty())
+        << "lm_head is not initialized in embedding mode.";
+    out_hidden = hidden_states;
+    if (seleted_idxes.defined()) {
+      out_hidden = hidden_states.index_select(/*dim=*/0, seleted_idxes);
+    }
+    return lm_head_(out_hidden);
+  }
+
   // hidden_states: [num_tokens, hidden_size]
   // seleted_idxes: [num_tokens]
   // returns: [num_seqs, hidden_size]

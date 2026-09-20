@@ -444,11 +444,12 @@ void KVCacheShape::init_mla_packed_c8_shape(const KVCacheCapacity& kv_cache_cap,
 
 void KVCacheShape::init_index_cache_shape(const KVCacheCapacity& kv_cache_cap,
                                           const ModelArgs& model_args) {
-  int64_t index_block_count = kv_cache_cap.n_blocks();
-  if (Platform::supports_dsa_indexer_cache_sharding() &&
-      util::kv_split_size_effective() > 1) {
-    index_block_count *= util::kv_split_size_effective();
+  int64_t replication_factor = 1;
+  if (Platform::requires_dsa_indexer_cache_replication()) {
+    replication_factor = util::kv_split_size_effective();
   }
+  const int64_t index_block_count =
+      kv_cache_cap.n_blocks() * replication_factor;
   if (kpool_layout_ == KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
       model_args.index_kpool_compress()) {
     CHECK_EQ(kv_cache_cap.block_size() % model_args.index_kpool(), 0)

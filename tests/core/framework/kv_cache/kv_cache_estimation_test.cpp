@@ -21,11 +21,32 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/parallel_config.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/model/model_args.h"
 
 namespace xllm {
 namespace {
+
+class DcpIndexerEstimationTest : public ::testing::TestWithParam<int32_t> {
+ protected:
+  void SetUp() override {
+    ParallelConfig::get_instance().kv_split_size(GetParam()).cp_size(4);
+  }
+
+  void TearDown() override { ParallelConfig::get_instance() = saved_config_; }
+
+  int64_t expected_factor() const {
+#if defined(USE_NPU)
+    return GetParam() == 0 ? 4 : GetParam();
+#else
+    return 1;
+#endif
+  }
+
+ private:
+  ParallelConfig saved_config_ = ParallelConfig::get_instance();
+};
 
 ModelArgs make_standard_args() {
   ModelArgs model_args;
@@ -825,5 +846,30 @@ TEST(KVCacheEstimationTest,
   EXPECT_EQ(capacity.c128_count() + 2, target_only_capacity.c128_count());
   EXPECT_LT(capacity.n_blocks(), target_only_capacity.n_blocks());
 }
+
+TEST_P(DcpIndexerEstimationTest, IncludesAllIndexerBytes) {
+  ModelArgs model_args = make_standard_args();
+  model_args.index_n_heads(1).index_head_dim(16);
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.indexer_cache_dtype = "auto";
+  const KVCacheCapacity ordinary =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(ordinary.index_slot_size(), 32 * expected_factor());
+
+  options.indexer_cache_dtype = "int8";
+  const KVCacheCapacity quantized =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(quantized.index_slot_size(), 20 * expected_factor());
+  EXPECT_EQ(quantized.slot_size(), ordinary.slot_size());
+
+  model_args.index_n_heads(0);
+  const KVCacheCapacity absent =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(absent.index_slot_size(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(KvSplits,
+                         DcpIndexerEstimationTest,
+                         ::testing::Values(1, 2, 4, 0));
 
 }  // namespace xllm

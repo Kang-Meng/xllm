@@ -64,10 +64,10 @@ class Platform final {
   // KPool stores compressed index pages with a separate per-request tail.
   static constexpr bool uses_compressed_kpool_cache() { return is_mlu(); }
 
-  // Indexer cache uses expanded block IDs under kv_split
-  // (logical B -> [B*dcp, ..., B*dcp+dcp-1]).
-  static constexpr bool supports_dsa_indexer_cache_sharding() {
-    return is_mlu() || is_npu();
+  // Under KV splitting, each NPU rank retains the full indexer cache.
+  // Logical block B maps to index pages [B * split, (B + 1) * split).
+  static constexpr bool requires_dsa_indexer_cache_replication() {
+    return is_npu();
   }
 
   // Shared DSA layers reuse the previous full layer's top-k and never write

@@ -430,6 +430,22 @@ class ReplicatedLinearImpl : public torch::nn::Module {
 
   // return the weight (for testing)
   torch::Tensor weight() const { return weight_; }
+  bool is_weight_loaded() const {
+    if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+      return weight_is_loaded_ && weight_scale_is_loaded_ &&
+             (!smooth_.defined() || smooth_is_loaded_);
+    }
+    if (is_w8a8_quant(resolved_weight_quant_method_)) {
+      return weight_is_loaded_ && input_scale_is_loaded_ &&
+             input_offset_is_loaded_ && deq_scale_is_loaded_;
+    }
+    if (weight_.defined() && (weight_.scalar_type() == torch::kFloat8_e4m3fn ||
+                              weight_.scalar_type() == torch::kFloat8_e5m2)) {
+      return weight_is_loaded_ && weight_scale_is_loaded_ &&
+             (quant_args_.activation_dynamic() || input_scale_is_loaded_);
+    }
+    return weight_is_loaded_;
+  }
   bool uses_w8a8_dynamic_quant() const;
   torch::Tensor w8a8_dynamic_weight_scale() const;
   at::ScalarType output_dtype() const;

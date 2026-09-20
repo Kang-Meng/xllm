@@ -958,6 +958,7 @@ struct ExpertInput {
 struct GraphInput {
   torch::Tensor attn_mask;
   torch::Tensor tiling_data;
+  torch::Tensor num_valid_token_rows;
 #if defined(USE_DCU)
   bool use_dense_flash_attention = false;
 #endif
@@ -990,6 +991,7 @@ struct GraphInput {
     GraphInput out;
     out.attn_mask = safe_to(attn_mask, device, true);
     out.tiling_data = safe_to(tiling_data, device, true);
+    out.num_valid_token_rows = safe_to(num_valid_token_rows, device, true);
 #if defined(USE_DCU)
     out.use_dense_flash_attention = use_dense_flash_attention;
 #endif

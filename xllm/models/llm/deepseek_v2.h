@@ -114,7 +114,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
                                                      /*device=*/device_));
     }
     auto& attn_metadata = *(modified_input_params.attn_metadata);
-    prepare_attention_metadata(attn_metadata);
+    prepare_attention_metadata(modified_input_params, attn_metadata);
     torch::Tensor hidden_states = embed_tokens_(tokens);
     std::optional<torch::Tensor> residual;
     if (!run_decoder_layers(hidden_states,
@@ -163,6 +163,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
  protected:
   virtual void prepare_attention_metadata(
+      const ModelInputParams& /*input_params*/,
       layer::AttentionMetadata& /*attn_metadata*/) const {}
 
   virtual std::optional<KVShardLayout> cp_kv_shard_layout() const {

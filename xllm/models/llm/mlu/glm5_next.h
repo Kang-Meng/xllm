@@ -162,6 +162,12 @@ class Glm5NextModelImpl final
     norm_->load_state_dict(state_dict.get_dict_with_prefix("norm."));
   }
 
+  void verify_loaded_weights() const {
+    for (const auto& layer : layers_) {
+      layer->verify_loaded_weights();
+    }
+  }
+
  private:
   torch::Device device_;
   int64_t hc_mult_ = 1;
@@ -177,6 +183,13 @@ class Glm5NextForCausalLMImpl final
       : LlmForCausalLMImplBase<Glm5NextModel>(context) {}
 
   bool is_hybrid_linear_attention() { return true; }
+
+  void load_model(std::unique_ptr<ModelLoader> loader,
+                  std::string prefix = "model.") override {
+    LlmForCausalLMImplBase<Glm5NextModel>::load_model(std::move(loader),
+                                                      std::move(prefix));
+    model_->verify_loaded_weights();
+  }
 };
 TORCH_MODULE(Glm5NextForCausalLM);
 

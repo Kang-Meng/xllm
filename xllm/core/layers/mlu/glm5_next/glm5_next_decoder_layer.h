@@ -59,6 +59,7 @@ class Glm5NextDecoderLayerImpl final : public torch::nn::Module {
   Glm5NextDecoderLayerImpl(const ModelContext& context, int32_t layer_id);
 
   void load_state_dict(const StateDict& state_dict);
+  void verify_loaded_weights() const;
 
   torch::Tensor forward(torch::Tensor& hidden_states,
                         std::optional<torch::Tensor>& residual,

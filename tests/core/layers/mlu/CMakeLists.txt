@@ -99,11 +99,11 @@ cc_test(
     layer_test
   SRCS
     dense_mlp_test.cpp
-    dcp_attention_merge_test.cpp
+    mla_decode_lse_test.cpp
     dcp_indexer_candidate_test.cpp
     dcp_decode_context_test.cpp
     tests_utils.cpp
-    deepseek_v32_sp_utils_test.cpp
+    deepseek_v32_cp_utils_test.cpp
     dp_utils_test.cpp
     indexer_test.cpp
     mla_test.cpp
@@ -343,4 +343,25 @@ cc_test(
     glog::glog
     torch
     GTest::gtest_main
+)
+
+# Forks four ranks; keep separate from binaries that initialize MLU in the parent.
+cc_test(
+  NAME
+    glm5_attention_dcp_test
+  SRCS
+    glm5_attention_dcp_test.cpp
+  DEPS
+    :config
+    :block
+    :mlu_layers
+    :model_context
+    :parallel_state
+    :state_dict
+    :util
+    GTest::gtest_main
+    torch
+    glog::glog
+  ENVIRONMENT
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
 )

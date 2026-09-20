@@ -18,7 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include "framework/kv_cache/kv_shard_layout.h"
-#include "layers/mlu/dcp_attention_merge.h"
+#include "layers/mlu/dcp_indexer_candidate.h"
 #include "layers/mlu/dsa_topk_state.h"
 
 namespace xllm {
@@ -32,13 +32,30 @@ class DcpDecodeContext final {
   DcpDecodeContext(KVShardLayout layout, ProcessGroup* dcp_group);
 
   torch::Tensor localize_slots(const torch::Tensor& global_slots) const;
-  torch::Tensor expand_indexer_block_table(
-      const torch::Tensor& logical_block_table) const;
+  // Projects the gathered global top-k onto this rank's local KV slots with
+  // the fused Triton localizer: owned entries are de-interleaved to local
+  // slots, filtered by ownership, and compacted to the row front in column
+  // order; context lens are rewritten to the per-row owned counts.
   DsaTopkState localize_topk(const DsaTopkState& global_state) const;
-  torch::Tensor gather_topk_cache(const torch::Tensor& global_slots,
-                                  const torch::Tensor& local_cache) const;
-  DcpAttentionResult merge(const torch::Tensor& local_output,
-                           const torch::Tensor& local_lse) const;
+  // Launch/finish pair around the indexer candidate merge: the launch
+  // submits the cross-rank candidate all-gather without waiting, so the
+  // caller can enqueue independent compute (e.g. the deferred MLA latent
+  // projections) before the finish to overlap it with the communication.
+  DcpIndexerGatherAsyncCtx launch_indexer_candidate_gather(
+      const torch::Tensor& local_scores,
+      const torch::Tensor& local_global_slots) const;
+  DsaTopkState finish_indexer_candidate_merge(
+      DcpIndexerGatherAsyncCtx&& gather,
+      int64_t topk,
+      const torch::Tensor& slot_mapping) const;
+  torch::Tensor merge(const torch::Tensor& local_output,
+                      const torch::Tensor& local_lse,
+                      const torch::Tensor& slot_mapping,
+                      bool head_sharded) const;
+
+  // DCP group size (1 when no DCP group is configured).
+  int32_t world_size() const;
+  const KVShardLayout& layout() const { return layout_; }
 
  private:
   KVShardLayout layout_;

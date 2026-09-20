@@ -43,6 +43,10 @@ class JITKernel final {
  public:
   static JITKernel& get(std::string py_path, std::string fn_name);
 
+  // Initialize the backend before graph capture starts. Backend lazy
+  // initialization may allocate device resources that capture forbids.
+  static void initialize_backend();
+
   template <typename... Args>
   void launch(void* stream, Grid g, LaunchCfg cfg, Args&&... args) {
     ensure_signature();

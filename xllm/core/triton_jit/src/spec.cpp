@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "spec.h"
+#include "triton_jit/include/spec.h"
 
 #include <string>
 
@@ -85,6 +85,12 @@ std::string serialize_key(const SpecList& specs,
   if (!cfg.bottleneck.empty()) {
     s += "|b";
     s += cfg.bottleneck;
+  }
+  for (const std::optional<bool>& option : {cfg.enable_fp_fusion,
+                                            cfg.enable_soft_i64,
+                                            cfg.force_use_shared_memory}) {
+    s += '|';
+    s += option.has_value() ? (*option ? '1' : '0') : '-';
   }
   s += "|d";
   s += std::to_string(device);

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from xllm.python.attention.kv_shard_layout import KVShardLayout
@@ -123,3 +124,23 @@ def test_graph_padded_zero_block_expands_to_valid_indexer_pages() -> None:
         expanded,
         torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.int32),
     )
+
+
+@pytest.mark.parametrize("split", [1, 2, 4])
+def test_indexer_page_bounds(split: int) -> None:
+    layout = KVShardLayout(physical_block_size=4, dcp_size=split, dcp_rank=0)
+    logical_blocks = torch.arange(16, dtype=torch.int32).reshape(1, -1)
+    pages = layout.expand_indexer_block_table(logical_blocks)
+    assert torch.equal(pages, torch.arange(16 * split, dtype=torch.int32).reshape(1, -1))
+    assert pages[0, -1].item() == 16 * split - 1
+    # Read every mapped page from a full-history cache, including the last page.
+    cache = torch.arange(16 * split * 4).reshape(16 * split, 4)
+    assert cache[pages.long()].shape == (1, 16 * split, 4)
+    if split == 4:
+        assert pages[0, 16:20].tolist() == [16, 17, 18, 19]
+        with pytest.raises(IndexError):
+            _ = cache[:16][pages.long()]
+
+    padded = layout.expand_indexer_block_table(torch.tensor([[15, -1]], dtype=torch.int32))
+    assert padded[0, :split].tolist() == list(range(15 * split, 16 * split))
+    assert padded[0, split:].tolist() == [-1] * split
