@@ -396,8 +396,18 @@ def test_dspark_moe_loader_receives_explicit_checkpoint_prefix(
     ]
 
 
+@pytest.mark.parametrize(
+    ("gate_name", "up_name", "down_name"),
+    [
+        ("gate_proj", "up_proj", "down_proj"),
+        ("w1", "w3", "w2"),
+    ],
+)
 def test_dspark_loads_moe_from_mlp_checkpoint_prefix(
     monkeypatch: pytest.MonkeyPatch,
+    gate_name: str,
+    up_name: str,
+    down_name: str,
 ) -> None:
     model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
     source_prefix = "mtp.0.mlp."
@@ -409,9 +419,12 @@ def test_dspark_loads_moe_from_mlp_checkpoint_prefix(
         expert_prefix = source_prefix + f"experts.{expert_id}."
         tensors.update(
             {
-                expert_prefix + "w1.weight": torch.full((4, 8), expert_id + 1, dtype=torch.int8),
-                expert_prefix + "w3.weight": torch.full((4, 8), expert_id + 3, dtype=torch.int8),
-                expert_prefix + "w2.weight": torch.full((8, 4), expert_id + 5, dtype=torch.int8),
+                expert_prefix + gate_name + ".weight": torch.full((4, 8), expert_id + 1, dtype=torch.int8),
+                expert_prefix + gate_name + ".weight_scale": torch.ones(4, 1),
+                expert_prefix + up_name + ".weight": torch.full((4, 8), expert_id + 3, dtype=torch.int8),
+                expert_prefix + up_name + ".weight_scale": torch.ones(4, 1),
+                expert_prefix + down_name + ".weight": torch.full((8, 4), expert_id + 5, dtype=torch.int8),
+                expert_prefix + down_name + ".weight_scale": torch.ones(8, 1),
             }
         )
     loader = deepseek_v4_dspark.W8A8WeightLoader(
@@ -446,13 +459,13 @@ def test_dspark_loads_moe_from_mlp_checkpoint_prefix(
             mlp.experts_w13[expert_id],
             torch.cat(
                 [
-                    tensors[expert_prefix + "w1.weight"],
-                    tensors[expert_prefix + "w3.weight"],
+                    tensors[expert_prefix + gate_name + ".weight"],
+                    tensors[expert_prefix + up_name + ".weight"],
                 ],
                 dim=0,
             ),
         )
         torch.testing.assert_close(
             mlp.experts_w2[expert_id],
-            tensors[expert_prefix + "w2.weight"],
+            tensors[expert_prefix + down_name + ".weight"],
         )

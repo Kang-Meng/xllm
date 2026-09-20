@@ -267,7 +267,6 @@ class DeepseekV4DSparkForCausalLM(
         attention.process_weights_after_loading()
 
         mlp = self.model.layers[layer_id].mlp
-        moe_prefix = None
         if hasattr(mlp, "experts_w13"):
             moe_prefix = _find_checkpoint_prefix(
                 loader,
@@ -275,9 +274,13 @@ class DeepseekV4DSparkForCausalLM(
                     checkpoint_prefix + "ffn.",
                     checkpoint_prefix + "mlp.",
                 ),
-                ("experts.0.w1.weight",),
+                (
+                    "experts.0.gate_proj.weight",
+                    "experts.0.w1.weight",
+                ),
             )
-        if moe_prefix is not None:
+            if moe_prefix is None:
+                raise KeyError(f"DeepSeek-V4 DSpark MoE weights not found under {checkpoint_prefix}")
             self._load_dsv4_moe(
                 loader,
                 checkpoint_prefix,
