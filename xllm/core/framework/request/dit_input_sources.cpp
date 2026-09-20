@@ -16,6 +16,7 @@ limitations under the License.
 #include "framework/request/dit_input_sources.h"
 
 #include <algorithm>
+#include <functional>
 #include <utility>
 
 #include "core/util/tensor_helper.h"
@@ -145,11 +146,11 @@ std::optional<torch::Tensor> DiTTensorSources::get(
   return std::nullopt;
 }
 
-std::optional<NamedTensor> DiTTensorSources::get_namedtensor(
+std::optional<NamedTensorConstRef> DiTTensorSources::get_named_tensor(
     std::string_view name) const {
   for (const NamedTensor& input : entries_) {
     if (input.name == name) {
-      return input;
+      return std::cref(input);
     }
   }
   return std::nullopt;
@@ -171,10 +172,12 @@ bool DiTTensorSources::batch_signature_matches(
     return false;
   }
   for (const NamedTensor& input : entries_) {
-    std::optional<NamedTensor> other_input = other.get_namedtensor(input.name);
+    const std::optional<NamedTensorConstRef> other_input =
+        other.get_named_tensor(input.name);
     if (!other_input.has_value() ||
-        input.parameters != other_input->parameters ||
-        !tensor_batch_signature_matches(input.tensor, other_input->tensor)) {
+        input.parameters != other_input->get().parameters ||
+        !tensor_batch_signature_matches(input.tensor,
+                                        other_input->get().tensor)) {
       return false;
     }
   }

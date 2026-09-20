@@ -45,8 +45,6 @@ bool EmbedVLMWorkerImpl::init_model(ModelContext& context) {
   CHECK(model_ == nullptr) << "Model is already initialized.";
 
   context.set_encoder_embedding_mode(false);
-  use_aux_hidden_states_ =
-      !context.get_model_args().layers_to_capture().empty();
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(
@@ -72,7 +70,7 @@ std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
   auto model_output = model_executor_->forward(
       flatten_tokens, flatten_positions, kv_caches_, params);
   torch::Tensor hidden_states;
-  if (use_aux_hidden_states_) {
+  if (ModelConfig::get_instance().capture_hidden_state_layer() >= 0) {
     CHECK(model_output.aux_hidden_states.defined())
         << "Captured hidden states are required but the model did not return "
            "aux_hidden_states";

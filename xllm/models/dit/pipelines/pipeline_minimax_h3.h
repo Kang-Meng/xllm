@@ -112,17 +112,19 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     // 1. Prepare Parameters
     CHECK_EQ(input.batch_size, 1)
         << "MiniMax-H3 native T2VA currently supports batch_size=1";
-    const std::optional<NamedTensor> prompt_embed =
-        input.tensor_sources.get_namedtensor("prompt_embed");
+    CHECK_EQ(input.generation_params.num_videos_per_prompt, 1)
+        << "MiniMax-H3 currently supports num_videos_per_prompt=1";
+    const std::optional<NamedTensorConstRef> prompt_embed =
+        input.tensor_sources.get_named_tensor("prompt_embed");
     CHECK(prompt_embed.has_value())
         << "MiniMax-H3 T2VA requires prompt_embed from the encoder service";
     const std::vector<int64_t>* prompt_token_tags =
-        get_tensor_parameter<std::vector<int64_t>>(prompt_embed->parameters,
-                                                   "prompt_token_tags");
+        get_tensor_parameter<std::vector<int64_t>>(
+            prompt_embed->get().parameters, "prompt_token_tags");
     CHECK(prompt_token_tags != nullptr)
         << "MiniMax-H3 T2VA requires prompt_token_tags from the encoder "
            "service";
-    const torch::Tensor& prompt_embeds = prompt_embed->tensor;
+    const torch::Tensor& prompt_embeds = prompt_embed->get().tensor;
     CHECK(prompt_embeds.is_floating_point())
         << "MiniMax-H3 prompt_embed must be floating point";
     CHECK(torch::isfinite(prompt_embeds).all().item<bool>())
@@ -184,7 +186,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     const int64_t audio_latents =
         audio_processor_->audio_latents_for_video(num_frames, video_fps);
     const int64_t seed =
-        generation_params.seed > 0 ? generation_params.seed : 42;
+        generation_params.seed_is_set ? generation_params.seed : 42;
 
     // 2. Check for FL2VA or Ref2VA
     const bool is_ref2va = task_type_ == "ref2va";
@@ -489,7 +491,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     int64_t num_condition_audio_rows = 0;
   };
 
-  enum class ReferenceKind { kImage, kVideo, kAudio };
+  enum class ReferenceKind { IMAGE, VIDEO, AUDIO };
 
   struct ReferenceBlock {
     ReferenceKind kind;
@@ -735,7 +737,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     int64_t reference_video_rows = 0;
     int64_t reference_audio_rows = 0;
     for (const ReferenceBlock& reference : references) {
-      if (reference.kind != ReferenceKind::kAudio) {
+      if (reference.kind != ReferenceKind::AUDIO) {
         reference_video_rows += reference.latent_frames *
                                 (reference.latent_height / patch_h_) *
                                 (reference.latent_width / patch_w_);
@@ -799,7 +801,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     int64_t cursor = text_tokens;
     double rotary_time = static_cast<double>(text_tokens);
     for (const ReferenceBlock& reference : references) {
-      if (reference.kind == ReferenceKind::kImage) {
+      if (reference.kind == ReferenceKind::IMAGE) {
         std::pair<torch::Tensor, torch::Tensor> grid =
             frame_grid(reference.latent_height, reference.latent_width);
         const int64_t rows = reference.latent_frames * grid.first.size(0);
@@ -813,7 +815,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
             .copy_(grid.first.repeat({reference.latent_frames, 1}));
         cursor += rows;
         rotary_time += 1.0;
-      } else if (reference.kind == ReferenceKind::kAudio) {
+      } else if (reference.kind == ReferenceKind::AUDIO) {
         const int64_t rows = reference.audio_latents * audio_channels_;
         audio_index_blocks.emplace_back(
             torch::arange(cursor, cursor + rows, long_options));
@@ -984,7 +986,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
         const std::pair<int64_t, int64_t> size =
             visual_processor_->resolve_reference_image_size(
                 batched_image.size(2), batched_image.size(3));
-        result.blocks.push_back({ReferenceKind::kImage,
+        result.blocks.push_back({ReferenceKind::IMAGE,
                                  false,
                                  1,
                                  size.first / vae_spatial_ratio_,
@@ -1040,7 +1042,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
                           video_encode_clip_length_ *
                           video_encode_latents_per_clip_ -
                       video_encode_token_drop_;
-        result.blocks.push_back({ReferenceKind::kVideo,
+        result.blocks.push_back({ReferenceKind::VIDEO,
                                  has_audio,
                                  reference_video_latent_frames,
                                  size.first / vae_spatial_ratio_,
@@ -1072,7 +1074,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       const int64_t reference_audio_latents =
           audio_processor_->reference_audio_latents(samples);
       result.blocks.push_back(
-          {ReferenceKind::kAudio, true, 0, 0, 0, reference_audio_latents});
+          {ReferenceKind::AUDIO, true, 0, 0, 0, reference_audio_latents});
       if (is_tp_driver_) {
         reference_audio_inputs.emplace_back(std::move(audio_input));
       }
@@ -1108,7 +1110,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     std::vector<torch::Tensor> packed_visual_rows;
     size_t visual_index = 0;
     for (const ReferenceBlock& block : result.blocks) {
-      if (block.kind == ReferenceKind::kAudio) {
+      if (block.kind == ReferenceKind::AUDIO) {
         continue;
       }
       const std::vector<int64_t> shape = {1,
@@ -1141,7 +1143,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     const int64_t video_row_count = [&]() {
       int64_t rows = 0;
       for (const ReferenceBlock& block : result.blocks) {
-        if (block.kind != ReferenceKind::kAudio) {
+        if (block.kind != ReferenceKind::AUDIO) {
           rows += block.latent_frames * (block.latent_height / patch_h_) *
                   (block.latent_width / patch_w_);
         }

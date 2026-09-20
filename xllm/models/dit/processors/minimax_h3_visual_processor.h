@@ -35,7 +35,7 @@ struct MiniMaxH3VisualProcessorConfig {
 
 class MiniMaxH3VisualProcessorImpl final : public torch::nn::Module {
  public:
-  MiniMaxH3VisualProcessorImpl(ModelContext context,
+  MiniMaxH3VisualProcessorImpl(const ModelContext& context,
                                MiniMaxH3VisualProcessorConfig config)
       : image_processor_(
             register_module("image_processor",

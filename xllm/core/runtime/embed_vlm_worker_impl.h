@@ -43,9 +43,6 @@ class EmbedVLMWorkerImpl : public WorkerImpl {
   bool init_model(ModelContext& context) override;
 
   std::optional<ForwardOutput> step(const ForwardInput& input) override;
-
- private:
-  bool use_aux_hidden_states_ = false;
 };
 
 }  // namespace xllm

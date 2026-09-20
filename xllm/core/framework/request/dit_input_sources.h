@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -46,6 +47,8 @@ struct NamedTensor {
   torch::Tensor tensor;
   TensorParameters parameters;
 };
+
+using NamedTensorConstRef = std::reference_wrapper<const NamedTensor>;
 
 struct MediaNamedTensor {
   std::string name;
@@ -90,7 +93,8 @@ class DiTTensorSources final {
 
   bool contains(std::string_view name) const;
   std::optional<torch::Tensor> get(std::string_view name) const;
-  std::optional<NamedTensor> get_namedtensor(std::string_view name) const;
+  std::optional<NamedTensorConstRef> get_named_tensor(
+      std::string_view name) const;
 
   std::vector<NamedTensor>& entries();
   const std::vector<NamedTensor>& entries() const;

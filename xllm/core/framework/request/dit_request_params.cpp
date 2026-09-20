@@ -386,7 +386,7 @@ DiTRequestParams::DiTRequestParams(const proto::VideoGenerationRequest& request,
     const int64_t audio_sampling_rate =
         request.has_parameters() && request.parameters().has_sampling_rate()
             ? request.parameters().sampling_rate()
-            : 32000;
+            : generation_params.audio_sampling_rate;
     std::vector<MediaNamedTensor> decoded_sources;
     if (!media_decoder.decode(decoded_sources,
                               request_parse_status,

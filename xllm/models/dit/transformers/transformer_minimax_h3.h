@@ -22,7 +22,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "core/framework/dit_model_context.h"
@@ -37,7 +37,7 @@ namespace minimax_h3 {
 
 // RMSNorm module owning its scale weight. It also exposes the fp32 RMSNorm
 // math for callers that need the same operation without owning a module.
-class H3RMSNormImpl : public torch::nn::Module {
+class H3RMSNormImpl final : public torch::nn::Module {
  public:
   H3RMSNormImpl(int64_t dim, double eps) : eps_(eps) {
     weight_ = register_parameter("weight", torch::ones({dim}));
@@ -75,7 +75,7 @@ class H3RMSNormImpl : public torch::nn::Module {
 };
 TORCH_MODULE(H3RMSNorm);
 
-class H3SwiGLUFFNImpl : public torch::nn::Module {
+class H3SwiGLUFFNImpl final : public torch::nn::Module {
  public:
   H3SwiGLUFFNImpl(int64_t hidden_size,
                   int64_t ffn_dim,
@@ -190,7 +190,7 @@ inline torch::Tensor h3_timestep_embedding(const torch::Tensor& timesteps,
   return emb;
 }
 
-class H3TimestepEmbeddingImpl : public torch::nn::Module {
+class H3TimestepEmbeddingImpl final : public torch::nn::Module {
  public:
   H3TimestepEmbeddingImpl(int64_t in_dim, int64_t hidden_dim, int64_t out_dim) {
     linear_1_ = register_module(
@@ -243,9 +243,10 @@ class H3TimestepEmbeddingImpl : public torch::nn::Module {
 };
 TORCH_MODULE(H3TimestepEmbedding);
 
-class H3RotaryPosEmbedImpl : public torch::nn::Module {
+class H3RotaryPosEmbedImpl final : public torch::nn::Module {
  public:
-  H3RotaryPosEmbedImpl(int64_t rope_freq_dim = 16, double rope_theta = 10000.0)
+  explicit H3RotaryPosEmbedImpl(int64_t rope_freq_dim = 16,
+                                double rope_theta = 10000.0)
       : rope_freq_dim_(rope_freq_dim), rope_theta_(rope_theta) {}
 
   std::pair<torch::Tensor, torch::Tensor> forward(
@@ -290,7 +291,7 @@ inline torch::Tensor h3_apply_rotary(const torch::Tensor& hidden_states,
   return torch::cat({rotary, pass}, -1).contiguous();
 }
 
-class H3AttentionImpl : public torch::nn::Module {
+class H3AttentionImpl final : public torch::nn::Module {
  public:
   H3AttentionImpl(int64_t hidden_size,
                   int64_t heads,
@@ -405,7 +406,7 @@ class H3AttentionImpl : public torch::nn::Module {
 };
 TORCH_MODULE(H3Attention);
 
-class H3TokenRefinerBlockImpl : public torch::nn::Module {
+class H3TokenRefinerBlockImpl final : public torch::nn::Module {
  public:
   H3TokenRefinerBlockImpl(int64_t hidden_size,
                           int64_t heads,
@@ -454,7 +455,7 @@ class H3TokenRefinerBlockImpl : public torch::nn::Module {
 };
 TORCH_MODULE(H3TokenRefinerBlock);
 
-class H3TokenRefinerImpl : public torch::nn::Module {
+class H3TokenRefinerImpl final : public torch::nn::Module {
  public:
   H3TokenRefinerImpl(int64_t hidden_size,
                      int64_t heads,
@@ -511,7 +512,7 @@ class H3TokenRefinerImpl : public torch::nn::Module {
 };
 TORCH_MODULE(H3TokenRefiner);
 
-class H3AdaLayerNormModulationImpl : public torch::nn::Module {
+class H3AdaLayerNormModulationImpl final : public torch::nn::Module {
  public:
   H3AdaLayerNormModulationImpl(int64_t time_embed_dim,
                                int64_t hidden_size,
@@ -550,7 +551,7 @@ class H3AdaLayerNormModulationImpl : public torch::nn::Module {
 };
 TORCH_MODULE(H3AdaLayerNormModulation);
 
-class H3TransformerBlockImpl : public torch::nn::Module {
+class H3TransformerBlockImpl final : public torch::nn::Module {
  public:
   H3TransformerBlockImpl(int64_t hidden_size,
                          int64_t heads,
@@ -626,7 +627,7 @@ class H3TransformerBlockImpl : public torch::nn::Module {
 };
 TORCH_MODULE(H3TransformerBlock);
 
-class H3AdaLayerNormOutImpl : public torch::nn::Module {
+class H3AdaLayerNormOutImpl final : public torch::nn::Module {
  public:
   H3AdaLayerNormOutImpl(int64_t hidden_size,
                         int64_t time_embed_dim,
@@ -684,7 +685,7 @@ struct MiniMaxH3TransformerOutput {
   torch::Tensor audio_sample;
 };
 
-class MiniMaxH3Transformer3DModelImpl : public torch::nn::Module {
+class MiniMaxH3Transformer3DModelImpl final : public torch::nn::Module {
  public:
   explicit MiniMaxH3Transformer3DModelImpl(const DiTModelContext& context)
       : options_(context.get_tensor_options()) {
@@ -842,8 +843,11 @@ class MiniMaxH3Transformer3DModelImpl : public torch::nn::Module {
         1, video_indices, video_embeds.to(text_embeds.scalar_type()));
     packed.index_copy_(
         1, audio_indices, audio_embeds.to(text_embeds.scalar_type()));
-    torch::Tensor timestep_proj = minimax_h3::h3_timestep_embedding(
-        timestep.flatten(), freq_dim_, true, 0.0);
+    torch::Tensor timestep_proj =
+        minimax_h3::h3_timestep_embedding(timestep.flatten(),
+                                          freq_dim_,
+                                          /*flip_sin_to_cos=*/true,
+                                          /*downscale_freq_shift=*/0.0);
     torch::Tensor temb =
         time_embedder_->forward(timestep_proj.to(torch::kFloat32));
     auto rotary = rope_->forward(position_ids);

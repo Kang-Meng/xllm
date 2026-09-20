@@ -28,7 +28,7 @@ limitations under the License.
 
 namespace xllm {
 
-class MiniMaxH3Scheduler {
+class MiniMaxH3Scheduler final {
  public:
   explicit MiniMaxH3Scheduler(double shift = 12.0) { set_shift(shift); }
 

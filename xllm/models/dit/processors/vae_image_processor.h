@@ -30,7 +30,7 @@ namespace xllm {
 class VAEImageProcessorImpl : public torch::nn::Module {
  public:
   explicit VAEImageProcessorImpl(
-      ModelContext context,
+      const ModelContext& context,
       bool do_resize = true,
       bool do_normalize = true,
       bool do_binarize = false,

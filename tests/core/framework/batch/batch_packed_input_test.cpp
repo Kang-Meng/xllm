@@ -318,10 +318,12 @@ TEST(BatchPackedInputTest, PackedProtoPreservesDiTGenerationParams) {
   EXPECT_TRUE(
       torch::equal(*unpacked_dit_input.tensor_sources.get("prompt_embed"),
                    *dit_input.tensor_sources.get("prompt_embed")));
-  EXPECT_EQ(
-      unpacked_dit_input.tensor_sources.get_namedtensor("prompt_embed")
-          ->parameters,
-      dit_input.tensor_sources.get_namedtensor("prompt_embed")->parameters);
+  EXPECT_EQ(unpacked_dit_input.tensor_sources.get_named_tensor("prompt_embed")
+                ->get()
+                .parameters,
+            dit_input.tensor_sources.get_named_tensor("prompt_embed")
+                ->get()
+                .parameters);
   EXPECT_TRUE(torch::equal(*unpacked_dit_input.tensor_sources.get("latent"),
                            *dit_input.tensor_sources.get("latent")));
 
@@ -340,9 +342,12 @@ TEST(BatchPackedInputTest, PackedProtoPreservesDiTGenerationParams) {
       torch::equal(*proto_input_round_trip.tensor_sources.get("prompt_embed"),
                    *dit_input.tensor_sources.get("prompt_embed")));
   EXPECT_EQ(
-      proto_input_round_trip.tensor_sources.get_namedtensor("prompt_embed")
-          ->parameters,
-      dit_input.tensor_sources.get_namedtensor("prompt_embed")->parameters);
+      proto_input_round_trip.tensor_sources.get_named_tensor("prompt_embed")
+          ->get()
+          .parameters,
+      dit_input.tensor_sources.get_named_tensor("prompt_embed")
+          ->get()
+          .parameters);
   EXPECT_TRUE(torch::equal(*proto_input_round_trip.tensor_sources.get("latent"),
                            *dit_input.tensor_sources.get("latent")));
 

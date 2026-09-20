@@ -388,11 +388,11 @@ TEST(DiTRequestParamsTest, PromptTokenTagsDecodeFromPromptEmbedParameters) {
   DiTRequestParams params(request, "rid", "rtime");
 
   ASSERT_TRUE(params.request_parse_status.ok());
-  const std::optional<NamedTensor> parsed_prompt_embed =
-      params.input_params.tensor_sources.get_namedtensor("prompt_embed");
+  const std::optional<NamedTensorConstRef> parsed_prompt_embed =
+      params.input_params.tensor_sources.get_named_tensor("prompt_embed");
   ASSERT_TRUE(parsed_prompt_embed.has_value());
   const std::vector<int64_t>* tags = get_tensor_parameter<std::vector<int64_t>>(
-      parsed_prompt_embed->parameters, "prompt_token_tags");
+      parsed_prompt_embed->get().parameters, "prompt_token_tags");
   ASSERT_NE(tags, nullptr);
   EXPECT_EQ(*tags, std::vector<int64_t>({0, 1}));
 }

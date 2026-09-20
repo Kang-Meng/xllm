@@ -340,8 +340,10 @@ class AudioEncoderImpl final : public torch::nn::Module {
           state_dict.get_dict_with_prefix("block." + std::to_string(index + 1) +
                                           "."));
     }
-    snake_post_->load_state_dict(state_dict.get_dict_with_prefix("block.6."));
-    conv_post_->load_state_dict(state_dict.get_dict_with_prefix("block.7."));
+    snake_post_->load_state_dict(state_dict.get_dict_with_prefix(
+        "block." + std::to_string(blocks_->size() + 1) + "."));
+    conv_post_->load_state_dict(state_dict.get_dict_with_prefix(
+        "block." + std::to_string(blocks_->size() + 2) + "."));
   }
 
   void verify_loaded_weights(const std::string& prefix) {
@@ -350,8 +352,10 @@ class AudioEncoderImpl final : public torch::nn::Module {
       blocks_[index]->as<EncoderBlock>()->verify_loaded_weights(
           prefix + "block." + std::to_string(index + 1) + ".");
     }
-    snake_post_->verify_loaded_weights(prefix + "block.6.");
-    conv_post_->verify_loaded_weights(prefix + "block.7.");
+    snake_post_->verify_loaded_weights(
+        prefix + "block." + std::to_string(blocks_->size() + 1) + ".");
+    conv_post_->verify_loaded_weights(
+        prefix + "block." + std::to_string(blocks_->size() + 2) + ".");
   }
 
  private:
@@ -995,9 +999,13 @@ class BigVGANDecoderImpl final : public torch::nn::Module {
                                                  /*bias=*/true));
     upsamplers_ = register_module("ups", torch::nn::ModuleList());
     residual_blocks_ = register_module("resblocks", torch::nn::ModuleList());
+    int64_t channels = decoder_dim;
     for (size_t stage = 0; stage < upsample_rates_.size(); ++stage) {
-      const int64_t in_channels = decoder_dim >> stage;
-      const int64_t out_channels = decoder_dim >> (stage + 1);
+      const int64_t in_channels = channels;
+      const int64_t out_channels = channels / 2;
+      CHECK_GT(out_channels, 0)
+          << "MiniMax-H3 audio VAE decoder channel count must be positive";
+      channels = out_channels;
       upsamplers_->push_back(UpsampleStage(
           in_channels,
           out_channels,
@@ -1010,9 +1018,9 @@ class BigVGANDecoderImpl final : public torch::nn::Module {
       }
     }
     activation_post_ =
-        register_module("activation_post", Activation1d(/*channels=*/8));
+        register_module("activation_post", Activation1d(channels));
     conv_post_ = register_module("conv_post",
-                                 WeightNormConv1d(/*in_channels=*/8,
+                                 WeightNormConv1d(channels,
                                                   /*out_channels=*/1,
                                                   /*kernel_size=*/7,
                                                   /*stride=*/1,
@@ -1107,7 +1115,23 @@ class AutoencoderKLMiniMaxH3AudioImpl final : public torch::nn::Module {
     CHECK_GT(decoder_dim_, 0);
     CHECK_GT(args.num_attention_heads(), 0);
     CHECK_GT(sampling_rate_, 0);
-    CHECK_EQ(sampling_rate_ % audio_latents_per_second_, 0);
+    CHECK_EQ(latent_dim_ % latent_channels_, 0)
+        << "MiniMax-H3 audio VAE latent_dim must be a multiple of "
+           "latent_channels";
+    const auto rate_product = [](const std::vector<int64_t>& rates) {
+      CHECK(!rates.empty()) << "MiniMax-H3 audio VAE rates must not be empty";
+      int64_t product = 1;
+      for (int64_t rate : rates) {
+        CHECK_GT(rate, 0);
+        CHECK_LE(product, std::numeric_limits<int64_t>::max() / rate)
+            << "MiniMax-H3 audio VAE rate product overflows";
+        product *= rate;
+      }
+      return product;
+    };
+    hop_length_ = rate_product(args.encoder_rates());
+    CHECK_EQ(rate_product(args.decoder_rates()), hop_length_)
+        << "MiniMax-H3 audio VAE encoder and decoder rate products must match";
     CHECK_EQ(latents_mean_.size(), static_cast<size_t>(latent_channels_));
     CHECK_EQ(latents_std_.size(), static_cast<size_t>(latent_channels_));
     encoder_ =
@@ -1205,9 +1229,7 @@ class AutoencoderKLMiniMaxH3AudioImpl final : public torch::nn::Module {
   const std::vector<double>& latents_std() const { return latents_std_; }
   int32_t sampling_rate() const { return sampling_rate_; }
   int64_t latent_channels() const { return latent_channels_; }
-  int64_t hop_length() const {
-    return sampling_rate_ / audio_latents_per_second_;
-  }
+  int64_t hop_length() const { return hop_length_; }
 
  private:
   void load_config(const std::string& path) {
@@ -1236,7 +1258,7 @@ class AutoencoderKLMiniMaxH3AudioImpl final : public torch::nn::Module {
 
   static std::vector<int64_t> default_residual_dilations() { return {1, 3, 5}; }
 
-  int64_t audio_latents_per_second_ = 40;
+  int64_t hop_length_ = 0;
   int64_t encoder_dim_ = 0;
   int64_t latent_dim_ = 0;
   int64_t latent_channels_ = 0;
