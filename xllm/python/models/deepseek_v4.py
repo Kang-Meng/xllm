@@ -748,6 +748,42 @@ class DeepseekV4Attention(Attention):
             self._cmp_wgate_bf16 = self.cmp_wgate.weight.to(torch.bfloat16).contiguous()
             self._cmp_norm_bf16 = self.cmp_norm.weight.to(torch.bfloat16).contiguous()
 
+    def write_context_kv(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        swa_cache: torch.Tensor,
+    ) -> None:
+        """Project target hidden states and write DSpark context KV."""
+        if hidden.dim() != 2:
+            raise ValueError("DeepSeek-V4 DSpark context hidden states must be two-dimensional")
+        if slot_mapping.numel() != hidden.shape[0]:
+            raise ValueError("DeepSeek-V4 DSpark context slot count mismatch")
+        kv = self._project_context_kv(hidden, cos, sin)
+        _scatter_by_slot(swa_cache, slot_mapping, kv)
+
+    def _project_context_kv(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project, normalize, and rotate context KV rows."""
+        kv = self.kv_a_layernorm(self.kv_proj(hidden))
+        kv = kv.view(-1, 1, self.head_dim)
+        from xllm.python import kernels as _k
+
+        _k.npu_inplace_partial_rotary_mul(
+            kv,
+            cos,
+            sin,
+            self.nope_head_dim,
+            self.rope_head_dim,
+        )
+        return kv
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -790,11 +826,6 @@ class DeepseekV4Attention(Attention):
         cos, sin = _expand_half_rope_cos_sin(cos_sin_cache.index_select(0, positions.long()))
         _k.npu_inplace_partial_rotary_mul(q, cos, sin, self.nope_head_dim, self.rope_head_dim)
 
-        kv = self.kv_proj(kv_hidden)
-        # kv_proj outputs head_dim = nope_head_dim + rope_head_dim; layernorm
-        # the whole thing then split for RoPE (matches C++ run_dsv4_preprocess).
-        kv = self.kv_a_layernorm(kv)
-        kv_tensor = kv.view(kv_hidden.shape[0], 1, self.head_dim)
         if cp_ctx is not None and cp_ctx.enabled() and dsa is not None:
             kv_cos = getattr(dsa, "kv_cos", None)
             kv_sin = getattr(dsa, "kv_sin", None)
@@ -806,13 +837,7 @@ class DeepseekV4Attention(Attention):
             kv_cos, kv_sin = cos, sin
         else:
             kv_cos, kv_sin = _expand_half_rope_cos_sin(cos_sin_cache.index_select(0, kv_positions.long()))
-        _k.npu_inplace_partial_rotary_mul(
-            kv_tensor,
-            kv_cos,
-            kv_sin,
-            self.nope_head_dim,
-            self.rope_head_dim,
-        )
+        kv_tensor = self._project_context_kv(kv_hidden, kv_cos, kv_sin)
 
         # Attach the compressor/indexer callbacks so the backend can invoke them.
         if self.indexer is not None and hasattr(backend, "attach_indexer"):
@@ -1631,6 +1656,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         else:
             self.mlp = DeepseekV4MoE(cfg, layer_id, dtype, device)
+
+    def write_context_kv(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        swa_cache: torch.Tensor,
+    ) -> None:
+        self.self_attn.write_context_kv(
+            hidden,
+            cos,
+            sin,
+            slot_mapping,
+            swa_cache,
+        )
 
     def forward(
         self,
