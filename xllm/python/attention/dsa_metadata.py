@@ -45,6 +45,15 @@ DSA_CACHE_SEQUENCE = 1
 DSA_CACHE_SLIDING_WINDOW = 2
 DSV4_COMPRESSED_BLOCK_TOKEN_SIZE = 128 if current_platform.is_mlu() else 2048
 
+# ---------------------------------------------------------------------------
+# Read-side SWA block-table layout.
+# ---------------------------------------------------------------------------
+# The shared default is right-aligned; DeepSeek-V4.1 explicitly requests the
+# ring layout because its read consumers address columns absolutely and do not
+# compensate for the right-aligned shift (see ``_process_swa_group``).
+READ_TABLE_LAYOUT_RIGHT_ALIGNED = "right_aligned"
+READ_TABLE_LAYOUT_RING = "ring"
+
 
 @dataclass
 class DSACacheInfo:
@@ -149,6 +158,12 @@ class DsaMetadata:
 
     is_acl_graph: bool = False
 
+    # Static committed-row bound (token rows) of the ACL-graph capacity gathers,
+    # fixed for the lifetime of one captured graph. Zero means "not bucketed":
+    # eager forwards use their exact per-forward maximum and graph forwards fall
+    # back to the backend's import-time granularity.
+    graph_token_capacity: int = 0
+
     # Per-forward DeepSeek-V4 context-parallel state. This is the Python
     # counterpart of DSAMetadata::v4_cp_context; it is populated only for
     # prefill when cp_size > 1 and must never survive into a later forward.
@@ -229,6 +244,105 @@ def build_cache_specs(
     return caches_info, group_infos
 
 
+def build_cache_specs_v41(
+    compress_ratios: Sequence[int],
+    kv_source_layer_ids: Sequence[int],
+    index_source_layer_ids: Sequence[int],
+    window_size: int,
+    n_layers: int,
+) -> tuple[list[list[DSACacheInfo]], list[DSAGroupInfo]]:
+    """Cache-spec construction for DeepSeek-V4.1 (adaptation contract section 2).
+
+    Group registration order is exact: group 0 is the SWA ring (block size =
+    window), followed by one TOKEN group per distinct kv-source compress ratio
+    in first-appearance (ascending kv-source layer id) order -- with the
+    standard V4.1 plan always ``[SWA, TOKEN(2), TOKEN(1)]``.
+
+    Per-layer entries (positional order matches the C++ allocation and the
+    ``LayerCache`` slots): a kv-source layer with ratio ``r`` owns
+    ``[key(TOKEN,r), index(TOKEN,r), swa]`` plus ``[kv_state, score_state]``
+    (both in the SWA group) when ``r > 1``; every other layer owns only its
+    ``swa`` entry. Reuse and Reindex layers read the source layer's caches
+    cross-layer (read-side only).
+    """
+    base_block_size = 128
+    group_infos: list[DSAGroupInfo] = []
+    group_key_map: dict[tuple[int, int, int], int] = {}
+
+    def register_group(cache_type: int, ratio: int, block_size: int) -> int:
+        key = (ratio, cache_type, block_size)
+        gid = group_key_map.get(key)
+        if gid is not None:
+            return gid
+        gid = len(group_infos)
+        group_key_map[key] = gid
+        group_infos.append(DSAGroupInfo(cache_type, ratio, block_size))
+        return gid
+
+    swa_gid = register_group(DSA_CACHE_SLIDING_WINDOW, 1, window_size)
+    kv_sources = sorted({int(source) for source in kv_source_layer_ids})
+    for source in kv_sources:
+        if not 0 <= source < n_layers:
+            raise ValueError(f"kv source layer {source} is outside the model's {n_layers} layers")
+        ratio = int(compress_ratios[source]) if source < len(compress_ratios) else 0
+        if ratio <= 0:
+            raise ValueError(f"kv source layer {source} must have a positive compress ratio")
+        register_group(DSA_CACHE_TOKEN, ratio, base_block_size)
+
+    # The DSA metadata builder pairs multi_block_tables[m] with group_infos[m]
+    # by index, and the worker exports multi_block_tables in the fixed
+    # kMultiBlockExportOrder (core/framework/block/block.h): [SWA, C4, C128, C2,
+    # C1], i.e. TOKEN groups in ratio order [4, 128, 2, 1]. The registration
+    # order above follows ascending kv-source layer id, so a config whose first
+    # kv-source carries ratio 1 (before any ratio-2 source) would register
+    # [SWA, TOKEN(1), TOKEN(2)] and silently mis-pair every TOKEN block table
+    # with the wrong group. Fail loud instead of miscomputing slots.
+    export_token_ratios = [4, 128, 2, 1]  # TOKEN groups of kMultiBlockExportOrder, in order.
+    actual_token_ratios = [gi.ratio for gi in group_infos if gi.cache_type == DSA_CACHE_TOKEN]
+    expected_token_ratios = [ratio for ratio in export_token_ratios if ratio in actual_token_ratios]
+    if actual_token_ratios != expected_token_ratios:
+        raise ValueError(
+            f"V4.1 TOKEN group registration order {actual_token_ratios} does not match the "
+            f"worker multi_block_tables export order {expected_token_ratios} "
+            "(kMultiBlockExportOrder [SWA, C4, C128, C2, C1]); multi_block_tables[m] would pair "
+            "with the wrong group_infos[m]. Ensure a kv-source layer with compress ratio 2 "
+            "precedes any kv-source layer with ratio 1 in kv_source_layer_ids."
+        )
+
+    caches_info: list[list[DSACacheInfo]] = [[] for _ in range(n_layers)]
+    kv_source_set = set(kv_sources)
+    for layer_id in range(n_layers):
+        ratio = int(compress_ratios[layer_id]) if layer_id < len(compress_ratios) else 0
+        entries: list[tuple[int, int, int]]
+        if layer_id in kv_source_set and ratio > 0:
+            # LayerCache slots: key(0), index(2), swa(5), kv_state(6),
+            # score_state(7) -- the states exist only for pooling ratios > 1.
+            entries = [
+                (DSA_CACHE_TOKEN, ratio, base_block_size),
+                (DSA_CACHE_TOKEN, ratio, base_block_size),
+                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
+            ]
+            if ratio > 1:
+                entries.append((DSA_CACHE_SLIDING_WINDOW, 1, window_size))
+                entries.append((DSA_CACHE_SLIDING_WINDOW, 1, window_size))
+        else:
+            entries = [(DSA_CACHE_SLIDING_WINDOW, 1, window_size)]
+        for cache_type, entry_ratio, block_size in entries:
+            gid = register_group(cache_type, entry_ratio, block_size)
+            caches_info[layer_id].append(DSACacheInfo(gid, cache_type, entry_ratio, block_size))
+        if layer_id not in kv_source_set:
+            # Every layer's first entry addresses the SWA group; assert the
+            # registration invariant so a regression cannot silently reorder
+            # the manager indices (debug-only; see build_cache_specs_v41 API).
+            assert caches_info[layer_id][0].group_id == swa_gid, (
+                "V4.1 cache-spec registration lost the SWA group invariant"
+            )
+    # API symmetry only: Reindex/Reuse layers own only their SWA entry, so the
+    # index-source list never influences grouping.
+    del index_source_layer_ids
+    return caches_info, group_infos
+
+
 class DsaMetadataBuilder:
     """Faithful Python port of ``DSAMetadataBuilder`` (dsa_metadata_builder.cpp).
 
@@ -241,9 +355,20 @@ class DsaMetadataBuilder:
         self,
         caches_info: list[list[DSACacheInfo]],
         group_infos: list[DSAGroupInfo],
+        read_table_layout: str = READ_TABLE_LAYOUT_RIGHT_ALIGNED,
     ) -> None:
+        if read_table_layout not in (READ_TABLE_LAYOUT_RIGHT_ALIGNED, READ_TABLE_LAYOUT_RING):
+            raise ValueError(
+                f"unknown SWA read-table layout: {read_table_layout!r} "
+                f"(expected {READ_TABLE_LAYOUT_RIGHT_ALIGNED!r} or {READ_TABLE_LAYOUT_RING!r})"
+            )
         self.caches_info = caches_info
         self.group_infos = group_infos
+        # Layout of the SWA read-side block table rebuilt in
+        # ``_process_swa_group``. ``"right_aligned"`` keeps the historical
+        # shared-path behaviour (DSV4 / V4-dspark); ``"ring"`` is requested by
+        # the DeepSeek-V4.1 backend whose readers need every column addressed.
+        self.read_table_layout = read_table_layout
 
     # -- public API ---------------------------------------------------------
 
@@ -615,8 +740,40 @@ class DsaMetadataBuilder:
                     write_idx += 1
         out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
-        # Rebuild the read-side block table: keep only the SWA window columns,
-        # right-aligned.
+        # Rebuild the read-side block table with the SWA ring semantics.
+        #
+        # The write path (`slot_for_position`) maps position `p` to
+        # `raw_bt[seq, (p // block_size) % semantic_cols]`, so a read consumer
+        # must resolve logical column `(p // block_size) % semantic_cols`.
+        # Two layouts satisfy that contract:
+        #
+        #   * "ring" (DeepSeek-V4.1, requested by ``Csa2AttentionBackend``):
+        #     every storage column `d` carries the ring block for its own
+        #     logical index, `new_bt[s, d] = raw_bt[s, d % semantic_cols]`, for
+        #     EVERY column `d`. The three V4.1 readers address the table by
+        #     absolute column `(p // block_size) % table_width` and do NOT
+        #     compensate for a shifted layout: `csa2_attention.py`'s
+        #     `_gather_swa_positions` / `_swa_position_slots` and
+        #     `deepseek_v41_engram.py`'s `_cache_source`. In production
+        #     `semantic_cols == 1` and the writer only fills column 0, so a
+        #     right-aligned table parks the single ring block in the LAST
+        #     column: every other addressed column reads `-1`. The eager
+        #     readers `clamp_min(0)` that to block 0 -- a foreign KV block
+        #     whenever the sequence's ring block is not 0 (e.g. ctx=257 with
+        #     `blocks=[0,9]` resolves as block 0 for 127/128 positions) -- and
+        #     the fused `sparse_attn_sharedkv` / `sparse_flash_mla` op does not
+        #     clamp at all: it reads the `int32_t(-1)` through a `uint64_t`
+        #     (`sparse_attn_sharedkv_common.h:149-158`), wraps it to a huge
+        #     offset and reads out of bounds.
+        #   * "right_aligned" (shared default, DSV4 / V4-dspark): only the last
+        #     `min(semantic_cols, dst_lens)` columns are filled and the rest
+        #     stay `-1`. Its consumers compensate for the shift:
+        #     `csa_attention.py`'s `_build_dspark_swa_indices` is
+        #     layout-adaptive (`valid_block_counts` / `first_retained_columns`)
+        #     and resolves both layouts identically, so this default keeps the
+        #     historical behaviour for those paths.
+        #
+        # The table width decision below is shared by both layouts.
         dst_lens = [(max(int(ctx_lens[s]), 0) + block_size - 1) // block_size for s in range(batch_size)]
         max_dst_len = max(max(dst_lens) if dst_lens else 0, semantic_cols)
         if graph_slot_capacity > 0 and graph_block_table_capacity_cols > 0:
@@ -628,15 +785,24 @@ class DsaMetadataBuilder:
             dtype=torch.int32,
             device=raw_bt.device,
         )
-        for s in range(batch_size):
-            if s >= raw_bt.size(0):
-                continue
-            retained_cols = min(semantic_cols, dst_lens[s])
-            start_col = dst_lens[s] - retained_cols
-            for j in range(retained_cols):
-                logical_col = start_col + j
-                physical_col = logical_col % semantic_cols
-                new_bt[s, logical_col] = raw_bt[s, physical_col]
+        rows = min(batch_size, int(raw_bt.size(0)))
+        if self.read_table_layout == READ_TABLE_LAYOUT_RING:
+            if rows > 0 and max_dst_len > 0 and semantic_cols > 0:
+                # Vectorized equivalent of a NAIVE per-column ring fill: filling
+                # `max_dst_len` columns (up to the graph storage width) with one
+                # device op each on every forward would cost ~151x-2141x more.
+                cols = torch.arange(max_dst_len, device=raw_bt.device) % semantic_cols
+                new_bt[:rows] = raw_bt[:rows, cols]
+        else:
+            for s in range(batch_size):
+                if s >= raw_bt.size(0):
+                    continue
+                retained_cols = min(semantic_cols, dst_lens[s])
+                start_col = dst_lens[s] - retained_cols
+                for j in range(retained_cols):
+                    logical_col = start_col + j
+                    physical_col = logical_col % semantic_cols
+                    new_bt[s, logical_col] = raw_bt[s, physical_col]
         return new_bt, out_slots
 
     # -- SEQUENCE group (expand_blocks_to_slots, cpp:270-307) --------------

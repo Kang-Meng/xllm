@@ -70,12 +70,31 @@ def _batch_matmul_transpose(x: torch.Tensor, weight: torch.Tensor) -> torch.Tens
     return torch.bmm(x.transpose(0, 1), weight).transpose(0, 1)
 
 
+def _scatter_nd_update(
+    value: torch.Tensor,
+    indices: torch.Tensor,
+    updates: torch.Tensor,
+) -> None:
+    """CPU reference for the kernels_npu scatter_nd_update in-place scatter.
+
+    Aligned with the ``xllm.python.kernels_npu.scatter_nd_update`` contract:
+    write every row of ``updates`` into ``value`` in place at the row named by
+    ``indices``, where ``indices`` has shape ``[num_updates, 1]`` (one row index
+    per update, as every caller passes it). Provided here so pure-Python tests
+    can exercise the sparse-attention paths without loading the native
+    ``xllm_ops`` extension.
+    """
+    flat_indices = indices.reshape(-1).to(torch.long)
+    value.index_copy_(0, flat_indices, updates.to(value.dtype))
+
+
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
     kernels.rms_norm = _rms_norm
     kernels.rms_norm_sigmoid_gated = _rms_norm_sigmoid_gated
     kernels.l2_norm = _l2_norm
     kernels.batch_matmul_transpose = _batch_matmul_transpose
+    kernels.scatter_nd_update = _scatter_nd_update
     kernels_npu = types.ModuleType("xllm.python.kernels_npu")
     kernels_npu.__path__ = [str(_PYTHON_ROOT / "kernels_npu")]
     distributed = types.ModuleType("xllm.python.distributed")
@@ -89,6 +108,12 @@ def _install_python_package_stub() -> None:
     package.distributed = distributed
 
     distributed.tp_rank = lambda device: 0
+    distributed.moe_ep_all_reduce = lambda x: None
+    distributed.moe_tp_all_reduce = lambda x: None
+    # V4.1 runs tp_size == 1 in the pure-Python tests, so the TP ops are
+    # single-rank identities (mirroring moe_tp_all_reduce above).
+    distributed.tp_all_reduce = lambda x: None
+    distributed.tp_all_gather = lambda x, dim, world_size: x
 
     sys.modules["xllm.python"] = package
     sys.modules["xllm.python.kernels"] = kernels

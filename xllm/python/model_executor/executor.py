@@ -107,10 +107,56 @@ def _create_attention_backend(
     config: dict | None = None,
     max_num_reqs: int = 1,
     num_decoding_tokens: int = 1,
+    acl_graph_enabled: bool = False,
 ) -> AttentionBackend:
     config = config or {}
     model_type = config.get("model_type", "")
+    # DeepSeek-V4.1 is NPU-only: reject on any other platform before the generic
+    # CUDA/NPU backend selection can return a backend it must not run on.
+    if model_type == "deepseek_v41" and not current_platform.is_npu():
+        raise NotImplementedError(
+            f"DeepSeek-V4.1 runs on NPU only; no attention backend available for device type '{device.type}'"
+        )
     if _is_deepseek_v4_model_type(model_type) and current_platform.is_npu():
+        if model_type == "deepseek_v41":
+            # The V4.1 CSA2 backend is NPU-only; it runs eagerly on NPU until
+            # the kernel milestone replaces its internals.
+            from xllm.python.attention.csa2_attention import Csa2AttentionBackend
+            from xllm.python.models.deepseek_v41 import _detect_v41_quant_mode
+
+            # Derive the served context length here so the backend can default
+            # its ACL-graph token-capacity granularity when the deployment does
+            # not set XLLM_V41_GRAPH_CAPACITY_GRANULARITY explicitly (an empty
+            # env value counts as unset). Same source as the decode graph
+            # runner's max_model_len below.
+            serving_len = int(config.get("max_position_embeddings", 0) or 0)
+            # Register the checkpoint's quantization mode so the backend can
+            # reject the fp8/none torch MoE from ACL-graph capture (51361671).
+            # The value comes from the shared model config, so every DP/TP rank
+            # derives the same capability and the whole DP group agrees on the
+            # graph-vs-eager decision; no per-rank env is consulted.
+            quant_mode = _detect_v41_quant_mode(config)
+            return Csa2AttentionBackend(
+                compress_ratios=list(config.get("compress_ratios", [])),
+                window_size=int(config.get("window_size", 128)),
+                n_layers=int(config.get("n_layers", config.get("num_hidden_layers", 0))),
+                num_heads=first_attention.num_heads,
+                attn_head_dim=first_attention.head_dim,
+                index_topk=int(config.get("index_topk", 512)),
+                index_n_heads=int(config.get("index_n_heads", 32)),
+                index_head_dim=int(config.get("index_head_dim", 128)),
+                rope_head_dim=int(config.get("qk_rope_head_dim", 64)),
+                device=device,
+                dtype=dtype,
+                kv_source_layer_ids=list(config.get("kv_source_layer_ids", [])),
+                index_source_layer_ids=list(config.get("index_source_layer_ids", [])),
+                candidate_source_layer_id=int(config.get("candidate_source_layer_id", -1)),
+                candidate_topk_blocks=int(config.get("candidate_topk_blocks", 0)),
+                candidate_block_size=int(config.get("candidate_block_size", 0)),
+                max_model_len=serving_len,
+                quant_mode=quant_mode,
+                acl_graph_enabled=acl_graph_enabled,
+            )
         from xllm.python.attention.dsa_attention import DsaAttentionBackend
 
         return DsaAttentionBackend(
@@ -274,6 +320,10 @@ class ModelExecutor:
             int(num_decoding_tokens),
             int(config.get("num_speculative_tokens", 0)) + 1,
         )
+        # Resolve the graph backend before the attention backend so the V4.1
+        # CSA2 backend can validate its ACL-graph capacity at startup (C of
+        # 51361671) instead of at the first captured forward.
+        graph_backend = _resolve_graph_backend(config)
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
@@ -281,6 +331,7 @@ class ModelExecutor:
             config,
             max_seqs_per_batch,
             num_decoding_tokens=num_decoding_tokens,
+            acl_graph_enabled=graph_backend == "aclgraph",
         )
 
         execution_model = model.model
@@ -305,7 +356,6 @@ class ModelExecutor:
         self._execution_metadata_builders = execution_metadata_builders
         self.eager_runner.bind_execution_metadata_builders(execution_metadata_builders)
 
-        graph_backend = _resolve_graph_backend(config)
         if self.layerwise_split_size > 1 and graph_backend not in _DISABLED_GRAPH_BACKENDS:
             raise NotImplementedError(
                 "Python GLM5.2 layerwise split requires eager execution; "

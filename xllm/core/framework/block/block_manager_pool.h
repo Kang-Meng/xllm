@@ -53,6 +53,10 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
     PROPERTY(int64_t, slot_size) = 0;   // Memory size per slot (for xtensor)
     PROPERTY(std::string, model_id);    // Model ID for multi-model support
+    // Model type of the owning engine (e.g. "deepseek_v41"), forwarded to
+    // BlockManager::Options so build_composite_leaves can pick composite
+    // behavior by explicit identity rather than inferring it from ratios.
+    PROPERTY(std::string, model_type);
     // Token-level sliding window size for CompositeBlockManager.
     PROPERTY(uint32_t, sliding_window_size) = 0;
     // Base SWA/cache-state block rows retained per sequence.

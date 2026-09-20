@@ -155,6 +155,18 @@ template <typename TargetEngine>
 bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
   KVCacheCapacity target_kv_cache_cap = engine_->estimate_kv_cache_capacity();
 
+  // Defense-in-depth. The primary gate is in Master::Master, which rejects
+  // V4.1 speculative options before any engine is built; a library caller that
+  // constructs this engine directly still fails fast here. The check sits ahead
+  // of every early return so it covers all three speculative branches --
+  // external-draft MTP, embedded-eagle3, and Suffix -- instead of silently
+  // taking the C4/C128-only grouped accounting below. DeepSeek-V4.1 groups its
+  // KV cache as TOKEN (C1/C2), which that accounting does not recognize.
+  if (util::is_deepseek_v41_model_type(model_args_.model_type())) {
+    LOG(FATAL) << "DeepSeek-V4.1 grouped KV (C1/C2) is not supported in the "
+                  "speculative path";
+  }
+
   if (!use_draft_engine_) {
     return engine_->allocate_kv_cache(target_kv_cache_cap);
   }

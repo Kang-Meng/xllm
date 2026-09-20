@@ -183,6 +183,9 @@ class _StaticAttentionMetadata:
     dsa_c128_cos_sin: torch.Tensor | None = None
     dsa_graph_mode: bool = False
     dsa_graph_block_table_cols: int = 0
+    # Token-capacity bound of the CSA2 committed-row buckets (0 = backend does
+    # not bucket); consumed by the backend's capacity gathers.
+    dsa_graph_token_capacity: int = 0
 
 
 class _DecodeGraphEntry:
@@ -203,6 +206,37 @@ class _DecodeGraphEntry:
     )
 
 
+class _DsaDerivedMetadataView:
+    """Read-through metadata view deriving the flat paging fields for DSA backends.
+
+    The C++ scheduler's multi-block export path (DeepSeek-V4.1 DSA) fills only
+    ``multi_block_tables`` and leaves the flat ``block_table`` undefined while
+    ``slot_mapping`` arrives as an empty [0] tensor. CSA2 never reads those
+    flat fields (DSA paging is rebuilt from the multi-block tables), but the
+    decode-graph admission/fill contract expects a well-formed flat table.
+    The view derives ``block_table`` from the SWA group table (manager 0) and
+    a zero ``slot_mapping`` so the generic graph machinery stays
+    shape-consistent; both are zero-reader fields for CSA2.
+    """
+
+    __slots__ = ("_base", "block_table", "slot_mapping", "multi_block_tables")
+
+    def __init__(
+        self,
+        base: AttentionMetadata,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        multi_block_tables: tuple[torch.Tensor, ...],
+    ) -> None:
+        self._base = base
+        self.block_table = block_table
+        self.slot_mapping = slot_mapping
+        self.multi_block_tables = multi_block_tables
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._base, name)
+
+
 _GraphKey = tuple[
     int,
     bool,
@@ -212,6 +246,7 @@ _GraphKey = tuple[
     tuple[int, ...] | None,
     tuple[int, ...],
     bool,
+    int,
 ]
 
 
@@ -347,6 +382,84 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
     ) -> bool:
+        metadata = self._normalize_dsa_metadata(metadata)
+        ok = self._can_execute_inner(input_ids, metadata, input_embedding)
+        return ok
+
+    def _normalize_dsa_metadata(
+        self,
+        metadata: AttentionMetadata,
+    ) -> AttentionMetadata:
+        """Derive or synthesize the flat/multi paging contract for DSA backends.
+
+        Two normalizations, both no-ops for non-DSA backends:
+
+        1. Busy DSA batches receive ``multi_block_tables`` only (the C++
+           scheduler's multi-block export leaves the flat ``block_table``
+           undefined); derive the flat table from the SWA group table.
+        2. Empty DP shards receive a single dummy token and NO multi-block
+           tables (the worker's empty-shard fake input is never routed
+           through the composite block exporter). Left on the eager runner,
+           the shard's fake-token full-model forward dominates every DP step
+           (all ranks wait for the slowest group), so synthesize one-row
+           all-zero tables and let the shard replay the bucket graph the
+           busy ranks also replay. Block 0 mirrors the eager table-less
+           fallback (ring block 0); the dummy row's output is discarded.
+           Real decode batches always carry tables (verified: busy-shard
+           decode exports n=3), so "table-less DSA batch" uniquely
+           identifies the empty-shard dummy.
+
+        Every rank derives the same contract from the same exported shape, so
+        the whole DP group takes one runner (graph or eager) for a step; a
+        mixed step would desynchronize the HCCL collectives.
+        """
+        group_infos = getattr(self.attention_backend, "group_infos", None)
+        if group_infos is None:
+            return metadata
+        tables = list(getattr(metadata, "multi_block_tables", ()) or ())
+        if not tables:
+            if not bool(getattr(metadata, "is_dummy", False)):
+                # A busy DSA batch must carry manager tables; a table-less
+                # non-dummy batch is an exporter regression, not an empty shard.
+                return metadata
+            tables = [torch.zeros((1, 1), dtype=torch.int32) for _ in group_infos]
+        elif len(tables) != len(group_infos) or tables[0].dim() != 2:
+            return metadata
+        block_table = metadata.block_table
+        if block_table is None:
+            # The C++ exporter stages the multi-block tables on the CPU. Keep
+            # the derived flat table where it is: this view is rebuilt by all
+            # three runner entry points (can_execute/warmup/execute), and a
+            # device staging here would add two extra pageable H2D copies per
+            # decode step, each draining the device queue. _decode_metadata
+            # already performs the single device conversion the fill needs.
+            block_table = tables[0]
+        slot_mapping = metadata.slot_mapping
+        if slot_mapping is None or slot_mapping.numel() != block_table.shape[0]:
+            slot_dtype = slot_mapping.dtype if slot_mapping is not None else torch.int64
+            slot_mapping = torch.zeros(block_table.shape[0], dtype=slot_dtype, device=block_table.device)
+        return _DsaDerivedMetadataView(
+            metadata,
+            block_table,
+            slot_mapping,
+            tuple(tables),
+        )
+
+    def _can_execute_inner(
+        self,
+        input_ids: torch.Tensor,
+        metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
+    ) -> bool:
+        # Static MoE graph-capability gate (51361671 A): the fp8/none checkpoint
+        # modes serve ``DeepseekV41MoE``, whose forward syncs to the host and
+        # loops over data-dependent expert segments, so no ACL graph can capture
+        # it. The marker is derived once from the shared model config at backend
+        # construction, so it does not depend on this rank's per-step metadata:
+        # every rank of a DP group returns False together and none drops to
+        # eager alone. Backends without the marker (non-V4.1) keep graph access.
+        if not getattr(self.attention_backend, "moe_graph_capturable", True):
+            return False
         if self.dp_size == 1 and input_ids.dim() != 1:
             return False
         # Debug switch. Under DP every rank must see it, not only the expanded one.
@@ -779,6 +892,37 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"DP decode is missing linear_state_indices: rank={self.dp_rank}, tokens={batch_size}",
                 )
                 return False
+        # V4.1 CSA2 multi-manager paging: graph replay refreshes every DSA
+        # manager's block table (_fill_dsa_block_tables raises without them),
+        # so a batch whose manager table count does not match the backend's
+        # group count must stay on the eager runner, whose CSA2 path has
+        # explicit table-less fallbacks (ring block 0 / plain window). Table-less
+        # batches were already normalized above (empty DP shard dummy), so this
+        # only rejects genuinely malformed multi-manager exports.
+        group_infos = getattr(self.attention_backend, "group_infos", None)
+        if group_infos is not None:
+            source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
+            if not source_tables or len(source_tables) != len(group_infos):
+                return False
+        # V4.1 CSA2 committed-row capacity buckets: the captured graph's
+        # gathers are sized by max_model_len, so a context beyond it (or a
+        # bucket the DP group does not share) must take the eager runner.
+        granularity = getattr(self.attention_backend, "graph_token_capacity_granularity", 0)
+        if granularity:
+            bucket = self._token_capacity_bucket(metadata)
+            if bucket <= 0:
+                # 0 == not graph-admissible: either this rank cannot read the
+                # host-planned global lengths under DP, or the max context is
+                # unknown. Keep the eager runner rather than capture a bucket
+                # the DP group may not share.
+                return False
+            if bucket > (self.max_model_len + int(granularity) - 1) // int(granularity):
+                # A bucket above ceil(max_model_len / granularity) sits beyond
+                # every capacity the graph may gather: fall back to the eager
+                # runner (admission == False) instead of capturing an
+                # out-of-range gather. This is the fail-closed upper bound, not
+                # a crash path.
+                return False
         return True
 
     @staticmethod
@@ -801,7 +945,16 @@ class DecodeAclGraphRunner(BaseRunner):
         if slot_mapping is not None and slot_mapping.dim() == 1 and slot_mapping.numel() == token_count:
             return True
         host_slots = getattr(metadata, "new_cache_slots_host_values", None)
-        return host_slots is not None and len(host_slots) == token_count
+        if host_slots is not None and len(host_slots) == token_count:
+            return True
+        # V4.1 DSA multi-manager batches: a sequence with composite blocks is
+        # exported through ``multi_block_tables`` and the C++ builder appends
+        # nothing to ``new_token_slot_ids``, so the flat scheduler slot list is
+        # empty by construction. The DSA builder then derives every committed
+        # row's physical slot from the persistent manager tables, which makes
+        # the flat contract a zero-reader field for CSA2 -- require the manager
+        # table set instead so both busy and empty DP shards admit the graph.
+        return bool(getattr(metadata, "multi_block_tables", ()))
 
     @staticmethod
     def _effective_slot_mapping(
@@ -814,9 +967,13 @@ class DecodeAclGraphRunner(BaseRunner):
         if slot_mapping is not None and slot_mapping.dim() == 1 and slot_mapping.numel() == token_count:
             return slot_mapping.to(device=device, dtype=torch.int32).contiguous()
         host_slots = getattr(metadata, "new_cache_slots_host_values", None)
-        if host_slots is None or len(host_slots) != token_count:
-            raise RuntimeError("ACL graph decode requires one scheduler cache slot per token")
-        return torch.tensor(host_slots, dtype=torch.int32, device=device)
+        if host_slots is not None and len(host_slots) == token_count:
+            return torch.tensor(host_slots, dtype=torch.int32, device=device)
+        if getattr(metadata, "multi_block_tables", ()):
+            # DSA flat slots are unread by CSA2 (see _has_effective_slot_mapping);
+            # zeros keep the captured static buffer shape-consistent.
+            return torch.zeros(token_count, dtype=torch.int32, device=device)
+        raise RuntimeError("ACL graph decode requires one scheduler cache slot per token")
 
     def _reject_dp_all_decode(self, dp_all_decode: bool, message: str) -> None:
         if dp_all_decode:
@@ -1035,6 +1192,7 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
     ) -> None:
+        metadata = self._normalize_dsa_metadata(metadata)
         batch_size = input_ids.shape[0]
         # Same seq-vs-token admission as execute: MTP verify packs
         # (num_spec+1) token-rows per seq, so the capacity gate (max_batch,
@@ -1064,6 +1222,7 @@ class DecodeAclGraphRunner(BaseRunner):
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
     ) -> ModelExecutionOutput:
+        metadata = self._normalize_dsa_metadata(metadata)
         batch_size = input_ids.shape[0]
         # Same seq-vs-token admission as can_execute: MTP verify packs
         # (num_spec+1) token-rows per seq, so the capacity gate (max_batch, in
@@ -1113,6 +1272,7 @@ class DecodeAclGraphRunner(BaseRunner):
             padded_batch_size,
             verify_width,
         )
+        token_capacity_bucket = self._token_capacity_bucket(metadata)
         graph_key = self._graph_key(
             padded_batch_size,
             is_expanded,
@@ -1120,6 +1280,7 @@ class DecodeAclGraphRunner(BaseRunner):
             kpool_query_lens,
             verify_width=verify_width,
             is_dflash_proposal=bool(getattr(metadata, "is_dflash_proposal", False)),
+            token_capacity_bucket=token_capacity_bucket,
         )
         entry = self._graphs.get(graph_key)
         first_capture = entry is None
@@ -1131,6 +1292,9 @@ class DecodeAclGraphRunner(BaseRunner):
                 metadata,
                 input_batch,
                 verify_width=verify_width,
+            )
+            entry.static_metadata.dsa_graph_token_capacity = token_capacity_bucket * int(
+                getattr(self.attention_backend, "graph_token_capacity_granularity", 0) or 0
             )
             entry.eplb = self._allocate_graph_eplb_state(eplb, padded_batch_size)
             self._graphs[graph_key] = entry
@@ -1263,8 +1427,15 @@ class DecodeAclGraphRunner(BaseRunner):
         kpool_query_lens: tuple[int, ...] = (),
         verify_width: int = 1,
         is_dflash_proposal: bool = False,
+        token_capacity_bucket: int = 0,
     ) -> _GraphKey:
-        """Fix graph-captured attention mode as well as execution shape."""
+        """Fix graph-captured attention mode as well as execution shape.
+
+        ``token_capacity_bucket`` partitions graphs by the max context length
+        for backends whose forward gathers grow with it (V4.1 CSA2
+        committed-row capacity); it stays 0 for backends that do not opt in,
+        keeping the legacy key space unchanged.
+        """
         if input_embedding is None:
             return (
                 padded_batch_size,
@@ -1275,6 +1446,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 None,
                 kpool_query_lens,
                 is_dflash_proposal,
+                token_capacity_bucket,
             )
         return (
             padded_batch_size,
@@ -1285,7 +1457,47 @@ class DecodeAclGraphRunner(BaseRunner):
             tuple(input_embedding.shape[1:]),
             kpool_query_lens,
             is_dflash_proposal,
+            token_capacity_bucket,
         )
+
+    def _token_capacity_bucket(self, metadata: AttentionMetadata) -> int:
+        """Bucket index over the batch's max context length (0 when disabled).
+
+        Backends that gather per-context rows (the V4.1 CSA2 indexer /
+        attention) need a shape-stable capacity inside the captured graph, so
+        each bucket fixes the capacity at its upper bound; crossing into a new
+        bucket captures a fresh graph lazily.
+
+        Every DP rank in a communication group must derive the same bucket or
+        their capture/replay schedules desynchronize the HCCL collectives, so
+        DP uses the scheduler's host-planned global KV maximum
+        (``dp_global_kv_max_seq_lens``, the same source the C++ MLA capture
+        bucket uses) instead of this rank's local lengths.
+        """
+        granularity = int(getattr(self.attention_backend, "graph_token_capacity_granularity", 0) or 0)
+        if not granularity:
+            return 0
+        if self.dp_size > 1:
+            global_lengths = getattr(metadata, "dp_global_kv_max_seq_lens", None)
+            if global_lengths is None or not global_lengths:
+                # Conservative DP contract: without the scheduler's host-planned
+                # global lengths, do not derive a per-rank bucket from this
+                # rank's local lengths (0 == not graph-admissible), otherwise
+                # ranks could pick different buckets and desync HCCL.
+                return 0
+            max_ctx = max((int(value) for value in global_lengths), default=0)
+            return (max_ctx + granularity - 1) // granularity
+        expanded = resolve_expanded_decode_metadata(metadata)
+        host_values = (
+            expanded.kv_seq_lens_host_values
+            if expanded is not None
+            else getattr(metadata, "kv_seq_lens_host_values", None)
+        )
+        if not host_values:
+            kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
+            host_values = kv_seq_lens.tolist() if kv_seq_lens is not None else []
+        max_ctx = max((int(value) for value in host_values), default=0)
+        return (max_ctx + granularity - 1) // granularity
 
     def _padded_kpool_query_lens(
         self,
@@ -1967,7 +2179,16 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_metadata.new_cache_slots_host_values = []
             return
         if len(source_slots) < batch_size:
-            raise RuntimeError("decode ACL graph requires one host cache slot per token")
+            if not getattr(metadata, "multi_block_tables", ()):
+                raise RuntimeError("decode ACL graph requires one host cache slot per token")
+            # DSA multi-manager exports publish no flat scheduler slots (the
+            # C++ builder skips ``new_token_slot_ids`` for composite-block
+            # sequences). Both the C++ and Python DSA builders fall back to
+            # deriving each committed row's slot from the persistent manager
+            # tables when the list length does not match, so degrade to the
+            # empty list instead of failing the capture.
+            entry.static_metadata.new_cache_slots_host_values = []
+            return
         real_slots = [int(slot) for slot in source_slots[:batch_size]]
         padding_slots = [0] * (entry.batch_size - batch_size)
         entry.static_metadata.new_cache_slots_host_values = real_slots + padding_slots

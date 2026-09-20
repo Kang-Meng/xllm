@@ -62,6 +62,7 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       .num_layers(options_.num_layers())
       .slot_size(options_.slot_size())
       .model_id(options_.model_id())
+      .model_type(options_.model_type())
       .enable_linear_state(options_.enable_linear_state())
       .linear_state_num_slots(options_.linear_state_num_slots())
       .preserve_decode_checkpoint(options_.enable_host_offload() &&
@@ -72,8 +73,9 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
   for (int32_t i = 0; i < dp_size; ++i) {
     // The pool always holds a CompositeBlockManager. Its KV leaf is a flat
     // BlockManagerImpl, or an XTensorBlockManagerImpl when enable_xtensor (the
-    // builder picks); SWA / C4 / C128 come from manager_types; the LINEAR leaf
-    // is added by the builder when enable_linear_state. The per-sequence
+    // builder picks); the grouped leaves come from manager_types -- V4's
+    // SWA / C4 / C128 or V4.1's SWA / C2 / C1; the LINEAR leaf is added by the
+    // builder when enable_linear_state. The per-sequence
     // EMBEDDING resource leaf is appended here under the EMBEDDING key when
     // spec decode needs it. Every leaf is routed by its BlockType.
     auto leaves = build_composite_leaves(block_options, /*dp_rank=*/i);

@@ -367,7 +367,19 @@ void HierarchyKVCacheTransfer::shutdown() {
 
 int32_t HierarchyKVCacheTransfer::domain_group_id(CacheHandle handle,
                                                   BlockType block_type) {
-  constexpr int32_t kBlockTypeCount = cache_group_id(BlockType::LINEAR) + 1;
+  // The enum is append-only, so the largest cache_group_id may belong to an
+  // appended enumerator (C2) rather than to LINEAR. Derive the packing modulus
+  // from the true maximum so (handle, block_type) stays collision-free.
+  constexpr int32_t kBlockTypeCount =
+      std::max({cache_group_id(BlockType::KV),
+                cache_group_id(BlockType::SWA),
+                cache_group_id(BlockType::C4),
+                cache_group_id(BlockType::C128),
+                cache_group_id(BlockType::EMBEDDING),
+                cache_group_id(BlockType::LINEAR),
+                cache_group_id(BlockType::C1),
+                cache_group_id(BlockType::C2)}) +
+      1;
   CHECK_LE(handle,
            static_cast<CacheHandle>(
                (std::numeric_limits<int32_t>::max() - kBlockTypeCount + 1) /
@@ -380,6 +392,12 @@ HierarchyKVCacheTransfer::GroupedCaches
 HierarchyKVCacheTransfer::build_device_groups(CacheDomain* domain) const {
   CHECK(domain != nullptr);
   CHECK(domain->device_kv_caches != nullptr);
+  // TODO(V4.1): PD / hierarchy migration for the V4.1 TOKEN groups (C1/C2)
+  // is deferred — the milestone runs with PD off. C1/C2 caches are skipped
+  // here and in build_block_type_tensor_map below; extending this list also
+  // requires wiring their tensor roles in build_block_type_tensor_map.
+  // (domain_group_id stays collision-free: kBlockTypeCount is the maximum
+  // cache_group_id across all enumerators, appended ones included.)
   GroupedCaches device_groups;
   const std::vector<BlockType> block_types = {BlockType::KV,
                                               BlockType::LINEAR,

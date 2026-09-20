@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/framework/block/block_manager_pool.h"
 #include "core/framework/block/concurrent_block_manager_impl.h"
 #include "core/framework/block/embedding_block_manager.h"
+#include "framework/block/block_manager_pool_test_peer.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/linear_state_block_manager.h"
 #include "framework/config/scheduler_config.h"
@@ -2199,5 +2200,68 @@ TEST_P(LinearStateWindowTest, PoolReleasesCancelledSequenceBeforeResults) {
 INSTANTIATE_TEST_SUITE_P(PrefixCacheModes,
                          LinearStateWindowTest,
                          ::testing::Bool());
+
+// V4.1 default configuration: enable_prefix_cache defaults to true while the
+// C2/C1 TOKEN leaves never participate in prefix cache, so the builder must
+// demote the composite to prefix-cache-off instead of aborting in
+// classify_leaf_combination ("SWA prefix cache is on but neither C4 nor C128
+// is present" FATAL). Regression test for the default-config startup crash.
+TEST(CompositeBlockManagerTest, V41DefaultPrefixCacheDemotesInsteadOfAbort) {
+  const uint32_t window_size = 4 * kBaseBlockSize;
+  BlockManager::Options opts = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      /*block_size=*/kBaseBlockSize,
+      /*window_size=*/window_size,
+      /*max_seqs_per_batch=*/4);
+  // V4.1 token shape: [SWA, TOKEN(2), TOKEN(1)]. The demotion falls out of the
+  // per-group leaf_participates_in_prefix_cache property (C1/C2 never
+  // participate), not of the model type.
+  opts.model_type("deepseek_v41");
+  opts.manager_types({kManagerTypeSlidingWindowBlockManager,
+                      kManagerTypeBlockManagerImpl,
+                      kManagerTypeBlockManagerImpl});
+  opts.compress_ratios({0, 2, 1});
+  ASSERT_TRUE(opts.enable_prefix_cache());
+
+  // Cover both PREFILL/MIX and DECODE explicitly; keep the cache flag default.
+  for (const bool is_decode : {false, true}) {
+    SCOPED_TRACE(is_decode);
+    opts.instance_is_decode(is_decode);
+    CompositeBlockManager manager(build_composite_leaves(opts), opts);
+    for (const BlockType type :
+         {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+      const BlockManager* leaf =
+          BlockManagerPoolTestPeer::leaf_of(manager, type);
+      ASSERT_NE(leaf, nullptr);
+      EXPECT_FALSE(leaf->options().enable_prefix_cache());
+    }
+    EXPECT_EQ(manager.leaf_combination(),
+              CompositeBlockManager::LeafCombination::UNSUPPORTED);
+  }
+}
+
+TEST(CompositeBlockManagerTest, V4DefaultPrefixCacheKeepsRolePolicy) {
+  BlockManager::Options opts = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      /*block_size=*/kBaseBlockSize,
+      /*window_size=*/4 * kBaseBlockSize,
+      /*max_seqs_per_batch=*/4);
+  ASSERT_TRUE(opts.enable_prefix_cache());
+  for (const bool is_decode : {false, true}) {
+    SCOPED_TRACE(is_decode);
+    opts.instance_is_decode(is_decode);
+    CompositeBlockManager manager(build_composite_leaves(opts), opts);
+    const BlockManager* swa =
+        BlockManagerPoolTestPeer::leaf_of(manager, BlockType::SWA);
+    ASSERT_NE(swa, nullptr);
+    EXPECT_EQ(swa->options().enable_prefix_cache(), !is_decode);
+    for (const BlockType type : {BlockType::C4, BlockType::C128}) {
+      const BlockManager* leaf =
+          BlockManagerPoolTestPeer::leaf_of(manager, type);
+      ASSERT_NE(leaf, nullptr);
+      EXPECT_TRUE(leaf->options().enable_prefix_cache());
+    }
+  }
+}
 
 }  // namespace xllm

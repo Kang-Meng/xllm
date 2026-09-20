@@ -647,8 +647,13 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .instance_role = options_.instance_role(),
       .has_key_cache_shape = kv_cache_shape.has_key_cache_shape(),
       .has_grouped_cache_layout = kv_cache_shape.has_grouped_cache_layout(),
+      // TODO(V4.1): grouped host offload for the V4.1 TOKEN groups (C1/C2)
+      // is deferred; keep it rejected so the unextended host paths cannot be
+      // reached. The V4.1 milestone runs with prefix cache / PD / host
+      // offload disabled.
       .supports_grouped_cache_offload =
-          util::is_deepseek_v4_model_type(args_.model_type()),
+          util::is_deepseek_v4_model_type(args_.model_type()) &&
+          !util::is_deepseek_v41_model_type(args_.model_type()),
       .has_conv_cache_shape = kv_cache_shape.has_conv_cache_shape(),
       .has_ssm_cache_shape = kv_cache_shape.has_ssm_cache_shape(),
       .kv_cache_dtype = options_.kv_cache_dtype(),
@@ -684,6 +689,7 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size())
       .model_id(options_.model_id())
+      .model_type(args_.model_type())
       .max_seqs_per_batch(options_.max_seqs_per_batch())
       .num_speculative_tokens(options_.num_speculative_tokens())
       .num_embedding_blocks(
@@ -704,13 +710,38 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
         0};  // unused for sliding window manager
     std::vector<uint32_t> token_manager_ratios;
     token_manager_ratios.reserve(2);
-    for (const int32_t ratio : args_.compress_ratios()) {
-      if (ratio == 4 || ratio == 128) {
+    if (util::is_deepseek_v41_model_type(args_.model_type())) {
+      // V4.1: one TOKEN manager per distinct kv-source compress ratio, in
+      // first-kv-source-appearance order (contract §2: group order
+      // [SWA, TOKEN(2), TOKEN(1)] for the standard layer plan). Reuse layers
+      // read the source layer's tensors and the TOKEN group's block table,
+      // so only the kv-source ratios get managers.
+      const std::vector<int32_t>& compress_ratios = args_.compress_ratios();
+      for (const int32_t layer_id : args_.kv_source_layer_ids()) {
+        if (layer_id < 0 ||
+            layer_id >= static_cast<int64_t>(compress_ratios.size())) {
+          continue;
+        }
+        const int32_t ratio = compress_ratios[static_cast<size_t>(layer_id)];
+        if (ratio != 2 && ratio != 1) {
+          continue;
+        }
         const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
         if (std::find(token_manager_ratios.begin(),
                       token_manager_ratios.end(),
                       ratio_u32) == token_manager_ratios.end()) {
           token_manager_ratios.push_back(ratio_u32);
+        }
+      }
+    } else {
+      for (const int32_t ratio : args_.compress_ratios()) {
+        if (ratio == 4 || ratio == 128) {
+          const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
+          if (std::find(token_manager_ratios.begin(),
+                        token_manager_ratios.end(),
+                        ratio_u32) == token_manager_ratios.end()) {
+            token_manager_ratios.push_back(ratio_u32);
+          }
         }
       }
     }

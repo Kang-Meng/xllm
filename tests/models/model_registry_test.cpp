@@ -54,5 +54,43 @@ TEST(ModelRegistryTest, DeepseekV4DSparkUsesTorchBackend) {
             "--npu_kernel_backend=TORCH.");
 }
 
+TEST(ModelRegistryTest, DeepseekV41UsesTorchBackend) {
+  std::string effective_backend;
+  std::string resolved_name;
+  std::string error_message;
+
+  EXPECT_TRUE(resolve_model_registration("deepseek_v41",
+                                         "AUTO",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(effective_backend, "TORCH");
+  EXPECT_EQ(resolved_name, "deepseek_v41");
+  EXPECT_TRUE(error_message.empty());
+
+  EXPECT_TRUE(resolve_model_registration("deepseek_v41",
+                                         "TORCH",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(effective_backend, "TORCH");
+  EXPECT_EQ(resolved_name, "deepseek_v41");
+
+  EXPECT_FALSE(resolve_model_registration("deepseek_v41",
+                                          "ATB",
+                                          &effective_backend,
+                                          &resolved_name,
+                                          &error_message));
+  EXPECT_EQ(error_message,
+            "Model type deepseek_v41 only supports "
+            "--npu_kernel_backend=TORCH.");
+}
+
+TEST(ModelRegistryTest, DeepseekV41RegistersArgsLoaderAndLlmBackend) {
+  EXPECT_TRUE(
+      static_cast<bool>(ModelRegistry::get_model_args_loader("deepseek_v41")));
+  EXPECT_EQ(ModelRegistry::get_model_backend("deepseek_v41"), "llm");
+}
+
 }  // namespace
 }  // namespace xllm

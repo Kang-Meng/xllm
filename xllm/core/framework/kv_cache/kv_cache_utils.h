@@ -104,6 +104,11 @@ struct KVCacheCreateOptions {
   PROPERTY(int64_t, index_head_dim) = 0;
   PROPERTY(int64_t, window_size) = 0;
   PROPERTY(std::vector<int32_t>, compress_ratios);
+  // DeepSeek V4.1: layers that own a Compressor and publish the shared
+  // compressed main-KV / index caches. Only kv-source layers allocate TOKEN
+  // group tensors; reuse layers read them (contract §2: allocation is driven
+  // solely by the kv-source layers' entries).
+  PROPERTY(std::vector<int32_t>, kv_source_layer_ids);
 };
 
 struct KVCacheTensors {

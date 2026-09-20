@@ -127,6 +127,14 @@ def test_dspark_native_swa_indices_map_expanded_metadata_ring() -> None:
         is_chunked_prefill=False,
     )
 
+    # ``CsaAttentionBackend`` builds the metadata without overriding
+    # ``read_table_layout``, so it inherits the shared right-aligned default
+    # (``READ_TABLE_LAYOUT_RIGHT_ALIGNED``): only the retained columns are
+    # filled, at ``raw[s, d % semantic_cols]``, leaving the leading columns as
+    # ``-1``. Only v41/``csa2`` opts into the ring layout that rings every
+    # column (``[[20, 21, 20]]``). ``_build_dspark_swa_indices`` is
+    # layout-adaptive, so the resolved slots below are unchanged -- which is
+    # what this test actually pins.
     assert compressed_metadata.block_tables[0][0].tolist() == [[-1, 21, 20]]
     backend._build_dspark_swa_metadata(compressed_metadata)
 

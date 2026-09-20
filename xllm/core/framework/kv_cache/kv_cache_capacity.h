@@ -88,6 +88,12 @@ class KVCacheCapacity final {
   PROPERTY(int64_t, c4_count) = 0;
   PROPERTY(int64_t, c128_count) = 0;
 
+  // DeepSeek V4.1 TOKEN-group pool counts (kv-source layers, compress ratios
+  // 2 and 1). Only meaningful for deepseek_v41, whose positional pool vector
+  // is [swa_count, c2_count, c1_count].
+  PROPERTY(int64_t, c2_count) = 0;
+  PROPERTY(int64_t, c1_count) = 0;
+
  private:
   int64_t index_slot_size_ = 0;
   int64_t index_block_size_ = 0;

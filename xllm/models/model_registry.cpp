@@ -76,6 +76,7 @@ bool is_torch_only_model_type(const std::string& model_type) {
       "deepseek_v4",
       "deepseek_v4_dspark",
       "deepseek_v4_mtp",
+      "deepseek_v41",
       "glm5_next_mtp",
       "qwen3_5",
       "qwen3_5_text",

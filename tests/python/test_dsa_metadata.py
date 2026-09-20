@@ -28,6 +28,8 @@ import torch
 from xllm.python.attention.dsa_metadata import (
     DSA_CACHE_SLIDING_WINDOW,
     DSA_CACHE_TOKEN,
+    READ_TABLE_LAYOUT_RIGHT_ALIGNED,
+    READ_TABLE_LAYOUT_RING,
     DsaMetadataBuilder,
     build_cache_specs,
 )
@@ -91,10 +93,17 @@ def test_build_cache_specs_real_dsv4_config() -> None:
     assert c1 + c4 + c128 == 43
 
 
-def _make_builder(n_layers: int = 4) -> tuple[DsaMetadataBuilder, list, list]:
+def _make_builder(
+    n_layers: int = 4,
+    read_table_layout: str = READ_TABLE_LAYOUT_RIGHT_ALIGNED,
+) -> tuple[DsaMetadataBuilder, list, list]:
     compress_ratios = [0, 4, 128, 4]
     caches_info, group_infos = build_cache_specs(compress_ratios, 128, n_layers)
-    return DsaMetadataBuilder(caches_info, group_infos), caches_info, group_infos
+    return (
+        DsaMetadataBuilder(caches_info, group_infos, read_table_layout=read_table_layout),
+        caches_info,
+        group_infos,
+    )
 
 
 def test_build_seq_lengths_and_start_pos() -> None:
@@ -237,6 +246,118 @@ def test_build_swa_group_uses_scheduler_resolved_slots_for_expanded_decode() -> 
     )
 
     assert dsa.slot_mappings[0][0].tolist() == [301, 302, 401, 402]
+
+
+def _swa_read_table(
+    raw_bt: torch.Tensor,
+    ctx_lens: list[int],
+    *,
+    block_size: int = 128,
+    graph_cols: int = 0,
+    layout: str = READ_TABLE_LAYOUT_RING,
+) -> torch.Tensor:
+    """Drive the real builder's SWA read-side table construction."""
+    builder, _, _ = _make_builder(read_table_layout=layout)
+    read_bt, _ = builder._process_swa_group(
+        raw_bt=raw_bt,
+        block_size=block_size,
+        ctx_lens=list(ctx_lens),
+        q_lens=[1] * len(ctx_lens),
+        batch_size=len(ctx_lens),
+        graph_slot_capacity=len(ctx_lens) if graph_cols > 0 else 0,
+        graph_block_table_capacity_cols=graph_cols,
+        new_cache_slots=None,
+    )
+    return read_bt
+
+
+@pytest.mark.parametrize("ctx_len", [129, 257, 513])
+def test_swa_read_table_rings_every_addressed_column(ctx_len: int) -> None:
+    """A non-zero ring block must appear in EVERY column a reader addresses.
+
+    The "ring" layout (requested by DeepSeek-V4.1) fills every column with the
+    block for its own logical index, ``min(semantic_cols, ceil(ctx / block_size))``
+    right-aligned columns carrying the ring is NOT enough: every read-side
+    consumer addresses columns absolutely, so the older half of a multi-block
+    window would resolve to block 0. With ``raw_bt = [[8]]`` (one ring block,
+    id 8) every addressed column must read 8.
+    """
+    raw_bt = torch.tensor([[8]], dtype=torch.int32)
+    read_bt = _swa_read_table(raw_bt, [ctx_len])
+    addressed = (ctx_len + 127) // 128
+    assert read_bt.shape == (1, addressed)
+    assert read_bt[0, :addressed].tolist() == [8] * addressed
+
+
+def test_swa_read_table_resolves_each_sequence_ring_block() -> None:
+    """batch > 1: each row resolves to its OWN ring block, never block 0."""
+    rings = [8, 9, 10, 11]
+    raw_bt = torch.tensor([[ring] for ring in rings], dtype=torch.int32)
+    read_bt = _swa_read_table(raw_bt, [257] * len(rings))
+    addressed = (257 + 127) // 128  # 3
+    assert read_bt.shape == (len(rings), addressed)
+    for seq, ring in enumerate(rings):
+        assert read_bt[seq].tolist() == [ring] * addressed
+
+
+def test_swa_read_table_modulos_by_semantic_cols() -> None:
+    """Several ring blocks per sequence: column ``d`` carries ``raw[s, d % sc]``."""
+    raw_bt = torch.tensor([[8, 9]], dtype=torch.int32)  # semantic_cols == 2
+    read_bt = _swa_read_table(raw_bt, [385])
+    addressed = (385 + 127) // 128  # 4
+    assert read_bt.shape == (1, addressed)
+    assert read_bt[0].tolist() == [8, 9, 8, 9]
+
+
+def test_swa_read_table_rings_the_full_graph_storage_width() -> None:
+    """Production graph width: all 8192 columns carry the sequence ring block.
+
+    Production runs ``graph_block_table_capacity_cols=8192`` with one ring block
+    per sequence, so the read table is 8192 wide and every addressed column must
+    equal that single ring block (not just the right-aligned tail).
+    """
+    raw_bt = torch.tensor([[8]], dtype=torch.int32)
+    read_bt = _swa_read_table(raw_bt, [257], graph_cols=8192)
+    assert read_bt.shape == (1, 8192)
+    assert bool((read_bt[0] == 8).all())
+
+
+def test_swa_read_table_matches_the_write_path_ring_resolution() -> None:
+    """Every position's eager read must resolve the block the writer used.
+
+    The write path (``slot_for_position``) maps position ``p`` to
+    ``raw_bt[s, (p // block_size) % semantic_cols]``; the eager reader
+    (``_gather_swa_positions``) resolves ``(p // block_size) % read_cols``
+    against the read-side table and clamps ``-1`` to 0. Both must agree for
+    every position, not only the newest window.
+    """
+    block_size = 128
+    ctx_len = 513
+    raw_bt = torch.tensor([[8]], dtype=torch.int32)
+    read_bt = _swa_read_table(raw_bt, [ctx_len], block_size=block_size)
+    read_cols = int(read_bt.size(1))
+    semantic_cols = int(raw_bt.size(1))
+    for pos in range(ctx_len):
+        write_block = int(raw_bt[0, (pos // block_size) % semantic_cols].item())
+        eager_block = int(read_bt[0, (pos // block_size) % read_cols].clamp_min(0).item())
+        assert eager_block == write_block, f"pos={pos}"
+
+
+def test_default_swa_read_table_stays_right_aligned() -> None:
+    """The shared (non-V4.1) default keeps the historical right-aligned layout."""
+    raw_bt = torch.tensor([[8]], dtype=torch.int32)
+    read_bt = _swa_read_table(raw_bt, [257], layout=READ_TABLE_LAYOUT_RIGHT_ALIGNED)
+    # dst_lens = ceil(257 / 128) = 3, semantic_cols = 1 -> one retained column at
+    # the tail, the leading columns stay -1 (the DSV4 / V4-dspark consumers
+    # compensate for this shift via _build_dspark_swa_indices).
+    assert read_bt.shape == (1, 3)
+    assert read_bt[0].tolist() == [-1, -1, 8]
+
+
+def test_builder_rejects_unknown_read_table_layout() -> None:
+    caches_info, group_infos = build_cache_specs([0], 128, 1)
+    with pytest.raises(ValueError, match="unknown SWA read-table layout"):
+        DsaMetadataBuilder(caches_info, group_infos, read_table_layout="bogus")
 
 
 def test_build_block_tables_shared_within_group() -> None:

@@ -209,6 +209,12 @@ struct ModelArgs {
   PROPERTY(int32_t, o_lora_rank) = 0;
   PROPERTY(int32_t, o_groups) = 0;
   PROPERTY(std::vector<int32_t>, compress_ratios);
+  // deepseek v4.1: layers that own a Compressor and publish the shared
+  // compressed main-KV / index caches; all other CSA2 layers reuse them.
+  PROPERTY(std::vector<int32_t>, kv_source_layer_ids) = {};
+  // deepseek v4.1: layers that own an Indexer and compute fresh Top-K
+  // indices; all others reuse the latest Top-K.
+  PROPERTY(std::vector<int32_t>, index_source_layer_ids) = {};
   PROPERTY(float, compress_rope_theta) = 0.0f;
   PROPERTY(int32_t, window_size) = 0;
   PROPERTY(int32_t, n_activated_experts) = 0;
@@ -222,6 +228,32 @@ struct ModelArgs {
   PROPERTY(float, hc_eps) = 1e-6f;
   PROPERTY(int64_t, max_batch_size) = 0;
   PROPERTY(int64_t, max_seq_len) = 0;
+
+  // deepseek v4.1 (Flash): CSA2/CED candidate block pool, engram sparse-recall
+  // tables and DSpark draft MoE geometry. Loaded from the HF config's
+  // text_config by the deepseek_v41 args loader; those HF text_config fields
+  // are the semantic source of truth. Defaults are "disabled" sentinels
+  // (-1 / 0 / empty), not released-model values.
+  // (kv_source_layer_ids / index_source_layer_ids live next to
+  // compress_ratios above.)
+  PROPERTY(int32_t, candidate_source_layer_id) = -1;
+  PROPERTY(int32_t, candidate_topk_blocks) = 0;
+  PROPERTY(int32_t, candidate_block_size) = 0;
+  PROPERTY(std::vector<int32_t>, engram_layer_ids) = {};
+  PROPERTY(std::vector<int64_t>, engram_num_embeddings) = {};
+  PROPERTY(int32_t, engram_max_ngram_size) = 0;
+  PROPERTY(int32_t, engram_vocab_size) = 0;
+  PROPERTY(int32_t, engram_n_heads) = 0;
+  PROPERTY(int32_t, engram_head_dim) = 0;
+  // -1 = "unset": matches DeepseekV41Config.engram_pad_token_id in
+  // xllm/python/models/deepseek_v41.py, whose guard rejects an enabled engram
+  // with an unset pad id. Keep this and the deepseek_v41 loader default equal.
+  PROPERTY(int32_t, engram_pad_token_id) = -1;
+  PROPERTY(int32_t, engram_compressed_vocab_size) = 0;
+  PROPERTY(int32_t, dspark_n_routed_experts) = 0;
+  PROPERTY(int32_t, dspark_num_experts_per_tok) = 0;
+  // image_token_id is shared with the multimodal token ids below; the
+  // deepseek_v41 args loader applies the V4.1 default (-1) itself.
 
   PROPERTY(int32_t, vision_start_token_id) = 0;
   PROPERTY(int32_t, vision_end_token_id) = 0;

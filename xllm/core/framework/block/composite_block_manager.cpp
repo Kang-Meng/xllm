@@ -74,14 +74,19 @@ void publish_blocks(Sequence* seq,
   kv.set_num_cached_blocks(type, end);
 }
 
+// Whether a leaf of the given BlockType participates in prefix cache under
+// the current role. On PREFILL/MIX (instance_is_decode == false), supported
+// cache-bearing leaves participate. On DECODE we skip SWA and
+// LINEAR because the D forward never reads their shared prefix before P
+// overwrites it -- SWA hits carry gap-invalid placeholders that would break
+// the grouped-response CHECK, and LINEAR restore is a net waste (D does no
+// prefill). EMBEDDING has never had a prefix cache and stays out on both sides.
+//
 // Host offload is intentionally broader than this predicate: decode keeps an
 // offload-only SWA Host leaf, while this predicate still prevents SWA from
 // being probed or restored as a prefix.
 bool leaf_participates_in_prefix_cache(BlockType type,
                                        bool instance_is_decode) {
-  if (!instance_is_decode) {
-    return true;
-  }
   switch (type) {
     case BlockType::KV:
     case BlockType::C4:
@@ -89,7 +94,13 @@ bool leaf_participates_in_prefix_cache(BlockType type,
       return true;
     case BlockType::SWA:
     case BlockType::LINEAR:
+      return !instance_is_decode;
     case BlockType::EMBEDDING:
+      return false;
+    // TODO(V4.1): Enable only after C1/C2 composite classification and restore
+    // are implemented. Neither role may mount a partial TOKEN prefix.
+    case BlockType::C1:
+    case BlockType::C2:
       return false;
   }
   // Fail loudly on unhandled BlockType. Falling back to false would silently
@@ -98,6 +109,24 @@ bool leaf_participates_in_prefix_cache(BlockType type,
   LOG(FATAL) << "leaf_participates_in_prefix_cache: unhandled BlockType="
              << static_cast<int32_t>(type);
   return false;
+}
+
+// Map a composite sub-manager's compression ratio to its cache-group BlockType.
+// V4.1 TOKEN groups: ratio 1 -> C1, ratio 2 -> C2; V4 compressed groups:
+// ratio 4 -> C4, ratio 128 -> C128. Any other ratio falls back to C128,
+// matching the historical inline ternary; callers CHECK the valid set where it
+// matters.
+inline BlockType block_type_from_compress_ratio(uint32_t ratio) {
+  if (ratio == 1) {
+    return BlockType::C1;
+  }
+  if (ratio == 2) {
+    return BlockType::C2;
+  }
+  if (ratio == 4) {
+    return BlockType::C4;
+  }
+  return BlockType::C128;
 }
 
 // Wrap the leaf in a concurrency adapter when sequence-level calls may run
@@ -143,18 +172,52 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     int32_t dp_rank) {
   CompositeBlockManager::LeafMap leaves;
 
-  const bool prefix_cache_on = options.enable_prefix_cache();
   const bool is_decode = options.instance_is_decode();
   const bool linear_participates =
       leaf_participates_in_prefix_cache(BlockType::LINEAR, is_decode);
   const bool swa_participates =
       leaf_participates_in_prefix_cache(BlockType::SWA, is_decode);
-  const bool c4_participates =
-      leaf_participates_in_prefix_cache(BlockType::C4, is_decode);
-  const bool c128_participates =
-      leaf_participates_in_prefix_cache(BlockType::C128, is_decode);
   const bool kv_participates =
       leaf_participates_in_prefix_cache(BlockType::KV, is_decode);
+
+  // Prefix-cache support is a property of the cache groups themselves
+  // (leaf_participates_in_prefix_cache), not of the model type. A flat KV leaf
+  // anchors its own prefix; a grouped attention layout needs at least one
+  // full-history compressed group that participates. A grouped shape carrying
+  // only non-participating TOKEN groups (V4.1's C1/C2 today) would leave SWA as
+  // the only caching leaf and abort in classify_leaf_combination, so demote the
+  // whole composite to prefix-cache-off with a warning: enable_prefix_cache
+  // defaults to true and the default configuration must still start.
+  bool prefix_cache_on = options.enable_prefix_cache();
+  // Anchor the prefix cache only on cache groups this instance actually
+  // registers. leaf_participates_in_prefix_cache reports C4/C128 as true
+  // unconditionally, so probing them without checking registration would keep
+  // prefix cache on for a shape that registers only SWA + C1/C2 (V4.1) and then
+  // abort in classify_leaf_combination.
+  bool grouped_anchor_participates = false;
+  for (size_t i = 0; i < options.manager_types().size(); ++i) {
+    if (options.manager_types()[i] != kManagerTypeBlockManagerImpl) {
+      continue;  // The SWA leaf alone is not a prefix-cache anchor.
+    }
+    if (i >= options.compress_ratios().size()) {
+      break;  // Size mismatch is CHECKed when the leaves are built.
+    }
+    const uint32_t ratio = options.compress_ratios()[i];
+    const BlockType key = block_type_from_compress_ratio(ratio);
+    const bool participates = leaf_participates_in_prefix_cache(key, is_decode);
+    if (participates) {
+      grouped_anchor_participates = true;
+      break;
+    }
+  }
+  if (prefix_cache_on && !options.manager_types().empty() &&
+      !grouped_anchor_participates) {
+    LOG(WARNING) << "grouped cache has no prefix-cache-capable group for "
+                    "model_type="
+                 << options.model_type()
+                 << "; disabling prefix cache for this instance";
+    prefix_cache_on = false;
+  }
 
   if (options.enable_linear_state()) {
     CHECK_GT(options.linear_state_num_slots(), 0)
@@ -201,7 +264,8 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     return leaves;
   }
 
-  // DSV4: SWA + compressed (C4 / C128) leaves.
+  // DSV4: SWA + compressed (C4 / C128) leaves; DSV4.1: SWA + TOKEN (C1 / C2)
+  // leaves.
   const size_t n = options.manager_types().size();
   CHECK_EQ(n, options.compress_ratios().size())
       << "manager_types and compress_ratios must have the same size";
@@ -213,30 +277,45 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     BlockManager::Options opts = options;
 
     if (type == kManagerTypeBlockManagerImpl) {
-      CHECK(compress_ratio == 4 || compress_ratio == 128)
+      CHECK(compress_ratio == 1 || compress_ratio == 2 || compress_ratio == 4 ||
+            compress_ratio == 128)
           << "unexpected compress_ratio " << compress_ratio
           << " for composite BlockManagerImpl sub-manager";
-      const BlockType key =
-          compress_ratio == 4 ? BlockType::C4 : BlockType::C128;
-      const Dsv4CacheGeometry& geometry =
-          KVCacheConfig::get_instance().dsv4_cache_geometry();
-      const int64_t logical_block_size = geometry.compressed_block_token_size();
-      uint32_t typed_num_blocks = key == BlockType::C4
-                                      ? options.c4_num_blocks()
-                                      : options.c128_num_blocks();
-      if (typed_num_blocks == 0) {
-        CHECK_GT(options.block_size(), 0);
-        const int64_t base_token_capacity =
-            static_cast<int64_t>(options.num_blocks()) * options.block_size();
-        typed_num_blocks = static_cast<uint32_t>(
-            base_token_capacity / geometry.compressed_block_token_size());
+      // V4.1 TOKEN groups: C1 (ratio 1) / C2 (ratio 2); V4 compressed groups:
+      // C4 (ratio 4) / C128 (ratio 128). Ratios 1 and 2 only appear together
+      // on V4.1 models.
+      const BlockType key = block_type_from_compress_ratio(compress_ratio);
+      if (compress_ratio == 1 || compress_ratio == 2) {
+        // V4.1 TOKEN group: a C2 block spans two engine blocks and a C1 block
+        // spans one, so scale the logical block size and shrink the block count
+        // to keep the same token capacity as the engine-block pool.
+        opts.block_size(static_cast<uint32_t>(options.block_size()) *
+                        compress_ratio);
+        opts.num_blocks(static_cast<uint32_t>(options.num_blocks()) /
+                        compress_ratio);
+      } else {
+        const Dsv4CacheGeometry& geometry =
+            KVCacheConfig::get_instance().dsv4_cache_geometry();
+        const int64_t logical_block_size =
+            geometry.compressed_block_token_size();
+        uint32_t typed_num_blocks = compress_ratio == 4
+                                        ? options.c4_num_blocks()
+                                        : options.c128_num_blocks();
+        if (typed_num_blocks == 0) {
+          CHECK_GT(options.block_size(), 0);
+          const int64_t base_token_capacity =
+              static_cast<int64_t>(options.num_blocks()) * options.block_size();
+          typed_num_blocks = static_cast<uint32_t>(
+              base_token_capacity / geometry.compressed_block_token_size());
+        }
+        CHECK_GT(typed_num_blocks, 0u)
+            << "missing DSV4 compressed block count for ratio "
+            << compress_ratio;
+        opts.block_size(static_cast<int32_t>(logical_block_size))
+            .num_blocks(typed_num_blocks);
       }
-      CHECK_GT(typed_num_blocks, 0u)
-          << "missing DSV4 compressed block count for ratio " << compress_ratio;
-      opts.block_size(static_cast<int32_t>(logical_block_size))
-          .num_blocks(typed_num_blocks);
       const bool compressed_participates =
-          key == BlockType::C4 ? c4_participates : c128_participates;
+          leaf_participates_in_prefix_cache(key, is_decode);
       const bool compressed_prefix_cache =
           prefix_cache_on && compressed_participates;
       opts.block_type(key)

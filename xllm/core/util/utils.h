@@ -185,11 +185,18 @@ inline bool is_deepseek_v4_dspark_model_type(std::string_view model_type) {
   return model_type == kDeepseekV4DSparkModelType;
 }
 
+inline constexpr std::string_view kDeepseekV4ModelType = "deepseek_v4";
+inline constexpr std::string_view kDeepseekV41ModelType = "deepseek_v41";
+
+inline bool is_deepseek_v41_model_type(std::string_view model_type) {
+  return model_type == kDeepseekV41ModelType;
+}
+
 inline bool is_deepseek_v4_model_type(std::string_view model_type) {
-  constexpr std::string_view kTargetModelType = "deepseek_v4";
-  return model_type == kTargetModelType ||
+  return model_type == kDeepseekV4ModelType ||
          is_deepseek_v4_dspark_model_type(model_type) ||
-         is_target_mtp_model_type(model_type, kTargetModelType);
+         is_deepseek_v41_model_type(model_type) ||
+         is_target_mtp_model_type(model_type, kDeepseekV4ModelType);
 }
 
 // Returns whether a model's KV cache can be transferred between different TP

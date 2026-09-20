@@ -92,8 +92,12 @@ size_t KVCacheState::num_blocks(BlockType type) const {
 bool KVCacheState::has_any_blocks() const {
   // Cache-bearing types only; EMBEDDING is a per-sequence resource block, not
   // token cache, and must not count toward "the sequence already holds cache".
-  for (const BlockType type :
-       {BlockType::KV, BlockType::SWA, BlockType::C4, BlockType::C128}) {
+  for (const BlockType type : {BlockType::KV,
+                               BlockType::SWA,
+                               BlockType::C1,
+                               BlockType::C2,
+                               BlockType::C4,
+                               BlockType::C128}) {
     const auto it = composite_blocks_.find(type);
     if (it != composite_blocks_.end() && !it->second.empty()) {
       return true;
@@ -326,12 +330,14 @@ size_t KVCacheState::current_max_tokens_capacity() const {
     CHECK(size_it != block_sizes_.end());
     return kv.size() * size_it->second;
   }
-  // DSV4: only the compressed incremental groups (C4 / C128) have a linear
-  // token capacity. The SWA ring is excluded on purpose -- its committed tokens
-  // keep advancing past ring_capacity * block_size, so counting it here would
-  // make incr_kv_cache_tokens_num's CHECK fail.
+  // DSV4: only the compressed incremental groups (C4 / C128, and the V4.1
+  // TOKEN groups C1 / C2) have a linear token capacity. The SWA ring is
+  // excluded on purpose -- its committed tokens keep advancing past
+  // ring_capacity * block_size, so counting it here would make
+  // incr_kv_cache_tokens_num's CHECK fail.
   size_t capacity = 0;
-  for (const BlockType type : {BlockType::C4, BlockType::C128}) {
+  for (const BlockType type :
+       {BlockType::C1, BlockType::C2, BlockType::C4, BlockType::C128}) {
     const Slice<Block> bs = blocks(type);
     if (bs.empty()) {
       continue;

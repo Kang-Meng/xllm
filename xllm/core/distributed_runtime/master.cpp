@@ -572,12 +572,31 @@ Master::Master(const Options& options, EngineType type)
     CHECK(!dcp_topology_error.has_value()) << dcp_topology_error.value();
   }
   std::string model_type;
-  if (native_qwen_dcp_requested ||
+  if (options_.backend() == "llm" || native_qwen_dcp_requested ||
       (options_.cp_size() > 1 && Platform::uses_model_cp_sharding()) ||
       (ModelConfig::is_python_model_impl(
            ModelConfig::get_instance().model_impl()) &&
        options_.num_speculative_tokens() > 0)) {
     model_type = util::get_model_type(model_path, options_.backend());
+  }
+  // V4.1 does not support KV cache Store, speculative decoding, or
+  // disaggregated PD: the grouped KV (C1/C2) is not handled by the restore or
+  // draft-accounting paths. Reject the options before any engine/worker is
+  // built. Prefix-cache support is a property of the cache groups and is
+  // resolved in the block layer (leaf_participates_in_prefix_cache), not here.
+  if (util::is_deepseek_v41_model_type(model_type)) {
+    CHECK(!options_.enable_kvcache_store())
+        << "DeepSeek-V4.1 does not support KV cache Store: restore for the "
+           "grouped KV (C1/C2) is not implemented.";
+    const bool v41_speculative_requested =
+        options_.num_speculative_tokens() > 0 ||
+        !options_.draft_model_path().value_or("").empty();
+    CHECK(!v41_speculative_requested)
+        << "DeepSeek-V4.1 does not support speculative decoding: grouped KV "
+           "(C1/C2) is not implemented in the speculative path.";
+    CHECK(!options_.enable_disagg_pd())
+        << "DeepSeek-V4.1 does not support disaggregated PD: the grouped "
+           "TOKEN KV (C1/C2) transfer path is not implemented.";
   }
   const std::optional<std::string> speculative_error =
       ModelConfig::validate_python_speculative_decode(

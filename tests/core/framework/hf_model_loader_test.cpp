@@ -916,6 +916,87 @@ TEST(HFModelLoaderTest, DeepseekV4DSparkModelArgsFrom0731Config) {
   EXPECT_EQ(args.markov_rank(), 256);
   ASSERT_EQ(args.compress_ratios().size(), 43);
 }
+
+TEST(HFModelLoaderTest, DeepseekV41ModelArgsFromConfig) {
+  auto loader = ModelRegistry::get_model_args_loader("deepseek_v41");
+  ASSERT_NE(loader, nullptr);
+
+  // Mirrors the released DeepSeek-V4.1-Flash config; fields that equal the
+  // loader defaults in load_deepseek_v41_model_args are omitted.
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "deepseek_v41",
+      "image_token_id": 129264,
+      "quantization_config": {
+        "scale_fmt": "ue8m0"
+      },
+      "text_config": {
+        "sliding_window": 128,
+        "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                            2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                            1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "candidate_source_layer_id": 20,
+        "candidate_topk_blocks": 2048,
+        "candidate_block_size": 8,
+        "engram_layer_ids": [1, 14],
+        "engram_pad_token_id": 2,
+        "engram_num_embeddings": [384006168, 384016682],
+        "engram_max_ngram_size": 4,
+        "engram_vocab_size": 16000000,
+        "engram_n_heads": 8,
+        "engram_head_dim": 256,
+        "engram_compressed_vocab_size": 99092,
+        "dspark_markov_rank": 256,
+        "dspark_target_layer_ids": [37, 38, 39],
+        "dspark_n_routed_experts": 128,
+        "dspark_num_experts_per_tok": 3
+      }
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.model_type(), "deepseek_v41");
+  EXPECT_EQ(args.head_dim(), 512);
+  EXPECT_EQ(args.window_size(), 128);
+  EXPECT_EQ(args.n_hash_layers(), 0);
+  EXPECT_EQ(args.image_token_id(), 129264);
+  EXPECT_EQ(args.scale_fmt(), "ue8m0");
+  EXPECT_EQ(args.stop_token_ids(), std::unordered_set<int32_t>({1}));
+  EXPECT_EQ(args.num_nextn_predict_layers(), 3);
+  EXPECT_EQ(args.dspark_num_layers(), 3);
+
+  // Ratios are preserved as configured (no V4-style normalization);
+  // 43 entries = 40 backbone + 3 DSpark tail.
+  EXPECT_EQ(args.compress_ratios(),
+            std::vector<int32_t>({0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                  2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0}));
+
+  EXPECT_EQ(args.kv_source_layer_ids(), std::vector<int32_t>({2, 8, 14, 20}));
+  EXPECT_EQ(args.index_source_layer_ids(),
+            std::vector<int32_t>({2, 8, 14, 20, 24, 28, 32, 36}));
+  EXPECT_EQ(args.candidate_source_layer_id(), 20);
+  EXPECT_EQ(args.candidate_topk_blocks(), 2048);
+  EXPECT_EQ(args.candidate_block_size(), 8);
+
+  EXPECT_EQ(args.engram_layer_ids(), std::vector<int32_t>({1, 14}));
+  EXPECT_EQ(args.engram_num_embeddings(),
+            std::vector<int64_t>({384006168, 384016682}));
+  EXPECT_EQ(args.engram_max_ngram_size(), 4);
+  EXPECT_EQ(args.engram_vocab_size(), 16000000);
+  EXPECT_EQ(args.engram_n_heads(), 8);
+  EXPECT_EQ(args.engram_head_dim(), 256);
+  EXPECT_EQ(args.engram_compressed_vocab_size(), 99092);
+  EXPECT_EQ(args.engram_pad_token_id(), 2);
+
+  EXPECT_EQ(args.markov_rank(), 256);
+  EXPECT_EQ(args.dspark_n_routed_experts(), 128);
+  EXPECT_EQ(args.dspark_num_experts_per_tok(), 3);
+}
 #endif
 
 TEST(HFModelLoaderTest, Qwen35MtpModelArgsFromDenseConfig) {

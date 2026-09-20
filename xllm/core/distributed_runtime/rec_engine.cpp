@@ -264,7 +264,8 @@ bool RecEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .block_size(block_size)
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
-      .max_seqs_per_batch(options_.max_seqs_per_batch());
+      .max_seqs_per_batch(options_.max_seqs_per_batch())
+      .model_type(args_.model_type());
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
   return pipeline_->allocate_kv_cache(kv_cache_shape);

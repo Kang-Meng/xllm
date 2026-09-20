@@ -82,7 +82,8 @@ class KVCacheShape final {
     GROUPED_POOL = 1,
   };
 
-  void init_dsv4_pool_shape(const KVCacheCapacity& kv_cache_cap);
+  void init_dsv4_pool_shape(const KVCacheCapacity& kv_cache_cap,
+                            const ModelArgs& model_args);
   void init_key_cache_shape(const KVCacheCapacity& kv_cache_cap,
                             const ModelArgs& model_args,
                             int64_t world_size);
@@ -110,6 +111,10 @@ class KVCacheShape final {
   int64_t replicated_block_pages_ = 1;
   std::optional<std::vector<int64_t>> kpool_tail_shape_;
   ShapeKind shape_kind_ = ShapeKind::NORMAL;
+  // True when the grouped pool slots carry the V4.1 meaning
+  // [swa_count, c2_count, c1_count] instead of V4's
+  // [swa_count, c4_count, c128_count].
+  bool dsv41_pool_ = false;
   std::optional<std::vector<int64_t>> key_cache_shape_;
   std::optional<std::vector<int64_t>> value_cache_shape_;
 

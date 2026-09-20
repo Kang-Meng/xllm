@@ -47,10 +47,12 @@ class KVCacheState {
   std::vector<Block>* mutable_blocks(BlockType type);
   // Number of blocks held under `type`.
   size_t num_blocks(BlockType type) const;
-  // True if the sequence holds any cache-bearing blocks (KV / SWA / C4 / C128).
-  // Excludes EMBEDDING, which is a per-sequence resource, not token cache. Used
-  // to decide whether an allocation that started from an empty sequence should
-  // be fully rolled back on failure (vs. a grow on an already-populated seq).
+  // True if the sequence holds any cache-bearing blocks. Flat attention models
+  // hold KV; grouped-cache models hold KV plus one grouped triple each -- V4's
+  // SWA / C4 / C128 or V4.1's SWA / C2 / C1. Excludes EMBEDDING, which is a
+  // per-sequence resource, not token cache. Used to decide whether an
+  // allocation that started from an empty sequence should be fully rolled back
+  // on failure (vs. a grow on an already-populated seq).
   bool has_any_blocks() const;
 
   // True after this cache tier has completed its prefix-cache probe.  This is
@@ -138,7 +140,7 @@ class KVCacheState {
   std::vector<std::pair<BlockType, const std::vector<Block>*>>
   multi_block_export_view() const;
   // True when this sequence holds any multi_block_tables-exported group
-  // (SWA / C4 / C128).
+  // (V4: SWA / C4 / C128; V4.1: SWA / C2 / C1).
   bool has_multi_block_export() const;
 
   // Per-sequence embedding-row block (BlockType::EMBEDDING): returns the
@@ -179,7 +181,8 @@ class KVCacheState {
   bool prefix_cache_matched_ = false;
 
   // KV cache blocks keyed by cache role. The flat attention KV lives under
-  // BlockType::KV; DSV4 keeps its SWA / C4 / C128 groups here; the per-sequence
+  // BlockType::KV; the grouped-cache models keep their triples here -- V4 under
+  // SWA / C4 / C128 and V4.1 under SWA / C2 / C1; the per-sequence
   // embedding-row slot lives under BlockType::EMBEDDING and the GDN recurrent
   // slot under BlockType::LINEAR. std::map
   // keeps deterministic iteration for reset / dealloc / debugging, but worker

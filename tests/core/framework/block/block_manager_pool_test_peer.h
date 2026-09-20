@@ -40,6 +40,14 @@ class BlockManagerPoolTestPeer final {
         composite->leaf_of(BlockType::LINEAR));
   }
 
+  // Leaf lookup on a bare composite (block tests assert per-leaf options on
+  // composites they build directly, without a pool). leaf_of stays private in
+  // production.
+  static BlockManager* leaf_of(const CompositeBlockManager& composite,
+                               BlockType type) {
+    return composite.leaf_of(type);
+  }
+
   // Assert by-hash checkpoint presence/lookup directly against the LINEAR
   // leaf's inherited prefix_cache_. Production has no by-hash probe on the leaf
   // (restore sources are mounted through allocate_shared); the peer is a friend

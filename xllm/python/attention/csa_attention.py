@@ -122,10 +122,16 @@ def _build_dspark_swa_indices(
     positions = start_positions.unsqueeze(1) + columns.unsqueeze(0)
     logical_block_columns = torch.div(positions, cache_block_size, rounding_mode="floor")
 
-    # DsaMetadataBuilder expands an SWA ring into logical block-table columns
-    # and right-aligns the retained physical blocks. Positions just before the
-    # retained range still wrap into those blocks, so taking modulo by the
-    # expanded table width would incorrectly select its -1 padding.
+    # DsaMetadataBuilder's default SWA read-side layout is right-aligned: only
+    # the last `min(semantic_cols, dst_lens)` block-table columns carry the
+    # retained ring blocks and the rest stay `-1`. This compensation shifts a
+    # reader's logical column back into that retained tail --
+    # `valid_block_counts` is the filled tail width, `first_retained_columns`
+    # the leading `-1` prefix, and `expanded_block_columns` folds the logical
+    # index into the tail -- so it is the active path for the shared (DSV4 /
+    # V4-dspark) layout. DeepSeek-V4.1 instead requests the "ring" layout, in
+    # which every column is valid; its readers address columns absolutely and
+    # need no compensation (this code then degenerates to identity).
     valid_block_counts = block_table.ge(0).sum(dim=1, dtype=torch.int64)
     safe_block_counts = valid_block_counts.clamp_min(1)
     logical_block_counts = torch.div(
@@ -370,6 +376,11 @@ class DsaAttentionBackend(AttentionBackend):
             enable_graph=enable_graph,
             graph_block_table_capacity_cols=graph_capacity_cols,
         )
+        # Capacity-bucket bound (token rows) baked into the captured graph's
+        # committed-row gathers. The decode-graph runner fixes it once per graph
+        # entry; it must stay constant across replays of that entry or the
+        # gathered row count would re-shape mid-graph.
+        compressed_metadata.graph_token_capacity = int(getattr(metadata, "dsa_graph_token_capacity", 0) or 0)
         self._populate_compressed_attention_rope(compressed_metadata, metadata)
         # Only build the per-ratio map when rotary caches were attached. The
         # C++ model returns early from build_dsa_rope_metadata when its rotary
@@ -531,6 +542,9 @@ class DsaAttentionBackend(AttentionBackend):
         persistent.max_seq_len = refreshed.max_seq_len
         persistent.sparse_metadata_ori_win_left = getattr(refreshed, "sparse_metadata_ori_win_left", -1)
         persistent.is_acl_graph = refreshed.is_acl_graph
+        # The capture-time capacity bound is re-derived from the same static
+        # entry metadata, so this is a no-op unless the entry changed buckets.
+        persistent.graph_token_capacity = int(getattr(refreshed, "graph_token_capacity", 0) or 0)
         persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
 
     @classmethod

@@ -40,7 +40,13 @@ from typing import Any, Callable, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_npu
+
+# CPU test environments (tests/python/conftest.py stubs the kernels package)
+# have no torch_npu; only the NPU kernel paths below need it.
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None  # type: ignore[assignment]
 
 from xllm.python.attention.csa_attention import (
     _get_layer_cache_tensor,
@@ -1490,6 +1496,9 @@ class DeepseekV4MoE(nn.Module):
         if self.w4a8_dynamic:
             # W4A8_DYNAMIC uses the same two grouped GEMMs as C++
             # forward_expert: W4 GMM1 -> SwiGLU -> dynamic int8 -> W4 GMM2.
+            # Deferred import: torch_npu only exists on NPU builds.
+            import torch_npu
+
             sorted_hidden, expanded_row_idx, group_list, per_token = torch_npu.npu_moe_init_routing_v2(
                 hidden,
                 topk_idx.to(torch.int32),

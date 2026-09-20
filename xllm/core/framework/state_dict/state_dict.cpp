@@ -51,6 +51,10 @@ torch::ScalarType get_dtype(const Dtype& dtype) {
       return torch::kFloat8_e5m2;
     case Dtype::F8_E4M3:
       return torch::kFloat8_e4m3fn;
+    case Dtype::F8_E8M0:
+      // UE8M0 exponent-only scales (e.g. DeepSeek V4.1 .scale tensors).
+      // Expose the raw bytes; the python dequant decodes 2^(b-127).
+      return torch::kUInt8;
     case Dtype::I16:
       return torch::kInt16;
     case Dtype::F16:
