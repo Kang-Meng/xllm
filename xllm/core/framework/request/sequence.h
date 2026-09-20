@@ -185,6 +185,14 @@ class Sequence final {
   // whether the new added token is the first token
   bool is_first_token() const { return is_first_token_; }
   std::optional<RemoteToken>& first_token() { return first_token_; }
+
+  // Record a completed PD handoff independently of the number of tokens
+  // migrated from Prefill. The flag is consumed when the first local Decode
+  // input is built.
+  void mark_pd_handoff_reset_pending() { pd_handoff_reset_pending_ = true; }
+  bool pd_handoff_reset_pending() const { return pd_handoff_reset_pending_; }
+  void consume_pd_handoff_reset() { pd_handoff_reset_pending_ = false; }
+
   // get the total number of tokens
   size_t num_tokens() const { return num_tokens_; }
   // get the number of prompt tokens
@@ -614,6 +622,11 @@ class Sequence final {
 
   // whether the added token is the first generated token
   bool is_first_token_ = false;
+
+  // Whether the next local Decode must reset KDA speculative state restored
+  // through a PD handoff. Unlike is_first_token_, this remains true when the
+  // handoff carries multiple generated tokens.
+  bool pd_handoff_reset_pending_ = false;
 
   // whether the prefill stage has been cached.
   bool is_cache_block_for_prefill_ = false;

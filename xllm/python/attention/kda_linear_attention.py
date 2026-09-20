@@ -62,6 +62,12 @@ class KdaLinearAttentionMixin:
             if "armed_buf" in st:
                 st["armed_buf"].index_fill_(0, idx64, False)
 
+    def reset_kda_spec_slots(self, idx: torch.Tensor) -> None:
+        """Invalidate process-local speculative state after a PD handoff."""
+        if idx is None or idx.numel() == 0:
+            return
+        self.disarm_kda_v3_slots(idx)
+
     def snapshot_kda_v3_state(self, idx: torch.Tensor):
         """Snapshot V3 combined-pool rows the graph warmup/capture mutates."""
         # Expanded verification repeats a sequence slot for each token row.

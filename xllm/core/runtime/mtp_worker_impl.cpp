@@ -1740,6 +1740,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         prepare_validate_inputs(
             metadata_template, validate_input, static_graph_tasks_prepared);
       }
+      // Only the target input consumes the first-decode marker.
+      input.input_params.pd_handoff_reset_mask.clear();
+      metadata_template.input_params.pd_handoff_reset_mask.clear();
     } else if (use_continuous_dsa_drafts) {
       next_step_input = std::move(later_draft_inputs[draft_idx + 1]);
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
@@ -3035,6 +3038,12 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   const int32_t logical_block_size =
       options_.block_size() * parallel_args_.kv_split_size_effective();
   const bool positions_decoupled = positions_are_decoupled_from_kv_length();
+  const std::vector<int32_t>& pd_handoff_reset_mask =
+      input.input_params.pd_handoff_reset_mask;
+  if (!pd_handoff_reset_mask.empty()) {
+    CHECK_EQ(pd_handoff_reset_mask.size(), static_cast<size_t>(num_sequences))
+        << "target PD handoff reset mask count mismatch";
+  }
 #if defined(USE_NPU)
   const bool use_explicit_spec_verify_replay_update =
       should_use_explicit_spec_verify_replay_update(input);
@@ -3656,6 +3665,9 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                 impl_->context_.get_model_args().model_type());
   const bool use_uniform_two_rows = should_use_uniform_two_draft_rows(
       last_states, force_two_rows, dp_enabled, requires_uniform_rows);
+  // Only the target input consumes the first-decode marker; the draft copies
+  // it via base_input above, so drop it here to keep the target-only invariant.
+  input_params.pd_handoff_reset_mask.clear();
 
   const int32_t logical_block_size =
       options_.block_size() * parallel_args_.kv_split_size_effective();
@@ -3931,6 +3943,7 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
   draft_input.device_tensors_ready = false;
 
   auto& input_params = draft_input.input_params;
+  input_params.pd_handoff_reset_mask.clear();
   input_params.embedding.input_embedding = torch::Tensor();
   const int32_t num_sequences = input_params.meta.num_sequences;
   if (draft_impl_->has_request_state_cache()) {

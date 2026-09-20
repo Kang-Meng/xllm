@@ -112,6 +112,8 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::kpool_query_lens)
       .def_property_readonly("has_initial_state",
                              &PyAttentionMetadataView::has_initial_state)
+      .def_property_readonly("pd_handoff_reset_mask",
+                             &PyAttentionMetadataView::pd_handoff_reset_mask)
       .def_property_readonly(
           "dp_execution_token_counts",
           &PyAttentionMetadataView::dp_execution_token_counts)
@@ -355,6 +357,10 @@ const std::vector<int32_t>& PyAttentionMetadataView::kpool_query_lens() const {
 }
 py::object PyAttentionMetadataView::has_initial_state() const {
   return optional_tensor(metadata_->has_initial_states);
+}
+
+py::object PyAttentionMetadataView::pd_handoff_reset_mask() const {
+  return optional_tensor(metadata_->pd_handoff_reset_mask);
 }
 
 const std::vector<int32_t>& PyAttentionMetadataView::dp_execution_token_counts()

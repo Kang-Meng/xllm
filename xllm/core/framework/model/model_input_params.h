@@ -1034,6 +1034,7 @@ struct ModelInputParams {
     embedding.linear_state_indices = torch::Tensor();
     linear_state_cache_ops.clear();
     linear_state_validity_mask.clear();
+    pd_handoff_reset_mask.clear();
   }
 
   ModelInputParams to(const torch::Device& device) const {
@@ -1051,6 +1052,7 @@ struct ModelInputParams {
     }
     params.linear_state_cache_ops = linear_state_cache_ops;
     params.linear_state_validity_mask = linear_state_validity_mask;
+    params.pd_handoff_reset_mask = pd_handoff_reset_mask;
     params.is_spec_verify = is_spec_verify;
     params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
     params.num_accepted_tokens_host = num_accepted_tokens_host;
@@ -1196,6 +1198,9 @@ struct ModelInputParams {
   // Worker-produced per-row result declaring whether the recurrent state is
   // valid for model-forward consumption after restore processing.
   LinearStateValidityMask linear_state_validity_mask;
+  // Per-logical-sequence first-decode marker after PD handoff. Speculative
+  // execution must not expand this marker to token rows.
+  std::vector<int32_t> pd_handoff_reset_mask;
 
   bool is_spec_verify = false;
   // Propagated to AttentionMetadata for caller-managed cacheless prefill.
@@ -1271,5 +1276,11 @@ struct ModelInputParams {
   // Flag for graph capture/replay mode.
   bool enable_graph = false;
 };
+
+// True if any sequence carries a pending PD-handoff reset marker.
+inline bool has_pd_handoff_reset(const std::vector<int32_t>& mask) {
+  return std::any_of(
+      mask.begin(), mask.end(), [](int32_t value) { return value != 0; });
+}
 
 }  // namespace xllm

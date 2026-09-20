@@ -1222,6 +1222,10 @@ bool DisaggPDScheduler::decode_recv_first_generation(
             << ", pull_ms=" << pull_timer.elapsed_seconds() * 1000.0;
   }
 
+  const ModelArgs& model_args = engine_->model_args();
+  if (uses_glm5_speculative_kda(model_args)) {
+    sequence->mark_pd_handoff_reset_pending();
+  }
   Timer enqueue_timer;
   if (!request_queue_.write(request)) {
     LOG(ERROR) << "Failed to enqueue decode request, request_id: " << req_id;

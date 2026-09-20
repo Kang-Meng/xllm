@@ -45,6 +45,7 @@ from xllm.python import kernels
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.qlinear import QLinearWeightLoader
+from xllm.python.model_executor.forward_context import record_layer_event
 from xllm.python.models.glm5_next import (
     Glm5NextConfig,
     Glm5NextForCausalLM,
@@ -221,6 +222,7 @@ class Glm5NextMtpModel(nn.Module):
         prev_topk = None
         for layer in self.layers:
             hidden_states, prev_topk = layer(hidden_states, position_ids, attention_mask, prev_topk)
+            record_layer_event(layer.layer_id)
         hidden_states = self.norm(hidden_states)
         return hidden_states.view(-1, self.cfg.hidden_size)
 

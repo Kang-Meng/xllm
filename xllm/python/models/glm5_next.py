@@ -76,6 +76,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     get_forward_context_or_none,
     in_acl_graph,
+    record_layer_event,
 )
 
 _has_mhc_fused = hasattr(kernels, "hc_pre") and kernels.hc_pre is not None
@@ -678,6 +679,8 @@ class Glm5NextKdaAttention(Attention):
     ``chunk_kda`` interfaces (or fla_npu fused ops when
     ``GLM5NEXT_KDA_BACKEND=fla_npu``); see their docstrings.
     """
+
+    is_glm_next_kda: bool = True
 
     def __init__(self, cfg: Glm5NextConfig, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__(
@@ -2422,10 +2425,11 @@ class Glm5NextModel(nn.Module):
         # position embeddings are computed or threaded (reference passes None).
         hidden = hidden.unsqueeze(2).expand(-1, -1, self.cfg.hc_mult, -1).contiguous()
         prev_topk: Optional[torch.Tensor] = None
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             hidden, prev_topk = layer(hidden, position_ids, attention_mask, prev_topk)
             # residual=None: the collapsed stream is itself the full residual.
-            self.aux_hidden_capture.capture_layer(i, hidden, None, aux_hidden_buffer)
+            self.aux_hidden_capture.capture_layer(layer.layer_id, hidden, None, aux_hidden_buffer)
+            record_layer_event(layer.layer_id)
         # Final collapse: unweighted mean over the streams, then RMSNorm
         # (reference `self.norm(self.hc_head(hidden_states))`, line 1537).
         # Flatten [B, S, D] -> [B*S, D]: the engine's compute_logits does

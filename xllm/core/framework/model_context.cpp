@@ -100,6 +100,7 @@ ModelContext ModelContext::with_parallel_args(
 #endif
   derived.model_id_ = model_id_;
   derived.optimization_config_ = optimization_config_;
+  derived.speculative_runtime_config_ = speculative_runtime_config_;
   derived.flash_comm1_options_ = flash_comm1_options_;
   derived.stream_registry_ = stream_registry_;
   return derived;
@@ -115,6 +116,7 @@ ModelContext ModelContext::with_quant_args(const QuantArgs& quant_args) const {
       parallel_args_, model_args_, quant_args, tensor_options_);
 #endif
   derived.model_id_ = model_id_;
+  derived.speculative_runtime_config_ = speculative_runtime_config_;
   derived.stream_registry_ = stream_registry_;
   derived.derive_optimization_config();
   return derived;

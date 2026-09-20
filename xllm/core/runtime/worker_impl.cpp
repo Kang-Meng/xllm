@@ -2161,7 +2161,8 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 #if defined(USE_NPU)
   if (options_.enable_speculative_decode() &&
       SpeculativeConfig::is_mtp_algorithm(speculative_algorithm) &&
-      util::is_deepseek_v4_model_type(args.model_type())) {
+      (util::is_deepseek_v4_model_type(args.model_type()) ||
+       is_glm5_next_target_model(args))) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
   }
   if (is_block_diffusion) {
@@ -2295,6 +2296,11 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   auto tensor_options = torch::dtype(dtype_).device(device_);
   context_ = ModelContext(parallel_args_, args, quant_args, tensor_options);
   context_.set_model_id(options_.model_id());
+  SpeculativeRuntimeConfig speculative_runtime_config;
+  speculative_runtime_config.is_draft_engine = options_.is_draft_engine();
+  speculative_runtime_config.adaptive_enabled =
+      options_.enable_adaptive_speculative_decode();
+  context_.set_speculative_runtime_config(speculative_runtime_config);
   FlashComm1Options flash_comm1_options;
   flash_comm1_options.enable_flashcomm1 = options_.enable_flashcomm1();
   flash_comm1_options.min_prefill_tokens =

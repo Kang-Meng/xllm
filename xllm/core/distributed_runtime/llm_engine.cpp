@@ -247,6 +247,12 @@ bool LLMEngine::init_model(MasterStatus master_status) {
 #endif
   quant_args_ = model_loader->quant_args();
 
+  if (options_.num_speculative_tokens() > 0 &&
+      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+      is_glm5_next_target_model(args_)) {
+    args_.num_speculative_tokens(options_.num_speculative_tokens());
+  }
+
   // A draft engine is fed token ids and detokenized by the target, so it
   // shares the target vocabulary and loads no tokenizer of its own.
   if (!options_.is_draft_engine()) {

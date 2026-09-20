@@ -330,6 +330,7 @@ Sequence::Sequence(const Sequence& other, size_t index)
       time_to_first_token_latency_seconds_(
           other.time_to_first_token_latency_seconds_),
       is_first_token_(other.is_first_token_),
+      pd_handoff_reset_pending_(other.pd_handoff_reset_pending_),
       is_cache_block_for_prefill_(other.is_cache_block_for_prefill_),
       sequence_params_(other.sequence_params_),
       decoder_(other.decoder_),
@@ -959,6 +960,7 @@ void Sequence::reset() {
   kv_state_.reset();
   host_kv_state_.reset();
   clear_host_cache_match();
+  pd_handoff_reset_pending_ = false;
   volatile_num_prompt_tokens_ = num_tokens_;
 }
 

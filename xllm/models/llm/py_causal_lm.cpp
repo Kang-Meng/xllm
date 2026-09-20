@@ -345,7 +345,8 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
 
   py::module_ registry = py::module_::import("xllm.python.registry");
   py::object model_cls = registry.attr("get_model_class")(py::str(module_name));
-  config_dict_ = build_config_dict(parallel_args);
+  config_dict_ = build_config_dict(parallel_args,
+                                   context.get_speculative_runtime_config());
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();
 }
@@ -368,7 +369,8 @@ const py::object& PyCausalLM::get_or_build_python_kv_caches(
 }
 
 py::dict PyCausalLM::build_config_dict(
-    const ParallelArgs& parallel_args) const {
+    const ParallelArgs& parallel_args,
+    const SpeculativeRuntimeConfig& speculative_runtime_config) const {
   py::dict d;
   PyDictVisitor visitor(d);
   visit_properties(model_args_, visitor);
@@ -394,6 +396,9 @@ py::dict PyCausalLM::build_config_dict(
   d["ep_rank"] = ep_rank_;
   d["requires_framework_kpool_tail"] =
       uses_npu_compressed_kpool_tail(model_args_);
+  d["runtime_adaptive_speculative_decode_enabled"] =
+      speculative_runtime_config.adaptive_enabled;
+  d["is_draft_engine"] = speculative_runtime_config.is_draft_engine;
   // cp_size is a reflected ParallelArgs PROPERTY (already in d), but cp_rank is
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;

@@ -52,6 +52,13 @@ struct OptimizationConfig {
   // PROPERTY(bool, enable_fused_mlp_kernel) = false;
 };
 
+// Runtime speculative-decoding state that Python model execution cannot infer
+// from the checkpoint's ModelArgs alone.
+struct SpeculativeRuntimeConfig {
+  bool is_draft_engine = false;
+  bool adaptive_enabled = false;
+};
+
 class ModelContext {
  public:
   ModelContext() : parallel_args_(1, 1, nullptr) {};
@@ -83,6 +90,10 @@ class ModelContext {
     return optimization_config_;
   }
 
+  const SpeculativeRuntimeConfig& get_speculative_runtime_config() const {
+    return speculative_runtime_config_;
+  }
+
   const FlashComm1Options& get_flash_comm1_options() const {
     return flash_comm1_options_;
   }
@@ -93,6 +104,10 @@ class ModelContext {
 
   void set_flash_comm1_options(const FlashComm1Options& options) {
     flash_comm1_options_ = options;
+  }
+
+  void set_speculative_runtime_config(const SpeculativeRuntimeConfig& config) {
+    speculative_runtime_config_ = config;
   }
 
   ModelContext with_parallel_args(const ParallelArgs& parallel_args) const;
@@ -130,6 +145,7 @@ class ModelContext {
   ParallelArgs parallel_args_;
   torch::TensorOptions tensor_options_;
   OptimizationConfig optimization_config_;
+  SpeculativeRuntimeConfig speculative_runtime_config_;
   FlashComm1Options flash_comm1_options_;
   std::shared_ptr<ModelStreamRegistry> stream_registry_;
 

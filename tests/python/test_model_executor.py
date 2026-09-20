@@ -343,12 +343,14 @@ class TestCreateAttentionBackend:
                 torch.float16,
                 {"cp_size": 1, "enable_mla": True},
                 max_num_reqs=3,
+                num_decoding_tokens=4,
             )
 
         assert isinstance(backend, StubAttentionBackend)
         assert backend.init_kwargs["dcp_group"] is dcp_group
         assert backend.init_kwargs["index_topk"] == 512
         assert backend.init_kwargs["max_num_reqs"] == 3
+        assert backend.init_kwargs["num_decoding_tokens"] == 4
 
     @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
@@ -374,7 +376,10 @@ class TestCreateAttentionBackend:
 
 class TestModelExecutorConstruction:
     @pytest.mark.parametrize("graph_backend", ["off", "aclgraph"])
-    @pytest.mark.parametrize("explicit_width,config_depth,expected_width", [(1, 0, 1), (1, 3, 4), (4, 1, 4)])
+    @pytest.mark.parametrize(
+        "explicit_width,config_depth,expected_width",
+        [(1, 0, 1), (1, 3, 4), (4, 1, 4)],
+    )
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_decoding_width_reaches_backend_and_graph_runner(
@@ -489,6 +494,34 @@ class TestModelExecutorConstruction:
         assert first_attention.num_heads == 8
         assert first_attention.num_kv_heads == 1
         assert first_attention.head_dim == 512
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+        return_value=StubAttentionBackend(),
+    )
+    def test_glm_next_kda_rejects_adaptive_speculative_decode(self, _mock_backend: MagicMock) -> None:
+        class _KdaAttention(Attention):
+            is_glm_next_kda = True
+
+        model = _FakeModel(num_layers=0)
+        model.kda = _KdaAttention(
+            num_heads=16,
+            num_kv_heads=16,
+            head_dim=64,
+            scale=0.125,
+            sliding_window=0,
+            layer_id=0,
+        )
+
+        with pytest.raises(ValueError, match="GLM5 KDA does not support adaptive speculative decode"):
+            ModelExecutor(
+                model,
+                {
+                    "python_graph_backend": "off",
+                    "runtime_adaptive_speculative_decode_enabled": True,
+                },
+                max_seqs_per_batch=4,
+            )
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
@@ -1768,6 +1801,23 @@ def test_eager_runner_rejects_missing_cp_lengths(
         runner.execute(torch.zeros(1), torch.zeros(1), metadata)
 
     assert not runner.attention_backend._prepared
+
+
+class TestResetKdaSpecStateOnPdHandoff:
+    def test_resets_only_marked_linear_state_slots(self) -> None:
+        executor = object.__new__(ModelExecutor)
+        reset_calls: list[list[int]] = []
+        executor.attention_backend = SimpleNamespace(
+            reset_kda_spec_slots=lambda indices: reset_calls.append(indices.reshape(-1).tolist())
+        )
+        metadata = SimpleNamespace(
+            pd_handoff_reset_mask=torch.tensor([1, 0], dtype=torch.bool),
+            linear_state_indices=torch.tensor([7, 9], dtype=torch.int32),
+        )
+
+        executor._reset_kda_spec_state_on_pd_handoff(metadata)
+
+        assert reset_calls == [[7]]
 
 
 class TestExecuteRouting:

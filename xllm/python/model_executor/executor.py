@@ -95,6 +95,7 @@ def _create_attention_backend(
                 dcp_group=dcp_group,
                 index_topk=index_topk,
                 max_num_reqs=max(max_num_reqs, 1),
+                num_decoding_tokens=max(num_decoding_tokens, 1),
             )
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
@@ -153,6 +154,13 @@ class ModelExecutor:
         # import glm5_next (that import pulls KDA kernel transitive deps and
         # fails on builds without them).
         dsa_layers = [layer for layer in attention_layers if getattr(layer, "is_glm_next_mla", False)]
+        has_kda_layers = any(getattr(layer, "is_glm_next_kda", False) for layer in attention_layers)
+        is_draft_engine = bool(config.get("is_draft_engine", False))
+        adaptive_speculative_decode_enabled = bool(config.get("runtime_adaptive_speculative_decode_enabled", False))
+        if has_kda_layers and not is_draft_engine and adaptive_speculative_decode_enabled:
+            raise ValueError(
+                "GLM5 KDA does not support adaptive speculative decode; disable adaptive speculative decoding."
+            )
         if dsa_layers:
             first_attention = dsa_layers[0]
         else:
@@ -165,7 +173,10 @@ class ModelExecutor:
         first_parameter = next(model.parameters())
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
-        num_decoding_tokens = max(int(num_decoding_tokens), int(config.get("num_speculative_tokens", 0)) + 1)
+        num_decoding_tokens = max(
+            int(num_decoding_tokens),
+            int(config.get("num_speculative_tokens", 0)) + 1,
+        )
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
@@ -305,6 +316,28 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         self._kv_bound = True
 
+    def _reset_kda_spec_state_on_pd_handoff(self, metadata: AttentionMetadata) -> None:
+        """Reset process-local KDA speculative state on first PD decode."""
+        reset_mask = getattr(metadata, "pd_handoff_reset_mask", None)
+        if not isinstance(reset_mask, torch.Tensor) or reset_mask.numel() == 0:
+            return
+
+        slots = getattr(metadata, "linear_state_indices", None)
+        if not isinstance(slots, torch.Tensor) or slots.numel() == 0:
+            raise RuntimeError("PD handoff reset requires linear-state indices")
+        if reset_mask.numel() != slots.numel():
+            raise RuntimeError(
+                "PD handoff reset mask is not aligned with linear-state "
+                f"slots: mask={reset_mask.numel()}, slots={slots.numel()}"
+            )
+
+        reset_fn = getattr(self.attention_backend, "reset_kda_spec_slots", None)
+        if reset_fn is None:
+            raise RuntimeError("PD handoff reset requires KDA speculative-state support")
+        reset_slots = slots.reshape(-1)[reset_mask.reshape(-1).to(device=slots.device, dtype=torch.bool)]
+        if reset_slots.numel() > 0:
+            reset_fn(reset_slots)
+
     @torch.inference_mode()
     def execute(
         self,
@@ -321,6 +354,8 @@ class ModelExecutor:
             raise RuntimeError("KV caches are not bound")
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
+
+        self._reset_kda_spec_state_on_pd_handoff(metadata)
 
         eplb = None
         if expert_load_data is not None:
