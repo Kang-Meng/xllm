@@ -775,6 +775,18 @@ struct BatchInputMeta {
   bool is_graph_warmup = false;
 };
 
+// Stable, model-execution view of the logical batch. Unlike
+// BatchInputMeta::num_sequences, these fields are never repurposed to describe
+// expanded attention rows or graph buckets.
+struct ExecutionBatchMetadata {
+  int32_t num_reqs = 0;
+  int64_t num_tokens = 0;
+  std::vector<int32_t> num_scheduled_tokens;
+  std::vector<int32_t> num_computed_tokens;
+  std::vector<int32_t> query_start_loc{0};
+  std::vector<uint8_t> is_prefilling;
+};
+
 struct ModelEmbeddingInput {
   // input embedding
   mutable torch::Tensor input_embedding;
@@ -1026,6 +1038,7 @@ struct ModelInputParams {
   ModelInputParams to(const torch::Device& device) const {
     ModelInputParams params;
     params.meta = meta;
+    params.execution_batch = execution_batch;
     params.attention = attention.to(device);
     params.embedding = embedding.to(device);
     params.block_copy = block_copy.to(device);
@@ -1173,6 +1186,7 @@ struct ModelInputParams {
   }
 
   BatchInputMeta meta;
+  ExecutionBatchMetadata execution_batch;
   AttentionInput attention;
   ModelEmbeddingInput embedding;
   ParallelInput parallel;

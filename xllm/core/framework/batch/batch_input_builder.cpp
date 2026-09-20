@@ -122,6 +122,19 @@ std::vector<int32_t> build_q_cu_seq_lens_vec(
   return q_cu_seq_lens;
 }
 
+std::vector<int32_t> build_query_start_loc(
+    const std::vector<int32_t>& num_scheduled_tokens) {
+  std::vector<int32_t> query_start_loc;
+  query_start_loc.reserve(num_scheduled_tokens.size() + 1);
+  query_start_loc.emplace_back(0);
+  for (int32_t num_tokens : num_scheduled_tokens) {
+    CHECK_GT(num_tokens, 0)
+        << "each scheduled request must execute at least one token";
+    query_start_loc.emplace_back(query_start_loc.back() + num_tokens);
+  }
+  return query_start_loc;
+}
+
 struct BlockCopyKernelInputData {
   std::vector<int32_t> src_indices;
   std::vector<int32_t> dst_indices;
@@ -224,6 +237,9 @@ BatchInputBuilder::BatchInputBuilder(
   state_.mrope_positions_vec.reserve(sequences.size());
   state_.block_tables_vec.reserve(sequences.size());
   state_.acc_logprob_vec.reserve(sequences.size());
+  state_.num_scheduled_tokens.reserve(sequences.size());
+  state_.num_computed_tokens.reserve(sequences.size());
+  state_.is_prefilling.reserve(sequences.size());
   state_.mtp_shifted_token_ids.reserve(reserve_size);
   const EPLBConfig& eplb_config = EPLBConfig::get_instance();
   build_eplb_decode_token_mask_ = eplb_config.enable_eplb();
@@ -462,6 +478,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     // reallocate (which serializes on the allocator and erodes the speedup).
     thread_state.block_tables_vec.reserve(sequences_per_thread);
     thread_state.new_token_slot_ids.reserve(sequences_per_thread);
+    thread_state.num_scheduled_tokens.reserve(sequences_per_thread);
+    thread_state.num_computed_tokens.reserve(sequences_per_thread);
+    thread_state.is_prefilling.reserve(sequences_per_thread);
     thread_state.kv_cache_tokens_nums.reserve(sequences_per_thread);
 #if defined(USE_NPU) || defined(USE_MUSA)
     thread_state.seq_lens.reserve(sequences_per_thread);
@@ -536,6 +555,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   }
   state_.block_tables_vec.reserve(total_seqs);
   state_.new_token_slot_ids.reserve(total_slots);
+  state_.num_scheduled_tokens.reserve(total_seqs);
+  state_.num_computed_tokens.reserve(total_seqs);
+  state_.is_prefilling.reserve(total_seqs);
   state_.kv_cache_tokens_nums.reserve(total_seqs);
 #if defined(USE_NPU) || defined(USE_MUSA)
   state_.seq_lens.reserve(total_seqs);
@@ -610,6 +632,15 @@ void BatchInputBuilder::process_sequences_multithreaded() {
                                         state.unique_token_lens_vec.end());
     state_.max_seq_len = std::max(state_.max_seq_len, state.max_seq_len);
     state_.q_max_seq_len = std::max(state_.q_max_seq_len, state.q_max_seq_len);
+    state_.num_scheduled_tokens.insert(state_.num_scheduled_tokens.end(),
+                                       state.num_scheduled_tokens.begin(),
+                                       state.num_scheduled_tokens.end());
+    state_.num_computed_tokens.insert(state_.num_computed_tokens.end(),
+                                      state.num_computed_tokens.begin(),
+                                      state.num_computed_tokens.end());
+    state_.is_prefilling.insert(state_.is_prefilling.end(),
+                                state.is_prefilling.begin(),
+                                state.is_prefilling.end());
 #if defined(USE_NPU)
     state_.seq_lens.insert(
         state_.seq_lens.end(), state.seq_lens.begin(), state.seq_lens.end());
@@ -746,6 +777,11 @@ void BatchInputBuilder::process_single_sequence(
   // Update state
   state.max_seq_len = std::max(state.max_seq_len, seq_len);
   state.q_max_seq_len = std::max(state.q_max_seq_len, padded_q_seq_len);
+  state.num_scheduled_tokens.emplace_back(static_cast<int32_t>(q_seq_len));
+  state.num_computed_tokens.emplace_back(
+      static_cast<int32_t>(n_kv_cache_tokens));
+  state.is_prefilling.emplace_back(
+      static_cast<uint8_t>(sequence->is_prefill_stage()));
   state.kv_cache_tokens_nums.emplace_back(n_kv_cache_tokens);
 #if defined(USE_NPU)
   state.seq_lens.push_back(seq_len);
@@ -1160,6 +1196,23 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   input_params.meta.kv_max_seq_len = state_.max_seq_len;
   input_params.meta.q_max_seq_len = state_.q_max_seq_len;
   input_params.meta.is_graph_warmup = is_graph_warmup_;
+  const int32_t num_reqs = static_cast<int32_t>(num_sequences_);
+  input_params.execution_batch.num_reqs = num_reqs;
+  input_params.execution_batch.num_scheduled_tokens =
+      std::move(state_.num_scheduled_tokens);
+  CHECK_EQ(input_params.execution_batch.num_scheduled_tokens.size(),
+           static_cast<size_t>(num_reqs));
+  input_params.execution_batch.query_start_loc =
+      build_query_start_loc(input_params.execution_batch.num_scheduled_tokens);
+  input_params.execution_batch.num_tokens =
+      input_params.execution_batch.query_start_loc.back();
+  input_params.execution_batch.num_computed_tokens =
+      std::move(state_.num_computed_tokens);
+  CHECK_EQ(input_params.execution_batch.num_computed_tokens.size(),
+           static_cast<size_t>(num_reqs));
+  input_params.execution_batch.is_prefilling = std::move(state_.is_prefilling);
+  CHECK_EQ(input_params.execution_batch.is_prefilling.size(),
+           static_cast<size_t>(num_reqs));
   input_params.attention.device.kv_seq_lens =
       torch::tensor(state_.seq_lens, torch::kInt);
   input_params.attention.device.kv_cache_tokens_nums =

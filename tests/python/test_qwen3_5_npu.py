@@ -37,20 +37,16 @@ from tests.python.qwen3_5_test_utils import (
     make_config as _config,
 )
 from tests.python.qwen3_5_test_utils import (
-    make_gdn_forward_context as _gdn_forward_context,
-)
-from tests.python.qwen3_5_test_utils import (
     make_linear_config as _linear_config,
 )
 from xllm.python import distributed, kernels
-from xllm.python.attention.backend import LayerCache
 from xllm.python.kernels_npu.causal_conv1d import (
     causal_conv1d_decode as npu_causal_conv1d_decode,
 )
 from xllm.python.layers.npu.layernorm import NpuGemmaRMSNorm
-from xllm.python.layers.npu.mega_moe_context import MegaMoeContext
-from xllm.python.layers.npu.mega_moe_context_provider import (
-    create_token_owner_mega_moe_context_provider,
+from xllm.python.layers.npu.mega_moe_metadata import MegaMoeMetadata
+from xllm.python.layers.npu.mega_moe_metadata_builder import (
+    TokenOwnerMegaMoeMetadataBuilder,
 )
 from xllm.python.layers.npu.qwen3_5.attention import NpuQwen3_5Attention
 from xllm.python.layers.npu.qwen3_5.decoder_layer import (
@@ -58,9 +54,12 @@ from xllm.python.layers.npu.qwen3_5.decoder_layer import (
 )
 from xllm.python.layers.npu.qwen3_5.gated_delta_net import (
     NpuQwen3_5GatedDeltaNet,
-    _build_mega_prefill_indices,
-    _compute_mega_prefill_num_matrices,
-    _get_or_build_mega_prefill_plan,
+)
+from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
+    GdnDecodeMetadata,
+    GdnMetadata,
+    GdnPrefillMetadata,
+    GdnStateCache,
 )
 from xllm.python.layers.npu.qwen3_5.moe import (
     NpuQwen3_5SparseMoEBlock,
@@ -73,6 +72,7 @@ from xllm.python.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
+from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
 
 kernels.gemma_rms_norm = _gemma_rms_norm
@@ -90,27 +90,102 @@ distributed.moe_ep_all_reduce = MagicMock()
 distributed.broadcast_ = MagicMock()
 
 
-def _mega_moe_execution(
+def _mega_moe_graph_metadata(
     block: NpuQwen3_5SparseMoEBlock,
+    token_capacity: int,
+    local_token_count: int,
+) -> MegaMoeMetadata:
+    builder = TokenOwnerMegaMoeMetadataBuilder(
+        is_token_owner=block.experts.tp_rank == 0,
+        dp_size=block.experts.dp_size,
+        dp_rank=block.experts.dp_rank,
+        hidden_size=block.experts.w13.shape[1],
+        top_k=block.experts.top_k,
+        token_limit=block.experts._mega_moe_num_max_tokens_per_rank,
+    )
+    metadata = SimpleNamespace(
+        num_reqs=local_token_count,
+        num_tokens=local_token_count,
+        num_scheduled_tokens=[1] * local_token_count,
+        num_computed_tokens=[0] * local_token_count,
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=None,
+        query_start_loc=list(range(local_token_count + 1)),
+        is_prefilling=[0] * local_token_count,
+    )
+    batch = InputBatch.from_runtime(
+        torch.zeros(local_token_count, dtype=torch.int32),
+        torch.zeros(local_token_count, dtype=torch.int32),
+        metadata,
+        is_dummy=False,
+    ).bind_graph_inputs(
+        torch.zeros(token_capacity, dtype=torch.int32),
+        torch.zeros(token_capacity, dtype=torch.int32),
+        torch.arange(token_capacity) >= local_token_count,
+    )
+    execution_token_counts = [token_capacity] * block.experts.dp_size
+    execution_token_counts[block.experts.dp_rank] = local_token_count
+    runtime_metadata = SimpleNamespace(dp_execution_token_counts=tuple(execution_token_counts))
+    persistent_metadata = builder.allocate_persistent(batch, runtime_metadata)
+    builder.update_persistent(
+        persistent_metadata,
+        batch,
+        runtime_metadata,
+    )
+    return persistent_metadata
+
+
+def _mega_moe_eager_metadata(
+    block: NpuQwen3_5SparseMoEBlock,
+    local_token_count: int,
     execution_token_counts: tuple[int, ...],
-    active_token_mask: torch.Tensor | None = None,
-) -> MegaMoeContext:
-    provider = create_token_owner_mega_moe_context_provider(block)
-    assert provider is not None
-    local_token_count = execution_token_counts[block.experts.dp_rank]
-    layout = provider.build_eager(
-        torch.zeros(local_token_count, dtype=torch.int64),
+) -> MegaMoeMetadata:
+    builder = TokenOwnerMegaMoeMetadataBuilder(
+        is_token_owner=block.experts.tp_rank == 0,
+        dp_size=block.experts.dp_size,
+        dp_rank=block.experts.dp_rank,
+        hidden_size=block.experts.w13.shape[1],
+        top_k=block.experts.top_k,
+        token_limit=block.experts._mega_moe_num_max_tokens_per_rank,
+    )
+    metadata = SimpleNamespace(
+        num_reqs=local_token_count,
+        num_tokens=local_token_count,
+        num_scheduled_tokens=[1] * local_token_count,
+        num_computed_tokens=[0] * local_token_count,
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=None,
+        query_start_loc=list(range(local_token_count + 1)),
+        is_prefilling=[0] * local_token_count,
+    )
+    input_batch = InputBatch.from_runtime(
+        torch.zeros(local_token_count, dtype=torch.int32),
+        torch.zeros(local_token_count, dtype=torch.int32),
+        metadata,
+        is_dummy=False,
+    )
+    return builder.build(
+        input_batch,
         SimpleNamespace(dp_execution_token_counts=execution_token_counts),
     )
-    if active_token_mask is not None:
-        token_capacity = layout.token_capacity
-        rank_mask = active_token_mask.narrow(
-            0,
-            block.experts.dp_rank * token_capacity,
-            token_capacity,
-        )
-        layout.active_token_mask.copy_(rank_mask)
-    return layout
+
+
+def test_token_owner_metadata_builder_is_created_only_when_enabled() -> None:
+    disabled = TokenOwnerMegaMoeMetadataBuilder.from_config(
+        {"enable_mega_moe": False},
+    )
+    enabled = TokenOwnerMegaMoeMetadataBuilder.from_config(
+        {
+            "enable_mega_moe": True,
+            "tp_rank": 0,
+            "hidden_size": 64,
+            "num_experts_per_tok": 2,
+            "mega_moe_num_max_tokens_per_rank": 4096,
+        },
+    )
+
+    assert disabled is None
+    assert isinstance(enabled, TokenOwnerMegaMoeMetadataBuilder)
 
 
 def test_npu_decoder_factory_selects_privateuseone_backend() -> None:
@@ -528,37 +603,31 @@ def test_npu_decode_uses_mega_fusion_boundary(monkeypatch) -> None:
     monkeypatch.setattr(layer.in_proj_ba, "forward", ba_forward)
     layer.out_proj = torch.nn.Identity()
     state_indices = torch.arange(1, batch_size + 1, dtype=torch.int32)
-    metadata = SimpleNamespace(
-        linear_state_indices=state_indices,
-        has_initial_state=None,
-        q_cu_seq_lens=None,
-        q_seq_lens_host=None,
-        is_prefill=False,
-        is_chunked_prefill=False,
+    conv_state = torch.zeros(
+        batch_size + 1,
+        3,
+        384,
+        dtype=torch.bfloat16,
+    )
+    ssm_state = torch.zeros(
+        batch_size + 1,
+        1,
+        128,
+        128,
+        dtype=torch.float32,
     )
     context = ForwardContext(
         attention_backend=None,
         device=torch.device("cpu"),
-        metadata=metadata,
-        layer_caches=[
-            LayerCache(
-                key=None,
-                value=None,
-                conv=torch.zeros(
-                    batch_size + 1,
-                    3,
-                    384,
-                    dtype=torch.bfloat16,
-                ),
-                ssm=torch.zeros(
-                    batch_size + 1,
-                    1,
-                    128,
-                    128,
-                    dtype=torch.float32,
-                ),
+        metadata=None,
+        layer_caches=[],
+        execution_contexts={
+            GdnMetadata: GdnDecodeMetadata(
+                state_caches={0: GdnStateCache(conv_state, ssm_state)},
+                read_state_indices=state_indices,
+                write_state_indices=state_indices,
             )
-        ],
+        },
     )
 
     with forward_context(context):
@@ -691,28 +760,24 @@ def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch) -> None:
         layer.in_proj_qkvz.weight.zero_()
         layer.in_proj_ba.weight.zero_()
     layer.out_proj = torch.nn.Identity()
-    metadata = SimpleNamespace(
-        linear_state_indices=torch.tensor([2], dtype=torch.int32),
-        linear_state_read_indices=torch.tensor([1], dtype=torch.int32),
-        linear_state_write_indices=torch.tensor([2], dtype=torch.int32),
-        has_initial_state=torch.tensor([True], dtype=torch.bool),
-        q_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
-        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-        is_prefill=True,
-        is_chunked_prefill=False,
-    )
+    conv_state = torch.zeros(3, 3, 384, dtype=torch.bfloat16)
+    ssm_state = torch.zeros(3, 1, 128, 128, dtype=torch.float32)
     context = ForwardContext(
         attention_backend=None,
         device=torch.device("cpu"),
-        metadata=metadata,
-        layer_caches=[
-            LayerCache(
-                key=None,
-                value=None,
-                conv=torch.zeros(3, 3, 384, dtype=torch.bfloat16),
-                ssm=torch.zeros(3, 1, 128, 128, dtype=torch.float32),
+        metadata=None,
+        layer_caches=[],
+        execution_contexts={
+            GdnMetadata: GdnPrefillMetadata(
+                state_caches={0: GdnStateCache(conv_state, ssm_state)},
+                conv_read_indices=torch.tensor([1], dtype=torch.int32),
+                conv_write_indices=torch.tensor([2], dtype=torch.int32),
+                ssm_read_indices=torch.tensor([1], dtype=torch.int32),
+                ssm_write_indices=torch.tensor([2], dtype=torch.int32),
+                cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+                num_matrices=1,
             )
-        ],
+        },
     )
     with forward_context(context):
         output = layer(torch.zeros(1, 8, dtype=torch.bfloat16))
@@ -728,71 +793,6 @@ def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch) -> None:
     torch.testing.assert_close(args[10], torch.tensor([1], dtype=torch.int32))
     torch.testing.assert_close(args[11], torch.tensor([2], dtype=torch.int32))
     assert args[15] == 1
-
-
-def test_npu_mega_prefill_builds_checkpoint_indices() -> None:
-    conv_read, conv_write, ssm_read, ssm_write = _build_mega_prefill_indices(
-        torch.tensor([1, 3], dtype=torch.int32),
-        torch.tensor([2, 4], dtype=torch.int32),
-        torch.tensor([False, True]),
-        checkpoint_stride=2,
-    )
-
-    torch.testing.assert_close(conv_read, torch.tensor([-1, 3], dtype=torch.int32))
-    torch.testing.assert_close(conv_write, torch.tensor([2, 4], dtype=torch.int32))
-    torch.testing.assert_close(ssm_read, torch.tensor([-1, 6], dtype=torch.int32))
-    torch.testing.assert_close(ssm_write, torch.tensor([4, 8], dtype=torch.int32))
-
-
-def test_npu_mega_prefill_plan_is_shared_within_one_forward() -> None:
-    context = ForwardContext(
-        attention_backend=None,
-        device=torch.device("cpu"),
-        metadata=SimpleNamespace(),
-        layer_caches=[],
-    )
-    read_state_indices = torch.tensor([1, 3], dtype=torch.int32)
-    write_state_indices = torch.tensor([2, 4], dtype=torch.int32)
-    has_initial_state = torch.tensor([False, True])
-    query_lengths_host = torch.tensor([127, 129], dtype=torch.int32)
-
-    with forward_context(context):
-        first = _get_or_build_mega_prefill_plan(
-            read_state_indices,
-            write_state_indices,
-            has_initial_state,
-            query_lengths_host,
-            checkpoint_stride=2,
-            num_value_heads=3,
-        )
-        second = _get_or_build_mega_prefill_plan(
-            read_state_indices,
-            write_state_indices,
-            has_initial_state,
-            query_lengths_host,
-            checkpoint_stride=2,
-            num_value_heads=3,
-        )
-
-    assert first is second
-    assert first.num_sequences == 2
-    assert first.num_tokens == 256
-    assert first.num_matrices == 9
-
-
-@pytest.mark.parametrize(
-    ("query_lengths", "num_value_heads", "expected"),
-    (
-        ([1], 2, 2),
-        ([127, 128, 129], 3, 12),
-    ),
-)
-def test_npu_mega_prefill_num_matrices(
-    query_lengths: list[int],
-    num_value_heads: int,
-    expected: int,
-) -> None:
-    assert _compute_mega_prefill_num_matrices(query_lengths, num_value_heads) == expected
 
 
 def test_npu_decode_passes_native_weight_and_cache_to_tilelang(
@@ -1117,7 +1117,13 @@ def test_npu_moe_token_owner_uses_shared_eager_bucket(
         device=torch.device("cpu"),
         metadata=SimpleNamespace(dp_execution_token_counts=(2, 3)),
         layer_caches=[],
-        execution_contexts={MegaMoeContext: _mega_moe_execution(block, (2, 3))},
+        execution_contexts={
+            MegaMoeMetadata: _mega_moe_eager_metadata(
+                block,
+                local_token_count=2,
+                execution_token_counts=(2, 3),
+            ),
+        },
     )
 
     with forward_context(context):
@@ -1132,6 +1138,16 @@ def test_npu_moe_token_owner_uses_shared_eager_bucket(
     assert owner_input.shape == (3, cfg.hidden_size)
     torch.testing.assert_close(owner_input[:2], hidden)
     torch.testing.assert_close(owner_input[2], torch.zeros_like(hidden[0]))
+    assert mega_moe_args[2].shape == (3, cfg.num_experts_per_tok)
+    assert mega_moe_args[3].shape == (3, cfg.num_experts_per_tok)
+    torch.testing.assert_close(
+        mega_moe_args[2][2],
+        torch.zeros(cfg.num_experts_per_tok, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        mega_moe_args[3][2],
+        torch.zeros(cfg.num_experts_per_tok, dtype=torch.float32),
+    )
     torch.testing.assert_close(
         mega_moe_args[12],
         torch.tensor([1, 1, 0], dtype=torch.int8),
@@ -1177,35 +1193,84 @@ def test_npu_moe_token_non_owner_uses_shared_eager_bucket(
         output.copy_(expected)
 
     monkeypatch.setattr(distributed, "broadcast_", _broadcast, raising=False)
+    mega_moe_metadata = _mega_moe_eager_metadata(
+        block,
+        local_token_count=2,
+        execution_token_counts=(2, 3),
+    )
     context = ForwardContext(
         attention_backend=None,
         device=torch.device("cpu"),
         metadata=SimpleNamespace(dp_execution_token_counts=(2, 3)),
         layer_caches=[],
-        execution_contexts={MegaMoeContext: _mega_moe_execution(block, (2, 3))},
+        execution_contexts={
+            MegaMoeMetadata: mega_moe_metadata,
+        },
     )
 
     with forward_context(context):
         output = block.experts(hidden)
 
+    mega_moe_args = mega_moe.call_args.args
     torch.testing.assert_close(output, expected)
+    assert mega_moe_args[1] is mega_moe_metadata.dummy_input
+    assert mega_moe_args[2] is mega_moe_metadata.dummy_topk_ids
+    assert mega_moe_args[3] is mega_moe_metadata.dummy_topk_weights
     torch.testing.assert_close(
-        mega_moe.call_args.args[1],
+        mega_moe_args[1],
         torch.zeros(3, cfg.hidden_size, dtype=torch.bfloat16),
     )
     torch.testing.assert_close(
-        mega_moe.call_args.args[2],
+        mega_moe_args[2],
         torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int32),
     )
     torch.testing.assert_close(
-        mega_moe.call_args.args[3],
+        mega_moe_args[3],
         torch.full((3, cfg.num_experts_per_tok), 0.5, dtype=torch.float32),
     )
     torch.testing.assert_close(
-        mega_moe.call_args.args[12],
+        mega_moe_args[12],
         torch.tensor([1, 0, 0], dtype=torch.int8),
     )
     gate_forward.assert_not_called()
+
+
+def test_npu_moe_requires_execution_metadata() -> None:
+    cfg = _config(
+        tp_size=2,
+        tp_rank=0,
+        dp_size=2,
+        dp_rank=0,
+        world_size=4,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        ep_size=4,
+        ep_rank=0,
+        enable_mega_moe=True,
+        mega_moe_context=torch.zeros(1, dtype=torch.int32),
+        mega_moe_ccl_buffer_size=1024,
+        mega_moe_num_max_tokens_per_rank=4096,
+    )
+    block = NpuQwen3_5SparseMoEBlock(
+        cfg,
+        torch.bfloat16,
+        torch.device("cpu"),
+    )
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=SimpleNamespace(dp_execution_token_counts=(2, 3)),
+        layer_caches=[],
+    )
+
+    with (
+        forward_context(context),
+        pytest.raises(
+            RuntimeError,
+            match="execution metadata is unavailable",
+        ),
+    ):
+        block.experts(torch.zeros(2, cfg.hidden_size, dtype=torch.bfloat16))
 
 
 def test_npu_moe_token_owner_reuses_graph_mask_slice(
@@ -1264,17 +1329,14 @@ def test_npu_moe_token_owner_reuses_graph_mask_slice(
     context = ForwardContext(
         attention_backend=None,
         device=torch.device("cpu"),
-        metadata=SimpleNamespace(dp_execution_token_counts=(4, 4)),
+        metadata=SimpleNamespace(dp_execution_token_counts=(4, 2)),
         layer_caches=[],
         execution_state=AclGraphExecutionState({}),
         execution_contexts={
-            MegaMoeContext: _mega_moe_execution(
+            MegaMoeMetadata: _mega_moe_graph_metadata(
                 block,
-                (4, 4),
-                torch.tensor(
-                    [1, 1, 1, 0, 1, 1, 0, 0],
-                    dtype=torch.int8,
-                ),
+                token_capacity=4,
+                local_token_count=2,
             ),
         },
     )
@@ -1293,7 +1355,7 @@ def test_npu_moe_token_owner_reuses_graph_mask_slice(
     broadcast.assert_called_once_with(output, 0, "tp")
 
 
-def test_npu_moe_token_non_owner_reuses_graph_dummy_buffers(
+def test_npu_moe_token_non_owner_reuses_graph_dummy_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = _config(
@@ -1321,23 +1383,30 @@ def test_npu_moe_token_non_owner_reuses_graph_dummy_buffers(
     mega_moe = MagicMock(return_value=torch.zeros_like(hidden))
     monkeypatch.setattr(kernels, "mega_moe", mega_moe, raising=False)
     monkeypatch.setattr(distributed, "broadcast_", MagicMock(), raising=False)
+    mega_moe_metadata = _mega_moe_graph_metadata(
+        block,
+        token_capacity=4,
+        local_token_count=4,
+    )
     context = ForwardContext(
         attention_backend=None,
         device=torch.device("cpu"),
         metadata=SimpleNamespace(dp_execution_token_counts=(4, 4)),
         layer_caches=[],
         execution_state=AclGraphExecutionState({}),
-        execution_contexts={MegaMoeContext: _mega_moe_execution(block, (4, 4))},
+        execution_contexts={
+            MegaMoeMetadata: mega_moe_metadata,
+        },
     )
 
     with forward_context(context):
-        block.experts(hidden)
-        block.experts(hidden)
+        output = block.experts(hidden)
 
-    first_args = mega_moe.call_args_list[0].args
-    second_args = mega_moe.call_args_list[1].args
-    for index in (1, 2, 3, 12):
-        assert first_args[index].data_ptr() == second_args[index].data_ptr()
+    first_args = mega_moe.call_args.args
+    assert output.shape == hidden.shape
+    assert first_args[1] is mega_moe_metadata.dummy_input
+    assert first_args[2] is mega_moe_metadata.dummy_topk_ids
+    assert first_args[3] is mega_moe_metadata.dummy_topk_weights
     torch.testing.assert_close(
         first_args[1],
         torch.zeros(4, cfg.hidden_size, dtype=torch.bfloat16),
@@ -1347,6 +1416,57 @@ def test_npu_moe_token_non_owner_reuses_graph_dummy_buffers(
         torch.tensor([1, 0, 0, 0], dtype=torch.int8),
     )
     block.experts.gate.forward.assert_not_called()
+
+
+def test_npu_moe_falls_back_when_capacity_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config(
+        tp_size=2,
+        tp_rank=0,
+        dp_size=2,
+        dp_rank=0,
+        world_size=4,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        ep_size=4,
+        ep_rank=0,
+        enable_mega_moe=True,
+        mega_moe_context=torch.zeros(1, dtype=torch.int32),
+        mega_moe_ccl_buffer_size=1024,
+        mega_moe_num_max_tokens_per_rank=2,
+    )
+    block = NpuQwen3_5SparseMoEBlock(
+        cfg,
+        torch.bfloat16,
+        torch.device("cpu"),
+    )
+    hidden = torch.ones(3, cfg.hidden_size, dtype=torch.bfloat16)
+    expected = torch.full_like(hidden, 7)
+    fallback = MagicMock(return_value=expected)
+    monkeypatch.setattr(block.experts, "_forward_ep_level1", fallback)
+    mega_moe = MagicMock()
+    monkeypatch.setattr(kernels, "mega_moe", mega_moe, raising=False)
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=SimpleNamespace(dp_execution_token_counts=(3, 3)),
+        layer_caches=[],
+        execution_contexts={
+            MegaMoeMetadata: _mega_moe_eager_metadata(
+                block,
+                local_token_count=3,
+                execution_token_counts=(3, 3),
+            ),
+        },
+    )
+
+    with forward_context(context):
+        output = block.experts(hidden)
+
+    assert output is expected
+    fallback.assert_called_once_with(hidden)
+    mega_moe.assert_not_called()
 
 
 def test_npu_moe_graph_dp_gather_uses_fixed_shape(monkeypatch) -> None:

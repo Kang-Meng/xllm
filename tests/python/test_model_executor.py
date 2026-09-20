@@ -39,12 +39,9 @@ from xllm.python.attention.backend import (  # noqa: E402
     normalize_layer_caches,
 )
 from xllm.python.layers.attention import Attention  # noqa: E402
-from xllm.python.layers.npu.mega_moe_context import (  # noqa: E402
-    MegaMoeContext,
-    MegaMoeLayerSpec,
-)
-from xllm.python.layers.npu.mega_moe_context_provider import (  # noqa: E402
-    TokenOwnerMegaMoeContextProvider,
+from xllm.python.layers.npu.mega_moe_metadata import MegaMoeMetadata  # noqa: E402
+from xllm.python.layers.npu.mega_moe_metadata_builder import (  # noqa: E402
+    TokenOwnerMegaMoeMetadataBuilder,
 )
 from xllm.python.model_executor.executor import (  # noqa: E402
     ModelExecutor,
@@ -58,6 +55,7 @@ from xllm.python.model_executor.forward_context import (  # noqa: E402
     get_forward_context,
     record_layer_event,
 )
+from xllm.python.model_executor.input_batch import InputBatch  # noqa: E402
 from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
     DecodeAclGraphRunner,
 )
@@ -165,6 +163,41 @@ class _FakeModelNoAttention(nn.Module):
 class _FailingLayerSynchronizer:
     def record_event(self, layer_id: int) -> bool:
         return False
+
+
+def _make_input_batch(
+    num_scheduled_tokens: tuple[int, ...],
+    *,
+    token_capacity: int | None = None,
+    num_draft_tokens_per_req: tuple[int, ...] | None = None,
+) -> InputBatch:
+    num_tokens = sum(num_scheduled_tokens)
+    query_start_loc = [0]
+    for count in num_scheduled_tokens:
+        query_start_loc.append(query_start_loc[-1] + count)
+    metadata = SimpleNamespace(
+        num_reqs=len(num_scheduled_tokens),
+        num_tokens=num_tokens,
+        num_scheduled_tokens=list(num_scheduled_tokens),
+        num_computed_tokens=[0] * len(num_scheduled_tokens),
+        num_draft_tokens=sum(num_draft_tokens_per_req or ()),
+        num_draft_tokens_per_req=(None if num_draft_tokens_per_req is None else list(num_draft_tokens_per_req)),
+        query_start_loc=query_start_loc,
+        is_prefilling=[0] * len(num_scheduled_tokens),
+    )
+    batch = InputBatch.from_runtime(
+        torch.zeros(num_tokens, dtype=torch.int32),
+        torch.arange(num_tokens, dtype=torch.int32),
+        metadata,
+        is_dummy=False,
+    )
+    if token_capacity is None:
+        return batch
+    return batch.bind_graph_inputs(
+        torch.zeros(token_capacity, dtype=torch.int32),
+        torch.zeros(token_capacity, dtype=torch.int32),
+        torch.arange(token_capacity) >= num_tokens,
+    )
 
 
 def test_attention_backend_defaults_to_non_mla() -> None:
@@ -422,31 +455,35 @@ class TestModelExecutorConstruction:
         assert executor.decode_graph_runner is None
         assert executor.inductor_runner is None
 
-    @patch("xllm.python.model_executor.executor.create_token_owner_mega_moe_context_provider")
+    @patch("xllm.python.model_executor.executor.get_execution_metadata_builder_classes")
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
         return_value=StubAttentionBackend(),
     )
-    def test_discovered_token_owner_mega_moe_provider_is_bound(
+    def test_eager_binds_execution_metadata_builders(
         self,
         _mock_backend,
-        mock_provider_factory,
+        mock_builder_classes,
     ) -> None:
-        provider = MagicMock()
-        mock_provider_factory.return_value = provider
-        model = _FakeModel(num_layers=1)
+        builder = MagicMock()
+        builder_class = MagicMock()
+        builder_class.from_config.return_value = builder
+        mock_builder_classes.return_value = (builder_class,)
+        config = {
+            "enable_mega_moe": True,
+            "model_type": "qwen3_5_moe",
+            "python_graph_backend": "off",
+        }
+
         executor = ModelExecutor(
-            model,
-            {
-                "enable_mega_moe": True,
-                "python_graph_backend": "off",
-            },
+            _FakeModel(num_layers=1),
+            config,
             max_seqs_per_batch=4,
         )
 
-        providers = executor.eager_runner.execution_context_providers
-        assert providers == (provider,)
-        mock_provider_factory.assert_called_once_with(model.model)
+        assert executor.eager_runner.execution_metadata_builders == (builder,)
+        mock_builder_classes.assert_called_once_with("qwen3_5_moe")
+        builder_class.from_config.assert_called_once_with(config)
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
@@ -643,32 +680,40 @@ class TestModelExecutorConstruction:
         assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is True
 
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
-    @patch("xllm.python.model_executor.executor.create_token_owner_mega_moe_context_provider")
+    @patch("xllm.python.model_executor.executor.get_execution_metadata_builder_classes")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
-    def test_acl_graph_qwen_mega_moe_uses_execution_context_provider(
+    def test_acl_graph_qwen_mega_moe_keeps_legacy_mask_with_metadata_builder(
         self,
         mock_create,
-        mock_provider_factory,
+        mock_builder_classes,
         mock_graph_runner,
     ) -> None:
         mock_create.return_value = StubAttentionBackend()
-        provider = MagicMock()
-        mock_provider_factory.return_value = provider
+        builder = MagicMock()
+        builder.metadata_type = MegaMoeMetadata
+        builder.bind_layer_caches = MagicMock()
+        builder_class = MagicMock()
+        builder_class.from_config.return_value = builder
+        mock_builder_classes.return_value = (builder_class,)
 
+        model = _FakeModel(num_layers=1)
+        config = {
+            "enable_mega_moe": True,
+            "model_type": "qwen3_5_moe",
+            "max_position_embeddings": 128,
+            "python_graph_backend": "aclgraph",
+        }
         ModelExecutor(
-            _FakeModel(num_layers=1),
-            {
-                "enable_mega_moe": True,
-                "model_type": "qwen3_5_moe",
-                "max_position_embeddings": 128,
-                "python_graph_backend": "aclgraph",
-            },
+            model,
+            config,
             max_seqs_per_batch=4,
         )
 
-        assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is False
-        providers = mock_graph_runner.return_value.bind_execution_context_providers.call_args.args[0]
-        assert providers == (provider,)
+        assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is True
+        builders = mock_graph_runner.return_value.bind_execution_metadata_builders.call_args.args[0]
+        assert builders == (builder,)
+        mock_builder_classes.assert_called_once_with("qwen3_5_moe")
+        builder_class.from_config.assert_called_once_with(config)
 
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
@@ -1318,136 +1363,158 @@ class TestDecodeAclGraphSpeculativeMetadata:
         assert mask is not None
         assert mask.tolist() == [1, 1, 1, 0, 1, 0, 0, 0]
 
-    def test_token_owner_provider_updates_graph_layout_in_place(self) -> None:
-        spec = MegaMoeLayerSpec(
-            layer_id=7,
+    def test_token_owner_metadata_builder_updates_graph_mask_in_place(self) -> None:
+        builder = TokenOwnerMegaMoeMetadataBuilder(
+            is_token_owner=True,
+            dp_size=1,
+            dp_rank=0,
             hidden_size=8,
             top_k=2,
             token_limit=4096,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-            dp_size=2,
-            dp_rank=0,
-            tp_rank=0,
         )
-        provider = TokenOwnerMegaMoeContextProvider((spec,))
-        layout = provider.allocate_graph(
-            token_capacity=4,
-            device=torch.device("cpu"),
-            metadata=SimpleNamespace(),
-        )
-        layer_context = layout.layers[spec.layer_id]
-        assert layer_context is not None
-        active_token_mask = layout.active_token_mask
+        input_batch = _make_input_batch((3,), token_capacity=4)
+        runtime_metadata = SimpleNamespace()
+        persistent_metadata = builder.allocate_persistent(input_batch, runtime_metadata)
+        active_token_mask = persistent_metadata.active_token_mask
         data_ptr = active_token_mask.data_ptr()
 
-        provider.update_graph(
-            layout,
-            SimpleNamespace(dp_execution_token_counts=(3, 1)),
-            local_token_count=3,
+        builder.update_persistent(
+            persistent_metadata,
+            input_batch,
+            runtime_metadata,
         )
 
         assert active_token_mask.data_ptr() == data_ptr
         assert active_token_mask.tolist() == [1, 1, 1, 0]
 
-    def test_token_owner_provider_owns_layer_buffer_reuse_policy(self) -> None:
-        specs = tuple(
-            MegaMoeLayerSpec(
-                layer_id=layer_id,
-                hidden_size=8,
-                top_k=2,
-                token_limit=4096,
-                dtype=torch.bfloat16,
-                device=torch.device("cpu"),
-                dp_size=2,
-                dp_rank=0,
-                tp_rank=1,
-            )
-            for layer_id in (3, 7)
+    def test_token_non_owner_graph_metadata_contains_shared_dummy_inputs(self) -> None:
+        builder = TokenOwnerMegaMoeMetadataBuilder(
+            is_token_owner=False,
+            dp_size=1,
+            dp_rank=0,
+            hidden_size=8,
+            top_k=2,
+            token_limit=4096,
         )
-        provider = TokenOwnerMegaMoeContextProvider(specs)
+        input_batch = _make_input_batch((1,), token_capacity=4)
+        runtime_metadata = SimpleNamespace()
+        metadata = builder.allocate_persistent(input_batch, runtime_metadata)
 
-        eager_context = provider.build_eager(
-            torch.zeros(2, dtype=torch.int64),
-            SimpleNamespace(dp_execution_token_counts=(2, 3)),
-        )
-        assert eager_context.layers[3] is eager_context.layers[7]
+        assert metadata.active_token_mask.tolist() == [1, 0, 0, 0]
+        assert metadata.dummy_input is not None
+        assert metadata.dummy_input.shape == (4, 8)
+        assert metadata.dummy_input.dtype == torch.bfloat16
+        assert metadata.dummy_topk_weights is not None
+        assert metadata.dummy_topk_weights.shape == (4, 2)
+        assert metadata.dummy_topk_weights.dtype == torch.float32
+        assert metadata.dummy_topk_ids is not None
+        assert metadata.dummy_topk_ids.shape == (4, 2)
+        assert metadata.dummy_topk_ids.dtype == torch.int32
 
-        graph_context = provider.allocate_graph(
-            token_capacity=4,
-            device=torch.device("cpu"),
-            metadata=SimpleNamespace(),
+        data_ptrs = (
+            metadata.dummy_input.data_ptr(),
+            metadata.dummy_topk_weights.data_ptr(),
+            metadata.dummy_topk_ids.data_ptr(),
         )
-        first = graph_context.layers[3]
-        second = graph_context.layers[7]
-        assert first is not None
-        assert second is not None
-        assert first is not second
-        assert first.input_buffer is not None
-        assert second.input_buffer is not None
-        assert first.input_buffer.data_ptr() == second.input_buffer.data_ptr()
-        assert first.topk_weights_buffer is not None
-        assert second.topk_weights_buffer is not None
-        assert first.topk_weights_buffer.data_ptr() == second.topk_weights_buffer.data_ptr()
-        assert first.topk_ids_buffer is not None
-        assert second.topk_ids_buffer is not None
-        assert first.topk_ids_buffer.data_ptr() == second.topk_ids_buffer.data_ptr()
-        assert first.output_buffer is not None
-        assert second.output_buffer is not None
-        assert first.output_buffer.data_ptr() != second.output_buffer.data_ptr()
-
-    def test_token_owner_provider_uses_one_graph_mask_for_all_layers(self) -> None:
-        specs = tuple(
-            MegaMoeLayerSpec(
-                layer_id=layer_id,
-                hidden_size=8,
-                top_k=2,
-                token_limit=4096,
-                dtype=torch.bfloat16,
-                device=torch.device("cpu"),
-                dp_size=2,
-                dp_rank=0,
-                tp_rank=0,
-            )
-            for layer_id in (3, 7)
-        )
-        provider = TokenOwnerMegaMoeContextProvider(specs)
-        context = provider.allocate_graph(
-            token_capacity=4,
-            device=torch.device("cpu"),
-            metadata=SimpleNamespace(),
-        )
-        active_token_mask = context.active_token_mask
-
-        provider.update_graph(
-            context,
-            SimpleNamespace(dp_execution_token_counts=(2, 1)),
-            local_token_count=2,
+        builder.update_persistent(metadata, input_batch, runtime_metadata)
+        assert data_ptrs == (
+            metadata.dummy_input.data_ptr(),
+            metadata.dummy_topk_weights.data_ptr(),
+            metadata.dummy_topk_ids.data_ptr(),
         )
 
-        assert context.active_token_mask.data_ptr() == active_token_mask.data_ptr()
-        assert context.active_token_mask.tolist() == [1, 1, 0, 0]
-
-    def test_token_owner_provider_marks_over_capacity_layers_for_fallback(self) -> None:
-        spec = MegaMoeLayerSpec(
-            layer_id=7,
+    def test_token_non_owner_skips_dummy_inputs_above_mega_moe_limit(self) -> None:
+        builder = TokenOwnerMegaMoeMetadataBuilder(
+            is_token_owner=False,
+            dp_size=1,
+            dp_rank=0,
             hidden_size=8,
             top_k=2,
             token_limit=2,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
+        )
+
+        metadata = builder.build(
+            _make_input_batch((3,)),
+            SimpleNamespace(),
+        )
+
+        assert metadata.dummy_input is None
+        assert metadata.dummy_topk_weights is None
+        assert metadata.dummy_topk_ids is None
+
+    def test_token_owner_builder_returns_same_metadata_type_for_eager_and_graph(self) -> None:
+        builder = TokenOwnerMegaMoeMetadataBuilder(
+            is_token_owner=True,
             dp_size=2,
             dp_rank=0,
-            tp_rank=0,
+            hidden_size=8,
+            top_k=2,
+            token_limit=4096,
         )
-        provider = TokenOwnerMegaMoeContextProvider((spec,))
-
-        context = provider.build_eager(
-            torch.zeros(3, dtype=torch.int64),
-            SimpleNamespace(dp_execution_token_counts=(3, 3)),
+        eager_batch = _make_input_batch((2,))
+        eager_metadata = builder.build(
+            eager_batch,
+            SimpleNamespace(dp_execution_token_counts=(2, 3)),
+        )
+        graph_metadata = builder.allocate_persistent(
+            _make_input_batch((2,), token_capacity=4),
+            SimpleNamespace(dp_execution_token_counts=(2, 3)),
         )
 
-        assert context.layers[spec.layer_id] is None
+        assert isinstance(eager_metadata, MegaMoeMetadata)
+        assert isinstance(graph_metadata, MegaMoeMetadata)
+        assert eager_metadata.active_token_mask.tolist() == [1, 1, 0]
+
+    @pytest.mark.parametrize(
+        ("execution_token_counts", "error"),
+        (
+            ((), "expected 2 DP execution token counts"),
+            ((2,), "expected 2 DP execution token counts"),
+            ((1, 3), "does not match the local input"),
+        ),
+    )
+    def test_token_owner_builder_rejects_invalid_dp_execution_counts(
+        self,
+        execution_token_counts: tuple[int, ...],
+        error: str,
+    ) -> None:
+        builder = TokenOwnerMegaMoeMetadataBuilder(
+            is_token_owner=True,
+            dp_size=2,
+            dp_rank=0,
+            hidden_size=8,
+            top_k=2,
+            token_limit=4096,
+        )
+
+        with pytest.raises(RuntimeError, match=error):
+            builder.build(
+                _make_input_batch((2,)),
+                SimpleNamespace(dp_execution_token_counts=execution_token_counts),
+            )
+
+    def test_token_owner_metadata_builder_uses_one_graph_mask_for_all_layers(self) -> None:
+        builder = TokenOwnerMegaMoeMetadataBuilder(
+            is_token_owner=True,
+            dp_size=1,
+            dp_rank=0,
+            hidden_size=8,
+            top_k=2,
+            token_limit=4096,
+        )
+        input_batch = _make_input_batch((2,), token_capacity=4)
+        runtime_metadata = SimpleNamespace()
+        metadata = builder.allocate_persistent(input_batch, runtime_metadata)
+        active_token_mask = metadata.active_token_mask
+
+        builder.update_persistent(
+            metadata,
+            input_batch,
+            runtime_metadata,
+        )
+
+        assert metadata.active_token_mask.data_ptr() == active_token_mask.data_ptr()
+        assert metadata.active_token_mask.tolist() == [1, 1, 0, 0]
 
 
 # ---------------------------------------------------------------------------
@@ -1540,6 +1607,35 @@ class TestBindKvCaches:
         executor.bind_kv_caches([kv])
         executor.bind_kv_caches([kv])  # should not raise or re-bind
 
+    @patch("xllm.python.model_executor.executor.get_execution_metadata_builder_classes")
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+    )
+    def test_bind_forwards_layer_caches_to_cache_aware_builder(
+        self,
+        mock_create,
+        mock_builder_classes,
+    ) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        builder = MagicMock()
+        builder.metadata_type = MegaMoeMetadata
+        builder_class = MagicMock()
+        builder_class.from_config.return_value = builder
+        mock_builder_classes.return_value = (builder_class,)
+        executor = ModelExecutor(
+            _FakeModel(num_layers=1),
+            {"model_type": "cache_aware", "python_graph_backend": "off"},
+            max_seqs_per_batch=4,
+        )
+        kv = (torch.zeros(1), torch.zeros(1))
+
+        executor.bind_kv_caches([kv])
+
+        bound_caches = builder.bind_layer_caches.call_args.args[0]
+        assert len(bound_caches) == 1
+        assert bound_caches[0].key is kv[0]
+        assert bound_caches[0].value is kv[1]
+
 
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor.execute routing
@@ -1558,58 +1654,47 @@ def _make_eager_runner(*, is_mla: bool = True) -> EagerRunner:
     return runner
 
 
-def test_eager_runner_builds_dynamic_mega_moe_execution_layout() -> None:
+def test_eager_runner_builds_model_visible_execution_metadata() -> None:
     runner = _make_eager_runner(is_mla=False)
     runner.cp_size = 1
-    spec = MegaMoeLayerSpec(
-        layer_id=7,
-        hidden_size=8,
-        top_k=2,
-        token_limit=4096,
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-        dp_size=2,
-        dp_rank=0,
-        tp_rank=0,
+    builder = MagicMock()
+    builder.metadata_type = MegaMoeMetadata
+    eager_metadata = MegaMoeMetadata(
+        active_token_mask=torch.tensor([1, 1, 0], dtype=torch.int8),
     )
-    runner.bind_execution_context_providers((TokenOwnerMegaMoeContextProvider((spec,)),))
+    builder.build.return_value = eager_metadata
+    runner.bind_execution_metadata_builders((builder,))
+    input_batch = _make_input_batch((2,))
     metadata = SimpleNamespace(
         is_prefill=True,
         is_chunked_prefill=False,
         is_mixed=False,
         is_spec_verify=False,
-        dp_execution_token_counts=(2, 3),
     )
 
-    def execute_model(
+    def _execute_model(
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        context = get_execution_context(MegaMoeContext)
-        assert context is not None
-        assert context.token_capacity == 3
-        layer_context = context.layers[spec.layer_id]
-        assert layer_context is not None
-        assert context.active_token_mask.tolist() == [1, 1, 0]
+        assert get_execution_context(MegaMoeMetadata) is eager_metadata
         return input_ids + positions
 
-    runner.model.side_effect = execute_model
+    runner.model.side_effect = _execute_model
     output = runner.execute(
-        torch.ones(2),
-        torch.ones(2),
+        input_batch.input_ids,
+        input_batch.positions,
         metadata,
+        input_batch=input_batch,
     )
 
-    torch.testing.assert_close(output, torch.full((2,), 2.0))
+    builder.build.assert_called_once_with(input_batch, metadata)
+    torch.testing.assert_close(output, input_batch.input_ids + input_batch.positions)
 
 
-def test_eager_runner_builds_execution_context_before_backend_prepare() -> None:
+def test_eager_runner_requires_input_batch_for_execution_metadata() -> None:
     runner = _make_eager_runner(is_mla=False)
     runner.cp_size = 1
-    runner.attention_backend.prepare = MagicMock()
-    provider = MagicMock()
-    provider.build_eager.side_effect = RuntimeError("invalid execution context")
-    runner.bind_execution_context_providers((provider,))
+    runner.bind_execution_metadata_builders((MagicMock(),))
     metadata = SimpleNamespace(
         is_prefill=True,
         is_chunked_prefill=False,
@@ -1617,14 +1702,8 @@ def test_eager_runner_builds_execution_context_before_backend_prepare() -> None:
         is_spec_verify=False,
     )
 
-    with pytest.raises(RuntimeError, match="invalid execution context"):
-        runner.execute(
-            torch.ones(2),
-            torch.ones(2),
-            metadata,
-        )
-
-    runner.attention_backend.prepare.assert_not_called()
+    with pytest.raises(RuntimeError, match="require upstream InputBatch"):
+        runner.execute(torch.zeros(2), torch.arange(2), metadata)
 
 
 def test_eager_runner_preserves_qwen_pure_prefill_cp_context_contract() -> None:
@@ -1873,7 +1952,7 @@ class TestExecuteRouting:
         executor.eager_runner = MagicMock()
         grad_enabled = None
 
-        def execute(*_args):
+        def execute(*_args, **_kwargs):
             nonlocal grad_enabled
             grad_enabled = torch.is_grad_enabled()
             return torch.ones(5)
@@ -1884,6 +1963,30 @@ class TestExecuteRouting:
         executor.eager_runner.execute.assert_called_once()
         assert grad_enabled is False
         assert torch.equal(result, torch.ones(5))
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+    )
+    def test_execute_without_builders_skips_input_batch_materialization(self, mock_create):
+        mock_create.return_value = StubAttentionBackend()
+        executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+        executor.eager_runner = MagicMock()
+        executor.eager_runner.execute.return_value = torch.ones(1)
+        metadata = MagicMock(spec=AttentionMetadata)
+        metadata.is_prefill = False
+        metadata.is_chunked_prefill = False
+
+        with patch.object(InputBatch, "from_runtime") as from_runtime:
+            executor.execute(
+                torch.zeros(1),
+                torch.zeros(1),
+                metadata,
+                input_batch_metadata=MagicMock(),
+            )
+
+        from_runtime.assert_not_called()
+        assert executor.eager_runner.execute.call_args.kwargs["input_batch"] is None
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
@@ -1941,5 +2044,6 @@ class TestExecuteRouting:
             metadata,
             None,
             eplb=None,
+            input_batch=None,
         )
         assert torch.equal(result, torch.ones(4))

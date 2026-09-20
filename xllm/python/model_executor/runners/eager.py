@@ -18,15 +18,13 @@ import torch
 
 from xllm.python.attention.backend import AttentionMetadata
 from xllm.python.model_executor.cp_utils import build_cp_context
-from xllm.python.model_executor.execution_context import (
-    build_eager_execution_contexts,
-)
 from xllm.python.model_executor.forward_context import (
     EplbRuntimeState,
     ForwardContext,
     LayerSynchronizer,
     forward_context,
 )
+from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 
 
@@ -63,6 +61,7 @@ class EagerRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
+        input_batch: InputBatch | None = None,
     ) -> ModelExecutionOutput:
         cp_context = None
         is_mla = self.attention_backend.is_mla
@@ -95,11 +94,15 @@ class EagerRunner(BaseRunner):
                     self.device,
                 )
 
-        execution_contexts = build_eager_execution_contexts(
-            self.execution_context_providers,
-            input_ids,
-            metadata,
-        )
+        execution_contexts = {}
+        if self.execution_metadata_builders:
+            if input_batch is None:
+                raise RuntimeError("execution metadata builders require upstream InputBatch metadata")
+            for builder in self.execution_metadata_builders:
+                metadata_type = builder.metadata_type
+                if metadata_type in execution_contexts:
+                    raise RuntimeError(f"duplicate execution metadata builder for {metadata_type.__name__}")
+                execution_contexts[metadata_type] = builder.build(input_batch, metadata)
 
         # Admission and context construction must finish before prepare(). A
         # sharded MLA backend enters CP collectives during prepare, so rejecting

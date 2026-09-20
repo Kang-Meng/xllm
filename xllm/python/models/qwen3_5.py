@@ -270,8 +270,24 @@ class Qwen3_5Model(nn.Module):
             device=device,
         )
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: object | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        if kwargs:
+            raise TypeError(f"unsupported Qwen3.5 execution inputs: {sorted(kwargs)}")
+        if intermediate_tensors is not None:
+            raise NotImplementedError("Qwen3.5 does not support pipeline parallelism")
+        if inputs_embeds is not None:
+            raise NotImplementedError("Qwen3.5 does not support inputs_embeds")
+        if input_ids is None:
+            raise ValueError("input_ids must be provided")
         hidden = self.embed_tokens(input_ids)
+
         residual: torch.Tensor | None = None
         for layer_id, layer in enumerate(self.layers):
             hidden, residual = layer(hidden, residual, positions)

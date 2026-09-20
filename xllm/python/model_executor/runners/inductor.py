@@ -23,6 +23,7 @@ from xllm.python.model_executor.forward_context import (
     LayerSynchronizer,
     forward_context,
 )
+from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.runners.base import BaseRunner
 
 
@@ -39,7 +40,17 @@ class InductorRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
+        input_batch: InputBatch | None = None,
     ) -> torch.Tensor:
+        execution_contexts = {}
+        if self.execution_metadata_builders:
+            if input_batch is None:
+                raise RuntimeError("execution metadata builders require upstream InputBatch metadata")
+            for builder in self.execution_metadata_builders:
+                metadata_type = builder.metadata_type
+                if metadata_type in execution_contexts:
+                    raise RuntimeError(f"duplicate execution metadata builder for {metadata_type.__name__}")
+                execution_contexts[metadata_type] = builder.build(input_batch, metadata)
         self.attention_backend.prepare(metadata)
         with forward_context(
             ForwardContext(
@@ -49,6 +60,7 @@ class InductorRunner(BaseRunner):
                 self.layer_caches,
                 layer_synchronizer=layer_synchronizer,
                 eplb=eplb,
+                execution_contexts=execution_contexts,
             )
         ):
             if input_embedding is None:

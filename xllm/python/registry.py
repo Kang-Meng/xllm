@@ -21,15 +21,28 @@ class by the model's architecture (or model_type) string.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from importlib import import_module
+from typing import TYPE_CHECKING, cast
 
 import torch.nn as nn
 
 from xllm.python.model_platform_support import MODEL_PLATFORM_SUPPORT
 from xllm.python.platform import current_platform
 
-_ModelPath = tuple[str, str]
-_REGISTRY: dict[str, _ModelPath] = {}
+if TYPE_CHECKING:
+    from xllm.python.model_executor.execution_context import RegisteredExecutionMetadataBuilder
+
+_ImportPath = tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelRegistration:
+    model_path: _ImportPath
+    execution_metadata_builder_paths: tuple[_ImportPath, ...] = ()
+
+
+_REGISTRY: dict[str, _ModelRegistration] = {}
 
 
 def register_model(
@@ -38,25 +51,51 @@ def register_model(
     """Register a model class for callers that already imported its module."""
 
     def deco(cls: type[nn.Module]) -> type[nn.Module]:
-        path = (cls.__module__, cls.__name__)
+        registration = _ModelRegistration(
+            model_path=(cls.__module__, cls.__name__),
+        )
         for name in names:
-            _REGISTRY[name] = path
+            _REGISTRY[name] = registration
         return cls
 
     return deco
 
 
-def _register_model_path(module_name: str, class_name: str, *names: str) -> None:
-    path = (module_name, class_name)
+def _register_model_path(
+    module_name: str,
+    class_name: str,
+    *names: str,
+    execution_metadata_builders: tuple[_ImportPath, ...] = (),
+) -> None:
+    registration = _ModelRegistration(
+        model_path=(module_name, class_name),
+        execution_metadata_builder_paths=execution_metadata_builders,
+    )
     for name in names:
-        _REGISTRY[name] = path
+        _REGISTRY[name] = registration
+
+
+def get_execution_metadata_builder_classes(
+    name: str,
+) -> tuple[type[RegisteredExecutionMetadataBuilder], ...]:
+    """Return the execution metadata builder types registered for a model."""
+    registration = _REGISTRY.get(name)
+    if registration is None:
+        return ()
+    return tuple(
+        cast(
+            "type[RegisteredExecutionMetadataBuilder]",
+            getattr(import_module(module_name), class_name),
+        )
+        for module_name, class_name in registration.execution_metadata_builder_paths
+    )
 
 
 def get_model_class(name: str) -> type[nn.Module]:
     if name not in _REGISTRY:
         raise KeyError(f"model '{name}' not registered; available: {sorted(_REGISTRY)}")
 
-    module_name, class_name = _REGISTRY[name]
+    module_name, class_name = _REGISTRY[name].model_path
     implementation = module_name.rsplit(".", 1)[-1]
     platform = current_platform.device_type()
     support = MODEL_PLATFORM_SUPPORT.get(implementation, {})
@@ -90,6 +129,16 @@ def _register_builtin_models() -> None:
         "Qwen3_5MoeForCausalLM",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        execution_metadata_builders=(
+            (
+                "xllm.python.layers.npu.mega_moe_metadata_builder",
+                "TokenOwnerMegaMoeMetadataBuilder",
+            ),
+            (
+                "xllm.python.layers.npu.qwen3_5.gdn_metadata_builder",
+                "Qwen3_5GdnMetadataBuilder",
+            ),
+        ),
     )
     _register_model_path(
         "xllm.python.models.qwen3_dspark",

@@ -44,10 +44,6 @@ from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
 )
-from xllm.python.model_executor.execution_context import (
-    allocate_graph_execution_contexts,
-    update_graph_execution_contexts,
-)
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
@@ -57,6 +53,7 @@ from xllm.python.model_executor.forward_context import (
     LayerSynchronizer,
     forward_context,
 )
+from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 from xllm.python.model_executor.runners.decode_cuda_graph import (
     _CAPTURE_WARMUP_STEPS,
@@ -149,6 +146,7 @@ class _DecodeGraphEntry:
         "execution_state",
         "eplb",
         "execution_contexts",
+        "is_padding",
     )
 
 
@@ -775,6 +773,7 @@ class DecodeAclGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
+        input_batch: InputBatch | None = None,
     ) -> ModelExecutionOutput:
         batch_size = input_ids.shape[0]
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None
@@ -835,7 +834,13 @@ class DecodeAclGraphRunner(BaseRunner):
         entry = self._graphs.get(graph_key)
         first_capture = entry is None
         if first_capture:
-            entry = self._allocate_entry(padded_batch_size, input_ids, positions, metadata)
+            entry = self._allocate_entry(
+                padded_batch_size,
+                input_ids,
+                positions,
+                metadata,
+                input_batch,
+            )
             entry.eplb = self._allocate_graph_eplb_state(eplb, padded_batch_size)
             self._graphs[graph_key] = entry
         entry_eplb = getattr(entry, "eplb", None)
@@ -854,7 +859,15 @@ class DecodeAclGraphRunner(BaseRunner):
             self._update_stream = torch.npu.Stream(device=input_ids.device, priority=-1)
             self._replay_done_event = torch.npu.Event()
 
-        self._fill_entry(entry, input_ids, positions, metadata, batch_size, input_embedding)
+        self._fill_entry(
+            entry,
+            input_ids,
+            positions,
+            metadata,
+            batch_size,
+            input_embedding,
+            input_batch,
+        )
 
         prepare_context = ForwardContext(
             self.attention_backend,
@@ -1010,6 +1023,7 @@ class DecodeAclGraphRunner(BaseRunner):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        input_batch: InputBatch | None = None,
     ) -> _DecodeGraphEntry:
         device = input_ids.device
         (
@@ -1047,14 +1061,24 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.static_output = None
         entry.graph_tasks = []
         entry.execution_state = AclGraphExecutionState({})
-        entry.execution_contexts = allocate_graph_execution_contexts(
-            self.execution_context_providers,
-            padded_batch_size,
-            device,
-            metadata,
-        )
         entry.static_input_ids = torch.zeros(padded_batch_size, dtype=input_ids.dtype, device=device)
         entry.static_positions = torch.zeros(padded_batch_size, dtype=torch.int32, device=device)
+        entry.is_padding = torch.ones(
+            padded_batch_size,
+            dtype=torch.bool,
+            device=device,
+        )
+        entry.execution_contexts = {}
+        if self.execution_metadata_builders:
+            graph_input_batch = self._build_padded_input_batch(entry, input_batch)
+            for builder in self.execution_metadata_builders:
+                metadata_type = builder.metadata_type
+                if metadata_type in entry.execution_contexts:
+                    raise RuntimeError(f"duplicate execution metadata builder for {metadata_type.__name__}")
+                entry.execution_contexts[metadata_type] = builder.allocate_persistent(
+                    graph_input_batch,
+                    metadata,
+                )
         entry.static_input_embedding = None
         kpool_query_lens = self._padded_kpool_query_lens(
             metadata,
@@ -1239,6 +1263,7 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         batch_size: int,
         input_embedding: torch.Tensor | None,
+        input_batch: InputBatch | None = None,
     ) -> None:
         padded_batch_size = entry.batch_size
         static_metadata = entry.static_metadata
@@ -1402,11 +1427,31 @@ class DecodeAclGraphRunner(BaseRunner):
             batch_size,
         )
         self._fill_mega_moe_token_mask(entry, metadata, batch_size)
-        update_graph_execution_contexts(
-            self.execution_context_providers,
-            entry.execution_contexts,
-            metadata,
-            batch_size,
+        if self.execution_metadata_builders:
+            graph_input_batch = self._build_padded_input_batch(entry, input_batch)
+            for builder in self.execution_metadata_builders:
+                persistent_metadata = entry.execution_contexts.get(builder.metadata_type)
+                if persistent_metadata is None:
+                    raise RuntimeError(f"missing persistent execution metadata for {builder.metadata_type.__name__}")
+                builder.update_persistent(
+                    persistent_metadata,
+                    graph_input_batch,
+                    metadata,
+                )
+
+    def _build_padded_input_batch(
+        self,
+        entry: _DecodeGraphEntry,
+        input_batch: InputBatch | None,
+    ) -> InputBatch:
+        if input_batch is None:
+            raise RuntimeError("execution metadata builders require upstream InputBatch metadata")
+        entry.is_padding.fill_(True)
+        entry.is_padding[: input_batch.num_tokens].fill_(False)
+        return input_batch.bind_graph_inputs(
+            entry.static_input_ids,
+            entry.static_positions,
+            entry.is_padding,
         )
 
     def _fill_dsa_block_tables(

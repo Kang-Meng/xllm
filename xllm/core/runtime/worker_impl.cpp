@@ -1376,6 +1376,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
         input_params.num_accepted_tokens =
             torch::ones_like(input_params.embedding.linear_state_indices);
       }
+      input_params.execution_batch.num_tokens = dummy_token_count;
       if (idle_block_input) {
         apply_idle_block_dummy_input(input_params, dummy_token_count, device_);
       }

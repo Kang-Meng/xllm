@@ -25,13 +25,18 @@ from xllm.python.attention.backend import (
     normalize_layer_caches,
 )
 from xllm.python.layers.attention import Attention
-from xllm.python.layers.npu.mega_moe_context_provider import (
-    create_token_owner_mega_moe_context_provider,
+from xllm.python.model_executor.execution_context import (
+    LayerCacheAwareExecutionMetadataBuilder,
 )
 from xllm.python.model_executor.forward_context import EplbRuntimeState, LayerSynchronizer
+from xllm.python.model_executor.input_batch import (
+    InputBatch,
+    InputBatchMetadata,
+)
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.platform import current_platform
+from xllm.python.registry import get_execution_metadata_builder_classes
 
 
 def _is_deepseek_v4_model_type(model_type: str) -> bool:
@@ -201,6 +206,15 @@ class ModelExecutor:
         self.decode_graph_runner = None
         self.inductor_runner = None
 
+        model_type = str(config.get("model_type", ""))
+        execution_metadata_builders = tuple(
+            builder
+            for builder_class in get_execution_metadata_builder_classes(model_type)
+            if (builder := builder_class.from_config(config)) is not None
+        )
+        self._execution_metadata_builders = execution_metadata_builders
+        self.eager_runner.bind_execution_metadata_builders(execution_metadata_builders)
+
         graph_backend = _resolve_graph_backend(config)
         if self.layerwise_split_size > 1 and graph_backend not in ("", "off", "none", "0"):
             raise NotImplementedError(
@@ -210,11 +224,6 @@ class ModelExecutor:
         dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
-        token_owner_mega_moe_provider = create_token_owner_mega_moe_context_provider(execution_model)
-        execution_context_providers = (
-            (token_owner_mega_moe_provider,) if token_owner_mega_moe_provider is not None else ()
-        )
-        self.eager_runner.bind_execution_context_providers(execution_context_providers)
         if dp_size > 1 and graph_backend not in (
             "",
             "off",
@@ -262,11 +271,10 @@ class ModelExecutor:
                 # width so a caller that passes num_decoding_tokens still wins
                 # (single source of truth, no param/config divergence).
                 num_decoding_tokens=num_decoding_tokens,
-                enable_mega_moe_token_mask=bool(
-                    config.get("enable_mega_moe", False) and token_owner_mega_moe_provider is None
-                ),
+                enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
                 is_spec_draft=is_spec_draft,
             )
+            self.decode_graph_runner.bind_execution_metadata_builders(execution_metadata_builders)
         else:
             if self.layerwise_split_size > 1:
                 raise NotImplementedError(
@@ -286,9 +294,7 @@ class ModelExecutor:
             from xllm.python.model_executor.runners.inductor import InductorRunner
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
-
-        if self.decode_graph_runner is not None:
-            self.decode_graph_runner.bind_execution_context_providers(execution_context_providers)
+            self.inductor_runner.bind_execution_metadata_builders(execution_metadata_builders)
 
     @staticmethod
     def _attention_config(layer: Attention) -> tuple[int, int, int, float, int]:
@@ -311,6 +317,9 @@ class ModelExecutor:
             indexed_caches = [cache for cache in layer_caches if cache.index is not None]
             if not indexed_caches or any(cache.kpool_tail is None for cache in indexed_caches):
                 raise ValueError("model requires a framework-managed kPool tail for every indexer layer")
+        for builder in self._execution_metadata_builders:
+            if isinstance(builder, LayerCacheAwareExecutionMetadataBuilder):
+                builder.bind_layer_caches(layer_caches)
         self.attention_backend.bind_kv_caches(layer_caches)
         self.eager_runner.bind_layer_caches(layer_caches)
         if self.decode_graph_runner is not None:
@@ -352,6 +361,7 @@ class ModelExecutor:
         expert_load_data: torch.Tensor | None = None,
         eplb_decode_token_mask: torch.Tensor | None = None,
         is_graph_warmup: bool = False,
+        input_batch_metadata: InputBatchMetadata | None = None,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
@@ -367,6 +377,18 @@ class ModelExecutor:
                 decode_token_mask=eplb_decode_token_mask,
                 is_graph_warmup=is_graph_warmup,
             )
+
+        input_batch = None
+        if self._execution_metadata_builders:
+            if input_batch_metadata is None:
+                raise RuntimeError("execution metadata builders require upstream InputBatch metadata")
+            input_batch = InputBatch.from_runtime(
+                input_ids,
+                positions,
+                input_batch_metadata,
+                is_dummy=bool(getattr(metadata, "is_dummy", False)),
+            )
+
         graph_runner = self.decode_graph_runner
         if (
             graph_runner is not None
@@ -385,6 +407,7 @@ class ModelExecutor:
                 metadata,
                 input_embedding,
                 eplb=eplb,
+                input_batch=input_batch,
             )
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(
@@ -392,14 +415,16 @@ class ModelExecutor:
                 positions,
                 metadata,
                 input_embedding,
-                layer_synchronizer,
-                eplb,
+                layer_synchronizer=layer_synchronizer,
+                eplb=eplb,
+                input_batch=input_batch,
             )
         return self.eager_runner.execute(
             input_ids,
             positions,
             metadata,
             input_embedding,
-            layer_synchronizer,
-            eplb,
+            layer_synchronizer=layer_synchronizer,
+            eplb=eplb,
+            input_batch=input_batch,
         )

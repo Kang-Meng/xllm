@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/kv_shard_batch_metadata.h"
 #include "core/runtime/py_attention_metadata.h"
+#include "core/runtime/py_input_batch.h"
 #include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
 
@@ -68,6 +69,7 @@ torch::Tensor slice_chunk_embeds(MMBatchData& mm_data,
 
 void register_xllm_runtime_module(py::module_& m) {
   register_attention_metadata_views(m);
+  register_input_batch_metadata_view(m);
 
   m.def("tp_all_reduce", [](torch::Tensor tensor) {
     PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
@@ -237,6 +239,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
 
   py::object py_metadata = py::cast(PyAttentionMetadataView(
       attn_metadata, params, args_.dummy_token_count()));
+  py::object py_input_batch_metadata =
+      py::cast(PyInputBatchMetadataView(params));
   py::object input_embedding =
       optional_tensor(params.embedding.input_embedding);
 
@@ -387,7 +391,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    py_sync,
                                    expert_load_data,
                                    eplb_decode_token_mask,
-                                   params.meta.is_graph_warmup);
+                                   params.meta.is_graph_warmup,
+                                   py_input_batch_metadata);
   if (py::isinstance<py::tuple>(hidden_obj)) {
     py::tuple output = hidden_obj.cast<py::tuple>();
     CHECK_EQ(output.size(), 2) << "Python model tuple output must be "

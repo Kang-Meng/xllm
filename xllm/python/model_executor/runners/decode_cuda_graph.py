@@ -27,6 +27,7 @@ from xllm.python.model_executor.forward_context import (
     LayerSynchronizer,
     forward_context,
 )
+from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.runners.base import BaseRunner
 
 _CAPTURE_WARMUP_STEPS = 2
@@ -186,7 +187,9 @@ class DecodeCudaGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
+        input_batch: InputBatch | None = None,
     ) -> torch.Tensor:
+        del input_batch
         batch_size = input_ids.shape[0]
         graph_key = self._graph_key(input_ids, metadata)
         if graph_key is None:

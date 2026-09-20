@@ -95,6 +95,11 @@ class BatchInputBuilder {
     BatchForwardType batch_forward_type;
     uint32_t max_seq_len = 0;
     uint32_t q_max_seq_len = 0;
+    // Authoritative request-scoped execution counts. Keep these independent
+    // from backend-specific attention layouts such as q_seq_lens.
+    std::vector<int32_t> num_scheduled_tokens;
+    std::vector<int32_t> num_computed_tokens;
+    std::vector<uint8_t> is_prefilling;
     // Tracking token counts in KV cache for linear-attention state setup.
     std::vector<int32_t> kv_cache_tokens_nums;
 #if defined(USE_NPU)

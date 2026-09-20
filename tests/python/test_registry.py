@@ -38,3 +38,26 @@ def test_glm5_next_text_and_vl_registry_entries_are_distinct(monkeypatch: pytest
 
     assert text_cls.__name__ == "Glm5NextForCausalLM"
     assert vl_cls.__name__ == "Glm5NextVLModel"
+
+
+def test_qwen35_registers_execution_metadata_builder_class() -> None:
+    builder_classes = registry.get_execution_metadata_builder_classes("qwen3_5_moe_text")
+
+    assert tuple(builder_class.__name__ for builder_class in builder_classes) == (
+        "TokenOwnerMegaMoeMetadataBuilder",
+        "Qwen3_5GdnMetadataBuilder",
+    )
+
+
+def test_qwen35_uses_official_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
+
+    model_class = registry.get_model_class("qwen3_5_moe_text")
+
+    assert model_class.__name__ == "Qwen3_5ForCausalLM"
+
+
+def test_model_without_execution_metadata_builder_returns_empty_tuple() -> None:
+    assert registry.get_execution_metadata_builder_classes("qwen3") == ()

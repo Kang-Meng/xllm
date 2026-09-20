@@ -25,14 +25,15 @@ from xllm.python.attention.backend import (
     AttentionMetadata,
     LayerCache,
 )
-from xllm.python.model_executor.execution_context import ExecutionContextProvider
+from xllm.python.model_executor.execution_context import ExecutionMetadataBuilder
 from xllm.python.model_executor.forward_context import EplbRuntimeState, LayerSynchronizer
+from xllm.python.model_executor.input_batch import InputBatch
 
 ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 class BaseRunner(ABC):
-    execution_context_providers: tuple[ExecutionContextProvider, ...] = ()
+    execution_metadata_builders: tuple[ExecutionMetadataBuilder, ...] = ()
 
     def __init__(
         self,
@@ -44,16 +45,16 @@ class BaseRunner(ABC):
         self.attention_backend = attention_backend
         self.device = device
         self.layer_caches: list[LayerCache] = []
-        self.execution_context_providers = ()
+        self.execution_metadata_builders = ()
 
     def bind_layer_caches(self, layer_caches: list[LayerCache]) -> None:
         self.layer_caches = layer_caches
 
-    def bind_execution_context_providers(
+    def bind_execution_metadata_builders(
         self,
-        providers: Sequence[ExecutionContextProvider],
+        builders: Sequence[ExecutionMetadataBuilder],
     ) -> None:
-        self.execution_context_providers = tuple(providers)
+        self.execution_metadata_builders = tuple(builders)
 
     @abstractmethod
     def execute(
@@ -64,5 +65,6 @@ class BaseRunner(ABC):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
+        input_batch: InputBatch | None = None,
     ) -> ModelExecutionOutput:
         pass

@@ -602,6 +602,47 @@ TEST(BatchInputBuilderTest, DSV4PartialBlockIsRepeatedOnNextChunk) {
             2u);
 }
 
+TEST(BatchInputBuilderTest, RecordsPrefillStageBeforeAdvancingKvCount) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(4);
+  BlockManagerImpl manager(options);
+
+  Sequence full_prefill = make_basic_sequence({1, 2, 3, 4});
+  full_prefill.add_blocks(BlockType::KV, manager.allocate(1));
+
+  Sequence final_chunk =
+      make_basic_sequence({5, 6, 7, 8, 9, 10, 11, 12}, /*index=*/1);
+  final_chunk.add_blocks(BlockType::KV, manager.allocate(2));
+  final_chunk.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
+
+  ASSERT_TRUE(full_prefill.is_prefill_stage());
+  ASSERT_TRUE(final_chunk.is_prefill_stage());
+  std::vector<Sequence*> sequences = {&full_prefill, &final_chunk};
+  std::vector<uint32_t> allowed_max_tokens = {4, 4};
+  std::vector<torch::Tensor> input_embeddings;
+  std::vector<MMData> mm_data;
+  BatchInputBuilder builder(sequences,
+                            allowed_max_tokens,
+                            input_embeddings,
+                            mm_data,
+                            /*swap_block_transfer_infos=*/nullptr,
+                            /*batch_id=*/0,
+                            /*args=*/nullptr,
+                            BatchForwardType::PREFILL);
+
+  ForwardInput input = builder.build_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
+
+  EXPECT_FALSE(full_prefill.is_prefill_stage());
+  EXPECT_FALSE(final_chunk.is_prefill_stage());
+  EXPECT_EQ(input.input_params.execution_batch.num_scheduled_tokens,
+            (std::vector<int32_t>{4, 4}));
+  EXPECT_EQ(input.input_params.execution_batch.num_computed_tokens,
+            (std::vector<int32_t>{0, 4}));
+  EXPECT_EQ(input.input_params.execution_batch.is_prefilling,
+            (std::vector<uint8_t>{1, 1}));
+}
+
 TEST(BatchTest, ProcessSampleOutputStoresMtpBootstrapEmbedding) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(4);

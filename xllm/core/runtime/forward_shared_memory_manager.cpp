@@ -2517,6 +2517,12 @@ inline void deserialize_forward_input_payload(
   read_data(context, input_params.meta.q_max_seq_len);
   read_data(context, input_params.meta.batch_id);
   read_data(context, input_params.meta.is_graph_warmup);
+  read_data(context, input_params.execution_batch.num_reqs);
+  read_data(context, input_params.execution_batch.num_tokens);
+  read_vector(context, input_params.execution_batch.num_scheduled_tokens);
+  read_vector(context, input_params.execution_batch.num_computed_tokens);
+  read_vector(context, input_params.execution_batch.query_start_loc);
+  read_vector(context, input_params.execution_batch.is_prefilling);
   read_tensor_and_vector(context,
                          input_params.attention.device.q_seq_lens,
                          input_params.attention.host.q_seq_lens,
@@ -2994,6 +3000,15 @@ inline void serialize_forward_input_sections(
   write_data(context.descriptor, input_params.meta.q_max_seq_len);
   write_data(context.descriptor, input_params.meta.batch_id);
   write_data(context.descriptor, input_params.meta.is_graph_warmup);
+  write_data(context.descriptor, input_params.execution_batch.num_reqs);
+  write_data(context.descriptor, input_params.execution_batch.num_tokens);
+  write_vector(context.descriptor,
+               input_params.execution_batch.num_scheduled_tokens);
+  write_vector(context.descriptor,
+               input_params.execution_batch.num_computed_tokens);
+  write_vector(context.descriptor,
+               input_params.execution_batch.query_start_loc);
+  write_vector(context.descriptor, input_params.execution_batch.is_prefilling);
 
   write_host_vector_or_tensor(context,
                               input_params.attention.host.q_seq_lens,

@@ -29,6 +29,7 @@ def test_executor_forwards_worker_eplb_state_to_eager_runner() -> None:
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = None
     executor.inductor_runner = None
+    executor._execution_metadata_builders = ()
     executor.eager_runner = MagicMock()
     executor.eager_runner.execute.return_value = torch.ones(1)
 
@@ -45,7 +46,7 @@ def test_executor_forwards_worker_eplb_state_to_eager_runner() -> None:
         is_graph_warmup=True,
     )
 
-    state = executor.eager_runner.execute.call_args.args[-1]
+    state = executor.eager_runner.execute.call_args.kwargs["eplb"]
     assert isinstance(state, EplbRuntimeState)
     assert state.expert_load_data is expert_load_data
     assert state.decode_token_mask is decode_token_mask
