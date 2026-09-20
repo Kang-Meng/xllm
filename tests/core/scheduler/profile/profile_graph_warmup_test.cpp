@@ -188,10 +188,10 @@ class RecordingProfileEngine final : public Engine {
 
   const ModelArgs& model_args() const override { return model_args_; }
 
-  runtime::DecodeGraphExecutionShape decode_graph_execution_shape()
-      const override {
-    return make_decode_graph_execution_shape(
-        num_speculative_tokens_ + 1, num_speculative_tokens_, false);
+  runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const override {
+    return make_decode_graph_warmup_config(num_speculative_tokens_ + 1,
+                                           num_speculative_tokens_,
+                                           /*enable_no_padding=*/false);
   }
 
   std::vector<int64_t> get_active_activation_memory() const override {

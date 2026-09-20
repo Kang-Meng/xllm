@@ -486,30 +486,8 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
   }
 
   const size_t kv_cache_tokens_num = seq->kv_cache_tokens_num();
-  size_t max_handle_num_tokens =
+  const size_t max_handle_num_tokens =
       std::min(kv_cache_tokens_num + token_budget, seq->num_tokens());
-
-  // Linear-state block alignment: for models with linear attention layers +
-  // prefix cache, chunk boundaries must align to chunk_stride so linear-state
-  // checkpoints land at recoverable positions.
-  if (has_linear_attention_layers(state.model_args) &&
-      state.enable_prefix_cache && seq->is_prefill_stage()) {
-    const size_t chunk_stride =
-        static_cast<size_t>(::xllm::SchedulerConfig::get_instance()
-                                .max_tokens_per_chunk_for_prefill());
-    const size_t aligned =
-        (max_handle_num_tokens / chunk_stride) * chunk_stride;
-    if (aligned <= kv_cache_tokens_num) {
-      if (max_handle_num_tokens == seq->num_tokens()) {
-        // Final chunk: allow unaligned to complete the sequence.
-      } else {
-        *actual_tokens = 0;
-        return false;
-      }
-    } else {
-      max_handle_num_tokens = aligned;
-    }
-  }
 
   CHECK_GT(max_handle_num_tokens, kv_cache_tokens_num);
   *actual_tokens = max_handle_num_tokens - kv_cache_tokens_num;
@@ -725,12 +703,32 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
         if (sequence->finished()) {
           continue;
         }
+        const bool is_prefill = sequence->is_prefill_stage();
+        const size_t remaining_tokens =
+            budget.remaining_token_budget - allocated_tokens;
+        size_t num_tokens = state.min_speculative_tokens_required + 1;
+        if (is_prefill) {
+          allocate_shared_blocks_for(sequence.get(), state);
+          num_tokens = std::min(
+              compute_prefill_tokens(sequence.get(), remaining_tokens, state),
+              sequence->num_need_compute_tokens());
+        }
+        if (num_tokens == 0 || num_tokens > remaining_tokens ||
+            allocated_seqs >= budget.remaining_seq_budget) {
+          has_enough_budget = false;
+          break;
+        }
         double seq_estimate_latency = 0;
         if (options_.enable_latency_aware_schedule() &&
             !(options_.instance_role().has_value() &&
               options_.instance_role().value() == InstanceRole::PREFILL)) {
           seq_estimate_latency =
-              state.profile_manager->predict_step_time(sequence.get(), false);
+              is_prefill ? state.profile_manager->predict_step_time(
+                               sequence->kv_cache_tokens_num() + num_tokens,
+                               sequence->kv_cache_tokens_num(),
+                               false)
+                         : state.profile_manager->predict_step_time(
+                               sequence.get(), false);
           if (budget.estimate_latency + allocated_estimate_latency +
                   seq_estimate_latency >
               budget.latency_budget) {
@@ -738,28 +736,28 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
             break;
           }
         }
-        if (allocated_tokens + state.min_speculative_tokens_required >=
-                budget.remaining_token_budget ||
-            allocated_seqs >= budget.remaining_seq_budget) {
-          has_enough_budget = false;
-          break;
-        }
-        size_t updated_num_tokens =
-            sequence->num_tokens() + state.min_speculative_tokens_required;
-        if (!state.kv_cache_manager->allocate(sequence.get(),
-                                              updated_num_tokens)) {
+        const bool allocated =
+            is_prefill ? allocate_for_prefill(sequence.get(),
+                                              num_tokens,
+                                              &num_tokens,
+                                              state,
+                                              /*skip_shared=*/true)
+                       : state.kv_cache_manager->allocate(
+                             sequence.get(),
+                             sequence->num_tokens() +
+                                 state.min_speculative_tokens_required);
+        if (!allocated) {
           has_enough_blocks = false;
           break;
         }
         if (sequence->if_cache_block_for_prefill()) {
           state.kv_cache_manager->cache(sequence.get());
         }
-        allocated_tokens += state.min_speculative_tokens_required + 1;
+        allocated_tokens += num_tokens;
         allocated_seqs += 1;
         allocated_estimate_latency += seq_estimate_latency;
         candidate_sequences.emplace_back(sequence.get());
-        candidate_token_budgets.emplace_back(
-            state.min_speculative_tokens_required + 1);
+        candidate_token_budgets.emplace_back(num_tokens);
       }
     }
 
