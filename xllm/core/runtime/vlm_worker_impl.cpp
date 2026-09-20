@@ -271,17 +271,9 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
 
 std::optional<ForwardOutput> VLMWorkerImpl::step_for_schedule_overlap(
     ForwardInput& input) {
-  // A VLM frontend can still be a linear-attention model (e.g. GLM-5.3-Flash-VL
-  // carries KDA recurrent layers). prepare_work_before_execute_on_stream defers
-  // the slot restore whenever schedule overlap is on, so mirror LLMWorkerImpl
-  // and restore here (worker thread, on compute_stream_) before the forward.
-  // The single-threaded worker pool keeps chunk N's restore stream-ordered
-  // after chunk N-1's forward without a cross-stream barrier. Dense VLMs have
-  // no recurrent state, so try_restore_linear_state_slots is a no-op for them
-  // and this preamble reduces to the plain fast path.
   if (has_linear_attention_layers(context_.get_model_args())) {
-    c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
-    try_restore_linear_state_slots(input.input_params);
+    c10::StreamGuard state_guard = compute_stream_->set_stream_guard();
+    prepare_linear_state_cache(input.input_params);
   }
   return execute_no_sync_on_stream(input, *compute_stream_);
 }

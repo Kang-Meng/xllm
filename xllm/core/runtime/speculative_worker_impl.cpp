@@ -504,19 +504,6 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   validate_input.device_tensors_ready = true;
 }
 
-void SpeculativeWorkerImpl::prepare_work_before_execute(
-    const ForwardInput& input,
-    ForwardInput& processed_input) {
-  // The composite owns no KV cache. Preserve linear-state metadata for the
-  // target leaf, which prepares and restores its own recurrent cache before
-  // execution.
-  prepare_work_before_execute_on_stream(input,
-                                        processed_input,
-                                        *prepare_stream_,
-                                        /*record_ready_event=*/true,
-                                        /*restore_linear_state=*/false);
-}
-
 // Per-seq adaptive validate builder: each sequence contributes
 // per_seq_val_tokens[i] rows instead of a uniform N+1. Only implements the
 // chunked-prefill (non-atb_spec_kernel) path since DFlash/DSpark require

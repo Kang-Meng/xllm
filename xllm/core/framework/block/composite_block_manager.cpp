@@ -73,14 +73,6 @@ void publish_blocks(Sequence* seq,
   kv.set_num_cached_blocks(type, end);
 }
 
-// Whether a leaf of the given BlockType participates in prefix cache under
-// the current role. On the PREFILL side (instance_is_decode == false) every
-// cache-bearing leaf participates. On the DECODE side we skip SWA and
-// LINEAR because the D forward never reads their shared prefix before P
-// overwrites it -- SWA hits carry gap-invalid placeholders that would break
-// the grouped-response CHECK, and LINEAR restore is a net waste (D does no
-// prefill). EMBEDDING has never had a prefix cache and stays out on both sides.
-//
 // Host offload is intentionally broader than this predicate: decode keeps an
 // offload-only SWA Host leaf, while this predicate still prevents SWA from
 // being probed or restored as a prefix.
@@ -163,26 +155,12 @@ CompositeBlockManager::LeafMap build_composite_leaves(
   const bool kv_participates =
       leaf_participates_in_prefix_cache(BlockType::KV, is_decode);
 
-  // LINEAR resource leaf (Qwen3.5-Next GDN). Additive on top of the KV
-  // family: a GDN model holds both KV and LINEAR. Not an admission leaf
-  // (block_size==1 would misreport pool capacity). Scheduler-thread only, so
-  // no ConcurrentBlockManagerImpl wrap. supports_prefix_cache follows the
-  // role predicate; on DECODE it is off so probe_prefix_cache skips the
-  // leaf and the composite classifies FLAT_KV_LINEAR down to FLAT_KV.
   if (options.enable_linear_state()) {
     CHECK_GT(options.linear_state_num_slots(), 0)
         << "linear_state_num_slots must be set when linear state is enabled";
     const bool linear_prefix_cache = prefix_cache_on && linear_participates;
     int32_t chunk_stride =
         SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
-    // The chunk stride is the checkpoint boundary for the LINEAR prefix cache.
-    // It only matters when that cache is on (PREFILL role); the LINEAR leaf
-    // holds no token cache otherwise (see set_kv_cache_info's LINEAR skip) and
-    // each sequence takes exactly one slot regardless of block_size. When the
-    // cache is off (DECODE role) chunked prefill is legitimately disabled and
-    // the stride is left at its -1 default, so require a positive stride only
-    // when the LINEAR prefix cache is actually enabled, and fall back to a
-    // valid positive block_size otherwise so the pool sizing stays well-formed.
     if (linear_prefix_cache) {
       CHECK_GT(chunk_stride, 0) << "max_tokens_per_chunk_for_prefill must be "
                                    "positive for linear state prefix cache";
@@ -192,10 +170,13 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     leaves.emplace(
         BlockType::LINEAR,
         CompositeBlockManager::LeafEntry{
-            std::make_unique<LinearStateBlockManager>(
-                static_cast<uint32_t>(options.linear_state_num_slots()),
-                chunk_stride,
-                linear_prefix_cache),
+            maybe_concurrent(
+                std::make_unique<LinearStateBlockManager>(
+                    static_cast<uint32_t>(options.linear_state_num_slots()),
+                    chunk_stride,
+                    linear_prefix_cache,
+                    is_decode),
+                options),
             /*participates_in_admission=*/false,
             /*supports_prefix_cache=*/linear_prefix_cache});
   }
@@ -340,7 +321,7 @@ BlockManager* CompositeBlockManager::leaf_of(BlockType type) const {
 }
 
 void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
-  if (seq == nullptr) {
+  if (seq == nullptr || seq->is_graph_warmup()) {
     return;
   }
   KVCacheState& kv = seq->kv_state();
@@ -374,9 +355,6 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
   }
 
   for (auto& [type, entry] : leaves_) {
-    // EMBEDDING / LINEAR hold no token cache. KV also participates here so a
-    // Host-restored prefix is published immediately after its HBM destination
-    // blocks are allocated; cache_for_sequence later flushes only the tail.
     if (type == BlockType::EMBEDDING || type == BlockType::LINEAR) {
       continue;
     }
@@ -445,7 +423,6 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   // on failure). Stage keyed by BlockType; commit only after every leaf
   // succeeds so a failure rolls back cleanly.
   std::map<BlockType, std::vector<Block>> staged;
-
   auto release_staged = [&]() {
     for (auto& [type, blocks] : staged) {
       leaf_of(type)->deallocate(blocks);
@@ -454,8 +431,7 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   };
 
   for (auto& [type, entry] : leaves_) {
-    std::optional<std::vector<Block>> blocks =
-        entry.leaf->allocate_for_sequence(seq, num_tokens);
+    auto blocks = entry.leaf->allocate_for_sequence(seq, num_tokens);
     if (!blocks.has_value()) {
       release_staged();
       return false;
@@ -592,13 +568,10 @@ using ProbeResult = CompositeBlockManager::ProbeResult;
 
 // Trim outcome. `to_mount` feeds the shape's mount step; `to_drop` goes to
 // leaf->deallocate() (cache release, not physical free).
-// `linear_restore_src`, when set, is the LINEAR checkpoint that the caller
-// stashes via Sequence::set_linear_restore_src_block.
 struct TrimOutcome {
   std::vector<ProbeResult> to_mount;
   std::vector<ProbeResult> to_drop;
   size_t safe_hit_tokens = 0;
-  std::optional<Block> linear_restore_src;
 };
 
 std::optional<ProbeResult> take_probe(std::vector<ProbeResult>& probes,
@@ -643,7 +616,6 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
         const size_t linear_index = safe_hit_tokens / linear->block_size - 1;
         if (linear_index < linear->blocks.size() &&
             linear->blocks[linear_index].is_valid()) {
-          out.linear_restore_src = std::move(linear->blocks[linear_index]);
           break;
         }
       }
@@ -665,6 +637,18 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
   }
   out.safe_hit_tokens = safe_count * kv_block_size;
   out.to_mount = std::move(probes);
+  if (linear.has_value()) {
+    if (out.safe_hit_tokens > 0) {
+      const size_t source_index = out.safe_hit_tokens / linear->block_size - 1;
+      std::vector<Block> source_blocks(source_index + 1);
+      source_blocks.back() = std::move(linear->blocks[source_index]);
+      out.to_mount.emplace_back(ProbeResult{linear->type,
+                                            linear->leaf,
+                                            std::move(source_blocks),
+                                            linear->block_size});
+    }
+    out.to_drop.emplace_back(std::move(*linear));
+  }
   return out;
 }
 
@@ -762,6 +746,10 @@ void CompositeBlockManager::allocate_shared_for_sequence(Sequence* seq) {
   if (seq == nullptr || combination_ == LeafCombination::UNSUPPORTED) {
     return;
   }
+  if (combination_ == LeafCombination::FLAT_KV_LINEAR &&
+      seq->kv_state().prefix_cache_matched()) {
+    return;
+  }
   std::vector<ProbeResult> probes = probe_prefix_cache(seq, leaves_);
   if (probes.empty()) {
     seq->kv_state().set_prefix_cache_matched();
@@ -784,9 +772,6 @@ void CompositeBlockManager::allocate_shared_for_sequence(Sequence* seq) {
   }
 
   release_probes(&trimmed.to_drop);
-  if (trimmed.linear_restore_src.has_value()) {
-    seq->set_linear_restore_src_block(std::move(*trimmed.linear_restore_src));
-  }
 
   // FLAT_KV{,_LINEAR} defer to Sequence::add_shared_blocks, which owns replace
   // and exact-repeat. Composite layouts mount every leaf before advancing the
@@ -794,9 +779,13 @@ void CompositeBlockManager::allocate_shared_for_sequence(Sequence* seq) {
   switch (combination_) {
     case LeafCombination::FLAT_KV:
     case LeafCombination::FLAT_KV_LINEAR: {
-      if (!trimmed.to_mount.empty()) {
-        ProbeResult& kv = trimmed.to_mount.front();
-        seq->add_shared_blocks(kv.type, std::move(kv.blocks));
+      for (ProbeResult& probe : trimmed.to_mount) {
+        if (probe.type == BlockType::LINEAR) {
+          seq->kv_state().mount_composite_shared(probe.type,
+                                                 std::move(probe.blocks));
+        } else {
+          seq->add_shared_blocks(probe.type, std::move(probe.blocks));
+        }
       }
       break;
     }
@@ -823,7 +812,8 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq,
   // Chunked-prefill mid-step: only KV needs a token-clamped flush now;
   // SWA / C4 / C128 get their flush from the pre-grow hook at the top of
   // the next allocate_sequence.
-  if (seq == nullptr || combination_ == LeafCombination::UNSUPPORTED) {
+  if (seq == nullptr || seq->is_graph_warmup() ||
+      combination_ == LeafCombination::UNSUPPORTED) {
     return;
   }
   switch (combination_) {

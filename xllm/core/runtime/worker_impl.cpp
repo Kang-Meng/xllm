@@ -361,11 +361,11 @@ LinearStateInputRows get_mlu_linear_state_rows(ModelInputParams& input_params) {
           ? static_cast<int64_t>(host_q_seq_lens.size()) - 1
           : static_cast<int64_t>(
                 input_params.attention.host.kpool_query_lens.size());
-  const int64_t cache_op_rows =
-      static_cast<int64_t>(input_params.linear_state_cache_ops.size());
+  const int64_t slot_rows =
+      static_cast<int64_t>(input_params.embedding.linear_state_ids.size());
 
   // A data-parallel worker may receive an empty shard during graph warmup.
-  if (sequence_rows == 0 && active_rows == -1 && cache_op_rows == 0) {
+  if (sequence_rows == 0 && active_rows == -1 && slot_rows == 0) {
     input_params.embedding.linear_state_ids = {kPaddingLinearStateId};
     return {{}, 0, /*empty_shard=*/true};
   }
@@ -373,21 +373,21 @@ LinearStateInputRows get_mlu_linear_state_rows(ModelInputParams& input_params) {
   CHECK_GT(sequence_rows, 0)
       << "invalid MLU linear-state input row counts: sequence_rows="
       << sequence_rows << ", active_rows=" << active_rows
-      << ", cache_op_rows=" << cache_op_rows;
+      << ", slot_rows=" << slot_rows;
   CHECK_GT(active_rows, 0)
       << "invalid MLU linear-state input row counts: sequence_rows="
       << sequence_rows << ", active_rows=" << active_rows
-      << ", cache_op_rows=" << cache_op_rows;
+      << ", slot_rows=" << slot_rows;
   CHECK_EQ(host_q_seq_lens.front(), 0)
       << "MLU linear-state q_seq_lens must start with zero";
   CHECK_EQ(active_rows % sequence_rows, 0)
       << "invalid MLU linear-state input row counts: sequence_rows="
       << sequence_rows << ", active_rows=" << active_rows
-      << ", cache_op_rows=" << cache_op_rows;
-  CHECK_EQ(cache_op_rows, active_rows)
+      << ", slot_rows=" << slot_rows;
+  CHECK_EQ(slot_rows, active_rows)
       << "invalid MLU linear-state input row counts: sequence_rows="
       << sequence_rows << ", active_rows=" << active_rows
-      << ", cache_op_rows=" << cache_op_rows;
+      << ", slot_rows=" << slot_rows;
   return {cached_tokens, active_rows, /*empty_shard=*/false};
 }
 #endif
@@ -406,23 +406,6 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
   }
   input_params.linear_state_validity_mask =
       build_linear_state_mask(rows.cached_tokens, rows.active_rows);
-  // MTP spec-verify expands one logical sequence into multiple active rows
-  // (bonus + drafted tokens) that share ONE linear state slot. cache_ops are
-  // built per logical sequence while the restore contract is one op per
-  // active row (validity_mask is indexed by row); replicate each op across
-  // its contiguous row group, mirroring build_linear_state_mask's layout.
-  auto& cache_ops = input_params.linear_state_cache_ops;
-  const size_t row_count = input_params.linear_state_validity_mask.size();
-  if (!cache_ops.empty() && row_count > cache_ops.size() &&
-      row_count % cache_ops.size() == 0) {
-    const size_t repeat = row_count / cache_ops.size();
-    std::vector<LinearStateCacheOp> expanded;
-    expanded.reserve(row_count);
-    for (const LinearStateCacheOp& cache_op : cache_ops) {
-      expanded.insert(expanded.end(), repeat, cache_op);
-    }
-    cache_ops = std::move(expanded);
-  }
 }
 #endif
 
@@ -916,29 +899,32 @@ ForwardInput WorkerImpl::update_input_by_last_step_output(
 }
 
 bool WorkerImpl::owns_recurrent_cache() const {
-  return std::any_of(
-      kv_caches_.begin(), kv_caches_.end(), [](const KVCache& kv_cache) {
-        return kv_cache.get_ssm_cache().defined();
-      });
+  return has_request_state_cache();
 }
 
-void WorkerImpl::try_restore_linear_state_slots(ModelInputParams& params) {
+void WorkerImpl::prepare_linear_state_cache(ModelInputParams& params) {
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_CUDA) || \
     defined(USE_MUSA)
-  if (!has_linear_attention_layers(context_.get_model_args())) {
-    return;
-  }
-  // A composite worker (e.g. MTPWorkerImpl) carries the TARGET model args but
-  // never allocates its own kv_caches_ — its inner impls each own caches and
-  // run their own restore. Skip the restore when this worker holds no
-  // recurrent cache; restoring into an unallocated pool is a hard CHECK
-  // inside restore_linear_state_slots.
   if (!owns_recurrent_cache()) {
     return;
   }
+
+  bool reads_distinct_state = false;
+#if defined(USE_NPU)
+  const ModelArgs& args = context_.get_model_args();
+  const bool is_python_model = ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl());
+  reads_distinct_state =
+      (is_python_model && args.model_type() == "glm5_next" &&
+       params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) ||
+      (!is_python_model && is_qwen3_5_target_model_type(args.model_type()));
+#endif
+  // TODO: need remove when all device support none D2D
   restore_linear_state_slots(kv_caches_,
-                             params.linear_state_cache_ops,
-                             params.linear_state_validity_mask);
+                             params.embedding.linear_state_ids,
+                             params.embedding.linear_state_read_ids,
+                             params.linear_state_validity_mask,
+                             reads_distinct_state);
 #endif
 }
 
@@ -946,29 +932,11 @@ std::optional<ForwardOutput> WorkerImpl::step_for_schedule_overlap(
     ForwardInput& input) {
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_CUDA) || \
     defined(USE_MUSA)
-  // prepare_work_before_execute_on_stream defers the linear-state restore
-  // whenever schedule overlap is on (see the enable_schedule_overlap() gate
-  // there). A worker that owns a recurrent cache must therefore perform the
-  // restore here, on compute_stream_ in the worker thread, so chunk N's
-  // checkpoint copy is stream-ordered after chunk N-1's forward. LLMWorkerImpl
-  // overrides this to drop the default-stream sync via
-  // execute_no_sync_on_stream; other frontends (VLMWorkerImpl, future
-  // model-impl paths) inherit this base version. Gate on owns_recurrent_cache()
-  // so speculative/MTP outer workers -- which carry linear-attention target
-  // args but allocate no kv_caches_ -- keep the historical return step(input)
-  // fast path instead of being pulled onto compute_stream_ for a restore that
-  // would be a no-op anyway.
   if (owns_recurrent_cache()) {
-    // The StreamGuard here brackets BOTH the restore and step(input) so the
-    // forward is guaranteed to read the just-restored slots even if
-    // compute_stream_ becomes a distinct pooled stream in the future.
     c10::StreamGuard compute_guard = compute_stream_->set_stream_guard();
-    // step() will run on compute_stream_ inside this guard, so wait on the
-    // event that publishes prepare_stream_'s H2D copies before either the
-    // restore or the forward observes them.
     CHECK(compute_stream_->wait_event(input.metadata_ready_event))
         << "failed to wait input metadata ready event on compute stream";
-    try_restore_linear_state_slots(input.input_params);
+    prepare_linear_state_cache(input.input_params);
     return step(input);
   }
 #endif
@@ -1327,16 +1295,12 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     const ForwardInput& input,
     ForwardInput& processed_input,
     Stream& prepare_stream,
-    bool record_ready_event,
-    bool restore_linear_state) {
+    bool record_ready_event) {
   if (!input.json_object_state_snapshots.empty()) {
     ForwardInput restored_input = input;
     restore_json_object_states(restored_input);
-    prepare_work_before_execute_on_stream(restored_input,
-                                          processed_input,
-                                          prepare_stream,
-                                          record_ready_event,
-                                          restore_linear_state);
+    prepare_work_before_execute_on_stream(
+        restored_input, processed_input, prepare_stream, record_ready_event);
     return;
   }
 #if defined(USE_NPU)
@@ -1446,17 +1410,8 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     // draft operations and fail discover_num_slots().
     if (has_request_state_cache()) {
       prepare_input_params_for_linear_attention(input_params);
-      // Non-overlap path: restore on the current prepare_stream_ (installed
-      // by the outer StreamGuard) so the restore copy is ordered with the
-      // subsequent metadata_ready_event that the forward will wait on.
-      // Under schedule_overlap chunked prefill the previous chunk's forward
-      // runs on compute_stream_ from a worker thread that may not have
-      // enqueued its kernels yet when this prepare runs on the main thread.
-      // Defer the slot-restore copy to step_for_schedule_overlap (worker
-      // thread, on compute_stream_) so stream ordering between chunk N-1
-      // writes and chunk N restore is automatic.
-      if (restore_linear_state && !enable_schedule_overlap()) {
-        try_restore_linear_state_slots(input_params);
+      if (!enable_schedule_overlap()) {
+        prepare_linear_state_cache(input_params);
       }
     }
 #endif

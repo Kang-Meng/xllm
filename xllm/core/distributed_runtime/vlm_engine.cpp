@@ -155,6 +155,7 @@ bool VLMEngine::init_model(MasterStatus master_status) {
   CHECK(tokenizer_ != nullptr);
 
   args_ = model_loader->model_args();
+  configure_prefix_cache(options_);
   quant_args_ = model_loader->quant_args();
   tokenizer_args_ = model_loader->tokenizer_args();
 
@@ -301,10 +302,7 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
   estimate_options.is_draft_engine = options_.is_draft_engine();
   estimate_options.enable_chunked_prefill = options_.enable_chunked_prefill();
   estimate_options.enable_schedule_overlap = options_.enable_schedule_overlap();
-  const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
-  estimate_options.enable_prefix_cache =
-      kv_cache_config.enable_prefix_cache() &&
-      !kv_cache_config.enable_xtensor();
+  estimate_options.enable_prefix_cache = options_.enable_prefix_cache();
   estimate_options.enable_disagg_pd = options_.enable_disagg_pd();
   estimate_options.instance_role = options_.instance_role();
 
@@ -387,9 +385,6 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_speculative_tokens(options_.num_speculative_tokens())
       .num_embedding_blocks(
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
-      // DECODE-side prefix cache participation is per-leaf and gated by the
-      // predicate in composite_block_manager.cpp; mirror llm_engine so a
-      // linear-attention VLM decode instance disables the LINEAR prefix cache.
       .instance_is_decode(options_.instance_role() == InstanceRole::DECODE);
   if (enable_state_cache) {
     // The unified state slot pool spans all physical slots [0, N); it can

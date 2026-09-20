@@ -222,33 +222,21 @@ PyAttentionMetadataView::PyAttentionMetadataView(
   new_cache_slots_host_values_ = params.attention.host.new_cache_slots;
   multi_block_tables_ = params.multi_block_tables;
   linear_state_indices_ = params.embedding.linear_state_indices;
-  const auto& cache_ops = params.linear_state_cache_ops;
-  const bool has_direct_read = std::any_of(
-      cache_ops.begin(), cache_ops.end(), [](const LinearStateCacheOp& op) {
-        return op.is_direct_read();
-      });
-  if (has_direct_read) {
-    CHECK((metadata_->is_prefill || metadata_->is_chunked_prefill) &&
-          !params.is_spec_verify)
-        << "linear-state direct read is only supported for non-speculative "
-           "prefill";
+  if (!params.embedding.linear_state_read_ids.empty() &&
+      (metadata_->is_prefill || metadata_->is_chunked_prefill) &&
+      params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) {
     CHECK(linear_state_indices_.defined());
-    CHECK_EQ(cache_ops.size(), params.embedding.linear_state_ids.size())
-        << "direct-read cache ops must align with host linear-state ids";
-    CHECK_EQ(cache_ops.size(),
+    CHECK_EQ(params.embedding.linear_state_read_ids.size(),
+             params.embedding.linear_state_ids.size());
+    CHECK_EQ(params.embedding.linear_state_read_ids.size(),
              static_cast<size_t>(linear_state_indices_.numel()))
-        << "direct-read cache ops must align with Python metadata rows";
-
-    std::vector<int32_t> read_ids = params.embedding.linear_state_ids;
-    for (size_t i = 0; i < cache_ops.size(); ++i) {
-      const LinearStateCacheOp& cache_op = cache_ops[i];
-      if (cache_op.is_direct_read()) {
-        read_ids[i] = cache_op.restore_src_slot_id;
-      }
+        << "linear-state read ids must align with Python metadata rows";
+    linear_state_read_indices_ = params.embedding.linear_state_read_indices;
+    if (!linear_state_read_indices_.defined()) {
+      linear_state_read_indices_ =
+          torch::tensor(params.embedding.linear_state_read_ids, torch::kInt32)
+              .to(linear_state_indices_.device());
     }
-    linear_state_read_indices_ =
-        torch::tensor(read_ids, torch::TensorOptions().dtype(torch::kInt32))
-            .to(linear_state_indices_.device());
   }
   raw_dp_execution_token_counts_ =
       params.parallel.raw_dp_global_token_nums.empty()

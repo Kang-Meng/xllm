@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <functional>
 #include <numeric>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1130,7 +1131,11 @@ TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
   EXPECT_EQ(restored.kpool_layout(), KPoolCacheLayout::COMPRESSED_WITH_TAIL);
   const int64_t expected_tail_len = Platform::is_npu() ? 9 : 16;
   EXPECT_EQ(restored.kpool_tail_shape(),
-            (std::vector<int64_t>{5, 2, expected_tail_len, 16}));
+            (std::vector<int64_t>{
+                capacity.num_linear_state_blocks(), 2, expected_tail_len, 16}));
+  ASSERT_TRUE(restored.has_index_cache_shape());
+  EXPECT_EQ(restored.index_cache_shape().front(), capacity.n_blocks());
+  EXPECT_NE(capacity.num_linear_state_blocks(), capacity.n_blocks());
 #if !defined(USE_NPU)
   KVCacheCreateOptions create_options;
   create_options.enable_lighting_indexer(true).dtype(torch::kBFloat16);
@@ -1144,7 +1149,10 @@ TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
   for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
     allocated_bytes += tensor.tensor.numel() * tensor.tensor.element_size();
   }
-  EXPECT_EQ(allocated_bytes, capacity.n_blocks() * 1152 + 5120);
+  EXPECT_EQ(allocated_bytes,
+            capacity.n_blocks() * 1152 + capacity.num_linear_state_blocks() *
+                                             2 * expected_tail_len * 16 *
+                                             sizeof(uint16_t));
   EXPECT_LE(allocated_bytes, options.cache_size_in_bytes);
 
 #endif

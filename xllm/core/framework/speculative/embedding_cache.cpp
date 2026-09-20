@@ -106,6 +106,11 @@ void EmbeddingCache::write_mtp_bootstrap_context(
   CHECK(embedding.defined()) << "MTP bootstrap embedding is undefined";
   CHECK_GE(token_id, 0) << "MTP bootstrap token should be valid";
 
+  DecodeState& tail = mutable_tail(embedding_id);
+  if (tail.valid && !request_id.empty() && tail.request_id == request_id) {
+    return;
+  }
+
   DecodeState state;
   state.valid = true;
   state.request_id = request_id;
@@ -114,7 +119,6 @@ void EmbeddingCache::write_mtp_bootstrap_context(
   state.position_offset = 0;
   state.embedding = clone_contiguous_detached_tensor(embedding);
 
-  DecodeState& tail = mutable_tail(embedding_id);
   tail = std::move(state);
 }
 

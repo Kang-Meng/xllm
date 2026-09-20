@@ -35,16 +35,6 @@ constexpr int64_t kNumSlots = 16;
 constexpr int64_t kCheckpointStride = 4;
 const torch::Device kDevice(torch::kCPU);
 
-LinearStateCacheOp cache_op(int32_t live_slot,
-                            bool reset,
-                            bool restore,
-                            int32_t source_slot) {
-  return {.linear_state_id = live_slot,
-          .reset_requested = reset,
-          .restore_requested = restore,
-          .restore_src_slot_id = source_slot};
-}
-
 void expect_int32_vector(const torch::Tensor& tensor,
                          const std::vector<int32_t>& expected) {
   EXPECT_EQ(tensor.scalar_type(), torch::kInt32);
@@ -72,23 +62,23 @@ TEST(Qwen3_5GatedDeltaNetIndicesTest, BuildsColdWarmOrderedPaddingAndStridedIndi
 }
 
 // clang-format off
-TEST(Qwen3_5GatedDeltaNetIndicesTest, MapsMixedColdContinuationRestoreAndDirectReadDescriptors) {
+TEST(Qwen3_5GatedDeltaNetIndicesTest, MapsMixedColdContinuationAndIndependentReadSlots) {
   // clang-format on
   AttentionMetadata metadata;
   const std::vector<int32_t> slots = {2, 4, 6, 8};
   const std::vector<int64_t> validity = {0, 1, 1, 1};
-  const std::vector<LinearStateCacheOp> cache_ops = {
-      cache_op(2, true, false, -1),
-      cache_op(4, false, false, -1),
-      cache_op(6, false, true, 10),
-      cache_op(8, false, false, 12),
+  const std::vector<int32_t> read_ids = {
+      2,
+      4,
+      6,
+      12,
   };
 
   const MegaGdnPrefillIndicesCache& indices =
       get_or_build_prefill_indices(metadata,
                                    slots,
                                    validity,
-                                   cache_ops,
+                                   read_ids,
                                    kCheckpointStride,
                                    kNumSlots,
                                    kDevice);
@@ -153,27 +143,6 @@ TEST(Qwen3_5GatedDeltaNetIndicesTest, NewMetadataMaterializesNewTensorSet) {
   EXPECT_EQ(next.device_tensor_materializations, 4);
 }
 
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedCacheOps) {
-  AttentionMetadata metadata;
-  const std::vector<int32_t> slots = {2};
-  const std::vector<int64_t> validity = {1};
-  get_or_build_prefill_indices(metadata,
-                               slots,
-                               validity,
-                               {cache_op(2, false, false, 3)},
-                               kCheckpointStride,
-                               kNumSlots,
-                               kDevice);
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            slots,
-                                            validity,
-                                            {cache_op(2, false, false, 4)},
-                                            kCheckpointStride,
-                                            kNumSlots,
-                                            kDevice),
-               "cache ops changed");
-}
-
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsInvalidValidity) {
   AttentionMetadata metadata;
   EXPECT_DEATH(get_or_build_prefill_indices(
@@ -209,68 +178,28 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsDuplicateNonzeroSlot) {
                "write slots must be unique");
 }
 
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsDescriptorSizeMismatch) {
+TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsReadSizeMismatch) {
   AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1, 2},
-                                            {1, 1},
-                                            {cache_op(1, false, false, -1)},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
-               "cache_ops must be empty or sequence-scoped");
+  EXPECT_DEATH(get_or_build_prefill_indices(
+                   metadata, {1, 2}, {1, 1}, {1}, 1, kNumSlots, kDevice),
+               "read_ids must be empty or sequence-scoped");
 }
 
 // clang-format off
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsDescriptorLiveSlotMismatch) {
-  // clang-format on
-  AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {1},
-                                            {cache_op(2, false, false, -1)},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
-               "descriptor and live slots must stay aligned");
-}
 
 // clang-format off
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsMutuallyExclusiveResetAndRestore) {
-  // clang-format on
-  AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {0},
-                                            {cache_op(1, true, true, 2)},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
-               "reset and restore are mutually exclusive");
-}
 
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsResetWithSource) {
-  AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {0},
-                                            {cache_op(1, true, false, 2)},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
-               "reset must not carry a restore source");
-}
 
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsRestoreWithoutSource) {
+TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsNegativeReadSlot) {
   AttentionMetadata metadata;
   EXPECT_DEATH(get_or_build_prefill_indices(metadata,
                                             {1},
                                             {1},
-                                            {cache_op(1, false, true, -1)},
+                                            {-1},
                                             1,
                                             kNumSlots,
                                             kDevice),
-               "restore requires a valid source slot");
+               "read_ids");
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsColdDirectRead) {
@@ -278,47 +207,25 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsColdDirectRead) {
   EXPECT_DEATH(get_or_build_prefill_indices(metadata,
                                             {1},
                                             {0},
-                                            {cache_op(1, false, false, 2)},
+                                            {2},
                                             1,
                                             kNumSlots,
                                             kDevice),
-               "direct-read row must be warm after restore");
+               "direct-read row must be warm");
 }
 
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsWarmReset) {
-  AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {1},
-                                            {cache_op(1, true, false, -1)},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
-               "reset row must remain cold after restore");
-}
 
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsColdPhysicalRestore) {
-  AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {0},
-                                            {cache_op(1, false, true, 2)},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
-               "restored row must be warm after restore");
-}
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsPaddingSource) {
   AttentionMetadata metadata;
   EXPECT_DEATH(get_or_build_prefill_indices(metadata,
                                             {1},
                                             {1},
-                                            {cache_op(1, false, false, 0)},
+                                            {0},
                                             1,
                                             kNumSlots,
                                             kDevice),
-               "source must be a real non-padding slot");
+               "padding must not be used");
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsSourceOutOfBounds) {
@@ -326,7 +233,7 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsSourceOutOfBounds) {
   EXPECT_DEATH(get_or_build_prefill_indices(metadata,
                                             {1},
                                             {1},
-                                            {cache_op(1, false, false, 16)},
+                                            {16},
                                             1,
                                             kNumSlots,
                                             kDevice),
@@ -414,6 +321,13 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedValidity) {
       get_or_build_prefill_indices(
           metadata, {1}, {0}, {}, kCheckpointStride, kNumSlots, kDevice),
       "validity changed");
+}
+
+TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedReadSlots) {
+  AttentionMetadata metadata;
+  get_or_build_prefill_indices(metadata, {1}, {1}, {2}, kCheckpointStride, kNumSlots, kDevice);
+  EXPECT_DEATH(get_or_build_prefill_indices(metadata, {1}, {1}, {3}, kCheckpointStride, kNumSlots, kDevice),
+               "read state ids changed");
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedDevice) {

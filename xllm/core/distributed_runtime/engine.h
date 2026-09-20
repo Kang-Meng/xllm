@@ -22,6 +22,7 @@ limitations under the License.
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/config/kv_cache_config.h"
 #include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -194,6 +195,25 @@ class Engine {
   };
 
  protected:
+  void configure_prefix_cache(runtime::Options& options) const {
+    const bool decode_linear_model =
+        options.instance_role() == InstanceRole::DECODE &&
+        has_linear_attention_layers(model_args());
+    const bool enable_xtensor = KVCacheConfig::get_instance().enable_xtensor();
+    if (options.enable_prefix_cache() &&
+        (decode_linear_model || enable_xtensor)) {
+      options.enable_prefix_cache(false);
+      LOG(INFO) << "Disabling prefix cache for model "
+                << model_args().model_type()
+                << ": decode_linear_model=" << decode_linear_model
+                << ", enable_xtensor=" << enable_xtensor;
+    }
+    if (!options.is_draft_engine()) {
+      KVCacheConfig::get_instance().enable_prefix_cache(
+          options.enable_prefix_cache());
+    }
+  }
+
   // model args
   ModelArgs args_;
 
