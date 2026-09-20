@@ -20,16 +20,22 @@ limitations under the License.
 
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "core/framework/dit_model_context.h"
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
 #include "core/layers/common/linear.h"
+#if defined(USE_NPU)
+#include "models/dit/utils/dit_block_weight_manager.h"
+#endif
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -618,12 +624,21 @@ class H3TransformerBlockImpl final : public torch::nn::Module {
     adaln_->verify_loaded_weights(prefix + "adaln_proj.");
   }
 
+#if defined(USE_NPU)
+  void build_weight_loader() { weight_loader_.build_from_module(*this); }
+
+  dit::BlockWeightLoader& weight_loader() { return weight_loader_; }
+#endif
+
  private:
   H3RMSNorm norm1_{nullptr};
   H3Attention attn_{nullptr};
   H3RMSNorm norm2_{nullptr};
   H3SwiGLUFFN ff_{nullptr};
   H3AdaLayerNormModulation adaln_{nullptr};
+#if defined(USE_NPU)
+  dit::BlockWeightLoader weight_loader_;
+#endif
 };
 TORCH_MODULE(H3TransformerBlock);
 
@@ -694,6 +709,7 @@ class MiniMaxH3Transformer3DModelImpl final : public torch::nn::Module {
     CHECK(parallel_args.tp_size() == 1 ||
           parallel_args.dit_tp_group_ != nullptr)
         << "MiniMax-H3 TP requires a DiT TP process group";
+    const bool use_rolling_load = dit_rolling_load_enabled();
     ModelContext transformer_context(parallel_args,
                                      context.get_model_args("transformer"),
                                      context.get_quant_args("transformer"),
@@ -766,14 +782,19 @@ class MiniMaxH3Transformer3DModelImpl final : public torch::nn::Module {
                                                     transformer_context));
     blocks_ = register_module("transformer_blocks", torch::nn::ModuleList());
     for (int64_t i = 0; i < num_layers_; ++i) {
-      blocks_->push_back(H3TransformerBlock(hidden_size_,
-                                            heads_,
-                                            head_dim_,
-                                            ffn_dim_,
-                                            time_embed_dim_,
-                                            norm_eps_,
-                                            qk_norm_eps_,
-                                            transformer_context));
+      H3TransformerBlock block(hidden_size_,
+                               heads_,
+                               head_dim_,
+                               ffn_dim_,
+                               time_embed_dim_,
+                               norm_eps_,
+                               qk_norm_eps_,
+                               transformer_context);
+      if (use_rolling_load) {
+        // Park each block immediately to avoid retaining all weights on NPU.
+        block->to(torch::kCPU);
+      }
+      blocks_->push_back(block);
     }
     norm_out_ = register_module(
         "norm_out",
@@ -790,7 +811,37 @@ class MiniMaxH3Transformer3DModelImpl final : public torch::nn::Module {
                                               .bias(true)));
   }
 
-  void apply_reference_precision(const torch::Device& device) {
+  static bool dit_rolling_load_enabled() {
+#if defined(USE_NPU)
+    return LoadConfig::get_instance().enable_rolling_load() &&
+           ParallelConfig::get_instance().tp_size() == 1;
+#else
+    return false;
+#endif
+  }
+
+#if defined(USE_NPU)
+  // Pack only after apply_reference_precision has established the final dtype.
+  void prepare_for_rolling_load() {
+    for (auto& block : *blocks_) {
+      block->as<minimax_h3::H3TransformerBlock>()->build_weight_loader();
+    }
+  }
+
+  // Non-owning pointers remain valid while this transformer's blocks exist.
+  std::vector<dit::BlockWeightLoader*> get_block_weight_loaders() {
+    std::vector<dit::BlockWeightLoader*> loaders;
+    loaders.reserve(blocks_->size());
+    for (auto& block : *blocks_) {
+      loaders.push_back(
+          &block->as<minimax_h3::H3TransformerBlock>()->weight_loader());
+    }
+    return loaders;
+  }
+#endif
+
+  void apply_reference_precision(const torch::Device& device,
+                                 bool rolling = false) {
     proj_in_->to(device, torch::kFloat32);
     audio_proj_in_->to(device, torch::kFloat32);
     time_embedder_->to(device, torch::kFloat32);
@@ -800,7 +851,8 @@ class MiniMaxH3Transformer3DModelImpl final : public torch::nn::Module {
 
     context_embedder_->to(device, torch::kBFloat16);
     token_refiner_->to(device, torch::kBFloat16);
-    blocks_->to(device, torch::kBFloat16);
+    blocks_->to(rolling ? torch::Device(torch::kCPU) : device,
+                torch::kBFloat16);
     norm_out_->to(device, torch::kBFloat16);
 
     validate_module_dtype("proj_in", *proj_in_, torch::kFloat32);
@@ -816,16 +868,19 @@ class MiniMaxH3Transformer3DModelImpl final : public torch::nn::Module {
     validate_module_dtype("norm_out", *norm_out_, torch::kBFloat16);
   }
 
-  MiniMaxH3TransformerOutput forward(const torch::Tensor& hidden_states,
-                                     const torch::Tensor& audio_hidden_states,
-                                     const torch::Tensor& encoder_hidden_states,
-                                     const torch::Tensor& timestep,
-                                     const torch::Tensor& timestep_indices,
-                                     const torch::Tensor& position_ids,
-                                     const torch::Tensor& token_tags,
-                                     const torch::Tensor& video_indices,
-                                     const torch::Tensor& audio_indices,
-                                     const torch::Tensor& text_indices) {
+  MiniMaxH3TransformerOutput forward(
+      const torch::Tensor& hidden_states,
+      const torch::Tensor& audio_hidden_states,
+      const torch::Tensor& encoder_hidden_states,
+      const torch::Tensor& timestep,
+      const torch::Tensor& timestep_indices,
+      const torch::Tensor& position_ids,
+      const torch::Tensor& token_tags,
+      const torch::Tensor& video_indices,
+      const torch::Tensor& audio_indices,
+      const torch::Tensor& text_indices,
+      std::function<void(int32_t)> before_layer_cb = nullptr,
+      std::function<void(int32_t)> after_layer_cb = nullptr) {
     torch::Tensor video_embeds =
         proj_in_->forward(hidden_states.to(proj_in_->weight.scalar_type()));
     torch::Tensor audio_embeds = audio_proj_in_->forward(
@@ -853,9 +908,17 @@ class MiniMaxH3Transformer3DModelImpl final : public torch::nn::Module {
     auto rotary = rope_->forward(position_ids);
     torch::Tensor adaln_indices =
         timestep_indices.to(torch::kLong) * 3 + token_tags.to(torch::kLong);
+    int32_t block_index = 0;
     for (auto& block : *blocks_) {
+      if (before_layer_cb) {
+        before_layer_cb(block_index);
+      }
       packed = block->as<minimax_h3::H3TransformerBlock>()->forward(
           packed, temb, adaln_indices, rotary.first, rotary.second);
+      if (after_layer_cb) {
+        after_layer_cb(block_index);
+      }
+      ++block_index;
     }
 
     packed =

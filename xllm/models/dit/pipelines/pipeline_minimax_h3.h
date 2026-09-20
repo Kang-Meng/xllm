@@ -21,6 +21,7 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,8 +30,12 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/dit_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/dit_model_context.h"
 #include "core/framework/dit_model_loader.h"
+#if defined(USE_NPU)
+#include "core/layers/npu/loader/rolling_weight_buffer.h"
+#endif
 #include "core/runtime/dit_forward_params.h"
 #include "models/dit/autoencoders/autoencoder_kl_minimax_h3_audio.h"
 #include "models/dit/autoencoders/autoencoder_kl_minimax_h3_video.h"
@@ -38,6 +43,9 @@ limitations under the License.
 #include "models/dit/processors/minimax_h3_visual_processor.h"
 #include "models/dit/schedulers/minimax_h3_scheduler.h"
 #include "models/dit/transformers/transformer_minimax_h3.h"
+#if defined(USE_NPU)
+#include "models/dit/utils/dit_block_weight_manager.h"
+#endif
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -106,6 +114,20 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
           AutoencoderKLMiniMaxH3Audio(context.get_model_context("audio_vae")));
     }
   }
+
+#if defined(USE_NPU)
+  ~MiniMaxH3PipelineImpl() override {
+    if (use_rolling_load_) {
+      // Tail refills may still use host weights when the pipeline is destroyed.
+      torch::DeviceGuard guard(options_.device());
+      const aclError result = aclrtSynchronizeDevice();
+      if (result != ACL_SUCCESS) {
+        LOG(ERROR) << "Failed to synchronize MiniMax-H3 rolling load, result="
+                   << result;
+      }
+    }
+  }
+#endif
 
   DiTForwardOutput forward(const DiTForwardInput& input) {
     torch::NoGradGuard no_grad;
@@ -276,6 +298,16 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     audio_scheduler_.set_timesteps(num_inference_steps, options_.device());
     CHECK_EQ(scheduler_.timesteps().numel(),
              audio_scheduler_.timesteps().numel());
+    std::function<void(int32_t)> before_layer_cb;
+    std::function<void(int32_t)> after_layer_cb;
+#if defined(USE_NPU)
+    if (use_rolling_load_) {
+      before_layer_cb = [this](int32_t i) { rolling_transformer_.wait_h2d(i); };
+      after_layer_cb = [this](int32_t i) {
+        rolling_transformer_.schedule_next_h2d(i);
+      };
+    }
+#endif
     for (int64_t step = 0; step < scheduler_.timesteps().numel(); ++step) {
       torch::Tensor video_timestep = scheduler_.timesteps()[step];
       torch::Tensor audio_timestep = audio_scheduler_.timesteps()[step];
@@ -292,7 +324,9 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
                                 layout.token_tags,
                                 layout.video_indices,
                                 layout.audio_indices,
-                                layout.text_indices);
+                                layout.text_indices,
+                                before_layer_cb,
+                                after_layer_cb);
       if (layout.num_condition_video_rows > 0) {
         torch::Tensor generated_rows =
             video_rows.slice(1, layout.num_condition_video_rows);
@@ -432,7 +466,15 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
           loader->take_component_loader("audio_scheduler"));
     }
 
-    transformer_->apply_reference_precision(options_.device());
+    use_rolling_load_ =
+        MiniMaxH3Transformer3DModelImpl::dit_rolling_load_enabled();
+    transformer_->apply_reference_precision(options_.device(),
+                                            use_rolling_load_);
+#if defined(USE_NPU)
+    if (use_rolling_load_) {
+      init_rolling_transformer();
+    }
+#endif
     if (is_tp_driver_) {
       vae_->to(options_.device(), torch::kFloat32);
       audio_vae_->to(options_.device(), torch::kFloat32);
@@ -441,6 +483,27 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   }
 
  private:
+#if defined(USE_NPU)
+  void init_rolling_transformer() {
+    torch::DeviceGuard guard(options_.device());
+    transformer_->prepare_for_rolling_load();
+    auto loaders = transformer_->get_block_weight_loaders();
+    size_t max_storage = 0;
+    for (const dit::BlockWeightLoader* loader : loaders) {
+      max_storage = std::max(max_storage, loader->storage_size());
+    }
+
+    constexpr int32_t kMinRollingSlots = 2;
+    const int32_t num_slots =
+        std::max(LoadConfig::get_instance().rolling_load_num_rolling_slots(),
+                 kMinRollingSlots);
+    auto buffer =
+        std::make_shared<layer::RollingWeightBuffer>(num_slots, max_storage);
+    rolling_transformer_.init(std::move(loaders), std::move(buffer), num_slots);
+    rolling_transformer_.preload();
+  }
+#endif
+
   void validate_media_sources(const DiTMediaSources& media_sources) const {
     size_t image_count = 0;
     size_t video_count = 0;
@@ -1333,6 +1396,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   torch::TensorOptions options_;
   ProcessGroup* tp_group_ = nullptr;
   bool is_tp_driver_ = true;
+  bool use_rolling_load_ = false;
   std::string task_type_;
   int64_t patch_h_;
   int64_t patch_w_;
@@ -1351,6 +1415,9 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   AutoencoderKLMiniMaxH3Audio audio_vae_{nullptr};
   MiniMaxH3Scheduler scheduler_;
   MiniMaxH3Scheduler audio_scheduler_{/*shift=*/3.0};
+#if defined(USE_NPU)
+  dit::DitRollingLoadManager rolling_transformer_;
+#endif
 };
 TORCH_MODULE(MiniMaxH3Pipeline);
 
