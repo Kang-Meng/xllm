@@ -2094,10 +2094,14 @@ class DeepseekV4ForCausalLM(PyModelBase):
             """
             load_w8a8_dynamic_projection(loader, ckpt_prefix, param_prefix, shard_dims)
 
-        # --- Embedding (checkpoint: embed.weight). ---
+        embed_key = _require_checkpoint_key(
+            loader,
+            ("embed.weight", "embed_tokens.weight"),
+            "DeepSeek-V4 embedding weight",
+        )
         loader.copy_in(
             "model.embed_tokens.weight",
-            loader.shard(loader.load_tensor("embed.weight"), dim=1),
+            loader.shard(loader.load_tensor(embed_key), dim=1),
         )
 
         # --- Per-layer weights (checkpoint: layers.N.<...>). ---
@@ -2157,8 +2161,12 @@ class DeepseekV4ForCausalLM(PyModelBase):
             elif isinstance(mlp, DeepseekV3MLP):
                 self._load_dsv4_dense_mlp(loader, ck, pm, mlp)
 
-        # --- Final norm + hc_head + lm_head. ---
-        loader.copy_in("model.norm.weight", loader.load_tensor("norm.weight"))
+        final_norm_key = _require_checkpoint_key(
+            loader,
+            ("norm.weight", "final_layernorm.weight"),
+            "DeepSeek-V4 final norm",
+        )
+        loader.copy_in("model.norm.weight", loader.load_tensor(final_norm_key))
         loader.copy_in("model.hc_head_fn", loader.load_tensor("hc_head_fn"))
         loader.copy_in("model.hc_head_base", loader.load_tensor("hc_head_base"))
         loader.copy_in("model.hc_head_scale", loader.load_tensor("hc_head_scale"))
@@ -2168,9 +2176,10 @@ class DeepseekV4ForCausalLM(PyModelBase):
             loader,
             (
                 "lm_head.weight",
+                "model.head.weight",
                 "head.weight",
             ),
-            "checkpoint output-head weight",
+            "DeepSeek-V4 output-head weight",
         )
         loader.copy_in(
             "lm_head.weight",
