@@ -17,6 +17,7 @@ limitations under the License.
 #pragma once
 #include <absl/strings/str_split.h>
 
+#include <cstdint>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -76,6 +77,28 @@ class JsonReader {
       return data->get<T>();
     }
     return std::nullopt;
+  }
+
+  // Read an integer field that HF configs may encode as either a scalar or an
+  // array (e.g. eos_token_id) into a vector. A scalar yields a single-element
+  // vector; a non-empty array is read as-is. Returns nullopt when the key is
+  // absent, null, an object, OR an empty array (so callers get their default
+  // and downstream code never has to guard against ``vec.front()`` on empty).
+  // Unlike value<std::vector<int32_t>>, a scalar node does not throw.
+  std::optional<std::vector<int32_t>> value_int_or_array(
+      const std::string& key) const {
+    const nlohmann::json* data = resolve(key);
+    if (data == nullptr || data->is_null() || data->is_object()) {
+      return std::nullopt;
+    }
+    if (data->is_array()) {
+      auto vec = data->get<std::vector<int32_t>>();
+      if (vec.empty()) {
+        return std::nullopt;
+      }
+      return vec;
+    }
+    return std::vector<int32_t>{data->get<int32_t>()};
   }
 
   // Resolve a dot-separated key path against a json object; returns nullptr if

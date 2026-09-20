@@ -15,8 +15,9 @@
 """Public interfaces for Python model weight loading."""
 
 from .draft_weight_loaders import (
-    load_own_lm_head,
-    load_own_weight,
+    load_draft_embedding_if_present,
+    load_draft_lm_head_if_present,
+    load_missing_draft_vocab_from_quarot_target,
 )
 from .module_loaders import (
     load_causal_lm_weights,
@@ -40,8 +41,9 @@ __all__ = [
     "gqa_head_split",
     "gqa_qkv_shards",
     "load_causal_lm_weights",
+    "load_draft_embedding_if_present",
+    "load_draft_lm_head_if_present",
     "load_gqa_fused_attention",
-    "load_own_lm_head",
-    "load_own_weight",
+    "load_missing_draft_vocab_from_quarot_target",
     "shard_tensor",
 ]

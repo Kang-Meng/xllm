@@ -268,11 +268,26 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
 
-        hidden = self.self_attn(positions, hidden, cos_sin_cache, cos, sin, mrope_section)
+        hidden = self._attn_block(hidden, positions, cos_sin_cache, cos, sin, mrope_section)
 
         hidden, residual = self.post_attention_layernorm(hidden, residual)
-        hidden = self.mlp(hidden)
+        hidden = self._mlp_block(hidden)
         return hidden, residual
+
+    # Override seams: subclasses wrap attention/MLP without restating forward().
+    def _attn_block(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        mrope_section: list[int] | None,
+    ) -> torch.Tensor:
+        return self.self_attn(positions, hidden, cos_sin_cache, cos, sin, mrope_section)
+
+    def _mlp_block(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.mlp(hidden)
 
     def load_weights(self, weights: ScopedWeightLoader, context: ParallelLoadContext) -> None:
         weights.load_tensor(self.input_layernorm.weight, "input_layernorm.weight")
@@ -291,6 +306,7 @@ class Qwen3Model(nn.Module):
         *,
         causal: bool = True,
         create_embedding: bool = True,
+        decoder_layer_cls: type[nn.Module] = Qwen3DecoderLayer,
     ) -> None:
         super().__init__()
         tp = cfg.tp_size
@@ -313,7 +329,7 @@ class Qwen3Model(nn.Module):
         )
         self.layers = cast(
             Sequence[Qwen3DecoderLayer],
-            nn.ModuleList(Qwen3DecoderLayer(cfg, i, dtype, device, causal=causal) for i in range(cfg.n_layers)),
+            nn.ModuleList(decoder_layer_cls(cfg, i, dtype, device, causal=causal) for i in range(cfg.n_layers)),
         )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)

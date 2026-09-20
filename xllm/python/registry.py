@@ -104,6 +104,12 @@ def _register_builtin_models() -> None:
         "DFlashQwen3Model",
     )
     _register_model_path(
+        "xllm.python.models.qwen3_dflash2",
+        "DFlash2Qwen3ForCausalLM",
+        "DFlash2DraftModel",
+        "DFlash2Qwen3Model",
+    )
+    _register_model_path(
         "xllm.python.models.qwen3_vl",
         "Qwen3VLForConditionalGeneration",
         "qwen3_vl",

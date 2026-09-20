@@ -400,8 +400,7 @@ py::dict PyCausalLM::build_config_dict(
   d["layerwise_split_rank"] = layerwise_split_rank_;
   const bool requires_eager_execution =
       !model_args_.layers_to_capture().empty() ||
-      model_args_.model_type() == "DFlashDraftModel" ||
-      model_args_.model_type() == "DSparkDraftModel";
+      model_args_.requires_eager_execution();
   d["enable_graph"] = requires_eager_execution
                           ? false
                           : ExecutionConfig::get_instance().enable_graph();
@@ -515,6 +514,22 @@ torch::Tensor PyCausalLM::dspark_markov_bias(
   py::gil_scoped_acquire gil;
   return py_model_.attr("dspark_markov_bias")(previous_token_ids)
       .cast<torch::Tensor>();
+}
+
+DFlash2CandidateOutput PyCausalLM::dflash2_candidates(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& unary_logits,
+    const torch::Tensor& anchor_token_ids) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  py::tuple output = py_model_
+                         .attr("dflash2_candidates")(
+                             hidden_states, unary_logits, anchor_token_ids)
+                         .cast<py::tuple>();
+  DFlash2CandidateOutput candidates;
+  candidates.candidate_ids = output[0].cast<torch::Tensor>();
+  candidates.edge_logits = output[1].cast<torch::Tensor>();
+  return candidates;
 }
 
 torch::Tensor PyCausalLM::dspark_confidence_probs(

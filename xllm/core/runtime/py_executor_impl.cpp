@@ -231,8 +231,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         << "KV cache layer count changed after initial bind";
   }
 
-  py::object py_metadata =
-      py::cast(PyAttentionMetadataView(attn_metadata, params));
+  py::object py_metadata = py::cast(PyAttentionMetadataView(
+      attn_metadata, params, args_.dummy_token_count()));
   py::object input_embedding =
       optional_tensor(params.embedding.input_embedding);
 

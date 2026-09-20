@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python.model_executor.forward_context import LayerSynchronizer
-from xllm.python.model_loader import ParallelLoadContext, load_own_lm_head
+from xllm.python.model_loader import ParallelLoadContext, load_draft_lm_head_if_present
 from xllm.python.models.dspark import DSparkForCausalLMBase
 from xllm.python.models.qwen3_dflash import (
     DFlashQwen3Config,
@@ -82,7 +82,7 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         all_weights = self.model.load_weights(state_dicts, tp_rank, tp_size)
-        load_own_lm_head(
+        load_draft_lm_head_if_present(
             self,
             all_weights,
             context=ParallelLoadContext(tp_rank, tp_size),

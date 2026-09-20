@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python.models import glm5_next
+from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 
 
 class _Embedding(nn.Module):
@@ -82,6 +83,7 @@ def _make_model(events: list[str]) -> tuple[glm5_next.Glm5NextModel, list[_Decod
     model.layers = nn.ModuleList(layers)
     model.norm = _Norm(events)
     model.hc_head = _HyperHead()
+    model.aux_hidden_capture = AuxHiddenCapture(())
     model._inputs_embeds = None
     return model, layers
 
@@ -191,8 +193,8 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     gather = _patch_cp_gather(monkeypatch, remote_by_local)
 
     backend = MagicMock()
-    backend.execute_linear.side_effect = (
-        lambda mixed_qkv, _beta, _layer, *, raw_gate_proj: mixed_qkv[:, :1].transpose(1, 2).unsqueeze(2)
+    backend.execute_linear.side_effect = lambda mixed_qkv, _beta, _layer, *, raw_gate_proj: (
+        mixed_qkv[:, :1].transpose(1, 2).unsqueeze(2)
     )
     with patch.object(
         glm5_next,

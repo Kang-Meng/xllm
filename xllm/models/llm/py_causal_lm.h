@@ -97,6 +97,11 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
                                std::vector<KVCache>& kv_caches,
                                const ModelInputParams& input_params) override;
 
+  DFlash2CandidateOutput dflash2_candidates(
+      const torch::Tensor& hidden_states,
+      const torch::Tensor& unary_logits,
+      const torch::Tensor& anchor_token_ids) override;
+
   torch::Tensor dspark_markov_bias(
       const torch::Tensor& previous_token_ids) override;
 

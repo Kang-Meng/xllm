@@ -475,7 +475,10 @@ def _capture_test_model(
     model.rotary = SimpleNamespace(cos_sin_cache=torch.empty(0))
     model.compress_rotary_c4 = SimpleNamespace(cos_sin_cache=torch.empty(0))
     model.compress_rotary_c128 = SimpleNamespace(cos_sin_cache=torch.empty(0))
-    model.aux_hidden_capture = deepseek_v4.AuxHiddenCapture(layers_to_capture)
+    model.aux_hidden_capture = deepseek_v4.AuxHiddenCapture(
+        layers_to_capture,
+        transform=lambda hidden: hidden.mean(dim=1) if hidden.dim() == 3 else hidden,
+    )
     model.attach_rope_tables_to_backend = MagicMock()
     model._hc_head = MagicMock(side_effect=lambda hidden: hidden.mean(dim=1))
     model._test_metadata = metadata

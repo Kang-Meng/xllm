@@ -64,7 +64,9 @@ class KdaLinearAttentionMixin:
 
     def snapshot_kda_v3_state(self, idx: torch.Tensor):
         """Snapshot V3 combined-pool rows the graph warmup/capture mutates."""
-        idx64 = idx if idx.dtype == torch.int64 else idx.to(torch.int64)
+        # Expanded verification repeats a sequence slot for each token row.
+        # One saved copy per physical slot restores the same state.
+        idx64 = torch.unique(idx.to(torch.int64))
         snap = []
         for st in self.__dict__.get("_kda_v3", {}).values():
             if "armed_buf" not in st:
@@ -145,6 +147,9 @@ class KdaLinearAttentionMixin:
         gate_lb = getattr(fg, "safe_gate_lower_bound", None) if fg is not None else None
         read_idx, idx = resolve_linear_state_io_indices(metadata)
         is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
+        is_spec_verify = getattr(metadata, "is_spec_verify", False)
+        if is_spec_verify and idx is None:
+            raise RuntimeError("KDA spec-verify requires linear-state slots")
         num_seqs = idx.shape[0] if idx is not None else batch_size
         # ACL-graph decode with a flattened batch: the model forward unsqueezes
         # the 1-D ``[num_seqs]`` decode input into ``[1, num_seqs]``, so
@@ -290,7 +295,9 @@ class KdaLinearAttentionMixin:
                     ssm_cache,
                     recurrent_kda,
                 )
-            if is_prefill:
+            # Hybrid targets label eager verification as CHUNKED_PREFILL, but
+            # each token still needs its own recoverable conv/SSM state slot.
+            if is_prefill and not is_spec_verify:
                 self.disarm_kda_v3_slots(idx)
             elif (
                 self._kda_verify_width > 1
@@ -310,6 +317,8 @@ class KdaLinearAttentionMixin:
                     ssm_cache,
                     recurrent_kda,
                 )
+            elif is_spec_verify:
+                raise RuntimeError("KDA spec-verify requires a non-empty uniform token block within the decoding width")
             state_read_idx = read_idx if is_prefill else idx
             conv_i = conv_cache.index_select(0, state_read_idx)
             ssm_i = ssm_cache.index_select(0, state_read_idx)

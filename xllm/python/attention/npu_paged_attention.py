@@ -66,6 +66,7 @@ from xllm.python.attention.kda_linear_attention import (
 #    only aligns when q_len == kv_len and would misalign on a cache hit).
 _SPARSE_MODE_NONE = 0
 _SPARSE_MODE_RIGHT_DOWN_CAUSAL = 3
+_SPARSE_MODE_BAND = 4
 
 _HAS_FIA_V2 = hasattr(torch.ops.npu, "npu_fused_infer_attention_score_v2") and hasattr(
     torch_npu, "_npu_fused_infer_attention_score_v2_get_max_workspace"
@@ -219,6 +220,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._is_mla = is_mla
         self._uses_sparse_mla = False
         self._kda_verify_width = num_decoding_tokens
+        self._kda_validated_query_shape: tuple[int, int] | None = None
 
         self._kv_caches: list[LayerCache] = []
         self._kpool_cache_triton_compatible: tuple[bool, ...] = ()
@@ -372,6 +374,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         graph_mode: bool = False,
     ) -> None:
         self._metadata = metadata
+        self._kda_validated_query_shape = None
         if getattr(metadata, "q_cu_host_values", None) is not None:
             # Static graph metadata carries the (per-entry constant) host
             # copy: reading the device buffer would block the host until the
@@ -640,6 +643,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 metadata,
                 num_tokens,
                 layer.causal,
+                layer.attention_window,
             )
         return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
 
@@ -981,15 +985,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             actual_seq_q=self._mla_actual_seq_q,
             actual_seq_kv=self._mla_actual_seq_kv,
             index_cache_scale=index_cache_scale,
-            get_quant_indexer_metadata=lambda num_heads_q,
-            head_dim,
-            sparse_count,
-            cmp_ratio: self._get_quant_indexer_metadata(
-                num_heads_q,
-                index_cache.size(2),
-                head_dim,
-                sparse_count,
-                cmp_ratio,
+            get_quant_indexer_metadata=lambda num_heads_q, head_dim, sparse_count, cmp_ratio: (
+                self._get_quant_indexer_metadata(
+                    num_heads_q,
+                    index_cache.size(2),
+                    head_dim,
+                    sparse_count,
+                    cmp_ratio,
+                )
             ),
             update_index_cache=lambda values, scales: self._update_mla_index_cache(
                 index_cache,
@@ -1049,15 +1052,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         scales: torch.Tensor | None,
     ) -> None:
         cache_view = index_cache.view(-1, index_cache.size(-1))
-        scatter_indices = slot_mapping.reshape(-1, 1).clamp_min(0)
-        kernels.scatter_nd_update(
-            cache_view,
-            scatter_indices,
-            values,
-        )
+        # Custom scatter sorts flattened offsets through FP32, which loses
+        # integer precision for large caches with odd row widths such as 257.
+        row_indices = slot_mapping.reshape(-1).clamp_min(0).to(torch.int64)
+        cache_view.index_copy_(0, row_indices, values)
         if index_cache_scale is not None and scales is not None:
             scale_view = index_cache_scale.view(-1, index_cache_scale.size(-1))
-            kernels.scatter_nd_update(scale_view, scatter_indices, scales)
+            scale_view.index_copy_(0, row_indices, scales)
 
     def _materialize_cp_cache(
         self,
@@ -1277,11 +1278,25 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         """
         device = mixed_qkv.device
         num_seqs = idx.shape[0]
+        if num_seqs == 0 or mixed_qkv.shape[0] != 1 or mixed_qkv.shape[2] % num_seqs:
+            raise ValueError("KDA spec-verify requires flattened, equal-width sequence blocks")
         rows_per_seq = mixed_qkv.shape[2] // num_seqs  # 2 verify, 1 plain
         if not 1 <= rows_per_seq <= self._kda_verify_width:
             raise ValueError(
                 f"KDA verify width {rows_per_seq} exceeds configured decoding width {self._kda_verify_width}"
             )
+        in_graph = in_acl_graph()
+        q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
+        if (
+            not in_graph
+            and getattr(metadata, "is_spec_verify", False)
+            and q_seq_lens_host is not None
+            and q_seq_lens_host.numel() == num_seqs
+            and self._kda_validated_query_shape != (num_seqs, rows_per_seq)
+        ):
+            if any(length != rows_per_seq for length in q_seq_lens_host.tolist()):
+                raise ValueError("KDA spec-verify requires uniform query lengths")
+            self._kda_validated_query_shape = (num_seqs, rows_per_seq)
         head_dim = layer.head_dim
         nh = layer.num_heads_local
         qkv_dim = layer.qkv_dim
@@ -1308,6 +1323,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         kv_src = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         kv_rows = kv_src.to(device=device, dtype=torch.int64)
         base_now = kv_rows.view(num_seqs, -1)[:, 0].contiguous()
+        if expanded is None and kv_rows.numel() == num_seqs and rows_per_seq > 1:
+            # Sequence-scoped KV lengths include the entire query block. Use
+            # the first token's boundary, as in expanded metadata, so a change
+            # in verification width does not alter the previous accepted count.
+            base_now = base_now - (rows_per_seq - 1)
         armed_h = armed_buf.index_select(0, idx)
         kv_prev_h = kv_prev.index_select(0, idx)
         accepted_counts = torch.where(
@@ -1638,10 +1658,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         metadata: AttentionMetadata,
         num_tokens: int,
         causal: bool,
+        attention_window: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         actual_seq = self._cumulative_seq_lens(metadata, num_tokens)
         atten_mask = self._causal_mask if causal else None
         sparse_mode = _SPARSE_MODE_RIGHT_DOWN_CAUSAL if causal else _SPARSE_MODE_NONE
+        window_args: dict[str, int] = {}
+        if attention_window is not None:
+            atten_mask = self._causal_mask
+            sparse_mode = _SPARSE_MODE_BAND
+            window_args["pre_tokens"], window_args["next_tokens"] = attention_window
 
         # Prefix-cache hit (or chunked prefill with prior context): part of the
         # KV already lives in the paged cache, so this forward only carries the
@@ -1669,6 +1695,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 block_size=block_size,
                 sparse_mode=sparse_mode,
                 softmax_lse_flag=False,
+                **window_args,
             )
             return output.reshape(num_tokens, self.num_heads * self.head_dim)
 
@@ -1686,6 +1713,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             num_key_value_heads=self.num_kv_heads,
             sparse_mode=sparse_mode,
             softmax_lse_flag=False,
+            **window_args,
         )
         return output.reshape(num_tokens, self.num_heads * self.head_dim)
 

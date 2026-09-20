@@ -30,6 +30,8 @@ limitations under the License.
 
 namespace xllm {
 
+inline constexpr std::string_view kDFlashDraftModelType = "DFlashDraftModel";
+inline constexpr std::string_view kDSparkDraftModelType = "DSparkDraftModel";
 inline constexpr std::string_view kDFlash2DraftModelType = "DFlash2DraftModel";
 
 inline constexpr bool is_dflash2_draft_model_type(std::string_view model_type) {
@@ -96,6 +98,11 @@ struct ModelArgs {
   PROPERTY(int32_t, dflash2_conv_kernel_size) = 0;
   PROPERTY(int32_t, dflash2_selector_rank) = 0;
   PROPERTY(int32_t, dflash2_selector_top_k) = 0;
+
+  // Worker-stamped for block-diffusion drafts that must run eager.
+  PROPERTY(bool, requires_eager_execution) = false;
+  // Minimum input rows an idle/empty shard must still materialize.
+  PROPERTY(int32_t, dummy_token_count) = 1;
 
   PROPERTY(bool, use_qk_norm) = false;
   PROPERTY(float, rms_norm_eps) = 0.0f;

@@ -47,6 +47,8 @@ class Attention(nn.Module):
         self.sliding_window = sliding_window
         self.layer_id = layer_id
         self.causal = causal
+        # Optional (preceding, following) token extents relative to each query.
+        self.attention_window: tuple[int, int] | None = None
 
     def forward(
         self,

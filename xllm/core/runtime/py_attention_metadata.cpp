@@ -213,8 +213,10 @@ PyAttentionMetadataView::PyAttentionMetadataView(
 
 PyAttentionMetadataView::PyAttentionMetadataView(
     std::shared_ptr<layer::AttentionMetadata> metadata,
-    const ModelInputParams& params)
+    const ModelInputParams& params,
+    int32_t dummy_token_count)
     : PyAttentionMetadataView(std::move(metadata)) {
+  CHECK_GT(dummy_token_count, 0);
   new_cache_slots_host_values_ = params.attention.host.new_cache_slots;
   multi_block_tables_ = params.multi_block_tables;
   linear_state_indices_ = params.embedding.linear_state_indices;
@@ -251,13 +253,12 @@ PyAttentionMetadataView::PyAttentionMetadataView(
           ? params.parallel.dp_global_token_nums
           : params.parallel.raw_dp_global_token_nums;
   // Python model kernels consume materialized execution rows. Empty DP ranks
-  // therefore contribute the worker-created dummy row instead of zero rows.
+  // contribute the model's complete dummy input, which may be a draft block.
   dp_execution_token_counts_ = params.parallel.dp_global_token_nums;
-  for (int32_t& count : dp_execution_token_counts_) {
-    if (count == 0) {
-      count = 1;
-    }
-  }
+  std::replace(dp_execution_token_counts_.begin(),
+               dp_execution_token_counts_.end(),
+               /*old_value=*/0,
+               dummy_token_count);
   dp_is_decode_ = params.parallel.dp_is_decode;
 }
 

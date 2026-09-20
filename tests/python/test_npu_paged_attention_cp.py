@@ -34,10 +34,6 @@ from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
 )
 
 
-def _scatter_rows(var: torch.Tensor, indices: torch.Tensor, updates: torch.Tensor) -> None:
-    var.index_copy_(0, indices.flatten(), updates)
-
-
 def test_decode_prepare_does_not_require_cp_metadata_fields() -> None:
     backend = object.__new__(NpuPagedAttentionBackend)
     backend._is_mla = True
@@ -90,23 +86,15 @@ def test_owner_local_index_write_redirects_non_owned_slots_to_padding() -> None:
     slots = torch.tensor([2, -1, 3, -1, 4], dtype=torch.int64)
     values = torch.arange(5, dtype=torch.float32).view(-1, 1)
 
-    with patch(
-        "xllm.python.attention.npu_paged_attention.kernels.scatter_nd_update",
-        side_effect=_scatter_rows,
-        create=True,
-    ) as scatter_nd_update:
-        NpuPagedAttentionBackend._update_mla_index_cache(
-            cache,
-            None,
-            slots,
-            values,
-            None,
-        )
+    NpuPagedAttentionBackend._update_mla_index_cache(
+        cache,
+        None,
+        slots,
+        values,
+        None,
+    )
 
     torch.testing.assert_close(cache.view(-1)[block_size:], torch.tensor([0.0, 2.0, 4.0, -1.0]))
-    scatter_nd_update.assert_called_once()
-    assert scatter_nd_update.call_args.args[1].flatten().tolist() == [2, 0, 3, 0, 4]
-    torch.testing.assert_close(scatter_nd_update.call_args.args[2], values)
 
 
 def test_quantized_index_write_uses_shared_padding_slots() -> None:
@@ -125,29 +113,19 @@ def test_quantized_index_write_uses_shared_padding_slots() -> None:
     expected_scale_cache[3] = scales[2]
     expected_scale_cache[5] = scales[4]
 
-    with patch(
-        "xllm.python.attention.npu_paged_attention.kernels.scatter_nd_update",
-        side_effect=_scatter_rows,
-        create=True,
-    ) as scatter:
-        NpuPagedAttentionBackend._update_mla_index_cache(
-            cache,
-            scale_cache,
-            slots,
-            values,
-            scales,
-        )
+    NpuPagedAttentionBackend._update_mla_index_cache(
+        cache,
+        scale_cache,
+        slots,
+        values,
+        scales,
+    )
 
     torch.testing.assert_close(cache.view(-1, 2)[block_size:], expected_cache[block_size:])
     torch.testing.assert_close(
         scale_cache.view(-1, 1)[block_size:],
         expected_scale_cache[block_size:],
     )
-    assert scatter.call_count == 2
-    value_indices = scatter.call_args_list[0].args[1]
-    scale_indices = scatter.call_args_list[1].args[1]
-    assert value_indices.flatten().tolist() == [2, 0, 3, 0, 5]
-    torch.testing.assert_close(scale_indices, value_indices)
 
 
 @pytest.mark.parametrize(
@@ -170,26 +148,18 @@ def test_all_invalid_index_write_only_updates_padding_block(
     values = torch.arange(40, 48, dtype=cache_dtype).view(4, 2)
     scales = torch.arange(50, 54, dtype=torch.float16).view(4, 1) if with_scales else None
 
-    with patch(
-        "xllm.python.attention.npu_paged_attention.kernels.scatter_nd_update",
-        side_effect=_scatter_rows,
-        create=True,
-    ) as scatter:
-        NpuPagedAttentionBackend._update_mla_index_cache(
-            cache,
-            scale_cache,
-            slots,
-            values,
-            scales,
-        )
+    NpuPagedAttentionBackend._update_mla_index_cache(
+        cache,
+        scale_cache,
+        slots,
+        values,
+        scales,
+    )
 
     torch.testing.assert_close(
         cache.view(-1, 2)[block_size:],
         original_cache.view(-1, 2)[block_size:],
     )
-    assert scatter.call_count == (2 if with_scales else 1)
-    for call in scatter.call_args_list:
-        assert call.args[1].flatten().tolist() == [0, 0, 0, 0]
     if scale_cache is not None and original_scale_cache is not None:
         torch.testing.assert_close(
             scale_cache.view(-1, 1)[block_size:],

@@ -443,6 +443,26 @@ void disable_layerwise_split_for_draft(ParallelArgs* parallel_args) {
   // for the models served here.
 }
 
+// Negative cache slots keep the dummy prefill from writing real KV;
+// token_ids/positions come from the shared empty-shard path above.
+void apply_idle_block_dummy_input(ModelInputParams& input_params,
+                                  int32_t dummy_token_count,
+                                  const torch::Device& device) {
+  input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  input_params.meta.q_max_seq_len = dummy_token_count;
+  input_params.meta.kv_max_seq_len = dummy_token_count;
+  input_params.embedding.input_embedding = torch::Tensor();
+  input_params.attn_metadata.reset();
+  input_params.attention = AttentionInput();
+  input_params.attention.host.q_seq_lens = {dummy_token_count};
+  input_params.attention.host.q_cu_seq_lens = {0, dummy_token_count};
+  input_params.attention.host.kv_seq_lens = {dummy_token_count};
+  input_params.attention.host.kv_cache_tokens_nums = {0};
+  input_params.attention.host.new_cache_slots.assign(dummy_token_count,
+                                                     /*value=*/-1);
+  input_params.attention.rebuild_device_buffer(device);
+}
+
 }  // namespace
 
 WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
@@ -1363,8 +1383,13 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     bool empty_shard = input_params.meta.num_sequences == 0 &&
                        (!processed_input.token_ids.defined() ||
                         processed_input.token_ids.numel() == 0);
+    const int32_t dummy_token_count =
+        context_.get_model_args().dummy_token_count();
+    const bool idle_block_input =
+        input_params.meta.num_sequences == 0 && dummy_token_count > 1;
     const bool need_fake_input_for_empty_shard =
-        empty_shard && !input_params.meta.batch_forward_type.is_empty() &&
+        (empty_shard || idle_block_input) &&
+        !input_params.meta.batch_forward_type.is_empty() &&
         ((context_.get_parallel_args().dp_size() > 1 ||
           context_.get_parallel_args().ep_size() > 1 ||
           !context_.get_parallel_args().mapping_data().empty()));
@@ -1376,11 +1401,14 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
                                   ? processed_input.positions.options()
                                   : torch::TensorOptions().dtype(torch::kInt32);
       processed_input.token_ids =
-          torch::ones({1}, token_options.device(device_));
+          torch::ones({dummy_token_count}, token_options.device(device_));
       processed_input.positions =
-          torch::zeros({1}, position_options.device(device_));
-      processed_input.input_params.embedding.linear_state_indices =
+          torch::arange(dummy_token_count, position_options.device(device_));
+      input_params.embedding.linear_state_indices =
           torch::zeros({1}, token_options.dtype(torch::kInt32).device(device_));
+      if (idle_block_input) {
+        apply_idle_block_dummy_input(input_params, dummy_token_count, device_);
+      }
       empty_shard = false;
     }
     if (empty_shard) {
@@ -2142,12 +2170,14 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
       const bool is_dspark = speculative_algorithm == "DSpark";
       const bool is_deepseek_v4_dspark =
           is_dspark && util::is_deepseek_v4_model_type(args.model_type());
-      std::string draft_model_type = "DFlashDraftModel";
+      std::string draft_model_type = std::string(kDFlashDraftModelType);
       if (is_dspark) {
-        draft_model_type = "DSparkDraftModel";
+        draft_model_type = std::string(kDSparkDraftModelType);
       } else if (SpeculativeConfig::is_dflash2_algorithm(
                      speculative_algorithm)) {
         draft_model_type = std::string(kDFlash2DraftModelType);
+        CHECK_GT(args.dflash2_block_size(), 0);
+        args.dummy_token_count(args.dflash2_block_size());
       }
       if (is_deepseek_v4_dspark) {
         draft_model_type = std::string(util::kDeepseekV4DSparkModelType);
@@ -2156,6 +2186,8 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
                 << " to " << draft_model_type
                 << " for block-diffusion speculative decoding";
       args.model_type(draft_model_type);
+      // DeepseekV4DSpark excluded: whether it needs eager is unresolved.
+      args.requires_eager_execution(!is_deepseek_v4_dspark);
       if (is_deepseek_v4_dspark) {
         configure_deepseek_v4_dspark_args(args, options_);
       }

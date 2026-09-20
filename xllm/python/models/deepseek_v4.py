@@ -1746,7 +1746,10 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = nn.Parameter(torch.empty(cfg.hc_mult, dtype=torch.float32, device=device))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32, device=device))
         self._build_rotary_tables(cfg, dtype, device)
-        self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
+        self.aux_hidden_capture = AuxHiddenCapture(
+            cfg.layers_to_capture,
+            transform=lambda hidden: hidden.mean(dim=1) if hidden.dim() == 3 else hidden,
+        )
 
     def _build_rotary_tables(
         self,
@@ -1954,14 +1957,7 @@ class DeepseekV4Model(nn.Module):
                 layer_cos_sin_cache,
                 input_ids,
             )
-            if self.aux_hidden_capture.should_capture(layer_id):
-                captured = hidden.mean(dim=1) if hidden.dim() == 3 else hidden
-                self.aux_hidden_capture.capture_layer(
-                    layer_id,
-                    captured,
-                    None,
-                    aux_hidden_buffer,
-                )
+            self.aux_hidden_capture.capture_layer(layer_id, hidden, None, aux_hidden_buffer)
             record_layer_event(layer_id)
         if cp_ctx is not None and cp_ctx.enabled():
             hidden = cp_ctx.gather_restore(hidden)
