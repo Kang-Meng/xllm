@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn as nn
@@ -53,6 +53,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     record_layer_event,
 )
+from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
@@ -1998,6 +1999,82 @@ class DeepseekV4ForCausalLM(PyModelBase):
             device=device,
         )
 
+    def _load_dsv4_attention_weights(
+        self,
+        loader: W8A8WeightLoader,
+        layer_checkpoint_prefix: str,
+        attention_checkpoint_prefix: str,
+        layer_parameter_prefix: str,
+        attention: DeepseekV4Attention,
+        *,
+        w8a8_loader: Callable[[str, str, dict[str, int] | None], None],
+    ) -> None:
+        """Load the attention, layernorm, and HyperConnection weights of one layer."""
+        attention_parameter_prefix = layer_parameter_prefix + "self_attn."
+        w8a8_loader(
+            attention_checkpoint_prefix + "wq_a",
+            attention_parameter_prefix + "q_a_proj",
+            None,
+        )
+        w8a8_loader(
+            attention_checkpoint_prefix + "wq_b",
+            attention_parameter_prefix + "q_b_proj",
+            {"weight": 0, "weight_scale": 0, "weight_offset": 0},
+        )
+        w8a8_loader(
+            attention_checkpoint_prefix + "wkv",
+            attention_parameter_prefix + "kv_proj",
+            None,
+        )
+
+        loader.copy_in(
+            attention_parameter_prefix + "o_a_proj.weight",
+            loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_a.weight"), dim=0),
+        )
+        loader.copy_in(
+            attention_parameter_prefix + "o_b_proj.weight",
+            loader.shard(loader.load_tensor(attention_checkpoint_prefix + "wo_b.weight"), dim=1),
+        )
+        loader.copy_in(
+            attention_parameter_prefix + "q_a_layernorm.weight",
+            loader.load_tensor(attention_checkpoint_prefix + "q_norm.weight"),
+        )
+        loader.copy_in(
+            attention_parameter_prefix + "kv_a_layernorm.weight",
+            loader.load_tensor(attention_checkpoint_prefix + "kv_norm.weight"),
+        )
+
+        sink_key = _find_checkpoint_key(
+            loader,
+            (
+                attention_checkpoint_prefix + "attn_sink",
+                attention_checkpoint_prefix + "attn_sink.weight",
+            ),
+        )
+        if sink_key is not None:
+            sink = loader.load_tensor(sink_key)
+            if sink.dim() == 1 and sink.size(0) == self.cfg.n_heads and self.cfg.tp_size > 1:
+                shard_size = self.cfg.n_heads // self.cfg.tp_size
+                sink = sink.narrow(0, self.cfg.tp_rank * shard_size, shard_size)
+            loader.copy_in(attention_parameter_prefix + "attn_sink", sink)
+            attention.attn_sink_loaded = True
+
+        loader.copy_in(
+            layer_parameter_prefix + "input_layernorm.weight",
+            loader.load_tensor(layer_checkpoint_prefix + "attn_norm.weight"),
+        )
+        loader.copy_in(
+            layer_parameter_prefix + "post_attention_layernorm.weight",
+            loader.load_tensor(layer_checkpoint_prefix + "ffn_norm.weight"),
+        )
+        for part in ("attn", "ffn"):
+            for suffix in ("fn", "scale", "base"):
+                name = f"hc_{part}_{suffix}"
+                loader.copy_in(
+                    layer_parameter_prefix + "hc." + name,
+                    loader.load_tensor(layer_checkpoint_prefix + name),
+                )
+
     def load_weights(self, state_dicts, tp_rank: int, tp_size: int) -> None:
         cfg = self.cfg
         loader = W8A8WeightLoader(
@@ -2019,15 +2096,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
             ``W8A8DynamicLinear`` format -- NOT the static deq_scale/quant_bias
             format of ``W8A8StaticLinear``.
             """
-            for suffix in ("weight", "weight_scale", "weight_offset"):
-                ckpt_key = ckpt_prefix + "." + suffix
-                if not _has(ckpt_key):
-                    continue
-                t = loader.load_tensor(ckpt_key)
-                dim = (shard_dims or {}).get(suffix)
-                if dim is not None:
-                    t = loader.shard(t, dim=dim)
-                loader.copy_in(param_prefix + "." + suffix, t)
+            load_w8a8_dynamic_projection(loader, ckpt_prefix, param_prefix, shard_dims)
 
         # --- Embedding (checkpoint: embed.weight). ---
         loader.copy_in(
@@ -2040,57 +2109,14 @@ class DeepseekV4ForCausalLM(PyModelBase):
             ck = f"layers.{i}."  # checkpoint prefix
             pm = f"model.layers.{i}."  # parameter prefix
             attn = self.model.layers[i].self_attn
-            # Attention W8A8 projections (ckpt name -> module name).
-            _w8a8(ck + "attn.wq_a", pm + "self_attn.q_a_proj")
-            _w8a8(
-                ck + "attn.wq_b",
-                pm + "self_attn.q_b_proj",
-                {"weight": 0, "weight_scale": 0, "weight_offset": 0},
+            self._load_dsv4_attention_weights(
+                loader,
+                ck,
+                ck + "attn.",
+                pm,
+                attn,
+                w8a8_loader=_w8a8,
             )
-            _w8a8(ck + "attn.wkv", pm + "self_attn.kv_proj")
-            # o_a/o_b are bf16 (unquantized) column/row-parallel weights, not W8A8.
-            loader.copy_in(
-                pm + "self_attn.o_a_proj.weight",
-                loader.shard(loader.load_tensor(ck + "attn.wo_a.weight"), dim=0),
-            )
-            loader.copy_in(
-                pm + "self_attn.o_b_proj.weight",
-                loader.shard(loader.load_tensor(ck + "attn.wo_b.weight"), dim=1),
-            )
-            # Attention layernorms + sink.
-            loader.copy_in(
-                pm + "self_attn.q_a_layernorm.weight",
-                loader.load_tensor(ck + "attn.q_norm.weight"),
-            )
-            loader.copy_in(
-                pm + "self_attn.kv_a_layernorm.weight",
-                loader.load_tensor(ck + "attn.kv_norm.weight"),
-            )
-            # attn_sink (parameter): load either bare tensor or .weight form.
-            sink_key = ck + "attn.attn_sink"
-            if not _has(sink_key):
-                sink_key = ck + "attn.attn_sink.weight"
-            if _has(sink_key):
-                sink = loader.load_tensor(sink_key)
-                if sink.dim() == 1 and sink.size(0) == cfg.n_heads and cfg.tp_size > 1:
-                    shard_size = cfg.n_heads // cfg.tp_size
-                    sink = sink.narrow(0, cfg.tp_rank * shard_size, shard_size)
-                loader.copy_in(pm + "self_attn.attn_sink", sink)
-                attn.attn_sink_loaded = True
-            # Layer layernorms (ckpt attn_norm/ffn_norm -> input/post_attention).
-            loader.copy_in(
-                pm + "input_layernorm.weight",
-                loader.load_tensor(ck + "attn_norm.weight"),
-            )
-            loader.copy_in(
-                pm + "post_attention_layernorm.weight",
-                loader.load_tensor(ck + "ffn_norm.weight"),
-            )
-            # HyperConnection weights (ckpt layers.N.hc_* -> model.layers.N.hc.hc_*).
-            for part in ("attn", "ffn"):
-                for suffix in ("fn", "scale", "base"):
-                    name = f"hc_{part}_{suffix}"
-                    loader.copy_in(pm + "hc." + name, loader.load_tensor(ck + name))
             # Indexer weights (ckpt layers.N.attn.indexer.*).
             if attn.indexer is not None and _has(ck + "attn.indexer.wq_b.weight"):
                 # Indexer wq_b (ReplicatedLinear, not sharded) + weights_proj.

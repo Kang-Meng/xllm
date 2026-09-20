@@ -34,6 +34,10 @@ from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.platform import current_platform
 
 
+def _is_deepseek_v4_model_type(model_type: str) -> bool:
+    return model_type.startswith("deepseek_v4")
+
+
 def _resolve_graph_backend(config: dict) -> str:
     graph_backend = str(config.get("python_graph_backend", "off")).lower()
     graph_disabled = graph_backend in ("", "off", "none", "0")
@@ -53,7 +57,7 @@ def _create_attention_backend(
 ) -> AttentionBackend:
     config = config or {}
     model_type = config.get("model_type", "")
-    if model_type == "deepseek_v4" and current_platform.is_npu():
+    if _is_deepseek_v4_model_type(model_type) and current_platform.is_npu():
         from xllm.python.attention.dsa_attention import DsaAttentionBackend
 
         return DsaAttentionBackend(

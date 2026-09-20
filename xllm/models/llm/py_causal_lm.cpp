@@ -116,7 +116,8 @@ py::list build_python_kv_caches(std::vector<KVCache>& kv_caches) {
                        optional_tensor(kv_cache.get_v_cache()),
                        optional_tensor(kv_cache.get_index_cache()),
                        optional_tensor(kv_cache.get_conv_cache()),
-                       optional_tensor(kv_cache.get_ssm_cache())));
+                       optional_tensor(kv_cache.get_ssm_cache()),
+                       optional_tensor(kv_cache.get_swa_cache())));
   }
   return python_caches;
 }

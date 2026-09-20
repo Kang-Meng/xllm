@@ -26,11 +26,15 @@ if(USE_NPU)
     DEPS
       models
       GTest::gtest_main
+    ENVIRONMENT
+      "PYTHONPATH=${PROJECT_SOURCE_DIR}:$ENV{PYTHONPATH}"
   )
   target_link_libraries(py_causal_lm_test
                         PUBLIC Python::Python
                                ascendcl
                                hccl
                                c_sec
-                               nnopbase)
+                               nnopbase
+                               model_context
+                               npu_layers)
 endif()

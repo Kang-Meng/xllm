@@ -820,7 +820,7 @@ class DecodeAclGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
-    ) -> torch.Tensor:
+    ) -> ModelExecutionOutput:
         batch_size = input_ids.shape[0]
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None or self._is_untyped_spec_verify(metadata)
         # Same seq-vs-token admission as can_execute: MTP verify packs
