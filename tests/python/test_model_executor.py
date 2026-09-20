@@ -577,13 +577,15 @@ class TestModelExecutorConstruction:
                 max_seqs_per_batch=4,
             )
 
+    @pytest.mark.parametrize("is_spec_draft", [False, True])
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_acl_graph_capacity_respects_decode_batch_limit(
         self,
-        mock_create,
-        mock_graph_runner,
-    ):
+        mock_create: MagicMock,
+        mock_graph_runner: MagicMock,
+        is_spec_draft: bool,
+    ) -> None:
         mock_create.return_value = StubAttentionBackend()
         model = _FakeModel(num_layers=1)
 
@@ -596,6 +598,7 @@ class TestModelExecutorConstruction:
             max_seqs_per_batch=256,
             num_decoding_tokens=4,
             acl_graph_decode_batch_size_limit=16,
+            is_spec_draft=is_spec_draft,
         )
 
         # PR3 passes max_seqs_per_batch (sequences) directly as the runner's
@@ -613,6 +616,7 @@ class TestModelExecutorConstruction:
             16,
             num_decoding_tokens=4,
             enable_mega_moe_token_mask=False,
+            is_spec_draft=is_spec_draft,
         )
 
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
@@ -670,9 +674,9 @@ class TestModelExecutorConstruction:
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_acl_graph_data_parallel_passes_global_token_budget(
         self,
-        mock_create,
-        mock_graph_runner,
-    ):
+        mock_create: MagicMock,
+        mock_graph_runner: MagicMock,
+    ) -> None:
         mock_create.return_value = StubAttentionBackend()
         model = _FakeModel(num_layers=1)
 
@@ -705,6 +709,7 @@ class TestModelExecutorConstruction:
             None,
             num_decoding_tokens=4,
             enable_mega_moe_token_mask=True,
+            is_spec_draft=False,
         )
 
 

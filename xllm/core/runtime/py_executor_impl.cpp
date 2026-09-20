@@ -152,12 +152,16 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
+  const bool is_spec_draft =
+      options_.is_draft_engine() || (options_.enable_speculative_decode() &&
+                                     options_.num_decoding_tokens() == 1);
   py_executor_ = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),
       py_causal_lm_->config_dict(),
       options_.max_seqs_per_batch(),
       options_.num_decoding_tokens(),
-      ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit());
+      ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit(),
+      py::arg("is_spec_draft") = is_spec_draft);
 }
 
 PyExecutorImpl::~PyExecutorImpl() {

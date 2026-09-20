@@ -199,6 +199,80 @@ TEST(MtpAsyncInputBuilderTest, RejectsPageCountBeyondBlockTableWidth) {
                "Expanded KV length exceeds block-table capacity");
 }
 
+TEST(MtpAsyncInputBuilderTest, PybindViewOwnsGlobalDpKvMaxSequenceLengths) {
+  if (!Py_IsInitialized()) {
+    setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", /*overwrite=*/1);
+    Py_InitializeEx(/*initsigs=*/0);
+  }
+  py::gil_scoped_acquire gil;
+  py::module_ main_module = py::module_::import("__main__");
+  if (!py::hasattr(main_module, "AttentionMetadataView")) {
+    register_attention_metadata_views(main_module);
+  }
+
+  const std::vector<std::vector<int32_t>> histories = {{32769, 0}, {0, 32769}};
+  for (const std::vector<int32_t>& expected : histories) {
+    py::object py_metadata;
+    {
+      auto metadata = std::make_shared<layer::AttentionMetadata>();
+      metadata->kv_seq_lens_vec = {1};
+      metadata->max_seq_len = 1;
+      metadata->is_dummy = true;
+
+      ModelInputParams params;
+      params.parallel.dp_global_token_nums = {expected[0] == 0 ? 0 : 1,
+                                              expected[1] == 0 ? 0 : 1};
+      params.parallel.dp_global_kv_max_seq_lens = expected;
+      PyAttentionMetadataView view(std::move(metadata), params);
+      EXPECT_EQ(view.dp_global_kv_max_seq_lens(), expected);
+      EXPECT_EQ(view.dp_execution_token_counts(), (std::vector<int32_t>{1, 1}));
+      py_metadata = py::cast(std::move(view));
+
+      params.parallel.dp_global_kv_max_seq_lens = {7, 9};
+      EXPECT_EQ(py_metadata.attr("dp_global_kv_max_seq_lens")
+                    .cast<std::vector<int32_t>>(),
+                expected);
+    }
+
+    EXPECT_EQ(py_metadata.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>(),
+              expected);
+    py::list lengths = py_metadata.attr("dp_global_kv_max_seq_lens");
+    lengths[0] = py::int_(/*value=*/123);
+    EXPECT_EQ(py_metadata.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>(),
+              expected);
+    EXPECT_THROW(
+        py::setattr(py_metadata, "dp_global_kv_max_seq_lens", py::none()),
+        py::error_already_set);
+  }
+}
+
+TEST(MtpAsyncInputBuilderTest, PybindViewDefaultsGlobalDpKvMaxSequenceLengths) {
+  if (!Py_IsInitialized()) {
+    setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", /*overwrite=*/1);
+    Py_InitializeEx(/*initsigs=*/0);
+  }
+  py::gil_scoped_acquire gil;
+  py::module_ main_module = py::module_::import("__main__");
+  if (!py::hasattr(main_module, "AttentionMetadataView")) {
+    register_attention_metadata_views(main_module);
+  }
+
+  auto metadata = std::make_shared<layer::AttentionMetadata>();
+  py::object py_metadata = py::cast(PyAttentionMetadataView(metadata));
+  EXPECT_TRUE(py_metadata.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>()
+                  .empty());
+
+  ModelInputParams params;
+  py::object py_params_metadata =
+      py::cast(PyAttentionMetadataView(std::move(metadata), params));
+  EXPECT_TRUE(py_params_metadata.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>()
+                  .empty());
+}
+
 TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
   ensure_xllm_torch_ops_registered();
   if (!Py_IsInitialized()) {

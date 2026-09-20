@@ -120,6 +120,9 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly(
           "raw_dp_execution_token_counts",
           &PyAttentionMetadataView::raw_dp_execution_token_counts)
+      .def_property_readonly(
+          "dp_global_kv_max_seq_lens",
+          &PyAttentionMetadataView::dp_global_kv_max_seq_lens)
       .def_property_readonly("dp_is_decode",
                              &PyAttentionMetadataView::dp_is_decode)
       .def_property_readonly("q_seq_lens", &PyAttentionMetadataView::q_seq_lens)
@@ -249,6 +252,8 @@ PyAttentionMetadataView::PyAttentionMetadataView(
                dp_execution_token_counts_.end(),
                /*old_value=*/0,
                dummy_token_count);
+  // Empty DP shards retain zero history, even when they execute a dummy row.
+  dp_global_kv_max_seq_lens_ = params.parallel.dp_global_kv_max_seq_lens;
   dp_is_decode_ = params.parallel.dp_is_decode;
 }
 
@@ -359,6 +364,11 @@ const std::vector<int32_t>& PyAttentionMetadataView::dp_execution_token_counts()
 const std::vector<int32_t>&
 PyAttentionMetadataView::raw_dp_execution_token_counts() const {
   return raw_dp_execution_token_counts_;
+}
+
+const std::vector<int32_t>& PyAttentionMetadataView::dp_global_kv_max_seq_lens()
+    const {
+  return dp_global_kv_max_seq_lens_;
 }
 
 const std::vector<int32_t>& PyAttentionMetadataView::dp_is_decode() const {

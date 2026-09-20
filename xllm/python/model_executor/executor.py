@@ -135,6 +135,8 @@ class ModelExecutor:
         max_seqs_per_batch: int,
         num_decoding_tokens: int = 1,
         acl_graph_decode_batch_size_limit: int | None = None,
+        *,
+        is_spec_draft: bool = False,
     ) -> None:
         self.model = model
         self._kv_bound = False
@@ -263,6 +265,7 @@ class ModelExecutor:
                 enable_mega_moe_token_mask=bool(
                     config.get("enable_mega_moe", False) and token_owner_mega_moe_provider is None
                 ),
+                is_spec_draft=is_spec_draft,
             )
         else:
             if self.layerwise_split_size > 1:

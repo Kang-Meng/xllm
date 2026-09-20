@@ -131,6 +131,9 @@ class AttentionMetadata(Protocol):
     pd_handoff_reset_mask: torch.Tensor | None
     dp_execution_token_counts: Sequence[int]
     raw_dp_execution_token_counts: Sequence[int]
+    # Host-planned logical KV lengths for all DP ranks, including this query.
+    # Empty DP ranks retain zero; this is not reserved block-table capacity.
+    dp_global_kv_max_seq_lens: Sequence[int]
     mega_moe_token_mask: torch.Tensor | None
     dp_is_decode: Sequence[int]
     q_seq_lens: torch.Tensor | None

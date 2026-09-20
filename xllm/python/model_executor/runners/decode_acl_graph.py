@@ -176,6 +176,8 @@ class DecodeAclGraphRunner(BaseRunner):
         decode_batch_size_limit: int | None = None,
         num_decoding_tokens: int = 1,
         enable_mega_moe_token_mask: bool = False,
+        *,
+        is_spec_draft: bool = False,
     ) -> None:
         super().__init__(model, attention_backend, device)
         self.dp_size = dp_size
@@ -191,6 +193,7 @@ class DecodeAclGraphRunner(BaseRunner):
         self.decode_batch_size_limit = int(decode_batch_size_limit or 0)
         self.max_model_len = max_model_len
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
+        self._is_spec_draft = is_spec_draft
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
@@ -211,8 +214,9 @@ class DecodeAclGraphRunner(BaseRunner):
             # ranks, so local graph-admission checks cannot guarantee that the
             # whole group selects the same runner. Keep the target executor on
             # eager until the scheduler publishes one group-wide admission
-            # decision. Draft executors use num_decoding_tokens=1 and remain
-            # graphable.
+            # decision. Draft executors use width one; the history policy
+            # below also keeps DP/index-history drafts on Eager until their
+            # global history is refreshed for every draft iteration.
             return False
         batch_size = input_ids.numel()
         is_expanded_spec_verify = resolve_expanded_decode_metadata(
@@ -627,20 +631,52 @@ class DecodeAclGraphRunner(BaseRunner):
         if needs_linear_state:
             if linear_idx is None:
                 return False
-        # The kPool indexer's graph gather densifies each sequence to a
-        # static max_kv (graph_index_history_max_kv). A sequence whose block
-        # table outgrows that cap must take the eager runner's dynamic
-        # gather instead of capturing/replaying a too-small graph.
-        if any(getattr(cache, "index", None) is not None for cache in self.layer_caches):
-            max_kv_cap = getattr(self.attention_backend, "graph_index_history_max_kv", None)
-            effective_bt = self._effective_block_table(metadata)
-            if (
-                max_kv_cap is not None
-                and effective_bt is not None
-                and effective_bt.shape[1] * self.attention_backend.page_size > max_kv_cap
-            ):
+        return self._has_compatible_index_history(metadata)
+
+    def _has_compatible_index_history(self, metadata: AttentionMetadata) -> bool:
+        """Keep DP history-cap fallback independent of each rank's local table."""
+        if not any(getattr(cache, "index", None) is not None for cache in self.layer_caches):
+            return True
+        max_kv_cap = getattr(self.attention_backend, "graph_index_history_max_kv", None)
+        if max_kv_cap is None:
+            return True
+        if self.dp_size > 1:
+            if self._is_spec_draft:
+                # Draft iterations advance local KV without another host DP
+                # plan. Do not admit any rank from a stale global history.
+                # DP1 and non-index draft runners keep their existing paths.
                 return False
-        return True
+            # One DP shard can cross the cap while another has a shorter
+            # real history or only a dummy row. Local table-based fallback
+            # would mix Eager and Graph inside the same EP communication
+            # step. Consume the host plan; do not inspect device lengths or
+            # add a per-step collective.
+            global_kv_lengths = getattr(metadata, "dp_global_kv_max_seq_lens", None)
+            if global_kv_lengths is None:
+                return False
+            if not isinstance(global_kv_lengths, Sequence):
+                raise RuntimeError("DP index-history lengths must be a host sequence of nonnegative integers")
+            if not global_kv_lengths:
+                # Older/standalone metadata producers do not publish this
+                # contract. All such ranks must conservatively use Eager.
+                return False
+            if len(global_kv_lengths) != self.dp_size:
+                raise RuntimeError(f"DP index-history lengths must contain {self.dp_size} entries")
+            if any(
+                not isinstance(length, int) or isinstance(length, bool) or length < 0 for length in global_kv_lengths
+            ):
+                raise RuntimeError("DP index-history lengths must be nonnegative host integers")
+            page_size = self.attention_backend.page_size
+            if max_kv_cap <= 0 or max_kv_cap % page_size != 0:
+                return False
+            # These are full logical histories, including the current query;
+            # do not add one or divide by DP/DCP. Extra reserved table pages
+            # are masked by the graph gather and do not extend valid history.
+            return max(global_kv_lengths) <= max_kv_cap
+
+        # Preserve the existing TP-only admission rule and metadata contract.
+        effective_bt = self._effective_block_table(metadata)
+        return effective_bt is None or effective_bt.shape[1] * self.attention_backend.page_size <= max_kv_cap
 
     @staticmethod
     def _effective_block_table(metadata: AttentionMetadata) -> torch.Tensor | None:
