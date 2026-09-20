@@ -458,6 +458,24 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
   KVCacheState& hbm_state = sequence->kv_state();
   KVCacheState& host_state = sequence->host_kv_state();
   bool queued_offload = false;
+  size_t completed_tokens = hbm_state.kv_cache_tokens_num();
+  size_t cache_unit_size = 0;
+  const auto c128_entry = host_manager->leaf_entries().find(BlockType::C128);
+  if (c128_entry != host_manager->leaf_entries().end()) {
+    cache_unit_size = c128_entry->second.leaf->block_size();
+    CHECK_GT(cache_unit_size, 0u);
+    for (const auto& [type, entry] : host_manager->leaf_entries()) {
+      const size_t block_size = entry.leaf->block_size();
+      const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
+      completed_tokens =
+          std::min(completed_tokens,
+                   num_hash_blocks(hasher_type,
+                                   sequence->hash_tokens(hasher_type).size(),
+                                   block_size) *
+                       block_size);
+    }
+    completed_tokens = completed_tokens / cache_unit_size * cache_unit_size;
+  }
   for (const auto& [type, entry] : host_manager->leaf_entries()) {
     std::vector<Block>* hbm_blocks = hbm_state.mutable_blocks(type);
     std::vector<Block>* host_blocks = host_state.mutable_blocks(type);
@@ -521,7 +539,6 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
       continue;
     }
 
-    const size_t completed_tokens = hbm_state.kv_cache_tokens_num();
     size_t completed_blocks = completed_tokens / block_size;
     const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
     if (block_hash_lookahead(hasher_type) > 0) {
@@ -542,6 +559,15 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
     const size_t comparable_blocks =
         std::min({hbm_blocks->size(), host_blocks->size(), completed_blocks});
     for (size_t i = 0; i < comparable_blocks; ++i) {
+      if (type == BlockType::SWA && cache_unit_size > 0) {
+        CHECK_EQ(cache_unit_size % block_size, 0u);
+        const size_t blocks_per_unit = cache_unit_size / block_size;
+        const size_t blocks_per_window = std::min<size_t>(
+            blocks_per_unit, entry.leaf->options().swa_blocks_per_seq());
+        if (i % blocks_per_unit < blocks_per_unit - blocks_per_window) {
+          continue;
+        }
+      }
       Block& hbm_block = (*hbm_blocks)[i];
       Block& host_block = (*host_blocks)[i];
       // Prefix-capable HBM leaves are held by both the sequence and the device
@@ -645,6 +671,11 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
   // HBM leaf trims it, select the exact speculative checkpoint, pin it through
   // D2H, then publish it to Host/Store. FLAT_KV_LINEAR remains unsupported by
   // the hierarchy manager until that ownership and transfer protocol exists.
+  if (composite->leaf_combination() ==
+      CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
+    composite->cache_full_blocks_for_sequence(sequence);
+    collect_offload_pairs(sequence);
+  }
   if (!composite->allocate_sequence(sequence, num_tokens)) {
     release_host_match(sequence, dp_rank);
     return false;

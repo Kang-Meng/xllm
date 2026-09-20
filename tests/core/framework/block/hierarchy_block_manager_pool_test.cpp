@@ -25,7 +25,9 @@ limitations under the License.
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -116,6 +118,36 @@ class HierarchyPoolTestPeer final {
         pair.reset();
       }
     }
+  }
+
+  static std::set<std::pair<BlockType, std::string>> complete_offload_pairs(
+      HierarchyBlockManagerPool& pool) {
+    std::set<std::pair<BlockType, std::string>> stored_keys;
+    std::map<BlockType, std::vector<Block>> host_blocks;
+    std::vector<Block> device_blocks;
+    const size_t pair_count = pending_offload_pair_count(pool);
+    device_blocks.reserve(pair_count);
+    std::shared_ptr<OffloadBlockPair> pair;
+    while (pool.offload_block_pair_queues_.front().try_dequeue(pair)) {
+      stored_keys.emplace(pair->block_type,
+                          std::string(reinterpret_cast<const char*>(
+                                          pair->dst.get_immutable_hash_value()),
+                                      XXH3_128BITS_HASH_VALUE_LEN));
+      auto [blocks, inserted] = host_blocks.try_emplace(pair->block_type);
+      if (inserted) {
+        blocks->second.reserve(pair_count);
+      }
+      blocks->second.emplace_back(std::move(pair->dst));
+      device_blocks.emplace_back(std::move(pair->src));
+      pair.reset();
+    }
+    pool.block_managers_.front()->deallocate(device_blocks);
+    for (auto& [type, blocks] : host_blocks) {
+      auto* leaf = pool.host_block_managers_.front().at(type).leaf.get();
+      leaf->cache(blocks);
+      leaf->deallocate(blocks);
+    }
+    return stored_keys;
   }
 };
 
@@ -511,12 +543,17 @@ TEST(HierarchyBlockManagerPoolTest,
   sequence.kv_state().set_kv_cache_tokens_num(kPromptTokens);
   ASSERT_TRUE(pool.allocate(&sequence, kPromptTokens));
   sequence.kv_state().set_kv_cache_tokens_num(kPromptTokens);
+  const auto& host = HierarchyPoolTestPeer::host_block_managers(pool).front();
+  const size_t unit_tokens = host.at(BlockType::C128).leaf->block_size();
+  const size_t completed_units = kPromptTokens / unit_tokens;
+  const size_t checkpoint_block =
+      completed_units * unit_tokens / options.block_size() - 1;
+  const bool has_checkpoint =
+      sequence.kv_state().blocks(BlockType::SWA)[checkpoint_block].is_valid();
   pool.deallocate(&sequence);
 
-  // The active SWA window crosses the previous complete block and the partial
-  // tail block. Offload the complete SWA block together with the complete C128
-  // cache unit for every completed 2048-token interval.
-  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 19u);
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool),
+            2 * completed_units + static_cast<size_t>(has_checkpoint));
 }
 
 TEST(HierarchyBlockManagerPoolTest, AllocateSharedMountsMatchesWithoutH2d) {
@@ -1203,6 +1240,91 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_TRUE(sequence.host_kv_state().blocks(BlockType::C4)[1].is_valid());
   EXPECT_FALSE(sequence.host_kv_state().blocks(BlockType::C128)[0].is_valid());
   EXPECT_TRUE(sequence.host_kv_state().blocks(BlockType::C128)[1].is_valid());
+}
+
+TEST(HierarchyBlockManagerPoolTest, Dsv4OffloadWaitsForCompleteC128Unit) {
+  for (const bool decode : {false, true}) {
+    SCOPED_TRACE(decode);
+    auto options = make_typed_cache_options();
+    options.instance_is_decode(decode);
+    HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+    const auto& host = HierarchyPoolTestPeer::host_block_managers(pool).front();
+    const size_t unit_tokens = host.at(BlockType::C128).leaf->block_size();
+    std::vector<int32_t> tokens(decode ? unit_tokens - 1 : unit_tokens + 1,
+                                101);
+    Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+    if (decode) {
+      sequence.kv_state().set_kv_cache_tokens_num(unit_tokens - 1);
+    }
+    ASSERT_TRUE(pool.allocate(&sequence, unit_tokens));
+    sequence.kv_state().set_kv_cache_tokens_num(unit_tokens - 1);
+    HierarchyPoolTestPeer::device_composite(pool)
+        ->cache_full_blocks_for_sequence(&sequence);
+    HierarchyPoolTestPeer::collect_offload_pairs(pool, &sequence);
+    EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
+    if (decode) {
+      sequence.append_token(Token(101));
+    }
+    sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
+    pool.deallocate(&sequence);
+    EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 3u);
+  }
+}
+
+TEST(HierarchyBlockManagerPoolTest, Dsv4LargeChunksPersistEveryC128Checkpoint) {
+  for (const size_t unit_count : {2u, 4u}) {
+    SCOPED_TRACE(unit_count);
+    auto options = make_typed_cache_options();
+    options.enable_kvcache_store(true).prefetch_batch_size(8);
+    HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+    const auto& host = HierarchyPoolTestPeer::host_block_managers(pool).front();
+    const size_t unit_tokens = host.at(BlockType::C128).leaf->block_size();
+    const size_t completed_tokens = unit_count * unit_tokens;
+    std::vector<int32_t> tokens(completed_tokens + unit_tokens + 1, 97);
+    Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+    ASSERT_TRUE(pool.allocate(&sequence, completed_tokens));
+    sequence.kv_state().set_kv_cache_tokens_num(completed_tokens);
+    ASSERT_TRUE(pool.allocate(&sequence, completed_tokens + unit_tokens));
+    EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool),
+              unit_count * 3);
+
+    const auto stored_keys =
+        HierarchyPoolTestPeer::complete_offload_pairs(pool);
+    EXPECT_EQ(stored_keys.size(), unit_count * 3);
+    Sequence host_reader = make_test_sequence(/*index=*/1, tokens);
+    pool.allocate_shared(&host_reader);
+    EXPECT_EQ(host_reader.host_kv_state().kv_cache_tokens_num(),
+              completed_tokens);
+    const auto host_restore =
+        pool.select_host_cache_restore(&host_reader, unit_count);
+    EXPECT_EQ(host_restore.restore_target_tokens, completed_tokens);
+
+    FakePrefetchEngine engine(/*worker_count=*/1);
+    HierarchyBlockManagerPool replay_pool(options, &engine, /*dp_size=*/1);
+    auto request =
+        make_test_request(std::vector<int32_t>(completed_tokens + 1, 97));
+    bool done = false;
+    replay_pool.prefetch_from_storage(
+        request, [&](std::shared_ptr<Request>) { done = true; });
+    const auto& prefetch = engine.request();
+    std::vector<uint8_t> hits;
+    hits.reserve(prefetch.transfer_infos.size());
+    for (const auto& info : prefetch.transfer_infos) {
+      const std::string key(reinterpret_cast<const char*>(info.hash_key),
+                            XXH3_128BITS_HASH_VALUE_LEN);
+      hits.emplace_back(stored_keys.count({info.block_type, key}) != 0);
+    }
+    const auto hit_units = prefetch.count_prefix_hit_units(0, hits);
+    EXPECT_EQ(hit_units, unit_count);
+    engine.finish_worker(/*worker_index=*/0, hit_units.value_or(0));
+    EXPECT_TRUE(done);
+    EXPECT_EQ(
+        request->sequences().front()->host_kv_state().kv_cache_tokens_num(),
+        completed_tokens);
+    replay_pool.deallocate(request->sequences().front().get());
+    pool.deallocate(&host_reader);
+    pool.deallocate(&sequence);
+  }
 }
 
 TEST(HierarchyBlockManagerPoolTest,

@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/distributed_runtime/engine.h"
 #include "core/framework/block/composite_block_manager.h"
 #include "core/framework/block/hierarchy_block_manager_pool.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "core/framework/request/request.h"
 #include "core/framework/request/sequence.h"
 
@@ -479,10 +480,11 @@ TEST(TypedMtpPrefixCacheTest, DecodeOffloadWaitsForCompletedLookahead) {
   BlockManagerPool::Options options = typed_hierarchy_options();
   options.instance_is_decode(true);
   HierarchyBlockManagerPool pool(options, &engine);
-  Sequence sequence = make_mtp_sequence(std::vector<int32_t>(16, 7));
-  sequence.kv_state().set_kv_cache_tokens_num(16);
-  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/16));
-  sequence.kv_state().set_kv_cache_tokens_num(16);
+  const size_t unit_tokens = Dsv4CacheGeometry().compressed_block_token_size();
+  Sequence sequence = make_mtp_sequence(std::vector<int32_t>(unit_tokens, 7));
+  sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
+  ASSERT_TRUE(pool.allocate(&sequence, unit_tokens));
+  sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
   pool.deallocate(&sequence);
   pool.transfer_blocks();
   EXPECT_TRUE(engine.offloads().empty());
@@ -493,19 +495,22 @@ TEST(TypedMtpPrefixCacheTest, DecodeOffloadUsesConfirmedMtpIdentity) {
   BlockManagerPool::Options options = typed_hierarchy_options();
   options.instance_is_decode(true);
   HierarchyBlockManagerPool pool(options, &engine);
-  Sequence sequence = make_mtp_sequence(std::vector<int32_t>(16, 7));
-  sequence.kv_state().set_kv_cache_tokens_num(16);
-  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/16));
-  sequence.kv_state().set_kv_cache_tokens_num(16);
+  const size_t unit_tokens = Dsv4CacheGeometry().compressed_block_token_size();
+  Sequence sequence = make_mtp_sequence(std::vector<int32_t>(unit_tokens, 7));
+  sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
+  ASSERT_TRUE(pool.allocate(&sequence, unit_tokens));
+  sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
   sequence.append_token(Token(8));
-  ASSERT_EQ(sequence.kv_cache_tokens_num(), 16u);
-  ASSERT_EQ(sequence.hash_tokens(BlockHasherType::MTP_TEXT).size(), 17u);
-  sequence.update_block_hashes(/*block_size=*/16, BlockHasherType::MTP_TEXT);
-  ASSERT_EQ(sequence.block_hashes().size(), 1u);
-  const XXH3Key expected_hash = sequence.block_hashes()[0];
+  ASSERT_EQ(sequence.kv_cache_tokens_num(), unit_tokens);
+  ASSERT_EQ(sequence.hash_tokens(BlockHasherType::MTP_TEXT).size(),
+            unit_tokens + 1);
+  sequence.update_block_hashes(options.block_size(), BlockHasherType::MTP_TEXT);
+  const size_t swa_blocks = unit_tokens / options.block_size();
+  ASSERT_EQ(sequence.block_hashes().size(), swa_blocks);
+  const XXH3Key expected_hash = sequence.block_hashes()[swa_blocks - 1];
   pool.deallocate(&sequence);
   pool.transfer_blocks();
-  ASSERT_EQ(engine.offloads().size(), 1u);
+  ASSERT_EQ(engine.offloads().size(), 3u);
   EXPECT_EQ(engine.offloads()[0].block_type, BlockType::SWA);
   EXPECT_EQ(XXH3Key(engine.offloads()[0].hash_key), expected_hash);
 }
@@ -515,33 +520,30 @@ TEST(TypedPrefixCacheTest, DecodeOffloadUsesContentIdentityWithoutDeviceStamp) {
   BlockManagerPool::Options options = typed_hierarchy_options();
   options.instance_is_decode(true).hasher_type(BlockHasherType::TEXT);
   HierarchyBlockManagerPool pool(options, &engine);
+  const size_t unit_tokens = Dsv4CacheGeometry().compressed_block_token_size();
   const PrefixHash unstamped_hash{};
   XXH3Key previous_hash(unstamped_hash.data());
   for (int32_t token : {7, 8}) {
-    Sequence sequence = make_mtp_sequence(std::vector<int32_t>(16, token));
+    Sequence sequence =
+        make_mtp_sequence(std::vector<int32_t>(unit_tokens, token));
     // Decode receives the completed prefix from prefill rather than probing
     // the grouped device prefix cache locally.
-    sequence.kv_state().set_kv_cache_tokens_num(16);
-    ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/16));
-    sequence.kv_state().set_kv_cache_tokens_num(16);
+    sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
+    ASSERT_TRUE(pool.allocate(&sequence, unit_tokens));
+    sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
     // An offload-only device block has no content stamp. Give it a known
     // unrelated value so copying it fails deterministically.
     sequence.kv_state()
         .mutable_blocks(BlockType::SWA)
-        ->at(0)
+        ->back()
         .set_hash_value(unstamped_hash.data());
-    auto hasher =
-        BlockHasher::create(BlockHasherType::TEXT, sequence.mm_data());
-    XXH3Key expected_hash;
-    hasher->compute(sequence.tokens(),
-                    /*start_token_idx=*/0,
-                    /*end_token_idx=*/16,
-                    /*pre_hash_value=*/nullptr,
-                    expected_hash);
+    sequence.update_block_hashes(options.block_size(), BlockHasherType::TEXT);
+    const XXH3Key expected_hash =
+        sequence.block_hashes()[unit_tokens / options.block_size() - 1];
     EXPECT_NE(expected_hash, previous_hash);
     pool.deallocate(&sequence);
     pool.transfer_blocks();
-    ASSERT_EQ(engine.offloads().size(), 1u);
+    ASSERT_EQ(engine.offloads().size(), 3u);
     EXPECT_EQ(engine.offloads()[0].block_type, BlockType::SWA);
     EXPECT_EQ(XXH3Key(engine.offloads()[0].hash_key), expected_hash);
     previous_hash = expected_hash;
