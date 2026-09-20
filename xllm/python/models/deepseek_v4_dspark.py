@@ -260,27 +260,13 @@ class DeepseekV4DSparkForCausalLM(
                 description=f"DeepSeek-V4 DSpark {checkpoint_module}",
             )
 
-        attention_prefix = _find_checkpoint_prefix(
+        attention, _ = self._load_dsv4_attention(
             loader,
-            (
-                checkpoint_prefix + "attn.",
-                checkpoint_prefix + "self_attn.",
-            ),
-            ("wq_a.weight", "wkv.weight"),
-        )
-        if attention_prefix is None:
-            raise KeyError(f"DeepSeek-V4 DSpark layer {layer_id} attention weights not found")
-
-        attention = self.model.layers[layer_id].self_attn
-        self._load_dsv4_attention_weights(
-            loader,
-            checkpoint_prefix,
-            attention_prefix,
-            parameter_prefix,
-            attention,
+            checkpoint_prefix=checkpoint_prefix,
+            parameter_prefix=parameter_prefix,
+            layer_id=layer_id,
             w8a8_loader=_w8a8,
         )
-
         attention.process_weights_after_loading()
 
         mlp = self.model.layers[layer_id].mlp

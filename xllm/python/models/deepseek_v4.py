@@ -2071,6 +2071,38 @@ class DeepseekV4ForCausalLM(PyModelBase):
                     loader.load_tensor(layer_checkpoint_prefix + name),
                 )
 
+    def _load_dsv4_attention(
+        self,
+        loader: W8A8WeightLoader,
+        checkpoint_prefix: str,
+        parameter_prefix: str,
+        layer_id: int,
+        *,
+        w8a8_loader: Callable[[str, str, dict[str, int] | None], None],
+    ) -> tuple[DeepseekV4Attention, str]:
+        """Resolve and load one attention block from a supported checkpoint layout."""
+        attention_prefix = _find_checkpoint_prefix(
+            loader,
+            (
+                checkpoint_prefix + "attn.",
+                checkpoint_prefix + "self_attn.",
+            ),
+            ("wq_a.weight", "wkv.weight"),
+        )
+        if attention_prefix is None:
+            raise KeyError(f"DeepSeek-V4 layer {layer_id} attention weights not found")
+
+        attention = self.model.layers[layer_id].self_attn
+        self._load_dsv4_attention_weights(
+            loader,
+            checkpoint_prefix,
+            attention_prefix,
+            parameter_prefix,
+            attention,
+            w8a8_loader=w8a8_loader,
+        )
+        return attention, attention_prefix
+
     def load_weights(self, state_dicts, tp_rank: int, tp_size: int) -> None:
         cfg = self.cfg
         loader = W8A8WeightLoader(
@@ -2108,33 +2140,31 @@ class DeepseekV4ForCausalLM(PyModelBase):
         for i in range(cfg.n_layers):
             ck = f"layers.{i}."  # checkpoint prefix
             pm = f"model.layers.{i}."  # parameter prefix
-            attn = self.model.layers[i].self_attn
-            self._load_dsv4_attention_weights(
+            attn, attention_prefix = self._load_dsv4_attention(
                 loader,
-                ck,
-                ck + "attn.",
-                pm,
-                attn,
+                checkpoint_prefix=ck,
+                parameter_prefix=pm,
+                layer_id=i,
                 w8a8_loader=_w8a8,
             )
             # Indexer weights (ckpt layers.N.attn.indexer.*).
-            if attn.indexer is not None and _has(ck + "attn.indexer.wq_b.weight"):
+            if attn.indexer is not None and _has(attention_prefix + "indexer.wq_b.weight"):
                 # Indexer wq_b (ReplicatedLinear, not sharded) + weights_proj.
-                _w8a8(ck + "attn.indexer.wq_b", pm + "self_attn.indexer.wq_b")
+                _w8a8(attention_prefix + "indexer.wq_b", pm + "self_attn.indexer.wq_b")
                 loader.copy_in(
                     pm + "self_attn.indexer.weights_proj.weight",
-                    loader.load_tensor(ck + "attn.indexer.weights_proj.weight"),
+                    loader.load_tensor(attention_prefix + "indexer.weights_proj.weight"),
                 )
                 # Compressor sub-module: wkv (unquantized f32 fused wk+wv) +
                 # wgate + ape + norm (all f32, not W8A8).
                 self._load_dsv4_compressor_from_prefixes(
                     loader,
                     (
-                        ck + "attn.indexer.compressor.",
-                        ck + "attn.indexer.compress.",
+                        attention_prefix + "indexer.compressor.",
+                        attention_prefix + "indexer.compress.",
                     ),
                     pm + "self_attn.indexer.compressor_",
-                    f"DeepSeek-V4 indexer compressor weights not found under {ck}attn.indexer",
+                    f"DeepSeek-V4 indexer compressor weights not found under {attention_prefix}indexer",
                 )
             # Attention-level cmp_kv compressor (head_dim=512, separate from the
             # indexer compressor at head_dim=128). Ckpt: attn.compressor.* or
@@ -2144,11 +2174,11 @@ class DeepseekV4ForCausalLM(PyModelBase):
                 self._load_dsv4_compressor_from_prefixes(
                     loader,
                     (
-                        ck + "attn.compressor.",
-                        ck + "attn.compress.",
+                        attention_prefix + "compressor.",
+                        attention_prefix + "compress.",
                     ),
                     pm + "self_attn.cmp_",
-                    f"DeepSeek-V4 attention compressor weights not found under {ck}attn",
+                    f"DeepSeek-V4 attention compressor weights not found under {attention_prefix}",
                 )
             attn.process_weights_after_loading()
             # MoE / dense MLP weights. MoE layers use hash routing

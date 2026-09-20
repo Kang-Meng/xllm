@@ -79,6 +79,7 @@ def test_load_weights_routes_compressor_aliases_through_loader(
     tensors = {
         "embed.weight": torch.ones(1),
         "norm.weight": torch.ones(1),
+        "layers.0.attn.wq_a.weight": torch.ones(1),
         attention_prefix + "k_proj.weight": torch.full((2, 3), 1.0),
         attention_prefix + "v_proj.weight": torch.full((4, 3), 2.0),
         attention_prefix + "score_proj.weight": torch.full((6, 3), 3.0),
