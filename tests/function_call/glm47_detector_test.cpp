@@ -71,6 +71,19 @@ class Glm47DetectorTest : public ::testing::Test {
   std::vector<JsonTool> tools_;
 };
 
+namespace {
+// Concatenate the streamed argument fragments of one parse result.
+std::string collect_streamed_args(const StreamingParseResult& result) {
+  std::string arguments;
+  for (const auto& call : result.calls) {
+    if (!call.name.has_value()) {
+      arguments += call.parameters;
+    }
+  }
+  return arguments;
+}
+}  // namespace
+
 // Test constructor and basic properties
 TEST_F(Glm47DetectorTest, ConstructorInitializesCorrectly) {
   EXPECT_NE(detector_, nullptr);
@@ -435,6 +448,90 @@ TEST_F(Glm47DetectorTest, StreamingParseWithNormalText) {
   auto result3 = detector_->parse_streaming_increment(chunk3, tools_);
   EXPECT_GE(result3.calls.size(), 1);
   EXPECT_EQ(result3.calls[0].name.value(), "get_weather");
+}
+
+// The marker can share one increment with the tail of the normal text: MTP
+// emits several tokens per step, and delayed streaming callbacks can carry
+// several steps at once. That tail must still be streamed; dropping it
+// truncates responses that do contain tool calls only in stream mode.
+TEST_F(Glm47DetectorTest, StreamingKeepsNormalTextBeforeMarkerInSameChunk) {
+  auto result1 = detector_->parse_streaming_increment(
+      "根据您的经营目标，我来为您生成全站智能推广的", tools_);
+  EXPECT_EQ(result1.normal_text,
+            "根据您的经营目标，我来为您生成全站智能推广的");
+
+  // Marker and the tail of the sentence arrive together.
+  auto result2 = detector_->parse_streaming_increment(
+      "投放方案。<tool_call>get_weather\n<arg_key>", tools_);
+  EXPECT_EQ(result2.normal_text, "投放方案。");
+  ASSERT_EQ(result2.calls.size(), 1);
+  EXPECT_TRUE(result2.calls[0].name.has_value());
+  EXPECT_EQ(result2.calls[0].name.value(), "get_weather");
+
+  auto result3 = detector_->parse_streaming_increment(
+      "city</arg_key>\n<arg_value>Beijing", tools_);
+  auto result4 = detector_->parse_streaming_increment("</arg_value>", tools_);
+  auto result5 = detector_->parse_streaming_increment("\n</tool_call>", tools_);
+
+  EXPECT_EQ(result1.normal_text + result2.normal_text,
+            "根据您的经营目标，我来为您生成全站智能推广的投放方案。");
+
+  std::string streamed_args = collect_streamed_args(result3) +
+                              collect_streamed_args(result4) +
+                              collect_streamed_args(result5);
+  ASSERT_FALSE(streamed_args.empty());
+  nlohmann::json params = nlohmann::json::parse(streamed_args);
+  EXPECT_EQ(params["city"], "Beijing");
+}
+
+// An increment ending with '<' is held back as a possible marker start. The
+// held text must be flushed once the marker turns out to be a real tool call.
+TEST_F(Glm47DetectorTest, StreamingKeepsNormalTextHeldByPotentialMarkerPrefix) {
+  auto result1 = detector_->parse_streaming_increment("First part ", tools_);
+  EXPECT_EQ(result1.normal_text, "First part ");
+
+  auto result2 = detector_->parse_streaming_increment("second part.<", tools_);
+  EXPECT_EQ(result2.normal_text, "");
+  EXPECT_EQ(result2.calls.size(), 0);
+
+  auto result3 = detector_->parse_streaming_increment(
+      "tool_call>get_weather<arg_key>city</arg_key>", tools_);
+  EXPECT_EQ(result3.normal_text, "second part.");
+  ASSERT_GE(result3.calls.size(), 1);
+  EXPECT_TRUE(result3.calls[0].name.has_value());
+  EXPECT_EQ(result3.calls[0].name.value(), "get_weather");
+
+  auto result4 = detector_->parse_streaming_increment(
+      "<arg_value>Beijing</arg_value></tool_call>", tools_);
+  std::string streamed_args = collect_streamed_args(result4);
+  ASSERT_FALSE(streamed_args.empty());
+  nlohmann::json params = nlohmann::json::parse(streamed_args);
+  EXPECT_EQ(params["city"], "Beijing");
+}
+
+// Normal text that follows a completed tool call shares the increment that
+// carries the next marker, so it must be flushed as well.
+TEST_F(Glm47DetectorTest, StreamingKeepsNormalTextBetweenToolCalls) {
+  auto result1 = detector_->parse_streaming_increment(
+      "<tool_call>get_weather<arg_key>city</arg_key>"
+      "<arg_value>Beijing</arg_value></tool_call>",
+      tools_);
+  ASSERT_GE(result1.calls.size(), 1);
+  EXPECT_EQ(result1.calls[0].name.value(), "get_weather");
+
+  // Finalizes the first call; the following text stays buffered together with
+  // the second marker.
+  auto result2 = detector_->parse_streaming_increment(
+      "中间说明<tool_call>calculate<arg_key>expression</arg_key>", tools_);
+  EXPECT_EQ(result2.normal_text, "");
+  EXPECT_GE(result2.calls.size(), 1);
+
+  auto result3 = detector_->parse_streaming_increment(
+      "<arg_value>1 + 2</arg_value></tool_call>", tools_);
+  EXPECT_EQ(result3.normal_text, "中间说明");
+  ASSERT_GE(result3.calls.size(), 1);
+  EXPECT_TRUE(result3.calls[0].name.has_value());
+  EXPECT_EQ(result3.calls[0].name.value(), "calculate");
 }
 
 // Object/array arg values also end with '}'. Streaming must still emit the

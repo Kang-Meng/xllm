@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 namespace xllm {
 namespace function_call {
@@ -681,7 +682,19 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
       return StreamingParseResult("", {});
     }
 
-    size_t content_start = bot_pos + bot_token_.length();
+    // Normal text buffered before the marker must be returned to the client.
+    // The marker can share one increment with the tail of the normal text (MTP
+    // emits several tokens per step, and delayed streaming callbacks can carry
+    // several steps at once), and this branch used to discard that prefix,
+    // silently truncating the response. The non-streaming path keeps it through
+    // extract_normal_text().
+    std::string normal_text = current_text.substr(0, bot_pos);
+    if (!normal_text.empty()) {
+      current_text.erase(0, bot_pos);
+      buffer_ = current_text;
+    }
+
+    size_t content_start = bot_token_.length();
     size_t eot_pos = current_text.find(eot_token_, content_start);
     bool is_tool_end_flag = (eot_pos != std::string::npos);
 
@@ -722,7 +735,7 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
       // - Or we have </tool_call> (tool call ended with no args)
       if (func_name.empty() || (func_args_raw.empty() && !is_tool_end_flag)) {
         // Function name not yet complete, wait for more data
-        return StreamingParseResult("", {});
+        return StreamingParseResult(normal_text, {});
       }
       calls.push_back(ToolCallItem(current_tool_id_, func_name, ""));
       current_tool_name_sent_ = true;
@@ -782,7 +795,7 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
         // Remove the completed tool call from buffer
         buffer_ = current_text.substr(eot_pos + eot_token_.length());
 
-        StreamingParseResult result("", calls);
+        StreamingParseResult result(std::move(normal_text), calls);
         current_tool_id_++;
         last_arguments_ = "";
         current_tool_name_sent_ = false;
@@ -792,7 +805,7 @@ StreamingParseResult Glm47Detector::parse_streaming_increment(
       }
     }
 
-    return StreamingParseResult("", calls);
+    return StreamingParseResult(std::move(normal_text), calls);
 
   } catch (const std::exception& e) {
     LOG(ERROR) << "Error in parse_streaming_increment: " << e.what();
