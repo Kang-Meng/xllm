@@ -36,6 +36,7 @@ class LinearStateBlockManager final : public BlockManagerImpl {
 
   std::optional<std::vector<Block>> allocate_for_sequence(
       Sequence* seq,
+      KVCacheState& kv_state,
       size_t num_tokens) override;
 
   using BlockManagerImpl::allocate;
@@ -54,10 +55,12 @@ class LinearStateBlockManager final : public BlockManagerImpl {
   using BlockManagerImpl::cache;
 
  private:
-  void cache_read_source(Sequence* seq);
-  void retain_read_source(Sequence* seq);
-  std::optional<std::vector<Block>> allocate_prefill(Sequence* seq);
-  std::optional<std::vector<Block>> allocate_decode(Sequence* seq);
+  void cache_read_source(Sequence* seq, KVCacheState& kv_state);
+  void retain_read_source(KVCacheState& kv_state);
+  std::optional<std::vector<Block>> allocate_prefill(Sequence* seq,
+                                                     KVCacheState& kv_state);
+  std::optional<std::vector<Block>> allocate_decode(
+      const KVCacheState& kv_state);
 
   friend class BlockManagerPoolTestPeer;
 };

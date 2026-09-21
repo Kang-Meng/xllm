@@ -160,15 +160,6 @@ std::vector<Block> XTensorBlockManagerImpl::allocate(size_t num_blocks) {
 
 std::optional<std::vector<Block>>
 XTensorBlockManagerImpl::allocate_for_sequence(Sequence* seq,
-                                               size_t num_tokens) {
-  if (seq == nullptr) {
-    return std::nullopt;
-  }
-  return allocate_for_sequence(seq, seq->kv_state(), num_tokens);
-}
-
-std::optional<std::vector<Block>>
-XTensorBlockManagerImpl::allocate_for_sequence(Sequence* seq,
                                                KVCacheState& kv_state,
                                                size_t num_tokens) {
   if (seq == nullptr) {

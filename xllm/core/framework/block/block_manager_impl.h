@@ -40,9 +40,6 @@ class BlockManagerImpl : public BlockManager {
   // flat-KV / compressed / xtensor leaves; SlidingWindow and Single override.
   std::optional<std::vector<Block>> allocate_for_sequence(
       Sequence* seq,
-      size_t num_tokens) override;
-  std::optional<std::vector<Block>> allocate_for_sequence(
-      Sequence* seq,
       KVCacheState& kv_state,
       size_t num_tokens) override;
   bool allocate_for_prefetch(Sequence* seq, size_t num_tokens) override;

@@ -16,7 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <atomic>
-#include <map>
+#include <memory>
 
 #include "block_manager_pool.h"
 #include "composite_block_manager.h"
@@ -72,9 +72,8 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
  private:
   friend class HierarchyPoolTestPeer;
   void release_host_match(Sequence* sequence, int32_t dp_rank);
-  void collect_offload_pairs(Sequence* sequence,
-                             int32_t dp_rank,
-                             size_t completed_tokens);
+  void collect_load_block_transfer_infos(Sequence* sequence);
+  void collect_offload_pairs(Sequence* sequence);
   bool should_probe_prefix_cache(Sequence* sequence) const;
   void transfer_offload_blocks();
 
@@ -83,7 +82,7 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
  private:
   Engine* engine_;
   // Per-DP Host block managers discovered from the device prefix-cache leaves.
-  std::vector<CompositeBlockManager::LeafMap> host_block_managers_;
+  std::vector<std::unique_ptr<CompositeBlockManager>> host_block_managers_;
 
   // Per-DP H2D descriptions waiting to be registered with workers. Blocks stay
   // owned only by the Sequence's Host/device cache states.
