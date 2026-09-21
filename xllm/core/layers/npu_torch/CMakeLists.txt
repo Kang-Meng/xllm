@@ -2,6 +2,18 @@ include(cc_library)
 
 cc_library(
   NAME
+    qwen3_5_gdn_indices
+  HDRS
+    qwen3_5_gdn_indices.h
+  SRCS
+    qwen3_5_gdn_indices.cpp
+  DEPS
+    torch
+    glog::glog
+)
+
+cc_library(
+  NAME
     npu_torch_layers
   HDRS
     fused_moe.h
@@ -43,6 +55,7 @@ cc_library(
     deepseek_v4_indexer.cpp
     deepseek_v4_gate.cpp
   DEPS
+    :qwen3_5_gdn_indices
     :common_layers
     :npu_layers
     :xllm_ops

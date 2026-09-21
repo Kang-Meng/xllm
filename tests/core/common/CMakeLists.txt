@@ -3,6 +3,7 @@ include(cc_test)
 cc_test(
   NAME
     common_test
+  CPU_ONLY
   SRCS
     flash_comm1_context_test.cpp
     metrics_test.cpp

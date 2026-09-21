@@ -8,6 +8,7 @@ endif()
 cc_test(
   NAME
     anthropic_protocol_test
+  CPU_ONLY
   SRCS
     anthropic_protocol_test.cpp
   DEPS
@@ -24,6 +25,7 @@ cc_test(
 cc_test(
   NAME
     anthropic_service_test
+  CPU_ONLY
   SRCS
     anthropic_service_test.cpp
   DEPS
@@ -38,6 +40,7 @@ add_dependencies(anthropic_service_test brpc-static)
 cc_test(
   NAME
     api_service_test
+  CPU_ONLY
   SRCS
     chat_json_parser_test.cpp
   DEPS
@@ -51,6 +54,7 @@ cc_test(
 cc_test(
   NAME
     completion_json_parser_test
+  CPU_ONLY
   SRCS
     completion_json_parser_test.cpp
   DEPS
@@ -62,6 +66,7 @@ cc_test(
 cc_test(
   NAME
     request_id_test
+  CPU_ONLY
   SRCS
     request_id_test.cpp
   DEPS
@@ -72,6 +77,7 @@ cc_test(
 cc_test(
   NAME
     request_admission_test
+  CPU_ONLY
   SRCS
     request_admission_test.cpp
   DEPS
@@ -82,6 +88,7 @@ cc_test(
 cc_test(
   NAME
     mm_service_utils_test
+  CPU_ONLY
   SRCS
     mm_service_utils_test.cpp
   DEPS
@@ -103,6 +110,7 @@ cc_test(
 cc_test(
   NAME
     anthropic_json_test
+  CPU_ONLY
   SRCS
     anthropic_json_test.cpp
   DEPS
@@ -116,6 +124,7 @@ cc_test(
 cc_test(
   NAME
     anthropic_stream_utils_test
+  CPU_ONLY
   SRCS
     anthropic_stream_utils_test.cpp
     ../../xllm/api_service/anthropic_stream_utils.cpp
@@ -127,6 +136,7 @@ cc_test(
 cc_test(
   NAME
     usage_json_test
+  CPU_ONLY
   SRCS
     usage_json_test.cpp
   DEPS
@@ -140,6 +150,7 @@ cc_test(
 cc_test(
   NAME
     sample_service_impl_test
+  CPU_ONLY
   SRCS
     sample_service_impl_test.cpp
   DEPS
@@ -150,6 +161,7 @@ cc_test(
 cc_test(
   NAME
     models_service_impl_test
+  CPU_ONLY
   SRCS
     models_service_impl_test.cpp
   DEPS
@@ -163,6 +175,7 @@ cc_test(
 cc_test(
   NAME
     openai_service_test
+  CPU_ONLY
   SRCS
     openai_service_test.cpp
   DEPS

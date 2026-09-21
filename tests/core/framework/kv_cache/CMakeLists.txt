@@ -3,6 +3,7 @@ include(cc_test)
 cc_test(
   NAME
     cache_layout_builder_test
+  CPU_ONLY
   SRCS
     cache_layout_builder_test.cpp
   DEPS
@@ -20,6 +21,7 @@ target_link_libraries(cache_layout_builder_test
 cc_test(
   NAME
     kv_cache_estimation_test
+  CPU_ONLY
   SRCS
     kv_cache_estimation_test.cpp
   DEPS
@@ -54,6 +56,7 @@ target_link_libraries(kv_cache_test
 cc_test(
   NAME
     linear_state_restore_test
+  CPU_ONLY
   SRCS
     linear_state_restore_test.cpp
   DEPS

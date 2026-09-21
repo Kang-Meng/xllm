@@ -6,6 +6,7 @@ include(cc_test)
 cc_test(
   NAME
     spawn_worker_protocol_test
+  CPU_ONLY
   SRCS
     spawn_worker_protocol_test.cpp
   DEPS

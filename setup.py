@@ -27,6 +27,7 @@ from scripts.build_support.env import (
     set_musa_envs,
     set_npu_envs,
 )
+from scripts.build_support.testing import prepare_test_environment
 from scripts.build_support.utils import (
     check_and_install_pre_commit,
     get_ascend_platform,
@@ -665,6 +666,8 @@ class ExtBuildSingleTest(ExtBuild):
                         test_executable = candidate
                         break
 
+        env = prepare_test_environment(env, cmake_dir)
+        logger.info(f"Test Torch extensions cache: {env['TORCH_EXTENSIONS_DIR']}")
         if not test_executable:
             # If not found, try using ctest to run
             logger.warning(f"⚠️  Could not find test executable {self.test_name}, trying ctest...")
@@ -849,6 +852,8 @@ class TestUT(Command):
         default_parallel: int = max(os.cpu_count() or 1, 8)
         test_parallel: str = os.getenv("CTEST_PARALLEL", str(default_parallel))
         logger.info(f"Test parallelism: {test_parallel} (set CTEST_PARALLEL to override)")
+        test_environment = prepare_test_environment(dict(os.environ), cmake_dir)
+        logger.info(f"Test Torch extensions cache: {test_environment['TORCH_EXTENSIONS_DIR']}")
 
         def run_subprocess_with_streaming(
             cmd: list[str],
@@ -859,6 +864,7 @@ class TestUT(Command):
             process = subprocess.Popen(
                 cmd,
                 cwd=cmake_dir,
+                env=test_environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,

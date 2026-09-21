@@ -3,27 +3,15 @@ include(cc_test)
 cc_test(
   NAME
     qwen3_5_gated_delta_net_indices_test
+  CPU_ONLY
   SRCS
     qwen3_5_gated_delta_net_indices_test.cpp
   DEPS
-    :npu_torch_layers
+    :qwen3_5_gdn_indices
     glog::glog
     torch
     GTest::gtest_main
 )
-
-target_link_libraries(qwen3_5_gated_delta_net_indices_test
-                      PRIVATE
-                      ascendcl
-                      hccl
-                      c_sec
-                      nnopbase
-                      atb)
-
-target_link_options(qwen3_5_gated_delta_net_indices_test PRIVATE
-  "-Wl,--whole-archive"
-  "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
-  "-Wl,--no-whole-archive")
 
 get_property(_qwen3_5_gdn_tests DIRECTORY PROPERTY TESTS)
 list(FILTER _qwen3_5_gdn_tests
@@ -33,6 +21,7 @@ set_tests_properties(${_qwen3_5_gdn_tests} PROPERTIES RUN_SERIAL TRUE)
 cc_test(
   NAME
     deepseek_v4_eplb_load_utils_test
+  CPU_ONLY
   SRCS
     deepseek_v4_eplb_load_utils_test.cpp
   DEPS
@@ -71,6 +60,7 @@ target_link_options(npu_deepseek_v4_indexer_test PRIVATE
 cc_test(
   NAME
     deepseek_v4_eplb_test
+  CPU_ONLY
   SRCS
     deepseek_v4_eplb_test.cpp
   DEPS

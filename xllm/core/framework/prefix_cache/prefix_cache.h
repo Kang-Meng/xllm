@@ -33,7 +33,6 @@ limitations under the License.
 #include "framework/block/block.h"
 #include "util/hash_util.h"
 #include "util/slice.h"
-#include "util/threadpool.h"
 
 namespace xllm {
 
@@ -61,10 +60,7 @@ class PrefixCache {
                        BlockHasherType hasher_type = BlockHasherType::TEXT)
       : block_size_(block_size), hasher_type_(hasher_type), num_blocks_(0) {}
 
-  virtual ~PrefixCache() {
-    exited_.store(true);
-    sleep(2);
-  };
+  virtual ~PrefixCache() = default;
 
   // Solid-prefix probe: walks the chain per block position, stops on the
   // first miss. Reach in tokens is `returned.size() * block_size_`.
@@ -192,8 +188,6 @@ class PrefixCache {
   uint32_t block_size_;
   BlockHasherType hasher_type_;
   size_t num_blocks_ = 0;
-  std::atomic_bool exited_{false};
-
   std::unordered_map<XXH3Key, Node*, FixedStringKeyHash, FixedStringKeyEqual>
       cached_blocks_;
 

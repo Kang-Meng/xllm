@@ -39,7 +39,7 @@ function(cc_test)
 
   cmake_parse_arguments(
     CC_TEST # prefix
-    "" # options
+    "CPU_ONLY" # options
     "NAME;ENVIRONMENT" # one value args
     "SRCS;COPTS;LINKOPTS;DEPS;INCLUDES;ARGS;DATA" # multi value args
     ${ARGN}
@@ -112,7 +112,7 @@ function(cc_test)
     PRIVATE ${CC_TEST_LINKOPTS}
   )
 
-  if(USE_NPU)
+  if(USE_NPU AND NOT CC_TEST_CPU_ONLY)
     target_sources(${CC_TEST_NAME} PRIVATE
       "${PROJECT_SOURCE_DIR}/tests/npu_test_environment.cpp"
     )
@@ -127,6 +127,11 @@ function(cc_test)
     EXTRA_ARGS ${CC_TEST_ARGS}
     TEST_LIST _cc_test_${CC_TEST_NAME}_tests
   )
+
+  if(CC_TEST_CPU_ONLY)
+    set_tests_properties(${_cc_test_${CC_TEST_NAME}_tests}
+      PROPERTIES LABELS cpu)
+  endif()
 
   if(CC_TEST_ENVIRONMENT)
     set_tests_properties(${_cc_test_${CC_TEST_NAME}_tests}

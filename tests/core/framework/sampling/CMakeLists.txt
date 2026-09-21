@@ -29,6 +29,7 @@ add_dependencies(sampler_test brpc-static)
 cc_test(
   NAME
     json_object_grammar_test
+  CPU_ONLY
   SRCS
     json_object_grammar_test.cpp
   DEPS

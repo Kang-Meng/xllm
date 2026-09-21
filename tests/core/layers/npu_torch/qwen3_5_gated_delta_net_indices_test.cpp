@@ -19,7 +19,8 @@ limitations under the License.
 #include <limits>
 #include <vector>
 
-#include "core/layers/npu_torch/qwen3_5_gated_delta_net.h"
+#include "core/layers/common/attention_metadata.h"
+#include "core/layers/npu_torch/qwen3_5_gdn_indices.h"
 
 namespace xllm::layer {
 namespace {

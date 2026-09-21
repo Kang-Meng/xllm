@@ -74,6 +74,7 @@ endif()
 cc_test(
   NAME
     cp_context_builder_test
+  CPU_ONLY
   SRCS
     cp_context_builder_test.cpp
   DEPS

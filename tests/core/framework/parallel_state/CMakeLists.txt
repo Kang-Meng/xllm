@@ -3,6 +3,7 @@ include(cc_test)
 cc_test(
   NAME
     context_parallel_topology_test
+  CPU_ONLY
   SRCS
     context_parallel_topology_test.cpp
   DEPS
@@ -13,6 +14,7 @@ cc_test(
 cc_test(
   NAME
     collective_communicator_policy_test
+  CPU_ONLY
   SRCS
     collective_communicator_policy_test.cpp
   DEPS
@@ -26,6 +28,7 @@ if(USE_NPU)
   cc_test(
     NAME
       mapping_npu_test
+    CPU_ONLY
     SRCS
       mapping_npu_test.cpp
     DEPS
@@ -44,6 +47,7 @@ if(USE_NPU)
   cc_test(
     NAME
       npu_dp_ep_padding_test
+    CPU_ONLY
     SRCS
       npu_dp_ep_padding_test.cpp
     DEPS
@@ -63,6 +67,7 @@ if(USE_NPU)
   cc_test(
     NAME
       npu_cp_capability_test
+    CPU_ONLY
     SRCS
       npu_cp_capability_test.cpp
     DEPS
@@ -81,6 +86,7 @@ if(USE_NPU)
   cc_test(
     NAME
       npu_cp_plan_test
+    CPU_ONLY
     SRCS
       npu_cp_plan_test.cpp
     DEPS
@@ -107,6 +113,7 @@ if(USE_NPU OR USE_MLU)
   cc_test(
     NAME
       cp_group_ranks_test
+    CPU_ONLY
     SRCS
       cp_group_ranks_test.cpp
     DEPS

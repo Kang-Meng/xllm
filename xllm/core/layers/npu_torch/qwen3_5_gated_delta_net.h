@@ -22,23 +22,11 @@ limitations under the License.
 #include <tuple>
 #include <utility>
 
-#include "qwen3_next_gated_delta_net.h"
+#include "core/layers/npu_torch/qwen3_5_gdn_indices.h"
+#include "core/layers/npu_torch/qwen3_next_gated_delta_net.h"
 
 namespace xllm {
 namespace layer {
-
-namespace qwen3_5_gdn_internal {
-
-const MegaGdnPrefillIndicesCache& get_or_build_prefill_indices(
-    const AttentionMetadata& attn_metadata,
-    const std::vector<int32_t>& live_slots,
-    const std::vector<int64_t>& validity_mask,
-    const std::vector<int32_t>& read_slots,
-    int64_t checkpoint_stride,
-    int64_t num_slots,
-    const torch::Device& device);
-
-}  // namespace qwen3_5_gdn_internal
 
 class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
  public:
