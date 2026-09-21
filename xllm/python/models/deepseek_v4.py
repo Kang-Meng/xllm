@@ -39,6 +39,7 @@ from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch_npu
 
 from xllm.python.attention.csa_attention import (
@@ -51,6 +52,7 @@ from xllm.python.layers.layernorm import RMSNorm
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
+    in_acl_graph,
     record_layer_event,
 )
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
@@ -1214,6 +1216,13 @@ def _rotate_hadamard(x: torch.Tensor, hadamard: torch.Tensor, scale: float) -> t
 # ---------------------------------------------------------------------------
 
 
+def _silu_for_execution(gate: torch.Tensor) -> torch.Tensor:
+    """Use the graph-capturable ATen SiLU path during ACL Graph execution."""
+    if in_acl_graph():
+        return F.silu(gate)
+    return torch_npu.npu_silu(gate)
+
+
 class DeepseekV4MoE(nn.Module):
     """DeepSeek-V4 MoE with hash routing.
 
@@ -1320,7 +1329,10 @@ class DeepseekV4MoE(nn.Module):
 
             def _pack(weight: torch.Tensor) -> torch.Tensor:
                 weight = torch_npu.npu_format_cast(weight.transpose(1, 2).contiguous(), 29)
-                return weight.view(torch.int32).contiguous()
+                weight = weight.view(torch.int32).contiguous()
+                if weight.device.type == "npu":
+                    torch.npu.synchronize(weight.device)
+                return weight
 
             def _scale(scale: torch.Tensor, scale_second: torch.Tensor | None) -> torch.Tensor:
                 transposed = scale.transpose(1, 2).contiguous()
@@ -1513,7 +1525,7 @@ class DeepseekV4MoE(nn.Module):
             if 0.0 < limit < 1_000_000.0:
                 gate = gate.clamp_max(limit)
                 up = up.clamp(min=-limit, max=limit)
-            act = (torch_npu.npu_silu(gate) * up).to(activation_dtype)
+            act = (_silu_for_execution(gate) * up).to(activation_dtype)
             # C++ FusedMoE normalizes the fused SwiGLU result to the dtype
             # accepted by dynamic_quant before producing the W4A8 GEMM2
             # activation scale. Keep this explicit so the Python path does
