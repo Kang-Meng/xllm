@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <limits>
 #include <map>
 #include <tuple>
@@ -896,6 +897,7 @@ void HierarchyBlockManagerPool::transfer_blocks(std::vector<Batch>& batches) {
     CHECK_LT(i, batches.size())
         << "Missing batch for pending H2D transfer at dp_rank=" << i;
     batches[i].set_batch_id();
+    batches[i].require_host_restore();
     engine_->transfer_kv_blocks(
         i, batches[i].batch_id(), std::move(load_block_transfer_infos_[i]));
     load_block_transfer_infos_[i].clear();
@@ -944,6 +946,8 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
     }
 
     if (!transfer_infos.empty()) {
+      const uint32_t expected_workers = engine_->host_transfer_worker_count();
+      CHECK_GT(expected_workers, 0U);
       std::shared_ptr<KVTransferTracker::Completion> completion =
           offload_transfers_.track();
       folly::collectAll(
@@ -953,13 +957,24 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
                       host_blocks = std::move(dst_blocks),
                       block_types_vec = std::move(block_types),
                       device_block_mgr_ptr = block_managers_[i].get(),
-                      host_manager = host_block_managers_[i].get()](
+                      host_manager = host_block_managers_[i].get(),
+                      dp_rank = i,
+                      expected_workers](
                          std::vector<folly::Try<uint32_t>>&& results) mutable {
-            bool copy_ok = true;
+            bool copy_ok = results.size() == expected_workers;
+            if (!copy_ok) {
+              LOG(ERROR) << "Incomplete Host offload at dp_rank=" << dp_rank
+                         << ", expected workers=" << expected_workers
+                         << ", actual results=" << results.size();
+            }
             for (auto&& result : results) {
               if (result.hasException()) {
-                LOG(ERROR) << "Offload RPC failed: "
-                           << result.exception().what();
+                const std::exception* exception =
+                    result.exception().get_exception();
+                LOG(ERROR) << "Offload RPC failed at dp_rank=" << dp_rank
+                           << ": "
+                           << (exception != nullptr ? exception->what()
+                                                    : "non-standard exception");
                 copy_ok = false;
                 continue;
               }

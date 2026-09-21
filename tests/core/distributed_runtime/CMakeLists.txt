@@ -36,3 +36,11 @@ if(USE_NPU)
     "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
     "-Wl,--no-whole-archive")
 endif()
+
+cc_test(
+  NAME llm_engine_host_transfer_test
+  SRCS llm_engine_host_transfer_test.cpp
+  DEPS :distributed_runtime :xllm_server GTest::gtest_main
+)
+target_link_libraries(llm_engine_host_transfer_test PRIVATE
+  :xtensor :xllm_server :batch)

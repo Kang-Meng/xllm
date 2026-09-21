@@ -554,12 +554,14 @@ void CollectiveCommunicator::create_process_groups(
             dcp_ranks,
             world_size,
             cp_topology->dcp_size(),
-            port + cp_topology->dp_rank() + 1,
+            port + cp_topology->dcp_group_index() + 1,
             get_context_parallel_group_host(dcp_ranks.front(), host),
             "dcp_group",
             device);
         parallel_args_->dcp_group_ = dcp_group_.get();
-        port += dp_size;
+        // Reserve one TCPStore port per distinct DCP subgroup, including
+        // separate TP lanes and replicas within each PCP group.
+        port += cp_topology->dcp_group_count();
       }
       CHECK_EQ(parallel_args_->dcp_group_->rank(), cp_topology->dcp_rank());
     }

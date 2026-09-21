@@ -88,6 +88,12 @@ class Engine {
     return false;
   };
 
+  // Number of cache shards in one DP group, independent of submitted results.
+  virtual uint32_t host_transfer_worker_count() const {
+    NOT_IMPLEMENTED();
+    return 0;
+  }
+
   virtual std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
       const uint32_t dp_rank,
       const std::vector<BlockTransferInfo>& block_transfer_info) {

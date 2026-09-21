@@ -71,6 +71,8 @@ class CacheTransferEngine final : public Engine {
   std::vector<int64_t> get_active_activation_memory() const override {
     return {0};
   }
+  uint32_t host_transfer_worker_count() const override { return 1; }
+
   void prefetch_from_storage(
       uint32_t /*dp_rank*/,
       std::shared_ptr<const StoragePrefetchRequest> request,

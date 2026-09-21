@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "batch_input_builder.h"
@@ -208,8 +209,10 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                             &args,
                             batch_forward_type_,
                             cp_size);
-  return builder.build_forward_input(num_decoding_tokens,
-                                     min_decoding_batch_size);
+  ForwardInput forward_input =
+      builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
+  stamp_host_restore(forward_input);
+  return forward_input;
 }
 
 ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
@@ -246,8 +249,10 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
                                               &args,
                                               batch_forward_type_,
                                               thread_pool);
-  return builder->build_rec_forward_input(num_decoding_tokens,
-                                          min_decoding_batch_size);
+  ForwardInput forward_input = builder->build_rec_forward_input(
+      num_decoding_tokens, min_decoding_batch_size);
+  stamp_host_restore(forward_input);
+  return forward_input;
 }
 
 std::vector<Sequence*> Batch::get_sequences() {
@@ -429,12 +434,18 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
   ForwardInput forward_input =
       builder.build_forward_input(/*num_decoding_tokens=*/0,
                                   /*min_decoding_batch_size=*/0);
+  stamp_host_restore(forward_input);
   if (has_partial_finished_beam_group()) {
     // Beam-search kernel assumes fixed beam width per group. When only part of
     // a group is active, fall back to software beam merge.
     forward_input.sampling_params.acc_logprob = torch::Tensor();
   }
   return forward_input;
+}
+
+void Batch::stamp_host_restore(ForwardInput& forward_input) {
+  forward_input.input_params.meta.requires_host_restore =
+      std::exchange(requires_host_restore_, false);
 }
 
 void Batch::refresh_output_targets() {

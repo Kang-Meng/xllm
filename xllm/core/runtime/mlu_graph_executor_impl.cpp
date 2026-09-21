@@ -31,6 +31,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/common/constants.h"
 #include "core/framework/config/execution_config.h"
+#include "core/triton_jit/include/jit_kernel.h"
 #include "framework/model/causal_vlm.h"
 #include "runtime/decode_graph_bucket.h"
 #include "util/utils.h"
@@ -80,7 +81,8 @@ GraphPoolMemoryUsage get_graph_pool_usage(
   const auto snapshot = torch_mlu::MLUCachingAllocator::snapshot();
   for (const auto& segment : snapshot.segments) {
     if (segment.device != device_index ||
-        segment.owner_private_pool_id != pool_id) {
+        segment.owner_private_pool_id.first != pool_id.first ||
+        segment.owner_private_pool_id.second != pool_id.second) {
       continue;
     }
     usage.reserved_bytes += segment.total_size;
@@ -283,6 +285,7 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   }
   tokens_ = torch::zeros({max_tokens}, int_tensor_options);
   new_cache_slots_ = torch::zeros({max_tokens}, int_tensor_options);
+  num_valid_token_rows_ = torch::zeros({1}, int_tensor_options);
   block_table_ = torch::zeros({graph_tokens_capacity, max_num_blocks_per_req},
                               int_tensor_options);
   // MTP validate expands decode rows from N to N * (K + 1), where K is the
@@ -301,6 +304,9 @@ void GraphPersistentParam::init_params(const ModelInputParams& params,
                                        uint32_t padding_needed) {
   params_ = params.to(tokens_.device());
   params_.enable_graph = true;
+  // Captured kernels read the bucket's real row count from this persistent
+  // scalar; update_input_buffer refreshes it before every replay.
+  params_.graph.num_valid_token_rows = num_valid_token_rows_;
   params_.attention.device.q_seq_lens = q_seq_lens_.slice(
       0, 0, params.attention.device.q_seq_lens.size(0) + padding_needed);
   params_.attention.device.kv_seq_lens = kv_seq_lens_.slice(
@@ -353,6 +359,9 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
     new_cache_slots_.slice(0, actual_tokens, padded_tokens).zero_();
   }
   params_.meta.num_sequences = params.meta.num_sequences;
+  // Refresh the graph bucket's real row count so replayed kernels mask the
+  // padding rows against the current batch instead of the captured one.
+  num_valid_token_rows_.fill_(static_cast<int32_t>(actual_tokens));
 
   // Apply padding if required number of tokens exceeds actual input
   // Generate padded sequence lengths by extending the last valid value
@@ -442,6 +451,7 @@ std::size_t GraphPersistentParam::get_persistent_tensor_bytes() const {
   total += tensor_bytes(tokens_);
   total += tensor_bytes(new_cache_slots_);
   total += tensor_bytes(block_table_);
+  total += tensor_bytes(num_valid_token_rows_);
   total += tensor_bytes(q_seq_lens_);
   total += tensor_bytes(kv_seq_lens_);
   total += tensor_bytes(input_embeds_);
@@ -488,6 +498,7 @@ void MluGraph::capture(CausalLM* model,
                        const torch_mlu::MLUStream& capture_stream,
                        const runtime::Options& options) {
   int32_t slice_dim = persistent_param_->use_mrope_ ? 1 : 0;
+  triton_jit::JITKernel::initialize_backend();
   torch_mlu::synchronize();
   auto prev_stream = torch_mlu::getCurrentMLUStream();
   torch_mlu::mlu::MLUStreamGuard guard(capture_stream);

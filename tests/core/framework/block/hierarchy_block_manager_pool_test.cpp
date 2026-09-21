@@ -22,7 +22,9 @@ limitations under the License.
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -128,6 +130,8 @@ class FakeOffloadEngine final : public Engine {
     return {0};
   }
 
+  uint32_t host_transfer_worker_count() const override { return 2; }
+
   std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
       uint32_t,
       const std::vector<BlockTransferInfo>& transfer_infos) override {
@@ -212,6 +216,35 @@ class FakePrefetchEngine final : public Engine {
   uint32_t dp_rank_ = 0;
   std::shared_ptr<const StoragePrefetchRequest> request_;
   std::shared_ptr<PrefetchResult> result_;
+};
+
+class ControlledOffloadEngine final : public Engine {
+ public:
+  explicit ControlledOffloadEngine(size_t result_count)
+      : promises_(result_count) {}
+
+  ForwardOutput step(std::vector<Batch>& /*batch*/) override { return {}; }
+  void update_last_step_result(std::vector<Batch>& /*batch*/) override {}
+  std::vector<int64_t> get_active_activation_memory() const override {
+    return {0};
+  }
+  uint32_t host_transfer_worker_count() const override { return 8; }
+
+  std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
+      uint32_t dp_rank,
+      const std::vector<BlockTransferInfo>& infos) override {
+    EXPECT_EQ(dp_rank, 0U);
+    transfer_infos_ = infos;
+    std::vector<folly::SemiFuture<uint32_t>> futures;
+    futures.reserve(promises_.size());
+    for (auto& promise : promises_) {
+      futures.emplace_back(promise.getSemiFuture());
+    }
+    return futures;
+  }
+
+  std::vector<folly::Promise<uint32_t>> promises_;
+  std::vector<BlockTransferInfo> transfer_infos_;
 };
 
 BlockManagerPool::Options make_flat_kv_options() {
@@ -947,6 +980,120 @@ TEST(HierarchyBlockManagerPoolTest,
 
   pool.deallocate(&sequence);
 }
+
+namespace {
+
+struct OffloadOutcome {
+  size_t result_count_;
+  int32_t failed_worker_;
+  bool exception_;
+  bool publish_;
+};
+
+class HostOffloadCompletionTest
+    : public ::testing::TestWithParam<OffloadOutcome> {};
+
+TEST_P(HostOffloadCompletionTest,
+       PublishesOnlyCompleteCopiesAfterAllWorkersEnd) {
+  const auto& outcome = GetParam();
+  ControlledOffloadEngine engine(outcome.result_count_);
+  HierarchyBlockManagerPool pool(
+      make_flat_kv_options(), &engine, /*dp_size=*/1);
+  const auto& host = HierarchyPoolTestPeer::host_leaves(pool);
+  BlockManager* host_leaf = host.at(BlockType::KV).leaf.get();
+  const size_t initial_free = host_leaf->num_free_blocks();
+  const size_t initial_device_free = pool.num_free_blocks().front();
+  const std::vector<int32_t> tokens(257, 73);
+  Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/128));
+  sequence.kv_state().set_kv_cache_tokens_num(128);
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/256));
+  pool.transfer_blocks();
+  EXPECT_EQ(engine.transfer_infos_.size(), 1U);
+  pool.deallocate(&sequence);
+  pool.reset_prefix_cache();
+
+  for (size_t i = 0; i < engine.promises_.size(); ++i) {
+    // Even if an earlier worker failed, neither publish nor release the Host
+    // reservation while another worker can still be writing it.
+    EXPECT_TRUE(pool.has_pending_async_block_release());
+    pool.reset_prefix_cache();
+    EXPECT_EQ(pool.num_free_blocks().front(), initial_device_free - 1);
+    EXPECT_EQ(host_leaf->num_blocks_in_prefix_cache(), 0U);
+    EXPECT_EQ(host_leaf->num_free_blocks(), initial_free - 1);
+    if (static_cast<int32_t>(i) != outcome.failed_worker_) {
+      engine.promises_[i].setValue(1U);
+    } else if (outcome.exception_) {
+      engine.promises_[i].setException(
+          folly::make_exception_wrapper<std::runtime_error>("offload failed"));
+    } else {
+      engine.promises_[i].setValue(0U);
+    }
+  }
+  EXPECT_FALSE(pool.has_pending_async_block_release());
+  pool.reset_prefix_cache();
+  EXPECT_EQ(pool.num_free_blocks().front(), initial_device_free);
+  EXPECT_EQ(host_leaf->num_blocks_in_prefix_cache(),
+            outcome.publish_ ? 1U : 0U);
+  EXPECT_EQ(host_leaf->num_free_blocks(),
+            initial_free - (outcome.publish_ ? 1U : 0U));
+  std::vector<Block> matched = host_leaf->allocate_shared(tokens);
+  EXPECT_EQ(matched.size(), outcome.publish_ ? 1U : 0U);
+  host_leaf->deallocate(matched);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Workers,
+    HostOffloadCompletionTest,
+    ::testing::Values(OffloadOutcome{8, -1, false, true},
+                      OffloadOutcome{8, 2, false, false},
+                      OffloadOutcome{8, 2, true, false},
+                      OffloadOutcome{2, -1, false, false},
+                      OffloadOutcome{0, -1, false, false},
+                      OffloadOutcome{9, -1, false, false}));
+
+class TypedHostOffloadTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(TypedHostOffloadTest, PreservesTypedReservationsUntilAllCopiesEnd) {
+  ControlledOffloadEngine engine(/*result_count=*/8);
+  HierarchyBlockManagerPool pool(
+      make_typed_cache_options(), &engine, /*dp_size=*/1);
+  const auto& leaves = HierarchyPoolTestPeer::host_leaves(pool);
+  const std::map<BlockType, size_t> copy_counts = {
+      {BlockType::SWA, 1}, {BlockType::C4, 32}, {BlockType::C128, 1}};
+  std::map<BlockType, size_t> initial_free;
+  for (const auto& [type, count] : copy_counts) {
+    initial_free.emplace(type, leaves.at(type).leaf->num_free_blocks());
+  }
+  Sequence sequence =
+      make_test_sequence(/*index=*/0, std::vector<int32_t>(20001, 73));
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/16384));
+  sequence.kv_state().set_kv_cache_tokens_num(16384);
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/20001));
+  pool.transfer_blocks();
+  EXPECT_EQ(engine.transfer_infos_.size(), 34U);
+  pool.deallocate(&sequence);
+  for (size_t i = 0; i < engine.promises_.size(); ++i) {
+    EXPECT_TRUE(pool.has_pending_async_block_release());
+    for (const auto& [type, count] : copy_counts) {
+      EXPECT_EQ(leaves.at(type).leaf->num_blocks_in_prefix_cache(), 0U);
+      EXPECT_EQ(leaves.at(type).leaf->num_free_blocks(),
+                initial_free.at(type) - count);
+    }
+    engine.promises_[i].setValue(!GetParam() && i == 2 ? 33U : 34U);
+  }
+  EXPECT_FALSE(pool.has_pending_async_block_release());
+  for (const auto& [type, count] : copy_counts) {
+    const size_t published = GetParam() ? count : 0;
+    EXPECT_EQ(leaves.at(type).leaf->num_blocks_in_prefix_cache(), published);
+    EXPECT_EQ(leaves.at(type).leaf->num_free_blocks(),
+              initial_free.at(type) - published);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Completion, TypedHostOffloadTest, ::testing::Bool());
+
+}  // namespace
 
 TEST(HierarchyBlockManagerPoolTest,
      FlatKvChunkGrowthOffloadsCompletedBlocksIncrementally) {

@@ -79,6 +79,10 @@ class LLMEngine : public Engine {
                       const int32_t dst_dp_rank,
                       const std::vector<KVTransferMapping>& mappings) override;
 
+  uint32_t host_transfer_worker_count() const override {
+    return dp_local_size_;
+  }
+
   std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
       const uint32_t dp_rank,
       const std::vector<BlockTransferInfo>& block_transfer_info) override;
@@ -165,6 +169,11 @@ class LLMEngine : public Engine {
   void process_group_test();
 
  protected:
+  // Inject already-created clients without starting model workers.
+  LLMEngine(runtime::Options options,
+            std::vector<std::shared_ptr<WorkerClient>> worker_clients);
+  void init_worker_topology();
+
   // options
   runtime::Options options_;
 

@@ -50,6 +50,11 @@ class ContextParallelTopology final {
   int32_t dcp_size() const { return dcp_size_; }
   int32_t dcp_rank() const { return dcp_rank_; }
 
+  // Dense logical group IDs across the world, including groups whose
+  // collectives can reuse an existing PCP or single-rank communicator.
+  int32_t dcp_group_index() const { return dcp_group_index_; }
+  int32_t dcp_group_count() const { return dcp_group_count_; }
+
   const std::vector<int32_t>& pcp_group_ranks() const {
     return pcp_group_ranks_;
   }
@@ -65,6 +70,8 @@ class ContextParallelTopology final {
   int32_t pcp_rank_ = 0;
   int32_t dcp_size_ = 1;
   int32_t dcp_rank_ = 0;
+  int32_t dcp_group_index_ = 0;
+  int32_t dcp_group_count_ = 1;
   std::vector<int32_t> pcp_group_ranks_;
   std::vector<int32_t> dcp_group_ranks_;
 };

@@ -772,6 +772,7 @@ struct BatchInputMeta {
   int32_t kv_max_seq_len = 0;
   int32_t q_max_seq_len = 0;
   uint64_t batch_id = 0;
+  bool requires_host_restore = false;
   bool is_graph_warmup = false;
 };
 

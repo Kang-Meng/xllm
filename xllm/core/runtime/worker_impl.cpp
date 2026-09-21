@@ -1662,9 +1662,7 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
   threadpool_.schedule([this,
                         input = std::move(input_on_device),
                         promise = std::move(promise)]() mutable {
-    if (hierarchy_kv_cache_transfer_ != nullptr) {
-      hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
-    }
+    set_hierarchy_layer_synchronizer(input.input_params);
 
     // run the model on the given input in working thread
     if (!enable_schedule_overlap()) {
@@ -2576,6 +2574,10 @@ void WorkerImpl::clear_hierarchy_kv_cache_transfer() {
 
 void WorkerImpl::set_hierarchy_layer_synchronizer(
     ModelInputParams& input_params) {
+  CHECK(!input_params.meta.requires_host_restore ||
+        hierarchy_kv_cache_transfer_ != nullptr)
+      << "Missing Host restore manager at batch_id="
+      << input_params.meta.batch_id;
   if (hierarchy_kv_cache_transfer_ != nullptr) {
     hierarchy_kv_cache_transfer_->set_layer_synchronizer(input_params);
   }

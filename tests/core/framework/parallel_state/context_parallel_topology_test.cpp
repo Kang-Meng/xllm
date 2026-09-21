@@ -124,5 +124,72 @@ TEST(ContextParallelTopologyTest, LocalRankIndexesEveryLegalDcpGroup) {
   }
 }
 
+TEST(ContextParallelTopologyTest, InterleavedDcpGroupsHaveDistinctIds) {
+  const ContextParallelTopology even(/*global_rank=*/0,
+                                     /*world_size=*/8,
+                                     /*dp_size=*/1,
+                                     /*pcp_size=*/8,
+                                     /*dcp_size=*/4);
+  const ContextParallelTopology odd(/*global_rank=*/1,
+                                    /*world_size=*/8,
+                                    /*dp_size=*/1,
+                                    /*pcp_size=*/8,
+                                    /*dcp_size=*/4);
+  EXPECT_EQ(even.dcp_group_ranks(), (std::vector<int32_t>{0, 2, 4, 6}));
+  EXPECT_EQ(odd.dcp_group_ranks(), (std::vector<int32_t>{1, 3, 5, 7}));
+  EXPECT_EQ(even.dcp_group_index(), 0);
+  EXPECT_EQ(odd.dcp_group_index(), 1);
+  EXPECT_EQ(even.dcp_group_count(), 2);
+  EXPECT_EQ(odd.dcp_group_count(), 2);
+}
+
+TEST(ContextParallelTopologyTest, GroupIdsBijectivelyIdentifyMemberSets) {
+  // Exercise DP boundaries, TP lanes, PCP replicas, singleton and PCP-wide
+  // reuse layouts, and DCP spanning the complete DP-local domain.
+  for (const int32_t dp_size : {1, 2}) {
+    for (const int32_t tp_size : {1, 2}) {
+      for (const int32_t pcp_size : {1, 4, 8}) {
+        for (const int32_t dcp_size : {1, 2, 4, 8, 16}) {
+          const bool partitions_pcp = pcp_size % dcp_size == 0;
+          if (!partitions_pcp && dcp_size != pcp_size * tp_size) {
+            continue;
+          }
+          const int32_t world_size = dp_size * pcp_size * tp_size;
+          const int32_t group_count = world_size / dcp_size;
+          std::vector<std::vector<int32_t>> groups(group_count);
+          std::vector<int32_t> member_counts(group_count, 0);
+          for (int32_t rank = 0; rank < world_size; ++rank) {
+            SCOPED_TRACE(::testing::Message()
+                         << "dp=" << dp_size << " tp=" << tp_size
+                         << " pcp=" << pcp_size << " dcp=" << dcp_size
+                         << " rank=" << rank);
+            const ContextParallelTopology topology(
+                rank, world_size, dp_size, pcp_size, dcp_size);
+            ASSERT_EQ(topology.dcp_group_count(), group_count);
+            const int32_t index = topology.dcp_group_index();
+            ASSERT_GE(index, 0);
+            ASSERT_LT(index, group_count);
+            // The first member records the group's identity. Every subsequent
+            // member must agree, so no ID can alias a different member set.
+            if (groups[index].empty()) {
+              groups[index] = topology.dcp_group_ranks();
+            }
+            EXPECT_EQ(groups[index], topology.dcp_group_ranks());
+            ++member_counts[index];
+            for (const int32_t member : topology.dcp_group_ranks()) {
+              const ContextParallelTopology peer(
+                  member, world_size, dp_size, pcp_size, dcp_size);
+              EXPECT_EQ(peer.dcp_group_index(), index);
+            }
+          }
+          for (const int32_t count : member_counts) {
+            EXPECT_EQ(count, dcp_size);
+          }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace xllm::parallel_state

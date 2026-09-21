@@ -122,16 +122,7 @@ LLMEngine::LLMEngine(const runtime::Options& options,
   // setup all workers and create worker clients in nnode_rank=0 engine side.
   setup_workers(options);
 
-  dp_size_ = options_.dp_size();
-  cp_size_ = options_.cp_size();
-  dp_batch_embedding_ids_.resize(dp_size_);
-  dp_batch_request_ids_.resize(dp_size_);
-  dp_batch_generations_.resize(dp_size_, 0);
-  worker_clients_num_ = worker_clients_.size();
-  dp_local_size_ = worker_clients_num_ / dp_size_;
-  // MLU and NPU model-side CP both use orthogonal CP x attention-TP, so the
-  // DP-local TP width is divided by CP.
-  dp_local_tp_size_ = dp_local_size_ / cp_size_;
+  init_worker_topology();
 
   // create ThreadPool for link cluster
   link_threadpool_ = std::make_unique<ThreadPool>(
@@ -146,6 +137,31 @@ LLMEngine::LLMEngine(const runtime::Options& options,
       /*num_threads=*/16,
       /*cpu_binding=*/false,
       /*pool_name=*/"LLMEngine.forward_input");
+}
+
+LLMEngine::LLMEngine(runtime::Options options,
+                     std::vector<std::shared_ptr<WorkerClient>> worker_clients)
+    : options_(std::move(options)), worker_clients_(std::move(worker_clients)) {
+  init_worker_topology();
+}
+
+void LLMEngine::init_worker_topology() {
+  CHECK_GT(options_.dp_size(), 0);
+  CHECK_GT(options_.cp_size(), 0);
+  dp_size_ = static_cast<uint32_t>(options_.dp_size());
+  cp_size_ = static_cast<uint32_t>(options_.cp_size());
+  CHECK_LE(worker_clients_.size(), std::numeric_limits<uint32_t>::max());
+  worker_clients_num_ = static_cast<uint32_t>(worker_clients_.size());
+  CHECK(worker_clients_num_ > 0 || options_.node_rank() > 0);
+  CHECK_EQ(worker_clients_num_ % dp_size_, 0U);
+  dp_local_size_ = worker_clients_num_ / dp_size_;
+  // MLU and NPU model-side CP both use orthogonal CP x attention-TP, so the
+  // DP-local TP width is divided by CP.
+  CHECK_EQ(dp_local_size_ % cp_size_, 0U);
+  dp_local_tp_size_ = dp_local_size_ / cp_size_;
+  dp_batch_embedding_ids_.resize(dp_size_);
+  dp_batch_request_ids_.resize(dp_size_);
+  dp_batch_generations_.resize(dp_size_, 0);
 }
 
 runtime::DecodeGraphWarmupConfig LLMEngine::decode_graph_warmup_config() const {
@@ -780,6 +796,29 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   // XTensor mode: reserve padding blocks and start prealloc thread.
   kv_cache_manager_->reserve_xtensor_padding_blocks();
 
+  if (!options_.is_draft_engine()) {
+    if (!options.manager_types().empty() || kv_cache_config.enable_xtensor()) {
+      LOG(INFO) << "KV token capacity: N/A ("
+                << (kv_cache_config.enable_xtensor() ? "XTensor"
+                                                     : "grouped cache")
+                << ")";
+    } else {
+      const auto free_blocks_per_dp = kv_cache_manager_->num_free_blocks();
+      const int64_t logical_block_size = kv_cache_manager_->block_size();
+      for (size_t dp_rank = 0; dp_rank < free_blocks_per_dp.size(); ++dp_rank) {
+        const int64_t token_capacity =
+            static_cast<int64_t>(free_blocks_per_dp[dp_rank]) *
+            logical_block_size;
+        // Logical block size already includes KV splitting. This is a DP-level
+        // slot upper bound; sequence tails and other state can limit admission.
+        LOG(INFO) << "KV token capacity: dp_rank=" << dp_rank
+                  << ", kv_split_size=" << kv_split_size_eff
+                  << ", estimated_kv_token_capacity=" << token_capacity
+                  << " (upper bound)";
+      }
+    }
+  }
+
   return true;
 }
 
@@ -834,23 +873,27 @@ bool LLMEngine::pull_kv_blocks(const int32_t src_dp_size,
 std::vector<folly::SemiFuture<uint32_t>> LLMEngine::transfer_kv_blocks(
     const uint32_t dp_rank,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
+  CHECK_LT(dp_rank, dp_size_);
+  CHECK_GT(dp_local_size_, 0U);
   std::vector<folly::SemiFuture<uint32_t>> futures;
-  futures.reserve(dp_local_tp_size_);
+  futures.reserve(dp_local_size_);
 
-  for (uint32_t tp_rank = 0; tp_rank < dp_local_tp_size_; ++tp_rank) {
-    futures.emplace_back(worker_clients_[tp_rank + dp_local_tp_size_ * dp_rank]
+  for (uint32_t local_rank = 0; local_rank < dp_local_size_; ++local_rank) {
+    futures.emplace_back(worker_clients_[local_rank + dp_local_size_ * dp_rank]
                              ->transfer_kv_blocks(block_transfer_info));
   }
 
-  return std::move(futures);
+  return futures;
 }
 
 void LLMEngine::transfer_kv_blocks(
     const uint32_t dp_rank,
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
-  for (uint32_t tp_rank = 0; tp_rank < dp_local_tp_size_; ++tp_rank) {
-    worker_clients_[tp_rank + dp_local_tp_size_ * dp_rank]->transfer_kv_blocks(
+  CHECK_LT(dp_rank, dp_size_);
+  CHECK_GT(dp_local_size_, 0U);
+  for (uint32_t local_rank = 0; local_rank < dp_local_size_; ++local_rank) {
+    worker_clients_[local_rank + dp_local_size_ * dp_rank]->transfer_kv_blocks(
         batch_id, block_transfer_info);
   }
 }

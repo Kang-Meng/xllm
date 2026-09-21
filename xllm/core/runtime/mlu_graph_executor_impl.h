@@ -67,6 +67,10 @@ class GraphPersistentParam {
   torch::Tensor kv_seq_lens_;
   torch::Tensor new_cache_slots_;
   torch::Tensor block_table_;
+  // Real row count of the current graph bucket, exposed to captured model
+  // kernels via params_.graph.num_valid_token_rows so they can mask bucket
+  // padding rows on device (refreshed before every replay).
+  torch::Tensor num_valid_token_rows_;
   uint32_t num_decoding_tokens_;
   torch::Tensor linear_state_indices_;
 

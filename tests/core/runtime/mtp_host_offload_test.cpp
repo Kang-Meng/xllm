@@ -628,12 +628,15 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
 
   ModelInputParams target_input_params;
   target_input_params.meta.batch_id = kBatchId;
+  target_input_params.meta.requires_host_restore = true;
   worker.set_hierarchy_layer_synchronizer(target_input_params);
+  EXPECT_FALSE(target_input_params.meta.requires_host_restore);
   ASSERT_NE(target_input_params.parallel.layer_wise_load_synchronizer, nullptr);
   EXPECT_FALSE(unified_transfer->take_load_handle(kBatchId).has_value());
 
   ModelInputParams draft_input_params = target_input_params;
   draft_ptr->set_hierarchy_layer_synchronizer(draft_input_params);
+  EXPECT_FALSE(draft_input_params.meta.requires_host_restore);
   ASSERT_NE(draft_input_params.parallel.layer_wise_load_synchronizer, nullptr);
   EXPECT_EQ(target_input_params.parallel.layer_wise_load_synchronizer.get(),
             draft_input_params.parallel.layer_wise_load_synchronizer.get());
@@ -777,12 +780,15 @@ TEST_F(MTPHostOffloadTest, Dsv4DraftSkipsUnsupportedCompressedBlockTypes) {
 
   ModelInputParams target_input_params;
   target_input_params.meta.batch_id = kBatchId;
+  target_input_params.meta.requires_host_restore = true;
   worker.set_hierarchy_layer_synchronizer(target_input_params);
+  EXPECT_FALSE(target_input_params.meta.requires_host_restore);
   for (uint32_t layer_index = 0; layer_index < 3; ++layer_index) {
     ASSERT_TRUE(target_input_params.synchronize_layer(layer_index));
   }
   ModelInputParams draft_input_params = target_input_params;
   draft_ptr->set_hierarchy_layer_synchronizer(draft_input_params);
+  EXPECT_FALSE(draft_input_params.meta.requires_host_restore);
   ASSERT_TRUE(draft_input_params.synchronize_draft_layer());
 
   for (BlockType block_type : block_types) {

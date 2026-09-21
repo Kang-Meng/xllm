@@ -76,6 +76,8 @@ class Batch {
 
   uint64_t batch_id() const { return batch_id_; }
 
+  void require_host_restore() { requires_host_restore_ = true; }
+
   // get the number of sequences in the batch
   size_t size() const { return sequences_.size(); }
   bool empty() const { return sequences_.empty() && sequence_groups_.empty(); }
@@ -151,6 +153,7 @@ class Batch {
     bool from_sample_slot = false;
   };
 
+  void stamp_host_restore(ForwardInput& forward_input);
   void refresh_output_targets();
   void refresh_onerec_prefill_output_targets();
   bool update_sequence_state(Sequence* seq, bool replace_fake_token);
@@ -189,6 +192,7 @@ class Batch {
   BatchForwardType batch_forward_type_;
 
   uint64_t batch_id_ = UNINITIALIZED_BATCH_ID;
+  bool requires_host_restore_ = false;
 };
 
 }  // namespace xllm

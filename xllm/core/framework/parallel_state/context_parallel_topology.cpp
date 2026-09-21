@@ -56,6 +56,9 @@ ContextParallelTopology::ContextParallelTopology(int32_t global_rank,
     const int32_t pcp_per_dcp = pcp_size_ / dcp_size_;
     dcp_rank_ = pcp_rank_ / pcp_per_dcp;
     const int32_t dcp_replica_rank = pcp_rank_ % pcp_per_dcp;
+    dcp_group_index_ =
+        (dp_rank_ * tp_size_ + tp_rank_) * pcp_per_dcp + dcp_replica_rank;
+    dcp_group_count_ = dp_size * tp_size_ * pcp_per_dcp;
     dcp_group_ranks_.reserve(static_cast<size_t>(dcp_size_));
     for (int32_t owner_rank = 0; owner_rank < dcp_size_; ++owner_rank) {
       const int32_t owner_pcp_rank =
@@ -66,6 +69,8 @@ ContextParallelTopology::ContextParallelTopology(int32_t global_rank,
     return;
   }
 
+  dcp_group_index_ = dp_rank_;
+  dcp_group_count_ = dp_size;
   dcp_group_ranks_.reserve(static_cast<size_t>(dp_stride));
   for (int32_t rank = 0; rank < dp_stride; ++rank) {
     dcp_group_ranks_.emplace_back(dp_group_start + rank);

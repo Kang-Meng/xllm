@@ -37,6 +37,7 @@ limitations under the License.
 #include "framework/block/block_manager_pool.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/composite_block_manager.h"
+#include "framework/block/hierarchy_block_manager_pool.h"
 #include "framework/config/beam_search_config.h"
 #include "framework/config/service_config.h"
 #include "framework/kv_cache/kv_cache.h"
@@ -642,6 +643,125 @@ TEST(BatchInputBuilderTest, RecordsPrefillStageBeforeAdvancingKvCount) {
   EXPECT_EQ(input.input_params.execution_batch.is_prefilling,
             (std::vector<uint8_t>{1, 1}));
 }
+
+namespace {
+
+class ImmediateHostEngine final : public Engine {
+ public:
+  ForwardOutput step(std::vector<Batch>& /*batch*/) override { return {}; }
+  void update_last_step_result(std::vector<Batch>& /*batch*/) override {}
+  std::vector<int64_t> get_active_activation_memory() const override {
+    return {0};
+  }
+  uint32_t host_transfer_worker_count() const override { return 1; }
+  std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
+      uint32_t /*dp_rank*/,
+      const std::vector<BlockTransferInfo>& infos) override {
+    std::vector<folly::SemiFuture<uint32_t>> results;
+    results.reserve(1);
+    results.emplace_back(
+        folly::makeSemiFuture(static_cast<uint32_t>(infos.size())));
+    return results;
+  }
+  void transfer_kv_blocks(
+      uint32_t dp_rank,
+      uint64_t batch_id,
+      const std::vector<BlockTransferInfo>& infos) override {
+    EXPECT_EQ(dp_rank, 0U);
+    EXPECT_EQ(infos.size(), 1U);
+    load_batch_id_ = batch_id;
+  }
+  uint64_t load_batch_id_ = 0;
+};
+
+class HostRestoreInputTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(HostRestoreInputTest,
+       CarriesRestoreRequirementFromHostHitThroughTransport) {
+  ImmediateHostEngine engine;
+  BlockManagerPool::Options options;
+  options.num_blocks(8)
+      .host_num_blocks(16)
+      .block_size(4)
+      .enable_prefix_cache(true)
+      .enable_host_offload(true);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+  Sequence source = make_basic_sequence(tokens);
+  ASSERT_TRUE(pool.allocate(&source, /*num_tokens=*/4));
+  source.kv_state().set_kv_cache_tokens_num(4);
+  pool.deallocate(&source);
+  pool.transfer_blocks();
+  pool.reset_prefix_cache();
+
+  Sequence restored = make_basic_sequence(tokens);
+  pool.allocate_shared(&restored);
+  ASSERT_TRUE(restored.has_host_cache_match());
+  ASSERT_TRUE(pool.allocate(&restored, /*num_tokens=*/5));
+  std::vector<Batch> batches(1);
+  batches.front().add(&restored);
+  pool.transfer_blocks(batches);
+  EXPECT_NE(engine.load_batch_id_, 0U);
+  auto build_input = [&]() {
+    if (GetParam()) {
+      return batches.front().prepare_forward_input(ModelArgs(),
+                                                   /*thread_pool=*/nullptr);
+    }
+    return batches.front().prepare_forward_input(
+        /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
+  };
+  ForwardInput input = build_input();
+  EXPECT_EQ(input.input_params.meta.batch_id, engine.load_batch_id_);
+  EXPECT_TRUE(input.input_params.meta.requires_host_restore);
+  ForwardInput copied = input;
+  EXPECT_TRUE(copied.input_params.meta.requires_host_restore);
+  ForwardInput converted =
+      input.to(torch::Device(torch::kCPU), torch::kFloat32);
+  EXPECT_TRUE(converted.input_params.meta.requires_host_restore);
+
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(forward_input_to_packed_proto(input, &packed));
+  ForwardInput lazy_input;
+  packed_proto_to_forward_input(
+      packed, lazy_input, torch::Device(torch::kCPU), nullptr);
+  ForwardInput unpacked;
+  ASSERT_TRUE(detail::unpack_from_input_host_buffer(
+      lazy_input,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      unpacked,
+      /*materialize_device_buffer=*/false));
+  EXPECT_EQ(unpacked.input_params.meta.batch_id, engine.load_batch_id_);
+  EXPECT_TRUE(unpacked.input_params.meta.requires_host_restore);
+
+  const std::string name = ForwardSharedMemoryManager::create_unique_name(
+      "host_restore_input", /*dp_group=*/0, ForwardType::RAW_INPUT, /*rank=*/0);
+  bool creator = false;
+  ForwardSharedMemoryManager writer(
+      name, 1 << 20, creator, ForwardType::RAW_INPUT);
+  bool reader_creator = false;
+  ForwardSharedMemoryManager reader(
+      name, 1 << 20, reader_creator, ForwardType::RAW_INPUT);
+  ASSERT_TRUE(writer.input_write(input));
+  ForwardInput round_trip;
+  reader.input_read(round_trip, torch::Device(torch::kCPU));
+  EXPECT_EQ(round_trip.input_params.meta.batch_id, engine.load_batch_id_);
+  EXPECT_TRUE(round_trip.input_params.meta.requires_host_restore);
+
+  restored.append_token(Token(/*id=*/6));
+  batches.front().refresh_forward_type();
+  ForwardInput next = build_input();
+  EXPECT_FALSE(next.input_params.meta.requires_host_restore);
+  ASSERT_TRUE(writer.input_write(next));
+  reader.input_read(round_trip, torch::Device(torch::kCPU));
+  EXPECT_FALSE(round_trip.input_params.meta.requires_host_restore);
+  EXPECT_FALSE(ForwardInput().input_params.meta.requires_host_restore);
+  pool.deallocate(&restored);
+}
+
+INSTANTIATE_TEST_SUITE_P(Builders, HostRestoreInputTest, ::testing::Bool());
+
+}  // namespace
 
 TEST(BatchTest, ProcessSampleOutputStoresMtpBootstrapEmbedding) {
   BlockManager::Options options;

@@ -276,13 +276,18 @@ TEST_P(LinearProfileGraphWarmupTest, PrefillRespectsSequenceLimit) {
             (std::vector<std::vector<int32_t>>{{10}}));
 }
 
-TEST_P(LinearProfileGraphWarmupTest, EagerWarmupAcceptsMoreThanOneCheckpoint) {
+TEST_P(LinearProfileGraphWarmupTest, EagerWarmupRespectsBackendSupport) {
   ExecutionConfig::get_instance().enable_graph() = false;
   RecordingProfileEngine engine(
       true, InstanceRole::PREFILL, std::get<1>(GetParam()));
   ProfileManager profile_manager(&engine, options(InstanceRole::PREFILL));
+#if defined(USE_NPU)
+  // NPU eager warmup accepts a prefill spanning multiple checkpoints.
   EXPECT_EQ(engine.prefill_batches(),
             (std::vector<std::vector<int32_t>>{{10}}));
+#else
+  EXPECT_TRUE(engine.prefill_batches().empty());
+#endif
   EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(),
             (std::vector<size_t>{0}));
 }

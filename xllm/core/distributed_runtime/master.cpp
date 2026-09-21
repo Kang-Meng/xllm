@@ -165,8 +165,20 @@ std::optional<std::string> validate_model_cp(const Options& options,
       return "MLU CP requires dp_size == 1";
     }
 
-    if (ParallelConfig::get_instance().kv_split_size() != 1) {
-      return "MLU CP requires kv_split_size == 1";
+    const int32_t kv_split_size =
+        ParallelConfig::get_instance().kv_split_size_effective();
+    if (kv_split_size > 1 && model_type != "glm_moe_dsa") {
+      return "MLU CP with kv_split_size > 1 supports only glm_moe_dsa";
+    }
+    const int32_t tp_size =
+        global_world_size / (options.dp_size() * options.cp_size());
+    const bool partitions_pcp = kv_split_size > 0 &&
+                                kv_split_size <= options.cp_size() &&
+                                options.cp_size() % kv_split_size == 0;
+    const bool spans_pcp_and_tp = kv_split_size == options.cp_size() * tp_size;
+    if (!partitions_pcp && !spans_pcp_and_tp) {
+      return "MLU CP requires kv_split_size to divide cp_size or equal "
+             "cp_size * tp_size";
     }
 
     if (options.ep_size() != global_world_size) {
