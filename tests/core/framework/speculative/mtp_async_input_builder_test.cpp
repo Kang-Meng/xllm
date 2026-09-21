@@ -363,7 +363,11 @@ TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
       py::arg("page_size") = kBlockSize, py::arg("is_mla") = false);
 
   ModelInputParams params;
+  params.num_accepted_tokens = torch::tensor({1, 2}, torch::kInt);
   py::object py_metadata = py::cast(PyAttentionMetadataView(metadata, params));
+  EXPECT_TRUE(torch::equal(
+      py_metadata.attr("num_accepted_tokens").cast<torch::Tensor>(),
+      params.num_accepted_tokens));
   py::tuple selected = runner.attr("_decode_metadata")(py_metadata);
 
   EXPECT_TRUE(torch::equal(selected[0].cast<torch::Tensor>(),

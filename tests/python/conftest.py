@@ -127,7 +127,9 @@ def causal_conv1d_reference(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
                 convolved = torch.nn.functional.silu(convolved)
             output[start:end].copy_(convolved)
             state[sequence].copy_(window[-state.shape[1] :])
-        return output.view_as(inputs)
+        output = output.view_as(inputs)
+        calls[-1]["output"] = output.clone()
+        return output
 
     monkeypatch.setattr(torch.ops.xllm_ops, "causal_conv1d", native_conv, raising=False)
     return calls

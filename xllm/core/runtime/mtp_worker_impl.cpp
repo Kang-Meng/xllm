@@ -1004,9 +1004,30 @@ bool MTPWorkerImpl::supports_explicit_spec_verify_replay_update() const {
 }
 
 bool MTPWorkerImpl::requires_uniform_validate_width() const {
+  if (impl_ == nullptr ||
+      impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
+    return false;
+  }
+  // Qwen3.5 GDN and GLM5 KDA select recurrent checkpoints from a dense 2-D
+  // [sequence, validate_width] table, so every sequence must use the same
+  // width. Keep this model capability check platform-independent; the
+  // checkpoint allocation itself remains NPU-specific.
   return supports_expanded_spec_verify() &&
          mtp_async::requires_uniform_spec_verify(
              context_.get_model_args().model_type());
+}
+
+int32_t MTPWorkerImpl::preserve_checkpoint_validate_width(
+    int32_t effective_speculative_tokens,
+    const std::vector<int32_t>& accepted_prefix_lengths,
+    int32_t num_speculative_tokens) {
+  const int32_t max_accepted_tokens =
+      accepted_prefix_lengths.empty()
+          ? 1
+          : *std::max_element(accepted_prefix_lengths.begin(),
+                              accepted_prefix_lengths.end());
+  return std::min(std::max(effective_speculative_tokens, max_accepted_tokens),
+                  num_speculative_tokens);
 }
 
 bool MTPWorkerImpl::should_use_explicit_spec_verify_replay_update(
@@ -1061,6 +1082,15 @@ int64_t MTPWorkerImpl::spec_verify_block_table_width(
   return required_width;
 }
 
+int64_t MTPWorkerImpl::active_spec_verify_block_table_width(
+    const ModelInputParams& input_params) const {
+  CHECK_GT(options_.block_size(), 0);
+  const int64_t effective_kv_seq_len =
+      std::max<int64_t>(input_params.meta.kv_max_seq_len, 1);
+  return (effective_kv_seq_len + options_.block_size() - 1) /
+         options_.block_size();
+}
+
 torch::Tensor MTPWorkerImpl::acquire_spec_verify_control_block_table(
     int64_t num_sequences,
     int64_t block_table_capacity) {
@@ -1088,7 +1118,8 @@ torch::Tensor MTPWorkerImpl::acquire_spec_verify_control_block_table(
 
 void MTPWorkerImpl::ensure_spec_verify_control_block_table(
     ModelInputParams& input_params,
-    int64_t num_sequences) {
+    int64_t num_sequences,
+    int64_t active_width) {
   auto& block_tables = input_params.attention.host.block_tables;
   if (block_tables.defined()) {
     return;
@@ -1096,17 +1127,39 @@ void MTPWorkerImpl::ensure_spec_verify_control_block_table(
   CHECK(!input_params.multi_block_tables.empty())
       << "missing model-managed block tables for spec verify";
   CHECK(impl_ != nullptr) << "target model must be initialized";
-  block_tables = acquire_spec_verify_control_block_table(
-      num_sequences,
+  const int64_t block_table_capacity =
       mtp_async::speculative_verify_block_table_capacity(
           impl_->context_.get_model_args().max_position_embeddings(),
-          options_.block_size()));
+          options_.block_size());
+  CHECK_GT(active_width, 0);
+  CHECK_LE(active_width, block_table_capacity)
+      << "active spec verify block table exceeds declared capacity";
+  // Keep one reusable maximum-capacity backing buffer, but expose only the
+  // columns consumed by this generic expanded-verify step to bound metadata
+  // packing costs.
+  block_tables = acquire_spec_verify_control_block_table(num_sequences,
+                                                         block_table_capacity)
+                     .narrow(/*dim=*/1, /*start=*/0, active_width);
 }
 
 bool MTPWorkerImpl::use_chunked_prefill_spec_verify_path() const {
   return target_spec_verify_mode_ ==
              mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
          supports_expanded_spec_verify();
+}
+
+bool MTPWorkerImpl::uses_speculative_linear_state_checkpoints() const {
+#if defined(USE_NPU)
+  if (impl_ == nullptr ||
+      impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
+    return false;
+  }
+  const std::string& model_type = impl_->context_.get_model_args().model_type();
+  return is_qwen3_5_target_model_type(model_type) ||
+         is_glm5_next_target_model_type(model_type);
+#else
+  return false;
+#endif
 }
 
 ForwardInput
@@ -1736,9 +1789,6 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         prepare_validate_inputs(
             metadata_template, validate_input, static_graph_tasks_prepared);
       }
-      // Only the target input consumes the first-decode marker.
-      input.input_params.pd_handoff_reset_mask.clear();
-      metadata_template.input_params.pd_handoff_reset_mask.clear();
     } else if (use_continuous_dsa_drafts) {
       next_step_input = std::move(later_draft_inputs[draft_idx + 1]);
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
@@ -2095,37 +2145,30 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_adaptive_validate(
     effective_speculative_tokens = 1;
   }
 
-  // Qwen3.5 GDN spec-verify commits the recurrent/conv checkpoint selected by
-  // the previous step's num_accepted_tokens (nat): the GDN kernel indexes
-  // ssm_state as nat - 1 and requires nat <= this step's validate width. Floor
-  // effective_speculative_tokens by the batch's max nat so uniform_val_tokens
-  // >= max(nat) + 1. nat itself must stay the true accepted count (never
-  // clamped) so the committed checkpoint matches the last accepted token;
-  // clamping it would commit a stale checkpoint (see issue #2247). Read from
-  // embedding_cache directly since input.num_accepted_tokens_host is populated
-  // by prepare_validate_inputs which hasn't run yet here.
-  if (supports_expanded_spec_verify() && embedding_cache_ != nullptr &&
+  // Recurrent spec-verify kernels commit the checkpoint selected by the
+  // previous step's num_accepted_tokens (nat): the kernel indexes state as
+  // nat - 1 and requires nat <= this step's validate width. Preserve enough
+  // width for the largest nat in the batch, as Qwen3.5 does. Read from
+  // embedding_cache directly because prepare_validate_inputs has not run yet.
+  if (uses_speculative_linear_state_checkpoints() &&
+      embedding_cache_ != nullptr &&
       !input.input_params.embedding.embedding_ids.empty()) {
-    std::vector<int32_t> nat = embedding_cache_->read_accepted_prefix_lengths(
-        input.input_params.embedding.embedding_ids,
-        input.input_params.embedding.request_ids);
-    int32_t max_nat = 0;
-    for (int32_t v : nat) {
-      max_nat = std::max(max_nat, v);
-    }
+    const std::vector<int32_t> accepted_prefix_lengths =
+        embedding_cache_->read_accepted_prefix_lengths(
+            input.input_params.embedding.embedding_ids,
+            input.input_params.embedding.request_ids,
+            num_speculative_tokens + 1);
     effective_speculative_tokens =
-        std::max(effective_speculative_tokens, max_nat);
-    effective_speculative_tokens =
-        std::min(effective_speculative_tokens, num_speculative_tokens);
+        preserve_checkpoint_validate_width(effective_speculative_tokens,
+                                           accepted_prefix_lengths,
+                                           num_speculative_tokens);
   }
 
   std::vector<int32_t> per_seq_val_tokens(static_cast<size_t>(batch_size));
-  // Qwen3.5 GatedDeltaNet spec-verify path requires dense same-length validate
-  // tokens across sequences (see qwen3_gated_delta_net_base.cpp:405-408). On
-  // Qwen3.5 we still take the batch-max pruning benefit (effective_sl < max_sl
-  // when the controller decides to shrink), but every seq gets the same
-  // validate width. On non-Qwen3.5 models we keep per-seq variable-length
-  // tokens for maximum pruning benefit.
+  // Recurrent checkpoint kernels require dense same-length validate tokens
+  // across sequences. We still take the batch-max pruning benefit when the
+  // controller shrinks the width, while other models retain per-sequence
+  // variable lengths.
   const bool require_uniform_val_tokens = requires_uniform_validate_width();
   const int32_t uniform_val_tokens = effective_speculative_tokens + 1;
   for (int32_t i = 0; i < batch_size; ++i) {
@@ -3033,12 +3076,6 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   const int32_t logical_block_size =
       options_.block_size() * parallel_args_.kv_split_size_effective();
   const bool positions_decoupled = positions_are_decoupled_from_kv_length();
-  const std::vector<int32_t>& pd_handoff_reset_mask =
-      input.input_params.pd_handoff_reset_mask;
-  if (!pd_handoff_reset_mask.empty()) {
-    CHECK_EQ(pd_handoff_reset_mask.size(), static_cast<size_t>(num_sequences))
-        << "target PD handoff reset mask count mismatch";
-  }
 #if defined(USE_NPU)
   const bool use_explicit_spec_verify_replay_update =
       should_use_explicit_spec_verify_replay_update(input);
@@ -3241,18 +3278,19 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
       }
       input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens_vec);
     }
+  }
+  if (use_chunked_prefill_spec_verify_path() ||
+      uses_speculative_linear_state_checkpoints()) {
     accepted_prefix_lengths.assign(num_sequences, 1);
     if (embedding_cache_ != nullptr &&
         !input.input_params.embedding.embedding_ids.empty()) {
       accepted_prefix_lengths = embedding_cache_->read_accepted_prefix_lengths(
           input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+          input.input_params.embedding.request_ids,
+          options_.num_speculative_tokens() + 1);
     }
-    // num_accepted_tokens must stay the true accepted count. The Qwen3.5 GDN
-    // spec-verify kernel uses it to select which recurrent/conv checkpoint to
-    // commit (checkpoint index = nat - 1); it is a logical checkpoint index,
-    // not the conv_state physical history capacity. Clamping it commits a
-    // stale checkpoint whenever 4+ tokens were accepted (see issue #2247).
+    // num_accepted_tokens selects the previous step's conv/SSM checkpoint
+    // (checkpoint index = nat - 1) and stays equal to the accepted count.
     input_params.num_accepted_tokens_host.assign(
         accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
     if (!use_explicit_spec_verify_replay_update) {
@@ -3266,7 +3304,12 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     build_expanded_spec_verify_graph_host_input(input_params);
 
     auto& attention = input_params.attention;
-    ensure_spec_verify_control_block_table(input_params, num_sequences);
+    ensure_spec_verify_control_block_table(
+        input_params,
+        num_sequences,
+        mtp_async::speculative_verify_block_table_capacity(
+            impl_->context_.get_model_args().max_position_embeddings(),
+            options_.block_size()));
     CHECK(attention.host.block_tables.defined());
     CHECK_EQ(attention.host.block_tables.dim(), 2);
     CHECK_EQ(attention.host.block_tables.size(0), num_sequences);
@@ -3384,7 +3427,10 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     input_params.graph.spec_verify_source_addresses_stable = true;
   } else {
     if (supports_expanded_spec_verify()) {
-      ensure_spec_verify_control_block_table(input_params, num_sequences);
+      ensure_spec_verify_control_block_table(
+          input_params,
+          num_sequences,
+          active_spec_verify_block_table_width(input_params));
     }
     input_params.attention.rebuild_device_buffer(device_);
     if (supports_expanded_spec_verify()) {
@@ -3424,7 +3470,8 @@ bool MTPWorkerImpl::prepare_static_mtp_graph_tasks_before_final_draft(
   const std::vector<int32_t> accepted_prefix_lengths =
       embedding_cache_->read_accepted_prefix_lengths(
           input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+          input.input_params.embedding.request_ids,
+          options_.num_speculative_tokens() + 1);
   if (accepted_prefix_lengths.size() != 1) {
     return false;
   }
@@ -3604,19 +3651,19 @@ void MTPWorkerImpl::prepare_validate_inputs(
       }
       input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens_vec);
     }
+  }
+  if (use_chunked_prefill_spec_verify_path() ||
+      uses_speculative_linear_state_checkpoints()) {
     std::vector<int32_t> accepted_prefix_lengths(num_sequences, 1);
     if (embedding_cache_ != nullptr &&
         !input.input_params.embedding.embedding_ids.empty()) {
       accepted_prefix_lengths = embedding_cache_->read_accepted_prefix_lengths(
           input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+          input.input_params.embedding.request_ids,
+          options_.num_speculative_tokens() + 1);
     }
-    // num_accepted_tokens must stay the true accepted count: the Qwen3.5 GDN
-    // spec-verify kernel commits the recurrent/conv checkpoint at index
-    // nat - 1, so clamping it would commit a stale state whenever 4+ tokens
-    // were accepted (see issue #2247). The conv1d kernel already clamps its
-    // own physical conv_state read offset internally, and the tiling check
-    // no longer rejects nat > segment length, so no host-side clamp is needed.
+    // num_accepted_tokens selects the previous step's conv/SSM checkpoint
+    // (checkpoint index = nat - 1) and stays equal to the accepted count.
     input_params.num_accepted_tokens =
         torch::tensor(accepted_prefix_lengths, token_options);
     input_params.num_accepted_tokens_host.assign(
@@ -3625,7 +3672,10 @@ void MTPWorkerImpl::prepare_validate_inputs(
 
 #if defined(USE_NPU)
   if (supports_expanded_spec_verify()) {
-    ensure_spec_verify_control_block_table(input_params, num_sequences);
+    ensure_spec_verify_control_block_table(
+        input_params,
+        num_sequences,
+        active_spec_verify_block_table_width(input_params));
   }
 #endif
   input_params.attention.rebuild_device_buffer(device_);
@@ -3668,10 +3718,6 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                 impl_->context_.get_model_args().model_type());
   const bool use_uniform_two_rows = should_use_uniform_two_draft_rows(
       last_states, force_two_rows, dp_enabled, requires_uniform_rows);
-  // Only the target input consumes the first-decode marker; the draft copies
-  // it via base_input above, so drop it here to keep the target-only invariant.
-  input_params.pd_handoff_reset_mask.clear();
-
   const int32_t logical_block_size =
       options_.block_size() * parallel_args_.kv_split_size_effective();
   specBuilder::DecodeRowContext row_ctx =
@@ -3946,7 +3992,6 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
   draft_input.device_tensors_ready = false;
 
   auto& input_params = draft_input.input_params;
-  input_params.pd_handoff_reset_mask.clear();
   input_params.embedding.input_embedding = torch::Tensor();
   const int32_t num_sequences = input_params.meta.num_sequences;
   if (draft_impl_->has_request_state_cache()) {

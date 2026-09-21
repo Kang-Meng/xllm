@@ -103,6 +103,7 @@ class AttentionMetadata(Protocol):
     paged_kv_last_page_len: torch.Tensor
     qo_indptr: torch.Tensor | None
     q_cu_seq_lens: torch.Tensor | None
+    q_cu_seq_lens_host_values: list[int] | None
     kv_cu_seq_lens: torch.Tensor | None
     kv_seq_lens_host: torch.Tensor | None
     kv_seq_lens_host_values: list[int] | None
@@ -129,7 +130,6 @@ class AttentionMetadata(Protocol):
     kpool_query_lens: Sequence[int]
     num_accepted_tokens: torch.Tensor | None
     has_initial_state: torch.Tensor | None
-    pd_handoff_reset_mask: torch.Tensor | None
     dp_execution_token_counts: Sequence[int]
     raw_dp_execution_token_counts: Sequence[int]
     # Host-planned logical KV lengths for all DP ranks, including this query.
@@ -148,6 +148,30 @@ class AttentionMetadata(Protocol):
     kv_split_size: int
     kv_split_rank: int
     has_kv_shard: bool
+
+
+def linear_state_checkpoint_stride(
+    conv_cache: torch.Tensor,
+    ssm_cache: torch.Tensor,
+) -> int:
+    """Return the number of SSM checkpoints owned by each linear slot."""
+    if conv_cache.shape[0] <= 0 or ssm_cache.shape[0] % conv_cache.shape[0] != 0:
+        raise RuntimeError("linear SSM cache does not align with state slots")
+    return ssm_cache.shape[0] // conv_cache.shape[0]
+
+
+def build_speculative_ssm_state_indices(
+    state_indices: torch.Tensor,
+    checkpoint_stride: int,
+    dtype: torch.dtype = torch.int32,
+) -> torch.Tensor:
+    """Map slots to checkpoints using dtype for offsets and the result."""
+    checkpoint_offsets = torch.arange(
+        checkpoint_stride,
+        dtype=dtype,
+        device=state_indices.device,
+    )
+    return state_indices.to(dtype).contiguous().view(-1, 1) * checkpoint_stride + checkpoint_offsets.view(1, -1)
 
 
 def resolve_linear_state_io_indices(
@@ -312,7 +336,7 @@ class AttentionBackend(ABC):
     def execute_linear(
         self,
         mixed_qkv: torch.Tensor,
-        beta: torch.Tensor,
+        beta_raw: torch.Tensor,
         layer: Attention,
         raw_gate_proj: torch.Tensor,
     ) -> torch.Tensor:
@@ -322,10 +346,11 @@ class AttentionBackend(ABC):
         head-subset already sharded). ``raw_gate_proj`` is the pre-gate forget
         projection ``f_b(f_a(x))`` shaped ``[B, S, num_heads_local, head_dim]``;
         the plain decode/prefill kernels fuse the safe-gate from it in-kernel,
-        while the MTP verify / cross-layer / mask paths materialize the gate
-        from it on demand. ``beta`` is ``[B, S, num_heads_local]``. Returns the
-        core attention output ``[B, S, num_heads_local, head_dim]`` for the
-        caller to gate + project.
+        while unsupported safe-gate configurations materialize the gate on
+        demand. ``beta_raw`` is the pre-sigmoid
+        ``[B, S, num_heads_local]`` projection. Returns the core attention
+        output ``[B, S, num_heads_local, head_dim]`` for the caller to gate +
+        project.
 
         The backend owns the per-layer conv/ssm state (the conv/ssm slots of
         ``LayerCache``) and reads/advances/writes it via the

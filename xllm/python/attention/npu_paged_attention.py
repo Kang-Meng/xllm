@@ -34,10 +34,9 @@ from xllm.python.attention.backend import (
     LayerCache,
     MlaIndexContext,
     MlaPreprocessContext,
+    build_speculative_ssm_state_indices,
+    linear_state_checkpoint_stride,
     resolve_linear_state_io_indices,
-)
-from xllm.python.attention.expanded_decode_metadata import (
-    resolve_expanded_decode_metadata,
 )
 from xllm.python.attention.kv_shard_layout import has_rope_dim
 from xllm.python.model_executor.cp_utils import cp_gather_kv
@@ -221,6 +220,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._uses_sparse_mla = False
         self._kda_verify_width = num_decoding_tokens
         self._kda_validated_query_shape: tuple[int, int] | None = None
+        self._kda_checkpoint_stride: int | None = None
+        self._kda_prepared_ssm_state_indices: torch.Tensor | None = None
 
         self._kv_caches: list[LayerCache] = []
         self._kpool_cache_triton_compatible: tuple[bool, ...] = ()
@@ -337,6 +338,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._kpool_cache_triton_compatible = tuple(_is_compact_kpool_cache_compatible(cache) for cache in kv_caches)
         self._page_size = page_sizes.pop()
         self._num_kv_blocks = num_kv_blocks.pop()
+        checkpoint_strides = {
+            linear_state_checkpoint_stride(cache.conv, cache.ssm)
+            for cache in kv_caches
+            if cache.conv is not None and cache.ssm is not None
+        }
+        if len(checkpoint_strides) > 1:
+            raise RuntimeError("linear-attention layers use inconsistent checkpoint capacities")
+        self._kda_checkpoint_stride = checkpoint_strides.pop() if checkpoint_strides else None
         has_sparse_index = any(cache.index is not None for cache in kv_caches)
         # glm5_next DSA layers are NoPE: the latent lives in the key slot and
         # the value/rope slot is a 0-dim tensor normalized to None, while the
@@ -349,6 +358,54 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if has_sparse_index or has_latent_only_cache:
             self._is_mla = True
         self._uses_sparse_mla = self._is_mla and has_sparse_index
+
+    def _prepare_kda_speculative_state_indices(
+        self,
+        metadata: AttentionMetadata,
+        *,
+        graph_mode: bool,
+    ) -> None:
+        """Build the shared KDA checkpoint table once for the current batch."""
+        self._kda_prepared_ssm_state_indices = None
+        accepted_tokens = getattr(metadata, "num_accepted_tokens", None)
+        checkpoint_stride = self._kda_checkpoint_stride
+        if accepted_tokens is None or checkpoint_stride is None:
+            return
+
+        state_indices = getattr(metadata, "linear_state_write_indices", None)
+        if state_indices is None:
+            state_indices = getattr(metadata, "linear_state_indices", None)
+        if state_indices is None:
+            return
+
+        q_seq_lens = getattr(metadata, "q_seq_lens", None)
+        # ACL Graph expands state slots per token row, while q_seq_lens keeps
+        # the logical sequence grouping used by execute_linear's graph V3
+        # dispatch. Keep this derivation aligned with that grouping logic.
+        if graph_mode and q_seq_lens is not None:
+            num_seqs = int(q_seq_lens.numel())
+        else:
+            num_seqs = int(accepted_tokens.numel())
+        if num_seqs <= 0 or state_indices.numel() < num_seqs or state_indices.numel() % num_seqs:
+            raise RuntimeError(
+                "KDA speculative state metadata is not grouped by logical sequence: "
+                f"slots={state_indices.numel()}, sequences={num_seqs}"
+            )
+        logical_state_indices = state_indices.reshape(num_seqs, -1)[:, 0]
+        prepared_indices = build_speculative_ssm_state_indices(
+            logical_state_indices,
+            checkpoint_stride,
+        )
+        if graph_mode:
+            static_indices = getattr(metadata, "linear_state_checkpoint_indices", None)
+            if static_indices is None:
+                static_indices = torch.empty_like(prepared_indices)
+                metadata.linear_state_checkpoint_indices = static_indices
+            elif static_indices.shape != prepared_indices.shape:
+                raise RuntimeError("KDA speculative checkpoint shape changed after graph allocation")
+            static_indices.copy_(prepared_indices)
+            prepared_indices = static_indices
+        self._kda_prepared_ssm_state_indices = prepared_indices
 
     @staticmethod
     def _query_sequence_ends(
@@ -375,6 +432,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     ) -> None:
         self._metadata = metadata
         self._kda_validated_query_shape = None
+        self._prepare_kda_speculative_state_indices(metadata, graph_mode=graph_mode)
         if getattr(metadata, "q_cu_host_values", None) is not None:
             # Static graph metadata carries the (per-entry constant) host
             # copy: reading the device buffer would block the host until the
@@ -1234,8 +1292,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     def _spec_verify_v3(
         self,
         mixed_qkv: torch.Tensor,
-        gate: torch.Tensor,
-        beta: torch.Tensor,
+        raw_gate_proj: torch.Tensor,
+        beta_raw: torch.Tensor,
         layer: Attention,
         idx: torch.Tensor,
         metadata,
@@ -1243,29 +1301,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         ssm_cache,
         recurrent_kda,
     ) -> torch.Tensor:
-        """Advance native KDA with persistent per-token speculative checkpoints.
-
-        Metadata carries the previous verification's accepted-token count,
-        including its always-accepted base token, for each logical sequence.
-        Select checkpoint count-1 without inferring or clamping the count from
-        KV lengths or the current verification width. The selected SSM state
-        is staged into the base row before calling recurrent_kda with count 1.
-
-        Pools retain the configured maximum width so captured addresses remain
-        stable across width changes. The C++ cache supplies the base state and
-        receives the new after-base state; draft checkpoints stay in this pool
-        until the next verification selects one. Graph capture must restore
-        both pools, even though no per-layer acceptance history is retained.
-        """
+        """Run GLM5 speculative KDA on framework-owned checkpoint state."""
         device = mixed_qkv.device
         num_seqs = idx.shape[0]
         if num_seqs == 0 or mixed_qkv.shape[0] != 1 or mixed_qkv.shape[2] % num_seqs:
             raise ValueError("KDA spec-verify requires flattened, equal-width sequence blocks")
-        rows_per_seq = mixed_qkv.shape[2] // num_seqs  # 2 verify, 1 plain
-        if not 1 <= rows_per_seq <= self._kda_verify_width:
-            raise ValueError(
-                f"KDA verify width {rows_per_seq} exceeds configured decoding width {self._kda_verify_width}"
-            )
+        rows_per_seq = mixed_qkv.shape[2] // num_seqs
         in_graph = in_acl_graph()
         q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
         if (
@@ -1284,95 +1325,98 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         conv_dim = layer.conv_dim
         conv_state_len = layer.conv_kernel_size - 1
         scale = 1.0 / (head_dim**0.5)
-        nslots = conv_cache.shape[0]  # C++ pool capacity
+        required_conv_state_len = conv_state_len + rows_per_seq - 1
+        if conv_cache.shape[1] < required_conv_state_len:
+            raise RuntimeError("KDA V3 conv checkpoint capacity is smaller than the verify width")
 
-        accepted_counts = getattr(metadata, "num_accepted_tokens", None)
-        if accepted_counts is None:
-            raise RuntimeError("KDA speculative execution requires num_accepted_tokens metadata")
-        if accepted_counts.ndim != 1 or accepted_counts.numel() < num_seqs:
-            raise ValueError("KDA accepted-token metadata must cover every logical sequence")
-        accepted_counts = accepted_counts[:num_seqs].to(device=device, dtype=torch.int64)
+        num_accepted_tokens = getattr(metadata, "num_accepted_tokens", None)
+        if num_accepted_tokens is None or num_accepted_tokens.numel() < num_seqs:
+            raise RuntimeError("KDA V3 requires one accepted-token count per logical sequence")
+        num_accepted_tokens = num_accepted_tokens[:num_seqs].to(torch.int32).contiguous()
 
-        st = self.__dict__.setdefault("_kda_v3", {}).setdefault(layer.layer_id, {})
-        if "combined_conv" not in st:
-            pool_slots = self._kda_verify_width * nslots
-            st["combined_conv"] = torch.zeros(
-                pool_slots, conv_state_len, conv_dim, dtype=conv_cache.dtype, device=device
-            )
-            st["combined_ssm"] = torch.zeros(pool_slots, nh, head_dim, head_dim, dtype=ssm_cache.dtype, device=device)
-        combined_conv = st["combined_conv"]
-        combined_ssm = st["combined_ssm"]
-
-        idx64 = idx if idx.dtype == torch.int64 else idx.to(torch.int64)
-        idx32 = idx64.to(torch.int32)
-
-        # ---- 1) committed running state (C++ pool) -> combined base ----
-        combined_conv[:nslots].index_copy_(0, idx64, conv_cache.index_select(0, idx64))
-        combined_ssm[:nslots].index_copy_(0, idx64, ssm_cache.index_select(0, idx64))
-
-        slot_offsets = torch.arange(rows_per_seq, dtype=torch.int32, device=device) * nslots
-        ssm_state_indices = (idx32.view(-1, 1) + slot_offsets.view(1, -1)).reshape(-1)
-        qsl_key = (num_seqs, rows_per_seq)
-        qsl_buf = st.setdefault("qsl_buf", {}).get(qsl_key)
+        qsl_key = (num_seqs, rows_per_seq, device)
+        qsl_cache = self.__dict__.setdefault("_kda_v3_query_start_locs", {})
+        qsl_buf = qsl_cache.get(qsl_key)
         if qsl_buf is None:
             qsl_buf = torch.arange(num_seqs + 1, dtype=torch.int32, device=device) * rows_per_seq
-            st["qsl_buf"][qsl_key] = qsl_buf
+            qsl_cache[qsl_key] = qsl_buf
 
-        # ---- 2) conv-boundary select (slot m-1: prev last-accepted state) ----
-        # Boundary = running conv state after the previous step's last accepted
-        # token = slot (m-1) per seq (0=base/reject, 1=draft0 accept, ...,
-        # R-1=all-accepted). Generalizes the legacy 2-way where(m2, draft, base).
-        boundary_slot = idx64 + (accepted_counts - 1) * nslots
-        sel_conv = combined_conv.index_select(0, boundary_slot)  # [S, Ks, C]
-        combined_ssm.index_copy_(0, idx64, combined_ssm.index_select(0, boundary_slot))
-
-        conv_input = mixed_qkv.reshape(conv_dim, num_seqs, rows_per_seq).permute(1, 2, 0).contiguous()
-        conv_history = torch.cat([sel_conv, conv_input], dim=1)
-        conv_out = self._causal_conv1d(conv_input, sel_conv, layer)
-        conv_checkpoints = torch.stack(
-            [conv_history[:, proposal + 1 : proposal + 1 + conv_state_len] for proposal in range(rows_per_seq)],
-            dim=1,
-        ).reshape(-1, conv_state_len, conv_dim)
-        combined_conv.index_copy_(0, ssm_state_indices.to(torch.int64), conv_checkpoints)
-
-        # ---- 4) split conv_out -> q/k/v; gate/beta -> g/b (TND, [T,nh,hd]) ----
+        idx32 = idx.to(torch.int32).contiguous()
+        conv_input = mixed_qkv.transpose(1, 2).reshape(-1, conv_dim).contiguous()
+        conv_out = kernels.causal_conv1d_update_v2(
+            conv_input,
+            layer.conv_weight.squeeze(1),
+            conv_cache,
+            idx32,
+            qsl_buf,
+            rows_per_seq,
+            num_accepted_tokens,
+            bias=None,
+            activation=layer.activation in ("silu", "swish"),
+        )
         c_split = conv_out.split(qkv_dim, dim=-1)
         q = c_split[0].reshape(-1, nh, head_dim).to(torch.bfloat16)
         k = c_split[1].reshape(-1, nh, head_dim).to(torch.bfloat16)
         v = c_split[2].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        if gate.dim() == 3:
-            gate = gate.view(num_seqs, rows_per_seq, nh * head_dim)
-        cur_g = gate.view(num_seqs, rows_per_seq, nh, head_dim)
-        cur_b = beta.view(num_seqs, rows_per_seq, nh)
-        g_flat = cur_g.reshape(-1, nh, head_dim).to(torch.float32)
-        b_flat = cur_b.reshape(-1, nh).to(torch.float32)
+        fg = layer.forget_gate
+        gate_lb = fg.safe_gate_lower_bound
+        fuse_gate = gate_lb is not None and -5.0 <= gate_lb < 0.0
+        if fuse_gate:
+            gate_arg = raw_gate_proj.reshape(-1, nh, head_dim).contiguous()
+            gate_kwargs = dict(
+                A_log=fg.A_log.to(torch.float32).contiguous(),
+                dt_bias=fg.dt_bias.to(torch.float32).contiguous(),
+                use_gate_in_kernel=True,
+                safe_gate=True,
+                lower_bound=gate_lb,
+            )
+        else:
+            gate_arg = fg.gate_from_raw(raw_gate_proj).reshape(-1, nh, head_dim).contiguous()
+            gate_kwargs = dict(use_gate_in_kernel=False)
+        beta_raw_flat = beta_raw.reshape(-1, nh).contiguous()
 
-        # ---- 5) fused multi-slot recurrent: advance [b, d0, ..., d{R-1}] ----
+        checkpoint_stride = self._kda_checkpoint_stride
+        if checkpoint_stride is None:
+            raise RuntimeError("KDA V3 requires a bound linear-state checkpoint stride")
+        if checkpoint_stride < rows_per_seq:
+            raise RuntimeError("KDA V3 SSM checkpoint capacity is smaller than the verify width")
+        # The vLLM-Ascend recurrent_kda speculative ABI uses a 2-D
+        # [num_seqs, checkpoint_stride] slot table, not packed per-token
+        # indices. The kernel uses the true num_accepted_tokens value to read
+        # each sequence's initial state from checkpoint column
+        # num_accepted_tokens - 1, then writes this verify step's token states
+        # to columns [0, rows_per_seq).
+        # See vLLM-Ascend commit 23cfbd5ba, recurrent_kda_torch_adpt.h and
+        # op_kernel/recurrent_kda.h (StateMetadataOffset,
+        # ResolveInitialStateSlot, and StateSlotForToken).
+        ssm_state_indices = self._kda_prepared_ssm_state_indices
+        if ssm_state_indices is None:
+            raise RuntimeError("KDA speculative checkpoint indices were not prepared")
+        if ssm_state_indices.shape != (num_seqs, checkpoint_stride) or ssm_state_indices.device != idx32.device:
+            raise RuntimeError(
+                "KDA speculative checkpoint metadata does not match the current layer: "
+                f"indices={tuple(ssm_state_indices.shape)}, sequences={num_seqs}, stride={checkpoint_stride}"
+            )
         ret = recurrent_kda(
             q,
             k,
             v,
-            g_flat,
-            b_flat,
-            initial_state=combined_ssm,
+            gate_arg,
+            beta_raw_flat,
+            initial_state=ssm_cache,
             cu_seqlens=qsl_buf,
             ssm_state_indices=ssm_state_indices,
-            num_accepted_tokens=torch.ones_like(idx32),
+            num_accepted_tokens=num_accepted_tokens,
             layout="TND",
             scale=scale,
             output_final_state=True,
             inplace_final_state=True,
             use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=False,
-            use_beta_sigmoid_in_kernel=False,
+            use_beta_sigmoid_in_kernel=True,
             state_v_first=True,
+            **gate_kwargs,
         )
         core_out = ret[0] if isinstance(ret, tuple) else ret
-
-        # ---- 7) commit after-b (always accepted) -> C++ source of truth ----
-        conv_cache.index_copy_(0, idx64, combined_conv[:nslots].index_select(0, idx64))
-        ssm_cache.index_copy_(0, idx64, combined_ssm[:nslots].index_select(0, idx64))
-
         return core_out.view(1, num_seqs * rows_per_seq, nh, head_dim)
 
     def _mla_sparse(

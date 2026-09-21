@@ -83,6 +83,11 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly("qo_indptr", &PyAttentionMetadataView::qo_indptr)
       .def_property_readonly("q_cu_seq_lens",
                              &PyAttentionMetadataView::q_cu_seq_lens)
+#if defined(USE_NPU)
+      .def_property_readonly(
+          "q_cu_seq_lens_host_values",
+          &PyAttentionMetadataView::q_cu_seq_lens_host_values)
+#endif
       .def_property_readonly("kv_cu_seq_lens",
                              &PyAttentionMetadataView::kv_cu_seq_lens)
       .def_property_readonly("kv_seq_lens_host",
@@ -114,8 +119,6 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::num_accepted_tokens)
       .def_property_readonly("has_initial_state",
                              &PyAttentionMetadataView::has_initial_state)
-      .def_property_readonly("pd_handoff_reset_mask",
-                             &PyAttentionMetadataView::pd_handoff_reset_mask)
       .def_property_readonly(
           "dp_execution_token_counts",
           &PyAttentionMetadataView::dp_execution_token_counts)
@@ -310,6 +313,13 @@ py::object PyAttentionMetadataView::q_cu_seq_lens() const {
   return optional_tensor(metadata_->q_cu_seq_lens);
 }
 
+#if defined(USE_NPU)
+const std::vector<int64_t>& PyAttentionMetadataView::q_cu_seq_lens_host_values()
+    const {
+  return metadata_->q_cu_seq_lens_host_vec;
+}
+#endif
+
 py::object PyAttentionMetadataView::kv_cu_seq_lens() const {
   return optional_tensor(metadata_->kv_cu_seq_lens);
 }
@@ -355,12 +365,9 @@ py::object PyAttentionMetadataView::linear_state_write_indices() const {
 const std::vector<int32_t>& PyAttentionMetadataView::kpool_query_lens() const {
   return metadata_->kpool_query_lens;
 }
+
 py::object PyAttentionMetadataView::has_initial_state() const {
   return optional_tensor(metadata_->has_initial_states);
-}
-
-py::object PyAttentionMetadataView::pd_handoff_reset_mask() const {
-  return optional_tensor(metadata_->pd_handoff_reset_mask);
 }
 
 const std::vector<int32_t>& PyAttentionMetadataView::dp_execution_token_counts()

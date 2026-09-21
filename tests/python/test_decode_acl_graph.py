@@ -55,6 +55,7 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
         kv_cu_seq_lens=torch.tensor([0, 1, 3, 6, 10], dtype=torch.int32),
         q_cu_seq_lens=torch.arange(5, dtype=torch.int32),
         linear_state_indices=linear_state_indices,
+        num_accepted_tokens=torch.tensor([1, 2, 1, 2], dtype=torch.int32),
         expanded_decode_metadata=None,
         multi_block_tables=(),
         new_cache_slots_host_values=[0, 1, 2, 3],
@@ -86,6 +87,11 @@ def test_accepted_tokens_use_live_per_sequence_graph_buffer() -> None:
         runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
     assert static_counts.data_ptr() == address
     assert static_counts.tolist() == [1] * 8
+
+    plain_metadata = _metadata(torch.tensor([3, 7, 11, 15], dtype=torch.int32))
+    plain_metadata.num_accepted_tokens = None
+    plain_entry = runner._allocate_entry(8, input_ids, positions, plain_metadata)
+    assert plain_entry.static_metadata.num_accepted_tokens is None
 
 
 def test_verify_graph_key_tracks_width_not_active_sequence_count() -> None:
@@ -128,6 +134,7 @@ def test_accepted_tokens_reject_missing_or_invalid_replay_metadata(
     metadata = _metadata(torch.tensor([3, 3, 7, 7], dtype=torch.int32))
     metadata.num_accepted_tokens = torch.ones(2, dtype=torch.int32)
     entry = runner._allocate_entry(8, input_ids, positions, metadata)
+    entry.static_metadata.is_spec_verify = True
     metadata.num_accepted_tokens = accepted_counts
     with (
         patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True),
@@ -147,7 +154,7 @@ def test_slice_output_preserves_aux_hidden_tuple() -> None:
     torch.testing.assert_close(output[1], aux_hidden[:3])
 
 
-def test_linear_state_indices_use_stable_graph_buffer() -> None:
+def test_linear_state_graph_buffers_are_stable() -> None:
     runner = _runner()
     input_ids = torch.arange(4, dtype=torch.int32)
     positions = torch.arange(4, dtype=torch.int32)
@@ -160,7 +167,9 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
         metadata=metadata,
     )
     static_indices = entry.static_metadata.linear_state_indices
+    static_num_accepted_tokens = entry.static_metadata.num_accepted_tokens
     data_ptr = static_indices.data_ptr()
+    accepted_data_ptr = static_num_accepted_tokens.data_ptr()
     assert entry.static_metadata.kpool_query_lens == (4, 4)
     assert entry.static_metadata.kpool_query_lens_device.tolist() == [4, 4]
     assert DecodeAclGraphRunner._graph_key(
@@ -183,9 +192,12 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
             input_embedding=None,
         )
         assert static_indices.tolist() == [3, 7, 11, 15, 0, 0, 0, 0]
-
         metadata.linear_state_indices = torch.tensor(
             [4, 8, 12, 16],
+            dtype=torch.int32,
+        )
+        metadata.num_accepted_tokens = torch.tensor(
+            [2, 1, 2, 1],
             dtype=torch.int32,
         )
         runner._fill_entry(
@@ -199,6 +211,46 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
 
     assert static_indices.data_ptr() == data_ptr
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
+    assert static_num_accepted_tokens.data_ptr() == accepted_data_ptr
+    assert static_num_accepted_tokens.tolist() == [2, 1, 2, 1, 1, 1, 1, 1]
+
+
+def test_linear_state_snapshot_restores_all_ssm_checkpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(synchronize=lambda: None),
+        raising=False,
+    )
+    runner = _runner()
+    conv = torch.arange(48, dtype=torch.float32).reshape(4, 2, 6)
+    ssm = torch.arange(48, dtype=torch.float32).reshape(12, 1, 2, 2)
+    runner.bind_layer_caches(
+        [
+            SimpleNamespace(
+                conv=conv,
+                ssm=ssm,
+            )
+        ]
+    )
+    entry = SimpleNamespace(
+        static_metadata=SimpleNamespace(
+            linear_state_indices=torch.tensor([1, 1, 3, 3], dtype=torch.int64),
+        )
+    )
+
+    snapshot = runner._snapshot_linear_state(entry)
+    assert torch.equal(snapshot[0][2], torch.tensor([1, 3], dtype=torch.int64))
+    assert torch.equal(snapshot[0][3], torch.tensor([3, 4, 5, 9, 10, 11], dtype=torch.int64))
+    expected_conv = conv.clone()
+    expected_ssm = ssm.clone()
+    conv.zero_()
+    ssm.zero_()
+    runner._restore_linear_state(entry, snapshot)
+
+    assert torch.equal(conv[[1, 3]], expected_conv[[1, 3]])
+    checkpoint_indices = torch.tensor([3, 4, 5, 9, 10, 11])
+    assert torch.equal(ssm[checkpoint_indices], expected_ssm[checkpoint_indices])
 
 
 def test_explicit_verify_reuses_row_aligned_paging_metadata() -> None:

@@ -145,21 +145,6 @@ TEST(AttentionMetadataBuilderTest,
       "linear state mask row count mismatch");
 }
 
-TEST(AttentionMetadataBuilderTest, DecodeMaterializesOnlyPdHandoffResetMask) {
-  ModelInputParams params = make_params();
-  params.meta.batch_forward_type = BatchForwardType::DECODE;
-  params.pd_handoff_reset_mask = {0, 1, 0};
-
-  AttentionMetadata metadata =
-      AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
-
-  EXPECT_FALSE(metadata.has_initial_states.defined());
-  ASSERT_TRUE(metadata.pd_handoff_reset_mask.defined());
-  EXPECT_EQ(metadata.pd_handoff_reset_mask.scalar_type(), torch::kBool);
-  EXPECT_TRUE(torch::equal(metadata.pd_handoff_reset_mask,
-                           torch::tensor({false, true, false}, torch::kBool)));
-}
-
 TEST(AttentionMetadataBuilderTest, IgnoresTransportIdsWithoutLinearStateOps) {
   ModelInputParams params = make_params();
   params.embedding.linear_state_ids = {-1, -1, -1};

@@ -619,7 +619,7 @@ class Glm5NextForgetGate(nn.Module):
         Fed to ``recurrent_kda``/``chunk_kda_fwd`` with ``use_gate_in_kernel=True``
         so the kernel computes the safe-gate ``lower_bound * sigmoid(exp(A_log) *
         (raw + dt_bias))`` internally (bit-exact to :meth:`gate_from_raw`,
-        verified on NPU). The MTP verify / cross-layer paths still need the
+        verified on NPU). Unsupported lower-bound configurations use the
         materialized gate (:meth:`gate_from_raw`).
 
         Returned in the same ``[B, S, num_heads, head_dim]`` layout as the
@@ -772,13 +772,10 @@ class Glm5NextKdaAttention(Attention):
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         # Compute the raw forget-gate projection once and hand it to the
-        # backend. The plain decode/prefill kernels fuse the safe-gate from the
-        # raw in-kernel (no python-side gate materialization); the MTP verify /
-        # cross-layer / mask paths materialize the gate from the same raw inside
-        # the backend, only when they actually need it (bit-exact, no second
-        # f_a/f_b GEMM).
+        # backend. Recurrent decode/verify kernels fuse the safe-gate and beta
+        # sigmoid in-kernel; chunk-prefill materializes only the FP32 beta it
+        # requires. The output gate remains separate for o_norm below.
         g_raw, gate = self._project_fg(fg_latents)
-        beta = torch.sigmoid(beta_raw.float())
 
         # KDA conv1d + delta-rule + conv/ssm state is owned by the backend
         # (NpuPagedAttentionBackend.execute_linear). No self-contained fallback
@@ -797,9 +794,9 @@ class Glm5NextKdaAttention(Attention):
                 g_raw.reshape(-1, self.num_heads_local, self.head_dim),
                 cp_context,
             ).unsqueeze(0)
-            beta = cp_merge_rows(beta.reshape(-1, self.num_heads_local), cp_context).unsqueeze(0)
+            beta_raw = cp_merge_rows(beta_raw.reshape(-1, self.num_heads_local), cp_context).unsqueeze(0)
 
-        core_attn_out = backend.execute_linear(mixed_qkv, beta, self, raw_gate_proj=g_raw)
+        core_attn_out = backend.execute_linear(mixed_qkv, beta_raw, self, raw_gate_proj=g_raw)
 
         if cp_context is not None:
             core_attn_out = cp_shard_rows(

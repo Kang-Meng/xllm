@@ -34,6 +34,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "distributed_runtime/engine.h"
+#include "framework/batch/batch.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
@@ -78,7 +79,8 @@ class FakeEngine final : public Engine {
              int32_t block_size,
              int32_t num_speculative_tokens = 0,
              int32_t dp_size = 1,
-             int32_t embedding_blocks = 0) {
+             int32_t embedding_blocks = 0,
+             bool enable_linear_state = false) {
     BlockManagerPool::Options options;
     options.num_blocks(num_blocks)
         .block_size(block_size)
@@ -87,6 +89,14 @@ class FakeEngine final : public Engine {
         .num_speculative_tokens(num_speculative_tokens)
         .num_embedding_blocks(embedding_blocks == 0 ? num_blocks
                                                     : embedding_blocks);
+    if (enable_linear_state) {
+      options.enable_linear_state(true)
+          .linear_state_num_slots(num_blocks)
+          .instance_is_decode(true);
+      model_args_.model_type("qwen3_5")
+          .num_speculative_tokens(num_speculative_tokens)
+          .layer_types({"linear_attention"});
+    }
     tokenizer_ = std::make_unique<FakeTokenizer>();
     block_manager_ = std::make_unique<BlockManagerPool>(options, dp_size);
   }
@@ -589,6 +599,66 @@ TEST(DisaggPDSchedulerTest, GroupedPullAlignsActiveSwaSuffix) {
   ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
   engine.block_manager_pool()->deallocate(queued.get());
   queued->sequences()[0]->kv_state().erase_blocks(BlockType::SWA);
+}
+
+TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
+  FakeEngine engine(/*num_blocks=*/8,
+                    /*block_size=*/2,
+                    /*num_speculative_tokens=*/1,
+                    /*dp_size=*/1,
+                    /*embedding_blocks=*/8,
+                    /*enable_linear_state=*/true);
+  TestDisaggPDScheduler scheduler(&engine, make_mtp_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  Sequence* sequence = request->sequences()[0].get();
+  ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  const int32_t local_linear_state_id = sequence->get_linear_state_slot_id();
+  ASSERT_GE(local_linear_state_id, 0);
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  KVTransferMapping source_mapping;
+  source_mapping.group_id = cache_group_id(BlockType::LINEAR);
+  source_mapping.remote_ids = {101};
+  torch::Tensor bootstrap_embedding = torch::tensor({1.0f, 2.0f});
+  ASSERT_TRUE(scheduler.decode_recv_first_generation(
+      "req",
+      /*token_id=*/42,
+      /*has_logprob=*/false,
+      /*logprob=*/0.0f,
+      /*time_to_first_token_latency_seconds=*/0.1,
+      /*upstream_elapsed_seconds=*/0.0,
+      /*top_tokens=*/{},
+      /*top_logprobs=*/{},
+      /*kv_cache_transfer_mode=*/"PULL",
+      /*src_cluster_ids=*/{1},
+      /*src_addrs=*/{"remote"},
+      /*source_mappings=*/{source_mapping},
+      /*src_dp_size=*/1,
+      /*src_dp_rank=*/0,
+      bootstrap_embedding));
+
+  ASSERT_EQ(engine.pulled_mappings.size(), 1u);
+  EXPECT_EQ(engine.pulled_mappings[0].group_id,
+            cache_group_id(BlockType::LINEAR));
+  EXPECT_EQ(engine.pulled_mappings[0].remote_ids, std::vector<uint64_t>({101}));
+  EXPECT_EQ(
+      engine.pulled_mappings[0].local_ids,
+      std::vector<uint64_t>({static_cast<uint64_t>(local_linear_state_id)}));
+
+  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(batches[0].size(), 1u);
+  ForwardInput input = batches[0].prepare_forward_input(
+      /*num_decoding_tokens=*/2,
+      /*min_decoding_bach_size=*/0,
+      engine.model_args());
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids,
+            std::vector<int32_t>({local_linear_state_id}));
+  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids,
+            std::vector<int32_t>({local_linear_state_id}));
+  ASSERT_EQ(input.input_params.attention.host.kv_cache_tokens_nums.size(), 1u);
+  EXPECT_GT(input.input_params.attention.host.kv_cache_tokens_nums[0], 0);
 }
 
 TEST(DisaggPDSchedulerTest, FirstDecodeTokenLatencyIsNonNegative) {

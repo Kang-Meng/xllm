@@ -322,28 +322,6 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         self._kv_bound = True
 
-    def _reset_kda_spec_state_on_pd_handoff(self, metadata: AttentionMetadata) -> None:
-        """Reset process-local KDA speculative state on first PD decode."""
-        reset_mask = getattr(metadata, "pd_handoff_reset_mask", None)
-        if not isinstance(reset_mask, torch.Tensor) or reset_mask.numel() == 0:
-            return
-
-        slots = getattr(metadata, "linear_state_indices", None)
-        if not isinstance(slots, torch.Tensor) or slots.numel() == 0:
-            raise RuntimeError("PD handoff reset requires linear-state indices")
-        if reset_mask.numel() != slots.numel():
-            raise RuntimeError(
-                "PD handoff reset mask is not aligned with linear-state "
-                f"slots: mask={reset_mask.numel()}, slots={slots.numel()}"
-            )
-
-        reset_fn = getattr(self.attention_backend, "reset_kda_spec_slots", None)
-        if reset_fn is None:
-            raise RuntimeError("PD handoff reset requires KDA speculative-state support")
-        reset_slots = slots.reshape(-1)[reset_mask.reshape(-1).to(device=slots.device, dtype=torch.bool)]
-        if reset_slots.numel() > 0:
-            reset_fn(reset_slots)
-
     @torch.inference_mode()
     def execute(
         self,
@@ -361,8 +339,6 @@ class ModelExecutor:
             raise RuntimeError("KV caches are not bound")
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
-
-        self._reset_kda_spec_state_on_pd_handoff(metadata)
 
         eplb = None
         if expert_load_data is not None:

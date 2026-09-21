@@ -124,8 +124,6 @@ class BatchInputBuilder {
     // Additional data
     std::vector<int32_t> embedding_ids;
     std::vector<int32_t> linear_state_ids;
-    // Per-logical-sequence first-decode marker after PD handoff.
-    std::vector<int32_t> pd_handoff_reset_mask;
     std::vector<int32_t> linear_state_read_ids;
     std::vector<std::string> request_ids;
     std::vector<int32_t> extra_token_ids;

@@ -62,11 +62,6 @@ namespace {
 // so decode always stays single-threaded while large prefill still fans out.
 constexpr size_t kMultithreadTokenThreshold = 65536;
 
-// The builder holds args_ as a pointer that may be null.
-bool uses_glm53_speculative_kda(const ModelArgs* args) {
-  return args != nullptr && uses_glm5_speculative_kda(*args);
-}
-
 uint32_t get_sample_source_position(const SampleSlot& sample_slot) {
   if (sample_slot.token_position == 0) {
     return 0;
@@ -488,7 +483,6 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 #endif
     thread_state.embedding_ids.reserve(sequences_per_thread);
     thread_state.linear_state_ids.reserve(sequences_per_thread);
-    thread_state.pd_handoff_reset_mask.reserve(sequences_per_thread);
     thread_state.linear_state_read_ids.reserve(sequences_per_thread);
     thread_state.request_ids.reserve(sequences_per_thread);
     thread_state.extra_token_ids.reserve(sequences_per_thread);
@@ -565,7 +559,6 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 #endif
   state_.embedding_ids.reserve(total_seqs);
   state_.linear_state_ids.reserve(total_seqs);
-  state_.pd_handoff_reset_mask.reserve(total_seqs);
   state_.linear_state_read_ids.reserve(total_seqs);
   state_.request_ids.reserve(total_seqs);
   state_.extra_token_ids.reserve(total_seqs);
@@ -676,9 +669,6 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.linear_state_ids.insert(state_.linear_state_ids.end(),
                                    state.linear_state_ids.begin(),
                                    state.linear_state_ids.end());
-    state_.pd_handoff_reset_mask.insert(state_.pd_handoff_reset_mask.end(),
-                                        state.pd_handoff_reset_mask.begin(),
-                                        state.pd_handoff_reset_mask.end());
     state_.linear_state_read_ids.insert(state_.linear_state_read_ids.end(),
                                         state.linear_state_read_ids.begin(),
                                         state.linear_state_read_ids.end());
@@ -869,15 +859,6 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
       handle_sampling_parameters(sequence, state_ptr);
       ++sample_slot_idx;
     }
-  }
-
-  if (uses_glm53_speculative_kda(args_)) {
-    // Mark the first decode after PD handoff for KDA state reset. This state is
-    // independent of the index kPool representation and must also be reset
-    // when index_kpool_compress is disabled.
-    const bool needs_pd_handoff_reset =
-        !sequence->is_prefill_stage() && sequence->pd_handoff_reset_pending();
-    state.pd_handoff_reset_mask.emplace_back(needs_pd_handoff_reset ? 1 : 0);
   }
 
   // Add extra token id
@@ -1287,16 +1268,6 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   input_params.embedding.linear_state_ids = std::move(state_.linear_state_ids);
   input_params.embedding.linear_state_read_ids =
       std::move(state_.linear_state_read_ids);
-  if (has_pd_handoff_reset(state_.pd_handoff_reset_mask)) {
-    CHECK_EQ(state_.pd_handoff_reset_mask.size(), sequences_.size());
-    for (size_t seq_index = 0; seq_index < sequences_.size(); ++seq_index) {
-      if (state_.pd_handoff_reset_mask[seq_index] != 0) {
-        sequences_[seq_index]->consume_pd_handoff_reset();
-      }
-    }
-    input_params.pd_handoff_reset_mask =
-        std::move(state_.pd_handoff_reset_mask);
-  }
   if (!input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         torch::tensor(input_params.embedding.linear_state_ids, torch::kInt);

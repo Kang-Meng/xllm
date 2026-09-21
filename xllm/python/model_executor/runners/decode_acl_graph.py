@@ -38,7 +38,12 @@ import torch
 import torch.nn as nn
 
 from xllm.python import kernels
-from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.attention.backend import (
+    AttentionBackend,
+    AttentionMetadata,
+    build_speculative_ssm_state_indices,
+    linear_state_checkpoint_stride,
+)
 from xllm.python.attention.dsa_metadata import DSA_CACHE_TOKEN
 from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
@@ -99,6 +104,7 @@ class _StaticAttentionMetadata:
     block_table: torch.Tensor | None = None
     kv_seq_lens: torch.Tensor | None = None
     linear_state_indices: torch.Tensor | None = None
+    linear_state_checkpoint_indices: torch.Tensor | None = None
     num_accepted_tokens: torch.Tensor | None = None
     has_initial_state: torch.Tensor | None = None
     dp_execution_token_counts: tuple[int, ...] = ()
@@ -1085,6 +1091,13 @@ class DecodeAclGraphRunner(BaseRunner):
             input_ids.numel(),
             padded_batch_size,
         )
+        needs_accepted_tokens = getattr(metadata, "num_accepted_tokens", None) is not None or (
+            self.num_decoding_tokens > 1
+            and any(
+                getattr(cache, "conv", None) is not None and getattr(cache, "ssm", None) is not None
+                for cache in self.layer_caches
+            )
+        )
         entry.static_metadata = _StaticAttentionMetadata(
             slot_mapping=torch.zeros(
                 padded_batch_size,
@@ -1120,12 +1133,12 @@ class DecodeAclGraphRunner(BaseRunner):
             # fixed address; contents are refreshed by _fill_entry each step.
             linear_state_indices=torch.zeros(padded_batch_size, dtype=torch.int64, device=device),
             num_accepted_tokens=(
-                torch.ones(padded_batch_size, dtype=torch.int32, device=device)
-                if getattr(metadata, "num_accepted_tokens", None) is not None
-                or (
-                    self.num_decoding_tokens > 1
-                    and any(cache.conv is not None and cache.ssm is not None for cache in self.layer_caches)
+                torch.ones(
+                    padded_batch_size,
+                    dtype=torch.int32,
+                    device=device,
                 )
+                if needs_accepted_tokens
                 else None
             ),
             has_initial_state=torch.zeros(padded_batch_size, dtype=torch.int32, device=device),
@@ -1381,18 +1394,16 @@ class DecodeAclGraphRunner(BaseRunner):
                     )
             if padded_batch_size > batch_size:
                 static_metadata.linear_state_indices[batch_size:].zero_()
-        source_accepted = getattr(metadata, "num_accepted_tokens", None)
+        src_accepted = getattr(metadata, "num_accepted_tokens", None)
         static_accepted = static_metadata.num_accepted_tokens
         if static_accepted is not None:
             static_accepted.fill_(1)
-            if not getattr(metadata, "is_dummy", False):
-                if source_accepted is None:
-                    raise RuntimeError("accepted-token metadata is missing during ACL graph replay")
-                if source_accepted.ndim != 1 or not 0 < source_accepted.numel() <= batch_size:
+            if not static_metadata.is_dummy and src_accepted is None:
+                raise RuntimeError("accepted-token metadata is missing during ACL graph replay")
+            if not static_metadata.is_dummy:
+                if src_accepted.ndim != 1 or not 0 < src_accepted.numel() <= batch_size:
                     raise ValueError("accepted-token metadata must contain one count per logical sequence")
-                static_accepted[: source_accepted.numel()].copy_(source_accepted)
-        elif source_accepted is not None:
-            raise RuntimeError("accepted-token metadata availability changed after ACL graph allocation")
+                static_accepted[: src_accepted.numel()].copy_(src_accepted.to(torch.int32))
         if static_metadata.has_initial_state is not None:
             src_his = getattr(metadata, "has_initial_state", None)
             if src_his is None:
@@ -1605,13 +1616,6 @@ class DecodeAclGraphRunner(BaseRunner):
         # would leave each sequence's recurrent state several steps ahead.
         # Snapshot the touched state slots and restore them after capture.
         linear_snapshot = self._snapshot_linear_state(entry)
-        # V3 combined [base|draft0|...|draft{R-1}] pools follow the same
-        # lifecycle (warmup + capture advance them); restore entry contents or
-        # the first replay resumes from a state several steps stale.
-        v3_snapshot = None
-        v3_snap_fn = getattr(self.attention_backend, "snapshot_kda_v3_state", None)
-        if v3_snap_fn is not None and entry.static_metadata.linear_state_indices is not None:
-            v3_snapshot = v3_snap_fn(entry.static_metadata.linear_state_indices)
         context = ForwardContext(
             self.attention_backend,
             self.device,
@@ -1621,12 +1625,12 @@ class DecodeAclGraphRunner(BaseRunner):
             eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
         )
-        # The snapshots above (linear/v3) read conv/ssm state on the
-        # current (default) stream, while the warmup forward below advances
-        # that state on self._stream. NPU cross-stream accesses to the same
-        # memory are not auto-serialized, so make the warmup stream wait for
-        # the snapshot reads to complete first — otherwise the snapshot may
-        # land after the advance and restore a state that is already stale.
+        # The linear snapshot includes V3's framework-owned checkpoints. Its
+        # reads run on the current (default) stream, while the warmup forward
+        # below advances the state on self._stream. NPU cross-stream accesses
+        # to the same memory are not auto-serialized, so make the warmup stream
+        # wait for the snapshot reads to complete first — otherwise the
+        # snapshot may land after the advance and restore stale state.
         self._stream.wait_stream(torch.npu.current_stream())
         with forward_context(context), torch.npu.stream(self._stream):
             for _ in range(_CAPTURE_WARMUP_STEPS):
@@ -1648,30 +1652,36 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
         self._restore_linear_state(entry, linear_snapshot)
-        if v3_snapshot is not None:
-            v3_restore_fn = getattr(self.attention_backend, "restore_kda_v3_state", None)
-            if v3_restore_fn is not None:
-                v3_restore_fn(v3_snapshot)
 
-    def _snapshot_linear_state(
-        self, entry: _DecodeGraphEntry
-    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None:
+    def _snapshot_linear_state(self, entry: _DecodeGraphEntry) -> list[tuple[torch.Tensor, ...]] | None:
         """Copy the conv/ssm rows the capture run is about to advance."""
         idx = entry.static_metadata.linear_state_indices
         if idx is None:
             return None
+        logical_state_indices = torch.unique(idx)
         snapshot = []
         for cache in self.layer_caches:
             conv = getattr(cache, "conv", None)
             ssm = getattr(cache, "ssm", None)
             if conv is None or ssm is None:
                 continue
+            checkpoint_stride = linear_state_checkpoint_stride(
+                conv,
+                ssm,
+            )
+            ssm_indices = build_speculative_ssm_state_indices(
+                logical_state_indices,
+                checkpoint_stride,
+                dtype=idx.dtype,
+            ).reshape(-1)
             snapshot.append(
                 (
                     conv,
                     ssm,
-                    conv.index_select(0, idx).clone(),
-                    ssm.index_select(0, idx).clone(),
+                    logical_state_indices,
+                    ssm_indices,
+                    conv.index_select(0, logical_state_indices).clone(),
+                    ssm.index_select(0, ssm_indices).clone(),
                 )
             )
         return snapshot or None
@@ -1679,14 +1689,13 @@ class DecodeAclGraphRunner(BaseRunner):
     @staticmethod
     def _restore_linear_state(
         entry: _DecodeGraphEntry,
-        snapshot: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None,
+        snapshot: list[tuple[torch.Tensor, ...]] | None,
     ) -> None:
         if not snapshot:
             return
-        idx = entry.static_metadata.linear_state_indices
-        for conv, ssm, conv_rows, ssm_rows in snapshot:
-            conv.index_copy_(0, idx, conv_rows)
-            ssm.index_copy_(0, idx, ssm_rows)
+        for conv, ssm, state_indices, ssm_indices, conv_rows, ssm_rows in snapshot:
+            conv.index_copy_(0, state_indices, conv_rows)
+            ssm.index_copy_(0, ssm_indices, ssm_rows)
         torch.npu.synchronize()
 
     def _forward_static(self, entry: _DecodeGraphEntry) -> ModelExecutionOutput:

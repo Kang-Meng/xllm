@@ -275,40 +275,6 @@ void materialize_linear_state_validity(
           : torch::tensor(params.linear_state_validity_mask, options);
 }
 
-void materialize_pd_handoff_reset_mask(
-    const ModelInputParams& params,
-    const std::optional<torch::Device>& device,
-    AttentionMetadata& attn_metadata) {
-  const int64_t mask_rows =
-      static_cast<int64_t>(params.pd_handoff_reset_mask.size());
-  if (mask_rows == 0 || attn_metadata.is_dummy ||
-      !has_pd_handoff_reset(params.pd_handoff_reset_mask)) {
-    return;
-  }
-
-  int64_t metadata_rows = mask_rows;
-  if (!params.embedding.linear_state_ids.empty()) {
-    metadata_rows =
-        static_cast<int64_t>(params.embedding.linear_state_ids.size());
-  } else if (params.embedding.linear_state_indices.defined()) {
-    metadata_rows = params.embedding.linear_state_indices.numel();
-  }
-  CHECK_EQ(mask_rows, metadata_rows)
-      << "PD handoff reset mask row count mismatch: mask_rows=" << mask_rows
-      << ", metadata_rows=" << metadata_rows;
-
-  torch::TensorOptions options;
-  if (params.attention.device.q_seq_lens.defined()) {
-    options = params.attention.device.q_seq_lens.options();
-  } else {
-    CHECK(device.has_value())
-        << "PD handoff reset metadata requires a target device";
-    options = torch::TensorOptions().device(device.value());
-  }
-  attn_metadata.pd_handoff_reset_mask =
-      torch::tensor(params.pd_handoff_reset_mask, options.dtype(torch::kBool));
-}
-
 AttentionMetadata build_attention_metadata(
     const ModelInputParams& params,
     bool enable_mla,
@@ -536,7 +502,6 @@ AttentionMetadata build_attention_metadata(
   }
   materialize_linear_state_validity(
       params, device, build_options, attn_metadata);
-  materialize_pd_handoff_reset_mask(params, device, attn_metadata);
 
   // Set is_causal: true for prefill (causal attention), false for decode
   // (non-causal) Default to true (causal) if not explicitly set

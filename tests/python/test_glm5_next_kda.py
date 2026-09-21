@@ -285,12 +285,12 @@ def test_merged_input_forward_preserves_backend_arguments_and_output(
     reductions = []
 
     def _execute_linear(
-        mixed_qkv: torch.Tensor, beta: torch.Tensor, layer: torch.nn.Module, *, raw_gate_proj: torch.Tensor
+        mixed_qkv: torch.Tensor, beta_raw_arg: torch.Tensor, layer: torch.nn.Module, *, raw_gate_proj: torch.Tensor
     ) -> torch.Tensor:
         assert layer is attention
         torch.testing.assert_close(mixed_qkv, expected_qkv)
-        assert beta.dtype == torch.float32
-        torch.testing.assert_close(beta, beta_raw.float().sigmoid())
+        assert beta_raw_arg.dtype == beta_raw.dtype
+        torch.testing.assert_close(beta_raw_arg, beta_raw)
         torch.testing.assert_close(raw_gate_proj, expected_raw)
         return core_output
 
@@ -364,6 +364,158 @@ def native_causal_conv1d(npu_runtime: ModuleType) -> Callable[..., torch.Tensor]
     if not hasattr(torch.ops.xllm_ops, "causal_conv1d"):
         pytest.fail("Set XLLM_KDA_TEST_OP_LIBRARY to an operator-only library registering xllm_ops::causal_conv1d")
     return torch.ops.xllm_ops.causal_conv1d
+
+
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@torch.inference_mode()
+def test_chunk_kda_varlen_matches_independent_sequences(npu_runtime: ModuleType) -> None:
+    kda_ops = pytest.importorskip("fla_npu.ops.ascendc")
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(42)
+    sequence_lengths = (17, 33)
+    num_tokens = sum(sequence_lengths)
+    num_heads = 1
+    head_dim = 128
+
+    def _random(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        return torch.randn(shape, generator=generator).to(device=device, dtype=dtype)
+
+    query = glm5_next._l2norm(_random((1, num_tokens, num_heads, head_dim), torch.float32), dim=-1).to(torch.bfloat16)
+    key = glm5_next._l2norm(_random((1, num_tokens, num_heads, head_dim), torch.float32), dim=-1).to(torch.bfloat16)
+    value = _random((1, num_tokens, num_heads, head_dim), torch.bfloat16)
+    raw_gate = _random((1, num_tokens, num_heads, head_dim), torch.bfloat16)
+    beta = _random((1, num_tokens, num_heads), torch.bfloat16).float().sigmoid()
+    initial_state = _random((len(sequence_lengths), num_heads, head_dim, head_dim), torch.float32)
+    a_log = _random((num_heads,), torch.float32)
+    dt_bias = _random((num_heads * head_dim,), torch.float32)
+    cumulative_lengths = torch.tensor(
+        [0, sequence_lengths[0], num_tokens],
+        dtype=torch.int32,
+        device=device,
+    )
+    common_kwargs = dict(
+        chunk_size=64,
+        layout="BSND",
+        output_final_state=True,
+        return_intermediate_states=False,
+        state_v_first=True,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        use_gate_in_kernel=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+    packed_result = kda_ops.chunk_kda_fwd(
+        query,
+        key,
+        value,
+        raw_gate,
+        beta,
+        head_dim**-0.5,
+        initial_state=initial_state,
+        cu_seqlens=cumulative_lengths,
+        **common_kwargs,
+    )
+    packed_output = packed_result[0]
+    packed_state = packed_result[1]
+
+    sequence_outputs = []
+    sequence_states = []
+    start = 0
+    for sequence_index, sequence_length in enumerate(sequence_lengths):
+        end = start + sequence_length
+        result = kda_ops.chunk_kda_fwd(
+            query[:, start:end],
+            key[:, start:end],
+            value[:, start:end],
+            raw_gate[:, start:end],
+            beta[:, start:end],
+            head_dim**-0.5,
+            initial_state=initial_state[sequence_index : sequence_index + 1],
+            cu_seqlens=torch.tensor([0, sequence_length], dtype=torch.int32, device=device),
+            **common_kwargs,
+        )
+        sequence_outputs.append(result[0])
+        sequence_states.append(result[1])
+        start = end
+
+    torch.testing.assert_close(packed_output, torch.cat(sequence_outputs, dim=1), rtol=0, atol=0)
+    torch.testing.assert_close(packed_state, torch.cat(sequence_states, dim=0), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@torch.inference_mode()
+def test_recurrent_kda_beta_sigmoid_matches_host_preprocessing(npu_runtime: ModuleType) -> None:
+    kda_ops = pytest.importorskip("fla_npu.ops.ascendc")
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(123)
+    num_tokens = 8
+    num_heads = 1
+    head_dim = 128
+
+    def _random(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        return torch.randn(shape, generator=generator).to(device=device, dtype=dtype)
+
+    query = _random((num_tokens, num_heads, head_dim), torch.bfloat16)
+    key = _random((num_tokens, num_heads, head_dim), torch.bfloat16)
+    value = _random((num_tokens, num_heads, head_dim), torch.bfloat16)
+    raw_gate = _random((num_tokens, num_heads, head_dim), torch.bfloat16)
+    # Include sigmoid's transition and saturation regions instead of relying
+    # only on a standard-normal beta projection.
+    beta_raw = torch.tensor(
+        [[-8.0], [-4.0], [-1.0], [-0.125], [0.125], [1.0], [4.0], [8.0]],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    initial_state = _random((1, num_heads, head_dim, head_dim), torch.float32)
+    a_log = _random((num_heads,), torch.float32)
+    dt_bias = _random((num_heads * head_dim,), torch.float32)
+    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+
+    common_kwargs = dict(
+        cu_seqlens=cu_seqlens,
+        layout="TND",
+        scale=head_dim**-0.5,
+        output_final_state=True,
+        inplace_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+        state_v_first=True,
+        A_log=a_log,
+        dt_bias=dt_bias,
+    )
+
+    host_state = initial_state.clone()
+    host_output, host_final_state = kda_ops.recurrent_kda(
+        query,
+        key,
+        value,
+        raw_gate,
+        beta_raw.float().sigmoid(),
+        use_beta_sigmoid_in_kernel=False,
+        initial_state=host_state,
+        **common_kwargs,
+    )
+
+    kernel_state = initial_state.clone()
+    kernel_output, kernel_final_state = kda_ops.recurrent_kda(
+        query,
+        key,
+        value,
+        raw_gate,
+        beta_raw,
+        use_beta_sigmoid_in_kernel=True,
+        initial_state=kernel_state,
+        **common_kwargs,
+    )
+
+    torch.npu.synchronize()
+    torch.testing.assert_close(kernel_output, host_output, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(kernel_final_state, host_final_state, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
@@ -526,7 +678,7 @@ def test_real_kda_merged_projection_graph_replay(
             output_gate = attention.g_b_proj(output_latent).view(hidden_shape)
         return (
             mixed_qkv.transpose(1, 2),
-            beta_raw.float().sigmoid(),
+            beta_raw,
             raw_gate,
             attention.forget_gate.gate_from_raw(raw_gate),
             output_gate,

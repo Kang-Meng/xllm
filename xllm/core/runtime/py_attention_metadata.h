@@ -72,6 +72,9 @@ class PyAttentionMetadataView final {
   const torch::Tensor& paged_kv_last_page_len() const;
   pybind11::object qo_indptr() const;
   pybind11::object q_cu_seq_lens() const;
+#if defined(USE_NPU)
+  const std::vector<int64_t>& q_cu_seq_lens_host_values() const;
+#endif
   pybind11::object kv_cu_seq_lens() const;
   pybind11::object kv_seq_lens_host() const;
   const std::vector<int32_t>& kv_seq_lens_host_values() const;
@@ -86,7 +89,6 @@ class PyAttentionMetadataView final {
   const std::vector<int32_t>& kpool_query_lens() const;
   pybind11::object num_accepted_tokens() const;
   pybind11::object has_initial_state() const;
-  pybind11::object pd_handoff_reset_mask() const;
   const std::vector<int32_t>& dp_execution_token_counts() const;
   const std::vector<int32_t>& raw_dp_execution_token_counts() const;
   const std::vector<int32_t>& dp_global_kv_max_seq_lens() const;

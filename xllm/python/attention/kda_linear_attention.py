@@ -19,7 +19,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from xllm.python.attention.backend import resolve_linear_state_io_indices
+from xllm.python.attention.backend import (
+    linear_state_checkpoint_stride,
+    resolve_linear_state_io_indices,
+)
 from xllm.python.model_executor.forward_context import (
     get_execution_buffer,
     in_acl_graph,
@@ -27,6 +30,38 @@ from xllm.python.model_executor.forward_context import (
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
+
+
+def _get_host_q_cu_seq_lens(metadata, expected_num_seqs: int) -> list[int]:
+    """Return cumulative query lengths without synchronizing a device tensor."""
+    host_values = getattr(metadata, "q_cu_seq_lens_host_values", None)
+    if host_values is not None and len(host_values) == expected_num_seqs + 1:
+        return [int(value) for value in host_values]
+    if host_values is not None and len(host_values) == expected_num_seqs:
+        return [0] + [int(value) for value in host_values]
+
+    q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
+    if (
+        q_seq_lens_host is not None
+        and q_seq_lens_host.device.type == "cpu"
+        and q_seq_lens_host.numel() == expected_num_seqs
+    ):
+        q_cu_list = [0]
+        cumulative = 0
+        for length in q_seq_lens_host.tolist():
+            cumulative += int(length)
+            q_cu_list.append(cumulative)
+        return q_cu_list
+
+    q_cu_seq_lens = metadata.q_cu_seq_lens
+    assert q_cu_seq_lens is not None, "multi-sequence linear attention needs q_cu_seq_lens"
+    if q_cu_seq_lens.numel() != expected_num_seqs + 1:
+        raise RuntimeError(
+            f"KDA query/state metadata length mismatch: q_cu={q_cu_seq_lens.numel()}, state={expected_num_seqs}"
+        )
+    if q_cu_seq_lens.device.type != "cpu":
+        raise RuntimeError("NPU KDA multi-sequence prefill requires host q_cu_seq_lens metadata")
+    return [int(value) for value in q_cu_seq_lens.to(torch.int64).tolist()]
 
 
 class KdaLinearAttentionMixin:
@@ -55,46 +90,10 @@ class KdaLinearAttentionMixin:
         )
         return output.reshape(value.shape)
 
-    def reset_kda_spec_slots(self, idx: torch.Tensor) -> None:
-        """Clear local checkpoints on PD handoff without replacing graph buffers."""
-        if idx is None or idx.numel() == 0:
-            return
-        idx64 = torch.unique(idx.to(torch.int64))
-        for state in self.__dict__.get("_kda_v3", {}).values():
-            nslots = state["combined_conv"].shape[0] // self._kda_verify_width
-            offsets = torch.arange(self._kda_verify_width, device=idx64.device) * nslots
-            slot_indices = (idx64[:, None] + offsets[None, :]).flatten()
-            state["combined_conv"].index_fill_(0, slot_indices, 0)
-            state["combined_ssm"].index_fill_(0, slot_indices, 0)
-
-    def snapshot_kda_v3_state(self, idx: torch.Tensor) -> list[tuple]:
-        """Snapshot each touched base/draft row once before graph capture."""
-        idx64 = torch.unique(idx.to(torch.int64))
-        snap = []
-        for st in self.__dict__.get("_kda_v3", {}).values():
-            nslots = st["combined_conv"].shape[0] // self._kda_verify_width
-            offsets = torch.arange(self._kda_verify_width, device=idx64.device) * nslots
-            slot_idx = (idx64[:, None] + offsets[None, :]).flatten()
-            snap.append(
-                (
-                    st,
-                    slot_idx,
-                    st["combined_conv"].index_select(0, slot_idx),
-                    st["combined_ssm"].index_select(0, slot_idx),
-                )
-            )
-        return snap
-
-    @staticmethod
-    def restore_kda_v3_state(snap: list[tuple]) -> None:
-        for st, slot_idx, conv_snap, ssm_snap in snap:
-            st["combined_conv"].index_copy_(0, slot_idx, conv_snap)
-            st["combined_ssm"].index_copy_(0, slot_idx, ssm_snap)
-
     def execute_linear(
         self,
         mixed_qkv: torch.Tensor,
-        beta: torch.Tensor,
+        beta_raw: torch.Tensor,
         layer: Attention,
         raw_gate_proj: torch.Tensor,
     ) -> torch.Tensor:
@@ -105,10 +104,10 @@ class KdaLinearAttentionMixin:
         against the transformers reference); only the state I/O moved here so
         both attention layer types dispatch through the backend.
 
-        ``raw_gate_proj`` is the pre-gate projection ``f_b(f_a(x))``. Plain
-        decode/prefill kernels fuse the safe-gate calculation in-kernel. MTP
-        verify uses the V3 multi-slot path with a materialized safe-gate from
-        ``Glm5NextForgetGate.gate_from_raw``.
+        ``raw_gate_proj`` is the pre-gate projection ``f_b(f_a(x))`` and
+        ``beta_raw`` is the pre-sigmoid beta projection. Recurrent decode and
+        verify kernels consume both raw tensors; chunk-prefill materializes
+        only the FP32 beta required by its kernel.
         """
         from fla_npu.ops.ascendc import chunk_kda_fwd, recurrent_kda
 
@@ -166,7 +165,7 @@ class KdaLinearAttentionMixin:
             mixed_qkv = mixed_qkv.transpose(0, 2)  # [1, C, T] -> [T, C, 1]
             batch_size, _, seq_len = mixed_qkv.shape
             hidden_shape = (batch_size, seq_len, -1, head_dim)
-            beta = beta.transpose(0, 1)  # [1, T, nh] -> [T, 1, nh]
+            beta_raw = beta_raw.transpose(0, 1)  # [1, T, nh] -> [T, 1, nh]
             # Plain graph decode (spec-verify is excluded above), so the gate is
             # never materialized here; only the raw projection the kernel fuses
             # follows the transpose. [1, T, nh, hd] -> [T, 1, nh, hd].
@@ -224,8 +223,8 @@ class KdaLinearAttentionMixin:
                         group_idx = idx
                     return self._spec_verify_v3(
                         mixed_qkv,
-                        fg.gate_from_raw(raw_gate_proj),
-                        beta,
+                        raw_gate_proj,
+                        beta_raw,
                         layer,
                         group_idx,
                         metadata,
@@ -274,8 +273,8 @@ class KdaLinearAttentionMixin:
                 idx = torch.tensor(merged_slots, dtype=torch.int64, device=idx.device)
                 return self._spec_verify_v3(
                     mixed_qkv,
-                    fg.gate_from_raw(raw_gate_proj),
-                    beta,
+                    raw_gate_proj,
+                    beta_raw,
                     layer,
                     idx,
                     metadata,
@@ -285,16 +284,22 @@ class KdaLinearAttentionMixin:
                 )
             if (
                 (not is_prefill or is_spec_verify)
-                and self._kda_verify_width > 1
+                and getattr(metadata, "num_accepted_tokens", None) is not None
                 and idx.numel() > 0
                 and mixed_qkv.dim() == 3
                 and mixed_qkv.shape[2] >= idx.numel()
                 and mixed_qkv.shape[2] % idx.numel() == 0
+                and (is_spec_verify or mixed_qkv.shape[2] > idx.numel())
             ):
+                # A multi-token row group is the MTP/speculative V3 path even
+                # when legacy metadata does not mark it as spec verify. Plain
+                # width-one decode must remain on the regular recurrent path;
+                # ACL graphs still carry an all-ones accepted-token buffer, but
+                # that buffer alone does not make a request speculative.
                 return self._spec_verify_v3(
                     mixed_qkv,
-                    fg.gate_from_raw(raw_gate_proj),
-                    beta,
+                    raw_gate_proj,
+                    beta_raw,
                     layer,
                     idx,
                     metadata,
@@ -304,9 +309,15 @@ class KdaLinearAttentionMixin:
                 )
             elif is_spec_verify:
                 raise RuntimeError("KDA spec-verify requires a non-empty uniform token block within the decoding width")
+            ssm_checkpoint_stride = linear_state_checkpoint_stride(
+                conv_cache,
+                ssm_cache,
+            )
+            conv_cache_base = conv_cache[:, :conv_state_len]
             state_read_idx = read_idx if is_prefill else idx
-            conv_i = conv_cache.index_select(0, state_read_idx)
-            ssm_i = ssm_cache.index_select(0, state_read_idx)
+            conv_i = conv_cache_base.index_select(0, state_read_idx)
+            ssm_read_idx = state_read_idx * ssm_checkpoint_stride
+            ssm_i = ssm_cache.index_select(0, ssm_read_idx)
             his = metadata.has_initial_state
             if his is not None and len(his) == num_seqs:
                 if not isinstance(his, torch.Tensor):
@@ -330,8 +341,7 @@ class KdaLinearAttentionMixin:
         else:
             q_cu = metadata.q_cu_seq_lens
             assert q_cu is not None, "multi-sequence linear attention needs q_cu_seq_lens"
-            q_cu = q_cu.to(torch.int64)
-            q_cu_list = q_cu.tolist()
+            q_cu_list = _get_host_q_cu_seq_lens(metadata, num_seqs)
             mixed_qkv = self._causal_conv1d(
                 mixed_qkv, conv_state, layer, query_start_loc=q_cu_list, is_prefill=is_prefill
             )
@@ -344,21 +354,17 @@ class KdaLinearAttentionMixin:
         key = key.view(hidden_shape)
         value = value.view(hidden_shape)
 
-        # ``beta`` arrives as [B, S, nh] and is already correct for both
+        # ``beta_raw`` arrives as [B, S, nh] and is already correct for both
         # layouts: per-sequence [num_seqs, per_seq_len, nh] when the batch rows
         # map 1:1 to sequences, and flattened [1, T, nh] (T = sum of q_cu) for
         # the varlen multi-sequence path. Re-viewing it as
         # (num_seqs, seq_len, nh) assumes a uniform per-seq length == the
         # flattened total and crashes on multi-sequence decode batches
         # (e.g. 2 concurrent requests: view [2, 2, 4] on 8 elements).
-        # fla_npu KDA ops require fp32 gate/beta (the pure-torch reference also
-        # upcasts them); the model hands them in bf16.
-        b = beta.to(torch.float32)
         fuse_gate = raw_gate_proj is not None and fg is not None and gate_lb is not None and -5.0 <= gate_lb < 0.0
         if fuse_gate:
             g = None
             g_raw = raw_gate_proj if num_seqs == batch_size else raw_gate_proj.view(hidden_shape)
-            g_raw = g_raw.to(torch.float32)
             kda_A_log = fg.A_log.to(torch.float32).contiguous()
             kda_dt_bias = fg.dt_bias.to(torch.float32).contiguous()
             _gate_kwargs = dict(
@@ -382,7 +388,7 @@ class KdaLinearAttentionMixin:
             v_tnd = value.reshape(-1, num_heads_local, head_dim).to(torch.bfloat16).contiguous()
             g_tnd = None if fuse_gate else g.reshape(-1, num_heads_local, head_dim).contiguous()
             g_raw_tnd = g_raw.reshape(-1, num_heads_local, head_dim).contiguous() if fuse_gate else None
-            b_tnd = b.reshape(-1, num_heads_local).contiguous()
+            beta_raw_tnd = beta_raw.reshape(-1, num_heads_local).contiguous()
             if num_seqs != batch_size:
                 cu_seqlens = q_cu.to(torch.int32)
             elif seq_len == 1:
@@ -407,7 +413,7 @@ class KdaLinearAttentionMixin:
                 k_tnd,
                 v_tnd,
                 g_raw_tnd if fuse_gate else g_tnd,
-                b_tnd,
+                beta_raw_tnd,
                 initial_state=ssm_state,
                 cu_seqlens=cu_seqlens,
                 layout="TND",
@@ -415,7 +421,7 @@ class KdaLinearAttentionMixin:
                 output_final_state=True,
                 inplace_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                use_beta_sigmoid_in_kernel=False,
+                use_beta_sigmoid_in_kernel=True,
                 state_v_first=True,
                 **_gate_kwargs,
             )
@@ -430,77 +436,39 @@ class KdaLinearAttentionMixin:
             q_in = _l2norm(query.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
             k_in = _l2norm(key.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
             v_in = value.to(torch.bfloat16).contiguous()
+            beta = beta_raw.float().sigmoid()
             cu_seqlens = (
                 q_cu.to(torch.int32)
                 if num_seqs != batch_size
                 else torch.tensor([0, seq_len], dtype=torch.int32, device=device)
             )
-            if cu_seqlens.numel() > 2:
-                # Seq-wise prefill: one single-sequence chunk_kda_fwd per
-                # sequence. A merged multi-sequence prefill (engine batches the
-                # concurrent requests' prefills) leaves per-seq conv/ssm state
-                # that differs from a single-request prefill (state-fingerprint
-                # verified: L0 state matches, L1+ diverges on seq1/seq2), and
-                # that state drift propagates through every later verify step.
-                # state_v_first=True pins the [HV,V,K] state layout so the
-                # ssm state handed to decode matches the recurrent path
-                # (default False is [HV,K,V] — K/V-transposed; K=V=128 hides
-                # the shape mismatch while corrupting decode precision).
-                _pout, _pstates = [], []
-                for s in range(num_seqs):
-                    t0, t1 = q_cu_list[s], q_cu_list[s + 1]
-                    sel = slice(int(t0), int(t1))
-                    _r = chunk_kda_fwd(
-                        q_in[:, sel].contiguous(),
-                        k_in[:, sel].contiguous(),
-                        v_in[:, sel].contiguous(),
-                        (g_raw[:, sel] if fuse_gate else g[:, sel]).contiguous(),
-                        b[:, sel].contiguous(),
-                        scale,
-                        chunk_size=64,
-                        layout="BSND",
-                        initial_state=ssm_state[s : s + 1],
-                        output_final_state=True,
-                        cu_seqlens=torch.tensor([0, int(t1 - t0)], dtype=torch.int32, device=device),
-                        return_intermediate_states=False,
-                        state_v_first=True,
-                        **_gate_kwargs,
-                    )
-                    _pout.append(_r[0])
-                    _pstates.append(_r[1])
-                # Each _r[0] is [1, seq_len_s, nh, hd] (layout="BSND", one
-                # sequence per call). The per-sequence token counts differ
-                # across a multi-sequence prefill batch, so they must be
-                # concatenated along the token axis (dim=1) to restore the
-                # original [1, total_tokens, nh, hd] packing of q_in — cat on
-                # dim=0 would require equal seq_len and crashes (aclnnCat 161002
-                # "dim 1 of tensor 1 is [X], should be equal to tensor 0 [Y]")
-                # at >=2 concurrent prefills of differing length.
-                core_attn_out = torch.cat(_pout, dim=1).to(query.dtype)
-                final_state = torch.cat(_pstates, dim=0)
-            else:
-                result = chunk_kda_fwd(
-                    q_in,
-                    k_in,
-                    v_in,
-                    g_raw if fuse_gate else g,
-                    b,
-                    scale,
-                    chunk_size=64,
-                    layout="BSND",
-                    initial_state=ssm_state,
-                    output_final_state=True,
-                    cu_seqlens=cu_seqlens,
-                    return_intermediate_states=False,
-                    state_v_first=True,
-                    **_gate_kwargs,
-                )
-                core_attn_out = result[0].to(query.dtype)
-                final_state = result[1]
+            # The AscendC kernel supports both the single-sequence and rank-4
+            # B=1 varlen layouts. Keep all sequences in one call so launch
+            # count is independent of the number of concurrent prefills;
+            # cu_seqlens selects the independent sequence boundaries.
+            result = chunk_kda_fwd(
+                q_in,
+                k_in,
+                v_in,
+                g_raw if fuse_gate else g,
+                beta,
+                scale,
+                chunk_size=64,
+                layout="BSND",
+                initial_state=ssm_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                return_intermediate_states=False,
+                state_v_first=True,
+                **_gate_kwargs,
+            )
+            core_attn_out = result[0].to(query.dtype)
+            final_state = result[1]
 
         if idx is not None:
-            conv_cache.index_copy_(0, idx, conv_state)
-            ssm_cache.index_copy_(0, idx, final_state.float().contiguous())
+            conv_cache_base.index_copy_(0, idx, conv_state)
+            ssm_write_idx = idx * ssm_checkpoint_stride
+            ssm_cache.index_copy_(0, ssm_write_idx, final_state.float().contiguous())
         # multi-seq path reshaped mixed_qkv to [num_seqs, ...]; flatten the
         # output back to [1, T, ...] so the KDA forward's hidden_shape [1, T]
         # aligns for o_norm / o_proj.

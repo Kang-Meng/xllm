@@ -158,22 +158,32 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
   bool supports_explicit_spec_verify_replay_update() const;
   bool should_use_explicit_spec_verify_replay_update(
       const ForwardInput& input) const;
-  // Returns true when the target model's spec-verify kernel requires the
-  // validate width (val_tokens) to be identical across every sequence in the
-  // batch.
-  // Kept separate from supports_expanded_spec_verify() so the
+  // Returns true when the target model's recurrent spec-verify kernel requires
+  // the validate width (val_tokens) to be identical across every sequence in
+  // the batch. Other paths accept per-seq variable widths.
+  // Kept separate from supports_explicit_spec_verify_replay_update() so the
   // two capabilities can diverge for future targets.
   bool requires_uniform_validate_width() const;
+  static int32_t preserve_checkpoint_validate_width(
+      int32_t effective_speculative_tokens,
+      const std::vector<int32_t>& accepted_prefix_lengths,
+      int32_t num_speculative_tokens);
   int64_t spec_verify_block_table_width(
       const torch::Tensor& block_tables) const;
+  int64_t active_spec_verify_block_table_width(
+      const ModelInputParams& input_params) const;
   void ensure_spec_verify_control_block_table(ModelInputParams& input_params,
-                                              int64_t num_sequences);
+                                              int64_t num_sequences,
+                                              int64_t active_width);
   torch::Tensor acquire_spec_verify_control_block_table(
       int64_t num_sequences,
       int64_t block_table_capacity);
   // Returns true when validation must use chunked-prefill to avoid the
   // FlashInfer batch-decode read-before-write race on the bonus token.
   bool use_chunked_prefill_spec_verify_path() const;
+  // Returns true when target recurrent kernels select a checkpoint using the
+  // previous validation step's accepted-token count.
+  bool uses_speculative_linear_state_checkpoints() const;
   bool uses_embedded_eagle3_draft() const;
   // Multiaxis RoPE positions can include a prompt-dependent offset and do not
   // identify the corresponding KV cache length.

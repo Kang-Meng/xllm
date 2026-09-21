@@ -19,6 +19,38 @@ from __future__ import annotations
 import torch
 
 
+def causal_conv1d_update_v2(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+    num_accepted_tokens: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool = True,
+    pad_slot_id: int = -1,
+) -> torch.Tensor:
+    """Run speculative causal convolution against framework-owned state.
+
+    ``conv_state`` uses the framework layout ``[slots, state_len, dim]``.
+    The native wrapper expects a ``[slots, dim, state_len]`` view and mutates
+    the same backing storage in place.
+    """
+    return torch.ops.xllm_ops.causal_conv1d_update_v2(
+        value,
+        conv_state.transpose(1, 2),
+        weight,
+        activation,
+        bias,
+        state_indices,
+        query_start_loc,
+        max_query_len,
+        pad_slot_id,
+        num_accepted_tokens,
+    )
+
+
 def causal_conv1d_qkv_prefill(
     value: torch.Tensor,
     weight: torch.Tensor,
@@ -100,4 +132,8 @@ def causal_conv1d_decode(
     )
 
 
-__all__ = ["causal_conv1d_qkv_prefill", "causal_conv1d_decode"]
+__all__ = [
+    "causal_conv1d_qkv_prefill",
+    "causal_conv1d_decode",
+    "causal_conv1d_update_v2",
+]

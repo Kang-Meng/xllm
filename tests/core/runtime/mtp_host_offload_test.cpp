@@ -309,6 +309,15 @@ class TestMTPWorker final : public MTPWorkerImpl {
       release.wait();
     });
   }
+
+  static int32_t preserve_checkpoint_width(
+      int32_t effective_speculative_tokens,
+      const std::vector<int32_t>& accepted_prefix_lengths,
+      int32_t num_speculative_tokens) {
+    return preserve_checkpoint_validate_width(effective_speculative_tokens,
+                                              accepted_prefix_lengths,
+                                              num_speculative_tokens);
+  }
 };
 
 class TestDFlashWorker final : public DFlashWorkerImpl {
@@ -345,6 +354,14 @@ class MTPHostOffloadTest : public ::testing::Test {
     }
   }
 };
+
+TEST(MTPAdaptiveValidateWidthTest, PreservesWidthForPreviousAcceptedTokens) {
+  EXPECT_EQ(TestMTPWorker::preserve_checkpoint_width(
+                /*effective_speculative_tokens=*/1,
+                /*accepted_prefix_lengths=*/{4, 1},
+                /*num_speculative_tokens=*/3),
+            3);
+}
 
 TEST(SpeculativeDraftKVCacheShapeTest, ReusesGroupedTargetPoolCounts) {
   ModelArgs target_model_args =

@@ -2645,70 +2645,6 @@ TEST(BatchTest, Glm53DecodeUpdatesExistingTailWithoutRestore) {
             forward_input.input_params.embedding.linear_state_ids[0]);
 }
 
-TEST(BatchTest, Glm53PdHandoffResetSurvivesMultipleMigrationTokens) {
-  for (const bool enable_schedule_overlap : {false, true}) {
-    SCOPED_TRACE(enable_schedule_overlap);
-    BlockManager::Options options;
-    options.num_blocks(/*num_blocks=*/3).block_size(/*block_size=*/4);
-    BlockManagerImpl manager(options);
-
-    RequestSamplingParam sampling_param;
-    StoppingChecker stopping_checker;
-    stopping_checker.set_max_generated_tokens(4);
-    SequenceParams seq_params;
-    seq_params.seq_capacity = 8;
-    seq_params.stopping_checker = &stopping_checker;
-    seq_params.sampling_param = &sampling_param;
-    seq_params.enable_schedule_overlap = enable_schedule_overlap;
-
-    IncrementalDecoder decoder("", 1, false, false);
-    Sequence sequence(/*index=*/0,
-                      /*token_ids=*/{1},
-                      /*input_embedding=*/torch::Tensor(),
-                      /*mm_data=*/MMData(),
-                      std::move(decoder),
-                      seq_params);
-    sequence.add_blocks(BlockType::KV, manager.allocate(1));
-    sequence.add_blocks(BlockType::LINEAR, manager.allocate(1));
-    sequence.kv_state().set_kv_cache_tokens_num(/*num_tokens=*/1);
-
-    for (const int64_t token_id : {2, 3}) {
-      if (enable_schedule_overlap) {
-        sequence.append_token(Token(/*id=*/-1));
-        sequence.update_last_step_token(Token(token_id));
-      } else {
-        sequence.append_token(Token(token_id));
-      }
-    }
-    ASSERT_FALSE(sequence.is_first_token());
-    sequence.kv_state().set_kv_cache_tokens_num(/*num_tokens=*/2);
-    sequence.mark_pd_handoff_reset_pending();
-
-    std::vector<Sequence*> sequences = {&sequence};
-    std::vector<uint32_t> allowed_max_tokens = {1};
-    std::vector<torch::Tensor> input_embeddings_vec;
-    std::vector<MMData> mm_data_vec;
-    ModelArgs args;
-    args.model_type("glm5_next")
-        .num_speculative_tokens(1)
-        .layer_types({"linear_attention"});
-    BatchInputBuilder builder(sequences,
-                              allowed_max_tokens,
-                              input_embeddings_vec,
-                              mm_data_vec,
-                              /*swap_block_transfer_infos=*/nullptr,
-                              /*batch_id=*/1,
-                              &args,
-                              BatchForwardType::DECODE);
-
-    ForwardInput forward_input = builder.build_forward_input(
-        /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
-
-    EXPECT_EQ(forward_input.input_params.pd_handoff_reset_mask,
-              std::vector<int32_t>({1}));
-    EXPECT_FALSE(sequence.pd_handoff_reset_pending());
-  }
-}
 #else
 TEST(BatchTest, Glm53PrefillPreservesReadIdsOutsideNpu) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/4);
@@ -3268,7 +3204,6 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateMetadata) {
   forward_input.input_params.attention.host.block_tables =
       forward_input.input_params.attention.device.block_tables;
   forward_input.input_params.embedding.linear_state_ids = {4, 6};
-  forward_input.input_params.pd_handoff_reset_mask = {1, 0};
 
   TransferKVInfo transfer_info;
   transfer_info.request_id = "dsv4-round-trip";
@@ -3297,8 +3232,6 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateMetadata) {
   reader_manager.input_read(from_shm, torch::Device(torch::kCPU));
   EXPECT_EQ(from_shm.input_params.embedding.linear_state_ids,
             std::vector<int32_t>({4, 6}));
-  EXPECT_EQ(from_shm.input_params.pd_handoff_reset_mask,
-            std::vector<int32_t>({1, 0}));
   ASSERT_EQ(from_shm.transfer_kv_infos.size(), 1u);
   EXPECT_EQ(from_shm.transfer_kv_infos[0].request_id, "dsv4-round-trip");
   EXPECT_TRUE(from_shm.transfer_kv_infos[0].rank_local_mapping);

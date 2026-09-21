@@ -760,13 +760,6 @@ inline bool is_glm5_next_target_model(const ModelArgs& args) {
   return is_glm5_next_target_model_type(args.model_type());
 }
 
-// GLM5 target models with speculative decoding need KDA handoff bookkeeping.
-// Algorithm-specific callers must additionally validate that the configured
-// speculative method is MTP because ModelArgs does not carry it.
-inline bool uses_glm5_speculative_kda(const ModelArgs& args) {
-  return args.num_speculative_tokens() > 0 && is_glm5_next_target_model(args);
-}
-
 // Keep the NPU compressed KPool rollout on a closed model/configuration set.
 // Other indexer models and GLM5 configurations that do not compress multiple
 // rows while guaranteeing causal tail selection retain their packed layout.

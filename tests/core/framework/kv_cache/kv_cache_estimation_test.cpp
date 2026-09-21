@@ -509,6 +509,21 @@ TEST(KVCacheEstimationTest, Qwen35TextMtpUsesSsmCheckpointStride) {
   EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 189056);
 }
 
+#if defined(USE_NPU)
+TEST(KVCacheEstimationTest, Glm5MtpPreallocatesSpeculativeCheckpoints) {
+  ModelArgs model_args = make_linear_attention_args();
+  model_args.model_type("glm5_next");
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.num_speculative_tokens = 3;
+
+  KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.linear_conv_state_len(), 5);
+  EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 4);
+  EXPECT_EQ(capacity.linear_slot_size(), 832);
+}
+#endif
+
 TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
   ModelArgs model_args;
   model_args.model_type("deepseek_v4")

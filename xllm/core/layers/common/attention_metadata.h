@@ -233,8 +233,6 @@ struct AttentionMetadata {
   // Per-sequence recurrent-state validity for prefill/chunked-prefill only.
   // Decode advances already-initialized states selected by linear state ids.
   torch::Tensor has_initial_states;
-  // Per-sequence first-decode marker after PD handoff.
-  torch::Tensor pd_handoff_reset_mask;
   int32_t tot = 0;
 
   // custom attention mask

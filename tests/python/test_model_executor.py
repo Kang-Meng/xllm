@@ -1899,23 +1899,6 @@ def test_eager_runner_rejects_missing_cp_lengths(
     assert not runner.attention_backend._prepared
 
 
-class TestResetKdaSpecStateOnPdHandoff:
-    def test_resets_only_marked_linear_state_slots(self) -> None:
-        executor = object.__new__(ModelExecutor)
-        reset_calls: list[list[int]] = []
-        executor.attention_backend = SimpleNamespace(
-            reset_kda_spec_slots=lambda indices: reset_calls.append(indices.reshape(-1).tolist())
-        )
-        metadata = SimpleNamespace(
-            pd_handoff_reset_mask=torch.tensor([1, 0], dtype=torch.bool),
-            linear_state_indices=torch.tensor([7, 9], dtype=torch.int32),
-        )
-
-        executor._reset_kda_spec_state_on_pd_handoff(metadata)
-
-        assert reset_calls == [[7]]
-
-
 class TestExecuteRouting:
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",

@@ -188,7 +188,7 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     remote_by_local = {
         (1.0, 1.0, 1.0, 4.0, 4.0, 4.0): remote_hidden.expand(-1, 3),
         (10.0, 40.0): remote_hidden.mul(10).unsqueeze(-1),
-        tuple(torch.sigmoid(local_hidden).reshape(-1).tolist()): torch.sigmoid(remote_hidden),
+        (1.0, 4.0): remote_hidden,
     }
     gather = _patch_cp_gather(monkeypatch, remote_by_local)
 
@@ -209,7 +209,7 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     expected_hidden = torch.tensor([1.0, 2.0, 3.0, 4.0])
     torch.testing.assert_close(mixed_qkv, expected_hidden.view(1, 1, 4).expand(1, 3, 4))
     torch.testing.assert_close(raw_gate_proj, expected_hidden.view(1, 4, 1, 1) * 10)
-    torch.testing.assert_close(beta, torch.sigmoid(expected_hidden).view(1, 4, 1))
+    torch.testing.assert_close(beta, expected_hidden.view(1, 4, 1))
     assert gather.call_count == 3
     torch.testing.assert_close(attention.o_norm.call_args.args[1], local_hidden.unsqueeze(-1) * 100)
     torch.testing.assert_close(output, torch.tensor([[[101.0], [404.0]]]))

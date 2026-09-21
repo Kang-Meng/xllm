@@ -1828,11 +1828,6 @@ bool PDOOCScheduler::decode_recv_multi_generations(
     }
   }
 
-  const ModelArgs& model_args = engine_->model_args();
-  if (uses_glm5_speculative_kda(model_args)) {
-    // PD-OOC currently transfers only the first sequence of each request.
-    request->sequences()[0]->mark_pd_handoff_reset_pending();
-  }
   request_queue_.write(request);
   return true;
 }
