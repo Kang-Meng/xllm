@@ -31,6 +31,11 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "core/runtime/options.h"
 #include "core/util/model_config_utils.h"
+#include "models/llm/glm5_next_mtp_args.h"
+#if defined(USE_MLU)
+#include "models/llm/mlu/glm5_next_mtp.h"
+#include "models/llm/mtp_model_base.h"
+#endif
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -89,6 +94,85 @@ class DummyRecCausalLM final : public RecCausalLM {
  private:
   torch::TensorOptions options_;
 };
+
+#if defined(USE_MLU)
+// Keep real MTP checkpoint slicing and head loading; replace only the large
+// decoder body with a scalar weight so this test needs no full checkpoint.
+class CheckpointDecoderImpl final : public torch::nn::Module {
+ public:
+  CheckpointDecoderImpl(const ModelContext& /*context*/, int32_t layer_idx) {
+    EXPECT_EQ(layer_idx, 45);  // Quantization prefixes must keep this index.
+  }
+
+  void load_state_dict(const StateDict& state_dict) {
+    const auto weight = state_dict.get_tensor("weight");
+    if (weight.defined()) {
+      weight_ = weight;
+    }
+  }
+
+  torch::Tensor forward(torch::Tensor hidden_states,
+                        std::optional<torch::Tensor>& /*residual*/,
+                        torch::Tensor& /*positions*/,
+                        const layer::AttentionMetadata& /*metadata*/,
+                        KVCache& /*cache*/,
+                        ModelInputParams& /*params*/,
+                        const std::optional<torch::Tensor>& /*input_ids*/) {
+    return hidden_states;
+  }
+
+  void verify_loaded_weights() const {
+    ASSERT_TRUE(weight_.defined());
+    EXPECT_EQ(weight_.item<float>(), 7.0f);
+  }
+
+ private:
+  torch::Tensor weight_;
+};
+TORCH_MODULE(CheckpointDecoder);
+
+using CheckpointMtpModelImpl = MtpModelImplBase<CheckpointDecoder>;
+TORCH_MODULE(CheckpointMtpModel);
+using GlmCheckpointModel =
+    mlu::model::Glm5NextMtpCheckpointImplBase<CheckpointMtpModel>;
+
+class GlmCheckpointLoader final : public ModelLoader {
+ public:
+  GlmCheckpointLoader(const std::string& prefix,
+                      bool include_embedding,
+                      bool include_head) {
+    states_.reserve(3);
+    const std::string layer_prefix = prefix + "layers.45.";
+    states_.emplace_back(std::make_unique<StateDict>(
+        std::unordered_map<std::string, torch::Tensor>{
+            {layer_prefix + "weight", torch::tensor(7.0f)},
+            {layer_prefix + "shared_head.norm.weight", torch::full({4}, 11.0f)},
+            {prefix + "embed_tokens.weight", torch::full({8, 4}, -1.0f)},
+            {"lm_head.weight", torch::full({8, 4}, -2.0f)}}));
+    if (include_embedding) {
+      states_.emplace_back(std::make_unique<StateDict>(
+          std::unordered_map<std::string, torch::Tensor>{
+              {layer_prefix + "embed_tokens.weight",
+               torch::arange(32, torch::kFloat32).view({8, 4})}}));
+    }
+    if (include_head) {
+      states_.emplace_back(std::make_unique<StateDict>(
+          std::unordered_map<std::string, torch::Tensor>{
+              {layer_prefix + "shared_head.head.weight",
+               torch::arange(32, torch::kFloat32).view({8, 4}) + 3}}));
+    }
+  }
+
+  std::unique_ptr<Tokenizer> tokenizer() const override { return nullptr; }
+  std::vector<std::unique_ptr<StateDict>>& get_state_dicts() override {
+    return states_;
+  }
+  std::string model_weights_path() const override { return ""; }
+
+ private:
+  std::vector<std::unique_ptr<StateDict>> states_;
+};
+#endif
 
 }  // namespace
 
@@ -308,6 +392,245 @@ TEST(HFModelLoaderTest, RecFactoryCreatesRecCausalLmInstance) {
 }
 
 #if defined(USE_NPU) || defined(USE_MLU)
+TEST(HFModelLoaderTest, Glm5NextDefaultsMissingMtpLayerCountToZero) {
+  auto loader = ModelRegistry::get_model_args_loader("glm5_next");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json({
+    "model_type": "glm5_next",
+    "text_config": {"num_hidden_layers": 45}
+  })json"));
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.num_nextn_predict_layers(), 0);
+}
+
+TEST(HFModelLoaderTest, RegisteredMtpAdapterKeepsTargetAndFixesDraftCache) {
+  auto loader = ModelRegistry::get_model_args_loader("glm5_next");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json({
+    "model_type": "glm5_next",
+    "text_config": {
+      "num_hidden_layers": 45,
+      "num_nextn_predict_layers": 1,
+      "index_kpool_compress": true
+    }
+  })json"));
+  ModelArgs target_args;
+  ASSERT_TRUE(loader(reader, &target_args));
+  target_args.enable_mla(true);
+  ModelRegistry::configure_mtp_args(target_args,
+                                    "MTP",
+                                    /*is_draft_engine=*/false,
+                                    /*is_python_model=*/false);
+  EXPECT_EQ(target_args.model_type(), "glm5_next");
+  EXPECT_EQ(target_args.n_layers(), 45);
+  EXPECT_TRUE(has_linear_attention_layers(target_args));
+  ModelArgs other_args = target_args;
+  ModelRegistry::configure_mtp_args(other_args,
+                                    "Eagle3",
+                                    /*is_draft_engine=*/true,
+                                    /*is_python_model=*/false);
+  EXPECT_EQ(other_args.model_type(), "glm5_next");
+  EXPECT_EQ(other_args.layer_types(), target_args.layer_types());
+  ModelArgs draft_args = target_args;
+  ModelRegistry::configure_mtp_args(draft_args,
+                                    "mTp",
+                                    /*is_draft_engine=*/true,
+                                    /*is_python_model=*/false);
+  ModelRegistry::configure_mtp_args(draft_args,
+                                    "MTP",
+                                    /*is_draft_engine=*/true,
+                                    /*is_python_model=*/false);
+  EXPECT_EQ(draft_args.model_type(), "glm5_next_mtp");
+  EXPECT_FALSE(has_linear_attention_layers(draft_args));
+  EXPECT_EQ(draft_args.n_layers(), 1);
+  EXPECT_EQ(draft_args.mtp_start_layer_idx(), 45);
+  EXPECT_EQ(draft_args.layer_types(),
+            std::vector<std::string>({"deepseek_sparse_attention"}));
+  KVCacheEstimateOptions options;
+  options.cache_size_in_bytes = 1024 * 1024 * 1024;
+  options.block_size = 16;
+  options.world_size = 8;
+  options.n_local_kv_heads = 8;
+  options.max_seqs_per_batch = 32;
+  options.is_draft_engine = true;
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(draft_args, options);
+  EXPECT_EQ(capacity.n_layers(), 1);
+  EXPECT_EQ(capacity.num_linear_attention_layers(), 0);
+  EXPECT_EQ(capacity.num_full_attention_layers(), 1);
+  EXPECT_EQ(capacity.num_indexer_layers(), 1);
+}
+
+#if defined(USE_MLU)
+TEST(HFModelLoaderTest, GlmMtpLoadsOwnVocabularyWeightsAcrossShards) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  ProcessGroup group(/*rank=*/0, /*world_size=*/1, device);
+  ParallelArgs parallel_args(/*rank=*/0, /*world_size=*/1, &group);
+  parallel_args.tp_group_ = &group;
+  for (const std::string prefix : {"model.", "model.language_model."}) {
+    for (const bool tied : {false, true}) {
+      SCOPED_TRACE(prefix);
+      SCOPED_TRACE(tied);
+      ModelArgs args;
+      args.model_type("glm5_next_mtp")
+          .n_layers(1)
+          .mtp_start_layer_idx(45)
+          .num_nextn_predict_layers(1)
+          .hidden_size(4)
+          .vocab_size(8)
+          .tie_word_embeddings(tied);
+      ModelContext context(parallel_args, args, QuantArgs(), options);
+      GlmCheckpointModel model(context);
+      model.load_model(std::make_unique<GlmCheckpointLoader>(
+          prefix, /*include_embedding=*/true, /*include_head=*/!tied));
+      const auto expected_embedding =
+          torch::arange(32, torch::kFloat32).view({8, 4});
+      const auto expected_head =
+          tied ? expected_embedding : expected_embedding + 3;
+      const auto ids = torch::tensor({0, 3, 7}, torch::kInt64);
+      EXPECT_TRUE(torch::equal(
+          model.get_input_embeddings(ids.to(device)).cpu().to(torch::kFloat32),
+          expected_embedding.index_select(0, ids)));
+      EXPECT_TRUE(
+          torch::equal(model.logits(torch::eye(4, options), torch::Tensor())
+                           .cpu()
+                           .to(torch::kFloat32),
+                       expected_head.transpose(0, 1)));
+      EXPECT_TRUE(
+          torch::equal(model.named_parameters()["model.norm.weight"].cpu().to(
+                           torch::kFloat32),
+                       torch::full({4}, 11.0f)));
+    }
+  }
+}
+
+TEST(HFModelLoaderTest, GlmMtpRejectsMissingOwnVocabularyWeights) {
+  ProcessGroup group(/*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  ParallelArgs parallel_args(/*rank=*/0, /*world_size=*/1, &group);
+  parallel_args.tp_group_ = &group;
+  ModelArgs args;
+  args.model_type("glm5_next_mtp")
+      .n_layers(1)
+      .mtp_start_layer_idx(45)
+      .num_nextn_predict_layers(1)
+      .hidden_size(4)
+      .vocab_size(8);
+  ModelContext context(
+      parallel_args,
+      args,
+      QuantArgs(),
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+  EXPECT_DEATH(
+      {
+        GlmCheckpointModel model(context);
+        model.load_model(std::make_unique<GlmCheckpointLoader>(
+            "model.", /*include_embedding=*/false, /*include_head=*/true));
+      },
+      "missing appended-layer embed_tokens.weight");
+  EXPECT_DEATH(
+      {
+        GlmCheckpointModel model(context);
+        model.load_model(std::make_unique<GlmCheckpointLoader>(
+            "model.", /*include_embedding=*/true, /*include_head=*/false));
+      },
+      "missing or has incomplete");
+}
+
+TEST(HFModelLoaderTest, GlmMtpNativeAdapterRejectsExportedLayout) {
+  ModelArgs args;
+  args.model_type("glm5_next_mtp").n_layers(1).num_nextn_predict_layers(1);
+  EXPECT_DEATH(ModelRegistry::configure_mtp_args(args,
+                                                 "MTP",
+                                                 /*is_draft_engine=*/true,
+                                                 /*is_python_model=*/false),
+               "exported draft checkpoints are not supported");
+}
+
+TEST(HFModelLoaderTest, MtpModelLoadsExplicitAndLegacyCheckpointOffsets) {
+  ProcessGroup group(/*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  ParallelArgs parallel_args(/*rank=*/0, /*world_size=*/1, &group);
+  parallel_args.tp_group_ = &group;
+  for (const bool normalized : {false, true}) {
+    SCOPED_TRACE(normalized);
+    ModelArgs args;
+    args.model_type("deepseek_v3_mtp")
+        .n_layers(45)
+        .num_nextn_predict_layers(1)
+        .hidden_size(4)
+        .vocab_size(8);
+    if (normalized) {
+      args.model_type("glm5_next");
+      ModelRegistry::configure_mtp_args(args,
+                                        "MTP",
+                                        /*is_draft_engine=*/true,
+                                        /*is_python_model=*/false);
+    }
+    ModelContext context(
+        parallel_args,
+        args,
+        QuantArgs(),
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    MtpModelImplBase<CheckpointDecoder> model(context);
+    StateDict weights({
+        {"layers.45.weight", torch::tensor(7.0f)},
+        {"layers.45.shared_head.norm.weight", torch::full({4}, 11.0f)},
+        {"layers.1.weight", torch::tensor(-1.0f)},
+        {"layers.1.shared_head.norm.weight", torch::full({4}, -1.0f)},
+    });
+    model.load_state_dict(weights);
+    model.verify_loaded_weights();
+    EXPECT_TRUE(torch::equal(model.named_parameters()["norm.weight"],
+                             torch::full({4}, 11.0f)));
+  }
+}
+#endif
+
+TEST(HFModelLoaderTest, GlmMtpAdapterLimitsOnlyNativeMluReuse) {
+  for (const bool is_python_model : {false, true}) {
+    ModelArgs args;
+    args.model_type("glm5_next")
+        .n_layers(45)
+        .num_nextn_predict_layers(1)
+        .index_share_for_mtp_iteration(true);
+    ModelRegistry::configure_mtp_args(
+        args, "MTP", /*is_draft_engine=*/true, is_python_model);
+    EXPECT_EQ(args.n_layers(), 1);
+    EXPECT_EQ(args.mtp_start_layer_idx(), 45);
+    if (Platform::is_mlu() && !is_python_model) {
+      EXPECT_FALSE(args.index_share_for_mtp_iteration());
+      EXPECT_TRUE(args.index_topk_pattern().empty());
+    } else {
+      EXPECT_TRUE(args.index_share_for_mtp_iteration());
+      EXPECT_EQ(args.index_topk_pattern(), "S");
+    }
+    ModelRegistry::configure_mtp_args(
+        args, "MTP", /*is_draft_engine=*/true, is_python_model);
+    EXPECT_EQ(args.n_layers(), 1);
+    EXPECT_EQ(args.mtp_start_layer_idx(), 45);
+  }
+}
+
+TEST(HFModelLoaderTest, GlmMtpAdapterPreservesExportedLayout) {
+  ModelArgs args;
+  args.model_type("glm5_next_mtp")
+      .n_layers(1)
+      .num_nextn_predict_layers(1)
+      .layer_types({"deepseek_sparse_attention"});
+  ModelRegistry::configure_mtp_args(args,
+                                    "MTP",
+                                    /*is_draft_engine=*/true,
+                                    /*is_python_model=*/true);
+  EXPECT_EQ(args.n_layers(), 1);
+  EXPECT_EQ(args.mtp_start_layer_idx(), -1);
+  EXPECT_EQ(args.layer_types(),
+            std::vector<std::string>({"deepseek_sparse_attention"}));
+}
+
 #if defined(USE_NPU)
 TEST(HFModelLoaderTest, Glm5NextNativeMtpUsesAppendedLayer) {
   auto loader = ModelRegistry::get_model_args_loader("glm5_next");

@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #pragma once
 
+#include "models/llm/glm5_next_mtp_args.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -33,7 +34,7 @@ inline bool load_model_args(const JsonReader& json, ModelArgs* args) {
   // every GLM-5.3-Flash checkpoint (verified across GLM-5.3-Flash-W8A8,
   // GLM-next-w8a8, *-mtp). xllm registers under the same names, so no
   // normalization is needed; downstream model_type checks
-  // (e.g. is_glm5_next_mtp_draft_model_type) match the checkpoint value
+  // (e.g. native/Python MTP weight sharing) match the checkpoint value
   // directly.
   // GLM-5.3-Flash config.json nests every text-side field under "text_config"
   // (verified against GLM-5.3-Flash-W8A8). Read those fields with an explicit
@@ -217,7 +218,29 @@ inline bool load_model_args(const JsonReader& json, ModelArgs* args) {
   return true;
 }
 
+inline void configure_mtp_args(ModelArgs& args, bool is_python_model) {
+#if defined(USE_MLU)
+  CHECK(is_python_model || args.model_type() != "glm5_next_mtp" ||
+        args.mtp_start_layer_idx() >= 0)
+      << "Native MLU GLM5 MTP requires a full target checkpoint with an "
+         "appended MTP layer; exported draft checkpoints are not supported.";
+#else
+  (void)is_python_model;
+#endif
+  configure_glm5_next_mtp_args(args,
+                               /*speculative_algorithm=*/"MTP",
+                               /*is_draft_engine=*/true);
+}
+
 }  // namespace glm5_next_args
+
+const bool glm5_next_mtp_adapter_registered = []() {
+  ModelRegistry::register_mtp_args_adapter("glm5_next",
+                                           &glm5_next_args::configure_mtp_args);
+  ModelRegistry::register_mtp_args_adapter("glm5_next_mtp",
+                                           &glm5_next_args::configure_mtp_args);
+  return true;
+}();
 
 REGISTER_MODEL_ARGS_LOADER(glm5_next, &glm5_next_args::load_model_args);
 REGISTER_MODEL_ARGS_LOADER(glm5_next_mtp, &glm5_next_args::load_model_args);

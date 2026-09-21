@@ -13,14 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "kv_cache.h"
+#include "framework/kv_cache/kv_cache.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <numeric>
-#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,10 +30,10 @@ limitations under the License.
 #include "framework/block/block.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/deepseek_v4_kv_cache_impl.h"
+#include "framework/kv_cache/kv_cache_estimation.h"
+#include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_tensor_allocator.h"
 #include "framework/kv_cache/kv_cache_utils.h"
-#include "kv_cache_estimation.h"
-#include "kv_cache_shape.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 #include "worker.pb.h"
@@ -1182,9 +1182,12 @@ TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
   options.n_local_kv_heads = 1;
   options.max_seqs_per_batch = 3;
   options.num_speculative_tokens = 5;
+  // Exercise different standalone capacities without relying on auto-sizing.
+  options.max_linear_state_cache_slots = 3;
   KVCacheEstimateOptions draft_options = options;
   draft_options.is_draft_engine = true;
   draft_options.max_seqs_per_batch = 1;
+  draft_options.max_linear_state_cache_slots = 1;
   draft_options.num_speculative_tokens = 0;
 
   for (const int32_t nextn_layers : {0, 1}) {
@@ -1241,7 +1244,7 @@ TEST(KVCacheTest, SharedKPoolBudgetRejectsInsufficientMemory) {
   KVCacheCapacity capacity;
   capacity.block_size(16)
       .slot_size(64)
-      .index_slot_size(8)
+      .index_cache_sizes(/*slot_size=*/8, /*block_size=*/128)
       .num_full_attention_layers(1)
       .num_indexer_layers(1)
       .num_linear_state_blocks(5)
@@ -1313,5 +1316,40 @@ TEST_P(DcpIndexerShapeTest, MatchesCapacityBudget) {
 INSTANTIATE_TEST_SUITE_P(KvSplits,
                          DcpIndexerShapeTest,
                          ::testing::Values(1, 2, 4, 0));
+
+#if !defined(USE_NPU)
+TEST(KVCacheTest, NonDivisiblePoolEstimateMatchesAllocation) {
+  ModelArgs args;
+  args.n_layers(1)
+      .head_dim(128)
+      .index_n_heads(32)
+      .index_head_dim(128)
+      .index_kpool(3)
+      .index_kpool_compress(true);
+  KVCacheEstimateOptions options;
+  options.kpool_layout = KPoolCacheLayout::COMPRESSED_WITH_TAIL;
+  options.cache_size_in_bytes = 1024 * 1024;
+  options.block_size = 24;
+  options.n_local_kv_heads = 1;
+  options.max_seqs_per_batch = 1;
+  const KVCacheCapacity capacity = estimate_kv_cache_capacity(args, options);
+  const KVCacheShape shape(capacity, args, /*world_size=*/1);
+  KVCacheCreateOptions create_options;
+  create_options.enable_lighting_indexer(true).dtype(torch::kBFloat16);
+  KVCache cache(shape, create_options, /*layer_id=*/0);
+  EXPECT_EQ(cache.get_index_cache().nbytes(),
+            capacity.n_blocks() * capacity.index_block_size());
+  EXPECT_EQ(capacity.index_block_size(), 8 * 128 * 2);
+  int64_t allocated_bytes = 0;
+  for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
+    allocated_bytes += tensor.tensor.nbytes();
+  }
+  EXPECT_EQ(allocated_bytes,
+            capacity.n_blocks() *
+                    (24 * capacity.slot_size() + capacity.index_block_size()) +
+                capacity.linear_cache_size_in_bytes());
+  EXPECT_LE(allocated_bytes, options.cache_size_in_bytes);
+}
+#endif
 
 }  // namespace xllm

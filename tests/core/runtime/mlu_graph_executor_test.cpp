@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_output.h"
 #include "mlu_graph_executor_impl.h"
+#include "models/llm/mlu/glm5_next_graph.h"
 #include "models/llm/mlu/mtp_topk_state.h"
 #include "platform/device.h"
 #include "runtime/decode_graph_bucket.h"
@@ -168,6 +169,53 @@ class MockCausalLM : public CausalLM {
   std::vector<int32_t> last_dp_token_nums_;
 };
 
+namespace {
+
+// Exercise the production GLM metadata through real executor capture/replay.
+// Reading a page payload through KPool's table makes stale page IDs observable.
+class GlmGraphMetadataModel final : public MockCausalLM {
+ public:
+  explicit GlmGraphMetadataModel(const torch::TensorOptions& options)
+      : MockCausalLM(options),
+        pages_(torch::arange(256, options.dtype(torch::kInt32)) * 7) {}
+
+  bool requires_graph_forward_metadata() override { return true; }
+
+  std::unique_ptr<ModelGraphMetadataState> create_graph_forward_metadata_state()
+      override {
+    return std::make_unique<mlu::model::Glm5NextGraphMetadataState>();
+  }
+
+  void prepare_graph_forward_metadata(ModelGraphMetadataState* state,
+                                      const torch::Tensor& positions,
+                                      ModelInputParams& params) override {
+    mlu::model::Glm5NextGraphMetadata::prepare(state, positions, params);
+  }
+
+  ModelOutput forward(const torch::Tensor& /*tokens*/,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>& /*kv_caches*/,
+                      const ModelInputParams& params) override {
+    ++capture_count_;
+    const auto& metadata = *params.attn_metadata;
+    const auto& batch = *metadata.kpool_batch_metadata;
+    CHECK_EQ(batch.row_batch.numel(), positions.numel());
+    CHECK_EQ(batch.tail_indices.numel(), positions.numel());
+    auto block_ids = batch.block_table.select(1, 0).to(torch::kInt64);
+    auto values = pages_.index_select(0, block_ids) + metadata.kv_seq_lens +
+                  batch.tail_indices;
+    return ModelOutput(values.unsqueeze(1).expand({positions.numel(), 1024}));
+  }
+
+  int32_t capture_count() const { return capture_count_; }
+
+ private:
+  torch::Tensor pages_;
+  int32_t capture_count_ = 0;
+};
+
+}  // namespace
+
 class MluGraphExecutorTest : public ::testing::Test {
  protected:
   MluGraphExecutorTest() = default;
@@ -253,6 +301,43 @@ class MluGraphExecutorTest : public ::testing::Test {
   std::unique_ptr<::xllm::mlu::MluGraphExecutorImpl> impl_;
   std::unique_ptr<BaseExecutorImpl> base_impl_;
 };
+
+TEST_F(MluGraphExecutorTest, GlmMetadataReplaysPageRemapsAndPaddedBuckets) {
+  options_.enable_graph_mode_decode_no_padding(false);
+  auto model = std::make_unique<GlmGraphMetadataModel>(tensor_options_);
+  mlu::MluGraphExecutorImpl executor(
+      model.get(), model_args_, tensor_options_.device(), options_);
+
+  // Revisit the four-token graph after capturing a different bucket, then
+  // change request count within that bucket and change only physical page IDs.
+  const std::vector<int32_t> batch_sizes = {3, 3, 2, 4, 3, 3};
+  for (size_t step = 0; step < batch_sizes.size(); ++step) {
+    const int32_t rows = batch_sizes[step];
+    auto input = prepare_inputs(rows, /*seed=*/97);
+    const int32_t page_id = static_cast<int32_t>(step) + 1;
+    const int32_t state_id = page_id + 10;
+    auto& params = input.input_params;
+    params.attention.device.block_tables.fill_(page_id);
+    params.embedding.linear_state_ids.assign(rows, state_id);
+    params.embedding.linear_state_indices =
+        torch::full({rows}, state_id, tensor_options_.dtype(torch::kInt32));
+    for (int32_t row = 0; row <= rows; ++row) {
+      params.attention.host.kv_seq_lens[row] = row * page_id;
+    }
+    params.attention.device.kv_seq_lens =
+        torch::tensor(params.attention.host.kv_seq_lens,
+                      tensor_options_.dtype(torch::kInt32));
+    params.meta.kv_max_seq_len = page_id;
+
+    auto output =
+        executor.run(input.token_ids, input.positions, kv_caches_, params);
+    torch_mlu::synchronize();
+    auto expected =
+        torch::full({rows, 1024}, page_id * 8 + state_id, tensor_options_);
+    EXPECT_TRUE(torch::equal(output.hidden_states, expected)) << step;
+  }
+  EXPECT_EQ(model->capture_count(), 2);
+}
 
 // Test graph creation and execution with different batch sizes
 TEST_F(MluGraphExecutorTest, DifferentBatchSizes) {

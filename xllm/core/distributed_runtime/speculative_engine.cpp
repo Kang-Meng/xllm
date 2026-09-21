@@ -267,20 +267,20 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
   // Draft model has no linear-attention layers in the current MTP/Eagle path.
   const int64_t draft_full_attention_layers = draft_kv_cache_cap.n_layers();
   const int64_t target_full_attention_block_size_in_bytes =
-      block_size *
-      (target_full_attention_layers * (target_kv_cache_cap.slot_size() +
-                                       target_kv_cache_cap.scale_slot_size()) +
-       target_kv_cache_cap.num_indexer_layers() *
-           target_kv_cache_cap.index_slot_size());
+      block_size * (target_full_attention_layers *
+                    (target_kv_cache_cap.slot_size() +
+                     target_kv_cache_cap.scale_slot_size())) +
+      target_kv_cache_cap.num_indexer_layers() *
+          target_kv_cache_cap.index_block_size();
   // The draft KV cache is allocated from the draft's own KVCacheShape, so its
   // per-block cost uses the draft's own slot size, which may exceed the
   // target's (e.g. a full-attention draft against an MLA target).
   const int64_t draft_full_attention_block_size_in_bytes =
-      block_size *
-      (draft_full_attention_layers * (draft_kv_cache_cap.slot_size() +
-                                      draft_kv_cache_cap.scale_slot_size()) +
-       draft_kv_cache_cap.num_indexer_layers() *
-           draft_kv_cache_cap.index_slot_size());
+      block_size * (draft_full_attention_layers *
+                    (draft_kv_cache_cap.slot_size() +
+                     draft_kv_cache_cap.scale_slot_size())) +
+      draft_kv_cache_cap.num_indexer_layers() *
+          draft_kv_cache_cap.index_block_size();
   const int32_t layerwise_split_size =
       options_.is_draft_engine()
           ? 1

@@ -455,8 +455,7 @@ MluGraph::MluGraph(GraphPersistentParam* persistent_param,
     : persistent_param_(persistent_param),
       padding_num_tokens_(padding_num_tokens) {}
 
-void MluGraph::prepare_model_graph_metadata(CausalLM* model,
-                                            const ModelInputParams& params) {
+void MluGraph::prepare_model_graph_metadata(CausalLM* model) {
   if (!model->requires_graph_forward_metadata()) {
     return;
   }
@@ -464,7 +463,16 @@ void MluGraph::prepare_model_graph_metadata(CausalLM* model,
   if (!model_graph_metadata_state_) {
     model_graph_metadata_state_ = model->create_graph_forward_metadata_state();
   }
-  auto graph_params = make_graph_params(params, padding_num_tokens_);
+  // Metadata must see the same padded buffers that forward captures.
+  auto graph_params = persistent_param_->params_;
+  graph_params.meta.num_sequences = padding_num_tokens_;
+  if (!graph_params.embedding.linear_state_ids.empty()) {
+    graph_params.embedding.linear_state_ids.resize(padding_num_tokens_,
+                                                   kPaddingLinearStateId);
+  }
+  if (!graph_params.linear_state_validity_mask.empty()) {
+    graph_params.linear_state_validity_mask.resize(padding_num_tokens_, 0);
+  }
   int32_t slice_dim = persistent_param_->use_mrope_ ? 1 : 0;
   model->prepare_graph_forward_metadata(
       model_graph_metadata_state_.get(),
@@ -529,14 +537,16 @@ void MluGraph::update_input_buffer(CausalLM* model,
                                    const ModelInputParams& params,
                                    bool is_init) {
   uint32_t padding_needed = padding_num_tokens_ - tokens.size(0);
-  if (is_init) {
+  // Rebind views when switching buckets: storage is shared, metadata state is
+  // owned by each graph. Reusing another bucket's views changes their shapes.
+  if (is_init || model->requires_graph_forward_metadata()) {
     persistent_param_->init_params(params, padding_num_tokens_, padding_needed);
   }
   persistent_param_->update_input_buffer(
       tokens, positions, params, padding_needed);
   // For some models (e.g. DeepSeekV4), the metadata depends on variable host
   // data, which needs to be updated outside of capture.
-  prepare_model_graph_metadata(model, params);
+  prepare_model_graph_metadata(model);
 }
 
 MluGraphExecutorImpl::MluGraphExecutorImpl(CausalLM* model,

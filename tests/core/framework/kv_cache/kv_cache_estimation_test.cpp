@@ -13,9 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "kv_cache_estimation.h"
+#include "framework/kv_cache/kv_cache_estimation.h"
 
 #include <gtest/gtest.h>
+#include <torch/torch.h>
 
 #include <cstdint>
 #include <utility>
@@ -95,6 +96,16 @@ TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {
   EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 0);
 }
 
+TEST(KVCacheEstimationTest, IndexCacheSizesMustBeConfiguredTogether) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        KVCacheCapacity capacity;
+        capacity.index_cache_sizes(/*slot_size=*/8, /*block_size=*/0);
+      },
+      "slot and block sizes must both be zero or positive");
+}
+
 TEST(KVCacheEstimationTest, UserIndexerCacheDtypeDirectlyControlsQuantization) {
   ModelArgs model_args = make_standard_args();
   model_args.model_type("unsupported_model")
@@ -124,13 +135,17 @@ TEST(KVCacheEstimationTest, UserIndexerCacheDtypeDirectlyControlsQuantization) {
   KVCacheEstimateOptions kpool_options = make_estimate_options();
   kpool_options.block_size = 128;
   kpool_options.dtype = torch::kBFloat16;
+  kpool_options.kpool_layout = KPoolCacheLayout::COMPRESSED_WITH_TAIL;
 
   const KVCacheCapacity packed_capacity =
       estimate_kv_cache_capacity(kpool_args, kpool_options);
   EXPECT_EQ(packed_capacity.kpool_layout(), KPoolCacheLayout::PACKED);
+  EXPECT_EQ(packed_capacity.index_block_size(),
+            packed_capacity.index_slot_size() * kpool_options.block_size);
 
   kpool_args.index_kpool_always_select_tail(true);
   kpool_options.num_speculative_tokens = 3;
+  kpool_options.kpool_layout = KPoolCacheLayout::PACKED;
   const KVCacheCapacity compressed_capacity =
       estimate_kv_cache_capacity(kpool_args, kpool_options);
   EXPECT_EQ(compressed_capacity.kpool_layout(),
@@ -270,6 +285,35 @@ TEST(KVCacheEstimationTest, LinearStateCapacityDoesNotDependOnPrefixCache) {
 }
 
 #if defined(USE_MLU)
+TEST(KVCacheEstimationTest, Glm5NextSpecVerifyExpandsHybridState) {
+  ModelArgs model_args = make_standard_args();
+  model_args.model_type("glm5_next")
+      .enable_mla(true)
+      .kv_lora_rank(8)
+      .qk_rope_head_dim(0)
+      .index_n_heads(1)
+      .index_head_dim(16)
+      .linear_num_key_heads(2)
+      .linear_num_value_heads(2)
+      .linear_key_head_dim(4)
+      .linear_value_head_dim(4)
+      .linear_conv_kernel_dim(4)
+      .layer_types({"linear_attention",
+                    "deepseek_sparse_attention",
+                    "linear_attention",
+                    "deepseek_sparse_attention"});
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.n_local_linear_k_heads = 2;
+  options.n_local_linear_v_heads = 2;
+  options.num_speculative_tokens = 2;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.linear_conv_state_len(), 5);
+  EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 3);
+}
+
 TEST(KVCacheEstimationTest, KPoolReservesSpeculativeTailWithRequestState) {
   ModelArgs args = make_linear_attention_args();
   args.index_n_heads(1).index_head_dim(16).index_kpool(4).index_kpool_compress(
@@ -277,6 +321,8 @@ TEST(KVCacheEstimationTest, KPoolReservesSpeculativeTailWithRequestState) {
   KVCacheEstimateOptions options = make_linear_attention_options();
   options.dtype = torch::kBFloat16;
   options.num_speculative_tokens = 5;
+  // Fix the request-state capacity; automatic sizing follows the memory budget.
+  options.max_linear_state_cache_slots = 8;
   const KVCacheCapacity capacity = estimate_kv_cache_capacity(args, options);
   // Two recurrent layers and two indexer layers. Each tail keeps K + W
   // BF16 key/gate rows; W includes the verify base token and prelaunch room.
@@ -899,4 +945,36 @@ INSTANTIATE_TEST_SUITE_P(KvSplits,
                          DcpIndexerEstimationTest,
                          ::testing::Values(1, 2, 4, 0));
 
+}  // namespace xllm
+
+namespace xllm {
+TEST(KVCacheEstimationTest, CompressedPoolsUseExactBlockBytes) {
+  // NPU selects this layout from model configuration, not the option alone.
+  ModelArgs args;
+  args.model_type("glm5_next")
+      .n_layers(1)
+      .head_dim(128)
+      .index_n_heads(32)
+      .index_head_dim(128)
+      .index_kpool(3)
+      .index_kpool_compress(true)
+      .index_kpool_always_select_tail(true);
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kBFloat16;
+  options.kv_cache_dtype = "auto";
+  options.cache_size_in_bytes = 1024 * 1024;
+  options.block_size = 24;
+  options.world_size = 1;
+  options.n_local_kv_heads = 1;
+  options.max_seqs_per_batch = 1;
+  options.kpool_layout = KPoolCacheLayout::COMPRESSED_WITH_TAIL;
+  const auto capacity = estimate_kv_cache_capacity(args, options);
+  ASSERT_EQ(capacity.kpool_layout(), KPoolCacheLayout::COMPRESSED_WITH_TAIL);
+  const auto actual = torch::empty({1, 1, 8, 128}, torch::kBFloat16);
+  EXPECT_EQ(capacity.index_block_size(), actual.nbytes());
+  const int64_t block_bytes = 24 * capacity.slot_size() + actual.nbytes();
+  const int64_t available =
+      capacity.cache_size_in_bytes() - capacity.linear_cache_size_in_bytes();
+  EXPECT_EQ(capacity.n_blocks(), available / block_bytes);
+}
 }  // namespace xllm

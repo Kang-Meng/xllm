@@ -59,3 +59,5 @@ set_tests_properties(
   PROPERTIES
     RUN_SERIAL TRUE
 )
+
+add_subdirectory(kpool)

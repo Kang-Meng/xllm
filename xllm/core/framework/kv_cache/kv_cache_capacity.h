@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
+
 #include <cstdint>
 
 #include "common/macros.h"
@@ -24,6 +26,24 @@ namespace xllm {
 
 class KVCacheCapacity final {
  public:
+  KVCacheCapacity& index_cache_sizes(int64_t slot_size, int64_t block_size) {
+    CHECK_GE(slot_size, 0) << "Index cache slot size must be non-negative.";
+    CHECK_GE(block_size, 0) << "Index cache block size must be non-negative.";
+    CHECK_EQ(slot_size == 0, block_size == 0)
+        << "Index cache slot and block sizes must both be zero or positive.";
+    index_slot_size_ = slot_size;
+    index_block_size_ = block_size;
+    return *this;
+  }
+
+  [[nodiscard]] int64_t index_slot_size() const noexcept {
+    return index_slot_size_;
+  }
+
+  [[nodiscard]] int64_t index_block_size() const noexcept {
+    return index_block_size_;
+  }
+
   PROPERTY(int64_t, n_blocks) = 0;
   PROPERTY(int64_t, cache_size_in_bytes) = 0;
   PROPERTY(int64_t, block_size) = 0;
@@ -34,7 +54,7 @@ class KVCacheCapacity final {
   PROPERTY(int64_t, kpool_tail_slot_size) = 0;
 
   // for index cache
-  PROPERTY(int64_t, index_slot_size) = 0;
+  // Rounded-up per-token diagnostic size; allocation uses exact block bytes.
   PROPERTY(int64_t, num_indexer_layers) = 0;
   PROPERTY(bool, enable_indexer_cache_quant) = false;
 
@@ -60,6 +80,10 @@ class KVCacheCapacity final {
   PROPERTY(int64_t, swa_count) = 0;
   PROPERTY(int64_t, c4_count) = 0;
   PROPERTY(int64_t, c128_count) = 0;
+
+ private:
+  int64_t index_slot_size_ = 0;
+  int64_t index_block_size_ = 0;
 };
 
 }  // namespace xllm

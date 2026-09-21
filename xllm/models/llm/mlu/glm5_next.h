@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/mlu/glm5_next/glm5_next_decoder_layer.h"
 #include "models/llm/llm_model_base.h"
+#include "models/llm/mlu/glm5_next_graph.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -53,8 +54,6 @@ class Glm5NextModelImpl final
     const ParallelArgs& parallel_args = context.get_parallel_args();
     CHECK_EQ(parallel_args.cp_size(), 1)
         << "GLM5-Next MLU does not yet support context parallelism.";
-    CHECK_EQ(args.num_speculative_tokens(), 0)
-        << "GLM5-Next MLU speculative decoding is not supported yet.";
     CHECK_GT(hc_mult_, 0) << "GLM5-Next requires hc_mult > 0.";
 
     const int64_t tp_size = std::max<int64_t>(parallel_args.tp_size(), 1);
@@ -79,12 +78,15 @@ class Glm5NextModelImpl final
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) override {
     torch::NoGradGuard no_grad;
+    CHECK(!input_params.is_spec_verify &&
+          (!input_params.attn_metadata ||
+           !input_params.attn_metadata->is_spec_verify))
+        << "Native MLU GLM5-Next speculative verification is not supported "
+           "yet: "
+           "the MTP worker must implement Dense Validate Span and state "
+           "commit.";
     CHECK_EQ(kv_caches.size(), layers_.size())
         << "GLM5-Next requires one layer-specific cache object per layer.";
-    CHECK(!input_params.enable_graph)
-        << "GLM5-Next MLU currently requires eager execution.";
-    CHECK(!input_params.is_spec_verify)
-        << "GLM5-Next MLU speculative verification is not supported yet.";
 
     if (tokens.numel() == 0) {
       tokens = torch::ones(
@@ -115,8 +117,9 @@ class Glm5NextModelImpl final
                                                      /*attn_mask=*/std::nullopt,
                                                      /*device=*/device_));
     }
-    if (modified_input_params.attn_metadata->is_prefill ||
-        modified_input_params.attn_metadata->is_chunked_prefill) {
+    if (!modified_input_params.attn_metadata->is_spec_verify &&
+        (modified_input_params.attn_metadata->is_prefill ||
+         modified_input_params.attn_metadata->is_chunked_prefill)) {
       layer::AttentionMetadataBuilder::build_linear_prefill(
           *modified_input_params.attn_metadata,
           kernel::mlu::kda_prefill_chunk_size(local_linear_heads_,
@@ -181,6 +184,19 @@ class Glm5NextForCausalLMImpl final
  public:
   explicit Glm5NextForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<Glm5NextModel>(context) {}
+
+  bool requires_graph_forward_metadata() { return true; }
+
+  std::unique_ptr<ModelGraphMetadataState>
+  create_graph_forward_metadata_state() {
+    return std::make_unique<Glm5NextGraphMetadataState>();
+  }
+
+  void prepare_graph_forward_metadata(ModelGraphMetadataState* state,
+                                      const torch::Tensor& positions,
+                                      ModelInputParams& params) {
+    Glm5NextGraphMetadata::prepare(state, positions, params);
+  }
 
   bool is_hybrid_linear_attention() { return true; }
 

@@ -2079,12 +2079,20 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   model_weights_path_ = std::move(model_weights_path);
 
   auto args = model_loader->model_args();
-#if defined(USE_NPU)
-  if (configure_glm5_next_mtp_args(
-          args, options_.speculative_algorithm(), options_.is_draft_engine())) {
-    LOG(INFO) << "Loading GLM MTP directly from " << model_weights_path
-              << ", appended layer " << args.mtp_start_layer_idx();
-  }
+  ModelRegistry::configure_mtp_args(
+      args,
+      options_.speculative_algorithm(),
+      options_.is_draft_engine(),
+      ModelConfig::is_python_model_impl(context_.get_model_impl()));
+#if defined(USE_MLU)
+  const bool native_glm5_next =
+      !ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
+      (args.model_type() == "glm5_next" ||
+       args.model_type() == "glm5_next_mtp");
+  CHECK(!(native_glm5_next && options_.enable_speculative_decode()))
+      << "Native MLU GLM5-Next speculative decoding is not supported yet: "
+         "Dense Validate Span and accepted-span state replay are not wired "
+         "into the MTP worker. Disable speculative decoding.";
 #endif
   auto quant_args = model_loader->quant_args();
   const bool embedding_mode = options_.task_type() == "embed";

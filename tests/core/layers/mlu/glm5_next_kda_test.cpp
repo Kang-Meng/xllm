@@ -16,6 +16,8 @@ limitations under the License.
 #include "layers/mlu/glm5_next/glm5_next_kda.h"
 
 #include <framework/core/device.h>
+#include <framework/core/stream_guard.h>
+#include <framework/graphs/MLUGraph.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -33,6 +35,7 @@ limitations under the License.
 
 #include "kernels/mlu/chunk_kda.h"
 #include "kernels/mlu/mlu_ops_api.h"
+#include "tests/core/layers/mlu/tests_utils.h"
 
 namespace xllm::layer {
 namespace {
@@ -102,6 +105,101 @@ double tensor_cosine_similarity(const torch::Tensor& actual,
   const double denominator =
       actual_fp32.norm().item<double>() * expected_fp32.norm().item<double>();
   return numerator / std::max(denominator, std::numeric_limits<double>::min());
+}
+
+TEST(Glm5NextKDATest, PaddedVerifyLayerPreservesStateAndReplays) {
+  const torch::NoGradGuard no_grad;
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const auto ints = options.dtype(torch::kInt32);
+  test::MockProcessGroup group(device);
+  ParallelArgs parallel(0, 1, &group);
+  parallel.tp_group_ = &group;
+  ModelArgs args;
+  args.hidden_size(128)
+      .linear_num_key_heads(8)
+      .linear_num_value_heads(8)
+      .linear_key_head_dim(128)
+      .linear_value_head_dim(128)
+      .linear_conv_kernel_dim(4)
+      .rms_norm_eps(1e-6);
+  Glm5NextKDA layer(args, QuantArgs(), parallel, options);
+  torch::manual_seed(20260918);
+  for (auto& parameter : layer->named_parameters()) {
+    parameter.value().normal_(0.0, 0.03);
+  }
+  for (int32_t width : {2, 3, 4, 5}) {
+    SCOPED_TRACE(width);
+    auto conv = torch::randn({3, width + 2, 3 * 8 * 128}, options);
+    auto ssm =
+        torch::randn({3 * width, 8, 128, 128}, options.dtype(torch::kFloat32)) *
+        0.03;
+    KVCache eager_cache(
+        LinearAttentionKVCacheTensors{conv.clone(), ssm.clone()});
+    KVCache graph_cache(
+        LinearAttentionKVCacheTensors{conv.clone(), ssm.clone()});
+    auto hidden = torch::randn({3 * width, 128}, options);
+    ModelInputParams padded;
+    padded.is_spec_verify = true;
+    padded.embedding.linear_state_ids = {1, 0, 0};
+    padded.embedding.linear_state_indices = torch::tensor({1, 0, 0}, ints);
+    padded.num_accepted_tokens = torch::tensor({width, 1, width}, ints);
+    ModelInputParams real = padded;
+    real.embedding.linear_state_ids = {1};
+    real.embedding.linear_state_indices = torch::tensor({1}, ints);
+    real.num_accepted_tokens = padded.num_accepted_tokens.narrow(0, 0, 1);
+    AttentionMetadata padded_meta{};
+    padded_meta.is_chunked_prefill = true;
+    padded_meta.max_query_len = width;
+    padded_meta.q_cu_seq_lens =
+        torch::tensor({0, width, 2 * width, 3 * width}, ints);
+    AttentionMetadata real_meta = padded_meta;
+    real_meta.q_cu_seq_lens = torch::tensor({0, width}, ints);
+    auto expected = layer->forward(
+        hidden.narrow(0, 0, width), real_meta, eager_cache, real);
+    auto warmup = layer->forward(hidden, padded_meta, graph_cache, padded);
+    EXPECT_TRUE(
+        torch::allclose(warmup.narrow(0, 0, width), expected, 0.02, 0.002));
+    EXPECT_TRUE(
+        torch::equal(warmup.narrow(0, width, 2 * width),
+                     torch::zeros_like(warmup.narrow(0, width, 2 * width))));
+    torch_mlu::synchronize();
+    torch_mlu::MLUGraph graph;
+    torch::Tensor output;
+    {
+      torch_mlu::mlu::MLUStreamGuard stream(
+          torch_mlu::getStreamFromPool(false, 0));
+      graph.capture_begin();
+      output = layer->forward(hidden, padded_meta, graph_cache, padded);
+      graph.capture_end();
+    }
+    for (int32_t round = 0; round < 3; ++round) {
+      EXPECT_TRUE(torch::equal(graph_cache.get_conv_cache(),
+                               eager_cache.get_conv_cache()));
+      EXPECT_TRUE(torch::allclose(graph_cache.get_ssm_cache(),
+                                  eager_cache.get_ssm_cache(),
+                                  0.001,
+                                  0.0001));
+      EXPECT_TRUE(torch::equal(graph_cache.get_ssm_cache().narrow(0, 0, width),
+                               ssm.narrow(0, 0, width)));
+      hidden.normal_();
+      padded.num_accepted_tokens[0].fill_(round % width + 1);
+      expected = layer->forward(
+          hidden.narrow(0, 0, width), real_meta, eager_cache, real);
+      graph.replay();
+      EXPECT_TRUE(
+          torch::allclose(output.narrow(0, 0, width), expected, 0.02, 0.002));
+      EXPECT_TRUE(torch::isfinite(output).all().item<bool>());
+    }
+    EXPECT_TRUE(torch::equal(graph_cache.get_conv_cache(),
+                             eager_cache.get_conv_cache()));
+    EXPECT_TRUE(torch::allclose(graph_cache.get_ssm_cache(),
+                                eager_cache.get_ssm_cache(),
+                                0.001,
+                                0.0001));
+  }
 }
 
 TEST(Glm5NextKDATest, SafeGateUsesBoundedPerKeyFormula) {
@@ -668,8 +766,16 @@ TEST(Glm5NextKDATest, PrefillFeedsIndexedMtpCheckpointsAcrossRaggedRequests) {
   ASSERT_TRUE(torch::isfinite(prefill_output).all().item<bool>());
   ASSERT_TRUE(torch::isfinite(prefill_state).all().item<bool>());
 
-  const std::array<std::pair<int64_t, bool>, 6> decode_cases = {
-      {{3, false}, {3, true}, {4, false}, {4, true}, {8, false}, {8, true}}};
+  const std::array<std::pair<int64_t, bool>, 10> decode_cases = {{{2, false},
+                                                                  {2, true},
+                                                                  {3, false},
+                                                                  {3, true},
+                                                                  {4, false},
+                                                                  {4, true},
+                                                                  {5, false},
+                                                                  {5, true},
+                                                                  {8, false},
+                                                                  {8, true}}};
   for (const auto& [checkpoint_width, ragged] : decode_cases) {
     SCOPED_TRACE(checkpoint_width);
     SCOPED_TRACE(ragged ? "ragged" : "dense");
@@ -694,7 +800,7 @@ TEST(Glm5NextKDATest, PrefillFeedsIndexedMtpCheckpointsAcrossRaggedRequests) {
       }
     }
     // A padded row with tokens must produce zero output and preserve the pool.
-    const int64_t padding_sequence = kSequences - 1;
+    const int64_t padding_sequence = kSequences - 3;
     std::fill(slots.begin() + padding_sequence * checkpoint_width,
               slots.end(),
               /*value=*/0);

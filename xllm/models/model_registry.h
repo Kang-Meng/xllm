@@ -18,6 +18,7 @@ limitations under the License.
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "core/framework/dit_model_context.h"
@@ -54,6 +55,14 @@ using MultimodalProcessorFactory =
 using ModelArgsLoader =
     std::function<bool(const JsonReader& json, ModelArgs* args)>;
 
+using MtpArgsAdapter = std::function<void(ModelArgs&, bool)>;
+
+struct MtpModelCapabilities {
+  // A platform-native implementation must explicitly opt out until its cache
+  // updates and graph execution support cross-step index sharing.
+  bool supports_native_index_share_for_iteration = true;
+};
+
 using QuantArgsLoader =
     std::function<bool(const JsonReader& json, QuantArgs* args)>;
 
@@ -75,6 +84,8 @@ struct ModelMeta {
   DiTModelFactory dit_model_factory;
   MultimodalProcessorFactory multimodal_processor_factory;
   ModelArgsLoader model_args_loader;
+  MtpArgsAdapter mtp_args_adapter;
+  MtpModelCapabilities mtp_capabilities;
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
   CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
@@ -103,6 +114,17 @@ class ModelRegistry {
 
   static void register_model_args_loader(const std::string& name,
                                          ModelArgsLoader loader);
+
+  static void register_mtp_args_adapter(const std::string& name,
+                                        MtpArgsAdapter adapter);
+
+  static void register_mtp_capabilities(const std::string& name,
+                                        MtpModelCapabilities capabilities);
+
+  static void configure_mtp_args(ModelArgs& args,
+                                 std::string_view algorithm,
+                                 bool is_draft_engine,
+                                 bool is_python_model);
 
   static void register_quant_args_loader(const std::string& name,
                                          QuantArgsLoader loader);

@@ -69,7 +69,8 @@ torch::Tensor causal_conv1d_update_decode(
       num_accepted_tokens_opt.has_value() ? width - 1 + seqlen - 1 : width - 1;
   int32_t num_cache_lines = static_cast<int32_t>(conv_state.size(0));
 
-  torch::Tensor out = torch::empty_like(x_input);
+  // Skipped padding rows must remain defined before downstream projections.
+  torch::Tensor out = torch::zeros_like(x_input);
   torch::Tensor conv_state_indices =
       conv_state_indices_opt.has_value()
           ? conv_state_indices_opt.value().contiguous().to(torch::kInt32)
@@ -186,7 +187,7 @@ torch::Tensor causal_conv1d_update_decode(
       /*IS_APC_ENABLED=*/is_apc ? 1 : 0,
       /*IS_SPEC_DECODING=*/num_accepted_tokens_opt.has_value() ? 1 : 0,
       /*NP2_STATELEN=*/np2_statelen,
-      /*HAS_NULL_BLOCK=*/(pad_slot_id >= 0 && is_apc) ? 1 : 0,
+      /*HAS_NULL_BLOCK=*/pad_slot_id >= 0 ? 1 : 0,
       /*BLOCK_N=*/block_n,
       /*BLOCK_B=*/kBlockB);
 

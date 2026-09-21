@@ -38,3 +38,16 @@ if(USE_NPU)
                                model_context
                                npu_layers)
 endif()
+
+if(USE_MLU)
+  # Uses CPU tensors and forks before any MLU device initialization.
+  cc_test(
+    NAME
+      glm5_next_mlu_test
+    SRCS
+      glm5_next_mlu_test.cpp
+    DEPS
+      models
+      GTest::gtest_main
+  )
+endif()

@@ -27,6 +27,7 @@ limitations under the License.
 #include <c10/core/Device.h>
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>

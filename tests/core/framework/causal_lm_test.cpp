@@ -26,7 +26,7 @@ namespace {
 // A model that only implements the 2-arg logits, like the models on the
 // generic LlmForCausalLMImplBase whose lm_head cannot emit the selected
 // hidden in the same projection.
-class TwoArgLogitsModel final {
+class TwoArgLogitsModel {
  public:
   ModelOutput forward(const torch::Tensor& tokens,
                       const torch::Tensor& positions,

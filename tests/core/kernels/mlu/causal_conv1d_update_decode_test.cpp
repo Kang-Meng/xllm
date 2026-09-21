@@ -54,6 +54,44 @@ class CausalConv1dUpdateDecodeJitTest : public ::testing::Test {
   torch::Device device() { return torch::Device(torch::kPrivateUse1, 0); }
 };
 
+TEST_F(CausalConv1dUpdateDecodeJitTest, PaddingSkipsStateWithoutApc) {
+  const torch::DeviceGuard guard(device());
+  const auto ints =
+      torch::TensorOptions().device(device()).dtype(torch::kInt32);
+  for (int32_t width : {2, 3, 4, 5}) {
+    auto state = bf16_randn({3, 128, width + 2}, device());
+    auto reference = state.clone();
+    auto weight = bf16_randn({128, 4}, device());
+    auto input = bf16_randn({3 * width, 128}, device());
+    auto actual = causal_conv1d_update_decode(
+        input,
+        state,
+        weight,
+        std::nullopt,
+        torch::tensor({1, 0, 0}, ints),
+        /*activation=*/true,
+        /*pad_slot_id=*/0,
+        torch::tensor({0, width, 2 * width, 3 * width}, ints),
+        width,
+        torch::tensor({width, 1, 1}, ints));
+    auto expected = causal_conv1d_update_decode(input.narrow(0, 0, width),
+                                                reference,
+                                                weight,
+                                                std::nullopt,
+                                                torch::tensor({1}, ints),
+                                                /*activation=*/true,
+                                                /*pad_slot_id=*/0,
+                                                torch::tensor({0, width}, ints),
+                                                width,
+                                                torch::tensor({width}, ints));
+    EXPECT_TRUE(torch::equal(state, reference));
+    EXPECT_TRUE(torch::equal(actual.narrow(0, 0, width), expected));
+    EXPECT_TRUE(
+        torch::equal(actual.narrow(0, width, 2 * width),
+                     torch::zeros_like(actual.narrow(0, width, 2 * width))));
+  }
+}
+
 TEST_F(CausalConv1dUpdateDecodeJitTest, SecondCallHitsCache) {
   torch::DeviceGuard guard(device());
   int32_t dim = 1024;

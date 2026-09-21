@@ -85,12 +85,19 @@ int64_t kv_slot_size(const ModelArgs& model_args,
          options.n_local_kv_heads;
 }
 
-int64_t index_slot_size(const ModelArgs& model_args,
-                        bool enable_indexer_cache_quantization,
-                        int64_t dtype_size,
-                        KPoolCacheLayout kpool_layout) {
+struct IndexCacheFootprint {
+  int64_t slot_size = 0;
+  int64_t block_size = 0;
+};
+
+IndexCacheFootprint estimate_index_cache_footprint(
+    const ModelArgs& model_args,
+    bool enable_indexer_cache_quantization,
+    int64_t dtype_size,
+    int64_t block_size,
+    KPoolCacheLayout kpool_layout) {
   if (model_args.index_n_heads() <= 0) {
-    return 0;
+    return {};
   }
 
   const int64_t index_n_head = 1;
@@ -111,21 +118,26 @@ int64_t index_slot_size(const ModelArgs& model_args,
   if (enable_indexer_cache_quantization) {
     // int8 index cache: one byte per element, plus an independent per-token
     // fp32 scale (kept separate from the main-KV scale_slot_size path).
-    return replication_factor *
-           (static_cast<int64_t>(sizeof(int8_t)) * index_n_head *
-                model_args.index_head_dim() +
-            static_cast<int64_t>(sizeof(float)));
+    const int64_t slot_size =
+        replication_factor * (static_cast<int64_t>(sizeof(int8_t)) *
+                                  index_n_head * model_args.index_head_dim() +
+                              static_cast<int64_t>(sizeof(float)));
+    return {slot_size, slot_size * block_size};
   }
   if (uses_compressed_tail) {
-    CHECK_EQ(model_args.index_head_dim() % model_args.index_kpool(), 0)
-        << "KPool index head dim must be divisible by index_kpool.";
-    return replication_factor * dtype_size * index_n_head *
-           model_args.index_head_dim() / model_args.index_kpool();
+    const int64_t pool_bytes = replication_factor * dtype_size * index_n_head *
+                               model_args.index_head_dim();
+    const int64_t slot_size =
+        (pool_bytes + model_args.index_kpool() - 1) / model_args.index_kpool();
+    CHECK_EQ(block_size % model_args.index_kpool(), 0);
+    return {slot_size, block_size / model_args.index_kpool() * pool_bytes};
   }
   const int64_t index_width = uses_packed_kpool
                                   ? 2 * model_args.index_head_dim() + 1
                                   : model_args.index_head_dim();
-  return replication_factor * dtype_size * index_n_head * index_width;
+  const int64_t slot_size =
+      replication_factor * dtype_size * index_n_head * index_width;
+  return {slot_size, slot_size * block_size};
 }
 
 int64_t scale_slot_size(const ModelArgs& model_args,
@@ -159,9 +171,9 @@ int64_t standard_full_cache_block_size_in_bytes(
       << "num_indexer_layers cannot exceed full-attention layers";
   const int64_t logical_block_bytes =
       kv_cache_cap.block_size() *
-      (full_attention_layers *
-           (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size()) +
-       indexer_layers * kv_cache_cap.index_slot_size());
+          (full_attention_layers *
+           (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size())) +
+      indexer_layers * kv_cache_cap.index_block_size();
   CHECK_GT(logical_block_bytes, 0) << "logical block bytes must be positive";
   return logical_block_bytes;
 }
@@ -188,16 +200,16 @@ int64_t layerwise_split_block_count(const ModelArgs& model_args,
     any_indexer_layer = any_indexer_layer || has_indexer;
     const int64_t bytes =
         kv_cache_cap.block_size() *
-        (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size() +
-         (has_indexer ? kv_cache_cap.index_slot_size() : 0));
+            (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size()) +
+        (has_indexer ? kv_cache_cap.index_block_size() : 0);
     layer_bytes[static_cast<size_t>(layer_id)] = bytes;
   }
 
   // Scratch matches an owned layer, including indexer when any layer has one.
   const int64_t scratch_bytes_per_block =
       kv_cache_cap.block_size() *
-      (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size() +
-       (any_indexer_layer ? kv_cache_cap.index_slot_size() : 0));
+          (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size()) +
+      (any_indexer_layer ? kv_cache_cap.index_block_size() : 0);
   CHECK_GT(scratch_bytes_per_block, 0);
 
   int64_t common_block_count = std::numeric_limits<int64_t>::max();
@@ -228,10 +240,12 @@ int64_t layerwise_split_block_count(const ModelArgs& model_args,
   return common_block_count;
 }
 
-bool enable_qwen3_5_spec_verify(const ModelArgs& model_args,
-                                const KVCacheEstimateOptions& options) {
+bool enable_hybrid_spec_verify(const ModelArgs& model_args,
+                               const KVCacheEstimateOptions& options) {
   return options.num_speculative_tokens > 0 && !options.is_draft_engine &&
-         is_qwen3_5_target_model_type(model_args.model_type());
+         (is_qwen3_5_target_model_type(model_args.model_type()) ||
+          model_args.model_type() == "glm5_next" ||
+          model_args.model_type() == "glm5_next_text");
 }
 
 int64_t linear_slot_size(const ModelArgs& model_args,
@@ -241,7 +255,7 @@ int64_t linear_slot_size(const ModelArgs& model_args,
     return 0;
   }
   const int64_t num_speculative_tokens =
-      enable_qwen3_5_spec_verify(model_args, options)
+      enable_hybrid_spec_verify(model_args, options)
           ? options.num_speculative_tokens
           : 0;
 
@@ -749,12 +763,15 @@ KVCacheCapacity estimate_kv_cache_capacity(
       model_args.enable_mla() &&
       util::enable_mla_packed_c8(options.kv_cache_dtype == "int8",
                                  model_args.model_type());
+  const IndexCacheFootprint index_cache =
+      estimate_index_cache_footprint(model_args,
+                                     enable_indexer_cache_quantization,
+                                     dtype_size,
+                                     options.block_size,
+                                     kpool_layout);
 
   kv_cache_cap.slot_size(kv_slot_size(model_args, options, cache_dtype_size))
-      .index_slot_size(index_slot_size(model_args,
-                                       enable_indexer_cache_quantization,
-                                       dtype_size,
-                                       kpool_layout))
+      .index_cache_sizes(index_cache.slot_size, index_cache.block_size)
       .kpool_layout(kpool_layout)
       .enable_indexer_cache_quant(enable_indexer_cache_quantization)
       .enable_mla_kv_cache_quant(enable_mla_kv_cache_quantization)
@@ -763,7 +780,7 @@ KVCacheCapacity estimate_kv_cache_capacity(
       .n_layers(model_args.n_layers())
       .block_size(options.block_size);
   const int64_t num_speculative_tokens =
-      enable_qwen3_5_spec_verify(model_args, options)
+      enable_hybrid_spec_verify(model_args, options)
           ? options.num_speculative_tokens
           : 0;
   kv_cache_cap.linear_conv_state_len(model_args.linear_conv_kernel_dim() - 1 +

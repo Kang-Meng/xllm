@@ -119,8 +119,7 @@ class MluGraph {
     return model_graph_metadata_state_.get();
   }
 
-  void prepare_model_graph_metadata(CausalLM* model,
-                                    const ModelInputParams& params);
+  void prepare_model_graph_metadata(CausalLM* model);
 
  private:
   // MLUGraph with mempool for managing temporary tensors during forward pass

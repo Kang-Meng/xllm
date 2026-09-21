@@ -80,7 +80,21 @@ still be explicitly specified to enable MTP. The runtime locates the appended
 layer using `text_config.num_hidden_layers` and maps it to a single DSA/MoE draft,
 including its own embedding, `shared_head`, and quantization tensors. No weight
 files are rewritten or copied. Currently, `num_nextn_predict_layers=1` is supported.
-Previously exported `glm5_next_mtp` directories remain supported.
+Previously exported `glm5_next_mtp` directories remain supported by the
+Python/NPU implementation described here.
+
+The native MLU implementation currently supports ordinary prefill/decode only.
+Its draft weight loader accepts the full target checkpoint, with one appended
+MTP layer at `model.layers.N` or `model.language_model.layers.N`. It loads the
+draft's own `embed_tokens.weight` and `shared_head.head.weight` from that layer
+and rejects missing vocabulary weights; it does not reuse target vocabulary
+weights. Exported draft directories use a different layout and are explicitly
+rejected by the native MLU argument adapter.
+
+Draft weight loading does not imply end-to-end native MLU MTP support. Dense
+Validate Span (request-grouped K+1 inputs), accepted-count/checkpoint commits,
+and draft accepted-span state replay are not yet connected, so native MLU
+speculative decoding is explicitly rejected at startup.
 
 ## 4. Start the Service
 

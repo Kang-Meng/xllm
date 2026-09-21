@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/util/dit_model_discovery.h"
 #include "llm/py_causal_lm.h"
@@ -312,6 +313,35 @@ void ModelRegistry::register_model_args_loader(const std::string& name,
                                               << " already registered.");
   } else {
     instance->model_registry_[name].model_args_loader = loader;
+  }
+}
+
+void ModelRegistry::register_mtp_args_adapter(const std::string& name,
+                                              MtpArgsAdapter adapter) {
+  get_instance()->model_registry_[name].mtp_args_adapter = std::move(adapter);
+}
+
+void ModelRegistry::register_mtp_capabilities(
+    const std::string& name,
+    MtpModelCapabilities capabilities) {
+  get_instance()->model_registry_[name].mtp_capabilities = capabilities;
+}
+
+void ModelRegistry::configure_mtp_args(ModelArgs& args,
+                                       std::string_view algorithm,
+                                       bool is_draft_engine,
+                                       bool is_python_model) {
+  if (!is_draft_engine || !SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+    return;
+  }
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(args.model_type());
+  if (it != registry.end() && it->second.mtp_args_adapter) {
+    if (!is_python_model && !it->second.mtp_capabilities
+                                 .supports_native_index_share_for_iteration) {
+      args.index_share_for_mtp_iteration(false);
+    }
+    it->second.mtp_args_adapter(args, is_python_model);
   }
 }
 

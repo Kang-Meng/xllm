@@ -22,6 +22,7 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#include "core/common/constants.h"
 #include "framework/state_dict/utils.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
@@ -522,7 +523,7 @@ torch::Tensor Glm5NextKDAImpl::forward(const torch::Tensor& hidden_states,
         /*bias_opt=*/std::nullopt,
         logical_state_indices,
         /*activation=*/true,
-        /*pad_slot_id=*/-1,
+        /*pad_slot_id=*/kPaddingLinearStateId,
         attn_metadata.q_cu_seq_lens,
         static_cast<int32_t>(attn_metadata.max_query_len),
         input_params.num_accepted_tokens);
@@ -530,6 +531,9 @@ torch::Tensor Glm5NextKDAImpl::forward(const torch::Tensor& hidden_states,
 
     torch::Tensor state_indices = build_rebased_ssm_state_indices(
         logical_state_indices, checkpoint_stride, attn_metadata.max_query_len);
+    // Slot zero is reserved; every checkpoint of a virtual request skips state.
+    state_indices.masked_fill_(
+        logical_state_indices.eq(kPaddingLinearStateId).unsqueeze(1), 0);
     xllm::kernel::FusedSigmoidGatingDeltaRuleUpdateParams params;
     params.A_log = A_log_;
     params.a = raw_gate.view({num_tokens, local_projection_size_});
@@ -603,7 +607,7 @@ torch::Tensor Glm5NextKDAImpl::forward(const torch::Tensor& hidden_states,
         /*bias_opt=*/std::nullopt,
         logical_state_indices,
         /*activation=*/true,
-        /*pad_slot_id=*/-1);
+        /*pad_slot_id=*/kPaddingLinearStateId);
     std::tie(q, k, v) = split_mixed_qkv(mixed_qkv);
 
     xllm::kernel::FusedSigmoidGatingDeltaRuleUpdateParams params;

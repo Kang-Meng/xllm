@@ -78,7 +78,16 @@ GLM-5.3-Flash-W8A8 无需单独导出 MTP。将 `--draft_model` 和 `--model`
 指向同一个原始权重目录即可；启用 MTP 时仍需显式指定 `--draft_model`。
 运行时按 `text_config.num_hidden_layers` 定位附加层，并将其映射为单层 DSA/MoE draft，
 同时读取该层自己的 embedding、`shared_head` 和量化参数，不会改写或复制权重文件。
-目前支持 `num_nextn_predict_layers=1`。已经导出的 `glm5_next_mtp` 目录仍可使用。
+目前支持 `num_nextn_predict_layers=1`。已经导出的 `glm5_next_mtp` 目录仍可用于本文的 Python/NPU 实现。
+
+原生 MLU 实现当前仅支持普通 prefill/decode。其 draft 权重加载器接受包含单个附加 MTP 层的完整
+checkpoint，层路径为 `model.layers.N` 或 `model.language_model.layers.N`；显式读取该层自己的
+`embed_tokens.weight` 和 `shared_head.head.weight`，缺失两端权重会报错，不复用 target 两端权重。
+导出的 draft 目录采用不同的布局，原生 MLU 参数适配阶段会明确拒绝。
+
+权重加载支持不代表端到端原生 MLU MTP 推理已支持。Dense Validate Span（按请求分组的 K+1 输入）、
+accepted-count/checkpoint 提交及 draft accepted-span 状态回放尚未接入，因此原生 MLU 配置
+speculative decoding 会在启动时显式拒绝。
 
 ## 4. 启动服务
 

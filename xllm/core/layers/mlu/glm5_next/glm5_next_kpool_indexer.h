@@ -34,72 +34,16 @@ limitations under the License.
 
 namespace xllm::layer {
 
-inline constexpr int64_t kGlm5NextGraphMaxKvSeqLen = 32768;
-
 // Rebuilt at the model-forward boundary; never retained across batches.
 void prepare_glm5_next_kpool_metadata(AttentionMetadata& metadata,
                                       const torch::Device& device);
-
-struct Glm5NextKPoolSelection final {
-  torch::Tensor physical_slots;
-  torch::Tensor context_lens;
-};
-
-struct Glm5NextKPoolHistory final {
-  torch::Tensor keys;
-  torch::Tensor valid;
-};
 
 // Apply FP32 LayerNorm and restore the projection dtype.
 torch::Tensor glm5_next_kpool_normalize_key(torch::Tensor key,
                                             RMSNorm& key_norm);
 
-// Score compressed keys per query head. GLM5-Next applies ReLU before the
-// learned head reduction, so the head weights cannot be folded into Q.
-torch::Tensor glm5_next_kpool_score_queries(const torch::Tensor& query,
-                                            const torch::Tensor& head_weights,
-                                            const torch::Tensor& pooled_key,
-                                            double softmax_scale);
-
-// Feature-wise softmax pooling, rounded through BF16 before Hadamard.
-torch::Tensor glm5_next_kpool_compress_keys(const torch::Tensor& raw_k,
-                                            const torch::Tensor& gate_score,
-                                            const torch::Tensor& ape,
-                                            const torch::Tensor& hadamard,
-                                            int64_t index_kpool);
-
-// Complete pools before overwriting the raw K/gate tail shared across steps,
-// then stash the latest tail. Callers pass raw layouts; row-major inputs are
-// enforced here. index_cache: [blocks, 1, block_size / index_kpool, D] BF16.
-// tail_cache: [state_slots, 2, tail_len, D] BF16.
-void launch_kpool_update(const torch::Tensor& k,
-                         const torch::Tensor& gate,
-                         const torch::Tensor& ape,
-                         const torch::Tensor& hadamard,
-                         torch::Tensor& index_cache,
-                         torch::Tensor& tail_cache,
-                         const torch::Tensor& tail_block_ids,
-                         const torch::Tensor& block_table,
-                         const torch::Tensor& positions,
-                         const torch::Tensor& row_batch,
-                         const torch::Tensor& starts,
-                         int64_t block_size,
-                         int64_t index_kpool,
-                         bool single_token = false);
-
-// Reads paged compressed pools up to max_kv_seq_len. Runtime KV lengths only
-// affect the validity mask, so a fixed maximum keeps graph shapes stable.
-Glm5NextKPoolHistory glm5_next_kpool_read_compressed_cache(
-    const torch::Tensor& compressed_pool_cache,
-    const torch::Tensor& block_table,
-    const torch::Tensor& kv_seq_lens,
-    int64_t max_kv_seq_len,
-    int64_t block_size,
-    int64_t index_kpool);
-
-// Select causal top-k pools with Triton scoring and exact selection. Long
-// prefill gathers one request at a time; query chunks reuse bounded scores.
-// Output order is unspecified. Equal scores prefer lower logical pool ids.
+// Select causal pools with paged Triton scoring and torch::topk. Query chunks
+// reuse bounded scores. Equal-score ordering follows native torch::topk.
 torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
                                      const torch::Tensor& head_weights,
                                      const torch::Tensor& positions,
@@ -111,22 +55,8 @@ torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
                                      int64_t index_kpool,
                                      int64_t index_topk,
                                      double softmax_scale,
-                                     int64_t workspace_bytes = 64 * 1024 * 1024,
-                                     const KPoolBatchMetadata* batch = nullptr);
-
-// Expand logical pool ids back to their token slots, append the incomplete
-// causal tail, compact valid entries to the left, then map through block_table.
-// MLU-only, with strided int32/int64 inputs and int32 outputs. Scratch remains
-// bounded across query counts and output widths; selected pools must fit top-k.
-Glm5NextKPoolSelection glm5_next_kpool_expand_to_physical_slots(
-    const torch::Tensor& selected_pool_ids,
-    const torch::Tensor& query_positions,
-    const torch::Tensor& row_batch,
-    const torch::Tensor& block_table,
-    int64_t block_size,
-    int64_t index_topk,
-    int64_t index_kpool,
-    bool always_select_tail);
+                                     int64_t workspace_bytes = 64 * 1024 *
+                                                               1024);
 
 class Glm5NextKPoolIndexerImpl final : public torch::nn::Module {
  public:
@@ -182,7 +112,6 @@ class Glm5NextKPoolIndexerImpl final : public torch::nn::Module {
   int64_t index_topk_ = 0;
   int64_t index_kpool_ = 0;
   int64_t block_size_ = 0;
-  int64_t graph_max_kv_seq_len_ = kGlm5NextGraphMaxKvSeqLen;
   double softmax_scale_ = 1.0;
   bool always_select_tail_ = true;
 
