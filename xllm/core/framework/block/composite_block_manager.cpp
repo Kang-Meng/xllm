@@ -269,10 +269,12 @@ CompositeBlockManager::LeafMap build_composite_leaves(
 
 CompositeBlockManager::CompositeBlockManager(
     LeafMap leaves,
-    const BlockManager::Options& options)
+    const BlockManager::Options& options,
+    PrefixCachePublishMode publish_mode)
     : BlockManager(options),
       leaves_(std::move(leaves)),
-      combination_(classify_leaf_combination(leaves_)) {
+      combination_(classify_leaf_combination(leaves_)),
+      publish_mode_(publish_mode) {
   CHECK(!leaves_.empty()) << "CompositeBlockManager requires at least one leaf";
 }
 
@@ -321,7 +323,8 @@ BlockManager* CompositeBlockManager::leaf_of(BlockType type) const {
 }
 
 void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
-  if (seq == nullptr || seq->is_graph_warmup()) {
+  if (seq == nullptr || seq->is_graph_warmup() ||
+      publish_mode_ == PrefixCachePublishMode::EXPLICIT) {
     return;
   }
   KVCacheState& kv = seq->kv_state();
@@ -412,7 +415,15 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   if (seq == nullptr) {
     return false;
   }
-  KVCacheState& kv_state = seq->kv_state();
+  return allocate_sequence(seq, seq->kv_state(), num_tokens);
+}
+
+bool CompositeBlockManager::allocate_sequence(Sequence* seq,
+                                              KVCacheState& kv_state,
+                                              size_t num_tokens) {
+  if (seq == nullptr) {
+    return false;
+  }
 
   // Publish blocks completed by the previous forward before growing again.
   // SlidingWindowBlockManager can then release a cached, slid-out block and
@@ -431,7 +442,7 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   };
 
   for (auto& [type, entry] : leaves_) {
-    auto blocks = entry.leaf->allocate_for_sequence(seq, num_tokens);
+    auto blocks = entry.leaf->allocate_for_sequence(seq, kv_state, num_tokens);
     if (!blocks.has_value()) {
       release_staged();
       return false;
@@ -459,7 +470,7 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
     const auto staged_it = staged.find(type);
     const size_t staged_for_type =
         staged_it == staged.end() ? 0 : staged_it->second.size();
-    const size_t total = seq->kv_state().num_blocks(type) + staged_for_type;
+    const size_t total = kv_state.num_blocks(type) + staged_for_type;
     if (total < needed) {
       release_staged();
       return false;
@@ -472,17 +483,30 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   for (auto& [type, blocks] : staged) {
     kv_state.add_blocks(type, blocks);
   }
+  staged.clear();
   cache_full_blocks_for_sequence(seq);
 
   // Release slid-out SWA blocks only after they have had a chance to enter the
   // prefix cache. Other leaves are no-ops here.
-  release_out_of_window_for_sequence(seq);
+  release_out_of_window_for_sequence(seq, kv_state);
   return true;
 }
 
 void CompositeBlockManager::release_out_of_window_for_sequence(Sequence* seq) {
+  if (seq == nullptr) {
+    return;
+  }
+  release_out_of_window_for_sequence(seq, seq->kv_state());
+}
+
+void CompositeBlockManager::release_out_of_window_for_sequence(
+    Sequence* seq,
+    KVCacheState& kv_state) {
+  if (seq == nullptr) {
+    return;
+  }
   for (auto& [type, entry] : leaves_) {
-    entry.leaf->release_out_of_window(seq);
+    entry.leaf->release_out_of_window(seq, kv_state);
   }
 }
 
@@ -490,11 +514,19 @@ void CompositeBlockManager::deallocate_for_sequence(Sequence* seq) {
   if (seq == nullptr) {
     return;
   }
+  deallocate_for_sequence(seq, seq->kv_state());
+}
+
+void CompositeBlockManager::deallocate_for_sequence(Sequence* seq,
+                                                    KVCacheState& kv_state) {
+  if (seq == nullptr) {
+    return;
+  }
   // Publish prefix cache first, then release blocks. seq->reset() belongs to
   // the pool caller.
   cache_for_sequence(seq);
   for (auto& [type, entry] : leaves_) {
-    entry.leaf->deallocate(seq->kv_state().blocks(type));
+    entry.leaf->deallocate(kv_state.blocks(type));
   }
 }
 
@@ -586,7 +618,7 @@ std::optional<ProbeResult> take_probe(std::vector<ProbeResult>& probes,
   return std::nullopt;
 }
 
-// FLAT_KV: no trim; Sequence::add_shared_blocks owns replace + exact-repeat.
+// FLAT_KV: no trim; KVCacheState owns replace + exact-repeat.
 TrimOutcome trim_flat_kv(std::vector<ProbeResult> probes) {
   CHECK_EQ(probes.size(), 1u) << "FLAT_KV expects a single KV probe";
   TrimOutcome out;
@@ -652,8 +684,8 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
   return out;
 }
 
-// SWA_COMPRESSED: cross-leaf min -> C128-stride clamp -> SWA tail-continuity
-// (fallback in C128 steps) -> exact-repeat pop -> per-leaf trim.
+// SWA_COMPRESSED: cross-leaf min -> prompt/C128 clamp -> SWA tail-continuity
+// (fallback in C128 steps) -> per-leaf trim.
 TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
                                 size_t prompt_tokens) {
   TrimOutcome out;
@@ -671,6 +703,15 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
     safe_hit_tokens = std::min(safe_hit_tokens, p.blocks.size() * p.block_size);
   }
   safe_hit_tokens = (safe_hit_tokens / c128_block_size) * c128_block_size;
+
+  // A forward pass must retain at least one C128 unit to compute. Clamp an
+  // exact prompt hit before validating the SWA window, because the window at
+  // the full-prompt boundary can be valid while the preceding window has
+  // already been evicted.
+  const size_t max_prefix_tokens = prompt_tokens == 0 ? 0 : prompt_tokens - 1;
+  safe_hit_tokens =
+      (std::min(safe_hit_tokens, max_prefix_tokens) / c128_block_size) *
+      c128_block_size;
 
   // SWA attention reads the last `swa_blocks_per_seq` base blocks; a middle
   // invalid placeholder in that tail means garbage KV. Fall back in C128
@@ -707,11 +748,6 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
     }
   }
 
-  // Exact-repeat pop: forward needs at least one C128 block to compute.
-  if (safe_hit_tokens == prompt_tokens && safe_hit_tokens >= c128_block_size) {
-    safe_hit_tokens -= c128_block_size;
-  }
-
   if (safe_hit_tokens == 0) {
     out.to_drop = std::move(probes);
     return out;
@@ -741,18 +777,27 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
 }  // namespace
 
 void CompositeBlockManager::allocate_shared_for_sequence(Sequence* seq) {
+  if (seq == nullptr) {
+    return;
+  }
+  allocate_shared_for_sequence(seq, seq->kv_state());
+}
+
+void CompositeBlockManager::allocate_shared_for_sequence(
+    Sequence* seq,
+    KVCacheState& kv_state) {
   // Shared flow: probe -> trim -> mount. Trim strategy is per-shape (see
   // trim_flat_kv / trim_flat_kv_linear / trim_swa_compressed).
   if (seq == nullptr || combination_ == LeafCombination::UNSUPPORTED) {
     return;
   }
   if (combination_ == LeafCombination::FLAT_KV_LINEAR &&
-      seq->kv_state().prefix_cache_matched()) {
+      kv_state.prefix_cache_matched()) {
     return;
   }
-  std::vector<ProbeResult> probes = probe_prefix_cache(seq, leaves_);
+  std::vector<ProbeResult> probes = probe_prefix_cache(seq, leaves_, kv_state);
   if (probes.empty()) {
-    seq->kv_state().set_prefix_cache_matched();
+    kv_state.set_prefix_cache_matched();
     return;
   }
 
@@ -773,34 +818,33 @@ void CompositeBlockManager::allocate_shared_for_sequence(Sequence* seq) {
 
   release_probes(&trimmed.to_drop);
 
-  // FLAT_KV{,_LINEAR} defer to Sequence::add_shared_blocks, which owns replace
-  // and exact-repeat. Composite layouts mount every leaf before advancing the
-  // sequence-level token count once.
+  // FLAT_KV{,_LINEAR} let KVCacheState own replace and exact-repeat. Composite
+  // layouts mount every leaf before advancing the sequence-level token count
+  // once.
   switch (combination_) {
     case LeafCombination::FLAT_KV:
     case LeafCombination::FLAT_KV_LINEAR: {
       for (ProbeResult& probe : trimmed.to_mount) {
         if (probe.type == BlockType::LINEAR) {
-          seq->kv_state().mount_composite_shared(probe.type,
-                                                 std::move(probe.blocks));
+          kv_state.mount_composite_shared(probe.type, std::move(probe.blocks));
         } else {
-          seq->add_shared_blocks(probe.type, std::move(probe.blocks));
+          kv_state.add_shared_blocks(
+              probe.type, std::move(probe.blocks), seq->num_tokens());
         }
       }
       break;
     }
     case LeafCombination::SWA_COMPRESSED: {
       for (ProbeResult& probe : trimmed.to_mount) {
-        seq->kv_state().mount_composite_shared(probe.type,
-                                               std::move(probe.blocks));
+        kv_state.mount_composite_shared(probe.type, std::move(probe.blocks));
       }
-      seq->kv_state().set_kv_cache_tokens_num(trimmed.safe_hit_tokens);
+      kv_state.set_kv_cache_tokens_num(trimmed.safe_hit_tokens);
       break;
     }
     case LeafCombination::UNSUPPORTED:
       break;
   }
-  seq->kv_state().set_prefix_cache_matched();
+  kv_state.set_prefix_cache_matched();
 }
 
 void CompositeBlockManager::cache_for_sequence(Sequence* seq) {
@@ -813,7 +857,8 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq,
   // SWA / C4 / C128 get their flush from the pre-grow hook at the top of
   // the next allocate_sequence.
   if (seq == nullptr || seq->is_graph_warmup() ||
-      combination_ == LeafCombination::UNSUPPORTED) {
+      combination_ == LeafCombination::UNSUPPORTED ||
+      publish_mode_ == PrefixCachePublishMode::EXPLICIT) {
     return;
   }
   switch (combination_) {
@@ -842,6 +887,14 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq,
     case LeafCombination::UNSUPPORTED:
       break;
   }
+}
+
+void CompositeBlockManager::cache_blocks(BlockType type,
+                                         const std::vector<Block>& blocks) {
+  BlockManager* leaf = leaf_of(type);
+  CHECK(leaf != nullptr) << "Missing block manager for block type "
+                         << static_cast<int32_t>(type);
+  leaf->cache(blocks);
 }
 
 std::vector<Block> CompositeBlockManager::allocate_blocks(BlockType type,
@@ -889,15 +942,6 @@ void CompositeBlockManager::deallocate(const Slice<Block>& blocks) {
 std::vector<Block> CompositeBlockManager::allocate(size_t /*num_blocks*/) {
   NOT_IMPLEMENTED();
   return {};
-}
-
-std::optional<std::vector<Block>> CompositeBlockManager::allocate_for_sequence(
-    Sequence* /*seq*/,
-    size_t /*num_tokens*/) {
-  // The pool drives the composite via allocate_sequence(); the leaf-level
-  // entry point is meaningless on the composite itself.
-  NOT_IMPLEMENTED();
-  return std::nullopt;
 }
 
 std::optional<std::vector<Block>> CompositeBlockManager::allocate_for_sequence(

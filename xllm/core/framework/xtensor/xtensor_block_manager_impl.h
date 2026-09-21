@@ -69,9 +69,6 @@ class XTensorBlockManagerImpl : public BlockManager {
   // implements this directly.
   std::optional<std::vector<Block>> allocate_for_sequence(
       Sequence* seq,
-      size_t num_tokens) override;
-  std::optional<std::vector<Block>> allocate_for_sequence(
-      Sequence* seq,
       KVCacheState& kv_state,
       size_t num_tokens) override;
 

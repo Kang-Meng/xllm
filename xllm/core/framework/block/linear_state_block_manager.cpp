@@ -59,34 +59,34 @@ LinearStateBlockManager::LinearStateBlockManager(uint32_t num_slots,
 
 std::optional<std::vector<Block>>
 LinearStateBlockManager::allocate_for_sequence(Sequence* seq,
+                                               KVCacheState& kv_state,
                                                size_t /*num_tokens*/) {
   if (seq == nullptr) {
     return std::nullopt;
   }
   if (options_.instance_is_decode() || !seq->is_prefill_stage()) {
-    retain_read_source(seq);
-    return allocate_decode(seq);
+    retain_read_source(kv_state);
+    return allocate_decode(kv_state);
   }
-  return allocate_prefill(seq);
+  return allocate_prefill(seq, kv_state);
 }
 
-void LinearStateBlockManager::retain_read_source(Sequence* seq) {
-  KVCacheState& state = seq->kv_state();
-  std::vector<Block>* blocks = state.mutable_blocks(BlockType::LINEAR);
+void LinearStateBlockManager::retain_read_source(KVCacheState& kv_state) {
+  std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::LINEAR);
   if (blocks->empty()) {
     return;
   }
   CHECK(blocks->back().is_valid());
   const bool shared_source =
-      state.shared_blocks_num(BlockType::LINEAR) == blocks->size();
+      kv_state.shared_blocks_num(BlockType::LINEAR) == blocks->size();
   const size_t keep_begin = blocks->size() - 1;
   deallocate(Slice<Block>(*blocks).slice(0, keep_begin));
   blocks->erase(blocks->begin(), blocks->begin() + keep_begin);
-  state.set_shared_blocks_num(BlockType::LINEAR, shared_source ? 1 : 0);
+  kv_state.set_shared_blocks_num(BlockType::LINEAR, shared_source ? 1 : 0);
 }
 
-void LinearStateBlockManager::cache_read_source(Sequence* seq) {
-  KVCacheState& kv_state = seq->kv_state();
+void LinearStateBlockManager::cache_read_source(Sequence* seq,
+                                                KVCacheState& kv_state) {
   const Slice<Block> blocks = kv_state.blocks(BlockType::LINEAR);
   if (seq->is_graph_warmup() || prefix_cache_ == nullptr || blocks.empty()) {
     return;
@@ -112,9 +112,10 @@ void LinearStateBlockManager::cache_read_source(Sequence* seq) {
 }
 
 std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
-    Sequence* seq) {
-  cache_read_source(seq);
-  retain_read_source(seq);
+    Sequence* seq,
+    KVCacheState& kv_state) {
+  cache_read_source(seq, kv_state);
+  retain_read_source(kv_state);
   std::vector<Block> allocated = BlockManagerImpl::allocate(1);
   if (allocated.empty()) {
     return std::nullopt;
@@ -123,8 +124,8 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
 }
 
 std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
-    Sequence* seq) {
-  if (seq->kv_state().num_blocks(BlockType::LINEAR) > 0) {
+    const KVCacheState& kv_state) {
+  if (kv_state.num_blocks(BlockType::LINEAR) > 0) {
     return std::vector<Block>{};
   }
   std::vector<Block> allocated = BlockManagerImpl::allocate(1);
