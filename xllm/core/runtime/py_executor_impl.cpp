@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_visitor.h"
+#include "core/framework/speculative/mtp_async_state.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/kv_shard_batch_metadata.h"
@@ -243,6 +244,9 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       py::cast(PyInputBatchMetadataView(params));
   py::object input_embedding =
       optional_tensor(params.embedding.input_embedding);
+  torch::Tensor execution_tokens =
+      mtp_async::materialize_graph_speculative_verify_tokens(tokens,
+                                                             params.graph);
 
   // --- VLM: vision encode + embedding merge on image/video prefill steps ---
   // On steps carrying multimodal input, ``params.multimodal.mm_data`` holds the
@@ -336,17 +340,20 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         AudioScatterMaskVisitor mask_visitor(
             /*seq_lens=*/params.attention.host.kv_seq_lens,
             /*scheduled_seq_lens=*/params.attention.host.q_seq_lens,
-            tokens);
+            execution_tokens);
         CHECK(mm_data.foreach (mask_visitor));
         audio_mask = py::cast(mask_visitor.finish());
       }
       // Sets top_model.model._inputs_embeds + deepstack_input_embeds.
       if (audio_embeds.is_none()) {
         top_model.attr("get_input_embeddings")(
-            tokens, image_embeds, video_embeds);
+            execution_tokens, image_embeds, video_embeds);
       } else {
-        top_model.attr("get_input_embeddings")(
-            tokens, image_embeds, video_embeds, audio_embeds, audio_mask);
+        top_model.attr("get_input_embeddings")(execution_tokens,
+                                               image_embeds,
+                                               video_embeds,
+                                               audio_embeds,
+                                               audio_mask);
       }
     }
   }
@@ -384,7 +391,7 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // and Qwen3VLModel.forward reads _inputs_embeds. positions_arg carries the
   // mRoPE [3,N]->1-D decode collapse.
   py::object hidden_obj =
-      py_executor_.attr("execute")(tokens,
+      py_executor_.attr("execute")(execution_tokens,
                                    positions_arg,
                                    py_metadata,
                                    input_embedding,

@@ -21,6 +21,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/model_args.h"
+#include "core/framework/model/model_input_params.h"
 
 namespace xllm::mtp_async {
 namespace {
@@ -162,6 +163,17 @@ torch::Tensor materialize_speculative_verify_tokens(
         .copy_(source.flatten(), /*non_blocking=*/true);
   }
   return verify_tokens;
+}
+
+torch::Tensor materialize_graph_speculative_verify_tokens(
+    const torch::Tensor& tokens,
+    const GraphInput& graph_input) {
+  const torch::Tensor& verify_tokens =
+      graph_input.input_tokens_override.defined()
+          ? graph_input.input_tokens_override
+          : tokens;
+  return materialize_speculative_verify_tokens(
+      verify_tokens, graph_input.spec_verify_draft_token_sources);
 }
 
 torch::Tensor extract_target_base_kv_seq_lens(

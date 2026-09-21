@@ -20,6 +20,8 @@ limitations under the License.
 
 #include <utility>
 
+#include "core/framework/model/model_input_params.h"
+
 namespace xllm::mtp_async {
 namespace {
 
@@ -219,6 +221,24 @@ TEST(MtpAsyncStateTest, LeavesOrdinaryEagerTokensUnchanged) {
 
   EXPECT_EQ(materialized.data_ptr(), verify_tokens.data_ptr());
   EXPECT_TRUE(torch::equal(materialized, verify_tokens));
+}
+
+TEST(MtpAsyncStateTest, SelectsGraphVerifyTokenOverrideForEagerExecution) {
+  const torch::Tensor tokens = torch::tensor({1, 2}, torch::kInt);
+  GraphInput graph_input;
+  graph_input.input_tokens_override =
+      torch::tensor({10, -1, -1, 20, -1, -1}, torch::kInt);
+  graph_input.spec_verify_draft_token_sources = {
+      torch::tensor({11, 21}, torch::kLong),
+      torch::tensor({12, 22}, torch::kLong)};
+
+  torch::Tensor materialized =
+      materialize_graph_speculative_verify_tokens(tokens, graph_input);
+
+  EXPECT_EQ(materialized.data_ptr(),
+            graph_input.input_tokens_override.data_ptr());
+  EXPECT_TRUE(torch::equal(
+      materialized, torch::tensor({10, 11, 12, 20, 21, 22}, torch::kInt)));
 }
 
 TEST(MtpAsyncStateTest, BuildsMixedAcceptanceStateWithoutHostRoundTrip) {

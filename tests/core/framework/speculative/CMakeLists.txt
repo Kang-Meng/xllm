@@ -49,6 +49,7 @@ cc_test(
   DEPS
     torch
     glog::glog
+    proto::xllm_proto
     GTest::gtest_main
 )
 if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")

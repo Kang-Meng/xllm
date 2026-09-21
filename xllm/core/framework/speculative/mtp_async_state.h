@@ -21,6 +21,10 @@ limitations under the License.
 #include <string_view>
 #include <vector>
 
+namespace xllm {
+struct GraphInput;
+}
+
 namespace xllm::mtp_async {
 
 enum class TargetSpecVerifyMode {
@@ -83,6 +87,12 @@ bool supports_combined_draft_configuration(
 torch::Tensor materialize_speculative_verify_tokens(
     const torch::Tensor& verify_tokens,
     const std::vector<torch::Tensor>& draft_token_sources);
+
+// Select the graph-owned target verify input when present, then materialize
+// proposer-owned token columns into it for eager execution.
+torch::Tensor materialize_graph_speculative_verify_tokens(
+    const torch::Tensor& tokens,
+    const GraphInput& graph_input);
 
 // Recover the KV length at the first target-verify token. Chunked-prefill
 // stores one post-verify length per sequence, while decode stores one length
