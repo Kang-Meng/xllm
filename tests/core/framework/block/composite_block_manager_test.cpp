@@ -1137,6 +1137,41 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheExactRepeatPopsOneC128) {
   manager.deallocate_for_sequence(&seq_hit);
 }
 
+TEST(CompositeBlockManagerTest,
+     Dsv4ExactRepeatRejectsEvictedPreviousSwaWindow) {
+  const uint32_t window_size = 4 * kBaseBlockSize;
+  BlockManager::Options opts = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      kBaseBlockSize,
+      window_size,
+      /*max_seqs_per_batch=*/1);
+  set_swa_capacity_for_token_budget(&opts, 2 * kBlockSizeRatio128);
+  CompositeBlockManager manager(build_composite_leaves(opts), opts);
+
+  const size_t prompt_tokens = 2 * kBlockSizeRatio128;
+  const std::vector<int32_t> prompt_a(prompt_tokens, 42);
+  Sequence source = MakeTestSequence(/*index=*/0, prompt_a);
+  ASSERT_TRUE(manager.allocate_sequence(&source, prompt_tokens));
+  source.kv_state().incr_kv_cache_tokens_num(prompt_tokens);
+  manager.deallocate_for_sequence(&source);
+  source.reset();
+
+  // Filling the SWA pool with a different active sequence evicts the oldest
+  // cached SWA blocks from A, including A's window ending at 16384, while its
+  // newest window ending at 32768 remains. The larger C4/C128 pools retain A's
+  // complete compressed prefix.
+  const std::vector<int32_t> prompt_b(prompt_tokens, 43);
+  Sequence pressure = MakeTestSequence(/*index=*/1, prompt_b);
+  ASSERT_TRUE(manager.allocate_sequence(&pressure, prompt_tokens));
+
+  Sequence probe = MakeTestSequence(/*index=*/2, prompt_a);
+  manager.allocate_shared_for_sequence(&probe);
+  EXPECT_EQ(probe.kv_state().kv_cache_tokens_num(), 0u);
+
+  manager.deallocate_for_sequence(&probe);
+  manager.deallocate_for_sequence(&pressure);
+}
+
 // DSV4 D-side (instance_is_decode=true) should skip the SWA leaf's prefix
 // cache entirely: no shared blocks on SWA even when the same prompt was
 // previously seeded. C4 / C128 continue to hit because the role predicate

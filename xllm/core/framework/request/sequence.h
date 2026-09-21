@@ -275,7 +275,6 @@ class Sequence final {
 
   void add_blocks(BlockType type, const std::vector<Block>& blocks);
   void add_host_blocks(BlockType type, const std::vector<Block>& blocks);
-  void add_shared_blocks(BlockType type, std::vector<Block>&& blocks);
   void add_shared_host_blocks(BlockType type, std::vector<Block>&& blocks);
 
   // Precomputed chained block hashes used by the prefix cache. Covers all full

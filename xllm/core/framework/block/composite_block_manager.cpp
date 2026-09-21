@@ -618,7 +618,7 @@ std::optional<ProbeResult> take_probe(std::vector<ProbeResult>& probes,
   return std::nullopt;
 }
 
-// FLAT_KV: no trim; Sequence::add_shared_blocks owns replace + exact-repeat.
+// FLAT_KV: no trim; KVCacheState owns replace + exact-repeat.
 TrimOutcome trim_flat_kv(std::vector<ProbeResult> probes) {
   CHECK_EQ(probes.size(), 1u) << "FLAT_KV expects a single KV probe";
   TrimOutcome out;
@@ -684,8 +684,8 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
   return out;
 }
 
-// SWA_COMPRESSED: cross-leaf min -> C128-stride clamp -> SWA tail-continuity
-// (fallback in C128 steps) -> exact-repeat pop -> per-leaf trim.
+// SWA_COMPRESSED: cross-leaf min -> prompt/C128 clamp -> SWA tail-continuity
+// (fallback in C128 steps) -> per-leaf trim.
 TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
                                 size_t prompt_tokens) {
   TrimOutcome out;
@@ -703,6 +703,15 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
     safe_hit_tokens = std::min(safe_hit_tokens, p.blocks.size() * p.block_size);
   }
   safe_hit_tokens = (safe_hit_tokens / c128_block_size) * c128_block_size;
+
+  // A forward pass must retain at least one C128 unit to compute. Clamp an
+  // exact prompt hit before validating the SWA window, because the window at
+  // the full-prompt boundary can be valid while the preceding window has
+  // already been evicted.
+  const size_t max_prefix_tokens = prompt_tokens == 0 ? 0 : prompt_tokens - 1;
+  safe_hit_tokens =
+      (std::min(safe_hit_tokens, max_prefix_tokens) / c128_block_size) *
+      c128_block_size;
 
   // SWA attention reads the last `swa_blocks_per_seq` base blocks; a middle
   // invalid placeholder in that tail means garbage KV. Fall back in C128
@@ -737,11 +746,6 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
         safe_hit_tokens = 0;
       }
     }
-  }
-
-  // Exact-repeat pop: forward needs at least one C128 block to compute.
-  if (safe_hit_tokens == prompt_tokens && safe_hit_tokens >= c128_block_size) {
-    safe_hit_tokens -= c128_block_size;
   }
 
   if (safe_hit_tokens == 0) {
@@ -814,9 +818,9 @@ void CompositeBlockManager::allocate_shared_for_sequence(
 
   release_probes(&trimmed.to_drop);
 
-  // FLAT_KV{,_LINEAR} defer to Sequence::add_shared_blocks, which owns replace
-  // and exact-repeat. Composite layouts mount every leaf before advancing the
-  // sequence-level token count once.
+  // FLAT_KV{,_LINEAR} let KVCacheState own replace and exact-repeat. Composite
+  // layouts mount every leaf before advancing the sequence-level token count
+  // once.
   switch (combination_) {
     case LeafCombination::FLAT_KV:
     case LeafCombination::FLAT_KV_LINEAR: {
