@@ -285,9 +285,14 @@ BlockManagerPool::Options make_typed_cache_options() {
 Sequence make_test_sequence(size_t index,
                             const std::vector<int32_t>& prompt_token_ids) {
   torch::Device device(Platform::type_torch(), 0);
-  RequestSamplingParam sampling_param;
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(16);
+  // Sequence borrows these defaults for its entire lifetime.
+  static RequestSamplingParam sampling_param;
+  static StoppingChecker stopping_checker(/*max_generated_tokens=*/16,
+                                          /*max_context_len=*/0,
+                                          /*eos_token=*/-1,
+                                          /*ignore_eos=*/false,
+                                          /*stop_tokens=*/{},
+                                          /*stop_sequences=*/{});
   SequenceParams seq_params;
   seq_params.seq_capacity =
       std::max<size_t>(32768, prompt_token_ids.size() + 16);

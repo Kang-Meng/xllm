@@ -280,12 +280,16 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
     store_config.model_id = options_.store_namespace();
     store_config.tp_rank = options_.tp_rank();
     store_config.tp_size = options_.tp_size();
+    store_config.kv_split_size = options_.kv_split_size();
+    store_config.kv_split_rank = options_.kv_split_rank();
     store_config.enable_mla = options_.enable_mla();
     LOG(INFO) << "[Mooncake][StoreEngine] initialize, endpoint="
               << store_local_hostname << ", protocol=" << store_config.protocol
               << ", worker_rank=" << options_.store_worker_id()
               << ", tp_rank=" << store_config.tp_rank
               << ", tp_size=" << store_config.tp_size
+              << ", kv_split_size=" << store_config.kv_split_size
+              << ", kv_split_rank=" << store_config.kv_split_rank
               << ", enable_mla=" << store_config.enable_mla;
     kv_cache_store_ = std::make_unique<KVCacheStore>();
     CHECK(kv_cache_store_->init(store_config, std::move(store_index)))
@@ -295,6 +299,8 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
               << ", worker_rank=" << options_.store_worker_id()
               << ", tp_rank=" << store_config.tp_rank
               << ", tp_size=" << store_config.tp_size
+              << ", kv_split_size=" << store_config.kv_split_size
+              << ", kv_split_rank=" << store_config.kv_split_rank
               << ", enable_mla=" << store_config.enable_mla;
   }
   registration_finalized_ = true;
@@ -523,7 +529,10 @@ std::vector<uint8_t> HierarchyKVCacheTransfer::prefetch_kv_blocks(
       kv_cache_store_->batch_get_with_status(block_transfer_info);
   const size_t hit_count =
       std::count(hits.begin(), hits.end(), static_cast<uint8_t>(1));
-  VLOG(1) << "[Mooncake][PrefetchGet] type="
+  VLOG(1) << "[Mooncake][PrefetchGet] worker_rank="
+          << options_.store_worker_id()
+          << ", kv_split_size=" << options_.kv_split_size()
+          << ", kv_split_rank=" << options_.kv_split_rank() << ", type="
           << static_cast<int32_t>(block_transfer_info[0].block_type)
           << ", blocks=" << hits.size() << ", hits=" << hit_count;
   return hits;
@@ -569,9 +578,12 @@ uint32_t HierarchyKVCacheTransfer::offload(
     VLOG(1) << "[Mooncake][OffloadPut] worker_rank="
             << options_.store_worker_id() << ", tp_rank=" << options_.tp_rank()
             << ", tp_size=" << options_.tp_size()
+            << ", kv_split_size=" << options_.kv_split_size()
+            << ", kv_split_rank=" << options_.kv_split_rank()
             << ", enable_mla=" << options_.enable_mla()
             << ", skipped_mla_nonzero_rank="
-            << (options_.enable_mla() && options_.tp_rank() != 0U)
+            << (options_.enable_mla() && options_.kv_split_size() == 1 &&
+                options_.tp_rank() != 0U)
             << ", blocks=" << block_transfer_info.size()
             << ", success=" << put_count;
   }

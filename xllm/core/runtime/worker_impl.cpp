@@ -2494,12 +2494,15 @@ WorkerImpl::create_hierarchy_kv_cache_transfer() {
   const uint32_t tp_size =
       mlu_overlap ? dp_local_size : dp_local_size / options_.cp_size();
   CHECK_GT(tp_size, 0u);
-  const int32_t worker_rank = context_.get_parallel_args().rank();
+  const auto& parallel_args = context_.get_parallel_args();
+  const int32_t worker_rank = parallel_args.rank();
   CHECK_GE(worker_rank, 0);
   const uint32_t worker_id = static_cast<uint32_t>(worker_rank);
   HierarchyKVCacheTransfer::Options transfer_options;
   transfer_options.tp_rank(worker_id % tp_size)
       .tp_size(tp_size)
+      .kv_split_size(parallel_args.kv_split_size_effective())
+      .kv_split_rank(parallel_args.kv_split_rank())
       .layers(context_.get_model_args().n_layers())
       .host_blocks_factor(options_.host_blocks_factor())
       .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())

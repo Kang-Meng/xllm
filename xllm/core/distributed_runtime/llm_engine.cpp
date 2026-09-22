@@ -903,6 +903,8 @@ void LLMEngine::prefetch_from_storage(
     std::shared_ptr<const StoragePrefetchRequest> request,
     PrefetchResult::StopPredicate stop_requested,
     PrefetchResult::DoneCallback done) {
+  CHECK_LT(dp_rank, dp_size_);
+  CHECK_GT(dp_local_size_, 0U);
   CHECK(request != nullptr);
   CHECK(request->valid());
   const uint32_t configured_timeout_ms = options_.prefetch_timeout();
@@ -910,14 +912,14 @@ void LLMEngine::prefetch_from_storage(
                                  ? -1
                                  : static_cast<int64_t>(configured_timeout_ms);
   auto result =
-      std::make_shared<PrefetchResult>(dp_local_tp_size_,
+      std::make_shared<PrefetchResult>(dp_local_size_,
                                        request->batch_end_unit_offsets,
                                        timeout_ms,
                                        std::move(stop_requested),
                                        std::move(done));
-  for (uint32_t tp_rank = 0; tp_rank < dp_local_tp_size_; ++tp_rank) {
-    worker_clients_[tp_rank + dp_local_tp_size_ * dp_rank]
-        ->prefetch_from_storage(request, result, tp_rank);
+  for (uint32_t local_rank = 0; local_rank < dp_local_size_; ++local_rank) {
+    worker_clients_[local_rank + dp_local_size_ * dp_rank]
+        ->prefetch_from_storage(request, result, local_rank);
   }
 }
 

@@ -48,6 +48,8 @@ struct KVCacheStoreInitConfig {
   int32_t replica_num = 1;
   uint32_t tp_rank = 0;
   uint32_t tp_size = 1;
+  int32_t kv_split_size = 1;
+  int32_t kv_split_rank = 0;
   bool enable_mla = false;
 };
 

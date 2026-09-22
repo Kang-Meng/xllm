@@ -184,7 +184,16 @@ struct ParallelArgs {
       return dcp_group_->rank();
     }
 
-    return rank_ / (world_size_ / kv);
+    CHECK_GT(world_size_, 0);
+    CHECK_GT(dp_size_, 0);
+    CHECK_GE(rank_, 0);
+    CHECK_LT(rank_, world_size_);
+    CHECK_EQ(world_size_ % dp_size_, 0);
+    const int32_t dp_local_size = world_size_ / dp_size_;
+    CHECK_LE(kv, dp_local_size);
+    CHECK_EQ(dp_local_size % kv, 0);
+    const int32_t dp_local_rank = rank_ % dp_local_size;
+    return dp_local_rank / (dp_local_size / kv);
   }
 
   // tp size

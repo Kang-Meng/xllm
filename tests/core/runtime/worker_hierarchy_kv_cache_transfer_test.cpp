@@ -14,9 +14,16 @@ limitations under the License.
 ==============================================================================*/
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <iterator>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "core/framework/kv_cache/kv_cache_capacity.h"
@@ -301,6 +308,135 @@ TEST_F(WorkerHierarchyKVCacheTransferTest,
     EXPECT_EQ(prepared.token_ids.numel(), 1);
     EXPECT_TRUE(prepared.input_params.num_accepted_tokens_host.empty());
     EXPECT_FALSE(prepared.input_params.num_accepted_tokens.defined());
+  }
+}
+
+TEST_F(WorkerHierarchyKVCacheTransferTest,
+       RestoresParallelShardsAndDraftFromFreshHostCaches) {
+  const char* master = std::getenv("XLLM_TEST_STORE_MASTER");
+  if (master == nullptr) {
+    GTEST_SKIP() << "Set XLLM_TEST_STORE_MASTER to a local TCP Mooncake Store.";
+  }
+  struct SplitCase {
+    int32_t size;
+    bool draft;
+    std::array<int32_t, 8> values;
+  };
+  const std::vector<SplitCase> cases = {{0, true, {1, 1, 2, 2, 3, 3, 4, 4}},
+                                        {1, false, {1, 1, 1, 1, 1, 1, 1, 1}},
+                                        {2, false, {1, 1, 1, 1, 2, 2, 2, 2}},
+                                        {4, true, {1, 1, 2, 2, 3, 3, 4, 4}},
+                                        {8, true, {1, 2, 3, 4, 5, 6, 7, 8}}};
+  const ModelArgs model_args = make_model_args();
+  const KVCacheShape shape = make_cache_shape(model_args);
+  const KVCacheCreateOptions create_options =
+      make_create_options(device_->unwrap());
+  std::unique_ptr<Stream> stream = device_->current_stream();
+  for (const SplitCase& topology : cases) {
+    runtime::Options options = make_runtime_options(/*host_blocks_factor=*/2.0);
+    options.world_size(8)
+        .cp_size(4)
+        .enable_mla(true)
+        .enable_kvcache_store(true)
+        .store_protocol("tcp")
+        .store_metadata_server("P2PHANDSHAKE")
+        .store_master_server_address(master)
+        .store_local_hostname("127.0.0.1:25100")
+        .model_id("worker-split-test:" + std::to_string(getpid()) + ":" +
+                  std::to_string(topology.size));
+    const auto round_trip = [&](int32_t rank,
+                                bool restore,
+                                bool missing_draft = false) {
+      SCOPED_TRACE(::testing::Message() << "size=" << topology.size << " rank="
+                                        << rank << " restore=" << restore);
+      ParallelArgs args(rank,
+                        /*world_size=*/8,
+                        /*dp_size=*/1,
+                        /*cp_size=*/4,
+                        /*process_group=*/nullptr,
+                        /*ep_size=*/8);
+      args.kv_split_size(topology.size);
+      TestHierarchyWorker worker(args, device_->unwrap(), options, model_args);
+      std::vector<KVCache> target;
+      std::vector<KVCache> draft;
+      allocate_kv_caches(target, shape, create_options);
+      allocate_kv_caches(draft, shape, create_options);
+      const int32_t value = topology.values[rank];
+      target.front().get_k_cache().fill_(restore ? 0 : value);
+      target.front().get_v_cache().fill_(restore ? 0 : value + 10);
+      draft.front().get_k_cache().fill_(restore ? 0 : value + 20);
+      draft.front().get_v_cache().fill_(restore ? 0 : value + 30);
+      ASSERT_EQ(device_->synchronize_default_stream(), 0);
+      auto transfer = worker.create_hierarchy_kv_cache_transfer();
+      const auto register_cache = [&](std::vector<KVCache>& caches,
+                                      HierarchyKVCacheTransfer::CacheRole role,
+                                      const std::string& component) {
+        HierarchyKVCacheTransfer::CacheRegistration registration;
+        registration.role = role;
+        registration.device_kv_caches = &caches;
+        registration.kv_cache_shape = shape;
+        registration.create_options = create_options;
+        registration.producer_stream = stream.get();
+        registration.store_key_component = component;
+        transfer->register_cache(std::move(registration));
+      };
+      register_cache(
+          target, HierarchyKVCacheTransfer::CacheRole::TARGET, "main");
+      if (topology.draft) {
+        register_cache(draft,
+                       HierarchyKVCacheTransfer::CacheRole::DRAFT,
+                       missing_draft ? "missing-draft" : "draft");
+      }
+      ASSERT_TRUE(transfer->finalize_registration());
+      BlockTransferInfo info(/*src_block_id=*/0, /*dst_block_id=*/0);
+      std::fill(std::begin(info.hash_key), std::end(info.hash_key), 93);
+      info.transfer_type = TransferType::D2H2G;
+      if (!restore) {
+        ASSERT_EQ(transfer->transfer_kv_blocks(/*batch_id=*/1, {info}), 1U);
+        return;
+      }
+      info.transfer_type = TransferType::G2H;
+      std::vector<BlockTransferInfo> infos = {info};
+      Slice<BlockTransferInfo> slice(infos);
+      if (missing_draft) {
+        EXPECT_EQ(transfer->prefetch_kv_blocks(slice),
+                  std::vector<uint8_t>({0}));
+        return;
+      }
+      ASSERT_EQ(transfer->prefetch_kv_blocks(slice), std::vector<uint8_t>({1}));
+      info.transfer_type = TransferType::H2D;
+      info.dst_block_id = 1;
+      ASSERT_EQ(transfer->transfer_kv_blocks(/*batch_id=*/2, {info}), 1U);
+      ModelInputParams params;
+      params.meta.batch_id = 2;
+      params.meta.requires_host_restore = true;
+      transfer->set_layer_synchronizer(params);
+      ASSERT_TRUE(params.synchronize_layer(/*layer_id=*/0));
+      EXPECT_TRUE(torch::equal(
+          target.front().get_k_cache()[1],
+          torch::full_like(target.front().get_k_cache()[1], value)));
+      EXPECT_TRUE(torch::equal(
+          target.front().get_v_cache()[1],
+          torch::full_like(target.front().get_v_cache()[1], value + 10)));
+      if (topology.draft) {
+        ASSERT_TRUE(params.synchronize_draft_layer());
+        EXPECT_TRUE(torch::equal(
+            draft.front().get_k_cache()[1],
+            torch::full_like(draft.front().get_k_cache()[1], value + 20)));
+        EXPECT_TRUE(torch::equal(
+            draft.front().get_v_cache()[1],
+            torch::full_like(draft.front().get_v_cache()[1], value + 30)));
+      }
+    };
+    for (int32_t rank = 0; rank < 8; ++rank) {
+      round_trip(rank, /*restore=*/false);
+    }
+    for (int32_t rank = 0; rank < 8; ++rank) {
+      round_trip(rank, /*restore=*/true);
+    }
+    if (topology.draft) {
+      round_trip(/*rank=*/7, /*restore=*/true, /*missing_draft=*/true);
+    }
   }
 }
 

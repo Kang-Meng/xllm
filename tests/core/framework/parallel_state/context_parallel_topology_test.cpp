@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <vector>
 
+#include "core/framework/parallel_state/parallel_args.h"
+
 namespace xllm::parallel_state {
 namespace {
 
@@ -65,6 +67,48 @@ TEST(ContextParallelTopologyTest, PartitionsFactorDcpInsidePcpGroup) {
   EXPECT_EQ(
       second_dp_partition.dcp_group_ranks()[second_dp_partition.dcp_rank()],
       13);
+}
+
+TEST(ContextParallelTopologyTest, ParallelArgsFallbackUsesDpLocalDcpRank) {
+  constexpr int32_t kWorldSize = 16;
+  constexpr int32_t kDpSize = 2;
+  constexpr int32_t kCpSize = 4;
+  constexpr int32_t kKvSplitSize = 2;
+
+  for (int32_t rank = 0; rank < kWorldSize; ++rank) {
+    xllm::ParallelArgs args(rank,
+                            kWorldSize,
+                            kDpSize,
+                            kCpSize,
+                            nullptr,
+                            /*ep_size=*/kWorldSize);
+    args.kv_split_size(kKvSplitSize);
+
+    const ContextParallelTopology topology(
+        rank, kWorldSize, kDpSize, kCpSize, kKvSplitSize);
+    EXPECT_EQ(args.kv_split_rank(), topology.dcp_rank()) << "rank=" << rank;
+  }
+}
+
+TEST(ContextParallelTopologyTest, ParallelArgsFallbackHandlesTpOnlyDcp) {
+  constexpr int32_t kWorldSize = 16;
+  constexpr int32_t kDpSize = 2;
+  constexpr int32_t kCpSize = 1;
+  constexpr int32_t kKvSplitSize = 8;
+
+  const std::vector<int32_t> expected_ranks = {
+      0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7};
+  for (int32_t rank = 0; rank < kWorldSize; ++rank) {
+    xllm::ParallelArgs args(rank,
+                            kWorldSize,
+                            kDpSize,
+                            kCpSize,
+                            nullptr,
+                            /*ep_size=*/kWorldSize);
+    args.kv_split_size(kKvSplitSize);
+
+    EXPECT_EQ(args.kv_split_rank(), expected_ranks[rank]) << "rank=" << rank;
+  }
 }
 
 TEST(ContextParallelTopologyTest, SupportsPcpBoundaryDcpLayouts) {
