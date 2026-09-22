@@ -31,6 +31,34 @@ from xllm.python.layers.qlinear import QLinearWeightLoader
 from xllm.python.models import glm5_next
 
 
+@pytest.fixture(autouse=True)
+def _cpu_hc_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide deterministic CPU substitutes for the NPU-only mHC kernels."""
+
+    def hc_pre_fused(
+        hidden: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        hc_mult: int,
+        iterations: int,
+        norm_eps: float,
+        hc_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del fn, scale, base, iterations, norm_eps, hc_eps
+        post = hidden.new_ones((*hidden.shape[:-2], hc_mult))
+        comb = torch.eye(hc_mult, dtype=hidden.dtype, device=hidden.device).expand(*hidden.shape[:-2], hc_mult, hc_mult)
+        return hidden.mean(dim=-2), post, comb
+
+    def hc_post(output: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+        return post.to(output.dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(
+            comb.to(output.dtype).transpose(-1, -2), residual
+        )
+
+    monkeypatch.setattr(glm5_next.kernels, "hc_pre_fused", hc_pre_fused, raising=False)
+    monkeypatch.setattr(glm5_next.kernels, "hc_post", hc_post, raising=False)
+
+
 def _config(world: int = 2, rank: int = 0, **kwargs: object) -> glm5_next.Glm5NextConfig:
     values = dict(
         hidden_size=8,
@@ -415,7 +443,9 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.uniform_(-0.1, 0.1)
-    monkeypatch.setattr(glm5_next, "_has_mhc_fused", False)
+    for layer in model.layers:
+        layer.attn_hc.process_weights_after_loading()
+        layer.ffn_hc.process_weights_after_loading()
     monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: None)
     monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
     incoming, normalized, local_attention = {}, {}, {}

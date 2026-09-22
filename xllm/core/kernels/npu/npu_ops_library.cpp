@@ -900,6 +900,10 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "hc_post(Tensor x, Tensor residual, Tensor post, Tensor comb) -> "
       "Tensor");
+  m.def(
+      "hc_pre_fused(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "int hc_mult, int hc_sinkhorn_iters, float norm_eps, float hc_eps) "
+      "-> (Tensor, Tensor, Tensor)");
   // Compressor: NSA-style KV pooling. kv_state/score_state are in-place (Ref).
   // Returns (cmp_kv, wkv_proj, softmax_res, norm_x, norm_rstd).
   m.def(
@@ -990,6 +994,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("dequant_swiglu_quant",
          TORCH_FN(xllm::kernel::npu::dequant_swiglu_quant));
   m.impl("hc_pre", TORCH_FN(xllm::kernel::npu::hc_pre));
+  m.impl("hc_pre_fused", TORCH_FN(xllm::kernel::npu::hc_pre_fused));
   m.impl("hc_post", TORCH_FN(xllm::kernel::npu::hc_post));
   m.impl("compressor", TORCH_FN(xllm::kernel::npu::compressor));
   m.impl("sparse_attn_sharedkv",

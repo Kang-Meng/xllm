@@ -32,6 +32,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "core/kernels/xllm_torch_ops.h"
@@ -400,6 +401,7 @@ device_ops = (
     "moe_gating_top_k_hash",
     "dequant_swiglu_quant",
     "hc_pre",
+    "hc_pre_fused",
     "hc_post",
     "compressor",
     "mega_moe",
@@ -422,6 +424,56 @@ for op_name in (
     assert torch._C._dispatch_has_kernel_for_dispatch_key(
         f"xllm_ops::{op_name}", "CompositeExplicitAutograd"
     ), op_name
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, FusedHcPreMatchesUniformReferenceAndGraph) {
+  if (kernel::npu::aclnn::detail::get_op_api_func_addr("aclnnHcPre") ==
+          nullptr ||
+      kernel::npu::aclnn::detail::get_op_api_func_addr(
+          "aclnnHcPreGetWorkspaceSize") == nullptr) {
+    GTEST_SKIP() << "The optional HcPre vendor is not available.";
+  }
+  py::gil_scoped_acquire gil;
+  py::exec(R"PY(
+import torch
+
+def run_hc_pre(hidden: torch.Tensor, weight: torch.Tensor,
+               scale: torch.Tensor, base: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    return torch.ops.xllm_ops.hc_pre_fused(hidden, weight, scale, base, 4, 20, 1e-5, 1e-6)
+
+with torch.inference_mode():
+    weight = torch.zeros((24, 16384), dtype=torch.float32, device="npu")
+    scale = torch.ones(3, dtype=torch.float32, device="npu")
+    base = torch.zeros(24, dtype=torch.float32, device="npu")
+    for shape in ((2, 4, 4096), (1, 4, 4, 4096)):
+        hidden = torch.full(shape, 2, dtype=torch.bfloat16, device="npu")
+        collapsed, post, combination = run_hc_pre(hidden, weight, scale, base)
+        assert collapsed.shape == (*shape[:-2], shape[-1])
+        assert post.shape == shape[:-1]
+        assert combination.shape == (*shape[:-1], 4)
+        assert collapsed.dtype == torch.bfloat16
+        assert post.dtype == combination.dtype == torch.float32
+        torch.testing.assert_close(collapsed.cpu(), torch.full(collapsed.shape, 4, dtype=torch.bfloat16))
+        torch.testing.assert_close(post.cpu(), torch.ones(post.shape))
+        torch.testing.assert_close(combination.cpu(), torch.full(combination.shape, 0.25), rtol=1e-5, atol=1e-6)
+        stream = torch.npu.Stream()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.stream(stream):
+            run_hc_pre(hidden, weight, scale, base)
+        torch.npu.synchronize()
+        with torch.npu.graph(graph, stream=stream):
+            captured = run_hc_pre(hidden, weight, scale, base)
+        torch.npu.synchronize()
+        with torch.npu.stream(stream):
+            hidden.fill_(3)
+            base.fill_(0.25)
+            graph.replay()
+        torch.npu.synchronize()
+        expected = run_hc_pre(hidden, weight, scale, base)
+        for actual, reference in zip(captured, expected, strict=True):
+            torch.testing.assert_close(actual.cpu(), reference.cpu(), rtol=0, atol=0)
+        base.zero_()
 )PY");
 }
 

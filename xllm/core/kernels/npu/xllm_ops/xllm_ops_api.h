@@ -256,6 +256,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre(
     double norm_eps,
     double hc_eps);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre_fused(
+    const torch::Tensor& hidden,
+    const torch::Tensor& hc_fn,
+    const torch::Tensor& hc_scale,
+    const torch::Tensor& hc_base,
+    int64_t hc_mult,
+    int64_t hc_sinkhorn_iters,
+    double norm_eps,
+    double hc_eps);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     const at::Tensor& x,
     int64_t k,

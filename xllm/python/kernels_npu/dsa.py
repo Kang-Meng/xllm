@@ -43,6 +43,22 @@ def hc_pre(
     return torch.ops.xllm_ops.hc_pre(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps)
 
 
+def hc_pre_fused(
+    hidden: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    hc_sinkhorn_iters: int,
+    norm_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the complete HcPre operator with prepared FP32 parameters."""
+    return torch.ops.xllm_ops.hc_pre_fused(
+        hidden, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps
+    )
+
+
 def hc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
