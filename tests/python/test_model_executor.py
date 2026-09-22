@@ -679,6 +679,43 @@ class TestModelExecutorConstruction:
 
         assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is True
 
+    @pytest.mark.parametrize(
+        ("model_type", "degree", "ep_size", "expected"),
+        [
+            ("glm5_next", 2, 8, True),
+            ("glm5_next_text", 2, 2, True),
+            ("glm5_next", 1, 8, False),
+            ("glm5_next", 0, 1, False),
+            ("qwen3_5_moe", 2, 8, False),
+        ],
+    )
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_acl_graph_glm_eplv2_uses_typed_metadata_builder_without_megamoe(
+        self, mock_create, mock_graph_runner, model_type, degree, ep_size, expected
+    ):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+        executor = ModelExecutor(
+            model,
+            {
+                "model_type": model_type,
+                "expert_parallel_degree": degree,
+                "ep_size": ep_size,
+                "enable_mega_moe": False,
+                "max_position_embeddings": 128,
+                "python_graph_backend": "aclgraph",
+            },
+            max_seqs_per_batch=16,
+            acl_graph_decode_batch_size_limit=16,
+        )
+        assert bool(executor._execution_metadata_builders) is expected
+        assert bool(executor.eager_runner.execution_metadata_builders) is expected
+        mock_graph_runner.return_value.bind_execution_metadata_builders.assert_called_once_with(
+            executor.eager_runner.execution_metadata_builders
+        )
+        assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is False
+
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor.get_execution_metadata_builder_classes")
     @patch("xllm.python.model_executor.executor._create_attention_backend")

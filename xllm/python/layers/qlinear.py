@@ -161,7 +161,7 @@ class QLinearWeightLoader:
                 t = self.shard(t, dim=dim)
             self.copy_in(f"{qlinear_name}._w8a8.{suffix}", t)
 
-    def load_w8a8_mlp_into_qlinear(self, mlp_pfx: str) -> None:
+    def load_w8a8_mlp_into_qlinear(self, mlp_pfx: str, *, world: int | None = None, rank: int | None = None) -> None:
         """Load dynamic W8A8 MLP tensors into the QLinear-wrapped ``_w8a8``.
 
         Cats gate+up on dim 0 and shards down on dim 1, but writes into
@@ -175,15 +175,19 @@ class QLinearWeightLoader:
         self.copy_in(
             mlp_pfx + "gate_up_proj._w8a8.weight",
             torch.cat(
-                [self.shard(self.load_tensor(g + "weight"), 0), self.shard(self.load_tensor(u + "weight"), 0)], dim=0
+                [
+                    self.shard(self.load_tensor(g + "weight"), 0, world, rank),
+                    self.shard(self.load_tensor(u + "weight"), 0, world, rank),
+                ],
+                dim=0,
             ).contiguous(),
         )
         self.copy_in(
             mlp_pfx + "gate_up_proj._w8a8.weight_scale",
             torch.cat(
                 [
-                    self.shard(self.load_tensor(g + "weight_scale"), 0),
-                    self.shard(self.load_tensor(u + "weight_scale"), 0),
+                    self.shard(self.load_tensor(g + "weight_scale"), 0, world, rank),
+                    self.shard(self.load_tensor(u + "weight_scale"), 0, world, rank),
                 ],
                 dim=0,
             ).contiguous(),
@@ -192,12 +196,12 @@ class QLinearWeightLoader:
             mlp_pfx + "gate_up_proj._w8a8.weight_offset",
             torch.cat(
                 [
-                    self.shard(self.load_tensor(g + "weight_offset"), 0),
-                    self.shard(self.load_tensor(u + "weight_offset"), 0),
+                    self.shard(self.load_tensor(g + "weight_offset"), 0, world, rank),
+                    self.shard(self.load_tensor(u + "weight_offset"), 0, world, rank),
                 ],
                 dim=0,
             ).contiguous(),
         )
-        self.copy_in(mlp_pfx + "down_proj._w8a8.weight", self.shard(self.load_tensor(d + "weight"), dim=1))
+        self.copy_in(mlp_pfx + "down_proj._w8a8.weight", self.shard(self.load_tensor(d + "weight"), 1, world, rank))
         self.copy_in(mlp_pfx + "down_proj._w8a8.weight_scale", self.load_tensor(d + "weight_scale"))
         self.copy_in(mlp_pfx + "down_proj._w8a8.weight_offset", self.load_tensor(d + "weight_offset"))

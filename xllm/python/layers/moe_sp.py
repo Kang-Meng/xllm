@@ -12,18 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility imports for the former DP MoE helper module."""
+"""Compatibility imports for the former token-parallel helper module."""
 
-from xllm.python.layers.moe_parallel import (
-    _NO_SCATTER,
-    DpScatterState,
-    dp_gather_tokens,
-    reduce_and_scatter,
-)
+from xllm.python.layers.moe_parallel import TokenParallelLayout
 
-__all__ = [
-    "DpScatterState",
-    "dp_gather_tokens",
-    "reduce_and_scatter",
-    "_NO_SCATTER",
-]
+__all__ = ["TokenParallelLayout"]

@@ -321,6 +321,32 @@ def moe_ep_all_reduce(x: torch.Tensor) -> None:
     all_reduce_(x, "moe_ep")
 
 
+def moe_ep_hccl_info(device: torch.device | str) -> tuple[str, int, int]:
+    """Return the initialized expert group's HCCL name, rank and size."""
+    device_obj = torch.device(device)
+    group = _groups.get(("moe_ep", str(device_obj)))
+    if group is None:
+        raise RuntimeError(f"MoE EP dispatch requires an initialized process group for {device_obj}")
+    rank, world_size = group.rank(), group.size()
+    if world_size <= 1 or not 0 <= rank < world_size:
+        raise RuntimeError(f"MoE EP dispatch requires an initialized multi-rank group: rank {rank}/{world_size}")
+    get_comm_name = getattr(group._get_backend(device_obj), "get_hccl_comm_name", None)
+    if get_comm_name is None:
+        raise RuntimeError("MoE EP dispatch requires an HCCL process group")
+    comm_name = get_comm_name(rank)
+    if not isinstance(comm_name, str) or not comm_name:
+        raise RuntimeError("MoE EP dispatch requires a nonempty HCCL communication name")
+    return comm_name, rank, world_size
+
+
+def moe_ep_group(device: torch.device | str) -> ProcessGroup:
+    """Return the existing EP group without creating a second communicator."""
+    group = _groups.get(("moe_ep", str(torch.device(device))))
+    if group is None:
+        raise RuntimeError(f"MoE EP group is not initialized for {device}")
+    return group
+
+
 def dcp_group(device: torch.device | str) -> ProcessGroup | None:
     return _groups.get(("dcp", str(torch.device(device))))
 
@@ -409,6 +435,10 @@ def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp
     group = _require_group(x, group_name)
     if group.size() != world_size:
         raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    if dim == 0:
+        output = x.new_empty((x.shape[0] * world_size, *x.shape[1:]))
+        dist.all_gather_into_tensor(output, x.contiguous(), group=group)
+        return output
     chunks = [torch.empty_like(x) for _ in range(world_size)]
     dist.all_gather(chunks, x, group=group)
     return torch.cat(chunks, dim=dim)
@@ -419,6 +449,31 @@ def _(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> tor
     shape = list(x.shape)
     shape[dim] *= world_size
     return x.new_empty(shape)
+
+
+def _reduce_scatter_shape(x: torch.Tensor, world_size: int) -> tuple[int, ...]:
+    if world_size <= 0 or x.ndim == 0 or x.shape[0] <= 0 or x.shape[0] % world_size:
+        raise ValueError("reduce_scatter requires a positive world size dividing nonempty input rows")
+    return (x.shape[0] // world_size, *x.shape[1:])
+
+
+@torch.library.custom_op("xllm_ops::reduce_scatter", mutates_args=())
+def reduce_scatter(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    """Reduce full-hidden partials directly into disjoint contiguous token rows."""
+    shape = _reduce_scatter_shape(x, world_size)
+    if world_size == 1:
+        return x.clone()
+    group = _require_group(x, group_name)
+    if group.size() != world_size:
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    output = x.new_empty(shape)
+    dist.reduce_scatter_tensor(output, x.contiguous(), group=group)
+    return output
+
+
+@reduce_scatter.register_fake
+def _reduce_scatter_fake(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    return x.new_empty(_reduce_scatter_shape(x, world_size))
 
 
 @torch.library.custom_op("xllm_ops::all_gather_variable", mutates_args=())
@@ -503,6 +558,7 @@ __all__ = [
     "all_reduce_",
     "broadcast_",
     "all_gather",
+    "reduce_scatter",
     "all_gather_variable",
     "dp_all_gather",
     "gather_dp_execution_tokens",

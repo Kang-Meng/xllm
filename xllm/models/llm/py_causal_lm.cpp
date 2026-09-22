@@ -413,8 +413,13 @@ py::dict PyCausalLM::build_config_dict(
           : ExecutionConfig::get_instance().python_graph_backend();
 #if defined(USE_NPU)
   d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
+  const auto& eplb_config = EPLBConfig::get_instance();
+  if (model_args_.model_type() == "glm5_next" ||
+      model_args_.model_type() == "glm5_next_text") {
+    d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
+    d["enable_eplb"] = eplb_config.enable_eplb();
+  }
   if (mega_moe_comm_resource_ != nullptr) {
-    const auto& eplb_config = EPLBConfig::get_instance();
     d["enable_mega_moe"] = true;
     d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
     d["enable_eplb"] = eplb_config.enable_eplb();

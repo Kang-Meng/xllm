@@ -195,6 +195,13 @@ def _register_builtin_models() -> None:
         "xllm.python.models.glm5_next",
         "Glm5NextForCausalLM",
         "glm5_next",
+        "glm5_next_text",
+        execution_metadata_builders=(
+            (
+                "xllm.python.layers.npu.glm5_next_metadata",
+                "Glm5NextEplv2MetadataBuilder",
+            ),
+        ),
     )
     # Internal key selected by the typed C++ LLM/VLM bridge.
     _register_model_path(

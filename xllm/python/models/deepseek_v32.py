@@ -49,18 +49,7 @@ from xllm.python.models.weight_utils import (
     mla_head_split,
     moe_shard,
 )
-
-_SHARED_EXPERT_STREAMS: dict[tuple[str, int | None], torch.npu.Stream] = {}
-
-
-def _shared_expert_stream(device: torch.device) -> torch.npu.Stream:
-    key = (device.type, device.index)
-    stream = _SHARED_EXPERT_STREAMS.get(key)
-    if stream is None:
-        stream = torch.npu.Stream(device=device)
-        _SHARED_EXPERT_STREAMS[key] = stream
-    return stream
-
+from xllm.python.npu_streams import shared_expert_stream
 
 _GATE_STREAMS: dict[tuple[str, int | None], torch.npu.Stream] = {}
 
@@ -1407,7 +1396,7 @@ class DeepseekV3MoE(nn.Module):
 
     def _forward_parallel(self, hidden: torch.Tensor, use_mega_moe: bool) -> torch.Tensor:
         self._ensure_expert_parallel_resources()
-        shared_stream = _shared_expert_stream(hidden.device)
+        shared_stream = shared_expert_stream(hidden.device)
         start_event = self._shared_expert_start_event
         shared_done_event = self._shared_expert_done_event
         assert start_event is not None
@@ -1464,7 +1453,7 @@ class DeepseekV3MoE(nn.Module):
 
     def _forward_fine_grained_parallel(self, hidden: torch.Tensor, use_mega_moe: bool) -> torch.Tensor:
         self._ensure_expert_parallel_resources()
-        shared_stream = _shared_expert_stream(hidden.device)
+        shared_stream = shared_expert_stream(hidden.device)
         gate_stream = _gate_stream(hidden.device)
         current_stream = torch.npu.current_stream()
 

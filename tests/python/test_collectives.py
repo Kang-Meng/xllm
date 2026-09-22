@@ -50,6 +50,38 @@ class _FakeGroup:
         return self._size
 
 
+def test_moe_ep_hccl_info_uses_existing_group() -> None:
+    queried = []
+    backend = SimpleNamespace(get_hccl_comm_name=lambda rank: queried.append(rank) or "ep_test_group")
+    group = SimpleNamespace(rank=lambda: 1, size=lambda: 2, _get_backend=lambda device: backend)
+    collectives._groups[("moe_ep", "cpu")] = group
+    assert collectives.moe_ep_hccl_info("cpu") == ("ep_test_group", 1, 2)
+    assert queried == [1]
+
+
+def test_moe_ep_hccl_info_rejects_missing_group() -> None:
+    with pytest.raises(RuntimeError, match="initialized process group"):
+        collectives.moe_ep_hccl_info("cpu")
+
+
+@pytest.mark.parametrize("comm_name", ["", None, 1])
+def test_moe_ep_hccl_info_rejects_invalid_name(comm_name: object) -> None:
+    backend = SimpleNamespace(get_hccl_comm_name=lambda rank: comm_name)
+    collectives._groups[("moe_ep", "cpu")] = SimpleNamespace(
+        rank=lambda: 0, size=lambda: 2, _get_backend=lambda device: backend
+    )
+    with pytest.raises(RuntimeError, match="nonempty HCCL"):
+        collectives.moe_ep_hccl_info("cpu")
+
+
+def test_moe_ep_hccl_info_rejects_non_hccl_group() -> None:
+    collectives._groups[("moe_ep", "cpu")] = SimpleNamespace(
+        rank=lambda: 0, size=lambda: 2, _get_backend=lambda device: object()
+    )
+    with pytest.raises(RuntimeError, match="HCCL process group"):
+        collectives.moe_ep_hccl_info("cpu")
+
+
 @pytest.fixture(autouse=True)
 def _clear_collective_state():
     def reset():
@@ -426,3 +458,54 @@ def test_symmetric_buffer_accepts_supported_dtype(monkeypatch, dtype):
     assert collectives._symm_buffer(group, group_name, tensor) is buffer
     empty.assert_called_once_with(8, dtype=dtype, device=device)
     rendezvous.assert_called_once_with(buffer, "tp-group")
+
+
+def test_row_all_gather_uses_one_contiguous_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    group = _FakeGroup(0, 2)
+    collectives._groups[("tp", "cpu")] = group
+    value = torch.arange(24, dtype=torch.float64).reshape(4, 6)[:, ::2]
+    calls = []
+
+    def gather(output: torch.Tensor, source: torch.Tensor, *, group: object) -> None:
+        assert source.is_contiguous()
+        calls.append(output.data_ptr())
+        output.copy_(torch.cat((source, source + 1)))
+
+    monkeypatch.setattr(dist, "all_gather_into_tensor", gather)
+    old = MagicMock(side_effect=AssertionError("row gather must not allocate a tensor list"))
+    monkeypatch.setattr(dist, "all_gather", old)
+    result = collectives.all_gather(value, 0, 2)
+    torch.testing.assert_close(result, torch.cat((value, value + 1)))
+    assert len(calls) == 1 and result.is_contiguous()
+    old.assert_not_called()
+
+
+def test_reduce_scatter_uses_sum_and_local_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    group = _FakeGroup(1, 2)
+    collectives._groups[("moe_ep", "cpu")] = group
+    value = torch.arange(48, dtype=torch.float32).reshape(6, 8)[:, ::2]
+    observed = []
+
+    def reduce(output: torch.Tensor, source: torch.Tensor, *, group: object) -> None:
+        assert source.is_contiguous()
+        observed.append(source.shape)
+        output.copy_((source * 3).chunk(2)[1])
+
+    monkeypatch.setattr(dist, "reduce_scatter_tensor", reduce)
+    result = collectives.reduce_scatter(value, 2, "moe_ep")
+    torch.testing.assert_close(result, value[3:] * 3)
+    assert observed == [value.shape]
+    assert result.shape == collectives._reduce_scatter_fake(value, 2).shape
+
+
+@pytest.mark.parametrize("rows,world", [(3, 2), (0, 2), (4, 0), (4, -1)])
+def test_reduce_scatter_rejects_invalid_row_contract(rows: int, world: int) -> None:
+    with pytest.raises(ValueError, match="nonempty input rows"):
+        collectives.reduce_scatter(torch.zeros(rows, 4), world)
+
+
+def test_reduce_scatter_one_rank_does_not_alias_input() -> None:
+    value = torch.arange(12).reshape(3, 4)
+    actual = collectives.reduce_scatter(value, 1)
+    torch.testing.assert_close(actual, value)
+    assert actual.data_ptr() != value.data_ptr()
