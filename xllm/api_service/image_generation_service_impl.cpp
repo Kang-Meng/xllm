@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <string>
 
+#include "api_service/request_admission.h"
 #include "butil/base64.h"
 #include "common/instance_name.h"
 #include "core/util/binary_payload.h"
@@ -92,18 +93,12 @@ ImageGenerationServiceImpl::ImageGenerationServiceImpl(
 void ImageGenerationServiceImpl::process_async_impl(
     std::shared_ptr<ImageGenerationCall> call) {
   const auto& rpc_request = call->request();
-  // check if model is supported
-  const auto& model = rpc_request.model();
-  if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
-    return;
-  }
-
-  // Check if the request is being rate-limited.
-  if (master_->get_rate_limiter()->is_limited()) {
-    call->finish_with_error(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.");
+  const std::string& model = rpc_request.model();
+  const Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (!admission_status.ok()) {
+    call->finish_with_error(admission_status.code(),
+                            admission_status.message());
     return;
   }
 
@@ -114,7 +109,7 @@ void ImageGenerationServiceImpl::process_async_impl(
                                   BinaryPayload(call->take_request_iobuf()));
 
   auto saved_request_id = request_params.request_id;
-  std::string output_type = request_params.output_type;
+  std::string output_type = request_params.generation_params.output_type;
   // schedule the request
   master_->handle_request(
       std::move(request_params),

@@ -24,6 +24,7 @@ limitations under the License.
 #include <cstring>
 #include <opencv2/opencv.hpp>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "api_service/call.h"
@@ -95,7 +96,7 @@ void encode_wav(const torch::Tensor& samples,
 DiTRequest::DiTRequest(const std::string& request_id,
                        const std::string& x_request_id,
                        const std::string& x_request_time,
-                       const DiTRequestState& state,
+                       DiTRequestState state,
                        const std::string& service_request_id,
                        const std::string& source_xservice_addr,
                        RateLimiter* rate_limiter)
@@ -105,7 +106,7 @@ DiTRequest::DiTRequest(const std::string& request_id,
                   service_request_id,
                   source_xservice_addr,
                   rate_limiter),
-      state_(state) {}
+      state_(std::move(state)) {}
 
 bool DiTRequest::finished() const { return true; }
 
@@ -129,7 +130,7 @@ void DiTRequest::update_connection_status() {
 
 void DiTRequest::handle_forward_output(torch::Tensor output,
                                        torch::Tensor audio_output) {
-  uint32_t output_count = 1;
+  int32_t output_count = 1;
   switch (state_.request_kind()) {
     case DiTRequestKind::kImage:
       output_count = state_.generation_params().num_images_per_prompt;
@@ -142,7 +143,7 @@ void DiTRequest::handle_forward_output(torch::Tensor output,
     case DiTRequestKind::kText:
       LOG(FATAL) << "Text request must not contain tensor output";
   }
-  output_.tensors = torch::chunk(output, static_cast<int32_t>(output_count));
+  output_.tensors = torch::chunk(output, output_count);
   if (audio_output.defined()) {
     output_.audio_tensors = torch::chunk(
         audio_output, static_cast<int32_t>(output_.tensors.size()));

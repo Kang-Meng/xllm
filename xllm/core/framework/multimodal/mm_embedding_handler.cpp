@@ -22,7 +22,6 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/util/hash_util.h"
@@ -34,51 +33,20 @@ namespace xllm {
 namespace {
 
 bool parse_tensor(const xllm::proto::Tensor& in_tensor,
-                  MMPayload& payload,
+                  const BinaryPayload& payload,
                   torch::Tensor& out_tensor) {
-  const auto& params = in_tensor.parameters();
-  auto it = params.find("is_binary");
-  bool is_binary = (it != params.end() && it->second.bool_param());
-
-  if (!is_binary) {
-    out_tensor = util::proto_to_torch(in_tensor);
-    return out_tensor.defined();
-  }
-
-  auto len_it = params.find("len");
-
-  if (len_it == params.end()) {
-    return false;
-  }
-
-  const int64_t offset = 0;
-  const int64_t byte_len = len_it->second.int64_param();
-
-  std::string binary_payload;
-  if (!payload.get(binary_payload, byte_len)) {
-    return false;
-  }
-
-  auto dtype = util::datatype_proto_to_torch(in_tensor.datatype());
-
-  std::vector<int64_t> sizes;
-  sizes.reserve(in_tensor.shape_size());
-  for (auto dim : in_tensor.shape()) {
-    sizes.push_back(dim);
-  }
-
-  const char* src = binary_payload.data() + offset;
-
-  out_tensor = torch::from_blob(
-      const_cast<char*>(src), sizes, torch::TensorOptions().dtype(dtype));
-
-  out_tensor = out_tensor.clone();
-
-  return true;
+  const auto& parameters = in_tensor.parameters();
+  const auto binary_it = parameters.find("is_binary");
+  const bool is_binary = binary_it != parameters.end() &&
+                         binary_it->second.has_bool_param() &&
+                         binary_it->second.bool_param();
+  out_tensor = is_binary ? util::proto_to_torch(in_tensor, payload)
+                         : util::proto_to_torch(in_tensor);
+  return out_tensor.defined();
 }
 
 bool parse_embedding_output(const xllm::proto::Embedding& in_embedding_output,
-                            MMPayload& payload,
+                            const BinaryPayload& payload,
                             EmbeddingOutput& out_embedding_output) {
   if (!parse_tensor(in_embedding_output.embedding(),
                     payload,
@@ -109,7 +77,7 @@ MMEmbeddingHandler::MMEmbeddingHandler(MMType::Value mm_type)
 
 MMErrCode MMEmbeddingHandler::load(const MMContent& content,
                                    MMInputItem& input,
-                                   MMPayload& payload) {
+                                   const BinaryPayload& payload) {
   MMInputItem parsed_input;
   parsed_input.type = mm_type_;
   if (!parse_embedding_output(

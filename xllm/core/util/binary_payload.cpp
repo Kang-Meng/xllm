@@ -28,12 +28,47 @@ BinaryPayload::BinaryPayload(std::string_view data) {
   data_.append(data.data(), data.size());
 }
 
+BinaryPayload::BinaryPayload(BinaryPayload&& other) noexcept
+    : data_(other.data_.movable()) {}
+
+BinaryPayload& BinaryPayload::operator=(BinaryPayload&& other) noexcept {
+  if (this != &other) {
+    data_ = other.data_.movable();
+  }
+  return *this;
+}
+
 size_t BinaryPayload::size() const { return data_.size(); }
 
 bool BinaryPayload::empty() const { return data_.empty(); }
 
 bool BinaryPayload::valid_range(size_t offset, size_t length) const {
   return offset <= data_.size() && length <= data_.size() - offset;
+}
+
+std::optional<std::string_view> BinaryPayload::contiguous_view(
+    size_t offset,
+    size_t length) const {
+  if (!valid_range(offset, length)) {
+    return std::nullopt;
+  }
+  if (length == 0) {
+    return std::string_view();
+  }
+
+  size_t remaining_offset = offset;
+  for (size_t index = 0; index < data_.backing_block_num(); ++index) {
+    const butil::StringPiece block = data_.backing_block(index);
+    if (remaining_offset >= block.size()) {
+      remaining_offset -= block.size();
+      continue;
+    }
+    if (length > block.size() - remaining_offset) {
+      return std::nullopt;
+    }
+    return std::string_view(block.data() + remaining_offset, length);
+  }
+  return std::nullopt;
 }
 
 bool BinaryPayload::copy_to(size_t offset, size_t length, void* target) const {

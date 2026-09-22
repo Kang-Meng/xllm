@@ -20,6 +20,7 @@ limitations under the License.
 #include <deque>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "dit_input_sources.h"
@@ -34,6 +35,7 @@ using DiTOutputsFunc = std::function<std::vector<bool>(
 class Call;
 
 enum class DiTRequestKind : int8_t {
+  kNone = -1,
   kImage = 0,
   kAudio = 1,
   kVideo = 2,
@@ -72,6 +74,9 @@ struct DiTGenerationParams {
     return !(*this == other);
   }
 
+  // Response encoding only; excluded from batch equality and worker transport.
+  std::string output_type = "base64";
+
   int32_t width = 512;
 
   int32_t height = 512;
@@ -82,9 +87,9 @@ struct DiTGenerationParams {
 
   float guidance_scale = 3.5;
 
-  uint32_t num_images_per_prompt = 1;
+  int32_t num_images_per_prompt = 1;
 
-  uint32_t num_videos_per_prompt = 1;
+  int32_t num_videos_per_prompt = 1;
 
   // Default seed for image/audio DiT models when the client omits seed (legacy
   // behavior). Cola-DLM uses seed_is_set to distinguish explicit seed=0 from
@@ -159,10 +164,10 @@ struct DiTInputParams {
 
 struct DiTRequestState {
  public:
-  DiTRequestState(DiTInputParams& input_params,
-                  DiTGenerationParams& generation_params,
-                  const DiTOutputFunc& output_func,
-                  const DiTOutputsFunc& outputs_func,
+  DiTRequestState(DiTInputParams input_params,
+                  DiTGenerationParams generation_params,
+                  DiTOutputFunc output_func,
+                  DiTOutputsFunc outputs_func,
                   DiTRequestKind request_kind,
                   std::optional<Call*> call = std::nullopt)
       : input_params_(std::move(input_params)),
@@ -171,7 +176,7 @@ struct DiTRequestState {
         outputs_func_(std::move(outputs_func)),
         request_kind_(request_kind),
         call_(call) {}
-  DiTRequestState() {}
+  DiTRequestState() = default;
   DiTInputParams& input_params() { return input_params_; }
   const DiTInputParams& input_params() const { return input_params_; }
   DiTGenerationParams& generation_params() { return generation_params_; }

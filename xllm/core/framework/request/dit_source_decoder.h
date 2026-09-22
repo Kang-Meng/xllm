@@ -37,6 +37,10 @@ class DiTSourceDecoder final {
   explicit DiTSourceDecoder(const BinaryPayload& request_payload);
 
   bool add_source(const proto::MediaSource& source, Status& status);
+  bool add_source(const proto::MediaSource& source,
+                  std::string name,
+                  std::string modality,
+                  Status& status);
 
   bool add_sources(
       const google::protobuf::RepeatedPtrField<proto::MediaSource>& sources,

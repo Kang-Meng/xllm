@@ -21,6 +21,7 @@ limitations under the License.
 #include <string>
 
 #include "common/instance_name.h"
+#include "core/util/binary_payload.h"
 #include "distributed_runtime/llm_master.h"
 #include "embedding_output_builder.h"
 #include "framework/config/model_config.h"
@@ -181,7 +182,7 @@ void MMEmbeddingServiceImpl::process_async_impl(
 
   auto request_id = request_params.request_id;
 
-  auto payload = call->take_request_payload();
+  BinaryPayload payload(call->take_request_iobuf());
 
   // schedule the request
   master_->handle_request(

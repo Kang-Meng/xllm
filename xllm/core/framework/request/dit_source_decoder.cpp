@@ -16,6 +16,8 @@ limitations under the License.
 #include "framework/request/dit_source_decoder.h"
 
 #include <cstdint>
+#include <optional>
+#include <string_view>
 #include <utility>
 
 #include "butil/base64.h"
@@ -36,20 +38,26 @@ ThreadPool& DiTSourceDecoder::thread_pool() {
 
 bool DiTSourceDecoder::add_source(const proto::MediaSource& source,
                                   Status& status) {
-  Input input;
-  if (source.name().empty() || source.modality().empty()) {
+  return add_source(source, source.name(), source.modality(), status);
+}
+
+bool DiTSourceDecoder::add_source(const proto::MediaSource& source,
+                                  std::string name,
+                                  std::string modality,
+                                  Status& status) {
+  if (name.empty() || modality.empty()) {
     status = Status(StatusCode::INVALID_ARGUMENT,
                     "media source name and modality must not be empty");
     return false;
   }
-  input.name = source.name();
-  input.modality = source.modality();
-  if (source.modality() != "image" && source.modality() != "video" &&
-      source.modality() != "audio") {
+  if (modality != "image" && modality != "video" && modality != "audio") {
     status = Status(StatusCode::INVALID_ARGUMENT,
                     "modality must be image, video, or audio");
     return false;
   }
+  Input input;
+  input.name = std::move(name);
+  input.modality = std::move(modality);
   if (source.type() == "base64") {
     input.encoded_data = source.base64();
   } else if (source.type() == "binary" && source.has_binary()) {
@@ -175,11 +183,18 @@ bool DiTSourceDecoder::decode_inputs(const IndexedDecodeFn& decode_fn,
       }
       raw_bytes = decoded_bytes;
     } else {
-      if (!request_payload_.copy_to(
-              input.binary_offset, input.binary_length, decoded_bytes)) {
-        return;
+      const std::optional<std::string_view> payload_view =
+          request_payload_.contiguous_view(input.binary_offset,
+                                           input.binary_length);
+      if (payload_view.has_value()) {
+        raw_bytes = *payload_view;
+      } else {
+        if (!request_payload_.copy_to(
+                input.binary_offset, input.binary_length, decoded_bytes)) {
+          return;
+        }
+        raw_bytes = decoded_bytes;
       }
-      raw_bytes = decoded_bytes;
     }
     if (decode_fn(index,
                   input.modality,

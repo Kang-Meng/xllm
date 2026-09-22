@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include "api_service/request_admission.h"
 #include "distributed_runtime/dit_master.h"
 #include "framework/request/dit_request_output.h"
 #include "framework/request/dit_request_params.h"
@@ -62,15 +63,11 @@ void TextGenerationServiceImpl::process_async_impl(
     std::shared_ptr<TextGenerationCall> call) {
   const auto& rpc_request = call->request();
   const std::string& model = rpc_request.model();
-  if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
-    return;
-  }
-
-  if (master_->get_rate_limiter()->is_limited()) {
-    call->finish_with_error(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.");
+  const Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (!admission_status.ok()) {
+    call->finish_with_error(admission_status.code(),
+                            admission_status.message());
     return;
   }
 

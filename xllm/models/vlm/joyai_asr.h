@@ -83,7 +83,7 @@ class JoyaiAsrSpeechAdapter final : public SpeechModelInterface {
     MMContentVec contents;
     contents.reserve(context.empty() ? 2 : 3);
     AudioURL audio_url;
-    audio_url.url = "data:" + params.mime_type + ";binary," +
+    audio_url.url = "data:" + params.mime_type + ";binary,0," +
                     std::to_string(params.audio_bytes);
     contents.emplace_back("audio_url", audio_url);
     if (!context.empty()) {

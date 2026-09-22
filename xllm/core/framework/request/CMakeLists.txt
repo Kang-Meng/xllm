@@ -9,6 +9,7 @@ cc_library(
     dit_input_sources.h
     dit_source_decoder.h
     dit_request_params.h
+    dit_request_parser.h
     finish_reason.h
     incremental_decoder.h
     request_base.h
@@ -48,6 +49,7 @@ cc_library(
     request_params.cpp
     sample_slot.cpp
     dit_request_params.cpp
+    dit_request_parser.cpp
     sequence.cpp
     sequence_logprob_state.cpp
     sequence_kv_state.cpp
@@ -65,6 +67,7 @@ cc_library(
     :chat_template
     :chat_template_base
     :multimodal
+    :util
     :json_object_grammar
     glog::glog
     absl::strings

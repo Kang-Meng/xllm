@@ -1,59 +1,74 @@
 #pragma once
-#include <torch/torch.h>
-
-#include <cstdint>
-#include <nlohmann/json.hpp>
-#include <optional>
 #include <string>
-#include <vector>
+#include <variant>
 
 #include "audio_generation.pb.h"
+#include "core/common/types.h"
 #include "core/util/binary_payload.h"
-#include "dit_request_output.h"
 #include "dit_request_state.h"
 #include "image_generation.pb.h"
-#include "request.h"
-#include "tensor.pb.h"
 #include "text_generation.pb.h"
 #include "video_generation.pb.h"
+
 namespace xllm {
 
-struct DiTRequestParams {
-  DiTRequestParams() = default;
+class DiTRequestParser;
+
+using DiTInputProto = std::variant<std::monostate,
+                                   const proto::Input*,
+                                   const proto::AudioInput*,
+                                   const proto::VideoInput*,
+                                   const proto::TextInput*>;
+
+struct DiTRawInputParams {
+  // Non-owning pointer. Online callbacks retain the request until parsing ends.
+  DiTInputProto input;
+  BinaryPayload binary_payload;
+};
+
+class DiTRequestParams final {
+ public:
+  // Offline callers provide prepared input and generation parameters.
+  explicit DiTRequestParams(
+      DiTRequestKind request_kind = DiTRequestKind::kNone);
+
   DiTRequestParams(const proto::ImageGenerationRequest& request,
                    const std::string& x_rid,
                    const std::string& x_rtime,
-                   const BinaryPayload& request_payload = {});
+                   BinaryPayload request_payload = {});
   DiTRequestParams(const proto::AudioGenerationRequest& request,
                    const std::string& x_rid,
                    const std::string& x_rtime,
-                   const BinaryPayload& request_payload = {});
+                   BinaryPayload request_payload = {});
   DiTRequestParams(const proto::VideoGenerationRequest& request,
                    const std::string& x_rid,
                    const std::string& x_rtime,
-                   const BinaryPayload& request_payload = {});
+                   BinaryPayload request_payload = {});
   DiTRequestParams(const proto::TextGenerationRequest& request,
                    const std::string& x_rid,
                    const std::string& x_rtime);
 
-  bool verify_params(DiTOutputCallback callback) const;
+  DiTRequestKind request_kind() const { return request_kind_; }
+
+  bool parse_input_params(Status& status);
+  bool verify_params(Status& status) const;
 
   // request id
   std::string request_id;
   std::string x_request_id;
   std::string x_request_time;
 
-  std::string model;
-
-  DiTRequestKind request_kind = DiTRequestKind::kImage;
-
+  DiTRawInputParams raw_input_params;
   DiTInputParams input_params;
-  // Mandatory: Generation control parameters (encapsulates all fields related
-  // to "image generation process")
+
   DiTGenerationParams generation_params;
 
   Status request_parse_status;
-  std::string output_type = "base64";
+
+ private:
+  DiTRequestKind request_kind_ = DiTRequestKind::kNone;
+  // Non-owning; points to an immutable parser with static lifetime.
+  const DiTRequestParser* parser_ = nullptr;
 };
 
 }  // namespace xllm

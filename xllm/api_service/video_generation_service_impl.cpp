@@ -18,6 +18,7 @@ limitations under the License.
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "api_service/mm_service_utils.h"
+#include "api_service/request_admission.h"
 #include "api_service/utils.h"
 #include "core/framework/request/dit_request_params.h"
 #include "core/util/binary_payload.h"
@@ -82,9 +83,12 @@ VideoGenerationServiceImpl::VideoGenerationServiceImpl(
 void VideoGenerationServiceImpl::process_async_impl(
     std::shared_ptr<VideoGenerationCall> call) {
   const auto& rpc_request = call->request();
-  const auto& model = rpc_request.model();
-  if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+  const std::string& model = rpc_request.model();
+  const Status admission_status = api_service_internal::admit_rpc_request(
+      model, models_, master_->get_rate_limiter());
+  if (!admission_status.ok()) {
+    call->finish_with_error(admission_status.code(),
+                            admission_status.message());
     return;
   }
 
@@ -94,7 +98,7 @@ void VideoGenerationServiceImpl::process_async_impl(
                                   BinaryPayload(call->take_request_iobuf()));
 
   std::string saved_request_id = request_params.request_id;
-  std::string output_type = request_params.output_type;
+  std::string output_type = request_params.generation_params.output_type;
   master_->handle_request(
       std::move(request_params),
       call.get(),

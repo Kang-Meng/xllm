@@ -14,6 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include <absl/cleanup/cleanup.h>
+#include <butil/base64.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
@@ -23,6 +25,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "api_service/embedding_output_builder.h"
@@ -42,6 +45,18 @@ namespace {
 constexpr int32_t kVisionStart = 151652;
 constexpr int32_t kVisionEnd = 151653;
 constexpr int32_t kImageToken = 151655;
+constexpr char kTinyPngBase64[] =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQIHWP4z8AAAAMB"
+    "AQBb2/lEAAAAAElFTkSuQmCC";
+
+const std::string& tiny_png_bytes() {
+  static const std::string bytes = [] {
+    std::string result;
+    CHECK(butil::Base64Decode(kTinyPngBase64, &result));
+    return result;
+  }();
+  return bytes;
+}
 
 EmbeddingOutput make_embedding() {
   EmbeddingOutput output;
@@ -63,7 +78,7 @@ bool load_embedding(const EmbeddingOutput& output,
     return false;
   }
   MMEmbeddingHandler handler(MMType::IMAGE);
-  MMPayload payload(std::move(binary_payload));
+  BinaryPayload payload(binary_payload);
   return handler.process(MMContent("image_embedding", wire), input, payload) ==
          MMErrCode::SUCCESS;
 }
@@ -218,7 +233,7 @@ TEST_F(MMEmbeddingRoundtripTest, RoundTripsPreserveImageKeysAndPrefixHashes) {
       EXPECT_EQ(wire.hash_key(), embedding.hash_key);
       MMInputItem item;
       MMEmbeddingHandler handler(MMType::IMAGE);
-      MMPayload payload(std::move(binary_payload));
+      BinaryPayload payload(binary_payload);
       ASSERT_EQ(
           handler.process(MMContent("image_embedding", wire), item, payload),
           MMErrCode::SUCCESS);
@@ -241,6 +256,107 @@ TEST_F(MMEmbeddingRoundtripTest, RoundTripsPreserveImageKeysAndPrefixHashes) {
                          actual_hashes);
     EXPECT_EQ(actual_hashes, expected_hashes);
   }
+}
+
+TEST_F(MMEmbeddingRoundtripTest, BinaryEmbeddingUsesExplicitOffset) {
+  const EmbeddingOutput expected = make_embedding();
+  EmbeddingOutputBuilder builder(/*use_binary_encoding=*/true,
+                                 /*metadata_use_binary_encoding=*/false);
+  proto::Embedding wire;
+  std::string tensor_payload;
+  ASSERT_TRUE(builder.build_embedding_output(expected, wire, tensor_payload));
+  constexpr std::string_view kPrefix = "unused-prefix";
+  (*wire.mutable_embedding()->mutable_parameters())["offset"].set_int64_param(
+      static_cast<int64_t>(kPrefix.size()));
+
+  butil::IOBuf first_block;
+  first_block.append(kPrefix.data(), kPrefix.size());
+  first_block.append(tensor_payload.data(), /*count=*/1);
+  butil::IOBuf second_block;
+  second_block.append(tensor_payload.data() + 1, tensor_payload.size() - 1);
+  butil::IOBuf segmented_payload;
+  segmented_payload.append(first_block);
+  segmented_payload.append(second_block);
+
+  MMEmbeddingHandler handler(MMType::IMAGE);
+  BinaryPayload payload(std::move(segmented_payload));
+  MMInputItem input;
+
+  ASSERT_EQ(handler.process(MMContent("image_embedding", wire), input, payload),
+            MMErrCode::SUCCESS);
+  EXPECT_TRUE(input.embedding.embedding.equal(expected.embedding));
+  EXPECT_TRUE(input.embedding.metadata.at("image_grid_thw")
+                  .equal(expected.metadata.at("image_grid_thw")));
+}
+
+TEST_F(MMEmbeddingRoundtripTest, BinaryEmbeddingRequiresExplicitOffset) {
+  const EmbeddingOutput expected = make_embedding();
+  EmbeddingOutputBuilder builder(/*use_binary_encoding=*/true,
+                                 /*metadata_use_binary_encoding=*/false);
+  proto::Embedding wire;
+  std::string binary_payload;
+  ASSERT_TRUE(builder.build_embedding_output(expected, wire, binary_payload));
+  wire.mutable_embedding()->mutable_parameters()->erase("offset");
+
+  MMEmbeddingHandler handler(MMType::IMAGE);
+  BinaryPayload payload(binary_payload);
+  MMInputItem input;
+
+  EXPECT_EQ(handler.process(MMContent("image_embedding", wire), input, payload),
+            MMErrCode::PARSE_EMB_ERR);
+}
+
+TEST_F(MMEmbeddingRoundtripTest, BinaryMediaUsesExplicitOffsetAndLength) {
+  const std::string& png = tiny_png_bytes();
+  const std::string binary_payload = "unused" + png + "trailing";
+  const std::string binary_url =
+      "data:image/png;binary,6," + std::to_string(png.size());
+  const MMContentVec contents = {
+      MMContent("image_url", ImageURL{.url = binary_url}),
+      MMContent("image_url", ImageURL{.url = binary_url})};
+  std::vector<Message> messages;
+  messages.emplace_back("user", contents);
+  butil::IOBuf first_block;
+  first_block.append(binary_payload.data(), png.size());
+  butil::IOBuf second_block;
+  second_block.append(binary_payload.data() + png.size(),
+                      binary_payload.size() - png.size());
+  butil::IOBuf segmented_payload;
+  segmented_payload.append(first_block);
+  segmented_payload.append(second_block);
+  MMInput inputs{BinaryPayload(std::move(segmented_payload))};
+  MMInputTransfer transfer;
+
+  ASSERT_EQ(transfer.trans(messages, inputs), MMErrCode::SUCCESS);
+  ASSERT_EQ(inputs.size(), 2u);
+  for (const MMInputItem& input : inputs.items()) {
+    EXPECT_EQ(input.raw_data, png);
+    EXPECT_TRUE(input.decode_image.defined());
+  }
+}
+
+TEST_F(MMEmbeddingRoundtripTest, BinaryMediaRejectsLengthOnlyFormat) {
+  const std::string& png = tiny_png_bytes();
+  const MMContentVec contents = {MMContent(
+      "image_url",
+      ImageURL{.url = "data:image/png;binary," + std::to_string(png.size())})};
+  std::vector<Message> messages;
+  messages.emplace_back("user", contents);
+  MMInput inputs{BinaryPayload(png)};
+  MMInputTransfer transfer;
+
+  EXPECT_EQ(transfer.trans(messages, inputs), MMErrCode::LOAD_DATA_ERR);
+}
+
+TEST_F(MMEmbeddingRoundtripTest, BinaryMediaRejectsOutOfRangeReference) {
+  const MMContentVec contents = {
+      MMContent("image_url", ImageURL{.url = "data:image/png;binary,1,8"})};
+  std::vector<Message> messages;
+  messages.emplace_back("user", contents);
+  MMInput inputs{BinaryPayload("12345678")};
+  MMInputTransfer transfer;
+
+  EXPECT_EQ(transfer.trans(messages, inputs), MMErrCode::LOAD_DATA_ERR);
 }
 
 TEST_F(MMEmbeddingRoundtripTest, ReusedInputsDoNotKeepPreviousImageState) {

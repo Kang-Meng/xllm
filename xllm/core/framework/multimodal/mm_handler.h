@@ -25,8 +25,8 @@ limitations under the License.
 namespace xllm {
 
 struct MMInputItem;
-struct MMPayload;
-struct MMInput;
+class BinaryPayload;
+class MMInput;
 
 class MMHandlerBase {
  public:
@@ -35,18 +35,18 @@ class MMHandlerBase {
 
   MMErrCode process(const MMContent& content,
                     MMInputItem& input,
-                    MMPayload& payload);
+                    const BinaryPayload& payload);
 
   virtual MMErrCode load(const MMContent& content,
                          MMInputItem& input,
-                         MMPayload& payload) = 0;
+                         const BinaryPayload& payload) = 0;
 
   virtual MMErrCode decode(MMInputItem& input) = 0;
 
  protected:
   MMErrCode load_from_dataurl(const std::string& url,
                               std::string& data,
-                              MMPayload& payload);
+                              const BinaryPayload& payload);
 
   MMErrCode load_from_local(const std::string& url, std::string& data);
 
@@ -66,7 +66,7 @@ class ImageHandler : public MMHandlerBase {
 
   MMErrCode load(const MMContent& content,
                  MMInputItem& input,
-                 MMPayload& payload) override;
+                 const BinaryPayload& payload) override;
   MMErrCode decode(MMInputItem& input) override;
 
  private:
@@ -80,7 +80,7 @@ class VideoHandler : public MMHandlerBase {
 
   MMErrCode load(const MMContent& content,
                  MMInputItem& input,
-                 MMPayload& payload) override;
+                 const BinaryPayload& payload) override;
   MMErrCode decode(MMInputItem& input) override;
 
  private:
@@ -94,7 +94,7 @@ class AudioHandler : public MMHandlerBase {
 
   MMErrCode load(const MMContent& content,
                  MMInputItem& input,
-                 MMPayload& payload) override;
+                 const BinaryPayload& payload) override;
   MMErrCode decode(MMInputItem& input) override;
 
  private:
@@ -109,7 +109,7 @@ class MMHandlerSet {
   MMErrCode process(const std::string& type,
                     const MMContent& content,
                     MMInputItem& input,
-                    MMPayload& payload);
+                    const BinaryPayload& payload);
 
  private:
   std::unordered_map<std::string, std::unique_ptr<MMHandlerBase>> handlers_;

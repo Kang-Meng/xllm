@@ -267,7 +267,7 @@ std::optional<StoppingChecker> VLMRequestFactory::build_stopping_checker(
 std::shared_ptr<Request> VLMRequestFactory::create(
     std::vector<Message> messages,
     const RequestParams& sp,
-    std::string payload,
+    BinaryPayload payload,
     OutputCallback callback,
     bool use_prompt_as_is) {
   // Guard the rate-limit slot acquired at the service entry. The next hop

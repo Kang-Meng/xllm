@@ -20,6 +20,8 @@ limitations under the License.
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "audio_generation.pb.h"
@@ -119,15 +121,26 @@ proto::VideoGenerationRequest MakeVideoRequest() {
   return request;
 }
 
-bool VerifyFailsWithInvalidArgument(const DiTRequestParams& params) {
-  StatusCode error_code = StatusCode::OK;
-  const bool valid = params.verify_params([&](DiTRequestOutput output) {
-    if (output.status.has_value()) {
-      error_code = output.status->code();
-    }
-    return true;
-  });
-  return !valid && error_code == StatusCode::INVALID_ARGUMENT;
+const DiTInputParams& decode_input(DiTRequestParams& params) {
+  Status status;
+  EXPECT_TRUE(params.parse_input_params(status));
+  return params.input_params;
+}
+
+bool verify_fails_with_invalid_argument(DiTRequestParams& params) {
+  Status parse_status;
+  if (!params.parse_input_params(parse_status)) {
+    return parse_status.code() == StatusCode::INVALID_ARGUMENT;
+  }
+  Status status;
+  const bool valid = params.verify_params(status);
+  return !valid && status.code() == StatusCode::INVALID_ARGUMENT;
+}
+
+bool decode_fails_with_invalid_argument(DiTRequestParams& params) {
+  Status status;
+  const bool decoded = params.parse_input_params(status);
+  return !decoded && status.code() == StatusCode::INVALID_ARGUMENT;
 }
 
 TEST(DiTRequestParamsTest, LegacyImagesMapToOrderedUnknownSources) {
@@ -138,12 +151,32 @@ TEST(DiTRequestParamsTest, LegacyImagesMapToOrderedUnknownSources) {
   DiTRequestParams params(request, "rid", "rtime");
 
   ASSERT_TRUE(params.request_parse_status.ok());
-  ASSERT_EQ(params.input_params.media_sources.size(), 2u);
-  EXPECT_EQ(params.input_params.media_sources.at(0).name, "unknown");
-  EXPECT_EQ(params.input_params.media_sources.at(1).name, "unknown");
-  EXPECT_EQ(params.input_params.media_sources.at(0).modality, "image");
-  EXPECT_TRUE(torch::equal(params.input_params.media_sources.at(0).tensor,
-                           params.input_params.media_sources.at(1).tensor));
+  const DiTInputParams& input_params = decode_input(params);
+  ASSERT_EQ(input_params.media_sources.size(), 2u);
+  EXPECT_EQ(input_params.media_sources.at(0).name, "unknown");
+  EXPECT_EQ(input_params.media_sources.at(1).name, "unknown");
+  EXPECT_EQ(input_params.media_sources.at(0).modality, "image");
+  EXPECT_TRUE(torch::equal(input_params.media_sources.at(0).tensor,
+                           input_params.media_sources.at(1).tensor));
+}
+
+TEST(DiTRequestParamsTest, ConstructorCollectsMediaWithoutDecoding) {
+  proto::ImageGenerationRequest request = MakeImageRequest();
+  proto::MediaSource* source = request.mutable_input()->add_media_sources();
+  source->set_type("base64");
+  source->set_name("image");
+  source->set_modality("image");
+  source->set_base64("not-base64");
+
+  DiTRequestParams params(request, "rid", "rtime");
+
+  ASSERT_TRUE(params.request_parse_status.ok());
+  const auto* input =
+      std::get_if<const proto::Input*>(&params.raw_input_params.input);
+  ASSERT_NE(input, nullptr);
+  ASSERT_NE(*input, nullptr);
+  ASSERT_EQ((*input)->media_sources_size(), 1);
+  EXPECT_EQ((*input)->media_sources(0).base64(), "not-base64");
 }
 
 TEST(DiTRequestParamsTest, ImageSourcesSupportBase64AndBinaryInOrder) {
@@ -165,11 +198,12 @@ TEST(DiTRequestParamsTest, ImageSourcesSupportBase64AndBinaryInOrder) {
   DiTRequestParams params(request, "rid", "rtime", BinaryPayload(payload));
 
   ASSERT_TRUE(params.request_parse_status.ok());
-  ASSERT_EQ(params.input_params.media_sources.size(), 2u);
-  EXPECT_EQ(params.input_params.media_sources.at(0).name, "unknown");
-  EXPECT_EQ(params.input_params.media_sources.at(1).name, "control_image");
-  EXPECT_TRUE(torch::equal(params.input_params.media_sources.at(0).tensor,
-                           params.input_params.media_sources.at(1).tensor));
+  const DiTInputParams& input_params = decode_input(params);
+  ASSERT_EQ(input_params.media_sources.size(), 2u);
+  EXPECT_EQ(input_params.media_sources.at(0).name, "unknown");
+  EXPECT_EQ(input_params.media_sources.at(1).name, "control_image");
+  EXPECT_TRUE(torch::equal(input_params.media_sources.at(0).tensor,
+                           input_params.media_sources.at(1).tensor));
 }
 
 TEST(DiTRequestParamsTest, VideoImageSourcesAreDecoded) {
@@ -193,11 +227,12 @@ TEST(DiTRequestParamsTest, VideoImageSourcesAreDecoded) {
 
   ASSERT_TRUE(params.request_parse_status.ok());
   std::vector<torch::Tensor> images =
-      params.input_params.media_sources.get({"image", "last_image"});
+      decode_input(params).media_sources.get({"image", "last_image"});
   EXPECT_EQ(images.size(), 2u);
 }
 
-TEST(DiTRequestParamsTest, MixedImageSourcesAndLegacyImagesPreserveOrder) {
+TEST(DiTRequestParamsTest,
+     MixedImageSourcesAndLegacyImagesPreserveExistingOrder) {
   proto::ImageGenerationRequest request = MakeImageRequest();
   proto::Input* input = request.mutable_input();
   proto::MediaSource* base64 = input->add_media_sources();
@@ -216,17 +251,18 @@ TEST(DiTRequestParamsTest, MixedImageSourcesAndLegacyImagesPreserveOrder) {
       request, "rid", "rtime", BinaryPayload(TinyPngBytes()));
 
   ASSERT_TRUE(params.request_parse_status.ok());
-  ASSERT_EQ(params.input_params.media_sources.size(), 3u);
-  EXPECT_EQ(params.input_params.media_sources.at(0).name, "first");
-  EXPECT_EQ(params.input_params.media_sources.at(1).name, "second");
-  EXPECT_EQ(params.input_params.media_sources.at(2).name, "unknown");
-  EXPECT_TRUE(torch::equal(params.input_params.media_sources.at(0).tensor,
-                           params.input_params.media_sources.at(1).tensor));
-  EXPECT_TRUE(torch::equal(params.input_params.media_sources.at(1).tensor,
-                           params.input_params.media_sources.at(2).tensor));
+  const DiTInputParams& input_params = decode_input(params);
+  ASSERT_EQ(input_params.media_sources.size(), 3u);
+  EXPECT_EQ(input_params.media_sources.at(0).name, "first");
+  EXPECT_EQ(input_params.media_sources.at(1).name, "second");
+  EXPECT_EQ(input_params.media_sources.at(2).name, "unknown");
+  EXPECT_TRUE(torch::equal(input_params.media_sources.at(0).tensor,
+                           input_params.media_sources.at(1).tensor));
+  EXPECT_TRUE(torch::equal(input_params.media_sources.at(1).tensor,
+                           input_params.media_sources.at(2).tensor));
 }
 
-TEST(DiTRequestParamsTest, FailedParallelImageDecodeCommitsNoSources) {
+TEST(DiTRequestParamsTest, FailedParallelImageDecodePreservesExistingInput) {
   proto::ImageGenerationRequest request = MakeImageRequest();
   proto::Input* input = request.mutable_input();
   proto::MediaSource* valid = input->add_media_sources();
@@ -243,9 +279,19 @@ TEST(DiTRequestParamsTest, FailedParallelImageDecodeCommitsNoSources) {
   invalid->set_base64(invalid_base64);
 
   DiTRequestParams params(request, "rid", "rtime");
+  ASSERT_TRUE(params.request_parse_status.ok());
+  params.input_params.prompt = "existing prompt";
+  const torch::Tensor existing_tensor = torch::ones({1});
+  params.input_params.media_sources.add("existing", "image", existing_tensor);
+  Status status;
 
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(params));
-  EXPECT_TRUE(params.input_params.media_sources.empty());
+  EXPECT_FALSE(params.parse_input_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(params.input_params.prompt, "existing prompt");
+  ASSERT_EQ(params.input_params.media_sources.size(), 1);
+  EXPECT_TRUE(params.input_params.media_sources.contains("existing"));
+  EXPECT_TRUE(torch::equal(params.input_params.media_sources.at(0).tensor,
+                           existing_tensor));
 }
 
 TEST(DiTRequestParamsTest, DuplicateImageSourceNamesArePreserved) {
@@ -262,8 +308,8 @@ TEST(DiTRequestParamsTest, DuplicateImageSourceNamesArePreserved) {
   DiTRequestParams params(request, "rid", "rtime");
 
   ASSERT_TRUE(params.request_parse_status.ok());
-  EXPECT_EQ(params.input_params.media_sources.get({"image", "image"}).size(),
-            2u);
+  const DiTInputParams& input_params = decode_input(params);
+  EXPECT_EQ(input_params.media_sources.get({"image", "image"}).size(), 2u);
 }
 
 TEST(DiTRequestParamsTest, RejectsOutOfBoundsBinaryImage) {
@@ -279,7 +325,8 @@ TEST(DiTRequestParamsTest, RejectsOutOfBoundsBinaryImage) {
   DiTRequestParams params(
       request, "rid", "rtime", BinaryPayload(TinyPngBytes()));
 
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(params));
+  ASSERT_TRUE(params.request_parse_status.ok());
+  EXPECT_TRUE(decode_fails_with_invalid_argument(params));
 }
 
 TEST(DiTRequestParamsTest, RejectsOverflowingBinaryImageRange) {
@@ -295,7 +342,8 @@ TEST(DiTRequestParamsTest, RejectsOverflowingBinaryImageRange) {
   DiTRequestParams params(
       request, "rid", "rtime", BinaryPayload(TinyPngBytes()));
 
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(params));
+  ASSERT_TRUE(params.request_parse_status.ok());
+  EXPECT_TRUE(decode_fails_with_invalid_argument(params));
 }
 
 TEST(DiTRequestParamsTest, RejectsEmptyImageSource) {
@@ -304,7 +352,8 @@ TEST(DiTRequestParamsTest, RejectsEmptyImageSource) {
 
   DiTRequestParams params(request, "rid", "rtime");
 
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(params));
+  ASSERT_TRUE(params.request_parse_status.ok());
+  EXPECT_TRUE(decode_fails_with_invalid_argument(params));
 }
 
 TEST(DiTRequestParamsTest, BinaryTensorInputMatchesContentsInput) {
@@ -333,9 +382,10 @@ TEST(DiTRequestParamsTest, BinaryTensorInputMatchesContentsInput) {
       binary_request, "rid", "rtime", BinaryPayload(payload));
 
   ASSERT_TRUE(binary_params.request_parse_status.ok());
-  EXPECT_TRUE(torch::equal(
-      *binary_params.input_params.tensor_sources.get("prompt_embed"),
-      *contents_params.input_params.tensor_sources.get("prompt_embed")));
+  const DiTInputParams& binary_input = decode_input(binary_params);
+  const DiTInputParams& contents_input = decode_input(contents_params);
+  EXPECT_TRUE(torch::equal(*binary_input.tensor_sources.get("prompt_embed"),
+                           *contents_input.tensor_sources.get("prompt_embed")));
 }
 
 TEST(DiTRequestParamsTest, VideoBinaryTensorInputMatchesContentsInput) {
@@ -364,9 +414,10 @@ TEST(DiTRequestParamsTest, VideoBinaryTensorInputMatchesContentsInput) {
       binary_request, "rid", "rtime", BinaryPayload(payload));
 
   ASSERT_TRUE(binary_params.request_parse_status.ok());
-  EXPECT_TRUE(torch::equal(
-      *binary_params.input_params.tensor_sources.get("prompt_embed"),
-      *contents_params.input_params.tensor_sources.get("prompt_embed")));
+  const DiTInputParams& binary_input = decode_input(binary_params);
+  const DiTInputParams& contents_input = decode_input(contents_params);
+  EXPECT_TRUE(torch::equal(*binary_input.tensor_sources.get("prompt_embed"),
+                           *contents_input.tensor_sources.get("prompt_embed")));
 }
 
 TEST(DiTRequestParamsTest, PromptTokenTagsDecodeFromPromptEmbedParameters) {
@@ -388,8 +439,9 @@ TEST(DiTRequestParamsTest, PromptTokenTagsDecodeFromPromptEmbedParameters) {
   DiTRequestParams params(request, "rid", "rtime");
 
   ASSERT_TRUE(params.request_parse_status.ok());
+  const DiTInputParams& input_params = decode_input(params);
   const std::optional<NamedTensorConstRef> parsed_prompt_embed =
-      params.input_params.tensor_sources.get_named_tensor("prompt_embed");
+      input_params.tensor_sources.get_named_tensor("prompt_embed");
   ASSERT_TRUE(parsed_prompt_embed.has_value());
   const std::vector<int64_t>* tags = get_tensor_parameter<std::vector<int64_t>>(
       parsed_prompt_embed->get().parameters, "prompt_token_tags");
@@ -397,38 +449,129 @@ TEST(DiTRequestParamsTest, PromptTokenTagsDecodeFromPromptEmbedParameters) {
   EXPECT_EQ(*tags, std::vector<int64_t>({0, 1}));
 }
 
+TEST(DiTRequestParamsTest, InvalidResolutionReturnsInvalidArgument) {
+  for (const std::string& size : {"invalid",
+                                  "1x1",
+                                  "1*",
+                                  "*1",
+                                  "-1*1",
+                                  "1*-1",
+                                  "1*1*1",
+                                  "2147483648*1",
+                                  "1*2147483648"}) {
+    proto::ImageGenerationRequest request = MakeImageRequest();
+    request.mutable_parameters()->set_size(size);
+
+    DiTRequestParams params(request, "rid", "rtime");
+
+    EXPECT_TRUE(verify_fails_with_invalid_argument(params)) << size;
+  }
+}
+
 TEST(DiTRequestParamsTest, ImageOutputTypeDefaultsAndValidates) {
   proto::ImageGenerationRequest default_request = MakeImageRequest();
   DiTRequestParams default_params(default_request, "rid", "rtime");
-  EXPECT_EQ(default_params.output_type, "base64");
+  EXPECT_EQ(default_params.generation_params.output_type, "base64");
 
   proto::ImageGenerationRequest binary_request = MakeImageRequest();
   binary_request.mutable_parameters()->set_output_type("binary");
   DiTRequestParams binary_params(binary_request, "rid", "rtime");
-  EXPECT_EQ(binary_params.output_type, "binary");
+  EXPECT_EQ(binary_params.generation_params.output_type, "binary");
   EXPECT_TRUE(binary_params.request_parse_status.ok());
 
   proto::ImageGenerationRequest invalid_request = MakeImageRequest();
   invalid_request.mutable_parameters()->set_output_type("url");
   DiTRequestParams invalid_params(invalid_request, "rid", "rtime");
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(invalid_params));
+  EXPECT_TRUE(invalid_params.request_parse_status.ok());
+  EXPECT_TRUE(verify_fails_with_invalid_argument(invalid_params));
+}
+
+TEST(DiTRequestParamsTest, ImageGenerationCountValidatesAfterParsing) {
+  proto::ImageGenerationRequest request = MakeImageRequest();
+  request.mutable_parameters()->set_num_images_per_prompt(-1);
+
+  DiTRequestParams params(request, "rid", "rtime");
+
+  EXPECT_TRUE(params.request_parse_status.ok());
+  EXPECT_EQ(params.generation_params.num_images_per_prompt, -1);
+  EXPECT_TRUE(verify_fails_with_invalid_argument(params));
 }
 
 TEST(DiTRequestParamsTest, VideoOutputTypeDefaultsAndValidates) {
   proto::VideoGenerationRequest default_request = MakeVideoRequest();
   DiTRequestParams default_params(default_request, "rid", "rtime");
-  EXPECT_EQ(default_params.output_type, "base64");
+  EXPECT_EQ(default_params.generation_params.output_type, "base64");
 
   proto::VideoGenerationRequest binary_request = MakeVideoRequest();
   binary_request.mutable_parameters()->set_output_type("binary");
   DiTRequestParams binary_params(binary_request, "rid", "rtime");
-  EXPECT_EQ(binary_params.output_type, "binary");
+  EXPECT_EQ(binary_params.generation_params.output_type, "binary");
   EXPECT_TRUE(binary_params.request_parse_status.ok());
 
   proto::VideoGenerationRequest invalid_request = MakeVideoRequest();
   invalid_request.mutable_parameters()->set_output_type("url");
   DiTRequestParams invalid_params(invalid_request, "rid", "rtime");
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(invalid_params));
+  EXPECT_TRUE(invalid_params.request_parse_status.ok());
+  EXPECT_TRUE(verify_fails_with_invalid_argument(invalid_params));
+}
+
+TEST(DiTRequestParamsTest, VideoGenerationCountValidatesAfterParsing) {
+  proto::VideoGenerationRequest request = MakeVideoRequest();
+  request.mutable_parameters()->set_num_videos_per_prompt(-1);
+
+  DiTRequestParams params(request, "rid", "rtime");
+
+  EXPECT_TRUE(params.request_parse_status.ok());
+  EXPECT_EQ(params.generation_params.num_videos_per_prompt, -1);
+  EXPECT_TRUE(verify_fails_with_invalid_argument(params));
+}
+
+TEST(DiTRequestParamsTest, PromptAudioUsesCanonicalSourceIdentity) {
+  std::string wav_base64;
+  butil::Base64Encode(TinyWavBytes(), &wav_base64);
+  proto::AudioGenerationRequest request = MakeAudioRequest();
+  proto::MediaSource* source = request.mutable_input()->mutable_prompt_audio();
+  source->set_type("base64");
+  source->set_name("ignored-name");
+  source->set_modality("image");
+  source->set_base64(wav_base64);
+  const std::string original_request = request.SerializeAsString();
+
+  DiTRequestParams params(request, "rid", "rtime");
+  const DiTInputParams& input_params = decode_input(params);
+
+  ASSERT_EQ(input_params.media_sources.size(), 1u);
+  EXPECT_EQ(input_params.media_sources.at(0).name, "prompt_audio");
+  EXPECT_EQ(input_params.media_sources.at(0).modality, "audio");
+  EXPECT_EQ(request.SerializeAsString(), original_request);
+}
+
+TEST(DiTRequestParamsTest, BinaryPromptAudioUsesCanonicalSourceIdentity) {
+  proto::AudioGenerationRequest request = MakeAudioRequest();
+  proto::MediaSource* source = request.mutable_input()->mutable_prompt_audio();
+  source->set_type("binary");
+  source->set_name("ignored-name");
+  source->set_modality("image");
+  source->mutable_binary()->set_offset(2);
+  source->mutable_binary()->set_length(TinyWavBytes().size());
+  const std::string original_request = request.SerializeAsString();
+
+  DiTRequestParams params(
+      request, "rid", "rtime", BinaryPayload("xx" + TinyWavBytes()));
+  const DiTInputParams& input_params = decode_input(params);
+
+  ASSERT_EQ(input_params.media_sources.size(), 1u);
+  EXPECT_EQ(input_params.media_sources.at(0).name, "prompt_audio");
+  EXPECT_EQ(input_params.media_sources.at(0).modality, "audio");
+  EXPECT_EQ(request.SerializeAsString(), original_request);
+}
+
+TEST(DiTRequestParamsTest, VideoDefaultAudioSamplingRateIs32000) {
+  proto::VideoGenerationRequest request = MakeVideoRequest();
+
+  DiTRequestParams params(request, "rid", "rtime");
+
+  EXPECT_EQ(params.generation_params.audio_sampling_rate, 32000);
 }
 
 TEST(DiTRequestParamsTest, PromptAudioSupportsBase64AndBinary) {
@@ -439,31 +582,38 @@ TEST(DiTRequestParamsTest, PromptAudioSupportsBase64AndBinary) {
   proto::MediaSource* base64_source =
       base64_request.mutable_input()->mutable_prompt_audio();
   base64_source->set_type("base64");
-  base64_source->set_name("prompt_audio");
-  base64_source->set_modality("audio");
   base64_source->set_base64(wav_base64);
+  const std::string original_base64_request =
+      base64_request.SerializeAsString();
   DiTRequestParams base64_params(base64_request, "rid", "rtime");
 
   proto::AudioGenerationRequest binary_request = MakeAudioRequest();
   proto::MediaSource* binary_source =
       binary_request.mutable_input()->mutable_prompt_audio();
   binary_source->set_type("binary");
-  binary_source->set_name("prompt_audio");
-  binary_source->set_modality("audio");
   binary_source->mutable_binary()->set_offset(2);
   binary_source->mutable_binary()->set_length(TinyWavBytes().size());
+  const std::string original_binary_request =
+      binary_request.SerializeAsString();
   DiTRequestParams binary_params(
       binary_request, "rid", "rtime", BinaryPayload("xx" + TinyWavBytes()));
 
   ASSERT_TRUE(base64_params.request_parse_status.ok());
   ASSERT_TRUE(binary_params.request_parse_status.ok());
-  EXPECT_EQ(base64_params.input_params.media_sources.at(0).modality, "audio");
-  EXPECT_EQ(binary_params.input_params.media_sources.at(0).modality, "audio");
-  const torch::Tensor base64_audio =
-      base64_params.input_params.media_sources.at(0).tensor;
+  const DiTInputParams& base64_input = decode_input(base64_params);
+  const DiTInputParams& binary_input = decode_input(binary_params);
+  ASSERT_EQ(base64_input.media_sources.size(), 1u);
+  ASSERT_EQ(binary_input.media_sources.size(), 1u);
+  EXPECT_EQ(base64_input.media_sources.at(0).name, "prompt_audio");
+  EXPECT_EQ(binary_input.media_sources.at(0).name, "prompt_audio");
+  EXPECT_EQ(base64_input.media_sources.at(0).modality, "audio");
+  EXPECT_EQ(binary_input.media_sources.at(0).modality, "audio");
+  const torch::Tensor base64_audio = base64_input.media_sources.at(0).tensor;
   EXPECT_EQ(base64_audio.scalar_type(), torch::kFloat32);
-  EXPECT_TRUE(torch::equal(
-      base64_audio, binary_params.input_params.media_sources.at(0).tensor));
+  EXPECT_TRUE(
+      torch::equal(base64_audio, binary_input.media_sources.at(0).tensor));
+  EXPECT_EQ(base64_request.SerializeAsString(), original_base64_request);
+  EXPECT_EQ(binary_request.SerializeAsString(), original_binary_request);
 }
 
 TEST(DiTRequestParamsTest, RejectsOutOfBoundsBinaryPromptAudio) {
@@ -478,24 +628,26 @@ TEST(DiTRequestParamsTest, RejectsOutOfBoundsBinaryPromptAudio) {
   DiTRequestParams params(
       request, "rid", "rtime", BinaryPayload(TinyWavBytes()));
 
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(params));
+  ASSERT_TRUE(params.request_parse_status.ok());
+  EXPECT_TRUE(decode_fails_with_invalid_argument(params));
 }
 
 TEST(DiTRequestParamsTest, AudioOutputTypeDefaultsAndValidates) {
   proto::AudioGenerationRequest default_request = MakeAudioRequest();
   DiTRequestParams default_params(default_request, "rid", "rtime");
-  EXPECT_EQ(default_params.output_type, "base64");
+  EXPECT_EQ(default_params.generation_params.output_type, "base64");
 
   proto::AudioGenerationRequest binary_request = MakeAudioRequest();
   binary_request.mutable_parameters()->set_output_type("binary");
   DiTRequestParams binary_params(binary_request, "rid", "rtime");
-  EXPECT_EQ(binary_params.output_type, "binary");
+  EXPECT_EQ(binary_params.generation_params.output_type, "binary");
   EXPECT_TRUE(binary_params.request_parse_status.ok());
 
   proto::AudioGenerationRequest invalid_request = MakeAudioRequest();
   invalid_request.mutable_parameters()->set_output_type("url");
   DiTRequestParams invalid_params(invalid_request, "rid", "rtime");
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(invalid_params));
+  EXPECT_TRUE(invalid_params.request_parse_status.ok());
+  EXPECT_TRUE(verify_fails_with_invalid_argument(invalid_params));
 }
 
 TEST(DiTRequestParamsTest, RejectsBinaryTensorLengthMismatch) {
@@ -509,8 +661,11 @@ TEST(DiTRequestParamsTest, RejectsBinaryTensorLengthMismatch) {
 
   const std::string payload(sizeof(float), 0);
   DiTRequestParams params(request, "rid", "rtime", BinaryPayload(payload));
+  ASSERT_TRUE(params.request_parse_status.ok());
+  Status status;
 
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(params));
+  EXPECT_FALSE(params.parse_input_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
 }
 
 TEST(DiTRequestParamsTest, RejectsMissingOrInvalidBinaryImagePayload) {
@@ -525,8 +680,199 @@ TEST(DiTRequestParamsTest, RejectsMissingOrInvalidBinaryImagePayload) {
   DiTRequestParams invalid_params(
       request, "rid", "rtime", BinaryPayload("nope"));
 
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(missing_params));
-  EXPECT_TRUE(VerifyFailsWithInvalidArgument(invalid_params));
+  ASSERT_TRUE(missing_params.request_parse_status.ok());
+  EXPECT_TRUE(decode_fails_with_invalid_argument(missing_params));
+  ASSERT_TRUE(invalid_params.request_parse_status.ok());
+  Status status;
+  EXPECT_FALSE(invalid_params.parse_input_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+}
+
+TEST(DiTRequestParamsTest, NullInputPointersPreserveExistingInput) {
+  const std::vector<std::pair<DiTRequestKind, DiTInputProto>> null_inputs = {
+      {DiTRequestKind::kImage, static_cast<const proto::Input*>(nullptr)},
+      {DiTRequestKind::kAudio, static_cast<const proto::AudioInput*>(nullptr)},
+      {DiTRequestKind::kVideo, static_cast<const proto::VideoInput*>(nullptr)},
+      {DiTRequestKind::kText, static_cast<const proto::TextInput*>(nullptr)}};
+  for (const auto& [request_kind, input] : null_inputs) {
+    SCOPED_TRACE(input.index());
+    DiTRequestParams params(request_kind);
+    params.raw_input_params.input = input;
+    params.input_params.prompt = "existing prompt";
+    const torch::Tensor existing_tensor = torch::ones({1});
+    params.input_params.media_sources.add("existing", "image", existing_tensor);
+    Status status;
+
+    EXPECT_FALSE(params.parse_input_params(status));
+    EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(status.message(), "input is missing");
+    EXPECT_EQ(params.input_params.prompt, "existing prompt");
+    ASSERT_EQ(params.input_params.media_sources.size(), 1);
+    EXPECT_TRUE(params.input_params.media_sources.contains("existing"));
+    EXPECT_TRUE(torch::equal(params.input_params.media_sources.at(0).tensor,
+                             existing_tensor));
+  }
+}
+
+TEST(DiTRequestParamsTest, RejectsUnknownRequestKind) {
+  DiTRequestParams params(static_cast<DiTRequestKind>(42));
+  params.input_params.prompt = "prompt";
+  Status status;
+
+  EXPECT_FALSE(params.verify_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "request kind is invalid");
+}
+
+TEST(DiTRequestParamsTest, DefaultRequestRequiresConcreteKind) {
+  DiTRequestParams params;
+  params.input_params.prompt = "offline prompt";
+  EXPECT_EQ(params.request_kind(), DiTRequestKind::kNone);
+  Status status;
+
+  EXPECT_TRUE(params.parse_input_params(status));
+  EXPECT_FALSE(params.verify_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "request kind is invalid");
+}
+
+TEST(DiTRequestParamsTest, UnknownRequestKindCannotParseRawInput) {
+  proto::Input input;
+  input.set_prompt("raw prompt");
+  for (const DiTRequestKind request_kind :
+       {DiTRequestKind::kNone, static_cast<DiTRequestKind>(42)}) {
+    SCOPED_TRACE(static_cast<int32_t>(request_kind));
+    DiTRequestParams params(request_kind);
+    params.raw_input_params.input = &input;
+    params.input_params.prompt = "existing prompt";
+    Status status;
+
+    EXPECT_FALSE(params.parse_input_params(status));
+    EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(status.message(), "request kind is invalid");
+    EXPECT_EQ(params.input_params.prompt, "existing prompt");
+  }
+}
+
+TEST(DiTRequestParamsTest, PreparsedOfflineInputRemainsUnchanged) {
+  for (const DiTRequestKind request_kind : {DiTRequestKind::kImage,
+                                            DiTRequestKind::kAudio,
+                                            DiTRequestKind::kVideo,
+                                            DiTRequestKind::kText}) {
+    SCOPED_TRACE(static_cast<int32_t>(request_kind));
+    DiTRequestParams params(request_kind);
+    params.input_params.prompt = "offline prompt";
+    const torch::Tensor existing_tensor = torch::ones({1});
+    params.input_params.media_sources.add("existing", "image", existing_tensor);
+    params.generation_params.guidance_scale = 4.0f;
+    params.generation_params.max_new_tokens = 48;
+    params.generation_params.audio_sampling_rate = 48000;
+    params.generation_params.output_type = "binary";
+    const DiTGenerationParams expected_generation_params =
+        params.generation_params;
+    Status status;
+
+    EXPECT_EQ(params.request_kind(), request_kind);
+    ASSERT_TRUE(
+        std::holds_alternative<std::monostate>(params.raw_input_params.input));
+    ASSERT_TRUE(params.parse_input_params(status));
+    EXPECT_TRUE(params.verify_params(status)) << status.message();
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(params.input_params.prompt, "offline prompt");
+    ASSERT_EQ(params.input_params.media_sources.size(), 1);
+    EXPECT_EQ(params.input_params.media_sources.at(0).name, "existing");
+    EXPECT_TRUE(torch::equal(params.input_params.media_sources.at(0).tensor,
+                             existing_tensor));
+    EXPECT_EQ(params.generation_params, expected_generation_params);
+    EXPECT_EQ(params.generation_params.output_type, "binary");
+  }
+}
+
+TEST(DiTRequestParamsTest, OfflineImageRejectsInvalidImageCount) {
+  DiTRequestParams params(DiTRequestKind::kImage);
+  params.input_params.prompt = "offline prompt";
+  params.generation_params.num_images_per_prompt = 0;
+  Status status;
+
+  ASSERT_TRUE(params.parse_input_params(status));
+  EXPECT_FALSE(params.verify_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "num_images_per_prompt must be greater than 0.");
+}
+
+TEST(DiTRequestParamsTest, OfflineAudioRejectsInvalidOutputType) {
+  DiTRequestParams params(DiTRequestKind::kAudio);
+  params.input_params.prompt = "offline prompt";
+  params.generation_params.output_type = "invalid";
+  Status status;
+
+  ASSERT_TRUE(params.parse_input_params(status));
+  EXPECT_FALSE(params.verify_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "output_type must be either base64 or binary");
+}
+
+TEST(DiTRequestParamsTest, OfflineVideoRejectsInvalidVideoCount) {
+  DiTRequestParams params(DiTRequestKind::kVideo);
+  params.input_params.prompt = "offline prompt";
+  params.generation_params.num_videos_per_prompt = 0;
+  Status status;
+
+  ASSERT_TRUE(params.parse_input_params(status));
+  EXPECT_FALSE(params.verify_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "num_videos_per_prompt must be greater than 0.");
+}
+
+TEST(DiTRequestParamsTest, OfflineTextRejectsInvalidTokenCount) {
+  DiTRequestParams params(DiTRequestKind::kText);
+  params.input_params.prompt = "offline prompt";
+  params.generation_params.max_new_tokens = 0;
+  Status status;
+
+  ASSERT_TRUE(params.parse_input_params(status));
+  EXPECT_FALSE(params.verify_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "max_new_tokens must be positive.");
+}
+
+TEST(DiTRequestParamsTest, VerifyUsesConstructedRequestKind) {
+  DiTRequestParams image_params(DiTRequestKind::kImage);
+  image_params.input_params.prompt = "offline prompt";
+  image_params.generation_params.num_images_per_prompt = 0;
+  Status status;
+  ASSERT_FALSE(image_params.verify_params(status));
+
+  DiTRequestParams text_params(DiTRequestKind::kText);
+  text_params.input_params.prompt = "offline prompt";
+  text_params.generation_params.num_images_per_prompt = 0;
+  EXPECT_TRUE(text_params.verify_params(status));
+  EXPECT_TRUE(status.ok());
+
+  text_params.generation_params.max_new_tokens = 0;
+  EXPECT_FALSE(text_params.verify_params(status));
+  EXPECT_EQ(status.message(), "max_new_tokens must be positive.");
+}
+
+TEST(DiTRequestParamsTest, ParseUsesConstructedRequestKind) {
+  proto::TextInput input;
+  input.set_prompt("text prompt");
+  DiTRequestParams image_params(DiTRequestKind::kImage);
+  image_params.raw_input_params.input = &input;
+  image_params.input_params.prompt = "existing prompt";
+  Status status;
+
+  ASSERT_FALSE(image_params.parse_input_params(status));
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "input type does not match parser");
+  EXPECT_EQ(image_params.input_params.prompt, "existing prompt");
+
+  DiTRequestParams text_params(DiTRequestKind::kText);
+  text_params.raw_input_params.input = &input;
+  Status text_status;
+  ASSERT_TRUE(text_params.parse_input_params(text_status));
+  EXPECT_TRUE(text_status.ok());
+  EXPECT_EQ(text_params.input_params.prompt, "text prompt");
 }
 
 // ===========================================================================
@@ -537,21 +883,18 @@ TEST(DiTRequestParamsTest, TextRequestSetsKindToText) {
   auto req = MakeTextRequest("Cola-DLM", "hello");
   DiTRequestParams params(req, "rid", "rtime");
 
-  EXPECT_EQ(params.request_kind, DiTRequestKind::kText);
-}
-
-TEST(DiTRequestParamsTest, TextRequestMapsModel) {
-  auto req = MakeTextRequest("Cola-DLM", "hello");
-  DiTRequestParams params(req, "rid", "rtime");
-
-  EXPECT_EQ(params.model, "Cola-DLM");
+  EXPECT_EQ(params.request_kind(), DiTRequestKind::kText);
 }
 
 TEST(DiTRequestParamsTest, TextRequestMapsPrompt) {
   auto req = MakeTextRequest("Cola-DLM", "hello world");
   DiTRequestParams params(req, "rid", "rtime");
 
-  EXPECT_EQ(params.input_params.prompt, "hello world");
+  const auto* input =
+      std::get_if<const proto::TextInput*>(&params.raw_input_params.input);
+  ASSERT_NE(input, nullptr);
+  ASSERT_NE(*input, nullptr);
+  EXPECT_EQ((*input)->prompt(), "hello world");
 }
 
 TEST(DiTRequestParamsTest, TextRequestUsesProvidedRequestId) {
@@ -642,56 +985,41 @@ TEST(DiTRequestParamsVerifyTest, TextValidParamsReturnsTrue) {
   p->set_max_new_tokens(128);
   p->set_diffusion_steps(16);
   DiTRequestParams params(req, "rid", "rtime");
+  decode_input(params);
 
-  bool called = false;
-  auto result = params.verify_params([&](DiTRequestOutput /*unused*/) -> bool {
-    called = true;
-    return true;
-  });
+  Status status;
+  const bool result = params.verify_params(status);
 
   EXPECT_TRUE(result);
-  EXPECT_FALSE(called);  // No error callback on success.
+  EXPECT_TRUE(status.ok());
 }
 
 TEST(DiTRequestParamsVerifyTest, TextEmptyPromptReturnsFalse) {
   auto req = MakeTextRequest("Cola-DLM", "");
   DiTRequestParams params(req, "rid", "rtime");
+  decode_input(params);
 
-  StatusCode error_code = StatusCode::OK;
-  std::string error_msg;
-  auto result = params.verify_params([&](DiTRequestOutput output) -> bool {
-    if (output.status.has_value()) {
-      error_code = output.status.value().code();
-      error_msg = output.status.value().message();
-    }
-    return true;
-  });
+  Status status;
+  const bool result = params.verify_params(status);
 
   EXPECT_FALSE(result);
-  EXPECT_EQ(error_code, StatusCode::INVALID_ARGUMENT);
-  EXPECT_EQ(error_msg, "prompt is empty");
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "prompt is empty");
 }
 
-TEST(DiTRequestParamsVerifyTest, TextEmptyModelReturnsFalse) {
+TEST(DiTRequestParamsVerifyTest, TextValidationDoesNotRequireModel) {
   auto req = MakeTextRequest("", "hello");
   auto* p = req.mutable_parameters();
   p->set_max_new_tokens(128);
   p->set_diffusion_steps(16);
   DiTRequestParams params(req, "rid", "rtime");
+  decode_input(params);
 
-  StatusCode error_code = StatusCode::OK;
-  std::string error_msg;
-  auto result = params.verify_params([&](DiTRequestOutput output) -> bool {
-    if (output.status.has_value()) {
-      error_code = output.status.value().code();
-      error_msg = output.status.value().message();
-    }
-    return true;
-  });
+  Status status;
+  const bool result = params.verify_params(status);
 
-  EXPECT_FALSE(result);
-  EXPECT_EQ(error_code, StatusCode::INVALID_ARGUMENT);
-  EXPECT_EQ(error_msg, "model is empty");
+  EXPECT_TRUE(result);
+  EXPECT_TRUE(status.ok());
 }
 
 TEST(DiTRequestParamsVerifyTest, TextZeroMaxNewTokensReturnsFalse) {
@@ -700,17 +1028,13 @@ TEST(DiTRequestParamsVerifyTest, TextZeroMaxNewTokensReturnsFalse) {
   p->set_max_new_tokens(0);
   p->set_diffusion_steps(16);
   DiTRequestParams params(req, "rid", "rtime");
+  decode_input(params);
 
-  StatusCode error_code = StatusCode::OK;
-  auto result = params.verify_params([&](DiTRequestOutput output) -> bool {
-    if (output.status.has_value()) {
-      error_code = output.status.value().code();
-    }
-    return true;
-  });
+  Status status;
+  const bool result = params.verify_params(status);
 
   EXPECT_FALSE(result);
-  EXPECT_EQ(error_code, StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
 }
 
 TEST(DiTRequestParamsVerifyTest, TextNegativeDiffusionStepsReturnsFalse) {
@@ -719,17 +1043,13 @@ TEST(DiTRequestParamsVerifyTest, TextNegativeDiffusionStepsReturnsFalse) {
   p->set_max_new_tokens(128);
   p->set_diffusion_steps(-1);
   DiTRequestParams params(req, "rid", "rtime");
+  decode_input(params);
 
-  StatusCode error_code = StatusCode::OK;
-  auto result = params.verify_params([&](DiTRequestOutput output) -> bool {
-    if (output.status.has_value()) {
-      error_code = output.status.value().code();
-    }
-    return true;
-  });
+  Status status;
+  const bool result = params.verify_params(status);
 
   EXPECT_FALSE(result);
-  EXPECT_EQ(error_code, StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
 }
 
 // ===========================================================================

@@ -28,6 +28,7 @@ limitations under the License.
 #include "common/options.h"
 #include "common/types.h"
 #include "core/framework/multimodal/mm_input.h"
+#include "core/util/binary_payload.h"
 #include "engine.h"
 #include "framework/chat_template/jinja_chat_template.h"
 #include "framework/request/request_output.h"
@@ -54,7 +55,7 @@ class VLMMaster : public Master {
   // chat
   void handle_request(std::vector<Message> messages,
                       RequestParams sp,
-                      std::string payload,
+                      BinaryPayload payload,
                       OutputCallback callback,
                       bool use_prompt_as_is = false);
 

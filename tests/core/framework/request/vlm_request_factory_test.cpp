@@ -296,7 +296,7 @@ TEST_F(VLMRequestFactoryTest, MessageOverloadFailsWhenTemplateRejects) {
 
   auto request = factory->create(messages,
                                  sp,
-                                 /*payload=*/std::string{},
+                                 /*payload=*/BinaryPayload(),
                                  make_capture_callback(&capture));
 
   EXPECT_EQ(request, nullptr);
@@ -321,7 +321,7 @@ TEST_F(VLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
 
   auto request = factory->create(messages,
                                  sp,
-                                 /*payload=*/std::string{},
+                                 /*payload=*/BinaryPayload(),
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);

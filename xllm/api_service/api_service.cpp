@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "api_service.h"
 
+#include <butil/strings/string_number_conversions.h>
 #include <glog/logging.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/util/json_util.h>
@@ -325,20 +326,23 @@ void APIService::SampleHttp(::google::protobuf::RpcController* controller,
 
 namespace {
 
-size_t get_json_content_length(const brpc::Controller* ctrl) {
-  const auto infer_content_len =
+bool get_json_content_length(const brpc::Controller* ctrl,
+                             size_t* content_length) {
+  const std::string* header =
       ctrl->http_request().GetHeader(kInferContentLength);
-  if (infer_content_len != nullptr) {
-    return std::stoul(*infer_content_len);
+  if (header == nullptr) {
+    header = ctrl->http_request().GetHeader(kContentLength);
+  }
+  if (header == nullptr) {
+    LOG(ERROR) << "Content-Length header is missing.";
+    return false;
   }
 
-  const auto content_len = ctrl->http_request().GetHeader(kContentLength);
-  if (content_len != nullptr) {
-    return std::stoul(*content_len);
+  if (!butil::StringToSizeT(*header, content_length)) {
+    LOG(ERROR) << "Content-Length header is invalid.";
+    return false;
   }
-
-  LOG(ERROR) << "Content-Length header is missing.";
-  return (size_t)-1L;
+  return true;
 }
 
 template <typename CallT, typename Service>
@@ -353,9 +357,9 @@ void media_generation_http_impl(std::unique_ptr<Service>& service,
   auto resp_pb =
       google::protobuf::Arena::CreateMessage<typename CallT::ResType>(arena);
 
-  const size_t json_content_length = get_json_content_length(ctrl);
-  if (json_content_length == static_cast<size_t>(-1L)) {
-    ctrl->SetFailed("Content-Length header is missing.");
+  size_t json_content_length = 0;
+  if (!get_json_content_length(ctrl, &json_content_length)) {
+    ctrl->SetFailed("Content-Length header is missing or invalid.");
     return;
   }
   const butil::IOBuf& attachment = ctrl->request_attachment();
@@ -472,9 +476,9 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
   auto resp_pb =
       google::protobuf::Arena::CreateMessage<typename ChatCall::ResType>(arena);
 
-  auto content_len = get_json_content_length(ctrl);
-  if (content_len == (size_t)-1L) {
-    ctrl->SetFailed("Content-Length header is missing.");
+  size_t content_len = 0;
+  if (!get_json_content_length(ctrl, &content_len)) {
+    ctrl->SetFailed("Content-Length header is missing or invalid.");
     return;
   }
 
@@ -654,11 +658,25 @@ void handle_embedding_request(std::unique_ptr<Service>& embedding_service_impl_,
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
   api_service::ensure_http_x_request_id(ctrl);
+  size_t json_content_length = 0;
+  if (!get_json_content_length(ctrl, &json_content_length)) {
+    ctrl->SetFailed("Content-Length header is missing or invalid.");
+    return;
+  }
+  const butil::IOBuf& attachment = ctrl->request_attachment();
+  if (json_content_length > attachment.size() ||
+      json_content_length >
+          static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    ctrl->SetFailed("JSON content length exceeds request attachment.");
+    return;
+  }
+
+  butil::IOBufAsZeroCopyInputStream attachment_stream(attachment);
+  google::protobuf::io::LimitingInputStream json_stream(
+      &attachment_stream, static_cast<int64_t>(json_content_length));
   std::string error;
   json2pb::Json2PbOptions options;
-  butil::IOBuf& buf = ctrl->request_attachment();
-  butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
-  auto st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
+  auto st = json2pb::JsonToProtoMessage(&json_stream, req_pb, options, &error);
   if (!st) {
     ctrl->SetFailed(error);
     LOG(ERROR) << "parse json to proto failed: " << error;
@@ -1086,9 +1104,9 @@ void handle_anthropic_messages(std::unique_ptr<AnthropicServiceImpl>& service,
       google::protobuf::Arena::CreateMessage<typename AnthropicCall::ResType>(
           arena);
 
-  auto content_len = get_json_content_length(ctrl);
-  if (content_len == (size_t)-1L) {
-    ctrl->SetFailed("Content-Length header is missing.");
+  size_t content_len = 0;
+  if (!get_json_content_length(ctrl, &content_len)) {
+    ctrl->SetFailed("Content-Length header is missing or invalid.");
     return;
   }
   std::string attachment;

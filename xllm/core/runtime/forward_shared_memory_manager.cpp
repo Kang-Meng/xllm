@@ -376,15 +376,15 @@ inline size_t get_dit_generation_params_size(
              4  // width, height, num_inference_steps, max_sequence_length
          + type_size<float> *
                4  // true_cfg_scale, guidance_scale, strength, cfg_renorm_min
-         + type_size<uint32_t>  // num_images_per_prompt
-         + type_size<int64_t>   // seed
-         + type_size<bool>      // enable_cfg_renorm
-         + type_size<int32_t>   // num_frames
-         + type_size<double>    // video_fps
-         + type_size<float> *   // guidance_scale_2, boundary_ratio, flow_shift
+         + type_size<int32_t>  // num_images_per_prompt
+         + type_size<int64_t>  // seed
+         + type_size<bool>     // enable_cfg_renorm
+         + type_size<int32_t>  // num_frames
+         + type_size<double>   // video_fps
+         + type_size<float> *  // guidance_scale_2, boundary_ratio, flow_shift
                3 +
          type_size<int32_t>        // seconds
-         + type_size<uint32_t>     // num_videos_per_prompt
+         + type_size<int32_t>      // num_videos_per_prompt
          + type_size<int32_t> * 2  // max_new_tokens, diffusion_steps
          + type_size<float> * 3    // temperature, top_p, repetition_penalty
          + type_size<int32_t>      // top_k

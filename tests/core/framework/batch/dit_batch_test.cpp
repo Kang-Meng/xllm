@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <utility>
 
 namespace xllm {
 namespace {
@@ -35,12 +36,13 @@ TEST(DiTBatchTest, SingleRequestSourcesUseBatchViews) {
   DiTGenerationParams generation_params;
   DiTOutputFunc output_func;
   DiTOutputsFunc outputs_func;
-  DiTRequestState state(input_params,
-                        generation_params,
-                        output_func,
-                        outputs_func,
+  DiTRequestState state(std::move(input_params),
+                        std::move(generation_params),
+                        std::move(output_func),
+                        std::move(outputs_func),
                         DiTRequestKind::kImage);
-  auto request = std::make_shared<DiTRequest>("request", "rid", "rtime", state);
+  auto request =
+      std::make_shared<DiTRequest>("request", "rid", "rtime", std::move(state));
 
   DiTBatch batch;
   batch.add(request);

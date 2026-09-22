@@ -46,7 +46,6 @@ class Call {
   const std::string& get_x_request_id() const { return x_request_id_; }
   const std::string& get_x_request_time() const { return x_request_time_; }
 
-  std::string take_request_payload();
   butil::IOBuf take_request_iobuf() {
     return butil::IOBuf(request_payload_.movable());
   }

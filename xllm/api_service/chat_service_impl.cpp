@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/request/rec_type.h"
 #include "core/framework/request/request_params.h"
+#include "core/util/binary_payload.h"
 #include "core/util/utils.h"
 #include "core/util/uuid.h"
 #include "mm_service_utils.h"
@@ -890,7 +891,7 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   auto saved_request_id = request_params.request_id;
   auto saved_tools = request_params.tools;
 
-  auto payload = call->take_request_payload();
+  BinaryPayload payload(call->take_request_iobuf());
 
   // schedule the request
   master_->handle_request(

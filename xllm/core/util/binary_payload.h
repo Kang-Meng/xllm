@@ -18,7 +18,9 @@ limitations under the License.
 #include <butil/iobuf.h>
 
 #include <cstddef>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace xllm {
 
@@ -28,10 +30,16 @@ class BinaryPayload final {
   explicit BinaryPayload(const butil::IOBuf& data);
   explicit BinaryPayload(butil::IOBuf&& data);
   explicit BinaryPayload(std::string_view data);
+  BinaryPayload(const BinaryPayload&) = default;
+  BinaryPayload& operator=(const BinaryPayload&) = default;
+  BinaryPayload(BinaryPayload&& other) noexcept;
+  BinaryPayload& operator=(BinaryPayload&& other) noexcept;
 
   size_t size() const;
   bool empty() const;
 
+  std::optional<std::string_view> contiguous_view(size_t offset,
+                                                  size_t length) const;
   bool copy_to(size_t offset, size_t length, void* target) const;
   bool copy_to(size_t offset, size_t length, std::string& target) const;
 

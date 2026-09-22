@@ -92,17 +92,22 @@ void DiTMaster::handle_request(DiTRequestParams params,
         [this] { get_rate_limiter()->decrease_one_request(); });
 
     Timer timer;
-    // verify the prompt
-    if (!params.verify_params(callback)) {
+    Status parse_status;
+    if (!params.parse_input_params(parse_status)) {
+      callback(DiTRequestOutput(std::move(parse_status)));
       return;
     }
-    DiTRequestState dit_state = DiTRequestState(params.input_params,
-                                                params.generation_params,
-                                                callback,
-                                                nullptr,
-                                                params.request_kind,
-                                                call);
-    rate_limit_guard.dismiss();
+    if (!params.verify_params(parse_status)) {
+      CALLBACK_WITH_ERROR(parse_status.code(), parse_status.message());
+      return;
+    }
+
+    DiTRequestState dit_state(std::move(params.input_params),
+                              std::move(params.generation_params),
+                              callback,
+                              nullptr,
+                              params.request_kind(),
+                              call);
     auto request = std::make_shared<DiTRequest>(params.request_id,
                                                 params.x_request_id,
                                                 params.x_request_time,
@@ -110,6 +115,7 @@ void DiTMaster::handle_request(DiTRequestParams params,
                                                 /*service_request_id=*/"",
                                                 /*source_xservice_addr=*/"",
                                                 get_rate_limiter());
+    rate_limit_guard.dismiss();
 
     if (!scheduler_->add_request(request)) {
       CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
@@ -125,7 +131,6 @@ void DiTMaster::handle_batch_request(std::vector<DiTRequestParams> params_vec,
     handle_request(std::move(params_vec[i]),
                    std::nullopt,
                    [i, callback](const DiTRequestOutput& output) {
-                     output.log_request_status();
                      return callback(i, output);
                    });
   }

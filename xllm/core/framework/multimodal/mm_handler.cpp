@@ -17,19 +17,52 @@ limitations under the License.
 
 #include <butil/base64.h>
 #include <butil/strings/string_number_conversions.h>
+#include <butil/strings/string_piece.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <string_view>
 
 #include "common/global_flags.h"
 #include "core/framework/config/multimodal_config.h"
+#include "core/util/binary_payload.h"
 #include "core/util/hash_util.h"
 #include "core/util/http_downloader.h"
 #include "mm_codec.h"
 #include "mm_embedding_handler.h"
 
 namespace xllm {
+namespace {
+
+bool parse_binary_range(std::string_view data, size_t& offset, size_t& length) {
+  const size_t separator = data.find(',');
+  if (separator == std::string_view::npos || separator == 0 ||
+      separator + 1 == data.size() ||
+      data.find(',', separator + 1) != std::string_view::npos) {
+    return false;
+  }
+
+  const std::string_view offset_text = data.substr(0, separator);
+  const std::string_view length_text = data.substr(separator + 1);
+  const auto is_decimal_digit = [](char value) {
+    return value >= '0' && value <= '9';
+  };
+  if (!std::all_of(offset_text.begin(), offset_text.end(), is_decimal_digit) ||
+      !std::all_of(length_text.begin(), length_text.end(), is_decimal_digit) ||
+      !butil::StringToSizeT(
+          butil::StringPiece(offset_text.data(), offset_text.size()),
+          &offset) ||
+      !butil::StringToSizeT(
+          butil::StringPiece(length_text.data(), length_text.size()),
+          &length)) {
+    return false;
+  }
+  return length > 0;
+}
+
+}  // namespace
 
 namespace {
 
@@ -45,7 +78,7 @@ const std::unordered_map<std::string, std::string>& global_download_headers() {
 
 MMErrCode MMHandlerBase::process(const MMContent& content,
                                  MMInputItem& input,
-                                 MMPayload& payload) {
+                                 const BinaryPayload& payload) {
   MMErrCode code = this->load(content, input, payload);
   if (code != MMErrCode::SUCCESS) return code;
 
@@ -61,7 +94,7 @@ MMErrCode MMHandlerBase::process(const MMContent& content,
 
 MMErrCode MMHandlerBase::load_from_dataurl(const std::string& url,
                                            std::string& raw_data,
-                                           MMPayload& payload) {
+                                           const BinaryPayload& payload) {
   size_t pos = url.find_first_of(';');
   if (pos == std::string::npos) return MMErrCode::LOAD_DATA_ERR;
 
@@ -78,18 +111,15 @@ MMErrCode MMHandlerBase::load_from_dataurl(const std::string& url,
     }
     return MMErrCode::SUCCESS;
   } else if (type == "binary") {
-    size_t len = 0;
-    bool res = butil::StringToSizeT(data, &len);
-    if (res) {
-      if (!payload.get(raw_data, len)) {
-        LOG(ERROR) << "load data from binary url failed, url is: " << url;
-        return MMErrCode::LOAD_DATA_ERR;
-      }
-      return MMErrCode::SUCCESS;
-    } else {
-      LOG(ERROR) << " data url is invalid, url is " << url;
+    size_t offset = 0;
+    size_t length = 0;
+    if (!parse_binary_range(
+            std::string_view(data.data(), data.size()), offset, length) ||
+        !payload.copy_to(offset, length, raw_data)) {
+      LOG(ERROR) << "load data from binary url failed, url is: " << url;
       return MMErrCode::LOAD_DATA_ERR;
     }
+    return MMErrCode::SUCCESS;
   } else {
     LOG(ERROR) << " data url is invalid, url is " << url;
     return MMErrCode::LOAD_DATA_ERR;
@@ -128,7 +158,7 @@ MMErrCode MMHandlerBase::load_from_http(
 
 MMErrCode ImageHandler::load(const MMContent& content,
                              MMInputItem& input,
-                             MMPayload& payload) {
+                             const BinaryPayload& payload) {
   input.clear();
 
   const auto& image_url = content.image_url;
@@ -165,7 +195,7 @@ MMErrCode ImageHandler::decode(MMInputItem& input) {
 
 MMErrCode VideoHandler::load(const MMContent& content,
                              MMInputItem& input,
-                             MMPayload& payload) {
+                             const BinaryPayload& payload) {
   input.clear();
 
   const auto& video_url = content.video_url;
@@ -214,7 +244,7 @@ MMErrCode VideoHandler::decode(MMInputItem& input) {
 
 MMErrCode AudioHandler::load(const MMContent& content,
                              MMInputItem& input,
-                             MMPayload& payload) {
+                             const BinaryPayload& payload) {
   input.clear();
 
   const auto& audio_url = content.audio_url;
@@ -261,7 +291,7 @@ MMHandlerSet::~MMHandlerSet() {}
 MMErrCode MMHandlerSet::process(const std::string& type,
                                 const MMContent& content,
                                 MMInputItem& input,
-                                MMPayload& payload) {
+                                const BinaryPayload& payload) {
   auto itor = handlers_.find(type);
   if (itor == handlers_.end()) {
     return MMErrCode::HANDLER_ERR;

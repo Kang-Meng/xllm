@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <string>
+#include <utility>
 
 namespace xllm {
 namespace {
@@ -27,9 +28,12 @@ DiTRequest create_request(DiTRequestKind request_kind,
   DiTInputParams input_params;
   DiTOutputFunc output_func;
   DiTOutputsFunc outputs_func;
-  DiTRequestState state(
-      input_params, generation_params, output_func, outputs_func, request_kind);
-  return DiTRequest("request", "x-request", "time", state);
+  DiTRequestState state(std::move(input_params),
+                        std::move(generation_params),
+                        std::move(output_func),
+                        std::move(outputs_func),
+                        request_kind);
+  return DiTRequest("request", "x-request", "time", std::move(state));
 }
 
 TEST(DiTRequestTest, GeneratesImageOutputByRequestKind) {

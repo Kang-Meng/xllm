@@ -49,13 +49,6 @@ void Call::init(std::string body_x_request_id, bool is_http_request) {
   init_request_payload();
 }
 
-std::string Call::take_request_payload() {
-  std::string payload;
-  request_payload_.copy_to(&payload);
-  request_payload_.clear();
-  return payload;
-}
-
 void Call::init_request_payload() {
   const auto infer_content_len =
       controller_->http_request().GetHeader(kInferContentLength);

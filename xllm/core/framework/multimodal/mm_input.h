@@ -24,6 +24,7 @@ limitations under the License.
 #include "core/common/message.h"
 #include "core/common/types.h"
 #include "core/framework/multimodal/embedding_output.h"
+#include "core/util/binary_payload.h"
 #include "core/util/hash_util.h"
 #include "mm_type.h"
 
@@ -70,35 +71,10 @@ struct MMInputItem {
   EmbeddingInput embedding;
 };
 
-struct MMPayload {
-  MMPayload() = default;
-  explicit MMPayload(std::string data, size_t offset = 0)
-      : data(std::move(data)), offset(offset) {}
-
-  bool get(std::string& value, size_t len) {
-    if (len == data.size()) {
-      value = std::move(data);
-      return true;
-    }
-
-    if (data.size() - offset < len) {
-      return false;
-    }
-
-    value = data.substr(offset, len);
-    offset += len;
-
-    return true;
-  }
-
-  std::string data;
-  size_t offset;
-};
-
 class MMInput {
  public:
   MMInput() = default;
-  explicit MMInput(std::string payload) : payload_(std::move(payload)) {}
+  explicit MMInput(BinaryPayload payload) : payload_(std::move(payload)) {}
 
   bool empty() const { return items_.empty(); }
   void clear() { items_.clear(); }
@@ -129,11 +105,10 @@ class MMInput {
 
   bool foreach (MMInputItem::IVisitor& v) const;
 
-  MMPayload& payload() { return payload_; }
-  const MMPayload& payload() const { return payload_; }
+  const BinaryPayload& payload() const { return payload_; }
 
  private:
-  MMPayload payload_;
+  BinaryPayload payload_;
   std::vector<MMInputItem> items_;
 };
 
@@ -182,10 +157,10 @@ class MMInputTransfer {
  private:
   MMErrCode trans_parallel(const MMContentVec& mmc,
                            std::vector<MMInputItem>& inputs,
-                           MMPayload& payload);
+                           const BinaryPayload& payload);
   MMErrCode trans(const MMContentVec& mmc,
                   std::vector<MMInputItem>& inputs,
-                  MMPayload& payload);
+                  const BinaryPayload& payload);
 
   std::unique_ptr<MMHandlerSet> mm_handlers_;
   std::unique_ptr<ThreadPool> threadpool_;

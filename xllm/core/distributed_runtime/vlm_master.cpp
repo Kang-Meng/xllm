@@ -273,7 +273,7 @@ void VLMMaster::handle_request(std::string prompt,
 
 void VLMMaster::handle_request(std::vector<Message> messages,
                                RequestParams sp,
-                               std::string payload,
+                               BinaryPayload payload,
                                OutputCallback callback,
                                bool use_prompt_as_is) {
   // Offline-only guard: fail loudly on the caller thread (pybind surfaces
@@ -375,7 +375,6 @@ void VLMMaster::handle_batch_request_with_image_urls(
         std::move(prompts[i]), image_urls[i]));
   }
 
-  std::string payload;
   for (size_t i = 0; i < num_requests; ++i) {
     // Offline vLLM-style requests hand in a final prompt. The text-only
     // offline path never applies the chat template either, so use the
@@ -385,7 +384,7 @@ void VLMMaster::handle_batch_request_with_image_urls(
         std::move(conversations[i]),
         // the sampling parameter may be shared
         sps.size() == 1 ? sps[0] : std::move(sps[i]),
-        std::move(payload),
+        BinaryPayload(),
         [i, callback](const RequestOutput& output) {
           output.log_request_status();
           return callback(i, output);
@@ -401,13 +400,12 @@ void VLMMaster::handle_batch_request(
   CHECK(conversations.size() == sps.size() || sps.size() == 1)
       << "Number of conversations and sampling parameters should be the same";
 
-  std::string payload;
   const size_t num_requests = conversations.size();
   for (size_t i = 0; i < num_requests; ++i) {
     handle_request(std::move(conversations[i]),
                    // the sampling parameter may be shared
                    sps.size() == 1 ? sps[0] : std::move(sps[i]),
-                   std::move(payload),
+                   BinaryPayload(),
                    [i, callback](const RequestOutput& output) {
                      output.log_request_status();
                      return callback(i, output);

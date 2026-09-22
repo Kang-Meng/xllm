@@ -682,7 +682,7 @@ void SpeechToTextServiceImpl::process_async_impl(
   master_->handle_request(
       std::move(messages),
       std::move(request_params),
-      std::move(audio_bytes),
+      BinaryPayload(audio_bytes),
       [call,
        model = std::move(model),
        task = task_,
