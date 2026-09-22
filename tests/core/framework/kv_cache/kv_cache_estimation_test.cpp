@@ -668,6 +668,103 @@ TEST(KVCacheEstimationTest,
   EXPECT_EQ(capacity.swa_count(), 22);
 }
 
+// The SWA ring backs both the live prefill burst and the rows of a published
+// prefix-cache checkpoint. The fair per-DP token budget only bounds the
+// former, so a ring sized from the per-DP share alone recycles checkpoint rows
+// before the next request can probe them and turns every cross-request prefix
+// hit into a full re-prefill. The ring must keep one publish unit of rows.
+TEST(KVCacheEstimationTest,
+     DeepSeekV4PdPrefillFairBudgetKeepsPrefixCachePublishUnit) {
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4")
+      .n_layers(3)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(257)
+      .compress_ratios({1, 4, 128});
+
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kFloat32;
+  options.kv_cache_dtype = "auto";
+  options.cache_size_in_bytes = 64 * 1024 * 1024;
+  options.block_size = 128;
+  options.max_seqs_per_batch = 4;
+  options.max_tokens_per_batch = 16384;
+  options.max_tokens_per_chunk_for_prefill = 4096;
+  options.enable_prefix_cache = true;
+  options.enable_dp_fair_token_budget = true;
+  options.dp_size = 4;
+  options.enable_disagg_pd = true;
+  options.instance_role = InstanceRole::PREFILL;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  // Four sequences retain three window blocks each, one C128 publish unit of
+  // checkpoint rows (128 blocks), four per-sequence tail blocks, and two
+  // guard blocks. The per-DP share alone would only fund 32 burst blocks.
+  EXPECT_EQ(capacity.swa_count(), 146);
+
+  // Without a compressed publish unit there is nothing to retain, so the
+  // per-DP share still sizes the ring.
+  KVCacheEstimateOptions no_prefix_options = options;
+  no_prefix_options.enable_prefix_cache = false;
+  const KVCacheCapacity no_prefix_capacity =
+      estimate_kv_cache_capacity(model_args, no_prefix_options);
+  EXPECT_EQ(no_prefix_capacity.swa_count(), 50);
+}
+
+// Same guard, replayed with the shipped DeepSeek-V4-Flash-0731-w8a8 shape and
+// the exact serving parameters of
+// deepseek_v4_xllm_perf_prefix_i30000_o1024_bs1_dp4_ep16, so this test predicts
+// the startup log line the CICD run prints:
+//   Initializing DSV4 kv cache with shape: [swa_count=162, ...]   (fixed)
+//   Initializing DSV4 kv cache with shape: [swa_count=66, ...]    (regression)
+// swa_count is a function of the window, max_seqs_per_batch, the per-step
+// token bound and the compress ratios only -- it does not depend on the memory
+// budget -- so the two budget cases below must agree.
+TEST(KVCacheEstimationTest, DeepSeekV4FlashPrefillSwaRingMatchesShippedShape) {
+  ModelArgs model_args;
+  // compress_ratios from DeepSeek-V4-Flash-0731-w8a8/config.json (46 entries;
+  // only the 43 real layers are read).
+  model_args.model_type("deepseek_v4")
+      .n_layers(43)
+      .head_dim(512)
+      .index_head_dim(128)
+      .index_n_heads(64)
+      .window_size(128)
+      .compress_ratios({0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 0, 0, 0});
+
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kBFloat16;
+  options.kv_cache_dtype = "auto";
+  options.cache_size_in_bytes = 64LL * 1024 * 1024 * 1024;
+  options.block_size = 128;
+  options.max_seqs_per_batch = 16;
+  options.max_tokens_per_batch = 16384;
+  options.max_tokens_per_chunk_for_prefill = 4096;
+  options.enable_chunked_prefill = true;
+  options.enable_prefix_cache = true;
+  options.enable_dp_fair_token_budget = true;
+  options.dp_size = 4;
+  options.enable_disagg_pd = true;
+  options.instance_role = InstanceRole::PREFILL;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  // window 128 / block 128 -> one window block per sequence, 16 sequences;
+  // 128 burst blocks for max_tokens_per_batch = 16384; 16 tail + 2 guard.
+  EXPECT_EQ(capacity.swa_count(), 162);
+  EXPECT_EQ(capacity.c4_count(), 32 * capacity.c128_count());
+
+  // The regression produced 66 = 16 + ceil((16384 / 4) / 128) + 16 + 2.
+  EXPECT_NE(capacity.swa_count(), 66);
+}
+
 TEST(KVCacheEstimationTest, DeepSeekV4PdDecodeUsesBatchTokenCapacity) {
   ModelArgs model_args;
   model_args.model_type("deepseek_v4")

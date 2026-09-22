@@ -380,6 +380,7 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
       std::max(options.max_seqs_per_batch, static_cast<int64_t>(1));
   int64_t burst_budget =
       std::max(options.max_tokens_per_batch, static_cast<int64_t>(0));
+  bool shrunk_to_per_group_share = false;
   if (options.enable_dp_fair_token_budget && options.dp_size > 1 &&
       options.instance_role == InstanceRole::PREFILL) {
     // The scheduler caps each DP group at max_tokens_per_batch / dp_size
@@ -398,8 +399,33 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
       per_group_cap = burst_budget;
     }
     burst_budget = per_group_cap;
+    shrunk_to_per_group_share = true;
   }
-  const int64_t burst_blocks = util::ceil_div(burst_budget, block_size);
+  // The SWA ring backs two independent demands and has to be sized for both:
+  //   (a) the live prefill burst, which the per-DP fair budget above bounds;
+  //   (b) the rows of a published prefix-cache checkpoint, because the
+  //       composite publishes prefix entries in C128-sized units and a unit is
+  //       only restorable while the SWA rows at that checkpoint are still
+  //       resident (trim_swa_compressed discards a checkpoint whose rows were
+  //       recycled).
+  // Sizing for (a) alone starves (b) as soon as the per-DP share drops below
+  // one publish unit: the ring then recycles checkpoint rows before the next
+  // request probes them, every cross-request prefix hit degrades to a miss,
+  // and the request silently re-prefills its whole prompt. Keep at least one
+  // publish unit worth of SWA rows alive whenever one can be published. The
+  // unit is the largest compress ratio, i.e. the number of base blocks the
+  // composite stages per published C128 checkpoint.
+  int64_t publish_unit_blocks = 0;
+  if (shrunk_to_per_group_share && options.enable_prefix_cache) {
+    for (const int32_t ratio : compress_ratios) {
+      if (ratio > 1) {
+        publish_unit_blocks =
+            std::max(publish_unit_blocks, static_cast<int64_t>(ratio));
+      }
+    }
+  }
+  const int64_t burst_blocks =
+      std::max(util::ceil_div(burst_budget, block_size), publish_unit_blocks);
   cache_cost.swa_count =
       swa_blocks_per_seq * max_seqs + burst_blocks + max_seqs + 2;
 
