@@ -31,7 +31,8 @@ class LinearStateBlockManager final : public BlockManagerImpl {
   explicit LinearStateBlockManager(uint32_t num_slots,
                                    int32_t chunk_stride,
                                    bool enable_prefix_cache = true,
-                                   bool instance_is_decode = false);
+                                   bool instance_is_decode = false,
+                                   uint32_t num_speculative_tokens = 0);
   ~LinearStateBlockManager() override = default;
 
   std::optional<std::vector<Block>> allocate_for_sequence(
@@ -59,8 +60,8 @@ class LinearStateBlockManager final : public BlockManagerImpl {
   void retain_read_source(KVCacheState& kv_state);
   std::optional<std::vector<Block>> allocate_prefill(Sequence* seq,
                                                      KVCacheState& kv_state);
-  std::optional<std::vector<Block>> allocate_decode(
-      const KVCacheState& kv_state);
+  std::optional<std::vector<Block>> allocate_decode(Sequence* seq,
+                                                    KVCacheState& kv_state);
 
   friend class BlockManagerPoolTestPeer;
 };

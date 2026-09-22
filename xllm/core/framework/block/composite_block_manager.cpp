@@ -175,7 +175,8 @@ CompositeBlockManager::LeafMap build_composite_leaves(
                     static_cast<uint32_t>(options.linear_state_num_slots()),
                     chunk_stride,
                     linear_prefix_cache,
-                    is_decode),
+                    is_decode,
+                    options.num_speculative_tokens()),
                 options),
             /*participates_in_admission=*/false,
             /*supports_prefix_cache=*/linear_prefix_cache});

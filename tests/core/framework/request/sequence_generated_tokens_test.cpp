@@ -74,6 +74,7 @@ TEST(SequenceGeneratedTokensTest, CountsRealAppendedTokens) {
   sequence.append_token(Token(11));
 
   EXPECT_EQ(sequence.generated_tokens_since_latency(), 2u);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 4u);
 }
 
 TEST(SequenceGeneratedTokensTest, TbtResetsGeneratedTokenCount) {
@@ -100,6 +101,7 @@ TEST(SequenceGeneratedTokensTest, IgnoresOverlapFakeTokens) {
   sequence.append_token(Token(-1));
 
   EXPECT_EQ(sequence.generated_tokens_since_latency(), 0u);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 0u);
 }
 
 TEST(SequenceGeneratedTokensTest, CountsOverlapCommittedTokens) {
@@ -111,6 +113,7 @@ TEST(SequenceGeneratedTokensTest, CountsOverlapCommittedTokens) {
   sequence.update_last_step_token(Token(11), /*token_offset=*/0);
 
   EXPECT_EQ(sequence.generated_tokens_since_latency(), 2u);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 0u);
 }
 
 class RequestGeneratedTokenUsageTest

@@ -889,6 +889,7 @@ TEST(SequenceTest, JsonObjectCommitAdvancesGrammarOnce) {
 
   EXPECT_EQ(sequence.num_tokens(), original_num_tokens + 1);
   EXPECT_EQ(sequence.tokens()[sequence.num_prompt_tokens()], 0);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2u);
   const JsonObjectGrammarState* state = sequence.json_object_state();
   ASSERT_NE(state, nullptr);
   EXPECT_EQ(state->snapshot().token_ids, std::vector<int32_t>({0}));
@@ -934,6 +935,7 @@ TEST(SequenceTest, JsonObjectOverlapCommitAdvancesGrammarOnce) {
 
   EXPECT_EQ(sequence.num_tokens(), placeholder_num_tokens);
   EXPECT_EQ(sequence.tokens()[sequence.num_prompt_tokens()], 0);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2u);
   const JsonObjectGrammarState* committed_state = sequence.json_object_state();
   ASSERT_NE(committed_state, nullptr);
   EXPECT_EQ(committed_state->snapshot().token_ids, std::vector<int32_t>({0}));
@@ -1008,6 +1010,7 @@ TEST(SequenceTest, JsonObjectCommitMismatchFailsBeforeTokenMutation) {
   EXPECT_NO_FATAL_FAILURE(sequence.append_token(Token(/*id=*/1)));
 
   EXPECT_EQ(sequence.num_tokens(), original_num_tokens);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 0u);
   ASSERT_TRUE(sequence.error_status().has_value());
   EXPECT_TRUE(sequence.finished());
   const JsonObjectGrammarState* state = sequence.json_object_state();
@@ -1051,6 +1054,7 @@ TEST(SequenceTest, JsonObjectOverlapMismatchKeepsPlaceholderToken) {
 
   EXPECT_EQ(sequence.num_tokens(), original_num_tokens);
   EXPECT_EQ(sequence.tokens()[sequence.num_prompt_tokens()], -1);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 0u);
   ASSERT_TRUE(sequence.error_status().has_value());
   EXPECT_TRUE(sequence.finished());
   const JsonObjectGrammarState* state = sequence.json_object_state();
@@ -2897,7 +2901,26 @@ TEST(BatchTest, DecodeDestinationIsOwnedOnlyBySequence) {
   EXPECT_EQ(reclaimed.front().ref_count(), 1u);
 }
 
-TEST(BatchTest, OverlapRawAcceptanceKeepsSingleLinearSlot) {
+TEST(BatchTest, ResultConfirmsForwardCacheProgress) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(16);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_basic_sequence({1, 2, 3});
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+
+  Batch batch;
+  batch.add(&sequence, 3);
+  batch.prepare_forward_input(1, 0, ModelArgs());
+  EXPECT_EQ(sequence.kv_cache_tokens_num(), 3u);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 0u);
+
+  RawForwardOutput output;
+  output.outputs.emplace_back(make_raw_sample_output(8, std::nullopt));
+  batch.process_sample_output(output, /*replace_fake_token=*/false);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 3u);
+}
+
+TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   ScopedPrefillChunkStride chunk_stride(2048);
   const bool previous_overlap =
       SchedulerConfig::get_instance().enable_schedule_overlap();
@@ -2906,7 +2929,7 @@ TEST(BatchTest, OverlapRawAcceptanceKeepsSingleLinearSlot) {
   options.num_blocks(2048)
       .block_size(2)
       .enable_linear_state(true)
-      .linear_state_num_slots(2)
+      .linear_state_num_slots(3)
       .num_speculative_tokens(3)
       .enable_prefix_cache(false);
   CompositeBlockManager manager(build_composite_leaves(options), options);
@@ -2926,21 +2949,27 @@ TEST(BatchTest, OverlapRawAcceptanceKeepsSingleLinearSlot) {
   prefill.add(&sequence, 2046);
   prefill.prepare_forward_input(1, 0, args);
   prefill.process_sample_output(fake, false);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 0u);
   prefill.process_sample_output(first_token, true);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2046u);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
   Batch first;
   first.add(&sequence, 1);
   first.prepare_forward_input(1, 0, args);
   const int32_t first_output_id = sequence.get_linear_state_slot_id();
   first.process_sample_output(fake, false);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2046u);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
   Batch second;
   second.add(&sequence, 1);
   ForwardInput second_input = second.prepare_forward_input(1, 0, args);
-  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(second_input.input_params.embedding.linear_state_read_ids.front(),
             first_output_id);
+  EXPECT_NE(second_input.input_params.embedding.linear_state_ids.front(),
+            first_output_id);
   second.process_sample_output(fake, false);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2046u);
   RawForwardOutput accepted;
   RawSampleOutput accepted_row;
   accepted_row.tokens.reserve(4);
@@ -2951,9 +2980,10 @@ TEST(BatchTest, OverlapRawAcceptanceKeepsSingleLinearSlot) {
   accepted.outputs.emplace_back(std::move(accepted_row));
   first.process_sample_output(accepted, true);
   EXPECT_EQ(sequence.kv_cache_tokens_num(), 2051u);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2050u);
   const int32_t source_id = sequence.get_linear_state_slot_id();
-  EXPECT_EQ(source_id, first_output_id);
-  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_NE(source_id, first_output_id);
+  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
   Batch third;
   third.add(&sequence, 1);
@@ -2966,6 +2996,7 @@ TEST(BatchTest, OverlapRawAcceptanceKeepsSingleLinearSlot) {
   third.process_sample_output(fake, false);
   accepted.outputs.front().tokens.resize(2);
   second.process_sample_output(accepted, true);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2052u);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
@@ -3020,7 +3051,7 @@ TEST(BatchTest, IntermediatePrefillAdvancesCacheProgress) {
   }
 }
 
-TEST(BatchTest, OverlapDecodeReusesPrefillTailBeforeAndAfterResults) {
+TEST(BatchTest, OverlapDecodeProtectsPrefillTailNearCheckpoint) {
   ScopedModelImpl model_impl("native");
   ScopedPrefillChunkStride chunk_stride(2048);
   RequestSamplingParam sampling;
@@ -3083,10 +3114,10 @@ TEST(BatchTest, OverlapDecodeReusesPrefillTailBeforeAndAfterResults) {
 
       ASSERT_TRUE(
           manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
-      ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+      ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
       EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
                 source_id);
-      EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+      EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
       manager.deallocate_for_sequence(&sequence);
     }
   }
@@ -3200,6 +3231,7 @@ TEST(BatchTest, OverlapTensorAcceptanceUpdatesCacheProgress) {
   accepted.next_tokens = torch::tensor({{9, 10, 11, -1}}, torch::kInt64);
   first.process_sample_output(accepted, true);
   EXPECT_EQ(sequence.kv_cache_tokens_num(), 7u);
+  EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 6u);
 }
 
 TEST(BatchTest, ThreadedInputBuildKeepsLinearOwnershipInSequences) {
@@ -3681,6 +3713,7 @@ TEST(BatchTest, KeepTargetsForOverlapReplacement) {
   fake_output.outputs.push_back(make_raw_sample_output(-1, std::nullopt));
   batch.process_sample_output(fake_output, /*replace_fake_token=*/false);
   EXPECT_EQ(seq.tokens()[seq.num_prompt_tokens()], -1);
+  EXPECT_EQ(seq.last_confirmed_cached_tokens_num(), 0u);
   EXPECT_FALSE(seq.finished());
 
   RawForwardOutput real_output;
@@ -3688,6 +3721,7 @@ TEST(BatchTest, KeepTargetsForOverlapReplacement) {
   batch.process_sample_output(real_output, /*replace_fake_token=*/true);
 
   EXPECT_EQ(seq.tokens()[seq.num_prompt_tokens()], 101);
+  EXPECT_EQ(seq.last_confirmed_cached_tokens_num(), seq.num_prompt_tokens());
   EXPECT_TRUE(seq.finished());
 
   SchedulerConfig::get_instance().enable_schedule_overlap(
@@ -3906,6 +3940,7 @@ TEST(BatchTest, OverlapMTPReplacementSkipsPreemptedSequenceWithoutKVBlocks) {
       batch.process_sample_output(real_output, /*replace_fake_token=*/true));
   EXPECT_EQ(seq.num_generated_tokens(), 1);
   EXPECT_EQ(seq.tokens()[seq.num_prompt_tokens()], 101);
+  EXPECT_EQ(seq.last_confirmed_cached_tokens_num(), 0u);
 
   SchedulerConfig::get_instance().enable_schedule_overlap(
       old_enable_schedule_overlap);

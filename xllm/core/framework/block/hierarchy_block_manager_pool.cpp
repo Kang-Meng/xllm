@@ -562,6 +562,10 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
+  // TODO: LINEAR offload must retain the confirmed historical slot before the
+  // HBM leaf trims it, select the exact speculative checkpoint, pin it through
+  // D2H, then publish it to Host/Store. FLAT_KV_LINEAR remains unsupported by
+  // the hierarchy manager until that ownership and transfer protocol exists.
   if (!composite->allocate_sequence(sequence, num_tokens)) {
     release_host_match(sequence, dp_rank);
     return false;

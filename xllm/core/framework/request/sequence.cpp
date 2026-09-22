@@ -326,6 +326,8 @@ Sequence::Sequence(const Sequence& other, size_t index)
       host_kv_state_(other.host_kv_state_),
       effective_restore_tokens_(other.effective_restore_tokens_),
       host_cache_copy_units_(other.host_cache_copy_units_),
+      last_confirmed_cached_tokens_num_(
+          other.last_confirmed_cached_tokens_num_),
       latest_generate_time_(other.latest_generate_time_),
       time_to_first_token_latency_seconds_(
           other.time_to_first_token_latency_seconds_),
@@ -504,6 +506,8 @@ void Sequence::append_token(const Token& token) {
     return;
   }
 
+  set_last_confirmed_cached_tokens_num(cur_idx);
+
   // A real token was committed (overlap-fake placeholders returned above).
   ++generated_tokens_since_latency_;
   if (need_unique_tokens_) {
@@ -527,7 +531,6 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   if (error_status().has_value()) {
     return;
   }
-
   const int32_t token_id = static_cast<int32_t>(token.id);
   if (!try_commit_json_object_token(token_id,
                                     static_cast<int64_t>(token_offset))) {
@@ -557,6 +560,11 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
 
   // A real token is committed here (one per call, including the extra accepted
   // MTP token when token_offset > 0); preempted MTP steps returned above.
+  // kv_cache_tokens_num may already include later overlap placeholders, while
+  // cur_generated_token_idx_ identifies this result's confirmed cache cursor.
+  if (kv_state_.current_max_tokens_capacity() > 0) {
+    set_last_confirmed_cached_tokens_num(cur_generated_token_idx_);
+  }
   ++generated_tokens_since_latency_;
 
   tokens_[cur_generated_token_idx_] = token_id;
@@ -959,6 +967,7 @@ void Sequence::reset() {
   kv_state_.reset();
   host_kv_state_.reset();
   clear_host_cache_match();
+  set_last_confirmed_cached_tokens_num(0);
   volatile_num_prompt_tokens_ = num_tokens_;
 }
 
