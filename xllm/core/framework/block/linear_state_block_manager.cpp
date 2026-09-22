@@ -130,6 +130,22 @@ void LinearStateBlockManager::cache_read_source(Sequence* seq,
 std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
     Sequence* seq,
     KVCacheState& kv_state) {
+  // If the sequence's effective restore boundary is ahead of this tier's
+  // cursor, the existing slot belongs to a shorter cache hit. Drop it without
+  // inserting into this tier's prefix cache, then build the two-slot
+  // [restore, live] window. The rule applies identically to HBM and Host
+  // states; the caller identifies the tier by the KVCacheState reference.
+  if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num()) {
+    std::vector<Block> old_blocks = kv_state.take_blocks(BlockType::LINEAR);
+    deallocate(old_blocks);
+    std::vector<Block> allocated = BlockManagerImpl::allocate(2);
+    if (allocated.size() != 2) {
+      deallocate(allocated);
+      return std::nullopt;
+    }
+    return allocated;
+  }
+
   cache_read_source(seq, kv_state);
   retain_read_source(kv_state);
   std::vector<Block> allocated = BlockManagerImpl::allocate(1);
