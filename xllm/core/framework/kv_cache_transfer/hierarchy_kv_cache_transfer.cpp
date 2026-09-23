@@ -109,14 +109,38 @@ BlockTypeTensorMap build_block_type_tensor_map(const KVCache& kv_cache,
                         index_cache_scale.value());
       }
       return tensors;
-    case BlockType::LINEAR:
-      if (has_tensor(conv_cache)) {
-        tensors.emplace(KVCacheTensorRole::CONV, conv_cache);
+    case BlockType::LINEAR: {
+      if (!has_tensor(conv_cache) && !has_tensor(ssm_cache)) {
+        return {};
       }
-      if (has_tensor(ssm_cache)) {
-        tensors.emplace(KVCacheTensorRole::SSM, ssm_cache);
-      }
+      CHECK(has_tensor(conv_cache) && has_tensor(ssm_cache))
+          << "LINEAR transfer requires both Conv and SSM cache tensors.";
+      CHECK_EQ(ssm_cache.size(0) % conv_cache.size(0), 0)
+          << "SSM rows must be divisible by logical LINEAR slots.";
+      const int64_t checkpoint_stride = ssm_cache.size(0) / conv_cache.size(0);
+      std::vector<int64_t> logical_ssm_shape = ssm_cache.sizes().vec();
+      logical_ssm_shape[0] = checkpoint_stride;
+      logical_ssm_shape.insert(logical_ssm_shape.begin(), conv_cache.size(0));
+      constexpr int64_t kCommittedConvRows = 3;
+#if defined(USE_MUSA)
+      constexpr int64_t kDeviceConvHistoryAxis = 2;
+#else
+      constexpr int64_t kDeviceConvHistoryAxis = 1;
+#endif
+      CHECK_GT(conv_cache.dim(), kDeviceConvHistoryAxis);
+      CHECK_GE(conv_cache.size(kDeviceConvHistoryAxis), kCommittedConvRows)
+          << "LINEAR Host transfer requires three committed Conv rows.";
+      torch::Tensor transfer_conv_cache =
+          conv_cache.narrow(kDeviceConvHistoryAxis,
+                            /*start=*/0,
+                            /*length=*/kCommittedConvRows);
+      torch::Tensor transfer_ssm_cache =
+          ssm_cache.view(std::move(logical_ssm_shape))
+              .narrow(/*dim=*/1, /*start=*/0, /*length=*/1);
+      tensors.emplace(KVCacheTensorRole::CONV, transfer_conv_cache);
+      tensors.emplace(KVCacheTensorRole::SSM, transfer_ssm_cache);
       return tensors;
+    }
     case BlockType::SWA:
       // The persistent SWA window is restored for every DSV4 layer.
       if (has_tensor(swa_cache)) {

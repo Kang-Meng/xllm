@@ -1479,13 +1479,11 @@ TEST_P(LinearStateWindowTest, PrefillLeafUsesExplicitState) {
 
     auto allocated = leaf->allocate_for_sequence(&sequence, kv_state, 8);
     ASSERT_TRUE(allocated.has_value());
-    ASSERT_EQ(allocated->size(), 1u);
-    ASSERT_EQ(kv_state.num_blocks(BlockType::LINEAR), 1u);
-    EXPECT_EQ(kv_state.blocks(BlockType::LINEAR).front().id(),
-              retained_source_id);
+    ASSERT_EQ(allocated->size(), 2u);
+    EXPECT_TRUE(kv_state.blocks(BlockType::LINEAR).empty());
+    EXPECT_EQ(kv_state.num_cached_blocks(BlockType::LINEAR), 0u);
     EXPECT_NE(allocated->front().id(), retained_source_id);
-    EXPECT_EQ(kv_state.num_cached_blocks(BlockType::LINEAR),
-              GetParam() ? 1u : 0u);
+    EXPECT_NE(allocated->back().id(), retained_source_id);
     EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::LINEAR), 0u);
     EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
     EXPECT_EQ(sequence.get_linear_state_slot_id(), sequence_source_id);

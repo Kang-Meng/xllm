@@ -257,6 +257,9 @@ std::vector<Block> LinearStateBlockManager::allocate_shared(
   }
   std::vector<Block> blocks = prefix_cache_->match(
       token_ids.slice(0, token_ids.size() - 1), {}, MMData(), block_hashes);
+  VLOG(1) << "[HostCache][LinearMatch] manager=" << this
+          << " decode=" << options_.instance_is_decode()
+          << " blocks=" << blocks.size();
   for (const Block& block : blocks) {
     if (block.is_valid() && mark_used(&usage_accounted_ids_, block.id())) {
       num_used_blocks_.fetch_add(1, std::memory_order_relaxed);
@@ -275,6 +278,9 @@ void LinearStateBlockManager::cache(const Slice<int32_t>& token_ids,
   }
   const size_t publish_end =
       std::min(token_ids.size() / block_size(), blocks.size() - 1);
+  VLOG(1) << "[HostCache][LinearCache] manager=" << this
+          << " decode=" << options_.instance_is_decode()
+          << " blocks=" << blocks.size() << " publish_end=" << publish_end;
   if (publish_end <= existed_shared_blocks_num) {
     return;
   }

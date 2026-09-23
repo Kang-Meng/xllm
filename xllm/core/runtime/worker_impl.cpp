@@ -909,16 +909,27 @@ void WorkerImpl::prepare_linear_state_cache(ModelInputParams& params) {
     return;
   }
 
+  const bool is_prefill = params.meta.batch_forward_type.no_decode();
   bool reads_distinct_state = false;
 #if defined(USE_NPU)
   const ModelArgs& args = context_.get_model_args();
   const bool is_python_model = ModelConfig::is_python_model_impl(
       ModelConfig::get_instance().model_impl());
+  const bool is_qwen_target = is_qwen3_5_target_model_type(args.model_type());
   reads_distinct_state =
-      (is_python_model && args.model_type() == "glm5_next" &&
+      (is_python_model && is_glm5_next_target_model(args) &&
        params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) ||
-      (!is_python_model && is_qwen3_5_target_model_type(args.model_type()));
+      (!is_python_model && is_qwen_target);
 #endif
+  if (is_prefill && params.meta.requires_host_restore) {
+    CHECK(hierarchy_kv_cache_transfer_ != nullptr)
+        << "Missing Host restore manager at batch_id=" << params.meta.batch_id;
+    hierarchy_kv_cache_transfer_->set_layer_synchronizer(params);
+  }
+  if (is_prefill && params.parallel.layer_wise_load_synchronizer != nullptr) {
+    CHECK(params.synchronize_all_layers())
+        << "failed to wait for Host cache load before LINEAR state restore";
+  }
   // TODO: need remove when all device support none D2D
   restore_linear_state_slots(kv_caches_,
                              params.embedding.linear_state_ids,
@@ -1343,7 +1354,6 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     ensure_forward_input_device_tensors(processed_input, device_);
 
     auto& input_params = processed_input.input_params;
-
     bool empty_shard = input_params.meta.num_sequences == 0 &&
                        (!processed_input.token_ids.defined() ||
                         processed_input.token_ids.numel() == 0);

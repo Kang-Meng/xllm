@@ -41,7 +41,7 @@ void finalize_host_blocks(bool publish,
                           std::vector<Block> host_blocks,
                           const std::vector<BlockType>& block_types,
                           CompositeBlockManager* host_manager) {
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
   CHECK_EQ(host_blocks.size(), block_types.size());
   std::unordered_map<BlockType, std::vector<Block>> blocks_by_type;
   for (size_t i = 0; i < host_blocks.size(); ++i) {
@@ -49,6 +49,9 @@ void finalize_host_blocks(bool publish,
   }
 
   for (auto& [type, blocks] : blocks_by_type) {
+    VLOG(1) << "[HostCache][OffloadComplete] type="
+            << static_cast<int32_t>(type) << " blocks=" << blocks.size()
+            << " publish=" << publish;
     if (publish) {
       host_manager->cache_blocks(type, blocks);
     }
@@ -305,7 +308,7 @@ void finalize_prefetch(Sequence* sequence,
                        size_t final_tokens,
                        bool publish) {
   CHECK(sequence != nullptr);
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
   const auto& leaves = host_manager->leaf_entries();
   trim_prefetch_state(sequence, leaves, publish ? final_tokens : 0);
   KVCacheState& host_state = sequence->host_kv_state();
@@ -416,7 +419,7 @@ void HierarchyBlockManagerPool::release_host_match(Sequence* sequence,
   CHECK(sequence != nullptr);
   KVCacheState& host_state = sequence->host_kv_state();
   auto* host_manager = host_block_managers_[dp_rank].get();
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
   host_manager->deallocate_for_sequence(sequence, host_state);
   host_state.reset();
   sequence->clear_host_cache_match();
@@ -436,7 +439,7 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   // deallocate; their host ids stay reserved (held by the queue) until the
   // D2H copy completes and the offload callback caches + frees them.
   auto* host_manager = host_block_managers_[dp_rank].get();
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
   host_manager->deallocate_for_sequence(sequence, sequence->host_kv_state());
 
   // Release device blocks via the composite (includes prefix cache flush).
@@ -450,7 +453,7 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
   if (!options_.enable_prefix_cache()) {
     return;
   }
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
 
   KVCacheState& hbm_state = sequence->kv_state();
   KVCacheState& host_state = sequence->host_kv_state();
@@ -462,6 +465,12 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
     CHECK_GT(block_size, 0u);
 
     if (type == BlockType::LINEAR) {
+      VLOG(1) << "[HostCache][LinearOffload] seq=" << sequence->seq_id()
+              << " stage=" << static_cast<int>(sequence->stage())
+              << " hbm_tokens=" << hbm_state.kv_cache_tokens_num()
+              << " host_tokens=" << host_state.kv_cache_tokens_num()
+              << " hbm_blocks=" << hbm_blocks->size()
+              << " host_blocks=" << host_blocks->size();
       if (!sequence->is_prefill_stage() || hbm_blocks->empty()) {
         continue;
       }
@@ -505,6 +514,8 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
           OffloadBlockPair{/*src=*/hbm_block,
                            /*dst=*/host_destination,
                            /*block_type=*/BlockType::LINEAR});
+      VLOG(1) << "[HostCache][LinearOffloadEnqueue] seq=" << sequence->seq_id()
+              << " src=" << hbm_block.id() << " dst=" << host_destination.id();
       offload_block_pair_queues_[dp_rank].enqueue(std::move(pair));
       queued_offload = true;
       continue;
@@ -641,7 +652,7 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   KVCacheState& host_state = sequence->host_kv_state();
   auto* host_manager = host_block_managers_[dp_rank].get();
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
   if (!host_manager->allocate_sequence(sequence, host_state, num_tokens)) {
     host_manager->release_out_of_window_for_sequence(sequence, host_state);
   }
@@ -657,7 +668,7 @@ void HierarchyBlockManagerPool::collect_load_block_transfer_infos(
     Sequence* sequence) {
   const int32_t dp_rank = sequence->dp_rank();
   const auto* host_manager = host_block_managers_[dp_rank].get();
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
   KVCacheState& host_state = sequence->host_kv_state();
   KVCacheState& hbm_state = sequence->kv_state();
   const size_t host_cached_tokens = host_state.kv_cache_tokens_num();
@@ -745,7 +756,7 @@ void HierarchyBlockManagerPool::allocate_shared(Sequence* sequence) {
   KVCacheState& host_state = sequence->host_kv_state();
   if (!host_state.prefix_cache_matched()) {
     auto* host_manager = host_block_managers_[dp_rank].get();
-    CHECK(host_manager != nullptr);
+    CHECK(host_manager);
     host_manager->allocate_shared_for_sequence(sequence, host_state);
     host_state.set_prefix_cache_matched();
   }
@@ -849,7 +860,7 @@ bool HierarchyBlockManagerPool::should_probe_prefix_cache(
 BlockManager* HierarchyBlockManagerPool::leaf_of(BlockType type,
                                                  int32_t dp_rank) const {
   const auto* host_manager = host_block_managers_[dp_rank].get();
-  CHECK(host_manager != nullptr);
+  CHECK(host_manager);
   const auto& leaves = host_manager->leaf_entries();
   const auto leaf = leaves.find(type);
   return leaf == leaves.end() ? nullptr : leaf->second.leaf.get();
@@ -891,7 +902,7 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
     const CompositeBlockManager::LeafCombination combination =
         composite->leaf_combination();
     auto* host_manager = host_block_managers_[dp_rank].get();
-    CHECK(host_manager != nullptr);
+    CHECK(host_manager);
     const CompositeBlockManager::LeafMap& host_leaves =
         host_manager->leaf_entries();
     const size_t unit_size = prefetch_unit_size(combination, host_leaves);

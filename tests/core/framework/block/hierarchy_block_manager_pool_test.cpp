@@ -807,18 +807,13 @@ TEST(HierarchyBlockManagerPoolTest,
   pool.deallocate(&sequence);
 }
 
-TEST(HierarchyBlockManagerPoolTest,
-     EmptyHostConfigurationKeepsDeviceAllocation) {
+TEST(HierarchyBlockManagerPoolTest, EmptyHostConfigurationRejectsAllocation) {
   BlockManagerPool::Options options = make_flat_kv_options();
   options.host_num_blocks(0).host_num_blocks_by_type({});
   HierarchyBlockManagerPool pool(options, nullptr, 1);
   EXPECT_EQ(HierarchyPoolTestPeer::host_block_managers(pool).front(), nullptr);
   Sequence sequence = make_test_sequence(0, std::vector<int32_t>(257, 23));
-  ASSERT_TRUE(pool.allocate(&sequence, 257));
-  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 3u);
-  EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
-  EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
-  pool.deallocate(&sequence);
+  EXPECT_DEATH(pool.allocate(&sequence, 257), "host_manager");
 }
 
 TEST(HierarchyBlockManagerPoolTest, FailedHbmAllocationDoesNotQueueH2d) {
@@ -1428,7 +1423,8 @@ TEST(HierarchyBlockManagerPoolTest, H2dUsesCachedTokensInsteadOfPublishCursor) {
               restore_tokens / kBlockSize);
     EXPECT_EQ(host_state.num_blocks(BlockType::KV),
               (kPromptTokens + kBlockSize - 1) / kBlockSize);
-    EXPECT_EQ(host_state.kv_cache_tokens_num(), kHostCachedTokens);
+    EXPECT_EQ(host_state.kv_cache_tokens_num(),
+              std::max(kHostCachedTokens, initial_hbm_tokens));
     ASSERT_TRUE(pool.allocate(sequence, kPromptTokens));
     EXPECT_EQ(HierarchyPoolTestPeer::pending_load_infos(pool).size(),
               transfers.size());

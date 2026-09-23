@@ -46,25 +46,44 @@ LinearAttentionKVCacheImpl::LinearAttentionKVCacheImpl(
   CHECK(type == BlockType::LINEAR)
       << "LinearAttentionKVCacheImpl host cache only supports "
          "BlockType::LINEAR.";
+  CHECK(kv_cache_shape.has_conv_cache_shape() &&
+        kv_cache_shape.has_ssm_cache_shape())
+      << "Host LINEAR cache requires both Conv and SSM tensors.";
+  const std::vector<int64_t>& device_conv_shape =
+      kv_cache_shape.conv_cache_shape();
+  const std::vector<int64_t>& device_ssm_shape =
+      kv_cache_shape.ssm_cache_shape();
+  CHECK(kv_cache_shape.has_key_cache_shape())
+      << "Host LINEAR cache capacity requires the KV cache shape.";
+  const int64_t host_slot_count = scale_host_block_count(
+      kv_cache_shape.key_cache_shape()[0], create_options.host_blocks_factor());
+
   host_page_aligned_regions_.reserve(2);
-  if (kv_cache_shape.has_conv_cache_shape()) {
-    create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.conv_cache_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
-        create_options.dtype(),
-        &conv_cache_,
-        &conv_cache_shape_);
-  }
-  if (kv_cache_shape.has_ssm_cache_shape()) {
-    create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.ssm_cache_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
-        create_options.ssm_dtype(),
-        &ssm_cache_,
-        &ssm_cache_shape_);
-  }
+  std::vector<int64_t> host_conv_shape = device_conv_shape;
+  host_conv_shape[0] = host_slot_count;
+#if defined(USE_MUSA)
+  constexpr int64_t kConvHistoryAxis = 2;
+#else
+  constexpr int64_t kConvHistoryAxis = 1;
+#endif
+  constexpr int64_t kCommittedConvRows = 3;
+  CHECK_GT(host_conv_shape.size(), kConvHistoryAxis);
+  CHECK_GE(host_conv_shape[kConvHistoryAxis], kCommittedConvRows);
+  host_conv_shape[kConvHistoryAxis] = kCommittedConvRows;
+  host_conv_shape.insert(host_conv_shape.begin() + 1, layer_count);
+  create_host_tensor(host_conv_shape,
+                     create_options.dtype(),
+                     &conv_cache_,
+                     &conv_cache_shape_);
+
+  std::vector<int64_t> host_ssm_shape = device_ssm_shape;
+  host_ssm_shape[0] = 1;
+  host_ssm_shape.insert(host_ssm_shape.begin(), layer_count);
+  host_ssm_shape.insert(host_ssm_shape.begin(), host_slot_count);
+  create_host_tensor(host_ssm_shape,
+                     create_options.ssm_dtype(),
+                     &ssm_cache_,
+                     &ssm_cache_shape_);
 }
 
 torch::Tensor LinearAttentionKVCacheImpl::get_conv_cache() const {

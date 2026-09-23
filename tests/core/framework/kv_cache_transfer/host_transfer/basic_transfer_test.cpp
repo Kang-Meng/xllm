@@ -150,6 +150,7 @@ TEST(BasicHostKVTransferTest, RoundTripUsesConfiguredLayerEventGroups) {
                                device,
                                *compute_stream,
                                /*layer_copy_batches=*/2);
+  ASSERT_EQ(compute_stream->synchronize(), 0);
 
   const HostKVRequest offload_request{{HostKVMapping{5, 0, 0}}};
   ASSERT_TRUE(transfer.offload(offload_request));

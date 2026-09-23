@@ -1106,6 +1106,98 @@ TEST_F(HostKVCacheConfigTest, AcceptsSupportedGroupedCacheLayout) {
   EXPECT_FALSE(validate_host_cache_options(options).has_value());
 }
 
+#if !defined(USE_NPU)
+TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
+  KVCacheCapacity capacity;
+  capacity.n_blocks(8)
+      .block_size(16)
+      .num_linear_state_blocks(4)
+      .linear_conv_state_len(5)
+      .linear_ssm_checkpoint_stride(3);
+  ModelArgs model_args;
+  model_args.model_type("qwen3_5_text")
+      .n_layers(1)
+      .n_heads(2)
+      .n_kv_heads(1)
+      .head_dim(4)
+      .full_attention_interval(2)
+      .linear_num_key_heads(1)
+      .linear_num_value_heads(1)
+      .linear_key_head_dim(2)
+      .linear_value_head_dim(2);
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+  KVCacheCreateOptions options;
+  options.device(torch::Device(torch::kCPU))
+      .dtype(torch::kFloat32)
+      .ssm_dtype(torch::kFloat32)
+      .host_blocks_factor(2.0)
+      .model_type("qwen3_5_text");
+
+  KVCache host_cache(shape, options, BlockType::LINEAR, /*layer_count=*/2);
+  const torch::Tensor conv = host_cache.get_conv_cache();
+  const torch::Tensor ssm = host_cache.get_ssm_cache();
+
+  ASSERT_TRUE(conv.is_contiguous());
+  ASSERT_TRUE(ssm.is_contiguous());
+  EXPECT_EQ(conv.size(0), 16);
+  EXPECT_EQ(conv.size(1), 2);
+#if defined(USE_MUSA)
+  EXPECT_EQ(conv.size(3), 3);
+#else
+  EXPECT_EQ(conv.size(2), 3);
+#endif
+  EXPECT_EQ(ssm.size(0), 16);
+  EXPECT_EQ(ssm.size(1), 2);
+  EXPECT_EQ(ssm.size(2), 1);
+}
+#endif
+
+TEST_F(HostKVCacheConfigTest, AcceptsLinearAttentionCachesForAnyModel) {
+  for (const std::string& model_type :
+       {"qwen3_5", "glm5_next", "unknown_linear_model"}) {
+    HostCacheValidationOptions options;
+    options.host_blocks_factor = 2.0;
+    options.device_block_count = 128;
+    options.supports_host_kv_offload = true;
+    options.has_conv_cache_shape = true;
+    options.has_ssm_cache_shape = true;
+    options.model_type = model_type;
+
+    EXPECT_FALSE(validate_host_cache_options(options).has_value())
+        << model_type;
+  }
+}
+
+TEST_F(HostKVCacheConfigTest, RejectsLinearAttentionKVCacheStore) {
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.enable_kvcache_store = true;
+  options.has_conv_cache_shape = true;
+  options.has_ssm_cache_shape = true;
+  options.model_type = "qwen3_5";
+
+  const std::optional<std::string> error = validate_host_cache_options(options);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error->find("do not support KV cache Store"), std::string::npos);
+}
+
+TEST_F(HostKVCacheConfigTest, RejectsPartialLinearAttentionCache) {
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.has_conv_cache_shape = true;
+  options.model_type = "qwen3_5";
+
+  const std::optional<std::string> error = validate_host_cache_options(options);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error->find("requires both conv and SSM"), std::string::npos);
+}
+
 TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
   ModelArgs args;
   args.model_type("glm5_next")
