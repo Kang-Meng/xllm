@@ -38,6 +38,12 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
 
   ~DSparkWorkerImpl() override = default;
 
+  // Load the draft weights, then (for reduced-vocabulary drafts) precompute the
+  // draft-to-target id map from the checkpoint's ``d2t`` table.
+  bool init_model(const std::string& model_weights_path,
+                  int32_t random_seed,
+                  MasterStatus master_status) override;
+
  protected:
   // N-wide query block: anchor (slot 0) carries the last real token and
   // predicts the first draft token; every position is a prediction. DFlash's
@@ -66,6 +72,11 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
       const SamplingParameters& sampling_params) const;
 
   ProcessGroup* sampling_process_group_ = nullptr;
+
+  // draft-id -> target-id map (hot_token_id[i] = d2t[i] + i), precomputed from
+  // the checkpoint's ``d2t`` table. Undefined for full-vocabulary drafts, in
+  // which case no remapping is applied.
+  torch::Tensor hot_token_id_;
 };
 
 }  // namespace xllm

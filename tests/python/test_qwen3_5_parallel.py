@@ -36,6 +36,7 @@ from xllm.python.layers.qwen3_5.decoder_layer import (
 )
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.model_loader import ScopedWeightLoader
+from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.qwen3_5 import Qwen3_5Model
 
 kernels.gemma_rms_norm = _gemma_rms_norm
@@ -126,6 +127,7 @@ def test_model_records_pd_layer_events_in_order() -> None:
     model.embed_tokens = torch.nn.Identity()
     model.layers = torch.nn.ModuleList(DecoderLayer() for _ in range(3))
     model.norm = FinalNorm()
+    model.aux_hidden_capture = AuxHiddenCapture(())
 
     hidden = torch.zeros(2, 4)
     positions = torch.arange(2)

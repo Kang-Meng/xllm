@@ -134,6 +134,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                 context,
             )
         self.mlp.load_weights(weights.with_prefix("mlp."), context)
+        self.mlp.process_weights_after_loading()
 
     def forward(
         self,

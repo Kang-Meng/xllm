@@ -69,7 +69,13 @@ from xllm.python.layers.gated_mlp import GatedMLP  # noqa: E402
 from xllm.python.layers.qwen3_5.decoder_layer import (  # noqa: E402
     get_qwen3_5_decoder_layer_class,
 )
-from xllm.python.model_executor.forward_context import forward_context  # noqa: E402
+from xllm.python.model_executor.forward_context import (  # noqa: E402
+    ForwardContext,
+    forward_context,
+)
+from xllm.python.model_executor.runners.decode_cuda_graph import (  # noqa: E402
+    _StaticAttentionMetadata,
+)
 from xllm.python.model_loader import (  # noqa: E402
     ParallelLoadContext,
     ScopedWeightLoader,
@@ -174,7 +180,7 @@ def test_cuda_gdn_loads_native_conv_weight_layout(monkeypatch) -> None:
     prepare_row_weight.assert_called_once()
 
 
-def test_cuda_decode_uses_cuda_recurrent_kernel(monkeypatch) -> None:
+def test_cuda_graph_decode_uses_cuda_recurrent_kernel(monkeypatch) -> None:
     monkeypatch.setattr(
         kernels,
         "resolve_gdn_prefill_backend",
@@ -201,9 +207,24 @@ def test_cuda_decode_uses_cuda_recurrent_kernel(monkeypatch) -> None:
     )
     _install_constant_gdn_projections(layer)
 
-    with forward_context(_gdn_forward_context(is_prefill=False)):
+    base_context = _gdn_forward_context(is_prefill=False)
+    metadata = _StaticAttentionMetadata(
+        slot_mapping=torch.zeros(1, dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        paged_kv_indices=torch.zeros(1, dtype=torch.int32),
+        paged_kv_last_page_len=torch.ones(1, dtype=torch.int32),
+        linear_state_indices=torch.tensor([1], dtype=torch.int32),
+    )
+    context = ForwardContext(
+        attention_backend=base_context.attention_backend,
+        device=base_context.device,
+        metadata=metadata,
+        layer_caches=base_context.layer_caches,
+    )
+    with forward_context(context):
         assert layer(torch.zeros(1, 8)).shape == (1, 8)
 
+    assert not metadata.is_spec_verify
     recurrent.assert_called_once()
     rms.assert_called_once()
 

@@ -319,7 +319,9 @@ def test_npu_fused_attention_preparation_matches_unfused_after_reload() -> None:
 
     load(layer, updated_checkpoint)
     fresh_layer = new_layer()
+    kernels.prepare_row_parallel_weight.reset_mock()
     load(fresh_layer, updated_checkpoint)
+    kernels.prepare_row_parallel_weight.assert_called_once()
 
     torch.testing.assert_close(layer.qkv_proj.weight, fresh_layer.qkv_proj.weight)
     assert layer.qkv_proj.bias is not None
@@ -427,6 +429,7 @@ def test_npu_gdn_rejects_geometry_unsupported_by_decode(
 
 
 def test_npu_gdn_loads_native_conv_weight_layout() -> None:
+    kernels.prepare_row_parallel_weight.reset_mock()
     cfg = _linear_config()
     layer = NpuQwen3_5GatedDeltaNet(
         cfg,
@@ -461,6 +464,7 @@ def test_npu_gdn_loads_native_conv_weight_layout() -> None:
         layer.conv1d_weight,
         checkpoint_conv.squeeze(1).transpose(0, 1),
     )
+    kernels.prepare_row_parallel_weight.assert_called_once()
 
 
 def test_npu_gdn_packs_rank_local_projection_weights() -> None:
@@ -695,6 +699,8 @@ def test_npu_moe_loads_native_weight_order() -> None:
         ScopedWeightLoader([_StateDict(tensors)], "mlp."),
         context,
     )
+    kernels.prepare_row_parallel_weight.reset_mock()
+    layer.mlp.process_weights_after_loading()
 
     gate, up = gate_up.chunk(2, dim=1)
     local_gate = gate.chunk(2, dim=1)[1]
@@ -717,6 +723,7 @@ def test_npu_moe_loads_native_weight_order() -> None:
         layer.mlp.experts.w2,
         expected_w2.to(torch.bfloat16),
     )
+    kernels.prepare_row_parallel_weight.assert_called_once()
 
 
 def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch) -> None:

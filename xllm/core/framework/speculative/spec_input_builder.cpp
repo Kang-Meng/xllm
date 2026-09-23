@@ -539,6 +539,30 @@ void update_input_params(ModelInputParams& input_params,
   }
 }
 
+void update_execution_batch_metadata(
+    ModelInputParams& input_params,
+    std::vector<int32_t> num_scheduled_tokens) {
+  ExecutionBatchMetadata& metadata = input_params.execution_batch;
+  CHECK_EQ(num_scheduled_tokens.size(), static_cast<size_t>(metadata.num_reqs))
+      << "speculative execution widths must remain request-scoped";
+
+  std::vector<int32_t> query_start_loc;
+  query_start_loc.reserve(num_scheduled_tokens.size() + 1);
+  query_start_loc.emplace_back(0);
+  for (int32_t num_tokens : num_scheduled_tokens) {
+    CHECK_GT(num_tokens, 0)
+        << "each speculative request must execute at least one token";
+    CHECK_LE(num_tokens,
+             std::numeric_limits<int32_t>::max() - query_start_loc.back())
+        << "speculative execution token count exceeds int32 range";
+    query_start_loc.emplace_back(query_start_loc.back() + num_tokens);
+  }
+
+  metadata.num_tokens = query_start_loc.back();
+  metadata.num_scheduled_tokens = std::move(num_scheduled_tokens);
+  metadata.query_start_loc = std::move(query_start_loc);
+}
+
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
   return torch::tensor(values,
                        torch::TensorOptions()

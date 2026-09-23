@@ -67,6 +67,7 @@ class _StaticAttentionMetadata:
     paged_kv_last_page_len_host: torch.Tensor | None = None
     is_prefill: bool = False
     is_chunked_prefill: bool = False
+    is_spec_verify: bool = False
     linear_state_indices: torch.Tensor | None = None
     has_initial_state: torch.Tensor | None = None
     dp_execution_token_counts: tuple[int, ...] = ()

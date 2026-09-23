@@ -169,6 +169,11 @@ void update_input_params(ModelInputParams& input_params,
                          std::vector<int32_t> kv_seq_lens_vec,
                          bool update_block_tables = false);
 
+// Rebuilds request-scoped execution metadata after speculative validation
+// expands each logical request to one or more execution tokens.
+void update_execution_batch_metadata(ModelInputParams& input_params,
+                                     std::vector<int32_t> num_scheduled_tokens);
+
 // Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);
 

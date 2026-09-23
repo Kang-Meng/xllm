@@ -114,14 +114,21 @@ def install_constant_gdn_projections(layer) -> None:
     layer.out_proj = torch.nn.Identity()
 
 
-def make_gdn_forward_context(*, is_prefill: bool) -> ForwardContext:
+def make_gdn_forward_context(
+    *,
+    is_prefill: bool,
+    state_index: int = 1,
+    checkpoint_stride: int = 1,
+) -> ForwardContext:
+    num_state_slots = max(state_index + 1, 2)
     metadata = SimpleNamespace(
-        linear_state_indices=torch.tensor([1], dtype=torch.int32),
+        linear_state_indices=torch.tensor([state_index], dtype=torch.int32),
         has_initial_state=(torch.tensor([False], dtype=torch.bool) if is_prefill else None),
         q_cu_seq_lens=(torch.tensor([0, 1], dtype=torch.int32) if is_prefill else None),
         q_seq_lens_host=(torch.tensor([1], dtype=torch.int32) if is_prefill else None),
         is_prefill=is_prefill,
         is_chunked_prefill=False,
+        is_spec_verify=False,
     )
     return ForwardContext(
         attention_backend=None,
@@ -131,8 +138,13 @@ def make_gdn_forward_context(*, is_prefill: bool) -> ForwardContext:
             LayerCache(
                 key=None,
                 value=None,
-                conv=torch.zeros(2, 3, 24),
-                ssm=torch.zeros(2, 2, 4, 4),
+                conv=torch.zeros(num_state_slots, 3, 24),
+                ssm=torch.zeros(
+                    num_state_slots * checkpoint_stride,
+                    2,
+                    4,
+                    4,
+                ),
             )
         ],
     )

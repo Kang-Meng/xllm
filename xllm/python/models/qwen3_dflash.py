@@ -59,6 +59,7 @@ def _load_reference_quarot_rotation(
 class DFlashQwen3Config(Qwen3Config):
     draft_vocab_size: int = 0
     world_size: int = 1
+    use_sliding_window: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> DFlashQwen3Config:
@@ -73,6 +74,7 @@ class DFlashQwen3Config(Qwen3Config):
             **base.__dict__,
             draft_vocab_size=draft_vocab_size,
             world_size=int(d.get("world_size", base.tp_size * base.dp_size)),
+            use_sliding_window=bool(d.get("use_sliding_window", False)),
         )
 
     def validate(self) -> None:
@@ -91,10 +93,22 @@ class DFlashQwen3Config(Qwen3Config):
         if self.vocab_size % self.tp_size:
             raise ValueError("vocab_size must be divisible by tp_size")
         if self.draft_vocab_size != self.vocab_size:
-            raise ValueError("reduced-vocabulary block-diffusion drafts are not supported")
+            if not self._allows_reduced_vocab():
+                raise ValueError("reduced-vocabulary block-diffusion drafts are not supported")
+            if self.draft_vocab_size <= 0 or self.draft_vocab_size % self.tp_size:
+                raise ValueError("draft_vocab_size must be positive and divisible by tp_size")
         if self.layers_to_capture:
             raise ValueError("DFlash draft model does not support layers_to_capture")
         self.head_split()
+
+    def _allows_reduced_vocab(self) -> bool:
+        """Whether a draft vocabulary smaller than the target's is supported.
+
+        Reduced-vocab drafts require draft-to-target id remapping (a ``d2t`` table
+        applied in the worker). The plain DFlash path has no such remap, so it
+        stays disabled here; subclasses that implement it opt in.
+        """
+        return False
 
 
 class DFlashContextProjection(nn.Module):

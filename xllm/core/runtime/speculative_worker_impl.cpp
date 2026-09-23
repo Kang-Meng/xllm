@@ -494,6 +494,9 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
                                      std::move(buf.out_kv_seq_lens),
                                      /*update_block_tables=*/true);
   }
+  specBuilder::update_execution_batch_metadata(
+      input_params,
+      std::vector<int32_t>(static_cast<size_t>(num_sequences), num_val_tokens));
   input_params.attention.rebuild_device_buffer(device_);
 
   // update the sampling_params
@@ -601,6 +604,8 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
                                    buf.meta.kv_max_seq_len,
                                    std::move(buf.out_kv_seq_lens),
                                    /*update_block_tables=*/true);
+  specBuilder::update_execution_batch_metadata(input_params,
+                                               per_seq_val_tokens);
   input_params.attention.rebuild_device_buffer(device_);
 
   // update sampling params using the per-seq width.

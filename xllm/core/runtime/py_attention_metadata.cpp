@@ -117,6 +117,8 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::kpool_query_lens)
       .def_property_readonly("num_accepted_tokens",
                              &PyAttentionMetadataView::num_accepted_tokens)
+      .def_property_readonly("linear_state_ids",
+                             &PyAttentionMetadataView::linear_state_ids)
       .def_property_readonly("has_initial_state",
                              &PyAttentionMetadataView::has_initial_state)
       .def_property_readonly(
@@ -128,6 +130,11 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly(
           "dp_global_kv_max_seq_lens",
           &PyAttentionMetadataView::dp_global_kv_max_seq_lens)
+      .def_property_readonly(
+          "num_accepted_tokens_host_values",
+          &PyAttentionMetadataView::num_accepted_tokens_host_values)
+      .def_property_readonly("query_start_loc",
+                             &PyAttentionMetadataView::query_start_loc)
       .def_property_readonly("dp_is_decode",
                              &PyAttentionMetadataView::dp_is_decode)
       .def_property_readonly("q_seq_lens", &PyAttentionMetadataView::q_seq_lens)
@@ -260,6 +267,11 @@ PyAttentionMetadataView::PyAttentionMetadataView(
                dummy_token_count);
   // Empty DP shards retain zero history, even when they execute a dummy row.
   dp_global_kv_max_seq_lens_ = params.parallel.dp_global_kv_max_seq_lens;
+  linear_state_ids_ = params.embedding.linear_state_ids;
+  num_accepted_tokens_host_values_ = params.num_accepted_tokens_host;
+#if defined(USE_NPU) || defined(USE_MUSA)
+  query_start_loc_ = params.parallel.query_start_loc;
+#endif
   dp_is_decode_ = params.parallel.dp_is_decode;
 }
 
@@ -366,6 +378,10 @@ const std::vector<int32_t>& PyAttentionMetadataView::kpool_query_lens() const {
   return metadata_->kpool_query_lens;
 }
 
+const std::vector<int32_t>& PyAttentionMetadataView::linear_state_ids() const {
+  return linear_state_ids_;
+}
+
 py::object PyAttentionMetadataView::has_initial_state() const {
   return optional_tensor(metadata_->has_initial_states);
 }
@@ -383,6 +399,15 @@ PyAttentionMetadataView::raw_dp_execution_token_counts() const {
 const std::vector<int32_t>& PyAttentionMetadataView::dp_global_kv_max_seq_lens()
     const {
   return dp_global_kv_max_seq_lens_;
+}
+
+const std::vector<int64_t>&
+PyAttentionMetadataView::num_accepted_tokens_host_values() const {
+  return num_accepted_tokens_host_values_;
+}
+
+const std::vector<int64_t>& PyAttentionMetadataView::query_start_loc() const {
+  return query_start_loc_;
 }
 
 const std::vector<int32_t>& PyAttentionMetadataView::dp_is_decode() const {

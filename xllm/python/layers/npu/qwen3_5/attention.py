@@ -82,6 +82,7 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
         super().load_weights(state, context)
 
     def _finish_loading(self) -> None:
+        self.o_proj.process_weights_after_loading()
         if not self.use_fused_qkv or self._weights_reordered:
             return
 

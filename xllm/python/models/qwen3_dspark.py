@@ -50,6 +50,13 @@ class Qwen3DSparkConfig(DFlashQwen3Config):
         super().validate()
         if self.markov_rank <= 0:
             raise ValueError("Qwen3 DSpark requires markov_rank > 0")
+        if self.use_sliding_window:
+            raise ValueError("sliding-window DSpark drafts are not supported yet")
+
+    def _allows_reduced_vocab(self) -> bool:
+        # DSpark remaps draft ids to target ids via the checkpoint's d2t table
+        # in DSparkWorkerImpl, so a reduced draft vocabulary is supported.
+        return True
 
 
 class Qwen3DSparkModel(DFlashQwen3Model):

@@ -26,6 +26,7 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnDecodeMetadata,
     GdnMetadata,
     GdnPrefillMetadata,
+    GdnSpecVerifyMetadata,
     GdnStateCache,
 )
 from xllm.python.model_executor.input_batch import InputBatch
@@ -261,6 +262,16 @@ class Qwen3_5GdnMetadataBuilder:
             metadata,
             input_batch.input_ids.device,
         )
+        if getattr(metadata, "is_spec_verify", False):
+            num_accepted = metadata.num_accepted_tokens
+            if num_accepted is None:
+                raise ValueError("Qwen3.5 GDN spec verify requires num_accepted_tokens")
+            return GdnSpecVerifyMetadata(
+                state_caches=state_caches,
+                read_state_indices=read_indices,
+                write_state_indices=write_indices,
+                num_accepted_tokens=num_accepted.to(device=input_batch.input_ids.device, dtype=torch.int32),
+            )
         if metadata.is_prefill or metadata.is_chunked_prefill:
             return self._build_prefill_metadata(
                 input_batch,

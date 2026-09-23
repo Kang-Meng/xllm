@@ -55,3 +55,14 @@ class GdnDecodeMetadata(GdnMetadata):
 
     read_state_indices: torch.Tensor
     write_state_indices: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class GdnSpecVerifyMetadata(GdnDecodeMetadata):
+    """Decode-shaped inputs for the MegaGdn MTP speculative-verify path.
+
+    Carries per-sequence accepted-token counts so the kernel commits recurrent
+    state only up to each sequence's accepted prefix.
+    """
+
+    num_accepted_tokens: torch.Tensor
