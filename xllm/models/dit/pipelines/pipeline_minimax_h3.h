@@ -60,12 +60,23 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   explicit MiniMaxH3PipelineImpl(const DiTModelContext& context)
       : options_(context.get_tensor_options()),
         tp_group_(context.get_parallel_args().dit_tp_group_),
+        vae_group_(context.get_parallel_args().dit_vae_group_),
         is_tp_driver_(tp_group_ == nullptr || tp_group_->rank() == 0),
+        is_vae_parallel_enabled_(vae_group_ != nullptr &&
+                                 vae_group_->world_size() > 1),
+        is_video_vae_worker_(is_vae_parallel_enabled_ || is_tp_driver_),
         task_type_(DiTConfig::get_instance().dit_h3_task_type()) {
     CHECK(task_type_ == "fl2va" || task_type_ == "ref2va")
         << "MiniMax-H3 dit_h3_task_type must be fl2va or ref2va";
     const ModelArgs& transformer_args = context.get_model_args("transformer");
     const ModelArgs& vae_args = context.get_model_args("vae");
+    const int32_t vae_size = context.get_parallel_args().vae_size();
+    CHECK_GT(vae_size, 0);
+    CHECK(vae_size == 1 || vae_group_ != nullptr)
+        << "MiniMax-H3 requires a VAE group when vae_size > 1";
+    if (vae_group_ != nullptr) {
+      CHECK_EQ(vae_size, vae_group_->world_size());
+    }
     const std::vector<int64_t>& patch_size = transformer_args.wan_patch_size();
     CHECK_EQ(patch_size.size(), static_cast<size_t>(3))
         << "MiniMax-H3 transformer patch_size must have 3 dimensions";
@@ -106,9 +117,11 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
                                 /*channel_count=*/audio_channels_));
     transformer_ =
         register_module("transformer", MiniMaxH3Transformer3DModel(context));
-    if (is_tp_driver_) {
+    if (is_video_vae_worker_) {
       vae_ = register_module(
           "vae", AutoencoderKLMiniMaxH3(context.get_model_context("vae")));
+    }
+    if (is_tp_driver_) {
       audio_vae_ = register_module(
           "audio_vae",
           AutoencoderKLMiniMaxH3Audio(context.get_model_context("audio_vae")));
@@ -359,40 +372,64 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       }
     }
 
-    if (!is_tp_driver_) {
+    if (!is_video_vae_worker_) {
       synchronize_tp_ranks();
       return DiTForwardOutput();
     }
 
     // 6. Decode
-    torch::Tensor generated_video_rows =
-        layout.num_condition_video_rows > 0
-            ? video_rows.slice(1, layout.num_condition_video_rows)
-            : video_rows;
-    torch::Tensor video_latent = unpatchify_video(
-        generated_video_rows, latent_frames, latent_height, latent_width);
+    torch::Tensor video_latent;
+    if (is_tp_driver_) {
+      torch::Tensor generated_video_rows =
+          layout.num_condition_video_rows > 0
+              ? video_rows.slice(1, layout.num_condition_video_rows)
+              : video_rows;
+      video_latent = unpatchify_video(
+          generated_video_rows, latent_frames, latent_height, latent_width);
+      torch::Tensor video_latent_mean =
+          torch::tensor(vae_->latents_mean(),
+                        torch::TensorOptions()
+                            .dtype(torch::kFloat32)
+                            .device(video_latent.device()))
+              .view({1, video_latent_channels_, 1, 1, 1});
+      torch::Tensor video_latent_std =
+          torch::tensor(vae_->latents_std(),
+                        torch::TensorOptions()
+                            .dtype(torch::kFloat32)
+                            .device(video_latent.device()))
+              .view({1, video_latent_channels_, 1, 1, 1});
+      video_latent = video_latent.to(torch::kFloat32) * video_latent_std +
+                     video_latent_mean;
+    } else {
+      video_latent = torch::empty(
+          {1,
+           video_latent_channels_,
+           latent_frames,
+           latent_height,
+           latent_width},
+          options_.dtype(torch::kFloat32).device(options_.device()));
+    }
+    if (is_vae_parallel_enabled_) {
+      // A VAE group root need not be a TP driver; first share the complete
+      // latent within each TP group.
+      if (tp_group_ != nullptr && tp_group_->world_size() > 1) {
+        tp_group_->broadcast(video_latent, /*root_rank=*/0);
+      }
+      vae_group_->broadcast(video_latent, /*root_rank=*/0);
+    }
+
+    torch::Tensor video = vae_->decode(video_latent);
+    if (!is_tp_driver_) {
+      synchronize_tp_ranks();
+      return DiTForwardOutput();
+    }
+
     torch::Tensor generated_audio_rows =
         layout.num_condition_audio_rows > 0
             ? audio_rows.slice(1, layout.num_condition_audio_rows)
             : audio_rows;
     torch::Tensor audio_latent =
         unpatchify_audio(generated_audio_rows, audio_latents);
-
-    // Denormalize video latents.
-    torch::Tensor video_latent_mean =
-        torch::tensor(vae_->latents_mean(),
-                      torch::TensorOptions()
-                          .dtype(torch::kFloat32)
-                          .device(video_latent.device()))
-            .view({1, video_latent_channels_, 1, 1, 1});
-    torch::Tensor video_latent_std =
-        torch::tensor(vae_->latents_std(),
-                      torch::TensorOptions()
-                          .dtype(torch::kFloat32)
-                          .device(video_latent.device()))
-            .view({1, video_latent_channels_, 1, 1, 1});
-    video_latent =
-        video_latent.to(torch::kFloat32) * video_latent_std + video_latent_mean;
 
     // Denormalize audio latents.
     torch::Tensor audio_latent_mean =
@@ -410,7 +447,6 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     audio_latent =
         audio_latent.to(torch::kFloat32) * audio_latent_std + audio_latent_mean;
 
-    torch::Tensor video = vae_->decode(video_latent);
     // Convert decoded video to RGB pixels.
     torch::Tensor pixel_mean =
         torch::tensor(std::vector<float>{0.485f, 0.456f, 0.406f},
@@ -454,8 +490,10 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
     transformer_->load_model(
         loader->take_component_loader(transformer_component));
-    if (is_tp_driver_) {
+    if (is_video_vae_worker_) {
       vae_->load_model(loader->take_component_loader("vae"));
+    }
+    if (is_tp_driver_) {
       audio_vae_->load_model(loader->take_component_loader("audio_vae"));
     }
     if (loader->has_component("scheduler")) {
@@ -475,8 +513,10 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       init_rolling_transformer();
     }
 #endif
-    if (is_tp_driver_) {
+    if (is_video_vae_worker_) {
       vae_->to(options_.device(), torch::kFloat32);
+    }
+    if (is_tp_driver_) {
       audio_vae_->to(options_.device(), torch::kFloat32);
     }
     LOG(INFO) << "MiniMax-H3 " << task_type_ << " native components loaded";
@@ -1055,7 +1095,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
                                  size.first / vae_spatial_ratio_,
                                  size.second / vae_spatial_ratio_,
                                  0});
-        if (is_tp_driver_) {
+        if (is_video_vae_worker_) {
           torch::Tensor image = visual_processor_->prepare_reference_image(
               batched_image.select(0, 0), size.first, size.second);
           visual_latents.emplace_back(vae_->encode_reference_condition(
@@ -1111,7 +1151,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
                                  size.first / vae_spatial_ratio_,
                                  size.second / vae_spatial_ratio_,
                                  reference_audio_latents});
-        if (is_tp_driver_) {
+        if (is_video_vae_worker_) {
           torch::Tensor video =
               visual_processor_->prepare_reference_video(video_input,
                                                          *prompt_video_fps,
@@ -1123,9 +1163,9 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
               video.permute({1, 0, 2, 3})
                   .unsqueeze(0)
                   .to(options_.device(), torch::kUInt8)));
-          if (has_audio) {
-            reference_audio_inputs.emplace_back(std::move(soundtrack));
-          }
+        }
+        if (has_audio && is_tp_driver_) {
+          reference_audio_inputs.emplace_back(std::move(soundtrack));
         }
         continue;
       }
@@ -1187,7 +1227,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
               generator,
               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
               .to(options_.device());
-      if (is_tp_driver_) {
+      if (is_video_vae_worker_) {
         CHECK_EQ(visual_latents[visual_index].dim(), 5);
         for (int64_t dimension = 0; dimension < 5; ++dimension) {
           CHECK_EQ(visual_latents[visual_index].size(dimension),
@@ -1220,7 +1260,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       }
       return rows;
     }();
-    if (is_tp_driver_ && !packed_visual_rows.empty()) {
+    if (is_video_vae_worker_ && !packed_visual_rows.empty()) {
       result.video_rows = torch::cat(packed_visual_rows, 1).contiguous();
     } else {
       result.video_rows = torch::empty(
@@ -1261,7 +1301,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     const int64_t latent_width = width / vae_spatial_ratio_;
     const int64_t rows_per_frame =
         latent_height / patch_h_ * (latent_width / patch_w_);
-    if (!is_tp_driver_) {
+    if (!is_video_vae_worker_) {
       for (size_t index = 0; index < keyframe_anchors.size(); ++index) {
         (void)torch::randn(
             {1, video_latent_channels_, 1, latent_height, latent_width},
@@ -1395,8 +1435,11 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   torch::TensorOptions options_;
   ProcessGroup* tp_group_ = nullptr;
+  ProcessGroup* vae_group_ = nullptr;
   bool is_tp_driver_ = true;
   bool use_rolling_load_ = false;
+  bool is_vae_parallel_enabled_ = false;
+  bool is_video_vae_worker_ = true;
   std::string task_type_;
   int64_t patch_h_;
   int64_t patch_w_;
