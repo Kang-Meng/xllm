@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-only policy boundaries, separate from numerical kernel tests."""
+"""Host-side MoE parallelism policy, separate from numerical kernel tests."""
 
 import pytest
 

@@ -54,6 +54,7 @@ class DpScatterState:
     enabled: bool
 
     def scatter(self, output: torch.Tensor) -> torch.Tensor:
+        """Return this rank's output rows, or the unchanged output for DP1."""
         if self.enabled:
             return output.narrow(0, self.output_offset, self.local_tokens)
         return output
@@ -122,7 +123,7 @@ def reduce_and_scatter(
 
 
 def mc2_buffer_bytes_per_source_row(hidden_size: int, local_experts: int, ep_size: int, topk: int) -> int:
-    """A3 fullmesh/default EP window bound, including the default shared slot.
+    """Estimate MC2 window bytes per source row, including the shared slot.
 
     CANN specifies the window layout using two-byte activations even when
     dispatch quantization is enabled. Traffic compression does not halve this
@@ -135,7 +136,7 @@ def mc2_buffer_bytes_per_source_row(hidden_size: int, local_experts: int, ep_siz
 
 @dataclass(frozen=True)
 class Eplv2CommPolicy:
-    """One immutable policy per model; no device queries in the selector."""
+    """Choose MC2 or All-to-AllV from host-side capacity and execution mode."""
 
     mc2_capacity: int
     mode: str = "auto"
@@ -151,6 +152,7 @@ class Eplv2CommPolicy:
         token_limit: int = 512,
         mode: str = "auto",
     ) -> Eplv2CommPolicy:
+        """Validate EPLv2 geometry and calculate the maximum MC2 source rows."""
         if mode not in ("auto", "mc2", "alltoall"):
             raise ValueError("EPLv2 communication mode must be auto, mc2 or alltoall")
         if buffer_mb <= 0 or not 0 < token_limit <= 512:
@@ -164,6 +166,7 @@ class Eplv2CommPolicy:
         return cls(capacity, mode)
 
     def select(self, source_rows: int, *, graph: bool = False) -> str:
+        """Select a transport; reject Graph execution when MC2 cannot fit."""
         if source_rows <= 0:
             raise ValueError("EPLv2 source rows must include at least one padded row")
         eligible = source_rows <= self.mc2_capacity
@@ -182,6 +185,8 @@ class Eplv2CommPolicy:
 
 @dataclass(frozen=True, slots=True)
 class TokenParallelLayout:
+    """Own a TP shard of source rows and pad EP dispatch to a common capacity."""
+
     num_tokens: int
     tp_size: int
     tp_rank: int
@@ -189,6 +194,7 @@ class TokenParallelLayout:
     dispatch_rows: int | None = None
 
     def __post_init__(self) -> None:
+        """Reject invalid shard coordinates or insufficient dispatch capacity."""
         if self.num_tokens < 0 or self.tp_size <= 0 or not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("Invalid token-parallel layout")
         if self.dispatch_rows is not None and self.dispatch_rows < self.shard_tokens:
@@ -204,7 +210,7 @@ class TokenParallelLayout:
         dp_rank: int,
         execution_counts: Sequence[int] | None,
     ) -> TokenParallelLayout:
-        """Separate TP-local ownership from the EP-wide dispatch capacity."""
+        """Keep TP-local ownership while matching EP dispatch rows across DP ranks."""
         if dp_size <= 0 or not 0 <= dp_rank < dp_size:
             raise ValueError("Invalid data-parallel layout")
         if dp_size == 1:
@@ -225,6 +231,7 @@ class TokenParallelLayout:
 
     @property
     def shard_tokens(self) -> int:
+        """Return the padded number of source rows per TP rank (at least one)."""
         return max(1, (self.num_tokens + self.tp_size - 1) // self.tp_size)
 
     @property
@@ -234,14 +241,17 @@ class TokenParallelLayout:
 
     @property
     def dispatch_tokens(self) -> int:
+        """Return the common EP dispatch capacity, or this rank's TP capacity."""
         return self.shard_tokens if self.dispatch_rows is None else self.dispatch_rows
 
     def pad_dispatch(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Pad a local TP shard to the rows required by EP dispatch."""
         if tensor.ndim == 0 or tensor.shape[0] != self.shard_tokens:
             raise ValueError("Dispatch input must contain this rank's SP rows")
         return self._pad(tensor, self.dispatch_tokens)
 
     def _pad(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
+        """Copy tensor rows and zero-fill the remaining capacity."""
         if tensor.shape[0] == rows:
             return tensor.contiguous()
         padded = tensor.new_empty((rows, *tensor.shape[1:]))
@@ -250,6 +260,7 @@ class TokenParallelLayout:
         return padded
 
     def shard(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Extract this rank's source-token rows and zero-pad its TP tail."""
         if tensor.dim() == 0 or tensor.shape[0] != self.num_tokens:
             raise ValueError("Token tensor does not match the full layout")
         start = min(self.tp_rank * self.shard_tokens, self.num_tokens)
@@ -267,6 +278,7 @@ class TokenParallelLayout:
         return distributed.reduce_scatter(padded, self.tp_size, group_name)
 
     def gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Collect TP-local rows and trim the padded tail to source-token count."""
         if tensor.dim() == 0 or tensor.shape[0] != self.shard_tokens:
             raise ValueError("Token tensor does not match the local layout")
         if self.tp_size == 1:
