@@ -747,19 +747,21 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     // identify the model that produced the layout.
     if (!options.manager_types().empty() || has_gdn_state) {
       std::map<BlockType, uint32_t> host_capacities;
+      const int64_t host_kv_block_count = scale_host_block_count(
+          kv_cache_cap.n_blocks(), options_.host_blocks_factor());
+      const int64_t chunk_size =
+          SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
       // Hybrid linear-attention models use a flat KV pool plus a separate
       // recurrent-state slot pool.
       if (options.manager_types().empty()) {
-        host_capacities.emplace(
-            BlockType::KV,
-            static_cast<uint32_t>(scale_host_block_count(
-                kv_cache_cap.n_blocks(), options_.host_blocks_factor())));
+        host_capacities.emplace(BlockType::KV,
+                                static_cast<uint32_t>(host_kv_block_count));
       }
       if (has_gdn_state) {
         host_capacities.emplace(
             BlockType::LINEAR,
-            static_cast<uint32_t>(scale_host_block_count(
-                kv_cache_cap.n_blocks(), options_.host_blocks_factor())));
+            static_cast<uint32_t>(linear_state_block_count(
+                host_kv_block_count, chunk_size, block_size)));
       }
       uint32_t host_c128_blocks = 0;
       if (kv_cache_cap.c128_count() > 0) {

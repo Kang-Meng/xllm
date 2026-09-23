@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "framework/kv_cache/linear_attention_kv_cache_impl.h"
 
+#include "core/framework/config/scheduler_config.h"
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "util/tensor_helper.h"
 
 namespace xllm {
@@ -55,8 +57,12 @@ LinearAttentionKVCacheImpl::LinearAttentionKVCacheImpl(
       kv_cache_shape.ssm_cache_shape();
   CHECK(kv_cache_shape.has_key_cache_shape())
       << "Host LINEAR cache capacity requires the KV cache shape.";
-  const int64_t host_slot_count = scale_host_block_count(
+  const int64_t host_kv_block_count = scale_host_block_count(
       kv_cache_shape.key_cache_shape()[0], create_options.host_blocks_factor());
+  const int64_t host_slot_count = linear_state_block_count(
+      host_kv_block_count,
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(),
+      create_options.block_size());
 
   host_page_aligned_regions_.reserve(2);
   std::vector<int64_t> host_conv_shape = device_conv_shape;

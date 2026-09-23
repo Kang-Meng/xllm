@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "framework/block/block.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/deepseek_v4_kv_cache_impl.h"
@@ -1106,6 +1107,17 @@ TEST_F(HostKVCacheConfigTest, AcceptsSupportedGroupedCacheLayout) {
   EXPECT_FALSE(validate_host_cache_options(options).has_value());
 }
 
+TEST(KVCacheTest, LinearStateCapacityUsesChunkGranularity) {
+  EXPECT_EQ(linear_state_block_count(/*kv_block_count=*/5216,
+                                     /*chunk_size=*/1024,
+                                     /*block_size=*/128),
+            652);
+  EXPECT_EQ(linear_state_block_count(/*kv_block_count=*/5219,
+                                     /*chunk_size=*/1024,
+                                     /*block_size=*/128),
+            652);
+}
+
 #if !defined(USE_NPU)
 TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
   KVCacheCapacity capacity;
@@ -1130,23 +1142,29 @@ TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
   options.device(torch::Device(torch::kCPU))
       .dtype(torch::kFloat32)
       .ssm_dtype(torch::kFloat32)
+      .block_size(16)
       .host_blocks_factor(2.0)
       .model_type("qwen3_5_text");
 
+  const int32_t old_chunk_size =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(32);
   KVCache host_cache(shape, options, BlockType::LINEAR, /*layer_count=*/2);
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(
+      old_chunk_size);
   const torch::Tensor conv = host_cache.get_conv_cache();
   const torch::Tensor ssm = host_cache.get_ssm_cache();
 
   ASSERT_TRUE(conv.is_contiguous());
   ASSERT_TRUE(ssm.is_contiguous());
-  EXPECT_EQ(conv.size(0), 16);
+  EXPECT_EQ(conv.size(0), 8);
   EXPECT_EQ(conv.size(1), 2);
 #if defined(USE_MUSA)
   EXPECT_EQ(conv.size(3), 3);
 #else
   EXPECT_EQ(conv.size(2), 3);
 #endif
-  EXPECT_EQ(ssm.size(0), 16);
+  EXPECT_EQ(ssm.size(0), 8);
   EXPECT_EQ(ssm.size(1), 2);
   EXPECT_EQ(ssm.size(2), 1);
 }
