@@ -79,10 +79,17 @@ class CacheTransferEngine final : public Engine {
       PrefetchResult::StopPredicate stop_requested,
       PrefetchResult::DoneCallback done) override {
     request_ = std::move(request);
-    queries_ = request_->transfer_infos;
+    for (const PrefetchUnit& unit : request_->units) {
+      queries_.insert(
+          queries_.end(), unit.gated_blocks.begin(), unit.gated_blocks.end());
+      queries_.insert(queries_.end(),
+                      unit.non_gated_blocks.begin(),
+                      unit.non_gated_blocks.end());
+    }
     result_ = std::make_shared<PrefetchResult>(
         /*worker_count=*/1,
-        request_->batch_end_unit_offsets,
+        *request_,
+        /*batch_size=*/2,
         /*timeout_ms=*/-1,
         std::move(stop_requested),
         std::move(done));
@@ -105,11 +112,11 @@ class CacheTransferEngine final : public Engine {
   }
   void finish_prefetch() {
     ASSERT_NE(result_, nullptr);
-    for (size_t batch_index = 0; batch_index < request_->batch_count();
+    for (size_t batch_index = 0; batch_index < request_->batch_count(2);
          ++batch_index) {
       const auto control = result_->record_batch_result(
           /*worker_index=*/0,
-          static_cast<uint8_t>(request_->batch_unit_count(batch_index)));
+          static_cast<uint8_t>(request_->batch_unit_count(batch_index, 2)));
       ASSERT_TRUE(control.has_value());
       if (*control == PrefetchControl::STOP) {
         break;
@@ -618,8 +625,8 @@ TEST(TypedMtpPrefixCacheTest, StoreQueriesOnlyCompleteDependencyUnits) {
     EXPECT_EQ(completed, ready);
     ready_done = true;
   });
-  // One C128 checkpoint, 32 C4 blocks, and its two-block SWA window.
-  ASSERT_EQ(engine.queries().size(), 35u);
+  // One C128 checkpoint, 32 C4 blocks, and one sparse SWA checkpoint block.
+  ASSERT_EQ(engine.queries().size(), 34u);
   EXPECT_FALSE(ready_done);
   engine.finish_prefetch();
   ASSERT_TRUE(ready_done);

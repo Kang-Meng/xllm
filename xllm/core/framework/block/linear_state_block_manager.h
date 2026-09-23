@@ -39,6 +39,8 @@ class LinearStateBlockManager final : public BlockManagerImpl {
       Sequence* seq,
       KVCacheState& kv_state,
       size_t num_tokens) override;
+  bool allocate_for_prefetch(Sequence* seq, size_t num_tokens) override;
+  void trim_prefetch_blocks(Sequence* seq, size_t max_hit_tokens) override;
 
   using BlockManagerImpl::allocate;
   Block allocate() override;

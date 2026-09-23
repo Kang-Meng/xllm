@@ -927,12 +927,12 @@ void LLMEngine::prefetch_from_storage(
   const int64_t timeout_ms = configured_timeout_ms == 0
                                  ? -1
                                  : static_cast<int64_t>(configured_timeout_ms);
-  auto result =
-      std::make_shared<PrefetchResult>(dp_local_size_,
-                                       request->batch_end_unit_offsets,
-                                       timeout_ms,
-                                       std::move(stop_requested),
-                                       std::move(done));
+  auto result = std::make_shared<PrefetchResult>(dp_local_size_,
+                                                 *request,
+                                                 options_.prefetch_batch_size(),
+                                                 timeout_ms,
+                                                 std::move(stop_requested),
+                                                 std::move(done));
   for (uint32_t local_rank = 0; local_rank < dp_local_size_; ++local_rank) {
     worker_clients_[local_rank + dp_local_size_ * dp_rank]
         ->prefetch_from_storage(request, result, local_rank);

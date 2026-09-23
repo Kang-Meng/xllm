@@ -132,14 +132,134 @@ SlidingWindowBlockManager::allocate_for_sequence(Sequence* seq,
 
 bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
                                                       size_t num_tokens) {
+  if (seq == nullptr) {
+    return false;
+  }
   const size_t block_size = options_.block_size();
   CHECK_GT(block_size, 0u);
   const size_t target_blocks = num_tokens / block_size;
-  const size_t blocks_per_window =
-      static_cast<size_t>(options_.swa_blocks_per_seq());
-  const size_t required_begin =
-      target_blocks - std::min(target_blocks, blocks_per_window);
-  return allocate_prefetch_range(seq, num_tokens, required_begin);
+  const size_t c128_ratio = [&]() {
+    for (uint32_t ratio : options_.compress_ratios()) {
+      if (ratio == 128) {
+        return static_cast<size_t>(ratio);
+      }
+    }
+    // Standalone SWA tests do not carry composite compression metadata. A
+    // one-block cadence is the least surprising fallback for that shape.
+    return size_t{1};
+  }();
+  const size_t c128_span_blocks = c128_ratio;
+
+  KVCacheState& host_state = seq->host_kv_state();
+  const size_t cached_cursor =
+      std::min(host_state.num_cached_blocks(BlockType::SWA), target_blocks);
+  const size_t shared_blocks = host_state.shared_blocks_num(BlockType::SWA);
+  std::vector<Block> old = host_state.take_blocks(BlockType::SWA);
+  old.resize(target_blocks);
+
+  std::vector<Block> blocks(target_blocks);
+  std::vector<Block> dropped;
+  dropped.reserve(old.size());
+  auto is_checkpoint = [c128_span_blocks](size_t index) {
+    return c128_span_blocks > 0 && (index + 1) % c128_span_blocks == 0;
+  };
+  for (size_t index = 0; index < old.size(); ++index) {
+    if (!old[index].is_valid()) {
+      continue;
+    }
+    // Prefetch SWA has one physical position per C128 boundary. Existing
+    // prefix probes may be dense, so collapse them to the same sparse layout
+    // before appending pending Store destinations.
+    if (is_checkpoint(index)) {
+      blocks[index] = std::move(old[index]);
+    } else {
+      dropped.emplace_back(std::move(old[index]));
+    }
+  }
+  if (!dropped.empty()) {
+    deallocate(dropped);
+  }
+
+  seq->update_block_hashes(static_cast<uint32_t>(block_size),
+                           options_.hasher_type());
+  const Slice<XXH3Key> hashes = seq->block_hashes();
+  CHECK_GE(hashes.size(), target_blocks);
+  std::vector<size_t> missing;
+  for (size_t index = cached_cursor; index < target_blocks; ++index) {
+    if (is_checkpoint(index) && !blocks[index].is_valid()) {
+      missing.emplace_back(index);
+    }
+  }
+
+  const size_t allocatable = std::min(
+      missing.size(), num_free_blocks() + num_blocks_in_prefix_cache());
+  std::vector<Block> allocated = allocate(allocatable);
+  if (allocated.empty() && allocatable > 0) {
+    allocated = allocate(std::min(missing.size(), num_free_blocks()));
+  }
+  for (size_t i = 0; i < allocated.size(); ++i) {
+    allocated[i].set_hash_value(hashes[missing[i]].data);
+    blocks[missing[i]] = std::move(allocated[i]);
+  }
+  if (!blocks.empty()) {
+    host_state.replace_composite_blocks(BlockType::SWA,
+                                        std::move(blocks),
+                                        std::min(shared_blocks, target_blocks),
+                                        target_blocks);
+  }
+  return allocated.size() == missing.size();
+}
+
+void SlidingWindowBlockManager::trim_prefetch_blocks(Sequence* seq,
+                                                     size_t max_hit_tokens) {
+  if (seq == nullptr || block_size() == 0) {
+    return;
+  }
+  KVCacheState& host_state = seq->host_kv_state();
+  std::vector<Block> blocks = host_state.take_blocks(BlockType::SWA);
+  const size_t keep = std::min(max_hit_tokens / block_size(), blocks.size());
+  size_t source_index = keep;
+  for (size_t index = keep; index > 0; --index) {
+    if (blocks[index - 1].is_valid()) {
+      source_index = index - 1;
+      break;
+    }
+  }
+
+  std::vector<Block> to_release;
+  to_release.reserve(blocks.size());
+  Block source;
+  if (source_index < keep) {
+    source = blocks[source_index];
+  }
+  for (size_t index = 0; index < blocks.size(); ++index) {
+    if (!blocks[index].is_valid() || index == source_index) {
+      continue;
+    }
+    to_release.emplace_back(std::move(blocks[index]));
+  }
+  if (!to_release.empty()) {
+    deallocate(to_release);
+  }
+  if (!source.is_valid()) {
+    host_state.erase_blocks(BlockType::SWA);
+    return;
+  }
+
+  seq->update_block_hashes(static_cast<uint32_t>(block_size()),
+                           options_.hasher_type());
+  const Slice<XXH3Key> hashes = seq->block_hashes();
+  CHECK_GT(hashes.size(), source_index);
+  source.set_hash_value(hashes[source_index].data);
+  // The regular token-chain insert assumes a dense vector. SWA's logical
+  // vector is sparse by design, so publish only the surviving absolute
+  // checkpoint block through the block-identity overload.
+  BlockManagerImpl::cache(std::vector<Block>{source});
+
+  std::vector<Block> retained(source_index + 1);
+  retained[source_index] = std::move(source);
+  host_state.replace_composite_blocks(
+      BlockType::SWA, std::move(retained), source_index + 1, source_index + 1);
 }
 
 void SlidingWindowBlockManager::release_out_of_window(Sequence* seq,

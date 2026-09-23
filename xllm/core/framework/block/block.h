@@ -86,6 +86,20 @@ inline constexpr bool is_kv_split_cache_block_type(BlockType type) {
   return false;
 }
 
+inline constexpr bool is_prefetch_gate_block_type(BlockType type) {
+  switch (type) {
+    case BlockType::KV:
+    case BlockType::C4:
+    case BlockType::C128:
+      return true;
+    case BlockType::SWA:
+    case BlockType::EMBEDDING:
+    case BlockType::LINEAR:
+      return false;
+  }
+  return false;
+}
+
 inline constexpr std::optional<BlockType> block_type_from_cache_group_id(
     int32_t group_id) {
   switch (group_id) {

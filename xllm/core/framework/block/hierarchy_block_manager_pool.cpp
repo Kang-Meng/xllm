@@ -20,8 +20,8 @@ limitations under the License.
 #include <algorithm>
 #include <atomic>
 #include <exception>
-#include <limits>
 #include <map>
+#include <optional>
 #include <tuple>
 #include <unordered_map>
 
@@ -34,8 +34,6 @@ limitations under the License.
 namespace xllm {
 
 namespace {
-
-using ProbeResult = CompositeBlockManager::ProbeResult;
 
 void finalize_host_blocks(bool publish,
                           std::vector<Block> host_blocks,
@@ -106,201 +104,213 @@ bool has_valid_swa_window(size_t tokens,
 
 size_t prefetch_unit_size(CompositeBlockManager::LeafCombination combination,
                           const CompositeBlockManager::LeafMap& leaves) {
-  const BlockType unit_type =
-      combination == CompositeBlockManager::LeafCombination::SWA_COMPRESSED
-          ? BlockType::C128
-          : BlockType::KV;
+  BlockType unit_type = BlockType::KV;
+  if (combination == CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
+    unit_type = BlockType::C128;
+  } else if (combination ==
+             CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR) {
+    unit_type = BlockType::LINEAR;
+  }
   const auto unit_leaf = leaves.find(unit_type);
   CHECK(unit_leaf != leaves.end());
   CHECK_GT(unit_leaf->second.leaf->block_size(), 0u);
+  if (unit_type == BlockType::LINEAR) {
+    const auto kv_leaf = leaves.find(BlockType::KV);
+    CHECK(kv_leaf != leaves.end());
+    CHECK_GT(kv_leaf->second.leaf->block_size(), 0u);
+    CHECK_EQ(unit_leaf->second.leaf->block_size() %
+                 kv_leaf->second.leaf->block_size(),
+             0u);
+  }
   return unit_leaf->second.leaf->block_size();
 }
 
-size_t complete_prefetch_tokens(
-    const Sequence* sequence,
-    CompositeBlockManager::LeafCombination combination,
-    const CompositeBlockManager::LeafMap& leaves,
-    size_t limit_tokens) {
-  CHECK(sequence != nullptr);
-  const KVCacheState& host_state = sequence->host_kv_state();
-  if (combination == CompositeBlockManager::LeafCombination::FLAT_KV) {
-    const BlockManager* leaf = leaves.at(BlockType::KV).leaf.get();
-    const size_t block_size = leaf->block_size();
-    const size_t limit_blocks = limit_tokens / block_size;
-    const Slice<Block> blocks = host_state.blocks(BlockType::KV);
-    size_t complete_blocks = 0;
-    while (complete_blocks < limit_blocks && complete_blocks < blocks.size() &&
-           blocks[complete_blocks].is_valid()) {
-      ++complete_blocks;
-    }
-    return complete_blocks * block_size;
-  }
-
-  CHECK(combination == CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-  const BlockManager* swa_leaf = leaves.at(BlockType::SWA).leaf.get();
-  const BlockManager* c4_leaf = leaves.at(BlockType::C4).leaf.get();
-  const BlockManager* c128_leaf = leaves.at(BlockType::C128).leaf.get();
-  const size_t swa_block_size = swa_leaf->block_size();
-  const size_t c4_block_size = c4_leaf->block_size();
-  const size_t unit_size = c128_leaf->block_size();
-  const size_t blocks_per_window =
-      static_cast<size_t>(swa_leaf->options().swa_blocks_per_seq());
-  const Slice<Block> swa_blocks = host_state.blocks(BlockType::SWA);
-  const Slice<Block> c4_blocks = host_state.blocks(BlockType::C4);
-  const Slice<Block> c128_blocks = host_state.blocks(BlockType::C128);
-
-  const size_t limit_units = limit_tokens / unit_size;
-  size_t complete_units = 0;
-  for (size_t unit = 0; unit < limit_units; ++unit) {
-    if (unit >= c128_blocks.size() || !c128_blocks[unit].is_valid()) {
-      break;
-    }
-
-    const size_t c4_begin = unit * unit_size / c4_block_size;
-    const size_t c4_end = (unit + 1) * unit_size / c4_block_size;
-    bool c4_complete = c4_end <= c4_blocks.size();
-    for (size_t index = c4_begin; c4_complete && index < c4_end; ++index) {
-      c4_complete = c4_blocks[index].is_valid();
-    }
-    if (!c4_complete || !has_valid_swa_window((unit + 1) * unit_size,
-                                              swa_block_size,
-                                              blocks_per_window,
-                                              swa_blocks)) {
-      break;
-    }
-    ++complete_units;
-  }
-  return complete_units * unit_size;
-}
-
-void trim_prefetch_state(Sequence* sequence,
-                         const CompositeBlockManager::LeafMap& leaves,
-                         size_t keep_tokens) {
-  CHECK(sequence != nullptr);
-  KVCacheState& host_state = sequence->host_kv_state();
-  for (const auto& [type, entry] : leaves) {
-    if (type == BlockType::EMBEDDING || type == BlockType::LINEAR) {
-      continue;
-    }
-    const size_t keep = keep_tokens / entry.leaf->block_size();
-    const size_t shared = std::min(host_state.shared_blocks_num(type), keep);
-    const size_t cached = std::min(host_state.num_cached_blocks(type), keep);
-    std::vector<Block> blocks = host_state.take_blocks(type);
-    trim_blocks_from_back(entry.leaf.get(), &blocks, keep);
-    if (!blocks.empty()) {
-      host_state.replace_composite_blocks(
-          type, std::move(blocks), shared, cached);
-    }
-  }
-}
-
-void append_prefetch_transfer(StoragePrefetchRequest* request,
+bool append_prefetch_transfer(std::vector<BlockTransferInfo>* transfers,
                               BlockType type,
                               size_t block_index,
                               const KVCacheState& host_state) {
-  CHECK(request != nullptr);
+  CHECK(transfers != nullptr);
   const Slice<Block> blocks = host_state.blocks(type);
-  CHECK_LT(block_index, blocks.size());
-  CHECK(blocks[block_index].is_valid());
-  request->transfer_infos.emplace_back(
+  if (block_index >= blocks.size() || !blocks[block_index].is_valid()) {
+    return false;
+  }
+  transfers->emplace_back(
       /*src_id=*/-1,
       /*dst_id=*/blocks[block_index].id(),
       blocks[block_index].get_immutable_hash_value(),
       TransferType::G2H,
       type);
+  return true;
+}
+
+size_t valid_block_size(const Slice<Block>& blocks) {
+  for (const Block& block : blocks) {
+    if (block.is_valid()) {
+      return block.size();
+    }
+  }
+  return 0;
+}
+
+StoragePrefetchRequest build_flat_kv_prefetch_request(
+    const Sequence* sequence) {
+  CHECK(sequence != nullptr);
+  const KVCacheState& host_state = sequence->host_kv_state();
+  const Slice<Block> kv_blocks = host_state.blocks(BlockType::KV);
+  const size_t block_size = valid_block_size(kv_blocks);
+  if (block_size == 0 || kv_blocks.empty()) {
+    return {};
+  }
+  const size_t base_units = host_state.shared_tokens_num() / block_size;
+  if (base_units >= kv_blocks.size()) {
+    return {};
+  }
+
+  StoragePrefetchRequest request;
+  request.units.reserve(kv_blocks.size() - base_units);
+  for (size_t unit = base_units; unit < kv_blocks.size(); ++unit) {
+    PrefetchUnit prefetch_unit;
+    if (!append_prefetch_transfer(
+            &prefetch_unit.gated_blocks, BlockType::KV, unit, host_state)) {
+      break;
+    }
+    request.units.emplace_back(std::move(prefetch_unit));
+  }
+  return request;
+}
+
+StoragePrefetchRequest build_flat_kv_linear_prefetch_request(
+    const Sequence* sequence) {
+  CHECK(sequence != nullptr);
+  const KVCacheState& host_state = sequence->host_kv_state();
+  const Slice<Block> kv_blocks = host_state.blocks(BlockType::KV);
+  const Slice<Block> linear_blocks = host_state.blocks(BlockType::LINEAR);
+  const size_t kv_block_size = valid_block_size(kv_blocks);
+  size_t unit_size = valid_block_size(linear_blocks);
+  // A capacity miss can leave the optional Linear vector entirely invalid;
+  // both vectors still cover the same target range, so their logical lengths
+  // preserve the KV-per-Linear unit ratio.
+  if (unit_size == 0 && !linear_blocks.empty() &&
+      kv_blocks.size() % linear_blocks.size() == 0) {
+    unit_size = kv_block_size * (kv_blocks.size() / linear_blocks.size());
+  }
+  if (kv_block_size == 0 || unit_size == 0 || linear_blocks.empty() ||
+      unit_size % kv_block_size != 0) {
+    return {};
+  }
+  const size_t base_units = host_state.shared_tokens_num() / unit_size;
+  if (base_units >= linear_blocks.size()) {
+    return {};
+  }
+
+  StoragePrefetchRequest request;
+  request.units.reserve(linear_blocks.size() - base_units);
+  for (size_t unit = base_units; unit < linear_blocks.size(); ++unit) {
+    PrefetchUnit prefetch_unit;
+    prefetch_unit.has_non_gated = true;
+    const size_t kv_begin = unit * unit_size / kv_block_size;
+    const size_t kv_end = (unit + 1) * unit_size / kv_block_size;
+    bool gate_available = true;
+    for (size_t block_index = kv_begin; block_index < kv_end; ++block_index) {
+      const bool available = append_prefetch_transfer(
+          &prefetch_unit.gated_blocks, BlockType::KV, block_index, host_state);
+      gate_available = gate_available && available;
+    }
+    if (!gate_available) {
+      break;
+    }
+    if (linear_blocks[unit].is_valid()) {
+      append_prefetch_transfer(
+          &prefetch_unit.non_gated_blocks, BlockType::LINEAR, unit, host_state);
+    }
+    request.units.emplace_back(std::move(prefetch_unit));
+  }
+  return request;
+}
+
+StoragePrefetchRequest build_swa_compressed_prefetch_request(
+    const Sequence* sequence) {
+  CHECK(sequence != nullptr);
+  const KVCacheState& host_state = sequence->host_kv_state();
+  const Slice<Block> swa_blocks = host_state.blocks(BlockType::SWA);
+  const Slice<Block> c4_blocks = host_state.blocks(BlockType::C4);
+  const Slice<Block> c128_blocks = host_state.blocks(BlockType::C128);
+  size_t swa_block_size = valid_block_size(swa_blocks);
+  const size_t c4_block_size = valid_block_size(c4_blocks);
+  size_t unit_size = valid_block_size(c128_blocks);
+  // C4/C128 are allocated to the same target range. This keeps unit
+  // construction possible when C128 has only invalid capacity placeholders.
+  if (unit_size == 0 && !c128_blocks.empty() &&
+      c4_blocks.size() % c128_blocks.size() == 0) {
+    unit_size = c4_block_size * (c4_blocks.size() / c128_blocks.size());
+  }
+  if (swa_block_size == 0 && !swa_blocks.empty() && c128_blocks.size() != 0 &&
+      swa_blocks.size() % c128_blocks.size() == 0 && unit_size != 0) {
+    swa_block_size = unit_size / (swa_blocks.size() / c128_blocks.size());
+  }
+  if (c4_block_size == 0 || unit_size == 0 || c128_blocks.empty() ||
+      unit_size % c4_block_size != 0 ||
+      (swa_block_size != 0 && unit_size % swa_block_size != 0)) {
+    return {};
+  }
+  const size_t base_units = host_state.shared_tokens_num() / unit_size;
+  if (base_units >= c128_blocks.size()) {
+    return {};
+  }
+
+  StoragePrefetchRequest request;
+  request.units.reserve(c128_blocks.size() - base_units);
+  for (size_t unit = base_units; unit < c128_blocks.size(); ++unit) {
+    PrefetchUnit prefetch_unit;
+    prefetch_unit.has_non_gated = true;
+    if (swa_block_size != 0) {
+      const size_t swa_begin = unit * unit_size / swa_block_size;
+      const size_t swa_end = (unit + 1) * unit_size / swa_block_size;
+      for (size_t block_index = swa_begin; block_index < swa_end;
+           ++block_index) {
+        if (block_index < swa_blocks.size() &&
+            swa_blocks[block_index].is_valid()) {
+          append_prefetch_transfer(&prefetch_unit.non_gated_blocks,
+                                   BlockType::SWA,
+                                   block_index,
+                                   host_state);
+        }
+      }
+    }
+
+    bool gate_available = true;
+    const size_t c4_begin = unit * unit_size / c4_block_size;
+    const size_t c4_end = (unit + 1) * unit_size / c4_block_size;
+    for (size_t block_index = c4_begin; block_index < c4_end; ++block_index) {
+      const bool available = append_prefetch_transfer(
+          &prefetch_unit.gated_blocks, BlockType::C4, block_index, host_state);
+      gate_available = gate_available && available;
+    }
+    const bool c128_available = append_prefetch_transfer(
+        &prefetch_unit.gated_blocks, BlockType::C128, unit, host_state);
+    gate_available = gate_available && c128_available;
+    if (!gate_available) {
+      break;
+    }
+    request.units.emplace_back(std::move(prefetch_unit));
+  }
+  return request;
 }
 
 StoragePrefetchRequest build_prefetch_request(
     const Sequence* sequence,
-    CompositeBlockManager::LeafCombination combination,
-    const CompositeBlockManager::LeafMap& leaves,
-    size_t base_tokens,
-    size_t final_tokens,
-    size_t max_units_per_batch) {
-  CHECK(sequence != nullptr);
-  CHECK_LE(base_tokens, final_tokens);
-  const KVCacheState& host_state = sequence->host_kv_state();
-  const size_t unit_size = prefetch_unit_size(combination, leaves);
-  const size_t base_units = base_tokens / unit_size;
-  const size_t final_units = final_tokens / unit_size;
-  const size_t unit_count = final_units - base_units;
-  size_t transfers_per_unit = 1;
-  if (combination == CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
-    const BlockManager* swa_leaf = leaves.at(BlockType::SWA).leaf.get();
-    const size_t swa_block_size = swa_leaf->block_size();
-    const size_t c4_block_size = leaves.at(BlockType::C4).leaf->block_size();
-    CHECK_GT(swa_block_size, 0u);
-    CHECK_GT(c4_block_size, 0u);
-    CHECK_EQ(unit_size % swa_block_size, 0u);
-    CHECK_EQ(unit_size % c4_block_size, 0u);
-    const size_t blocks_per_window =
-        static_cast<size_t>(swa_leaf->options().swa_blocks_per_seq());
-    transfers_per_unit += unit_size / c4_block_size;
-    transfers_per_unit +=
-        std::min(unit_size / swa_block_size, blocks_per_window);
+    CompositeBlockManager::LeafCombination combination) {
+  switch (combination) {
+    case CompositeBlockManager::LeafCombination::FLAT_KV:
+      return build_flat_kv_prefetch_request(sequence);
+    case CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR:
+      return build_flat_kv_linear_prefetch_request(sequence);
+    case CompositeBlockManager::LeafCombination::SWA_COMPRESSED:
+      return build_swa_compressed_prefetch_request(sequence);
+    case CompositeBlockManager::LeafCombination::UNSUPPORTED:
+      return {};
   }
-  CHECK_LE(unit_count, std::numeric_limits<size_t>::max() / transfers_per_unit);
-
-  StoragePrefetchRequest request;
-  request.unit_end_offsets.reserve(unit_count);
-  request.transfer_infos.reserve(unit_count * transfers_per_unit);
-
-  size_t next_swa_block = 0;
-  if (combination == CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
-    next_swa_block = base_tokens / leaves.at(BlockType::SWA).leaf->block_size();
-  }
-  for (size_t unit = base_units; unit < final_units; ++unit) {
-    if (combination == CompositeBlockManager::LeafCombination::FLAT_KV) {
-      append_prefetch_transfer(&request, BlockType::KV, unit, host_state);
-    } else {
-      CHECK(combination ==
-            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-      const BlockManager* swa_leaf = leaves.at(BlockType::SWA).leaf.get();
-      const size_t swa_block_size = swa_leaf->block_size();
-      const size_t swa_end = (unit + 1) * unit_size / swa_block_size;
-      const size_t blocks_per_window =
-          static_cast<size_t>(swa_leaf->options().swa_blocks_per_seq());
-      const size_t swa_begin = swa_end - std::min(swa_end, blocks_per_window);
-      next_swa_block = std::max(next_swa_block, swa_begin);
-      const Slice<Block> swa_blocks = host_state.blocks(BlockType::SWA);
-      for (; next_swa_block < swa_end; ++next_swa_block) {
-        if (swa_blocks[next_swa_block].is_valid()) {
-          append_prefetch_transfer(
-              &request, BlockType::SWA, next_swa_block, host_state);
-        }
-      }
-
-      const size_t c4_block_size = leaves.at(BlockType::C4).leaf->block_size();
-      const size_t c4_begin = unit * unit_size / c4_block_size;
-      const size_t c4_end = (unit + 1) * unit_size / c4_block_size;
-      for (size_t block_index = c4_begin; block_index < c4_end; ++block_index) {
-        append_prefetch_transfer(
-            &request, BlockType::C4, block_index, host_state);
-      }
-      append_prefetch_transfer(&request, BlockType::C128, unit, host_state);
-    }
-
-    CHECK_LE(request.transfer_infos.size(),
-             std::numeric_limits<uint32_t>::max());
-    request.unit_end_offsets.emplace_back(
-        static_cast<uint32_t>(request.transfer_infos.size()));
-  }
-
-  const size_t batch_size =
-      std::max<size_t>(1,
-                       std::min<size_t>(max_units_per_batch,
-                                        std::numeric_limits<uint8_t>::max()));
-  request.batch_end_unit_offsets.reserve(
-      request.unit_end_offsets.size() / batch_size + 1);
-  for (size_t end = batch_size; end < request.unit_end_offsets.size();
-       end += batch_size) {
-    request.batch_end_unit_offsets.emplace_back(static_cast<uint32_t>(end));
-  }
-  if (!request.unit_end_offsets.empty()) {
-    request.batch_end_unit_offsets.emplace_back(
-        static_cast<uint32_t>(request.unit_end_offsets.size()));
-  }
-  return request;
+  return {};
 }
 
 void finalize_prefetch(Sequence* sequence,
@@ -310,27 +320,54 @@ void finalize_prefetch(Sequence* sequence,
   CHECK(sequence != nullptr);
   CHECK(host_manager);
   const auto& leaves = host_manager->leaf_entries();
-  trim_prefetch_state(sequence, leaves, publish ? final_tokens : 0);
   KVCacheState& host_state = sequence->host_kv_state();
   if (!publish) {
+    for (const auto& [type, entry] : leaves) {
+      std::vector<Block> blocks = host_state.take_blocks(type);
+      entry.leaf->deallocate(blocks);
+    }
     host_state.reset();
     return;
   }
 
-  for (const auto& [type, entry] : leaves) {
-    std::vector<Block> blocks = host_state.take_blocks(type);
-    if (blocks.empty()) {
-      continue;
-    }
-    host_manager->cache_blocks(type, blocks);
-    const size_t logical_blocks = blocks.size();
-    host_state.replace_composite_blocks(
-        type, std::move(blocks), logical_blocks, logical_blocks);
-    VLOG(1) << "[Mooncake][PrefetchComplete] type="
-            << static_cast<int32_t>(type) << ", reach=" << logical_blocks;
-  }
+  // Each Host leaf releases overflow aliases, publishes the retained range and
+  // rebuilds its own cursor. The pool only commits the sequence-level token
+  // boundary after all leaves have completed that transaction.
+  host_manager->trim_prefetch_blocks(sequence, final_tokens);
   host_state.set_kv_cache_tokens_num(final_tokens);
   host_state.set_prefix_cache_matched();
+}
+
+size_t finalize_prefetch_tokens(
+    CompositeBlockManager::LeafCombination combination,
+    const CompositeBlockManager::LeafMap& leaves,
+    size_t base_tokens,
+    const PrefetchSummary& summary) {
+  const size_t unit_size = prefetch_unit_size(combination, leaves);
+  size_t gated_units = 0;
+  while (gated_units < summary.gated_hits.size() &&
+         summary.gated_hits[gated_units] != 0) {
+    ++gated_units;
+  }
+  const size_t gated_tokens = base_tokens + gated_units * unit_size;
+  if (combination == CompositeBlockManager::LeafCombination::FLAT_KV) {
+    return gated_tokens;
+  }
+
+  // Optional SWA/LINEAR cache misses do not stop gated prefetch. Publish up
+  // to the deepest optional hit inside the contiguous gated prefix; the leaf
+  // trim implementation releases every other temporary block.
+  size_t deepest_optional_unit = 0;
+  const size_t inspect = std::min(gated_units, summary.non_gated_hits.size());
+  for (size_t index = 0; index < inspect; ++index) {
+    if (summary.non_gated_hits[index] != 0) {
+      deepest_optional_unit = index + 1;
+    }
+  }
+  if (deepest_optional_unit == 0) {
+    return base_tokens;
+  }
+  return base_tokens + deepest_optional_unit * unit_size;
 }
 
 }  // namespace
@@ -641,10 +678,6 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
-  // TODO: LINEAR offload must retain the confirmed historical slot before the
-  // HBM leaf trims it, select the exact speculative checkpoint, pin it through
-  // D2H, then publish it to Host/Store. FLAT_KV_LINEAR remains unsupported by
-  // the hierarchy manager until that ownership and transfer protocol exists.
   if (!composite->allocate_sequence(sequence, num_tokens)) {
     release_host_match(sequence, dp_rank);
     return false;
@@ -921,73 +954,64 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
     }
     const size_t target_tokens = (cacheable_tokens / unit_size) * unit_size;
 
-    std::vector<ProbeResult> probes = CompositeBlockManager::probe_prefix_cache(
-        sequence, host_leaves, sequence->host_kv_state());
-    for (ProbeResult& probe : probes) {
-      sequence->host_kv_state().mount_composite_shared(probe.type,
-                                                       std::move(probe.blocks));
-    }
-    const size_t base_tokens = complete_prefetch_tokens(
-        sequence, combination, host_leaves, target_tokens);
-    trim_prefetch_state(sequence, host_leaves, base_tokens);
+    // Host admission owns the shared-prefix probe and cross-leaf trim. Keep
+    // that transaction in the composite so prefetch sees the same shared
+    // cursors as ordinary Host prefix-cache admission.
+    host_manager->allocate_shared_for_sequence(sequence,
+                                               sequence->host_kv_state());
+    // Composite admission has completed the physical shared probe, but the
+    // Host tier is not publishable until the Store callback validates the
+    // requested units. Keep the tier-match flag private to this transaction.
+    sequence->host_kv_state().set_prefix_cache_matched(false);
+    const size_t base_tokens = sequence->host_kv_state().kv_cache_tokens_num();
 
-    if (combination == CompositeBlockManager::LeafCombination::FLAT_KV) {
-      host_leaves.at(BlockType::KV)
-          .leaf->allocate_for_prefetch(sequence, target_tokens);
-    } else {
-      CHECK(combination ==
-            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-      for (size_t boundary = base_tokens + unit_size; boundary <= target_tokens;
-           boundary += unit_size) {
-        bool complete = true;
-        for (const auto& [type, entry] : host_leaves) {
-          complete =
-              entry.leaf->allocate_for_prefetch(sequence, boundary) && complete;
-        }
-        if (!complete) {
-          break;
-        }
-      }
+    // Prefetch allocation is a Host-only transaction. Every leaf receives the
+    // full target once. The resulting state vectors carry both the shared
+    // prefix and every successfully allocated destination; request
+    // construction turns that state directly into complete Store units.
+    for (const auto& [type, entry] : host_leaves) {
+      entry.leaf->allocate_for_prefetch(sequence, target_tokens);
     }
 
-    const size_t allocated_tokens = complete_prefetch_tokens(
-        sequence, combination, host_leaves, target_tokens);
-    trim_prefetch_state(sequence, host_leaves, allocated_tokens);
     StoragePrefetchRequest storage_request =
-        build_prefetch_request(sequence,
-                               combination,
-                               host_leaves,
-                               base_tokens,
-                               allocated_tokens,
-                               options_.prefetch_batch_size());
+        build_prefetch_request(sequence, combination);
+    auto storage_request_ptr = std::make_shared<const StoragePrefetchRequest>(
+        std::move(storage_request));
 
     auto finalize = [this,
                      request,
                      sequence,
                      dp_rank,
                      base_tokens,
-                     unit_size,
-                     store_units = storage_request.unit_end_offsets.size(),
-                     finish_sequence](size_t hit_units) mutable {
-      CHECK_LE(hit_units, store_units);
-      const bool publish = !request->finished() && !request->cancelled();
-      const size_t final_tokens = base_tokens + hit_units * unit_size;
+                     combination,
+                     storage_request_ptr,
+                     finish_sequence](PrefetchSummary summary) mutable {
+      const bool transfer_ok =
+          storage_request_ptr->units.empty() ||
+          summary.gated_hits.size() == storage_request_ptr->units.size();
+      const bool publish =
+          transfer_ok && !request->finished() && !request->cancelled();
+      const size_t final_tokens = finalize_prefetch_tokens(
+          combination,
+          host_block_managers_[dp_rank]->leaf_entries(),
+          base_tokens,
+          summary);
       finalize_prefetch(
           sequence, host_block_managers_[dp_rank].get(), final_tokens, publish);
       finish_sequence();
     };
 
-    if (storage_request.transfer_infos.empty()) {
-      finalize(/*hit_units=*/0);
+    if (storage_request_ptr->units.empty()) {
+      PrefetchSummary summary;
+      finalize(std::move(summary));
       continue;
     }
 
-    CHECK(storage_request.valid());
+    CHECK(storage_request_ptr->valid());
     CHECK(engine_ != nullptr) << "Mooncake prefetch requires an Engine.";
     engine_->prefetch_from_storage(
         dp_rank,
-        std::make_shared<const StoragePrefetchRequest>(
-            std::move(storage_request)),
+        storage_request_ptr,
         [request]() { return request->finished() || request->cancelled(); },
         std::move(finalize));
   }

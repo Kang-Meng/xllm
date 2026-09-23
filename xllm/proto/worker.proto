@@ -144,10 +144,16 @@ message BlockTransferInfos {
   repeated BlockTransferInfo transfer_infos = 3;
 }
 
+message PrefetchUnit {
+  repeated BlockTransferInfo gated_blocks = 1;
+  repeated BlockTransferInfo non_gated_blocks = 2;
+  bool has_non_gated = 3;
+}
+
 message PrefetchRequest {
-  repeated BlockTransferInfo transfer_infos = 1;
-  repeated uint32 unit_end_offsets = 2;
-  repeated uint32 batch_end_unit_offsets = 3;
+  // A request is a sequence of complete semantic units. The worker expands
+  // one batch of units into a flat transfer vector locally.
+  repeated PrefetchUnit units = 1;
 }
 
 message TransferStatus {

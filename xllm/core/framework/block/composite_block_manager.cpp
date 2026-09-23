@@ -898,6 +898,23 @@ void CompositeBlockManager::cache_blocks(BlockType type,
   leaf->cache(blocks);
 }
 
+void CompositeBlockManager::trim_prefetch_blocks(Sequence* seq,
+                                                 size_t max_hit_tokens) {
+  if (seq == nullptr) {
+    return;
+  }
+  // Prefetch finalization is deliberately leaf-owned. In particular, the
+  // LINEAR and SWA leaves collapse their sparse temporary vectors differently
+  // from full-cache KV/C4/C128 leaves; the composite only fans out the same
+  // logical boundary and never interprets physical block counts.
+  for (auto& [type, entry] : leaves_) {
+    if (type == BlockType::EMBEDDING) {
+      continue;
+    }
+    entry.leaf->trim_prefetch_blocks(seq, max_hit_tokens);
+  }
+}
+
 std::vector<Block> CompositeBlockManager::allocate_blocks(BlockType type,
                                                           size_t num_blocks) {
   BlockManager* leaf = leaf_of(type);

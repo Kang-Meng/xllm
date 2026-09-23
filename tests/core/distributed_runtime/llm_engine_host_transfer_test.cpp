@@ -157,26 +157,30 @@ TEST_P(EngineHostTransferTest, PrefetchWaitsForEveryShardAndStopsAtFirstMiss) {
   options.world_size(static_cast<int32_t>(topology.workers_))
       .dp_size(static_cast<int32_t>(topology.dp_))
       .cp_size(static_cast<int32_t>(topology.cp_))
-      .prefetch_timeout(0);
+      .prefetch_timeout(0)
+      .prefetch_batch_size(5);
   ClientEngine engine(std::move(options), std::move(clients));
   auto request = std::make_shared<StoragePrefetchRequest>();
-  request->transfer_infos.reserve(5);
   for (int32_t i = 0; i < 5; ++i) {
     BlockTransferInfo info(/*src_block_id=*/i, /*dst_block_id=*/i);
     info.transfer_type = TransferType::G2H;
-    request->transfer_infos.emplace_back(info);
+    PrefetchUnit unit;
+    unit.gated_blocks.emplace_back(info);
+    request->units.emplace_back(std::move(unit));
   }
-  request->unit_end_offsets = {1, 2, 3, 4, 5};
-  request->batch_end_unit_offsets = {5};
   size_t callbacks = 0;
   size_t common_prefix = 0;
   engine.prefetch_from_storage(
       topology.rank_,
       request,
       [] { return false; },
-      [&](size_t prefix) {
+      [&](PrefetchSummary summary) {
         ++callbacks;
-        common_prefix = prefix;
+        common_prefix = 0;
+        while (common_prefix < summary.gated_hits.size() &&
+               summary.gated_hits[common_prefix] != 0) {
+          ++common_prefix;
+        }
       });
   std::vector<uint32_t> prefetched;
   prefetched.reserve(topology.workers_);
@@ -194,12 +198,12 @@ TEST_P(EngineHostTransferTest, PrefetchWaitsForEveryShardAndStopsAtFirstMiss) {
               topology.expected_.size());
     EXPECT_EQ(callbacks, 0U);
     const bool last = i + 1 == topology.expected_.size();
-    const auto hits = request->count_prefix_hit_units(
-        /*batch_index=*/0,
+    const std::vector<uint8_t> gated_hits =
         last ? std::vector<uint8_t>{1, 1, 1, 0, 1}
-             : std::vector<uint8_t>{1, 1, 1, 1, 1});
-    ASSERT_TRUE(hits.has_value());
-    EXPECT_EQ(worker.prefetch_result_->record_batch_result(i, *hits),
+             : std::vector<uint8_t>{1, 1, 1, 1, 1};
+    const std::vector<uint8_t> non_gated_hits(5, 1);
+    EXPECT_EQ(worker.prefetch_result_->record_batch_result(
+                  i, gated_hits, non_gated_hits),
               PrefetchControl::STOP);
     EXPECT_EQ(callbacks, 0U);
     worker.prefetch_result_->mark_worker_ended(i, /*worker_ok=*/true);

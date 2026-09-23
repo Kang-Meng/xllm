@@ -104,11 +104,16 @@ class WorkerPrefetchSession final
  public:
   WorkerPrefetchSession(Worker* worker,
                         ThreadPool* threadpool,
-                        StoragePrefetchRequest request)
-      : worker_(worker), threadpool_(threadpool), request_(std::move(request)) {
+                        StoragePrefetchRequest request,
+                        size_t batch_size)
+      : worker_(worker),
+        threadpool_(threadpool),
+        request_(std::move(request)),
+        batch_size_(batch_size) {
     CHECK(worker_ != nullptr);
     CHECK(threadpool_ != nullptr);
     CHECK(request_.valid());
+    CHECK_GT(batch_size_, 0u);
   }
 
   void retain() {
@@ -157,9 +162,8 @@ class WorkerPrefetchSession final
         state_ = State::COMPLETED;
         close = true;
       } else if (control == PrefetchControl::CONTINUE &&
-                 last_prefix_hit_units_ ==
-                     request_.batch_unit_count(batch_index_) &&
-                 batch_index_ + 1 < request_.batch_count()) {
+                 last_batch_gate_complete_ &&
+                 batch_index_ + 1 < request_.batch_count(batch_size_)) {
         ++batch_index_;
         state_ = State::RUNNING_BATCH;
         run_next = true;
@@ -223,17 +227,56 @@ class WorkerPrefetchSession final
       batch_index = batch_index_;
     }
 
-    const auto [transfer_begin, transfer_end] =
-        request_.batch_transfer_range(batch_index);
-    Slice<BlockTransferInfo> all_transfers(request_.transfer_infos);
-    Slice<BlockTransferInfo> batch =
-        all_transfers.slice(transfer_begin, transfer_end);
-    std::vector<uint8_t> logical_hits = worker_->prefetch_kv_blocks(batch);
-    const std::optional<uint8_t> prefix_hit_units =
-        request_.count_prefix_hit_units(batch_index, logical_hits);
-    if (!prefix_hit_units.has_value()) {
+    const size_t unit_begin =
+        request_.batch_unit_begin(batch_index, batch_size_);
+    const size_t unit_count =
+        request_.batch_unit_count(batch_index, batch_size_);
+    std::vector<BlockTransferInfo> batch_transfers;
+    batch_transfers.reserve(
+        request_.batch_transfer_count(batch_index, batch_size_));
+    std::vector<size_t> gated_offsets;
+    std::vector<size_t> non_gated_offsets;
+    for (size_t index = unit_begin; index < unit_begin + unit_count; ++index) {
+      const PrefetchUnit& unit = request_.units[index];
+      gated_offsets.emplace_back(batch_transfers.size());
+      batch_transfers.insert(batch_transfers.end(),
+                             unit.gated_blocks.begin(),
+                             unit.gated_blocks.end());
+      non_gated_offsets.emplace_back(batch_transfers.size());
+      batch_transfers.insert(batch_transfers.end(),
+                             unit.non_gated_blocks.begin(),
+                             unit.non_gated_blocks.end());
+    }
+    Slice<BlockTransferInfo> batch_slice(batch_transfers);
+    const std::vector<uint8_t> transfer_hits =
+        worker_->prefetch_kv_blocks(batch_slice);
+    if (transfer_hits.size() != batch_transfers.size()) {
       fail_and_close(stream_id_);
       return;
+    }
+    std::vector<uint8_t> gated_hits(batch_size_, 0);
+    std::vector<uint8_t> non_gated_hits(batch_size_, 0);
+    bool gate_complete = true;
+    for (size_t local = 0; local < unit_count; ++local) {
+      const PrefetchUnit& unit = request_.units[unit_begin + local];
+      const size_t gated_begin = gated_offsets[local];
+      const size_t non_gated_begin = non_gated_offsets[local];
+      bool gated_hit = true;
+      for (size_t offset = 0; offset < unit.gated_blocks.size(); ++offset) {
+        gated_hit = gated_hit && transfer_hits[gated_begin + offset] != 0;
+      }
+      bool non_gated_hit = !unit.has_non_gated;
+      if (unit.has_non_gated) {
+        non_gated_hit = !unit.non_gated_blocks.empty();
+        for (size_t offset = 0; offset < unit.non_gated_blocks.size();
+             ++offset) {
+          non_gated_hit =
+              non_gated_hit && transfer_hits[non_gated_begin + offset] != 0;
+        }
+      }
+      gated_hits[local] = gated_hit ? 1 : 0;
+      non_gated_hits[local] = non_gated_hit ? 1 : 0;
+      gate_complete = gate_complete && gated_hit;
     }
 
     bool close_after_result = false;
@@ -242,13 +285,14 @@ class WorkerPrefetchSession final
       if (state_ != State::RUNNING_BATCH || batch_index != batch_index_) {
         return;
       }
-      last_prefix_hit_units_ = *prefix_hit_units;
+      last_batch_gate_complete_ = gate_complete;
       close_after_result = stop_after_batch_;
       state_ = close_after_result ? State::COMPLETED : State::WAITING_DECISION;
     }
 
     butil::IOBuf result;
-    result.append(&*prefix_hit_units, sizeof(*prefix_hit_units));
+    result.append(gated_hits.data(), gated_hits.size());
+    result.append(non_gated_hits.data(), non_gated_hits.size());
     if (brpc::StreamWrite(stream_id_, result) != 0) {
       fail_and_close(stream_id_);
     } else if (close_after_result) {
@@ -270,10 +314,11 @@ class WorkerPrefetchSession final
   Worker* worker_ = nullptr;
   ThreadPool* threadpool_ = nullptr;
   StoragePrefetchRequest request_;
+  size_t batch_size_ = 0;
   std::mutex mutex_;
   brpc::StreamId stream_id_ = brpc::INVALID_STREAM_ID;
   size_t batch_index_ = 0;
-  size_t last_prefix_hit_units_ = 0;
+  bool last_batch_gate_complete_ = false;
   bool stop_after_batch_ = false;
   State state_ = State::CREATED;
   std::shared_ptr<WorkerPrefetchSession> keepalive_;
@@ -838,8 +883,11 @@ void WorkerService::PrefetchFromStorage(
     return;
   }
 
-  auto session = std::make_shared<WorkerPrefetchSession>(
-      worker_.get(), &copy_threadpool_, std::move(request));
+  auto session =
+      std::make_shared<WorkerPrefetchSession>(worker_.get(),
+                                              &copy_threadpool_,
+                                              std::move(request),
+                                              options_.prefetch_batch_size());
 
   brpc::StreamId stream_id;
   brpc::StreamOptions stream_options;

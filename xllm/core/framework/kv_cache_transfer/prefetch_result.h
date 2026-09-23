@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -37,169 +38,185 @@ enum class PrefetchControl : uint8_t {
   STOP = 1,
 };
 
-class StoragePrefetchRequest final {
- public:
-  std::vector<BlockTransferInfo> transfer_infos;
-  std::vector<uint32_t> unit_end_offsets;
-  std::vector<uint32_t> batch_end_unit_offsets;
+struct PrefetchUnit final {
+  std::vector<BlockTransferInfo> gated_blocks;
+  std::vector<BlockTransferInfo> non_gated_blocks;
+  // A unit may have an optional cache whose allocation failed. Keeping this
+  // bit separate from the vector lets the worker report an optional miss
+  // instead of treating an empty vector as "not applicable".
+  bool has_non_gated = false;
 
   bool valid() const {
-    if (transfer_infos.empty() || unit_end_offsets.empty() ||
-        batch_end_unit_offsets.empty()) {
-      return false;
-    }
+    const auto valid_transfer = [](const BlockTransferInfo& info) {
+      return info.transfer_type == TransferType::G2H;
+    };
+    return !gated_blocks.empty() &&
+           std::all_of(
+               gated_blocks.begin(), gated_blocks.end(), valid_transfer) &&
+           std::all_of(non_gated_blocks.begin(),
+                       non_gated_blocks.end(),
+                       valid_transfer);
+  }
+};
 
-    uint32_t previous = 0;
-    for (uint32_t offset : unit_end_offsets) {
-      if (offset <= previous || offset > transfer_infos.size()) {
-        return false;
-      }
-      previous = offset;
-    }
-    if (unit_end_offsets.back() != transfer_infos.size()) {
-      return false;
-    }
+class StoragePrefetchRequest final {
+ public:
+  std::vector<PrefetchUnit> units;
 
-    previous = 0;
-    for (uint32_t offset : batch_end_unit_offsets) {
-      if (offset <= previous || offset > unit_end_offsets.size() ||
-          offset - previous > std::numeric_limits<uint8_t>::max()) {
-        return false;
-      }
-      previous = offset;
-    }
-    if (batch_end_unit_offsets.back() != unit_end_offsets.size()) {
-      return false;
-    }
-
-    return std::all_of(transfer_infos.begin(),
-                       transfer_infos.end(),
-                       [](const BlockTransferInfo& info) {
-                         return info.transfer_type == TransferType::G2H;
-                       });
+  bool valid() const {
+    return !units.empty() &&
+           std::all_of(units.begin(),
+                       units.end(),
+                       [](const PrefetchUnit& unit) { return unit.valid(); });
   }
 
-  size_t batch_count() const { return batch_end_unit_offsets.size(); }
+  size_t unit_count() const { return units.size(); }
 
-  size_t batch_unit_begin(size_t batch_index) const {
-    return batch_index == 0 ? 0 : batch_end_unit_offsets[batch_index - 1];
+  size_t batch_count(size_t batch_size) const {
+    CHECK_GT(batch_size, 0u);
+    return (units.size() + batch_size - 1) / batch_size;
   }
 
-  size_t batch_unit_count(size_t batch_index) const {
-    CHECK_LT(batch_index, batch_end_unit_offsets.size());
-    return batch_end_unit_offsets[batch_index] - batch_unit_begin(batch_index);
+  size_t batch_unit_begin(size_t batch_index, size_t batch_size) const {
+    CHECK_LT(batch_index, batch_count(batch_size));
+    return batch_index * batch_size;
   }
 
-  std::pair<size_t, size_t> batch_transfer_range(size_t batch_index) const {
-    CHECK_LT(batch_index, batch_end_unit_offsets.size());
-    const size_t unit_begin = batch_unit_begin(batch_index);
-    const size_t unit_end = batch_end_unit_offsets[batch_index];
-    const size_t transfer_begin =
-        unit_begin == 0 ? 0 : unit_end_offsets[unit_begin - 1];
-    return {transfer_begin, unit_end_offsets[unit_end - 1]};
+  // This is the number of real units in the batch. The worker still returns
+  // batch_size entries for both vectors and pads the remainder with zeroes.
+  size_t batch_unit_count(size_t batch_index, size_t batch_size) const {
+    const size_t begin = batch_unit_begin(batch_index, batch_size);
+    return std::min(batch_size, units.size() - begin);
   }
 
-  std::optional<uint8_t> count_prefix_hit_units(
-      size_t batch_index,
-      const std::vector<uint8_t>& logical_hits) const {
-    if (batch_index >= batch_count()) {
-      return std::nullopt;
+  size_t batch_transfer_count(size_t batch_index, size_t batch_size) const {
+    const size_t begin = batch_unit_begin(batch_index, batch_size);
+    const size_t count = batch_unit_count(batch_index, batch_size);
+    size_t result = 0;
+    for (size_t index = begin; index < begin + count; ++index) {
+      result += units[index].gated_blocks.size();
+      result += units[index].non_gated_blocks.size();
     }
-    const auto [transfer_begin, transfer_end] =
-        batch_transfer_range(batch_index);
-    if (logical_hits.size() != transfer_end - transfer_begin) {
-      return std::nullopt;
-    }
-
-    const size_t unit_begin = batch_unit_begin(batch_index);
-    const size_t unit_end = batch_end_unit_offsets[batch_index];
-    size_t hit_units = 0;
-    size_t local_begin = 0;
-    for (size_t unit = unit_begin; unit < unit_end; ++unit) {
-      const size_t local_end = unit_end_offsets[unit] - transfer_begin;
-      const bool unit_hit = std::all_of(
-          logical_hits.begin() + static_cast<std::ptrdiff_t>(local_begin),
-          logical_hits.begin() + static_cast<std::ptrdiff_t>(local_end),
-          [](uint8_t hit) { return hit != 0; });
-      if (!unit_hit) {
-        break;
-      }
-      ++hit_units;
-      local_begin = local_end;
-    }
-    return static_cast<uint8_t>(hit_units);
+    return result;
   }
+};
+
+struct PrefetchSummary final {
+  // Per-unit AND across all workers. gated_hits is used for the contiguous
+  // full-cache prefix; non_gated_hits selects the deepest optional checkpoint
+  // inside that prefix.
+  std::vector<uint8_t> gated_hits;
+  std::vector<uint8_t> non_gated_hits;
 };
 
 class PrefetchResult final {
  public:
   using StopPredicate = std::function<bool()>;
-  using DoneCallback = std::function<void(size_t)>;
+  using DoneCallback = std::function<void(PrefetchSummary)>;
 
   PrefetchResult(size_t worker_count,
-                 std::vector<uint32_t> batch_end_unit_offsets,
+                 const StoragePrefetchRequest& request,
+                 size_t batch_size,
                  int64_t timeout_ms,
                  StopPredicate stop_requested,
                  DoneCallback done)
       : workers_(worker_count),
         remaining_workers_(worker_count),
-        batch_end_unit_offsets_(std::move(batch_end_unit_offsets)),
+        request_(request),
+        batch_size_(batch_size),
         timeout_ms_(timeout_ms),
         stop_requested_(std::move(stop_requested)),
         done_(std::move(done)) {
     CHECK_GT(worker_count, 0u);
-    CHECK(!batch_end_unit_offsets_.empty());
+    CHECK_GT(batch_size_, 0u);
+    CHECK(request_.valid());
     CHECK(timeout_ms_ == -1 || timeout_ms_ > 0);
     CHECK(stop_requested_ != nullptr);
     CHECK(done_ != nullptr);
+    for (WorkerProgress& worker : workers_) {
+      worker.gated_hits.assign(request_.unit_count(), 0);
+      worker.non_gated_hits.assign(request_.unit_count(), 0);
+    }
   }
 
   size_t worker_count() const { return workers_.size(); }
   int64_t stream_idle_timeout_ms() const { return timeout_ms_; }
+  size_t batch_wire_size() const { return batch_size_; }
+  size_t batch_count() const { return request_.batch_count(batch_size_); }
 
-  std::optional<PrefetchControl> record_batch_result(size_t worker_index,
-                                                     uint8_t prefix_hit_units) {
+  size_t batch_unit_count(size_t worker_index) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    CHECK_LT(worker_index, workers_.size());
+    return request_.batch_unit_count(workers_[worker_index].batch_index,
+                                     batch_size_);
+  }
+
+  // The wire response always has 2 * batch_size bytes, including zero padding
+  // for a short final batch. Only the first real unit_count bytes from each
+  // vector are committed to the aggregate summary.
+  std::optional<PrefetchControl> record_batch_result(
+      size_t worker_index,
+      const std::vector<uint8_t>& gated_hits,
+      const std::vector<uint8_t>& non_gated_hits) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (worker_index >= workers_.size()) {
       return std::nullopt;
     }
-
     WorkerProgress& worker = workers_[worker_index];
     if (worker.state != WorkerState::WAITING_RESULT ||
-        worker.batch_index >= batch_end_unit_offsets_.size()) {
+        worker.batch_index >= batch_count() ||
+        gated_hits.size() != batch_size_ ||
+        non_gated_hits.size() != batch_size_) {
       return std::nullopt;
     }
+    const size_t begin =
+        request_.batch_unit_begin(worker.batch_index, batch_size_);
+    const size_t count =
+        request_.batch_unit_count(worker.batch_index, batch_size_);
+    std::copy(gated_hits.begin(),
+              gated_hits.begin() + static_cast<std::ptrdiff_t>(count),
+              worker.gated_hits.begin() + static_cast<std::ptrdiff_t>(begin));
+    std::copy(
+        non_gated_hits.begin(),
+        non_gated_hits.begin() + static_cast<std::ptrdiff_t>(count),
+        worker.non_gated_hits.begin() + static_cast<std::ptrdiff_t>(begin));
 
-    const size_t batch_begin =
-        worker.batch_index == 0
-            ? 0
-            : batch_end_unit_offsets_[worker.batch_index - 1];
-    const size_t batch_end = batch_end_unit_offsets_[worker.batch_index];
-    const size_t batch_units = batch_end - batch_begin;
-    if (prefix_hit_units > batch_units) {
-      return std::nullopt;
+    bool gate_miss = false;
+    for (size_t index = 0; index < count; ++index) {
+      gate_miss = gate_miss || gated_hits[index] == 0;
+    }
+    if (gate_miss) {
+      gate_stop_.store(true, std::memory_order_release);
     }
 
-    worker.hit_units += prefix_hit_units;
-    const bool last_batch =
-        worker.batch_index + 1 == batch_end_unit_offsets_.size();
+    const bool last_batch = worker.batch_index + 1 == batch_count();
     const bool timed_out =
         timeout_ms_ > 0 && timer_.elapsed_milliseconds() >= timeout_ms_;
-    const bool stopped = stop_requested_();
-
-    if (prefix_hit_units != batch_units || last_batch || timed_out || stopped ||
-        failed_) {
+    const bool stopped = gate_stop_.load(std::memory_order_acquire) ||
+                         timed_out || stop_requested_();
+    if (gate_miss || last_batch || stopped || failed_) {
       worker.state = WorkerState::WAITING_CLOSE;
       return PrefetchControl::STOP;
     }
-
     ++worker.batch_index;
     return PrefetchControl::CONTINUE;
   }
 
+  // Compact legacy response: synthesize unit bytes from a contiguous prefix.
+  std::optional<PrefetchControl> record_batch_result(size_t worker_index,
+                                                     uint8_t prefix_hit_units) {
+    const size_t count = batch_unit_count(worker_index);
+    std::vector<uint8_t> gated(batch_size_, 0);
+    std::vector<uint8_t> optional(batch_size_, 1);
+    std::fill(gated.begin(),
+              gated.begin() + std::min<size_t>(prefix_hit_units, count),
+              1);
+    return record_batch_result(worker_index, gated, optional);
+  }
+
   void mark_worker_ended(size_t worker_index, bool worker_ok) {
     DoneCallback done;
-    size_t common_hit_units = 0;
+    PrefetchSummary summary;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       CHECK_LT(worker_index, workers_.size());
@@ -217,13 +234,23 @@ class PrefetchResult final {
         return;
       }
 
-      common_hit_units = workers_.front().hit_units;
+      summary.gated_hits.assign(request_.unit_count(), 1);
+      summary.non_gated_hits.assign(request_.unit_count(), 1);
       for (const WorkerProgress& progress : workers_) {
-        common_hit_units = std::min(common_hit_units, progress.hit_units);
+        for (size_t index = 0; index < request_.unit_count(); ++index) {
+          summary.gated_hits[index] =
+              summary.gated_hits[index] && progress.gated_hits[index];
+          summary.non_gated_hits[index] =
+              summary.non_gated_hits[index] && progress.non_gated_hits[index];
+        }
+      }
+      if (failed_) {
+        summary.gated_hits.clear();
+        summary.non_gated_hits.clear();
       }
       done = std::move(done_);
     }
-    done(common_hit_units);
+    done(std::move(summary));
   }
 
  private:
@@ -235,19 +262,22 @@ class PrefetchResult final {
 
   struct WorkerProgress {
     size_t batch_index = 0;
-    size_t hit_units = 0;
     WorkerState state = WorkerState::WAITING_RESULT;
+    std::vector<uint8_t> gated_hits;
+    std::vector<uint8_t> non_gated_hits;
   };
 
   mutable std::mutex mutex_;
   std::vector<WorkerProgress> workers_;
   size_t remaining_workers_ = 0;
-  std::vector<uint32_t> batch_end_unit_offsets_;
+  StoragePrefetchRequest request_;
+  size_t batch_size_ = 0;
   int64_t timeout_ms_ = -1;
   StopPredicate stop_requested_;
   DoneCallback done_;
   Timer timer_;
   bool failed_ = false;
+  std::atomic_bool gate_stop_{false};
 };
 
 }  // namespace xllm
