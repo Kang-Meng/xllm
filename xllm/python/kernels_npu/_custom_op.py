@@ -30,6 +30,7 @@ before exposing any kernel.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 
 import torch
@@ -41,19 +42,40 @@ def _is_registered(qualname: str) -> bool:
     return library is not None and hasattr(library, op_name)
 
 
+def _loaded_xllm_ops_runtime() -> bool:
+    """True when the current process loaded the xLLM NPU ops library.
+
+    ``torch.ops.xllm_ops`` is lazily materialised by torch even when no schema
+    is loaded, so namespace presence alone cannot distinguish a real xLLM
+    binary from a standalone/test interpreter. A real binary always registers
+    ``rms_norm`` first (``npu_ops_library.cpp``); probing it keeps missing
+    operators silent outside the runtime and loud under genuine build skew.
+    """
+    library = getattr(torch.ops, "xllm_ops", None)
+    return library is not None and hasattr(library, "rms_norm")
+
+
 def register_fake(qualname: str, fake_impl: Callable) -> None:
     """Register the FakeTensor implementation of a C++ operator.
 
-    Raises when the operator is missing, so that a schema present in
-    ``TORCH_LIBRARY`` but absent from the loaded library fails at import time
-    rather than during graph capture.
+    When the operator is missing from the loaded library, the schema in
+    ``npu_ops_library.cpp`` is newer than the compiled binary (a stale build).
+    Skipping with a warning instead of raising keeps every model bootable under
+    build skew; only graph capture that actually reaches the missing operator
+    fails, which is the correct signal that the binary must be rebuilt. When
+    no xLLM operator is loaded (standalone/test interpreters), skip silently.
     """
     if not _is_registered(qualname):
-        raise RuntimeError(
-            f"operator '{qualname}' is not registered; "
-            "xllm/core/kernels/npu/npu_ops_library.cpp must define it before "
-            "its fake implementation can be attached"
-        )
+        if _loaded_xllm_ops_runtime():
+            warnings.warn(
+                f"skipping fake registration for '{qualname}': the operator is "
+                "not registered by the loaded xLLM binary. The Python source "
+                "is newer than the compiled build; rebuild the binary "
+                "(xllm/core/kernels/npu/npu_ops_library.cpp) to enable graph "
+                "capture through this operator.",
+                stacklevel=2,
+            )
+        return
     torch.library.register_fake(qualname)(fake_impl)
 
 
