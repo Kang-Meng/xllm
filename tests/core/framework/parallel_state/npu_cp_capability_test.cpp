@@ -25,11 +25,27 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/parallel_state/parallel_args.h"
 #include "core/util/scope_guard.h"
 #include "models/model_registry.h"
 
 namespace xllm {
 namespace {
+
+TEST(NpuDcpTopologyTest, KvOwnerIsLocalToDpCohort) {
+  for (int32_t rank = 0; rank < 8; ++rank) {
+    ParallelArgs args(rank,
+                      /*world_size=*/8,
+                      /*dp_size=*/2,
+                      /*cp_size=*/1,
+                      /*process_group=*/nullptr,
+                      /*ep_size=*/8);
+    args.kv_split_size(2);
+    EXPECT_EQ(args.kv_split_rank(), (rank % 4) / 2);
+    args.cp_size(2);
+    EXPECT_EQ(args.kv_split_rank(), (rank % 4) / 2);
+  }
+}
 
 TEST(NpuCpCapabilityTest, RegisteredCpCapableModels) {
   // The models that opt into NPU model-side CP. deepseek_v32 / glm_moe_dsa
@@ -342,12 +358,39 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
 
   execution_config.python_graph_backend("off");
   options.ep_size(2);
-  EXPECT_EQ(validate_model_cp(options,
-                              EngineType::LLM,
-                              "glm5_next",
-                              /*global_world_size=*/8),
-            std::optional<std::string>(
-                "Python GLM-5 Next CP initially requires ep_size == 1"));
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  options.dp_size(2).ep_size(8);
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  options.dp_size(0);
+  EXPECT_TRUE(validate_model_cp(options,
+                                EngineType::LLM,
+                                "glm5_next",
+                                /*global_world_size=*/8)
+                  .has_value());
+  options.dp_size(uint32_t{1} << 31);
+  EXPECT_TRUE(validate_model_cp(options,
+                                EngineType::LLM,
+                                "glm5_next",
+                                /*global_world_size=*/8)
+                  .has_value());
+  options.dp_size(2);
+  for (uint32_t ep_size : {0u, 3u}) {
+    options.ep_size(ep_size);
+    EXPECT_TRUE(validate_model_cp(options,
+                                  EngineType::LLM,
+                                  "glm5_next",
+                                  /*global_world_size=*/8)
+                    .has_value());
+  }
+  options.dp_size(1);
   options.ep_size(1);
 
   parallel_config.kv_split_size(2);

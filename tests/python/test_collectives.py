@@ -20,6 +20,7 @@ import importlib.util
 import json
 import sys
 import time
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -194,6 +195,52 @@ def _run_glm_ep1_tp_collective(global_rank: int, rendezvous_path: str) -> None:
             dist.destroy_process_group()
 
 
+def _run_glm53_dp_cp_ep_collectives(global_rank: int, rendezvous_path: str) -> None:
+    world_size = 8
+    dp_rank, local_rank = divmod(global_rank, 4)
+    cp_rank, tp_rank = divmod(local_rank, 2)
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{rendezvous_path}",
+            rank=global_rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=20),
+        )
+        for name, size, stride, expected_rank in (
+            ("tp", 2, None, tp_rank),
+            ("dp", 2, None, dp_rank),
+            ("moe_ep", world_size, None, global_rank),
+            ("cp", 2, 2, cp_rank),
+        ):
+            memberships = collectives._group_memberships(name, size, world_size, stride)
+            for index, ranks in enumerate(memberships):
+                group = dist.new_group(ranks=ranks, backend="gloo", timeout=timedelta(seconds=20))
+                if global_rank in ranks:
+                    assert group.rank() == expected_rank
+                    if name == "cp":
+                        assert index == dp_rank * 2 + tp_rank
+                    collectives._groups[(name, "cpu")] = group
+
+        cp_rows = collectives.all_gather(torch.tensor([[float(global_rank)]]), 0, 2, "cp")
+        expected_cp = torch.tensor([[float(dp_rank * 4 + tp_rank)], [float(dp_rank * 4 + 2 + tp_rank)]])
+        torch.testing.assert_close(cp_rows, expected_cp)
+
+        local_rows = torch.full((1 if dp_rank == 0 else 3, 1), float(global_rank))
+        gathered, offset = collectives.gather_dp_execution_tokens(local_rows, (1, 3), dp_rank)
+        expected_dp = torch.tensor([float(local_rank)] + [float(local_rank + 4)] * 3).unsqueeze(-1)
+        assert offset == dp_rank
+        torch.testing.assert_close(gathered, expected_dp)
+
+        expert_partial = torch.tensor([[float(global_rank + 1)]])
+        collectives.moe_ep_all_reduce(expert_partial)
+        torch.testing.assert_close(expert_partial, torch.tensor([[36.0]]))
+    finally:
+        collectives._groups.clear()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def test_parallel_groups_share_one_multitenant_tcp_store(monkeypatch):
     base_store, tcp_store, init_world, new_group = _mock_process_groups(monkeypatch, global_rank=0)
 
@@ -271,14 +318,11 @@ def test_native_runtime_bridge_bypasses_python_process_groups(monkeypatch):
     python_gather.assert_not_called()
 
 
-@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo backend is unavailable")
-def test_glm_ep1_tp_reduce_does_not_mix_cp_cohorts(tmp_path: Path) -> None:
-    rendezvous_path = tmp_path / "glm-ep1-tp-reduce"
-
+def _run_gloo_workers(worker: Callable[[int, str], None], nprocs: int, rendezvous_path: Path) -> None:
     process_context = torch.multiprocessing.start_processes(
-        _run_glm_ep1_tp_collective,
+        worker,
         args=(str(rendezvous_path),),
-        nprocs=4,
+        nprocs=nprocs,
         join=False,
         start_method="fork",
     )
@@ -289,7 +333,7 @@ def test_glm_ep1_tp_reduce_does_not_mix_cp_cohorts(tmp_path: Path) -> None:
             grace_period=5.0,
         ):
             if time.monotonic() >= deadline:
-                pytest.fail("Gloo CP2 x TP2 collective test timed out")
+                pytest.fail(f"{worker.__name__} Gloo collective test timed out")
     finally:
         for process in process_context.processes:
             if process.is_alive():
@@ -301,6 +345,16 @@ def test_glm_ep1_tp_reduce_does_not_mix_cp_cohorts(tmp_path: Path) -> None:
             if process.is_alive():
                 process.kill()
                 process.join(timeout=5.0)
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo backend is unavailable")
+def test_glm_ep1_tp_reduce_does_not_mix_cp_cohorts(tmp_path: Path) -> None:
+    _run_gloo_workers(_run_glm_ep1_tp_collective, 4, tmp_path / "glm-ep1-tp-reduce")
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo backend is unavailable")
+def test_glm53_dp2_cp2_tp2_ep8_collectives_keep_dp_cohorts(tmp_path: Path) -> None:
+    _run_gloo_workers(_run_glm53_dp_cp_ep_collectives, 8, tmp_path / "glm53-dp2-cp2-tp2-ep8")
 
 
 def test_dcp_group_is_strided_like_kv_split_rank(monkeypatch):
@@ -315,6 +369,92 @@ def test_dcp_group_is_strided_like_kv_split_rank(monkeypatch):
         [2, 6],
         [3, 7],
     ]
+
+
+@pytest.mark.parametrize(
+    "world, cp, tp, expected",
+    [
+        (4, 2, 1, [[0, 1], [2, 3]]),
+        (8, 2, 2, [[0, 2], [1, 3], [4, 6], [5, 7]]),
+        (8, 4, 1, [[0, 1, 2, 3], [4, 5, 6, 7]]),
+        (4, 2, 2, [[0, 2], [1, 3]]),
+    ],
+)
+def test_cp_memberships_preserve_dp_cohorts(world: int, cp: int, tp: int, expected: list[list[int]]) -> None:
+    assert collectives._group_memberships("cp", cp, world, tp) == expected
+
+
+@pytest.mark.parametrize("stride", [0, -1, 3])
+def test_cp_memberships_reject_invalid_cohorts(stride: int) -> None:
+    with pytest.raises(ValueError, match="complete DP cohorts"):
+        collectives._group_memberships("cp", 2, 8, stride)
+
+
+def test_cp_group_initialization_uses_tp_stride(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=3)
+    group = collectives.init_process_group("cp", "127.0.0.1", 46001, 1, 2, "cuda:0", 3, 4, 1, 1)
+    assert group.rank() == 1
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 1], [2, 3]]
+
+
+def test_dcp_group_initialization_stays_within_dp(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=5)
+    group = collectives.init_process_group("dcp", "127.0.0.1", 46001, 0, 2, "cuda:0", 5, 8, 3, 2)
+    assert group.rank() == 0
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [
+        [0, 2],
+        [1, 3],
+        [4, 6],
+        [5, 7],
+    ]
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_all_gather_materializes_strided_activations(monkeypatch: pytest.MonkeyPatch, dim: int) -> None:
+    value = torch.arange(24, dtype=torch.float32).reshape(4, 6).transpose(0, 1)
+    assert not value.is_contiguous()
+    group = _FakeGroup(0, 2)
+    monkeypatch.setattr(collectives, "_require_group", lambda value, name: group)
+
+    def gather(chunks: list[torch.Tensor], tensor: torch.Tensor, group: object) -> None:
+        assert tensor.is_contiguous()
+        assert all(chunk.is_contiguous() for chunk in chunks)
+        torch.testing.assert_close(tensor, value)
+        chunks[0].copy_(tensor)
+        chunks[1].copy_(tensor + 100)
+
+    def gather_rows(output: torch.Tensor, tensor: torch.Tensor, group: object) -> None:
+        assert tensor.is_contiguous()
+        assert output.is_contiguous()
+        torch.testing.assert_close(tensor, value)
+        output.copy_(torch.cat((tensor, tensor + 100), dim=0))
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", gather_rows)
+    actual = collectives.all_gather(value, dim, 2, "cp")
+    torch.testing.assert_close(actual, torch.cat((value, value + 100), dim=dim))
+    assert not value.is_contiguous()
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_all_gather_keeps_contiguous_input_buffer(monkeypatch: pytest.MonkeyPatch, dim: int) -> None:
+    value = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    group = _FakeGroup(0, 2)
+    monkeypatch.setattr(collectives, "_require_group", lambda tensor, name: group)
+
+    def gather(chunks: list[torch.Tensor], tensor: torch.Tensor, group: object) -> None:
+        assert tensor.data_ptr() == value.data_ptr()
+        for index, chunk in enumerate(chunks):
+            chunk.copy_(tensor + 100 * index)
+
+    def gather_rows(output: torch.Tensor, tensor: torch.Tensor, group: object) -> None:
+        assert tensor.data_ptr() == value.data_ptr()
+        output.copy_(torch.cat((tensor, tensor + 100)))
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", gather_rows)
+    result = collectives.all_gather(value, dim, 2, "cp")
+    torch.testing.assert_close(result, torch.cat((value, value + 100), dim=dim))
 
 
 def test_dp_execution_gather_uses_fixed_collective_for_equal_counts(monkeypatch):

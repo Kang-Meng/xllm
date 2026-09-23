@@ -225,8 +225,9 @@ std::optional<std::string> validate_model_cp(const Options& options,
     // DEFAULT/PREFILL) still apply. Orthogonal TP x CP is supported (both may
     // be > 1, sharing world = cp * tp); the collective communicator builds the
     // narrowed TP group and the strided CP group as separate torch subgroups
-    // off the shared world rendezvous endpoint. DP > 1 stays unsupported: the
-    // Python executor does not implement the dp * cp * tp rank layout.
+    // off the shared world rendezvous endpoint. GLM-5 Next also restores
+    // DP-local CP rows before routed MoE, supporting the dp * cp * tp layout.
+    // Other Python CP models remain restricted to DP1.
     if (ModelConfig::is_python_model_impl(
             ModelConfig::get_instance().model_impl())) {
       // Only models whose Python forward actually shards the sequence (via
@@ -266,17 +267,25 @@ std::optional<std::string> validate_model_cp(const Options& options,
         return "Python model-side CP requires Prefill to use EagerRunner; use "
                "--python_graph_backend=off or decode-only aclgraph";
       }
-      if (options.dp_size() != 1) {
+      if (options.dp_size() != 1 && model_type != "glm5_next") {
         return "Python CP requires dp_size == 1";
       }
-      if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
+      if (options.dp_size() == 0) {
+        return "Python CP requires dp_size >= 1";
+      }
+      const uint64_t parallel_width = static_cast<uint64_t>(options.dp_size()) *
+                                      static_cast<uint64_t>(options.cp_size());
+      if (global_world_size <= 0 ||
+          static_cast<uint64_t>(global_world_size) % parallel_width != 0) {
         return "Python CP requires world_size divisible by dp_size * cp_size";
       }
       const int32_t kv_split =
           ParallelConfig::get_instance().kv_split_size_effective();
       if (model_type == "glm5_next") {
-        if (options.ep_size() != 1) {
-          return "Python GLM-5 Next CP initially requires ep_size == 1";
+        if (options.ep_size() == 0 ||
+            global_world_size % options.ep_size() != 0) {
+          return "Python GLM-5 Next CP requires ep_size to be a positive "
+                 "divisor of world_size";
         }
         if (kv_split != 1) {
           return "Python GLM-5 Next CP initially requires kv_split_size == 1";
@@ -509,12 +518,12 @@ Master::Master(const Options& options, EngineType type)
   const int32_t global_world_size = options_.nnodes();
   const int32_t kv_split_size =
       ParallelConfig::get_instance().kv_split_size_effective();
+  const bool npu_dcp_requested =
+      Platform::is_npu() && options_.cp_size() == 1 && kv_split_size > 1;
   const bool native_qwen_dcp_requested =
-      Platform::is_npu() &&
-      !ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl()) &&
-      options_.cp_size() == 1 && kv_split_size > 1;
-  if (native_qwen_dcp_requested) {
+      npu_dcp_requested && !ModelConfig::is_python_model_impl(
+                               ModelConfig::get_instance().model_impl());
+  if (npu_dcp_requested) {
     const std::optional<std::string> dcp_topology_error =
         validate_qwen_dcp_topology(
             global_world_size, options_.dp_size(), kv_split_size);
