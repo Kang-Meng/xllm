@@ -1364,6 +1364,10 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   }
 
   if (replay_graph != nullptr) {
+    // Captured execution cannot interleave Host-load waits with individual
+    // layers, so publish every restored cache page before replay starts.
+    CHECK(params_single.synchronize_all_layers())
+        << "failed to wait for Host cache loads before ACL graph replay";
     // Replay the existing graph
     VLOG(kGraphExecutorLogVerboseLevel)
         << "AclGraphExecutorImpl::run() in replay mode";

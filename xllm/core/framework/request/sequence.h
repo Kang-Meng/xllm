@@ -217,6 +217,13 @@ class Sequence final {
                      effective_restore_tokens_.value_or(0)});
   }
 
+  size_t last_confirmed_cached_tokens_num() const {
+    return last_confirmed_cached_tokens_num_;
+  }
+  void set_last_confirmed_cached_tokens_num(size_t num_tokens) {
+    last_confirmed_cached_tokens_num_ = num_tokens;
+  }
+
   size_t num_prefix_cache_tokens() const;
 
   // add a new token id to the sequence and update the count
@@ -578,6 +585,10 @@ class Sequence final {
 
   std::optional<size_t> effective_restore_tokens_;
   size_t host_cache_copy_units_ = 0;
+
+  // Real-result cursor used by LINEAR decode rolling. Sequence result commits
+  // update it; builder pre-advancement and overlap placeholders do not.
+  size_t last_confirmed_cached_tokens_num_ = 0;
 
   // Held by value: it is always present after construction, so a unique_ptr
   // only added a heap allocation per sequence and an indirection on the

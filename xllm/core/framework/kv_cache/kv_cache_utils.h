@@ -223,6 +223,13 @@ LinearAttentionKVCacheTensors create_linear_attention_kv_cache_tensors(
 // (clamped to >= 1.0 so the host pool is never smaller than the device pool).
 int64_t scale_host_block_count(int64_t block_count, double host_blocks_factor);
 
+// Convert a KV block capacity into logical linear-state checkpoint slots.
+// Each slot covers one prefill chunk, which contains chunk_size / block_size
+// KV blocks.
+int64_t linear_state_block_count(int64_t kv_block_count,
+                                 int64_t chunk_size,
+                                 int64_t block_size);
+
 // Return an actionable error for an unsupported host prefix-cache
 // configuration, or std::nullopt when the configuration is valid.
 std::optional<std::string> validate_host_cache_options(

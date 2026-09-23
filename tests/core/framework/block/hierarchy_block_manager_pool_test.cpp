@@ -807,18 +807,13 @@ TEST(HierarchyBlockManagerPoolTest,
   pool.deallocate(&sequence);
 }
 
-TEST(HierarchyBlockManagerPoolTest,
-     EmptyHostConfigurationKeepsDeviceAllocation) {
+TEST(HierarchyBlockManagerPoolTest, EmptyHostConfigurationRejectsAllocation) {
   BlockManagerPool::Options options = make_flat_kv_options();
   options.host_num_blocks(0).host_num_blocks_by_type({});
   HierarchyBlockManagerPool pool(options, nullptr, 1);
   EXPECT_EQ(HierarchyPoolTestPeer::host_block_managers(pool).front(), nullptr);
   Sequence sequence = make_test_sequence(0, std::vector<int32_t>(257, 23));
-  ASSERT_TRUE(pool.allocate(&sequence, 257));
-  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 3u);
-  EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
-  EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
-  pool.deallocate(&sequence);
+  EXPECT_DEATH(pool.allocate(&sequence, 257), "host_manager");
 }
 
 TEST(HierarchyBlockManagerPoolTest, FailedHbmAllocationDoesNotQueueH2d) {
@@ -1428,7 +1423,8 @@ TEST(HierarchyBlockManagerPoolTest, H2dUsesCachedTokensInsteadOfPublishCursor) {
               restore_tokens / kBlockSize);
     EXPECT_EQ(host_state.num_blocks(BlockType::KV),
               (kPromptTokens + kBlockSize - 1) / kBlockSize);
-    EXPECT_EQ(host_state.kv_cache_tokens_num(), kHostCachedTokens);
+    EXPECT_EQ(host_state.kv_cache_tokens_num(),
+              std::max(kHostCachedTokens, initial_hbm_tokens));
     ASSERT_TRUE(pool.allocate(sequence, kPromptTokens));
     EXPECT_EQ(HierarchyPoolTestPeer::pending_load_infos(pool).size(),
               transfers.size());
@@ -2079,20 +2075,25 @@ TEST(HierarchyBlockManagerPoolTest, TypedLayoutSupportsStoragePrefetch) {
   EXPECT_EQ(HierarchyPoolTestPeer::host_leaves(pool).size(), 3u);
 }
 
-TEST(HierarchyBlockManagerPoolTest, RejectsLinearCacheLayout) {
+TEST(HierarchyBlockManagerPoolTest, SupportsLinearCacheLayout) {
   BlockManagerPool::Options options = make_flat_kv_options();
-  options.enable_linear_state(true).linear_state_num_slots(64);
+  options.enable_linear_state(true)
+      .linear_state_num_slots(64)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 64}});
 
   const int32_t original_chunk_stride =
       SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() = 128;
-  EXPECT_DEATH(
-      {
-        HierarchyBlockManagerPool pool(options,
-                                       /*engine=*/nullptr,
-                                       /*dp_size=*/1);
-      },
-      "supports only FLAT_KV and SWA_COMPRESSED cache layouts");
+  HierarchyBlockManagerPool pool(options,
+                                 /*engine=*/nullptr,
+                                 /*dp_size=*/1);
+  const auto* device = HierarchyPoolTestPeer::device_composite(pool);
+  EXPECT_EQ(device->leaf_combination(),
+            CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR);
+  const auto& host = HierarchyPoolTestPeer::host_leaves(pool);
+  EXPECT_TRUE(host.contains(BlockType::KV));
+  EXPECT_TRUE(host.contains(BlockType::LINEAR));
+  EXPECT_EQ(host.at(BlockType::LINEAR).leaf->block_size(), 128);
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
       original_chunk_stride;
 }

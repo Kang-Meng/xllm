@@ -584,6 +584,24 @@ int64_t scale_host_block_count(int64_t block_count, double host_blocks_factor) {
                            static_cast<int64_t>(scaled_block_count));
 }
 
+int64_t linear_state_block_count(int64_t kv_block_count,
+                                 int64_t chunk_size,
+                                 int64_t block_size) {
+  CHECK_GT(kv_block_count, 0) << "kv_block_count must be positive.";
+  CHECK_GT(chunk_size, 0) << "chunk_size must be positive.";
+  CHECK_GT(block_size, 0) << "block_size must be positive.";
+  CHECK_EQ(chunk_size % block_size, 0)
+      << "chunk_size must be a multiple of block_size.";
+  const int64_t kv_blocks_per_chunk = chunk_size / block_size;
+  CHECK_GT(kv_blocks_per_chunk, 0);
+  const int64_t linear_blocks = kv_block_count / kv_blocks_per_chunk;
+  CHECK_GT(linear_blocks, 0)
+      << "KV capacity is too small for one linear-state checkpoint: "
+      << "kv_block_count=" << kv_block_count
+      << ", kv_blocks_per_chunk=" << kv_blocks_per_chunk;
+  return linear_blocks;
+}
+
 std::optional<std::string> validate_host_cache_options(
     const HostCacheValidationOptions& options) {
   if (!std::isfinite(options.host_blocks_factor) ||
@@ -650,12 +668,15 @@ std::optional<std::string> validate_host_cache_options(
                  "SWA/C4/C128) that host offload does not support";
     violations.emplace_back(violation.str());
   }
-  if (options.has_conv_cache_shape || options.has_ssm_cache_shape) {
+  if (options.has_conv_cache_shape != options.has_ssm_cache_shape) {
     std::ostringstream violation;
     violation << "model \"" << options.model_type
-              << "\" uses linear-attention conv/SSM cache tensors that host "
-                 "offload does not restore";
+              << "\" has a partial linear-attention cache layout; Host "
+                 "offload requires both conv and SSM tensors";
     violations.emplace_back(violation.str());
+  } else if (options.has_conv_cache_shape && options.enable_kvcache_store) {
+    violations.emplace_back(
+        "linear-attention Host checkpoints do not support KV cache Store");
   }
 
   if (violations.empty()) {

@@ -1160,6 +1160,21 @@ struct ModelInputParams {
     return true;
   }
 
+  bool synchronize_all_layers() const {
+    if (parallel.layer_wise_load_synchronizer == nullptr) {
+      return true;
+    }
+    for (uint32_t event_index = 0;
+         event_index < parallel.layer_wise_load_synchronizer->size();
+         ++event_index) {
+      if (!parallel.layer_wise_load_synchronizer->synchronize_layer(
+              static_cast<int64_t>(event_index))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool synchronize_draft_layer() const {
     if (parallel.layer_wise_load_synchronizer == nullptr) {
       return true;

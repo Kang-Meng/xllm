@@ -111,6 +111,17 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       request_queue_(::xllm::RecConfig::get_instance().request_queue_size()) {
   CHECK(engine_ != nullptr);
 
+  // UnifiedPolicy's mixed prefill/decode redistribution can trim or re-admit a
+  // chunk independently of the LINEAR checkpoint boundary. LINEAR state can
+  // only be restored at its rolling checkpoint, so keep these models on the
+  // exclusive prefill-first policy as a defensive guard.
+  if (has_linear_attention_layers(engine_->model_args()) &&
+      batch_mode_.enable_mix_batch &&
+      batch_mode_.priority_strategy == "multi_slo_and_prio") {
+    LOG(WARNING) << "Disabling UnifiedPolicy for models with LINEAR state.";
+    batch_mode_.enable_mix_batch = false;
+  }
+
   kv_cache_manager_ = engine_->block_manager_pool();
   CHECK(kv_cache_manager_ != nullptr);
 

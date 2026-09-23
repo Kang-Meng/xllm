@@ -141,6 +141,109 @@ TEST(HierarchyKVCacheTransferTest,
   }
 }
 
+void verify_committed_linear_round_trip(const char* model_type) {
+  constexpr int64_t kSlotCount = 3;
+  constexpr int64_t kSourceSlot = 1;
+  constexpr int64_t kDestinationSlot = 2;
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  KVCacheCapacity capacity;
+  capacity.n_blocks(2)
+      .block_size(4)
+      .num_linear_state_blocks(kSlotCount)
+      .linear_conv_state_len(5)
+      .linear_ssm_checkpoint_stride(3);
+  ModelArgs model_args;
+  model_args.model_type(model_type)
+      .n_layers(2)
+      .n_heads(2)
+      .n_kv_heads(1)
+      .head_dim(4)
+      .full_attention_interval(2)
+      .linear_conv_kernel_dim(4)
+      .linear_num_key_heads(1)
+      .linear_num_value_heads(1)
+      .linear_key_head_dim(2)
+      .linear_value_head_dim(2);
+  const KVCacheShape cache_shape(capacity, model_args, /*world_size=*/1);
+  KVCacheCreateOptions create_options;
+  create_options.device(device.unwrap())
+      .dtype(torch::kFloat32)
+      .ssm_dtype(torch::kFloat32)
+      .num_layers(2)
+      .full_attention_interval(2)
+      .enable_linear_attention(true)
+      .model_type(model_type);
+  std::vector<KVCache> caches;
+  allocate_kv_caches(caches, cache_shape, create_options);
+  torch::Tensor conv = caches[0].get_conv_cache();
+  torch::Tensor ssm = caches[0].get_ssm_cache();
+  conv[kSourceSlot].copy_(
+      torch::arange(conv[kSourceSlot].numel(), conv.options())
+          .view_as(conv[kSourceSlot]));
+  ssm.narrow(0, kSourceSlot * 3, 3)
+      .copy_(torch::arange(ssm[0].numel() * 3, ssm.options())
+                 .view_as(ssm.narrow(0, kSourceSlot * 3, 3)));
+  ASSERT_EQ(device.synchronize_default_stream(), 0);
+
+  HierarchyKVCacheTransfer::Options transfer_options;
+  transfer_options.layers(2).host_blocks_factor(2.0).layers_wise_copy_batchs(1);
+  std::unique_ptr<Stream> compute_stream = device.current_stream();
+  HierarchyKVCacheTransfer transfer(transfer_options,
+                                    device.unwrap(),
+                                    compute_stream.get(),
+                                    &caches,
+                                    cache_shape,
+                                    create_options);
+  BlockTransferInfo offload(kSourceSlot, /*dst_block_id=*/0);
+  offload.block_type = BlockType::LINEAR;
+  offload.transfer_type = TransferType::D2H2G;
+  ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/9, {offload}), 1U);
+
+  conv[kDestinationSlot].fill_(-1.0);
+  ssm.narrow(0, kDestinationSlot * 3, 3).fill_(-1.0);
+  ASSERT_EQ(device.synchronize_default_stream(), 0);
+  BlockTransferInfo load(/*src_block_id=*/0, kDestinationSlot);
+  load.block_type = BlockType::LINEAR;
+  load.transfer_type = TransferType::H2D;
+  ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/9, {load}), 1U);
+  ModelInputParams input_params;
+  input_params.meta.batch_id = 9;
+  input_params.meta.requires_host_restore = true;
+  transfer.set_layer_synchronizer(input_params);
+  ASSERT_TRUE(input_params.synchronize_all_layers());
+  EXPECT_FALSE(transfer.take_load_handle(/*batch_id=*/9).has_value());
+
+#if defined(USE_MUSA)
+  constexpr int64_t kConvHistoryAxis = 1;
+#else
+  constexpr int64_t kConvHistoryAxis = 0;
+#endif
+  const torch::Tensor destination_conv = conv[kDestinationSlot];
+  const torch::Tensor source_conv = conv[kSourceSlot];
+  EXPECT_TRUE(torch::equal(destination_conv.narrow(kConvHistoryAxis, 0, 3),
+                           source_conv.narrow(kConvHistoryAxis, 0, 3)));
+  EXPECT_TRUE(torch::all(destination_conv.narrow(kConvHistoryAxis, 3, 2) == -1)
+                  .item<bool>());
+  EXPECT_TRUE(torch::equal(ssm[kDestinationSlot * 3], ssm[kSourceSlot * 3]));
+  EXPECT_TRUE(torch::all(ssm.narrow(0, kDestinationSlot * 3 + 1, 2) == -1)
+                  .item<bool>());
+}
+
+TEST(HierarchyKVCacheTransferTest,
+     LinearRoundTripCopiesOnlyCommittedCheckpoint) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP()
+        << "An accelerator device is required for hierarchy KV transfer.";
+  }
+
+  for (const char* model_type : {"qwen3_5_text", "glm5_next"}) {
+    SCOPED_TRACE(model_type);
+    verify_committed_linear_round_trip(model_type);
+  }
+}
+
 TEST(HierarchyKVCacheTransferTest, RejectsMixedOffloadBatchBeforeSubmission) {
   if (Platform::device_count() < 1) {
     GTEST_SKIP()

@@ -1,9 +1,5 @@
----
-title: "Global Multi-Level KV Cache"
-sidebar:
-  order: 51
----
 
+# Global Multi-Level KV Cache
 ## Background
 
 Long-context inference repeatedly reads historical KV cache during autoregressive decoding. As model sizes and context windows grow, device memory capacity and bandwidth become major constraints. A device-only cache also makes a cold request recompute a prefix even when the same prefix was produced by an earlier request or another xLLM instance.
@@ -28,13 +24,29 @@ The deployment can contain the following components:
 - **xLLM Service**: Routes requests and manages fused or disaggregated Prefill/Decode instances.
 - **HierarchyBlockManagerPool**: Probes the device and Host prefix caches, creates G2H, H2D, and D2H2G plans, and publishes or releases blocks after asynchronous work completes.
 - **HierarchyKVCacheTransfer**: Registers target and draft cache domains, creates Host caches, and performs Host-to-Device and Device-to-Host copies.
-- **KVCacheStore**: Maps each logical block to one or more Mooncake objects and performs batched existence checks, reads, and writes.
+- **KVCacheStore**: Maps each logical block to one or more Mooncake objects and performs batched reads, writes, and logical-hit aggregation.
 - **xLLM Worker**: Owns the device and Host KV caches, `HierarchyKVCacheTransfer`, and `KVCacheStore`, and executes inference.
 - **Mooncake Store**: Provides the distributed, process-independent KV object tier.
 
 The service-level architecture is shown below:
 
 ![xLLM Global Multi-Level KV Cache](../../assets/globalkvcache_architecture.png)
+
+## Cache Layouts and BlockType
+
+`HierarchyBlockManagerPool` uses `CompositeBlockManager` to combine a request's cache pools. The hierarchy currently supports three layouts:
+
+| Layout | Device/Host `BlockType` | Complete copy unit / write-back boundary |
+|---|---|---|
+| `FLAT_KV` | `KV` | One complete KV block |
+| `FLAT_KV_LINEAR` | `KV`, `LINEAR` | For Qwen3.5/GLM5.3, one checkpoint/copy unit every `max_tokens_per_chunk_for_prefill` completed tokens |
+| `SWA_COMPRESSED` | `SWA`, `C4`, `C128` | For DeepSeek-V4, each unit is exactly `1 SWA + 32 C4 + 1 C128`, or 34 transfer entries |
+
+`KV` is the attention cache used by ordinary and Qwen-family models. `SWA`, `C4`, and `C128` are independent pools in the DeepSeek-V4 compressed-cache layout. `C4` and `C128` must be complete, while `SWA` only needs to cover the window immediately before each restorable `C128` checkpoint. On Decode, the `SWA` Host leaf is write-back-only and does not participate in prefix probing or Host restoration.
+
+With linear attention (GDN/KDA), KV and recurrent state use separate Host block pools, each scaled by `host_blocks_factor`. Host transfer for `LINEAR` stores only committed state: it copies only the first three rows of the device Conv history and the first checkpoint row of the current SSM slot. Prefill retains at most two rolling slots, `[restore, live]`. `EMBEDDING` is a per-sequence speculative-decoding embedding slot; it is not part of hierarchical KV transfer and does not create Mooncake Store objects.
+
+`HierarchyKVCacheTransfer` currently supports H2D and D2H2G copies for `LINEAR`, but the Mooncake G2H prefetch unit in `HierarchyBlockManagerPool` is fully implemented only for `FLAT_KV` and `SWA_COMPRESSED`. Consequently, `FLAT_KV_LINEAR` can use Host transfer and eligible checkpoint write-back, but should not rely on the current Store path for cross-process prefix prefetch. Full Store admission and rolling-state lifetime management for `LINEAR` remain incomplete.
 
 ## Unified Cache Domains and Store Keys
 
@@ -48,173 +60,223 @@ The service-level architecture is shown below:
 
 During initialization, the Store builds an index by `BlockType`. Every cache domain that supports that `BlockType` produces a separate physical object. For example, when both the target and draft models contain `BlockType::KV`, one logical KV block maps to two Store objects. If a `BlockType` exists only in the target model, only the target object is generated.
 
-The current object-key namespace is `xllm-kv-v3`. Conceptually, a key contains the following fields:
+The current object-key namespace is `xllm-kv-v3`. `model_id` and `key_component` use length-prefixed encoding, while hash fields are appended as 128-bit binary values. Conceptually, a key contains the following fields:
 
 ```text
-Non-MLA: xllm-kv-v3 + model_id + key_component + tp_size
-                      + block_type + tp_rank + schema_hash + block_hash
+Non-MLA: xllm-kv-v3:<model_id>:<key_component>:<tp_size>:<tp_rank>
+                      :<kv_split_size>:<kv_split_rank>:<block_type>
+                      :<schema_hash><block_hash>
 
-MLA:     xllm-kv-v3 + model_id + key_component + mla
-                      + block_type + schema_hash + block_hash
+MLA:     xllm-kv-v3:<model_id>:<key_component>:mla
+                      :<kv_split_size>:<kv_split_rank>:<block_type>
+                      :<schema_hash><block_hash>
 ```
 
 - `model_id` is the target-model namespace and is included in both target and draft objects.
 - `key_component` separates the target model, speculative algorithm, and draft-model source.
-- Non-MLA caches use `tp_size`, `tp_rank`, and `block_type` to isolate different parallel topologies, ranks, and cache types.
-- MLA KV cache is replicated across ranks, so its object key uses a fixed `mla` marker and contains neither `tp_size` nor `tp_rank`. Every rank reads through the same object key, while only TP rank 0 writes to Mooncake Store.
-- `schema_hash` is derived from each tensor's role, dtype, and per-block shape, excluding the number of Host blocks. Changing only `host_blocks_factor` therefore does not change object keys, while a cache-layout change automatically selects a new key space.
-- `block_hash` is the 128-bit content hash of the corresponding token block.
+- Non-MLA caches use `tp_size`, `tp_rank`, `kv_split_size`, `kv_split_rank`, and `block_type` to isolate different parallel topologies, ranks, KV shards, and cache types. Here, `tp_size` and `tp_rank` are the effective local TP topology used by the Store client and do not necessarily equal the global process rank.
+- MLA KV cache uses a fixed `mla` marker and omits `tp_size` and `tp_rank`; `kv_split_size` and `kv_split_rank` remain part of the object key. With `kv_split_size=1`, KV is not sharded, every rank reads the same object, and only TP rank 0 writes it. With KV split enabled, each KV split rank reads and writes its own Store object.
+- `kv_split_size` is the effective number of KV shards, and `kv_split_rank` is the current Worker's shard index. A configured value of `0` inherits `cp_size`; `1` disables KV sharding and fixes `kv_split_rank` to `0`.
+- `schema_hash` is derived from the parallel mode, `BlockType`, and each tensor's role, dtype, and per-block shape, excluding the number of Host blocks. Changing only `host_blocks_factor` therefore does not change object keys. Changes to the KV/LINEAR/compressed layout, dtype, role, or per-block shape automatically select a new key space.
+- `block_hash` is the 128-bit content hash of the corresponding logical block. For `LINEAR`, it identifies the committed recurrent checkpoint state.
 
-The Store API exposes logical blocks to its caller and expands them into physical cache-domain requests internally. A worker reports a hit only when **all physical objects** for that logical block exist and are read successfully. `PrefetchResult` then applies a logical AND across all TP ranks. A Store hit is publishable only when it is complete across both cache domains and TP ranks.
+The Store API exposes logical blocks to its caller and expands them into physical cache-domain requests internally. A worker reports a hit only when **all physical objects** for that logical block are read successfully. `PrefetchResult` then applies a logical AND across the local Worker group involved for the current DP rank. The group size is `world_size / dp_size`; which TP/CP workers it contains depends on the backend topology and must not be reduced to TP rank alone. With KV split enabled, different `kv_split_rank` values use different object keys and cannot be treated as the same cache copy. A Store hit is publishable only when every cache domain and every required Worker are complete.
+
+### KV Split and Store
+
+KV split can be enabled together with Mooncake Store. The Store maps every logical block to an independent object key for each `kv_split_size` and `kv_split_rank`, so one KV shard cannot overwrite another or be mistaken for a complete KV hit. During Store restoration on Prefill, a block is mounted into the Host Prefix Cache only when every registered cache domain and every Worker required by the request hit.
+
+For MLA cache, the unsharded configuration still lets only TP rank 0 write the shared object; with sharding enabled, every KV split rank writes its own object. Under speculative decoding, the target and draft models retain separate `key_component` values and each cache domain is further separated by KV split, so a missing draft shard makes the corresponding logical block a miss.
+
+Valid `kv_split_size` values are checked against the backend, model, and parallel topology. In a conventional CP configuration, `K` must be positive and meet the backend constraint, usually by dividing `cp_size`; `0` inherits `cp_size`, and `1` disables KV sharding. Instances that need to reuse the same Store objects must use the same model identity, cache layout, and effective split topology. Different split topologies occupy different key spaces and do not cross-hit.
 
 ## Block Lifecycle
 
-Fused instances and the Prefill side of disaggregated PD use the complete Mooncake admission, Host restore, and write-back path. Decode keeps Store enabled for its Host/Mooncake write-back path, while its request-admission path remains Device-prefix-only. With speculative decoding enabled, each logical block operation in the following diagram covers every target or draft cache domain that supports its `BlockType`.
+For `FLAT_KV` and `SWA_COMPRESSED`, fused instances and the Prefill side of disaggregated PD use the complete Mooncake admission, Host restore, and write-back path. Decode keeps Store enabled for its Host/Mooncake write-back path, while its request-admission path remains Device-prefix-only. `FLAT_KV_LINEAR` currently guarantees only Host-to-Device and Device-to-Host transfer plus eligible checkpoint write-back; the complete Store-admission path in the diagram does not apply to it. With speculative decoding enabled, each logical block operation in the diagram covers every target or draft cache domain that supports its `BlockType`.
+
+Scheduling-side and execution-side responsibilities are separate:
+
+- `HierarchyBlockManagerPool` owns `load_block_transfer_infos_` and `offload_block_pair_queues_`, block ownership, Host destination reservation, and publish/free operations in completion callbacks. It generates and records transfer plans but does not perform physical copies.
+- In each Worker, `HierarchyKVCacheTransfer` performs the actual layer-wise Host-to-Device and Device-to-Host copies and Store get/put operations, creates copy streams, events, and `LayerSynchronizer`, and records `batch_id -> HostKVLoadHandle`. D2H results return to the scheduling side through futures, where the BlockManager aggregates them and updates the Host Prefix Cache.
+
+Write-back does not wait until request `deallocate`. After each Forward updates the HBM token cursor, the next `allocate/grow` publishes the copy unit completed by the previous Forward and immediately collects a new D2H2G mapping. Ordinary models collect once per complete KV block; DeepSeek-V4 collects once per `1 SWA + 32 C4 + 1 C128` composite unit; Qwen3.5/GLM5.3 collect once per chunked-prefill stride. `deallocate` only collects the final complete unit that has not yet been queued, then releases the sequence.
+
+Arrows in the following diagram use function names from the implementation. State changes, thread relationships, and data semantics are described in `Note` entries.
 
 ```mermaid
 sequenceDiagram
     autonumber
 
     participant Client as Client / xLLM Service
-    participant Scheduler as Scheduler
+    participant Scheduler as ContinuousScheduler
     participant BlockMgr as HierarchyBlockManagerPool
-    participant Engine as Engine / RemoteWorker
-    participant Result as PrefetchResult / Async Callback
-    participant Worker as TP Workers
-    participant Store as Mooncake Store
-    participant Host as Host Cache
-    participant HBM as Device HBM
+    participant Engine as LLMEngine
+    participant Remote as RemoteWorker
+    participant Channel as CommChannel
+    participant Service as WorkerService
+    participant Result as PrefetchResult
+    participant Worker as WorkerImpl / HierarchyKVCacheTransfer
+    participant Copy as HostKVTransfer
+    participant Store as KVCacheStore / Mooncake Store
+    participant Cache as Host Cache / Device HBM
 
     rect rgb(235, 245, 255)
         Note over Client,Store: Phase 1: request admission and Mooncake prefetch
 
-        Client->>Scheduler: add_request(request)
-        Scheduler->>BlockMgr: prefetch_from_storage(request)
-        BlockMgr->>Host: Probe Host Prefix Cache
-        Host-->>BlockMgr: Existing blocks and holes
-        BlockMgr->>Host: Allocate G2H destinations for holes
-        Host-->>BlockMgr: Host block IDs
+        Client->>Scheduler: ContinuousScheduler::add_request()
+        Scheduler->>BlockMgr: HierarchyBlockManagerPool::prefetch_from_storage()
+        BlockMgr->>BlockMgr: CompositeBlockManager::probe_prefix_cache()
+        BlockMgr->>BlockMgr: BlockManager::allocate_for_prefetch()
+        BlockMgr->>BlockMgr: build_prefetch_request()
+        Note right of BlockMgr: Retain Host hits and reserve holes as G2H destinations
 
         Note over BlockMgr,Store: If Host already covers the prefix, Store RPCs are skipped
-        BlockMgr->>Engine: prefetch_from_storage(G2H infos)
-        Engine->>Result: Create worker-by-block result matrix
+        BlockMgr->>Engine: LLMEngine::prefetch_from_storage()
+        Engine->>Result: PrefetchResult::PrefetchResult()
 
-        par All TP ranks
-            Engine->>Worker: PrefetchFromStorage(G2H batch)
-            Worker->>Worker: Expand each BlockType into cache-domain objects
-            Worker->>Store: BatchIsExist(all physical keys)
-            Store-->>Worker: Physical-existence bitmap
-            opt All physical objects for a logical block exist
-                Worker->>Store: BatchGet(all component keys, Host tensors)
-                Store-->>Worker: Fill each domain's Host tensors
+        par All local Workers involved in this DP rank
+            Engine->>Remote: RemoteWorker::prefetch_from_storage()
+            Remote->>Channel: CommChannel::prefetch_from_storage()
+            Channel->>Service: WorkerService::PrefetchFromStorage()
+            loop Each WorkerPrefetchSession batch
+                Service->>Service: WorkerPrefetchSession::run_batch()
+                Service->>Worker: WorkerImpl::prefetch_kv_blocks()
+                Worker->>Worker: HierarchyKVCacheTransfer::prefetch_kv_blocks()
+                Worker->>Store: KVCacheStore::batch_get_with_status()
+                Store-->>Worker: std::vector<uint8_t>
+                Worker-->>Service: std::vector<uint8_t> logical_hits
+                Service-->>Channel: uint8_t prefix_hit_units (brpc stream)
+                Channel->>Result: PrefetchResult::record_batch_result()
+                Result-->>Channel: PrefetchControl
+                Channel-->>Service: PrefetchControl (brpc stream)
             end
-            Worker->>Worker: Aggregate a rank-local logical bitmap
-            Worker-->>Result: Logical bitmap and completion
+            Service-->>Channel: brpc::StreamClose()
+            Channel->>Result: PrefetchResult::mark_worker_ended()
         end
 
-        loop Admission polling
-            Scheduler->>BlockMgr: update_prefetch_result(timeout)
-            BlockMgr->>Result: completed()?
-        end
-        BlockMgr->>Result: merged_hits()
-        Result-->>BlockMgr: Logical AND across all TP ranks
-        Note right of Result: Every cache domain must hit within one rank<br/>then all TP ranks are ANDed
-
-        BlockMgr->>Host: Release Store-miss destinations
-        BlockMgr->>Host: Cache Store-hit blocks
-        BlockMgr->>BlockMgr: Compute reachable prefix and mount Host state
-        BlockMgr-->>Scheduler: Prefetch complete
-        Scheduler->>Scheduler: AdmissionReady / enqueue_ready_request
-        Note over Scheduler,Result: Workers do not directly callback the Scheduler
+        Result-->>BlockMgr: DoneCallback(common_hit_units)
+        Note right of Result: ClientStreamReceiver invokes PrefetchResult in the scheduling process;<br/>common_hit_units is the minimum contiguous hit count across participating Workers
+        BlockMgr->>BlockMgr: finalize_prefetch()
+        Note right of BlockMgr: Publish hit blocks, release miss blocks, and mount Host state
+        BlockMgr-->>Scheduler: PrefetchDoneCallback(request)
+        Scheduler->>Scheduler: ContinuousScheduler::enqueue_ready_request()
     end
 
     rect rgb(240, 255, 240)
-        Note over Scheduler,HBM: Phase 2: Host-to-HBM restore and forward
+        Note over Scheduler,Cache: Phase 2: restore Host KV to HBM and execute Forward
 
-        Scheduler->>BlockMgr: allocate(sequence, num_tokens)
-        BlockMgr->>BlockMgr: Merge Device and mounted Host prefixes
-        BlockMgr->>HBM: Allocate missing Device blocks
-        HBM-->>BlockMgr: Device block IDs
-        BlockMgr->>Host: Best-effort allocate future D2H destinations
-        Host-->>BlockMgr: Reserved Host block IDs
-        BlockMgr->>BlockMgr: Publish Device Prefix metadata
-        Note over BlockMgr,HBM: Metadata publication is token-cursor bounded but precedes physical H2D completion
-        BlockMgr->>BlockMgr: Build layer-wise H2D plan
+        Scheduler->>BlockMgr: HierarchyBlockManagerPool::allocate()
+        BlockMgr->>BlockMgr: CompositeBlockManager::allocate_sequence(sequence, num_tokens)
+        BlockMgr->>BlockMgr: CompositeBlockManager::allocate_sequence(sequence, host_state, num_tokens)
+        BlockMgr->>BlockMgr: collect_load_block_transfer_infos()
+        Note right of BlockMgr: H2D mappings are stored in load_block_transfer_infos_
 
-        Scheduler->>BlockMgr: transfer_blocks(batches)
-        BlockMgr->>Engine: Enqueue TransferBlocks(H2D, batch_id)
-        BlockMgr-->>Scheduler: Return after dispatch, without waiting for H2D completion
+        Scheduler->>BlockMgr: HierarchyBlockManagerPool::transfer_blocks(batches)
+        BlockMgr->>Engine: LLMEngine::transfer_kv_blocks(dp_rank, batch_id, infos)
+        Engine->>Remote: RemoteWorker::transfer_kv_blocks(batch_id, infos)
+        Remote->>Channel: CommChannel::transfer_kv_blocks(batch_id, infos)
+        Channel->>Service: WorkerService::TransferBlocks()
+        Service->>Worker: WorkerImpl::transfer_kv_blocks(batch_id, infos)
+        Worker->>Worker: HierarchyKVCacheTransfer::transfer_kv_blocks()
+        Worker->>Copy: BasicHostKVTransfer::prepare_load() / CompactHostKVTransfer::prepare_load()
+        Note right of Worker: HostKVLoadHandle is stored in load_handles_[batch_id]
+        Worker->>Worker: load_threadpool_->schedule(load_from_host)
+        Worker-->>Service: uint32_t info_count
+        Service-->>Channel: TransferStatus.success_cnt
+        Note over Remote,Service: RemoteWorker::threadpool_ executes the H2D registration RPC<br/>before the subsequently queued step_remote_async()
 
-        par All TP ranks
-            Engine->>Worker: Register H2D transfer
-            Worker->>Worker: Create LayerSynchronizer(batch_id)
-            Worker->>Worker: Schedule load_from_host asynchronously
-            Worker-->>Engine: Registration ACK with scheduled block count
-            Engine->>Worker: Forward(batch_id), ordered after registration
-            Worker->>Worker: Attach LayerSynchronizer(batch_id)
-            Note right of Worker: Speculative target/draft mappings share<br/>the same batch and synchronizer
-
-            loop Each layer-copy range
-                Worker->>Host: Read Host KV tensors
-                Host-->>Worker: Host KV
-                Worker->>HBM: Async H2D copy and record event
-                Worker->>Worker: Current compute layer waits for event
-                Worker->>HBM: Read KV after the event completes
+        par load_threadpool
+            Worker->>Worker: HierarchyKVCacheTransfer::load_from_host()
+            Worker->>Copy: HostKVTransfer::load(request, handle)
+            Copy->>Copy: BasicHostKVTransfer::load_impl() / CompactHostKVTransfer::load_impl()
+            Note over Copy,Cache: The H2D copy stream records a LayerSynchronizer ready event per layer range
+        and Forward executor
+            Scheduler->>Engine: LLMEngine::step(batches)
+            Engine->>Remote: RemoteWorker::step_remote_async(input)
+            Remote->>Channel: CommChannel::execute_model_async(input, promise)
+            Channel->>Service: WorkerService::ExecuteModel()
+            Service->>Worker: WorkerImpl::step_async(input)
+            Worker->>Worker: WorkerImpl::set_hierarchy_layer_synchronizer()
+            Worker->>Worker: HierarchyKVCacheTransfer::set_layer_synchronizer(params)
+            opt Worker owns recurrent cache
+                Worker->>Worker: WorkerImpl::prepare_linear_state_cache(params)
+                Worker->>Worker: ModelInputParams::synchronize_all_layers()
+                Note right of Worker: LINEAR restoration waits for all H2D events<br/>before restore_linear_state_slots()
             end
-
-            Worker-->>Engine: Forward output
+            loop Each model layer
+                Worker->>Worker: ModelInputParams::synchronize_layer(layer_idx)
+                Note right of Worker: Wait for the layer-range event before<br/>the layer attention reads HBM KV
+            end
+            Worker-->>Service: optional<ForwardOutput>
+            Service-->>Channel: proto::ForwardOutput
+            Channel-->>Remote: RawForwardOutput
+            Remote-->>Engine: SemiFuture<optional<RawForwardOutput>>
         end
 
-        Note over Scheduler,Worker: There is no H2D-complete callback to the Scheduler
+        Note right of Worker: Target and draft mappings share the same batch_id and synchronizer
     end
 
     rect rgb(255, 245, 235)
-        Note over Scheduler,Store: Phase 3: HBM-to-Host-to-Mooncake write-back
+        Note over Scheduler,Store: Phase 3: incremental write-back by copy unit during Prefill/Decode
 
-        Scheduler->>BlockMgr: deallocate(completed sequence)
-        BlockMgr->>BlockMgr: Publish completed Device Prefix metadata
-        BlockMgr->>BlockMgr: Collect HBM to reserved-Host block pairs
-        BlockMgr->>BlockMgr: Reset sequence while offload pairs retain block references
+        loop Continue growing after each Forward
+            Note over Scheduler,Cache: Forward N has completed and updated the HBM token cursor
+            Scheduler->>BlockMgr: HierarchyBlockManagerPool::allocate()
+            BlockMgr->>BlockMgr: CompositeBlockManager::allocate_sequence(sequence, num_tokens)
+            Note right of BlockMgr: allocate_sequence() calls<br/>cache_full_blocks_for_sequence() before and after growth
+            BlockMgr->>BlockMgr: CompositeBlockManager::allocate_sequence(sequence, host_state, num_tokens)
+            BlockMgr->>BlockMgr: collect_offload_pairs()
+            Note right of BlockMgr: HBM-to-Host pairs for newly complete units enter<br/>offload_block_pair_queues_
 
-        Scheduler->>BlockMgr: transfer_offload_blocks()
-        BlockMgr->>Engine: Submit asynchronous D2H2G plans
+            Scheduler->>BlockMgr: HierarchyBlockManagerPool::transfer_blocks(batches)
+            BlockMgr->>BlockMgr: transfer_offload_blocks()
+            BlockMgr->>Engine: LLMEngine::transfer_kv_blocks(dp_rank, infos)
 
-        par All TP ranks
-            Engine->>Worker: TransferKvBlocks(D2H2G)
-            Worker->>Worker: Copy stream waits for compute stream
-            Worker->>HBM: Read Device KV
-            HBM-->>Worker: Device KV
-            Worker->>Host: D2H copy for each cache domain and synchronize stream
-            Worker->>Worker: Expand physical objects and deduplicate by key
-            opt Non-MLA or MLA TP rank 0
-                Worker->>Store: BatchIsExist(unique keys)
+            loop Every participating local Worker
+                Engine->>Remote: RemoteWorker::transfer_kv_blocks(infos)
+                Remote-->>Engine: SemiFuture<uint32_t>
+            end
+            Engine-->>BlockMgr: vector<SemiFuture<uint32_t>>
+            BlockMgr->>BlockMgr: folly::collectAll(...).thenValue()
 
-                alt Store key is absent
-                    Worker->>Store: BatchPut(missing keys, Host tensors)
-                    Store-->>Worker: Put results
-                else Store key already exists
-                    Worker->>Worker: Skip overwrite and count it as present
-                end
+            par RemoteWorker copy_threadpool_ / Worker executor
+                Remote->>Channel: CommChannel::transfer_kv_blocks(infos, promise)
+                Channel->>Service: WorkerService::TransferBlocks()
+                Service->>Worker: WorkerImpl::transfer_kv_blocks(batch_id, infos)
+                Note right of Worker: WorkerImpl queues D2H2G on its single-threaded executor<br/>after the preceding Forward
+                Worker->>Worker: HierarchyKVCacheTransfer::transfer_kv_blocks()
+                Worker->>Worker: HierarchyKVCacheTransfer::offload()
+                Worker->>Worker: HierarchyKVCacheTransfer::offload_to_host()
+                Worker->>Copy: HostKVTransfer::offload(request)
+                Copy->>Copy: BasicHostKVTransfer::offload_impl() / CompactHostKVTransfer::offload_impl()
+                Note over Copy,Cache: When HostKVTransfer::offload() succeeds,<br/>Host tensors are safe for CPU and Store access
+                Worker->>Store: KVCacheStore::batch_put()
+                Store-->>Worker: uint32_t put_count
+                Note right of Store: Unsharded MLA skips inside batch_put() on non-zero TP ranks;<br/>other Workers write their own objects or KV shards
+                Note right of Worker: BatchPut is best-effort;<br/>partial failure does not change D2H success
+                Worker-->>Service: uint32_t block_count
+                Service-->>Channel: TransferStatus.success_cnt
+                Channel-->>Remote: folly::Promise<uint32_t>::setValue()
             end
 
-            Note right of Worker: Non-zero MLA ranks skip Store writes
-            Worker->>Worker: Logical put succeeds only if all physical objects succeed
-            Note right of Worker: Partial BatchPut failure is logged only<br/>and does not change D2H success
-            Worker-->>Engine: Full block count when D2H succeeds
+            Note right of BlockMgr: Validate the Worker count and each returned block count
+            BlockMgr->>BlockMgr: CompositeBlockManager::deallocate(device_blocks)
+            BlockMgr->>BlockMgr: finalize_host_blocks(copy_ok, ...)
+            Note right of BlockMgr: On copy_ok, call cache_blocks() before release;<br/>both paths eventually deallocate the retained Host references
         end
 
-        Engine-->>Result: TP futures
-        Result->>Result: Validate every TP result against the expected block count
-        Result-->>BlockMgr: Future callback(copy_ok)
-        BlockMgr->>HBM: Always release offload-held Device blocks
-
-        alt D2H succeeds on every TP rank
-            BlockMgr->>Host: Publish Host Prefix Cache
-        else D2H fails on any TP rank
-            BlockMgr->>Host: Publish nothing and release reserved Host blocks
+        opt Sequence completes or is cancelled
+            Scheduler->>BlockMgr: HierarchyBlockManagerPool::deallocate()
+            BlockMgr->>BlockMgr: CompositeBlockManager::cache_full_blocks_for_sequence()
+            BlockMgr->>BlockMgr: collect_offload_pairs()
+            BlockMgr->>BlockMgr: CompositeBlockManager::deallocate_for_sequence(sequence, host_state)
+            BlockMgr->>BlockMgr: CompositeBlockManager::deallocate_for_sequence(sequence)
+            BlockMgr->>BlockMgr: Sequence::reset()
+            Note right of BlockMgr: Collect only the final complete unit not already queued;<br/>the queue retains block references required by D2H
+            Scheduler->>BlockMgr: HierarchyBlockManagerPool::transfer_blocks()
+            BlockMgr->>BlockMgr: transfer_offload_blocks()
+            Note over Scheduler,BlockMgr: ContinuousScheduler::prepare_batch() also calls<br/>the no-argument transfer_blocks() for an empty batch
         end
-
-        Note over Scheduler,Result: Offload completion is handled by the BlockManager callback, not the Scheduler
     end
 ```
 
@@ -240,95 +302,175 @@ sequenceDiagram
     autonumber
 
     participant Client as Client / xLLM Service
-    participant PSched as PREFILL Scheduler
-    participant PBlock as PREFILL BlockManager
-    participant PWorker as PREFILL TP Workers
-    participant Store as Mooncake Store
-    participant Host as PREFILL Host Cache
-    participant PHBM as PREFILL HBM
-    participant DService as DECODE Service / Scheduler
-    participant DBlock as DECODE BlockManager
-    participant KVTransfer as PD KV Transfer (Mooncake)
+    participant PSched as PREFILL DisaggPDScheduler
+    participant PBlock as PREFILL HierarchyBlockManagerPool
+    participant PEngine as PREFILL LLMEngine
+    participant PRemote as PREFILL RemoteWorker / RPC
+    participant PResult as PREFILL PrefetchResult
+    participant PWorker as PREFILL WorkerImpl / HierarchyKVCacheTransfer
+    participant Store as KVCacheStore / Mooncake Store
+    participant PCache as PREFILL Host / HBM
+    participant DService as DisaggPDService / Impl
+    participant DSched as DECODE DisaggPDScheduler
+    participant DBlock as DECODE KVCacheManager
+    participant DEngine as DECODE LLMEngine
+    participant DRemote as DECODE RemoteWorker / WorkerImpl
+    participant KVTransfer as KVCacheTransfer
     participant DHBM as DECODE HBM
 
     rect rgb(235, 245, 255)
-        Note over Client,PHBM: Phase 1: PREFILL admission and Mooncake restore
+        Note over Client,PCache: Phase 1: PREFILL admission and Mooncake restoration
 
-        Client->>PSched: add_request(request, decode_address)
-        PSched->>PBlock: prefetch_from_storage(request)
-        PBlock->>PWorker: TP-parallel PrefetchFromStorage(G2H)
-        PWorker->>Store: BatchIsExist / BatchGet
-        Store-->>PWorker: Fill registered Host tensors
-        PWorker->>Host: Store-hit Host blocks are ready
-        PWorker-->>PBlock: Rank-local bitmap through PrefetchResult
-        PBlock->>PBlock: TP logical AND and mount Host state
-        PSched->>PBlock: Poll update_prefetch_result
-        PBlock-->>PSched: Prefetch complete
-        PSched->>PSched: enqueue_ready_request to PREFILL dispatch queue
+        Client->>PSched: ContinuousScheduler::add_request()
+        PSched->>PBlock: HierarchyBlockManagerPool::prefetch_from_storage()
+        PBlock->>PEngine: LLMEngine::prefetch_from_storage()
+        PEngine->>PRemote: RemoteWorker::prefetch_from_storage()
+        PRemote->>PRemote: CommChannel::prefetch_from_storage()
+        PRemote->>PWorker: WorkerService::PrefetchFromStorage()
+        PWorker->>PWorker: WorkerImpl::prefetch_kv_blocks()
+        PWorker->>PWorker: HierarchyKVCacheTransfer::prefetch_kv_blocks()
+        PWorker->>Store: KVCacheStore::batch_get_with_status()
+        Store-->>PWorker: std::vector<uint8_t>
+        PWorker-->>PRemote: uint8_t prefix_hit_units (brpc stream)
+        PRemote->>PResult: PrefetchResult::record_batch_result()
+        PRemote->>PResult: PrefetchResult::mark_worker_ended()
+        PResult-->>PBlock: DoneCallback(common_hit_units)
+        PBlock->>PBlock: finalize_prefetch()
+        PBlock-->>PSched: PrefetchDoneCallback(request)
+        PSched->>PSched: DisaggPDScheduler::enqueue_ready_request()
+        Note right of PSched: The request enters prefill_request_queue_;<br/>the Scheduler does not poll for Store results
     end
 
     rect rgb(250, 240, 255)
         Note over PSched,DHBM: Phase 2: allocate Decode destinations first
 
-        PSched->>DService: AddNewRequests(prompt metadata)
-        DService->>DBlock: try_allocate(DECODE sequence)
-        DBlock->>DHBM: Probe Device Prefix Cache only
-        DBlock->>DHBM: Allocate blocks for the missing suffix
-        Note over Store,DBlock: DECODE admission does not fetch Host/Mooncake prefix or schedule H2D restore<br/>Store remains enabled for DECODE write-back
-        DBlock-->>DService: Allocation success
-        DService->>DService: Collect D block IDs and remote_shared_num
-        DService-->>PSched: Allocation response
-
-        PSched->>PSched: Save TransferKVInfo
-        PSched->>PSched: Advance transfer cursor past D-side shared prefix
-        PSched->>PSched: Enqueue request into PREFILL request_queue
+        PSched->>PSched: DisaggPDScheduler::dispatch_requests()
+        PSched->>DService: DisaggPDService_Stub::AddNewRequests()
+        DService->>DService: DisaggPDService::AddNewRequests()
+        DService->>DService: DisaggPDServiceImpl::decode_recv_new_requests()
+        DService->>DSched: DisaggPDScheduler::try_allocate()
+        DSched->>DBlock: KVCacheManager::try_allocate()
+        Note over Store,DBlock: DECODE admission does not fetch a Host/Mooncake prefix or schedule H2D restore<br/>Store remains enabled for DECODE write-back
+        DService->>DSched: DisaggPDScheduler::decode_schedule()
+        DService-->>PSched: proto::DisaggResponses
+        PSched->>PSched: KVCacheState::set_transfer_kv_info()
+        PSched->>PSched: KVCacheState::advance_transfer_block_idx()
+        PSched->>PSched: KVCacheState::advance_group_transfer_block_idx()
+        PSched->>PSched: folly::MPMCQueue::write(request)
+        Note right of PSched: The cursor starts after the D-side remote_shared_num
     end
 
     rect rgb(240, 255, 240)
-        Note over PSched,DHBM: Phase 3: PREFILL forward and P-to-D KV transfer
+        Note over PSched,DHBM: Phase 3: Forward, Host write-back, and P-to-D transfer for each PREFILL chunk
 
-        PSched->>PBlock: Allocate PREFILL sequence
-        PBlock->>Host: Use mounted Store/Host prefix
-        PBlock->>PHBM: Allocate Device blocks
-        PBlock->>PBlock: Build Host-to-HBM restore plan
-        PSched->>PBlock: transfer_blocks(batches)
-        PBlock->>PWorker: Register H2D plan and batch_id
-        PSched->>PWorker: PREFILL Forward
-        Note over PWorker,PHBM: Forward attaches LayerSynchronizer by batch_id<br/>and waits for the required H2D events
+        loop Each PREFILL chunk
+            PSched->>PBlock: HierarchyBlockManagerPool::allocate()
+            PBlock->>PBlock: CompositeBlockManager::allocate_sequence(sequence, num_tokens)
+            PBlock->>PBlock: CompositeBlockManager::allocate_sequence(sequence, host_state, num_tokens)
+            PBlock->>PBlock: collect_load_block_transfer_infos()
+            PBlock->>PBlock: collect_offload_pairs()
+            Note right of PBlock: Growth publishes the copy unit completed by the prior round;<br/>the BlockManagerPool retains both H2D and D2H mappings
 
-        alt PUSH
-            PWorker->>KVTransfer: push_kv_blocks_async(P local to D remote)
-            Note over PWorker,KVTransfer: Transfer advances layer by layer with PREFILL<br/>and skips D-side shared blocks
-            KVTransfer->>PHBM: Read computed PREFILL KV
-            KVTransfer->>DHBM: Push into preallocated Decode blocks
-            PWorker->>PWorker: Wait for KV push before returning Forward
-            PWorker-->>PSched: Forward output / first token
+            PSched->>PBlock: HierarchyBlockManagerPool::transfer_blocks(batches)
+            opt H2D mappings exist
+                PBlock->>PEngine: LLMEngine::transfer_kv_blocks(dp_rank, batch_id, infos)
+                PEngine->>PRemote: RemoteWorker::transfer_kv_blocks(batch_id, infos)
+                PRemote->>PRemote: CommChannel::transfer_kv_blocks(batch_id, infos)
+                PRemote->>PWorker: WorkerService::TransferBlocks()
+                PWorker->>PWorker: WorkerImpl::transfer_kv_blocks(batch_id, infos)
+                PWorker->>PWorker: HierarchyKVCacheTransfer::transfer_kv_blocks()
+                PWorker->>PWorker: load_threadpool_->schedule(load_from_host)
+                Note over PWorker,PCache: HierarchyKVCacheTransfer::load_from_host() calls HostKVTransfer::load()<br/>on load_threadpool_ to perform layer-wise H2D and record events
+            end
+            opt D2H2G mappings completed by the previous round exist
+                PBlock->>PBlock: transfer_offload_blocks()
+                PBlock->>PEngine: LLMEngine::transfer_kv_blocks(dp_rank, infos)
+                PEngine->>PRemote: RemoteWorker::transfer_kv_blocks(infos)
+                PRemote-->>PEngine: SemiFuture<uint32_t>
+                PEngine-->>PBlock: vector<SemiFuture<uint32_t>>
+                PBlock->>PBlock: folly::collectAll(...).thenValue()
+                PRemote->>PRemote: CommChannel::transfer_kv_blocks(infos, promise)
+                PRemote->>PWorker: WorkerService::TransferBlocks()
+                PWorker->>PWorker: WorkerImpl::transfer_kv_blocks(batch_id, infos)
+                PWorker->>PWorker: HierarchyKVCacheTransfer::offload()
+                PWorker->>PWorker: HierarchyKVCacheTransfer::offload_to_host()
+                Note over PWorker,PCache: HostKVTransfer::offload() performs layer-wise D2H on the Worker
+                PWorker->>Store: KVCacheStore::batch_put()
+                PWorker-->>PRemote: uint32_t block_count
+                PRemote-->>PBlock: folly::Promise<uint32_t>::setValue(block_count)
+                PBlock->>PBlock: CompositeBlockManager::deallocate(device_blocks)
+                PBlock->>PBlock: finalize_host_blocks(copy_ok, ...)
+            end
 
-            PSched->>DService: FirstGeneration(token, mode=PUSH)
-            DService->>DService: Append first token without PULL
-            DService->>DService: Enqueue Decode request
-            DService-->>PSched: FirstGeneration success
-        else PULL
-            PWorker-->>PSched: Forward output / first token
-            PSched->>DService: FirstGeneration(token + P source metadata, mode=PULL)
-            DService->>KVTransfer: pull_kv_blocks(P source to D destination)
-            KVTransfer->>PHBM: Read PREFILL KV
-            KVTransfer->>DHBM: Write Decode blocks and recurrent state
-            KVTransfer-->>DService: Pull success
-            DService->>DService: Enqueue only after pull succeeds
-            DService-->>PSched: FirstGeneration success
+            PSched->>PEngine: LLMEngine::step(batches)
+            PEngine->>PRemote: RemoteWorker::step_remote_async(input)
+            PRemote->>PRemote: CommChannel::execute_model_async(input, promise)
+            PRemote->>PWorker: WorkerService::ExecuteModel()
+            PWorker->>PWorker: WorkerImpl::step_async(input)
+            PWorker->>PWorker: WorkerImpl::set_hierarchy_layer_synchronizer()
+            PWorker->>PWorker: HierarchyKVCacheTransfer::set_layer_synchronizer(params)
+            opt Worker owns recurrent cache
+                PWorker->>PWorker: WorkerImpl::prepare_linear_state_cache(params)
+                PWorker->>PWorker: ModelInputParams::synchronize_all_layers()
+            end
+            opt kv_cache_transfer_mode == PUSH
+                PWorker->>KVTransfer: KVCacheTransfer::push_kv_blocks_async()
+            end
+            loop Each model layer
+                PWorker->>PWorker: ModelInputParams::synchronize_layer(layer_idx)
+                PWorker->>PWorker: ModelInputParams::record_layer(layer_idx, device)
+                Note over PWorker,KVTransfer: synchronize_layer() waits for Host load before attention;<br/>record_layer() lets the PUSH thread read completed KV layer by layer
+            end
+            opt kv_cache_transfer_mode == PUSH
+                Note over KVTransfer,DHBM: KVCacheTransfer writes the preallocated DECODE destination blocks
+                PWorker->>PWorker: KVTransferCompletion::wait()
+            end
+            PWorker-->>PRemote: optional<ForwardOutput> / RawForwardOutput
+            PRemote-->>PEngine: SemiFuture<optional<RawForwardOutput>>
+            PEngine-->>PSched: ForwardOutput
         end
 
-        PSched->>PBlock: cache_prefill_blocks after FirstGeneration succeeds
-        PSched->>PBlock: Deallocate PREFILL sequence
-        Note over PBlock,Store: PREFILL then uses the common asynchronous D2H-to-Host-to-Mooncake write-back path
+        PSched->>PSched: DisaggPDScheduler::prefill_send_first_generation()
+        PSched->>DService: DisaggPDService_Stub::FirstGeneration()
+        DService->>DService: DisaggPDService::FirstGeneration()
+        DService->>DService: DisaggPDServiceImpl::decode_recv_first_generation()
+        DService->>DSched: DisaggPDScheduler::decode_recv_first_generation()
+        alt kv_cache_transfer_mode == PULL
+            DSched->>DEngine: LLMEngine::pull_kv_blocks()
+            DEngine->>DRemote: RemoteWorker::pull_kv_blocks()
+            DRemote->>DRemote: CommChannel::pull_kv_blocks()
+            DRemote->>DRemote: WorkerService::PullKVCache()
+            DRemote->>DRemote: WorkerImpl::pull_kv_blocks_async()
+            DRemote->>KVTransfer: KVCacheTransfer::pull_kv_blocks_async()
+            KVTransfer-->>DRemote: SemiFuture<bool>
+            DRemote-->>DEngine: bool
+            DEngine-->>DSched: bool
+            Note over DSched,DHBM: Enqueue continues only after pull_kv_blocks() succeeds
+        else kv_cache_transfer_mode == PUSH
+            Note over DSched,DHBM: The Prefill Worker already wrote KV to its final destination; no PULL runs
+        end
+        DSched->>DSched: folly::MPMCQueue::write(request)
+        DService-->>PSched: proto::Status
+
+        opt FirstGeneration succeeds
+            PSched->>PSched: DisaggPDScheduler::cache_prefill_blocks()
+        end
+        PSched->>PBlock: HierarchyBlockManagerPool::deallocate()
+        PBlock->>PBlock: CompositeBlockManager::cache_full_blocks_for_sequence()
+        PBlock->>PBlock: collect_offload_pairs()
+        Note over PBlock,Store: The chunk loop has already written back incrementally; deallocate() only collects<br/>the final complete copy unit not yet queued, then releases the sequence
+        Note over PSched,PBlock: A later ContinuousScheduler::prepare_batch() keeps flushing<br/>even when it produces an empty batch
+        PSched->>PBlock: HierarchyBlockManagerPool::transfer_blocks()
+        PBlock->>PBlock: transfer_offload_blocks()
     end
 
     rect rgb(255, 245, 235)
         Note over DService,DHBM: Phase 4: DECODE execution
 
-        DService->>DHBM: Decode Forward uses Device blocks
-        DService-->>Client: Token stream
+        DSched->>DEngine: LLMEngine::step(batches)
+        Note over DEngine,DHBM: Forward uses the preallocated and populated Device blocks
+        DEngine-->>DSched: ForwardOutput
+        Note over Client,DSched: ResponseProcessor emits the token stream
     end
 ```
 
@@ -341,7 +483,8 @@ The scheduler supports both `PUSH` and `PULL` through `kv_cache_transfer_mode`. 
 - Build and install [xLLM](/en/getting_started/quick_start/).
 - Install [xLLM Service](https://github.com/xLLM-AI/xllm-service) when service routing or disaggregated PD is required.
 - Build or install the Mooncake Store `mooncake_master` and `mooncake_client` binaries.
-- Reserve enough Host memory. Mooncake Store requires `--enable_prefix_cache=true` and `--host_blocks_factor > 1`.
+- Reserve enough Host memory. `--host_blocks_factor > 1` is required to create Host Cache. Mooncake Store additionally requires `--enable_prefix_cache=true` together with `--host_blocks_factor > 1`.
+- For DeepSeek-V4 compressed cache, Host capacity is allocated independently for `SWA`, `C4`, and `C128`. With linear attention, `KV` and `LINEAR` also consume separate Host block pools. Do not estimate Host memory from ordinary KV blocks alone.
 
 Mooncake's etcd-backed high availability backends are enabled by default when building xLLM and the bundled Mooncake binaries:
 
@@ -453,7 +596,7 @@ This step is required for service routing and disaggregated PD, but not for a st
   --prefetch_timeout=30000
 ```
 
-`store_local_hostname` is a base Transfer Engine endpoint. Each worker uses `base_port + worker_rank`, so the entire port range must be free and reachable.
+`store_local_hostname` is a base Transfer Engine endpoint. When no port is configured, it defaults to `127.0.0.1:12345`. Each worker uses `base_port + worker_rank`, so the entire port range must be free and reachable. Prefill and Decode, or multiple xLLM instances on the same node, must use disjoint base-port ranges.
 
 For RDMA, set `--store_protocol=rdma`. Use `--store_rdma_devices=mlx5_0,mlx5_1` to select HCAs for the Store client embedded in each xLLM Worker, or leave it empty for Mooncake auto-discovery. Initialization failures remain RDMA failures and never fall back to TCP. xLLM does not read `DEVICE_NAMES`; the standalone `mooncake_client` uses its own `--device_names` option.
 
@@ -477,6 +620,15 @@ Use the normal [Disaggregated PD](/en/features/disagg_pd/) flags and enable Stor
   --store_local_hostname=127.0.0.1:12345
 ```
 
+If the backend and model on Prefill support KV split, the same command can include a parallel configuration such as:
+
+```text
+--cp_size=4 \
+--kv_split_size=2
+```
+
+Here, `2` shards KV across two split ranks, and every shard uses an independent Store key. Whether Decode enables KV split, and which topology it uses, depends on its own backend and model support. A different topology uses a different Store key space.
+
 Enable Store on Decode with a different local endpoint range:
 
 ```bash
@@ -493,15 +645,16 @@ Enable Store on Decode with a different local endpoint range:
   --store_local_hostname=127.0.0.1:13345
 ```
 
-See the [CLI Reference](/en/cli_reference/) for all `KVCacheStoreConfig` parameters.
+See the [CLI Reference](/en/cli_reference/) for all `KVCacheStoreConfig` parameters. `prefetch_batch_size` controls the batch size for contiguous Store units. After a Worker encounters the first miss in a batch, it stops requesting later batches; the final hit length is the common prefix across all Workers. `layers_wise_copy_batchs` controls how many layers each synchronization event covers when Host-to-Device or Device-to-Host copies are grouped by layer.
 
 ## Correctness and Operational Notes
 
-- Store hits use two levels of completeness checks: each worker must successfully read every registered cache domain for the `BlockType`, and every TP rank must then report a hit before the block is mounted into the Host Prefix Cache.
-- `prefetch_timeout` stops issuing new prefetch batches after the timeout, but admission still waits for every in-flight TP batch to finish. `0` waits indefinitely.
+- Store hits use two levels of completeness checks: each Worker must successfully read every registered cache domain for the `BlockType`, and the local Worker group for the current DP rank must then report a hit before the block is mounted into the Host Prefix Cache. With KV split enabled, each `kv_split_rank` shard must hit independently.
+- `prefetch_timeout` stops issuing new prefetch batches after the timeout, but admission still waits for every in-flight Worker batch to finish. `0` waits indefinitely.
 - H2D registration does not wait for the physical copy. Forward attaches a `LayerSynchronizer` using `batch_id` and waits at the corresponding layers. The Scheduler receives no H2D-complete callback.
-- Host Prefix publication depends only on successful D2H completion from every TP rank. Mooncake `BatchPut` is best-effort; a partial Store write failure is logged but does not invalidate an already successful Host copy.
-- `BatchPut` first deduplicates object keys and calls `BatchIsExist`. Existing objects are never overwritten, and duplicate objects in one batch are written only once. A logical block counts as a Store success only when every cache-domain object already exists or is written successfully.
-- The current Store key version is `xllm-kv-v3`. Host-block capacity is excluded from `schema_hash`, while tensor role, dtype, per-block shape, TP topology, `BlockType`, and cache-domain identity isolate the key space.
+- Host Prefix publication depends only on successful D2H completion from every participating Worker. Mooncake `BatchPut` is best-effort; a partial Store write failure is logged but does not invalidate an already successful Host copy.
+- `BatchPut` first deduplicates object keys. Mooncake's "object already exists" result counts as success and does not overwrite the existing object. Duplicate objects in one batch are written only once. A logical block counts as a Store success only when every cache-domain object already exists or is written successfully.
+- The current Store key version is `xllm-kv-v3`. Host-block capacity is excluded from `schema_hash`, while tensor role, dtype, per-block shape, TP topology, `kv_split_size`, `kv_split_rank`, `BlockType`, and cache-domain identity isolate the key space. Objects written under older key formats do not match the current format and must be written again.
 - Weight contents are not automatically encoded in object keys. Use a new `model_id` whenever target or draft weights, quantization, or any other setting that can change KV values is updated, and rotate or clean the old Store namespace as needed.
 - In PD, Prefill and Decode both enable Store. They must use disjoint `store_local_hostname` base-port ranges because both roles reuse worker ranks and each worker binds `base_port + worker_rank`.
+- The `LINEAR` state in `FLAT_KV_LINEAR` currently supports committed-checkpoint copies between Host and Device and eligible D2H2G checkpoint write-back, but it is not part of the current Store G2H prefetch-unit path. Before relying on cross-process `LINEAR` reuse, verify that the deployed version implements complete admission and rolling-state lifetime management.
