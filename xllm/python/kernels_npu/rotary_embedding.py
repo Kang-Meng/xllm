@@ -20,6 +20,62 @@ import torch
 import torch_npu
 
 
+def has_fused_qk_rotary(head_dim: int) -> bool:
+    """Return whether the fused CANN QK-RoPE op supports this head_dim.
+
+    ``npu_apply_rotary_pos_emb`` supports head_dim 64 and 128 only; this is
+    the single place to update when the CANN support domain changes.
+    """
+    return head_dim in (64, 128)
+
+
+def apply_qk_rotary(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply joint half-layout RoPE to Q/K with shared full-width tables.
+
+    Q/K have shape [tokens, heads, head_dim]; the tables have shape
+    [1, tokens, 1, head_dim] (see :func:`expand_half_rope_table`). Raises
+    ``ValueError`` when the cos/sin width does not match the Q/K head_dim.
+    CANN rounds the fused arithmetic differently from separate BF16
+    multiply/add operations, so model-level parity must be validated before
+    enabling this path. The CANN operator updates Q/K in place, so private
+    contiguous copies preserve the caller's inputs.
+    """
+    head_dim = query.size(-1)
+    if key.size(-1) != head_dim:
+        raise ValueError(f"q head_dim {head_dim} does not match k head_dim {key.size(-1)}")
+    if cosine.size(-1) != head_dim or sine.size(-1) != head_dim:
+        raise ValueError(f"cos/sin table width ({cosine.size(-1)}, {sine.size(-1)}) does not match head_dim {head_dim}")
+    query_out, key_out = torch_npu.npu_apply_rotary_pos_emb(
+        query.clone(memory_format=torch.contiguous_format).unsqueeze(0),
+        key.clone(memory_format=torch.contiguous_format).unsqueeze(0),
+        cosine,
+        sine,
+        layout="BSND",
+        rotary_mode="half",
+    )
+    return query_out.squeeze(0), key_out.squeeze(0)
+
+
+def expand_half_rope_table(half_table: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Duplicate a half-width cos/sin table into the fused-op full-width layout.
+
+    ``half_table`` is ``[num_tokens, head_dim // 2]`` as returned by
+    ``gather_half_rope_cos_sin``; the result is ``[1, num_tokens, 1, head_dim]``.
+    Raises ``ValueError`` when the half width does not match ``head_dim``, so
+    a mismatched rotary cache fails fast instead of silently producing a
+    wrong-width table.
+    """
+    if half_table.dim() != 2 or half_table.size(-1) * 2 != head_dim:
+        raise ValueError(f"half table shape {tuple(half_table.shape)} does not match head_dim {head_dim}")
+    num_tokens = half_table.size(0)
+    return torch.cat((half_table, half_table), dim=-1).view(1, num_tokens, 1, head_dim)
+
+
 def has_split_qkv_rmsnorm_mrope_specialization(
     num_q_heads: int,
     num_kv_heads: int,
@@ -277,6 +333,7 @@ def npu_inplace_partial_rotary_mul(
 
 
 __all__ = [
+    "apply_qk_rotary",
     "build_split_qkv_rmsnorm_mrope_gather_pattern",
     "fused_qk_norm_rope",
     "has_split_qkv_rmsnorm_mrope_specialization",

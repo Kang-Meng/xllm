@@ -32,6 +32,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from xllm.python import kernels
 from xllm.python.layers import (
     Attention,
     ColumnParallelLinear,
@@ -128,6 +129,7 @@ class Qwen2Attention(nn.Module):
     def __init__(self, cfg: Qwen2Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.layer_id = layer_id
+        self._use_fused_rope = kernels.has_fused_qk_rotary(cfg.head_dim)
         num_heads, num_kv_heads = cfg.head_split()
         tp = cfg.tp_size
         self.num_heads = num_heads
@@ -166,8 +168,8 @@ class Qwen2Attention(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-        half_cos: torch.Tensor,
-        half_sin: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden)
         num_tokens = qkv.size(0)
@@ -175,9 +177,13 @@ class Qwen2Attention(nn.Module):
         k = qkv[:, self.q_size : self.q_size + self.kv_size].view(num_tokens, self.num_kv_heads, self.head_dim)
         v = qkv[:, self.q_size + self.kv_size :]
 
-        # Manual RoPE; rows are gathered once per forward (see Qwen2Model).
-        q = apply_rotary_half(q, half_cos, half_sin)
-        k = apply_rotary_half(k, half_cos, half_sin)
+        # Manual RoPE; the table pair is built once per forward (see Qwen2Model)
+        # in the layout the active path expects.
+        if self._use_fused_rope:
+            q, k = kernels.apply_qk_rotary(q, k, rope_cos, rope_sin)
+        else:
+            q = apply_rotary_half(q, rope_cos, rope_sin)
+            k = apply_rotary_half(k, rope_cos, rope_sin)
 
         attn_out = self.attn(q.reshape(num_tokens, self.q_size), k.reshape(num_tokens, self.kv_size), v)
         return self.o_proj(attn_out)
@@ -213,8 +219,8 @@ class Qwen2DecoderLayer(nn.Module):
         self,
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
-        half_cos: torch.Tensor,
-        half_sin: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden
@@ -222,7 +228,7 @@ class Qwen2DecoderLayer(nn.Module):
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
 
-        hidden = self.self_attn(hidden, half_cos, half_sin)
+        hidden = self.self_attn(hidden, rope_cos, rope_sin)
 
         hidden, residual = self.post_attention_layernorm(hidden, residual)
         hidden = self.mlp(hidden)
@@ -239,6 +245,7 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(self, cfg: Qwen2Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
+        self._use_fused_rope = kernels.has_fused_qk_rotary(cfg.head_dim)
         tp = cfg.tp_size
         assert cfg.hidden_size % tp == 0
         self.embed_tokens = HiddenParallelEmbedding(
@@ -269,14 +276,18 @@ class Qwen2Model(nn.Module):
 
         positions = positions.to(torch.int64).contiguous()
         # positions and the rotary cache are invariant across the layer
-        # loop: gather the per-token (cos_half, sin_half) rows once here
-        # instead of once per layer — n_layers identical
-        # [num_tokens, head_dim] gathers (and recorded decode-graph ops)
-        # collapse to one.
-        half_cos, half_sin = gather_half_rope_cos_sin(self.rotary.cos_sin_cache, positions)
+        # loop: build the rope table pair once here instead of once per
+        # layer — n_layers identical [num_tokens, head_dim] gathers (and
+        # recorded decode-graph ops) collapse to one. The fused path expands
+        # the gathered half rows to full-width tables once here; the
+        # reference path consumes the half rows directly.
+        rope_cos, rope_sin = gather_half_rope_cos_sin(self.rotary.cos_sin_cache, positions)
+        if self._use_fused_rope:
+            rope_cos = kernels.expand_half_rope_table(rope_cos, self.rotary.head_dim)
+            rope_sin = kernels.expand_half_rope_table(rope_sin, self.rotary.head_dim)
         residual: torch.Tensor | None = None
         for i, layer in enumerate(self.layers):
-            hidden, residual = layer(hidden, residual, half_cos, half_sin)
+            hidden, residual = layer(hidden, residual, rope_cos, rope_sin)
             record_layer_event(i)
         hidden, _ = self.norm(hidden, residual)
         return hidden
