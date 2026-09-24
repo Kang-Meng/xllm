@@ -26,11 +26,6 @@ import torch
 
 reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache
 update_decode_graph_metadata = torch.ops.xllm_ops.update_decode_graph_metadata
-_TRANSPOSE_BATCHMATMUL = getattr(
-    torch.ops.npu,
-    "npu_transpose_batchmatmul",
-    None,
-)
 
 
 def vision_fusion_attention(
@@ -72,10 +67,14 @@ def vision_fusion_attention(
 
 
 def batch_matmul_transpose(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Project MLA values with the dedicated NPU transposed-BMM kernel."""
-    if x.device.type not in ("npu", "privateuseone") or _TRANSPOSE_BATCHMATMUL is None:
-        return torch.bmm(x, weight).transpose(0, 1)
-    return _TRANSPOSE_BATCHMATMUL(x, weight, perm_y=(1, 0, 2))
+    """Project MLA input [T,H,D] with weight [H,D,O] into [T,H,O]."""
+    return torch.ops.npu.npu_transpose_batchmatmul(
+        x,
+        weight,
+        perm_x1=(1, 0, 2),
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+    )
 
 
 __all__ = [

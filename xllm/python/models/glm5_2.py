@@ -514,7 +514,7 @@ class Glm52MLAAttention(Attention):
             self.qk_nope_head_dim + self.qk_rope_head_dim,
         )
         q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK).transpose(0, 1)
+        q_latent = kernels.batch_matmul_transpose(q_nope, self.W_UK)
         cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
         q_pe = _interleave_rope_with(q_rope, cos, sin)
         kv = self.kv_a_proj_with_mqa(hidden)
@@ -551,10 +551,7 @@ class Glm52MLAAttention(Attention):
             attn_out = gathered_attn_out.narrow(1, head_offset, self.num_heads_local)
         else:
             attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
-        v_full = kernels.batch_matmul_transpose(
-            attn_out.transpose(0, 1),
-            self.W_UV,
-        )
+        v_full = kernels.batch_matmul_transpose(attn_out, self.W_UV)
         v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
         if self.cfg.tp_size > 1:

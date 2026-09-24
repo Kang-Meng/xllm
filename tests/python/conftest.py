@@ -65,11 +65,17 @@ def _l2_norm(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return normalized.to(input_dtype)
 
 
+def _batch_matmul_transpose(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """CPU reference for the MLA [T,H,D] projection contract."""
+    return torch.bmm(x.transpose(0, 1), weight).transpose(0, 1)
+
+
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
     kernels.rms_norm = _rms_norm
     kernels.rms_norm_sigmoid_gated = _rms_norm_sigmoid_gated
     kernels.l2_norm = _l2_norm
+    kernels.batch_matmul_transpose = _batch_matmul_transpose
     kernels_npu = types.ModuleType("xllm.python.kernels_npu")
     kernels_npu.__path__ = [str(_PYTHON_ROOT / "kernels_npu")]
     distributed = types.ModuleType("xllm.python.distributed")

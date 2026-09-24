@@ -1682,7 +1682,7 @@ class Glm5NextMlaAttention(Attention):
 
         q = self.q_b_proj(q_c).view(num_tokens, self.num_heads_local, self.qk_head_dim)
         q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK).transpose(0, 1)
+        q_latent = kernels.batch_matmul_transpose(q_nope, self.W_UK)
 
         # NoPE: qk_rope_head_dim == 0 -> q_rope/k_rope are empty -> q_pe/k_pe None.
         q_pe = None
@@ -1699,7 +1699,7 @@ class Glm5NextMlaAttention(Attention):
                 cp_context,
             )
         local_num_tokens = attn_out.shape[0]
-        v_full = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
+        v_full = kernels.batch_matmul_transpose(attn_out, self.W_UV)
         v_full = v_full.reshape(local_num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
         if cp_context is not None:

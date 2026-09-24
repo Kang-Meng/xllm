@@ -849,10 +849,7 @@ class DeepseekV3MLAAttention(Attention):
             topk=topk,
             cache_is_preprocessed=True,
         )
-        v_full = kernels.batch_matmul_transpose(
-            attn_out.transpose(0, 1),
-            self.W_UV,
-        )
+        v_full = kernels.batch_matmul_transpose(attn_out, self.W_UV)
         v_full = v_full.reshape(hidden.shape[0], self.num_heads_local * self.v_head_dim)
         output = self.o_proj(v_full)
         if self.cfg.tp_size > 1:
@@ -914,7 +911,7 @@ class DeepseekV3MLAAttention(Attention):
             self.qk_nope_head_dim + self.qk_rope_head_dim,
         )
         q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK).transpose(0, 1)
+        q_latent = kernels.batch_matmul_transpose(q_nope, self.W_UK)
         q_pe = _interleave_rope_with(q_rope, rope_cos, rope_sin)
         k_latent_raw, k_rope_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_latent = self.kv_a_layernorm(k_latent_raw)
@@ -923,10 +920,7 @@ class DeepseekV3MLAAttention(Attention):
         k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
 
         attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
-        v_full = kernels.batch_matmul_transpose(
-            attn_out.transpose(0, 1),
-            self.W_UV,
-        )
+        v_full = kernels.batch_matmul_transpose(attn_out, self.W_UV)
         v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
         if self.cfg.tp_size > 1:
