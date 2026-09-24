@@ -64,6 +64,26 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
     )
 
 
+def test_eplv2_graph_admission_uses_padded_token_rows_for_dflash2() -> None:
+    runner = _runner()
+    runner.max_batch = 128
+    runner.num_decoding_tokens = 8
+    runner._eplv2_graph_token_limit = 16
+    metadata = _metadata(torch.arange(3, dtype=torch.int32))
+    with (
+        patch.object(runner, "_has_compatible_decode_metadata", return_value=True),
+        patch(
+            "xllm.python.model_executor.runners.decode_acl_graph.resolve_expanded_decode_metadata",
+            return_value=object(),
+        ),
+    ):
+        # One and two 8-row sequences fit; three sequences would capture a
+        # padded 32-row graph even though the active input has only 24 rows.
+        for sequences, expected in ((1, True), (2, True), (3, False)):
+            metadata.linear_state_indices = torch.arange(sequences)
+            assert runner.can_execute(torch.arange(sequences * 8), metadata) is expected
+
+
 def test_accepted_tokens_use_live_per_sequence_graph_buffer() -> None:
     runner = _runner()
     input_ids = torch.arange(4, dtype=torch.int32)

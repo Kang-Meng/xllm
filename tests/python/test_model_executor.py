@@ -716,6 +716,31 @@ class TestModelExecutorConstruction:
         )
         assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is False
 
+    @pytest.mark.parametrize("mode,expected_limit", [("auto", 24), ("alltoall", 0)])
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_glm_eplv2_graph_uses_model_mc2_capacity(
+        self, mock_create, mock_graph_runner, mode: str, expected_limit: int
+    ):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+        model.model._comm_policy = SimpleNamespace(mc2_capacity=3, mode=mode)
+        ModelExecutor(
+            model,
+            {
+                "model_type": "glm5_next",
+                "expert_parallel_degree": 2,
+                "tp_size": 8,
+                "ep_size": 8,
+                "num_speculative_tokens": 7,
+                "max_position_embeddings": 128,
+                "python_graph_backend": "aclgraph",
+            },
+            max_seqs_per_batch=128,
+        )
+        assert mock_graph_runner.call_args.kwargs["eplv2_graph_token_limit"] == expected_limit
+        assert mock_graph_runner.call_args.kwargs["num_decoding_tokens"] == 8
+
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor.get_execution_metadata_builder_classes")
     @patch("xllm.python.model_executor.executor._create_attention_backend")

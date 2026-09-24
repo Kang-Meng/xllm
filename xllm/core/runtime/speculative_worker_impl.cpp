@@ -126,6 +126,45 @@ void scale_speculative_parallel_token_counts(ModelInputParams& params,
       params.expert.eplb_decode_token_mask, multiplier);
 }
 
+// Validation replaces each request's single decode token with its full query
+// width. num_reqs stays the logical request count; only the token layout grows
+// so it matches the expanded token_ids tensor.
+void align_execution_batch_query_widths(
+    ExecutionBatchMetadata& batch,
+    const std::vector<int32_t>& query_widths) {
+  if (batch.num_reqs == 0) {
+    return;
+  }
+  CHECK_EQ(static_cast<int32_t>(query_widths.size()), batch.num_reqs);
+  CHECK_EQ(batch.num_scheduled_tokens.size(),
+           static_cast<size_t>(batch.num_reqs));
+  int64_t scheduled_tokens = 0;
+  for (int32_t count : batch.num_scheduled_tokens) {
+    scheduled_tokens += count;
+  }
+  int64_t expanded_tokens = 0;
+  for (int32_t width : query_widths) {
+    CHECK_GT(width, 0);
+    expanded_tokens += width;
+  }
+  if (batch.num_tokens == expanded_tokens &&
+      scheduled_tokens == expanded_tokens) {
+    return;
+  }
+  CHECK_EQ(scheduled_tokens, static_cast<int64_t>(batch.num_reqs))
+      << "speculative verify expected one scheduled token per request "
+         "before expanding the validation width";
+  batch.num_scheduled_tokens = query_widths;
+  std::vector<int32_t> query_start_loc;
+  query_start_loc.reserve(query_widths.size() + 1);
+  query_start_loc.emplace_back(0);
+  for (int32_t width : query_widths) {
+    query_start_loc.emplace_back(query_start_loc.back() + width);
+  }
+  batch.query_start_loc = std::move(query_start_loc);
+  batch.num_tokens = expanded_tokens;
+}
+
 std::vector<SpeculativeTokenStats> calculate_mtp_speculative_token_stats(
     const torch::Tensor& tokens,
     const std::vector<int32_t>& proposed_tokens) {
@@ -504,6 +543,9 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
       validate_input.sampling_params, num_val_tokens, total_num_val_tokens);
 
   scale_speculative_parallel_token_counts(input_params, num_val_tokens);
+  align_execution_batch_query_widths(
+      input_params.execution_batch,
+      std::vector<int32_t>(static_cast<size_t>(num_sequences), num_val_tokens));
   validate_input.device_tensors_ready = true;
 }
 
@@ -618,6 +660,8 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   // all-to-all pads. The authoritative per-rank counts are gathered over the DP
   // group by the draft-model worker's sync_dp_global_token_nums_after_prune(),
   // called on every DP rank right before the target validate forward.
+  align_execution_batch_query_widths(input_params.execution_batch,
+                                     per_seq_val_tokens);
   validate_input.device_tensors_ready = true;
 }
 

@@ -248,6 +248,15 @@ class ModelExecutor:
                 DecodeAclGraphRunner,
             )
 
+            # EPLv2 uses MC2 only while the per-TP-rank dispatch fits the HCCL
+            # window. Larger batches must take the eager All-to-AllV path
+            # before graph capture, including expanded DFlash2 verify rows.
+            eplv2_policy = getattr(execution_model, "_comm_policy", None)
+            eplv2_graph_kwargs: dict[str, int] = {}
+            if eplv2_policy is not None and int(config.get("expert_parallel_degree", 0)) == 2:
+                tp_size = int(config.get("tp_size", 1))
+                capacity = 0 if eplv2_policy.mode == "alltoall" else eplv2_policy.mc2_capacity * tp_size
+                eplv2_graph_kwargs["eplv2_graph_token_limit"] = capacity
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
@@ -267,6 +276,7 @@ class ModelExecutor:
                 num_decoding_tokens=num_decoding_tokens,
                 enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
                 is_spec_draft=is_spec_draft,
+                **eplv2_graph_kwargs,
             )
             self.decode_graph_runner.bind_execution_metadata_builders(execution_metadata_builders)
         else:

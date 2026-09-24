@@ -184,6 +184,7 @@ class DecodeAclGraphRunner(BaseRunner):
         enable_mega_moe_token_mask: bool = False,
         *,
         is_spec_draft: bool = False,
+        eplv2_graph_token_limit: int | None = None,
     ) -> None:
         super().__init__(model, attention_backend, device)
         self.dp_size = dp_size
@@ -200,12 +201,18 @@ class DecodeAclGraphRunner(BaseRunner):
         self.max_model_len = max_model_len
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
         self._is_spec_draft = is_spec_draft
+        self._eplv2_graph_token_limit = eplv2_graph_token_limit
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
+
+    def _eplv2_graph_admits(self, token_rows: int) -> bool:
+        """Keep MC2 capture inside the HCCL window; All-to-AllV stays eager."""
+        limit = self._eplv2_graph_token_limit
+        return limit is None or _decode_bucket(token_rows) <= limit
 
     def can_execute(
         self,
@@ -287,6 +294,8 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"expected length {self.dp_size}). All DP ranks must use the same graph shape."
                 )
             _require_positive_execution_counts(execution_counts)
+            if not self._eplv2_graph_admits(max(execution_counts)):
+                return False
             dp_is_decode = getattr(metadata, "dp_is_decode", None)
             if dp_is_decode is not None and not all(dp_is_decode):
                 return False
@@ -320,6 +329,8 @@ class DecodeAclGraphRunner(BaseRunner):
             )
             return ok
         bucket_size = _decode_bucket(size_check_bs)
+        if not self._eplv2_graph_admits(batch_size):
+            return False
         ok = (
             ((not metadata.is_prefill and not metadata.is_chunked_prefill) or is_expanded_spec_verify)
             and self._has_compatible_decode_metadata(input_ids, metadata)

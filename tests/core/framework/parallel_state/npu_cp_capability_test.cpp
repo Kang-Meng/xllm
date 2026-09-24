@@ -393,6 +393,22 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
   options.dp_size(1);
   options.ep_size(1);
 
+  options.expert_parallel_degree(2).ep_size(8);
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  options.ep_size(4);
+  EXPECT_EQ(validate_model_cp(options,
+                              EngineType::LLM,
+                              "glm5_next",
+                              /*global_world_size=*/8),
+            std::optional<std::string>(
+                "Python GLM-5 Next EPLv2 with PCP requires ep_size equal to "
+                "world_size"));
+  options.expert_parallel_degree(1).ep_size(1);
+
   parallel_config.kv_split_size(2);
   EXPECT_EQ(validate_model_cp(options,
                               EngineType::LLM,

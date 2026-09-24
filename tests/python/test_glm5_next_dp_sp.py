@@ -86,6 +86,100 @@ def test_each_global_token_has_one_sp_owner_with_common_ep_capacity(dp: int) -> 
         assert owned == list(range(count))
 
 
+@pytest.mark.parametrize("dp,pcp,tp", [(1, 2, 4), (2, 2, 2), (2, 4, 1)])
+def test_pcp_prefill_shards_use_pcp_mask_and_one_ep_capacity(
+    dp: int, pcp: int, tp: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    global_counts = (3,) if dp == 1 else (3, 7)
+    dispatch_tokens = set()
+    owners = set()
+    for global_rank in range(8):
+        dp_rank = global_rank // (pcp * tp)
+        cp_rank = (global_rank // tp) % pcp
+        tp_rank = global_rank % tp
+        cfg = _cfg(dp, global_rank)
+        cfg.cp_size, cfg.cp_rank = pcp, cp_rank
+        cfg.tp_size, cfg.tp_rank = tp, tp_rank
+        cfg._validate_moe_parallelism()
+        # Each PCP rank has a real row and a zigzag padding row; the model
+        # must not mistake pre-PCP raw DP rows for local active rows.
+        cp_mask = torch.tensor([True, False, True, False], dtype=torch.bool)
+        cp_context = SimpleNamespace(cp_size=pcp, cp_rank=cp_rank, shard_valid_mask=cp_mask)
+        context = _context(global_counts, global_counts)
+        context.cp_context = cp_context
+        monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda context=context: context)
+        monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
+        layout, mask = glm5_next._eplv2_token_layout(cfg, torch.ones(4, 8), Eplv2CommPolicy(512))
+        dispatch_tokens.add(layout.dispatch_tokens)
+        for row in range(layout.valid_tokens):
+            if mask[row]:
+                owners.add((dp_rank, cp_rank, row + tp_rank * layout.shard_tokens))
+        assert mask.tolist() == layout.shard(cp_mask).tolist()
+    assert len(dispatch_tokens) == 1
+    assert len(owners) == dp * pcp * 2
+
+
+def test_empty_dp_pcp_prefill_uses_active_dispatch_and_inactive_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    dp, pcp, tp = 2, 2, 2
+    counts = (8, 1)
+    policy = Eplv2CommPolicy(512)
+    dispatch_tokens = set()
+    backends = set()
+    for global_rank in range(dp * pcp * tp):
+        dp_rank = global_rank // (pcp * tp)
+        cp_rank = (global_rank // tp) % pcp
+        tp_rank = global_rank % tp
+        cfg = _cfg(dp, global_rank)
+        cfg.cp_size, cfg.cp_rank = pcp, cp_rank
+        cfg.tp_size, cfg.tp_rank = tp, tp_rank
+        cfg._validate_moe_parallelism()
+        empty = dp_rank == 1
+        if empty:
+            context = _context(counts, counts, is_prefill=True, is_dummy=True)
+            hidden = torch.ones(1, 8)
+        else:
+            context = _context(counts, counts, is_prefill=True, is_dummy=False)
+            context.cp_context = SimpleNamespace(
+                cp_size=pcp,
+                cp_rank=cp_rank,
+                shard_valid_mask=torch.tensor([True, False, True, False]),
+            )
+            hidden = torch.ones(4, 8)
+        monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda context=context: context)
+        monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
+        layout, mask = glm5_next._eplv2_token_layout(cfg, hidden, policy)
+        dispatch_tokens.add(layout.dispatch_tokens)
+        backends.add(layout.routed_backend)
+        if empty:
+            assert mask.tolist() == [False]
+            assert not layout.shard(torch.zeros(1, dtype=torch.bool)).any()
+    assert dispatch_tokens == {8}
+    assert len(backends) == 1
+
+
+@pytest.mark.parametrize("dp,pcp,tp", [(1, 2, 4), (2, 2, 2)])
+def test_pcp_decode_keeps_tp_local_ownership_and_dp_masks(
+    dp: int, pcp: int, tp: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for rank in range(8):
+        cfg = _cfg(dp, rank)
+        cfg.cp_size, cfg.cp_rank = pcp, (rank // tp) % pcp
+        cfg.tp_size, cfg.tp_rank = tp, rank % tp
+        cfg._validate_moe_parallelism()
+        counts = (3,) if dp == 1 else (3, 5)
+        raw = (3,) if dp == 1 else (3, 0)
+        context = _context(counts, raw, is_prefill=False)
+        context.cp_context = None
+        rows = counts[cfg.dp_rank]
+        active = torch.arange(rows) < raw[cfg.dp_rank]
+        context.execution_contexts = {Glm5NextEplv2Metadata: Glm5NextEplv2Metadata(active)}
+        monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda context=context: context)
+        monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
+        layout, mask = glm5_next._eplv2_token_layout(cfg, torch.ones(rows, 8), Eplv2CommPolicy(512))
+        assert mask.tolist() == layout.shard(active).tolist()
+        assert layout.dispatch_tokens == (max(counts) + tp - 1) // tp
+
+
 @pytest.mark.parametrize("counts", [None, (), (1,), (0, 2), (2.5, 2), torch.tensor([3, 2])])
 def test_invalid_dp_counts_fail_without_device_queries(counts: object) -> None:
     with pytest.raises((ValueError, TypeError)):
