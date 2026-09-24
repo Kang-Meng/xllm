@@ -52,6 +52,11 @@ class Call {
   }
   void init_request_payload();
 
+  // Sets the payload for handlers.
+  void set_request_payload(butil::IOBuf payload) {
+    request_payload_ = std::move(payload);
+  }
+
   virtual bool is_disconnected() const = 0;
 
  protected:

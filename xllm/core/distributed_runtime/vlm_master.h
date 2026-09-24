@@ -84,6 +84,8 @@ class VLMMaster : public Master {
 
   int get_image_limit() { return options_.limit_image_per_prompt(); }
 
+  const std::string& model_type() const { return model_args_.model_type(); }
+
  private:
   using Task = folly::Function<void()>;
 
