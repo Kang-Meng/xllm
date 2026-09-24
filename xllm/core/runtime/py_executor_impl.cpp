@@ -195,9 +195,13 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         layer::AttentionMetadataBuilder::build(
             params, enable_mla_, std::nullopt, device_));
   }
-  if (enable_mla_ && py_causal_lm_->cp_size() > 1 &&
+  const bool is_decode_context_parallel =
+      py_causal_lm_->cp_size() == 1 && py_causal_lm_->kv_split_size() > 1;
+  const bool is_mla_prefill_kv_shard =
+      enable_mla_ && py_causal_lm_->cp_size() > 1 &&
       py_causal_lm_->kv_split_size() > 1 &&
-      (attn_metadata->is_prefill || attn_metadata->is_chunked_prefill)) {
+      (attn_metadata->is_prefill || attn_metadata->is_chunked_prefill);
+  if (is_decode_context_parallel || is_mla_prefill_kv_shard) {
     const KVShardLayout layout(options_.block_size(),
                                py_causal_lm_->kv_split_size(),
                                py_causal_lm_->kv_split_rank());

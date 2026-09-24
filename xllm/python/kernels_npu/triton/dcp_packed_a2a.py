@@ -216,6 +216,133 @@ def _fused_dcp_lse_combine_kernel(
         tl.store(output_ptr + output_offsets, merged, mask=d_mask)
 
 
+@triton.jit
+def _fused_dcp_lse_combine_with_local_kernel(
+    recv_ptr,
+    output_ptr,
+    local_output_ptr,
+    local_lse_ptr,
+    local_output_stride_t,
+    local_output_stride_h,
+    local_output_stride_d,
+    local_lse_stride_t,
+    local_lse_stride_h,
+    recv_stride_rank,
+    recv_stride_scatter,
+    recv_stride_replicated,
+    recv_stride_d,
+    output_stride_t,
+    output_stride_h,
+    output_stride_d,
+    head_dim,
+    num_heads,
+    total_rows,
+    DCP_SIZE: tl.constexpr,
+    SCATTER_TOKENS: tl.constexpr,
+    LSE_PACK_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    program_idx = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    d_offsets = tl.arange(0, BLOCK_D)
+
+    for linear_idx in range(program_idx, total_rows, num_programs):
+        token_idx = (linear_idx // num_heads).to(tl.int64)
+        head_idx = (linear_idx % num_heads).to(tl.int64)
+
+        if SCATTER_TOKENS:
+            scatter_idx = token_idx
+            replicated_idx = head_idx
+        else:
+            scatter_idx = head_idx
+            replicated_idx = token_idx
+
+        local_lse_value = tl.load(local_lse_ptr + token_idx * local_lse_stride_t + head_idx * local_lse_stride_h).to(
+            tl.float32
+        )
+        local_valid = (
+            (local_lse_value == local_lse_value)
+            & (local_lse_value != float("inf"))
+            & (local_lse_value != -float("inf"))
+        )
+        lse_max = tl.where(local_valid, local_lse_value, -float("inf"))
+        for rank_idx in tl.static_range(DCP_SIZE):
+            recv_base = (
+                rank_idx * recv_stride_rank
+                + scatter_idx * recv_stride_scatter
+                + replicated_idx * recv_stride_replicated
+            )
+            if LSE_PACK_DIM == 1:
+                lse = tl.load(recv_ptr + recv_base + head_dim * recv_stride_d).to(tl.float32)
+                valid_lse = (lse == lse) & (lse != float("inf")) & (lse != -float("inf"))
+            else:
+                exponent_code = tl.load(recv_ptr + recv_base + head_dim * recv_stride_d).to(tl.float32)
+                significand_hi = tl.load(recv_ptr + recv_base + (head_dim + 1) * recv_stride_d).to(tl.float32)
+                significand_mid = tl.load(recv_ptr + recv_base + (head_dim + 2) * recv_stride_d).to(tl.float32)
+                significand_lo = tl.load(recv_ptr + recv_base + (head_dim + 3) * recv_stride_d).to(tl.float32)
+                packed_valid = exponent_code != 0.0
+                sign = tl.where(exponent_code < 0.0, -1.0, 1.0)
+                exponent_magnitude = tl.where(exponent_code < 0.0, -exponent_code, exponent_code)
+                safe_exponent = exponent_magnitude - 128.0
+                significand = significand_hi * 65536.0 + significand_mid * 256.0 + significand_lo
+                lse = sign * significand * tl.exp2(safe_exponent - 23.0)
+                valid_lse = packed_valid & (lse == lse) & (lse != float("inf")) & (lse != -float("inf"))
+            lse_max = tl.maximum(lse_max, tl.where(valid_lse, lse, -float("inf")))
+
+        any_valid_lse = lse_max != -float("inf")
+        safe_lse_max = tl.where(any_valid_lse, lse_max, 0.0)
+        weight_sum = 0.0
+        merged = tl.zeros([BLOCK_D], dtype=tl.float32)
+        d_mask = d_offsets < head_dim
+        for rank_idx in tl.static_range(DCP_SIZE):
+            recv_base = (
+                rank_idx * recv_stride_rank
+                + scatter_idx * recv_stride_scatter
+                + replicated_idx * recv_stride_replicated
+            )
+            if LSE_PACK_DIM == 1:
+                lse = tl.load(recv_ptr + recv_base + head_dim * recv_stride_d).to(tl.float32)
+                valid_lse = (lse == lse) & (lse != float("inf")) & (lse != -float("inf"))
+            else:
+                exponent_code = tl.load(recv_ptr + recv_base + head_dim * recv_stride_d).to(tl.float32)
+                significand_hi = tl.load(recv_ptr + recv_base + (head_dim + 1) * recv_stride_d).to(tl.float32)
+                significand_mid = tl.load(recv_ptr + recv_base + (head_dim + 2) * recv_stride_d).to(tl.float32)
+                significand_lo = tl.load(recv_ptr + recv_base + (head_dim + 3) * recv_stride_d).to(tl.float32)
+                packed_valid = exponent_code != 0.0
+                sign = tl.where(exponent_code < 0.0, -1.0, 1.0)
+                exponent_magnitude = tl.where(exponent_code < 0.0, -exponent_code, exponent_code)
+                safe_exponent = exponent_magnitude - 128.0
+                significand = significand_hi * 65536.0 + significand_mid * 256.0 + significand_lo
+                lse = sign * significand * tl.exp2(safe_exponent - 23.0)
+                valid_lse = packed_valid & (lse == lse) & (lse != float("inf")) & (lse != -float("inf"))
+            weight = tl.where(valid_lse, tl.exp(lse - safe_lse_max), 0.0)
+            partial_output = tl.load(
+                recv_ptr + recv_base + d_offsets * recv_stride_d,
+                mask=d_mask,
+                other=0.0,
+            ).to(tl.float32)
+            partial_output = tl.where(valid_lse, partial_output, 0.0)
+            merged += partial_output * weight
+            weight_sum += weight
+
+        local_weight = tl.where(local_valid, tl.exp(local_lse_value - safe_lse_max), 0.0)
+        local_offsets = (
+            token_idx * local_output_stride_t + head_idx * local_output_stride_h + d_offsets * local_output_stride_d
+        )
+        local_output_value = tl.load(
+            local_output_ptr + local_offsets,
+            mask=d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        merged += tl.where(local_valid, local_output_value, 0.0) * local_weight
+        weight_sum += local_weight
+
+        denominator = tl.where(weight_sum > 0.0, weight_sum, 1.0)
+        merged /= denominator
+        output_offsets = token_idx * output_stride_t + head_idx * output_stride_h + d_offsets * output_stride_d
+        tl.store(output_ptr + output_offsets, merged, mask=d_mask)
+
+
 def _lse_pack_dim(output_dtype: torch.dtype) -> int:
     if output_dtype in (torch.bfloat16, torch.float16):
         return 4
@@ -375,6 +502,79 @@ def fused_dcp_lse_combine(
     _fused_dcp_lse_combine_kernel[(_grid_size(total_rows),)](
         recv,
         output,
+        *recv.stride(),
+        *output.stride(),
+        head_dim,
+        num_heads,
+        total_rows,
+        DCP_SIZE=dcp_size,
+        SCATTER_TOKENS=scatter_dim == 0,
+        LSE_PACK_DIM=lse_pack_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+    return output
+
+
+def fused_dcp_lse_combine_with_local(
+    recv: torch.Tensor,
+    head_dim: int,
+    scatter_dim: int,
+    local_output: torch.Tensor,
+    local_lse: torch.Tensor,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Merge DCP payloads with an additional local attention contribution."""
+    if recv.ndim != 4:
+        raise RuntimeError(f"DCP packed A2A combine expects a 4D receive buffer, got {tuple(recv.shape)}.")
+    if not recv.is_contiguous():
+        raise RuntimeError("DCP packed A2A combine requires a contiguous HCCL receive buffer.")
+    if recv.device.type != "npu":
+        raise RuntimeError(f"DCP packed A2A combine requires an NPU tensor, got {recv.device}.")
+    if scatter_dim not in (0, 1):
+        raise ValueError(f"DCP packed A2A combine scatter_dim must be 0 or 1, got {scatter_dim}.")
+    if not isinstance(head_dim, int) or isinstance(head_dim, bool) or head_dim <= 0:
+        raise ValueError(f"DCP packed A2A combine requires a positive integer head_dim, got {head_dim}.")
+
+    dcp_size, local_scatter_size, replicated_size, packed_dim = (int(x) for x in recv.shape)
+    lse_pack_dim = _lse_pack_dim(recv.dtype)
+    if packed_dim != head_dim + lse_pack_dim:
+        raise RuntimeError(
+            "DCP packed A2A combine received an invalid packed dimension: "
+            f"expected {head_dim + lse_pack_dim}, got {packed_dim}."
+        )
+    num_tokens, num_heads = (
+        (local_scatter_size, replicated_size) if scatter_dim == 0 else (replicated_size, local_scatter_size)
+    )
+    _validate_dcp_packed_a2a_inputs(
+        local_output,
+        local_lse,
+        dcp_size=1,
+        scatter_dim=scatter_dim,
+    )
+    expected = (num_tokens, num_heads, head_dim)
+    if tuple(local_output.shape) != expected:
+        raise RuntimeError(
+            "DCP local contribution must match the post-scatter output shape: "
+            f"expected {expected}, got {tuple(local_output.shape)}"
+        )
+    if local_output.dtype != recv.dtype:
+        raise TypeError(
+            f"DCP local contribution must match the receive dtype: expected {recv.dtype}, got {local_output.dtype}"
+        )
+    if output is None:
+        output = torch.empty(expected, dtype=recv.dtype, device=recv.device)
+    elif tuple(output.shape) != expected or output.dtype != recv.dtype:
+        raise RuntimeError(
+            f"DCP packed A2A combine output must be {expected} {recv.dtype}, got {tuple(output.shape)} {output.dtype}."
+        )
+    total_rows = num_tokens * num_heads
+    _fused_dcp_lse_combine_with_local_kernel[(_grid_size(total_rows),)](
+        recv,
+        output,
+        local_output,
+        local_lse,
+        *local_output.stride(),
+        *local_lse.stride()[:2],
         *recv.stride(),
         *output.stride(),
         head_dim,

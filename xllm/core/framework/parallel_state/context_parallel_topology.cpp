@@ -17,7 +17,35 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <numeric>
+
 namespace xllm::parallel_state {
+
+DcpTopology build_contiguous_dcp_topology(int32_t global_rank,
+                                          int32_t world_size,
+                                          int32_t dp_size,
+                                          int32_t dcp_size) {
+  CHECK_GT(world_size, 0) << "world_size must be positive";
+  CHECK_GT(dp_size, 0) << "dp_size must be positive";
+  CHECK_GT(dcp_size, 0) << "dcp_size must be positive";
+  CHECK_GE(global_rank, 0) << "global_rank must be non-negative";
+  CHECK_LT(global_rank, world_size) << "global_rank must be in the world";
+  CHECK_EQ(world_size % dp_size, 0)
+      << "world_size must be divisible by dp_size";
+  CHECK_EQ((world_size / dp_size) % dcp_size, 0)
+      << "dcp_size must divide the DP-local world size";
+
+  DcpTopology topology;
+  topology.rank = global_rank % dcp_size;
+  topology.group_index = global_rank / dcp_size;
+  topology.group_ranks.reserve(world_size / dcp_size);
+  for (int32_t group_start = 0; group_start < world_size;
+       group_start += dcp_size) {
+    auto& ranks = topology.group_ranks.emplace_back(dcp_size);
+    std::iota(ranks.begin(), ranks.end(), group_start);
+  }
+  return topology;
+}
 
 ContextParallelTopology::ContextParallelTopology(int32_t global_rank,
                                                  int32_t world_size,

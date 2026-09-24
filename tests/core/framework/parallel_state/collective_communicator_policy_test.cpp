@@ -20,6 +20,49 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(CollectiveCommunicatorPolicyTest,
+     PreservesLegacyKvSplitRankWithoutTopology) {
+  for (int32_t global_rank = 0; global_rank < 8; ++global_rank) {
+    ParallelArgs args(global_rank, /*world_size=*/8, /*process_group=*/nullptr);
+    args.kv_split_size(2);
+    EXPECT_FALSE(args.dcp_topology_.has_value());
+    EXPECT_EQ(args.kv_split_rank(), global_rank / 4);
+  }
+}
+
+TEST(CollectiveCommunicatorPolicyTest,
+     PreservesNativeDcpGroupRankWithoutTopology) {
+  ProcessGroup dcp_group(
+      /*rank=*/1, /*world_size=*/2, torch::Device(torch::kCPU));
+  ParallelArgs args(/*rank=*/1, /*world_size=*/8, /*process_group=*/nullptr);
+  args.kv_split_size(2);
+  args.dcp_group_ = &dcp_group;
+  EXPECT_FALSE(args.dcp_topology_.has_value());
+  EXPECT_EQ(args.kv_split_rank(), 1);
+}
+
+TEST(CollectiveCommunicatorPolicyTest,
+     CopiesFinalizedDcpRankWithoutCommunicator) {
+  for (int32_t global_rank = 0; global_rank < 8; ++global_rank) {
+    ParallelArgs args(global_rank, /*world_size=*/8, /*process_group=*/nullptr);
+    args.kv_split_size(2);
+    args.dcp_topology_ = parallel_state::build_contiguous_dcp_topology(
+        global_rank, /*world_size=*/8, /*dp_size=*/1, /*dcp_size=*/2);
+
+    // Worker and ModelContext copies must agree before any Python group exists.
+    const ParallelArgs model_args = args;
+    ASSERT_TRUE(model_args.dcp_topology_.has_value());
+    EXPECT_EQ(model_args.dcp_group_, nullptr);
+    EXPECT_EQ(model_args.rank(), global_rank);
+    EXPECT_EQ(model_args.world_size(), 8);
+    EXPECT_EQ(model_args.kv_split_rank(), global_rank % 2);
+    const auto& topology = *model_args.dcp_topology_;
+    EXPECT_EQ(
+        topology.group_ranks[topology.group_index][model_args.kv_split_rank()],
+        global_rank);
+  }
+}
+
 TEST(CollectiveCommunicatorPolicyTest, ReusesOnlyEquivalentTpGroup) {
   EXPECT_TRUE(can_reuse_tp_group_for_moe(
       /*dp_size=*/1, /*tp_size=*/4, /*moe_tp_size=*/4));

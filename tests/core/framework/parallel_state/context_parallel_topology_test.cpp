@@ -24,6 +24,80 @@ limitations under the License.
 namespace xllm::parallel_state {
 namespace {
 
+TEST(DcpTopologyTest, FinalizesMembershipAndCoordinatesTogether) {
+  const std::vector<std::vector<int32_t>> expected_groups{
+      {0, 1}, {2, 3}, {4, 5}, {6, 7}};
+  for (int32_t global_rank = 0; global_rank < 8; ++global_rank) {
+    const DcpTopology topology = build_contiguous_dcp_topology(global_rank,
+                                                               /*world_size=*/8,
+                                                               /*dp_size=*/1,
+                                                               /*dcp_size=*/2);
+    EXPECT_EQ(topology.group_ranks, expected_groups);
+    EXPECT_EQ(topology.rank, global_rank % 2);
+    EXPECT_EQ(topology.group_index, global_rank / 2);
+    EXPECT_EQ(topology.group_ranks[topology.group_index][topology.rank],
+              global_rank);
+  }
+}
+
+TEST(DcpTopologyTest, KeepsGroupsInsideEachDpReplica) {
+  for (const int32_t dcp_size : {1, 2, 4, 8}) {
+    for (int32_t global_rank = 0; global_rank < 16; ++global_rank) {
+      const DcpTopology topology =
+          build_contiguous_dcp_topology(global_rank,
+                                        /*world_size=*/16,
+                                        /*dp_size=*/2,
+                                        dcp_size);
+      EXPECT_EQ(topology.group_ranks.size(), 16 / dcp_size);
+      const auto& own_group = topology.group_ranks[topology.group_index];
+      ASSERT_EQ(own_group.size(), dcp_size);
+      EXPECT_EQ(own_group[topology.rank], global_rank);
+      for (const int32_t member : own_group) {
+        EXPECT_EQ(member / 8, global_rank / 8);
+      }
+    }
+  }
+}
+
+TEST(DcpTopologyTest, RejectsInvalidDimensionsAndRanks) {
+  EXPECT_DEATH(build_contiguous_dcp_topology(/*global_rank=*/0,
+                                             /*world_size=*/0,
+                                             /*dp_size=*/1,
+                                             /*dcp_size=*/2),
+               "world_size must be positive");
+  EXPECT_DEATH(build_contiguous_dcp_topology(/*global_rank=*/0,
+                                             /*world_size=*/8,
+                                             /*dp_size=*/0,
+                                             /*dcp_size=*/2),
+               "dp_size must be positive");
+  EXPECT_DEATH(build_contiguous_dcp_topology(/*global_rank=*/0,
+                                             /*world_size=*/8,
+                                             /*dp_size=*/1,
+                                             /*dcp_size=*/0),
+               "dcp_size must be positive");
+  EXPECT_DEATH(build_contiguous_dcp_topology(/*global_rank=*/-1,
+                                             /*world_size=*/8,
+                                             /*dp_size=*/1,
+                                             /*dcp_size=*/2),
+               "global_rank must be non-negative");
+  EXPECT_DEATH(build_contiguous_dcp_topology(/*global_rank=*/8,
+                                             /*world_size=*/8,
+                                             /*dp_size=*/1,
+                                             /*dcp_size=*/2),
+               "global_rank must be in the world");
+  EXPECT_DEATH(build_contiguous_dcp_topology(/*global_rank=*/0,
+                                             /*world_size=*/8,
+                                             /*dp_size=*/3,
+                                             /*dcp_size=*/2),
+               "world_size must be divisible by dp_size");
+  // Dividing the global world is not enough: a group must not cross DP.
+  EXPECT_DEATH(build_contiguous_dcp_topology(/*global_rank=*/0,
+                                             /*world_size=*/12,
+                                             /*dp_size=*/2,
+                                             /*dcp_size=*/4),
+               "dcp_size must divide the DP-local world size");
+}
+
 TEST(ContextParallelTopologyTest, SeparatesTpPcpAndFullDomainDcp) {
   const ContextParallelTopology topology(/*global_rank=*/3,
                                          /*world_size=*/8,

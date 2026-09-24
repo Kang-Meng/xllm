@@ -20,6 +20,20 @@ limitations under the License.
 
 namespace xllm::parallel_state {
 
+// Finalized DCP membership, independent of communication resources. All ranks
+// carry the same group ordering so Python can create every subgroup in order.
+struct DcpTopology {
+  std::vector<std::vector<int32_t>> group_ranks;
+  int32_t rank = 0;
+  int32_t group_index = 0;
+};
+
+// Build adjacent-rank DCP groups inside each DP replica (PCP is disabled).
+DcpTopology build_contiguous_dcp_topology(int32_t global_rank,
+                                          int32_t world_size,
+                                          int32_t dp_size,
+                                          int32_t dcp_size);
+
 // Rank layout for prefill context parallelism (PCP) and decode context
 // parallelism (DCP).
 //

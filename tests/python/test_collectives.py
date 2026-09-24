@@ -457,6 +457,253 @@ def test_all_gather_keeps_contiguous_input_buffer(monkeypatch: pytest.MonkeyPatc
     torch.testing.assert_close(result, torch.cat((value, value + 100), dim=dim))
 
 
+@pytest.mark.parametrize("global_rank", range(8))
+def test_dcp_group_consumes_upstream_qwen_memberships(monkeypatch: pytest.MonkeyPatch, global_rank: int) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=global_rank)
+    memberships = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    rank, group_index = global_rank % 2, global_rank // 2
+
+    # The C++ bridge passes the new optional argument positionally.
+    group = collectives.init_process_group(
+        "dcp",
+        "127.0.0.1",
+        46001,
+        rank,
+        2,
+        "cuda:0",
+        global_rank,
+        8,
+        group_index,
+        group_ranks=memberships,
+    )
+
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == memberships
+    own_ranks = collectives._group_ranks[("dcp", "cuda:0")]
+    assert own_ranks[group.rank()] == global_rank
+    assert group.rank() == global_rank % 2
+    assert collectives.dcp_group("cuda:0") is group
+
+
+@pytest.mark.parametrize("group_name", ["tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp"])
+@pytest.mark.parametrize("pass_none", [False, True])
+def test_default_topologies_remain_compatible(
+    monkeypatch: pytest.MonkeyPatch, group_name: str, pass_none: bool
+) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=3)
+    contiguous = group_name in ("tp", "moe_tp", "layerwise")
+    rank, group_index = (1, 1) if contiguous else (0, 3)
+    kwargs = {"group_ranks": None} if pass_none else {}
+    groups = [
+        collectives.init_process_group(group_name, "127.0.0.1", 46001, rank, 2, "cuda:0", 3, 8, group_index, **kwargs)
+        for _ in range(2)
+    ]
+
+    assert groups[0] is groups[1]
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == (
+        [[0, 1], [2, 3], [4, 5], [6, 7]] if contiguous else [[0, 4], [1, 5], [2, 6], [3, 7]]
+    )
+
+
+@pytest.mark.parametrize("group_name", ["tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp"])
+def test_explicit_topology_overrides_defaults_and_preserves_group_order(
+    monkeypatch: pytest.MonkeyPatch, group_name: str
+) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=3)
+    # Neither built-in layout has this group order. Consume it without deriving.
+    memberships = [[2, 3], [0, 1], [6, 7], [4, 5]]
+    derive_memberships = MagicMock(side_effect=AssertionError("topology was re-derived"))
+    monkeypatch.setattr(collectives, "_group_memberships", derive_memberships)
+
+    groups = [
+        collectives.init_process_group(group_name, "127.0.0.1", 46001, 1, 2, "cuda:0", 3, 8, 0, group_ranks=memberships)
+        for _ in range(2)
+    ]
+
+    assert groups[0] is groups[1]
+    assert groups[0].rank() == 1
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == memberships
+    assert collectives._group_ranks[(group_name, "cuda:0")] == (2, 3)
+    derive_memberships.assert_not_called()
+
+
+def test_tp_accepts_explicit_strided_memberships(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=5)
+    memberships = [[0, 4], [1, 5], [2, 6], [3, 7]]
+
+    group = collectives.init_process_group("tp", "127.0.0.1", 46001, 1, 2, "cuda:0", 5, 8, 1, group_ranks=memberships)
+
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == memberships
+    assert group.rank() == 1
+    assert collectives._group_ranks[("tp", "cuda:0")] == (1, 5)
+
+
+def test_dcp_groups_preserve_upstream_data_parallel_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=10)
+    memberships = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11], [12, 13], [14, 15]]
+
+    collectives.init_process_group("dcp", "127.0.0.1", 46001, 0, 2, "cuda:0", 10, 16, 5, group_ranks=memberships)
+
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == memberships
+    assert collectives._group_ranks[("dcp", "cuda:0")] == (10, 11)
+
+
+def test_explicit_topology_does_not_affect_other_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=2)
+    collectives.init_process_group(
+        "dcp",
+        "127.0.0.1",
+        46001,
+        0,
+        2,
+        "cuda:0",
+        2,
+        8,
+        1,
+        group_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+    )
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    new_group.reset_mock()
+
+    # Another group and another device still use the original default rules.
+    collectives.init_process_group("dp", "127.0.0.1", 46001, 0, 2, "cuda:0", 2, 8, 2)
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 4], [1, 5], [2, 6], [3, 7]]
+    new_group.reset_mock()
+    collectives.init_process_group("dcp", "127.0.0.1", 46001, 0, 2, "cuda:1", 2, 8, 2)
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 4], [1, 5], [2, 6], [3, 7]]
+
+
+@pytest.mark.parametrize("group_name", ["tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp"])
+@pytest.mark.parametrize("explicit_topology_first", [False, True])
+def test_rejects_different_members_with_same_rank_and_size(
+    monkeypatch: pytest.MonkeyPatch, group_name: str, explicit_topology_first: bool
+) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=0)
+    # Choose an explicit layout different from this group type's default.
+    explicit_memberships = (
+        [[0, 4], [1, 5], [2, 6], [3, 7]]
+        if group_name in ("tp", "moe_tp", "layerwise")
+        else [[0, 1], [2, 3], [4, 5], [6, 7]]
+    )
+    first_memberships = explicit_memberships if explicit_topology_first else None
+    second_memberships = None if explicit_topology_first else explicit_memberships
+    collectives.init_process_group(
+        group_name, "127.0.0.1", 46001, 0, 2, "cuda:0", 0, 8, 0, group_ranks=first_memberships
+    )
+    new_group.reset_mock()
+
+    # Both layouts give rank 0 local rank 0 and size 2; only the peers differ.
+    with pytest.raises(RuntimeError, match="different members"):
+        collectives.init_process_group(
+            group_name, "127.0.0.1", 46001, 0, 2, "cuda:0", 0, 8, 0, group_ranks=second_memberships
+        )
+    new_group.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("rank", "group_index", "world_size", "global_world_size"),
+    [(0, 1, 2, 8), (1, 0, 2, 8), (-1, 1, 2, 8), (1, -1, 2, 8), (1, 1, 4, 8), (1, 1, 2, 16)],
+)
+def test_rejects_inconsistent_explicit_topology_before_rendezvous(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    group_index: int,
+    world_size: int,
+    global_world_size: int,
+) -> None:
+    _, tcp_store, init_world, new_group = _mock_process_groups(monkeypatch, global_rank=3)
+
+    with pytest.raises((ValueError, RuntimeError), match="dcp topology"):
+        collectives.init_process_group(
+            "dcp",
+            "127.0.0.1",
+            46001,
+            rank,
+            world_size,
+            "cuda:0",
+            3,
+            global_world_size,
+            group_index,
+            group_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+        )
+    tcp_store.assert_not_called()
+    init_world.assert_not_called()
+    new_group.assert_not_called()
+
+
+def test_explicit_topology_creation_failure_is_not_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=3)
+    new_group.side_effect = RuntimeError("collective creation failed")
+    derive_memberships = MagicMock(side_effect=AssertionError("default topology used"))
+    monkeypatch.setattr(collectives, "_group_memberships", derive_memberships)
+
+    with pytest.raises(RuntimeError, match="collective creation failed"):
+        collectives.init_process_group(
+            "dcp",
+            "127.0.0.1",
+            46001,
+            1,
+            2,
+            "cuda:0",
+            3,
+            8,
+            1,
+            group_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+        )
+    assert collectives.dcp_group("cuda:0") is None
+    assert new_group.call_count == 1
+    derive_memberships.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "memberships",
+    [[], [[]], [[0, 1], [2]], [[0, 1], [1, 2]], [[0, 1], [2, 4]], [[-1, 0], [1, 2]], [[1, 0], [2, 3]]],
+)
+def test_rejects_invalid_memberships_before_rendezvous(
+    monkeypatch: pytest.MonkeyPatch, memberships: list[list[int]]
+) -> None:
+    _, tcp_store, init_world, new_group = _mock_process_groups(monkeypatch, global_rank=3)
+    with pytest.raises(ValueError, match="dcp topology"):
+        collectives.init_process_group("dcp", "127.0.0.1", 46001, 1, 2, "cuda:0", 3, 4, 1, group_ranks=memberships)
+    tcp_store.assert_not_called()
+    init_world.assert_not_called()
+    new_group.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_rank", [True, "0", 0.0])
+def test_rejects_noninteger_topology_ranks_before_rendezvous(
+    monkeypatch: pytest.MonkeyPatch, invalid_rank: object
+) -> None:
+    _, tcp_store, init_world, new_group = _mock_process_groups(monkeypatch, global_rank=3)
+    with pytest.raises(TypeError, match="ranks must be integers"):
+        collectives.init_process_group(
+            "dcp",
+            "127.0.0.1",
+            46001,
+            1,
+            2,
+            "cuda:0",
+            3,
+            4,
+            1,
+            group_ranks=[[invalid_rank, 1], [2, 3]],
+        )
+    tcp_store.assert_not_called()
+    init_world.assert_not_called()
+    new_group.assert_not_called()
+
+
+def test_explicit_topology_keeps_cached_members_independent_of_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_process_groups(monkeypatch, global_rank=3)
+    memberships = [[0, 1], [2, 3]]
+    group = collectives.init_process_group("dcp", "127.0.0.1", 46001, 1, 2, "cuda:0", 3, 4, 1, group_ranks=memberships)
+    assert memberships == [[0, 1], [2, 3]]
+    memberships[1][:] = [0, 1]
+    memberships.clear()
+
+    assert group.rank() == 1
+    assert collectives._group_ranks[("dcp", "cuda:0")] == (2, 3)
+
+
 def test_dp_execution_gather_uses_fixed_collective_for_equal_counts(monkeypatch):
     value = torch.zeros(4, 8)
     gathered = torch.zeros(8, 8)

@@ -46,6 +46,48 @@ def _is_deepseek_v4_model_type(model_type: str) -> bool:
     return model_type.startswith("deepseek_v4")
 
 
+def _is_qwen3_5_model_type(model_type: str) -> bool:
+    return model_type in {
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }
+
+
+def _validate_qwen3_5_dcp_config(
+    config: dict,
+    dcp_size: int,
+) -> None:
+    tp_size = int(config.get("tp_size", 1))
+    if dcp_size > tp_size or tp_size % dcp_size:
+        raise ValueError(f"Qwen3.5 DCP size must divide TP size: dcp_size={dcp_size}, tp_size={tp_size}")
+    num_kv_heads_value = config.get("n_kv_heads")
+    if num_kv_heads_value is None:
+        num_kv_heads_value = config.get("num_key_value_heads")
+    if num_kv_heads_value is None:
+        raise ValueError("Qwen3.5 DCP requires the global KV-head count")
+    num_kv_heads = int(num_kv_heads_value)
+    if num_kv_heads <= 0:
+        raise ValueError("Qwen3.5 DCP requires a positive global KV-head count")
+    if num_kv_heads >= tp_size:
+        kv_head_replicas = 1
+    else:
+        if tp_size % num_kv_heads:
+            raise ValueError(
+                "Qwen3.5 DCP requires TP size to be divisible by the global "
+                f"KV-head count: tp_size={tp_size}, num_kv_heads={num_kv_heads}"
+            )
+        kv_head_replicas = tp_size // num_kv_heads
+    if kv_head_replicas % dcp_size:
+        raise ValueError(
+            "Qwen3.5 DCP size must divide the replicated KV-head group: "
+            f"dcp_size={dcp_size}, kv_head_replicas={kv_head_replicas}"
+        )
+    if bool(config.get("enable_disagg_pd", False)):
+        raise NotImplementedError("Qwen3.5 Python DCP does not yet support disaggregated P/D")
+
+
 def _resolve_graph_backend(config: dict) -> str:
     graph_backend = str(config.get("python_graph_backend", "off")).lower()
     if graph_backend in _DISABLED_GRAPH_BACKENDS and config.get("enable_graph", False) and current_platform.is_npu():
@@ -84,6 +126,30 @@ def _create_attention_backend(
     if current_platform.is_npu():
         dcp_group = distributed.dcp_group(device)
         if int(config.get("cp_size", 1)) == 1 and dcp_group is not None and dcp_group.size() > 1:
+            if _is_qwen3_5_model_type(str(model_type)):
+                if current_platform.get_ascend_soc_generation() == "a5":
+                    raise NotImplementedError(
+                        "Qwen3.5 Python DCP is not supported on Ascend950 because "
+                        "its TND attention fallback does not return softmax LSE"
+                    )
+                _validate_qwen3_5_dcp_config(config, dcp_group.size())
+                from xllm.python.attention.dense_dcp_backend import (
+                    DenseDcpAttentionBackend,
+                )
+
+                return DenseDcpAttentionBackend(
+                    num_heads=first_attention.num_heads,
+                    num_kv_heads=first_attention.num_kv_heads,
+                    head_dim=first_attention.head_dim,
+                    scale=first_attention.scale,
+                    sliding_window=first_attention.sliding_window,
+                    device=device,
+                    dtype=dtype,
+                    dcp_group=dcp_group,
+                    num_decoding_tokens=max(num_decoding_tokens, 1),
+                )
+            if not bool(config.get("enable_mla", False)):
+                raise NotImplementedError(f"Dense DCP attention is not supported for model type '{model_type}'")
             from xllm.python.attention.sfa_dcp_backend import (
                 SfaDcpAttentionBackend,
                 dcp_layer_options,

@@ -39,8 +39,9 @@ _GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dc
 # ``cp`` strides by the attention TP size: ranks sharing a (dp, tp) slot but
 # holding different sequence shards form one CP group, matching the C++
 # compute_cp_group_ranks layout (rank = dp*cp*tp + cp_rank*tp + tp_rank).
-# CP and DCP callers with DP pass an explicit within-cohort stride.
-# DCP then matches the DP-local ownership in ParallelArgs::kv_split_rank.
+# CP and legacy DCP callers with DP pass an explicit within-cohort stride.
+# Explicit memberships can override these defaults when the upstream runtime
+# has already finalized a model-specific topology.
 _CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp", "layerwise"))
 
 _groups = {}
@@ -150,6 +151,43 @@ def _group_memberships(
     return [[index + offset * count for offset in range(world_size)] for index in range(count)]
 
 
+def _validate_group_topology(
+    group_name: str,
+    memberships: list[list[int]],
+    rank: int,
+    world_size: int,
+    global_rank: int,
+    global_world_size: int,
+    group_index: int,
+    *,
+    explicit_memberships: bool,
+) -> None:
+    """Validate topology and caller coordinates before creating or reusing a group."""
+    if (
+        global_world_size <= 0
+        or world_size <= 0
+        or len(memberships) * world_size != global_world_size
+        or any(len(ranks) != world_size for ranks in memberships)
+    ):
+        raise ValueError(f"{group_name} topology sizes do not match the process-group initialization")
+    if explicit_memberships:
+        all_ranks = [member for ranks in memberships for member in ranks]
+        if any(not isinstance(member, int) or isinstance(member, bool) for member in all_ranks):
+            raise TypeError(f"{group_name} topology ranks must be integers")
+        if sorted(all_ranks) != list(range(global_world_size)):
+            raise ValueError(f"{group_name} topology must partition all global ranks exactly once")
+        # c10d new_group sorts its rank list; reject a conflicting local-rank
+        # order instead of silently changing the upstream topology.
+        if any(ranks != sorted(ranks) for ranks in memberships):
+            raise ValueError(f"{group_name} topology members within each group must be sorted")
+    if (
+        not 0 <= group_index < len(memberships)
+        or not 0 <= rank < world_size
+        or memberships[group_index][rank] != global_rank
+    ):
+        raise RuntimeError(f"{group_name} topology rank or group index does not match the caller")
+
+
 def _supports_symmetric_memory(device: torch.device, ranks: list[int]) -> bool:
     if device.type != "cuda" or _world_topology is None:
         return False
@@ -181,11 +219,35 @@ def init_process_group(
     global_world_size: int,
     group_index: int,
     group_stride: int | None = None,
+    group_ranks: Sequence[Sequence[int]] | None = None,
 ) -> ProcessGroup:
+    """Create a parallel group from explicit memberships or the legacy layout.
+
+    ``group_ranks`` lists every group of this kind in the same order on all
+    processes, not just the current process's peers. Each sorted inner list
+    contains global ranks; ``group_index`` selects our list and ``rank`` our
+    position in it. None preserves the default layout for ``group_name``.
+    """
     if group_name not in _GROUP_NAMES:
         raise ValueError(f"unsupported parallel group: {group_name}")
     device_obj = torch.device(device)
     group_key = (group_name, str(device_obj))
+    if group_stride is not None and group_ranks is not None:
+        raise ValueError("group_stride and group_ranks are mutually exclusive")
+    if group_ranks is not None:
+        memberships = [list(ranks) for ranks in group_ranks]
+    else:
+        memberships = _group_memberships(group_name, world_size, global_world_size, group_stride)
+    _validate_group_topology(
+        group_name,
+        memberships,
+        rank,
+        world_size,
+        global_rank,
+        global_world_size,
+        group_index,
+        explicit_memberships=group_ranks is not None,
+    )
     group = _groups.get(group_key)
     if group is not None:
         if group.rank() != rank or group.size() != world_size:
@@ -194,6 +256,8 @@ def init_process_group(
                 f"rank {group.rank()}/{group.size()}, requested "
                 f"rank {rank}/{world_size}"
             )
+        if _group_ranks.get(group_key) != tuple(memberships[group_index]):
+            raise RuntimeError(f"{group_name} group for {group_key[1]} is already initialized with different members")
         return group
 
     _ensure_world(host, port, device_obj, global_rank, global_world_size)
@@ -201,7 +265,6 @@ def init_process_group(
 
     own = None
     own_ranks = None
-    memberships = _group_memberships(group_name, world_size, global_world_size, group_stride)
     for index, ranks in enumerate(memberships):
         candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
         if global_rank in ranks:

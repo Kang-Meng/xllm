@@ -131,6 +131,10 @@ def _register_builtin_models() -> None:
         "qwen3_5_moe_text",
         execution_metadata_builders=(
             (
+                "xllm.python.attention.dense_dcp_metadata_builder",
+                "DenseDcpMetadataBuilder",
+            ),
+            (
                 "xllm.python.layers.npu.mega_moe_metadata_builder",
                 "TokenOwnerMegaMoeMetadataBuilder",
             ),

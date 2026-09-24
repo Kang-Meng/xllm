@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include "core/common/macros.h"
+#include "core/framework/parallel_state/context_parallel_topology.h"
 #include "core/framework/parallel_state/process_group.h"
 
 #if defined(USE_NPU)
@@ -24,6 +25,7 @@ limitations under the License.
 #endif
 
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 
 namespace xllm {
@@ -180,6 +182,10 @@ struct ParallelArgs {
       return 0;
     }
 
+    if (dcp_topology_.has_value()) {
+      return dcp_topology_->rank;
+    }
+
     if (dcp_group_ != nullptr) {
       return dcp_group_->rank();
     }
@@ -237,8 +243,8 @@ struct ParallelArgs {
   ProcessGroup* single_rank_group_ = nullptr;
   // PCP ProcessGroup for prefill AllGather (NPU standalone; MLU aliases TP).
   ProcessGroup* cp_group_ = nullptr;
-  // DCP ProcessGroup is authoritative for KV ownership, kv_split_rank, and
-  // decode merge.
+  // Native DCP resource supplies KV ownership when no explicit topology is
+  // provided. Python DCP can use dcp_topology_ without a native communicator.
   ProcessGroup* dcp_group_ = nullptr;
   ProcessGroup* moe_ep_group_ = nullptr;
   // Dedicated group for EPLB weight migration. It has the same rank set as
@@ -253,6 +259,11 @@ struct ParallelArgs {
   // the bootstrap keys for each logical group independent.
   std::string python_rendezvous_host_;
   int32_t python_rendezvous_port_ = 0;
+
+  // Optional logical DCP topology finalized before ModelContext construction.
+  // Python materializes these memberships without deriving another layout;
+  // unset preserves the existing native/legacy topology behavior.
+  std::optional<parallel_state::DcpTopology> dcp_topology_;
 
   // ProcessGroups for DiT models
   ProcessGroup* dit_tp_group_ = nullptr;

@@ -79,6 +79,7 @@ limitations under the License.
 #endif
 #include "core/distributed_runtime/master.h"
 #include "core/framework/model/mtp_utils.h"
+#include "core/framework/parallel_state/context_parallel_topology.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/eplb/eplb_utils.h"
@@ -2258,6 +2259,23 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   if (options_.is_draft_engine() || is_spec_draft_) {
     disable_layerwise_split_for_draft(&parallel_args_);
   }
+
+#if defined(USE_NPU)
+  // Resolve Python Qwen3.5 KV ownership before copying ParallelArgs into the
+  // model context. Native DCP and other Python models retain their topology.
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl()) &&
+      is_qwen3_5_target_model_type(args.model_type()) &&
+      parallel_args_.cp_size() == 1 &&
+      parallel_args_.kv_split_size_effective() > 1) {
+    parallel_args_.dcp_topology_ =
+        parallel_state::build_contiguous_dcp_topology(
+            parallel_args_.rank(),
+            parallel_args_.world_size(),
+            parallel_args_.dp_size(),
+            parallel_args_.kv_split_size_effective());
+  }
+#endif
 
   // create model context
   dtype_ = dtype;

@@ -56,6 +56,7 @@ def test_qwen35_registers_execution_metadata_builder_class() -> None:
     builder_classes = registry.get_execution_metadata_builder_classes("qwen3_5_moe_text")
 
     assert tuple(builder_class.__name__ for builder_class in builder_classes) == (
+        "DenseDcpMetadataBuilder",
         "TokenOwnerMegaMoeMetadataBuilder",
         "Qwen3_5GdnMetadataBuilder",
     )
@@ -71,5 +72,6 @@ def test_qwen35_uses_official_model(
     assert model_class.__name__ == "Qwen3_5ForCausalLM"
 
 
-def test_model_without_execution_metadata_builder_returns_empty_tuple() -> None:
-    assert registry.get_execution_metadata_builder_classes("qwen3") == ()
+@pytest.mark.parametrize("model_type", ["qwen3", "deepseek_v32", "deepseek_v4", "glm_moe_dsa"])
+def test_model_without_execution_metadata_builder_returns_empty_tuple(model_type: str) -> None:
+    assert registry.get_execution_metadata_builder_classes(model_type) == ()

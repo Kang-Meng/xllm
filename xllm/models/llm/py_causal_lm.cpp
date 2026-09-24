@@ -23,6 +23,7 @@ limitations under the License.
 #include <memory>
 #include <string>
 
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
@@ -308,18 +309,24 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
       CHECK_EQ(tp_size_ % kv_split_size, 0);
       const int32_t dcp_stride = tp_size_ / kv_split_size;
       const int32_t dcp_rank = parallel_args.kv_split_rank();
+      const auto& dcp_topology = parallel_args.dcp_topology_;
       const int32_t dcp_group_index =
-          dp_rank_ * dcp_stride + tp_rank_ % dcp_stride;
-      init_process_group("dcp",
-                         parallel_args.python_rendezvous_host_,
-                         parallel_args.python_rendezvous_port_,
-                         dcp_rank,
-                         kv_split_size,
-                         c10::str(device_),
-                         global_rank,
-                         global_world_size,
-                         dcp_group_index,
-                         dcp_stride);
+          dcp_topology.has_value()
+              ? dcp_topology->group_index
+              : dp_rank_ * dcp_stride + tp_rank_ % dcp_stride;
+      init_process_group(
+          "dcp",
+          parallel_args.python_rendezvous_host_,
+          parallel_args.python_rendezvous_port_,
+          dcp_rank,
+          kv_split_size,
+          c10::str(device_),
+          global_rank,
+          global_world_size,
+          dcp_group_index,
+          dcp_topology.has_value() ? py::none() : py::cast(dcp_stride),
+          dcp_topology.has_value() ? py::cast(dcp_topology->group_ranks)
+                                   : py::none());
     }
     if (!is_deepseek_v4 && layerwise_split_size_ > 1) {
       CHECK_EQ(tp_size_ % layerwise_split_size_, 0)
@@ -381,6 +388,7 @@ py::dict PyCausalLM::build_config_dict(
   visit_properties(parallel_args, visitor);
   d["dtype"] = dtype_to_string(options_);
   d["device"] = c10::str(device_);
+  d["enable_disagg_pd"] = DisaggPDConfig::get_instance().enable_disagg_pd();
   d["enable_eplb"] = EPLBConfig::get_instance().enable_eplb();
   d["use_ctc"] = ModelConfig::get_instance().use_ctc();
   d["redundant_experts_num"] =

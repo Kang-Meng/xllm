@@ -485,8 +485,9 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
 
 TEST(NpuDcpTopologyTest, AcceptsOnlyTpLocalFactors) {
   const auto is_valid = [](int32_t kv_split_size) {
-    return !validate_qwen_dcp_topology(
-                /*global_world_size=*/8, /*dp_size=*/2, kv_split_size)
+    return !validate_qwen_dcp_topology(/*global_world_size=*/8,
+                                       /*dp_size=*/2,
+                                       kv_split_size)
                 .has_value();
   };
 
