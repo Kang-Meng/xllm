@@ -476,6 +476,7 @@ bool storage_prefetch_request_to_proto(const StoragePrefetchRequest& request,
     proto_info->set_block_type(
         static_cast<proto::BlockType>(static_cast<int8_t>(info.block_type)));
   };
+  proto_request->mutable_units()->Reserve(request.units.size());
   for (const PrefetchUnit& unit : request.units) {
     proto::PrefetchUnit* proto_unit = proto_request->add_units();
     proto_unit->set_has_non_gated(unit.has_non_gated);

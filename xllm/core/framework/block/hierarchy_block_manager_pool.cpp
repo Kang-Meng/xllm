@@ -125,16 +125,19 @@ size_t prefetch_unit_size(CompositeBlockManager::LeafCombination combination,
   return unit_leaf->second.leaf->block_size();
 }
 
-bool append_prefetch_transfer(std::vector<BlockTransferInfo>* transfers,
+bool append_prefetch_transfer(PrefetchUnit* unit,
                               BlockType type,
                               size_t block_index,
                               const KVCacheState& host_state) {
-  CHECK(transfers != nullptr);
+  CHECK(unit != nullptr);
   const Slice<Block> blocks = host_state.blocks(type);
   if (block_index >= blocks.size() || !blocks[block_index].is_valid()) {
     return false;
   }
-  transfers->emplace_back(
+  std::vector<BlockTransferInfo>& transfers = is_prefetch_gate_block_type(type)
+                                                  ? unit->gated_blocks
+                                                  : unit->non_gated_blocks;
+  transfers.emplace_back(
       /*src_id=*/-1,
       /*dst_id=*/blocks[block_index].id(),
       blocks[block_index].get_immutable_hash_value(),
@@ -171,7 +174,7 @@ StoragePrefetchRequest build_flat_kv_prefetch_request(
   for (size_t unit = base_units; unit < kv_blocks.size(); ++unit) {
     PrefetchUnit prefetch_unit;
     if (!append_prefetch_transfer(
-            &prefetch_unit.gated_blocks, BlockType::KV, unit, host_state)) {
+            &prefetch_unit, BlockType::KV, unit, host_state)) {
       break;
     }
     request.units.emplace_back(std::move(prefetch_unit));
@@ -213,7 +216,7 @@ StoragePrefetchRequest build_flat_kv_linear_prefetch_request(
     bool gate_available = true;
     for (size_t block_index = kv_begin; block_index < kv_end; ++block_index) {
       const bool available = append_prefetch_transfer(
-          &prefetch_unit.gated_blocks, BlockType::KV, block_index, host_state);
+          &prefetch_unit, BlockType::KV, block_index, host_state);
       gate_available = gate_available && available;
     }
     if (!gate_available) {
@@ -221,7 +224,7 @@ StoragePrefetchRequest build_flat_kv_linear_prefetch_request(
     }
     if (linear_blocks[unit].is_valid()) {
       append_prefetch_transfer(
-          &prefetch_unit.non_gated_blocks, BlockType::LINEAR, unit, host_state);
+          &prefetch_unit, BlockType::LINEAR, unit, host_state);
     }
     request.units.emplace_back(std::move(prefetch_unit));
   }
@@ -270,10 +273,8 @@ StoragePrefetchRequest build_swa_compressed_prefetch_request(
            ++block_index) {
         if (block_index < swa_blocks.size() &&
             swa_blocks[block_index].is_valid()) {
-          append_prefetch_transfer(&prefetch_unit.non_gated_blocks,
-                                   BlockType::SWA,
-                                   block_index,
-                                   host_state);
+          append_prefetch_transfer(
+              &prefetch_unit, BlockType::SWA, block_index, host_state);
         }
       }
     }
@@ -283,11 +284,11 @@ StoragePrefetchRequest build_swa_compressed_prefetch_request(
     const size_t c4_end = (unit + 1) * unit_size / c4_block_size;
     for (size_t block_index = c4_begin; block_index < c4_end; ++block_index) {
       const bool available = append_prefetch_transfer(
-          &prefetch_unit.gated_blocks, BlockType::C4, block_index, host_state);
+          &prefetch_unit, BlockType::C4, block_index, host_state);
       gate_available = gate_available && available;
     }
     const bool c128_available = append_prefetch_transfer(
-        &prefetch_unit.gated_blocks, BlockType::C128, unit, host_state);
+        &prefetch_unit, BlockType::C128, unit, host_state);
     gate_available = gate_available && c128_available;
     if (!gate_available) {
       break;
@@ -392,6 +393,9 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
       case CompositeBlockManager::LeafCombination::SWA_COMPRESSED:
         break;
       case CompositeBlockManager::LeafCombination::UNSUPPORTED:
+        CHECK(!options_.enable_prefix_cache())
+            << "Unsupported prefix-cache leaf combination";
+        break;
       default:
         LOG(FATAL) << "HierarchyBlockManagerPool supports only FLAT_KV, "
                       "FLAT_KV_LINEAR and SWA_COMPRESSED cache layouts; got "
@@ -487,9 +491,6 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
 void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
   const int32_t dp_rank = sequence->dp_rank();
   const auto* host_manager = host_block_managers_[dp_rank].get();
-  if (!options_.enable_prefix_cache()) {
-    return;
-  }
   CHECK(host_manager);
 
   KVCacheState& hbm_state = sequence->kv_state();
@@ -904,117 +905,107 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
     PrefetchDoneCallback done) {
   CHECK(request != nullptr);
   CHECK(done != nullptr);
-  if (!options_.enable_kvcache_store() || request->sequences().empty()) {
+  if (!options_.enable_prefix_cache() || !options_.enable_kvcache_store() ||
+      request->sequences().empty()) {
     done(std::move(request));
     return;
   }
 
   prefetching_requests_.fetch_add(1, std::memory_order_relaxed);
-  auto remaining =
-      std::make_shared<std::atomic<size_t>>(request->sequences().size());
-  auto finish_sequence =
-      [this, request, remaining, done = std::move(done)]() mutable {
-        if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-          done(std::move(request));
-          const size_t previous =
-              prefetching_requests_.fetch_sub(1, std::memory_order_acq_rel);
-          CHECK_GT(previous, 0u);
-        }
-      };
+  const std::unique_ptr<Sequence>& prefill_sequence =
+      request->sequences().front();
+  Sequence* sequence = prefill_sequence.get();
+  CHECK(sequence != nullptr);
+  CHECK(!sequence->has_any_blocks())
+      << "Mooncake prefetch admission requires an empty Sequence state.";
 
-  for (const std::unique_ptr<Sequence>& prefill_sequence :
-       request->sequences()) {
-    Sequence* sequence = prefill_sequence.get();
-    CHECK(sequence != nullptr);
-    CHECK(!sequence->has_any_blocks())
-        << "Mooncake prefetch admission requires an empty Sequence state.";
-
-    const int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
-    const auto* composite = static_cast<const CompositeBlockManager*>(
-        block_managers_[dp_rank].get());
-    const CompositeBlockManager::LeafCombination combination =
-        composite->leaf_combination();
-    auto* host_manager = host_block_managers_[dp_rank].get();
-    CHECK(host_manager);
-    const CompositeBlockManager::LeafMap& host_leaves =
-        host_manager->leaf_entries();
-    const size_t unit_size = prefetch_unit_size(combination, host_leaves);
-    const size_t max_prefix_tokens =
-        sequence->tokens().empty() ? 0 : sequence->tokens().size() - 1;
-    size_t cacheable_tokens = max_prefix_tokens;
-    for (const auto& [type, entry] : host_leaves) {
-      const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
-      const size_t block_size = entry.leaf->block_size();
-      const size_t hashable_tokens =
-          num_hash_blocks(hasher_type,
-                          sequence->hash_tokens(hasher_type).size(),
-                          block_size) *
-          block_size;
-      cacheable_tokens = std::min(cacheable_tokens, hashable_tokens);
-    }
-    const size_t target_tokens = (cacheable_tokens / unit_size) * unit_size;
-
-    // Host admission owns the shared-prefix probe and cross-leaf trim. Keep
-    // that transaction in the composite so prefetch sees the same shared
-    // cursors as ordinary Host prefix-cache admission.
-    host_manager->allocate_shared_for_sequence(sequence,
-                                               sequence->host_kv_state());
-    // Composite admission has completed the physical shared probe, but the
-    // Host tier is not publishable until the Store callback validates the
-    // requested units. Keep the tier-match flag private to this transaction.
-    sequence->host_kv_state().set_prefix_cache_matched(false);
-    const size_t base_tokens = sequence->host_kv_state().kv_cache_tokens_num();
-
-    // Prefetch allocation is a Host-only transaction. Every leaf receives the
-    // full target once. The resulting state vectors carry both the shared
-    // prefix and every successfully allocated destination; request
-    // construction turns that state directly into complete Store units.
-    for (const auto& [type, entry] : host_leaves) {
-      entry.leaf->allocate_for_prefetch(sequence, target_tokens);
-    }
-
-    StoragePrefetchRequest storage_request =
-        build_prefetch_request(sequence, combination);
-    auto storage_request_ptr = std::make_shared<const StoragePrefetchRequest>(
-        std::move(storage_request));
-
-    auto finalize = [this,
-                     request,
-                     sequence,
-                     dp_rank,
-                     base_tokens,
-                     combination,
-                     storage_request_ptr,
-                     finish_sequence](PrefetchSummary summary) mutable {
-      const bool transfer_ok =
-          storage_request_ptr->units.empty() ||
-          summary.gated_hits.size() == storage_request_ptr->units.size();
-      const bool publish =
-          transfer_ok && !request->finished() && !request->cancelled();
-      const size_t final_tokens = finalize_prefetch_tokens(
-          combination,
-          host_block_managers_[dp_rank]->leaf_entries(),
-          base_tokens,
-          summary);
-      finalize_prefetch(
-          sequence, host_block_managers_[dp_rank].get(), final_tokens, publish);
-      finish_sequence();
-    };
-
-    if (storage_request_ptr->units.empty()) {
-      PrefetchSummary summary;
-      finalize(std::move(summary));
-      continue;
-    }
-
-    CHECK(storage_request_ptr->valid());
-    CHECK(engine_ != nullptr) << "Mooncake prefetch requires an Engine.";
-    engine_->prefetch_from_storage(
-        dp_rank,
-        storage_request_ptr,
-        [request]() { return request->finished() || request->cancelled(); },
-        std::move(finalize));
+  const int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+  const auto* composite =
+      static_cast<const CompositeBlockManager*>(block_managers_[dp_rank].get());
+  const CompositeBlockManager::LeafCombination combination =
+      composite->leaf_combination();
+  auto* host_manager = host_block_managers_[dp_rank].get();
+  CHECK(host_manager);
+  const CompositeBlockManager::LeafMap& host_leaves =
+      host_manager->leaf_entries();
+  const size_t unit_size = prefetch_unit_size(combination, host_leaves);
+  const size_t max_prefix_tokens =
+      sequence->tokens().empty() ? 0 : sequence->tokens().size() - 1;
+  size_t cacheable_tokens = max_prefix_tokens;
+  for (const auto& [type, entry] : host_leaves) {
+    const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
+    const size_t block_size = entry.leaf->block_size();
+    const size_t hashable_tokens =
+        num_hash_blocks(hasher_type,
+                        sequence->hash_tokens(hasher_type).size(),
+                        block_size) *
+        block_size;
+    cacheable_tokens = std::min(cacheable_tokens, hashable_tokens);
   }
+  const size_t target_tokens = (cacheable_tokens / unit_size) * unit_size;
+
+  // Host admission owns the shared-prefix probe and cross-leaf trim. Keep
+  // that transaction in the composite so prefetch sees the same shared
+  // cursors as ordinary Host prefix-cache admission.
+  host_manager->allocate_shared_for_sequence(sequence,
+                                             sequence->host_kv_state());
+  // Composite admission has completed the physical shared probe, but the
+  // Host tier is not publishable until the Store callback validates the
+  // requested units. Keep the tier-match flag private to this transaction.
+  sequence->host_kv_state().set_prefix_cache_matched(false);
+  const size_t base_tokens = sequence->host_kv_state().kv_cache_tokens_num();
+
+  // Prefetch allocation is a Host-only transaction. Every leaf receives the
+  // full target once. The resulting state vectors carry both the shared
+  // prefix and every successfully allocated destination; request
+  // construction turns that state directly into complete Store units.
+  for (const auto& [type, entry] : host_leaves) {
+    entry.leaf->allocate_for_prefetch(sequence, target_tokens);
+  }
+
+  StoragePrefetchRequest storage_request =
+      build_prefetch_request(sequence, combination);
+  auto storage_request_ptr = std::make_shared<const StoragePrefetchRequest>(
+      std::move(storage_request));
+
+  auto finalize = [this,
+                   request,
+                   sequence,
+                   dp_rank,
+                   base_tokens,
+                   combination,
+                   storage_request_ptr,
+                   done = std::move(done)](PrefetchSummary summary) mutable {
+    const bool transfer_ok =
+        storage_request_ptr->units.empty() ||
+        summary.gated_hits.size() == storage_request_ptr->units.size();
+    const bool publish =
+        transfer_ok && !request->finished() && !request->cancelled();
+    const size_t final_tokens =
+        finalize_prefetch_tokens(combination,
+                                 host_block_managers_[dp_rank]->leaf_entries(),
+                                 base_tokens,
+                                 summary);
+    finalize_prefetch(
+        sequence, host_block_managers_[dp_rank].get(), final_tokens, publish);
+    done(std::move(request));
+    const size_t previous =
+        prefetching_requests_.fetch_sub(1, std::memory_order_acq_rel);
+    CHECK_GT(previous, 0u);
+  };
+
+  if (storage_request_ptr->units.empty()) {
+    finalize(PrefetchSummary{});
+    return;
+  }
+
+  CHECK(storage_request_ptr->valid());
+  CHECK(engine_ != nullptr) << "Mooncake prefetch requires an Engine.";
+  engine_->prefetch_from_storage(
+      dp_rank,
+      storage_request_ptr,
+      [request]() { return request->finished() || request->cancelled(); },
+      std::move(finalize));
 }
 
 void HierarchyBlockManagerPool::transfer_blocks(std::vector<Batch>& batches) {

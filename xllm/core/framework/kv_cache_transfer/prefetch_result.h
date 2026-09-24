@@ -23,6 +23,7 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -38,7 +39,8 @@ enum class PrefetchControl : uint8_t {
   STOP = 1,
 };
 
-struct PrefetchUnit final {
+class PrefetchUnit final {
+ public:
   std::vector<BlockTransferInfo> gated_blocks;
   std::vector<BlockTransferInfo> non_gated_blocks;
   // A unit may have an optional cache whose allocation failed. Keeping this
@@ -143,6 +145,11 @@ class PrefetchResult final {
   int64_t stream_idle_timeout_ms() const { return timeout_ms_; }
   size_t batch_wire_size() const { return batch_size_; }
   size_t batch_count() const { return request_.batch_count(batch_size_); }
+  void mark_worker_failed() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    failed_ = true;
+    continue_prefetch_->store(false, std::memory_order_release);
+  }
 
   size_t batch_unit_count(size_t worker_index) const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -160,6 +167,7 @@ class PrefetchResult final {
       const std::vector<uint8_t>& non_gated_hits) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (worker_index >= workers_.size()) {
+      continue_prefetch_->store(false, std::memory_order_release);
       return std::nullopt;
     }
     WorkerProgress& worker = workers_[worker_index];
@@ -167,6 +175,7 @@ class PrefetchResult final {
         worker.batch_index >= batch_count() ||
         gated_hits.size() != batch_size_ ||
         non_gated_hits.size() != batch_size_) {
+      continue_prefetch_->store(false, std::memory_order_release);
       return std::nullopt;
     }
     const size_t begin =
@@ -181,20 +190,12 @@ class PrefetchResult final {
         non_gated_hits.begin() + static_cast<std::ptrdiff_t>(count),
         worker.non_gated_hits.begin() + static_cast<std::ptrdiff_t>(begin));
 
-    bool gate_miss = false;
+    bool gated_complete = true;
     for (size_t index = 0; index < count; ++index) {
-      gate_miss = gate_miss || gated_hits[index] == 0;
+      gated_complete = gated_complete && gated_hits[index] != 0;
     }
-    if (gate_miss) {
-      gate_stop_.store(true, std::memory_order_release);
-    }
-
-    const bool last_batch = worker.batch_index + 1 == batch_count();
-    const bool timed_out =
-        timeout_ms_ > 0 && timer_.elapsed_milliseconds() >= timeout_ms_;
-    const bool stopped = gate_stop_.load(std::memory_order_acquire) ||
-                         timed_out || stop_requested_();
-    if (gate_miss || last_batch || stopped || failed_) {
+    const bool has_next_batch = worker.batch_index + 1 < batch_count();
+    if (!should_continue_prefetch(gated_complete, has_next_batch)) {
       worker.state = WorkerState::WAITING_CLOSE;
       return PrefetchControl::STOP;
     }
@@ -214,7 +215,7 @@ class PrefetchResult final {
     return record_batch_result(worker_index, gated, optional);
   }
 
-  void mark_worker_ended(size_t worker_index, bool worker_ok) {
+  void mark_worker_ended(size_t worker_index) {
     DoneCallback done;
     PrefetchSummary summary;
     {
@@ -224,33 +225,41 @@ class PrefetchResult final {
       if (worker.state == WorkerState::ENDED) {
         return;
       }
-      if (!worker_ok) {
+      if (worker.state != WorkerState::WAITING_CLOSE) {
         failed_ = true;
+        continue_prefetch_->store(false, std::memory_order_release);
       }
       worker.state = WorkerState::ENDED;
       CHECK_GT(remaining_workers_, 0u);
       --remaining_workers_;
-      if (remaining_workers_ != 0) {
-        return;
-      }
-
-      summary.gated_hits.assign(request_.unit_count(), 1);
-      summary.non_gated_hits.assign(request_.unit_count(), 1);
-      for (const WorkerProgress& progress : workers_) {
-        for (size_t index = 0; index < request_.unit_count(); ++index) {
-          summary.gated_hits[index] =
-              summary.gated_hits[index] && progress.gated_hits[index];
-          summary.non_gated_hits[index] =
-              summary.non_gated_hits[index] && progress.non_gated_hits[index];
+      if (remaining_workers_ == 0) {
+        summary.gated_hits.assign(request_.unit_count(), 1);
+        summary.non_gated_hits.assign(request_.unit_count(), 1);
+        for (const WorkerProgress& progress : workers_) {
+          for (size_t index = 0; index < request_.unit_count(); ++index) {
+            summary.gated_hits[index] =
+                summary.gated_hits[index] && progress.gated_hits[index];
+            summary.non_gated_hits[index] =
+                summary.non_gated_hits[index] && progress.non_gated_hits[index];
+          }
         }
+        if (failed_) {
+          summary.gated_hits.clear();
+          summary.non_gated_hits.clear();
+        }
+        done = std::move(done_);
       }
-      if (failed_) {
-        summary.gated_hits.clear();
-        summary.non_gated_hits.clear();
-      }
-      done = std::move(done_);
     }
-    done(std::move(summary));
+    if (done != nullptr) {
+      done(std::move(summary));
+    }
+  }
+
+  void mark_worker_ended(size_t worker_index, bool worker_ok) {
+    if (!worker_ok) {
+      mark_worker_failed();
+    }
+    mark_worker_ended(worker_index);
   }
 
  private:
@@ -267,6 +276,16 @@ class PrefetchResult final {
     std::vector<uint8_t> non_gated_hits;
   };
 
+  bool should_continue_prefetch(bool gated_complete, bool has_next_batch) {
+    const bool timed_out =
+        timeout_ms_ > 0 && timer_.elapsed_milliseconds() >= timeout_ms_;
+    if (!gated_complete || timed_out || stop_requested_()) {
+      continue_prefetch_->store(false, std::memory_order_release);
+    }
+    return gated_complete && has_next_batch &&
+           continue_prefetch_->load(std::memory_order_acquire);
+  }
+
   mutable std::mutex mutex_;
   std::vector<WorkerProgress> workers_;
   size_t remaining_workers_ = 0;
@@ -277,7 +296,8 @@ class PrefetchResult final {
   DoneCallback done_;
   Timer timer_;
   bool failed_ = false;
-  std::atomic_bool gate_stop_{false};
+  std::shared_ptr<std::atomic_bool> continue_prefetch_ =
+      std::make_shared<std::atomic_bool>(true);
 };
 
 }  // namespace xllm

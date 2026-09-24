@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 
 #include "common/global_flags.h"
 
@@ -443,11 +444,9 @@ class ClientStreamReceiver final : public brpc::StreamInputHandler {
  private:
   std::shared_ptr<PrefetchResult> result_;
   size_t worker_index_ = 0;
-  bool stop_sent_ = false;
-  bool failed_ = false;
 
   void fail_and_close(brpc::StreamId id) {
-    failed_ = true;
+    result_->mark_worker_failed();
     brpc::StreamClose(id);
   }
 
@@ -456,12 +455,12 @@ class ClientStreamReceiver final : public brpc::StreamInputHandler {
     butil::IOBuf response;
     response.append(&control_byte, sizeof(control_byte));
     if (brpc::StreamWrite(id, response) == 0) {
-      stop_sent_ = control == PrefetchControl::STOP;
       return true;
     }
     LOG(ERROR) << "Failed to write Mooncake prefetch decision: worker="
                << worker_index_;
-    fail_and_close(id);
+    result_->mark_worker_failed();
+    brpc::StreamClose(id);
     return false;
   }
 
@@ -488,12 +487,6 @@ class ClientStreamReceiver final : public brpc::StreamInputHandler {
       fail_and_close(id);
       return -1;
     }
-    if (stop_sent_) {
-      LOG(ERROR) << "Mooncake prefetch continued after stop: worker="
-                 << worker_index_;
-      fail_and_close(id);
-      return -1;
-    }
 
     std::vector<uint8_t> gated_hits(batch_size);
     std::vector<uint8_t> non_gated_hits(batch_size);
@@ -514,22 +507,16 @@ class ClientStreamReceiver final : public brpc::StreamInputHandler {
     return 0;
   }
 
-  void on_idle_timeout(brpc::StreamId id) override {
-    if (stop_sent_) {
-      brpc::StreamClose(id);
-      return;
-    }
-    fail_and_close(id);
-  }
+  void on_idle_timeout(brpc::StreamId id) override { fail_and_close(id); }
 
   void on_failed(brpc::StreamId /*id*/,
                  int /*error_code*/,
                  const std::string& /*error_text*/) override {
-    failed_ = true;
+    result_->mark_worker_failed();
   }
 
   void on_closed(brpc::StreamId /*id*/) override {
-    result_->mark_worker_ended(worker_index_, stop_sent_ && !failed_);
+    result_->mark_worker_ended(worker_index_);
     delete this;
   }
 };
@@ -564,6 +551,7 @@ void CommChannel::prefetch_from_storage(const StoragePrefetchRequest& request,
   if (cntl.Failed() || !response.ok()) {
     LOG(ERROR) << "Failed to connect Mooncake prefetch stream: "
                << cntl.ErrorText();
+    result->mark_worker_failed();
     brpc::StreamClose(stream_id);
   }
 }

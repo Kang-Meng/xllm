@@ -1035,9 +1035,60 @@ TEST_F(HostKVCacheConfigTest, AcceptsKVCacheStoreOnDisaggregatedDecode) {
   options.supports_host_kv_offload = true;
   options.enable_disagg_pd = true;
   options.enable_kvcache_store = true;
+  options.enable_prefix_cache = false;
   options.instance_role = InstanceRole::DECODE;
 
   EXPECT_FALSE(validate_host_cache_options(options).has_value());
+}
+
+TEST_F(HostKVCacheConfigTest,
+       RejectsKVCacheStoreOnDisaggregatedLinearDecodeWithoutPrefixCache) {
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.enable_disagg_pd = true;
+  options.enable_kvcache_store = true;
+  options.enable_prefix_cache = false;
+  options.instance_role = InstanceRole::DECODE;
+  options.has_conv_cache_shape = true;
+  options.has_ssm_cache_shape = true;
+
+  const std::optional<std::string> error = validate_host_cache_options(options);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error->find("prefix caching is disabled"), std::string::npos);
+}
+
+TEST_F(HostKVCacheConfigTest,
+       RejectsDisabledPrefixCacheOnDisaggregatedDecodeWithoutStore) {
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.enable_disagg_pd = true;
+  options.enable_prefix_cache = false;
+  options.instance_role = InstanceRole::DECODE;
+
+  const std::optional<std::string> error = validate_host_cache_options(options);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error->find("prefix caching is disabled"), std::string::npos);
+}
+
+TEST_F(HostKVCacheConfigTest,
+       RejectsDisabledPrefixCacheOutsideDisaggregatedDecode) {
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.enable_kvcache_store = true;
+  options.enable_prefix_cache = false;
+
+  const std::optional<std::string> error = validate_host_cache_options(options);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error->find("prefix caching is disabled"), std::string::npos);
 }
 
 TEST_F(HostKVCacheConfigTest, AcceptsDisaggregatedDecodeInstance) {
@@ -1186,7 +1237,7 @@ TEST_F(HostKVCacheConfigTest, AcceptsLinearAttentionCachesForAnyModel) {
   }
 }
 
-TEST_F(HostKVCacheConfigTest, RejectsLinearAttentionKVCacheStore) {
+TEST_F(HostKVCacheConfigTest, AcceptsLinearAttentionKVCacheStore) {
   HostCacheValidationOptions options;
   options.host_blocks_factor = 2.0;
   options.device_block_count = 128;
@@ -1196,10 +1247,7 @@ TEST_F(HostKVCacheConfigTest, RejectsLinearAttentionKVCacheStore) {
   options.has_ssm_cache_shape = true;
   options.model_type = "qwen3_5";
 
-  const std::optional<std::string> error = validate_host_cache_options(options);
-
-  ASSERT_TRUE(error.has_value());
-  EXPECT_NE(error->find("do not support KV cache Store"), std::string::npos);
+  EXPECT_FALSE(validate_host_cache_options(options).has_value());
 }
 
 TEST_F(HostKVCacheConfigTest, RejectsPartialLinearAttentionCache) {
