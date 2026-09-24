@@ -25,6 +25,7 @@ limitations under the License.
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
@@ -44,6 +45,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "models/model_registry.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
@@ -51,6 +53,7 @@ limitations under the License.
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/mtp_async_input_builder.h"
+#include "core/framework/speculative/mtp_async_replay_builder.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/spec_verify.h"
@@ -315,13 +318,33 @@ torch::Tensor clone_host_tensor(const torch::Tensor& tensor) {
   return tensor.contiguous().clone();
 }
 
+torch::Tensor clone_host_block_table(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return tensor;
+  }
+  CHECK(tensor.device().is_cpu()) << "expected a CPU host tensor";
+  if (tensor.layout() == torch::kStrided && tensor.dim() == 2 &&
+      tensor.scalar_type() == torch::kInt32 && tensor.is_contiguous() &&
+      !tensor.is_neg() && !tensor.is_conj()) {
+    // Keep an independent snapshot without launching an ATen parallel copy
+    // team on every TP rank. Match clone's non-pinned CPU allocation.
+    torch::Tensor snapshot =
+        torch::empty(tensor.sizes(), tensor.options().pinned_memory(false));
+    if (tensor.numel() != 0) {
+      std::memcpy(snapshot.data_ptr(), tensor.data_ptr(), tensor.nbytes());
+    }
+    return snapshot;
+  }
+  return clone_host_tensor(tensor);
+}
+
 void stabilize_decode_host_tensors(ForwardInput& input) {
   input.token_ids_host = clone_host_tensor(input.token_ids_host);
   input.positions_host = clone_host_tensor(input.positions_host);
   input.input_params.attention.host.block_tables =
-      clone_host_tensor(input.input_params.attention.host.block_tables);
+      clone_host_block_table(input.input_params.attention.host.block_tables);
   for (torch::Tensor& block_table : input.input_params.multi_block_tables) {
-    block_table = clone_host_tensor(block_table);
+    block_table = clone_host_block_table(block_table);
   }
 }
 
@@ -482,14 +505,6 @@ ParallelArgs mtp_draft_parallel_args(const ParallelArgs& parallel_args,
   draft_args.moe_ep_group_ = parallel_args.single_rank_group_;
   draft_args.moe_tp_group_ = parallel_args.single_rank_group_;
   return draft_args;
-}
-
-// The GLM-5.3-Flash python MTP draft checkpoint carries its own embed_tokens /
-// lm_head copies (the exporter materializes them), so it needs no
-// target->draft weight sharing (the python CausalLM set_lm_head path is not
-// implemented for PyCausalLM).
-bool is_glm5_next_mtp_draft_model_type(const std::string& model_type) {
-  return model_type == "glm5_next_mtp";
 }
 
 }  // namespace
@@ -828,10 +843,16 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
         model_weights_path, random_seed, master_status);
   }
 
-  if (impl_ != nullptr && impl_->get_status() == WorkerImpl::Status::LOADED) {
+  if (!result) {
+    return false;
+  }
+
+  if (impl_ != nullptr &&
+      impl_->get_status() != WorkerImpl::Status::UNINITIALIZED) {
     context_ = impl_->context_;
     target_spec_verify_mode_ = mtp_async::classify_target_spec_verify_mode(
-        context_.get_model_args().model_type());
+        context_.get_model_args().model_type(),
+        ModelConfig::is_python_model_impl(context_.get_model_impl()));
     if (requires_uniform_validate_width()) {
       adaptive_spec_controller_.reset();
     }
@@ -843,15 +864,27 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
         draft_impl_->context_.get_model_args().model_type();
     combined_draft_execution_path_ =
         mtp_async::classify_combined_draft_execution_path(draft_model_type);
+    std::string resolved_draft_model_name;
+    std::string error_message;
+    CHECK(resolve_model_registration_name(
+        draft_model_type, &resolved_draft_model_name, &error_message))
+        << error_message;
+    const MtpModelCapabilities draft_capabilities =
+        ModelRegistry::get_mtp_capabilities(resolved_draft_model_name);
+    const bool is_python_draft = ModelConfig::is_python_model_impl(
+        draft_impl_->context_.get_model_impl());
+    const bool native_draft_owns_shared_weights =
+        draft_impl_->loaded_vocab_weights().value_or(
+            draft_capabilities.native_draft_owns_embedding_and_lm_head);
     const bool draft_owns_shared_weights =
         (options_.enable_mtp_draft_body_tp1() &&
          combined_draft_execution_path_ ==
              mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION) ||
-        is_glm5_next_mtp_draft_model_type(draft_model_type) ||
-        draft_model_type == "deepseek_v4_mtp";
-    // Qwen3.5, GLM-5.3-Flash, and DeepSeek-V4 draft checkpoints contain
-    // complete embedding and LMHead weights. Keep those trained endpoints;
-    // replacing them with the target endpoints changes draft logits.
+        (is_python_draft
+             ? draft_capabilities.python_draft_owns_embedding_and_lm_head
+             : native_draft_owns_shared_weights);
+    // Python ownership remains registry-declared; native MLU ownership comes
+    // from the weights loaded by the draft checkpoint.
     if (!draft_owns_shared_weights) {
       const bool python_weights_shared =
           draft_impl_->share_weights_from(*impl_);
@@ -895,6 +928,10 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
         << "Expanded MTP verify requires the NPU Torch backend";
   }
 #endif
+  if (impl_->get_status() != WorkerImpl::Status::UNINITIALIZED &&
+      draft_impl_->get_status() != WorkerImpl::Status::UNINITIALIZED) {
+    init_draft_context_policy();
+  }
   return result;
 }
 
@@ -990,17 +1027,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_worker_no_sync(
 }
 
 bool MTPWorkerImpl::supports_expanded_spec_verify() const {
-  return mtp_async::supports_expanded_spec_verify(
-      target_spec_verify_mode_,
-      ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl()));
+  return target_spec_verify_mode_ ==
+         mtp_async::TargetSpecVerifyMode::EXPANDED_VERIFY;
 }
 
 bool MTPWorkerImpl::supports_explicit_spec_verify_replay_update() const {
   return mtp_async::supports_native_spec_verify_replay_update(
       target_spec_verify_mode_,
-      ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl()));
+      ModelConfig::is_python_model_impl(context_.get_model_impl()));
 }
 
 bool MTPWorkerImpl::requires_uniform_validate_width() const {
@@ -1012,9 +1046,8 @@ bool MTPWorkerImpl::requires_uniform_validate_width() const {
   // [sequence, validate_width] table, so every sequence must use the same
   // width. Keep this model capability check platform-independent; the
   // checkpoint allocation itself remains NPU-specific.
-  return supports_expanded_spec_verify() &&
-         mtp_async::requires_uniform_spec_verify(
-             context_.get_model_args().model_type());
+  return mtp_async::requires_uniform_spec_verify(
+      context_.get_model_args().model_type());
 }
 
 int32_t MTPWorkerImpl::preserve_checkpoint_validate_width(
@@ -1162,6 +1195,60 @@ bool MTPWorkerImpl::uses_speculative_linear_state_checkpoints() const {
 #endif
 }
 
+void MTPWorkerImpl::init_draft_context_policy() {
+  std::string resolved_draft_model_name;
+  std::string error_message;
+  CHECK(resolve_model_registration_name(
+      draft_impl_->context_.get_model_args().model_type(),
+      &resolved_draft_model_name,
+      &error_message))
+      << error_message;
+  const MtpModelCapabilities capabilities =
+      ModelRegistry::get_mtp_capabilities(resolved_draft_model_name);
+  const DraftContextUpdate update =
+      capabilities.supports_accepted_span_replay
+          ? DraftContextUpdate::ACCEPTED_SPAN_REPLAY
+          : DraftContextUpdate::TAIL_EXTEND;
+  const bool is_python_target =
+      ModelConfig::is_python_model_impl(context_.get_model_impl());
+  const bool is_python_draft =
+      ModelConfig::is_python_model_impl(draft_impl_->context_.get_model_impl());
+  CHECK(mtp_async::is_draft_context_update_compatible(
+      target_spec_verify_mode_,
+      update,
+      context_.get_model_args().model_type(),
+      is_python_target,
+      draft_impl_->context_.get_model_args().model_type(),
+      is_python_draft,
+      uses_embedded_eagle3_draft()))
+      << "Incompatible draft context update: target="
+      << context_.get_model_args().model_type()
+      << ", verify_mode=" << static_cast<int32_t>(target_spec_verify_mode_)
+      << ", draft=" << draft_impl_->context_.get_model_args().model_type()
+      << ", update=" << static_cast<int32_t>(update);
+  const auto replay_policy = mtp_async::draft_context_replay_semantics(
+      update, options_.num_speculative_tokens());
+  if (draft_context_replay_policy_.has_value()) {
+    CHECK_EQ(draft_context_replay_policy_->full_target_replay,
+             replay_policy.full_target_replay)
+        << "Draft context update policy changed after initialization.";
+    CHECK_EQ(draft_context_replay_policy_->target_expansion_width,
+             replay_policy.target_expansion_width)
+        << "Draft context update policy changed after initialization.";
+    CHECK_EQ(draft_context_replay_policy_->draft_position_offset,
+             replay_policy.draft_position_offset)
+        << "Draft context update policy changed after initialization.";
+    return;
+  }
+  draft_context_replay_policy_ = replay_policy;
+}
+
+bool MTPWorkerImpl::requires_full_target_replay() const {
+  CHECK(draft_context_replay_policy_.has_value())
+      << "Draft context replay policy is not initialized.";
+  return draft_context_replay_policy_->full_target_replay;
+}
+
 ForwardInput
 MTPWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
     ForwardInput& inputs) {
@@ -1217,18 +1304,21 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     draft_outputs.reserve(options_.num_speculative_tokens());
 
     ForwardInput new_input = input;
+    CHECK(draft_context_replay_policy_.has_value())
+        << "Draft context replay policy is not initialized.";
+    const int32_t extend_width =
+        draft_context_replay_policy_->target_expansion_width;
     for (int32_t& token_num :
          new_input.input_params.parallel.dp_global_token_nums) {
-      token_num *= 2;
+      token_num *= extend_width;
     }
     for (int32_t& token_num :
          new_input.input_params.parallel.raw_dp_global_token_nums) {
-      token_num *= 2;
+      token_num *= extend_width;
     }
     new_input.input_params.expert.eplb_decode_token_mask =
         eplb::expand_decode_token_mask(
-            new_input.input_params.expert.eplb_decode_token_mask,
-            /*tokens_per_row=*/2);
+            new_input.input_params.expert.eplb_decode_token_mask, extend_width);
     if (use_prelaunched_first_draft) {
       draft_outputs.emplace_back(
           std::move(pending_draft_context_.output.value()));
@@ -3689,6 +3779,90 @@ void MTPWorkerImpl::prepare_validate_inputs(
   finish_metadata_prepare(*prepare_stream_, validate_input);
 }
 
+void MTPWorkerImpl::prepare_draft_replay_inputs(
+    const ForwardInput& base_input,
+    const std::vector<EmbeddingCache::DecodeState>& last_states,
+    ForwardInput& extend_input) {
+  // Called on the prepare stream after waiting for target context writes.
+  const bool dp_enabled = parallel_args_.dp_size() > 1;
+  CHECK(draft_context_replay_policy_.has_value())
+      << "Draft context replay policy is not initialized.";
+  const int32_t uniform_width =
+      draft_context_replay_policy_->target_expansion_width;
+  mtp_async::DraftReplayInputPlan plan =
+      mtp_async::build_draft_replay_input_plan(
+          base_input,
+          last_states,
+          embedding_cache_->embedding_placeholder(),
+          options_.block_size() * parallel_args_.kv_split_size_effective(),
+          uniform_width,
+          extend_input.input_params.meta.is_graph_warmup);
+  auto& input_params = extend_input.input_params;
+  const int32_t num_sequences = input_params.meta.num_sequences;
+  auto& rows = plan.rows;
+  const int32_t num_rows = static_cast<int32_t>(rows.out_positions.size());
+  specBuilder::set_token_position_tensors(extend_input,
+                                          rows.out_token_ids,
+                                          rows.out_positions,
+                                          base_input.token_ids.options(),
+                                          base_input.positions.options());
+  input_params.meta.num_sequences = num_rows;
+  input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  input_params.is_spec_verify = false;
+  input_params.attention.host.kpool_query_lens = plan.kpool_query_lens;
+  input_params.attn_metadata.reset();
+  specBuilder::update_input_params(input_params,
+                                   rows,
+                                   /*q_max_seq_len=*/1,
+                                   std::move(rows.out_q_seq_lens),
+                                   std::move(rows.out_q_cu_seq_lens),
+                                   rows.meta.kv_max_seq_len,
+                                   std::move(rows.out_kv_seq_lens),
+                                   /*update_block_tables=*/true);
+  input_params.attention.rebuild_device_buffer(device_);
+  for (auto& embedding : plan.embeddings) {
+    embedding = embedding.to(device_);
+  }
+  input_params.embedding.input_embedding = torch::stack(plan.embeddings);
+
+  for (auto* counts : {&input_params.parallel.dp_global_token_nums,
+                       &input_params.parallel.raw_dp_global_token_nums}) {
+    if (dp_enabled) {
+      for (int32_t& count : *counts) {
+        count *= uniform_width;
+      }
+    } else if (counts->size() == 1) {
+      counts->front() = num_rows;
+    }
+  }
+  auto& mask = input_params.expert.eplb_decode_token_mask;
+  if (dp_enabled) {
+    mask = eplb::expand_decode_token_mask(mask, uniform_width);
+  } else if (mask.defined()) {
+    auto source_rows =
+        torch::tensor(plan.source_sequences, torch::dtype(torch::kLong))
+            .to(mask.device());
+    auto valid_rows = torch::tensor(plan.valid_rows, torch::dtype(torch::kInt))
+                          .to(mask.options());
+    mask = mask.reshape({-1}).index_select(0, source_rows) * valid_rows;
+  }
+  auto& sampling = extend_input.sampling_params;
+  const auto idx_options = sampling.selected_token_idxes.defined()
+                               ? sampling.selected_token_idxes.options()
+                               : torch::dtype(torch::kInt).device(device_);
+  sampling.selected_token_idxes =
+      safe_to(specBuilder::make_cpu_int_tensor(plan.selected_rows),
+              idx_options,
+              /*non_blocking=*/true);
+  if (!sampling.sample_idxes.defined()) {
+    sampling.sample_idxes = torch::arange(num_sequences, idx_options);
+  }
+  extend_input.device_tensors_ready = true;
+  check_draft_input_embedding(
+      extend_input.input_params.embedding.input_embedding, "target replay");
+  finish_metadata_prepare(*prepare_stream_, extend_input);
+}
+
 void MTPWorkerImpl::prepare_draft_extend_inputs(
     const ForwardInput& base_input,
     const std::vector<EmbeddingCache::DecodeState>& last_states,
@@ -3705,6 +3879,10 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   prepare_draft_sampling(extend_input.sampling_params);
   clear_ready_events(extend_input);
   extend_input.device_tensors_ready = false;
+  if (requires_full_target_replay()) {
+    prepare_draft_replay_inputs(base_input, last_states, extend_input);
+    return;
+  }
   auto& input_params = extend_input.input_params;
   const int32_t num_sequences = input_params.meta.num_sequences;
 
@@ -3987,6 +4165,15 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
                                          int32_t position_offset) {
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   draft_input = input;
+  if (requires_full_target_replay()) {
+    // The first proposal used the target hidden at current_position - 1.
+    // Recursive proposals advance from that draft position; target validation
+    // continues to use the unshifted input template.
+    CHECK(draft_context_replay_policy_.has_value())
+        << "Draft context replay policy is not initialized.";
+    position_offset += draft_context_replay_policy_->draft_position_offset;
+    draft_input.input_params.attn_metadata.reset();
+  }
   prepare_draft_sampling(draft_input.sampling_params);
   clear_ready_events(draft_input);
   draft_input.device_tensors_ready = false;

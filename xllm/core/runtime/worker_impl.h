@@ -288,6 +288,10 @@ class WorkerImpl {
     return model_->share_weights_from(*source.model_);
   }
 
+  std::optional<bool> loaded_vocab_weights() {
+    return model_->loaded_vocab_weights();
+  }
+
   bool enable_schedule_overlap() const {
     return options_.enable_schedule_overlap_;
   }

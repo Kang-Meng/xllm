@@ -307,6 +307,14 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
     model_->set_word_embedding(word_embedding);
   }
 
+  bool has_loaded_vocab_weights() {
+    if (!model_->get_word_embedding()->is_weight_loaded()) {
+      return false;
+    }
+    return embedding_mode_ ||
+           (!lm_head_.is_empty() && lm_head_->is_weight_loaded());
+  }
+
  protected:
   // parameter members, must be registered
   LlmModelType model_{nullptr};

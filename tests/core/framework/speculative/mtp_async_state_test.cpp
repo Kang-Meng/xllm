@@ -21,60 +21,66 @@ limitations under the License.
 #include <utility>
 
 #include "core/framework/model/model_input_params.h"
+#include "core/framework/speculative/mtp_execution_policy.h"
 
 namespace xllm::mtp_async {
 namespace {
 
 TEST(MtpAsyncStateTest, ClassifiesClosedTargetSpecVerifyPolicy) {
-  const std::pair<std::string_view, TargetSpecVerifyMode> test_cases[] = {
-      {"qwen3_5", TargetSpecVerifyMode::EXPANDED_VERIFY},
-      {"qwen3_5_moe", TargetSpecVerifyMode::EXPANDED_VERIFY},
-      {"qwen3_5_text", TargetSpecVerifyMode::EXPANDED_VERIFY},
-      {"qwen3_5_moe_text", TargetSpecVerifyMode::EXPANDED_VERIFY},
-      {"deepseek_v32", TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY},
-      {"deepseek_v4", TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY},
-      {"deepseek_v4_dspark", TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY},
-      {"mimo", TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL},
-      {"glm5_next", TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY},
-      {"glm5_3_flash", TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY},
-      {"glm5_next_mtp", TargetSpecVerifyMode::GENERIC},
-      {"qwen3_next", TargetSpecVerifyMode::GENERIC},
-      {"qwen3_5_mtp", TargetSpecVerifyMode::GENERIC},
-      {"qwen3_5_moe_mtp", TargetSpecVerifyMode::GENERIC},
-      {"glm_moe_dsa", TargetSpecVerifyMode::GENERIC},
-      {"mimo_mtp", TargetSpecVerifyMode::GENERIC},
-      {"unknown_model", TargetSpecVerifyMode::GENERIC},
+  struct TestCase {
+    std::string_view model_type;
+    TargetSpecVerifyMode native_mode;
+    TargetSpecVerifyMode python_mode;
   };
-
-  for (const auto& [model_type, expected] : test_cases) {
-    EXPECT_EQ(classify_target_spec_verify_mode(model_type), expected)
-        << "model_type=" << model_type;
-  }
-}
-
-TEST(MtpAsyncStateTest, RestrictsExpandedVerifyToSupportedExecutors) {
-  for (bool is_python_model : {false, true}) {
-    EXPECT_TRUE(supports_expanded_spec_verify(
-        TargetSpecVerifyMode::EXPANDED_VERIFY, is_python_model));
-    EXPECT_EQ(
-        supports_expanded_spec_verify(
-            TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY, is_python_model),
-        is_python_model);
-    EXPECT_FALSE(supports_expanded_spec_verify(TargetSpecVerifyMode::GENERIC,
-                                               is_python_model));
-    EXPECT_FALSE(supports_expanded_spec_verify(
-        TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL, is_python_model));
+  using Mode = TargetSpecVerifyMode;
+  const TestCase test_cases[] = {
+      {"qwen3_5", Mode::EXPANDED_VERIFY, Mode::EXPANDED_VERIFY},
+      {"qwen3_5_moe", Mode::EXPANDED_VERIFY, Mode::EXPANDED_VERIFY},
+      {"qwen3_5_text", Mode::EXPANDED_VERIFY, Mode::EXPANDED_VERIFY},
+      {"qwen3_5_moe_text", Mode::EXPANDED_VERIFY, Mode::EXPANDED_VERIFY},
+      {"deepseek_v32", Mode::GENERIC, Mode::EXPANDED_VERIFY},
+      {"deepseek_v4", Mode::GENERIC, Mode::EXPANDED_VERIFY},
+      {"deepseek_v4_dspark", Mode::GENERIC, Mode::EXPANDED_VERIFY},
+      {"mimo", Mode::CAUSAL_CHUNKED_PREFILL, Mode::CAUSAL_CHUNKED_PREFILL},
+      {"glm5_next", Mode::CAUSAL_CHUNKED_PREFILL, Mode::EXPANDED_VERIFY},
+      {"glm5_3_flash", Mode::CAUSAL_CHUNKED_PREFILL, Mode::EXPANDED_VERIFY},
+      {"glm5_next_text", Mode::CAUSAL_CHUNKED_PREFILL, Mode::EXPANDED_VERIFY},
+      {"glm5_next_mtp", Mode::GENERIC, Mode::GENERIC},
+      {"qwen3_next", Mode::GENERIC, Mode::GENERIC},
+      {"qwen3_5_mtp", Mode::GENERIC, Mode::GENERIC},
+      {"qwen3_5_moe_mtp", Mode::GENERIC, Mode::GENERIC},
+      {"glm_moe_dsa", Mode::GENERIC, Mode::GENERIC},
+      {"mimo_mtp", Mode::GENERIC, Mode::GENERIC},
+      {"unknown_model", Mode::GENERIC, Mode::GENERIC},
+  };
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(test_case.model_type);
+    EXPECT_EQ(classify_target_spec_verify_mode(test_case.model_type,
+                                               /*is_python_model=*/false),
+              test_case.native_mode);
+    EXPECT_EQ(classify_target_spec_verify_mode(test_case.model_type,
+                                               /*is_python_model=*/true),
+              test_case.python_mode);
   }
 }
 
 TEST(MtpAsyncStateTest, RequiresUniformVerifyWidthsForRecurrentTargets) {
-  for (std::string_view model_type :
-       {"qwen3_5", "qwen3_5_moe", "glm5_next", "glm5_3_flash"}) {
-    EXPECT_TRUE(requires_uniform_spec_verify(model_type));
+  for (std::string_view model_type : {"qwen3_5",
+                                      "qwen3_5_moe",
+                                      "qwen3_5_text",
+                                      "qwen3_5_moe_text",
+                                      "glm5_next",
+                                      "glm5_3_flash",
+                                      "glm5_next_text"}) {
+    EXPECT_TRUE(requires_uniform_spec_verify(model_type)) << model_type;
   }
-  for (std::string_view model_type :
-       {"deepseek_v32", "deepseek_v4", "glm5_next_mtp", "unknown_model"}) {
-    EXPECT_FALSE(requires_uniform_spec_verify(model_type));
+  for (std::string_view model_type : {"deepseek_v32",
+                                      "deepseek_v4",
+                                      "mimo",
+                                      "glm5_next_mtp",
+                                      "qwen3_5_mtp",
+                                      "unknown_model"}) {
+    EXPECT_FALSE(requires_uniform_spec_verify(model_type)) << model_type;
   }
 }
 
@@ -82,11 +88,42 @@ TEST(MtpAsyncStateTest, RestrictsFusedVerifyTokenUpdateToNativeExecutors) {
   for (TargetSpecVerifyMode mode :
        {TargetSpecVerifyMode::GENERIC,
         TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
-        TargetSpecVerifyMode::EXPANDED_VERIFY,
-        TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY}) {
+        TargetSpecVerifyMode::EXPANDED_VERIFY}) {
     EXPECT_FALSE(supports_native_spec_verify_replay_update(mode, true));
     EXPECT_EQ(supports_native_spec_verify_replay_update(mode, false),
               mode == TargetSpecVerifyMode::EXPANDED_VERIFY);
+  }
+}
+
+TEST(MtpAsyncStateTest, RestrictsAcceptedSpanReplayToNativeGlm5Pairs) {
+  for (std::string_view target :
+       {"glm5_next", "glm5_3_flash", "glm5_next_text"}) {
+    EXPECT_TRUE(supports_accepted_span_replay(target,
+                                              /*is_python_target=*/false,
+                                              "glm5_next_mtp",
+                                              /*is_python_draft=*/false));
+    EXPECT_FALSE(supports_accepted_span_replay(target,
+                                               /*is_python_target=*/true,
+                                               "glm5_next_mtp",
+                                               /*is_python_draft=*/false));
+    EXPECT_FALSE(supports_accepted_span_replay(target,
+                                               /*is_python_target=*/false,
+                                               "glm5_next_mtp",
+                                               /*is_python_draft=*/true));
+    for (std::string_view draft :
+         {"qwen3_5_mtp", "mimo_mtp", "unknown_model"}) {
+      EXPECT_FALSE(supports_accepted_span_replay(target,
+                                                 /*is_python_target=*/false,
+                                                 draft,
+                                                 /*is_python_draft=*/false));
+    }
+  }
+  for (std::string_view target :
+       {"mimo", "qwen3_5", "deepseek_v4", "glm5_next_mtp", "unknown_model"}) {
+    EXPECT_FALSE(supports_accepted_span_replay(target,
+                                               /*is_python_target=*/false,
+                                               "glm5_next_mtp",
+                                               /*is_python_draft=*/false));
   }
 }
 
@@ -346,6 +383,47 @@ TEST(MtpAsyncStateTest, BuildsLaterDraftMetadataFromAcceptedDeviceBase) {
   EXPECT_TRUE(torch::equal(
       map_positions_to_cache_slots(block_tables, positions, /*block_size=*/4),
       torch::tensor({45, 89}, torch::kInt)));
+}
+
+TEST(MtpAsyncStateTest, KeepsReplaySemanticsTogether) {
+  const DraftContextReplaySemantics tail =
+      draft_context_replay_semantics(DraftContextUpdate::TAIL_EXTEND, 4);
+  EXPECT_FALSE(tail.full_target_replay);
+  EXPECT_EQ(tail.target_expansion_width, 2);
+  EXPECT_EQ(tail.draft_position_offset, 0);
+
+  const DraftContextReplaySemantics replay = draft_context_replay_semantics(
+      DraftContextUpdate::ACCEPTED_SPAN_REPLAY, 4);
+  EXPECT_TRUE(replay.full_target_replay);
+  EXPECT_EQ(replay.target_expansion_width, 5);
+  EXPECT_EQ(replay.draft_position_offset, -1);
+}
+
+TEST(MtpAsyncStateTest, ValidatesReplayAgainstTargetAndDraftCapabilities) {
+  EXPECT_TRUE(is_draft_context_update_compatible(
+      TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
+      DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+      "glm5_next",
+      /*is_python_target=*/false,
+      "glm5_next_mtp",
+      /*is_python_draft=*/false,
+      /*uses_embedded_eagle3=*/false));
+  EXPECT_FALSE(is_draft_context_update_compatible(
+      TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
+      DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+      "glm5_next",
+      /*is_python_target=*/false,
+      "glm5_next_mtp",
+      /*is_python_draft=*/false,
+      /*uses_embedded_eagle3=*/true));
+  EXPECT_FALSE(is_draft_context_update_compatible(
+      TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
+      DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+      "mimo",
+      /*is_python_target=*/false,
+      "glm5_next_mtp",
+      /*is_python_draft=*/false,
+      /*uses_embedded_eagle3=*/false));
 }
 
 }  // namespace

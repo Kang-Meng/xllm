@@ -83,18 +83,18 @@ files are rewritten or copied. Currently, `num_nextn_predict_layers=1` is suppor
 Previously exported `glm5_next_mtp` directories remain supported by the
 Python/NPU implementation described here.
 
-The native MLU implementation currently supports ordinary prefill/decode only.
-Its draft weight loader accepts the full target checkpoint, with one appended
+The native MLU draft weight loader accepts the full target checkpoint, with one appended
 MTP layer at `model.layers.N` or `model.language_model.layers.N`. It loads the
 draft's own `embed_tokens.weight` and `shared_head.head.weight` from that layer
 and rejects missing vocabulary weights; it does not reuse target vocabulary
 weights. Exported draft directories use a different layout and are explicitly
 rejected by the native MLU argument adapter.
 
-Draft weight loading does not imply end-to-end native MLU MTP support. Dense
-Validate Span (request-grouped K+1 inputs), accepted-count/checkpoint commits,
-and draft accepted-span state replay are not yet connected, so native MLU
-speculative decoding is explicitly rejected at startup.
+Native MLU MTP uses Dense Validate Span with request-grouped K+1 inputs,
+accepted-count/checkpoint updates, and replay of every accepted token into the
+draft context. These paths are connected in this branch; deployment validation
+must cover both target verification and draft context updates. The checkpoint
+layout restrictions above still apply.
 
 ## 4. Start the Service
 

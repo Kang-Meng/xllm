@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "core/framework/speculative/embedding_cache.h"
 #include "core/framework/speculative/mtp_async_state.h"
+#include "core/framework/speculative/mtp_execution_policy.h"
 #include "core/framework/speculative/mtp_json_object_state.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "runtime/draft_model_spec_worker_impl.h"
@@ -184,6 +185,8 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
   // Returns true when target recurrent kernels select a checkpoint using the
   // previous validation step's accepted-token count.
   bool uses_speculative_linear_state_checkpoints() const;
+  void init_draft_context_policy();
+  bool requires_full_target_replay() const override;
   bool uses_embedded_eagle3_draft() const;
   // Multiaxis RoPE positions can include a prompt-dependent offset and do not
   // identify the corresponding KV cache length.
@@ -227,6 +230,11 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
       ForwardInput& extend_input,
       bool force_two_rows = false,
       bool wait_for_compute_stream = true);
+
+  void prepare_draft_replay_inputs(
+      const ForwardInput& base_input,
+      const std::vector<EmbeddingCache::DecodeState>& last_states,
+      ForwardInput& extend_input);
 
   struct PendingTargetContext {
     std::vector<int32_t> embedding_ids;
@@ -318,6 +326,9 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
       mtp_async::TargetSpecVerifyMode::GENERIC;
   mtp_async::CombinedDraftExecutionPath combined_draft_execution_path_ =
       mtp_async::CombinedDraftExecutionPath::UNSUPPORTED;
+  // Fixed after both models load, before any embedding/KV cache allocation.
+  std::optional<mtp_async::DraftContextReplaySemantics>
+      draft_context_replay_policy_;
 
   // Target hidden size captured when the target loads;
   // get_embedding_placeholder_size() falls back to it for the placeholder width

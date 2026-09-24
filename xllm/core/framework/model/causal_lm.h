@@ -15,6 +15,9 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+#ifndef XLLM_CORE_FRAMEWORK_MODEL_CAUSAL_LM_H_
+#define XLLM_CORE_FRAMEWORK_MODEL_CAUSAL_LM_H_
+
 // clang-format off
 #if defined(USE_NPU)
 #include "graph/types.h"
@@ -29,6 +32,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -45,6 +49,15 @@ limitations under the License.
 #include "model_traits.h"
 
 namespace xllm {
+
+// The draft's context update protocol after target verification.
+enum class DraftContextUpdate : int8_t {
+  // Extend the accepted tail using the existing one- or two-row path.
+  TAIL_EXTEND,
+  // Replay every accepted token with its target hidden state, using the
+  // replay path's token/hidden alignment and position conventions.
+  ACCEPTED_SPAN_REPLAY,
+};
 
 namespace layer {
 struct AttentionMetadata;
@@ -137,7 +150,6 @@ class CausalLM : public torch::nn::Module {
 
   virtual const torch::TensorOptions& options() const = 0;
 
-  // MTP-specific interface.
 #if defined(USE_NPU)
   virtual layer::NpuLmHead get_npu_lm_head() {
     NOT_IMPLEMENTED();
@@ -182,6 +194,8 @@ class CausalLM : public torch::nn::Module {
   }
 
   virtual bool share_weights_from(CausalLM& /*source*/) { return false; }
+
+  virtual std::optional<bool> loaded_vocab_weights() { return std::nullopt; }
 
   // DFlash-specific interface. Attention-free scatter-only pass that projects
   // target hidden into the draft's per-layer KV cache. Not part of forward()
@@ -265,6 +279,16 @@ class CausalLMImpl : public CausalLM {
     } else {
       return CausalLM::is_hybrid_linear_attention();
     }
+  }
+
+  std::optional<bool> loaded_vocab_weights() override {
+    if constexpr (detail::has_loaded_vocab_weights<Model>::value &&
+                  detail::has_loaded_vocab_weights_capability<Model>::value) {
+      if (model_->reports_loaded_vocab_weights()) {
+        return model_->has_loaded_vocab_weights();
+      }
+    }
+    return CausalLM::loaded_vocab_weights();
   }
 
   bool supports_mla_graph_kv_bucketing() const override {
@@ -550,3 +574,5 @@ class CausalLMImpl : public CausalLM {
 };
 
 }  // namespace xllm
+
+#endif  // XLLM_CORE_FRAMEWORK_MODEL_CAUSAL_LM_H_

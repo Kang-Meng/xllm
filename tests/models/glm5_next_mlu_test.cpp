@@ -23,7 +23,7 @@ limitations under the License.
 namespace xllm::mlu::model {
 namespace {
 
-TEST(Glm5NextMluDeathTest, RejectsSpeculativeVerificationBeforeUsingInputs) {
+TEST(Glm5NextMluDeathTest, RejectsNonSpanVerificationBeforeUsingInputs) {
   const torch::Device device(torch::kCPU);
   ProcessGroup group(/*rank=*/0, /*world_size=*/1, device);
   ParallelArgs parallel_args(/*rank=*/0, /*world_size=*/1, &group);
@@ -49,13 +49,13 @@ TEST(Glm5NextMluDeathTest, RejectsSpeculativeVerificationBeforeUsingInputs) {
   ModelInputParams params;
   params.is_spec_verify = true;
   EXPECT_DEATH(model.forward(tokens, positions, caches, params),
-               "speculative verification is not supported yet");
+               "requires chunked-prefill");
 
   params.is_spec_verify = false;
   params.attn_metadata = std::make_shared<layer::AttentionMetadata>();
   params.attn_metadata->is_spec_verify = true;
   EXPECT_DEATH(model.forward(tokens, positions, caches, params),
-               "speculative verification is not supported yet");
+               "requires chunked-prefill");
 }
 
 }  // namespace

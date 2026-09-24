@@ -38,7 +38,8 @@ torch::Tensor to_cpu_int64_contiguous(const torch::Tensor& tensor) {
 
 }  // namespace
 
-EmbeddingCache::EmbeddingCache(int32_t total_nums) {
+EmbeddingCache::EmbeddingCache(int32_t total_nums, bool retain_replay_span)
+    : retain_replay_span_(retain_replay_span) {
   CHECK_GT(total_nums, 0) << "No embeddings to allocate";
   decode_tails_.resize(total_nums);
 }
@@ -92,6 +93,10 @@ void EmbeddingCache::write_prefill_target_context(
     state.position_offset = 0;
     state.embedding = clone_contiguous_detached_tensor(
         target_embeddings.select(/*dim=*/0, i));
+    if (retain_replay_span_) {
+      state.replay_token_ids = {state.token_id};
+      state.replay_embeddings = state.embedding.unsqueeze(0);
+    }
 
     DecodeState& tail = mutable_tail(ids[i]);
     tail = std::move(state);
@@ -118,6 +123,10 @@ void EmbeddingCache::write_mtp_bootstrap_context(
   state.token_id = token_id;
   state.position_offset = 0;
   state.embedding = clone_contiguous_detached_tensor(embedding);
+  if (retain_replay_span_) {
+    state.replay_token_ids = {state.token_id};
+    state.replay_embeddings = state.embedding.unsqueeze(0);
+  }
 
   tail = std::move(state);
 }
@@ -182,15 +191,26 @@ void EmbeddingCache::write_target_context(
     state.position_offset = last_idx;
     state.correction_token_id = correction_token;
     state.correction_position_offset = correction_offset;
-    state.embedding = clone_contiguous_detached_tensor(
-        accepted_embeddings.select(/*dim=*/0, i).select(/*dim=*/0, last_idx));
+    if (retain_replay_span_) {
+      state.replay_token_ids.assign(
+          accepted_tokens_data + row_offset,
+          accepted_tokens_data + row_offset + accepted_len);
+      state.replay_embeddings = clone_contiguous_detached_tensor(
+          accepted_embeddings.select(/*dim=*/0, i).narrow(0, 0, accepted_len));
+      state.embedding = state.replay_embeddings.select(0, last_idx);
+    } else {
+      state.embedding = clone_contiguous_detached_tensor(
+          accepted_embeddings.select(/*dim=*/0, i).select(/*dim=*/0, last_idx));
+    }
     if (last_idx > 0) {
       const int64_t prev_token =
           accepted_tokens_data[row_offset + last_idx - 1];
       state.prev_token_id = static_cast<int32_t>(prev_token);
-      state.prev_embedding = clone_contiguous_detached_tensor(
-          accepted_embeddings.select(/*dim=*/0, i)
-              .select(/*dim=*/0, last_idx - 1));
+      state.prev_embedding =
+          retain_replay_span_
+              ? state.replay_embeddings.select(0, last_idx - 1)
+              : clone_contiguous_detached_tensor(
+                    accepted_embeddings.select(0, i).select(0, last_idx - 1));
     }
 
     DecodeState& tail = mutable_tail(ids[i]);

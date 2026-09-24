@@ -31,21 +31,24 @@ enum class TargetSpecVerifyMode {
   GENERIC,
   CAUSAL_CHUNKED_PREFILL,
   EXPANDED_VERIFY,
-  PYTHON_EXPANDED_VERIFY,
 };
 
 // Keep target verification policy closed over model types with validated
 // layouts. Unknown models retain the generic path.
 TargetSpecVerifyMode classify_target_spec_verify_mode(
-    std::string_view model_type);
-
-bool supports_expanded_spec_verify(TargetSpecVerifyMode mode,
-                                   bool is_python_model);
+    std::string_view model_type,
+    bool is_python_model);
 
 bool supports_native_spec_verify_replay_update(TargetSpecVerifyMode mode,
                                                bool is_python_model);
 
 bool requires_uniform_spec_verify(std::string_view model_type);
+
+// Accepted-span replay is validated only for native GLM5 target/MTP pairs.
+bool supports_accepted_span_replay(std::string_view target_model_type,
+                                   bool is_python_target,
+                                   std::string_view draft_model_type,
+                                   bool is_python_draft);
 
 // Shared allocation/launch width for target verification block tables. The
 // extra entry covers the speculative token that can cross a block boundary.

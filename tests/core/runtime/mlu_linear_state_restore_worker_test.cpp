@@ -257,6 +257,9 @@ TEST(MluLinearStateRestoreWorkerTest,
 
   Device xllm_device(device);
   std::unique_ptr<Stream> model_stream = xllm_device.current_stream();
+  // The fixture fills caches on the default stream; publish those writes
+  // before the worker restores them on its separate preparation stream.
+  Device(device).synchronize_default_stream();
   input.metadata_ready_event = model_stream->record_event();
   ForwardInput processed_input;
   worker.prepare_work_before_execute(input, processed_input);
