@@ -57,10 +57,19 @@ def _rms_norm_sigmoid_gated(
     return (x * weight.to(torch.float32) * gate.sigmoid()).to(input_dtype)
 
 
+def _l2_norm(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """CPU reference for L2 normalization over the last dimension."""
+    input_dtype = value.dtype
+    value_fp32 = value.to(torch.float32)
+    normalized = value_fp32 * torch.rsqrt(value_fp32.square().sum(dim=-1, keepdim=True) + eps)
+    return normalized.to(input_dtype)
+
+
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
     kernels.rms_norm = _rms_norm
     kernels.rms_norm_sigmoid_gated = _rms_norm_sigmoid_gated
+    kernels.l2_norm = _l2_norm
     kernels_npu = types.ModuleType("xllm.python.kernels_npu")
     kernels_npu.__path__ = [str(_PYTHON_ROOT / "kernels_npu")]
     distributed = types.ModuleType("xllm.python.distributed")

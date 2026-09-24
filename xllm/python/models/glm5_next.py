@@ -23,12 +23,8 @@ the patched HuggingFace ``Glm5NextForCausalLM`` reference for tensor alignment.
 This implementation follows the transformers model semantics while routing
 supported fused operations through the active platform kernel API.
 
-KDA goes through the stable ``fused_recurrent_kda`` /
-``chunk_kda`` interfaces (same signatures as the transformers
-``@use_kernel_func_from_hub``-decorated functions). Today those run the faithful
-pure-torch delta-rule bodies (matching transformers' recurrent/chunk paths for
-alignment); an NPU small-kernel implementation can later be swapped in behind
-the same interface without touching the layer. No fla_npu dependency.
+KDA execution is dispatched by the attention backend to the fused NPU
+``fla_npu`` operators.
 
 Per-layer linear state (conv_state + recurrent_state) is managed by the
 framework: the executor binds per-sequence ``(conv_cache, ssm_cache)`` slots
@@ -149,15 +145,6 @@ except ImportError:  # pragma: no cover - stub-loader path
 # (see glm5_next_kpool.py).
 
 
-# ---------------------------------------------------------------------------
-# Small faithful helpers (mirror transformers modeling_glm5_next exactly).
-# ---------------------------------------------------------------------------
-def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """FLA-style l2norm: sqrt(sum(x^2)+eps) then divide (NOT F.normalize)."""
-    inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x / inv_norm
-
-
 class Glm5NextRMSNorm(nn.Module):
     """RMSNorm matching transformers through the platform kernel API."""
 
@@ -204,152 +191,6 @@ class _RMSNormGated(nn.Module):
         # Fused sigmoid-gated kernel (one launch over all rows). Must be the
         # sigmoid-gated kernel — never kernels.rms_norm_gated, which is SiLU.
         return kernels.rms_norm_sigmoid_gated(x, gate, self.weight, self.variance_epsilon)
-
-
-def fused_recurrent_kda(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """KDA fused recurrent delta-rule (single-token decode path).
-
-    Stable interface matching transformers ``fused_recurrent_kda``
-    (``@use_kernel_func_from_hub_with_fallback``-decorated); the pure-torch body is the
-    faithful port of the reference fallback. An NPU small kernel can be swapped
-    in behind this interface without changing the layer.
-    """
-    initial_dtype = query.dtype
-    # transformers recurrent path: NO transpose; shapes stay [B, S, nh, hd].
-    query, key, value, beta, g = [x.contiguous().to(torch.float32) for x in (query, key, value, beta, g)]
-    if use_qk_l2norm_in_kernel:
-        query = _l2norm(query, dim=-1, eps=1e-6)
-        key = _l2norm(key, dim=-1, eps=1e-6)
-    batch_size, sequence_length, num_heads, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    scale = 1.0 / (query.shape[-1] ** 0.5)
-    query = query * scale
-    core_attn_out = torch.zeros(
-        batch_size,
-        sequence_length,
-        num_heads,
-        v_head_dim,
-        dtype=value.dtype,
-        device=value.device,
-    )
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    for i in range(sequence_length):
-        q_i = query[:, i]
-        k_i = key[:, i]
-        v_i = value[:, i]
-        g_i = g[:, i][..., None].exp()
-        b_i = beta[:, i][..., None]
-        last_recurrent_state = last_recurrent_state * g_i
-        kv_mem = (last_recurrent_state * k_i[..., None]).sum(dim=-2)
-        delta = (v_i - kv_mem) * b_i
-        last_recurrent_state = last_recurrent_state + k_i.unsqueeze(-1) * delta.unsqueeze(-2)
-        core_attn_out[:, i] = (last_recurrent_state * q_i.unsqueeze(-1)).sum(dim=-2)
-    final_state = last_recurrent_state if output_final_state else None
-    return core_attn_out.to(initial_dtype), final_state
-
-
-def chunk_kda(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    chunk_size: int = 64,
-    initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """KDA chunked delta-rule (multi-token prefill path).
-
-    Stable interface matching transformers ``chunk_kda``
-    (``@use_kernel_func_from_hub_with_fallback``-decorated); the pure-torch body is the
-    faithful port of the reference fallback. An NPU small kernel can be swapped
-    in behind this interface without changing the layer.
-    """
-    initial_dtype = query.dtype
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
-    if use_qk_l2norm_in_kernel:
-        query = _l2norm(query, dim=-1, eps=1e-6)
-        key = _l2norm(key, dim=-1, eps=1e-6)
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    scale = 1.0 / (query.shape[-1] ** 0.5)
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    total_sequence_length = sequence_length + pad_size
-
-    query = F.pad(query, (0, 0, 0, pad_size)) * scale
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    g = F.pad(g, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-
-    query, key, value, g, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, g, k_beta, v_beta)
-    ]
-    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
-
-    # Intra chunk
-    g = g.cumsum(dim=-2)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
-    decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp().float()
-    attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp())
-
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    core_attn_out = torch.zeros_like(value)
-
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
-    for i in range(total_sequence_length // chunk_size):
-        q_i = query[:, :, i]
-        k_i = key[:, :, i]
-        v_i = value[:, :, i]
-        g_i = g[:, :, i]
-
-        attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
-        attn_intra = (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i]).sum(dim=-1).masked_fill(mask, 0)
-        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
-        v_new = v_i - v_prime
-
-        core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
-            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
-        )
-
-    final_state = last_recurrent_state if output_final_state else None
-    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, final_state
 
 
 # ---------------------------------------------------------------------------
@@ -726,9 +567,8 @@ class Glm5NextKdaAttention(Attention):
     ssm_cache: ``[num_slots, nh, k_hd, v_hd]`` fp32) and the per-sequence
     slot/cold-start view (``linear_state_indices`` / ``has_initial_state``).
 
-    The KDA math goes through the stable ``fused_recurrent_kda`` /
-    ``chunk_kda`` interfaces (or fla_npu fused ops when
-    ``GLM5NEXT_KDA_BACKEND=fla_npu``); see their docstrings.
+    KDA math is dispatched through ``NpuPagedAttentionBackend`` to fused
+    ``fla_npu`` operators.
     """
 
     is_glm_next_kda: bool = True
