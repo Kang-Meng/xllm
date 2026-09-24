@@ -311,4 +311,47 @@ bool BlockManagerImpl::allocate_prefetch_range(Sequence* seq,
   return allocated.size() == missing.size();
 }
 
+void BlockManagerImpl::trim_prefetch_blocks(Sequence* seq,
+                                            size_t max_hit_tokens) {
+  if (seq == nullptr || block_size_ == 0) {
+    return;
+  }
+
+  KVCacheState& host_state = seq->host_kv_state();
+  const size_t keep = std::min(max_hit_tokens / block_size_,
+                               host_state.num_blocks(block_type()));
+  std::vector<Block> blocks = host_state.take_blocks(block_type());
+  if (blocks.size() > keep) {
+    std::vector<Block> dropped;
+    dropped.reserve(blocks.size() - keep);
+    for (size_t i = keep; i < blocks.size(); ++i) {
+      if (blocks[i].is_valid()) {
+        dropped.emplace_back(std::move(blocks[i]));
+      }
+    }
+    blocks.resize(keep);
+    if (!dropped.empty()) {
+      deallocate(dropped);
+    }
+  }
+
+  if (blocks.empty()) {
+    host_state.erase_blocks(block_type());
+    return;
+  }
+
+  // Store prefetch owns newly materialized Host blocks until this point. Once
+  // the gate boundary is known, publish exactly the retained range and make
+  // both state cursors describe that published logical range.
+  seq->update_block_hashes(static_cast<uint32_t>(block_size_),
+                           options_.hasher_type());
+  cache(seq->hash_tokens(options_.hasher_type()),
+        blocks,
+        /*existed_shared_blocks_num=*/0,
+        seq->mm_data(),
+        seq->block_hashes());
+  host_state.replace_composite_blocks(
+      block_type(), std::move(blocks), keep, keep);
+}
+
 }  // namespace xllm

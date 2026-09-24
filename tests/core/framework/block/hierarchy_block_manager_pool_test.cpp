@@ -156,8 +156,12 @@ class FakeOffloadEngine final : public Engine {
 
 class FakePrefetchEngine final : public Engine {
  public:
-  explicit FakePrefetchEngine(size_t worker_count, int64_t timeout_ms = -1)
-      : worker_count_(worker_count), timeout_ms_(timeout_ms) {}
+  explicit FakePrefetchEngine(size_t worker_count,
+                              int64_t timeout_ms = -1,
+                              size_t batch_size = 2)
+      : worker_count_(worker_count),
+        timeout_ms_(timeout_ms),
+        batch_size_(batch_size) {}
 
   ForwardOutput step(std::vector<Batch>& /*batch*/) override { return {}; }
 
@@ -174,9 +178,11 @@ class FakePrefetchEngine final : public Engine {
       PrefetchResult::DoneCallback done) override {
     CHECK(request != nullptr);
     dp_rank_ = dp_rank;
+    ++request_count_;
     request_ = std::move(request);
     result_ = std::make_shared<PrefetchResult>(worker_count_,
-                                               request_->batch_end_unit_offsets,
+                                               *request_,
+                                               batch_size_,
                                                timeout_ms_,
                                                std::move(stop_requested),
                                                std::move(done));
@@ -188,14 +194,18 @@ class FakePrefetchEngine final : public Engine {
 
   const std::shared_ptr<PrefetchResult>& result() const { return result_; }
 
+  size_t request_count() const { return request_count_; }
+
   void finish_worker(size_t worker_index,
                      size_t hit_units,
                      bool worker_ok = true) {
     CHECK(result_ != nullptr);
     size_t remaining_hits = hit_units;
-    for (size_t batch_index = 0; batch_index < request_->batch_count();
+    for (size_t batch_index = 0;
+         batch_index < request_->batch_count(batch_size_);
          ++batch_index) {
-      const size_t batch_units = request_->batch_unit_count(batch_index);
+      const size_t batch_units =
+          request_->batch_unit_count(batch_index, batch_size_);
       const uint8_t batch_hits =
           static_cast<uint8_t>(std::min(remaining_hits, batch_units));
       const std::optional<PrefetchControl> control =
@@ -210,10 +220,55 @@ class FakePrefetchEngine final : public Engine {
     result_->mark_worker_ended(worker_index, worker_ok);
   }
 
+  void finish_worker_with_logical_hits(size_t worker_index,
+                                       const std::vector<uint8_t>& logical_hits,
+                                       bool worker_ok = true) {
+    CHECK(result_ != nullptr);
+    size_t logical_index = 0;
+    for (size_t batch_index = 0;
+         batch_index < request_->batch_count(batch_size_);
+         ++batch_index) {
+      const size_t unit_begin =
+          request_->batch_unit_begin(batch_index, batch_size_);
+      const size_t unit_count =
+          request_->batch_unit_count(batch_index, batch_size_);
+      std::vector<uint8_t> gated(batch_size_, 0);
+      std::vector<uint8_t> non_gated(batch_size_, 0);
+      for (size_t local = 0; local < unit_count; ++local) {
+        const PrefetchUnit& unit = request_->units[unit_begin + local];
+        bool gated_hit = true;
+        for (size_t i = 0; i < unit.gated_blocks.size(); ++i) {
+          CHECK_LT(logical_index, logical_hits.size());
+          gated_hit = gated_hit && logical_hits[logical_index++] != 0;
+        }
+        bool non_gated_hit = !unit.has_non_gated;
+        if (unit.has_non_gated) {
+          non_gated_hit = !unit.non_gated_blocks.empty();
+          for (size_t i = 0; i < unit.non_gated_blocks.size(); ++i) {
+            CHECK_LT(logical_index, logical_hits.size());
+            non_gated_hit = non_gated_hit && logical_hits[logical_index++] != 0;
+          }
+        }
+        gated[local] = gated_hit ? 1 : 0;
+        non_gated[local] = non_gated_hit ? 1 : 0;
+      }
+      const std::optional<PrefetchControl> control =
+          result_->record_batch_result(worker_index, gated, non_gated);
+      CHECK(control.has_value());
+      if (*control == PrefetchControl::STOP) {
+        break;
+      }
+    }
+    CHECK_EQ(logical_index, logical_hits.size());
+    result_->mark_worker_ended(worker_index, worker_ok);
+  }
+
  private:
   size_t worker_count_ = 0;
   int64_t timeout_ms_ = -1;
+  size_t batch_size_ = 2;
   uint32_t dp_rank_ = 0;
+  size_t request_count_ = 0;
   std::shared_ptr<const StoragePrefetchRequest> request_;
   std::shared_ptr<PrefetchResult> result_;
 };
@@ -315,7 +370,8 @@ Sequence make_test_sequence(size_t index,
 }
 
 std::shared_ptr<Request> make_test_request(
-    const std::vector<int32_t>& prompt_token_ids) {
+    const std::vector<int32_t>& prompt_token_ids,
+    size_t best_of = 1) {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
   StoppingChecker stopping_checker;
@@ -329,8 +385,8 @@ std::shared_ptr<Request> make_test_request(
                              scheduler_param,
                              stopping_checker,
                              prompt_token_ids.size() + 16,
-                             /*n=*/1,
-                             /*best_of=*/1,
+                             /*n=*/best_of,
+                             /*best_of=*/best_of,
                              /*logprobs=*/false,
                              /*stream=*/false,
                              /*echo=*/false,
@@ -1806,17 +1862,39 @@ TEST(HierarchyBlockManagerPoolTest,
 
 TEST(PrefetchResultTest, UsesMinimumContiguousUnitPrefixAcrossWorkers) {
   size_t common_hit_units = std::numeric_limits<size_t>::max();
+  StoragePrefetchRequest request;
+  for (size_t unit_index = 0; unit_index < 5; ++unit_index) {
+    PrefetchUnit unit;
+    BlockTransferInfo info(/*src_block_id=*/-1,
+                           /*dst_block_id=*/static_cast<int32_t>(unit_index));
+    info.transfer_type = TransferType::G2H;
+    info.block_type = BlockType::KV;
+    unit.gated_blocks.emplace_back(info);
+    request.units.emplace_back(std::move(unit));
+  }
   PrefetchResult result(
       /*worker_count=*/2,
-      /*batch_end_unit_offsets=*/{2, 4, 5},
+      request,
+      /*batch_size=*/2,
       /*timeout_ms=*/-1,
       [] { return false; },
-      [&common_hit_units](size_t hit_units) { common_hit_units = hit_units; });
+      [&common_hit_units](PrefetchSummary summary) {
+        common_hit_units = 0;
+        while (common_hit_units < summary.gated_hits.size() &&
+               summary.gated_hits[common_hit_units] != 0) {
+          ++common_hit_units;
+        }
+      });
 
   std::optional<PrefetchControl> control =
       result.record_batch_result(/*worker_index=*/0, /*prefix_hit_units=*/2);
   ASSERT_TRUE(control.has_value());
   EXPECT_EQ(*control, PrefetchControl::CONTINUE);
+  control =
+      result.record_batch_result(/*worker_index=*/1, /*prefix_hit_units=*/2);
+  ASSERT_TRUE(control.has_value());
+  EXPECT_EQ(*control, PrefetchControl::CONTINUE);
+
   control =
       result.record_batch_result(/*worker_index=*/0, /*prefix_hit_units=*/1);
   ASSERT_TRUE(control.has_value());
@@ -1827,29 +1905,187 @@ TEST(PrefetchResultTest, UsesMinimumContiguousUnitPrefixAcrossWorkers) {
   control =
       result.record_batch_result(/*worker_index=*/1, /*prefix_hit_units=*/2);
   ASSERT_TRUE(control.has_value());
-  EXPECT_EQ(*control, PrefetchControl::CONTINUE);
-  control =
-      result.record_batch_result(/*worker_index=*/1, /*prefix_hit_units=*/2);
-  ASSERT_TRUE(control.has_value());
-  EXPECT_EQ(*control, PrefetchControl::CONTINUE);
-  control =
-      result.record_batch_result(/*worker_index=*/1, /*prefix_hit_units=*/1);
-  ASSERT_TRUE(control.has_value());
+  // Worker 0 has already observed the shared gate miss, so worker 1 closes
+  // after its current batch even though that batch itself is a hit.
   EXPECT_EQ(*control, PrefetchControl::STOP);
   result.mark_worker_ended(/*worker_index=*/1, /*worker_ok=*/true);
 
   EXPECT_EQ(common_hit_units, 3u);
 }
 
+TEST(PrefetchResultTest, WorkersAdvanceIndependently) {
+  StoragePrefetchRequest request;
+  for (size_t unit_index = 0; unit_index < 4; ++unit_index) {
+    PrefetchUnit unit;
+    BlockTransferInfo info(/*src_block_id=*/-1,
+                           /*dst_block_id=*/static_cast<int32_t>(unit_index));
+    info.transfer_type = TransferType::G2H;
+    info.block_type = BlockType::KV;
+    unit.gated_blocks.emplace_back(info);
+    request.units.emplace_back(std::move(unit));
+  }
+  PrefetchResult result(
+      /*worker_count=*/2,
+      request,
+      /*batch_size=*/2,
+      /*timeout_ms=*/-1,
+      [] { return false; },
+      [](PrefetchSummary /*summary*/) {});
+  const std::vector<uint8_t> hits = {1, 1};
+
+  std::optional<PrefetchControl> control =
+      result.record_batch_result(/*worker_index=*/0, hits, hits);
+  ASSERT_TRUE(control.has_value());
+  EXPECT_EQ(*control, PrefetchControl::CONTINUE);
+  control = result.record_batch_result(/*worker_index=*/0, hits, hits);
+  ASSERT_TRUE(control.has_value());
+  EXPECT_EQ(*control, PrefetchControl::STOP);
+
+  control = result.record_batch_result(/*worker_index=*/1, hits, hits);
+  ASSERT_TRUE(control.has_value());
+  EXPECT_EQ(*control, PrefetchControl::CONTINUE);
+  control = result.record_batch_result(/*worker_index=*/1, hits, hits);
+  ASSERT_TRUE(control.has_value());
+  EXPECT_EQ(*control, PrefetchControl::STOP);
+  result.mark_worker_ended(/*worker_index=*/0, /*worker_ok=*/true);
+  result.mark_worker_ended(/*worker_index=*/1, /*worker_ok=*/true);
+}
+
+TEST(PrefetchResultTest, OptionalMissDoesNotStopGatePrefix) {
+  StoragePrefetchRequest request;
+  for (size_t unit_index = 0; unit_index < 2; ++unit_index) {
+    PrefetchUnit unit;
+    BlockTransferInfo gated(/*src_block_id=*/-1,
+                            /*dst_block_id=*/static_cast<int32_t>(unit_index));
+    gated.transfer_type = TransferType::G2H;
+    gated.block_type = BlockType::KV;
+    unit.gated_blocks.emplace_back(gated);
+    BlockTransferInfo non_gated(
+        /*src_block_id=*/-1,
+        /*dst_block_id=*/static_cast<int32_t>(unit_index + 2));
+    non_gated.transfer_type = TransferType::G2H;
+    non_gated.block_type = BlockType::LINEAR;
+    unit.non_gated_blocks.emplace_back(non_gated);
+    unit.has_non_gated = true;
+    request.units.emplace_back(std::move(unit));
+  }
+
+  PrefetchSummary summary;
+  PrefetchResult result(
+      /*worker_count=*/1,
+      request,
+      /*batch_size=*/2,
+      /*timeout_ms=*/-1,
+      [] { return false; },
+      [&summary](PrefetchSummary value) { summary = std::move(value); });
+  const std::optional<PrefetchControl> control = result.record_batch_result(
+      /*worker_index=*/0,
+      /*gated_hits=*/std::vector<uint8_t>{1, 1},
+      /*non_gated_hits=*/std::vector<uint8_t>{0, 0});
+  ASSERT_TRUE(control.has_value());
+  EXPECT_EQ(*control, PrefetchControl::STOP);
+  result.mark_worker_ended(/*worker_index=*/0, /*worker_ok=*/true);
+
+  EXPECT_EQ(summary.gated_hits, (std::vector<uint8_t>{1, 1}));
+  EXPECT_EQ(summary.non_gated_hits, (std::vector<uint8_t>{0, 0}));
+}
+
+TEST(PrefetchResultTest, LogicalHitsAreAndedAcrossWorkers) {
+  StoragePrefetchRequest request;
+  for (size_t unit_index = 0; unit_index < 2; ++unit_index) {
+    PrefetchUnit unit;
+    BlockTransferInfo gated(/*src_block_id=*/-1,
+                            /*dst_block_id=*/static_cast<int32_t>(unit_index));
+    gated.transfer_type = TransferType::G2H;
+    gated.block_type = BlockType::KV;
+    unit.gated_blocks.emplace_back(gated);
+    BlockTransferInfo non_gated(
+        /*src_block_id=*/-1,
+        /*dst_block_id=*/static_cast<int32_t>(unit_index + 2));
+    non_gated.transfer_type = TransferType::G2H;
+    non_gated.block_type = BlockType::LINEAR;
+    unit.non_gated_blocks.emplace_back(non_gated);
+    unit.has_non_gated = true;
+    request.units.emplace_back(std::move(unit));
+  }
+
+  PrefetchSummary summary;
+  PrefetchResult result(
+      /*worker_count=*/2,
+      request,
+      /*batch_size=*/2,
+      /*timeout_ms=*/-1,
+      [] { return false; },
+      [&summary](PrefetchSummary value) { summary = std::move(value); });
+  const std::vector<uint8_t> worker_zero_gated = {1, 1};
+  const std::vector<uint8_t> worker_zero_non_gated = {0, 1};
+  const std::vector<uint8_t> worker_one_gated = {1, 1};
+  const std::vector<uint8_t> worker_one_non_gated = {1, 0};
+  ASSERT_TRUE(
+      result.record_batch_result(0, worker_zero_gated, worker_zero_non_gated)
+          .has_value());
+  result.mark_worker_ended(0, /*worker_ok=*/true);
+  ASSERT_TRUE(
+      result.record_batch_result(1, worker_one_gated, worker_one_non_gated)
+          .has_value());
+  result.mark_worker_ended(1, /*worker_ok=*/true);
+
+  EXPECT_EQ(summary.gated_hits, (std::vector<uint8_t>{1, 1}));
+  EXPECT_EQ(summary.non_gated_hits, (std::vector<uint8_t>{0, 0}));
+}
+
+TEST(PrefetchResultTest, WorkerFailureMarksSummaryUnsuccessful) {
+  StoragePrefetchRequest request;
+  BlockTransferInfo info(/*src_block_id=*/-1, /*dst_block_id=*/0);
+  info.transfer_type = TransferType::G2H;
+  info.block_type = BlockType::KV;
+  PrefetchUnit unit;
+  unit.gated_blocks.emplace_back(info);
+  request.units.emplace_back(std::move(unit));
+
+  PrefetchSummary summary;
+  PrefetchResult result(
+      /*worker_count=*/1,
+      request,
+      /*batch_size=*/1,
+      /*timeout_ms=*/-1,
+      [] { return false; },
+      [&summary](PrefetchSummary value) { summary = std::move(value); });
+  ASSERT_TRUE(result
+                  .record_batch_result(
+                      0, std::vector<uint8_t>{1}, std::vector<uint8_t>{1})
+                  .has_value());
+  result.mark_worker_ended(0, /*worker_ok=*/false);
+
+  EXPECT_TRUE(summary.gated_hits.empty());
+}
+
 TEST(PrefetchResultTest, StopsAfterCancellationOrTimeout) {
   bool cancelled = false;
   size_t common_hit_units = 0;
+  StoragePrefetchRequest request;
+  for (size_t unit_index = 0; unit_index < 4; ++unit_index) {
+    PrefetchUnit unit;
+    BlockTransferInfo info(/*src_block_id=*/-1,
+                           /*dst_block_id=*/static_cast<int32_t>(unit_index));
+    info.transfer_type = TransferType::G2H;
+    info.block_type = BlockType::KV;
+    unit.gated_blocks.emplace_back(info);
+    request.units.emplace_back(std::move(unit));
+  }
   PrefetchResult cancelled_result(
       /*worker_count=*/1,
-      /*batch_end_unit_offsets=*/{2, 4},
+      request,
+      /*batch_size=*/2,
       /*timeout_ms=*/-1,
       [&cancelled] { return cancelled; },
-      [&common_hit_units](size_t hit_units) { common_hit_units = hit_units; });
+      [&common_hit_units](PrefetchSummary summary) {
+        common_hit_units = 0;
+        while (common_hit_units < summary.gated_hits.size() &&
+               summary.gated_hits[common_hit_units] != 0) {
+          ++common_hit_units;
+        }
+      });
   cancelled = true;
   std::optional<PrefetchControl> control = cancelled_result.record_batch_result(
       /*worker_index=*/0, /*prefix_hit_units=*/2);
@@ -1864,10 +2100,11 @@ TEST(PrefetchResultTest, StopsAfterCancellationOrTimeout) {
 
   PrefetchResult timed_out_result(
       /*worker_count=*/1,
-      /*batch_end_unit_offsets=*/{2, 4},
+      request,
+      /*batch_size=*/2,
       /*timeout_ms=*/1,
       [] { return false; },
-      [](size_t /*hit_units*/) {});
+      [](PrefetchSummary /*summary*/) {});
   EXPECT_EQ(timed_out_result.stream_idle_timeout_ms(), 1);
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
   control = timed_out_result.record_batch_result(
@@ -1891,10 +2128,8 @@ TEST(HierarchyBlockManagerPoolTest,
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
   ASSERT_NE(engine.result(), nullptr);
-  EXPECT_EQ(engine.request().transfer_infos.size(), 8u);
-  EXPECT_EQ(engine.request().unit_end_offsets.size(), 8u);
-  EXPECT_EQ(engine.request().batch_end_unit_offsets,
-            (std::vector<uint32_t>{2, 4, 6, 8}));
+  EXPECT_EQ(engine.request().units.size(), 8u);
+  EXPECT_EQ(engine.request().batch_count(2), 4u);
   EXPECT_TRUE(sequence->host_kv_state().has_any_blocks());
   EXPECT_FALSE(sequence->host_kv_state().prefix_cache_matched());
 
@@ -1934,7 +2169,7 @@ TEST(HierarchyBlockManagerPoolTest,
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
   ASSERT_EQ(engine.dp_rank(), 0u);
-  ASSERT_EQ(engine.request().transfer_infos.size(), 8u);
+  ASSERT_EQ(engine.request().units.size(), 8u);
   ASSERT_NE(engine.result(), nullptr);
   EXPECT_FALSE(sequence->kv_state().has_any_blocks());
   EXPECT_TRUE(sequence->host_kv_state().has_any_blocks());
@@ -1992,8 +2227,69 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_TRUE(completed);
   EXPECT_EQ(host_leaf->num_free_blocks(), free_blocks_before);
   EXPECT_EQ(host_leaf->num_blocks_in_prefix_cache(), cached_blocks_before);
+  EXPECT_EQ(host_leaf->num_used_blocks(), 0u);
   EXPECT_FALSE(sequence->host_kv_state().has_any_blocks());
   EXPECT_FALSE(sequence->host_kv_state().prefix_cache_matched());
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     FailedStoragePrefetchDoesNotPublishHostPrefix) {
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.enable_kvcache_store(true).prefetch_batch_size(2);
+  FakePrefetchEngine engine(/*worker_count=*/1);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  std::vector<int32_t> tokens(1025, 41);
+  std::shared_ptr<Request> request = make_test_request(tokens);
+  Sequence* sequence = request->sequences().front().get();
+  BlockManager* host_leaf =
+      HierarchyPoolTestPeer::host_leaves(pool).at(BlockType::KV).leaf.get();
+  bool completed = false;
+
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+  ASSERT_NE(engine.result(), nullptr);
+  engine.finish_worker(/*worker_index=*/0,
+                       /*hit_units=*/0,
+                       /*worker_ok=*/false);
+
+  EXPECT_TRUE(completed);
+  EXPECT_EQ(host_leaf->num_used_blocks(), 0u);
+  EXPECT_EQ(host_leaf->num_blocks_in_prefix_cache(), 0u);
+  EXPECT_FALSE(sequence->host_kv_state().has_any_blocks());
+  EXPECT_FALSE(sequence->host_kv_state().prefix_cache_matched());
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     MultiSequenceStoragePrefetchUsesOnlyFirstSequence) {
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.enable_kvcache_store(true).prefetch_batch_size(2);
+  FakePrefetchEngine engine(/*worker_count=*/1);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  std::vector<int32_t> tokens(1025, 43);
+  std::shared_ptr<Request> request = make_test_request(tokens, /*best_of=*/2);
+  ASSERT_TRUE(request->expand_sequences(/*share_prefix=*/false));
+  ASSERT_EQ(request->sequences().size(), 2u);
+  bool completed = false;
+
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+  ASSERT_EQ(engine.request_count(), 1u);
+  ASSERT_EQ(engine.request().units.size(), 8u);
+
+  engine.finish_worker(/*worker_index=*/0,
+                       /*hit_units=*/8);
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(request->sequences()[0]->host_kv_state().has_any_blocks());
+  EXPECT_TRUE(request->sequences()[0]->host_kv_state().prefix_cache_matched());
+  EXPECT_FALSE(request->sequences()[1]->host_kv_state().has_any_blocks());
+  EXPECT_FALSE(request->sequences()[1]->host_kv_state().prefix_cache_matched());
+  BlockManager* host_leaf =
+      HierarchyPoolTestPeer::host_leaves(pool).at(BlockType::KV).leaf.get();
+  EXPECT_EQ(host_leaf->num_blocks_in_prefix_cache(), 8u);
+  pool.deallocate(request->sequences()[0].get());
+  pool.deallocate(request->sequences()[1].get());
 }
 
 TEST(HierarchyBlockManagerPoolTest,
@@ -2015,8 +2311,8 @@ TEST(HierarchyBlockManagerPoolTest,
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
   ASSERT_NE(engine.result(), nullptr);
-  EXPECT_EQ(engine.request().transfer_infos.size(), 1u + 32u + 1u);
-  EXPECT_EQ(engine.request().unit_end_offsets, (std::vector<uint32_t>{34}));
+  EXPECT_EQ(engine.request().units.size(), 1u);
+  EXPECT_EQ(engine.request().batch_transfer_count(0, 2), 34u);
 
   engine.finish_worker(/*worker_index=*/0, /*hit_units=*/1);
   EXPECT_FALSE(completed);
@@ -2053,8 +2349,8 @@ TEST(HierarchyBlockManagerPoolTest,
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
   ASSERT_NE(engine.result(), nullptr);
-  ASSERT_EQ(engine.request().unit_end_offsets.size(), 2u);
-  EXPECT_EQ(engine.request().unit_end_offsets, (std::vector<uint32_t>{34, 68}));
+  ASSERT_EQ(engine.request().units.size(), 2u);
+  EXPECT_EQ(engine.request().batch_transfer_count(0, 2), 68u);
 
   engine.finish_worker(/*worker_index=*/0, /*hit_units=*/0);
   EXPECT_FALSE(completed);
@@ -2094,6 +2390,106 @@ TEST(HierarchyBlockManagerPoolTest, SupportsLinearCacheLayout) {
   EXPECT_TRUE(host.contains(BlockType::KV));
   EXPECT_TRUE(host.contains(BlockType::LINEAR));
   EXPECT_EQ(host.at(BlockType::LINEAR).leaf->block_size(), 128);
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      original_chunk_stride;
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     DecodeLinearLayoutOffloadsKvWithoutPrefixPrefetch) {
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.enable_linear_state(true)
+      .linear_state_num_slots(64)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 64}})
+      .enable_prefix_cache(false)
+      .enable_disagg_pd(true)
+      .instance_is_decode(true)
+      .enable_kvcache_store(true)
+      .prefetch_batch_size(4);
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() = 2048;
+
+  FakePrefetchEngine engine(/*worker_count=*/1,
+                            /*timeout_ms=*/-1,
+                            /*batch_size=*/4);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const auto* device = HierarchyPoolTestPeer::device_composite(pool);
+  EXPECT_EQ(device->leaf_combination(),
+            CompositeBlockManager::LeafCombination::UNSUPPORTED);
+
+  std::vector<int32_t> tokens(4097, 103);
+  std::shared_ptr<Request> request = make_test_request(tokens);
+  bool completed = false;
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+  EXPECT_TRUE(completed);
+  EXPECT_EQ(engine.request_count(), 0u);
+
+  Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+  ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
+  sequence.kv_state().set_kv_cache_tokens_num(4096);
+  pool.deallocate(&sequence);
+
+  // Decode's LINEAR leaf is receiver/live state, not a Prefill checkpoint.
+  // The 32 completed KV blocks are still queued for Store writeback.
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 32u);
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      original_chunk_stride;
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     LinearOptionalStoreMissLeavesSparseHostCheckpoint) {
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.enable_linear_state(true)
+      .linear_state_num_slots(64)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 64}})
+      .enable_kvcache_store(true)
+      .prefetch_batch_size(4);
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() = 128;
+
+  FakePrefetchEngine engine(/*worker_count=*/1,
+                            /*timeout_ms=*/-1,
+                            /*batch_size=*/4);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  std::vector<int32_t> tokens(513, 97);
+  std::shared_ptr<Request> request = make_test_request(tokens);
+  Sequence* sequence = request->sequences().front().get();
+  bool completed = false;
+
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+  ASSERT_NE(engine.result(), nullptr);
+  ASSERT_EQ(engine.request().units.size(), 4u);
+
+  std::vector<uint8_t> logical_hits;
+  logical_hits.reserve(engine.request().batch_transfer_count(0, 4));
+  for (size_t unit = 0; unit < 4; ++unit) {
+    logical_hits.emplace_back(uint8_t{1});
+    logical_hits.emplace_back(unit == 2 ? uint8_t{0} : uint8_t{1});
+  }
+  engine.finish_worker_with_logical_hits(/*worker_index=*/0, logical_hits);
+
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(sequence->host_kv_state().prefix_cache_matched());
+  EXPECT_EQ(sequence->kv_cache_tokens_num(), 512u);
+  const Slice<Block> linear_blocks =
+      sequence->host_kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(linear_blocks.size(), 1u);
+  EXPECT_TRUE(linear_blocks[0].is_valid());
+  EXPECT_EQ(sequence->host_kv_state().num_cached_blocks(BlockType::LINEAR), 1u);
+
+  const HostCacheRestorePoint restore =
+      pool.select_host_cache_restore(sequence, /*max_copy_units=*/4);
+  EXPECT_EQ(restore.restore_target_tokens, 512u);
+  EXPECT_EQ(restore.copy_units, 4u);
+  pool.deallocate(sequence);
+
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
       original_chunk_stride;
 }

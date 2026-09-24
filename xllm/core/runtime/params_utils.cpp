@@ -468,21 +468,25 @@ bool storage_prefetch_request_to_proto(const StoragePrefetchRequest& request,
     return false;
   }
 
-  proto_request->mutable_transfer_infos()->Reserve(
-      request.transfer_infos.size());
-  for (const BlockTransferInfo& info : request.transfer_infos) {
-    proto::BlockTransferInfo* proto_info = proto_request->add_transfer_infos();
+  auto append = [](const BlockTransferInfo& info,
+                   proto::BlockTransferInfo* proto_info) {
     proto_info->set_src_block_id(info.src_block_id);
     proto_info->set_dst_block_id(info.dst_block_id);
     proto_info->set_hash_key(info.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
     proto_info->set_block_type(
         static_cast<proto::BlockType>(static_cast<int8_t>(info.block_type)));
+  };
+  proto_request->mutable_units()->Reserve(request.units.size());
+  for (const PrefetchUnit& unit : request.units) {
+    proto::PrefetchUnit* proto_unit = proto_request->add_units();
+    proto_unit->set_has_non_gated(unit.has_non_gated);
+    for (const BlockTransferInfo& info : unit.gated_blocks) {
+      append(info, proto_unit->add_gated_blocks());
+    }
+    for (const BlockTransferInfo& info : unit.non_gated_blocks) {
+      append(info, proto_unit->add_non_gated_blocks());
+    }
   }
-  proto_request->mutable_unit_end_offsets()->Add(
-      request.unit_end_offsets.begin(), request.unit_end_offsets.end());
-  proto_request->mutable_batch_end_unit_offsets()->Add(
-      request.batch_end_unit_offsets.begin(),
-      request.batch_end_unit_offsets.end());
   return true;
 }
 
@@ -493,25 +497,44 @@ bool proto_to_storage_prefetch_request(
     return false;
   }
 
-  request->transfer_infos.clear();
-  request->transfer_infos.reserve(proto_request.transfer_infos_size());
-  for (const proto::BlockTransferInfo& proto_info :
-       proto_request.transfer_infos()) {
+  request->units.clear();
+  auto parse = [](const proto::BlockTransferInfo& proto_info,
+                  BlockTransferInfo* info) {
     if (proto_info.hash_key().size() != XXH3_128BITS_HASH_VALUE_LEN) {
       return false;
     }
-    request->transfer_infos.emplace_back(
+    *info = BlockTransferInfo(
         proto_info.src_block_id(),
         proto_info.dst_block_id(),
         reinterpret_cast<const uint8_t*>(proto_info.hash_key().data()),
         TransferType::G2H,
         static_cast<BlockType>(proto_info.block_type()));
+    return true;
+  };
+  request->units.reserve(proto_request.units_size());
+  for (const proto::PrefetchUnit& proto_unit : proto_request.units()) {
+    PrefetchUnit unit;
+    unit.has_non_gated = proto_unit.has_non_gated();
+    unit.gated_blocks.reserve(proto_unit.gated_blocks_size());
+    unit.non_gated_blocks.reserve(proto_unit.non_gated_blocks_size());
+    for (const proto::BlockTransferInfo& proto_info :
+         proto_unit.gated_blocks()) {
+      BlockTransferInfo info(/*src_block_id=*/-1, /*dst_block_id=*/-1);
+      if (!parse(proto_info, &info)) {
+        return false;
+      }
+      unit.gated_blocks.emplace_back(std::move(info));
+    }
+    for (const proto::BlockTransferInfo& proto_info :
+         proto_unit.non_gated_blocks()) {
+      BlockTransferInfo info(/*src_block_id=*/-1, /*dst_block_id=*/-1);
+      if (!parse(proto_info, &info)) {
+        return false;
+      }
+      unit.non_gated_blocks.emplace_back(std::move(info));
+    }
+    request->units.emplace_back(std::move(unit));
   }
-  request->unit_end_offsets.assign(proto_request.unit_end_offsets().begin(),
-                                   proto_request.unit_end_offsets().end());
-  request->batch_end_unit_offsets.assign(
-      proto_request.batch_end_unit_offsets().begin(),
-      proto_request.batch_end_unit_offsets().end());
   return request->valid();
 }
 
