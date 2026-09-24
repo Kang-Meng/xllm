@@ -365,11 +365,9 @@ class KdaLinearAttentionMixin:
         if fuse_gate:
             g = None
             g_raw = raw_gate_proj if num_seqs == batch_size else raw_gate_proj.view(hidden_shape)
-            kda_A_log = fg.A_log.to(torch.float32).contiguous()
-            kda_dt_bias = fg.dt_bias.to(torch.float32).contiguous()
             _gate_kwargs = dict(
-                A_log=kda_A_log,
-                dt_bias=kda_dt_bias,
+                A_log=fg.A_log.contiguous(),
+                dt_bias=fg.dt_bias.contiguous(),
                 use_gate_in_kernel=True,
                 safe_gate=True,
                 lower_bound=gate_lb,

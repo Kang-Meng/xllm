@@ -157,28 +157,6 @@ class Glm5NextRMSNorm(nn.Module):
         return kernels.rms_norm(x, self.weight, self.variance_epsilon)
 
 
-class _UnweightedRMSNorm(nn.Module):
-    """Unweighted RMSNorm (transformers Glm5NextTextUnweightedRMSNorm).
-
-    Used inside the mHC input projection: no weight parameter, just rescale by
-    the fp32 RMS then cast back (input_norm in the reference HyperConnection).
-    The vendor npu_rms_norm needs a weight and this norm only runs on the
-    non-fused-mHC fallback (fused hc_pre folds the mHC rsqrt in), so keep it
-    pure-torch.
-    """
-
-    def __init__(self, eps: float) -> None:
-        super().__init__()
-        self.variance_epsilon = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        return x.to(input_dtype)
-
-
 class _RMSNormGated(nn.Module):
     """RMSNorm + sigmoid gate (transformers Glm5NextRMSNormGated)."""
 
@@ -500,6 +478,17 @@ class Glm5NextForgetGate(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(self.qkv_dim, dtype=torch.float32))
         self.A_log = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.safe_gate_lower_bound = cfg.linear_lower_bound
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> Glm5NextForgetGate:
+        a_log = self.A_log.detach()
+        dt_bias = self.dt_bias.detach()
+        super()._apply(fn, recurse)
+        # The model applies dtype globally during initialization, but fused
+        # KDA kernels require these constants in FP32. Preserve their values
+        # while adopting the target device.
+        self.A_log.data = a_log.to(device=self.A_log.device, dtype=torch.float32)
+        self.dt_bias.data = dt_bias.to(device=self.dt_bias.device, dtype=torch.float32)
+        return self
 
     def raw_projection(self, forget_latent: torch.Tensor) -> torch.Tensor:
         """Project the replicated f_a latent through f_b, without applying the gate.
@@ -2354,7 +2343,7 @@ class Glm5NextHyperConnection(nn.Module):
         self.hc_mult = cfg.hc_mult
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
-        self.input_norm = _UnweightedRMSNorm(cfg.rms_norm_eps)
+        self.rms_norm_eps = cfg.rms_norm_eps
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * cfg.hidden_size, dtype=torch.float32, device=device))
         self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32, device=device))
@@ -2399,7 +2388,7 @@ class Glm5NextHyperConnection(nn.Module):
             self._base_compute,
             hc,
             self.hc_sinkhorn_iters,
-            self.input_norm.variance_epsilon,
+            self.rms_norm_eps,
             self.hc_eps,
         )
         return post, comb, collapsed

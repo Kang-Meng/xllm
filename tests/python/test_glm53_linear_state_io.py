@@ -144,9 +144,12 @@ def _install_kda_stubs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         raising=False,
     )
 
-    glm_module = types.ModuleType("xllm.python.models.glm5_next")
-    glm_module._l2norm = lambda value, **_kwargs: value
-    monkeypatch.setitem(sys.modules, "xllm.python.models.glm5_next", glm_module)
+    monkeypatch.setattr(
+        sys.modules["xllm.python.kernels"],
+        "l2_norm",
+        lambda value, _eps=1e-6: value,
+        raising=False,
+    )
 
     return kernel_calls
 

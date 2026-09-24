@@ -30,6 +30,26 @@ from xllm.python.models.glm5_next import _KDA_IN_PROJ
 _ATTENTION_PREFIX = "model.layers.0.self_attn."
 
 
+def _l2_normalize(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    value_fp32 = value.to(torch.float32)
+    return value_fp32 * torch.rsqrt(value_fp32.square().sum(dim=-1, keepdim=True) + eps)
+
+
+@torch.inference_mode()
+def test_kda_gate_parameters_stay_fp32_across_model_dtype_cast() -> None:
+    config = glm5_next.Glm5NextConfig(kda_num_heads=8, kda_head_dim=8)
+    gate = glm5_next.Glm5NextForgetGate(config, torch.bfloat16, torch.device("cpu"))
+    gate.A_log.fill_(0.123456789)
+    gate.dt_bias.fill_(-0.987654321)
+    gate.to(dtype=torch.bfloat16)
+
+    assert gate.A_log.dtype == torch.float32
+    assert gate.dt_bias.dtype == torch.float32
+    assert gate.f_b_proj.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(gate.A_log, torch.full_like(gate.A_log, 0.123456789), rtol=0, atol=0)
+    torch.testing.assert_close(gate.dt_bias, torch.full_like(gate.dt_bias, -0.987654321), rtol=0, atol=0)
+
+
 class _StateDict:
     def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
         self.tensors = tensors
@@ -381,8 +401,8 @@ def test_chunk_kda_varlen_matches_independent_sequences(npu_runtime: ModuleType)
     def _random(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         return torch.randn(shape, generator=generator).to(device=device, dtype=dtype)
 
-    query = glm5_next._l2norm(_random((1, num_tokens, num_heads, head_dim), torch.float32), dim=-1).to(torch.bfloat16)
-    key = glm5_next._l2norm(_random((1, num_tokens, num_heads, head_dim), torch.float32), dim=-1).to(torch.bfloat16)
+    query = _l2_normalize(_random((1, num_tokens, num_heads, head_dim), torch.float32)).to(torch.bfloat16)
+    key = _l2_normalize(_random((1, num_tokens, num_heads, head_dim), torch.float32)).to(torch.bfloat16)
     value = _random((1, num_tokens, num_heads, head_dim), torch.bfloat16)
     raw_gate = _random((1, num_tokens, num_heads, head_dim), torch.bfloat16)
     beta = _random((1, num_tokens, num_heads), torch.bfloat16).float().sigmoid()
