@@ -128,8 +128,11 @@ class AttentionMetadata(Protocol):
     linear_state_read_indices: torch.Tensor | None
     linear_state_write_indices: torch.Tensor | None
     kpool_query_lens: Sequence[int]
-    num_accepted_tokens: torch.Tensor | None
+    linear_state_ids: Sequence[int]
     has_initial_state: torch.Tensor | None
+    num_accepted_tokens: torch.Tensor | None
+    num_accepted_tokens_host_values: Sequence[int]
+    query_start_loc: Sequence[int]
     dp_execution_token_counts: Sequence[int]
     raw_dp_execution_token_counts: Sequence[int]
     # Host-planned logical KV lengths for all DP ranks, including this query.

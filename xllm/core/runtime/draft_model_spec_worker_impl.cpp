@@ -324,7 +324,8 @@ void DraftModelSpecWorkerImpl::finalize_hierarchy_kv_cache_transfers() {
 }
 
 void DraftModelSpecWorkerImpl::init_embedding_cache(int64_t num_blocks) {
-  embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
+  embedding_cache_ = std::make_shared<EmbeddingCache>(
+      num_blocks, requires_full_target_replay());
   const int64_t placeholder_size = get_embedding_placeholder_size();
   if (placeholder_size > 0) {
     embedding_cache_->set_placeholder(
@@ -356,6 +357,8 @@ bool DraftModelSpecWorkerImpl::allocate_kv_cache(
     const KVCacheShape& kv_cache_shape) {
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
+  // MTP must fix its context policy before either pool or transfer is created.
+  static_cast<void>(requires_full_target_replay());
   prepare_hierarchy_kv_cache_transfers();
 
   return allocate_pools(kv_cache_shape,
@@ -369,6 +372,7 @@ bool DraftModelSpecWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
+  static_cast<void>(requires_full_target_replay());
   prepare_hierarchy_kv_cache_transfers();
 
   if (kv_cache_transfer_ == nullptr) {

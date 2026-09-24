@@ -18,12 +18,14 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <butil/iobuf.h>
 #include <glog/logging.h>
+#include <google/protobuf/message.h>
 #include <json2pb/pb_to_json.h>
 
 #include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "anthropic.pb.h"
 #include "api_service/anthropic_json.h"
@@ -95,6 +97,15 @@ class StreamCall : public Call {
     return true;
   }
 
+  // For non-streaming plain-text responses.
+  bool write_text_and_finish(std::string_view text) {
+    controller_->http_response().set_content_type("text/plain; charset=utf-8");
+    controller_->response_attachment().append(text.data(), text.size());
+    XLLM_VERBOSE_TRACE() << "event=response_serialized x-request-id="
+                         << x_request_id_;
+    return true;
+  }
+
   bool finish_with_error(const StatusCode& code,
                          const std::string& error_message) {
     XLLM_VERBOSE_TRACE() << "event=request_error x-request-id=" << x_request_id_
@@ -111,21 +122,23 @@ class StreamCall : public Call {
     return true;
   }
 
-  // For stream response
-  bool write(Response& response) {
+  // Writes one SSE event ("data: {json}\n\n"). Stream chunks may use a
+  // different proto type from the non-streaming response. Returns false on
+  // serialization failure or client disconnect.
+  bool write(const google::protobuf::Message& message) {
     io_buf_.clear();
     io_buf_.append("data: ");
     butil::IOBufAsZeroCopyOutputStream json_output(&io_buf_);
     std::string err_msg;
     if (!json2pb::ProtoMessageToJson(
-            response, &json_output, json_options_, &err_msg)) {
+            message, &json_output, json_options_, &err_msg)) {
       LOG(ERROR) << "Failed to convert proto to json: " << err_msg;
       return false;
     }
     io_buf_.append("\n\n");
 
     connection_status_ |= pa_->Write(io_buf_);
-    return true;
+    return connection_status_ == 0;
   }
 
   // For stream response

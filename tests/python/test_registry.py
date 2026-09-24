@@ -40,6 +40,18 @@ def test_glm5_next_text_and_vl_registry_entries_are_distinct(monkeypatch: pytest
     assert vl_cls.__name__ == "Glm5NextVLModel"
 
 
+@pytest.mark.parametrize("name", ["deepseek_v4_mtp", "DeepseekV4MtpForCausalLM"])
+def test_deepseek_v4_mtp_registry_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
+
+    model_class = registry.get_model_class(name)
+
+    assert model_class.__name__ == "DeepseekV4MtpForCausalLM"
+
+
 def test_qwen35_registers_execution_metadata_builder_class() -> None:
     builder_classes = registry.get_execution_metadata_builder_classes("qwen3_5_moe_text")
 

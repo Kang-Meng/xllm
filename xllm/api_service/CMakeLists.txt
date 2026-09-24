@@ -25,12 +25,14 @@ cc_library(
     rerank_service_impl.h
     qwen3_rerank_service_impl.h
     non_stream_call.h
+    multipart_parser.h
     service_impl_factory.h
     serving_mode.h
     stream_call.h
     models_service_impl.h
     stream_output_parser.h
     mm_service_utils.h
+    speech_to_text_service_impl.h
     embedding_output_builder.h
     utils.h
   SRCS
@@ -54,6 +56,8 @@ cc_library(
     video_generation_service_impl.cpp
     models_service_impl.cpp
     rerank_service_impl.cpp
+    multipart_parser.cpp
+    speech_to_text_service_impl.cpp
     stream_output_parser.cpp
     qwen3_rerank_service_impl.cpp
     embedding_output_builder.cpp

@@ -35,12 +35,15 @@ from typing import Sequence
 
 import torch
 
+from xllm.python.platform import current_platform
+
 # ---------------------------------------------------------------------------
 # Cache-type enum (mirrors ``DSACacheType`` in dsa_metadata.h).
 # ---------------------------------------------------------------------------
 DSA_CACHE_TOKEN = 0
 DSA_CACHE_SEQUENCE = 1
 DSA_CACHE_SLIDING_WINDOW = 2
+DSV4_COMPRESSED_BLOCK_TOKEN_SIZE = 128 if current_platform.is_mlu() else 2048
 
 
 @dataclass
@@ -169,7 +172,7 @@ def build_cache_specs(
     (sliding-window) group; TOKEN groups for ratios {4, 128} are registered in
     the order they first appear.
     """
-    base_block_size = 128
+    compressed_block_sizes = {ratio: DSV4_COMPRESSED_BLOCK_TOKEN_SIZE // ratio for ratio in (4, 128)}
     group_infos: list[DSAGroupInfo] = []
     group_key_map: dict[tuple[int, int, int], int] = {}
 
@@ -187,7 +190,7 @@ def build_cache_specs(
     for ratio in compress_ratios:
         cr = _normalize_compress_ratio(ratio)
         if cr in (4, 128):
-            register_group(DSA_CACHE_TOKEN, cr, base_block_size)
+            register_group(DSA_CACHE_TOKEN, cr, compressed_block_sizes[cr])
 
     caches_info: list[list[DSACacheInfo]] = [[] for _ in range(n_layers)]
     for layer_id in range(n_layers):
@@ -200,18 +203,18 @@ def build_cache_specs(
             # cmp_kv, cmp_index, swa, kv_state, score_state, idx_kv,
             # idx_score, indexer_scale.
             entries = [
-                (DSA_CACHE_TOKEN, 4, base_block_size),
-                (DSA_CACHE_TOKEN, 4, base_block_size),
+                (DSA_CACHE_TOKEN, 4, compressed_block_sizes[4]),
+                (DSA_CACHE_TOKEN, 4, compressed_block_sizes[4]),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_TOKEN, 4, base_block_size),
+                (DSA_CACHE_TOKEN, 4, compressed_block_sizes[4]),
             ]
         elif cr == 128:
             entries = [
-                (DSA_CACHE_TOKEN, 128, base_block_size),
+                (DSA_CACHE_TOKEN, 128, compressed_block_sizes[128]),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
                 (DSA_CACHE_SLIDING_WINDOW, 1, window_size),

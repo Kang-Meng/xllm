@@ -84,6 +84,24 @@ struct has_logits_with_hidden<T,
     : std::true_type {};
 
 template <typename T, typename = void>
+struct has_loaded_vocab_weights : std::false_type {};
+
+template <typename T>
+struct has_loaded_vocab_weights<
+    T,
+    std::void_t<decltype(std::declval<T>()->has_loaded_vocab_weights())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_loaded_vocab_weights_capability : std::false_type {};
+
+template <typename T>
+struct has_loaded_vocab_weights_capability<
+    T,
+    std::void_t<decltype(std::declval<T>()->reports_loaded_vocab_weights())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
 struct has_lazy_load_model : std::false_type {};
 
 template <typename T>

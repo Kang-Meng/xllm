@@ -28,12 +28,3 @@ class NpuQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
     gated_delta_net_cls = NpuQwen3_5GatedDeltaNet
     sparse_moe_cls = NpuQwen3_5SparseMoEBlock
     normalization_cls = NpuGemmaRMSNorm
-
-    def _prepare_forward(self) -> None:
-        if self.layer_id == 0:
-            # TODO: Remove this backend-local workaround once TileLang's dynamic
-            # symbol cache can safely persist between service forwards.
-            import tilelang
-
-            tilelang.disable_cache()
-            tilelang.cache.clear_cache()

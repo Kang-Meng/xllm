@@ -28,6 +28,7 @@ limitations under the License.
 #include "framework/block/block_utils.h"
 #include "framework/block/linear_state_block_manager.h"
 #include "framework/config/scheduler_config.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
 #include "framework/request/stopping_checker.h"
@@ -42,12 +43,10 @@ namespace {
 constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
 constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
 constexpr uint32_t kMaxTokensPerBatch = 1280;
+constexpr uint32_t kCompressedBlockTokenSize = kDsv4CompressedBlockTokenSize;
 
-// Base block_size = 128. Two BlockManagerImpl: compress_ratio 4 and 128.
-// - Ratio 4: block_size = 128*4 = 512, num_blocks = base_num_blocks/4.
-// - Ratio 128: block_size = 128*128 = 16384, num_blocks = base_num_blocks/128.
-// Use base_num_blocks = 128*32 = 4096 so that ratio-4 has 1024 blocks,
-// ratio-128 has 32 blocks (ratio-4 block count is 32x ratio-128).
+// C4 and C128 cover the same number of original tokens per logical block, so
+// a base token capacity maps to equal typed block counts.
 BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
                                            uint32_t block_size,
                                            uint32_t window_size,
@@ -58,12 +57,16 @@ BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
       (kMaxTokensPerBatch + block_size - 1) / block_size;
   const uint32_t swa_num_blocks = swa_blocks_per_seq * max_seqs_per_batch +
                                   burst_blocks + max_seqs_per_batch + 2;
+  const uint32_t compressed_num_blocks =
+      base_num_blocks * block_size / kCompressedBlockTokenSize;
   BlockManager::Options opts;
   opts.num_blocks(base_num_blocks)
       .block_size(block_size)
       .sliding_window_size(window_size)
       .swa_blocks_per_seq(swa_blocks_per_seq)
       .swa_num_blocks(swa_num_blocks)
+      .c4_num_blocks(compressed_num_blocks)
+      .c128_num_blocks(compressed_num_blocks)
       .max_tokens_per_batch(kMaxTokensPerBatch)
       .max_seqs_per_batch(max_seqs_per_batch)
       .manager_types({kManagerTypeSlidingWindowBlockManager,
@@ -88,12 +91,8 @@ void set_swa_capacity_for_token_budget(BlockManager::Options* options,
 }
 
 constexpr uint32_t kBaseBlockSize = 128;
-constexpr uint32_t kCompressRatio4 = 4;
-constexpr uint32_t kCompressRatio128 = 128;
-// Sub-manager 1 (ratio 4): block_size = 128*4 = 512.
-constexpr uint32_t kBlockSizeRatio4 = kBaseBlockSize * kCompressRatio4;
-// Sub-manager 2 (ratio 128): block_size = 128*128 = 16384.
-constexpr uint32_t kBlockSizeRatio128 = kBaseBlockSize * kCompressRatio128;
+constexpr uint32_t kBlockSizeRatio4 = kCompressedBlockTokenSize;
+constexpr uint32_t kBlockSizeRatio128 = kCompressedBlockTokenSize;
 
 inline size_t CeilBlocks(size_t num_tokens, size_t block_size) {
   return (num_tokens + block_size - 1) / block_size;
@@ -116,7 +115,7 @@ Sequence MakeTestSequence(size_t index,
     return checker;
   }();
   SequenceParams seq_params;
-  // Large enough to hold DSV4-scale prompts (>= a full C128 block = 16384
+  // Large enough to hold DSV4-scale prompts (>= a full compressed block = 2048
   // tokens). Individual tests can still use short prompts; sequence capacity
   // just has to bound `num_tokens + max_generated_tokens`.
   seq_params.seq_capacity = 65536;
@@ -423,7 +422,7 @@ TEST(CompositeBlockManagerTest, SlidingWindowLeafAcceptsNullSequence) {
 
 TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
   const uint32_t base_block_size = kBaseBlockSize;
-  const uint32_t base_num_blocks = 4096;  // ratio-4: 1024 blocks, ratio-128: 32
+  const uint32_t base_num_blocks = 4096;  // C4/C128: 256 blocks each.
   const uint32_t window_size = 128;
   const uint32_t max_seqs_per_batch = 4;
 
@@ -450,7 +449,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
     EXPECT_EQ(b.size(), base_block_size);
   }
 
-  // BlockManagerImpl compress_ratio 4, block_size=128*4=512.
+  // C4 logical block size is 2048 original tokens.
   const size_t expected_blocks_1 = CeilBlocks(num_tokens, kBlockSizeRatio4);
   EXPECT_EQ(c4.size(), expected_blocks_1);
   for (const auto& b : c4) {
@@ -458,7 +457,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
     EXPECT_EQ(b.size(), kBlockSizeRatio4);
   }
 
-  // BlockManagerImpl compress_ratio 128, block_size=128*128=16384.
+  // C128 logical block size is also 2048 original tokens.
   const size_t expected_blocks_2 = CeilBlocks(num_tokens, kBlockSizeRatio128);
   EXPECT_EQ(c128.size(), expected_blocks_2);
   for (const auto& b : c128) {
@@ -480,8 +479,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
-  // Seq1: 1024 tokens. Ratio 4: ceil(1024/512)=2; ratio 128:
-  // ceil(1024/16384)=1.
+  // Seq1: 1024 tokens. Both compressed groups need one logical block.
   Sequence seq1 = MakeTestSequence(0, std::vector<int32_t>(1024, 1));
   EXPECT_TRUE(manager.allocate_sequence(&seq1, 1024));
   const std::vector<Block> s1_swa = SwaBlocks(seq1);
@@ -491,9 +489,9 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
   EXPECT_EQ(s1_c4.size(), CeilBlocks(1024, kBlockSizeRatio4));
   EXPECT_EQ(s1_c128.size(), CeilBlocks(1024, kBlockSizeRatio128));
 
-  // Seq2: 1400 tokens. Ratio 4: ceil(1400/512)=3; ratio 128:
-  // ceil(1400/16384)=1. Keep total SWA logical blocks within the dynamic
-  // pool budget derived from max_tokens_per_batch.
+  // Seq2: 1400 tokens. Both compressed groups need one 2048-token logical
+  // block. Keep total SWA logical blocks within the dynamic pool budget
+  // derived from max_tokens_per_batch.
   Sequence seq2 = MakeTestSequence(1, std::vector<int32_t>(1400, 1));
   EXPECT_TRUE(manager.allocate_sequence(&seq2, 1400));
   const std::vector<Block> s2_swa = SwaBlocks(seq2);
@@ -794,36 +792,26 @@ TEST(CompositeBlockManagerTest,
   seq.reset();
 }
 
-// Finding 3 regression: composite capacity stats must report a single admission
-// leaf's raw block count (the smallest-block-size one = C4 here), NOT a min/sum
-// mix across C4+C128. C128's raw count (32) must never define pool capacity,
-// otherwise schedulers (which read num_free * block_size() as base tokens)
-// badly under-estimate capacity.
-TEST(CompositeBlockManagerTest, CapacityStatsUseFinestAdmissionLeaf) {
-  // base_num_blocks=4096 -> C4: 4096/4=1024 blocks (bs=512);
-  //                         C128: 4096/128=32 blocks (bs=16384).
+TEST(CompositeBlockManagerTest, CapacityStatsUseBaseBlockUnits) {
+  // base_num_blocks=4096 -> C4/C128: 256 blocks * 2048 tokens. Public
+  // capacity remains expressed as 4096 base blocks of 128 tokens.
   BlockManager::Options opts =
       MakeCompositeOptions(4096, kBaseBlockSize, 128, 4);
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
-  // num_total_blocks must equal the C4 leaf's total (1024 - padding), i.e. far
-  // larger than C128's 32. Assert it is well above the C128 count so a min/sum
-  // regression (which would yield ~32 or 1024+32) is caught.
   const size_t total = manager.num_total_blocks();
-  EXPECT_GT(total, 900u);   // C4 ~1023, not C128's ~31
-  EXPECT_LT(total, 1100u);  // not C4+C128 sum territory either
+  EXPECT_EQ(total, (256u - 1u) * 16u);
 
   // Free (no sequence yet) equals total; used is 0.
   EXPECT_EQ(manager.num_free_blocks(), total);
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 
-  // After allocating one sequence, used reflects ONLY the C4 leaf (capacity
-  // leaf), not a C4+C128 sum.
+  // After allocating one sequence, used remains normalized to base blocks.
   Sequence seq = MakeTestSequence(0, std::vector<int32_t>(1024, 1));
   ASSERT_TRUE(manager.allocate_sequence(&seq, 1024));
   const size_t c4_used = C4Blocks(seq).size();  // capacity leaf's used count
-  EXPECT_EQ(manager.num_used_blocks(), c4_used);
-  EXPECT_EQ(manager.num_free_blocks(), total - c4_used);
+  EXPECT_EQ(manager.num_used_blocks(), c4_used * 16);
+  EXPECT_EQ(manager.num_free_blocks(), total - c4_used * 16);
 
   manager.deallocate_for_sequence(&seq);
 }
@@ -831,8 +819,8 @@ TEST(CompositeBlockManagerTest, CapacityStatsUseFinestAdmissionLeaf) {
 // DSV4 prefix cache: a fresh sequence with the same prompt as a previously
 // released sequence should mount shared blocks from all three prefix-cache
 // leaves (SWA / C4 / C128). The composite takes the cross-leaf min hit length
-// clamped to a C128 block, so the prompt has to span at least one C128 block
-// (128 * base = 16384 tokens) for the hit to be non-trivial. Uses a 2*C128
+// clamped to a common compressed block, so the prompt has to span at least
+// 2048 tokens for the hit to be non-trivial. Uses a two-unit
 // prompt so we get a meaningful hit even after the exact-repeat pop.
 TEST(CompositeBlockManagerTest, Dsv4PrefixCacheHitOnRepeatedPrefix) {
   const uint32_t base_num_blocks = 4096;
@@ -921,7 +909,8 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheMissCleanly) {
 TEST(CompositeBlockManagerTest, Dsv4PrefixCacheEvictsAtC128Capacity) {
   // C128 has four physical blocks and each prompt consumes two. The third
   // distinct prompt must evict the first prompt from both compressed leaves.
-  const uint32_t base_num_blocks = 4 * kCompressRatio128;
+  const uint32_t base_num_blocks =
+      4 * kCompressedBlockTokenSize / kBaseBlockSize;
   const uint32_t window_size = 4 * kBaseBlockSize;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, /*max_seqs_per_batch=*/1);
@@ -1011,8 +1000,8 @@ TEST(CompositeBlockManagerTest,
 
   seq.kv_state().incr_kv_cache_tokens_num(first_chunk_tokens);
 
-  // The first block is outside the two-block window. No C128 cache unit is
-  // complete yet, so the next growth releases it directly and reuses its
+  // The first block is outside the two-block window. No compressed-cache unit
+  // is complete yet, so the next growth releases it directly and reuses its
   // physical id without publishing a partial DSV4 prefix.
   ASSERT_TRUE(manager.allocate_sequence(&seq, second_chunk_tokens));
   const std::vector<Block> swa_blocks = SwaBlocks(seq);
@@ -1066,7 +1055,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCachePostGrowCursorAdvances) {
   EXPECT_EQ(manager.leaf_entries()
                 .at(BlockType::C4)
                 .leaf->num_blocks_in_prefix_cache(),
-            32u);
+            1u);
   EXPECT_EQ(manager.leaf_entries()
                 .at(BlockType::C128)
                 .leaf->num_blocks_in_prefix_cache(),
@@ -1084,7 +1073,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheSkipsPartialCacheUnitTail) {
   set_swa_capacity_for_token_budget(&opts, 2 * kBlockSizeRatio128);
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
-  const size_t completed_tokens = kBlockSizeRatio128 + kBlockSizeRatio4;
+  const size_t completed_tokens = kBlockSizeRatio128 + kBaseBlockSize;
   Sequence seq =
       MakeTestSequence(0, std::vector<int32_t>(completed_tokens, 17));
   ASSERT_TRUE(manager.allocate_sequence(&seq, completed_tokens));
@@ -1098,7 +1087,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheSkipsPartialCacheUnitTail) {
   EXPECT_EQ(manager.leaf_entries()
                 .at(BlockType::C4)
                 .leaf->num_blocks_in_prefix_cache(),
-            32u);
+            1u);
   EXPECT_EQ(manager.leaf_entries()
                 .at(BlockType::C128)
                 .leaf->num_blocks_in_prefix_cache(),

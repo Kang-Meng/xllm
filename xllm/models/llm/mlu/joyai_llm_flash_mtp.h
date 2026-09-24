@@ -24,6 +24,8 @@ class JoyAILLMFlashMtpForCausalLMImpl
   JoyAILLMFlashMtpForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekMtpModel>(context) {}
 
+  bool reports_loaded_vocab_weights() const { return true; }
+
   void load_model(
       std::unique_ptr<ModelLoader> loader,
       std::string prefix = "model." /*llm model weight prefix*/) override {

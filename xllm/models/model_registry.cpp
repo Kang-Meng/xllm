@@ -327,6 +327,16 @@ void ModelRegistry::register_mtp_capabilities(
   get_instance()->model_registry_[name].mtp_capabilities = capabilities;
 }
 
+MtpModelCapabilities ModelRegistry::get_mtp_capabilities(
+    const std::string& name) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(name);
+  if (it == registry.end()) {
+    return MtpModelCapabilities();
+  }
+  return it->second.mtp_capabilities;
+}
+
 void ModelRegistry::configure_mtp_args(ModelArgs& args,
                                        std::string_view algorithm,
                                        bool is_draft_engine,

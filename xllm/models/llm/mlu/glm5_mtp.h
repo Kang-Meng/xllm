@@ -25,6 +25,8 @@ class Glm5MtpForCausalLMImpl : public LlmForCausalLMImplBase<DeepseekMtpModel> {
   Glm5MtpForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekMtpModel>(context) {}
 
+  bool reports_loaded_vocab_weights() const { return true; }
+
   void load_model(
       std::unique_ptr<ModelLoader> loader,
       std::string prefix = "model." /*llm model weight prefix*/) override {

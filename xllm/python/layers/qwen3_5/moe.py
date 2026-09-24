@@ -98,6 +98,9 @@ class Qwen3_5SparseMoEBlockBase(nn.Module, ABC):
 
         self.shared_expert.load_weights(state.with_prefix("shared_expert."), context)
 
+    def process_weights_after_loading(self) -> None:
+        self.shared_expert.process_weights_after_loading()
+
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         routed = self.experts(hidden)
         shared = self.shared_expert(hidden)

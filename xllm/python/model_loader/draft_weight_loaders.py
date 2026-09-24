@@ -82,7 +82,7 @@ def _create_lm_head_shard(
 
     return ColumnParallelLinear(
         cfg.hidden_size,
-        cfg.vocab_size // tp_size,
+        (getattr(cfg, "draft_vocab_size", 0) or cfg.vocab_size) // tp_size,
         tp_size,
         gather_output=True,
         dtype=dtype,

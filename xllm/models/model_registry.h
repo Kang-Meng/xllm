@@ -61,6 +61,9 @@ struct MtpModelCapabilities {
   // A platform-native implementation must explicitly opt out until its cache
   // updates and graph execution support cross-step index sharing.
   bool supports_native_index_share_for_iteration = true;
+  bool supports_accepted_span_replay = false;
+  bool native_draft_owns_embedding_and_lm_head = false;
+  bool python_draft_owns_embedding_and_lm_head = false;
 };
 
 using QuantArgsLoader =
@@ -120,6 +123,8 @@ class ModelRegistry {
 
   static void register_mtp_capabilities(const std::string& name,
                                         MtpModelCapabilities capabilities);
+
+  static MtpModelCapabilities get_mtp_capabilities(const std::string& name);
 
   static void configure_mtp_args(ModelArgs& args,
                                  std::string_view algorithm,

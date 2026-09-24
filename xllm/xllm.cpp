@@ -35,6 +35,7 @@ namespace py = pybind11;
 #include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -984,10 +985,31 @@ class VendorConfigLock {
 }  // namespace
 #endif
 
+// Flush logs/stdio and hard-exit without running global/static destructors.
+//
+// This binary embeds CPython (pybind11) and intentionally never finalizes it.
+// Returning from main (or calling exit()) would destroy global pybind11 type
+// objects during static teardown without holding the GIL, aborting the process
+// with "pybind11::handle::dec_ref() ... PyGILState_Check() failure" whenever a
+// server is stopped (observed on every NPU DeepSeek-V4 eager/MTP run once the
+// HTTP server finishes serving). Bypassing atexit/static teardown lets the OS
+// reclaim the interpreter; glog/stdio are flushed explicitly first so no log
+// records are lost.
+[[noreturn]] void exit_without_python_teardown(int exit_code) {
+  google::FlushLogFiles(google::GLOG_INFO);
+  fflush(nullptr);
+  std::_Exit(exit_code);
+}
+
+// Signal handlers may only call async-signal-safe functions. In particular,
+// neither logging nor flushing is safe here, so exit without any teardown.
+[[noreturn]] void exit_immediately_without_python_teardown(int exit_code) {
+  std::_Exit(exit_code);
+}
+
 void shutdown_handler(int signal) {
-  // TODO: gracefully shutdown the server
-  LOG(WARNING) << "Received signal " << signal << ", stopping server...";
-  exit(1);
+  (void)signal;
+  exit_immediately_without_python_teardown(1);
 }
 
 void validate_config(const std::string& model_type) {
@@ -1094,6 +1116,14 @@ void validate_config(const std::string& model_type) {
                     "speculative decoding. "
                  << "Disabling enable_graph_double_buffer.";
     execution_config.enable_graph_double_buffer(false);
+  }
+  if (SpeculativeConfig::is_dspark_algorithm(
+          speculative_config.speculative_algorithm()) &&
+      execution_config.enable_graph()) {
+    LOG(WARNING)
+        << "ACL graph is not supported with DSpark speculative "
+           "decoding (eager-only verify path). Disabling enable_graph.";
+    execution_config.enable_graph(false);
   }
   // enable_xtensor / enable_rolling_load imply enable_manual_loader
   if ((kv_cache_config.enable_xtensor() || load_config.enable_rolling_load()) &&
@@ -1268,7 +1298,7 @@ int run() {
     if (!xllm_server->start(std::move(api_service))) {
       LOG(ERROR) << "Failed to start brpc server on port "
                  << service_config.port();
-      return -1;
+      exit_without_python_teardown(1);
     }
   } else {
     // No HTTP server on this rank. Stay alive until SIGINT/SIGTERM so
@@ -1276,7 +1306,12 @@ int run() {
     master->wait();
   }
 
-  return 0;
+  // Join serving threads through the master destructor, then hard-exit instead
+  // of returning to main: normal exit would run global/static destructors that
+  // release pybind11 type objects without the GIL (see
+  // exit_without_python_teardown).
+  master.reset();
+  exit_without_python_teardown(0);
 }
 
 int main(int argc, char** argv) {

@@ -425,6 +425,72 @@ void append_decode_row(const DecodeRowContext& ctx,
   }
 }
 
+MtpReplayInputs build_mtp_replay_inputs(
+    const DecodeRowContext& ctx,
+    const std::vector<EmbeddingCache::DecodeState>& states,
+    const torch::Tensor& placeholder,
+    int32_t block_size,
+    int32_t uniform_width,
+    bool is_graph_warmup) {
+  CHECK_EQ(states.size(), static_cast<size_t>(ctx.num_sequences));
+  CHECK_GE(uniform_width, 0);
+  MtpReplayInputs result;
+  int32_t capacity = 0;
+  for (const auto& state : states) {
+    capacity += uniform_width > 0
+                    ? uniform_width
+                    : std::max<int32_t>(1, state.replay_token_ids.size());
+  }
+  result.rows.out_token_ids.reserve(capacity);
+  result.rows.out_positions.reserve(capacity);
+  result.rows.out_new_cache_slots.reserve(capacity);
+  result.rows.out_kv_seq_lens.reserve(capacity + 1);
+  result.rows.out_q_seq_lens.reserve(capacity + 1);
+  result.rows.out_q_cu_seq_lens.reserve(capacity + 1);
+  result.rows.out_block_tables.reserve(capacity * ctx.block_table_stride);
+  result.embeddings.reserve(capacity);
+  result.selected_rows.reserve(ctx.num_sequences);
+  result.source_sequences.reserve(capacity);
+  result.valid_rows.reserve(capacity);
+  for (int32_t seq_id = 0; seq_id < ctx.num_sequences; ++seq_id) {
+    const auto& state = states[seq_id];
+    const int32_t span = static_cast<int32_t>(state.replay_token_ids.size());
+    CHECK(state.valid || is_graph_warmup)
+        << "MTP replay requires target context";
+    if (state.valid) {
+      CHECK_GT(span, 0);
+      CHECK_EQ(state.replay_token_ids.back(), ctx.token_ids[seq_id]);
+      CHECK(state.replay_embeddings.defined());
+      CHECK_EQ(state.replay_embeddings.dim(), 2);
+      CHECK_EQ(state.replay_embeddings.size(0), span);
+      CHECK_GE(ctx.positions[seq_id], span);
+    }
+    const int32_t width = uniform_width > 0 ? uniform_width : std::max(1, span);
+    CHECK_GE(width, span);
+    const int32_t padding = width - span;
+    for (int32_t row_id = 0; row_id < width; ++row_id) {
+      const int32_t replay_id = row_id - padding;
+      const bool valid = replay_id >= 0;
+      RowSpec row;
+      row.seq_id = seq_id;
+      row.token_id = valid ? state.replay_token_ids[replay_id] : 0;
+      row.position_offset = valid ? replay_id - span : -ctx.positions[seq_id];
+      row.append_q_len_one = true;
+      row.append_block_table = true;
+      append_decode_row(ctx, row, block_size, result.rows);
+      if (!valid) {
+        result.rows.out_new_cache_slots.back() = 0;
+      }
+      result.embeddings.emplace_back(
+          valid ? state.replay_embeddings.select(0, replay_id) : placeholder);
+      result.source_sequences.emplace_back(seq_id);
+      result.valid_rows.emplace_back(valid ? 1 : 0);
+    }
+    result.selected_rows.emplace_back(result.embeddings.size() - 1);
+  }
+  return result;
+}
+
 TokenWithOffset resolve_token_with_position_offset(
     int32_t input_token_id,
     int32_t seq_id,
@@ -537,6 +603,30 @@ void update_input_params(ModelInputParams& input_params,
       }
     }
   }
+}
+
+void update_execution_batch_metadata(
+    ModelInputParams& input_params,
+    std::vector<int32_t> num_scheduled_tokens) {
+  ExecutionBatchMetadata& metadata = input_params.execution_batch;
+  CHECK_EQ(num_scheduled_tokens.size(), static_cast<size_t>(metadata.num_reqs))
+      << "speculative execution widths must remain request-scoped";
+
+  std::vector<int32_t> query_start_loc;
+  query_start_loc.reserve(num_scheduled_tokens.size() + 1);
+  query_start_loc.emplace_back(0);
+  for (int32_t num_tokens : num_scheduled_tokens) {
+    CHECK_GT(num_tokens, 0)
+        << "each speculative request must execute at least one token";
+    CHECK_LE(num_tokens,
+             std::numeric_limits<int32_t>::max() - query_start_loc.back())
+        << "speculative execution token count exceeds int32 range";
+    query_start_loc.emplace_back(query_start_loc.back() + num_tokens);
+  }
+
+  metadata.num_tokens = query_start_loc.back();
+  metadata.num_scheduled_tokens = std::move(num_scheduled_tokens);
+  metadata.query_start_loc = std::move(query_start_loc);
 }
 
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {

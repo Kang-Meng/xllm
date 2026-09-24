@@ -34,15 +34,13 @@ from torch.distributed import ProcessGroup
 
 _GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp"))
 # ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
-# ``moe_ep``, ``cp`` and ``dcp`` stride across those blocks. Both layouts follow
-# from how the caller derives a rank within each group, so a group's full
-# membership is determined by its own size and needs no extra information from
-# the caller.
+# ``moe_ep``, ``cp`` and ``dcp`` stride across those blocks. Context groups also
+# need the within-DP stride when their world contains multiple DP cohorts.
 # ``cp`` strides by the attention TP size: ranks sharing a (dp, tp) slot but
 # holding different sequence shards form one CP group, matching the C++
 # compute_cp_group_ranks layout (rank = dp*cp*tp + cp_rank*tp + tp_rank).
-# ``dcp`` matches ParallelArgs::kv_split_rank when cp_size == 1:
-# rank_in_group = global_rank / (world / dcp_size).
+# CP and DCP callers with DP pass an explicit within-cohort stride.
+# DCP then matches the DP-local ownership in ParallelArgs::kv_split_rank.
 _CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp", "layerwise"))
 
 _groups = {}
@@ -122,7 +120,12 @@ def _ensure_world(
     _world_initialized = True
 
 
-def _group_memberships(group_name: str, world_size: int, global_world_size: int) -> list[list[int]]:
+def _group_memberships(
+    group_name: str,
+    world_size: int,
+    global_world_size: int,
+    group_stride: int | None = None,
+) -> list[list[int]]:
     """Every group of this kind, in an order all ranks agree on.
 
     ``new_group`` is collective over the whole world, so each rank has to create
@@ -130,6 +133,17 @@ def _group_memberships(group_name: str, world_size: int, global_world_size: int)
     """
     if world_size <= 0 or global_world_size % world_size:
         raise ValueError(f"{group_name} size {world_size} does not divide the world size {global_world_size}")
+    if group_stride is not None:
+        if group_name not in ("cp", "dcp") or group_stride <= 0 or global_world_size % (world_size * group_stride):
+            raise ValueError("CP/DCP group stride must describe complete DP cohorts")
+        # Context parallelism varies within one DP cohort; a global stride instead mixes
+        # different requests whenever DP > 1.
+        cohort_size = world_size * group_stride
+        return [
+            [base + tp_rank + cp_rank * group_stride for cp_rank in range(world_size)]
+            for base in range(0, global_world_size, cohort_size)
+            for tp_rank in range(group_stride)
+        ]
     count = global_world_size // world_size
     if group_name in _CONTIGUOUS_GROUPS:
         return [[index * world_size + offset for offset in range(world_size)] for index in range(count)]
@@ -166,6 +180,7 @@ def init_process_group(
     global_rank: int,
     global_world_size: int,
     group_index: int,
+    group_stride: int | None = None,
 ) -> ProcessGroup:
     if group_name not in _GROUP_NAMES:
         raise ValueError(f"unsupported parallel group: {group_name}")
@@ -186,7 +201,7 @@ def init_process_group(
 
     own = None
     own_ranks = None
-    memberships = _group_memberships(group_name, world_size, global_world_size)
+    memberships = _group_memberships(group_name, world_size, global_world_size, group_stride)
     for index, ranks in enumerate(memberships):
         candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
         if global_rank in ranks:
@@ -439,6 +454,9 @@ def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp
         output = x.new_empty((x.shape[0] * world_size, *x.shape[1:]))
         dist.all_gather_into_tensor(output, x.contiguous(), group=group)
         return output
+    # Non-row gathers can receive strided inputs. HCCL requires contiguous
+    # buffers; contiguous() reuses storage when the input is already contiguous.
+    x = x.contiguous()
     chunks = [torch.empty_like(x) for _ in range(world_size)]
     dist.all_gather(chunks, x, group=group)
     return torch.cat(chunks, dim=dim)

@@ -264,7 +264,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
                          c10::str(device_),
                          global_rank,
                          global_world_size,
-                         global_rank % tp_size_);
+                         global_rank % (global_world_size / dp_size_));
     }
     if (!is_deepseek_v4 && moe_tp_size_ > 1) {
       init_process_group("moe_tp",
@@ -300,13 +300,16 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
                          c10::str(device_),
                          global_rank,
                          global_world_size,
-                         cp_group_index);
+                         cp_group_index,
+                         tp_size_);
     }
     const int32_t kv_split_size = parallel_args.kv_split_size_effective();
     if (!is_deepseek_v4 && cp_size_ == 1 && kv_split_size > 1) {
+      CHECK_EQ(tp_size_ % kv_split_size, 0);
+      const int32_t dcp_stride = tp_size_ / kv_split_size;
       const int32_t dcp_rank = parallel_args.kv_split_rank();
       const int32_t dcp_group_index =
-          global_rank % (global_world_size / kv_split_size);
+          dp_rank_ * dcp_stride + tp_rank_ % dcp_stride;
       init_process_group("dcp",
                          parallel_args.python_rendezvous_host_,
                          parallel_args.python_rendezvous_port_,
@@ -315,7 +318,8 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
                          c10::str(device_),
                          global_rank,
                          global_world_size,
-                         dcp_group_index);
+                         dcp_group_index,
+                         dcp_stride);
     }
     if (!is_deepseek_v4 && layerwise_split_size_ > 1) {
       CHECK_EQ(tp_size_ % layerwise_split_size_, 0)

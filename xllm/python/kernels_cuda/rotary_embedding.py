@@ -80,6 +80,35 @@ def fused_qk_norm_rope(
     )
 
 
+def has_fused_qk_rotary(head_dim: int) -> bool:
+    """CUDA does not provide the fused CANN QK-RoPE operator."""
+    del head_dim
+    return False
+
+
+def apply_qk_rotary(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply joint half-layout RoPE to Q/K with shared full-width tables."""
+    del query, key, cosine, sine
+    raise NotImplementedError(
+        "apply_qk_rotary has no CUDA kernel; models on CUDA use the "
+        "apply_rotary_half path in xllm.python.layers.rotary_embedding"
+    )
+
+
+def expand_half_rope_table(half_table: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Duplicate a half-width cos/sin table into the fused-op full-width layout."""
+    del half_table, head_dim
+    raise NotImplementedError(
+        "expand_half_rope_table has no CUDA kernel; models on CUDA use the "
+        "apply_rotary_half path in xllm.python.layers.rotary_embedding"
+    )
+
+
 def interleaved_rotary_embedding(
     value: torch.Tensor,
     cosine: torch.Tensor,
@@ -145,7 +174,10 @@ def inplace_partial_rotary_mul(
 
 
 __all__ = [
+    "apply_qk_rotary",
+    "expand_half_rope_table",
     "fused_qk_norm_rope",
+    "has_fused_qk_rotary",
     "inplace_partial_rotary_mul",
     "interleaved_rotary_embedding",
     "mrope",

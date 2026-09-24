@@ -27,6 +27,7 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnDecodeMetadata,
     GdnMetadata,
     GdnPrefillMetadata,
+    GdnSpecVerifyMetadata,
 )
 from xllm.python.layers.qwen3_5.common import Qwen3_5GatedDeltaNetConfig
 from xllm.python.layers.qwen3_5.gated_delta_net import shard_qkv_rows
@@ -217,6 +218,7 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
             rank=context.tp_rank,
             world_size=context.tp_size,
         )
+        self.out_proj.process_weights_after_loading()
 
     def _project_prefill_inputs(
         self,
@@ -313,6 +315,91 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
             )
         return chunk_outputs[0] if len(chunk_outputs) == 1 else torch.cat(chunk_outputs, dim=0)
 
+    def _spec_verify(
+        self,
+        hidden: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        read_state_indices: torch.Tensor,
+        write_state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Verify a speculative token block via the fused MegaGdn MTP decode.
+
+        The kernel consumes dense per-sequence blocks ``[B, S, ...]``: the
+        speculative path packs exactly ``S`` tokens per sequence, where ``S`` is
+        the checkpoint stride carried by the (conv, ssm) cache shapes. State
+        read/write indices and accepted-token counts are sequence-scoped;
+        ``num_accepted_tokens`` lets the kernel commit recurrent state only up to
+        each sequence's accepted prefix.
+        """
+        num_accepted_tokens = num_accepted_tokens.to(device=hidden.device, dtype=torch.int32)
+
+        batch_size = read_state_indices.numel()
+        if batch_size <= 0 or write_state_indices.numel() != batch_size:
+            raise ValueError("Qwen3.5 MegaGdnMtpDecode requires one state slot per sequence")
+        if num_accepted_tokens.numel() != batch_size:
+            raise ValueError("Qwen3.5 MegaGdnMtpDecode accepted-token counts must be sequence-scoped")
+        total_tokens = hidden.shape[0]
+        if total_tokens % batch_size:
+            raise ValueError("Qwen3.5 MegaGdnMtpDecode packs one equal-width block per sequence")
+        sequence_length = total_tokens // batch_size
+        if not 2 <= sequence_length <= 17:
+            raise NotImplementedError("Qwen3.5 MegaGdnMtpDecode supports 2 to 17 verify tokens")
+
+        if conv_state.dim() != 3 or conv_state.shape[2] != self.conv_dim:
+            raise ValueError("Qwen3.5 MegaGdnMtpDecode received an invalid Conv cache")
+        if conv_state.shape[1] != sequence_length + 2:
+            raise ValueError("Qwen3.5 MegaGdnMtpDecode requires an S+2 Conv history")
+        if ssm_state.dim() != 4 or ssm_state.shape[1:] != (
+            self.num_v_heads,
+            self.key_head_dim,
+            self.value_head_dim,
+        ):
+            raise ValueError("Qwen3.5 MegaGdnMtpDecode received an invalid SSM cache")
+        if ssm_state.shape[0] != conv_state.shape[0] * sequence_length:
+            raise ValueError("Qwen3.5 MegaGdnMtpDecode requires one SSM checkpoint per verify token")
+        if self.conv1d_weight.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
+            raise NotImplementedError("Qwen3.5 MegaGdnMtpDecode Conv tensors must be BF16")
+        if ssm_state.dtype != torch.float32:
+            raise NotImplementedError("Qwen3.5 MegaGdnMtpDecode SSM cache must be FP32")
+
+        mixed_qkvz = self.in_proj_qkvz(hidden)
+        mixed_ba = self.in_proj_ba(hidden)
+        if mixed_qkvz.dtype != torch.bfloat16 or mixed_ba.dtype != torch.bfloat16:
+            raise NotImplementedError("Qwen3.5 MegaGdnMtpDecode projections must be BF16")
+        mixed_qkv, z = mixed_qkvz.split((self.conv_dim, self.value_dim), dim=-1)
+        b, a = mixed_ba.split((self.num_v_heads, self.num_v_heads), dim=-1)
+        mixed_qkv = mixed_qkv.view(batch_size, sequence_length, self.conv_dim)
+        z = z.view(batch_size, sequence_length, self.num_v_heads, self.value_head_dim)
+        b = b.view(batch_size, sequence_length, self.num_v_heads)
+        a = a.view(batch_size, sequence_length, self.num_v_heads)
+
+        read_state_indices = read_state_indices.contiguous()
+        write_state_indices = write_state_indices.contiguous()
+        chunk_outputs = []
+        for start in range(0, batch_size, _MEGA_GDN_MAX_DECODE_BATCH_SIZE):
+            end = min(start + _MEGA_GDN_MAX_DECODE_BATCH_SIZE, batch_size)
+            chunk_outputs.append(
+                kernels.mega_gdn_mtp_decode(
+                    mixed_qkv[start:end].contiguous(),
+                    z[start:end].contiguous(),
+                    b[start:end].contiguous(),
+                    a[start:end].contiguous(),
+                    self.conv1d_weight,
+                    conv_state,
+                    self.A_log,
+                    self.dt_bias,
+                    ssm_state,
+                    read_state_indices[start:end].contiguous(),
+                    write_state_indices[start:end].contiguous(),
+                    num_accepted_tokens[start:end].contiguous(),
+                    self.norm_weight,
+                    True,
+                )
+            )
+        return chunk_outputs[0] if len(chunk_outputs) == 1 else torch.cat(chunk_outputs, dim=0)
+
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         metadata = get_execution_context(GdnMetadata)
         if metadata is None:
@@ -340,6 +427,15 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
                 metadata.cu_seqlens.contiguous(),
                 self.norm_weight,
                 metadata.num_matrices,
+            )
+        elif isinstance(metadata, GdnSpecVerifyMetadata):
+            output = self._spec_verify(
+                hidden,
+                state_cache.conv_state,
+                state_cache.ssm_state,
+                metadata.read_state_indices,
+                metadata.write_state_indices,
+                metadata.num_accepted_tokens,
             )
         elif isinstance(metadata, GdnDecodeMetadata):
             output = self._decode(

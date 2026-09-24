@@ -44,6 +44,7 @@ _EXPORTS = {
         "fused_gdn_gating",
         "fused_sigmoid_gating_delta_rule_decode",
         "mega_gdn_decode",
+        "mega_gdn_mtp_decode",
         "mega_gdn_prefill",
     ),
     "linear": ("prepare_quant_weight", "prepare_row_parallel_weight"),
@@ -90,8 +91,11 @@ _EXPORTS = {
     ),
     "quantization": ("dynamic_quant", "quant_matmul", "quantize_per_tensor"),
     "rotary_embedding": (
+        "apply_qk_rotary",
         "build_split_qkv_rmsnorm_mrope_gather_pattern",
+        "expand_half_rope_table",
         "fused_qk_norm_rope",
+        "has_fused_qk_rotary",
         "has_split_qkv_rmsnorm_mrope_specialization",
         "interleaved_rotary_embedding",
         "npu_inplace_partial_rotary_mul",
@@ -144,6 +148,9 @@ __all__ = [
     "fused_qk_norm_rope",
     "build_split_qkv_rmsnorm_mrope_gather_pattern",
     "has_split_qkv_rmsnorm_mrope_specialization",
+    "apply_qk_rotary",
+    "expand_half_rope_table",
+    "has_fused_qk_rotary",
     "interleaved_rotary_embedding",
     "npu_inplace_partial_rotary_mul",
     "split_qkv_rmsnorm_mrope",
@@ -201,6 +208,7 @@ __all__ = [
     "fused_sigmoid_gating_delta_rule_decode",
     "chunk_gated_delta_rule",
     "mega_gdn_decode",
+    "mega_gdn_mtp_decode",
     "mega_gdn_prefill",
 ]
 _runtime_initialized = False

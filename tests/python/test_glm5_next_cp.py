@@ -20,6 +20,9 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn
 
+from xllm.python.layers import moe_parallel
+from xllm.python.layers.moe_parallel import TokenParallelLayout
+from xllm.python.model_executor import cp_utils
 from xllm.python.models import glm5_next
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 
@@ -134,6 +137,130 @@ def test_cp_model_loop_shards_rows_and_merges_final_hidden() -> None:
     torch.testing.assert_close(layers[0].attention_mask, torch.tensor([[True, False]]))
     assert layers[1].prev_topk is layers[0].output_topk
     torch.testing.assert_close(output, merged_output)
+
+
+class _SpMoe(glm5_next.Glm5NextMoE):
+    def __init__(self) -> None:
+        nn.Module.__init__(self)
+
+
+class _SpDecoder(nn.Module):
+    """Last sparse layer: keep only this TP rank's shard row."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer_id = 0
+        self.mlp = _SpMoe()
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prev_topk: torch.Tensor | None,
+        *,
+        input_layout: TokenParallelLayout | None = None,
+        output_layout: TokenParallelLayout | None = None,
+        token_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        assert output_layout is not None and output_layout.shard_tokens == 1
+        local = hidden[:, :1] + 1
+        return local, None
+
+
+def test_pcp_sp_gathers_tp_rows_before_cp_merge() -> None:
+    """CP=2, TP=4, 8 tokens: SP owns 1 row, CP merge needs all 4 local rows."""
+    events: list[str] = []
+    model, _layers = _make_model(events)
+    model.cfg = SimpleNamespace(
+        hidden_size=1,
+        hc_mult=4,
+        expert_parallel_degree=2,
+        eplv2_sequence_parallel=True,
+        tp_size=4,
+        tp_rank=0,
+        layers_to_capture=(),
+    )
+    model.layers = nn.ModuleList([_SpDecoder()])
+    layout = TokenParallelLayout(4, 4, 0)
+    model._sp_layout_and_mask = lambda hidden, attention_mask: (layout, torch.ones(1, dtype=torch.bool))
+    cp_context = SimpleNamespace(
+        cp_size=2,
+        total_local=4,
+        shard_gather_index=torch.arange(4),
+        shard_valid_mask=torch.ones(4, dtype=torch.bool),
+        restore_index=torch.arange(8),
+    )
+
+    def tp_all_gather(value: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+        assert dim == 0 and world_size == 4 and value.shape[0] == 1
+        events.append("tp_gather")
+        return value.repeat(4, *([1] * (value.dim() - 1)))
+
+    def all_gather(value: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+        assert dim == 0 and world_size == 2 and group_name == "cp"
+        assert value.shape[0] == cp_context.total_local
+        events.append(f"cp_merge:{tuple(value.shape)}")
+        return torch.cat((value, value + 10), dim=0)
+
+    with (
+        patch.object(glm5_next, "get_forward_context_or_none", return_value=SimpleNamespace(cp_context=cp_context)),
+        patch.object(moe_parallel.distributed, "tp_all_gather", side_effect=tp_all_gather, create=True),
+        patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
+    ):
+        output = model(torch.arange(8), torch.arange(8))
+
+    assert events[-2:] == ["tp_gather", "cp_merge:(4, 1)"]
+    assert output.shape == (8, 1)
+
+
+def test_pcp_sp_aux_capture_merges_full_cp_local_rows() -> None:
+    events: list[str] = []
+    model, _layers = _make_model(events)
+    model.cfg = SimpleNamespace(
+        hidden_size=1,
+        hc_mult=4,
+        expert_parallel_degree=2,
+        eplv2_sequence_parallel=True,
+        tp_size=4,
+        tp_rank=0,
+        layers_to_capture=(0,),
+    )
+    model.layers = nn.ModuleList([_SpDecoder()])
+    model.aux_hidden_capture = AuxHiddenCapture(
+        (0,),
+        transform=lambda streams: streams.mean(dim=2).reshape(-1, 1),
+    )
+    layout = TokenParallelLayout(4, 4, 0)
+    model._sp_layout_and_mask = lambda hidden, attention_mask: (layout, torch.ones(1, dtype=torch.bool))
+    cp_context = SimpleNamespace(
+        cp_size=2,
+        total_local=4,
+        shard_gather_index=torch.arange(4),
+        shard_valid_mask=torch.ones(4, dtype=torch.bool),
+        restore_index=torch.arange(8),
+    )
+    merged_shapes: list[tuple[int, ...]] = []
+
+    def tp_all_gather(value: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+        assert value.shape[0] == 1
+        return value.repeat(4, *([1] * (value.dim() - 1)))
+
+    def all_gather(value: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+        assert group_name == "cp" and value.shape[0] == 4
+        merged_shapes.append(tuple(value.shape))
+        return torch.cat((value, value + 10), dim=0)
+
+    with (
+        patch.object(glm5_next, "get_forward_context_or_none", return_value=SimpleNamespace(cp_context=cp_context)),
+        patch.object(moe_parallel.distributed, "tp_all_gather", side_effect=tp_all_gather, create=True),
+        patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
+    ):
+        hidden, aux = model(torch.arange(8), torch.arange(8))
+
+    assert hidden.shape == (8, 1)
+    assert aux.shape[0] == 8
+    assert merged_shapes == [(4, 1), (4, 1)]
 
 
 def _cp2_context(rank: int) -> SimpleNamespace:
@@ -360,6 +487,49 @@ def test_kda_cp_projects_only_local_rows_and_overwrites_padding(monkeypatch) -> 
     assert torch.equal(output[0, 1], torch.zeros(3))
 
 
+def test_kda_pcp_eplv2_sp_masks_padding_before_reducing() -> None:
+    attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
+    nn.Module.__init__(attention)
+    attention.hidden_size = 3
+    attention.head_dim = 2
+    attention.conv_dim = 12
+    attention.num_heads_local = 2
+    attention.input_projection_sizes = (12, 2, 4)
+    attention.cfg = SimpleNamespace(hidden_size=3)
+    attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
+        (
+            hidden[..., :1].expand(-1, -1, 12),
+            hidden[..., :1].expand(-1, -1, 2),
+            hidden[..., :1].expand(-1, -1, 4),
+        ),
+        dim=-1,
+    )
+    attention._project_fg = lambda latent: (latent.view(1, 2, 2, 2), latent.view(1, 2, 2, 2))
+    attention.o_norm = _KdaNorm()
+    attention.o_proj = _KdaOutputProjection()
+    backend = MagicMock()
+    backend.execute_linear.return_value = torch.arange(12, dtype=torch.float32).view(1, 3, 2, 2)
+    with (
+        patch.object(
+            glm5_next,
+            "get_forward_context_or_none",
+            return_value=SimpleNamespace(attention_backend=backend, cp_context=_cp2_padded_context()),
+        ),
+        patch.object(
+            glm5_next, "cp_merge_rows", side_effect=[torch.ones(3, 12), torch.ones(3, 2, 2), torch.ones(3, 2)]
+        ),
+        patch.object(glm5_next.distributed, "all_reduce_", side_effect=AssertionError("SP requires RS"), create=True),
+    ):
+        output = attention(
+            torch.tensor([[[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]]]),
+            torch.tensor([[0, 0]], dtype=torch.int32),
+            torch.tensor([[True, False]]),
+            output_layout=TokenParallelLayout(2, 1, 0),
+        )
+    torch.testing.assert_close(output[0, 0], torch.tensor([1.0, 2.0, 3.0]))
+    assert torch.equal(output[0, 1], torch.zeros(3))
+
+
 def _make_mla_attention(indexer: object | None) -> glm5_next.Glm5NextMlaAttention:
     attention = glm5_next.Glm5NextMlaAttention.__new__(glm5_next.Glm5NextMlaAttention)
     nn.Module.__init__(attention)
@@ -467,6 +637,42 @@ def test_mla_cp_projects_only_local_rows_and_overwrites_padding(monkeypatch) -> 
     assert torch.equal(output[1], torch.zeros(3))
     torch.testing.assert_close(topk[0], global_topk[0])
     torch.testing.assert_close(topk[1], torch.zeros((1, 2), dtype=torch.int32))
+
+
+def test_mla_pcp_eplv2_sp_masks_padding_before_reducing_and_returns_local_topk(monkeypatch) -> None:
+    indexer = MagicMock()
+    global_topk = torch.tensor([[[10]], [[20]], [[30]]], dtype=torch.int32)
+    indexer.select_qli.return_value = global_topk
+    attention = _make_mla_attention(indexer)
+    cp_context = _cp2_padded_context()
+    backend = MagicMock()
+    backend.mla_index_context.return_value = object()
+    backend.execute_mla.return_value = torch.tensor([[[11.0]], [[22.0]], [[33.0]]])
+    merge = MagicMock(
+        side_effect=[
+            torch.tensor([[1.0], [2.0], [3.0]]),
+            torch.tensor([[0], [1], [2]], dtype=torch.int32),
+        ]
+    )
+    with (
+        patch.object(
+            glm5_next,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+        ),
+        patch.object(glm5_next, "cp_merge_rows", merge),
+        patch.object(
+            glm5_next.distributed, "all_reduce_", side_effect=AssertionError("SP must reduce-scatter"), create=True
+        ),
+    ):
+        output, topk = attention(
+            torch.tensor([[[1.0], [0.0]]]),
+            torch.tensor([[0, 0]], dtype=torch.int32),
+            torch.tensor([[True, False]]),
+            output_layout=TokenParallelLayout(2, 1, 0),
+        )
+    torch.testing.assert_close(output, torch.tensor([[11.0], [0.0]]))
+    torch.testing.assert_close(topk, torch.tensor([[[10]], [[0]]], dtype=torch.int32))
 
 
 def test_dsa_cp_full_indexer_ignores_previous_topk_and_reshards_output(monkeypatch) -> None:

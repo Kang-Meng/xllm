@@ -111,7 +111,7 @@ class KdaLinearAttentionMixin:
         """
         from fla_npu.ops.ascendc import chunk_kda_fwd, recurrent_kda
 
-        from xllm.python.models.glm5_next import _l2norm
+        from xllm.python.kernels import l2_norm
 
         metadata = self._metadata
         assert metadata is not None, "execute_linear called before prepare()"
@@ -433,8 +433,10 @@ class KdaLinearAttentionMixin:
             # concurrent requests flattened to [1, 2, ...]) surfaced it.
             core_attn_out = core_attn_out.to(query.dtype).reshape(hidden_shape)
         else:
-            q_in = _l2norm(query.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
-            k_in = _l2norm(key.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
+            # Normalize Q/K with the NPU l2norm_fwd kernel before calling the
+            # FLA AscendC operator.
+            q_in = l2_norm(query)
+            k_in = l2_norm(key)
             v_in = value.to(torch.bfloat16).contiguous()
             beta = beta_raw.float().sigmoid()
             cu_seqlens = (

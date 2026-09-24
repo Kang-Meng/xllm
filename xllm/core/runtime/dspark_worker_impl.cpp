@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
+#include "framework/model_loader.h"
 #include "framework/parallel_state/process_group.h"
 #include "framework/sampling/sampler.h"
 #include "runtime/llm_worker_impl.h"
@@ -37,6 +38,33 @@ DSparkWorkerImpl::DSparkWorkerImpl(const ParallelArgs& parallel_args,
       sampling_process_group_(parallel_args.tp_group_ != nullptr
                                   ? parallel_args.tp_group_
                                   : parallel_args.process_group_) {}
+
+bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
+                                  int32_t random_seed,
+                                  MasterStatus master_status) {
+  bool result = DFlashWorkerImpl::init_model(
+      model_weights_path, random_seed, master_status);
+
+  // Reduced-vocabulary drafts ship a "d2t" table mapping each draft id to a
+  // target id via diffs (target_id = d2t[i] + i). Precompute the full map so
+  // sampled draft ids can be remapped to target space. Full-vocab drafts have
+  // no "d2t"; hot_token_id_ stays undefined and no remapping is applied.
+  if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
+    auto model_loader = ModelLoader::create(model_weights_path);
+    for (const auto& state_dict : model_loader->get_state_dicts()) {
+      torch::Tensor d2t_tensor = state_dict->get_tensor("d2t");
+      if (d2t_tensor.defined()) {
+        torch::Tensor arange_tensor = torch::arange(d2t_tensor.size(0));
+        hot_token_id_ = (d2t_tensor + arange_tensor).to(device_, torch::kLong);
+        LOG(INFO) << "DSparkWorkerImpl: loaded d2t, draft vocab size "
+                  << hot_token_id_.size(0);
+        break;
+      }
+    }
+  }
+
+  return result;
+}
 
 DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
     const ForwardInput& input,
@@ -190,6 +218,9 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
 
   using ISlice = torch::indexing::Slice;
   Sampler sampler;
+  // Loop-invariant: only needed when remapping reduced-vocab draft ids.
+  const int64_t target_vocab_size =
+      hot_token_id_.defined() ? context_.get_model_args().vocab_size() : 0;
   torch::Tensor previous_token_ids = anchor_token_ids;
   for (int64_t token_idx = 0; token_idx < num_speculative_tokens; ++token_idx) {
     torch::Tensor markov_bias =
@@ -199,8 +230,7 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
     CHECK_EQ(markov_bias.size(0), num_reqs)
         << "DSpark Markov bias batch must match base_logits.";
     CHECK_EQ(markov_bias.size(1), draft_vocab_size)
-        << "DSpark reduced-vocab drafts need draft-to-target remapping, not "
-           "yet implemented.";
+        << "DSpark Markov bias width must equal the draft vocabulary.";
 
     torch::Tensor step_logits =
         base_logits.select(/*dim=*/1, /*index=*/token_idx) + markov_bias;
@@ -208,6 +238,22 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
         sampler.forward(step_logits, step_sampling_params);
     torch::Tensor sampled_token_ids = sample_output.next_tokens;
     synchronize_sampled_token_ids(sampled_token_ids, step_sampling_params);
+
+    // Reduced-vocab draft: map draft ids to target ids before they reach the
+    // proposal and the Markov feedback embedding, both indexed in target space.
+    // Scatter the draft probs into the full target vocab so the verifier's
+    // (p-q)+ rejection residual is computed in target space.
+    if (hot_token_id_.defined()) {
+      sampled_token_ids = hot_token_id_.index_select(0, sampled_token_ids);
+      if (need_draft_probs && sample_output.probs.defined()) {
+        torch::Tensor full_vocab_probs =
+            torch::zeros({sample_output.probs.size(0), target_vocab_size},
+                         sample_output.probs.options());
+        full_vocab_probs.index_put_({ISlice(), hot_token_id_},
+                                    sample_output.probs);
+        sample_output.probs = full_vocab_probs;
+      }
+    }
 
     token_ids.index_put_({ISlice(), token_idx}, sampled_token_ids);
     if (need_draft_probs) {

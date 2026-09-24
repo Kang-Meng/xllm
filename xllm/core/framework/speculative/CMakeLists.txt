@@ -9,7 +9,9 @@ cc_library(
     adaptive_pruning_helpers.h
     spec_input_builder.h
     mtp_async_input_builder.h
+    mtp_async_replay_builder.h
     mtp_async_state.h
+    mtp_execution_policy.h
     mtp_json_object_state.h
     embedding_cache.h
     spec_verify.h
@@ -19,7 +21,9 @@ cc_library(
     adaptive_pruning_helpers.cpp
     spec_input_builder.cpp
     mtp_async_input_builder.cpp
+    mtp_async_replay_builder.cpp
     mtp_async_state.cpp
+    mtp_execution_policy.cpp
     embedding_cache.cpp
     spec_verify.cpp
   DEPS

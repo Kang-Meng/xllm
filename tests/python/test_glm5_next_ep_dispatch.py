@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU contracts for the isolated DP1, MTP0 GLM EPLv2 candidate."""
+"""CPU contracts for GLM EPLv2 token ownership and routing."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -117,13 +117,11 @@ def test_router_fp32_preserves_expert_input_dtype(
     [
         {"dp_size": 2},
         {"cp_size": 2},
-        {"num_speculative_tokens": 1},
         {"moe_tp_size": 2},
         {"ep_rank": 1},
         {"enable_mega_moe": True},
         {"enable_fused_mc2": True},
         {"enable_eplb": True},
-        {"layers_to_capture": (0,)},
         {"n_routed_experts": 7},
         {"tp_rank": -1},
         {"expert_parallel_degree": 3},
@@ -167,6 +165,26 @@ def test_eplv2_accepts_dp2_tp4_ep8_with_distinct_group_ranks(global_rank: int) -
     cfg._validate_moe_parallelism()
     cfg.ep_rank = (global_rank + 1) % 8
     with pytest.raises(ValueError, match="EP over all DP"):
+        cfg._validate_moe_parallelism()
+
+
+@pytest.mark.parametrize("dp,pcp,tp", [(1, 2, 4), (2, 2, 2), (1, 4, 2), (2, 4, 1)])
+@pytest.mark.parametrize("global_rank", range(8))
+def test_eplv2_pcp_layout_uses_global_ep_rank(dp: int, pcp: int, tp: int, global_rank: int) -> None:
+    cfg = _config(
+        world=tp,
+        rank=global_rank % tp,
+        dp_size=dp,
+        dp_rank=global_rank // (pcp * tp),
+        cp_size=pcp,
+        cp_rank=(global_rank // tp) % pcp,
+        ep_size=8,
+        ep_rank=global_rank,
+    )
+    cfg._validate_moe_parallelism()
+    assert cfg.ep_rank == (cfg.dp_rank * cfg.cp_size + cfg.cp_rank) * cfg.tp_size + cfg.tp_rank
+    cfg.cp_rank = (cfg.cp_rank + 1) % pcp
+    with pytest.raises(ValueError, match="EP over all DP/CP"):
         cfg._validate_moe_parallelism()
 
 
@@ -272,13 +290,42 @@ def test_graph_rejects_missing_or_malformed_mask(mask: torch.Tensor | None, monk
         model(torch.ones(2, 8))
 
 
-def test_rejects_speculative_rows_before_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = _moe(_config())
+def test_speculative_rows_use_eplv2_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _moe(_config(world=8))
+    model.shared_experts = _Shared()
     monkeypatch.setattr(
         glm5_next, "get_forward_context_or_none", lambda: SimpleNamespace(metadata=_metadata(is_spec_verify=True))
     )
-    with pytest.raises(ValueError, match="MTP0"):
-        model(torch.ones(2, 8))
+    routed = Mock(return_value=torch.ones(2, 8))
+    monkeypatch.setattr(model, "_run_routed_sp", routed)
+    monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
+    layout = TokenParallelLayout(16, 8, 0, "mc2")
+    actual = model(torch.ones(2, 8), token_layout=layout, token_mask=torch.ones(2, dtype=torch.bool))
+    torch.testing.assert_close(actual, torch.full((2, 8), 5.5))
+    routed.assert_called_once()
+
+
+def test_pd_decode_dflash2_flags_accept_eplv2_without_fused_mc2() -> None:
+    for rank in range(8):
+        cfg = glm5_next.Glm5NextConfig.from_dict(
+            {
+                "hidden_size": 8,
+                "moe_intermediate_size": 16,
+                "n_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "tp_size": 8,
+                "tp_rank": rank,
+                "ep_size": 8,
+                "ep_rank": rank,
+                "moe_tp_size": 1,
+                "moe_tp_rank": 0,
+                "expert_parallel_degree": 2,
+                "enable_fused_mc2": False,
+                "num_speculative_tokens": 7,
+                "layers_to_capture": (0, 3),
+            }
+        )
+        assert (cfg.expert_parallel_degree, cfg.ep_size, cfg.num_speculative_tokens) == (2, 8, 7)
 
 
 def test_tp_route_keeps_main_unified_w8a8_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,16 +427,18 @@ def test_shared_loader_override_is_exclusive_to_eplv2(monkeypatch: pytest.Monkey
         assert layer.mlp.shared_experts.tp_size == cfg.tp_size
 
 
-def test_eplv2_rejects_runtime_cp_before_selecting_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_eplv2_rejects_mismatched_pcp_context_before_selecting_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     model = glm5_next.Glm5NextModel.__new__(glm5_next.Glm5NextModel)
     torch.nn.Module.__init__(model)
-    model.cfg = _config()
+    model.cfg = _config(cp_size=2, ep_size=4)
     selector = Mock(side_effect=AssertionError("Reject CP before backend selection"))
     model._comm_policy = SimpleNamespace(select=selector)
     monkeypatch.setattr(
-        glm5_next, "get_forward_context_or_none", lambda: SimpleNamespace(cp_context=object(), metadata=None)
+        glm5_next,
+        "get_forward_context_or_none",
+        lambda: SimpleNamespace(cp_context=SimpleNamespace(cp_size=2, cp_rank=1), metadata=None),
     )
-    with pytest.raises(ValueError, match="CP1 before entering attention"):
+    with pytest.raises(ValueError, match="matching prefill shard"):
         model._sp_layout_and_mask(torch.ones(1, 3, 8), torch.ones(1, 3, dtype=torch.bool))
     selector.assert_not_called()
 
@@ -398,11 +447,9 @@ def test_eplv2_rejects_runtime_cp_before_selecting_backend(monkeypatch: pytest.M
 @pytest.mark.parametrize(
     "failure,message",
     [
-        ("spec_verify", "MTP0"),
         ("mc2_capacity", "exceed capacity"),
         ("alltoall_graph", "requires eager"),
         ("graph_mask", "stable active-token mask"),
-        ("aux_capture", "auxiliary hidden capture"),
     ],
 )
 def test_model_rejects_unsupported_execution_before_first_layer(
@@ -410,10 +457,7 @@ def test_model_rejects_unsupported_execution_before_first_layer(
 ) -> None:
     model = glm5_next.Glm5NextModel.__new__(glm5_next.Glm5NextModel)
     torch.nn.Module.__init__(model)
-    model.cfg = _config(
-        eplv2_sequence_parallel=sequence_parallel,
-        layers_to_capture=(0,) if failure == "aux_capture" else (),
-    )
+    model.cfg = _config(eplv2_sequence_parallel=sequence_parallel)
     model._inputs_embeds = torch.ones(1, 3, 8)
     model._comm_policy = Eplv2CommPolicy(
         1 if failure == "mc2_capacity" else 512,
@@ -423,9 +467,7 @@ def test_model_rejects_unsupported_execution_before_first_layer(
     first_layer.forward = Mock(side_effect=AssertionError("Admission must precede Attention/KV updates"))
     model.layers = torch.nn.ModuleList([first_layer])
     context = SimpleNamespace(
-        metadata=_metadata(
-            is_spec_verify=failure == "spec_verify",
-        ),
+        metadata=_metadata(),
         execution_contexts=(
             {}
             if failure == "graph_mask"
@@ -473,15 +515,18 @@ def test_direct_moe_rejects_capacity_before_shared_execution(monkeypatch: pytest
     shared.assert_not_called()
 
 
-def test_eplv2_full_layout_entry_rejects_runtime_cp_before_experts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_eplv2_full_layout_entry_rejects_unsharded_pcp_prefill_before_experts(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _moe(_config(eplv2_sequence_parallel=False))
     routed = Mock(side_effect=AssertionError("CP must be rejected before routed execution"))
     monkeypatch.setattr(model, "_run_routed_sp", routed)
+    model.cfg.cp_size = 2
     monkeypatch.setattr(
-        glm5_next, "get_forward_context_or_none", lambda: SimpleNamespace(cp_context=object(), metadata=None)
+        glm5_next,
+        "get_forward_context_or_none",
+        lambda: SimpleNamespace(cp_context=None, metadata=_metadata(is_prefill=True)),
     )
     monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
-    with pytest.raises(ValueError, match="CP1"):
+    with pytest.raises(ValueError, match="prefill requires a matching PCP shard"):
         model(torch.ones(3, 8))
     routed.assert_not_called()
 

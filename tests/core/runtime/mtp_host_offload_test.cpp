@@ -18,6 +18,9 @@ limitations under the License.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <string>
@@ -277,6 +280,12 @@ class TestMTPWorker final : public MTPWorkerImpl {
                 const runtime::Options& options)
       : MTPWorkerImpl(parallel_args, device, options, WorkerType::LLM) {}
 
+  std::shared_ptr<EmbeddingCache> initialize_replay_cache(bool retain_span) {
+    retain_replay_span_ = retain_span;
+    init_embedding_cache(kBlockCount);
+    return embedding_cache_;
+  }
+
   void replace_transfer_workers(std::unique_ptr<LLMWorkerImpl> target,
                                 std::unique_ptr<LLMWorkerImpl> draft) {
     impl_ = std::move(target);
@@ -318,6 +327,12 @@ class TestMTPWorker final : public MTPWorkerImpl {
                                               accepted_prefix_lengths,
                                               num_speculative_tokens);
   }
+
+ private:
+  bool requires_full_target_replay() const override {
+    return retain_replay_span_;
+  }
+  bool retain_replay_span_ = false;
 };
 
 class TestDFlashWorker final : public DFlashWorkerImpl {
@@ -363,6 +378,323 @@ TEST(MTPAdaptiveValidateWidthTest, PreservesWidthForPreviousAcceptedTokens) {
             3);
 }
 
+// Replace model construction and weight I/O, keeping the real worker loading
+// lifecycle, policy validation, KV allocation and embedding cache.
+class ContextPolicyModel final : public CausalLM {
+ public:
+  ContextPolicyModel(DraftContextUpdate update, torch::TensorOptions options)
+      : update_(update), options_(std::move(options)) {}
+
+  bool share_weights_from(CausalLM& /*source*/) override { return true; }
+
+  ModelOutput forward(const torch::Tensor& /*tokens*/,
+                      const torch::Tensor& /*positions*/,
+                      std::vector<KVCache>& /*caches*/,
+                      const ModelInputParams& /*params*/) override {
+    LOG(FATAL) << "Model execution is outside the context-policy test.";
+    return {};
+  }
+  torch::Tensor logits(const torch::Tensor& /*hidden*/,
+                       const torch::Tensor& /*indices*/) override {
+    LOG(FATAL) << "Logits are outside the context-policy test.";
+    return {};
+  }
+  void load_model(std::unique_ptr<ModelLoader> /*loader*/) override {}
+  torch::Device device() const override { return options_.device(); }
+  const torch::TensorOptions& options() const override { return options_; }
+  void prepare_expert_weight(
+      int32_t /*layer_id*/,
+      const std::vector<int32_t>& /*expert_ids*/) override {
+    LOG(FATAL) << "Expert loading is outside the context-policy test.";
+  }
+  void update_expert_weight(int32_t /*layer_id*/) override {
+    LOG(FATAL) << "Expert updates are outside the context-policy test.";
+  }
+
+ private:
+  DraftContextUpdate update_;
+  torch::TensorOptions options_;
+};
+
+class ContextLoadingWorker final : public HierarchyTransferTestWorker {
+ public:
+  ContextLoadingWorker(const ParallelArgs& parallel_args,
+                       const torch::Device& device,
+                       const runtime::Options& options,
+                       const ModelArgs& args,
+                       DraftContextUpdate update,
+                       std::string draft_model_type = "glm5_next_mtp",
+                       std::string draft_model_impl = "native")
+      : HierarchyTransferTestWorker(parallel_args, device, options, args),
+        update_(update),
+        draft_model_type_(std::move(draft_model_type)),
+        draft_model_impl_(std::move(draft_model_impl)) {}
+
+  bool init_model(ModelContext& context) override {
+    if (options_.is_draft_engine()) {
+      // Supply the fake draft's identity while retaining the real loading path.
+      ModelArgs args = context.get_model_args();
+      args.model_type(draft_model_type_);
+      context = ModelContext(context.get_parallel_args(),
+                             args,
+                             context.get_quant_args(),
+                             context.get_tensor_options());
+      context.set_model_impl(draft_model_impl_);
+    }
+    model_ = std::make_unique<ContextPolicyModel>(update_,
+                                                  context.get_tensor_options());
+    return true;
+  }
+  void load_model(std::unique_ptr<ModelLoader> /*loader*/) override {}
+
+  void load_target(const std::string& model_impl) {
+    context_.set_model_impl(model_impl);
+    CHECK(init_model(context_));
+    mark_loaded();
+  }
+
+ private:
+  DraftContextUpdate update_;
+  std::string draft_model_type_;
+  std::string draft_model_impl_;
+};
+
+class ContextPolicyMTPWorker final : public MTPWorkerImpl {
+ public:
+  ContextPolicyMTPWorker(const ParallelArgs& parallel_args,
+                         const torch::Device& device,
+                         const runtime::Options& options,
+                         std::unique_ptr<LLMWorkerImpl> target,
+                         std::unique_ptr<LLMWorkerImpl> draft)
+      : MTPWorkerImpl(parallel_args, device, options, WorkerType::LLM) {
+    impl_ = std::move(target);
+    draft_impl_ = std::move(draft);
+    dtype_ = impl_->dtype();
+  }
+
+  std::shared_ptr<EmbeddingCache> embedding_cache() const {
+    return embedding_cache_;
+  }
+};
+
+class MTPContextPolicyTest : public MTPHostOffloadTest {
+ protected:
+  void SetUp() override {
+#if defined(USE_NPU)
+    GTEST_SKIP() << "GLM5 Next MTP replay capabilities are registered only "
+                    "for MLU models.";
+#else
+    MTPHostOffloadTest::SetUp();
+    if (IsSkipped()) {
+      return;
+    }
+    char path[] = "/tmp/xllm_context_policy_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    model_path_ = path;
+    std::ofstream(model_path_ / "config.json") << R"json({
+      "model_type": "qwen3", "torch_dtype": "float32",
+      "hidden_size": 2, "num_hidden_layers": 1,
+      "num_attention_heads": 1, "num_key_value_heads": 1,
+      "head_dim": 2, "vocab_size": 8
+    })json";
+    // A valid empty safetensors checkpoint; the test worker skips weight I/O.
+    std::ofstream(model_path_ / "model.safetensors", std::ios::binary)
+        .write("\x08\0\0\0\0\0\0\0{}      ", 16);
+#endif
+  }
+
+  void TearDown() override {
+    if (!model_path_.empty()) {
+      std::filesystem::remove_all(model_path_);
+    }
+  }
+
+  std::unique_ptr<ContextPolicyMTPWorker> make_worker(
+      DraftContextUpdate update,
+      const std::string& target_type = "glm5_next",
+      const std::string& target_impl = "native",
+      bool embedded_eagle3 = false,
+      bool target_ready = false,
+      const std::string& draft_type = "glm5_next_mtp",
+      const std::string& draft_impl = "native") {
+    const torch::Device device(Platform::type_torch(), /*index=*/0);
+    const ParallelArgs parallel_args(
+        /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+    runtime::Options options = make_runtime_options(/*host_blocks_factor=*/0);
+    options.speculative_algorithm(embedded_eagle3 ? "Eagle3" : "MTP");
+    ModelArgs args =
+        make_model_args(target_type, /*layer_count=*/1, /*head_dim=*/2);
+    args.hidden_size(2).enable_embedded_eagle3_draft(embedded_eagle3);
+    auto target = std::make_unique<ContextLoadingWorker>(
+        parallel_args, device, options, args, DraftContextUpdate::TAIL_EXTEND);
+    target->load_target(target_impl);
+    if (target_ready) {
+      CHECK(target->allocate_kv_cache(cache_shape()));
+    }
+    runtime::Options draft_options = options;
+    draft_options.is_draft_engine(true).num_speculative_tokens(0);
+    std::string resolved_draft_type = draft_type;
+    if (update == DraftContextUpdate::TAIL_EXTEND &&
+        resolved_draft_type == "glm5_next_mtp") {
+      resolved_draft_type = "qwen3_5_mtp";
+    }
+    auto draft = std::make_unique<ContextLoadingWorker>(parallel_args,
+                                                        device,
+                                                        draft_options,
+                                                        args,
+                                                        update,
+                                                        resolved_draft_type,
+                                                        draft_impl);
+    return std::make_unique<ContextPolicyMTPWorker>(
+        parallel_args, device, options, std::move(target), std::move(draft));
+  }
+
+  KVCacheShape cache_shape() const {
+    return make_cache_shape(
+        make_model_args("qwen3", /*layer_count=*/1, /*head_dim=*/2));
+  }
+
+  std::filesystem::path model_path_;
+};
+
+TEST_F(MTPContextPolicyTest, HybridTargetKeepsTailDraftContextCompact) {
+  auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND);
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  ASSERT_TRUE(worker->allocate_kv_cache(cache_shape()));
+  auto cache = worker->embedding_cache();
+  const torch::Tensor hidden = torch::tensor({1.0f, 2.0f});
+  cache->write_mtp_bootstrap_context(
+      /*embedding_id=*/0, "request", /*token_id=*/7, hidden);
+  const auto states = cache->read_decode_states({0}, {"request"});
+  ASSERT_EQ(states.size(), 1);
+  EXPECT_TRUE(states.front().replay_token_ids.empty());
+  EXPECT_FALSE(states.front().replay_embeddings.defined());
+  EXPECT_TRUE(torch::equal(states.front().embedding, hidden));
+}
+
+TEST_F(MTPContextPolicyTest, RejectsCacheAllocationBeforeDraftInitialization) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND);
+        worker->allocate_kv_cache(cache_shape());
+      },
+      "Draft context replay policy is not initialized");
+}
+
+TEST_F(MTPContextPolicyTest,
+       ReplayDraftRetainsAcceptedSpanAcrossCacheAllocation) {
+  // The target may already own its cache when the draft finishes loading.
+  auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                            /*target_type=*/"glm5_next",
+                            /*target_impl=*/"native",
+                            /*embedded_eagle3=*/false,
+                            /*target_ready=*/true);
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  for (int32_t allocation = 0; allocation < 2; ++allocation) {
+    ASSERT_TRUE(worker->allocate_kv_cache(cache_shape()));
+    auto cache = worker->embedding_cache();
+    torch::Tensor tokens = torch::tensor({{7, 8}}, torch::kInt);
+    torch::Tensor hidden = torch::tensor({{{1.0f, 2.0f}, {3.0f, 4.0f}}});
+    cache->write_target_context(
+        {0}, {"request"}, tokens, hidden, /*num_speculative_tokens=*/1);
+    hidden.fill_(99);
+    tokens.fill_(-1);
+    const auto states = cache->read_decode_states({0}, {"request"});
+    ASSERT_EQ(states.size(), 1);
+    EXPECT_EQ(states.front().replay_token_ids, (std::vector<int32_t>{7, 8}));
+    EXPECT_TRUE(torch::equal(states.front().replay_embeddings,
+                             torch::tensor({{1.0f, 2.0f}, {3.0f, 4.0f}})));
+    EXPECT_TRUE(
+        torch::equal(states.front().embedding, torch::tensor({3.0f, 4.0f})));
+  }
+}
+
+TEST_F(MTPContextPolicyTest, RejectsReplayForGenericTarget) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                  /*target_type=*/"qwen3");
+        worker->init_model(
+            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
+      },
+      "Incompatible draft context update.*target=qwen3");
+}
+
+TEST_F(MTPContextPolicyTest, RejectsReplayForOtherChunkedPrefillTargets) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                  /*target_type=*/"mimo");
+        worker->init_model(
+            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
+      },
+      "Incompatible draft context update.*target=mimo");
+}
+
+TEST_F(MTPContextPolicyTest, RejectsReplayForPythonDraft) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                  /*target_type=*/"glm5_next",
+                                  /*target_impl=*/"native",
+                                  /*embedded_eagle3=*/false,
+                                  /*target_ready=*/false,
+                                  /*draft_type=*/"glm5_next_mtp",
+                                  /*draft_impl=*/"python");
+        worker->init_model(
+            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
+      },
+      "Incompatible draft context update");
+}
+
+TEST_F(MTPContextPolicyTest, PythonTargetKeepsTailUpdatesAndRejectsReplay) {
+  auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND,
+                            /*target_type=*/"glm5_next",
+                            /*target_impl=*/"python");
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  ASSERT_TRUE(worker->allocate_kv_cache(cache_shape()));
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto replay_worker =
+            make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                        /*target_type=*/"glm5_next",
+                        /*target_impl=*/"python");
+        replay_worker->init_model(
+            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
+      },
+      "Incompatible draft context update.*target=glm5_next");
+}
+
+TEST_F(MTPContextPolicyTest, EmbeddedEagleKeepsTailUpdatesAndRejectsReplay) {
+  auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND,
+                            /*target_type=*/"glm5_next",
+                            /*target_impl=*/"native",
+                            /*embedded_eagle3=*/true);
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  ASSERT_TRUE(worker->allocate_kv_cache(cache_shape()));
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto replay_worker =
+            make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                        /*target_type=*/"glm5_next",
+                        /*target_impl=*/"native",
+                        /*embedded_eagle3=*/true);
+        replay_worker->init_model(
+            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
+      },
+      "Incompatible draft context update");
+}
+
 TEST(SpeculativeDraftKVCacheShapeTest, ReusesGroupedTargetPoolCounts) {
   ModelArgs target_model_args =
       make_model_args("deepseek_v4", /*layer_count=*/3, /*head_dim=*/8);
@@ -385,6 +717,27 @@ TEST(SpeculativeDraftKVCacheShapeTest, ReusesGroupedTargetPoolCounts) {
 
   EXPECT_TRUE(draft_shape.has_grouped_cache_layout());
   EXPECT_EQ(draft_shape.key_cache_shape(), (std::vector<int64_t>{2, 3, 5}));
+}
+
+TEST_F(MTPHostOffloadTest, SharedCacheAllocationHonorsReplaySpanPolicy) {
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  const runtime::Options options =
+      make_runtime_options(/*host_blocks_factor=*/0.0);
+  TestMTPWorker worker(parallel_args, device, options);
+  const auto embedding = torch::tensor({1.0f, 2.0f});
+  for (bool retain_span : {false, true}) {
+    auto cache = worker.initialize_replay_cache(retain_span);
+    cache->write_mtp_bootstrap_context(
+        /*embedding_id=*/0, "request", /*token_id=*/7, embedding);
+    const auto states = cache->read_decode_states({0}, {"request"});
+    ASSERT_EQ(states.size(), 1);
+    EXPECT_EQ(states.front().replay_embeddings.defined(), retain_span);
+    EXPECT_EQ(states.front().replay_token_ids,
+              retain_span ? std::vector<int32_t>{7} : std::vector<int32_t>{});
+    EXPECT_TRUE(torch::equal(states.front().embedding, embedding));
+  }
 }
 
 TEST_F(MTPHostOffloadTest, VectorTransferWithoutHierarchyIsNoop) {

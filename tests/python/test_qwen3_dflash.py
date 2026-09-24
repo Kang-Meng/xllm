@@ -204,13 +204,12 @@ def test_context_projection_writes_each_layer_cache(
     synchronizer.record_event.assert_called_once_with(0)
 
 
-def test_checkpoint_weight_names_load_into_fused_modules(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_checkpoint_weight_names_load_into_fused_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    prepare_row_parallel_weight = Mock(side_effect=lambda weight: (weight, False))
     monkeypatch.setattr(
         kernels,
         "prepare_row_parallel_weight",
-        lambda weight: (weight, False),
+        prepare_row_parallel_weight,
         raising=False,
     )
     model = DFlashQwen3ForCausalLM(_config_dict())
@@ -250,3 +249,4 @@ def test_checkpoint_weight_names_load_into_fused_modules(
     assert model.model.fc.weight.shape == (4, 8)
     assert model.model.embed_tokens is None
     assert model.lm_head is None
+    assert prepare_row_parallel_weight.call_count == 2

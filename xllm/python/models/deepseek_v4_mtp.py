@@ -16,18 +16,33 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import Any
+
 import torch
 import torch.nn as nn
 
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.layernorm import RMSNorm
+from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.model_executor.forward_context import get_forward_context, record_layer_event
+from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
+from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v4 import (
     DeepseekV4Config,
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     DeepseekV4Model,
+    _find_checkpoint_prefix,
     _hc_head_merge,
+    _require_checkpoint_key,
 )
+from xllm.python.models.weight_utils import W8A8WeightLoader
+
+
+def _mtp_layer_count(config: dict[str, Any]) -> int:
+    count = int(config.get("num_nextn_predict_layers", 1))
+    return count if count > 0 else 1
 
 
 class DeepseekV4MtpLayer(DeepseekV4DecoderLayer):
@@ -239,3 +254,189 @@ class DeepseekV4MtpModel(DeepseekV4Model):
             aux_hidden = cp_ctx.gather_restore(aux_hidden)
         hidden = self.norm(hidden, None)
         return hidden, aux_hidden.flatten(1)
+
+
+class DeepseekV4MtpForCausalLM(DeepseekV4ForCausalLM):
+    """DeepSeek-V4 MTP draft calculator driven by the C++ speculative worker."""
+
+    def __init__(self, config: dict) -> None:
+        PyModelBase.__init__(self)
+        target_cfg = DeepseekV4Config.from_dict(config)
+        mtp_layers = _mtp_layer_count(config)
+        self.cfg = replace(
+            target_cfg,
+            model_type="deepseek_v4_mtp",
+            n_layers=mtp_layers,
+            n_hash_layers=0,
+            compress_ratios=[1] * mtp_layers,
+            layers_to_capture=(),
+        )
+        dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
+        device = torch.device(config.get("device", "npu:0"))
+        self.model = DeepseekV4MtpModel(self.cfg, dtype, device)
+        self.lm_head = ColumnParallelLinear(
+            self.cfg.hidden_size,
+            self.cfg.vocab_size // self.cfg.tp_size,
+            self.cfg.tp_size,
+            gather_output=True,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _load_dsv4_decoder_layer(
+        self,
+        loader: W8A8WeightLoader,
+        checkpoint_prefix: str,
+        parameter_prefix: str,
+        layer_id: int,
+    ) -> None:
+        """Load one draft decoder layer with the target model's aliases."""
+
+        def _w8a8(
+            checkpoint_module: str,
+            parameter_module: str,
+            shard_dims: dict[str, int] | None = None,
+        ) -> None:
+            load_w8a8_dynamic_projection(
+                loader,
+                checkpoint_module,
+                parameter_module,
+                shard_dims,
+            )
+
+        attention, attention_prefix = self._load_dsv4_attention(
+            loader,
+            checkpoint_prefix=checkpoint_prefix,
+            parameter_prefix=parameter_prefix,
+            layer_id=layer_id,
+            w8a8_loader=_w8a8,
+        )
+        indexer_prefix = attention_prefix + "indexer."
+        if attention.indexer is not None and loader.has(indexer_prefix + "wq_b.weight"):
+            _w8a8(
+                indexer_prefix + "wq_b",
+                parameter_prefix + "self_attn.indexer.wq_b",
+            )
+            loader.copy_in(
+                parameter_prefix + "self_attn.indexer.weights_proj.weight",
+                loader.load_tensor(indexer_prefix + "weights_proj.weight"),
+            )
+            self._load_dsv4_compressor_from_prefixes(
+                loader,
+                (
+                    indexer_prefix + "compressor.",
+                    indexer_prefix + "compress.",
+                ),
+                parameter_prefix + "self_attn.indexer.compressor_",
+                f"DeepSeek-V4 MTP indexer compressor weights not found under {indexer_prefix}",
+            )
+        if hasattr(attention, "cmp_wkv"):
+            self._load_dsv4_compressor_from_prefixes(
+                loader,
+                (
+                    attention_prefix + "compressor.",
+                    attention_prefix + "compress.",
+                ),
+                parameter_prefix + "self_attn.cmp_",
+                f"DeepSeek-V4 MTP attention compressor weights not found under {attention_prefix}",
+            )
+        attention.process_weights_after_loading()
+
+        mlp = self.model.layers[layer_id].mlp
+        if hasattr(mlp, "experts_w13"):
+            moe_prefix = _find_checkpoint_prefix(
+                loader,
+                (checkpoint_prefix + "ffn.", checkpoint_prefix + "mlp."),
+                (
+                    "experts.0.gate_proj.weight",
+                    "experts.0.w1.weight",
+                ),
+            )
+            if moe_prefix is None:
+                raise KeyError(f"DeepSeek-V4 MTP MoE weights not found under {checkpoint_prefix}")
+            self._load_dsv4_moe(
+                loader,
+                checkpoint_prefix,
+                parameter_prefix,
+                layer_id,
+                moe_prefix,
+            )
+            mlp.process_weights_after_loading()
+        else:
+            self._load_dsv4_dense_mlp(
+                loader,
+                checkpoint_prefix,
+                parameter_prefix,
+                mlp,
+            )
+
+    def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
+        del tp_rank, tp_size
+        loader = W8A8WeightLoader(
+            self,
+            state_dicts,
+            self.cfg.tp_size,
+            self.cfg.tp_rank,
+            src_prefixes=("", "model."),
+        )
+        layer_prefixes: list[str] = []
+        for layer_id in range(self.cfg.n_layers):
+            checkpoint_prefix = _find_checkpoint_prefix(
+                loader,
+                (f"mtp.{layer_id}.", f"layers.{layer_id}."),
+                ("e_proj.weight", "attn.wq_a.weight", "self_attn.wq_a.weight"),
+            )
+            if checkpoint_prefix is None:
+                raise KeyError(f"DeepSeek-V4 MTP layer {layer_id} weights not found")
+            layer_prefixes.append(checkpoint_prefix)
+            parameter_prefix = f"model.layers.{layer_id}."
+            self._load_dsv4_decoder_layer(
+                loader,
+                checkpoint_prefix,
+                parameter_prefix,
+                layer_id,
+            )
+            for name in ("enorm.weight", "hnorm.weight", "e_proj.weight", "h_proj.weight"):
+                key = _require_checkpoint_key(
+                    loader,
+                    (checkpoint_prefix + name,),
+                    f"DeepSeek-V4 MTP layer {layer_id} {name}",
+                )
+                loader.copy_in(parameter_prefix + name, loader.load_tensor(key))
+            for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
+                key = _require_checkpoint_key(
+                    loader,
+                    (checkpoint_prefix + name,),
+                    f"DeepSeek-V4 MTP layer {layer_id} {name}",
+                )
+                loader.copy_in(parameter_prefix + name, loader.load_tensor(key))
+
+        first_prefix = layer_prefixes[0]
+        embed_key = _require_checkpoint_key(
+            loader,
+            (
+                first_prefix + "emb.tok_emb.weight",
+                first_prefix + "embed.weight",
+                first_prefix + "embed_tokens.weight",
+            ),
+            "DeepSeek-V4 MTP embedding weight",
+        )
+        loader.copy_in(
+            "model.embed_tokens.weight",
+            loader.shard(loader.load_tensor(embed_key), dim=1),
+        )
+        norm_key = _require_checkpoint_key(
+            loader,
+            (first_prefix + "norm.weight",),
+            "DeepSeek-V4 MTP final norm",
+        )
+        loader.copy_in("model.norm.weight", loader.load_tensor(norm_key))
+        head_key = _require_checkpoint_key(
+            loader,
+            (first_prefix + "head.weight",),
+            "DeepSeek-V4 MTP output-head weight",
+        )
+        loader.copy_in(
+            "lm_head.weight",
+            loader.shard(loader.load_tensor(head_key), dim=0),
+        )

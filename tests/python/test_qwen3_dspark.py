@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -73,10 +75,11 @@ def test_config_requires_positive_markov_rank() -> None:
 
 
 def test_checkpoint_loads_dspark_heads(monkeypatch: pytest.MonkeyPatch) -> None:
+    prepare_row_parallel_weight = Mock(side_effect=lambda weight: (weight, False))
     monkeypatch.setattr(
         kernels,
         "prepare_row_parallel_weight",
-        lambda weight: (weight, False),
+        prepare_row_parallel_weight,
         raising=False,
     )
     model = Qwen3DSparkForCausalLM(
@@ -108,6 +111,7 @@ def test_checkpoint_loads_dspark_heads(monkeypatch: pytest.MonkeyPatch) -> None:
 
     model.load_weights([_StateDict(tensors)], tp_rank=0, tp_size=1)
 
+    assert prepare_row_parallel_weight.call_count == 2
     torch.testing.assert_close(
         model.markov_head.markov_w1.weight,
         tensors["markov_head.markov_w1.weight"],

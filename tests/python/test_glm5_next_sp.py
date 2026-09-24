@@ -432,12 +432,17 @@ def test_shared_weights_follow_moe_tp_not_attention_tp(world: int, quantized: bo
 @pytest.mark.parametrize(
     "schedule", [("sparse", "sparse"), ("dense", "sparse", "sparse"), ("sparse", "dense", "sparse")]
 )
+@pytest.mark.parametrize("capture", [False, True])
 def test_model_keeps_mhc_and_norm_local_until_attention(
-    world: int, rows: int, schedule: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+    world: int, rows: int, schedule: tuple[str, ...], capture: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     torch.manual_seed(5319)
     cfg = _config(
-        world, n_layers=len(schedule), layer_types=["linear_attention"] * len(schedule), mlp_layer_types=list(schedule)
+        world,
+        n_layers=len(schedule),
+        layer_types=["linear_attention"] * len(schedule),
+        mlp_layer_types=list(schedule),
+        layers_to_capture=(0, len(schedule) - 1) if capture else (),
     )
     model = glm5_next.Glm5NextModel(cfg, torch.float32, torch.device("cpu"))
     with torch.no_grad():
@@ -448,7 +453,7 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
         layer.ffn_hc.process_weights_after_loading()
     monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: None)
     monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
-    incoming, normalized, local_attention = {}, {}, {}
+    incoming, normalized, layer_outputs, local_attention = {}, {}, {}, {}
     layer_events = Mock()
     monkeypatch.setattr(glm5_next, "record_layer_event", layer_events)
     norm_shapes: list[tuple[int, int]] = []
@@ -482,6 +487,12 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
                 incoming[index] = args[0].detach().reshape(rows, 4, 8).clone()
 
         layer.register_forward_pre_hook(capture_input)
+
+        def capture_output(module: nn.Module, args: tuple, output: tuple, index: int = index) -> None:
+            if not cfg.eplv2_sequence_parallel:
+                layer_outputs[index] = output[0].detach().reshape(rows, 4, 8).clone()
+
+        layer.register_forward_hook(capture_output)
         layer.self_attn = Attention(index)
         layer.mlp._test_index = index
         layer.mlp.forward = MethodType(pointwise, layer.mlp)
@@ -497,7 +508,12 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
     context = _metadata()
     context.execution_contexts = {Glm5NextEplv2Metadata: Glm5NextEplv2Metadata(torch.ones(rows, dtype=torch.bool))}
     monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: context)
-    expected = model(ids, positions).detach()
+    expected = model(ids, positions)
+    if capture:
+        expected_hidden, expected_aux = expected
+    else:
+        expected_hidden, expected_aux = expected, None
+    expected_hidden = expected_hidden.detach()
     cfg.eplv2_sequence_parallel = True
     for rank in range(world):
         cfg.tp_rank = cfg.ep_rank = rank
@@ -510,8 +526,10 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
             elif previous_sp:
                 queue.append(incoming[index])
             previous_sp = kind == "sparse"
+            if capture and kind == "sparse" and index in cfg.layers_to_capture:
+                queue.append(layer_outputs[index])
         if previous_sp:
-            queue.append(expected)
+            queue.append(expected_hidden)
         calls = []
 
         def gather(
@@ -538,7 +556,12 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
         layer_events.reset_mock()
         model._inputs_embeds = hidden.clone()
         actual = model(ids, positions)
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        if capture:
+            actual_hidden, actual_aux = actual
+            torch.testing.assert_close(actual_aux, expected_aux, rtol=1e-5, atol=1e-6)
+        else:
+            actual_hidden = actual
+        torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6)
         assert len(calls) == len(queue)
         assert [call.args[0] for call in layer_events.call_args_list] == list(range(len(schedule)))
         assert norm_shapes == [

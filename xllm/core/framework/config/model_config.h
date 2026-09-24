@@ -45,6 +45,7 @@ class ModelConfig final {
   [[nodiscard]] static std::optional<std::string>
   validate_python_speculative_decode(std::string_view model_impl,
                                      std::string_view model_type,
+                                     std::string_view speculative_algorithm,
                                      int32_t num_speculative_tokens);
 
   [[nodiscard]] static const OptionCategory& option_category() {
@@ -69,7 +70,9 @@ class ModelConfig final {
          "mm_download_headers",
          "flashinfer_workspace_buffer_size",
          "use_audio_in_video",
-         "use_cpp_chat_template"}};
+         "use_cpp_chat_template",
+         "audio_max_upload_file_mb",
+         "audio_max_decode_duration_s"}};
     return kOptionCategory;
   }
 
@@ -112,6 +115,10 @@ class ModelConfig final {
   PROPERTY(bool, use_audio_in_video) = false;
 
   PROPERTY(bool, use_cpp_chat_template) = true;
+
+  PROPERTY(int32_t, audio_max_upload_file_mb) = 25;
+
+  PROPERTY(int32_t, audio_max_decode_duration_s) = 600;
 };
 
 }  // namespace xllm

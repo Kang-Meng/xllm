@@ -23,12 +23,8 @@ the patched HuggingFace ``Glm5NextForCausalLM`` reference for tensor alignment.
 This implementation follows the transformers model semantics while routing
 supported fused operations through the active platform kernel API.
 
-KDA goes through the stable ``fused_recurrent_kda`` /
-``chunk_kda`` interfaces (same signatures as the transformers
-``@use_kernel_func_from_hub``-decorated functions). Today those run the faithful
-pure-torch delta-rule bodies (matching transformers' recurrent/chunk paths for
-alignment); an NPU small-kernel implementation can later be swapped in behind
-the same interface without touching the layer. No fla_npu dependency.
+KDA execution is dispatched by the attention backend to the fused NPU
+``fla_npu`` operators.
 
 Per-layer linear state (conv_state + recurrent_state) is managed by the
 framework: the executor binds per-sequence ``(conv_cache, ssm_cache)`` slots
@@ -149,15 +145,6 @@ except ImportError:  # pragma: no cover - stub-loader path
 # (see glm5_next_kpool.py).
 
 
-# ---------------------------------------------------------------------------
-# Small faithful helpers (mirror transformers modeling_glm5_next exactly).
-# ---------------------------------------------------------------------------
-def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """FLA-style l2norm: sqrt(sum(x^2)+eps) then divide (NOT F.normalize)."""
-    inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x / inv_norm
-
-
 class Glm5NextRMSNorm(nn.Module):
     """RMSNorm matching transformers through the platform kernel API."""
 
@@ -204,152 +191,6 @@ class _RMSNormGated(nn.Module):
         # Fused sigmoid-gated kernel (one launch over all rows). Must be the
         # sigmoid-gated kernel — never kernels.rms_norm_gated, which is SiLU.
         return kernels.rms_norm_sigmoid_gated(x, gate, self.weight, self.variance_epsilon)
-
-
-def fused_recurrent_kda(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """KDA fused recurrent delta-rule (single-token decode path).
-
-    Stable interface matching transformers ``fused_recurrent_kda``
-    (``@use_kernel_func_from_hub_with_fallback``-decorated); the pure-torch body is the
-    faithful port of the reference fallback. An NPU small kernel can be swapped
-    in behind this interface without changing the layer.
-    """
-    initial_dtype = query.dtype
-    # transformers recurrent path: NO transpose; shapes stay [B, S, nh, hd].
-    query, key, value, beta, g = [x.contiguous().to(torch.float32) for x in (query, key, value, beta, g)]
-    if use_qk_l2norm_in_kernel:
-        query = _l2norm(query, dim=-1, eps=1e-6)
-        key = _l2norm(key, dim=-1, eps=1e-6)
-    batch_size, sequence_length, num_heads, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    scale = 1.0 / (query.shape[-1] ** 0.5)
-    query = query * scale
-    core_attn_out = torch.zeros(
-        batch_size,
-        sequence_length,
-        num_heads,
-        v_head_dim,
-        dtype=value.dtype,
-        device=value.device,
-    )
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    for i in range(sequence_length):
-        q_i = query[:, i]
-        k_i = key[:, i]
-        v_i = value[:, i]
-        g_i = g[:, i][..., None].exp()
-        b_i = beta[:, i][..., None]
-        last_recurrent_state = last_recurrent_state * g_i
-        kv_mem = (last_recurrent_state * k_i[..., None]).sum(dim=-2)
-        delta = (v_i - kv_mem) * b_i
-        last_recurrent_state = last_recurrent_state + k_i.unsqueeze(-1) * delta.unsqueeze(-2)
-        core_attn_out[:, i] = (last_recurrent_state * q_i.unsqueeze(-1)).sum(dim=-2)
-    final_state = last_recurrent_state if output_final_state else None
-    return core_attn_out.to(initial_dtype), final_state
-
-
-def chunk_kda(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    chunk_size: int = 64,
-    initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """KDA chunked delta-rule (multi-token prefill path).
-
-    Stable interface matching transformers ``chunk_kda``
-    (``@use_kernel_func_from_hub_with_fallback``-decorated); the pure-torch body is the
-    faithful port of the reference fallback. An NPU small kernel can be swapped
-    in behind this interface without changing the layer.
-    """
-    initial_dtype = query.dtype
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
-    if use_qk_l2norm_in_kernel:
-        query = _l2norm(query, dim=-1, eps=1e-6)
-        key = _l2norm(key, dim=-1, eps=1e-6)
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    scale = 1.0 / (query.shape[-1] ** 0.5)
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    total_sequence_length = sequence_length + pad_size
-
-    query = F.pad(query, (0, 0, 0, pad_size)) * scale
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    g = F.pad(g, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-
-    query, key, value, g, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, g, k_beta, v_beta)
-    ]
-    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
-
-    # Intra chunk
-    g = g.cumsum(dim=-2)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
-    decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp().float()
-    attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp())
-
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    core_attn_out = torch.zeros_like(value)
-
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
-    for i in range(total_sequence_length // chunk_size):
-        q_i = query[:, :, i]
-        k_i = key[:, :, i]
-        v_i = value[:, :, i]
-        g_i = g[:, :, i]
-
-        attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
-        attn_intra = (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i]).sum(dim=-1).masked_fill(mask, 0)
-        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
-        v_new = v_i - v_prime
-
-        core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
-            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
-        )
-
-    final_state = last_recurrent_state if output_final_state else None
-    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, final_state
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +259,7 @@ class Glm5NextConfig:
     moe_tp_size: Optional[int] = None
     moe_tp_rank: Optional[int] = None
     cp_size: int = 1
+    cp_rank: int = 0
     num_speculative_tokens: int = 0
     enable_eplb: bool = False
     expert_parallel_degree: int = 0
@@ -525,6 +367,7 @@ class Glm5NextConfig:
             moe_tp_size=int(pick("moe_tp_size", default=pick("tp_size", default=1))),
             moe_tp_rank=int(pick("moe_tp_rank", default=pick("tp_rank", default=0))),
             cp_size=int(pick("cp_size", default=1)),
+            cp_rank=int(pick("cp_rank", default=0)),
             eplv2_sequence_parallel=bool(pick("eplv2_sequence_parallel", default=True)),
             eplv2_shared_overlap=bool(pick("eplv2_shared_overlap", default=True)),
             eplv2_comm_mode=str(
@@ -559,7 +402,7 @@ class Glm5NextConfig:
             raise ValueError("GLM-5.3-Flash ordinary EP does not support enable_mega_moe")
         if self.enable_fused_mc2:
             raise ValueError("GLM-5.3-Flash ordinary EP does not support enable_fused_mc2")
-        for name in ("tp", "ep", "dp", "moe_tp"):
+        for name in ("tp", "ep", "dp", "cp", "moe_tp"):
             size = getattr(self, f"{name}_size")
             rank = getattr(self, f"{name}_rank")
             if size <= 0 or not 0 <= rank < size:
@@ -568,11 +411,11 @@ class Glm5NextConfig:
             raise ValueError("n_routed_experts must be divisible by ep_size")
         if self.moe_intermediate_size % self.moe_tp_size:
             raise ValueError("moe_intermediate_size must be divisible by moe_tp_size")
-        if self.ep_size == 1 and self.dp_size == 1:
+        if self.ep_size == 1 and self.dp_size == 1 and self.cp_size == 1:
             if (self.moe_tp_size, self.moe_tp_rank) != (self.tp_size, self.tp_rank):
                 raise ValueError("TP-only MoE must use the attention TP size and rank")
-        elif self.ep_size * self.moe_tp_size != self.dp_size * self.tp_size:
-            raise ValueError("EP size times MoE-TP size must equal DP size times attention TP size")
+        elif self.ep_size * self.moe_tp_size != self.dp_size * self.cp_size * self.tp_size:
+            raise ValueError("EP size times MoE-TP size must equal DP size times CP size times attention TP size")
         if self.expert_parallel_degree == 2:
             self._validate_eplv2_parallelism()
 
@@ -585,19 +428,15 @@ class Glm5NextConfig:
             raise ValueError("GLM EPLv2 requires EP > 1")
         if self.enable_eplb:
             raise ValueError("GLM EPLv2 does not support EPLB")
-        if self.layers_to_capture:
-            raise ValueError("GLM EPLv2 does not support auxiliary hidden capture (layers_to_capture)")
         if not math.isfinite(self.swiglu_limit) or self.swiglu_limit <= 0:
             raise ValueError("GLM EPLv2 requires a finite positive SwiGLU clamp limit")
-        if self.cp_size != 1 or self.num_speculative_tokens != 0:
-            raise ValueError("GLM EPLv2 currently requires CP1 and MTP0")
         if self.moe_tp_size != 1 or self.moe_tp_rank != 0:
             raise ValueError("GLM EPLv2 requires unsharded local experts (MoE-TP1)")
         if (self.ep_size, self.ep_rank) != (
-            self.dp_size * self.tp_size,
-            self.dp_rank * self.tp_size + self.tp_rank,
+            self.dp_size * self.cp_size * self.tp_size,
+            (self.dp_rank * self.cp_size + self.cp_rank) * self.tp_size + self.tp_rank,
         ):
-            raise ValueError("GLM EPLv2 requires EP over all DP/attention-TP ranks with MoE-TP1")
+            raise ValueError("GLM EPLv2 requires EP over all DP/CP/attention-TP ranks with MoE-TP1")
 
     def _resolve_schedules(self, full_attn_layers: list, d: dict) -> None:
         n = self.n_layers
@@ -713,6 +552,15 @@ def _stable_pack(dst: torch.Tensor | None, packed: torch.Tensor) -> torch.Tensor
     return dst
 
 
+def _zero_cp_padding(tensor: torch.Tensor, cp_context: Any) -> torch.Tensor:
+    """Zero this rank's zigzag padding rows."""
+    total_local = cp_context.total_local
+    token_axis = 0 if tensor.shape[0] == total_local else 1
+    mask_shape = [1] * tensor.dim()
+    mask_shape[token_axis] = total_local
+    return tensor.masked_fill(~cp_context.shard_valid_mask.view(mask_shape), 0)
+
+
 class Glm5NextKdaAttention(Attention):
     """KDA linear-attention layer (conv1d + delta-rule + gated norm + o_proj).
 
@@ -724,9 +572,8 @@ class Glm5NextKdaAttention(Attention):
     ssm_cache: ``[num_slots, nh, k_hd, v_hd]`` fp32) and the per-sequence
     slot/cold-start view (``linear_state_indices`` / ``has_initial_state``).
 
-    The KDA math goes through the stable ``fused_recurrent_kda`` /
-    ``chunk_kda`` interfaces (or fla_npu fused ops when
-    ``GLM5NEXT_KDA_BACKEND=fla_npu``); see their docstrings.
+    KDA math is dispatched through ``NpuPagedAttentionBackend`` to fused
+    ``fla_npu`` operators.
     """
 
     is_glm_next_kda: bool = True
@@ -838,8 +685,6 @@ class Glm5NextKdaAttention(Attention):
                 "Glm5NextKdaAttention requires an attention backend with execute_linear; run inside the engine."
             )
         cp_context = getattr(ctx, "cp_context", None)
-        if cp_context is not None and output_layout is not None:
-            raise ValueError("GLM EPLv2 SP attention currently requires CP1")
         if cp_context is not None:
             mixed_qkv = cp_merge_rows(mixed_qkv.transpose(1, 2).reshape(-1, self.conv_dim), cp_context)
             mixed_qkv = mixed_qkv.unsqueeze(0).transpose(1, 2).contiguous()
@@ -863,12 +708,13 @@ class Glm5NextKdaAttention(Attention):
         # o_proj). At tp==1 this is a no-op.
         o = self.o_proj(output)
         if output_layout is not None:
+            if cp_context is not None:
+                o = _zero_cp_padding(o, cp_context)
             return output_layout.reduce_scatter(o.reshape(-1, self.cfg.hidden_size)).unsqueeze(0)
         if self.tp > 1:
             distributed.all_reduce_(o)
         if cp_context is not None:
-            mask_shape = [1, cp_context.total_local] + [1] * (o.dim() - 2)
-            o = o.masked_fill(~cp_context.shard_valid_mask.view(mask_shape), 0)
+            o = _zero_cp_padding(o, cp_context)
         return o
 
 
@@ -1802,8 +1648,6 @@ class Glm5NextMlaAttention(Attention):
         """
         forward_context = get_forward_context()
         cp_context = getattr(forward_context, "cp_context", None)
-        if cp_context is not None and output_layout is not None:
-            raise ValueError("GLM EPLv2 SP attention currently requires CP1")
         if cp_context is not None:
             hidden_states = cp_merge_rows(
                 hidden_states.reshape(-1, self.hidden_size),
@@ -1863,14 +1707,18 @@ class Glm5NextMlaAttention(Attention):
         v_full = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
         v_full = v_full.reshape(local_num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
+        if cp_context is not None:
+            topk = cp_shard_rows(topk.reshape(num_tokens, -1), cp_context).view(cp_context.total_local, 1, -1)
         if output_layout is not None:
+            # Zero padding before reduce-scatter. The all-reduce path below
+            # must zero afterwards: the reduction itself writes into padding.
+            if cp_context is not None:
+                o = _zero_cp_padding(o, cp_context)
             return output_layout.reduce_scatter(o), topk
         if self.cfg.tp_size > 1:
             distributed.all_reduce_(o)
         if cp_context is not None:
-            mask_shape = [cp_context.total_local] + [1] * (o.dim() - 1)
-            o = o.masked_fill(~cp_context.shard_valid_mask.view(mask_shape), 0)
-            topk = cp_shard_rows(topk.reshape(num_tokens, -1), cp_context).view(cp_context.total_local, 1, -1)
+            o = _zero_cp_padding(o, cp_context)
         return o, topk
 
 
@@ -2068,19 +1916,6 @@ class Glm5NextExperts(nn.Module):
         return current.sum(1).to(hidden_states.dtype)
 
 
-def _eplv2_forward_context() -> ForwardContext | None:
-    """Reject unsupported runtime modes before Attention or expert work."""
-    context = get_forward_context_or_none()
-    if getattr(context, "cp_context", None) is not None:
-        raise ValueError("GLM EPLv2 requires CP1 before entering attention or experts")
-    metadata = context.metadata if context is not None else None
-    if metadata is not None:
-        expanded = getattr(metadata, "expanded_decode_metadata", None)
-        if metadata.is_spec_verify or (expanded is not None and getattr(expanded, "enabled", True)):
-            raise ValueError("GLM EPLv2 requires MTP0 before entering attention or experts")
-    return context
-
-
 def _eplv2_comm_policy(cfg: Glm5NextConfig) -> Eplv2CommPolicy | None:
     if cfg.expert_parallel_degree != 2:
         return None
@@ -2103,26 +1938,66 @@ def _select_eplv2_backend(
     return policy.select(dispatch_tokens, graph=graph), graph
 
 
+def _pcp_dp_dispatch_rows(cfg: Glm5NextConfig, counts: object) -> int:
+    """EP capacity shared by every DP rank, including zigzag-padded PCP shards."""
+    if counts is None or len(counts) != cfg.dp_size or any(count <= 0 for count in counts):
+        raise ValueError("DP/PCP EPLv2 requires positive global execution counts")
+    return (2 * max(counts) + cfg.tp_size - 1) // cfg.tp_size
+
+
 def _eplv2_token_layout(
     cfg: Glm5NextConfig,
     hidden: torch.Tensor,
     policy: Eplv2CommPolicy,
 ) -> tuple[TokenParallelLayout, torch.Tensor]:
     """Plan EP-wide communication from host counts, retaining TP-local rows."""
-    context = _eplv2_forward_context()
+    context = get_forward_context_or_none()
     metadata = context.metadata if context is not None else None
     counts = getattr(metadata, "dp_execution_token_counts", None)
     rows = hidden.numel() // hidden.shape[-1]
-    layout = TokenParallelLayout.from_dp(rows, cfg.tp_size, cfg.tp_rank, cfg.dp_size, cfg.dp_rank, counts)
+    cp_context = getattr(context, "cp_context", None)
+    if cp_context is not None:
+        if (getattr(cp_context, "cp_size", None), getattr(cp_context, "cp_rank", None)) != (
+            cfg.cp_size,
+            cfg.cp_rank,
+        ):
+            raise ValueError("GLM EPLv2 PCP requires a matching prefill shard on every PCP rank")
+        # InputBatch counts describe global (pre-PCP) rows. Zigzag padding can
+        # make one local shard as large as twice that count; DP must share one
+        # EP capacity. A single DP group already has equal local lengths.
+        dispatch_rows = _pcp_dp_dispatch_rows(cfg, counts) if cfg.dp_size > 1 else None
+        layout = TokenParallelLayout(rows, cfg.tp_size, cfg.tp_rank, dispatch_rows=dispatch_rows)
+        mask = cp_context.shard_valid_mask
+    else:
+        is_pcp_prefill = (
+            cfg.cp_size > 1
+            and metadata is not None
+            and (getattr(metadata, "is_prefill", False) or getattr(metadata, "is_chunked_prefill", False))
+        )
+        # EagerRunner omits cp_context on is_dummy ranks. Those ranks still join
+        # the EP collective, so they need the active ranks' PCP dispatch capacity
+        # and an all-false mask. A real prefill without a PCP shard stays rejected.
+        if is_pcp_prefill and cfg.dp_size > 1 and bool(getattr(metadata, "is_dummy", False)):
+            layout = TokenParallelLayout(
+                rows,
+                cfg.tp_size,
+                cfg.tp_rank,
+                dispatch_rows=_pcp_dp_dispatch_rows(cfg, counts),
+            )
+            mask = torch.zeros(rows, dtype=torch.bool, device=hidden.device)
+        else:
+            if is_pcp_prefill:
+                raise ValueError("GLM EPLv2 PCP prefill requires a matching PCP shard")
+            layout = TokenParallelLayout.from_dp(rows, cfg.tp_size, cfg.tp_rank, cfg.dp_size, cfg.dp_rank, counts)
+            execution_metadata = (
+                getattr(context, "execution_contexts", {}).get(Glm5NextEplv2Metadata) if context is not None else None
+            )
+            if not isinstance(execution_metadata, Glm5NextEplv2Metadata):
+                raise ValueError("GLM EPLv2 requires typed execution metadata with a stable active-token mask")
+            mask = execution_metadata.local_token_mask
     backend, _ = _select_eplv2_backend(policy, context, layout.dispatch_tokens)
-    execution_metadata = (
-        getattr(context, "execution_contexts", {}).get(Glm5NextEplv2Metadata) if context is not None else None
-    )
-    if not isinstance(execution_metadata, Glm5NextEplv2Metadata):
-        raise ValueError("GLM EPLv2 requires typed execution metadata with a stable active-token mask")
-    mask = execution_metadata.local_token_mask
     if mask.shape != (rows,) or mask.dtype not in (torch.int8, torch.bool) or mask.device != hidden.device:
-        raise ValueError("GLM EPLv2 active-token mask must match DP-local execution rows")
+        raise ValueError("GLM EPLv2 active-token mask must match local execution rows")
     return replace(layout, routed_backend=backend), layout.shard(mask).to(torch.bool)
 
 
@@ -2260,6 +2135,8 @@ class Glm5NextMoE(nn.Module):
             return self._forward_ep(hidden_states)
         if self.use_w8a8:
             return self._forward_w8a8(hidden_states)
+        if self.cfg.cp_size > 1:
+            raise NotImplementedError("GLM-5.3-Flash CP supports W8A8 expert weights only, not BF16")
         if self.cfg.ep_size > 1 or self.cfg.dp_size > 1:
             raise NotImplementedError("GLM-5.3-Flash ordinary EP/DP supports W8A8 expert weights only, not BF16")
         return self._forward_bf16_tp(hidden_states)
@@ -2276,9 +2153,15 @@ class Glm5NextMoE(nn.Module):
         return final
 
     def _forward_w8a8(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Use clamped local experts and joint reduction for every TP/EP/DP layout."""
+        """Use clamped local experts and joint reduction for TP/EP/DP/CP layouts."""
         orig_shape = hidden_states.shape
-        flat = hidden_states.view(-1, self.hidden)
+        cp_context = getattr(get_forward_context(), "cp_context", None) if self.cfg.cp_size > 1 else None
+        # Routed experts span the full MoE group, including CP ranks. Restore
+        # identical rows before reducing, not shards with equal padded lengths.
+        moe_hidden = (
+            cp_merge_rows(hidden_states.view(-1, self.hidden), cp_context) if cp_context is not None else hidden_states
+        )
+        flat = moe_hidden.view(-1, self.hidden)
         flat, scatter_state = dp_gather_tokens(flat, self.cfg.dp_size, self.cfg.dp_rank)
         logits = self.gate(flat.float())
         topk_weights, topk_ids = kernels.moe_gate_routing(
@@ -2312,8 +2195,12 @@ class Glm5NextMoE(nn.Module):
         # fixed padded DP execution counts through the same scatter state.
         # Accumulate and reduce in FP32: adding BF16 routed/shared partials
         # first otherwise amplifies rounding when those terms cancel.
-        shared = self.shared_experts(hidden_states).view(-1, self.hidden).float()
-        scatter_state.scatter(out).add_(shared)
+        # Shared weights are replicated across CP and sharded only across
+        # attention TP. Contribute one CP replica, including during decode
+        # when cp_context is absent but the MoE group still spans CP ranks.
+        if self.cfg.cp_rank == 0:
+            shared = self.shared_experts(moe_hidden).view(-1, self.hidden).float()
+            scatter_state.scatter(out).add_(shared)
         out = reduce_and_scatter(
             out,
             scatter_state,
@@ -2321,6 +2208,8 @@ class Glm5NextMoE(nn.Module):
             moe_tp_size=self.cfg.moe_tp_size,
             ep_size=self.cfg.ep_size,
         )
+        if cp_context is not None:
+            out = cp_shard_rows(out, cp_context)
         return out.to(hidden_states.dtype).view(*orig_shape)
 
     def _route_ep(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2415,7 +2304,7 @@ class Glm5NextMoE(nn.Module):
             or token_mask.device != flat.device
         ):
             raise ValueError("GLM EPLv2 SP requires a bool source mask matching the local rows")
-        context = _eplv2_forward_context()
+        context = get_forward_context_or_none()
         if layout.routed_backend is None:
             # Direct layer calls need the same admission as model execution,
             # before launching shared work on either stream.
@@ -2748,8 +2637,6 @@ class Glm5NextModel(nn.Module):
     ) -> tuple[TokenParallelLayout | None, torch.Tensor | None]:
         if getattr(self.cfg, "expert_parallel_degree", 0) != 2:
             return None, None
-        if self.cfg.layers_to_capture:
-            raise ValueError("GLM EPLv2 does not support auxiliary hidden capture before entering attention")
         if self.cfg.eplv2_sequence_parallel and hidden.shape[0] != 1:
             raise ValueError("GLM EPLv2 SP requires flattened engine input with batch dimension one")
         layout, mask = _eplv2_token_layout(self.cfg, hidden, self._comm_policy)
@@ -2784,8 +2671,6 @@ class Glm5NextModel(nn.Module):
         is_eplv2 = getattr(self.cfg, "expert_parallel_degree", 0) == 2
         forward_context = get_forward_context_or_none() if is_eplv2 else get_forward_context()
         cp_context = getattr(forward_context, "cp_context", None)
-        if cp_context is not None and is_eplv2:
-            raise ValueError("GLM EPLv2 currently requires CP1 before entering attention")
         if cp_context is not None:
             hidden = cp_shard_rows(hidden.view(-1, self.cfg.hidden_size), cp_context).unsqueeze(0)
             position_ids = cp_shard_positions(position_ids.reshape(-1), cp_context).unsqueeze(0).contiguous()
@@ -2817,9 +2702,13 @@ class Glm5NextModel(nn.Module):
                     token_mask=token_mask if output_layout is not None else None,
                 )
                 input_layout = output_layout
-            # EPLv2 rejects auxiliary capture before execution. Ordinary
-            # TP/EPLv1 retains main's full/CP-local capture and event protocol.
-            self.aux_hidden_capture.capture_layer(layer.layer_id, hidden, None, aux_hidden_buffer)
+            # DFlash2 consumes intermediate target hidden states in full token
+            # order. SP layers own only local rows; restore replicas at the
+            # capture boundary without gathering every layer's residuals.
+            captured_hidden = hidden
+            if input_layout is not None and layer.layer_id in self.cfg.layers_to_capture:
+                captured_hidden = input_layout.gather(hidden.reshape(-1, *hidden.shape[2:])).unsqueeze(0)
+            self.aux_hidden_capture.capture_layer(layer.layer_id, captured_hidden, None, aux_hidden_buffer)
             record_layer_event(layer.layer_id)
         # Final collapse: unweighted mean over the streams, then RMSNorm
         # (reference `self.norm(self.hc_head(hidden_states))`, line 1537).
@@ -2828,12 +2717,16 @@ class Glm5NextModel(nn.Module):
         # token ids in the flattened sequence, so a 3-D output would select the
         # wrong (batch) axis and gather out of range for multi-token prefill.
         h = self.norm(self.hc_head(hidden)).view(-1, self.cfg.hidden_size)
+        # The last MoE layer leaves SP-local rows. CP merge indexes
+        # owner_rank * total_local, so restore the full CP-local layout first.
+        # The aux buffer is allocated before the SP split and capture already
+        # gathers those rows, so it must not be gathered again here.
+        if input_layout is not None:
+            h = input_layout.gather(h)
         if cp_context is not None:
             h = cp_merge_rows(h, cp_context)
             if aux_hidden_buffer is not None:
                 aux_hidden_buffer = cp_merge_rows(aux_hidden_buffer, cp_context)
-        if input_layout is not None:
-            h = input_layout.gather(h)
         return self.aux_hidden_capture.finalize(h, aux_hidden_buffer)
 
 
@@ -3287,6 +3180,8 @@ class Glm5NextForCausalLM(PyModelBase):
             # Expert branch: probe exp0's gate_proj for a weight_scale tensor.
             # Real W8A8 checkpoints carry weight_scale; bf16 checkpoints do not.
             is_w8a8 = L.find(mlp + "experts.0.gate_proj.weight_scale") is not None
+            if not is_w8a8 and self.cfg.cp_size > 1:
+                raise NotImplementedError("GLM-5.3-Flash CP supports W8A8 expert weights only, not BF16")
             if not is_w8a8 and (self.cfg.ep_size > 1 or self.cfg.dp_size > 1):
                 raise NotImplementedError("GLM-5.3-Flash ordinary EP/DP supports W8A8 expert weights only, not BF16")
             moe.use_w8a8 = is_w8a8

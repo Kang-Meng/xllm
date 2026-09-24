@@ -45,14 +45,20 @@ torch::Tensor gather_sequence_rows(const torch::Tensor& values,
 }  // namespace
 
 TargetSpecVerifyMode classify_target_spec_verify_mode(
-    std::string_view model_type) {
+    std::string_view model_type,
+    bool is_python_model) {
   if (is_qwen3_5_target_model_type(model_type)) {
     return TargetSpecVerifyMode::EXPANDED_VERIFY;
   }
-  if (model_type == "deepseek_v32" || model_type == "deepseek_v4" ||
-      model_type == "deepseek_v4_dspark" ||
-      is_glm5_next_target_model_type(model_type)) {
-    return TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY;
+  if (is_glm5_next_target_model_type(model_type) ||
+      model_type == "glm5_next_text") {
+    return is_python_model ? TargetSpecVerifyMode::EXPANDED_VERIFY
+                           : TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL;
+  }
+  if (is_python_model &&
+      (model_type == "deepseek_v32" || model_type == "deepseek_v4" ||
+       model_type == "deepseek_v4_dspark")) {
+    return TargetSpecVerifyMode::EXPANDED_VERIFY;
   }
   if (model_type == "mimo") {
     return TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL;
@@ -60,21 +66,25 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
   return TargetSpecVerifyMode::GENERIC;
 }
 
-bool supports_expanded_spec_verify(TargetSpecVerifyMode mode,
-                                   bool is_python_model) {
-  return mode == TargetSpecVerifyMode::EXPANDED_VERIFY ||
-         (mode == TargetSpecVerifyMode::PYTHON_EXPANDED_VERIFY &&
-          is_python_model);
-}
-
 bool requires_uniform_spec_verify(std::string_view model_type) {
   return is_qwen3_5_target_model_type(model_type) ||
-         is_glm5_next_target_model_type(model_type);
+         is_glm5_next_target_model_type(model_type) ||
+         model_type == "glm5_next_text";
 }
 
 bool supports_native_spec_verify_replay_update(TargetSpecVerifyMode mode,
                                                bool is_python_model) {
-  return !is_python_model && supports_expanded_spec_verify(mode, false);
+  return !is_python_model && mode == TargetSpecVerifyMode::EXPANDED_VERIFY;
+}
+
+bool supports_accepted_span_replay(std::string_view target_model_type,
+                                   bool is_python_target,
+                                   std::string_view draft_model_type,
+                                   bool is_python_draft) {
+  return !is_python_target && !is_python_draft &&
+         (is_glm5_next_target_model_type(target_model_type) ||
+          target_model_type == "glm5_next_text") &&
+         draft_model_type == "glm5_next_mtp";
 }
 
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,

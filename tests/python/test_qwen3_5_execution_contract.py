@@ -32,6 +32,7 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnDecodeMetadata,
     GdnMetadata,
     GdnPrefillMetadata,
+    GdnSpecVerifyMetadata,
     GdnStateCache,
 )
 from xllm.python.layers.npu.qwen3_5.gdn_metadata_builder import (
@@ -115,7 +116,10 @@ def _metadata(
     read_indices: torch.Tensor | None,
     write_indices: torch.Tensor,
     is_prefill: bool,
+    is_chunked_prefill: bool = False,
+    is_spec_verify: bool = False,
     has_initial_state: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
     q_cu_seq_lens: torch.Tensor | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
@@ -125,8 +129,9 @@ def _metadata(
         has_initial_state=has_initial_state,
         q_cu_seq_lens=q_cu_seq_lens,
         is_prefill=is_prefill,
-        is_chunked_prefill=False,
-        is_spec_verify=False,
+        is_chunked_prefill=is_chunked_prefill,
+        is_spec_verify=is_spec_verify,
+        num_accepted_tokens=num_accepted_tokens,
     )
 
 
@@ -344,6 +349,37 @@ def test_gdn_eager_decode_preserves_scheduler_slots() -> None:
     torch.testing.assert_close(
         gdn_metadata.write_state_indices,
         indices.to(torch.int32),
+    )
+
+
+def test_gdn_spec_verify_takes_precedence_over_chunked_prefill() -> None:
+    write_indices = torch.tensor([5, 9], dtype=torch.int64)
+    num_accepted_tokens = torch.tensor([4, 2], dtype=torch.int64)
+
+    gdn_metadata = _builder().build(
+        _input_batch((4, 4)),
+        _metadata(
+            read_indices=None,
+            write_indices=write_indices,
+            is_prefill=False,
+            is_chunked_prefill=True,
+            is_spec_verify=True,
+            num_accepted_tokens=num_accepted_tokens,
+        ),
+    )
+
+    assert isinstance(gdn_metadata, GdnSpecVerifyMetadata)
+    torch.testing.assert_close(
+        gdn_metadata.read_state_indices,
+        write_indices.to(torch.int32),
+    )
+    torch.testing.assert_close(
+        gdn_metadata.write_state_indices,
+        write_indices.to(torch.int32),
+    )
+    torch.testing.assert_close(
+        gdn_metadata.num_accepted_tokens,
+        num_accepted_tokens.to(torch.int32),
     )
 
 

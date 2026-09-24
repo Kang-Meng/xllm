@@ -38,9 +38,6 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   Timer timer;
   ForwardInput query_input;
   prepare_query_inputs(input, query_input);
-  // The target's recurrent state must not leak into the pure full-attention
-  // draft; the target validation input is prepared separately and keeps it.
-  query_input.input_params.clear_linear_attention_state();
 
   const int32_t batch_size = input.input_params.meta.num_sequences;
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();

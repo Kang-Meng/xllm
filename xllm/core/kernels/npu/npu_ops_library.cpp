@@ -132,17 +132,24 @@ torch::Tensor l2_norm_npu(torch::Tensor input, double eps) {
   return xllm::kernel::npu::npu_l2norm_last_dim(input, eps);
 }
 
+// The Python layer stores conv weight as [dim, kernel_width]; the CANN kernel
+// expects [kernel_width, dim]. kernel_width is small relative to dim, so a
+// larger dim-0 identifies the [dim, kernel_width] layout that needs
+// transposing.
+torch::Tensor to_kernel_conv_weight_layout(torch::Tensor weight) {
+  if (weight.size(0) > weight.size(1)) {
+    return weight.t().contiguous();
+  }
+  return weight;
+}
+
 torch::Tensor causal_conv1d_prefill_npu(torch::Tensor x,
                                         torch::Tensor weight,
                                         torch::Tensor conv_state,
                                         torch::Tensor state_indices,
                                         torch::Tensor has_initial_state,
                                         torch::Tensor query_start_loc) {
-  // Python layer stores weight as [dim, kernel_width]; CANN expects
-  // [kernel_width, dim].
-  if (weight.size(0) > weight.size(1)) {
-    weight = weight.t().contiguous();
-  }
+  weight = to_kernel_conv_weight_layout(weight);
 
   // Convert device tensors to host vectors for IntArrayRef parameters.
   auto qsl_cpu = query_start_loc.to(torch::kCPU, torch::kInt64).contiguous();
@@ -212,11 +219,7 @@ causal_conv1d_qkv_prefill_npu(torch::Tensor x,
                               int64_t num_v_heads,
                               int64_t head_k_dim,
                               int64_t head_v_dim) {
-  // Python layer stores weight as [dim, kernel_width]; CANN expects
-  // [kernel_width, dim].
-  if (weight.size(0) > weight.size(1)) {
-    weight = weight.t().contiguous();
-  }
+  weight = to_kernel_conv_weight_layout(weight);
 
   auto qsl_cpu = query_start_loc.to(torch::kCPU, torch::kInt64).contiguous();
   auto si_cpu = state_indices.to(torch::kCPU, torch::kInt64).contiguous();
@@ -239,6 +242,33 @@ causal_conv1d_qkv_prefill_npu(torch::Tensor x,
                                               num_v_heads,
                                               head_k_dim,
                                               head_v_dim);
+}
+
+torch::Tensor causal_conv1d_spec_verify_npu(
+    const torch::Tensor& x,
+    torch::Tensor weight,
+    const torch::Tensor& conv_state,
+    const std::vector<int64_t>& state_indices,
+    const std::vector<int64_t>& query_start_loc,
+    const std::vector<int64_t>& num_accepted_tokens) {
+  weight = to_kernel_conv_weight_layout(weight);
+
+  constexpr int64_t kActivationSilu = 1;
+  constexpr int64_t kPadSlotId = -1;
+  constexpr int64_t kRunModeUpdate = 1;
+
+  return xllm::kernel::npu::causal_conv1d(
+      x,
+      weight,
+      conv_state,
+      /*bias_opt=*/std::nullopt,
+      torch::IntArrayRef(query_start_loc),
+      torch::IntArrayRef(state_indices),
+      /*initial_state_mode_opt=*/torch::IntArrayRef{},
+      torch::IntArrayRef(num_accepted_tokens),
+      kActivationSilu,
+      kPadSlotId,
+      kRunModeUpdate);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_npu(
@@ -328,6 +358,38 @@ torch::Tensor mega_gdn_decode_npu(torch::Tensor qkv,
   return std::get<3>(outputs);
 }
 
+torch::Tensor mega_gdn_mtp_decode_npu(torch::Tensor qkv,
+                                      torch::Tensor z,
+                                      torch::Tensor b,
+                                      torch::Tensor a,
+                                      torch::Tensor conv_weight,
+                                      torch::Tensor conv_state,
+                                      torch::Tensor a_log,
+                                      torch::Tensor dt_bias,
+                                      torch::Tensor ssm_state,
+                                      torch::Tensor read_state_indices,
+                                      torch::Tensor write_state_indices,
+                                      torch::Tensor num_accepted_tokens,
+                                      torch::Tensor norm_weight,
+                                      bool fla_ssm_state_layout) {
+  auto outputs =
+      xllm::kernel::npu::npu_mega_gdn_mtp_decode(qkv,
+                                                 z,
+                                                 b,
+                                                 a,
+                                                 conv_weight,
+                                                 conv_state,
+                                                 a_log,
+                                                 dt_bias,
+                                                 ssm_state,
+                                                 read_state_indices,
+                                                 write_state_indices,
+                                                 num_accepted_tokens,
+                                                 norm_weight,
+                                                 fla_ssm_state_layout);
+  return std::get<3>(outputs);
+}
+
 torch::Tensor fused_sigmoid_gating_delta_rule_decode_npu(
     torch::Tensor a_log,
     torch::Tensor a,
@@ -357,6 +419,37 @@ torch::Tensor fused_sigmoid_gating_delta_rule_decode_npu(
       /*use_qk_l2norm_in_kernel=*/true,
       /*softplus_beta=*/1.0f,
       /*softplus_threshold=*/20.0f);
+}
+
+torch::Tensor fused_recurrent_gated_delta_rule_spec_verify_npu(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor g,
+    torch::Tensor beta,
+    torch::Tensor ssm_state,
+    torch::Tensor checkpoint_indices,
+    torch::Tensor num_accepted_tokens,
+    torch::Tensor cu_seqlens,
+    double scale) {
+  auto output_and_state =
+      xllm::kernel::npu::npu_fused_recurrent_gated_delta_rule(
+          q,
+          k,
+          v,
+          g,
+          /*beta=*/beta,
+          /*scale=*/static_cast<float>(scale),
+          /*initial_state=*/ssm_state,
+          /*inplace_final_state=*/true,
+          /*cu_seqlens=*/cu_seqlens,
+          /*ssm_state_indices=*/checkpoint_indices,
+          /*num_accepted_tokens=*/num_accepted_tokens,
+          /*use_qk_l2norm_in_kernel=*/true);
+  return output_and_state.first.view({checkpoint_indices.size(0),
+                                      checkpoint_indices.size(1),
+                                      v.size(-2),
+                                      v.size(-1)});
 }
 
 std::tuple<torch::Tensor, torch::Tensor> fused_add_rms_norm_npu(
@@ -728,6 +821,12 @@ TORCH_LIBRARY(xllm_ops, m) {
       "write_state_indices, Tensor norm_weight, bool fla_ssm_state_layout) "
       "-> Tensor");
   m.def(
+      "mega_gdn_mtp_decode(Tensor qkv, Tensor z, Tensor b, Tensor a, Tensor "
+      "conv_weight, Tensor(a!) conv_state, Tensor a_log, Tensor dt_bias, "
+      "Tensor(b!) ssm_state, Tensor read_state_indices, Tensor "
+      "write_state_indices, Tensor num_accepted_tokens, Tensor norm_weight, "
+      "bool fla_ssm_state_layout) -> Tensor");
+  m.def(
       "causal_conv1d_prefill(Tensor x, Tensor weight, Tensor(a!) conv_state, "
       "Tensor state_indices, Tensor has_initial_state, "
       "Tensor query_start_loc) -> Tensor");
@@ -743,10 +842,19 @@ TORCH_LIBRARY(xllm_ops, m) {
       "int num_qk_heads, int num_v_heads, "
       "int head_k_dim, int head_v_dim) -> (Tensor, Tensor, Tensor)");
   m.def(
+      "causal_conv1d_spec_verify(Tensor x, Tensor weight, "
+      "Tensor(a!) conv_state, int[] state_indices, int[] query_start_loc, "
+      "int[] num_accepted_tokens) -> Tensor");
+  m.def(
       "fused_sigmoid_gating_delta_rule_decode(Tensor a_log, Tensor a, "
       "Tensor dt_bias, Tensor q, Tensor k, Tensor v, Tensor b, "
       "Tensor(a!) ssm_state, Tensor state_indices, Tensor cu_seqlens, "
       "float scale) -> Tensor");
+  m.def(
+      "fused_recurrent_gated_delta_rule_spec_verify(Tensor q, Tensor k, "
+      "Tensor v, Tensor g, Tensor beta, Tensor(a!) ssm_state, "
+      "Tensor checkpoint_indices, Tensor num_accepted_tokens, "
+      "Tensor cu_seqlens, float scale) -> Tensor");
   m.def(
       "fused_add_rms_norm(Tensor(a!) input, Tensor(b!) residual, Tensor "
       "weight, "
@@ -952,13 +1060,18 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("chunk_gated_delta_rule", TORCH_FN(xllm::chunk_gated_delta_rule_npu));
   m.impl("mega_gdn_prefill", TORCH_FN(xllm::mega_gdn_prefill_npu));
   m.impl("mega_gdn_decode", TORCH_FN(xllm::mega_gdn_decode_npu));
+  m.impl("mega_gdn_mtp_decode", TORCH_FN(xllm::mega_gdn_mtp_decode_npu));
   m.impl("causal_conv1d_prefill", TORCH_FN(xllm::causal_conv1d_prefill_npu));
   m.impl("causal_conv1d_update_v2",
          TORCH_FN(xllm::causal_conv1d_update_v2_npu));
   m.impl("causal_conv1d_qkv_prefill",
          TORCH_FN(xllm::causal_conv1d_qkv_prefill_npu));
+  m.impl("causal_conv1d_spec_verify",
+         TORCH_FN(xllm::causal_conv1d_spec_verify_npu));
   m.impl("fused_sigmoid_gating_delta_rule_decode",
          TORCH_FN(xllm::fused_sigmoid_gating_delta_rule_decode_npu));
+  m.impl("fused_recurrent_gated_delta_rule_spec_verify",
+         TORCH_FN(xllm::fused_recurrent_gated_delta_rule_spec_verify_npu));
   m.impl("fused_add_rms_norm", TORCH_FN(xllm::fused_add_rms_norm_npu));
   m.impl("rms_norm_dynamic_quant",
          TORCH_FN(xllm::kernel::npu::rms_norm_dynamic_quant));

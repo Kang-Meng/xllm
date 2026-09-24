@@ -33,6 +33,7 @@ from xllm.python.model_loader import (
     gqa_head_split,
     load_causal_lm_weights,
 )
+from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 
 
@@ -80,6 +81,7 @@ class Qwen3_5Config:
     mega_moe_context: torch.Tensor | None
     mega_moe_ccl_buffer_size: int
     mega_moe_num_max_tokens_per_rank: int
+    layers_to_capture: tuple[int, ...] = ()
 
     @classmethod
     def from_dict(cls, d: dict) -> Qwen3_5Config:
@@ -167,6 +169,7 @@ class Qwen3_5Config:
             mega_moe_context=pick("mega_moe_context", default=None),
             mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
             mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
+            layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
         )
 
     def validate(self) -> None:
@@ -269,6 +272,7 @@ class Qwen3_5Model(nn.Module):
             dtype=dtype,
             device=device,
         )
+        self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
 
     def forward(
         self,
@@ -277,7 +281,7 @@ class Qwen3_5Model(nn.Module):
         intermediate_tensors: object | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if kwargs:
             raise TypeError(f"unsupported Qwen3.5 execution inputs: {sorted(kwargs)}")
         if intermediate_tensors is not None:
@@ -286,14 +290,17 @@ class Qwen3_5Model(nn.Module):
             raise NotImplementedError("Qwen3.5 does not support inputs_embeds")
         if input_ids is None:
             raise ValueError("input_ids must be provided")
+
         hidden = self.embed_tokens(input_ids)
 
         residual: torch.Tensor | None = None
+        aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         for layer_id, layer in enumerate(self.layers):
             hidden, residual = layer(hidden, residual, positions)
             record_layer_event(layer_id)
+            self.aux_hidden_capture.capture_layer(layer_id, hidden, residual, aux_hidden_buffer)
         hidden, _ = self.norm(hidden, residual)
-        return hidden
+        return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
 
 
 class Qwen3_5ForCausalLM(PyModelBase):

@@ -88,7 +88,10 @@ from .quantization import (
     quantize_per_tensor,
 )
 from .rotary_embedding import (
+    apply_qk_rotary,
+    expand_half_rope_table,
     fused_qk_norm_rope,
+    has_fused_qk_rotary,
     inplace_partial_rotary_mul,
     interleaved_rotary_embedding,
     mrope,
@@ -119,6 +122,9 @@ __all__ = [
     "vision_fusion_attention",
     "batch_matmul_transpose",
     "fused_qk_norm_rope",
+    "apply_qk_rotary",
+    "expand_half_rope_table",
+    "has_fused_qk_rotary",
     "inplace_partial_rotary_mul",
     "interleaved_rotary_embedding",
     "mrope",

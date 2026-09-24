@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "api_service/chat_json_parser.h"
 #include "api_service/completion_json_parser.h"
+#include "api_service/multipart_parser.h"
 #include "api_service/request_id.h"
 #include "api_service/rpc_request_metrics.h"
 #include "api_service/service_impl_factory.h"
@@ -42,6 +43,7 @@ limitations under the License.
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/config/distributed_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/profile_config.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
@@ -100,12 +102,19 @@ void process_typed_brpc_request(std::unique_ptr<Service>& service_impl,
     return;
   }
 
-  auto arena = GetArenaWithCheck<CallT>(response);
-  // brpc passes the request as `const`, but downstream Call wrappers only read
-  // from it.  We cast away constness so the Call can hold a non-const pointer.
+  // This entry returns one typed RPC response. SSE uses the HTTP entry.
+  if constexpr (is_stream_call_v<CallT>) {
+    if (request->stream()) {
+      ctrl->SetFailed("Streaming requests require the HTTP endpoint.");
+      return;
+    }
+  }
+
+  // brpc owns the typed rpc messages and deletes them after done->Run();
+  // use_arena=true only suppresses the Call's own delete.
   auto req_pb = const_cast<typename CallT::ReqType*>(request);
   std::shared_ptr<Call> call = std::make_shared<CallT>(
-      ctrl, done_guard.release(), req_pb, response, arena != nullptr);
+      ctrl, done_guard.release(), req_pb, response, /*use_arena=*/true);
   service_impl->process_async(call);
 }
 
@@ -375,6 +384,74 @@ void media_generation_http_impl(std::unique_ptr<Service>& service,
                               resp_pb,
                               arena != nullptr,
                               /*is_http_request=*/true);
+  service->process_async(call);
+}
+
+}  // namespace
+
+namespace {
+
+// Shared HTTP entry for the speech-to-text endpoints: parses a
+// multipart/form-data upload; any other Content-Type is rejected.
+void speech_to_text_http_impl(std::unique_ptr<SpeechToTextServiceImpl>& service,
+                              xllm::ClosureGuard& guard,
+                              brpc::Controller* ctrl) {
+  const std::string content_type = ctrl->http_request().content_type();
+  if (content_type.rfind("multipart/form-data", 0) != 0) {
+    ctrl->SetFailed(
+        "Content-Type must be multipart/form-data for speech-to-text "
+        "requests.");
+    return;
+  }
+
+  // The Call owns and deletes these messages; unique_ptr covers the early
+  // returns.
+  auto req_pb = std::make_unique<proto::SpeechToTextRequest>();
+  auto resp_pb = std::make_unique<proto::SpeechToTextResponse>();
+
+  api_service::MultipartFormData form;
+  Status parse_status = api_service::parse_multipart_form_data(
+      content_type,
+      ctrl->request_attachment(),
+      static_cast<size_t>(
+          ModelConfig::get_instance().audio_max_upload_file_mb()) *
+          1024 * 1024,
+      form);
+  if (!parse_status.ok()) {
+    ctrl->SetFailed(parse_status.message());
+    LOG(ERROR) << "parse multipart form data failed: "
+               << parse_status.message();
+    return;
+  }
+
+  const auto file_idx = api_service::find_multipart_field(form, "file");
+  if (!file_idx.has_value()) {
+    ctrl->SetFailed("Expected `file` to be a file-like object.");
+    return;
+  }
+  api_service::MultipartPart& file_part = form.parts[*file_idx];
+
+  std::string error;
+  if (!fill_request_from_multipart_form(form, file_part, *req_pb, &error)) {
+    ctrl->SetFailed(error);
+    LOG(ERROR) << "invalid speech-to-text form fields: " << error;
+    return;
+  }
+
+  // Capture the size before the buffer is moved into the call payload.
+  const uint64_t file_size = static_cast<uint64_t>(file_part.value.size());
+  auto* file = req_pb->mutable_file();
+  file->set_type("binary");
+  file->mutable_binary()->set_offset(0);
+  file->mutable_binary()->set_length(file_size);
+
+  auto call = std::make_shared<SpeechToTextCall>(ctrl,
+                                                 guard.release(),
+                                                 req_pb.release(),
+                                                 resp_pb.release(),
+                                                 /*use_arena=*/false,
+                                                 /*is_http_request=*/true);
+  call->set_request_payload(std::move(file_part.value));
   service->process_async(call);
 }
 
@@ -693,6 +770,84 @@ void APIService::AudioGenerationHttp(
   }
   media_generation_http_impl<AudioGenerationCall>(
       audio_generation_service_impl_, done_guard, ctrl, request, response);
+}
+
+void APIService::AudioTranscription(
+    ::google::protobuf::RpcController* controller,
+    const proto::SpeechToTextRequest* request,
+    proto::SpeechToTextResponse* response,
+    ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<SpeechToTextCall, SpeechToTextServiceImpl>(
+      audio_transcription_service_impl_,
+      controller,
+      request,
+      response,
+      done,
+      "AudioTranscription");
+}
+
+void APIService::AudioTranscriptionHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  if (!audio_transcription_service_impl_) {
+    ctrl->SetFailed(
+        "AudioTranscription service is not available on this server");
+    return;
+  }
+  speech_to_text_http_impl(audio_transcription_service_impl_, done_guard, ctrl);
+}
+
+void APIService::AudioTranslation(::google::protobuf::RpcController* controller,
+                                  const proto::SpeechToTextRequest* request,
+                                  proto::SpeechToTextResponse* response,
+                                  ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<SpeechToTextCall, SpeechToTextServiceImpl>(
+      audio_translation_service_impl_,
+      controller,
+      request,
+      response,
+      done,
+      "AudioTranslation");
+}
+
+void APIService::AudioTranslationHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  if (!audio_translation_service_impl_) {
+    ctrl->SetFailed("AudioTranslation service is not available on this server");
+    return;
+  }
+  speech_to_text_http_impl(audio_translation_service_impl_, done_guard, ctrl);
 }
 
 void APIService::TextGeneration(::google::protobuf::RpcController* controller,

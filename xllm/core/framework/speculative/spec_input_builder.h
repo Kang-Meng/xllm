@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/framework/sampling/draft_proposal.h"
+#include "core/framework/speculative/embedding_cache.h"
 #include "util/slice.h"
 
 namespace xllm {
@@ -89,6 +90,26 @@ struct RowSpec {
   bool append_q_len_one = false;
   bool append_block_table = false;
 };
+
+struct MtpReplayInputs {
+  DecodeBuildBuffers rows;
+  std::vector<torch::Tensor> embeddings;
+  std::vector<int32_t> selected_rows;
+  std::vector<int32_t> source_sequences;
+  std::vector<int32_t> valid_rows;
+};
+
+// Replays the emitted target prefix at the positions of the target hidden
+// states, one position before the corresponding emitted tokens. A one-token
+// prefill/bootstrap span therefore overwrites the prefill tail slot. DP may
+// request a uniform width; leading padding writes only to reserved slot 0.
+MtpReplayInputs build_mtp_replay_inputs(
+    const DecodeRowContext& ctx,
+    const std::vector<EmbeddingCache::DecodeState>& states,
+    const torch::Tensor& placeholder,
+    int32_t block_size,
+    int32_t uniform_width = 0,
+    bool is_graph_warmup = false);
 
 // Resolved token and relative position offset for placeholder token handling.
 struct TokenWithOffset {
@@ -168,6 +189,11 @@ void update_input_params(ModelInputParams& input_params,
                          int32_t kv_max_seq_len,
                          std::vector<int32_t> kv_seq_lens_vec,
                          bool update_block_tables = false);
+
+// Rebuilds request-scoped execution metadata after speculative validation
+// expands each logical request to one or more execution tokens.
+void update_execution_batch_metadata(ModelInputParams& input_params,
+                                     std::vector<int32_t> num_scheduled_tokens);
 
 // Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);

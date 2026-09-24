@@ -174,6 +174,52 @@ TEST(SpecDecodeInputBuilderTest, ValidateInputsNonAtbExpansion) {
             std::vector<int32_t>({2, 3, 4, 2, 3, 4}));
 }
 
+TEST(SpecDecodeInputBuilderTest, UpdatesDenseValidateExecutionBatchMetadata) {
+  ModelInputParams params;
+  params.execution_batch.num_reqs = 2;
+  params.execution_batch.num_tokens = 2;
+  params.execution_batch.num_scheduled_tokens = {1, 1};
+  params.execution_batch.num_computed_tokens = {7, 11};
+  params.execution_batch.query_start_loc = {0, 1, 2};
+  params.execution_batch.is_prefilling = {0, 0};
+
+  update_execution_batch_metadata(params, {16, 16});
+
+  EXPECT_EQ(params.execution_batch.num_reqs, 2);
+  EXPECT_EQ(params.execution_batch.num_tokens, 32);
+  EXPECT_EQ(params.execution_batch.num_scheduled_tokens,
+            std::vector<int32_t>({16, 16}));
+  EXPECT_EQ(params.execution_batch.query_start_loc,
+            std::vector<int32_t>({0, 16, 32}));
+  EXPECT_EQ(params.execution_batch.num_computed_tokens,
+            std::vector<int32_t>({7, 11}));
+  EXPECT_EQ(params.execution_batch.is_prefilling, std::vector<uint8_t>({0, 0}));
+}
+
+TEST(SpecDecodeInputBuilderTest,
+     UpdatesVariableValidateExecutionBatchMetadata) {
+  ModelInputParams params;
+  params.execution_batch.num_reqs = 3;
+  params.execution_batch.num_tokens = 3;
+  params.execution_batch.num_scheduled_tokens = {1, 1, 1};
+  params.execution_batch.num_computed_tokens = {3, 5, 8};
+  params.execution_batch.query_start_loc = {0, 1, 2, 3};
+  params.execution_batch.is_prefilling = {0, 0, 0};
+
+  update_execution_batch_metadata(params, {3, 16, 1});
+
+  EXPECT_EQ(params.execution_batch.num_reqs, 3);
+  EXPECT_EQ(params.execution_batch.num_tokens, 20);
+  EXPECT_EQ(params.execution_batch.num_scheduled_tokens,
+            std::vector<int32_t>({3, 16, 1}));
+  EXPECT_EQ(params.execution_batch.query_start_loc,
+            std::vector<int32_t>({0, 3, 19, 20}));
+  EXPECT_EQ(params.execution_batch.num_computed_tokens,
+            std::vector<int32_t>({3, 5, 8}));
+  EXPECT_EQ(params.execution_batch.is_prefilling,
+            std::vector<uint8_t>({0, 0, 0}));
+}
+
 TEST(SpecDecodeInputBuilderTest, AppendDecodeRowTokenKinds) {
   std::vector<int32_t> kv_seq_lens = to_layout_seq_lens({5, 9});
   torch::Tensor token_ids = torch::tensor({10, 20}, torch::kInt);

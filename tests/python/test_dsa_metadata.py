@@ -38,14 +38,16 @@ def test_build_cache_specs_groups() -> None:
     compress_ratios = [0, 0, 4, 128, 4, 128, 4, 0]
     caches_info, group_infos = build_cache_specs(compress_ratios, window_size=128, n_layers=8)
 
-    # Three groups: SWA(1,128), TOKEN(4,128), TOKEN(128,128).
+    # Three groups: SWA(1,128), TOKEN(4,512), TOKEN(128,16).
     assert len(group_infos) == 3
     assert group_infos[0].cache_type == DSA_CACHE_SLIDING_WINDOW
     assert group_infos[0].ratio == 1
     assert group_infos[1].cache_type == DSA_CACHE_TOKEN
     assert group_infos[1].ratio == 4
+    assert group_infos[1].block_size == 512
     assert group_infos[2].cache_type == DSA_CACHE_TOKEN
     assert group_infos[2].ratio == 128
+    assert group_infos[2].block_size == 16
 
 
 def test_build_cache_specs_per_layer_cache_counts() -> None:
@@ -156,10 +158,10 @@ def test_build_token_group_slot_committed_rows() -> None:
     # Layer 1 (cr=4): cmp cache is caches_info[1][0] -> group 1 (TOKEN4).
     cmp_slot = dsa.slot_mappings[1][0]
     # One committed row: compressed_idx = prev_committed = 7//4 = 1.
-    # block_idx = 1 // 128 = 0, block_id = token4_bt[0,0] = 20.
-    # slot = 20 * 128 + 1 = 2561.
+    # block_idx = 1 // 512 = 0, block_id = token4_bt[0,0] = 20.
+    # slot = 20 * 512 + 1 = 10241.
     assert cmp_slot.numel() >= 1
-    assert cmp_slot[0].item() == 20 * 128 + 1
+    assert cmp_slot[0].item() == 20 * 512 + 1
 
 
 def test_build_token_group_slot_empty_between_boundaries() -> None:
@@ -194,7 +196,7 @@ def test_build_token_group_slot_commits_at_later_boundary() -> None:
         is_chunked_prefill=False,
     )
 
-    assert dsa.slot_mappings[1][0].tolist() == [20 * 128 + 32]
+    assert dsa.slot_mappings[1][0].tolist() == [20 * 512 + 32]
 
 
 def test_build_swa_group_slot_query_tokens_only() -> None:
@@ -331,7 +333,7 @@ def test_build_c128_slot_at_compression_boundary() -> None:
     )
 
     # Layer 2 uses TOKEN(128) for cache 0. The first compressed row is offset 0.
-    assert dsa.slot_mappings[2][0].tolist() == [30 * 128]
+    assert dsa.slot_mappings[2][0].tolist() == [30 * 16]
     assert dsa.c128_pad_positions.tolist() == [0]
 
 
@@ -350,7 +352,7 @@ def test_multi_batch_slots_are_concatenated_by_sequence() -> None:
     )
 
     assert dsa.slot_mappings[0][0].tolist() == [10 * 128 + 3, 12 * 128 + 7]
-    assert dsa.slot_mappings[1][0].tolist() == [20 * 128, 22 * 128 + 1]
+    assert dsa.slot_mappings[1][0].tolist() == [20 * 512, 22 * 512 + 1]
 
 
 def test_packed_manager_block_table_is_unpacked() -> None:
@@ -387,7 +389,7 @@ def test_graph_slots_and_block_tables_use_bucket_capacity() -> None:
         graph_block_table_capacity_cols=4,
     )
 
-    assert dsa.slot_mappings[1][0].tolist() == [20 * 128 + 1, -1, -1, -1]
+    assert dsa.slot_mappings[1][0].tolist() == [20 * 512 + 1, -1, -1, -1]
     assert dsa.block_tables[1][0].shape == (1, 4)
     assert dsa.block_tables[1][0].tolist() == [[20, 21, -1, -1]]
     assert dsa.slot_mappings[0][0].tolist() == [10 * 128 + 7, -1, -1, -1]

@@ -576,6 +576,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
       options_.num_speculative_tokens(), sample_from_anchor());
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
   ForwardInput query_input = input;
+  query_input.input_params.clear_linear_attention_state();
   dflash_detail::invalidate_draft_model_geometry(query_input.input_params);
   query_input.input_params.meta.batch_forward_type = draft_batch_forward_type();
   query_input.input_params.meta.q_max_seq_len =
@@ -1281,6 +1282,10 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   query_input = input;
   query_input.device_tensors_ready = false;
   ModelInputParams& input_params = query_input.input_params;
+  // DFlash-family drafts are pure full-attention models. The copied target
+  // input may belong to a hybrid model, so discard its recurrent-cache state
+  // before rebuilding the draft query geometry.
+  input_params.clear_linear_attention_state();
   input_params.embedding.input_embedding = torch::Tensor();
   dflash_detail::invalidate_draft_model_geometry(input_params);
 
