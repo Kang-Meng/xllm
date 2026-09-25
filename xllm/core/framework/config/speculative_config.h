@@ -59,9 +59,7 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "MTP");
   }
 
-  // True for the DSpark block-diffusion draft. DSpark runs eager only (its
-  // verify path is not ACL-graph capturable yet), so callers use this to gate
-  // graph-mode features off.
+  // True for the DSpark block-diffusion draft.
   static bool is_dspark_algorithm(std::string_view algorithm) {
     return boost::iequals(algorithm, "DSpark");
   }

@@ -92,6 +92,21 @@ size_t get_sequence_free_blocks_for_rank(KVCacheManager* kv_cache_manager,
   return util::max(free_blocks);
 }
 
+// Re-queue requests skipped during a scheduling pass so they are retried
+// once step-local capacity (e.g. a DP group's token cap) refreshes. Every
+// queue type's plain push is the right re-entry operation: the deque-backed
+// queues of the fcfs/multi_slo_and_prio strategies insert at the front, and
+// the reverse iteration restores the requests' relative order; heap-backed
+// priority queues re-place each request by its comparator instead, so retry
+// order there follows the queue's priority semantics.
+void restore_skipped_requests(
+    RequestPriorityQueue* queue,
+    const std::vector<std::shared_ptr<Request>>& skipped) {
+  for (auto it = skipped.rbegin(); it != skipped.rend(); ++it) {
+    queue->push(*it);
+  }
+}
+
 }  // namespace
 
 // =============================================================================
@@ -248,6 +263,7 @@ void SchedulerPolicy::schedule_prefill_from_queue(
 
   bool budget_exhausted = false;
   bool blocks_exhausted = false;
+  std::vector<std::shared_ptr<Request>> skipped;
 
   while (!queue->empty() && budget.remaining_seq_budget > 0 &&
          budget.remaining_token_budget > 0 &&
@@ -396,6 +412,16 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     if (!can_schedule) {
       break;
     }
+    // Sequences that received a zero-token share for this step (e.g. their
+    // DP group's per-step token cap is exhausted) were skipped above. The
+    // request must keep its prefill queue slot: admitting it with no
+    // sequences would drop it out of the prefill path and requeue it as a
+    // decode-stage request, stalling it until a prefill-idle step.
+    if (prefill_sequences.empty()) {
+      skipped.emplace_back(request);
+      queue->pop_top();
+      continue;
+    }
 
     budget.remaining_token_budget -= allocated_tokens;
     budget.remaining_seq_budget -= allocated_seqs;
@@ -431,6 +457,7 @@ void SchedulerPolicy::schedule_prefill_from_queue(
   // Handle unschedulable head request.
   handle_unschedulable_head(
       queue, state, finished, budget_exhausted, blocks_exhausted);
+  restore_skipped_requests(queue, skipped);
 }
 
 size_t SchedulerPolicy::compute_prefill_tokens(Sequence* seq,

@@ -762,7 +762,10 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       if (!options_.disable_log_stats()) {
         request->log_statistic(request->elapsed_seconds());
       }
-      request->state().decode_rpc_address.clear();
+      // Keep decode_rpc_address (the peer that accepted the Allocate RPC):
+      // the first-generation task below needs it to release the decode-side
+      // reservation if the transfer fails; it is cleared once the transfer
+      // succeeds.
       requests.emplace_back(request);
       if (!request->state().stream) {
         non_stream_requests.emplace_back(request);
@@ -790,6 +793,26 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       {
         std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
         req_to_channel_map_.erase(request->request_id());
+      }
+      response_processor_->wait_completion();
+      kv_cache_manager_->deallocate(request.get());
+    };
+    // Fails a request whose handoff to the decode instance cannot complete:
+    // releases the decode-side KV reservation reserved by the Allocate RPC
+    // (decode_rpc_address still holds the peer that accepted it, so the
+    // release RPC reaches that instance instead of the reservation leaking
+    // until the prefill instance is unlinked), then responds. A stream
+    // request has not been responded to yet and needs the explicit failure
+    // response; a non-stream request already received its response via
+    // process_completed_requests, so a second response would break the
+    // single request-response pairing and it only runs the shared cleanup.
+    auto fail_handoff_request = [this, &fail_request](
+                                    const std::shared_ptr<Request>& request,
+                                    Status status) {
+      release_failed_request(request);
+      if (request->state().stream) {
+        fail_request(request, status);
+        return;
       }
       response_processor_->wait_completion();
       kv_cache_manager_->deallocate(request.get());
@@ -887,7 +910,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
         if (!embedding.defined()) {
           LOG(ERROR) << "Missing MTP bootstrap embedding, request_id: "
                      << request->request_id();
-          fail_request(
+          fail_handoff_request(
               request,
               {StatusCode::UNKNOWN, "Missing MTP bootstrap embedding"});
           continue;
@@ -897,9 +920,9 @@ void DisaggPDScheduler::prefill_send_first_generation() {
                                   gen->mutable_mtp_bootstrap_embedding())) {
           LOG(ERROR) << "Failed to serialize MTP bootstrap embedding, "
                      << "request_id: " << request->request_id();
-          fail_request(request,
-                       {StatusCode::UNKNOWN,
-                        "Failed to serialize MTP bootstrap embedding"});
+          fail_handoff_request(request,
+                               {StatusCode::UNKNOWN,
+                                "Failed to serialize MTP bootstrap embedding"});
           continue;
         }
         request->sequences()[0]->clear_mtp_bootstrap_embedding();
@@ -932,16 +955,23 @@ void DisaggPDScheduler::prefill_send_first_generation() {
                    << request->state().decode_address
                    << ", error text : " << cntl.ErrorText()
                    << ", response status: " << resp.ok();
+        fail_handoff_request(
+            request,
+            {StatusCode::UNAVAILABLE,
+             "Failed to send first generation to decode instance"});
+        continue;
       }
+      // The handoff succeeded, so the decode instance owns the reservation
+      // from here on; drop the captured Allocate peer so no later release
+      // attempt can target it.
+      request->state().decode_rpc_address.clear();
 
       {
         std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
         req_to_channel_map_.erase(request->request_id());
       }
       response_processor_->wait_completion();
-      if (sent_first_generation) {
-        cache_prefill_blocks(request.get());
-      }
+      cache_prefill_blocks(request.get());
       kv_cache_manager_->deallocate(request.get());
     }
   });
