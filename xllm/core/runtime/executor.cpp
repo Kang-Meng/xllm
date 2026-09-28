@@ -44,6 +44,10 @@ ForwardInput Executor::prepare_inputs(Batch& batch) {
   return impl_->prepare_inputs(batch);
 }
 
+void Executor::set_dp_process_group(ProcessGroup* group) {
+  impl_->set_dp_process_group(group);
+}
+
 ModelOutput Executor::forward(const torch::Tensor& tokens,
                               const torch::Tensor& positions,
                               std::vector<KVCache>& kv_caches,

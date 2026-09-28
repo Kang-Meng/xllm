@@ -69,7 +69,33 @@ inline bool load_model_args(const JsonReader& json,
   return true;
 }
 
+inline void configure_mtp_args(ModelArgs& args, bool is_python_model) {
+  if (is_python_model) {
+    return;
+  }
+  const int32_t mtp_layers =
+      std::max<int32_t>(args.num_nextn_predict_layers(), 1);
+  args.num_nextn_predict_layers(mtp_layers);
+  args.n_layers(mtp_layers);
+  args.layer_types(std::vector<std::string>(static_cast<size_t>(mtp_layers),
+                                            "full_attention"));
+  args.full_attention_interval(1);
+}
+
 }  // namespace qwen3_5_mtp
+
+const bool qwen3_5_mtp_adapter_registered = []() {
+  for (const char* name : {"qwen3_5",
+                           "qwen3_5_moe",
+                           "qwen3_5_text",
+                           "qwen3_5_moe_text",
+                           "qwen3_5_mtp",
+                           "qwen3_5_moe_mtp"}) {
+    ModelRegistry::register_mtp_args_adapter(name,
+                                             &qwen3_5_mtp::configure_mtp_args);
+  }
+  return true;
+}();
 
 class Qwen3_5MtpModelImplBase : public Qwen3HybridModelImplBase {
  public:

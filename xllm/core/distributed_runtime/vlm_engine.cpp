@@ -92,16 +92,15 @@ VLMEngine::VLMEngine(const runtime::Options& options,
 }
 
 runtime::DecodeGraphWarmupConfig VLMEngine::decode_graph_warmup_config() const {
-  if (!Platform::is_npu()) {
-    return {};
-  }
   runtime::DecodeGraphWarmupConfig warmup_config;
   warmup_config.num_decoding_tokens = options_.num_decoding_tokens();
   warmup_config.num_speculative_tokens = options_.num_speculative_tokens();
   warmup_config.enable_graph_mode_decode_no_padding =
       options_.enable_graph_mode_decode_no_padding();
-  warmup_config.max_graph_batch_size =
-      ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit();
+  if (Platform::is_npu()) {
+    warmup_config.max_graph_batch_size =
+        ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit();
+  }
   return warmup_config;
 }
 
@@ -289,10 +288,8 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
       static_cast<int64_t>(options_.max_seqs_per_batch());
   estimate_options.max_concurrent_requests = static_cast<int64_t>(
       ::xllm::ServiceConfig::get_instance().max_concurrent_requests());
-  if (Platform::is_npu()) {
-    estimate_options.num_speculative_tokens =
-        static_cast<int64_t>(options_.num_speculative_tokens());
-  }
+  estimate_options.num_speculative_tokens =
+      static_cast<int64_t>(options_.num_speculative_tokens());
   estimate_options.max_tokens_per_batch =
       static_cast<int64_t>(options_.max_tokens_per_batch());
   estimate_options.max_tokens_per_chunk_for_prefill =

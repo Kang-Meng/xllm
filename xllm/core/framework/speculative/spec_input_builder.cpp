@@ -307,6 +307,10 @@ DecodeRowContext make_decode_row_context(const ForwardInput& input) {
   }
   CHECK(input.positions_host.defined())
       << "positions_host must be defined for decode row build";
+  CHECK(input.positions_host.is_contiguous());
+  ctx.position_axes =
+      input.positions_host.dim() == 2 ? input.positions_host.size(0) : 1;
+  CHECK(ctx.position_axes == 1 || ctx.position_axes == 3);
   ctx.positions = get_positions(input);
   CHECK_GE(static_cast<int32_t>(ctx.positions.size()), ctx.num_sequences)
       << "positions size is smaller than num_sequences, positions_size="
@@ -431,7 +435,8 @@ MtpReplayInputs build_mtp_replay_inputs(
     const torch::Tensor& placeholder,
     int32_t block_size,
     int32_t uniform_width,
-    bool is_graph_warmup) {
+    bool is_graph_warmup,
+    int32_t pad_cache_slot) {
   CHECK_EQ(states.size(), static_cast<size_t>(ctx.num_sequences));
   CHECK_GE(uniform_width, 0);
   MtpReplayInputs result;
@@ -452,6 +457,9 @@ MtpReplayInputs build_mtp_replay_inputs(
   result.selected_rows.reserve(ctx.num_sequences);
   result.source_sequences.reserve(capacity);
   result.valid_rows.reserve(capacity);
+  if (ctx.position_axes == 3) {
+    result.mrope_positions.reserve(capacity);
+  }
   for (int32_t seq_id = 0; seq_id < ctx.num_sequences; ++seq_id) {
     const auto& state = states[seq_id];
     const int32_t span = static_cast<int32_t>(state.replay_token_ids.size());
@@ -479,12 +487,31 @@ MtpReplayInputs build_mtp_replay_inputs(
       row.append_block_table = true;
       append_decode_row(ctx, row, block_size, result.rows);
       if (!valid) {
-        result.rows.out_new_cache_slots.back() = 0;
+        result.rows.out_new_cache_slots.back() = pad_cache_slot;
       }
       result.embeddings.emplace_back(
           valid ? state.replay_embeddings.select(0, replay_id) : placeholder);
       result.source_sequences.emplace_back(seq_id);
       result.valid_rows.emplace_back(valid ? 1 : 0);
+      if (ctx.position_axes == 3) {
+        std::array<int32_t, 3> rotary = {0, 0, 0};
+        if (valid) {
+          if (state.replay_mrope_positions.defined()) {
+            CHECK_EQ(state.replay_mrope_positions.sizes(),
+                     torch::IntArrayRef({3, span}));
+            auto stored = state.replay_mrope_positions.accessor<int32_t, 2>();
+            for (int32_t axis = 0; axis < 3; ++axis) {
+              rotary[axis] = stored[axis][replay_id];
+            }
+          } else {
+            for (int32_t axis = 0; axis < 3; ++axis) {
+              rotary[axis] = ctx.positions[axis * ctx.num_sequences + seq_id] +
+                             row.position_offset;
+            }
+          }
+        }
+        result.mrope_positions.emplace_back(rotary);
+      }
     }
     result.selected_rows.emplace_back(result.embeddings.size() - 1);
   }

@@ -77,16 +77,6 @@ bool supports_native_spec_verify_replay_update(TargetSpecVerifyMode mode,
   return !is_python_model && mode == TargetSpecVerifyMode::EXPANDED_VERIFY;
 }
 
-bool supports_accepted_span_replay(std::string_view target_model_type,
-                                   bool is_python_target,
-                                   std::string_view draft_model_type,
-                                   bool is_python_draft) {
-  return !is_python_target && !is_python_draft &&
-         (is_glm5_next_target_model_type(target_model_type) ||
-          target_model_type == "glm5_next_text") &&
-         draft_model_type == "glm5_next_mtp";
-}
-
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,
                                                 int64_t block_size) {
   CHECK_GT(max_position_embeddings, 0);

@@ -95,38 +95,6 @@ TEST(MtpAsyncStateTest, RestrictsFusedVerifyTokenUpdateToNativeExecutors) {
   }
 }
 
-TEST(MtpAsyncStateTest, RestrictsAcceptedSpanReplayToNativeGlm5Pairs) {
-  for (std::string_view target :
-       {"glm5_next", "glm5_3_flash", "glm5_next_text"}) {
-    EXPECT_TRUE(supports_accepted_span_replay(target,
-                                              /*is_python_target=*/false,
-                                              "glm5_next_mtp",
-                                              /*is_python_draft=*/false));
-    EXPECT_FALSE(supports_accepted_span_replay(target,
-                                               /*is_python_target=*/true,
-                                               "glm5_next_mtp",
-                                               /*is_python_draft=*/false));
-    EXPECT_FALSE(supports_accepted_span_replay(target,
-                                               /*is_python_target=*/false,
-                                               "glm5_next_mtp",
-                                               /*is_python_draft=*/true));
-    for (std::string_view draft :
-         {"qwen3_5_mtp", "mimo_mtp", "unknown_model"}) {
-      EXPECT_FALSE(supports_accepted_span_replay(target,
-                                                 /*is_python_target=*/false,
-                                                 draft,
-                                                 /*is_python_draft=*/false));
-    }
-  }
-  for (std::string_view target :
-       {"mimo", "qwen3_5", "deepseek_v4", "glm5_next_mtp", "unknown_model"}) {
-    EXPECT_FALSE(supports_accepted_span_replay(target,
-                                               /*is_python_target=*/false,
-                                               "glm5_next_mtp",
-                                               /*is_python_draft=*/false));
-  }
-}
-
 TEST(MtpAsyncStateTest, ClassifiesSupportedCombinedDraftExecutionPaths) {
   EXPECT_EQ(classify_combined_draft_execution_path("qwen3_5_mtp"),
             CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION);
@@ -399,31 +367,81 @@ TEST(MtpAsyncStateTest, KeepsReplaySemanticsTogether) {
   EXPECT_EQ(replay.draft_position_offset, -1);
 }
 
-TEST(MtpAsyncStateTest, ValidatesReplayAgainstTargetAndDraftCapabilities) {
-  EXPECT_TRUE(is_draft_context_update_compatible(
-      TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
-      DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
-      "glm5_next",
-      /*is_python_target=*/false,
-      "glm5_next_mtp",
-      /*is_python_draft=*/false,
-      /*uses_embedded_eagle3=*/false));
-  EXPECT_FALSE(is_draft_context_update_compatible(
-      TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
-      DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
-      "glm5_next",
-      /*is_python_target=*/false,
-      "glm5_next_mtp",
-      /*is_python_draft=*/false,
-      /*uses_embedded_eagle3=*/true));
-  EXPECT_FALSE(is_draft_context_update_compatible(
-      TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
-      DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
-      "mimo",
-      /*is_python_target=*/false,
-      "glm5_next_mtp",
-      /*is_python_draft=*/false,
-      /*uses_embedded_eagle3=*/false));
+TEST(MtpAsyncStateTest, MatchesNativeReplayContractsByVerifyMode) {
+  EXPECT_TRUE(replay_compatible(TargetSpecVerifyMode::EXPANDED_VERIFY,
+                                DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                /*target_capable=*/true,
+                                /*draft_capable=*/true,
+                                /*is_python_target=*/false,
+                                /*is_python_draft=*/false,
+                                /*uses_embedded_eagle3=*/false));
+  EXPECT_TRUE(replay_compatible(TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
+                                DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                /*target_capable=*/true,
+                                /*draft_capable=*/true,
+                                /*is_python_target=*/false,
+                                /*is_python_draft=*/false,
+                                /*uses_embedded_eagle3=*/false));
+  EXPECT_FALSE(replay_compatible(TargetSpecVerifyMode::EXPANDED_VERIFY,
+                                 DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                 /*target_capable=*/false,
+                                 /*draft_capable=*/true,
+                                 /*is_python_target=*/false,
+                                 /*is_python_draft=*/false,
+                                 /*uses_embedded_eagle3=*/false));
+  EXPECT_FALSE(replay_compatible(TargetSpecVerifyMode::EXPANDED_VERIFY,
+                                 DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                 /*target_capable=*/true,
+                                 /*draft_capable=*/false,
+                                 /*is_python_target=*/false,
+                                 /*is_python_draft=*/false,
+                                 /*uses_embedded_eagle3=*/false));
+  EXPECT_FALSE(replay_compatible(TargetSpecVerifyMode::EXPANDED_VERIFY,
+                                 DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                 /*target_capable=*/true,
+                                 /*draft_capable=*/true,
+                                 /*is_python_target=*/true,
+                                 /*is_python_draft=*/false,
+                                 /*uses_embedded_eagle3=*/false));
+  EXPECT_FALSE(replay_compatible(TargetSpecVerifyMode::EXPANDED_VERIFY,
+                                 DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                 /*target_capable=*/true,
+                                 /*draft_capable=*/true,
+                                 /*is_python_target=*/false,
+                                 /*is_python_draft=*/false,
+                                 /*uses_embedded_eagle3=*/true));
+  EXPECT_FALSE(replay_compatible(TargetSpecVerifyMode::EXPANDED_VERIFY,
+                                 DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                 /*target_capable=*/true,
+                                 /*draft_capable=*/true,
+                                 /*is_python_target=*/false,
+                                 /*is_python_draft=*/true,
+                                 /*uses_embedded_eagle3=*/false));
+  for (TargetSpecVerifyMode mode :
+       {TargetSpecVerifyMode::GENERIC, static_cast<TargetSpecVerifyMode>(-1)}) {
+    EXPECT_FALSE(replay_compatible(mode,
+                                   DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                   /*target_capable=*/true,
+                                   /*draft_capable=*/true,
+                                   /*is_python_target=*/false,
+                                   /*is_python_draft=*/false,
+                                   /*uses_embedded_eagle3=*/false));
+  }
+}
+
+TEST(MtpAsyncStateTest, KeepsTailExtensionAvailableWithoutReplayCapabilities) {
+  for (TargetSpecVerifyMode mode :
+       {TargetSpecVerifyMode::GENERIC,
+        TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL,
+        TargetSpecVerifyMode::EXPANDED_VERIFY}) {
+    EXPECT_TRUE(replay_compatible(mode,
+                                  DraftContextUpdate::TAIL_EXTEND,
+                                  /*target_capable=*/false,
+                                  /*draft_capable=*/false,
+                                  /*is_python_target=*/true,
+                                  /*is_python_draft=*/true,
+                                  /*uses_embedded_eagle3=*/true));
+  }
 }
 
 }  // namespace

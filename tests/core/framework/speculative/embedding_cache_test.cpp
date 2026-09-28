@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <array>
+
 #include "core/framework/speculative/mtp_async_replay_builder.h"
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/runtime/forward_params.h"
@@ -390,10 +392,12 @@ TEST(EmbeddingCacheTest, BuildsDraftReplayInputPlanWithoutRuntimeState) {
                                                torch::zeros({2}),
                                                /*logical_block_size=*/4,
                                                /*uniform_width=*/3,
-                                               /*graph_warmup=*/false);
+                                               /*graph_warmup=*/false,
+                                               /*pad_cache_slot=*/-1);
 
   EXPECT_EQ(plan.rows.out_token_ids, std::vector<int32_t>({0, 41, 42}));
   EXPECT_EQ(plan.rows.out_positions, std::vector<int32_t>({0, 3, 4}));
+  EXPECT_EQ(plan.rows.out_new_cache_slots, std::vector<int32_t>({-1, 11, 20}));
   EXPECT_EQ(plan.selected_rows, std::vector<int32_t>({2}));
   EXPECT_EQ(plan.source_sequences, std::vector<int32_t>({0, 0, 0}));
   EXPECT_EQ(plan.valid_rows, std::vector<int32_t>({0, 1, 1}));
@@ -423,6 +427,35 @@ TEST(EmbeddingCacheTest,
   EXPECT_EQ(replay.rows.out_token_ids, std::vector<int32_t>({40, 50}));
   EXPECT_TRUE(torch::equal(torch::stack(replay.embeddings),
                            torch::tensor({{6.0f, 7.0f}, {6.0f, 7.0f}})));
+}
+
+TEST(EmbeddingCacheTest, PrefillReplayKeepsDistinctRotaryAxes) {
+  EmbeddingCache cache(/*total_nums=*/1, /*retain_replay_span=*/true);
+  torch::Tensor positions =
+      torch::tensor({{5, 6}, {10, 11}, {20, 21}}, torch::kInt);
+  cache.write_prefill_target_context(
+      {0},
+      {"vlm"},
+      torch::tensor({42}, torch::kInt),
+      torch::tensor({{1.0f, 2.0f}, {3.0f, 4.0f}}),
+      torch::tensor({1}, torch::kInt),
+      positions);
+  positions.fill_(999);
+  const auto states = cache.read_decode_states({0}, {"vlm"});
+  auto input = make_replay_input({42}, {7});
+  input.positions_host = torch::tensor({{7}, {7}, {7}}, torch::kInt);
+  const auto replay = specBuilder::build_mtp_replay_inputs(
+      specBuilder::make_decode_row_context(input),
+      states,
+      torch::zeros({2}),
+      /*block_size=*/4,
+      /*uniform_width=*/1);
+
+  EXPECT_EQ(replay.rows.out_positions, std::vector<int32_t>({6}));
+  const std::vector<std::array<int32_t, 3>> expected_rotary = {{6, 11, 21}};
+  EXPECT_EQ(replay.mrope_positions, expected_rotary);
+  EXPECT_TRUE(torch::equal(states[0].replay_mrope_positions,
+                           torch::tensor({{6}, {11}, {21}}, torch::kInt)));
 }
 
 TEST(EmbeddingCacheTest, ReplayFollowsRequestOrderAndPadsOnlyReservedSlots) {

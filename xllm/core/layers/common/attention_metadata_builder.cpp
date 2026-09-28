@@ -258,6 +258,16 @@ void materialize_linear_state_validity(
     return;
   }
 
+  if (params.linear_state_validity_mask_tensor.defined()) {
+    CHECK_EQ(params.linear_state_validity_mask_tensor.scalar_type(),
+             torch::kBool)
+        << "linear state validity tensor must use bool dtype";
+    CHECK_EQ(params.linear_state_validity_mask_tensor.numel(), mask_rows)
+        << "linear state validity tensor row count mismatch";
+    attn_metadata.has_initial_states = params.linear_state_validity_mask_tensor;
+    return;
+  }
+
   torch::TensorOptions options;
   if (params.embedding.linear_state_indices.defined()) {
     options = params.embedding.linear_state_indices.options();
@@ -610,7 +620,8 @@ AttentionMetadata AttentionMetadataBuilder::build(
 void AttentionMetadataBuilder::build_linear_prefill(
     AttentionMetadata& attn_metadata,
     int64_t block_size) {
-  if (!attn_metadata.is_prefill && !attn_metadata.is_chunked_prefill) {
+  if (attn_metadata.is_spec_verify ||
+      (!attn_metadata.is_prefill && !attn_metadata.is_chunked_prefill)) {
     return;
   }
 

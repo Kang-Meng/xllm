@@ -521,6 +521,46 @@ TEST_P(Qwen3_5GatedDeltaNetSpecVerifyTest, ReturnsFullDenseValidateSpan) {
       spec_kv_cache, input_params, q_max_seq_len);
 }
 
+TEST_F(Qwen3_5GatedDeltaNetTest, VirtualVerifyRequestsLeaveStateUnchanged) {
+  constexpr int64_t kWidth = 3;
+  auto layer = MakeLayer();
+  torch::Tensor hidden = MakeHidden(/*num_tokens=*/4 * kWidth);
+  auto compact_meta = MakeSpecVerifyMetadata(/*batch_size=*/2, kWidth);
+  auto padded_meta = MakeSpecVerifyMetadata(/*batch_size=*/4, kWidth);
+  auto compact_params = MakeSpecVerifyInputParams({1, kWidth});
+  auto padded_params = MakeSpecVerifyInputParams({1, kWidth, 1, 1});
+  padded_params.embedding.linear_state_ids = {1, 2, 0, 0};
+  auto compact_cache = MakeSpecVerifyKvCache(kWidth);
+  auto padded_cache = MakeSpecVerifyKvCache(kWidth);
+  padded_cache.get_conv_cache().select(0, 0).fill_(7);
+  padded_cache.get_ssm_cache().narrow(0, 0, kWidth).fill_(7);
+
+  torch::Tensor expected = layer->forward(hidden.narrow(0, 0, 2 * kWidth),
+                                          compact_meta,
+                                          compact_cache,
+                                          compact_params);
+  torch::Tensor actual =
+      layer->forward(hidden, padded_meta, padded_cache, padded_params);
+  Device xllm_device(device_);
+  xllm_device.synchronize_default_stream();
+
+  EXPECT_TRUE(torch::allclose(actual.narrow(0, 0, 2 * kWidth),
+                              expected,
+                              /*rtol=*/1e-3,
+                              /*atol=*/1e-3));
+  EXPECT_TRUE(torch::equal(
+      padded_cache.get_conv_cache().select(0, 0),
+      torch::full_like(padded_cache.get_conv_cache().select(0, 0), 7)));
+  EXPECT_TRUE(torch::equal(
+      padded_cache.get_ssm_cache().narrow(0, 0, kWidth),
+      torch::full_like(padded_cache.get_ssm_cache().narrow(0, 0, kWidth), 7)));
+  EXPECT_TRUE(torch::equal(padded_cache.get_conv_cache().narrow(0, 1, 2),
+                           compact_cache.get_conv_cache().narrow(0, 1, 2)));
+  EXPECT_TRUE(torch::equal(
+      padded_cache.get_ssm_cache().narrow(0, kWidth, 2 * kWidth),
+      compact_cache.get_ssm_cache().narrow(0, kWidth, 2 * kWidth)));
+}
+
 INSTANTIATE_TEST_SUITE_P(DenseValidateWidths,
                          Qwen3_5GatedDeltaNetSpecVerifyTest,
                          ::testing::Values(int64_t{2}, int64_t{3}, int64_t{4}),

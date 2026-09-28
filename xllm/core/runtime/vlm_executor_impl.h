@@ -42,6 +42,8 @@ class VlmExecutorImpl : public ExecutorImpl {
 
   ~VlmExecutorImpl() override = default;
 
+  void set_dp_process_group(ProcessGroup* group) override;
+
   ForwardInput prepare_inputs(Batch& batch) override;
 
   ModelOutput run(const torch::Tensor& tokens,

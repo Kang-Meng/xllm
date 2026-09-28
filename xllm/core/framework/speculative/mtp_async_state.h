@@ -44,12 +44,6 @@ bool supports_native_spec_verify_replay_update(TargetSpecVerifyMode mode,
 
 bool requires_uniform_spec_verify(std::string_view model_type);
 
-// Accepted-span replay is validated only for native GLM5 target/MTP pairs.
-bool supports_accepted_span_replay(std::string_view target_model_type,
-                                   bool is_python_target,
-                                   std::string_view draft_model_type,
-                                   bool is_python_draft);
-
 // Shared allocation/launch width for target verification block tables. The
 // extra entry covers the speculative token that can cross a block boundary.
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,

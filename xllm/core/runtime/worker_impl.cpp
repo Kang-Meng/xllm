@@ -385,10 +385,10 @@ LinearStateInputRows get_mlu_linear_state_rows(ModelInputParams& input_params) {
       << "invalid MLU linear-state input row counts: sequence_rows="
       << sequence_rows << ", active_rows=" << active_rows
       << ", slot_rows=" << slot_rows;
-  CHECK_EQ(slot_rows, active_rows)
-      << "invalid MLU linear-state input row counts: sequence_rows="
-      << sequence_rows << ", active_rows=" << active_rows
-      << ", slot_rows=" << slot_rows;
+  CHECK(slot_rows == active_rows ||
+        (input_params.is_spec_verify && slot_rows == sequence_rows))
+      << "invalid MLU linear-state slot layout: sequence_rows=" << sequence_rows
+      << ", active_rows=" << active_rows << ", slot_rows=" << slot_rows;
   return {cached_tokens, active_rows, /*empty_shard=*/false};
 }
 #endif
@@ -2187,10 +2187,6 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
       LOG(INFO) << "Overriding draft model_type from " << current_type << " to "
                 << mtp_model_type << " for speculative decoding";
       args.model_type(mtp_model_type);
-      const int32_t mtp_layers = args.num_nextn_predict_layers();
-      args.n_layers(mtp_layers);
-      args.layer_types(std::vector<std::string>(mtp_layers, "full_attention"));
-      args.full_attention_interval(1);
     }
   }
   if (options_.enable_speculative_decode() && !options_.is_draft_engine() &&
@@ -2239,6 +2235,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
               {"glm_moe_dsa", "glm_moe_dsa_mtp"},
               {"joyai_llm_flash", "joyai_llm_flash_mtp"},
               {"mimo", "mimo_mtp"},
+              {"qwen3_5", "qwen3_5_mtp"},
+              {"qwen3_5_moe", "qwen3_5_moe_mtp"},
+              {"qwen3_5_text", "qwen3_5_mtp"},
+              {"qwen3_5_moe_text", "qwen3_5_moe_mtp"},
           };
       const std::string& current_type = args.model_type();
       auto it = kModelTypeToMtpType.find(current_type);

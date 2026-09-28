@@ -27,6 +27,8 @@ limitations under the License.
 
 namespace xllm {
 
+class ProcessGroup;
+
 class Executor final {
  public:
   Executor(CausalLM* model,
@@ -35,6 +37,8 @@ class Executor final {
            const runtime::Options& options);
 
   virtual ~Executor() = default;
+
+  void set_dp_process_group(ProcessGroup* group);
 
   ForwardInput prepare_inputs(Batch& batch);
 

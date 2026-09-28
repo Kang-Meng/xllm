@@ -19,25 +19,21 @@ limitations under the License.
 
 namespace xllm::mtp_async {
 
-bool is_draft_context_update_compatible(TargetSpecVerifyMode target_mode,
-                                        DraftContextUpdate update,
-                                        std::string_view target_model_type,
-                                        bool is_python_target,
-                                        std::string_view draft_model_type,
-                                        bool is_python_draft,
-                                        bool uses_embedded_eagle3) {
-  switch (update) {
-    case DraftContextUpdate::TAIL_EXTEND:
-      return true;
-    case DraftContextUpdate::ACCEPTED_SPAN_REPLAY:
-      return !uses_embedded_eagle3 &&
-             supports_accepted_span_replay(target_model_type,
-                                           is_python_target,
-                                           draft_model_type,
-                                           is_python_draft) &&
-             target_mode == TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL;
+bool replay_compatible(TargetSpecVerifyMode target_mode,
+                       DraftContextUpdate update,
+                       bool target_capable,
+                       bool draft_capable,
+                       bool is_python_target,
+                       bool is_python_draft,
+                       bool uses_embedded_eagle3) {
+  if (update == DraftContextUpdate::TAIL_EXTEND) {
+    return true;
   }
-  return false;
+  return update == DraftContextUpdate::ACCEPTED_SPAN_REPLAY && target_capable &&
+         draft_capable && !is_python_target && !is_python_draft &&
+         !uses_embedded_eagle3 &&
+         (target_mode == TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL ||
+          target_mode == TargetSpecVerifyMode::EXPANDED_VERIFY);
 }
 
 DraftContextReplaySemantics draft_context_replay_semantics(

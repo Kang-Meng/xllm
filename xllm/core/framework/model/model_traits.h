@@ -37,6 +37,7 @@ class NpuWordEmbedding;
 }  // namespace layer
 
 namespace detail {
+
 template <typename T, typename = void>
 struct has_get_lm_head : std::false_type {};
 

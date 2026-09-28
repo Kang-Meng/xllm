@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -35,6 +36,7 @@ struct DraftReplayInputPlan final {
   std::vector<int32_t> selected_rows;
   std::vector<int32_t> source_sequences;
   std::vector<int32_t> valid_rows;
+  std::vector<std::array<int32_t, 3>> mrope_positions;
   std::vector<int32_t> kpool_query_lens;
 };
 
@@ -44,7 +46,8 @@ DraftReplayInputPlan build_draft_replay_input_plan(
     const torch::Tensor& embedding_placeholder,
     int32_t logical_block_size,
     int32_t uniform_width,
-    bool graph_warmup);
+    bool graph_warmup,
+    int32_t pad_cache_slot = 0);
 
 }  // namespace mtp_async
 }  // namespace xllm

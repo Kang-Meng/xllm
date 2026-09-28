@@ -397,6 +397,43 @@ TEST_F(Qwen3_5AttentionTest, DecodeWithGate) {
       << "Decode output must be finite";
 }
 
+TEST_F(Qwen3_5AttentionTest, VirtualDecodeRowSkipsKvWrite) {
+  auto layer = MakeLayer(/*attn_output_gate=*/true);
+  constexpr int64_t kSeqLen = 64;
+  auto hidden = MakeHidden(/*num_tokens=*/2);
+  auto positions = MakePositions(/*batch_size=*/2,
+                                 kSeqLen,
+                                 /*prefill=*/false);
+  auto padded_meta = MakeDecodeMetadata(/*batch_size=*/2, kSeqLen);
+  padded_meta.slot_mapping.select(0, 1).fill_(-1);
+  std::tie(padded_meta.mrope_cos, padded_meta.mrope_sin) =
+      ApplyMrope(positions);
+  auto compact_meta = MakeDecodeMetadata(/*batch_size=*/1, kSeqLen);
+  std::tie(compact_meta.mrope_cos, compact_meta.mrope_sin) =
+      ApplyMrope(positions.narrow(1, 0, 1));
+  KVCache padded_cache(KVCacheTensors{kv_cache_.get_k_cache().clone(),
+                                      kv_cache_.get_v_cache().clone()});
+  KVCache compact_cache(KVCacheTensors{kv_cache_.get_k_cache().clone(),
+                                       kv_cache_.get_v_cache().clone()});
+
+  torch::Tensor expected = layer->forward(positions.narrow(1, 0, 1),
+                                          hidden.narrow(0, 0, 1),
+                                          compact_meta,
+                                          compact_cache);
+  torch::Tensor actual =
+      layer->forward(positions, hidden, padded_meta, padded_cache);
+  Device(device_).synchronize_default_stream();
+
+  EXPECT_TRUE(torch::allclose(actual.narrow(0, 0, 1),
+                              expected,
+                              /*rtol=*/1e-3,
+                              /*atol=*/1e-3));
+  EXPECT_TRUE(
+      torch::equal(padded_cache.get_k_cache(), compact_cache.get_k_cache()));
+  EXPECT_TRUE(
+      torch::equal(padded_cache.get_v_cache(), compact_cache.get_v_cache()));
+}
+
 TEST_F(Qwen3_5AttentionTest, TextPositionsProduceValidMropeCaches) {
   (void)MakeLayer(/*attn_output_gate=*/true);
   auto text_positions = torch::arange(0, 4, options_.dtype(torch::kInt32));

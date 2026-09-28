@@ -174,6 +174,7 @@ if(USE_MLU)
       mlu_graph_executor_test
     SRCS
       mlu_graph_executor_test.cpp
+      mlu_graph_planner_test.cpp
       mlu_linear_state_restore_worker_test.cpp
     DEPS
       :runtime
@@ -184,6 +185,35 @@ if(USE_MLU)
       GTest::gtest_main
       torch_mlu
   )
+
+  # Forked ranks select separate logical MLUs before creating a real CNCL group.
+  cc_test(
+    NAME
+      mlu_graph_dp_collective_test
+    SRCS
+      mlu_graph_dp_collective_test.cpp
+    DEPS
+      :runtime
+      :parallel_state
+      :model_loader
+      :batch
+      :kv_cache
+      :platform
+      :util
+      GTest::gtest_main
+      torch_mlu
+      glog::glog
+  )
+  set_tests_properties(
+    MluGraphDpCollectiveTest.AllRanksCaptureThenReplay
+    MluGraphDpCollectiveTest.OneRankRejectsSoAllRunEager
+    MluGraphDpCollectiveTest.DifferentPlansMakeAllRunEager
+    MluGraphDpCollectiveTest.DifferentEmbeddingPresenceMakesAllRunEager
+    MluGraphDpCollectiveTest.PartialCacheHitRecapturesThenReplays
+    MluGraphDpCollectiveTest.VlmAllRanksCaptureThenReplay
+    MluGraphDpCollectiveTest.VlmOneRankRejectsSoAllRunEager
+    MluGraphDpCollectiveTest.VlmPartialCacheHitRecapturesThenReplays
+    PROPERTIES RUN_SERIAL TRUE TIMEOUT 150)
 endif()
 
 if(USE_NPU OR USE_MLU)

@@ -51,4 +51,19 @@ if(USE_MLU)
       models
       GTest::gtest_main
   )
+
+  cc_test(
+    NAME
+      qwen3_5_mlu_forward_test
+    SRCS
+      qwen3_5_mlu_forward_test.cpp
+    DEPS
+      models
+      :mlu_layers
+      :common_layers
+      :parallel_state
+      :model_context
+      GTest::gtest_main
+      torch_mlu
+  )
 endif()

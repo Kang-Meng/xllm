@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,6 +27,7 @@ limitations under the License.
 #include "models/llm/mlu/deepseek_mtp.h"
 #include "models/llm/mlu/glm5_next_graph.h"
 #include "models/model_registry.h"
+#include "util/env_var.h"
 
 namespace xllm::mlu::model {
 
@@ -84,13 +87,31 @@ class Glm5NextMtpForCausalLMImpl final
 };
 TORCH_MODULE(Glm5NextMtpForCausalLM);
 
+inline int64_t fixed_graph_capacity(const ModelArgs& args) {
+  int64_t capacity =
+      util::get_int_env("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", 32768);
+  CHECK_GT(capacity, 0) << "XLLM_GRAPH_INDEX_HISTORY_MAX_KV must be positive";
+  if (args.max_position_embeddings() > 0) {
+    capacity = std::min(capacity, args.max_position_embeddings());
+  }
+  return capacity;
+}
+
 const bool glm5_next_mtp_capabilities_registered = []() {
   MtpModelCapabilities capabilities;
   capabilities.supports_native_index_share_for_iteration = false;
   capabilities.supports_accepted_span_replay = true;
+  capabilities.replay_family = MtpReplayFamily::GLM5;
+  capabilities.supports_causal_replay_target = true;
+  capabilities.supports_grouped_mtp_graph = true;
+  capabilities.graph_history = MtpGraphHistoryPolicy::KPOOL_FIXED;
   capabilities.python_draft_owns_embedding_and_lm_head = true;
   ModelRegistry::register_mtp_capabilities("glm5_next", capabilities);
   ModelRegistry::register_mtp_capabilities("glm5_next_mtp", capabilities);
+  ModelRegistry::register_graph_history_capacity("glm5_next",
+                                                 &fixed_graph_capacity);
+  ModelRegistry::register_graph_history_capacity("glm5_next_mtp",
+                                                 &fixed_graph_capacity);
   return true;
 }();
 

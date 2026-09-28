@@ -130,6 +130,8 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
   CHECK(model_ != nullptr) << "Failed to create model.";
   model_executor_ = std::make_unique<Executor>(
       model_.get(), context.get_model_args(), device_, options_);
+  model_executor_->set_dp_process_group(
+      context.get_parallel_args().dp_local_process_group_);
 
   // MTP draft workers execute a separate one-layer model and must not consume
   // the target model's EPLB prepare/update commands. Only the target reports

@@ -27,14 +27,16 @@ DraftReplayInputPlan build_draft_replay_input_plan(
     const torch::Tensor& embedding_placeholder,
     int32_t logical_block_size,
     int32_t uniform_width,
-    bool graph_warmup) {
+    bool graph_warmup,
+    int32_t pad_cache_slot) {
   const auto row_ctx = specBuilder::make_decode_row_context(base_input);
   auto replay = specBuilder::build_mtp_replay_inputs(row_ctx,
                                                      states,
                                                      embedding_placeholder,
                                                      logical_block_size,
                                                      uniform_width,
-                                                     graph_warmup);
+                                                     graph_warmup,
+                                                     pad_cache_slot);
 
   DraftReplayInputPlan plan;
   plan.rows = std::move(replay.rows);
@@ -42,6 +44,7 @@ DraftReplayInputPlan build_draft_replay_input_plan(
   plan.selected_rows = std::move(replay.selected_rows);
   plan.source_sequences = std::move(replay.source_sequences);
   plan.valid_rows = std::move(replay.valid_rows);
+  plan.mrope_positions = std::move(replay.mrope_positions);
   plan.kpool_query_lens.assign(row_ctx.num_sequences, uniform_width);
   return plan;
 }

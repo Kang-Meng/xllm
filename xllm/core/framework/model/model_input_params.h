@@ -1033,6 +1033,7 @@ struct ModelInputParams {
     embedding.linear_state_read_ids.clear();
     embedding.linear_state_read_indices = torch::Tensor();
     linear_state_validity_mask.clear();
+    linear_state_validity_mask_tensor = torch::Tensor();
   }
 
   ModelInputParams to(const torch::Device& device) const {
@@ -1050,6 +1051,8 @@ struct ModelInputParams {
       params.dit_forward_input.emplace(dit_forward_input->to(device));
     }
     params.linear_state_validity_mask = linear_state_validity_mask;
+    params.linear_state_validity_mask_tensor =
+        safe_to(linear_state_validity_mask_tensor, device, true);
     params.is_spec_verify = is_spec_verify;
     params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
     params.num_accepted_tokens_host = num_accepted_tokens_host;
@@ -1220,6 +1223,10 @@ struct ModelInputParams {
   // Worker-produced per-row result declaring whether the recurrent state is
   // valid for model-forward consumption after restore processing.
   LinearStateValidityMask linear_state_validity_mask;
+  // Graph executors supply a persistent device copy to avoid materializing the
+  // host mask while the accelerator queue is under graph capture.
+  torch::Tensor linear_state_validity_mask_tensor;
+
   bool is_spec_verify = false;
   // Propagated to AttentionMetadata for caller-managed cacheless prefill.
   bool prefill_without_cache = false;

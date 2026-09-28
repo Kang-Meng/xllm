@@ -16,7 +16,6 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
-#include <string_view>
 
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/speculative/mtp_async_state.h"
@@ -32,16 +31,17 @@ struct DraftContextReplaySemantics final {
   int32_t draft_position_offset;
 };
 
-bool is_draft_context_update_compatible(TargetSpecVerifyMode target_mode,
-                                        DraftContextUpdate update,
-                                        std::string_view target_model_type,
-                                        bool is_python_target,
-                                        std::string_view draft_model_type,
-                                        bool is_python_draft,
-                                        bool uses_embedded_eagle3);
-
 DraftContextReplaySemantics draft_context_replay_semantics(
     DraftContextUpdate update,
     int32_t num_speculative_tokens);
+
+// Match a model-declared native replay contract to its active verify mode.
+bool replay_compatible(TargetSpecVerifyMode target_mode,
+                       DraftContextUpdate update,
+                       bool target_capable,
+                       bool draft_capable,
+                       bool is_python_target,
+                       bool is_python_draft,
+                       bool uses_embedded_eagle3);
 
 }  // namespace xllm::mtp_async

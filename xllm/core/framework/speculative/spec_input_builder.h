@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -64,6 +65,7 @@ struct DecodeRowContext {
   std::vector<torch::Tensor> multi_block_tables_owner;
   Slice<int32_t> token_ids;
   Slice<int32_t> positions;
+  int32_t position_axes = 1;
   Slice<int32_t> kv_seq_lens;
   Slice<int32_t> block_tables;
   std::vector<std::vector<Slice<int32_t>>> multi_block_tables;
@@ -97,19 +99,21 @@ struct MtpReplayInputs {
   std::vector<int32_t> selected_rows;
   std::vector<int32_t> source_sequences;
   std::vector<int32_t> valid_rows;
+  std::vector<std::array<int32_t, 3>> mrope_positions;
 };
 
 // Replays the emitted target prefix at the positions of the target hidden
 // states, one position before the corresponding emitted tokens. A one-token
 // prefill/bootstrap span therefore overwrites the prefill tail slot. DP may
-// request a uniform width; leading padding writes only to reserved slot 0.
+// request a uniform width; the caller chooses the backend padding slot.
 MtpReplayInputs build_mtp_replay_inputs(
     const DecodeRowContext& ctx,
     const std::vector<EmbeddingCache::DecodeState>& states,
     const torch::Tensor& placeholder,
     int32_t block_size,
     int32_t uniform_width = 0,
-    bool is_graph_warmup = false);
+    bool is_graph_warmup = false,
+    int32_t pad_cache_slot = 0);
 
 // Resolved token and relative position offset for placeholder token handling.
 struct TokenWithOffset {

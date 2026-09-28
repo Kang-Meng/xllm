@@ -56,12 +56,31 @@ using ModelArgsLoader =
     std::function<bool(const JsonReader& json, ModelArgs* args)>;
 
 using MtpArgsAdapter = std::function<void(ModelArgs&, bool)>;
+using GraphHistoryCapacityAdapter = std::function<int64_t(const ModelArgs&)>;
+
+enum class MtpReplayFamily : int8_t {
+  NONE,
+  GLM5,
+  QWEN35,
+};
+
+enum class MtpGraphHistoryPolicy : int8_t {
+  MAX_CONTEXT,
+  QWEN_FULL_ATTENTION,
+  KPOOL_FIXED,
+};
 
 struct MtpModelCapabilities {
   // A platform-native implementation must explicitly opt out until its cache
   // updates and graph execution support cross-step index sharing.
   bool supports_native_index_share_for_iteration = true;
   bool supports_accepted_span_replay = false;
+  bool allow_tail_fallback = false;
+  MtpReplayFamily replay_family = MtpReplayFamily::NONE;
+  bool supports_causal_replay_target = false;
+  bool supports_expanded_replay_target = false;
+  bool supports_grouped_mtp_graph = false;
+  MtpGraphHistoryPolicy graph_history = MtpGraphHistoryPolicy::MAX_CONTEXT;
   bool native_draft_owns_embedding_and_lm_head = false;
   bool python_draft_owns_embedding_and_lm_head = false;
 };
@@ -88,6 +107,7 @@ struct ModelMeta {
   MultimodalProcessorFactory multimodal_processor_factory;
   ModelArgsLoader model_args_loader;
   MtpArgsAdapter mtp_args_adapter;
+  GraphHistoryCapacityAdapter graph_history_capacity_adapter;
   MtpModelCapabilities mtp_capabilities;
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
@@ -125,6 +145,12 @@ class ModelRegistry {
                                         MtpModelCapabilities capabilities);
 
   static MtpModelCapabilities get_mtp_capabilities(const std::string& name);
+  static void register_graph_history_capacity(
+      const std::string& name,
+      GraphHistoryCapacityAdapter adapter);
+  static int64_t get_graph_history_capacity(const std::string& name,
+                                            const ModelArgs& args,
+                                            int64_t default_capacity);
 
   static void configure_mtp_args(ModelArgs& args,
                                  std::string_view algorithm,

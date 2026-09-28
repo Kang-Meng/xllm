@@ -49,7 +49,8 @@ void EmbeddingCache::write_prefill_target_context(
     const std::vector<std::string>& request_ids,
     const torch::Tensor& next_tokens,
     const torch::Tensor& embeddings,
-    const torch::Tensor& selected_token_idxes) {
+    const torch::Tensor& selected_token_idxes,
+    const torch::Tensor& target_positions) {
   CHECK(next_tokens.defined()) << "prefill target tokens are undefined";
   CHECK(embeddings.defined()) << "prefill target embeddings are undefined";
   CHECK_EQ(next_tokens.dim(), 1) << "prefill target tokens should be [batch]";
@@ -73,6 +74,21 @@ void EmbeddingCache::write_prefill_target_context(
   }
   CHECK_EQ(target_embeddings.size(0), static_cast<int64_t>(ids.size()))
       << "prefill target embedding count mismatch";
+  torch::Tensor selected_positions;
+  if (target_positions.defined() && target_positions.dim() == 2) {
+    CHECK_EQ(target_positions.size(0), 3);
+    selected_positions = target_positions;
+    if (selected_positions.size(1) != static_cast<int64_t>(ids.size())) {
+      CHECK(selected_token_idxes.defined());
+      torch::Tensor position_idxes = selected_token_idxes.to(
+          torch::dtype(torch::kLong).device(selected_positions.device()));
+      selected_positions =
+          selected_positions.index_select(/*dim=*/1, position_idxes);
+    }
+    CHECK_EQ(selected_positions.size(1), static_cast<int64_t>(ids.size()));
+    selected_positions = selected_positions.to(
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+  }
 
   torch::Tensor next_tokens_cpu = to_cpu_int64_contiguous(next_tokens);
   const int64_t* next_tokens_data = next_tokens_cpu.const_data_ptr<int64_t>();
@@ -96,6 +112,10 @@ void EmbeddingCache::write_prefill_target_context(
     if (retain_replay_span_) {
       state.replay_token_ids = {state.token_id};
       state.replay_embeddings = state.embedding.unsqueeze(0);
+      if (selected_positions.defined()) {
+        state.replay_mrope_positions =
+            selected_positions.select(1, i).unsqueeze(1).contiguous().clone();
+      }
     }
 
     DecodeState& tail = mutable_tail(ids[i]);
@@ -107,7 +127,8 @@ void EmbeddingCache::write_mtp_bootstrap_context(
     int32_t embedding_id,
     const std::string& request_id,
     int32_t token_id,
-    const torch::Tensor& embedding) {
+    const torch::Tensor& embedding,
+    const torch::Tensor& target_position) {
   CHECK(embedding.defined()) << "MTP bootstrap embedding is undefined";
   CHECK_GE(token_id, 0) << "MTP bootstrap token should be valid";
 
@@ -126,6 +147,16 @@ void EmbeddingCache::write_mtp_bootstrap_context(
   if (retain_replay_span_) {
     state.replay_token_ids = {state.token_id};
     state.replay_embeddings = state.embedding.unsqueeze(0);
+    if (target_position.defined() && target_position.dim() == 1 &&
+        target_position.numel() == 3) {
+      state.replay_mrope_positions = target_position
+                                         .to(torch::TensorOptions()
+                                                 .dtype(torch::kInt32)
+                                                 .device(torch::kCPU))
+                                         .reshape({3, 1})
+                                         .contiguous()
+                                         .clone();
+    }
   }
 
   tail = std::move(state);

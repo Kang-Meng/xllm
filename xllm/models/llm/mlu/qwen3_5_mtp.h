@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <tuple>
 #include <vector>
@@ -86,5 +88,27 @@ REGISTER_MODEL_ARGS_LOADER(qwen3_5_moe_mtp,
                                  "qwen3_5_moe_text",
                                  "qwen3_5_moe_mtp");
                            });
+
+const bool qwen3_5_mtp_contract_registered = []() {
+  MtpModelCapabilities target;
+  target.replay_family = MtpReplayFamily::QWEN35;
+  target.supports_expanded_replay_target = true;
+  target.supports_grouped_mtp_graph = true;
+  target.graph_history = MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION;
+  MtpModelCapabilities draft;
+  draft.replay_family = MtpReplayFamily::QWEN35;
+  draft.supports_accepted_span_replay = true;
+  draft.allow_tail_fallback = true;
+  draft.supports_grouped_mtp_graph = true;
+  draft.graph_history = MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION;
+  for (const char* name :
+       {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}) {
+    ModelRegistry::register_mtp_capabilities(name, target);
+  }
+  for (const char* name : {"qwen3_5_mtp", "qwen3_5_moe_mtp"}) {
+    ModelRegistry::register_mtp_capabilities(name, draft);
+  }
+  return true;
+}();
 
 }  // namespace xllm

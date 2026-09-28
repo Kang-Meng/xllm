@@ -71,6 +71,12 @@ constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
 
+void clear_draft_state(ModelInputParams& params) {
+  params.clear_linear_attention_state();
+  params.num_accepted_tokens = torch::Tensor();
+  params.num_accepted_tokens_host.clear();
+}
+
 bool has_active_dp_tokens(const ForwardInput& input) {
   const ParallelInput& parallel = input.input_params.parallel;
   const std::vector<int32_t>& token_nums =
@@ -481,6 +487,7 @@ runtime::Options mtp_target_options(const runtime::Options& options) {
 runtime::Options mtp_draft_options(const runtime::Options& options) {
   runtime::Options draft_options = options;
   draft_options.enable_schedule_overlap(false)
+      .backend("llm")
       .is_draft_engine(true)
       .num_decoding_tokens(1)
       .num_speculative_tokens(0)
@@ -1212,22 +1219,40 @@ void MTPWorkerImpl::init_draft_context_policy() {
       << error_message;
   const MtpModelCapabilities capabilities =
       ModelRegistry::get_mtp_capabilities(resolved_draft_model_name);
-  const DraftContextUpdate update =
-      capabilities.supports_accepted_span_replay
-          ? DraftContextUpdate::ACCEPTED_SPAN_REPLAY
-          : DraftContextUpdate::TAIL_EXTEND;
   const bool is_python_target =
       ModelConfig::is_python_model_impl(context_.get_model_impl());
   const bool is_python_draft =
       ModelConfig::is_python_model_impl(draft_impl_->context_.get_model_impl());
-  CHECK(mtp_async::is_draft_context_update_compatible(
-      target_spec_verify_mode_,
-      update,
-      context_.get_model_args().model_type(),
-      is_python_target,
-      draft_impl_->context_.get_model_args().model_type(),
-      is_python_draft,
-      uses_embedded_eagle3_draft()))
+  const bool legacy_tail =
+      capabilities.allow_tail_fallback &&
+      (is_python_target || is_python_draft || uses_embedded_eagle3_draft());
+  const DraftContextUpdate update =
+      capabilities.supports_accepted_span_replay && !legacy_tail
+          ? DraftContextUpdate::ACCEPTED_SPAN_REPLAY
+          : DraftContextUpdate::TAIL_EXTEND;
+  std::string resolved_target_model_name;
+  CHECK(resolve_model_registration_name(context_.get_model_args().model_type(),
+                                        &resolved_target_model_name,
+                                        &error_message))
+      << error_message;
+  const MtpModelCapabilities target_capabilities =
+      ModelRegistry::get_mtp_capabilities(resolved_target_model_name);
+  const bool target_capable =
+      target_spec_verify_mode_ ==
+              mtp_async::TargetSpecVerifyMode::CAUSAL_CHUNKED_PREFILL
+          ? target_capabilities.supports_causal_replay_target
+          : target_capabilities.supports_expanded_replay_target;
+  const bool replay_pair =
+      target_capable &&
+      target_capabilities.replay_family != MtpReplayFamily::NONE &&
+      target_capabilities.replay_family == capabilities.replay_family;
+  CHECK(mtp_async::replay_compatible(target_spec_verify_mode_,
+                                     update,
+                                     replay_pair,
+                                     capabilities.supports_accepted_span_replay,
+                                     is_python_target,
+                                     is_python_draft,
+                                     uses_embedded_eagle3_draft()))
       << "Incompatible draft context update: target="
       << context_.get_model_args().model_type()
       << ", verify_mode=" << static_cast<int32_t>(target_spec_verify_mode_)
@@ -1472,7 +1497,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
         input.input_params.embedding.request_ids,
         output.sample_output.next_tokens,
         target_hidden,
-        input.sampling_params.selected_token_idxes);
+        input.sampling_params.selected_token_idxes,
+        input.positions);
     clear_selected_embeddings(output);
   } else {
     clear_all_output_embeddings(output);
@@ -1664,7 +1690,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
           embedding.embedding_ids[row_idx],
           embedding.request_ids[row_idx],
           token_ids[row_idx],
-          bootstrap_embeddings[i]);
+          bootstrap_embeddings[i],
+          input.positions.dim() == 2 ? input.positions.select(1, row_idx)
+                                     : torch::Tensor());
     }
   }
 
@@ -3818,8 +3846,12 @@ void MTPWorkerImpl::prepare_draft_replay_inputs(
           embedding_cache_->embedding_placeholder(),
           options_.block_size() * parallel_args_.kv_split_size_effective(),
           uniform_width,
-          extend_input.input_params.meta.is_graph_warmup);
+          extend_input.input_params.meta.is_graph_warmup,
+          Platform::is_mlu() ? -1 : 0);
   auto& input_params = extend_input.input_params;
+  if (!draft_impl_->has_request_state_cache()) {
+    clear_draft_state(input_params);
+  }
   const int32_t num_sequences = input_params.meta.num_sequences;
   auto& rows = plan.rows;
   const int32_t num_rows = static_cast<int32_t>(rows.out_positions.size());
@@ -3828,6 +3860,19 @@ void MTPWorkerImpl::prepare_draft_replay_inputs(
                                           rows.out_positions,
                                           base_input.token_ids.options(),
                                           base_input.positions.options());
+  if (!plan.mrope_positions.empty()) {
+    CHECK_EQ(plan.mrope_positions.size(), static_cast<size_t>(num_rows));
+    std::vector<int32_t> rotary(3 * num_rows);
+    for (int32_t axis = 0; axis < 3; ++axis) {
+      for (int32_t row = 0; row < num_rows; ++row) {
+        rotary[axis * num_rows + row] = plan.mrope_positions[row][axis];
+      }
+    }
+    torch::Tensor rotary_host =
+        specBuilder::make_cpu_int_tensor(rotary).reshape({3, num_rows});
+    extend_input.positions =
+        safe_to(rotary_host, base_input.positions.options(), true);
+  }
   input_params.meta.num_sequences = num_rows;
   input_params.meta.batch_forward_type = BatchForwardType::DECODE;
   input_params.is_spec_verify = false;
@@ -4202,6 +4247,9 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
 
   auto& input_params = draft_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
+  if (!draft_impl_->has_request_state_cache()) {
+    clear_draft_state(input_params);
+  }
   const int32_t num_sequences = input_params.meta.num_sequences;
   if (draft_impl_->has_request_state_cache()) {
     input_params.attention.host.kpool_query_lens.assign(num_sequences, 1);

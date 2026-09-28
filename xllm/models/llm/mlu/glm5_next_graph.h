@@ -58,15 +58,30 @@ class Glm5NextGraphMetadata final {
     metadata.kv_seq_lens.copy_(torch::diff(attention.kv_seq_lens));
     metadata.q_seq_lens.copy_(torch::diff(attention.q_seq_lens));
     if (metadata.has_initial_states.defined()) {
-      metadata.has_initial_states.copy_(
-          torch::tensor(params.linear_state_validity_mask,
-                        metadata.has_initial_states.options()));
+      // The executor refreshes the graph-owned device mask, preferring an
+      // explicit device input over the host source just like the builder.
+      if (params.linear_state_validity_mask_tensor.defined()) {
+        if (metadata.has_initial_states.data_ptr() !=
+            params.linear_state_validity_mask_tensor.data_ptr()) {
+          metadata.has_initial_states.copy_(
+              params.linear_state_validity_mask_tensor);
+        }
+      } else {
+        metadata.has_initial_states.copy_(
+            torch::tensor(params.linear_state_validity_mask,
+                          metadata.has_initial_states.options()));
+      }
     }
-    // Decode block tables and state indices alias graph-owned persistent
-    // storage. The executor refreshes their contents on every replay, including
-    // same-shape page remaps; never replace the captured tensor addresses.
-    CHECK_EQ(metadata.kpool_batch_metadata->block_table.data_ptr(),
-             attention.block_tables.data_ptr());
+    auto& batch = *metadata.kpool_batch_metadata;
+    // Ordinary decode aliases graph-owned storage, refreshed by the executor.
+    // Expanded attention rows materialize a request-level table instead. Copy
+    // its current page IDs on every replay without replacing captured storage.
+    if (batch.block_table.data_ptr() != attention.block_tables.data_ptr()) {
+      batch.block_table.copy_(attention.block_tables.index_select(
+          /*dim=*/0,
+          batch.query_starts.narrow(
+              /*dim=*/0, /*start=*/0, batch.q_seq_lens.size())));
+    }
   }
 };
 

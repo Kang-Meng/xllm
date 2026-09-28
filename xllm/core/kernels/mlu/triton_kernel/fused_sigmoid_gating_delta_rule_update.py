@@ -76,12 +76,6 @@ def tmo_fused_sigmoid_gating_delta_rule_update_kernel(
     pid = tl.program_id(0)
     num_jobs = tl.num_programs(0)
 
-    if not IS_KDA:
-        rangeV = tl.arange(0, HV)
-        # xLLM may pass bf16 A_log, while MLU tl.exp requires fp32 input.
-        A_logs = tl.load(A_log + rangeV).to(tl.float32)
-        dt_bias_vals = tl.load(dt_bias + rangeV)  # [HV,]
-
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     NUM_HV_BLOCKS: tl.constexpr = triton.cdiv(HV, BLOCK_HV)
     if SPLIT_HV:
@@ -183,9 +177,15 @@ def tmo_fused_sigmoid_gating_delta_rule_update_kernel(
             )  # [BL*BN, HV]
             b_beta = tl.sigmoid(b_vals)  # [BL*BN, HV]
         if not IS_KDA:
-            a_vals = tl.load(a + (start_T + o_T)[:, None] * HV + tl.arange(0, HV)[None, :], mask=mask_ab).to(
-                tl.float32
-            )  # [BL*BN, HV]
+            if SPLIT_HV:
+                gate_offsets = b_offsets
+            else:
+                gate_offsets = tl.arange(0, HV)
+            # Load decay parameters with the same head tile as b.  This is
+            # required when GDN work is split across independent head tiles.
+            A_logs = tl.load(A_log + gate_offsets).to(tl.float32)
+            dt_bias_vals = tl.load(dt_bias + gate_offsets).to(tl.float32)
+            a_vals = tl.load(a + (start_T + o_T)[:, None] * HV + gate_offsets[None, :], mask=mask_ab).to(tl.float32)
             xs = a_vals + dt_bias_vals[None, :]  # [BL*BN, HV]
             softplus_xs = tl.where(
                 beta * xs <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * xs)), xs
@@ -304,7 +304,7 @@ def tmo_fused_sigmoid_gating_delta_rule_update_kernel(
 
                             # [BV, BK]
                             if not IS_KDA:
-                                b_h *= b_gs[i_t, gi_hv]
+                                b_h *= b_gs[i_t, local_i_hv if SPLIT_HV else gi_hv]
                             else:
                                 b_h *= (b_gs[i_t, local_i_hv, :])[None, :]
                             # [BV]

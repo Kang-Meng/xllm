@@ -40,6 +40,7 @@ limitations under the License.
 #include "core/runtime/options.h"
 #include "core/runtime/speculative_worker_impl.h"
 #include "core/util/slice.h"
+#include "models/model_registry.h"
 
 namespace xllm {
 namespace {
@@ -453,6 +454,12 @@ class ContextLoadingWorker final : public HierarchyTransferTestWorker {
     mark_loaded();
   }
 
+  void add_request_state_cache() {
+    const torch::Tensor state =
+        torch::zeros({1}, context_.get_tensor_options());
+    kv_caches_.emplace_back(LinearAttentionKVCacheTensors{state, state});
+  }
+
  private:
   DraftContextUpdate update_;
   std::string draft_model_type_;
@@ -474,6 +481,17 @@ class ContextPolicyMTPWorker final : public MTPWorkerImpl {
 
   std::shared_ptr<EmbeddingCache> embedding_cache() const {
     return embedding_cache_;
+  }
+
+  void add_draft_request_state_cache() {
+    static_cast<ContextLoadingWorker*>(draft_impl_.get())
+        ->add_request_state_cache();
+  }
+
+  ForwardInput prepare_next_draft(const ForwardInput& input) {
+    ForwardInput draft_input;
+    prepare_draft_inputs(input, draft_input, /*position_offset=*/0);
+    return draft_input;
   }
 };
 
@@ -536,7 +554,7 @@ class MTPContextPolicyTest : public MTPHostOffloadTest {
     std::string resolved_draft_type = draft_type;
     if (update == DraftContextUpdate::TAIL_EXTEND &&
         resolved_draft_type == "glm5_next_mtp") {
-      resolved_draft_type = "qwen3_5_mtp";
+      resolved_draft_type = "mimo_mtp";
     }
     auto draft = std::make_unique<ContextLoadingWorker>(parallel_args,
                                                         device,
@@ -552,6 +570,41 @@ class MTPContextPolicyTest : public MTPHostOffloadTest {
   KVCacheShape cache_shape() const {
     return make_cache_shape(
         make_model_args("qwen3", /*layer_count=*/1, /*head_dim=*/2));
+  }
+
+  ForwardInput make_decode_input() const {
+    const torch::Device device(Platform::type_torch(), /*index=*/0);
+    ForwardInput input;
+    input.token_ids_host = torch::tensor({7}, torch::kInt);
+    input.token_ids = input.token_ids_host.to(device);
+    input.positions_host = torch::tensor({2}, torch::kInt);
+    input.positions = input.positions_host.to(device);
+    ModelInputParams& params = input.input_params;
+    params.meta.batch_forward_type = BatchForwardType::DECODE;
+    params.meta.num_sequences = 1;
+    params.meta.q_max_seq_len = 1;
+    params.meta.kv_max_seq_len = 3;
+#if defined(USE_NPU)
+    params.attention.host.q_seq_lens = {1};
+    params.attention.host.kv_seq_lens = {3};
+#else
+    params.attention.host.q_seq_lens = {0, 1};
+    params.attention.host.kv_seq_lens = {0, 3};
+#endif
+    params.attention.host.q_cu_seq_lens = {0, 1};
+    params.attention.host.block_tables = torch::tensor({{0}}, torch::kInt);
+    params.embedding.linear_state_ids = {5};
+    params.embedding.linear_state_indices =
+        torch::tensor({5}, torch::kInt).to(device);
+    params.embedding.linear_state_read_ids = {6};
+    params.embedding.linear_state_read_indices =
+        torch::tensor({6}, torch::kInt).to(device);
+    params.linear_state_validity_mask = {1};
+    params.linear_state_validity_mask_tensor =
+        torch::tensor({1}, torch::kInt).to(device);
+    params.num_accepted_tokens = torch::tensor({2}, torch::kInt).to(device);
+    params.num_accepted_tokens_host = {2};
+    return input;
   }
 
   std::filesystem::path model_path_;
@@ -571,6 +624,91 @@ TEST_F(MTPContextPolicyTest, HybridTargetKeepsTailDraftContextCompact) {
   EXPECT_TRUE(states.front().replay_token_ids.empty());
   EXPECT_FALSE(states.front().replay_embeddings.defined());
   EXPECT_TRUE(torch::equal(states.front().embedding, hidden));
+}
+
+TEST_F(MTPContextPolicyTest, FullAttentionDraftDropsTargetState) {
+  auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND);
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  const ForwardInput input = make_decode_input();
+
+  const ForwardInput draft = worker->prepare_next_draft(input);
+  const ModelInputParams& params = draft.input_params;
+  EXPECT_TRUE(params.embedding.linear_state_ids.empty());
+  EXPECT_FALSE(params.embedding.linear_state_indices.defined());
+  EXPECT_TRUE(params.embedding.linear_state_read_ids.empty());
+  EXPECT_FALSE(params.embedding.linear_state_read_indices.defined());
+  EXPECT_TRUE(params.linear_state_validity_mask.empty());
+  EXPECT_FALSE(params.linear_state_validity_mask_tensor.defined());
+  EXPECT_FALSE(params.num_accepted_tokens.defined());
+  EXPECT_TRUE(params.num_accepted_tokens_host.empty());
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids,
+            (std::vector<int32_t>{5}));
+}
+
+TEST_F(MTPContextPolicyTest, StatefulDraftRetainsRequestState) {
+  auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND);
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  worker->add_draft_request_state_cache();
+  const ForwardInput input = make_decode_input();
+
+  const ForwardInput draft = worker->prepare_next_draft(input);
+  const ModelInputParams& params = draft.input_params;
+  EXPECT_EQ(params.embedding.linear_state_ids, (std::vector<int32_t>{5}));
+  EXPECT_EQ(params.embedding.linear_state_read_ids, (std::vector<int32_t>{5}));
+  EXPECT_TRUE(torch::equal(params.embedding.linear_state_indices,
+                           input.input_params.embedding.linear_state_indices));
+  EXPECT_TRUE(torch::equal(params.embedding.linear_state_read_indices,
+                           input.input_params.embedding.linear_state_indices));
+  EXPECT_EQ(params.linear_state_validity_mask, (std::vector<int64_t>{1}));
+  EXPECT_TRUE(
+      torch::equal(params.linear_state_validity_mask_tensor,
+                   input.input_params.linear_state_validity_mask_tensor));
+  EXPECT_TRUE(torch::equal(params.num_accepted_tokens,
+                           input.input_params.num_accepted_tokens));
+  EXPECT_EQ(params.num_accepted_tokens_host, (std::vector<int64_t>{2}));
+  EXPECT_EQ(params.attention.host.kpool_query_lens, (std::vector<int32_t>{1}));
+}
+
+TEST_F(MTPContextPolicyTest, QwenNativePairRetainsAcceptedSpan) {
+  auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                            /*target_type=*/"qwen3_5",
+                            /*target_impl=*/"native",
+                            /*embedded_eagle3=*/false,
+                            /*target_ready=*/false,
+                            /*draft_type=*/"qwen3_5_mtp");
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  ASSERT_TRUE(worker->allocate_kv_cache(cache_shape()));
+  auto cache = worker->embedding_cache();
+  cache->write_target_context({0},
+                              {"request"},
+                              torch::tensor({{7, 8}}, torch::kInt),
+                              torch::tensor({{{1.0f, 2.0f}, {3.0f, 4.0f}}}),
+                              /*num_speculative_tokens=*/1);
+  const auto states = cache->read_decode_states({0}, {"request"});
+  EXPECT_EQ(states.front().replay_token_ids, (std::vector<int32_t>{7, 8}));
+}
+
+TEST_F(MTPContextPolicyTest, QwenPythonTargetKeepsTailContext) {
+  auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND,
+                            /*target_type=*/"qwen3_5",
+                            /*target_impl=*/"python",
+                            /*embedded_eagle3=*/false,
+                            /*target_ready=*/false,
+                            /*draft_type=*/"qwen3_5_mtp");
+  ASSERT_TRUE(worker->init_model(
+      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  ASSERT_TRUE(worker->allocate_kv_cache(cache_shape()));
+  auto cache = worker->embedding_cache();
+  cache->write_mtp_bootstrap_context(
+      /*embedding_id=*/0,
+      "request",
+      /*token_id=*/7,
+      torch::tensor({1.0f, 2.0f}));
+  const auto states = cache->read_decode_states({0}, {"request"});
+  EXPECT_TRUE(states.front().replay_token_ids.empty());
 }
 
 TEST_F(MTPContextPolicyTest, RejectsCacheAllocationBeforeDraftInitialization) {
@@ -622,6 +760,44 @@ TEST_F(MTPContextPolicyTest, RejectsReplayForGenericTarget) {
             model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
       },
       "Incompatible draft context update.*target=qwen3");
+}
+
+TEST_F(MTPContextPolicyTest, RejectsMixedNativeReplayFamilies) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                  /*target_type=*/"glm5_next",
+                                  /*target_impl=*/"native",
+                                  /*embedded_eagle3=*/false,
+                                  /*target_ready=*/false,
+                                  /*draft_type=*/"qwen3_5_mtp");
+        worker->init_model(
+            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
+      },
+      "Incompatible draft context update");
+}
+
+TEST_F(MTPContextPolicyTest, RejectsReplayWithoutTargetFamily) {
+  ASSERT_TRUE(ModelRegistry::get_mtp_capabilities("qwen3_5")
+                  .supports_expanded_replay_target);
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        MtpModelCapabilities target =
+            ModelRegistry::get_mtp_capabilities("qwen3_5");
+        target.replay_family = MtpReplayFamily::NONE;
+        ModelRegistry::register_mtp_capabilities("qwen3_5", target);
+        auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
+                                  /*target_type=*/"qwen3_5",
+                                  /*target_impl=*/"native",
+                                  /*embedded_eagle3=*/false,
+                                  /*target_ready=*/false,
+                                  /*draft_type=*/"qwen3_5_mtp");
+        worker->init_model(
+            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
+      },
+      "Incompatible draft context update");
 }
 
 TEST_F(MTPContextPolicyTest, RejectsReplayForOtherChunkedPrefillTargets) {

@@ -58,6 +58,9 @@ class EmbeddingCache final {
     // only when the draft requires replay of every verified KV position.
     std::vector<int32_t> replay_token_ids;
     torch::Tensor replay_embeddings;
+    // Prefill may end at three distinct rotary coordinates. Keep the target
+    // hidden's coordinates for the first draft replay after a VLM prompt.
+    torch::Tensor replay_mrope_positions;
 
     int32_t correction_token_id = 0;  // accepted token for step correction
     int32_t correction_position_offset = 0;
@@ -77,13 +80,16 @@ class EmbeddingCache final {
       const std::vector<std::string>& request_ids,
       const torch::Tensor& next_tokens,
       const torch::Tensor& embeddings,
-      const torch::Tensor& selected_token_idxes = torch::Tensor());
+      const torch::Tensor& selected_token_idxes = torch::Tensor(),
+      const torch::Tensor& target_positions = torch::Tensor());
 
   // Writes PD handoff bootstrap target context for the first MTP decode step.
-  void write_mtp_bootstrap_context(int32_t embedding_id,
-                                   const std::string& request_id,
-                                   int32_t token_id,
-                                   const torch::Tensor& embedding);
+  void write_mtp_bootstrap_context(
+      int32_t embedding_id,
+      const std::string& request_id,
+      int32_t token_id,
+      const torch::Tensor& embedding,
+      const torch::Tensor& target_position = torch::Tensor());
 
   // Writes target validate output after rejection sampling. accepted_tokens is
   // a contiguous accepted prefix padded by -1; accepted_embeddings keeps the

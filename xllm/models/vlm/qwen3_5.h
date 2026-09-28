@@ -15,6 +15,12 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+#include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/lm_head.h"
@@ -41,6 +47,28 @@ limitations under the License.
 
 namespace xllm {
 #if !defined(USE_NPU)
+
+namespace detail {
+
+inline const ModelInputParams& select_qwen_dp_params(
+    const ModelInputParams& input_params,
+    int32_t dp_size,
+    std::optional<ModelInputParams>& storage) {
+  const std::vector<int32_t>& dp_token_nums =
+      input_params.parallel.dp_global_token_nums;
+  if (dp_size <= 1 || std::none_of(dp_token_nums.begin(),
+                                   dp_token_nums.end(),
+                                   [](int32_t count) { return count == 0; })) {
+    return input_params;
+  }
+
+  storage.emplace(input_params);
+  std::vector<int32_t>& patched_counts = storage->parallel.dp_global_token_nums;
+  std::replace(patched_counts.begin(), patched_counts.end(), 0, 1);
+  return *storage;
+}
+
+}  // namespace detail
 
 class Qwen3_5ModelImpl final
     : public LlmModelImplBase<layer::Qwen3_5DecoderLayer> {
@@ -94,24 +122,20 @@ class Qwen3_5ModelImpl final
     return layer::rotary::apply_mrope(cos_sin_, positions, mrope_section_);
   }
 
-  virtual ModelOutput forward(torch::Tensor tokens,
-                              torch::Tensor positions,
-                              std::vector<KVCache>& kv_caches,
-                              const ModelInputParams& input_params) {
-    ModelInputParams& input_params_new =
-        const_cast<ModelInputParams&>(input_params);
-    std::vector<torch::Tensor> deep_stacks;
-
-    if (dp_size_ > 1) {
-      if (tokens.numel() == 0) {
-        tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
-        positions = torch::tensor({1}).to(torch::kInt32).to(positions.device());
-      }
-      auto& dp_token_nums = input_params_new.parallel.dp_global_token_nums;
-      std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
+  ModelOutput forward(torch::Tensor tokens,
+                      torch::Tensor positions,
+                      std::vector<KVCache>& kv_caches,
+                      const ModelInputParams& input_params) override {
+    if (dp_size_ > 1 && tokens.numel() == 0) {
+      tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
+      positions = torch::tensor({1}).to(torch::kInt32).to(positions.device());
     }
 
-    auto inputs_embeds = input_params.embedding.input_embedding;
+    std::optional<ModelInputParams> storage;
+    const ModelInputParams& effective_params =
+        detail::select_qwen_dp_params(input_params, dp_size_, storage);
+
+    auto inputs_embeds = effective_params.embedding.input_embedding;
     torch::Tensor h;
     if (inputs_embeds.defined()) {
       h = inputs_embeds;
@@ -119,13 +143,9 @@ class Qwen3_5ModelImpl final
       h = embed_tokens_(tokens);
     }
 
-    if (!input_params_new.attn_metadata) {
-      input_params_new.attn_metadata =
-          std::make_shared<layer::AttentionMetadata>(
-              get_attention_metadata(input_params_new, h));
-    }
-
-    auto& attn_metadata = *(input_params_new.attn_metadata);
+    // Build derived tensors inside forward so graph replay refreshes them from
+    // the persistent inputs instead of retaining values from capture time.
+    auto attn_metadata = get_attention_metadata(effective_params, h);
     std::tie(attn_metadata.mrope_cos, attn_metadata.mrope_sin) =
         apply_mrope(positions);
 
@@ -137,7 +157,7 @@ class Qwen3_5ModelImpl final
                 positions,
                 attn_metadata,
                 kv_caches[i],
-                input_params_new);
+                effective_params);
     }
     if (residual.has_value()) {
       h = h + residual.value();
