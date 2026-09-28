@@ -423,7 +423,8 @@ Status MooncakeTransferEngineCore::set_cache_peer(
   if (mode == CachePeerMode::ACTIVE) {
     ReshardPlanTemplate active_plan;
     const Status plan_status = ReshardPlanner().build_outgoing_plan(
-        *local_manifest, peer_manifest, &active_plan);
+        *local_manifest, peer_manifest, &active_plan,
+        /*include_replicas=*/true);
     if (!plan_status.ok()) {
       return plan_status;
     }

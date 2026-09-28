@@ -63,6 +63,10 @@ class KVCacheShape final {
   bool has_conv_cache_shape() const;
   bool has_ssm_cache_shape() const;
   int64_t linear_ssm_checkpoint_stride() const;
+  // Physical pages one logical block owns in this pool. 1 = the pool follows
+  // the target's kv_split sharding; > 1 = the pool is replicated on every rank
+  // and its slots are addressed by the logical token index.
+  int64_t replicated_block_pages() const { return replicated_block_pages_; }
   bool has_grouped_cache_layout() const {
     return shape_kind_ == ShapeKind::GROUPED_POOL;
   }
@@ -103,6 +107,7 @@ class KVCacheShape final {
 
  private:
   KPoolCacheLayout kpool_layout_ = KPoolCacheLayout::PACKED;
+  int64_t replicated_block_pages_ = 1;
   std::optional<std::vector<int64_t>> kpool_tail_shape_;
   ShapeKind shape_kind_ = ShapeKind::NORMAL;
   std::optional<std::vector<int64_t>> key_cache_shape_;

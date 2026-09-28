@@ -147,13 +147,126 @@ Status validate_compatibility(const WorkerCacheLayoutManifest& source,
   return Status();
 }
 
+// A logical span is identified by its logical tensor and logical offset.
+using SpanOwnerKey =
+    std::tuple<int32_t, int64_t, int32_t, int32_t, std::string, uint64_t>;
+
+SpanOwnerKey span_owner_key(const CacheTensorManifest& tensor,
+                            const LogicalSpan& span) {
+  return std::make_tuple(static_cast<int32_t>(tensor.cache_namespace),
+                         tensor.layer_id,
+                         tensor.role,
+                         tensor.group_id,
+                         span.logical_tensor,
+                         span.logical_offset_bytes);
+}
+
+// Declared owner of every span one manifest physically holds.
+std::vector<std::pair<SpanOwnerKey, int32_t>> manifest_spans(
+    const WorkerCacheLayoutManifest& manifest) {
+  std::vector<std::pair<SpanOwnerKey, int32_t>> spans;
+  for (const CacheTensorManifest& tensor : manifest.tensors) {
+    for (const LogicalSpan& span : tensor.shard.spans) {
+      spans.emplace_back(span_owner_key(tensor, span), span.owner_tp_rank);
+    }
+  }
+  return spans;
+}
+
+using SpanOwnerMap = std::map<SpanOwnerKey, int32_t>;
+
+// Which rank writes each logical span of a manifest.
+//
+// LogicalSpan::owner_tp_rank is a global property of the layout, but the
+// planner needs a different answer in two places. The destination accepts
+// everything it holds, and a replicated tensor -- for GLM-5.3 the DSA indexer,
+// whose INDEX/INDEX_SCALE descriptor is a single shared head present on every
+// TP rank -- appears in several manifests under the same logical key with
+// different physical offsets, so exactly one of them has to be picked.
+class SpanWriters final {
+ public:
+  // Every manifest writes every span it physically holds.
+  static SpanWriters everything() { return SpanWriters(); }
+
+  // Only the rank the layout declares.
+  static SpanWriters declared() {
+    SpanWriters writers;
+    writers.by_declaration_ = true;
+    return writers;
+  }
+
+  // The lowest TP rank of `candidates` that holds the span. The declared owner
+  // is not necessarily a candidate: with a partial kv_split layout every source
+  // of a KV-split partition can be a non-owner replica. Spans whose holders
+  // declare *different* owners stay unresolved, so validate_writer_coverage
+  // keeps rejecting such a layout with "multiple writers".
+  static SpanWriters lowest_of(
+      const std::vector<WorkerCacheLayoutManifest>& sources,
+      const std::vector<size_t>& candidates) {
+    struct SpanHolders {
+      std::optional<int32_t> declared_owner;
+      bool conflicting = false;
+      int32_t lowest_tp_rank = -1;
+    };
+    std::map<SpanOwnerKey, SpanHolders> holders;
+    for (size_t index : candidates) {
+      const int32_t tp_rank = sources[index].coordinates.tp_rank;
+      for (const auto& [key, declared_owner] : manifest_spans(sources[index])) {
+        SpanHolders& entry = holders[key];
+        entry.lowest_tp_rank = entry.lowest_tp_rank < 0
+                                   ? tp_rank
+                                   : std::min(entry.lowest_tp_rank, tp_rank);
+        // A negative owner means "no rank declares this span"; leave it
+        // unresolved rather than promoting a replica to writer.
+        if (declared_owner < 0) {
+          entry.conflicting = true;
+        } else if (!entry.declared_owner.has_value()) {
+          entry.declared_owner = declared_owner;
+        } else if (*entry.declared_owner != declared_owner) {
+          entry.conflicting = true;
+        }
+      }
+    }
+    SpanWriters writers;
+    writers.by_declaration_ = true;
+    for (const auto& [key, entry] : holders) {
+      if (!entry.conflicting) {
+        writers.resolved_.emplace(key, entry.lowest_tp_rank);
+      }
+    }
+    return writers;
+  }
+
+  // Whether `tp_rank` writes this span when it expands `manifest`.
+  bool writes(const CacheTensorManifest& tensor,
+              const LogicalSpan& span,
+              int32_t tp_rank) const {
+    if (!by_declaration_) {
+      return true;
+    }
+    const auto owner = resolved_.find(span_owner_key(tensor, span));
+    return tp_rank ==
+           (owner == resolved_.end() ? span.owner_tp_rank : owner->second);
+  }
+
+ private:
+  bool by_declaration_ = false;
+  SpanOwnerMap resolved_;
+};
+
+// A source whose kv_split already spans the whole CP x TP partition stores
+// every span it holds, so filtering by the declared owner would drop nothing.
+SpanWriters source_writers(const ParallelCoordinates& coordinates) {
+  return kv_split_spans_cp_and_tp(coordinates) ? SpanWriters::everything()
+                                               : SpanWriters::declared();
+}
+
 void expand_manifest(const WorkerCacheLayoutManifest& manifest,
-                     bool only_static_owner,
+                     const SpanWriters& writers,
                      std::vector<AtomicLogicalRegion>* regions) {
   for (const CacheTensorManifest& tensor : manifest.tensors) {
     for (const LogicalSpan& span : tensor.shard.spans) {
-      if (only_static_owner &&
-          manifest.coordinates.tp_rank != span.owner_tp_rank) {
+      if (!writers.writes(tensor, span, manifest.coordinates.tp_rank)) {
         continue;
       }
       for (uint64_t repeat = 0; repeat < span.repeat_count; ++repeat) {
@@ -359,7 +472,8 @@ Status validate_source_instance(
   }
 
   const ParallelCoordinates& expected = reference.coordinates;
-  if (!supports_kv_split_topology(expected)) {
+  if (!same_partition_sizes(expected, destination.coordinates) &&
+      !supports_kv_split_topology(expected)) {
     return invalid(
         "source cp_size must be divisible by kv_split_size, or "
         "kv_split_size must equal cp_size * tp_size");
@@ -409,9 +523,9 @@ Status validate_source_instance(
 
 bool has_logical_overlap(const WorkerCacheLayoutManifest& source,
                          const RegionGroups& destination_groups,
-                         bool only_static_owner) {
+                         const SpanWriters& writers) {
   std::vector<AtomicLogicalRegion> source_regions;
-  expand_manifest(source, only_static_owner, &source_regions);
+  expand_manifest(source, writers, &source_regions);
   const RegionGroups source_groups = group_regions(source_regions);
   for (const auto& [key, sources] : source_groups) {
     const auto destination_it = destination_groups.find(key);
@@ -442,6 +556,7 @@ Status select_collapsed_writers(
   std::map<std::pair<int32_t, int32_t>, int32_t> cp_kv_ranks;
   const bool spans_cp_and_tp =
       kv_split_spans_cp_and_tp(sources.front().coordinates);
+  const SpanWriters span_writers = source_writers(sources.front().coordinates);
   for (size_t index = 0; index < sources.size(); ++index) {
     const ParallelCoordinates& coordinates = sources[index].coordinates;
     if (!spans_cp_and_tp) {
@@ -474,9 +589,8 @@ Status select_collapsed_writers(
     required_groups->emplace(group);
     // Lowest CP rank is the deterministic writer; replicas are PLAN_ONLY.
     for (size_t index : cp_workers.begin()->second) {
-      if (has_logical_overlap(sources[index],
-                              destination_groups,
-                              /*only_static_owner=*/!spans_cp_and_tp)) {
+      if (has_logical_overlap(
+              sources[index], destination_groups, span_writers)) {
         writers->emplace_back(index);
       }
     }
@@ -829,11 +943,13 @@ Status ReshardPlanner::select_sources(
   }
 
   std::vector<AtomicLogicalRegion> destination_regions;
-  expand_manifest(
-      destination, /*only_static_owner=*/false, &destination_regions);
+  expand_manifest(destination, SpanWriters::everything(), &destination_regions);
   const RegionGroups destination_groups = group_regions(destination_regions);
   const bool collapse_partitions = !same_partition_sizes(
       sources.front().coordinates, destination.coordinates);
+  // Writers for the homogeneous branch; unused when partitions collapse, where
+  // the per-partition pair rules already carry the ownership.
+  SpanWriters homogeneous_writers = SpanWriters::declared();
   std::vector<size_t> writers;
   std::set<CoverageKey> required_groups;
   if (collapse_partitions) {
@@ -843,15 +959,20 @@ Status ReshardPlanner::select_sources(
       return selection;
     }
   } else {
+    std::vector<size_t> homogeneous_candidates;
     for (size_t index = 0; index < sources.size(); ++index) {
       const ParallelCoordinates& coordinates = sources[index].coordinates;
       if (!same_partition(coordinates, destination.coordinates)) {
         continue;
       }
       required_groups.emplace(coordinates.dp_rank, 0);
-      if (has_logical_overlap(sources[index],
-                              destination_groups,
-                              /*only_static_owner=*/true)) {
+      homogeneous_candidates.emplace_back(index);
+    }
+    homogeneous_writers =
+        SpanWriters::lowest_of(sources, homogeneous_candidates);
+    for (size_t index : homogeneous_candidates) {
+      if (has_logical_overlap(
+              sources[index], destination_groups, homogeneous_writers)) {
         writers.emplace_back(index);
       }
     }
@@ -866,11 +987,10 @@ Status ReshardPlanner::select_sources(
     }
     const int32_t kv_partition =
         collapse_partitions ? source.coordinates.kv_split_rank : 0;
-    const bool only_static_owner =
-        !kv_split_spans_cp_and_tp(source.coordinates);
     expand_manifest(
         source,
-        only_static_owner,
+        collapse_partitions ? source_writers(source.coordinates)
+                            : homogeneous_writers,
         &writer_regions[{source.coordinates.dp_rank, kv_partition}]);
   }
 
@@ -893,7 +1013,8 @@ Status ReshardPlanner::validate_destination_coverage(
 Status ReshardPlanner::build_outgoing_plan(
     const WorkerCacheLayoutManifest& source,
     const WorkerCacheLayoutManifest& destination,
-    ReshardPlanTemplate* plan) const {
+    ReshardPlanTemplate* plan,
+    bool include_replicas) const {
   if (plan == nullptr) {
     return invalid("reshard plan output must not be null");
   }
@@ -913,10 +1034,15 @@ Status ReshardPlanner::build_outgoing_plan(
 
   std::vector<AtomicLogicalRegion> source_regions;
   std::vector<AtomicLogicalRegion> destination_regions;
-  const bool only_static_owner = !kv_split_spans_cp_and_tp(source.coordinates);
-  expand_manifest(source, only_static_owner, &source_regions);
-  expand_manifest(
-      destination, /*only_static_owner=*/false, &destination_regions);
+  // The data plane is built for a peer the link already selected, so with
+  // `include_replicas` the source owns everything it holds -- including replica
+  // copies of a replicated tensor. Filtering by the declared owner would
+  // silently drop those bytes for every non-owning KV-split partition.
+  expand_manifest(source,
+                  include_replicas ? SpanWriters::everything()
+                                   : source_writers(source.coordinates),
+                  &source_regions);
+  expand_manifest(destination, SpanWriters::everything(), &destination_regions);
   const RegionGroups source_groups = group_regions(source_regions);
   const RegionGroups destination_groups = group_regions(destination_regions);
   std::vector<PlannedAtomicRegion> candidates;

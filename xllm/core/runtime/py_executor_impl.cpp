@@ -197,8 +197,14 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         layer::AttentionMetadataBuilder::build(
             params, enable_mla_, std::nullopt, device_));
   }
+  // The dense-DCP case is a model with no MLA latent cache (Qwen3.5), which
+  // needs KV-shard metadata on every step. An MLA model with cp_size == 1 has
+  // no CP group for the DSA prefill to shard across, so attaching the metadata
+  // there only trips the sharded-MLA-prefill guard in npu_paged_attention.py;
+  // keep the pre-main behavior for MLA and require the active CP group.
   const bool is_decode_context_parallel =
-      py_causal_lm_->cp_size() == 1 && py_causal_lm_->kv_split_size() > 1;
+      !enable_mla_ && py_causal_lm_->cp_size() == 1 &&
+      py_causal_lm_->kv_split_size() > 1;
   const bool is_mla_prefill_kv_shard =
       enable_mla_ && py_causal_lm_->cp_size() > 1 &&
       py_causal_lm_->kv_split_size() > 1 &&

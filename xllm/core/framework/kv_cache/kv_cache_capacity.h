@@ -49,6 +49,13 @@ class KVCacheCapacity final {
   PROPERTY(int64_t, block_size) = 0;
   PROPERTY(int64_t, slot_size) = 0;
 
+  // Physical pages one logical block owns in this pool. 1 means the pool
+  // follows the target's kv_split sharding (each rank owns one page per logical
+  // block); kv_split means the pool is replicated, so every rank holds the
+  // whole block and addresses it by the logical slot index. A standalone
+  // drafter (DFlash/DFlash2) sets this to kv_split.
+  PROPERTY(int64_t, replicated_block_pages) = 1;
+
   PROPERTY(KPoolCacheLayout, kpool_layout) = default_kpool_layout();
   PROPERTY(int64_t, kpool_tail_len) = 0;
   PROPERTY(int64_t, kpool_tail_slot_size) = 0;

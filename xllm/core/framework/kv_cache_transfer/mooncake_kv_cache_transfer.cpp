@@ -73,12 +73,6 @@ std::vector<KVCacheTensor> get_mooncake_tensors(const KVCache& cache) {
   return cache.get_cache_tensors();
 }
 
-int64_t physical_rows_per_resource(KVCacheTensorRole role,
-                                   int64_t ssm_checkpoint_stride) {
-  CHECK_GT(ssm_checkpoint_stride, 0);
-  return role == KVCacheTensorRole::SSM ? ssm_checkpoint_stride : 1;
-}
-
 void append_mappings(std::vector<KVTransferMapping>& dst,
                      const std::vector<KVTransferMapping>& src) {
   for (const KVTransferMapping& src_mapping : src) {
@@ -316,7 +310,10 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
         pending_registration_context_->tensor_layout;
     tensor_layout.linear_ssm_checkpoint_stride = ssm_checkpoint_stride;
     // The shape carries the actual producer layout, including compressed KPool
-    // and draft caches. K/V blocks still cover the original token capacity.
+    // and replicated draft caches. K/V blocks still cover the original token
+    // capacity.
+    tensor_layout.replicated_block_pages =
+        std::max<int64_t>(kv_cache_shape.replicated_block_pages(), 1);
     tensor_layout.index_block_capacity = 0;
     if (kv_cache_shape.kpool_layout() ==
             KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
@@ -349,7 +346,9 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
       const int64_t physical_row_count = tensor.size(0);
       CHECK_GT(physical_row_count, 0);
       const int64_t rows_per_resource =
-          physical_rows_per_resource(cache_tensor.role, ssm_checkpoint_stride);
+          physical_rows_per_resource(cache_tensor.role,
+                                     kv_cache_shape.replicated_block_pages(),
+                                     ssm_checkpoint_stride);
       CHECK_EQ(physical_row_count % rows_per_resource, 0)
           << "Cache tensor physical rows must be divisible by its logical "
              "resource geometry, role="
@@ -422,7 +421,9 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
     spec_layout_ = layout;
   }
 
-  register_kv_cache_impl(kv_caches, ssm_checkpoint_stride);
+  register_kv_cache_impl(kv_caches,
+                         ssm_checkpoint_stride,
+                         kv_cache_shape.replicated_block_pages());
   if (pending_registration_context_.has_value()) {
     publish_cache_layout(tensor_manifests, *pending_registration_context_);
     pending_registration_context_.reset();
@@ -476,12 +477,11 @@ void MooncakeKVCacheTransferDefault::register_kv_cache_spec(
   register_kv_cache(kv_caches, kv_cache_shape, dtype);
 }
 
-void MooncakeKVCacheTransferDefault::add_buf(
-    const torch::Tensor& tensor,
-    std::vector<void*>& addrs,
-    std::vector<size_t>& lens,
-    std::vector<uint64_t>& buf_bytes,
-    int64_t physical_rows_per_resource) const {
+void MooncakeKVCacheTransferDefault::add_buf(const torch::Tensor& tensor,
+                                             std::vector<void*>& addrs,
+                                             std::vector<size_t>& lens,
+                                             std::vector<uint64_t>& buf_bytes,
+                                             int64_t rows_per_resource) const {
   if (!tensor.defined() || tensor.numel() == 0) {
     return;
   }
@@ -491,10 +491,10 @@ void MooncakeKVCacheTransferDefault::add_buf(
       << "Mooncake registration requires a contiguous cache tensor";
   const int64_t block_count = tensor.size(0);
   CHECK_GT(block_count, 0) << "cache tensor block dim must be positive";
-  CHECK_GT(physical_rows_per_resource, 0);
-  CHECK_EQ(block_count % physical_rows_per_resource, 0)
+  CHECK_GT(rows_per_resource, 0);
+  CHECK_EQ(block_count % rows_per_resource, 0)
       << "cache tensor rows must be divisible by physical rows per resource";
-  const int64_t resource_count = block_count / physical_rows_per_resource;
+  const int64_t resource_count = block_count / rows_per_resource;
 
   const int64_t storage_offset = tensor.storage_offset();
   CHECK_GE(storage_offset, 0) << "tensor storage offset must be non-negative";
@@ -598,7 +598,8 @@ bool MooncakeKVCacheTransferDefault::append_buffer_mappings(
 
 void MooncakeKVCacheTransferDefault::register_kv_cache_impl(
     const std::vector<xllm::KVCache>& kv_caches,
-    int64_t ssm_checkpoint_stride) {
+    int64_t ssm_checkpoint_stride,
+    int64_t replicated_block_pages) {
   std::vector<void*> addrs;
   std::vector<size_t> lens;
   std::vector<uint64_t> buf_bytes;
@@ -610,12 +611,13 @@ void MooncakeKVCacheTransferDefault::register_kv_cache_impl(
     const std::vector<KVCacheTensor> transfer_tensors =
         get_mooncake_tensors(cache);
     for (const KVCacheTensor& cache_tensor : transfer_tensors) {
-      add_buf(
-          cache_tensor.tensor,
-          addrs,
-          lens,
-          buf_bytes,
-          physical_rows_per_resource(cache_tensor.role, ssm_checkpoint_stride));
+      add_buf(cache_tensor.tensor,
+              addrs,
+              lens,
+              buf_bytes,
+              physical_rows_per_resource(cache_tensor.role,
+                                         replicated_block_pages,
+                                         ssm_checkpoint_stride));
     }
   }
 

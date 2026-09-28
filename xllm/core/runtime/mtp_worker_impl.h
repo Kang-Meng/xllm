@@ -213,6 +213,7 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
   void prepare_draft_inputs(const ForwardInput& inputs,
                             ForwardInput& draft_inputs,
                             int32_t position_offset);
+
   void update_decode_step_input(
       ForwardInput& input,
       const std::vector<EmbeddingCache::DecodeState>& last_states) const;

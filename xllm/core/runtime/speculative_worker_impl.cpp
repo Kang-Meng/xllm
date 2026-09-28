@@ -304,7 +304,7 @@ ForwardInput SpeculativeWorkerImpl::update_input_by_last_step_output(
 
   auto& input_params = new_inputs.input_params;
   const int32_t num_sequences = input_params.meta.num_sequences;
-  const int32_t block_size = options_.block_size();
+  const int32_t block_size = logical_block_size();
 
   Slice<int32_t> token_ids = tensor_slice(inputs.token_ids_host);
   torch::Tensor last_token_ids = safe_to(
@@ -439,7 +439,7 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   const int32_t num_sequences = input_params.meta.num_sequences;
   const int32_t num_val_tokens = num_speculative_tokens + 1;
   const int32_t total_num_val_tokens = num_sequences * num_val_tokens;
-  const int32_t block_size = options_.block_size();
+  const int32_t block_size = logical_block_size();
   // Hybrid targets (for example Qwen3.8 GDN) mark validation as spec-verify
   // before entering this generic builder.  They must keep one sequence row
   // with an N+1-token query so recurrent state is checkpointed and committed
@@ -578,7 +578,7 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
       max_val_tokens = v;
     }
   }
-  const int32_t block_size = options_.block_size();
+  const int32_t block_size = logical_block_size();
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);
 

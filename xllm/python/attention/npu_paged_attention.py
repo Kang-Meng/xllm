@@ -486,6 +486,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
         if metadata.block_table is not None:
             self._block_table_i32 = metadata.block_table.to(torch.int32)
+            # One block-table column spans a LOGICAL block
+            # (block_size * kv_split_size), not one physical page.  Keep the
+            # logical size so graph capture bounds below stay correct when DCP
+            # shards the KV cache.
+            self._logical_block_size = int(
+                getattr(metadata, "logical_block_size", 0) or self.page_size
+            )
 
             real_batch = metadata.block_table.shape[0]
 
@@ -646,7 +653,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 # the captured tiling metadata remains valid for every replay.
                 self._mla_max_seqlen_k = _mla_graph_max_seqlen_k(
                     self._block_table_i32,
-                    self.page_size,
+                    self._logical_block_size,
                 )
             else:
                 kv_seq_lens_host = getattr(metadata, "kv_seq_lens_host", None)

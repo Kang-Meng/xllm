@@ -64,6 +64,11 @@ class PyAttentionMetadataView final {
 
   const torch::Tensor& slot_mapping() const;
   pybind11::object local_slot_mapping() const;
+  // Tokens covered by one block-table column: block_size * kv_split_size.
+  // With kv_split a block-table column is a logical block, so Python-side
+  // metadata validation must not use the physical block size.
+  int32_t logical_block_size() const;
+
   int32_t kv_split_size() const;
   int32_t kv_split_rank() const;
   bool has_kv_shard() const;

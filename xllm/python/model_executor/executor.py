@@ -148,27 +148,34 @@ def _create_attention_backend(
                     dcp_group=dcp_group,
                     num_decoding_tokens=max(num_decoding_tokens, 1),
                 )
-            if not bool(config.get("enable_mla", False)):
-                raise NotImplementedError(f"Dense DCP attention is not supported for model type '{model_type}'")
-            from xllm.python.attention.sfa_dcp_backend import (
-                SfaDcpAttentionBackend,
-                dcp_layer_options,
-            )
+            # Only an MLA model has a latent KV for the DCP backend to shard.
+            # The DFlash2 draft is GQA: it is not sharded at all but keeps a
+            # full replica of its own pool, read through the expanded block
+            # table, so it skips this branch and falls through to the plain
+            # paged backend below. A dense target has no such replica, so it
+            # still has to refuse.
+            if bool(config.get("enable_mla", False)):
+                from xllm.python.attention.sfa_dcp_backend import (
+                    SfaDcpAttentionBackend,
+                    dcp_layer_options,
+                )
 
-            index_topk = dcp_layer_options(first_attention)
-            return SfaDcpAttentionBackend(
-                num_heads=first_attention.num_heads,
-                num_kv_heads=first_attention.num_kv_heads,
-                head_dim=first_attention.head_dim,
-                scale=first_attention.scale,
-                sliding_window=first_attention.sliding_window,
-                device=device,
-                dtype=dtype,
-                dcp_group=dcp_group,
-                index_topk=index_topk,
-                max_num_reqs=max(max_num_reqs, 1),
-                num_decoding_tokens=max(num_decoding_tokens, 1),
-            )
+                index_topk = dcp_layer_options(first_attention)
+                return SfaDcpAttentionBackend(
+                    num_heads=first_attention.num_heads,
+                    num_kv_heads=first_attention.num_kv_heads,
+                    head_dim=first_attention.head_dim,
+                    scale=first_attention.scale,
+                    sliding_window=first_attention.sliding_window,
+                    device=device,
+                    dtype=dtype,
+                    dcp_group=dcp_group,
+                    index_topk=index_topk,
+                    max_num_reqs=max(max_num_reqs, 1),
+                    num_decoding_tokens=max(num_decoding_tokens, 1),
+                )
+            if not bool(config.get("is_draft_engine", False)):
+                raise NotImplementedError(f"Dense DCP attention is not supported for model type '{model_type}'")
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
         )

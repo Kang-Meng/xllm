@@ -22,6 +22,7 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/embedding_cache.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/model/model_args.h"
@@ -123,6 +124,16 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // stays here and a subclass flips one bit.
   virtual bool sample_from_anchor() const { return false; }
 
+  // DFlash/DFlash2 drafts are standalone full-attention models, so they cannot
+  // follow the target's kv_split sharding: every rank keeps a full replica of
+  // the context and one logical block owns kv_split physical pages. Drafters
+  // that share the target's architecture (MTP, DSpark) keep the default 1.
+  int64_t draft_replicated_block_pages() const override {
+    return SpeculativeConfig::draft_replicated_block_pages(
+        options_.speculative_algorithm(),
+        parallel_args_.kv_split_size_effective());
+  }
+
   // Shared with subclasses (DSpark): build the N/N+1-wide draft query block and
   // the target validate input. A DSpark override of run_decode_draft calls both
   // before its draft forward.
@@ -130,6 +141,14 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
                             ForwardInput& query_input);
   void prepare_validate_inputs(const ForwardInput& input,
                                ForwardInput& validate_input);
+
+  // A replicated draft pool stores kv_split physical pages per logical block,
+  // so the draft's own block table has to be expanded to address them. The
+  // logical slot arithmetic in specBuilder is unchanged: run against the
+  // expanded table with the physical block size it still resolves to the
+  // draft's flat cache index (logical_block * kv_split + page_in_block).
+  // No-op when the draft follows the target's kv_split sharding.
+  void expand_draft_block_tables(ModelInputParams& input_params) const;
 
  private:
   bool draft_use_block_parallel_rows() const {

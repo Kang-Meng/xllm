@@ -75,6 +75,28 @@ class SpeculativeConfig final {
            boost::iequals(algorithm, "dspark");
   }
 
+  // Standalone drafters own a full-attention KV pool built from their own
+  // architecture instead of running inside the target's KV. GLM-5.3-Flash's
+  // DFlash2 draft is a Qwen3-style block-diffusion model, so it cannot follow
+  // the target's kv_split sharding and keeps a complete replica of the context
+  // on every kv_split rank (one logical block = kv_split physical pages).
+  //
+  // Drafters that share the target's architecture (MTP, Eagle3, DeepSeek-V4
+  // DSpark) inherit the target's sharding and must return false here.
+  static bool owns_replicated_kv_cache(std::string_view algorithm) {
+    return boost::iequals(algorithm, "DFlash") ||
+           is_dflash2_algorithm(algorithm);
+  }
+
+  // Physical pages one logical block occupies in the drafter's KV pool. 1
+  // means the draft follows the target's kv_split sharding.
+  static int32_t draft_replicated_block_pages(std::string_view algorithm,
+                                              int32_t kv_split_size) {
+    return kv_split_size > 1 && owns_replicated_kv_cache(algorithm)
+               ? kv_split_size
+               : 1;
+  }
+
   static bool supports_host_kv_cache(std::string_view algorithm) {
     return is_mtp_algorithm(algorithm) ||
            is_block_diffusion_algorithm(algorithm) ||

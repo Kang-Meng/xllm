@@ -76,10 +76,16 @@ def resolve_expanded_decode_metadata(
         kv_seq_lens_host=expanded.kv_seq_lens_host,
         kv_seq_lens_host_values=host_values,
     )
+    # Prefer the engine-reported logical block size (tokens per block-table
+    # column): with kv_split one column spans block_size * kv_split_size
+    # tokens, so validating page counts against the physical block size
+    # rejects every sequence that crosses a physical block boundary.
     _validate_expanded_decode_metadata(
         resolved,
         slot_mapping=getattr(metadata, "slot_mapping", None),
-        block_size=block_size,
+        block_size=int(
+            getattr(metadata, "logical_block_size", 0) or block_size
+        ),
     )
     return resolved
 

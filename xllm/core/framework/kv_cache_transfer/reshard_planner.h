@@ -90,9 +90,13 @@ class ReshardPlanner final {
       const std::vector<WorkerCacheLayoutManifest>& sources,
       const WorkerCacheLayoutManifest& destination) const;
 
+  // include_replicas: the link calls this per selected peer, so the source owns
+  // everything it holds inside that pair, replica copies included (see
+  // reshard_planner.cpp).
   Status build_outgoing_plan(const WorkerCacheLayoutManifest& source,
                              const WorkerCacheLayoutManifest& destination,
-                             ReshardPlanTemplate* plan) const;
+                             ReshardPlanTemplate* plan,
+                             bool include_replicas = false) const;
 };
 
 class RequestRegionBinder final {

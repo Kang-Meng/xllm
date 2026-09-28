@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
+#include "core/layers/common/kv_shard_batch_metadata.h"
 #include "framework/model/model_args.h"
 #include "framework/sampling/sampling_params.h"
 #if defined(USE_NPU) || defined(USE_MLU)
@@ -524,6 +525,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   }
   scale_speculative_parallel_token_counts(query_input.input_params,
                                           draft_width);
+  expand_draft_block_tables(query_input.input_params);
   // Warmup only: prime the draft; its output is unused. Keep it alive until the
   // sync below so the no-sync draft input is not freed while the target forward
   // launched next can reuse the buffer.
@@ -1265,10 +1267,24 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
     build_dflash_expanded_spec_verify_graph_input(
-        input_params, device_.unwrap(), options_.block_size());
+        input_params, device_.unwrap(), logical_block_size());
 #endif
   }
   record_metadata_ready_event(*prepare_stream_, validate_input);
+}
+
+void DFlashWorkerImpl::expand_draft_block_tables(
+    ModelInputParams& input_params) const {
+  const int64_t replicated_block_pages = draft_replicated_block_pages();
+  if (replicated_block_pages <= 1) {
+    return;
+  }
+  input_params.attention.host.block_tables =
+      layer::expand_replicated_block_table(
+          input_params.attention.host.block_tables, replicated_block_pages);
+  input_params.attention.device.block_tables =
+      layer::expand_replicated_block_table(
+          input_params.attention.device.block_tables, replicated_block_pages);
 }
 
 void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
@@ -1283,11 +1299,15 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   input_params.clear_linear_attention_state();
   input_params.embedding.input_embedding = torch::Tensor();
   dflash_detail::invalidate_draft_model_geometry(input_params);
+  // The draft addresses its own pool, so both the row builder below and the
+  // draft's attention must see this rank's expanded block table. Expand before
+  // building the rows: calc_slot_id indexes it with the physical block size.
+  expand_draft_block_tables(input_params);
 
   specBuilder::DecodeBuildBuffers buf;
   std::vector<int32_t> selected_idxes;
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
-  build_query_rows(input,
+  build_query_rows(query_input,
                    mask_token_id_,
                    options_.num_speculative_tokens(),
                    options_.block_size(),
@@ -1453,8 +1473,21 @@ std::vector<std::string> DFlashWorkerImpl::write_target_context_to_cache(
       << "DFlash accepted token/embedding width mismatch.";
 
   specBuilder::DecodeBuildBuffers buf;
+  // The accepted-context rows are addressed against the draft's own pool, so
+  // the row builder and the scatter below must both use this rank's expanded
+  // block table. Publish and PD push only read the transfer bookkeeping, which
+  // the expanded copy keeps intact. expand_draft_block_tables() is a no-op
+  // unless this draft replicates kv-split pages, so copy the input only then
+  // instead of on every decode step.
+  std::optional<ForwardInput> expanded_draft_input;
+  if (draft_replicated_block_pages() > 1) {
+    expanded_draft_input.emplace(input);
+    expand_draft_block_tables(expanded_draft_input->input_params);
+  }
+  const ForwardInput& draft_input =
+      expanded_draft_input.has_value() ? *expanded_draft_input : input;
   std::vector<int64_t> accepted_idxes = build_accepted_context_rows(
-      input, accepted_tokens, options_.block_size(), buf);
+      draft_input, accepted_tokens, options_.block_size(), buf);
   torch::TensorOptions host_index_options = torch::TensorOptions()
                                                 .dtype(torch::kLong)
                                                 .device(torch::kCPU)
@@ -1489,7 +1522,7 @@ std::vector<std::string> DFlashWorkerImpl::write_target_context_to_cache(
         << "failed to wait DFlash context hidden ready event";
   }
   std::vector<std::string> failed_request_ids = write_context_kv(
-      input, context_hidden, positions_device, new_cache_slots_device);
+      draft_input, context_hidden, positions_device, new_cache_slots_device);
   CHECK(!input.input_params.embedding.embedding_ids.empty())
       << "DFlash target context cache write requires embedding ids";
   embedding_cache_->write_target_context(

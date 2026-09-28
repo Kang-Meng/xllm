@@ -71,6 +71,32 @@ torch::Tensor localize_kv_shard_context_lens(
   return full_logical_blocks * physical_block_size + owned_remainder;
 }
 
+torch::Tensor expand_replicated_block_table(
+    const torch::Tensor& logical_block_table,
+    int64_t replicated_block_pages) {
+  if (!logical_block_table.defined() || logical_block_table.numel() == 0 ||
+      replicated_block_pages <= 1) {
+    return logical_block_table;
+  }
+  CHECK_EQ(logical_block_table.dim(), 2)
+      << "block table must be [sequences, logical_blocks]";
+  CHECK(logical_block_table.scalar_type() == torch::kInt32 ||
+        logical_block_table.scalar_type() == torch::kInt64)
+      << "block table must use int32 or int64";
+  const int64_t rows = logical_block_table.size(0);
+  const int64_t columns = logical_block_table.size(1);
+  torch::Tensor page_offsets =
+      torch::arange(replicated_block_pages, logical_block_table.options());
+  torch::Tensor expanded =
+      logical_block_table.unsqueeze(-1) * replicated_block_pages + page_offsets;
+  expanded =
+      torch::where(logical_block_table.unsqueeze(-1) >= 0,
+                   expanded,
+                   torch::full_like(expanded, KVShardLayout::kInvalidSlot));
+  return expanded.reshape({rows, columns * replicated_block_pages})
+      .contiguous();
+}
+
 std::shared_ptr<const KVShardBatchMetadata> build_kv_shard_batch_metadata(
     const AttentionMetadata& attention_metadata,
     const KVShardLayout& layout) {

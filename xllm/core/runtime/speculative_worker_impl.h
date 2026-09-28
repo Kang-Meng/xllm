@@ -159,6 +159,14 @@ class SpeculativeWorkerImpl : public WorkerImpl {
                                ForwardInput& validate_inputs,
                                const std::vector<int32_t>& per_seq_val_tokens);
 
+  // Tokens covered by one column of the target's block table. The table holds
+  // logical blocks, so when the KV cache is split across ranks a column spans
+  // block_size * kv_split_size tokens; algorithms that carry that geometry
+  // (MTP, DFlash) override this, the rest keep the physical block size.
+  virtual int32_t logical_block_size() const {
+    return static_cast<int32_t>(options_.block_size());
+  }
+
  protected:
   // Target model worker
   std::unique_ptr<WorkerImpl> impl_;

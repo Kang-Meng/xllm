@@ -21,6 +21,8 @@ limitations under the License.
 #include <algorithm>
 #include <utility>
 
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/util/pybind_helper.h"
@@ -68,6 +70,8 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::slot_mapping)
       .def_property_readonly("local_slot_mapping",
                              &PyAttentionMetadataView::local_slot_mapping)
+      .def_property_readonly("logical_block_size",
+                             &PyAttentionMetadataView::logical_block_size)
       .def_property_readonly("kv_split_size",
                              &PyAttentionMetadataView::kv_split_size)
       .def_property_readonly("kv_split_rank",
@@ -285,6 +289,11 @@ py::object PyAttentionMetadataView::local_slot_mapping() const {
   }
   return optional_tensor(
       metadata_->kv_shard_batch_metadata->local_slot_mapping);
+}
+
+int32_t PyAttentionMetadataView::logical_block_size() const {
+  return static_cast<int32_t>(KVCacheConfig::get_instance().block_size()) *
+         ParallelConfig::get_instance().kv_split_size_effective();
 }
 
 int32_t PyAttentionMetadataView::kv_split_size() const {

@@ -93,6 +93,14 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         self._expanded_indexer_block_table: torch.Tensor | None = None
         self._sfa_metadata: AscendSFADCPMetadata | None = None
 
+    def _make_builder(self, max_num_reqs: int) -> AscendSFADCPMetadataBuilder:
+        assert self._kv_layout is not None
+        return AscendSFADCPMetadataBuilder(
+            layout=self._kv_layout,
+            device=self.device,
+            max_num_reqs=max(max_num_reqs, 1),
+        )
+
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         super().bind_kv_caches(kv_caches)
         self._kv_layout = KVShardLayout(
@@ -107,22 +115,21 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             index_topk=self._index_topk,
             layout=self._kv_layout,
         )
-        self._builder = AscendSFADCPMetadataBuilder(
-            layout=self._kv_layout,
-            device=self.device,
-            max_num_reqs=max(self._max_num_reqs, 1),
-        )
+        self._builder = self._make_builder(self._max_num_reqs)
 
     def _ensure_builder_capacity(self, num_reqs: int) -> None:
         if self._builder is None or self._kv_layout is None:
             raise RuntimeError("SFA DCP backend requires bind_kv_caches before execute")
-        if num_reqs <= self._builder.dcp_local_seq_lens_buf.shape[0]:
+        capacity = self._builder.dcp_local_seq_lens_buf.shape[0]
+        if num_reqs <= capacity:
             return
-        raise RuntimeError(
-            "SFA DCP builder buffer is too small; "
-            f"max_num_reqs={self._builder.dcp_local_seq_lens_buf.shape[0]}, "
-            f"num_reqs={num_reqs}"
-        )
+        # The expanded spec-verify path packs one metadata row per token, so a
+        # batch of N sequences needs N * (num_speculative_tokens + 1) rows while
+        # the initial sizing only knows the sequence budget. Grow the workspace
+        # instead of failing the step, and keep geometric headroom: the row
+        # count follows the running batch, so sizing to exactly `num_reqs` would
+        # rebuild this builder (and reallocate its NPU buffers) on every step.
+        self._builder = self._make_builder(max(num_reqs, 2 * capacity, self._max_num_reqs))
 
     def prepare(
         self,

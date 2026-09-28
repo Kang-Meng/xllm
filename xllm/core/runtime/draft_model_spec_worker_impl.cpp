@@ -146,12 +146,15 @@ KVCacheShape build_speculative_draft_kv_cache_shape(
     const ModelArgs& draft_model_args,
     int64_t block_size,
     int64_t draft_world_size,
-    const std::string& kv_cache_dtype) {
+    const std::string& kv_cache_dtype,
+    int64_t replicated_block_pages) {
   CHECK(!target_kv_cache_shape.key_cache_shape().empty())
       << "target KV cache shape must contain key cache shape";
   if (target_kv_cache_shape.has_grouped_cache_layout()) {
     return target_kv_cache_shape;
   }
+  CHECK_GE(replicated_block_pages, 1)
+      << "replicated_block_pages must be at least one";
 
   // Propagate the target-side packed-C8 layout to the draft pool so the two
   // allocators agree on 656B/token rows (glm_moe_dsa_mtp + int8). Every other
@@ -163,8 +166,13 @@ KVCacheShape build_speculative_draft_kv_cache_shape(
       util::enable_mla_packed_c8(kv_cache_dtype == "int8",
                                  draft_model_args.model_type());
   KVCacheCapacity draft_capacity;
-  draft_capacity.n_blocks(target_kv_cache_shape.key_cache_shape()[0])
+  // A replicated draft pool owns `replicated_block_pages` physical rows per
+  // logical block on every rank, so the block manager's logical block ids still
+  // index it directly and the draft's slots stay logical token slots.
+  draft_capacity.n_blocks(target_kv_cache_shape.key_cache_shape()[0] *
+                          replicated_block_pages)
       .block_size(block_size)
+      .replicated_block_pages(replicated_block_pages)
       .enable_mla_kv_cache_quant(draft_mla_packed_c8);
   draft_capacity.kpool_layout(target_kv_cache_shape.kpool_layout());
   if (target_kv_cache_shape.has_kpool_tail_shape()) {
@@ -220,7 +228,8 @@ KVCacheShape DraftModelSpecWorkerImpl::build_draft_kv_cache_shape(
       draft_impl_->context_.get_model_args(),
       options_.block_size(),
       draft_world_size,
-      options_.kv_cache_dtype());
+      options_.kv_cache_dtype(),
+      draft_replicated_block_pages());
 }
 
 std::tuple<int64_t, int64_t>

@@ -35,12 +35,16 @@ class ModelArgs;
 
 // Builds the draft KV cache geometry, reusing the target's grouped pool counts
 // and propagating its packed-C8 layout when kv_cache_dtype selects it.
+// `replicated_block_pages` > 1 makes the draft pool a full replica: one logical
+// block owns that many physical pages on every rank, so the draft addresses its
+// cache by the logical slot index instead of the target's kv_split shard.
 KVCacheShape build_speculative_draft_kv_cache_shape(
     const KVCacheShape& target_kv_cache_shape,
     const ModelArgs& draft_model_args,
     int64_t block_size,
     int64_t draft_world_size,
-    const std::string& kv_cache_dtype);
+    const std::string& kv_cache_dtype,
+    int64_t replicated_block_pages = 1);
 
 // Base for draft-model speculative workers (MTP, DFlash/DSpark); Suffix has no
 // draft model and derives from SpeculativeWorkerImpl directly.
@@ -86,6 +90,23 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl {
   // Some drafts replay every verified KV position, so retain the full
   // accepted span when allocating their embedding cache.
   virtual bool requires_full_target_replay() const { return false; }
+
+  // Physical pages one logical block owns in the draft pool. 1 (default) keeps
+  // the draft on the target's kv_split sharding; > 1 replicates the whole
+  // context on every rank, which is what a standalone drafter needs.
+  virtual int64_t draft_replicated_block_pages() const { return 1; }
+
+  // Tokens covered by one column of the TARGET's block table. The table holds
+  // logical blocks, so under kv_split one column spans block_size *
+  // kv_split_size tokens. Every conversion between a KV length and a column
+  // count against that table has to use this value; the draft's own table is
+  // expanded to physical pages instead (DFlashWorkerImpl::
+  // expand_draft_block_tables). SuffixWorkerImpl has no draft and derives from
+  // SpeculativeWorkerImpl directly, so it keeps the physical block size.
+  int32_t logical_block_size() const override {
+    return static_cast<int32_t>(options_.block_size()) *
+           parallel_args_.kv_split_size_effective();
+  }
 
   void prepare_hierarchy_kv_cache_transfers();
   void finalize_hierarchy_kv_cache_transfers();

@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "framework/model/mtp_utils.h"
 #include "llm_engine.h"
@@ -274,13 +275,22 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
           target_kv_cache_cap.index_block_size();
   // The draft KV cache is allocated from the draft's own KVCacheShape, so its
   // per-block cost uses the draft's own slot size, which may exceed the
-  // target's (e.g. a full-attention draft against an MLA target).
+  // target's (e.g. a full-attention draft against an MLA target). A standalone
+  // drafter replicates the whole context on every kv_split rank, so one logical
+  // draft block costs that many physical pages. Kept in lockstep with
+  // DraftModelSpecWorkerImpl::draft_replicated_block_pages() through the same
+  // SpeculativeConfig predicate.
+  const int32_t replicated_block_pages =
+      SpeculativeConfig::draft_replicated_block_pages(
+          options_.speculative_algorithm(),
+          ParallelConfig::get_instance().kv_split_size_effective());
   const int64_t draft_full_attention_block_size_in_bytes =
-      block_size * (draft_full_attention_layers *
-                    (draft_kv_cache_cap.slot_size() +
-                     draft_kv_cache_cap.scale_slot_size())) +
-      draft_kv_cache_cap.num_indexer_layers() *
-          draft_kv_cache_cap.index_block_size();
+      replicated_block_pages *
+      (block_size * (draft_full_attention_layers *
+                     (draft_kv_cache_cap.slot_size() +
+                      draft_kv_cache_cap.scale_slot_size())) +
+       draft_kv_cache_cap.num_indexer_layers() *
+           draft_kv_cache_cap.index_block_size());
   const int32_t layerwise_split_size =
       options_.is_draft_engine()
           ? 1

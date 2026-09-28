@@ -20,6 +20,8 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "util/utils.h"
+
 namespace xllm {
 
 namespace {
@@ -76,6 +78,19 @@ uint64_t tensor_stride_bytes(const torch::Tensor& tensor, int64_t dim) {
   return static_cast<uint64_t>(tensor.stride(dim)) * tensor.element_size();
 }
 
+// Writes the descriptor every replicated entry point below ends with: the kind
+// and the resource scope are shared, only the span geometry differs.
+void store_replicated_descriptor(KVCacheTensor* cache_tensor,
+                                 LogicalSpan span) {
+  LogicalShardDescriptor descriptor;
+  descriptor.kind = LogicalShardKind::REPLICATED;
+  descriptor.resource_scope = cache_tensor->sequence_scoped
+                                  ? CacheResourceScope::SEQUENCE
+                                  : CacheResourceScope::BLOCK;
+  descriptor.spans.emplace_back(std::move(span));
+  cache_tensor->shard_descriptor = std::move(descriptor);
+}
+
 bool describe_replicated_tensor(KVCacheTensor* cache_tensor,
                                 std::string* error) {
   const torch::Tensor& tensor = cache_tensor->tensor;
@@ -96,18 +111,48 @@ bool describe_replicated_tensor(KVCacheTensor* cache_tensor,
   span.bytes_per_region = tensor_bytes / resource_count;
   span.owner_tp_rank = 0;
 
-  LogicalShardDescriptor descriptor;
-  descriptor.kind = LogicalShardKind::REPLICATED;
-  descriptor.resource_scope = cache_tensor->sequence_scoped
-                                  ? CacheResourceScope::SEQUENCE
-                                  : CacheResourceScope::BLOCK;
-  descriptor.spans.emplace_back(std::move(span));
-  cache_tensor->shard_descriptor = std::move(descriptor);
+  store_replicated_descriptor(cache_tensor, std::move(span));
+  return true;
+}
+
+// The NPU replicates the DSA indexer cache on every rank and packs
+// `indexer_pages_per_block()` physical index pages into one logical cache
+// block (platform.h). Grouping those pages into a single logical resource keeps
+// the block-id mapping every transfer binder uses pointing at exactly the index
+// pages the Python read/write path addresses, for every kv_split size.
+bool describe_replicated_index_pages(int64_t indexer_pages,
+                                     KVCacheTensor* cache_tensor,
+                                     std::string* error) {
+  const torch::Tensor& tensor = cache_tensor->tensor;
+  if (!tensor.is_contiguous() || tensor.dim() == 0 || tensor.size(0) <= 0) {
+    return fail(
+        "replicated index cache tensor must be contiguous and non-empty",
+        error);
+  }
+  if (tensor.size(0) % indexer_pages != 0) {
+    return fail("index cache rows are not divisible by its pages per block",
+                error);
+  }
+  const uint64_t page_bytes = tensor_stride_bytes(tensor, 0);
+  if (page_bytes == 0) {
+    return fail("index cache page must contain at least one element", error);
+  }
+
+  LogicalSpan span;
+  span.logical_tensor = cache_tensor->role.to_string();
+  span.bytes_per_region = page_bytes;
+  span.repeat_count = static_cast<uint64_t>(indexer_pages);
+  span.logical_stride_bytes = page_bytes;
+  span.physical_stride_bytes = page_bytes;
+  span.owner_tp_rank = 0;
+
+  store_replicated_descriptor(cache_tensor, std::move(span));
   return true;
 }
 
 bool describe_attention_heads(const CacheTensorLayoutContext& context,
                               int64_t global_head_count,
+                              int64_t replicated_block_pages,
                               KVCacheTensor* cache_tensor,
                               std::string* error) {
   const torch::Tensor& tensor = cache_tensor->tensor;
@@ -163,7 +208,15 @@ bool describe_attention_heads(const CacheTensorLayoutContext& context,
   const uint64_t physical_token_stride =
       tensor_stride_bytes(tensor, token_axis);
   const uint64_t physical_head_stride = tensor_stride_bytes(tensor, head_axis);
-  const uint64_t token_count = static_cast<uint64_t>(tensor.size(token_axis));
+  // A replicated pool stores `replicated_block_pages` physical pages per
+  // logical block. Those pages are consecutive rows, so one span per head with
+  // a token-major repeat covers them byte-exactly: row `page * token_count +
+  // token` sits at exactly `(page * token_count + token) *
+  // physical_token_stride` within the resource.
+  CHECK_GE(replicated_block_pages, 1)
+      << "cache replicated pages per block must be positive";
+  const uint64_t token_count = static_cast<uint64_t>(tensor.size(token_axis)) *
+                               static_cast<uint64_t>(replicated_block_pages);
 
   for (int64_t local_head = 0; local_head < local_head_count; ++local_head) {
     const int64_t global_head = first_global_head + local_head;
@@ -376,6 +429,25 @@ bool is_kv_head_role(KVCacheTensorRole role) {
 
 }  // namespace
 
+int64_t physical_rows_per_resource(KVCacheTensorRole role,
+                                   int64_t replicated_block_pages,
+                                   int64_t ssm_checkpoint_stride) {
+  CHECK_GT(ssm_checkpoint_stride, 0);
+  CHECK_GE(replicated_block_pages, 1);
+  if (role == KVCacheTensorRole::SSM) {
+    return ssm_checkpoint_stride;
+  }
+  if (role == KVCacheTensorRole::INDEX ||
+      role == KVCacheTensorRole::INDEX_SCALE) {
+    return indexer_pages_per_block();
+  }
+  if (role == KVCacheTensorRole::KEY || role == KVCacheTensorRole::VALUE ||
+      role == KVCacheTensorRole::WINDOW) {
+    return std::max<int64_t>(replicated_block_pages, 1);
+  }
+  return 1;
+}
+
 bool describe_cache_tensor(const CacheTensorLayoutContext& context,
                            KVCacheTensor* cache_tensor,
                            std::string* error) {
@@ -385,6 +457,15 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
   }
   if (cache_tensor->shard_descriptor.has_value()) {
     return true;
+  }
+  // A logical index block owns `indexer_pages_per_block()` physical pages on
+  // the NPU, so the replicated descriptor of an index cache must span the whole
+  // block instead of a single page.
+  const int64_t index_pages = indexer_pages_per_block();
+  if (index_pages > 1 &&
+      (cache_tensor->role == KVCacheTensorRole::INDEX ||
+       cache_tensor->role == KVCacheTensorRole::INDEX_SCALE)) {
+    return describe_replicated_index_pages(index_pages, cache_tensor, error);
   }
 
 #if !defined(USE_NPU)
@@ -414,8 +495,11 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
   }
 #endif
   if (is_kv_head_role(cache_tensor->role) && context.kv_head_count > 0) {
-    return describe_attention_heads(
-        context, context.kv_head_count, cache_tensor, error);
+    return describe_attention_heads(context,
+                                    context.kv_head_count,
+                                    context.replicated_block_pages,
+                                    cache_tensor,
+                                    error);
   }
   if (cache_tensor->role == KVCacheTensorRole::INDEX ||
       cache_tensor->role == KVCacheTensorRole::INDEX_SCALE) {
@@ -427,8 +511,11 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
     if (context.index_block_capacity > 0) {
       index_context.block_token_capacity = context.index_block_capacity;
     }
-    return describe_attention_heads(
-        index_context, /*global_head_count=*/1, cache_tensor, error);
+    return describe_attention_heads(index_context,
+                                    /*global_head_count=*/1,
+                                    /*replicated_block_pages=*/1,
+                                    cache_tensor,
+                                    error);
   }
 
   // Roles whose producer exposes no head axis are explicit whole-resource

@@ -137,7 +137,7 @@ class MooncakeKVCacheTransferDefault final
                std::vector<void*>& addrs,
                std::vector<size_t>& lens,
                std::vector<uint64_t>& buf_bytes,
-               int64_t physical_rows_per_resource = 1) const;
+               int64_t rows_per_resource = 1) const;
   bool append_buffer_mappings(
       const BufLayout& layout,
       const std::vector<int64_t>& layer_ids,
@@ -145,9 +145,11 @@ class MooncakeKVCacheTransferDefault final
       std::vector<MooncakeTransferEngine::BufferTransferMapping>*
           buffer_mappings) const;
 
-  // Register per-layer K/V tensor memory.
+  // Register per-layer K/V tensor memory. `replicated_block_pages` is the
+  // shape's pages-per-logical-block factor (1 for the kv_split-sharded layout).
   void register_kv_cache_impl(const std::vector<xllm::KVCache>& kv_caches,
-                              int64_t ssm_checkpoint_stride);
+                              int64_t ssm_checkpoint_stride,
+                              int64_t replicated_block_pages = 1);
 
   bool has_v_cache_ = true;
   BufLayout main_layout_;

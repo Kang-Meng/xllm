@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 
 #include "core/platform/platform.h"
+#include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "util/utils.h"
 #include "worker.pb.h"
@@ -82,6 +83,15 @@ KVCacheShape::KVCacheShape(const KVCacheCapacity& kv_cache_cap,
                            int64_t world_size) {
   CHECK_GT(world_size, 0) << "world_size must be positive.";
   CHECK_GT(kv_cache_cap.block_size(), 0) << "block_size must be positive.";
+  replicated_block_pages_ =
+      std::max<int64_t>(kv_cache_cap.replicated_block_pages(), 1);
+  if (replicated_block_pages_ > 1) {
+    CHECK_EQ(kv_cache_cap.n_blocks() % replicated_block_pages_, 0)
+        << "A replicated cache pool must own a whole number of logical "
+           "blocks: n_blocks="
+        << kv_cache_cap.n_blocks()
+        << ", replicated_block_pages=" << replicated_block_pages_;
+  }
 
   if (util::is_deepseek_v4_model_type(model_args.model_type())) {
     init_dsv4_pool_shape(kv_cache_cap);
@@ -444,10 +454,7 @@ void KVCacheShape::init_mla_packed_c8_shape(const KVCacheCapacity& kv_cache_cap,
 
 void KVCacheShape::init_index_cache_shape(const KVCacheCapacity& kv_cache_cap,
                                           const ModelArgs& model_args) {
-  int64_t replication_factor = 1;
-  if (Platform::requires_dsa_indexer_cache_replication()) {
-    replication_factor = util::kv_split_size_effective();
-  }
+  const int64_t replication_factor = indexer_pages_per_block();
   const int64_t index_block_count =
       kv_cache_cap.n_blocks() * replication_factor;
   if (kpool_layout_ == KPoolCacheLayout::COMPRESSED_WITH_TAIL &&

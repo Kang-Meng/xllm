@@ -57,6 +57,16 @@ torch::Tensor localize_kv_shard_context_lens(
     const torch::Tensor& global_context_lens,
     const KVShardLayout& layout);
 
+// Mirror of the shard layout for a REPLICATED cache pool: one logical block
+// owns `replicated_block_pages` physical pages on every rank, laid out as pages
+// [block * replicated_block_pages, (block + 1) * replicated_block_pages).
+// Expanding the logical table makes it address those physical pages directly,
+// which is what a standalone drafter (DFlash/DFlash2) needs; the default pool
+// (one page per logical block) returns the table unchanged.
+torch::Tensor expand_replicated_block_table(
+    const torch::Tensor& logical_block_table,
+    int64_t replicated_block_pages);
+
 // Build only shared slot mapping and shard identity.
 std::shared_ptr<const KVShardBatchMetadata> build_kv_shard_batch_metadata(
     const AttentionMetadata& attention_metadata,

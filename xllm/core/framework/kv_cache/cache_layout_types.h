@@ -80,6 +80,10 @@ struct CacheTensorLayoutContext {
   int64_t linear_ssm_checkpoint_stride = 1;
   bool enable_mla = false;
   bool head_major_layout = false;
+  // Physical pages one logical block owns in this pool; 1 for the ordinary
+  // kv_split-sharded layout. A replicated pool (standalone drafter) groups that
+  // many physical pages into one logical resource.
+  int64_t replicated_block_pages = 1;
 };
 
 }  // namespace xllm

@@ -520,6 +520,35 @@ TEST(SpecDecodeInputBuilderTest, CalcSlotIdUsesDcpLogicalBlockSize) {
             7 * 128 + 22);
 }
 
+// One block-table column is a logical block: with kv_split_size=4 a physical
+// block of 128 tokens spans 512 tokens, so position 200 stays in column 0 and
+// 513 is the first position of column 1. Reading the table with the physical
+// block size instead would move 200 into the second logical block.
+TEST(SpecDecodeInputBuilderTest, CalcSlotIdCrossesOneColumnPerLogicalBlock) {
+  std::vector<int32_t> block_table = {7, 9};
+
+  EXPECT_EQ(calc_slot_id(/*position=*/200,
+                         to_slice(block_table),
+                         /*block_size=*/512),
+            7 * 512 + 200);
+  EXPECT_EQ(calc_slot_id(/*position=*/511,
+                         to_slice(block_table),
+                         /*block_size=*/512),
+            7 * 512 + 511);
+  EXPECT_EQ(calc_slot_id(/*position=*/512,
+                         to_slice(block_table),
+                         /*block_size=*/512),
+            9 * 512);
+  EXPECT_EQ(calc_slot_id(/*position=*/513,
+                         to_slice(block_table),
+                         /*block_size=*/512),
+            9 * 512 + 1);
+  EXPECT_EQ(calc_slot_id(/*position=*/200,
+                         to_slice(block_table),
+                         /*block_size=*/128),
+            9 * 128 + 72);
+}
+
 TEST(SpecDecodeInputBuilderTest, CalcRingSlotIdWrapsSlidingWindowBlocks) {
   std::vector<int32_t> block_table = {7, 9};
 

@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
+#include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/model/model_args.h"
@@ -111,10 +112,7 @@ IndexCacheFootprint estimate_index_cache_footprint(
         << "KPool cache layouts do not support indexer_cache_dtype=\"int8\".";
     CHECK_GT(model_args.index_kpool(), 0) << "KPool requires index_kpool > 0.";
   }
-  int64_t replication_factor = 1;
-  if (Platform::requires_dsa_indexer_cache_replication()) {
-    replication_factor = util::kv_split_size_effective();
-  }
+  const int64_t replication_factor = indexer_pages_per_block();
   if (enable_indexer_cache_quantization) {
     // int8 index cache: one byte per element, plus an independent per-token
     // fp32 scale (kept separate from the main-KV scale_slot_size path).

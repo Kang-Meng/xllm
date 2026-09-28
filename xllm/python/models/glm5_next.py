@@ -1030,7 +1030,11 @@ class Glm5NextIndexer(nn.Module):
             self.index_kpool,
             return_value=False,
             actual_seq_k=actual_seq_k,
-            block_table=fused_block_table.to(dtype=torch.int32).contiguous(),
+            # The DCP-expanded indexer table carries -1 for logical blocks that are not
+            # backed by a page. The dense read path clamps those entries
+            # (glm5_next_kpool.py), while forwarding -1 to the kernel makes it address a
+            # huge page id and silently returns wrong top-k sets.
+            block_table=fused_block_table.clamp(min=0).to(dtype=torch.int32).contiguous(),
             mask_mode=3,
             layout_k="PA_BBND",
         )
@@ -1216,7 +1220,10 @@ class Glm5NextIndexer(nn.Module):
                 (pool_anchor[:, None, :] <= q_pos[:, :, None]) & kv_ok[:, None, :] & attention_mask[:, :, None]
             )  # [B, seq_len, n_pools]
             candidate_valid = (pool_visible & pool_valid[:, None]).to(torch.bool)
-            pool_scores = pool_scores.masked_fill(~candidate_valid, torch.finfo(pool_scores.dtype).min)
+            # In-place: pool_scores is only read for its last dim and by the topk below,
+            # so masking a fresh copy just wastes a second [B, seq_len, n_pools] fp32
+            # buffer (up to ~2 GiB per indexer layer at 1M-token contexts).
+            pool_scores.masked_fill_(~candidate_valid, torch.finfo(pool_scores.dtype).min)
         else:
             candidate_valid = pool_valid[:, None].expand(batch_size, seq_len, -1).to(torch.bool)
 
