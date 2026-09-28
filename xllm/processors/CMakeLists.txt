@@ -35,6 +35,7 @@ cc_library(
     processors
   HDRS
     transforms.h
+    audio_utils.h
     cacheable_multimodal_processor.h
     multimodal_processor.h
     audio_processor.h
@@ -55,8 +56,12 @@ cc_library(
     qwen2_vl_prompt_processor.h
     qwen2_vl_image_processor.h
     qwen2_vl_video_processor.h
+    qwen3_omni_video_processor.h
+    qwen3_omni_image_processor.h
     qwen3_vl_prompt_processor.h
     qwen3_vl_video_processor.h
+    qwen3_omni_audio_processor.h
+    qwen3_omni_prompt_processor.h
     video_processor.h
   SRCS
     transforms.cpp
@@ -77,8 +82,12 @@ cc_library(
     qwen2_vl_prompt_processor.cpp
     qwen2_vl_image_processor.cpp
     qwen2_vl_video_processor.cpp
+    qwen3_omni_video_processor.cpp
+    qwen3_omni_image_processor.cpp
     qwen3_vl_prompt_processor.cpp
     qwen3_vl_video_processor.cpp
+    qwen3_omni_audio_processor.cpp
+    qwen3_omni_prompt_processor.cpp
   DEPS
     ${BASE_DEPS}
 )

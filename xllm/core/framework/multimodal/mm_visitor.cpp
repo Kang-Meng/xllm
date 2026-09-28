@@ -86,13 +86,19 @@ bool MMInputGatherVisitor::visit(const MMInputItem& item) {
   }
   if (item.has_type(MMType::VIDEO)) {
     data_type_ |= MMType::VIDEO;
-    item_types_.push_back(MMType::VIDEO);
+    uint32_t item_type = MMType::VIDEO;
+    if (item.has_type(MMType::AUDIO)) {
+      item_type |= MMType::AUDIO;
+    }
+    item_types_.push_back(item_type);
     videos_.push_back(item.decode_video);
     video_metadata_.push_back(item.video_meta);
   }
   if (item.has_type(MMType::AUDIO)) {
     data_type_ |= MMType::AUDIO;
-    item_types_.push_back(MMType::AUDIO);
+    if (!item.has_type(MMType::VIDEO)) {
+      item_types_.push_back(MMType::AUDIO);
+    }
     audios_.push_back(item.decode_audio);
     audio_metadata_.push_back(item.audio_meta);
   }
@@ -123,7 +129,17 @@ MMItemVec MMInputGatherVisitor::finish(std::vector<MMDataItem>& image_items,
     } else if (item_type & MMType::IMAGE) {
       take_next(image_items, image_idx);
     } else if (item_type & MMType::VIDEO) {
-      take_next(video_items, video_idx);
+      CHECK(video_idx < video_items.size())
+          << "Multimodal item count does not match input.";
+      MMDataItem video_item = std::move(video_items[video_idx++]);
+      if (item_type & MMType::AUDIO) {
+        CHECK(audio_idx < audio_items.size())
+            << "Multimodal item count does not match input.";
+        for (auto& [key, value] : audio_items[audio_idx++].mutable_data()) {
+          video_item.mutable_data()[key] = std::move(value);
+        }
+      }
+      output_items.push_back(std::move(video_item));
     } else if (item_type & MMType::AUDIO) {
       take_next(audio_items, audio_idx);
     } else {

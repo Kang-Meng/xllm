@@ -61,6 +61,10 @@ class ModelConfig final {
          "enable_return_embedding_modality_tags",
          "python_model_path",
          "limit_image_per_prompt",
+         "image_max_tokens_num",
+         "fps_min_frames",
+         "fps_max_frames",
+         "video_max_token_num",
          "max_encoder_cache_size",
          "max_processor_cache_items",
          "reasoning_parser",
@@ -95,6 +99,10 @@ class ModelConfig final {
   PROPERTY(bool, enable_return_embedding_modality_tags) = false;
 
   PROPERTY(int32_t, limit_image_per_prompt) = 8;
+  PROPERTY(int32_t, image_max_tokens_num) = 0;
+  PROPERTY(int32_t, fps_min_frames) = 4;
+  PROPERTY(int32_t, fps_max_frames) = 768;
+  PROPERTY(int32_t, video_max_token_num) = -1;
 
   PROPERTY(int64_t, max_encoder_cache_size) = 0;
 

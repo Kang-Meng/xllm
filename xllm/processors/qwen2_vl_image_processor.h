@@ -25,7 +25,7 @@ limitations under the License.
 
 namespace xllm {
 
-class Qwen2VLImageProcessor final : public ImageProcessor {
+class Qwen2VLImageProcessor : public ImageProcessor {
  public:
   explicit Qwen2VLImageProcessor(const ModelArgs& args);
 
@@ -36,6 +36,17 @@ class Qwen2VLImageProcessor final : public ImageProcessor {
                      std::vector<torch::Tensor>& pixel_values,
                      std::vector<torch::Tensor>& thw) const;
 
+ protected:
+  // per-token resize budget (token units). When both are > 0 the
+  // token-budget smart_resize is used; otherwise the legacy pixel-budget path.
+  int32_t max_pixels_ = 12845056;
+  int32_t min_pixels_ = 3136;
+
+  // patch geometry shared with subclasses (e.g. Qwen3OmniImageProcessor) that
+  // convert a token budget into pixel bounds in their constructor.
+  int32_t merge_size_ = 2;
+  int32_t patch_size_ = 14;
+
  private:
   bool do_convert_rgb_ = true;
   bool do_normalize_ = true;
@@ -45,16 +56,8 @@ class Qwen2VLImageProcessor final : public ImageProcessor {
   torch::Tensor image_mean_;
   torch::Tensor image_std_;
 
-  int32_t max_pixels_ = 12845056;
-  int32_t min_pixels_ = 3136;
-
-  // per-token resize budget (token units). When both are > 0 the
-  // token-budget smart_resize is used; otherwise the legacy pixel-budget path.
   int32_t min_tokens_ = 0;
   int32_t max_tokens_ = 0;
-
-  int32_t merge_size_ = 2;
-  int32_t patch_size_ = 14;
 
   int32_t resample_ = 3;
   double rescale_factor_ = 0.00392156862745098;

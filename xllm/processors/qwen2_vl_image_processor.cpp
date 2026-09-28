@@ -22,6 +22,10 @@ limitations under the License.
 //  to Python compiles but fails at runtime:
 //  "Unable to convert call argument to Python object")
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 

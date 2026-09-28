@@ -78,6 +78,17 @@ class Qwen3VLMPositionGenerator final : public MPositionGenerator {
       const ModelArgs& model_args) const override;
 };
 
+// Position generator for the Qwen3-Omni-Thinker. Builds 3-D (T, H, W) M-RoPE
+// position ids for text/image/video/audio tokens, including the audio-in-video
+// interleaving case. Ports `get_positions_omni` from the old framework.
+class Qwen3OmniMPositionGenerator final : public MPositionGenerator {
+ public:
+  std::tuple<torch::Tensor, int32_t> generate(
+      Slice<int32_t> tokens,
+      const MMData& mm_data,
+      const ModelArgs& model_args) const override;
+};
+
 class Glm4VMPositionGenerator final : public MPositionGenerator {
  public:
   std::tuple<torch::Tensor, int32_t> generate(

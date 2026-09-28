@@ -69,6 +69,28 @@ DEFINE_int32(limit_image_per_prompt,
              "Maximum number of image per prompt. Only applicable for "
              "multimodal models.");
 
+DEFINE_int32(image_max_tokens_num,
+             0,
+             "Maximum image tokens used by image preprocessing. The "
+             "pixel budget is this value multiplied by "
+             "(patch_size * merge_size)^2. Zero uses the model's configured "
+             "max_pixels.");
+DEFINE_int32(fps_min_frames,
+             4,
+             "Minimum number of frames sampled from a video when sampling "
+             "with fps (qwen_omni_utils FPS_MIN_FRAMES). Only applicable for "
+             "Qwen omni-series multimodal models.");
+DEFINE_int32(fps_max_frames,
+             768,
+             "Maximum number of frames sampled from a video when sampling "
+             "with fps (qwen_omni_utils FPS_MAX_FRAMES). Only applicable for "
+             "Qwen omni-series multimodal models.");
+DEFINE_int32(video_max_token_num,
+             -1,
+             "Per-frame token budget for video frames; the pixel budget is "
+             "video_max_token_num * (patch_size * merge_size)^2. -1 uses "
+             "video_max_pixels from the model configuration.");
+
 DEFINE_int64(max_encoder_cache_size,
              0,
              "Max gpu/npu memory size in MB for encoder cache per worker. "
@@ -165,6 +187,10 @@ void ModelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(capture_hidden_state_layer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_return_embedding_modality_tags);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(limit_image_per_prompt);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(image_max_tokens_num);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(fps_min_frames);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(fps_max_frames);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(video_max_token_num);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_encoder_cache_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_processor_cache_items);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(reasoning_parser);
@@ -234,6 +260,10 @@ void ModelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(capture_hidden_state_layer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_return_embedding_modality_tags);
   XLLM_CONFIG_ASSIGN_FROM_JSON(limit_image_per_prompt);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(image_max_tokens_num);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(fps_min_frames);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(fps_max_frames);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(video_max_token_num);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_encoder_cache_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_processor_cache_items);
   XLLM_CONFIG_ASSIGN_FROM_JSON(reasoning_parser);
@@ -266,6 +296,14 @@ void ModelConfig::append_config_json(
       config_json, default_config, enable_return_embedding_modality_tags);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, limit_image_per_prompt);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, image_max_tokens_num);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, fps_min_frames);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, fps_max_frames);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, video_max_token_num);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, max_encoder_cache_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

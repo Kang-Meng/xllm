@@ -1071,6 +1071,23 @@ void validate_config(const std::string& model_type) {
   if (model_config.max_processor_cache_items() < 0) {
     LOG(FATAL) << "max_processor_cache_items must be >= 0.";
   }
+  if (model_config.image_max_tokens_num() < 0) {
+    LOG(FATAL) << "image_max_tokens_num must be >= 0.";
+  }
+  if (model_config.fps_min_frames() < 0) {
+    LOG(FATAL) << "fps_min_frames must be >= 0.";
+  }
+  if (model_config.fps_max_frames() < 0) {
+    LOG(FATAL) << "fps_max_frames must be >= 0.";
+  }
+  if (model_config.fps_max_frames() < model_config.fps_min_frames()) {
+    LOG(FATAL) << "fps_max_frames must be greater than or equal to "
+                  "fps_min_frames.";
+  }
+  if (model_config.video_max_token_num() == 0 ||
+      model_config.video_max_token_num() < -1) {
+    LOG(FATAL) << "video_max_token_num must be -1 or greater than 0.";
+  }
 #if defined(USE_MLU)
   // Disable enable_schedule_overlap for VLM models on MLU backend
   if (scheduler_config.enable_schedule_overlap() &&

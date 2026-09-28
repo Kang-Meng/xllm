@@ -1366,6 +1366,10 @@ bool HFModelLoader::load_video_preprocessor_args(
       model_weights_path + "/video_preprocessor_config.json";
   const std::string nested_file_path =
       model_weights_path + "/processor_config.json";
+  // Qwen3-Omni keeps video fields (video_max_pixels, ...) in the flat
+  // preprocessor_config.json instead of a dedicated video preprocessor file.
+  const std::string omni_file_path =
+      model_weights_path + "/preprocessor_config.json";
   bool parsed = false;
   std::string used_file_path;
   if (video_preprocess_reader.parse(flat_file_path)) {
@@ -1375,6 +1379,9 @@ bool HFModelLoader::load_video_preprocessor_args(
     // GLM-5.3-Flash nests video fields under ``video_processor``.
     parsed = true;
     used_file_path = nested_file_path;
+  } else if (video_preprocess_reader.parse(omni_file_path)) {
+    parsed = true;
+    used_file_path = omni_file_path;
   }
   if (parsed) {
     LOG(INFO) << "Success to parse video preprocess args file: "
@@ -1429,6 +1436,9 @@ bool HFModelLoader::load_video_preprocessor_args(
     // the token-budget smart_resize is used.
     args_.mm_video_min_tokens() = field_int("min_image_tokens", 0);
     args_.mm_video_max_tokens() = field_int("max_image_tokens", 0);
+
+    // Qwen3-Omni per-frame pixel budget for video (pixel units).
+    args_.mm_video_max_pixels() = field_int("video_max_pixels", 0);
   }
 
   return true;
@@ -1505,6 +1515,31 @@ bool HFModelLoader::load_audio_preprocessor_args(
   if (auto v = field_double_vec("inverse_std_variences")) {
     args_.mm_audio_cmvn_inverse_std() = std::move(*v);
   }
+  // Qwen3-Omni whisper feature-extraction params (same
+  // preprocessor_config.json family).
+  args_.mm_audio_feature_size() =
+      audio_preprocess_reader.value_or<int64_t>("feature_size", 80);
+
+  args_.mm_audio_hop_length() =
+      audio_preprocess_reader.value_or<int64_t>("hop_length", 160);
+
+  args_.mm_audio_chunk_length() =
+      audio_preprocess_reader.value_or<int64_t>("chunk_length", 300);
+
+  args_.mm_audio_n_fft() =
+      audio_preprocess_reader.value_or<int64_t>("n_fft", 400);
+
+  args_.mm_audio_padding_value() =
+      audio_preprocess_reader.value_or<double>("padding_value", 0.0);
+
+  args_.mm_audio_dither() =
+      audio_preprocess_reader.value_or<double>("dither", 0.0);
+
+  args_.mm_audio_return_attention_mask() =
+      audio_preprocess_reader.value_or<bool>(
+          "return_attention_mask",
+          static_cast<bool>(args_.mm_audio_return_attention_mask()));
+
   return true;
 }
 

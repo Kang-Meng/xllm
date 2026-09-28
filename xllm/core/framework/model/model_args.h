@@ -371,6 +371,44 @@ struct ModelArgs {
   PROPERTY(int, mm_tokens_per_second) = 0;
   PROPERTY(int, mm_temporal_patch_size) = 0;
 
+  // qwen3_omni_moe_thinker related args
+
+  // qwen3_omni qwen2vl video processor args
+  PROPERTY(int64_t, mm_position_id_per_seconds) = 0;
+  PROPERTY(double, mm_fps) = 0;
+
+  // qwen3_omni whisper processor related args
+  PROPERTY(bool, mm_use_audio_in_video) = false;
+  PROPERTY(int64_t, mm_audio_feature_size) = 0;
+  PROPERTY(int64_t, mm_audio_hop_length) = 0;
+  PROPERTY(int64_t, mm_audio_chunk_length) = 0;
+  PROPERTY(int64_t, mm_audio_n_fft) = 0;
+  PROPERTY(double, mm_audio_padding_value) = 0.0;
+  PROPERTY(double, mm_audio_dither) = 0.0;
+  PROPERTY(bool, mm_audio_return_attention_mask) = false;
+  PROPERTY(std::string, mm_audio_padding_side) = "right";
+
+  PROPERTY(bool, mm_audio_truncation) = false;
+  PROPERTY(int64_t, mm_audio_padding_strategy) = 0;
+  PROPERTY(int64_t, mm_audio_max_length) = 0;
+  PROPERTY(int64_t, mm_audio_pad_to_multiple_of) = 0;
+  PROPERTY(bool, mm_audio_do_normalize) = false;
+  PROPERTY(bool, mm_audio_return_token_timestamps) = false;
+
+  // qwen3_omni audio encoder related args
+  PROPERTY(int32_t, audio_start_token_id) = 0;
+  PROPERTY(int32_t, audio_end_token_id) = 0;
+  PROPERTY(int64_t, mm_audio_num_attention_heads) = 0;
+  PROPERTY(int64_t, mm_audio_hidden_size) = 0;
+  PROPERTY(int64_t, mm_audio_downsample_hidden_size) = 0;
+  PROPERTY(int64_t, mm_audio_max_source_positions) = 0;
+  PROPERTY(bool, mm_audio_scale_embedding) = false;
+  PROPERTY(int64_t, mm_audio_n_window) = 0;
+  PROPERTY(int64_t, mm_audio_n_window_infer) = 0;
+  PROPERTY(int64_t, mm_audio_conv_chunksize) = 0;
+  PROPERTY(int64_t, mm_audio_encoder_layers) = 0;
+  PROPERTY(int64_t, mm_audio_output_dim) = 0;
+
   // VLM model projector's mm_projector_type
   PROPERTY(std::string, mm_projector_type);
 
@@ -461,6 +499,11 @@ struct ModelArgs {
   // GLM-5.3-Flash per-token resize budget for video (see mm_image_*).
   PROPERTY(int, mm_video_min_tokens) = 0;
   PROPERTY(int, mm_video_max_tokens) = 0;
+
+  // Qwen3-Omni per-frame pixel budget for video, loaded from
+  // preprocessor_config.json (video_max_pixels). When > 0 it overrides the
+  // default VIDEO_MAX_TOKEN_NUM * factor^2 budget in the omni video processor.
+  PROPERTY(int64_t, mm_video_max_pixels) = 0;
 
   PROPERTY(int, mm_image_feature_size) = 0;
   PROPERTY(int, mm_scale_resolution) = 0;
@@ -933,6 +976,7 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", mm_video_merge_size: " << args.mm_video_merge_size();
   os << ", mm_video_min_tokens: " << args.mm_video_min_tokens();
   os << ", mm_video_max_tokens: " << args.mm_video_max_tokens();
+  os << ", mm_video_max_pixels: " << args.mm_video_max_pixels();
   os << ", mm_pad_token_id: " << args.mm_pad_token_id();
   os << ", tie_word_embeddings: " << args.tie_word_embeddings();
   os << ", use_sliding_window: " << args.use_sliding_window();

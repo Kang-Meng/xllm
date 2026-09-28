@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/message.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
 #include "core/framework/multimodal/mm_visitor.h"

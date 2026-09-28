@@ -198,6 +198,15 @@ class MemoryMediaReader {
       return false;
     }
 
+    for (uint32_t i = 0; i < fmt_ctx_->nb_streams; ++i) {
+      AVStream* stream = fmt_ctx_->streams[i];
+      if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+          !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+        has_video_stream_ = true;
+        break;
+      }
+    }
+
     stream_index_ = av_find_best_stream(fmt_ctx_, type, -1, -1, nullptr, 0);
     if (stream_index_ < 0) {
       return false;
@@ -271,6 +280,7 @@ class MemoryMediaReader {
   AVFrame* frm_ = nullptr;
   MemCtx mc_{nullptr, 0, 0};
   int32_t stream_index_ = -1;
+  bool has_video_stream_ = false;
 };
 
 class MemoryVideoReader : public MemoryMediaReader {
@@ -451,9 +461,10 @@ class MemoryAudioReader : public MemoryMediaReader {
     av_channel_layout_uninit(&out_layout);
     av_channel_layout_uninit(&in_layout);
 
-    // if downmixing stereo -> mono, use customized remix matrix (L+R)/2
+    // Preserve explicit averaging for standalone audio; use FFmpeg for video
+    // audio.
     int32_t in_ch = codec_ctx_->ch_layout.nb_channels;
-    if (target_ch_ == 1 && in_ch == 2) {
+    if (target_ch_ == 1 && in_ch == 2 && !has_video_stream_) {
       constexpr double matrix[2] = {0.5, 0.5};
       if (swr_set_matrix(swr_ctx_, matrix, in_ch) < 0) {
         return false;

@@ -42,6 +42,7 @@ inline constexpr std::string_view kInlineConfig = R"json({
   "max_tokens_per_batch": 8192,
   "max_seqs_per_batch": 64,
   "model_impl": "py",
+  "image_max_tokens_num": 384,
   "disable_graph_warmup": true,
   "python_graph_backend": "cudagraphs",
   "enable_fia_decode": true
@@ -115,6 +116,7 @@ class ConfigFlagGuard final {
         old_max_tokens_per_batch_(FLAGS_max_tokens_per_batch),
         old_max_seqs_per_batch_(FLAGS_max_seqs_per_batch),
         old_model_impl_(FLAGS_model_impl),
+        old_image_max_tokens_num_(FLAGS_image_max_tokens_num),
         old_python_model_path_(FLAGS_python_model_path),
         old_disable_graph_warmup_(FLAGS_disable_graph_warmup),
         old_python_graph_backend_(FLAGS_python_graph_backend),
@@ -127,6 +129,7 @@ class ConfigFlagGuard final {
     FLAGS_max_tokens_per_batch = old_max_tokens_per_batch_;
     FLAGS_max_seqs_per_batch = old_max_seqs_per_batch_;
     FLAGS_model_impl = old_model_impl_;
+    FLAGS_image_max_tokens_num = old_image_max_tokens_num_;
     FLAGS_python_model_path = old_python_model_path_;
     FLAGS_disable_graph_warmup = old_disable_graph_warmup_;
     FLAGS_python_graph_backend = old_python_graph_backend_;
@@ -140,6 +143,7 @@ class ConfigFlagGuard final {
   int32_t old_max_tokens_per_batch_;
   int32_t old_max_seqs_per_batch_;
   std::string old_model_impl_;
+  int32_t old_image_max_tokens_num_;
   std::string old_python_model_path_;
   bool old_disable_graph_warmup_;
   std::string old_python_graph_backend_;
@@ -154,6 +158,7 @@ class StartupConfigGuard final {
         kv_cache_config_(KVCacheConfig::get_instance()),
         scheduler_config_(SchedulerConfig::get_instance()),
         old_model_impl_(model_config_.model_impl()),
+        old_image_max_tokens_num_(model_config_.image_max_tokens_num()),
         old_python_model_path_(model_config_.python_model_path()),
         old_python_graph_backend_(execution_config_.python_graph_backend()),
         old_enable_fia_decode_(execution_config_.enable_fia_decode()),
@@ -166,6 +171,7 @@ class StartupConfigGuard final {
 
   ~StartupConfigGuard() {
     model_config_.model_impl(old_model_impl_)
+        .image_max_tokens_num(old_image_max_tokens_num_)
         .python_model_path(old_python_model_path_);
     execution_config_.python_graph_backend(old_python_graph_backend_)
         .enable_fia_decode(old_enable_fia_decode_);
@@ -182,6 +188,7 @@ class StartupConfigGuard final {
   KVCacheConfig& kv_cache_config_;
   SchedulerConfig& scheduler_config_;
   std::string old_model_impl_;
+  int32_t old_image_max_tokens_num_;
   std::string old_python_model_path_;
   std::string old_python_graph_backend_;
   bool old_enable_fia_decode_;
@@ -281,6 +288,7 @@ TEST(ConfigJsonTest, FromJsonUsesParsedOverrides) {
   // recognized via is_python_model_impl(). from_json still mirrors it into the
   // matching gflag.
   EXPECT_EQ(model_config.model_impl(), "py");
+  EXPECT_EQ(model_config.image_max_tokens_num(), 384);
   EXPECT_TRUE(ModelConfig::is_python_model_impl(model_config.model_impl()));
   // model and python_model_path are command-line-only: from_json neither reads
   // them nor touches their gflags, so both keep their pre-call values.
@@ -672,8 +680,10 @@ TEST(ConfigJsonTest, DumpStartupConfigWritesNonDefaultValuesOnly) {
   DumpConfigJsonFlagGuard flag_guard(dump_path.string());
   StartupConfigGuard startup_config_guard;
 
-  ModelConfig::get_instance().model_impl("python").python_model_path(
-      "/tmp/xllm-python-model");
+  ModelConfig::get_instance()
+      .model_impl("python")
+      .image_max_tokens_num(384)
+      .python_model_path("/tmp/xllm-python-model");
   ExecutionConfig::get_instance()
       .python_graph_backend("cudagraphs")
       .enable_fia_decode(true);
@@ -689,6 +699,7 @@ TEST(ConfigJsonTest, DumpStartupConfigWritesNonDefaultValuesOnly) {
   ASSERT_TRUE(std::filesystem::exists(dump_path));
   const nlohmann::ordered_json config_json = read_json_file(dump_path);
   EXPECT_EQ(config_json.at("model_impl").get<std::string>(), "python");
+  EXPECT_EQ(config_json.at("image_max_tokens_num").get<int32_t>(), 384);
   EXPECT_EQ(config_json.at("python_graph_backend").get<std::string>(),
             "cudagraphs");
   EXPECT_TRUE(config_json.at("enable_fia_decode").get<bool>());
