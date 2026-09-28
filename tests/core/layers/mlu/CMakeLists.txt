@@ -57,6 +57,7 @@ cc_test(
     glm5_next_decoder_layer_test
   SRCS
     glm5_next_decoder_layer_test.cpp
+    tests_utils.cpp
   DEPS
     :config
     :mlu_layers
@@ -233,6 +234,24 @@ cc_test(
     glog::glog
     torch
     GTest::gtest_main
+)
+
+# Isolate forked CNCL ranks from tests that initialize MLU in the parent.
+cc_test(
+  NAME
+    deepseek_v4_sparse_moe_collective_test
+  SRCS
+    deepseek_v4_sparse_moe_collective_test.cpp
+  DEPS
+    :config
+    :mlu_layers
+    :common_layers
+    :parallel_state
+    :state_dict
+    :util
+    GTest::gtest_main
+    torch
+    glog::glog
 )
 
 # Add test for DeepEP

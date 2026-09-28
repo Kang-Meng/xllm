@@ -20,6 +20,7 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -182,19 +183,19 @@ void expect_sparse_kda_matches_reference(
     const std::vector<int32_t>& sequence_lengths,
     const std::vector<int32_t>& accepted_counts,
     bool inplace_final_state,
-    bool include_invalid_slots) {
+    bool include_invalid_slots,
+    int64_t checkpoint_capacity = 4) {
   ASSERT_EQ(sequence_lengths.size(), accepted_counts.size());
   torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
   torch::manual_seed(20260908);
 
-  constexpr int64_t kCheckpointCapacity = 4;
   constexpr int64_t kNumHeads = 8;
   constexpr int64_t kHeadDim = 128;
   constexpr float kGateLowerBound = -5.0f;
   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
   const int64_t batch_size = static_cast<int64_t>(sequence_lengths.size());
-  const int64_t state_slots = batch_size * kCheckpointCapacity + 1;
+  const int64_t state_slots = batch_size * checkpoint_capacity + 1;
   std::vector<int32_t> offsets;
   offsets.reserve(sequence_lengths.size() + 1);
   offsets.emplace_back(0);
@@ -218,7 +219,7 @@ void expect_sparse_kda_matches_reference(
       torch::randn({state_slots, kNumHeads, kHeadDim, kHeadDim}, fp32_options) *
       0.05;
   auto state_indices_cpu = torch::arange(1, state_slots, int_options)
-                               .view({batch_size, kCheckpointCapacity});
+                               .view({batch_size, checkpoint_capacity});
   if (include_invalid_slots) {
     ASSERT_TRUE(inplace_final_state);
     ASSERT_GE(batch_size, 3);
@@ -229,6 +230,14 @@ void expect_sparse_kda_matches_reference(
     state_indices_cpu.select(/*dim=*/0, /*index=*/batch_size - 1)
         .select(/*dim=*/0, /*index=*/0)
         .zero_();
+    if (checkpoint_capacity > 4) {
+      // A missing checkpoint at the end of the first token window must not
+      // reset the recurrence feeding the next window.
+      ASSERT_NE(accepted_counts.back(), 4);
+      state_indices_cpu.select(/*dim=*/0, /*index=*/batch_size - 1)
+          .select(/*dim=*/0, /*index=*/3)
+          .zero_();
+    }
   }
 
   auto expected_out_cpu = torch::zeros_like(v_cpu);
@@ -363,6 +372,38 @@ TEST(FusedSigmoidUpdateTest,
                                       {1, 4, 2, 3, 4},
                                       /*inplace_final_state=*/false,
                                       /*include_invalid_slots=*/false);
+}
+
+TEST(FusedSigmoidUpdateTest,
+     GroupedKdaBatchPreservesPaddingAndAcceptedCheckpoints) {
+  std::vector<int32_t> sequence_lengths(32, 4);
+  std::vector<int32_t> accepted_counts(32, 2);
+  sequence_lengths[0] = 0;
+  sequence_lengths[1] = 1;
+  sequence_lengths[2] = 3;
+  accepted_counts[1] = 4;
+  // The last two rows cover a fully padded state and a missing destination
+  // checkpoint while retaining a valid accepted state, respectively.
+  expect_sparse_kda_matches_reference(sequence_lengths,
+                                      accepted_counts,
+                                      /*inplace_final_state=*/true,
+                                      /*include_invalid_slots=*/true);
+}
+
+TEST(FusedSigmoidUpdateTest, LongCheckpointsSurviveNullWindowBoundaries) {
+  expect_sparse_kda_matches_reference({5, 8, 6},
+                                      {5, 8, 2},
+                                      /*inplace_final_state=*/true,
+                                      /*include_invalid_slots=*/true,
+                                      /*checkpoint_capacity=*/8);
+}
+
+TEST(FusedSigmoidUpdateTest, NonInplaceLongQueriesIgnoreCheckpointCapacity) {
+  expect_sparse_kda_matches_reference({5, 9, 6},
+                                      {1, 1, 1},
+                                      /*inplace_final_state=*/false,
+                                      /*include_invalid_slots=*/false,
+                                      /*checkpoint_capacity=*/1);
 }
 
 TEST(FusedSigmoidUpdateTest, EmptyKdaBatchPreservesInputState) {
@@ -551,6 +592,23 @@ TEST(FusedSigmoidUpdateTest, CompileHintsSeparateKernelCacheEntries) {
   const triton_jit::LaunchCfg mv_cfg{1, 4, "mv"};
   EXPECT_NE(triton_jit::serialize_key(specs, default_cfg, /*device=*/0),
             triton_jit::serialize_key(specs, mv_cfg, /*device=*/0));
+  triton_jit::LaunchCfg collapse_enabled_cfg = default_cfg;
+  collapse_enabled_cfg.disable_trans_collapse_pass = false;
+  triton_jit::LaunchCfg collapse_disabled_cfg = default_cfg;
+  collapse_disabled_cfg.disable_trans_collapse_pass = true;
+  const std::string default_key =
+      triton_jit::serialize_key(specs, default_cfg, /*device=*/0);
+  const std::string enabled_key =
+      triton_jit::serialize_key(specs, collapse_enabled_cfg, /*device=*/0);
+  const std::string disabled_key =
+      triton_jit::serialize_key(specs, collapse_disabled_cfg, /*device=*/0);
+  EXPECT_NE(default_key, enabled_key);
+  EXPECT_NE(default_key, disabled_key);
+  EXPECT_NE(enabled_key, disabled_key);
+  collapse_disabled_cfg.disable_trans_collapse_pass = std::nullopt;
+  EXPECT_EQ(
+      default_key,
+      triton_jit::serialize_key(specs, collapse_disabled_cfg, /*device=*/0));
 }
 
 TEST(FusedSigmoidUpdateTest, PersistentKdaBatchesMatchFp32Checkpoints) {

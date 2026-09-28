@@ -57,6 +57,24 @@ int64_t choose_block_hv(int64_t num_k_heads,
   return heads_per_query;
 }
 
+int64_t choose_kda_head_group(int64_t num_sequences,
+                              int64_t num_heads,
+                              int64_t core_count) {
+  int64_t best_group = num_heads;
+  int64_t best_work =
+      ((num_sequences + core_count - 1) / core_count) * num_heads;
+  // Equal work prefers larger contiguous head tiles, reducing fragmented IO.
+  for (int64_t group = num_heads / 2; group > 0; group /= 2) {
+    int64_t jobs = num_sequences * (num_heads / group);
+    int64_t work = ((jobs + core_count - 1) / core_count) * group;
+    if (work < best_work) {
+      best_group = group;
+      best_work = work;
+    }
+  }
+  return best_group;
+}
+
 }  // namespace
 
 using xllm::triton_jit::JITKernel;
@@ -205,11 +223,26 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
   CHECK(prop != nullptr);
   int64_t core_count = prop->cluster_count * prop->core_num_per_cluster;
 
+  // Small batches need more independent tiles. Low checkpoint-slot occupancy
+  // also benefits from scheduling heads separately. Occupancy only selects a
+  // kernel; token boundaries always come from query_start_loc on the device.
+  const bool sparse_checkpoints =
+      num_accepted_tokens_opt.has_value() && state_indices.dim() == 2 &&
+      state_indices.size(1) > 1 &&
+      batch_size * seq_len * 4 < num_sequences * state_indices.size(1) * 3;
   const bool use_glm_kda =
       is_kda && kda_use_safe_gate && use_qk_l2norm_in_kernel &&
       ssm_state_indices.defined() && num_k_heads == 8 && num_v_heads == 8 &&
       head_k_dim == 128 && head_v_dim == 128 && initial_state.is_contiguous() &&
       A_log.is_contiguous() && dt_bias.is_contiguous();
+  // The table capacity is a bound only for a legal in-place 2D table.
+  // CU boundaries still determine each sequence's actual recurrence length.
+  const bool explicit_index_table =
+      ssm_state_indices.defined() && state_indices.dim() == 2;
+  const int64_t checkpoint_capacity =
+      explicit_index_table ? state_indices.size(1) : 0;
+  const bool bounded_glm_query = inplace_final_state && explicit_index_table &&
+                                 checkpoint_capacity <= kBlockQueryLen;
   const bool glm_fp32_state = q.scalar_type() == torch::kBFloat16 &&
                               k.scalar_type() == torch::kBFloat16 &&
                               v.scalar_type() == torch::kBFloat16 &&
@@ -218,18 +251,213 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
                               initial_state.scalar_type() == torch::kFloat32 &&
                               A_log.scalar_type() == torch::kFloat32 &&
                               dt_bias.scalar_type() == torch::kFloat32;
-  if (use_glm_kda && glm_fp32_state) {
-    constexpr int32_t kDirectBlockV = 128;
-    const int64_t direct_tiles = num_sequences * num_v_heads;
+  // Preserve the existing generic dtype paths; these schedules are tuned for
+  // BF16 inputs with FP32 recurrent state and gate parameters.
+  const bool use_optimized_glm_kda = use_glm_kda && glm_fp32_state;
+  // Four checkpoint slots bound every legal packed row to at most four
+  // tokens. CU lengths remain device inputs, including empty graph rows.
+  // Short rows and NULL slots are masked inside the chunk kernel.
+  const bool use_chunk_glm_kda =
+      use_optimized_glm_kda && inplace_final_state &&
+      num_accepted_tokens_opt.has_value() && explicit_index_table &&
+      checkpoint_capacity == kBlockQueryLen && num_sequences >= 5 &&
+      batch_size * seq_len == num_sequences * kBlockQueryLen &&
+      kda_gate_lower_bound == -5.0f;
+  if (use_chunk_glm_kda) {
+    constexpr int32_t kChunkWorkers = 32;
+    const int64_t chunk_tiles = num_sequences * num_v_heads;
+    triton_jit::LaunchCfg chunk_cfg;
+    chunk_cfg.num_warps = 1;
+    chunk_cfg.num_stages = 5;
+    chunk_cfg.force_use_shared_memory = true;
+    chunk_cfg.disable_trans_collapse_pass = true;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    JITKernel::get("xllm.core.kernels.mlu.triton_kernel.fused_recurrent_kda",
+                   "fused_chunk_kda_decode_kernel")
+        .launch(static_cast<void*>(queue),
+                {static_cast<uint32_t>(
+                     std::min<int64_t>(chunk_tiles, kChunkWorkers)),
+                 1,
+                 1},
+                chunk_cfg,
+                q,
+                k,
+                v,
+                a,
+                b,
+                out,
+                initial_state,
+                query_start_loc,
+                state_indices,
+                num_accepted_tokens,
+                A_log,
+                dt_bias,
+                /*scale=*/static_cast<float>(scale),
+                /*N=*/static_cast<int32_t>(num_sequences),
+                /*TOTAL_TOKENS=*/static_cast<int32_t>(batch_size * seq_len),
+                /*H=*/static_cast<int32_t>(num_k_heads),
+                /*HV=*/static_cast<int32_t>(num_v_heads),
+                /*K=*/static_cast<int32_t>(head_k_dim),
+                /*V=*/static_cast<int32_t>(head_v_dim),
+                /*BV=*/128,
+                /*stride_state_slot=*/initial_state.stride(0),
+                /*stride_indices_seq=*/stride_indices_seq,
+                /*stride_indices_tok=*/stride_indices_tok,
+                /*LOWER_BOUND=*/kda_gate_lower_bound);
+    return std::make_pair(out, final_state);
+  }
+  // Keep the measured small-batch and single-token schedules. Unbounded
+  // output-state requests and longer checkpoint tables retain state across
+  // windows, including a NULL destination at a window boundary.
+  const bool use_grouped_glm_kda =
+      use_optimized_glm_kda &&
+      ((!inplace_final_state) ||
+       (explicit_index_table && checkpoint_capacity > kBlockQueryLen) ||
+       (explicit_index_table && checkpoint_capacity > 1 &&
+        num_sequences >= 32));
+  if (use_grouped_glm_kda) {
+    constexpr int32_t kGlmHeadGroup = 4;
+    constexpr int32_t kGlmBlockV = 128;
+    const int64_t glm_tiles = num_sequences * (num_v_heads / kGlmHeadGroup);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    JITKernel& glm_kernel = JITKernel::get(
+        /*py_path=*/"xllm.core.kernels.mlu.triton_kernel.fused_glm_kda_update",
+        /*fn_name=*/"fused_glm_kda_update_kernel");
+    glm_kernel.launch(
+        static_cast<void*>(queue),
+        /*grid=*/
+        {static_cast<uint32_t>(std::min(glm_tiles, core_count)), 1, 1},
+        /*cfg=*/{/*num_warps=*/1, /*num_stages=*/3},
+        A_log,
+        a,
+        b,
+        dt_bias,
+        softplus_beta,
+        softplus_threshold,
+        q,
+        k,
+        v,
+        out_storage,
+        initial_state,
+        final_state,
+        query_start_loc,
+        state_indices,
+        num_accepted_tokens_arg,
+        /*scale=*/static_cast<float>(scale),
+        /*N=*/num_sequences,
+        /*T=*/seq_len,
+        /*B=*/static_cast<int32_t>(batch_size),
+        /*H=*/static_cast<int32_t>(num_k_heads),
+        /*HV=*/static_cast<int32_t>(num_v_heads),
+        /*BLOCK_HV=*/kGlmHeadGroup,
+        /*K=*/static_cast<int32_t>(head_k_dim),
+        /*V=*/static_cast<int32_t>(head_v_dim),
+        /*BK=*/static_cast<int32_t>(head_k_dim),
+        /*BV=*/kGlmBlockV,
+        /*stride_init_state_token=*/initial_state.stride(0),
+        /*stride_final_state_token=*/final_state.stride(0),
+        /*stride_indices_seq=*/stride_indices_seq,
+        /*stride_indices_tok=*/stride_indices_tok,
+        /*USE_INITIAL_STATE=*/1,
+        /*INPLACE_FINAL_STATE=*/inplace_final_state ? 1 : 0,
+        /*USE_QK_L2NORM_IN_KERNEL=*/1,
+        /*IS_VARLEN=*/cu_seqlens.defined() ? 1 : 0,
+        /*IS_CONTINUOUS_BATCHING=*/1,
+        /*IS_SPEC_DECODING=*/num_accepted_tokens_opt.has_value() ? 1 : 0,
+        /*IS_KDA=*/1,
+        /*KDA_USE_SAFE_GATE=*/1,
+        /*KDA_GATE_LOWER_BOUND=*/kda_gate_lower_bound,
+        /*SPLIT_HV=*/1,
+        /*BLOCK_N=*/1,
+        /*BLOCK_QUERY_LEN=*/static_cast<int32_t>(kBlockQueryLen),
+        /*FACTORED_REDUCE=*/1,
+        /*BOUNDED_QUERY=*/bounded_glm_query ? 1 : 0);
+    return std::make_pair(out, final_state);
+  }
+  if (use_optimized_glm_kda && sparse_checkpoints) {
+    // Preserve the sequence/head/value grid for sparsely populated queries.
+    constexpr int32_t kBlockV = 128;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    JITKernel& kda_kernel = JITKernel::get(
+        /*py_path=*/
+        "xllm.core.kernels.mlu.triton_kernel.sparse_recurrent_kda",
+        /*fn_name=*/"sparse_recurrent_kda_kernel");
+    kda_kernel.launch(
+        static_cast<void*>(queue),
+        /*grid=*/
+        {1,
+         static_cast<uint32_t>((head_v_dim + kBlockV - 1) / kBlockV),
+         static_cast<uint32_t>(num_sequences * num_v_heads)},
+        /*cfg=*/{/*num_warps=*/1, /*num_stages=*/3},
+        q,
+        k,
+        v,
+        a,
+        b,
+        out,
+        initial_state,
+        final_state,
+        query_start_loc,
+        state_indices,
+        num_accepted_tokens_arg,
+        A_log,
+        dt_bias,
+        /*scale=*/static_cast<float>(scale),
+        /*N=*/num_sequences,
+        /*T=*/batch_size * seq_len,
+        /*B=*/static_cast<int32_t>(batch_size),
+        /*H=*/static_cast<int32_t>(num_k_heads),
+        /*HV=*/static_cast<int32_t>(num_v_heads),
+        /*K=*/static_cast<int32_t>(head_k_dim),
+        /*V=*/static_cast<int32_t>(head_v_dim),
+        /*BK=*/static_cast<int32_t>(head_k_dim),
+        /*BV=*/kBlockV,
+        /*stride_init_state_token=*/initial_state.stride(0),
+        /*stride_final_state_token=*/final_state.stride(0),
+        /*stride_indices_seq=*/stride_indices_seq,
+        /*stride_indices_tok=*/stride_indices_tok,
+        /*USE_INITIAL_STATE=*/1,
+        /*INPLACE_FINAL_STATE=*/inplace_final_state ? 1 : 0,
+        /*IS_BETA_HEADWISE=*/0,
+        /*USE_QK_L2NORM_IN_KERNEL=*/1,
+        /*IS_VARLEN=*/1,
+        /*IS_CONTINUOUS_BATCHING=*/1,
+        /*IS_SPEC_DECODING=*/1,
+        /*IS_KDA=*/1,
+        /*SIGMOID_BETA=*/1,
+        /*COMPUTE_GATE=*/1,
+        /*SAFE_GATE=*/1,
+        /*LOWER_BOUND=*/kda_gate_lower_bound);
+    return std::make_pair(out, final_state);
+  }
+  int64_t kda_head_group =
+      use_optimized_glm_kda
+          ? choose_kda_head_group(num_sequences, num_v_heads, core_count)
+          : num_v_heads;
+  // A single head cannot amortize the grouped kernel's token preloading.
+  // Underfilled batches with few tokens similarly favor independent tiles.
+  // Token counts select a layout only; the kernel still reads each CU boundary.
+  const bool short_underfilled_batch = num_sequences < core_count &&
+                                       batch_size * seq_len <= num_sequences &&
+                                       kda_head_group < num_v_heads;
+  const bool use_direct_kda =
+      use_optimized_glm_kda &&
+      (num_sequences <= core_count / 2 || sparse_checkpoints ||
+       kda_head_group == 1 || short_underfilled_batch);
+  if (use_direct_kda) {
+    int64_t direct_block_v = num_sequences == 1 ? 32 : 128;
+    int64_t direct_tiles = num_sequences * num_v_heads *
+                           ((head_v_dim + direct_block_v - 1) / direct_block_v);
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     JITKernel& direct_kernel = JITKernel::get(
         /*py_path=*/"xllm.core.kernels.mlu.triton_kernel.fused_recurrent_kda",
         /*fn_name=*/"fused_recurrent_kda_kernel");
     direct_kernel.launch(
         static_cast<void*>(queue),
-        /*grid=*/
-        {static_cast<uint32_t>(std::min(direct_tiles, core_count)), 1, 1},
-        /*cfg=*/{/*num_warps=*/1, /*num_stages=*/4, /*bottleneck=*/"mv"},
+        /*grid=*/{static_cast<uint32_t>(direct_tiles), 1, 1},
+        /*cfg=*/
+        {/*num_warps=*/1,
+         /*num_stages=*/direct_block_v == 128 ? 4 : 3},
         q,
         k,
         v,
@@ -254,7 +482,7 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
         /*LOWER_BOUND=*/kda_gate_lower_bound,
         /*SPEC=*/num_accepted_tokens_opt.has_value() ? 1 : 0,
         /*INPLACE=*/inplace_final_state ? 1 : 0,
-        /*BV=*/kDirectBlockV,
+        /*BV=*/static_cast<int32_t>(direct_block_v),
         /*BK=*/static_cast<int32_t>(head_k_dim));
     return std::make_pair(out, final_state);
   }
@@ -300,7 +528,14 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
       block_v = std::min<int64_t>(head_v_dim, kSplitBlockV);
     }
   }
-  const bool split_hv = split_gdn_hv || split_single_token;
+  const bool use_factored_kda_reduce =
+      use_optimized_glm_kda && block_k == 128 && block_v == 128 && block_n == 1;
+  if (use_optimized_glm_kda) {
+    // Three-dimensional update broadcasting keeps all head groups within NRAM.
+    block_hv = kda_head_group;
+  }
+  const bool split_hv = split_gdn_hv || split_single_token ||
+                        (use_optimized_glm_kda && block_hv < num_v_heads);
   int64_t num_hv_blocks =
       split_hv ? (num_v_heads + block_hv - 1) / block_hv : 1;
   int64_t total_blocks = ((head_k_dim + block_k - 1) / block_k) *
@@ -360,9 +595,8 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
            /*SPLIT_HV=*/split_hv ? 1 : 0,
            /*BLOCK_N=*/static_cast<int32_t>(block_n),
            /*BLOCK_QUERY_LEN=*/static_cast<int32_t>(kBlockQueryLen),
-           // The factored reduction was validated for the Qwen GDN K=128
-           // path. Keep KDA and other dimensions on their existing reduction.
-           /*FACTORED_REDUCE=*/!is_kda && head_k_dim == 128 ? 1 : 0);
+           /*FACTORED_REDUCE=*/
+           (use_factored_kda_reduce || (!is_kda && head_k_dim == 128)) ? 1 : 0);
 
   return std::make_pair(out, final_state);
 }

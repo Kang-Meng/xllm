@@ -1171,6 +1171,18 @@ TEST(KVCacheTest, LinearStateCapacityUsesChunkGranularity) {
 
 #if !defined(USE_NPU)
 TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
+  torch::Tensor context_tensor;
+  if (Platform::is_mlu()) {
+    if (Platform::device_count() < 1) {
+      GTEST_SKIP() << "MLU device is required for host KV cache tests.";
+    }
+    Device device(/*device_index=*/0);
+    device.set_device();
+    device.init_device_context();
+    context_tensor =
+        torch::zeros({1}, torch::TensorOptions().device(device.unwrap()));
+    ASSERT_TRUE(context_tensor.defined());
+  }
   KVCacheCapacity capacity;
   capacity.n_blocks(8)
       .block_size(16)

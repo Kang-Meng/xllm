@@ -96,8 +96,8 @@ class DummyRecCausalLM final : public RecCausalLM {
 };
 
 #if defined(USE_MLU)
-// Keep real MTP checkpoint slicing and head loading; replace only the large
-// decoder body with a scalar weight so this test needs no full checkpoint.
+// Keep real MTP checkpoint slicing; replace only the large decoder body with
+// a scalar weight so this test needs no full checkpoint.
 class CheckpointDecoderImpl final : public torch::nn::Module {
  public:
   CheckpointDecoderImpl(const ModelContext& /*context*/, int32_t layer_idx) {
@@ -465,7 +465,7 @@ TEST(HFModelLoaderTest, RegisteredMtpAdapterKeepsTargetAndFixesDraftCache) {
 }
 
 #if defined(USE_MLU)
-TEST(HFModelLoaderTest, GlmMtpLoadsOwnVocabularyWeightsAcrossShards) {
+TEST(HFModelLoaderTest, GlmMtpLoadsBodyAndSharesTargetVocabularyWeights) {
   const torch::Device device(torch::kPrivateUse1, 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -488,10 +488,22 @@ TEST(HFModelLoaderTest, GlmMtpLoadsOwnVocabularyWeightsAcrossShards) {
       GlmCheckpointModel model(context);
       model.load_model(std::make_unique<GlmCheckpointLoader>(
           prefix, /*include_embedding=*/true, /*include_head=*/!tied));
+      EXPECT_FALSE(model.has_loaded_vocab_weights());
       const auto expected_embedding =
           torch::arange(32, torch::kFloat32).view({8, 4});
       const auto expected_head =
           tied ? expected_embedding : expected_embedding + 3;
+      layer::WordEmbedding target_embedding(context);
+      target_embedding->load_state_dict(
+          StateDict(std::unordered_map<std::string, torch::Tensor>{
+              {"weight", expected_embedding}}));
+      layer::LmHead target_head(context);
+      target_head->load_state_dict(
+          StateDict(std::unordered_map<std::string, torch::Tensor>{
+              {"weight", expected_head}}));
+      model.set_word_embedding(target_embedding);
+      model.set_lm_head(target_head);
+      EXPECT_TRUE(model.has_loaded_vocab_weights());
       const auto ids = torch::tensor({0, 3, 7}, torch::kInt64);
       EXPECT_TRUE(torch::equal(
           model.get_input_embeddings(ids.to(device)).cpu().to(torch::kFloat32),
@@ -509,7 +521,7 @@ TEST(HFModelLoaderTest, GlmMtpLoadsOwnVocabularyWeightsAcrossShards) {
   }
 }
 
-TEST(HFModelLoaderTest, GlmMtpRejectsMissingOwnVocabularyWeights) {
+TEST(HFModelLoaderTest, GlmMtpAllowsMissingOwnVocabularyWeights) {
   ProcessGroup group(/*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
   ParallelArgs parallel_args(/*rank=*/0, /*world_size=*/1, &group);
   parallel_args.tp_group_ = &group;
@@ -525,20 +537,17 @@ TEST(HFModelLoaderTest, GlmMtpRejectsMissingOwnVocabularyWeights) {
       args,
       QuantArgs(),
       torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
-  EXPECT_DEATH(
-      {
-        GlmCheckpointModel model(context);
-        model.load_model(std::make_unique<GlmCheckpointLoader>(
-            "model.", /*include_embedding=*/false, /*include_head=*/true));
-      },
-      "missing appended-layer embed_tokens.weight");
-  EXPECT_DEATH(
-      {
-        GlmCheckpointModel model(context);
-        model.load_model(std::make_unique<GlmCheckpointLoader>(
-            "model.", /*include_embedding=*/true, /*include_head=*/false));
-      },
-      "missing or has incomplete");
+  for (const bool include_embedding : {false, true}) {
+    for (const bool include_head : {false, true}) {
+      GlmCheckpointModel model(context);
+      model.load_model(std::make_unique<GlmCheckpointLoader>(
+          "model.", include_embedding, include_head));
+      EXPECT_FALSE(model.has_loaded_vocab_weights());
+      EXPECT_TRUE(
+          torch::equal(model.named_parameters()["model.norm.weight"].cpu(),
+                       torch::full({4}, 11.0f)));
+    }
+  }
 }
 
 TEST(HFModelLoaderTest, GlmMtpNativeAdapterRejectsExportedLayout) {

@@ -551,7 +551,8 @@ torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
                                      int64_t index_kpool,
                                      int64_t index_topk,
                                      double softmax_scale,
-                                     int64_t workspace_bytes) {
+                                     int64_t workspace_bytes,
+                                     const torch::Tensor& query_starts) {
   CHECK_GT(index_kpool, 0);
   CHECK_LE((max_kv_seq_len + block_size - 1) / block_size, block_table.size(1));
   const int64_t count = index_topk / index_kpool;
@@ -566,6 +567,10 @@ torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
       query.size(0), workspace_bytes / (pools * sizeof(float)));
   torch::Tensor workspace =
       torch::empty({chunk, pools}, query.options().dtype(torch::kFloat32));
+  // Request offsets address the complete query tensor. Smaller workspaces use
+  // the existing independent-query path instead of slicing request metadata.
+  const torch::Tensor verify_starts =
+      chunk == query.size(0) ? query_starts : torch::Tensor();
   for (int64_t start = 0; start < query.size(0); start += chunk) {
     const int64_t rows = std::min(chunk, query.size(0) - start);
     torch::Tensor scores = workspace.narrow(0, 0, rows);
@@ -578,7 +583,8 @@ torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
                              scores,
                              block_size,
                              index_kpool,
-                             softmax_scale);
+                             softmax_scale,
+                             verify_starts);
     result.narrow(0, start, rows)
         .copy_(kernel::mlu::select_kpool(scores, count));
   }
@@ -810,18 +816,26 @@ torch::Tensor Glm5NextKPoolIndexerImpl::select_pools(
   }
   // Every verify query sees only pools complete at its own logical position.
   const torch::Tensor& score_positions = positions;
-  return glm5_next_kpool_select(query,
-                                weights,
-                                score_positions,
-                                execution.batch->row_batch,
-                                index_cache,
-                                execution.batch->block_table,
-                                execution.score_capacity,
-                                block_size_,
-                                index_kpool_,
-                                index_topk_,
-                                softmax_scale_,
-                                /*workspace_bytes=*/kWorkspaceBytes);
+  const bool four_query_verify =
+      metadata.is_spec_verify && metadata.max_query_len == 4 &&
+      !execution.batch->q_seq_lens.empty() &&
+      std::all_of(execution.batch->q_seq_lens.begin(),
+                  execution.batch->q_seq_lens.end(),
+                  [](int32_t length) { return length == 4; });
+  return glm5_next_kpool_select(
+      query,
+      weights,
+      score_positions,
+      execution.batch->row_batch,
+      index_cache,
+      execution.batch->block_table,
+      execution.score_capacity,
+      block_size_,
+      index_kpool_,
+      index_topk_,
+      softmax_scale_,
+      /*workspace_bytes=*/kWorkspaceBytes,
+      four_query_verify ? execution.batch->query_starts : torch::Tensor());
 }
 
 std::tuple<torch::Tensor, torch::Tensor> Glm5NextKPoolIndexerImpl::forward(

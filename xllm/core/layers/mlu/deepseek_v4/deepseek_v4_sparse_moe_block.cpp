@@ -176,7 +176,6 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_selected(
                                                             row_token_nums,
                                                             parallel_args_);
 
-  torch::Tensor shared_out = moe_->forward_shared(moe_inputs.hidden_states);
   const int64_t gathered_rows = moe_inputs.hidden_states.size(0);
   FusedMoEImpl::RouteInfo route = make_route(moe_inputs.topk_weights,
                                              moe_inputs.topk_ids,
@@ -187,11 +186,15 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_selected(
                             route);
   ProcessGroup* reduce_group = routed_pg();
   CHECK(reduce_group != nullptr) << "routed process group is not initialized";
-  if (reduce_group->world_size() > 1) {
-    routed_out = parallel_state::reduce(routed_out, reduce_group);
-  }
 
-  torch::Tensor output = std::move(routed_out);
+  // CNCL owns the communication stream and its producer dependency. Defer the
+  // consumer wait until shared computation is enqueued; the context retains the
+  // routed tensor until communication rejoins the current stream. Single-rank
+  // groups pass through without launching communication.
+  auto reduction =
+      parallel_state::launch_reduce(std::move(routed_out), reduce_group);
+  torch::Tensor shared_out = moe_->forward_shared(moe_inputs.hidden_states);
+  torch::Tensor output = parallel_state::finish_reduce(std::move(reduction));
   if (shared_out.defined()) {
     output.add_(shared_out);
   }

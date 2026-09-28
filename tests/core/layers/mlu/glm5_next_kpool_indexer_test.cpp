@@ -1645,6 +1645,57 @@ TEST(Glm5NextKPoolIndexerTest, VerifyMasksHighScoringFuturePoolBeforeTopk) {
     EXPECT_EQ(output.physical_slots[1][0].item<int32_t>(), 20);
   }
 }
+
+TEST(Glm5NextKPoolIndexerTest,
+     FourQuerySelectionKeepsCausalityWithSmallWorkspace) {
+  const torch::Device device(Platform::type_torch(), 0);
+  const auto opts =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const auto ints = opts.dtype(torch::kInt64);
+  torch::Tensor cache = torch::arange(1, 17, opts)
+                            .view({4, 1, 4, 1})
+                            .expand({4, 1, 4, 128})
+                            .contiguous();
+  cache[1][0][1].fill_(10000);
+  const torch::Tensor q = torch::ones({8, kHeads, 128}, opts);
+  const torch::Tensor weights =
+      torch::ones({8, kHeads}, opts.dtype(torch::kFloat32));
+  const torch::Tensor positions =
+      torch::tensor({6, 7, 8, 9, 14, 15, 16, -1}, ints);
+  const torch::Tensor rows = torch::tensor({0, 0, 0, 0, 1, 1, 1, 1}, ints);
+  const torch::Tensor table = torch::tensor({{1, 0}, {3, 2}}, ints);
+  const torch::Tensor starts = torch::tensor({0, 4, 8}, ints);
+  const torch::Tensor expected = glm5_next_kpool_select(q,
+                                                        weights,
+                                                        positions,
+                                                        rows,
+                                                        cache,
+                                                        table,
+                                                        /*max_kv_seq_len=*/32,
+                                                        /*block_size=*/16,
+                                                        /*index_kpool=*/4,
+                                                        kTopk,
+                                                        /*softmax_scale=*/1.0);
+  for (const int64_t bytes : {int64_t{64}, int64_t{256}}) {
+    const torch::Tensor actual = glm5_next_kpool_select(q,
+                                                        weights,
+                                                        positions,
+                                                        rows,
+                                                        cache,
+                                                        table,
+                                                        /*max_kv_seq_len=*/32,
+                                                        /*block_size=*/16,
+                                                        /*index_kpool=*/4,
+                                                        kTopk,
+                                                        /*softmax_scale=*/1.0,
+                                                        bytes,
+                                                        starts);
+    EXPECT_TRUE(torch::equal(actual, expected));
+    EXPECT_EQ(actual[0][0].item<int64_t>(), 0);
+    EXPECT_EQ(actual[1][0].item<int64_t>(), 1);
+    EXPECT_TRUE(actual[7].eq(-1).all().item<bool>());
+  }
+}
 }  // namespace xllm::layer
 
 namespace xllm::layer {

@@ -44,19 +44,20 @@ torch::Tensor glm5_next_kpool_normalize_key(torch::Tensor key,
 
 // Select causal pools with paged Triton scoring and torch::topk. Query chunks
 // reuse bounded scores. Equal-score ordering follows native torch::topk.
-torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
-                                     const torch::Tensor& head_weights,
-                                     const torch::Tensor& positions,
-                                     const torch::Tensor& row_batch,
-                                     const torch::Tensor& index_cache,
-                                     const torch::Tensor& block_table,
-                                     int64_t max_kv_seq_len,
-                                     int64_t block_size,
-                                     int64_t index_kpool,
-                                     int64_t index_topk,
-                                     double softmax_scale,
-                                     int64_t workspace_bytes = 64 * 1024 *
-                                                               1024);
+torch::Tensor glm5_next_kpool_select(
+    const torch::Tensor& query,
+    const torch::Tensor& head_weights,
+    const torch::Tensor& positions,
+    const torch::Tensor& row_batch,
+    const torch::Tensor& index_cache,
+    const torch::Tensor& block_table,
+    int64_t max_kv_seq_len,
+    int64_t block_size,
+    int64_t index_kpool,
+    int64_t index_topk,
+    double softmax_scale,
+    int64_t workspace_bytes = 64 * 1024 * 1024,
+    const torch::Tensor& query_starts = torch::Tensor());
 
 class Glm5NextKPoolIndexerImpl final : public torch::nn::Module {
  public:

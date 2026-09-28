@@ -66,7 +66,9 @@ class Glm5NextDecoderLayerImpl final : public torch::nn::Module {
                         torch::Tensor& positions,
                         const AttentionMetadata& attn_metadata,
                         KVCache& kv_cache,
-                        const ModelInputParams& input_params);
+                        const ModelInputParams& input_params,
+                        std::optional<PendingMHC>* pending_mhc = nullptr,
+                        bool is_last_layer = true);
 
  private:
   int32_t layer_id_ = 0;

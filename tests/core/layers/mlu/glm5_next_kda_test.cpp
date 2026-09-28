@@ -35,10 +35,122 @@ limitations under the License.
 
 #include "kernels/mlu/chunk_kda.h"
 #include "kernels/mlu/mlu_ops_api.h"
+#include "kernels/ops_api.h"
 #include "tests/core/layers/mlu/tests_utils.h"
 
 namespace xllm::layer {
 namespace {
+
+constexpr std::array<const char*, 6> kProjectionNames = {"q_proj.weight",
+                                                         "k_proj.weight",
+                                                         "v_proj.weight",
+                                                         "b_proj.weight",
+                                                         "f_a_proj.weight",
+                                                         "g_a_proj.weight"};
+
+TEST(Glm5NextKDAInputProjectionTest, LoadsShardsInAnyOrderAndReplicatesGates) {
+  torch::InferenceMode guard;
+  torch::manual_seed(20260908);
+  constexpr int64_t kHiddenSize = 64;
+  constexpr int64_t kNumHeads = 8;
+  constexpr int64_t kHeadDim = 16;
+  const auto options = torch::TensorOptions().dtype(torch::kFloat32);
+  const std::array<int64_t, 6> widths = {128, 128, 128, 8, 16, 16};
+  std::array<torch::Tensor, 6> weights;
+  for (size_t index = 0; index < weights.size(); ++index) {
+    weights[index] = torch::randn({widths[index], kHiddenSize}, options);
+  }
+  for (const int32_t tp_size : {1, 2, 8}) {
+    for (int32_t rank = 0; rank < tp_size; ++rank) {
+      Glm5NextKDAInputProjection projection(
+          kHiddenSize, kNumHeads, kHeadDim, rank, tp_size, options);
+      // Separate checkpoint files, deliberately arriving out of projection
+      // order.
+      for (const size_t index : {5, 2, 0, 4, 1, 3}) {
+        projection->load_state_dict(
+            StateDict({{kProjectionNames[index], weights[index]}}));
+      }
+      projection->verify_loaded_weights();
+      // A repeated loader call must not overwrite a completed shard.
+      projection->load_state_dict(
+          StateDict({{"q_proj.weight", torch::zeros_like(weights[0])}}));
+      std::vector<torch::Tensor> expected;
+      expected.reserve(weights.size());
+      for (size_t index = 0; index < weights.size(); ++index) {
+        const int64_t width =
+            index < 4 ? widths[index] / tp_size : widths[index];
+        const int64_t offset = index < 4 ? rank * width : 0;
+        expected.emplace_back(weights[index].narrow(0, offset, width));
+      }
+      EXPECT_TRUE(torch::equal(projection->named_parameters()["weight"],
+                               torch::cat(expected, /*dim=*/0)));
+    }
+  }
+}
+
+TEST(Glm5NextKDAInputProjectionDeathTest, RejectsMissingAndMalformedWeights) {
+  torch::InferenceMode guard;
+  const auto options = torch::TensorOptions().dtype(torch::kFloat32);
+  Glm5NextKDAInputProjection projection(
+      /*hidden_size=*/64,
+      /*num_heads=*/8,
+      /*head_dim=*/16,
+      /*rank=*/1,
+      /*tp_size=*/2,
+      options);
+  EXPECT_DEATH(projection->verify_loaded_weights(), "q_proj.weight");
+  EXPECT_DEATH(projection->load_state_dict(StateDict(
+                   {{"f_a_proj.weight", torch::zeros({8, 64}, options)}})),
+               "f_a_proj.weight");
+}
+
+TEST(Glm5NextKDAInputProjectionTest, MatchesSeparateMluProjections) {
+  torch::InferenceMode guard;
+  torch::manual_seed(20260908);
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  constexpr int64_t kHiddenSize = 4096;
+  constexpr int64_t kNumHeads = 64;
+  constexpr int64_t kHeadDim = 128;
+  const std::array<int64_t, 6> widths = {8192, 8192, 8192, 64, 128, 128};
+  std::array<torch::Tensor, 6> weights;
+  for (size_t index = 0; index < weights.size(); ++index) {
+    weights[index] = torch::randn({widths[index], kHiddenSize}, options) * 0.02;
+  }
+  for (const int32_t rank : {0, 3, 7}) {
+    Glm5NextKDAInputProjection projection(
+        kHiddenSize, kNumHeads, kHeadDim, rank, /*tp_size=*/8, options);
+    std::vector<torch::Tensor> local_weights;
+    local_weights.reserve(weights.size());
+    for (size_t index = 0; index < weights.size(); ++index) {
+      projection->load_state_dict(
+          StateDict({{kProjectionNames[index], weights[index]}}));
+      const int64_t width = index < 4 ? widths[index] / 8 : widths[index];
+      const int64_t offset = index < 4 ? rank * width : 0;
+      local_weights.emplace_back(weights[index].narrow(0, offset, width));
+    }
+    projection->verify_loaded_weights();
+    for (const int64_t tokens : {1, 32, 64, 257, 8192}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "rank=" << rank << " tokens=" << tokens);
+      const torch::Tensor input = torch::randn({tokens, kHiddenSize}, options);
+      const torch::Tensor actual = projection->forward(input);
+      int64_t offset = 0;
+      for (const auto& weight : local_weights) {
+        kernel::MatmulParams params;
+        params.a = input;
+        params.b = weight;
+        const torch::Tensor expected = kernel::matmul(params);
+        EXPECT_TRUE(torch::allclose(actual.narrow(1, offset, weight.size(0)),
+                                    expected,
+                                    /*rtol=*/0.01,
+                                    /*atol=*/0.02));
+        offset += weight.size(0);
+      }
+    }
+  }
+}
 
 torch::Tensor make_chunk_indices(const torch::Tensor& cu_seqlens,
                                  int64_t chunk_size) {
@@ -915,6 +1027,201 @@ TEST(Glm5NextKDATest, PrefillFeedsIndexedMtpCheckpointsAcrossRaggedRequests) {
         torch::equal(padding_output, torch::zeros_like(padding_output)));
     EXPECT_TRUE(torch::isfinite(actual_output).all().item<bool>());
     EXPECT_TRUE(torch::isfinite(actual_pool).all().item<bool>());
+  }
+}
+
+void check_four_token_verify(bool ragged, float gate_value, bool correlated) {
+  constexpr int64_t kSequences = 16;
+  constexpr int64_t kWidth = 4;
+  constexpr int64_t kHeads = 8;
+  constexpr int64_t kDim = 128;
+  constexpr int64_t kTokens = kSequences * kWidth;
+  constexpr int64_t kSlots = kTokens + 1;
+  const torch::NoGradGuard no_grad;
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  const torch::DeviceGuard guard(device);
+  torch::manual_seed(/*seed=*/20260922);
+  const auto fp32 =
+      torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  const auto bf16 = fp32.dtype(torch::kBFloat16);
+  const auto ints = fp32.dtype(torch::kInt32);
+  torch::Tensor q = torch::randn({1, kTokens, kHeads, kDim}, bf16);
+  torch::Tensor k = torch::randn_like(q);
+  if (correlated) {
+    k = q.slice(/*dim=*/1, /*start=*/0, /*end=*/1).expand_as(q).contiguous();
+    q = k + torch::randn_like(k) * 0.01f;
+  }
+  torch::Tensor v = torch::randn_like(q);
+  torch::Tensor raw_gate =
+      torch::full({kTokens, kHeads * kDim}, gate_value, bf16);
+  torch::Tensor raw_beta =
+      torch::full({kTokens, kHeads}, /*fill_value=*/2.0f, bf16);
+  const torch::Tensor a_log = correlated ? torch::zeros({kHeads}, fp32)
+                                         : torch::randn({kHeads}, fp32) * 0.1f;
+  const torch::Tensor bias = correlated
+                                 ? torch::zeros({kHeads * kDim}, fp32)
+                                 : torch::randn({kHeads * kDim}, fp32) * 0.1f;
+  if (!correlated) {
+    raw_gate.add_(torch::randn_like(raw_gate) * 0.5f);
+    raw_beta.copy_(torch::randn_like(raw_beta));
+  }
+  const torch::Tensor log_gate =
+      glm5_next_safe_gate(raw_gate.view({kTokens, kHeads, kDim}),
+                          a_log,
+                          bias,
+                          /*lower_bound=*/-5.0f);
+  torch::Tensor state =
+      torch::randn({kSlots, kHeads, kDim, kDim}, fp32) * 0.03f;
+  const torch::Tensor original_state = state.clone();
+  std::vector<int32_t> offsets{0};
+  std::vector<int32_t> slots;
+  offsets.reserve(kSequences + 1);
+  slots.reserve(kTokens);
+  for (int64_t seq = 0; seq < kSequences; ++seq) {
+    const int32_t length =
+        ragged ? static_cast<int32_t>(seq % (kWidth + 1)) : kWidth;
+    offsets.emplace_back(offsets.back() + length);
+    for (int64_t token = 0; token < kWidth; ++token) {
+      slots.emplace_back(
+          static_cast<int32_t>((kSequences - seq - 1) * kWidth + token + 1));
+    }
+  }
+  // Slot zero is the reserved NULL page, both as input and output checkpoint.
+  std::fill(slots.end() - kWidth, slots.end(), /*value=*/0);
+  slots[2 * kWidth + 1] = 0;
+  torch::Tensor indices = torch::tensor(slots, ints).view({kSequences, kWidth});
+  torch::Tensor cu = torch::tensor(offsets, ints);
+  torch::Tensor accepted = torch::ones({kSequences}, ints);
+  const auto run = [&]() {
+    return kernel::mlu::fused_sigmoid_gating_delta_rule_update(
+        a_log,
+        raw_gate,
+        raw_beta,
+        bias,
+        q,
+        k,
+        v,
+        state,
+        indices,
+        cu,
+        /*scale=*/1.0 / std::sqrt(static_cast<double>(kDim)),
+        /*use_qk_l2norm_in_kernel=*/true,
+        /*softplus_beta=*/1.0f,
+        /*softplus_threshold=*/20.0f,
+        accepted,
+        /*inplace_final_state=*/true,
+        /*is_kda=*/true,
+        /*kda_use_safe_gate=*/true,
+        /*kda_gate_lower_bound=*/-5.0f);
+  };
+  // Compile before capture, then exercise replay with changing accepted slots.
+  run();
+  torch_mlu::synchronize();
+  torch_mlu::MLUGraph graph;
+  torch::Tensor graph_output;
+  {
+    torch_mlu::mlu::MLUStreamGuard stream(
+        torch_mlu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0));
+    graph.capture_begin();
+    graph_output = run().first;
+    graph.capture_end();
+  }
+  for (int32_t round : {0, 1, 3}) {
+    SCOPED_TRACE(round);
+    state.copy_(original_state);
+    std::vector<int32_t> counts;
+    counts.reserve(kSequences);
+    for (int64_t seq = 0; seq < kSequences; ++seq) {
+      counts.emplace_back(static_cast<int32_t>((seq + round) % kWidth + 1));
+    }
+    counts[2] = 3;
+    // An empty row may carry zero acceptance without reading column -1.
+    if (ragged) {
+      counts[0] = 0;
+    }
+    accepted.copy_(torch::tensor(counts, ints));
+    torch::Tensor expected_output = torch::zeros_like(v);
+    torch::Tensor expected_state = original_state.clone();
+    std::array<bool, kSlots> written{};
+    for (int64_t seq = 0; seq < kSequences; ++seq) {
+      if (offsets[seq] == offsets[seq + 1]) {
+        continue;
+      }
+      const int32_t initial_slot = slots[seq * kWidth + counts[seq] - 1];
+      if (initial_slot <= 0) {
+        continue;
+      }
+      torch::Tensor recurrence =
+          original_state[initial_slot].unsqueeze(0).clone();
+      for (int64_t token = offsets[seq]; token < offsets[seq + 1]; ++token) {
+        torch::Tensor output;
+        std::tie(output, recurrence) = glm5_next_kda_eager_recurrence(
+            q.slice(/*dim=*/1, token, token + 1),
+            k.slice(/*dim=*/1, token, token + 1),
+            v.slice(/*dim=*/1, token, token + 1),
+            log_gate.slice(/*dim=*/0, token, token + 1),
+            raw_beta.slice(/*dim=*/0, token, token + 1),
+            recurrence,
+            /*l2norm_qk=*/true);
+        expected_output.slice(/*dim=*/1, token, token + 1).copy_(output);
+        const int32_t slot = slots[seq * kWidth + token - offsets[seq]];
+        if (slot <= 0) {
+          continue;
+        }
+        expected_state[slot].copy_(recurrence.squeeze(/*dim=*/0));
+        written[slot] = true;
+      }
+    }
+    auto [actual_output, actual_state] = run();
+    EXPECT_EQ(actual_state.data_ptr(), state.data_ptr());
+    EXPECT_TRUE(torch::allclose(
+        actual_output, expected_output, /*rtol=*/3e-2, /*atol=*/2e-3));
+    EXPECT_TRUE(torch::allclose(
+        actual_state, expected_state, /*rtol=*/5e-4, /*atol=*/5e-5));
+    state.copy_(original_state);
+    graph.replay();
+    EXPECT_TRUE(torch::allclose(
+        graph_output, expected_output, /*rtol=*/3e-2, /*atol=*/2e-3));
+    EXPECT_TRUE(
+        torch::allclose(state, expected_state, /*rtol=*/5e-4, /*atol=*/5e-5));
+    EXPECT_TRUE(torch::isfinite(graph_output).all().item<bool>());
+    EXPECT_TRUE(torch::isfinite(state).all().item<bool>());
+    std::vector<int64_t> untouched;
+    untouched.reserve(kSlots);
+    for (int64_t slot = 0; slot < kSlots; ++slot) {
+      if (!written[slot]) {
+        untouched.emplace_back(slot);
+      }
+    }
+    const torch::Tensor untouched_indices =
+        torch::tensor(untouched, ints.dtype(torch::kInt64));
+    EXPECT_TRUE(torch::equal(
+        state.index_select(/*dim=*/0, untouched_indices),
+        original_state.index_select(/*dim=*/0, untouched_indices)));
+    EXPECT_TRUE(torch::equal(
+        graph_output.slice(/*dim=*/1, offsets.back()),
+        torch::zeros_like(graph_output.slice(/*dim=*/1, offsets.back()))));
+  }
+}
+
+TEST(Glm5NextKDATest, FourTokenVerifyPreservesAllCheckpointsAndReplays) {
+  check_four_token_verify(/*ragged=*/false,
+                          /*gate_value=*/-2.0f,
+                          /*correlated=*/false);
+}
+
+TEST(Glm5NextKDATest, FourTokenVerifyHandlesRaggedAndNullSlots) {
+  check_four_token_verify(/*ragged=*/true,
+                          /*gate_value=*/-2.0f,
+                          /*correlated=*/false);
+}
+
+TEST(Glm5NextKDATest, FourTokenVerifyCorrelatedKeysAcrossSafeGateRange) {
+  for (float gate_value : {-30.0f, 30.0f}) {
+    SCOPED_TRACE(gate_value);
+    check_four_token_verify(/*ragged=*/false,
+                            gate_value,
+                            /*correlated=*/true);
   }
 }
 

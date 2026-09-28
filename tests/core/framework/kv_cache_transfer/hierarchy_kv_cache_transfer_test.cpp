@@ -21,6 +21,7 @@ limitations under the License.
 #include <memory>
 #include <vector>
 
+#include "core/framework/config/scheduler_config.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/model/model_args.h"
@@ -171,6 +172,7 @@ void verify_committed_linear_round_trip(const char* model_type) {
   create_options.device(device.unwrap())
       .dtype(torch::kFloat32)
       .ssm_dtype(torch::kFloat32)
+      .block_size(4)
       .num_layers(2)
       .full_attention_interval(2)
       .enable_linear_attention(true)
@@ -190,12 +192,17 @@ void verify_committed_linear_round_trip(const char* model_type) {
   HierarchyKVCacheTransfer::Options transfer_options;
   transfer_options.layers(2).host_blocks_factor(2.0).layers_wise_copy_batchs(1);
   std::unique_ptr<Stream> compute_stream = device.current_stream();
+  const int32_t old_chunk_size =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(8);
   HierarchyKVCacheTransfer transfer(transfer_options,
                                     device.unwrap(),
                                     compute_stream.get(),
                                     &caches,
                                     cache_shape,
                                     create_options);
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(
+      old_chunk_size);
   BlockTransferInfo offload(kSourceSlot, /*dst_block_id=*/0);
   offload.block_type = BlockType::LINEAR;
   offload.transfer_type = TransferType::D2H2G;

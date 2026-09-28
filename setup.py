@@ -915,6 +915,7 @@ class TestUT(Command):
         "AttentionMultiDeviceTest",
         "Glm5AttentionDcpTest",
         "FusedMoEAll2AllMultiDeviceTest",
+        "DeepseekV4SparseMoECollectiveTest",
     ]
 
     def initialize_options(self) -> None:

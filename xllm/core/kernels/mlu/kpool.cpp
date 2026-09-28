@@ -227,7 +227,8 @@ void score_kpool(const torch::Tensor& query,
                  torch::Tensor& scores,
                  int64_t block_size,
                  int64_t pool_size,
-                 double scale) {
+                 double scale,
+                 const torch::Tensor& query_starts) {
   CHECK_GT(pool_size, 0);
   CHECK_EQ(block_size % pool_size, 0);
   CHECK_EQ(query.dim(), 3);
@@ -250,6 +251,50 @@ void score_kpool(const torch::Tensor& query,
   const torch::Tensor pages = table.contiguous();
   const torch::Tensor pos = positions.contiguous();
   const torch::Tensor batch = rows.contiguous();
+  const bool four_query_verify =
+      query_starts.defined() && query_starts.dim() == 1 &&
+      query_starts.numel() == table.size(0) + 1 && table.size(0) > 0 &&
+      (query_starts.scalar_type() == torch::kInt32 ||
+       query_starts.scalar_type() == torch::kInt64) &&
+      query_starts.device() == q.device() && q.size(0) == table.size(0) * 4 &&
+      cache.dim() == 4 && cache.size(1) == 1 && cache.size(2) == 4 &&
+      cache.size(3) == 128 && q.size(1) == 32 && q.size(2) == 128 &&
+      block_size == 16 && pool_size == 4 &&
+      q.scalar_type() == torch::kBFloat16 &&
+      cache.scalar_type() == torch::kBFloat16 &&
+      w.scalar_type() == torch::kFloat32;
+  if (four_query_verify) {
+    constexpr int32_t kPoolsPerTile = 128;
+    constexpr int32_t kTilesPerProgram = 4;
+    const torch::Tensor starts = query_starts.contiguous();
+    triton_jit::JITKernel::get(
+        "xllm.core.kernels.mlu.triton_kernel.glm5_next_kpool",
+        "score_verify_pools")
+        .launch(static_cast<void*>(torch_mlu::getCurMLUStream()),
+                {static_cast<uint32_t>(table.size(0)),
+                 static_cast<uint32_t>(
+                     (scores.size(1) + kPoolsPerTile * kTilesPerProgram - 1) /
+                     (kPoolsPerTile * kTilesPerProgram)),
+                 1},
+                {1, 1},
+                q,
+                w,
+                cache,
+                pages,
+                pos,
+                batch,
+                starts,
+                scores,
+                q.size(0),
+                scores.size(1),
+                cache.size(0),
+                pages.size(1),
+                scores.stride(0),
+                static_cast<float>(scale),
+                kPoolsPerTile,
+                kTilesPerProgram);
+    return;
+  }
   constexpr int32_t kTile = 128;
   constexpr int32_t kChunk = 4;
   const int64_t tiles = (scores.size(1) + kTile - 1) / kTile;

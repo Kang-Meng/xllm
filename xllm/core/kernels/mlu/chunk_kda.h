@@ -36,12 +36,32 @@ class ChunkKDAImpl final : public torch::nn::Module {
   explicit ChunkKDAImpl(int64_t num_heads);
   ~ChunkKDAImpl() override = default;
 
+  // chunk_indices must enumerate all chunks in sequence-major order.
   std::tuple<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& q,
       const torch::Tensor& k,
       const torch::Tensor& v,
       const torch::Tensor& log_gate,
       const torch::Tensor& beta,
+      const torch::Tensor& initial_state,
+      const torch::Tensor& cu_seqlens,
+      const torch::Tensor& chunk_indices,
+      bool output_final_state,
+      bool use_qk_l2norm);
+
+  // Fuses safe-gate and beta activation for normalized Q/K with at least
+  // eight heads. Other supported configurations use device activation and
+  // the generic forward path. Chunk metadata must be sequence-major, with
+  // every local chunk present in order, as produced by the KDA layer.
+  std::tuple<torch::Tensor, torch::Tensor> forward_raw_gate(
+      const torch::Tensor& q,
+      const torch::Tensor& k,
+      const torch::Tensor& v,
+      const torch::Tensor& raw_gate,
+      const torch::Tensor& a_log,
+      const torch::Tensor& dt_bias,
+      float gate_lower_bound,
+      const torch::Tensor& raw_beta,
       const torch::Tensor& initial_state,
       const torch::Tensor& cu_seqlens,
       const torch::Tensor& chunk_indices,

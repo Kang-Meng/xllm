@@ -3815,6 +3815,7 @@ void MTPWorkerImpl::prepare_draft_replay_inputs(
     }
     torch::Tensor rotary_host =
         specBuilder::make_cpu_int_tensor(rotary).reshape({3, num_rows});
+    extend_input.positions_host = rotary_host;
     extend_input.positions =
         safe_to(rotary_host, base_input.positions.options(), true);
   }

@@ -44,6 +44,11 @@ void update_kpool(const torch::Tensor& k,
 
 // Writes caller-owned FP32 workspace. Positions are causal, zero-based token
 // positions; -1 masks the whole row. Rows map queries to request page tables.
+// Optional device query_starts describes request-major verify spans bounded by
+// four queries, including shorter live spans during graph replay. Without it,
+// scoring retains the independent-query path. Rows must name the same
+// page-table request throughout each span; the model's batch metadata
+// guarantees this.
 void score_kpool(const torch::Tensor& query,
                  const torch::Tensor& weights,
                  const torch::Tensor& cache,
@@ -53,7 +58,8 @@ void score_kpool(const torch::Tensor& query,
                  torch::Tensor& scores,
                  int64_t block_size,
                  int64_t pool_size,
-                 double scale);
+                 double scale,
+                 const torch::Tensor& query_starts = torch::Tensor());
 
 // Native torch.topk tie ordering; nonfinite selections and missing columns -1.
 torch::Tensor select_kpool(const torch::Tensor& scores, int64_t count);
