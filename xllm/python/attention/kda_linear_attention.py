@@ -65,11 +65,14 @@ def _get_host_q_cu_seq_lens(metadata, expected_num_seqs: int) -> list[int]:
 
 
 def _take_leading_token_rows(tensor: torch.Tensor | None, num_rows: int, keep_rows: int) -> torch.Tensor | None:
-    """Keep the verify rows and drop a bucket tail that is shorter than one group."""
+    """Keep the verify rows and drop a bucket tail that is shorter than one group.
+
+    Callers pass gate ``[1, T, heads, dim]`` and beta ``[1, T, heads]``. The
+    token axis is 1 (or 0 for a flat ``[T, ...]`` tensor). Head count can equal
+    the bucket, so a later axis must not be treated as the token axis.
+    """
     if tensor is None or keep_rows >= num_rows:
         return tensor
-    if tensor.dim() >= 3 and tensor.shape[2] == num_rows:
-        return tensor[:, :, :keep_rows]
     if tensor.dim() >= 2 and tensor.shape[1] == num_rows:
         return tensor[:, :keep_rows]
     if tensor.shape[0] == num_rows:

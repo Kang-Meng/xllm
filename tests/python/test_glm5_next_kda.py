@@ -22,7 +22,10 @@ import pytest
 import torch
 import torch.nn.functional as functional
 
-from xllm.python.attention.kda_linear_attention import KdaLinearAttentionMixin
+from xllm.python.attention.kda_linear_attention import (
+    KdaLinearAttentionMixin,
+    _take_leading_token_rows,
+)
 from xllm.python.layers.qlinear import QLinearWeightLoader
 from xllm.python.models import glm5_next
 from xllm.python.models.glm5_next import _KDA_IN_PROJ
@@ -48,6 +51,29 @@ def test_kda_gate_parameters_stay_fp32_across_model_dtype_cast() -> None:
     assert gate.f_b_proj.weight.dtype == torch.bfloat16
     torch.testing.assert_close(gate.A_log, torch.full_like(gate.A_log, 0.123456789), rtol=0, atol=0)
     torch.testing.assert_close(gate.dt_bias, torch.full_like(gate.dt_bias, -0.987654321), rtol=0, atol=0)
+
+
+def test_leading_token_rows_slice_tokens_when_heads_equal_bucket() -> None:
+    """Local head count can equal the token bucket. Slice tokens, not heads."""
+    gate = torch.arange(256, dtype=torch.float32).reshape(1, 8, 8, 4)
+    beta = torch.arange(64, dtype=torch.float32).reshape(1, 8, 8)
+    flat = torch.arange(8, dtype=torch.float32)
+
+    sliced_gate = _take_leading_token_rows(gate, 8, 6)
+    sliced_beta = _take_leading_token_rows(beta, 8, 6)
+    assert sliced_gate is not None and sliced_beta is not None
+    assert tuple(sliced_gate.shape) == (1, 6, 8, 4)
+    assert tuple(sliced_beta.shape) == (1, 6, 8)
+    torch.testing.assert_close(sliced_gate, gate[:, :6])
+    torch.testing.assert_close(sliced_beta, beta[:, :6])
+
+    different_heads = torch.arange(320, dtype=torch.float32).reshape(1, 8, 10, 4)
+    sliced_different = _take_leading_token_rows(different_heads, 8, 6)
+    assert sliced_different is not None
+    assert tuple(sliced_different.shape) == (1, 6, 10, 4)
+    assert tuple(_take_leading_token_rows(flat, 8, 6).shape) == (6,)
+    assert _take_leading_token_rows(gate, 8, 8) is gate
+    assert _take_leading_token_rows(None, 8, 6) is None
 
 
 class _StateDict:
