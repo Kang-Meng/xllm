@@ -43,6 +43,31 @@ uint64_t hash_transfer_request_ids(
   return hash;
 }
 
+template <typename ParseRankFn>
+void for_each_reduction_rank(ProcessGroup* (&reduction_groups)[2],
+                             const torch::Tensor& payload,
+                             const char* shape_error,
+                             ParseRankFn&& parse_rank) {
+  ProcessGroup* previous_group = nullptr;
+  for (ProcessGroup* group : reduction_groups) {
+    if (group == nullptr || group == previous_group ||
+        group->world_size() <= 1) {
+      continue;
+    }
+    torch::Tensor gathered =
+        group->allgather_base_sync(payload).to(torch::kCPU);
+    CHECK_EQ(gathered.numel(),
+             static_cast<int64_t>(group->world_size() * payload.numel()))
+        << shape_error;
+    const int64_t* gathered_data = gathered.data_ptr<int64_t>();
+    for (int32_t rank = 0; rank < group->world_size(); ++rank) {
+      const int64_t rank_offset = rank * payload.numel();
+      parse_rank(gathered_data + rank_offset);
+    }
+    previous_group = group;
+  }
+}
+
 }  // namespace
 
 std::vector<std::string> canonical_transfer_request_ids(
@@ -60,9 +85,9 @@ std::vector<std::string> reduce_failed_request_ids(
     const Device& device) {
   // Request batches are replicated across TP/CP ranks, but differ between DP
   // replicas. Reducing on the DP group would therefore combine unrelated
-  // request-ID bitmaps and can deadlock when their shapes differ. Callers skip
-  // this function for empty transfer lists, which are group-consistent because
-  // transfer entries are derived from the replicated request batch.
+  // request-ID bitmaps and can deadlock when their shapes differ. The
+  // fixed-size metadata collective below also verifies that TP/CP ranks agree
+  // on empty transfer sets before any rank skips the bitmap collective.
   ProcessGroup* reduction_groups[] = {parallel_args.tp_group_,
                                       parallel_args.cp_group_};
   bool needs_collective = false;
@@ -83,18 +108,41 @@ std::vector<std::string> reduce_failed_request_ids(
     return failed_request_ids;
   }
 
-  const size_t kPayloadMetadataSize = 2;
-  const size_t payload_size =
-      kPayloadMetadataSize + canonical_request_ids.size();
-  std::vector<int64_t> payload_values(payload_size, 0);
-  payload_values[0] = static_cast<int64_t>(canonical_request_ids.size());
+  constexpr size_t kMetadataPayloadSize = 2;
+  std::vector<int64_t> metadata_values(kMetadataPayloadSize, 0);
+  metadata_values[0] = static_cast<int64_t>(canonical_request_ids.size());
   const uint64_t request_ids_hash =
       hash_transfer_request_ids(canonical_request_ids);
-  std::memcpy(&payload_values[1], &request_ids_hash, sizeof(request_ids_hash));
+  std::memcpy(&metadata_values[1], &request_ids_hash, sizeof(request_ids_hash));
+  torch::Tensor metadata_payload =
+      torch::from_blob(
+          metadata_values.data(),
+          {static_cast<int64_t>(metadata_values.size())},
+          torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU))
+          .clone()
+          .to(device);
+
+  // Agree on the request set before any rank branches around an empty set or
+  // enters the variable-length failure-bitmap collective.
+  for_each_reduction_rank(
+      reduction_groups,
+      metadata_payload,
+      "unexpected KV transfer request metadata shape",
+      [&](const int64_t* rank_data) {
+        CHECK_EQ(rank_data[0], metadata_values[0])
+            << "KV transfer request count differs across reduction ranks";
+        CHECK_EQ(rank_data[1], metadata_values[1])
+            << "KV transfer request IDs differ across reduction ranks";
+      });
+  if (canonical_request_ids.empty()) {
+    return {};
+  }
+
+  std::vector<int64_t> payload_values(canonical_request_ids.size(), 0);
   for (size_t index = 0; index < canonical_request_ids.size(); ++index) {
     if (local_failed_request_ids.find(canonical_request_ids[index]) !=
         local_failed_request_ids.end()) {
-      payload_values[kPayloadMetadataSize + index] = 1;
+      payload_values[index] = 1;
     }
   }
   torch::Tensor payload =
@@ -105,32 +153,17 @@ std::vector<std::string> reduce_failed_request_ids(
           .clone()
           .to(device);
   std::vector<int32_t> reduced_bitmap(canonical_request_ids.size(), 0);
-  ProcessGroup* previous_group = nullptr;
-  for (ProcessGroup* group : reduction_groups) {
-    if (group == nullptr || group == previous_group ||
-        group->world_size() <= 1) {
-      continue;
-    }
-    torch::Tensor gathered =
-        group->allgather_base_sync(payload).to(torch::kCPU);
-    CHECK_EQ(gathered.numel(),
-             static_cast<int64_t>(group->world_size() * payload.numel()))
-        << "unexpected KV transfer request payload shape";
-    const int64_t* gathered_data = gathered.data_ptr<int64_t>();
-    for (int32_t rank = 0; rank < group->world_size(); ++rank) {
-      const int64_t rank_offset = rank * payload.numel();
-      CHECK_EQ(gathered_data[rank_offset], payload_values[0])
-          << "KV transfer request count differs across reduction ranks";
-      CHECK_EQ(gathered_data[rank_offset + 1], payload_values[1])
-          << "KV transfer request IDs differ across reduction ranks";
-      for (size_t index = 0; index < canonical_request_ids.size(); ++index) {
-        if (gathered_data[rank_offset + kPayloadMetadataSize + index] > 0) {
-          reduced_bitmap[index] = 1;
+  for_each_reduction_rank(
+      reduction_groups,
+      payload,
+      "unexpected KV transfer request payload shape",
+      [&](const int64_t* rank_data) {
+        for (size_t index = 0; index < canonical_request_ids.size(); ++index) {
+          if (rank_data[index] > 0) {
+            reduced_bitmap[index] = 1;
+          }
         }
-      }
-    }
-    previous_group = group;
-  }
+      });
   std::vector<std::string> failed_request_ids;
   for (size_t index = 0; index < canonical_request_ids.size(); ++index) {
     if (reduced_bitmap[index] > 0) {
@@ -150,7 +183,7 @@ std::vector<std::string> finalize_kv_push_failures(
       kv_transfers.wait();
   const std::vector<std::string> canonical_request_ids =
       canonical_transfer_request_ids(transfer_kv_infos);
-  if (kv_cache_transfer_mode != "PUSH" || canonical_request_ids.empty()) {
+  if (kv_cache_transfer_mode != "PUSH") {
     return {};
   }
   return reduce_failed_request_ids(

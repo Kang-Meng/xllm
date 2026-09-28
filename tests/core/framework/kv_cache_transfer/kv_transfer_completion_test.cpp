@@ -16,18 +16,93 @@ limitations under the License.
 #include "core/framework/kv_cache_transfer/kv_transfer_completion.h"
 
 #include <gtest/gtest.h>
+#include <torch/torch.h>
 
 #include <chrono>
 #include <future>
 #include <memory>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 #include <vector>
+
+#include "core/framework/parallel_state/parallel_args.h"
+#include "core/framework/parallel_state/process_group.h"
+#include "core/platform/device.h"
 
 namespace xllm {
 namespace {
 
 using namespace std::chrono_literals;
+
+class SimulatedAllGatherProcessGroup final : public ProcessGroup {
+ public:
+  explicit SimulatedAllGatherProcessGroup(bool mismatched_request_count = false)
+      : ProcessGroup(/*rank=*/0,
+                     /*world_size=*/2,
+                     torch::Device(torch::kCPU)),
+        mismatched_request_count_(mismatched_request_count) {}
+
+  torch::Tensor allgather_base_sync(const torch::Tensor& input) override {
+    ++allgather_count_;
+    torch::Tensor remote_payload = input.clone();
+    if (mismatched_request_count_) {
+      remote_payload[0].add_(1);
+    } else if (allgather_count_ == 2 && remote_payload.numel() > 1) {
+      remote_payload[1].fill_(1);
+    }
+    return torch::cat({input, remote_payload});
+  }
+
+  size_t allgather_count() const { return allgather_count_; }
+
+ private:
+  bool mismatched_request_count_;
+  size_t allgather_count_ = 0;
+};
+
+ParallelArgs make_parallel_args(ProcessGroup* tp_group) {
+  ParallelArgs parallel_args(/*rank=*/0,
+                             /*world_size=*/2,
+                             /*dp_size=*/1,
+                             /*cp_size=*/1,
+                             /*process_group=*/nullptr,
+                             /*ep_size=*/1);
+  parallel_args.tp_group_ = tp_group;
+  return parallel_args;
+}
+
+TEST(KVTransferFailureReductionTest, MergesFailureBitmapAcrossTpRanks) {
+  SimulatedAllGatherProcessGroup tp_group;
+  ParallelArgs parallel_args = make_parallel_args(&tp_group);
+  Device device(torch::Device(torch::kCPU));
+
+  EXPECT_EQ(
+      reduce_failed_request_ids(
+          {"request-a"}, {"request-a", "request-b"}, parallel_args, device),
+      (std::vector<std::string>{"request-a", "request-b"}));
+  EXPECT_EQ(tp_group.allgather_count(), 2u);
+}
+
+TEST(KVTransferFailureReductionTest,
+     EmptyRequestSetUsesFixedMetadataCollective) {
+  SimulatedAllGatherProcessGroup tp_group;
+  ParallelArgs parallel_args = make_parallel_args(&tp_group);
+  Device device(torch::Device(torch::kCPU));
+
+  EXPECT_TRUE(reduce_failed_request_ids({}, {}, parallel_args, device).empty());
+  EXPECT_EQ(tp_group.allgather_count(), 1u);
+}
+
+TEST(KVTransferFailureReductionTest, RejectsTpRankRequestCountMismatch) {
+  SimulatedAllGatherProcessGroup tp_group(/*mismatched_request_count=*/true);
+  ParallelArgs parallel_args = make_parallel_args(&tp_group);
+  Device device(torch::Device(torch::kCPU));
+
+  EXPECT_DEATH(
+      { reduce_failed_request_ids({}, {"request-a"}, parallel_args, device); },
+      "request count differs across reduction ranks");
+}
 
 TEST(KVTransferCompletionTest, ReturnsMergedFailedRequestIds) {
   folly::Promise<std::vector<KVTransferTaskResult>> first_promise;
