@@ -14,6 +14,7 @@
 
 import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -33,6 +34,22 @@ def _indexer(device: torch.device) -> glm5_next.Glm5NextIndexer:
         index_kpool_compress=True,
     )
     return glm5_next.Glm5NextIndexer(config, 1, torch.bfloat16, device).to(device=device, dtype=torch.bfloat16)
+
+
+def test_graph_kpool_prefix_drops_short_bucket_tail() -> None:
+    hidden = torch.arange(16, dtype=torch.float32).reshape(1, 8, 2)
+    flat = torch.arange(8, dtype=torch.float32)
+    ctx = SimpleNamespace(kpool_query_lens=(6,))
+
+    assert glm5_next._prefix_token_tensor(hidden, 8, 6).shape == (1, 6, 2)
+    assert glm5_next._prefix_token_tensor(flat, 8, 6).tolist() == list(range(6))
+    batched = torch.arange(16, dtype=torch.float32).reshape(2, 4, 2)
+    with pytest.raises(RuntimeError, match="cannot keep the first"):
+        glm5_next._prefix_token_tensor(batched, 8, 6)
+    with pytest.raises(RuntimeError, match="cover the current token rows"):
+        glm5_next._kpool_update_query_lens(ctx, 8)
+    with patch("xllm.python.models.glm5_next.in_acl_graph", return_value=True):
+        assert glm5_next._kpool_update_query_lens(ctx, 8) == [6]
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 17])

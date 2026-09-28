@@ -358,6 +358,7 @@ class ModelExecutor:
                 num_decoding_tokens=num_decoding_tokens,
                 enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
                 is_spec_draft=is_spec_draft,
+                draft_query_width=int(config.get("draft_query_width", 1) or 1),
                 **eplv2_graph_kwargs,
             )
             self.decode_graph_runner.bind_execution_metadata_builders(execution_metadata_builders)

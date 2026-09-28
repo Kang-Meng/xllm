@@ -64,6 +64,19 @@ def _get_host_q_cu_seq_lens(metadata, expected_num_seqs: int) -> list[int]:
     return [int(value) for value in q_cu_seq_lens.to(torch.int64).tolist()]
 
 
+def _take_leading_token_rows(tensor: torch.Tensor | None, num_rows: int, keep_rows: int) -> torch.Tensor | None:
+    """Keep the verify rows and drop a bucket tail that is shorter than one group."""
+    if tensor is None or keep_rows >= num_rows:
+        return tensor
+    if tensor.dim() >= 3 and tensor.shape[2] == num_rows:
+        return tensor[:, :, :keep_rows]
+    if tensor.dim() >= 2 and tensor.shape[1] == num_rows:
+        return tensor[:, :keep_rows]
+    if tensor.shape[0] == num_rows:
+        return tensor[:keep_rows]
+    return tensor
+
+
 class KdaLinearAttentionMixin:
     """KDA linear-attention + MTP spec-verify state I/O, mixed into NpuPagedAttentionBackend."""
 
@@ -212,19 +225,31 @@ class KdaLinearAttentionMixin:
                 # the per-sequence group count rides on q_seq_lens (N
                 # entries of value spec_width). Pure shape math — no
                 # device->host syncs. Row slots arrive per-row and pairwise
-                # equal; take each group's row 0.
+                # equal; take each group's row 0. A bucket tail shorter than
+                # spec_width is padding and stays out of the recurrent chain.
                 num_rows = int(mixed_qkv.shape[2])
                 q_seq_lens = getattr(metadata, "q_seq_lens", None)
                 n_groups = int(q_seq_lens.numel()) if q_seq_lens is not None else int(q_cu_raw.numel()) - 1
-                if num_seqs > 0 and n_groups > 0 and (num_rows % n_groups == 0):
-                    if idx.numel() == num_rows:
-                        group_idx = idx.view(n_groups, num_rows // n_groups)[:, 0].contiguous()
+                spec_width = int(getattr(metadata, "spec_group_width", 0) or 0)
+                full_rows = n_groups * spec_width if spec_width > 1 and n_groups > 0 else num_rows
+                uniform = num_seqs > 0 and n_groups > 0 and full_rows == num_rows and num_rows % n_groups == 0
+                padded_tail = num_seqs > 0 and n_groups > 0 and spec_width > 1 and 0 < full_rows < num_rows
+                if uniform or padded_tail:
+                    row_count = full_rows if padded_tail else num_rows
+                    group_width = spec_width if padded_tail else num_rows // n_groups
+                    if padded_tail and idx.numel() == num_rows:
+                        group_idx = idx[:row_count].view(n_groups, group_width)[:, 0].contiguous()
+                    elif idx.numel() == num_rows:
+                        group_idx = idx.view(n_groups, group_width)[:, 0].contiguous()
                     else:
                         group_idx = idx
-                    return self._spec_verify_v3(
-                        mixed_qkv,
-                        raw_gate_proj,
-                        beta_raw,
+                    verify_qkv = mixed_qkv[:, :, :row_count] if padded_tail else mixed_qkv
+                    verify_gate = _take_leading_token_rows(raw_gate_proj, num_rows, row_count)
+                    verify_beta = _take_leading_token_rows(beta_raw, num_rows, row_count)
+                    verify_out = self._spec_verify_v3(
+                        verify_qkv,
+                        verify_gate,
+                        verify_beta,
                         layer,
                         group_idx,
                         metadata,
@@ -232,6 +257,12 @@ class KdaLinearAttentionMixin:
                         ssm_cache,
                         recurrent_kda,
                     )
+                    if not padded_tail or verify_out.shape[1] == num_rows:
+                        return verify_out
+                    tail = verify_out.new_zeros(
+                        (verify_out.shape[0], num_rows - verify_out.shape[1], *verify_out.shape[2:])
+                    )
+                    return torch.cat((verify_out, tail), dim=1)
             q_rows = 0 if in_graph else (int(q_cu_raw.numel()) - 1 if q_cu_raw is not None else 0)
             per_row_idx = None
             per_row_cu = None

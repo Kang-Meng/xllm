@@ -71,6 +71,49 @@ def _require_positive_execution_counts(execution_counts: Sequence[int]) -> None:
         raise RuntimeError(f"DP execution token counts must be positive, got {execution_counts}")
 
 
+def _dp_active_execution_counts(
+    execution_counts: Sequence[int],
+    raw_counts: Sequence[int] | None,
+) -> list[int]:
+    """Drop empty-rank placeholders. A raw 0 is not a verify sequence."""
+    counts = [int(count) for count in execution_counts]
+    if raw_counts is not None and len(raw_counts) == len(counts):
+        active = [count for count, raw in zip(counts, raw_counts) if int(raw) > 0]
+        if active:
+            return active
+    return counts
+
+
+def _dp_spec_sequence_batch(
+    execution_counts: Sequence[int],
+    raw_counts: Sequence[int] | None,
+    local_width: int,
+) -> int | None:
+    """Fold expanded-verify tokens into sequences.
+
+    A raw 0 is an empty-rank placeholder. Width 1 is plain decode and is never
+    folded. ``None`` means an active count is not a whole verify group, so every
+    rank must stay eager. Both ranks must pass that same width.
+    """
+    counts = [int(count) for count in execution_counts]
+    if local_width <= 1:
+        return max(counts)
+    active = _dp_active_execution_counts(counts, raw_counts)
+    if any(count % local_width != 0 for count in active):
+        return None
+    return max(active) // local_width
+
+
+def _complete_kpool_groups(padded_num_tokens: int, verify_width: int) -> tuple[int, ...]:
+    """Groups of ``verify_width`` that fit in a bucket. A short tail is omitted."""
+    if verify_width <= 1 or padded_num_tokens <= 0:
+        return ()
+    full_groups = padded_num_tokens // verify_width
+    if full_groups <= 0:
+        return ()
+    return (verify_width,) * full_groups
+
+
 def _padded_rank_slices(
     token_counts: Sequence[int],
     dp_size: int,
@@ -124,6 +167,9 @@ class _StaticAttentionMetadata:
     is_mixed: bool = False
     is_spec_verify: bool = False
     is_dummy: bool = False
+    # Verify group width baked into this captured graph. 0 means the KDA
+    # path derives equal groups from the padded row count.
+    spec_group_width: int = 0
     local_slot_mapping: torch.Tensor | None = None
     kv_split_size: int = 1
     kv_split_rank: int = 0
@@ -184,12 +230,16 @@ class DecodeAclGraphRunner(BaseRunner):
         enable_mega_moe_token_mask: bool = False,
         *,
         is_spec_draft: bool = False,
+        draft_query_width: int = 1,
         eplv2_graph_token_limit: int | None = None,
     ) -> None:
         super().__init__(model, attention_backend, device)
         self.dp_size = dp_size
         self.dp_rank = dp_rank
-        self.max_batch = (max_batch + dp_size - 1) // dp_size
+        # Each rank may receive every sequence in the batch. The scheduler's
+        # remaining_seq_budget is the full max_seqs_per_batch, not an even
+        # split, so the graph capacity matches that budget.
+        self.max_batch = max_batch
         # Token rows per logical sequence: 1 for plain decode, num_spec+1 for
         # MTP spec-verify. Static paging buffers are sized in token rows so the
         # expanded-verify graph (N*width rows) gets matching capacity instead
@@ -201,6 +251,9 @@ class DecodeAclGraphRunner(BaseRunner):
         self.max_model_len = max_model_len
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
         self._is_spec_draft = is_spec_draft
+        # Draft graphs stay width 1. This width only folds token rows into
+        # sequences for the max_seqs_per_batch check.
+        self._draft_query_width = max(1, int(draft_query_width))
         self._eplv2_graph_token_limit = eplv2_graph_token_limit
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
@@ -214,29 +267,94 @@ class DecodeAclGraphRunner(BaseRunner):
         limit = self._eplv2_graph_token_limit
         return limit is None or _decode_bucket(token_rows) <= limit
 
+    def _shared_graph_plan(
+        self,
+        metadata: AttentionMetadata,
+        batch_size: int,
+        local_expanded: bool | None = None,
+    ) -> tuple[bool, int, int | None]:
+        """Return the graph layout every DP rank must capture.
+
+        ``(is_expanded, verify_width, admission_batch)``. ``admission_batch`` is
+        ``None`` when active token counts are not whole verify groups. Under DP
+        the width comes only from ``is_spec_verify`` and ``num_decoding_tokens``,
+        so an empty rank and a busy rank share one graph key. A local expanded
+        layout that is not that group-wide verify raises instead of capturing
+        a private graph. Plain decode stays width 1.
+        """
+        if local_expanded is None:
+            local_expanded = resolve_expanded_decode_metadata(metadata) is not None
+        marked_spec_verify = bool(getattr(metadata, "is_spec_verify", False))
+        spec_verify = marked_spec_verify or local_expanded
+        local_width = 1
+        if local_expanded and batch_size > 0:
+            linear_idx = getattr(metadata, "linear_state_indices", None)
+            seq_count = linear_idx.numel() if linear_idx is not None and linear_idx.numel() > 0 else batch_size
+            if batch_size % seq_count == 0:
+                local_width = batch_size // seq_count
+        if self.dp_size > 1:
+            # Local expanded rows must not choose a width the empty rank cannot see.
+            if marked_spec_verify and self.num_decoding_tokens > 1:
+                if local_width > 1 and local_width != self.num_decoding_tokens:
+                    raise RuntimeError(
+                        "DP spec-verify layout does not match num_decoding_tokens: "
+                        f"measured={local_width}, num_decoding_tokens={self.num_decoding_tokens}"
+                    )
+                verify_width = self.num_decoding_tokens
+            else:
+                if local_width > 1:
+                    raise RuntimeError(
+                        "DP expanded decode is not a group-wide spec verify: "
+                        f"measured={local_width}, num_decoding_tokens={self.num_decoding_tokens}"
+                    )
+                verify_width = 1
+        elif local_width > 1:
+            verify_width = local_width
+        elif spec_verify and self.num_decoding_tokens > 1:
+            verify_width = self.num_decoding_tokens
+        else:
+            verify_width = 1
+        is_expanded = verify_width > 1
+        if self.dp_size > 1:
+            admission_batch = _dp_spec_sequence_batch(
+                metadata.dp_execution_token_counts,
+                getattr(metadata, "raw_dp_execution_token_counts", None),
+                verify_width,
+            )
+        elif verify_width > 1 and batch_size % verify_width == 0:
+            admission_batch = batch_size // verify_width
+        else:
+            admission_batch = batch_size
+        if self._is_spec_draft and verify_width <= 1 and self._draft_query_width > 1:
+            # Capacity is in sequences. Draft rows are query_width per sequence
+            # but the captured graph stays width 1, so fold only this gate.
+            if self.dp_size > 1:
+                active_counts = _dp_active_execution_counts(
+                    metadata.dp_execution_token_counts,
+                    getattr(metadata, "raw_dp_execution_token_counts", None),
+                )
+                if active_counts and all(count % self._draft_query_width == 0 for count in active_counts):
+                    admission_batch = max(active_counts) // self._draft_query_width
+            elif batch_size % self._draft_query_width == 0:
+                admission_batch = batch_size // self._draft_query_width
+        return is_expanded, verify_width, admission_batch
+
     def can_execute(
         self,
         input_ids: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
     ) -> bool:
-        if input_ids.dim() != 1:
+        if self.dp_size == 1 and input_ids.dim() != 1:
             return False
-        if self.dp_size > 1 and self.num_decoding_tokens > 1:
-            # Target validation metadata differs between active and empty DP
-            # ranks, so local graph-admission checks cannot guarantee that the
-            # whole group selects the same runner. Keep the target executor on
-            # eager until the scheduler publishes one group-wide admission
-            # decision. Draft executors use width one; the history policy
-            # below also keeps DP/index-history drafts on Eager until their
-            # global history is refreshed for every draft iteration.
+        # Debug switch. Under DP every rank must see it, not only the expanded one.
+        disable_verify_graph = os.environ.get("XLLM_NO_VERIFY_GRAPH") == "1"
+        if disable_verify_graph and self.dp_size > 1 and self.num_decoding_tokens > 1:
             return False
         batch_size = input_ids.numel()
-        is_expanded_spec_verify = resolve_expanded_decode_metadata(metadata) is not None
-        # Debug isolation switch: force spec-verify batches through the eager
-        # runner while keeping the chunked-typed (expanded) layout, to A/B the
-        # typed-eager semantics against the graph capture/replay path.
-        if is_expanded_spec_verify and os.environ.get("XLLM_NO_VERIFY_GRAPH") == "1":
+        expanded_view = resolve_expanded_decode_metadata(metadata)
+        is_expanded_spec_verify = expanded_view is not None
+        if disable_verify_graph and is_expanded_spec_verify:
             return False
         # MTP spec-verify packs (num_speculative_tokens+1) token-rows per
         # sequence, so batch_size (input_ids.numel()) is in TOKENS while
@@ -247,37 +365,59 @@ class DecodeAclGraphRunner(BaseRunner):
         # (linear_state_indices is per-seq) — the graph still captures/replays
         # at the full token bucket (keyed by padded_batch_size below), this
         # only fixes the graph-vs-eager admission decision.
-        if is_expanded_spec_verify:
+        if self.dp_size == 1 and is_expanded_spec_verify:
             lsi = getattr(metadata, "linear_state_indices", None)
             has_kda_layers = lsi is not None and lsi.numel() > 0
             seq_count = lsi.numel() if has_kda_layers else batch_size
             size_check_bs = seq_count
-            # The captured bucket is a power of two (1/2/4/8/16k) but the
-            # static expanded-verify metadata (per-row q_cu + per-group
-            # q_seq_lens) is only laid out when the PADDED bucket divides by
-            # the spec width. Widths that are not powers of two (w=3 for
-            # num_spec=2, w=5, ...) would capture an entry without the group
-            # layout and silently degrade the in-graph verify semantics —
-            # refuse graph admission there and fall back to eager instead.
-            if batch_size % max(seq_count, 1) == 0 and seq_count > 0:
-                width = batch_size // seq_count
-                if _decode_bucket(batch_size) % width != 0:
-                    return False
-        else:
+        elif self.dp_size == 1:
             size_check_bs = batch_size
+        if self.dp_size == 1 and self._is_spec_draft and self._draft_query_width > 1:
+            if size_check_bs % self._draft_query_width != 0:
+                return False
+            size_check_bs //= self._draft_query_width
         kpool_query_lens = tuple(int(length) for length in getattr(metadata, "kpool_query_lens", ()))
         if kpool_query_lens:
-            if any(length <= 0 for length in kpool_query_lens) or sum(kpool_query_lens) != batch_size:
+            spans_cover_rows = all(length > 0 for length in kpool_query_lens) and sum(kpool_query_lens) == batch_size
+            if not spans_cover_rows:
+                # Only this rank sees the span list. Returning eager here would
+                # leave a peer that has no spans on the shared graph.
+                if self.dp_size > 1:
+                    raise RuntimeError(
+                        "DP KPool graph spans must cover this rank's token rows with positive lengths: "
+                        f"spans={kpool_query_lens}, tokens={batch_size}"
+                    )
                 return False
             query_width = kpool_query_lens[0]
             if any(length != query_width for length in kpool_query_lens[1:]):
-                return False
-            if _decode_bucket(batch_size) % query_width != 0:
+                # Only this rank sees the span list. Returning eager here would
+                # leave a peer that has no spans on the shared graph.
+                if self.dp_size > 1:
+                    raise RuntimeError(
+                        f"DP KPool graph spans must be uniform across requests: spans={kpool_query_lens}"
+                    )
                 return False
         if self.dp_size > 1:
-            # Prefill-typed batches exit before the DP contract check below
-            # (a prefill without DP counts falls back to eager, never raises).
-            if (metadata.is_prefill or metadata.is_chunked_prefill) and not is_expanded_spec_verify:
+            # A verify rank is chunked-prefill locally while a peer can still
+            # be marked decode. dp_is_decode is the replicated step type, so
+            # only a real non-decode step leaves the graph. A local chunked
+            # flag must not make one rank eager and the other replay.
+            dp_is_decode = getattr(metadata, "dp_is_decode", None)
+            if dp_is_decode is None or len(dp_is_decode) != self.dp_size:
+                raise RuntimeError(
+                    "DP decode step requires dp_is_decode on every rank: "
+                    f"got {dp_is_decode!r}, expected length {self.dp_size}"
+                )
+            all_decode = all(dp_is_decode)
+            if input_ids.dim() != 1:
+                if all_decode:
+                    raise RuntimeError(
+                        "DP decode input_ids must be one-dimensional: "
+                        f"rank={self.dp_rank}, shape={tuple(input_ids.shape)}"
+                    )
+                return False
+            local_non_decode = (metadata.is_prefill or metadata.is_chunked_prefill) and not is_expanded_spec_verify
+            if local_non_decode and not all_decode:
                 return False
             # DP ranks share one graph shape, so a missing or malformed
             # Execution counts cannot silently fall back to eager: divergent
@@ -296,8 +436,7 @@ class DecodeAclGraphRunner(BaseRunner):
             _require_positive_execution_counts(execution_counts)
             if not self._eplv2_graph_admits(max(execution_counts)):
                 return False
-            dp_is_decode = getattr(metadata, "dp_is_decode", None)
-            if dp_is_decode is not None and not all(dp_is_decode):
+            if not all_decode:
                 return False
             # MegaMoe shares one fixed graph shape across DP ranks, so the
             # local rows must equal this rank's advertised execution count;
@@ -309,21 +448,40 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"rank={self.dp_rank}, rows={input_ids.shape[0]}, "
                     f"counts={execution_counts}"
                 )
-            # dp_execution_token_counts are TOKEN rows while max_batch is in SEQS (see
-            # the seq-vs-token note above); fold expanded verify rows down to
-            # sequences so both units agree before the bucket comparison.
-            width = 1
-            if is_expanded_spec_verify and size_check_bs > 0 and batch_size % size_check_bs == 0:
-                width = batch_size // size_check_bs
-            max_global_tokens = max(int(c) for c in execution_counts)
-            global_batch = max(
-                (max_global_tokens + width - 1) // width,
-                size_check_bs,
+            _, verify_width, global_batch = self._shared_graph_plan(
+                metadata,
+                batch_size,
+                local_expanded=is_expanded_spec_verify,
             )
+            if global_batch is None:
+                return False
+            max_global_tokens = max(int(c) for c in execution_counts)
+            if self._is_spec_draft and verify_width <= 1 and self._draft_query_width > 1:
+                raw_counts = getattr(metadata, "raw_dp_execution_token_counts", None)
+                active_counts = _dp_active_execution_counts(execution_counts, raw_counts)
+                if any(count % self._draft_query_width != 0 for count in active_counts):
+                    return False
+            if verify_width > 1 and kpool_query_lens:
+                self._require_shared_kpool_layout(
+                    metadata,
+                    batch_size,
+                    _decode_bucket(max_global_tokens),
+                    verify_width,
+                )
+            if input_embedding is not None and input_embedding.shape[0] != batch_size:
+                raise RuntimeError(
+                    "DP decode input_embedding does not match token rows: "
+                    f"rank={self.dp_rank}, tokens={batch_size}, "
+                    f"embedding_rows={int(input_embedding.shape[0])}"
+                )
             ok = (
-                ((not metadata.is_prefill and not metadata.is_chunked_prefill) or is_expanded_spec_verify)
-                and self._has_compatible_decode_metadata(input_ids, metadata)
-                and (input_embedding is None or input_embedding.shape[0] == batch_size)
+                self._has_compatible_decode_metadata(
+                    input_ids,
+                    metadata,
+                    dp_all_decode=True,
+                    local_expanded=is_expanded_spec_verify,
+                    expanded_view=expanded_view,
+                )
                 and _decode_bucket(global_batch) <= self.max_batch
                 and (self.decode_batch_size_limit <= 0 or _decode_bucket(global_batch) <= self.decode_batch_size_limit)
             )
@@ -333,7 +491,12 @@ class DecodeAclGraphRunner(BaseRunner):
             return False
         ok = (
             ((not metadata.is_prefill and not metadata.is_chunked_prefill) or is_expanded_spec_verify)
-            and self._has_compatible_decode_metadata(input_ids, metadata)
+            and self._has_compatible_decode_metadata(
+                input_ids,
+                metadata,
+                local_expanded=is_expanded_spec_verify,
+                expanded_view=expanded_view,
+            )
             and (input_embedding is None or input_embedding.shape[0] == batch_size)
             and bucket_size <= self.max_batch
             and (self.decode_batch_size_limit <= 0 or bucket_size <= self.decode_batch_size_limit)
@@ -521,6 +684,10 @@ class DecodeAclGraphRunner(BaseRunner):
         self,
         input_ids: torch.Tensor,
         metadata: AttentionMetadata,
+        *,
+        dp_all_decode: bool = False,
+        local_expanded: bool | None = None,
+        expanded_view: object | None = None,
     ) -> bool:
         """Check the one-token-per-sequence contract of ACL decode graphs.
 
@@ -530,26 +697,50 @@ class DecodeAclGraphRunner(BaseRunner):
         to raise from _decode_metadata/_validate during fill, propagating rather
         than being swallowed into a silent eager fallback).
         """
-        if not self._is_shape_compatible(input_ids, metadata):
+        if not self._is_shape_compatible(
+            input_ids,
+            metadata,
+            expanded_view=expanded_view,
+            expanded_resolved=local_expanded is not None,
+        ):
+            self._require_dp_all_decode_row_layout(input_ids, metadata, dp_all_decode)
+            self._require_dp_all_decode_block_capacity(input_ids, metadata, dp_all_decode)
             return False
         batch_size = input_ids.numel()
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
+        is_expanded = (
+            local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
+        )
         if not is_expanded and metadata.kv_cu_seq_lens is not None:
             if metadata.kv_cu_seq_lens.numel() not in (
                 batch_size,
                 batch_size + 1,
             ):
+                self._reject_dp_all_decode(
+                    dp_all_decode,
+                    "DP decode kv_cu_seq_lens does not match token rows: "
+                    f"rank={self.dp_rank}, tokens={batch_size}, kv_cu={metadata.kv_cu_seq_lens.numel()}",
+                )
                 return False
         if metadata.q_cu_seq_lens is not None and not is_expanded:
             if metadata.q_cu_seq_lens.numel() not in (
                 batch_size,
                 batch_size + 1,
             ):
+                self._reject_dp_all_decode(
+                    dp_all_decode,
+                    "DP decode q_cu_seq_lens does not match token rows: "
+                    f"rank={self.dp_rank}, tokens={batch_size}, q_cu={metadata.q_cu_seq_lens.numel()}",
+                )
                 return False
         has_initial_state = getattr(metadata, "has_initial_state", None)
         if has_initial_state is not None:
             state_count = has_initial_state.numel()
             if state_count != batch_size and not (is_expanded and state_count > 0 and batch_size % state_count == 0):
+                self._reject_dp_all_decode(
+                    dp_all_decode,
+                    "DP decode has_initial_state does not match token rows: "
+                    f"rank={self.dp_rank}, tokens={batch_size}, states={state_count}",
+                )
                 return False
         linear_idx = getattr(metadata, "linear_state_indices", None)
         if (
@@ -557,6 +748,11 @@ class DecodeAclGraphRunner(BaseRunner):
             and linear_idx.numel() != batch_size
             and not (is_expanded and linear_idx.numel() > 0 and batch_size % linear_idx.numel() == 0)
         ):
+            self._reject_dp_all_decode(
+                dp_all_decode,
+                "DP decode linear_state_indices does not match token rows: "
+                f"rank={self.dp_rank}, tokens={batch_size}, indices={linear_idx.numel()}",
+            )
             return False
         # Linear-attention (KDA) layers read per-sequence conv/ssm state via
         # linear_state_indices; without it the captured graph would index
@@ -564,8 +760,22 @@ class DecodeAclGraphRunner(BaseRunner):
         # slot id per logical sequence — the fill expands it
         # per token row.
         needs_linear_state = any(getattr(cache, "conv", None) is not None for cache in self.layer_caches)
-        if needs_linear_state:
-            if linear_idx is None:
+        if needs_linear_state and linear_idx is None:
+            raw_counts = getattr(metadata, "raw_dp_execution_token_counts", None)
+            # A spec-verify placeholder has no local slots. It still replays
+            # the busy rank's expanded graph, whose padding slot is filled later.
+            placeholder_verify = (
+                raw_counts is not None
+                and 0 <= self.dp_rank < len(raw_counts)
+                and int(raw_counts[self.dp_rank]) <= 0
+                and bool(getattr(metadata, "is_spec_verify", False))
+                and self.num_decoding_tokens > 1
+            )
+            if not placeholder_verify:
+                self._reject_dp_all_decode(
+                    dp_all_decode,
+                    f"DP decode is missing linear_state_indices: rank={self.dp_rank}, tokens={batch_size}",
+                )
                 return False
         return True
 
@@ -606,10 +816,115 @@ class DecodeAclGraphRunner(BaseRunner):
             raise RuntimeError("ACL graph decode requires one scheduler cache slot per token")
         return torch.tensor(host_slots, dtype=torch.int32, device=device)
 
+    def _reject_dp_all_decode(self, dp_all_decode: bool, message: str) -> None:
+        if dp_all_decode:
+            raise RuntimeError(message)
+
+    def _require_dp_all_decode_row_layout(
+        self,
+        input_ids: torch.Tensor,
+        metadata: AttentionMetadata,
+        dp_all_decode: bool,
+    ) -> None:
+        """Raise when one all-decode rank would otherwise drop to eager alone.
+
+        Block-table rows, KV lengths, and cache slots are local. A peer with a
+        matching layout would still enter the graph.
+        """
+        if input_ids.dim() != 1 or not dp_all_decode:
+            return
+        token_rows = int(input_ids.numel())
+        block_table = self._effective_block_table(metadata)
+        kv_seq_lens = metadata.kv_seq_lens
+        expanded = resolve_expanded_decode_metadata(metadata)
+        if expanded is not None:
+            block_table = expanded.block_table
+            kv_seq_lens = expanded.kv_seq_lens
+            host_values = expanded.kv_seq_lens_host_values
+        else:
+            host_values = getattr(metadata, "kv_seq_lens_host_values", None)
+        block_rows = int(block_table.shape[0]) if block_table is not None and block_table.dim() == 2 else None
+        kv_rows = int(kv_seq_lens.numel()) if kv_seq_lens is not None and kv_seq_lens.dim() == 1 else None
+        requires_host = not getattr(self.attention_backend, "is_mla", False) or getattr(
+            self.attention_backend,
+            "requires_host_kv_lengths",
+            False,
+        )
+        host_rows = len(host_values) if host_values is not None else None
+        slot_rows_match = self._has_effective_slot_mapping(metadata, token_rows)
+        rows_match = (
+            block_rows == token_rows
+            and kv_rows == token_rows
+            and slot_rows_match
+            and (not requires_host or host_rows == token_rows)
+        )
+        if rows_match:
+            return
+        raise RuntimeError(
+            "DP decode row layout does not match token rows: "
+            f"rank={self.dp_rank}, tokens={token_rows}, block_rows={block_rows}, "
+            f"kv_rows={kv_rows}, host_kv_rows={host_rows}, slots_match={slot_rows_match}"
+        )
+
+    def _require_dp_all_decode_block_capacity(
+        self,
+        input_ids: torch.Tensor,
+        metadata: AttentionMetadata,
+        dp_all_decode: bool,
+    ) -> None:
+        """Raise when the block table cannot hold this rank's KV lengths.
+
+        A peer whose table is wide enough would still enter the graph. Rows that
+        do not match are reported separately. A complete paged layout is left to
+        the graph.
+        """
+        if input_ids.dim() != 1 or not dp_all_decode:
+            return
+        block_table = self._effective_block_table(metadata)
+        expanded = resolve_expanded_decode_metadata(metadata)
+        if expanded is not None:
+            block_table = expanded.block_table
+            host_values = expanded.kv_seq_lens_host_values
+            paged_kv_indptr = expanded.paged_kv_indptr
+            paged_kv_indices = expanded.paged_kv_indices
+            paged_kv_last_page_len = expanded.paged_kv_last_page_len
+        else:
+            host_values = getattr(metadata, "kv_seq_lens_host_values", None)
+            paged_kv_indptr = metadata.paged_kv_indptr
+            paged_kv_indices = metadata.paged_kv_indices
+            paged_kv_last_page_len = metadata.paged_kv_last_page_len
+        if block_table is None or block_table.dim() != 2 or host_values is None:
+            return
+        sequence_count = int(block_table.shape[0])
+        if len(host_values) != sequence_count:
+            return
+        paged_missing = paged_kv_indptr is None or paged_kv_indices is None or paged_kv_last_page_len is None
+        paged_mismatch = (not paged_missing) and (
+            paged_kv_last_page_len.numel() != sequence_count or paged_kv_indptr.numel() != sequence_count + 1
+        )
+        if not paged_missing and not paged_mismatch:
+            return
+        page_size = int(self.attention_backend.page_size)
+        table_width = int(block_table.shape[1])
+        if (
+            page_size > 0
+            and table_width > 0
+            and all((max(int(kv_seq_len), 1) + page_size - 1) // page_size <= table_width for kv_seq_len in host_values)
+        ):
+            return
+        raise RuntimeError(
+            "DP decode block table cannot hold the KV length: "
+            f"rank={self.dp_rank}, page_size={page_size}, columns={table_width}, "
+            f"kv_lengths={list(host_values)}"
+        )
+
     def _is_shape_compatible(
         self,
         input_ids: torch.Tensor,
         metadata: AttentionMetadata,
+        expanded_view: object | None = None,
+        *,
+        expanded_resolved: bool = False,
     ) -> bool:
         """Pure, side-effect-free shape/contract pre-check.
 
@@ -619,12 +934,13 @@ class DecodeAclGraphRunner(BaseRunner):
         any state this does not cover raises later (let-it-crash, §7) instead
         of being silently swallowed. No on-device paging construction.
         """
-        block_table = self._effective_block_table(metadata)
-        kv_seq_lens = metadata.kv_seq_lens
-        expanded = resolve_expanded_decode_metadata(metadata)
+        expanded = expanded_view if expanded_resolved else resolve_expanded_decode_metadata(metadata)
         if expanded is not None:
             block_table = expanded.block_table
             kv_seq_lens = expanded.kv_seq_lens
+        else:
+            block_table = self._effective_block_table(metadata)
+            kv_seq_lens = metadata.kv_seq_lens
         if block_table is None or kv_seq_lens is None:
             return False
         if block_table.dim() != 2 or kv_seq_lens.dim() != 1:
@@ -721,13 +1037,12 @@ class DecodeAclGraphRunner(BaseRunner):
         # Same seq-vs-token admission as execute: MTP verify packs
         # (num_spec+1) token-rows per seq, so the capacity gate (max_batch,
         # in seqs) must compare SEQUENCE count, not token count.
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
-        if is_expanded:
-            lsi = getattr(metadata, "linear_state_indices", None)
-            cap_bs = lsi.numel() if lsi is not None and lsi.numel() > 0 else batch_size
-        else:
-            cap_bs = batch_size
-        if _decode_bucket(cap_bs) > self.max_batch:
+        _, _, admission_batch = self._shared_graph_plan(
+            metadata,
+            batch_size,
+            local_expanded=resolve_expanded_decode_metadata(metadata) is not None,
+        )
+        if admission_batch is None or _decode_bucket(admission_batch) > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
 
         # Graph capture is performed lazily by ``execute`` on the first decode
@@ -748,16 +1063,10 @@ class DecodeAclGraphRunner(BaseRunner):
         input_batch: InputBatch | None = None,
     ) -> ModelExecutionOutput:
         batch_size = input_ids.shape[0]
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
         # Same seq-vs-token admission as can_execute: MTP verify packs
         # (num_spec+1) token-rows per seq, so the capacity gate (max_batch, in
         # seqs) must compare SEQUENCE count, not token count. The graph is still
         # keyed/captured at the full token bucket (padded_batch_size).
-        if is_expanded:
-            lsi = getattr(metadata, "linear_state_indices", None)
-            cap_bs = lsi.numel() if lsi is not None and lsi.numel() > 0 else batch_size
-        else:
-            cap_bs = batch_size
         if self.dp_size > 1:
             # DP ranks share one captured graph shape: the bucket must be the
             # GLOBAL max token count, not this rank's local batch_size, so
@@ -768,8 +1077,8 @@ class DecodeAclGraphRunner(BaseRunner):
             # buffers / q_cu / q_seq_lens are all per token row; folding tokens
             # back to sequences here would under-size the buffers and crash
             # _fill_entry's per-token-row copy. The sequence capacity gate
-            # below (_decode_bucket(cap_bs) <= max_batch) is a separate
-            # seq-unit check. Assert this rank's count equals its batch_size.
+            # below uses the shared verify layout, including an empty rank.
+            # Assert this rank's count equals its batch_size.
             execution_counts = getattr(metadata, "dp_execution_token_counts", None)
             if execution_counts is None or len(execution_counts) != self.dp_size:
                 raise RuntimeError(
@@ -787,14 +1096,20 @@ class DecodeAclGraphRunner(BaseRunner):
             padded_batch_size = _decode_bucket(max_global_tokens)
         else:
             padded_batch_size = _decode_bucket(batch_size)
-        if _decode_bucket(cap_bs) > self.max_batch:
+        expanded_view = resolve_expanded_decode_metadata(metadata)
+        is_expanded, verify_width, admission_batch = self._shared_graph_plan(
+            metadata,
+            batch_size,
+            local_expanded=expanded_view is not None,
+        )
+        if admission_batch is None or _decode_bucket(admission_batch) > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
 
-        verify_width = batch_size // cap_bs if is_expanded and cap_bs > 0 and batch_size % cap_bs == 0 else 1
-        kpool_query_lens = self._padded_kpool_query_lens(
+        kpool_query_lens = self._graph_kpool_query_lens(
             metadata,
             batch_size,
             padded_batch_size,
+            verify_width,
         )
         graph_key = self._graph_key(
             padded_batch_size,
@@ -812,6 +1127,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 positions,
                 metadata,
                 input_batch,
+                verify_width=verify_width,
             )
             entry.eplb = self._allocate_graph_eplb_state(eplb, padded_batch_size)
             self._graphs[graph_key] = entry
@@ -839,6 +1155,9 @@ class DecodeAclGraphRunner(BaseRunner):
             batch_size,
             input_embedding,
             input_batch,
+            verify_width=verify_width,
+            kpool_query_lens=kpool_query_lens,
+            local_expanded=expanded_view is not None,
         )
 
         prepare_context = ForwardContext(
@@ -959,18 +1278,20 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         num_tokens: int,
         padded_num_tokens: int,
+        verify_width: int = 1,
     ) -> tuple[int, ...]:
-        """Return uniform KPool request spans covering the graph bucket."""
+        """Return uniform KPool request spans for the complete groups in a bucket.
+
+        A tail shorter than the request width stays in the tensor as padding and
+        is not another request. Expanded verify with no metadata spans uses
+        ``verify_width``, so an empty rank and a busy rank share one graph key.
+        """
         query_lens = tuple(int(length) for length in getattr(metadata, "kpool_query_lens", ()))
         if not query_lens:
-            uses_compressed_kpool_tail = any(
-                cache.kpool_tail is not None
-                and cache.kpool_tail.dim() == 4
-                and cache.kpool_tail.dtype == torch.bfloat16
-                for cache in self.layer_caches
-            )
-            if not uses_compressed_kpool_tail:
+            if not self._uses_compressed_kpool_tail():
                 return ()
+            if verify_width > 1:
+                return _complete_kpool_groups(padded_num_tokens, verify_width)
             query_lens = (1,) * num_tokens
         if any(length <= 0 for length in query_lens):
             raise RuntimeError(f"KPool graph query spans must be positive: {query_lens}")
@@ -982,12 +1303,62 @@ class DecodeAclGraphRunner(BaseRunner):
         query_width = query_lens[0]
         if any(length != query_width for length in query_lens[1:]):
             raise RuntimeError(f"KPool ACL graph requires uniform request spans: {query_lens}")
-        if padded_num_tokens % query_width != 0:
+        pad_rows = padded_num_tokens - num_tokens
+        full_groups = pad_rows // query_width
+        return query_lens + (query_width,) * full_groups
+
+    def _uses_compressed_kpool_tail(self) -> bool:
+        return any(
+            cache.kpool_tail is not None and cache.kpool_tail.dim() == 4 and cache.kpool_tail.dtype == torch.bfloat16
+            for cache in self.layer_caches
+        )
+
+    def _canonical_kpool_query_lens(self, padded_num_tokens: int, verify_width: int) -> tuple[int, ...]:
+        """Complete-group spans every DP rank uses for one verify graph bucket.
+
+        ``padded // width`` groups of ``width`` cover the rows that fill a
+        request. A shorter tail is bucket padding and is omitted here.
+        """
+        if not self._uses_compressed_kpool_tail():
+            return ()
+        return _complete_kpool_groups(padded_num_tokens, verify_width)
+
+    def _graph_kpool_query_lens(
+        self,
+        metadata: AttentionMetadata,
+        num_tokens: int,
+        padded_num_tokens: int,
+        verify_width: int,
+    ) -> tuple[int, ...]:
+        if self.dp_size > 1 and verify_width > 1 and self._uses_compressed_kpool_tail():
+            return _complete_kpool_groups(padded_num_tokens, verify_width)
+        return self._padded_kpool_query_lens(
+            metadata,
+            num_tokens,
+            padded_num_tokens,
+            verify_width=verify_width,
+        )
+
+    def _require_shared_kpool_layout(
+        self,
+        metadata: AttentionMetadata,
+        num_tokens: int,
+        padded_num_tokens: int,
+        verify_width: int,
+    ) -> None:
+        if self.dp_size <= 1 or verify_width <= 1 or not self._uses_compressed_kpool_tail():
+            return
+        local = self._padded_kpool_query_lens(
+            metadata,
+            num_tokens,
+            padded_num_tokens,
+            verify_width=verify_width,
+        )
+        shared = self._canonical_kpool_query_lens(padded_num_tokens, verify_width)
+        if local != shared:
             raise RuntimeError(
-                "KPool ACL graph token bucket must be divisible by its request width: "
-                f"bucket={padded_num_tokens}, width={query_width}"
+                f"DP KPool graph spans do not match the shared bucket layout: local={local}, shared={shared}"
             )
-        return query_lens + (query_width,) * ((padded_num_tokens - num_tokens) // query_width)
 
     def _allocate_entry(
         self,
@@ -996,6 +1367,7 @@ class DecodeAclGraphRunner(BaseRunner):
         positions: torch.Tensor,
         metadata: AttentionMetadata,
         input_batch: InputBatch | None = None,
+        verify_width: int = 1,
     ) -> _DecodeGraphEntry:
         device = input_ids.device
         (
@@ -1052,10 +1424,11 @@ class DecodeAclGraphRunner(BaseRunner):
                     metadata,
                 )
         entry.static_input_embedding = None
-        kpool_query_lens = self._padded_kpool_query_lens(
+        kpool_query_lens = self._graph_kpool_query_lens(
             metadata,
             input_ids.numel(),
             padded_batch_size,
+            verify_width,
         )
         needs_accepted_tokens = getattr(metadata, "num_accepted_tokens", None) is not None or (
             self.num_decoding_tokens > 1
@@ -1132,13 +1505,14 @@ class DecodeAclGraphRunner(BaseRunner):
         )
         entry.static_metadata.q_cu_host_values = [0] * (padded_batch_size + 1)
         expanded_view = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
-        is_expanded = expanded_view is not None
-        entry.static_metadata.is_spec_verify = is_expanded
+        local_expanded = expanded_view is not None
+        group_expanded = verify_width > 1 or local_expanded
+        entry.static_metadata.is_spec_verify = group_expanded
         entry.kv_seq_lens_delta = torch.empty(padded_batch_size, dtype=torch.int32, device=device)
         # The graph metadata update writes per-sequence KV lengths into this
         # buffer.  MLA/SFA consumes the same stable buffer as its key lengths.
         entry.static_metadata.kv_seq_lens = entry.kv_seq_lens_delta
-        if is_expanded:
+        if group_expanded:
             # Spec-verify rows per logical sequence: the static q_cu holds
             # GROUP boundaries [0, w, 2w, ...] so the in-graph KDA verify
             # grouping derives the sequence count without host syncs.
@@ -1147,25 +1521,27 @@ class DecodeAclGraphRunner(BaseRunner):
             # sequence count (N) for typed expanded verify — otherwise
             # spec_width stays 1 and q_seq_lens is built as N*w single-token
             # groups, breaking the KDA recurrent-state chain.
-            expanded_kv = expanded_view.kv_seq_lens
-            src_rows = expanded_kv.shape[0] if expanded_kv is not None else 0
-            src_lsi = getattr(metadata, "linear_state_indices", None)
-            src_seqs = src_lsi.shape[0] if src_lsi is not None else 0
-            spec_width = 1
-            if src_seqs > 0 and src_rows > src_seqs and src_rows % src_seqs == 0:
-                spec_width = src_rows // src_seqs
-            w = spec_width
-            if padded_batch_size % w == 0:
-                # q_cu stays PER-ROW (the eager verify layout the attention
-                # backends consume); the per-SEQENCE group count rides on
-                # q_seq_lens (N entries of value w).
+            # An empty rank has no expanded view. It still uses the shared
+            # verify width so q_cu matches the busy rank's graph.
+            w = verify_width if verify_width > 1 else 1
+            if local_expanded and w == 1:
+                expanded_kv = expanded_view.kv_seq_lens
+                src_rows = expanded_kv.shape[0] if expanded_kv is not None else 0
+                src_lsi = getattr(metadata, "linear_state_indices", None)
+                src_seqs = src_lsi.shape[0] if src_lsi is not None else 0
+                if src_seqs > 0 and src_rows > src_seqs and src_rows % src_seqs == 0:
+                    w = src_rows // src_seqs
+            # q_cu stays PER-ROW over the whole bucket, including padding.
+            # q_seq_lens lists only complete verify groups. A tail that does
+            # not fill another group stays padding and is not a fake sequence.
+            n_groups = padded_batch_size // w
+            if n_groups > 0:
                 entry.static_metadata.q_cu_seq_lens = torch.arange(
                     0, padded_batch_size + 1, 1, dtype=torch.int32, device=device
                 )
                 entry.static_metadata.q_cu_host_values = list(range(padded_batch_size + 1))
-                entry.static_metadata.q_seq_lens = torch.full(
-                    (padded_batch_size // w,), w, dtype=torch.int32, device=device
-                )
+                entry.static_metadata.q_seq_lens = torch.full((n_groups,), w, dtype=torch.int32, device=device)
+                entry.static_metadata.spec_group_width = w
             entry.static_metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
                 kv_seq_lens=entry.kv_seq_lens_delta,
                 block_table=entry.static_metadata.block_table,
@@ -1242,15 +1618,20 @@ class DecodeAclGraphRunner(BaseRunner):
         batch_size: int,
         input_embedding: torch.Tensor | None,
         input_batch: InputBatch | None = None,
+        verify_width: int = 1,
+        kpool_query_lens: tuple[int, ...] | None = None,
+        local_expanded: bool | None = None,
     ) -> None:
         padded_batch_size = entry.batch_size
         static_metadata = entry.static_metadata
         static_metadata.is_dummy = bool(getattr(metadata, "is_dummy", False))
-        kpool_query_lens = self._padded_kpool_query_lens(
-            metadata,
-            batch_size,
-            padded_batch_size,
-        )
+        if kpool_query_lens is None:
+            kpool_query_lens = self._graph_kpool_query_lens(
+                metadata,
+                batch_size,
+                padded_batch_size,
+                verify_width,
+            )
         if kpool_query_lens != static_metadata.kpool_query_lens:
             raise RuntimeError(
                 "KPool query-span layout changed for an existing ACL graph: "
@@ -1278,7 +1659,9 @@ class DecodeAclGraphRunner(BaseRunner):
             slot_mapping,
             block_table.shape[0],
         )
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
+        is_expanded = (
+            local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
+        )
         cumulative_kv_seq_lens = self._cumulative_lengths(
             kv_seq_lens,
             None if is_expanded else metadata.kv_cu_seq_lens,

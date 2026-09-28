@@ -1334,6 +1334,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
         eplb::expand_decode_token_mask(
             new_input.input_params.expert.eplb_decode_token_mask,
             options_.num_speculative_tokens() + 1);
+    // Idle decode joins the busy ranks' target validate. Mark the same spec
+    // verify flag so every rank captures one expanded graph instead of a
+    // width-1 graph on the dummy row.
+    if (use_chunked_prefill_spec_verify_path()) {
+      new_input.input_params.is_spec_verify = true;
+    }
     // Deadlock-safety under DP: this rank's shard is empty but all peers
     // decode, so busy peers allgather their pruned validate counts before the
     // target forward. Join that allgather in lockstep with this rank's uniform
@@ -3082,8 +3088,8 @@ void MTPWorkerImpl::update_decode_step_input(
           input.input_params.attention.host.block_tables;
       if (block_tables.defined() && block_tables.dim() == 2 &&
           seq_id < block_tables.size(0)) {
-        const int32_t allocated_kv_len = static_cast<int32_t>(
-            block_tables.size(1) * logical_block_size());
+        const int32_t allocated_kv_len =
+            static_cast<int32_t>(block_tables.size(1) * logical_block_size());
         const int32_t validate_width = options_.num_speculative_tokens() + 1;
         const int32_t max_valid_position = allocated_kv_len - validate_width;
         if (current_position > max_valid_position) {

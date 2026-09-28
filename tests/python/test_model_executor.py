@@ -812,6 +812,7 @@ class TestModelExecutorConstruction:
             num_decoding_tokens=4,
             enable_mega_moe_token_mask=False,
             is_spec_draft=is_spec_draft,
+            draft_query_width=1,
         )
 
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
@@ -975,7 +976,31 @@ class TestModelExecutorConstruction:
             num_decoding_tokens=4,
             enable_mega_moe_token_mask=True,
             is_spec_draft=False,
+            draft_query_width=1,
         )
+
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_acl_graph_forwards_nondefault_draft_query_width(
+        self,
+        mock_create: MagicMock,
+        mock_graph_runner: MagicMock,
+    ) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+
+        ModelExecutor(
+            model,
+            {
+                "max_position_embeddings": 128,
+                "python_graph_backend": "aclgraph",
+                "draft_query_width": 8,
+            },
+            max_seqs_per_batch=8,
+            is_spec_draft=True,
+        )
+
+        assert mock_graph_runner.call_args.kwargs["draft_query_width"] == 8
 
 
 class TestDecodeCudaGraphDataParallelKeys:
@@ -1539,7 +1564,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
         assert _decode_bucket(4) == 4
         assert _decode_bucket(5) == 8
 
-    def test_mega_moe_dp_uses_ceil_divided_local_graph_capacity(self) -> None:
+    def test_mega_moe_dp_keeps_full_sequence_graph_capacity(self) -> None:
         runner = DecodeAclGraphRunner(
             nn.Identity(),
             _PagedStubAttentionBackend(),
@@ -1550,7 +1575,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
             enable_mega_moe_token_mask=True,
         )
 
-        assert runner.max_batch == 5
+        assert runner.max_batch == 68
         assert _decode_bucket(1) == 1
         assert _decode_bucket(5) == 8
         assert _decode_bucket(6) == 8

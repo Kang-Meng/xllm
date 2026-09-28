@@ -74,15 +74,19 @@ runtime::Options target_options(const runtime::Options& options) {
 runtime::Options draft_options(const runtime::Options& options) {
   // DSpark sizes its attention window from num_speculative_tokens; other
   // DFlash-style drafts still run one step at a time.
+  const bool sample_from_anchor = options.speculative_algorithm() == "DSpark";
   const int32_t draft_num_speculative_tokens =
-      options.speculative_algorithm() == "DSpark"
-          ? options.num_speculative_tokens()
-          : 0;
+      sample_from_anchor ? options.num_speculative_tokens() : 0;
+  const int32_t draft_query_width =
+      std::max(1,
+               dflash_detail::decode_draft_width(
+                   options.num_speculative_tokens(), sample_from_anchor));
   runtime::Options opts = options;
   opts.enable_schedule_overlap(false)
       .is_draft_engine(true)
       .num_decoding_tokens(1)
       .num_speculative_tokens(draft_num_speculative_tokens)
+      .draft_graph_query_width(draft_query_width)
       .enable_graph_aux_hidden_states(false);
   return opts;
 }
@@ -534,6 +538,10 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
           *draft_impl_, query_input, *prepare_stream_, *compute_stream_);
 
   ForwardInput validate_input = input;
+  // Idle decode joins the busy ranks' target validate. Mark the same spec
+  // verify flag so every rank captures one expanded graph instead of a
+  // separate width-1 graph on the dummy row.
+  validate_input.input_params.is_spec_verify = target_is_hybrid_recurrent_;
   // DSpark's N-wide draft geometry must be rescaled to (N+1) for the target's
   // anchor + drafts forward.
   scale_speculative_parallel_token_counts(

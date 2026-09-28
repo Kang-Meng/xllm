@@ -57,6 +57,8 @@ struct OptimizationConfig {
 struct SpeculativeRuntimeConfig {
   bool is_draft_engine = false;
   bool adaptive_enabled = false;
+  // Rows per draft sequence. 1 keeps draft graph admission in token units.
+  int32_t draft_query_width = 1;
 };
 
 class ModelContext {

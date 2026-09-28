@@ -727,13 +727,33 @@ def _current_q_seq_lens(num_seqs: int, num_tokens: int) -> list[int]:
     return [ends[0]] + [ends[i] - ends[i - 1] for i in range(1, len(ends))]
 
 
+def _prefix_token_tensor(tensor: torch.Tensor, num_tokens: int, keep_rows: int) -> torch.Tensor:
+    """Keep the leading token rows of a ``[T, ...]`` or ``[1, T, ...]`` tensor.
+
+    ACL decode graph batches are flat or a single packed row. A multi-row batch
+    is not token-prefix addressable, so it is rejected instead of reshaped.
+    """
+    if keep_rows >= num_tokens:
+        return tensor
+    if tensor.shape[0] == num_tokens:
+        return tensor[:keep_rows]
+    if tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.shape[1] == num_tokens:
+        return tensor[:, :keep_rows]
+    raise RuntimeError(
+        f"cannot keep the first {keep_rows} token rows of shape {tuple(tensor.shape)} for num_tokens={num_tokens}"
+    )
+
+
 def _kpool_update_query_lens(ctx: MlaIndexContext, num_tokens: int) -> list[int]:
     """Resolve logical request spans for request-owned KPool tail updates."""
     if ctx.kpool_query_lens:
         query_lens = [int(length) for length in ctx.kpool_query_lens]
         if any(length <= 0 for length in query_lens):
             raise RuntimeError(f"kPool query spans must be positive: spans={query_lens}")
-        if sum(query_lens) != num_tokens:
+        covered = sum(query_lens)
+        # ACL graph buckets can extend past the last complete request. Those
+        # tail rows stay in the tensor and are sliced off before the update.
+        if covered != num_tokens and not (in_acl_graph() and 0 < covered < num_tokens):
             raise RuntimeError(
                 f"kPool query spans must cover the current token rows: spans={query_lens}, num_tokens={num_tokens}"
             )
@@ -1284,6 +1304,7 @@ class Glm5NextIndexer(nn.Module):
         """Update the selected KPool layout and return SFA token indices."""
         batch_size, seq_len = hidden_states.shape[:2]
         num_tokens = batch_size * seq_len
+        full_num_tokens = num_tokens
         key, weights = self._project_key_weights(hidden_states)
         if ctx.block_table is None:
             raise RuntimeError("GLM-5.3-Flash kPool requires a block table")
@@ -1304,6 +1325,19 @@ class Glm5NextIndexer(nn.Module):
             query_lens_device = None
         if uses_compressed_tail and in_acl_graph() and query_lens_device is None:
             raise RuntimeError("ACL graph compressed KPool requires device query lengths matching its request spans")
+        if kpool_query_lens is not None and sum(kpool_query_lens) < num_tokens:
+            # Spans list complete requests only. Bucket rows after that prefix
+            # are padding: keep them out of the tail update, then pad top-k
+            # back so attention still sees the captured bucket.
+            keep_rows = sum(kpool_query_lens)
+            hidden_states = _prefix_token_tensor(hidden_states, num_tokens, keep_rows)
+            key = _prefix_token_tensor(key, num_tokens, keep_rows)
+            weights = _prefix_token_tensor(weights, num_tokens, keep_rows)
+            qr = _prefix_token_tensor(qr, num_tokens, keep_rows)
+            positions = _prefix_token_tensor(positions, num_tokens, keep_rows)
+            attention_mask = _prefix_token_tensor(attention_mask, num_tokens, keep_rows)
+            num_tokens = keep_rows
+            batch_size, seq_len = hidden_states.shape[:2]
         kpool_block_table = ctx.block_table
         pool_query_block_table = kpool_block_table
         kpool_kv_lens = ctx.actual_seq_kv.reshape(-1).to(torch.int64)
@@ -1325,7 +1359,14 @@ class Glm5NextIndexer(nn.Module):
                     kpool_query_lens,
                     query_lens_device,
                 )
-                kpool_valid_rows = _kpool_valid_rows(attention_mask, ctx.slot_mapping)
+                slot_mapping = ctx.slot_mapping
+                if (
+                    slot_mapping is not None
+                    and num_tokens < full_num_tokens
+                    and slot_mapping.numel() == full_num_tokens
+                ):
+                    slot_mapping = _prefix_token_tensor(slot_mapping, full_num_tokens, num_tokens)
+                kpool_valid_rows = _kpool_valid_rows(attention_mask, slot_mapping)
                 triton_query_len = _compact_kpool_triton_query_len(kpool_query_lens, self.index_kpool)
                 # Decode/spec-verify resolves read/write to the same tensor. A
                 # distinct prefix-restore destination needs the torch path's
@@ -1472,7 +1513,10 @@ class Glm5NextIndexer(nn.Module):
         )
         if is_varlen:
             topk_indices = topk_indices[valid]
-        return topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
+        topk_indices = topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
+        if num_tokens < full_num_tokens:
+            topk_indices = F.pad(topk_indices, (0, 0, 0, 0, 0, full_num_tokens - num_tokens), value=-1)
+        return topk_indices
 
 
 # ---------------------------------------------------------------------------

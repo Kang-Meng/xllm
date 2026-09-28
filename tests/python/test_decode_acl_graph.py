@@ -758,7 +758,7 @@ def test_dp_empty_rank_uses_group_wide_acl_graph_bucket() -> None:
         )
 
 
-def test_dp_mtp_target_active_and_empty_ranks_use_eager() -> None:
+def test_dp_mtp_target_dummy_rank_uses_shared_graph_bucket() -> None:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False)
     active_runner = DecodeAclGraphRunner(
         nn.Identity(),
@@ -790,56 +790,319 @@ def test_dp_mtp_target_active_and_empty_ranks_use_eager() -> None:
         dp_rank=0,
         num_decoding_tokens=1,
     )
-    active_metadata = _dp_metadata((4, 0))
-    active_metadata.is_dummy = False
-    empty_metadata = _dp_metadata((4, 0))
-    empty_metadata.is_dummy = True
+    metadata = _dp_metadata((4, 0))
 
-    with (
-        patch.object(
-            active_runner,
-            "_has_compatible_decode_metadata",
-            return_value=True,
-        ),
-        patch.object(
-            empty_runner,
-            "_has_compatible_decode_metadata",
-            return_value=True,
-        ),
-        patch.object(
-            draft_runner,
-            "_has_compatible_decode_metadata",
-            return_value=True,
-        ),
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
     ):
-        assert not active_runner.can_execute(
-            torch.zeros(4, dtype=torch.int32),
-            active_metadata,
-        )
-        assert not empty_runner.can_execute(
-            torch.zeros(1, dtype=torch.int32),
-            empty_metadata,
-        )
-        assert draft_runner.can_execute(
-            torch.zeros(4, dtype=torch.int32),
-            active_metadata,
-        )
+        assert active_runner.can_execute(torch.zeros(4, dtype=torch.int32), metadata)
+        assert empty_runner.can_execute(torch.zeros(1, dtype=torch.int32), metadata)
+        assert draft_runner.can_execute(torch.zeros(4, dtype=torch.int32), metadata)
 
 
-@pytest.mark.parametrize(
-    ("width", "disable_verify_graph"),
-    [
-        pytest.param(4, False, id="kda-verify-default"),
-        pytest.param(4, True, id="verify-graph-disabled"),
-        pytest.param(3, False, id="unsupported-verify-width"),
-    ],
-)
-def test_dp_mtp_target_fallback_is_group_wide(
-    width: int,
-    disable_verify_graph: bool,
-) -> None:
+def test_dp_expanded_verify_and_dummy_rank_share_graph_decision() -> None:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False)
-    active_runner = DecodeAclGraphRunner(
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=3,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=4,
+        )
+        for rank in range(2)
+    ]
+    active = _expanded_verify_metadata(4)
+    active.dp_execution_token_counts = (4, 1)
+    active.raw_dp_execution_token_counts = (4, 0)
+    active.is_spec_verify = True
+    active.is_chunked_prefill = True
+    dummy = _dp_metadata((4, 0))
+    dummy.raw_dp_execution_token_counts = (4, 0)
+    dummy.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0].can_execute(torch.zeros(4, dtype=torch.int32), active)
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
+        busy_plan = runners[0]._shared_graph_plan(active, 4)
+        empty_plan = runners[1]._shared_graph_plan(dummy, 1)
+        assert busy_plan == empty_plan == (True, 4, 1)
+
+    wide_runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=16,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=4,
+        )
+        for rank in range(2)
+    ]
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert wide_runners[0].can_execute(torch.zeros(4, dtype=torch.int32), active)
+        assert wide_runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
+
+
+def test_dp_plain_decode_with_empty_rank_keeps_width_one() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=3,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=4,
+        )
+        for rank in range(2)
+    ]
+    active = _dp_metadata((4, 0))
+    active.raw_dp_execution_token_counts = (4, 0)
+    dummy = _dp_metadata((4, 0))
+    dummy.raw_dp_execution_token_counts = (4, 0)
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0]._shared_graph_plan(active, 4) == (False, 1, 4)
+        assert runners[1]._shared_graph_plan(dummy, 1) == (False, 1, 4)
+        assert runners[0].can_execute(torch.zeros(4, dtype=torch.int32), active) is False
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy) is False
+
+
+def test_dp_empty_spec_rank_matches_busy_verify_graph_key() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=3,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=4,
+        )
+        for rank in range(2)
+    ]
+    active = _expanded_verify_metadata(4)
+    active.dp_execution_token_counts = (4, 1)
+    active.raw_dp_execution_token_counts = (4, 0)
+    active.is_spec_verify = True
+    dummy = _dp_metadata((4, 0))
+    dummy.raw_dp_execution_token_counts = (4, 0)
+    dummy.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        busy_plan = runners[0]._shared_graph_plan(active, 4)
+        empty_plan = runners[1]._shared_graph_plan(dummy, 1)
+        assert busy_plan == (True, 4, 1)
+        assert empty_plan == busy_plan
+        busy_key = DecodeAclGraphRunner._graph_key(4, busy_plan[0], None, (), verify_width=busy_plan[1])
+        empty_key = DecodeAclGraphRunner._graph_key(4, empty_plan[0], None, (), verify_width=empty_plan[1])
+        assert busy_key == empty_key
+        assert runners[0].can_execute(torch.zeros(4, dtype=torch.int32), active)
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
+
+        unmarked = _expanded_verify_metadata(4)
+        unmarked.dp_execution_token_counts = (4, 1)
+        unmarked.raw_dp_execution_token_counts = (4, 0)
+        unmarked.is_spec_verify = False
+        with pytest.raises(RuntimeError, match="group-wide spec verify"):
+            runners[0]._shared_graph_plan(unmarked, 4)
+
+
+def test_dflash_draft_graph_capacity_uses_sequence_count() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=1,
+            is_spec_draft=True,
+            draft_query_width=8,
+        )
+        for rank in range(2)
+    ]
+    active = _dp_metadata((16, 0))
+    active.raw_dp_execution_token_counts = (16, 0)
+    dummy = _dp_metadata((16, 0))
+    dummy.raw_dp_execution_token_counts = (16, 0)
+    misaligned = _dp_metadata((10, 0))
+    misaligned.raw_dp_execution_token_counts = (10, 0)
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0]._shared_graph_plan(active, 16) == (False, 1, 2)
+        assert runners[1]._shared_graph_plan(dummy, 1) == (False, 1, 2)
+        assert runners[0].can_execute(torch.zeros(16, dtype=torch.int32), active)
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
+        assert runners[0].can_execute(torch.zeros(10, dtype=torch.int32), misaligned) is False
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), misaligned) is False
+
+
+def test_dp_uneven_sequences_stay_in_graph_with_full_batch_capacity() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=6,
+        )
+        for rank in range(2)
+    ]
+    active = _dp_metadata((48, 0))
+    active.raw_dp_execution_token_counts = (48, 0)
+    active.is_spec_verify = True
+    dummy = _dp_metadata((48, 0))
+    dummy.raw_dp_execution_token_counts = (48, 0)
+    dummy.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0].max_batch == 8
+        assert runners[0].can_execute(torch.zeros(48, dtype=torch.int32), active)
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
+
+
+def test_dp_spec_verify_width_six_pads_to_bucket_eight() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=64,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=6,
+        )
+        for rank in range(2)
+    ]
+    active = _expanded_verify_metadata(6)
+    active.dp_execution_token_counts = (6, 6)
+    active.raw_dp_execution_token_counts = (6, 6)
+    active.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0]._shared_graph_plan(active, 6) == (True, 6, 1)
+        assert runners[0].can_execute(torch.zeros(6, dtype=torch.int32), active)
+        assert runners[1].can_execute(torch.zeros(6, dtype=torch.int32), active)
+
+
+def test_dp_spec_verify_refuses_bucket_not_divisible_by_width() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=3,
+        )
+        for rank in range(2)
+    ]
+    active = _dp_metadata((2, 0))
+    active.raw_dp_execution_token_counts = (2, 0)
+    active.is_spec_verify = True
+    dummy = _dp_metadata((2, 0))
+    dummy.raw_dp_execution_token_counts = (2, 0)
+    dummy.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0]._shared_graph_plan(active, 2) == (True, 3, None)
+        assert runners[1]._shared_graph_plan(dummy, 1) == (True, 3, None)
+        assert runners[0].can_execute(torch.zeros(2, dtype=torch.int32), active) is False
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy) is False
+
+
+def test_dp_spec_verify_uses_num_decoding_tokens_on_every_rank() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=16,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=8,
+        )
+        for rank in range(2)
+    ]
+    active = _expanded_verify_metadata(8)
+    active.dp_execution_token_counts = (8, 1)
+    active.raw_dp_execution_token_counts = (8, 0)
+    active.is_spec_verify = True
+    dummy = _dp_metadata((8, 0))
+    dummy.raw_dp_execution_token_counts = (8, 0)
+    dummy.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0]._shared_graph_plan(active, 8) == (True, 8, 1)
+        assert runners[1]._shared_graph_plan(dummy, 1) == (True, 8, 1)
+
+
+def test_dp_spec_verify_rejects_measured_width_mismatch() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runner = DecodeAclGraphRunner(
         nn.Identity(),
         attention_backend,
         torch.device("cpu"),
@@ -847,8 +1110,181 @@ def test_dp_mtp_target_fallback_is_group_wide(
         max_model_len=8,
         dp_size=2,
         dp_rank=0,
-        num_decoding_tokens=width,
+        num_decoding_tokens=8,
     )
+    active = _expanded_verify_metadata(4)
+    active.dp_execution_token_counts = (4, 1)
+    active.raw_dp_execution_token_counts = (4, 0)
+    active.is_spec_verify = True
+
+    with pytest.raises(RuntimeError, match="num_decoding_tokens"):
+        runner._shared_graph_plan(active, 4)
+
+
+def test_dp_spec_verify_stays_eager_when_active_count_is_not_a_multiple() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=16,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=4,
+        )
+        for rank in range(2)
+    ]
+    active = _dp_metadata((6, 0))
+    active.raw_dp_execution_token_counts = (6, 0)
+    active.is_spec_verify = True
+    dummy = _dp_metadata((6, 0))
+    dummy.raw_dp_execution_token_counts = (6, 0)
+    dummy.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        assert runners[0].can_execute(torch.zeros(6, dtype=torch.int32), active) is False
+        assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy) is False
+
+
+def test_dp_kpool_spans_must_match_shared_bucket_layout() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+        dp_size=2,
+        dp_rank=0,
+        num_decoding_tokens=8,
+    )
+    runner.layer_caches = [SimpleNamespace(kpool_tail=torch.zeros((1, 1, 1, 1), dtype=torch.bfloat16))]
+    aligned = _dp_metadata((8, 8))
+    aligned.is_spec_verify = True
+    mismatched = _dp_metadata((8, 8))
+    mismatched.is_spec_verify = True
+    mismatched.kpool_query_lens = (1,) * 8
+
+    with patch.object(DecodeAclGraphRunner, "_has_compatible_decode_metadata", return_value=True):
+        assert runner.can_execute(torch.zeros(8, dtype=torch.int32), aligned)
+        with pytest.raises(RuntimeError, match="shared bucket layout"):
+            runner.can_execute(torch.zeros(8, dtype=torch.int32), mismatched)
+    assert runner._graph_kpool_query_lens(aligned, 8, 8, 8) == (8,)
+    assert runner._graph_kpool_query_lens(aligned, 1, 8, 8) == (8,)
+
+    uneven = _dp_metadata((16, 16))
+    uneven.is_spec_verify = True
+    uneven.kpool_query_lens = (10, 6)
+    short = _dp_metadata((16, 16))
+    short.is_spec_verify = True
+    short.kpool_query_lens = (8,)
+    nonpositive = _dp_metadata((8, 8))
+    nonpositive.is_spec_verify = True
+    nonpositive.kpool_query_lens = (0, 8)
+    with (
+        patch.object(DecodeAclGraphRunner, "_has_compatible_decode_metadata", return_value=True),
+        pytest.raises(RuntimeError, match="must be uniform"),
+    ):
+        runner.can_execute(torch.zeros(16, dtype=torch.int32), uneven)
+    with (
+        patch.object(DecodeAclGraphRunner, "_has_compatible_decode_metadata", return_value=True),
+        pytest.raises(RuntimeError, match="positive lengths"),
+    ):
+        runner.can_execute(torch.zeros(16, dtype=torch.int32), short)
+    with (
+        patch.object(DecodeAclGraphRunner, "_has_compatible_decode_metadata", return_value=True),
+        pytest.raises(RuntimeError, match="positive lengths"),
+    ):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), nonpositive)
+
+
+def _aligned_dp_decode_metadata(rows: int) -> SimpleNamespace:
+    metadata = _dp_metadata((rows, rows))
+    metadata.is_spec_verify = True
+    metadata.slot_mapping = torch.arange(rows, dtype=torch.int32)
+    metadata.block_table = torch.zeros((rows, 2), dtype=torch.int32)
+    metadata.kv_seq_lens = torch.ones(rows, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [1] * rows
+    metadata.kv_cu_seq_lens = torch.arange(rows + 1, dtype=torch.int32)
+    metadata.q_cu_seq_lens = torch.arange(rows + 1, dtype=torch.int32)
+    metadata.paged_kv_indptr = torch.arange(rows + 1, dtype=torch.int32)
+    metadata.paged_kv_indices = torch.zeros(rows, dtype=torch.int32)
+    metadata.paged_kv_last_page_len = torch.ones(rows, dtype=torch.int32)
+    metadata.linear_state_indices = torch.zeros(rows, dtype=torch.int32)
+    metadata.expanded_decode_metadata = None
+    return metadata
+
+
+def test_dp_all_decode_row_mismatch_raises() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=16,
+        max_model_len=8,
+        dp_size=2,
+        dp_rank=0,
+        num_decoding_tokens=8,
+    )
+    aligned = _aligned_dp_decode_metadata(8)
+    mismatched = _aligned_dp_decode_metadata(8)
+    mismatched.block_table = torch.zeros((1, 2), dtype=torch.int32)
+    mismatched.kv_seq_lens = torch.ones(1, dtype=torch.int32)
+    mismatched.kv_seq_lens_host_values = [1]
+    mismatched.slot_mapping = torch.zeros(1, dtype=torch.int32)
+
+    assert runner.can_execute(torch.zeros(8, dtype=torch.int32), aligned)
+    assert runner.can_execute(torch.zeros(8, dtype=torch.int32), aligned, torch.zeros(8, 4))
+    narrow = _aligned_dp_decode_metadata(8)
+    narrow.paged_kv_indptr = None
+    narrow.paged_kv_indices = None
+    narrow.paged_kv_last_page_len = None
+    narrow.block_table = torch.zeros((8, 1), dtype=torch.int32)
+    narrow.kv_seq_lens = torch.full((8,), 5, dtype=torch.int32)
+    narrow.kv_seq_lens_host_values = [5] * 8
+    with pytest.raises(RuntimeError, match="cannot hold the KV length"):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), narrow)
+    fits = _aligned_dp_decode_metadata(8)
+    fits.paged_kv_indptr = None
+    fits.paged_kv_indices = None
+    fits.paged_kv_last_page_len = None
+    fits.block_table = torch.zeros((8, 1), dtype=torch.int32)
+    fits.kv_seq_lens = torch.full((8,), 4, dtype=torch.int32)
+    fits.kv_seq_lens_host_values = [4] * 8
+    assert runner.can_execute(torch.zeros(8, dtype=torch.int32), fits)
+    with pytest.raises(RuntimeError, match="input_embedding does not match"):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), aligned, torch.zeros(3, 4))
+    with pytest.raises(RuntimeError, match="does not match token rows"):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), mismatched)
+
+    bad_q_cu = _aligned_dp_decode_metadata(8)
+    bad_q_cu.q_cu_seq_lens = torch.zeros(3, dtype=torch.int32)
+    bad_indices = _aligned_dp_decode_metadata(8)
+    bad_indices.linear_state_indices = torch.zeros(3, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="q_cu_seq_lens does not match"):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), bad_q_cu)
+    with pytest.raises(RuntimeError, match="linear_state_indices does not match"):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), bad_indices)
+
+    bad_initial_state = _aligned_dp_decode_metadata(8)
+    bad_initial_state.has_initial_state = torch.ones(3, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="has_initial_state does not match"):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), bad_initial_state)
+
+    runner.layer_caches = [SimpleNamespace(conv=object(), kpool_tail=None)]
+    missing_indices = _aligned_dp_decode_metadata(8)
+    missing_indices.linear_state_indices = None
+    missing_indices.raw_dp_execution_token_counts = (8, 0)
+    with pytest.raises(RuntimeError, match="missing linear_state_indices"):
+        runner.can_execute(torch.zeros(8, dtype=torch.int32), missing_indices)
+
     empty_runner = DecodeAclGraphRunner(
         nn.Identity(),
         attention_backend,
@@ -857,16 +1293,136 @@ def test_dp_mtp_target_fallback_is_group_wide(
         max_model_len=8,
         dp_size=2,
         dp_rank=1,
-        num_decoding_tokens=width,
+        num_decoding_tokens=8,
     )
-    active_metadata = _dp_metadata((width, 0))
-    active_metadata.is_dummy = False
-    active_metadata.kv_seq_lens = torch.ones(width, dtype=torch.int32)
-    active_metadata.block_table = torch.zeros((width, 1), dtype=torch.int32)
-    active_metadata.linear_state_indices = torch.tensor([0], dtype=torch.int32)
-    active_metadata.q_cu_seq_lens = None
-    empty_metadata = _dp_metadata((width, 0))
-    empty_metadata.is_dummy = True
+    empty_runner.layer_caches = [SimpleNamespace(conv=object(), kpool_tail=None)]
+    placeholder = _aligned_dp_decode_metadata(1)
+    placeholder.dp_execution_token_counts = (8, 1)
+    placeholder.raw_dp_execution_token_counts = (8, 0)
+    placeholder.linear_state_indices = None
+    assert empty_runner.can_execute(torch.zeros(1, dtype=torch.int32), placeholder)
+
+
+def test_dp_kpool_spans_keep_complete_groups_only() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=16,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=6,
+        )
+        for rank in range(2)
+    ]
+    for runner in runners:
+        runner.layer_caches = [SimpleNamespace(kpool_tail=torch.zeros((1, 2, 1, 1), dtype=torch.bfloat16))]
+    active = _dp_metadata((6, 6))
+    active.is_spec_verify = True
+    active.kpool_query_lens = (6,)
+    empty = _dp_metadata((6, 6))
+    empty.is_spec_verify = True
+
+    with patch.object(DecodeAclGraphRunner, "_has_compatible_decode_metadata", return_value=True):
+        assert runners[0].can_execute(torch.zeros(6, dtype=torch.int32), active)
+        assert runners[1].can_execute(torch.zeros(6, dtype=torch.int32), empty)
+    assert runners[0]._graph_kpool_query_lens(active, 6, 8, 6) == (6,)
+    assert runners[1]._graph_kpool_query_lens(empty, 6, 8, 6) == (6,)
+    assert runners[0]._graph_kpool_query_lens(empty, 8, 16, 8) == (8, 8)
+
+
+def test_empty_rank_kpool_spans_follow_shared_verify_width() -> None:
+    runner = _runner()
+    runner.layer_caches = [SimpleNamespace(kpool_tail=torch.zeros((1, 1, 1, 1), dtype=torch.bfloat16))]
+    metadata = SimpleNamespace()
+
+    busy = runner._padded_kpool_query_lens(metadata, 8, 16, verify_width=8)
+    empty = runner._padded_kpool_query_lens(metadata, 1, 16, verify_width=8)
+
+    assert busy == (8, 8)
+    assert empty == busy
+
+
+def test_dp_expanded_verify_without_placeholder_folds_to_sequences() -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=3,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=4,
+        )
+        for rank in range(2)
+    ]
+    metadata = _expanded_verify_metadata(8)
+    metadata.dp_execution_token_counts = (8, 8)
+    metadata.raw_dp_execution_token_counts = (8, 8)
+    metadata.linear_state_indices = torch.tensor([0, 1], dtype=torch.int32)
+    metadata.is_spec_verify = True
+
+    with patch.object(
+        DecodeAclGraphRunner,
+        "_has_compatible_decode_metadata",
+        return_value=True,
+    ):
+        for runner in runners:
+            assert runner.can_execute(torch.zeros(8, dtype=torch.int32), metadata)
+
+
+def _expanded_verify_metadata(rows: int) -> SimpleNamespace:
+    metadata = _dp_metadata((rows, rows))
+    metadata.slot_mapping = torch.arange(rows, dtype=torch.int32)
+    metadata.linear_state_indices = torch.tensor([0], dtype=torch.int32)
+    metadata.expanded_decode_metadata = SimpleNamespace(
+        enabled=True,
+        kv_seq_lens=torch.ones(rows, dtype=torch.int32),
+        block_table=torch.zeros((rows, 1), dtype=torch.int32),
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        paged_attention_tiling_data=None,
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=None,
+    )
+    return metadata
+
+
+@pytest.mark.parametrize(
+    ("width", "disable_verify_graph"),
+    [
+        pytest.param(4, False, id="kda-verify-default"),
+        pytest.param(4, True, id="verify-graph-disabled"),
+        pytest.param(3, False, id="width-three-pads-inside-bucket"),
+    ],
+)
+def test_dp_mtp_target_fallback_is_group_wide(
+    width: int,
+    disable_verify_graph: bool,
+) -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    runners = [
+        DecodeAclGraphRunner(
+            nn.Identity(),
+            attention_backend,
+            torch.device("cpu"),
+            max_batch=16,
+            max_model_len=8,
+            dp_size=2,
+            dp_rank=rank,
+            num_decoding_tokens=width,
+        )
+        for rank in range(2)
+    ]
+    metadata = _expanded_verify_metadata(width)
+    metadata.is_spec_verify = True
+    admitted = not disable_verify_graph
 
     with (
         patch.dict(
@@ -874,24 +1430,13 @@ def test_dp_mtp_target_fallback_is_group_wide(
             {"XLLM_NO_VERIFY_GRAPH": "1" if disable_verify_graph else "0"},
         ),
         patch.object(
-            active_runner,
-            "_has_compatible_decode_metadata",
-            return_value=True,
-        ),
-        patch.object(
-            empty_runner,
+            DecodeAclGraphRunner,
             "_has_compatible_decode_metadata",
             return_value=True,
         ),
     ):
-        assert not active_runner.can_execute(
-            torch.zeros(width, dtype=torch.int32),
-            active_metadata,
-        )
-        assert not empty_runner.can_execute(
-            torch.zeros(1, dtype=torch.int32),
-            empty_metadata,
-        )
+        for runner in runners:
+            assert runner.can_execute(torch.zeros(width, dtype=torch.int32), metadata) is admitted
 
 
 def test_kda_verify_graph_is_enabled_by_default() -> None:
@@ -927,6 +1472,19 @@ def test_dp_mixed_step_does_not_enter_acl_decode_graph() -> None:
             torch.zeros(3, dtype=torch.int32),
             _dp_metadata((3, 2), dp_is_decode=(0, 1)),
         )
+        missing_step_type = _dp_metadata((3, 2))
+        del missing_step_type.dp_is_decode
+        with pytest.raises(RuntimeError, match="requires dp_is_decode"):
+            runner.can_execute(torch.zeros(3, dtype=torch.int32), missing_step_type)
+        assert not runner.can_execute(
+            torch.zeros(1, 3, dtype=torch.int32),
+            _dp_metadata((3, 2), dp_is_decode=(0, 1)),
+        )
+        with pytest.raises(RuntimeError, match="must be one-dimensional"):
+            runner.can_execute(
+                torch.zeros(1, 8, dtype=torch.int32),
+                _dp_metadata((8, 8)),
+            )
 
 
 def test_dp_acl_graph_requires_group_wide_token_counts() -> None:

@@ -2299,6 +2299,8 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   speculative_runtime_config.is_draft_engine = options_.is_draft_engine();
   speculative_runtime_config.adaptive_enabled =
       options_.enable_adaptive_speculative_decode();
+  speculative_runtime_config.draft_query_width =
+      std::max<int32_t>(1, options_.draft_graph_query_width());
   context_.set_speculative_runtime_config(speculative_runtime_config);
   FlashComm1Options flash_comm1_options;
   flash_comm1_options.enable_flashcomm1 = options_.enable_flashcomm1();
