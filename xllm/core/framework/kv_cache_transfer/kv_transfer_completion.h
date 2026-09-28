@@ -28,6 +28,7 @@ limitations under the License.
 namespace xllm {
 
 class Device;
+class InstanceRole;
 struct ParallelArgs;
 struct TransferKVInfo;
 
@@ -74,11 +75,13 @@ class KVTransferCompletion final {
 };
 
 // Waits for KV push completion and reduces failed request IDs across the
-// replicated TP/CP groups when PUSH transfer is enabled.
+// replicated TP/CP groups on PUSH-sending instances. The instance role is
+// identical across ranks; an empty local transfer list is not a safe gate.
 std::vector<std::string> finalize_kv_push_failures(
     KVTransferCompletion& kv_transfers,
     const std::vector<TransferKVInfo>& transfer_kv_infos,
     const std::string& kv_cache_transfer_mode,
+    InstanceRole instance_role,
     const ParallelArgs& parallel_args,
     const Device& device);
 

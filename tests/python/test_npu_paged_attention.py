@@ -28,6 +28,11 @@ from xllm.python.attention.backend import (  # noqa: E402
     build_speculative_ssm_state_indices,
 )
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend  # noqa: E402
+from xllm.python.model_executor.forward_context import (  # noqa: E402
+    AclGraphExecutionState,
+    ForwardContext,
+    forward_context,
+)
 
 
 def test_speculative_ssm_indices_keep_all_bootstrap_checkpoints() -> None:
@@ -118,6 +123,51 @@ def test_kda_dense_conv_dispatches_fused_activation(
     assert torch.all(state == 7)
 
 
+def test_graph_index_history_uses_full_table_and_masks_unused_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = NpuPagedAttentionBackend(
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        scale=128**-0.5,
+        sliding_window=0,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    # Cross the former 32K limit while keeping the index width small.
+    capacity = 257 * 128
+    index = torch.arange(capacity, dtype=torch.float32).reshape(257, 128, 1, 1)
+    cache = torch.empty(257, 128, 1, 128)
+    layer_cache = LayerCache(key=cache, value=cache, index=index)
+    backend.bind_kv_caches([layer_cache])
+    metadata = SimpleNamespace(
+        block_table=torch.arange(257, dtype=torch.int32).repeat(2, 1),
+        kv_seq_lens=torch.tensor([32769, 129], dtype=torch.int32),
+    )
+    backend._metadata = metadata
+    context = ForwardContext(
+        attention_backend=backend,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[layer_cache],
+        execution_state=AclGraphExecutionState(persistent_buffers={}),
+    )
+
+    def forbid_host_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("graph history must not read device values on host")
+
+    with forward_context(context), monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "cpu", forbid_host_read)
+        patch.setattr(torch.Tensor, "tolist", forbid_host_read)
+        patch.setattr(torch.Tensor, "item", forbid_host_read)
+        history = backend.gather_index_history(SimpleNamespace(layer_id=0), batch_size=2)
+    assert history.shape == (2, capacity, 1)
+    torch.testing.assert_close(history[0, :32769, 0], torch.arange(32769, dtype=torch.float32))
+    torch.testing.assert_close(history[1, :129, 0], torch.arange(129, dtype=torch.float32))
+    assert torch.count_nonzero(history[0, 32769:]) == 0
+    assert torch.count_nonzero(history[1, 129:]) == 0
+
+
 def test_xfia_prepare_preserves_live_device_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = NpuPagedAttentionBackend(
         num_heads=4,
@@ -171,13 +221,62 @@ def test_xfia_prepare_preserves_live_device_metadata(monkeypatch: pytest.MonkeyP
     assert backend._actual_seq_kv == []
 
 
-def test_xfia_dflash2_chunked_query_keeps_band_window() -> None:
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("proposal_width", [1, 8])
+@pytest.mark.parametrize("sliding_window,expected_starts", [(0, [0, 0, 0]), (2048, [0, 7, 257])])
+def test_xfia_single_token_decode_uses_actual_window(
+    graph_mode: bool,
+    proposal_width: int,
+    sliding_window: int,
+    expected_starts: list[int],
+) -> None:
     backend = NpuPagedAttentionBackend(
         num_heads=4,
         num_kv_heads=1,
         head_dim=128,
         scale=128**-0.5,
-        sliding_window=2048,
+        sliding_window=sliding_window,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        use_xfia_decode=True,
+        xfia_query_width=proposal_width,
+    )
+    cache = torch.empty(60, 128, 1, 128, dtype=torch.bfloat16)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
+    table = torch.arange(60, dtype=torch.int32).reshape(3, 20)
+    lengths = torch.tensor([7, 2055, 2305], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=False,
+        is_spec_verify=False,
+        block_table=table,
+        kv_seq_lens=lengths,
+        slot_mapping=torch.arange(3),
+    )
+    context = ForwardContext(
+        attention_backend=backend,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[LayerCache(key=cache, value=cache)],
+        execution_state=AclGraphExecutionState(persistent_buffers={}) if graph_mode else None,
+    )
+    with forward_context(context):
+        backend.prepare(metadata, graph_mode=graph_mode)
+    assert backend._xfia_query_ends.tolist() == [1, 2, 3]
+    assert backend._xfia_kv_starts.tolist() == expected_starts
+    torch.testing.assert_close(backend._xfia_kv_lengths, lengths)
+    torch.testing.assert_close(backend._block_table_i32, table)
+
+
+@pytest.mark.parametrize("sliding_window", [0, 2048])
+def test_xfia_dflash2_chunked_query_keeps_band_window(sliding_window: int) -> None:
+    backend = NpuPagedAttentionBackend(
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        scale=128**-0.5,
+        sliding_window=sliding_window,
         is_mla=False,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
@@ -198,7 +297,8 @@ def test_xfia_dflash2_chunked_query_keeps_band_window() -> None:
     backend.prepare(metadata)
     assert backend._xfia_query_ends.tolist() == list(range(1, 17))
     assert backend._xfia_kv_lengths.tolist() == [2055] * 8 + [2305] * 8
-    assert backend._xfia_kv_starts.tolist() == list(range(8)) + list(range(250, 258))
+    expected_starts = list(range(8)) + list(range(250, 258)) if sliding_window else [0] * 16
+    assert backend._xfia_kv_starts.tolist() == expected_starts
     torch.testing.assert_close(backend._block_table_i32, table.repeat_interleave(8, dim=0))
 
 

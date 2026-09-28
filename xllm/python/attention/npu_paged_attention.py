@@ -20,7 +20,6 @@ Prefill uses FIA TND with causal mask; decode uses FIA TND with block_table.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -267,7 +266,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._kv_owner_representatives: torch.Tensor | None = None
         self._materialized_block_table: torch.Tensor | None = None
         self._sfa_page_layout: _SfaPageLayout | None = None
-        self._graph_index_history_max_kv: int | None = None
 
         self._causal_mask = (
             torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1).to(torch.int8).contiguous().to(device)
@@ -304,21 +302,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if block_table is None:
             raise RuntimeError("indexer_block_table needs a paged block_table")
         return block_table
-
-    @property
-    def graph_index_history_max_kv(self) -> int:
-        """Static KV-length cap for the kPool graph gather.
-
-        The graph branch of ``gather_index_history`` densifies each sequence
-        to a fixed ``[num_seqs, max_kv, width]`` buffer; sizing it by the full
-        block-table capacity (max_position_embeddings can be 1M) is not
-        viable. Decode steps whose block table exceeds this cap fall back to
-        the eager runner (see DecodeAclGraphRunner), which keeps the dynamic
-        gather. Override with XLLM_GRAPH_INDEX_HISTORY_MAX_KV.
-        """
-        if self._graph_index_history_max_kv is None:
-            self._graph_index_history_max_kv = int(os.environ.get("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "32768"))
-        return self._graph_index_history_max_kv
 
     @property
     def is_mla(self) -> bool:
@@ -1292,9 +1275,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
         if in_acl_graph():
             # Graph branch: fixed shapes only (no .item()/host sync). Gather
-            # the block table in one vectorized index_select up to a static
-            # max_kv (replay-stable; capped by graph_index_history_max_kv —
-            # the runner falls back to eager beyond it). Rows past each
+            # the complete block table in one vectorized index_select using
+            # its replay-stable capacity. Rows past each
             # sequence's live length are zeroed by an explicit kv_seq_lens
             # mask: the valid channel alone cannot be trusted because a
             # recycled block still carries a previous owner's valid=1 rows,
@@ -1302,11 +1284,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             kv_lens_dev = metadata.kv_seq_lens
             if kv_lens_dev is None:
                 raise RuntimeError("gather_index_history graph mode needs device kv_seq_lens")
-            max_kv = min(
-                block_table.shape[1] * block_size,
-                self.graph_index_history_max_kv,
-            )
-            num_blocks = (max_kv + block_size - 1) // block_size
+            max_kv = block_table.shape[1] * block_size
             out = get_execution_buffer(
                 ("KPOOL_INDEX_HISTORY", num_seqs, max_kv, width),
                 lambda: torch.empty(
@@ -1318,7 +1296,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 ),
             )
             flat = index_cache.view(-1, width)
-            bt = block_table[:num_seqs, :num_blocks].to(torch.int64)
+            bt = block_table[:num_seqs].to(torch.int64)
             block_offsets = torch.arange(block_size, device=device)
             slot_ids = (bt[:, :, None] * block_size + block_offsets[None, None, :]).reshape(num_seqs, max_kv)
             gathered = flat.index_select(0, slot_ids.reshape(-1)).view(num_seqs, max_kv, width)
@@ -1908,7 +1886,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if rows not in self._xfia_row_ends:
             self._xfia_row_ends[rows] = torch.arange(1, rows + 1, dtype=torch.int32, device=self.device)
         self._xfia_query_ends = self._xfia_row_ends[rows]
-        if self._xfia_query_width > 1:
+        if self.sliding_window <= 0:
+            self._xfia_kv_starts = torch.zeros_like(self._xfia_kv_lengths)
+        elif rows == sequences:
+            # A configured proposal width does not make single-token decode
+            # rows part of a proposal. Each row uses its own sequence window.
+            self._xfia_kv_starts = (self._xfia_kv_lengths - self.sliding_window).clamp_min(0)
+        else:
             # Preserve FIA band-mode's right-aligned [left=window-1, right=width-1]
             # visibility. Every proposal row sees the complete proposal block;
             # its left boundary can fall inside a physical KV page.
@@ -1916,8 +1900,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             self._xfia_kv_starts = (
                 self._xfia_kv_lengths - self._xfia_query_width + row_in_block - (self.sliding_window - 1)
             ).clamp_min(0)
-        else:
-            self._xfia_kv_starts = torch.zeros_like(self._xfia_kv_lengths)
         if graph_mode:
             for attribute, name in (
                 ("_block_table_i32", "XFIA_BLOCK_TABLE"),

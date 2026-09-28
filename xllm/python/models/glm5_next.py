@@ -1436,12 +1436,11 @@ class Glm5NextIndexer(nn.Module):
             weights_bsd = weights.reshape(num_tokens, self.n_heads).index_select(0, src_flat).view(num_seqs, max_q, -1)
             positions_bsd = positions.reshape(-1).index_select(0, src_flat).view(num_seqs, max_q)
 
-        max_kv_cap = getattr(backend, "graph_index_history_max_kv", None)
-        if in_acl_graph() and max_kv_cap is not None:
+        if in_acl_graph():
             token_page_size = (
                 pool_cache.shape[1] * self.index_kpool if pool_cache is not None else ctx.index_cache.shape[1]
             )
-            kv_len = min(ctx.block_table.shape[1] * token_page_size, max_kv_cap)
+            kv_len = ctx.block_table.shape[1] * token_page_size
         elif pool_cache is not None:
             kv_len = int(kpool_kv_lens.max().item())
         else:

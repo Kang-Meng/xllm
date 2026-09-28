@@ -482,6 +482,7 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
         kv_transfers,
         input.transfer_kv_infos,
         runtime_.worker.options_.kv_cache_transfer_mode(),
+        runtime_.worker.options_.instance_role(),
         runtime_.context->get_parallel_args(),
         runtime_.worker.device_);
   };

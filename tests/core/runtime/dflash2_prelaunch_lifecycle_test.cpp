@@ -16,10 +16,13 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include "core/framework/kv_cache_transfer/kv_transfer_completion.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/request/stopping_checker.h"
 #include "platform/device.h"
 #include "runtime/dflash2_worker_impl.h"
+#include "torch_npu/csrc/core/npu/NPUGraph.h"
 
 namespace xllm {
 
@@ -41,6 +44,39 @@ class DFlash2WorkerImplTestPeer final {
 };
 
 namespace {
+
+TEST(DFlash2PrelaunchTransferTest, NonSendingPushCompletionIsGraphCapturable) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  ProcessGroup tp_group(/*rank=*/0, /*world_size=*/2, device.unwrap());
+  ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/2, /*process_group=*/nullptr);
+  parallel_args.tp_group_ = &tp_group;
+  auto marker = torch::zeros(
+      {1}, torch::TensorOptions().device(device.unwrap()).dtype(torch::kInt));
+  auto stream = device.get_stream_from_pool();
+  stream->wait_stream(*device.current_stream());
+  auto guard = stream->set_stream_guard();
+  marker.add_(1);
+  stream->synchronize();
+  for (const InstanceRole role :
+       {InstanceRole::DEFAULT, InstanceRole::DECODE}) {
+    KVTransferCompletion completion;
+    c10_npu::NPUGraph graph;
+    graph.capture_begin(/*pool=*/{0, 0},
+                        ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+    const auto failures = finalize_kv_push_failures(
+        completion, {}, "PUSH", role, parallel_args, device);
+    marker.add_(1);
+    graph.capture_end();
+    EXPECT_TRUE(failures.empty());
+    marker.zero_();
+    graph.replay();
+    stream->synchronize();
+    EXPECT_EQ(marker.cpu().item<int32_t>(), 1);
+  }
+}
 
 class DFlash2PrelaunchLifecycleTest : public ::testing::TestWithParam<bool> {};
 

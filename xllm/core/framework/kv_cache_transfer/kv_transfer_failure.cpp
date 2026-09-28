@@ -177,6 +177,7 @@ std::vector<std::string> finalize_kv_push_failures(
     KVTransferCompletion& kv_transfers,
     const std::vector<TransferKVInfo>& transfer_kv_infos,
     const std::string& kv_cache_transfer_mode,
+    InstanceRole instance_role,
     const ParallelArgs& parallel_args,
     const Device& device) {
   const std::unordered_set<std::string> local_failed_request_ids =
@@ -184,6 +185,17 @@ std::vector<std::string> finalize_kv_push_failures(
   const std::vector<std::string> canonical_request_ids =
       canonical_transfer_request_ids(transfer_kv_infos);
   if (kv_cache_transfer_mode != "PUSH") {
+    return {};
+  }
+  // These roles never send PD KV. In particular, decode's speculative body
+  // may be captured in a graph, where the metadata collective's synchronous
+  // host/device copies are forbidden. Use rank-uniform configuration here;
+  // PUSH senders must still validate even an empty local request set.
+  if (instance_role == InstanceRole::DEFAULT ||
+      instance_role == InstanceRole::DECODE) {
+    CHECK(canonical_request_ids.empty())
+        << "non-sending instance has outgoing KV transfer requests";
+    CHECK(local_failed_request_ids.empty());
     return {};
   }
   return reduce_failed_request_ids(

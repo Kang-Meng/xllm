@@ -288,6 +288,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
         finalize_kv_push_failures(kv_transfers,
                                   input.transfer_kv_infos,
                                   options_.kv_cache_transfer_mode(),
+                                  options_.instance_role(),
                                   context_.get_parallel_args(),
                                   device_);
     kv_push_waited = true;

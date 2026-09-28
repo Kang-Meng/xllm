@@ -26,6 +26,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/common/types.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/platform/device.h"
@@ -102,6 +103,55 @@ TEST(KVTransferFailureReductionTest, RejectsTpRankRequestCountMismatch) {
   EXPECT_DEATH(
       { reduce_failed_request_ids({}, {"request-a"}, parallel_args, device); },
       "request count differs across reduction ranks");
+}
+
+TEST(KVTransferFailureReductionTest, NonSendingRolesSkipEmptyCollectives) {
+  for (const InstanceRole role :
+       {InstanceRole::DEFAULT, InstanceRole::DECODE}) {
+    SimulatedAllGatherProcessGroup tp_group;
+    ParallelArgs parallel_args = make_parallel_args(&tp_group);
+    Device device(torch::Device(torch::kCPU));
+    KVTransferCompletion completion;
+
+    EXPECT_TRUE(finalize_kv_push_failures(
+                    completion, {}, "PUSH", role, parallel_args, device)
+                    .empty());
+    EXPECT_EQ(tp_group.allgather_count(), 0u);
+  }
+}
+
+TEST(KVTransferFailureReductionTest, SendingRolesValidateEmptyTransferSets) {
+  for (const InstanceRole role : {InstanceRole::PREFILL, InstanceRole::MIX}) {
+    SimulatedAllGatherProcessGroup tp_group;
+    ParallelArgs parallel_args = make_parallel_args(&tp_group);
+    Device device(torch::Device(torch::kCPU));
+    KVTransferCompletion completion;
+
+    EXPECT_TRUE(finalize_kv_push_failures(
+                    completion, {}, "PUSH", role, parallel_args, device)
+                    .empty());
+    EXPECT_EQ(tp_group.allgather_count(), 1u);
+  }
+}
+
+TEST(KVTransferFailureReductionTest, NonSendingRolesRejectOutgoingTransfers) {
+  SimulatedAllGatherProcessGroup tp_group;
+  ParallelArgs parallel_args = make_parallel_args(&tp_group);
+  Device device(torch::Device(torch::kCPU));
+  KVTransferCompletion completion;
+  TransferKVInfo transfer;
+  transfer.request_id = "request-a";
+
+  EXPECT_DEATH(
+      {
+        finalize_kv_push_failures(completion,
+                                  {transfer},
+                                  "PUSH",
+                                  InstanceRole::DECODE,
+                                  parallel_args,
+                                  device);
+      },
+      "non-sending instance has outgoing KV transfer requests");
 }
 
 TEST(KVTransferCompletionTest, ReturnsMergedFailedRequestIds) {
