@@ -197,13 +197,9 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
     return mode == CachePeerMode::ABSENT || remote_addr != failed_peer;
   }
 
-  bool open_local_session(const std::string& remote_addr) override {
-    opened_sessions.emplace_back(remote_addr);
-    return true;
-  }
-
-  bool close_local_session(const std::string& remote_addr) override {
-    closed_sessions.emplace_back(remote_addr);
+  bool set_local_peer(const WorkerCacheLayoutManifest& manifest,
+                      CachePeerMode mode) override {
+    local_peer_calls.emplace_back(PeerCall{manifest.addr, mode});
     return true;
   }
 
@@ -216,8 +212,7 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
   std::vector<std::vector<uint64_t>> registered_block_bytes;
   std::vector<MoveCall> move_calls;
   std::vector<PeerCall> peer_calls;
-  std::vector<std::string> opened_sessions;
-  std::vector<std::string> closed_sessions;
+  std::vector<PeerCall> local_peer_calls;
 };
 
 TEST(MooncakeTransferEngineTest, LinksAllPcpSourcesWithOneActiveOwner) {
@@ -254,17 +249,20 @@ TEST(MooncakeTransferEngineTest, LinksAllPcpSourcesWithOneActiveOwner) {
 
   ASSERT_TRUE(transfer.link_sessions(cluster_ids, remote_addrs));
   ASSERT_EQ(transfer.peer_calls.size(), 8U);
+  ASSERT_EQ(transfer.local_peer_calls.size(), 8U);
   EXPECT_EQ(transfer.peer_calls[0].mode, CachePeerMode::ACTIVE);
+  EXPECT_EQ(transfer.local_peer_calls[0].mode, CachePeerMode::ACTIVE);
   for (size_t index = 1; index < transfer.peer_calls.size(); ++index) {
     EXPECT_EQ(transfer.peer_calls[index].mode, CachePeerMode::PLAN_ONLY);
+    EXPECT_EQ(transfer.local_peer_calls[index].mode, CachePeerMode::PLAN_ONLY);
   }
-  EXPECT_EQ(transfer.opened_sessions, std::vector<std::string>({"source_0"}));
 
   for (size_t index = 0; index < remote_addrs.size(); ++index) {
     EXPECT_TRUE(
         transfer.close_session(cluster_ids[index], remote_addrs[index]));
   }
-  EXPECT_EQ(transfer.closed_sessions, std::vector<std::string>({"source_0"}));
+  ASSERT_EQ(transfer.local_peer_calls.size(), 16U);
+  EXPECT_EQ(transfer.local_peer_calls[8].mode, CachePeerMode::ABSENT);
 }
 
 TEST(MooncakeTransferEngineTest, LinkFailureRollsBackEveryPcpSource) {
@@ -308,8 +306,13 @@ TEST(MooncakeTransferEngineTest, LinkFailureRollsBackEveryPcpSource) {
                       return call.mode == CachePeerMode::ABSENT;
                     }),
       8);
-  EXPECT_EQ(transfer.closed_sessions,
-            std::vector<std::string>({"rollback-source_0"}));
+  EXPECT_EQ(
+      std::count_if(transfer.local_peer_calls.begin(),
+                    transfer.local_peer_calls.end(),
+                    [](const RecordingMooncakeTransferEngine::PeerCall& call) {
+                      return call.mode == CachePeerMode::ABSENT;
+                    }),
+      8);
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
@@ -506,7 +509,6 @@ class ScopedEnvironmentVariable final {
 };
 
 struct NpuMixedTransferCaches {
-  torch::Tensor backing;
   torch::Tensor conv;
   torch::Tensor ssm;
   torch::Tensor key;
@@ -519,14 +521,13 @@ struct NpuMixedTransferCaches {
 NpuMixedTransferCaches make_npu_mixed_transfer_caches(
     const torch::Device& device) {
   NpuMixedTransferCaches tensors;
-  tensors.backing = torch::zeros({6, 2, 1024, 512},
-                                 torch::dtype(torch::kBFloat16).device(device));
-  tensors.conv = tensors.backing.index({0});
-  tensors.ssm = tensors.backing.index({1});
-  tensors.key = tensors.backing.index({2});
-  tensors.value = tensors.backing.index({3});
-  tensors.index = tensors.backing.index({4});
-  tensors.index_scale = tensors.backing.index({5});
+  const auto options = torch::dtype(torch::kBFloat16).device(device);
+  tensors.conv = torch::zeros({2, 1024, 384}, options);
+  tensors.ssm = torch::zeros({2, 1, 128, 384}, options);
+  tensors.key = torch::zeros({2, 1024, 1, 384}, options);
+  tensors.value = torch::zeros({2, 1024, 1, 384}, options);
+  tensors.index = torch::zeros({2, 1024, 1, 384}, options);
+  tensors.index_scale = torch::zeros({2, 1024, 1, 384}, options);
   tensors.caches.emplace_back(
       LinearAttentionKVCacheTensors{tensors.conv, tensors.ssm});
   tensors.caches.emplace_back(
@@ -534,6 +535,32 @@ NpuMixedTransferCaches make_npu_mixed_transfer_caches(
                             tensors.index,
                             tensors.index_scale});
   return tensors;
+}
+
+ModelArgs make_npu_round_trip_model_args() {
+  ModelArgs args;
+  args.model_type("test")
+      .n_layers(2)
+      .n_heads(1)
+      .n_kv_heads(1)
+      .head_dim(384)
+      .index_n_heads(1)
+      .linear_num_key_heads(1)
+      .linear_num_value_heads(1)
+      .linear_key_head_dim(128)
+      .linear_value_head_dim(384);
+  return args;
+}
+
+KVCacheShape make_npu_round_trip_cache_shape() {
+  proto::KVCacheShape proto_shape;
+  for (int64_t dim : {2, 1024, 384}) {
+    proto_shape.add_conv_cache_shape(dim);
+  }
+  for (int64_t dim : {2, 1, 128, 384}) {
+    proto_shape.add_ssm_cache_shape(dim);
+  }
+  return KVCacheShape::from_proto(proto_shape);
 }
 
 void fill_mixed_transfer_block(NpuMixedTransferCaches* tensors,
@@ -594,8 +621,15 @@ int run_npu_round_trip_peer(int command_fd,
   remote_transfer.initialize(device_index);
   NpuMixedTransferCaches remote_caches =
       make_npu_mixed_transfer_caches(remote_torch_device);
-  remote_transfer.register_kv_cache(
-      remote_caches.caches, KVCacheShape(), torch::kBFloat16);
+  remote_transfer.configure_cache_layout(make_args(/*rank=*/0,
+                                                   /*world_size=*/1,
+                                                   /*dp_size=*/1),
+                                         make_npu_round_trip_model_args(),
+                                         /*block_token_capacity=*/1024,
+                                         /*is_spec_draft=*/false);
+  remote_transfer.register_kv_cache(remote_caches.caches,
+                                    make_npu_round_trip_cache_shape(),
+                                    torch::kBFloat16);
 
   const auto& layers = remote_transfer.main_layout_.layers;
   const bool layout_matches =
@@ -1250,9 +1284,10 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                                /*dp_size=*/1);
   std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
 
-  folly::SemiFuture<bool> future = transfer.push_kv_blocks_async(
-      {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
-  EXPECT_FALSE(std::move(future).get());
+  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
+      transfer.push_kv_blocks_async(
+          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_FALSE(std::move(future).get().empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 
@@ -1335,9 +1370,10 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   parallel_args.kv_split_size(2);
   std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
 
-  folly::SemiFuture<bool> future = transfer.push_kv_blocks_async(
-      {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
-  EXPECT_FALSE(std::move(future).get());
+  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
+      transfer.push_kv_blocks_async(
+          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_FALSE(std::move(future).get().empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 
@@ -1366,9 +1402,10 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   parallel_args.kv_split_size(2);
   std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
 
-  folly::SemiFuture<bool> future = transfer.push_kv_blocks_async(
-      {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
-  EXPECT_FALSE(std::move(future).get());
+  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
+      transfer.push_kv_blocks_async(
+          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_FALSE(std::move(future).get().empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 
@@ -1510,8 +1547,14 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   local_transfer.initialize(/*device_id=*/0);
   NpuMixedTransferCaches local_caches =
       make_npu_mixed_transfer_caches(local_torch_device);
+  local_transfer.configure_cache_layout(make_args(/*rank=*/0,
+                                                  /*world_size=*/1,
+                                                  /*dp_size=*/1),
+                                        make_npu_round_trip_model_args(),
+                                        /*block_token_capacity=*/1024,
+                                        /*is_spec_draft=*/false);
   local_transfer.register_kv_cache(
-      local_caches.caches, KVCacheShape(), torch::kBFloat16);
+      local_caches.caches, make_npu_round_trip_cache_shape(), torch::kBFloat16);
 
   ASSERT_EQ(local_transfer.main_layout_.layers.size(), 2U);
   ASSERT_EQ(local_transfer.main_layout_.layers[0].size(), 2U);
@@ -1578,11 +1621,13 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                          /*device_index=*/0));
   ASSERT_TRUE(synchronizer->record_event(/*layer_index=*/1,
                                          /*device_index=*/0));
-  ASSERT_TRUE(local_transfer.push_kv_blocks(merged_infos,
-                                            synchronizer,
-                                            /*is_spec_draft=*/false,
-                                            /*kv_split_rank=*/0,
-                                            /*kv_split_size=*/1));
+  ASSERT_TRUE(local_transfer
+                  .push_kv_blocks(merged_infos,
+                                  synchronizer,
+                                  /*is_spec_draft=*/false,
+                                  /*kv_split_rank=*/0,
+                                  /*kv_split_size=*/1)
+                  .empty());
 
   int32_t command = kValidatePushCommand;
   ASSERT_TRUE(write_all(parent_to_child[1], &command, sizeof(command)));
@@ -1665,11 +1710,13 @@ TEST(MooncakeKVCacheTransferDefaultTest,
       std::make_shared<KVPushSynchronizerImpl>(/*num_layers=*/1);
   synchronizer->abort();
 
-  EXPECT_FALSE(transfer.push_kv_blocks(merged_infos,
-                                       synchronizer,
-                                       /*is_spec_draft=*/false,
-                                       /*kv_split_rank=*/0,
-                                       /*kv_split_size=*/1));
+  EXPECT_FALSE(transfer
+                   .push_kv_blocks(merged_infos,
+                                   synchronizer,
+                                   /*is_spec_draft=*/false,
+                                   /*kv_split_rank=*/0,
+                                   /*kv_split_size=*/1)
+                   .empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 

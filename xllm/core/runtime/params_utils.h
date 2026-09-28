@@ -67,6 +67,7 @@ void forward_output_to_proto(
     const std::vector<std::string>& dit_text_output,
     const std::vector<torch::Tensor>& dit_audio,
     const std::vector<JsonObjectOutputError>& json_object_errors,
+    const std::vector<std::string>& failed_request_ids,
     proto::ForwardOutput* pb_forward_output);
 
 Token build_token(int64_t index,

@@ -681,14 +681,10 @@ bool MooncakeTransferEngine::set_remote_peer(
       &core_, cluster_id, manifest, proto_mode, remote_addr);
 }
 
-bool MooncakeTransferEngine::open_local_session(
-    const std::string& remote_addr) {
-  return core_.open_session(/*cluster_id=*/0, remote_addr);
-}
-
-bool MooncakeTransferEngine::close_local_session(
-    const std::string& remote_addr) {
-  return core_.close_session(/*cluster_id=*/0, remote_addr);
+bool MooncakeTransferEngine::set_local_peer(
+    const WorkerCacheLayoutManifest& manifest,
+    CachePeerMode mode) {
+  return core_.set_cache_peer(manifest, mode).ok();
 }
 
 bool MooncakeTransferEngine::open_session(const uint64_t cluster_id,
@@ -714,11 +710,12 @@ bool MooncakeTransferEngine::close_session(const uint64_t cluster_id,
   if (cache_peer.has_value()) {
     if (!set_remote_peer(cluster_id,
                          remote_addr,
-                         cache_peer->destination_manifest,
+                         cache_peer->local_manifest,
                          CachePeerMode::ABSENT)) {
       return false;
     }
-    if (cache_peer->holds_session && !close_local_session(remote_addr)) {
+    if (!set_local_peer(cache_peer->remote_manifest, CachePeerMode::ABSENT)) {
+      LOG(ERROR) << "Local cache peer cleanup failed for " << remote_addr;
       return false;
     }
     std::lock_guard<std::mutex> lock(session_mutex_);
@@ -780,8 +777,6 @@ bool MooncakeTransferEngine::link_sessions(
     return false;
   }
 
-  std::vector<size_t> opened_indices;
-  opened_indices.reserve(selected_indices.size());
   const std::unordered_set<size_t> selected_set(selected_indices.begin(),
                                                 selected_indices.end());
   bool linked = true;
@@ -794,12 +789,9 @@ bool MooncakeTransferEngine::link_sessions(
       linked = false;
       break;
     }
-    if (active && !open_local_session(remote_addrs[index])) {
+    if (!set_local_peer(remote_manifests[index], mode)) {
       linked = false;
       break;
-    }
-    if (active) {
-      opened_indices.emplace_back(index);
     }
   }
 
@@ -812,9 +804,10 @@ bool MooncakeTransferEngine::link_sessions(
                            CachePeerMode::ABSENT)) {
         LOG(ERROR) << "Cache peer rollback failed for " << remote_addrs[index];
       }
-    }
-    for (size_t index : opened_indices) {
-      close_local_session(remote_addrs[index]);
+      if (!set_local_peer(remote_manifests[index], CachePeerMode::ABSENT)) {
+        LOG(ERROR) << "Local cache peer rollback failed for "
+                   << remote_addrs[index];
+      }
     }
     return false;
   }
@@ -822,8 +815,8 @@ bool MooncakeTransferEngine::link_sessions(
   std::lock_guard<std::mutex> lock(session_mutex_);
   for (size_t index = 0; index < remote_manifests.size(); ++index) {
     LocalCachePeer cache_peer;
-    cache_peer.destination_manifest = *local_manifest;
-    cache_peer.holds_session = selected_set.find(index) != selected_set.end();
+    cache_peer.local_manifest = *local_manifest;
+    cache_peer.remote_manifest = remote_manifests[index];
     cache_peers_[remote_addrs[index]] = std::move(cache_peer);
   }
   return true;

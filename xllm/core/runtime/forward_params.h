@@ -26,6 +26,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/types.h"
@@ -659,6 +660,7 @@ struct ForwardOutput {
   // the same mask to target logits a second time.
   bool filter_bitmask_applied_to_logits = false;
   std::vector<JsonObjectOutputError> json_object_errors;
+  std::vector<std::string> failed_request_ids;
   // Keep no-sync input tensor handles alive until downstream consumers finish
   // using outputs on the same compute stream. Composite workers append child
   // outputs' retained inputs here. Local runtime handles; not in proto/shm.
@@ -687,6 +689,24 @@ struct ForwardOutput {
   // dit output data
   DiTForwardOutput dit_forward_output;
 };
+
+inline ForwardOutput make_failed_output(
+    std::vector<std::string> failed_request_ids) {
+  ForwardOutput output;
+  output.failed_request_ids = std::move(failed_request_ids);
+  return output;
+}
+
+inline std::optional<ForwardOutput> make_non_driver_forward_output(
+    ForwardOutput output,
+    std::vector<std::string> failed_request_ids,
+    bool eplb_enabled) {
+  output.failed_request_ids = std::move(failed_request_ids);
+  if (eplb_enabled || !output.failed_request_ids.empty()) {
+    return output;
+  }
+  return std::nullopt;
+}
 
 inline void copy_retained_inputs(ForwardOutput& destination,
                                  const ForwardOutput& source) {
@@ -721,6 +741,7 @@ struct RawSampleOutput {
 struct RawForwardOutput {
   std::vector<RawSampleOutput> outputs;  // num seqs
   std::vector<JsonObjectOutputError> json_object_errors;
+  std::vector<std::string> failed_request_ids;
   std::vector<int64_t> expert_load_data;
   int64_t prepared_token = -1;
   // beam search kernel output

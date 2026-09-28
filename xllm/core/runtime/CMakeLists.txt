@@ -103,6 +103,7 @@ cc_library(
     :kv_cache_transfer
     :linear_state_restore
     :kv_transfer_completion
+    :kv_transfer_failure
     :models
     :sampler
     :tokenizer

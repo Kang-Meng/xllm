@@ -762,10 +762,6 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       if (!options_.disable_log_stats()) {
         request->log_statistic(request->elapsed_seconds());
       }
-      // Keep decode_rpc_address (the peer that accepted the Allocate RPC):
-      // the first-generation task below needs it to release the decode-side
-      // reservation if the transfer fails; it is cleared once the transfer
-      // succeeds.
       requests.emplace_back(request);
       if (!request->state().stream) {
         non_stream_requests.emplace_back(request);
@@ -797,15 +793,9 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       response_processor_->wait_completion();
       kv_cache_manager_->deallocate(request.get());
     };
-    // Fails a request whose handoff to the decode instance cannot complete:
-    // releases the decode-side KV reservation reserved by the Allocate RPC
-    // (decode_rpc_address still holds the peer that accepted it, so the
-    // release RPC reaches that instance instead of the reservation leaking
-    // until the prefill instance is unlinked), then responds. A stream
-    // request has not been responded to yet and needs the explicit failure
-    // response; a non-stream request already received its response via
-    // process_completed_requests, so a second response would break the
-    // single request-response pairing and it only runs the shared cleanup.
+    // Release the Decode reservation when handoff preparation or the
+    // FirstGeneration RPC fails. Non-stream requests already received their
+    // prefill response, so only shared cleanup is performed for them.
     auto fail_handoff_request = [this, &fail_request](
                                     const std::shared_ptr<Request>& request,
                                     Status status) {
@@ -961,9 +951,8 @@ void DisaggPDScheduler::prefill_send_first_generation() {
              "Failed to send first generation to decode instance"});
         continue;
       }
-      // The handoff succeeded, so the decode instance owns the reservation
-      // from here on; drop the captured Allocate peer so no later release
-      // attempt can target it.
+
+      // The handoff succeeded, so the Decode instance owns the reservation.
       request->state().decode_rpc_address.clear();
 
       {

@@ -122,6 +122,9 @@ void proto_to_forward_output(const proto::ForwardOutput& pb_output,
     raw_forward_output.json_object_errors.push_back(
         {pb_error.sample_sequence_id(), pb_error.message()});
   }
+  raw_forward_output.failed_request_ids.assign(
+      pb_output.failed_request_ids().begin(),
+      pb_output.failed_request_ids().end());
   raw_forward_output.prepared_token = pb_output.prepared_token();
   for (size_t i = 0; i < seq_nums; ++i) {
     proto::SquenceOutput pb_seq_out = pb_output.outputs()[i];
@@ -180,6 +183,7 @@ void forward_output_to_proto(
     const std::vector<std::string>& dit_text_output,
     const std::vector<torch::Tensor>& dit_audio,
     const std::vector<JsonObjectOutputError>& json_object_errors,
+    const std::vector<std::string>& failed_request_ids,
     proto::ForwardOutput* pb_forward_output) {
   Timer timer;
   // LLM decode fills next_tokens; DiT text diffusion (e.g. Cola-DLM) may leave
@@ -377,6 +381,9 @@ void forward_output_to_proto(
         pb_forward_output->add_json_object_errors();
     pb_error->set_sample_sequence_id(error.sample_sequence_id);
     pb_error->set_message(error.message);
+  }
+  for (const std::string& request_id : failed_request_ids) {
+    pb_forward_output->add_failed_request_ids(request_id);
   }
   COUNTER_ADD(proto_latency_seconds_o2proto, timer.elapsed_seconds());
   return;

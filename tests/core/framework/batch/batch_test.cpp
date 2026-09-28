@@ -813,6 +813,26 @@ TEST(BatchTest, ProcessRawOutputStoresMtpBootstrapEmbedding) {
   EXPECT_TRUE(torch::equal(stored, torch::tensor({3.0f, 4.0f})));
 }
 
+TEST(BatchTest, ProcessRawOutputFailsRequestForKVPushFailure) {
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  Sequence sequence = make_overlap_sequence({1},
+                                            /*seq_capacity=*/8,
+                                            &sampling_param,
+                                            &stopping_checker,
+                                            /*request_id=*/"request-a");
+  Batch batch(&sequence);
+
+  RawForwardOutput raw_output;
+  raw_output.failed_request_ids = {"request-a"};
+
+  batch.process_sample_output(raw_output, /*replace_fake_token=*/false);
+
+  ASSERT_TRUE(sequence.error_status().has_value());
+  EXPECT_EQ(sequence.error_status()->code(), StatusCode::UNKNOWN);
+  EXPECT_EQ(sequence.error_status()->message(), "KV cache push failed");
+}
+
 TEST(BatchTest, ProcessRawOutputAccumulatesRequestSpeculativeStats) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(4);
@@ -1693,6 +1713,7 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
                           /*dit_text_output=*/{},
                           /*dit_audio=*/{},
                           /*json_object_errors=*/{},
+                          /*failed_request_ids=*/{},
                           &proto_output);
   RawForwardOutput raw_output;
   proto_to_forward_output(proto_output, raw_output);
@@ -2078,6 +2099,7 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
                           /*dit_text_output=*/{},
                           /*dit_audio=*/{},
                           errors,
+                          /*failed_request_ids=*/{"request-a", "request-b"},
                           &proto_output);
 
   RawForwardOutput round_trip;
@@ -2093,6 +2115,9 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
   EXPECT_EQ(round_trip.json_object_errors[0].sample_sequence_id, "req-error#0");
   EXPECT_EQ(round_trip.json_object_errors[0].message,
             "missing prior sampled output row");
+  ASSERT_EQ(round_trip.failed_request_ids.size(), 2u);
+  EXPECT_EQ(round_trip.failed_request_ids[0], "request-a");
+  EXPECT_EQ(round_trip.failed_request_ids[1], "request-b");
 }
 
 TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
@@ -2130,7 +2155,9 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
                                               undefined,
                                               undefined,
                                               undefined,
-                                              errors));
+                                              errors,
+                                              /*failed_request_ids=*/
+                                              {"request-a", "request-b"}));
 
   RawForwardOutput round_trip;
   reader_manager.raw_output_read(round_trip);
@@ -2145,6 +2172,9 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   EXPECT_EQ(round_trip.json_object_errors[0].sample_sequence_id, "req-error#0");
   EXPECT_EQ(round_trip.json_object_errors[0].message,
             "prior token violates json_object grammar");
+  ASSERT_EQ(round_trip.failed_request_ids.size(), 2u);
+  EXPECT_EQ(round_trip.failed_request_ids[0], "request-a");
+  EXPECT_EQ(round_trip.failed_request_ids[1], "request-b");
 }
 
 TEST(BatchTest, ForwardInputBlockCopyKernelFieldsMatchExpectedLayout) {

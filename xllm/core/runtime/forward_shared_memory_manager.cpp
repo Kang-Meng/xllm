@@ -2778,6 +2778,7 @@ size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
   }
 
   size += calculate_json_object_errors_size(output.json_object_errors);
+  size += get_string_vector_size(output.failed_request_ids);
 
   size += get_vector_size(output.expert_load_data);
   size += get_vector_size(output.src_seq_idxes);
@@ -2878,6 +2879,7 @@ void deserialize_raw_forward_output(const char* buffer,
   }
 
   read_json_object_errors(buffer, output.json_object_errors);
+  read_string_vector(buffer, output.failed_request_ids);
 
   read_vector(buffer, output.expert_load_data);
   read_vector(buffer, output.src_seq_idxes);
@@ -2901,6 +2903,7 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
   }
 
   write_json_object_errors(buffer, output.json_object_errors);
+  write_string_vector(buffer, output.failed_request_ids);
 
   write_vector(buffer, output.expert_load_data);
   write_vector(buffer, output.src_seq_idxes);
@@ -3552,7 +3555,8 @@ bool ForwardSharedMemoryManager::raw_output_write(
     const torch::Tensor& src_seq_idxes,
     const torch::Tensor& out_tokens,
     const torch::Tensor& out_logprobs,
-    const std::vector<JsonObjectOutputError>& json_object_errors) {
+    const std::vector<JsonObjectOutputError>& json_object_errors,
+    const std::vector<std::string>& failed_request_ids) {
   RawForwardOutput output;
   convert_tensor_to_raw_output(next_tokens,
                                logprobs,
@@ -3577,8 +3581,9 @@ bool ForwardSharedMemoryManager::raw_output_write(
     }
   }
   output.json_object_errors = json_object_errors;
-  uint64_t total_size = sizeof(ControlMetadata);
-  total_size += calculate_raw_forward_output_size(output);
+  output.failed_request_ids = failed_request_ids;
+  const uint64_t payload_size = calculate_raw_forward_output_size(output);
+  const uint64_t total_size = sizeof(ControlMetadata) + payload_size;
   if (unlikely(total_size > size())) {
     LOG(ERROR) << "raw output size overflow, total_size: " << total_size
                << ", shm size: " << size();
@@ -3586,7 +3591,13 @@ bool ForwardSharedMemoryManager::raw_output_write(
   }
 
   char* data_ptr = static_cast<char*>(base_address()) + sizeof(ControlMetadata);
+  char* payload_begin = data_ptr;
   serialize_raw_forward_output(output, data_ptr);
+  CHECK_EQ(data_ptr, payload_begin + payload_size)
+      << "packed raw forward output payload size mismatch";
+  const uint64_t real_size =
+      static_cast<uint64_t>(data_ptr - static_cast<char*>(base_address()));
+  CHECK_EQ(total_size, real_size) << "total_size != real_size.";
   std::atomic_thread_fence(std::memory_order_release);
   control_ptr_->version = ++last_version_;
   return true;

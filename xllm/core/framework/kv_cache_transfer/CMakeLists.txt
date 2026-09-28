@@ -62,6 +62,22 @@ cc_library(
 
 cc_library(
   NAME
+    kv_transfer_failure
+  HDRS
+    kv_transfer_completion.h
+  SRCS
+    kv_transfer_failure.cpp
+  DEPS
+    :common
+    :kv_transfer_completion
+    :parallel_state
+    :platform
+    glog::glog
+    torch
+)
+
+cc_library(
+  NAME
     kv_cache_transfer
   HDRS
     kv_cache_transfer.h

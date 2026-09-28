@@ -420,6 +420,7 @@ message ForwardOutput {
   repeated float out_logprobs = 7;
   DiTForwardOutput dit_forward_output = 8;
   repeated JsonObjectOutputError json_object_errors = 9;
+  repeated string failed_request_ids = 10;
 }
 
 // master create Collective service

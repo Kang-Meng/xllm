@@ -82,6 +82,13 @@ bool has_active_dp_tokens(const ForwardInput& input) {
   });
 }
 
+void append_failed_request_ids(ForwardOutput& destination,
+                               const ForwardOutput& source) {
+  destination.failed_request_ids.insert(destination.failed_request_ids.end(),
+                                        source.failed_request_ids.begin(),
+                                        source.failed_request_ids.end());
+}
+
 void broadcast_tokens_in_group(torch::Tensor& tokens,
                                ProcessGroup* process_group,
                                int32_t root_rank = 0) {
@@ -1290,6 +1297,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     auto draft_output = run_worker_no_sync(*draft_impl_, input, draft_prepared);
     if (draft_output.has_value()) {
       transfer_retained_inputs(*output, draft_output.value());
+      append_failed_request_ids(*output, draft_output.value());
     }
     clear_all_output_embeddings(*output);
     finalize_output_on_stream(
@@ -1361,6 +1369,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
         run_worker_no_sync(*impl_, new_input, target_prepared).value();
     for (ForwardOutput& draft_output : draft_outputs) {
       transfer_retained_inputs(output, draft_output);
+      append_failed_request_ids(output, draft_output);
     }
     clear_all_output_embeddings(output);
     finalize_output_on_stream(
@@ -1470,11 +1479,15 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   }
 
   transfer_retained_inputs(output, draft_output);
+  append_failed_request_ids(output, draft_output);
   finalize_output_on_stream(
       output, *compute_stream_, enable_schedule_overlap());
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
       !::xllm::EPLBConfig::get_instance().enable_eplb()) {
+    if (!output.failed_request_ids.empty()) {
+      return make_failed_output(std::move(output.failed_request_ids));
+    }
     return std::nullopt;
   }
   return output;
@@ -2351,6 +2364,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                                             target_prepared)
                         .value();
   }
+  for (const ForwardOutput& draft_output : draft_outputs) {
+    append_failed_request_ids(target_output, draft_output);
+  }
   const double target_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               target_latency_ms / 1000.0);
@@ -2447,6 +2463,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
 
     if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
         !::xllm::EPLBConfig::get_instance().enable_eplb()) {
+      if (!target_output.failed_request_ids.empty()) {
+        return make_failed_output(std::move(target_output.failed_request_ids));
+      }
       return std::nullopt;
     }
     clear_all_output_embeddings(target_output);
@@ -2602,6 +2621,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
       !::xllm::EPLBConfig::get_instance().enable_eplb()) {
+    if (!target_output.failed_request_ids.empty()) {
+      return make_failed_output(std::move(target_output.failed_request_ids));
+    }
     return std::nullopt;
   }
   clear_all_output_embeddings(target_output);

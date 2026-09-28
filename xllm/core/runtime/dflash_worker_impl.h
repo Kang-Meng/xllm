@@ -200,13 +200,15 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
       ForwardInput& input,
       const std::vector<EmbeddingCache::DecodeState>& last_states) const;
 
-  void write_context_kv(const ForwardInput& input,
-                        const torch::Tensor& context_hidden,
-                        const torch::Tensor& positions_device,
-                        const torch::Tensor& new_cache_slots_device);
+  std::vector<std::string> write_context_kv(
+      const ForwardInput& input,
+      const torch::Tensor& context_hidden,
+      const torch::Tensor& positions_device,
+      const torch::Tensor& new_cache_slots_device);
 
-  void write_target_context_to_cache(const ForwardInput& input,
-                                     const SampleOutput& validate_output);
+  std::vector<std::string> write_target_context_to_cache(
+      const ForwardInput& input,
+      const SampleOutput& validate_output);
 
  protected:
   int32_t mask_token_id_ = -1;

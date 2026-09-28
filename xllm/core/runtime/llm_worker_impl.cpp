@@ -22,6 +22,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "common/device_monitor.h"
 #include "common/metrics.h"
@@ -245,6 +246,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   auto& sampling_params = input.sampling_params;
 
   KVTransferCompletion kv_transfers;
+  const std::vector<std::string> canonical_request_ids =
+      canonical_transfer_request_ids(input.transfer_kv_infos);
+  std::vector<std::string> failed_request_ids;
+  bool kv_push_waited = false;
 
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
@@ -269,11 +274,21 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
         kv_cache_transfer_->push_kv_blocks_async(input.transfer_kv_infos,
                                                  context_.get_parallel_args(),
                                                  layer_synchronizer,
-                                                 is_spec_draft_));
+                                                 is_spec_draft_),
+        canonical_request_ids);
 #endif
   }
-  auto wait_kv_push = [&kv_transfers]() {
-    CHECK(kv_transfers.wait()) << "KV cache push failed";
+  auto wait_kv_push = [&]() {
+    if (kv_push_waited) {
+      return;
+    }
+    failed_request_ids =
+        finalize_kv_push_failures(kv_transfers,
+                                  input.transfer_kv_infos,
+                                  options_.kv_cache_transfer_mode(),
+                                  context_.get_parallel_args(),
+                                  device_);
+    kv_push_waited = true;
   };
   if (eplb_executor_ != nullptr) {
     eplb_executor_->start_eplb_step(input.input_params.expert.eplb_info);
@@ -287,6 +302,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
   if (!model_output.hidden_states.defined()) {
     wait_kv_push();
+    if (!failed_request_ids.empty()) {
+      return make_failed_output(std::move(failed_request_ids));
+    }
     return std::nullopt;
   }
 
@@ -348,15 +366,16 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     MULTI_MODEL_STEP_UNLOCK();
     if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
       wait_kv_push();
-      return std::nullopt;
+      return make_non_driver_forward_output(ForwardOutput{},
+                                            std::move(failed_request_ids),
+                                            /*eplb_enabled=*/false);
     }
     int ret = device_.synchronize_default_stream();
     CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
     wait_kv_push();
-    if (eplb_executor_ != nullptr) {
-      return output;
-    }
-    return std::nullopt;
+    return make_non_driver_forward_output(std::move(output),
+                                          std::move(failed_request_ids),
+                                          eplb_executor_ != nullptr);
   }
 
   // driver prepare model output
@@ -421,6 +440,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 #endif
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     wait_kv_push();
+    output.failed_request_ids = std::move(failed_request_ids);
     output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
     if (enable_schedule_overlap() && record_ready_event) {
       output.ready_event = record_current_stream_event(device_);
@@ -433,6 +453,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
 
   wait_kv_push();
+  output.failed_request_ids = std::move(failed_request_ids);
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   if (should_sync_default_stream) {

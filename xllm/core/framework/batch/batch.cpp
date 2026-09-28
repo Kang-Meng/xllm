@@ -128,6 +128,55 @@ std::unordered_set<std::string> fail_json_object_requests(
   return failed_request_ids;
 }
 
+std::unordered_set<std::string> fail_kv_push_requests(
+    const std::vector<Sequence*>& sequences,
+    const std::vector<std::string>& failed_request_ids) {
+  if (failed_request_ids.empty()) {
+    return {};
+  }
+
+  std::unordered_set<std::string> known_request_ids;
+  known_request_ids.reserve(sequences.size());
+  for (Sequence* sequence : sequences) {
+    CHECK(sequence != nullptr);
+    known_request_ids.insert(sequence->request_id());
+  }
+
+  std::unordered_set<std::string> matched_request_ids;
+  for (const std::string& request_id : failed_request_ids) {
+    if (known_request_ids.find(request_id) == known_request_ids.end()) {
+      LOG(ERROR) << "KV cache push failure references unknown request_id: "
+                 << request_id;
+      continue;
+    }
+    matched_request_ids.insert(request_id);
+  }
+
+  if (matched_request_ids.empty()) {
+    return matched_request_ids;
+  }
+  for (Sequence* sequence : sequences) {
+    if (!sequence->cancelled() &&
+        matched_request_ids.find(sequence->request_id()) !=
+            matched_request_ids.end()) {
+      sequence->fail(Status(StatusCode::UNKNOWN, "KV cache push failed"));
+    }
+  }
+  return matched_request_ids;
+}
+
+std::unordered_set<std::string> collect_failed_request_ids(
+    const std::vector<Sequence*>& sequences,
+    const RawForwardOutput& raw_output) {
+  std::unordered_set<std::string> failed_request_ids =
+      fail_json_object_requests(sequences, raw_output.json_object_errors);
+  const std::unordered_set<std::string> failed_kv_push_request_ids =
+      fail_kv_push_requests(sequences, raw_output.failed_request_ids);
+  failed_request_ids.insert(failed_kv_push_request_ids.begin(),
+                            failed_kv_push_request_ids.end());
+  return failed_request_ids;
+}
+
 }  // namespace
 
 Batch::Batch(Sequence* sequence) { add(sequence); }
@@ -552,7 +601,7 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
                                   OptionalModelArgsRef model_args) {
   const std::vector<Sequence*> sequences = get_sequences();
   const std::unordered_set<std::string> failed_request_ids =
-      fail_json_object_requests(sequences, raw_output.json_object_errors);
+      collect_failed_request_ids(sequences, raw_output);
 
   for (size_t output_idx = 0; output_idx < output_targets_.size();
        ++output_idx) {
@@ -906,7 +955,7 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
                                        bool replace_fake_token) {
   const std::vector<Sequence*> sequences = get_sequences();
   const std::unordered_set<std::string> failed_request_ids =
-      fail_json_object_requests(sequences, raw_output.json_object_errors);
+      collect_failed_request_ids(sequences, raw_output);
 
   const int32_t beam_width = sequences_[0]->sampling_param()->beam_width;
   if (beam_width <= 1) {

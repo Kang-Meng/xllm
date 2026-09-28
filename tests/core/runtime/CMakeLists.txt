@@ -2,6 +2,18 @@ include(cc_test)
 
 cc_test(
   NAME
+    forward_output_test
+  CPU_ONLY
+  SRCS
+    forward_output_test.cpp
+  DEPS
+    torch
+    proto::xllm_proto
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     acl_graph_bucket_policy_test
   CPU_ONLY
   SRCS

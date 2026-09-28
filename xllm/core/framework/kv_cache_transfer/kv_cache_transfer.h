@@ -17,7 +17,13 @@ limitations under the License.
 
 #include <folly/futures/Future.h>
 
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 #include "common/types.h"
+#include "core/framework/kv_cache_transfer/kv_transfer_types.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
 #if defined(USE_NPU)
@@ -58,12 +64,27 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
     int32_t kv_split_size,
     const std::vector<TransferKVInfo>& kv_infos);
 
+inline void append_unique_request_id(
+    std::unordered_map<std::string, std::unordered_set<std::string>>& seen,
+    const std::string& key,
+    std::vector<std::string>& request_ids,
+    const std::string& request_id) {
+  auto& seen_ids = seen[key];
+  if (seen_ids.empty() && !request_ids.empty()) {
+    seen_ids.insert(request_ids.begin(), request_ids.end());
+  }
+  if (seen_ids.emplace(request_id).second) {
+    request_ids.emplace_back(request_id);
+  }
+}
+
 class KVCacheTransfer {
  public:
   struct KVCacheInfo {
     uint64_t dst_cluster_id;
     std::string dst_addr;
     std::vector<KVTransferMapping> mappings;
+    std::vector<std::string> request_ids;
 
     // XTensor mode: destination offsets from D-node (per-layer)
     // dst_xtensor_layer_offsets[layer_id] = {k_offsets, v_offsets}
@@ -120,7 +141,8 @@ class KVCacheTransfer {
       const std::vector<KVTransferMapping>& mappings);
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
-  virtual folly::SemiFuture<bool> push_kv_blocks_async(
+  virtual folly::SemiFuture<std::vector<KVTransferTaskResult>>
+  push_kv_blocks_async(
       const std::vector<TransferKVInfo>& transfer_kv_infos,
       const ParallelArgs& parallel_args,
       std::shared_ptr<KVPushSynchronizerImpl> layer_synchronizer,
@@ -133,7 +155,7 @@ class KVCacheTransfer {
       const ParallelArgs& parallel_args);
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
-  virtual bool push_kv_blocks(
+  virtual std::vector<KVTransferTaskResult> push_kv_blocks(
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
       std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,
       bool is_spec_draft,

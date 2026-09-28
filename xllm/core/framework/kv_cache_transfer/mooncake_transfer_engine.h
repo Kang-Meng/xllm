@@ -224,14 +224,14 @@ class MooncakeTransferEngine {
                                const std::string& remote_addr,
                                const WorkerCacheLayoutManifest& manifest,
                                CachePeerMode mode);
-  virtual bool open_local_session(const std::string& remote_addr);
-  virtual bool close_local_session(const std::string& remote_addr);
+  virtual bool set_local_peer(const WorkerCacheLayoutManifest& manifest,
+                              CachePeerMode mode);
 
  private:
   // Preserve the exact identity used by idempotent ABSENT requests.
   struct LocalCachePeer {
-    WorkerCacheLayoutManifest destination_manifest;
-    bool holds_session = false;
+    WorkerCacheLayoutManifest local_manifest;
+    WorkerCacheLayoutManifest remote_manifest;
   };
 
   uint16_t listen_port_;

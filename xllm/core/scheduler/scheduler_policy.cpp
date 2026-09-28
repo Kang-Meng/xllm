@@ -92,13 +92,6 @@ size_t get_sequence_free_blocks_for_rank(KVCacheManager* kv_cache_manager,
   return util::max(free_blocks);
 }
 
-// Re-queue requests skipped during a scheduling pass so they are retried
-// once step-local capacity (e.g. a DP group's token cap) refreshes. Every
-// queue type's plain push is the right re-entry operation: the deque-backed
-// queues of the fcfs/multi_slo_and_prio strategies insert at the front, and
-// the reverse iteration restores the requests' relative order; heap-backed
-// priority queues re-place each request by its comparator instead, so retry
-// order there follows the queue's priority semantics.
 void restore_skipped_requests(
     RequestPriorityQueue* queue,
     const std::vector<std::shared_ptr<Request>>& skipped) {
@@ -412,11 +405,9 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     if (!can_schedule) {
       break;
     }
-    // Sequences that received a zero-token share for this step (e.g. their
-    // DP group's per-step token cap is exhausted) were skipped above. The
-    // request must keep its prefill queue slot: admitting it with no
-    // sequences would drop it out of the prefill path and requeue it as a
-    // decode-stage request, stalling it until a prefill-idle step.
+    // Keep requests whose sequences received no tokens in the prefill queue.
+    // Otherwise a DP-group quota exhaustion can admit an empty request and
+    // incorrectly move it into the decode path.
     if (prefill_sequences.empty()) {
       skipped.emplace_back(request);
       queue->pop_top();
