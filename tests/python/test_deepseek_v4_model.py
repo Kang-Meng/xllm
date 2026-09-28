@@ -405,8 +405,11 @@ def test_model_accepts_cp_config() -> None:
 
 
 def test_causal_lm_accepts_data_parallelism_config() -> None:
-    model = DeepseekV4ForCausalLM({**_DSV4_CONFIG, "dp_size": 2})
+    # The production constructor defaults to npu:0. This configuration test
+    # must not initialize an NPU or compete with device tests for HBM.
+    model = DeepseekV4ForCausalLM({**_DSV4_CONFIG, "dp_size": 2, "device": "cpu"})
     assert model.cfg.dp_size == 2
+    assert all(parameter.device.type == "cpu" for parameter in model.parameters())
 
 
 def _capture_test_model(

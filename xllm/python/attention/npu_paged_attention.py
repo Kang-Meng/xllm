@@ -207,6 +207,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         device: torch.device,
         dtype: torch.dtype,
         num_decoding_tokens: int = 1,
+        use_xfia_decode: bool = False,
+        xfia_query_width: int = 1,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -215,6 +217,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self.sliding_window = sliding_window
         self.dtype = dtype
         self.device = device
+        self._use_xfia_decode = use_xfia_decode
+        self._xfia_query_width = xfia_query_width
+        self._xfia_query_ends: torch.Tensor | None = None
+        self._xfia_kv_lengths: torch.Tensor | None = None
+        self._xfia_kv_starts: torch.Tensor | None = None
+        self._xfia_row_ends: dict[int, torch.Tensor] = {}
         self._use_fia_v2 = _HAS_FIA_V2
         self._is_mla = is_mla
         self._uses_sparse_mla = False
@@ -319,7 +327,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     @property
     def requires_host_kv_lengths(self) -> bool:
         """Whether ACL Graph replay must update FIA's host KV-length list."""
-        return self._is_mla and not self._uses_sparse_mla
+        return not self._use_xfia_decode and (not self._is_mla or not self._uses_sparse_mla)
 
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         full_attention_caches = [(cache.key, cache.value) for cache in kv_caches if cache.key is not None]
@@ -431,15 +439,48 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         graph_mode: bool = False,
     ) -> None:
         self._metadata = metadata
+        if self._use_xfia_decode and (
+            not (metadata.is_prefill or metadata.is_chunked_prefill)
+            or (
+                metadata.is_chunked_prefill
+                and getattr(metadata, "is_spec_verify", False)
+                and metadata.block_table is not None
+                and metadata.slot_mapping.numel() == metadata.block_table.shape[0] * self._xfia_query_width
+            )
+        ):
+            self._prepare_xfia_decode(metadata, graph_mode=graph_mode)
+            return
         self._kda_validated_query_shape = None
         self._prepare_kda_speculative_state_indices(metadata, graph_mode=graph_mode)
-        if getattr(metadata, "q_cu_host_values", None) is not None:
-            # Static graph metadata carries the (per-entry constant) host
-            # copy: reading the device buffer would block the host until the
-            # prior replay drains, serializing the scheduler behind device.
-            self._actual_seq_lens = metadata.q_cu_host_values[1:]
-        elif metadata.q_cu_seq_lens is not None:
-            self._actual_seq_lens = metadata.q_cu_seq_lens[1:].cpu().tolist()
+        q_cu_host_values = getattr(metadata, "q_cu_host_values", None)
+        if q_cu_host_values is None:
+            # Runtime metadata exposes the same host copy under the public
+            # q_cu_seq_lens_host_values name.  Prefer either host form during
+            # graph capture; reading the device buffer would synchronize with
+            # the prior replay and abort ACL graph capture.
+            q_cu_host_values = getattr(metadata, "q_cu_seq_lens_host_values", None)
+        if q_cu_host_values is not None and len(q_cu_host_values) > 1:
+            self._actual_seq_lens = q_cu_host_values[1:]
+        elif q_cu_host_values is not None and len(q_cu_host_values) == 1:
+            self._actual_seq_lens = None
+        elif q_cu_host_values is None:
+            q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
+            if q_seq_lens_host is not None and q_seq_lens_host.device.type == "cpu":
+                cumulative = [0]
+                for length in q_seq_lens_host.tolist():
+                    cumulative.append(cumulative[-1] + int(length))
+                self._actual_seq_lens = cumulative[1:]
+            elif metadata.q_cu_seq_lens is not None:
+                if metadata.q_cu_seq_lens.device.type == "cpu":
+                    self._actual_seq_lens = metadata.q_cu_seq_lens[1:].tolist()
+                else:
+                    # A device-to-host copy is illegal while the draft ACL
+                    # graph is being captured.  The eager fallback uses
+                    # num_tokens as a single packed sequence, which is the
+                    # only safe value when no host sequence metadata exists.
+                    self._actual_seq_lens = None
+            else:
+                self._actual_seq_lens = None
         else:
             self._actual_seq_lens = None
 
@@ -573,7 +614,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 self._mla_actual_seq_kv = actual_seq_kv
             # Dense (FIA v2) MLA needs host cumulative seq-lens; sparse SFA
             # does not, so skip the D2H unless the dense path can run.
-            if self.requires_host_kv_lengths:
+            if self._is_mla and self.requires_host_kv_lengths:
                 if metadata.is_prefill or metadata.is_chunked_prefill:
                     self._mla_actual_seq_q_host = actual_seq_q.cpu().tolist()
                 else:
@@ -584,11 +625,17 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 self._mla_actual_seq_kv_host = None
             if metadata.is_prefill or metadata.is_chunked_prefill:
                 q_seq_lens = getattr(metadata, "q_seq_lens", None)
-                if q_seq_lens is not None and q_seq_lens.numel() > 0:
+                q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
+                if q_seq_lens_host is not None and q_seq_lens_host.numel() > 0:
+                    self._mla_max_seqlen_q = int(q_seq_lens_host.max().item())
+                elif q_seq_lens is not None and q_seq_lens.device.type == "cpu" and q_seq_lens.numel() > 0:
                     self._mla_max_seqlen_q = int(q_seq_lens.max().item())
                 else:
-                    seq_starts = torch.cat([actual_seq_q.new_zeros(1), actual_seq_q[:-1]])
-                    self._mla_max_seqlen_q = int((actual_seq_q - seq_starts).max().item())
+                    # Do not read a device scalar while an ACL graph is
+                    # being captured.  Graph metadata normally has the host
+                    # q lengths above; one is the safe decode-style fallback
+                    # when that optional host field is absent.
+                    self._mla_max_seqlen_q = 1
             else:
                 self._mla_max_seqlen_q = 1
             if graph_mode and self._block_table_i32 is not None:
@@ -602,7 +649,21 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                     self.page_size,
                 )
             else:
-                self._mla_max_seqlen_k = int(actual_seq_kv.max().item())
+                kv_seq_lens_host = getattr(metadata, "kv_seq_lens_host", None)
+                kv_seq_lens_host_values = getattr(metadata, "kv_seq_lens_host_values", None)
+                if kv_seq_lens_host is not None and kv_seq_lens_host.numel() > 0:
+                    self._mla_max_seqlen_k = int(kv_seq_lens_host.max().item())
+                elif kv_seq_lens_host_values:
+                    self._mla_max_seqlen_k = max(int(value) for value in kv_seq_lens_host_values)
+                elif actual_seq_kv.device.type == "cpu" and actual_seq_kv.numel() > 0:
+                    self._mla_max_seqlen_k = int(actual_seq_kv.max().item())
+                elif self._block_table_i32 is not None:
+                    self._mla_max_seqlen_k = _mla_graph_max_seqlen_k(
+                        self._block_table_i32,
+                        self.page_size,
+                    )
+                else:
+                    self._mla_max_seqlen_k = 1
         else:
             self._mla_actual_seq_q = None
             self._mla_actual_seq_kv = None
@@ -690,8 +751,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         kernels.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
 
         if metadata.is_prefill or metadata.is_chunked_prefill:
+            if (
+                self._use_xfia_decode
+                and metadata.is_chunked_prefill
+                and getattr(metadata, "is_spec_verify", False)
+                and metadata.block_table is not None
+                and num_tokens == metadata.block_table.shape[0] * self._xfia_query_width
+            ):
+                return self._xfia_decode(q_3d, k_cache, v_cache, layer_id)
             if self._use_expanded_decode:
-                return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
+                return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
             return self._prefill(
                 q_3d,
                 k_3d,
@@ -703,7 +772,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 layer.causal,
                 layer.attention_window,
             )
-        return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
+        return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
 
     def execute_mla(
         self,
@@ -1345,7 +1414,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         conv_input = mixed_qkv.transpose(1, 2).reshape(-1, conv_dim).contiguous()
         conv_out = kernels.causal_conv1d_update_v2(
             conv_input,
-            layer.conv_weight.squeeze(1),
+            # The native wrapper transposes [channels, width] to contiguous
+            # [width, channels]. Reuse the weight packed at model load so
+            # that transpose is a view instead of a device copy on every layer.
+            layer.conv_weight_t.transpose(0, 1),
             conv_cache,
             idx32,
             qsl_buf,
@@ -1809,6 +1881,72 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     # Decode: FIA with block_table (paged KV, no gather)
     # ------------------------------------------------------------------
 
+    def _prepare_xfia_decode(self, metadata: AttentionMetadata, *, graph_mode: bool = False) -> None:
+        """Keep decode lengths on device, including ACL graph replay inputs."""
+        if metadata.block_table is None or metadata.kv_seq_lens is None:
+            raise RuntimeError("XFIA decode requires device block tables and KV lengths")
+        if self._is_mla or self.head_dim != 128 or self.page_size != 128:
+            raise RuntimeError("XFIA decode requires dense attention with head/page size 128")
+        self._block_table_i32 = metadata.block_table.to(torch.int32).contiguous()
+        self._xfia_kv_lengths = metadata.kv_seq_lens.to(torch.int32).contiguous()
+        sequences = self._block_table_i32.shape[0]
+        if metadata.kv_seq_lens.numel() != sequences:
+            raise RuntimeError("XFIA requires one KV length per block-table row")
+        rows = metadata.slot_mapping.numel()
+        if rows != sequences:
+            if rows != sequences * self._xfia_query_width:
+                raise RuntimeError("XFIA requires complete DFlash2 proposal blocks")
+            self._block_table_i32 = self._block_table_i32.repeat_interleave(self._xfia_query_width, dim=0)
+            self._xfia_kv_lengths = self._xfia_kv_lengths.repeat_interleave(self._xfia_query_width)
+        if rows not in self._xfia_row_ends:
+            self._xfia_row_ends[rows] = torch.arange(1, rows + 1, dtype=torch.int32, device=self.device)
+        self._xfia_query_ends = self._xfia_row_ends[rows]
+        if self._xfia_query_width > 1:
+            # Preserve FIA band-mode's right-aligned [left=window-1, right=width-1]
+            # visibility. Every proposal row sees the complete proposal block;
+            # its left boundary can fall inside a physical KV page.
+            row_in_block = (self._xfia_query_ends - 1).remainder(self._xfia_query_width)
+            self._xfia_kv_starts = (
+                self._xfia_kv_lengths - self._xfia_query_width + row_in_block - (self.sliding_window - 1)
+            ).clamp_min(0)
+        else:
+            self._xfia_kv_starts = torch.zeros_like(self._xfia_kv_lengths)
+        if graph_mode:
+            for attribute, name in (
+                ("_block_table_i32", "XFIA_BLOCK_TABLE"),
+                ("_xfia_kv_lengths", "XFIA_KV_LENGTHS"),
+                ("_xfia_kv_starts", "XFIA_KV_STARTS"),
+            ):
+                source = getattr(self, attribute)
+                destination = get_execution_buffer(
+                    (name,) + tuple(source.shape), lambda source=source: torch.empty_like(source)
+                )
+                destination.copy_(source)
+                setattr(self, attribute, destination)
+
+    def _xfia_decode(
+        self,
+        q: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        output = get_execution_buffer(("XFIA_OUTPUT", layer_id) + tuple(q.shape), lambda: torch.empty_like(q))
+        # All changing arguments are device tensor contents. The captured op
+        # needs no external event or host-side FIA task update on replay.
+        torch.ops.xllm_ops.x_flash_attention_decode_out(
+            q,
+            key,
+            value,
+            self._block_table_i32,
+            self._xfia_query_ends,
+            self._xfia_kv_lengths,
+            self._xfia_kv_starts,
+            self.scale,
+            output,
+        )
+        return output.reshape(q.shape[0], self.num_heads * self.head_dim)
+
     def _fia_out(
         self,
         q: torch.Tensor,
@@ -1867,7 +2005,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         v_cache: torch.Tensor,
         metadata: AttentionMetadata,
         num_tokens: int,
+        layer_id: int = 0,
     ) -> torch.Tensor:
+        if self._use_xfia_decode:
+            return self._xfia_decode(q_3d, k_cache, v_cache, layer_id)
         block_size = k_cache.size(1)
         k_flat = k_cache.view(k_cache.size(0), block_size, -1)
         v_flat = v_cache.view(v_cache.size(0), block_size, -1)

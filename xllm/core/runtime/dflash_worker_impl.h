@@ -93,6 +93,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
     DraftProposal proposal;
     // DSpark ConfidenceHead output for adaptive pruning; empty otherwise.
     torch::Tensor confidence_probs;
+    std::vector<torch::Tensor> retained_tensors;
     // No-sync draft inputs must outlive validation's stream sync.
     std::vector<std::shared_ptr<ForwardInput>> retained_inputs;
   };
@@ -101,6 +102,19 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // one forward + sequential Markov-head sampling loop).
   virtual DraftBlock run_decode_draft(const ForwardInput& input,
                                       ForwardInput& validate_input);
+
+  virtual bool prepare_draft_prelaunch(const ForwardInput& /*input*/) {
+    return false;
+  }
+  virtual void launch_draft_prelaunch(const ForwardInput& /*input*/,
+                                      const SampleOutput& /*output*/,
+                                      const torch::Tensor& /*accepted_host*/) {
+    LOG(FATAL) << "Draft prelaunch was not implemented";
+  }
+  virtual void discard_draft_prelaunch() {}
+  // Finish host preparation, then retire writes to scheduler-owned KV blocks
+  // before publishing tokens that may terminate a request.
+  virtual void finish_draft_prelaunch(const ForwardInput& /*input*/) {}
 
   // Block layout hook: false (DFlash) -> query_width N+1, slot 0 is the
   // un-selected anchor; true (DSpark) -> query_width N, every position predicts

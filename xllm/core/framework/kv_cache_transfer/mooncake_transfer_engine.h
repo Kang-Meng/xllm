@@ -69,8 +69,11 @@ class MooncakeTransferEngineCore {
 
   Status set_local_cache_layout(const WorkerCacheLayoutManifest& manifest);
   std::optional<WorkerCacheLayoutManifest> local_cache_layout() const;
+  // Receivers may keep an ACTIVE session without a reverse outgoing plan.
+  // RPC callers retain the default requirement for a non-empty send plan.
   Status set_cache_peer(const WorkerCacheLayoutManifest& peer_manifest,
-                        CachePeerMode mode);
+                        CachePeerMode mode,
+                        bool require_outgoing_plan = true);
   bool has_outgoing_plan(const std::string& remote_addr,
                          CacheNamespace cache_namespace) const;
   bool has_reshard_plan(const std::string& remote_addr) const;
@@ -121,7 +124,8 @@ class MooncakeTransferEngineCore {
     SegmentHandle handle = static_cast<SegmentHandle>(-1);
     int32_t ref_count = 0;
   };
-  // PLAN_ONLY stores identity only; ACTIVE also owns the plan and session.
+  // PLAN_ONLY stores identity only; ACTIVE also owns a plan and session.
+  // The plan may be empty for a receiving peer with no reverse transfer.
   struct CachePeerLink {
     std::string destination_incarnation;
     uint64_t destination_layout_generation = 0;

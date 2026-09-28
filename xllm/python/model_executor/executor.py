@@ -173,6 +173,13 @@ def _create_attention_backend(
             NpuPagedAttentionBackend,
         )
 
+        dflash2_block_size = int(config.get("dflash2_block_size", 0))
+        use_xfia_decode = False
+        if dflash2_block_size > 0:
+            import xllm_runtime
+
+            # Share the C++ prelaunch and scheduler hardware predicate.
+            use_xfia_decode = xllm_runtime.is_ascend_a3()
         return NpuPagedAttentionBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -183,6 +190,8 @@ def _create_attention_backend(
             device=device,
             dtype=dtype,
             num_decoding_tokens=num_decoding_tokens,
+            xfia_query_width=max(dflash2_block_size, 1),
+            use_xfia_decode=use_xfia_decode,
         )
     if current_platform.is_cuda():
         from xllm.python.attention.flashinfer import FlashInferBackend

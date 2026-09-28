@@ -19,6 +19,8 @@ limitations under the License.
 #include <torch_npu/csrc/libs/init_npu.h>
 #include <torch_npu/torch_npu.h>
 
+#include <algorithm>
+#include <cctype>
 #include <nlohmann/json.hpp>
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/framework/OpCommand.h>
@@ -103,6 +105,23 @@ bool is_ascend950() {
   const char* soc_name = aclrtGetSocName();
   return soc_name != nullptr &&
          std::string(soc_name).find("Ascend950") != std::string::npos;
+}
+
+bool is_ascend_a3() {
+  const char* soc_name = aclrtGetSocName();
+  if (soc_name == nullptr) {
+    return false;
+  }
+
+  std::string normalized_soc_name(soc_name);
+  std::transform(normalized_soc_name.begin(),
+                 normalized_soc_name.end(),
+                 normalized_soc_name.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::toupper(character));
+                 });
+  return normalized_soc_name.find("910C") != std::string::npos ||
+         normalized_soc_name.find("910_93") != std::string::npos;
 }
 
 torch::Tensor expand_kv_heads(const torch::Tensor& tensor,

@@ -8,9 +8,11 @@ cc_library(
     speculative_profile_registry.h
     adaptive_pruning_helpers.h
     spec_input_builder.h
+    speculative_cache_utils.h
     mtp_async_input_builder.h
     mtp_async_replay_builder.h
     mtp_async_state.h
+    dflash_async_input_builder.h
     mtp_execution_policy.h
     mtp_json_object_state.h
     embedding_cache.h
@@ -20,9 +22,11 @@ cc_library(
     speculative_profile_registry.cpp
     adaptive_pruning_helpers.cpp
     spec_input_builder.cpp
+    speculative_cache_utils.cpp
     mtp_async_input_builder.cpp
     mtp_async_replay_builder.cpp
     mtp_async_state.cpp
+    dflash_async_input_builder.cpp
     mtp_execution_policy.cpp
     embedding_cache.cpp
     spec_verify.cpp

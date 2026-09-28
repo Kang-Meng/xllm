@@ -61,6 +61,7 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "runtime/llm_worker_impl.h"
+#include "runtime/speculative_worker_utils.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
 #include "util/timer.h"
@@ -70,6 +71,12 @@ namespace xllm {
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
+
+using speculative_worker::broadcast_tokens_in_group;
+using speculative_worker::clear_all_output_embeddings;
+using speculative_worker::clear_selected_embeddings;
+using speculative_worker::record_metadata_ready_event;
+using speculative_worker::wait_metadata_ready_event;
 
 void clear_draft_state(ModelInputParams& params) {
   params.clear_linear_attention_state();
@@ -95,17 +102,6 @@ void append_failed_request_ids(ForwardOutput& destination,
                                         source.failed_request_ids.end());
 }
 
-void broadcast_tokens_in_group(torch::Tensor& tokens,
-                               ProcessGroup* process_group,
-                               int32_t root_rank = 0) {
-  if (process_group == nullptr || process_group->world_size() <= 1 ||
-      !tokens.defined()) {
-    return;
-  }
-  tokens = tokens.contiguous();
-  process_group->broadcast(tokens, root_rank);
-}
-
 bool should_broadcast_spec_tokens(const ParallelArgs& parallel_args,
                                   bool enable_spec_token_broadcast,
                                   bool all_greedy_sample) {
@@ -128,9 +124,8 @@ void broadcast_spec_tokens(torch::Tensor& tokens,
                            const ParallelArgs& parallel_args) {
   // DeepSeek-V4 TORCH publishes orthogonal TP and CP groups. Other backends
   // retain their existing single-group speculative broadcast behavior.
-  ProcessGroup* tp_group = parallel_args.tp_group_ != nullptr
-                               ? parallel_args.tp_group_
-                               : parallel_args.process_group_;
+  ProcessGroup* tp_group =
+      speculative_worker::sampling_process_group(parallel_args);
   const bool use_orthogonal_cp_consensus =
       parallel_args.cp_size() > 1 && parallel_args.tp_group_ != nullptr &&
       parallel_args.cp_group_ != nullptr &&
@@ -146,23 +141,9 @@ void broadcast_spec_tokens(torch::Tensor& tokens,
   }
 }
 
-void record_metadata_ready_event(Stream& stream, ForwardInput& input) {
-  input.metadata_ready_event = stream.record_event_or_sync();
-}
-
-void finish_metadata_prepare(Stream& stream, ForwardInput& input) {
-  record_metadata_ready_event(stream, input);
-}
-
 void record_current_metadata_ready_event(ForwardInput& input, Stream& stream) {
-  CHECK(stream.wait_event(input.metadata_ready_event))
-      << "failed to wait speculative metadata ready event";
+  wait_metadata_ready_event(input, stream);
   record_metadata_ready_event(stream, input);
-}
-
-void wait_metadata_ready_event(const ForwardInput& input, Stream& stream) {
-  CHECK(stream.wait_event(input.metadata_ready_event))
-      << "failed to wait speculative metadata ready event";
 }
 
 void record_output_ready_event(ForwardOutput& output, Stream& stream) {
@@ -232,24 +213,7 @@ void bind_expanded_spec_verify_graph_input(ModelInputParams& input_params,
   if (!input_params.graph.use_expanded_decode_for_spec_verify_attention) {
     return;
   }
-  CHECK(input_params.attention.device.block_tables.defined())
-      << "spec verify block tables must be rebuilt before graph input";
   const auto& q_seq_lens = input_params.attention.host.q_seq_lens;
-  CHECK_GE(input_params.attention.device.block_tables.size(0),
-           static_cast<int64_t>(q_seq_lens.size()))
-      << "spec verify block table rows are fewer than sequences";
-  std::vector<torch::Tensor> expanded_block_rows;
-  for (int64_t seq_idx = 0; seq_idx < static_cast<int64_t>(q_seq_lens.size());
-       ++seq_idx) {
-    for (int32_t token_idx = 0;
-         token_idx < q_seq_lens[static_cast<size_t>(seq_idx)];
-         ++token_idx) {
-      expanded_block_rows.emplace_back(
-          input_params.attention.device.block_tables.select(/*dim=*/0,
-                                                            seq_idx));
-    }
-  }
-
   if (!kv_lens_already_bound) {
     torch::Tensor expanded_kv_seq_lens_host =
         torch::tensor(input_params.graph.expanded_kv_seq_lens_vec,
@@ -261,9 +225,9 @@ void bind_expanded_spec_verify_graph_input(ModelInputParams& input_params,
         expanded_kv_seq_lens_host.to(device, /*non_blocking=*/true);
   }
 
-  // ATB consumes this tensor as dense row-major storage. Keep the generic
-  // fallback contiguous; a zero-stride expand view is rejected at runtime.
-  torch::Tensor expanded_block_tables = torch::stack(expanded_block_rows, 0);
+  torch::Tensor expanded_block_tables =
+      layer::ExpandedDecodeMetadataBuilder::build_tokenwise_block_tables(
+          input_params.attention.device.block_tables, q_seq_lens);
   layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
       input_params,
       input_params.graph.expanded_kv_seq_lens,
@@ -281,19 +245,6 @@ void build_expanded_spec_verify_graph_input(ModelInputParams& input_params,
 }
 #endif
 
-void clear_sample_embeddings(ForwardOutput& output) {
-  output.sample_output.embeddings = torch::Tensor();
-}
-
-void clear_selected_embeddings(ForwardOutput& output) {
-  output.sample_output.selected_embeddings = torch::Tensor();
-}
-
-void clear_all_output_embeddings(ForwardOutput& output) {
-  clear_sample_embeddings(output);
-  clear_selected_embeddings(output);
-}
-
 void clear_ready_events(ForwardInput& input) {
   input.metadata_ready_event.reset();
 }
@@ -310,17 +261,15 @@ std::optional<ForwardOutput> run_worker_no_sync_impl(
     Stream& prepare_stream,
     Stream& compute_stream,
     ForwardInput& processed_input) {
-  worker.prepare_work_before_execute_on_stream(
-      input,
-      processed_input,
-      prepare_stream,
-      /*record_ready_event=*/&prepare_stream != &compute_stream);
-  if (auto* llm_worker = dynamic_cast<LLMWorkerImpl*>(&worker);
-      llm_worker != nullptr) {
-    return llm_worker->execute_no_sync_on_stream(
-        processed_input, compute_stream, /*record_ready_event=*/false);
-  }
-  return worker.execute_no_sync_on_stream(processed_input, compute_stream);
+  speculative_worker::WorkerStreamOptions stream_options;
+  stream_options.record_input_ready_event = &prepare_stream != &compute_stream;
+  stream_options.record_output_ready_event = false;
+  return speculative_worker::run_worker_no_sync(worker,
+                                                input,
+                                                prepare_stream,
+                                                compute_stream,
+                                                &processed_input,
+                                                stream_options);
 }
 
 torch::Tensor clone_host_tensor(const torch::Tensor& tensor) {
@@ -1565,7 +1514,7 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
                                     prefill_input.positions.options(),
                                     /*non_blocking=*/true);
   prefill_input.device_tensors_ready = true;
-  finish_metadata_prepare(*prepare_stream_, prefill_input);
+  record_metadata_ready_event(*prepare_stream_, prefill_input);
 }
 
 void MTPWorkerImpl::prepare_draft_sampling(
@@ -1906,7 +1855,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
             options_.block_size());
         validate_input.retained_device_tensors = {
             accepted_tokens, target_base_positions, target_base_kv_seq_lens};
-        finish_metadata_prepare(*prepare_stream_, validate_input);
+        record_metadata_ready_event(*prepare_stream_, validate_input);
       }
 
       // Host cache materialization is still required before staging the next
@@ -3589,7 +3538,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
       use_explicit_spec_verify_replay_update && static_graph_tasks_prepared;
 #endif
   if (record_ready_event) {
-    finish_metadata_prepare(*prepare_stream_, validate_input);
+    record_metadata_ready_event(*prepare_stream_, validate_input);
   }
 }
 
@@ -3826,7 +3775,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
   }
 #endif
   validate_input.device_tensors_ready = true;
-  finish_metadata_prepare(*prepare_stream_, validate_input);
+  record_metadata_ready_event(*prepare_stream_, validate_input);
 }
 
 void MTPWorkerImpl::prepare_draft_replay_inputs(
@@ -3927,7 +3876,7 @@ void MTPWorkerImpl::prepare_draft_replay_inputs(
   extend_input.device_tensors_ready = true;
   check_draft_input_embedding(
       extend_input.input_params.embedding.input_embedding, "target replay");
-  finish_metadata_prepare(*prepare_stream_, extend_input);
+  record_metadata_ready_event(*prepare_stream_, extend_input);
 }
 
 void MTPWorkerImpl::prepare_draft_extend_inputs(
@@ -4208,7 +4157,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
         /*start=*/0, /*end=*/num_sequences, idx_options);
   }
   extend_input.device_tensors_ready = true;
-  finish_metadata_prepare(*prepare_stream_, extend_input);
+  record_metadata_ready_event(*prepare_stream_, extend_input);
 }
 
 bool MTPWorkerImpl::should_use_uniform_two_draft_rows(
@@ -4314,7 +4263,7 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
 
   // Positions/KV metadata do not depend on the in-flight draft result. Prepare
   // them concurrently; token ids and embeddings are filled on compute_stream.
-  finish_metadata_prepare(*prepare_stream_, draft_input);
+  record_metadata_ready_event(*prepare_stream_, draft_input);
 }
 
 SampleOutput MTPWorkerImpl::validate(

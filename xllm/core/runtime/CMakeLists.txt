@@ -40,6 +40,7 @@ cc_library(
     xservice_client.h
     draft_model_spec_worker_impl.h
     speculative_worker_impl.h
+    speculative_worker_utils.h
     mtp_worker_impl.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
@@ -80,6 +81,7 @@ cc_library(
     params_utils.cpp
     draft_model_spec_worker_impl.cpp
     speculative_worker_impl.cpp
+    speculative_worker_utils.cpp
     mtp_worker_impl.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp

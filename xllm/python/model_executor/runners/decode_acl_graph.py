@@ -368,10 +368,10 @@ class DecodeAclGraphRunner(BaseRunner):
             dtype=torch.int32,
         ).contiguous()
         is_mla = getattr(self.attention_backend, "is_mla", False)
-        requires_host_kv_lengths = not is_mla or getattr(
+        requires_host_kv_lengths = getattr(
             self.attention_backend,
             "requires_host_kv_lengths",
-            False,
+            not is_mla,
         )
         if not requires_host_kv_lengths:
             # The C++ engine sizes kv_seq_lens_host_values by the global DP
@@ -682,13 +682,13 @@ class DecodeAclGraphRunner(BaseRunner):
             if expanded is not None
             else getattr(metadata, "kv_seq_lens_host_values", None)
         )
-        # Host KV lengths are required for non-sparse-MLA backends; a missing
+        # Backends with host length inputs require a valid list; a missing
         # or mis-sized host list is an expected "not compatible" (→ eager).
         is_mla = getattr(self.attention_backend, "is_mla", False)
-        requires_host = not is_mla or getattr(
+        requires_host = getattr(
             self.attention_backend,
             "requires_host_kv_lengths",
-            False,
+            not is_mla,
         )
         if requires_host:
             if host_values is None or len(host_values) != sequence_count:
@@ -1224,9 +1224,8 @@ class DecodeAclGraphRunner(BaseRunner):
                     if getattr(
                         self.attention_backend,
                         "requires_host_kv_lengths",
-                        False,
+                        not getattr(self.attention_backend, "is_mla", False),
                     )
-                    or not getattr(self.attention_backend, "is_mla", False)
                     else None
                 ),
             )
@@ -1574,10 +1573,10 @@ class DecodeAclGraphRunner(BaseRunner):
         kv_seq_lens: list[int] | None,
         batch_size: int,
     ) -> None:
-        if getattr(self.attention_backend, "is_mla", False) and not getattr(
+        if not getattr(
             self.attention_backend,
             "requires_host_kv_lengths",
-            False,
+            not getattr(self.attention_backend, "is_mla", False),
         ):
             return
         if kv_seq_lens is None:

@@ -952,3 +952,21 @@ def test_dp_acl_graph_requires_group_wide_token_counts() -> None:
         pytest.raises(RuntimeError, match="valid dp_execution_token_counts"),
     ):
         runner.can_execute(torch.zeros(3, dtype=torch.int32), metadata)
+
+
+def test_xfia_graph_accepts_device_only_lengths() -> None:
+    runner = _runner()
+    runner.attention_backend.requires_host_kv_lengths = False
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.kv_seq_lens_host_values = None
+    assert runner._has_compatible_decode_metadata(torch.arange(4), metadata)
+    table, lengths, host_lengths, *_ = runner._decode_metadata(metadata)
+    assert table is metadata.block_table
+    assert lengths is metadata.kv_seq_lens
+    assert host_lengths is None
+    entry = SimpleNamespace(
+        batch_size=4,
+        static_metadata=SimpleNamespace(kv_seq_lens_host_values=[1] * 4),
+    )
+    runner._fill_host_metadata(entry, None, batch_size=4)
+    assert entry.static_metadata.kv_seq_lens_host_values == [1] * 4

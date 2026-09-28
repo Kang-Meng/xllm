@@ -100,6 +100,11 @@ class Batch {
                                      ThreadPool* thread_pool,
                                      int32_t cp_size = 1);
 
+  // Pin KV pages and per-request state slots until this batch is retired.
+  // With schedule overlap, an earlier batch can finish a request while this
+  // batch still reads/writes its KV, LINEAR or EMBEDDING cache.
+  void retain_cache_blocks();
+
   // process output
   //
   // replace_fake_token:
@@ -174,6 +179,7 @@ class Batch {
   std::vector<Sequence*> sequences_;
   std::vector<SequencesGroup*> sequence_groups_;
   std::vector<BlockTransferInfo> swap_block_transfer_infos_;
+  std::vector<Block> retained_cache_blocks_;
 
   // max number of tokens to process for each sequence
   // default to max value

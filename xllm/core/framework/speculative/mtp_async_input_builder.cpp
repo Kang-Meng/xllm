@@ -22,6 +22,7 @@ limitations under the License.
 #endif
 
 #include "core/framework/speculative/mtp_async_state.h"
+#include "core/framework/speculative/speculative_cache_utils.h"
 #include "core/runtime/forward_params.h"
 #include "layers/common/expanded_decode_metadata_builder.h"
 
@@ -36,7 +37,7 @@ torch::Tensor build_device_cache_slots(const ForwardInput& input,
     return torch::zeros_like(positions, positions.options().dtype(torch::kInt))
         .flatten();
   }
-  return map_positions_to_cache_slots(
+  return speculative::map_positions_to_cache_slots(
       input.input_params.attention.device.block_tables, positions, block_size);
 }
 
@@ -256,7 +257,7 @@ void prepare_target_verify_from_accepted_state(
             .view({batch_size, validate_width, expanded_block_tables.size(1)})
             .select(/*dim=*/1, /*index=*/0);
     validate_input.input_params.attention.device.new_cache_slots =
-        map_positions_to_cache_slots(
+        speculative::map_positions_to_cache_slots(
             sequence_block_tables, position_rows, block_size);
   } else {
     validate_input.input_params.attention.device.new_cache_slots =

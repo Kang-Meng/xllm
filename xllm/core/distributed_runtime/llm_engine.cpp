@@ -1174,6 +1174,17 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
       << "Split DP batch failed with dp_size as " << dp_size_
       << " and actual batch size as " << batch.size() << ".";
 
+  // The scheduler can collect EOS from the previous batch after dispatching
+  // this one. Keep its pages allocated until this batch's real output is
+  // collected; DFlash2 fences its prelaunch KV writes before that output is
+  // published. Together these protect the extra in-flight overlap step.
+  if (options_.enable_schedule_overlap() &&
+      SpeculativeConfig::is_dflash2_algorithm(
+          options_.speculative_algorithm())) {
+    for (auto& dp_batch : batch) {
+      dp_batch.retain_cache_blocks();
+    }
+  }
   auto forward_inputs = prepare_inputs(batch);
   const bool is_graph_warmup = contains_graph_warmup(forward_inputs);
   int64_t dispatched_activation_token = -1;

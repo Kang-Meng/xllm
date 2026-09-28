@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/speculative/mtp_execution_policy.h"
+#include "core/framework/speculative/speculative_cache_utils.h"
 
 namespace xllm::mtp_async {
 namespace {
@@ -330,9 +331,9 @@ TEST(MtpAsyncStateTest, MapsPositionsAcrossCacheBlockBoundaries) {
       torch::tensor({{10, 11, 12}, {20, 21, 22}}, torch::kInt);
   const torch::Tensor positions = torch::tensor({{3, 4}, {7, 8}}, torch::kLong);
 
-  EXPECT_TRUE(torch::equal(
-      map_positions_to_cache_slots(block_tables, positions, /*block_size=*/4),
-      torch::tensor({43, 44, 87, 88}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(speculative::map_positions_to_cache_slots(
+                               block_tables, positions, /*block_size=*/4),
+                           torch::tensor({43, 44, 87, 88}, torch::kInt)));
 }
 
 TEST(MtpAsyncStateTest, BuildsLaterDraftMetadataFromAcceptedDeviceBase) {
@@ -348,9 +349,9 @@ TEST(MtpAsyncStateTest, BuildsLaterDraftMetadataFromAcceptedDeviceBase) {
   EXPECT_TRUE(torch::equal(
       make_kv_seq_lens(state, offsets, /*use_chunked_prefill=*/false),
       torch::tensor({6, 10}, torch::kLong)));
-  EXPECT_TRUE(torch::equal(
-      map_positions_to_cache_slots(block_tables, positions, /*block_size=*/4),
-      torch::tensor({45, 89}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(speculative::map_positions_to_cache_slots(
+                               block_tables, positions, /*block_size=*/4),
+                           torch::tensor({45, 89}, torch::kInt)));
 }
 
 TEST(MtpAsyncStateTest, KeepsReplaySemanticsTogether) {

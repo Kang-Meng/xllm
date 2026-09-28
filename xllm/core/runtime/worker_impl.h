@@ -122,7 +122,8 @@ class WorkerImpl {
   void prepare_work_before_execute_on_stream(const ForwardInput& input,
                                              ForwardInput& processed_input,
                                              Stream& prepare_stream,
-                                             bool record_ready_event = true);
+                                             bool record_ready_event = true,
+                                             bool wait_for_compute = true);
 #if defined(USE_NPU)
   // Per-worker-static configuration handed to NpuCpPlan::prepare(); built once
   // and cached.
@@ -338,8 +339,10 @@ class WorkerImpl {
 
   bool can_prepare_npu_graph_decode_input(
       const ModelInputParams& input_params) const;
-  bool can_prepare_without_compute_stream_wait(
-      const ModelInputParams& input_params) const;
+  // Speculative workers may opt in only when their own prelaunch path owns
+  // independent input buffers. Leaf workers keep the default ordering.
+  virtual bool can_prepare_without_compute_stream_wait(
+      const ForwardInput& input) const;
   bool can_skip_npu_graph_decode_sync(
       const ModelInputParams& input_params) const;
 

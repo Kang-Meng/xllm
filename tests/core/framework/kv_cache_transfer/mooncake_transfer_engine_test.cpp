@@ -874,6 +874,54 @@ TEST(MooncakeTransferEngineServiceTest,
   EXPECT_TRUE(core.set_local_cache_layout(updated_local).ok());
 }
 
+TEST(MooncakeTransferEngineServiceTest,
+     ReplicatedReceiverAllowsEmptyReversePlanButRequiresSession) {
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  const WorkerCacheLayoutManifest receiver = make_pcp_manifest(
+      /*tp_rank=*/1,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/1,
+      "replicated-receiver",
+      /*cluster_id=*/1);
+  const WorkerCacheLayoutManifest sender = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/1,
+      "replicated-sender",
+      /*cluster_id=*/2);
+  ASSERT_TRUE(core.set_local_cache_layout(receiver).ok());
+
+  ReshardPlanTemplate incoming_plan;
+  ASSERT_TRUE(ReshardPlanner()
+                  .build_outgoing_plan(sender, receiver, &incoming_plan)
+                  .ok());
+  ASSERT_FALSE(incoming_plan.regions.empty());
+
+  // The remote sending RPC must still reject an empty outgoing plan.
+  const Status sending_status =
+      core.set_cache_peer(sender, CachePeerMode::ACTIVE);
+  EXPECT_EQ(sending_status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(sending_status.message(),
+            "active cache peer requires a non-empty plan");
+
+  // A receiver passes plan validation and must open a real data session.
+  // This CPU fixture has no initialized transport, so session setup fails
+  // without publishing a peer. The empty reverse plan must not reject it.
+  const Status receiving_status = core.set_cache_peer(
+      sender, CachePeerMode::ACTIVE, /*require_outgoing_plan=*/false);
+  EXPECT_EQ(receiving_status.code(), StatusCode::UNAVAILABLE);
+  EXPECT_EQ(receiving_status.message(),
+            "failed to open cache peer data session");
+  EXPECT_FALSE(core.has_reshard_plan(sender.addr));
+  EXPECT_FALSE(core.has_outgoing_plan(sender.addr, CacheNamespace::MAIN));
+
+  WorkerCacheLayoutManifest updated_receiver = receiver;
+  ++updated_receiver.layout_generation;
+  EXPECT_TRUE(core.set_local_cache_layout(updated_receiver).ok());
+}
+
 TEST(MooncakeTransferEngineServiceTest, CloseSessionRejectsMissingAddr) {
   MooncakeTransferEngineService service;
   proto::SessionInfo request;

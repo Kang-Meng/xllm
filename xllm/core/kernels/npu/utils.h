@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "acl/acl.h"
+#include "aclnn/acl_meta.h"
 #include "util/tensor_helper.h"
 
 namespace xllm::kernel::npu {
@@ -38,6 +39,7 @@ void check_tensor_shapes_equal(const torch::Tensor& a,
                                const torch::Tensor& b,
                                const std::string& func_name = "");
 bool is_ascend950();
+bool is_ascend_a3();
 torch::Tensor expand_kv_heads(const torch::Tensor& tensor,
                               int64_t num_heads,
                               int64_t num_kv_heads);

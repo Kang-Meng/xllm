@@ -801,15 +801,13 @@ bool WorkerImpl::can_prepare_npu_graph_decode_input(
 }
 
 bool WorkerImpl::can_prepare_without_compute_stream_wait(
-    const ModelInputParams& input_params) const {
+    const ForwardInput& /*input*/) const {
 #if defined(USE_NPU)
-  (void)input_params;
   return !options_.enable_speculative_decode() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph_double_buffer() &&
          (options_.backend() == "llm" || options_.backend() == "vlm");
 #else
-  (void)input_params;
   return false;
 #endif
 }
@@ -1308,12 +1306,16 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     const ForwardInput& input,
     ForwardInput& processed_input,
     Stream& prepare_stream,
-    bool record_ready_event) {
+    bool record_ready_event,
+    bool wait_for_compute) {
   if (!input.json_object_state_snapshots.empty()) {
     ForwardInput restored_input = input;
     restore_json_object_states(restored_input);
-    prepare_work_before_execute_on_stream(
-        restored_input, processed_input, prepare_stream, record_ready_event);
+    prepare_work_before_execute_on_stream(restored_input,
+                                          processed_input,
+                                          prepare_stream,
+                                          record_ready_event,
+                                          wait_for_compute);
     return;
   }
 #if defined(USE_NPU)
@@ -1335,11 +1337,11 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
   }
 #endif
   c10::StreamGuard stream_guard = prepare_stream.set_stream_guard();
-  if (enable_schedule_overlap() &&
-      !can_prepare_without_compute_stream_wait(input.input_params) &&
-      compute_stream_) {
+  if (wait_for_compute && enable_schedule_overlap() &&
+      !can_prepare_without_compute_stream_wait(input) && compute_stream_) {
     // MTP updates reuse shared prepare/compute streams and need this ordering;
-    // only graph double-buffer decode can prepare the next slot independently.
+    // graph double buffering or an explicitly enabled speculative prelaunch
+    // path must provide independent input buffers before skipping this wait.
     prepare_stream.wait_stream(*compute_stream_);
   }
   CHECK(prepare_stream.wait_event(input.metadata_ready_event))
@@ -1401,8 +1403,17 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     apply_kv_block_swaps(input_params);
 
 #if defined(USE_NPU)
+    // Python spec-verify uses paged MLA directly. The ATB prefix-cache
+    // history/ring scratch is neither exported to Python nor read by its
+    // attention backend. Building it forces scalar/length D2H reads and
+    // prevents metadata preparation from overlapping the pending draft.
+    const bool python_spec_verify =
+        input_params.is_spec_verify &&
+        ModelConfig::is_python_model_impl(
+            ModelConfig::get_instance().model_impl());
     if (context_.get_model_args().enable_mla() &&
-        input_params.meta.batch_forward_type.is_chunked_prefill()) {
+        input_params.meta.batch_forward_type.is_chunked_prefill() &&
+        !python_spec_verify) {
       prepare_mla_prefixcache_inputs(input_params);
     }
 

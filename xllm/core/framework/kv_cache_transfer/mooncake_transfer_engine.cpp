@@ -30,6 +30,18 @@ namespace xllm {
 
 namespace {
 
+Status check_active_plan_requirement(
+    const std::optional<ReshardPlanTemplate>& plan,
+    CachePeerMode mode,
+    bool require_outgoing_plan) {
+  if (mode == CachePeerMode::ACTIVE && require_outgoing_plan &&
+      (!plan.has_value() || plan->regions.empty())) {
+    return Status(StatusCode::INVALID_ARGUMENT,
+                  "active cache peer requires a non-empty plan");
+  }
+  return Status();
+}
+
 bool close_remote_session(MooncakeTransferEngineCore* core,
                           uint64_t cluster_id) {
   proto::MooncakeTransferEngineService_Stub* stub =
@@ -357,7 +369,8 @@ MooncakeTransferEngineCore::local_cache_layout() const {
 
 Status MooncakeTransferEngineCore::set_cache_peer(
     const WorkerCacheLayoutManifest& peer_manifest,
-    CachePeerMode mode) {
+    CachePeerMode mode,
+    bool require_outgoing_plan) {
   const Status manifest_status = validate_worker_cache_layout(peer_manifest);
   if (!manifest_status.ok()) {
     return manifest_status;
@@ -385,7 +398,8 @@ Status MooncakeTransferEngineCore::set_cache_peer(
     }
     if (identity_matches) {
       if (existing->second.mode == mode) {
-        return Status();
+        return check_active_plan_requirement(
+            existing->second.plan, mode, require_outgoing_plan);
       }
       return Status(StatusCode::INVALID_ARGUMENT,
                     "cache peer mode change requires unlink");
@@ -413,11 +427,12 @@ Status MooncakeTransferEngineCore::set_cache_peer(
     if (!plan_status.ok()) {
       return plan_status;
     }
-    if (active_plan.regions.empty()) {
-      return Status(StatusCode::INVALID_ARGUMENT,
-                    "active cache peer requires a non-empty plan");
-    }
     plan = std::move(active_plan);
+  }
+  const Status requirement_status =
+      check_active_plan_requirement(plan, mode, require_outgoing_plan);
+  if (!requirement_status.ok()) {
+    return requirement_status;
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -436,7 +451,8 @@ Status MooncakeTransferEngineCore::set_cache_peer(
       existing->second.destination_layout_generation ==
           peer_manifest.layout_generation) {
     if (existing->second.mode == mode) {
-      return Status();
+      return check_active_plan_requirement(
+          existing->second.plan, mode, require_outgoing_plan);
     }
     return Status(StatusCode::INVALID_ARGUMENT,
                   "cache peer mode change requires unlink");
@@ -684,7 +700,10 @@ bool MooncakeTransferEngine::set_remote_peer(
 bool MooncakeTransferEngine::set_local_peer(
     const WorkerCacheLayoutManifest& manifest,
     CachePeerMode mode) {
-  return core_.set_cache_peer(manifest, mode).ok();
+  // ACTIVE is selected by the incoming plan. A replicated KV receiver may
+  // have no outgoing regions, but still needs a data session for reads.
+  return core_.set_cache_peer(manifest, mode, /*require_outgoing_plan=*/false)
+      .ok();
 }
 
 bool MooncakeTransferEngine::open_session(const uint64_t cluster_id,

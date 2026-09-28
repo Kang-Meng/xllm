@@ -241,6 +241,35 @@ class TestNpuGraphBackendResolution:
 
 
 class TestCreateAttentionBackend:
+    @pytest.mark.parametrize("is_ascend_a3", [False, True])
+    @pytest.mark.parametrize("proposal_width", [0, 8])
+    def test_dflash2_xfia_requires_a3(self, is_ascend_a3: bool, proposal_width: int) -> None:
+        native_query = MagicMock(return_value=is_ascend_a3)
+        runtime = types.ModuleType("xllm_runtime")
+        runtime.is_ascend_a3 = native_query
+        with (
+            patch.dict(sys.modules, {"xllm_runtime": runtime}),
+            patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
+            patch(
+                "xllm.python.model_executor.executor.current_platform.get_ascend_soc_generation",
+                return_value="a2" if is_ascend_a3 else "a3",
+            ) as python_soc_query,
+            patch("xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend", StubAttentionBackend),
+        ):
+            backend = _create_attention_backend(
+                _make_attention_layer(num_kv_heads=1, head_dim=128),
+                torch.device("npu"),
+                torch.bfloat16,
+                {"dflash2_block_size": proposal_width},
+            )
+        assert backend.init_kwargs["use_xfia_decode"] == (is_ascend_a3 and proposal_width > 0)
+        assert backend.init_kwargs["xfia_query_width"] == max(proposal_width, 1)
+        python_soc_query.assert_not_called()
+        if proposal_width > 0:
+            native_query.assert_called_once_with()
+        else:
+            native_query.assert_not_called()
+
     @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,

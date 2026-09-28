@@ -33,9 +33,14 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
+#if defined(USE_NPU)
+#include "core/kernels/npu/utils.h"
+#endif
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
 #include "framework/model/model_args.h"
@@ -187,6 +192,28 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
 
   if (options_.enable_schedule_overlap()) {
     min_speculative_tokens_required_ = options_.num_speculative_tokens() * 2;
+    // In overlap mode the worker may first correct the scheduler's fake
+    // position by N tokens. DFlash2 prelaunch can then accept N+1 and issue
+    // another N+1-row proposal, requiring 3*N+1 extra slots beyond the host
+    // anchor.
+#if defined(USE_NPU)
+    const bool is_ascend_a3 = kernel::npu::is_ascend_a3();
+#else
+    const bool is_ascend_a3 = false;
+#endif
+    // Match DFlash2WorkerImpl::prelaunch_enabled_ for the conditions visible
+    // to the scheduler. The worker additionally checks its local NPU device.
+    if (::xllm::SpeculativeConfig::is_dflash2_algorithm(
+            ::xllm::SpeculativeConfig::get_instance()
+                .speculative_algorithm()) &&
+        is_ascend_a3 && ModelConfig::get_instance().model_impl() == "python" &&
+        options_.dp_size() == 1 && options_.cp_size() == 1 &&
+        (!options_.enable_disagg_pd() ||
+         options_.instance_role() == InstanceRole::DECODE) &&
+        !SpeculativeConfig::get_instance()
+             .enable_adaptive_speculative_decode()) {
+      min_speculative_tokens_required_ += options_.num_speculative_tokens() + 1;
+    }
   } else {
     min_speculative_tokens_required_ = options_.num_speculative_tokens();
   }

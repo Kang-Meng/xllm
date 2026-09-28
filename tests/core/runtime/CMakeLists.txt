@@ -24,6 +24,18 @@ cc_test(
 
 if(USE_NPU)
   cc_test(
+    NAME dflash2_prelaunch_lifecycle_test
+    SRCS dflash2_prelaunch_lifecycle_test.cpp
+    DEPS :runtime :models :batch :block :platform GTest::gtest_main
+  )
+  target_link_libraries(dflash2_prelaunch_lifecycle_test PRIVATE
+    torch_npu torch_python Python::Python ascendcl hccl c_sec nnopbase)
+  target_link_options(dflash2_prelaunch_lifecycle_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
+  cc_test(
     NAME
       npu_linear_state_lifecycle_test
     SRCS

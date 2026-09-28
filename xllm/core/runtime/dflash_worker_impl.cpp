@@ -35,7 +35,6 @@ limitations under the License.
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/model/model_args.h"
-#include "framework/parallel_state/process_group.h"
 #include "framework/sampling/sampling_params.h"
 #if defined(USE_NPU) || defined(USE_MLU)
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
@@ -49,6 +48,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_verify.h"
 #include "core/platform/platform.h"
 #include "runtime/llm_worker_impl.h"
+#include "runtime/speculative_worker_utils.h"
 #include "util/json_reader.h"
 #include "util/model_config_utils.h"
 #include "util/timer.h"
@@ -57,24 +57,10 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-// Per-rank sampling RNG can diverge across the tensor-parallel group.
-// Broadcasting the sampled draft/accepted tokens to the group's rank 0 keeps
-// every rank's cached draft probs and accepted prefixes identical. No-op for a
-// single rank (world_size <= 1).
-ProcessGroup* spec_broadcast_group(const ParallelArgs& parallel_args) {
-  return parallel_args.tp_group_ != nullptr ? parallel_args.tp_group_
-                                            : parallel_args.process_group_;
-}
-
-void broadcast_spec_tokens(torch::Tensor& tokens,
-                           ProcessGroup* pg,
-                           int32_t root_rank = 0) {
-  if (pg == nullptr || pg->world_size() <= 1 || !tokens.defined()) {
-    return;
-  }
-  tokens = tokens.contiguous();
-  pg->broadcast(tokens, root_rank);
-}
+using speculative_worker::clear_all_output_embeddings;
+using speculative_worker::clear_selected_embeddings;
+using speculative_worker::record_metadata_ready_event;
+using speculative_worker::wait_metadata_ready_event;
 
 runtime::Options target_options(const runtime::Options& options) {
   runtime::Options opts = options;
@@ -137,24 +123,6 @@ void repeat_sampling_params(SamplingParameters& sampling_params,
   repeat_sampling_tensor(sampling_params.do_sample, repeats);
 }
 
-void clear_selected_embeddings(ForwardOutput& output) {
-  output.sample_output.selected_embeddings = torch::Tensor();
-}
-
-void clear_all_output_embeddings(ForwardOutput& output) {
-  output.sample_output.embeddings = torch::Tensor();
-  clear_selected_embeddings(output);
-}
-
-void record_metadata_ready_event(Stream& stream, ForwardInput& input) {
-  input.metadata_ready_event = stream.record_event_or_sync();
-}
-
-void wait_metadata_ready_event(const ForwardInput& input, Stream& stream) {
-  CHECK(stream.wait_event(input.metadata_ready_event))
-      << "failed to wait DFlash metadata ready event";
-}
-
 #if defined(USE_NPU)
 void build_dflash_expanded_spec_verify_graph_input(
     ModelInputParams& input_params,
@@ -169,10 +137,6 @@ void build_dflash_expanded_spec_verify_graph_input(
   const auto& kv_seq_lens = input_params.attention.host.kv_seq_lens;
   CHECK(!q_seq_lens.empty());
   CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size());
-  CHECK(input_params.attention.device.block_tables.defined());
-  CHECK_GE(input_params.attention.device.block_tables.size(0),
-           static_cast<int64_t>(q_seq_lens.size()));
-
   std::vector<int32_t> expanded_kv_seq_lens =
       layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
           q_seq_lens, kv_seq_lens);
@@ -184,21 +148,9 @@ void build_dflash_expanded_spec_verify_graph_input(
                         .pinned_memory(true))
           .to(device, /*non_blocking=*/true);
 
-  std::vector<torch::Tensor> expanded_block_rows;
-  expanded_block_rows.reserve(expanded_kv_seq_lens.size());
-  for (int64_t seq_idx = 0; seq_idx < static_cast<int64_t>(q_seq_lens.size());
-       ++seq_idx) {
-    for (int32_t token_idx = 0;
-         token_idx < q_seq_lens[static_cast<size_t>(seq_idx)];
-         ++token_idx) {
-      expanded_block_rows.emplace_back(
-          input_params.attention.device.block_tables.select(/*dim=*/0,
-                                                            seq_idx));
-    }
-  }
-  CHECK(!expanded_block_rows.empty());
   torch::Tensor expanded_block_tables =
-      torch::stack(expanded_block_rows, /*dim=*/0).contiguous();
+      layer::ExpandedDecodeMetadataBuilder::build_tokenwise_block_tables(
+          input_params.attention.device.block_tables, q_seq_lens);
   layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
       input_params,
       expanded_kv_seq_lens_device,
@@ -207,23 +159,6 @@ void build_dflash_expanded_spec_verify_graph_input(
       block_size);
 }
 #endif
-
-std::optional<ForwardOutput> run_worker_no_sync_impl(
-    WorkerImpl& worker,
-    const ForwardInput& input,
-    Stream& prepare_stream,
-    Stream& compute_stream,
-    ForwardInput* processed_output = nullptr) {
-  ForwardInput processed_input;
-  worker.prepare_work_before_execute_on_stream(
-      input, processed_input, prepare_stream);
-  std::optional<ForwardOutput> output =
-      worker.execute_no_sync_on_stream(processed_input, compute_stream);
-  if (processed_output != nullptr) {
-    *processed_output = std::move(processed_input);
-  }
-  return output;
-}
 
 void build_query_rows(const ForwardInput& input,
                       int32_t mask_token_id,
@@ -556,9 +491,11 @@ std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
     const ForwardInput& input) {
+  discard_draft_prelaunch();
   if (!input.input_params.meta.batch_forward_type.is_decode()) {
-    std::optional<ForwardOutput> output = run_worker_no_sync_impl(
-        *impl_, input, *prepare_stream_, *compute_stream_);
+    std::optional<ForwardOutput> output =
+        speculative_worker::run_worker_no_sync(
+            *impl_, input, *prepare_stream_, *compute_stream_);
     // Active prefill ranks write the draft context KV without a draft forward.
     // Keep idle ranks symmetric: a draft MoE forward here would enter EP
     // collectives that active ranks never join and deadlock the whole group.
@@ -590,8 +527,9 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   // Warmup only: prime the draft; its output is unused. Keep it alive until the
   // sync below so the no-sync draft input is not freed while the target forward
   // launched next can reuse the buffer.
-  std::optional<ForwardOutput> draft_output = run_worker_no_sync_impl(
-      *draft_impl_, query_input, *prepare_stream_, *compute_stream_);
+  std::optional<ForwardOutput> draft_output =
+      speculative_worker::run_worker_no_sync(
+          *draft_impl_, query_input, *prepare_stream_, *compute_stream_);
 
   ForwardInput validate_input = input;
   // DSpark's N-wide draft geometry must be rescaled to (N+1) for the target's
@@ -605,7 +543,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   // its own uniform (unpruned) count. No-op unless adaptive + dp_size>1.
   sync_dp_global_token_nums_for_idle_rank(validate_input.input_params);
   ForwardOutput output =
-      run_worker_no_sync_impl(
+      speculative_worker::run_worker_no_sync(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
           .value();
   // See above: sync the no-sync draft and target forwards before returning.
@@ -616,14 +554,16 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
     const ForwardInput& input) {
+  discard_draft_prelaunch();
   Timer timer;
   ForwardInput processed_target_input;
-  ForwardOutput output = run_worker_no_sync_impl(*impl_,
-                                                 input,
-                                                 *prepare_stream_,
-                                                 *compute_stream_,
-                                                 &processed_target_input)
-                             .value();
+  ForwardOutput output =
+      speculative_worker::run_worker_no_sync(*impl_,
+                                             input,
+                                             *prepare_stream_,
+                                             *compute_stream_,
+                                             &processed_target_input)
+          .value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
@@ -768,7 +708,7 @@ DFlashWorkerImpl::DraftBlock DFlashWorkerImpl::run_decode_draft(
   prepare_query_inputs(input, query_input);
 
   ForwardOutput draft_output =
-      run_worker_no_sync_impl(
+      speculative_worker::run_worker_no_sync(
           *draft_impl_, query_input, *prepare_stream_, *compute_stream_)
           .value();
   // Overlap validate input preparation with the async draft forward: the draft
@@ -928,6 +868,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
     const ForwardInput& input,
     const DraftBlock& draft_block_in,
     ForwardInput& validate_input) {
+  c10::StreamGuard compute_guard = compute_stream_->set_stream_guard();
   Timer timer;
   // Adaptive-speculative per-seq varlen validate:
   // 1. controller decides per-seq prefix_lengths from confidence/proposal
@@ -997,8 +938,11 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   }
   sync_dp_global_token_nums_after_prune(validate_input.input_params,
                                         local_total_val_tokens);
+  // Stage host-originating template data before target launch: a nominally
+  // asynchronous pageable H2D can otherwise drain target's execution stream.
+  const bool prelaunch = !did_prune && prepare_draft_prelaunch(input);
   ForwardOutput target_output =
-      run_worker_no_sync_impl(
+      speculative_worker::run_worker_no_sync(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
           .value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
@@ -1066,20 +1010,53 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   // serialize without a cross-stream wait; the sync below only makes the
   // accepted tokens host-visible for the D2H copy and context-cache write.
   maybe_broadcast_spec_tokens(val_output.next_tokens);
-  compute_stream_->synchronize();
-  val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
+  if (prelaunch) {
+    torch::Tensor accepted_host = torch::empty(val_output.next_tokens.sizes(),
+                                               val_output.next_tokens.options()
+                                                   .device(torch::kCPU)
+                                                   .pinned_memory(true));
+    StreamEventPtr accepted_ready;
+    {
+      c10::StreamGuard guard = compute_stream_->set_stream_guard();
+      accepted_host.copy_(val_output.next_tokens, /*non_blocking=*/true);
+      accepted_ready = compute_stream_->record_event();
+      CHECK(accepted_ready != nullptr);
+      // Context projection, device input preparation and the entire next
+      // draft are submitted before any accepted-token host wait.
+      launch_draft_prelaunch(input, val_output, accepted_host);
+    }
+    CHECK(accepted_ready->synchronize())
+        << "DFlash2 accepted-token copy failed";
+    val_output.next_tokens = std::move(accepted_host);
+  } else {
+    compute_stream_->synchronize();
+    val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
+  }
   // Precise adaptive-aware metrics on the already-CPU tensor: static path
   // passes an empty per_seq_val_tokens and every row counts full width;
   // adaptive passes the per-seq widths so padded tail slots aren't counted
   // as rejections. Zero extra device sync — we're already on CPU.
   record_validate_metrics(
       val_output, did_prune ? per_seq_val_tokens : std::vector<int32_t>{});
-  std::vector<std::string> failed_request_ids =
-      write_target_context_to_cache(input, val_output);
-  target_output.failed_request_ids.insert(
-      target_output.failed_request_ids.end(),
-      std::make_move_iterator(failed_request_ids.begin()),
-      std::make_move_iterator(failed_request_ids.end()));
+  if (prelaunch) {
+    // The projected context KV has already been enqueued on device. Only
+    // commit the small host decode state used by schedule-overlap correction.
+    // Prelaunch excludes inputs with KV transfers; those use the path below.
+    embedding_cache_->write_target_context(
+        input.input_params.embedding.embedding_ids,
+        input.input_params.embedding.request_ids,
+        val_output.next_tokens,
+        val_output.embeddings,
+        options_.num_speculative_tokens());
+    finish_draft_prelaunch(input);
+  } else {
+    std::vector<std::string> failed_request_ids =
+        write_target_context_to_cache(input, val_output);
+    target_output.failed_request_ids.insert(
+        target_output.failed_request_ids.end(),
+        std::make_move_iterator(failed_request_ids.begin()),
+        std::make_move_iterator(failed_request_ids.end()));
+  }
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
     if (target_output.failed_request_ids.empty()) {
@@ -1177,7 +1154,8 @@ void DFlashWorkerImpl::process_draft_sample_output(
 void DFlashWorkerImpl::maybe_broadcast_spec_tokens(torch::Tensor& tokens) {
   if (get_optimization_config().enable_spec_token_broadcast) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-    broadcast_spec_tokens(tokens, spec_broadcast_group(parallel_args_));
+    speculative_worker::broadcast_tokens_in_group(
+        tokens, speculative_worker::sampling_process_group(parallel_args_));
   }
 }
 

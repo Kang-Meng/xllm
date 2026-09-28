@@ -30,16 +30,21 @@ def _backend_for_linear_cache(
     from xllm.python.attention.backend import linear_state_checkpoint_stride
     from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
 
-    backend = object.__new__(NpuPagedAttentionBackend)
+    backend = NpuPagedAttentionBackend(
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        scale=2**-0.5,
+        sliding_window=0,
+        is_mla=False,
+        device=conv_cache.device,
+        dtype=conv_cache.dtype,
+        num_decoding_tokens=verify_width,
+    )
     backend._kv_caches = [SimpleNamespace(conv=conv_cache, ssm=ssm_cache)]
-    backend._metadata = None
-    backend._kda_verify_width = verify_width
     backend._kda_checkpoint_stride = (
         linear_state_checkpoint_stride(conv_cache, ssm_cache) if conv_cache.shape[0] > 0 else None
     )
-    backend._kda_prepared_ssm_state_indices = None
-    backend._mla_quant_indexer_metadata = {}
-    backend._is_mla = False
     return backend
 
 

@@ -43,6 +43,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include "core/kernels/npu/utils.h"
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
 
@@ -125,6 +126,7 @@ void register_xllm_runtime_module(py::module_& m) {
   });
 
 #if defined(USE_NPU)
+  m.def("is_ascend_a3", &kernel::npu::is_ascend_a3);
   py::class_<NPULayerSynchronizerImpl,
              std::shared_ptr<NPULayerSynchronizerImpl>>(m, "LayerSynchronizer")
       .def("record_event",

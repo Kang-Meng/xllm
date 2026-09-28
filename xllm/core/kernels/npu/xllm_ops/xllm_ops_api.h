@@ -306,6 +306,16 @@ std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv(
     c10::string_view layout_kv,
     bool return_softmax_lse);
 
+torch::Tensor x_flash_attention_decode_out(const torch::Tensor& query,
+                                           const torch::Tensor& key,
+                                           const torch::Tensor& value,
+                                           const torch::Tensor& block_table,
+                                           const torch::Tensor& query_ends,
+                                           const torch::Tensor& kv_lengths,
+                                           const torch::Tensor& kv_starts,
+                                           double scale,
+                                           torch::Tensor& output);
+
 at::Tensor sparse_flash_attention(
     const at::Tensor& query,
     const at::Tensor& key,
