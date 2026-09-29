@@ -13,9 +13,9 @@
 # limitations under the License.
 """NPU Triton kernel for GLM-Next compact-tail KPool compression.
 
-The kernel consumes projected K/gate rows, completes at most one pool per
-request, updates the request-owned tail, and writes the completed pool directly
-into the paged compressed cache.
+The kernel consumes projected K/gate rows, completes every pool covered by
+each request, then updates its owned tail. Pool reads finish before tail writes
+so speculative spans may cross multiple compression boundaries safely.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _update_compact_kpool_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Update one request's compact tail and completed pool."""
+    """Update one request's compact tail and all completed pools."""
     request_idx = tl.program_id(0)
     dim_offsets = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     dim_mask = dim_offsets < HEAD_DIM
@@ -78,154 +78,166 @@ def _update_compact_kpool_kernel(
         mask=request_active,
         other=-1,
     ).to(tl.int64)
-    completion_offset = (RATE - 1 - first_position % RATE) % RATE
-    expected_completion_position = first_position + completion_offset
-    completion_row = query_start + completion_offset
-    has_completion = request_active & (completion_offset < QUERY_LEN)
-    completion_position = tl.load(
-        positions_ptr + completion_row * positions_stride,
-        mask=has_completion,
-        other=-1,
-    ).to(tl.int64)
-    pool_complete = (
-        has_completion
-        & (completion_position == expected_completion_position)
-        & (completion_position >= RATE - 1)
-        & ((completion_position + 1) % RATE == 0)
-    )
-
-    logit_max = tl.full((BLOCK_D,), float("-inf"), dtype=tl.float32)
-    denominator = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    for member_idx in tl.static_range(RATE):
-        member_position = completion_position - (RATE - 1 - member_idx)
-        current_offset = member_position - first_position
-        safe_current_offset = tl.minimum(tl.maximum(current_offset, 0), QUERY_LEN - 1)
-        current_row = query_start + safe_current_offset
-        current_position = tl.load(
-            positions_ptr + current_row * positions_stride,
-            mask=pool_complete,
+    first_completion_offset = (RATE - 1 - first_position % RATE) % RATE
+    # One request may complete several pools (e.g. an 8-row DFlash2 verify
+    # with rate 4). Read every pool from the original tail before updating it.
+    for pool_idx in tl.static_range((QUERY_LEN + RATE - 1) // RATE):
+        completion_offset = first_completion_offset + pool_idx * RATE
+        expected_completion_position = first_position + completion_offset
+        completion_row = query_start + completion_offset
+        has_completion = request_active & (completion_offset < QUERY_LEN)
+        completion_position = tl.load(
+            positions_ptr + completion_row * positions_stride,
+            mask=has_completion,
             other=-1,
         ).to(tl.int64)
-        from_current = (
-            pool_complete & (current_offset >= 0) & (current_offset < QUERY_LEN) & (current_position == member_position)
+        pool_complete = (
+            has_completion
+            & (completion_position == expected_completion_position)
+            & (completion_position >= RATE - 1)
+            & ((completion_position + 1) % RATE == 0)
         )
-        current_valid = tl.load(
-            valid_ptr + current_row * valid_stride,
-            mask=from_current,
-            other=0,
-        ).to(tl.int1)
-        member_valid = pool_complete & (member_position >= 0) & ((~from_current) | current_valid)
-        tail_row = tl.maximum(member_position, 0) % tail_capacity
-        tail_gate_address = (
-            safe_tail_id * tail_stride_slot
-            + tail_stride_kind
-            + tail_row * tail_stride_row
-            + dim_offsets * tail_stride_dim
-        )
-        old_gate = tl.load(
-            tail_cache_ptr + tail_gate_address,
-            mask=member_valid & (~from_current) & dim_mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        old_marker = tl.load(
-            tail_cache_ptr + safe_tail_id * tail_stride_slot + tail_stride_kind + tail_row * tail_stride_row,
-            mask=pool_complete & (~from_current),
-            other=float("-inf"),
-        ).to(tl.float32)
-        current_gate = tl.load(
-            gate_ptr + current_row * gate_stride_row + dim_offsets * gate_stride_dim,
-            mask=member_valid & from_current & dim_mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        member_valid = member_valid & (from_current | (old_marker != float("-inf")))
-        member_gate = tl.where(from_current, current_gate, old_gate)
-        pool_complete = pool_complete & member_valid
-        ape = tl.load(
-            ape_ptr + member_idx * ape_stride_member + dim_offsets * ape_stride_dim,
-            mask=dim_mask,
-            other=0.0,
-        ).to(tl.float32)
-        logit = member_gate + ape
-        next_max = tl.maximum(logit_max, logit)
-        rescale = tl.where(logit_max == float("-inf"), 0.0, tl.exp(logit_max - next_max))
-        contribution = tl.where(logit == float("-inf"), 0.0, tl.exp(logit - next_max))
-        denominator = denominator * rescale + contribution
-        logit_max = next_max
 
-    numerator = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    for member_idx in tl.static_range(RATE):
-        member_position = completion_position - (RATE - 1 - member_idx)
-        current_offset = member_position - first_position
-        safe_current_offset = tl.minimum(tl.maximum(current_offset, 0), QUERY_LEN - 1)
-        current_row = query_start + safe_current_offset
-        current_position = tl.load(
-            positions_ptr + current_row * positions_stride,
-            mask=pool_complete,
+        logit_max = tl.full((BLOCK_D,), float("-inf"), dtype=tl.float32)
+        denominator = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        for member_idx in tl.static_range(RATE):
+            member_position = completion_position - (RATE - 1 - member_idx)
+            current_offset = member_position - first_position
+            safe_current_offset = tl.minimum(tl.maximum(current_offset, 0), QUERY_LEN - 1)
+            current_row = query_start + safe_current_offset
+            current_position = tl.load(
+                positions_ptr + current_row * positions_stride,
+                mask=pool_complete,
+                other=-1,
+            ).to(tl.int64)
+            from_current = (
+                pool_complete
+                & (current_offset >= 0)
+                & (current_offset < QUERY_LEN)
+                & (current_position == member_position)
+            )
+            current_valid = tl.load(
+                valid_ptr + current_row * valid_stride,
+                mask=from_current,
+                other=0,
+            ).to(tl.int1)
+            member_valid = pool_complete & (member_position >= 0) & ((~from_current) | current_valid)
+            tail_row = tl.maximum(member_position, 0) % tail_capacity
+            tail_gate_address = (
+                safe_tail_id * tail_stride_slot
+                + tail_stride_kind
+                + tail_row * tail_stride_row
+                + dim_offsets * tail_stride_dim
+            )
+            old_gate = tl.load(
+                tail_cache_ptr + tail_gate_address,
+                mask=member_valid & (~from_current) & dim_mask,
+                other=float("-inf"),
+            ).to(tl.float32)
+            old_marker = tl.load(
+                tail_cache_ptr + safe_tail_id * tail_stride_slot + tail_stride_kind + tail_row * tail_stride_row,
+                mask=pool_complete & (~from_current),
+                other=float("-inf"),
+            ).to(tl.float32)
+            current_gate = tl.load(
+                gate_ptr + current_row * gate_stride_row + dim_offsets * gate_stride_dim,
+                mask=member_valid & from_current & dim_mask,
+                other=float("-inf"),
+            ).to(tl.float32)
+            member_valid = member_valid & (from_current | (old_marker != float("-inf")))
+            member_gate = tl.where(from_current, current_gate, old_gate)
+            pool_complete = pool_complete & member_valid
+            ape = tl.load(
+                ape_ptr + member_idx * ape_stride_member + dim_offsets * ape_stride_dim,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            logit = member_gate + ape
+            next_max = tl.maximum(logit_max, logit)
+            rescale = tl.where(logit_max == float("-inf"), 0.0, tl.exp(logit_max - next_max))
+            contribution = tl.where(logit == float("-inf"), 0.0, tl.exp(logit - next_max))
+            denominator = denominator * rescale + contribution
+            logit_max = next_max
+
+        numerator = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        for member_idx in tl.static_range(RATE):
+            member_position = completion_position - (RATE - 1 - member_idx)
+            current_offset = member_position - first_position
+            safe_current_offset = tl.minimum(tl.maximum(current_offset, 0), QUERY_LEN - 1)
+            current_row = query_start + safe_current_offset
+            current_position = tl.load(
+                positions_ptr + current_row * positions_stride,
+                mask=pool_complete,
+                other=-1,
+            ).to(tl.int64)
+            from_current = (
+                pool_complete
+                & (current_offset >= 0)
+                & (current_offset < QUERY_LEN)
+                & (current_position == member_position)
+            )
+            tail_row = tl.maximum(member_position, 0) % tail_capacity
+            tail_key_address = (
+                safe_tail_id * tail_stride_slot + tail_row * tail_stride_row + dim_offsets * tail_stride_dim
+            )
+            tail_gate_address = tail_key_address + tail_stride_kind
+            old_key = tl.load(
+                tail_cache_ptr + tail_key_address,
+                mask=pool_complete & (~from_current) & dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            old_gate = tl.load(
+                tail_cache_ptr + tail_gate_address,
+                mask=pool_complete & (~from_current) & dim_mask,
+                other=float("-inf"),
+            ).to(tl.float32)
+            current_key = tl.load(
+                raw_k_ptr + current_row * raw_k_stride_row + dim_offsets * raw_k_stride_dim,
+                mask=pool_complete & from_current & dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            current_gate = tl.load(
+                gate_ptr + current_row * gate_stride_row + dim_offsets * gate_stride_dim,
+                mask=pool_complete & from_current & dim_mask,
+                other=float("-inf"),
+            ).to(tl.float32)
+            member_key = tl.where(from_current, current_key, old_key)
+            member_gate = tl.where(from_current, current_gate, old_gate)
+            ape = tl.load(
+                ape_ptr + member_idx * ape_stride_member + dim_offsets * ape_stride_dim,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            safe_denominator = tl.where(denominator > 0.0, denominator, 1.0)
+            normalized_weight = tl.where(
+                pool_complete,
+                tl.exp(member_gate + ape - logit_max) / safe_denominator,
+                0.0,
+            )
+            rounded_weight = normalized_weight.to(tl.bfloat16).to(tl.float32)
+            rounded_product = (rounded_weight * member_key).to(tl.bfloat16).to(tl.float32)
+            numerator += rounded_product
+
+        pool_id = tl.maximum(completion_position, 0) // RATE
+        logical_block = pool_id // pool_block_size
+        table_in_range = logical_block < block_table_width
+        safe_logical_block = tl.minimum(tl.maximum(logical_block, 0), block_table_width - 1)
+        physical_block = tl.load(
+            block_table_ptr + request_idx * block_table_stride_row + safe_logical_block * block_table_stride_col,
+            mask=pool_complete & table_in_range,
             other=-1,
         ).to(tl.int64)
-        from_current = (
-            pool_complete & (current_offset >= 0) & (current_offset < QUERY_LEN) & (current_position == member_position)
+        physical_block_valid = (physical_block >= 0) & (physical_block < num_pool_blocks)
+        safe_physical_block = tl.minimum(tl.maximum(physical_block, 0), num_pool_blocks - 1)
+        pool_offset = pool_id % pool_block_size
+        pool_address = (
+            safe_physical_block * pool_stride_block + pool_offset * pool_stride_slot + dim_offsets * pool_stride_dim
         )
-        tail_row = tl.maximum(member_position, 0) % tail_capacity
-        tail_key_address = safe_tail_id * tail_stride_slot + tail_row * tail_stride_row + dim_offsets * tail_stride_dim
-        tail_gate_address = tail_key_address + tail_stride_kind
-        old_key = tl.load(
-            tail_cache_ptr + tail_key_address,
-            mask=pool_complete & (~from_current) & dim_mask,
-            other=0.0,
-        ).to(tl.float32)
-        old_gate = tl.load(
-            tail_cache_ptr + tail_gate_address,
-            mask=pool_complete & (~from_current) & dim_mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        current_key = tl.load(
-            raw_k_ptr + current_row * raw_k_stride_row + dim_offsets * raw_k_stride_dim,
-            mask=pool_complete & from_current & dim_mask,
-            other=0.0,
-        ).to(tl.float32)
-        current_gate = tl.load(
-            gate_ptr + current_row * gate_stride_row + dim_offsets * gate_stride_dim,
-            mask=pool_complete & from_current & dim_mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        member_key = tl.where(from_current, current_key, old_key)
-        member_gate = tl.where(from_current, current_gate, old_gate)
-        ape = tl.load(
-            ape_ptr + member_idx * ape_stride_member + dim_offsets * ape_stride_dim,
-            mask=dim_mask,
-            other=0.0,
-        ).to(tl.float32)
-        safe_denominator = tl.where(denominator > 0.0, denominator, 1.0)
-        normalized_weight = tl.where(
-            pool_complete,
-            tl.exp(member_gate + ape - logit_max) / safe_denominator,
-            0.0,
+        tl.store(
+            pool_cache_ptr + pool_address,
+            numerator.to(tl.bfloat16),
+            mask=pool_complete & table_in_range & physical_block_valid & dim_mask,
         )
-        rounded_weight = normalized_weight.to(tl.bfloat16).to(tl.float32)
-        rounded_product = (rounded_weight * member_key).to(tl.bfloat16).to(tl.float32)
-        numerator += rounded_product
-
-    pool_id = tl.maximum(completion_position, 0) // RATE
-    logical_block = pool_id // pool_block_size
-    table_in_range = logical_block < block_table_width
-    safe_logical_block = tl.minimum(tl.maximum(logical_block, 0), block_table_width - 1)
-    physical_block = tl.load(
-        block_table_ptr + request_idx * block_table_stride_row + safe_logical_block * block_table_stride_col,
-        mask=pool_complete & table_in_range,
-        other=-1,
-    ).to(tl.int64)
-    physical_block_valid = (physical_block >= 0) & (physical_block < num_pool_blocks)
-    safe_physical_block = tl.minimum(tl.maximum(physical_block, 0), num_pool_blocks - 1)
-    pool_offset = pool_id % pool_block_size
-    pool_address = (
-        safe_physical_block * pool_stride_block + pool_offset * pool_stride_slot + dim_offsets * pool_stride_dim
-    )
-    tl.store(
-        pool_cache_ptr + pool_address,
-        numerator.to(tl.bfloat16),
-        mask=pool_complete & table_in_range & physical_block_valid & dim_mask,
-    )
 
     # Compression reads are complete before the circular tail is updated.
     for query_offset in tl.static_range(QUERY_LEN):
@@ -282,8 +294,8 @@ def update_compact_kpool(
 
     The current rows are sequence-major with one equal-width span per request.
     Read and write tail ids must already resolve to the same request-owned
-    state; prefix restore with distinct ids remains on the torch path. Since a
-    span is no wider than ``rate``, each request completes at most one pool.
+    state; prefix restore with distinct ids remains on the torch path. The
+    tail capacity bounds the query span, which may complete multiple pools.
     """
     if rate <= 0:
         raise ValueError("compact KPool compression rate must be positive")
@@ -315,8 +327,8 @@ def update_compact_kpool(
         raise ValueError("compact KPool head dimension must be positive")
     if num_tokens == 0:
         return
-    if query_len <= 0 or query_len > rate or num_tokens % query_len != 0:
-        raise ValueError("compact KPool Triton update requires uniform request spans no wider than one pool")
+    if query_len <= 0 or num_tokens % query_len != 0:
+        raise ValueError("compact KPool Triton update requires uniform request spans")
     num_requests = num_tokens // query_len
     if flat_gate.shape != flat_k.shape:
         raise ValueError("raw K and gate rows must have identical shapes")

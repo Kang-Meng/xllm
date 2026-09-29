@@ -95,11 +95,11 @@ def _compact_kpool_triton_query_len(
     query_lens: Sequence[int],
     rate: int,
 ) -> int | None:
-    """Return the uniform request width supported by the compact Triton kernel."""
+    """Resolve a uniform width; the caller also checks compact-tail capacity."""
     if not query_lens:
         return None
     query_len = int(query_lens[0])
-    if query_len <= 0 or query_len > rate:
+    if rate <= 0 or query_len <= 0:
         return None
     if any(int(length) != query_len for length in query_lens[1:]):
         return None

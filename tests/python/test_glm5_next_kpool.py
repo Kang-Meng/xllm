@@ -36,6 +36,23 @@ def _indexer(device: torch.device) -> glm5_next.Glm5NextIndexer:
     return glm5_next.Glm5NextIndexer(config, 1, torch.bfloat16, device).to(device=device, dtype=torch.bfloat16)
 
 
+@pytest.mark.parametrize(
+    ("query_lens", "rate", "expected"),
+    [
+        ([], 4, None),
+        ([1, 1], 4, 1),
+        ([4, 4], 4, 4),
+        ([8, 8], 4, 8),
+        ([9, 9], 4, 9),
+        ([4, 8], 4, None),
+        ([0], 4, None),
+        ([1], 0, None),
+    ],
+)
+def test_compact_kpool_query_width_spans_multiple_pools(query_lens: list[int], rate: int, expected: int | None) -> None:
+    assert glm5_next._compact_kpool_triton_query_len(query_lens, rate) == expected
+
+
 def test_graph_kpool_prefix_drops_short_bucket_tail() -> None:
     hidden = torch.arange(16, dtype=torch.float32).reshape(1, 8, 2)
     flat = torch.arange(8, dtype=torch.float32)
@@ -473,8 +490,10 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
 
 
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@pytest.mark.parametrize("query_len", [1, 4, 7, 8, 9])
+@pytest.mark.parametrize("position_offset", [0, 1, 2, 3])
 @torch.inference_mode()
-def test_compact_kpool_triton_matches_torch_reference() -> None:
+def test_compact_kpool_triton_matches_torch_reference(query_len: int, position_offset: int) -> None:
     runtime = pytest.importorskip("torch_npu")
     pytest.importorskip("triton")
     from xllm.python.kernels_npu.triton.kpool_compress import (
@@ -484,8 +503,7 @@ def test_compact_kpool_triton_matches_torch_reference() -> None:
     torch.manual_seed(42)
     rate = 4
     head_dim = 128
-    query_len = 4
-    first_positions = (2, 29, 5)
+    first_positions = (position_offset, 28 + position_offset, 5)
     num_requests = len(first_positions)
     positions = torch.cat(
         [torch.arange(start, start + query_len, dtype=torch.int64) for start in first_positions],
@@ -499,7 +517,7 @@ def test_compact_kpool_triton_matches_torch_reference() -> None:
     tail_ids = torch.tensor([1, 2, 0], dtype=torch.int32)
     block_table = torch.tensor([[2, 0], [3, 1], [0, 0]], dtype=torch.int64)
     compressed_cache = torch.zeros(4, 4, 1, head_dim, dtype=torch.bfloat16)
-    tail_cache = torch.randn(num_requests, 2, rate + 3, head_dim, dtype=torch.bfloat16)
+    tail_cache = torch.randn(num_requests, 2, rate + query_len - 1, head_dim, dtype=torch.bfloat16)
     tail_cache[0].zero_()
 
     device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
@@ -565,3 +583,31 @@ def test_compact_kpool_triton_matches_torch_reference() -> None:
 
     torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
     torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
+
+    # Replay with a partially accepted prefix, then a full-window advance.
+    # Both steps must read the live circular tail and write every new pool.
+    for accepted_prefix in (1, query_len):
+        device_positions.add_(accepted_prefix)
+        device_raw_k.mul_(0.75).add_(0.125)
+        device_gate_scores.mul_(0.5).sub_(0.25)
+        expected_cache = actual_cache.clone()
+        expected_tail = actual_tail.clone()
+        update_compressed_kpool(
+            device_raw_k,
+            device_gate_scores,
+            device_valid_rows,
+            device_positions,
+            expected_cache,
+            expected_tail,
+            device_tail_ids,
+            device_tail_ids,
+            device_block_table,
+            [query_len] * num_requests,
+            device_ape,
+            rate,
+            graph_mode=True,
+        )
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
+        torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
