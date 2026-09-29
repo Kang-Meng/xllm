@@ -522,6 +522,20 @@ TEST(KVCacheEstimationTest, Glm5MtpPreallocatesSpeculativeCheckpoints) {
   EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 4);
   EXPECT_EQ(capacity.linear_slot_size(), 832);
 }
+
+TEST(KVCacheEstimationTest, Glm5PrefillDoesNotReserveMtpCheckpoints) {
+  ModelArgs model_args = make_linear_attention_args();
+  model_args.model_type("glm5_next");
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.num_speculative_tokens = 3;
+  options.instance_role = InstanceRole::PREFILL;
+
+  KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.linear_conv_state_len(), 2);
+  EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 1);
+  EXPECT_LT(capacity.linear_slot_size(), 832);
+}
 #endif
 
 TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
@@ -733,10 +747,10 @@ TEST(KVCacheEstimationTest, DeepSeekV4FlashPrefillSwaRingMatchesShippedShape) {
       .index_head_dim(128)
       .index_n_heads(64)
       .window_size(128)
-      .compress_ratios({0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-                        4, 0, 0, 0});
+      .compress_ratios({0, 0,   4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+                        4, 128, 4, 128, 4, 128, 4, 0,   0, 0});
 
   KVCacheEstimateOptions options;
   options.dtype = torch::kBFloat16;

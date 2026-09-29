@@ -238,9 +238,20 @@ int64_t layerwise_split_block_count(const ModelArgs& model_args,
   return common_block_count;
 }
 
+int64_t effective_num_speculative_tokens(
+    const KVCacheEstimateOptions& options) {
+  // A prefill instance never receives speculative decode tokens. Keep the
+  // runtime MTP options intact for draft prefill, but do not reserve decode
+  // checkpoints in its cache shape.
+  return options.instance_role == InstanceRole::PREFILL
+             ? 0
+             : options.num_speculative_tokens;
+}
+
 bool enable_hybrid_spec_verify(const ModelArgs& model_args,
                                const KVCacheEstimateOptions& options) {
-  return options.num_speculative_tokens > 0 && !options.is_draft_engine &&
+  return effective_num_speculative_tokens(options) > 0 &&
+         !options.is_draft_engine &&
          (is_qwen3_5_target_model_type(model_args.model_type()) ||
           model_args.model_type() == "glm5_next" ||
           model_args.model_type() == "glm5_next_text");
@@ -254,7 +265,7 @@ int64_t linear_slot_size(const ModelArgs& model_args,
   }
   const int64_t num_speculative_tokens =
       enable_hybrid_spec_verify(model_args, options)
-          ? options.num_speculative_tokens
+          ? effective_num_speculative_tokens(options)
           : 0;
 
   const int64_t head_k_dim = model_args.linear_key_head_dim();
@@ -805,7 +816,7 @@ KVCacheCapacity estimate_kv_cache_capacity(
       .block_size(options.block_size);
   const int64_t num_speculative_tokens =
       enable_hybrid_spec_verify(model_args, options)
-          ? options.num_speculative_tokens
+          ? effective_num_speculative_tokens(options)
           : 0;
   kv_cache_cap.linear_conv_state_len(model_args.linear_conv_kernel_dim() - 1 +
                                      num_speculative_tokens);
@@ -820,18 +831,19 @@ KVCacheCapacity estimate_kv_cache_capacity(
         << "Compressed KPool requires owned layer caches.";
     CHECK_EQ(options.dtype, torch::kBFloat16);
     CHECK_EQ(options.block_size % model_args.index_kpool(), 0);
-    CHECK_GE(options.num_speculative_tokens, 0);
+    const int64_t num_speculative_tokens =
+        effective_num_speculative_tokens(options);
+    CHECK_GE(num_speculative_tokens, 0);
     if (uses_npu_compressed_kpool_tail(model_args)) {
       // Preserve one complete pool plus speculative rows that may be rejected.
       // The verify base token advances the committed sequence and is already
       // covered by the regular pool tail.
       kv_cache_cap.kpool_tail_len(model_args.index_kpool() +
-                                  options.num_speculative_tokens);
+                                  num_speculative_tokens);
     } else {
       // Preserve the MLU asynchronous handoff window.
-      const int64_t window = options.num_speculative_tokens > 0
-                                 ? 2 * (options.num_speculative_tokens + 1)
-                                 : 0;
+      const int64_t window =
+          num_speculative_tokens > 0 ? 2 * (num_speculative_tokens + 1) : 0;
       kv_cache_cap.kpool_tail_len(model_args.index_kpool() + window);
     }
     kv_cache_cap.kpool_tail_slot_size(2 * sizeof(uint16_t) *
