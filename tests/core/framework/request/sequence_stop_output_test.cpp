@@ -452,5 +452,56 @@ TEST_F(SequenceStopOutputTest, ManualFinishKeepsLastGeneratedToken) {
   EXPECT_EQ(output.finish_reason.value(), "stop");
 }
 
+// Regression test for the PD decode-side prefill-token check: decode() looks
+// one token ahead of the slice it is given, while get_decodable_token_count()
+// holds the trailing tokens back as a potential multi-token stop suffix. That
+// slice can therefore end exactly at the decoder offset, which used to abort on
+// slice.h:69.
+TEST_F(SequenceStopOutputTest, PrefillTokenCheckToleratesWithheldStopSuffix) {
+  const std::vector<int32_t> stop_sequence = {'X', 'Y'};
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{stop_sequence});
+  append_token('A');
+  ASSERT_FALSE(sequence_->finished());
+  sequence_->enable_checking_prefill_token();
+
+  // The only generated token is withheld, so the decoder gets a slice of length
+  // num_prompt_tokens and has no token to inspect.
+  auto output =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
+
+  ASSERT_TRUE(output.has_value());
+  EXPECT_TRUE(output->text.empty());
+}
+
+// The deferred check must run once the token becomes visible. Clearing the flag
+// without inspecting the token would drop the skip and re-emit the text of the
+// prefill token, so only 'B' may be emitted here.
+TEST_F(SequenceStopOutputTest, PrefillTokenCheckRunsOnceTokenIsVisible) {
+  const std::vector<int32_t> stop_sequence = {'X', 'Y'};
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{stop_sequence});
+  append_token('A');
+  sequence_->enable_checking_prefill_token();
+
+  // Call 1: 'A' is withheld, so the check is deferred and nothing is emitted.
+  auto first =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(first->text.empty());
+
+  // Call 2: appending 'B' and 'C' releases 'A', so the deferred check runs and
+  // skips the prefill token 'A'.
+  append_token('B');
+  append_token('C');
+  auto second =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
+
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(second->text, "B");
+}
+
 }  // namespace
 }  // namespace xllm

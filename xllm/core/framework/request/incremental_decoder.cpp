@@ -55,13 +55,20 @@ std::string IncrementalDecoder::decode(const Slice<int32_t>& token_ids,
   // phase needs to skip that token. If it cannot, the decode token and that
   // token need to generate characters together.
   if (checking_prefill_token_) {
-    const auto prefill_token_text =
-        tokenizer.decode(token_ids.slice(output_offset_, output_offset_ + 1),
-                         skip_special_tokens_);
-    if (!absl::EndsWith(prefill_token_text, "�")) {
-      output_offset_ += 1;
+    // `token_ids` may be shorter than the sequence's token count: the
+    // stop-output suppression in Sequence::get_decodable_token_count() holds
+    // back the trailing tokens, so the slice handed to decode() can end exactly
+    // at output_offset_. There is then no token to inspect yet -- keep the flag
+    // set and run the check on a later call, once the token becomes visible.
+    if (output_offset_ < token_ids.size()) {
+      const auto prefill_token_text =
+          tokenizer.decode(token_ids.slice(output_offset_, output_offset_ + 1),
+                           skip_special_tokens_);
+      if (!absl::EndsWith(prefill_token_text, "�")) {
+        output_offset_ += 1;
+      }
+      checking_prefill_token_ = false;
     }
-    checking_prefill_token_ = false;
   }
 
   const auto prefix_text = tokenizer.decode(
