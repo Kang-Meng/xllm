@@ -66,7 +66,7 @@ inline DSparkSasMode classify_dspark_sas_mode(const ModelArgs& draft_args,
 
 }  // namespace dflash_detail
 
-// DFlash2 proposal attention follows the prelaunch gate: A3, Python, DP/CP 1,
+// DFlash2 proposal attention follows the prelaunch gate: A3, Python, CP 1,
 // schedule overlap, and the same PD role and adaptive-decode limits.
 bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
                                  const torch::Device& device,

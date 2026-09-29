@@ -232,7 +232,7 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::execute_draft_query(
 bool DFlash2WorkerImpl::can_prepare_without_compute_stream_wait(
     const ForwardInput& input) const {
   // Reuse the owner's actual enablement, including A3/Python, overlap,
-  // DP/CP, PD role and adaptive-decode restrictions. The outer worker stages
+  // CP, PD role and adaptive-decode restrictions. The outer worker stages
   // fresh metadata; it owns neither the leaf graph's persistent buffers nor
   // its KV cache. Do not extend this exemption to the leaf workers.
   return prelaunch_graph_enabled_ &&

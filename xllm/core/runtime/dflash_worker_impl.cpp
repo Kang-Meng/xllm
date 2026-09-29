@@ -315,7 +315,7 @@ bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
          ModelConfig::is_python_model_impl(
              ModelConfig::get_instance().model_impl()) &&
          device.is_privateuseone() && options.enable_schedule_overlap() &&
-         parallel_args.dp_size() == 1 && parallel_args.cp_size() == 1 &&
+         parallel_args.cp_size() == 1 &&
          (!options.enable_disagg_pd() ||
           options.instance_role() == InstanceRole::DECODE) &&
          !options.enable_adaptive_speculative_decode();
