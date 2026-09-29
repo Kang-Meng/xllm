@@ -54,6 +54,12 @@ TEST(DsaTopkRelayTest, PublishedStateIsReusedAsOneValue) {
   const torch::Tensor context_lens =
       torch::tensor({2, 1}, torch::dtype(torch::kInt32));
   publish_transfer->publish_output(DsaTopkState(block_tables, context_lens));
+  const torch::Tensor sorted_slots = torch::tensor({0, 1});
+  const torch::Tensor sorted_rows = torch::tensor({0, 1});
+  const torch::Tensor remapped =
+      torch::tensor({{0, 1}, {1, 0}}, torch::dtype(torch::kInt32));
+  publish_transfer->publish_prefill_remap(DsaPrefillRemap(
+      remapped, block_tables, context_lens, sorted_slots, sorted_rows));
   relay.finish_layer(publish_decision, *publish_transfer);
 
   const DsaTopkShareDecision reuse_decision{
@@ -69,6 +75,19 @@ TEST(DsaTopkRelayTest, PublishedStateIsReusedAsOneValue) {
       torch::equal(reuse_transfer->input()->block_tables(), block_tables));
   EXPECT_TRUE(
       torch::equal(reuse_transfer->input()->context_lens(), context_lens));
+  ASSERT_NE(reuse_transfer->prefill_remap_input(), nullptr);
+  EXPECT_TRUE(reuse_transfer->prefill_remap_input()->matches(
+      block_tables, context_lens, sorted_slots, sorted_rows));
+  EXPECT_EQ(reuse_transfer->prefill_remap_input()->block_table().data_ptr(),
+            remapped.data_ptr());
+
+  DsaTopkShareDecision last_decision = reuse_decision;
+  last_decision.last_shared = true;
+  relay.finish_layer(last_decision, *reuse_transfer);
+  std::optional<DsaTopkTransfer> next_transfer =
+      relay.prepare_layer(reuse_decision);
+  ASSERT_TRUE(next_transfer.has_value());
+  EXPECT_EQ(next_transfer->prefill_remap_input(), nullptr);
 }
 
 TEST(DsaTopkRelayTest, ReuseBeforePublishFails) {

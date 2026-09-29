@@ -48,6 +48,10 @@ class HttpDownloader {
 class BRpcDownloader : public HttpDownloader {
  public:
   BRpcDownloader() = default;
+  // `default_headers` are applied before per-request headers, so a
+  // per-request header with the same name overrides the default one.
+  explicit BRpcDownloader(
+      std::unordered_map<std::string, std::string> default_headers);
   ~BRpcDownloader() = default;
 
   bool download(const std::string& host,
@@ -60,6 +64,8 @@ class BRpcDownloader : public HttpDownloader {
   std::shared_ptr<brpc::Channel> get_channel(const std::string& host);
 
  private:
+  std::unordered_map<std::string, std::string> default_headers_;
+
   inline static bthread::RWLock rw_lock_;
   inline static std::unordered_map<std::string, std::shared_ptr<brpc::Channel>>
       channels_;
@@ -70,8 +76,5 @@ class BRpcDownloader : public HttpDownloader {
 // Exposed for testing.
 std::unordered_map<std::string, std::string> parse_headers_json(
     const std::string& raw);
-
-// Parse the --mm_download_headers gflag. Cached after first call.
-std::unordered_map<std::string, std::string> parse_global_headers();
 
 }  // namespace xllm

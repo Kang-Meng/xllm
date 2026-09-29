@@ -133,7 +133,7 @@ TEST(MMContentTest, ImageUrlWithoutHeaders) {
 
 TEST(HeaderMergeTest, RequestHeadersOverrideGlobal) {
   // Simulate the merge order used in BRpcDownloader::download():
-  // 1) global defaults first
+  // 1) default (global) headers first
   // 2) per-request headers second (SetHeader overrides)
 
   std::unordered_map<std::string, std::string> global;

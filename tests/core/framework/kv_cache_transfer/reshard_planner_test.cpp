@@ -24,6 +24,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 
 namespace xllm {
@@ -424,14 +425,34 @@ TEST(ReshardPlannerTest, ShrinkTpFourToTwo) {
   run_copy_case(/*source_tp=*/4, /*destination_tp=*/2, /*global_heads=*/8);
 }
 
-TEST(ReshardPlannerTest, CheckpointedSsmBindsLogicalSlotsAcrossTp) {
+void check_checkpointed_ssm_copy(bool enable_mla) {
   std::vector<WorkerCacheLayoutManifest> sources;
   for (int32_t rank = 0; rank < 2; ++rank) {
     sources.emplace_back(make_ssm_manifest(
         rank, /*tp_size=*/2, /*global_heads=*/4, 3 + rank, "source"));
   }
-  const WorkerCacheLayoutManifest destination = make_ssm_manifest(
+  WorkerCacheLayoutManifest destination = make_ssm_manifest(
       /*tp_rank=*/3, /*tp_size=*/4, /*global_heads=*/4, 17, "destination");
+  // Exercise the production descriptors, including a hybrid model whose MLA
+  // caches are replicated but recurrent state is not.
+  for (WorkerCacheLayoutManifest* manifest :
+       {&sources[0], &sources[1], &destination}) {
+    CacheTensorManifest& tensor = manifest->tensors[0];
+    CacheTensorLayoutContext context;
+    context.tp_rank = manifest->coordinates.tp_rank;
+    context.tp_size = manifest->coordinates.tp_size;
+    context.enable_mla = enable_mla;
+    context.linear_value_head_count = 4;
+    context.linear_ssm_checkpoint_stride = 3;
+    KVCacheTensor cache_tensor{KVCacheTensorRole::SSM,
+                               torch::zeros(tensor.shape, torch::kUInt8),
+                               tensor.group_id,
+                               /*sequence_scoped=*/true};
+    std::string error;
+    ASSERT_TRUE(describe_cache_tensor(context, &cache_tensor, &error)) << error;
+    ASSERT_TRUE(cache_tensor.shard_descriptor.has_value());
+    tensor.shard = *cache_tensor.shard_descriptor;
+  }
   ReshardPlanner planner;
   ASSERT_TRUE(planner.validate_destination_coverage(sources, destination).ok());
 
@@ -472,6 +493,16 @@ TEST(ReshardPlannerTest, CheckpointedSsmBindsLogicalSlotsAcrossTp) {
                               /*destination_resource=*/1,
                               /*source_resource=*/1);
 }
+
+TEST(ReshardPlannerTest, CheckpointedSsmBindsLogicalSlotsAcrossTp) {
+  check_checkpointed_ssm_copy(/*enable_mla=*/false);
+}
+
+#if defined(USE_NPU) || defined(USE_MLU)
+TEST(ReshardPlannerTest, HybridMlaPreservesCheckpointedSsmAcrossTp) {
+  check_checkpointed_ssm_copy(/*enable_mla=*/true);
+}
+#endif
 
 TEST(ReshardPlannerTest, HandlesProductionScaleNonMlaLayout) {
   constexpr int64_t kLayerCount = 80;

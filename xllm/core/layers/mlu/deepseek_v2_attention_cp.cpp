@@ -211,12 +211,39 @@ torch::Tensor DeepseekV2AttentionImpl::forward_cp(
     attn_output_local = v32_cp::reorder_to_local_shard(global_output, cp_ctx);
   } else if (use_dcp) {
     torch::Tensor k_cache = kv_cache.get_k_cache();
+    torch::Tensor mapped_blocks;
+    const bool shared_prefill = topk_transfer != nullptr &&
+                                topk_transfer->input() != nullptr &&
+                                !has_indexer_;
+    if (shared_prefill) {
+      const DsaPrefillRemap* remap = topk_transfer->prefill_remap_input();
+      CHECK(remap != nullptr)
+          << "CP+DCP shared prefill requires a relayed block table.";
+      CHECK(remap->matches(kernel_metadata.block_table,
+                           kernel_metadata.kv_seq_lens,
+                           cp_ctx.sorted_gathered_slot_mapping_int64,
+                           cp_ctx.sorted_gathered_slot_rows))
+          << "CP+DCP shared prefill block table has mismatched sources.";
+      mapped_blocks = remap->block_table();
+    } else if (topk_transfer != nullptr && topk_transfer->captures_output()) {
+      mapped_blocks =
+          remap_prefill_blocks(cp_ctx.sorted_gathered_slot_mapping_int64,
+                               cp_ctx.sorted_gathered_slot_rows,
+                               kernel_metadata);
+      topk_transfer->publish_prefill_remap(
+          DsaPrefillRemap(mapped_blocks,
+                          kernel_metadata.block_table,
+                          kernel_metadata.kv_seq_lens,
+                          cp_ctx.sorted_gathered_slot_mapping_int64,
+                          cp_ctx.sorted_gathered_slot_rows));
+    }
     auto [attention_cache, compact_metadata] =
         build_prefill_cache(mla_inputs.k_input,
                             k_cache,
                             cp_ctx.sorted_gathered_slot_mapping_int64,
                             cp_ctx.sorted_gathered_slot_rows,
-                            kernel_metadata);
+                            kernel_metadata,
+                            mapped_blocks);
     std::tie(attn_output_local, std::ignore) = attn_(compact_metadata,
                                                      mla_inputs.q_input,
                                                      mla_inputs.k_input,

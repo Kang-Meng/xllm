@@ -161,6 +161,52 @@ TEST_F(CausalConv1dUpdateDecodeJitTest, AcceptsUncompiledDim) {
 }
 
 TEST_F(CausalConv1dUpdateDecodeJitTest,
+       Tp2GraphPaddedSpecDecodeFitsNramAndUpdatesState) {
+  torch::DeviceGuard guard(device());
+  constexpr int32_t kDim = 12288;
+  constexpr int32_t kWidth = 4;
+  constexpr int32_t kBatch = 8;
+  constexpr int32_t kNullSlot = 64;
+  torch::TensorOptions bf16_options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device());
+  torch::TensorOptions int_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device());
+  torch::Tensor x = torch::ones({32, kDim}, bf16_options);
+  torch::Tensor weight = torch::ones({kDim, kWidth}, bf16_options);
+  torch::Tensor conv_state = torch::zeros({65, kDim, 6}, bf16_options);
+  torch::Tensor conv_state_indices = torch::tensor(
+      std::vector<int32_t>{0, 1, 2, 3, 4, 5, 6, kNullSlot}, int_options);
+  torch::Tensor query_start_loc = torch::tensor(
+      std::vector<int32_t>{0, 4, 8, 12, 16, 20, 24, 28, 28}, int_options);
+  torch::Tensor accepted_tokens =
+      torch::full({kBatch}, /*fill_value=*/4, int_options);
+
+  torch::Tensor out = causal_conv1d_update_decode(x,
+                                                  conv_state,
+                                                  weight,
+                                                  /*bias_opt=*/std::nullopt,
+                                                  conv_state_indices,
+                                                  /*activation=*/false,
+                                                  /*pad_slot_id=*/kNullSlot,
+                                                  query_start_loc,
+                                                  /*max_query_len=*/4,
+                                                  accepted_tokens);
+  torch_mlu::synchronize();
+
+  torch::Tensor expected = torch::zeros_like(out);
+  for (int32_t sequence = 0; sequence < kBatch - 1; ++sequence) {
+    for (int32_t token = 0; token < kWidth; ++token) {
+      expected[sequence * kWidth + token].fill_(token + 1);
+    }
+  }
+  EXPECT_TRUE(torch::equal(out, expected));
+  EXPECT_TRUE(torch::equal(conv_state[0].select(/*dim=*/1, /*index=*/5),
+                           torch::ones({kDim}, bf16_options)));
+  EXPECT_TRUE(torch::equal(conv_state[kNullSlot],
+                           torch::zeros({kDim, 6}, bf16_options)));
+}
+
+TEST_F(CausalConv1dUpdateDecodeJitTest,
        PreservesAdjacentSlotAcrossConsecutiveDecode) {
   torch::DeviceGuard guard(device());
   const int32_t dim = 2048;

@@ -26,6 +26,45 @@ limitations under the License.
 
 namespace xllm::layer {
 
+class DsaPrefillRemap final {
+ public:
+  DsaPrefillRemap(torch::Tensor block_table,
+                  torch::Tensor topk,
+                  torch::Tensor context_lens,
+                  torch::Tensor sorted_slots,
+                  torch::Tensor sorted_rows)
+      : block_table_(std::move(block_table)),
+        topk_(std::move(topk)),
+        context_lens_(std::move(context_lens)),
+        sorted_slots_(std::move(sorted_slots)),
+        sorted_rows_(std::move(sorted_rows)) {}
+
+  const torch::Tensor& block_table() const { return block_table_; }
+
+  bool matches(const torch::Tensor& topk,
+               const torch::Tensor& context_lens,
+               const torch::Tensor& sorted_slots,
+               const torch::Tensor& sorted_rows) const {
+    return topk_.unsafeGetTensorImpl() == topk.unsafeGetTensorImpl() &&
+           context_lens_.unsafeGetTensorImpl() ==
+               context_lens.unsafeGetTensorImpl() &&
+           sorted_slots_.unsafeGetTensorImpl() ==
+               sorted_slots.unsafeGetTensorImpl() &&
+           sorted_rows_.unsafeGetTensorImpl() ==
+               sorted_rows.unsafeGetTensorImpl() &&
+           block_table_.defined() && block_table_.sizes() == topk.sizes() &&
+           block_table_.scalar_type() == topk.scalar_type() &&
+           block_table_.device() == topk.device();
+  }
+
+ private:
+  torch::Tensor block_table_;
+  torch::Tensor topk_;
+  torch::Tensor context_lens_;
+  torch::Tensor sorted_slots_;
+  torch::Tensor sorted_rows_;
+};
+
 // Per-attention transfer prepared by a relay or the MTP bridge. Factory
 // methods expose only valid reuse/capture combinations, and output is
 // published as one DsaTopkState rather than through independent pointers.
@@ -43,14 +82,21 @@ class DsaTopkTransfer final {
 
   static DsaTopkTransfer reuse(
       const DsaTopkState& input,
-      const std::optional<DsaTopkState>& localized_input = std::nullopt) {
-    return DsaTopkTransfer(input, localized_input, /*captures_output=*/false);
+      const std::optional<DsaTopkState>& localized_input = std::nullopt,
+      std::optional<DsaPrefillRemap> prefill_remap = std::nullopt) {
+    return DsaTopkTransfer(input,
+                           localized_input,
+                           /*captures_output=*/false,
+                           std::move(prefill_remap));
   }
 
-  static DsaTopkTransfer reuse_and_capture(const DsaTopkState& input) {
+  static DsaTopkTransfer reuse_and_capture(
+      const DsaTopkState& input,
+      std::optional<DsaPrefillRemap> prefill_remap = std::nullopt) {
     return DsaTopkTransfer(input,
                            /*localized_input=*/std::nullopt,
-                           /*captures_output=*/true);
+                           /*captures_output=*/true,
+                           std::move(prefill_remap));
   }
 
   static DsaTopkTransfer prepare_mtp_step(
@@ -70,6 +116,11 @@ class DsaTopkTransfer final {
     return localized_input_.has_value() ? &localized_input_.value() : nullptr;
   }
 
+  const DsaPrefillRemap* prefill_remap_input() const {
+    return prefill_remap_input_.has_value() ? &prefill_remap_input_.value()
+                                            : nullptr;
+  }
+
   bool captures_output() const { return captures_output_; }
 
   void publish_output(DsaTopkState output) {
@@ -85,6 +136,15 @@ class DsaTopkTransfer final {
     CHECK(!localized_output_.has_value())
         << "DSA top-k localized view was already published.";
     localized_output_ = std::move(localized);
+  }
+
+  void publish_prefill_remap(DsaPrefillRemap remap) {
+    CHECK(captures_output_) << "DSA transfer does not capture prefill remap.";
+    CHECK(output_.has_value())
+        << "DSA prefill remap requires a published top-k state.";
+    CHECK(!prefill_remap_output_.has_value())
+        << "DSA prefill remap was already published.";
+    prefill_remap_output_ = std::move(remap);
   }
 
   void complete(
@@ -109,21 +169,30 @@ class DsaTopkTransfer final {
     return localized_output_.has_value() ? &localized_output_.value() : nullptr;
   }
 
+  const DsaPrefillRemap* prefill_remap_output() const {
+    return prefill_remap_output_.has_value() ? &prefill_remap_output_.value()
+                                             : nullptr;
+  }
+
   std::optional<DsaTopkState> mtp_output_state() const { return output_; }
 
  private:
   DsaTopkTransfer(std::optional<DsaTopkState> input,
                   std::optional<DsaTopkState> localized_input,
-                  bool captures_output)
+                  bool captures_output,
+                  std::optional<DsaPrefillRemap> prefill_remap = std::nullopt)
       : input_(std::move(input)),
         localized_input_(std::move(localized_input)),
+        prefill_remap_input_(std::move(prefill_remap)),
         captures_output_(captures_output) {}
 
   std::optional<DsaTopkState> input_;
   std::optional<DsaTopkState> localized_input_;
+  std::optional<DsaPrefillRemap> prefill_remap_input_;
   bool captures_output_ = false;
   std::optional<DsaTopkState> output_;
   std::optional<DsaTopkState> localized_output_;
+  std::optional<DsaPrefillRemap> prefill_remap_output_;
 };
 
 // Owns the forward-scoped producer-to-consumer state. The model only resets
@@ -134,6 +203,7 @@ class DsaTopkRelay final {
   void reset() {
     state_.reset();
     localized_state_.reset();
+    prefill_remap_.reset();
   }
 
   std::optional<DsaTopkTransfer> prepare_layer(
@@ -143,7 +213,8 @@ class DsaTopkRelay final {
     if (decision.reuse_topk) {
       CHECK(state_.has_value())
           << "DSA top-k reuse requires a previously published state.";
-      return DsaTopkTransfer::reuse(state_.value(), localized_state_);
+      return DsaTopkTransfer::reuse(
+          state_.value(), localized_state_, prefill_remap_);
     }
     if (decision.output_topk) {
       return DsaTopkTransfer::capture_output();
@@ -154,11 +225,20 @@ class DsaTopkRelay final {
   void finish_layer(const DsaTopkShareDecision& decision,
                     const DsaTopkTransfer& transfer) {
     if (!decision.output_topk) {
+      if (decision.last_shared) {
+        prefill_remap_.reset();
+      }
       return;
     }
     const DsaTopkState* output = transfer.output();
     CHECK(output != nullptr) << "DSA top-k producer did not publish its state.";
     state_ = *output;
+    if (const DsaPrefillRemap* remap = transfer.prefill_remap_output();
+        remap != nullptr) {
+      prefill_remap_ = *remap;
+    } else {
+      prefill_remap_.reset();
+    }
     if (const DsaTopkState* localized = transfer.localized_output();
         localized != nullptr) {
       localized_state_ = *localized;
@@ -170,6 +250,7 @@ class DsaTopkRelay final {
  private:
   std::optional<DsaTopkState> state_;
   std::optional<DsaTopkState> localized_state_;
+  std::optional<DsaPrefillRemap> prefill_remap_;
 };
 
 }  // namespace xllm::layer

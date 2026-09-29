@@ -36,6 +36,7 @@ limitations under the License.
 #include "kernels/mlu/chunk_kda.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
+#include "layers/common/attention_metadata_builder.h"
 #include "tests/core/layers/mlu/tests_utils.h"
 
 namespace xllm::layer {
@@ -311,6 +312,60 @@ TEST(Glm5NextKDATest, PaddedVerifyLayerPreservesStateAndReplays) {
                                 eager_cache.get_ssm_cache(),
                                 0.001,
                                 0.0001));
+  }
+}
+
+TEST(Glm5NextKDATest, IdleDpVerifyPreservesAllCacheSlots) {
+  const torch::NoGradGuard no_grad;
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const auto ints = options.dtype(torch::kInt32);
+  test::MockProcessGroup group(device);
+  ParallelArgs parallel(0, 1, &group);
+  parallel.tp_group_ = &group;
+  torch::manual_seed(20260929);
+  for (const int64_t heads : {8, 16}) {
+    ModelArgs args;
+    args.hidden_size(128)
+        .linear_num_key_heads(heads)
+        .linear_num_value_heads(heads)
+        .linear_key_head_dim(128)
+        .linear_value_head_dim(128)
+        .linear_conv_kernel_dim(4)
+        .rms_norm_eps(1e-6);
+    Glm5NextKDA layer(args, QuantArgs(), parallel, options);
+    for (auto& parameter : layer->named_parameters()) {
+      parameter.value().normal_(0.0, 0.03);
+    }
+    for (const int64_t width : {2, 4, 5}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "heads=" << heads << " width=" << width);
+      const torch::Tensor conv =
+          torch::randn({3, width + 2, 3 * heads * 128}, options);
+      const torch::Tensor ssm = torch::randn({3 * width, heads, 128, 128},
+                                             options.dtype(torch::kFloat32));
+      KVCache cache(LinearAttentionKVCacheTensors{conv.clone(), ssm.clone()});
+      ModelInputParams input;
+      input.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+      input.meta.num_sequences = 0;
+      input.meta.q_max_seq_len = 0;
+      input.is_spec_verify = true;
+      input.embedding.linear_state_ids = {0};
+      input.embedding.linear_state_indices = torch::zeros({1}, ints);
+      input.num_accepted_tokens = torch::ones({1}, ints);
+      const AttentionMetadata metadata = AttentionMetadataBuilder::build(
+          input, /*enable_mla=*/false, /*attn_mask=*/{}, device);
+      ASSERT_TRUE(metadata.is_dummy);
+      ASSERT_EQ(metadata.max_query_len, 1);
+      const torch::Tensor hidden = torch::randn({1, 128}, options);
+      const torch::Tensor output =
+          layer->forward(hidden, metadata, cache, input);
+      EXPECT_TRUE(torch::equal(output, torch::zeros_like(hidden)));
+      EXPECT_TRUE(torch::equal(cache.get_conv_cache(), conv));
+      EXPECT_TRUE(torch::equal(cache.get_ssm_cache(), ssm));
+    }
   }
 }
 

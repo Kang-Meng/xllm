@@ -33,6 +33,7 @@ namespace {
 constexpr int64_t kMaxBlockHv = 32;
 constexpr int64_t kMaxGdnBlockHv = 16;
 constexpr int64_t kMinGdnBlockHv = 2;
+constexpr int64_t kMaxKdaBlockHv = 8;
 constexpr int64_t kMaxBlockN = 4;
 constexpr int64_t kBlockQueryLen = 4;
 constexpr int64_t kSplitBlockV = 64;
@@ -500,9 +501,11 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
     }
   }
   int64_t max_block_hv = kMaxBlockHv / block_n;
-  // Bound GDN head tiles to keep four-token Qwen3.5 updates within MLU NRAM.
-  // Preserve the existing KDA launch configuration.
-  if (!is_kda) {
+  // Bound head tiles for four-token updates within MLU590 NRAM. TP4 and TP2
+  // increase the local KDA head count beyond the optimized eight-head path.
+  if (is_kda) {
+    max_block_hv = std::min(max_block_hv, kMaxKdaBlockHv);
+  } else {
     max_block_hv = std::min(max_block_hv, kMaxGdnBlockHv);
   }
 

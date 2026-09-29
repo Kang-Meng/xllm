@@ -31,6 +31,7 @@ namespace xllm::layer {
 struct DsaTopkShareDecision {
   bool reuse_topk = false;
   bool output_topk = false;
+  bool last_shared = false;
 };
 
 inline bool has_dsa_indexer(const ModelArgs& args) {
@@ -86,6 +87,7 @@ class DsaTopkSharePlan final {
           layer_id + 1 < num_layers &&
           decisions_[static_cast<size_t>(layer_id + 1)].reuse_topk;
       decision.output_topk = !decision.reuse_topk && next_layer_reuses;
+      decision.last_shared = decision.reuse_topk && !next_layer_reuses;
     }
   }
 

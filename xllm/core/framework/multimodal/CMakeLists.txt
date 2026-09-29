@@ -28,6 +28,7 @@ cc_library(
   DEPS
     common
     util
+    :config
     encoder_cache
     :processor_cache
     glog::glog

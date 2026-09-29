@@ -796,7 +796,9 @@ AttentionRunResult run_attention_prefill_once(
     int32_t prefix_len = 0,
     bool build_cp_context = true,
     DsaTopkTransfer* topk_transfer = nullptr,
-    bool enable_indexer = true) {
+    bool enable_indexer = true,
+    std::optional<layer::v32_cp::DeepseekV32CPContext>* cp_ctx_cache =
+        nullptr) {
   ParallelArgs effective_parallel_args = parallel_args;
   effective_parallel_args.cp_size() =
       enable_full_weight_path ? parallel_args.world_size() : 1;
@@ -813,24 +815,32 @@ AttentionRunResult run_attention_prefill_once(
   torch::Tensor local_positions = positions;
   torch::Tensor local_hidden_states = hidden_states;
   if (build_cp_context && enable_full_weight_path && args.index_n_heads() > 0) {
-    ProcessGroup* cp_group = parallel_args.cp_group_ != nullptr
-                                 ? parallel_args.cp_group_
-                                 : parallel_args.process_group_;
-    std::optional<KVShardLayout> kv_shard_layout;
-    if (effective_parallel_args.kv_split_size_effective() > 1) {
-      kv_shard_layout.emplace(KVCacheConfig::get_instance().block_size(),
-                              effective_parallel_args.kv_split_size_effective(),
-                              effective_parallel_args.kv_split_rank());
+    if (cp_ctx_cache != nullptr && cp_ctx_cache->has_value()) {
+      cp_ctx = *cp_ctx_cache;
+    } else {
+      ProcessGroup* cp_group = parallel_args.cp_group_ != nullptr
+                                   ? parallel_args.cp_group_
+                                   : parallel_args.process_group_;
+      std::optional<KVShardLayout> kv_shard_layout;
+      if (effective_parallel_args.kv_split_size_effective() > 1) {
+        kv_shard_layout.emplace(
+            KVCacheConfig::get_instance().block_size(),
+            effective_parallel_args.kv_split_size_effective(),
+            effective_parallel_args.kv_split_rank());
+      }
+      cp_ctx = layer::v32_cp::build_deepseek_v32_cp_context(
+          effective_parallel_args.cp_size(),
+          metadata,
+          batch_forward_type,
+          tokens,
+          cp_group,
+          parallel_args.rank(),
+          parallel_args.world_size(),
+          kv_shard_layout);
+      if (cp_ctx_cache != nullptr) {
+        *cp_ctx_cache = cp_ctx;
+      }
     }
-    cp_ctx = layer::v32_cp::build_deepseek_v32_cp_context(
-        effective_parallel_args.cp_size(),
-        metadata,
-        batch_forward_type,
-        tokens,
-        cp_group,
-        parallel_args.rank(),
-        parallel_args.world_size(),
-        kv_shard_layout);
     if (cp_ctx.has_value()) {
       local_positions =
           layer::v32_cp::reorder_to_local_shard(positions, cp_ctx.value());
@@ -1396,6 +1406,7 @@ int32_t run_prefill_share_child(int32_t rank,
     torch::Tensor positions =
         torch::arange(kSeqLen, options.dtype(torch::kInt32).device(device));
 
+    std::optional<layer::v32_cp::DeepseekV32CPContext> cp_ctx_cache;
     KVCache full_layer_cache = create_decode_kv_cache(model_args, options);
     full_layer_cache.get_k_cache().zero_();
     DsaTopkTransfer full_transfer = DsaTopkTransfer::capture_output();
@@ -1413,7 +1424,9 @@ int32_t run_prefill_share_child(int32_t rank,
                                    BatchForwardType::PREFILL,
                                    /*prefix_len=*/0,
                                    /*build_cp_context=*/use_cp,
-                                   &full_transfer);
+                                   &full_transfer,
+                                   /*enable_indexer=*/true,
+                                   &cp_ctx_cache);
     xllm_device.synchronize_default_stream();
 
     const DsaTopkState* full_topk = full_transfer.output();
@@ -1435,8 +1448,18 @@ int32_t run_prefill_share_child(int32_t rank,
         missing_slot ? torch::full_like(full_topk->block_tables(), kSeqLen + 1)
                      : full_topk->block_tables(),
         full_topk->context_lens());
+    std::optional<DsaPrefillRemap> shared_remap;
+    if (use_cp && !missing_slot) {
+      const DsaPrefillRemap* full_remap = full_transfer.prefill_remap_output();
+      CHECK(full_remap != nullptr);
+      shared_remap.emplace(full_remap->block_table(),
+                           shared_topk.block_tables(),
+                           shared_topk.context_lens(),
+                           cp_ctx_cache->sorted_gathered_slot_mapping_int64,
+                           cp_ctx_cache->sorted_gathered_slot_rows);
+    }
     DsaTopkTransfer shared_transfer =
-        DsaTopkTransfer::reuse_and_capture(shared_topk);
+        DsaTopkTransfer::reuse_and_capture(shared_topk, shared_remap);
     checking_missing_slot = missing_slot;
     AttentionRunResult shared_result =
         run_attention_prefill_once(model_args,
@@ -1453,7 +1476,8 @@ int32_t run_prefill_share_child(int32_t rank,
                                    /*prefix_len=*/0,
                                    /*build_cp_context=*/use_cp,
                                    &shared_transfer,
-                                   /*enable_indexer=*/false);
+                                   /*enable_indexer=*/missing_slot && use_cp,
+                                   &cp_ctx_cache);
     xllm_device.synchronize_default_stream();
 
     if (missing_slot) {
@@ -1612,7 +1636,40 @@ int32_t run_sparse_prefill_child(int32_t rank,
                                     global_topk.context_lens(), *cp))
                  : global_topk;
           torch::Tensor topk_snapshot = topk.block_tables().clone();
-          DsaTopkTransfer transfer = DsaTopkTransfer::reuse_and_capture(topk);
+          std::optional<DsaPrefillRemap> prefill_remap;
+          if (cp.has_value()) {
+            const torch::Tensor& sorted_slots =
+                cp->sorted_gathered_slot_mapping_int64;
+            const torch::Tensor& sorted_rows = cp->sorted_gathered_slot_rows;
+            const torch::Tensor& table = topk.block_tables();
+            const torch::Tensor columns =
+                torch::arange(table.size(1), table.options());
+            const torch::Tensor valid =
+                (columns < topk.context_lens().unsqueeze(1)) & (table >= 0);
+            const torch::Tensor slots = table.to(torch::kInt64).contiguous();
+            const torch::Tensor positions =
+                torch::searchsorted(sorted_slots, slots);
+            const torch::Tensor safe_positions =
+                positions.clamp_max(sorted_slots.numel() - 1);
+            const torch::Tensor matches =
+                (positions < sorted_slots.numel()) &
+                (sorted_slots.index_select(0, safe_positions.flatten())
+                     .view_as(table) == slots);
+            const torch::Tensor checked_positions = torch::where(
+                valid,
+                torch::where(matches, positions, sorted_slots.numel()),
+                0);
+            const torch::Tensor rows =
+                sorted_rows.index_select(0, checked_positions.flatten())
+                    .view_as(table);
+            const torch::Tensor mapped =
+                torch::where(valid, rows, torch::where(table < 0, -1, 0))
+                    .to(table.scalar_type());
+            prefill_remap.emplace(
+                mapped, table, topk.context_lens(), sorted_slots, sorted_rows);
+          }
+          DsaTopkTransfer transfer =
+              DsaTopkTransfer::reuse_and_capture(topk, prefill_remap);
           KVCache cache(KVCacheTensors{
               torch::zeros({sharded ? 8 : 16,
                             1,

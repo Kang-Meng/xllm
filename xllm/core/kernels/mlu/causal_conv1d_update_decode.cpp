@@ -125,7 +125,10 @@ torch::Tensor causal_conv1d_update_decode(
   int32_t stride_o_token = is_varlen ? static_cast<int32_t>(out.stride(0))
                                      : static_cast<int32_t>(out.stride(2));
 
-  int32_t block_n = dim;
+  // TP2 GLM KDA has 12288 channels. Split them into feature tiles so the
+  // speculative four-token update fits MLU590 NRAM during graph capture.
+  constexpr int32_t kMaxBlockN = 4096;
+  int32_t block_n = dim > 2 * kMaxBlockN ? kMaxBlockN : dim;
   constexpr int32_t kBlockB = 1024;
   int32_t num_feature_blocks = (dim + block_n - 1) / block_n;
   // NP2_STATELEN: next power of two >= state_len.

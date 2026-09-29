@@ -18,8 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <nlohmann/json.hpp>
-
-#include "core/framework/config/model_config.h"
+#include <utility>
 
 namespace xllm {
 
@@ -37,12 +36,6 @@ std::unordered_map<std::string, std::string> parse_headers_json(
     LOG(ERROR) << "Failed to parse mm_download_headers JSON: " << e.what();
   }
   return result;
-}
-
-std::unordered_map<std::string, std::string> parse_global_headers() {
-  static const std::unordered_map<std::string, std::string> cached =
-      parse_headers_json(ModelConfig::get_instance().mm_download_headers());
-  return cached;
 }
 
 bool HttpDownloader::fetch_data(
@@ -74,6 +67,10 @@ bool HttpDownloader::parse_url(const std::string& url, std::string& host) {
   host = url.substr(host_start, pos - host_start);
   return true;
 }
+
+BRpcDownloader::BRpcDownloader(
+    std::unordered_map<std::string, std::string> default_headers)
+    : default_headers_(std::move(default_headers)) {}
 
 std::shared_ptr<brpc::Channel> BRpcDownloader::get_channel(
     const std::string& host) {
@@ -113,11 +110,11 @@ bool BRpcDownloader::download(
     const std::unordered_map<std::string, std::string>& headers) {
   brpc::Controller cntl;
   cntl.http_request().uri() = url;
-  // 1) global defaults (lowest priority)
-  for (const auto& [k, v] : parse_global_headers()) {
+  // 1) default headers (lowest priority)
+  for (const auto& [k, v] : default_headers_) {
     cntl.http_request().SetHeader(k, v);
   }
-  // 2) per-request headers (override global)
+  // 2) per-request headers (override defaults)
   for (const auto& [k, v] : headers) {
     cntl.http_request().SetHeader(k, v);
   }

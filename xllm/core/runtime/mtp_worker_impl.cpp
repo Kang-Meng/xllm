@@ -1334,10 +1334,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
         eplb::expand_decode_token_mask(
             new_input.input_params.expert.eplb_decode_token_mask,
             options_.num_speculative_tokens() + 1);
-    // Idle decode joins the busy ranks' target validate. Mark the same spec
-    // verify flag so every rank captures one expanded graph instead of a
-    // width-1 graph on the dummy row.
+    // Idle decode joins the busy ranks' target validate. Keep its forward type
+    // and spec-verify flag consistent with the busy ranks, while preserving
+    // the zero query length that identifies the dummy row.
     if (use_chunked_prefill_spec_verify_path()) {
+      new_input.input_params.meta.batch_forward_type =
+          BatchForwardType::CHUNKED_PREFILL;
       new_input.input_params.is_spec_verify = true;
     }
     // Deadlock-safety under DP: this rank's shard is empty but all peers

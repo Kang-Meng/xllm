@@ -115,7 +115,12 @@ class DeepseekV2AttentionImpl : public torch::nn::Module {
       const torch::Tensor& k_cache,
       const torch::Tensor& sorted_slots,
       const torch::Tensor& sorted_rows,
-      const AttentionMetadata& metadata) const;
+      const AttentionMetadata& metadata,
+      const torch::Tensor& mapped_blocks = {}) const;
+
+  torch::Tensor remap_prefill_blocks(const torch::Tensor& sorted_slots,
+                                     const torch::Tensor& sorted_rows,
+                                     const AttentionMetadata& metadata) const;
 
   torch::Tensor forward_dcp(const torch::Tensor& positions,
                             const torch::Tensor& hidden_states,

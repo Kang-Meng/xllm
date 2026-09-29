@@ -61,29 +61,18 @@ torch::Tensor finish_tp_query_gather(parallel_state::GatherAsyncCtx ctx) {
 
 }  // namespace
 
-std::pair<KVCache, AttentionMetadata>
-DeepseekV2AttentionImpl::build_prefill_cache(
-    const torch::Tensor& k_input,
-    const torch::Tensor& k_cache,
+torch::Tensor DeepseekV2AttentionImpl::remap_prefill_blocks(
     const torch::Tensor& sorted_slots,
     const torch::Tensor& sorted_rows,
     const AttentionMetadata& metadata) const {
-  const int64_t token_count = k_input.size(0);
+  const int64_t token_count = sorted_slots.numel();
   CHECK_GT(token_count, 0) << "Empty prefill must bypass attention";
-  CHECK_EQ(k_input.dim(), 2);
-  CHECK_EQ(k_cache.dim(), 4);
-  CHECK_EQ(k_cache.size(1), 1);
-  CHECK_EQ(k_cache.size(3), k_input.size(1));
-  CHECK_EQ(sorted_slots.numel(), token_count);
   CHECK_EQ(sorted_rows.numel(), token_count);
   CHECK_EQ(sorted_slots.scalar_type(), torch::kInt64);
   CHECK_EQ(sorted_rows.scalar_type(), torch::kInt64);
   CHECK_EQ(metadata.block_table.dim(), 2);
   CHECK_EQ(metadata.block_table.size(0), metadata.kv_seq_lens.numel());
-  const int64_t block_size = k_cache.size(2);
-  CHECK_GT(block_size, 0);
 
-  AttentionMetadata compact_metadata = metadata;
   const torch::Tensor& topk = metadata.block_table;
   torch::Tensor columns = torch::arange(topk.size(1), topk.options());
   torch::Tensor valid =
@@ -101,9 +90,34 @@ DeepseekV2AttentionImpl::build_prefill_cache(
       torch::where(valid, torch::where(matches, positions, token_count), 0);
   torch::Tensor scratch_rows =
       sorted_rows.index_select(0, checked_positions.flatten()).view_as(topk);
+  return torch::where(valid, scratch_rows, torch::where(topk < 0, -1, 0))
+      .to(topk.scalar_type());
+}
+
+std::pair<KVCache, AttentionMetadata>
+DeepseekV2AttentionImpl::build_prefill_cache(
+    const torch::Tensor& k_input,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& sorted_slots,
+    const torch::Tensor& sorted_rows,
+    const AttentionMetadata& metadata,
+    const torch::Tensor& mapped_blocks) const {
+  const int64_t token_count = k_input.size(0);
+  CHECK_GT(token_count, 0) << "Empty prefill must bypass attention";
+  CHECK_EQ(k_input.dim(), 2);
+  CHECK_EQ(k_cache.dim(), 4);
+  CHECK_EQ(k_cache.size(1), 1);
+  CHECK_EQ(k_cache.size(3), k_input.size(1));
+  CHECK_EQ(sorted_slots.numel(), token_count);
+  CHECK_EQ(sorted_rows.numel(), token_count);
+  const int64_t block_size = k_cache.size(2);
+  CHECK_GT(block_size, 0);
+
+  AttentionMetadata compact_metadata = metadata;
   compact_metadata.block_table =
-      torch::where(valid, scratch_rows, torch::where(topk < 0, -1, 0))
-          .to(topk.scalar_type());
+      mapped_blocks.defined()
+          ? mapped_blocks
+          : remap_prefill_blocks(sorted_slots, sorted_rows, metadata);
 
   torch::Tensor scratch =
       torch::zeros({(token_count + block_size - 1) / block_size,

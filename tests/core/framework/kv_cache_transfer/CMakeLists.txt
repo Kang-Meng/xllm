@@ -48,6 +48,10 @@ cc_test(
     GTest::gtest_main
 )
 
+# Rescan the config/platform/util cycle for util's ModelConfig dependency.
+target_link_libraries(kv_transfer_completion_test PRIVATE
+  "$<LINK_GROUP:RESCAN,config,platform,util>")
+
 cc_test(
   NAME
     reshard_planner_test
@@ -56,6 +60,7 @@ cc_test(
     reshard_planner_test.cpp
   DEPS
     :reshard_planner
+    :kv_cache
     GTest::gtest_main
 )
 

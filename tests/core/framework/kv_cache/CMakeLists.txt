@@ -1,11 +1,17 @@
 include(cc_test)
 
+set(cache_layout_builder_test_sources cache_layout_builder_test.cpp)
+if(USE_NPU OR USE_MLU)
+  list(APPEND cache_layout_builder_test_sources
+    cache_layout_builder_hybrid_mla_test.cpp)
+endif()
+
 cc_test(
   NAME
     cache_layout_builder_test
   CPU_ONLY
   SRCS
-    cache_layout_builder_test.cpp
+    ${cache_layout_builder_test_sources}
   DEPS
     :kv_cache
     GTest::gtest_main

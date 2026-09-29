@@ -227,6 +227,26 @@ TEST(CacheLayoutBuilderTest, DescribesCompositeConvState) {
   EXPECT_EQ(descriptor.spans[0].repeat_count, 5U);
 }
 
+TEST(CacheLayoutBuilderTest, HybridMlaKeepsKPoolTailSequenceScopedReplica) {
+  CacheTensorLayoutContext context;
+  context.enable_mla = true;
+  context.tp_rank = 1;
+  context.tp_size = 2;
+  context.linear_value_head_count = 4;
+  KVCacheTensor tail{KVCacheTensorRole::KPOOL_TAIL,
+                     torch::zeros({3, 2, 8, 4}, torch::kBFloat16),
+                     cache_group_id(BlockType::LINEAR),
+                     /*sequence_scoped=*/true};
+  std::string error;
+  ASSERT_TRUE(describe_cache_tensor(context, &tail, &error)) << error;
+  const auto& descriptor = *tail.shard_descriptor;
+  EXPECT_EQ(descriptor.kind, LogicalShardKind::REPLICATED);
+  EXPECT_EQ(descriptor.resource_scope, CacheResourceScope::SEQUENCE);
+  ASSERT_EQ(descriptor.spans.size(), 1U);
+  EXPECT_EQ(descriptor.spans[0].owner_tp_rank, 0);
+  EXPECT_EQ(descriptor.spans[0].bytes_per_region, 2U * 8U * 4U * 2U);
+}
+
 TEST(KVShardLayoutTest, MapsTokensAndSlots) {
   const int64_t dcp4_lengths[] = {128, 128, 1, 0};
   for (int32_t rank = 0; rank < 4; ++rank) {

@@ -31,6 +31,17 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+// Parse --mm_download_headers once; it is fixed after startup.
+const std::unordered_map<std::string, std::string>& global_download_headers() {
+  static const std::unordered_map<std::string, std::string> headers =
+      parse_headers_json(ModelConfig::get_instance().mm_download_headers());
+  return headers;
+}
+
+}  // namespace
+
 MMErrCode MMHandlerBase::process(const MMContent& content,
                                  MMInputItem& input,
                                  MMPayload& payload) {
@@ -107,8 +118,8 @@ MMErrCode MMHandlerBase::load_from_http(
     const std::string& url,
     std::string& data,
     const std::unordered_map<std::string, std::string>& headers) {
-  BRpcDownloader helper_;
-  if (!helper_.fetch_data(url, data, headers)) {
+  BRpcDownloader downloader(global_download_headers());
+  if (!downloader.fetch_data(url, data, headers)) {
     return MMErrCode::LOAD_HTTP_ERR;
   }
   return MMErrCode::SUCCESS;

@@ -513,11 +513,16 @@ torch::Tensor Glm5NextKDAImpl::forward(const torch::Tensor& hidden_states,
   torch::Tensor conv_cache = kv_cache.get_conv_cache().transpose(-1, -2);
   torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
   const int64_t checkpoint_stride = get_checkpoint_stride(kv_cache);
+  // An idle DP shard executes one padding token but shares the target's full
+  // speculative cache layout. Keep that physical stride for the kernels;
+  // q_cu_seq_lens still bounds the dummy query to one token.
+  const int64_t verify_width =
+      attn_metadata.is_dummy ? checkpoint_stride : attn_metadata.max_query_len;
   if (input_params.is_spec_verify) {
-    CHECK_EQ(checkpoint_stride, attn_metadata.max_query_len)
+    CHECK_EQ(checkpoint_stride, verify_width)
         << "GLM5-Next KDA Spec Verify checkpoint stride mismatch";
     const int64_t expected_conv_state_len =
-        (attn_metadata.max_query_len - 1) + (conv_kernel_size_ - 1);
+        (verify_width - 1) + (conv_kernel_size_ - 1);
     CHECK_EQ(conv_cache.size(2), expected_conv_state_len)
         << "GLM5-Next KDA Spec Verify conv state length mismatch";
   }
@@ -541,12 +546,12 @@ torch::Tensor Glm5NextKDAImpl::forward(const torch::Tensor& hidden_states,
         /*activation=*/true,
         /*pad_slot_id=*/kPaddingLinearStateId,
         attn_metadata.q_cu_seq_lens,
-        static_cast<int32_t>(attn_metadata.max_query_len),
+        static_cast<int32_t>(verify_width),
         input_params.num_accepted_tokens);
     std::tie(q, k, v) = split_mixed_qkv(mixed_qkv);
 
     torch::Tensor state_indices = build_rebased_ssm_state_indices(
-        logical_state_indices, checkpoint_stride, attn_metadata.max_query_len);
+        logical_state_indices, checkpoint_stride, verify_width);
     // Slot zero is reserved; every checkpoint of a virtual request skips state.
     state_indices.masked_fill_(
         logical_state_indices.eq(kPaddingLinearStateId).unsqueeze(1), 0);

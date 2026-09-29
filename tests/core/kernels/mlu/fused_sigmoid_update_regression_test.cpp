@@ -184,13 +184,15 @@ void expect_sparse_kda_matches_reference(
     const std::vector<int32_t>& accepted_counts,
     bool inplace_final_state,
     bool include_invalid_slots,
-    int64_t checkpoint_capacity = 4) {
+    int64_t checkpoint_capacity = 4,
+    int64_t num_heads = 8,
+    int64_t padded_token_count = 0) {
   ASSERT_EQ(sequence_lengths.size(), accepted_counts.size());
   torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
   torch::manual_seed(20260908);
 
-  constexpr int64_t kNumHeads = 8;
+  const int64_t kNumHeads = num_heads;
   constexpr int64_t kHeadDim = 128;
   constexpr float kGateLowerBound = -5.0f;
   const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
@@ -203,16 +205,20 @@ void expect_sparse_kda_matches_reference(
     offsets.emplace_back(offsets.back() + length);
   }
   const int64_t total_tokens = offsets.back();
+  const int64_t allocated_tokens =
+      padded_token_count > 0 ? padded_token_count : total_tokens;
+  ASSERT_GE(allocated_tokens, total_tokens);
   auto fp32_options =
       torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
   auto bf16_options = fp32_options.dtype(torch::kBFloat16);
   auto int_options = fp32_options.dtype(torch::kInt32);
   auto a_log_cpu = torch::randn({kNumHeads}, fp32_options) * 0.25;
   auto dt_bias_cpu = torch::randn({kNumHeads * kHeadDim}, fp32_options) * 0.1;
-  auto a_cpu = torch::randn({total_tokens, kNumHeads * kHeadDim}, bf16_options);
-  auto b_cpu = torch::randn({total_tokens, kNumHeads}, bf16_options);
+  auto a_cpu =
+      torch::randn({allocated_tokens, kNumHeads * kHeadDim}, bf16_options);
+  auto b_cpu = torch::randn({allocated_tokens, kNumHeads}, bf16_options);
   auto q_cpu =
-      torch::randn({1, total_tokens, kNumHeads, kHeadDim}, bf16_options);
+      torch::randn({1, allocated_tokens, kNumHeads, kHeadDim}, bf16_options);
   auto k_cpu = torch::randn_like(q_cpu);
   auto v_cpu = torch::randn_like(q_cpu);
   auto initial_state_cpu =
@@ -244,13 +250,13 @@ void expect_sparse_kda_matches_reference(
   auto expected_state_cpu =
       inplace_final_state
           ? initial_state_cpu.clone()
-          : torch::empty({total_tokens, kNumHeads, kHeadDim, kHeadDim},
+          : torch::empty({allocated_tokens, kNumHeads, kHeadDim, kHeadDim},
                          fp32_options);
   auto query_cpu = q_cpu.to(torch::kFloat32).select(/*dim=*/0, /*index=*/0);
   auto key_cpu = k_cpu.to(torch::kFloat32).select(/*dim=*/0, /*index=*/0);
   auto value_cpu = v_cpu.to(torch::kFloat32).select(/*dim=*/0, /*index=*/0);
   auto gate_cpu =
-      a_cpu.to(torch::kFloat32).view({total_tokens, kNumHeads, kHeadDim});
+      a_cpu.to(torch::kFloat32).view({allocated_tokens, kNumHeads, kHeadDim});
   auto beta_cpu = b_cpu.to(torch::kFloat32);
   auto bias_cpu = dt_bias_cpu.view({kNumHeads, kHeadDim});
   for (int64_t sequence = 0; sequence < batch_size; ++sequence) {
@@ -388,6 +394,32 @@ TEST(FusedSigmoidUpdateTest,
                                       accepted_counts,
                                       /*inplace_final_state=*/true,
                                       /*include_invalid_slots=*/true);
+}
+
+TEST(FusedSigmoidUpdateTest,
+     SixteenHeadGraphPaddedMtpFitsNramAndMatchesReference) {
+  // Physical [1, 32, 16, 128] tensors retain graph padding while the eight
+  // CU rows include an empty row and a nonempty row with an invalid state.
+  expect_sparse_kda_matches_reference({4, 0, 4, 1, 2, 4, 2, 3},
+                                      {1, 4, 2, 3, 4, 1, 2, 3},
+                                      /*inplace_final_state=*/true,
+                                      /*include_invalid_slots=*/true,
+                                      /*checkpoint_capacity=*/4,
+                                      /*num_heads=*/16,
+                                      /*padded_token_count=*/32);
+}
+
+TEST(FusedSigmoidUpdateTest,
+     ThirtyTwoHeadGraphPaddedMtpFitsNramAndMatchesReference) {
+  // TP2 doubles local heads; the physical graph shape and eight CU rows stay
+  // the same, while the generic KDA kernel must split the head dimension.
+  expect_sparse_kda_matches_reference({4, 0, 4, 1, 2, 4, 2, 3},
+                                      {1, 4, 2, 3, 4, 1, 2, 3},
+                                      /*inplace_final_state=*/true,
+                                      /*include_invalid_slots=*/true,
+                                      /*checkpoint_capacity=*/4,
+                                      /*num_heads=*/32,
+                                      /*padded_token_count=*/32);
 }
 
 TEST(FusedSigmoidUpdateTest, LongCheckpointsSurviveNullWindowBoundaries) {
