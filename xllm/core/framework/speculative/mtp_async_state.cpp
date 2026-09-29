@@ -142,6 +142,25 @@ bool supports_combined_draft_configuration(
   return false;
 }
 
+bool json_object_allows_draft_prelaunch(
+    int32_t dp_size,
+    const std::vector<int32_t>& dp_global_json_object_active,
+    bool has_local_json_object_states) {
+  if (dp_size == 1) {
+    // A single rank owns the whole batch, so its local state decides.
+    return !has_local_json_object_states;
+  }
+  if (dp_size <= 0 ||
+      dp_global_json_object_active.size() != static_cast<size_t>(dp_size)) {
+    return false;
+  }
+  // Only a complete all-zero vector proves the whole DP batch is plain. This
+  // also rejects flags outside {0, 1} without a rank-local fallback.
+  return std::all_of(dp_global_json_object_active.begin(),
+                     dp_global_json_object_active.end(),
+                     [](int32_t active) { return active == 0; });
+}
+
 torch::Tensor materialize_speculative_verify_tokens(
     const torch::Tensor& verify_tokens,
     const std::vector<torch::Tensor>& draft_token_sources) {

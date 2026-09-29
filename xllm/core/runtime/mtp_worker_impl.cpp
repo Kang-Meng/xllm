@@ -2852,6 +2852,27 @@ bool MTPWorkerImpl::can_prelaunch_next_first_draft(
   if (!can_use_combined_first_draft()) {
     return false;
   }
+  // JSON-constrained rows carry host-side grammar bookkeeping that a
+  // prelaunched draft cannot account for: step_decode() consumes the prepared
+  // draft without rebuilding current_draft_input, so the draft token count
+  // would not match the grammar state count. Keep those batches on the in-loop
+  // draft path, which copies the states from this input. The decision must be
+  // identical on every DP rank because the prelaunched draft forward carries
+  // HCCL collectives.
+  if (!mtp_async::json_object_allows_draft_prelaunch(
+          parallel_args_.dp_size(),
+          input.input_params.parallel.dp_global_json_object_active,
+          !input.json_object_states.empty())) {
+    LOG_FIRST_N(WARNING, 4)
+        << "MTP first-draft prelaunch disabled: json_object constrained "
+           "decoding is active for this DP batch; using the in-loop draft "
+           "path."
+        << " dp_size=" << parallel_args_.dp_size()
+        << ", local_json_object_rows=" << input.json_object_states.size()
+        << ", dp_global_json_object_active="
+        << input.input_params.parallel.dp_global_json_object_active;
+    return false;
+  }
   const bool requires_dp_symmetric_prelaunch =
       parallel_args_.dp_size() > 1 &&
       combined_draft_execution_path_ ==

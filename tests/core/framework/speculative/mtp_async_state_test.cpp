@@ -18,7 +18,9 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <utility>
+#include <vector>
 
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/speculative/mtp_execution_policy.h"
@@ -136,6 +138,50 @@ TEST(MtpAsyncStateTest, RestrictsCombinedDraftToValidatedConfigurations) {
       /*dp_size=*/1));
   EXPECT_FALSE(supports_combined_draft_configuration(
       CombinedDraftExecutionPath::UNSUPPORTED, "ATB", /*dp_size=*/1));
+}
+
+TEST(MtpAsyncStateTest, AllowsDraftPrelaunchOnlyForPlainBatches) {
+  const std::vector<int32_t> no_dp_metadata;
+  const std::vector<int32_t> plain_dp_batch = {0, 0};
+
+  // A single DP rank owns the whole batch, so its local grammar state decides.
+  EXPECT_TRUE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/1, no_dp_metadata, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/1, no_dp_metadata, /*has_local_json_object_states=*/true));
+
+  // In DP only a complete all-zero vector permits the prelaunch.
+  EXPECT_TRUE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, plain_dp_batch, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, {0, 1}, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, {1, 0}, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, {1, 1}, /*has_local_json_object_states=*/false));
+}
+
+TEST(MtpAsyncStateTest, RejectsDraftPrelaunchOnMalformedDpMetadata) {
+  // Missing, short, and long metadata is ineligible instead of falling back to
+  // rank-local state, which would desynchronise the collective order.
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, {}, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, {0}, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/3, {0, 0}, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/0, {}, /*has_local_json_object_states=*/false));
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/-1, {}, /*has_local_json_object_states=*/false));
+  // A flag outside {0, 1} is malformed, not constrained.
+  EXPECT_FALSE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, {0, 2}, /*has_local_json_object_states=*/false));
+
+  // The replicated vector is authoritative in DP: a contradictory rank-local
+  // flag must not flip the decision on its own.
+  EXPECT_TRUE(json_object_allows_draft_prelaunch(
+      /*dp_size=*/2, {0, 0}, /*has_local_json_object_states=*/true));
 }
 
 TEST(MtpAsyncStateTest, ExtractsTargetBaseKvLengthsFromVerifyLayouts) {

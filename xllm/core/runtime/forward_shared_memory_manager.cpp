@@ -102,7 +102,14 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
   return reinterpret_cast<std::uintptr_t>(ptr) % kCudaZeroCopyAlignment == 0;
 }
 
+// Descriptors are written and read as a hard-coded ordered field list with no
+// length self-description, so a payload produced by another engine build would
+// silently shift every field after the first divergence instead of failing.
+// Tag the header and reject a mismatch before parsing anything.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000001ULL;
+
 struct RawInputLayoutHeader final {
+  uint64_t format_tag = kRawInputFormatTag;
   uint64_t descriptor_bytes = 0;
   uint64_t tensor_arena_offset = 0;
   uint64_t tensor_arena_bytes = 0;
@@ -2475,16 +2482,27 @@ inline void deserialize_forward_input_payload(
     bool materialize_device_buffer = true,
     bool stabilize_dit_host_tensors = false) {
   const char* payload_base = buffer;
+  // Bound the payload before the first field: read_data() does not check.
+  CHECK_GE(buffer_size, sizeof(RawInputLayoutHeader))
+      << "raw input layout header overflow";
   RawInputLayoutHeader layout;
+  read_data(buffer, layout.format_tag);
+  CHECK_EQ(layout.format_tag, kRawInputFormatTag)
+      << "incompatible raw input format; engine and workers must run the same "
+         "packed input schema";
   read_data(buffer, layout.descriptor_bytes);
   read_data(buffer, layout.tensor_arena_offset);
   read_data(buffer, layout.tensor_arena_bytes);
-  CHECK_GE(buffer_size, sizeof(RawInputLayoutHeader))
-      << "raw input layout header overflow";
+  // Bound each term by subtraction: untrusted header fields must not wrap these
+  // checks before the pointer arithmetic below consumes them.
+  CHECK_LE(layout.descriptor_bytes, buffer_size - sizeof(RawInputLayoutHeader))
+      << "raw input descriptor overflow";
   CHECK_GE(layout.tensor_arena_offset,
            sizeof(RawInputLayoutHeader) + layout.descriptor_bytes)
       << "raw input tensor arena overlaps descriptor";
-  CHECK_LE(layout.tensor_arena_offset + layout.tensor_arena_bytes, buffer_size)
+  CHECK_LE(layout.tensor_arena_offset, buffer_size)
+      << "raw input tensor arena offset overflow";
+  CHECK_LE(layout.tensor_arena_bytes, buffer_size - layout.tensor_arena_offset)
       << "raw input layout overflow";
   CHECK_EQ(layout.tensor_arena_offset % kRawInputTensorArenaAlignment, 0)
       << "raw input tensor arena offset is not aligned";
@@ -2576,6 +2594,7 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.parallel.raw_dp_global_token_nums);
   read_vector(context, input_params.parallel.dp_global_batch_generations);
   read_vector(context, input_params.parallel.dp_global_kv_max_seq_lens);
+  read_vector(context, input_params.parallel.dp_global_json_object_active);
   read_vector(context, input_params.parallel.dp_is_decode);
   read_vector(context, input_params.embedding.embedding_ids);
   read_vector(context, input_params.embedding.linear_state_ids);
@@ -3063,6 +3082,8 @@ inline void serialize_forward_input_sections(
                input_params.parallel.dp_global_batch_generations);
   write_vector(context.descriptor,
                input_params.parallel.dp_global_kv_max_seq_lens);
+  write_vector(context.descriptor,
+               input_params.parallel.dp_global_json_object_active);
   write_vector(context.descriptor, input_params.parallel.dp_is_decode);
   write_vector(context.descriptor, input_params.embedding.embedding_ids);
   write_vector(context.descriptor, input_params.embedding.linear_state_ids);
@@ -3158,14 +3179,17 @@ inline RawInputLayoutHeader calculate_forward_input_layout(
   const uint64_t tensor_arena_offset =
       align_up(sizeof(RawInputLayoutHeader) + context.descriptor.size,
                kRawInputTensorArenaAlignment);
-  return RawInputLayoutHeader{
-      context.descriptor.size, tensor_arena_offset, context.tensor_arena.size};
+  return RawInputLayoutHeader{kRawInputFormatTag,
+                              context.descriptor.size,
+                              tensor_arena_offset,
+                              context.tensor_arena.size};
 }
 
 inline void serialize_forward_input(const ForwardInput& input,
                                     const RawInputLayoutHeader& layout,
                                     char*& buffer) {
   char* payload_base = buffer;
+  write_data(buffer, layout.format_tag);
   write_data(buffer, layout.descriptor_bytes);
   write_data(buffer, layout.tensor_arena_offset);
   write_data(buffer, layout.tensor_arena_bytes);

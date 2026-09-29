@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -423,6 +427,103 @@ TEST(BatchPackedInputTest, PackedProtoLazyToPreservesJsonMetadata) {
             std::vector<std::string>({"req-json#0"}));
   EXPECT_EQ(materialized_input.sample_prior_output_rows,
             std::vector<int32_t>({-1}));
+}
+
+TEST(BatchPackedInputTest, PackedProtoRejectsIncompatibleLayoutHeader) {
+  // The assertions below inspect the CHECK message. Under the default fast
+  // style gtest forks this already multi-threaded test process, and the child
+  // can die before glog flushes, leaving no message to match. The threadsafe
+  // style re-executes the binary in a clean child instead.
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  FLAGS_logtostderr = true;
+
+  // The payload header is consumed as [format_tag][descriptor_bytes]
+  // [tensor_arena_offset][tensor_arena_bytes] with no length self-description,
+  // so a foreign or corrupted header must be rejected before any field is
+  // parsed instead of shifting every later field.
+  constexpr size_t kRawLayoutHeaderBytes = 4 * sizeof(uint64_t);
+
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(4);
+
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 32;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.enable_schedule_overlap = true;
+
+  MMData mm_data;
+  BlockManager::Options options;
+  options.num_blocks(2).block_size(4);
+  BlockManagerImpl manager(options);
+
+  IncrementalDecoder decoder("", 1, false, false);
+  Sequence sequence(/*index=*/0,
+                    /*token_ids=*/{1, 2, 3, 4},
+                    torch::Tensor(),
+                    mm_data,
+                    std::move(decoder),
+                    seq_params);
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+
+  std::vector<Sequence*> sequences = {&sequence};
+  std::vector<uint32_t> allowed_max_tokens = {4};
+  BatchInputBuilder builder(sequences,
+                            allowed_max_tokens,
+                            {},
+                            {},
+                            nullptr,
+                            /*batch_id=*/2,
+                            nullptr,
+                            BatchForwardType::DECODE);
+  ForwardInput input = builder.build_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
+
+  proto::PackedForwardInput packed_input;
+  ASSERT_TRUE(forward_input_to_packed_proto(input, &packed_input));
+  const std::string payload = packed_input.payload();
+  ASSERT_GE(payload.size(), kRawLayoutHeaderBytes);
+
+  // An engine build without the format tag leads with the old descriptor
+  // length instead, which must not be parsed as a matching tag.
+  std::string legacy_payload = payload;
+  std::memcpy(legacy_payload.data(),
+              payload.data() + sizeof(uint64_t),
+              sizeof(uint64_t));
+  proto::PackedForwardInput legacy_input;
+  legacy_input.mutable_payload()->swap(legacy_payload);
+  ForwardInput legacy_lazy;
+  packed_proto_to_forward_input(
+      legacy_input, legacy_lazy, torch::Device(torch::kCPU), nullptr);
+  ForwardInput legacy_unpacked;
+  EXPECT_DEATH(detail::unpack_from_input_host_buffer(
+                   legacy_lazy,
+                   torch::Device(torch::kCPU),
+                   torch::kFloat32,
+                   legacy_unpacked,
+                   /*materialize_device_buffer=*/false),
+               "incompatible raw input format");
+
+  // An untrusted arena length must not wrap the layout bounds check.
+  std::string corrupt_payload = payload;
+  const uint64_t huge_arena_bytes = std::numeric_limits<uint64_t>::max();
+  std::memcpy(corrupt_payload.data() + 3 * sizeof(uint64_t),
+              &huge_arena_bytes,
+              sizeof(huge_arena_bytes));
+  proto::PackedForwardInput corrupt_input;
+  corrupt_input.mutable_payload()->swap(corrupt_payload);
+  ForwardInput corrupt_lazy;
+  packed_proto_to_forward_input(
+      corrupt_input, corrupt_lazy, torch::Device(torch::kCPU), nullptr);
+  ForwardInput corrupt_unpacked;
+  EXPECT_DEATH(detail::unpack_from_input_host_buffer(
+                   corrupt_lazy,
+                   torch::Device(torch::kCPU),
+                   torch::kFloat32,
+                   corrupt_unpacked,
+                   /*materialize_device_buffer=*/false),
+               "raw input layout overflow");
 }
 
 }  // namespace xllm

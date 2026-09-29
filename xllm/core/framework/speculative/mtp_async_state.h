@@ -78,6 +78,20 @@ bool supports_combined_draft_configuration(
     std::string_view npu_backend,
     int32_t dp_size);
 
+// Whether json_object constrained decoding permits the MTP first-draft
+// prelaunch window. The prelaunched draft is sampled before the accepted token
+// is known, so a batch with constrained rows cannot rebuild its grammar
+// accounting in step_decode(); such batches must use the in-loop draft path.
+// A prelaunch is submitted inside HCCL collectives, so the decision must be
+// identical on every DP rank: dp_size==1 uses the rank-local flag, dp_size>1
+// requires the replicated per-shard flags to be complete and all zero.
+// Missing or malformed metadata is ineligible instead of falling back to
+// rank-local state. In-loop MTP drafting is never affected.
+bool json_object_allows_draft_prelaunch(
+    int32_t dp_size,
+    const std::vector<int32_t>& dp_global_json_object_active,
+    bool has_local_json_object_states);
+
 // Materialize proposer-owned token columns into the row-major target verify
 // input. Graph replay normally performs this copy internally; eager fallback
 // must use the same logical tokens before invoking the model.
