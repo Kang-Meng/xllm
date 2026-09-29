@@ -182,10 +182,11 @@ def _create_attention_backend(
 
         dflash2_block_size = int(config.get("dflash2_block_size", 0))
         use_xfia_decode = False
-        if dflash2_block_size > 0:
+        if dflash2_block_size > 0 and bool(config.get("dflash_xfia_enabled", False)):
             import xllm_runtime
 
-            # Share the C++ prelaunch and scheduler hardware predicate.
+            # C++ enable_dflash_proposal_xfia already applied the prelaunch gate.
+            # Confirm the device here so a stale config cannot enable XFIA off A3.
             use_xfia_decode = xllm_runtime.is_ascend_a3()
         return NpuPagedAttentionBackend(
             num_heads=first_attention.num_heads,

@@ -166,6 +166,7 @@ class _StaticAttentionMetadata:
     mega_moe_token_mask: torch.Tensor | None = None
     is_mixed: bool = False
     is_spec_verify: bool = False
+    is_dflash_proposal: bool = False
     is_dummy: bool = False
     # Verify group width baked into this captured graph. 0 means the KDA
     # path derives equal groups from the padded row count.
@@ -1508,6 +1509,7 @@ class DecodeAclGraphRunner(BaseRunner):
         local_expanded = expanded_view is not None
         group_expanded = verify_width > 1 or local_expanded
         entry.static_metadata.is_spec_verify = group_expanded
+        entry.static_metadata.is_dflash_proposal = bool(getattr(metadata, "is_dflash_proposal", False))
         entry.kv_seq_lens_delta = torch.empty(padded_batch_size, dtype=torch.int32, device=device)
         # The graph metadata update writes per-sequence KV lengths into this
         # buffer.  MLA/SFA consumes the same stable buffer as its key lengths.

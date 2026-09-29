@@ -206,7 +206,9 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
     if (::xllm::SpeculativeConfig::is_dflash2_algorithm(
             ::xllm::SpeculativeConfig::get_instance()
                 .speculative_algorithm()) &&
-        is_ascend_a3 && ModelConfig::get_instance().model_impl() == "python" &&
+        is_ascend_a3 &&
+        ModelConfig::is_python_model_impl(
+            ModelConfig::get_instance().model_impl()) &&
         options_.dp_size() == 1 && options_.cp_size() == 1 &&
         (!options_.enable_disagg_pd() ||
          options_.instance_role() == InstanceRole::DECODE) &&

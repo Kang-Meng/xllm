@@ -1054,6 +1054,7 @@ struct ModelInputParams {
     params.linear_state_validity_mask_tensor =
         safe_to(linear_state_validity_mask_tensor, device, true);
     params.is_spec_verify = is_spec_verify;
+    params.is_dflash_proposal = is_dflash_proposal;
     params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
     params.num_accepted_tokens_host = num_accepted_tokens_host;
 #if defined(USE_MUSA)
@@ -1121,7 +1122,8 @@ struct ModelInputParams {
     LOG(INFO) << "ModelInputParams: dp_global_token_nums is "
               << parallel.dp_global_token_nums
               << ", dp_is_decode: " << parallel.dp_is_decode;
-    LOG(INFO) << "ModelInputParams: is_spec_verify is " << is_spec_verify;
+    LOG(INFO) << "ModelInputParams: is_spec_verify is " << is_spec_verify
+              << ", is_dflash_proposal is " << is_dflash_proposal;
     print_tensor(num_accepted_tokens,
                  "ModelInputParams: num_accepted_tokens",
                  /*max_elements=*/4);
@@ -1228,6 +1230,8 @@ struct ModelInputParams {
   torch::Tensor linear_state_validity_mask_tensor;
 
   bool is_spec_verify = false;
+  // DFlash2 draft query is a proposal block, not a target spec-verify.
+  bool is_dflash_proposal = false;
   // Propagated to AttentionMetadata for caller-managed cacheless prefill.
   bool prefill_without_cache = false;
   torch::Tensor num_accepted_tokens;

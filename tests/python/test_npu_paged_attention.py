@@ -289,7 +289,8 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(sliding_window: int) -> No
     metadata = SimpleNamespace(
         is_prefill=False,
         is_chunked_prefill=True,
-        is_spec_verify=True,
+        is_spec_verify=False,
+        is_dflash_proposal=True,
         block_table=table,
         kv_seq_lens=torch.tensor([2055, 2305], dtype=torch.int32),
         slot_mapping=torch.arange(16),
@@ -300,6 +301,42 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(sliding_window: int) -> No
     expected_starts = list(range(8)) + list(range(250, 258)) if sliding_window else [0] * 16
     assert backend._xfia_kv_starts.tolist() == expected_starts
     torch.testing.assert_close(backend._block_table_i32, table.repeat_interleave(8, dim=0))
+
+
+def test_target_spec_verify_chunk_does_not_use_xfia(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = NpuPagedAttentionBackend(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        scale=0.5,
+        sliding_window=2048,
+        is_mla=False,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        use_xfia_decode=True,
+        xfia_query_width=8,
+    )
+    cache = torch.empty(4, 128, 1, 4)
+    backend.bind_kv_caches([LayerCache(key=cache, value=torch.empty_like(cache))])
+    table = torch.arange(4, dtype=torch.int32).reshape(2, 2)
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_spec_verify=True,
+        is_dflash_proposal=False,
+        block_table=table,
+        kv_seq_lens=torch.full((2,), 136, dtype=torch.int32),
+        kv_seq_lens_host_values=[136, 136],
+        q_cu_seq_lens=torch.tensor([0, 8, 16], dtype=torch.int32),
+        slot_mapping=torch.arange(16),
+    )
+
+    def forbid_xfia(*args: object, **kwargs: object) -> None:
+        raise AssertionError("target spec-verify must not use XFIA decode")
+
+    monkeypatch.setattr(backend, "_prepare_xfia_decode", forbid_xfia)
+    backend.prepare(metadata)
+    torch.testing.assert_close(backend._block_table_i32, table)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

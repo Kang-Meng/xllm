@@ -59,6 +59,8 @@ struct SpeculativeRuntimeConfig {
   bool adaptive_enabled = false;
   // Rows per draft sequence. 1 keeps draft graph admission in token units.
   int32_t draft_query_width = 1;
+  // Draft engine may use XFIA for DFlash2 proposal blocks.
+  bool dflash_xfia_enabled = false;
 };
 
 class ModelContext {

@@ -19,9 +19,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
-#include "core/framework/config/model_config.h"
 #if defined(USE_NPU)
-#include "core/kernels/npu/utils.h"
 #include "core/platform/npu/device_capture_lock.h"
 #include "torch_npu/csrc/core/npu/NPUGraph.h"
 #endif
@@ -77,18 +75,8 @@ DFlash2WorkerImpl::DFlash2WorkerImpl(const ParallelArgs& parallel_args,
     : DFlashWorkerImpl(parallel_args, device, options),
       sampling_process_group_(
           speculative_worker::sampling_process_group(parallel_args)) {
-#if defined(USE_NPU)
-  const bool is_ascend_a3 = kernel::npu::is_ascend_a3();
-#else
-  const bool is_ascend_a3 = false;
-#endif
   prelaunch_enabled_ =
-      is_ascend_a3 && ModelConfig::get_instance().model_impl() == "python" &&
-      device.is_privateuseone() && options.enable_schedule_overlap() &&
-      parallel_args.dp_size() == 1 && parallel_args.cp_size() == 1 &&
-      (!options.enable_disagg_pd() ||
-       options.instance_role() == InstanceRole::DECODE) &&
-      !options.enable_adaptive_speculative_decode();
+      enable_dflash_proposal_xfia(parallel_args, device, options);
   prelaunch_graph_enabled_ =
       prelaunch_enabled_ && ExecutionConfig::get_instance().enable_graph();
 }
@@ -129,11 +117,11 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   }
   ForwardInput query_input;
   prepare_query_inputs(input, query_input);
-  // Python attention distinguishes speculative proposal blocks from ordinary
-  // prompt chunks explicitly, even when their token counts happen to match.
-  if (ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl())) {
-    query_input.input_params.is_spec_verify = true;
+  // Proposal blocks share token counts with ordinary chunks. Mark only the
+  // prelaunch mode, where XFIA is enabled, and do not reuse the target
+  // spec-verify flag.
+  if (prelaunch_enabled_) {
+    query_input.input_params.is_dflash_proposal = true;
   }
 
   const int32_t batch_size = input.input_params.meta.num_sequences;
@@ -318,7 +306,7 @@ bool DFlash2WorkerImpl::prepare_draft_prelaunch(const ForwardInput& input) {
   }
   ForwardInput query;
   prepare_query_inputs(future, query);
-  query.input_params.is_spec_verify = true;
+  query.input_params.is_dflash_proposal = true;
   query.skip_sampling_for_logits_only = true;
   query.return_selected_hidden = true;
   prepared_prelaunch_.emplace();

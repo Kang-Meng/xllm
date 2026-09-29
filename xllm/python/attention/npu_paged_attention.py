@@ -55,6 +55,12 @@ from xllm.python.attention.kda_linear_attention import (
     KdaLinearAttentionMixin,
 )
 
+
+def _is_dflash_proposal(metadata: object) -> bool:
+    """DFlash2 proposal blocks are not target spec-verify steps."""
+    return bool(getattr(metadata, "is_dflash_proposal", False))
+
+
 # Ascend FIA sparse_mode values (see CANN aclnnFusedInferAttentionScore docs).
 # 0: no compressed mask; used for single-query decode where no causal mask is
 #    needed.
@@ -426,7 +432,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             not (metadata.is_prefill or metadata.is_chunked_prefill)
             or (
                 metadata.is_chunked_prefill
-                and getattr(metadata, "is_spec_verify", False)
+                and _is_dflash_proposal(metadata)
                 and metadata.block_table is not None
                 and metadata.slot_mapping.numel() == metadata.block_table.shape[0] * self._xfia_query_width
             )
@@ -473,9 +479,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             # (block_size * kv_split_size), not one physical page.  Keep the
             # logical size so graph capture bounds below stay correct when DCP
             # shards the KV cache.
-            self._logical_block_size = int(
-                getattr(metadata, "logical_block_size", 0) or self.page_size
-            )
+            self._logical_block_size = int(getattr(metadata, "logical_block_size", 0) or self.page_size)
 
             real_batch = metadata.block_table.shape[0]
 
@@ -744,7 +748,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if (
                 self._use_xfia_decode
                 and metadata.is_chunked_prefill
-                and getattr(metadata, "is_spec_verify", False)
+                and _is_dflash_proposal(metadata)
                 and metadata.block_table is not None
                 and num_tokens == metadata.block_table.shape[0] * self._xfia_query_width
             ):

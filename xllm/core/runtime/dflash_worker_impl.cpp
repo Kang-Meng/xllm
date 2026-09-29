@@ -29,6 +29,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
@@ -41,6 +42,7 @@ limitations under the License.
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
 #if defined(USE_NPU)
+#include "core/kernels/npu/utils.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/layers/npu_torch/deepseek_sparse_attention.h"
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
@@ -71,7 +73,8 @@ runtime::Options target_options(const runtime::Options& options) {
   return opts;
 }
 
-runtime::Options draft_options(const runtime::Options& options) {
+runtime::Options draft_options(const runtime::Options& options,
+                               bool enable_dflash_xfia) {
   // DSpark sizes its attention window from num_speculative_tokens; other
   // DFlash-style drafts still run one step at a time.
   const bool sample_from_anchor = options.speculative_algorithm() == "DSpark";
@@ -87,6 +90,7 @@ runtime::Options draft_options(const runtime::Options& options) {
       .num_decoding_tokens(1)
       .num_speculative_tokens(draft_num_speculative_tokens)
       .draft_graph_query_width(draft_query_width)
+      .enable_dflash_xfia(enable_dflash_xfia)
       .enable_graph_aux_hidden_states(false);
   return opts;
 }
@@ -295,6 +299,28 @@ std::vector<int64_t> build_accepted_context_rows(
 
 }  // namespace
 
+bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
+                                 const torch::Device& device,
+                                 const runtime::Options& options) {
+  if (!SpeculativeConfig::is_dflash2_algorithm(
+          options.speculative_algorithm())) {
+    return false;
+  }
+#if defined(USE_NPU)
+  const bool is_ascend_a3 = kernel::npu::is_ascend_a3();
+#else
+  const bool is_ascend_a3 = false;
+#endif
+  return is_ascend_a3 &&
+         ModelConfig::is_python_model_impl(
+             ModelConfig::get_instance().model_impl()) &&
+         device.is_privateuseone() && options.enable_schedule_overlap() &&
+         parallel_args.dp_size() == 1 && parallel_args.cp_size() == 1 &&
+         (!options.enable_disagg_pd() ||
+          options.instance_role() == InstanceRole::DECODE) &&
+         !options.enable_adaptive_speculative_decode();
+}
+
 DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                                    const torch::Device& device,
                                    const runtime::Options& options)
@@ -319,7 +345,11 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                      "context parallelism (cp_size > 1).";
             }
             return std::make_unique<LLMWorkerImpl>(
-                parallel_args, device, draft_options(options));
+                parallel_args,
+                device,
+                draft_options(options,
+                              enable_dflash_proposal_xfia(
+                                  parallel_args, device, options)));
           }) {
   speculative_position_labels_.reserve(
       static_cast<size_t>(options.num_speculative_tokens()));
@@ -490,8 +520,11 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
 
 std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
   CHECK(impl_ != nullptr);
-  return estimate_kv_cache_capacity_with_draft(target_options(options_),
-                                               draft_options(options_));
+  return estimate_kv_cache_capacity_with_draft(
+      target_options(options_),
+      draft_options(options_,
+                    enable_dflash_proposal_xfia(
+                        parallel_args_, device_.unwrap(), options_)));
 }
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(

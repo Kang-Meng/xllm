@@ -175,6 +175,8 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly("is_mixed", &PyAttentionMetadataView::is_mixed)
       .def_property_readonly("is_spec_verify",
                              &PyAttentionMetadataView::is_spec_verify)
+      .def_property_readonly("is_dflash_proposal",
+                             &PyAttentionMetadataView::is_dflash_proposal)
       .def_property_readonly("is_dummy", &PyAttentionMetadataView::is_dummy);
 }
 
@@ -526,6 +528,10 @@ bool PyAttentionMetadataView::is_mixed() const { return metadata_->is_mixed; }
 
 bool PyAttentionMetadataView::is_spec_verify() const {
   return metadata_->is_spec_verify;
+}
+
+bool PyAttentionMetadataView::is_dflash_proposal() const {
+  return metadata_->is_dflash_proposal;
 }
 
 bool PyAttentionMetadataView::is_dummy() const { return metadata_->is_dummy; }

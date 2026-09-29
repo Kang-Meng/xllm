@@ -412,6 +412,7 @@ py::dict PyCausalLM::build_config_dict(
       speculative_runtime_config.adaptive_enabled;
   d["is_draft_engine"] = speculative_runtime_config.is_draft_engine;
   d["draft_query_width"] = speculative_runtime_config.draft_query_width;
+  d["dflash_xfia_enabled"] = speculative_runtime_config.dflash_xfia_enabled;
   // cp_size is a reflected ParallelArgs PROPERTY (already in d), but cp_rank is
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;

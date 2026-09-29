@@ -104,6 +104,10 @@ struct Options {
   // admission. 1 means the rows are already one per sequence.
   PROPERTY(int32_t, draft_graph_query_width) = 1;
 
+  // DFlash2 proposal attention (XFIA) is enabled only for the prelaunch mode:
+  // A3, Python, DP/CP 1, schedule overlap, and the same PD/adaptive limits.
+  PROPERTY(bool, enable_dflash_xfia) = false;
+
   PROPERTY(int32_t, world_size) = 1;
 
   // task type, support 'generate' and 'embed' currently
