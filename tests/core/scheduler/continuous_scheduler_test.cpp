@@ -493,15 +493,15 @@ class BlockedOverlapScheduler final : public ContinuousScheduler {
 
 }  // namespace
 
-TEST(EnginePrefixCacheTest, DecodeLinearDisablesAllPrefixesAndKeepsReceiving) {
+TEST(EnginePrefixCacheTest, DecodeLinearKeepsKvPrefixesAndReceiving) {
   ScopedConfigValue<bool> global_prefix_cache(
       KVCacheConfig::get_instance().enable_prefix_cache(), true);
   ScopedConfigValue<bool> xtensor(
       KVCacheConfig::get_instance().enable_xtensor(), false);
   FakeEngine engine(32, 4, true, true, InstanceRole::DECODE);
   BlockManagerPool* pool = engine.block_manager_pool();
-  EXPECT_FALSE(pool->options().enable_prefix_cache());
-  EXPECT_FALSE(KVCacheConfig::get_instance().enable_prefix_cache());
+  EXPECT_TRUE(pool->options().enable_prefix_cache());
+  EXPECT_TRUE(KVCacheConfig::get_instance().enable_prefix_cache());
   const std::vector<size_t> initial_free_blocks = pool->num_free_blocks();
 
   const std::vector<int32_t> prompt{1, 2, 3, 4, 5, 6, 7, 8};
@@ -515,31 +515,33 @@ TEST(EnginePrefixCacheTest, DecodeLinearDisablesAllPrefixesAndKeepsReceiving) {
   ASSERT_GE(received_state, 0);
   pool->cache(first_sequence, prompt.size());
   pool->cache(first_sequence);
-  EXPECT_EQ(pool->num_blocks_in_prefix_cache(), std::vector<size_t>{0});
+  EXPECT_GT(pool->num_blocks_in_prefix_cache().front(), 0u);
 
   auto second_request = generate_request_with_prompt_tokens(prompt, 4, 32);
   Sequence* second_sequence = second_request->sequences().front().get();
   pool->allocate_shared(second_sequence);
-  EXPECT_FALSE(second_sequence->has_any_blocks());
-  EXPECT_EQ(second_sequence->kv_cache_tokens_num(), 0u);
+  EXPECT_TRUE(second_sequence->has_any_blocks());
+  EXPECT_GT(second_sequence->kv_cache_tokens_num(), 0u);
   ASSERT_TRUE(pool->try_allocate(second_sequence));
-  EXPECT_EQ(second_sequence->kv_state().shared_tokens_num(), 0u);
-  EXPECT_NE(second_sequence->kv_state().blocks(BlockType::KV).front().id(),
+  EXPECT_GT(second_sequence->kv_state().shared_tokens_num(), 0u);
+  EXPECT_EQ(second_sequence->kv_state().blocks(BlockType::KV).front().id(),
             first_sequence->kv_state().blocks(BlockType::KV).front().id());
   EXPECT_NE(second_sequence->get_linear_state_slot_id(), received_state);
 
   pool->deallocate(first_sequence);
   pool->deallocate(second_sequence);
-  EXPECT_EQ(pool->num_free_blocks(), initial_free_blocks);
-  EXPECT_EQ(pool->num_blocks_in_prefix_cache(), std::vector<size_t>{0});
+  EXPECT_EQ(pool->num_free_blocks(),
+            std::vector<size_t>{initial_free_blocks.front() - 2});
+  EXPECT_GT(pool->num_blocks_in_prefix_cache().front(), 0u);
   EXPECT_TRUE(first_sequence->is_prefill_stage());
   pool->allocate_shared(first_sequence);
-  EXPECT_FALSE(first_sequence->has_any_blocks());
-  EXPECT_EQ(first_sequence->kv_cache_tokens_num(), 0u);
+  EXPECT_TRUE(first_sequence->has_any_blocks());
+  EXPECT_GT(first_sequence->kv_cache_tokens_num(), 0u);
   ASSERT_TRUE(pool->allocate(first_sequence, 4));
-  EXPECT_EQ(first_sequence->kv_state().shared_tokens_num(), 0u);
+  EXPECT_GT(first_sequence->kv_state().shared_tokens_num(), 0u);
   pool->deallocate(first_sequence);
-  EXPECT_EQ(pool->num_free_blocks(), initial_free_blocks);
+  EXPECT_EQ(pool->num_free_blocks(),
+            std::vector<size_t>{initial_free_blocks.front() - 2});
 }
 
 TEST(EnginePrefixCacheTest, LinearPrefillAndMixedRolesKeepRequestedSetting) {
@@ -559,7 +561,7 @@ TEST(EnginePrefixCacheTest, LinearPrefillAndMixedRolesKeepRequestedSetting) {
   }
 }
 
-TEST(EnginePrefixCacheTest, ImplicitLinearLayersDisableDecodePrefixCache) {
+TEST(EnginePrefixCacheTest, ImplicitLinearLayersKeepDecodePrefixCache) {
   ScopedConfigValue<bool> xtensor(
       KVCacheConfig::get_instance().enable_xtensor(), false);
   FakeEngine engine(32, 4);
@@ -569,8 +571,8 @@ TEST(EnginePrefixCacheTest, ImplicitLinearLayersDisableDecodePrefixCache) {
   runtime::Options options;
   options.enable_prefix_cache(true).instance_role(InstanceRole::DECODE);
   engine.configure_prefix_cache(options);
-  EXPECT_FALSE(options.enable_prefix_cache());
-  EXPECT_FALSE(KVCacheConfig::get_instance().enable_prefix_cache());
+  EXPECT_TRUE(options.enable_prefix_cache());
+  EXPECT_TRUE(KVCacheConfig::get_instance().enable_prefix_cache());
 }
 
 TEST(EnginePrefixCacheTest, FullAttentionDecodeKeepsRequestedSetting) {
@@ -619,7 +621,7 @@ TEST(EnginePrefixCacheTest, DraftPrefixCacheDoesNotChangeGlobalConfig) {
       options.enable_prefix_cache(true).is_draft_engine(true).instance_role(
           role);
       engine.configure_prefix_cache(options);
-      EXPECT_EQ(options.enable_prefix_cache(), role != InstanceRole::DECODE);
+      EXPECT_TRUE(options.enable_prefix_cache());
       EXPECT_EQ(KVCacheConfig::get_instance().enable_prefix_cache(),
                 global_enabled);
     }
@@ -690,7 +692,7 @@ TEST(EnginePrefixCacheTest, MtpDraftKeepsSharedCacheLayoutConfiguration) {
   EXPECT_TRUE(target_options.enable_prefix_cache());
 }
 
-TEST(EnginePrefixCacheTest, DecodeLinearRejectsHostPrefixCacheAndStore) {
+TEST(EnginePrefixCacheTest, DecodeLinearSupportsHostPrefixCacheAndStore) {
   ScopedConfigValue<bool> xtensor(
       KVCacheConfig::get_instance().enable_xtensor(), false);
   FakeEngine engine(32, 4, true, true, InstanceRole::DECODE);
@@ -708,9 +710,7 @@ TEST(EnginePrefixCacheTest, DecodeLinearRejectsHostPrefixCacheAndStore) {
     options.enable_kvcache_store = enable_store;
     const std::optional<std::string> error =
         validate_host_cache_options(options);
-    ASSERT_TRUE(error.has_value());
-    EXPECT_NE(error->find("prefix caching is disabled for this engine"),
-              std::string::npos);
+    EXPECT_FALSE(error.has_value()) << error.value_or("");
   }
 }
 
@@ -734,7 +734,7 @@ TEST(ContinuousSchedulerTest, InBatchPrefixCacheUsesGlobalConfig) {
   }
 }
 
-TEST(ContinuousSchedulerTest, DecodeLinearDisablesInBatchPrefixReuse) {
+TEST(ContinuousSchedulerTest, DecodeLinearEnablesInBatchPrefixReuse) {
   ScopedConfigValue<bool> global_prefix_cache(
       KVCacheConfig::get_instance().enable_prefix_cache(), true);
   ScopedConfigValue<bool> in_batch_prefix_cache(
@@ -746,7 +746,7 @@ TEST(ContinuousSchedulerTest, DecodeLinearDisablesInBatchPrefixReuse) {
       create_scheduler_options(16, 4, 0, 4, 1);
   options.instance_role(InstanceRole::DECODE).enable_disagg_pd(true);
   TestContinuousScheduler scheduler(&engine, options);
-  EXPECT_FALSE(scheduler.in_batch_prefix_cache_enabled());
+  EXPECT_TRUE(scheduler.in_batch_prefix_cache_enabled());
 
   const std::vector<int32_t> prompt{1, 2, 3, 4, 5, 6, 7, 8};
   auto first_request = generate_request_with_prompt_tokens(prompt, 4, 32);
@@ -759,11 +759,11 @@ TEST(ContinuousSchedulerTest, DecodeLinearDisablesInBatchPrefixReuse) {
   Sequence* first_sequence = first_request->sequences().front().get();
   Sequence* second_sequence = second_request->sequences().front().get();
   EXPECT_EQ(first_sequence->kv_state().shared_tokens_num(), 0u);
-  EXPECT_EQ(second_sequence->kv_state().shared_tokens_num(), 0u);
-  EXPECT_NE(second_sequence->kv_state().blocks(BlockType::KV).front().id(),
+  EXPECT_GT(second_sequence->kv_state().shared_tokens_num(), 0u);
+  EXPECT_EQ(second_sequence->kv_state().blocks(BlockType::KV).front().id(),
             first_sequence->kv_state().blocks(BlockType::KV).front().id());
   EXPECT_EQ(engine.block_manager_pool()->num_blocks_in_prefix_cache(),
-            std::vector<size_t>{0});
+            std::vector<size_t>{2});
 }
 
 TEST(ContinuousSchedulerTest, DrainsInflightBatchBeforeRetryingBlockedQueue) {

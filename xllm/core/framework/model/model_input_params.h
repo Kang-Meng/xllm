@@ -696,7 +696,8 @@ struct BlockTransferInfo {
   int32_t dst_block_id = -1;
   uint8_t hash_key[XXH3_128BITS_HASH_VALUE_LEN];
   BlockType block_type = BlockType::KV;
-  TransferType transfer_type;
+  TransferType transfer_type = TransferType::G2H;
+  size_t checkpoint_row = 0;
 
   BlockTransferInfo(int32_t src_block_id, int32_t dst_block_id) {
     this->src_block_id = src_block_id;
@@ -719,7 +720,8 @@ struct BlockTransferInfo {
       : src_block_id(other.src_block_id),
         dst_block_id(other.dst_block_id),
         block_type(other.block_type),
-        transfer_type(other.transfer_type) {
+        transfer_type(other.transfer_type),
+        checkpoint_row(other.checkpoint_row) {
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
   }
 
@@ -727,7 +729,8 @@ struct BlockTransferInfo {
       : src_block_id(other.src_block_id),
         dst_block_id(other.dst_block_id),
         block_type(other.block_type),
-        transfer_type(other.transfer_type) {
+        transfer_type(other.transfer_type),
+        checkpoint_row(other.checkpoint_row) {
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
 
     other.src_block_id = -1;
@@ -739,6 +742,7 @@ struct BlockTransferInfo {
     dst_block_id = other.dst_block_id;
     block_type = other.block_type;
     transfer_type = other.transfer_type;
+    checkpoint_row = other.checkpoint_row;
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
     return *this;
   }
@@ -748,6 +752,7 @@ struct BlockTransferInfo {
     dst_block_id = other.dst_block_id;
     block_type = other.block_type;
     transfer_type = other.transfer_type;
+    checkpoint_row = other.checkpoint_row;
     memcpy(hash_key, other.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
 
     other.src_block_id = -1;

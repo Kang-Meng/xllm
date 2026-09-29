@@ -22,15 +22,24 @@ limitations under the License.
 #include <map>
 #include <vector>
 
-#include "framework/kv_cache/kv_cache_tensor_role.h"
+#include "framework/block/block.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 
 namespace xllm {
+
+class KVCache;
 
 struct HostKVLayerLayout {
   int64_t absolute_layer_id = -1;
   int64_t group_layer_slot = -1;
   std::map<KVCacheTensorRole::Value, torch::Tensor> device_roles;
+  const KVCache* device_cache = nullptr;
+  BlockType block_type = BlockType::KV;
 };
+
+// Non-LINEAR caches ignore checkpoint_row and return their canonical tensors.
+BlockTypeTensorMap get_device_transfer_tensors(const HostKVLayerLayout& layer,
+                                               size_t checkpoint_row);
 
 struct HostKVGroupLayout {
   int32_t group_id = -1;
@@ -42,6 +51,7 @@ struct HostKVMapping {
   int32_t group_id = -1;
   int64_t host_block_id = -1;
   int64_t device_block_id = -1;
+  size_t checkpoint_row = 0;
 };
 
 struct HostKVRequest {

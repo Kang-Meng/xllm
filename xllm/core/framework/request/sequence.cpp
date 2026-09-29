@@ -328,6 +328,7 @@ Sequence::Sequence(const Sequence& other, size_t index)
       host_cache_copy_units_(other.host_cache_copy_units_),
       last_confirmed_cached_tokens_num_(
           other.last_confirmed_cached_tokens_num_),
+      accepted_length_(other.accepted_length_),
       latest_generate_time_(other.latest_generate_time_),
       time_to_first_token_latency_seconds_(
           other.time_to_first_token_latency_seconds_),
@@ -531,6 +532,12 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   if (error_status().has_value()) {
     return;
   }
+  // A preempted sequence can still receive the previous overlap result after
+  // its KV state was reset. The target token at offset zero remains valid
+  // output, but additional MTP tokens have no committed recurrent state.
+  if (token_offset > 0 && kv_state_.current_max_tokens_capacity() == 0) {
+    return;
+  }
   const int32_t token_id = static_cast<int32_t>(token.id);
   if (!try_commit_json_object_token(token_id,
                                     static_cast<int64_t>(token_offset))) {
@@ -542,14 +549,6 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
 
   // for mtp, currently only support multi-nodes task.
   if (token_offset > 0) {
-    // Skip MTP token processing if sequence has no KV cache blocks.
-    // This happens when the sequence was preempted during schedule_request(),
-    // causing its KV cache to be deallocated (reset), but it's still in
-    // last_batch_ being processed by update_last_step_result().
-    // Composite KV managers can have capacity without exposing local blocks.
-    if (kv_state_.current_max_tokens_capacity() == 0) {
-      return;
-    }
     kv_state_.incr_kv_cache_tokens_num(1);
     num_tokens_++;
     // when enable speculative decoding, fake token id will be covered.
@@ -583,6 +582,7 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
         sequence_params_.sampling_param->top_logprobs);
   }
   ++cur_generated_token_idx_;
+  set_accepted_length(token_offset);
   finish_status_invalidated_ = true;
   updated_since_last_beam_search_ = true;
 }
@@ -968,6 +968,7 @@ void Sequence::reset() {
   host_kv_state_.reset();
   clear_host_cache_match();
   set_last_confirmed_cached_tokens_num(0);
+  accepted_length_ = 0;
   volatile_num_prompt_tokens_ = num_tokens_;
 }
 

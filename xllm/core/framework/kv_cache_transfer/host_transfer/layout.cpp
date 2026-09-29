@@ -21,6 +21,8 @@ limitations under the License.
 #include <limits>
 #include <set>
 
+#include "framework/kv_cache/kv_cache.h"
+
 namespace xllm {
 namespace {
 
@@ -113,6 +115,20 @@ void validate_role(const torch::Tensor& host_tensor,
 }
 
 }  // namespace
+
+BlockTypeTensorMap get_device_transfer_tensors(const HostKVLayerLayout& layer,
+                                               size_t checkpoint_row) {
+  if (layer.device_cache == nullptr) {
+    return layer.device_roles;
+  }
+
+  BlockTypeTensorMap transfer_tensors =
+      layer.device_cache->get_block_type_tensors(layer.block_type,
+                                                 checkpoint_row);
+  CHECK(!transfer_tensors.empty())
+      << "device cache is missing the active transfer roles.";
+  return transfer_tensors;
+}
 
 HostKVLayout::HostKVLayout(int64_t num_layers,
                            std::vector<HostKVGroupLayout> groups,

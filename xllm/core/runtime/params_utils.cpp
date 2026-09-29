@@ -422,6 +422,8 @@ uint64_t proto_to_block_transfer_info(
         TransferType(pb_block_transfer_info.transfer_type()),
         static_cast<BlockType>(
             pb_block_transfer_info.transfer_infos(i).block_type()));
+    block_transfer_info.back().checkpoint_row =
+        pb_block_transfer_info.transfer_infos(i).checkpoint_row();
   }
 
   return pb_block_transfer_info.batch_id();
@@ -448,6 +450,7 @@ bool block_transfer_info_to_proto(
     pb_cache.set_hash_key(info.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
     pb_cache.set_block_type(
         static_cast<proto::BlockType>(static_cast<int8_t>(info.block_type)));
+    pb_cache.set_checkpoint_row(info.checkpoint_row);
 
     *pb_block_transfer_info->mutable_transfer_infos()->Add() =
         std::move(pb_cache);
@@ -482,6 +485,7 @@ bool storage_prefetch_request_to_proto(const StoragePrefetchRequest& request,
     proto_info->set_hash_key(info.hash_key, XXH3_128BITS_HASH_VALUE_LEN);
     proto_info->set_block_type(
         static_cast<proto::BlockType>(static_cast<int8_t>(info.block_type)));
+    proto_info->set_checkpoint_row(info.checkpoint_row);
   };
   proto_request->mutable_units()->Reserve(request.units.size());
   for (const PrefetchUnit& unit : request.units) {
@@ -516,6 +520,7 @@ bool proto_to_storage_prefetch_request(
         reinterpret_cast<const uint8_t*>(proto_info.hash_key().data()),
         TransferType::G2H,
         static_cast<BlockType>(proto_info.block_type()));
+    info->checkpoint_row = proto_info.checkpoint_row();
     return true;
   };
   request->units.reserve(proto_request.units_size());

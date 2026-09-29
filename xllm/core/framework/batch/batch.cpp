@@ -947,6 +947,9 @@ void Batch::append_token_for_sequence(Sequence* seq,
     if (seq->error_status().has_value()) {
       return;
     }
+    if (token.id >= 0) {
+      seq->set_accepted_length(static_cast<size_t>(token_idx));
+    }
     if (::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
       seq->pre_scheduled_step_prefill_queue().push(false);
       // if not replace_fake_token, pop out here to avoid endless growth

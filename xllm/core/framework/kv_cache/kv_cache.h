@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -71,6 +72,8 @@ class KVCache final {
   torch::Tensor get_compress_state() const;
   torch::Tensor get_compress_index_state() const;
   BlockTypeTensorMap get_block_type_tensors(BlockType type) const;
+  BlockTypeTensorMap get_block_type_tensors(BlockType type,
+                                            size_t checkpoint_row) const;
   std::vector<std::vector<int64_t>> get_shapes();
 
   bool empty() const;

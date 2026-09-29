@@ -176,7 +176,8 @@ CompositeBlockManager::LeafMap build_composite_leaves(
                     chunk_stride,
                     linear_prefix_cache,
                     is_decode,
-                    options.num_speculative_tokens()),
+                    options.num_speculative_tokens(),
+                    is_decode && options.preserve_decode_checkpoint()),
                 options),
             /*participates_in_admission=*/false,
             /*supports_prefix_cache=*/linear_prefix_cache});
@@ -550,6 +551,12 @@ CompositeBlockManager::probe_prefix_cache(Sequence* seq,
   }
   probes.reserve(leaves.size());
   for (const auto& [type, entry] : leaves) {
+    // LINEAR state is a rolling decode window. Decode/fused-decode must use
+    // the live slot selected by the recurrent kernel; only prefill probes the
+    // LINEAR prefix cache.
+    if (type == BlockType::LINEAR && seq->stage() == SequenceStage::DECODE) {
+      continue;
+    }
     if (!entry.supports_prefix_cache || entry.leaf == nullptr) {
       continue;
     }

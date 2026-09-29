@@ -330,6 +330,12 @@ BlockTypeTensorMap KVCache::get_block_type_tensors(BlockType type) const {
   return impl_->get_block_type_tensors(type);
 }
 
+BlockTypeTensorMap KVCache::get_block_type_tensors(
+    BlockType type,
+    size_t checkpoint_row) const {
+  return impl_->get_block_type_tensors(type, checkpoint_row);
+}
+
 torch::Tensor KVCache::get_compress_kv_state() const {
   return impl_->get_compress_kv_state();
 }

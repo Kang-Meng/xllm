@@ -63,6 +63,51 @@ TEST(PackCacheBlocksTest, GathersPairsWithoutChangingSurroundingStorage) {
                            torch::full({2, 2}, -9, torch::kInt32)));
 }
 
+TEST(PackCacheBlocksTest, GathersLinearCheckpointViews) {
+  const torch::Device device = mlu_device();
+  const torch::DeviceGuard guard(device);
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  constexpr int64_t kBlockCount = 2;
+  constexpr int64_t kCheckpointStride = 4;
+  const torch::Tensor block_ids = torch::tensor(
+      {1, 0}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  const torch::Tensor conv_physical =
+      torch::arange(/*end=*/24, options).view({kBlockCount, 6, 2});
+  const torch::Tensor ssm_physical =
+      torch::arange(/*end=*/16, options)
+          .view({kBlockCount * kCheckpointStride, 2});
+  const torch::Tensor conv_source =
+      conv_physical.narrow(/*dim=*/1, /*start=*/2, /*length=*/3);
+  const torch::Tensor ssm_source =
+      ssm_physical.view({kBlockCount, kCheckpointStride, 2})
+          .narrow(/*dim=*/1, /*start=*/2, /*length=*/1);
+  ASSERT_FALSE(conv_source.is_contiguous());
+  ASSERT_FALSE(ssm_source.is_contiguous());
+
+  torch::Tensor conv_storage = torch::full({4, 3, 2}, -7, options);
+  torch::Tensor ssm_storage = torch::full({4, 1, 2}, -9, options);
+  torch::Tensor conv_destination = conv_storage.narrow(0, 1, 2);
+  torch::Tensor ssm_destination = ssm_storage.narrow(0, 1, 2);
+
+  pack_cache_blocks({conv_source, ssm_source},
+                    block_ids,
+                    {conv_destination, ssm_destination});
+
+  EXPECT_TRUE(torch::equal(conv_destination.cpu(),
+                           conv_source.index_select(0, block_ids).cpu()));
+  EXPECT_TRUE(torch::equal(ssm_destination.cpu(),
+                           ssm_source.index_select(0, block_ids).cpu()));
+  EXPECT_TRUE(torch::equal(conv_storage[0].cpu(),
+                           torch::full({3, 2}, -7, torch::kFloat32)));
+  EXPECT_TRUE(torch::equal(conv_storage[3].cpu(),
+                           torch::full({3, 2}, -7, torch::kFloat32)));
+  EXPECT_TRUE(torch::equal(ssm_storage[0].cpu(),
+                           torch::full({1, 2}, -9, torch::kFloat32)));
+  EXPECT_TRUE(torch::equal(ssm_storage[3].cpu(),
+                           torch::full({1, 2}, -9, torch::kFloat32)));
+}
+
 TEST(PackCacheBlocksDeathTest, RejectsMismatchedPairCounts) {
   EXPECT_DEATH(pack_cache_blocks({}, torch::Tensor(), {torch::Tensor()}),
                "Check failed: sources.size\\(\\) == destinations.size\\(\\)");

@@ -87,6 +87,9 @@ class BlockManager {
     // for the unified slot pool. Both are ignored unless linear state is on.
     PROPERTY(bool, enable_linear_state) = false;
     PROPERTY(int32_t, linear_state_num_slots) = 0;
+    // Keep a completed Decode LINEAR checkpoint until the hierarchy pool can
+    // pair it with a Host LINEAR destination.
+    PROPERTY(bool, preserve_decode_checkpoint) = false;
     // Number of speculative tokens for MTP decode (passed from
     // runtime::Options). Used by CompositeBlockManager to adjust SWA block
     // release accounting.

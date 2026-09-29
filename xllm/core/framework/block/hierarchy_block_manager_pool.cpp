@@ -419,6 +419,13 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
           .enable_disagg_pd(options_.enable_disagg_pd())
           .enable_kvcache_store(options_.enable_kvcache_store())
           .enable_host_offload(options_.enable_host_offload());
+      if (type == BlockType::LINEAR && host_options.instance_is_decode() &&
+          options_.enable_host_offload()) {
+        // Decode HBM deliberately does not probe LINEAR prefix cache. The
+        // Host copy is still a restore source after Decode preemption, so it
+        // must publish and match independently of the device leaf setting.
+        host_options.enable_prefix_cache(true);
+      }
 
       std::unique_ptr<BlockManager> leaf;
       if (type == BlockType::SWA) {
@@ -429,7 +436,9 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
             host_options.block_size(),
             host_options.enable_prefix_cache(),
             host_options.instance_is_decode(),
-            host_options.num_speculative_tokens());
+            host_options.num_speculative_tokens(),
+            host_options.instance_is_decode() &&
+                options_.enable_host_offload());
       } else {
         leaf = std::make_unique<BlockManagerImpl>(host_options);
       }
@@ -475,10 +484,9 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
 
   collect_offload_pairs(sequence);
 
-  // Release the host blocks still held by the sequence. Blocks moved into the
-  // offload queue are now invalid in this vector and are skipped by
-  // deallocate; their host ids stay reserved (held by the queue) until the
-  // D2H copy completes and the offload callback caches + frees them.
+  // Release the host blocks still held by the sequence. Decode LINEAR source
+  // and destination blocks moved into the offload queue remain owned there
+  // until D2H completes.
   auto* host_manager = host_block_managers_[dp_rank].get();
   CHECK(host_manager);
   host_manager->deallocate_for_sequence(sequence, sequence->host_kv_state());
@@ -509,7 +517,52 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
               << " host_tokens=" << host_state.kv_cache_tokens_num()
               << " hbm_blocks=" << hbm_blocks->size()
               << " host_blocks=" << host_blocks->size();
-      if (!sequence->is_prefill_stage() || hbm_blocks->empty()) {
+      if (!sequence->is_prefill_stage()) {
+        const size_t confirmed_tokens =
+            sequence->last_confirmed_cached_tokens_num();
+        const std::optional<size_t> checkpoint_row =
+            last_decode_step_checkpoint_row(*sequence, block_size);
+        const bool hbm_checkpoint_ready =
+            checkpoint_row.has_value() && hbm_blocks->size() == 2 &&
+            hbm_blocks->front().is_valid() && hbm_blocks->back().is_valid();
+        const bool host_checkpoint_ready = host_blocks->size() == 2 &&
+                                           host_blocks->front().is_valid() &&
+                                           host_blocks->back().is_valid();
+        if (!hbm_checkpoint_ready || !host_checkpoint_ready) {
+          continue;
+        }
+
+        const size_t checkpoint_count = confirmed_tokens / block_size;
+        CHECK_GT(checkpoint_count, 0u);
+        const size_t checkpoint_index = checkpoint_count - 1;
+        sequence->update_linear_state_hashes(static_cast<uint32_t>(block_size));
+        const Slice<XXH3Key> checkpoint_hashes =
+            sequence->linear_state_hashes();
+        CHECK_GT(checkpoint_hashes.size(), checkpoint_index);
+        hbm_blocks->front().set_hash_value(
+            checkpoint_hashes[checkpoint_index].data);
+
+        auto pair = std::make_shared<OffloadBlockPair>();
+        pair->src = std::move(hbm_blocks->front());
+        pair->dst = std::move(host_blocks->front());
+        pair->block_type = BlockType::LINEAR;
+        pair->checkpoint_row = checkpoint_row.value();
+        pair->dst.set_hash_value(pair->src.get_immutable_hash_value());
+        CHECK(!hbm_blocks->front().is_valid());
+        CHECK(!host_blocks->front().is_valid());
+
+        // The pair, rather than either rolling vector, owns both blocks until
+        // the asynchronous D2H completion releases or publishes them.
+        hbm_blocks->erase(hbm_blocks->begin());
+        host_blocks->erase(host_blocks->begin());
+        hbm_state.set_shared_blocks_num(BlockType::LINEAR, 0);
+        host_state.set_shared_blocks_num(BlockType::LINEAR, 0);
+        offload_block_pair_queues_[dp_rank].enqueue(std::move(pair));
+        queued_offload = true;
+        continue;
+      }
+
+      if (hbm_blocks->empty()) {
         continue;
       }
 
@@ -551,7 +604,8 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
       auto pair = std::make_shared<OffloadBlockPair>(
           OffloadBlockPair{/*src=*/hbm_block,
                            /*dst=*/host_destination,
-                           /*block_type=*/BlockType::LINEAR});
+                           /*block_type=*/BlockType::LINEAR,
+                           /*checkpoint_row=*/0});
       VLOG(1) << "[HostCache][LinearOffloadEnqueue] seq=" << sequence->seq_id()
               << " src=" << hbm_block.id() << " dst=" << host_destination.id();
       offload_block_pair_queues_[dp_rank].enqueue(std::move(pair));
@@ -600,7 +654,8 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
       auto pair = std::make_shared<OffloadBlockPair>(
           OffloadBlockPair{/*src=*/hbm_block,
                            /*dst=*/std::move(host_block),
-                           /*block_type=*/type});
+                           /*block_type=*/type,
+                           /*checkpoint_row=*/0});
       offload_block_pair_queues_[dp_rank].enqueue(std::move(pair));
       queued_offload = true;
     }
@@ -667,6 +722,7 @@ void HierarchyBlockManagerPool::trim_host_cache(
 bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
                                          size_t num_tokens) {
   CHECK(sequence != nullptr);
+  const bool had_device_blocks = sequence->kv_state().has_any_blocks();
   const int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
   if (should_probe_prefix_cache(sequence)) {
     allocate_shared(sequence);
@@ -679,16 +735,27 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
-  if (!composite->allocate_sequence(sequence, num_tokens)) {
-    release_host_match(sequence, dp_rank);
-    return false;
-  }
-
   KVCacheState& host_state = sequence->host_kv_state();
   auto* host_manager = host_block_managers_[dp_rank].get();
   CHECK(host_manager);
+
+  if (!composite->allocate_sequence(sequence, num_tokens)) {
+    release_host_match(sequence, dp_rank);
+    if (!had_device_blocks) {
+      composite->deallocate_for_sequence(sequence);
+      sequence->reset();
+    }
+    return false;
+  }
+
   if (!host_manager->allocate_sequence(sequence, host_state, num_tokens)) {
     host_manager->release_out_of_window_for_sequence(sequence, host_state);
+    if (!had_device_blocks) {
+      host_manager->deallocate_for_sequence(sequence, host_state);
+      composite->deallocate_for_sequence(sequence);
+      sequence->reset();
+    }
+    return false;
   }
 
   collect_load_block_transfer_infos(sequence);
@@ -1060,6 +1127,7 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
       // block_type from device layer coverage; this side just needs it to
       // route publish/free.
       transfer_infos.back().block_type = block_pair->block_type;
+      transfer_infos.back().checkpoint_row = block_pair->checkpoint_row;
       block_types.emplace_back(block_pair->block_type);
       block_pair.reset();
     }

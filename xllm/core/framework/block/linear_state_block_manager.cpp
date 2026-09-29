@@ -53,17 +53,48 @@ bool crosses_checkpoint(size_t begin, size_t end, size_t checkpoint_stride) {
 
 }  // namespace
 
+bool last_decode_step_crosses_checkpoint(const Sequence& sequence,
+                                         size_t checkpoint_stride) {
+  return last_decode_step_checkpoint_row(sequence, checkpoint_stride)
+      .has_value();
+}
+
+std::optional<size_t> last_decode_step_checkpoint_row(
+    const Sequence& sequence,
+    size_t checkpoint_stride) {
+  CHECK_GT(checkpoint_stride, 0u);
+  const size_t confirmed_tokens = sequence.last_confirmed_cached_tokens_num();
+  const size_t accepted_length = sequence.accepted_length();
+  // accepted_length is the maximum accepted draft offset. The preceding bonus
+  // token also advances the recurrent cache, so the confirmed span is one
+  // larger than that offset.
+  if (confirmed_tokens <= accepted_length) {
+    return std::nullopt;
+  }
+  const size_t confirmed_span = accepted_length + 1;
+  const size_t begin = confirmed_tokens - confirmed_span;
+  if (!crosses_checkpoint(begin, confirmed_tokens, checkpoint_stride)) {
+    return std::nullopt;
+  }
+  const size_t checkpoint_tokens =
+      (confirmed_tokens / checkpoint_stride) * checkpoint_stride;
+  CHECK_GT(checkpoint_tokens, begin);
+  return checkpoint_tokens - begin - 1;
+}
+
 LinearStateBlockManager::LinearStateBlockManager(
     uint32_t num_slots,
     int32_t chunk_stride,
     bool enable_prefix_cache,
     bool instance_is_decode,
-    uint32_t num_speculative_tokens)
+    uint32_t num_speculative_tokens,
+    bool preserve_decode_checkpoint)
     : BlockManagerImpl(make_linear_state_options(num_slots,
                                                  chunk_stride,
                                                  enable_prefix_cache,
                                                  instance_is_decode,
-                                                 num_speculative_tokens)) {
+                                                 num_speculative_tokens)),
+      preserve_decode_checkpoint_(preserve_decode_checkpoint) {
   CHECK_GT(num_slots, 1u)
       << "linear-state leaf needs at least one usable slot (plus padding)";
   CHECK_GT(chunk_stride, 0)
@@ -328,6 +359,17 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
   const size_t tokens_per_step =
       static_cast<size_t>(options_.num_speculative_tokens()) + 1;
   const size_t checkpoint_stride = block_size();
+  const bool completed_checkpoint =
+      blocks->size() == 2 &&
+      last_decode_step_crosses_checkpoint(*seq, checkpoint_stride);
+
+  if (preserve_decode_checkpoint_ && completed_checkpoint) {
+    // HierarchyBlockManagerPool owns the transfer boundary. It moves the
+    // HBM and Host front blocks into an OffloadBlockPair after both tiers
+    // preserve the same logical checkpoint. Hashing happens once at that
+    // ownership boundary.
+    return std::vector<Block>{};
+  }
 
   // Prefill may leave its read source in front of the newest write block.
   // Decode starts from the newest state, so discard that historical prefill
@@ -339,13 +381,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
   }
 
   if (blocks->size() == 2) {
-    const size_t previous_begin = confirmed_tokens > tokens_per_step
-                                      ? confirmed_tokens - tokens_per_step
-                                      : 0;
-    if (crosses_checkpoint(
-            previous_begin, confirmed_tokens, checkpoint_stride)) {
-      // TODO: Offload the first block before releasing it once LINEAR
-      // hierarchy cache can preserve the confirmed checkpoint state.
+    if (completed_checkpoint) {
       deallocate(Slice<Block>(*blocks).slice(0, 1));
       blocks->erase(blocks->begin());
       kv_state.set_shared_blocks_num(BlockType::LINEAR, 0);

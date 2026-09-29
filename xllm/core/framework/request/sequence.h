@@ -224,6 +224,9 @@ class Sequence final {
     last_confirmed_cached_tokens_num_ = num_tokens;
   }
 
+  size_t accepted_length() const { return accepted_length_; }
+  void set_accepted_length(size_t length) { accepted_length_ = length; }
+
   size_t num_prefix_cache_tokens() const;
 
   // add a new token id to the sequence and update the count
@@ -589,6 +592,10 @@ class Sequence final {
   // Real-result cursor used by LINEAR decode rolling. Sequence result commits
   // update it; builder pre-advancement and overlap placeholders do not.
   size_t last_confirmed_cached_tokens_num_ = 0;
+
+  // Maximum accepted draft offset in the most recent sample. A regular decode
+  // target occupies offset zero, so it records zero here.
+  size_t accepted_length_ = 0;
 
   // Held by value: it is always present after construction, so a unique_ptr
   // only added a heap allocation per sequence and an indirection on the

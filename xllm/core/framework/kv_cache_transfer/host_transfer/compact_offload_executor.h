@@ -49,11 +49,12 @@ class CompactOffloadExecutor final {
 
  private:
   struct SourceState {
-    torch::Tensor tensor;
     size_t destination_offset = 0;
+    const HostKVLayerLayout* layer = nullptr;
   };
 
   struct RoleState {
+    KVCacheTensorRole::Value role = KVCacheTensorRole::KEY;
     torch::Tensor host;
     std::vector<SourceState> sources;
     size_t block_bytes = 0;
@@ -86,13 +87,15 @@ class CompactOffloadExecutor final {
   void reuse_slot(SlotState& slot);
   void pack_blocks(const GroupState& group,
                    const torch::Tensor& block_ids,
-                   const torch::Tensor& packed);
+                   const torch::Tensor& packed,
+                   size_t checkpoint_row);
   void submit(SlotState& slot,
               int32_t group_id,
               const GroupState& group,
               const std::vector<HostKVMapping>& mappings,
               size_t mapping_offset,
-              size_t mapping_count);
+              size_t mapping_count,
+              size_t checkpoint_row);
   void submit_d2h(SlotState& slot,
                   const GroupState& group,
                   const std::vector<HostKVMapping>& mappings,

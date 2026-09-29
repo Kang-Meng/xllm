@@ -37,6 +37,11 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
   block_managers_.reserve(dp_size);
 
   BlockManager::Options block_options;
+  const auto& host_capacities = options_.host_num_blocks_by_type();
+  const auto host_linear_capacity = host_capacities.find(BlockType::LINEAR);
+  const bool has_host_linear_destination =
+      host_linear_capacity != host_capacities.end() &&
+      host_linear_capacity->second > 0;
   block_options.num_blocks(options_.num_blocks())
       .block_size(options_.block_size())
       .enable_prefix_cache(options_.enable_prefix_cache())
@@ -57,6 +62,8 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       .model_id(options_.model_id())
       .enable_linear_state(options_.enable_linear_state())
       .linear_state_num_slots(options_.linear_state_num_slots())
+      .preserve_decode_checkpoint(options_.enable_host_offload() &&
+                                  has_host_linear_destination)
       .num_speculative_tokens(options_.num_speculative_tokens())
       .instance_is_decode(options_.instance_is_decode());
 

@@ -33,6 +33,7 @@ limitations under the License.
 #include "framework/block/block_manager_pool.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/composite_block_manager.h"
+#include "framework/block/linear_state_block_manager.h"
 #include "framework/block/sliding_window_block_manager.h"
 #include "framework/config/scheduler_config.h"
 #include "framework/request/request.h"
@@ -115,6 +116,14 @@ class HierarchyPoolTestPeer final {
         pair.reset();
       }
     }
+  }
+
+  static std::shared_ptr<OffloadBlockPair> take_pending_offload_pair(
+      HierarchyBlockManagerPool& pool,
+      int32_t dp_rank = 0) {
+    std::shared_ptr<OffloadBlockPair> pair;
+    pool.offload_block_pair_queues_.at(dp_rank).try_dequeue(pair);
+    return pair;
   }
 };
 
@@ -842,8 +851,7 @@ TEST(HierarchyBlockManagerPoolTest,
   pool.deallocate(&sequence);
 }
 
-TEST(HierarchyBlockManagerPoolTest,
-     FailedHostGrowthStillRestoresExistingPrefix) {
+TEST(HierarchyBlockManagerPoolTest, FailedHostGrowthRejectsAllocation) {
   BlockManagerPool::Options options = make_flat_kv_options();
   options.host_num_blocks(3);
   HierarchyBlockManagerPool pool(options, nullptr, 1);
@@ -853,13 +861,10 @@ TEST(HierarchyBlockManagerPoolTest,
   seed_host_prefix(host_leaf, tokens);
   Sequence sequence = make_test_sequence(0, tokens);
 
-  ASSERT_TRUE(allocate_with_host_cache_budget(&pool, &sequence, 257, 2));
-  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 3u);
-  EXPECT_EQ(sequence.host_kv_state().num_blocks(BlockType::KV), 2u);
-  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 256u);
-  EXPECT_EQ(HierarchyPoolTestPeer::pending_load_infos(pool).size(), 2u);
+  EXPECT_FALSE(allocate_with_host_cache_budget(&pool, &sequence, 257, 2));
+  EXPECT_FALSE(sequence.kv_state().has_any_blocks());
+  EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
-  HierarchyPoolTestPeer::dispatch_pending_h2d(pool);
   pool.deallocate(&sequence);
 }
 
@@ -1011,8 +1016,7 @@ TEST(HierarchyBlockManagerPoolTest, HbmAllocationFailureDoesNotQueueH2d) {
   exhausted_c128.clear();
 }
 
-TEST(HierarchyBlockManagerPoolTest,
-     HostAllocationFailureDoesNotRejectHbmAllocation) {
+TEST(HierarchyBlockManagerPoolTest, HostAllocationFailureRejectsHbmAllocation) {
   BlockManagerPool::Options options = make_flat_kv_options();
   // BlockManagerImpl reserves block id 0, leaving only one usable Host block.
   // HBM has enough capacity for both blocks requested below.
@@ -1021,17 +1025,11 @@ TEST(HierarchyBlockManagerPoolTest,
 
   std::vector<int32_t> tokens(257, 71);
   Sequence sequence = make_test_sequence(/*index=*/0, tokens);
-  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/256));
-
-  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 2u);
-  EXPECT_GE(sequence.kv_state().current_max_tokens_capacity(), 256u);
+  EXPECT_FALSE(pool.allocate(&sequence, /*num_tokens=*/256));
+  EXPECT_FALSE(sequence.kv_state().has_any_blocks());
   EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
   EXPECT_FALSE(sequence.has_host_cache_match());
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
-  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
-
-  sequence.kv_state().set_kv_cache_tokens_num(128);
-  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/256));
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
 
   pool.deallocate(&sequence);
@@ -2437,6 +2435,110 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 32u);
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
       original_chunk_stride;
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     DecodeLinearOffloadUsesCanonicalMtpCheckpointHash) {
+  constexpr int32_t kCheckpointStride = 8;
+  constexpr size_t kAcceptedLength = 3;
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.enable_linear_state(true)
+      .linear_state_num_slots(64)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 64}})
+      .enable_prefix_cache(false)
+      .enable_disagg_pd(true)
+      .instance_is_decode(true)
+      .enable_kvcache_store(true)
+      .num_embedding_blocks(64)
+      .num_speculative_tokens(kAcceptedLength);
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kCheckpointStride;
+
+  HierarchyBlockManagerPool pool(options,
+                                 /*engine=*/nullptr,
+                                 /*dp_size=*/1);
+  Sequence sequence =
+      make_test_sequence(/*index=*/0, std::vector<int32_t>(9, 103));
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/9));
+  sequence.kv_state().set_kv_cache_tokens_num(9);
+  sequence.set_last_confirmed_cached_tokens_num(6);
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/12));
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
+
+  const Slice<Block> hbm_before = sequence.kv_state().blocks(BlockType::LINEAR);
+  const Slice<Block> host_before =
+      sequence.host_kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(hbm_before.size(), 2u);
+  ASSERT_EQ(host_before.size(), 2u);
+  const int32_t hbm_checkpoint_id = hbm_before.front().id();
+  const int32_t hbm_live_id = hbm_before.back().id();
+  const int32_t host_checkpoint_id = host_before.front().id();
+  const int32_t host_live_id = host_before.back().id();
+
+  sequence.append_token(104);
+  sequence.append_token(105);
+  sequence.append_token(106);
+  ASSERT_EQ(sequence.last_confirmed_cached_tokens_num(), 11u);
+  sequence.set_accepted_length(kAcceptedLength);
+  ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+
+  const Slice<XXH3Key> checkpoint_hashes = sequence.linear_state_hashes();
+  ASSERT_EQ(checkpoint_hashes.size(), 1u);
+  const XXH3Key expected_hash = checkpoint_hashes.front();
+
+  ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+            hbm_live_id);
+  ASSERT_EQ(sequence.host_kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).front().id(),
+            host_live_id);
+  ASSERT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 1u);
+
+  const std::shared_ptr<OffloadBlockPair> pair =
+      HierarchyPoolTestPeer::take_pending_offload_pair(pool);
+  ASSERT_NE(pair, nullptr);
+  EXPECT_EQ(pair->src.id(), hbm_checkpoint_id);
+  EXPECT_EQ(pair->dst.id(), host_checkpoint_id);
+  EXPECT_EQ(pair->block_type, BlockType::LINEAR);
+  EXPECT_EQ(pair->checkpoint_row, 0u);
+  EXPECT_TRUE(XXH3Key(pair->src.get_immutable_hash_value()) == expected_hash);
+  EXPECT_TRUE(XXH3Key(pair->dst.get_immutable_hash_value()) == expected_hash);
+
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      original_chunk_stride;
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     DecodeLinearCheckpointRowTracksBoundaryOvershoot) {
+  constexpr size_t kCheckpointStride = 8;
+  constexpr size_t kAcceptedLength = 3;
+  Sequence sequence =
+      make_test_sequence(/*index=*/0, std::vector<int32_t>(16, 103));
+  sequence.set_accepted_length(kAcceptedLength);
+
+  for (size_t confirmed_tokens = 8; confirmed_tokens <= 11;
+       ++confirmed_tokens) {
+    sequence.set_last_confirmed_cached_tokens_num(confirmed_tokens);
+    const std::optional<size_t> checkpoint_row =
+        last_decode_step_checkpoint_row(sequence, kCheckpointStride);
+    ASSERT_TRUE(checkpoint_row.has_value());
+    EXPECT_EQ(checkpoint_row.value(), 11 - confirmed_tokens);
+    EXPECT_TRUE(
+        last_decode_step_crosses_checkpoint(sequence, kCheckpointStride));
+  }
+
+  sequence.set_last_confirmed_cached_tokens_num(12);
+  EXPECT_FALSE(
+      last_decode_step_checkpoint_row(sequence, kCheckpointStride).has_value());
+  EXPECT_FALSE(
+      last_decode_step_crosses_checkpoint(sequence, kCheckpointStride));
+
+  sequence.set_last_confirmed_cached_tokens_num(2049);
+  EXPECT_EQ(
+      last_decode_step_checkpoint_row(sequence, /*checkpoint_stride=*/512), 2u);
 }
 
 TEST(HierarchyBlockManagerPoolTest,

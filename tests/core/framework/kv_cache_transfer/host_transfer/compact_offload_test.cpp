@@ -27,6 +27,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/host_transfer/compact_transfer.h"
 #include "framework/kv_cache_transfer/host_transfer/layout.h"
@@ -389,6 +390,87 @@ TEST(CompactOffloadTest, CopiesPaddedRolesAcrossTiles) {
                              torch::zeros_like(host_value[host_block][0])));
   }
   compact_offload.drain();
+  compact_offload.drain();
+}
+
+TEST(CompactOffloadTest, SplitsLinearMappingsByAcceptedStage) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "MLU device is required for compact D2H.";
+  }
+
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const torch::TensorOptions host_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  const torch::TensorOptions device_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device.unwrap());
+  constexpr int64_t kBlockCount = 2;
+  constexpr int64_t kCheckpointStride = 4;
+  constexpr int64_t kConvHistoryRows = 6;
+  torch::Tensor conv_cache =
+      torch::empty({kBlockCount, kConvHistoryRows, 2}, device_options);
+  torch::Tensor ssm_cache =
+      torch::empty({kBlockCount * kCheckpointStride, 2}, device_options);
+  for (int64_t block_id = 0; block_id < kBlockCount; ++block_id) {
+    for (int64_t row = 0; row < kConvHistoryRows; ++row) {
+      conv_cache[block_id][row].fill_(
+          static_cast<double>(block_id * 100 + row * 10));
+    }
+    for (int64_t checkpoint = 0; checkpoint < kCheckpointStride; ++checkpoint) {
+      ssm_cache[block_id * kCheckpointStride + checkpoint].fill_(
+          static_cast<double>(block_id * 1000 + checkpoint * 100));
+    }
+  }
+  KVCache device_cache(LinearAttentionKVCacheTensors{conv_cache, ssm_cache});
+
+  torch::Tensor host_conv =
+      torch::full({kBlockCount, 1, 3, 2}, -1.0, host_options);
+  torch::Tensor host_ssm =
+      torch::full({kBlockCount, 1, 1, 2}, -1.0, host_options);
+  HostKVGroupLayout group;
+  group.group_id = 41;
+  group.host_roles.emplace(KVCacheTensorRole::CONV, host_conv);
+  group.host_roles.emplace(KVCacheTensorRole::SSM, host_ssm);
+  HostKVLayerLayout layer;
+  layer.absolute_layer_id = 0;
+  layer.group_layer_slot = 0;
+  layer.device_roles = device_cache.get_block_type_tensors(
+      BlockType::LINEAR, /*checkpoint_row=*/0);
+  layer.device_cache = &device_cache;
+  layer.block_type = BlockType::LINEAR;
+  group.layers.emplace_back(std::move(layer));
+
+  HostKVLayout layout(/*num_layers=*/1, {std::move(group)}, device.unwrap());
+  SynchronousD2HBatchMemcpy batch_memcpy;
+  CompactOffloadHarness compact_offload(layout,
+                                        device,
+                                        batch_memcpy,
+                                        /*target_bytes=*/1024);
+  std::unique_ptr<Stream> compute_stream = device.current_stream();
+  ASSERT_NE(compute_stream, nullptr);
+  const HostKVRequest request{
+      {HostKVMapping{41, 1, 1, 3}, HostKVMapping{41, 0, 0, 0}}};
+
+  ASSERT_TRUE(compact_offload.execute(request, *compute_stream));
+
+  EXPECT_EQ(batch_memcpy.submit_count(), 2U);
+  EXPECT_EQ(batch_memcpy.descriptor_count(), 4U);
+  EXPECT_TRUE(torch::equal(host_conv[0][0],
+                           conv_cache[0]
+                               .narrow(/*dim=*/0,
+                                       /*start=*/0,
+                                       /*length=*/3)
+                               .to(torch::kCPU)));
+  EXPECT_TRUE(torch::equal(host_conv[1][0],
+                           conv_cache[1]
+                               .narrow(/*dim=*/0,
+                                       /*start=*/3,
+                                       /*length=*/3)
+                               .to(torch::kCPU)));
+  EXPECT_TRUE(torch::equal(host_ssm[0][0][0], ssm_cache[0].to(torch::kCPU)));
+  EXPECT_TRUE(torch::equal(host_ssm[1][0][0],
+                           ssm_cache[kCheckpointStride + 3].to(torch::kCPU)));
   compact_offload.drain();
 }
 

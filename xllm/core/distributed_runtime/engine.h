@@ -202,17 +202,12 @@ class Engine {
 
  protected:
   void configure_prefix_cache(runtime::Options& options) const {
-    const bool decode_linear_model =
-        options.instance_role() == InstanceRole::DECODE &&
-        has_linear_attention_layers(model_args());
     const bool enable_xtensor = KVCacheConfig::get_instance().enable_xtensor();
-    if (options.enable_prefix_cache() &&
-        (decode_linear_model || enable_xtensor)) {
+    if (options.enable_prefix_cache() && enable_xtensor) {
       options.enable_prefix_cache(false);
       LOG(INFO) << "Disabling prefix cache for model "
                 << model_args().model_type()
-                << ": decode_linear_model=" << decode_linear_model
-                << ", enable_xtensor=" << enable_xtensor;
+                << ": enable_xtensor=" << enable_xtensor;
     }
     if (!options.is_draft_engine()) {
       KVCacheConfig::get_instance().enable_prefix_cache(

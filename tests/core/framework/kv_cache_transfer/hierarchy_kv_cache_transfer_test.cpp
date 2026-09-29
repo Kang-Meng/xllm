@@ -245,10 +245,15 @@ TEST(HierarchyKVCacheTransferTest,
         << "An accelerator device is required for hierarchy KV transfer.";
   }
 
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() = 4;
   for (const char* model_type : {"qwen3_5_text", "glm5_next"}) {
     SCOPED_TRACE(model_type);
     verify_committed_linear_round_trip(model_type);
   }
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      original_chunk_stride;
 }
 
 TEST(HierarchyKVCacheTransferTest, RejectsMixedOffloadBatchBeforeSubmission) {

@@ -1536,6 +1536,44 @@ TEST_P(LinearStateWindowTest, DecodeReceiverUsesExplicitState) {
   }
 }
 
+TEST_P(LinearStateWindowTest,
+       HostDecodeCheckpointDoesNotAdvanceSequenceHashes) {
+  LinearStateBlockManager host_manager(
+      /*num_slots=*/4,
+      /*chunk_stride=*/4,
+      GetParam(),
+      /*instance_is_decode=*/true,
+      /*num_speculative_tokens=*/0,
+      /*preserve_decode_checkpoint=*/true);
+  Sequence sequence = make_sequence(0, {7, 7, 7});
+  sequence.kv_state().set_kv_cache_tokens_num(3);
+  sequence.append_token(8);
+  sequence.set_last_confirmed_cached_tokens_num(4);
+  sequence.host_kv_state().add_blocks(BlockType::LINEAR,
+                                      host_manager.allocate(2));
+  const int32_t checkpoint_id =
+      sequence.host_kv_state().blocks(BlockType::LINEAR).front().id();
+  const int32_t live_id =
+      sequence.host_kv_state().blocks(BlockType::LINEAR).back().id();
+
+  std::optional<std::vector<Block>> allocated =
+      host_manager.allocate_for_sequence(
+          &sequence, sequence.host_kv_state(), sequence.num_tokens());
+
+  ASSERT_TRUE(allocated.has_value());
+  EXPECT_TRUE(allocated->empty());
+  EXPECT_TRUE(sequence.linear_state_hashes().empty());
+  ASSERT_EQ(sequence.host_kv_state().num_blocks(BlockType::LINEAR), 2u);
+  EXPECT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).front().id(),
+            checkpoint_id);
+  EXPECT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).back().id(),
+            live_id);
+
+  host_manager.deallocate(sequence.host_kv_state().blocks(BlockType::LINEAR));
+  sequence.host_kv_state().reset();
+  EXPECT_EQ(host_manager.num_used_blocks(), 0u);
+}
+
 TEST_P(LinearStateWindowTest, DecodeReceiverAllocationIsOwnedByLeaf) {
   for (const size_t prompt_length : {12u, 13u}) {
     LinearStateBlockManager manager(3, 4, GetParam(), true);

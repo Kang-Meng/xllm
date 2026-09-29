@@ -180,6 +180,12 @@ BlockTypeTensorMap KVCacheImpl::get_block_type_tensors(BlockType type) const {
   return tensor_map;
 }
 
+BlockTypeTensorMap KVCacheImpl::get_block_type_tensors(
+    BlockType type,
+    size_t /*checkpoint_row*/) const {
+  return get_block_type_tensors(type);
+}
+
 bool KVCacheImpl::empty() const {
   return !key_cache_.defined() ||
          (!value_cache_shape_.empty() && !value_cache_.defined());

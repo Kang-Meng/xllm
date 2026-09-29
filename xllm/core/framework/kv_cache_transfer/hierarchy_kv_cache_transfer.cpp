@@ -115,31 +115,7 @@ BlockTypeTensorMap build_block_type_tensor_map(const KVCache& kv_cache,
       }
       CHECK(has_tensor(conv_cache) && has_tensor(ssm_cache))
           << "LINEAR transfer requires both Conv and SSM cache tensors.";
-      CHECK_EQ(ssm_cache.size(0) % conv_cache.size(0), 0)
-          << "SSM rows must be divisible by logical LINEAR slots.";
-      const int64_t checkpoint_stride = ssm_cache.size(0) / conv_cache.size(0);
-      std::vector<int64_t> logical_ssm_shape = ssm_cache.sizes().vec();
-      logical_ssm_shape[0] = checkpoint_stride;
-      logical_ssm_shape.insert(logical_ssm_shape.begin(), conv_cache.size(0));
-      constexpr int64_t kCommittedConvRows = 3;
-#if defined(USE_MUSA)
-      constexpr int64_t kDeviceConvHistoryAxis = 2;
-#else
-      constexpr int64_t kDeviceConvHistoryAxis = 1;
-#endif
-      CHECK_GT(conv_cache.dim(), kDeviceConvHistoryAxis);
-      CHECK_GE(conv_cache.size(kDeviceConvHistoryAxis), kCommittedConvRows)
-          << "LINEAR Host transfer requires three committed Conv rows.";
-      torch::Tensor transfer_conv_cache =
-          conv_cache.narrow(kDeviceConvHistoryAxis,
-                            /*start=*/0,
-                            /*length=*/kCommittedConvRows);
-      torch::Tensor transfer_ssm_cache =
-          ssm_cache.view(std::move(logical_ssm_shape))
-              .narrow(/*dim=*/1, /*start=*/0, /*length=*/1);
-      tensors.emplace(KVCacheTensorRole::CONV, transfer_conv_cache);
-      tensors.emplace(KVCacheTensorRole::SSM, transfer_ssm_cache);
-      return tensors;
+      return kv_cache.get_block_type_tensors(type, /*checkpoint_row=*/0);
     }
     case BlockType::SWA:
       // The persistent SWA window is restored for every DSV4 layer.
@@ -434,6 +410,8 @@ HostKVLayout HierarchyKVCacheTransfer::create_host_kv_layout(
       layer.group_layer_slot = static_cast<int64_t>(layer_slot);
       layer.device_roles =
           build_block_type_tensor_map(*group_caches[layer_slot], block_type);
+      layer.device_cache = group_caches[layer_slot];
+      layer.block_type = block_type;
       group.layers.emplace_back(std::move(layer));
     }
     groups.emplace_back(std::move(group));
@@ -466,7 +444,8 @@ HostKVRequest HierarchyKVCacheTransfer::make_request(
       mappings.emplace_back(
           HostKVMapping{domain_group_id(domain.handle, info.block_type),
                         is_load ? info.src_block_id : info.dst_block_id,
-                        is_load ? info.dst_block_id : info.src_block_id});
+                        is_load ? info.dst_block_id : info.src_block_id,
+                        info.checkpoint_row});
     }
     CHECK(has_participating_domain)
         << "No KV cache domain supports block type "

@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -26,13 +27,22 @@ namespace xllm {
 
 class Sequence;
 
+// Returns true when the latest confirmed Decode result completed a checkpoint.
+bool last_decode_step_crosses_checkpoint(const Sequence& sequence,
+                                         size_t checkpoint_stride);
+
+// Returns the row of the completed checkpoint within that Decode result.
+std::optional<size_t> last_decode_step_checkpoint_row(const Sequence& sequence,
+                                                      size_t checkpoint_stride);
+
 class LinearStateBlockManager final : public BlockManagerImpl {
  public:
   explicit LinearStateBlockManager(uint32_t num_slots,
                                    int32_t chunk_stride,
                                    bool enable_prefix_cache = true,
                                    bool instance_is_decode = false,
-                                   uint32_t num_speculative_tokens = 0);
+                                   uint32_t num_speculative_tokens = 0,
+                                   bool preserve_decode_checkpoint = false);
   ~LinearStateBlockManager() override = default;
 
   std::optional<std::vector<Block>> allocate_for_sequence(
@@ -64,6 +74,11 @@ class LinearStateBlockManager final : public BlockManagerImpl {
                                                      KVCacheState& kv_state);
   std::optional<std::vector<Block>> allocate_decode(Sequence* seq,
                                                     KVCacheState& kv_state);
+
+  // Host offload consumes a completed Decode checkpoint after both the HBM
+  // and Host leaves finish allocation. Keep the source in the rolling vector
+  // until HierarchyBlockManagerPool moves it into an OffloadBlockPair.
+  bool preserve_decode_checkpoint_ = false;
 
   friend class BlockManagerPoolTestPeer;
 };

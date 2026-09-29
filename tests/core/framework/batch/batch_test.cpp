@@ -3084,6 +3084,7 @@ TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   first.process_sample_output(accepted, true);
   EXPECT_EQ(sequence.kv_cache_tokens_num(), 2051u);
   EXPECT_EQ(sequence.last_confirmed_cached_tokens_num(), 2050u);
+  EXPECT_EQ(sequence.accepted_length(), 3u);
   const int32_t source_id = sequence.get_linear_state_slot_id();
   EXPECT_NE(source_id, first_output_id);
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
@@ -4044,6 +4045,7 @@ TEST(BatchTest, OverlapMTPReplacementSkipsPreemptedSequenceWithoutKVBlocks) {
   EXPECT_EQ(seq.num_generated_tokens(), 1);
   EXPECT_EQ(seq.tokens()[seq.num_prompt_tokens()], 101);
   EXPECT_EQ(seq.last_confirmed_cached_tokens_num(), 0u);
+  EXPECT_EQ(seq.accepted_length(), 0u);
 
   SchedulerConfig::get_instance().enable_schedule_overlap(
       old_enable_schedule_overlap);

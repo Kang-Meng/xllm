@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -63,6 +64,12 @@ class KVCacheImpl {
   // device-pool discriminator guards: a per-type host cache holds exactly the
   // tensors for that block type.
   virtual BlockTypeTensorMap get_block_type_tensors(BlockType type) const;
+
+  // Return the tensors used for a transfer at the requested LINEAR
+  // checkpoint row. Non-LINEAR caches ignore checkpoint_row.
+  virtual BlockTypeTensorMap get_block_type_tensors(
+      BlockType type,
+      size_t checkpoint_row) const;
 
   virtual bool empty() const;
 

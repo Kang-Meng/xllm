@@ -34,6 +34,9 @@ class LinearAttentionKVCacheImpl final : public KVCacheImpl {
   torch::Tensor get_ssm_cache() const override;
 
   BlockTypeTensorMap get_block_type_tensors(BlockType type) const override;
+  BlockTypeTensorMap get_block_type_tensors(
+      BlockType type,
+      size_t checkpoint_row) const override;
 
   bool empty() const override;
 

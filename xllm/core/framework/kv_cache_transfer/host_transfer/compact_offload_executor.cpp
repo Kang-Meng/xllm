@@ -23,6 +23,7 @@ limitations under the License.
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,9 @@ namespace {
 constexpr size_t kCompactD2HSlotAlignment = 512;
 
 bool mapping_less(const HostKVMapping& lhs, const HostKVMapping& rhs) {
+  if (lhs.checkpoint_row != rhs.checkpoint_row) {
+    return lhs.checkpoint_row < rhs.checkpoint_row;
+  }
   if (lhs.device_block_id != rhs.device_block_id) {
     return lhs.device_block_id < rhs.device_block_id;
   }
@@ -96,22 +100,33 @@ void CompactOffloadExecutor::execute(const HostKVRequest& request,
   for (const HostKVMapping& mapping : request.draft_mappings) {
     request_groups[mapping.group_id].emplace_back(mapping);
   }
-  for (auto& [group_id, mappings] : request_groups) {
-    (void)group_id;
-    std::sort(mappings.begin(), mappings.end(), mapping_less);
-  }
-
   pack_stream_->wait_stream(compute_stream);
-  for (const auto& [group_id, mappings] : request_groups) {
+  for (auto& [group_id, mappings] : request_groups) {
     const GroupState& group = groups_.at(group_id);
-    for (size_t mapping_offset = 0; mapping_offset < mappings.size();
-         mapping_offset += static_cast<size_t>(group.blocks_per_tile)) {
-      const size_t mapping_count =
-          std::min(static_cast<size_t>(group.blocks_per_tile),
-                   mappings.size() - mapping_offset);
-      SlotState& slot = next_slot();
-      reuse_slot(slot);
-      submit(slot, group_id, group, mappings, mapping_offset, mapping_count);
+    std::sort(mappings.begin(), mappings.end(), mapping_less);
+
+    for (size_t stage_begin = 0; stage_begin < mappings.size();) {
+      const size_t checkpoint_row = mappings[stage_begin].checkpoint_row;
+      size_t stage_end = stage_begin + 1;
+      while (stage_end < mappings.size() &&
+             mappings[stage_end].checkpoint_row == checkpoint_row) {
+        ++stage_end;
+      }
+      for (size_t tile_begin = stage_begin; tile_begin < stage_end;
+           tile_begin += static_cast<size_t>(group.blocks_per_tile)) {
+        const size_t mapping_count = std::min(
+            static_cast<size_t>(group.blocks_per_tile), stage_end - tile_begin);
+        SlotState& slot = next_slot();
+        reuse_slot(slot);
+        submit(slot,
+               group_id,
+               group,
+               mappings,
+               tile_begin,
+               mapping_count,
+               checkpoint_row);
+      }
+      stage_begin = stage_end;
     }
   }
   flush_slots();
@@ -131,6 +146,7 @@ void CompactOffloadExecutor::append_role(GroupState* group,
                                          const HostKVGroupLayout& layout_group,
                                          KVCacheTensorRole::Value role) {
   RoleState state;
+  state.role = role;
   state.host = layout_group.host_roles.at(role);
   state.block_bytes = layout.block_bytes(layout_group.group_id, role);
   state.packed_offset = group->packed_bytes;
@@ -167,7 +183,7 @@ void CompactOffloadExecutor::append_role(GroupState* group,
     CHECK_EQ(state.block_bytes % source.element_size(), 0U)
         << "compact D2H block bytes are not dtype aligned.";
     ranges.emplace_back(destination_offset, destination_end);
-    state.sources.emplace_back(SourceState{source, destination_offset});
+    state.sources.emplace_back(SourceState{destination_offset, &layer});
   }
   CHECK(!state.sources.empty())
       << "compact D2H role must contain active sources.";
@@ -195,7 +211,10 @@ CompactOffloadExecutor::GroupState CompactOffloadExecutor::make_group(
       << "compact D2H group must have packed bytes.";
   for (const RoleState& role : group.roles) {
     for (const SourceState& source : role.sources) {
-      CHECK_EQ(group.packed_bytes % source.tensor.element_size(), 0U)
+      CHECK(source.layer != nullptr) << "compact D2H source layer is null.";
+      const torch::Tensor& source_tensor =
+          source.layer->device_roles.at(role.role);
+      CHECK_EQ(group.packed_bytes % source_tensor.element_size(), 0U)
           << "compact D2H mapping bytes are not dtype aligned.";
     }
   }
@@ -264,7 +283,8 @@ void CompactOffloadExecutor::reuse_slot(SlotState& slot) {
 
 void CompactOffloadExecutor::pack_blocks(const GroupState& group,
                                          const torch::Tensor& block_ids,
-                                         const torch::Tensor& packed) {
+                                         const torch::Tensor& packed,
+                                         size_t checkpoint_row) {
 #if defined(USE_MLU)
   size_t source_count = 0;
   for (const RoleState& role : group.roles) {
@@ -276,18 +296,34 @@ void CompactOffloadExecutor::pack_blocks(const GroupState& group,
   std::vector<torch::Tensor> destinations;
   sources.reserve(source_count);
   destinations.reserve(source_count);
+  std::unordered_map<const HostKVLayerLayout*, BlockTypeTensorMap>
+      layer_tensors;
+  layer_tensors.reserve(source_count);
   for (const RoleState& role : group.roles) {
     for (const SourceState& source : role.sources) {
-      sources.emplace_back(source.tensor);
-      std::vector<int64_t> shape(source.tensor.sizes().begin(),
-                                 source.tensor.sizes().end());
+      CHECK(source.layer != nullptr) << "compact D2H source layer is null.";
+      auto layer_it = layer_tensors.find(source.layer);
+      if (layer_it == layer_tensors.end()) {
+        layer_it = layer_tensors
+                       .emplace(source.layer,
+                                get_device_transfer_tensors(*source.layer,
+                                                            checkpoint_row))
+                       .first;
+      }
+      auto source_it = layer_it->second.find(role.role);
+      CHECK(source_it != layer_it->second.end())
+          << "device cache is missing the active transfer role.";
+      const torch::Tensor& source_tensor = source_it->second;
+      sources.emplace_back(source_tensor);
+      std::vector<int64_t> shape(source_tensor.sizes().begin(),
+                                 source_tensor.sizes().end());
       shape[0] = block_ids.size(0);
       destinations.emplace_back(
           packed
               .narrow(1,
                       static_cast<int64_t>(source.destination_offset),
                       static_cast<int64_t>(role.block_bytes))
-              .view(source.tensor.scalar_type())
+              .view(source_tensor.scalar_type())
               .view(shape));
     }
   }
@@ -296,6 +332,7 @@ void CompactOffloadExecutor::pack_blocks(const GroupState& group,
   static_cast<void>(group);
   static_cast<void>(block_ids);
   static_cast<void>(packed);
+  static_cast<void>(checkpoint_row);
   LOG(FATAL) << "Compact D2H is only supported on MLU.";
 #endif
 }
@@ -305,7 +342,8 @@ void CompactOffloadExecutor::submit(SlotState& slot,
                                     const GroupState& group,
                                     const std::vector<HostKVMapping>& mappings,
                                     size_t mapping_offset,
-                                    size_t mapping_count) {
+                                    size_t mapping_count,
+                                    size_t checkpoint_row) {
   if (slot.last_group_id != group_id) {
     const c10::StreamGuard stream_guard = pack_stream_->set_stream_guard();
     slot.packed.zero_();
@@ -331,7 +369,7 @@ void CompactOffloadExecutor::submit(SlotState& slot,
     const c10::StreamGuard stream_guard = pack_stream_->set_stream_guard();
     device_ids.copy_(slot.host_block_ids.narrow(0, 0, tile_count),
                      /*non_blocking=*/true);
-    pack_blocks(group, device_ids, packed);
+    pack_blocks(group, device_ids, packed, checkpoint_row);
   }
   StreamEventPtr pack_complete = pack_stream_->record_event();
   CHECK(pack_complete != nullptr)

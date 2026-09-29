@@ -115,6 +115,56 @@ BlockTypeTensorMap LinearAttentionKVCacheImpl::get_block_type_tensors(
   return tensor_map;
 }
 
+BlockTypeTensorMap LinearAttentionKVCacheImpl::get_block_type_tensors(
+    BlockType type,
+    size_t checkpoint_row) const {
+  if (type != BlockType::LINEAR) {
+    return get_block_type_tensors(type);
+  }
+
+  BlockTypeTensorMap tensor_map = get_block_type_tensors(type);
+  auto conv_it = tensor_map.find(KVCacheTensorRole::CONV);
+  auto ssm_it = tensor_map.find(KVCacheTensorRole::SSM);
+  if (conv_it == tensor_map.end() || ssm_it == tensor_map.end()) {
+    return tensor_map;
+  }
+
+  constexpr int64_t kCommittedConvRows = 3;
+#if defined(USE_MUSA)
+  constexpr int64_t kConvHistoryAxis = 2;
+#else
+  constexpr int64_t kConvHistoryAxis = 1;
+#endif
+  CHECK_GT(conv_it->second.dim(), kConvHistoryAxis);
+  const int64_t conv_history_rows = conv_it->second.size(kConvHistoryAxis);
+  CHECK_GE(conv_history_rows, kCommittedConvRows);
+  CHECK_LE(checkpoint_row,
+           static_cast<size_t>(conv_history_rows - kCommittedConvRows))
+      << "LINEAR checkpoint row selects rows outside the device cache: "
+      << "checkpoint_row=" << checkpoint_row;
+  conv_it->second = conv_it->second.narrow(kConvHistoryAxis,
+                                           static_cast<int64_t>(checkpoint_row),
+                                           kCommittedConvRows);
+
+  CHECK_GT(ssm_it->second.size(0), 0);
+  CHECK_EQ(ssm_it->second.size(0) % conv_cache_.size(0), 0)
+      << "SSM rows must be divisible by logical LINEAR slots.";
+  const int64_t checkpoint_stride =
+      ssm_it->second.size(0) / conv_cache_.size(0);
+  CHECK_LT(checkpoint_row, static_cast<size_t>(checkpoint_stride))
+      << "LINEAR checkpoint row exceeds the checkpoint stride: "
+      << "checkpoint_row=" << checkpoint_row
+      << ", checkpoint_stride=" << checkpoint_stride;
+  std::vector<int64_t> logical_ssm_shape = ssm_it->second.sizes().vec();
+  logical_ssm_shape[0] = checkpoint_stride;
+  logical_ssm_shape.insert(logical_ssm_shape.begin(), conv_cache_.size(0));
+  ssm_it->second = ssm_it->second.view(std::move(logical_ssm_shape))
+                       .narrow(/*dim=*/1,
+                               static_cast<int64_t>(checkpoint_row),
+                               /*length=*/1);
+  return tensor_map;
+}
+
 bool LinearAttentionKVCacheImpl::empty() const {
   return !conv_cache_.defined() || !ssm_cache_.defined();
 }

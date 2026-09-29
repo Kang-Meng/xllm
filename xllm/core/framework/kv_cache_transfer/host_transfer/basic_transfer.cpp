@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <exception>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -83,6 +84,9 @@ CopyPlan build_plan(const HostKVLayout& layout,
       mappings.size() * static_cast<size_t>(range.end - range.begin);
   plan.src_tensors.reserve(estimated_copies);
   plan.dst_tensors.reserve(estimated_copies);
+  std::unordered_map<const HostKVLayerLayout*,
+                     std::unordered_map<size_t, BlockTypeTensorMap>>
+      device_tensor_cache;
   for (const HostKVMapping& mapping : mappings) {
     const HostKVGroupLayout& group = layout.group(mapping.group_id);
     for (const HostKVLayerLayout& layer : group.layers) {
@@ -90,7 +94,17 @@ CopyPlan build_plan(const HostKVLayout& layout,
           layer.absolute_layer_id >= range.end) {
         continue;
       }
-      for (const auto& [role, device_tensor] : layer.device_roles) {
+      auto& cached_offsets = device_tensor_cache[&layer];
+      auto tensor_it = cached_offsets.find(mapping.checkpoint_row);
+      if (tensor_it == cached_offsets.end()) {
+        tensor_it = cached_offsets
+                        .emplace(mapping.checkpoint_row,
+                                 get_device_transfer_tensors(
+                                     layer, mapping.checkpoint_row))
+                        .first;
+      }
+      const BlockTypeTensorMap& device_tensors = tensor_it->second;
+      for (const auto& [role, device_tensor] : device_tensors) {
         auto host_it = group.host_roles.find(role);
         if (host_it == group.host_roles.end()) {
           continue;

@@ -35,6 +35,7 @@ struct OffloadBlockPair {
   Block src;
   Block dst;
   BlockType block_type = BlockType::KV;
+  size_t checkpoint_row = 0;
 };
 
 class HierarchyBlockManagerPool : public BlockManagerPool {
