@@ -448,10 +448,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             # graph capture; reading the device buffer would synchronize with
             # the prior replay and abort ACL graph capture.
             q_cu_host_values = getattr(metadata, "q_cu_seq_lens_host_values", None)
-        if q_cu_host_values is not None and len(q_cu_host_values) > 1:
-            self._actual_seq_lens = q_cu_host_values[1:]
-        elif q_cu_host_values is not None and len(q_cu_host_values) == 1:
-            self._actual_seq_lens = None
+        if q_cu_host_values is not None and len(q_cu_host_values) > 0:
+            # Runtime host lengths omit the leading zero; graph lengths include it.
+            self._actual_seq_lens = list(q_cu_host_values[1:]) if q_cu_host_values[0] == 0 else list(q_cu_host_values)
         elif q_cu_host_values is None:
             q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
             if q_seq_lens_host is not None and q_seq_lens_host.device.type == "cpu":
