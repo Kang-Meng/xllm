@@ -26,6 +26,8 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
@@ -49,7 +51,10 @@ class Glm5NextModelImpl final
       : LlmModelImplBase<layer::Glm5NextDecoderLayer>("glm5_next",
                                                       context.get_model_args()),
         device_(context.get_tensor_options().device()),
-        hc_mult_(context.get_model_args().hc_mult()) {
+        hc_mult_(context.get_model_args().hc_mult()),
+        aux_capture_(context.get_model_args(),
+                     context.get_tensor_options(),
+                     SchedulerConfig::get_instance().max_tokens_per_batch()) {
     const ModelArgs& args = context.get_model_args();
     const ParallelArgs& parallel_args = context.get_parallel_args();
     CHECK_EQ(parallel_args.cp_size(), 1)
@@ -135,6 +140,8 @@ class Glm5NextModelImpl final
               static_cast<uint32_t>(layer_id))) {
         return ModelOutput();
       }
+      const bool capture_hidden =
+          aux_capture_.should_capture(static_cast<int32_t>(layer_id));
       hidden_states = layers_[layer_id]->forward(
           hidden_states,
           residual,
@@ -143,7 +150,15 @@ class Glm5NextModelImpl final
           kv_caches[layer_id],
           modified_input_params,
           &pending_mhc,
-          /*is_last_layer=*/layer_id + 1 == layers_.size());
+          /*is_last_layer=*/layer_id + 1 == layers_.size(),
+          /*materialize_output=*/capture_hidden);
+      if (capture_hidden) {
+        CHECK(!pending_mhc.has_value())
+            << "Captured GLM5-Next layers must materialize mHC output.";
+        aux_capture_.capture_layer(static_cast<int32_t>(layer_id),
+                                   hidden_states.mean(/*dim=*/-2),
+                                   std::nullopt);
+      }
       if (!modified_input_params.record_layer(static_cast<uint32_t>(layer_id),
                                               hidden_states.device())) {
         return ModelOutput();
@@ -158,7 +173,7 @@ class Glm5NextModelImpl final
         << "GLM5-Next mHC residual-stream count changed unexpectedly.";
     hidden_states = hidden_states.mean(/*dim=*/-2);
     auto [normalized, residual_out] = norm_(hidden_states, std::nullopt);
-    return ModelOutput(normalized, residual_out);
+    return aux_capture_.finalize(normalized, residual_out);
   }
 
   void load_state_dict(const StateDict& state_dict) override {
@@ -180,6 +195,7 @@ class Glm5NextModelImpl final
  private:
   torch::Device device_;
   int64_t hc_mult_ = 1;
+  AuxHiddenCapture aux_capture_;
   int64_t local_linear_heads_ = 1;
   torch::nn::ModuleList blocks_{nullptr};
 };

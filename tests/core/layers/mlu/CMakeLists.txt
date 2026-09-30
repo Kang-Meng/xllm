@@ -384,3 +384,19 @@ cc_test(
   ENVIRONMENT
     "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
 )
+
+cc_test(
+  NAME
+    dflash2_test
+  SRCS
+    dflash2_test.cpp
+  DEPS
+    :mlu_layers
+    :common_layers
+    :model_context
+    :state_dict
+    :kv_cache
+    glog::glog
+    torch
+    GTest::gtest_main
+)

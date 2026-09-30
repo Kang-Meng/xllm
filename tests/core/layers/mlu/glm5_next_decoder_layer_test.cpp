@@ -24,6 +24,7 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "framework/model/aux_hidden_capture.h"
 #include "framework/model/model_args.h"
 #include "kernels/mlu/chunk_kda.h"
 #include "layers/mlu/tests_utils.h"
@@ -32,7 +33,91 @@ limitations under the License.
 namespace xllm::layer {
 namespace {
 
-void run_prefill_without_fusion(bool chunked_prefill) {
+enum class LayerTestMode {
+  PREFILL,
+  CHUNKED_PREFILL,
+  DECODE_CAPTURE,
+  VERIFY_CAPTURE,
+};
+
+void verify_capture_boundary(Glm5NextDecoderLayer& layer,
+                             const ModelArgs& args,
+                             const torch::TensorOptions& options,
+                             bool spec_verify) {
+  const int32_t width = spec_verify ? 3 : 1;
+  const int64_t heads = args.linear_num_key_heads();
+  const int64_t head_dim = args.linear_key_head_dim();
+  const auto ints = options.dtype(torch::kInt32);
+  const auto make_cache = [&]() {
+    return KVCache(LinearAttentionKVCacheTensors{
+        torch::zeros({2,
+                      width + args.linear_conv_kernel_dim() - 2,
+                      3 * heads * head_dim},
+                     options),
+        torch::zeros({2 * width, heads, head_dim, head_dim},
+                     options.dtype(torch::kFloat32))});
+  };
+  ModelInputParams input;
+  input.is_spec_verify = spec_verify;
+  input.embedding.linear_state_ids = {1};
+  input.embedding.linear_state_indices = torch::tensor({1}, ints);
+  input.num_accepted_tokens = torch::tensor({1}, ints);
+  AttentionMetadata metadata{};
+  metadata.is_chunked_prefill = spec_verify;
+  metadata.is_spec_verify = spec_verify;
+  metadata.max_query_len = width;
+  metadata.q_cu_seq_lens = torch::tensor({0, width}, ints);
+  torch::Tensor positions = torch::arange(width, options.dtype(torch::kInt64));
+  torch::Tensor actual =
+      torch::randn({width, args.hc_mult(), args.hidden_size()}, options);
+  torch::Tensor expected = actual.clone();
+  std::optional<torch::Tensor> actual_residual;
+  std::optional<torch::Tensor> expected_residual;
+  std::optional<PendingMHC> pending;
+  ModelArgs capture_args = args;
+  capture_args.layers_to_capture({1});
+  AuxHiddenCapture capture(capture_args, options, width);
+
+  // Capture in the middle of a pending chain, then resume deferral. The
+  // reference completes every layer using the unfused mHC operations.
+  for (int32_t layer_id = 0; layer_id < 4; ++layer_id) {
+    SCOPED_TRACE(layer_id);
+    KVCache actual_cache = make_cache();
+    KVCache expected_cache = make_cache();
+    const bool capture_hidden = capture.should_capture(layer_id);
+    actual = layer->forward(actual,
+                            actual_residual,
+                            positions,
+                            metadata,
+                            actual_cache,
+                            input,
+                            &pending,
+                            /*is_last_layer=*/layer_id == 3,
+                            /*materialize_output=*/capture_hidden);
+    expected = layer->forward(expected,
+                              expected_residual,
+                              positions,
+                              metadata,
+                              expected_cache,
+                              input);
+    if (layer_id == 0 || layer_id == 2) {
+      ASSERT_TRUE(pending.has_value());
+      continue;
+    }
+    ASSERT_FALSE(pending.has_value());
+    ASSERT_EQ(actual.sizes(), expected.sizes());
+    EXPECT_TRUE(torch::allclose(actual, expected, 0.02, 0.02));
+    if (capture_hidden) {
+      capture.capture_layer(layer_id, actual.mean(-2), std::nullopt);
+      const ModelOutput captured = capture.finalize(actual.mean(-2));
+      EXPECT_TRUE(torch::allclose(
+          captured.aux_hidden_states, expected.mean(-2), 0.02, 0.02));
+    }
+  }
+}
+
+void run_layer_chain(LayerTestMode mode) {
+  const bool chunked_prefill = mode == LayerTestMode::CHUNKED_PREFILL;
   torch::InferenceMode guard;
   const torch::Device device(torch::kPrivateUse1, /*index=*/0);
   Device mlu_device(device);
@@ -115,6 +200,15 @@ void run_prefill_without_fusion(bool chunked_prefill) {
   const StateDict state_dict(weights);
   first_layer->load_state_dict(state_dict);
   second_layer->load_state_dict(state_dict);
+  if (mode == LayerTestMode::DECODE_CAPTURE ||
+      mode == LayerTestMode::VERIFY_CAPTURE) {
+    verify_capture_boundary(
+        first_layer,
+        args,
+        options,
+        /*spec_verify=*/mode == LayerTestMode::VERIFY_CAPTURE);
+    return;
+  }
   const auto make_cache = [&]() {
     return KVCache(LinearAttentionKVCacheTensors{
         torch::zeros({2, kConvWidth - 1, 3 * kProjectionSize}, options),
@@ -193,11 +287,19 @@ void run_prefill_without_fusion(bool chunked_prefill) {
 }
 
 TEST(Glm5NextDecoderLayerTest, PrefillDoesNotDeferMHC) {
-  run_prefill_without_fusion(/*chunked_prefill=*/false);
+  run_layer_chain(LayerTestMode::PREFILL);
 }
 
 TEST(Glm5NextDecoderLayerTest, ChunkedPrefillDoesNotDeferMHC) {
-  run_prefill_without_fusion(/*chunked_prefill=*/true);
+  run_layer_chain(LayerTestMode::CHUNKED_PREFILL);
+}
+
+TEST(Glm5NextDecoderLayerTest, DecodeCaptureMaterializesMHCAndResumesFusion) {
+  run_layer_chain(LayerTestMode::DECODE_CAPTURE);
+}
+
+TEST(Glm5NextDecoderLayerTest, VerifyCaptureMaterializesMHCAndResumesFusion) {
+  run_layer_chain(LayerTestMode::VERIFY_CAPTURE);
 }
 
 TEST(Glm5NextDecoderLayerTest, ResolvesAttentionAndMlpRolesIndependently) {

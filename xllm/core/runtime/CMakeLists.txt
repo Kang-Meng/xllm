@@ -45,6 +45,7 @@ cc_library(
     suffix_worker_impl.h
     eagle3_worker_impl.h
     dflash_worker_impl.h
+    draft_model_config.h
     dflash2_worker_impl.h
     dspark_worker_impl.h
     forward_shared_memory_manager.h
@@ -68,6 +69,7 @@ cc_library(
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
     worker.cpp
     worker_impl.cpp
+    draft_model_config.cpp
     worker_rendezvous.cpp
     llm_worker_impl.cpp
     vlm_worker_impl.cpp

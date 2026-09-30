@@ -99,9 +99,9 @@ struct Options {
 
   PROPERTY(bool, is_draft_engine) = false;
 
-  // Draft forwards lay out query_width rows per sequence, but the captured
-  // draft graph stays width 1. This width is only for sequence-capacity
-  // admission. 1 means the rows are already one per sequence.
+  // Query rows per draft sequence, used for graph sequence-capacity admission
+  // and block-diffusion model geometry. The captured draft graph stays width 1.
+  // 1 means the rows are already one per sequence.
   PROPERTY(int32_t, draft_graph_query_width) = 1;
 
   // DFlash2 proposal attention (XFIA) is enabled only for the prelaunch mode:

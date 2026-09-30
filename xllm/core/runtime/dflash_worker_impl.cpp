@@ -75,9 +75,9 @@ runtime::Options target_options(const runtime::Options& options) {
 
 runtime::Options draft_options(const runtime::Options& options,
                                bool enable_dflash_xfia) {
-  // DSpark sizes its attention window from num_speculative_tokens; other
-  // DFlash-style drafts still run one step at a time.
   const bool sample_from_anchor = options.speculative_algorithm() == "DSpark";
+  // DFlash-style drafts execute one forward. Their proposal geometry is
+  // carried separately from the speculative-token count used by DSpark.
   const int32_t draft_num_speculative_tokens =
       sample_from_anchor ? options.num_speculative_tokens() : 0;
   const int32_t draft_query_width =
@@ -485,13 +485,15 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
       const int32_t requested_block_size =
           options_.num_speculative_tokens() + 1;
       CHECK_EQ(requested_block_size, draft_args.dflash2_block_size())
-          << "DFlash2 runtime block size must match the checkpoint's trained "
-             "dflash_config.block_size.";
+          << "DFlash2 runtime block size must match the draft model's "
+             "configured dflash_config.block_size.";
+#if defined(USE_NPU)
       CHECK(!target_is_hybrid_recurrent_ ||
             ::xllm::ExecutionConfig::get_instance().enable_graph())
           << "DFlash2 with a hybrid recurrent target requires ACL Graph: the "
              "expanded spec-verify replay path preserves the accepted GDN "
              "checkpoint, while eager validation is not lossless.";
+#endif
     }
     // Context hidden comes from the target.
     const ModelArgs& target_args = impl_->context_.get_model_args();

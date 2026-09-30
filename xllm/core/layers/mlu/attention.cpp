@@ -229,28 +229,29 @@ void AttentionImpl::prefill_forward(
     }
   }
 
-  xllm::kernel::mlu::batch_prefill(query,
-                                   key,
-                                   value,
-                                   output,
-                                   output_lse,
-                                   attn_metadata.q_cu_seq_lens,
-                                   attn_metadata.kv_cu_seq_lens,
-                                   /*alibi_slope=*/std::nullopt,
-                                   /*alibi_bias=*/std::nullopt,
-                                   /*q_quant_scale=*/std::nullopt,
-                                   /*k_quant_scale=*/std::nullopt,
-                                   /*v_quant_scale=*/std::nullopt,
-                                   /*out_quant_scale=*/std::nullopt,
-                                   block_tables,
-                                   attn_metadata.max_query_len,
-                                   attn_metadata.max_seq_len,
-                                   scale_,
-                                   /*is_causal=*/true,
-                                   sliding_window_,
-                                   /*window_size_right=*/-1,
-                                   /*compute_dtype=*/"float",
-                                   return_lse);
+  xllm::kernel::mlu::batch_prefill(
+      query,
+      key,
+      value,
+      output,
+      output_lse,
+      attn_metadata.q_cu_seq_lens,
+      attn_metadata.kv_cu_seq_lens,
+      /*alibi_slope=*/std::nullopt,
+      /*alibi_bias=*/std::nullopt,
+      /*q_quant_scale=*/std::nullopt,
+      /*k_quant_scale=*/std::nullopt,
+      /*v_quant_scale=*/std::nullopt,
+      /*out_quant_scale=*/std::nullopt,
+      block_tables,
+      attn_metadata.max_query_len,
+      attn_metadata.max_seq_len,
+      scale_,
+      !attn_metadata.non_causal_window_right.has_value(),
+      sliding_window_,
+      attn_metadata.non_causal_window_right.value_or(-1),
+      /*compute_dtype=*/"float",
+      return_lse);
 }
 
 void AttentionImpl::decoder_forward(

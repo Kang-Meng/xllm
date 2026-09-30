@@ -2,6 +2,22 @@ include(cc_test)
 
 cc_test(
   NAME
+    draft_model_config_test
+  CPU_ONLY
+  SRCS
+    draft_model_config_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/runtime/draft_model_config.cpp
+  DEPS
+    :util
+    :platform
+    $<$<BOOL:${USE_NPU}>:config>
+    torch
+    glog::glog
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     forward_output_test
   CPU_ONLY
   SRCS

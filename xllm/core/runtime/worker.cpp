@@ -58,8 +58,9 @@ Worker::Worker(const ParallelArgs& parallel_args,
     } else if (algorithm == "DFlash") {
       impl_ = new DFlashWorkerImpl(parallel_args, device, options);
     } else if (SpeculativeConfig::is_dflash2_algorithm(algorithm)) {
-#if !defined(USE_NPU)
-      LOG(FATAL) << "DFlash2 speculative decoding is only supported on NPU.";
+#if !defined(USE_NPU) && !defined(USE_MLU)
+      LOG(FATAL)
+          << "DFlash2 speculative decoding is only supported on NPU and MLU.";
 #endif
       impl_ = new DFlash2WorkerImpl(parallel_args, device, options);
     } else if (algorithm == "DSpark") {

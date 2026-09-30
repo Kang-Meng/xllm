@@ -172,7 +172,8 @@ torch::Tensor Glm5NextDecoderLayerImpl::forward(
     KVCache& kv_cache,
     const ModelInputParams& input_params,
     std::optional<PendingMHC>* pending_mhc,
-    bool is_last_layer) {
+    bool is_last_layer,
+    bool materialize_output) {
   residual = std::nullopt;
 
   const bool has_pending_storage = pending_mhc != nullptr;
@@ -255,7 +256,9 @@ torch::Tensor Glm5NextDecoderLayerImpl::forward(
     ffn_output = sparse_moe_->forward_selected(
         ffn_input, route.reduce_weight, route.expert_id, input_params);
   }
-  if (mhc_plan.defer_post) {
+  // Auxiliary hidden capture needs the post-mHC residual streams at this
+  // layer boundary. Keep fusion within the layer and consume any pending input.
+  if (mhc_plan.defer_post && !materialize_output) {
     pending_mhc->emplace(
         PendingMHC{ffn_output, residual_ffn, ffn_hc.post, ffn_hc.comb});
     hidden_states = ffn_output;

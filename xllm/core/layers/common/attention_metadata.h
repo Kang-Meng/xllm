@@ -159,6 +159,9 @@ struct AttentionMetadata {
   bool is_dummy;
   // Whether to apply causal mask. Default: true.
   bool is_causal = true;
+  // Optional non-causal prefill window for backends that consume it.
+  // An absent window preserves the backend's existing masking behavior.
+  std::optional<int32_t> non_causal_window_right;
 #if defined(USE_DCU)
   bool use_dense_flash_attention = false;
 #endif
