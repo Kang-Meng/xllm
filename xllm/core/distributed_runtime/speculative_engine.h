@@ -130,4 +130,11 @@ class SuffixSpeculativeEngine : public SpeculativeEngineBase<LLMEngine> {
   ~SuffixSpeculativeEngine() override = default;
 };
 
+class SuffixVLMSpeculativeEngine final
+    : public SpeculativeEngineBase<VLMEngine> {
+ public:
+  explicit SuffixVLMSpeculativeEngine(const runtime::Options& options);
+  ~SuffixVLMSpeculativeEngine() override = default;
+};
+
 }  // namespace xllm

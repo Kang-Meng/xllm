@@ -48,6 +48,8 @@ class VLMWorkerImpl : public WorkerImpl {
 
   std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
+  std::vector<std::vector<int32_t>> get_prompt_lookup_hints() override;
+
  protected:
   std::optional<ForwardOutput> step_for_schedule_overlap(
       ForwardInput& input) override;

@@ -39,6 +39,18 @@ class Sampler final {
       const SamplingParameters& params,
       const torch::Tensor& filter_mask = torch::Tensor()) const;
 
+  // Applies every in-place logit processor from the sampling parameters
+  // (frequency/presence penalties, repetition penalties, then the token
+  // bitmask or the dense filter mask) and returns the row subset to sample
+  // from: `logits` itself unless the parameters select sample indices.
+  // forward() builds on this; callers that only need the processed logits
+  // (e.g. greedy speculative verification, which samples separately) can
+  // call it directly and skip the sampling passes.
+  static torch::Tensor apply_logits_processors(
+      torch::Tensor& logits,
+      const SamplingParameters& params,
+      const torch::Tensor& filter_mask = torch::Tensor());
+
   // helper functions
   // probs: [..., vocab_size]
   static torch::Tensor greedy_sample(const torch::Tensor& probs);

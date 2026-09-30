@@ -805,7 +805,11 @@ Master::Master(const Options& options, EngineType type)
     apply_runtime_kv_cache_options(options_, spec_options);
 
     if (use_suffix_spec) {
-      engine_ = std::make_unique<SuffixSpeculativeEngine>(spec_options);
+      if (type == EngineType::VLMSSM) {
+        engine_ = std::make_unique<SuffixVLMSpeculativeEngine>(spec_options);
+      } else {
+        engine_ = std::make_unique<SuffixSpeculativeEngine>(spec_options);
+      }
     } else {
       if (type == EngineType::VLMSSM) {
         engine_ =

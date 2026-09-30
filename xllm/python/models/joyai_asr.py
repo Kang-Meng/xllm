@@ -459,6 +459,9 @@ class JoyaiASRForConditionalGeneration(PyModelBase):
         self._encode_cache: dict[int, tuple[torch.Tensor, list[int]]] = {}
         self._encode_cache_bytes = 0
         self._encode_cache_budget_bytes = int(config.get("encode_cache_mb", 256)) * 1024 * 1024
+        # Most-recent prefill's per-audio CTC hypotheses, in encode item
+        # order; consumed by get_prompt_lookup_hints for speculative drafts.
+        self._ctc_results: list[list[int]] = []
 
     # ------------------------------------------------------------------
     # Connection logic: Conformer -> LLM
@@ -534,6 +537,7 @@ class JoyaiASRForConditionalGeneration(PyModelBase):
             pad_counts = [int(n) for n in audio_meta[:, 1].tolist()]
         cached: list[tuple[torch.Tensor, list[int]] | None] = [self._encode_cache.get(h) for h in hash_keys]
         if hash_keys and all(e is not None for e in cached):
+            self._ctc_results = [list(e[1]) for e in cached]
             return self._assemble_blocks([(e[0], e[1]) for e in cached], pad_counts)
 
         # Host-side split; only the miss batch moves to the device below.
@@ -612,7 +616,16 @@ class JoyaiASRForConditionalGeneration(PyModelBase):
                         )
                     )
                 miss_pos += 1
+        self._ctc_results = [list(hyp) for _, hyp in entries]
         return self._assemble_blocks(entries, pad_counts)
+
+    def get_prompt_lookup_hints(self) -> list[list[int]]:
+        """Return current audio CTC proposals in encode item order.
+
+        Proposals never bypass target-model verification. A request with no
+        CTC hypothesis simply receives no useful draft.
+        """
+        return [list(tokens) for tokens in self._ctc_results]
 
     def get_input_embeddings(
         self,

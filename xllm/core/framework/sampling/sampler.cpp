@@ -29,12 +29,12 @@ limitations under the License.
 
 namespace xllm {
 
-SampleOutput Sampler::forward(torch::Tensor& logits,
-                              const SamplingParameters& params,
-                              const torch::Tensor& filter_mask) const {
+torch::Tensor Sampler::apply_logits_processors(
+    torch::Tensor& logits,
+    const SamplingParameters& params,
+    const torch::Tensor& filter_mask) {
   const torch::Tensor& effective_filter_mask =
       filter_mask.defined() ? filter_mask : params.filter_mask;
-  SampleOutput output;
   // apply frequency and presence penalties
   if (params.frequency_penalties.defined()) {
     apply_frequency_presence_penalties(logits,
@@ -51,24 +51,11 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   }
 
   torch::Tensor sample_logits = logits;
-  torch::Tensor sample_temperatures = params.temperatures;
-  torch::Tensor sample_top_k = params.top_k;
-  torch::Tensor sample_top_p = params.top_p;
   torch::Tensor sample_filter_bitmask = params.filter_bitmask;
   const bool use_sample_indices =
       params.selected_token_idxes.numel() != params.sample_idxes.numel();
   if (use_sample_indices) {
     sample_logits = logits.index_select(/*dim=*/0, params.sample_idxes);
-    if (params.temperatures.defined()) {
-      sample_temperatures =
-          params.temperatures.index_select(/*dim=*/0, params.sample_idxes);
-    }
-    if (params.top_k.defined()) {
-      sample_top_k = params.top_k.index_select(/*dim=*/0, params.sample_idxes);
-    }
-    if (params.top_p.defined()) {
-      sample_top_p = params.top_p.index_select(/*dim=*/0, params.sample_idxes);
-    }
     if (sample_filter_bitmask.defined()) {
       sample_filter_bitmask =
           sample_filter_bitmask.index_select(/*dim=*/0, params.sample_idxes);
@@ -89,6 +76,33 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
         << effective_filter_mask.size(1)
         << ", sample_logits.size(1)=" << sample_logits.size(1);
     sample_logits = sample_logits + effective_filter_mask;
+  }
+  return sample_logits;
+}
+
+SampleOutput Sampler::forward(torch::Tensor& logits,
+                              const SamplingParameters& params,
+                              const torch::Tensor& filter_mask) const {
+  SampleOutput output;
+  torch::Tensor sample_logits =
+      apply_logits_processors(logits, params, filter_mask);
+
+  torch::Tensor sample_temperatures = params.temperatures;
+  torch::Tensor sample_top_k = params.top_k;
+  torch::Tensor sample_top_p = params.top_p;
+  const bool use_sample_indices =
+      params.selected_token_idxes.numel() != params.sample_idxes.numel();
+  if (use_sample_indices) {
+    if (params.temperatures.defined()) {
+      sample_temperatures =
+          params.temperatures.index_select(/*dim=*/0, params.sample_idxes);
+    }
+    if (params.top_k.defined()) {
+      sample_top_k = params.top_k.index_select(/*dim=*/0, params.sample_idxes);
+    }
+    if (params.top_p.defined()) {
+      sample_top_p = params.top_p.index_select(/*dim=*/0, params.sample_idxes);
+    }
   }
 
   if (params.all_greedy_sample && !params.logprobs && !params.return_probs &&

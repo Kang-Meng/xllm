@@ -87,6 +87,10 @@ SuffixSpeculativeEngine::SuffixSpeculativeEngine(
     const runtime::Options& options)
     : SpeculativeEngineBase<LLMEngine>(options, /*use_draft_engine=*/false) {}
 
+SuffixVLMSpeculativeEngine::SuffixVLMSpeculativeEngine(
+    const runtime::Options& options)
+    : SpeculativeEngineBase<VLMEngine>(options, /*use_draft_engine=*/false) {}
+
 template <typename TargetEngine>
 runtime::DecodeGraphWarmupConfig
 SpeculativeEngineBase<TargetEngine>::decode_graph_warmup_config() const {

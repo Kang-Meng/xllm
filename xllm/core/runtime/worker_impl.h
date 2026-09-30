@@ -273,6 +273,12 @@ class WorkerImpl {
   }
 #endif
 
+  // Optional prompt proposals for speculative drafting, collected from the
+  // most recently completed prefill; empty when the model provides none.
+  virtual std::vector<std::vector<int32_t>> get_prompt_lookup_hints() {
+    return {};
+  }
+
   virtual layer::LmHead get_lm_head() { return model_->get_lm_head(); }
 
   virtual void set_lm_head(layer::LmHead& head) { model_->set_lm_head(head); }

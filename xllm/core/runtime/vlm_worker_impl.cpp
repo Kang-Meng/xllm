@@ -19,6 +19,7 @@ limitations under the License.
 #include <folly/Unit.h>
 #include <folly/futures/Future.h>
 #include <glog/logging.h>
+#include <pybind11/stl.h>
 #include <torch/torch.h>
 
 #include <memory>
@@ -31,6 +32,7 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
+#include "models/llm/py_causal_lm.h"
 #include "models/model_registry.h"
 #include "runtime/params_utils.h"
 #include "util/threadpool.h"
@@ -154,6 +156,20 @@ std::optional<ForwardOutput> VLMWorkerImpl::execute_no_sync_on_stream(
   return step_internal(input, sync_policy, record_ready_event);
 }
 
+std::vector<std::vector<int32_t>> VLMWorkerImpl::get_prompt_lookup_hints() {
+  auto* python_model = dynamic_cast<PyCausalLM*>(model_.get());
+  if (python_model == nullptr) {
+    return {};
+  }
+  pybind11::gil_scoped_acquire gil;
+  pybind11::object top_model = python_model->python_model();
+  if (!pybind11::hasattr(top_model, "get_prompt_lookup_hints")) {
+    return {};
+  }
+  return top_model.attr("get_prompt_lookup_hints")()
+      .cast<std::vector<std::vector<int32_t>>>();
+}
+
 std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     const ForwardInput& input,
     ForwardSyncPolicy sync_policy,
@@ -219,12 +235,11 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
 
   ForwardOutput output;
   if (sampling_params.selected_token_idxes.defined()) {
-    auto sample_output = sampler_->forward(logits, sampling_params);
     output.logits = logits;
+    if (!input.skip_sampling_for_logits_only) {
+      output.sample_output = sampler_->forward(logits, sampling_params);
+    }
     COUNTER_ADD(execution_latency_seconds_sampling, timer.elapsed_seconds());
-
-    // set sample output to output
-    output.sample_output = sample_output;
 
     // carry over the sampling params
     output.do_sample = sampling_params.do_sample;

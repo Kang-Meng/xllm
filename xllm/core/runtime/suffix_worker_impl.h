@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -31,7 +32,8 @@ class SuffixWorkerImpl : public SpeculativeWorkerImpl {
  public:
   SuffixWorkerImpl(const ParallelArgs& parallel_args,
                    const torch::Device& device,
-                   const runtime::Options& options);
+                   const runtime::Options& options,
+                   WorkerType worker_type = WorkerType::LLM);
 
   ~SuffixWorkerImpl() override = default;
 
@@ -45,8 +47,15 @@ class SuffixWorkerImpl : public SpeculativeWorkerImpl {
                         const DraftProposal& draft_proposal,
                         const ForwardOutput& target_output);
 
+  void store_prompt_hint(const std::string& request_id,
+                         std::vector<int32_t> hint);
+  void drop_prompt_hint(const std::string& request_id);
+
  private:
   std::unique_ptr<SuffixDecodingCache> suffix_cache_;
+  bool vlm_target_ = false;
+  std::unordered_map<std::string, std::vector<int32_t>> model_prompt_hints_;
+  std::deque<std::string> model_prompt_hints_order_;
   std::unordered_map<std::string, std::vector<int32_t>> suffix_recent_tokens_;
   std::unordered_set<std::string> suffix_active_decode_req_ids_;
 };

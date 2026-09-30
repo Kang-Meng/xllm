@@ -143,14 +143,19 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   // Common helper: update sampling params for validation
   void update_sampling_params(SamplingParameters& sampling_params,
                               const int32_t num_val_tokens,
-                              const int32_t total_num_val_tokens);
+                              const int32_t total_num_val_tokens,
+                              bool repeat_unique_history = true);
   void update_sampling_params(SamplingParameters& sampling_params,
                               const std::vector<int32_t>& per_seq_val_tokens,
                               const int32_t total_num_val_tokens);
 
   // prepare inputs for target model at Decode phase (validation).
+  // repeat_unique_history=false skips repeating the unique-token history
+  // tensors when the caller rebuilds them itself (the VLM suffix path
+  // extends them per verification position in extend_validation_history).
   void prepare_validate_inputs(const ForwardInput& inputs,
-                               ForwardInput& validate_inputs);
+                               ForwardInput& validate_inputs,
+                               bool repeat_unique_history = true);
   // Per-seq variant used by adaptive-speculative pruning: each sequence's
   // validate row width equals per_seq_val_tokens[i] (must be in [1, N+1]).
   // The dense meta/token/position/kv-slot buffers are rebuilt as varlen with

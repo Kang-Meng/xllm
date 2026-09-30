@@ -362,7 +362,8 @@ ForwardInput SpeculativeWorkerImpl::update_input_by_last_step_output(
 void SpeculativeWorkerImpl::update_sampling_params(
     SamplingParameters& sampling_params,
     const int32_t num_val_tokens,
-    const int32_t total_num_val_tokens) {
+    const int32_t total_num_val_tokens,
+    const bool repeat_unique_history) {
   std::vector<int32_t> selected_token_idxes_vec;
   selected_token_idxes_vec.reserve(total_num_val_tokens);
   for (int32_t i = 0; i < total_num_val_tokens; i++) {
@@ -380,9 +381,11 @@ void SpeculativeWorkerImpl::update_sampling_params(
   TENSOR_REPEAT(sampling_params.temperatures, num_val_tokens);
   TENSOR_REPEAT(sampling_params.top_p, num_val_tokens);
   TENSOR_REPEAT(sampling_params.top_k, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.unique_token_ids, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.unique_token_counts, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.unique_token_ids_lens, num_val_tokens);
+  if (repeat_unique_history) {
+    TENSOR_REPEAT(sampling_params.unique_token_ids, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.unique_token_counts, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.unique_token_ids_lens, num_val_tokens);
+  }
   TENSOR_REPEAT(sampling_params.do_sample, num_val_tokens);
   TENSOR_REPEAT(sampling_params.filter_mask, num_val_tokens);
   TENSOR_REPEAT(sampling_params.filter_bitmask, num_val_tokens);
@@ -428,7 +431,8 @@ void SpeculativeWorkerImpl::update_sampling_params(
 
 void SpeculativeWorkerImpl::prepare_validate_inputs(
     const ForwardInput& input,
-    ForwardInput& validate_input) {
+    ForwardInput& validate_input,
+    const bool repeat_unique_history) {
   validate_input = input.to(device_, dtype_);
   validate_input.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
@@ -539,8 +543,10 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   input_params.attention.rebuild_device_buffer(device_);
 
   // update the sampling_params
-  update_sampling_params(
-      validate_input.sampling_params, num_val_tokens, total_num_val_tokens);
+  update_sampling_params(validate_input.sampling_params,
+                         num_val_tokens,
+                         total_num_val_tokens,
+                         repeat_unique_history);
 
   scale_speculative_parallel_token_counts(input_params, num_val_tokens);
   align_execution_batch_query_widths(

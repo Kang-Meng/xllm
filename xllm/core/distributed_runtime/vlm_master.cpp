@@ -46,8 +46,21 @@ namespace xllm {
 namespace {
 
 bool should_use_vlm_speculative_engine(const Options& options) {
-  return options.speculative_algorithm() != "Suffix" &&
-         !options.draft_model_path().value_or("").empty();
+  if (options.speculative_algorithm() == "Suffix") {
+    return options.num_speculative_tokens() > 0;
+  }
+  return !options.draft_model_path().value_or("").empty();
+}
+
+// Suffix speculative decoding on VLM verifies greedily; reject sampling
+// requests at admission instead of aborting the worker mid-flight. Keep the
+// predicate in sync with the batch-level greedy check in sampling_params.cpp
+// (the do_sample flag is never set on this path).
+bool is_suffix_vlm_sampling_rejected(const Options& options,
+                                     const RequestParams& sp) {
+  return options.speculative_algorithm() == "Suffix" &&
+         options.num_speculative_tokens() > 0 &&
+         (sp.temperature != 0.0f || sp.top_p != 1.0f || sp.top_k > 0);
 }
 
 std::vector<Message> build_user_messages_from_image_urls(
@@ -233,6 +246,12 @@ void VLMMaster::handle_request(std::string prompt,
         [this] { get_rate_limiter()->decrease_one_request(); });
 
     Timer timer;
+    if (is_suffix_vlm_sampling_rejected(options_, sp)) {
+      CALLBACK_WITH_ERROR(
+          StatusCode::INVALID_ARGUMENT,
+          "Suffix speculative decoding on VLM supports greedy sampling only");
+      return;
+    }
     // verify the prompt
     if (!sp.verify_params(callback)) {
       return;
@@ -285,6 +304,12 @@ void VLMMaster::handle_request(std::vector<Message> messages,
     xllm::ScopeGuard rate_limit_guard(
         [this] { get_rate_limiter()->decrease_one_request(); });
 
+    if (is_suffix_vlm_sampling_rejected(options_, sp)) {
+      CALLBACK_WITH_ERROR(
+          StatusCode::INVALID_ARGUMENT,
+          "Suffix speculative decoding on VLM supports greedy sampling only");
+      return;
+    }
     // verify the prompt
     if (!sp.verify_params(callback)) {
       return;
