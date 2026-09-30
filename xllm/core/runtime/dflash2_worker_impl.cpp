@@ -119,8 +119,9 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   prepare_query_inputs(input, query_input);
   // Proposal blocks share token counts with ordinary chunks. Mark only the
   // prelaunch mode, where XFIA is enabled, and do not reuse the target
-  // spec-verify flag.
-  if (prelaunch_enabled_) {
+  // spec-verify flag. Graph-warmup batches keep the plain chunk metadata:
+  // their draft forwards must not take the XFIA proposal path.
+  if (prelaunch_enabled_ && !input.input_params.meta.is_graph_warmup) {
     query_input.input_params.is_dflash_proposal = true;
   }
 

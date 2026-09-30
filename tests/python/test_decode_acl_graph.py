@@ -235,6 +235,18 @@ def test_linear_state_graph_buffers_are_stable() -> None:
     assert static_num_accepted_tokens.tolist() == [2, 1, 2, 1, 1, 1, 1, 1]
 
 
+def test_dflash_proposal_mode_uses_a_distinct_graph_key() -> None:
+    ordinary_key = DecodeAclGraphRunner._graph_key(8, False, None)
+    proposal_key = DecodeAclGraphRunner._graph_key(
+        8,
+        False,
+        None,
+        is_dflash_proposal=True,
+    )
+
+    assert ordinary_key != proposal_key
+
+
 def test_linear_state_snapshot_restores_all_ssm_checkpoints(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         torch,

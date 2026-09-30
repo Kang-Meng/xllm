@@ -211,6 +211,7 @@ _GraphKey = tuple[
     torch.device | None,
     tuple[int, ...] | None,
     tuple[int, ...],
+    bool,
 ]
 
 
@@ -1118,6 +1119,7 @@ class DecodeAclGraphRunner(BaseRunner):
             input_embedding,
             kpool_query_lens,
             verify_width=verify_width,
+            is_dflash_proposal=bool(getattr(metadata, "is_dflash_proposal", False)),
         )
         entry = self._graphs.get(graph_key)
         first_capture = entry is None
@@ -1260,10 +1262,20 @@ class DecodeAclGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None,
         kpool_query_lens: tuple[int, ...] = (),
         verify_width: int = 1,
+        is_dflash_proposal: bool = False,
     ) -> _GraphKey:
-        """Fix both the token bucket and recurrent group width for a graph."""
+        """Fix graph-captured attention mode as well as execution shape."""
         if input_embedding is None:
-            return padded_batch_size, is_expanded, verify_width, None, None, None, kpool_query_lens
+            return (
+                padded_batch_size,
+                is_expanded,
+                verify_width,
+                None,
+                None,
+                None,
+                kpool_query_lens,
+                is_dflash_proposal,
+            )
         return (
             padded_batch_size,
             is_expanded,
@@ -1272,6 +1284,7 @@ class DecodeAclGraphRunner(BaseRunner):
             input_embedding.device,
             tuple(input_embedding.shape[1:]),
             kpool_query_lens,
+            is_dflash_proposal,
         )
 
     def _padded_kpool_query_lens(
