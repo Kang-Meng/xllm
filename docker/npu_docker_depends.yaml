@@ -1,10 +1,11 @@
 # ==========================================================================
 # xLLM development image - external third-party dependency manifest (single source of truth)
 # ==========================================================================
-# Consumer: the xllm-image-build skill in the xllm-dockerfile repository. When
-#           building the final development image, it reads this file, builds the
-#           declared artifacts in a temporary container, and renders the install
-#           steps into the image.
+# Consumer: the xllm-deps-bundle skill in the xllm-dockerfile repository. It
+#           reads this file, builds the declared artifacts in temporary
+#           containers, and assembles them into one self-extracting run bundle
+#           (op run packages + python wheels + metadata + env-var setup) that
+#           gets installed inside the container alongside xllm itself.
 #
 # Design principles
 #   1. This file is self-contained: it describes which external components xLLM
@@ -36,14 +37,6 @@
 
 schema_version: 1
 
-# Chip flavor to official CANN soc_version mapping. The build cross-checks this
-# mapping against the soc versions supported by the toolkit in the image and
-# fails directly on any mismatch.
-soc_map:
-  a2: ascend910b
-  a3: ascend910_93
-  a5: ascend950
-
 # The components list is also the installation order in the final image.
 # For type=ascend-op-run components, unset ASCEND_CUSTOM_OPP_PATH before
 # installation and prepend the vendor directory to ASCEND_CUSTOM_OPP_PATH after
@@ -54,13 +47,15 @@ components:
   - name: cann-ops-transformer-run
     type: ascend-op-run
     repo: https://gitcode.com/cann/ops-transformer.git
-    # Pin a commit for reproducibility. To follow upstream, change this back to
-    # master and force a rebuild with deps --force.
-    ref: 0e15a6247e4ad52fd31bb8691086d6f28099ece6
+    # Track the moving master branch: upstream keeps evolving and xLLM needs
+    # the latest operators. The build records the actual commit it compiled;
+    # reusing artifacts after master moves prints a HEAD-mismatch warning -
+    # force a rebuild with `bundle --force` when freshness matters.
+    ref: master
     source_dir: ops-transformer
     build:
       # System dependencies recommended by the upstream install_deps.sh. They
-      # are installed only in the temporary build container, not the final image.
+      # are installed only in the temporary build container, not the bundle.
       system_packages: [pigz, dos2unix, patch, make]
       requirements: requirements.txt
       cmd: >-
@@ -70,7 +65,7 @@ components:
         vendor_name: ops_transformer
         # Operators currently required by xLLM. Keep this comma-separated list
         # on one line and append new operators here.
-        ops: quant_lightning_indexer_v2,quant_lightning_indexer_v2_metadata,sparse_flash_mla,sparse_flash_mla_metadata,mega_moe,key_pool,pool_key_indexer
+        ops: quant_lightning_indexer_v2,quant_lightning_indexer_v2_metadata,sparse_flash_mla,sparse_flash_mla_metadata,mega_moe,key_pool,pool_key_indexer,sparse_flash_attention
     artifacts:
       - build_out/*.run
     install:
@@ -96,31 +91,43 @@ components:
       # prove that the package was built for that SoC and is not empty.
       - |
         _v={vendor_dir}
-        _k="$_v/op_impl/ai_core/tbe/kernel/{soc}"
-        test -d "$_k" || { echo "missing SoC kernel root directory: $_k"; exit 8; }
-        test -n "$(ls -A "$_k" 2>/dev/null)" || { echo "empty SoC kernel directory: $_k"; exit 8; }
-        _nk=0
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          _k="$_v/op_impl/ai_core/tbe/kernel/$_soc"
+          test -d "$_k" || { echo "missing SoC kernel root directory: $_k"; exit 8; }
+          test -n "$(ls -A "$_k" 2>/dev/null)" || { echo "empty SoC kernel directory: $_k"; exit 8; }
+        done
         for _op in $(echo {ops} | tr ',' ' '); do
           test -n "$(ls -d $_v/op_impl/ai_core/tbe/*_impl/ascendc/$_op 2>/dev/null)" || { echo "operator missing from package: $_op"; exit 8; }
-          if test -d "$_k/$_op"; then _nk=$((_nk + 1)); fi
         done
-        echo "  operators complete: $(echo {ops} | tr ',' ' ') | with {soc} kernels: $_nk"
+        echo "  operators complete: $(echo {ops} | tr ',' ' ') | kernels for all SoCs in ({soc})"
+      # package must not contain undeclared ops: stale artifacts from a previous
+      # build would shadow the correct implementation via vendor priority
+      - |
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          XLLM_BINCFG="{vendor_dir}/op_impl/ai_core/tbe/kernel/config/$_soc/binary_info_config.json" \
+          XLLM_OPS="{ops}" python3 -c 'import json,os;cfg=json.load(open(os.environ["XLLM_BINCFG"]));d={"".join(p.capitalize() for p in o.split("_")) for o in os.environ["XLLM_OPS"].split(",")};e=sorted(set(cfg)-d);import sys; print(",".join(e)); sys.exit(1) if e else print("  no undeclared ops")'
+        done
       # The op_api library must exist because it provides aclnn entry points.
       - test -n "$(ls {vendor_dir}/op_api/lib/*.so* 2>/dev/null)"
       # CANN dynamically loads these libraries through ASCEND_CUSTOM_OPP_PATH at
       # runtime, so they do not depend on LD_LIBRARY_PATH. Verify that their own
       # dependencies can be resolved by the dynamic linker.
-      # Run ldd -r once to capture both the exit code and the complete log; on
-      # failure, print the log to make diagnosis possible.
-      - ldd -r {vendor_dir}/op_api/lib/*.so* > /tmp/opapi_ldd.log 2>&1 && echo "  op_api library dependencies are self-resolving (no LD_LIBRARY_PATH needed)" || { cat /tmp/opapi_ldd.log; exit 8; }
+      # ldd -r exits 0 even when symbols stay unresolved, so scan its output
+      # instead of trusting the exit code; print the log on failure.
+      - |
+        ldd -r {vendor_dir}/op_api/lib/*.so* > /tmp/opapi_ldd.log 2>&1 || true
+        if grep -Eqi 'undefined symbol|not found' /tmp/opapi_ldd.log; then
+          cat /tmp/opapi_ldd.log; exit 8
+        fi
+        echo "  op_api library dependencies are self-resolving (no LD_LIBRARY_PATH needed)"
 
   # ---- Torch extension wheel (JIT wrapper, py3-none-any, SoC-independent) ----
   - name: cann-ops-transformer-torch-ext
     type: python-wheel
     repo: https://gitcode.com/cann/ops-transformer.git
-    # Pin a commit for reproducibility. To follow upstream, change this back to
-    # master and force a rebuild with deps --force.
-    ref: 0e15a6247e4ad52fd31bb8691086d6f28099ece6
+    # Same moving master branch as cann-ops-transformer-run (shared source_dir:
+    # both components build from one checkout at one commit).
+    ref: master
     source_dir: ops-transformer
     build:
       system_packages: [pigz, dos2unix, patch, make]
@@ -136,6 +143,74 @@ components:
       # Requires a device because it imports torch and torch_npu. It cannot run
       # during image build, which has no NPU device or host driver.
       - python3 -c "import cann_ops_transformer; from cann_ops_transformer import ops; names=[n for n in dir(ops) if not n.startswith('_')]; print('  torch_ext exposed operators:', len(names)); print('  sample:', sorted(names)[:8])"
+
+  # ---- vLLM-Ascend operator run package (MoE hidden-state pre-op) ----
+  - name: vllm-ascend-ops-run
+    type: ascend-op-run
+    # for a2/a5 is expected to fail the SoC kernel check below - that is
+    # intentional fail-fast behavior.
+    # hc_pre ships arch35 (A3/ascend910_93) kernels only; components whose
+    # supported_socs excludes the current soc are skipped at build time.
+    supported_socs: [ascend910_93]
+    repo: https://github.com/vllm-project/vllm-ascend.git
+    # Track the moving main branch (upstream keeps evolving). The actual
+    # compiled commit is recorded in the bundle metadata (components[].commit)
+    # and after install in vendors/xllm_deps_metadata/ - use that for
+    # traceability instead of pinning a ref here.
+    # sparse_flash_attention comes from ops-transformer above; this package
+    # only carries hc_pre.
+    ref: main
+    source_dir: vllm-ascend
+    build:
+      cmd: >-
+        bash csrc/build.sh --pkg --soc={soc} --vendor_name={vendor_name}
+        --ops={ops} -j{jobs} -O3
+      vars:
+        vendor_name: llm_ascend
+        ops: hc_pre
+    artifacts:
+      - csrc/build_out/*.run
+    install:
+      cmd: bash {artifact} --quiet --force --install-for-all
+    verify:
+      # Device-free checks that run inside the bundle install as well.
+      # Compare the CANN version recorded in the package with the target
+      # image so cross-version builds are visible.
+      - |
+        echo "  package custom_opp_compiler_version=$(sed -n 's/^custom_opp_compiler_version=//p' {vendor_dir}/version.info) / image CANN=$(basename ${ASCEND_HOME_PATH:-unknown})"
+      # Every declared operator must be present in the package (ascendc/<op>
+      # is the canonical location), and the target-SoC kernel root directory
+      # must exist and be non-empty.
+      - |
+        _v={vendor_dir}
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          _k="$_v/op_impl/ai_core/tbe/kernel/$_soc"
+          test -d "$_k" || { echo "missing SoC kernel root directory: $_k"; exit 8; }
+          test -n "$(ls -A "$_k" 2>/dev/null)" || { echo "empty SoC kernel directory: $_k"; exit 8; }
+        done
+        for _op in $(echo {ops} | tr ',' ' '); do
+          test -n "$(ls -d $_v/op_impl/ai_core/tbe/*_impl/ascendc/$_op 2>/dev/null)" || { echo "operator missing from package: $_op"; exit 8; }
+        done
+        echo "  operators complete: $(echo {ops} | tr ',' ' ') | kernels for all SoCs in ({soc})"
+      # package must not contain undeclared ops: stale artifacts from a previous
+      # build would shadow the correct implementation via vendor priority
+      - |
+        for _soc in $(echo {soc} | tr ',' ' '); do
+          XLLM_BINCFG="{vendor_dir}/op_impl/ai_core/tbe/kernel/config/$_soc/binary_info_config.json" \
+          XLLM_OPS="{ops}" python3 -c 'import json,os;cfg=json.load(open(os.environ["XLLM_BINCFG"]));d={"".join(p.capitalize() for p in o.split("_")) for o in os.environ["XLLM_OPS"].split(",")};e=sorted(set(cfg)-d);import sys; print(",".join(e)); sys.exit(1) if e else print("  no undeclared ops")'
+        done
+      # The op_api library must exist because it provides aclnn entry points;
+      # its own dependencies must resolve without LD_LIBRARY_PATH (CANN loads
+      # it through ASCEND_CUSTOM_OPP_PATH at runtime).
+      - test -n "$(ls {vendor_dir}/op_api/lib/*.so* 2>/dev/null)"
+      # ldd -r exits 0 even when symbols stay unresolved, so scan its output
+      # instead of trusting the exit code; print the log on failure.
+      - |
+        ldd -r {vendor_dir}/op_api/lib/*.so* > /tmp/opapi_ldd.log 2>&1 || true
+        if grep -Eqi 'undefined symbol|not found' /tmp/opapi_ldd.log; then
+          cat /tmp/opapi_ldd.log; exit 8
+        fi
+        echo "  op_api library dependencies are self-resolving (no LD_LIBRARY_PATH needed)"
 
   # ---- Linear-attention operator library wheel (built per SoC) ----
   - name: flash-linear-attention-npu
