@@ -23,7 +23,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from xllm.python.model_executor.forward_context import get_forward_context
+from xllm.python.model_executor.forward_context import (
+    get_forward_context,
+    wait_for_layer_load,
+)
 
 
 class Attention(nn.Module):
@@ -56,5 +59,6 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
+        wait_for_layer_load(self.layer_id)
         backend = get_forward_context().attention_backend
         return backend.execute(q, k, v, self)

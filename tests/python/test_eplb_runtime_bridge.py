@@ -26,6 +26,7 @@ from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRu
 def test_executor_forwards_worker_eplb_state_to_eager_runner() -> None:
     executor = object.__new__(ModelExecutor)
     executor._kv_bound = True
+    executor._is_spec_draft = False
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = None
     executor.inductor_runner = None

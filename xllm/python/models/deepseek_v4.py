@@ -54,6 +54,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     in_acl_graph,
     record_layer_event,
+    wait_for_layer_load,
 )
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
@@ -793,6 +794,7 @@ class DeepseekV4Attention(Attention):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
+        wait_for_layer_load(self.layer_id)
         num_tokens = hidden.shape[0]
         backend = get_forward_context().attention_backend
         metadata = get_forward_context().metadata

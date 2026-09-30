@@ -35,6 +35,11 @@ struct HostCacheStoreEntry {
   KVCache* cache = nullptr;
 };
 
+enum class StoreTpLayout : uint8_t {
+  TP_REPLICATED,
+  TP_SHARDED,
+};
+
 using HostCacheStoreIndex =
     std::map<BlockType, std::vector<HostCacheStoreEntry>>;
 
@@ -48,6 +53,7 @@ struct KVCacheStoreInitConfig {
   int32_t replica_num = 1;
   uint32_t tp_rank = 0;
   uint32_t tp_size = 1;
+  int32_t cp_rank = 0;
   int32_t kv_split_size = 1;
   int32_t kv_split_rank = 0;
   bool enable_mla = false;
@@ -89,6 +95,7 @@ class KVCacheStore final {
     BlockType block_type = BlockType::KV;
     std::string key_prefix;
     std::vector<torch::Tensor> block_tensors;
+    bool is_put_owner = true;
   };
 
   struct PhysicalRequest {
@@ -111,11 +118,14 @@ class KVCacheStore final {
   KVCacheStore& operator=(const KVCacheStore&) = delete;
 
   void initialize_store_index(HostCacheStoreIndex store_index);
+  StoreTpLayout resolve_tp_layout(BlockType block_type) const;
   std::string build_schema_hash(BlockType block_type,
-                                const KVCache& cache) const;
+                                const KVCache& cache,
+                                StoreTpLayout tp_layout) const;
   std::string build_key_prefix(const std::string& key_component,
                                BlockType block_type,
-                               const std::string& schema_hash) const;
+                               const std::string& schema_hash,
+                               StoreTpLayout tp_layout) const;
   std::string build_key(const StoreEntry& entry,
                         const BlockTransferInfo& block_info) const;
   std::vector<PhysicalRequest> build_requests(

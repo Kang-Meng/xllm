@@ -293,6 +293,126 @@ TEST_F(KVCacheStoreIntegrationTest, NonzeroMlaReplicaPublishesItsSplit) {
   EXPECT_EQ(replica.batch_put(infos), 1U);
 }
 
+TEST_F(KVCacheStoreIntegrationTest, NonzeroCpRankPublishesItsSplit) {
+  for (bool enable_mla : {false, true}) {
+    for (int32_t split_size : {2, 4}) {
+      SCOPED_TRACE(::testing::Message() << "enable_mla=" << enable_mla
+                                        << " split_size=" << split_size);
+      config_.enable_mla = enable_mla;
+      config_.cp_rank = 1;
+      config_.tp_size = 2;
+      config_.tp_rank = 1;
+      config_.kv_split_size = split_size;
+      config_.kv_split_rank = split_size - 1;
+      const std::vector<BlockTransferInfo> infos = {make_block_info(93)};
+      {
+        KVCache cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
+        cache.get_k_cache().fill_(23 + split_size);
+        cache.get_v_cache().fill_(47 + split_size);
+        KVCacheStore writer;
+        ASSERT_TRUE(init_store(writer, cache, config_));
+        ASSERT_EQ(writer.batch_put(infos), 1U);
+      }
+
+      KVCache cache = make_attention_cache(/*host_blocks=*/3, /*width=*/8);
+      KVCacheStore reader;
+      ASSERT_TRUE(init_store(reader, cache, config_));
+      ASSERT_EQ(reader.batch_get(infos), 1U);
+      EXPECT_TRUE(torch::equal(
+          cache.get_k_cache()[0],
+          torch::full_like(cache.get_k_cache()[0], 23 + split_size)));
+      EXPECT_TRUE(torch::equal(
+          cache.get_v_cache()[0],
+          torch::full_like(cache.get_v_cache()[0], 47 + split_size)));
+    }
+  }
+}
+
+TEST(KVCacheStoreTest, SplitPutRequiresBackendForEveryCpAndTpRank) {
+  struct SplitWriter {
+    int32_t cp_rank;
+    uint32_t tp_rank;
+    uint32_t tp_size;
+    int32_t split_size;
+    int32_t split_rank;
+  };
+  const std::vector<SplitWriter> writers = {{0, 0, 1, 2, 0},
+                                            {1, 0, 1, 2, 1},
+                                            {1, 1, 2, 4, 3},
+                                            {0, 5, 8, 4, 2},
+                                            {2, 0, 2, 2, 1},
+                                            {3, 1, 2, 2, 1},
+                                            {0, 1, 2, 2, 1}};
+  for (bool enable_mla : {false, true}) {
+    for (BlockType block_type : {BlockType::KV, BlockType::LINEAR}) {
+      KVCache cache = block_type == BlockType::KV
+                          ? make_attention_cache(/*host_blocks=*/2, /*width=*/8)
+                          : make_linear_cache(/*host_blocks=*/2, /*width=*/8);
+      for (const SplitWriter& writer : writers) {
+        SCOPED_TRACE(::testing::Message()
+                     << "enable_mla=" << enable_mla
+                     << " block_type=" << static_cast<int32_t>(block_type)
+                     << " cp_rank=" << writer.cp_rank << " tp_rank="
+                     << writer.tp_rank << " split_size=" << writer.split_size
+                     << " split_rank=" << writer.split_rank);
+        KVCacheStoreInitConfig config = make_store_config(
+            "split-writer-test", writer.tp_rank, writer.tp_size, enable_mla);
+        config.cp_rank = writer.cp_rank;
+        config.kv_split_size = writer.split_size;
+        config.kv_split_rank = writer.split_rank;
+        HostCacheStoreIndex index;
+        index[block_type].emplace_back(
+            HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+        KVCacheStore store;
+        KVCacheStoreTestPeer::initialize_index(
+            &store, config, std::move(index));
+        KVCacheStoreTestPeer::mark_initialized(&store);
+
+        // No backend can persist these valid buffers. A split owner must
+        // report failure instead of taking the successful replica-skip path.
+        const std::vector<BlockTransferInfo> infos = {
+            make_block_info(94, block_type)};
+        ASSERT_TRUE(
+            KVCacheStoreTestPeer::multi_buffer(store, infos).has_value());
+        EXPECT_EQ(store.batch_put(infos), 0U);
+      }
+    }
+  }
+}
+
+TEST(KVCacheStoreTest, UnsplitPutSkipsOnlySameKeyReplicas) {
+  for (bool enable_mla : {false, true}) {
+    for (BlockType block_type : {BlockType::KV, BlockType::LINEAR}) {
+      KVCache cache = block_type == BlockType::KV
+                          ? make_attention_cache(/*host_blocks=*/2, /*width=*/8)
+                          : make_linear_cache(/*host_blocks=*/2, /*width=*/8);
+      for (int32_t cp_rank : {0, 1}) {
+        for (uint32_t tp_rank : {0U, 1U}) {
+          SCOPED_TRACE(::testing::Message()
+                       << "enable_mla=" << enable_mla
+                       << " block_type=" << static_cast<int32_t>(block_type)
+                       << " cp_rank=" << cp_rank << " tp_rank=" << tp_rank);
+          KVCacheStoreInitConfig config = make_store_config(
+              "unsplit-writer-test", tp_rank, /*tp_size=*/2, enable_mla);
+          config.cp_rank = cp_rank;
+          HostCacheStoreIndex index;
+          index[block_type].emplace_back(
+              HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+          KVCacheStore store;
+          KVCacheStoreTestPeer::initialize_index(
+              &store, config, std::move(index));
+          KVCacheStoreTestPeer::mark_initialized(&store);
+          const bool same_key_replica =
+              cp_rank != 0 ||
+              (enable_mla && block_type == BlockType::KV && tp_rank != 0);
+          EXPECT_EQ(store.batch_put({make_block_info(95, block_type)}),
+                    same_key_replica ? 1U : 0U);
+        }
+      }
+    }
+  }
+}
+
 TEST(KVCacheStoreDeathTest, RejectsInvalidSplitTopologyBeforeStoreSetup) {
   for (const auto& [size, rank] : std::vector<std::pair<int32_t, int32_t>>{
            {0, 0}, {-1, 0}, {4, -1}, {4, 4}}) {

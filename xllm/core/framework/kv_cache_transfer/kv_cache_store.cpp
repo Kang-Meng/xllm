@@ -115,9 +115,11 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
       CHECK(key_components.emplace(entry.key_component).second)
           << "Duplicate KVCacheStore key component for BlockType "
           << static_cast<int32_t>(block_type) << ": " << entry.key_component;
-      std::string schema_hash = build_schema_hash(block_type, *entry.cache);
-      std::string key_prefix =
-          build_key_prefix(entry.key_component, block_type, schema_hash);
+      const StoreTpLayout tp_layout = resolve_tp_layout(block_type);
+      std::string schema_hash =
+          build_schema_hash(block_type, *entry.cache, tp_layout);
+      std::string key_prefix = build_key_prefix(
+          entry.key_component, block_type, schema_hash, tp_layout);
       const BlockTypeTensorMap tensors =
           entry.cache->get_block_type_tensors(block_type);
       std::vector<torch::Tensor> block_tensors;
@@ -125,19 +127,34 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
       for (const auto& tensor_entry : tensors) {
         block_tensors.emplace_back(tensor_entry.second);
       }
+      // Split ranks own distinct Store keys, including nonzero CP/TP ranks.
+      // Deduplicate CP and replicated TP writers only for unsplit keys.
+      const bool is_put_owner =
+          config_.kv_split_size > 1 ||
+          (config_.cp_rank == 0 &&
+           (tp_layout == StoreTpLayout::TP_SHARDED || config_.tp_rank == 0));
       store_entries.emplace_back(StoreEntry{entry.cache_handle,
                                             std::move(entry.key_component),
                                             std::move(schema_hash),
                                             entry.cache,
                                             block_type,
                                             std::move(key_prefix),
-                                            std::move(block_tensors)});
+                                            std::move(block_tensors),
+                                            is_put_owner});
     }
   }
 }
 
+StoreTpLayout KVCacheStore::resolve_tp_layout(BlockType block_type) const {
+  if (config_.enable_mla && block_type == BlockType::KV) {
+    return StoreTpLayout::TP_REPLICATED;
+  }
+  return StoreTpLayout::TP_SHARDED;
+}
+
 std::string KVCacheStore::build_schema_hash(BlockType block_type,
-                                            const KVCache& cache) const {
+                                            const KVCache& cache,
+                                            StoreTpLayout tp_layout) const {
   const BlockTypeTensorMap tensors = cache.get_block_type_tensors(block_type);
   CHECK(!tensors.empty()) << "Host cache has no tensors for BlockType "
                           << static_cast<int32_t>(block_type);
@@ -171,20 +188,18 @@ std::string KVCacheStore::build_schema_hash(BlockType block_type,
                      sizeof(schema_hash.data));
 }
 
-std::string KVCacheStore::build_key_prefix(
-    const std::string& key_component,
-    BlockType block_type,
-    const std::string& schema_hash) const {
+std::string KVCacheStore::build_key_prefix(const std::string& key_component,
+                                           BlockType block_type,
+                                           const std::string& schema_hash,
+                                           StoreTpLayout tp_layout) const {
   std::string prefix = "xllm-kv-v3:";
   append_key_field(prefix, config_.model_id);
   append_key_field(prefix, key_component);
-  if (config_.enable_mla) {
+  if (tp_layout == StoreTpLayout::TP_REPLICATED) {
     prefix.append("mla:");
   } else {
     prefix.append(std::to_string(config_.tp_size));
     prefix.push_back(':');
-  }
-  if (!config_.enable_mla) {
     prefix.append(std::to_string(config_.tp_rank));
     prefix.push_back(':');
   }
@@ -288,14 +303,6 @@ uint32_t KVCacheStore::batch_put(
   if (!is_initialized_ || block_transfer_info.empty()) {
     return 0;
   }
-  if (config_.enable_mla && config_.kv_split_size == 1 &&
-      config_.tp_rank != 0U) {
-    VLOG(1) << "KVCacheStore skips unsplit MLA remote put: tp_rank="
-            << config_.tp_rank << ", kv_split_size=" << config_.kv_split_size
-            << ", kv_split_rank=" << config_.kv_split_rank;
-    return static_cast<uint32_t>(block_transfer_info.size());
-  }
-
   const GroupedRequests grouped = build_grouped_requests(block_transfer_info);
   const std::vector<PhysicalRequest>& requests = grouped.requests;
   const std::vector<RequestGroup>& groups = grouped.groups;
@@ -313,6 +320,12 @@ uint32_t KVCacheStore::batch_put(
   for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
     const RequestGroup& group = groups[group_index];
     const PhysicalRequest& request = requests[group.request_indices.front()];
+    if (!request.entry->is_put_owner) {
+      for (size_t request_index : group.request_indices) {
+        physical_results[request_index] = 1;
+      }
+      continue;
+    }
     const std::optional<MooncakeMultiBuffer> buffer = build_multi_buffer(
         *request.entry,
         block_transfer_info[request.logical_index].dst_block_id);

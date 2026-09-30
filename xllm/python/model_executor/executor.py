@@ -28,7 +28,12 @@ from xllm.python.layers.attention import Attention
 from xllm.python.model_executor.execution_context import (
     LayerCacheAwareExecutionMetadataBuilder,
 )
-from xllm.python.model_executor.forward_context import EplbRuntimeState, LayerSynchronizer
+from xllm.python.model_executor.forward_context import (
+    EplbRuntimeState,
+    LayerLoadContext,
+    LayerLoadSynchronizer,
+    LayerSynchronizer,
+)
 from xllm.python.model_executor.input_batch import (
     InputBatch,
     InputBatchMetadata,
@@ -229,6 +234,7 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        self._is_spec_draft = is_spec_draft
         self._requires_framework_kpool_tail = bool(config.get("requires_framework_kpool_tail", False))
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
@@ -428,6 +434,8 @@ class ModelExecutor:
         eplb_decode_token_mask: torch.Tensor | None = None,
         is_graph_warmup: bool = False,
         input_batch_metadata: InputBatchMetadata | None = None,
+        layer_load_synchronizer: LayerLoadSynchronizer | None = None,
+        layers_per_event: int = 1,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
@@ -453,12 +461,24 @@ class ModelExecutor:
                 is_dummy=bool(getattr(metadata, "is_dummy", False)),
             )
 
+        layer_load_context = (
+            LayerLoadContext(layer_load_synchronizer, layers_per_event) if layer_load_synchronizer is not None else None
+        )
+        # Draft caches use a separate restore event rather than target layer
+        # numbering. Preserve the full wait until that mapping is passed here.
+        if self._is_spec_draft and layer_load_context is not None:
+            layer_load_context.synchronize_all_layers()
+            layer_load_context = None
         graph_runner = self.decode_graph_runner
         if (
             graph_runner is not None
             and (eplb is None or current_platform.is_npu())
             and graph_runner.can_execute(input_ids, metadata, input_embedding)
         ):
+            # Replay bypasses Python attention calls. Also protect first-capture
+            # state snapshots and warmup before entering the graph runner.
+            if layer_load_context is not None:
+                layer_load_context.synchronize_all_layers()
             graph_runner.warmup(
                 input_ids,
                 positions,
@@ -474,6 +494,9 @@ class ModelExecutor:
                 input_batch=input_batch,
             )
         if self.inductor_runner is not None:
+            # Compiled execution must not capture request-specific Host events.
+            if layer_load_context is not None:
+                layer_load_context.synchronize_all_layers()
             return self.inductor_runner.execute(
                 input_ids,
                 positions,
@@ -491,4 +514,5 @@ class ModelExecutor:
             layer_synchronizer=layer_synchronizer,
             eplb=eplb,
             input_batch=input_batch,
+            layer_load_context=layer_load_context,
         )

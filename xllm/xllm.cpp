@@ -1046,14 +1046,6 @@ void validate_config(const std::string& model_type) {
         << "Failed to load model args for model type " << resolved_model_type;
   }
 
-  if (model_args.index_kpool_compress()) {
-    CHECK_LE(kv_cache_store_config.host_blocks_factor(), 1.0)
-        << "Compressed KPool host offload requires request-state scheduler "
-           "support.";
-    CHECK(!kv_cache_store_config.enable_kvcache_store())
-        << "Compressed KPool external storage is not supported yet.";
-  }
-
   if (kv_cache_store_config.enable_kvcache_store()) {
     CHECK(kv_cache_config.enable_prefix_cache())
         << "KV cache Store requires --enable_prefix_cache=true.";

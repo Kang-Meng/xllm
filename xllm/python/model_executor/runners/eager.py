@@ -21,6 +21,7 @@ from xllm.python.model_executor.cp_utils import build_cp_context
 from xllm.python.model_executor.forward_context import (
     EplbRuntimeState,
     ForwardContext,
+    LayerLoadContext,
     LayerSynchronizer,
     forward_context,
 )
@@ -62,6 +63,7 @@ class EagerRunner(BaseRunner):
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
+        layer_load_context: LayerLoadContext | None = None,
     ) -> ModelExecutionOutput:
         cp_context = None
         is_mla = self.attention_backend.is_mla
@@ -116,6 +118,7 @@ class EagerRunner(BaseRunner):
                 metadata,
                 self.layer_caches,
                 layer_synchronizer=layer_synchronizer,
+                layer_load_context=layer_load_context,
                 cp_context=cp_context,
                 eplb=eplb,
                 execution_contexts=execution_contexts,

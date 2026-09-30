@@ -206,7 +206,7 @@ KVCacheTensors create_kv_cache_tensors(
   if (create_options.enable_kv_cache_huge_page_allocator()) {
     tensors.key_cache = alloc_npu_huge_page_tensor(
         kv_cache_shape.key_cache_shape(), key_dtype, npu_format_type);
-    if (!mla_packed_c8) {
+    if (!mla_packed_c8 && kv_cache_shape.has_value_cache_shape()) {
       tensors.value_cache =
           alloc_npu_huge_page_tensor(kv_cache_shape.value_cache_shape(),
                                      create_options.dtype(),
@@ -217,7 +217,7 @@ KVCacheTensors create_kv_cache_tensors(
         torch::empty(kv_cache_shape.key_cache_shape(),
                      torch::dtype(key_dtype).device(create_options.device())),
         npu_format_type);
-    if (!mla_packed_c8) {
+    if (!mla_packed_c8 && kv_cache_shape.has_value_cache_shape()) {
       tensors.value_cache = at_npu::native::npu_format_cast(
           torch::empty(kv_cache_shape.value_cache_shape(),
                        torch::dtype(create_options.dtype())

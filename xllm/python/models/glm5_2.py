@@ -57,7 +57,11 @@ from xllm.python.model_executor.cp_utils import (
     cp_shard_positions,
     cp_shard_rows,
 )
-from xllm.python.model_executor.forward_context import get_forward_context, record_layer_event
+from xllm.python.model_executor.forward_context import (
+    get_forward_context,
+    record_layer_event,
+    wait_for_layer_load,
+)
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
@@ -461,6 +465,7 @@ class Glm52MLAAttention(Attention):
         cos_sin_cache: torch.Tensor,
         prev_topk_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        wait_for_layer_load(self.layer_id)
         num_tokens = hidden.shape[0]
         q_a = self.q_a_proj(hidden)
         q_c = self.q_a_layernorm(q_a)

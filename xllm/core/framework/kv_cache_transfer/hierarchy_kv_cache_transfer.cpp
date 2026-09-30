@@ -280,6 +280,7 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
     store_config.model_id = options_.store_namespace();
     store_config.tp_rank = options_.tp_rank();
     store_config.tp_size = options_.tp_size();
+    store_config.cp_rank = options_.cp_rank();
     store_config.kv_split_size = options_.kv_split_size();
     store_config.kv_split_rank = options_.kv_split_rank();
     store_config.enable_mla = options_.enable_mla();
