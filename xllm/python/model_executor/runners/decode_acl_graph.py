@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -41,8 +42,6 @@ from xllm.python import kernels
 from xllm.python.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
-    build_speculative_ssm_state_indices,
-    linear_state_checkpoint_stride,
 )
 from xllm.python.attention.dsa_metadata import DSA_CACHE_TOKEN
 from xllm.python.attention.expanded_decode_metadata import (
@@ -112,6 +111,23 @@ def _complete_kpool_groups(padded_num_tokens: int, verify_width: int) -> tuple[i
     if full_groups <= 0:
         return ()
     return (verify_width,) * full_groups
+
+
+class _CaptureAttentionMetadata:
+    """Keep the batch layout while routing linear state to reserved slot 0."""
+
+    def __init__(self, metadata: AttentionMetadata) -> None:
+        self._metadata = metadata
+        for name in ("linear_state_indices", "linear_state_read_indices", "linear_state_write_indices"):
+            indices = getattr(metadata, name, None)
+            setattr(self, name, torch.zeros_like(indices) if indices is not None else None)
+        indices = self.linear_state_indices
+        self.has_initial_state = torch.zeros_like(indices, dtype=torch.int32) if indices is not None else None
+        accepted = getattr(metadata, "num_accepted_tokens", None)
+        self.num_accepted_tokens = torch.ones_like(accepted) if accepted is not None else None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._metadata, name)
 
 
 def _padded_rank_slices(
@@ -1314,11 +1330,19 @@ class DecodeAclGraphRunner(BaseRunner):
             self._update_stream = torch.npu.Stream(device=input_ids.device, priority=-1)
             self._replay_done_event = torch.npu.Event()
 
+        capture_metadata = None
+        if first_capture and any(
+            getattr(cache, "conv", None) is not None and getattr(cache, "ssm", None) is not None
+            for cache in self.layer_caches
+        ):
+            # Both KDA checkpoint tables and model-specific metadata builders
+            # must see padding slots before any warmup forward can run.
+            capture_metadata = _CaptureAttentionMetadata(metadata)
         self._fill_entry(
             entry,
             input_ids,
             positions,
-            metadata,
+            capture_metadata if capture_metadata is not None else metadata,
             batch_size,
             input_embedding,
             input_batch,
@@ -1349,6 +1373,25 @@ class DecodeAclGraphRunner(BaseRunner):
 
         if first_capture:
             self._capture(entry)
+            if capture_metadata is not None:
+                # Capture may still read the persistent indices. Order real
+                # metadata writes after it, then rebuild every derived table
+                # in the same storage before the first request replay.
+                torch.npu.current_stream().wait_stream(self._stream)
+                self._fill_entry(
+                    entry,
+                    input_ids,
+                    positions,
+                    metadata,
+                    batch_size,
+                    input_embedding,
+                    input_batch,
+                    verify_width=verify_width,
+                    kpool_query_lens=kpool_query_lens,
+                    local_expanded=expanded_view is not None,
+                )
+                with forward_context(prepare_context):
+                    self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
 
         # Besides ordering input updates, this wait protects the output view
         # returned by the previous replay.  The graph cannot overwrite its
@@ -2194,12 +2237,8 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.static_metadata.new_cache_slots_host_values = real_slots + padding_slots
 
     def _capture(self, entry: _DecodeGraphEntry) -> None:
-        # The pre-capture warmup forwards execute for real. KV/index-cache
-        # writes are idempotent (same slot, same value), but linear-attention
-        # (KDA) conv/ssm state ADVANCES on every run, so warmup + capture
-        # would leave each sequence's recurrent state several steps ahead.
-        # Snapshot the touched state slots and restore them after capture.
-        linear_snapshot = self._snapshot_linear_state(entry)
+        # Warmup forwards execute for real. execute() routes linear state to
+        # reserved slot 0 so these passes cannot advance live request state.
         context = ForwardContext(
             self.attention_backend,
             self.device,
@@ -2209,12 +2248,8 @@ class DecodeAclGraphRunner(BaseRunner):
             eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
         )
-        # The linear snapshot includes V3's framework-owned checkpoints. Its
-        # reads run on the current (default) stream, while the warmup forward
-        # below advances the state on self._stream. NPU cross-stream accesses
-        # to the same memory are not auto-serialized, so make the warmup stream
-        # wait for the snapshot reads to complete first — otherwise the
-        # snapshot may land after the advance and restore stale state.
+        # Metadata was filled on the caller stream; warmup must consume the
+        # completed padding indices and checkpoint tables.
         self._stream.wait_stream(torch.npu.current_stream())
         with forward_context(context), torch.npu.stream(self._stream):
             for _ in range(_CAPTURE_WARMUP_STEPS):
@@ -2235,52 +2270,6 @@ class DecodeAclGraphRunner(BaseRunner):
         with forward_context(context), torch.npu.graph(entry.graph, stream=self._stream):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
-        self._restore_linear_state(entry, linear_snapshot)
-
-    def _snapshot_linear_state(self, entry: _DecodeGraphEntry) -> list[tuple[torch.Tensor, ...]] | None:
-        """Copy the conv/ssm rows the capture run is about to advance."""
-        idx = entry.static_metadata.linear_state_indices
-        if idx is None:
-            return None
-        logical_state_indices = torch.unique(idx)
-        snapshot = []
-        for cache in self.layer_caches:
-            conv = getattr(cache, "conv", None)
-            ssm = getattr(cache, "ssm", None)
-            if conv is None or ssm is None:
-                continue
-            checkpoint_stride = linear_state_checkpoint_stride(
-                conv,
-                ssm,
-            )
-            ssm_indices = build_speculative_ssm_state_indices(
-                logical_state_indices,
-                checkpoint_stride,
-                dtype=idx.dtype,
-            ).reshape(-1)
-            snapshot.append(
-                (
-                    conv,
-                    ssm,
-                    logical_state_indices,
-                    ssm_indices,
-                    conv.index_select(0, logical_state_indices).clone(),
-                    ssm.index_select(0, ssm_indices).clone(),
-                )
-            )
-        return snapshot or None
-
-    @staticmethod
-    def _restore_linear_state(
-        entry: _DecodeGraphEntry,
-        snapshot: list[tuple[torch.Tensor, ...]] | None,
-    ) -> None:
-        if not snapshot:
-            return
-        for conv, ssm, state_indices, ssm_indices, conv_rows, ssm_rows in snapshot:
-            conv.index_copy_(0, state_indices, conv_rows)
-            ssm.index_copy_(0, ssm_indices, ssm_rows)
-        torch.npu.synchronize()
 
     def _forward_static(self, entry: _DecodeGraphEntry) -> ModelExecutionOutput:
         if entry.static_input_embedding is None:

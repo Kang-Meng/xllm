@@ -16,12 +16,13 @@
 
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
+from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
 from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadata
 from xllm.python.model_executor.runners.decode_acl_graph import (
@@ -247,42 +248,70 @@ def test_dflash_proposal_mode_uses_a_distinct_graph_key() -> None:
     assert ordinary_key != proposal_key
 
 
-def test_linear_state_snapshot_restores_all_ssm_checkpoints(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(synchronize=lambda: None),
-        raising=False,
-    )
+@pytest.mark.parametrize("verify_width", [1, 2])
+def test_capture_preserves_live_state_until_first_replay(monkeypatch: pytest.MonkeyPatch, verify_width: int) -> None:
+    npu = MagicMock()
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
     runner = _runner()
-    conv = torch.arange(48, dtype=torch.float32).reshape(4, 2, 6)
-    ssm = torch.arange(48, dtype=torch.float32).reshape(12, 1, 2, 2)
-    runner.bind_layer_caches(
-        [
-            SimpleNamespace(
-                conv=conv,
-                ssm=ssm,
-            )
-        ]
-    )
-    entry = SimpleNamespace(
-        static_metadata=SimpleNamespace(
-            linear_state_indices=torch.tensor([1, 1, 3, 3], dtype=torch.int64),
+    slots = torch.arange(1, 5, verify_width)
+    metadata = _metadata(slots)
+    metadata.has_initial_state = torch.ones_like(slots)
+    metadata.num_accepted_tokens = torch.full_like(slots, verify_width, dtype=torch.int32)
+    if verify_width > 1:
+        metadata.is_spec_verify = True
+        metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
+            kv_seq_lens=metadata.kv_seq_lens,
+            block_table=metadata.block_table,
+            paged_kv_indptr=metadata.paged_kv_indptr,
+            paged_kv_indices=metadata.paged_kv_indices,
+            paged_kv_last_page_len=metadata.paged_kv_last_page_len,
+            paged_attention_tiling_data=None,
+            kv_seq_lens_host=None,
+            kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
         )
-    )
+    conv = torch.arange(8, dtype=torch.float32)
+    ssm = torch.arange(8 * verify_width, dtype=torch.float32)
+    initial_conv, initial_ssm = conv.clone(), ssm.clone()
+    runner.bind_layer_caches([LayerCache(None, None, conv=conv, ssm=ssm)])
+    output = torch.empty(4, 1)
+    prepared = []
 
-    snapshot = runner._snapshot_linear_state(entry)
-    assert torch.equal(snapshot[0][2], torch.tensor([1, 3], dtype=torch.int64))
-    assert torch.equal(snapshot[0][3], torch.tensor([3, 4, 5, 9, 10, 11], dtype=torch.int64))
-    expected_conv = conv.clone()
-    expected_ssm = ssm.clone()
-    conv.zero_()
-    ssm.zero_()
-    runner._restore_linear_state(entry, snapshot)
+    def prepare(static: object, *, graph_mode: bool) -> None:
+        indices = static.linear_state_indices[::verify_width]
+        checkpoints = indices[:, None] * verify_width + torch.arange(verify_width)
+        if static.linear_state_checkpoint_indices is None:
+            static.linear_state_checkpoint_indices = torch.empty_like(checkpoints)
+        static.linear_state_checkpoint_indices.copy_(checkpoints)
+        prepared.append(static)
 
-    assert torch.equal(conv[[1, 3]], expected_conv[[1, 3]])
-    checkpoint_indices = torch.tensor([3, 4, 5, 9, 10, 11])
-    assert torch.equal(ssm[checkpoint_indices], expected_ssm[checkpoint_indices])
+    def advance(_entry: object = None) -> torch.Tensor:
+        static = prepared[-1]
+        indices = static.linear_state_indices[::verify_width]
+        checkpoints = static.linear_state_checkpoint_indices
+        accepted = static.num_accepted_tokens[: indices.numel()].long()
+        values = ssm[checkpoints[torch.arange(indices.numel()), accepted - 1]] + 1
+        conv.index_copy_(0, indices, conv[indices] + 1)
+        ssm.index_copy_(0, checkpoints.flatten(), values.repeat_interleave(verify_width))
+        output.copy_(values.repeat_interleave(verify_width).view(-1, 1))
+        if npu.NPUGraph.return_value.replay.call_count == 0:
+            torch.testing.assert_close(conv[1:], initial_conv[1:])
+            torch.testing.assert_close(ssm[verify_width:], initial_ssm[verify_width:])
+        return output
+
+    runner.attention_backend.prepare = prepare
+    monkeypatch.setattr(runner, "_forward_static", advance)
+    npu.NPUGraph.return_value.replay.side_effect = advance
+    tokens = torch.arange(4, dtype=torch.int32)
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        result = runner.execute(tokens, tokens, metadata)
+    expected = initial_ssm[slots * verify_width + verify_width - 1] + 1
+    torch.testing.assert_close(result.flatten(), expected.repeat_interleave(verify_width))
+    torch.testing.assert_close(conv[slots], initial_conv[slots] + 1)
+    checkpoints = slots[:, None] * verify_width + torch.arange(verify_width)
+    torch.testing.assert_close(ssm[checkpoints], expected[:, None].expand_as(checkpoints))
+    torch.testing.assert_close(metadata.linear_state_indices, slots)
+    assert metadata.has_initial_state.tolist() == [1] * slots.numel()
+    assert metadata.num_accepted_tokens.tolist() == [verify_width] * slots.numel()
 
 
 def test_explicit_verify_reuses_row_aligned_paging_metadata() -> None:
