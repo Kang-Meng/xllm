@@ -794,6 +794,8 @@ class BuildDistWheel(bdist_wheel):
             name += f"_torch{torch_version}"
 
         self.distribution.metadata.name = name
+        # build may have already finalized or generated metadata under the base name.
+        self.reinitialize_command("egg_info")
         super().finalize_options()
 
     def run(self) -> None:

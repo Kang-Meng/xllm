@@ -17,6 +17,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+from types import ModuleType
 from unittest import mock
 
 from setuptools import Distribution
@@ -24,7 +25,7 @@ from setuptools import Distribution
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _load_setup_module():
+def _load_setup_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("xllm_setup", os.path.join(_REPO_ROOT, "setup.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -32,7 +33,7 @@ def _load_setup_module():
 
 
 class WheelMetadataTest(unittest.TestCase):
-    def test_device_name_reaches_generated_metadata(self) -> None:
+    def test_wheel_name_refreshes_cached_metadata(self) -> None:
         setup_module = _load_setup_module()
         with (
             tempfile.TemporaryDirectory() as temp_dir,
@@ -53,12 +54,13 @@ class WheelMetadataTest(unittest.TestCase):
             }
 
             distribution.get_command_obj("egg_info").ensure_finalized()
+            distribution.run_command("egg_info")
             distribution.get_command_obj("bdist_wheel").ensure_finalized()
             distribution.run_command("egg_info")
 
             egg_info = distribution.get_command_obj("egg_info")
             with open(os.path.join(egg_info.egg_info, "PKG-INFO"), encoding="utf-8") as metadata:
-                self.assertIn("Name: xllm_mlu_torch2.10.0\n", metadata)
+                self.assertIn("Name: xllm_mlu_torch2.10.0\n", metadata.read())
 
 
 if __name__ == "__main__":
