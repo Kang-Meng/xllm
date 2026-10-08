@@ -809,9 +809,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         cp_context = get_forward_context().cp_context
         rope_dim = getattr(layer, "qk_rope_head_dim", None)
         if cp_context is not None and rope_dim == 0:
-            # GLM-5 Next restores the fresh-Prefill rows before entering its
-            # NoPE DSA island, so the backend writes and attends the complete
-            # logical stream once, then the model reshards the output.
+            # GLM-5 Next NoPE DSA under CP prefill. The model always merges to
+            # global rows, so the latent cache is written once through the
+            # global slot mapping and every projection/indexer GEMM upstream
+            # ran with M = the global token count, exactly as in the
+            # cp_size == 1 path. Under CP this rank attends only its own real
+            # query rows and scatters them back into the global layout for
+            # the model's reshard -- the partitioned call IS the CP path
+            # (no runtime switch: cp membership is uniform across the CP
+            # group, so gating on it can never desynchronize ranks, and the
+            # ON-vs-OFF equivalence was oracle-validated bit-identical).
             if cache_is_preprocessed:
                 raise RuntimeError("CP prefill does not support preprocessed MLA cache inputs")
             if topk is None:
@@ -822,6 +829,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 raise RuntimeError("CP prefill does not support SFA C8 packed KV cache")
             if metadata.slot_mapping is None:
                 raise RuntimeError("CP prefill requires a global MLA slot mapping")
+            # kv_split_size > 1 with CP is refused at admission for every
+            # model that reaches this NoPE branch (master.cpp: "Python
+            # GLM-5 Next CP initially requires kv_split_size == 1") -- the
+            # startup validation is the single owner of that policy, so the
+            # backend keeps no second copy of the check.
             torch.ops.xllm_ops.reshape_paged_cache(
                 metadata.slot_mapping,
                 k_latent_3d,
@@ -832,15 +844,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             # glm5_next currently requires kv_split_size=1, making this an
             # identity while preserving the uniform metadata-driven boundary.
             attention_nope, block_table = self._materialize_cp_cache(nope_cache, metadata, cp_context)
-            return self._mla_sparse(
+            return self._mla_cp_partitioned_query(
                 q_latent,
-                None,
-                attention_nope,
-                None,
                 topk,
+                attention_nope,
                 block_table,
-                self._mla_actual_seq_q,
-                self._mla_actual_seq_kv,
+                cp_context,
                 layer_id,
             )
 
@@ -950,6 +959,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         )
         attention_nope, block_table = self._materialize_cp_cache(nope_cache, metadata, cp_context)
         attention_rope, _ = self._materialize_cp_cache(rope_cache, metadata, cp_context)
+        # Early-return BEFORE the SFA layout materialization: an empty rank
+        # (no real query rows) would otherwise pay two full-page new_zeros
+        # and full-page index_copy_ whose result the helper's empty-rows
+        # branch immediately discards -- waste that scales with the
+        # segment's total KV page count.
         if cp_context.query_index.numel() == 0:
             return q_latent.new_zeros(q_latent.shape)
         if metadata.has_kv_shard and metadata.kv_split_size > 1:
@@ -957,12 +971,50 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 attention_nope,
                 attention_rope,
             )
-        query_index = cp_context.query_index
-        segment_sequences = cp_context.segment_seq_indices
-        q_real = q_latent.index_select(0, query_index).contiguous()
-        q_pe_real = q_pe.index_select(0, query_index).contiguous()
-        topk_real = topk.index_select(0, query_index).contiguous()
-        local_block_table = block_table.index_select(0, segment_sequences).contiguous()
+        return self._mla_cp_sparse_scatter(
+            q_latent,
+            q_pe,
+            attention_nope,
+            attention_rope,
+            topk,
+            block_table,
+            cp_context,
+            cp_context.query_index,
+            layer_id,
+        )
+
+    def _mla_cp_sparse_scatter(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor | None,
+        attention_nope: torch.Tensor,
+        attention_rope: torch.Tensor | None,
+        topk: torch.Tensor,
+        block_table: torch.Tensor,
+        cp_context: CpContext,
+        rows: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """One sparse MLA call over this rank's real query rows, scattered back.
+
+        ``rows`` are the rows to attend and scatter along -- the caller picks
+        their provenance (the RoPE CP branch's local ``query_index`` rows, the
+        NoPE branch's ``shard_index[query_index]`` global rows). The selected
+        rows run through one ``sparse_mode=3`` call over their exact causal
+        prefix, and the result is scattered back into a global-layout tensor
+        at those rows (padding and peer-owned rows stay zero).
+
+        An empty ``rows`` set means this rank owns no real query row (all of
+        its chunks are padding): the latent-cache write already ran in the
+        caller, so the rank stays a full CP participant in the collectives
+        and there is nothing left to attend.
+        """
+        if rows.numel() == 0:
+            return q_latent.new_zeros(q_latent.shape)
+        q_real = q_latent.index_select(0, rows).contiguous()
+        q_pe_real = q_pe.index_select(0, rows).contiguous() if q_pe is not None else None
+        topk_real = topk.index_select(0, rows).contiguous()
+        local_block_table = block_table.index_select(0, cp_context.segment_seq_indices).contiguous()
         output = self._mla_sparse(
             q_real,
             q_pe_real,
@@ -974,9 +1026,59 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             cp_context.segment_kv_seq_lens_tensor,
             layer_id,
         )
-        local_output = q_latent.new_zeros(q_latent.shape)
-        local_output.index_copy_(0, query_index, output)
-        return local_output
+        scattered = q_latent.new_zeros(q_latent.shape)
+        scattered.index_copy_(0, rows, output)
+        return scattered
+
+    def _mla_cp_partitioned_query(
+        self,
+        q_latent: torch.Tensor,
+        topk: torch.Tensor,
+        attention_nope: torch.Tensor,
+        block_table: torch.Tensor,
+        cp_context: CpContext,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Sparse NoPE MLA over only this rank's real CP query rows.
+
+        ``q_latent``/``topk`` are the model's **global** ``[T_global, ...]``
+        rows -- the same tensors a ``cp_size == 1`` forward would attend --
+        so every upstream projection and the indexer keep ``M = T_global``
+        and stay bit-identical to ``cp_size == 1``. ``shard_index`` maps a
+        local row to
+        its global row, so ``shard_index[query_index]`` selects exactly this
+        rank's real rows. One sparse MLA call then covers every non-empty
+        ``(sequence, half)`` segment over its exact causal prefix
+        (``sparse_mode=3``), and the result is scattered back into a
+        global-layout tensor at those rows so the model's legacy
+        ``cp_shard_rows`` can reslice it unchanged (padding and peer-owned rows
+        stay zero).
+
+        The latent-cache write and its materialization stay on the legacy global
+        ``slot_mapping`` path and are done by the caller, exactly as in the
+        unpartitioned branch. ``kv_split_size > 1`` is rejected before the call:
+        only the identity materialization path is verified for GLM-5.3-Flash
+        (which forces ``kv_split_size == 1``).
+        """
+        # real_rows carries this rank's CP shard's global row indices: the CP
+        # partition assigns each global row to exactly one rank and
+        # shard_index maps this rank's local rows onto its own distinct
+        # global rows, so the rows index_copy_ scatters along are unique
+        # by construction. A duplicate here would mean a broken CpContext
+        # upstream (not a shape this function defends against at a
+        # per-forward device-sync cost).
+        real_rows = cp_context.shard_index.index_select(0, cp_context.query_index)
+        return self._mla_cp_sparse_scatter(
+            q_latent,
+            None,
+            attention_nope,
+            None,
+            topk,
+            block_table,
+            cp_context,
+            real_rows,
+            layer_id,
+        )
 
     # SFA C8 packed-row tile size. Must stay in sync with the C++
     # `MlaPackedC8Layout` struct in kv_cache_shape.h.

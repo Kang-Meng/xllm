@@ -28,7 +28,9 @@ from xllm.python.attention.npu_paged_attention import (  # noqa: E402
     NpuPagedAttentionBackend,
     _build_stable_sfa_page_layout,
 )
-from xllm.python.model_executor.cp_utils import build_cp_context  # noqa: E402
+from xllm.python.model_executor.cp_utils import (  # noqa: E402
+    build_cp_context,
+)
 from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
     _StaticAttentionMetadata,
 )
@@ -326,24 +328,57 @@ def test_materialization_rejects_incomplete_owner_distribution() -> None:
         backend._prepare_kv_shard_materialization(metadata)
 
 
-def test_mla_nope_cp_uses_global_rows_and_skips_rope_cache() -> None:
+def _nope_cp_partition_context() -> SimpleNamespace:
+    """A cp_size=2 plan over 6 global tokens where this rank owns global rows
+    ``[0, 2, 3, 4, 5]`` and local row 2 is padding, spread over three
+    ``(sequence, half)`` segments.
+
+    ``query_index`` selects local rows and ``shard_index`` maps each of them to
+    its global row, so ``query_index`` is not the identity and neither is
+    ``shard_index``; in particular ``shard_index[query_index]`` (the real
+    global rows) differs from ``query_index`` itself -- local row 1 is global
+    row 2, while global row 1 belongs to the peer rank. A bug that drops the
+    real-row selection, or that indexes the global query with the local
+    ``query_index``, changes which rows are attended and is observable in the
+    assertions below.
+    """
+    return SimpleNamespace(
+        query_index=torch.tensor([0, 1, 3, 4, 5], dtype=torch.int64),
+        shard_index=torch.tensor([0, 2, -1, 3, 4, 5], dtype=torch.int64),
+        segment_seq_indices=torch.tensor([0, 0, 1], dtype=torch.int64),
+        q_cu_seqlens_tensor=torch.tensor([2, 3, 5], dtype=torch.int32),
+        segment_kv_seq_lens_tensor=torch.tensor([10, 12, 7], dtype=torch.int32),
+        total_local=6,
+    )
+
+
+def _nope_cp_partition_backend(nope_cache: torch.Tensor) -> NpuPagedAttentionBackend:
     backend = object.__new__(NpuPagedAttentionBackend)
     backend._metadata = SimpleNamespace(
         has_kv_shard=False,
         kv_split_size=1,
-        slot_mapping=torch.arange(4, dtype=torch.int64),
+        slot_mapping=torch.arange(6, dtype=torch.int64),
     )
-    backend._block_table_i32 = torch.tensor([[0]], dtype=torch.int32)
-    nope_cache = torch.zeros(1, 8, 2)
+    backend._block_table_i32 = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
     backend._kv_caches = [SimpleNamespace(key=nope_cache, value=None)]
-    actual_seq_q = torch.tensor([4], dtype=torch.int32)
-    actual_seq_kv = torch.tensor([4], dtype=torch.int32)
-    backend._mla_actual_seq_q = actual_seq_q
-    backend._mla_actual_seq_kv = actual_seq_kv
-    cp_context = SimpleNamespace()
-    q_latent = torch.zeros(4, 1, 2)
-    k_latent = torch.ones(4, 1, 2)
-    topk = torch.arange(4, dtype=torch.int32).view(4, 1)
+    backend._mla_actual_seq_q = torch.tensor([3, 6], dtype=torch.int32)
+    backend._mla_actual_seq_kv = torch.tensor([12, 7], dtype=torch.int32)
+    return backend
+
+
+def test_mla_nope_cp_partitions_query_and_skips_rope_cache() -> None:
+    """Partitioned NoPE CP path: the model's **global** latent/query/topk reach
+    the backend unchanged, the sparse kernel runs on this rank's real global
+    rows only, and the result is scattered back into the global layout the
+    model's ``cp_shard_rows`` then reslices.
+    """
+    nope_cache = torch.zeros(4, 8, 2)
+    backend = _nope_cp_partition_backend(nope_cache)
+    cp_context = _nope_cp_partition_context()
+    real_rows = cp_context.shard_index.index_select(0, cp_context.query_index)
+    q_latent = torch.arange(12, dtype=torch.float32).view(6, 1, 2)
+    k_latent = torch.ones(6, 1, 2)
+    topk = torch.arange(6, dtype=torch.int32).view(6, 1)
     layer = SimpleNamespace(layer_id=0, qk_rope_head_dim=0)
 
     with (
@@ -352,10 +387,11 @@ def test_mla_nope_cp_uses_global_rows_and_skips_rope_cache() -> None:
             return_value=SimpleNamespace(cp_context=cp_context),
         ),
         patch.object(torch.ops.xllm_ops, "reshape_paged_cache", create=True) as reshape,
-        patch.object(backend, "_mla_sparse", return_value=torch.ones_like(q_latent)) as sparse,
+        patch.object(backend, "_mla_sparse", side_effect=lambda query, *_args: torch.ones_like(query)) as sparse,
     ):
         output = backend.execute_mla(q_latent, None, k_latent, None, layer, topk)
 
+    # The global latent is written straight through the global slot mapping.
     reshape.assert_called_once_with(
         backend._metadata.slot_mapping,
         k_latent,
@@ -364,12 +400,77 @@ def test_mla_nope_cp_uses_global_rows_and_skips_rope_cache() -> None:
         nope_cache,
     )
     sparse_args = sparse.call_args.args
-    assert sparse_args[1] is None
-    assert sparse_args[3] is None
-    assert sparse_args[5] is backend._block_table_i32
-    assert sparse_args[6] is actual_seq_q
-    assert sparse_args[7] is actual_seq_kv
-    torch.testing.assert_close(output, torch.ones_like(q_latent))
+    assert sparse_args[0].shape == (5, 1, 2)  # only this rank's real global rows
+    torch.testing.assert_close(sparse_args[0], q_latent.index_select(0, real_rows))
+    assert sparse_args[1] is None  # q_pe
+    assert sparse_args[3] is None  # rope cache
+    torch.testing.assert_close(
+        sparse_args[5],
+        torch.tensor([[0, 1], [0, 1], [2, 3]], dtype=torch.int32),
+    )
+    assert sparse_args[6] is cp_context.q_cu_seqlens_tensor
+    assert sparse_args[7] is cp_context.segment_kv_seq_lens_tensor
+    # Global-layout return: computed rows filled, the peer-owned row zero.
+    assert output.shape == q_latent.shape
+    torch.testing.assert_close(output.index_select(0, real_rows), torch.ones(5, 1, 2))
+    torch.testing.assert_close(output[1], torch.zeros(1, 2))
+
+
+def test_mla_nope_cp_empty_rank_skips_sparse_and_keeps_cache_write() -> None:
+    nope_cache = torch.zeros(4, 8, 2)
+    backend = _nope_cp_partition_backend(nope_cache)
+    cp_context = _nope_cp_partition_context()
+    cp_context.query_index = torch.zeros(0, dtype=torch.int64)
+    q_latent = torch.zeros(6, 1, 2)
+    k_latent = torch.ones(6, 1, 2)
+    topk = torch.arange(6, dtype=torch.int32).view(6, 1)
+    layer = SimpleNamespace(layer_id=0, qk_rope_head_dim=0)
+
+    with (
+        patch(
+            "xllm.python.attention.npu_paged_attention.get_forward_context",
+            return_value=SimpleNamespace(cp_context=cp_context),
+        ),
+        patch.object(torch.ops.xllm_ops, "reshape_paged_cache", create=True) as reshape,
+        patch.object(backend, "_mla_sparse", create=True) as sparse,
+    ):
+        output = backend.execute_mla(q_latent, None, k_latent, None, layer, topk)
+
+    sparse.assert_not_called()
+    reshape.assert_called_once_with(
+        backend._metadata.slot_mapping,
+        k_latent,
+        k_latent,
+        nope_cache,
+        nope_cache,
+    )
+    assert output.shape == q_latent.shape
+    assert torch.equal(output, torch.zeros_like(q_latent))
+
+
+def test_mla_nope_cp_partition_helper_returns_global_zeros_for_empty_rank() -> None:
+    """An all-padding rank owns no real global row, so the helper itself must
+    skip the sparse kernel and return a zero tensor in the global layout the
+    model reslices."""
+    nope_cache = torch.zeros(4, 8, 2)
+    backend = _nope_cp_partition_backend(nope_cache)
+    cp_context = _nope_cp_partition_context()
+    cp_context.query_index = torch.zeros(0, dtype=torch.int64)
+    q_latent = torch.arange(12, dtype=torch.float32).view(6, 1, 2)
+
+    with patch.object(backend, "_mla_sparse", create=True) as sparse:
+        output = backend._mla_cp_partitioned_query(
+            q_latent,
+            torch.zeros(6, 1, 1, dtype=torch.int32),
+            nope_cache,
+            backend._block_table_i32,
+            cp_context,
+            0,
+        )
+
+    sparse.assert_not_called()
+    assert output.shape == q_latent.shape
+    assert torch.equal(output, torch.zeros_like(q_latent))
 
 
 @pytest.mark.parametrize("has_kv_shard", [False, True])

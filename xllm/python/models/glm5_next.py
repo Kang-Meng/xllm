@@ -1301,7 +1301,15 @@ class Glm5NextIndexer(nn.Module):
         layer: Attention,
         backend,
     ) -> torch.Tensor:
-        """Update the selected KPool layout and return SFA token indices."""
+        """Update the selected KPool layout and return SFA token indices.
+
+        Context parallelism is a no-op here: the owning ``Glm5NextMlaAttention``
+        merges its rows to global token order before calling the indexer, so the
+        key-side cache write and the query-side top-k both run on the complete
+        logical stream exactly as in the ``cp_size == 1`` path. Only the sparse
+        MLA call is CP-partitioned, and that happens inside the attention
+        backend (see ``NpuPagedAttentionBackend._mla_cp_partitioned_query``).
+        """
         batch_size, seq_len = hidden_states.shape[:2]
         num_tokens = batch_size * seq_len
         full_num_tokens = num_tokens
@@ -1687,6 +1695,12 @@ class Glm5NextMlaAttention(Attention):
         """
         forward_context = get_forward_context()
         cp_context = getattr(forward_context, "cp_context", None)
+        # CP keeps the model-side row layout identical to ``cp_size == 1``:
+        # merge to global order, project, index and top-k on the complete
+        # logical stream, then reshard the layer output. Only the backend's
+        # sparse attention partitions the query rows (always, under CP);
+        # because that happens after every projection, the GEMM batch shape
+        # -- and so every projection's bits -- stays exactly the legacy one.
         if cp_context is not None:
             hidden_states = cp_merge_rows(
                 hidden_states.reshape(-1, self.hidden_size),
@@ -2763,9 +2777,22 @@ class Glm5NextModel(nn.Module):
         if input_layout is not None:
             h = input_layout.gather(h)
         if cp_context is not None:
-            h = cp_merge_rows(h, cp_context)
+            # ``cp_merge_rows`` only permutes the row axis, while packing ``h``
+            # [T_local, D] and the auxiliary capture [T_local, D * k] along the
+            # feature axis (same local rows) and splitting the result back only
+            # touch the feature axis. The two operations therefore commute, so
+            # one wider all-gather is exactly equivalent to merging each tensor
+            # separately -- at half the collectives. The gather stays
+            # unconditional on the local row count: a rank that skipped it,
+            # even for T_local == 0, would deadlock the CP group.
             if aux_hidden_buffer is not None:
-                aux_hidden_buffer = cp_merge_rows(aux_hidden_buffer, cp_context)
+                width = h.shape[-1]
+                fused = torch.cat([h, aux_hidden_buffer], dim=-1)
+                fused = cp_merge_rows(fused, cp_context)
+                h = fused[..., :width]
+                aux_hidden_buffer = fused[..., width:]
+            else:
+                h = cp_merge_rows(h, cp_context)
         return self.aux_hidden_capture.finalize(h, aux_hidden_buffer)
 
 
