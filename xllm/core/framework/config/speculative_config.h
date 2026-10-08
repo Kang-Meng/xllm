@@ -55,6 +55,16 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, kDFlash2Algorithm);
   }
 
+  // The glm5_next + DFlash2 pairing this whitelist admits is proven correct
+  // (aux-hidden capture restores global rows under CP, unit-tested in
+  // test_glm5_next_cp.py). Both the master admission gate and the draft
+  // worker gate consume this predicate so the whitelist cannot drift when
+  // further algorithms or models are cleared.
+  static bool is_glm5_next_dflash2(std::string_view model_type,
+                                   std::string_view algorithm) {
+    return model_type == "glm5_next" && is_dflash2_algorithm(algorithm);
+  }
+
   static bool is_mtp_algorithm(std::string_view algorithm) {
     return boost::iequals(algorithm, "MTP");
   }

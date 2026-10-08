@@ -332,11 +332,20 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
           [&parallel_args, &device, &options] {
             // The draft consumes the target's aux hidden states, which the
             // worker does not expose under CP; reject cp_size > 1 except
-            // DeepSeek-V4 on NPU.
+            // DeepSeek-V4 on NPU, or GLM-5-Next on NPU with the DFlash2
+            // algorithm specifically (design.md §3.1 Gate B4). GLM-5-Next's
+            // aux-hidden-buffer CP restore is proven correct
+            // (test_glm5_next_cp.py's
+            // test_layer_capture_restores_global_rows_with_context_parallelism)
+            // but was only verified for DFlash2's dispatch path; other
+            // block-diffusion algorithms (DFlash(1), DSpark) stay rejected.
             bool allow_cp = false;
             if (parallel_args.cp_size() > 1 && Platform::is_npu()) {
-              allow_cp = util::is_deepseek_v4_model_type(util::get_model_type(
-                  options.model_path(), options.backend()));
+              const std::string model_type =
+                  util::get_model_type(options.model_path(), options.backend());
+              allow_cp = util::is_deepseek_v4_model_type(model_type) ||
+                         SpeculativeConfig::is_glm5_next_dflash2(
+                             model_type, options.speculative_algorithm());
             }
             if (!allow_cp) {
               CHECK_LE(parallel_args.cp_size(), 1)

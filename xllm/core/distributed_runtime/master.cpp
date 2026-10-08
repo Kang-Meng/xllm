@@ -195,10 +195,20 @@ std::optional<std::string> validate_model_cp(const Options& options,
       return "Model-side CP supports only the generate task";
     }
     const bool is_dsv4_model = util::is_deepseek_v4_model_type(model_type);
+    // glm5_next is exempted alongside deepseek_v4 only for DFlash2
+    // specifically: DFlash2's aux-hidden-buffer restore under CP is proven
+    // correct (glm5_next.py's cp_merge_rows on aux_hidden_buffer, mirroring
+    // DeepseekV4CpContext.gather_restore) and unit-tested
+    // (test_glm5_next_cp.py's
+    // test_layer_capture_restores_global_rows_with_context_parallelism).
+    // Eagle3/DFlash(1)/DSpark are not exempted here: their glm5_next-specific
+    // dispatch paths were not individually verified (design.md §3.1 Gate B1).
+    const bool is_glm5_next_dflash2 = SpeculativeConfig::is_glm5_next_dflash2(
+        model_type, options.speculative_algorithm());
     if (engine_type == EngineType::SSM &&
         SpeculativeConfig::requires_aux_hidden_capture(
             options.speculative_algorithm()) &&
-        !is_dsv4_model) {
+        !is_dsv4_model && !is_glm5_next_dflash2) {
       return "Current model-side CP does not support aux-hidden-capture "
              "speculative algorithms (Eagle3/DFlash/DSpark); run speculative "
              "decoding on a cp_size=1 Decode instance.";
@@ -249,9 +259,17 @@ std::optional<std::string> validate_model_cp(const Options& options,
                model_type +
                "; supported models are qwen3, glm_moe_dsa, and glm5_next.";
       }
-      if (model_type == "glm5_next" && engine_type == EngineType::SSM) {
-        return "Python GLM-5 Next CP does not support target-side speculative "
-               "verification; run speculation on a cp_size=1 Decode instance";
+      // Consume the shared glm5_next+DFlash2 pairing predicate (like the
+      // aux-capture gate above) so the algorithm whitelist cannot drift
+      // when further algorithms are cleared. The explicit model_type
+      // qualifier stays: this gate scopes a glm5_next-specific refusal,
+      // and dropping the qualifier would newly refuse qwen3/glm_moe_dsa
+      // SSM shapes that pass today with a glm5_next-specific message.
+      if (model_type == "glm5_next" && engine_type == EngineType::SSM &&
+          !is_glm5_next_dflash2) {
+        return "Python GLM-5 Next CP does not support this target-side "
+               "speculative algorithm; run speculation on a cp_size=1 "
+               "Decode instance";
       }
       if (model_type == "glm_moe_dsa" && engine_type == EngineType::SSM &&
           SpeculativeConfig::is_mtp_algorithm(
@@ -299,7 +317,13 @@ std::optional<std::string> validate_model_cp(const Options& options,
         }
         const SchedulerConfig& scheduler_config =
             SchedulerConfig::get_instance();
-        if (scheduler_config.enable_chunked_prefill()) {
+        // Chunked prefill under CP is admitted only for the DFlash2
+        // whitelist that was actually validated (the spec-verify chunked
+        // prefill path); every other glm5_next CP combination keeps the
+        // pre-existing refusal, matching how the aux-capture gates above
+        // converge on the same predicate.
+        if (scheduler_config.enable_chunked_prefill() &&
+            !is_glm5_next_dflash2) {
           return "Python GLM-5 Next CP initially requires "
                  "enable_chunked_prefill=false";
         }

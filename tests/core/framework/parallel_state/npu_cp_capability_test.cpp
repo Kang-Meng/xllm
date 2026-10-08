@@ -338,14 +338,53 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                                  /*global_world_size=*/8)
                    .has_value());
 
+  // B4 (implement.md, design.md §3.1 Gates B1/B2): the blanket
+  // EngineType::SSM rejection for glm5_next+CP is narrowed to exclude only
+  // DFlash2 — MTP/Suffix (and any other non-DFlash2 algorithm) stay
+  // rejected with the new, narrower message text.
+  EXPECT_EQ(validate_model_cp(options,
+                              EngineType::SSM,
+                              "glm5_next",
+                              /*global_world_size=*/8),
+            std::optional<std::string>(
+                "Python GLM-5 Next CP does not support this target-side "
+                "speculative algorithm; run speculation on a cp_size=1 "
+                "Decode instance"));
+
+  // DFlash2 is exempted from both the general aux-hidden-capture gate
+  // (Gate B1, alongside deepseek_v4) and the glm5_next-specific blanket SSM
+  // rejection (Gate B2): the combination must now be admitted.
+  options.speculative_algorithm("DFlash2");
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::SSM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  // Case-insensitive, mirroring SpeculativeConfig::is_dflash2_algorithm.
+  options.speculative_algorithm("dflash2");
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::SSM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+
+  // Eagle3/DFlash(1)/DSpark are aux-hidden-capture algorithms too, but were
+  // not individually verified for glm5_next (design.md §3.1 Gate B1) — they
+  // must still hit the general aux-hidden-capture gate, not the narrower
+  // glm5_next-specific one (is_dsv4_model is false and is_glm5_next_dflash2
+  // is false for these, so the earlier, general gate fires first).
+  options.speculative_algorithm("Eagle3");
   EXPECT_EQ(
       validate_model_cp(options,
                         EngineType::SSM,
                         "glm5_next",
                         /*global_world_size=*/8),
       std::optional<std::string>(
-          "Python GLM-5 Next CP does not support target-side speculative "
-          "verification; run speculation on a cp_size=1 Decode instance"));
+          "Current model-side CP does not support aux-hidden-capture "
+          "speculative algorithms (Eagle3/DFlash/DSpark); run speculative "
+          "decoding on a cp_size=1 Decode instance."));
+
+  options.speculative_algorithm("MTP");
 
   execution_config.python_graph_backend("inductor");
   EXPECT_EQ(validate_model_cp(options,
@@ -418,6 +457,14 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                 "Python GLM-5 Next CP initially requires kv_split_size == 1"));
   parallel_config.kv_split_size(1);
 
+  // Chunked prefill under glm5_next+CP converges on the DFlash2 whitelist
+  // like the aux-capture gates above: only the pairing that was validated
+  // end to end (the spec-verify chunked-prefill path) is admitted, every
+  // other combination keeps the pre-existing refusal. The model-level
+  // cp_context mechanism itself remains proven by tests/python/
+  // test_glm5_next_cp.py's
+  // test_kda_cp_chunked_prefill_matches_noncp_nonchunked_baseline, which
+  // exercises the path directly without the master gate.
   scheduler_config.enable_chunked_prefill(true);
   EXPECT_EQ(
       validate_model_cp(options,
@@ -426,6 +473,14 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                         /*global_world_size=*/8),
       std::optional<std::string>("Python GLM-5 Next CP initially requires "
                                  "enable_chunked_prefill=false"));
+  // The validated DFlash2 pairing keeps the chunked path open.
+  options.speculative_algorithm("DFlash2");
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  options.speculative_algorithm("MTP");
   scheduler_config.enable_chunked_prefill(false);
 
   scheduler_config.enable_mix_batch(true);

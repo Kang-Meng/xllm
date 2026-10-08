@@ -2658,6 +2658,13 @@ class Glm5NextDecoderLayer(nn.Module):
 
 
 class Glm5NextModel(nn.Module):
+    # The forward's CP exit merges BOTH the final hidden state and the
+    # aux-hidden buffer back to global row order (cp_merge_rows on each),
+    # so a target-side spec-verify draft reads token-aligned rows. The
+    # eager runner's CP spec-verify gate keys on this capability; models
+    # that leave the aux buffer CP-sharded must not set it.
+    restores_aux_hidden_under_cp = True
+
     def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg

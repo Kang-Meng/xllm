@@ -54,6 +54,30 @@ class EagerRunner(BaseRunner):
     cp_size: int = 1
     cp_rank: int = 0
 
+    @property
+    def model_restores_aux_hidden_under_cp(self) -> bool:
+        """Whether the bound model restores the aux-hidden buffer to global
+        row order under Context Parallelism, which is what a target-side
+        speculative-verification draft (e.g. DFlash2) consumes.
+
+        Having capture layers configured is NOT sufficient: a model may
+        capture aux rows yet leave them in CP-sharded order at the model
+        exit (glm_moe_dsa merges only ``hidden``; glm5_next and
+        deepseek_v4 merge the aux buffer too), and a draft reading
+        sharded rows silently consumes token-misaligned hidden.
+
+        Necessary, NOT sufficient. This attribute is the model-side half of
+        the admission only: whether a given model+algorithm pairing may run
+        spec-verify under CP is decided solely by the C++ admission
+        (master.cpp's CP gates + the SpeculativeConfig predicates), the one
+        place that knows the algorithm. A shape this runner sees has already
+        passed that admission; this gate then fails closed on any model
+        that never proved the aux-restore capability (explicit opt-in class
+        attribute; anything else -- including every model that never wired
+        the attribute -- stays refused).
+        """
+        return bool(getattr(self.model, "restores_aux_hidden_under_cp", False))
+
     def execute(
         self,
         input_ids: torch.Tensor,
@@ -71,10 +95,22 @@ class EagerRunner(BaseRunner):
         is_mla_cp_prefill = (
             not is_empty_rank and self.cp_size > 1 and is_mla and (metadata.is_prefill or metadata.is_chunked_prefill)
         )
-        if is_mla_cp_prefill and metadata.is_spec_verify:
-            raise NotImplementedError("Python Context-Parallel does not support MTP speculative verification")
+        # B6 (research/b6-spec-verify-v3-cp-safety.md) confirmed the
+        # model-level aux-hidden-buffer CP restore -- and, for glm5_next's
+        # KDA layers specifically, the ephemeral _spec_verify_v3 scratch-pool
+        # mechanism DFlash2's target-verify path uses -- are both CP-safe.
+        # Gate on the model's explicit CP aux-restore capability rather
+        # than capture configuration: only a model that merges the aux
+        # buffer back to global row order (glm5_next, deepseek_v4) feeds a
+        # draft token-aligned rows; capture configured but sharded
+        # (glm_moe_dsa) or absent must both stay refused.
+        if is_mla_cp_prefill and metadata.is_spec_verify and not self.model_restores_aux_hidden_under_cp:
+            raise NotImplementedError(
+                "Python Context-Parallel does not support this target-side speculative verification path"
+            )
         if is_mla_cp_prefill and metadata.is_mixed:
             raise NotImplementedError("Python Context-Parallel does not support mixed batches")
+
         use_cp_context = (
             not is_empty_rank and self.cp_size > 1 and (metadata.is_prefill or (is_mla and metadata.is_chunked_prefill))
         )

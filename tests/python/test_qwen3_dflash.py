@@ -88,6 +88,8 @@ def test_top_level_and_nested_rope_config_formats_are_supported() -> None:
         ({"dp_size": 2, "world_size": 1}, "world_size must equal"),
         ({"dp_size": 2, "dp_rank": 2, "world_size": 2}, "dp_rank must be"),
         ({"tp_rank": 1}, "tp_rank must be"),
+        ({"cp_size": 2, "world_size": 4}, "world_size must equal"),
+        ({"cp_size": 0}, "parallel sizes must be positive"),
     ],
 )
 def test_config_rejects_invalid_parallel_settings(
@@ -96,6 +98,18 @@ def test_config_rejects_invalid_parallel_settings(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _config(**overrides)
+
+
+def test_config_accepts_context_parallel_world_size() -> None:
+    config = _config(dp_size=2, cp_size=2, world_size=4)
+
+    assert config.cp_size == 2
+
+
+def test_config_defaults_world_size_with_cp_dimension() -> None:
+    config = _config(dp_size=2, cp_size=2)
+
+    assert config.world_size == 4
 
 
 def test_config_rejects_reduced_draft_vocabulary() -> None:

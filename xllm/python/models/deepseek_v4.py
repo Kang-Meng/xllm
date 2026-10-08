@@ -1742,6 +1742,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module):
     """DeepSeek-V4 transformer body."""
 
+    # The forward's CP exit restores BOTH the final hidden state and the
+    # aux-hidden buffer to global row order (gather_restore on each), so a
+    # target-side spec-verify draft reads token-aligned rows. The eager
+    # runner's CP spec-verify gate keys on this capability; models that
+    # leave the aux buffer CP-sharded must not set it.
+    restores_aux_hidden_under_cp = True
+
     def __init__(self, cfg: DeepseekV4Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg

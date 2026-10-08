@@ -2047,7 +2047,7 @@ class TestBindKvCaches:
 # ---------------------------------------------------------------------------
 
 
-def _make_eager_runner(*, is_mla: bool = True) -> EagerRunner:
+def _make_eager_runner(*, is_mla: bool = True, restores_aux_hidden_under_cp: bool = False) -> EagerRunner:
     runner = object.__new__(EagerRunner)
     backend_type = _MlaStubAttentionBackend if is_mla else StubAttentionBackend
     runner.attention_backend = backend_type()
@@ -2056,6 +2056,12 @@ def _make_eager_runner(*, is_mla: bool = True) -> EagerRunner:
     runner.device = torch.device("cpu")
     runner.layer_caches = []
     runner.model = MagicMock(return_value=torch.ones(2))
+    # A plain MagicMock() auto-vivifies any attribute lookup (including
+    # ``restores_aux_hidden_under_cp``) as a truthy MagicMock; pin it
+    # explicitly so ``model_restores_aux_hidden_under_cp`` reflects the
+    # caller's intent instead of defaulting to True by mock
+    # auto-attribute accident.
+    runner.model.restores_aux_hidden_under_cp = restores_aux_hidden_under_cp
     return runner
 
 
@@ -2221,8 +2227,14 @@ def test_eager_runner_rejects_mixed_cp_before_collective() -> None:
     assert not runner.attention_backend._prepared
 
 
-def test_eager_runner_rejects_mla_spec_verify_cp_before_collective() -> None:
-    runner = _make_eager_runner()
+def test_eager_runner_rejects_mla_spec_verify_cp_without_aux_restore_before_collective() -> None:
+    """Gate B5 (design.md §3.1): a model without the CP aux-restore
+    capability -- including one that HAS capture layers configured but
+    leaves the aux buffer CP-sharded (glm_moe_dsa merges only ``hidden``),
+    and any model type that never wired the attribute -- still must not
+    reach a spec-verify CP forward: a draft would read token-misaligned
+    rows."""
+    runner = _make_eager_runner(restores_aux_hidden_under_cp=False)
     metadata = SimpleNamespace(
         is_prefill=False,
         is_chunked_prefill=True,
@@ -2232,12 +2244,79 @@ def test_eager_runner_rejects_mla_spec_verify_cp_before_collective() -> None:
 
     with (
         patch("xllm.python.model_executor.runners.eager.build_cp_context") as build_context,
-        pytest.raises(NotImplementedError, match="MTP speculative verification"),
+        pytest.raises(NotImplementedError, match="target-side speculative verification"),
     ):
         runner.execute(torch.zeros(1), torch.zeros(1), metadata)
 
     build_context.assert_not_called()
     assert not runner.attention_backend._prepared
+
+
+def test_eager_runner_admits_mla_spec_verify_cp_with_aux_restore_capability() -> None:
+    """Gate B5 (design.md §3.1): a model that restores the aux-hidden
+    buffer to global row order under CP (e.g. DFlash2's glm5_next target,
+    per B6's CP-safety trace, research/b6-spec-verify-v3-cp-safety.md) is
+    no longer blanket-rejected for a spec-verify CP forward -- the batch
+    proceeds and builds a cp_context normally."""
+    runner = _make_eager_runner(restores_aux_hidden_under_cp=True)
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_mixed=False,
+        is_spec_verify=True,
+        q_seq_lens_host=torch.tensor([2], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([2], dtype=torch.int32),
+    )
+
+    with patch(
+        "xllm.python.model_executor.runners.eager.build_cp_context",
+        return_value=object(),
+    ) as build_context:
+        runner.execute(torch.zeros(2), torch.arange(2), metadata)
+
+    build_context.assert_called_once_with([2], [2], 4, 2, torch.device("cpu"))
+    assert runner.attention_backend._prepared
+
+
+def test_model_restores_aux_hidden_under_cp_reflects_model_attribute() -> None:
+    """Unit-level coverage of the ``model_restores_aux_hidden_under_cp``
+    property itself, independent of the ``execute`` gating above."""
+    runner = _make_eager_runner(restores_aux_hidden_under_cp=False)
+    assert runner.model_restores_aux_hidden_under_cp is False
+
+    runner.model.restores_aux_hidden_under_cp = True
+    assert runner.model_restores_aux_hidden_under_cp is True
+
+    # A model with no such attribute at all (e.g. a Python model type that
+    # never wired the capability, or glm_moe_dsa whose aux rows stay
+    # CP-sharded) must not raise and must stay refused.
+    del runner.model.restores_aux_hidden_under_cp
+    assert runner.model_restores_aux_hidden_under_cp is False
+
+
+def test_cp_aux_restore_capability_is_an_explicit_model_opt_in() -> None:
+    """The capability the CP spec-verify gate keys on is an explicit class
+    attribute only the proven models set: glm5_next and deepseek_v4 merge
+    the aux-hidden buffer back to global row order at the CP exit, while
+    glm_moe_dsa (glm5_2) captures aux rows but merges only ``hidden``,
+    leaving them CP-sharded. A reachable glm_moe_dsa + DFlash + CP shape
+    must therefore stay refused even though worker_impl auto-fills its
+    layers_to_capture (making capture ``enabled``).
+
+    deepseek_v4 imports torch_npu unconditionally at module level, so the
+    model-class pins skip on hosts without torch_npu (mirroring
+    test_deepseek_v4_mtp_core.py) instead of failing the file's collection.
+    """
+    pytest.importorskip("torch_npu")
+    from xllm.python.models.deepseek_v4 import DeepseekV4Model
+    from xllm.python.models.glm5_2 import Glm52Model
+    from xllm.python.models.glm5_next import Glm5NextModel
+
+    assert Glm5NextModel.restores_aux_hidden_under_cp is True
+    assert DeepseekV4Model.restores_aux_hidden_under_cp is True
+    # glm_moe_dsa merges only ``hidden`` under CP; the attribute must stay
+    # unset so the eager gate keeps refusing its spec-verify CP forwards.
+    assert not hasattr(Glm52Model, "restores_aux_hidden_under_cp")
 
 
 @pytest.mark.parametrize(

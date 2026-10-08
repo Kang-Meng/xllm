@@ -60,6 +60,12 @@ class DFlashQwen3Config(Qwen3Config):
     draft_vocab_size: int = 0
     world_size: int = 1
     use_sliding_window: bool = False
+    # Context parallelism is a target-model concern: the draft does not shard
+    # the sequence, but it is constructed on the same rank set as the target,
+    # so the reflected ``world_size`` still includes the CP dimension. Track it
+    # so ``validate`` can accept ``tp * dp * cp == world_size`` instead of
+    # rejecting the configuration outright.
+    cp_size: int = 1
 
     @classmethod
     def from_dict(cls, d: dict) -> DFlashQwen3Config:
@@ -70,20 +76,29 @@ class DFlashQwen3Config(Qwen3Config):
 
         base = Qwen3Config.from_dict(normalized_config)
         draft_vocab_size = int(d.get("draft_vocab_size") or base.vocab_size)
+        cp_size = int(d.get("cp_size", 1))
         return cls(
             **base.__dict__,
             draft_vocab_size=draft_vocab_size,
-            world_size=int(d.get("world_size", base.tp_size * base.dp_size)),
+            world_size=int(d.get("world_size", base.tp_size * base.dp_size * cp_size)),
             use_sliding_window=bool(d.get("use_sliding_window", False)),
+            cp_size=cp_size,
         )
 
     def validate(self) -> None:
         if self.hidden_size <= 0 or self.n_layers <= 0 or self.n_heads <= 0:
             raise ValueError("invalid Qwen3-style block-diffusion dimensions")
-        if min(self.tp_size, self.dp_size) <= 0:
+        if min(self.tp_size, self.dp_size, self.cp_size) <= 0:
             raise ValueError("parallel sizes must be positive")
-        if self.tp_size * self.dp_size != self.world_size:
-            raise ValueError("world_size must equal tp_size * dp_size")
+        if self.tp_size * self.dp_size * self.cp_size != self.world_size:
+            # cp_size defaults to 1 when the config dict omits it, so a CP
+            # deployment that supplies world_size without cp_size fails here
+            # with a mismatch that looks like a tp/dp error. Name the default.
+            raise ValueError(
+                "world_size must equal tp_size * dp_size * cp_size "
+                "(cp_size defaults to 1 when the config omits it; a CP "
+                "deployment must pass cp_size alongside world_size)"
+            )
         if not 0 <= self.dp_rank < self.dp_size:
             raise ValueError("dp_rank must be in [0, dp_size)")
         if not 0 <= self.tp_rank < self.tp_size:

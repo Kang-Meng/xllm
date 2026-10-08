@@ -14,8 +14,10 @@ limitations under the License.
 ==============================================================================*/
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -105,6 +107,38 @@ runtime::Options make_runtime_options(double host_blocks_factor) {
       .cp_size(1);
   return options;
 }
+
+// B5 (implement.md, design.md §3.1 Gate B4): a scratch model directory whose
+// config.json declares model_type so DFlashWorkerImpl's allow_cp check (which
+// calls util::get_model_type on options.model_path()) can resolve a real
+// model_type without loading actual weights.
+// Writes a one-file model_type config into a UNIQUE temp directory and
+// removes the directory on scope exit. The pre-fix helper returned a bare
+// path from a fixed per-model_type name: two of these tests running in
+// parallel (or one crashing) collided on or leaked the directory.
+class ScopedModelTypeConfig {
+ public:
+  explicit ScopedModelTypeConfig(const std::string& model_type) {
+    static std::atomic<uint64_t> counter{0};
+    dir_ = std::filesystem::temp_directory_path() /
+           ("xllm_dflash_allow_cp_test_" + model_type + "_" +
+            std::to_string(::getpid()) + "_" +
+            std::to_string(counter.fetch_add(1)));
+    std::filesystem::create_directories(dir_);
+    std::ofstream config_file(dir_ / "config.json");
+    config_file << "{\"model_type\": \"" << model_type << "\"}";
+  }
+
+  ~ScopedModelTypeConfig() { std::filesystem::remove_all(dir_); }
+
+  ScopedModelTypeConfig(const ScopedModelTypeConfig&) = delete;
+  ScopedModelTypeConfig& operator=(const ScopedModelTypeConfig&) = delete;
+
+  const std::filesystem::path& path() const { return dir_; }
+
+ private:
+  std::filesystem::path dir_;
+};
 
 class RecordingTransferWorker final : public LLMWorkerImpl {
  public:
@@ -1105,6 +1139,65 @@ TEST_F(MTPHostOffloadTest, DFlashUsesSpeculativeHierarchyTransferLifecycle) {
   }
 
   EXPECT_TRUE(transfer_lifetime.expired());
+}
+
+// B5 (implement.md, design.md §3.1 Gate B4): glm5_next + cp_size>1 +
+// DFlash2 must no longer CHECK-fail in DFlashWorkerImpl's allow_cp gate.
+// Model-level correctness of the aux-hidden-buffer CP restore this relies on
+// is proven separately in
+// tests/python/test_glm5_next_cp.py::test_layer_capture_restores_global_rows_with_context_parallelism.
+TEST_F(MTPHostOffloadTest, DFlash2AllowsGlm5NextContextParallelism) {
+  if (!Platform::is_npu()) {
+    GTEST_SKIP() << "allow_cp's glm5_next exemption is NPU-only.";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  // cp_size=2, dp_size=1, ep_size=1: exercises the parallel_args.cp_size() > 1
+  // branch of DFlashWorkerImpl's allow_cp lambda.
+  const ParallelArgs parallel_args(
+      /*rank=*/0,
+      /*world_size=*/2,
+      /*dp_size=*/1,
+      /*cp_size=*/2,
+      /*process_group=*/nullptr,
+      /*ep_size=*/1);
+  runtime::Options options = make_runtime_options(2.0);
+  options.speculative_algorithm("DFlash2");
+  const ScopedModelTypeConfig model_config("glm5_next");
+  options.model_path(model_config.path().string());
+
+  // Construction must not CHECK-fail: allow_cp resolves true because
+  // model_type == "glm5_next" && is_dflash2_algorithm("DFlash2").
+  auto worker = std::make_unique<TestDFlashWorker>(
+      parallel_args, device.unwrap(), options);
+  EXPECT_NE(worker, nullptr);
+}
+
+// Regression: the pre-existing DeepSeek-V4 + cp_size>1 exemption (allow_cp's
+// original condition) must remain unaffected by B5's glm5_next addition.
+TEST_F(MTPHostOffloadTest, DeepseekV4StillAllowsContextParallelism) {
+  if (!Platform::is_npu()) {
+    GTEST_SKIP() << "allow_cp's deepseek_v4 exemption is NPU-only.";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0,
+      /*world_size=*/2,
+      /*dp_size=*/1,
+      /*cp_size=*/2,
+      /*process_group=*/nullptr,
+      /*ep_size=*/1);
+  runtime::Options options = make_runtime_options(2.0);
+  options.speculative_algorithm("MTP");
+  const ScopedModelTypeConfig model_config("deepseek_v4");
+  options.model_path(model_config.path().string());
+
+  auto worker = std::make_unique<TestDFlashWorker>(
+      parallel_args, device.unwrap(), options);
+  EXPECT_NE(worker, nullptr);
 }
 
 TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
