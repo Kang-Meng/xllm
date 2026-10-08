@@ -749,6 +749,18 @@ struct ModelArgs {
   PROPERTY(int64_t, text_dim) = 4096;
   PROPERTY(std::vector<int64_t>, rope_dim_list) = { 16, 56, 56 };
   PROPERTY(int64_t, rope_theta_dit) = 10000;
+
+  // JoyOV2 DiT / XVAE / XDAC related args
+  PROPERTY(int64_t, share_expert_dim) = 0;
+  PROPERTY(int64_t, moe_hidden_size) = 0;
+  PROPERTY(float, dit_top_p) = 0.0f;
+  PROPERTY(bool, sandwich_norm) = false;
+  PROPERTY(std::vector<int64_t>, mrope_section) = {};
+  PROPERTY(int64_t, num_encoder_layers) = 0;
+  PROPERTY(int64_t, scale_factor_spatial) = 0;
+  PROPERTY(int64_t, scale_factor_temporal) = 0;
+  PROPERTY(std::vector<int64_t>, block_in_channels) = {};
+  PROPERTY(std::vector<bool>, temporal_downsample) = {};
 };
 
 // Qwen hybrid models may describe full-attention layers explicitly via

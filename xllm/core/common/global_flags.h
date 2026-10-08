@@ -393,6 +393,8 @@ DECLARE_bool(dit_debug_print);
 
 DECLARE_bool(dit_enable_vae_tiling);
 
+DECLARE_bool(dit_enable_joyo_text_encoder);
+
 DECLARE_bool(dit_sparse_attention_enabled);
 
 DECLARE_double(dit_sparse_attention_sparsity);
