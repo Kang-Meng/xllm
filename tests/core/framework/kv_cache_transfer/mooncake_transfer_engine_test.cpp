@@ -18,6 +18,8 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <gtest/gtest.h>
 
+#include "tests/core/framework/kv_cache_transfer/scoped_environment_variable.h"
+
 #if defined(USE_NPU)
 #include <signal.h>
 #include <sys/wait.h>
@@ -232,6 +234,10 @@ TEST(MooncakeKVCacheTransferInitializeTest,
   // that refusal through the MC_TCP_PROTO guard, which returns before any port
   // is bound or any device is touched, so the case is deterministic and free of
   // hardware.
+  // ScopedEnvironmentVariable restores the caller's value when this test
+  // (and the parent side of the death-test fork) finishes; a plain
+  // unsetenv would wipe a value an exported shell relied on.
+  xllm::tests::ScopedEnvironmentVariable mc_tcp_proto("MC_TCP_PROTO");
   setenv("MC_TCP_PROTO", "1", /*overwrite=*/1);
   auto engine = std::make_unique<MooncakeTransferEngine>(
       /*listen_port=*/0, torch::Device(torch::kCPU));
@@ -247,7 +253,6 @@ TEST(MooncakeKVCacheTransferInitializeTest,
   // of the transfer engine.
   EXPECT_DEATH(transfer.initialize(/*device_id=*/0),
                "Mooncake transfer engine failed to initialize");
-  unsetenv("MC_TCP_PROTO");
 }
 
 // Pins the pair (width, rank) the cache-layout producer publishes. The removed
@@ -576,32 +581,6 @@ class ScopedSigpipeIgnore final {
  private:
   using SignalHandler = void (*)(int);
   SignalHandler previous_handler_;
-};
-
-class ScopedEnvironmentVariable final {
- public:
-  explicit ScopedEnvironmentVariable(const char* name) : name_(name) {
-    const char* value = std::getenv(name);
-    if (value != nullptr) {
-      original_value_ = value;
-    }
-  }
-
-  ~ScopedEnvironmentVariable() {
-    if (original_value_.has_value()) {
-      setenv(name_.c_str(), original_value_->c_str(), /*overwrite=*/1);
-    } else {
-      unsetenv(name_.c_str());
-    }
-  }
-
-  bool set(const char* value) {
-    return setenv(name_.c_str(), value, /*overwrite=*/1) == 0;
-  }
-
- private:
-  std::string name_;
-  std::optional<std::string> original_value_;
 };
 
 struct NpuMixedTransferCaches {
@@ -1865,6 +1844,114 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 
+// The push path validates twice: once BEFORE the KV-split filter with the
+// source's real declared width, and once AFTER it with the literal 1, which
+// means "each rank's mapping is 1:1 now" and says nothing about a declared
+// width. A destination that declares the same width as the source must survive
+// BOTH sites. Reading the post-filter literal as a declared width refused every
+// push to a destination that declares kv_split_size > 1 -- i.e. exactly the
+// equal-width topologies this path exists for.
+//
+// The measurement below drives the real call path, not the classifier: the
+// argument wiring is what broke, and no unit test on plan_kv_split_widths()
+// can see a caller passing the wrong argument.
+//
+// The destination DP rank is deliberately one this source worker is not linked
+// to, so merge_kv_blocks() drops the request and the future reports the
+// validation outcome alone (no transfer is attempted, nothing needs a peer):
+// an empty task-result vector means "nothing failed".
+TEST(MooncakeKVCacheTransferDefaultTest,
+     EqualDeclaredKvSplitWidthsSurviveBothPushValidationSites) {
+  // The push-side width defense reads the source's declared write mode from
+  // the process environment; an exported XLLM_CP_INDEX_WRITE_MODE=sharded
+  // would flip this equal-width pair to UNRECONCILABLE and fail the
+  // expectation, so pin the ambient environment off for this scope. The
+  // shared ScopedEnvironmentVariable guard restores the caller's value on
+  // scope exit -- including when a fatal ASSERT below returns early or the
+  // async future throws, where the old manual setenv epilogue never ran.
+  xllm::tests::ScopedEnvironmentVariable write_mode_guard(
+      "XLLM_CP_INDEX_WRITE_MODE");
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  std::vector<KVCache> caches;
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+
+  // Destination: dp=2 tp=2, dp_rank 5 not linked to this worker (linked ranks
+  // are {0, 1} for this source shape).
+  TransferKVInfo info = make_info(/*dst_dp_size=*/2,
+                                  /*dst_tp_size=*/2,
+                                  /*dst_dp_rank=*/5);
+  info.rank_local_mapping = true;
+  // Both registration records declare width 2, so the decision is rank-local.
+  info.remote_instance_info.kv_split_size = 2;
+  ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                         /*world_size=*/2,
+                                         /*dp_size=*/1);
+  parallel_args.kv_split_size(2);
+  std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
+
+  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
+      transfer.push_kv_blocks_async(
+          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_TRUE(std::move(future).get().empty())
+      << "an equal-width pair must pass both push validation sites";
+  EXPECT_TRUE(engine_observer->move_calls.empty());
+}
+
+// The push-side backstop for the settled heterogeneous pair: a mapping that
+// claims rank-local (1:1) while the destination declared kv_split_size = 1 and
+// the source declares 2 is exactly the mis-addressing the width gate exists to
+// prevent -- both owners would write the same destination blocks. The width
+// plan must refuse it before any bytes are mapped, with a failed task result
+// naming the request, so a regression of the scheduler gate fails loudly
+// instead of corrupting the transfer.
+TEST(MooncakeKVCacheTransferDefaultTest,
+     PushRefusesRankLocalClaimAgainstDeclaredWidth) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  std::vector<KVCache> caches;
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+
+  // What the pre-fix width-blind gate derived for the settled pair: the
+  // response's group types are rank-preserving and the source is split, so
+  // rank_local_mapping = true even though the destination declares 1.
+  TransferKVInfo info = make_info(/*dst_dp_size=*/1,
+                                  /*dst_tp_size=*/1,
+                                  /*dst_dp_rank=*/0);
+  info.rank_local_mapping = true;
+  info.remote_instance_info.kv_split_size = 1;
+  ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                         /*world_size=*/2,
+                                         /*dp_size=*/1);
+  parallel_args.kv_split_size(2);
+  std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
+
+  folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
+      transfer.push_kv_blocks_async(
+          {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  const std::vector<KVTransferTaskResult> results = std::move(future).get();
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0].error_code, KVTransferErrorCode::FAILED);
+  EXPECT_EQ(results[0].request_ids, (std::vector<std::string>{"req"}));
+  EXPECT_TRUE(engine_observer->move_calls.empty());
+}
+
 TEST(MooncakeKVCacheTransferDefaultTest,
      DISABLED_NpuLinearIndexerScaleRoundTripPeerProcess) {
   const char* command_fd_env = std::getenv(kPeerCommandFdEnv);
@@ -1895,7 +1982,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 TEST(MooncakeKVCacheTransferDefaultTest,
      NpuLinearIndexerScalePushAndPullRoundTrip) {
   if (std::getenv(kControllerProcessEnv) == nullptr) {
-    ScopedEnvironmentVariable controller_process(kControllerProcessEnv);
+    xllm::tests::ScopedEnvironmentVariable controller_process(
+        kControllerProcessEnv);
     ASSERT_TRUE(controller_process.set("1"));
 
     const pid_t controller_pid = fork();
@@ -1945,7 +2033,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   ASSERT_EQ(pipe(parent_to_child), 0);
   ASSERT_EQ(pipe(child_to_parent), 0);
   ScopedSigpipeIgnore sigpipe_guard;
-  ScopedEnvironmentVariable hccl_base_port("HCCL_IF_BASE_PORT");
+  xllm::tests::ScopedEnvironmentVariable hccl_base_port("HCCL_IF_BASE_PORT");
   ASSERT_TRUE(hccl_base_port.set("35439"));
 
   ASSERT_EQ(setenv(kPeerCommandFdEnv,

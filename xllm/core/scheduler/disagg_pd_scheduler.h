@@ -26,6 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "disagg_pd.pb.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/request/request.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "runtime/xservice_client.h"
@@ -48,6 +49,45 @@ bool exceeds_decode_capacity(size_t num_prompt_tokens,
                              size_t num_blocks);
 
 bool has_rank_preserving_kv_groups(const proto::DisaggResponse& response);
+
+// The KV-split admission decision one dispatched request resolves to: the
+// width plan, the TransferKVInfo mapping claim it licenses, and the rejection
+// reason when no mapping is expressible.
+struct KvSplitDispatchPlan {
+  KvSplitWidthPlan plan = KvSplitWidthPlan::UNRECONCILABLE;
+  // Whether a TransferKVInfo built from the decode instance's allocation
+  // response may claim the rank-local 1:1 mapping. Exact only when a response
+  // was passed to resolve_kv_split_plan().
+  bool rank_local_mapping = false;
+  // Human-readable rejection reason; empty unless the plan is UNRECONCILABLE.
+  std::string reason;
+};
+
+// Shared KV-split width resolution for every dispatch override
+// (DisaggPDScheduler::dispatch_requests and PDOOCScheduler::dispatch_requests,
+// online and offline): determines how a PUSH toward `remote_info` may map
+// source logical blocks onto the destination's declared block table, and
+// assembles the TransferKVInfo rank-local mapping decision from the decode
+// instance's allocation `response`.
+//
+// `src_kv_split_size` / `src_cp_index_write_mode` are the SOURCE's declared
+// width and write mode (instance_info_); `remote_info` is the destination's
+// registered record. `response` is nullptr until the AddNewRequests RPC has
+// returned: the plan and rejection reason are then still exact, while
+// rank_local_mapping stays false because the destination's group layout is
+// not yet known.
+//
+// Both overrides MUST resolve the plan through this helper. The OOC path
+// historically skipped it, so an equal-width pair (decode declaring
+// kv_split_size > 1) silently fell back to strided remapping and was
+// mis-addressed by kv_split_rank + k * kv_split_size, and unreconcilable
+// pairs (including a sharded-write source against an equal-width
+// destination) were never rejected.
+KvSplitDispatchPlan resolve_kv_split_plan(
+    int32_t src_kv_split_size,
+    int32_t src_cp_index_write_mode,
+    const InstanceInfo& remote_info,
+    const proto::DisaggResponse* response);
 
 class DisaggPDScheduler : public ContinuousScheduler {
  public:

@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "absl/strings/str_join.h"
 #include "common/metrics.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "util/net.h"
 
 namespace xllm {
@@ -457,7 +458,8 @@ Status MooncakeTransferEngineCore::set_cache_peer(
           ReshardPlanner().build_outgoing_plan(*local_manifest,
                                                peer_manifest,
                                                &active_plan,
-                                               /*include_replicas=*/true);
+                                               /*include_replicas=*/true,
+                                               declared_cp_index_write_mode());
       if (!plan_status.ok()) {
         return plan_status;
       }

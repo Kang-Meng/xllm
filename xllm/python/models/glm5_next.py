@@ -677,6 +677,12 @@ class Glm5NextKdaAttention(Attention):
             )
         cp_context = getattr(ctx, "cp_context", None)
         if cp_context is not None:
+            # Merging to global rows is also what makes the per-sequence conv/ssm
+            # state safe to *replicate* across the CP ranks when KV is
+            # owner-sharded (BlockType::LINEAR is not a kv-split block type):
+            # every rank then runs this delta-rule over the same global stream
+            # and writes identical values into its own copy of the same slot, so
+            # the replicas cannot drift. See resolve_linear_state_io_indices.
             mixed_qkv = cp_merge_rows(mixed_qkv.transpose(1, 2).reshape(-1, self.conv_dim), cp_context)
             mixed_qkv = mixed_qkv.unsqueeze(0).transpose(1, 2).contiguous()
             g_raw = cp_merge_rows(
@@ -1358,7 +1364,44 @@ class Glm5NextIndexer(nn.Module):
                 kpool_query_lens,
                 query_lens_device,
             )
+        # Shard-aware index cache (kv_split_size > 1 under CP): the write below
+        # needs a page table expanded to one column per physical pool page,
+        # and the read needs a page-expanded table addressing the view the
+        # backend materializes. Which geometry each side uses follows
+        # XLLM_CP_INDEX_WRITE_MODE: replicated (the default) persists every
+        # stripe of every logical block at its NATURAL row (``entry *
+        # kv_split + stripe``), so the write table is the natural-row
+        # expansion and the read is the local full-replica cache with its
+        # physically expanded table -- no cross-rank gather. Sharded keeps the
+        # m7 owner-local geometry: the write table points every owned column
+        # at ``entry * kv_split_size`` (the page the PD transfer plan's
+        # page-level overlap moves), peer columns stay invalid, and the read
+        # reconstructs the logical cache over the CP group (page = entry *
+        # kv_split_size + owner). With no shard both stay the local view
+        # above, so a kv_split_size == 1 launch is untouched.
+        pool_read_block_table = kpool_block_table
+        if ctx.has_kv_shard:
+            pool_query_block_table = ctx.materialized_block_table
+            pool_read_block_table = ctx.materialized_block_table
+            if kpool_query_lens is not None:
+                # The materialized table is expanded over the *engine* table's
+                # entries, so collapse it with the same raw lengths the local
+                # table used above; re-expanding after the collapse would
+                # renumber every page.
+                pool_read_block_table, _ = _kpool_logical_rows(
+                    pool_read_block_table,
+                    ctx.actual_seq_kv.reshape(-1).to(torch.int64),
+                    kpool_query_lens,
+                    query_lens_device,
+                )
         if self.index_kpool_compress:
+            # Only the compressed path consumes the localized write table
+            # (its two update call sites below); a kv_split_size > 1
+            # non-compressed indexer would otherwise pay the
+            # repeat_interleave/torch.where expansion per layer per step for
+            # a table it immediately discards -- and the ctx stubs of the
+            # non-compressed structural tests carry no localize hook.
+            pool_write_block_table = ctx.localize_pool_block_table(kpool_block_table)
             raw_k, gate_scores = self.get_kpool_states(hidden_states, key)
             if uses_compressed_tail:
                 if ctx.kpool_tail_read_indices is None or ctx.kpool_tail_write_indices is None:
@@ -1377,6 +1420,19 @@ class Glm5NextIndexer(nn.Module):
                 ):
                     slot_mapping = _prefix_token_tensor(slot_mapping, full_num_tokens, num_tokens)
                 kpool_valid_rows = _kpool_valid_rows(attention_mask, slot_mapping)
+                # The kPool tail is a per-sequence LINEAR resource every CP
+                # rank replicates bit-identically: each rank runs the merged
+                # global stream, so under an owner shard (has_kv_shard) the
+                # tail's real-token validity is the global attention mask,
+                # NOT the owner-localized slot mask that gates pool writes --
+                # zeroing peer tokens in the tail (key=0/gate=-inf) would
+                # make every rank's copy diverge by which tokens it owns, and
+                # the PD handoff's collapsed-writer choice between those
+                # copies would be write-order-dependent. Without a shard the
+                # original combined mask (attention AND slot>0) stays: it
+                # also excludes padding-slot and speculative-placeholder
+                # rows, which must not reach the tail on a plain launch.
+                kpool_tail_valid_rows = attention_mask.to(torch.bool) if ctx.has_kv_shard else kpool_valid_rows
                 triton_query_len = _compact_kpool_triton_query_len(kpool_query_lens, self.index_kpool)
                 # Decode/spec-verify resolves read/write to the same tensor. A
                 # distinct prefix-restore destination needs the torch path's
@@ -1393,11 +1449,12 @@ class Glm5NextIndexer(nn.Module):
                         raw_k.contiguous(),
                         gate_scores.contiguous(),
                         kpool_valid_rows.contiguous(),
+                        kpool_tail_valid_rows.contiguous(),
                         positions.contiguous(),
                         ctx.index_cache,
                         ctx.kpool_tail,
                         kpool_tail_write_indices.contiguous(),
-                        kpool_block_table.contiguous(),
+                        pool_write_block_table.contiguous(),
                         triton_query_len,
                         self.index_kpool_compress_ape,
                         self.index_kpool,
@@ -1407,18 +1464,26 @@ class Glm5NextIndexer(nn.Module):
                         raw_k,
                         gate_scores,
                         kpool_valid_rows,
+                        kpool_tail_valid_rows,
                         positions,
                         ctx.index_cache,
                         ctx.kpool_tail,
                         kpool_tail_read_indices,
                         kpool_tail_write_indices,
-                        kpool_block_table,
+                        pool_write_block_table,
                         kpool_query_lens,
                         self.index_kpool_compress_ape,
                         self.index_kpool,
                         graph_mode=in_acl_graph(),
                     )
                 pool_cache = ctx.index_cache
+                if ctx.has_kv_shard:
+                    # Refresh the read view after the write above: in sharded
+                    # mode the gather must observe this forward's pools on
+                    # every CP rank; in replicated mode this is the identity
+                    # returning the just-written local full replica with its
+                    # physically expanded table.
+                    pool_cache, _, _ = ctx.materialize_index_cache()
                 packed = None
             else:
                 pool_cache = None
@@ -1516,7 +1581,7 @@ class Glm5NextIndexer(nn.Module):
             key_valid=key_valid,
             kv_seq_lens=kv_seq_lens,
             pool_cache=pool_cache,
-            pool_block_table=kpool_block_table,
+            pool_block_table=pool_read_block_table,
             query_positions=positions_bsd,
             pool_query_block_table=pool_query_block_table,
             append_unscored_tail=uses_compressed_tail and self.index_kpool_always_select_tail,

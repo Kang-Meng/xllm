@@ -106,7 +106,14 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // length self-description, so a payload produced by another engine build would
 // silently shift every field after the first divergence instead of failing.
 // Tag the header and reject a mismatch before parsing anything.
-constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000001ULL;
+//
+// v2: the InstanceInfo descriptor gained cp_index_write_mode between
+// dp_size/kv_split_size and the ttft profiling vector. The layout change is
+// invisible to a v1 reader (same field count prefix, no length
+// self-description), so the tag MUST bump with every descriptor change --
+// a mixed-version master/worker pair now fails this check loudly instead of
+// misparsing the tail of every TransferKVInfo.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000002ULL;
 
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
@@ -214,6 +221,7 @@ inline size_t get_instance_info_size(const InstanceInfo& info) {
 
   size += type_size<int32_t>    // dp_size
           + type_size<int32_t>  // kv_split_size
+          + type_size<int32_t>  // cp_index_write_mode
           + type_size<uint64_t> +
           info.ttft_profiling_data.size() *
               (type_size<int32_t> + type_size<int64_t>);
@@ -810,6 +818,7 @@ inline void write_instance_info(char*& buffer, const InstanceInfo& info) {
 
   write_data(buffer, info.dp_size);
   write_data(buffer, info.kv_split_size);
+  write_data(buffer, info.cp_index_write_mode);
 
   const uint64_t prof_size = info.ttft_profiling_data.size();
   write_data(buffer, prof_size);
@@ -836,6 +845,7 @@ inline void write_instance_info(RawInputSerializeContext& context,
 
   write_data(context.descriptor, info.dp_size);
   write_data(context.descriptor, info.kv_split_size);
+  write_data(context.descriptor, info.cp_index_write_mode);
 
   const uint64_t prof_size = info.ttft_profiling_data.size();
   write_data(context.descriptor, prof_size);
@@ -1739,6 +1749,7 @@ inline void read_instance_info(const char*& buffer, InstanceInfo& info) {
 
   read_data(buffer, info.dp_size);
   read_data(buffer, info.kv_split_size);
+  read_data(buffer, info.cp_index_write_mode);
 
   uint64_t prof_size;
   read_data(buffer, prof_size);
@@ -1767,6 +1778,7 @@ inline void read_instance_info(ReadContext& context, InstanceInfo& info) {
 
   read_data(context, info.dp_size);
   read_data(context, info.kv_split_size);
+  read_data(context, info.cp_index_write_mode);
 
   uint64_t prof_size;
   read_data(context, prof_size);

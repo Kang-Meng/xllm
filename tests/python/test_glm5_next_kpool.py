@@ -150,6 +150,11 @@ def test_indexer_paged_selection_reuses_merged_weights_for_varlen_queries(
         block_table=torch.zeros(3, 1, dtype=torch.int32),
         actual_seq_kv=torch.tensor([8, 8, 8]),
         kpool_tail=None,
+        # Full-replica index cache: every context field MlaIndexContext defaults
+        # to, spelled out because this is a duck-typed stand-in.
+        has_kv_shard=False,
+        materialized_block_table=None,
+        localize_pool_block_table=lambda table: table,
     )
     backend = SimpleNamespace(gather_index_history=lambda *_args: history)
     monkeypatch.setattr(glm5_next, "_current_q_seq_lens", lambda *_args: query_lengths)
@@ -384,6 +389,7 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
         raw_k=torch.tensor([[1, 10], [3, 30], [5, 50]], dtype=torch.bfloat16),
         gate_scores=torch.zeros(3, 2, dtype=torch.bfloat16),
         valid_rows=torch.ones(3, dtype=torch.bool),
+        tail_valid_rows=torch.ones(3, dtype=torch.bool),
         positions=torch.tensor([0, 1, 2]),
         compressed_cache=compressed_cache,
         tail_cache=tail_cache,
@@ -398,6 +404,7 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
         raw_k=torch.tensor([[7, 70]], dtype=torch.bfloat16),
         gate_scores=torch.zeros(1, 2, dtype=torch.bfloat16),
         valid_rows=torch.ones(1, dtype=torch.bool),
+        tail_valid_rows=torch.ones(1, dtype=torch.bool),
         positions=torch.tensor([3]),
         compressed_cache=compressed_cache,
         tail_cache=tail_cache,
@@ -427,6 +434,7 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
         torch.tensor([[9, 90]], dtype=torch.bfloat16),
         torch.zeros(1, 2, dtype=torch.bfloat16),
         torch.zeros(1, dtype=torch.bool),
+        torch.zeros(1, dtype=torch.bool),
         torch.tensor([4]),
         compressed_cache,
         tail_cache,
@@ -440,6 +448,7 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
     update_compressed_kpool(
         torch.tensor([[11, 110], [13, 130], [15, 150]], dtype=torch.bfloat16),
         torch.zeros(3, 2, dtype=torch.bfloat16),
+        torch.ones(3, dtype=torch.bool),
         torch.ones(3, dtype=torch.bool),
         torch.tensor([5, 6, 7]),
         compressed_cache,
@@ -465,6 +474,7 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
         raw_k=torch.tensor([[1, 10], [3, 30]], dtype=torch.bfloat16),
         gate_scores=torch.tensor([[2, 20], [4, 40]], dtype=torch.bfloat16),
         valid_rows=torch.tensor([False, True]),
+        tail_valid_rows=torch.tensor([False, True]),
         positions=torch.tensor([0, 1]),
         compressed_cache=torch.zeros(1, 2, 1, 2, dtype=torch.bfloat16),
         tail_cache=placeholder_tail,
@@ -537,6 +547,7 @@ def test_compact_kpool_triton_matches_torch_reference(query_len: int, position_o
         device_raw_k,
         device_gate_scores,
         device_valid_rows,
+        device_valid_rows,
         device_positions,
         expected_cache,
         expected_tail,
@@ -555,6 +566,7 @@ def test_compact_kpool_triton_matches_torch_reference(query_len: int, position_o
         update_compact_kpool(
             device_raw_k,
             device_gate_scores,
+            device_valid_rows,
             device_valid_rows,
             device_positions,
             actual_cache,
@@ -596,6 +608,7 @@ def test_compact_kpool_triton_matches_torch_reference(query_len: int, position_o
             device_raw_k,
             device_gate_scores,
             device_valid_rows,
+            device_valid_rows,
             device_positions,
             expected_cache,
             expected_tail,
@@ -611,3 +624,91 @@ def test_compact_kpool_triton_matches_torch_reference(query_len: int, position_o
         torch.npu.synchronize()
         torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
         torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
+
+
+def test_tail_keeps_peer_tokens_valid_when_pool_mask_localizes_writes() -> None:
+    """Sharded CP: the tail is a globally-valid replica, not owner-localized.
+
+    Under XLLM_CP_INDEX_WRITE_MODE=sharded each CP rank gates POOL completion
+    with the owner-localized mask (peer tokens invalid), but the kPool tail
+    is a per-sequence LINEAR accumulator every rank replicates bit-identically
+    from the merged global stream. If the tail write reused the localized
+    mask, each rank would zero the peer tokens it does not own (key=0,
+    gate=-inf), the PD handoff's collapsed-writer choice between the
+    divergent copies would be write-order-dependent, and the decode side
+    could never complete the boundary pool whose members the "winning" copy
+    zeroed. This pins the separation: pool writes honor the localized mask,
+    the tail honors the global one.
+    """
+    compressed_cache = torch.zeros(2, 1, 1, 2, dtype=torch.bfloat16)
+    tail_cache = torch.zeros(2, 2, 4, 2, dtype=torch.bfloat16)
+    tail_ids = torch.tensor([1])
+    block_table = torch.tensor([[0, -1]], dtype=torch.int64)
+    ape = torch.zeros(2, dtype=torch.bfloat16)
+
+    update_compressed_kpool(
+        raw_k=torch.tensor([[1.0, 10.0], [3.0, 30.0]], dtype=torch.bfloat16),
+        gate_scores=torch.tensor([[0.5, 0.5], [0.25, 0.25]], dtype=torch.bfloat16),
+        # Rank 0's owner-localized pool mask: the peer token (row 1) must not
+        # complete pools on this rank -- that write belongs to the peer.
+        valid_rows=torch.tensor([True, False]),
+        # ... but the tail is the global accumulator: the peer token keeps
+        # its real state in this rank's replica.
+        tail_valid_rows=torch.tensor([True, True]),
+        positions=torch.tensor([0, 1]),
+        compressed_cache=compressed_cache,
+        tail_cache=tail_cache,
+        tail_read_ids=tail_ids,
+        tail_write_ids=tail_ids,
+        block_table=block_table,
+        query_lens=[2],
+        ape=ape,
+        rate=4,
+    )
+
+    # The peer token's tail row keeps its real key and gate...
+    torch.testing.assert_close(tail_cache[1, 0, 1, 0].item(), 3.0)
+    torch.testing.assert_close(tail_cache[1, 1, 1, 0].item(), 0.25)
+    # ...and the owned token's row is unchanged from the global write.
+    torch.testing.assert_close(tail_cache[1, 0, 0, 0].item(), 1.0)
+    torch.testing.assert_close(tail_cache[1, 1, 0, 0].item(), 0.5)
+    # The pool write DID honor the localized mask: with rate=4 and only one
+    # valid member, no pool completes, so the compressed cache stays empty.
+    assert not bool((compressed_cache != 0).any())
+
+
+def test_tail_localized_mask_still_zeros_peer_tokens_when_requested() -> None:
+    """The tail mask is an independent input, not implied by the pool mask.
+
+    A caller that genuinely wants the tail zeroed for a row (for example a
+    padding row inside the attention mask) passes it through
+    tail_valid_rows; the kernel must not silently re-derive it from the pool
+    mask in either direction.
+    """
+    compressed_cache = torch.zeros(2, 1, 1, 2, dtype=torch.bfloat16)
+    tail_cache = torch.zeros(2, 2, 4, 2, dtype=torch.bfloat16)
+    tail_ids = torch.tensor([1])
+    block_table = torch.tensor([[0, -1]], dtype=torch.int64)
+    ape = torch.zeros(2, dtype=torch.bfloat16)
+
+    update_compressed_kpool(
+        raw_k=torch.tensor([[1.0, 10.0], [3.0, 30.0]], dtype=torch.bfloat16),
+        gate_scores=torch.tensor([[0.5, 0.5], [0.25, 0.25]], dtype=torch.bfloat16),
+        valid_rows=torch.tensor([True, True]),
+        tail_valid_rows=torch.tensor([True, False]),
+        positions=torch.tensor([0, 1]),
+        compressed_cache=compressed_cache,
+        tail_cache=tail_cache,
+        tail_read_ids=tail_ids,
+        tail_write_ids=tail_ids,
+        block_table=block_table,
+        query_lens=[2],
+        ape=ape,
+        rate=4,
+    )
+
+    # The explicitly-masked tail row is the invalid placeholder...
+    assert tail_cache[1, 0, 1, 0].item() == 0.0
+    assert tail_cache[1, 1, 1, 0].item() == float("-inf")
+    # ...while the valid row keeps its real state.
+    torch.testing.assert_close(tail_cache[1, 0, 0, 0].item(), 1.0)

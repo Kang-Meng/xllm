@@ -40,6 +40,7 @@ limitations under the License.
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/kv_cache_transfer/pd_topology_guard.h"
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
@@ -172,6 +173,27 @@ bool has_rank_preserving_kv_groups(const proto::DisaggResponse& response) {
       });
 }
 
+KvSplitDispatchPlan resolve_kv_split_plan(
+    int32_t src_kv_split_size,
+    int32_t src_cp_index_write_mode,
+    const InstanceInfo& remote_info,
+    const proto::DisaggResponse* response) {
+  KvSplitDispatchPlan resolved;
+  resolved.plan = plan_kv_split_widths(src_kv_split_size,
+                                       remote_info.kv_split_size,
+                                       src_cp_index_write_mode,
+                                       remote_info.cp_index_write_mode,
+                                       &resolved.reason);
+  // Only a RANK_LOCAL plan licenses the 1:1 mapping, and only once the
+  // destination's allocation response proves every KV-split group keeps this
+  // rank's blocks (has_rank_preserving_kv_groups); anything else stays
+  // strided so filter_kv_split_infos remaps each rank's own slice.
+  resolved.rank_local_mapping = resolved.plan == KvSplitWidthPlan::RANK_LOCAL &&
+                                response != nullptr &&
+                                has_rank_preserving_kv_groups(*response);
+  return resolved;
+}
+
 DisaggPDScheduler::DisaggPDScheduler(Engine* engine, const Options& options)
     : ContinuousScheduler(engine, options), server_name_("DisaggPDServer") {
   if (!options_.instance_role().has_value()) {
@@ -256,6 +278,22 @@ void DisaggPDScheduler::register_instance_info(const std::string& server_name,
   instance_info_.dp_size = options_.dp_size();
   instance_info_.kv_split_size =
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+  // The declared CP index write mode is the other half of the admission
+  // input: a source in the sharded mode cannot serve an equal-width
+  // kv_split_size > 1 decode (plan_kv_split_widths refuses the pair), so an
+  // operator links kv_split instances only after checking this against the
+  // peer's declaration.
+  instance_info_.cp_index_write_mode = declared_cp_index_write_mode();
+  // The declared width and write mode are the peer's only inputs to the PUSH
+  // mapping plan, so print both at startup on both roles: this line is what
+  // an operator checks against the other side before a kv_split_size > 1
+  // decode is rolled out.
+  LOG(INFO) << "Instance declares kv_split_size = "
+            << instance_info_.kv_split_size
+            << ", cp_index_write_mode = " << instance_info_.cp_index_write_mode
+            << " ("
+            << cp_index_write_mode_label(instance_info_.cp_index_write_mode)
+            << "), dp_size = " << instance_info_.dp_size;
 
   // Get total physical pages per worker (for etcd registration)
 #if defined(USE_NPU)
@@ -502,6 +540,31 @@ void DisaggPDScheduler::dispatch_requests() {
                " is incompatible: " + topo_result.reason});
       continue;
     }
+    // The destination's DECLARED KV split width is what decides which block
+    // mapping a push may use. Deriving it from the response's group types
+    // instead made the gate width-blind: it was true for a destination that
+    // declares kv_split_size = 1 -- the settled decode width -- and then every
+    // source shard addressed the same destination blocks. Refuse before the
+    // decode reservation and the AddNewRequests RPC when the pair is not
+    // expressible as a mapping. resolve_kv_split_plan is the shared
+    // resolution: the OOC dispatch override and the push-side width
+    // validation compose the same decision.
+    const KvSplitDispatchPlan kv_split_plan =
+        resolve_kv_split_plan(instance_info_.kv_split_size,
+                              instance_info_.cp_index_write_mode,
+                              remote_info,
+                              /*response=*/nullptr);
+    if (kv_split_plan.plan == KvSplitWidthPlan::UNRECONCILABLE) {
+      LOG(ERROR) << "Rejecting request " << request->request_id()
+                 << " for decode instance " << selected_instance << ": "
+                 << kv_split_plan.reason;
+      response_processor_->process_failed_request(
+          request,
+          {StatusCode::INVALID_ARGUMENT,
+           "decode instance " + selected_instance + ": " +
+               kv_split_plan.reason});
+      continue;
+    }
     if (topo_result.status == PdTopoStatus::ALLOW_HETERO && VLOG_IS_ON(1)) {
       const PdTopo local_topo = get_pd_topo(instance_info_);
       const PdTopo remote_topo = get_pd_topo(remote_info);
@@ -665,8 +728,16 @@ void DisaggPDScheduler::dispatch_requests() {
           TransferKVInfo info;
           info.request_id = requests[i]->request_id();
           const auto& resp = resps.resps()[i];
-          info.rank_local_mapping = instance_info_.kv_split_size > 1 &&
-                                    has_rank_preserving_kv_groups(resp);
+          // Re-resolve with the allocation response now at hand: the plan is
+          // unchanged (same declared widths and write mode) while the
+          // response's group layout decides whether the rank-local mapping
+          // claim is appropriate for this destination.
+          const KvSplitDispatchPlan resolved =
+              resolve_kv_split_plan(instance_info_.kv_split_size,
+                                    instance_info_.cp_index_write_mode,
+                                    remote_info,
+                                    &resp);
+          info.rank_local_mapping = resolved.rank_local_mapping;
           info.mappings.reserve(resp.groups_size());
           for (const proto::KVTransferGroup& proto_group : resp.groups()) {
             KVTransferMapping mapping;
@@ -1369,13 +1440,26 @@ bool DisaggPDScheduler::link_instance(const std::string& instance_name,
                                       const int32_t dp_size,
                                       const int32_t src_kv_split_size) {
   std::lock_guard<std::mutex> lock(linked_instances_mutex_);
+  // proto3's 0 means the peer's registration (or the service that served it)
+  // predates the kv_split_size field entirely. Such a peer never splits KV,
+  // so its effective TOPOLOGY width is 1 for the layout negotiation; the
+  // registration record keeps the verbatim 0 (see xservice_client) so the
+  // push plan still refuses to map a transfer against an undeclared width
+  // -- folding the 0 into the plan is what once made a decode intending
+  // dcp=4 silently take the 1:1 mapping path. Normalize only here, at the
+  // topology boundary, never in the record.
+  const int32_t topology_kv_split_size =
+      src_kv_split_size > 0 ? src_kv_split_size : 1;
   if (!engine_->link_cluster(
-          cluster_ids, addrs, ports, dp_size, src_kv_split_size)) {
+          cluster_ids, addrs, ports, dp_size, topology_kv_split_size)) {
     LOG(ERROR) << "Link instance failed, instance_name: " << instance_name;
     return false;
   }
   LOG(INFO) << "Successfully linked instance, instance_name: " << instance_name
-            << ", prefill_kv_split_size: " << src_kv_split_size;
+            << ", prefill_kv_split_size: " << src_kv_split_size
+            << (src_kv_split_size > 0
+                    ? ""
+                    : " (undeclared; negotiated as 1 for legacy topology)");
   linked_instance_.emplace(instance_name);
   return true;
 }
@@ -1401,8 +1485,16 @@ bool DisaggPDScheduler::unlink_instance(
   }
 
   std::lock_guard<std::mutex> lock(linked_instances_mutex_);
+  // Same normalization as link_instance: proto3's 0 means the peer never
+  // declared a width, and the topology it was linked under is 1.
+  // unlink_cluster validates src_kv_split_size > 0 exactly like
+  // link_cluster, so passing the raw 0 for an undeclared peer would make
+  // every unlink of that peer fail -- the linked edges would never close
+  // and linked_instance_ would never release the name.
+  const int32_t topology_kv_split_size =
+      src_kv_split_size > 0 ? src_kv_split_size : 1;
   if (!engine_->unlink_cluster(
-          cluster_ids, addrs, ports, dp_size, src_kv_split_size)) {
+          cluster_ids, addrs, ports, dp_size, topology_kv_split_size)) {
     LOG(ERROR) << "Unlink instance failed, instance_name: " << instance_name;
     return false;
   }

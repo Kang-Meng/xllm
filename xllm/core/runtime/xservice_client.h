@@ -119,4 +119,15 @@ class XServiceClient {
   Engine* engine_ = nullptr;  // not own, for xtensor info
 };
 
+// Builds the in-process instance record from a GetInstanceInfo response.
+//
+// `kv_split_size` is copied verbatim so that proto3's 0 -- "the field was not
+// present" -- stays distinguishable from a declared 1. Collapsing the two is a
+// silent mis-addressing risk: the transfer plan keys on the peer's DECLARED
+// width, and a peer that never declared one must be refused, not assumed to be
+// 1. See plan_kv_split_widths(). `cp_index_write_mode` follows the same
+// verbatim contract for the write mode.
+InstanceInfo instance_info_from_proto(
+    const xllm_service::proto::InstanceMetaInfo& response);
+
 }  // namespace xllm

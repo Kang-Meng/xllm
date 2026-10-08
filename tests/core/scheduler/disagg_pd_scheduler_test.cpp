@@ -784,6 +784,174 @@ TEST(DisaggPDSchedulerTest, KeepsExpandedGroupedCacheMappings) {
   EXPECT_FALSE(has_rank_preserving_kv_groups(response));
 }
 
+// The shared dispatch resolution (resolve_kv_split_plan) is what BOTH
+// dispatch overrides -- DisaggPDScheduler::dispatch_requests and
+// PDOOCScheduler::dispatch_requests/dispatch_offline_requests -- compose the
+// TransferKVInfo mapping claim from. The OOC overrides historically built
+// the info without the width plan, so an equal-width pair (decode declaring
+// kv_split_size > 1) was always remapped by the kv_split stride and an
+// unreconcilable pair was never rejected; these pins hold the helper to the
+// contract that closed both holes.
+namespace {
+
+constexpr int32_t kTestSrcKvSplitSize = 2;
+
+InstanceInfo make_remote_info(int32_t kv_split_size) {
+  InstanceInfo remote;
+  remote.name = "decode";
+  remote.kv_split_size = kv_split_size;
+  return remote;
+}
+
+InstanceInfo make_remote_info(int32_t kv_split_size,
+                              int32_t cp_index_write_mode) {
+  InstanceInfo remote = make_remote_info(kv_split_size);
+  remote.cp_index_write_mode = cp_index_write_mode;
+  return remote;
+}
+
+proto::DisaggResponse make_rank_preserving_response() {
+  proto::DisaggResponse response;
+  response.add_groups()->set_group_id(cache_group_id(BlockType::KV));
+  response.add_groups()->set_group_id(cache_group_id(BlockType::LINEAR));
+  return response;
+}
+
+}  // namespace
+
+TEST(DisaggPDSchedulerTest,
+     ResolveKvSplitPlanLicensesRankLocalMappingForEqualWidthPair) {
+  const proto::DisaggResponse response = make_rank_preserving_response();
+
+  // The pre-RPC resolution: the plan is already exact while the mapping
+  // claim stays false because the destination's group layout is not yet
+  // known -- this is the state the dispatch gates consume.
+  const KvSplitDispatchPlan pre_rpc =
+      resolve_kv_split_plan(kTestSrcKvSplitSize,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(kTestSrcKvSplitSize),
+                            /*response=*/nullptr);
+  EXPECT_EQ(pre_rpc.plan, KvSplitWidthPlan::RANK_LOCAL);
+  EXPECT_FALSE(pre_rpc.rank_local_mapping);
+  EXPECT_TRUE(pre_rpc.reason.empty());
+
+  // The post-RPC resolution with a rank-preserving allocation: the 1:1
+  // mapping claim the OOC dispatch must now set on its TransferKVInfo.
+  const KvSplitDispatchPlan post_rpc =
+      resolve_kv_split_plan(kTestSrcKvSplitSize,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(kTestSrcKvSplitSize),
+                            &response);
+  EXPECT_EQ(post_rpc.plan, KvSplitWidthPlan::RANK_LOCAL);
+  EXPECT_TRUE(post_rpc.rank_local_mapping);
+  EXPECT_TRUE(post_rpc.reason.empty());
+
+  // A group layout that shards KV across ranks must not claim the rank-local
+  // mapping even at equal widths: the strided filter remaps each rank's own
+  // slice instead.
+  proto::DisaggResponse expanded = make_rank_preserving_response();
+  expanded.add_groups()->set_group_id(cache_group_id(BlockType::C4));
+  const KvSplitDispatchPlan expanded_plan =
+      resolve_kv_split_plan(kTestSrcKvSplitSize,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(kTestSrcKvSplitSize),
+                            &expanded);
+  EXPECT_EQ(expanded_plan.plan, KvSplitWidthPlan::RANK_LOCAL);
+  EXPECT_FALSE(expanded_plan.rank_local_mapping);
+}
+
+TEST(DisaggPDSchedulerTest,
+     ResolveKvSplitPlanRefusesUnreconcilablePairsWithReason) {
+  // An inexpressible width pair: no mapping may be derived, and the reason
+  // names both widths for the INVALID_ARGUMENT the dispatch paths emit.
+  const KvSplitDispatchPlan mismatched =
+      resolve_kv_split_plan(kTestSrcKvSplitSize,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(/*kv_split_size=*/3),
+                            /*response=*/nullptr);
+  EXPECT_EQ(mismatched.plan, KvSplitWidthPlan::UNRECONCILABLE);
+  EXPECT_FALSE(mismatched.rank_local_mapping);
+  EXPECT_NE(mismatched.reason.find(std::to_string(kTestSrcKvSplitSize)),
+            std::string::npos)
+      << mismatched.reason;
+  EXPECT_NE(mismatched.reason.find("3"), std::string::npos)
+      << mismatched.reason;
+
+  // An undeclared width (proto3's 0 on the registration record) is equally
+  // refused rather than read as 1 -- for a SPLIT source, whose stride
+  // remapping depends on the destination's declared width.
+  const KvSplitDispatchPlan undeclared =
+      resolve_kv_split_plan(kTestSrcKvSplitSize,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(/*kv_split_size=*/0),
+                            /*response=*/nullptr);
+  EXPECT_EQ(undeclared.plan, KvSplitWidthPlan::UNRECONCILABLE);
+  EXPECT_FALSE(undeclared.reason.empty());
+
+  // A width-1 source against an undeclared destination stays expressible:
+  // the source never splits, skips the stride filter, and maps onto the
+  // destination's table one-to-one whatever the destination declares or
+  // fails to declare -- the pre-field legacy semantics (a non-CP prefill
+  // serving an old-service-registered decode transferred with stride=1).
+  const KvSplitDispatchPlan legacy_pair =
+      resolve_kv_split_plan(/*src_kv_split_size=*/1,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(/*kv_split_size=*/0),
+                            /*response=*/nullptr);
+  EXPECT_EQ(legacy_pair.plan, KvSplitWidthPlan::RANK_LOCAL);
+  EXPECT_TRUE(legacy_pair.reason.empty());
+
+  // An undeclared SOURCE is always refused: nothing can be validated about
+  // how its blocks are laid out.
+  const KvSplitDispatchPlan undeclared_source =
+      resolve_kv_split_plan(/*src_kv_split_size=*/0,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(kTestSrcKvSplitSize),
+                            /*response=*/nullptr);
+  EXPECT_EQ(undeclared_source.plan, KvSplitWidthPlan::UNRECONCILABLE);
+  EXPECT_FALSE(undeclared_source.reason.empty());
+
+  // A sharded-write source against an equal-width destination: refused with
+  // the write mode named (the registration-side half of the contract).
+  const proto::DisaggResponse rank_preserving = make_rank_preserving_response();
+  const KvSplitDispatchPlan sharded =
+      resolve_kv_split_plan(kTestSrcKvSplitSize,
+                            kCpIndexWriteModeSharded,
+                            make_remote_info(kTestSrcKvSplitSize),
+                            &rank_preserving);
+  EXPECT_EQ(sharded.plan, KvSplitWidthPlan::UNRECONCILABLE);
+  EXPECT_FALSE(sharded.rank_local_mapping);
+  EXPECT_NE(sharded.reason.find("write mode"), std::string::npos)
+      << sharded.reason;
+
+  // A sharded-write DESTINATION against a replicated source: the same
+  // refusal from the other direction. resolve_kv_split_plan reads
+  // remote_info.cp_index_write_mode (the field the registration record
+  // already publishes), so a destination's sharded declaration is enforced,
+  // not silently ignored.
+  const KvSplitDispatchPlan sharded_dst = resolve_kv_split_plan(
+      kTestSrcKvSplitSize,
+      kCpIndexWriteModeReplicated,
+      make_remote_info(kTestSrcKvSplitSize, kCpIndexWriteModeSharded),
+      &rank_preserving);
+  EXPECT_EQ(sharded_dst.plan, KvSplitWidthPlan::UNRECONCILABLE);
+  EXPECT_FALSE(sharded_dst.rank_local_mapping);
+  EXPECT_NE(sharded_dst.reason.find("write mode"), std::string::npos)
+      << sharded_dst.reason;
+  EXPECT_NE(sharded_dst.reason.find("the destination"), std::string::npos)
+      << sharded_dst.reason;
+
+  // The settled heterogeneous pair stays expressible and strided.
+  const KvSplitDispatchPlan settled =
+      resolve_kv_split_plan(kTestSrcKvSplitSize,
+                            kCpIndexWriteModeReplicated,
+                            make_remote_info(/*kv_split_size=*/1),
+                            &rank_preserving);
+  EXPECT_EQ(settled.plan, KvSplitWidthPlan::STRIDED);
+  EXPECT_FALSE(settled.rank_local_mapping);
+  EXPECT_TRUE(settled.reason.empty());
+}
+
 TEST(DisaggPDSchedulerTest, PromptBeyondDecodeBlockCapacityIsPermanent) {
   EXPECT_TRUE(exceeds_decode_capacity(
       /*num_prompt_tokens=*/7, /*block_size=*/2, /*num_blocks=*/4));

@@ -66,6 +66,13 @@ class Platform final {
 
   // Under KV splitting, each NPU rank retains the full indexer cache.
   // Logical block B maps to index pages [B * split, (B + 1) * split).
+  // XLLM_CP_INDEX_WRITE_MODE=replicated (the Python-side default) writes
+  // every stripe's page at that natural row, so each rank's tensor is a
+  // physical full replica and any single transfer writer supplies every
+  // valid page. The sharded mode stores each rank's valid stripe at the
+  // FIRST page of the group (row B * split): the transfer plan's page-level
+  // overlap against a kv_split_size == 1 destination only ever reads page 0
+  // of a source resource, so that is where the owner's page must live.
   static constexpr bool requires_dsa_indexer_cache_replication() {
     return is_npu();
   }

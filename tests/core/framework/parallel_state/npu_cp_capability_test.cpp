@@ -448,14 +448,51 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                 "world_size"));
   options.expert_parallel_degree(1).ep_size(1);
 
+  // Owner-sharded KV is admitted under the same constraint glm_moe_dsa uses:
+  // the KVShardBatchMetadata that the owner-local write and the CP gather
+  // consume is built for prefill/chunked-prefill batches only, so the sharded
+  // shape needs a prefill-only instance -- which in turn only exists under
+  // disaggregated PD. A standalone instance runs prefill and decode on the
+  // same ranks whatever the role says, so the role alone is not enough.
+  options.cp_size(4);
   parallel_config.kv_split_size(2);
   EXPECT_EQ(validate_model_cp(options,
                               EngineType::LLM,
                               "glm5_next",
                               /*global_world_size=*/8),
             std::optional<std::string>(
-                "Python GLM-5 Next CP initially requires kv_split_size == 1"));
+                "Python GLM-5 Next CP with kv_split_size > 1 requires "
+                "disaggregated PD with the PREFILL role; set "
+                "enable_disagg_pd=true and instance_role=PREFILL"));
+  // The DEFAULT role is refused by the same gate: under disaggregated PD it is
+  // handed decode batches, whose shards no backend combines.
+  options.enable_disagg_pd(true);
+  options.instance_role(InstanceRole::DEFAULT);
+  EXPECT_EQ(validate_model_cp(options,
+                              EngineType::LLM,
+                              "glm5_next",
+                              /*global_world_size=*/8),
+            std::optional<std::string>(
+                "Python GLM-5 Next CP with kv_split_size > 1 requires "
+                "disaggregated PD with the PREFILL role; set "
+                "enable_disagg_pd=true and instance_role=PREFILL"));
+  // The admitted shape: world=8, dp=1, tp=2, cp=4, kv_split == cp, on a
+  // prefill-only instance under disaggregated PD.
+  options.instance_role(InstanceRole::PREFILL);
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  parallel_config.kv_split_size(4);
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
   parallel_config.kv_split_size(1);
+  options.enable_disagg_pd(false);
+  options.cp_size(2);
 
   // Chunked prefill under glm5_next+CP converges on the DFlash2 whitelist
   // like the aux-capture gates above: only the pairing that was validated

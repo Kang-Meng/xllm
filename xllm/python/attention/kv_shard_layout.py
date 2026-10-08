@@ -136,3 +136,120 @@ class KVShardLayout:
             torch.full_like(expanded, -1),
         )
         return expanded.flatten(start_dim=1).contiguous()
+
+
+def localize_pool_write_block_table(
+    block_table: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    """Local page table for an owner-sharded (``XLLM_CP_INDEX_WRITE_MODE=sharded``)
+    compressed-kPool write.
+
+    A pool page holds ``block_size / index_kpool`` pools, so one logical block
+    of ``block_size * dcp_size`` tokens spans ``dcp_size`` physical pool pages.
+    Both pool writers (``update_compressed_kpool`` and the compact Triton
+    update) index a pool table by the **global physical page**
+    ``pool_id // pools_per_page`` and skip a page whose id is negative, while
+    the local cache stores only this rank's own stripe. The NPU groups those
+    ``dcp_size`` pages under the logical block's resource (platform.h:
+    logical block B owns index rows ``[B * dcp_size, (B + 1) * dcp_size)``),
+    and the PD transfer plan's page-level overlap reads PAGE 0 of every source
+    resource, so this rank's stripe must live at the first page of the block's
+    group. This view therefore maps every owned column onto
+    ``block_table[column // dcp_size] * dcp_size`` and marks the peer-owned
+    columns invalid, which is what lets both writers stay ownership-agnostic
+    while the transferred page is exactly the page written.
+
+    Returns ``block_table`` unchanged when ``dcp_size <= 1``, so a full-replica
+    (``kv_split_size == 1``) launch keeps its existing table object.
+    """
+    if dcp_size <= 1:
+        return block_table
+    if block_table.dim() != 2:
+        raise ValueError("pool block table must be two-dimensional")
+    repeated = block_table.repeat_interleave(dcp_size, dim=1)
+    owners = torch.arange(repeated.shape[1], device=block_table.device) % dcp_size
+    owned = (owners == dcp_rank).expand_as(repeated)
+    grouped = repeated * dcp_size
+    return torch.where(
+        owned & (repeated >= 0),
+        grouped,
+        torch.full_like(grouped, KVShardLayout.INVALID_SLOT),
+    )
+
+
+def replicate_pool_write_block_table(
+    block_table: torch.Tensor,
+    dcp_size: int,
+) -> torch.Tensor:
+    """Page table for a replicated (``XLLM_CP_INDEX_WRITE_MODE=replicated``,
+    the default) compressed-kPool write.
+
+    Same column contract as :func:`localize_pool_write_block_table` -- one
+    input column per logical block, one output column per global physical
+    page, consumed by both pool writers through their negative-id skip -- but
+    with the full-table arithmetic and no owner filter: output column ``i``
+    (stripe ``i % dcp_size`` of logical block ``block_table[i // dcp_size]``)
+    addresses that stripe's NATURAL page
+    ``block_table[i // dcp_size] * dcp_size + i % dcp_size``. Every rank
+    computes identical pools from the CP-merged global stream, so every rank
+    persists every stripe of every block and the local index cache becomes a
+    physical full replica: the read needs no cross-rank gather, and any single
+    PD transfer writer supplies every valid page of every resource.
+
+    Returns ``block_table`` unchanged when ``dcp_size <= 1``, so a full-replica
+    (``kv_split_size == 1``) launch keeps its existing table object.
+    """
+    if dcp_size <= 1:
+        return block_table
+    if block_table.dim() != 2:
+        raise ValueError("pool block table must be two-dimensional")
+    # The natural-row expansion is exactly KVShardLayout's indexer-block
+    # table view: column i addresses block_table[i // dcp_size] * dcp_size
+    # + i % dcp_size and a negative group stays invalid (INVALID_SLOT ==
+    # -1 matches expand_indexer_block_table's fill). Reuse the authority
+    # implementation that _materialized_block_table already consumes
+    # instead of keeping a second copy of the group-layout invariant.
+    return KVShardLayout(physical_block_size=1, dcp_size=dcp_size, dcp_rank=0).expand_indexer_block_table(block_table)
+
+
+def localize_index_write_slots(
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    dcp_size: int,
+) -> torch.Tensor:
+    """Remap owner-local latent-cache slots onto the index cache's page group.
+
+    This is the ``XLLM_CP_INDEX_WRITE_MODE=sharded`` write geometry. The NPU
+    index cache groups ``dcp_size`` physical pages under one logical block
+    (platform.h), while the owner-local slot mapping addresses the latent
+    cache, which stores a single page per logical block. A paged index write
+    must therefore land on page ``page * dcp_size`` -- the first page of the
+    logical block's group, exactly the page the PD transfer plan's page-level
+    overlap moves against a ``kv_split_size == 1`` destination. Peer-owned
+    slots stay invalid, so the scatter's padding redirect is unchanged.
+
+    The replicated mode (the default) needs no remapping at all: a global
+    logical slot ``s`` (block ``s // (page_size * dcp_size)``, stripe
+    ``(s % (page_size * dcp_size)) // page_size``) already addresses its
+    natural index row ``(s // (page_size * dcp_size)) * page_size * dcp_size +
+    s % (page_size * dcp_size) == s``, so the backend hands the writers the
+    global slot mapping unchanged and every stripe's page is written.
+
+    Returns ``slot_mapping`` unchanged when ``dcp_size <= 1``, so a
+    full-replica (``kv_split_size == 1``) launch keeps its mapping object.
+    """
+    if dcp_size <= 1:
+        return slot_mapping
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    valid_slots = slot_mapping >= 0
+    safe_slots = slot_mapping.clamp_min(0)
+    pages = torch.div(safe_slots, page_size, rounding_mode="floor")
+    grouped = safe_slots + pages * page_size * (dcp_size - 1)
+    return torch.where(
+        valid_slots,
+        grouped,
+        torch.full_like(grouped, KVShardLayout.INVALID_SLOT),
+    )

@@ -43,12 +43,86 @@ index ops so ``merge(all_gather(shard(x))) == x`` holds by construction.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
 from xllm.python import distributed
+
+# Explicit runtime switch for the CP indexer-cache (kPool/INDEX) write mode.
+# Defaults to replicated.
+#
+# Under CP + kv_split the NPU index cache is FULL-SIZE on every rank
+# (kv_cache_shape.cpp init_index_cache_shape: n_blocks * kv_split pages;
+# platform.h requires_dsa_indexer_cache_replication), and the indexer input is
+# the CP-merged global stream on every rank (Glm5NextMlaAttention.forward
+# merges hidden states before select_qli), so every rank can persist ALL
+# kv_split pages of every block bit-identically. The m7 owner-sharded mode
+# saved zero memory -- the tensor is full-size anyway -- and left the peer
+# pages stale, which forced a per-DSA-layer cross-rank all_gather on every
+# index read and made the equal-width D(kv_split) transfer topology
+# inexpressible (only page 0 of each source resource was ever valid).
+# Replicated writes make the local cache a physical full replica: the index
+# read becomes the identity, and any single transfer writer supplies every
+# valid page, which is what the PR370/M0 planner model already assumes.
+_CP_INDEX_WRITE_MODE_ENV = "XLLM_CP_INDEX_WRITE_MODE"
+# Only an explicit, recognized value selects a mode; anything else leaves the
+# default (replicated) in place rather than silently flipping it. An empty
+# value is deliberately NOT a mode: it commonly expands from an unset shell
+# variable, so it keeps the default instead of being read as a typo.
+_CP_INDEX_WRITE_MODES = frozenset({"replicated", "sharded"})
+_CP_INDEX_WRITE_MODE_DEFAULT = "replicated"
+
+
+def cp_index_write_mode() -> str:
+    """Which page layout CP indexer-cache writes persist under ``kv_split``.
+
+    ``"replicated"`` (default) drives every rank to persist ALL
+    ``kv_split_size`` pages of every logical block at their natural rows
+    (page ``block_table[b] * kv_split_size + stripe``), so the local index
+    cache is a physical full replica: index reads skip the cross-rank gather
+    and the PD transfer plan can take any single writer per resource.
+
+    ``"sharded"`` keeps the m7 owner-local behavior: each rank persists only
+    its own stripe, placed at the FIRST page of each block's index-page group
+    (the page the transfer plan's page-level overlap moves against a
+    ``kv_split_size == 1`` destination), and every index read reconstructs the
+    logical cache through a per-layer all_gather over the CP group. PD
+    transfer under this mode therefore supports ONLY ``kv_split_size == 1``
+    decode destinations: an equal-width ``kv_split_size > 1`` decode (the
+    D(kv_split SfaDcp) topology) plans 1:1 and moves every page of each INDEX
+    resource, but only page 0 of each resource was ever written on any rank,
+    so the decode would receive stale peer pages -- silent corruption. The
+    instance metadata carries this mode (``InstanceInfo.cp_index_write_mode``,
+    the proto field the registration publishes), and the transfer plan
+    (``plan_kv_split_widths``) refuses an equal-width ``kv_split_size > 1``
+    decode destination while this mode is ``sharded`` on either side: link
+    such pairs only under ``replicated`` (the default).
+
+    Read at call time (not import time) so a run can be flipped without a
+    rebuild. Unset, empty, or unrecognized values keep the default.
+    """
+    value = os.environ.get(_CP_INDEX_WRITE_MODE_ENV)
+    if value is None:
+        return _CP_INDEX_WRITE_MODE_DEFAULT
+    # Strip exactly the ASCII whitespace set the C++ parser
+    # (absl::StripAsciiWhitespace) strips, NOT str.strip()'s full Unicode
+    # set: the write geometry decided HERE and the declared mode the C++
+    # registration/transfer defenses read must normalize identically, or a
+    # value like "\u3000SHARDED\u3000" (full-width space, common from CJK
+    # input methods) would write sharded while every C++ side reads the
+    # replicated default -- an owner-sharded instance declaring replicated.
+    normalized = value.strip(" \t\n\v\f\r").lower()
+    if normalized in _CP_INDEX_WRITE_MODES:
+        return normalized
+    return _CP_INDEX_WRITE_MODE_DEFAULT
+
+
+def cp_index_write_replicated() -> bool:
+    """Whether CP indexer-cache writes replicate every stripe (the default)."""
+    return cp_index_write_mode() == _CP_INDEX_WRITE_MODE_DEFAULT
 
 
 @dataclass(frozen=True)

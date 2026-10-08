@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch_npu
 
+from scripts.logger import logger
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import (
     AttentionBackend,
@@ -37,8 +38,13 @@ from xllm.python.attention.backend import (
     linear_state_checkpoint_stride,
     resolve_linear_state_io_indices,
 )
-from xllm.python.attention.kv_shard_layout import has_rope_dim
-from xllm.python.model_executor.cp_utils import cp_gather_kv
+from xllm.python.attention.kv_shard_layout import (
+    has_rope_dim,
+    localize_index_write_slots,
+    localize_pool_write_block_table,
+    replicate_pool_write_block_table,
+)
+from xllm.python.model_executor.cp_utils import cp_gather_kv, cp_index_write_replicated
 from xllm.python.model_executor.forward_context import (
     AclGraphTask,
     get_execution_buffer,
@@ -71,6 +77,10 @@ def _is_dflash_proposal(metadata: object) -> bool:
 _SPARSE_MODE_NONE = 0
 _SPARSE_MODE_RIGHT_DOWN_CAUSAL = 3
 _SPARSE_MODE_BAND = 4
+
+# Emits the sharded-mode PD pairing warning once per process; the standing
+# configuration would otherwise re-log it on every prefill batch.
+_sharded_write_transfer_warning_emitted = False
 
 _HAS_FIA_V2 = hasattr(torch.ops.npu, "npu_fused_infer_attention_score_v2") and hasattr(
     torch_npu, "_npu_fused_infer_attention_score_v2_get_max_workspace"
@@ -271,6 +281,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._mla_max_seqlen_k = 0
         self._kv_owner_representatives: torch.Tensor | None = None
         self._materialized_block_table: torch.Tensor | None = None
+        # Physically expanded table (entry * kv_split + stripe) addressing the
+        # local full-replica index cache in replicated write mode; None while
+        # the write mode is sharded or the cache is a full replica.
+        self._replicated_index_block_table: torch.Tensor | None = None
         self._sfa_page_layout: _SfaPageLayout | None = None
 
         self._causal_mask = (
@@ -672,6 +686,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     def _prepare_kv_shard_materialization(self, metadata: AttentionMetadata) -> None:
         self._kv_owner_representatives = None
         self._materialized_block_table = None
+        self._replicated_index_block_table = None
         self._sfa_page_layout = None
         if not self._is_mla or not (metadata.is_prefill or metadata.is_chunked_prefill):
             return
@@ -682,6 +697,25 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         cp_size = distributed.cp_world_size(self.device)
         if cp_size <= 1 or cp_size % metadata.kv_split_size:
             raise RuntimeError("KV split must be a positive divisor of the active CP group")
+        global _sharded_write_transfer_warning_emitted
+        if not cp_index_write_replicated() and not _sharded_write_transfer_warning_emitted:
+            # Sharded index writes keep only page 0 of each logical block's
+            # index-page group valid on any rank, so a PD transfer plans
+            # against page 0 only -- correct for a kv_split_size == 1 decode,
+            # but an equal-width kv_split decode (D(kv_split SfaDcp)) plans 1:1
+            # and moves every page, receiving stale peer rows with no error
+            # anywhere. The link admission cannot see this python-side switch,
+            # so the loudest available signal is this once-per-process warning.
+            _sharded_write_transfer_warning_emitted = True
+            logger.warning(
+                "XLLM_CP_INDEX_WRITE_MODE=sharded with kv_split_size=%d: PD "
+                "transfers from this instance support only kv_split_size == 1 "
+                "decode destinations. An equal-width kv_split decode "
+                "(D(kv_split SfaDcp)) would receive stale peer INDEX pages "
+                "silently; link such pairs only under the default replicated "
+                "mode.",
+                metadata.kv_split_size,
+            )
 
         local_owner = torch.tensor([metadata.kv_split_rank], dtype=torch.int64, device=self.device)
         owner_by_cp_rank = distributed.all_gather(local_owner, 0, cp_size, "cp")
@@ -708,6 +742,17 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         expanded = torch.where(block_table.unsqueeze(-1) >= 0, expanded, torch.full_like(expanded, -1))
         self._materialized_block_table = expanded.flatten(1).contiguous()
         self._sfa_page_layout = _build_stable_sfa_page_layout(self._materialized_block_table)
+        if cp_index_write_replicated():
+            # Replicated index writes (the default): every rank persists every
+            # stripe's page at its natural row, so the local index cache is a
+            # physical full replica addressed by the replicate-mode pool table
+            # below (same natural-row expansion the pool writers use). The
+            # latent caches stay owner-sharded and keep gathering, so the
+            # owner bookkeeping above is still required.
+            self._replicated_index_block_table = replicate_pool_write_block_table(
+                block_table,
+                metadata.kv_split_size,
+            ).contiguous()
 
     def execute(
         self,
@@ -813,16 +858,19 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         cp_context = get_forward_context().cp_context
         rope_dim = getattr(layer, "qk_rope_head_dim", None)
         if cp_context is not None and rope_dim == 0:
-            # GLM-5 Next NoPE DSA under CP prefill. The model always merges to
-            # global rows, so the latent cache is written once through the
-            # global slot mapping and every projection/indexer GEMM upstream
-            # ran with M = the global token count, exactly as in the
-            # cp_size == 1 path. Under CP this rank attends only its own real
-            # query rows and scatters them back into the global layout for
-            # the model's reshard -- the partitioned call IS the CP path
-            # (no runtime switch: cp membership is uniform across the CP
-            # group, so gating on it can never desynchronize ranks, and the
-            # ON-vs-OFF equivalence was oracle-validated bit-identical).
+            # GLM-5 Next NoPE DSA under CP prefill. The model always merges
+            # to global rows, so every projection/indexer GEMM upstream ran
+            # with M = the global token count, exactly as in the cp_size == 1
+            # path. The latent cache is written once through the global slot
+            # mapping when the cache is a full replica and through the
+            # owner-local one when it is owner-sharded (kv_split), then the
+            # materialization reconstructs the read view. Under CP this rank
+            # attends only its own real query rows and scatters them back
+            # into the global layout for the model's reshard -- the
+            # partitioned call IS the CP path (no runtime switch: cp
+            # membership is uniform across the CP group, so gating on it can
+            # never desynchronize ranks, and the ON-vs-OFF equivalence was
+            # oracle-validated bit-identical).
             if cache_is_preprocessed:
                 raise RuntimeError("CP prefill does not support preprocessed MLA cache inputs")
             if topk is None:
@@ -831,7 +879,18 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 raise RuntimeError("CP prefill requires MLA cache inputs")
             if c8_enabled:
                 raise RuntimeError("CP prefill does not support SFA C8 packed KV cache")
-            if metadata.slot_mapping is None:
+            # Owner-sharded KV (kv_split_size > 1) keeps one stripe of the
+            # latent cache per rank, so the write must address the rows this
+            # rank owns: the local mapping folds the owned slots onto the
+            # local pages and marks peer-owned ones invalid. The global
+            # mapping would touch rows this rank does not own and leave its
+            # own stripe empty. _materialize_cp_cache below gathers every
+            # owner's stripe back over the CP group, so both branches attend
+            # the complete logical cache the kv_split_size == 1 shape
+            # produces; with no shard local_slot_mapping is the global one
+            # and this is the previous write verbatim.
+            cache_slots = metadata.local_slot_mapping if metadata.has_kv_shard else metadata.slot_mapping
+            if cache_slots is None:
                 raise RuntimeError("CP prefill requires a global MLA slot mapping")
             # kv_split_size > 1 with CP is refused at admission for every
             # model that reaches this NoPE branch (master.cpp: "Python
@@ -839,14 +898,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             # startup validation is the single owner of that policy, so the
             # backend keeps no second copy of the check.
             torch.ops.xllm_ops.reshape_paged_cache(
-                metadata.slot_mapping,
+                cache_slots,
                 k_latent_3d,
                 k_latent_3d,
                 nope_cache,
                 nope_cache,
             )
-            # glm5_next currently requires kv_split_size=1, making this an
-            # identity while preserving the uniform metadata-driven boundary.
+            # The gathered logical cache and its matching page table, identical
+            # in layout to what the kv_split_size == 1 shape produces. Whenever
+            # no shard is active this is the identity.
             attention_nope, block_table = self._materialize_cp_cache(nope_cache, metadata, cp_context)
             return self._mla_cp_partitioned_query(
                 q_latent,
@@ -1196,13 +1256,95 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if index_cache is None:
             raise RuntimeError(f"MLA index cache is missing for layer {layer.layer_id}")
         index_cache_scale = layer_cache.index_scale
-        slot_mapping = metadata.local_slot_mapping if metadata.has_kv_shard else metadata.slot_mapping
+        # XLLM_CP_INDEX_WRITE_MODE: replicated (default) persists every
+        # stripe's page at its natural row; sharded keeps the m7 owner-local
+        # geometry. Read once here so the write mapping, the pool-write table
+        # and the read tables below all agree on one mode per context.
+        index_write_replicated = cp_index_write_replicated()
+        has_index_shard = bool(metadata.has_kv_shard and metadata.kv_split_size > 1)
+        if has_index_shard and index_write_replicated:
+            # Replicated write mode: every rank persists every stripe's page
+            # at its natural row, and the natural row of global logical slot
+            # s is s itself (block s // (block_size * kv_split) contributes
+            # pages [e * kv_split, (e + 1) * kv_split) of block_size rows
+            # each), so the global slot mapping drives the paged index write
+            # directly -- exactly the kv_split_size == 1 arithmetic.
+            slot_mapping = metadata.slot_mapping
+        else:
+            slot_mapping = metadata.local_slot_mapping if metadata.has_kv_shard else metadata.slot_mapping
         if slot_mapping is None:
             raise RuntimeError("MLA index cache requires a slot mapping")
+        if has_index_shard and not index_write_replicated:
+            # Sharded write mode: the index cache groups kv_split_size
+            # physical pages under one logical block while the owner-local
+            # mapping addresses the latent cache's single page per block,
+            # so a paged index write must expand page p to p * kv_split_size
+            # -- the first page of the block's group, the page the PD
+            # transfer plan moves (the plan's page-level overlap only ever
+            # reads page 0 of a source resource). Without this the write
+            # would land on the latent cache's row and the transferred
+            # page would be one this rank never wrote.
+            slot_mapping = localize_index_write_slots(
+                slot_mapping,
+                self.page_size,
+                metadata.kv_split_size,
+            )
         kpool_tail_read_indices = None
         kpool_tail_write_indices = None
         if layer_cache.kpool_tail is not None:
             kpool_tail_read_indices, kpool_tail_write_indices = resolve_linear_state_io_indices(metadata)
+        # Which page-expanded table an index READ goes through: the physically
+        # expanded local table when the writes replicated every stripe (the
+        # cache is already a full replica), the gathered reconstruction's
+        # table when they were owner-sharded. The latent caches gather in both
+        # modes, so _materialized_block_table is prepared either way.
+        if (
+            has_index_shard
+            and index_write_replicated
+            and getattr(self, "_materialized_block_table", None) is not None
+            and getattr(self, "_replicated_index_block_table", None) is None
+        ):
+            # The shard was prepared under the sharded mode but this context
+            # runs replicated: reading the owner-sharded cache through the
+            # full-replica view would silently drop peer stripes, so fail
+            # loudly instead. (A backend whose preparation never ran at all
+            # keeps _materialized_block_table None and stays inert here; the
+            # attention path already rejects that case.)
+            raise RuntimeError(
+                "replicated index views were not prepared: the shard "
+                "materialization ran under XLLM_CP_INDEX_WRITE_MODE=sharded"
+            )
+        if (
+            has_index_shard
+            and not index_write_replicated
+            and getattr(self, "_materialized_block_table", None) is not None
+            and getattr(self, "_replicated_index_block_table", None) is not None
+        ):
+            # The mirror drift: the shard was prepared under the replicated
+            # mode (both views built) but this context runs sharded. The
+            # gathered reconstruction would read each block's page-0 rows,
+            # which under replicated writes all carry stripe-0 data -- every
+            # stripe j > 0 token would silently read stripe-0 pool values
+            # with no error anywhere in the path. Fail loudly instead.
+            # (A prepared-sharded shard keeps _replicated_index_block_table
+            # None, so the legitimate sharded read stays unaffected.)
+            raise RuntimeError(
+                "sharded index views were not prepared: the shard "
+                "materialization ran under XLLM_CP_INDEX_WRITE_MODE=replicated"
+            )
+        has_shard_views = bool(
+            metadata.has_kv_shard
+            and metadata.kv_split_size > 1
+            and getattr(self, "_materialized_block_table", None) is not None
+            and (not index_write_replicated or getattr(self, "_replicated_index_block_table", None) is not None)
+        )
+        index_read_block_table = None
+        if has_shard_views:
+            index_read_block_table = (
+                getattr(self, "_replicated_index_block_table", None)
+                if index_write_replicated
+                else getattr(self, "_materialized_block_table", None)
+            )
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=slot_mapping,
@@ -1240,6 +1382,28 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             kpool_query_lens=tuple(getattr(metadata, "kpool_query_lens", ())),
             kpool_query_lens_device=getattr(metadata, "kpool_query_lens_device", None),
             kpool_cache_triton_compatible=self._kpool_cache_triton_compatible[layer.layer_id],
+            # Shard-aware index views: mirror the exact predicate
+            # _prepare_kv_shard_materialization and _materialize_cp_cache use,
+            # so a context advertising a shard always has a page-expanded
+            # table to read through (an unprepared shard is already a hard
+            # error on the attention path). True in both write modes: the
+            # latent cache is owner-sharded either way and the index read
+            # always needs the page-expanded table -- the physically expanded
+            # local table in replicated mode, the gathered reconstruction's
+            # table in sharded mode.
+            has_kv_shard=has_shard_views,
+            materialized_block_table=index_read_block_table,
+            localize_pool_block_table=(
+                (lambda table: replicate_pool_write_block_table(table, metadata.kv_split_size))
+                if index_write_replicated
+                else (
+                    lambda table: localize_pool_write_block_table(
+                        table,
+                        metadata.kv_split_size,
+                        metadata.kv_split_rank,
+                    )
+                )
+            ),
         )
 
     def _get_quant_indexer_metadata(
@@ -1291,16 +1455,43 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         cache: torch.Tensor,
         metadata: AttentionMetadata,
         cp_context: CpContext | None,
+        pages_per_block: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather every owner's stripe of a shard-local cache over the CP group.
+
+        ``pages_per_block`` is the number of physical rows one logical block
+        spans in ``cache``: one for the latent caches, ``kv_split_size`` for
+        the index caches (the NPU groups that many pages under one block).
+        The owner's stripe of block ``b`` lives at row
+        ``block_table[b] * pages_per_block`` in every rank's local cache, so
+        the gather selects exactly that row and the interleaved result keeps
+        the full-replica layout (row ``b * kv_split_size + owner``).
+
+        In replicated write mode (``XLLM_CP_INDEX_WRITE_MODE=replicated``, the
+        default) an INDEX cache (``pages_per_block > 1``) is already a
+        physical full replica -- every rank persisted every stripe's page at
+        its natural row ``block_table[b] * kv_split_size + stripe`` -- so the
+        cross-rank gather is pure overhead and this returns the local cache
+        with its physically expanded page table instead. The latent caches
+        (``pages_per_block == 1``) stay owner-sharded in both modes and always
+        take the gather below.
+        """
         if cp_context is None or not metadata.has_kv_shard or metadata.kv_split_size <= 1:
             assert self._block_table_i32 is not None
             return cache, self._block_table_i32
+        if pages_per_block < 1:
+            raise RuntimeError("KV shard materialization requires at least one page per block")
+        if pages_per_block > 1 and cp_index_write_replicated():
+            if self._replicated_index_block_table is None:
+                raise RuntimeError("replicated index materialization was not prepared")
+            return cache, self._replicated_index_block_table
         if self._kv_owner_representatives is None or self._materialized_block_table is None:
             raise RuntimeError("KV shard materialization was not prepared")
         assert self._block_table_i32 is not None
         flat_blocks = self._block_table_i32.reshape(-1)
         safe_blocks = flat_blocks.clamp_min(0).to(torch.int64)
-        local_blocks = cache.index_select(0, safe_blocks)
+        source_rows = safe_blocks * pages_per_block
+        local_blocks = cache.index_select(0, source_rows)
         gathered = distributed.all_gather(local_blocks, 0, cp_context.cp_size, "cp")
         gathered = gathered.view(cp_context.cp_size, flat_blocks.numel(), *cache.shape[1:])
         owner_blocks = gathered.index_select(0, self._kv_owner_representatives)
@@ -1322,6 +1513,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             index_cache,
             metadata,
             cp_context,
+            pages_per_block=metadata.kv_split_size,
         )
         materialized_scale = None
         if index_cache_scale is not None:
@@ -1329,6 +1521,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 index_cache_scale,
                 metadata,
                 cp_context,
+                pages_per_block=metadata.kv_split_size,
             )
         return materialized_cache, materialized_scale, block_table
 
@@ -1373,6 +1566,28 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         index_cache = self._kv_caches[layer.layer_id].index
         assert index_cache is not None, "gather_index_history requires a paged index cache"
         block_table = self.indexer_block_table()
+        # Duck-typed metadata (graph-mode stand-ins, non-MLA shapes) may not
+        # carry the shard fields; the gate stays inert for them, as in
+        # dense_dcp_metadata_builder.
+        if getattr(metadata, "has_kv_shard", False) and metadata.kv_split_size > 1:
+            # Shard-aware index cache: in sharded write mode the local cache
+            # holds one owner page per logical block at the first page of the
+            # block's index-page group, so walking it with the logical table
+            # would read a fraction of every block; in replicated mode the
+            # local cache is already a physical full replica. Either way the
+            # read must go through the page-expanded view
+            # _materialize_cp_cache returns (the gathered reconstruction or
+            # the physically expanded local table) instead of the logical
+            # table. The compressed-pool layout never reaches here -- it reads
+            # through read_pools.
+            context = get_forward_context_or_none()
+            if context is not None and context.cp_context is not None:
+                index_cache, block_table = self._materialize_cp_cache(
+                    index_cache,
+                    metadata,
+                    context.cp_context,
+                    pages_per_block=metadata.kv_split_size,
+                )
         block_size = index_cache.shape[1]
         width = index_cache.shape[3]
         device = index_cache.device

@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "framework/kv_cache_transfer/kv_cache_store.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
 
 namespace xllm {
 namespace {
@@ -286,6 +287,11 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
         options_.kv_split_full_domain_size();
     store_config.kv_split_size = options_.kv_split_size();
     store_config.kv_split_rank = options_.kv_split_rank();
+    // The store's object keys must separate INDEX objects written under
+    // different CP index write modes (the shapes are identical; the valid
+    // pages are not), so the schema hash carries the process's declared
+    // mode.
+    store_config.cp_index_write_mode = declared_cp_index_write_mode();
     store_config.enable_mla = options_.enable_mla();
     LOG(INFO) << "[Mooncake][StoreEngine] initialize, endpoint="
               << store_local_hostname << ", protocol=" << store_config.protocol

@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "common/types.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache_transfer/mooncake_store_backend.h"
 #include "framework/model/model_input_params.h"
@@ -58,6 +59,13 @@ struct KVCacheStoreInitConfig {
   int32_t kv_split_full_domain_size = 1;
   int32_t kv_split_size = 1;
   int32_t kv_split_rank = 0;
+  // The process's declared CP index write mode (XLLM_CP_INDEX_WRITE_MODE,
+  // resolved by declared_cp_index_write_mode()). Part of the object-key
+  // schema: INDEX objects written under different modes are not
+  // interchangeable even though their tensor shapes match. Defaults to the
+  // switch's own default so a construction site that forgets to wire it
+  // keys the same space as the majority (replicated) writers.
+  int32_t cp_index_write_mode = kCpIndexWriteModeReplicated;
   bool enable_mla = false;
 };
 

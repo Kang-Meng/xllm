@@ -24,11 +24,16 @@ import torch
 import torch.nn as nn
 
 from xllm.python.attention.backend import linear_state_checkpoint_stride  # noqa: E402
+from xllm.python.attention.kv_shard_layout import (  # noqa: E402
+    localize_pool_write_block_table,
+    replicate_pool_write_block_table,
+)
 from xllm.python.layers import moe_parallel
 from xllm.python.layers.moe_parallel import TokenParallelLayout
 from xllm.python.model_executor import cp_utils
 from xllm.python.models import glm5_next
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
+from xllm.python.models.glm5_next_kpool import read_pools
 
 # ``xllm.python.attention.npu_paged_attention`` imports ``torch_npu`` at
 # module scope; stub it when absent so the real-backend handoff tests below
@@ -983,14 +988,15 @@ def _index_context_recording(cp_context, recorded: dict[str, torch.Tensor]) -> S
         kpool_tail_read_indices=None,
         kpool_tail_write_indices=None,
         slot_mapping=torch.arange(4, dtype=torch.int64),
-        # Dummy index-cache tensor: only its presence matters to select_qli
-        # (the recording update_index_cache above ignores its content).
-        index_cache=torch.zeros(1, 8, 1, 1),
+        index_cache=torch.zeros(1, _MLA_HANDOFF_BLOCK_SIZE, 1, 1),
         index_cache_scale=None,
         cp_context=cp_context,
         kpool_query_lens=(),
         kpool_query_lens_device=None,
         kpool_cache_triton_compatible=False,
+        has_kv_shard=False,
+        materialized_block_table=None,
+        localize_pool_block_table=lambda table: table,
         update_index_cache=update_index_cache,
     )
 
@@ -2254,6 +2260,307 @@ def _run_mla_decode_step(nope_cache: torch.Tensor, index_cache: torch.Tensor) ->
 
 
 # ---------------------------------------------------------------------------
+# KV-split indexer-pool suite (from the cp-kv-split branch): the write-mode
+# pin, the compressed-indexer select_qli fixtures, and the pool write
+# localization / replicated-natural-rows / roundtrip parity tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _pin_cp_index_write_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the CP index-write mode switch instead of inheriting the ambient
+    environment.
+
+    The switch is an operator-facing runtime flag; a shell that exports
+    ``XLLM_CP_INDEX_WRITE_MODE`` must not leak into these tests. The model-side
+    tests hand-build their index contexts (the layout hooks are injected
+    directly), so they are switch-independent by design; the replicated-mode
+    tests override this with ``"replicated"`` through the same ``monkeypatch``
+    instance.
+    """
+    monkeypatch.setenv("XLLM_CP_INDEX_WRITE_MODE", "sharded")
+
+
+def _compressed_index_context(
+    recorded: dict[str, object],
+    *,
+    has_kv_shard: bool,
+) -> SimpleNamespace:
+    """A compressed-tail context whose pool views are observable.
+
+    ``update_compressed_kpool`` is replaced by a recorder so the write's page
+    table can be read back, and the sharded case advertises a distinct
+    materialized cache/page table so a read that forgot to materialize is
+    visible.
+    """
+    ctx = _index_context_recording(None, recorded)
+    ctx.block_table = torch.tensor([[3, 7]], dtype=torch.int32)
+    ctx.actual_seq_kv = torch.tensor([4], dtype=torch.int64)
+    ctx.slot_mapping = torch.arange(4, dtype=torch.int64)
+    ctx.kpool_tail = torch.zeros(2, 2, 2, 1, dtype=torch.bfloat16)
+    ctx.kpool_tail_read_indices = torch.tensor([2], dtype=torch.int64)
+    ctx.kpool_tail_write_indices = ctx.kpool_tail_read_indices
+    ctx.kpool_query_lens = (4,)
+    ctx.index_cache = torch.full((8, 1, 1, 1), -7.0)
+    ctx.materialized_index_cache = torch.full((8, 1, 1, 1), 7.0)
+    ctx.materialized_block_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+    ctx.has_kv_shard = has_kv_shard
+    ctx.materialize_index_cache = lambda: (
+        ctx.materialized_index_cache,
+        None,
+        ctx.materialized_block_table,
+    )
+    ctx.localize_pool_block_table = (
+        (lambda table: localize_pool_write_block_table(table, dcp_size=2, dcp_rank=0))
+        if has_kv_shard
+        # A full replica: the helper short-circuits to the caller's table, which
+        # is what the backend closure does for kv_split_size == 1.
+        else (lambda table: table)
+    )
+    return ctx
+
+
+@pytest.mark.parametrize("has_kv_shard", [False, True])
+def _make_compressed_indexer() -> glm5_next.Glm5NextIndexer:
+    """The compressed-tail kPool body (``index_kpool > 1`` + per-request tail),
+    which is the shape the GLM-5.3-Flash checkpoint config selects: only the
+    pool write and the pool read are interesting here, so ``select_topk`` and
+    ``update_compressed_kpool`` are the call sites under test rather than the
+    kernel math they contain."""
+    indexer = _make_simple_indexer()
+    indexer.index_kpool = 2
+    indexer.index_kpool_compress = True
+    indexer.index_kpool_always_select_tail = True
+    indexer._uses_npu_compressed_tail = True
+    indexer._update_compact_kpool = None
+    indexer._compact_kpool_model_compatible = False
+    indexer.index_kpool_compress_ape = torch.zeros(2, 1)
+    return indexer
+
+
+def _replicated_compressed_index_context(
+    recorded: dict[str, object],
+) -> SimpleNamespace:
+    """A compressed-tail context wired the way ``mla_index_context`` wires it
+    in replicated write mode.
+
+    Eight tokens of one logical block (entry 2, so its index-page group is
+    [4, 5]); the pool write goes through the natural-row expansion and the
+    read through the local full-replica cache with its physically expanded
+    table. ``update_compressed_kpool`` stays REAL so the written pool rows can
+    be read back."""
+    ctx = _index_context_recording(None, recorded)
+    ctx.block_table = torch.tensor([[2]], dtype=torch.int32)
+    ctx.actual_seq_kv = torch.tensor([8], dtype=torch.int64)
+    ctx.slot_mapping = torch.arange(16, 24, dtype=torch.int64)
+    ctx.kpool_tail = torch.zeros(2, 2, 2, 1, dtype=torch.bfloat16)
+    ctx.kpool_tail_read_indices = torch.tensor([2], dtype=torch.int64)
+    ctx.kpool_tail_write_indices = ctx.kpool_tail_read_indices
+    ctx.kpool_query_lens = (8,)
+    ctx.index_cache = torch.full((8, 2, 1, 1), -7.0)
+    ctx.has_kv_shard = True
+    # The physically expanded local table: logical block 2 owns pages 4 and 5.
+    ctx.materialized_block_table = torch.tensor([[4, 5]], dtype=torch.int32)
+    ctx.materialize_index_cache = lambda: (
+        ctx.index_cache,
+        None,
+        ctx.materialized_block_table,
+    )
+    ctx.localize_pool_block_table = lambda table: replicate_pool_write_block_table(table, dcp_size=2)
+    return ctx
+
+
+def _run_compressed_select_qli(ctx: SimpleNamespace) -> tuple[object, MagicMock]:
+    """Drive ``select_qli`` over the 8-token stream and capture the call sites."""
+    indexer = _make_compressed_indexer()
+    select_topk = MagicMock(return_value=torch.zeros(1, 8, 1, dtype=torch.long))
+    indexer.select_topk = select_topk
+    hidden = torch.arange(1.0, 9.0).view(1, 8, 1)
+    with patch.object(glm5_next, "update_compressed_kpool", wraps=glm5_next.update_compressed_kpool) as write_pools:
+        indexer.select_qli(
+            hidden_states=hidden,
+            qr=hidden.reshape(8, 1),
+            positions=torch.arange(8, dtype=torch.int32).view(1, 8),
+            attention_mask=torch.ones(1, 8, dtype=torch.bool),
+            ctx=ctx,
+            layer=None,
+            backend=MagicMock(),
+        )
+    return write_pools, select_topk
+
+
+@pytest.mark.parametrize("has_kv_shard", [False, True])
+def test_dsa_indexer_pool_write_is_localized_and_read_is_materialized(has_kv_shard: bool) -> None:
+    """Owner-sharded index cache: the compressed-pool write must address this
+    rank's own pool pages (peer pages marked invalid) while the read must
+    address the reconstructed logical pages. With no shard both call sites see
+    exactly the objects they saw before, so the kv_split_size == 1 launch is
+    untouched.
+    """
+    indexer = _make_compressed_indexer()
+    recorded: dict[str, object] = {}
+    ctx = _compressed_index_context(recorded, has_kv_shard=has_kv_shard)
+    select_topk = MagicMock(return_value=torch.zeros(1, 4, 1, dtype=torch.long))
+    indexer.select_topk = select_topk
+    backend = MagicMock()
+
+    hidden = torch.arange(1.0, 5.0).view(1, 4, 1)
+    with patch.object(glm5_next, "update_compressed_kpool") as write_pools:
+        indexer.select_qli(
+            hidden_states=hidden,
+            qr=hidden.reshape(4, 1),
+            positions=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            attention_mask=torch.ones(1, 4, dtype=torch.bool),
+            ctx=ctx,
+            layer=None,
+            backend=backend,
+        )
+
+    # The write addresses pool pages through a table whose peer-owned columns
+    # are invalid; only columns 0 and 2 (owner 0's half of each logical block)
+    # survive, and each points at the FIRST page of the block's index-page
+    # group (entry * kv_split_size) -- the page the PD transfer plan moves.
+    write_pools.assert_called_once()
+    write_table = write_pools.call_args.args[9]
+    read_args = select_topk.call_args.kwargs
+    if has_kv_shard:
+        torch.testing.assert_close(
+            write_table,
+            torch.tensor([[6, -1, 14, -1]], dtype=torch.int32),
+        )
+        assert read_args["pool_cache"] is ctx.materialized_index_cache
+        torch.testing.assert_close(
+            read_args["pool_block_table"],
+            ctx.materialized_block_table,
+        )
+        torch.testing.assert_close(
+            read_args["pool_query_block_table"],
+            ctx.materialized_block_table,
+        )
+    else:
+        assert write_table is ctx.block_table
+        assert read_args["pool_cache"] is ctx.index_cache
+        assert write_table is read_args["pool_block_table"]
+        assert read_args["pool_query_block_table"] is ctx.block_table
+
+
+def test_dsa_indexer_pool_write_replicates_natural_rows_and_reads_local_replica(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replicated write mode (``XLLM_CP_INDEX_WRITE_MODE=replicated``, the
+    default): the compressed-pool write addresses every stripe's page at its
+    natural row (no owner filter, no -1 peer columns), and the read goes to
+    the LOCAL full-replica cache through the physically expanded table --
+    no gathered reconstruction. The sharded battery's counterpart test pins
+    the opposite geometry (owner columns only, group-first pages)."""
+    monkeypatch.setenv("XLLM_CP_INDEX_WRITE_MODE", "replicated")
+    recorded: dict[str, object] = {}
+    ctx = _replicated_compressed_index_context(recorded)
+
+    write_pools, select_topk = _run_compressed_select_qli(ctx)
+
+    # The write table is the natural-row expansion of the logical table
+    # [[2]]: stripes 0 and 1 address pages 4 and 5 -- never the owner-filtered
+    # [[4, -1]] the sharded mode produces for rank 0.
+    write_pools.assert_called_once()
+    write_table = write_pools.call_args.args[9]
+    torch.testing.assert_close(
+        write_table,
+        torch.tensor([[4, 5]], dtype=torch.int32),
+    )
+    # Every page of the block's group was persisted: pools 0 and 1 (stripe 0,
+    # page 4) and pools 2 and 3 (stripe 1, page 5) all completed, so neither
+    # group page keeps its -7 fill. In sharded mode page 5 would stay stale.
+    flat_cache = ctx.index_cache.view(-1)
+    assert not bool((flat_cache[8:12] == -7.0).any())
+
+    # The read is the identity view: the local cache object itself plus the
+    # physically expanded table, never a gathered copy.
+    read_args = select_topk.call_args.kwargs
+    assert read_args["pool_cache"] is ctx.index_cache
+    torch.testing.assert_close(
+        read_args["pool_block_table"],
+        ctx.materialized_block_table,
+    )
+    torch.testing.assert_close(
+        read_args["pool_query_block_table"],
+        ctx.materialized_block_table,
+    )
+
+
+def test_dsa_indexer_replicated_pool_roundtrip_matches_kv1_full_replica(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Write-read roundtrip at the model seam: the real
+    ``update_compressed_kpool`` plus ``read_pools`` over the same 8-token
+    stream must produce byte-identical pool caches and identical read-back
+    pools in the replicated kv_split_size == 2 layout and the
+    kv_split_size == 1 full-replica layout. This is the property that makes
+    the replicated index cache a drop-in full replica for the transfer side:
+    any single writer's pages are all valid."""
+    monkeypatch.setenv("XLLM_CP_INDEX_WRITE_MODE", "replicated")
+    recorded: dict[str, object] = {}
+    replicated_ctx = _replicated_compressed_index_context(recorded)
+    _, replicated_topk = _run_compressed_select_qli(replicated_ctx)
+
+    # The kv1 full-replica counterpart: page-granular block table [[4, 5]],
+    # no shard views, the identity pool-table hook. The same 8-token stream
+    # derives the same global slot mapping [16, 24).
+    kv1_ctx = _index_context_recording(None, recorded)
+    kv1_ctx.block_table = torch.tensor([[4, 5]], dtype=torch.int32)
+    kv1_ctx.actual_seq_kv = torch.tensor([8], dtype=torch.int64)
+    kv1_ctx.slot_mapping = torch.arange(16, 24, dtype=torch.int64)
+    kv1_ctx.kpool_tail = torch.zeros(2, 2, 2, 1, dtype=torch.bfloat16)
+    kv1_ctx.kpool_tail_read_indices = torch.tensor([2], dtype=torch.int64)
+    kv1_ctx.kpool_tail_write_indices = kv1_ctx.kpool_tail_read_indices
+    kv1_ctx.kpool_query_lens = (8,)
+    kv1_ctx.index_cache = torch.full((8, 2, 1, 1), -7.0)
+    kv1_ctx.has_kv_shard = False
+    _, kv1_topk = _run_compressed_select_qli(kv1_ctx)
+
+    # Identical cache bytes: both layouts wrote the same pools to the same
+    # physical rows (pages 4 and 5, pool rows 8..11).
+    torch.testing.assert_close(replicated_ctx.index_cache, kv1_ctx.index_cache)
+
+    # Identical read-back through read_pools on each captured view.
+    replicated_kwargs = replicated_topk.call_args.kwargs
+    kv1_kwargs = kv1_topk.call_args.kwargs
+    replicated_pools = read_pools(
+        replicated_kwargs["pool_cache"],
+        replicated_kwargs["pool_block_table"],
+        kv1_ctx.actual_seq_kv,
+        n_pools=4,
+        rate=2,
+    )
+    kv1_pools = read_pools(
+        kv1_kwargs["pool_cache"],
+        kv1_kwargs["pool_block_table"],
+        kv1_ctx.actual_seq_kv,
+        n_pools=4,
+        rate=2,
+    )
+    torch.testing.assert_close(replicated_pools[0], kv1_pools[0])
+    torch.testing.assert_close(replicated_pools[1], kv1_pools[1])
+    torch.testing.assert_close(replicated_pools[2], kv1_pools[2])
+
+
+# ---------------------------------------------------------------------------
+# M11.5 scheduler-overlap prework: the overlapped decode-input token
+# replacement must be byte-identical across CP ranks.
+#
+# There is no Python-side replacement entry: under ``enable_schedule_overlap``
+# the fake-token -> real-token rewrite happens in the worker
+# (``WorkerImpl::update_input_by_last_step_output``, xllm/core/runtime/
+# worker_impl.cpp -- the NPU path calls aclnnReplaceToken, whose golden is
+# third_party/xllm_ops/test/python_test/test_replace_token.py). The scheduler
+# feeds each sequence a 1-based negative placeholder produced by the driver
+# worker's fake output (``torch::arange(-1, -(N + 1), -1)``,
+# xllm/core/distributed_runtime/worker_service.cpp), the engine broadcasts one
+# ``ForwardInput`` to every CP rank of a DP group (``LLMEngine::step``, "Engine
+# sends full global tokens"), and every rank resolves the placeholder against
+# its own rank-local ``last_step_output_``. The tests below pin that protocol
+# at the narrowest Python-visible seam: the replacement rule itself.
+
 # DFlash2 spec-verify and chunked-prefill suite (from the pcp-dflash2
 # branch): the prefill-capture -> spec-verify roundtrip against the non-CP
 # baseline, the DFlash2 v3 spec-verify shape, and the chunked-prefill

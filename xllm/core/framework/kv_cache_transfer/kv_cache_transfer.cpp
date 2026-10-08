@@ -19,10 +19,14 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <optional>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
+#include "absl/strings/ascii.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "util/env_var.h"
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
@@ -43,7 +47,124 @@ std::vector<KVTransferTaskResult> failed_tasks_for_requests(
                                KVTransferErrorCode::FAILED}};
 }
 
+// Mirrors cp_utils.py: only an explicit, recognized value selects a mode, and
+// only "sharded" differs from the default. An empty value is deliberately not
+// a mode (an unset shell variable), so it keeps the replicated default.
+constexpr char kCpIndexWriteModeEnv[] = "XLLM_CP_INDEX_WRITE_MODE";
+
 }  // namespace
+
+int32_t declared_cp_index_write_mode() {
+  // Mirror the python reader (cp_utils.py: strip, then lowercase, then exact
+  // match): absl::StripAsciiWhitespace strips the full ASCII whitespace set
+  // (\t\n\v\f\r and space) just like python's str.strip(), so a value such
+  // as "  SHARDED\v" resolves identically on both sides.
+  const std::string lowered = absl::AsciiStrToLower(
+      util::get_optional_string_env(kCpIndexWriteModeEnv).value_or(""));
+  const absl::string_view trimmed = absl::StripAsciiWhitespace(lowered);
+  return trimmed == "sharded" ? kCpIndexWriteModeSharded
+                              : kCpIndexWriteModeReplicated;
+}
+
+const char* cp_index_write_mode_label(int32_t cp_index_write_mode) {
+  switch (cp_index_write_mode) {
+    case kCpIndexWriteModeReplicated:
+      return "replicated";
+    case kCpIndexWriteModeSharded:
+      return "sharded";
+    default:
+      return "unspecified";
+  }
+}
+
+KvSplitWidthPlan plan_kv_split_widths(int32_t src_kv_split_size,
+                                      int32_t dst_kv_split_size,
+                                      int32_t src_cp_index_write_mode,
+                                      int32_t dst_cp_index_write_mode,
+                                      std::string* reason) {
+  const auto reject = [reason](const std::string& message) {
+    if (reason != nullptr) {
+      *reason = message;
+    }
+    return KvSplitWidthPlan::UNRECONCILABLE;
+  };
+  if (src_kv_split_size < 1) {
+    // 0 is proto3's "field not present" and means the source never declared
+    // a width -- nothing can be validated about how its blocks are laid out.
+    return reject(
+        "KV split width not declared, source=" +
+        std::to_string(src_kv_split_size) +
+        ", destination=" + std::to_string(dst_kv_split_size) +
+        ": the source must declare kv_split_size before a PUSH can be mapped "
+        "(0 means the peer's registration record, or the service that served "
+        "it, carried no width)");
+  }
+  if (dst_kv_split_size < 1) {
+    // An undeclared DESTINATION width only matters when the source actually
+    // splits KV: a split source's stride remapping depends on the
+    // destination's declared width, and refusing is what once kept a decode
+    // intending dcp=4 (behind a service that never carried the field) from
+    // silently taking the 1:1 mapping path. A width-1 source never splits,
+    // skips filter_kv_split_infos entirely, and maps onto the destination's
+    // table one-to-one whatever the destination declares or fails to
+    // declare -- refusing it would fail every request of a legacy pair
+    // (non-CP prefill, old-service-registered decode) that transferred fine
+    // with stride=1 before the field existed.
+    if (src_kv_split_size == 1) {
+      return KvSplitWidthPlan::RANK_LOCAL;
+    }
+    return reject(
+        "KV split width not declared, source=" +
+        std::to_string(src_kv_split_size) +
+        ", destination=" + std::to_string(dst_kv_split_size) +
+        ": a split source requires the destination to declare kv_split_size "
+        "before a PUSH can be mapped (0 means the peer's registration record, "
+        "or the service that served it, carried no width)");
+  }
+  if (src_kv_split_size == dst_kv_split_size) {
+    // Sharded INDEX writes keep only page 0 of each logical block's
+    // index-page group valid on any rank, so the 1:1 page moves of a
+    // RANK_LOCAL plan would deliver stale peer pages. Only the replicated
+    // mode (the XLLM_CP_INDEX_WRITE_MODE default) makes every page of every
+    // resource transferable; an unspecified mode is a legacy instance and
+    // keeps the pre-field behavior. The check is symmetric: a sharded
+    // declaration on EITHER side of an equal-width kv_split_size > 1 pair
+    // poisons the 1:1 moves, because the sharded side's non-zero pages are
+    // stale no matter which endpoint wrote them.
+    const bool src_sharded =
+        src_cp_index_write_mode == kCpIndexWriteModeSharded;
+    const bool dst_sharded =
+        dst_cp_index_write_mode == kCpIndexWriteModeSharded;
+    if (src_kv_split_size > 1 && (src_sharded || dst_sharded)) {
+      const char* sharded_side =
+          src_sharded && dst_sharded
+              ? "both sides"
+              : (src_sharded ? "the source" : "the destination");
+      return reject(
+          "CP index write mode mismatch, source=" +
+          std::to_string(src_kv_split_size) + ", destination=" +
+          std::to_string(dst_kv_split_size) + ", source write mode=" +
+          cp_index_write_mode_label(src_cp_index_write_mode) +
+          ", destination write mode=" +
+          cp_index_write_mode_label(dst_cp_index_write_mode) + ": " +
+          std::string(sharded_side) +
+          " declare(s) the sharded index write mode "
+          "(XLLM_CP_INDEX_WRITE_MODE=sharded), whose pages stay valid only "
+          "for a kv_split_size == 1 destination -- pair an equal-width "
+          "kv_split destination only with the replicated write mode on both "
+          "sides (the default)");
+    }
+    return KvSplitWidthPlan::RANK_LOCAL;
+  }
+  if (dst_kv_split_size == 1) {
+    return KvSplitWidthPlan::STRIDED;
+  }
+  return reject(
+      "incompatible KV split widths, source=" +
+      std::to_string(src_kv_split_size) +
+      ", destination=" + std::to_string(dst_kv_split_size) +
+      ": only equal widths or an unsplit destination (width 1) are supported");
+}
 
 bool KVCacheTransfer::validate_transfer_mappings(
     const std::vector<KVTransferMapping>& mappings,
@@ -125,6 +246,54 @@ bool KVCacheTransfer::validate_transfer_mappings(
                                     info.request_id,
                                     kv_split_size,
                                     info.rank_local_mapping)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool KVCacheTransfer::validate_kv_split_width_plan(
+    const std::vector<TransferKVInfo>& transfer_kv_infos,
+    int32_t src_kv_split_size) {
+  // The push path re-reads the process's declared write mode: it is the same
+  // value register_instance_info put on the registration record, so this is
+  // defense in depth for the scheduler-side dispatch gate.
+  const int32_t src_cp_index_write_mode = declared_cp_index_write_mode();
+  for (const TransferKVInfo& info : transfer_kv_infos) {
+    // The push-side defense must classify BOTH mapping kinds: a strided
+    // info is only legitimate for the pairs plan_kv_split_widths calls
+    // STRIDED, and an inexpressible pair (e.g. a width-1 source feeding a
+    // width-2 destination) reaches this function with
+    // rank_local_mapping=false -- rank_local_mapping is set by the
+    // scheduler-side resolve, so a regressed scheduler gate would build
+    // exactly that info, and a plain "skip non-rank-local" would let it
+    // through to the unfiltered 1:1 remote_ids consumption.
+    std::string reason;
+    const KvSplitWidthPlan plan =
+        plan_kv_split_widths(src_kv_split_size,
+                             info.remote_instance_info.kv_split_size,
+                             src_cp_index_write_mode,
+                             info.remote_instance_info.cp_index_write_mode,
+                             &reason);
+    if (plan == KvSplitWidthPlan::UNRECONCILABLE) {
+      LOG(ERROR) << "Refusing KV cache transfer, request_id=" << info.request_id
+                 << ": " << reason;
+      return false;
+    }
+    // This branch is the scheduler-gate regression catch: rank_local_mapping
+    // is set by the dispatch-side resolve, and a mapper claiming 1:1 against
+    // a plan the widths do not license (STRIDED here -- UNRECONCILABLE is
+    // handled above and RANK_LOCAL cannot contradict itself) would have both
+    // owners write the same destination blocks. plan_kv_split_widths only
+    // fills `reason` on the UNRECONCILABLE path, so name the contradiction
+    // and the actual pair here instead of logging an empty tail.
+    if (info.rank_local_mapping && plan != KvSplitWidthPlan::RANK_LOCAL) {
+      LOG(ERROR) << "Refusing KV cache transfer, request_id=" << info.request_id
+                 << ": rank-local mapping contradicts the width plan, source="
+                 << src_kv_split_size
+                 << ", destination=" << info.remote_instance_info.kv_split_size
+                 << " (the pair plans to STRIDED; the scheduler gate must "
+                    "regress for a mapper to claim rank-local here)";
       return false;
     }
   }
@@ -248,6 +417,16 @@ KVCacheTransfer::push_kv_blocks_async(
     // degenerates to a copy, so we skip it and let each rank consume
     // remote_ids 1:1.
     const int32_t kv_split_size = parallel_args.kv_split_size_effective();
+    // The mapping decision is checked here, where `kv_split_size` really is the
+    // source's declared width. It deliberately does NOT live inside
+    // validate_transfer_mappings(): the post-filter call below passes the
+    // literal 1, which means "each rank's mapping is 1:1 now", not "the source
+    // declares width 1", and reading it as a width refused every push to a
+    // destination that declares kv_split_size > 1.
+    if (!validate_kv_split_width_plan(*kv_infos, kv_split_size)) {
+      promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
+      return;
+    }
     if (!validate_transfer_mappings(*kv_infos, kv_split_size)) {
       promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
       return;
@@ -261,6 +440,8 @@ KVCacheTransfer::push_kv_blocks_async(
         return;
       }
     }
+    // Post-filter identity: every rank's local_ids and remote_ids must line up
+    // 1:1. The literal 1 below is that expectation, not a declared width.
     if (!validate_transfer_mappings(*kv_infos, /*kv_split_size=*/1)) {
       promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
       return;

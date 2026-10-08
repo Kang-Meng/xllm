@@ -2078,6 +2078,11 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   info.mappings.emplace_back(make_mapping(BlockType::KV, {100, 101}));
   info.dp_rank = 1;
   info.remote_instance_info.dp_size = 2;
+  // The push-side width defense (validate_kv_split_width_plan) reads the
+  // remote's declared kv_split_size AND cp_index_write_mode from this
+  // shm-serialized record; pin that both survive the round trip.
+  info.remote_instance_info.kv_split_size = 2;
+  info.remote_instance_info.cp_index_write_mode = kCpIndexWriteModeSharded;
   seq.kv_state().set_transfer_kv_info(std::move(info));
 
   std::vector<Sequence*> sequences = {&seq};
@@ -2128,6 +2133,14 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       find_mapping(round_trip.transfer_kv_infos[0], BlockType::KV);
   EXPECT_EQ(mapping.local_ids, (std::vector<uint64_t>{1}));
   EXPECT_EQ(mapping.remote_ids, (std::vector<uint64_t>{100}));
+  // The shm record is the push-side defense's only view of the remote's
+  // declarations; both fields must arrive verbatim (kCpIndexWriteModeSharded
+  // is not proto3's 0, so a dropped field would read as Unspecified).
+  EXPECT_EQ(round_trip.transfer_kv_infos[0].remote_instance_info.kv_split_size,
+            2);
+  EXPECT_EQ(
+      round_trip.transfer_kv_infos[0].remote_instance_info.cp_index_write_mode,
+      kCpIndexWriteModeSharded);
   EXPECT_EQ(round_trip.input_params.embedding.mtp_bootstrap_row_idxes,
             std::vector<int32_t>{0});
   EXPECT_EQ(round_trip.input_params.parallel.dp_global_batch_generations,

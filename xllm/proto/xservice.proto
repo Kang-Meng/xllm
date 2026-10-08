@@ -50,6 +50,14 @@ message InstanceMetaInfo {
   string incarnation_id = 11;
   uint64 register_ts_ms = 12;
   int32 kv_split_size = 13;
+  // Which pages of each INDEX resource the instance writes under
+  // XLLM_CP_INDEX_WRITE_MODE: 0 = unspecified (legacy instance that
+  // predates the field; admission keeps the legacy behavior), 1 =
+  // replicated (the default: every rank writes all stripes at their
+  // natural rows), 2 = sharded (only the rank's own stripe, at the
+  // group-first page). Consulted by plan_kv_split_widths: a sharded
+  // source cannot serve an equal-width kv_split_size > 1 destination.
+  optional int32 cp_index_write_mode = 14;
 }
 
 message KvCacheEvent {

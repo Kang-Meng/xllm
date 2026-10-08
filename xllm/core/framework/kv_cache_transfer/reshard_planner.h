@@ -106,10 +106,23 @@ class ReshardPlanner final {
   // include_replicas: the link calls this per selected peer, so the source owns
   // everything it holds inside that pair, replica copies included (see
   // reshard_planner.cpp).
-  Status build_outgoing_plan(const WorkerCacheLayoutManifest& source,
-                             const WorkerCacheLayoutManifest& destination,
-                             ReshardPlanTemplate* plan,
-                             bool include_replicas = false) const;
+  //
+  // source_cp_index_write_mode (a kCpIndexWriteMode* value, common/types.h)
+  // selects which physical page of a source INDEX resource the plan reads
+  // under a width-collapsing (kv_split_size > 1 -> 1) transfer: the replicated
+  // mode (and legacy `unspecified`, which behaves as replicated) persists
+  // every stripe's page at its natural row, so the plan must read page
+  // `source.coordinates.kv_split_rank` -- the stripe this rank ships for the
+  // strided mapping (remote block r + k * kv_split needs source page
+  // k * kv_split + r, and both owners shipping page 0 would deliver the
+  // first stripe's bytes twice). The sharded mode keeps each rank's stripe
+  // at page 0, so the natural overlap already selects the right bytes.
+  Status build_outgoing_plan(
+      const WorkerCacheLayoutManifest& source,
+      const WorkerCacheLayoutManifest& destination,
+      ReshardPlanTemplate* plan,
+      bool include_replicas = false,
+      int32_t source_cp_index_write_mode = kCpIndexWriteModeReplicated) const;
 };
 
 class RequestRegionBinder final {

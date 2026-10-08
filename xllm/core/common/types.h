@@ -220,6 +220,16 @@ struct WeightSegment {
   uint64_t size;    // Segment size in bytes
 };
 
+// Values of InstanceInfo.cp_index_write_mode (InstanceMetaInfo.
+// cp_index_write_mode on the wire): which pages of each INDEX resource a
+// CP/KV-split instance actually writes. Mirrors XLLM_CP_INDEX_WRITE_MODE
+// (xllm/python/model_executor/cp_utils.py) -- the mode decides INDEX page
+// validity semantics, so it is declared at registration and consulted by
+// plan_kv_split_widths before a PD link is admitted.
+inline constexpr int32_t kCpIndexWriteModeUnspecified = 0;
+inline constexpr int32_t kCpIndexWriteModeReplicated = 1;
+inline constexpr int32_t kCpIndexWriteModeSharded = 2;
+
 struct InstanceInfo {
   std::string name = "";
   std::string rpc_address = "";
@@ -231,7 +241,19 @@ struct InstanceInfo {
   std::vector<uint64_t> cluster_ids;
   std::vector<std::string> addrs;
   int32_t dp_size = 1;
+  // Direct construction defaults this to 1, but instance_info_from_proto
+  // copies the wire value verbatim: a peer registered before the field
+  // existed (or served by a service that never carried it) arrives as the
+  // proto3 zero, which means "width never declared" -- a state the KV-split
+  // width gate treats differently from an explicit 1 (see
+  // plan_kv_split_widths: an undeclared destination width refuses a split
+  // source). Do not "normalize" the zero here; the distinction is load-bearing.
   int32_t kv_split_size = 1;
+  // Which pages of each INDEX resource this instance writes; see the
+  // kCpIndexWriteMode* constants above. 0 (the default) means the instance
+  // predates the field or never declared a mode, in which case link
+  // admission keeps the legacy behavior.
+  int32_t cp_index_write_mode = kCpIndexWriteModeUnspecified;
   // transfer listen ports
   std::vector<uint16_t> ports;
   // ttft profiling data
@@ -271,6 +293,7 @@ struct InstanceInfo {
     json_val["addrs"] = addrs;
     json_val["dp_size"] = dp_size;
     json_val["kv_split_size"] = kv_split_size;
+    json_val["cp_index_write_mode"] = cp_index_write_mode;
     json_val["ports"] = ports;
     json_val["ttft_profiling_data"] = ttft_profiling_data;
     json_val["tpot_profiling_data"] = tpot_profiling_data;

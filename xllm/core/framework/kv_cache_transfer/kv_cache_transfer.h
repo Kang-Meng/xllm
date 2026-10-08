@@ -49,6 +49,61 @@ using KVPushSynchronizerImpl = MLULayerSynchronizerImpl;
 using KVPushSynchronizerImpl = DCULayerSynchronizerImpl;
 #endif
 
+// How a PUSH may map source logical blocks onto the destination's declared
+// block table, given the two sides' DECLARED KV split widths (the source's
+// kv_split_size_effective() and the destination's registered
+// InstanceInfo.kv_split_size).
+//
+// Only two shapes are expressible; anything else must be refused before any
+// bytes are mapped, because the source cannot derive the destination's block
+// geometry from a width the destination did not declare:
+//   - RANK_LOCAL (src == dst): both sides shard KV identically, so each source
+//     rank's block k maps one-to-one onto the destination's block k.
+//   - STRIDED (dst == 1 < src): the destination is unsplit and holds src times
+//     as many blocks as one source logical block covers, so the source has to
+//     interleave (remote_stride = src) and filter_kv_split_infos hands each
+//     rank its own slice.
+//   - UNRECONCILABLE: no supported shape -- `reason` names both widths when it
+//     is not nullptr. A width below 1 means that side never declared one (0 is
+//     proto3's absent value on the registration record): that is refused rather
+//     than read as 1, because an undeclared peer is the one case where the
+//     mapping cannot be validated at all. A source that declares the SHARDED
+//     CP index write mode is equally refused against an equal-width
+//     kv_split_size > 1 destination: only page 0 of each INDEX resource is
+//     valid on any rank, so the 1:1 page moves of a RANK_LOCAL plan would
+//     deliver stale peer pages.
+enum class KvSplitWidthPlan : int8_t {
+  RANK_LOCAL = 0,
+  STRIDED = 1,
+  UNRECONCILABLE = 2,
+};
+
+// The DECLARED KV split widths and CP index write modes of both sides are the
+// plan's inputs; see declared_cp_index_write_mode() for how the local mode is
+// resolved and InstanceInfo.cp_index_write_mode for the peer's. Both mode
+// arguments use the kCpIndexWriteMode* values (common/types.h): only
+// kCpIndexWriteModeSharded changes admission -- on EITHER side of an
+// equal-width kv_split_size > 1 pair -- and kCpIndexWriteModeUnspecified (an
+// instance that predates the field) keeps the legacy behavior.
+KvSplitWidthPlan plan_kv_split_widths(int32_t src_kv_split_size,
+                                      int32_t dst_kv_split_size,
+                                      int32_t src_cp_index_write_mode,
+                                      int32_t dst_cp_index_write_mode,
+                                      std::string* reason);
+
+// This process's declared CP index write mode, read from
+// XLLM_CP_INDEX_WRITE_MODE with the same semantics as the python-side
+// cp_index_write_mode() (xllm/python/model_executor/cp_utils.py): only an
+// explicit "sharded" (after trim + lowercase) selects the sharded mode;
+// unset, empty, or unrecognized values keep the default replicated mode.
+// The registration record (register_instance_info) and the push-side width
+// validation both call this, so the process declares and enforces one mode.
+int32_t declared_cp_index_write_mode();
+
+// Stable operator-facing name of a kCpIndexWriteMode* value ("unspecified",
+// "replicated", "sharded"); used by registration logs and rejection reasons.
+const char* cp_index_write_mode_label(int32_t cp_index_write_mode);
+
 // In KV-split mode, filters and remaps each block-scoped cache mapping's
 // remote_ids so that every KV-split rank sees only the destination blocks
 // assigned to it. This includes ordinary KV and grouped SWA/C4/C128 caches.
@@ -173,6 +228,20 @@ class KVCacheTransfer {
   static bool validate_transfer_mappings(
       const std::vector<TransferKVInfo>& transfer_kv_infos,
       int32_t kv_split_size);
+
+  // Refuses a push whose mapping decision contradicts the two sides' DECLARED
+  // KV split widths: `rank_local_mapping` asserts that both sides shard KV
+  // identically, so an info that claims it while the destination declared a
+  // different width must not map bytes.
+  //
+  // `src_kv_split_size` must be the SOURCE's effective width. This is separate
+  // from validate_transfer_mappings() on purpose: the post-filter call there
+  // passes the literal 1 to mean "each rank's mapping is 1:1 now", which is not
+  // a statement about the source's declared width, and must never be read as
+  // one.
+  static bool validate_kv_split_width_plan(
+      const std::vector<TransferKVInfo>& transfer_kv_infos,
+      int32_t src_kv_split_size);
 
   // working thread
   ThreadPool threadpool_{/*num_threads=*/1,

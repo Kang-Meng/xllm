@@ -312,8 +312,24 @@ std::optional<std::string> validate_model_cp(const Options& options,
           return "Python GLM-5 Next EPLv2 with PCP requires ep_size "
                  "equal to world_size";
         }
-        if (kv_split != 1) {
-          return "Python GLM-5 Next CP initially requires kv_split_size == 1";
+        // Owner-sharded KV takes the same constraint glm_moe_dsa uses below,
+        // because the constraint is a property of the sharded-KV mechanism
+        // rather than of that model: PyExecutorImpl builds
+        // KVShardBatchMetadata only for prefill/chunked-prefill batches, so
+        // the owner-local write plus the CP gather that reconstructs the
+        // logical cache -- the only path that has been validated -- exists on
+        // the prefill side alone. On decode the shards would have to be
+        // combined by the dcp group through SfaDcpAttentionBackend, which is
+        // a different mechanism this gate does not enable. A prefill-only
+        // instance is the exact condition, not "role == PREFILL": with
+        // enable_disagg_pd=false the continuous scheduler runs prefill and
+        // decode on the same instance whatever the role says.
+        if (kv_split > 1 &&
+            (!options.enable_disagg_pd() ||
+             options.instance_role() != InstanceRole::PREFILL)) {
+          return "Python GLM-5 Next CP with kv_split_size > 1 requires "
+                 "disaggregated PD with the PREFILL role; set "
+                 "enable_disagg_pd=true and instance_role=PREFILL";
         }
         const SchedulerConfig& scheduler_config =
             SchedulerConfig::get_instance();

@@ -178,7 +178,20 @@ def build_speculative_ssm_state_indices(
 def resolve_linear_state_io_indices(
     metadata: AttentionMetadata,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Resolve linear-state read and live/write slots for one forward."""
+    """Resolve linear-state read and live/write slots for one forward.
+
+    These ids are deliberately **not** owner-localized when KV is owner-sharded
+    (``kv_split_size > 1``): ``BlockType::LINEAR`` -- the KDA conv/ssm recurrent
+    state and the kPool tail it also indexes -- is not a kv-split block type
+    (``is_kv_split_cache_block_type``), so the state is replicated to every
+    owner as one slot per sequence. Replication is exact rather than merely
+    close, because the KDA layer merges to global rows with ``cp_merge_rows``
+    before ``execute_linear``: every CP rank then runs the conv1d/delta-rule
+    over the same global stream, with the same weights, in the same order, and
+    writes identical values into its own replica of the same slot. Sharding
+    would instead need a cross-owner reduction per step and a defined owner for
+    the accumulator, neither of which exists.
+    """
     write_indices = getattr(metadata, "linear_state_write_indices", None)
     if write_indices is None:
         write_indices = getattr(metadata, "linear_state_indices", None)
@@ -202,6 +215,11 @@ def resolve_linear_state_io_indices(
     return read_indices, write_indices
 
 
+def _identity_block_table(block_table: torch.Tensor) -> torch.Tensor:
+    """Full-replica pool page view: the local table already addresses the cache."""
+    return block_table
+
+
 @dataclass(frozen=True)
 class MlaIndexContext:
     """Public contract handed to an optional LightningIndexer.
@@ -211,6 +229,25 @@ class MlaIndexContext:
     and prepares the paging / sequence-length metadata once per step; the indexer
     receives this view and produces ``topk``. ``materialize_index_cache`` returns
     the cache, optional scale, and their single matching block table together.
+
+    ``has_kv_shard`` marks a shard-aware index cache (``kv_split_size > 1``
+    under CP): the latent cache is owner-sharded either way, while the INDEX
+    cache's layout follows ``XLLM_CP_INDEX_WRITE_MODE``. In the default
+    ``replicated`` mode every rank persists ALL ``kv_split_size`` pages of
+    every logical block at their natural rows (``block_table[b] *
+    kv_split_size + stripe``; the index tensor is full-size per rank on NPU),
+    so ``materialize_index_cache`` is the identity returning the local cache
+    with its physically expanded table and the pool write goes through
+    ``localize_pool_block_table`` (the natural-row expansion). In ``sharded``
+    mode each rank holds only its own KV owner stripe, stored at the first
+    page of each logical block's index-page group (row ``block_table[b] *
+    kv_split_size``) so the PD transfer plan's page-level overlap moves
+    exactly the page this rank wrote; the pool write goes through
+    ``localize_pool_block_table`` (owner-filtered), ``slot_mapping`` is remapped
+    onto the same page grouping for paged index writes, and a pool read goes
+    through ``materialize_index_cache``/``materialized_block_table`` (the
+    cross-rank reconstruction). All of these default to the full-replica
+    behaviour, which is every ``kv_split_size == 1`` launch.
     """
 
     index_cache: torch.Tensor
@@ -234,6 +271,22 @@ class MlaIndexContext:
     kpool_query_lens: Sequence[int] = ()
     kpool_query_lens_device: torch.Tensor | None = None
     kpool_cache_triton_compatible: bool = False
+    # True only when the index cache really needs shard-aware views (an
+    # owner-sharded cache in sharded mode, a physically full replica that
+    # still reads through page-expanded tables in replicated mode); the
+    # latent cache is owner-sharded in both modes.
+    has_kv_shard: bool = False
+    # Page table the index READ goes through: the gathered logical pool cache
+    # (one page per logical block per owner) in sharded mode, the physically
+    # expanded local table in replicated mode; None while the cache is a full
+    # replica.
+    materialized_block_table: torch.Tensor | None = None
+    # Maps a pool block table onto this rank's pool write pages: the natural
+    # rows (``entry * kv_split + stripe``) in replicated mode, the owner's
+    # page at the first page of each logical block's index-page group with
+    # peer columns invalid in sharded mode. The identity while the cache is a
+    # full replica.
+    localize_pool_block_table: Callable[[torch.Tensor], torch.Tensor] = _identity_block_table
 
 
 @dataclass(frozen=True)

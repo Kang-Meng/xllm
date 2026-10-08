@@ -286,6 +286,51 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   LOG(INFO) << "Success register instance to etcd.";
 }
 
+InstanceInfo instance_info_from_proto(
+    const xllm_service::proto::InstanceMetaInfo& response) {
+  InstanceInfo result;
+  result.name = response.name();
+  result.rpc_address = response.rpc_address();
+  result.incarnation_id = response.incarnation_id();
+  result.register_ts_ms = response.register_ts_ms();
+  if (response.type() == xllm_service::proto::InstanceType::PREFILL) {
+    result.type = "PREFILL";
+  } else if (response.type() == xllm_service::proto::InstanceType::DECODE) {
+    result.type = "DECODE";
+  } else if (response.type() == xllm_service::proto::InstanceType::MIX) {
+    result.type = "MIX";
+  } else {
+    result.type = "DEFAULT";
+  }
+  // parse kv cache info
+  result.cluster_ids.reserve(static_cast<size_t>(response.cluster_ids_size()));
+  for (auto& cluster_id : response.cluster_ids()) {
+    result.cluster_ids.emplace_back(cluster_id);
+  }
+  result.addrs.reserve(static_cast<size_t>(response.addrs_size()));
+  for (auto& addr : response.addrs()) {
+    result.addrs.emplace_back(addr);
+  }
+  result.dp_size = response.dp_size();
+  // Copied verbatim, including proto3's 0 for "the field was not present": a
+  // peer that never declared a width must stay distinguishable from one that
+  // declares 1, because the PUSH transfer plan keys on the DECLARED width.
+  // Folding 0 into the record's 1 default is what made a decode intending
+  // dcp=4 (behind a service that does not carry InstanceMetaInfo.kv_split_size)
+  // silently take the 1:1 mapping path. See plan_kv_split_widths().
+  result.kv_split_size = response.kv_split_size();
+  // Same verbatim contract for the CP index write mode: 0 is an instance
+  // (or a serving master) that predates the field, and admission keeps the
+  // legacy behavior for it rather than guessing a mode.
+  result.cp_index_write_mode = response.cp_index_write_mode();
+  result.ports.reserve(static_cast<size_t>(response.ports_size()));
+  for (auto& port : response.ports()) {
+    result.ports.emplace_back(port);
+  }
+
+  return result;
+}
+
 InstanceInfo XServiceClient::get_instance_info(
     const std::string& instance_name) {
   InstanceInfo result;
@@ -308,35 +353,7 @@ InstanceInfo XServiceClient::get_instance_info(
                << master_addr << ", error text: " << cntl.ErrorText();
     return result;
   }
-  result.name = resp.name();
-  result.rpc_address = resp.rpc_address();
-  result.incarnation_id = resp.incarnation_id();
-  result.register_ts_ms = resp.register_ts_ms();
-  if (resp.type() == xllm_service::proto::InstanceType::PREFILL) {
-    result.type = "PREFILL";
-  } else if (resp.type() == xllm_service::proto::InstanceType::DECODE) {
-    result.type = "DECODE";
-  } else if (resp.type() == xllm_service::proto::InstanceType::MIX) {
-    result.type = "MIX";
-  } else {
-    result.type = "DEFAULT";
-  }
-  // parse kv cache info
-  for (auto& cluster_id : resp.cluster_ids()) {
-    result.cluster_ids.emplace_back(cluster_id);
-  }
-  for (auto& addr : resp.addrs()) {
-    result.addrs.emplace_back(addr);
-  }
-  result.dp_size = resp.dp_size();
-  if (resp.kv_split_size() > 0) {
-    result.kv_split_size = resp.kv_split_size();
-  }
-  for (auto& port : resp.ports()) {
-    result.ports.emplace_back(port);
-  }
-
-  return result;
+  return instance_info_from_proto(resp);
 }
 
 void XServiceClient::heartbeat() {

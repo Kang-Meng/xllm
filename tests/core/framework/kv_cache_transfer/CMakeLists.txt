@@ -81,6 +81,30 @@ target_link_libraries(mooncake_transfer_engine_test PRIVATE
   "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")
 endif()
 
+# Drives the source->destination KV block mapping for a P kv_split_size that
+# differs from the destination's declared width. Needs the batch builder, the
+# block manager and the scheduler's group-type predicate, all reachable through
+# xllm_server; the source declares kv_split_size = 2 while the settled decode
+# declares 1.
+# CPU_ONLY like the sibling host-only targets in this directory: the whole TU
+# builds BlockManagerImpl/Sequence/InstanceInfo records and calls the width
+# planning helpers directly -- no device, no kernel, no RPC -- so it must not
+# inherit the NPU bootstrap sources nor drop out of the `cpu` ctest label set.
+cc_test(
+  NAME
+    kv_split_width_mismatch_test
+  CPU_ONLY
+  SRCS
+    kv_split_width_mismatch_test.cpp
+  DEPS
+    :kv_cache_transfer
+    :xllm_server
+    GTest::gtest_main
+)
+
+target_link_libraries(kv_split_width_mismatch_test PRIVATE
+  "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")
+
 if(USE_MLU)
 cc_test(
   NAME

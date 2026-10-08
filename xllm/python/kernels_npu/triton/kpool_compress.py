@@ -30,6 +30,7 @@ def _update_compact_kpool_kernel(
     raw_k_ptr,
     gate_ptr,
     valid_ptr,
+    tail_valid_ptr,
     positions_ptr,
     pool_cache_ptr,
     tail_cache_ptr,
@@ -46,6 +47,7 @@ def _update_compact_kpool_kernel(
     gate_stride_row,
     gate_stride_dim,
     valid_stride,
+    tail_valid_stride,
     positions_stride,
     pool_stride_block,
     pool_stride_slot,
@@ -247,8 +249,12 @@ def _update_compact_kpool_kernel(
             mask=request_active,
             other=-1,
         ).to(tl.int64)
+        # The tail is a globally-valid linear accumulator on every CP rank:
+        # peer-owned tokens keep their real state here, so the tail mask is
+        # the global real-token mask, not the pool-write (owner-localized)
+        # mask the pool completion loads above.
         current_valid = tl.load(
-            valid_ptr + current_row * valid_stride,
+            tail_valid_ptr + current_row * tail_valid_stride,
             mask=request_active,
             other=0,
         ).to(tl.int1)
@@ -281,6 +287,7 @@ def update_compact_kpool(
     raw_k: torch.Tensor,
     gate_scores: torch.Tensor,
     valid_rows: torch.Tensor,
+    tail_valid_rows: torch.Tensor,
     positions: torch.Tensor,
     compressed_cache: torch.Tensor,
     tail_cache: torch.Tensor,
@@ -319,6 +326,7 @@ def update_compact_kpool(
     flat_k = raw_k.view(-1, head_dim)
     flat_gate = gate_scores.view(-1, gate_scores.shape[-1])
     flat_valid = valid_rows.view(-1)
+    flat_tail_valid = tail_valid_rows.view(-1)
     flat_positions = positions.view(-1)
     flat_tail_ids = tail_ids.view(-1)
     num_tokens = flat_k.shape[0]
@@ -334,6 +342,8 @@ def update_compact_kpool(
         raise ValueError("raw K and gate rows must have identical shapes")
     if flat_valid.numel() != num_tokens or flat_positions.numel() != num_tokens:
         raise ValueError("compact KPool update requires one validity and position per token")
+    if flat_tail_valid.numel() != num_tokens:
+        raise ValueError("compact KPool update requires one tail-validity per token")
     if compressed_cache.ndim != 4 or compressed_cache.shape[2:] != (1, head_dim):
         raise ValueError("compressed KPool cache must have shape [blocks, pools_per_block, 1, dim]")
     if compressed_cache.shape[0] == 0 or compressed_cache.shape[1] == 0:
@@ -367,6 +377,7 @@ def update_compact_kpool(
     colocated_tensors = (
         flat_gate,
         flat_valid,
+        flat_tail_valid,
         flat_positions,
         compressed_cache,
         tail_cache,
@@ -383,6 +394,7 @@ def update_compact_kpool(
         raw_k,
         gate_scores,
         valid_rows,
+        tail_valid_rows,
         positions,
         compressed_cache,
         tail_cache,
@@ -398,6 +410,7 @@ def _launch_compact_kpool(
     raw_k: torch.Tensor,
     gate_scores: torch.Tensor,
     valid_rows: torch.Tensor,
+    tail_valid_rows: torch.Tensor,
     positions: torch.Tensor,
     compressed_cache: torch.Tensor,
     tail_cache: torch.Tensor,
@@ -412,6 +425,7 @@ def _launch_compact_kpool(
     flat_k = raw_k.view(-1, head_dim)
     flat_gate = gate_scores.view(-1, head_dim)
     flat_valid = valid_rows.view(-1)
+    flat_tail_valid = tail_valid_rows.view(-1)
     flat_positions = positions.view(-1)
     flat_tail_ids = tail_ids.view(-1)
     # The model-side selector only calls this unchecked launcher after
@@ -424,6 +438,7 @@ def _launch_compact_kpool(
         flat_k,
         flat_gate,
         flat_valid,
+        flat_tail_valid,
         flat_positions,
         compressed_cache,
         tail_cache,
@@ -440,6 +455,7 @@ def _launch_compact_kpool(
         flat_gate.stride(0),
         flat_gate.stride(1),
         flat_valid.stride(0),
+        flat_tail_valid.stride(0),
         flat_positions.stride(0),
         compressed_cache.stride(0),
         compressed_cache.stride(1),

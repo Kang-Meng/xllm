@@ -33,6 +33,7 @@ limitations under the License.
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
 #include "framework/request/sequence.h"
@@ -255,6 +256,23 @@ PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
   prefill_queue_offline_ = std::make_unique<DequeQueue>();
   decode_queue_offline_ = std::make_unique<DequeQueue>();
 
+  server_name_.append(std::to_string(options.server_idx()));
+
+  // Start RPC server thread (must be done in subclass constructor to ensure
+  // PDOOCScheduler::start_rpc_server is called, not the base class version),
+  // and register this instance's real ParallelConfig BEFORE any dispatch
+  // thread exists: the width/write-mode gates in dispatch_requests and
+  // dispatch_offline_requests read instance_info_, which only
+  // register_instance_info fills. Reading the default-constructed record
+  // (kv_split_size=1) would let a real width-2 prefill pass a width-1
+  // decode as RANK_LOCAL -- the exact mis-mapping the gate exists to
+  // refuse -- and dispatch-thread reads racing this thread's writes to
+  // instance_info_ are a data race besides.
+  rpc_server_thread_ =
+      std::make_unique<std::thread>(&PDOOCScheduler::start_rpc_server, this);
+  initialize_rpc_server(server_name_);
+  register_instance_info(server_name_, engine);
+
   // OOC-specific threads based on instance role
   if (options_.instance_role().value() == InstanceRole::PREFILL) {
     VLOG(1) << "Running dispatch_thread_";
@@ -270,15 +288,6 @@ PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
     send_pull_signal_thread_ = std::make_unique<std::thread>(
         &PDOOCScheduler::decode_send_pull_signal, this);
   }
-
-  server_name_.append(std::to_string(options.server_idx()));
-
-  // Start RPC server thread (must be done in subclass constructor to ensure
-  // PDOOCScheduler::start_rpc_server is called, not the base class version)
-  rpc_server_thread_ =
-      std::make_unique<std::thread>(&PDOOCScheduler::start_rpc_server, this);
-  initialize_rpc_server(server_name_);
-  register_instance_info(server_name_, engine);
 }
 
 PDOOCScheduler::~PDOOCScheduler() {
@@ -1439,6 +1448,31 @@ void PDOOCScheduler::dispatch_requests() {
       }
     }
 
+    // The destination's DECLARED KV split width decides which block mapping
+    // a push may use, resolved exactly as the non-OOC dispatch does
+    // (resolve_kv_split_plan): without this gate an equal-width pair (decode
+    // declaring kv_split_size > 1) silently fell back to strided remapping
+    // and was mis-addressed by kv_split_rank + k * kv_split_size, and
+    // unreconcilable pairs were never rejected. create_rpc_channel has
+    // populated remote_instances_info_ for the selected instance, so refuse
+    // before the decode reservation and the AddNewRequests RPC.
+    const KvSplitDispatchPlan kv_split_plan =
+        resolve_kv_split_plan(instance_info_.kv_split_size,
+                              instance_info_.cp_index_write_mode,
+                              remote_instances_info_[selected_instance],
+                              /*response=*/nullptr);
+    if (kv_split_plan.plan == KvSplitWidthPlan::UNRECONCILABLE) {
+      LOG(ERROR) << "Rejecting request " << request->request_id()
+                 << " for decode instance " << selected_instance << ": "
+                 << kv_split_plan.reason;
+      response_processor_->process_failed_request(
+          request,
+          {StatusCode::INVALID_ARGUMENT,
+           "decode instance " + selected_instance + ": " +
+               kv_split_plan.reason});
+      continue;
+    }
+
     {
       std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
       for (auto& req : requests) {
@@ -1484,6 +1518,16 @@ void PDOOCScheduler::dispatch_requests() {
           TransferKVInfo info;
           info.request_id = requests[i]->request_id();
           const proto::DisaggResponse& resp = resps.resps()[i];
+          // Resolve with the allocation response at hand, exactly as the
+          // non-OOC dispatch does: without the rank_local_mapping claim the
+          // push path treats every mapping as strided and an equal-width
+          // pair would be mis-addressed by the kv_split stride.
+          const KvSplitDispatchPlan resolved =
+              resolve_kv_split_plan(instance_info_.kv_split_size,
+                                    instance_info_.cp_index_write_mode,
+                                    remote_instances_info_[selected_instance],
+                                    &resp);
+          info.rank_local_mapping = resolved.rank_local_mapping;
           info.mappings.reserve(resp.groups_size());
           for (const proto::KVTransferGroup& proto_group : resp.groups()) {
             KVTransferMapping mapping;
@@ -1939,6 +1983,34 @@ void PDOOCScheduler::dispatch_offline_requests() {
       continue;
     }
 
+    // Same KV-split width resolution as the online dispatches
+    // (resolve_kv_split_plan): the pulled request must not be handed to a
+    // decode instance whose declared width or the source's write mode makes
+    // the pair inexpressible. create_rpc_channel has populated
+    // remote_instances_info_ for the target instance, so refuse before the
+    // AddNewRequests RPC.
+    const KvSplitDispatchPlan kv_split_plan =
+        resolve_kv_split_plan(instance_info_.kv_split_size,
+                              instance_info_.cp_index_write_mode,
+                              remote_instances_info_[target_instance],
+                              /*response=*/nullptr);
+    if (kv_split_plan.plan == KvSplitWidthPlan::UNRECONCILABLE) {
+      LOG(ERROR) << "Rejecting offline request " << request->request_id()
+                 << " for decode instance " << target_instance << ": "
+                 << kv_split_plan.reason;
+      // The pair can never be expressed as a mapping, so requeueing against
+      // the same pulled instance would spin forever; fail the request and
+      // release the prefill-side blocks it already holds (the same cleanup
+      // do_permanent_rejection performs, with the mismatch named in the
+      // status).
+      response_processor_->process_failed_request(
+          request,
+          {StatusCode::INVALID_ARGUMENT,
+           "decode instance " + target_instance + ": " + kv_split_plan.reason});
+      kv_cache_manager_->deallocate(request.get());
+      continue;
+    }
+
     {
       std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
       req_to_channel_map_[request->request_id()] = stub;
@@ -1982,6 +2054,15 @@ void PDOOCScheduler::dispatch_offline_requests() {
         TransferKVInfo info;
         info.request_id = request->request_id();
         const proto::DisaggResponse& resp = resps.resps()[0];
+        // Resolve with the allocation response at hand, exactly as the
+        // online dispatch paths do, so an equal-width pair claims the
+        // rank-local mapping instead of the strided one.
+        const KvSplitDispatchPlan resolved =
+            resolve_kv_split_plan(instance_info_.kv_split_size,
+                                  instance_info_.cp_index_write_mode,
+                                  remote_instances_info_[target_instance],
+                                  &resp);
+        info.rank_local_mapping = resolved.rank_local_mapping;
         info.mappings.reserve(resp.groups_size());
         for (const proto::KVTransferGroup& proto_group : resp.groups()) {
           KVTransferMapping mapping;

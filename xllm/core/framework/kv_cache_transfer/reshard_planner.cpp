@@ -1084,11 +1084,70 @@ Status ReshardPlanner::validate_destination_coverage(
   return select_sources(sources, destination, &selected_indices);
 }
 
+namespace {
+
+// A width-collapsing INDEX transfer (kv_split_size > 1 source, kv_split_size
+// == 1 destination) reads ONE page out of each source resource's
+// kv_split-sized page group. Which page holds the bytes the strided mapping
+// needs depends on the source's declared write mode (common/types.h):
+//
+//   - sharded: every rank persists its own stripe at PAGE 0 of its local
+//     resource, so the natural overlap (page 0) already selects this rank's
+//     stripe.
+//   - replicated (and legacy `unspecified`, which the env reader resolves to
+//     replicated): every rank persists EVERY stripe at its natural row, so
+//     rank r's stripe r lives at page r. The strided mapping sends rank r's
+//     resource k to remote block r + k * kv_split, and that block needs
+//     source page k * kv_split + r -- reading page 0 instead would ship
+//     stripe 0's bytes for BOTH owners ([A, A] instead of [A, B]).
+Status select_replicated_index_source_page(
+    const WorkerCacheLayoutManifest& source,
+    int32_t source_cp_index_write_mode,
+    ReshardPlanTemplate* plan) {
+  if (source_cp_index_write_mode == kCpIndexWriteModeSharded) {
+    return Status();
+  }
+  const int32_t kv_split_rank = source.coordinates.kv_split_rank;
+  if (kv_split_rank <= 0) {
+    // Rank 0's stripe IS page 0, and a kv_split_size <= 1 source never
+    // collapses: the natural overlap is already correct in both cases.
+    return Status();
+  }
+  for (StridedRegionTemplate& region : plan->regions) {
+    const bool index_role =
+        region.role == static_cast<int32_t>(KVCacheTensorRole::INDEX) ||
+        region.role == static_cast<int32_t>(KVCacheTensorRole::INDEX_SCALE);
+    // The collapse signature: the source resource spans more bytes than the
+    // destination's (kv_split pages vs one). Equal-width and expanding pairs
+    // keep equal strides and must not shift.
+    const bool width_collapse =
+        region.local_resource_stride > region.remote_resource_stride;
+    if (!index_role || !width_collapse) {
+      continue;
+    }
+    const uint64_t shift =
+        static_cast<uint64_t>(kv_split_rank) * region.bytes_per_region;
+    if (shift >= region.local_resource_stride ||
+        region.local_offset_in_resource + region.bytes_per_region + shift >
+            region.local_resource_stride) {
+      return invalid(
+          "replicated index page selection runs past the source resource: "
+          "kv_split_rank=" +
+          std::to_string(kv_split_rank));
+    }
+    region.local_offset_in_resource += shift;
+  }
+  return Status();
+}
+
+}  // namespace
+
 Status ReshardPlanner::build_outgoing_plan(
     const WorkerCacheLayoutManifest& source,
     const WorkerCacheLayoutManifest& destination,
     ReshardPlanTemplate* plan,
-    bool include_replicas) const {
+    bool include_replicas,
+    int32_t source_cp_index_write_mode) const {
   if (plan == nullptr) {
     return invalid("reshard plan output must not be null");
   }
@@ -1182,7 +1241,8 @@ Status ReshardPlanner::build_outgoing_plan(
     }
   }
   compact_planned_regions(&candidates, &plan->regions);
-  return Status();
+  return select_replicated_index_source_page(
+      source, source_cp_index_write_mode, plan);
 }
 
 Status RequestRegionBinder::bind(const ReshardPlanTemplate& plan,

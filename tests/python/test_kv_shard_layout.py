@@ -19,7 +19,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from xllm.python.attention.kv_shard_layout import KVShardLayout
+from xllm.python.attention.kv_shard_layout import (
+    KVShardLayout,
+    localize_index_write_slots,
+    localize_pool_write_block_table,
+    replicate_pool_write_block_table,
+)
 
 
 def test_localize_slots_does_not_rewrite_worker_logical_slots() -> None:
@@ -157,3 +162,74 @@ def test_indexer_page_bounds(split: int) -> None:
     padded = layout.expand_indexer_block_table(torch.tensor([[15, -1]], dtype=torch.int32))
     assert padded[0, :split].tolist() == list(range(15 * split, 16 * split))
     assert padded[0, split:].tolist() == [-1] * split
+
+
+def test_localize_index_write_slots_expands_latent_pages_to_group_first_pages() -> None:
+    """The NPU index cache groups ``dcp_size`` pages under one logical block,
+    so a paged index write must move latent page ``p`` to index page
+    ``p * dcp_size`` -- the first page of the block's group and the page the
+    PD transfer plan's page-level overlap moves."""
+    local_slots = torch.tensor([0, 1, -1, -1, 2, 3, -1, -1, 4, 5, -1, -1], dtype=torch.int32)
+
+    expanded = localize_index_write_slots(local_slots, page_size=2, dcp_size=2)
+
+    # Latent pages 0, 1, 2 become index pages 0, 2, 4; peer slots stay invalid.
+    assert torch.equal(expanded, torch.tensor([0, 1, -1, -1, 4, 5, -1, -1, 8, 9, -1, -1], dtype=torch.int32))
+    assert localize_index_write_slots(local_slots, page_size=2, dcp_size=4).tolist() == [
+        0,
+        1,
+        -1,
+        -1,
+        8,
+        9,
+        -1,
+        -1,
+        16,
+        17,
+        -1,
+        -1,
+    ]
+    # kv_split_size == 1 keeps the caller's mapping object.
+    assert localize_index_write_slots(local_slots, page_size=2, dcp_size=1) is local_slots
+
+
+def test_replicate_pool_write_block_table_addresses_natural_rows() -> None:
+    """A replicated pool write (``XLLM_CP_INDEX_WRITE_MODE=replicated``, the
+    default) must persist every stripe's page at its NATURAL row: output
+    column ``i`` (stripe ``i % dcp_size`` of logical block
+    ``block_table[i // dcp_size]``) addresses page
+    ``block_table[i // dcp_size] * dcp_size + i % dcp_size``, which is the
+    group layout platform.h defines (logical block B owns index rows
+    ``[B * split, (B + 1) * split)``). No column is filtered, so every rank
+    writes every page of every block and the local cache becomes a physical
+    full replica."""
+    block_table = torch.tensor([[3, 7, -1]], dtype=torch.int32)
+
+    replicated = replicate_pool_write_block_table(block_table, dcp_size=2)
+
+    # Stripes 0 and 1 of logical block 3 land on pages 6 and 7; logical block
+    # 7 on pages 14 and 15; the invalid tail column stays invalid for both
+    # stripes. Contrast with the sharded view, which points only the owner's
+    # column at the group-FIRST page (6 / 14) and invalidates the peer.
+    assert torch.equal(
+        replicated,
+        torch.tensor([[6, 7, 14, 15, -1, -1]], dtype=torch.int32),
+    )
+    sharded_owner0 = localize_pool_write_block_table(block_table, dcp_size=2, dcp_rank=0)
+    sharded_owner1 = localize_pool_write_block_table(block_table, dcp_size=2, dcp_rank=1)
+    assert not torch.equal(replicated, sharded_owner0)
+    assert not torch.equal(replicated, sharded_owner1)
+    # Neither owner's sharded view alone covers the natural rows: the union of
+    # the two owners' valid pages is {6, 14} (each written at the group-first
+    # row), never {6, 7, 14, 15}.
+    assert sorted(sharded_owner0[sharded_owner0 >= 0].tolist()) == [6, 14]
+    assert sorted(sharded_owner1[sharded_owner1 >= 0].tolist()) == [6, 14]
+
+    # A four-way split interleave: logical block 2 spans pages 8..11.
+    assert torch.equal(
+        replicate_pool_write_block_table(torch.tensor([[2]], dtype=torch.int32), dcp_size=4),
+        torch.tensor([[8, 9, 10, 11]], dtype=torch.int32),
+    )
+    # kv_split_size == 1 keeps the caller's table object, so the full-replica
+    # launch passes exactly what it passed before.
+    assert replicate_pool_write_block_table(block_table, dcp_size=1) is block_table

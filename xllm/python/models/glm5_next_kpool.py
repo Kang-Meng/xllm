@@ -74,6 +74,7 @@ def update_compressed_kpool(
     raw_k: torch.Tensor,
     gate_scores: torch.Tensor,
     valid_rows: torch.Tensor,
+    tail_valid_rows: torch.Tensor,
     positions: torch.Tensor,
     compressed_cache: torch.Tensor,
     tail_cache: torch.Tensor,
@@ -86,6 +87,15 @@ def update_compressed_kpool(
     graph_mode: bool = False,
 ) -> None:
     """Complete compressed pools and then persist the current raw tail.
+
+    ``valid_rows`` gates POOL completion -- under sharded CP writes it is the
+    owner-localized mask, so each rank completes only the pools whose members
+    it owns and the mixed-ownership boundary pools stay for the decode side.
+    ``tail_valid_rows`` gates the tail persistence and must be the GLOBAL
+    real-token mask: the tail is a per-sequence linear accumulator replicated
+    on every CP rank, so a rank zeroing the peer tokens it does not own would
+    leave a divergent copy whose write-order in the PD handoff decides
+    whether the boundary pool can ever complete.
 
     ``raw_k``/``gate_scores``/``positions`` contain flattened, sequence-major
     query rows. ``query_lens`` maps those rows back to logical requests; the
@@ -104,6 +114,12 @@ def update_compressed_kpool(
     flat_k = raw_k.reshape(-1, raw_k.shape[-1])
     flat_gate = gate_scores.reshape(-1, gate_scores.shape[-1])
     flat_valid = valid_rows.reshape(-1).to(torch.bool)
+    flat_tail_valid = tail_valid_rows.reshape(-1).to(torch.bool)
+    if flat_tail_valid.numel() != flat_valid.numel():
+        raise ValueError(
+            "kPool tail validity must cover the same rows as the pool "
+            f"validity: tail={flat_tail_valid.numel()}, pools={flat_valid.numel()}"
+        )
     flat_positions = positions.reshape(-1).to(torch.int64)
     if flat_k.shape != flat_gate.shape:
         raise ValueError("raw K and gate rows must have identical shapes")
@@ -261,7 +277,7 @@ def update_compressed_kpool(
         stash_positions = flat_positions[stash_start:row_end]
         tail_rows = torch.remainder(stash_positions.clamp_min(0), tail_capacity)
         active_rows = (tail_write_id > 0) & (stash_positions >= 0)
-        writes = active_rows & flat_valid[stash_start:row_end]
+        writes = active_rows & flat_tail_valid[stash_start:row_end]
         old_keys = destination_tail[0].index_select(0, tail_rows)
         old_gates = destination_tail[1].index_select(0, tail_rows)
         destination_tail[0].index_copy_(

@@ -218,7 +218,15 @@ def test_mla_index_materialization_without_scale_keeps_legacy_path() -> None:
     assert actual_cache is materialized_cache
     assert actual_scale is None
     assert actual_table is block_table
-    materialize_cp_cache.assert_called_once_with(index_cache, metadata, cp_context)
+    # The scale-free call still passes the index-cache page geometry the
+    # owner-sharded path added (one page group per kv_split_size owners);
+    # with no scale there is exactly one materialization call, as before.
+    materialize_cp_cache.assert_called_once_with(
+        index_cache,
+        metadata,
+        cp_context,
+        pages_per_block=metadata.kv_split_size,
+    )
 
 
 def test_glm_quant_indexer_uses_materialized_scale_and_reshards_topk() -> None:

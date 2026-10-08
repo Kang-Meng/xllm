@@ -202,6 +202,16 @@ std::string KVCacheStore::build_schema_hash(BlockType block_type,
                                  : "tp=" + std::to_string(config_.tp_size);
   cache_schema.append("|type=");
   cache_schema.append(std::to_string(static_cast<int32_t>(block_type)));
+  // The CP index write mode decides which physical pages of an INDEX
+  // resource hold valid data (replicated persists every natural row;
+  // sharded keeps only page 0 of each page group), so objects written
+  // under different modes are not interchangeable even though the INDEX
+  // tensors' shapes are identical. Key the modes apart, or an instance
+  // reading replicated would score a sharded writer's stale peer pages as
+  // valid with no error signal. The constructor wires the process's
+  // declared mode (see hierarchy_kv_cache_transfer) into this config.
+  cache_schema.append("|cp_index_write_mode=");
+  cache_schema.append(std::to_string(config_.cp_index_write_mode));
   int64_t host_blocks = -1;
   for (const auto& [role, tensor] : tensors) {
     CHECK(tensor.defined() && tensor.dim() > 0 && tensor.is_contiguous());

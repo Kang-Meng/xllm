@@ -196,13 +196,15 @@ KVCacheStoreInitConfig make_store_config(
     const std::string& model_id = "target-model",
     uint32_t tp_rank = 1,
     uint32_t tp_size = 2,
-    bool enable_mla = false) {
+    bool enable_mla = false,
+    int32_t cp_index_write_mode = kCpIndexWriteModeReplicated) {
   KVCacheStoreInitConfig config;
   config.model_id = model_id;
   config.tp_rank = tp_rank;
   config.tp_size = tp_size;
   config.kv_split_full_domain_size = static_cast<int32_t>(tp_size);
   config.enable_mla = enable_mla;
+  config.cp_index_write_mode = cp_index_write_mode;
   return config;
 }
 
@@ -595,6 +597,36 @@ TEST(KVCacheStoreTest, DraftKeyDependsOnTargetDraftAndAlgorithm) {
   EXPECT_NE(baseline,
             build_draft_key("target-a", "spec_draft::dspark::draft-a"));
   EXPECT_EQ(baseline, build_draft_key("target-a", "spec_draft::mtp::draft-a"));
+}
+
+// The CP index write mode changes which physical pages of an INDEX resource
+// hold valid data while leaving every tensor shape identical, so the object
+// keys must separate the modes: a replicated reader scoring a sharded
+// writer's stale peer pages as valid is exactly the silent cross-mode hit
+// the schema field exists to prevent.
+TEST(KVCacheStoreTest, SchemaSeparatesCpIndexWriteModes) {
+  KVCache cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
+  const std::vector<BlockTransferInfo> block_info = {make_block_info(9)};
+
+  const auto build_key = [&cache, &block_info](int32_t cp_index_write_mode) {
+    KVCacheStore store;
+    HostCacheStoreIndex index;
+    index[BlockType::KV].emplace_back(
+        HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+    KVCacheStoreTestPeer::initialize_index(
+        &store,
+        make_store_config(/*model_id=*/"target-model",
+                          /*tp_rank=*/1,
+                          /*tp_size=*/2,
+                          /*enable_mla=*/false,
+                          cp_index_write_mode),
+        std::move(index));
+    return KVCacheStoreTestPeer::build_keys(store, block_info).front().second;
+  };
+
+  const std::string replicated = build_key(kCpIndexWriteModeReplicated);
+  EXPECT_NE(replicated, build_key(kCpIndexWriteModeSharded));
+  EXPECT_EQ(replicated, build_key(kCpIndexWriteModeReplicated));
 }
 
 TEST(KVCacheStoreTest, SchemaExcludesHostCapacity) {
