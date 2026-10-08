@@ -42,7 +42,7 @@ def _backend_for_linear_cache(
         num_decoding_tokens=verify_width,
     )
     backend._kv_caches = [SimpleNamespace(conv=conv_cache, ssm=ssm_cache)]
-    backend._kda_checkpoint_stride = (
+    backend._linear_state_checkpoint_stride = (
         linear_state_checkpoint_stride(conv_cache, ssm_cache) if conv_cache.shape[0] > 0 else None
     )
     return backend

@@ -1128,9 +1128,8 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
 
   const bool speculative_target_graph_decode =
       input_params.meta.batch_forward_type.is_decode() &&
-      ::xllm::ExecutionConfig::get_instance().enable_graph() &&
-      options_.enable_speculative_decode() && !options_.is_draft_engine() &&
-      token_sizes.size() > 1 &&
+      options_.enable_graph() && options_.enable_speculative_decode() &&
+      !options_.is_draft_engine() && token_sizes.size() > 1 &&
       input_params.parallel.dp_is_decode.size() == token_sizes.size() &&
       std::all_of(input_params.parallel.dp_is_decode.begin(),
                   input_params.parallel.dp_is_decode.end(),

@@ -24,6 +24,8 @@ import torch.nn as nn
 from xllm.python import kernels
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
+    MEGA_GDN_MTP_MAX_VERIFY_TOKENS,
+    MEGA_GDN_MTP_MIN_VERIFY_TOKENS,
     GdnDecodeMetadata,
     GdnMetadata,
     GdnPrefillMetadata,
@@ -344,8 +346,11 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         if total_tokens % batch_size:
             raise ValueError("Qwen3.5 MegaGdnMtpDecode packs one equal-width block per sequence")
         sequence_length = total_tokens // batch_size
-        if not 2 <= sequence_length <= 17:
-            raise NotImplementedError("Qwen3.5 MegaGdnMtpDecode supports 2 to 17 verify tokens")
+        if not MEGA_GDN_MTP_MIN_VERIFY_TOKENS <= sequence_length <= MEGA_GDN_MTP_MAX_VERIFY_TOKENS:
+            raise NotImplementedError(
+                f"Qwen3.5 MegaGdnMtpDecode supports {MEGA_GDN_MTP_MIN_VERIFY_TOKENS} "
+                f"to {MEGA_GDN_MTP_MAX_VERIFY_TOKENS} verify tokens"
+            )
 
         if conv_state.dim() != 3 or conv_state.shape[2] != self.conv_dim:
             raise ValueError("Qwen3.5 MegaGdnMtpDecode received an invalid Conv cache")
@@ -429,14 +434,20 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
                 metadata.num_matrices,
             )
         elif isinstance(metadata, GdnSpecVerifyMetadata):
+            tail_padding = metadata.num_tail_padding_tokens
+            verify_hidden = hidden[:-tail_padding] if tail_padding else hidden
             output = self._spec_verify(
-                hidden,
+                verify_hidden,
                 state_cache.conv_state,
                 state_cache.ssm_state,
                 metadata.read_state_indices,
                 metadata.write_state_indices,
                 metadata.num_accepted_tokens,
             )
+            if tail_padding:
+                # Keep incomplete padding out of the recurrent chain, then
+                # restore the bucket shape before the TP output projection.
+                output = torch.nn.functional.pad(output.reshape(-1, self.value_dim), (0, 0, 0, tail_padding))
         elif isinstance(metadata, GdnDecodeMetadata):
             output = self._decode(
                 hidden,

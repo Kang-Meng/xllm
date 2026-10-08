@@ -23,6 +23,8 @@ import torch
 
 from xllm.python.attention.backend import LayerCache, resolve_linear_state_io_indices
 from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
+    MEGA_GDN_MTP_MAX_VERIFY_TOKENS,
+    MEGA_GDN_MTP_MIN_VERIFY_TOKENS,
     GdnDecodeMetadata,
     GdnMetadata,
     GdnPrefillMetadata,
@@ -262,7 +264,7 @@ class Qwen3_5GdnMetadataBuilder:
             metadata,
             input_batch.input_ids.device,
         )
-        if getattr(metadata, "is_spec_verify", False):
+        if metadata.is_spec_verify:
             num_accepted = metadata.num_accepted_tokens
             if num_accepted is None:
                 raise ValueError("Qwen3.5 GDN spec verify requires num_accepted_tokens")
@@ -293,14 +295,30 @@ class Qwen3_5GdnMetadataBuilder:
         input_batch: InputBatch,
         metadata: AttentionMetadata,
     ) -> GdnMetadata:
+        device = input_batch.input_ids.device
+        state_caches = self._require_state_caches(device)
+        if metadata.is_spec_verify:
+            request_capacity = self._spec_verify_request_capacity(input_batch)
+            width = input_batch.num_scheduled_tokens[0]
+            if not MEGA_GDN_MTP_MIN_VERIFY_TOKENS <= width <= MEGA_GDN_MTP_MAX_VERIFY_TOKENS:
+                raise NotImplementedError(
+                    f"Qwen3.5 MegaGdnMtpDecode supports {MEGA_GDN_MTP_MIN_VERIFY_TOKENS} "
+                    f"to {MEGA_GDN_MTP_MAX_VERIFY_TOKENS} verify tokens"
+                )
+            return GdnSpecVerifyMetadata(
+                state_caches=state_caches,
+                read_state_indices=torch.zeros(request_capacity, dtype=torch.int32, device=device),
+                write_state_indices=torch.zeros(request_capacity, dtype=torch.int32, device=device),
+                num_accepted_tokens=torch.ones(request_capacity, dtype=torch.int32, device=device),
+                num_tail_padding_tokens=input_batch.num_tokens_after_padding % width,
+            )
         if metadata.is_prefill or metadata.is_chunked_prefill:
             raise NotImplementedError("Qwen3.5 GDN ACL Graph supports decode only")
         token_capacity = input_batch.num_tokens_after_padding
         if token_capacity <= 0:
             raise ValueError("Qwen3.5 GDN graph token capacity must be positive")
-        device = input_batch.input_ids.device
         return GdnDecodeMetadata(
-            state_caches=self._require_state_caches(device),
+            state_caches=state_caches,
             read_state_indices=torch.zeros(
                 token_capacity,
                 dtype=torch.int32,
@@ -319,6 +337,9 @@ class Qwen3_5GdnMetadataBuilder:
         input_batch: InputBatch,
         metadata: AttentionMetadata,
     ) -> None:
+        if isinstance(persistent_metadata, GdnSpecVerifyMetadata):
+            self._update_persistent_spec_verify(persistent_metadata, input_batch, metadata)
+            return
         if not isinstance(persistent_metadata, GdnDecodeMetadata):
             raise TypeError("Qwen3.5 GDN received invalid persistent metadata")
         if metadata.is_prefill or metadata.is_chunked_prefill:
@@ -343,6 +364,47 @@ class Qwen3_5GdnMetadataBuilder:
         persistent_metadata.write_state_indices.zero_()
         persistent_metadata.read_state_indices[: input_batch.num_tokens].copy_(read_indices)
         persistent_metadata.write_state_indices[: input_batch.num_tokens].copy_(write_indices)
+
+    def _update_persistent_spec_verify(
+        self,
+        persistent: GdnSpecVerifyMetadata,
+        input_batch: InputBatch,
+        metadata: AttentionMetadata,
+    ) -> None:
+        if not metadata.is_spec_verify:
+            raise ValueError("Qwen3.5 GDN verify graph requires speculative-verify metadata")
+        device = input_batch.input_ids.device
+        request_capacity = self._spec_verify_request_capacity(input_batch)
+        if persistent.read_state_indices.shape != (request_capacity,):
+            raise ValueError("Qwen3.5 GDN verify graph capacity does not match the execution batch")
+        read_indices, write_indices = self._resolve_indices(metadata, device)
+        num_reqs = input_batch.num_reqs
+        if read_indices.numel() != num_reqs:
+            raise ValueError("Qwen3.5 GDN verify requires one state slot per request")
+        accepted = metadata.num_accepted_tokens
+        if accepted is None or accepted.shape != (num_reqs,):
+            raise ValueError("Qwen3.5 GDN verify requires one accepted-token count per request")
+        # The worker validates accepted counts before staging them to the device.
+        accepted = accepted.to(device=device, dtype=torch.int32)
+
+        persistent.read_state_indices.zero_()
+        persistent.write_state_indices.zero_()
+        persistent.num_accepted_tokens.fill_(1)
+        persistent.read_state_indices[:num_reqs].copy_(read_indices)
+        persistent.write_state_indices[:num_reqs].copy_(write_indices)
+        persistent.num_accepted_tokens[:num_reqs].copy_(accepted)
+
+    def _spec_verify_request_capacity(self, input_batch: InputBatch) -> int:
+        """Validate GDN-specific grouping on an already validated InputBatch."""
+        if input_batch.num_reqs <= 0:
+            raise ValueError("Qwen3.5 GDN verify requires at least one request")
+        token_counts = input_batch.num_scheduled_tokens
+        width = token_counts[0]
+        if any(count != width for count in token_counts):
+            raise ValueError("Qwen3.5 GDN verify requires equal-width request groups")
+        if self._checkpoint_stride != width:
+            raise ValueError("Qwen3.5 GDN verify width must match the bound cache checkpoint stride")
+        return input_batch.num_tokens_after_padding // width
 
     def _build_prefill_metadata(
         self,
@@ -383,7 +445,7 @@ class Qwen3_5GdnMetadataBuilder:
             has_initial_state.to(device=device, dtype=torch.bool),
             checkpoint_stride,
         )
-        source_cu_seqlens = getattr(metadata, "q_cu_seq_lens", None)
+        source_cu_seqlens = metadata.q_cu_seq_lens
         if source_cu_seqlens is None:
             cu_seqlens = torch.tensor(
                 query_start_loc,

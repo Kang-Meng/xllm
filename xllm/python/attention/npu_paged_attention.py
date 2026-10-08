@@ -233,8 +233,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._uses_sparse_mla = False
         self._kda_verify_width = num_decoding_tokens
         self._kda_validated_query_shape: tuple[int, int] | None = None
-        self._kda_checkpoint_stride: int | None = None
-        self._kda_prepared_ssm_state_indices: torch.Tensor | None = None
+        self._linear_state_checkpoint_stride: int | None = None
+        self._prepared_ssm_state_indices: torch.Tensor | None = None
 
         self._kv_caches: list[LayerCache] = []
         self._kpool_cache_triton_compatible: tuple[bool, ...] = ()
@@ -342,7 +342,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         }
         if len(checkpoint_strides) > 1:
             raise RuntimeError("linear-attention layers use inconsistent checkpoint capacities")
-        self._kda_checkpoint_stride = checkpoint_strides.pop() if checkpoint_strides else None
+        self._linear_state_checkpoint_stride = checkpoint_strides.pop() if checkpoint_strides else None
         has_sparse_index = any(cache.index is not None for cache in kv_caches)
         # glm5_next DSA layers are NoPE: the latent lives in the key slot and
         # the value/rope slot is a 0-dim tensor normalized to None, while the
@@ -356,16 +356,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             self._is_mla = True
         self._uses_sparse_mla = self._is_mla and has_sparse_index
 
-    def _prepare_kda_speculative_state_indices(
+    def _prepare_speculative_ssm_state_indices(
         self,
         metadata: AttentionMetadata,
         *,
         graph_mode: bool,
     ) -> None:
-        """Build the shared KDA checkpoint table once for the current batch."""
-        self._kda_prepared_ssm_state_indices = None
+        """Build the speculative SSM checkpoint table once for the current batch."""
+        self._prepared_ssm_state_indices = None
         accepted_tokens = getattr(metadata, "num_accepted_tokens", None)
-        checkpoint_stride = self._kda_checkpoint_stride
+        checkpoint_stride = self._linear_state_checkpoint_stride
         if accepted_tokens is None or checkpoint_stride is None:
             return
 
@@ -381,11 +381,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # dispatch. Keep this derivation aligned with that grouping logic.
         if graph_mode and q_seq_lens is not None:
             num_seqs = int(q_seq_lens.numel())
+            group_width = int(getattr(metadata, "spec_group_width", 0))
+            if group_width > 1:
+                # An incomplete bucket tail has no recurrent state checkpoint.
+                state_indices = state_indices[: num_seqs * group_width]
         else:
             num_seqs = int(accepted_tokens.numel())
         if num_seqs <= 0 or state_indices.numel() < num_seqs or state_indices.numel() % num_seqs:
             raise RuntimeError(
-                "KDA speculative state metadata is not grouped by logical sequence: "
+                "Speculative SSM state metadata is not grouped by logical sequence: "
                 f"slots={state_indices.numel()}, sequences={num_seqs}"
             )
         logical_state_indices = state_indices.reshape(num_seqs, -1)[:, 0]
@@ -399,10 +403,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 static_indices = torch.empty_like(prepared_indices)
                 metadata.linear_state_checkpoint_indices = static_indices
             elif static_indices.shape != prepared_indices.shape:
-                raise RuntimeError("KDA speculative checkpoint shape changed after graph allocation")
+                raise RuntimeError("Speculative SSM checkpoint shape changed after graph allocation")
             static_indices.copy_(prepared_indices)
             prepared_indices = static_indices
-        self._kda_prepared_ssm_state_indices = prepared_indices
+        self._prepared_ssm_state_indices = prepared_indices
 
     @staticmethod
     def _query_sequence_ends(
@@ -440,7 +444,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             self._prepare_xfia_decode(metadata, graph_mode=graph_mode)
             return
         self._kda_validated_query_shape = None
-        self._prepare_kda_speculative_state_indices(metadata, graph_mode=graph_mode)
+        self._prepare_speculative_ssm_state_indices(metadata, graph_mode=graph_mode)
         q_cu_host_values = getattr(metadata, "q_cu_host_values", None)
         if q_cu_host_values is None:
             # Runtime metadata exposes the same host copy under the public
@@ -1537,7 +1541,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             gate_kwargs = dict(use_gate_in_kernel=False)
         beta_raw_flat = beta_raw.reshape(-1, nh).contiguous()
 
-        checkpoint_stride = self._kda_checkpoint_stride
+        checkpoint_stride = self._linear_state_checkpoint_stride
         if checkpoint_stride is None:
             raise RuntimeError("KDA V3 requires a bound linear-state checkpoint stride")
         if checkpoint_stride < rows_per_seq:
@@ -1551,7 +1555,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # See vLLM-Ascend commit 23cfbd5ba, recurrent_kda_torch_adpt.h and
         # op_kernel/recurrent_kda.h (StateMetadataOffset,
         # ResolveInitialStateSlot, and StateSlotForToken).
-        ssm_state_indices = self._kda_prepared_ssm_state_indices
+        ssm_state_indices = self._prepared_ssm_state_indices
         if ssm_state_indices is None:
             raise RuntimeError("KDA speculative checkpoint indices were not prepared")
         if ssm_state_indices.shape != (num_seqs, checkpoint_stride) or ssm_state_indices.device != idx32.device:

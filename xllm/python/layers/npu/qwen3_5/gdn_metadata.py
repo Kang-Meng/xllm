@@ -21,6 +21,10 @@ from dataclasses import dataclass
 
 import torch
 
+# MegaGdnMtpDecode tiling limits for verify width S = K + 1.
+MEGA_GDN_MTP_MIN_VERIFY_TOKENS = 2
+MEGA_GDN_MTP_MAX_VERIFY_TOKENS = 17
+
 
 @dataclass(frozen=True, slots=True)
 class GdnStateCache:
@@ -59,10 +63,18 @@ class GdnDecodeMetadata(GdnMetadata):
 
 @dataclass(frozen=True, slots=True)
 class GdnSpecVerifyMetadata(GdnDecodeMetadata):
-    """Decode-shaped inputs for the MegaGdn MTP speculative-verify path.
+    """Request-scoped inputs for the MegaGdn MTP speculative-verify path.
 
-    Carries per-sequence accepted-token counts so the kernel commits recurrent
-    state only up to each sequence's accepted prefix.
+    Accepted counts select the previous round's checkpoint at
+    ``logical_slot * width + accepted - 1``; the kernel then writes all of the
+    current round's checkpoints. Counts range from 1 through the verify width.
+
+    Graph buffers have persistent request capacity ``T_pad // width``, including
+    padding requests with logical slot 0 and accepted count 1. Updates preserve
+    tensor addresses and share the bound Conv/SSM pools across graph entries.
+    ``num_tail_padding_tokens`` excludes the incomplete group at the end of a
+    graph bucket from GDN computation; eager inputs contain no such tail.
     """
 
     num_accepted_tokens: torch.Tensor
+    num_tail_padding_tokens: int = 0

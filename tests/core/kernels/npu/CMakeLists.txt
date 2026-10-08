@@ -34,6 +34,24 @@ cc_test(
     pybind11::embed
 )
 
+# Keep real runtime graph tests isolated from tests/python's CPU package stubs.
+cc_test(
+  NAME
+    qwen3_5_target_graph_test
+  SRCS
+    qwen3_5_target_graph_test.cpp
+  DEPS
+    ascendcl
+    torch
+    torch_npu
+    kernels
+    npu_kernels
+    GTest::gtest
+    glog::glog
+    unified_dlog
+    pybind11::embed
+)
+
 # Temporarily disabled: Dsv4ScatterCache tests are unstable in the current
 # NPU test environment.
 # cc_test(

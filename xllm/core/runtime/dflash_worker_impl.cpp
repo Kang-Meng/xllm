@@ -137,8 +137,7 @@ void build_dflash_expanded_spec_verify_graph_input(
     ModelInputParams& input_params,
     const torch::Device& device,
     int32_t block_size) {
-  if (!::xllm::ExecutionConfig::get_instance().enable_graph() ||
-      !input_params.is_spec_verify ||
+  if (!input_params.is_spec_verify ||
       !input_params.meta.batch_forward_type.is_chunked_prefill()) {
     return;
   }
@@ -1309,8 +1308,10 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     // [0, q_len_0, ...] rather than the stale pre-verify host layout.
     input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
-    build_dflash_expanded_spec_verify_graph_input(
-        input_params, device_.unwrap(), logical_block_size());
+    if (options_.enable_graph()) {
+      build_dflash_expanded_spec_verify_graph_input(
+          input_params, device_.unwrap(), logical_block_size());
+    }
 #endif
   }
   record_metadata_ready_event(*prepare_stream_, validate_input);

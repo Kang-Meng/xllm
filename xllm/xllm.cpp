@@ -1126,17 +1126,6 @@ void validate_config(const std::string& model_type) {
                  << "Disabling enable_graph_double_buffer.";
     execution_config.enable_graph_double_buffer(false);
   }
-  if (SpeculativeConfig::is_dspark_algorithm(
-          speculative_config.speculative_algorithm()) &&
-      ModelConfig::is_python_model_impl(model_config.model_impl()) &&
-      is_qwen3_5_target_model_type(model_type) &&
-      speculative_config.num_speculative_tokens() > 0 &&
-      execution_config.enable_graph()) {
-    LOG(WARNING) << "ACL graph is not supported with Qwen3.5 Python DSpark "
-                    "speculative decoding (eager-only verify path). "
-                    "Disabling enable_graph.";
-    execution_config.enable_graph(false);
-  }
   // enable_xtensor / enable_rolling_load imply enable_manual_loader
   if ((kv_cache_config.enable_xtensor() || load_config.enable_rolling_load()) &&
       !load_config.enable_manual_loader()) {
