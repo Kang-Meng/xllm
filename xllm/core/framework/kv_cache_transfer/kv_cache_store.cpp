@@ -46,9 +46,24 @@ bool KVCacheStore::init(const KVCacheStoreInitConfig& config,
       << "KVCacheStore requires a target model identity.";
   CHECK_GT(config.tp_size, 0U);
   CHECK_LT(config.tp_rank, config.tp_size);
+  CHECK_GT(config.cp_size, 0);
+  CHECK_GE(config.cp_rank, 0);
+  CHECK_LT(config.cp_rank, config.cp_size);
+  CHECK_GE(config.kv_split_full_domain_size, config.cp_size);
+  CHECK_EQ(config.kv_split_full_domain_size % config.cp_size, 0);
+  const uint32_t workers_per_cp =
+      static_cast<uint32_t>(config.kv_split_full_domain_size / config.cp_size);
+  CHECK(config.tp_size == workers_per_cp ||
+        config.tp_size ==
+            static_cast<uint32_t>(config.kv_split_full_domain_size))
+      << "Store TP ranks must either repeat within each CP rank or span the "
+         "full DP-local domain.";
   CHECK_GE(config.kv_split_size, 1);
   CHECK_GE(config.kv_split_rank, 0);
   CHECK_LT(config.kv_split_rank, config.kv_split_size);
+  CHECK(config.cp_size % config.kv_split_size == 0 ||
+        config.kv_split_size == config.kv_split_full_domain_size)
+      << "kv_split_size must divide cp_size or equal the full DCP domain.";
   config_ = config;
   initialize_store_index(std::move(store_index));
 
@@ -115,9 +130,11 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
       CHECK(key_components.emplace(entry.key_component).second)
           << "Duplicate KVCacheStore key component for BlockType "
           << static_cast<int32_t>(block_type) << ": " << entry.key_component;
-      std::string schema_hash = build_schema_hash(block_type, *entry.cache);
-      std::string key_prefix =
-          build_key_prefix(entry.key_component, block_type, schema_hash);
+      const StoreTpLayout tp_layout = resolve_tp_layout(block_type);
+      std::string schema_hash =
+          build_schema_hash(block_type, *entry.cache, tp_layout);
+      std::string key_prefix = build_key_prefix(
+          entry.key_component, block_type, schema_hash, tp_layout);
       const BlockTypeTensorMap tensors =
           entry.cache->get_block_type_tensors(block_type);
       std::vector<torch::Tensor> block_tensors;
@@ -131,13 +148,51 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
                                             entry.cache,
                                             block_type,
                                             std::move(key_prefix),
-                                            std::move(block_tensors)});
+                                            std::move(block_tensors),
+                                            is_put_owner(tp_layout)});
     }
   }
 }
 
+StoreTpLayout KVCacheStore::resolve_tp_layout(BlockType block_type) const {
+  if (config_.enable_mla && block_type == BlockType::KV) {
+    return StoreTpLayout::TP_REPLICATED;
+  }
+  return StoreTpLayout::TP_SHARDED;
+}
+
+bool KVCacheStore::is_put_owner(StoreTpLayout tp_layout) const {
+  // A full-domain DCP rank uniquely identifies every DP-local worker, even
+  // when that domain happens to have the same size as CP.
+  if (config_.kv_split_size == config_.kv_split_full_domain_size) {
+    return true;
+  }
+
+  const bool tp_rank_spans_cp =
+      config_.tp_size ==
+      static_cast<uint32_t>(config_.kv_split_full_domain_size);
+  // MLU Store TP ranks span the whole DP-local domain. TP-sharded keys are
+  // therefore already unique across CP ranks and must all be published.
+  if (tp_layout == StoreTpLayout::TP_SHARDED && tp_rank_spans_cp) {
+    return true;
+  }
+
+  // When DCP partitions PCP, multiple CP ranks own replicas of the same split.
+  const int32_t cp_replicas_per_split = config_.cp_size / config_.kv_split_size;
+  const bool is_cp_replica_owner = config_.cp_rank % cp_replicas_per_split == 0;
+  const uint32_t workers_per_cp = static_cast<uint32_t>(
+      config_.kv_split_full_domain_size / config_.cp_size);
+  // TP-sharded Store keys include tp_rank, so every shard is a distinct writer.
+  // TP-replicated keys omit tp_rank; select one representative worker from each
+  // owning CP split to avoid concurrent writes to the same Store key.
+  const bool is_tp_replica_owner = tp_layout == StoreTpLayout::TP_SHARDED ||
+                                   config_.tp_rank % workers_per_cp == 0;
+  return is_cp_replica_owner && is_tp_replica_owner;
+}
+
 std::string KVCacheStore::build_schema_hash(BlockType block_type,
-                                            const KVCache& cache) const {
+                                            const KVCache& cache,
+                                            StoreTpLayout tp_layout) const {
   const BlockTypeTensorMap tensors = cache.get_block_type_tensors(block_type);
   CHECK(!tensors.empty()) << "Host cache has no tensors for BlockType "
                           << static_cast<int32_t>(block_type);
@@ -171,20 +226,18 @@ std::string KVCacheStore::build_schema_hash(BlockType block_type,
                      sizeof(schema_hash.data));
 }
 
-std::string KVCacheStore::build_key_prefix(
-    const std::string& key_component,
-    BlockType block_type,
-    const std::string& schema_hash) const {
+std::string KVCacheStore::build_key_prefix(const std::string& key_component,
+                                           BlockType block_type,
+                                           const std::string& schema_hash,
+                                           StoreTpLayout tp_layout) const {
   std::string prefix = "xllm-kv-v3:";
   append_key_field(prefix, config_.model_id);
   append_key_field(prefix, key_component);
-  if (config_.enable_mla) {
+  if (tp_layout == StoreTpLayout::TP_REPLICATED) {
     prefix.append("mla:");
   } else {
     prefix.append(std::to_string(config_.tp_size));
     prefix.push_back(':');
-  }
-  if (!config_.enable_mla) {
     prefix.append(std::to_string(config_.tp_rank));
     prefix.push_back(':');
   }
@@ -288,14 +341,6 @@ uint32_t KVCacheStore::batch_put(
   if (!is_initialized_ || block_transfer_info.empty()) {
     return 0;
   }
-  if (config_.enable_mla && config_.kv_split_size == 1 &&
-      config_.tp_rank != 0U) {
-    VLOG(1) << "KVCacheStore skips unsplit MLA remote put: tp_rank="
-            << config_.tp_rank << ", kv_split_size=" << config_.kv_split_size
-            << ", kv_split_rank=" << config_.kv_split_rank;
-    return static_cast<uint32_t>(block_transfer_info.size());
-  }
-
   const GroupedRequests grouped = build_grouped_requests(block_transfer_info);
   const std::vector<PhysicalRequest>& requests = grouped.requests;
   const std::vector<RequestGroup>& groups = grouped.groups;
@@ -313,6 +358,12 @@ uint32_t KVCacheStore::batch_put(
   for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
     const RequestGroup& group = groups[group_index];
     const PhysicalRequest& request = requests[group.request_indices.front()];
+    if (!request.entry->is_put_owner) {
+      for (size_t request_index : group.request_indices) {
+        physical_results[request_index] = 1;
+      }
+      continue;
+    }
     const std::optional<MooncakeMultiBuffer> buffer = build_multi_buffer(
         *request.entry,
         block_transfer_info[request.logical_index].dst_block_id);

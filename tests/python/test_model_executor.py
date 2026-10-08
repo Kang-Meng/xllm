@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import sys
 import types
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from importlib import import_module
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -50,10 +53,12 @@ from xllm.python.model_executor.executor import (  # noqa: E402
 )
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     ForwardContext,
+    LayerLoadContext,
     forward_context,
     get_execution_context,
     get_forward_context,
     record_layer_event,
+    wait_for_layer_load,
 )
 from xllm.python.model_executor.input_batch import InputBatch  # noqa: E402
 from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
@@ -223,6 +228,143 @@ def test_record_layer_event_propagates_record_failure() -> None:
 # ---------------------------------------------------------------------------
 # Tests: graph backend resolution
 # ---------------------------------------------------------------------------
+
+
+class _HostLoadSynchronizer:
+    def __init__(self, count: int, failed_event: int | None = None) -> None:
+        self.count = count
+        self.failed_event = failed_event
+        self.calls: list[int] = []
+
+    def size(self) -> int:
+        return self.count
+
+    def synchronize_layer(self, event_index: int) -> bool:
+        self.calls.append(event_index)
+        return event_index != self.failed_event
+
+
+def test_host_load_groups_wait_once_and_reset_between_forwards() -> None:
+    synchronizer = _HostLoadSynchronizer(3)
+    for _ in range(2):
+        context = LayerLoadContext(synchronizer, layers_per_event=2)
+        # A layerwise partition may start in the middle of an event group.
+        for layer_id in (1, 2, 3, 4, 4, 5):
+            context.synchronize_layer(layer_id)
+        context.synchronize_all_layers()
+    assert synchronizer.calls == [0, 1, 2, 0, 1, 2]
+
+
+@pytest.mark.parametrize("layers_per_event", [0, -1])
+def test_host_load_rejects_invalid_group_size(layers_per_event: int) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        LayerLoadContext(_HostLoadSynchronizer(1), layers_per_event)
+
+
+@pytest.mark.parametrize("layer_id", [-1, 2])
+def test_host_load_rejects_invalid_layer_index(layer_id: int) -> None:
+    synchronizer = _HostLoadSynchronizer(1)
+    context = LayerLoadContext(synchronizer, layers_per_event=2)
+    with pytest.raises(ValueError):
+        context.synchronize_layer(layer_id)
+    assert synchronizer.calls == []
+
+
+def test_host_load_failure_does_not_mark_event_complete() -> None:
+    synchronizer = _HostLoadSynchronizer(1, failed_event=0)
+    context = LayerLoadContext(synchronizer)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="Host cache load event 0"):
+            context.synchronize_layer(0)
+    assert synchronizer.calls == [0, 0]
+
+
+@pytest.mark.parametrize(
+    "module_name,class_name,num_inputs",
+    [
+        ("layers.attention", "Attention", 3),
+        ("models.glm5_next", "Glm5NextMlaAttention", 3),
+        ("models.glm5_next", "Glm5NextKdaAttention", 2),
+        ("models.glm5_2", "Glm52MLAAttention", 3),
+        ("models.deepseek_v32", "DeepseekV3MLAAttention", 5),
+        ("models.deepseek_v4", "DeepseekV4Attention", 3),
+    ],
+)
+def test_attention_aborts_before_any_projection_or_cache_access(
+    module_name: str, class_name: str, num_inputs: int
+) -> None:
+    attention_class = getattr(import_module(f"xllm.python.{module_name}"), class_name)
+    attention = attention_class.__new__(attention_class)
+    nn.Module.__init__(attention)
+    attention.layer_id = 0
+    # No weights or cache state are initialized: the failed load must abort
+    # before the attention body can touch either of them.
+    context = ForwardContext(
+        StubAttentionBackend(),
+        torch.device("cpu"),
+        MagicMock(),
+        [],
+        layer_load_context=LayerLoadContext(_HostLoadSynchronizer(1, failed_event=0)),
+    )
+    with forward_context(context), pytest.raises(RuntimeError, match="Host cache load event 0"):
+        attention(*[torch.zeros(1) for _ in range(num_inputs)])
+
+
+def test_attention_wait_is_noop_without_host_restore() -> None:
+    wait_for_layer_load(0)
+    context = ForwardContext(StubAttentionBackend(), torch.device("cpu"), MagicMock(), [])
+    with forward_context(context):
+        tensor = torch.zeros(1)
+        assert _make_attention_layer(layer_id=0)(tensor, tensor, tensor) is tensor
+
+
+def test_attention_blocks_until_its_host_copy_completes() -> None:
+    waiting = [Event(), Event()]
+    ready = [Event(), Event()]
+    computed = [Event(), Event()]
+
+    class AsyncLoads(_HostLoadSynchronizer):
+        def synchronize_layer(self, event_index: int) -> bool:
+            self.calls.append(event_index)
+            waiting[event_index].set()
+            return ready[event_index].wait(timeout=5)
+
+    class Backend(StubAttentionBackend):
+        def execute(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: Attention) -> torch.Tensor:
+            assert ready[layer.layer_id].is_set()
+            computed[layer.layer_id].set()
+            return q
+
+    synchronizer = AsyncLoads(2)
+    context = ForwardContext(
+        Backend(),
+        torch.device("cpu"),
+        MagicMock(),
+        [],
+        layer_load_context=LayerLoadContext(synchronizer),
+    )
+
+    def forward() -> None:
+        with forward_context(context):
+            tensor = torch.zeros(1)
+            for layer_id in range(2):
+                _make_attention_layer(layer_id=layer_id)(tensor, tensor, tensor)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(forward)
+        try:
+            assert waiting[0].wait(timeout=5)
+            assert not computed[0].is_set()
+            ready[0].set()
+            assert computed[0].wait(timeout=5)
+            assert waiting[1].wait(timeout=5)
+            assert not computed[1].is_set()
+        finally:
+            for event in ready:
+                event.set()
+        future.result(timeout=5)
+    assert computed[1].is_set()
+    assert synchronizer.calls == [0, 1]
 
 
 class TestNpuGraphBackendResolution:
@@ -2163,6 +2305,119 @@ def test_eager_runner_rejects_missing_cp_lengths(
 
 
 class TestExecuteRouting:
+    @pytest.mark.parametrize(
+        ("draft_event_index", "expected_calls"),
+        [(2, [2]), (None, [0, 1, 2])],
+    )
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_spec_draft_waits_for_dedicated_load_event(
+        self,
+        mock_create: MagicMock,
+        draft_event_index: int | None,
+        expected_calls: list[int],
+    ) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        executor = ModelExecutor(
+            _FakeModel(num_layers=1),
+            {},
+            max_seqs_per_batch=4,
+            is_spec_draft=True,
+        )
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+        executor.inductor_runner = MagicMock()
+        executor.inductor_runner.execute.return_value = torch.ones(1)
+        synchronizer = _HostLoadSynchronizer(3)
+
+        executor.execute(
+            torch.ones(1),
+            torch.zeros(1),
+            SimpleNamespace(is_prefill=True, is_chunked_prefill=False),
+            layer_load_synchronizer=synchronizer,
+            draft_load_event_index=draft_event_index,
+        )
+
+        assert synchronizer.calls == expected_calls
+
+    @pytest.mark.parametrize("prefill,chunked", [(True, False), (False, True), (False, False)])
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_eager_waits_at_each_attention(self, mock_create: MagicMock, prefill: bool, chunked: bool) -> None:
+        order: list[tuple[str, int]] = []
+
+        class Loads(_HostLoadSynchronizer):
+            def synchronize_layer(self, event_index: int) -> bool:
+                order.append(("load", event_index))
+                return super().synchronize_layer(event_index)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layers = nn.ModuleList([_make_attention_layer(layer_id=i) for i in range(2)])
+
+            def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+                for i, layer in enumerate(self.layers):
+                    input_ids = layer(input_ids, input_ids, input_ids)
+                    order.append(("attention", i))
+                return input_ids
+
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=0)
+        model.model = Model()
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1)) for _ in range(2)])
+        metadata = SimpleNamespace(is_prefill=prefill, is_chunked_prefill=chunked, is_dummy=False)
+        synchronizer = Loads(2)
+        for _ in range(2):
+            executor.execute(torch.ones(1), torch.zeros(1), metadata, layer_load_synchronizer=synchronizer)
+        assert order == [("load", 0), ("attention", 0), ("load", 1), ("attention", 1)] * 2
+
+    @pytest.mark.parametrize("failed_event", [None, 1])
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_graph_waits_before_warmup_on_every_request(self, mock_create: MagicMock, failed_event: int | None) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+        metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False)
+        synchronizer = _HostLoadSynchronizer(2, failed_event)
+        graph = MagicMock()
+        graph.can_execute.return_value = True
+        executor.decode_graph_runner = graph
+        for request_index in range(2):
+
+            def warmup(*args: object, request_count: int = request_index + 1) -> None:
+                assert synchronizer.calls == [0, 1] * request_count
+
+            graph.warmup.side_effect = warmup
+            expectation = (
+                pytest.raises(RuntimeError, match="Host cache load event 1")
+                if failed_event is not None
+                else nullcontext()
+            )
+            with expectation:
+                executor.execute(torch.ones(1), torch.zeros(1), metadata, layer_load_synchronizer=synchronizer)
+        assert graph.warmup.call_count == (2 if failed_event is None else 0)
+        assert graph.execute.call_count == (2 if failed_event is None else 0)
+
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_inductor_waits_outside_compiled_execution(self, mock_create: MagicMock) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+        synchronizer = _HostLoadSynchronizer(2)
+        executor.inductor_runner = MagicMock()
+
+        def compiled_execute(*args: object, **kwargs: object) -> torch.Tensor:
+            assert synchronizer.calls == [0, 1]
+            return torch.ones(1)
+
+        executor.inductor_runner.execute.side_effect = compiled_execute
+        executor.execute(
+            torch.ones(1),
+            torch.zeros(1),
+            SimpleNamespace(is_prefill=True, is_chunked_prefill=False),
+            layer_load_synchronizer=synchronizer,
+        )
+        executor.inductor_runner.execute.assert_called_once()
+
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
     )

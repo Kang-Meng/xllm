@@ -310,6 +310,7 @@ def _patch_cp_gather(monkeypatch, remote_by_local: dict[tuple[object, ...], torc
 def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> None:
     attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
     nn.Module.__init__(attention)
+    attention.layer_id = 0
     attention.hidden_size = 1
     attention.head_dim = 1
     attention.qkv_dim = 1
@@ -363,6 +364,7 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
 def test_kda_cp_one_keeps_full_postprocessing() -> None:
     attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
     nn.Module.__init__(attention)
+    attention.layer_id = 0
     attention.hidden_size = 1
     attention.head_dim = 1
     attention.qkv_dim = 1
@@ -459,6 +461,7 @@ class _MlaOutputProjection(nn.Module):
 def test_kda_cp_projects_only_local_rows_and_overwrites_padding(monkeypatch) -> None:
     attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
     nn.Module.__init__(attention)
+    attention.layer_id = 0
     attention.hidden_size = 3
     attention.head_dim = 2
     attention.qkv_dim = 4
@@ -518,6 +521,7 @@ def test_kda_cp_projects_only_local_rows_and_overwrites_padding(monkeypatch) -> 
 def test_kda_pcp_eplv2_sp_masks_padding_before_reducing() -> None:
     attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
     nn.Module.__init__(attention)
+    attention.layer_id = 0
     attention.hidden_size = 3
     attention.head_dim = 2
     attention.conv_dim = 12
@@ -561,6 +565,7 @@ def test_kda_pcp_eplv2_sp_masks_padding_before_reducing() -> None:
 def _make_mla_attention(indexer: object | None) -> glm5_next.Glm5NextMlaAttention:
     attention = glm5_next.Glm5NextMlaAttention.__new__(glm5_next.Glm5NextMlaAttention)
     nn.Module.__init__(attention)
+    attention.layer_id = 0
     attention.hidden_size = 1
     attention.qk_nope_head_dim = 1
     attention.qk_rope_head_dim = 0

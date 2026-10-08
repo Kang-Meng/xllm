@@ -2415,6 +2415,9 @@ WorkerImpl::create_hierarchy_kv_cache_transfer() {
   HierarchyKVCacheTransfer::Options transfer_options;
   transfer_options.tp_rank(worker_id % tp_size)
       .tp_size(tp_size)
+      .cp_rank(parallel_args.cp_rank())
+      .cp_size(parallel_args.cp_size())
+      .kv_split_full_domain_size(static_cast<int32_t>(dp_local_size))
       .kv_split_size(parallel_args.kv_split_size_effective())
       .kv_split_rank(parallel_args.kv_split_rank())
       .layers(context_.get_model_args().n_layers())

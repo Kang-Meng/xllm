@@ -399,6 +399,13 @@ void KVCacheShape::init_value_cache_shape(const KVCacheCapacity& kv_cache_cap,
                                           const ModelArgs& model_args,
                                           int64_t world_size) {
   if (model_args.enable_mla()) {
+    // GLM5 uses MLA without a separate value cache.  Represent that layout as
+    // an absent shape so device/host cache allocation and transfer registration
+    // never create or publish a zero-sized VALUE tensor.
+    if (model_args.qk_rope_head_dim() == 0) {
+      value_cache_shape_.reset();
+      return;
+    }
 #if defined(USE_NPU)
     if (use_npu_nz_kv_cache_layout(model_args.model_type())) {
       value_cache_shape_ = std::vector<int64_t>{

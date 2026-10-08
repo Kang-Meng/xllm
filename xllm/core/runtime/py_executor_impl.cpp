@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/runtime/py_input_batch.h"
 #include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
+#include "platform/layer_synchronizer.h"
 
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -72,6 +73,17 @@ torch::Tensor slice_chunk_embeds(MMBatchData& mm_data,
 void register_xllm_runtime_module(py::module_& m) {
   register_attention_metadata_views(m);
   register_input_batch_metadata_view(m);
+  py::class_<LayerSynchronizer, std::shared_ptr<LayerSynchronizer>>(
+      m, "LayerLoadSynchronizer")
+      .def(
+          "synchronize_layer",
+          [](LayerSynchronizer& self, int64_t event_index) {
+            CHECK_GE(event_index, 0);
+            CHECK_LT(static_cast<uint64_t>(event_index), self.size());
+            return self.synchronize_layer(event_index);
+          },
+          py::call_guard<py::gil_scoped_release>())
+      .def("size", &LayerSynchronizer::size);
 
   m.def("tp_all_reduce", [](torch::Tensor tensor) {
     PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
@@ -202,9 +214,9 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // no CP group for the DSA prefill to shard across, so attaching the metadata
   // there only trips the sharded-MLA-prefill guard in npu_paged_attention.py;
   // keep the pre-main behavior for MLA and require the active CP group.
-  const bool is_decode_context_parallel =
-      !enable_mla_ && py_causal_lm_->cp_size() == 1 &&
-      py_causal_lm_->kv_split_size() > 1;
+  const bool is_decode_context_parallel = !enable_mla_ &&
+                                          py_causal_lm_->cp_size() == 1 &&
+                                          py_causal_lm_->kv_split_size() > 1;
   const bool is_mla_prefill_kv_shard =
       enable_mla_ && py_causal_lm_->cp_size() > 1 &&
       py_causal_lm_->kv_split_size() > 1 &&
@@ -387,6 +399,13 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   }
 
   py::object py_sync = py::none();
+  // Host-load waits are separate from the PD push completion notifications.
+  // Python eager waits before each attention; graph execution waits for all
+  // loads before warmup/capture/replay, outside the recorded device graph.
+  py::object py_load_sync = py::none();
+  if (params.parallel.layer_wise_load_synchronizer) {
+    py_load_sync = py::cast(params.parallel.layer_wise_load_synchronizer);
+  }
 #if defined(USE_NPU)
   if (params.parallel.layer_synchronizer) {
     py_sync = py::cast(params.parallel.layer_synchronizer);
@@ -411,7 +430,10 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    expert_load_data,
                                    eplb_decode_token_mask,
                                    params.meta.is_graph_warmup,
-                                   py_input_batch_metadata);
+                                   py_input_batch_metadata,
+                                   py_load_sync,
+                                   params.parallel.layers_per_event,
+                                   params.parallel.draft_load_event_index);
   if (py::isinstance<py::tuple>(hidden_obj)) {
     py::tuple output = hidden_obj.cast<py::tuple>();
     CHECK_EQ(output.size(), 2) << "Python model tuple output must be "

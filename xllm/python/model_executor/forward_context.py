@@ -45,6 +45,45 @@ class LayerSynchronizer(Protocol):
         ...
 
 
+class LayerLoadSynchronizer(Protocol):
+    """Waits for grouped Host-to-device KV-cache copy events from C++."""
+
+    def synchronize_layer(self, event_index: int) -> bool: ...
+
+    def size(self) -> int: ...
+
+
+@dataclass(slots=True)
+class LayerLoadContext:
+    """Per-forward Host-load waits, independent of PD push notifications."""
+
+    synchronizer: LayerLoadSynchronizer
+    layers_per_event: int = 1
+    _completed_events: set[int] = field(default_factory=set, init=False)
+
+    def __post_init__(self) -> None:
+        if self.layers_per_event <= 0:
+            raise ValueError("Host-load layers_per_event must be positive")
+
+    def synchronize_event(self, event_index: int) -> None:
+        if event_index in self._completed_events:
+            return
+        if event_index < 0 or event_index >= self.synchronizer.size():
+            raise ValueError(f"Host-load event index out of range: {event_index}")
+        if not self.synchronizer.synchronize_layer(event_index):
+            raise RuntimeError(f"failed to wait for Host cache load event {event_index}")
+        self._completed_events.add(event_index)
+
+    def synchronize_layer(self, layer_id: int) -> None:
+        if layer_id < 0:
+            raise ValueError("Host-load layer_id must be non-negative")
+        self.synchronize_event(layer_id // self.layers_per_event)
+
+    def synchronize_all_layers(self) -> None:
+        for event_index in range(self.synchronizer.size()):
+            self.synchronize_event(event_index)
+
+
 @dataclass(frozen=True, slots=True)
 class AclGraphTask:
     event: object
@@ -92,6 +131,7 @@ class ForwardContext:
     # layers. A new ForwardContext gets a new cache, so entries never leak
     # across requests or graph executions.
     layer_shared_cache: dict[object, object] = field(default_factory=dict)
+    layer_load_context: LayerLoadContext | None = None
 
 
 _current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)
@@ -155,6 +195,13 @@ def record_layer_event(layer_id: int) -> None:
     if ctx is not None and ctx.layer_synchronizer is not None:
         if not ctx.layer_synchronizer.record_event(layer_id):
             raise RuntimeError(f"failed to record layer completion event for layer {layer_id}")
+
+
+def wait_for_layer_load(layer_id: int) -> None:
+    """Wait before the layer first reads or writes restored cache/state."""
+    ctx = _current_context.get()
+    if ctx is not None and ctx.layer_load_context is not None:
+        ctx.layer_load_context.synchronize_layer(layer_id)
 
 
 def get_execution_buffer(key: tuple[object, ...], factory: Callable[[], torch.Tensor]) -> torch.Tensor:

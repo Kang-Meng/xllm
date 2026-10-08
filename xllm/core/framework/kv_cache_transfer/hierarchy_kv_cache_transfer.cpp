@@ -280,6 +280,10 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
     store_config.model_id = options_.store_namespace();
     store_config.tp_rank = options_.tp_rank();
     store_config.tp_size = options_.tp_size();
+    store_config.cp_rank = options_.cp_rank();
+    store_config.cp_size = options_.cp_size();
+    store_config.kv_split_full_domain_size =
+        options_.kv_split_full_domain_size();
     store_config.kv_split_size = options_.kv_split_size();
     store_config.kv_split_rank = options_.kv_split_rank();
     store_config.enable_mla = options_.enable_mla();
@@ -288,6 +292,10 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
               << ", worker_rank=" << options_.store_worker_id()
               << ", tp_rank=" << store_config.tp_rank
               << ", tp_size=" << store_config.tp_size
+              << ", cp_rank=" << store_config.cp_rank
+              << ", cp_size=" << store_config.cp_size
+              << ", kv_split_full_domain_size="
+              << store_config.kv_split_full_domain_size
               << ", kv_split_size=" << store_config.kv_split_size
               << ", kv_split_rank=" << store_config.kv_split_rank
               << ", enable_mla=" << store_config.enable_mla;
@@ -299,6 +307,10 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
               << ", worker_rank=" << options_.store_worker_id()
               << ", tp_rank=" << store_config.tp_rank
               << ", tp_size=" << store_config.tp_size
+              << ", cp_rank=" << store_config.cp_rank
+              << ", cp_size=" << store_config.cp_size
+              << ", kv_split_full_domain_size="
+              << store_config.kv_split_full_domain_size
               << ", kv_split_size=" << store_config.kv_split_size
               << ", kv_split_rank=" << store_config.kv_split_rank
               << ", enable_mla=" << store_config.enable_mla;
@@ -581,12 +593,13 @@ uint32_t HierarchyKVCacheTransfer::offload(
     VLOG(1) << "[Mooncake][OffloadPut] worker_rank="
             << options_.store_worker_id() << ", tp_rank=" << options_.tp_rank()
             << ", tp_size=" << options_.tp_size()
+            << ", cp_rank=" << options_.cp_rank()
+            << ", cp_size=" << options_.cp_size()
+            << ", kv_split_full_domain_size="
+            << options_.kv_split_full_domain_size()
             << ", kv_split_size=" << options_.kv_split_size()
             << ", kv_split_rank=" << options_.kv_split_rank()
             << ", enable_mla=" << options_.enable_mla()
-            << ", skipped_mla_nonzero_rank="
-            << (options_.enable_mla() && options_.kv_split_size() == 1 &&
-                options_.tp_rank() != 0U)
             << ", blocks=" << block_transfer_info.size()
             << ", success=" << put_count;
   }

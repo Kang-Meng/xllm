@@ -26,6 +26,7 @@ from xllm.python.layers.qwen3_5.common import (
     PartialRotaryEmbedding,
     Qwen3_5DecoderConfig,
 )
+from xllm.python.model_executor.forward_context import wait_for_layer_load
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
 
 
@@ -142,6 +143,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        wait_for_layer_load(self.layer_id)
         self._prepare_forward()
         if residual is None:
             residual = hidden

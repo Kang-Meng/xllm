@@ -167,6 +167,19 @@ KVCache make_linear_cache(int64_t host_blocks, int64_t width) {
       torch::zeros({host_blocks, width}, options)});
 }
 
+KVCache make_compressed_kpool_cache(int64_t host_blocks,
+                                    int64_t index_width,
+                                    int64_t tail_blocks) {
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  IndexedKVCacheTensors tensors;
+  tensors.kv_cache_tensors.key_cache =
+      torch::zeros({host_blocks, 2, 8}, options);
+  tensors.index_cache = torch::zeros({host_blocks, 2, 1, index_width}, options);
+  tensors.kpool_tail = torch::zeros({tail_blocks, 2, 4, index_width}, options);
+  return KVCache(tensors);
+}
+
 BlockTransferInfo make_block_info(uint8_t hash_value,
                                   BlockType block_type = BlockType::KV,
                                   int32_t destination_block_id = 0) {
@@ -188,6 +201,7 @@ KVCacheStoreInitConfig make_store_config(
   config.model_id = model_id;
   config.tp_rank = tp_rank;
   config.tp_size = tp_size;
+  config.kv_split_full_domain_size = static_cast<int32_t>(tp_size);
   config.enable_mla = enable_mla;
   return config;
 }
@@ -241,6 +255,10 @@ TEST_F(KVCacheStoreIntegrationTest,
       KVCache cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
       cache.get_k_cache().fill_(size * 10 + rank);
       cache.get_v_cache().fill_(size * 10 + rank + 100);
+      config_.cp_size = size;
+      config_.cp_rank = rank;
+      config_.kv_split_full_domain_size =
+          size * static_cast<int32_t>(config_.tp_size);
       config_.kv_split_size = size;
       config_.kv_split_rank = rank;
       KVCacheStore store;
@@ -252,6 +270,10 @@ TEST_F(KVCacheStoreIntegrationTest,
     for (int32_t rank = 0; rank < size; ++rank) {
       SCOPED_TRACE(::testing::Message() << "size=" << size << " rank=" << rank);
       KVCache cache = make_attention_cache(/*host_blocks=*/3, /*width=*/8);
+      config_.cp_size = size;
+      config_.cp_rank = rank;
+      config_.kv_split_full_domain_size =
+          size * static_cast<int32_t>(config_.tp_size);
       config_.kv_split_size = size;
       config_.kv_split_rank = rank;
       KVCacheStore store;
@@ -267,13 +289,16 @@ TEST_F(KVCacheStoreIntegrationTest,
   }
 }
 
-TEST_F(KVCacheStoreIntegrationTest, NonzeroMlaReplicaPublishesItsSplit) {
+TEST_F(KVCacheStoreIntegrationTest, MlaReplicaReadsTpZeroPublishedSplit) {
   KVCache cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
   cache.get_k_cache().fill_(23);
   cache.get_v_cache().fill_(47);
+  config_.cp_size = 4;
+  config_.cp_rank = 2;
+  config_.kv_split_full_domain_size = 4 * static_cast<int32_t>(config_.tp_size);
   config_.kv_split_size = 4;
   config_.kv_split_rank = 2;
-  config_.tp_rank = 5;
+  config_.tp_rank = 0;
   const std::vector<BlockTransferInfo> infos = {make_block_info(92)};
   {
     KVCacheStore writer;
@@ -293,6 +318,162 @@ TEST_F(KVCacheStoreIntegrationTest, NonzeroMlaReplicaPublishesItsSplit) {
   EXPECT_EQ(replica.batch_put(infos), 1U);
 }
 
+TEST_F(KVCacheStoreIntegrationTest, NonzeroCpRankPublishesItsSplit) {
+  for (bool enable_mla : {false, true}) {
+    for (int32_t split_size : {2, 4}) {
+      SCOPED_TRACE(::testing::Message() << "enable_mla=" << enable_mla
+                                        << " split_size=" << split_size);
+      config_.enable_mla = enable_mla;
+      config_.cp_size = split_size;
+      config_.cp_rank = split_size - 1;
+      config_.tp_size = 2;
+      config_.tp_rank = enable_mla ? 0 : 1;
+      config_.kv_split_full_domain_size =
+          split_size * static_cast<int32_t>(config_.tp_size);
+      config_.kv_split_size = split_size;
+      config_.kv_split_rank = split_size - 1;
+      const std::vector<BlockTransferInfo> infos = {make_block_info(93)};
+      {
+        KVCache cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
+        cache.get_k_cache().fill_(23 + split_size);
+        cache.get_v_cache().fill_(47 + split_size);
+        KVCacheStore writer;
+        ASSERT_TRUE(init_store(writer, cache, config_));
+        ASSERT_EQ(writer.batch_put(infos), 1U);
+      }
+
+      KVCache cache = make_attention_cache(/*host_blocks=*/3, /*width=*/8);
+      KVCacheStore reader;
+      ASSERT_TRUE(init_store(reader, cache, config_));
+      ASSERT_EQ(reader.batch_get(infos), 1U);
+      EXPECT_TRUE(torch::equal(
+          cache.get_k_cache()[0],
+          torch::full_like(cache.get_k_cache()[0], 23 + split_size)));
+      EXPECT_TRUE(torch::equal(
+          cache.get_v_cache()[0],
+          torch::full_like(cache.get_v_cache()[0], 47 + split_size)));
+    }
+  }
+}
+
+TEST(KVCacheStoreTest, SplitPutElectsOneWriterPerStoreKey) {
+  struct SplitWriterCase {
+    int32_t cp_size;
+    int32_t cp_rank;
+    uint32_t tp_rank;
+    uint32_t tp_size;
+    int32_t full_domain_size;
+    int32_t split_size;
+    int32_t split_rank;
+    bool sharded_owner;
+    bool replicated_owner;
+  };
+  const std::vector<SplitWriterCase> writers = {
+      // kv_split_size < cp_size: elect one CP replica per split and TP shard.
+      {4, 0, 0, 2, 8, 2, 0, true, true},
+      {4, 1, 0, 2, 8, 2, 0, false, false},
+      {4, 2, 0, 2, 8, 2, 1, true, true},
+      {4, 3, 0, 2, 8, 2, 1, false, false},
+      {4, 0, 1, 2, 8, 2, 0, true, false},
+      {4, 2, 1, 2, 8, 2, 1, true, false},
+      // kv_split_size == cp_size: CP ranks are distinct, MLA TP ranks
+      // replicate.
+      {2, 1, 0, 2, 4, 2, 1, true, true},
+      {2, 1, 1, 2, 4, 2, 1, true, false},
+      // Full-domain DCP: split rank already distinguishes every CP/TP worker.
+      {2, 0, 0, 2, 4, 4, 0, true, true},
+      {2, 0, 1, 2, 4, 4, 1, true, true},
+      {2, 1, 0, 2, 4, 4, 2, true, true},
+      {2, 1, 1, 2, 4, 4, 3, true, true},
+      // MLU Store TP ranks span CP. Sharded keys remain unique; replicated
+      // keys elect the first worker in the first CP replica of each split.
+      {4, 0, 0, 8, 8, 2, 0, true, true},
+      {4, 0, 1, 8, 8, 2, 0, true, false},
+      {4, 1, 2, 8, 8, 2, 0, true, false},
+      {4, 2, 4, 8, 8, 2, 1, true, true},
+      {4, 3, 6, 8, 8, 2, 1, true, false},
+      // Full-domain remains unique when it equals CP and Store TP spans CP.
+      {4, 3, 3, 4, 4, 4, 3, true, true},
+  };
+  for (bool enable_mla : {false, true}) {
+    for (BlockType block_type : {BlockType::KV, BlockType::LINEAR}) {
+      KVCache cache = block_type == BlockType::KV
+                          ? make_attention_cache(/*host_blocks=*/2, /*width=*/8)
+                          : make_linear_cache(/*host_blocks=*/2, /*width=*/8);
+      for (const SplitWriterCase& writer : writers) {
+        SCOPED_TRACE(
+            ::testing::Message()
+            << "enable_mla=" << enable_mla
+            << " block_type=" << static_cast<int32_t>(block_type)
+            << " cp_size=" << writer.cp_size << " cp_rank=" << writer.cp_rank
+            << " tp_rank=" << writer.tp_rank << " tp_size=" << writer.tp_size
+            << " full_domain_size=" << writer.full_domain_size << " split_size="
+            << writer.split_size << " split_rank=" << writer.split_rank);
+        KVCacheStoreInitConfig config = make_store_config(
+            "split-writer-test", writer.tp_rank, writer.tp_size, enable_mla);
+        config.cp_size = writer.cp_size;
+        config.cp_rank = writer.cp_rank;
+        config.kv_split_full_domain_size = writer.full_domain_size;
+        config.kv_split_size = writer.split_size;
+        config.kv_split_rank = writer.split_rank;
+        HostCacheStoreIndex index;
+        index[block_type].emplace_back(
+            HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+        KVCacheStore store;
+        KVCacheStoreTestPeer::initialize_index(
+            &store, config, std::move(index));
+        KVCacheStoreTestPeer::mark_initialized(&store);
+
+        const std::vector<BlockTransferInfo> infos = {
+            make_block_info(94, block_type)};
+        ASSERT_TRUE(
+            KVCacheStoreTestPeer::multi_buffer(store, infos).has_value());
+        const bool tp_replicated = enable_mla && block_type == BlockType::KV;
+        const bool is_owner =
+            tp_replicated ? writer.replicated_owner : writer.sharded_owner;
+        // An owner reaches the missing backend and fails; a replica skips the
+        // physical put and reports the logical block as already published.
+        EXPECT_EQ(store.batch_put(infos), is_owner ? 0U : 1U);
+      }
+    }
+  }
+}
+
+TEST(KVCacheStoreTest, UnsplitPutSkipsOnlySameKeyReplicas) {
+  for (bool enable_mla : {false, true}) {
+    for (BlockType block_type : {BlockType::KV, BlockType::LINEAR}) {
+      KVCache cache = block_type == BlockType::KV
+                          ? make_attention_cache(/*host_blocks=*/2, /*width=*/8)
+                          : make_linear_cache(/*host_blocks=*/2, /*width=*/8);
+      for (int32_t cp_rank : {0, 1}) {
+        for (uint32_t tp_rank : {0U, 1U}) {
+          SCOPED_TRACE(::testing::Message()
+                       << "enable_mla=" << enable_mla
+                       << " block_type=" << static_cast<int32_t>(block_type)
+                       << " cp_rank=" << cp_rank << " tp_rank=" << tp_rank);
+          KVCacheStoreInitConfig config = make_store_config(
+              "unsplit-writer-test", tp_rank, /*tp_size=*/2, enable_mla);
+          config.cp_size = 2;
+          config.cp_rank = cp_rank;
+          config.kv_split_full_domain_size = 4;
+          HostCacheStoreIndex index;
+          index[block_type].emplace_back(
+              HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+          KVCacheStore store;
+          KVCacheStoreTestPeer::initialize_index(
+              &store, config, std::move(index));
+          KVCacheStoreTestPeer::mark_initialized(&store);
+          const bool same_key_replica =
+              cp_rank != 0 ||
+              (enable_mla && block_type == BlockType::KV && tp_rank != 0);
+          EXPECT_EQ(store.batch_put({make_block_info(95, block_type)}),
+                    same_key_replica ? 1U : 0U);
+        }
+      }
+    }
+  }
+}
+
 TEST(KVCacheStoreDeathTest, RejectsInvalidSplitTopologyBeforeStoreSetup) {
   for (const auto& [size, rank] : std::vector<std::pair<int32_t, int32_t>>{
            {0, 0}, {-1, 0}, {4, -1}, {4, 4}}) {
@@ -306,6 +487,53 @@ TEST(KVCacheStoreDeathTest, RejectsInvalidSplitTopologyBeforeStoreSetup) {
         },
         "kv_split");
   }
+  for (const auto& [size, rank] : std::vector<std::pair<int32_t, int32_t>>{
+           {0, 0}, {-1, 0}, {2, -1}, {2, 2}}) {
+    KVCacheStoreInitConfig config = make_store_config();
+    config.cp_size = size;
+    config.cp_rank = rank;
+    EXPECT_DEATH(
+        {
+          KVCacheStore store;
+          store.init(config, {});
+        },
+        "cp_");
+  }
+  KVCacheStoreInitConfig nonfactor = make_store_config();
+  nonfactor.cp_size = 4;
+  nonfactor.kv_split_full_domain_size = 8;
+  nonfactor.kv_split_size = 3;
+  EXPECT_DEATH(
+      {
+        KVCacheStore store;
+        store.init(nonfactor, {});
+      },
+      "kv_split_size must divide cp_size");
+
+  KVCacheStoreInitConfig overlapping_tp = make_store_config(
+      "target-model", /*tp_rank=*/7, /*tp_size=*/8, /*enable_mla=*/true);
+  overlapping_tp.cp_size = 4;
+  overlapping_tp.cp_rank = 3;
+  overlapping_tp.kv_split_full_domain_size = 8;
+  overlapping_tp.kv_split_size = 8;
+  overlapping_tp.kv_split_rank = 7;
+  EXPECT_DEATH(
+      {
+        KVCacheStore store;
+        store.init(overlapping_tp, {});
+      },
+      "requires Host caches");
+
+  KVCacheStoreInitConfig invalid_tp_domain = make_store_config(
+      "target-model", /*tp_rank=*/0, /*tp_size=*/4, /*enable_mla=*/true);
+  invalid_tp_domain.cp_size = 4;
+  invalid_tp_domain.kv_split_full_domain_size = 8;
+  EXPECT_DEATH(
+      {
+        KVCacheStore store;
+        store.init(invalid_tp_domain, {});
+      },
+      "Store TP ranks");
 }
 
 TEST(KVCacheStoreTest, TargetKeyDoesNotDependOnDraftRegistration) {
@@ -388,6 +616,55 @@ TEST(KVCacheStoreTest, SchemaExcludesHostCapacity) {
 
   EXPECT_EQ(build_target_key(&small_cache), build_target_key(&large_cache));
   EXPECT_NE(build_target_key(&small_cache), build_target_key(&different_cache));
+}
+
+TEST(KVCacheStoreTest, CompressedKPoolRegistersIndexAndTailLayouts) {
+  KVCache cache = make_compressed_kpool_cache(
+      /*host_blocks=*/2, /*index_width=*/8, /*tail_blocks=*/3);
+  HostCacheStoreIndex index;
+  index[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+  index[BlockType::LINEAR].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+  KVCacheStore store;
+  KVCacheStoreTestPeer::initialize_index(&store,
+                                         make_store_config("compressed-kpool",
+                                                           /*tp_rank=*/0,
+                                                           /*tp_size=*/2,
+                                                           /*enable_mla=*/true),
+                                         std::move(index));
+
+  const std::vector<BlockTransferInfo> kv_info = {
+      make_block_info(81, BlockType::KV)};
+  const std::vector<BlockTransferInfo> tail_info = {
+      make_block_info(81, BlockType::LINEAR)};
+  const std::optional<MooncakeMultiBuffer> kv_buffer =
+      KVCacheStoreTestPeer::multi_buffer(store, kv_info);
+  const std::optional<MooncakeMultiBuffer> tail_buffer =
+      KVCacheStoreTestPeer::multi_buffer(store, tail_info);
+  ASSERT_TRUE(kv_buffer.has_value());
+  ASSERT_TRUE(tail_buffer.has_value());
+  EXPECT_EQ(kv_buffer->sizes.size(), 2U);
+  EXPECT_EQ(tail_buffer->sizes.size(), 1U);
+  EXPECT_NE(KVCacheStoreTestPeer::build_keys(store, kv_info).front().second,
+            KVCacheStoreTestPeer::build_keys(store, tail_info).front().second);
+
+  KVCache different_index = make_compressed_kpool_cache(
+      /*host_blocks=*/2, /*index_width=*/16, /*tail_blocks=*/3);
+  HostCacheStoreIndex different_index_layout;
+  different_index_layout[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/0, "main", &different_index});
+  KVCacheStore different_store;
+  KVCacheStoreTestPeer::initialize_index(&different_store,
+                                         make_store_config("compressed-kpool",
+                                                           /*tp_rank=*/0,
+                                                           /*tp_size=*/2,
+                                                           /*enable_mla=*/true),
+                                         std::move(different_index_layout));
+  EXPECT_NE(KVCacheStoreTestPeer::build_keys(store, kv_info).front().second,
+            KVCacheStoreTestPeer::build_keys(different_store, kv_info)
+                .front()
+                .second);
 }
 
 TEST(KVCacheStoreTest, MlaKeyExcludesTensorParallelTopology) {

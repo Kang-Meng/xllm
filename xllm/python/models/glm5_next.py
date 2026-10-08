@@ -76,6 +76,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context_or_none,
     in_acl_graph,
     record_layer_event,
+    wait_for_layer_load,
 )
 
 
@@ -653,6 +654,7 @@ class Glm5NextKdaAttention(Attention):
         *,
         output_layout: TokenParallelLayout | None = None,
     ) -> torch.Tensor:
+        wait_for_layer_load(self.layer_id)
         batch_size, seq_len = hidden_states.shape[:2]
         projected = self.in_proj_qkvbfg_a(hidden_states)
         mixed_qkv, beta_raw, fg_latents = projected.split(self.input_projection_sizes, dim=-1)
@@ -1693,6 +1695,7 @@ class Glm5NextMlaAttention(Attention):
         kPool indexer updates the selected cache layout, runs ``select_topk``,
         and adapts the result to the SFA op's ``sparse_indices`` contract.
         """
+        wait_for_layer_load(self.layer_id)
         forward_context = get_forward_context()
         cp_context = getattr(forward_context, "cp_context", None)
         # CP keeps the model-side row layout identical to ``cp_size == 1``:

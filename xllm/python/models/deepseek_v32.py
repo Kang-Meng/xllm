@@ -41,6 +41,7 @@ from xllm.python.layers import (
 from xllm.python.model_executor.forward_context import (
     get_execution_buffer,
     get_forward_context,
+    wait_for_layer_load,
 )
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.weight_utils import (
@@ -864,6 +865,7 @@ class DeepseekV3MLAAttention(Attention):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
     ) -> torch.Tensor:
+        wait_for_layer_load(self.layer_id)
         num_tokens = hidden.shape[0]
         backend = get_forward_context().attention_backend
         if self._use_fused_mla_decode:
