@@ -13,7 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <framework/core/MLUStream.h>
 #include <framework/core/device.h>
+#include <framework/core/stream_guard.h>
+#include <framework/graphs/MLUGraph.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
@@ -812,6 +815,167 @@ TEST(FusedSigmoidUpdateTest,
 TEST(FusedSigmoidUpdateTest,
      RaggedKdaBatchPreservesEverySpeculativeCheckpoint) {
   expect_kda_batch_matches_sequential({0, 1, 2, 3, 0, 3, 2, 1});
+}
+
+void expect_tp4_decode_graph_matches_reference(int64_t bucket,
+                                               int64_t live_sequences,
+                                               bool include_empty_query) {
+  torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  torch::DeviceGuard guard(device);
+  torch::manual_seed(20261008);
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kDim = 128;
+  constexpr float kLowerBound = -5.0f;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kDim));
+  const auto fp32 = torch::TensorOptions().dtype(torch::kFloat32);
+  const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
+  const auto ints = torch::TensorOptions().dtype(torch::kInt32);
+  std::vector<int32_t> offsets;
+  std::vector<int32_t> slots;
+  offsets.reserve(bucket + 1);
+  slots.reserve(bucket);
+  offsets.emplace_back(0);
+  for (int64_t row = 0; row < bucket; ++row) {
+    const bool empty = include_empty_query && row == 1;
+    offsets.emplace_back(offsets.back() + (empty ? 0 : 1));
+    const int32_t slot = row < live_sequences
+                             ? static_cast<int32_t>(live_sequences - row)
+                             : (row % 2 == 0 ? 0 : -1);
+    slots.emplace_back(slot);
+  }
+  torch::Tensor a_log_cpu = torch::randn({kHeads}, fp32) * 0.1;
+  torch::Tensor bias_cpu = torch::randn({kHeads * kDim}, fp32) * 0.1;
+  torch::Tensor gate_cpu = torch::randn({bucket, kHeads * kDim}, bf16);
+  torch::Tensor beta_cpu = torch::randn({bucket, kHeads}, bf16);
+  torch::Tensor q_cpu = torch::randn({1, bucket, kHeads, kDim}, bf16);
+  torch::Tensor k_cpu = torch::randn_like(q_cpu);
+  torch::Tensor v_cpu = torch::randn_like(q_cpu);
+  torch::Tensor original_state =
+      torch::randn({bucket + 2, kHeads, kDim, kDim}, fp32) * 0.05;
+  torch::Tensor expected_state = original_state.clone();
+  torch::Tensor state = original_state.to(device);
+  torch::Tensor a_log = a_log_cpu.to(device);
+  torch::Tensor bias = bias_cpu.to(device);
+  torch::Tensor gate = gate_cpu.to(device);
+  torch::Tensor beta = beta_cpu.to(device);
+  torch::Tensor q = q_cpu.to(device);
+  torch::Tensor k = k_cpu.to(device);
+  torch::Tensor v = v_cpu.to(device);
+  torch::Tensor indices = torch::tensor(slots, ints).to(device);
+  torch::Tensor cu = torch::tensor(offsets, ints).to(device);
+  auto run = [&]() {
+    return fused_sigmoid_gating_delta_rule_update(
+        a_log,
+        gate,
+        beta,
+        bias,
+        q,
+        k,
+        v,
+        state,
+        indices,
+        cu,
+        scale,
+        /*use_qk_l2norm_in_kernel=*/true,
+        /*softplus_beta=*/1.0f,
+        /*softplus_threshold=*/20.0f,
+        /*num_accepted_tokens_opt=*/std::nullopt,
+        /*inplace_final_state=*/true,
+        /*is_kda=*/true,
+        /*kda_use_safe_gate=*/true,
+        /*kda_gate_lower_bound=*/kLowerBound);
+  };
+  // Warm the actual C++ dispatcher before capture; never reproduce its launch
+  // parameters in the test. Capture also exercises wrapper output zeroing.
+  auto warmup = run();
+  EXPECT_EQ(warmup.second.data_ptr(), state.data_ptr());
+  torch_mlu::synchronize();
+  torch_mlu::MLUGraph graph;
+  torch::Tensor output;
+  {
+    torch_mlu::mlu::MLUStreamGuard stream(
+        torch_mlu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0));
+    graph.capture_begin();
+    output = run().first;
+    graph.capture_end();
+  }
+  state.copy_(original_state);
+  for (int32_t round = 0; round < 3; ++round) {
+    SCOPED_TRACE(round);
+    // Change inputs while keeping graph addresses fixed, and carry recurrent
+    // state across replays instead of resetting it before each comparison.
+    q_cpu = torch::randn_like(q_cpu);
+    q.copy_(q_cpu);
+    torch::Tensor expected_output =
+        torch::zeros({1, bucket, kHeads, kDim}, fp32);
+    for (int64_t row = 0; row < live_sequences; ++row) {
+      if (offsets[row] == offsets[row + 1]) {
+        continue;
+      }
+      const int64_t token = offsets[row];
+      const int64_t slot = slots[row];
+      torch::Tensor recurrence = expected_state[slot].clone();
+      torch::Tensor step = kda_reference_step(
+          q_cpu[0][token].to(torch::kFloat32),
+          k_cpu[0][token].to(torch::kFloat32),
+          v_cpu[0][token].to(torch::kFloat32),
+          gate_cpu[token].to(torch::kFloat32).view({kHeads, kDim}),
+          beta_cpu[token].to(torch::kFloat32),
+          a_log_cpu,
+          bias_cpu.view({kHeads, kDim}),
+          recurrence,
+          scale,
+          kLowerBound);
+      expected_output[0][token].copy_(step);
+      expected_state[slot].copy_(recurrence);
+    }
+    graph.replay();
+    torch_mlu::synchronize();
+    torch::Tensor actual_output = output.to(torch::kCPU).to(torch::kFloat32);
+    torch::Tensor actual_state = state.to(torch::kCPU);
+    EXPECT_TRUE(torch::allclose(actual_output,
+                                expected_output,
+                                /*rtol=*/0.03,
+                                /*atol=*/0.003));
+    EXPECT_TRUE(torch::allclose(actual_state,
+                                expected_state,
+                                /*rtol=*/5e-4,
+                                /*atol=*/5e-5));
+    EXPECT_TRUE(torch::equal(actual_state[0], original_state[0]));
+    EXPECT_TRUE(
+        torch::equal(actual_state[bucket + 1], original_state[bucket + 1]));
+    EXPECT_TRUE(torch::isfinite(actual_output).all().item<bool>());
+    EXPECT_TRUE(torch::isfinite(actual_state).all().item<bool>());
+    for (int64_t token = offsets[live_sequences]; token < bucket; ++token) {
+      EXPECT_TRUE(torch::equal(actual_output[0][token],
+                               torch::zeros_like(actual_output[0][token])));
+    }
+    if (include_empty_query) {
+      EXPECT_TRUE(
+          torch::equal(actual_state[slots[1]], original_state[slots[1]]));
+    }
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, Tp4DecodeGraphBucketsMatchFp32Recurrence) {
+  for (int64_t bucket : {1, 2, 4, 8, 16, 32}) {
+    SCOPED_TRACE(bucket);
+    expect_tp4_decode_graph_matches_reference(bucket,
+                                              bucket,
+                                              /*include_empty_query=*/false);
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, Tp4DecodeGraphPaddingAndEmptyRowsPreserveState) {
+  expect_tp4_decode_graph_matches_reference(/*bucket=*/4,
+                                            /*live_sequences=*/3,
+                                            /*include_empty_query=*/false);
+  expect_tp4_decode_graph_matches_reference(/*bucket=*/8,
+                                            /*live_sequences=*/5,
+                                            /*include_empty_query=*/false);
+  expect_tp4_decode_graph_matches_reference(/*bucket=*/8,
+                                            /*live_sequences=*/5,
+                                            /*include_empty_query=*/true);
 }
 
 }  // namespace

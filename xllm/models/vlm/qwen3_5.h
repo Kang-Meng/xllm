@@ -158,6 +158,11 @@ class Qwen3_5ModelImpl final
                 attn_metadata,
                 kv_caches[i],
                 effective_params);
+
+      if (!effective_params.record_layer(static_cast<uint32_t>(i),
+                                         h.device())) {
+        return ModelOutput();
+      }
     }
     if (residual.has_value()) {
       h = h + residual.value();

@@ -531,6 +531,24 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
       block_v = std::min<int64_t>(head_v_dim, kSplitBlockV);
     }
   }
+  // TP4 decode has sixteen local heads. One program per sequence leaves most
+  // cores idle at small batches; distribute head groups across the cores while
+  // retaining larger contiguous tiles when they have the same per-core work.
+  // Keep speculative updates and the single-sequence value split unchanged.
+  const bool split_small_kda_batch =
+      is_kda && kda_use_safe_gate && use_qk_l2norm_in_kernel &&
+      glm_fp32_state && num_k_heads == 16 && num_v_heads == 16 &&
+      head_k_dim == 128 && head_v_dim == 128 && num_sequences > 1 &&
+      num_sequences <= core_count / 2 &&
+      batch_size * seq_len == num_sequences && inplace_final_state &&
+      !num_accepted_tokens_opt.has_value() && ssm_state_indices.defined() &&
+      initial_state.is_contiguous() && A_log.is_contiguous() &&
+      dt_bias.is_contiguous();
+  if (split_small_kda_batch) {
+    block_hv =
+        std::min(max_block_hv,
+                 choose_kda_head_group(num_sequences, num_v_heads, core_count));
+  }
   const bool use_factored_kda_reduce =
       use_optimized_glm_kda && block_k == 128 && block_v == 128 && block_n == 1;
   if (use_optimized_glm_kda) {
@@ -538,6 +556,7 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
     block_hv = kda_head_group;
   }
   const bool split_hv = split_gdn_hv || split_single_token ||
+                        split_small_kda_batch ||
                         (use_optimized_glm_kda && block_hv < num_v_heads);
   int64_t num_hv_blocks =
       split_hv ? (num_v_heads + block_hv - 1) / block_hv : 1;

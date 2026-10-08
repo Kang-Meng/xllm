@@ -192,6 +192,9 @@ class Qwen3_5MtpModelImplBase : public Qwen3HybridModelImplBase {
         return ModelOutput();
       }
 #endif
+      if (!input_params.record_layer(static_cast<uint32_t>(i), device_)) {
+        return ModelOutput();
+      }
     }
     auto [new_mtp_hidden, new_res] = norm_->forward(mtp_hidden, residual);
     mtp_hidden = new_mtp_hidden;
