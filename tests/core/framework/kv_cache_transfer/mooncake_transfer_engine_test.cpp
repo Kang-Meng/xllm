@@ -216,6 +216,101 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
   std::vector<PeerCall> local_peer_calls;
 };
 
+// Declared first on purpose. MooncakeTransferEngineCore::initialize() consults
+// the MC_TCP_PROTO refusal only while the shared core is still uninitialized,
+// and gtest runs a single-TU binary's tests in declaration order; the
+// precondition below turns a future reordering into a precise failure instead
+// of a mysterious "did not die".
+TEST(MooncakeKVCacheTransferInitializeTest,
+     EmptyEngineAddressFailsWithItsOwnMessage) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ASSERT_TRUE(MooncakeTransferEngineCore::get_instance().addr().empty())
+      << "this test must run before any test that initializes the shared "
+         "MooncakeTransferEngineCore";
+
+  // The engine returns "" when the core refuses to come up. This test drives
+  // that refusal through the MC_TCP_PROTO guard, which returns before any port
+  // is bound or any device is touched, so the case is deterministic and free of
+  // hardware.
+  setenv("MC_TCP_PROTO", "1", /*overwrite=*/1);
+  auto engine = std::make_unique<MooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+
+  // Before the guard the empty address was stored silently and only surfaced
+  // much later as "Failed to publish cache layout: cache layout identity and
+  // compatibility fields are required", which blames the layout fields instead
+  // of the transfer engine.
+  EXPECT_DEATH(transfer.initialize(/*device_id=*/0),
+               "Mooncake transfer engine failed to initialize");
+  unsetenv("MC_TCP_PROTO");
+}
+
+// Pins the pair (width, rank) the cache-layout producer publishes. The removed
+// hybrid mode published `linear_parallel_width = tp_size * cp_size` while
+// keeping the attention tp_rank, which was 0 on every rank, so every rank
+// claimed the first `local_head_count` heads and the same shard ownership.
+// The producer now derives the width once and the rank inside it; this test
+// holds that pair together and against the engine-side derivation
+// (`llm_engine.cpp`: dp_local_size_ / cp_size_) for the settled shapes.
+TEST(MooncakeKVCacheTransferLayoutTest, PublishedTpWidthAndRankAlwaysAgree) {
+  struct Shape {
+    int32_t world_size;
+    int32_t dp_size;
+    int32_t cp_size;
+  };
+  const Shape shapes[] = {
+      {/*world_size=*/16, /*dp_size=*/4, /*cp_size=*/1},  // settled DECODE
+      {/*world_size=*/16, /*dp_size=*/1, /*cp_size=*/4},  // settled PREFILL
+      {/*world_size=*/16, /*dp_size=*/2, /*cp_size=*/2},
+      {/*world_size=*/8, /*dp_size=*/1, /*cp_size=*/1},
+  };
+
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  ModelArgs model_args;
+
+  for (const Shape& shape : shapes) {
+    for (int32_t rank = 0; rank < shape.world_size; ++rank) {
+      const ParallelArgs parallel_args(rank,
+                                       shape.world_size,
+                                       shape.dp_size,
+                                       shape.cp_size,
+                                       /*process_group=*/nullptr,
+                                       /*ep_size=*/1);
+      transfer.configure_cache_layout(parallel_args,
+                                      model_args,
+                                      /*block_token_capacity=*/128,
+                                      /*is_spec_draft=*/false);
+      const auto& context = transfer.pending_registration_context_;
+      ASSERT_TRUE(context.has_value());
+
+      const int32_t expected_tp_size =
+          shape.world_size / shape.dp_size / shape.cp_size;
+      EXPECT_EQ(context->coordinates.tp_size, expected_tp_size);
+      EXPECT_EQ(context->tensor_layout.tp_size, expected_tp_size);
+      // The engine derives the same width as (worker_clients / dp) / cp; the
+      // two forms must stay equal for every shape, not only by convention.
+      EXPECT_EQ(context->tensor_layout.tp_size,
+                (shape.world_size / shape.dp_size) / shape.cp_size);
+      EXPECT_EQ(context->coordinates.tp_rank, context->tensor_layout.tp_rank);
+      EXPECT_GE(context->coordinates.tp_rank, 0);
+      EXPECT_LT(context->coordinates.tp_rank, expected_tp_size);
+      EXPECT_EQ(context->coordinates.kv_split_size,
+                parallel_args.kv_split_size_effective());
+    }
+  }
+}
+
 TEST(MooncakeTransferEngineTest, LinksAllPcpSourcesWithOneActiveOwner) {
   MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
   WorkerCacheLayoutManifest destination = make_pcp_manifest(
@@ -968,6 +1063,167 @@ TEST(MooncakeTransferEngineServiceTest, ReplicatedReceiverRequiresSession) {
   WorkerCacheLayoutManifest updated_receiver = receiver;
   ++updated_receiver.layout_generation;
   EXPECT_TRUE(core.set_local_cache_layout(updated_receiver).ok());
+}
+
+TEST(MooncakeTransferEngineServiceTest,
+     Cp1ReceiverLinksCpPrefillPeerWithoutReversePlan) {
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  // PCP x PD shape: the decode side stays cp1 while the prefill peer runs
+  // CP, so the reverse (decode->prefill) direction never carries bytes.
+  const WorkerCacheLayoutManifest decode = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/1,
+      "cp1-decode-receiver",
+      /*cluster_id=*/1);
+  const WorkerCacheLayoutManifest prefill = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/2,
+      "cp2-prefill-peer",
+      /*cluster_id=*/2);
+  ASSERT_TRUE(core.set_local_cache_layout(decode).ok());
+
+  // The reshard planner keeps rejecting the reverse pair: PR370 only
+  // supports collapsing a CP source into a cp1 destination, never the
+  // reverse, so local-peer admission must skip the reverse plan instead of
+  // asking the planner to build one.
+  ReshardPlanTemplate reverse_plan;
+  EXPECT_FALSE(ReshardPlanner()
+                   .build_outgoing_plan(decode,
+                                        prefill,
+                                        &reverse_plan,
+                                        /*include_replicas=*/true)
+                   .ok());
+
+  // set_local_peer's receiver path (require_outgoing_plan=false) must get
+  // past plan negotiation. This CPU fixture has no initialized transport,
+  // so the call stops at session setup rather than the partition check.
+  const Status receiver_status = core.set_cache_peer(
+      prefill, CachePeerMode::ACTIVE, /*require_outgoing_plan=*/false);
+  EXPECT_EQ(receiver_status.code(), StatusCode::UNAVAILABLE);
+  EXPECT_EQ(receiver_status.message(),
+            "failed to open cache peer data session");
+  EXPECT_FALSE(core.has_reshard_plan(prefill.addr));
+
+  // The sending RPC contract is unchanged: an active sender still requires
+  // a non-empty outgoing plan, so a CP peer cannot register itself as a
+  // push destination through the RPC path.
+  const Status sender_status =
+      core.set_cache_peer(prefill, CachePeerMode::ACTIVE);
+  EXPECT_EQ(sender_status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(sender_status.message(),
+            "active cache peer requires a non-empty plan");
+  EXPECT_FALSE(core.has_reshard_plan(prefill.addr));
+
+  WorkerCacheLayoutManifest updated_decode = decode;
+  ++updated_decode.layout_generation;
+  EXPECT_TRUE(core.set_local_cache_layout(updated_decode).ok());
+}
+
+TEST(MooncakeTransferEngineServiceTest,
+     Cp1ReceiverRejectsLayoutIncompatibleCpPrefillPeer) {
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  // Same PCP x PD receiver shape as above, but the CP prefill peer carries
+  // a different model fingerprint: the receiver link bypasses the reshard
+  // planner, so admission itself must reject the layout-incompatible peer
+  // instead of accepting it and failing later in the data plane.
+  const WorkerCacheLayoutManifest decode = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/1,
+      "cp1-decode-mismatched-receiver",
+      /*cluster_id=*/1);
+  WorkerCacheLayoutManifest prefill = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/2,
+      "cp2-prefill-fingerprint-mismatch",
+      /*cluster_id=*/2);
+  prefill.fingerprint = "another-model-fingerprint";
+  ASSERT_TRUE(core.set_local_cache_layout(decode).ok());
+
+  // The receiver path (require_outgoing_plan=false) must reject the peer
+  // with INVALID_ARGUMENT naming the mismatched identity field, before
+  // any session setup.
+  const Status receiver_status = core.set_cache_peer(
+      prefill, CachePeerMode::ACTIVE, /*require_outgoing_plan=*/false);
+  EXPECT_EQ(receiver_status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_NE(receiver_status.message().find("fingerprint"), std::string::npos);
+  EXPECT_FALSE(core.has_reshard_plan(prefill.addr));
+  EXPECT_FALSE(core.has_outgoing_plan(prefill.addr, CacheNamespace::MAIN));
+
+  // The RPC sender contract rejects the same layout-incompatible peer.
+  const Status sender_status =
+      core.set_cache_peer(prefill, CachePeerMode::ACTIVE);
+  EXPECT_EQ(sender_status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_NE(sender_status.message().find("fingerprint"), std::string::npos);
+  EXPECT_FALSE(core.has_reshard_plan(prefill.addr));
+
+  // A backend mismatch is named just like a fingerprint mismatch.
+  WorkerCacheLayoutManifest other_prefill = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/2,
+      "cp2-prefill-backend-mismatch",
+      /*cluster_id=*/2);
+  other_prefill.backend = "npu";
+  const Status backend_status = core.set_cache_peer(
+      other_prefill, CachePeerMode::ACTIVE, /*require_outgoing_plan=*/false);
+  EXPECT_EQ(backend_status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_NE(backend_status.message().find("backend"), std::string::npos);
+  EXPECT_FALSE(core.has_reshard_plan(other_prefill.addr));
+
+  WorkerCacheLayoutManifest updated_decode = decode;
+  ++updated_decode.layout_generation;
+  EXPECT_TRUE(core.set_local_cache_layout(updated_decode).ok());
+}
+
+TEST(MooncakeTransferEngineServiceTest,
+     CpPrefillKeepsNonEmptyPlanTowardCp1Decode) {
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  // The transfer-bearing direction: a CP prefill local pushing into a cp1
+  // decode peer must keep negotiating a real (non-empty) outgoing plan.
+  const WorkerCacheLayoutManifest prefill = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/2,
+      "cp2-prefill-sender",
+      /*cluster_id=*/3);
+  const WorkerCacheLayoutManifest decode = make_pcp_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/8,
+      /*cp_rank=*/0,
+      /*cp_size=*/1,
+      "cp1-decode-destination",
+      /*cluster_id=*/4);
+  ASSERT_TRUE(core.set_local_cache_layout(prefill).ok());
+
+  ReshardPlanTemplate outgoing_plan;
+  ASSERT_TRUE(ReshardPlanner()
+                  .build_outgoing_plan(prefill,
+                                       decode,
+                                       &outgoing_plan,
+                                       /*include_replicas=*/true)
+                  .ok());
+  EXPECT_FALSE(outgoing_plan.regions.empty());
+
+  // The RPC default (require_outgoing_plan=true) passes the plan check and
+  // only fails on this transport-less fixture at session setup.
+  const Status status = core.set_cache_peer(decode, CachePeerMode::ACTIVE);
+  EXPECT_EQ(status.code(), StatusCode::UNAVAILABLE);
+  EXPECT_EQ(status.message(), "failed to open cache peer data session");
+  EXPECT_FALSE(core.has_reshard_plan(decode.addr));
+
+  WorkerCacheLayoutManifest updated_prefill = prefill;
+  ++updated_prefill.layout_generation;
+  EXPECT_TRUE(core.set_local_cache_layout(updated_prefill).ok());
 }
 
 TEST(MooncakeTransferEngineServiceTest, CloseSessionRejectsMissingAddr) {

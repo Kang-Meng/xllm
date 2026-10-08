@@ -459,19 +459,19 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
   scheduler_config.enable_schedule_overlap(false);
 
   options.enable_disagg_pd(true);
-  EXPECT_EQ(validate_model_cp(options,
-                              EngineType::LLM,
-                              "glm5_next",
-                              /*global_world_size=*/8),
-            std::optional<std::string>(
-                "Python GLM-5 Next CP does not support disaggregated PD"));
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
   options.instance_role(InstanceRole::DEFAULT);
   EXPECT_EQ(validate_model_cp(options,
                               EngineType::LLM,
                               "glm5_next",
                               /*global_world_size=*/8),
             std::optional<std::string>(
-                "Python GLM-5 Next CP does not support disaggregated PD"));
+                "Python GLM-5 Next CP with disaggregated PD requires the "
+                "PREFILL role"));
   options.instance_role(InstanceRole::PREFILL)
       .enable_disagg_pd(false)
       .enable_pd_ooc(true);

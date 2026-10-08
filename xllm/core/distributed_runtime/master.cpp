@@ -315,8 +315,10 @@ std::optional<std::string> validate_model_cp(const Options& options,
           return "Python GLM-5 Next CP initially requires "
                  "enable_schedule_overlap=false";
         }
-        if (options.enable_disagg_pd()) {
-          return "Python GLM-5 Next CP does not support disaggregated PD";
+        if (options.enable_disagg_pd() &&
+            options.instance_role() != InstanceRole::PREFILL) {
+          return "Python GLM-5 Next CP with disaggregated PD requires the "
+                 "PREFILL role";
         }
         if (options.enable_pd_ooc()) {
           return "Python GLM-5 Next CP initially requires enable_pd_ooc=false";

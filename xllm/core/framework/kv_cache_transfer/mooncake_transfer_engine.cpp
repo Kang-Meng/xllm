@@ -23,6 +23,7 @@ limitations under the License.
 #include <numeric>
 #include <unordered_set>
 
+#include "absl/strings/str_join.h"
 #include "common/metrics.h"
 #include "util/net.h"
 
@@ -40,6 +41,16 @@ Status check_active_plan_requirement(
                   "active cache peer requires a non-empty plan");
   }
   return Status();
+}
+
+// Whether `local` links `peer` as a pure KV receiver: the local worker is
+// cp1 while the peer runs context parallelism. link_sessions runs on the
+// decode side and its peers are prefill workers, so this shape is a decode
+// worker whose prefill runs CP -- KV bytes only flow peer->local and the
+// reverse outgoing plan is empty by construction.
+bool links_cp_peer_as_receiver(const ParallelCoordinates& local,
+                               const ParallelCoordinates& peer) {
+  return local.cp_size == 1 && peer.cp_size > 1;
 }
 
 bool close_remote_session(MooncakeTransferEngineCore* core,
@@ -422,11 +433,34 @@ Status MooncakeTransferEngineCore::set_cache_peer(
   std::optional<ReshardPlanTemplate> plan;
   if (mode == CachePeerMode::ACTIVE) {
     ReshardPlanTemplate active_plan;
-    const Status plan_status = ReshardPlanner().build_outgoing_plan(
-        *local_manifest, peer_manifest, &active_plan,
-        /*include_replicas=*/true);
-    if (!plan_status.ok()) {
-      return plan_status;
+    if (links_cp_peer_as_receiver(local_manifest->coordinates,
+                                  peer_manifest.coordinates)) {
+      // This branch bypasses build_outgoing_plan, so the instance-identity
+      // half of validate_compatibility must run here: a cp1 decode worker
+      // may only receive from a CP prefill peer of the same instance
+      // layout. Only the partition-pair direction rule stays relaxed.
+      std::vector<std::string> mismatched_fields;
+      if (!same_instance_layout(
+              *local_manifest, peer_manifest, &mismatched_fields)) {
+        return Status(StatusCode::INVALID_ARGUMENT,
+                      "cp1 receiver cache peer is layout-incompatible: "
+                      "mismatched " +
+                          absl::StrJoin(mismatched_fields, ", "));
+      }
+      // The reverse direction never carries bytes, so keep an empty plan
+      // instead of extending the planner: supports_partition_layout only
+      // collapses a CP source into a cp1 destination, and fabricating
+      // reverse regions would aim real bytes at a prefill. Endpoint
+      // identity lives in the CachePeerLink fields, not in this plan.
+    } else {
+      const Status plan_status =
+          ReshardPlanner().build_outgoing_plan(*local_manifest,
+                                               peer_manifest,
+                                               &active_plan,
+                                               /*include_replicas=*/true);
+      if (!plan_status.ok()) {
+        return plan_status;
+      }
     }
     plan = std::move(active_plan);
   }
@@ -703,8 +737,16 @@ bool MooncakeTransferEngine::set_local_peer(
     CachePeerMode mode) {
   // ACTIVE is selected by the incoming plan. A replicated KV receiver may
   // have no outgoing regions, but still needs a data session for reads.
-  return core_.set_cache_peer(manifest, mode, /*require_outgoing_plan=*/false)
-      .ok();
+  const Status status =
+      core_.set_cache_peer(manifest, mode, /*require_outgoing_plan=*/false);
+  if (!status.ok()) {
+    // link_sessions only sees this bool and its rollback loop is silent,
+    // so the rejection reason must be logged here to be diagnosable.
+    LOG(ERROR) << "Set local cache peer failed for " << manifest.addr << ": "
+               << status.message();
+    return false;
+  }
+  return true;
 }
 
 bool MooncakeTransferEngine::open_session(const uint64_t cluster_id,

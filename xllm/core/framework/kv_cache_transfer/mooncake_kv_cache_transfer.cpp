@@ -150,6 +150,15 @@ MooncakeKVCacheTransferBase::MooncakeKVCacheTransferBase(
 void MooncakeKVCacheTransferBase::initialize(int32_t device_id) {
   (void)device_id;
   addr_ = mooncake_te_->initialize();
+  // A failed transfer-engine init returns "" here -- most often because the
+  // BRPC listen port is already bound by another rank process. Fail at the
+  // source, where the cause is still known: letting the empty address through
+  // reports it much later as "Failed to publish cache layout: cache layout
+  // identity and compatibility fields are required", which blames the layout
+  // fields and cost real debugging time on the 26000-port collision.
+  CHECK(!addr_.empty()) << "Mooncake transfer engine failed to initialize "
+                           "(listen port "
+                        << listen_port_ << " may already be in use)";
 }
 
 void MooncakeKVCacheTransferBase::configure_cache_layout(
@@ -168,6 +177,11 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
   CacheRegistrationContext context;
   context.cache_namespace =
       is_spec_draft ? CacheNamespace::SPEC_DRAFT : CacheNamespace::MAIN;
+  // The attention/model TP width. llm_engine.cpp derives the same value
+  // independently as `dp_local_tp_size_ = dp_local_size_ / cp_size_`; the two
+  // agree only by this arithmetic, so
+  // MooncakeKVCacheTransferLayoutTest.PublishedTpWidthAndRankAlwaysAgree pins
+  // the published (width, rank) pair for the settled shapes.
   const int32_t tp_size = parallel_args.world_size() / parallel_args.dp_size() /
                           parallel_args.cp_size();
   const int32_t rank_in_dp =

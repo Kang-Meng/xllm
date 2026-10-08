@@ -80,6 +80,19 @@ struct ReshardPlanTemplate {
   std::vector<StridedRegionTemplate> regions;
 };
 
+// Whether `source` and `destination` describe the same cache instance
+// layout: schema_version, fingerprint, backend and layout_family must all
+// agree. validate_compatibility() gates every planner-built plan on this
+// identity, and the cp1 receiver-link admission in
+// mooncake_transfer_engine.cpp re-checks it because that path never
+// consults the planner. When the layouts differ, `mismatched_fields` (if
+// not null) receives the names of the disagreeing fields for error
+// messages.
+bool same_instance_layout(
+    const WorkerCacheLayoutManifest& source,
+    const WorkerCacheLayoutManifest& destination,
+    std::vector<std::string>* mismatched_fields = nullptr);
+
 class ReshardPlanner final {
  public:
   Status select_sources(const std::vector<WorkerCacheLayoutManifest>& sources,

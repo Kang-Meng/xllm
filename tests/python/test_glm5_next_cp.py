@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +28,49 @@ from xllm.python.layers.moe_parallel import TokenParallelLayout
 from xllm.python.model_executor import cp_utils
 from xllm.python.models import glm5_next
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
+
+# ``xllm.python.attention.npu_paged_attention`` imports ``torch_npu`` at
+# module scope; stub it when absent so the real-backend handoff tests below
+# (which need the real cache-write code paths, not a mocked backend) can
+# import ``NpuPagedAttentionBackend`` on a host without NPU hardware. The
+# stub is installed only when torch_npu cannot actually be imported: a
+# wheel-only install without CANN/libhccl.so still has a find_spec hit but
+# fails the real import, so probe by importing. In the NPU container the
+# real module stays in charge, and a bare entry a previously imported test
+# module may have left in ``sys.modules`` satisfies the import directly.
+# The stub is removed again after the imports below so the rest of the
+# pytest session sees the true absence -- including glm5_next's own
+# module-level reference: its try/except binds either the real module or
+# None, and leaving it bound to the stub would make
+# ``_load_compact_kpool_update_op``'s ``torch_npu is None`` capability
+# check falsely pass on hosts without torch_npu, driving far-away failures
+# in the Triton kpool loader. Restoring None keeps the fresh-process
+# semantics for every later collector in the same session.
+try:
+    import torch_npu  # noqa: F401
+
+    _torch_npu_stub_installed = False
+except Exception:  # no CANN / missing libhccl.so fails at import time
+    sys.modules.pop("torch_npu", None)
+    sys.modules["torch_npu"] = types.ModuleType("torch_npu")
+    _torch_npu_stub_installed = True
+
+from xllm.python.attention import npu_paged_attention as npu_paged_attention_module
+from xllm.python.attention.backend import LayerCache
+from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+
+if _torch_npu_stub_installed:
+    del sys.modules["torch_npu"]
+    # Both modules that carry a module-level torch_npu reference bound
+    # during the stub window are reset to the fresh-process no-torch_npu
+    # state: glm5_next's try/except (None fallback, keyed by capability
+    # checks) and npu_paged_attention's plain import (no fallback -- a
+    # bare None matches "module absent" for every reader that does not
+    # call through it, and the stub never satisfied attribute calls
+    # either). Leaving either bound to the stub would keep a state no
+    # fresh process without torch_npu could reach.
+    glm5_next.torch_npu = None
+    npu_paged_attention_module.torch_npu = None
 
 
 class _Embedding(nn.Module):
@@ -1335,3 +1380,855 @@ def test_cp_one_preserves_full_rows_without_shard_or_merge(monkeypatch) -> None:
     assert events == ["embedding", "layer_0", "layer_1", "norm"]
     torch.testing.assert_close(layers[0].positions, torch.tensor([[0, 1, 2, 3]], dtype=torch.int32))
     torch.testing.assert_close(output, torch.tensor([[13.0], [23.0], [33.0], [43.0]]))
+
+
+# ---------------------------------------------------------------------------
+# PCP x PD prefill-role evidence (from the pcp-pd-prefill-role branch):
+# cross-rank rank-invariance of both persistent-cache writers, and the
+# prefill-to-decode handoff parity suites with CPU reference kernels.
+# ---------------------------------------------------------------------------
+
+
+def test_kda_cp_backend_inputs_are_identical_regardless_of_local_rank(monkeypatch) -> None:
+    """Every CP rank must feed the backend the exact same globally-merged
+    tensors for the same logical batch — this is the R3/design.md §2 invariant
+    ("every CP rank ends its forward holding the complete, globally-correct
+    persistent-cache-write input") that Capability A's gate relaxation
+    depends on. The existing sibling tests in this file only exercise
+    ``_cp2_context(0)``; this test drives the *same* real (unmocked)
+    ``Glm5NextKdaAttention.forward`` through both CP ranks of a zigzag
+    ``cp_size=2`` batch and asserts the backend receives byte-identical
+    ``mixed_qkv``/``beta``/``raw_gate_proj`` regardless of which physical rank
+    ran the forward — i.e. the persistent linear-state write is rank-
+    invariant, so a non-CP Decode instance pulling from any Prefill CP rank's
+    cache (design.md §2.2) sees the same, globally-correct data.
+    """
+    # Global tokens [0, 1, 2, 3] with hidden values [1.0, 2.0, 3.0, 4.0].
+    # Zigzag cp_size=2: rank 0 owns tokens [0, 3], rank 1 owns tokens [1, 2].
+    # A real ``all_gather`` returns the same rank-major concatenation to every
+    # caller; the fake below keys each call's local shard by its contents and
+    # rebuilds the rank-major pair, so the gathered tensors -- and therefore
+    # everything the backend receives -- are a function of the rows the
+    # forward actually passed, not precomputed constants.
+    mixed_r0 = torch.tensor([[1.0, 1.0, 1.0], [4.0, 4.0, 4.0]])
+    mixed_r1 = torch.tensor([[2.0, 2.0, 2.0], [3.0, 3.0, 3.0]])
+    g_raw_r0 = torch.tensor([[[10.0]], [[40.0]]])
+    g_raw_r1 = torch.tensor([[[20.0]], [[30.0]]])
+    # beta_raw reaches the merge pre-activation: the recurrent kernel fuses
+    # the beta sigmoid in-kernel (see the forward's comment), so the backend
+    # must receive the merged raw beta, not a sigmoid of it.
+    beta_r0 = torch.tensor([[1.0], [4.0]])
+    beta_r1 = torch.tensor([[2.0], [3.0]])
+    shards_by_local: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+    shards_by_local.update(_shards_by_local(mixed_r0, mixed_r1))
+    shards_by_local.update(_shards_by_local(g_raw_r0, g_raw_r1))
+    shards_by_local.update(_shards_by_local(beta_r0, beta_r1))
+    gather = _patch_cp_gather_rank_major(monkeypatch, shards_by_local)
+
+    backend = MagicMock()
+    backend.execute_linear.return_value = torch.zeros(1, 4, 1, 1)
+
+    captured_by_rank: dict[int, dict[str, torch.Tensor]] = {}
+    for rank, local_hidden in ((0, torch.tensor([[[1.0], [4.0]]])), (1, torch.tensor([[[2.0], [3.0]]]))):
+        attention = _make_kda_attention_for_cross_rank_test()
+        cp_context = _cp2_context(rank)
+        backend.execute_linear.reset_mock()
+        with patch.object(
+            glm5_next,
+            "get_forward_context_or_none",
+            return_value=SimpleNamespace(attention_backend=backend, cp_context=cp_context),
+        ):
+            attention(local_hidden, torch.tensor([[0, 3]], dtype=torch.int32), torch.tensor([[True, True]]))
+        mixed_qkv, beta, layer = backend.execute_linear.call_args.args
+        assert layer is attention
+        captured_by_rank[rank] = {
+            "mixed_qkv": mixed_qkv,
+            "beta": beta,
+            "raw_gate_proj": backend.execute_linear.call_args.kwargs["raw_gate_proj"],
+        }
+
+    assert gather.call_count == 6
+    torch.testing.assert_close(captured_by_rank[0]["mixed_qkv"], captured_by_rank[1]["mixed_qkv"])
+    torch.testing.assert_close(captured_by_rank[0]["beta"], captured_by_rank[1]["beta"])
+    torch.testing.assert_close(captured_by_rank[0]["raw_gate_proj"], captured_by_rank[1]["raw_gate_proj"])
+    expected_hidden = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    torch.testing.assert_close(captured_by_rank[0]["mixed_qkv"], expected_hidden.view(1, 1, 4).expand(1, 3, 4))
+    torch.testing.assert_close(captured_by_rank[0]["raw_gate_proj"], expected_hidden.view(1, 4, 1, 1) * 10)
+    # The merged raw beta: the sigmoid is fused inside the recurrent kernel,
+    # so the persistent write the backend receives carries the pre-activation
+    # rows in global order.
+    torch.testing.assert_close(captured_by_rank[0]["beta"], expected_hidden.view(1, 4, 1))
+
+
+# ---------------------------------------------------------------------------
+# A3: CP-Prefill -> non-CP-Decode cache-handoff correctness (design.md §2.2).
+#
+# The rank-invariance tests above prove CP ranks feed the backend identical
+# *inputs*. This section proves the stronger, distinct property design.md §2.2
+# and R3 actually claim: a CP-Prefill's resulting *persistent cache state*,
+# handed to a cp_size=1 Decode continuation, produces the same output as a
+# plain cp_size=1 Prefill+Decode baseline. Everything here drives the real
+# (unmocked) ``Glm5NextKdaAttention.forward``/``execute_linear`` and a real
+# ``NpuPagedAttentionBackend`` with real CPU ``conv``/``ssm`` cache tensors,
+# following ``test_glm53_linear_state_io.py``'s pattern; only the innermost
+# NPU-only kernels (``chunk_kda_fwd``/``recurrent_kda``/native conv1d) are
+# replaced by deterministic, content-sensitive CPU reference implementations
+# (not exact hardware-numerics reproductions -- see docstring below).
+# ---------------------------------------------------------------------------
+
+
+def test_mla_cp_backend_inputs_are_identical_regardless_of_local_rank(monkeypatch) -> None:
+    """MLA/DSA analog of ``test_kda_cp_backend_inputs_are_identical_regardless_of_local_rank``.
+
+    R3's research (``research/r3-disagg-pd-pcp-feasibility.md`` §2.1) found
+    the same "merge-before-write, fully-replicated" structural mechanism
+    (``cp_merge_rows`` before the backend call) holds for
+    ``Glm5NextMlaAttention``'s KV/MLA-latent cache write and raw index-cache
+    write exactly as it does for KDA's ``linear_state`` write — both call
+    ``cp_merge_rows`` on the CP-sharded local input before handing it to the
+    backend/indexer. This test drives the same real (unmocked)
+    ``Glm5NextMlaAttention.forward`` through both CP ranks of a zigzag
+    ``cp_size=2`` batch and asserts the indexer (the raw index-cache/kPool
+    writer) and ``backend.execute_mla`` (the MLA-latent-cache writer) receive
+    byte-identical merged inputs regardless of which physical rank ran the
+    forward — i.e. both persistent-cache writes are rank-invariant, so a
+    non-CP Decode instance pulling from any Prefill CP rank's cache
+    (design.md §2.2) sees the same, globally-correct data.
+    """
+    # Global tokens [0, 1, 2, 3] with hidden values [1.0, 2.0, 3.0, 4.0].
+    # Zigzag cp_size=2: rank 0 owns tokens [0, 3], rank 1 owns tokens [1, 2].
+    # A real ``all_gather`` returns the same rank-major concatenation to every
+    # caller; the fake below keys each call's local shard by its contents and
+    # rebuilds the rank-major pair, so the merged tensors the indexer and the
+    # backend receive are a function of the rows the forward actually passed.
+    hidden_r0 = torch.tensor([[1.0], [4.0]])
+    hidden_r1 = torch.tensor([[2.0], [3.0]])
+    positions_r0 = torch.tensor([[0], [3]], dtype=torch.int32)
+    positions_r1 = torch.tensor([[1], [2]], dtype=torch.int32)
+    # Two cp_merge_rows calls per forward (hidden_states, position_ids) since
+    # this attention has its own indexer (no prev_topk_indices merge).
+    shards_by_local: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+    shards_by_local.update(_shards_by_local(hidden_r0, hidden_r1))
+    shards_by_local.update(_shards_by_local(positions_r0, positions_r1))
+    gather = _patch_cp_gather_rank_major(monkeypatch, shards_by_local)
+
+    indexer = MagicMock()
+    indexer.select_qli.return_value = torch.zeros(4, 1, 1, dtype=torch.int32)
+    backend = MagicMock()
+    backend.mla_index_context.return_value = object()
+    backend.execute_mla.return_value = torch.zeros(4, 1, 1)
+
+    captured_by_rank: dict[int, dict[str, torch.Tensor]] = {}
+    for rank, local_hidden, local_positions in (
+        (0, torch.tensor([[[1.0], [4.0]]]), torch.tensor([[0, 3]], dtype=torch.int32)),
+        (1, torch.tensor([[[2.0], [3.0]]]), torch.tensor([[1, 2]], dtype=torch.int32)),
+    ):
+        attention = _make_mla_attention(indexer)
+        cp_context = _cp2_context(rank)
+        indexer.select_qli.reset_mock()
+        backend.execute_mla.reset_mock()
+        with patch.object(
+            glm5_next,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+        ):
+            attention(local_hidden, local_positions, torch.tensor([[True, True]]))
+        index_args = indexer.select_qli.call_args.args
+        mla_args = backend.execute_mla.call_args.args
+        captured_by_rank[rank] = {
+            "index_hidden_states": index_args[0],
+            "index_position_ids": index_args[2],
+            "q_latent": mla_args[0],
+            "k_latent_3d": mla_args[2],
+        }
+
+    assert gather.call_count == 4
+    for key in ("index_hidden_states", "index_position_ids", "q_latent", "k_latent_3d"):
+        torch.testing.assert_close(captured_by_rank[0][key], captured_by_rank[1][key])
+    expected_hidden = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    torch.testing.assert_close(captured_by_rank[0]["index_hidden_states"].reshape(-1), expected_hidden)
+    torch.testing.assert_close(captured_by_rank[0]["k_latent_3d"].reshape(-1), expected_hidden)
+
+
+# ---------------------------------------------------------------------------
+# A3 (MLA/DSA analog of the KDA handoff test above).
+# ---------------------------------------------------------------------------
+
+_MLA_HANDOFF_BLOCK_SIZE = 8
+
+
+def test_kda_cp_prefill_to_decode_handoff_matches_noncp_baseline(monkeypatch, causal_conv1d_reference) -> None:
+    """A3 (implement.md): a CP-Prefill's resulting cache state, handed off to
+    a cp_size=1 Decode continuation, must produce the same output as a plain
+    cp_size=1 Prefill+Decode baseline for the same prompt.
+
+    This is a distinct, stronger property than the rank-invariance tests
+    above: those prove CP ranks compute byte-identical backend *inputs*; this
+    proves the resulting persistent *cache* is correct enough to continue
+    generation correctly, by actually running the real backend's
+    ``execute_linear`` (real conv1d + delta-rule state I/O, real
+    ``conv``/``ssm`` cache tensors) for both the CP-Prefill and the baseline,
+    then simulating the PD handoff described in design.md §2.2 by copying
+    rank-0's post-Prefill cache tensors -- the shard
+    ``pull_kv_blocks``' rank arithmetic actually transfers -- into a fresh
+    cp_size=1 Decode worker's identical cache slots.
+
+    ``causal_conv1d_reference`` (conftest.py) supplies the same CPU conv1d
+    reference every other pure-Python KDA test in this repository uses (e.g.
+    ``test_glm53_linear_state_io.py``); ``_install_kda_reference_kernels``
+    supplies the delta-rule stand-in this test file needs on top of it (see
+    its docstring for why exact hardware fidelity is not required).
+    """
+    del causal_conv1d_reference  # fixture side effect (patches native conv1d) is what's needed
+    _install_kda_reference_kernels(monkeypatch)
+
+    # ---- Baseline: plain cp_size=1 Prefill (4 tokens) + Decode (1 token). ----
+    conv_cache_baseline = torch.zeros(1, 1, 3, dtype=torch.float32)
+    ssm_cache_baseline = torch.zeros(1, 1, 1, 1, dtype=torch.float32)
+    backend_baseline = _kda_backend_with_cache(conv_cache_baseline, ssm_cache_baseline)
+    backend_baseline._metadata = _kda_prefill_metadata(4)
+    attention_baseline = _make_kda_attention_for_handoff_test()
+    with patch.object(
+        glm5_next,
+        "get_forward_context_or_none",
+        return_value=SimpleNamespace(attention_backend=backend_baseline, cp_context=None),
+    ):
+        attention_baseline(
+            torch.tensor([[[1.0], [2.0], [3.0], [4.0]]]),
+            torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            torch.ones(1, 4, dtype=torch.bool),
+        )
+    conv_cache_baseline_postprefill = conv_cache_baseline.clone()
+    ssm_cache_baseline_postprefill = ssm_cache_baseline.clone()
+    baseline_decode_output = _run_kda_decode_step(conv_cache_baseline, ssm_cache_baseline)
+
+    # ---- CP case: same prompt's Prefill under cp_size=2, rank 0. Per
+    # design.md §2.2, only rank 0's cache is what a cp_size=1 Decode instance
+    # actually pulls -- rank 1's cache is proven byte-identical to it by the
+    # rank-invariance test above, so re-deriving it here would not exercise
+    # anything new. ----
+    conv_cache_rank0 = torch.zeros(1, 1, 3, dtype=torch.float32)
+    ssm_cache_rank0 = torch.zeros(1, 1, 1, 1, dtype=torch.float32)
+    _run_kda_cp_rank_prefill(
+        0,
+        torch.tensor([[[1.0], [4.0]]]),
+        torch.tensor([[0, 3]], dtype=torch.int32),
+        conv_cache_rank0,
+        ssm_cache_rank0,
+        monkeypatch,
+    )
+
+    # Per design.md §2.2, rank 0's cache is the one a cp_size=1 Decode
+    # instance's `pull_kv_blocks` rank arithmetic actually transfers; it must
+    # exactly match the non-CP baseline's post-Prefill cache.
+    torch.testing.assert_close(conv_cache_rank0, conv_cache_baseline_postprefill)
+    torch.testing.assert_close(ssm_cache_rank0, ssm_cache_baseline_postprefill)
+
+    # ---- Simulated handoff: copy rank-0's cache into a fresh cp_size=1 Decode
+    # worker's identical cache-tensor slots (stands in for pull_kv_blocks). ----
+    conv_cache_handoff = conv_cache_rank0.clone()
+    ssm_cache_handoff = ssm_cache_rank0.clone()
+    handoff_decode_output = _run_kda_decode_step(conv_cache_handoff, ssm_cache_handoff)
+
+    torch.testing.assert_close(handoff_decode_output, baseline_decode_output)
+
+
+def test_mla_cp_prefill_to_decode_handoff_matches_noncp_baseline(monkeypatch) -> None:
+    """MLA/DSA analog of ``test_kda_cp_prefill_to_decode_handoff_matches_noncp_baseline``.
+
+    Drives the real (unmocked) ``Glm5NextMlaAttention.forward`` /
+    ``NpuPagedAttentionBackend.execute_mla`` -- including the real
+    ``write_mla_paged_cache`` -> ``reshape_paged_cache`` KV/latent-cache write
+    and the real ``_update_mla_index_cache`` raw index-cache write -- for both
+    a plain cp_size=1 Prefill+Decode baseline and a cp_size=2 CP-Prefill,
+    then simulates the design.md §2.2 PD handoff by copying rank 0's
+    post-Prefill ``nope_cache``/``index_cache`` into a fresh cp_size=1 Decode
+    worker. Only the innermost NPU-only sparse-attention score kernel
+    (``_mla_sparse``) and the ``reshape_paged_cache`` custom op are replaced
+    by deterministic CPU reference implementations (see their docstrings);
+    the indexer's ``select_qli`` is a minimal content-writing stand-in (see
+    ``_index_writer_with_attend_all_topk``) rather than the real kPool
+    compression machinery, which is orthogonal to the KV/latent-cache and
+    index-cache write paths this test targets.
+
+    The final decode *output* assertion is sensitive to ``nope_cache``
+    corruption (the reference attention kernel reads it) but not to
+    ``index_cache`` corruption (the stand-in indexer does not gate its topk
+    on index-cache content) -- so ``index_cache`` correctness is checked by
+    a direct tensor-equality assertion instead, immediately after Prefill.
+    """
+    monkeypatch.setattr(torch.ops.xllm_ops, "reshape_paged_cache", _mla_reshape_paged_cache_reference, raising=False)
+
+    # ---- Baseline: plain cp_size=1 Prefill (4 tokens) + Decode (1 token). ----
+    nope_cache_baseline = torch.zeros(1, _MLA_HANDOFF_BLOCK_SIZE, 1, 1, dtype=torch.float32)
+    index_cache_baseline = torch.zeros(1, _MLA_HANDOFF_BLOCK_SIZE, 1, 1, dtype=torch.float32)
+    backend_baseline = _mla_handoff_backend(nope_cache_baseline, index_cache_baseline)
+    indexer_baseline = MagicMock()
+    indexer_baseline.select_qli.side_effect = _index_writer_with_attend_all_topk
+    attention_baseline = _make_mla_attention(indexer_baseline)
+    _mla_handoff_prepare(
+        backend_baseline,
+        slot_mapping=torch.arange(4, dtype=torch.int64),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([4], dtype=torch.int64),
+        q_cu_seq_lens=torch.tensor([0, 4], dtype=torch.int32),
+        is_prefill=True,
+    )
+    with (
+        patch.object(
+            backend_baseline,
+            "_mla_sparse",
+            lambda *args, **kwargs: _mla_sparse_reference(backend_baseline, *args, **kwargs),
+        ),
+        patch.object(
+            glm5_next,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=None, attention_backend=backend_baseline),
+        ),
+        patch.object(
+            npu_paged_attention_module,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=None, attention_backend=backend_baseline),
+        ),
+    ):
+        attention_baseline(
+            torch.tensor([[[1.0], [2.0], [3.0], [4.0]]]),
+            torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            torch.ones(1, 4, dtype=torch.bool),
+        )
+    nope_cache_baseline_postprefill = nope_cache_baseline.clone()
+    index_cache_baseline_postprefill = index_cache_baseline.clone()
+    baseline_decode_output = _run_mla_decode_step(nope_cache_baseline, index_cache_baseline)
+
+    # ---- CP case: same prompt's Prefill under cp_size=2, rank 0. ----
+    nope_cache_rank0 = torch.zeros(1, _MLA_HANDOFF_BLOCK_SIZE, 1, 1, dtype=torch.float32)
+    index_cache_rank0 = torch.zeros(1, _MLA_HANDOFF_BLOCK_SIZE, 1, 1, dtype=torch.float32)
+    _run_mla_cp_rank_prefill(
+        0,
+        torch.tensor([[[1.0], [4.0]]]),
+        torch.tensor([[0, 3]], dtype=torch.int32),
+        nope_cache_rank0,
+        index_cache_rank0,
+        monkeypatch,
+    )
+
+    # Per design.md §2.2, rank 0's cache is the one a cp_size=1 Decode
+    # instance's `pull_kv_blocks` rank arithmetic actually transfers; it must
+    # exactly match the non-CP baseline's post-Prefill cache -- both the
+    # KV/latent cache (attends/decodes correctly, checked via decode output
+    # below) and the raw index cache (checked directly here; see docstring).
+    torch.testing.assert_close(nope_cache_rank0, nope_cache_baseline_postprefill)
+    torch.testing.assert_close(index_cache_rank0, index_cache_baseline_postprefill)
+
+    # ---- Simulated handoff: copy rank-0's cache into a fresh cp_size=1 Decode
+    # worker's identical cache-tensor slots (stands in for pull_kv_blocks). ----
+    nope_cache_handoff = nope_cache_rank0.clone()
+    index_cache_handoff = index_cache_rank0.clone()
+
+    # The decode-output assertion below is sensitive to nope_cache corruption
+    # (the reference attention kernel reads it) but, per the docstring, not to
+    # index_cache corruption (the stand-in indexer does not gate its topk on
+    # index-cache content) -- so assert the handoff copy itself landed the
+    # right content directly, rather than relying on an insensitive output.
+    torch.testing.assert_close(index_cache_handoff, index_cache_baseline_postprefill)
+
+    handoff_decode_output = _run_mla_decode_step(nope_cache_handoff, index_cache_handoff)
+
+    torch.testing.assert_close(handoff_decode_output, baseline_decode_output)
+
+
+def _make_kda_attention_for_cross_rank_test() -> glm5_next.Glm5NextKdaAttention:
+    attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
+    nn.Module.__init__(attention)
+    # main's forward opens with wait_for_layer_load(self.layer_id) (the host
+    # cache store-reuse fix); the thread-local load context is absent in
+    # these tests, so the call is a no-op, but the attribute must exist.
+    attention.layer_id = 0
+    attention.hidden_size = 1
+    attention.head_dim = 1
+    attention.qkv_dim = 1
+    attention.conv_dim = 3
+    attention.num_heads_local = 1
+    attention.tp = 1
+    attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
+        (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
+        dim=-1,
+    )
+    attention.input_projection_sizes = (3, 1, 2)
+    attention.forget_gate = SimpleNamespace(raw_projection=lambda hidden: hidden.unsqueeze(-1) * 10)
+    attention.g_b_proj = lambda hidden: hidden * 100
+    attention._fg_b_weight = None
+    attention.o_norm = MagicMock(side_effect=lambda core, gate: core + gate)
+    attention.o_proj = nn.Identity()
+    return attention
+
+
+def _make_kda_attention_for_handoff_test() -> glm5_next.Glm5NextKdaAttention:
+    """Real ``Glm5NextKdaAttention`` driven through the real backend, unlike
+    ``_make_kda_attention_for_cross_rank_test`` (mocked backend). Needs a real
+    ``forget_gate`` (``raw_projection``/``gate_from_raw``) and conv weights
+    because ``execute_linear`` calls them for real."""
+    attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
+    nn.Module.__init__(attention)
+    attention.layer_id = 0
+    attention.hidden_size = 1
+    attention.head_dim = 1
+    attention.qkv_dim = 1
+    attention.conv_dim = 3
+    attention.conv_kernel_size = 2
+    attention.conv_weight_t = torch.ones(2, 3, dtype=torch.float32)
+    attention.activation = "identity"
+    attention.num_heads_local = 1
+    attention.tp = 1
+    attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
+        (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
+        dim=-1,
+    )
+    attention.input_projection_sizes = (3, 1, 2)
+    attention.forget_gate = SimpleNamespace(
+        raw_projection=lambda hidden: hidden.unsqueeze(-1),
+        safe_gate_lower_bound=None,
+        gate_from_raw=lambda raw: -0.5 * torch.sigmoid(raw),
+    )
+    attention.g_b_proj = lambda hidden: hidden * 100
+    attention._fg_b_weight = None
+    attention.o_norm = lambda core, gate: core + gate
+    attention.o_proj = nn.Identity()
+    return attention
+
+
+def _shards_by_local(
+    rank0_shard: torch.Tensor,
+    rank1_shard: torch.Tensor,
+) -> dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]]:
+    """Map each rank's local shard to the (rank0, rank1) pair it belongs to."""
+    return {
+        tuple(rank0_shard.reshape(-1).tolist()): (rank0_shard, rank1_shard),
+        tuple(rank1_shard.reshape(-1).tolist()): (rank0_shard, rank1_shard),
+    }
+
+
+def _patch_cp_gather_rank_major(
+    monkeypatch,
+    shards_by_local: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]],
+) -> MagicMock:
+    """Content-dependent rank-major fake for the CP ``all_gather``.
+
+    A real all_gather returns the same rank-major concatenation -- rank 0's
+    local shard first, rank 1's second -- to every caller, whichever rank
+    invoked it. The fake identifies the caller's local shard by its contents
+    and rebuilds that shard's rank-major pair, so the gathered tensor is a
+    function of what the forward actually passed: a rank-mixup or a merge
+    that consumes the wrong rank's rows changes the gathered tensor and
+    fails the downstream asserts, instead of comparing two constants.
+    """
+
+    def all_gather(value: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+        assert dim == 0
+        assert world_size == 2
+        assert group_name == "cp"
+        key = tuple(value.reshape(-1).tolist())
+        rank0_shard, rank1_shard = shards_by_local[key]
+        return torch.cat([rank0_shard, rank1_shard], dim=0)
+
+    gather = MagicMock(side_effect=all_gather)
+    monkeypatch.setattr(glm5_next.distributed, "all_gather", gather, raising=False)
+    return gather
+
+
+def _kda_backend_with_cache(conv_cache: torch.Tensor, ssm_cache: torch.Tensor) -> NpuPagedAttentionBackend:
+    backend = object.__new__(NpuPagedAttentionBackend)
+    backend._kv_caches = [LayerCache(key=None, value=None, conv=conv_cache, ssm=ssm_cache)]
+    backend._metadata = None
+    backend._kda_verify_width = 1
+    return backend
+
+
+def _kda_prefill_metadata(num_tokens: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        linear_state_indices=torch.tensor([0], dtype=torch.int32),
+        linear_state_read_indices=torch.tensor([0], dtype=torch.int32),
+        linear_state_write_indices=torch.tensor([0], dtype=torch.int32),
+        has_initial_state=torch.tensor([0], dtype=torch.int64),
+        is_prefill=True,
+        is_chunked_prefill=False,
+        q_cu_seq_lens=torch.tensor([0, num_tokens], dtype=torch.int32),
+        kv_seq_lens=None,
+        expanded_decode_metadata=None,
+    )
+
+
+def _kda_decode_metadata() -> SimpleNamespace:
+    return SimpleNamespace(
+        linear_state_indices=torch.tensor([0], dtype=torch.int32),
+        linear_state_read_indices=None,
+        linear_state_write_indices=None,
+        has_initial_state=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        q_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+        kv_seq_lens=None,
+        expanded_decode_metadata=None,
+    )
+
+
+def _install_kda_reference_kernels(monkeypatch) -> None:
+    """Install the two reference kernels above as ``fla_npu.ops.ascendc``.
+
+    ``execute_linear`` imports ``fla_npu.ops.ascendc`` lazily (inside the
+    function body), so patching ``sys.modules`` -- reverted automatically by
+    ``monkeypatch`` -- is enough; no need to reload any already-imported
+    module.
+    """
+    ascendc = types.ModuleType("fla_npu.ops.ascendc")
+    ascendc.chunk_kda_fwd = _chunk_kda_fwd_reference
+    ascendc.recurrent_kda = _recurrent_kda_reference
+    fla_npu_ops = types.ModuleType("fla_npu.ops")
+    fla_npu_ops.ascendc = ascendc
+    fla_npu = types.ModuleType("fla_npu")
+    fla_npu.ops = fla_npu_ops
+    monkeypatch.setitem(sys.modules, "fla_npu", fla_npu)
+    monkeypatch.setitem(sys.modules, "fla_npu.ops", fla_npu_ops)
+    monkeypatch.setitem(sys.modules, "fla_npu.ops.ascendc", ascendc)
+
+
+def _chunk_kda_fwd_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor | None,
+    beta: torch.Tensor,
+    scale: float,
+    **kwargs: object,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic, content-sensitive stand-in for the real NPU kernel.
+
+    Not a reproduction of the real delta-rule numerics (no such CPU kernel
+    exists in this repository to fall back to -- see
+    ``test_glm53_linear_state_io.py``'s ``_install_kda_stubs`` for the
+    existing precedent of stubbing this same kernel with placeholder math).
+    What A3 needs is a real, deterministic, *content-sensitive* recurrence
+    that a corrupted cache handoff would visibly perturb; exact hardware
+    fidelity is not required because both the CP-derived and non-CP baseline
+    decode runs go through this same reference, so any mismatch between them
+    can only come from the cache-handoff plumbing under test, not from
+    reference-kernel error.
+    """
+    initial_state = kwargs["initial_state"].float()
+    batch_size, seq_len, num_heads, head_dim = query.shape
+    state = initial_state.clone()
+    output = torch.zeros(batch_size, seq_len, num_heads, head_dim, dtype=torch.float32)
+    query_f, key_f, value_f, beta_f = query.float(), key.float(), value.float(), beta.float()
+    for b in range(batch_size):
+        for h in range(num_heads):
+            running_state = state[b, h].clone()
+            for t in range(seq_len):
+                decay = _kda_reference_gate_decay(gate[b, t, h].float()).mean() if gate is not None else 1.0
+                running_state = decay * running_state + beta_f[b, t, h] * torch.outer(key_f[b, t, h], value_f[b, t, h])
+                output[b, t, h] = scale * (query_f[b, t, h].unsqueeze(0) @ running_state).squeeze(0)
+            state[b, h] = running_state
+    return output.to(query.dtype), state
+
+
+def _recurrent_kda_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor | None,
+    beta: torch.Tensor,
+    **kwargs: object,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode-side counterpart of :func:`_chunk_kda_fwd_reference` (see its
+    docstring for why exact hardware fidelity is not required here)."""
+    initial_state = kwargs["initial_state"].float()
+    scale = kwargs.get("scale", 1.0)
+    total_tokens, num_heads, head_dim = query.shape
+    state = initial_state.clone()
+    output = torch.zeros(total_tokens, num_heads, head_dim, dtype=torch.float32)
+    query_f, key_f, value_f, beta_f = query.float(), key.float(), value.float(), beta.float()
+    for t in range(total_tokens):
+        for h in range(num_heads):
+            decay = _kda_reference_gate_decay(gate[t, h].float()).mean() if gate is not None else 1.0
+            row = t if state.shape[0] == total_tokens else 0
+            running_state = decay * state[row, h].clone() + beta_f[t, h] * torch.outer(key_f[t, h], value_f[t, h])
+            output[t, h] = scale * (query_f[t, h].unsqueeze(0) @ running_state).squeeze(0)
+            state[row, h] = running_state
+    return output.to(query.dtype), state
+
+
+def _kda_reference_gate_decay(gate: torch.Tensor) -> torch.Tensor:
+    return torch.exp(gate)
+
+
+def _index_writer_with_attend_all_topk(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    positions: torch.Tensor,
+    attention_mask: torch.Tensor,
+    ctx: object,
+    *rest: object,
+) -> torch.Tensor:
+    """``select_qli`` stand-in: writes real, content-derived rows into the
+    real index cache via ``ctx.update_index_cache`` (exercising the real
+    ``NpuPagedAttentionBackend._update_mla_index_cache`` write path this
+    test targets), then returns an "attend to every valid KV position" topk.
+    This sidesteps kPool's compression/Triton machinery (out of scope for
+    A3, which targets the KV/latent-cache and raw index-cache *write* paths,
+    not the indexer's internal selection logic) while still genuinely
+    writing and later comparing the index cache's content.
+    """
+    del qr, attention_mask
+    num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
+    packed = hidden_states.reshape(num_tokens, -1) * 1000  # distinguishable from raw hidden values
+    ctx.update_index_cache(packed, None)
+    kv_len = int(ctx.actual_seq_kv.reshape(-1)[-1].item())
+    return torch.arange(kv_len, dtype=torch.int32).view(1, 1, -1).expand(num_tokens, 1, -1)
+
+
+def _run_kda_cp_rank_prefill(
+    rank: int,
+    local_hidden: torch.Tensor,
+    local_positions: torch.Tensor,
+    conv_cache: torch.Tensor,
+    ssm_cache: torch.Tensor,
+    monkeypatch,
+) -> None:
+    """Run one CP rank's real Prefill forward, writing into ``conv_cache``/
+    ``ssm_cache`` for real via the real backend."""
+    gathered_mixed_qkv = torch.tensor([[1.0, 1.0, 1.0], [4.0, 4.0, 4.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0]])
+    gathered_g_raw = torch.tensor([[[1.0]], [[4.0]], [[2.0]], [[3.0]]])
+    # Raw (pre-sigmoid) beta: the model layer merges ``beta_raw`` and
+    # ``execute_linear`` applies the sigmoid itself, so a real ``all_gather``
+    # of the merged tensor returns the raw rank-major projection.
+    gathered_beta = torch.tensor([[1.0], [4.0], [2.0], [3.0]])
+    gather = MagicMock(side_effect=[gathered_mixed_qkv, gathered_g_raw, gathered_beta])
+    backend = _kda_backend_with_cache(conv_cache, ssm_cache)
+    backend._metadata = _kda_prefill_metadata(4)
+    attention = _make_kda_attention_for_handoff_test()
+    cp_context = _cp2_context(rank)
+    monkeypatch.setattr(glm5_next.distributed, "all_gather", gather, raising=False)
+    with patch.object(
+        glm5_next,
+        "get_forward_context_or_none",
+        return_value=SimpleNamespace(attention_backend=backend, cp_context=cp_context),
+    ):
+        attention(local_hidden, local_positions, torch.tensor([[True, True]]))
+
+
+def _run_kda_decode_step(
+    conv_cache: torch.Tensor,
+    ssm_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Run one plain (cp_size=1) Decode step against the given cache and
+    return the layer's output tensor."""
+    backend = _kda_backend_with_cache(conv_cache, ssm_cache)
+    backend._metadata = _kda_decode_metadata()
+    attention = _make_kda_attention_for_handoff_test()
+    with patch.object(
+        glm5_next,
+        "get_forward_context_or_none",
+        return_value=SimpleNamespace(attention_backend=backend, cp_context=None),
+    ):
+        return attention(
+            torch.tensor([[[5.0]]]), torch.tensor([[4]], dtype=torch.int32), torch.ones(1, 1, dtype=torch.bool)
+        )
+
+
+def _mla_handoff_backend(nope_cache: torch.Tensor, index_cache: torch.Tensor) -> NpuPagedAttentionBackend:
+    backend = object.__new__(NpuPagedAttentionBackend)
+    backend._kv_caches = [LayerCache(key=nope_cache, value=None, index=index_cache)]
+    backend._metadata = None
+    backend._is_mla = True
+    backend._uses_sparse_mla = True
+    backend.scale = 1.0
+    backend._block_table_i32 = None
+    backend._mla_quant_indexer_metadata = {}
+    backend._graph_workspace = None
+    backend._graph_outputs = {}
+    backend._graph_lses = {}
+    backend._page_size = _MLA_HANDOFF_BLOCK_SIZE
+    backend._kpool_cache_triton_compatible = (False,)
+    # ``prepare`` reads these two regardless of the metadata shape; the XFIA
+    # decode fast path stays off and no KDA speculative checkpointing runs.
+    backend._use_xfia_decode = False
+    backend._kda_checkpoint_stride = None
+    return backend
+
+
+def _mla_handoff_prepare(
+    backend: NpuPagedAttentionBackend,
+    *,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    kv_seq_lens: torch.Tensor,
+    q_cu_seq_lens: torch.Tensor,
+    is_prefill: bool,
+) -> None:
+    metadata = SimpleNamespace(
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        kv_seq_lens=kv_seq_lens,
+        q_cu_seq_lens=q_cu_seq_lens,
+        q_seq_lens=None,
+        is_prefill=is_prefill,
+        is_chunked_prefill=False,
+        has_kv_shard=False,
+        kv_split_size=1,
+        local_slot_mapping=None,
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=None,
+        q_cu_host_values=None,
+    )
+    backend.prepare(metadata)
+
+
+def _mla_reshape_paged_cache_reference(
+    slot_mapping: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> None:
+    """CPU reference for the real ``reshape_paged_cache`` op, mirroring
+    ``xllm/core/kernels/cuda/reshape_paged_cache.cu``'s per-slot scatter:
+    ``slot // block_size`` selects the block, ``slot % block_size`` the
+    offset within it; negative slots are padding and are skipped. GLM-5.3's
+    NoPE MLA aliases ``key_cache``/``value_cache`` to the same ``nope_cache``
+    tensor (see ``write_mla_paged_cache``), so this writes it twice
+    (redundant but harmless, matching the real op's contract).
+    """
+    slots = slot_mapping.reshape(-1).tolist()
+    num_kv_heads, head_dim = keys.shape[-2], keys.shape[-1]
+    key_flat = key_cache.view(-1, num_kv_heads, head_dim)
+    value_flat = value_cache.view(-1, num_kv_heads, head_dim)
+    for row, slot in enumerate(slots):
+        if slot < 0:
+            continue
+        key_flat[slot].copy_(keys[row])
+        value_flat[slot].copy_(values[row])
+
+
+def _mla_sparse_reference(
+    backend: NpuPagedAttentionBackend,
+    q_latent: torch.Tensor,
+    q_pe: torch.Tensor | None,
+    nope_cache: torch.Tensor,
+    rope_cache: torch.Tensor | None,
+    topk: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_q: torch.Tensor,
+    actual_seq_kv: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    """Deterministic, content-sensitive CPU stand-in for the real
+    ``npu_sparse_flash_attention`` kernel: dense scaled-dot-product softmax
+    attention over every valid cached KV position addressed through
+    ``block_table`` (this test's tiny per-sequence ``topk`` always selects
+    every valid position -- a degenerate case of top-k -- so ``topk`` itself
+    is unused here; see ``_index_writer_with_attend_all_topk`` below).
+
+    As with the KDA reference kernels, exact hardware-numerics fidelity is
+    not required: what A3 needs is a real read of ``nope_cache`` that is
+    sensitive to its content, so a corrupted cache-handoff copy is visible in
+    the decode output. Both the CP-derived and non-CP baseline runs go
+    through this same reference.
+    """
+    del q_pe, rope_cache, topk, layer_id
+    kv_lens = actual_seq_kv.reshape(-1).tolist()
+    q_ends = actual_seq_q.reshape(-1).tolist()
+    q_starts = [0, *q_ends[:-1]]
+    num_heads = q_latent.shape[1]
+    output = torch.zeros_like(q_latent)
+    flat_cache = nope_cache.view(-1, nope_cache.shape[-2], nope_cache.shape[-1])
+    for seq_idx, (kv_len, q_start, q_end) in enumerate(zip(kv_lens, q_starts, q_ends)):
+        block_row = block_table[seq_idx]
+        keys = []
+        for position in range(kv_len):
+            block_idx = int(block_row[position // _MLA_HANDOFF_BLOCK_SIZE].item())
+            offset = position % _MLA_HANDOFF_BLOCK_SIZE
+            keys.append(flat_cache[block_idx * _MLA_HANDOFF_BLOCK_SIZE + offset])
+        keys_tensor = torch.stack(keys, dim=0).float()  # [kv_len, num_heads, kv_lora]
+        for row in range(q_start, q_end):
+            query_row = q_latent[row].float()  # [num_heads, kv_lora]
+            for head in range(num_heads):
+                scores = (keys_tensor[:, head, :] * query_row[head].unsqueeze(0)).sum(-1) * backend.scale
+                weights = torch.softmax(scores, dim=0)
+                output[row, head] = (weights.unsqueeze(-1) * keys_tensor[:, head, :]).sum(0).to(output.dtype)
+    return output
+
+
+def _run_mla_cp_rank_prefill(
+    rank: int,
+    local_hidden: torch.Tensor,
+    local_positions: torch.Tensor,
+    nope_cache: torch.Tensor,
+    index_cache: torch.Tensor,
+    monkeypatch,
+) -> None:
+    """Run one CP rank's real Prefill forward, writing into ``nope_cache``/
+    ``index_cache`` for real via the real backend."""
+    gathered_hidden = torch.tensor([[1.0], [4.0], [2.0], [3.0]])
+    gathered_positions = torch.tensor([[0], [3], [1], [2]], dtype=torch.int32)
+    gather = MagicMock(side_effect=[gathered_hidden, gathered_positions])
+    backend = _mla_handoff_backend(nope_cache, index_cache)
+    indexer = MagicMock()
+    indexer.select_qli.side_effect = _index_writer_with_attend_all_topk
+    attention = _make_mla_attention(indexer)
+    cp_context = _cp2_context(rank)
+    _mla_handoff_prepare(
+        backend,
+        slot_mapping=torch.arange(4, dtype=torch.int64),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([4], dtype=torch.int64),
+        q_cu_seq_lens=torch.tensor([0, 4], dtype=torch.int32),
+        is_prefill=True,
+    )
+    monkeypatch.setattr(glm5_next.distributed, "all_gather", gather, raising=False)
+    with (
+        patch.object(backend, "_mla_sparse", lambda *args, **kwargs: _mla_sparse_reference(backend, *args, **kwargs)),
+        patch.object(
+            glm5_next,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+        ),
+        patch.object(
+            npu_paged_attention_module,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+        ),
+    ):
+        attention(local_hidden, local_positions, torch.tensor([[True, True]]))
+
+
+def _run_mla_decode_step(nope_cache: torch.Tensor, index_cache: torch.Tensor) -> torch.Tensor:
+    """Run one plain (cp_size=1) Decode step (5th token) against the given
+    cache and return the layer's output tensor."""
+    backend = _mla_handoff_backend(nope_cache, index_cache)
+    indexer = MagicMock()
+    indexer.select_qli.side_effect = _index_writer_with_attend_all_topk
+    attention = _make_mla_attention(indexer)
+    _mla_handoff_prepare(
+        backend,
+        slot_mapping=torch.tensor([4], dtype=torch.int64),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([5], dtype=torch.int64),
+        q_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
+        is_prefill=False,
+    )
+    with (
+        patch.object(backend, "_mla_sparse", lambda *args, **kwargs: _mla_sparse_reference(backend, *args, **kwargs)),
+        patch.object(
+            glm5_next,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=None, attention_backend=backend),
+        ),
+        patch.object(
+            npu_paged_attention_module,
+            "get_forward_context",
+            return_value=SimpleNamespace(cp_context=None, attention_backend=backend),
+        ),
+    ):
+        output, _ = attention(
+            torch.tensor([[[5.0]]]), torch.tensor([[4]], dtype=torch.int32), torch.ones(1, 1, dtype=torch.bool)
+        )
+    return output

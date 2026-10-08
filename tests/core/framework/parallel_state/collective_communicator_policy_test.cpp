@@ -103,6 +103,19 @@ TEST(CollectiveCommunicatorPolicyTest, MoETpGroupIdentityFollowsReusePolicy) {
                                 /*tp_size=*/2,
                                 /*moe_tp_size=*/4),
             &world_group);
+  // dp_size > 1 with moe_tp_size == tp_size is the width
+  // resolve_moe_tp_size() returns for an opted-in caller whatever dp_size says,
+  // so it is what a wrongly-set `moe_tp_scoped_to_cp_cohort` flag would produce
+  // here. The selection must still refuse the cohort's TP communicator: the
+  // caller-side dp_size == 1 gate (worker_server.cpp) keeps the published flag
+  // and the chosen group consistent, and this pins the half that makes a wrong
+  // flag harmless instead of world-mixing.
+  EXPECT_EQ(select_moe_tp_group(&tp_group,
+                                &world_group,
+                                /*dp_size=*/2,
+                                /*tp_size=*/4,
+                                /*moe_tp_size=*/4),
+            &world_group);
 }
 
 }  // namespace

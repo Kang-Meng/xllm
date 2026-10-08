@@ -31,6 +31,29 @@ limitations under the License.
 
 namespace xllm {
 
+bool same_instance_layout(const WorkerCacheLayoutManifest& source,
+                          const WorkerCacheLayoutManifest& destination,
+                          std::vector<std::string>* mismatched_fields) {
+  std::vector<std::string> mismatches;
+  if (source.schema_version != destination.schema_version) {
+    mismatches.emplace_back("schema_version");
+  }
+  if (source.fingerprint != destination.fingerprint) {
+    mismatches.emplace_back("fingerprint");
+  }
+  if (source.backend != destination.backend) {
+    mismatches.emplace_back("backend");
+  }
+  if (source.layout_family != destination.layout_family) {
+    mismatches.emplace_back("layout_family");
+  }
+  const bool same_layout = mismatches.empty();
+  if (mismatched_fields != nullptr) {
+    *mismatched_fields = std::move(mismatches);
+  }
+  return same_layout;
+}
+
 namespace {
 
 struct AtomicLogicalRegion {
@@ -137,10 +160,7 @@ Status validate_compatibility(const WorkerCacheLayoutManifest& source,
     return invalid("invalid destination layout: " +
                    destination_status.message());
   }
-  if (source.schema_version != destination.schema_version ||
-      source.fingerprint != destination.fingerprint ||
-      source.backend != destination.backend ||
-      source.layout_family != destination.layout_family) {
+  if (!same_instance_layout(source, destination)) {
     return invalid("source and destination cache layouts are incompatible");
   }
   if (!supports_partition_pair(source.coordinates, destination.coordinates)) {
@@ -515,10 +535,7 @@ Status validate_source_instance(
   if (!reference_status.ok()) {
     return invalid("invalid source layout: " + reference_status.message());
   }
-  if (reference.schema_version != destination.schema_version ||
-      reference.fingerprint != destination.fingerprint ||
-      reference.backend != destination.backend ||
-      reference.layout_family != destination.layout_family) {
+  if (!same_instance_layout(reference, destination)) {
     return invalid("source and destination instance layouts are incompatible");
   }
   if (!supports_partition_layout(reference.coordinates,
