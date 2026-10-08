@@ -27,6 +27,7 @@ limitations under the License.
 #include <sstream>
 
 #include "core/framework/config/kv_cache_config.h"
+#include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "util/utils.h"
 #if defined(USE_MLU)
@@ -680,6 +681,21 @@ std::optional<std::string> validate_host_cache_options(
                  "offload requires both conv and SSM tensors";
     violations.emplace_back(violation.str());
   }
+  // FRACTAL_NZ pools (NPU deepseek_v3 family with prefix cache, see
+  // use_npu_nz_kv_cache_layout) keep an interleaved physical layout that the
+  // zero-copy fold views cannot refold, so kv split indexer pages or a
+  // replicated draft pool cannot be host-offloaded over that layout. The
+  // fold path rejects such tensors as an internal invariant backstop; this
+  // rule must also fire here, before workers allocate caches.
+  if (options.is_npu_platform && options.needs_transfer_folding &&
+      use_npu_nz_kv_cache_layout(options.model_type)) {
+    std::ostringstream violation;
+    violation << "model \"" << options.model_type
+              << "\" allocates FRACTAL_NZ KV pools on NPU under prefix "
+                 "caching; host offload does not support kv split / "
+                 "replicated draft pools over that layout";
+    violations.emplace_back(violation.str());
+  }
 
   if (violations.empty()) {
     return std::nullopt;
@@ -717,6 +733,84 @@ std::vector<int64_t> build_host_group_tensor_shape(
       build_host_tensor_shape(base_shape, host_blocks_factor);
   host_shape.insert(host_shape.begin() + 1, layer_count);
   return host_shape;
+}
+
+std::vector<int64_t> fold_shape_for_host_transfer(
+    const std::vector<int64_t>& shape,
+    KVCacheTensorRole::Value role,
+    int64_t replicated_block_pages) {
+  // One row-count source of truth: physical_rows_per_resource() encodes the
+  // same rule the Mooncake manifest path records, so the host transfer and
+  // the manifest cannot drift apart. LINEAR roles never reach the fold (they
+  // pre-view their checkpoint stride), so the stride stays 1 here.
+  const int64_t pages =
+      physical_rows_per_resource(role,
+                                 std::max<int64_t>(replicated_block_pages, 1),
+                                 /*ssm_checkpoint_stride=*/1);
+  // P=1 pools keep the raw shape; folding below needs at least a
+  // [rows, per-row-dims...] layout to merge rows into dim 1.
+  if (pages <= 1) {
+    return shape;
+  }
+  CHECK_GE(shape.size(), 2)
+      << "a folded cache shape needs at least [rows, tokens] for role "
+      << static_cast<int32_t>(role);
+  CHECK_EQ(shape[0] % pages, 0)
+      << "cache shape rows must be divisible by pages-per-block for role "
+      << static_cast<int32_t>(role);
+  std::vector<int64_t> folded = shape;
+  folded[0] /= pages;
+  folded[1] *= pages;
+  return folded;
+}
+
+#if defined(USE_NPU)
+namespace {
+// A view() only rewrites the logical descriptor of a cache tensor. Pools
+// allocated in FRACTAL_NZ (deepseek_v3 / deepseek_v3_mtp with prefix cache,
+// see get_npu_kv_cache_format()) still report contiguous logical strides,
+// but their physical storage stays interleaved, so every host/device copy
+// through a folded view mis-addresses rows. Casting to ND inside the fold
+// would not make the combination correct either: npu_format_cast
+// materializes a copy, and the folded tensor is registered once as the
+// pool's transfer tensor, so later pool writes would stay invisible to
+// every D2H and an H2D would land in the copy. Folding such a pool must
+// fail here instead of silently corrupting transfers.
+bool has_foldable_storage_format(const torch::Tensor& tensor) {
+  if (!tensor.device().is_privateuseone()) {
+    return true;
+  }
+  return at_npu::native::get_npu_format(tensor) == ACL_FORMAT_ND;
+}
+}  // namespace
+#endif
+
+torch::Tensor fold_tensor_rows_for_transfer(const torch::Tensor& tensor,
+                                            KVCacheTensorRole::Value role,
+                                            int64_t replicated_block_pages) {
+  const int64_t pages =
+      physical_rows_per_resource(role,
+                                 std::max<int64_t>(replicated_block_pages, 1),
+                                 /*ssm_checkpoint_stride=*/1);
+  if (pages <= 1 || !tensor.defined() || tensor.numel() == 0) {
+    return tensor;
+  }
+  CHECK(tensor.is_contiguous())
+      << "host transfer folding requires a contiguous cache tensor for role "
+      << static_cast<int32_t>(role);
+#if defined(USE_NPU)
+  CHECK(has_foldable_storage_format(tensor))
+      << "host transfer folding requires an ND-format NPU cache tensor for "
+         "role "
+      << static_cast<int32_t>(role)
+      << ": a FRACTAL_NZ pool (deepseek_v3/deepseek_v3_mtp with prefix "
+         "cache) keeps an interleaved physical layout that a view cannot "
+         "refold; kv split / replicated draft pool offload is unsupported "
+         "for that combination";
+#endif
+  const std::vector<int64_t> folded_shape = fold_shape_for_host_transfer(
+      tensor.sizes().vec(), role, replicated_block_pages);
+  return tensor.view(folded_shape);
 }
 
 void create_host_page_aligned_tensor(const std::vector<int64_t>& dims,

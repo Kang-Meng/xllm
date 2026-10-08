@@ -15,7 +15,10 @@ limitations under the License.
 
 #include "framework/kv_cache/indexed_kv_cache_impl.h"
 
+#include <algorithm>
+
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "util/tensor_helper.h"
 
 namespace xllm {
@@ -75,20 +78,32 @@ IndexedKVCacheImpl::IndexedKVCacheImpl(
   CHECK(type == BlockType::KV)
       << "IndexedKVCacheImpl host cache only supports BlockType::KV.";
   host_page_aligned_regions_.reserve(4);
+  // Fold replicated pools into one dim0 row per logical block so the host
+  // transfer's "block id == dim0 row" contract holds: K/V follow the pool's
+  // replicated_block_pages, INDEX/INDEX_SCALE follow the NPU indexer
+  // replication (indexer_pages_per_block()).
+  const int64_t replicated_pages =
+      std::max<int64_t>(kv_cache_shape.replicated_block_pages(), 1);
   if (kv_cache_shape.has_key_cache_shape()) {
     create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.key_cache_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
+        build_host_group_tensor_shape(
+            fold_shape_for_host_transfer(kv_cache_shape.key_cache_shape(),
+                                         KVCacheTensorRole::KEY,
+                                         replicated_pages),
+            create_options.host_blocks_factor(),
+            layer_count),
         create_options.dtype(),
         &key_cache_,
         &key_cache_shape_);
   }
   if (kv_cache_shape.has_value_cache_shape()) {
     create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.value_cache_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
+        build_host_group_tensor_shape(
+            fold_shape_for_host_transfer(kv_cache_shape.value_cache_shape(),
+                                         KVCacheTensorRole::VALUE,
+                                         replicated_pages),
+            create_options.host_blocks_factor(),
+            layer_count),
         create_options.dtype(),
         &value_cache_,
         &value_cache_shape_);
@@ -99,10 +114,17 @@ IndexedKVCacheImpl::IndexedKVCacheImpl(
     const torch::ScalarType index_dtype =
         create_options.enable_indexer_cache_quant() ? torch::kChar
                                                     : create_options.dtype();
+    // replicated_pages only drives the KEY/VALUE folds above; the INDEX and
+    // INDEX_SCALE folds below take their row count from
+    // indexer_pages_per_block() inside fold_shape_for_host_transfer, so the
+    // passed argument is ignored for them.
     create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.index_cache_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
+        build_host_group_tensor_shape(
+            fold_shape_for_host_transfer(kv_cache_shape.index_cache_shape(),
+                                         KVCacheTensorRole::INDEX,
+                                         replicated_pages),
+            create_options.host_blocks_factor(),
+            layer_count),
         index_dtype,
         &index_cache_,
         &index_cache_shape_);
@@ -117,13 +139,16 @@ IndexedKVCacheImpl::IndexedKVCacheImpl(
 #else
         torch::kFloat32;
 #endif
-    create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.index_cache_scale_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
-        index_scale_dtype,
-        &index_scale,
-        &index_cache_scale_shape_);
+    create_host_tensor(build_host_group_tensor_shape(
+                           fold_shape_for_host_transfer(
+                               kv_cache_shape.index_cache_scale_shape(),
+                               KVCacheTensorRole::INDEX_SCALE,
+                               replicated_pages),
+                           create_options.host_blocks_factor(),
+                           layer_count),
+                       index_scale_dtype,
+                       &index_scale,
+                       &index_cache_scale_shape_);
     index_cache_scale_ = index_scale;
   }
 }

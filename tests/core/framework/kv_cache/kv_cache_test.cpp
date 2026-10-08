@@ -1158,6 +1158,33 @@ TEST_F(HostKVCacheConfigTest, AcceptsSupportedGroupedCacheLayout) {
   EXPECT_FALSE(validate_host_cache_options(options).has_value());
 }
 
+TEST_F(HostKVCacheConfigTest, RejectsFractalNzPoolWithTransferFolding) {
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.model_type = "deepseek_v3";
+  options.is_npu_platform = true;
+  options.needs_transfer_folding = true;
+
+  const std::optional<std::string> error = validate_host_cache_options(options);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NE(error->find("FRACTAL_NZ"), std::string::npos);
+}
+
+TEST_F(HostKVCacheConfigTest, AcceptsFractalNzPoolWithoutTransferFolding) {
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.model_type = "deepseek_v3";
+  options.is_npu_platform = true;
+  options.needs_transfer_folding = false;
+
+  EXPECT_FALSE(validate_host_cache_options(options).has_value());
+}
+
 TEST(KVCacheTest, LinearStateCapacityUsesChunkGranularity) {
   EXPECT_EQ(linear_state_block_count(/*kv_block_count=*/5216,
                                      /*chunk_size=*/1024,

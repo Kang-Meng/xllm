@@ -23,6 +23,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/kv_cache_store.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 
@@ -77,8 +78,10 @@ bool has_tensor(const torch::Tensor& tensor) {
 }
 
 BlockTypeTensorMap build_block_type_tensor_map(const KVCache& kv_cache,
-                                               BlockType type) {
+                                               BlockType type,
+                                               int64_t replicated_block_pages) {
   BlockTypeTensorMap tensors;
+
   const torch::Tensor key_cache = kv_cache.get_k_cache();
   const torch::Tensor value_cache = kv_cache.get_v_cache();
   const torch::Tensor index_cache = kv_cache.get_index_cache();
@@ -94,20 +97,36 @@ BlockTypeTensorMap build_block_type_tensor_map(const KVCache& kv_cache,
           has_tensor(swa_cache)) {
         return {};
       }
+      // Fold every replicated role into one dim0 row per logical block so the
+      // host transfer's "block id == dim0 row" contract holds under kv_split:
+      // K/V follow the pool's replicated_block_pages (a standalone drafter
+      // replicates), INDEX/INDEX_SCALE follow the NPU indexer replication.
       if (has_tensor(key_cache)) {
-        tensors.emplace(KVCacheTensorRole::KEY, key_cache);
+        tensors.emplace(
+            KVCacheTensorRole::KEY,
+            fold_tensor_rows_for_transfer(
+                key_cache, KVCacheTensorRole::KEY, replicated_block_pages));
       }
       if (has_tensor(value_cache)) {
-        tensors.emplace(KVCacheTensorRole::VALUE, value_cache);
+        tensors.emplace(
+            KVCacheTensorRole::VALUE,
+            fold_tensor_rows_for_transfer(
+                value_cache, KVCacheTensorRole::VALUE, replicated_block_pages));
       }
       if (has_tensor(index_cache)) {
-        tensors.emplace(KVCacheTensorRole::INDEX, index_cache);
+        tensors.emplace(
+            KVCacheTensorRole::INDEX,
+            fold_tensor_rows_for_transfer(
+                index_cache, KVCacheTensorRole::INDEX, replicated_block_pages));
       }
       // Quantized index state and scale must move together.
       if (index_cache_scale.has_value() &&
           has_tensor(index_cache_scale.value())) {
-        tensors.emplace(KVCacheTensorRole::INDEX_SCALE,
-                        index_cache_scale.value());
+        tensors.emplace(
+            KVCacheTensorRole::INDEX_SCALE,
+            fold_tensor_rows_for_transfer(index_cache_scale.value(),
+                                          KVCacheTensorRole::INDEX_SCALE,
+                                          replicated_block_pages));
       }
       return tensors;
     case BlockType::LINEAR: {
@@ -373,7 +392,9 @@ HierarchyKVCacheTransfer::build_device_groups(CacheDomain* domain) const {
     KVCache& kv_cache =
         domain->device_kv_caches->at(static_cast<size_t>(layer_id));
     for (BlockType type : block_types) {
-      if (!build_block_type_tensor_map(kv_cache, type).empty()) {
+      if (!build_block_type_tensor_map(
+               kv_cache, type, domain->kv_cache_shape.replicated_block_pages())
+               .empty()) {
         device_groups[type].emplace_back(&kv_cache);
         domain->layer_ids_by_type[type].emplace_back(layer_id);
       }
@@ -426,8 +447,10 @@ HostKVLayout HierarchyKVCacheTransfer::create_host_kv_layout(
       HostKVLayerLayout layer;
       layer.absolute_layer_id = layer_ids_it->second[layer_slot];
       layer.group_layer_slot = static_cast<int64_t>(layer_slot);
-      layer.device_roles =
-          build_block_type_tensor_map(*group_caches[layer_slot], block_type);
+      layer.device_roles = build_block_type_tensor_map(
+          *group_caches[layer_slot],
+          block_type,
+          domain.kv_cache_shape.replicated_block_pages());
       layer.device_cache = group_caches[layer_slot];
       layer.block_type = block_type;
       group.layers.emplace_back(std::move(layer));

@@ -159,4 +159,14 @@ cc_test(
     :kv_cache_transfer
     GTest::gtest_main
 )
+
+cc_test(
+  NAME
+    kv_split_host_transfer_test
+  SRCS
+    kv_split_host_transfer_test.cpp
+  DEPS
+    :kv_cache_transfer
+    GTest::gtest_main
+)
 endif()

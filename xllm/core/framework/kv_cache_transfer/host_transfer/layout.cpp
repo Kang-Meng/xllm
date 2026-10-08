@@ -118,7 +118,15 @@ void validate_role(const torch::Tensor& host_tensor,
 
 BlockTypeTensorMap get_device_transfer_tensors(const HostKVLayerLayout& layer,
                                                size_t checkpoint_row) {
-  if (layer.device_cache == nullptr) {
+  // Non-LINEAR caches ignore checkpoint_row and return their canonical
+  // tensors, which device_roles already holds as per-role fold views: under
+  // kv_split a replicated pool spans multiple physical rows per logical
+  // block, and create_host_kv_layout registered the folded one-row-per-block
+  // views there. Re-deriving through the KVCache here would hand the copy
+  // paths the raw multi-row tensors and break the block-id addressing, so
+  // only LINEAR layouts -- whose SSM cache addresses a checkpoint stride --
+  // go through the device cache.
+  if (layer.device_cache == nullptr || layer.block_type != BlockType::LINEAR) {
     return layer.device_roles;
   }
 

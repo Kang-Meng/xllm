@@ -626,6 +626,16 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   // Validate host offload before constructing block managers or asking workers
   // to allocate potentially large pinned host tensors.
   const KVCacheShape kv_cache_shape(kv_cache_cap, args_, dp_local_tp_size_);
+  const int32_t kv_split_size_eff =
+      ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+  // Any registered role would fold more than one physical row per logical
+  // block for host transfer: the NPU indexer replicates every kv split page,
+  // and a standalone drafter (DFlash family) replicates the whole pool.
+  const bool needs_transfer_folding =
+      (Platform::requires_dsa_indexer_cache_replication() &&
+       kv_split_size_eff > 1) ||
+      (SpeculativeConfig::draft_replicated_block_pages(
+           options_.speculative_algorithm(), kv_split_size_eff) > 1);
   HostCacheValidationOptions host_cache_validation_options{
       .host_blocks_factor = options_.host_blocks_factor(),
       .device_block_count = kv_cache_cap.n_blocks(),
@@ -644,6 +654,8 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .kv_cache_dtype = options_.kv_cache_dtype(),
       .indexer_cache_dtype = kv_cache_config.indexer_cache_dtype(),
       .model_type = args_.model_type(),
+      .is_npu_platform = Platform::is_npu(),
+      .needs_transfer_folding = needs_transfer_folding,
   };
   const std::optional<std::string> host_cache_error =
       validate_host_cache_options(host_cache_validation_options);
@@ -655,8 +667,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   kv_cache_shape.print_shapes();
 
   // initialize block manager
-  const int32_t kv_split_size_eff =
-      ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
       .hasher_type(mtp_hasher_type(BlockHasherType::TEXT,

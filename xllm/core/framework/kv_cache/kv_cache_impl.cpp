@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "framework/kv_cache/kv_cache_impl.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "framework/kv_cache/kv_cache_shape.h"
@@ -58,20 +59,31 @@ KVCacheImpl::KVCacheImpl(const KVCacheShape& kv_cache_shape,
   CHECK(type == BlockType::KV)
       << "Base KVCacheImpl host cache only supports BlockType::KV.";
   host_page_aligned_regions_.reserve(2);
+  // Fold replicated pools (a standalone drafter keeps replicated_block_pages
+  // per logical block) into one dim0 row per logical block so the host
+  // transfer's "block id == dim0 row" contract holds.
+  const int64_t replicated_pages =
+      std::max<int64_t>(kv_cache_shape.replicated_block_pages(), 1);
   if (kv_cache_shape.has_key_cache_shape()) {
     create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.key_cache_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
+        build_host_group_tensor_shape(
+            fold_shape_for_host_transfer(kv_cache_shape.key_cache_shape(),
+                                         KVCacheTensorRole::KEY,
+                                         replicated_pages),
+            create_options.host_blocks_factor(),
+            layer_count),
         create_options.dtype(),
         &key_cache_,
         &key_cache_shape_);
   }
   if (kv_cache_shape.has_value_cache_shape()) {
     create_host_tensor(
-        build_host_group_tensor_shape(kv_cache_shape.value_cache_shape(),
-                                      create_options.host_blocks_factor(),
-                                      layer_count),
+        build_host_group_tensor_shape(
+            fold_shape_for_host_transfer(kv_cache_shape.value_cache_shape(),
+                                         KVCacheTensorRole::VALUE,
+                                         replicated_pages),
+            create_options.host_blocks_factor(),
+            layer_count),
         create_options.dtype(),
         &value_cache_,
         &value_cache_shape_);

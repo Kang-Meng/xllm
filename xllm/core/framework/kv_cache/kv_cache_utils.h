@@ -148,6 +148,12 @@ struct HostCacheValidationOptions {
   std::string kv_cache_dtype = "auto";
   std::string indexer_cache_dtype = "auto";
   std::string model_type;
+  // The worker's caches run on an NPU device and at least one registered role
+  // would fold more than one physical row per logical block for host transfer
+  // (kv split indexer pages or a replicated draft pool). Together these gate
+  // the FRACTAL_NZ offload rejection in validate_host_cache_options().
+  bool is_npu_platform = false;
+  bool needs_transfer_folding = false;
 };
 
 struct KVCacheTensor {
@@ -247,6 +253,24 @@ std::vector<int64_t> build_host_group_tensor_shape(
     const std::vector<int64_t>& base_shape,
     double host_blocks_factor,
     int64_t layer_count);
+
+// Fold a per-layer cache shape [blocks * pages, page_tokens, ...] into
+// [blocks, pages * page_tokens, ...] so one dim0 row covers one logical block
+// and the host transfer's "block id == dim0 row" contract holds. Roles that
+// store one row per logical block are returned unchanged. The pages-per-block
+// rule is the one physical_rows_per_resource() encodes (cache_layout_builder)
+// so the host transfer and the Mooncake manifest path stay in lockstep.
+std::vector<int64_t> fold_shape_for_host_transfer(
+    const std::vector<int64_t>& shape,
+    KVCacheTensorRole::Value role,
+    int64_t replicated_block_pages);
+
+// Zero-copy view counterpart of fold_shape_for_host_transfer() for a device
+// cache tensor. Requires a contiguous tensor whose dim0 is divisible by the
+// role's pages-per-block.
+torch::Tensor fold_tensor_rows_for_transfer(const torch::Tensor& tensor,
+                                            KVCacheTensorRole::Value role,
+                                            int64_t replicated_block_pages);
 
 // Allocate a page-aligned, mlock'd (and NPU-registered) host tensor over a
 // HostPageAlignedRegion. The region owns the memory; the tensor is a view.
