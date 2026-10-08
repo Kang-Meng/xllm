@@ -1453,23 +1453,21 @@ void PDOOCScheduler::dispatch_requests() {
     // (resolve_kv_split_plan): without this gate an equal-width pair (decode
     // declaring kv_split_size > 1) silently fell back to strided remapping
     // and was mis-addressed by kv_split_rank + k * kv_split_size, and
-    // unreconcilable pairs were never rejected. create_rpc_channel has
-    // populated remote_instances_info_ for the selected instance, so refuse
-    // before the decode reservation and the AddNewRequests RPC.
-    const KvSplitDispatchPlan kv_split_plan =
-        resolve_kv_split_plan(instance_info_.kv_split_size,
-                              instance_info_.cp_index_write_mode,
-                              remote_instances_info_[selected_instance],
-                              /*response=*/nullptr);
-    if (kv_split_plan.plan == KvSplitWidthPlan::UNRECONCILABLE) {
-      LOG(ERROR) << "Rejecting request " << request->request_id()
-                 << " for decode instance " << selected_instance << ": "
-                 << kv_split_plan.reason;
-      response_processor_->process_failed_request(
-          request,
-          {StatusCode::INVALID_ARGUMENT,
-           "decode instance " + selected_instance + ": " +
-               kv_split_plan.reason});
+    // unreconcilable pairs were never rejected. create_rpc_channel normally
+    // populates remote_instances_info_ for the selected instance, but that
+    // is not a structural guarantee (a cached channel returns before
+    // registration; unlink erases the record), so take ONE locked snapshot
+    // per request and fail closed when it is missing -- an operator[] read
+    // here would race the RPC thread's concurrent insert AND fabricate a
+    // default width-1 record for a missing key, flipping the gate's
+    // failure direction to "admit". The snapshot is carried through the
+    // response handling below so the push defense sees exactly the record
+    // the gate validated.
+    const std::optional<InstanceInfo> remote_record =
+        admit_kv_split_request(request,
+                               selected_instance,
+                               /*release_prefill_blocks=*/false);
+    if (!remote_record.has_value()) {
       continue;
     }
 
@@ -1521,11 +1519,14 @@ void PDOOCScheduler::dispatch_requests() {
           // Resolve with the allocation response at hand, exactly as the
           // non-OOC dispatch does: without the rank_local_mapping claim the
           // push path treats every mapping as strided and an equal-width
-          // pair would be mis-addressed by the kv_split stride.
+          // pair would be mis-addressed by the kv_split stride. The record
+          // is the locked snapshot taken at the width gate above, so the
+          // claim and the push defense agree on one record even if the
+          // registration changes underneath.
           const KvSplitDispatchPlan resolved =
               resolve_kv_split_plan(instance_info_.kv_split_size,
                                     instance_info_.cp_index_write_mode,
-                                    remote_instances_info_[selected_instance],
+                                    *remote_record,
                                     &resp);
           info.rank_local_mapping = resolved.rank_local_mapping;
           info.mappings.reserve(resp.groups_size());
@@ -1538,8 +1539,7 @@ void PDOOCScheduler::dispatch_requests() {
             info.mappings.emplace_back(std::move(mapping));
           }
           info.dp_rank = resp.dp_rank();
-          // TODO: remote_instances_info_ is not multi-thread safe.
-          info.remote_instance_info = remote_instances_info_[selected_instance];
+          info.remote_instance_info = *remote_record;
           sequence->kv_state().set_transfer_kv_info(std::move(info));
 
           // Compress per-group transfer cursors to the D-side shared count.
@@ -1986,28 +1986,18 @@ void PDOOCScheduler::dispatch_offline_requests() {
     // Same KV-split width resolution as the online dispatches
     // (resolve_kv_split_plan): the pulled request must not be handed to a
     // decode instance whose declared width or the source's write mode makes
-    // the pair inexpressible. create_rpc_channel has populated
-    // remote_instances_info_ for the target instance, so refuse before the
-    // AddNewRequests RPC.
-    const KvSplitDispatchPlan kv_split_plan =
-        resolve_kv_split_plan(instance_info_.kv_split_size,
-                              instance_info_.cp_index_write_mode,
-                              remote_instances_info_[target_instance],
-                              /*response=*/nullptr);
-    if (kv_split_plan.plan == KvSplitWidthPlan::UNRECONCILABLE) {
-      LOG(ERROR) << "Rejecting offline request " << request->request_id()
-                 << " for decode instance " << target_instance << ": "
-                 << kv_split_plan.reason;
-      // The pair can never be expressed as a mapping, so requeueing against
-      // the same pulled instance would spin forever; fail the request and
-      // release the prefill-side blocks it already holds (the same cleanup
-      // do_permanent_rejection performs, with the mismatch named in the
-      // status).
-      response_processor_->process_failed_request(
-          request,
-          {StatusCode::INVALID_ARGUMENT,
-           "decode instance " + target_instance + ": " + kv_split_plan.reason});
-      kv_cache_manager_->deallocate(request.get());
+    // the pair inexpressible. create_rpc_channel normally populates
+    // remote_instances_info_ for the target instance, but that is not a
+    // structural guarantee, so take ONE locked snapshot and fail closed
+    // when missing -- an operator[] read would race the RPC thread's
+    // concurrent insert AND fabricate a default width-1 record for a
+    // missing key, flipping the gate's failure direction to "admit". The
+    // snapshot is carried through the response handling below.
+    const std::optional<InstanceInfo> remote_record =
+        admit_kv_split_request(request,
+                               target_instance,
+                               /*release_prefill_blocks=*/true);
+    if (!remote_record.has_value()) {
       continue;
     }
 
@@ -2056,11 +2046,14 @@ void PDOOCScheduler::dispatch_offline_requests() {
         const proto::DisaggResponse& resp = resps.resps()[0];
         // Resolve with the allocation response at hand, exactly as the
         // online dispatch paths do, so an equal-width pair claims the
-        // rank-local mapping instead of the strided one.
+        // rank-local mapping instead of the strided one. The record is the
+        // locked snapshot taken at the width gate above, so the claim and
+        // the push defense agree on one record even if the registration
+        // changes underneath.
         const KvSplitDispatchPlan resolved =
             resolve_kv_split_plan(instance_info_.kv_split_size,
                                   instance_info_.cp_index_write_mode,
-                                  remote_instances_info_[target_instance],
+                                  *remote_record,
                                   &resp);
         info.rank_local_mapping = resolved.rank_local_mapping;
         info.mappings.reserve(resp.groups_size());
@@ -2073,7 +2066,7 @@ void PDOOCScheduler::dispatch_offline_requests() {
           info.mappings.emplace_back(std::move(mapping));
         }
         info.dp_rank = resp.dp_rank();
-        info.remote_instance_info = remote_instances_info_[target_instance];
+        info.remote_instance_info = *remote_record;
         sequence->kv_state().set_transfer_kv_info(std::move(info));
 
         // Compress per-group / flat transfer cursors to the D-side shared

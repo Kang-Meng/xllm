@@ -494,30 +494,18 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
   options.enable_disagg_pd(false);
   options.cp_size(2);
 
-  // Chunked prefill under glm5_next+CP converges on the DFlash2 whitelist
-  // like the aux-capture gates above: only the pairing that was validated
-  // end to end (the spec-verify chunked-prefill path) is admitted, every
-  // other combination keeps the pre-existing refusal. The model-level
-  // cp_context mechanism itself remains proven by tests/python/
-  // test_glm5_next_cp.py's
-  // test_kda_cp_chunked_prefill_matches_noncp_nonchunked_baseline, which
-  // exercises the path directly without the master gate.
+  // B3 (implement.md): enable_chunked_prefill is no longer rejected for
+  // glm5_next+CP — the underlying is_mla-and-chunked-prefill cp_context
+  // mechanism is generic and pre-dates this gate (R2-followup verdict B);
+  // see tests/python/test_glm5_next_cp.py's
+  // test_kda_cp_chunked_prefill_matches_noncp_nonchunked_baseline for the
+  // model-level correctness proof this gate removal depends on.
   scheduler_config.enable_chunked_prefill(true);
-  EXPECT_EQ(
-      validate_model_cp(options,
-                        EngineType::LLM,
-                        "glm5_next",
-                        /*global_world_size=*/8),
-      std::optional<std::string>("Python GLM-5 Next CP initially requires "
-                                 "enable_chunked_prefill=false"));
-  // The validated DFlash2 pairing keeps the chunked path open.
-  options.speculative_algorithm("DFlash2");
   EXPECT_FALSE(validate_model_cp(options,
                                  EngineType::LLM,
                                  "glm5_next",
                                  /*global_world_size=*/8)
                    .has_value());
-  options.speculative_algorithm("MTP");
   scheduler_config.enable_chunked_prefill(false);
 
   scheduler_config.enable_mix_batch(true);
@@ -540,15 +528,44 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                                  "enable_prefix_cache=false"));
   kv_cache_config.enable_prefix_cache(false);
 
+  // M11.6: the schedule-overlap ban is lifted for glm5_next CP. The M11.5
+  // pins make overlap safe: the overlapped decode token replacement is
+  // byte-identical across CP ranks (greedy argmax over CP-replicated logits,
+  // and the CP sample-token broadcast for stochastic batches in
+  // LLMWorkerImpl::step_internal), the deferred KDA linear-state restore
+  // stays on the compute stream, and the single-threaded worker task pool
+  // keeps the block lifecycle FIFO.
   scheduler_config.enable_schedule_overlap(true);
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+
+  // The lift is scoped to overlap only: with overlap still enabled, the
+  // other initially-required flags keep refusing.
+  scheduler_config.enable_mix_batch(true);
+  EXPECT_EQ(
+      validate_model_cp(options,
+                        EngineType::LLM,
+                        "glm5_next",
+                        /*global_world_size=*/8),
+      std::optional<std::string>(
+          "Python GLM-5 Next CP initially requires enable_mix_batch=false"));
+  scheduler_config.enable_mix_batch(false);
+
+  kv_cache_config.enable_prefix_cache(true);
   EXPECT_EQ(
       validate_model_cp(options,
                         EngineType::LLM,
                         "glm5_next",
                         /*global_world_size=*/8),
       std::optional<std::string>("Python GLM-5 Next CP initially requires "
-                                 "enable_schedule_overlap=false"));
-  scheduler_config.enable_schedule_overlap(false);
+                                 "enable_prefix_cache=false"));
+  kv_cache_config.enable_prefix_cache(false);
+  // Overlap stays enabled through the checks below so the PD PREFILL-role
+  // admission and the pd_ooc refusal are also pinned for the overlapped
+  // combination (the L3 smoke topology); the config guard restores it.
 
   options.enable_disagg_pd(true);
   EXPECT_FALSE(validate_model_cp(options,
@@ -567,12 +584,151 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
   options.instance_role(InstanceRole::PREFILL)
       .enable_disagg_pd(false)
       .enable_pd_ooc(true);
+  // pd_ooc keeps refusing with schedule overlap enabled, proving the lift
+  // did not weaken the other initially-required bans.
   EXPECT_EQ(validate_model_cp(options,
                               EngineType::LLM,
                               "glm5_next",
                               /*global_world_size=*/8),
             std::optional<std::string>(
                 "Python GLM-5 Next CP initially requires enable_pd_ooc=false"));
+}
+
+TEST(NpuCpCapabilityTest, PythonGlm5NextShardedKvIsAdmittedAtCpSizeOne) {
+  // The cp_size == 1 Python DCP decode shape is admitted, and that admission
+  // is the design: validate_model_cp returns nullopt for every cp_size == 1
+  // instance before any kv_split logic runs (master.cpp's cp1 early return),
+  // so a glm5_next decode instance with kv_split_size > 1 never sees the
+  // "requires disaggregated PD with the PREFILL role" gate that governs the
+  // cp > 1 shape. Safety comes from backend selection instead: an MLA model
+  // at cp_size == 1 with a live DCP group selects SfaDcpAttentionBackend
+  // (executor.py), which localizes its own slots in prepare() and never
+  // writes through the global slot mapping -- pinning the selection is
+  // test_model_executor.py's
+  // test_glm_next_decode_cp1_selects_sfa_dcp_backend_from_dsa_layer.
+  //
+  // This is the inverted form of the pr-line's
+  // PythonGlm5NextShardedKvRequiresCp (6d87b4f16), which asserted a staging
+  // guard fired for this shape. m11 never carried that guard: the shape has
+  // been admissible here since the cp1 early return landed, and nothing pinned
+  // it until now.
+  ExecutionConfig& execution_config = ExecutionConfig::get_instance();
+  ModelConfig& model_config = ModelConfig::get_instance();
+  ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const std::string original_python_graph_backend =
+      execution_config.python_graph_backend();
+  const std::string original_model_impl = model_config.model_impl();
+  const int32_t original_kv_split_size = parallel_config.kv_split_size();
+  ScopeGuard config_guard([&] {
+    parallel_config.kv_split_size(original_kv_split_size);
+    model_config.model_impl(original_model_impl);
+    execution_config.python_graph_backend(original_python_graph_backend);
+  });
+  execution_config.python_graph_backend("off");
+  model_config.model_impl("python");
+  parallel_config.kv_split_size(2);
+
+  Options options;
+  options.task_type("generate");
+  options.cp_size(1);
+  options.dp_size(1);
+  options.ep_size(16);
+  options.enable_disagg_pd(true);
+  options.instance_role(InstanceRole::DECODE);
+
+  // Locate the failure before asserting on the shape: if either of these
+  // trips, the problem is the fixture, not the admission.
+  ASSERT_EQ(options.cp_size(), 1) << "options.cp_size was not set";
+  ASSERT_EQ(parallel_config.kv_split_size_effective(), 2)
+      << "kv_split_size_effective was not 2";
+  ASSERT_TRUE(ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl()))
+      << "model_impl is not the python path";
+
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/16)
+                   .has_value())
+      << "cp_size == 1 with kv_split_size > 1 on a DECODE-role python "
+         "glm5_next instance must be admissible, got: "
+      << validate_model_cp(options,
+                           EngineType::LLM,
+                           "glm5_next",
+                           /*global_world_size=*/16)
+             .value_or("");
+
+  // The same shape must also clear the DCP topology gate the Master
+  // constructor runs for NPU cp1 instances with kv_split_size > 1
+  // (validate_qwen_dcp_topology): world=16, dp=1 gives tp=16, and 2 divides
+  // 16, so the shard has a TP-local factor to live in.
+  EXPECT_FALSE(validate_qwen_dcp_topology(
+                   /*global_world_size=*/16,
+                   /*dp_size=*/1,
+                   /*kv_split_size=*/2)
+                   .has_value())
+      << "kv_split_size=2 must divide the TP size (16) within the DP replica";
+}
+
+TEST(NpuCpCapabilityTest, PythonDcpIsAdmittedAtDpGreaterThanOneAndCpSizeOne) {
+  // The other half of the same admission: cp_size == 1 with BOTH dp_size > 1
+  // and kv_split_size > 1. The pr-line staged this shape behind a
+  // "dp_size == 1 until DP-local KV groups are implemented" guard
+  // (6d87b4f16 removed it on hardware evidence); m11 never carried the guard
+  // because the DCP group is DP-replica-local by construction here
+  // (py_causal_lm.cpp derives dcp_group_index from dp_rank and tp_rank), so
+  // the shape only has to clear validate_qwen_dcp_topology's TP-divisibility
+  // rule. Pin that it does -- and that a width the TP size cannot host is
+  // still refused, so the admission is a real decision, not a vacuous pass.
+  ModelConfig& model_config = ModelConfig::get_instance();
+  ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const std::string original_model_impl = model_config.model_impl();
+  const int32_t original_kv_split_size = parallel_config.kv_split_size();
+  ScopeGuard config_guard([&] {
+    parallel_config.kv_split_size(original_kv_split_size);
+    model_config.model_impl(original_model_impl);
+  });
+  model_config.model_impl("python");
+  parallel_config.kv_split_size(2);
+
+  Options options;
+  options.task_type("generate");
+  options.cp_size(1);
+  options.dp_size(2);
+  options.ep_size(2);
+  options.enable_disagg_pd(true);
+  options.instance_role(InstanceRole::DECODE);
+
+  ASSERT_EQ(options.dp_size(), 2) << "options.dp_size was not set";
+  ASSERT_EQ(options.cp_size(), 1) << "options.cp_size was not set";
+  ASSERT_EQ(parallel_config.kv_split_size_effective(), 2)
+      << "kv_split_size_effective was not 2";
+
+  const std::optional<std::string> dp_error =
+      validate_model_cp(options,
+                        EngineType::LLM,
+                        "glm5_next",
+                        /*global_world_size=*/4);
+  EXPECT_FALSE(dp_error.has_value())
+      << "dp_size > 1 with kv_split_size > 1 at cp_size == 1 must be "
+         "admissible, got: "
+      << dp_error.value_or("");
+
+  // world=4, dp=2 gives tp=2: a kv_split of 2 fits, a kv_split of 4 does not.
+  EXPECT_FALSE(validate_qwen_dcp_topology(
+                   /*global_world_size=*/4,
+                   /*dp_size=*/2,
+                   /*kv_split_size=*/2)
+                   .has_value());
+  const std::optional<std::string> topology_error = validate_qwen_dcp_topology(
+      /*global_world_size=*/4,
+      /*dp_size=*/2,
+      /*kv_split_size=*/4);
+  ASSERT_TRUE(topology_error.has_value())
+      << "kv_split_size=4 exceeds the TP size (2) and must be refused";
+  EXPECT_EQ(topology_error.value(),
+            "Qwen DCP kv_split_size must divide the TP size within each DP "
+            "replica");
 }
 
 TEST(NpuDcpTopologyTest, AcceptsOnlyTpLocalFactors) {

@@ -813,6 +813,168 @@ TEST(ContinuousSchedulerTest, CancelledOverlapRequestReleasesBeforeResult) {
   }
 }
 
+// ===========================================================================
+// M11.5 scheduler-overlap prework: block-lifecycle ordering when a request
+// finishes inside the deferred output processing of an overlapped step.
+//
+// The timeline this pins (step_with_schedule_overlap, one step scheduled in
+// advance):
+//   step N    : batch B_N dispatched while B_{N-1} runs on the device; the
+//               deferred processing of B_{N-1} commits the request's last
+//               real token and the request finishes.
+//   step N+1 A: collect_finished deallocates the finished request's blocks
+//               BEFORE the engine collects B_N's result (C).
+//   step N+1 C: update_last_step_result(B_N) still dereferences the request's
+//               sequences -- the scheduler's last_running_requests_ snapshot
+//               (copied at step N's tail) keeps the request object alive
+//               until this collection completes.
+//
+// The early block free is safe for a non-DFlash2 overlap step because every
+// device access to KV/LINEAR cache tensors is enqueued on the per-worker
+// compute stream in step-task order (single-threaded WorkerImpl task pool,
+// worker_impl.h; LLMWorkerImpl::step_for_schedule_overlap chains the deferred
+// linear-state restore and the step on compute_stream_), so a freed block
+// reallocated into the next batch is only written by device work ordered
+// after the in-flight step. That is why LLMEngine::step's
+// retain_cache_blocks guard is DFlash2-only (see
+// llm_engine_host_transfer_test for the engine-side pin): DFlash2's
+// prelaunch enqueues KV writes one additional step ahead, outside this FIFO
+// window. A CP prefill lifting the glm5_next overlap ban (M11.6) relies on
+// exactly this ordering, since the engine broadcasts one batch to every CP
+// rank of the DP group.
+// ===========================================================================
+
+class OverlapFinishEngine final : public FakeEngine {
+ public:
+  OverlapFinishEngine() : FakeEngine(32, 4) {}
+
+  ForwardOutput step(std::vector<Batch>& batches) override {
+    ++step_calls_;
+    for (Batch& batch : batches) {
+      if (batch.empty()) {
+        continue;
+      }
+      batch.prepare_forward_input(1, 0, model_args());
+      RawForwardOutput output;
+      for (Sequence* sequence : batch.get_sequences()) {
+        // The batch being dispatched still references live blocks.
+        EXPECT_TRUE(sequence->has_any_blocks());
+        RawSampleOutput sample;
+        RawToken token;
+        // Stage-1 append under overlap: the driver's fake output is a
+        // negative placeholder (worker_service.cpp builds arange(-1, ...)),
+        // so the sequence stores a fake token for the next step's input.
+        token.id = -1;
+        sample.tokens.emplace_back(std::move(token));
+        output.outputs.emplace_back(std::move(sample));
+      }
+      batch.process_sample_output(output, false);
+    }
+    return {};
+  }
+
+  void update_last_step_result(std::vector<Batch>& batches) override {
+    ++completed_batches_;
+    for (Batch& batch : batches) {
+      if (batch.empty()) {
+        continue;
+      }
+      RawForwardOutput output;
+      for (Sequence* sequence : batch.get_sequences()) {
+        if (completed_batches_ == 1u) {
+          // First deferred collection: the request has not been collected as
+          // finished yet, so its blocks are still allocated.
+          EXPECT_TRUE(sequence->has_any_blocks());
+        } else {
+          // Later deferred collections: collect_finished of THIS step
+          // already deallocated the finished request's blocks before the
+          // in-flight batch's result is collected here. The sequence object
+          // itself must still be alive -- last_running_requests_ keeps the
+          // request alive until this collection completes.
+          EXPECT_EQ(sequence->kv_cache_tokens_num(), 0u);
+          EXPECT_FALSE(sequence->has_any_blocks());
+        }
+        RawSampleOutput sample;
+        RawToken token;
+        token.id = 5;
+        sample.tokens.emplace_back(std::move(token));
+        output.outputs.emplace_back(std::move(sample));
+      }
+      batch.process_sample_output(output, true);
+    }
+  }
+
+  size_t step_calls() const { return step_calls_; }
+  size_t completed_batches() const { return completed_batches_; }
+
+ private:
+  size_t step_calls_ = 0;
+  size_t completed_batches_ = 0;
+};
+
+TEST(ContinuousSchedulerTest, OverlapFinishedRequestOutlivesInflightResult) {
+  ScopedConfigValue<bool> overlap(
+      SchedulerConfig::get_instance().enable_schedule_overlap(), true);
+  OverlapFinishEngine engine;
+  ContinuousScheduler::Options options =
+      create_scheduler_options(16, 4, 0, 4, 1);
+  options.enable_schedule_overlap(true);
+  TestContinuousScheduler scheduler(&engine, options);
+  // max_tokens=1: the request finishes as soon as the deferred processing
+  // commits its first real generated token. Sequence params copy
+  // enable_schedule_overlap at Request construction, so the flag must be in
+  // the RequestState (update_last_step_token CHECKs it).
+  const std::vector<int32_t> prompt{1, 2, 3, 4};
+  RequestSamplingParam sampling_param;
+  SchedulerParam scheduler_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(1);
+  stopping_checker.set_max_context_len(32);
+  stopping_checker.set_ignore_eos(true);
+  RequestState req_state("x",
+                         prompt,
+                         sampling_param,
+                         scheduler_param,
+                         stopping_checker,
+                         prompt.size() + 30000,
+                         /*n=*/1,
+                         /*best_of=*/1,
+                         /*logprobs=*/false,
+                         /*stream=*/false,
+                         /*echo=*/false,
+                         /*skip_special_tokens=*/false,
+                         /*enable_schedule_overlap=*/true,
+                         /*output_func=*/nullptr,
+                         /*outputs_func=*/nullptr);
+  auto request =
+      std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
+  request->state().output_func = [](const RequestOutput&) { return true; };
+  const std::weak_ptr<Request> watch = request;
+  const size_t initial_free_blocks =
+      engine.block_manager_pool()->num_free_blocks().front();
+  scheduler.add_request(request);
+  request.reset();
+
+  // Step 1: prefill dispatched; its (fake) output appends the placeholder.
+  scheduler.step(absl::ZeroDuration());
+  // Step 2: decode dispatched one step ahead; the prefill's deferred result
+  // commits the real token and finishes the request.
+  scheduler.step(absl::ZeroDuration());
+  // Step 3: collect_finished frees the finished request's blocks, THEN the
+  // engine collects the in-flight decode batch's result (assertions inside
+  // OverlapFinishEngine::update_last_step_result pin both halves).
+  scheduler.step(absl::ZeroDuration());
+
+  EXPECT_EQ(engine.step_calls(), 2u);
+  EXPECT_EQ(engine.completed_batches(), 2u);
+  scheduler.wait_for_responses();
+  // The scheduler no longer holds the request: the deferred pipeline drained
+  // and the last_running_requests_ snapshot was replaced.
+  EXPECT_TRUE(watch.expired());
+  EXPECT_EQ(engine.block_manager_pool()->num_free_blocks().front(),
+            initial_free_blocks);
+}
+
 TEST(ContinuousSchedulerFactoryTest,
      ChunkedPrefillWithoutSPCreatesContinuousScheduler) {
   ContinuousScheduler::Options opt =

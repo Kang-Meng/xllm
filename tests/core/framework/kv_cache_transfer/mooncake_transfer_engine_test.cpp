@@ -316,6 +316,102 @@ TEST(MooncakeKVCacheTransferLayoutTest, PublishedTpWidthAndRankAlwaysAgree) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Role axis: KEY / VALUE / INDEX are described independently by the production
+// layout builder, so each role carries its own shard kind, owner and byte
+// range rather than sharing one blob's mapping. The descriptors below come
+// from describe_cache_tensor, the same call register_kv_cache makes; nothing
+// here is hand-built geometry. The transfer side consumes one descriptor per
+// role at move time (mooncake_kv_cache_transfer.cpp), so a role riding on
+// another role's geometry would move the wrong bytes silently.
+// ---------------------------------------------------------------------------
+struct RoleDescriptorProbe {
+  KVCacheTensorRole::Value role;
+  LogicalShardDescriptor descriptor;
+};
+
+RoleDescriptorProbe describe_role(KVCacheTensorRole::Value role,
+                                  const CacheTensorLayoutContext& context,
+                                  const torch::Tensor& tensor,
+                                  int32_t group_id) {
+  KVCacheTensor cache_tensor{role, tensor, group_id};
+  std::string error;
+  EXPECT_TRUE(describe_cache_tensor(context, &cache_tensor, &error)) << error;
+  EXPECT_TRUE(cache_tensor.shard_descriptor.has_value());
+  RoleDescriptorProbe probe;
+  probe.role = role;
+  probe.descriptor = cache_tensor.shard_descriptor.value();
+  return probe;
+}
+
+TEST(KvRoleAxisTest, KeyValueAndIndexCarryIndependentShardDescriptors) {
+  // One topology, three roles: tp=4, attention heads sharded by TP, the index
+  // pool replicated. The roles must come back with different ownership, not
+  // with one role's mapping standing in for another's.
+  constexpr int32_t kTpRank = 2;
+  constexpr int32_t kTpSize = 4;
+  constexpr int64_t kGlobalHeads = 8;
+  constexpr int64_t kTokens = 3;
+  constexpr int64_t kHeadDim = 4;
+
+  CacheTensorLayoutContext context;
+  context.tp_rank = kTpRank;
+  context.tp_size = kTpSize;
+  context.block_token_capacity = kTokens;
+  context.kv_head_count = kGlobalHeads;
+  context.index_head_count = 1;
+
+  const int64_t local_heads = kGlobalHeads / kTpSize;
+  const auto head_tensor = [&]() {
+    return torch::zeros({/*resources=*/2, kTokens, local_heads, kHeadDim});
+  };
+
+  const RoleDescriptorProbe key = describe_role(KVCacheTensorRole::KEY,
+                                                context,
+                                                head_tensor(),
+                                                cache_group_id(BlockType::KV));
+  const RoleDescriptorProbe value =
+      describe_role(KVCacheTensorRole::VALUE,
+                    context,
+                    head_tensor(),
+                    cache_group_id(BlockType::KV));
+  const RoleDescriptorProbe index =
+      describe_role(KVCacheTensorRole::INDEX,
+                    context,
+                    torch::zeros({/*resources=*/2, kTokens, 1, kHeadDim * 2}),
+                    cache_group_id(BlockType::C4));
+
+  // KEY and VALUE are TP-sharded: this rank owns its heads, and the two roles
+  // carry the same partition but their own descriptors.
+  for (const RoleDescriptorProbe& probe : {key, value}) {
+    EXPECT_EQ(probe.descriptor.kind, LogicalShardKind::SHARDED);
+    ASSERT_EQ(probe.descriptor.spans.size(), static_cast<size_t>(local_heads));
+    for (const LogicalSpan& span : probe.descriptor.spans) {
+      EXPECT_EQ(span.owner_tp_rank, kTpRank);
+      EXPECT_EQ(span.repeat_count, static_cast<uint64_t>(kTokens));
+      EXPECT_GT(span.bytes_per_region, 0U);
+    }
+  }
+  EXPECT_EQ(key.descriptor.spans[0].logical_offset_bytes,
+            value.descriptor.spans[0].logical_offset_bytes);
+
+  // INDEX is replicated: one span, one static owner for every rank, so it can
+  // never ride on a KEY/VALUE owner stripe.
+  EXPECT_EQ(index.descriptor.kind, LogicalShardKind::REPLICATED);
+  ASSERT_EQ(index.descriptor.spans.size(), 1U);
+  EXPECT_EQ(index.descriptor.spans[0].owner_tp_rank, 0);
+  EXPECT_NE(index.descriptor.kind, key.descriptor.kind);
+
+  // Distinct payloads: the three roles describe different byte counts, so a
+  // mapping that shipped one role under another role's geometry would leave a
+  // visible gap rather than coincidentally matching.
+  const uint64_t key_bytes = key.descriptor.spans[0].bytes_per_region;
+  const uint64_t value_bytes = value.descriptor.spans[0].bytes_per_region;
+  const uint64_t index_bytes = index.descriptor.spans[0].bytes_per_region;
+  EXPECT_EQ(key_bytes, value_bytes);
+  EXPECT_NE(index_bytes, key_bytes);
+}
+
 TEST(MooncakeTransferEngineTest, LinksAllPcpSourcesWithOneActiveOwner) {
   MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
   WorkerCacheLayoutManifest destination = make_pcp_manifest(

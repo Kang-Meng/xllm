@@ -1614,6 +1614,15 @@ class Glm5NextMlaAttention(Attention):
     is_glm_next_mla: bool = True
 
     def __init__(self, cfg: Glm5NextConfig, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
+        # num_heads is the GLOBAL cfg.n_heads here, unlike glm5_2's
+        # TP-local count: the model executor forwards it to the attention
+        # backend as-is. That is benign for the SfaDcp decode backend this
+        # model selects at cp_size == 1 + kv_split > 1 -- nothing on its
+        # decode path consumes backend.num_heads (the graph workspace is
+        # MLA-guarded and execute_mla is overridden), and the per-rank head
+        # count the DCP merge produces is derived from the SFA output shape
+        # (h_local = output_heads // dcp_size). Pinned by
+        # tests/python/test_sfa_dcp.py's num_heads convention tests.
         super().__init__(
             num_heads=cfg.n_heads,
             num_kv_heads=cfg.n_kv_heads,

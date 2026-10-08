@@ -41,6 +41,7 @@ from xllm.python.attention.backend import (  # noqa: E402
     LayerCache,
     normalize_layer_caches,
 )
+from xllm.python.attention.sfa_dcp_backend import dcp_layer_options  # noqa: E402
 from xllm.python.layers.attention import Attention  # noqa: E402
 from xllm.python.layers.npu.mega_moe_metadata import MegaMoeMetadata  # noqa: E402
 from xllm.python.layers.npu.mega_moe_metadata_builder import (  # noqa: E402
@@ -544,6 +545,64 @@ class TestCreateAttentionBackend:
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,
     )
+    def test_dflash2_draft_cp1_falls_through_to_plain_paged_backend(self, _mock_is_npu: MagicMock) -> None:
+        """M11.3 admission pin companion: the DFlash2 GQA draft at cp_size == 1
+        with a live DCP group is NOT sharded -- it keeps a full replica of its
+        own pool, read through the expanded block table -- so it must skip the
+        SfaDcp branch entirely (executor's ``is_draft_engine`` fall-through)
+        and land on the plain paged backend with no DCP group attached. A
+        dense (non-draft) target in the same shape is refused instead."""
+        attn = _make_attention_layer(num_kv_heads=1, head_dim=128)
+        dcp_group = MagicMock()
+        dcp_group.size.return_value = 2
+        sfa_module = types.ModuleType("xllm.python.attention.sfa_dcp_backend")
+        sfa_module.SfaDcpAttentionBackend = MagicMock()
+        sfa_module.dcp_layer_options = MagicMock(return_value=512)
+
+        with (
+            patch(
+                "xllm.python.model_executor.executor.distributed.dcp_group",
+                return_value=dcp_group,
+            ),
+            patch(
+                "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
+                StubAttentionBackend,
+            ),
+            patch.dict(sys.modules, {sfa_module.__name__: sfa_module}),
+        ):
+            backend = _create_attention_backend(
+                attn,
+                torch.device("npu"),
+                torch.bfloat16,
+                {"cp_size": 1, "enable_mla": False, "is_draft_engine": True},
+            )
+
+        assert isinstance(backend, StubAttentionBackend)
+        # No DCP group and no MLA: the draft's pool stays an unsharded
+        # full replica.
+        assert "dcp_group" not in backend.init_kwargs
+        assert backend.init_kwargs["is_mla"] is False
+        sfa_module.SfaDcpAttentionBackend.assert_not_called()
+
+        with (
+            patch(
+                "xllm.python.model_executor.executor.distributed.dcp_group",
+                return_value=dcp_group,
+            ),
+            patch.dict(sys.modules, {sfa_module.__name__: sfa_module}),
+            pytest.raises(NotImplementedError, match="Dense DCP attention is not supported"),
+        ):
+            _create_attention_backend(
+                attn,
+                torch.device("npu"),
+                torch.bfloat16,
+                {"cp_size": 1, "enable_mla": False, "is_draft_engine": False},
+            )
+
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
     def test_qwen35_uses_dense_dcp_backend(self, _mock_is_npu: MagicMock) -> None:
         attn = _make_attention_layer(num_kv_heads=1, head_dim=128)
         dcp_group = MagicMock()
@@ -849,6 +908,104 @@ class TestModelExecutorConstruction:
         assert first_attention.num_heads == 8
         assert first_attention.num_kv_heads == 1
         assert first_attention.head_dim == 512
+
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
+    def test_glm_next_decode_cp1_selects_sfa_dcp_backend_from_dsa_layer(
+        self,
+        _mock_is_npu: MagicMock,
+    ) -> None:
+        """M11.3 admission pin's safety half: the only backend selected for a
+        glm5_next MLA instance at cp_size == 1 with a live DCP group is
+        SfaDcpAttentionBackend.
+
+        This is what makes the admitted cp1 + kv_split_size > 1 DECODE shape
+        safe (validate_model_cp's cp1 early return never gates it): the
+        backend localizes its own slots in prepare() and never writes through
+        the global slot mapping. The pin covers the full selection chain --
+        first_attention picked from the DSA layers (``is_glm_next_mla``), the
+        DCP-group branch at cp_size == 1, and ``index_topk`` resolved from the
+        DSA layer's cfg (2048 for GLM-5.3 Flash) through the real
+        ``dcp_layer_options``. It also documents the num_heads convention:
+        glm5_next passes the GLOBAL ``cfg.n_heads`` through the Attention base
+        (unlike glm5_2's TP-local count), which is benign because nothing on
+        the SfaDcp decode path consumes the backend's num_heads (see
+        test_sfa_dcp.py's num_heads pins)."""
+
+        class _DsaAttention(Attention):
+            is_glm_next_mla = True
+
+        class _KdaAttention(Attention):
+            is_glm_next_kda = True
+
+        class _FakeGlmNextDecode(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Linear(1, 1)
+                # KDA (linear attention) layers come first in glm5_next with a
+                # different head config; the backend must be built from the
+                # first DSA layer instead.
+                self.kda = _KdaAttention(
+                    num_heads=16,
+                    num_kv_heads=16,
+                    head_dim=64,
+                    scale=0.125,
+                    sliding_window=0,
+                    layer_id=0,
+                )
+                self.dsa = _DsaAttention(
+                    num_heads=64,
+                    num_kv_heads=1,
+                    head_dim=512,
+                    scale=0.044,
+                    sliding_window=0,
+                    layer_id=3,
+                )
+                self.dsa.cfg = SimpleNamespace(index_topk=2048)
+                self._param = nn.Parameter(torch.zeros(1))
+
+        dcp_group = MagicMock()
+        dcp_group.size.return_value = 2
+        dcp_group.rank.return_value = 0
+        sfa_module = types.ModuleType("xllm.python.attention.sfa_dcp_backend")
+        sfa_module.SfaDcpAttentionBackend = StubAttentionBackend
+        # The real option resolution, not a stub: index_topk must come from
+        # the DSA layer's cfg.
+        sfa_module.dcp_layer_options = dcp_layer_options
+
+        with (
+            patch(
+                "xllm.python.model_executor.executor.distributed.dcp_group",
+                return_value=dcp_group,
+            ),
+            patch.dict(sys.modules, {sfa_module.__name__: sfa_module}),
+        ):
+            executor = ModelExecutor(
+                _FakeGlmNextDecode(),
+                {
+                    "model_type": "glm5_next",
+                    "cp_size": 1,
+                    "enable_mla": True,
+                    "python_graph_backend": "off",
+                },
+                max_seqs_per_batch=4,
+                num_decoding_tokens=1,
+            )
+
+        backend = executor.attention_backend
+        assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["dcp_group"] is dcp_group
+        assert backend.init_kwargs["index_topk"] == 2048
+        # The GLOBAL head count flows in from the DSA layer's Attention base
+        # (glm5_next convention); the SFA merge derives per-rank heads from
+        # output shapes instead, so this value is inert on the decode path.
+        assert backend.init_kwargs["num_heads"] == 64
+        assert backend.init_kwargs["num_kv_heads"] == 1
+        assert backend.init_kwargs["head_dim"] == 512
+        assert backend.init_kwargs["max_num_reqs"] == 4
+        assert backend.init_kwargs["num_decoding_tokens"] == 1
 
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",

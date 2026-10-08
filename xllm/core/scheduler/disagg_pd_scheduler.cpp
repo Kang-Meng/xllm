@@ -549,20 +549,15 @@ void DisaggPDScheduler::dispatch_requests() {
     // expressible as a mapping. resolve_kv_split_plan is the shared
     // resolution: the OOC dispatch override and the push-side width
     // validation compose the same decision.
-    const KvSplitDispatchPlan kv_split_plan =
-        resolve_kv_split_plan(instance_info_.kv_split_size,
-                              instance_info_.cp_index_write_mode,
-                              remote_info,
-                              /*response=*/nullptr);
-    if (kv_split_plan.plan == KvSplitWidthPlan::UNRECONCILABLE) {
-      LOG(ERROR) << "Rejecting request " << request->request_id()
-                 << " for decode instance " << selected_instance << ": "
-                 << kv_split_plan.reason;
-      response_processor_->process_failed_request(
-          request,
-          {StatusCode::INVALID_ARGUMENT,
-           "decode instance " + selected_instance + ": " +
-               kv_split_plan.reason});
+    // The admission sequence (registry snapshot -> fail closed -> width
+    // plan -> reject) lives in admit_kv_split_request; the record this
+    // dispatch just seeded the registry with is the one the helper reads
+    // back under the lock. remote_info stays in hand for the topology
+    // checks above and the response-side re-resolve below.
+    if (!admit_kv_split_request(request,
+                                selected_instance,
+                                /*release_prefill_blocks=*/false)
+             .has_value()) {
       continue;
     }
     if (topo_result.status == PdTopoStatus::ALLOW_HETERO && VLOG_IS_ON(1)) {
@@ -748,8 +743,11 @@ void DisaggPDScheduler::dispatch_requests() {
             info.mappings.emplace_back(std::move(mapping));
           }
           info.dp_rank = resps.resps()[i].dp_rank();
-          // TODO: remote_instances_info_ is not multi-thread safe.
-          info.remote_instance_info = remote_instances_info_[selected_instance];
+          // The same record the gate above resolved against: the unlocked
+          // operator[] read here could observe a mid-flight registration
+          // (and inserts a default width-1 record for a missing key) while
+          // the gate used the scoped snapshot -- keep one source of truth.
+          info.remote_instance_info = remote_info;
 
           // XTensor mode: save destination offsets from D-node
           if (resp.xtensor_layer_offsets_size() > 0) {
@@ -1386,6 +1384,78 @@ void DisaggPDScheduler::do_permanent_rejection(
   kv_cache_manager_->deallocate(request.get());
   std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
   req_to_channel_map_.erase(request->request_id());
+}
+
+void DisaggPDScheduler::reject_unreconcilable_kv_split(
+    const std::shared_ptr<Request>& request,
+    const std::string& instance_name,
+    const std::string& reason,
+    bool release_prefill_blocks) {
+  LOG(ERROR) << "Rejecting " << (release_prefill_blocks ? "offline " : "")
+             << "request " << request->request_id() << " for decode instance "
+             << instance_name << ": " << reason;
+  // The pair can never be expressed as a mapping, so requeueing against
+  // the same pulled instance would spin forever; fail the request, and on
+  // the offline path also release the prefill-side blocks it already
+  // holds (the same cleanup do_permanent_rejection performs, with the
+  // mismatch named in the status).
+  response_processor_->process_failed_request(
+      request,
+      {StatusCode::INVALID_ARGUMENT,
+       "decode instance " + instance_name + ": " + reason});
+  if (release_prefill_blocks) {
+    kv_cache_manager_->deallocate(request.get());
+  }
+  // The same channel-map cleanup do_permanent_rejection performs: the
+  // request is terminal, so its stub mapping must not linger. The retry
+  // paths re-dispatch a request WITHOUT erasing its earlier entry, so a
+  // rejection after a retry would otherwise leave a dead mapping behind
+  // (and the map only grows).
+  {
+    std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
+    req_to_channel_map_.erase(request->request_id());
+  }
+}
+
+std::optional<InstanceInfo> DisaggPDScheduler::admit_kv_split_request(
+    const std::shared_ptr<Request>& request,
+    const std::string& instance_name,
+    bool release_prefill_blocks) {
+  const std::optional<InstanceInfo> remote_record =
+      locked_remote_instance_info(instance_name);
+  if (!remote_record.has_value()) {
+    LOG(ERROR) << "Rejecting request " << request->request_id()
+               << ": no registered record for decode instance " << instance_name
+               << " (unlinked or registration raced the dispatch)";
+    response_processor_->process_failed_request(
+        request,
+        {StatusCode::INVALID_ARGUMENT,
+         "decode instance " + instance_name +
+             ": no registered instance record, KV split width cannot be "
+             "validated"});
+    return std::nullopt;
+  }
+  const KvSplitDispatchPlan kv_split_plan =
+      resolve_kv_split_plan(instance_info_.kv_split_size,
+                            instance_info_.cp_index_write_mode,
+                            *remote_record,
+                            /*response=*/nullptr);
+  if (kv_split_plan.plan == KvSplitWidthPlan::UNRECONCILABLE) {
+    reject_unreconcilable_kv_split(
+        request, instance_name, kv_split_plan.reason, release_prefill_blocks);
+    return std::nullopt;
+  }
+  return remote_record;
+}
+
+std::optional<InstanceInfo> DisaggPDScheduler::locked_remote_instance_info(
+    const std::string& instance_name) {
+  std::lock_guard<std::mutex> lock(instance_channel_map_mutex_);
+  const auto it = remote_instances_info_.find(instance_name);
+  if (it == remote_instances_info_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
 }
 
 void DisaggPDScheduler::update_token_latency_metrics(

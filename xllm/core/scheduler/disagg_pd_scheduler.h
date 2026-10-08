@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -162,6 +163,50 @@ class DisaggPDScheduler : public ContinuousScheduler {
 
  protected:
   void release_failed_request(const std::shared_ptr<Request>& request) override;
+
+  // Fail a request whose kv_split pair resolve_kv_split_plan marked
+  // UNRECONCILABLE. Shared by every dispatch path (the online dispatch
+  // here, PDOOCScheduler's online and offline dispatches) so the width
+  // gate's failure handling cannot drift between the non-OOC and OOC
+  // paths -- the OOC path historically missed the width gate for exactly
+  // that reason. release_prefill_blocks additionally frees the
+  // prefill-side blocks the offline path has already allocated.
+  void reject_unreconcilable_kv_split(const std::shared_ptr<Request>& request,
+                                      const std::string& instance_name,
+                                      const std::string& reason,
+                                      bool release_prefill_blocks);
+
+  // Caller-safe snapshot of a destination's registered record, taken under
+  // instance_channel_map_mutex_: check_remote_instance_info inserts into
+  // remote_instances_info_ on the RPC thread while the OOC scheduler runs
+  // its online and offline dispatches on two concurrent threads, so an
+  // unlocked operator[] read races the map's rehash -- and for a missing
+  // key operator[] would INSERT a default record (kv_split_size = 1,
+  // empty name), silently flipping the width gate's failure direction to
+  // "admit". Dispatch paths take one snapshot per request before the
+  // width gate and carry it through the response handling, so the push
+  // defense sees exactly the record the gate validated. std::nullopt when
+  // the instance has no record (unlinked, or the cached channel predates
+  // registration) -- callers must fail closed on that.
+  std::optional<InstanceInfo> locked_remote_instance_info(
+      const std::string& instance_name);
+
+  // The full KV-split admission sequence every dispatch path runs before
+  // touching a destination: snapshot the peer's registered record under the
+  // registry lock, fail closed when the record is missing (the request is
+  // already failed through process_failed_request), resolve the width plan
+  // through resolve_kv_split_plan, and reject through
+  // reject_unreconcilable_kv_split when the pair is UNRECONCILABLE. Returns
+  // the snapshot on success. The online dispatch here, PDOOCScheduler's
+  // online dispatch, and its offline dispatch MUST route through this helper
+  // -- the sequence was previously copied verbatim per path, and the next
+  // check added to one copy would silently miss the other two.
+  // release_prefill_blocks frees the prefill-side blocks the offline path
+  // has already allocated when it rejects.
+  std::optional<InstanceInfo> admit_kv_split_request(
+      const std::shared_ptr<Request>& request,
+      const std::string& instance_name,
+      bool release_prefill_blocks);
 
   // Caller holds received_request_map_mutex_. Deallocation stays outside it.
   std::shared_ptr<Request> take_waiting_request(const std::string& req_id);

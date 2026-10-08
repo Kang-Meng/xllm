@@ -380,6 +380,56 @@ TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
                            metadata->expanded_decode.paged_kv_indptr));
 }
 
+TEST(MtpAsyncInputBuilderTest, PybindViewDecodeStepStaysKvShardFree) {
+  // M11.3 Route B pin: an MLA decode step never carries KV-shard metadata.
+  // PyExecutorImpl::run attaches KVShardBatchMetadata only for prefill-ish
+  // MLA batches under an active CP group (cp_size > 1 && kv_split_size > 1)
+  // or for dense non-MLA DCP steps, so the cp_size == 1 + kv_split_size > 1
+  // decode shape reaches Python with has_kv_shard=False and
+  // kv_split_size=1 -- the C++ shard fields stay inert on decode by
+  // construction, and SfaDcpAttentionBackend (the only backend selected for
+  // that shape) localizes its own slots in prepare() instead of reading
+  // them. A regression that arms decode-side shard metadata would flip
+  // these accessors and break m11's replicated index-write contract.
+  if (!Py_IsInitialized()) {
+    setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", 1);
+    Py_InitializeEx(0);
+  }
+  py::gil_scoped_acquire gil;
+
+  auto decode_metadata = std::make_shared<layer::AttentionMetadata>();
+  decode_metadata->is_prefill = false;
+  decode_metadata->is_chunked_prefill = false;
+  decode_metadata->kv_seq_lens_vec = {4};
+  decode_metadata->max_seq_len = 4;
+  PyAttentionMetadataView decode_view(decode_metadata);
+
+  EXPECT_FALSE(decode_view.has_kv_shard());
+  EXPECT_EQ(decode_view.kv_split_size(), 1);
+  EXPECT_EQ(decode_view.kv_split_rank(), 0);
+  EXPECT_TRUE(decode_view.local_slot_mapping().is_none());
+
+  // Contrast: the prefill PCP shape the builder does serve. The same view
+  // must expose the shard verbatim, so the decode result above is the
+  // builder's phase gate at work, not a view that ignores shard metadata.
+  auto prefill_metadata = std::make_shared<layer::AttentionMetadata>();
+  prefill_metadata->is_prefill = true;
+  prefill_metadata->is_chunked_prefill = false;
+  auto shard = std::make_shared<layer::KVShardBatchMetadata>();
+  shard->kv_split_size = 2;
+  shard->kv_split_rank = 1;
+  shard->local_slot_mapping = torch::tensor({0, -1}, torch::kLong);
+  prefill_metadata->kv_shard_batch_metadata = shard;
+  PyAttentionMetadataView prefill_view(prefill_metadata);
+
+  EXPECT_TRUE(prefill_view.has_kv_shard());
+  EXPECT_EQ(prefill_view.kv_split_size(), 2);
+  EXPECT_EQ(prefill_view.kv_split_rank(), 1);
+  EXPECT_TRUE(
+      torch::equal(prefill_view.local_slot_mapping().cast<torch::Tensor>(),
+                   shard->local_slot_mapping));
+}
+
 TEST(MtpAsyncInputBuilderTest, SharedModulesPointToTargetModel) {
   py::gil_scoped_acquire gil;
   py::module_ types = py::module_::import("types");

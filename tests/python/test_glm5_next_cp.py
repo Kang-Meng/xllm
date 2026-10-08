@@ -3046,3 +3046,115 @@ def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d
 # continuous pipeline DFlash2+PCP actually exercises, which neither B1 nor
 # B6 alone did.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Schedule-overlap suite (from the sched-overlap branch): the driver
+# worker's fake-output token replacement protocol and its CP-rank
+# byte-identity invariant.
+# ---------------------------------------------------------------------------
+
+
+def _driver_fake_next_tokens(num_decode_seqs: int) -> torch.Tensor:
+    """Driver worker's fake overlap output: 1-based negative row references.
+
+    Mirrors the driver-side construction in ``WorkerService`` (worker_service.cpp):
+    when the overlapped step returns an asynchronous (tokenless) output, the
+    driver emits ``arange(-1, -(N + 1), -1)`` so the scheduler appends
+    placeholder ``-(row + 1)`` into each sequence's token array.
+    """
+    return torch.arange(-1, -1 * (num_decode_seqs + 1), -1, dtype=torch.int32)
+
+
+def _overlap_replace_token_golden(token_ids: torch.Tensor, next_tokens: torch.Tensor) -> torch.Tensor:
+    """CPU golden of the overlapped decode-input token replacement.
+
+    Mirrors the non-NPU fallback of ``WorkerImpl::update_input_by_last_step_output``
+    and the aclnnReplaceToken kernel golden: a negative input value ``v`` is a
+    1-based negative reference resolved as ``next_tokens[-v - 1]``;
+    non-negative values pass through unchanged.
+    """
+    neg_mask = token_ids < 0
+    clamped_neg_indices = torch.clamp(-token_ids, min=0)
+    replacement = next_tokens[clamped_neg_indices - 1]
+    return torch.where(neg_mask, replacement, token_ids)
+
+
+def test_overlap_decode_fake_token_protocol_matches_worker_replacement_rule() -> None:
+    """Placeholder encoding pin: ``-(row + 1)`` resolves to ``next_tokens[row]``
+    and real tokens pass through.
+
+    The overlapped decode input mixes negative placeholders (whose values the
+    driver's fake output fixed at ``-(row + 1)``) with real tokens (e.g. the
+    draft positions of a spec-verify row). The replacement must resolve each
+    placeholder to the same-row sampled token of the previous step and leave
+    real tokens untouched -- otherwise a CP rank would feed the model an input
+    that disagrees with the KV state the other ranks wrote.
+    """
+    num_rows = 5
+    # Distinct real tokens so a wrong row mapping cannot cancel out.
+    real_next_tokens = torch.tensor([101, 202, 303, 404, 505], dtype=torch.int64)
+
+    # Pure decode batch: every row's query token is the driver placeholder.
+    decode_input = _driver_fake_next_tokens(num_rows).clone()
+    replaced = _overlap_replace_token_golden(decode_input, real_next_tokens)
+    assert replaced.dtype == torch.int64
+    torch.testing.assert_close(replaced, real_next_tokens.to(torch.int64))
+
+    # Spec-verify-shaped row: real draft tokens pass through, the trailing
+    # placeholders still resolve through their row references.
+    mixed_input = torch.tensor([7, 8, 909, -4, -5], dtype=torch.int32)
+    mixed_replaced = _overlap_replace_token_golden(mixed_input, real_next_tokens)
+    torch.testing.assert_close(mixed_replaced, torch.tensor([7, 8, 909, 404, 505], dtype=torch.int64))
+
+
+def test_overlap_decode_token_replacement_is_byte_identical_across_cp_ranks() -> None:
+    """CP-rank consistency pin for the overlapped decode-input replacement.
+
+    Under CP with ``kv_split_size == 1`` decode runs replicated on every CP
+    rank, so the master's glm5_next-CP overlap ban (master.cpp: "initially
+    requires enable_schedule_overlap=false") can only be lifted if the
+    replacement each rank performs locally is byte-identical across ranks.
+    The simulation mirrors the real chain:
+
+    1. The engine broadcasts ONE ``ForwardInput`` to both CP ranks -- each
+       rank decodes its own fresh copy of the placeholder tensor.
+    2. Each rank samples its own copy of the replicated logits (under overlap
+       every rank runs the sampler; llm_worker_impl.cpp's non-driver early
+       return only fires when ``enable_schedule_overlap()`` is false),
+       producing its own rank-local ``last_step_output_``.
+    3. Each rank applies the replacement rule independently.
+
+    Deterministic sampling over replicated logits (greedy here) must give the
+    same tokens on both ranks, hence byte-identical decode inputs. If the
+    replacement rule, the placeholder encoding, or the per-rank sampling ever
+    diverges, the two ranks would write disagreeing KV state for the same
+    sequence.
+    """
+    num_rows = 4
+    vocab_size = 32
+    # Replicated CP decode computes the same logits on every rank (the same
+    # invariant test_kda_cp_backend_inputs_are_identical_regardless_of_local_rank
+    # pins at the model seam). Make the argmax distinct per row.
+    logits = torch.randn(num_rows, vocab_size, dtype=torch.float32, generator=torch.Generator().manual_seed(2026))
+
+    # 1. Engine broadcast: one placeholder tensor, fresh copy per CP rank.
+    broadcast_input = _driver_fake_next_tokens(num_rows).clone()
+    rank_inputs = [broadcast_input.clone() for _ in range(2)]
+    assert rank_inputs[0].data_ptr() != rank_inputs[1].data_ptr()
+
+    # 2. Per-rank sampling of replicated logits -> rank-local last_step_output.
+    rank_next_tokens = []
+    for _rank in range(2):
+        local_logits = logits.clone()
+        rank_next_tokens.append(torch.argmax(local_logits, dim=-1).to(torch.int64))
+
+    # 3. Per-rank replacement.
+    rank_replaced = [_overlap_replace_token_golden(rank_inputs[rank], rank_next_tokens[rank]) for rank in range(2)]
+
+    # Byte-identical across ranks: same dtype, same values.
+    assert rank_replaced[0].dtype == rank_replaced[1].dtype
+    assert torch.equal(rank_replaced[0], rank_replaced[1])
+    # And each row resolved to its own sampled token (row mapping is 1-based).
+    torch.testing.assert_close(rank_replaced[0], rank_next_tokens[0])
+    torch.testing.assert_close(rank_replaced[1], rank_next_tokens[1])

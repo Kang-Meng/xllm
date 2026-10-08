@@ -132,18 +132,60 @@ void expect_bitwise_equal(const StateSnapshot& actual,
   }
 }
 
+// The three branches of the reads_distinct_state predicate computed inside
+// WorkerImpl::prepare_linear_state_cache (worker_impl.cpp): native qwen3.5
+// targets read a distinct checkpoint slot for every batch, legacy native
+// models restore in place (slot copy), and python glm5_next reads a distinct
+// state only for non-spec-verify prefill batches. The family picks the
+// worker's model_type; the per-batch predicate below mirrors the worker's.
+enum class RestoreFamily {
+  kLegacyInPlace,
+  kNativeQwenDirectRead,
+  kPythonGlm5Next,
+};
+
+bool reads_distinct_state_for(RestoreFamily family,
+                              const ModelInputParams& params) {
+  switch (family) {
+    case RestoreFamily::kLegacyInPlace:
+      return false;
+    case RestoreFamily::kNativeQwenDirectRead:
+      return true;
+    case RestoreFamily::kPythonGlm5Next:
+      // Mirrors the python-model branch of the worker predicate
+      // (worker_impl.cpp, prepare_linear_state_cache):
+      //   is_python_model && is_glm5_next_target_model(args) &&
+      //   params.meta.batch_forward_type.no_decode() && !params.is_spec_verify
+      // (the python model impl is pinned by the fixture's ModelConfig).
+      return params.meta.batch_forward_type.no_decode() &&
+             !params.is_spec_verify;
+  }
+  return false;
+}
+
 class LifecycleWorker final : public LLMWorkerImpl {
  public:
   LifecycleWorker(const ParallelArgs& parallel_args,
                   const torch::Device& device,
                   const runtime::Options& options,
                   int64_t stride,
-                  bool reads_distinct_state)
-      : LLMWorkerImpl(parallel_args, device, options), stride_(stride) {
+                  RestoreFamily family)
+      : LLMWorkerImpl(parallel_args, device, options),
+        stride_(stride),
+        family_(family) {
     dtype_ = torch::kBFloat16;
     ModelArgs model_args;
-    model_args.model_type(reads_distinct_state ? "qwen3_5"
-                                               : "legacy_linear_test");
+    switch (family_) {
+      case RestoreFamily::kLegacyInPlace:
+        model_args.model_type("legacy_linear_test");
+        break;
+      case RestoreFamily::kNativeQwenDirectRead:
+        model_args.model_type("qwen3_5");
+        break;
+      case RestoreFamily::kPythonGlm5Next:
+        model_args.model_type("glm5_next");
+        break;
+    }
     std::vector<std::string> layer_types;
     layer_types.reserve(kNumLayers);
     for (int64_t layer = 0; layer < kNumLayers; ++layer) {
@@ -201,6 +243,12 @@ class LifecycleWorker final : public LLMWorkerImpl {
       Stream& compute_stream) override {
     auto stream_guard = compute_stream.set_stream_guard();
     CHECK(compute_stream.wait_event(input.metadata_ready_event));
+    // Capture the validity mask as seen by the batch's execute: under overlap
+    // the deferred restore inside step_for_schedule_overlap has already run
+    // by this point, so a marked mask here proves the restore executed inside
+    // the step task rather than after it.
+    masks_at_execute_entry_.push_back(
+        input.input_params.linear_state_validity_mask);
     snapshots_.push_back(clone_states(states_));
     advance_state(
         states_,
@@ -220,44 +268,35 @@ class LifecycleWorker final : public LLMWorkerImpl {
 
   const std::vector<StateSnapshot>& snapshots() const { return snapshots_; }
 
+  const std::vector<std::vector<int64_t>>& masks_at_execute_entry() const {
+    return masks_at_execute_entry_;
+  }
+
  private:
   const int64_t stride_;
+  RestoreFamily family_;
   StateSnapshot states_;
   std::vector<StateSnapshot> snapshots_;
+  std::vector<std::vector<int64_t>> masks_at_execute_entry_;
 };
 
 using LifecycleParameters = std::tuple<int64_t, bool, bool>;
 
-class NpuLinearStateLifecycleTest
-    : public ::testing::TestWithParam<LifecycleParameters> {
+// Shared harness state driving a LifecycleWorker against a CPU reference
+// snapshot sequence. Derived fixtures choose the RestoreFamily and the
+// ModelConfig model_impl in SetUp().
+class LinearStateLifecycleTestBase {
  protected:
-  void SetUp() override {
-    previous_model_impl_ = ModelConfig::get_instance().model_impl();
-    if (Platform::device_count() < 1) {
-      GTEST_SKIP() << "An NPU is required for LINEAR lifecycle tests.";
-    }
-    Device device(/*device_index=*/0);
-    device.set_device();
-    device.init_device_context();
-    stride_ = std::get<0>(GetParam());
-    overlap_ = std::get<1>(GetParam());
-    reads_distinct_state_ = std::get<2>(GetParam());
-    ModelConfig::get_instance().model_impl("native");
+  void construct_worker(const torch::Device& device, RestoreFamily family) {
+    family_ = family;
     const ParallelArgs parallel_args(
         /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
     runtime::Options options;
     options.enable_schedule_overlap(overlap_);
-    worker_ = std::make_unique<LifecycleWorker>(parallel_args,
-                                                device.unwrap(),
-                                                options,
-                                                stride_,
-                                                reads_distinct_state_);
+    worker_ = std::make_unique<LifecycleWorker>(
+        parallel_args, device, options, stride_, family_);
     reference_ = make_states(torch::Device(torch::kCPU), stride_);
     expected_.reserve(10);
-  }
-
-  void TearDown() override {
-    ModelConfig::get_instance().model_impl(previous_model_impl_);
   }
 
   ForwardInput prepare(
@@ -292,8 +331,10 @@ class NpuLinearStateLifecycleTest
   }
 
   void run(ForwardInput& input, const std::vector<int64_t>& expected_mask) {
-    apply_reference(
-        reference_, input.input_params, stride_, reads_distinct_state_);
+    apply_reference(reference_,
+                    input.input_params,
+                    stride_,
+                    reads_distinct_state_for(family_, input.input_params));
     expected_.push_back(clone_states(reference_));
     worker_->run(input);
     EXPECT_EQ(input.input_params.linear_state_validity_mask, expected_mask);
@@ -319,11 +360,37 @@ class NpuLinearStateLifecycleTest
 
   int64_t stride_ = 0;
   bool overlap_ = false;
-  bool reads_distinct_state_ = false;
+  RestoreFamily family_ = RestoreFamily::kLegacyInPlace;
   std::string previous_model_impl_;
   std::unique_ptr<LifecycleWorker> worker_;
   StateSnapshot reference_;
   std::vector<StateSnapshot> expected_;
+};
+
+class NpuLinearStateLifecycleTest
+    : public LinearStateLifecycleTestBase,
+      public ::testing::TestWithParam<LifecycleParameters> {
+ protected:
+  void SetUp() override {
+    previous_model_impl_ = ModelConfig::get_instance().model_impl();
+    if (Platform::device_count() < 1) {
+      GTEST_SKIP() << "An NPU is required for LINEAR lifecycle tests.";
+    }
+    Device device(/*device_index=*/0);
+    device.set_device();
+    device.init_device_context();
+    stride_ = std::get<0>(GetParam());
+    overlap_ = std::get<1>(GetParam());
+    ModelConfig::get_instance().model_impl("native");
+    construct_worker(device.unwrap(),
+                     std::get<2>(GetParam())
+                         ? RestoreFamily::kNativeQwenDirectRead
+                         : RestoreFamily::kLegacyInPlace);
+  }
+
+  void TearDown() override {
+    ModelConfig::get_instance().model_impl(previous_model_impl_);
+  }
 };
 
 TEST_P(NpuLinearStateLifecycleTest, PreservesReusedColdSlots) {
@@ -439,6 +506,117 @@ INSTANTIATE_TEST_SUITE_P(
       return "Stride" + std::to_string(std::get<0>(info.param)) +
              (std::get<1>(info.param) ? "Overlap" : "Prepare") +
              (std::get<2>(info.param) ? "DirectRead" : "InPlaceBackend");
+    });
+
+// ===========================================================================
+// Python glm5_next KDA linear-state restore under schedule overlap.
+//
+// The glm5_next CP overlap ban (master.cpp: "initially requires
+// enable_schedule_overlap=false") keeps these paths dark today; these tests
+// pin the two overlap dependencies the M11.6 gate lift relies on:
+//
+//   1. Deferral: with overlap ON, prepare_work_before_execute_on_stream
+//      SKIPS prepare_linear_state_cache (worker_impl.cpp,
+//      `if (!enable_schedule_overlap()) prepare_linear_state_cache(...)`);
+//      the restore instead runs inside the step task on the compute stream
+//      (LLMWorkerImpl::step_for_schedule_overlap, llm_worker_impl.cpp),
+//      FIFO-serialized with the previous step's device work by the
+//      single-threaded task pool (worker_impl.h). The base
+//      WorkerImpl::step_for_schedule_overlap additionally orders it after the
+//      metadata_ready_event wait (worker_impl.cpp).
+//   2. Mark-only restore: for a glm5_next python prefill batch
+//      (reads_distinct_state=true) restore_linear_state_slots only marks the
+//      validity mask -- no slot copies (linear_state_restore.cpp,
+//      `if (!reads_distinct_state) copy_linear_state_slot(...)`); decode and
+//      spec-verify batches fall back to the copy path.
+// ===========================================================================
+
+using Glm5NextPythonRestoreParameters = std::tuple<int64_t, bool>;
+
+class NpuGlm5NextPythonRestoreTest
+    : public LinearStateLifecycleTestBase,
+      public ::testing::TestWithParam<Glm5NextPythonRestoreParameters> {
+ protected:
+  void SetUp() override {
+    previous_model_impl_ = ModelConfig::get_instance().model_impl();
+    if (Platform::device_count() < 1) {
+      GTEST_SKIP() << "An NPU is required for glm5_next python restore tests.";
+    }
+    Device device(/*device_index=*/0);
+    device.set_device();
+    device.init_device_context();
+    stride_ = std::get<0>(GetParam());
+    overlap_ = std::get<1>(GetParam());
+    // The python-model branch of the reads_distinct_state predicate only
+    // fires for python model impls (ModelConfig::is_python_model_impl).
+    ModelConfig::get_instance().model_impl("python");
+    construct_worker(device.unwrap(), RestoreFamily::kPythonGlm5Next);
+  }
+
+  void TearDown() override {
+    ModelConfig::get_instance().model_impl(previous_model_impl_);
+  }
+};
+
+TEST_P(NpuGlm5NextPythonRestoreTest,
+       PrefillRestoreIsDeferredAndMarksValidityOnly) {
+  // Cold rotated prefill row: the glm5_next python backend materializes slot
+  // 2's distinct read of slot 1 itself, so the restore may only mark the
+  // validity mask (no copy_linear_state_slot).
+  ForwardInput input = prepare({2}, {1}, {0}, BatchForwardType::PREFILL);
+  if (overlap_) {
+    // Deferral pin: the prepare path skipped the restore, so the mask still
+    // holds the pre-restore warm value (cold row -> 0). If the restore had
+    // run at prepare time, the rotated row would already read 1 here.
+    EXPECT_EQ(input.input_params.linear_state_validity_mask,
+              std::vector<int64_t>({0}));
+  } else {
+    // Without overlap the restore runs inside
+    // prepare_work_before_execute_on_stream (worker_impl.cpp), so the
+    // rotated row is already marked before the step task exists.
+    EXPECT_EQ(input.input_params.linear_state_validity_mask,
+              std::vector<int64_t>({1}));
+  }
+  run(input, {1});
+  // The restore ran inside step_for_schedule_overlap, before the batch's
+  // execute observed the input: the execute-entry mask is already marked.
+  EXPECT_EQ(worker_->masks_at_execute_entry(),
+            std::vector<std::vector<int64_t>>({{1}}));
+  // Mark-only pin: the worker's cache states match a reference where NO slot
+  // copy was applied -- any restore-time copy would diverge bitwise.
+  verify();
+}
+
+TEST_P(NpuGlm5NextPythonRestoreTest, DecodeRestoreTakesTheCopyPath) {
+  // The python glm5_next branch of reads_distinct_state requires
+  // no_decode(); a decode batch therefore restores in place (slot copy),
+  // exactly like a legacy native model.
+  ForwardInput input = prepare({2}, {1}, {2050}, BatchForwardType::DECODE);
+  run(input, {1});
+  verify();
+}
+
+TEST_P(NpuGlm5NextPythonRestoreTest, SpecVerifyPrefillRestoreTakesCopyPath) {
+  // !params.is_spec_verify is the second gate of the python glm5_next
+  // branch: a spec-verify batch typed as chunked prefill must take the copy
+  // path even though no_decode() holds.
+  ForwardInput input = prepare({2},
+                               {1},
+                               {0},
+                               BatchForwardType::CHUNKED_PREFILL,
+                               /*is_spec_verify=*/true);
+  run(input, {1});
+  verify();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CheckpointLayouts,
+    NpuGlm5NextPythonRestoreTest,
+    ::testing::Combine(::testing::Values(int64_t{1}, int64_t{3}),
+                       ::testing::Bool()),
+    [](const ::testing::TestParamInfo<Glm5NextPythonRestoreParameters>& info) {
+      return "Stride" + std::to_string(std::get<0>(info.param)) +
+             (std::get<1>(info.param) ? "Overlap" : "Prepare");
     });
 
 }  // namespace

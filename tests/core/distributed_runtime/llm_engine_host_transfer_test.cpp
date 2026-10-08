@@ -14,15 +14,21 @@ limitations under the License.
 ==============================================================================*/
 
 #include <gtest/gtest.h>
+#include <torch/torch.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "core/distributed_runtime/llm_engine.h"
+#include "framework/batch/batch.h"
+#include "framework/block/block_manager_pool.h"
+#include "framework/request/request.h"
+#include "framework/request/stopping_checker.h"
 
 namespace xllm {
 namespace {
@@ -221,6 +227,167 @@ INSTANTIATE_TEST_SUITE_P(
         TransferTopology{16, 2, 1, 1, {8, 9, 10, 11, 12, 13, 14, 15}},
         TransferTopology{16, 2, 4, 0, {0, 1, 2, 3, 4, 5, 6, 7}},
         TransferTopology{16, 2, 4, 1, {8, 9, 10, 11, 12, 13, 14, 15}}));
+
+// ===========================================================================
+// M11.5 scheduler-overlap prework: retain_cache_blocks coverage for a
+// non-DFlash2 CP batch (llm_engine.cpp LLMEngine::step).
+//
+// The engine only retains a dispatched batch's cache blocks when
+// enable_schedule_overlap && is_dflash2_algorithm. That guard is sufficient
+// for a non-DFlash2 CP prefill because the scheduler-side block free of a
+// request finished in the deferred output processing (collect_finished ->
+// BlockManagerPool::deallocate, scheduler_policy.cpp) cannot corrupt the
+// in-flight overlap step: every device access to KV/LINEAR cache tensors is
+// enqueued on the per-worker compute stream in step-task order (the
+// single-threaded WorkerImpl task pool, worker_impl.h, keeps two step tasks
+// FIFO-serial; LLMWorkerImpl::step_for_schedule_overlap chains the deferred
+// linear-state restore and the step on compute_stream_), so a block freed at
+// the next schedule_request and reallocated into the following batch is only
+// written by device work ordered after the in-flight step. DFlash2 needs the
+// extra batch-held Block aliases because its prelaunch enqueues KV writes one
+// additional step ahead, outside that FIFO window (see
+// dflash2_prelaunch_lifecycle_test).
+// ===========================================================================
+
+class StepCaptureWorker final : public WorkerClient {
+ public:
+  folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
+      const ForwardInput& inputs) override {
+    ++step_count_;
+    captured_token_ids_ = inputs.token_ids.clone();
+    RawForwardOutput output;
+    RawSampleOutput sample;
+    RawToken token;
+    token.id = 5;
+    sample.tokens.emplace_back(std::move(token));
+    output.outputs.emplace_back(std::move(sample));
+    return folly::makeSemiFuture(
+        std::optional<RawForwardOutput>(std::move(output)));
+  }
+
+  uint32_t step_count() const { return step_count_; }
+  const torch::Tensor& captured_token_ids() const {
+    return captured_token_ids_;
+  }
+
+ private:
+  uint32_t step_count_ = 0;
+  torch::Tensor captured_token_ids_;
+};
+
+std::shared_ptr<Request> make_overlap_step_request() {
+  const std::vector<int32_t> prompt{1, 2, 3, 4};
+  RequestSamplingParam sampling_param;
+  SchedulerParam scheduler_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(32);
+  stopping_checker.set_max_context_len(30000);
+  stopping_checker.set_ignore_eos(true);
+  RequestState req_state("x",
+                         prompt,
+                         sampling_param,
+                         scheduler_param,
+                         stopping_checker,
+                         prompt.size() + 30000,
+                         /*n=*/1,
+                         /*best_of=*/1,
+                         /*logprobs=*/false,
+                         /*stream=*/false,
+                         /*echo=*/false,
+                         /*skip_special_tokens=*/false,
+                         /*enable_schedule_overlap=*/false,
+                         /*output_func=*/nullptr,
+                         /*outputs_func=*/nullptr);
+  return std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
+}
+
+TEST(LLMEngineOverlapRetainTest,
+     NonDFlash2OverlapStepDoesNotRetainCpPrefillBlocks) {
+  // Two workers form one DP group with cp_size=2: the engine must dispatch
+  // the same forward_inputs[dp_rank] to both CP ranks (llm_engine.cpp: "Engine
+  // sends full global tokens; model-side CP shards inside the worker").
+  std::vector<std::shared_ptr<StepCaptureWorker>> workers;
+  std::vector<std::shared_ptr<WorkerClient>> clients;
+  workers.reserve(2);
+  clients.reserve(2);
+  for (int32_t worker_rank = 0; worker_rank < 2; ++worker_rank) {
+    auto worker = std::make_shared<StepCaptureWorker>();
+    workers.emplace_back(worker);
+    clients.emplace_back(std::move(worker));
+  }
+  runtime::Options options;
+  options.world_size(2).dp_size(1).cp_size(2).enable_schedule_overlap(true);
+  // Any non-DFlash2 algorithm leaves the retain guard off.
+  options.speculative_algorithm("mtp");
+  ClientEngine engine(std::move(options), std::move(clients));
+
+  BlockManagerPool::Options pool_options;
+  pool_options.num_blocks_ = 32;
+  pool_options.block_size_ = 4;
+  pool_options.max_seqs_per_batch_ = 1024;
+  BlockManagerPool pool(pool_options, /*dp_size=*/1);
+  auto request = make_overlap_step_request();
+  Sequence* sequence = request->sequences().front().get();
+  ASSERT_TRUE(pool.try_allocate(sequence));
+  ASSERT_GT(sequence->kv_state().num_blocks(BlockType::KV), 0u);
+  // A prefill batch processes every prompt token: no KV tokens yet.
+  sequence->kv_state().set_kv_cache_tokens_num(0);
+
+  std::vector<Batch> batches;
+  batches.emplace_back(sequence);
+  engine.step(batches);
+
+  // Both CP ranks ran the same batch with byte-identical token inputs.
+  for (const auto& worker : workers) {
+    ASSERT_EQ(worker->step_count(), 1u);
+  }
+  EXPECT_TRUE(torch::equal(workers[0]->captured_token_ids(),
+                           workers[1]->captured_token_ids()));
+
+  // The DFlash2-only guard means a non-DFlash2 overlap step does NOT pin the
+  // batch's blocks: the sequence's own alias is the only reference. Safety
+  // for the freed-block window comes from compute-stream FIFO ordering, not
+  // from scheduler-side retention (see the comment above this test).
+  const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
+  ASSERT_FALSE(kv_blocks.empty());
+  EXPECT_EQ(kv_blocks.front().ref_count(), 1u);
+}
+
+TEST(LLMEngineOverlapRetainTest, DFlash2OverlapStepRetainsCpPrefillBlocks) {
+  std::vector<std::shared_ptr<WorkerClient>> clients;
+  clients.reserve(2);
+  for (int32_t worker_rank = 0; worker_rank < 2; ++worker_rank) {
+    clients.emplace_back(std::make_shared<StepCaptureWorker>());
+  }
+  runtime::Options options;
+  options.world_size(2).dp_size(1).cp_size(2).enable_schedule_overlap(true);
+  options.speculative_algorithm("DFlash2");
+  ClientEngine engine(std::move(options), std::move(clients));
+
+  BlockManagerPool::Options pool_options;
+  pool_options.num_blocks_ = 32;
+  pool_options.block_size_ = 4;
+  pool_options.max_seqs_per_batch_ = 1024;
+  BlockManagerPool pool(pool_options, /*dp_size=*/1);
+  auto request = make_overlap_step_request();
+  Sequence* sequence = request->sequences().front().get();
+  ASSERT_TRUE(pool.try_allocate(sequence));
+  ASSERT_GT(sequence->kv_state().num_blocks(BlockType::KV), 0u);
+  sequence->kv_state().set_kv_cache_tokens_num(0);
+
+  std::vector<Batch> batches;
+  batches.emplace_back(sequence);
+  engine.step(batches);
+
+  // With DFlash2 the dispatched batch holds Block aliases until the deferred
+  // output processing retires it, so the sequence's blocks are shared.
+  const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
+  ASSERT_FALSE(kv_blocks.empty());
+  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
+  // Dropping the batch releases the retain.
+  batches.clear();
+  EXPECT_EQ(sequence->kv_state().blocks(BlockType::KV).front().ref_count(), 1u);
+}
 
 }  // namespace
 }  // namespace xllm

@@ -333,16 +333,6 @@ std::optional<std::string> validate_model_cp(const Options& options,
         }
         const SchedulerConfig& scheduler_config =
             SchedulerConfig::get_instance();
-        // Chunked prefill under CP is admitted only for the DFlash2
-        // whitelist that was actually validated (the spec-verify chunked
-        // prefill path); every other glm5_next CP combination keeps the
-        // pre-existing refusal, matching how the aux-capture gates above
-        // converge on the same predicate.
-        if (scheduler_config.enable_chunked_prefill() &&
-            !is_glm5_next_dflash2) {
-          return "Python GLM-5 Next CP initially requires "
-                 "enable_chunked_prefill=false";
-        }
         if (scheduler_config.enable_mix_batch()) {
           return "Python GLM-5 Next CP initially requires "
                  "enable_mix_batch=false";
@@ -351,10 +341,13 @@ std::optional<std::string> validate_model_cp(const Options& options,
           return "Python GLM-5 Next CP initially requires "
                  "enable_prefix_cache=false";
         }
-        if (scheduler_config.enable_schedule_overlap()) {
-          return "Python GLM-5 Next CP initially requires "
-                 "enable_schedule_overlap=false";
-        }
+        // Schedule overlap is admitted for glm5_next CP: the overlapped
+        // decode token replacement is byte-identical across CP ranks
+        // (greedy argmax over CP-replicated logits, plus the CP sample-token
+        // broadcast for stochastic batches in LLMWorkerImpl), the deferred
+        // KDA linear-state restore stays ordered on the compute stream, and
+        // the single-threaded worker task pool keeps the block lifecycle
+        // FIFO. The M11.5 overlap-invariant tests are the authority.
         if (options.enable_disagg_pd() &&
             options.instance_role() != InstanceRole::PREFILL) {
           return "Python GLM-5 Next CP with disaggregated PD requires the "

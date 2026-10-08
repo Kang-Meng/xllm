@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
-from xllm.python.attention.backend import MlaIndexContext
+from xllm.python.attention.backend import LayerCache, MlaIndexContext
 from xllm.python.attention.kv_shard_layout import KVShardLayout
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
 from xllm.python.attention.sfa_dcp_backend import SfaDcpAttentionBackend
@@ -509,3 +510,119 @@ def test_npu_sparse_flash_attention_passes_none_rope() -> None:
     kwargs = fake_ops.sparse_flash_attention_lse.call_args.kwargs
     assert kwargs["query_rope"] is None
     assert kwargs["key_rope"] is None
+
+
+# ---------------------------------------------------------------------------
+# M11.3 num_heads convention pins (W1 audit verdict: benign).
+#
+# glm5_next passes the GLOBAL cfg.n_heads to the Attention base
+# (glm5_next.py's Glm5NextMlaAttention) while glm5_2 passes the TP-local
+# count, so the executor hands SfaDcpAttentionBackend a GLOBAL num_heads for
+# glm5_next. That value is inert on the SfaDcp decode path: the only
+# prepare-time consumer of backend.num_heads is the non-MLA graph workspace
+# (pinned below), and the per-rank head count the merge produces is derived
+# from the SFA OUTPUT shape, never from the constructor argument.
+# ---------------------------------------------------------------------------
+
+
+def test_sfa_dcp_graph_prepare_never_allocates_num_heads_workspace() -> None:
+    """The only prepare-time consumer of backend.num_heads is the dense-GQA
+    graph workspace, guarded by ``not self._is_mla``; SfaDcp is MLA, so a
+    graph-mode decode prepare must leave it untouched. A regression that
+    lifts the guard would size NPU workspace from the GLOBAL head count and
+    break the glm5_next shape this pin protects."""
+    dcp_group = MagicMock()
+    dcp_group.size.return_value = 2
+    dcp_group.rank.return_value = 0
+    backend = SfaDcpAttentionBackend(
+        # The GLOBAL head count, exactly what glm5_next's Attention base
+        # reports on a tp=2 instance.
+        num_heads=64,
+        num_kv_heads=1,
+        head_dim=512,
+        scale=0.044,
+        sliding_window=0,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        dcp_group=dcp_group,
+        index_topk=2048,
+        max_num_reqs=4,
+    )
+    assert backend.is_mla
+    page_size = 128
+    backend.bind_kv_caches(
+        [
+            LayerCache(
+                key=torch.empty(16, page_size, 1, 512),
+                value=torch.empty(16, page_size, 1, 0),
+                index=torch.empty(32, page_size, 1, 128),
+            )
+        ]
+    )
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([10], dtype=torch.int32),
+        block_table=torch.tensor([[1]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([200], dtype=torch.int32),
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=None,
+        q_cu_seq_lens=None,
+        q_seq_lens=None,
+        expanded_decode_metadata=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        has_kv_shard=False,
+        kv_split_size=1,
+    )
+
+    with forward_context(_cpu_context(AclGraphExecutionState({}))):
+        backend.prepare(metadata, graph_mode=True)
+
+    assert backend._graph_workspace is None
+
+
+def test_merge_dcp_outputs_derives_local_heads_from_output_shape() -> None:
+    """The merged output's head count comes from the SFA output shape
+    (``h_local = output_heads // dcp_size``, sfa_dcp.py), not from the
+    backend's constructor num_heads.
+
+    The gathered query's head count is whatever the model's per-rank
+    projection produced times the DCP group size -- for the M11.4 shape
+    D(cp1, tp2, ks2) that is the GLOBAL count -- so deriving per-rank heads
+    from the tensor keeps the merge correct for every TP x kv_split
+    combination regardless of the convention the Attention base used."""
+    impl = AscendSFADCPImpl(
+        _IdentityDcpGroup(),
+        scale=0.1,
+        index_topk=8,
+        layout=KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0),
+    )
+    num_tokens = 3
+    gathered_heads = 16
+    head_dim = 8
+    output = torch.randn(num_tokens, gathered_heads, head_dim)
+    softmax_lse = torch.randn(num_tokens, gathered_heads)
+    merged = torch.randn(num_tokens, gathered_heads // 2, head_dim)
+
+    with (
+        forward_context(_cpu_context(None)),
+        patch(
+            "xllm.python.kernels_npu.triton.dcp_packed_a2a.pack_dcp_output_lse",
+        ) as pack,
+        patch(
+            "xllm.python.kernels_npu.triton.dcp_packed_a2a.fused_dcp_lse_combine",
+            return_value=merged,
+        ) as combine,
+        patch.object(torch.distributed, "all_to_all_single") as all_to_all,
+    ):
+        result = impl._merge_dcp_outputs(output, softmax_lse)
+
+    assert result is merged
+    pack.assert_called_once()
+    all_to_all.assert_called_once()
+    # The combine consumes a merged buffer sized from the OUTPUT shape:
+    # 16 gathered heads over a dcp group of 2 -> 8 per-rank heads.
+    combine.assert_called_once()
+    merged_arg = combine.call_args.kwargs["output"]
+    assert tuple(merged_arg.shape) == (num_tokens, gathered_heads // 2, head_dim)
+    # The pack stage saw the gathered (output-shaped) head count verbatim.
+    assert pack.call_args.args[0] is output

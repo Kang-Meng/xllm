@@ -42,6 +42,7 @@ limitations under the License.
 #endif
 #include "models/model_registry.h"
 #include "runtime/params_utils.h"
+#include "runtime/speculative_worker_utils.h"
 #include "util/env_var.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
@@ -390,6 +391,49 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     output.max_top_logprobs = sampling_params.max_top_logprobs;
     if (!input.skip_sampling_for_logits_only) {
       auto sample_output = sampler_->forward(logits, sampling_params);
+      // Stochastic sampling under schedule overlap needs a CP-wide
+      // consensus: the overlapped decode replacement
+      // (update_input_by_last_step_output) resolves every rank's negative
+      // placeholders against its own rank-local sample, so all ranks of the
+      // plane must derive the same tokens. Greedy argmax over the
+      // CP-replicated logits is deterministic, but random_sample draws from
+      // the per-process default RNG, which is only seeded identically at
+      // init -- nothing keeps the generators in lockstep afterwards -- so
+      // unify stochastic batches with a root-0 broadcast, mirroring
+      // enable_spec_token_broadcast and DFlash2's noise consensus. The
+      // composition lands on the cohort's dp_driver, the worker whose
+      // output the engine collects. Requiring overlap is what makes the
+      // collective safe: without it only driver ranks sample.
+      //
+      // The tp axis runs where the backend publishes a tp group; the NPU ATB
+      // path builds only the cp group when cp_size > 1 (tp_group_ stays
+      // nullptr), so there the cp-axis broadcast is the operative consensus.
+      // What must never happen is entering this block with no usable group
+      // at all -- that would silently skip every axis -- so fail loudly
+      // instead of degrading. (Deliberately NOT the peers' tp && cp
+      // conjunction from mtp_worker_impl/dflash_worker_impl: under ATB both
+      // process_group_ and tp_group_ are nullptr, and that branch would
+      // broadcast on a null sampling group, skipping the cp axis too.)
+      if (enable_schedule_overlap() && options_.cp_size() > 1 &&
+          !options_.enable_speculative_decode() &&
+          !sampling_params.all_greedy_sample) {
+        CHECK(parallel_args_.tp_group_ != nullptr ||
+              parallel_args_.cp_group_ != nullptr)
+            << "cp_size=" << options_.cp_size()
+            << " but no tp/cp broadcast group is available for the "
+               "schedule-overlap token consensus";
+        speculative_worker::broadcast_tokens_in_group(sample_output.next_tokens,
+                                                      parallel_args_.tp_group_);
+        // Only broadcast the CP axis when it is a genuinely orthogonal
+        // group: backends that publish a single process group alias
+        // cp_group_ to tp_group_, and a second broadcast over the same
+        // group would be a redundant collective per decode step. Mirrors
+        // broadcast_spec_tokens' guard in mtp_worker_impl.
+        if (parallel_args_.cp_group_ != parallel_args_.tp_group_) {
+          speculative_worker::broadcast_tokens_in_group(
+              sample_output.next_tokens, parallel_args_.cp_group_);
+        }
+      }
       output.filter_bitmask_applied_to_logits =
           sampling_params.filter_bitmask.defined();
 
