@@ -262,8 +262,8 @@ void run_layer_chain(LayerTestMode mode) {
                                                 input_params,
                                                 &pending,
                                                 /*is_last_layer=*/false);
-    ASSERT_FALSE(pending.has_value());
-    ASSERT_EQ(output.sizes(), (torch::IntArrayRef{tokens, 4, kHiddenSize}));
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_EQ(output.sizes(), (torch::IntArrayRef{tokens, kHiddenSize}));
     output = second_layer->forward(hidden,
                                    residual,
                                    positions,
@@ -286,11 +286,11 @@ void run_layer_chain(LayerTestMode mode) {
   }
 }
 
-TEST(Glm5NextDecoderLayerTest, PrefillDoesNotDeferMHC) {
+TEST(Glm5NextDecoderLayerTest, PrefillDefersMHCThroughTheLayerChain) {
   run_layer_chain(LayerTestMode::PREFILL);
 }
 
-TEST(Glm5NextDecoderLayerTest, ChunkedPrefillDoesNotDeferMHC) {
+TEST(Glm5NextDecoderLayerTest, ChunkedPrefillDefersMHCThroughTheLayerChain) {
   run_layer_chain(LayerTestMode::CHUNKED_PREFILL);
 }
 

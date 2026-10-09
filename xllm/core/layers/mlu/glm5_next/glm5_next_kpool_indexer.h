@@ -31,6 +31,7 @@ limitations under the License.
 #include "layers/common/linear.h"
 #include "layers/common/rms_norm.h"
 #include "layers/common/rotary_embedding.h"
+#include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
 
 namespace xllm::layer {
 
@@ -76,12 +77,29 @@ class Glm5NextKPoolIndexerImpl final : public torch::nn::Module {
       torch::Tensor& tail_cache,
       const AttentionMetadata& attn_metadata);
 
+  std::tuple<torch::Tensor, torch::Tensor> forward_pcp(
+      const torch::Tensor& local_hidden_states,
+      const torch::Tensor& local_q_norm,
+      const torch::Tensor& local_positions,
+      const torch::Tensor& global_positions,
+      torch::Tensor& index_cache,
+      torch::Tensor& tail_cache,
+      const AttentionMetadata& global_metadata,
+      const AttentionMetadata& local_metadata,
+      const glm5_next_pcp::Context& context);
+
   void load_state_dict(const StateDict& state_dict);
 
   int64_t output_width() const { return index_topk_ + index_kpool_ - 1; }
 
  private:
-  struct Execution;
+  struct Execution {
+    std::shared_ptr<const KPoolBatchMetadata> batch;
+    bool graph_decode = false;
+    bool prefill = false;
+    bool fused_update = false;
+    int64_t score_capacity = 0;
+  };
 
   Execution prepare_execution(const AttentionMetadata& metadata,
                               const torch::Tensor& positions) const;
@@ -99,6 +117,12 @@ class Glm5NextKPoolIndexerImpl final : public torch::nn::Module {
                              const torch::Tensor& index_cache,
                              const AttentionMetadata& metadata,
                              const Execution& execution);
+  torch::Tensor select_projected_pools(const torch::Tensor& query,
+                                       const torch::Tensor& weights,
+                                       const torch::Tensor& positions,
+                                       const torch::Tensor& index_cache,
+                                       const AttentionMetadata& metadata,
+                                       const Execution& execution);
   torch::Tensor project_query(const torch::Tensor& q_norm,
                               const torch::Tensor& positions,
                               const AttentionMetadata& attn_metadata);

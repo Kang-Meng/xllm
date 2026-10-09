@@ -18,7 +18,6 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
-#include <numeric>
 #include <vector>
 
 #include "core/framework/config/eplb_config.h"
@@ -209,6 +208,17 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
     const torch::Tensor& local_hidden_states,
     const std::optional<torch::Tensor>& local_input_ids,
     const mlu_v4_cp::DeepseekV4CpContext& cp_context) {
+  return forward_cp(local_hidden_states,
+                    local_input_ids,
+                    cp_context.geometry.tokens_per_rank,
+                    cp_context.cp_group);
+}
+
+torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
+    const torch::Tensor& local_hidden_states,
+    const std::optional<torch::Tensor>& local_input_ids,
+    const std::vector<int32_t>& tokens_per_rank,
+    ProcessGroup* cp_group) {
   ProcessGroup* ep_group = routed_pg();
   ProcessGroup* tp_group = parallel_args_.tp_group_;
   CHECK(ep_group != nullptr);
@@ -216,7 +226,7 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
   const int32_t tp_size = tp_group->world_size();
   const int32_t tp_rank = tp_group->rank();
   const int32_t ep_size = ep_group->world_size();
-  CHECK_EQ(ep_size, cp_context.cp_group->world_size() * tp_size)
+  CHECK_EQ(ep_size, cp_group->world_size() * tp_size)
       << "DeepSeek V4 CP-aware MoE currently requires dp_size == 1 and a "
          "world-sized EP group.";
 
@@ -234,14 +244,20 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
   for (int32_t ep_rank = 0; ep_rank < ep_size; ++ep_rank) {
     const int32_t cp_rank = ep_rank / tp_size;
     const int32_t attention_tp_rank = ep_rank % tp_size;
-    const int32_t cp_tokens =
-        cp_context.geometry.tokens_per_rank[static_cast<size_t>(cp_rank)];
+    const int32_t cp_tokens = tokens_per_rank[static_cast<size_t>(cp_rank)];
     unique_tokens_per_ep_rank.emplace_back(
         split_range(cp_tokens, tp_size, attention_tp_rank).second);
   }
 
-  torch::Tensor gathered_hidden = parallel_state::gather(
+  auto pending_hidden = parallel_state::launch_gather(
       unique_hidden, ep_group, unique_tokens_per_ep_rank);
+  torch::Tensor shared_out;
+  if (local_unique_tokens > 0) {
+    shared_out = moe_->forward_shared(
+        unique_hidden.reshape({-1, local_hidden_states.size(-1)}));
+  }
+  torch::Tensor gathered_hidden =
+      parallel_state::finish_gather(std::move(pending_hidden));
   std::optional<torch::Tensor> gathered_ids = std::nullopt;
   if (local_input_ids.has_value()) {
     torch::Tensor unique_ids = local_input_ids.value().narrow(
@@ -256,7 +272,6 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
   torch::Tensor gathered_rows =
       gathered_hidden.reshape({-1, gathered_hidden.size(-1)}).contiguous();
   const int64_t row_factor = gathered_rows.size(0) / gathered_hidden.size(0);
-  torch::Tensor shared_out = moe_->forward_shared(gathered_rows);
   torch::Tensor routed_out = moe_->forward_experts(
       gathered_rows, /*enable_all2all_communication=*/false, route);
 
@@ -290,13 +305,8 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
       rows_per_ep_rank[static_cast<size_t>(ep_group->rank())];
   unique_output = unique_output.narrow(/*dim=*/0, 0, local_unique_rows);
 
-  const int64_t shared_offset =
-      std::accumulate(rows_per_ep_rank.begin(),
-                      rows_per_ep_rank.begin() + ep_group->rank(),
-                      int64_t{0});
   if (shared_out.defined()) {
-    unique_output.add_(shared_out.narrow(
-        /*dim=*/0, shared_offset, local_unique_rows));
+    unique_output.add_(shared_out);
   }
 
   gathered_shape[0] = local_unique_tokens;

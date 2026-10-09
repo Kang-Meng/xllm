@@ -74,6 +74,18 @@ cc_test(
 
 cc_test(
   NAME
+    glm5_next_pcp_context_test
+  SRCS
+    glm5_next_pcp_context_test.cpp
+  DEPS
+    :mlu_layers
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     glm5_next_kpool_indexer_test
   SRCS
     glm5_next_kpool_indexer_test.cpp

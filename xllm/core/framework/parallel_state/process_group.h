@@ -102,6 +102,11 @@ class ProcessGroup {
   // source of truth across the consensus group.
   virtual void broadcast(torch::Tensor& input, int32_t root_rank = 0);
 
+  // Keep input alive until the returned work has been waited on by its
+  // consumer. Returns a null work when world_size() <= 1.
+  virtual c10::intrusive_ptr<c10d::Work> broadcast_async(torch::Tensor& input,
+                                                         int32_t root_rank = 0);
+
   virtual void all_to_all_single(
       torch::Tensor output,
       torch::Tensor input,

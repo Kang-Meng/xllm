@@ -482,10 +482,16 @@ Glm5NextKDAImpl::split_mixed_qkv(const torch::Tensor& mixed_qkv) const {
       mixed_qkv, local_num_heads_, local_num_heads_, head_dim_, head_dim_);
 }
 
-torch::Tensor Glm5NextKDAImpl::forward(const torch::Tensor& hidden_states,
-                                       const AttentionMetadata& attn_metadata,
-                                       KVCache& kv_cache,
-                                       const ModelInputParams& input_params) {
+torch::Tensor Glm5NextKDAImpl::forward(
+    const torch::Tensor& hidden_states,
+    const AttentionMetadata& attn_metadata,
+    KVCache& kv_cache,
+    const ModelInputParams& input_params,
+    const glm5_next_pcp::Context* pcp_context) {
+  if (pcp_context != nullptr) {
+    return forward_pcp(
+        hidden_states, attn_metadata, kv_cache, input_params, *pcp_context);
+  }
   const int64_t num_tokens = hidden_states.size(0);
   if (input_params.is_spec_verify) {
     CHECK(attn_metadata.is_chunked_prefill)

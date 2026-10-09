@@ -1861,4 +1861,123 @@ TEST(Glm5NextKPoolIndexerTest, PrefillChainMatchesIndependentTorchState) {
   }
   KVCacheConfig::get_instance().block_size(saved);
 }
+
+// Long prefills score straight from the paged pool cache.  Rows that see more
+// complete pools than the selection budget must keep the highest-scoring ones.
+TEST(Glm5NextKPoolIndexerTest, LongPrefillKeepsTopScoringPoolsBeyondBudget) {
+  torch::NoGradGuard no_grad;
+  torch::manual_seed(44207);
+  const torch::Device device(Platform::type_torch(), 0);
+  const auto opts =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const int64_t saved = KVCacheConfig::get_instance().block_size();
+  KVCacheConfig::get_instance().block_size(16);
+  ModelArgs args;
+  args.model_type("glm5_next")
+      .hidden_size(kHidden)
+      .q_lora_rank(kRank)
+      .index_n_heads(kHeads)
+      .index_head_dim(128)
+      .qk_rope_head_dim(0)
+      .index_topk(kTopk)
+      .index_kpool(4)
+      .index_kpool_compress(true)
+      .index_kpool_always_select_tail(false)
+      .max_position_embeddings(1048576);
+  ParallelArgs parallel(0, 1, nullptr);
+  Glm5NextKPoolIndexer indexer(args, QuantArgs(), parallel, nullptr, opts);
+  auto parameters = indexer->named_parameters();
+  for (auto& p : parameters) {
+    p.value().zero_();
+  }
+  // Sparse identity projections make the reference independent of GEMM tiling.
+  const auto identity = torch::eye(128, opts);
+  parameters["wk.weight"].narrow(1, 0, 128).copy_(identity);
+  parameters["wq_b.weight"].narrow(1, 0, 128).copy_(
+      identity.repeat({kHeads, 1}));
+  parameters["k_norm.weight"].fill_(1);
+  parameters["weights_proj.weight"].select(1, 128).fill_(1.0 / 32);
+  constexpr int64_t kTokens = 4800;
+  constexpr int64_t kPages = kTokens / 16;
+  torch::Tensor hidden = torch::randn({kTokens, kHidden}, opts);
+  hidden.select(1, 128).fill_(1);
+  const torch::Tensor query_input = torch::randn({kTokens, kRank}, opts);
+  torch::Tensor hadamard = torch::ones({1, 1});
+  for (int64_t size = 1; size < 128; size *= 2) {
+    hadamard = torch::cat({torch::cat({hadamard, hadamard}, 1),
+                           torch::cat({hadamard, -hadamard}, 1)},
+                          0);
+  }
+  hadamard /= std::sqrt(128.0);
+  const auto ints = opts.dtype(torch::kInt32);
+  AttentionMetadata meta{};
+  meta.is_prefill = true;
+  meta.q_seq_lens_vec = {static_cast<int32_t>(kTokens)};
+  meta.kv_seq_lens_vec = meta.q_seq_lens_vec;
+  meta.q_seq_lens = torch::tensor(meta.q_seq_lens_vec, ints);
+  meta.kv_seq_lens = meta.q_seq_lens.clone();
+  meta.linear_state_indices = torch::tensor({1}, ints);
+  meta.block_table = torch::arange(kPages, ints).flip({0}).view({1, kPages});
+  const torch::Tensor positions = torch::arange(kTokens, ints);
+  torch::Tensor cache = torch::zeros({kPages, 1, 4, 128}, opts);
+  torch::Tensor tail = torch::zeros({2, 2, 12, 128}, opts);
+  const auto [slots, lengths] =
+      indexer->forward(hidden, query_input, positions, cache, tail, meta);
+  // Selection is defined on the keys the prefill actually cached.
+  const torch::Tensor keys =
+      read_pool_history(
+          cache, meta.block_table, meta.kv_seq_lens, kTokens, 16, 4)
+          .keys[0]
+          .cpu()
+          .to(torch::kFloat32);
+  // The device rounds the rotated query to BF16 on its own; scores within this
+  // margin of the budget boundary may fall on either side.
+  constexpr double kScoreMargin = 1e-3;
+  for (const int64_t row : {2051, 3999, 4799}) {
+    SCOPED_TRACE(row);
+    const int64_t count = (row + 1) / 4;
+    ASSERT_GT(count, kSelected);
+    const torch::Tensor q =
+        torch::matmul(
+            query_input[row].cpu().narrow(0, 0, 128).to(torch::kFloat32),
+            hadamard.transpose(0, 1))
+            .to(torch::kBFloat16)
+            .to(torch::kFloat32);
+    const torch::Tensor scores =
+        torch::relu(torch::matmul(keys.narrow(0, 0, count), q)) /
+        std::sqrt(4096.0);
+    const double boundary =
+        std::get<0>(scores.topk(kSelected))[kSelected - 1].item<double>();
+    const torch::Tensor must_select = scores > boundary + kScoreMargin;
+    const torch::Tensor may_select = scores >= boundary - kScoreMargin;
+
+    const torch::Tensor physical = slots[row].cpu().to(torch::kInt64);
+    const torch::Tensor live = physical.masked_select(physical >= 0);
+    EXPECT_EQ(lengths[row].item<int32_t>(), kSelected * 4);
+    EXPECT_EQ(live.numel(), kSelected * 4);
+    // block_table maps logical page p to physical page kPages - 1 - p.
+    const torch::Tensor logical =
+        (kPages - 1 - torch::floor_divide(live, 16)) * 16 +
+        torch::remainder(live, 16);
+    const torch::Tensor pools = torch::floor_divide(logical, 4);
+    ASSERT_TRUE(pools.lt(count).all().item<bool>());
+    torch::Tensor selected = torch::zeros({count}, torch::kBool);
+    selected.index_fill_(/*dim=*/0, pools, true);
+    EXPECT_EQ(selected.sum().item<int64_t>(), kSelected);
+    EXPECT_FALSE((must_select & ~selected).any().item<bool>());
+    EXPECT_FALSE((selected & ~may_select).any().item<bool>());
+  }
+  // The longest rows have more positive scores than the budget, so the boundary
+  // separates real scores rather than ReLU ties.
+  const torch::Tensor last_q =
+      torch::matmul(
+          query_input[kTokens - 1].cpu().narrow(0, 0, 128).to(torch::kFloat32),
+          hadamard.transpose(0, 1))
+          .to(torch::kBFloat16)
+          .to(torch::kFloat32);
+  EXPECT_GT(
+      torch::matmul(keys, last_q).gt(64 * kScoreMargin).sum().item<int64_t>(),
+      kSelected);
+  KVCacheConfig::get_instance().block_size(saved);
+}
 }  // namespace xllm::layer

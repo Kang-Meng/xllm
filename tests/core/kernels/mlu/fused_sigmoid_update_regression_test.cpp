@@ -621,6 +621,87 @@ TEST(FusedSigmoidUpdateTest, BatchedKdaShapeFitsMluNram) {
   EXPECT_TRUE(torch::equal(final_state, initial_state));
 }
 
+TEST(FusedSigmoidUpdateTest, BatchedSixteenHeadKdaMatchesSingleSteps) {
+  torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  torch::DeviceGuard guard(device);
+  torch::manual_seed(20260923);
+  constexpr int64_t kSequences = 16;
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kDim = 128;
+  const torch::TensorOptions fp32 =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  const torch::TensorOptions bf16 = fp32.dtype(torch::kBFloat16);
+  const torch::TensorOptions int32 = fp32.dtype(torch::kInt32);
+  const torch::Tensor a_log = torch::zeros({kHeads}, fp32);
+  const torch::Tensor dt_bias = torch::zeros({kHeads * kDim}, fp32);
+  torch::Tensor gate =
+      (torch::randn({kSequences, kHeads * kDim}, fp32) - 2.0f).to(bf16);
+  torch::Tensor beta = torch::randn({kSequences, kHeads}, bf16);
+  torch::Tensor q = torch::randn({1, kSequences, kHeads, kDim}, bf16);
+  torch::Tensor k = torch::randn_like(q);
+  torch::Tensor v = torch::randn_like(q);
+  torch::Tensor initial =
+      torch::randn({kSequences + 1, kHeads, kDim, kDim}, fp32) * 0.01f;
+  torch::Tensor batched_state = initial.clone();
+  torch::Tensor sequential_state = initial.clone();
+  torch::Tensor indices =
+      torch::arange(1, kSequences + 1, int32).view({kSequences, 1});
+  torch::Tensor cu = torch::arange(0, kSequences + 1, int32);
+  auto run = [&](torch::Tensor query,
+                 torch::Tensor key,
+                 torch::Tensor value,
+                 torch::Tensor raw_gate,
+                 torch::Tensor raw_beta,
+                 torch::Tensor state_indices,
+                 torch::Tensor starts,
+                 torch::Tensor& state) {
+    return fused_sigmoid_gating_delta_rule_update(
+        a_log,
+        raw_gate,
+        raw_beta,
+        dt_bias,
+        query,
+        key,
+        value,
+        state,
+        state_indices,
+        starts,
+        /*scale=*/1.0 / std::sqrt(static_cast<double>(kDim)),
+        /*use_qk_l2norm_in_kernel=*/true,
+        /*softplus_beta=*/1.0f,
+        /*softplus_threshold=*/20.0f,
+        /*num_accepted_tokens_opt=*/std::nullopt,
+        /*inplace_final_state=*/true,
+        /*is_kda=*/true,
+        /*kda_use_safe_gate=*/true,
+        /*kda_gate_lower_bound=*/-5.0f);
+  };
+  const torch::Tensor batched_output =
+      run(q, k, v, gate, beta, indices, cu, batched_state).first;
+  std::vector<torch::Tensor> outputs;
+  outputs.reserve(kSequences);
+  for (int64_t sequence = 0; sequence < kSequences; ++sequence) {
+    outputs.emplace_back(run(q.narrow(1, sequence, 1),
+                             k.narrow(1, sequence, 1),
+                             v.narrow(1, sequence, 1),
+                             gate.narrow(0, sequence, 1),
+                             beta.narrow(0, sequence, 1),
+                             indices.narrow(0, sequence, 1),
+                             torch::tensor({0, 1}, int32),
+                             sequential_state)
+                             .first);
+  }
+  torch_mlu::synchronize();
+  EXPECT_TRUE(torch::allclose(batched_output,
+                              torch::cat(outputs, /*dim=*/1),
+                              /*rtol=*/5e-3,
+                              /*atol=*/2e-5));
+  EXPECT_TRUE(torch::allclose(batched_state,
+                              sequential_state,
+                              /*rtol=*/1e-3,
+                              /*atol=*/2e-5));
+}
+
 TEST(FusedSigmoidUpdateTest, CompileHintsSeparateKernelCacheEntries) {
   const triton_jit::SpecList specs;
   const triton_jit::LaunchCfg default_cfg{1, 4};

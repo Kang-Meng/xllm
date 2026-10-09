@@ -526,6 +526,9 @@ void fused_compress_multi_kv(const torch::Tensor& kv,
                              bool overlap,
                              torch::Tensor& compressed_kv);
 
+// Clamp gate/up halves while preserving the layout expected by scaled_quantize.
+torch::Tensor fused_moe_clamp(const torch::Tensor& input, float limit);
+
 torch::Tensor causal_conv1d_fn(
     const torch::Tensor& x,
     const torch::Tensor& weight,

@@ -447,6 +447,31 @@ TEST_F(DeepseekV2SparseMoEBlockTest, MergeOutDpGatherSlicesLocalTokens) {
       mat(/*rows=*/3, {112.0f, 124.0f, 136.0f, 148.0f, 160.0f, 172.0f}));
 }
 
+TEST_F(DeepseekV2SparseMoEBlockTest,
+       Glm5NextClampedExpertsRepeatWithCachedKernel) {
+  model_args_.model_type() = "glm5_next";
+  model_args_.swiglu_limit() = 10.0f;
+  set_tp_ctx(/*world_size=*/1, /*ep_size=*/1);
+  auto moe = create_raw_moe();
+  StateDict state_dict(create_fp_weights(/*n_shared_experts=*/1));
+  moe->load_state_dict(state_dict);
+  const torch::Tensor input =
+      test::seeded_tensor("glm5_next_clamped_experts.input",
+                          {4, model_args_.hidden_size()},
+                          torch::kBFloat16,
+                          options_.device());
+  const torch::Tensor original = input.clone();
+  const torch::Tensor first =
+      moe->forward_experts(input, /*enable_all2all_communication=*/false);
+  const torch::Tensor second =
+      moe->forward_experts(input, /*enable_all2all_communication=*/false);
+  sync_dev();
+  EXPECT_EQ(first.sizes(), input.sizes());
+  EXPECT_TRUE(torch::isfinite(first.cpu()).all().item<bool>());
+  EXPECT_TRUE(torch::equal(first.cpu(), second.cpu()));
+  EXPECT_TRUE(torch::equal(input.cpu(), original.cpu()));
+}
+
 TEST_F(DeepseekV2SparseMoEBlockTest, ForwardReducePathCombinesSharedAndRouted) {
   auto block = create_block();
   auto raw_moe = create_raw_moe();

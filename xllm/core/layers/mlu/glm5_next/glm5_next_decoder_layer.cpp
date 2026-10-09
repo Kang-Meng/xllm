@@ -173,15 +173,26 @@ torch::Tensor Glm5NextDecoderLayerImpl::forward(
     const ModelInputParams& input_params,
     std::optional<PendingMHC>* pending_mhc,
     bool is_last_layer,
-    bool materialize_output) {
+    bool materialize_output,
+    const glm5_next_pcp::Context* pcp_context) {
+  if (pcp_context != nullptr) {
+    return forward_pcp(hidden_states,
+                       residual,
+                       positions,
+                       attn_metadata,
+                       pcp_context->local_metadata,
+                       kv_cache,
+                       input_params,
+                       pending_mhc,
+                       is_last_layer,
+                       materialize_output,
+                       *pcp_context);
+  }
   residual = std::nullopt;
 
   const bool has_pending_storage = pending_mhc != nullptr;
   const bool has_pending = has_pending_storage && pending_mhc->has_value();
   const MHCFusionPlan mhc_plan = resolve_mhc_fusion({
-      .is_prefill = attn_metadata.is_prefill,
-      .is_chunked_prefill = attn_metadata.is_chunked_prefill,
-      .is_spec_verify = attn_metadata.is_spec_verify,
       .supports_fused_mhc = attn_hc_pre_->supports_fused_mhc() &&
                             ffn_hc_pre_->supports_fused_mhc(),
       .has_pending_storage = has_pending_storage,
@@ -258,6 +269,103 @@ torch::Tensor Glm5NextDecoderLayerImpl::forward(
   }
   // Auxiliary hidden capture needs the post-mHC residual streams at this
   // layer boundary. Keep fusion within the layer and consume any pending input.
+  if (mhc_plan.defer_post && !materialize_output) {
+    pending_mhc->emplace(
+        PendingMHC{ffn_output, residual_ffn, ffn_hc.post, ffn_hc.comb});
+    hidden_states = ffn_output;
+    return hidden_states;
+  }
+  std::tie(hidden_states, std::ignore) =
+      hc_post_->forward(ffn_output, residual_ffn, ffn_hc.post, ffn_hc.comb);
+  return hidden_states;
+}
+
+torch::Tensor Glm5NextDecoderLayerImpl::forward_pcp(
+    torch::Tensor& hidden_states,
+    std::optional<torch::Tensor>& residual,
+    torch::Tensor& positions,
+    const AttentionMetadata& global_metadata,
+    const AttentionMetadata& local_metadata,
+    KVCache& kv_cache,
+    const ModelInputParams& input_params,
+    std::optional<PendingMHC>* pending_mhc,
+    bool is_last_layer,
+    bool materialize_output,
+    const glm5_next_pcp::Context& context) {
+  residual = std::nullopt;
+  const bool has_pending_storage = pending_mhc != nullptr;
+  const bool has_pending = has_pending_storage && pending_mhc->has_value();
+  const MHCFusionPlan mhc_plan = resolve_mhc_fusion({
+      .supports_fused_mhc = attn_hc_pre_->supports_fused_mhc() &&
+                            ffn_hc_pre_->supports_fused_mhc(),
+      .has_pending_storage = has_pending_storage,
+      .has_pending = has_pending,
+      .is_last_layer = is_last_layer,
+  });
+  CHECK(!has_pending || mhc_plan.consume_pending);
+
+  torch::Tensor residual_attention;
+  MHCPreOutput attention_hc;
+  torch::Tensor attention_input;
+  if (mhc_plan.consume_pending) {
+    PendingMHC& pending = pending_mhc->value();
+    std::tie(attention_input,
+             residual_attention,
+             attention_hc.post,
+             attention_hc.comb) =
+        attn_hc_pre_->fused_post_pre_norm(pending.x,
+                                          pending.residual,
+                                          pending.post,
+                                          pending.comb,
+                                          input_norm_->weight());
+    pending_mhc->reset();
+  } else {
+    residual_attention = hidden_states;
+    attention_hc = attn_hc_pre_->forward(hidden_states);
+    attention_input = std::get<0>(input_norm_->forward(attention_hc.output));
+  }
+
+  torch::Tensor attention_output;
+  if (kda_) {
+    attention_output = kda_->forward_pcp(
+        attention_input, global_metadata, kv_cache, input_params, context);
+  } else {
+    attention_output = dsa_->forward_glm5_next_pcp(positions,
+                                                   attention_input,
+                                                   global_metadata,
+                                                   local_metadata,
+                                                   kv_cache,
+                                                   context);
+  }
+
+  torch::Tensor residual_ffn;
+  MHCPreOutput ffn_hc;
+  torch::Tensor ffn_input;
+  if (mhc_plan.use_fused_mhc) {
+    std::tie(ffn_input, residual_ffn, ffn_hc.post, ffn_hc.comb) =
+        ffn_hc_pre_->fused_post_pre_norm(attention_output,
+                                         residual_attention,
+                                         attention_hc.post,
+                                         attention_hc.comb,
+                                         post_norm_->weight());
+  } else {
+    std::tie(hidden_states, std::ignore) = hc_post_->forward(attention_output,
+                                                             residual_attention,
+                                                             attention_hc.post,
+                                                             attention_hc.comb);
+    residual_ffn = hidden_states;
+    ffn_hc = ffn_hc_pre_->forward(hidden_states);
+    ffn_input = std::get<0>(post_norm_->forward(ffn_hc.output));
+  }
+  torch::Tensor ffn_output;
+  if (dense_mlp_) {
+    ffn_output = dense_mlp_->forward(ffn_input);
+  } else {
+    ffn_output = sparse_moe_->forward_cp(ffn_input,
+                                         std::nullopt,
+                                         context.geometry.tokens_per_rank,
+                                         context.cp_group);
+  }
   if (mhc_plan.defer_post && !materialize_output) {
     pending_mhc->emplace(
         PendingMHC{ffn_output, residual_ffn, ffn_hc.post, ffn_hc.comb});

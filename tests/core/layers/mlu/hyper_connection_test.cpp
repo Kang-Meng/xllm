@@ -206,70 +206,38 @@ torch::Tensor hc_head_ref(const torch::Tensor& x,
 
 }  // namespace
 
-TEST(MHCFusionPlanTest, BuildsPendingChainForDecodeAndSpecVerify) {
-  const std::array<MHCFusionContext, 2> phases = {{
-      {},
-      {.is_chunked_prefill = true, .is_spec_verify = true},
-  }};
-  for (MHCFusionContext context : phases) {
-    SCOPED_TRACE(::testing::Message()
-                 << "prefill=" << context.is_prefill
-                 << " chunked=" << context.is_chunked_prefill
-                 << " verify=" << context.is_spec_verify);
-    context.supports_fused_mhc = true;
-    context.has_pending_storage = true;
-    context.is_last_layer = false;
-    const MHCFusionPlan first_layer = resolve_mhc_fusion(context);
-    EXPECT_TRUE(first_layer.use_fused_mhc);
-    EXPECT_FALSE(first_layer.consume_pending);
-    EXPECT_TRUE(first_layer.defer_post);
+TEST(MHCFusionPlanTest, BuildsPendingChainAcrossLayers) {
+  MHCFusionContext context;
+  context.supports_fused_mhc = true;
+  context.has_pending_storage = true;
+  context.is_last_layer = false;
+  const MHCFusionPlan first_layer = resolve_mhc_fusion(context);
+  EXPECT_TRUE(first_layer.use_fused_mhc);
+  EXPECT_FALSE(first_layer.consume_pending);
+  EXPECT_TRUE(first_layer.defer_post);
 
-    context.has_pending = true;
-    const MHCFusionPlan middle_layer = resolve_mhc_fusion(context);
-    EXPECT_TRUE(middle_layer.use_fused_mhc);
-    EXPECT_TRUE(middle_layer.consume_pending);
-    EXPECT_TRUE(middle_layer.defer_post);
+  context.has_pending = true;
+  const MHCFusionPlan middle_layer = resolve_mhc_fusion(context);
+  EXPECT_TRUE(middle_layer.use_fused_mhc);
+  EXPECT_TRUE(middle_layer.consume_pending);
+  EXPECT_TRUE(middle_layer.defer_post);
 
-    context.is_last_layer = true;
-    const MHCFusionPlan last_layer = resolve_mhc_fusion(context);
-    EXPECT_TRUE(last_layer.use_fused_mhc);
-    EXPECT_TRUE(last_layer.consume_pending);
-    EXPECT_FALSE(last_layer.defer_post);
+  context.is_last_layer = true;
+  const MHCFusionPlan last_layer = resolve_mhc_fusion(context);
+  EXPECT_TRUE(last_layer.use_fused_mhc);
+  EXPECT_TRUE(last_layer.consume_pending);
+  EXPECT_FALSE(last_layer.defer_post);
 
-    context.has_pending = false;
-    const MHCFusionPlan single_layer = resolve_mhc_fusion(context);
-    EXPECT_TRUE(single_layer.use_fused_mhc);
-    EXPECT_FALSE(single_layer.consume_pending);
-    EXPECT_FALSE(single_layer.defer_post);
-  }
-}
-
-TEST(MHCFusionPlanTest, DisablesPrefillFusion) {
-  const std::array<MHCFusionContext, 3> phases = {{
-      {.is_prefill = true},
-      {.is_chunked_prefill = true},
-      {.is_prefill = true, .is_chunked_prefill = true},
-  }};
-  for (MHCFusionContext context : phases) {
-    SCOPED_TRACE(::testing::Message()
-                 << "prefill=" << context.is_prefill
-                 << " chunked=" << context.is_chunked_prefill);
-    context.supports_fused_mhc = true;
-    context.has_pending_storage = true;
-    context.has_pending = true;
-    context.is_last_layer = false;
-    const MHCFusionPlan plan = resolve_mhc_fusion(context);
-    EXPECT_FALSE(plan.use_fused_mhc);
-    EXPECT_FALSE(plan.consume_pending);
-    EXPECT_FALSE(plan.defer_post);
-  }
+  context.has_pending = false;
+  const MHCFusionPlan single_layer = resolve_mhc_fusion(context);
+  EXPECT_TRUE(single_layer.use_fused_mhc);
+  EXPECT_FALSE(single_layer.consume_pending);
+  EXPECT_FALSE(single_layer.defer_post);
 }
 
 TEST(MHCFusionPlanTest, DisablesUnsupportedFusionContexts) {
   const MHCFusionContext supported_decode = {
       .optimization_enabled = true,
-      .is_prefill = false,
-      .is_chunked_prefill = false,
       .supports_fused_mhc = true,
       .has_pending_storage = true,
       .has_pending = false,

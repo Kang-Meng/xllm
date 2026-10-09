@@ -52,6 +52,23 @@ if(USE_MLU)
       GTest::gtest_main
   )
 
+  # Forks eight ranks before any MLU device initialization.
+  cc_test(
+    NAME
+      glm5_next_mlu_pcp_regression_test
+    SRCS
+      glm5_next_mlu_pcp_regression_test.cpp
+    DEPS
+      models
+      :mlu_layers
+      :common_layers
+      :parallel_state
+      :model_context
+      :state_dict
+      GTest::gtest_main
+      torch_mlu
+  )
+
   cc_test(
     NAME
       qwen3_5_mlu_forward_test

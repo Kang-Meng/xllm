@@ -31,6 +31,7 @@ limitations under the License.
 #include "framework/parallel_state/process_group.h"
 #include "framework/state_dict/state_dict.h"
 #include "layers/mlu/deepseek_v4/deepseek_v4_sparse_moe_block.h"
+#include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
 #include "platform/device.h"
 #include "platform/model_stream_registry.h"
 #include "platform/platform.h"
@@ -128,7 +129,8 @@ int32_t run_rank(int32_t rank,
                  int32_t port,
                  bool use_ep,
                  bool with_shared,
-                 bool graph_replay) {
+                 bool graph_replay,
+                 bool use_cp) {
   // Bound a failed collective, including a peer that exits during setup.
   ::alarm(180);
   if (Platform::device_count() < world_size) {
@@ -147,8 +149,12 @@ int32_t run_rank(int32_t rank,
                                          "selected_moe_collective_test",
                                          device.unwrap());
   ProcessGroup single_rank(/*rank=*/0, /*world_size=*/1, device.unwrap());
-  const ParallelArgs parallel_args = make_parallel_args(
+  ParallelArgs parallel_args = make_parallel_args(
       rank, world_size, use_ep, collective.get(), &single_rank);
+  if (use_cp) {
+    parallel_args.tp_group_ = &single_rank;
+    parallel_args.cp_group_ = collective.get();
+  }
   const ParallelArgs reference_args = make_parallel_args(
       /*rank=*/0,
       /*world_size=*/1,
@@ -179,6 +185,43 @@ int32_t run_rank(int32_t rank,
   const StateDict weights = make_weights(model_args, options);
   block->load_state_dict(weights);
   reference->load_state_dict(weights);
+
+  if (use_cp) {
+    for (const std::vector<int32_t>& lengths :
+         {std::vector<int32_t>{128}, {129}, {65, 129}, {1, 0, 7}}) {
+      const auto context = glm5_next_pcp::build_context(
+          lengths, rank, collective.get(), /*chunk_size=*/64, device.unwrap());
+      const torch::Tensor full =
+          make_values(context.geometry.total_tokens, 16, 0.5f, options);
+      const torch::Tensor local = glm5_next_pcp::shard_rows(full, context);
+      CHECK(torch::equal(glm5_next_pcp::gather_restore(local, context), full));
+    }
+    for (const std::vector<int32_t>& lengths :
+         {std::vector<int32_t>{3, 5}, {0, 5}, {5, 0}}) {
+      const int64_t offset = rank == 0 ? 0 : lengths[0];
+      const torch::Tensor full =
+          make_values(
+              lengths[0] + lengths[1], model_args.hidden_size(), 0.5f, options)
+              .mul(10.0f);
+      torch::Tensor local = full.narrow(0, offset, lengths[rank]);
+      const torch::Tensor actual =
+          block->forward_cp(local, std::nullopt, lengths, collective.get());
+      if (local.size(0) == 0) {
+        CHECK_EQ(actual.sizes(), local.sizes());
+        continue;
+      }
+      const auto route = reference->prep_route(local, std::nullopt);
+      torch::Tensor expected = reference->forward_experts(
+          local, /*enable_all2all_communication=*/false, route);
+      const torch::Tensor shared = reference->forward_shared(local);
+      if (shared.defined()) {
+        expected.add_(shared);
+      }
+      check_output(actual, expected);
+    }
+    torch_mlu::synchronize();
+    return 0;
+  }
 
   torch::Tensor hidden =
       make_values(/*rows=*/8, model_args.hidden_size(), 0.5f, options)
@@ -237,7 +280,8 @@ int32_t run_rank(int32_t rank,
 void run_collective_test(int32_t world_size,
                          bool use_ep,
                          bool with_shared,
-                         bool graph_replay) {
+                         bool graph_replay,
+                         bool use_cp = false) {
   const int32_t port = net::get_local_free_port();
   std::vector<pid_t> children;
   children.reserve(world_size);
@@ -248,8 +292,8 @@ void run_collective_test(int32_t world_size,
       int32_t result = 1;
       // A child process boundary must report setup or device failures to GTest.
       try {
-        result =
-            run_rank(rank, world_size, port, use_ep, with_shared, graph_replay);
+        result = run_rank(
+            rank, world_size, port, use_ep, with_shared, graph_replay, use_cp);
       } catch (const std::exception& error) {
         LOG(ERROR) << "Selected MoE rank " << rank << ": " << error.what();
       }
@@ -285,6 +329,22 @@ TEST(DeepseekV4SparseMoECollectiveTest, EpSharedMatchesUnshardedReference) {
                       /*use_ep=*/true,
                       /*with_shared=*/true,
                       /*graph_replay=*/false);
+}
+
+TEST(DeepseekV4SparseMoECollectiveTest, CpSharedPreservesRaggedAndEmptyRanks) {
+  run_collective_test(/*world_size=*/2,
+                      /*use_ep=*/true,
+                      /*with_shared=*/true,
+                      /*graph_replay=*/false,
+                      /*use_cp=*/true);
+}
+
+TEST(DeepseekV4SparseMoECollectiveTest, CpWithoutSharedPreservesRaggedRanks) {
+  run_collective_test(/*world_size=*/2,
+                      /*use_ep=*/true,
+                      /*with_shared=*/false,
+                      /*graph_replay=*/false,
+                      /*use_cp=*/true);
 }
 
 TEST(DeepseekV4SparseMoECollectiveTest, TpSharedMatchesUnshardedReference) {

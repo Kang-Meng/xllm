@@ -286,17 +286,24 @@ void ProcessGroup::reduce_scatter(const torch::Tensor& input,
 }
 
 void ProcessGroup::broadcast(torch::Tensor& input, int32_t root_rank) {
+  auto work = broadcast_async(input, root_rank);
+  if (work.defined()) {
+    work->wait();
+  }
+}
+
+c10::intrusive_ptr<c10d::Work> ProcessGroup::broadcast_async(
+    torch::Tensor& input,
+    int32_t root_rank) {
   CHECK(pg_ != nullptr) << "Process group is not initialized.";
-  // single-rank group: nothing to unify, the local tensor is already the
-  // source of truth.
   if (world_size() <= 1) {
-    return;
+    return nullptr;
   }
   CHECK(input.is_contiguous()) << "input is not contiguous.";
   std::vector<torch::Tensor> tensors = {input};
   c10d::BroadcastOptions opts;
   opts.rootRank = root_rank;
-  pg_->broadcast(tensors, opts)->wait();
+  return pg_->broadcast(tensors, opts);
 }
 
 void ProcessGroup::all_to_all_single(

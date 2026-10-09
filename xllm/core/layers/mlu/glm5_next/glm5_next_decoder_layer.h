@@ -31,6 +31,7 @@ limitations under the License.
 #include "layers/mlu/deepseek_v2_attention.h"
 #include "layers/mlu/deepseek_v4/deepseek_v4_sparse_moe_block.h"
 #include "layers/mlu/glm5_next/glm5_next_kda.h"
+#include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
 #include "layers/mlu/hyper_connection.h"
 
 namespace xllm {
@@ -69,7 +70,20 @@ class Glm5NextDecoderLayerImpl final : public torch::nn::Module {
                         const ModelInputParams& input_params,
                         std::optional<PendingMHC>* pending_mhc = nullptr,
                         bool is_last_layer = true,
-                        bool materialize_output = false);
+                        bool materialize_output = false,
+                        const glm5_next_pcp::Context* pcp_context = nullptr);
+
+  torch::Tensor forward_pcp(torch::Tensor& hidden_states,
+                            std::optional<torch::Tensor>& residual,
+                            torch::Tensor& positions,
+                            const AttentionMetadata& global_metadata,
+                            const AttentionMetadata& local_metadata,
+                            KVCache& kv_cache,
+                            const ModelInputParams& input_params,
+                            std::optional<PendingMHC>* pending_mhc,
+                            bool is_last_layer,
+                            bool materialize_output,
+                            const glm5_next_pcp::Context& context);
 
  private:
   int32_t layer_id_ = 0;

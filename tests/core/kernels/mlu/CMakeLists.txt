@@ -32,6 +32,7 @@ cc_test(
   NAME
     triton_jit_ops_test
   SRCS
+    fused_moe_clamp_test.cpp
     fused_gdn_gating_test.cpp
     causal_conv1d_update_decode_test.cpp
     fused_recurrent_gated_delta_rule_packed_decode_test.cpp
@@ -39,6 +40,7 @@ cc_test(
     fused_recurrent_gated_delta_rule_test.cpp
     chunk_gated_delta_rule_regression_test.cpp
     chunk_kda_test.cpp
+    chunk_kda_pcp_test.cpp
     fused_recurrent_gated_delta_rule_beta_regression_test.cpp
     fused_sigmoid_update_regression_test.cpp
   DEPS

@@ -28,6 +28,7 @@ cc_library(
     glm5_next/glm5_next_decoder_layer.h
     glm5_next/glm5_next_kda.h
     glm5_next/glm5_next_kpool_indexer.h
+    glm5_next/glm5_next_pcp_context.h
     deepseek_v32_cp_context.h
     deepseek_v32_cp_plan.h
     moe_gate.h
@@ -47,6 +48,7 @@ cc_library(
     deepseek_v2_attention.cpp
     deepseek_v2_attention_dcp.cpp
     deepseek_v2_attention_cp.cpp
+    deepseek_v2_attention_glm5_next_pcp.cpp
     deepseek_v2_decoder_layer_impl.cpp
     deepseek_v2_sparse_moe_block.cpp
     indexer.cpp
@@ -61,7 +63,10 @@ cc_library(
     hyper_connection.cpp
     glm5_next/glm5_next_decoder_layer.cpp
     glm5_next/glm5_next_kda.cpp
+    glm5_next/glm5_next_kda_pcp.cpp
     glm5_next/glm5_next_kpool_indexer.cpp
+    glm5_next/glm5_next_kpool_indexer_pcp.cpp
+    glm5_next/glm5_next_pcp_context.cpp
     moe_gate.cpp
     fused_moe.cpp
     fused_moe_base.cpp

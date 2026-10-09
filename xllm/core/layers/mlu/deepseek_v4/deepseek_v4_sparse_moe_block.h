@@ -61,6 +61,10 @@ class DeepseekV4SparseMoEBlockImpl final : public torch::nn::Module {
   torch::Tensor forward_cp(const torch::Tensor& local_hidden_states,
                            const std::optional<torch::Tensor>& local_input_ids,
                            const mlu_v4_cp::DeepseekV4CpContext& cp_context);
+  torch::Tensor forward_cp(const torch::Tensor& local_hidden_states,
+                           const std::optional<torch::Tensor>& local_input_ids,
+                           const std::vector<int32_t>& tokens_per_rank,
+                           ProcessGroup* cp_group);
 
  private:
   bool need_gather() const;

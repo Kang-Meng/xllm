@@ -31,11 +31,14 @@ limitations under the License.
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/kernels/mlu/chunk_kda.h"
+#include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/mlu/glm5_next/glm5_next_decoder_layer.h"
+#include "core/layers/mlu/glm5_next/glm5_next_pcp_context.h"
 #include "models/llm/llm_model_base.h"
 #include "models/llm/mlu/glm5_next_graph.h"
 #include "models/model_registry.h"
@@ -43,6 +46,82 @@ limitations under the License.
 namespace xllm {
 namespace mlu {
 namespace model {
+
+namespace glm5_next_pcp {
+
+inline std::optional<layer::glm5_next_pcp::Context> prepare_context(
+    const layer::AttentionMetadata& metadata,
+    const std::vector<int32_t>& host_query_starts,
+    torch::Tensor& hidden_states,
+    torch::Tensor& positions,
+    int32_t cp_size,
+    int32_t cp_rank,
+    ProcessGroup* cp_group,
+    int64_t local_linear_heads,
+    const torch::Device& device) {
+  if (cp_size <= 1 || metadata.is_dummy || metadata.is_mixed ||
+      metadata.is_spec_verify ||
+      (!metadata.is_prefill && !metadata.is_chunked_prefill)) {
+    return std::nullopt;
+  }
+  const std::vector<int32_t> query_lengths =
+      layer::glm5_next_pcp::query_lengths_from_cumulative(host_query_starts,
+                                                          positions.size(0));
+  const int32_t chunk_size = static_cast<int32_t>(
+      kernel::mlu::kda_prefill_chunk_size(local_linear_heads,
+                                          /*use_qk_l2norm=*/true));
+  layer::glm5_next_pcp::Context context = layer::glm5_next_pcp::build_context(
+      query_lengths, cp_rank, cp_group, chunk_size, device);
+  const bool all_ranks_have_tokens =
+      std::all_of(context.geometry.tokens_per_rank.begin(),
+                  context.geometry.tokens_per_rank.end(),
+                  [](int32_t count) { return count > 0; });
+  if (!all_ranks_have_tokens) {
+    // A rank owns whole KDA chunks, so a batch with fewer chunks than CP ranks
+    // leaves some rank empty.  This is common for short prompts and for the
+    // last short chunk of a chunked prefill; every rank then runs the full
+    // sequence.
+    LOG_EVERY_N(WARNING, 100)
+        << "GLM5-Next PCP skipped: a CP rank would receive no tokens (tokens="
+        << context.geometry.total_tokens
+        << ", requests=" << query_lengths.size()
+        << ", chunk_size=" << chunk_size << ", cp_size=" << cp_size << ").";
+    return std::nullopt;
+  }
+
+  context.global_positions = positions;
+  context.local_metadata = metadata;
+  context.local_metadata.q_cu_seq_lens = context.local_cu_seqlens;
+  context.local_metadata.q_seq_lens_vec = context.local_query_lengths;
+  context.local_metadata.kpool_query_lens = context.local_query_lengths;
+  context.local_metadata.kpool_batch_metadata.reset();
+  context.local_metadata.q_seq_lens =
+      torch::tensor(context.local_query_lengths,
+                    torch::TensorOptions().dtype(torch::kInt32).device(device));
+  context.local_metadata.max_query_len = context.local_max_query_len;
+  context.local_metadata.slot_mapping =
+      layer::glm5_next_pcp::shard_rows(metadata.slot_mapping, context);
+  layer::AttentionMetadataBuilder::build_linear_prefill(context.local_metadata,
+                                                        chunk_size);
+  hidden_states = layer::glm5_next_pcp::shard_rows(hidden_states, context);
+  positions = layer::glm5_next_pcp::shard_rows(positions, context);
+  return context;
+}
+
+inline void restore_output(
+    torch::Tensor& normalized,
+    std::optional<torch::Tensor>& residual,
+    const std::optional<layer::glm5_next_pcp::Context>& context) {
+  if (!context.has_value()) {
+    return;
+  }
+  normalized = layer::glm5_next_pcp::gather_restore(normalized, *context);
+  if (residual.has_value()) {
+    residual = layer::glm5_next_pcp::gather_restore(residual.value(), *context);
+  }
+}
+
+}  // namespace glm5_next_pcp
 
 class Glm5NextModelImpl final
     : public LlmModelImplBase<layer::Glm5NextDecoderLayer> {
@@ -57,8 +136,11 @@ class Glm5NextModelImpl final
                      SchedulerConfig::get_instance().max_tokens_per_batch()) {
     const ModelArgs& args = context.get_model_args();
     const ParallelArgs& parallel_args = context.get_parallel_args();
-    CHECK_EQ(parallel_args.cp_size(), 1)
-        << "GLM5-Next MLU does not yet support context parallelism.";
+    cp_size_ = parallel_args.cp_size();
+    cp_rank_ = parallel_args.cp_rank();
+    cp_group_ = parallel_args.cp_group_;
+    CHECK(cp_size_ == 1 || cp_group_ != nullptr)
+        << "GLM5-Next PCP requires a CP process group.";
     CHECK_GT(hc_mult_, 0) << "GLM5-Next requires hc_mult > 0.";
 
     const int64_t tp_size = std::max<int64_t>(parallel_args.tp_size(), 1);
@@ -133,6 +215,18 @@ class Glm5NextModelImpl final
     const layer::AttentionMetadata& attn_metadata =
         *modified_input_params.attn_metadata;
 
+    std::optional<layer::glm5_next_pcp::Context> pcp_context =
+        glm5_next_pcp::prepare_context(
+            attn_metadata,
+            modified_input_params.attention.host.q_seq_lens,
+            hidden_states,
+            positions,
+            cp_size_,
+            cp_rank_,
+            cp_group_,
+            local_linear_heads_,
+            device_);
+
     std::optional<torch::Tensor> residual;
     std::optional<layer::PendingMHC> pending_mhc;
     for (size_t layer_id = 0; layer_id < layers_.size(); ++layer_id) {
@@ -151,13 +245,19 @@ class Glm5NextModelImpl final
           modified_input_params,
           &pending_mhc,
           /*is_last_layer=*/layer_id + 1 == layers_.size(),
-          /*materialize_output=*/capture_hidden);
+          /*materialize_output=*/capture_hidden,
+          pcp_context.has_value() ? &pcp_context.value() : nullptr);
       if (capture_hidden) {
         CHECK(!pending_mhc.has_value())
             << "Captured GLM5-Next layers must materialize mHC output.";
-        aux_capture_.capture_layer(static_cast<int32_t>(layer_id),
-                                   hidden_states.mean(/*dim=*/-2),
-                                   std::nullopt);
+        torch::Tensor captured_hidden = hidden_states.mean(/*dim=*/-2);
+        // Captured layers carry no residual; this only satisfies the
+        // restore_output signature.
+        std::optional<torch::Tensor> captured_residual;
+        glm5_next_pcp::restore_output(
+            captured_hidden, captured_residual, pcp_context);
+        aux_capture_.capture_layer(
+            static_cast<int32_t>(layer_id), captured_hidden, std::nullopt);
       }
       if (!modified_input_params.record_layer(static_cast<uint32_t>(layer_id),
                                               hidden_states.device())) {
@@ -173,6 +273,7 @@ class Glm5NextModelImpl final
         << "GLM5-Next mHC residual-stream count changed unexpectedly.";
     hidden_states = hidden_states.mean(/*dim=*/-2);
     auto [normalized, residual_out] = norm_(hidden_states, std::nullopt);
+    glm5_next_pcp::restore_output(normalized, residual_out, pcp_context);
     return aux_capture_.finalize(normalized, residual_out);
   }
 
@@ -197,6 +298,9 @@ class Glm5NextModelImpl final
   int64_t hc_mult_ = 1;
   AuxHiddenCapture aux_capture_;
   int64_t local_linear_heads_ = 1;
+  int32_t cp_size_ = 1;
+  int32_t cp_rank_ = 0;
+  ProcessGroup* cp_group_ = nullptr;
   torch::nn::ModuleList blocks_{nullptr};
 };
 TORCH_MODULE(Glm5NextModel);

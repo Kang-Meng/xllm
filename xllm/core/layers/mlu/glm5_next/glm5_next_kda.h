@@ -32,6 +32,7 @@ limitations under the License.
 #include "layers/common/attention_metadata.h"
 #include "layers/common/linear.h"
 #include "layers/common/rms_norm_gated.h"
+#include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
 
 namespace xllm {
 namespace layer {
@@ -99,7 +100,14 @@ class Glm5NextKDAImpl final : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const AttentionMetadata& attn_metadata,
                         KVCache& kv_cache,
-                        const ModelInputParams& input_params);
+                        const ModelInputParams& input_params,
+                        const glm5_next_pcp::Context* pcp_context = nullptr);
+
+  torch::Tensor forward_pcp(const torch::Tensor& hidden_states,
+                            const AttentionMetadata& attn_metadata,
+                            KVCache& kv_cache,
+                            const ModelInputParams& input_params,
+                            const glm5_next_pcp::Context& context);
 
  private:
   torch::Tensor get_linear_state_indices(const ModelInputParams& input_params,

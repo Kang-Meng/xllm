@@ -490,6 +490,11 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
 
   int64_t block_k = head_k_dim;
   int64_t block_v = std::min<int64_t>(head_v_dim, 128);
+  // Batched GLM KDA decode with 16 local heads exceeds MLU NRAM at BV=128.
+  if (is_kda && seq_len == num_sequences && num_sequences > 1 &&
+      num_v_heads >= 16) {
+    block_v = std::min<int64_t>(head_v_dim, kSplitBlockV);
+  }
   int64_t block_n = 1;
   // KDA carries an additional gate tile per sequence. Keeping one sequence per
   // tile prevents the GLM5 graph warmup shape from exceeding MLU590 NRAM.

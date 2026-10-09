@@ -39,6 +39,7 @@ limitations under the License.
 #include "layers/mlu/dcp_decode_context.h"
 #include "layers/mlu/deepseek_v32_cp_context.h"
 #include "layers/mlu/glm5_next/glm5_next_kpool_indexer.h"
+#include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
 #include "layers/mlu/indexer.h"
 #include "platform/stream.h"
 
@@ -74,6 +75,13 @@ class DeepseekV2AttentionImpl : public torch::nn::Module {
                         KVCache& kv_cache,
                         const v32_cp::DeepseekV32CPContext* cp_ctx = nullptr,
                         DsaTopkTransfer* topk_transfer = nullptr);
+
+  torch::Tensor forward_glm5_next_pcp(const torch::Tensor& local_positions,
+                                      const torch::Tensor& local_hidden_states,
+                                      const AttentionMetadata& global_metadata,
+                                      const AttentionMetadata& local_metadata,
+                                      KVCache& kv_cache,
+                                      const glm5_next_pcp::Context& context);
 
   bool use_replicated_attn_weights() const {
     return use_full_replicated_attention_weights_;

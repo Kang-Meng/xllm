@@ -41,8 +41,6 @@ constexpr char kKPoolKernelPath[] =
     "xllm.core.kernels.mlu.triton_kernel.glm5_next_kpool";
 constexpr char kKPoolExpandKernelPath[] =
     "xllm.core.kernels.mlu.triton_kernel.glm5_next_kpool_expand";
-constexpr char kKPoolSelectKernelPath[] =
-    "xllm.core.kernels.mlu.triton_kernel.glm5_next_kpool_select";
 constexpr int64_t kWorkspaceBytes = 64 * 1024 * 1024;
 
 int32_t max_sequence_length(const std::vector<int32_t>& lengths) {
@@ -103,35 +101,6 @@ torch::Tensor make_row_batch(const std::vector<int32_t>& q_seq_lens,
   }
   return torch::tensor(rows, torch::TensorOptions().dtype(torch::kInt64))
       .to(device);
-}
-
-int64_t power_of_two_shift(int64_t divisor) {
-  if ((divisor & (divisor - 1)) != 0) {
-    return -1;
-  }
-  int64_t shift = 0;
-  while (divisor > 1) {
-    divisor >>= 1;
-    ++shift;
-  }
-  return shift;
-}
-
-torch::Tensor floor_divide_power_of_two(const torch::Tensor& input,
-                                        int64_t divisor) {
-  const int64_t shift = power_of_two_shift(divisor);
-  if (shift < 0) {
-    return torch::floor_divide(input, divisor);
-  }
-  return torch::bitwise_right_shift(input, shift);
-}
-
-torch::Tensor remainder_power_of_two(const torch::Tensor& input,
-                                     int64_t divisor) {
-  if (power_of_two_shift(divisor) < 0) {
-    return torch::remainder(input, divisor);
-  }
-  return torch::bitwise_and(input, divisor - 1);
 }
 
 int64_t next_power_of_two(int64_t value) {
@@ -228,161 +197,6 @@ std::shared_ptr<KPoolBatchMetadata> make_kpool_batch_metadata(
     batch->max_kv_len = max_sequence_length(batch->kv_seq_lens);
   }
   return batch;
-}
-
-void launch_prefill_logits(const torch::Tensor& query,
-                           const torch::Tensor& weights,
-                           const torch::Tensor& keys,
-                           const torch::Tensor& block_table,
-                           const torch::Tensor& positions,
-                           const torch::Tensor& row_batch,
-                           torch::Tensor& scores,
-                           int64_t pool_size,
-                           int64_t pools_per_block,
-                           double scale,
-                           bool paged) {
-  const int64_t rows = query.size(0);
-  const int64_t pools = scores.size(1);
-  if (rows == 0 || pools == 0) {
-    return;
-  }
-  constexpr int64_t kScoreHeads = 32;
-  constexpr int64_t kWideScoreMinRows = 32;
-  constexpr int64_t kSplitHeadMinRows = 64;
-  constexpr int64_t kUnpagedScoreTile = 1024;
-  constexpr int64_t kPagedScoreTile = 256;
-  constexpr int64_t kWidePagedScoreTile = 512;
-  constexpr int64_t kSplitHeadTile = 16;
-  constexpr int64_t kMinHeadTile = 16;
-  constexpr int64_t kMaxHeadTile = 64;
-  const int64_t heads = query.size(1);
-  const bool wide = paged && rows >= kWideScoreMinRows && heads == kScoreHeads;
-  const bool split = paged && rows >= kSplitHeadMinRows && heads == kScoreHeads;
-  const int64_t pool_tile =
-      wide ? kWidePagedScoreTile
-           : (!paged && heads <= kScoreHeads ? kUnpagedScoreTile
-                                             : kPagedScoreTile);
-  const int64_t head_tile =
-      split ? kSplitHeadTile
-            : std::min<int64_t>(
-                  kMaxHeadTile,
-                  std::max<int64_t>(kMinHeadTile, next_power_of_two(heads)));
-  triton_jit::JITKernel::get(kKPoolSelectKernelPath, "score_prefill")
-      .launch(static_cast<void*>(torch_mlu::getCurMLUStream()),
-              {static_cast<uint32_t>(rows),
-               static_cast<uint32_t>((pools + pool_tile - 1) / pool_tile),
-               1},
-              {/*num_warps=*/1, /*num_stages=*/1},
-              query,
-              weights,
-              keys,
-              block_table,
-              positions,
-              row_batch,
-              scores,
-              query.stride(0),
-              query.stride(1),
-              weights.stride(0),
-              block_table.stride(0),
-              scores.stride(0),
-              pools,
-              static_cast<float>(scale),
-              /*H=*/static_cast<int32_t>(heads),
-              /*D=*/static_cast<int32_t>(query.size(2)),
-              /*P=*/static_cast<int32_t>(pool_size),
-              /*POOL_BLOCK=*/static_cast<int32_t>(pools_per_block),
-              /*BLOCK_H=*/static_cast<int32_t>(head_tile),
-              /*BLOCK_N=*/static_cast<int32_t>(pool_tile),
-              /*PAGED=*/paged ? 1 : 0);
-}
-
-torch::Tensor select_prefill(const torch::Tensor& query,
-                             const torch::Tensor& weights,
-                             const torch::Tensor& positions,
-                             const torch::Tensor& cache,
-                             const KPoolBatchMetadata& batch,
-                             int64_t block_size,
-                             int64_t pool_size,
-                             int64_t token_budget,
-                             double scale) {
-  CHECK_EQ(batch.q_seq_lens.size(), batch.kv_seq_lens.size());
-  const int64_t selected = token_budget / pool_size;
-  torch::Tensor result = torch::full(
-      {query.size(0), selected}, -1, query.options().dtype(torch::kInt64));
-  const int64_t max_pools = (batch.max_kv_len + pool_size - 1) / pool_size;
-  if (result.numel() == 0 || max_pools == 0) {
-    return result;
-  }
-  CHECK_GE(kWorkspaceBytes, max_pools * static_cast<int64_t>(sizeof(float)));
-  const int64_t chunk = std::min<int64_t>(
-      query.size(0), kWorkspaceBytes / (max_pools * sizeof(float)));
-  torch::Tensor workspace =
-      torch::empty({chunk, max_pools}, query.options().dtype(torch::kFloat32));
-  const torch::Tensor q = query.contiguous();
-  const torch::Tensor w = weights.contiguous();
-  const torch::Tensor pos = positions.contiguous();
-  const torch::Tensor rows = batch.row_batch.contiguous();
-  const torch::Tensor table = batch.block_table.contiguous();
-  const int64_t pools_per_block = block_size / pool_size;
-  int64_t query_offset = 0;
-  void* queue = static_cast<void*>(torch_mlu::getCurMLUStream());
-  for (size_t request = 0; request < batch.q_seq_lens.size(); ++request) {
-    const int64_t request_rows = batch.q_seq_lens[request];
-    const int64_t pools =
-        (batch.kv_seq_lens[request] + pool_size - 1) / pool_size;
-    const int64_t request_start = query_offset;
-    query_offset += request_rows;
-    if (request_rows == 0 || pools == 0) {
-      continue;
-    }
-    torch::Tensor keys = torch::empty({pools, query.size(2)}, query.options());
-    triton_jit::JITKernel::get(kKPoolSelectKernelPath, "gather_prefill_cache")
-        .launch(queue,
-                {static_cast<uint32_t>((pools + 63) / 64), 1, 1},
-                {/*num_warps=*/1, /*num_stages=*/1},
-                cache,
-                table,
-                keys,
-                static_cast<int64_t>(request),
-                pools,
-                table.stride(0),
-                /*D=*/static_cast<int32_t>(query.size(2)),
-                /*POOL_BLOCK=*/static_cast<int32_t>(pools_per_block),
-                /*BLOCK_N=*/64);
-    for (int64_t begin = 0; begin < request_rows; begin += chunk) {
-      const int64_t count = std::min(chunk, request_rows - begin);
-      const int64_t offset = request_start + begin;
-      torch::Tensor scores = workspace.narrow(0, 0, count).narrow(1, 0, pools);
-      launch_prefill_logits(q.narrow(0, offset, count),
-                            w.narrow(0, offset, count),
-                            keys,
-                            table,
-                            pos.narrow(0, offset, count),
-                            rows.narrow(0, offset, count),
-                            scores,
-                            pool_size,
-                            pools_per_block,
-                            scale,
-                            /*paged=*/false);
-      const bool streaming = pools > 16384 || selected > 2048;
-      const int32_t topk_tile =
-          static_cast<int32_t>(streaming ? 2048 : next_power_of_two(pools));
-      triton_jit::JITKernel::get(
-          kKPoolSelectKernelPath,
-          streaming ? "select_topk_streaming" : "select_topk")
-          .launch(queue,
-                  {static_cast<uint32_t>(count), 1, 1},
-                  {/*num_warps=*/1, /*num_stages=*/streaming ? 3 : 1},
-                  scores,
-                  result.narrow(0, offset, count),
-                  pools,
-                  scores.stride(0),
-                  /*K=*/static_cast<int32_t>(selected),
-                  /*BN=*/topk_tile);
-    }
-  }
-  CHECK_EQ(query_offset, query.size(0));
-  return result;
 }
 
 void update_prefill(const torch::Tensor& key,
@@ -706,14 +520,6 @@ torch::Tensor Glm5NextKPoolIndexerImpl::project_raw_k(
   return k.to(torch::kBFloat16);
 }
 
-struct Glm5NextKPoolIndexerImpl::Execution {
-  std::shared_ptr<const KPoolBatchMetadata> batch;
-  bool graph_decode = false;
-  bool prefill = false;
-  bool fused_update = false;
-  int64_t score_capacity = 0;
-};
-
 Glm5NextKPoolIndexerImpl::Execution Glm5NextKPoolIndexerImpl::prepare_execution(
     const AttentionMetadata& metadata,
     const torch::Tensor& positions) const {
@@ -803,16 +609,34 @@ torch::Tensor Glm5NextKPoolIndexerImpl::select_pools(
       project_query(q_norm, torch::clamp_min(positions, 0), metadata);
   const torch::Tensor weights =
       weights_proj_->forward(hidden_states.to(torch::kFloat32));
+  return select_projected_pools(
+      query, weights, positions, index_cache, metadata, execution);
+}
+
+torch::Tensor Glm5NextKPoolIndexerImpl::select_projected_pools(
+    const torch::Tensor& query,
+    const torch::Tensor& weights,
+    const torch::Tensor& positions,
+    const torch::Tensor& index_cache,
+    const AttentionMetadata& metadata,
+    const Execution& execution) {
   if (execution.prefill && !execution.fused_update) {
-    return select_prefill(query,
-                          weights,
-                          positions,
-                          index_cache,
-                          *execution.batch,
-                          block_size_,
-                          index_kpool_,
-                          index_topk_,
-                          softmax_scale_);
+    // Score directly from the paged pool cache.  The previous prefill path
+    // gathered every request's history into dense tensors and then reran an
+    // FP32 matmul for each query tile.  The paged score kernel already applies
+    // the request-local causal limit from positions and row_batch, so it is
+    // equivalent while avoiding the dense gather and host-side grouping loops.
+    return glm5_next_kpool_select(query,
+                                  weights,
+                                  positions,
+                                  execution.batch->row_batch,
+                                  index_cache,
+                                  execution.batch->block_table,
+                                  execution.batch->max_kv_len,
+                                  block_size_,
+                                  index_kpool_,
+                                  index_topk_,
+                                  softmax_scale_);
   }
   // Every verify query sees only pools complete at its own logical position.
   const torch::Tensor& score_positions = positions;

@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/model_context.h"
 #include "core/layers/common/quant_utils.h"
+#include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
 #include "layers/common/dp_utils.h"
 #include "platform/model_stream_registry.h"
@@ -467,12 +468,7 @@ torch::Tensor FusedMoEImpl::compute_routed_experts(
   }
 
   if (swiglu_limit_.has_value()) {
-    const float limit = swiglu_limit_.value();
-    std::vector<torch::Tensor> gate_up_chunks = gemm1_out.chunk(2, -1);
-    torch::Tensor gate = torch::clamp_max(gate_up_chunks[0], /*max=*/limit);
-    torch::Tensor up =
-        torch::clamp(gate_up_chunks[1], /*min=*/-limit, /*max=*/limit);
-    gemm1_out = torch::cat({gate, up}, -1);
+    gemm1_out = kernel::mlu::fused_moe_clamp(gemm1_out, swiglu_limit_.value());
   }
 
   torch::Tensor act_out;

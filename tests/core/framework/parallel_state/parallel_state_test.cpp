@@ -255,6 +255,35 @@ int run_broadcast_test_child(const BroadcastTestParams& params) {
       }
     }
 
+    // Exercise the PCP ordering: broadcast, independent all-gather and compute,
+    // then consume both results on the original stream after their waits.
+    torch::Tensor async_input = torch::full(
+        {params.numel}, static_cast<int64_t>(params.rank + 11), options);
+    torch::Tensor local =
+        torch::full({3, 2}, static_cast<int64_t>(params.rank + 1), options);
+    torch::Tensor gathered = torch::empty({params.world_size, 3, 2}, options);
+    auto broadcast_work =
+        process_group->broadcast_async(async_input, params.root_rank);
+    auto gather_work = process_group->allgather_base_async(local, gathered);
+    torch::Tensor independent = local.square();
+    broadcast_work->wait();
+    torch::Tensor published = async_input + independent.flatten()[0];
+    gather_work->wait();
+    torch::Tensor reduced = gathered.sum(/*dim=*/0);
+    const int64_t rank_value = params.rank + 1;
+    if (!torch::equal(
+            published,
+            torch::full_like(
+                published, params.root_rank + 11 + rank_value * rank_value)) ||
+        !torch::equal(
+            reduced,
+            torch::full_like(
+                reduced, params.world_size * (params.world_size + 1) / 2))) {
+      LOG(ERROR) << "Rank " << params.rank
+                 << ": deferred collective consumption mismatch";
+      return 1;
+    }
+
     LOG(INFO) << "Rank " << params.rank << ": broadcast test passed";
     return 0;
   } catch (const std::exception& e) {
