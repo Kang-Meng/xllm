@@ -610,6 +610,10 @@ class DeepseekV3MLP(nn.Module):
         return out
 
 
+def _mlapo_v2_enabled(fused_mla_decode: bool) -> bool:
+    return fused_mla_decode and os.environ.get("XLLM_ENABLE_MLAPO_V2", "1") == "1" and kernels.has_mla_preprocess_v2()
+
+
 class DeepseekV3MLAAttention(Attention):
     """Absorbed-MLA attention. KV cache stores latent (kv_lora) + rope."""
 
@@ -648,11 +652,7 @@ class DeepseekV3MLAAttention(Attention):
             "npu",
             "privateuseone",
         )
-        self._use_mlapo_v2 = (
-            self._use_fused_mla_decode
-            and os.environ.get("XLLM_ENABLE_MLAPO_V2") == "1"
-            and kernels.has_mla_preprocess_v2()
-        )
+        self._use_mlapo_v2 = _mlapo_v2_enabled(self._use_fused_mla_decode)
 
         self.qkv_a_proj = W8A8StaticLinear(
             cfg.hidden_size,

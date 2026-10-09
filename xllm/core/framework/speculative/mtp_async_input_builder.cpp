@@ -17,6 +17,10 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <utility>
+#include <vector>
+
 #if defined(USE_NPU)
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
 #endif
@@ -39,6 +43,18 @@ torch::Tensor build_device_cache_slots(const ForwardInput& input,
   }
   return speculative::map_positions_to_cache_slots(
       input.input_params.attention.device.block_tables, positions, block_size);
+}
+
+void write_accepted_token_column(ForwardInput& validate_input,
+                                 const AcceptedTokenMetadata& metadata,
+                                 int64_t batch_size,
+                                 int64_t validate_width) {
+  torch::Tensor token_rows =
+      validate_input.token_ids.view({batch_size, validate_width});
+  token_rows.select(/*dim=*/1, /*index=*/0)
+      .copy_(metadata.last_tokens.to(validate_input.token_ids.options()),
+             /*non_blocking=*/true);
+  validate_input.device_tensors_ready = true;
 }
 
 void apply_device_row_metadata(ForwardInput& input,
@@ -278,12 +294,100 @@ void prepare_target_verify_from_accepted_state(
           .to(validate_input.input_params.attention.device.kv_seq_lens
                   .options());
 
-  torch::Tensor token_rows =
-      validate_input.token_ids.view({batch_size, validate_width});
-  token_rows.select(/*dim=*/1, /*index=*/0)
-      .copy_(metadata.last_tokens.to(validate_input.token_ids.options()),
-             /*non_blocking=*/true);
-  validate_input.device_tensors_ready = true;
+  write_accepted_token_column(
+      validate_input, metadata, batch_size, validate_width);
+}
+
+void prepare_expanded_target_verify_from_accepted_state(
+    ForwardInput& validate_input,
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& base_positions,
+    const torch::Tensor& base_kv_seq_lens,
+    int32_t block_size) {
+  CHECK(validate_input.token_ids.defined());
+  CHECK(validate_input.positions.defined());
+  CHECK_EQ(accepted_tokens.dim(), 2);
+  CHECK(validate_input.input_params.multi_block_tables.empty());
+  const int64_t batch_size = accepted_tokens.size(0);
+  const int64_t validate_width = accepted_tokens.size(1);
+  const int64_t token_count = batch_size * validate_width;
+  CHECK_EQ(validate_input.token_ids.numel(), token_count);
+  CHECK_EQ(validate_input.positions.numel(), token_count);
+
+  auto& attention = validate_input.input_params.attention.device;
+  auto& graph = validate_input.input_params.graph;
+  CHECK(attention.block_tables.defined());
+  CHECK_EQ(attention.block_tables.dim(), 2);
+  CHECK_EQ(attention.block_tables.size(0), batch_size);
+  CHECK(attention.kv_seq_lens.defined());
+  CHECK_EQ(attention.kv_seq_lens.dim(), 1);
+  CHECK_EQ(attention.kv_seq_lens.numel(), batch_size)
+      << "verify KV lengths must be sequence-scoped";
+  CHECK(graph.use_expanded_decode_for_spec_verify_attention);
+  CHECK(graph.expanded_kv_seq_lens.defined());
+  CHECK_EQ(graph.expanded_kv_seq_lens.numel(), token_count);
+  CHECK(graph.expanded_block_tables.defined());
+  CHECK_EQ(graph.expanded_block_tables.dim(), 2);
+  CHECK_EQ(graph.expanded_block_tables.size(0), token_count);
+  // Block tables do not change with acceptance; only validate their layout.
+
+  AcceptedTokenMetadata metadata = build_accepted_token_metadata(
+      accepted_tokens, base_positions, base_kv_seq_lens);
+  torch::Tensor offsets =
+      torch::arange(validate_width, metadata.base_positions.options());
+  torch::Tensor offsets_row = offsets.unsqueeze(/*dim=*/0);
+  torch::Tensor position_rows =
+      metadata.base_positions.unsqueeze(/*dim=*/1) + offsets_row;
+  validate_input.positions =
+      position_rows.flatten().to(validate_input.positions.options());
+  attention.new_cache_slots =
+      build_device_cache_slots(validate_input, position_rows, block_size);
+  attention.kv_seq_lens = (metadata.base_kv_seq_lens + validate_width - 1)
+                              .to(attention.kv_seq_lens.options());
+  graph.expanded_kv_seq_lens =
+      (metadata.base_kv_seq_lens.unsqueeze(/*dim=*/1) + offsets_row)
+          .flatten()
+          .to(graph.expanded_kv_seq_lens.options());
+
+  write_accepted_token_column(
+      validate_input, metadata, batch_size, validate_width);
+}
+
+void refresh_expanded_target_verify_metadata(
+    ForwardInput& validate_input,
+    const std::vector<int32_t>& accepted_base_kv_seq_lens,
+    int32_t block_size) {
+  auto& params = validate_input.input_params;
+  CHECK(params.graph.use_expanded_decode_for_spec_verify_attention);
+  CHECK(params.graph.expanded_kv_seq_lens.defined());
+  CHECK(params.graph.expanded_block_tables.defined());
+  const std::vector<int32_t>& q_seq_lens = params.attention.host.q_seq_lens;
+  CHECK_EQ(q_seq_lens.size(), accepted_base_kv_seq_lens.size());
+  CHECK_EQ(q_seq_lens.size(), static_cast<size_t>(params.meta.num_sequences));
+  CHECK(!q_seq_lens.empty());
+
+  std::vector<int32_t> verify_kv_seq_lens;
+  verify_kv_seq_lens.reserve(q_seq_lens.size());
+  for (size_t seq_idx = 0; seq_idx < q_seq_lens.size(); ++seq_idx) {
+    CHECK_GT(q_seq_lens[seq_idx], 0) << "verify query length must be positive";
+    verify_kv_seq_lens.emplace_back(accepted_base_kv_seq_lens[seq_idx] +
+                                    q_seq_lens[seq_idx] - 1);
+  }
+  std::vector<int32_t> expanded_kv_seq_lens =
+      layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
+          q_seq_lens, verify_kv_seq_lens);
+  CHECK_EQ(expanded_kv_seq_lens.size(),
+           static_cast<size_t>(params.graph.expanded_kv_seq_lens.numel()));
+
+  params.meta.kv_max_seq_len =
+      *std::max_element(verify_kv_seq_lens.begin(), verify_kv_seq_lens.end());
+  params.attention.host.kv_seq_lens = std::move(verify_kv_seq_lens);
+  layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+      params,
+      params.graph.expanded_kv_seq_lens,
+      params.graph.expanded_block_tables,
+      std::move(expanded_kv_seq_lens),
+      block_size);
 }
 
 }  // namespace xllm::mtp_async

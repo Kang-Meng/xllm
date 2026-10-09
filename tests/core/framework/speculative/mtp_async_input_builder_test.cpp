@@ -140,6 +140,199 @@ TEST(MtpAsyncInputBuilderTest, CanSkipExpandedMetadataRebuild) {
   EXPECT_FALSE(draft_input.input_params.graph.expanded_kv_seq_lens.defined());
 }
 
+TEST(MtpAsyncInputBuilderTest,
+     CorrectsExpandedVerifyForPartialAndFullAcceptanceAcrossBlocks) {
+  const torch::Tensor block_tables =
+      torch::tensor({{10, 11, 12, 13}, {20, 21, 22, 23}}, torch::kInt);
+  ForwardInput validate_input;
+  validate_input.token_ids =
+      torch::tensor({11, -1, -2, 22, -1, -2}, torch::kInt);
+  validate_input.positions = torch::tensor({3, 4, 5, 7, 8, 9}, torch::kInt);
+  auto& attention = validate_input.input_params.attention.device;
+  attention.block_tables = block_tables;
+  attention.kv_seq_lens = torch::tensor({4, 8}, torch::kInt);
+  validate_input.input_params.attention.host.kv_seq_lens = {9, 13};
+  auto& graph = validate_input.input_params.graph;
+  graph.use_expanded_decode_for_spec_verify_attention = true;
+  graph.expanded_kv_seq_lens = torch::zeros({6}, torch::kInt);
+  graph.expanded_kv_seq_lens_vec = {7, 8, 9, 11, 12, 13};
+  validate_input.input_params.meta.num_sequences = 2;
+  validate_input.input_params.meta.kv_max_seq_len = 13;
+  validate_input.input_params.attention.host.q_seq_lens = {3, 3};
+  graph.expanded_block_tables = torch::tensor({{10, 11, 12, 13},
+                                               {10, 11, 12, 13},
+                                               {10, 11, 12, 13},
+                                               {20, 21, 22, 23},
+                                               {20, 21, 22, 23},
+                                               {20, 21, 22, 23}},
+                                              torch::kInt);
+  layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+      validate_input.input_params,
+      graph.expanded_kv_seq_lens,
+      graph.expanded_block_tables,
+      graph.expanded_kv_seq_lens_vec,
+      kBlockSize);
+  const torch::Tensor expected_expanded_block_tables =
+      graph.expanded_block_tables.clone();
+
+  prepare_expanded_target_verify_from_accepted_state(
+      validate_input,
+      torch::tensor({{42, -1, -1}, {73, 74, 75}}, torch::kInt),
+      torch::tensor({3, 7}, torch::kInt),
+      torch::tensor({4, 8}, torch::kInt),
+      kBlockSize);
+
+  EXPECT_TRUE(
+      torch::equal(validate_input.token_ids,
+                   torch::tensor({42, -1, -2, 75, -1, -2}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(validate_input.positions,
+                           torch::tensor({4, 5, 6, 10, 11, 12}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(attention.new_cache_slots,
+                   torch::tensor({44, 45, 46, 90, 91, 92}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(attention.kv_seq_lens, torch::tensor({7, 13}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(graph.expanded_kv_seq_lens,
+                           torch::tensor({5, 6, 7, 11, 12, 13}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(graph.expanded_block_tables,
+                           expected_expanded_block_tables));
+  EXPECT_TRUE(validate_input.device_tensors_ready);
+
+  // The host template assumed a different accepted count for the first
+  // sequence. Use the host state from the existing target-context flush to
+  // update the attention plan without reading the device lengths back.
+  refresh_expanded_target_verify_metadata(validate_input, {5, 11}, kBlockSize);
+  EXPECT_EQ(validate_input.input_params.attention.host.kv_seq_lens,
+            (std::vector<int32_t>{7, 13}));
+  EXPECT_EQ(validate_input.input_params.meta.kv_max_seq_len, 13);
+  EXPECT_EQ(graph.expanded_kv_seq_lens_vec,
+            (std::vector<int32_t>{5, 6, 7, 11, 12, 13}));
+  EXPECT_TRUE(torch::equal(graph.expanded_kv_seq_lens,
+                           torch::tensor({5, 6, 7, 11, 12, 13}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(graph.expanded_paged_kv_indptr,
+                   torch::tensor({0, 2, 4, 6, 9, 12, 16}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(
+      graph.expanded_paged_kv_indices,
+      torch::tensor(
+          {10, 11, 10, 11, 10, 11, 20, 21, 22, 20, 21, 22, 20, 21, 22, 23},
+          torch::kInt)));
+  EXPECT_TRUE(torch::equal(graph.expanded_paged_kv_last_page_len,
+                           torch::tensor({1, 2, 3, 3, 4, 1}, torch::kInt)));
+
+  attention.kv_seq_lens = torch::zeros({6}, torch::kInt);
+  EXPECT_DEATH(prepare_expanded_target_verify_from_accepted_state(
+                   validate_input,
+                   torch::tensor({{42, -1, -1}, {73, 74, 75}}, torch::kInt),
+                   torch::tensor({3, 7}, torch::kInt),
+                   torch::tensor({4, 8}, torch::kInt),
+                   kBlockSize),
+               "verify KV lengths must be sequence-scoped");
+}
+
+TEST(MtpAsyncInputBuilderTest, RejectsEmptyExpandedVerifyQuery) {
+  ForwardInput validate_input;
+  auto& params = validate_input.input_params;
+  params.meta.num_sequences = 1;
+  params.attention.host.q_seq_lens = {0};
+  params.graph.use_expanded_decode_for_spec_verify_attention = true;
+  params.graph.expanded_kv_seq_lens = torch::zeros({1}, torch::kInt);
+  params.graph.expanded_block_tables = torch::zeros({1, 1}, torch::kInt);
+
+  EXPECT_DEATH(
+      refresh_expanded_target_verify_metadata(validate_input, {5}, kBlockSize),
+      "verify query length must be positive");
+}
+
+TEST(MtpAsyncInputBuilderTest,
+     RefreshesExpandedVerifyHostPlanAfterPartialAcceptance) {
+  ForwardInput validate_input;
+  auto& params = validate_input.input_params;
+  params.meta.num_sequences = 2;
+  params.meta.kv_max_seq_len = 10;
+  params.attention.host.q_seq_lens = {3, 3};
+  params.attention.host.kv_seq_lens = {10, 6};
+  params.graph.use_expanded_decode_for_spec_verify_attention = true;
+  params.graph.expanded_kv_seq_lens_vec = {8, 9, 10, 4, 5, 6};
+  params.graph.expanded_kv_seq_lens =
+      torch::tensor({6, 7, 8, 4, 5, 6}, torch::kInt);
+  params.graph.expanded_block_tables = torch::tensor({{10, 11, 12},
+                                                      {10, 11, 12},
+                                                      {10, 11, 12},
+                                                      {20, 21, 22},
+                                                      {20, 21, 22},
+                                                      {20, 21, 22}},
+                                                     torch::kInt);
+  layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+      params,
+      params.graph.expanded_kv_seq_lens,
+      params.graph.expanded_block_tables,
+      params.graph.expanded_kv_seq_lens_vec,
+      kBlockSize);
+  EXPECT_EQ(params.graph.expanded_paged_kv_indices.numel(), 13);
+  const torch::Tensor corrected_device_kv_lens =
+      params.graph.expanded_kv_seq_lens.clone();
+
+  refresh_expanded_target_verify_metadata(validate_input, {6, 4}, kBlockSize);
+
+  EXPECT_EQ(params.attention.host.kv_seq_lens, (std::vector<int32_t>{8, 6}));
+  EXPECT_EQ(params.meta.kv_max_seq_len, 8);
+  EXPECT_EQ(params.graph.expanded_kv_seq_lens_vec,
+            (std::vector<int32_t>{6, 7, 8, 4, 5, 6}));
+  EXPECT_TRUE(torch::equal(params.graph.expanded_kv_seq_lens,
+                           corrected_device_kv_lens));
+  EXPECT_TRUE(torch::equal(params.graph.expanded_paged_kv_indptr,
+                           torch::tensor({0, 2, 4, 6, 7, 9, 11}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(params.graph.expanded_paged_kv_indices,
+                   torch::tensor({10, 11, 10, 11, 10, 11, 20, 20, 21, 20, 21},
+                                 torch::kInt)));
+  EXPECT_TRUE(torch::equal(params.graph.expanded_paged_kv_last_page_len,
+                           torch::tensor({2, 3, 4, 4, 1, 2}, torch::kInt)));
+}
+
+TEST(MtpAsyncInputBuilderTest, AdvancesLaterDraftFromAcceptedDeviceBase) {
+  ForwardInput draft_input;
+  draft_input.positions = torch::zeros({2}, torch::kInt);
+  draft_input.input_params.attention.device.kv_seq_lens =
+      torch::zeros({2}, torch::kInt);
+  ForwardInput block_table_source;
+  block_table_source.input_params.attention.device.block_tables =
+      torch::tensor({{10, 11, 12, 13}, {20, 21, 22, 23}}, torch::kInt);
+  const torch::Tensor base_positions = torch::tensor({4, 10}, torch::kInt);
+  const torch::Tensor base_kv_seq_lens = torch::tensor({5, 11}, torch::kInt);
+
+  prepare_later_draft_from_device_base(draft_input,
+                                       block_table_source,
+                                       base_positions,
+                                       base_kv_seq_lens,
+                                       /*position_offset=*/1,
+                                       kBlockSize);
+  EXPECT_TRUE(
+      torch::equal(draft_input.positions, torch::tensor({5, 11}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(draft_input.input_params.attention.device.new_cache_slots,
+                   torch::tensor({45, 91}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(draft_input.input_params.attention.device.kv_seq_lens,
+                   torch::tensor({6, 12}, torch::kInt)));
+
+  prepare_later_draft_from_device_base(draft_input,
+                                       block_table_source,
+                                       base_positions,
+                                       base_kv_seq_lens,
+                                       /*position_offset=*/2,
+                                       kBlockSize);
+  EXPECT_TRUE(
+      torch::equal(draft_input.positions, torch::tensor({6, 12}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(draft_input.input_params.attention.device.new_cache_slots,
+                   torch::tensor({46, 92}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(draft_input.input_params.attention.device.kv_seq_lens,
+                   torch::tensor({7, 13}, torch::kInt)));
+}
+
 TEST(MtpAsyncInputBuilderTest, BuildsTokenwiseSpecVerifyKvLengths) {
   EXPECT_EQ(layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
                 /*q_seq_lens=*/{2, 1}, /*kv_seq_lens=*/{4, 3}),

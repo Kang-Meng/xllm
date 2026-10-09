@@ -204,7 +204,8 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
   void prepare_validate_inputs(const ForwardInput& inputs,
                                ForwardInput& validate_inputs,
                                bool static_graph_tasks_prepared = false,
-                               bool record_ready_event = true);
+                               bool record_ready_event = true,
+                               bool defer_expanded_paging = false);
   void prepare_validate_inputs(const ForwardInput& inputs,
                                ForwardInput& validate_inputs,
                                const std::vector<int32_t>& per_seq_val_tokens);
@@ -278,8 +279,10 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
   bool pending_target_context_matches(const ForwardInput& input) const;
   bool device_target_context_ready_for_batch(const ForwardInput& input) const;
   void flush_pending_target_context();
+  bool npu_combined_draft_ready() const;
   bool supports_combined_first_draft_execution() const;
-  bool can_use_combined_first_draft() const;
+  bool supports_python_dsv32_continuous_drafts(const ForwardInput& input) const;
+  bool can_use_combined_first_draft(const ForwardInput& input) const;
   bool can_prelaunch_next_first_draft(const ForwardInput& input) const;
   void prepare_next_first_draft_template(const ForwardInput& input,
                                          ForwardInput& combined_input);

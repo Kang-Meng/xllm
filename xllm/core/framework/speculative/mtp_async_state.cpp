@@ -142,6 +142,23 @@ bool supports_combined_draft_configuration(
   return false;
 }
 
+bool supports_python_dsv32_continuous_draft_configuration(
+    std::string_view target_model_type,
+    std::string_view draft_model_type,
+    std::string_view npu_backend,
+    int32_t dp_size,
+    bool is_python_target,
+    bool is_python_draft,
+    bool has_model_managed_block_tables,
+    int32_t target_index_topk,
+    int32_t draft_index_topk) {
+  return target_model_type == "deepseek_v32" &&
+         draft_model_type == "deepseek_v32_mtp" && npu_backend == "TORCH" &&
+         dp_size == 1 && is_python_target && is_python_draft &&
+         !has_model_managed_block_tables && target_index_topk > 0 &&
+         draft_index_topk > 0;
+}
+
 bool json_object_allows_draft_prelaunch(
     int32_t dp_size,
     const std::vector<int32_t>& dp_global_json_object_active,

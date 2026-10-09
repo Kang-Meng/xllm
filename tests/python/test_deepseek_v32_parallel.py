@@ -54,6 +54,7 @@ from xllm.python.model_executor.forward_context import (  # noqa: E402
 from xllm.python.models.deepseek_v32 import (  # noqa: E402
     DeepseekV3Config,
     DeepseekV3MoE,
+    _mlapo_v2_enabled,
 )
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,37 @@ def _config(**overrides) -> DeepseekV3Config:
 # ---------------------------------------------------------------------------
 # Config validation tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fused_mla_decode", "env_value", "operator_available", "expected"),
+    [
+        (True, None, True, True),
+        (True, "1", True, True),
+        (True, "0", True, False),
+        (True, None, False, False),
+        (False, None, True, False),
+    ],
+)
+def test_mlapo_v2_default_and_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_mla_decode: bool,
+    env_value: str | None,
+    operator_available: bool,
+    expected: bool,
+) -> None:
+    if env_value is None:
+        monkeypatch.delenv("XLLM_ENABLE_MLAPO_V2", raising=False)
+    else:
+        monkeypatch.setenv("XLLM_ENABLE_MLAPO_V2", env_value)
+    monkeypatch.setattr(
+        kernels,
+        "has_mla_preprocess_v2",
+        MagicMock(return_value=operator_available),
+        raising=False,
+    )
+
+    assert _mlapo_v2_enabled(fused_mla_decode) is expected
 
 
 class TestDeepseekV3ConfigValidation:

@@ -105,6 +105,10 @@ TEST(MtpAsyncStateTest, ClassifiesSupportedCombinedDraftExecutionPaths) {
             CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION);
   EXPECT_EQ(classify_combined_draft_execution_path("glm_moe_dsa_mtp"),
             CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION);
+  EXPECT_EQ(classify_combined_draft_execution_path("deepseek_v32_mtp"),
+            CombinedDraftExecutionPath::UNSUPPORTED);
+  EXPECT_EQ(classify_combined_draft_execution_path("deepseek_v32"),
+            CombinedDraftExecutionPath::UNSUPPORTED);
   EXPECT_EQ(classify_combined_draft_execution_path("qwen3_next_mtp"),
             CombinedDraftExecutionPath::UNSUPPORTED);
   EXPECT_EQ(classify_combined_draft_execution_path("mimo_mtp"),
@@ -137,7 +141,94 @@ TEST(MtpAsyncStateTest, RestrictsCombinedDraftToValidatedConfigurations) {
       "TORCH",
       /*dp_size=*/1));
   EXPECT_FALSE(supports_combined_draft_configuration(
-      CombinedDraftExecutionPath::UNSUPPORTED, "ATB", /*dp_size=*/1));
+      CombinedDraftExecutionPath::UNSUPPORTED,
+      "ATB",
+      /*dp_size=*/1));
+}
+
+TEST(MtpAsyncStateTest,
+     AllowsDeepseekV32ContinuousDraftOnlyForSupportedConfig) {
+  struct TestCase {
+    std::string_view target_model_type;
+    std::string_view draft_model_type;
+    std::string_view npu_backend;
+    int32_t dp_size;
+    bool is_python_target;
+    bool is_python_draft;
+    bool has_model_managed_block_tables;
+    bool allowed;
+    int32_t target_index_topk = 1;
+    int32_t draft_index_topk = 1;
+  };
+  const TestCase cases[] = {
+      {"deepseek_v32", "deepseek_v32_mtp", "TORCH", 1, true, true, false, true},
+      {"deepseek_v4", "deepseek_v32_mtp", "TORCH", 1, true, true, false, false},
+      {"deepseek_v32", "mimo_mtp", "TORCH", 1, true, true, false, false},
+      {"deepseek_v32", "deepseek_v32_mtp", "ATB", 1, true, true, false, false},
+      {"deepseek_v32",
+       "deepseek_v32_mtp",
+       "TORCH",
+       2,
+       true,
+       true,
+       false,
+       false},
+      {"deepseek_v32",
+       "deepseek_v32_mtp",
+       "TORCH",
+       1,
+       false,
+       true,
+       false,
+       false},
+      {"deepseek_v32",
+       "deepseek_v32_mtp",
+       "TORCH",
+       1,
+       true,
+       false,
+       false,
+       false},
+      {"deepseek_v32", "deepseek_v32_mtp", "TORCH", 1, true, true, true, false},
+      // The same gate controls prelaunch, so zero topk cannot enter either
+      // the prelaunch or the continuous expanded-verify path.
+      {"deepseek_v32",
+       "deepseek_v32_mtp",
+       "TORCH",
+       1,
+       true,
+       true,
+       false,
+       false,
+       0,
+       1},
+      {"deepseek_v32",
+       "deepseek_v32_mtp",
+       "TORCH",
+       1,
+       true,
+       true,
+       false,
+       false,
+       1,
+       0},
+  };
+  for (const TestCase& test_case : cases) {
+    SCOPED_TRACE(test_case.npu_backend);
+    SCOPED_TRACE(test_case.target_index_topk);
+    SCOPED_TRACE(test_case.draft_index_topk);
+    EXPECT_EQ(supports_python_dsv32_continuous_draft_configuration(
+                  test_case.target_model_type,
+                  test_case.draft_model_type,
+                  test_case.npu_backend,
+                  test_case.dp_size,
+                  test_case.is_python_target,
+                  test_case.is_python_draft,
+                  test_case.has_model_managed_block_tables,
+                  test_case.target_index_topk,
+                  test_case.draft_index_topk),
+              test_case.allowed);
+  }
 }
 
 TEST(MtpAsyncStateTest, AllowsDraftPrelaunchOnlyForPlainBatches) {

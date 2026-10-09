@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace xllm {
 
@@ -59,6 +60,24 @@ void prepare_target_verify_from_accepted_state(
     const torch::Tensor& accepted_tokens,
     const torch::Tensor& base_positions,
     const torch::Tensor& base_kv_seq_lens,
+    int32_t block_size);
+
+// Python DSV32 uses chunked-prefill verification: KV lengths and block tables
+// are sequence-scoped, while positions, slots, and expanded graph KV lengths
+// are token-scoped. Correct both layouts from the accepted device state.
+void prepare_expanded_target_verify_from_accepted_state(
+    ForwardInput& validate_input,
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& base_positions,
+    const torch::Tensor& base_kv_seq_lens,
+    int32_t block_size);
+
+// After the existing target-context flush resolves acceptance, rebuild host
+// planning lengths and paged rows from the corrected device KV lengths without
+// reading device values back to the host.
+void refresh_expanded_target_verify_metadata(
+    ForwardInput& validate_input,
+    const std::vector<int32_t>& accepted_base_kv_seq_lens,
     int32_t block_size);
 
 }  // namespace mtp_async

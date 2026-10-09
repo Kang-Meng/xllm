@@ -78,6 +78,19 @@ bool supports_combined_draft_configuration(
     std::string_view npu_backend,
     int32_t dp_size);
 
+// DSV32 prelaunch and continuous drafts share the same Python MLA policy;
+// the expanded verify correction requires positive index_topk on both models.
+bool supports_python_dsv32_continuous_draft_configuration(
+    std::string_view target_model_type,
+    std::string_view draft_model_type,
+    std::string_view npu_backend,
+    int32_t dp_size,
+    bool is_python_target,
+    bool is_python_draft,
+    bool has_model_managed_block_tables,
+    int32_t target_index_topk,
+    int32_t draft_index_topk);
+
 // Whether json_object constrained decoding permits the MTP first-draft
 // prelaunch window. The prelaunched draft is sampled before the accepted token
 // is known, so a batch with constrained rows cannot rebuild its grammar
