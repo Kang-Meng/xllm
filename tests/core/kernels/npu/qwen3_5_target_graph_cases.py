@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.5 DSpark target ACL graph integration test, invoked by the C++ driver."""
+"""Qwen3.5 DSpark target DP/ACL graph integration test, invoked by the C++ driver."""
 
 from __future__ import annotations
 
+import os
+from datetime import timedelta
 from types import SimpleNamespace
 
 import torch
@@ -25,7 +27,7 @@ from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadat
 from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.models.qwen3_5 import Qwen3_5ForCausalLM
 
-_DEVICE = torch.device("npu:0")
+_DEVICE = torch.device(f"npu:{os.environ.get('LOCAL_RANK', '0')}")
 
 
 def _random(shape: tuple[int, ...], generator: torch.Generator, dtype: torch.dtype) -> torch.Tensor:
@@ -37,10 +39,12 @@ def _target_metadata(
     accepted: list[int],
     width: int,
     step: int,
+    *,
+    prefix: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, SimpleNamespace, SimpleNamespace]:
     batch = len(slots)
     tokens = batch * width
-    prefix = 2 + step * width
+    prefix = 2 + step * width if prefix is None else prefix
     logical_slots = torch.tensor(slots, dtype=torch.int32, device=_DEVICE)
     lengths = [prefix + offset + 1 for _ in slots for offset in range(width)]
     block_table = logical_slots[:, None]
@@ -118,12 +122,25 @@ def _target_metadata(
 
 @torch.inference_mode()
 def check_dspark_target_aclgraph() -> None:
-    """Verify graph replay matches eager with complete groups and bucket tails."""
-    for width in range(2, 18):
-        _check_dspark_target_aclgraph_width(width)
+    """Run DP1 normally; torchrun --no-python selects synchronized DP2 ranks."""
+    torch.npu.set_device(_DEVICE)
+    if int(os.environ.get("WORLD_SIZE", "1")) == 2:
+        torch.distributed.init_process_group("gloo", timeout=timedelta(seconds=120))
+        try:
+            for width in range(2, 18):
+                _check_dspark_target_aclgraph_width(width, torch.distributed.get_rank())
+        finally:
+            torch.distributed.destroy_process_group()
+    else:
+        for width in range(2, 18):
+            _check_dspark_target_aclgraph_width(width)
 
 
-def _check_dspark_target_aclgraph_width(width: int) -> None:
+def _live_cache_states(caches: list[LayerCache], width: int) -> tuple[torch.Tensor, ...]:
+    return caches[0].conv[1:], caches[0].ssm[width:], caches[1].key[1:], caches[1].value[1:]
+
+
+def _check_dspark_target_aclgraph_width(width: int, dp_rank: int | None = None) -> None:
     generator = torch.Generator().manual_seed(238)
     config = {
         "model_type": "qwen3_5",
@@ -141,8 +158,10 @@ def _check_dspark_target_aclgraph_width(width: int) -> None:
         "vocab_size": 128,
         "max_position_embeddings": 128,
         "layers_to_capture": [0, 1],
-        "device": "npu:0",
+        "device": str(_DEVICE),
         "dtype": "bfloat16",
+        "dp_size": 1 if dp_rank is None else 2,
+        "dp_rank": dp_rank or 0,
     }
     model = Qwen3_5ForCausalLM(config)
     for name, parameter in model.named_parameters():
@@ -174,23 +193,80 @@ def _check_dspark_target_aclgraph_width(width: int) -> None:
         ([5, 4, 3, 2, 1], [width, 1, 2, width, 1]),
         ([1], [width]),
     )
+    dp_request_counts = ((0, 5), (3, 2), (5, 0), (1, 0), (0, 7), (5, 0))
+    if dp_rank is not None:
+        steps = tuple(
+            (list(range(1, counts[dp_rank] + 1)), [1 + step % width] * counts[dp_rank])
+            for step, counts in enumerate(dp_request_counts)
+        )
     for step, (slots, accepted) in enumerate(steps):
-        ids, positions, metadata, batch = _target_metadata(slots, accepted, width, step)
-        assert graph.decode_graph_runner.can_execute(ids, metadata)
+        is_prefill = dp_rank is not None and step == 3
+        if is_prefill and slots:
+            ids, positions, metadata, batch = _target_metadata([9], [1], 2, step, prefix=0)
+        elif slots:
+            ids, positions, metadata, batch = _target_metadata(slots, accepted, width, step)
+        else:
+            ids, positions, metadata, batch = _target_metadata([0], [1], 1, 0, prefix=0)
+            ids.fill_(1)
+            metadata.is_dummy = True
+            metadata.is_chunked_prefill = False
+            metadata.expanded_decode_metadata = None
+            batch.num_reqs = 0
+            batch.num_scheduled_tokens = []
+            batch.num_computed_tokens = []
+            batch.query_start_loc = [0]
+            batch.is_prefilling = []
+        if is_prefill:
+            metadata.is_spec_verify = False
+            metadata.is_prefill = bool(slots)
+            metadata.is_chunked_prefill = bool(slots)
+            metadata.expanded_decode_metadata = None
+            metadata.has_initial_state.zero_()
+            batch.is_prefilling = [True] * len(slots)
+        if dp_rank is not None:
+            raw_counts = tuple(count * (2 if is_prefill else width) for count in dp_request_counts[step])
+            metadata.raw_dp_execution_token_counts = raw_counts
+            metadata.dp_execution_token_counts = tuple(max(1, count) for count in raw_counts)
+            metadata.dp_is_decode = (0, 1) if is_prefill else (1, 1)
+            kv_length = 2 if is_prefill else 2 + (step + 1) * width
+            metadata.dp_global_kv_max_seq_lens = tuple(kv_length if count else 0 for count in dp_request_counts[step])
+        assert graph.decode_graph_runner.can_execute(ids, metadata) == (not is_prefill)
+        if not slots:
+            before = tuple(state.clone() for state in _live_cache_states(eager_caches, width))
         expected = eager.execute(ids, positions, metadata, input_batch_metadata=batch)
+        if not slots:
+            for state, previous in zip(_live_cache_states(eager_caches, width), before):
+                torch.testing.assert_close(state, previous, rtol=0, atol=0)
+            before = tuple(state.clone() for state in _live_cache_states(caches, width))
         actual = graph.execute(ids, positions, metadata, input_batch_metadata=batch)
+        if not slots:
+            for state, previous in zip(_live_cache_states(caches, width), before):
+                torch.testing.assert_close(state, previous, rtol=0, atol=0)
         assert isinstance(actual, tuple) and isinstance(expected, tuple)
-        assert actual[0].shape == (len(slots) * width, 128)
-        assert actual[1].shape == (len(slots) * width, 256)
-        # Repeated batch sizes must reuse captured storage after B grows/shrinks.
-        first_outputs = captured_outputs.setdefault(len(slots), actual)
-        assert tuple(t.data_ptr() for t in actual) == tuple(t.data_ptr() for t in first_outputs)
-        for output, reference in zip(actual, expected):
-            assert torch.isfinite(output).all()
-            torch.testing.assert_close(output.cpu(), reference.cpu(), rtol=5e-3, atol=2e-2)
+        assert actual[0].shape == (ids.numel(), 128)
+        assert actual[1].shape == (ids.numel(), 256)
+        if not is_prefill:
+            # Reuse captured storage after B grows/shrinks and eager prefill.
+            batch_size = len(slots) if dp_rank is None else max(dp_request_counts[step])
+            first_outputs = captured_outputs.setdefault(batch_size, actual)
+            assert tuple(t.data_ptr() for t in actual) == tuple(t.data_ptr() for t in first_outputs)
         # Padding owns slot zero; compare all real state rows/checkpoints.
         torch.testing.assert_close(conv[1:].cpu(), eager_caches[0].conv[1:].cpu(), rtol=0, atol=0)
         torch.testing.assert_close(ssm[width:].cpu(), eager_caches[0].ssm[width:].cpu(), rtol=5e-3, atol=2.5e-5)
-        # Different padded projection shapes can round BF16 KV by one ULP.
-        torch.testing.assert_close(key[1:].cpu(), eager_caches[1].key[1:].cpu(), rtol=1e-2, atol=1e-4)
-        torch.testing.assert_close(value[1:].cpu(), eager_caches[1].value[1:].cpu(), rtol=1e-2, atol=1e-4)
+        # Padded BF16 projections can propagate rounding into near-zero KV values.
+        torch.testing.assert_close(key[1:].cpu(), eager_caches[1].key[1:].cpu(), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(value[1:].cpu(), eager_caches[1].value[1:].cpu(), rtol=1e-2, atol=1e-2)
+        if slots:
+            for output_index, (output, reference) in enumerate(zip(actual, expected)):
+                assert torch.isfinite(output).all()
+                output_name = "hidden" if output_index == 0 else "aux"
+                case = f"rank={dp_rank}, width={width}, step={step}, output={output_name}"
+                torch.testing.assert_close(
+                    output.cpu(),
+                    reference.cpu(),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=lambda message, case=case: f"{case}: {message}",
+                )
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()

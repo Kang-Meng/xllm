@@ -260,6 +260,8 @@ class Qwen3_5GdnMetadataBuilder:
         metadata: AttentionMetadata,
     ) -> GdnMetadata:
         state_caches = self._require_state_caches(input_batch.input_ids.device)
+        if input_batch.is_dummy:
+            return self._build_dummy_metadata(input_batch, state_caches)
         read_indices, write_indices = self._resolve_indices(
             metadata,
             input_batch.input_ids.device,
@@ -299,7 +301,7 @@ class Qwen3_5GdnMetadataBuilder:
         state_caches = self._require_state_caches(device)
         if metadata.is_spec_verify:
             request_capacity = self._spec_verify_request_capacity(input_batch)
-            width = input_batch.num_scheduled_tokens[0]
+            width = self._checkpoint_stride
             if not MEGA_GDN_MTP_MIN_VERIFY_TOKENS <= width <= MEGA_GDN_MTP_MAX_VERIFY_TOKENS:
                 raise NotImplementedError(
                     f"Qwen3.5 MegaGdnMtpDecode supports {MEGA_GDN_MTP_MIN_VERIFY_TOKENS} "
@@ -377,6 +379,11 @@ class Qwen3_5GdnMetadataBuilder:
         request_capacity = self._spec_verify_request_capacity(input_batch)
         if persistent.read_state_indices.shape != (request_capacity,):
             raise ValueError("Qwen3.5 GDN verify graph capacity does not match the execution batch")
+        if input_batch.is_dummy:
+            persistent.read_state_indices.zero_()
+            persistent.write_state_indices.zero_()
+            persistent.num_accepted_tokens.fill_(1)
+            return
         read_indices, write_indices = self._resolve_indices(metadata, device)
         num_reqs = input_batch.num_reqs
         if read_indices.numel() != num_reqs:
@@ -396,15 +403,38 @@ class Qwen3_5GdnMetadataBuilder:
 
     def _spec_verify_request_capacity(self, input_batch: InputBatch) -> int:
         """Validate GDN-specific grouping on an already validated InputBatch."""
-        if input_batch.num_reqs <= 0:
+        width = self._checkpoint_stride
+        if width is None:
+            raise RuntimeError("Qwen3.5 GDN state caches must be bound before execution")
+        if input_batch.is_dummy:
+            if input_batch.num_reqs != 0 or input_batch.num_tokens != 1:
+                raise ValueError("Qwen3.5 GDN requires one execution row for an empty DP shard")
+        elif input_batch.num_reqs <= 0:
             raise ValueError("Qwen3.5 GDN verify requires at least one request")
-        token_counts = input_batch.num_scheduled_tokens
-        width = token_counts[0]
-        if any(count != width for count in token_counts):
-            raise ValueError("Qwen3.5 GDN verify requires equal-width request groups")
-        if self._checkpoint_stride != width:
+        if any(count != width for count in input_batch.num_scheduled_tokens):
             raise ValueError("Qwen3.5 GDN verify width must match the bound cache checkpoint stride")
         return input_batch.num_tokens_after_padding // width
+
+    def _build_dummy_metadata(
+        self,
+        input_batch: InputBatch,
+        state_caches: Mapping[int, GdnStateCache],
+    ) -> GdnPrefillMetadata:
+        """Execute an idle rank without reading or modifying live state."""
+        if input_batch.num_reqs != 0 or input_batch.num_tokens != 1:
+            raise ValueError("Qwen3.5 GDN requires one execution row for an empty DP shard")
+        device = input_batch.input_ids.device
+        read_indices = torch.full((1,), -1, dtype=torch.int32, device=device)
+        write_indices = torch.zeros(1, dtype=torch.int32, device=device)
+        return GdnPrefillMetadata(
+            state_caches=state_caches,
+            conv_read_indices=read_indices,
+            conv_write_indices=write_indices,
+            ssm_read_indices=read_indices,
+            ssm_write_indices=write_indices,
+            cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            num_matrices=self._num_value_heads,
+        )
 
     def _build_prefill_metadata(
         self,
@@ -417,16 +447,9 @@ class Qwen3_5GdnMetadataBuilder:
         checkpoint_stride = self._checkpoint_stride
         if checkpoint_stride is None:
             raise RuntimeError("Qwen3.5 GDN state caches must be bound before execution")
-        if input_batch.is_dummy:
-            if input_batch.num_reqs != 0 or input_batch.num_tokens != 1:
-                raise ValueError("Qwen3.5 GDN requires one execution row for an empty DP shard")
-            num_sequences = 1
-            query_start_loc = (0, 1)
-            num_scheduled_tokens = (1,)
-        else:
-            num_sequences = input_batch.num_reqs
-            query_start_loc = input_batch.query_start_loc
-            num_scheduled_tokens = input_batch.num_scheduled_tokens
+        num_sequences = input_batch.num_reqs
+        query_start_loc = input_batch.query_start_loc
+        num_scheduled_tokens = input_batch.num_scheduled_tokens
 
         if write_indices.numel() != num_sequences:
             raise ValueError("Qwen3.5 GDN prefill requires one state slot per request")

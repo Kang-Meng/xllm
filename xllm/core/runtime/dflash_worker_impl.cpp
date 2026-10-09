@@ -555,9 +555,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
     return output;
   }
 
-  // Mirror prepare_query_inputs' metadata geometry: DSV4 DSpark represents
-  // every block row as a q_len=1 sequence, while Qwen/DFlash keeps one
-  // query_width-wide sequence.
+  // Idle ranks still use the active ranks' draft width for DP token counts.
+  // Their local query geometry follows the draft's dummy input contract.
   const int32_t draft_width = dflash_detail::decode_draft_width(
       options_.num_speculative_tokens(), sample_from_anchor());
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
@@ -565,8 +564,13 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   query_input.input_params.clear_linear_attention_state();
   dflash_detail::invalidate_draft_model_geometry(query_input.input_params);
   query_input.input_params.meta.batch_forward_type = draft_batch_forward_type();
-  query_input.input_params.meta.q_max_seq_len =
-      use_block_parallel_rows ? 1 : draft_width;
+  if (draft_impl_->context_.get_model_args().dummy_token_count() == 1) {
+    // The metadata builder uses zero query length to materialize a dummy row.
+    query_input.input_params.meta.q_max_seq_len = 0;
+  } else {
+    query_input.input_params.meta.q_max_seq_len =
+        use_block_parallel_rows ? 1 : draft_width;
+  }
   if (use_block_parallel_rows) {
     expand_block_parallel_sequence_rows(query_input.input_params, draft_width);
   }
