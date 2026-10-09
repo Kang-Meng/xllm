@@ -61,6 +61,7 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "runtime/llm_worker_impl.h"
+#include "runtime/speculative_worker_impl.h"
 #include "runtime/speculative_worker_utils.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
@@ -243,6 +244,7 @@ void build_expanded_spec_verify_graph_input(ModelInputParams& input_params,
   bind_expanded_spec_verify_graph_input(
       input_params, device, false, block_size);
 }
+
 #endif
 
 void clear_ready_events(ForwardInput& input) {
@@ -1321,27 +1323,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
               .value());
     }
 
-    new_input = input;
-    for (int32_t& token_num :
-         new_input.input_params.parallel.dp_global_token_nums) {
-      token_num *= options_.num_speculative_tokens() + 1;
-    }
-    for (int32_t& token_num :
-         new_input.input_params.parallel.raw_dp_global_token_nums) {
-      token_num *= options_.num_speculative_tokens() + 1;
-    }
-    new_input.input_params.expert.eplb_decode_token_mask =
-        eplb::expand_decode_token_mask(
-            new_input.input_params.expert.eplb_decode_token_mask,
-            options_.num_speculative_tokens() + 1);
-    // Idle decode joins the busy ranks' target validate. Keep its forward type
-    // and spec-verify flag consistent with the busy ranks, while preserving
-    // the zero query length that identifies the dummy row.
-    if (use_chunked_prefill_spec_verify_path()) {
-      new_input.input_params.meta.batch_forward_type =
-          BatchForwardType::CHUNKED_PREFILL;
-      new_input.input_params.is_spec_verify = true;
-    }
+    prepare_empty_validate_inputs(input, new_input);
     // Deadlock-safety under DP: this rank's shard is empty but all peers
     // decode, so busy peers allgather their pruned validate counts before the
     // target forward. Join that allgather in lockstep with this rank's uniform
@@ -3175,6 +3157,100 @@ void MTPWorkerImpl::update_decode_step_input(
   input.device_tensors_ready = false;
 }
 
+void MTPWorkerImpl::prepare_empty_validate_inputs(
+    const ForwardInput& input,
+    ForwardInput& validate_input) {
+  CHECK_EQ(input.input_params.meta.num_sequences, 0)
+      << "empty target validation requires an empty rank";
+  validate_input = input;
+
+  ModelInputParams& input_params = validate_input.input_params;
+  const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  scale_speculative_parallel_token_counts(input_params, num_val_tokens);
+
+  if (!use_chunked_prefill_spec_verify_path()) {
+    return;
+  }
+
+  input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  input_params.is_spec_verify = true;
+
+#if defined(USE_NPU)
+  if (parallel_args_.dp_size() <= 1 ||
+      !is_qwen3_5_target_model_type(context_.get_model_args().model_type()) ||
+      !supports_explicit_spec_verify_replay_update()) {
+    return;
+  }
+
+  c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
+  clear_ready_events(validate_input);
+  validate_input.input_host_buffer_has_layout = false;
+  validate_input.device_tensors_ready = false;
+
+  CHECK(input_params.attention.host.q_seq_lens.empty())
+      << "empty Qwen3.5 target validation must not contain real query lengths";
+  CHECK(input_params.attention.host.kv_seq_lens.empty())
+      << "empty Qwen3.5 target validation must not contain real KV lengths";
+  input_params.attention.host.q_cu_seq_lens.clear();
+  input_params.attention.host.new_cache_slots.clear();
+  input_params.attention.host.kv_cache_tokens_nums.clear();
+  input_params.attention.host.graph_q_seq_lens_data = nullptr;
+  input_params.attention.host.graph_kv_seq_lens_data = nullptr;
+  input_params.attention.device = AttentionDeviceInput{};
+  input_params.embedding.input_embedding = torch::Tensor();
+  input_params.clear_linear_attention_state();
+  input_params.meta.actual_num_sequences = 0;
+  input_params.meta.q_max_seq_len = num_val_tokens;
+  input_params.meta.kv_max_seq_len = 1;
+  input_params.parallel.query_start_loc.clear();
+  input_params.num_accepted_tokens_host.assign(1, 0);
+  input_params.num_accepted_tokens = torch::zeros(
+      {1}, torch::TensorOptions().dtype(torch::kInt).device(device_));
+  input_params.graph.attn_mask = torch::Tensor();
+  input_params.graph.tiling_data = torch::Tensor();
+  input_params.graph.input_tokens_override = torch::Tensor();
+  input_params.graph.spec_verify_draft_token_sources.clear();
+  input_params.graph.spec_verify_source_addresses_stable = false;
+  input_params.graph.spec_verify_static_graph_tasks_prepared = false;
+
+  CHECK_GT(options_.block_size(), 0)
+      << "empty expanded metadata requires a positive cache block size";
+  int64_t block_table_width = 0;
+  if (impl_ != nullptr) {
+    const int64_t max_position_embeddings =
+        impl_->context_.get_model_args().max_position_embeddings();
+    if (max_position_embeddings > 0) {
+      block_table_width = mtp_async::speculative_verify_block_table_capacity(
+          max_position_embeddings, options_.block_size());
+    }
+  }
+  const torch::Tensor& host_block_tables =
+      input.input_params.attention.host.block_tables;
+  if (block_table_width <= 0 && host_block_tables.defined() &&
+      host_block_tables.dim() == 2 && host_block_tables.size(1) > 0) {
+    block_table_width = host_block_tables.size(1);
+  }
+  const torch::Tensor& device_block_tables =
+      input.input_params.attention.device.block_tables;
+  if (block_table_width <= 0 && device_block_tables.defined() &&
+      device_block_tables.dim() == 2 && device_block_tables.size(1) > 0) {
+    block_table_width = device_block_tables.size(1);
+  }
+  CHECK_GT(block_table_width, 0)
+      << "empty expanded metadata requires block-table width from the model "
+         "position capacity or input block tables";
+  clear_expanded_spec_verify_graph_input(input_params);
+  const torch::TensorOptions int_options =
+      torch::TensorOptions().dtype(torch::kInt).device(device_);
+  layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+      input_params,
+      torch::ones({1}, int_options),
+      torch::zeros({1, block_table_width}, int_options),
+      std::vector<int32_t>{1},
+      options_.block_size());
+#endif
+}
+
 void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
                                             ForwardInput& validate_input,
                                             bool static_graph_tasks_prepared,
@@ -3372,14 +3448,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
       validate_sampling_params, num_val_tokens, total_num_val_tokens);
 #endif
 
-  for (int32_t& token_num : input_params.parallel.dp_global_token_nums) {
-    token_num *= num_val_tokens;
-  }
-  for (int32_t& token_num : input_params.parallel.raw_dp_global_token_nums) {
-    token_num *= num_val_tokens;
-  }
-  input_params.expert.eplb_decode_token_mask = eplb::expand_decode_token_mask(
-      input_params.expert.eplb_decode_token_mask, num_val_tokens);
+  scale_speculative_parallel_token_counts(input_params, num_val_tokens);
 
   std::vector<int32_t> accepted_prefix_lengths;
   if (use_chunked_prefill_spec_verify_path()) {

@@ -102,8 +102,23 @@ bool is_qwen3_5_dp_graph_step_supported(const ModelArgs& args,
       raw_dp_token_nums.empty() ? dp_token_nums : raw_dp_token_nums;
   const int32_t min_dp_token_num = util::min(graph_dp_token_nums);
   const int32_t max_dp_token_num = util::max(graph_dp_token_nums);
-  return min_dp_token_num > 0 && min_dp_token_num == max_dp_token_num &&
-         !options.enable_graph_mode_decode_no_padding();
+  if (options.enable_graph_mode_decode_no_padding() || max_dp_token_num <= 0 ||
+      min_dp_token_num < 0) {
+    return false;
+  }
+  if (!params.is_spec_verify && params.meta.batch_forward_type.is_decode() &&
+      options.num_decoding_tokens() == 1) {
+    return true;
+  }
+  if (params.is_spec_verify &&
+      params.meta.batch_forward_type.is_chunked_prefill() &&
+      params.graph.use_expanded_decode_for_spec_verify_attention &&
+      params.graph.expanded_kv_seq_lens.defined() &&
+      params.graph.expanded_block_tables.defined() &&
+      params.num_accepted_tokens.defined()) {
+    return true;
+  }
+  return min_dp_token_num == max_dp_token_num;
 }
 
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
@@ -1186,14 +1201,13 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   if (!is_qwen3_5_dp_graph_step_supported(args_, options_, params_single)) {
     const std::vector<int32_t>& raw_dp_token_nums =
         params_single.parallel.raw_dp_global_token_nums;
-    // Qwen3.5 DP graph is currently validated only with decode padding.
-    // No-padding changes graph bucketing and MTP input updates, so a locally
-    // prewarmed graph does not establish cross-rank replay compatibility.
+    // Qwen3.5 DP graph requires decode padding and, for uneven target MTP,
+    // expanded spec-verify metadata on every rank.
     const bool decode_no_padding =
         options_.enable_graph_mode_decode_no_padding();
     LOG_FIRST_N(WARNING, 1)
-        << "Falling back to eager mode because DP ACL graph requires a "
-           "balanced, non-empty token distribution with decode padding. "
+        << "Falling back to eager mode because DP ACL graph requires "
+           "decode padding and compatible per-rank metadata. "
            "dp_global_token_nums="
         << dp_token_nums << ", raw_dp_global_token_nums=" << raw_dp_token_nums
         << ", decode_no_padding=" << decode_no_padding;

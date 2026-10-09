@@ -1034,7 +1034,7 @@ TEST_F(AclGraphTaskUpdateTest,
                                              /*spec_verify=*/false);
 }
 
-TEST_F(AclGraphTaskUpdateTest, Qwen35DpPrepareSkipsUnsupportedDecodeSteps) {
+TEST_F(AclGraphTaskUpdateTest, Qwen35DpPrepareRespectsDecodeGraphAdmission) {
   ExecutionConfig::get_instance().enable_graph_double_buffer(true);
   model_args_.model_type("qwen3_5");
   model_ = std::make_unique<HybridConv1dMockLM>(model_args_, *device_);
@@ -1076,8 +1076,9 @@ TEST_F(AclGraphTaskUpdateTest, Qwen35DpPrepareSkipsUnsupportedDecodeSteps) {
   prepared_input.token_ids.add_(1);
   prepared_input.positions.add_(1);
   for (const std::vector<int32_t>& unsupported_token_counts :
-       {std::vector<int32_t>{kLocalBatchSize, kLocalBatchSize - 1},
-        std::vector<int32_t>{kLocalBatchSize, 0}}) {
+       {std::vector<int32_t>{kLocalBatchSize, -1},
+        std::vector<int32_t>{0, 0}}) {
+    SCOPED_TRACE(::testing::PrintToString(unsupported_token_counts));
     set_dp_layout(prepared_input.input_params, unsupported_token_counts);
     graph_exec->prepare_graph_input(prepared_input.token_ids,
                                     prepared_input.positions,
@@ -1086,12 +1087,27 @@ TEST_F(AclGraphTaskUpdateTest, Qwen35DpPrepareSkipsUnsupportedDecodeSteps) {
     EXPECT_FALSE(graph_exec->graph_slot_prepared_for_test(/*slot_idx=*/0));
   }
 
-  set_dp_layout(prepared_input.input_params, balanced_token_counts);
-  graph_exec->prepare_graph_input(prepared_input.token_ids,
-                                  prepared_input.positions,
-                                  kv_graph,
-                                  prepared_input.input_params);
-  EXPECT_TRUE(graph_exec->graph_slot_prepared_for_test(/*slot_idx=*/0));
+  int32_t prepare_slot = 0;
+  for (const std::vector<int32_t>& supported_token_counts :
+       {balanced_token_counts,
+        std::vector<int32_t>{kLocalBatchSize, kLocalBatchSize - 1},
+        std::vector<int32_t>{kLocalBatchSize, 0}}) {
+    SCOPED_TRACE(::testing::PrintToString(supported_token_counts));
+    ASSERT_FALSE(graph_exec->graph_slot_prepared_for_test(prepare_slot));
+    set_dp_layout(prepared_input.input_params, supported_token_counts);
+    graph_exec->prepare_graph_input(prepared_input.token_ids,
+                                    prepared_input.positions,
+                                    kv_graph,
+                                    prepared_input.input_params);
+    ASSERT_TRUE(graph_exec->graph_slot_prepared_for_test(prepare_slot));
+    (void)graph_exec->run(prepared_input.token_ids,
+                          prepared_input.positions,
+                          kv_graph,
+                          prepared_input.input_params);
+    EXPECT_FALSE(graph_exec->graph_slot_prepared_for_test(prepare_slot));
+    EXPECT_EQ(model_->capture_forward_count(), 2);
+    prepare_slot = 1 - prepare_slot;
+  }
 }
 
 TEST_F(AclGraphTaskUpdateTest, CaptureReplayVsEagerDecodeBranch) {

@@ -248,12 +248,21 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   const int64_t max_graph_tokens = get_decode_graph_token_capacity(options);
   const int64_t bucketed_max_graph_tokens =
       get_bucketed_decode_graph_token_capacity(options);
-  // Hybrid spec verify keeps sequence-scoped metadata (with bucket padding,
-  // see get_hybrid_metadata_capacity), while non-hybrid MTP expands every
-  // proposal token into its own decode metadata row.
-  const int64_t metadata_capacity = is_hybrid_linear_attention
-                                        ? get_hybrid_metadata_capacity(options)
-                                        : max_graph_tokens;
+  // Hybrid speculative verification normally keeps sequence-scoped metadata.
+  // In DP target-MTP decode, however, an empty rank builds cold dummy metadata
+  // for every proposal-token row so that its graph shape matches active ranks.
+  // Reserve bucketed token capacity for that capture path; otherwise preserve
+  // the sequence-scoped allocation, including bucket-padding coverage.
+  const bool needs_token_scoped_empty_dp_metadata =
+      is_hybrid_linear_attention && options.enable_speculative_decode() &&
+      !options.is_draft_engine() && options.dp_size() > 1 &&
+      is_qwen3_5_target_model_type(args.model_type());
+  const int64_t metadata_capacity =
+      needs_token_scoped_empty_dp_metadata
+          ? std::max(bucketed_max_graph_tokens,
+                     get_hybrid_metadata_capacity(options))
+          : (is_hybrid_linear_attention ? get_hybrid_metadata_capacity(options)
+                                        : max_graph_tokens);
 
   const int64_t max_seq_len = args_.max_position_embeddings();
 
@@ -981,13 +990,21 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           ? static_cast<int32_t>(padded_num_tokens -
                                  (padded_batch_size - 1) * q_max_seq_len)
           : 1;
-  const bool is_empty_dp_decode_rank =
-      is_decode && params.meta.num_sequences == 0 && actual_num_tokens > 0 &&
+  const bool is_qwen3_5_hybrid_target =
+      is_hybrid_linear_attention_ && !options_.is_draft_engine() &&
+      is_qwen3_5_target_model_type(args_.model_type());
+  const bool is_empty_dp_graph_rank =
+      (is_decode ||
+       (is_qwen3_5_hybrid_target && is_hybrid_spec_verify_chunked_prefill &&
+        params.graph.use_expanded_decode_for_spec_verify_attention)) &&
+      params.meta.num_sequences == 0 && actual_num_tokens > 0 &&
       params.parallel.dp_global_token_nums.size() > 1 &&
       params.attention.host.kv_seq_lens.empty() &&
       params.attention.host.q_seq_lens.empty();
+  const bool is_empty_qwen3_5_dp_graph_rank =
+      is_empty_dp_graph_rank && is_qwen3_5_hybrid_target;
   const int64_t actual_seq_len_rows =
-      is_empty_dp_decode_rank
+      is_empty_dp_graph_rank
           ? 0
           : (is_chunked_prefill ? actual_batch_size : actual_num_tokens);
 
@@ -1126,6 +1143,13 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           .slice(0, actual_batch_size, padded_batch_size)
           .fill_(kPaddingLinearStateId);
     }
+  } else if (is_empty_qwen3_5_dp_graph_rank) {
+    persistent_linear_state_indices_
+        .slice(/*dim=*/0, /*start=*/0, /*end=*/padded_batch_size)
+        .fill_(kPaddingLinearStateId);
+    persistent_linear_state_read_indices_
+        .slice(/*dim=*/0, /*start=*/0, /*end=*/padded_batch_size)
+        .fill_(kPaddingLinearStateId);
   }
   if (params.num_accepted_tokens.defined()) {
     persistent_num_accepted_tokens_
@@ -1203,22 +1227,26 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     q_cu_seq_lens_.copy_(q_cu_seq_lens_default_, /*non_blocking=*/true);
   }
   const bool has_q_cu = params.attention.device.q_cu_seq_lens.defined() &&
-                        params.attention.device.q_cu_seq_lens.dim() >= 1;
-  const int64_t q_cu_size =
-      (has_q_cu && params.attention.device.q_cu_seq_lens.numel() > 0)
-          ? params.attention.device.q_cu_seq_lens.size(0)
-          : 0;
-  if (has_q_cu && q_cu_size > 0) {
-    const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
+                        params.attention.device.q_cu_seq_lens.dim() >= 1 &&
+                        params.attention.device.q_cu_seq_lens.numel() > 0;
+  const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
+  const bool synthesize_empty_hybrid_q_cu =
+      !has_q_cu && is_hybrid_spec_verify_chunked_prefill &&
+      is_empty_qwen3_5_dp_graph_rank;
+  if (has_q_cu || synthesize_empty_hybrid_q_cu) {
     const bool input_has_leading_zero =
         params.is_spec_verify && use_hybrid_query_start_loc;
     const int64_t required_q_cu_seq_lens =
         actual_seq_len_rows + (input_has_leading_zero ? 1 : 0);
-    CHECK_GE(params.attention.device.q_cu_seq_lens.numel(),
-             required_q_cu_seq_lens)
-        << "q_cu_seq_lens does not have enough entries for ACL graph "
-           "execution";
-    if (use_hybrid_query_start_loc && !input_has_leading_zero) {
+    if (has_q_cu) {
+      CHECK_GE(params.attention.device.q_cu_seq_lens.numel(),
+               required_q_cu_seq_lens)
+          << "q_cu_seq_lens does not have enough entries for ACL graph "
+             "execution";
+    }
+    if (synthesize_empty_hybrid_q_cu) {
+      q_cu_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/1).zero_();
+    } else if (use_hybrid_query_start_loc && !input_has_leading_zero) {
       q_cu_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/1).zero_();
       q_cu_seq_lens_
           .slice(/*dim=*/0, /*start=*/1, /*end=*/actual_seq_len_rows + 1)
@@ -1236,11 +1264,11 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     }
     if (padded_batch_size > actual_seq_len_rows) {
       int32_t offset =
-          is_empty_dp_decode_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
+          is_empty_dp_graph_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
       std::vector<int32_t> padded_q_cu_seq_lens;
       padded_q_cu_seq_lens.reserve(padded_batch_size - actual_seq_len_rows);
       const int32_t padding_q_len = is_chunked_prefill ? q_max_seq_len : 1;
-      for (int64_t i = actual_seq_len_rows; i < padded_batch_size; ++i) {
+      for (int64_t row = actual_seq_len_rows; row < padded_batch_size; ++row) {
         offset += padding_q_len;
         padded_q_cu_seq_lens.emplace_back(offset);
       }
@@ -1249,9 +1277,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       const int64_t padding_end =
           padded_batch_size + (use_hybrid_query_start_loc ? 1 : 0);
       q_cu_seq_lens_
-          .slice(/*dim=*/0,
-                 /*start=*/padding_start,
-                 /*end=*/padding_end)
+          .slice(/*dim=*/0, /*start=*/padding_start, /*end=*/padding_end)
           .copy_(torch::tensor(padded_q_cu_seq_lens, torch::kInt).to(device_),
                  /*non_blocking=*/true);
     }
@@ -1265,7 +1291,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   const bool skip_unused_expanded_verify_mask =
       can_skip_unused_expanded_verify_mask(params, is_hybrid_linear_attention_);
   if (need_update_attn_mask_ && !skip_unused_expanded_verify_mask) {
-    update_attention_mask(params);
+    if (is_empty_qwen3_5_dp_graph_rank) {
+      persistent_mask_.slice(/*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens)
+          .zero_();
+    } else {
+      update_attention_mask(params);
+    }
   }
 
   std::vector<int32_t> padded_kv_seq_lens_vec(
@@ -1405,7 +1436,11 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     graph_params->attention.device.q_seq_lens =
         q_seq_lens(static_cast<uint32_t>(padded_batch_size));
     graph_params->meta.actual_num_sequences =
-        is_empty_dp_decode_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
+        is_empty_dp_graph_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
+    if (is_empty_qwen3_5_dp_graph_rank && is_decode) {
+      graph_params->meta.q_max_seq_len = 1;
+      graph_params->meta.kv_max_seq_len = 1;
+    }
     if (supports_mla_graph_kv_bucketing_) {
       std::vector<int32_t> capture_host_kv_seq_lens_vec =
           persistent_host_kv_seq_lens_;
@@ -1481,7 +1516,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
         persistent_new_cache_slots(padded_num_tokens);
     graph_params->attention.device.block_tables =
         persistent_block_tables(static_cast<uint32_t>(padded_batch_size));
-    if (!params.embedding.linear_state_ids.empty()) {
+    if (!params.embedding.linear_state_ids.empty() ||
+        is_empty_qwen3_5_dp_graph_rank) {
       graph_params->embedding.linear_state_ids =
           params.embedding.linear_state_ids;
       graph_params->embedding.linear_state_ids.resize(
@@ -1555,8 +1591,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       graph_params->graph.expanded_tiling_data =
           uses_paged_attention_tiling() ? tiling_data() : torch::Tensor();
     }
-    if (params.attention.device.q_cu_seq_lens.defined()) {
-      const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
+    if (params.attention.device.q_cu_seq_lens.defined() ||
+        synthesize_empty_hybrid_q_cu) {
       graph_params->attention.device.q_cu_seq_lens = q_cu_seq_lens_.slice(
           /*dim=*/0,
           /*start=*/0,

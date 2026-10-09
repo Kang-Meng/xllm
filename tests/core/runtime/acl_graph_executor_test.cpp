@@ -45,6 +45,7 @@ limitations under the License.
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
 #include "core/layers/npu_torch/qwen3_next_attention.h"
@@ -55,10 +56,12 @@ limitations under the License.
 #include "core/runtime/base_executor_impl.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/dflash_worker_impl.h"
+#include "core/runtime/mtp_worker_impl.h"
 #include "core/runtime/options.h"
 #include "core/runtime/speculative_worker_impl.h"
 #include "models/llm/deepseek_v4.h"
 #include "models/llm/dspark_weight_source.h"
+#include "models/llm/qwen3_next_hybrid_base.h"
 #include "models/model_registry.h"
 #include "tests/npu_test_environment.h"
 
@@ -98,6 +101,43 @@ class AclGraphExecutorTestEnvironment : public ::testing::Environment {
     ::testing::AddGlobalTestEnvironment(new AclGraphExecutorTestEnvironment);
 
 namespace xllm {
+
+namespace {
+
+class EmptyValidateTestMTPWorker final : public MTPWorkerImpl {
+ public:
+  EmptyValidateTestMTPWorker(const ParallelArgs& parallel_args,
+                             const torch::Device& device,
+                             const runtime::Options& options)
+      : MTPWorkerImpl(parallel_args, device, options, WorkerType::LLM) {}
+
+  ForwardInput prepare_validate_input(
+      const ForwardInput& input,
+      const std::string& model_type = "qwen3_5",
+      const std::string& model_impl = "native") {
+    ModelArgs args;
+    args.model_type(model_type);
+    context_ = ModelContext(
+        parallel_args_,
+        args,
+        QuantArgs(),
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_),
+        nullptr);
+    context_.set_model_impl(model_impl);
+    target_spec_verify_mode_ = mtp_async::classify_target_spec_verify_mode(
+        model_type, model_impl == "python");
+    ForwardInput validate_input;
+    if (input.input_params.meta.num_sequences == 0) {
+      prepare_empty_validate_inputs(input, validate_input);
+    } else {
+      prepare_validate_inputs(input, validate_input);
+    }
+    CHECK_EQ(prepare_stream_->synchronize(), 0);
+    return validate_input;
+  }
+};
+
+}  // namespace
 
 TEST(DeepseekV4MetadataInputTest, KeepsOnlyDraftRegisteredBlockTables) {
   ModelInputParams target_input_params;
@@ -1259,6 +1299,295 @@ TEST_F(AclGraphExecutorTest, DpDecodeGraphKeyIgnoresRawTokenDistribution) {
   }
 }
 
+TEST_F(AclGraphExecutorTest, Qwen35DpDecodeGraphAdmission) {
+  model_args_.model_type("qwen3_5");
+  options_.world_size(2).dp_size(2);
+  options_.max_seqs_per_batch(4).max_tokens_per_batch(16);
+  auto batch = CreateTestBatch();
+  auto input = batch->prepare_forward_input(
+      options_.num_decoding_tokens(), 0, model_args_);
+  input = input.to(*device_, torch::kFloat32);
+  input.input_params.parallel.dp_is_decode = {1, 1};
+  first_full_attention_cache(kv_caches_).get_k_cache().select(0, 0).zero_();
+  const auto expected = model_->forward(
+      input.token_ids, input.positions, kv_caches_, input.input_params);
+  npu::AclGraphExecutorImpl executor(
+      model_.get(), model_args_, *device_, options_);
+  const auto* simple_model = dynamic_cast<SimpleCausalLM*>(model_.get());
+  ASSERT_NE(simple_model, nullptr);
+
+  const std::vector<std::vector<int32_t>> distributions = {
+      {1, 0}, {1, 3}, {1, 2}, {1, 0}};
+  for (const auto& distribution : distributions) {
+    input.input_params.parallel.dp_global_token_nums = distribution;
+    input.input_params.parallel.raw_dp_global_token_nums = distribution;
+    const auto output = executor.run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_TRUE(simple_model->last_forward_enabled_graph());
+    EXPECT_TRUE(torch::allclose(
+        expected.hidden_states, output.hidden_states, 1e-5, 1e-6));
+  }
+
+  input.input_params.parallel.dp_global_token_nums = {1, 1};
+
+  const std::vector<std::vector<int32_t>> invalid_distributions = {
+      {-1, 1}, {0, 0}, {1}};
+  for (const auto& distribution : invalid_distributions) {
+    input.input_params.parallel.raw_dp_global_token_nums = distribution;
+    executor.run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_FALSE(simple_model->last_forward_enabled_graph());
+  }
+
+  input.input_params.parallel.raw_dp_global_token_nums = {1, 0};
+  const std::vector<std::vector<int32_t>> invalid_decode_metadata = {
+      {}, {1}, {1, 0}, {1, 1, 1}};
+  for (const auto& metadata : invalid_decode_metadata) {
+    input.input_params.parallel.dp_is_decode = metadata;
+    executor.run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_FALSE(simple_model->last_forward_enabled_graph());
+  }
+
+  options_.enable_graph_mode_decode_no_padding(true);
+  input.input_params.parallel.dp_global_token_nums = {1, 0};
+  input.input_params.parallel.raw_dp_global_token_nums = {1, 0};
+  input.input_params.parallel.dp_is_decode = {1, 1};
+  npu::AclGraphExecutorImpl no_padding_executor(
+      model_.get(), model_args_, *device_, options_);
+  no_padding_executor.run(
+      input.token_ids, input.positions, kv_caches_, input.input_params);
+  EXPECT_FALSE(simple_model->last_forward_enabled_graph());
+}
+
+TEST_F(AclGraphExecutorTest, Qwen35PaddedSpecVerifyBusyAndEmptyRanksUseGraph) {
+  class HybridSimpleCausalLM final : public SimpleCausalLM {
+   public:
+    using SimpleCausalLM::SimpleCausalLM;
+    bool is_hybrid_linear_attention() override { return true; }
+  };
+
+  ASSERT_FALSE(
+      ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding());
+  constexpr int32_t kSpecWidth = 2;
+  model_args_.model_type("qwen3_5").max_position_embeddings(32);
+  options_.world_size(2).dp_size(2).enable_graph(true);
+  options_.enable_graph_mode_decode_no_padding(false);
+  options_.max_seqs_per_batch(4).max_tokens_per_batch(16);
+  options_.num_speculative_tokens(kSpecWidth - 1);
+  options_.num_decoding_tokens(kSpecWidth).enable_speculative_decode(true);
+  HybridSimpleCausalLM model(model_args_, *device_);
+  auto batch = CreateTestBatch();
+  auto input = batch->prepare_forward_input(1, 0, model_args_);
+  input = input.to(*device_, torch::kFloat32);
+  input.input_params.parallel.dp_is_decode = {1, 1};
+  input.input_params.parallel.dp_global_token_nums = {1, 0};
+  input.input_params.parallel.raw_dp_global_token_nums = {1, 0};
+  input.input_params.expert.eplb_decode_token_mask =
+      torch::tensor({true}, torch::dtype(torch::kBool).device(*device_));
+  torch::npu::synchronize();
+
+  std::optional<uint64_t> expected_graph_key;
+  for (int32_t rank : {0, 1}) {
+    SCOPED_TRACE(rank);
+    layer::test::MockProcessGroup process_group(*device_, rank, 2);
+    ParallelArgs parallel_args(rank, 2, 2, &process_group);
+    EmptyValidateTestMTPWorker worker(parallel_args, *device_, options_);
+    ModelInputParams& params = input.input_params;
+    params.meta.num_sequences = 1 - rank;
+    params.meta.actual_num_sequences = 1 - rank;
+    params.attention.host.q_seq_lens.resize(1 - rank);
+    params.attention.host.kv_seq_lens.resize(1 - rank);
+    ForwardInput validate_input = worker.prepare_validate_input(input);
+    const ModelInputParams& validate_params = validate_input.input_params;
+    EXPECT_TRUE(validate_params.is_spec_verify);
+    EXPECT_TRUE(validate_params.meta.batch_forward_type.is_chunked_prefill());
+    EXPECT_EQ(validate_params.meta.q_max_seq_len, kSpecWidth);
+    EXPECT_TRUE(
+        validate_params.graph.use_expanded_decode_for_spec_verify_attention);
+    EXPECT_FALSE(validate_params.graph.spec_verify_source_addresses_stable);
+    EXPECT_EQ(validate_params.parallel.dp_global_token_nums,
+              std::vector<int32_t>({kSpecWidth, 0}));
+    EXPECT_EQ(validate_params.parallel.raw_dp_global_token_nums,
+              validate_params.parallel.dp_global_token_nums);
+    EXPECT_TRUE(torch::equal(
+        validate_params.expert.eplb_decode_token_mask,
+        params.expert.eplb_decode_token_mask.repeat_interleave(kSpecWidth)));
+    validate_input.token_ids.fill_(1);
+    const auto expected = model.forward(validate_input.token_ids,
+                                        validate_input.positions,
+                                        kv_caches_,
+                                        validate_params);
+    npu::AclGraphExecutorImpl executor(&model, model_args_, *device_, options_);
+    const uint64_t graph_key =
+        executor.graph_key_for_test(kSpecWidth, validate_params);
+    if (!expected_graph_key.has_value()) {
+      expected_graph_key = graph_key;
+    }
+    EXPECT_EQ(graph_key, expected_graph_key.value());
+    const auto output = executor.run(validate_input.token_ids,
+                                     validate_input.positions,
+                                     kv_caches_,
+                                     validate_params);
+    EXPECT_GT(executor.get_graph_count(), 0);
+    EXPECT_TRUE(model.last_forward_enabled_graph());
+    EXPECT_TRUE(torch::allclose(
+        expected.hidden_states, output.hidden_states, 1e-5, 1e-6));
+  }
+}
+
+TEST(AclGraphPersistentParamTest, Qwen35DpDecodeClearsInactiveRankState) {
+  ModelArgs args;
+  args.model_type("qwen3_5");
+  args.dtype("float32");
+  args.hidden_size(8);
+  args.max_position_embeddings(32);
+  runtime::Options options;
+  options.block_size(4).dp_size(2).max_seqs_per_batch(4);
+  options.max_tokens_per_batch(16).num_decoding_tokens(1);
+  const torch::Device device("npu:0");
+  const torch::TensorOptions int_options =
+      torch::dtype(torch::kInt).device(device);
+  npu::GraphPersistentParam persistent_param(
+      args,
+      device,
+      options,
+      /*need_update_attn_mask=*/true,
+      /*is_hybrid_linear_attention=*/true);
+  ASSERT_GT(persistent_param.persistent_mask().size(0), 2);
+  persistent_param.persistent_mask().fill_(7);
+  const torch::Tensor tokens = torch::ones({1}, int_options);
+  const torch::Tensor positions = torch::zeros({1}, int_options);
+  ModelInputParams active;
+  active.meta.batch_forward_type = BatchForwardType::DECODE;
+  active.meta.num_sequences = 1;
+  active.meta.q_max_seq_len = 1;
+  active.meta.kv_max_seq_len = 8;
+  active.attention.host.q_seq_lens = {1};
+  active.attention.host.kv_seq_lens = {8};
+  active.attention.device.q_seq_lens = torch::ones({1}, int_options);
+  active.attention.device.kv_seq_lens = torch::full({1}, 8, int_options);
+  active.attention.device.new_cache_slots = torch::full({1}, 7, int_options);
+  active.attention.device.block_tables = torch::ones({1, 2}, int_options);
+  active.embedding.linear_state_ids = {3};
+  active.embedding.linear_state_indices = torch::full({1}, 3, int_options);
+  active.embedding.linear_state_read_ids = {2};
+  active.embedding.linear_state_read_indices = torch::full({1}, 2, int_options);
+  active.linear_state_validity_mask = {1};
+  active.parallel.dp_global_token_nums = {1, 0};
+  active.parallel.raw_dp_global_token_nums = {1, 0};
+  active.parallel.dp_is_decode = {1, 1};
+
+  ModelInputParams inactive;
+  inactive.meta.batch_forward_type = BatchForwardType::DECODE;
+  inactive.parallel.dp_global_token_nums = {0, 1};
+  inactive.parallel.raw_dp_global_token_nums = {0, 1};
+  inactive.parallel.dp_is_decode = {1, 1};
+
+  for (const ModelInputParams* params : {&active, &inactive, &active}) {
+    const auto capture = persistent_param.update(
+        tokens, torch::Tensor(), torch::Tensor(), positions, *params, 2, true);
+    ASSERT_TRUE(capture.has_value());
+    const bool is_active = params->meta.num_sequences > 0;
+    EXPECT_TRUE(persistent_param.persistent_mask()
+                    .slice(/*dim=*/0, /*start=*/2)
+                    .eq(7)
+                    .all()
+                    .item<bool>());
+    if (!is_active) {
+      EXPECT_EQ(capture->graph.attn_mask.count_nonzero().item<int64_t>(), 0);
+    }
+    const std::vector<int32_t> expected_write_ids = {
+        is_active ? 3 : kPaddingLinearStateId, kPaddingLinearStateId};
+    const std::vector<int32_t> expected_read_ids = {
+        is_active ? 2 : kPaddingLinearStateId, kPaddingLinearStateId};
+    EXPECT_EQ(capture->meta.actual_num_sequences, is_active ? 1 : 0);
+    EXPECT_EQ(capture->meta.num_sequences, 2);
+    EXPECT_EQ(capture->meta.q_max_seq_len, 1);
+    EXPECT_EQ(capture->meta.kv_max_seq_len, is_active ? 8 : 1);
+    EXPECT_EQ(capture->parallel.dp_global_token_nums,
+              std::vector<int32_t>({2, 2}));
+    EXPECT_EQ(capture->parallel.raw_dp_global_token_nums,
+              params->parallel.raw_dp_global_token_nums);
+    EXPECT_EQ(capture->embedding.linear_state_ids, expected_write_ids);
+    EXPECT_EQ(capture->embedding.linear_state_read_ids, expected_read_ids);
+    EXPECT_TRUE(torch::equal(capture->embedding.linear_state_indices.cpu(),
+                             torch::tensor(expected_write_ids, torch::kInt)));
+    EXPECT_TRUE(torch::equal(capture->embedding.linear_state_read_indices.cpu(),
+                             torch::tensor(expected_read_ids, torch::kInt)));
+    EXPECT_EQ(capture->linear_state_validity_mask,
+              std::vector<int64_t>({is_active ? 1 : 0, 0}));
+    const std::vector<int32_t> expected_cache_slots = {is_active ? 7 : 0, 0};
+    EXPECT_TRUE(torch::equal(capture->attention.device.new_cache_slots.cpu(),
+                             torch::tensor(expected_cache_slots, torch::kInt)));
+    const auto metadata =
+        layer::AttentionMetadataBuilder::build(*capture, false);
+    EXPECT_FALSE(metadata.is_dummy);
+    EXPECT_EQ(metadata.slot_mapping.numel(), 2);
+    EXPECT_EQ(metadata.kv_seq_lens.numel(), 2);
+    EXPECT_EQ(metadata.block_table.size(0), 2);
+  }
+}
+
+TEST(AclGraphPersistentParamTest, EmptyDpDecodeMetadataScope) {
+  struct TestCase {
+    std::string model_type;
+    bool is_hybrid_linear_attention;
+    bool normalize_empty_decode;
+    bool is_draft_engine = false;
+  };
+  const std::vector<TestCase> test_cases = {{"qwen3_5", true, true},
+                                            {"qwen3_5_moe", true, true},
+                                            {"qwen3_5_text", true, true},
+                                            {"qwen3_5_moe_text", true, true},
+                                            {"qwen3_next", true, false},
+                                            {"qwen3_5_mtp", true, false},
+                                            {"qwen3_5", true, false, true},
+                                            {"qwen3_5", false, false}};
+  const torch::Device device("npu:0");
+  const torch::TensorOptions int_options =
+      torch::dtype(torch::kInt).device(device);
+  const torch::Tensor tokens = torch::ones({1}, int_options);
+  const torch::Tensor positions = torch::zeros({1}, int_options);
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(test_case.model_type);
+    SCOPED_TRACE(test_case.is_hybrid_linear_attention);
+    ModelArgs args;
+    args.model_type(test_case.model_type);
+    args.dtype("float32").hidden_size(8).max_position_embeddings(32);
+    runtime::Options options;
+    options.world_size(2).dp_size(2).block_size(4);
+    options.is_draft_engine(test_case.is_draft_engine);
+    options.max_seqs_per_batch(2).max_tokens_per_batch(2).num_decoding_tokens(
+        1);
+    npu::GraphPersistentParam persistent_param(
+        args, device, options, false, test_case.is_hybrid_linear_attention);
+    ModelInputParams params;
+    params.meta.batch_forward_type = BatchForwardType::DECODE;
+    params.parallel.dp_global_token_nums = {0, 1};
+    params.parallel.raw_dp_global_token_nums = {0, 1};
+    params.parallel.dp_is_decode = {1, 1};
+    const auto capture = persistent_param.update(
+        tokens, torch::Tensor(), torch::Tensor(), positions, params, 2, true);
+    ASSERT_TRUE(capture.has_value());
+    EXPECT_EQ(capture->meta.actual_num_sequences, 0);
+    EXPECT_EQ(capture->meta.num_sequences, 2);
+    EXPECT_EQ(capture->meta.q_max_seq_len,
+              test_case.normalize_empty_decode ? 1 : 0);
+    EXPECT_EQ(capture->meta.kv_max_seq_len,
+              test_case.normalize_empty_decode ? 1 : 0);
+    EXPECT_EQ(capture->embedding.linear_state_ids.empty(),
+              !test_case.normalize_empty_decode);
+    EXPECT_EQ(capture->embedding.linear_state_indices.defined(),
+              test_case.normalize_empty_decode);
+    EXPECT_EQ(capture->embedding.linear_state_read_indices.defined(),
+              test_case.normalize_empty_decode);
+    EXPECT_FALSE(capture->attention.device.q_cu_seq_lens.defined());
+    EXPECT_EQ(capture->parallel.query_start_loc,
+              std::vector<int64_t>({0, 1, 2}));
+  }
+}
+
 TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
   SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();
   const bool original_enable_atb_spec_kernel =
@@ -1347,6 +1676,309 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
 }
 
 class HybridSpecVerifyPaddingTest : public ::testing::TestWithParam<int32_t> {};
+
+TEST(AclGraphPersistentParamTest, EmptyDpTokenCapacityIsQwen35TargetOnly) {
+  SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();
+  const bool original_enable_atb_spec_kernel =
+      speculative_config.enable_atb_spec_kernel();
+  struct TestCase {
+    std::string model_type;
+    int32_t dp_size;
+    bool is_draft_engine;
+    bool speculative_decode;
+    int64_t expected_rows;
+    int32_t spec_width = 4;
+    bool enable_atb_spec_kernel = false;
+    uint32_t capture_decode_tokens = 0;
+  };
+  const std::vector<TestCase> test_cases = {
+      {"qwen3_5", 2, false, true, 16, 4, false, 16},
+      {"qwen3_5_moe", 2, false, true, 16},
+      {"qwen3_5_text", 2, false, true, 16},
+      {"qwen3_5_moe_text", 2, false, true, 16},
+      {"qwen3_next", 2, false, true, 4},
+      {"qwen3_5_mtp", 2, false, true, 4},
+      {"glm5_next", 2, false, true, 4},
+      {"qwen3_5", 1, false, true, 4},
+      {"qwen3_5", 2, true, true, 4},
+      {"qwen3_5", 2, false, false, 4},
+      {"qwen3_5", 2, false, true, 16, 3, false},
+      {"qwen3_5", 2, false, true, 32, 5, false},
+      {"qwen3_5", 2, false, true, 6, 3, true},
+      {"qwen3_5", 2, false, true, 7, 5, true},
+  };
+  const torch::Device device("npu:0");
+  const torch::TensorOptions int_options =
+      torch::dtype(torch::kInt).device(device);
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(test_case.model_type);
+    SCOPED_TRACE(test_case.dp_size);
+    SCOPED_TRACE(test_case.is_draft_engine);
+    SCOPED_TRACE(test_case.speculative_decode);
+    SCOPED_TRACE(test_case.spec_width);
+    SCOPED_TRACE(test_case.enable_atb_spec_kernel);
+    speculative_config.enable_atb_spec_kernel(test_case.enable_atb_spec_kernel);
+    ModelArgs args;
+    args.model_type(test_case.model_type);
+    args.dtype("float32").hidden_size(8).max_position_embeddings(32);
+    runtime::Options options;
+    options.block_size(4).dp_size(test_case.dp_size);
+    options.max_seqs_per_batch(4).max_tokens_per_batch(
+        runtime::get_decode_graph_token_bucket(4 * test_case.spec_width,
+                                               false));
+    options.num_decoding_tokens(test_case.spec_width);
+    options.enable_speculative_decode(test_case.speculative_decode);
+    options.is_draft_engine(test_case.is_draft_engine);
+    npu::GraphPersistentParam persistent_param(
+        args, device, options, false, true);
+    EXPECT_EQ(persistent_param.q_seq_lens().numel(), test_case.expected_rows);
+    EXPECT_EQ(persistent_param.kv_seq_lens().numel(), test_case.expected_rows);
+    EXPECT_EQ(persistent_param.persistent_block_tables().size(0),
+              test_case.expected_rows);
+    EXPECT_EQ(persistent_param.persistent_linear_state_indices().numel(),
+              test_case.expected_rows);
+    EXPECT_EQ(persistent_param.persistent_num_accepted_tokens().numel(),
+              test_case.expected_rows);
+    if (test_case.capture_decode_tokens == 0) {
+      continue;
+    }
+    ModelInputParams params;
+    params.meta.batch_forward_type = BatchForwardType::DECODE;
+    params.meta.q_max_seq_len = 1;
+    params.meta.kv_max_seq_len = 1;
+    params.parallel.dp_global_token_nums = {1, 1};
+    const uint32_t token_count = test_case.capture_decode_tokens;
+    const auto capture =
+        persistent_param.update(torch::ones({token_count}, int_options),
+                                torch::Tensor(),
+                                torch::Tensor(),
+                                torch::zeros({token_count}, int_options),
+                                params,
+                                token_count,
+                                true);
+    ASSERT_TRUE(capture.has_value());
+    EXPECT_EQ(capture->meta.num_sequences, token_count);
+    EXPECT_EQ(capture->attention.device.block_tables.size(0), token_count);
+  }
+  speculative_config.enable_atb_spec_kernel(original_enable_atb_spec_kernel);
+}
+
+TEST(MTPWorkerImplTest, EmptyValidateScopeAndGraphLayout) {
+  class MetadataRecorder final : public layer::Qwen3HybridDecoderLayerModule {
+   public:
+    void load_state_dict(const StateDict&) override {}
+    void verify_loaded_weights(const std::string&) const override {}
+    torch::Tensor forward(torch::Tensor& hidden_states,
+                          std::optional<torch::Tensor>&,
+                          torch::Tensor&,
+                          const layer::AttentionMetadata& metadata,
+                          KVCache&,
+                          const ModelInputParams& params,
+                          const torch::Tensor&) override {
+      metadata_ = metadata;
+      input_q_max_seq_len_ = params.meta.q_max_seq_len;
+      return hidden_states;
+    }
+    layer::AttentionMetadata metadata_;
+    int32_t input_q_max_seq_len_ = 0;
+  };
+  constexpr int32_t kSpecWidth = 4;
+  constexpr int64_t kBlockTableWidth = 3;
+  struct TestCase {
+    std::string model_type;
+    std::string model_impl;
+    int32_t dp_size;
+    bool rebuild_metadata;
+    bool chunked_prefill;
+    bool enable_graph = true;
+  };
+  const std::vector<TestCase> test_cases = {
+      {"qwen3_5", "native", 2, true, true},
+      {"qwen3_5_moe", "native", 2, true, true},
+      {"qwen3_5_text", "native", 2, true, true},
+      {"qwen3_5_moe_text", "native", 2, true, true},
+      {"qwen3_5", "native", 2, true, true, false},
+      {"qwen3_5", "python", 2, false, true},
+      {"qwen3_5", "python", 2, false, true, false},
+      {"qwen3_5", "native", 1, false, true},
+      {"qwen3_next", "native", 2, false, false},
+      {"qwen3_5_mtp", "native", 2, false, false},
+      {"glm5_next", "native", 2, false, true},
+      {"glm5_next", "python", 2, false, true},
+      {"mimo", "native", 2, false, true},
+  };
+  const torch::Device device("npu:0");
+  const torch::TensorOptions int_options =
+      torch::dtype(torch::kInt).device(device);
+  layer::test::MockProcessGroup process_group(device, 0, 2);
+  runtime::Options options;
+  options.num_speculative_tokens(kSpecWidth - 1).block_size(4).dp_size(2);
+  options.max_seqs_per_batch(4).max_tokens_per_batch(16);
+  options.num_decoding_tokens(kSpecWidth).enable_speculative_decode(true);
+  {
+    ParallelArgs parallel_args(0, 2, 2, &process_group);
+    EmptyValidateTestMTPWorker worker(parallel_args, device, options);
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(worker.prepare_validate_input(ForwardInput{}),
+                 "requires block-table width from the model");
+  }
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(test_case.model_type);
+    SCOPED_TRACE(test_case.model_impl);
+    SCOPED_TRACE(test_case.dp_size);
+    SCOPED_TRACE(test_case.enable_graph);
+    ParallelArgs parallel_args(0, 2, test_case.dp_size, &process_group);
+    options.dp_size(test_case.dp_size).enable_graph(test_case.enable_graph);
+    EmptyValidateTestMTPWorker worker(parallel_args, device, options);
+
+    ForwardInput input;
+    input.token_ids = torch::ones({1}, int_options);
+    input.positions = torch::zeros({1}, int_options);
+    input.input_host_buffer_has_layout = true;
+    input.device_tensors_ready = true;
+    input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+    input.input_params.parallel.dp_global_token_nums =
+        test_case.dp_size == 2 ? std::vector<int32_t>{0, 1}
+                               : std::vector<int32_t>{0};
+    input.input_params.parallel.raw_dp_global_token_nums =
+        input.input_params.parallel.dp_global_token_nums;
+    input.input_params.attention.host.block_tables =
+        torch::zeros({0, kBlockTableWidth}, torch::kInt);
+    input.input_params.attention.device.q_seq_lens =
+        torch::ones({1}, int_options);
+    input.input_params.attention.device.kv_seq_lens =
+        torch::ones({1}, int_options);
+    input.input_params.attention.device.q_cu_seq_lens =
+        torch::tensor({0, 1}, int_options);
+    input.input_params.attention.device.new_cache_slots =
+        torch::ones({1}, int_options);
+    input.input_params.attention.device.block_tables =
+        torch::ones({1, 1}, int_options);
+    input.input_params.embedding.linear_state_ids = {7};
+    input.input_params.embedding.linear_state_indices =
+        torch::full({1}, 7, int_options);
+    input.input_params.linear_state_validity_mask = {1};
+    input.input_params.linear_state_validity_mask_tensor =
+        torch::ones({1}, torch::dtype(torch::kBool).device(device));
+
+    const ForwardInput validate_input = worker.prepare_validate_input(
+        input, test_case.model_type, test_case.model_impl);
+    const auto& params = validate_input.input_params;
+    EXPECT_EQ(params.meta.batch_forward_type.is_chunked_prefill(),
+              test_case.chunked_prefill);
+    EXPECT_EQ(params.is_spec_verify, test_case.chunked_prefill);
+    EXPECT_EQ(params.meta.num_sequences, 0);
+    EXPECT_EQ(params.meta.actual_num_sequences, 0);
+    EXPECT_EQ(validate_input.input_host_buffer_has_layout,
+              !test_case.rebuild_metadata);
+    EXPECT_EQ(validate_input.device_tensors_ready, !test_case.rebuild_metadata);
+    EXPECT_EQ(params.meta.q_max_seq_len,
+              test_case.rebuild_metadata ? kSpecWidth : 0);
+    EXPECT_EQ(params.meta.kv_max_seq_len, test_case.rebuild_metadata ? 1 : 0);
+    EXPECT_EQ(params.graph.use_expanded_decode_for_spec_verify_attention,
+              test_case.rebuild_metadata);
+    EXPECT_EQ(params.num_accepted_tokens.defined(), test_case.rebuild_metadata);
+    EXPECT_EQ(params.attention.device.q_seq_lens.defined(),
+              !test_case.rebuild_metadata);
+    EXPECT_EQ(params.attention.device.kv_seq_lens.defined(),
+              !test_case.rebuild_metadata);
+    EXPECT_EQ(params.attention.device.q_cu_seq_lens.defined(),
+              !test_case.rebuild_metadata);
+    EXPECT_EQ(params.attention.device.new_cache_slots.defined(),
+              !test_case.rebuild_metadata);
+    EXPECT_EQ(params.attention.device.block_tables.defined(),
+              !test_case.rebuild_metadata);
+    EXPECT_EQ(params.embedding.linear_state_ids.empty(),
+              test_case.rebuild_metadata);
+    EXPECT_EQ(params.embedding.linear_state_indices.defined(),
+              !test_case.rebuild_metadata);
+    EXPECT_EQ(params.linear_state_validity_mask.empty(),
+              test_case.rebuild_metadata);
+    EXPECT_EQ(params.linear_state_validity_mask_tensor.defined(),
+              !test_case.rebuild_metadata);
+    const std::vector<int32_t> expected_tokens =
+        test_case.dp_size == 2 ? std::vector<int32_t>{0, kSpecWidth}
+                               : std::vector<int32_t>{0};
+    EXPECT_EQ(params.parallel.dp_global_token_nums, expected_tokens);
+    EXPECT_EQ(params.parallel.raw_dp_global_token_nums, expected_tokens);
+    ModelArgs args;
+    args.model_type(test_case.model_type).dtype("float32");
+    args.hidden_size(8).max_position_embeddings(32).vocab_size(8);
+    args.rms_norm_eps(1e-5f);
+    if (test_case.model_impl == "native") {
+      layer::test::MockProcessGroup tp_group(device, 0, 2 / test_case.dp_size);
+      ParallelArgs model_parallel_args = parallel_args;
+      model_parallel_args.tp_group_ = &tp_group;
+      const ModelContext context(model_parallel_args,
+                                 args,
+                                 QuantArgs(),
+                                 int_options.dtype(torch::kFloat));
+      Qwen3HybridModelImplBase model(context);
+      auto recorder = std::make_shared<MetadataRecorder>();
+      model.add_decoder_layer(recorder);
+      for (auto& parameter : model.parameters()) {
+        parameter.detach().zero_();
+      }
+      ModelInputParams model_params = params;
+      model_params.meta.q_max_seq_len = kSpecWidth;
+      model_params.enable_graph = test_case.enable_graph;
+      model_params.embedding.input_embedding =
+          torch::ones({1, 8}, int_options.dtype(torch::kFloat));
+      std::vector<KVCache> kv_caches(1);
+      model.forward(validate_input.token_ids,
+                    validate_input.positions,
+                    kv_caches,
+                    model_params);
+      EXPECT_EQ(recorder->metadata_.is_dummy, test_case.rebuild_metadata);
+      EXPECT_EQ(recorder->input_q_max_seq_len_, kSpecWidth);
+      EXPECT_EQ(model_params.meta.q_max_seq_len, kSpecWidth);
+      EXPECT_FALSE(layer::AttentionMetadataBuilder::build(
+                       model_params, false, {}, device)
+                       .is_dummy);
+    }
+    if (!test_case.rebuild_metadata) {
+      continue;
+    }
+    EXPECT_EQ(params.graph.expanded_kv_seq_lens_vec, std::vector<int32_t>({1}));
+    EXPECT_TRUE(torch::equal(params.graph.expanded_kv_seq_lens.cpu(),
+                             torch::tensor({1}, torch::kInt32)));
+    EXPECT_TRUE(
+        torch::equal(params.graph.expanded_block_tables.cpu(),
+                     torch::zeros({1, kBlockTableWidth}, torch::kInt32)));
+    EXPECT_EQ(params.num_accepted_tokens_host, std::vector<int64_t>({0}));
+    EXPECT_TRUE(torch::equal(params.num_accepted_tokens.cpu(),
+                             torch::zeros({1}, torch::kInt32)));
+    npu::GraphPersistentParam persistent_param(
+        args, device, options, true, true);
+    const auto capture = persistent_param.update(validate_input.token_ids,
+                                                 torch::Tensor(),
+                                                 torch::Tensor(),
+                                                 validate_input.positions,
+                                                 params,
+                                                 kSpecWidth,
+                                                 true,
+                                                 false,
+                                                 true);
+    ASSERT_TRUE(capture.has_value());
+    EXPECT_EQ(capture->meta.actual_num_sequences, 0);
+    EXPECT_EQ(capture->meta.num_sequences, 1);
+    EXPECT_EQ(capture->meta.q_max_seq_len, kSpecWidth);
+    EXPECT_EQ(capture->meta.kv_max_seq_len, 1);
+    EXPECT_EQ(capture->parallel.dp_global_token_nums,
+              std::vector<int32_t>({kSpecWidth, kSpecWidth}));
+    EXPECT_EQ(capture->parallel.raw_dp_global_token_nums, expected_tokens);
+    EXPECT_EQ(capture->parallel.query_start_loc,
+              std::vector<int64_t>({0, kSpecWidth}));
+    EXPECT_TRUE(torch::equal(capture->attention.device.q_cu_seq_lens.cpu(),
+                             torch::tensor({0, kSpecWidth}, torch::kInt32)));
+    EXPECT_EQ(capture->embedding.linear_state_ids,
+              std::vector<int32_t>({kPaddingLinearStateId}));
+    EXPECT_EQ(capture->linear_state_validity_mask, std::vector<int64_t>({0}));
+    EXPECT_EQ(capture->num_accepted_tokens_host, std::vector<int64_t>({1}));
+    EXPECT_TRUE(torch::equal(capture->num_accepted_tokens.cpu(),
+                             torch::ones({1}, torch::kInt32)));
+  }
+}
 
 TEST_P(HybridSpecVerifyPaddingTest, MetadataCoversBucketPadding) {
   SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();

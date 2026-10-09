@@ -113,8 +113,22 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
       }
     }
 
+    const ModelInputParams* attention_input = &input_params;
     layer::AttentionMetadataBuildOptions metadata_build_options;
 #if defined(USE_NPU)
+    std::optional<ModelInputParams> dummy_attention_input;
+    if (dp_size_ > 1 &&
+        is_qwen3_5_target_model_type(model_args_.model_type()) &&
+        input_params.is_spec_verify &&
+        input_params.meta.batch_forward_type.is_chunked_prefill() &&
+        input_params.meta.num_sequences == 0 &&
+        input_params.meta.q_max_seq_len > 0 &&
+        input_params.attention.host.q_seq_lens.empty() &&
+        input_params.attention.host.kv_seq_lens.empty()) {
+      dummy_attention_input = input_params;
+      dummy_attention_input->meta.q_max_seq_len = 0;
+      attention_input = &dummy_attention_input.value();
+    }
     // Native NPU GDN consumes the canonical host mask directly. Avoid
     // materializing the unused device bool tensor inside ACL graph capture.
     metadata_build_options.materialize_linear_state_validity =
@@ -122,7 +136,7 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
 #endif
 #if defined(USE_MUSA)
     layer::AttentionMetadata attn_metadata =
-        layer::AttentionMetadataBuilder::build(input_params,
+        layer::AttentionMetadataBuilder::build(*attention_input,
                                                model_args_.enable_mla(),
                                                /*attn_mask=*/std::nullopt,
                                                /*device=*/device_,
@@ -131,7 +145,7 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
 #else
     layer::AttentionMetadata attn_metadata =
         layer::AttentionMetadataBuilder::build(
-            input_params,
+            *attention_input,
             model_args_.enable_mla(),
             build_attention_mask(input_params),
             /*device=*/device_,
