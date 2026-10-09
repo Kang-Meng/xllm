@@ -40,6 +40,7 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
 #include "util/rec_model_utils.h"
+#include "util/utils.h"
 
 namespace xllm {
 
@@ -301,9 +302,9 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   GAUGE_SET(kv_cache_utilization_perc,
             kv_cache_manager_->kv_cache_utilization());
   GAUGE_SET(num_blocks_in_prefix_cache,
-            kv_cache_manager_->num_blocks_in_prefix_cache().size());
-  GAUGE_SET(num_free_blocks, kv_cache_manager_->num_free_blocks().size());
-  GAUGE_SET(num_used_blocks, kv_cache_manager_->num_used_blocks().size());
+            util::min(kv_cache_manager_->num_blocks_in_prefix_cache()));
+  GAUGE_SET(num_free_blocks, util::max(kv_cache_manager_->num_free_blocks()));
+  GAUGE_SET(num_used_blocks, util::min(kv_cache_manager_->num_used_blocks()));
 
   return batches;
 }

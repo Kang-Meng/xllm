@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "common/metrics.h"
 #include "continuous_scheduler.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
@@ -65,15 +66,17 @@ class FakeEngine : public Engine {
  public:
   FakeEngine(int32_t num_blocks,
              int32_t block_size,
-             bool linear_state = false) {
+             bool linear_state = false,
+             int32_t dp_size = 1,
+             bool enable_prefix_cache = false) {
     BlockManagerPool::Options opt;
     opt.num_blocks_ = num_blocks;
     opt.block_size_ = block_size;
-    opt.enable_prefix_cache_ = false;
+    opt.enable_prefix_cache_ = enable_prefix_cache;
     opt.enable_linear_state_ = linear_state;
     opt.linear_state_num_slots_ = linear_state ? 8 : 0;
     fake_tokenizer_ = std::make_unique<FakeTokenizer>();
-    fake_block_manager_ = std::make_unique<BlockManagerPool>(opt, 1);
+    fake_block_manager_ = std::make_unique<BlockManagerPool>(opt, dp_size);
   }
   ForwardOutput step(std::vector<Batch>& batch) override {
     for (Batch& item : batch) {
@@ -202,6 +205,96 @@ TEST(FixedStepsSchedulerTest, PrepareBatchEmptyWhenNoRequests) {
   std::vector<Batch> batches = base->prepare_batch_test();
   EXPECT_FALSE(batches.empty());
   EXPECT_TRUE(batches[0].empty());
+}
+
+TEST(FixedStepsSchedulerTest, ReportsBlockCountsInsteadOfRankCount) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), false);
+  auto engine = std::make_unique<FakeEngine>(32, 32);
+  int32_t dp_rank = -1;
+  auto held_blocks =
+      engine->block_manager_pool()->allocate(/*num_tokens=*/64, dp_rank);
+  ASSERT_EQ(dp_rank, 0);
+  ASSERT_EQ(held_blocks.size(), 2u);
+  auto opt = CreateOptions();
+  FixedStepsScheduler scheduler(engine.get(), opt);
+  ContinuousScheduler* base = &scheduler;
+  base->prepare_batch_test();
+
+  const std::vector<size_t> free_blocks =
+      engine->block_manager_pool()->num_free_blocks();
+  const std::vector<size_t> used_blocks =
+      engine->block_manager_pool()->num_used_blocks();
+  const std::vector<size_t> prefix_blocks =
+      engine->block_manager_pool()->num_blocks_in_prefix_cache();
+  ASSERT_EQ(free_blocks.size(), 1u);
+  ASSERT_EQ(used_blocks.size(), 1u);
+  ASSERT_EQ(prefix_blocks.size(), 1u);
+  EXPECT_GT(free_blocks[0], 1u);
+  EXPECT_GT(used_blocks[0], 1u);
+  EXPECT_DOUBLE_EQ(GAUGE_num_free_blocks.get_value(),
+                   static_cast<double>(free_blocks[0]));
+  EXPECT_DOUBLE_EQ(GAUGE_num_used_blocks.get_value(),
+                   static_cast<double>(used_blocks[0]));
+  EXPECT_DOUBLE_EQ(GAUGE_num_blocks_in_prefix_cache.get_value(),
+                   static_cast<double>(prefix_blocks[0]));
+}
+
+TEST(FixedStepsSchedulerTest, ReportsBlockCountsAcrossMultipleRanks) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  auto engine = std::make_unique<FakeEngine>(/*num_blocks=*/32,
+                                             /*block_size=*/32,
+                                             /*linear_state=*/false,
+                                             /*dp_size=*/2,
+                                             /*enable_prefix_cache=*/true);
+  BlockManagerPool* block_manager_pool = engine->block_manager_pool();
+  int32_t lightly_loaded_rank = -1;
+  auto lightly_held_blocks =
+      block_manager_pool->allocate(/*num_tokens=*/64, lightly_loaded_rank);
+  ASSERT_EQ(lightly_held_blocks.size(), 2u);
+  int32_t heavily_loaded_rank = -1;
+  auto heavily_held_blocks =
+      block_manager_pool->allocate(/*num_tokens=*/192, heavily_loaded_rank);
+  ASSERT_EQ(heavily_held_blocks.size(), 6u);
+  ASSERT_NE(lightly_loaded_rank, heavily_loaded_rank);
+
+  auto cached_requests = GenRequests({64}, {10}, RecType::kNone);
+  Sequence* cached_sequence = cached_requests[0]->sequences()[0].get();
+  ASSERT_EQ(cached_sequence->num_tokens(), 64u);
+  cached_sequence->set_dp_rank(heavily_loaded_rank);
+  ASSERT_TRUE(block_manager_pool->allocate(cached_sequence,
+                                           cached_sequence->num_tokens()));
+  cached_sequence->kv_state().set_kv_cache_tokens_num(
+      cached_sequence->num_tokens());
+  block_manager_pool->deallocate(cached_sequence);
+
+  auto opt = CreateOptions(/*max_tokens_per_batch=*/10000,
+                           /*max_seqs_per_batch=*/256,
+                           /*dp_size=*/2);
+  FixedStepsScheduler scheduler(engine.get(), opt);
+  ContinuousScheduler* base = &scheduler;
+  base->prepare_batch_test();
+
+  const std::vector<size_t> free_blocks = block_manager_pool->num_free_blocks();
+  const std::vector<size_t> used_blocks = block_manager_pool->num_used_blocks();
+  const std::vector<size_t> prefix_blocks =
+      block_manager_pool->num_blocks_in_prefix_cache();
+  ASSERT_EQ(free_blocks.size(), 2u);
+  ASSERT_EQ(used_blocks.size(), 2u);
+  ASSERT_EQ(prefix_blocks.size(), 2u);
+  EXPECT_GT(free_blocks[lightly_loaded_rank], free_blocks[heavily_loaded_rank]);
+  EXPECT_LT(used_blocks[lightly_loaded_rank], used_blocks[heavily_loaded_rank]);
+  EXPECT_EQ(prefix_blocks[lightly_loaded_rank], 0u);
+  EXPECT_EQ(prefix_blocks[heavily_loaded_rank], 2u);
+  EXPECT_DOUBLE_EQ(GAUGE_num_free_blocks.get_value(),
+                   static_cast<double>(free_blocks[lightly_loaded_rank]));
+  EXPECT_DOUBLE_EQ(GAUGE_num_used_blocks.get_value(),
+                   static_cast<double>(used_blocks[lightly_loaded_rank]));
+  EXPECT_DOUBLE_EQ(GAUGE_num_blocks_in_prefix_cache.get_value(),
+                   static_cast<double>(prefix_blocks[lightly_loaded_rank]));
+
+  block_manager_pool->reset_prefix_cache();
 }
 
 TEST(FixedStepsSchedulerTest, PrepareBatchOneRecSchedulesRequest) {
