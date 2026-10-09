@@ -25,6 +25,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from xllm.python import kernels
 from xllm.python.layers import ColumnParallelLinear, RMSNorm
 from xllm.python.models.deepseek_v32 import (
     DeepseekV3Config,
@@ -100,10 +101,14 @@ class DeepseekV32MtpModel(nn.Module):
             input_embedding = token_hidden
 
         rotated_embedding = self.rot(input_embedding) if self.enable_rot else input_embedding
-        enorm_out = self.enorm(token_hidden)
-        hnorm_out = self.hnorm(rotated_embedding)
-
-        h = self.eh_proj(torch.cat((enorm_out, hnorm_out), dim=-1))
+        eh_input = kernels.fused_eh_norm(
+            token_hidden,
+            rotated_embedding,
+            self.enorm.weight,
+            self.hnorm.weight,
+            self.enorm.eps,
+        )
+        h = self.eh_proj(eh_input)
 
         positions = positions.to(torch.int64).contiguous()
         half_rope_cos, half_rope_sin, rope_cos, rope_sin = self.rotary(positions)

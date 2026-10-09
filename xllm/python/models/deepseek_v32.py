@@ -965,12 +965,8 @@ class DeepseekV3Indexer(nn.Module):
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
         k, weights = self.wk_weights_proj(hidden).split([self.head_dim, self.n_head], dim=-1)
         k = self.k_norm(k)
-        q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        q_pe = _apply_half_rope_with_angles(q_pe, half_rope_cos, half_rope_sin)
-        k_pe = _apply_half_rope_with_angles(k_pe.unsqueeze(1), half_rope_cos, half_rope_sin).squeeze(1)
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        k = torch.cat([k_pe, k_nope], dim=-1)
+        kernels.rope_siso(q, half_rope_cos, half_rope_sin, rope_dim=self.rope_dim)
+        kernels.rope_siso(k.unsqueeze(1), half_rope_cos, half_rope_sin, rope_dim=self.rope_dim)
 
         use_quant_indexer = ctx.index_cache.dtype == torch.int8 and ctx.index_cache_scale is not None
         if use_quant_indexer:

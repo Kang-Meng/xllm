@@ -332,6 +332,25 @@ def npu_inplace_partial_rotary_mul(
     return x
 
 
+def rope_siso(
+    qk: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_dim: int,
+    is_neox_style: bool = True,
+) -> torch.Tensor:
+    """Apply partial RoPE in place to the first ``rope_dim`` channels."""
+    from .triton.rope_siso import rope_forward_triton_siso
+
+    return rope_forward_triton_siso(
+        qk,
+        cos,
+        sin,
+        rope_dim=rope_dim,
+        is_neox_style=is_neox_style,
+    )
+
+
 __all__ = [
     "apply_qk_rotary",
     "build_split_qkv_rmsnorm_mrope_gather_pattern",
@@ -341,6 +360,7 @@ __all__ = [
     "interleaved_rotary_embedding",
     "mrope",
     "npu_inplace_partial_rotary_mul",
+    "rope_siso",
     "split_qkv_rmsnorm_mrope",
     "vision_rotary_mul",
 ]

@@ -589,6 +589,221 @@ torch.testing.assert_close(
 )PY");
 }
 
+TEST_F(NpuXllmOpsTest, Dsv32RopeSisoPythonWrapperRunsOnNpu) {
+  py::gil_scoped_acquire gil;
+
+  py::exec(R"PY(
+import torch
+from xllm.python.kernels_npu.rotary_embedding import rope_siso
+
+torch.manual_seed(2026)
+num_tokens = 8
+
+for num_heads, head_dim, rope_dim, is_neox_style in (
+    (64, 128, 64, True),
+    (1, 128, 64, True),
+    (2, 128, 64, False),
+    (3, 8, 6, True),
+    (3, 8, 6, False),
+    (1, 8, 6, False),
+):
+    half = rope_dim // 2
+    x_cpu = torch.randn(
+        (num_tokens, num_heads, head_dim), dtype=torch.float32
+    ).to(torch.bfloat16)
+    angles_cpu = torch.randn(
+        (num_tokens, rope_dim), dtype=torch.float32
+    ).to(torch.bfloat16)
+    half_cos_cpu = angles_cpu[:, :half]
+    half_sin_cpu = angles_cpu[:, half:]
+    expected = x_cpu.clone()
+    if is_neox_style:
+        first, second = slice(None, half), slice(half, rope_dim)
+    else:
+        first, second = slice(None, rope_dim, 2), slice(1, rope_dim, 2)
+    x1 = x_cpu[..., first]
+    x2 = x_cpu[..., second]
+    cos = half_cos_cpu.unsqueeze(1)
+    sin = half_sin_cpu.unsqueeze(1)
+    expected[..., first] = x1 * cos - x2 * sin
+    expected[..., second] = x2 * cos + x1 * sin
+
+    x = x_cpu.to("privateuseone:0")
+    angles = angles_cpu.to(x.device)
+    half_cos = angles[:, :half]
+    half_sin = angles[:, half:]
+    result = rope_siso(
+        x,
+        half_cos,
+        half_sin,
+        rope_dim=rope_dim,
+        is_neox_style=is_neox_style,
+    )
+    torch.npu.synchronize()
+
+    assert result.data_ptr() == x.data_ptr()
+    assert torch.equal(x[..., rope_dim:].cpu(), x_cpu[..., rope_dim:])
+    torch.testing.assert_close(
+        x.cpu(), expected, atol=2e-2, rtol=2e-2
+    )
+
+    if num_heads == 1 and not is_neox_style:
+        # Exact identities expose silent BF16 channel-load failures.
+        for cosine, sine in ((1, 0), (0, 1)):
+            x.copy_(x_cpu.to(x.device))
+            half_cos.fill_(cosine)
+            half_sin.fill_(sine)
+            rope_siso(x, half_cos, half_sin, rope_dim=rope_dim, is_neox_style=False)
+            torch.npu.synchronize()
+            exact = x_cpu.clone()
+            if sine:
+                exact[..., 0:rope_dim:2] = -x_cpu[..., 1:rope_dim:2]
+                exact[..., 1:rope_dim:2] = x_cpu[..., 0:rope_dim:2]
+            assert torch.equal(x.cpu(), exact)
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, Dsv32RopeSisoRejectsInvalidDimensionsAndAngles) {
+  py::gil_scoped_acquire gil;
+
+  py::exec(R"PY(
+import torch
+from xllm.python.kernels_npu.rotary_embedding import rope_siso
+
+device = torch.device("privateuseone:0")
+x = torch.zeros((2, 1, 128), dtype=torch.bfloat16, device=device)
+angles = torch.ones((2, 64), dtype=torch.bfloat16, device=device)
+cos, sin = angles[:, :32], angles[:, 32:]
+
+for invalid_rope_dim in (0, -1, -2):
+    try:
+        rope_siso(x, cos, sin, rope_dim=invalid_rope_dim)
+    except ValueError as exc:
+        assert "rope_dim must be positive" in str(exc)
+    else:
+        raise AssertionError("non-positive rope_dim must be rejected")
+
+try:
+    rope_siso(x, cos, sin)
+except TypeError as exc:
+    assert "rope_dim" in str(exc)
+else:
+    raise AssertionError("rope_dim must be explicit to avoid ambiguous full-width tables")
+
+malformed_angles = (
+    (angles[:1, :], angles[:1, :], "one row per token"),
+    (cos.reshape(1, 2, 32), sin.reshape(1, 2, 32), "one row per token"),
+    (angles, angles, "half-width RoPE tables"),
+    (cos.float(), sin.float(), "same dtype as qk"),
+    (cos.cpu(), sin.cpu(), "same device as qk"),
+)
+for invalid_cos, invalid_sin, message in malformed_angles:
+    try:
+        rope_siso(x, invalid_cos, invalid_sin, rope_dim=64)
+    except ValueError as exc:
+        assert message in str(exc)
+    else:
+        raise AssertionError(f"malformed RoPE tables must be rejected: {message}")
+
+strided_angles = angles[:, ::2]
+for invalid_cos, invalid_sin in ((strided_angles, sin), (cos, strided_angles)):
+    try:
+        rope_siso(x, invalid_cos, invalid_sin, rope_dim=64)
+    except ValueError as exc:
+        assert "contiguous RoPE channels" in str(exc)
+    else:
+        raise AssertionError("non-contiguous RoPE channels must be rejected")
+
+empty = torch.empty((0, 3, 8), dtype=torch.bfloat16, device=device)
+empty_angles = torch.empty((0, 3), dtype=torch.bfloat16, device=device)
+assert rope_siso(empty, empty_angles, empty_angles, rope_dim=6) is empty
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, Dsv32RopeSisoReplaysAclGraph) {
+  py::gil_scoped_acquire gil;
+
+  py::exec(R"PY(
+import torch
+from xllm.python.kernels_npu.rotary_embedding import rope_siso
+
+torch.manual_seed(2026)
+original = torch.randn((8, 3, 8), dtype=torch.float32).to(torch.bfloat16)
+angles = torch.randn((8, 6), dtype=torch.float32).to(torch.bfloat16)
+cos_cpu, sin_cpu = angles[:, :3], angles[:, 3:]
+qk = original.to("privateuseone:0")
+cos, sin = cos_cpu.to(qk.device), sin_cpu.to(qk.device)
+
+stream = torch.npu.Stream()
+with torch.npu.stream(stream):
+    rope_siso(qk, cos, sin, rope_dim=6)
+torch.npu.synchronize()
+
+graph = torch.npu.NPUGraph()
+with torch.npu.graph(graph, stream=stream):
+    captured = rope_siso(qk, cos, sin, rope_dim=6)
+torch.npu.synchronize()
+assert captured.data_ptr() == qk.data_ptr()
+
+for scale in (0.5, 1.5):
+    fresh = (original.float() * scale).to(torch.bfloat16)
+    first, second = fresh[..., :3], fresh[..., 3:6]
+    expected = fresh.clone()
+    expected[..., :3] = first * cos_cpu.unsqueeze(1) - second * sin_cpu.unsqueeze(1)
+    expected[..., 3:6] = second * cos_cpu.unsqueeze(1) + first * sin_cpu.unsqueeze(1)
+    with torch.npu.stream(stream):
+        qk.copy_(fresh.to(qk.device))
+        graph.replay()
+    torch.npu.synchronize()
+    assert torch.equal(qk[..., 6:].cpu(), fresh[..., 6:])
+    torch.testing.assert_close(qk.cpu(), expected, atol=2e-2, rtol=2e-2)
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, Dsv32RopeSisoNonNeoxSingleHeadReplaysAclGraph) {
+  py::gil_scoped_acquire gil;
+
+  py::exec(R"PY(
+import torch
+from xllm.python.kernels_npu.rotary_embedding import rope_siso
+
+torch.manual_seed(2026)
+original = torch.randn((8, 1, 8), dtype=torch.float32).to(torch.bfloat16)
+angles = torch.randn((8, 6), dtype=torch.float32).to(torch.bfloat16)
+qk = original.to("privateuseone:0")
+cos, sin = angles[:, :3].to(qk.device), angles[:, 3:].to(qk.device)
+
+stream = torch.npu.Stream()
+with torch.npu.stream(stream):
+    rope_siso(qk, cos, sin, rope_dim=6, is_neox_style=False)
+torch.npu.synchronize()
+
+graph = torch.npu.NPUGraph()
+with torch.npu.graph(graph, stream=stream):
+    captured = rope_siso(qk, cos, sin, rope_dim=6, is_neox_style=False)
+torch.npu.synchronize()
+assert captured.data_ptr() == qk.data_ptr()
+
+for scale in (0.5, 1.5):
+    fresh = (original.float() * scale).to(torch.bfloat16)
+    expected = fresh.clone()
+    expected[..., 0:6:2] = (
+        fresh[..., 0:6:2] * angles[:, :3].unsqueeze(1)
+        - fresh[..., 1:6:2] * angles[:, 3:].unsqueeze(1)
+    )
+    expected[..., 1:6:2] = (
+        fresh[..., 1:6:2] * angles[:, :3].unsqueeze(1)
+        + fresh[..., 0:6:2] * angles[:, 3:].unsqueeze(1)
+    )
+    with torch.npu.stream(stream):
+        qk.copy_(fresh.to(qk.device))
+        graph.replay()
+    torch.npu.synchronize()
+    assert torch.equal(qk[..., 6:].cpu(), fresh[..., 6:])
+    torch.testing.assert_close(qk.cpu(), expected, atol=2e-2, rtol=2e-2)
+)PY");
+}
+
 TEST_F(NpuXllmOpsTest, Dsv4CompressorPythonWrapperRunsOnNpu) {
   py::gil_scoped_acquire gil;
 

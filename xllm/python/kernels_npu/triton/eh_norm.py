@@ -108,6 +108,8 @@ def fused_eh_norm(
     num_rows = embed_2d.shape[0]
     rows_per_block = max(1, min(32, 4096 // block_feature))
     output = torch.empty(num_rows, 2 * feature_dim, dtype=embed.dtype, device=embed.device)
+    if num_rows == 0:
+        return output.reshape(*original_shape[:-1], 2 * feature_dim)
     grid = (triton.cdiv(num_rows, rows_per_block),)
     _fused_eh_norm_kernel[grid](
         embed_2d,
