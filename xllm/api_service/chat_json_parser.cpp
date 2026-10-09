@@ -140,6 +140,30 @@ std::pair<Status, std::string> LlmChatJsonParser::preprocess(
       return {status, ""};
     }
 
+    // Forward top-level effort into the template context without overriding an
+    // explicitly supplied string value in chat_template_kwargs. The template
+    // decides whether to use it (DeepSeek-V4 reads it here).
+    const auto effort_it = json.find("reasoning_effort");
+    if (effort_it != json.end() && effort_it->is_string()) {
+      const std::string effort = effort_it->get<std::string>();
+      const auto kwargs_it = json.find("chat_template_kwargs");
+      if (kwargs_it == json.end() || kwargs_it->is_null()) {
+        json["chat_template_kwargs"] = {{"reasoning_effort", effort}};
+        modified = true;
+      } else if (!kwargs_it->is_object()) {
+        return {Status(StatusCode::INVALID_ARGUMENT,
+                       "chat_template_kwargs must be an object or null."),
+                ""};
+      } else {
+        // An invalid nested value does not override a valid top-level effort.
+        const auto nested_effort = kwargs_it->find("reasoning_effort");
+        if (nested_effort == kwargs_it->end() || !nested_effort->is_string()) {
+          json["chat_template_kwargs"]["reasoning_effort"] = effort;
+          modified = true;
+        }
+      }
+    }
+
     if (!json.contains("messages") || !json["messages"].is_array()) {
       return modified ? std::make_pair(Status(), json.dump())
                       : std::make_pair(Status(), std::move(json_str));

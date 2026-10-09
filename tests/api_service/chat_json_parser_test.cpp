@@ -21,7 +21,9 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 
 #include "anthropic.pb.h"
+#include "api_service/utils.h"
 #include "chat.pb.h"
+#include "parser/reasoning_detector.h"
 
 namespace xllm {
 
@@ -270,6 +272,254 @@ TEST_F(PreprocessChatJsonTest, PreservesOtherFields) {
   expect_success(input, llm_parser, expected);
   // For multimodal, array is preserved
   expect_success(input, vlm_parser, input);
+}
+
+TEST_F(PreprocessChatJsonTest, TopLevelReasoningEffortReachesChatTemplate) {
+  std::string input = R"({
+    "model": "test-model",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "reasoning_effort": "medium"
+  })";
+
+  LlmChatJsonParser parser;
+  auto [status, processed_json] = parser.preprocess(input);
+  ASSERT_TRUE(status.ok()) << "Unexpected error: " << status.message();
+
+  proto::ChatRequest request;
+  google::protobuf::util::JsonParseOptions options;
+  options.ignore_unknown_fields = true;
+  auto parse_status = google::protobuf::util::JsonStringToMessage(
+      processed_json, &request, options);
+  ASSERT_TRUE(parse_status.ok()) << parse_status.ToString();
+  ASSERT_TRUE(request.has_chat_template_kwargs());
+  const auto& kwargs = request.chat_template_kwargs().fields();
+  auto it = kwargs.find("reasoning_effort");
+  ASSERT_NE(it, kwargs.end());
+  EXPECT_EQ(it->second.string_value(), "medium");
+}
+
+TEST_F(PreprocessChatJsonTest, NestedReasoningEffortTakesPrecedence) {
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "reasoning_effort": "medium",
+    "chat_template_kwargs": {"reasoning_effort": "high"}
+  })";
+  LlmChatJsonParser parser;
+  auto [status, processed_json] = parser.preprocess(input);
+  ASSERT_TRUE(status.ok()) << "Unexpected error: " << status.message();
+
+  proto::ChatRequest request;
+  google::protobuf::util::JsonParseOptions options;
+  options.ignore_unknown_fields = true;
+  auto parse_status = google::protobuf::util::JsonStringToMessage(
+      processed_json, &request, options);
+  ASSERT_TRUE(parse_status.ok()) << parse_status.ToString();
+  ASSERT_TRUE(request.has_chat_template_kwargs());
+  const auto& kwargs = request.chat_template_kwargs().fields();
+  auto it = kwargs.find("reasoning_effort");
+  ASSERT_NE(it, kwargs.end());
+  EXPECT_EQ(it->second.string_value(), "high");
+}
+
+TEST_F(PreprocessChatJsonTest, NestedNoneOverridesTopLevelHigh) {
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "reasoning_effort": "high",
+    "chat_template_kwargs": {"reasoning_effort": "none"}
+  })";
+  LlmChatJsonParser parser;
+  auto [status, processed_json] = parser.preprocess(input);
+  ASSERT_TRUE(status.ok()) << "Unexpected error: " << status.message();
+
+  proto::ChatRequest request;
+  google::protobuf::util::JsonParseOptions options;
+  options.ignore_unknown_fields = true;
+  auto parse_status = google::protobuf::util::JsonStringToMessage(
+      processed_json, &request, options);
+  ASSERT_TRUE(parse_status.ok()) << parse_status.ToString();
+  ASSERT_TRUE(request.has_chat_template_kwargs());
+  const auto& kwargs = request.chat_template_kwargs().fields();
+  auto it = kwargs.find("reasoning_effort");
+  ASSERT_NE(it, kwargs.end());
+  EXPECT_EQ(it->second.string_value(), "none");
+  EXPECT_FALSE(api_service::get_enable_thinking_from_request(
+      api_service::struct_to_json(request.chat_template_kwargs()),
+      "deepseek-v4"));
+}
+
+TEST_F(PreprocessChatJsonTest, NullChatTemplateKwargsUsesTopLevel) {
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "reasoning_effort": "medium",
+    "chat_template_kwargs": null
+  })";
+  std::string expected = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "reasoning_effort": "medium",
+    "chat_template_kwargs": {"reasoning_effort": "medium"}
+  })";
+  LlmChatJsonParser parser;
+  expect_success(input, parser, expected);
+}
+
+TEST_F(PreprocessChatJsonTest, RejectsNonObjectChatTemplateKwargsWithEffort) {
+  LlmChatJsonParser parser;
+  for (const std::string& kwargs : {"[]", "\"not an object\"", "42"}) {
+    const std::string input =
+        R"({"messages":[],"reasoning_effort":"none","chat_template_kwargs":)" +
+        kwargs + "}";
+    auto [status, result] = parser.preprocess(input);
+    EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT) << input;
+    EXPECT_NE(status.message().find("chat_template_kwargs must be an object"),
+              std::string::npos)
+        << input;
+    EXPECT_TRUE(result.empty());
+  }
+}
+
+TEST_F(PreprocessChatJsonTest, InvalidNestedEffortUsesTopLevel) {
+  LlmChatJsonParser parser;
+  for (const std::string& nested_effort : {"null", "42", "false", "[]", "{}"}) {
+    const std::string input =
+        R"({"messages":[],"reasoning_effort":"none","chat_template_kwargs":{"reasoning_effort":)" +
+        nested_effort + "}}";
+    nlohmann::json expected = nlohmann::json::parse(input);
+    expected["chat_template_kwargs"]["reasoning_effort"] = "none";
+    expect_success(input, parser, expected.dump());
+    EXPECT_FALSE(api_service::get_enable_thinking_from_request(
+        expected["chat_template_kwargs"], "deepseek-v4"));
+  }
+}
+
+TEST_F(PreprocessChatJsonTest, NonObjectKwargsWithoutEffortPassThrough) {
+  LlmChatJsonParser parser;
+  for (const std::string& kwargs : {"[]", "\"not an object\"", "42"}) {
+    const std::string input =
+        R"({"messages":[],"chat_template_kwargs":)" + kwargs + "}";
+    auto [status, processed_json] = parser.preprocess(input);
+    ASSERT_TRUE(status.ok()) << status.message();
+    EXPECT_EQ(processed_json, input);
+
+    // Preprocessing does not validate unrelated inputs; protobuf rejects an
+    // invalid Struct when decoding the request body.
+    proto::ChatRequest request;
+    google::protobuf::util::JsonParseOptions options;
+    options.ignore_unknown_fields = true;
+    EXPECT_FALSE(google::protobuf::util::JsonStringToMessage(
+                     processed_json, &request, options)
+                     .ok())
+        << input;
+  }
+}
+
+TEST_F(PreprocessChatJsonTest, ForwardsEmptyAndUnrecognizedTopLevelEffort) {
+  LlmChatJsonParser parser;
+  for (const std::string& effort : {"", "unexpected"}) {
+    nlohmann::json input = {{"messages", nlohmann::json::array()},
+                            {"reasoning_effort", effort}};
+    nlohmann::json expected = input;
+    expected["chat_template_kwargs"] = {{"reasoning_effort", effort}};
+    expect_success(input.dump(), parser, expected.dump());
+    EXPECT_TRUE(api_service::get_enable_thinking_from_request(
+        expected["chat_template_kwargs"], "deepseek-v4"));
+  }
+}
+
+TEST_F(PreprocessChatJsonTest, NonStringReasoningEffortPreservesOldBehavior) {
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "reasoning_effort": null
+  })";
+  LlmChatJsonParser parser;
+  expect_success(input, parser, input);
+}
+
+TEST_F(PreprocessChatJsonTest, DeepSeekV4ThinkingMatchesTemplatePrecedence) {
+  using nlohmann::json;
+  EXPECT_FALSE(api_service::get_enable_thinking_from_request(
+      {{"reasoning_effort", "none"},
+       {"thinking", true},
+       {"enable_thinking", true}},
+      "deepseek-v4"));
+  EXPECT_TRUE(api_service::get_enable_thinking_from_request(
+      {{"thinking_mode", "thinking"},
+       {"reasoning_effort", "none"},
+       {"thinking", false}},
+      "deepseek-v4"));
+  EXPECT_FALSE(api_service::get_enable_thinking_from_request(
+      {{"thinking_mode", "chat"}, {"reasoning_effort", "high"}},
+      "deepseek-v4"));
+  EXPECT_FALSE(api_service::get_enable_thinking_from_request(
+      {{"thinking", false}, {"enable_thinking", true}}, "deepseek-v4"));
+  EXPECT_TRUE(api_service::get_enable_thinking_from_request(json::object(),
+                                                            "deepseek-v4"));
+  EXPECT_FALSE(api_service::get_enable_thinking_from_request(
+      {{"thinking_mode", "unexpected"}, {"thinking", true}}, "deepseek-v4"));
+
+  EXPECT_TRUE(api_service::get_enable_thinking_from_request(
+      {{"reasoning_effort", "none"}}, "glm47"));
+  EXPECT_TRUE(api_service::get_enable_thinking_from_request(
+      {{"thinking", false}, {"enable_thinking", true}}, "glm47"));
+}
+
+TEST_F(PreprocessChatJsonTest, TopLevelNoneKeepsPlainAnswerInContent) {
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "reasoning_effort": "none"
+  })";
+  LlmChatJsonParser parser;
+  auto [status, processed_json] = parser.preprocess(input);
+  ASSERT_TRUE(status.ok()) << "Unexpected error: " << status.message();
+  proto::ChatRequest request;
+  google::protobuf::util::JsonParseOptions options;
+  options.ignore_unknown_fields = true;
+  auto parse_status = google::protobuf::util::JsonStringToMessage(
+      processed_json, &request, options);
+  ASSERT_TRUE(parse_status.ok()) << parse_status.ToString();
+  ASSERT_TRUE(request.has_chat_template_kwargs());
+  const nlohmann::json kwargs =
+      api_service::struct_to_json(request.chat_template_kwargs());
+  const bool force_reasoning =
+      api_service::get_enable_thinking_from_request(kwargs, "deepseek-v4");
+  ASSERT_FALSE(force_reasoning);
+
+  ReasoningDetector reasoning_detector("<think>",
+                                       "</think>",
+                                       force_reasoning,
+                                       /*stream_reasoning=*/false);
+  std::string plain_text = "plain answer";
+  const ReasoningResult result =
+      reasoning_detector.detect_and_parse(plain_text);
+  ASSERT_TRUE(result.normal_text.has_value());
+  EXPECT_EQ(result.normal_text.value(), plain_text);
+  EXPECT_FALSE(result.reasoning_text.has_value());
+
+  ReasoningDetector stream_detector("<think>",
+                                    "</think>",
+                                    force_reasoning,
+                                    /*stream_reasoning=*/true);
+  std::string first_chunk = "plain ";
+  std::string second_chunk = "answer";
+  const ReasoningResult first =
+      stream_detector.parse_streaming_increment(first_chunk);
+  const ReasoningResult second =
+      stream_detector.parse_streaming_increment(second_chunk);
+  EXPECT_EQ(first.normal_text.value_or(""), first_chunk);
+  EXPECT_EQ(second.normal_text.value_or(""), second_chunk);
+  EXPECT_FALSE(first.reasoning_text.has_value());
+  EXPECT_FALSE(second.reasoning_text.has_value());
+}
+
+TEST_F(PreprocessChatJsonTest, ForcedReasoningMisclassifiesTaglessAnswer) {
+  ReasoningDetector detector("<think>",
+                             "</think>",
+                             /*force_reasoning=*/true,
+                             /*stream_reasoning=*/false);
+  std::string plain_text = "plain answer";
+  const ReasoningResult result = detector.detect_and_parse(plain_text);
+  EXPECT_FALSE(result.normal_text.has_value());
+  ASSERT_TRUE(result.reasoning_text.has_value());
+  EXPECT_EQ(result.reasoning_text.value(), plain_text);
 }
 
 TEST_F(PreprocessChatJsonTest, OpenAIObjectToolChoiceRemapped) {

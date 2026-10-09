@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include "framework/chat_template/deepseek_v4_thinking_mode.h"
+
 namespace xllm {
 namespace {
 
@@ -410,6 +412,40 @@ TEST(DeepseekV4CppTemplate, ExplicitThinkingFalseOverridesReasoningEffort) {
   EXPECT_EQ(*prompt,
             "<｜begin▁of▁sentence｜><｜User｜>hard problem"
             "<｜Assistant｜></think>");
+}
+
+TEST(DeepseekV4CppTemplate, SharedThinkingModePreservesPrecedence) {
+  nlohmann::ordered_json ordered = nlohmann::ordered_json::object();
+  ordered["thinking_mode"] = "unexpected";
+  ordered["thinking"] = true;
+  EXPECT_EQ(deepseek_v4::resolve_thinking_mode(ordered), "unexpected");
+
+  ordered = nlohmann::ordered_json::object();
+  ordered["thinking_mode"] = "thinking";
+  ordered["reasoning_effort"] = "none";
+  ordered["thinking"] = false;
+  EXPECT_EQ(deepseek_v4::resolve_thinking_mode(ordered), "thinking");
+
+  ordered = nlohmann::ordered_json::object();
+  ordered["reasoning_effort"] = "none";
+  ordered["thinking"] = true;
+  EXPECT_EQ(deepseek_v4::resolve_thinking_mode(ordered), "chat");
+
+  ordered = nlohmann::ordered_json::object();
+  ordered["thinking"] = false;
+  ordered["enable_thinking"] = true;
+  EXPECT_EQ(deepseek_v4::resolve_thinking_mode(ordered), "chat");
+  EXPECT_EQ(
+      deepseek_v4::resolve_thinking_mode(nlohmann::ordered_json::object()),
+      "thinking");
+
+  const nlohmann::json regular = {{"thinking_mode", "unexpected"},
+                                  {"thinking", true}};
+  EXPECT_EQ(deepseek_v4::resolve_thinking_mode(regular), "unexpected");
+  const nlohmann::json nullable = {{"reasoning_effort", nullptr},
+                                   {"thinking", "invalid"},
+                                   {"enable_thinking", false}};
+  EXPECT_EQ(deepseek_v4::resolve_thinking_mode(nullable), "chat");
 }
 
 }  // namespace

@@ -28,6 +28,8 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "framework/chat_template/deepseek_v4_thinking_mode.h"
+
 namespace xllm {
 namespace {
 
@@ -161,13 +163,11 @@ constexpr const char* kReasoningEffortPromptMax =
 
 // Reasoning effort tiers understood by the prompt encoder. Request-level values
 // are collapsed onto these by resolve_reasoning_effort().
-constexpr const char* kReasoningEffortNone = "none";
+using deepseek_v4::kReasoningEffortNone;
+using deepseek_v4::kThinkingModeThinking;
 constexpr const char* kReasoningEffortLowTier = "low";
 constexpr const char* kReasoningEffortHighTier = "high";
 constexpr const char* kReasoningEffortMaxTier = "max";
-
-constexpr const char* kThinkingModeThinking = "thinking";
-constexpr const char* kThinkingModeChat = "chat";
 
 constexpr const char* kRoleSystem = "system";
 constexpr const char* kRoleDeveloper = "developer";
@@ -214,17 +214,6 @@ nlohmann::ordered_json parse_json_object_or_empty(const std::string& text) {
   }
 }
 
-bool get_thinking_enabled(const nlohmann::ordered_json& kwargs) {
-  if (kwargs.contains("thinking") && kwargs["thinking"].is_boolean()) {
-    return kwargs["thinking"].get<bool>();
-  }
-  if (kwargs.contains("enable_thinking") &&
-      kwargs["enable_thinking"].is_boolean()) {
-    return kwargs["enable_thinking"].get<bool>();
-  }
-  return false;
-}
-
 std::string get_reasoning_effort(const nlohmann::ordered_json& kwargs) {
   if (kwargs.contains("reasoning_effort") &&
       kwargs["reasoning_effort"].is_string()) {
@@ -238,7 +227,7 @@ std::string get_reasoning_effort(const nlohmann::ordered_json& kwargs) {
 // none/minimal/low/medium/high/xhigh/max; this mirrors the mapping in vLLM's
 // DeepSeek-V4 tokenizer wrapper and Rust renderer:
 //   "none"                        -> "" (and forces chat mode, see
-//                                        get_thinking_mode)
+//                                        deepseek_v4::resolve_thinking_mode)
 //   "minimal" / "low" / "medium"  -> "low"  (renders no prefix)
 //   "max"                         -> "max"
 //   "high" / "xhigh" / absent /
@@ -268,34 +257,6 @@ const char* reasoning_effort_prompt(const std::string& resolved_effort) {
     return kReasoningEffortPromptHigh;
   }
   return "";
-}
-
-bool has_explicit_thinking_flag(const nlohmann::ordered_json& kwargs) {
-  return (kwargs.contains("thinking") && kwargs["thinking"].is_boolean()) ||
-         (kwargs.contains("enable_thinking") &&
-          kwargs["enable_thinking"].is_boolean());
-}
-
-std::string get_thinking_mode(const nlohmann::ordered_json& kwargs) {
-  if (kwargs.contains("thinking_mode") && kwargs["thinking_mode"].is_string()) {
-    return kwargs["thinking_mode"].get<std::string>();
-  }
-  const std::string reasoning_effort = get_reasoning_effort(kwargs);
-  // reasoning_effort="none" disables thinking outright, even when a thinking
-  // flag asks for it. Matches vLLM's DeepSeek-V4 tokenizer wrapper.
-  if (reasoning_effort == kReasoningEffortNone) {
-    return kThinkingModeChat;
-  }
-  // Without an explicit thinking flag, thinking is on: either implied by a
-  // reasoning_effort, or by DeepSeek-V4's own default. Matches vLLM's
-  // DeepSeek-V4 tokenizer wrapper, which sets thinking_enabled = true when
-  // neither "thinking" nor "enable_thinking" is present, and xLLM's own
-  // get_enable_thinking_from_request() default in chat_service_impl.cpp.
-  if (!has_explicit_thinking_flag(kwargs)) {
-    return kThinkingModeThinking;
-  }
-  return get_thinking_enabled(kwargs) ? kThinkingModeThinking
-                                      : kThinkingModeChat;
 }
 
 std::vector<nlohmann::ordered_json> tool_calls_from_openai_format(
@@ -773,7 +734,8 @@ std::optional<std::string> DeepseekV4CppTemplate::apply(
   try {
     nlohmann::ordered_json normalized =
         normalize_messages(messages, json_tools);
-    std::string thinking_mode = get_thinking_mode(chat_template_kwargs);
+    std::string thinking_mode =
+        deepseek_v4::resolve_thinking_mode(chat_template_kwargs);
     std::string reasoning_effort =
         resolve_reasoning_effort(get_reasoning_effort(chat_template_kwargs));
 

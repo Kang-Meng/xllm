@@ -29,6 +29,7 @@ limitations under the License.
 #include "chat.pb.h"
 #include "common.pb.h"
 #include "core/common/types.h"
+#include "core/framework/chat_template/deepseek_v4_thinking_mode.h"
 #include "core/framework/request/usage.h"
 #include "function_call/function_call.h"
 
@@ -53,6 +54,32 @@ inline void set_proto_usage(proto::Usage* proto_usage,
       proto_usage->mutable_completion_tokens_details();
   completion_tokens_details->set_reasoning_tokens(0);
   completion_tokens_details->set_audio_tokens(0);
+}
+
+inline bool get_enable_thinking_from_request(
+    const nlohmann::json& chat_template_kwargs,
+    const std::string& reasoning_parser_format) {
+  if (reasoning_parser_format == "deepseek-v4") {
+    return deepseek_v4::resolve_thinking_mode(chat_template_kwargs) ==
+           deepseek_v4::kThinkingModeThinking;
+  }
+
+  const bool default_value = !reasoning_parser_format.empty();
+  if (chat_template_kwargs.empty()) {
+    return default_value;
+  }
+  if (chat_template_kwargs.contains("enable_thinking") ||
+      chat_template_kwargs.contains("thinking")) {
+    auto get_bool_val = [&](const char* key) {
+      auto it = chat_template_kwargs.find(key);
+      if (it != chat_template_kwargs.end() && it->is_boolean()) {
+        return it->get<bool>();
+      }
+      return false;
+    };
+    return get_bool_val("enable_thinking") || get_bool_val("thinking");
+  }
+  return default_value;
 }
 
 inline bool check_for_unstreamed_tool_args(
