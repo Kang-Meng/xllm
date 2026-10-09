@@ -27,7 +27,9 @@ limitations under the License.
 #include <sstream>
 
 #include "core/framework/config/kv_cache_config.h"
+#include "framework/block/block_utils.h"
 #include "framework/kv_cache/cache_layout_builder.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "util/utils.h"
 #if defined(USE_MLU)
@@ -583,6 +585,24 @@ int64_t scale_host_block_count(int64_t block_count, double host_blocks_factor) {
       << "scaled host block count exceeds the int64 limit.";
   return std::max<int64_t>(block_count,
                            static_cast<int64_t>(scaled_block_count));
+}
+
+int64_t dsv4_host_swa_block_count(int64_t c128_block_count,
+                                  double host_blocks_factor,
+                                  int64_t window_size,
+                                  int64_t block_size) {
+  const int64_t unit_size = Dsv4CacheGeometry{}.compressed_block_token_size();
+  CHECK_GT(block_size, 0);
+  CHECK_EQ(unit_size % block_size, 0);
+  const int64_t window_blocks = get_swa_blocks_per_seq(window_size, block_size);
+  const int64_t blocks_per_unit = unit_size / block_size;
+  const int64_t blocks_per_checkpoint =
+      std::min(window_blocks, blocks_per_unit);
+  const int64_t host_c128_blocks =
+      scale_host_block_count(c128_block_count, host_blocks_factor);
+  CHECK_LE(host_c128_blocks,
+           std::numeric_limits<int64_t>::max() / blocks_per_checkpoint);
+  return host_c128_blocks * blocks_per_checkpoint;
 }
 
 int64_t linear_state_block_count(int64_t kv_block_count,

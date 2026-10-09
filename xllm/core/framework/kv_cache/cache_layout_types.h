@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "platform/platform.h"
@@ -70,6 +71,12 @@ struct CacheTensorLayoutContext {
   int32_t tp_rank = 0;
   int32_t tp_size = 1;
   int64_t block_token_capacity = 0;
+  // Physical token-axis span per cache pool (group_id -> span). Typed-block
+  // pools cover a pool-specific span per resource instead of the uniform
+  // scheduler block size; entries override block_token_capacity for tensors
+  // of that pool. Only pools deviating from the uniform capacity record a
+  // span, so the map is empty for uniform-block models.
+  std::unordered_map<int32_t, int64_t> group_block_capacities;
   // Physical pool entries per INDEX block; zero uses block_token_capacity.
   int64_t index_block_capacity = 0;
   int64_t kv_head_count = 0;

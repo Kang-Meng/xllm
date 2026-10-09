@@ -26,6 +26,7 @@ import torch
 
 from xllm.python import kernels
 from xllm.python.attention import csa_attention as csa_attention_module
+from xllm.python.attention import dsa_metadata as dsa_metadata_module
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa_attention import (
     COMPRESSED_SPARSE_ATTENTION,
@@ -336,20 +337,14 @@ def test_prepare_clamps_target_block_tables_to_draft_groups(monkeypatch) -> None
     assert dsa.slot_mappings[0][0].tolist() == [1280]
 
 
-@pytest.mark.parametrize(
-    ("index_topk", "expected_c4_columns", "expected_c128_slot"),
-    [
-        (512, 1, 3),
-        (1024, 2, 7),
-        (2048, 4, 15),
-    ],
-)
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("compressed_unit_tokens", [128, 2048])
 def test_empty_dp_metadata_uses_safe_lengths_and_cache_tables(
     monkeypatch,
     index_topk: int,
-    expected_c4_columns: int,
-    expected_c128_slot: int,
+    compressed_unit_tokens: int,
 ) -> None:
+    monkeypatch.setattr(dsa_metadata_module, "DSV4_COMPRESSED_BLOCK_TOKEN_SIZE", compressed_unit_tokens)
     backend = _make_backend()
     backend.index_topk = index_topk
     backend.bind_kv_caches(
@@ -391,14 +386,22 @@ def test_empty_dp_metadata_uses_safe_lengths_and_cache_tables(
     assert dsa.seq_lens_q.tolist() == [1]
     assert dsa.max_seq_len == index_topk
     assert dsa.max_query_len == 1
+    c4_group = backend.group_infos[backend.caches_info[1][0].group_id]
+    c4_tokens = index_topk // c4_group.ratio
+    expected_c4_columns = (c4_tokens + c4_group.block_size - 1) // c4_group.block_size
     assert tuple(dsa.block_tables[1][0].shape) == (1, expected_c4_columns)
     assert dsa.slot_mappings[0][0].tolist() == [127]
-    assert dsa.slot_mappings[1][0].tolist() == [127]
-    assert dsa.slot_mappings[2][0].tolist() == [expected_c128_slot]
+    assert dsa.slot_mappings[1][0].tolist() == [(c4_tokens - 1) % c4_group.block_size]
+    c128_group = backend.group_infos[backend.caches_info[2][0].group_id]
+    assert dsa.slot_mappings[2][0].tolist() == [(index_topk // c128_group.ratio - 1) % c128_group.block_size]
 
 
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-def test_empty_dp_graph_metadata_preserves_bucket_rows(monkeypatch, index_topk: int) -> None:
+@pytest.mark.parametrize("compressed_unit_tokens", [128, 2048])
+def test_empty_dp_graph_metadata_preserves_bucket_rows(
+    monkeypatch, index_topk: int, compressed_unit_tokens: int
+) -> None:
+    monkeypatch.setattr(dsa_metadata_module, "DSV4_COMPRESSED_BLOCK_TOKEN_SIZE", compressed_unit_tokens)
     backend = _make_backend()
     backend.index_topk = index_topk
     monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
@@ -445,8 +448,11 @@ def test_empty_dp_graph_metadata_preserves_bucket_rows(monkeypatch, index_topk: 
     assert tuple(dsa.block_tables[1][0].shape) == (4, graph_block_table_cols)
     assert dsa.block_tables[1][0][:, 0].tolist() == [0, 0, 0, 0]
     assert dsa.slot_mappings[0][0][:4].tolist() == [127, 127, 127, 127]
-    assert dsa.slot_mappings[1][0][:4].tolist() == [127, 127, 127, 127]
-    expected_c128_slot = index_topk // 128 - 1
+    c4_group = backend.group_infos[backend.caches_info[1][0].group_id]
+    expected_c4_slot = (index_topk // c4_group.ratio - 1) % c4_group.block_size
+    assert dsa.slot_mappings[1][0][:4].tolist() == [expected_c4_slot] * 4
+    c128_group = backend.group_infos[backend.caches_info[2][0].group_id]
+    expected_c128_slot = (index_topk // c128_group.ratio - 1) % c128_group.block_size
     assert dsa.slot_mappings[2][0][:4].tolist() == [expected_c128_slot] * 4
 
 

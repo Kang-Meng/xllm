@@ -18,7 +18,9 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <string>
+#include <vector>
 
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_shard_layout.h"
 #include "layers/common/kv_shard_batch_metadata.h"
 
@@ -271,6 +273,200 @@ TEST(KVShardLayoutTest, MapsTokensAndSlots) {
   EXPECT_FALSE(
       layer::localize_kv_shard_slots(torch::Tensor(), KVShardLayout(128, 2, 0))
           .defined());
+}
+
+TEST(CacheLayoutBuilderTest, RecordsPerPoolSpansFromTensors) {
+  const Dsv4CacheGeometry geometry;
+  CacheTensorLayoutContext context;
+  context.tp_rank = 0;
+  context.tp_size = 1;
+  context.block_token_capacity = 128;
+  context.kv_head_count = 1;
+
+  std::vector<KVCache> caches;
+  DeepSeekV4KVCacheTensors swa_tensors;
+  swa_tensors.swa_cache = torch::zeros({2, 128, 1, 8}, torch::kBFloat16);
+  caches.emplace_back(swa_tensors);
+  DeepSeekV4KVCacheTensors c4_tensors;
+  c4_tensors.compressed_block_type = BlockType::C4;
+  c4_tensors.key_cache =
+      torch::zeros({4, geometry.c4_physical_dim(), 1, 8}, torch::kBFloat16);
+  // INDEX gets a narrower token axis on purpose: compressed KPool layouts
+  // shape it differently from the pool's K/V tensors, so recording it into
+  // the per-pool span map would abort with a span conflict.
+  c4_tensors.index_cache = torch::zeros({4, 128, 1, 8}, torch::kInt8);
+  c4_tensors.swa_cache = torch::zeros({2, 128, 1, 8}, torch::kBFloat16);
+  caches.emplace_back(c4_tensors);
+  DeepSeekV4KVCacheTensors c128_tensors;
+  c128_tensors.compressed_block_type = BlockType::C128;
+  c128_tensors.key_cache =
+      torch::zeros({8, geometry.c128_physical_dim(), 1, 8}, torch::kBFloat16);
+  c128_tensors.swa_cache = torch::zeros({2, 128, 1, 8}, torch::kBFloat16);
+  caches.emplace_back(c128_tensors);
+
+  record_group_block_capacities(caches, &context);
+
+  // Only the compressed K/V pools record a span: WINDOW, INDEX and the state
+  // tensors do not define their pool's token axis, so the SWA group keeps the
+  // global block_token_capacity fallback.
+  ASSERT_EQ(context.group_block_capacities.size(), 2U);
+  EXPECT_EQ(context.group_block_capacities.at(cache_group_id(BlockType::C4)),
+            geometry.c4_physical_dim());
+  EXPECT_EQ(context.group_block_capacities.at(cache_group_id(BlockType::C128)),
+            geometry.c128_physical_dim());
+  EXPECT_EQ(
+      context.group_block_capacities.count(cache_group_id(BlockType::SWA)), 0U);
+}
+
+TEST(CacheLayoutBuilderTest, DescribesTypedPoolAgainstRecordedSpan) {
+  const Dsv4CacheGeometry geometry;
+  CacheTensorLayoutContext context;
+  context.tp_rank = 0;
+  context.tp_size = 1;
+  context.block_token_capacity = 128;
+  context.kv_head_count = 1;
+
+  std::vector<KVCache> caches;
+  DeepSeekV4KVCacheTensors c4_tensors;
+  c4_tensors.compressed_block_type = BlockType::C4;
+  c4_tensors.key_cache =
+      torch::zeros({4, geometry.c4_physical_dim(), 1, 8}, torch::kBFloat16);
+  DeepSeekV4KVCacheTensors c128_tensors;
+  c128_tensors.compressed_block_type = BlockType::C128;
+  c128_tensors.key_cache =
+      torch::zeros({8, geometry.c128_physical_dim(), 1, 8}, torch::kBFloat16);
+  caches.emplace_back(c4_tensors);
+  caches.emplace_back(c128_tensors);
+  record_group_block_capacities(caches, &context);
+
+  // Each typed pool validates against its own recorded span instead of the
+  // uniform scheduler block size.
+  KVCacheTensor c4_key{
+      KVCacheTensorRole::KEY,
+      torch::zeros({4, geometry.c4_physical_dim(), 1, 8}, torch::kBFloat16),
+      cache_group_id(BlockType::C4)};
+  std::string error;
+  ASSERT_TRUE(describe_cache_tensor(context, &c4_key, &error)) << error;
+
+  KVCacheTensor c128_key{
+      KVCacheTensorRole::KEY,
+      torch::zeros({4, geometry.c128_physical_dim(), 1, 8}, torch::kBFloat16),
+      cache_group_id(BlockType::C128)};
+  error.clear();
+  ASSERT_TRUE(describe_cache_tensor(context, &c128_key, &error)) << error;
+
+  // Pools without a recorded span keep the global capacity.
+  KVCacheTensor uniform_key{KVCacheTensorRole::KEY,
+                            torch::zeros({4, 128, 1, 8}, torch::kBFloat16),
+                            cache_group_id(BlockType::KV)};
+  error.clear();
+  EXPECT_TRUE(describe_cache_tensor(context, &uniform_key, &error)) << error;
+
+  // A C4 tensor with the uniform capacity is rejected: the pool's recorded
+  // span is the authority.
+  KVCacheTensor mismatched_key{KVCacheTensorRole::KEY,
+                               torch::zeros({4, 128, 1, 8}, torch::kBFloat16),
+                               cache_group_id(BlockType::C4)};
+  error.clear();
+  EXPECT_FALSE(describe_cache_tensor(context, &mismatched_key, &error));
+  EXPECT_NE(error.find("token capacity differs"), std::string::npos);
+}
+
+TEST(CacheLayoutBuilderTest, FailsWhenPoolSpansConflict) {
+  CacheTensorLayoutContext context;
+  context.tp_rank = 0;
+  context.tp_size = 1;
+  context.block_token_capacity = 16;
+  context.kv_head_count = 1;
+
+  // Both spans deviate from the uniform capacity: pools running at the
+  // uniform capacity record nothing, so a conflict needs two distinct
+  // deviating spans inside one pool.
+  KVCacheTensors tensors;
+  tensors.key_cache = torch::zeros({4, 32, 1, 8}, torch::kBFloat16);
+  tensors.value_cache = torch::zeros({4, 64, 1, 8}, torch::kBFloat16);
+  std::vector<KVCache> caches;
+  caches.emplace_back(tensors);
+
+  EXPECT_DEATH(record_group_block_capacities(caches, &context),
+               "Cache tensors of one pool must share the token-axis span");
+}
+
+TEST(CacheLayoutBuilderTest, SkipsSpanRecordingForMlaLayouts) {
+  CacheTensorLayoutContext context;
+  context.tp_rank = 0;
+  context.tp_size = 1;
+  context.block_token_capacity = 16;
+  context.kv_head_count = 1;
+  context.enable_mla = true;
+
+  // MLA pools legitimately mix K/V token-axis spans: the NPU NZ layout
+  // shapes the KEY axis after kv_lora_rank and the VALUE axis after
+  // qk_rope_head_dim, and describe routes MLA tensors through the
+  // replicated-tensor contract, which never reads a pool span.
+  KVCacheTensors tensors;
+  tensors.key_cache = torch::zeros({4, 32, 16, 16}, torch::kBFloat16);
+  tensors.value_cache = torch::zeros({4, 4, 16, 16}, torch::kBFloat16);
+  std::vector<KVCache> caches;
+  caches.emplace_back(tensors);
+
+  record_group_block_capacities(caches, &context);
+  EXPECT_EQ(context.group_block_capacities.size(), 0U);
+}
+
+TEST(CacheLayoutBuilderTest, SkipsSpanRecordingForUniformPools) {
+  CacheTensorLayoutContext context;
+  context.tp_rank = 0;
+  context.tp_size = 1;
+  context.block_token_capacity = 16;
+  context.kv_head_count = 1;
+
+  // Uniform pools run at the declared block capacity: recording their span
+  // would make describe validate the tensor against its own size and mute
+  // the producer-capacity check. They stay on the global fallback.
+  KVCacheTensors tensors;
+  tensors.key_cache = torch::zeros({4, 16, 1, 8}, torch::kBFloat16);
+  tensors.value_cache = torch::zeros({4, 16, 1, 8}, torch::kBFloat16);
+  std::vector<KVCache> caches;
+  caches.emplace_back(tensors);
+
+  record_group_block_capacities(caches, &context);
+  EXPECT_EQ(context.group_block_capacities.size(), 0U);
+
+  // The producer-declared capacity stays the authority: a uniform-pool
+  // tensor whose token axis diverges from it is rejected at describe
+  // instead of silently redefining the pool's published span.
+  KVCacheTensor diverging_key{KVCacheTensorRole::KEY,
+                              torch::zeros({4, 32, 1, 8}, torch::kBFloat16),
+                              cache_group_id(BlockType::KV)};
+  std::string error;
+  EXPECT_FALSE(describe_cache_tensor(context, &diverging_key, &error));
+  EXPECT_NE(error.find("token capacity differs"), std::string::npos);
+}
+
+TEST(CacheLayoutBuilderTest, SkipsSpanRecordingForTensorsWithoutTokenAxis) {
+  CacheTensorLayoutContext context;
+  context.tp_rank = 0;
+  context.tp_size = 1;
+  context.block_token_capacity = 16;
+  context.kv_head_count = 1;
+
+  // A tensor without the token axis defines no pool span: recording it
+  // would read a nonexistent axis. It is skipped here and left to
+  // describe_cache_tensor, which rejects it with a precise error. The
+  // value cache runs at a deviating span so recording still happens for
+  // the well-formed tensor.
+  KVCacheTensors tensors;
+  tensors.key_cache = torch::zeros({4}, torch::kBFloat16);
+  tensors.value_cache = torch::zeros({4, 32, 1, 8}, torch::kBFloat16);
+  std::vector<KVCache> caches;
+  caches.emplace_back(tensors);
+
+  record_group_block_capacities(caches, &context);
+
+  ASSERT_EQ(context.group_block_capacities.size(), 1U);
+  EXPECT_EQ(context.group_block_capacities.at(cache_group_id(BlockType::KV)),
+            32);
 }
 
 }  // namespace

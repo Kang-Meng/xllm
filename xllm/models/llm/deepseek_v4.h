@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/state_dict/utils.h"
 #include "core/kernels/ops_api.h"
@@ -349,6 +350,12 @@ inline void deepseek_v4_build_cache_specs(
   const auto& compress_ratios = model_args.compress_ratios();
   const int32_t window_size = model_args.window_size();
   const int32_t base_block_size = 128;
+  const Dsv4CacheGeometry& geometry =
+      KVCacheConfig::get_instance().dsv4_cache_geometry();
+  const int32_t c4_physical_dim =
+      static_cast<int32_t>(geometry.c4_physical_dim());
+  const int32_t c128_physical_dim =
+      static_cast<int32_t>(geometry.c128_physical_dim());
   CHECK_EQ(KVCacheConfig::get_instance().block_size(), base_block_size)
       << "DeepSeek V4 currently only supports block_size=128.";
 
@@ -370,7 +377,10 @@ inline void deepseek_v4_build_cache_specs(
   for (const int32_t ratio : compress_ratios) {
     const int32_t cr = deepseek_v4_normalize_compress_ratio(ratio);
     if (cr == 4 || cr == 128) {
-      register_group(DSACacheType::TOKEN, cr, base_block_size);
+      register_group(
+          DSACacheType::TOKEN,
+          cr,
+          cr == kDsv4C4CompressRatio ? c4_physical_dim : c128_physical_dim);
     }
   }
 
@@ -391,16 +401,16 @@ inline void deepseek_v4_build_cache_specs(
     if (cr == 1) {
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
     } else if (cr == 4) {
-      layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
-      layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
+      layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
+      layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
+      layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
     } else if (cr == 128) {
-      layer_caches.push_back({DSACacheType::TOKEN, 128, base_block_size});
+      layer_caches.push_back({DSACacheType::TOKEN, 128, c128_physical_dim});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
       layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
@@ -523,9 +533,13 @@ class DeepseekV4ModelImpl
     // Build DSA caches_info from compress_ratios
     const auto& compress_ratios = model_args.compress_ratios();
     const int32_t window_size = model_args.window_size();
-    // TODO: Wire runtime block_size into model metadata so this stays aligned
-    // with the DSv4 KV cache and block manager when the default changes.
     const int32_t base_block_size = 128;  // default block size
+    const Dsv4CacheGeometry& geometry =
+        KVCacheConfig::get_instance().dsv4_cache_geometry();
+    const int32_t c4_physical_dim =
+        static_cast<int32_t>(geometry.c4_physical_dim());
+    const int32_t c128_physical_dim =
+        static_cast<int32_t>(geometry.c128_physical_dim());
     CHECK_EQ(KVCacheConfig::get_instance().block_size(), base_block_size)
         << "DeepSeek V4 currently only supports block_size=128.";
 
@@ -550,7 +564,10 @@ class DeepseekV4ModelImpl
     for (const auto ratio : compress_ratios) {
       const int32_t cr = deepseek_v4_normalize_compress_ratio(ratio);
       if (cr == 4 || cr == 128) {
-        register_group(DSACacheType::TOKEN, cr, base_block_size);
+        register_group(
+            DSACacheType::TOKEN,
+            cr,
+            cr == kDsv4C4CompressRatio ? c4_physical_dim : c128_physical_dim);
       }
     }
 
@@ -574,23 +591,23 @@ class DeepseekV4ModelImpl
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
       } else if (cr == 4) {
         // C4: 8 caches
-        // compress_kv(TOKEN,4,128), compress_index(TOKEN,4,128),
+        // compress_kv(TOKEN,4), compress_index(TOKEN,4),
         // swa(SW,1,window), kv_state(SW,1,window), score_state(SW,1,window),
         // idx_kv_state(SW,1,window), idx_score_state(SW,1,window),
-        // indexer_scale(TOKEN,4,128)
-        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
-        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
+        // indexer_scale(TOKEN,4)
+        layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
+        layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::TOKEN, 4, base_block_size});
+        layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
       } else if (cr == 128) {
         // C128: 4 caches
-        // compress_kv(TOKEN,128,128), swa(SW,1,window),
+        // compress_kv(TOKEN,128), swa(SW,1,window),
         // kv_state(SW,1,window), score_state(SW,1,window)
-        layer_caches.push_back({DSACacheType::TOKEN, 128, base_block_size});
+        layer_caches.push_back({DSACacheType::TOKEN, 128, c128_physical_dim});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
         layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "framework/kv_cache/cache_layout_builder.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <limits>
 #include <string>
@@ -448,6 +450,59 @@ int64_t physical_rows_per_resource(KVCacheTensorRole role,
   return 1;
 }
 
+void record_group_block_capacities(const std::vector<KVCache>& kv_caches,
+                                   CacheTensorLayoutContext* tensor_layout) {
+  CHECK(tensor_layout != nullptr);
+  // MLA contexts describe every tensor through the replicated-tensor
+  // contract, which never reads a pool span, and their K/V tensors (NPU NZ
+  // layout) legitimately carry different token-axis spans within one pool.
+  // Recording would only trip the pool-span consistency check.
+  if (tensor_layout->enable_mla) {
+    return;
+  }
+  const int64_t token_axis = tensor_layout->head_major_layout ? 2 : 1;
+  for (const KVCache& cache : kv_caches) {
+    for (const KVCacheTensor& cache_tensor : cache.get_cache_tensors()) {
+      // Only the K/V roles define their pool's token-axis span: compressed
+      // KPool gives INDEX and INDEX_SCALE a narrower span than the K/V
+      // tensors sharing their group, and their geometry is already covered
+      // by index_block_capacity and the group's K/V span.
+      if (!is_kv_head_role(cache_tensor.role)) {
+        continue;
+      }
+      const torch::Tensor& tensor = cache_tensor.tensor;
+      // Tensors without the token axis define no pool span; leave them to
+      // describe_cache_tensor, which rejects them with a precise error.
+      if (!tensor.defined() || tensor.dim() <= token_axis) {
+        continue;
+      }
+      const int64_t span = tensor.size(token_axis);
+      // Uniform pools run at the declared block capacity: recording their
+      // span would make describe validate the tensor against its own size,
+      // muting the producer-capacity check for every untyped model. Only
+      // pools deviating from the uniform capacity define an override.
+      if (span == tensor_layout->block_token_capacity) {
+        continue;
+      }
+      const auto [entry, inserted] =
+          tensor_layout->group_block_capacities.emplace(cache_tensor.group_id,
+                                                        span);
+      CHECK(inserted || entry->second == span)
+          << "Cache tensors of one pool must share the token-axis span, "
+          << "group_id=" << cache_tensor.group_id;
+    }
+  }
+}
+
+int64_t effective_block_token_capacity(const CacheTensorLayoutContext& context,
+                                       int32_t group_id) {
+  const auto it = context.group_block_capacities.find(group_id);
+  if (it != context.group_block_capacities.end()) {
+    return it->second;
+  }
+  return context.block_token_capacity;
+}
+
 bool describe_cache_tensor(const CacheTensorLayoutContext& context,
                            KVCacheTensor* cache_tensor,
                            std::string* error) {
@@ -468,15 +523,24 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
     return describe_replicated_index_pages(index_pages, cache_tensor, error);
   }
 
+  // Typed-block pools cover a pool-specific token span per resource; resolve
+  // it once so every describe path below validates against the tensor's own
+  // pool geometry instead of the uniform scheduler block size.
+  CacheTensorLayoutContext effective_context = context;
+  effective_context.block_token_capacity =
+      effective_block_token_capacity(context, cache_tensor->group_id);
+
 #if !defined(USE_NPU) && !defined(USE_MLU)
   // Preserve the existing MLA transfer contract on other backends.
-  if (context.enable_mla) {
+  if (effective_context.enable_mla) {
     return describe_replicated_tensor(cache_tensor, error);
   }
 #endif
   // NPU/MLU hybrid MLA + linear-attention models shard recurrent state by TP.
   // Resolve CONV/SSM before the MLA replica fallback so each destination rank
   // receives the corresponding source rank's state rather than rank 0's copy.
+  // The CONV/SSM descriptors consume only the linear-attention geometry and
+  // never read a pool token span, so they take the unmodified context.
   if (cache_tensor->role == KVCacheTensorRole::CONV &&
       context.linear_key_head_count > 0 &&
       context.linear_value_head_count > 0) {
@@ -491,14 +555,15 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
   // physical cache formats differ from ordinary K/V layouts. The deterministic
   // TP owner prevents duplicate writes while every destination replica is
   // populated.
-  if (context.enable_mla) {
+  if (effective_context.enable_mla) {
     return describe_replicated_tensor(cache_tensor, error);
   }
 #endif
-  if (is_kv_head_role(cache_tensor->role) && context.kv_head_count > 0) {
-    return describe_attention_heads(context,
-                                    context.kv_head_count,
-                                    context.replicated_block_pages,
+  if (is_kv_head_role(cache_tensor->role) &&
+      effective_context.kv_head_count > 0) {
+    return describe_attention_heads(effective_context,
+                                    effective_context.kv_head_count,
+                                    effective_context.replicated_block_pages,
                                     cache_tensor,
                                     error);
   }
@@ -508,9 +573,10 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
     // key is a single shared logical head. KVCacheShape and the DeepSeek V4
     // grouped cache both allocate INDEX/INDEX_SCALE with a physical head
     // dimension of one on every TP rank.
-    CacheTensorLayoutContext index_context = context;
-    if (context.index_block_capacity > 0) {
-      index_context.block_token_capacity = context.index_block_capacity;
+    CacheTensorLayoutContext index_context = effective_context;
+    if (effective_context.index_block_capacity > 0) {
+      index_context.block_token_capacity =
+          effective_context.index_block_capacity;
     }
     return describe_attention_heads(index_context,
                                     /*global_head_count=*/1,

@@ -32,6 +32,7 @@ limitations under the License.
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
 #include "util/net.h"
+#include "util/utils.h"
 #include "util/uuid.h"
 
 namespace xllm {
@@ -228,6 +229,14 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
   fingerprint << model_args.model_type() << ":" << model_args.n_layers() << ":"
               << tensor_layout.kv_head_count << ":" << model_args.head_dim()
               << ":" << tensor_layout.index_head_count;
+  if (util::is_deepseek_v4_model_type(model_args.model_type())) {
+    const Dsv4CacheGeometry& geometry =
+        KVCacheConfig::get_instance().dsv4_cache_geometry();
+    fingerprint << "|dsv4_compressed_geometry:"
+                << geometry.compressed_block_token_size() << ":"
+                << geometry.c4_physical_dim() << ":"
+                << geometry.c128_physical_dim();
+  }
   if (!is_spec_draft && uses_npu_compressed_kpool_tail(model_args)) {
     fingerprint << "|compressed_kpool_tail:" << model_args.index_head_dim()
                 << ":" << model_args.index_kpool() << ":"
@@ -336,6 +345,33 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
       tensor_layout.index_block_capacity =
           kv_cache_shape.index_cache_shape().at(token_axis);
     }
+    // Typed-block pools (e.g. DSV4 compressed caches) allocate each pool at
+    // its own physical token span; record the spans from the actual tensors
+    // so descriptors and manifests validate against pool geometry.
+    record_group_block_capacities(kv_caches, &tensor_layout);
+    // Typed-pool spans change the manifest capacities published on the wire.
+    // Fold them into the layout fingerprint so a peer built without
+    // per-pool spans fails pairing with an explicit fingerprint mismatch
+    // instead of a per-tensor resource-semantics error. Recorded spans
+    // always deviate from the uniform block capacity, so every entry joins;
+    // uniform registrations keep a byte-identical fingerprint and
+    // mixed-version peers of untyped models still pair.
+    std::vector<std::pair<int32_t, int64_t>> pool_spans;
+    pool_spans.reserve(tensor_layout.group_block_capacities.size());
+    for (const auto& entry : tensor_layout.group_block_capacities) {
+      pool_spans.emplace_back(entry.first, entry.second);
+    }
+    if (!pool_spans.empty()) {
+      std::sort(pool_spans.begin(), pool_spans.end());
+      std::string& fingerprint = pending_registration_context_->fingerprint;
+      fingerprint += "|pool_token_spans:";
+      for (const auto& [group_id, span] : pool_spans) {
+        fingerprint += std::to_string(group_id);
+        fingerprint += ":";
+        fingerprint += std::to_string(span);
+        fingerprint += ";";
+      }
+    }
   }
 
   BufLayout layout;
@@ -411,10 +447,11 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
             static_cast<uint64_t>(tensor.stride(0)) * tensor.element_size() *
             static_cast<uint64_t>(rows_per_resource);
         tensor_manifest.buffer_bytes = static_cast<uint64_t>(tensor.nbytes());
-        tensor_manifest
-            .block_token_capacity = static_cast<uint64_t>(std::max<int64_t>(
-            pending_registration_context_->tensor_layout.block_token_capacity,
-            0));
+        tensor_manifest.block_token_capacity = static_cast<uint64_t>(
+            std::max<int64_t>(effective_block_token_capacity(
+                                  pending_registration_context_->tensor_layout,
+                                  cache_tensor.group_id),
+                              0));
         tensor_manifest.explicit_resource_offsets = false;
         tensor_manifest.shard =
             std::move(described_tensor.shard_descriptor.value());

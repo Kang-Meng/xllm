@@ -29,6 +29,7 @@ limitations under the License.
 
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/deepseek_v4_rotary_embedding.h"
@@ -283,6 +284,8 @@ class DeepseekV4Base {
   void build_dsa_cache_info(const ModelArgs& model_args) {
     const std::vector<int32_t>& compress_ratios = model_args.compress_ratios();
     const int32_t base_block_size = KVCacheConfig::get_instance().block_size();
+    const Dsv4CacheGeometry& geometry =
+        KVCacheConfig::get_instance().dsv4_cache_geometry();
     CHECK_GT(base_block_size, 0) << "DeepSeek V4 block_size must be positive.";
 
     std::unordered_map<DSAGroupKey, int32_t, DSAGroupKeyHash> group_key_map;
@@ -306,7 +309,10 @@ class DeepseekV4Base {
     for (const int32_t raw_ratio : compress_ratios) {
       const int32_t ratio = normalize_compress_ratio(raw_ratio);
       if (ratio == 4 || ratio == 128) {
-        register_group(DSACacheType::TOKEN, ratio, base_block_size);
+        register_group(
+            DSACacheType::TOKEN,
+            ratio,
+            static_cast<int32_t>(geometry.compressed_physical_dim(ratio)));
       }
     }
 
@@ -523,22 +529,23 @@ class DeepseekV4Base {
     auto int_options =
         torch::TensorOptions().dtype(torch::kInt32).device(runtime_device);
     // Create persistent buffers for each unique group
-    int32_t c128_block_size = 0;
+    int32_t c128_physical_dim = 0;
     for (int32_t group_id = 0;
          group_id < static_cast<int32_t>(group_infos_.size());
          ++group_id) {
-      if (group_infos_[static_cast<size_t>(group_id)].type ==
-              DSACacheType::TOKEN &&
-          group_infos_[static_cast<size_t>(group_id)].ratio == 128) {
-        c128_block_size =
-            group_infos_[static_cast<size_t>(group_id)].block_size;
+      const auto& group_info = group_infos_[static_cast<size_t>(group_id)];
+      if (group_info.type == DSACacheType::TOKEN && group_info.ratio == 128) {
+        c128_physical_dim = group_info.block_size;
       }
 
       // Create block_table buffer with maximum shape
-      int32_t block_size =
-          group_infos_[static_cast<size_t>(group_id)].block_size;
-      int64_t max_blocks_per_seq =
-          (max_position_embeddings_ + block_size + 1) / block_size + 1;
+      const int64_t block_token_size =
+          static_cast<int64_t>(group_info.block_size) *
+          (group_info.type == DSACacheType::TOKEN ? group_info.ratio : 1);
+      CHECK_GT(block_token_size, 0);
+      const int64_t max_blocks_per_seq =
+          (max_position_embeddings_ + block_token_size + 1) / block_token_size +
+          1;
       persistent.block_tables_by_group[group_id] =
           torch::full({num_tokens, max_blocks_per_seq}, -1, int_options);
 
@@ -547,13 +554,13 @@ class DeepseekV4Base {
           torch::full({num_tokens}, -1, int_options);
     }
 
-    CHECK_GT(c128_block_size, 0)
-        << "Invalid c128 block size: " << c128_block_size;
+    CHECK_GT(c128_physical_dim, 0)
+        << "Invalid c128 physical dim: " << c128_physical_dim;
     persistent.c128_context_lens = torch::zeros({num_tokens}, int_options);
     // block_table_for_attn: [num_tokens, max_blocks_per_seq]
     int64_t compress_len = max_position_embeddings_ / 128;
     const int64_t table_cols = std::max<int64_t>(
-        (compress_len + c128_block_size - 1) / c128_block_size, 1);
+        (compress_len + c128_physical_dim - 1) / c128_physical_dim, 1);
     persistent.c128_block_table_for_attn =
         torch::full({num_tokens, table_cols}, -1, int_options);
 
@@ -642,21 +649,25 @@ class DeepseekV4Base {
   std::vector<CacheEntry> cache_entries_for_ratio(
       int32_t ratio,
       int32_t base_block_size) const {
+    const Dsv4CacheGeometry& geometry =
+        KVCacheConfig::get_instance().dsv4_cache_geometry();
+    const int32_t compressed_physical_dim =
+        static_cast<int32_t>(geometry.compressed_physical_dim(ratio));
     if (ratio == 1) {
       return {{DSACacheType::SLIDING_WINDOW, 1, base_block_size}};
     }
     if (ratio == 4) {
-      return {{DSACacheType::TOKEN, 4, base_block_size},
-              {DSACacheType::TOKEN, 4, base_block_size},
+      return {{DSACacheType::TOKEN, 4, compressed_physical_dim},
+              {DSACacheType::TOKEN, 4, compressed_physical_dim},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
-              {DSACacheType::TOKEN, 4, base_block_size}};
+              {DSACacheType::TOKEN, 4, compressed_physical_dim}};
     }
     if (ratio == 128) {
-      return {{DSACacheType::TOKEN, 128, base_block_size},
+      return {{DSACacheType::TOKEN, 128, compressed_physical_dim},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size},
               {DSACacheType::SLIDING_WINDOW, 1, base_block_size}};

@@ -232,7 +232,8 @@ StoragePrefetchRequest build_flat_kv_linear_prefetch_request(
 }
 
 StoragePrefetchRequest build_swa_compressed_prefetch_request(
-    const Sequence* sequence) {
+    const Sequence* sequence,
+    size_t swa_blocks_per_window) {
   CHECK(sequence != nullptr);
   const KVCacheState& host_state = sequence->host_kv_state();
   const Slice<Block> swa_blocks = host_state.blocks(BlockType::SWA);
@@ -267,15 +268,19 @@ StoragePrefetchRequest build_swa_compressed_prefetch_request(
     PrefetchUnit prefetch_unit;
     prefetch_unit.has_non_gated = true;
     if (swa_block_size != 0) {
-      const size_t swa_begin = unit * unit_size / swa_block_size;
       const size_t swa_end = (unit + 1) * unit_size / swa_block_size;
+      const size_t swa_begin =
+          swa_end > swa_blocks_per_window ? swa_end - swa_blocks_per_window : 0;
+      bool complete_window = swa_end >= swa_blocks_per_window;
       for (size_t block_index = swa_begin; block_index < swa_end;
            ++block_index) {
-        if (block_index < swa_blocks.size() &&
-            swa_blocks[block_index].is_valid()) {
-          append_prefetch_transfer(
-              &prefetch_unit, BlockType::SWA, block_index, host_state);
-        }
+        complete_window =
+            append_prefetch_transfer(
+                &prefetch_unit, BlockType::SWA, block_index, host_state) &&
+            complete_window;
+      }
+      if (!complete_window) {
+        prefetch_unit.non_gated_blocks.clear();
       }
     }
 
@@ -300,14 +305,17 @@ StoragePrefetchRequest build_swa_compressed_prefetch_request(
 
 StoragePrefetchRequest build_prefetch_request(
     const Sequence* sequence,
-    CompositeBlockManager::LeafCombination combination) {
+    CompositeBlockManager::LeafCombination combination,
+    const CompositeBlockManager::LeafMap& leaves) {
   switch (combination) {
     case CompositeBlockManager::LeafCombination::FLAT_KV:
       return build_flat_kv_prefetch_request(sequence);
     case CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR:
       return build_flat_kv_linear_prefetch_request(sequence);
     case CompositeBlockManager::LeafCombination::SWA_COMPRESSED:
-      return build_swa_compressed_prefetch_request(sequence);
+      return build_swa_compressed_prefetch_request(
+          sequence,
+          leaves.at(BlockType::SWA).leaf->options().swa_blocks_per_seq());
     case CompositeBlockManager::LeafCombination::UNSUPPORTED:
       return {};
   }
@@ -504,6 +512,24 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
   KVCacheState& hbm_state = sequence->kv_state();
   KVCacheState& host_state = sequence->host_kv_state();
   bool queued_offload = false;
+  size_t completed_tokens = hbm_state.kv_cache_tokens_num();
+  size_t cache_unit_size = 0;
+  const auto c128_entry = host_manager->leaf_entries().find(BlockType::C128);
+  if (c128_entry != host_manager->leaf_entries().end()) {
+    cache_unit_size = c128_entry->second.leaf->block_size();
+    CHECK_GT(cache_unit_size, 0u);
+    for (const auto& [type, entry] : host_manager->leaf_entries()) {
+      const size_t block_size = entry.leaf->block_size();
+      const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
+      completed_tokens =
+          std::min(completed_tokens,
+                   num_hash_blocks(hasher_type,
+                                   sequence->hash_tokens(hasher_type).size(),
+                                   block_size) *
+                       block_size);
+    }
+    completed_tokens = completed_tokens / cache_unit_size * cache_unit_size;
+  }
   for (const auto& [type, entry] : host_manager->leaf_entries()) {
     std::vector<Block>* hbm_blocks = hbm_state.mutable_blocks(type);
     std::vector<Block>* host_blocks = host_state.mutable_blocks(type);
@@ -613,7 +639,6 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
       continue;
     }
 
-    const size_t completed_tokens = hbm_state.kv_cache_tokens_num();
     size_t completed_blocks = completed_tokens / block_size;
     const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
     if (block_hash_lookahead(hasher_type) > 0) {
@@ -634,6 +659,15 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
     const size_t comparable_blocks =
         std::min({hbm_blocks->size(), host_blocks->size(), completed_blocks});
     for (size_t i = 0; i < comparable_blocks; ++i) {
+      if (type == BlockType::SWA && cache_unit_size > 0) {
+        CHECK_EQ(cache_unit_size % block_size, 0u);
+        const size_t blocks_per_unit = cache_unit_size / block_size;
+        const size_t blocks_per_window = std::min<size_t>(
+            blocks_per_unit, entry.leaf->options().swa_blocks_per_seq());
+        if (i % blocks_per_unit < blocks_per_unit - blocks_per_window) {
+          continue;
+        }
+      }
       Block& hbm_block = (*hbm_blocks)[i];
       Block& host_block = (*host_blocks)[i];
       // Prefix-capable HBM leaves are held by both the sequence and the device
@@ -739,6 +773,15 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
   auto* host_manager = host_block_managers_[dp_rank].get();
   CHECK(host_manager);
 
+  // TODO: LINEAR offload must retain the confirmed historical slot before the
+  // HBM leaf trims it, select the exact speculative checkpoint, pin it through
+  // D2H, then publish it to Host/Store. FLAT_KV_LINEAR remains unsupported by
+  // the hierarchy manager until that ownership and transfer protocol exists.
+  if (composite->leaf_combination() ==
+      CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
+    composite->cache_full_blocks_for_sequence(sequence);
+    collect_offload_pairs(sequence);
+  }
   if (!composite->allocate_sequence(sequence, num_tokens)) {
     release_host_match(sequence, dp_rank);
     if (!had_device_blocks) {
@@ -1031,7 +1074,7 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
   }
 
   StoragePrefetchRequest storage_request =
-      build_prefetch_request(sequence, combination);
+      build_prefetch_request(sequence, combination, host_leaves);
   auto storage_request_ptr = std::make_shared<const StoragePrefetchRequest>(
       std::move(storage_request));
 

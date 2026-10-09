@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/parallel_config.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/model/model_args.h"
 
@@ -559,15 +560,30 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV4Pools) {
   KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
 
   EXPECT_EQ(capacity.swa_count(), 35);
+  const Dsv4CacheGeometry geometry;
+  const int64_t manager_blocks_per_unit =
+      geometry.compressed_block_token_size() / options.block_size;
+  constexpr int64_t kSwaBytesPerBlock =
+      128 * 16 * 4 + 128 * (16 * 4 + 2 * 16 * 4 * 2 + 2 * 8 * 4 * 2) +
+      128 * (16 * 4 + 16 * 4 * 2);
 #if defined(USE_MLU)
-  EXPECT_EQ(capacity.c4_count(), 64);
-  EXPECT_EQ(capacity.c128_count(), 2);
-  EXPECT_EQ(capacity.n_blocks(), 256);
+  constexpr int64_t kIndexBytes = 4;
+  constexpr int64_t kScaleBytes = 0;
+  constexpr int64_t kExpectedUnits = 352;
 #else
-  EXPECT_EQ(capacity.c4_count(), 96);
-  EXPECT_EQ(capacity.c128_count(), 3);
-  EXPECT_EQ(capacity.n_blocks(), 384);
+  constexpr int64_t kIndexBytes = 1;
+  constexpr int64_t kScaleBytes = 2;
+  constexpr int64_t kExpectedUnits = 28;
 #endif
+  const int64_t token_unit_bytes =
+      geometry.c4_physical_dim() * (16 * 4 + 8 * kIndexBytes + kScaleBytes) +
+      geometry.c128_physical_dim() * 16 * 4;
+  const int64_t expected_units =
+      (options.cache_size_in_bytes - 35 * kSwaBytesPerBlock) / token_unit_bytes;
+  EXPECT_EQ(expected_units, kExpectedUnits);
+  EXPECT_EQ(capacity.c4_count(), expected_units);
+  EXPECT_EQ(capacity.c128_count(), expected_units);
+  EXPECT_EQ(capacity.n_blocks(), expected_units * manager_blocks_per_unit);
 }
 
 TEST(KVCacheEstimationTest, DeepSeekV4RejectsBudgetWithoutCompressedCacheUnit) {
@@ -773,7 +789,9 @@ TEST(KVCacheEstimationTest, DeepSeekV4FlashPrefillSwaRingMatchesShippedShape) {
   // window 128 / block 128 -> one window block per sequence, 16 sequences;
   // 128 burst blocks for max_tokens_per_batch = 16384; 16 tail + 2 guard.
   EXPECT_EQ(capacity.swa_count(), 162);
-  EXPECT_EQ(capacity.c4_count(), 32 * capacity.c128_count());
+  // C4 and C128 now use the same 2048-token logical publish unit, so the
+  // scheduler owns the same number of typed blocks for both cache tensors.
+  EXPECT_EQ(capacity.c4_count(), capacity.c128_count());
 
   // The regression produced 66 = 16 + ceil((16384 / 4) / 128) + 16 + 2.
   EXPECT_NE(capacity.swa_count(), 66);
@@ -860,7 +878,7 @@ TEST(KVCacheEstimationTest, DeepSeekV4PrefixCacheKeepsOperationalSwaPool) {
       estimate_kv_cache_capacity(model_args, options);
 
   ASSERT_GT(capacity.c128_count(), 0);
-  EXPECT_EQ(capacity.c4_count(), 32 * capacity.c128_count());
+  EXPECT_EQ(capacity.c4_count(), capacity.c128_count());
   EXPECT_EQ(capacity.swa_count(), 22);
 }
 
@@ -898,7 +916,7 @@ TEST(KVCacheEstimationTest,
   EXPECT_EQ(capacity.swa_count(), 102);
   EXPECT_GT(capacity.c4_count(), 0);
   EXPECT_GT(capacity.c128_count(), 0);
-  EXPECT_EQ(capacity.c4_count(), 32 * capacity.c128_count());
+  EXPECT_EQ(capacity.c4_count(), capacity.c128_count());
 }
 
 TEST(KVCacheEstimationTest, DeepSeekV4DecodeKeepsOperationalSwaPool) {
@@ -1008,10 +1026,14 @@ TEST(KVCacheEstimationTest,
       get_dsv4_cache_policy(target_options.dtype);
   const int64_t scale_bytes =
       cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
+  const Dsv4CacheGeometry geometry;
+  const int64_t c4_physical_dim = geometry.c4_physical_dim();
+  const int64_t c128_physical_dim = geometry.c128_physical_dim();
   const int64_t c4_block_bytes =
-      128 * (16 * 4 + 8 * cache_policy.index_dtype_size + scale_bytes);
-  const int64_t c128_block_bytes = 128 * 16 * 4;
-  const int64_t compressed_unit_bytes = 32 * c4_block_bytes + c128_block_bytes;
+      c4_physical_dim *
+      (16 * 4 + 8 * cache_policy.index_dtype_size + scale_bytes);
+  const int64_t c128_block_bytes = c128_physical_dim * 16 * 4;
+  const int64_t compressed_unit_bytes = c4_block_bytes + c128_block_bytes;
   constexpr int64_t kTargetSwaBytes = 35 * 90112;
   constexpr int64_t kDraftSwaBytes =
       /*layers=*/3 * /*swa_count=*/35 * /*block_size=*/128 *
@@ -1038,11 +1060,11 @@ TEST(KVCacheEstimationTest,
   EXPECT_LE(capacity.cache_size_in_bytes() + kDraftSwaBytes,
             target_options.cache_size_in_bytes);
   EXPECT_EQ(capacity.swa_count(), 35);
-  EXPECT_EQ(capacity.c4_count(), 64);
+  EXPECT_EQ(capacity.c4_count(), 2);
   EXPECT_EQ(capacity.c128_count(), 2);
   EXPECT_EQ(capacity.swa_count(), target_only_capacity.swa_count());
-  EXPECT_EQ(capacity.c4_count() + 64, target_only_capacity.c4_count());
-  EXPECT_EQ(capacity.c128_count() + 2, target_only_capacity.c128_count());
+  EXPECT_GT(target_only_capacity.c4_count(), capacity.c4_count());
+  EXPECT_EQ(target_only_capacity.c4_count(), target_only_capacity.c128_count());
   EXPECT_LT(capacity.n_blocks(), target_only_capacity.n_blocks());
 }
 
