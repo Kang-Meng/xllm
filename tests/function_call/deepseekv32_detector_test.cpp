@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -1030,6 +1031,115 @@ TEST_F(DeepSeekV4DetectorTest, StreamingHandlesToolCallsTokenSplit) {
   EXPECT_EQ(tool_calls_found, 1);
   nlohmann::json params = nlohmann::json::parse(accumulated_args);
   EXPECT_EQ(params["city"], "Beijing");
+}
+
+TEST_F(DeepSeekV4DetectorTest, StreamingArgumentsStayValidWhenKeysReorder) {
+  std::vector<std::string> chunks = {
+      "<｜DSML｜tool_calls><｜DSML｜invoke name=\"get_weather\">"
+      "<｜DSML｜parameter name=\"date\" string=\"true\">2026-10-",
+      "08",
+      "</｜DSML｜parameter><｜DSML｜parameter name=\"city\" "
+      "string=\"true\">Bei",
+      "jing</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"};
+
+  std::string accumulated_args;
+  int32_t tool_calls_found = 0;
+  for (const std::string& chunk : chunks) {
+    StreamingParseResult result =
+        v4_detector_->parse_streaming_increment(chunk, tools_);
+    for (const ToolCallItem& call : result.calls) {
+      if (call.name.has_value()) {
+        ++tool_calls_found;
+        EXPECT_EQ(call.name.value(), "get_weather");
+      } else {
+        accumulated_args += call.parameters;
+      }
+    }
+  }
+
+  EXPECT_EQ(tool_calls_found, 1);
+  nlohmann::json params =
+      nlohmann::json::parse(accumulated_args, nullptr, false);
+  ASSERT_FALSE(params.is_discarded()) << accumulated_args;
+  EXPECT_EQ(params["city"], "Beijing");
+  EXPECT_EQ(params["date"], "2026-10-08");
+  ASSERT_EQ(v4_detector_->prev_tool_call_arr_.size(), 1);
+  ASSERT_EQ(v4_detector_->streamed_args_for_tool_.size(), 1);
+  EXPECT_EQ(v4_detector_->prev_tool_call_arr_[0].at("arguments"),
+            accumulated_args);
+  EXPECT_EQ(v4_detector_->streamed_args_for_tool_[0], accumulated_args);
+}
+
+TEST_F(DeepSeek32DetectorTest, StreamingArgumentsStayValidWhenKeysReorder) {
+  std::vector<std::string> chunks = {
+      "<｜DSML｜function_calls><｜DSML｜invoke name=\"get_weather\">"
+      "<｜DSML｜parameter name=\"date\" string=\"true\">2026-10-",
+      "08",
+      "</｜DSML｜parameter><｜DSML｜parameter name=\"city\" "
+      "string=\"true\">Bei",
+      "jing</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>"};
+
+  std::string accumulated_args;
+  for (const std::string& chunk : chunks) {
+    StreamingParseResult result =
+        detector_->parse_streaming_increment(chunk, tools_);
+    for (const ToolCallItem& call : result.calls) {
+      if (!call.name.has_value()) {
+        accumulated_args += call.parameters;
+      }
+    }
+  }
+
+  nlohmann::json params =
+      nlohmann::json::parse(accumulated_args, nullptr, false);
+  ASSERT_FALSE(params.is_discarded()) << accumulated_args;
+  EXPECT_EQ(params["city"], "Beijing");
+  EXPECT_EQ(params["date"], "2026-10-08");
+}
+
+TEST_F(DeepSeekV4DetectorTest, StreamingLengthRetainsArgumentsForFallback) {
+  std::string unfinished_invoke =
+      "<｜DSML｜tool_calls><｜DSML｜invoke name=\"get_weather\">"
+      "<｜DSML｜parameter name=\"city\" string=\"true\">"
+      "Beijing</｜DSML｜parameter>";
+  StreamingParseResult partial =
+      v4_detector_->parse_streaming_increment(unfinished_invoke, tools_);
+  ASSERT_EQ(partial.calls.size(), 1);
+  ASSERT_TRUE(partial.calls[0].name.has_value());
+  EXPECT_EQ(partial.calls[0].name.value(), "get_weather");
+  ASSERT_EQ(v4_detector_->prev_tool_call_arr_.size(), 1);
+  ASSERT_EQ(v4_detector_->streamed_args_for_tool_.size(), 1);
+  EXPECT_EQ(v4_detector_->prev_tool_call_arr_[0].at("arguments"),
+            R"({"city":"Beijing"})");
+  EXPECT_TRUE(v4_detector_->streamed_args_for_tool_[0].empty());
+
+  // The service finalizes a length-limited stream with an empty increment,
+  // then uses the cached arguments to send the remaining tool parameters.
+  StreamingParseResult flushed =
+      v4_detector_->parse_streaming_increment("", tools_);
+  EXPECT_TRUE(flushed.calls.empty());
+  EXPECT_EQ(v4_detector_->prev_tool_call_arr_[0].at("arguments"),
+            R"({"city":"Beijing"})");
+}
+
+TEST_F(DeepSeek32DetectorTest, StreamingLengthRetainsArgumentsForFallback) {
+  std::string unfinished_invoke =
+      "<｜DSML｜function_calls><｜DSML｜invoke name=\"get_weather\">"
+      "<｜DSML｜parameter name=\"city\" string=\"true\">"
+      "Beijing</｜DSML｜parameter>";
+  StreamingParseResult partial =
+      detector_->parse_streaming_increment(unfinished_invoke, tools_);
+  ASSERT_EQ(partial.calls.size(), 1);
+  ASSERT_TRUE(partial.calls[0].name.has_value());
+  ASSERT_EQ(detector_->prev_tool_call_arr_.size(), 1);
+  ASSERT_EQ(detector_->streamed_args_for_tool_.size(), 1);
+  EXPECT_EQ(detector_->prev_tool_call_arr_[0].at("arguments"),
+            R"({"city":"Beijing"})");
+  EXPECT_TRUE(detector_->streamed_args_for_tool_[0].empty());
+
+  detector_->parse_streaming_increment("", tools_);
+  EXPECT_EQ(detector_->prev_tool_call_arr_[0].at("arguments"),
+            R"({"city":"Beijing"})");
 }
 
 }  // namespace function_call
