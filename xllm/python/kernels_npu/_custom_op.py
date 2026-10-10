@@ -1183,6 +1183,27 @@ def _dequant_swiglu_quant_fake(
     return act_quantized, act_scale
 
 
+def _dequant_situ_quant_fake(
+    x: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    activation_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    quant_scale: torch.Tensor | None,
+    quant_offset: torch.Tensor | None,
+    group_index: torch.Tensor | None,
+    beta: float,
+    linear_beta: float,
+    activate_left: bool,
+    quant_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight_scale, activation_scale, bias, quant_scale, quant_offset
+    del group_index, beta, linear_beta, activate_left, quant_mode
+    out_dim = x.size(-1) // 2
+    act_quantized = x.new_empty((*x.shape[:-1], out_dim), dtype=torch.int8)
+    act_scale = x.new_empty(x.shape[:-1], dtype=torch.float32)
+    return act_quantized, act_scale
+
+
 def _sparse_flash_attention_lse_fake(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1304,6 +1325,7 @@ register_fake(
 register_fake("xllm_ops::compressor", _compressor_fake)
 register_fake("xllm_ops::moe_gating_top_k_hash", _moe_gating_top_k_hash_fake)
 register_fake("xllm_ops::dequant_swiglu_quant", _dequant_swiglu_quant_fake)
+register_fake("xllm_ops::dequant_situ_quant", _dequant_situ_quant_fake)
 register_fake("xllm_ops::hc_pre", _hc_pre_fake)
 register_fake("xllm_ops::hc_pre_fused", _hc_pre_fake)
 register_fake("xllm_ops::hc_post", _hc_post_fake)

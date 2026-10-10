@@ -1005,6 +1005,11 @@ TORCH_LIBRARY(xllm_ops, m) {
       "quant_offset, Tensor? group_index, bool activate_left, int quant_mode, "
       "int swiglu_mode, float clamp_limit, float glu_alpha, float glu_bias) "
       "-> (Tensor, Tensor)");
+  m.def(
+      "dequant_situ_quant(Tensor x, Tensor? weight_scale, Tensor? "
+      "activation_scale, Tensor? bias, Tensor? quant_scale, Tensor? "
+      "quant_offset, Tensor? group_index, float beta, float linear_beta, "
+      "bool activate_left, str quant_mode) -> (Tensor, Tensor)");
   // HyperConnection pre/post (hc_pre returns attn_input, post, comb).
   m.def(
       "hc_pre(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
@@ -1113,6 +1118,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::kernel::npu::moe_gating_top_k_hash));
   m.impl("dequant_swiglu_quant",
          TORCH_FN(xllm::kernel::npu::dequant_swiglu_quant));
+  m.impl("dequant_situ_quant", TORCH_FN(xllm::kernel::npu::dequant_situ_quant));
   m.impl("hc_pre", TORCH_FN(xllm::kernel::npu::hc_pre));
   m.impl("hc_pre_fused", TORCH_FN(xllm::kernel::npu::hc_pre_fused));
   m.impl("hc_post", TORCH_FN(xllm::kernel::npu::hc_post));

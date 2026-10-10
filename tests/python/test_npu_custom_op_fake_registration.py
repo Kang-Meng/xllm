@@ -28,6 +28,8 @@ import importlib
 import warnings
 
 import pytest
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from xllm.python.kernels_npu import _custom_op
 
@@ -70,3 +72,15 @@ def test_custom_op_module_imports_without_native_ops() -> None:
 
     module = importlib.import_module("xllm.python.kernels_npu._custom_op")
     assert hasattr(module, "register_fake")
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.bfloat16])
+def test_dequant_situ_quant_fake_output_contract(dtype: torch.dtype) -> None:
+    with FakeTensorMode():
+        x = torch.empty((7, 768), dtype=dtype)
+        y, scale = _custom_op._dequant_situ_quant_fake(x, None, None, None, None, None, None, 1.0, 1.0, True, "dynamic")
+        assert y.shape == (7, 384)
+        assert y.dtype == torch.int8
+        assert scale.shape == (7,)
+        assert scale.dtype == torch.float32
+        assert y.device == scale.device == x.device
