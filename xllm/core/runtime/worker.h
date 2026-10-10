@@ -125,7 +125,13 @@ class Worker {
       const uint64_t batch_id,
       Slice<BlockTransferInfo>& block_transfer_info);
 
+  // stats may be null; when set, Store Get volume and tiers are accumulated.
   virtual std::vector<uint8_t> prefetch_kv_blocks(
+      Slice<BlockTransferInfo>& block_transfer_info,
+      StoreGetStats* stats);
+
+  // Metadata-only Store existence check for each logical block.
+  virtual std::vector<uint8_t> probe_kv_blocks(
       Slice<BlockTransferInfo>& block_transfer_info);
 
   // Run the model on the given input. async call

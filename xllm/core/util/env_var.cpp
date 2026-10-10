@@ -97,5 +97,11 @@ int64_t get_process_group_test_timeout_seconds() {
   return get_int_env(kTimeoutEnvVar, kDefaultTimeoutSeconds);
 }
 
+bool store_prefetch_stats_enabled() {
+  static const bool enabled =
+      get_bool_env("XLLM_STORE_PREFETCH_STATS", /*defaultValue=*/false);
+  return enabled;
+}
+
 }  // namespace util
 }  // namespace xllm

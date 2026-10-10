@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,8 @@ limitations under the License.
 #include "worker.pb.h"
 
 namespace xllm {
+
+class WorkerPrefetchSession;
 
 class WorkerService : public proto::DistributeWorker {
  public:
@@ -199,11 +203,17 @@ class WorkerService : public proto::DistributeWorker {
 
   std::unique_ptr<std::thread> polling_thread_;
 
-  std::unique_ptr<ThreadPool> threadpool_;
+  std::mutex prefetch_mutex_;
+  std::vector<std::weak_ptr<WorkerPrefetchSession>> prefetch_sessions_;
 
-  ThreadPool copy_threadpool_{/*num_threads=*/5,
-                              /*cpu_binding=*/false,
-                              /*pool_name=*/"WorkerService.copy"};
+  // Producers drain before the stats pool; all pools drain before worker_.
+  // Null unless XLLM_STORE_PREFETCH_STATS is enabled.
+  std::unique_ptr<ThreadPool> prefetch_stats_threadpool_;
+  std::unique_ptr<ThreadPool> copy_threadpool_ = std::make_unique<ThreadPool>(
+      /*num_threads=*/5,
+      /*cpu_binding=*/false,
+      /*pool_name=*/"WorkerService.copy");
+  std::unique_ptr<ThreadPool> threadpool_;
 };
 
 }  // namespace xllm

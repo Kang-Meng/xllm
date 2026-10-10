@@ -576,7 +576,8 @@ uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
 }
 
 std::vector<uint8_t> HierarchyKVCacheTransfer::prefetch_kv_blocks(
-    Slice<BlockTransferInfo>& block_transfer_info) {
+    Slice<BlockTransferInfo>& block_transfer_info,
+    StoreGetStats* stats) {
   CHECK(registration_finalized_)
       << "Hierarchy KV cache registration is not finalized.";
   CHECK(!shutdown_) << "Hierarchy KV cache transfer is shut down.";
@@ -588,7 +589,7 @@ std::vector<uint8_t> HierarchyKVCacheTransfer::prefetch_kv_blocks(
     return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
   }
   std::vector<uint8_t> hits =
-      kv_cache_store_->batch_get_with_status(block_transfer_info);
+      kv_cache_store_->batch_get_with_status(block_transfer_info, stats);
   const size_t hit_count =
       std::count(hits.begin(), hits.end(), static_cast<uint8_t>(1));
   VLOG(1) << "[Mooncake][PrefetchGet] worker_rank="
@@ -598,6 +599,17 @@ std::vector<uint8_t> HierarchyKVCacheTransfer::prefetch_kv_blocks(
           << static_cast<int32_t>(block_transfer_info[0].block_type)
           << ", blocks=" << hits.size() << ", hits=" << hit_count;
   return hits;
+}
+
+std::vector<uint8_t> HierarchyKVCacheTransfer::probe_kv_blocks(
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  CHECK(registration_finalized_)
+      << "Hierarchy KV cache registration is not finalized.";
+  CHECK(!shutdown_) << "Hierarchy KV cache transfer is shut down.";
+  if (kv_cache_store_ == nullptr) {
+    return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
+  }
+  return kv_cache_store_->batch_exist(block_transfer_info);
 }
 
 bool HierarchyKVCacheTransfer::supports_block_type(BlockType block_type) const {

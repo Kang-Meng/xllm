@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -34,6 +35,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/types.h"
 #include "core/distributed_runtime/comm_channel.h"
+#include "core/distributed_runtime/worker_prefetch_session.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "framework/kv_cache/kv_cache_shape.h"
@@ -43,6 +45,7 @@ limitations under the License.
 #include "runtime/forward_params.h"
 #include "runtime/params_utils.h"
 #include "runtime/speculative_worker_impl.h"
+#include "util/env_var.h"
 #include "util/timer.h"
 
 namespace xllm {
@@ -98,231 +101,17 @@ std::vector<std::string> build_speculative_position_labels(
   return labels;
 }
 
-class WorkerPrefetchSession final
-    : public brpc::StreamInputHandler,
-      public std::enable_shared_from_this<WorkerPrefetchSession> {
- public:
-  WorkerPrefetchSession(Worker* worker,
-                        ThreadPool* threadpool,
-                        StoragePrefetchRequest request,
-                        size_t batch_size)
-      : worker_(worker),
-        threadpool_(threadpool),
-        request_(std::move(request)),
-        batch_size_(batch_size) {
-    CHECK(worker_ != nullptr);
-    CHECK(threadpool_ != nullptr);
-    CHECK(request_.valid());
-    CHECK_GT(batch_size_, 0u);
+// Store prefetch measurement runs on its own pool so a Store probe never
+// delays a prefetch batch on the copy pool.
+std::unique_ptr<ThreadPool> create_prefetch_stats_threadpool() {
+  if (!util::store_prefetch_stats_enabled()) {
+    return nullptr;
   }
-
-  void retain() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    keepalive_ = shared_from_this();
-  }
-
-  void release() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    keepalive_.reset();
-  }
-
-  void start(brpc::StreamId stream_id) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (state_ != State::CREATED) {
-        return;
-      }
-      stream_id_ = stream_id;
-      state_ = State::RUNNING_BATCH;
-    }
-    schedule_batch();
-  }
-
-  int on_received_messages(brpc::StreamId id,
-                           butil::IOBuf* const messages[],
-                           size_t size) override {
-    if (size != 1 || messages[0]->length() != 1) {
-      fail_and_close(id);
-      return -1;
-    }
-
-    uint8_t control_byte = 0;
-    messages[0]->copy_to(&control_byte, sizeof(control_byte));
-    const PrefetchControl control = static_cast<PrefetchControl>(control_byte);
-    bool run_next = false;
-    bool close = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (state_ == State::RUNNING_BATCH && control == PrefetchControl::STOP) {
-        stop_after_batch_ = true;
-      } else if (state_ != State::WAITING_DECISION) {
-        state_ = State::FAILED;
-        close = true;
-      } else if (control == PrefetchControl::STOP) {
-        state_ = State::COMPLETED;
-        close = true;
-      } else if (control == PrefetchControl::CONTINUE &&
-                 last_batch_gate_complete_ &&
-                 batch_index_ + 1 < request_.batch_count(batch_size_)) {
-        ++batch_index_;
-        state_ = State::RUNNING_BATCH;
-        run_next = true;
-      } else {
-        state_ = State::FAILED;
-        close = true;
-      }
-    }
-
-    if (run_next) {
-      schedule_batch();
-    } else if (close) {
-      brpc::StreamClose(id);
-    }
-    // A close triggered by anything other than a STOP is a protocol error;
-    // a STOP-driven close is the normal completion path.
-    const bool protocol_error = close && control != PrefetchControl::STOP;
-    return protocol_error ? -1 : 0;
-  }
-
-  void on_idle_timeout(brpc::StreamId id) override { fail_and_close(id); }
-
-  void on_failed(brpc::StreamId /*id*/,
-                 int /*error_code*/,
-                 const std::string& /*error_text*/) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ != State::COMPLETED) {
-      state_ = State::FAILED;
-    }
-  }
-
-  void on_closed(brpc::StreamId /*id*/) override {
-    std::shared_ptr<WorkerPrefetchSession> self = shared_from_this();
-    std::lock_guard<std::mutex> lock(mutex_);
-    state_ = State::CLOSED;
-    keepalive_.reset();
-  }
-
- private:
-  enum class State : uint8_t {
-    CREATED = 0,
-    RUNNING_BATCH = 1,
-    WAITING_DECISION = 2,
-    COMPLETED = 3,
-    FAILED = 4,
-    CLOSED = 5,
-  };
-
-  void schedule_batch() {
-    std::shared_ptr<WorkerPrefetchSession> self = shared_from_this();
-    threadpool_->schedule([self = std::move(self)]() { self->run_batch(); });
-  }
-
-  void run_batch() {
-    size_t batch_index = 0;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (state_ != State::RUNNING_BATCH) {
-        return;
-      }
-      batch_index = batch_index_;
-    }
-
-    const size_t unit_begin =
-        request_.batch_unit_begin(batch_index, batch_size_);
-    const size_t unit_count =
-        request_.batch_unit_count(batch_index, batch_size_);
-    std::vector<BlockTransferInfo> batch_transfers;
-    batch_transfers.reserve(
-        request_.batch_transfer_count(batch_index, batch_size_));
-    std::vector<size_t> gated_offsets;
-    std::vector<size_t> non_gated_offsets;
-    for (size_t index = unit_begin; index < unit_begin + unit_count; ++index) {
-      const PrefetchUnit& unit = request_.units[index];
-      gated_offsets.emplace_back(batch_transfers.size());
-      batch_transfers.insert(batch_transfers.end(),
-                             unit.gated_blocks.begin(),
-                             unit.gated_blocks.end());
-      non_gated_offsets.emplace_back(batch_transfers.size());
-      batch_transfers.insert(batch_transfers.end(),
-                             unit.non_gated_blocks.begin(),
-                             unit.non_gated_blocks.end());
-    }
-    Slice<BlockTransferInfo> batch_slice(batch_transfers);
-    const std::vector<uint8_t> transfer_hits =
-        worker_->prefetch_kv_blocks(batch_slice);
-    if (transfer_hits.size() != batch_transfers.size()) {
-      fail_and_close(stream_id_);
-      return;
-    }
-    std::vector<uint8_t> gated_hits(batch_size_, 0);
-    std::vector<uint8_t> non_gated_hits(batch_size_, 0);
-    bool gate_complete = true;
-    for (size_t local = 0; local < unit_count; ++local) {
-      const PrefetchUnit& unit = request_.units[unit_begin + local];
-      const size_t gated_begin = gated_offsets[local];
-      const size_t non_gated_begin = non_gated_offsets[local];
-      bool gated_hit = true;
-      for (size_t offset = 0; offset < unit.gated_blocks.size(); ++offset) {
-        gated_hit = gated_hit && transfer_hits[gated_begin + offset] != 0;
-      }
-      bool non_gated_hit = !unit.has_non_gated;
-      if (unit.has_non_gated) {
-        non_gated_hit = !unit.non_gated_blocks.empty();
-        for (size_t offset = 0; offset < unit.non_gated_blocks.size();
-             ++offset) {
-          non_gated_hit =
-              non_gated_hit && transfer_hits[non_gated_begin + offset] != 0;
-        }
-      }
-      gated_hits[local] = gated_hit ? 1 : 0;
-      non_gated_hits[local] = non_gated_hit ? 1 : 0;
-      gate_complete = gate_complete && gated_hit;
-    }
-
-    bool close_after_result = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (state_ != State::RUNNING_BATCH || batch_index != batch_index_) {
-        return;
-      }
-      last_batch_gate_complete_ = gate_complete;
-      close_after_result = stop_after_batch_;
-      state_ = close_after_result ? State::COMPLETED : State::WAITING_DECISION;
-    }
-
-    butil::IOBuf result;
-    result.append(gated_hits.data(), gated_hits.size());
-    result.append(non_gated_hits.data(), non_gated_hits.size());
-    if (brpc::StreamWrite(stream_id_, result) != 0) {
-      fail_and_close(stream_id_);
-    } else if (close_after_result) {
-      brpc::StreamClose(stream_id_);
-    }
-  }
-
-  void fail_and_close(brpc::StreamId id) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (state_ == State::CLOSED) {
-        return;
-      }
-      state_ = State::FAILED;
-    }
-    brpc::StreamClose(id);
-  }
-
-  Worker* worker_ = nullptr;
-  ThreadPool* threadpool_ = nullptr;
-  StoragePrefetchRequest request_;
-  size_t batch_size_ = 0;
-  std::mutex mutex_;
-  brpc::StreamId stream_id_ = brpc::INVALID_STREAM_ID;
-  size_t batch_index_ = 0;
-  bool last_batch_gate_complete_ = false;
-  bool stop_after_batch_ = false;
-  State state_ = State::CREATED;
-  std::shared_ptr<WorkerPrefetchSession> keepalive_;
-};
+  return std::make_unique<ThreadPool>(
+      /*num_threads=*/1,
+      /*cpu_binding=*/false,
+      /*pool_name=*/"WorkerService.prefetch_stats");
+}
 
 }  // namespace
 
@@ -340,6 +129,7 @@ WorkerService::WorkerService(runtime::Options options,
       /*init_func=*/[this]() mutable { device_.set_device(); },
       /*cpu_binding=*/false,
       /*pool_name=*/"WorkerService.request");
+  prefetch_stats_threadpool_ = create_prefetch_stats_threadpool();
 }
 
 WorkerService::WorkerService(runtime::Options options,
@@ -358,9 +148,27 @@ WorkerService::WorkerService(runtime::Options options,
       /*init_func=*/[this]() mutable { device_.set_device(); },
       /*cpu_binding=*/false,
       /*pool_name=*/"WorkerService.request");
+  prefetch_stats_threadpool_ = create_prefetch_stats_threadpool();
 }
 
-WorkerService::~WorkerService() = default;
+WorkerService::~WorkerService() {
+  std::vector<std::shared_ptr<WorkerPrefetchSession>> sessions;
+  {
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    sessions.reserve(prefetch_sessions_.size());
+    for (const auto& weak_session : prefetch_sessions_) {
+      if (auto session = weak_session.lock()) {
+        sessions.emplace_back(std::move(session));
+      }
+    }
+  }
+  for (const auto& session : sessions) {
+    session->shutdown();
+  }
+  threadpool_.reset();
+  copy_threadpool_.reset();
+  prefetch_stats_threadpool_.reset();
+}
 
 std::vector<SpeculativeTokenStats>
 WorkerService::record_speculative_metrics_from_output(
@@ -888,11 +696,32 @@ void WorkerService::PrefetchFromStorage(
     return;
   }
 
+  PrefetchSessionCallbacks callbacks;
+  callbacks.get = [worker = worker_.get()](Slice<BlockTransferInfo>& blocks,
+                                           StoreGetStats* stats) {
+    return worker->prefetch_kv_blocks(blocks, stats);
+  };
+  callbacks.probe = [worker = worker_.get()](Slice<BlockTransferInfo>& blocks) {
+    return worker->probe_kv_blocks(blocks);
+  };
   auto session =
-      std::make_shared<WorkerPrefetchSession>(worker_.get(),
-                                              &copy_threadpool_,
+      std::make_shared<WorkerPrefetchSession>(copy_threadpool_.get(),
+                                              prefetch_stats_threadpool_.get(),
                                               std::move(request),
-                                              options_.prefetch_batch_size());
+                                              options_.prefetch_batch_size(),
+                                              options_.server_idx(),
+                                              std::move(callbacks));
+
+  {
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    prefetch_sessions_.erase(std::remove_if(prefetch_sessions_.begin(),
+                                            prefetch_sessions_.end(),
+                                            [](const auto& weak_session) {
+                                              return weak_session.expired();
+                                            }),
+                             prefetch_sessions_.end());
+    prefetch_sessions_.emplace_back(session);
+  }
 
   brpc::StreamId stream_id;
   brpc::StreamOptions stream_options;

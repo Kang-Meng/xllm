@@ -171,6 +171,13 @@ class Request : public RequestBase {
 
   size_t num_prefix_cache_tokens() const { return num_prefix_cache_tokens_; }
 
+  // Recorded by Mooncake Store prefetch admission when
+  // XLLM_STORE_PREFETCH_STATS is enabled.
+  void record_store_prefetch(size_t tokens, double latency_ms) {
+    store_prefetch_tokens_ = tokens;
+    store_prefetch_latency_ms_ = latency_ms;
+  }
+
  private:
   RequestState state_;
   std::shared_ptr<RequestFailureState> failure_state_ =
@@ -193,6 +200,10 @@ class Request : public RequestBase {
   bool starved_ = false;
 
   size_t num_prefix_cache_tokens_ = 0;
+
+  size_t store_prefetch_tokens_ = 0;
+
+  double store_prefetch_latency_ms_ = 0.0;
 
   bool prefix_cache_hit_metrics_recorded_ = false;
 

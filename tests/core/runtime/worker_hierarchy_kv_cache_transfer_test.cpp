@@ -148,7 +148,7 @@ TEST_F(WorkerHierarchyKVCacheTransferTest,
       BlockTransferInfo(/*src_block_id=*/0, /*dst_block_id=*/1)};
   EXPECT_EQ(worker.transfer_kv_blocks(/*batch_id=*/1, transfer_info), 0U);
   Slice<BlockTransferInfo> transfer_slice(transfer_info);
-  EXPECT_EQ(worker.prefetch_kv_blocks(transfer_slice),
+  EXPECT_EQ(worker.prefetch_kv_blocks(transfer_slice, /*stats=*/nullptr),
             std::vector<uint8_t>({0}));
 }
 
@@ -399,11 +399,12 @@ TEST_F(WorkerHierarchyKVCacheTransferTest,
       std::vector<BlockTransferInfo> infos = {info};
       Slice<BlockTransferInfo> slice(infos);
       if (missing_draft) {
-        EXPECT_EQ(transfer->prefetch_kv_blocks(slice),
+        EXPECT_EQ(transfer->prefetch_kv_blocks(slice, /*stats=*/nullptr),
                   std::vector<uint8_t>({0}));
         return;
       }
-      ASSERT_EQ(transfer->prefetch_kv_blocks(slice), std::vector<uint8_t>({1}));
+      ASSERT_EQ(transfer->prefetch_kv_blocks(slice, /*stats=*/nullptr),
+                std::vector<uint8_t>({1}));
       info.transfer_type = TransferType::H2D;
       info.dst_block_id = 1;
       ASSERT_EQ(transfer->transfer_kv_blocks(/*batch_id=*/2, {info}), 1U);

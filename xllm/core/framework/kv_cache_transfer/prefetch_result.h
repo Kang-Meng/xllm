@@ -26,6 +26,7 @@ limitations under the License.
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -63,6 +64,8 @@ class PrefetchUnit final {
 
 class StoragePrefetchRequest final {
  public:
+  // Identifies the owning request in worker-side prefetch logs.
+  std::string request_id;
   std::vector<PrefetchUnit> units;
 
   bool valid() const {
@@ -103,12 +106,42 @@ class StoragePrefetchRequest final {
   }
 };
 
+enum class PrefetchStopReason : uint8_t {
+  COMPLETE = 0,
+  // A gated unit missed in at least one worker.
+  MISS = 1,
+  TIMEOUT = 2,
+  // The owning request finished or was cancelled.
+  CANCELLED = 3,
+  WORKER_FAILED = 4,
+};
+
+inline const char* prefetch_stop_reason_name(PrefetchStopReason reason) {
+  switch (reason) {
+    case PrefetchStopReason::COMPLETE:
+      return "complete";
+    case PrefetchStopReason::MISS:
+      return "miss";
+    case PrefetchStopReason::TIMEOUT:
+      return "timeout";
+    case PrefetchStopReason::CANCELLED:
+      return "cancelled";
+    case PrefetchStopReason::WORKER_FAILED:
+      return "worker_failed";
+  }
+  return "unknown";
+}
+
 struct PrefetchSummary final {
   // Per-unit AND across all workers. gated_hits is used for the contiguous
   // full-cache prefix; non_gated_hits selects the deepest optional checkpoint
   // inside that prefix.
   std::vector<uint8_t> gated_hits;
   std::vector<uint8_t> non_gated_hits;
+
+  // Measurement fields, valid even when a worker failed.
+  PrefetchStopReason stop_reason = PrefetchStopReason::COMPLETE;
+  double latency_ms = 0.0;
 };
 
 class PrefetchResult final {
@@ -243,6 +276,7 @@ class PrefetchResult final {
                 summary.non_gated_hits[index] && progress.non_gated_hits[index];
           }
         }
+        fill_measurement(&summary);
         if (failed_) {
           summary.gated_hits.clear();
           summary.non_gated_hits.clear();
@@ -279,11 +313,30 @@ class PrefetchResult final {
   bool should_continue_prefetch(bool gated_complete, bool has_next_batch) {
     const bool timed_out =
         timeout_ms_ > 0 && timer_.elapsed_milliseconds() >= timeout_ms_;
-    if (!gated_complete || timed_out || stop_requested_()) {
+    const bool stop_requested = stop_requested_();
+    if (!gated_complete || timed_out || stop_requested) {
       continue_prefetch_->store(false, std::memory_order_release);
+    }
+    // Only a stop that leaves units unfetched is recorded; the first recorded
+    // reason wins across workers.
+    if (stop_reason_ == PrefetchStopReason::COMPLETE) {
+      if (!gated_complete) {
+        stop_reason_ = PrefetchStopReason::MISS;
+      } else if (has_next_batch && timed_out) {
+        stop_reason_ = PrefetchStopReason::TIMEOUT;
+      } else if (has_next_batch && stop_requested) {
+        stop_reason_ = PrefetchStopReason::CANCELLED;
+      }
     }
     return gated_complete && has_next_batch &&
            continue_prefetch_->load(std::memory_order_acquire);
+  }
+
+  // Requires mutex_.
+  void fill_measurement(PrefetchSummary* summary) const {
+    summary->stop_reason =
+        failed_ ? PrefetchStopReason::WORKER_FAILED : stop_reason_;
+    summary->latency_ms = timer_.elapsed_milliseconds();
   }
 
   mutable std::mutex mutex_;
@@ -296,6 +349,7 @@ class PrefetchResult final {
   DoneCallback done_;
   Timer timer_;
   bool failed_ = false;
+  PrefetchStopReason stop_reason_ = PrefetchStopReason::COMPLETE;
   std::shared_ptr<std::atomic_bool> continue_prefetch_ =
       std::make_shared<std::atomic_bool>(true);
 };

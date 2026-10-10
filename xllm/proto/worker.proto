@@ -161,6 +161,8 @@ message PrefetchRequest {
   // A request is a sequence of complete semantic units. The worker expands
   // one batch of units into a flat transfer vector locally.
   repeated PrefetchUnit units = 1;
+  // Owning request id, used only to correlate prefetch logs.
+  string request_id = 2;
 }
 
 message TransferStatus {

@@ -2505,11 +2505,21 @@ void WorkerImpl::set_hierarchy_layer_synchronizer(
 }
 
 std::vector<uint8_t> WorkerImpl::prefetch_kv_blocks(
+    Slice<BlockTransferInfo>& block_transfer_info,
+    StoreGetStats* stats) {
+  if (hierarchy_kv_cache_transfer_ == nullptr) {
+    return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
+  }
+  return hierarchy_kv_cache_transfer_->prefetch_kv_blocks(block_transfer_info,
+                                                          stats);
+}
+
+std::vector<uint8_t> WorkerImpl::probe_kv_blocks(
     Slice<BlockTransferInfo>& block_transfer_info) {
   if (hierarchy_kv_cache_transfer_ == nullptr) {
     return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
   }
-  return hierarchy_kv_cache_transfer_->prefetch_kv_blocks(block_transfer_info);
+  return hierarchy_kv_cache_transfer_->probe_kv_blocks(block_transfer_info);
 }
 
 int64_t WorkerImpl::get_active_activation_memory() {

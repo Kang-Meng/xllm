@@ -81,6 +81,17 @@ class KVCacheStoreTestPeer final {
     return KVCacheStore::group_requests(requests).size();
   }
 
+  static std::vector<uint8_t> present_objects(
+      const std::vector<MooncakeReplicaTier>& tiers) {
+    return KVCacheStore::present_objects(tiers);
+  }
+
+  static void record_get(MooncakeReplicaTier tier,
+                         uint64_t bytes,
+                         StoreGetStats* stats) {
+    KVCacheStore::record_get(tier, bytes, stats);
+  }
+
   static void mark_initialized(KVCacheStore* store) {
     store->is_initialized_ = true;
   }
@@ -121,6 +132,11 @@ class MooncakeStoreBackendTestPeer final {
   static bool put_succeeded(int result) {
     return MooncakeStoreBackend::put_succeeded(result);
   }
+
+  static MooncakeReplicaTier replica_tier(
+      const std::vector<mooncake::Replica::Descriptor>& replicas) {
+    return MooncakeStoreBackend::replica_tier(replicas);
+  }
 };
 
 namespace {
@@ -158,6 +174,13 @@ KVCache make_attention_cache(int64_t host_blocks, int64_t width) {
       KVCacheTensors{torch::zeros({host_blocks, 2, width}, options),
                      torch::zeros({host_blocks, 2, width}, options)});
 }
+
+enum class ReplicaKind : uint8_t {
+  MEMORY = 0,
+  NOF = 1,
+  DISK = 2,
+  LOCAL_DISK = 3,
+};
 
 KVCache make_linear_cache(int64_t host_blocks, int64_t width) {
   const torch::TensorOptions options =
@@ -714,6 +737,10 @@ TEST(KVCacheStoreTest, MlaKeyExcludesTensorParallelTopology) {
         HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
     KVCacheStoreInitConfig config =
         make_store_config("target-model", tp_rank, tp_size, enable_mla);
+    config.cp_size = split_size;
+    config.cp_rank = split_rank;
+    config.kv_split_full_domain_size =
+        split_size * static_cast<int32_t>(tp_size);
     config.kv_split_size = split_size;
     config.kv_split_rank = split_rank;
     KVCacheStoreTestPeer::initialize_index(&store, config, std::move(index));
@@ -852,6 +879,57 @@ TEST(KVCacheStoreTest, AggregatesPhysicalResultsPerLogicalBlock) {
             std::vector<uint8_t>({1, 0}));
 }
 
+TEST(KVCacheStoreTest, ObjectPresenceRequiresEveryComponentObject) {
+  KVCache target_cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
+  KVCache draft_cache = make_attention_cache(/*host_blocks=*/2, /*width=*/4);
+  KVCacheStore store;
+  HostCacheStoreIndex index;
+  index[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/0, "main", &target_cache});
+  index[BlockType::KV].emplace_back(HostCacheStoreEntry{
+      /*cache_handle=*/1, "spec_draft::mtp::draft-model", &draft_cache});
+  KVCacheStoreTestPeer::initialize_index(
+      &store, make_store_config(), std::move(index));
+
+  const std::vector<BlockTransferInfo> block_info = {
+      make_block_info(11, BlockType::KV, /*destination_block_id=*/0),
+      make_block_info(12, BlockType::KV, /*destination_block_id=*/1),
+      make_block_info(13, BlockType::KV, /*destination_block_id=*/0)};
+  // Physical objects are ordered per logical block, then per component.
+  const std::vector<MooncakeReplicaTier> tiers = {MooncakeReplicaTier::MEMORY,
+                                                  MooncakeReplicaTier::DISK,
+                                                  MooncakeReplicaTier::MEMORY,
+                                                  MooncakeReplicaTier::MISSING,
+                                                  MooncakeReplicaTier::MISSING,
+                                                  MooncakeReplicaTier::MISSING};
+  const std::vector<uint8_t> present =
+      KVCacheStoreTestPeer::present_objects(tiers);
+
+  EXPECT_EQ(present, std::vector<uint8_t>({1, 1, 1, 0, 0, 0}));
+  EXPECT_EQ(KVCacheStoreTestPeer::aggregate(store, block_info, present),
+            std::vector<uint8_t>({1, 0, 0}));
+}
+
+TEST(KVCacheStoreTest, RecordsGetVolumePerReplicaTier) {
+  StoreGetStats stats;
+  KVCacheStoreTestPeer::record_get(
+      MooncakeReplicaTier::MEMORY, /*bytes=*/100, &stats);
+  KVCacheStoreTestPeer::record_get(
+      MooncakeReplicaTier::MEMORY, /*bytes=*/20, &stats);
+  KVCacheStoreTestPeer::record_get(
+      MooncakeReplicaTier::DISK, /*bytes=*/300, &stats);
+  // An unresolved tier still counts towards the total read volume.
+  KVCacheStoreTestPeer::record_get(
+      MooncakeReplicaTier::MISSING, /*bytes=*/7, &stats);
+
+  EXPECT_EQ(stats.read_bytes, 427U);
+  EXPECT_EQ(stats.memory_objects, 2U);
+  EXPECT_EQ(stats.memory_bytes, 120U);
+  EXPECT_EQ(stats.disk_objects, 1U);
+  EXPECT_EQ(stats.disk_bytes, 300U);
+  EXPECT_EQ(stats.tier_query_us, 0U);
+}
+
 TEST(KVCacheStoreTest, DeduplicatesPhysicalKeysAndRespectsBlockTypeEntries) {
   KVCache target_cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
   KVCache draft_cache = make_attention_cache(/*host_blocks=*/2, /*width=*/4);
@@ -939,6 +1017,71 @@ TEST(MooncakeStoreBackendTest, AcceptsOnlyExactSingleGetResult) {
   EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_succeeded(
       /*expected_bytes=*/static_cast<int64_t>(INT32_MAX) + 1,
       std::vector<int>{INT32_MAX}));
+}
+
+mooncake::Replica::Descriptor make_replica(ReplicaKind kind,
+                                           mooncake::ReplicaStatus status) {
+  mooncake::Replica::Descriptor replica;
+  replica.id = 0;
+  replica.status = status;
+  switch (kind) {
+    case ReplicaKind::MEMORY:
+      replica.descriptor_variant = mooncake::MemoryDescriptor{};
+      break;
+    case ReplicaKind::NOF:
+      replica.descriptor_variant = mooncake::NoFDescriptor{};
+      break;
+    case ReplicaKind::DISK:
+      replica.descriptor_variant = mooncake::DiskDescriptor{};
+      break;
+    case ReplicaKind::LOCAL_DISK:
+      replica.descriptor_variant = mooncake::LocalDiskDescriptor{};
+      break;
+  }
+  return replica;
+}
+
+TEST(MooncakeStoreBackendTest, ReplicaTierFollowsCompleteReadPreference) {
+  constexpr mooncake::ReplicaStatus kComplete =
+      mooncake::ReplicaStatus::COMPLETE;
+  constexpr mooncake::ReplicaStatus kProcessing =
+      mooncake::ReplicaStatus::PROCESSING;
+  const struct {
+    const char* name;
+    std::vector<mooncake::Replica::Descriptor> replicas;
+    MooncakeReplicaTier expected;
+  } cases[] = {
+      {"no replica", {}, MooncakeReplicaTier::MISSING},
+      {"memory",
+       {make_replica(ReplicaKind::MEMORY, kComplete)},
+       MooncakeReplicaTier::MEMORY},
+      {"nof",
+       {make_replica(ReplicaKind::NOF, kComplete)},
+       MooncakeReplicaTier::DISK},
+      {"disk",
+       {make_replica(ReplicaKind::DISK, kComplete)},
+       MooncakeReplicaTier::DISK},
+      {"local disk",
+       {make_replica(ReplicaKind::LOCAL_DISK, kComplete)},
+       MooncakeReplicaTier::DISK},
+      {"memory listed after disk",
+       {make_replica(ReplicaKind::DISK, kComplete),
+        make_replica(ReplicaKind::MEMORY, kComplete)},
+       MooncakeReplicaTier::MEMORY},
+      {"memory still being written",
+       {make_replica(ReplicaKind::MEMORY, kProcessing),
+        make_replica(ReplicaKind::DISK, kComplete)},
+       MooncakeReplicaTier::DISK},
+      {"only incomplete replicas",
+       {make_replica(ReplicaKind::MEMORY, kProcessing),
+        make_replica(ReplicaKind::DISK, mooncake::ReplicaStatus::FAILED)},
+       MooncakeReplicaTier::MISSING},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    EXPECT_EQ(MooncakeStoreBackendTestPeer::replica_tier(test_case.replicas),
+              test_case.expected);
+  }
 }
 
 TEST(MooncakeStoreBackendTest, TreatsObjectAlreadyExistsAsPutSuccess) {

@@ -203,8 +203,14 @@ uint32_t Worker::transfer_kv_blocks(
 }
 
 std::vector<uint8_t> Worker::prefetch_kv_blocks(
+    Slice<BlockTransferInfo>& block_transfer_info,
+    StoreGetStats* stats) {
+  return impl_->prefetch_kv_blocks(block_transfer_info, stats);
+}
+
+std::vector<uint8_t> Worker::probe_kv_blocks(
     Slice<BlockTransferInfo>& block_transfer_info) {
-  return impl_->prefetch_kv_blocks(block_transfer_info);
+  return impl_->probe_kv_blocks(block_transfer_info);
 }
 
 const torch::Device& Worker::device() const { return impl_->device(); }

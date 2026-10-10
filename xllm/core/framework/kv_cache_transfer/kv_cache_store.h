@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "common/types.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/kv_cache_transfer/kv_transfer_types.h"
 #include "framework/kv_cache_transfer/mooncake_store_backend.h"
 #include "framework/model/model_input_params.h"
 #include "util/slice.h"
@@ -91,7 +92,16 @@ class KVCacheStore final {
 
   uint32_t batch_put(Slice<BlockTransferInfo>& block_transfer_info);
   uint32_t batch_get(Slice<BlockTransferInfo>& block_transfer_info);
+  // When stats is non-null, the replica tier of every object is queried
+  // synchronously before the Get and successful reads are accumulated into
+  // stats. The query is an extra Mooncake master RPC on the prefetch path, so
+  // callers measuring end-to-end latency include it; its cost is reported
+  // separately in stats->tier_query_us.
   std::vector<uint8_t> batch_get_with_status(
+      Slice<BlockTransferInfo>& block_transfer_info,
+      StoreGetStats* stats = nullptr);
+  // Metadata-only check whether every object of each logical block is present.
+  std::vector<uint8_t> batch_exist(
       Slice<BlockTransferInfo>& block_transfer_info);
 
  private:
@@ -154,6 +164,12 @@ class KVCacheStore final {
   std::optional<MooncakeMultiBuffer> build_multi_buffer(const StoreEntry& entry,
                                                         int32_t block_id) const;
   std::optional<std::vector<MooncakeRegisteredRange>> collect_ranges() const;
+  static void record_get(MooncakeReplicaTier tier,
+                         uint64_t bytes,
+                         StoreGetStats* stats);
+  // 1 for every object held by at least one complete replica.
+  static std::vector<uint8_t> present_objects(
+      const std::vector<MooncakeReplicaTier>& tiers);
 
  private:
   bool is_initialized_ = false;

@@ -41,5 +41,16 @@ std::optional<std::string> get_optional_string_env(const std::string& name);
 // insufficient.
 int64_t get_process_group_test_timeout_seconds();
 
+// Whether Mooncake Store prefetch measurement is enabled. When
+// XLLM_STORE_PREFETCH_STATS is true, each worker logs its per-rank read volume,
+// latency breakdown, replica tiers and a probe beyond its gated-hit prefix
+// after it closes the stream. Failed sessions log accumulated reads without
+// probing. The master logs one summary line per
+// prefetched request. The value is read once per process. Default: false.
+// Enabling it adds one synchronous Mooncake replica-tier query per prefetch
+// batch, so the logged prefetch latencies include that query; the worker logs
+// its cost separately as tier_query_time.
+bool store_prefetch_stats_enabled();
+
 }  // namespace util
 }  // namespace xllm

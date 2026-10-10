@@ -165,6 +165,49 @@ bool MooncakeStoreBackend::get(const std::string& key,
   return false;
 }
 
+std::vector<MooncakeReplicaTier> MooncakeStoreBackend::batch_query_tiers(
+    const std::vector<std::string>& keys) {
+  std::vector<MooncakeReplicaTier> tiers(keys.size(),
+                                         MooncakeReplicaTier::MISSING);
+  if (client_ptr_ == nullptr || keys.empty()) {
+    return tiers;
+  }
+  try {
+    const std::vector<tl::expected<mooncake::QueryResult, mooncake::ErrorCode>>
+        results = client_ptr_->batch_query(keys);
+    const size_t result_count = std::min(keys.size(), results.size());
+    for (size_t index = 0; index < result_count; ++index) {
+      if (results[index].has_value()) {
+        tiers[index] = replica_tier(results[index].value().replicas);
+      }
+    }
+  } catch (const std::exception& error) {
+    LOG(WARNING) << "Mooncake BatchQuery failed: " << error.what();
+  } catch (...) {
+    LOG(WARNING) << "Mooncake BatchQuery failed unexpectedly.";
+  }
+  return tiers;
+}
+
+MooncakeReplicaTier MooncakeStoreBackend::replica_tier(
+    const std::vector<mooncake::Replica::Descriptor>& replicas) {
+  MooncakeReplicaTier tier = MooncakeReplicaTier::MISSING;
+  for (const mooncake::Replica::Descriptor& replica : replicas) {
+    // Mooncake reads only complete replicas, see SelectBestReplica.
+    if (replica.status != mooncake::ReplicaStatus::COMPLETE) {
+      continue;
+    }
+    if (replica.is_memory_replica()) {
+      return MooncakeReplicaTier::MEMORY;
+    }
+    if (replica.is_nof_replica() || replica.is_local_disk_replica() ||
+        replica.is_disk_replica()) {
+      tier = MooncakeReplicaTier::DISK;
+    }
+  }
+  return tier;
+}
+
 std::optional<std::vector<MooncakeRegisteredRange>>
 MooncakeStoreBackend::unique_ranges(
     const std::vector<MooncakeRegisteredRange>& ranges) {

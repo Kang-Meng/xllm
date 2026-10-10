@@ -23,6 +23,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -31,6 +32,7 @@ limitations under the License.
 #include "api_service/call.h"
 #include "common/metrics.h"
 #include "sequence.h"
+#include "util/env_var.h"
 #include "util/timer.h"
 
 namespace xllm {
@@ -147,6 +149,15 @@ void Request::log_statistic(double total_latency) {
              << ", speculative_token_acceptance_rate: " << acceptance_rate;
       speculative_stats_log = stream.str();
     }
+    std::string store_prefetch_log;
+    if (util::store_prefetch_stats_enabled()) {
+      std::ostringstream stream;
+      stream << ", store_prefetch_tokens: " << store_prefetch_tokens_
+             << std::fixed << std::setprecision(1)
+             << ", store_prefetch_latency: " << store_prefetch_latency_ms_
+             << "ms";
+      store_prefetch_log = stream.str();
+    }
     LOG(INFO) << "x-request-id: " << x_request_id_ << ", "
               << "x-request-time: " << x_request_time_ << ", "
               << "request_id: " << request_id_ << ", "
@@ -163,7 +174,7 @@ void Request::log_statistic(double total_latency) {
               << "total_latency: " << total_latency * 1000 << "ms, "
               << "avg tpot: " << tpot << "ms, "
               << "generation speed: " << gen_speed << " tokens/s"
-              << speculative_stats_log;
+              << speculative_stats_log << store_prefetch_log;
     // only log once when beam search is enabled
     if (check_beam_search()) {
       break;

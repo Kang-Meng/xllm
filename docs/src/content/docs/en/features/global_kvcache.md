@@ -602,6 +602,35 @@ For RDMA, set `--store_protocol=rdma`. Use `--store_rdma_devices=mlx5_0,mlx5_1` 
 
 Speculative decoding does not require a separate draft Store namespace. xLLM automatically generates a distinct `key_component` for the draft cache. If `--model_id` is omitted, xLLM uses the final component of the model path; production deployments should still provide a stable `--model_id` that identifies the model version.
 
+### Prefetch Measurement Logs
+
+Set `XLLM_STORE_PREFETCH_STATS=true` to enable Store prefetch measurements;
+they are disabled by default. Each read batch adds a synchronous replica-tier
+query. The master's `prefetch_latency` and the worker's `total` include this
+overhead. The worker's `get_time` excludes it, and `tier_query_time` reports it
+separately.
+
+The master logs `request_id`, `dp_rank`, `prompt_tokens`, `host_hit_tokens`,
+`target_tokens`, `fetched_tokens`, `stop_reason`, and `prefetch_latency`.
+Workers use the same `request_id` to log per-rank read volume, tier breakdowns,
+`queue_wait`, `get_time`, `tier_query_time`, `control_wait`, `total`, and `get_bw`.
+The master does not aggregate worker read volume or bandwidth.
+
+Worker `units` means hits/executed/requested, and `blocks` means hits/requested.
+`status` is `completed` or `failed`. Failure reports retain completed Get
+statistics, including a Get that was still running when the stream closed,
+and skip the tail probe. `total` ends at stream closure; a failure report may
+be emitted later, after the running Get returns.
+
+`probed_units` is the tail beyond this rank's contiguous gated-hit prefix.
+It starts at the first gated miss in the last batch, or after the batch when
+every unit hit. It includes units already read later in that batch but unable
+to form a contiguous hit prefix after the miss. `probed_present_units` counts
+units whose gated blocks are all present in the Store after stream closure.
+This is a per-rank snapshot, not a global count of reusable KV or recomputed
+tokens. `probe_status` is `complete`, `invalid` for a result-length mismatch,
+or `skipped` on failure. The latter two report `probed_present_units=unknown`.
+
 ### Disaggregated PD Example
 
 Use the normal [Disaggregated PD](/en/features/disagg_pd/) flags and enable Store on both roles. Use different `store_local_hostname` base ports for Prefill and Decode:

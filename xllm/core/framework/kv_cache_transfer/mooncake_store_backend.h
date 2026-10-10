@@ -41,6 +41,17 @@ struct MooncakeRegisteredRange {
   size_t bytes = 0;
 };
 
+// Fastest complete replica tier currently holding an object, following
+// Mooncake's read preference: MEMORY before any SSD-backed replica. This is an
+// approximation of the replica Mooncake actually reads: Mooncake also prefers a
+// local NoF SSD replica over a remote MEMORY one, but RealClient does not
+// expose the local endpoints needed to tell them apart.
+enum class MooncakeReplicaTier : uint8_t {
+  MISSING = 0,
+  MEMORY = 1,
+  DISK = 2,
+};
+
 struct MooncakeMultiBuffer {
   std::vector<void*> addresses;
   std::vector<size_t> sizes;
@@ -57,6 +68,10 @@ class MooncakeStoreBackend final {
       const std::vector<std::string>& keys,
       const std::vector<MooncakeMultiBuffer>& buffers);
   bool get(const std::string& key, const MooncakeMultiBuffer& buffer);
+  // Metadata-only lookup; reads no object data. Returns one tier per key, and
+  // MISSING for every key when the query fails.
+  std::vector<MooncakeReplicaTier> batch_query_tiers(
+      const std::vector<std::string>& keys);
 
  private:
   friend class MooncakeStoreBackendTestPeer;
@@ -66,6 +81,8 @@ class MooncakeStoreBackend final {
   static bool get_succeeded(int64_t expected_bytes,
                             const std::vector<int>& results);
   static bool put_succeeded(int result);
+  static MooncakeReplicaTier replica_tier(
+      const std::vector<mooncake::Replica::Descriptor>& replicas);
   void unregister_ranges();
 
  private:

@@ -88,6 +88,7 @@ cc_library(
     host_transfer/basic_transfer.h
     host_transfer/compact_transfer.h
     prefetch_result.h
+    prefetch_tail_probe.h
     hierarchy_kv_cache_transfer.h
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_transfer_engine.h>
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_kv_cache_transfer.h>

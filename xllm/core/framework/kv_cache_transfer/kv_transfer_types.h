@@ -31,4 +31,17 @@ struct KVTransferTaskResult {
   KVTransferErrorCode error_code = KVTransferErrorCode::NONE;
 };
 
+// Store Get volume split by the replica tier that served each object. An
+// object whose tier could not be resolved only contributes to read_bytes.
+struct StoreGetStats final {
+  uint64_t read_bytes = 0;
+  uint64_t memory_objects = 0;
+  uint64_t memory_bytes = 0;
+  uint64_t disk_objects = 0;
+  uint64_t disk_bytes = 0;
+  // Time spent resolving replica tiers before the Get, which is not part of
+  // the data read itself.
+  uint64_t tier_query_us = 0;
+};
+
 }  // namespace xllm

@@ -55,6 +55,30 @@ target_link_libraries(kv_transfer_completion_test PRIVATE
 
 cc_test(
   NAME
+    prefetch_result_test
+  CPU_ONLY
+  SRCS
+    prefetch_result_test.cpp
+  DEPS
+    :util
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    prefetch_tail_probe_test
+  CPU_ONLY
+  SRCS
+    prefetch_tail_probe_test.cpp
+  DEPS
+    :util
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     reshard_planner_test
   CPU_ONLY
   SRCS
@@ -129,7 +153,6 @@ cc_test(
 
 endif()
 
-if(USE_NPU OR USE_MLU)
 cc_test(
   NAME
     kv_cache_store_test
@@ -141,6 +164,7 @@ cc_test(
     GTest::gtest_main
 )
 
+if(USE_NPU OR USE_MLU)
 cc_test(
   NAME
     basic_host_kv_transfer_test

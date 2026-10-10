@@ -168,7 +168,8 @@ class RecordingTransferWorker final : public LLMWorkerImpl {
   }
 
   std::vector<uint8_t> prefetch_kv_blocks(
-      Slice<BlockTransferInfo>& block_transfer_info) override {
+      Slice<BlockTransferInfo>& block_transfer_info,
+      StoreGetStats* /*stats*/) override {
     ++prefetch_count_;
     return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/1);
   }
@@ -1028,7 +1029,8 @@ TEST_F(MTPHostOffloadTest, StorePrefetchWithoutHierarchyMisses) {
   worker.replace_transfer_workers(std::move(target), std::move(draft));
   Slice<BlockTransferInfo> transfer_slice(transfer_info);
 
-  const std::vector<uint8_t> hits = worker.prefetch_kv_blocks(transfer_slice);
+  const std::vector<uint8_t> hits =
+      worker.prefetch_kv_blocks(transfer_slice, /*stats=*/nullptr);
 
   EXPECT_EQ(hits, std::vector<uint8_t>({0}));
   EXPECT_EQ(target_ptr->prefetch_count(), 0U);

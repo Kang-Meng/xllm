@@ -5,6 +5,17 @@ include(cc_test)
 
 cc_test(
   NAME
+    worker_prefetch_session_test
+  CPU_ONLY
+  SRCS
+    worker_prefetch_session_test.cpp
+  DEPS
+    :worker_prefetch_session
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     spawn_worker_protocol_test
   CPU_ONLY
   SRCS

@@ -29,6 +29,7 @@ cc_library(
     remote_worker.h
     worker_server.h
     worker_service.h
+    worker_prefetch_session.h
     comm_channel.h
     shm_channel.h
   SRCS
@@ -64,6 +65,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:unified_dlog>
     :collective_service
     :xtensor
+    :worker_prefetch_session
 )
 
 cc_library(
@@ -79,6 +81,21 @@ cc_library(
     glog::glog
     proto::xllm_proto
     :platform
+    :worker_prefetch_session
+)
+
+cc_library(
+  NAME
+    worker_prefetch_session
+  HDRS
+    worker_prefetch_session.h
+  SRCS
+    worker_prefetch_session.cpp
+  DEPS
+    :util
+    torch
+    brpc
+    glog::glog
 )
 
 cc_library(

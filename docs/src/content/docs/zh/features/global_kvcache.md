@@ -602,6 +602,32 @@ mooncake_client \
 
 启用投机解码时不需要额外配置 Draft Store namespace。xLLM 会自动为 Draft 缓存生成独立的 `key_component`。未设置 `--model_id` 时，xLLM 会使用模型路径的末级名称；生产环境仍建议显式提供稳定且能标识模型版本的 `--model_id`。
 
+### 预取测量日志
+
+设置 `XLLM_STORE_PREFETCH_STATS=true` 可以开启 Store 预取测量，默认关闭。
+开启后，每个读取 batch 会额外同步查询副本 tier：master 的
+`prefetch_latency` 和 worker 的 `total` 包含这部分开销，worker 的
+`get_time` 扣除它，`tier_query_time` 单独报告查询时间。
+
+master 输出 `request_id`、`dp_rank`、`prompt_tokens`、`host_hit_tokens`、
+`target_tokens`、`fetched_tokens`、`stop_reason` 和 `prefetch_latency`。
+各 worker 使用相同的 `request_id` 输出本 rank 的读取量、tier 分桶、
+`queue_wait`、`get_time`、`tier_query_time`、`control_wait`、`total` 和 `get_bw`。
+master 不聚合各 worker 的读取量或带宽。
+
+worker 的 `units` 为命中数/执行数/请求总数，`blocks` 为命中数/请求数。
+`status` 为 `completed` 或 `failed`；失败时保留已完成 Get 的统计，包括
+stream 关闭时仍在执行、随后完成的 Get，并跳过尾部探测。
+`total` 截止到关闭 stream，失败日志可能在当前 Get 完成后才输出。
+
+`probed_units` 是本 rank 连续 gated-hit 前缀之后的尾部长度。尾部从最后
+batch 的首个 gated miss 开始；全部命中时从 batch 末尾开始。它包含同
+batch 内已经读取、但因前缀断裂无法形成连续命中前缀的 unit。
+`probed_present_units` 只计入所有 gated block 都存在的 unit，是关闭
+stream 后的本 rank Store 快照，不能直接解释为全局可复用 KV 或重算 token 数。
+`probe_status=complete` 表示探测完成，`invalid` 表示返回长度异常，
+`skipped` 表示失败路径跳过探测；后两者的 `probed_present_units` 为 `unknown`。
+
 ### PD 分离示例
 
 两个角色都需要正常配置 [PD 分离](/zh/features/disagg_pd/)参数并开启 Store。Prefill 和 Decode 必须使用不同的 `store_local_hostname` 基础端口：

@@ -20,12 +20,14 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 #include "util/hash_util.h"
+#include "util/timer.h"
 
 namespace xllm {
 namespace {
@@ -416,7 +418,8 @@ uint32_t KVCacheStore::batch_get(
 }
 
 std::vector<uint8_t> KVCacheStore::batch_get_with_status(
-    Slice<BlockTransferInfo>& block_transfer_info) {
+    Slice<BlockTransferInfo>& block_transfer_info,
+    StoreGetStats* stats) {
   std::vector<uint8_t> statuses(block_transfer_info.size(), /*value=*/0);
   if (!is_initialized_ || block_transfer_info.empty()) {
     return statuses;
@@ -437,6 +440,19 @@ std::vector<uint8_t> KVCacheStore::batch_get_with_status(
     }
   }
 
+  std::vector<MooncakeReplicaTier> tiers;
+  if (stats != nullptr && backend_ != nullptr) {
+    std::vector<std::string> keys;
+    keys.reserve(requests.size());
+    for (const PhysicalRequest& request : requests) {
+      keys.emplace_back(request.key);
+    }
+    const Timer tier_timer;
+    tiers = backend_->batch_query_tiers(keys);
+    stats->tier_query_us +=
+        static_cast<uint64_t>(tier_timer.elapsed_microseconds());
+  }
+
   std::vector<uint8_t> physical_results(requests.size(), /*value=*/0);
   for (size_t request_index = 0; request_index < requests.size();
        ++request_index) {
@@ -449,9 +465,66 @@ std::vector<uint8_t> KVCacheStore::batch_get_with_status(
     }
     physical_results[request_index] =
         backend_->get(request.key, *buffer) ? 1 : 0;
+    if (stats == nullptr || physical_results[request_index] == 0) {
+      continue;
+    }
+    const uint64_t bytes = std::accumulate(
+        buffer->sizes.begin(), buffer->sizes.end(), static_cast<uint64_t>(0));
+    const MooncakeReplicaTier tier = request_index < tiers.size()
+                                         ? tiers[request_index]
+                                         : MooncakeReplicaTier::MISSING;
+    record_get(tier, bytes, stats);
   }
   return aggregate_results(
       block_transfer_info.size(), requests, physical_results);
+}
+
+std::vector<uint8_t> KVCacheStore::batch_exist(
+    Slice<BlockTransferInfo>& block_transfer_info) {
+  if (!is_initialized_ || block_transfer_info.empty() || backend_ == nullptr) {
+    return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
+  }
+  const std::vector<PhysicalRequest> requests =
+      build_requests(block_transfer_info);
+  std::vector<std::string> keys;
+  keys.reserve(requests.size());
+  for (const PhysicalRequest& request : requests) {
+    keys.emplace_back(request.key);
+  }
+  const std::vector<MooncakeReplicaTier> tiers =
+      backend_->batch_query_tiers(keys);
+  CHECK_EQ(tiers.size(), requests.size());
+  return aggregate_results(
+      block_transfer_info.size(), requests, present_objects(tiers));
+}
+
+std::vector<uint8_t> KVCacheStore::present_objects(
+    const std::vector<MooncakeReplicaTier>& tiers) {
+  std::vector<uint8_t> present;
+  present.reserve(tiers.size());
+  for (const MooncakeReplicaTier tier : tiers) {
+    present.emplace_back(tier != MooncakeReplicaTier::MISSING ? 1 : 0);
+  }
+  return present;
+}
+
+void KVCacheStore::record_get(MooncakeReplicaTier tier,
+                              uint64_t bytes,
+                              StoreGetStats* stats) {
+  CHECK(stats != nullptr);
+  stats->read_bytes += bytes;
+  switch (tier) {
+    case MooncakeReplicaTier::MEMORY:
+      ++stats->memory_objects;
+      stats->memory_bytes += bytes;
+      break;
+    case MooncakeReplicaTier::DISK:
+      ++stats->disk_objects;
+      stats->disk_bytes += bytes;
+      break;
+    case MooncakeReplicaTier::MISSING:
+      break;
+  }
 }
 
 std::optional<MooncakeMultiBuffer> KVCacheStore::build_multi_buffer(

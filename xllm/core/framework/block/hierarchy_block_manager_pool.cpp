@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <atomic>
 #include <exception>
+#include <iomanip>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -30,6 +31,7 @@ limitations under the License.
 #include "concurrent_block_manager_impl.h"
 #include "linear_state_block_manager.h"
 #include "sliding_window_block_manager.h"
+#include "util/env_var.h"
 
 namespace xllm {
 
@@ -377,6 +379,28 @@ size_t finalize_prefetch_tokens(
     return base_tokens;
   }
   return base_tokens + deepest_optional_unit * unit_size;
+}
+
+// One line per prefetched request; see XLLM_STORE_PREFETCH_STATS. Per-rank
+// read volume and tail probes are logged by each worker with the same
+// request_id. prefetch_latency includes the per-batch replica-tier queries
+// that the measurement itself adds; see tier_query_time in the worker lines.
+void log_prefetch_summary(const Request& request,
+                          const Sequence& sequence,
+                          int32_t dp_rank,
+                          size_t host_hit_tokens,
+                          size_t target_tokens,
+                          size_t fetched_tokens,
+                          const PrefetchSummary& summary) {
+  LOG(INFO) << "[StorePrefetch] request_id: " << request.request_id()
+            << ", dp_rank: " << dp_rank
+            << ", prompt_tokens: " << sequence.num_prompt_tokens()
+            << ", host_hit_tokens: " << host_hit_tokens
+            << ", target_tokens: " << target_tokens
+            << ", fetched_tokens: " << fetched_tokens << ", stop_reason: "
+            << prefetch_stop_reason_name(summary.stop_reason)
+            << ", prefetch_latency: " << std::fixed << std::setprecision(1)
+            << summary.latency_ms << "ms";
 }
 
 }  // namespace
@@ -1075,6 +1099,7 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
 
   StoragePrefetchRequest storage_request =
       build_prefetch_request(sequence, combination, host_leaves);
+  storage_request.request_id = request->request_id();
   auto storage_request_ptr = std::make_shared<const StoragePrefetchRequest>(
       std::move(storage_request));
 
@@ -1083,6 +1108,7 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
                    sequence,
                    dp_rank,
                    base_tokens,
+                   target_tokens,
                    combination,
                    storage_request_ptr,
                    done = std::move(done)](PrefetchSummary summary) mutable {
@@ -1096,6 +1122,19 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
                                  host_block_managers_[dp_rank]->leaf_entries(),
                                  base_tokens,
                                  summary);
+    if (util::store_prefetch_stats_enabled() &&
+        !storage_request_ptr->units.empty()) {
+      const size_t fetched_tokens =
+          publish ? final_tokens - std::min(final_tokens, base_tokens) : 0;
+      request->record_store_prefetch(fetched_tokens, summary.latency_ms);
+      log_prefetch_summary(*request,
+                           *sequence,
+                           dp_rank,
+                           base_tokens,
+                           target_tokens,
+                           fetched_tokens,
+                           summary);
+    }
     finalize_prefetch(
         sequence, host_block_managers_[dp_rank].get(), final_tokens, publish);
     done(std::move(request));
