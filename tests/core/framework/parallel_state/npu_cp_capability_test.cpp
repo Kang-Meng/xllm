@@ -508,24 +508,32 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                    .has_value());
   scheduler_config.enable_chunked_prefill(false);
 
+  // A default enable_mix_batch=true no longer trips the gate: the flag is
+  // inert under CP because resolve_batch_mode() force-disables mixed batches
+  // whenever cp_size > 1, so the raw value is admitted untouched (the
+  // scheduler, not the validator, owns the effective batch mode).
   scheduler_config.enable_mix_batch(true);
-  EXPECT_EQ(
-      validate_model_cp(options,
-                        EngineType::LLM,
-                        "glm5_next",
-                        /*global_world_size=*/8),
-      std::optional<std::string>(
-          "Python GLM-5 Next CP initially requires enable_mix_batch=false"));
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  EXPECT_TRUE(scheduler_config.enable_mix_batch());
   scheduler_config.enable_mix_batch(false);
 
+  // The prefix-cache ban is narrowed to the standalone shapes: a non-PD
+  // instance (whatever its role label) keeps the refusal with the scoped
+  // message, while the PD PREFILL role is admitted below.
   kv_cache_config.enable_prefix_cache(true);
   EXPECT_EQ(
       validate_model_cp(options,
                         EngineType::LLM,
                         "glm5_next",
                         /*global_world_size=*/8),
-      std::optional<std::string>("Python GLM-5 Next CP initially requires "
-                                 "enable_prefix_cache=false"));
+      std::optional<std::string>(
+          "Python GLM-5 Next CP with enable_prefix_cache=true requires "
+          "disaggregated PD with the PREFILL role; a standalone CP instance "
+          "must set enable_prefix_cache=false"));
   kv_cache_config.enable_prefix_cache(false);
 
   // M11.6: the schedule-overlap ban is lifted for glm5_next CP. The M11.5
@@ -543,15 +551,14 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                    .has_value());
 
   // The lift is scoped to overlap only: with overlap still enabled, the
-  // other initially-required flags keep refusing.
+  // other initially-required flags keep refusing (mix batch is the
+  // exception -- the flag is inert under CP, admitted above).
   scheduler_config.enable_mix_batch(true);
-  EXPECT_EQ(
-      validate_model_cp(options,
-                        EngineType::LLM,
-                        "glm5_next",
-                        /*global_world_size=*/8),
-      std::optional<std::string>(
-          "Python GLM-5 Next CP initially requires enable_mix_batch=false"));
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
   scheduler_config.enable_mix_batch(false);
 
   kv_cache_config.enable_prefix_cache(true);
@@ -560,8 +567,10 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                         EngineType::LLM,
                         "glm5_next",
                         /*global_world_size=*/8),
-      std::optional<std::string>("Python GLM-5 Next CP initially requires "
-                                 "enable_prefix_cache=false"));
+      std::optional<std::string>(
+          "Python GLM-5 Next CP with enable_prefix_cache=true requires "
+          "disaggregated PD with the PREFILL role; a standalone CP instance "
+          "must set enable_prefix_cache=false"));
   kv_cache_config.enable_prefix_cache(false);
   // Overlap stays enabled through the checks below so the PD PREFILL-role
   // admission and the pd_ooc refusal are also pinned for the overlapped
@@ -573,7 +582,35 @@ TEST(NpuCpCapabilityTest, PythonGlm5NextCapabilityGate) {
                                  "glm5_next",
                                  /*global_world_size=*/8)
                    .has_value());
+  // The admitted prefix-cache shape: the PD PREFILL role carries prefix
+  // caching (the prefill-only PD instance the kv_split admission already
+  // scopes to), including the full serving topology -- CP4 x TP2,
+  // kv_split_size=2, chunked prefill, and schedule overlap together.
+  kv_cache_config.enable_prefix_cache(true);
+  scheduler_config.enable_chunked_prefill(true);
+  options.cp_size(4);
+  parallel_config.kv_split_size(2);
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::LLM,
+                                 "glm5_next",
+                                 /*global_world_size=*/8)
+                   .has_value());
+  options.cp_size(2);
+  parallel_config.kv_split_size(1);
+  scheduler_config.enable_chunked_prefill(false);
+  // Under PD, a non-PREFILL role with prefix caching is refused by the
+  // prefix gate before the PD role gate fires (master.cpp checks the
+  // prefix scope first).
   options.instance_role(InstanceRole::DEFAULT);
+  EXPECT_EQ(validate_model_cp(options,
+                              EngineType::LLM,
+                              "glm5_next",
+                              /*global_world_size=*/8),
+            std::optional<std::string>(
+                "Python GLM-5 Next CP with enable_prefix_cache=true requires "
+                "disaggregated PD with the PREFILL role; a standalone CP "
+                "instance must set enable_prefix_cache=false"));
+  kv_cache_config.enable_prefix_cache(false);
   EXPECT_EQ(validate_model_cp(options,
                               EngineType::LLM,
                               "glm5_next",

@@ -333,13 +333,30 @@ std::optional<std::string> validate_model_cp(const Options& options,
         }
         const SchedulerConfig& scheduler_config =
             SchedulerConfig::get_instance();
-        if (scheduler_config.enable_mix_batch()) {
-          return "Python GLM-5 Next CP initially requires "
-                 "enable_mix_batch=false";
-        }
-        if (KVCacheConfig::get_instance().enable_prefix_cache()) {
-          return "Python GLM-5 Next CP initially requires "
-                 "enable_prefix_cache=false";
+        // No mix-batch gate: resolve_batch_mode() force-disables mixed
+        // batches whenever cp_size > 1 (and again for every PD prefill
+        // instance), so the raw enable_mix_batch flag -- default true -- is
+        // inert for every shape this block validates. Gating on it rejected
+        // default-flag CP launches over behavior the scheduler never runs.
+        // Prefix caching is admitted on the same prefill-only PD shape the
+        // kv_split gate above admits. A prefix-cache hit reaches the model
+        // exactly like a chunked prefill's cached suffix: a batch whose
+        // kv_seq_lens exceed q_seq_lens over blocks the block manager
+        // already allocated, which is the prefix-extended CP forward the
+        // chunked-prefill admission proved (build_cp_context's
+        // kv_gather_index covers each segment's causal prefix). The
+        // prefill-only scope keeps the DEFAULT role's decode-on-CP ranks
+        // outside the admission: decode there reads matched blocks with no
+        // CP plan, and that combination stays untested. This admission is
+        // also what makes host offload configurable for glm5_next CP:
+        // validate_host_cache_options requires prefix caching, so without
+        // this shape a CP prefill could never set --host_blocks_factor > 1.
+        if (KVCacheConfig::get_instance().enable_prefix_cache() &&
+            (!options.enable_disagg_pd() ||
+             options.instance_role() != InstanceRole::PREFILL)) {
+          return "Python GLM-5 Next CP with enable_prefix_cache=true "
+                 "requires disaggregated PD with the PREFILL role; a "
+                 "standalone CP instance must set enable_prefix_cache=false";
         }
         // Schedule overlap is admitted for glm5_next CP: the overlapped
         // decode token replacement is byte-identical across CP ranks
