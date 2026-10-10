@@ -149,6 +149,10 @@ class KVCacheStore final {
                                StoreTpLayout tp_layout) const;
   std::string build_key(const StoreEntry& entry,
                         const BlockTransferInfo& block_info) const;
+  void log_key_trace(const char* operation,
+                     const char* status,
+                     const PhysicalRequest& request,
+                     const BlockTransferInfo& info) const;
   std::vector<PhysicalRequest> build_requests(
       Slice<BlockTransferInfo>& block_transfer_info) const;
   static std::vector<RequestGroup> group_requests(

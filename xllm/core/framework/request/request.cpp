@@ -31,6 +31,8 @@ limitations under the License.
 
 #include "api_service/call.h"
 #include "common/metrics.h"
+#include "core/framework/config/disagg_pd_config.h"
+#include "core/framework/request/token_dump.h"
 #include "sequence.h"
 #include "util/env_var.h"
 #include "util/timer.h"
@@ -128,6 +130,16 @@ void Request::log_statistic(double total_latency) {
   for (const auto& seq : sequences()) {
     double ttft = seq->time_to_first_token_latency_seconds();
     const size_t gen_tokens = count_committed_generated_tokens(*seq);
+    if (DisaggPDConfig::get_instance().instance_role() == "DECODE") {
+      const size_t num_prompt_tokens = seq->num_prompt_tokens();
+      // Overlap may leave trailing negative placeholders, not committed tokens.
+      dump_request_tokens(
+          "decode",
+          request_id_,
+          idx,
+          seq->tokens().slice(0, num_prompt_tokens + gen_tokens),
+          num_prompt_tokens);
+    }
     double tpot = 0.0;
     double gen_speed = 0.0;
     if (gen_tokens > 1 && total_latency > ttft && ttft > 0) {

@@ -30,6 +30,7 @@ cc_library(
     request_state.h
     rec_type.h
     stopping_checker.h
+    token_dump.h
     priority_comparator.h
   SRCS
     dit_request.cpp
@@ -54,6 +55,7 @@ cc_library(
     sequences_group.cpp
     request_state.cpp
     stopping_checker.cpp
+    token_dump.cpp
     priority_comparator.cpp
   DEPS
     :config

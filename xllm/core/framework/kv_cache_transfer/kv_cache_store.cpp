@@ -22,10 +22,12 @@ limitations under the License.
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
+#include "util/env_var.h"
 #include "util/hash_util.h"
 #include "util/timer.h"
 
@@ -39,7 +41,44 @@ void append_key_field(std::string& key, const std::string& value) {
   key.push_back(':');
 }
 
+std::string key_to_hex(std::string_view key) {
+  constexpr char kHexDigits[] = "0123456789abcdef";
+  std::string hex(key.size() * 2, '0');
+  for (size_t index = 0; index < key.size(); ++index) {
+    const uint8_t byte = static_cast<uint8_t>(key[index]);
+    hex[index * 2] = kHexDigits[byte >> 4];
+    hex[index * 2 + 1] = kHexDigits[byte & 0x0f];
+  }
+  return hex;
+}
+
 }  // namespace
+
+void KVCacheStore::log_key_trace(const char* operation,
+                                 const char* status,
+                                 const PhysicalRequest& request,
+                                 const BlockTransferInfo& info) const {
+  if (!util::store_prefetch_stats_enabled() || config_.tp_rank != 0 ||
+      config_.cp_rank != 0) {
+    return;
+  }
+  LOG(INFO) << "[StoreKeyTrace][" << operation << "] status=" << status
+            << " tp_rank=" << config_.tp_rank << " cp_rank=" << config_.cp_rank
+            << " kv_split_size=" << config_.kv_split_size
+            << " kv_split_rank=" << config_.kv_split_rank
+            << " logical_index=" << request.logical_index
+            << " component=" << request.entry->key_component
+            << " type=" << static_cast<int32_t>(info.block_type)
+            << " checkpoint_row=" << info.checkpoint_row << " transfer_info={"
+            << info.to_string() << "}"
+            << " hash_hex="
+            << key_to_hex(std::string_view(
+                   reinterpret_cast<const char*>(info.hash_key),
+                   XXH3_128BITS_HASH_VALUE_LEN))
+            << " schema_hex=" << key_to_hex(request.entry->schema_hash)
+            << " key_bytes=" << request.key.size()
+            << " key_hex=" << key_to_hex(request.key);
+}
 
 bool KVCacheStore::init(const KVCacheStoreInitConfig& config,
                         HostCacheStoreIndex store_index) {
@@ -371,6 +410,10 @@ uint32_t KVCacheStore::batch_put(
     const RequestGroup& group = groups[group_index];
     const PhysicalRequest& request = requests[group.request_indices.front()];
     if (!request.entry->is_put_owner) {
+      log_key_trace("BatchPut",
+                    "skipped_non_owner",
+                    request,
+                    block_transfer_info[request.logical_index]);
       for (size_t request_index : group.request_indices) {
         physical_results[request_index] = 1;
       }
@@ -380,6 +423,10 @@ uint32_t KVCacheStore::batch_put(
         *request.entry,
         block_transfer_info[request.logical_index].dst_block_id);
     if (!buffer.has_value()) {
+      log_key_trace("BatchPut",
+                    "no_buffer",
+                    request,
+                    block_transfer_info[request.logical_index]);
       continue;
     }
     put_keys.emplace_back(group.key);
@@ -388,18 +435,44 @@ uint32_t KVCacheStore::batch_put(
   }
 
   if (!put_keys.empty() && backend_ != nullptr) {
+    for (size_t group_index : put_group_indices) {
+      const PhysicalRequest& request =
+          requests[groups[group_index].request_indices.front()];
+      log_key_trace("BatchPut",
+                    "submit",
+                    request,
+                    block_transfer_info[request.logical_index]);
+    }
     const std::vector<uint8_t> results =
         backend_->batch_put(put_keys, put_buffers);
-    for (size_t result_index = 0; result_index < put_group_indices.size() &&
-                                  result_index < results.size();
+    for (size_t result_index = 0; result_index < put_group_indices.size();
          ++result_index) {
-      if (results[result_index] == 0) {
+      const PhysicalRequest& request =
+          requests[groups[put_group_indices[result_index]]
+                       .request_indices.front()];
+      const bool has_result = result_index < results.size();
+      const bool success = has_result && results[result_index] != 0;
+      log_key_trace(
+          "BatchPut",
+          !has_result ? "missing_result" : (success ? "success" : "failed"),
+          request,
+          block_transfer_info[request.logical_index]);
+      if (!success) {
         continue;
       }
       for (size_t request_index :
            groups[put_group_indices[result_index]].request_indices) {
         physical_results[request_index] = 1;
       }
+    }
+  } else if (backend_ == nullptr) {
+    for (size_t group_index : put_group_indices) {
+      const PhysicalRequest& request =
+          requests[groups[group_index].request_indices.front()];
+      log_key_trace("BatchPut",
+                    "no_backend",
+                    request,
+                    block_transfer_info[request.logical_index]);
     }
   }
 
@@ -461,10 +534,22 @@ std::vector<uint8_t> KVCacheStore::batch_get_with_status(
         *request.entry,
         block_transfer_info[request.logical_index].dst_block_id);
     if (!buffer.has_value() || backend_ == nullptr) {
+      log_key_trace("BatchGet",
+                    !buffer.has_value() ? "no_buffer" : "no_backend",
+                    request,
+                    block_transfer_info[request.logical_index]);
       continue;
     }
+    log_key_trace("BatchGet",
+                  "submit",
+                  request,
+                  block_transfer_info[request.logical_index]);
     physical_results[request_index] =
         backend_->get(request.key, *buffer) ? 1 : 0;
+    log_key_trace("BatchGet",
+                  physical_results[request_index] != 0 ? "hit" : "miss",
+                  request,
+                  block_transfer_info[request.logical_index]);
     if (stats == nullptr || physical_results[request_index] == 0) {
       continue;
     }
@@ -494,6 +579,16 @@ std::vector<uint8_t> KVCacheStore::batch_exist(
   const std::vector<MooncakeReplicaTier> tiers =
       backend_->batch_query_tiers(keys);
   CHECK_EQ(tiers.size(), requests.size());
+  for (size_t request_index = 0; request_index < requests.size();
+       ++request_index) {
+    const PhysicalRequest& request = requests[request_index];
+    log_key_trace("BatchExist",
+                  tiers[request_index] != MooncakeReplicaTier::MISSING
+                      ? "present"
+                      : "missing",
+                  request,
+                  block_transfer_info[request.logical_index]);
+  }
   return aggregate_results(
       block_transfer_info.size(), requests, present_objects(tiers));
 }

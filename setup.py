@@ -1141,10 +1141,8 @@ if __name__ == "__main__":
     test_name = config.get("test_name")
     tilelang_jobs = config.get("tilelang_jobs")
 
-    if "SKIP_TEST" in os.environ:
-        BUILD_TEST_FILE = False
-    if "SKIP_EXPORT" in os.environ:
-        BUILD_EXPORT = False
+    BUILD_TEST_FILE = False
+    BUILD_EXPORT = False
 
     version = get_version()
 

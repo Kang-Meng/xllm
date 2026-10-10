@@ -1100,6 +1100,23 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
   StoragePrefetchRequest storage_request =
       build_prefetch_request(sequence, combination, host_leaves);
   storage_request.request_id = request->request_id();
+  if (util::store_prefetch_stats_enabled()) {
+    for (size_t unit_index = 0; unit_index < storage_request.units.size();
+         ++unit_index) {
+      const PrefetchUnit& unit = storage_request.units[unit_index];
+      for (const std::vector<BlockTransferInfo>* transfers :
+           {&unit.gated_blocks, &unit.non_gated_blocks}) {
+        for (const BlockTransferInfo& info : *transfers) {
+          LOG(INFO) << "[StoreKeyTrace][PrefetchSend] request_id="
+                    << storage_request.request_id << " dp_rank=" << dp_rank
+                    << " unit_index=" << unit_index
+                    << " type=" << static_cast<int32_t>(info.block_type)
+                    << " checkpoint_row=" << info.checkpoint_row
+                    << " transfer_info={" << info.to_string() << "}";
+        }
+      }
+    }
+  }
   auto storage_request_ptr = std::make_shared<const StoragePrefetchRequest>(
       std::move(storage_request));
 
@@ -1210,6 +1227,13 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
       // route publish/free.
       transfer_infos.back().block_type = block_pair->block_type;
       transfer_infos.back().checkpoint_row = block_pair->checkpoint_row;
+      if (util::store_prefetch_stats_enabled()) {
+        LOG(INFO) << "[StoreKeyTrace][OffloadSend] dp_rank=" << i
+                  << " type=" << static_cast<int32_t>(block_pair->block_type)
+                  << " checkpoint_row=" << block_pair->checkpoint_row
+                  << " transfer_info={" << transfer_infos.back().to_string()
+                  << "}";
+      }
       block_types.emplace_back(block_pair->block_type);
       block_pair.reset();
     }

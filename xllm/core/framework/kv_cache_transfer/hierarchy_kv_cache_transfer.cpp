@@ -26,6 +26,7 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/kv_cache_store.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
+#include "util/env_var.h"
 
 namespace xllm {
 namespace {
@@ -588,6 +589,15 @@ std::vector<uint8_t> HierarchyKVCacheTransfer::prefetch_kv_blocks(
                << static_cast<uint32_t>(block_transfer_info[0].transfer_type);
     return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
   }
+  if (util::store_prefetch_stats_enabled() && options_.store_worker_id() == 0) {
+    for (const BlockTransferInfo& info : block_transfer_info) {
+      LOG(INFO) << "[StoreKeyTrace][PrefetchRecv] worker_rank="
+                << options_.store_worker_id()
+                << " type=" << static_cast<int32_t>(info.block_type)
+                << " checkpoint_row=" << info.checkpoint_row
+                << " transfer_info={" << info.to_string() << "}";
+    }
+  }
   std::vector<uint8_t> hits =
       kv_cache_store_->batch_get_with_status(block_transfer_info, stats);
   const size_t hit_count =
@@ -634,6 +644,15 @@ bool HierarchyKVCacheTransfer::supports_block_type(CacheRole role,
 
 uint32_t HierarchyKVCacheTransfer::offload(
     const std::vector<BlockTransferInfo>& block_transfer_info) {
+  if (util::store_prefetch_stats_enabled() && options_.store_worker_id() == 0) {
+    for (const BlockTransferInfo& info : block_transfer_info) {
+      LOG(INFO) << "[StoreKeyTrace][OffloadRecv] worker_rank="
+                << options_.store_worker_id()
+                << " type=" << static_cast<int32_t>(info.block_type)
+                << " checkpoint_row=" << info.checkpoint_row
+                << " transfer_info={" << info.to_string() << "}";
+    }
+  }
   if (host_kv_transfer_ == nullptr) {
     return static_cast<uint32_t>(block_transfer_info.size());
   }

@@ -25,8 +25,10 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/framework/chat_template/thinking_mode_resolver.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/request/token_dump.h"
 #include "framework/request/request_state.h"
 #include "framework/request/stopping_checker.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -278,6 +280,14 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   std::vector<int> local_prompt_tokens = std::move(encoded.value());
+
+  if (DisaggPDConfig::get_instance().instance_role() == "PREFILL") {
+    dump_request_tokens("prefill",
+                        sp.request_id,
+                        /*sequence_index=*/0,
+                        local_prompt_tokens,
+                        local_prompt_tokens.size());
+  }
 
   uint32_t max_tokens = sp.max_tokens;
   if (max_tokens == 0) {
