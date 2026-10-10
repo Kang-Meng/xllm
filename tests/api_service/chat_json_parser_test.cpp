@@ -23,6 +23,7 @@ limitations under the License.
 #include "anthropic.pb.h"
 #include "api_service/utils.h"
 #include "chat.pb.h"
+#include "core/framework/chat_template/thinking_mode_resolver.h"
 #include "parser/reasoning_detector.h"
 
 namespace xllm {
@@ -391,24 +392,17 @@ TEST_F(PreprocessChatJsonTest, InvalidNestedEffortUsesTopLevel) {
   }
 }
 
-TEST_F(PreprocessChatJsonTest, NonObjectKwargsWithoutEffortPassThrough) {
+TEST_F(PreprocessChatJsonTest, RejectsNonObjectKwargsWithoutEffort) {
   LlmChatJsonParser parser;
   for (const std::string& kwargs : {"[]", "\"not an object\"", "42"}) {
     const std::string input =
         R"({"messages":[],"chat_template_kwargs":)" + kwargs + "}";
-    auto [status, processed_json] = parser.preprocess(input);
-    ASSERT_TRUE(status.ok()) << status.message();
-    EXPECT_EQ(processed_json, input);
-
-    // Preprocessing does not validate unrelated inputs; protobuf rejects an
-    // invalid Struct when decoding the request body.
-    proto::ChatRequest request;
-    google::protobuf::util::JsonParseOptions options;
-    options.ignore_unknown_fields = true;
-    EXPECT_FALSE(google::protobuf::util::JsonStringToMessage(
-                     processed_json, &request, options)
-                     .ok())
+    auto [status, result] = parser.preprocess(input);
+    EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT) << input;
+    EXPECT_NE(status.message().find("chat_template_kwargs must be an object"),
+              std::string::npos)
         << input;
+    EXPECT_TRUE(result.empty());
   }
 }
 
@@ -460,6 +454,18 @@ TEST_F(PreprocessChatJsonTest, DeepSeekV4ThinkingMatchesTemplatePrecedence) {
       {{"reasoning_effort", "none"}}, "glm47"));
   EXPECT_TRUE(api_service::get_enable_thinking_from_request(
       {{"thinking", false}, {"enable_thinking", true}}, "glm47"));
+}
+
+TEST_F(PreprocessChatJsonTest, SharedThinkingPolicyMatchesGrammarFallback) {
+  const nlohmann::json disabled = {{"reasoning_effort", "none"}};
+  EXPECT_FALSE(thinking_mode::is_enabled(disabled, "deepseek-v4"));
+  EXPECT_TRUE(thinking_mode::is_enabled(disabled, "glm47"));
+
+  const nlohmann::json conflicting = {{"thinking", false},
+                                      {"enable_thinking", true}};
+  EXPECT_FALSE(thinking_mode::is_enabled(conflicting, "deepseek-v4"));
+  EXPECT_TRUE(thinking_mode::is_enabled(conflicting, "glm47"));
+  EXPECT_FALSE(thinking_mode::is_enabled(nlohmann::json::object(), ""));
 }
 
 TEST_F(PreprocessChatJsonTest, TopLevelNoneKeepsPlainAnswerInContent) {

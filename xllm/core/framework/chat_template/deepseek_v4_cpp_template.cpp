@@ -28,7 +28,7 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
-#include "framework/chat_template/deepseek_v4_thinking_mode.h"
+#include "core/framework/chat_template/deepseek_v4_thinking_mode.h"
 
 namespace xllm {
 namespace {

@@ -7,6 +7,7 @@ cc_library (
   HDRS
     chat_template.h
     deepseek_v4_thinking_mode.h
+    thinking_mode_resolver.h
   DEPS
     :tokenizer
     nlohmann_json::nlohmann_json

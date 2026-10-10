@@ -63,6 +63,7 @@ cc_library(
     :block
     :tokenizer
     :chat_template
+    :chat_template_base
     :multimodal
     :json_object_grammar
     glog::glog
