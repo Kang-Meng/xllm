@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model_context.h"
@@ -611,8 +612,8 @@ class Mistral3ForConditionalGenerationImpl : public torch::nn::Module {
     // select 3 intermediate layers (9, 19, 29) as embeddings
     bool is_embedding_task =
         ::xllm::ModelConfig::get_instance().task() == "embed";
-    bool return_full_embeddings =
-        ::xllm::ModelConfig::get_instance().enable_return_mm_full_embeddings();
+    bool return_full_embeddings = ::xllm::MultimodalConfig::get_instance()
+                                      .enable_return_mm_full_embeddings();
     bool return_flux2_embeddings =
         model_args_.encoder_embedding_mode() ||
         (is_embedding_task && return_full_embeddings);
@@ -634,7 +635,7 @@ class Mistral3ForConditionalGenerationImpl : public torch::nn::Module {
     // Flux2 text encoder: return raw hidden states without L2 normalization
     // hidden_states shape: [3, seq_len, hidden_size] (layers 9, 19, 29)
     auto h = hidden_states;
-    if (::xllm::ModelConfig::get_instance()
+    if (::xllm::MultimodalConfig::get_instance()
             .enable_return_mm_full_embeddings()) {
       return h;
     }

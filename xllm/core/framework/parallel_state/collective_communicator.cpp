@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/parallel_state/context_parallel_topology.h"
 #include "core/platform/platform.h"
@@ -363,7 +364,7 @@ void CollectiveCommunicator::create_process_groups(
   // Encoder DP is used by multi-modal models to parallelize vision encoder
   // work inside each language-model TP group. The rank set matches the TP
   // group, but each rank runs a full encoder on different multi-modal items.
-  if (::xllm::ParallelConfig::get_instance().enable_mm_encoder_dp()) {
+  if (::xllm::MultimodalConfig::get_instance().enable_mm_encoder_dp()) {
     const int32_t encoder_dp_size = world_size / dp_size;
     port_offset = global_rank / encoder_dp_size + 1;
     encoder_dp_group_ = create_process_group(global_rank,

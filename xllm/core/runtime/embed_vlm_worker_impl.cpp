@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
@@ -92,7 +93,7 @@ std::optional<ForwardOutput> EmbedVLMWorkerImpl::step(
       input.sampling_params.is_embeddings) {
     // split full embeddings and add them to mm_embeddings
     // so that the user could receive embeddings of images and texts
-    if (::xllm::ModelConfig::get_instance()
+    if (::xllm::MultimodalConfig::get_instance()
             .enable_return_mm_full_embeddings()) {
       auto q_seq_len_vec = input.input_params.attention.host.q_seq_lens;
       torch::Tensor embeddings = hidden_states;

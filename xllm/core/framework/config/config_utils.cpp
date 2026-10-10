@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/profile_config.h"
 #include "core/framework/config/rec_config.h"
@@ -119,6 +120,7 @@ nlohmann::ordered_json build_startup_config_json() {
 
   ServiceConfig::get_instance().append_config_json(config_json);
   ModelConfig::get_instance().append_config_json(config_json);
+  MultimodalConfig::get_instance().append_config_json(config_json);
   LoadConfig::get_instance().append_config_json(config_json);
   KVCacheConfig::get_instance().append_config_json(config_json);
   KVCacheStoreConfig::get_instance().append_config_json(config_json);

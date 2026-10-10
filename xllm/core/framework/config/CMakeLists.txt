@@ -17,6 +17,7 @@ cc_library(
     kv_cache_store_config.h
     load_config.h
     model_config.h
+    multimodal_config.h
     option_category.h
     parallel_config.h
     profile_config.h
@@ -37,6 +38,7 @@ cc_library(
     kv_cache_store_config.cpp
     load_config.cpp
     model_config.cpp
+    multimodal_config.cpp
     parallel_config.cpp
     profile_config.cpp
     rec_config.cpp

@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/option_category.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/profile_config.h"
@@ -55,6 +56,7 @@ class HelpFormatter {
         kConfigOptionCategory,
         ServiceConfig::option_category(),
         ModelConfig::option_category(),
+        MultimodalConfig::option_category(),
         LoadConfig::option_category(),
         KVCacheConfig::option_category(),
         KVCacheStoreConfig::option_category(),

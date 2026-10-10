@@ -56,27 +56,13 @@ class ModelConfig final {
          "model_impl",
          "backend",
          "task",
-         "use_ctc",
          "capture_hidden_state_layer",
-         "enable_return_embedding_modality_tags",
          "python_model_path",
-         "limit_image_per_prompt",
-         "image_max_tokens_num",
-         "fps_min_frames",
-         "fps_max_frames",
-         "video_max_token_num",
-         "max_encoder_cache_size",
-         "max_processor_cache_items",
          "reasoning_parser",
          "tool_call_parser",
          "enable_qwen3_reranker",
-         "enable_return_mm_full_embeddings",
-         "mm_download_headers",
          "flashinfer_workspace_buffer_size",
-         "use_audio_in_video",
-         "use_cpp_chat_template",
-         "audio_max_upload_file_mb",
-         "audio_max_decode_duration_s"}};
+         "use_cpp_chat_template"}};
     return kOptionCategory;
   }
 
@@ -92,21 +78,7 @@ class ModelConfig final {
 
   PROPERTY(std::string, task) = "generate";
 
-  PROPERTY(bool, use_ctc) = false;
-
   PROPERTY(int32_t, capture_hidden_state_layer) = -1;
-
-  PROPERTY(bool, enable_return_embedding_modality_tags) = false;
-
-  PROPERTY(int32_t, limit_image_per_prompt) = 8;
-  PROPERTY(int32_t, image_max_tokens_num) = 0;
-  PROPERTY(int32_t, fps_min_frames) = 4;
-  PROPERTY(int32_t, fps_max_frames) = 768;
-  PROPERTY(int32_t, video_max_token_num) = -1;
-
-  PROPERTY(int64_t, max_encoder_cache_size) = 0;
-
-  PROPERTY(int64_t, max_processor_cache_items) = 256;
 
   PROPERTY(std::string, reasoning_parser);
 
@@ -114,19 +86,9 @@ class ModelConfig final {
 
   PROPERTY(bool, enable_qwen3_reranker) = false;
 
-  PROPERTY(bool, enable_return_mm_full_embeddings) = false;
-
-  PROPERTY(std::string, mm_download_headers) = "";
-
   PROPERTY(int32_t, flashinfer_workspace_buffer_size) = 128 * 1024 * 1024;
 
-  PROPERTY(bool, use_audio_in_video) = false;
-
   PROPERTY(bool, use_cpp_chat_template) = true;
-
-  PROPERTY(int32_t, audio_max_upload_file_mb) = 25;
-
-  PROPERTY(int32_t, audio_max_decode_duration_s) = 600;
 };
 
 }  // namespace xllm

@@ -63,10 +63,6 @@ DEFINE_string(
     "hccl",
     "NPU communication backend.(e.g. lccl, hccl). When enable dp, use hccl.");
 
-DEFINE_bool(enable_mm_encoder_dp,
-            false,
-            "Enable encoder data parallelism for multi-modal models.");
-
 DEFINE_bool(
     enable_multi_stream_parallel,
     false,
@@ -97,7 +93,6 @@ void ParallelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(vae_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(text_encoder_tp_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(communication_backend);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mm_encoder_dp);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(micro_batch_num);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dp_balance);
@@ -115,7 +110,6 @@ void ParallelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(vae_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(text_encoder_tp_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(communication_backend);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mm_encoder_dp);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(micro_batch_num);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dp_balance);
@@ -141,8 +135,6 @@ void ParallelConfig::append_config_json(
       config_json, default_config, text_encoder_tp_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, communication_backend);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_mm_encoder_dp);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_multi_stream_parallel);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

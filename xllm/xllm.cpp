@@ -65,6 +65,7 @@ namespace py = pybind11;
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/profile_config.h"
 #include "core/framework/config/rec_config.h"
@@ -100,6 +101,7 @@ void initialize_configs() {
   KVCacheStoreConfig::get_instance().initialize();
   LoadConfig::get_instance().initialize();
   ModelConfig::get_instance().initialize();
+  MultimodalConfig::get_instance().initialize();
   ParallelConfig::get_instance().initialize();
   ProfileConfig::get_instance().initialize();
   RecConfig::get_instance().initialize();
@@ -111,6 +113,7 @@ void initialize_configs() {
 Options create_options(const std::string& instance_name, bool is_local) {
   const ServiceConfig& service_config = ServiceConfig::get_instance();
   const ModelConfig& model_config = ModelConfig::get_instance();
+  const MultimodalConfig& mm_config = MultimodalConfig::get_instance();
   const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
   const KVCacheStoreConfig& kv_cache_store_config =
       KVCacheStoreConfig::get_instance();
@@ -148,9 +151,9 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .task_type(model_config.task())
       .draft_model_path(speculative_config.draft_model())
       .backend(model_config.backend())
-      .limit_image_per_prompt(model_config.limit_image_per_prompt())
-      .max_encoder_cache_size(model_config.max_encoder_cache_size())
-      .max_processor_cache_items(model_config.max_processor_cache_items())
+      .limit_image_per_prompt(mm_config.limit_image_per_prompt())
+      .max_encoder_cache_size(mm_config.max_encoder_cache_size())
+      .max_processor_cache_items(mm_config.max_processor_cache_items())
       .block_size(kv_cache_config.block_size())
       .max_cache_size(kv_cache_config.max_cache_size())
       .max_memory_utilization(kv_cache_config.max_memory_utilization())
@@ -1014,6 +1017,7 @@ void shutdown_handler(int signal) {
 
 void validate_config(const std::string& model_type) {
   ModelConfig& model_config = ModelConfig::get_instance();
+  MultimodalConfig& mm_config = MultimodalConfig::get_instance();
   LoadConfig& load_config = LoadConfig::get_instance();
   KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
   KVCacheStoreConfig& kv_cache_store_config =
@@ -1057,28 +1061,35 @@ void validate_config(const std::string& model_type) {
     LOG(FATAL) << "Model is not supported currently, model type: "
                << model_type;
   }
-  if (model_config.max_encoder_cache_size() < 0) {
+  if (mm_config.max_encoder_cache_size() < 0) {
     LOG(FATAL) << "max_encoder_cache_size must be >= 0.";
   }
-  if (model_config.max_processor_cache_items() < 0) {
+  if (mm_config.max_processor_cache_items() < 0) {
     LOG(FATAL) << "max_processor_cache_items must be >= 0.";
   }
-  if (model_config.image_max_tokens_num() < 0) {
+  if (mm_config.image_max_tokens_num() < 0) {
     LOG(FATAL) << "image_max_tokens_num must be >= 0.";
   }
-  if (model_config.fps_min_frames() < 0) {
+  if (mm_config.fps_min_frames() < 0) {
     LOG(FATAL) << "fps_min_frames must be >= 0.";
   }
-  if (model_config.fps_max_frames() < 0) {
+  if (mm_config.fps_max_frames() < 0) {
     LOG(FATAL) << "fps_max_frames must be >= 0.";
   }
-  if (model_config.fps_max_frames() < model_config.fps_min_frames()) {
+  if (mm_config.fps_max_frames() < mm_config.fps_min_frames()) {
     LOG(FATAL) << "fps_max_frames must be greater than or equal to "
                   "fps_min_frames.";
   }
-  if (model_config.video_max_token_num() == 0 ||
-      model_config.video_max_token_num() < -1) {
+  if (mm_config.video_max_token_num() == 0 ||
+      mm_config.video_max_token_num() < -1) {
     LOG(FATAL) << "video_max_token_num must be -1 or greater than 0.";
+  }
+  if (mm_config.audio_max_upload_file_mb() <= 0) {
+    LOG(FATAL) << "audio_max_upload_file_mb must be positive.";
+  }
+  if (mm_config.audio_max_decode_duration_s() < 0) {
+    LOG(FATAL) << "audio_max_decode_duration_s must be >= 0 (0 disables the "
+                  "limit).";
   }
 #if defined(USE_MLU)
   // Disable enable_schedule_overlap for VLM models on MLU backend

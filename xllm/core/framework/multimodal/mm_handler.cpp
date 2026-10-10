@@ -23,7 +23,7 @@ limitations under the License.
 #include <iterator>
 
 #include "common/global_flags.h"
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/util/hash_util.h"
 #include "core/util/http_downloader.h"
 #include "mm_codec.h"
@@ -36,7 +36,8 @@ namespace {
 // Parse --mm_download_headers once; it is fixed after startup.
 const std::unordered_map<std::string, std::string>& global_download_headers() {
   static const std::unordered_map<std::string, std::string> headers =
-      parse_headers_json(ModelConfig::get_instance().mm_download_headers());
+      parse_headers_json(
+          MultimodalConfig::get_instance().mm_download_headers());
   return headers;
 }
 
@@ -193,7 +194,7 @@ MMErrCode VideoHandler::load(const MMContent& content,
 }
 
 MMErrCode VideoHandler::decode(MMInputItem& input) {
-  if (::xllm::ModelConfig::get_instance().use_audio_in_video()) {
+  if (::xllm::MultimodalConfig::get_instance().use_audio_in_video()) {
     FFmpegAudioDecoder audio_decoder;
     if (audio_decoder.decode(
             input.raw_data, input.decode_audio, input.audio_meta)) {

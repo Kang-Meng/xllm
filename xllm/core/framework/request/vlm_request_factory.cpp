@@ -27,7 +27,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/common/message.h"
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -324,7 +324,8 @@ std::shared_ptr<Request> VLMRequestFactory::create(
     // is overridden on purpose.
     nlohmann::json chat_template_kwargs = sp.chat_template_kwargs;
     if (model_args_->audio_token_id() != 0) {
-      chat_template_kwargs["use_ctc"] = ModelConfig::get_instance().use_ctc();
+      chat_template_kwargs["use_ctc"] =
+          MultimodalConfig::get_instance().use_ctc();
     }
     prompt = chat_template_->apply(messages, sp.tools, chat_template_kwargs);
   }

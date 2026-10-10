@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 
@@ -154,11 +155,12 @@ class StartupConfigGuard final {
  public:
   StartupConfigGuard()
       : model_config_(ModelConfig::get_instance()),
+        mm_config_(MultimodalConfig::get_instance()),
         execution_config_(ExecutionConfig::get_instance()),
         kv_cache_config_(KVCacheConfig::get_instance()),
         scheduler_config_(SchedulerConfig::get_instance()),
         old_model_impl_(model_config_.model_impl()),
-        old_image_max_tokens_num_(model_config_.image_max_tokens_num()),
+        old_image_max_tokens_num_(mm_config_.image_max_tokens_num()),
         old_python_model_path_(model_config_.python_model_path()),
         old_python_graph_backend_(execution_config_.python_graph_backend()),
         old_enable_fia_decode_(execution_config_.enable_fia_decode()),
@@ -171,8 +173,8 @@ class StartupConfigGuard final {
 
   ~StartupConfigGuard() {
     model_config_.model_impl(old_model_impl_)
-        .image_max_tokens_num(old_image_max_tokens_num_)
         .python_model_path(old_python_model_path_);
+    mm_config_.image_max_tokens_num(old_image_max_tokens_num_);
     execution_config_.python_graph_backend(old_python_graph_backend_)
         .enable_fia_decode(old_enable_fia_decode_);
     kv_cache_config_.block_size(old_block_size_)
@@ -184,6 +186,7 @@ class StartupConfigGuard final {
 
  private:
   ModelConfig& model_config_;
+  MultimodalConfig& mm_config_;
   ExecutionConfig& execution_config_;
   KVCacheConfig& kv_cache_config_;
   SchedulerConfig& scheduler_config_;
@@ -268,6 +271,9 @@ TEST(ConfigJsonTest, FromJsonUsesParsedOverrides) {
   ModelConfig model_config;
   model_config.from_json(json);
 
+  MultimodalConfig mm_config;
+  mm_config.from_json(json);
+
   ExecutionConfig execution_config;
   execution_config.from_json(json);
 
@@ -288,7 +294,7 @@ TEST(ConfigJsonTest, FromJsonUsesParsedOverrides) {
   // recognized via is_python_model_impl(). from_json still mirrors it into the
   // matching gflag.
   EXPECT_EQ(model_config.model_impl(), "py");
-  EXPECT_EQ(model_config.image_max_tokens_num(), 384);
+  EXPECT_EQ(mm_config.image_max_tokens_num(), 384);
   EXPECT_TRUE(ModelConfig::is_python_model_impl(model_config.model_impl()));
   // model and python_model_path are command-line-only: from_json neither reads
   // them nor touches their gflags, so both keep their pre-call values.
@@ -681,10 +687,9 @@ TEST(ConfigJsonTest, DumpStartupConfigWritesNonDefaultValuesOnly) {
   DumpConfigJsonFlagGuard flag_guard(dump_path.string());
   StartupConfigGuard startup_config_guard;
 
-  ModelConfig::get_instance()
-      .model_impl("python")
-      .image_max_tokens_num(384)
-      .python_model_path("/tmp/xllm-python-model");
+  ModelConfig::get_instance().model_impl("python").python_model_path(
+      "/tmp/xllm-python-model");
+  MultimodalConfig::get_instance().image_max_tokens_num(384);
   ExecutionConfig::get_instance()
       .python_graph_backend("cudagraphs")
       .enable_fia_decode(true);

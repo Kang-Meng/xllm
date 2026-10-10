@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
 #include "core/framework/parallel_state/parallel_state.h"
@@ -393,7 +394,7 @@ py::dict PyCausalLM::build_config_dict(
   d["device"] = c10::str(device_);
   d["enable_disagg_pd"] = DisaggPDConfig::get_instance().enable_disagg_pd();
   d["enable_eplb"] = EPLBConfig::get_instance().enable_eplb();
-  d["use_ctc"] = ModelConfig::get_instance().use_ctc();
+  d["use_ctc"] = MultimodalConfig::get_instance().use_ctc();
   d["redundant_experts_num"] =
       EPLBConfig::get_instance().redundant_experts_num();
   d["eplb_use_decode_only_load"] =

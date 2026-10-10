@@ -37,7 +37,7 @@ limitations under the License.
 #include "core/common/message.h"
 #include "core/common/types.h"
 #include "core/distributed_runtime/vlm_master.h"
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_codec.h"
 #include "core/framework/multimodal/mm_type.h"
 #include "core/framework/request/request_output.h"
@@ -606,7 +606,7 @@ void SpeechToTextServiceImpl::process_async_impl(
   std::string audio_bytes;
   const uint64_t max_bytes =
       static_cast<uint64_t>(
-          ModelConfig::get_instance().audio_max_upload_file_mb()) *
+          MultimodalConfig::get_instance().audio_max_upload_file_mb()) *
       1024 * 1024;
   const Status audio_status = load_speech_audio(
       rpc_request, call->take_request_iobuf(), max_bytes, audio_bytes);
@@ -630,7 +630,7 @@ void SpeechToTextServiceImpl::process_async_impl(
     duration_s = metadata.duration;
   }
   const int32_t max_duration_s =
-      ModelConfig::get_instance().audio_max_decode_duration_s();
+      MultimodalConfig::get_instance().audio_max_decode_duration_s();
   if (max_duration_s > 0 && duration_s > static_cast<double>(max_duration_s)) {
     call->finish_with_error(StatusCode::INVALID_ARGUMENT,
                             "Maximum audio duration exceeded.");

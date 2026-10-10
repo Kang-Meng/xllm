@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "api_service/embedding_output_builder.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_embedding_handler.h"
 #include "core/framework/multimodal/mm_input.h"
 #include "core/framework/prefix_cache/block_hasher.h"
@@ -104,16 +105,18 @@ class MMEmbeddingRoundtripTest : public ::testing::Test {
  protected:
   void SetUp() override {
     ModelConfig& config = ModelConfig::get_instance();
+    MultimodalConfig& mm_config = MultimodalConfig::get_instance();
     original_task_ = config.task();
     original_return_full_embeddings_ =
-        config.enable_return_mm_full_embeddings();
-    config.task("mm_embed").enable_return_mm_full_embeddings(false);
+        mm_config.enable_return_mm_full_embeddings();
+    config.task("mm_embed");
+    mm_config.enable_return_mm_full_embeddings(false);
   }
 
   void TearDown() override {
-    ModelConfig::get_instance()
-        .task(std::move(original_task_))
-        .enable_return_mm_full_embeddings(original_return_full_embeddings_);
+    ModelConfig::get_instance().task(std::move(original_task_));
+    MultimodalConfig::get_instance().enable_return_mm_full_embeddings(
+        original_return_full_embeddings_);
   }
 
   SequenceOutput generate_output(const std::vector<XXH3Key>& keys,
@@ -158,8 +161,8 @@ class MMEmbeddingRoundtripTest : public ::testing::Test {
 
 TEST_F(MMEmbeddingRoundtripTest,
        FullSequenceEmbeddingsDoNotRequirePerImageKeys) {
-  ModelConfig::get_instance().task("embed").enable_return_mm_full_embeddings(
-      true);
+  ModelConfig::get_instance().task("embed");
+  MultimodalConfig::get_instance().enable_return_mm_full_embeddings(true);
   const std::vector<XXH3Key> all_keys = {hash_string("first"),
                                          hash_string("second")};
   for (size_t image_count = 0; image_count <= all_keys.size(); ++image_count) {

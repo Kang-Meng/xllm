@@ -17,7 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "processors/qwen2_vl_image_processor.h"
 
 namespace xllm {
@@ -31,7 +31,7 @@ constexpr int32_t kQwen3OmniMinimumImageTokens = 4;
 Qwen3OmniImageProcessor::Qwen3OmniImageProcessor(const ModelArgs& args)
     : Qwen2VLImageProcessor(args) {
   const int32_t max_tokens =
-      ::xllm::ModelConfig::get_instance().image_max_tokens_num();
+      ::xllm::MultimodalConfig::get_instance().image_max_tokens_num();
   if (max_tokens > 0) {
     CHECK_GE(max_tokens, kQwen3OmniMinimumImageTokens)
         << "image_max_tokens_num must be at least "

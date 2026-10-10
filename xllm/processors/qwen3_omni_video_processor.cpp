@@ -20,7 +20,7 @@ limitations under the License.
 #include <optional>
 #include <tuple>
 
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "processors/transforms.h"
 
 namespace xllm {
@@ -82,11 +82,11 @@ Qwen3OmniVideoProcessor::Qwen3OmniVideoProcessor(const ModelArgs& args) {
   merge_size_ = args.mm_image_merge_size();
   video_max_pixels_ = args.mm_video_max_pixels();
 
-  const ModelConfig& model_config = ModelConfig::get_instance();
-  fps_min_frames_ = model_config.fps_min_frames();
-  fps_max_frames_ = model_config.fps_max_frames();
-  if (model_config.video_max_token_num() > 0) {
-    video_max_token_num_ = model_config.video_max_token_num();
+  const MultimodalConfig& mm_config = MultimodalConfig::get_instance();
+  fps_min_frames_ = mm_config.fps_min_frames();
+  fps_max_frames_ = mm_config.fps_max_frames();
+  if (mm_config.video_max_token_num() > 0) {
+    video_max_token_num_ = mm_config.video_max_token_num();
     video_max_pixels_ = 0;
   }
 }

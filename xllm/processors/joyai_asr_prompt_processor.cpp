@@ -20,7 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstring>
 
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 
 namespace xllm {
 
@@ -35,7 +35,7 @@ JoyaiASRPromptProcessor::JoyaiASRPromptProcessor(const ModelArgs& args)
       << "joyai_asr requires audio_token_id (config.json \"audio_token_id\", "
          "e.g. 151647 for <|AUDIO|>)";
   ctc_pad_token_id_ = args.mm_audio_ctc_pad_token_id();
-  ctc_enable_ = ModelConfig::get_instance().use_ctc();
+  ctc_enable_ = MultimodalConfig::get_instance().use_ctc();
 }
 
 bool JoyaiASRPromptProcessor::process(std::string& prompt,

@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/multimodal/embedding_output.h"
@@ -638,8 +639,8 @@ void Sequence::update_mm_embeddings(
     return;
   }
   output_mm_embeddings_ = mm_embeddings;
-  if (model_args.has_value() &&
-      ModelConfig::get_instance().enable_return_embedding_modality_tags()) {
+  if (model_args.has_value() && MultimodalConfig::get_instance()
+                                    .enable_return_embedding_modality_tags()) {
     output_mm_embeddings_tags_ = generate_mm_embeddings_tags(model_args->get());
   }
   CHECK(sequence_params_.sampling_param->is_embeddings);

@@ -43,7 +43,7 @@ limitations under the License.
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/config/distributed_config.h"
-#include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/profile_config.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
@@ -414,7 +414,7 @@ void speech_to_text_http_impl(std::unique_ptr<SpeechToTextServiceImpl>& service,
       content_type,
       ctrl->request_attachment(),
       static_cast<size_t>(
-          ModelConfig::get_instance().audio_max_upload_file_mb()) *
+          MultimodalConfig::get_instance().audio_max_upload_file_mb()) *
           1024 * 1024,
       form);
   if (!parse_status.ok()) {
