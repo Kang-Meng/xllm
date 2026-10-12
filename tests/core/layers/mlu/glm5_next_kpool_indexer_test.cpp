@@ -32,6 +32,7 @@ limitations under the License.
 #include "kernels/mlu/mlu_ops_api.h"
 #include "layers/common/attention_metadata_builder.h"
 #include "layers/mlu/attention.h"
+#include "layers/mlu/deepseek_v2_attention.h"
 #include "models/llm/mlu/glm5_next_graph.h"
 #include "platform/device.h"
 #include "platform/platform.h"
@@ -1979,5 +1980,180 @@ TEST(Glm5NextKPoolIndexerTest, LongPrefillKeepsTopScoringPoolsBeyondBudget) {
       torch::matmul(keys, last_q).gt(64 * kScoreMargin).sum().item<int64_t>(),
       kSelected);
   KVCacheConfig::get_instance().block_size(saved);
+}
+
+class DeepseekV2AttentionTestPeer final {
+ public:
+  static void install_indexer(DeepseekV2AttentionImpl& attention,
+                              Glm5NextKPoolIndexer indexer) {
+    attention.has_indexer_ = true;
+    attention.use_kpool_indexer_ = true;
+    attention.glm5_next_kpool_indexer_ = std::move(indexer);
+  }
+
+  static std::optional<DsaTopkState> resolve(
+      DeepseekV2AttentionImpl& attention,
+      const torch::Tensor& positions,
+      const torch::Tensor& hidden,
+      const torch::Tensor& queries,
+      const AttentionMetadata& metadata,
+      KVCache& cache,
+      const DsaTopkState* shared = nullptr) {
+    return attention.resolve_dsa_topk_state(positions,
+                                            hidden,
+                                            queries,
+                                            metadata,
+                                            cache,
+                                            metadata.is_prefill,
+                                            shared);
+  }
+};
+
+TEST(Glm5NextKPoolIndexerTest,
+     MtpReusesFrozenSelectionAndReplaysOnlyAcceptedSpan) {
+  torch::NoGradGuard no_grad;
+  const torch::Device device(Platform::type_torch(), 0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const auto ints = options.dtype(torch::kInt32);
+  const int64_t saved_block_size = KVCacheConfig::get_instance().block_size();
+  KVCacheConfig::get_instance().block_size(16);
+  ModelArgs args;
+  args.model_type("glm5_next")
+      .hidden_size(kHidden)
+      .q_lora_rank(kRank)
+      .index_n_heads(kHeads)
+      .index_head_dim(128)
+      .qk_rope_head_dim(0)
+      .index_topk(kTopk)
+      .index_kpool(4)
+      .index_kpool_compress(true)
+      .index_kpool_always_select_tail(true)
+      .max_position_embeddings(1048576);
+  ParallelArgs parallel(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  Glm5NextKPoolIndexer indexer(args, QuantArgs(), parallel, nullptr, options);
+  torch::manual_seed(1811);
+  for (auto& parameter : indexer->named_parameters()) {
+    parameter.value().normal_(/*mean=*/0.0, /*std=*/0.1);
+  }
+  DeepseekV2AttentionImpl attention;
+  DeepseekV2AttentionTestPeer::install_indexer(attention, indexer);
+  const torch::Tensor hidden = torch::randn({16, kHidden}, options);
+  const torch::Tensor queries = torch::randn({16, kRank}, options);
+  const torch::Tensor positions = torch::arange(16, ints);
+  const torch::Tensor table = torch::tensor({{2, 0, 1, 3}}, ints);
+  const auto make_cache = [&]() {
+    return KVCache(IndexedKVCacheTensors{
+        .index_cache = torch::zeros({4, 1, 4, 128}, options),
+        .kpool_tail = torch::zeros({2, 2, 16, 128}, options)});
+  };
+  const auto make_metadata = [&](int64_t count, int64_t length) {
+    AttentionMetadata metadata{};
+    metadata.block_table = table;
+    metadata.linear_state_indices = torch::tensor({1}, ints);
+    metadata.q_seq_lens = torch::tensor({count}, ints);
+    metadata.kv_seq_lens = torch::tensor({length}, ints);
+    metadata.q_seq_lens_vec = {static_cast<int32_t>(count)};
+    metadata.kv_seq_lens_vec = {static_cast<int32_t>(length)};
+    return metadata;
+  };
+  for (const int64_t prefix : {6, 7}) {
+    for (const int64_t accepted : {0, 1, 3}) {
+      SCOPED_TRACE("prefix=" + std::to_string(prefix) +
+                   ", accepted=" + std::to_string(accepted));
+      KVCache cache = make_cache();
+      AttentionMetadata prefill = make_metadata(prefix, prefix);
+      prefill.is_prefill = true;
+      DeepseekV2AttentionTestPeer::resolve(attention,
+                                           positions.narrow(0, 0, prefix),
+                                           hidden.narrow(0, 0, prefix),
+                                           queries.narrow(0, 0, prefix),
+                                           prefill,
+                                           cache);
+      AttentionMetadata draft = make_metadata(1, prefix + 1);
+      draft.block_table = table.repeat({2, 1});
+      draft.linear_state_indices = torch::tensor({1, 0}, ints);
+      draft.q_seq_lens = torch::tensor({1, 1}, ints);
+      draft.kv_seq_lens = torch::tensor({prefix + 1, int64_t{0}}, ints);
+      draft.q_seq_lens_vec = {1, 1};
+      draft.kv_seq_lens_vec = {static_cast<int32_t>(prefix + 1), 0};
+      const auto frozen = DeepseekV2AttentionTestPeer::resolve(
+          attention,
+          torch::tensor({prefix, int64_t{0}}, ints),
+          hidden.narrow(0, prefix, 2),
+          queries.narrow(0, prefix, 2),
+          draft,
+          cache);
+      ASSERT_TRUE(frozen.has_value());
+      EXPECT_EQ(frozen->context_lens()[0].item<int32_t>(), prefix + 1);
+      EXPECT_EQ(frozen->context_lens()[1].item<int32_t>(), 0);
+      const torch::Tensor saved_cache = cache.get_index_cache().clone();
+      const torch::Tensor saved_tail = cache.get_kpool_tail().clone();
+      const torch::Tensor saved_slots = frozen->block_tables().clone();
+      for (int64_t step = 1; step <= 3; ++step) {
+        draft.kv_seq_lens[0].fill_(prefix + step + 1);
+        draft.kv_seq_lens_vec[0] = static_cast<int32_t>(prefix + step + 1);
+        const auto reused = DeepseekV2AttentionTestPeer::resolve(
+            attention,
+            torch::tensor({prefix + step, int64_t{0}}, ints),
+            hidden.narrow(0, prefix + step, 2),
+            queries.narrow(0, prefix + step, 2),
+            draft,
+            cache,
+            &*frozen);
+        ASSERT_TRUE(reused.has_value());
+        EXPECT_EQ(reused->block_tables().data_ptr(),
+                  frozen->block_tables().data_ptr());
+        EXPECT_TRUE(torch::equal(reused->block_tables(), saved_slots));
+        EXPECT_TRUE(
+            torch::equal(reused->context_lens(), frozen->context_lens()));
+        EXPECT_TRUE(torch::equal(cache.get_index_cache(), saved_cache));
+        EXPECT_TRUE(torch::equal(cache.get_kpool_tail(), saved_tail));
+      }
+      // A new round replays the accepted suffix plus the fresh base token.
+      // Rejected speculative tokens were never written to the indexer cache.
+      const int64_t replay_begin = prefix + 1;
+      const int64_t replay_count = accepted + 1;
+      const int64_t length = replay_begin + replay_count;
+      AttentionMetadata replay = make_metadata(replay_count, length);
+      replay.is_spec_verify = true;
+      const auto actual = DeepseekV2AttentionTestPeer::resolve(
+          attention,
+          positions.narrow(0, replay_begin, replay_count),
+          hidden.narrow(0, replay_begin, replay_count),
+          queries.narrow(0, replay_begin, replay_count),
+          replay,
+          cache);
+      KVCache reference = make_cache();
+      AttentionMetadata whole_prefix = make_metadata(length, length);
+      whole_prefix.is_prefill = true;
+      const auto expected =
+          DeepseekV2AttentionTestPeer::resolve(attention,
+                                               positions.narrow(0, 0, length),
+                                               hidden.narrow(0, 0, length),
+                                               queries.narrow(0, 0, length),
+                                               whole_prefix,
+                                               reference);
+      ASSERT_TRUE(actual.has_value());
+      ASSERT_TRUE(expected.has_value());
+      EXPECT_TRUE(torch::equal(
+          actual->block_tables(),
+          expected->block_tables().narrow(0, replay_begin, replay_count)));
+      EXPECT_TRUE(torch::equal(
+          actual->context_lens(),
+          expected->context_lens().narrow(0, replay_begin, replay_count)));
+      EXPECT_TRUE(torch::allclose(cache.get_index_cache(),
+                                  reference.get_index_cache(),
+                                  /*rtol=*/0.015625,
+                                  /*atol=*/0.015625));
+      EXPECT_TRUE(torch::allclose(cache.get_kpool_tail(),
+                                  reference.get_kpool_tail(),
+                                  /*rtol=*/0.015625,
+                                  /*atol=*/0.015625));
+      EXPECT_EQ(cache.get_kpool_tail()[0].count_nonzero().item<int64_t>(), 0);
+    }
+  }
+  KVCacheConfig::get_instance().block_size(saved_block_size);
 }
 }  // namespace xllm::layer

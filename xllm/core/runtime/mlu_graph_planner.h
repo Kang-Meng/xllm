@@ -43,7 +43,12 @@ struct GraphKey {
   int64_t attention_row_query_len = 1;
   bool has_input_embedding = false;
   std::vector<int64_t> multi_block_table_column_counts;
+  std::vector<int64_t> mtp_topk_schema;
 };
+
+// Data-parallel ranks agree on a plan through a fixed-size packet, so the
+// variable-length key fields share this budget.
+constexpr std::size_t kMaxGraphKeyLayoutFields = 20;
 
 bool operator==(const GraphKey& lhs, const GraphKey& rhs);
 

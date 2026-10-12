@@ -212,6 +212,37 @@ class MockCausalLM : public CausalLM {
   std::vector<int32_t> last_dp_token_nums_;
 };
 
+// An input-dependent producer and consumer make missing graph output copies,
+// stale input addresses, and accidental producer replay observable.
+class MtpSelectionModel final : public MockCausalLM {
+ public:
+  explicit MtpSelectionModel(const torch::TensorOptions& options)
+      : MockCausalLM(options) {}
+
+  ModelOutput forward(const torch::Tensor& tokens,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>& caches,
+                      const ModelInputParams& params) override {
+    ModelOutput output =
+        MockCausalLM::forward(tokens, positions, caches, params);
+    auto state = std::dynamic_pointer_cast<const mlu::model::MluMtpTopkState>(
+        params.mtp_topk_state);
+    if (state == nullptr) {
+      mlu::model::MluMtpTopkState::LayerStates layers;
+      layers.reserve(1);
+      layers.emplace_back(layer::DsaTopkState(
+          tokens.to(torch::kInt32).unsqueeze(1).repeat({1, 2}),
+          torch::ones_like(tokens, tokens.options().dtype(torch::kInt32))));
+      state = std::make_shared<mlu::model::MluMtpTopkState>(std::move(layers));
+    }
+    output.hidden_states =
+        state->layer_states()[0]->block_tables().to(torch::kFloat32) +
+        positions.to(torch::kFloat32).unsqueeze(1);
+    output.mtp_topk_state = state;
+    return output;
+  }
+};
+
 // Make optional-input branches and block-table refresh observable in replay.
 class GraphInputsModel final : public MockCausalLM {
  public:
@@ -2631,6 +2662,143 @@ TEST_F(MluGraphExecutorTest,
   impl_->run(input.token_ids, input.positions, kv_caches_, input.input_params);
   torch_mlu::synchronize();
   EXPECT_EQ(model_->forward_cnt(), 5);
+}
+
+TEST_F(MluGraphExecutorTest,
+       DraftSharedSelectionCapturesBothModesAndReplaysNewRows) {
+  for (bool has_state : {false, true}) {
+    model_ = std::make_unique<MtpSelectionModel>(tensor_options_);
+    MtpModelCapabilities capabilities;
+    capabilities.supports_grouped_mtp_graph = true;
+    capabilities.supports_native_index_share_for_iteration = true;
+    ModelRegistry::register_mtp_capabilities("test_shared_selection",
+                                             capabilities);
+    model_args_.model_type("test_shared_selection");
+    options_.is_draft_engine(true);
+    rebuild_impl();
+    auto input = prepare_inputs(/*batch_size=*/3, /*seed=*/29);
+    if (has_state) {
+      kv_caches_[0] = KVCache(LinearAttentionKVCacheTensors{
+          torch::Tensor(), torch::zeros({1}, tensor_options_)});
+    }
+    input.token_ids = torch::tensor({11, 22, 33}, input.token_ids.options());
+    auto first = impl_->run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    ASSERT_NE(first.mtp_topk_state, nullptr);
+    EXPECT_EQ(first.mtp_topk_state->num_rows(), 3);
+    auto first_native =
+        std::dynamic_pointer_cast<const mlu::model::MluMtpTopkState>(
+            first.mtp_topk_state);
+    ASSERT_NE(first_native, nullptr);
+    const torch::Tensor first_selection =
+        first_native->layer_states()[0]->block_tables().clone();
+    const torch::Tensor reorder =
+        torch::tensor({2, 0, 1}, input.token_ids.options().dtype(torch::kLong));
+    input.input_params.mtp_topk_state =
+        first.mtp_topk_state->index_select_rows(reorder);
+    input.positions.fill_(7);
+    auto reuse = impl_->run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_TRUE(torch::equal(
+        reuse.hidden_states,
+        first_selection.index_select(0, reorder).to(torch::kFloat32) + 7));
+    // A reuse step hands the caller's selection back without copying it.
+    EXPECT_EQ(reuse.mtp_topk_state.get(),
+              input.input_params.mtp_topk_state.get());
+    const int32_t expected_calls = has_state ? 4 : 2;
+    EXPECT_EQ(model_->forward_cnt(), expected_calls);
+
+    // Refresh input state within the same bucket, keeping the old returned
+    // selection alive across subsequent producer and consumer replays.
+    input.input_params.mtp_topk_state.reset();
+    input.token_ids.add_(100);
+    auto next = impl_->run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    input.input_params.mtp_topk_state = next.mtp_topk_state;
+    input.positions.fill_(9);
+    auto next_reuse = impl_->run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_TRUE(torch::equal(next_reuse.hidden_states,
+                             first_selection.to(torch::kFloat32) + 109));
+    EXPECT_TRUE(torch::equal(first_native->layer_states()[0]->block_tables(),
+                             first_selection));
+    EXPECT_EQ(model_->forward_cnt(), expected_calls);
+    kv_caches_.clear();
+  }
+}
+
+TEST_F(MluGraphExecutorTest, EmptySelectionClearsAllGraphBufferRows) {
+  using mlu::model::MluMtpTopkState;
+  MluMtpTopkState::LayerStates layers;
+  layers.reserve(1);
+  const auto ints = tensor_options_.dtype(torch::kInt32);
+  layers.emplace_back(layer::DsaTopkState(torch::full({3, 2}, 17, ints),
+                                          torch::full({3}, 2, ints)));
+  const auto source = std::make_shared<MluMtpTopkState>(std::move(layers));
+  const auto buffer = source->make_graph_buffer(/*rows=*/4);
+  buffer->update(*source);
+  const auto view =
+      std::dynamic_pointer_cast<const MluMtpTopkState>(buffer->state());
+  ASSERT_NE(view, nullptr);
+  const void* address = view->layer_states()[0]->block_tables().data_ptr();
+  const auto empty =
+      source->index_select_rows(torch::empty({0}, ints.dtype(torch::kLong)));
+  ASSERT_EQ(empty->num_rows(), 0);
+  buffer->update(*empty);
+  EXPECT_EQ(view->layer_states()[0]->block_tables().data_ptr(), address);
+  EXPECT_TRUE(torch::equal(view->layer_states()[0]->block_tables(),
+                           torch::full({4, 2}, -1, ints)));
+  EXPECT_TRUE(torch::equal(view->layer_states()[0]->context_lens(),
+                           torch::zeros({4}, ints)));
+}
+
+TEST_F(MluGraphExecutorTest,
+       SharedSelectionBuffersClearPaddedRowsWithoutMovingAddresses) {
+  using mlu::model::MluMtpTopkState;
+  MluMtpTopkState::LayerStates layers;
+  layers.reserve(2);
+  layers.emplace_back(layer::DsaTopkState(
+      torch::full({3, 2}, 17, tensor_options_.dtype(torch::kInt32)),
+      torch::full({3}, 2, tensor_options_.dtype(torch::kInt32))));
+  layers.emplace_back(std::nullopt);
+  const auto source = std::make_shared<MluMtpTopkState>(std::move(layers));
+  const auto buffer = source->make_graph_buffer(/*rows=*/4);
+  buffer->update(*source);
+  const auto view =
+      std::dynamic_pointer_cast<const MluMtpTopkState>(buffer->state());
+  ASSERT_NE(view, nullptr);
+  const void* address = view->layer_states()[0]->block_tables().data_ptr();
+  EXPECT_EQ(buffer->tensor_bytes(), 4 * (2 + 1) * sizeof(int32_t));
+  auto small = std::dynamic_pointer_cast<const MluMtpTopkState>(
+      source->index_select_rows(
+          torch::tensor({2}, tensor_options_.dtype(torch::kLong))));
+  buffer->update(*small);
+  EXPECT_EQ(address, view->layer_states()[0]->block_tables().data_ptr());
+  EXPECT_TRUE(torch::equal(
+      view->layer_states()[0]->block_tables().slice(0, 1),
+      torch::full({3, 2}, -1, tensor_options_.dtype(torch::kInt32))));
+  EXPECT_TRUE(torch::equal(
+      view->layer_states()[0]->context_lens(),
+      torch::tensor({2, 0, 0, 0}, tensor_options_.dtype(torch::kInt32))));
+  EXPECT_FALSE(view->layer_states()[1].has_value());
+  EXPECT_TRUE(torch::equal(
+      source->layer_states()[0]->block_tables(),
+      torch::full({3, 2}, 17, tensor_options_.dtype(torch::kInt32))));
+  EXPECT_EQ(buffer->state().get(), view.get());
+  EXPECT_EQ(buffer->tensor_bytes(), 4 * (2 + 1) * sizeof(int32_t));
+
+  // A snapshot keeps the leading rows after the buffer is overwritten.
+  const auto snapshot = std::dynamic_pointer_cast<const MluMtpTopkState>(
+      buffer->snapshot(/*rows=*/1));
+  ASSERT_NE(snapshot, nullptr);
+  buffer->update(*source->index_select_rows(
+      torch::tensor({0, 1}, tensor_options_.dtype(torch::kLong))));
+  view->layer_states()[0]->block_tables().fill_(5);
+  EXPECT_EQ(snapshot->num_rows(), 1);
+  EXPECT_TRUE(torch::equal(
+      snapshot->layer_states()[0]->block_tables(),
+      torch::full({1, 2}, 17, tensor_options_.dtype(torch::kInt32))));
+  EXPECT_FALSE(snapshot->layer_states()[1].has_value());
 }
 
 }  // namespace xllm

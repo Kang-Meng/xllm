@@ -29,6 +29,7 @@ limitations under the License.
 #include <memory>
 #include <numeric>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/execution_config.h"
@@ -37,6 +38,7 @@ limitations under the License.
 #include "core/runtime/executor.h"
 #include "core/runtime/mlu_graph_executor_impl.h"
 #include "core/runtime/options.h"
+#include "models/llm/mlu/mtp_topk_state.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 #include "util/net.h"
@@ -55,6 +57,9 @@ enum class Scenario : int8_t {
   PLAN_MISMATCH,
   EMBEDDING_MISMATCH,
   PARTIAL_HIT,
+  MTP_MODE_MISMATCH,
+  MTP_SCHEMA_MISMATCH,
+  MTP_PARTIAL_HIT,
   VLM_ALL_SUPPORTED,
   VLM_ONE_REJECTED,
   VLM_PARTIAL_HIT,
@@ -64,10 +69,11 @@ enum class ChildOutcome : int8_t { PASSED, SKIPPED, FAILED };
 
 class CountingModel final : public CausalVLM {
  public:
-  explicit CountingModel(const torch::TensorOptions& options)
-      : options_(options) {}
+  explicit CountingModel(const torch::TensorOptions& options,
+                         bool share_topk = false)
+      : options_(options), share_topk_(share_topk) {}
 
-  ModelOutput forward(const torch::Tensor& /*tokens*/,
+  ModelOutput forward(const torch::Tensor& tokens,
                       const torch::Tensor& /*positions*/,
                       std::vector<KVCache>& /*kv_caches*/,
                       const ModelInputParams& params) override {
@@ -76,7 +82,26 @@ class CountingModel final : public CausalVLM {
         params.embedding.input_embedding.defined()
             ? params.embedding.input_embedding
             : torch::zeros({params.meta.num_sequences, kHiddenSize}, options_);
-    return ModelOutput(input + 1);
+    if (!share_topk_) {
+      return ModelOutput(input + 1);
+    }
+    auto state = std::dynamic_pointer_cast<const model::MluMtpTopkState>(
+        params.mtp_topk_state);
+    if (state == nullptr) {
+      model::MluMtpTopkState::LayerStates layers;
+      layers.reserve(1);
+      layers.emplace_back(layer::DsaTopkState(
+          tokens.to(torch::kInt32).unsqueeze(1).repeat({1, 2}),
+          torch::ones_like(tokens, tokens.options().dtype(torch::kInt32))));
+      state = std::make_shared<model::MluMtpTopkState>(std::move(layers));
+    }
+    ModelOutput output(input + state->layer_states()[0]
+                                   ->block_tables()
+                                   .select(1, 0)
+                                   .to(input.scalar_type())
+                                   .unsqueeze(1));
+    output.mtp_topk_state = std::move(state);
+    return output;
   }
 
   MMDict encode(const ModelInputParams& /*params*/) override { return {}; }
@@ -104,6 +129,7 @@ class CountingModel final : public CausalVLM {
  private:
   torch::TensorOptions options_;
   int32_t forward_count_ = 0;
+  bool share_topk_ = false;
 };
 
 struct StepInput {
@@ -210,6 +236,98 @@ void verify_group(ProcessGroup& group,
   CHECK_EQ(gathered[1].item<int64_t>(), 1);
 }
 
+void set_topk_input(StepInput& input,
+                    int32_t rank,
+                    int32_t step,
+                    bool reuse,
+                    int64_t columns) {
+  set_embedding(input, rank, step);
+  input.tokens.fill_(rank + step + 10);
+  input.params.mtp_topk_state.reset();
+  if (!reuse) {
+    return;
+  }
+  model::MluMtpTopkState::LayerStates layers;
+  layers.reserve(1);
+  layers.emplace_back(
+      layer::DsaTopkState(torch::full({input.tokens.size(0), columns},
+                                      rank + step + 20,
+                                      input.tokens.options()),
+                          torch::ones_like(input.tokens)));
+  input.params.mtp_topk_state =
+      std::make_shared<model::MluMtpTopkState>(std::move(layers));
+}
+
+void run_topk_step(MluGraphExecutorImpl& executor, StepInput& input) {
+  const auto source = std::dynamic_pointer_cast<const model::MluMtpTopkState>(
+      input.params.mtp_topk_state);
+  const torch::Tensor selection =
+      source == nullptr ? input.tokens.unsqueeze(1).repeat({1, 2})
+                        : source->layer_states()[0]->block_tables();
+  const ModelOutput output = executor.run(
+      input.tokens, input.positions, input.kv_caches, input.params);
+  const torch::Tensor expected =
+      input.params.embedding.input_embedding +
+      selection.select(1, 0).to(torch::kBFloat16).unsqueeze(1);
+  CHECK(torch::equal(output.hidden_states.to(torch::kCPU),
+                     expected.to(torch::kCPU)))
+      << "MTP graph/eager must consume this rank's current selection";
+  const auto result = std::dynamic_pointer_cast<const model::MluMtpTopkState>(
+      output.mtp_topk_state);
+  CHECK(result != nullptr);
+  CHECK(torch::equal(result->layer_states()[0]->block_tables().to(torch::kCPU),
+                     selection.to(torch::kCPU)))
+      << "MTP graph/eager must return this rank's current selection";
+}
+
+void run_topk_scenario(Scenario scenario,
+                       int32_t rank,
+                       const torch::Device& device,
+                       ProcessGroup& group) {
+  const auto hidden =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  CountingModel model(hidden, /*share_topk=*/true);
+  MtpModelCapabilities capabilities;
+  capabilities.supports_grouped_mtp_graph = true;
+  capabilities.supports_native_index_share_for_iteration = true;
+  ModelRegistry::register_mtp_capabilities("test_dp_shared_selection",
+                                           capabilities);
+  ModelArgs args;
+  args.model_type("test_dp_shared_selection")
+      .dtype("bfloat16")
+      .hidden_size(kHiddenSize)
+      .max_position_embeddings(8192);
+  runtime::Options options;
+  options.block_size(16)
+      .dp_size(kWorldSize)
+      .world_size(kWorldSize)
+      .is_draft_engine(true);
+  MluGraphExecutorImpl executor(&model, args, device, options);
+  StepInput input = make_input(rank, device, /*batch_size=*/3);
+  const bool reuse = scenario != Scenario::MTP_MODE_MISMATCH || rank != 0;
+  const int64_t columns =
+      scenario == Scenario::MTP_SCHEMA_MISMATCH && rank == 1 ? 4 : 2;
+  const bool partial_hit = scenario == Scenario::MTP_PARTIAL_HIT;
+  // Prove each mismatching layout works locally. For partial hits only rank 0
+  // owns a graph before attaching the real two-rank agreement group.
+  if (!partial_hit || rank == 0) {
+    set_topk_input(input, rank, /*step=*/0, reuse, columns);
+    run_topk_step(executor, input);
+    set_topk_input(input, rank, /*step=*/1, reuse, columns);
+    run_topk_step(executor, input);
+    CHECK_EQ(model.forward_count(), 1) << "Local MTP replay must work first";
+  }
+  executor.set_dp_process_group(&group);
+  for (int32_t step = 2; step <= 3; ++step) {
+    set_topk_input(input, rank, step, reuse, columns);
+    run_topk_step(executor, input);
+    const int32_t expected_calls = partial_hit ? (rank == 0 ? 2 : 1) : step;
+    CHECK_EQ(model.forward_count(), expected_calls)
+        << "Mismatched ranks must stay eager; partial hits must capture "
+           "together then replay";
+  }
+}
+
 int32_t run_child(Scenario scenario, int32_t rank, int32_t port) {
   try {
     if (Platform::device_count() < kWorldSize) {
@@ -229,6 +347,12 @@ int32_t run_child(Scenario scenario, int32_t rank, int32_t port) {
                              device);
     CHECK(group);
     verify_group(*group, rank, device);
+    if (scenario == Scenario::MTP_MODE_MISMATCH ||
+        scenario == Scenario::MTP_SCHEMA_MISMATCH ||
+        scenario == Scenario::MTP_PARTIAL_HIT) {
+      run_topk_scenario(scenario, rank, device, *group);
+      return 0;
+    }
 
     const auto hidden =
         torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -453,6 +577,18 @@ TEST(MluGraphDpCollectiveTest, DifferentEmbeddingPresenceMakesAllRunEager) {
 
 TEST(MluGraphDpCollectiveTest, PartialCacheHitRecapturesThenReplays) {
   run_scenario(Scenario::PARTIAL_HIT);
+}
+
+TEST(MluGraphDpCollectiveTest, MtpProducerAndReuseRanksBothRunEager) {
+  run_scenario(Scenario::MTP_MODE_MISMATCH);
+}
+
+TEST(MluGraphDpCollectiveTest, DifferentMtpSchemasMakeAllRanksRunEager) {
+  run_scenario(Scenario::MTP_SCHEMA_MISMATCH);
+}
+
+TEST(MluGraphDpCollectiveTest, MtpPartialCacheHitRecapturesThenReplays) {
+  run_scenario(Scenario::MTP_PARTIAL_HIT);
 }
 
 TEST(MluGraphDpCollectiveTest, VlmAllRanksCaptureThenReplay) {

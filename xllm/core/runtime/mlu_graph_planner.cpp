@@ -28,11 +28,43 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/model/mtp_topk_state.h"
 #include "core/runtime/decode_graph_bucket.h"
 
 namespace {
 using xllm::mlu::get_block_capacity;
 using xllm::mlu::GraphLayout;
+
+// Producer steps have no shared state and use the reserved empty schema. Reuse
+// steps must satisfy the engine's fixed capability and this step's input
+// contract; nullopt keeps an unsupported step on the eager path.
+std::optional<std::vector<int64_t>> plan_topk_schema(
+    const xllm::mlu::GraphStepMetadata& step,
+    const xllm::mlu::GraphPlannerConfig& config) {
+  const auto& state = step.params.mtp_topk_state;
+  if (state == nullptr) {
+    return std::vector<int64_t>{};
+  }
+  if (!config.options.is_draft_engine() ||
+      !config.capabilities.supports_grouped_mtp_graph ||
+      !config.capabilities.supports_native_index_share_for_iteration) {
+    return std::nullopt;
+  }
+  const auto topk =
+      std::dynamic_pointer_cast<const xllm::MtpTopkGraphState>(state);
+  // Query lengths identify the graph attention input device; reuse state must
+  // be on that device before graph-owned buffers are allocated or updated.
+  const auto& q_seq_lens = step.params.attention.device.q_seq_lens;
+  if (topk == nullptr || topk->num_rows() != step.tokens ||
+      !q_seq_lens.defined() || topk->device() != q_seq_lens.device()) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> schema = topk->graph_schema();
+  if (schema.empty()) {
+    return std::nullopt;
+  }
+  return schema;
+}
 
 uint32_t get_bucket_num_tokens(uint32_t num_tokens,
                                const xllm::runtime::Options& options) {
@@ -277,12 +309,14 @@ bool operator==(const GraphKey& lhs, const GraphKey& rhs) {
                   lhs.padded_num_reqs,
                   lhs.attention_row_query_len,
                   lhs.has_input_embedding,
-                  lhs.multi_block_table_column_counts) ==
+                  lhs.multi_block_table_column_counts,
+                  lhs.mtp_topk_schema) ==
          std::tie(rhs.padded_num_tokens,
                   rhs.padded_num_reqs,
                   rhs.attention_row_query_len,
                   rhs.has_input_embedding,
-                  rhs.multi_block_table_column_counts);
+                  rhs.multi_block_table_column_counts,
+                  rhs.mtp_topk_schema);
 }
 
 std::size_t GraphKeyHash::operator()(const GraphKey& key) const {
@@ -299,6 +333,10 @@ std::size_t GraphKeyHash::operator()(const GraphKey& key) const {
     hash_value(column_count);
   }
   hash_value(key.multi_block_table_column_counts.size());
+  for (int64_t value : key.mtp_topk_schema) {
+    hash_value(value);
+  }
+  hash_value(key.mtp_topk_schema.size());
   return seed;
 }
 
@@ -313,12 +351,16 @@ GraphDecision MluGraphPlanner::plan(const GraphStepMetadata& step) const {
   if (!allows_graph_mode(options, config_.capabilities, params)) {
     return EagerReason::NON_DECODE;
   }
+  std::optional<std::vector<int64_t>> topk_schema =
+      plan_topk_schema(step, config_);
+  if (!topk_schema.has_value()) {
+    return EagerReason::UNSUPPORTED_INPUT;
+  }
   const bool grouped = config_.capabilities.supports_grouped_mtp_graph &&
                        (config_.state_required || options.is_draft_engine() ||
                         params.is_spec_verify);
-  if (params.mtp_topk_state != nullptr ||
-      (grouped ? !supports_grouped_graph(options, params)
-               : !supports_ordinary_graph(options, params))) {
+  if (grouped ? !supports_grouped_graph(options, params)
+              : !supports_ordinary_graph(options, params)) {
     return EagerReason::UNSUPPORTED_INPUT;
   }
   std::optional<GraphLayout> layout = get_graph_layout(
@@ -344,10 +386,15 @@ GraphDecision MluGraphPlanner::plan(const GraphStepMetadata& step) const {
   key.padded_num_reqs = layout->padded_num_reqs;
   key.attention_row_query_len = layout->attention_row_query_len;
   key.has_input_embedding = params.embedding.input_embedding.defined();
+  key.mtp_topk_schema = std::move(*topk_schema);
   key.multi_block_table_column_counts.reserve(params.multi_block_tables.size());
   for (const torch::Tensor& table : params.multi_block_tables) {
     CHECK_EQ(table.dim(), 2);
     key.multi_block_table_column_counts.push_back(table.size(1));
+  }
+  if (key.multi_block_table_column_counts.size() + key.mtp_topk_schema.size() >
+      kMaxGraphKeyLayoutFields) {
+    return EagerReason::UNSUPPORTED_INPUT;
   }
   const int64_t main_columns =
       capacity > 0 ? get_block_capacity(capacity, options.block_size()) +

@@ -28,7 +28,6 @@ limitations under the License.
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/model/rec_causal_lm.h"
 #include "core/platform/device.h"
-#include "core/platform/platform.h"
 #include "core/runtime/options.h"
 #include "core/util/model_config_utils.h"
 #include "models/llm/glm5_next_mtp_args.h"
@@ -599,7 +598,7 @@ TEST(HFModelLoaderTest, MtpModelLoadsExplicitAndLegacyCheckpointOffsets) {
 }
 #endif
 
-TEST(HFModelLoaderTest, GlmMtpAdapterLimitsOnlyNativeMluReuse) {
+TEST(HFModelLoaderTest, GlmMtpAdapterPreservesIterationSharingForAllBackends) {
   for (const bool is_python_model : {false, true}) {
     ModelArgs args;
     args.model_type("glm5_next")
@@ -610,13 +609,8 @@ TEST(HFModelLoaderTest, GlmMtpAdapterLimitsOnlyNativeMluReuse) {
         args, "MTP", /*is_draft_engine=*/true, is_python_model);
     EXPECT_EQ(args.n_layers(), 1);
     EXPECT_EQ(args.mtp_start_layer_idx(), 45);
-    if (Platform::is_mlu() && !is_python_model) {
-      EXPECT_FALSE(args.index_share_for_mtp_iteration());
-      EXPECT_TRUE(args.index_topk_pattern().empty());
-    } else {
-      EXPECT_TRUE(args.index_share_for_mtp_iteration());
-      EXPECT_EQ(args.index_topk_pattern(), "S");
-    }
+    EXPECT_TRUE(args.index_share_for_mtp_iteration());
+    EXPECT_EQ(args.index_topk_pattern(), "S");
     ModelRegistry::configure_mtp_args(
         args, "MTP", /*is_draft_engine=*/true, is_python_model);
     EXPECT_EQ(args.n_layers(), 1);

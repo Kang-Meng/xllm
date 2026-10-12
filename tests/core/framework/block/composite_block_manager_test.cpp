@@ -96,6 +96,13 @@ void set_swa_capacity_for_token_budget(BlockManager::Options* options,
 constexpr uint32_t kBaseBlockSize = 128;
 constexpr uint32_t kCompressedUnitTokens = kCompressedBlockTokenSize;
 
+// Shortest repeated prompt, no shorter than `min_units` compressed units, whose
+// exact-repeat hit still spans one SWA window after dropping the last unit.
+inline size_t RepeatHitPromptTokens(size_t min_units, uint32_t window_size) {
+  return std::max<size_t>(min_units * kCompressedUnitTokens,
+                          window_size + kCompressedUnitTokens);
+}
+
 inline size_t CeilBlocks(size_t num_tokens, size_t block_size) {
   return (num_tokens + block_size - 1) / block_size;
 }
@@ -860,7 +867,9 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheHitOnRepeatedPrefix) {
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
   // max_tokens_per_batch has to accommodate the prompt so allocate_sequence
   // does not exceed the SWA burst budget.
-  set_swa_capacity_for_token_budget(&opts, 3 * kCompressedUnitTokens);
+  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/2, window_size);
+  set_swa_capacity_for_token_budget(
+      &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   ASSERT_TRUE(opts.enable_prefix_cache());
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
@@ -868,7 +877,6 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheHitOnRepeatedPrefix) {
   // multiple full blocks worth of cacheable prefix. Mark all tokens as
   // forwarded so the pre-grow hook (fired during the NEXT allocate) has data
   // to insert -- and we drive one extra allocate to trigger it explicitly.
-  const size_t num_tokens = 2 * kCompressedUnitTokens;
   const std::vector<int32_t> prompt(num_tokens, 7);
   Sequence seq_first = MakeTestSequence(0, prompt);
   ASSERT_TRUE(manager.allocate_sequence(&seq_first, num_tokens));
@@ -927,7 +935,8 @@ TEST(CompositeBlockManagerTest,
     manager.deallocate_for_sequence(&cold);
     cold.reset();
 
-    const size_t published_units = prompt_tokens / unit_tokens;
+    // The default TEXT hasher has no lookahead, so every cold token publishes.
+    const size_t published_units = cold_prompt.size() / unit_tokens;
     EXPECT_EQ(manager.leaf_entries()
                   .at(BlockType::C4)
                   .leaf->num_blocks_in_prefix_cache(),
@@ -1024,14 +1033,15 @@ TEST(CompositeBlockManagerTest, SlidingWindowSlidOutBlocksEnterPrefixCache) {
   const uint32_t max_seqs_per_batch = 4;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  set_swa_capacity_for_token_budget(&opts, 3 * kCompressedUnitTokens);
+  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/2, window_size);
+  set_swa_capacity_for_token_budget(
+      &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   ASSERT_TRUE(opts.enable_prefix_cache());
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
   // Prompt spans two full compressed units so the min-across-leaves gate can
   // survive AND the exact-repeat pop (one compressed unit) still leaves shared
   // blocks behind. A single-c128 prompt would end up entirely popped.
-  const size_t num_tokens = 2 * kCompressedUnitTokens;
   const std::vector<int32_t> prompt(num_tokens, 7);
   Sequence seq_first = MakeTestSequence(0, prompt);
   ASSERT_TRUE(manager.allocate_sequence(&seq_first, num_tokens));
@@ -1130,7 +1140,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCachePostGrowCursorAdvances) {
   EXPECT_EQ(manager.leaf_entries()
                 .at(BlockType::SWA)
                 .leaf->num_blocks_in_prefix_cache(),
-            4u);
+            std::min<size_t>(window_size, chunk) / kBaseBlockSize);
   EXPECT_EQ(manager.leaf_entries()
                 .at(BlockType::C4)
                 .leaf->num_blocks_in_prefix_cache(),
@@ -1144,6 +1154,9 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCachePostGrowCursorAdvances) {
 }
 
 TEST(CompositeBlockManagerTest, Dsv4PrefixCacheSkipsPartialCacheUnitTail) {
+#if defined(USE_MLU)
+  GTEST_SKIP() << "Requires a compressed unit larger than the base block";
+#endif
   const uint32_t base_num_blocks = 4096;
   const uint32_t window_size = kBaseBlockSize;
   const uint32_t max_seqs_per_batch = 4;
@@ -1190,10 +1203,11 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheExactRepeatPopsOneC128) {
   const uint32_t max_seqs_per_batch = 4;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  set_swa_capacity_for_token_budget(&opts, 4 * kCompressedUnitTokens);
+  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/3, window_size);
+  set_swa_capacity_for_token_budget(
+      &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
-  const size_t num_tokens = 3 * kCompressedUnitTokens;
   const std::vector<int32_t> prompt(num_tokens, 42);
   Sequence seq_first = MakeTestSequence(0, prompt);
   ASSERT_TRUE(manager.allocate_sequence(&seq_first, num_tokens));
@@ -1256,14 +1270,15 @@ TEST(CompositeBlockManagerTest, DecodeRoleSkipsSwaPrefixCache) {
   const uint32_t max_seqs_per_batch = 4;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  set_swa_capacity_for_token_budget(&opts, 3 * kCompressedUnitTokens);
+  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/2, window_size);
+  set_swa_capacity_for_token_budget(
+      &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   // First seed the cache under a PREFILL role so all three leaves publish
   // their blocks -- then swap in a DECODE-role composite that shares the
   // hash space via the same leaf construction path.
   ASSERT_TRUE(opts.enable_prefix_cache());
   {
     CompositeBlockManager prefill_manager(build_composite_leaves(opts), opts);
-    const size_t num_tokens = 2 * kCompressedUnitTokens;
     const std::vector<int32_t> prompt(num_tokens, 7);
     Sequence seq_seed = MakeTestSequence(0, prompt);
     ASSERT_TRUE(prefill_manager.allocate_sequence(&seq_seed, num_tokens));
@@ -1289,7 +1304,6 @@ TEST(CompositeBlockManagerTest, DecodeRoleSkipsSwaPrefixCache) {
   decode_opts.instance_is_decode(true);
   CompositeBlockManager decode_manager(build_composite_leaves(decode_opts),
                                        decode_opts);
-  const size_t num_tokens = 2 * kCompressedUnitTokens;
   const std::vector<int32_t> prompt(num_tokens, 7);
   Sequence seq_d = MakeTestSequence(2, prompt);
   decode_manager.allocate_shared_for_sequence(&seq_d);

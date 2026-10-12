@@ -17,8 +17,10 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace xllm {
 
@@ -37,6 +39,33 @@ class MtpTopkState {
   virtual MtpTopkStatePtr to(const torch::Device& device) const = 0;
   virtual MtpTopkStatePtr index_select_rows(
       const torch::Tensor& index) const = 0;
+};
+
+// A graph owns the writable storage; model inputs only receive a read-only
+// state view. Updates preserve addresses and clear unused rows.
+class MtpTopkGraphBuffer {
+ public:
+  virtual ~MtpTopkGraphBuffer() = default;
+  virtual MtpTopkStatePtr state() const = 0;
+  virtual void update(const MtpTopkState& source) = 0;
+  // Copies the leading rows into storage that later updates cannot reach.
+  virtual MtpTopkStatePtr snapshot(int64_t rows) const = 0;
+  virtual std::size_t tensor_bytes() const = 0;
+};
+
+// Optional graph contract. Eager-only backends continue to implement just
+// MtpTopkState. The schema is an opaque, deterministic sequence of layout
+// identifiers: equal schemas must support the same captured operations at a
+// fixed row capacity. Runtime compares it without interpreting payload fields.
+// The empty schema is reserved for steps without shared state, so a state that
+// can be captured must return a non-empty one. A step that receives a state
+// must return that selection unchanged: graphs hand the caller's input back
+// instead of buffering a second copy.
+class MtpTopkGraphState : public MtpTopkState {
+ public:
+  virtual std::vector<int64_t> graph_schema() const = 0;
+  virtual std::unique_ptr<MtpTopkGraphBuffer> make_graph_buffer(
+      int64_t rows) const = 0;
 };
 
 }  // namespace xllm

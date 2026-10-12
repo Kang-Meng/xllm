@@ -91,6 +91,8 @@ class DeepseekV2AttentionImpl : public torch::nn::Module {
   void verify_loaded_weights() const;
 
  private:
+  friend class DeepseekV2AttentionTestPeer;
+
   std::string weight_prefix_;
   struct HeadInfo {
     int64_t attn = 1;

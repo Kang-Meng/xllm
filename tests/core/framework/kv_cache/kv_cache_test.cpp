@@ -485,8 +485,11 @@ TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
   ExpectTensorGroup(caches[2], KVCacheTensorRole::WINDOW, BlockType::SWA);
   ExpectTensorGroup(caches[2], KVCacheTensorRole::KEY, BlockType::C2);
   ExpectTensorGroup(caches[2], KVCacheTensorRole::INDEX, BlockType::C2);
+#if !defined(USE_MLU)
+  // MLU exports only the packed compressor state, which V4.1 never allocates.
   ExpectTensorGroup(caches[2], KVCacheTensorRole::KV_STATE, BlockType::SWA);
   ExpectTensorGroup(caches[2], KVCacheTensorRole::SCORE_STATE, BlockType::SWA);
+#endif
   ExpectTensorGroup(caches[4], KVCacheTensorRole::KEY, BlockType::C1);
   ExpectTensorGroup(caches[4], KVCacheTensorRole::INDEX, BlockType::C1);
 }
@@ -1043,6 +1046,12 @@ TEST_F(HostKVCacheTest, HostKVCacheDeepSeekV4PerBlockType) {
   const Dsv4CacheGeometry geometry;
   const int64_t c4_physical_dim = geometry.c4_physical_dim();
   const int64_t c128_physical_dim = geometry.c128_physical_dim();
+  // Host tensors insert the layer dim at index 1 of the device block shape.
+#if defined(USE_MLU)
+  constexpr int64_t kHostTokenDim = 3;
+#else
+  constexpr int64_t kHostTokenDim = 2;
+#endif
 
   KVCacheCapacity capacity;
   capacity.block_size(kBlockSize)
@@ -1086,8 +1095,10 @@ TEST_F(HostKVCacheTest, HostKVCacheDeepSeekV4PerBlockType) {
   ASSERT_TRUE(c4_tensors.count(KVCacheTensorRole::INDEX) > 0);
   EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::KEY).size(0),
             scale_host_block_count(kC4Count, kHostFactor));
-  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::KEY).size(2), c4_physical_dim);
-  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::INDEX).size(2), c4_physical_dim);
+  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::KEY).size(kHostTokenDim),
+            c4_physical_dim);
+  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::INDEX).size(kHostTokenDim),
+            c4_physical_dim);
   EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::INDEX).scalar_type(),
             get_dsv4_cache_policy(options.dtype()).index_dtype);
   const std::optional<torch::Tensor> c4_scale =
@@ -1104,7 +1115,8 @@ TEST_F(HostKVCacheTest, HostKVCacheDeepSeekV4PerBlockType) {
   EXPECT_TRUE(c128_tensors.count(KVCacheTensorRole::INDEX) == 0);
   EXPECT_EQ(c128_tensors.at(KVCacheTensorRole::KEY).size(0),
             scale_host_block_count(kC128Count, kHostFactor));
-  EXPECT_EQ(c128_tensors.at(KVCacheTensorRole::KEY).size(2), c128_physical_dim);
+  EXPECT_EQ(c128_tensors.at(KVCacheTensorRole::KEY).size(kHostTokenDim),
+            c128_physical_dim);
 }
 
 TEST_F(HostKVCacheTest, DeepSeekV4HostSwaCapacityTracksCheckpointWindow) {

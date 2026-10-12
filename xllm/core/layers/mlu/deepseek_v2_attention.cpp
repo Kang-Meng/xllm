@@ -503,6 +503,10 @@ std::optional<DsaTopkState> DeepseekV2AttentionImpl::resolve_dsa_topk_state(
 
   std::optional<DsaTopkState> topk_state;
   if (external_topk != nullptr) {
+    // MTP reuses the complete expanded selection for the remaining proposal
+    // steps, including its original tail. Do not rerun the KPool indexer or
+    // append newly proposed tokens here. Accepted-span replay fills the draft
+    // index cache before the next proposal computes a fresh selection.
     topk_state = *external_topk;
   } else if (has_indexer_) {
     torch::Tensor index_cache = kv_cache.get_index_cache();

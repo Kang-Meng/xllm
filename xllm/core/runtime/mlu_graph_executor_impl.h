@@ -26,6 +26,7 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "core/framework/model/mtp_topk_state.h"
 #include "core/runtime/executor_impl.h"
 #include "core/runtime/executor_impl_factory.h"
 #include "core/runtime/mlu_graph_planner.h"
@@ -50,6 +51,8 @@ class GraphPersistentParam final {
                            const torch::Tensor& positions,
                            const ModelInputParams& params,
                            const GraphLayout& layout);
+  // Producer steps buffer the state they emit; reuse steps only verify it.
+  void store_topk_output(const MtpTopkStatePtr& state);
   std::size_t get_persistent_tensor_bytes() const;
 
   torch::Tensor tokens_;
@@ -58,6 +61,8 @@ class GraphPersistentParam final {
   bool use_mrope_ = false;
   torch::Tensor output_;
   torch::Tensor aux_hidden_states_;
+  std::unique_ptr<MtpTopkGraphBuffer> mtp_topk_input_;
+  std::unique_ptr<MtpTopkGraphBuffer> mtp_topk_output_;
 };
 
 // graph executor using libtorch MLUGraph for memory management
@@ -85,6 +90,10 @@ class MluGraph final {
                            const GraphLayout& layout);
 
   std::size_t owned_persistent_tensor_bytes() const;
+
+  // Independent copy of the leading rows a producer step emitted, or nullptr
+  // when this graph emits no MTP top-k state.
+  MtpTopkStatePtr snapshot_topk_output(int64_t rows) const;
 
  private:
   void prepare_model_graph_metadata(CausalLM* model);

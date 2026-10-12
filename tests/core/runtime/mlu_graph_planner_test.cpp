@@ -19,10 +19,13 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <memory>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "core/framework/model/mtp_topk_state.h"
+#include "core/runtime/mlu_graph_executor_impl.h"
+#include "models/llm/mlu/mtp_topk_state.h"
 
 namespace xllm::mlu {
 namespace {
@@ -34,6 +37,16 @@ GraphPlannerConfig qwen_config() {
       MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION;
   config.history_capacity = 32;
   config.max_tokens = 64;
+  return config;
+}
+
+// A draft engine whose model supports both grouped graphs and native index
+// sharing is the only configuration that admits top-k reuse steps.
+GraphPlannerConfig topk_reuse_config() {
+  GraphPlannerConfig config = qwen_config();
+  config.options.is_draft_engine(true);
+  config.capabilities.supports_grouped_mtp_graph = true;
+  config.capabilities.supports_native_index_share_for_iteration = true;
   return config;
 }
 
@@ -81,6 +94,193 @@ class PlannerTopkState final : public MtpTopkState {
     return nullptr;
   }
 };
+
+// A non-native implementation proves admission depends on the graph contract,
+// not the MLU model's concrete carrier or per-layer tensor layout.
+class PlannerGraphTopkState final : public MtpTopkGraphState {
+ public:
+  explicit PlannerGraphTopkState(std::vector<int64_t> schema = {7, 11})
+      : schema_(std::move(schema)) {}
+
+  int64_t num_rows() const override { return 3; }
+  torch::Device device() const override { return torch::Device(torch::kCPU); }
+  MtpTopkStatePtr to(const torch::Device& /*device*/) const override {
+    return std::make_shared<PlannerGraphTopkState>(schema_);
+  }
+  MtpTopkStatePtr index_select_rows(
+      const torch::Tensor& /*index*/) const override {
+    return nullptr;
+  }
+  std::vector<int64_t> graph_schema() const override { return schema_; }
+  std::unique_ptr<MtpTopkGraphBuffer> make_graph_buffer(
+      int64_t /*rows*/) const override {
+    return nullptr;
+  }
+
+ private:
+  std::vector<int64_t> schema_;
+};
+
+TEST(MtpTopkGraphBufferDeathTest, RejectsMissingBufferFromGraphContract) {
+  const torch::Tensor tokens = torch::zeros({3}, torch::kInt32);
+  ModelInputParams params = grouped_input();
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>();
+  GraphLayout layout;
+  layout.num_reqs = 3;
+  layout.padded_num_reqs = 3;
+  layout.padded_num_tokens = 3;
+  EXPECT_DEATH(GraphPersistentParam(tokens,
+                                    tokens,
+                                    params,
+                                    layout,
+                                    /*graph_max_kv_seq_len=*/32,
+                                    /*main_block_table_columns=*/2),
+               "graph contract must return a buffer");
+}
+
+TEST(MtpTopkGraphBufferDeathTest, RejectsProducerWithoutGraphContract) {
+  const torch::Tensor tokens = torch::zeros({3}, torch::kInt32);
+  GraphLayout layout;
+  layout.num_reqs = 3;
+  layout.padded_num_reqs = 3;
+  layout.padded_num_tokens = 3;
+  GraphPersistentParam buffers(tokens,
+                               tokens,
+                               grouped_input(),
+                               layout,
+                               /*graph_max_kv_seq_len=*/32,
+                               /*main_block_table_columns=*/2);
+  const auto state = std::make_shared<PlannerTopkState>();
+  EXPECT_DEATH(buffers.store_topk_output(state),
+               "state must implement the graph contract");
+}
+
+TEST(MtpTopkGraphBufferDeathTest, RejectsIncompatibleUpdatesBeforeCopying) {
+  const auto make_state =
+      [](int64_t rows, int64_t columns, bool first_present) {
+        model::MluMtpTopkState::LayerStates layers;
+        layers.reserve(2);
+        layer::DsaTopkState layer(torch::ones({rows, columns}, torch::kInt32),
+                                  torch::ones({rows}, torch::kInt32));
+        if (first_present) {
+          layers.emplace_back(std::move(layer));
+          layers.emplace_back(std::nullopt);
+        } else {
+          layers.emplace_back(std::nullopt);
+          layers.emplace_back(std::move(layer));
+        }
+        return std::make_shared<model::MluMtpTopkState>(std::move(layers));
+      };
+  const auto source =
+      make_state(/*rows=*/3, /*columns=*/2, /*first_present=*/true);
+  const auto buffer = source->make_graph_buffer(/*rows=*/4);
+  buffer->update(*source);
+  const PlannerTopkState incompatible;
+  EXPECT_DEATH(buffer->update(incompatible), "incompatible MTP top-k state");
+  const auto wide =
+      make_state(/*rows=*/3, /*columns=*/4, /*first_present=*/true);
+  EXPECT_DEATH(buffer->update(*wide), "schema changed");
+  const auto missing =
+      make_state(/*rows=*/3, /*columns=*/2, /*first_present=*/false);
+  EXPECT_DEATH(buffer->update(*missing), "schema changed");
+  const auto other_device = source->to(torch::Device(torch::kMeta));
+  EXPECT_DEATH(buffer->update(*other_device), "device changed");
+  const auto large =
+      make_state(/*rows=*/5, /*columns=*/2, /*first_present=*/true);
+  EXPECT_DEATH(buffer->update(*large), "exceeds row capacity");
+}
+
+TEST(MluGraphPlannerTest, AcceptsBackendIndependentTopkGraphContract) {
+  GraphPlannerConfig config = topk_reuse_config();
+  ModelInputParams params = grouped_input();
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>();
+  const auto decision = MluGraphPlanner(config).plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(decision));
+  EXPECT_EQ(std::get<GraphPlan>(decision).key.mtp_topk_schema,
+            (std::vector<int64_t>{7, 11}));
+  params.mtp_topk_state = std::make_shared<PlannerTopkState>();
+  expect_eager(
+      MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+// Data-parallel ranks compare the whole key in one fixed-size packet, so a key
+// that cannot fit is rejected here instead of being dropped at agreement time.
+TEST(MluGraphPlannerTest, KeyLayoutBeyondAgreementPacketStaysEager) {
+  const MluGraphPlanner planner(topk_reuse_config());
+  ModelInputParams params = grouped_input();
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>(
+      std::vector<int64_t>(kMaxGraphKeyLayoutFields, /*value=*/8));
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({3, params})));
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>(
+      std::vector<int64_t>(kMaxGraphKeyLayoutFields + 1, /*value=*/8));
+  expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+// The empty schema keys producer graphs, so a reuse step reporting it must not
+// be admitted into the producer's cache entry.
+TEST(MluGraphPlannerTest, ReuseStateWithReservedEmptySchemaStaysEager) {
+  const MluGraphPlanner planner(topk_reuse_config());
+  ModelInputParams params = grouped_input();
+  params.mtp_topk_state =
+      std::make_shared<PlannerGraphTopkState>(std::vector<int64_t>{});
+  expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+TEST(MluGraphPlannerTest, ProducerDoesNotRequireTopkReuseCapability) {
+  GraphPlannerConfig config = topk_reuse_config();
+  config.capabilities.supports_native_index_share_for_iteration = false;
+  const MluGraphPlanner planner(config);
+  ModelInputParams params = grouped_input();
+  const auto producer = planner.plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(producer));
+  EXPECT_TRUE(std::get<GraphPlan>(producer).key.mtp_topk_schema.empty());
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>();
+  expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+TEST(MluGraphPlannerTest, StatefulTargetGroupingDoesNotEnableTopkReuse) {
+  GraphPlannerConfig config = qwen_config();
+  config.state_required = true;
+  config.capabilities.supports_grouped_mtp_graph = true;
+  config.capabilities.supports_native_index_share_for_iteration = true;
+  ModelInputParams params = grouped_input();
+  params.embedding.linear_state_ids = {1, 2, 3};
+  const MluGraphPlanner target(config);
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(target.plan({3, params})));
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>();
+  expect_eager(target, 3, params, EagerReason::UNSUPPORTED_INPUT);
+  config.options.is_draft_engine(true);
+  const auto reuse = MluGraphPlanner(config).plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(reuse));
+  EXPECT_EQ(std::get<GraphPlan>(reuse).key.mtp_topk_schema,
+            (std::vector<int64_t>{7, 11}));
+  config.capabilities.supports_grouped_mtp_graph = false;
+  expect_eager(
+      MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+TEST(MluGraphPlannerTest, TopkInputValidationPreservesReasonPriority) {
+  GraphPlannerConfig config = topk_reuse_config();
+  const MluGraphPlanner planner(config);
+  ModelInputParams params = grouped_input();
+  params.mtp_topk_state = std::make_shared<PlannerTopkState>();
+  params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  params.attention.host.q_seq_lens = {0, 1};
+  expect_eager(planner, 3, params, EagerReason::NON_DECODE);
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>();
+  expect_eager(planner, 3, params, EagerReason::INVALID_LAYOUT);
+
+  params.attention.host.q_seq_lens = {0, 1, 2, 3};
+  params.attention.device.q_seq_lens = torch::Tensor();
+  expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+  params.attention.device.q_seq_lens = torch::empty(
+      {4}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kMeta));
+  expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+  params.attention.device.q_seq_lens = torch::zeros({4}, torch::kInt32);
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({3, params})));
+}
 
 TEST(MluGraphPlannerTest, OrdinaryStagesKeepReasonPriority) {
   GraphPlannerConfig config = qwen_config();
@@ -328,6 +528,43 @@ TEST(MluGraphPlannerTest, DraftAndVerifyUseCurrentStageMetadata) {
   params.is_spec_verify = true;
   params.num_accepted_tokens = torch::ones({3}, torch::kInt32);
   EXPECT_TRUE(std::holds_alternative<GraphPlan>(verify.plan({3, params})));
+}
+
+TEST(MluGraphPlannerTest, NativeDraftSharingSeparatesProducerAndReuseGraphs) {
+  GraphPlannerConfig config = topk_reuse_config();
+  ModelInputParams params = grouped_input();
+  const auto producer = MluGraphPlanner(config).plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(producer));
+  const auto make_state = [](int64_t rows, int64_t columns) {
+    model::MluMtpTopkState::LayerStates layers;
+    layers.reserve(2);
+    layers.emplace_back(
+        layer::DsaTopkState(torch::zeros({rows, columns}, torch::kInt32),
+                            torch::ones({rows}, torch::kInt32)));
+    layers.emplace_back(std::nullopt);
+    return std::make_shared<model::MluMtpTopkState>(std::move(layers));
+  };
+  params.mtp_topk_state = make_state(/*rows=*/3, /*columns=*/8);
+  const auto reuse = MluGraphPlanner(config).plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(reuse));
+  EXPECT_FALSE(std::get<GraphPlan>(producer).key ==
+               std::get<GraphPlan>(reuse).key);
+  params.mtp_topk_state = make_state(/*rows=*/3, /*columns=*/16);
+  const auto changed_width = MluGraphPlanner(config).plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(changed_width));
+  EXPECT_FALSE(std::get<GraphPlan>(reuse).key ==
+               std::get<GraphPlan>(changed_width).key);
+  params.mtp_topk_state = make_state(/*rows=*/2, /*columns=*/8);
+  expect_eager(
+      MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
+  params.mtp_topk_state = make_state(/*rows=*/3, /*columns=*/8);
+  config.capabilities.supports_native_index_share_for_iteration = false;
+  expect_eager(
+      MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
+  config.capabilities.supports_native_index_share_for_iteration = true;
+  config.options.is_draft_engine(false);
+  expect_eager(
+      MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
 }
 
 }  // namespace

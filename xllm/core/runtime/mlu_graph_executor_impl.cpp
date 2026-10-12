@@ -118,7 +118,6 @@ enum class GraphAction : int8_t { EAGER, CAPTURE, REPLAY };
 // A fixed-size packet keeps admission, layout, and cache state in one
 // collective. The complete compared fields are values, never a hash.
 constexpr int64_t kGraphPacketSize = 32;
-constexpr int64_t kGraphPacketFields = 11;
 
 GraphAction agree_graph_action(const xllm::mlu::GraphDecision& decision,
                                bool cache_hit,
@@ -126,22 +125,34 @@ GraphAction agree_graph_action(const xllm::mlu::GraphDecision& decision,
                                const torch::Device& device) {
   const auto* plan = std::get_if<xllm::mlu::GraphPlan>(&decision);
   std::array<int64_t, kGraphPacketSize> packet{};
-  if (plan != nullptr && plan->key.multi_block_table_column_counts.size() <=
-                             kGraphPacketSize - kGraphPacketFields) {
-    packet[0] = 1;
-    packet[1] = cache_hit ? 1 : 0;
-    packet[2] = plan->layout.padded_num_tokens;
-    packet[3] = plan->layout.padded_num_reqs;
-    packet[4] = plan->layout.tokens_per_request;
-    packet[5] = plan->layout.attention_row_query_len;
-    packet[6] = plan->layout.cache_pad_slot;
-    packet[7] = plan->history_capacity;
-    packet[8] = plan->main_block_table_columns;
-    packet[9] = plan->key.has_input_embedding;
-    packet[10] = plan->key.multi_block_table_column_counts.size();
-    std::copy(plan->key.multi_block_table_column_counts.begin(),
-              plan->key.multi_block_table_column_counts.end(),
-              packet.begin() + kGraphPacketFields);
+  if (plan != nullptr) {
+    const std::vector<int64_t>& table_columns =
+        plan->key.multi_block_table_column_counts;
+    const std::vector<int64_t>& topk_schema = plan->key.mtp_topk_schema;
+    // Admission and cache state lead the packet; every later value is compared
+    // across ranks.
+    const int64_t fields[] = {
+        1,
+        cache_hit ? 1 : 0,
+        plan->layout.padded_num_tokens,
+        plan->layout.padded_num_reqs,
+        plan->layout.tokens_per_request,
+        plan->layout.attention_row_query_len,
+        plan->layout.cache_pad_slot,
+        plan->history_capacity,
+        plan->main_block_table_columns,
+        plan->key.has_input_embedding ? 1 : 0,
+        static_cast<int64_t>(table_columns.size()),
+        static_cast<int64_t>(topk_schema.size()),
+    };
+    static_assert(std::size(fields) + xllm::mlu::kMaxGraphKeyLayoutFields <=
+                  static_cast<std::size_t>(kGraphPacketSize));
+    CHECK_LE(table_columns.size() + topk_schema.size(),
+             xllm::mlu::kMaxGraphKeyLayoutFields);
+    auto cursor =
+        std::copy(std::begin(fields), std::end(fields), packet.begin());
+    cursor = std::copy(table_columns.begin(), table_columns.end(), cursor);
+    std::copy(topk_schema.begin(), topk_schema.end(), cursor);
   }
   if (dp_group == nullptr || dp_group->world_size() <= 1) {
     return packet[0] == 0
@@ -166,6 +177,22 @@ GraphAction agree_graph_action(const xllm::mlu::GraphDecision& decision,
     all_hit = all_hit && peer[1] != 0;
   }
   return all_hit ? GraphAction::REPLAY : GraphAction::CAPTURE;
+}
+
+// Only states that implement the graph contract reach a graph: the planner
+// admits reuse inputs, and producer outputs come from the same model. A
+// missing contract or buffer here is a broken invariant.
+std::unique_ptr<xllm::MtpTopkGraphBuffer> make_topk_graph_buffer(
+    const xllm::MtpTopkStatePtr& state,
+    int64_t rows) {
+  const auto source =
+      std::dynamic_pointer_cast<const xllm::MtpTopkGraphState>(state);
+  CHECK(source != nullptr)
+      << "MTP top-k state must implement the graph contract";
+  std::unique_ptr<xllm::MtpTopkGraphBuffer> buffer =
+      source->make_graph_buffer(rows);
+  CHECK(buffer != nullptr) << "MTP top-k graph contract must return a buffer";
+  return buffer;
 }
 
 // Batch rows can vary within a bucket; all other dimensions and dtypes are
@@ -214,6 +241,11 @@ GraphPersistentParam::GraphPersistentParam(const torch::Tensor& tokens,
         << "input_embedding graph input device changed";
   }
   const int64_t graph_tokens = layout.padded_num_tokens;
+  if (params_.mtp_topk_state != nullptr) {
+    mtp_topk_input_ =
+        make_topk_graph_buffer(params_.mtp_topk_state, graph_tokens);
+    params_.mtp_topk_state = mtp_topk_input_->state();
+  }
   const int64_t extra_rows = (layout.padded_num_reqs - layout.num_reqs) *
                              layout.tokens_per_request /
                              layout.attention_row_query_len;
@@ -286,6 +318,12 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
                                                const torch::Tensor& positions,
                                                const ModelInputParams& params,
                                                const GraphLayout& layout) {
+  if (mtp_topk_input_ != nullptr) {
+    CHECK(params.mtp_topk_state != nullptr);
+    mtp_topk_input_->update(*params.mtp_topk_state);
+  } else {
+    CHECK(params.mtp_topk_state == nullptr);
+  }
   check_graph_tensor(tokens_, tokens, "tokens");
   check_graph_tensor(positions_, positions, "positions", use_mrope_ ? 1 : 0);
   const auto& source = params.attention.device;
@@ -529,6 +567,23 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
 
 MluGraphExecutorImpl::~MluGraphExecutorImpl() = default;
 
+void GraphPersistentParam::store_topk_output(const MtpTopkStatePtr& state) {
+  if (mtp_topk_input_ != nullptr) {
+    // A reuse step returns its input selection unchanged, so the executor
+    // hands the caller's state back instead of buffering a second copy.
+    CHECK(state != nullptr) << "MTP reuse step dropped its top-k state";
+    return;
+  }
+  if (state == nullptr) {
+    CHECK(mtp_topk_output_ == nullptr);
+    return;
+  }
+  if (mtp_topk_output_ == nullptr) {
+    mtp_topk_output_ = make_topk_graph_buffer(state, tokens_.size(0));
+  }
+  mtp_topk_output_->update(*state);
+}
+
 std::size_t GraphPersistentParam::get_persistent_tensor_bytes() const {
   std::size_t total = 0;
   for (const auto& tensor : {output_,
@@ -544,6 +599,9 @@ std::size_t GraphPersistentParam::get_persistent_tensor_bytes() const {
                              params_.num_accepted_tokens,
                              params_.linear_state_validity_mask_tensor}) {
     total += tensor_bytes(tensor);
+  }
+  for (const auto* buffer : {mtp_topk_input_.get(), mtp_topk_output_.get()}) {
+    total += buffer == nullptr ? 0 : buffer->tensor_bytes();
   }
   total += tensor_bytes(params_.graph.num_valid_token_rows);
   for (const auto& table : params_.multi_block_tables) {
@@ -587,6 +645,7 @@ void MluGraph::store_output(const ModelOutput& result) {
   store(persistent_param_->output_,
         result.hidden_states,
         persistent_param_->tokens_.size(0));
+  persistent_param_->store_topk_output(result.mtp_topk_state);
   if (enable_aux_hidden_states_ && result.aux_hidden_states.defined()) {
     store(persistent_param_->aux_hidden_states_,
           result.aux_hidden_states,
@@ -598,6 +657,11 @@ ModelOutput MluGraph::output() const {
   const auto& params = *persistent_param_;
   return make_graph_output(
       params.output_, params.aux_hidden_states_, enable_aux_hidden_states_);
+}
+
+MtpTopkStatePtr MluGraph::snapshot_topk_output(int64_t rows) const {
+  const auto& buffer = persistent_param_->mtp_topk_output_;
+  return buffer == nullptr ? nullptr : buffer->snapshot(rows);
 }
 
 ModelOutput MluGraph::capture(CausalLM* model,
@@ -793,10 +857,12 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
   const GraphKey& key = plan->key;
   auto it = graphs_.find(key);
   ModelOutput result;
+  const MluGraph* active_graph = nullptr;
   if (action == GraphAction::REPLAY) {
     CHECK(it != graphs_.end());
     it->second->update_input_buffer(model_, tokens, positions, params, layout);
     result = it->second->replay();
+    active_graph = it->second.get();
   } else {
     // Normalize unused model inputs only when allocating a new graph. Replay
     // copies directly into its active buffers without cloning ModelInputParams.
@@ -819,6 +885,7 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
                                                graph_max_kv_seq_len,
                                                plan->main_block_table_columns);
     auto graph = std::make_unique<MluGraph>(std::move(buffers));
+    active_graph = graph.get();
     graph->update_input_buffer(model_, tokens, positions, params, layout);
     if (!graph_capture_stream_.has_value()) {
       graph_capture_stream_ = torch_mlu::getStreamFromPool(
@@ -845,15 +912,24 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
               << ", tokens_per_request=" << layout.tokens_per_request
               << ", draft=" << options_.is_draft_engine()
               << ", verify=" << params.is_spec_verify
+              << ", mtp_topk_reuse=" << !key.mtp_topk_schema.empty()
               << ", padded_num_tokens=" << graph_tokens;
     log_memory_after_capture();
   }
-  return make_graph_output(
+  ModelOutput output = make_graph_output(
       result.hidden_states.slice(0, 0, actual_tokens),
       result.aux_hidden_states.defined()
           ? result.aux_hidden_states.slice(0, 0, actual_tokens)
           : torch::Tensor(),
       options_.enable_graph_aux_hidden_states());
+  // A reuse step hands the caller's selection back. A producer step returns
+  // independent storage: a later replay may overwrite this graph's output
+  // while another draft step still holds the previous selection.
+  output.mtp_topk_state =
+      params.mtp_topk_state != nullptr
+          ? params.mtp_topk_state
+          : active_graph->snapshot_topk_output(actual_tokens);
+  return output;
 }
 
 }  // namespace xllm::mlu

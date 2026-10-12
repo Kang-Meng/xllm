@@ -99,7 +99,7 @@ inline int64_t fixed_graph_capacity(const ModelArgs& args) {
 
 const bool glm5_next_mtp_capabilities_registered = []() {
   MtpModelCapabilities capabilities;
-  capabilities.supports_native_index_share_for_iteration = false;
+  capabilities.supports_native_index_share_for_iteration = true;
   capabilities.supports_accepted_span_replay = true;
   capabilities.replay_family = MtpReplayFamily::GLM5;
   capabilities.supports_causal_replay_target = true;
