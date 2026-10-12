@@ -153,7 +153,7 @@ void Eagle3WorkerImpl::check_draft_input_embedding(
       << embedding.dim();
   CHECK_GT(embedding.size(0), 0)
       << "Eagle3 " << phase << " embedding must contain at least one row.";
-  if (phase == "decode") {
+  if (phase == "decode" || phase == "decode extend") {
     CHECK(embedding.size(-1) == expected_hidden_size ||
           embedding.size(-1) == draft_hidden_size)
         << "Eagle3 " << phase
