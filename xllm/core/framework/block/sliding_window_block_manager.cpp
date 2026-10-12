@@ -184,7 +184,7 @@ bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
     }
   }
   if (!dropped.empty()) {
-    deallocate(dropped);
+    deallocate(std::move(dropped));
   }
 
   seq->update_block_hashes(static_cast<uint32_t>(block_size),
@@ -238,7 +238,7 @@ void SlidingWindowBlockManager::trim_prefetch_blocks(Sequence* seq,
     to_release.emplace_back(std::move(blocks[index]));
   }
   if (!to_release.empty()) {
-    deallocate(to_release);
+    deallocate(std::move(to_release));
   }
   blocks.resize(keep);
   std::vector<Block> retained(keep);
@@ -298,7 +298,7 @@ void SlidingWindowBlockManager::release_out_of_window(Sequence* seq,
     }
   }
   if (!blocks_to_release.empty()) {
-    deallocate(blocks_to_release);
+    deallocate(std::move(blocks_to_release));
   }
 }
 

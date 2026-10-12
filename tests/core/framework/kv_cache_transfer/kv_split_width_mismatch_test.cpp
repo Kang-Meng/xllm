@@ -142,7 +142,7 @@ Sequence make_sequence(std::vector<Block> blocks) {
                     /*mm_data=*/MMData(),
                     decoder,
                     seq_params);
-  sequence.add_blocks(BlockType::KV, std::move(blocks));
+  sequence.kv_state().add_blocks(BlockType::KV, std::move(blocks));
   return sequence;
 }
 

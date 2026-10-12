@@ -163,7 +163,7 @@ bool LinearStateBlockManager::allocate_for_prefetch(Sequence* seq,
     }
   }
   if (!dropped.empty()) {
-    deallocate(dropped);
+    deallocate(std::move(dropped));
   }
 
   const bool has_source = source_in_target && source.is_valid();
@@ -241,7 +241,7 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
     to_release.emplace_back(std::move(blocks[index]));
   }
   if (!to_release.empty()) {
-    deallocate(to_release);
+    deallocate(std::move(to_release));
   }
 
   if (!source.is_valid()) {
@@ -281,7 +281,12 @@ void LinearStateBlockManager::retain_read_source(KVCacheState& kv_state) {
   const bool shared_source =
       kv_state.shared_blocks_num(BlockType::LINEAR) == blocks->size();
   const size_t keep_begin = blocks->size() - 1;
-  deallocate(Slice<Block>(*blocks).slice(0, keep_begin));
+  std::vector<Block> to_release;
+  to_release.reserve(keep_begin);
+  for (size_t i = 0; i < keep_begin; ++i) {
+    to_release.emplace_back(std::move((*blocks)[i]));
+  }
+  deallocate(std::move(to_release));
   blocks->erase(blocks->begin(), blocks->begin() + keep_begin);
   kv_state.set_shared_blocks_num(BlockType::LINEAR, shared_source ? 1 : 0);
 }
@@ -322,10 +327,10 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
   // states; the caller identifies the tier by the KVCacheState reference.
   if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num()) {
     std::vector<Block> old_blocks = kv_state.take_blocks(BlockType::LINEAR);
-    deallocate(old_blocks);
+    deallocate(std::move(old_blocks));
     std::vector<Block> allocated = BlockManagerImpl::allocate(2);
     if (allocated.size() != 2) {
-      deallocate(allocated);
+      deallocate(std::move(allocated));
       return std::nullopt;
     }
     return allocated;
@@ -382,7 +387,9 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
 
   if (blocks->size() == 2) {
     if (completed_checkpoint) {
-      deallocate(Slice<Block>(*blocks).slice(0, 1));
+      std::vector<Block> to_release;
+      to_release.emplace_back(std::move((*blocks)[0]));
+      deallocate(std::move(to_release));
       blocks->erase(blocks->begin());
       kv_state.set_shared_blocks_num(BlockType::LINEAR, 0);
     } else {

@@ -111,7 +111,10 @@ class BlockManager {
   explicit BlockManager(Options options) : options_(options) {}
   virtual ~BlockManager() = default;
 
-  virtual void deallocate(const Slice<Block>& blocks) = 0;
+  // Release ownership of these blocks. The caller must move the vector so
+  // that the manager can account for the ownership transition exactly once.
+  // The vector is empty on return, including any invalid placeholders.
+  virtual void deallocate(std::vector<Block>&& blocks) = 0;
 
   virtual std::vector<Block> allocate(size_t num_blocks) = 0;
 

@@ -228,26 +228,8 @@ INSTANTIATE_TEST_SUITE_P(
         TransferTopology{16, 2, 4, 0, {0, 1, 2, 3, 4, 5, 6, 7}},
         TransferTopology{16, 2, 4, 1, {8, 9, 10, 11, 12, 13, 14, 15}}));
 
-// ===========================================================================
-// M11.5 scheduler-overlap prework: retain_cache_blocks coverage for a
-// non-DFlash2 CP batch (llm_engine.cpp LLMEngine::step).
-//
-// The engine only retains a dispatched batch's cache blocks when
-// enable_schedule_overlap && is_dflash2_algorithm. That guard is sufficient
-// for a non-DFlash2 CP prefill because the scheduler-side block free of a
-// request finished in the deferred output processing (collect_finished ->
-// BlockManagerPool::deallocate, scheduler_policy.cpp) cannot corrupt the
-// in-flight overlap step: every device access to KV/LINEAR cache tensors is
-// enqueued on the per-worker compute stream in step-task order (the
-// single-threaded WorkerImpl task pool, worker_impl.h, keeps two step tasks
-// FIFO-serial; LLMWorkerImpl::step_for_schedule_overlap chains the deferred
-// linear-state restore and the step on compute_stream_), so a block freed at
-// the next schedule_request and reallocated into the following batch is only
-// written by device work ordered after the in-flight step. DFlash2 needs the
-// extra batch-held Block aliases because its prelaunch enqueues KV writes one
-// additional step ahead, outside that FIFO window (see
-// dflash2_prelaunch_lifecycle_test).
-// ===========================================================================
+// Overlap batches borrow the sequence cache. Serial worker execution does not
+// require additional Block owners in the batch.
 
 class StepCaptureWorker final : public WorkerClient {
  public:
@@ -301,8 +283,7 @@ std::shared_ptr<Request> make_overlap_step_request() {
   return std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
 }
 
-TEST(LLMEngineOverlapRetainTest,
-     NonDFlash2OverlapStepDoesNotRetainCpPrefillBlocks) {
+TEST(LLMEngineOverlapOwnershipTest, MtpOverlapStepDoesNotCopyCpPrefillBlocks) {
   // Two workers form one DP group with cp_size=2: the engine must dispatch
   // the same forward_inputs[dp_rank] to both CP ranks (llm_engine.cpp: "Engine
   // sends full global tokens; model-side CP shards inside the worker").
@@ -317,7 +298,6 @@ TEST(LLMEngineOverlapRetainTest,
   }
   runtime::Options options;
   options.world_size(2).dp_size(1).cp_size(2).enable_schedule_overlap(true);
-  // Any non-DFlash2 algorithm leaves the retain guard off.
   options.speculative_algorithm("mtp");
   ClientEngine engine(std::move(options), std::move(clients));
 
@@ -344,16 +324,14 @@ TEST(LLMEngineOverlapRetainTest,
   EXPECT_TRUE(torch::equal(workers[0]->captured_token_ids(),
                            workers[1]->captured_token_ids()));
 
-  // The DFlash2-only guard means a non-DFlash2 overlap step does NOT pin the
-  // batch's blocks: the sequence's own alias is the only reference. Safety
-  // for the freed-block window comes from compute-stream FIFO ordering, not
-  // from scheduler-side retention (see the comment above this test).
+  // Serial worker execution needs only the sequence's own reference.
   const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
   ASSERT_FALSE(kv_blocks.empty());
   EXPECT_EQ(kv_blocks.front().ref_count(), 1u);
 }
 
-TEST(LLMEngineOverlapRetainTest, DFlash2OverlapStepRetainsCpPrefillBlocks) {
+TEST(LLMEngineOverlapOwnershipTest,
+     DFlash2OverlapStepDoesNotCopyCpPrefillBlocks) {
   std::vector<std::shared_ptr<WorkerClient>> clients;
   clients.reserve(2);
   for (int32_t worker_rank = 0; worker_rank < 2; ++worker_rank) {
@@ -379,12 +357,11 @@ TEST(LLMEngineOverlapRetainTest, DFlash2OverlapStepRetainsCpPrefillBlocks) {
   batches.emplace_back(sequence);
   engine.step(batches);
 
-  // With DFlash2 the dispatched batch holds Block aliases until the deferred
-  // output processing retires it, so the sequence's blocks are shared.
+  // DFlash2 follows the same ownership rule: Batch does not copy Blocks.
   const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
   ASSERT_FALSE(kv_blocks.empty());
-  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
-  // Dropping the batch releases the retain.
+  EXPECT_EQ(kv_blocks.front().ref_count(), 1u);
+  // Dropping the batch preserves the sequence's owner.
   batches.clear();
   EXPECT_EQ(sequence->kv_state().blocks(BlockType::KV).front().ref_count(), 1u);
 }

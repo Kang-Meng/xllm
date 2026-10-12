@@ -927,7 +927,12 @@ class TestUT(Command):
         pass
 
     def run_ctest(self, cmake_dir: str) -> int:
-        default_parallel: int = max(os.cpu_count() or 1, 8)
+        # Large build containers can report hundreds of host CPUs while the
+        # tests still share a small number of NPU devices.  Starting one test
+        # per CPU oversubscribes the device and makes resource-sensitive tests
+        # flaky or appear to hang.  Keep the default bounded while preserving
+        # an explicit override for larger test hosts.
+        default_parallel: int = min(os.cpu_count() or 1, 64)
         test_parallel: str = os.getenv("CTEST_PARALLEL", str(default_parallel))
         logger.info(f"Test parallelism: {test_parallel} (set CTEST_PARALLEL to override)")
         test_environment = prepare_test_environment(dict(os.environ), cmake_dir)

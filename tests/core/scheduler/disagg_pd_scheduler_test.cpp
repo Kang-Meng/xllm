@@ -26,6 +26,7 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -561,10 +562,15 @@ TEST(DisaggPDSchedulerTest, GroupedPullAlignsActiveSwaSuffix) {
   swa_options.num_blocks(8).block_size(2);
   BlockManagerImpl swa_manager(swa_options);
   std::vector<Block> live_swa_blocks = swa_manager.allocate(2);
+  const std::vector<uint64_t> live_swa_ids = {
+      static_cast<uint64_t>(live_swa_blocks[0].id()),
+      static_cast<uint64_t>(live_swa_blocks[1].id())};
   std::vector<Block> logical_swa_blocks(2);
-  logical_swa_blocks.insert(
-      logical_swa_blocks.end(), live_swa_blocks.begin(), live_swa_blocks.end());
-  sequence->add_blocks(BlockType::SWA, logical_swa_blocks);
+  logical_swa_blocks.insert(logical_swa_blocks.end(),
+                            std::make_move_iterator(live_swa_blocks.begin()),
+                            std::make_move_iterator(live_swa_blocks.end()));
+  sequence->kv_state().add_blocks(BlockType::SWA,
+                                  std::move(logical_swa_blocks));
   ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
 
   KVTransferMapping source_mapping;
@@ -588,10 +594,7 @@ TEST(DisaggPDSchedulerTest, GroupedPullAlignsActiveSwaSuffix) {
 
   ASSERT_EQ(engine.pulled_mappings.size(), 1U);
   EXPECT_EQ(engine.pulled_mappings[0].group_id, cache_group_id(BlockType::SWA));
-  EXPECT_EQ(
-      engine.pulled_mappings[0].local_ids,
-      (std::vector<uint64_t>{static_cast<uint64_t>(live_swa_blocks[0].id()),
-                             static_cast<uint64_t>(live_swa_blocks[1].id())}));
+  EXPECT_EQ(engine.pulled_mappings[0].local_ids, live_swa_ids);
   EXPECT_EQ(engine.pulled_mappings[0].remote_ids,
             (std::vector<uint64_t>{101, 102}));
 

@@ -924,15 +924,6 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   return output;
 }
 
-void Sequence::add_blocks(BlockType type, const std::vector<Block>& blocks) {
-  kv_state_.add_blocks(type, blocks);
-}
-
-void Sequence::add_host_blocks(BlockType type,
-                               const std::vector<Block>& blocks) {
-  host_kv_state_.add_blocks(type, blocks);
-}
-
 size_t Sequence::num_prefix_cache_tokens() const {
   size_t cached_tokens = std::max(kv_state_.shared_tokens_num(),
                                   host_kv_state_.shared_tokens_num());

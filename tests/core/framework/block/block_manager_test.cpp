@@ -112,7 +112,7 @@ bool allocate_kv_prefix_for_test(BlockManagerPool& pool, Sequence& sequence) {
     return false;
   }
   sequence.set_dp_rank(dp_rank);
-  sequence.add_blocks(BlockType::KV, std::move(blocks));
+  sequence.kv_state().add_blocks(BlockType::KV, std::move(blocks));
   return true;
 }
 
@@ -880,7 +880,7 @@ TEST_F(BlockManagerPoolTest, PrefixMountSurvivesAllocationFailureAndRetry) {
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
   pool.allocate_shared(&consumer);
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
-  leaf->deallocate(occupied);
+  leaf->deallocate(std::move(occupied));
   occupied.clear();
   ASSERT_TRUE(pool.allocate(&consumer, 9));
   ASSERT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 2u);

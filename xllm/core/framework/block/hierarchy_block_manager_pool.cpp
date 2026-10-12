@@ -55,7 +55,7 @@ void finalize_host_blocks(bool publish,
     if (publish) {
       host_manager->cache_blocks(type, blocks);
     }
-    host_manager->deallocate(blocks);
+    host_manager->deallocate(std::move(blocks));
   }
 }
 
@@ -84,7 +84,7 @@ void trim_blocks_from_back(BlockManager* leaf,
     dropped.emplace_back(std::move((*blocks)[i]));
   }
   blocks->resize(keep);
-  leaf->deallocate(dropped);
+  leaf->deallocate(std::move(dropped));
 }
 
 bool has_valid_swa_window(size_t tokens,
@@ -335,7 +335,7 @@ void finalize_prefetch(Sequence* sequence,
   if (!publish) {
     for (const auto& [type, entry] : leaves) {
       std::vector<Block> blocks = host_state.take_blocks(type);
-      entry.leaf->deallocate(blocks);
+      entry.leaf->deallocate(std::move(blocks));
     }
     host_state.reset();
     return;
@@ -618,7 +618,9 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
 
       const size_t host_cached_tokens = host_state.kv_cache_tokens_num();
       const size_t hbm_cached_tokens = hbm_state.kv_cache_tokens_num();
-      if (host_cached_tokens > hbm_cached_tokens || hbm_blocks->size() <= 1) {
+      // Host already covers an equal restore boundary or has reserved its
+      // D2H checkpoint. Only a checkpoint ahead of Host needs writeback.
+      if (host_cached_tokens >= hbm_cached_tokens || hbm_blocks->size() <= 1) {
         continue;
       }
 
@@ -631,18 +633,6 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
       if (!hbm_block.is_valid()) {
         continue;
       }
-      // A Host prefix-cache hit is owned by both the cache and this Sequence.
-      // Fresh D2H destinations have only the Sequence reference. When Host is
-      // shorter, allocate_prefill has already dropped the old hit and created
-      // a private [restore, live] pair, so this test only suppresses an offload
-      // for the checkpoint already present in Host.
-      const bool already_on_host = !host_blocks->empty() &&
-                                   host_blocks->front().is_valid() &&
-                                   host_blocks->front().ref_count() >= 2;
-      if (already_on_host) {
-        continue;
-      }
-
       if (host_blocks->size() <= 1 || !host_blocks->front().is_valid()) {
         continue;
       }
@@ -1255,8 +1245,7 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
             }
 
             // Always release the reserved ids so the block pools do not leak.
-            device_block_mgr_ptr->deallocate(device_blocks);
-            device_blocks.clear();
+            device_block_mgr_ptr->deallocate(std::move(device_blocks));
 
             // Successful copies become visible in the Host prefix cache.
             // Failures publish nothing, but both paths release every reserved

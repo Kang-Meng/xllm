@@ -97,18 +97,21 @@ std::vector<Block> BlockManagerImpl::allocate(size_t num_blocks) {
   return blocks;
 }
 
-void BlockManagerImpl::deallocate(const Slice<Block>& blocks) {
+void BlockManagerImpl::deallocate(std::vector<Block>&& blocks) {
   for (const auto& block : blocks) {
     if (!block.is_valid()) {
       continue;
     }
-    // Prefix-cache blocks may be shared by cache aliases, so only drop
-    // effective usage when no sequence owner remains. Without prefix cache,
-    // deallocate() marks the passed ids logically released immediately; their
-    // physical ids return to the free list when the last Block alias is
-    // dropped.
-    if ((!options_.enable_prefix_cache() || block.ref_count() <= 2u) &&
-        clear_used(&usage_accounted_ids_, block.id())) {
+    CHECK_GT(block.ref_count(), 0u);
+    // The vector passed here owns one reference, released before returning.
+    // A cached block with more than two references is still held by another
+    // owner. Drop effective usage only when releasing the last sequence owner
+    // leaves the cache reference. The final reference releases usage in free().
+    // Without prefix caching, deallocate marks the passed ids logically free;
+    // aliases can keep the physical blocks alive until their final release.
+    const bool release_usage =
+        !options_.enable_prefix_cache() || block.ref_count() == 2u;
+    if (release_usage && clear_used(&usage_accounted_ids_, block.id())) {
       if (num_used_blocks_ == 0) {
         LOG(ERROR) << "num_used_blocks_==0 cannot fetch_sub for id:"
                    << block.id()
@@ -126,6 +129,7 @@ void BlockManagerImpl::deallocate(const Slice<Block>& blocks) {
       num_used_blocks_.fetch_sub(1, std::memory_order_relaxed);
     }
   }
+  blocks.clear();
 }
 
 bool BlockManagerImpl::has_enough_blocks(uint32_t num_blocks) {
@@ -331,7 +335,7 @@ void BlockManagerImpl::trim_prefetch_blocks(Sequence* seq,
     }
     blocks.resize(keep);
     if (!dropped.empty()) {
-      deallocate(dropped);
+      deallocate(std::move(dropped));
     }
   }
 

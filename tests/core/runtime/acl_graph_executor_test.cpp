@@ -593,9 +593,9 @@ class AclGraphExecutorTest : public ::testing::Test {
 
   void reset() {
     for (auto& sequence : sequences_) {
-      auto blocks = sequence.kv_state().blocks(BlockType::KV);
+      auto blocks = sequence.kv_state().take_blocks(BlockType::KV);
       if (!blocks.empty()) {
-        block_manager_->deallocate(blocks);
+        block_manager_->deallocate(std::move(blocks));
       }
     }
   }
@@ -611,7 +611,7 @@ class AclGraphExecutorTest : public ::testing::Test {
     auto& sequence = sequences_.back();
 
     // Allocate blocks and configure sequence
-    sequence.add_blocks(BlockType::KV, block_manager_->allocate(3));
+    sequence.kv_state().add_blocks(BlockType::KV, block_manager_->allocate(3));
     // Set kv_cache_tokens_num to be >= num_prompt_tokens to move to decode
     // stage
     sequence.kv_state().incr_kv_cache_tokens_num(
@@ -875,7 +875,8 @@ TEST_F(AclGraphExecutorTest, DifferentBatchSizes) {
                               fake_decoder_,
                               seq_params_);
       auto& sequence = sequences_.back();
-      sequence.add_blocks(BlockType::KV, block_manager_->allocate(2));
+      sequence.kv_state().add_blocks(BlockType::KV,
+                                     block_manager_->allocate(2));
       std::cout << "batch_size: " << batch_size << " i: " << i
                 << " sequence.kv_state().current_max_tokens_capacity(): "
                 << sequence.kv_state().current_max_tokens_capacity()
@@ -962,7 +963,7 @@ TEST_F(AclGraphExecutorTest, DecodeBatchSizeThresholdFallsBackToEager) {
                             fake_decoder_,
                             seq_params_);
     auto& sequence = sequences_.back();
-    sequence.add_blocks(BlockType::KV, block_manager_->allocate(2));
+    sequence.kv_state().add_blocks(BlockType::KV, block_manager_->allocate(2));
     sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
     sequence.append_token(100 + i);
     batch->add(&sequence);
@@ -1018,7 +1019,7 @@ TEST_F(AclGraphExecutorTest, NoPaddingBucketCapturesOnlyForWarmup) {
                             fake_decoder_,
                             seq_params_);
     auto& sequence = sequences_.back();
-    sequence.add_blocks(BlockType::KV, block_manager_->allocate(2));
+    sequence.kv_state().add_blocks(BlockType::KV, block_manager_->allocate(2));
     sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
     sequence.append_token(100 + i);
     batch->add(&sequence);
@@ -1207,12 +1208,12 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
   auto embedding_block = block_manager_->allocate(1);
   ASSERT_EQ(embedding_block.size(), 1);
   const int32_t expected_embedding_id = embedding_block[0].id();
-  seq.add_blocks(BlockType::EMBEDDING, embedding_block);
+  seq.kv_state().add_blocks(BlockType::EMBEDDING, std::move(embedding_block));
 
   auto linear_state_slot = block_manager_->allocate(1);
   ASSERT_EQ(linear_state_slot.size(), 1);
   const int32_t expected_linear_state_id = linear_state_slot[0].id();
-  seq.add_blocks(BlockType::LINEAR, linear_state_slot);
+  seq.kv_state().add_blocks(BlockType::LINEAR, std::move(linear_state_slot));
   ASSERT_NE(expected_embedding_id, expected_linear_state_id);
 
   auto forward_input = batch->prepare_forward_input(

@@ -421,18 +421,16 @@ double BlockManagerPool::kv_cache_utilization() const {
 void BlockManagerPool::deallocate_without_cache(Sequence* sequence) {
   DCHECK(sequence != nullptr);
   int32_t dp_rank = get_dp_rank(sequence);
-  // Release every leaf's blocks directly (no prefix-cache final flush). Routing
-  // by Block::manager() inside composite::deallocate dispatches each block to
-  // its owning leaf.
+  // Release every leaf's blocks directly (no prefix-cache final flush).
   for (const BlockType type : {BlockType::KV,
                                BlockType::SWA,
                                BlockType::C4,
                                BlockType::C128,
                                BlockType::EMBEDDING,
                                BlockType::LINEAR}) {
-    const Slice<Block> blocks = sequence->kv_state().blocks(type);
+    std::vector<Block> blocks = sequence->kv_state().take_blocks(type);
     if (!blocks.empty()) {
-      block_managers_[dp_rank]->deallocate(blocks);
+      block_managers_[dp_rank]->deallocate(std::move(blocks));
     }
   }
   sequence->reset();

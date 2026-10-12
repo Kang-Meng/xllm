@@ -118,7 +118,7 @@ class CompositeBlockManager : public BlockManager {
   std::vector<Block> allocate_blocks(BlockType type, size_t num_blocks);
 
   // Type-ambiguous block-level primitives are not meaningful on a composition.
-  void deallocate(const Slice<Block>& blocks) override;
+  void deallocate(std::vector<Block>&& blocks) override;
   std::vector<Block> allocate(size_t num_blocks) override;
   std::optional<std::vector<Block>> allocate_for_sequence(
       Sequence* seq,

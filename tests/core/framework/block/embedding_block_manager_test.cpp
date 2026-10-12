@@ -39,11 +39,8 @@ TEST(EmbeddingBlockManagerTest, AllocateAndFreeRoundTrip) {
   EXPECT_EQ(manager.num_used_blocks(), 2);
   EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 2.0 / 3.0);
 
-  manager.deallocate(Slice<Block>(blocks));
-  EXPECT_EQ(manager.num_free_blocks(), 1);
-  EXPECT_EQ(manager.num_used_blocks(), 0);
-
-  blocks.clear();
+  manager.deallocate(std::move(blocks));
+  EXPECT_TRUE(blocks.empty());
   EXPECT_EQ(manager.num_free_blocks(), 3);
   EXPECT_EQ(manager.num_used_blocks(), 0);
   EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 0.0);
@@ -87,9 +84,8 @@ TEST(EmbeddingBlockManagerTest, UsedBlocksAccountingRoundTrips) {
   // EmbeddingBlockManager now reuses BlockManagerImpl's free list. With prefix
   // cache disabled there is no aliasing scenario (single blocks live only in
   // the owning sequence, never in a prefix cache), so deallocate drops
-  // effective usage immediately and the physical id returns when the Block is
-  // destroyed. id 0 is reserved internally, so 2 physical slots expose a single
-  // usable block.
+  // effective usage and returns the physical id before the call returns. id 0
+  // is reserved internally, so 2 physical slots expose a single usable block.
   EmbeddingBlockManager manager(2, "single");
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   EXPECT_EQ(manager.num_free_blocks(), 1u);
@@ -100,12 +96,13 @@ TEST(EmbeddingBlockManagerTest, UsedBlocksAccountingRoundTrips) {
     EXPECT_EQ(manager.num_free_blocks(), 0u);
 
     // Deallocate the owning reference: effective usage drops immediately.
-    manager.deallocate(Slice<Block>(&block, 1));
+    std::vector<Block> owned_blocks;
+    owned_blocks.emplace_back(std::move(block));
+    manager.deallocate(std::move(owned_blocks));
     EXPECT_EQ(manager.num_used_blocks(), 0u);
 
-    // Physical id returns to the free list when the Block is destroyed.
-    block = Block();
-    EXPECT_EQ(manager.num_used_blocks(), 0u);
+    EXPECT_TRUE(owned_blocks.empty());
+    EXPECT_FALSE(block.is_valid());
     EXPECT_EQ(manager.num_free_blocks(), 1u);
   }
 

@@ -1225,7 +1225,8 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     ForwardInput& processed_input,
     Stream& prepare_stream,
     bool record_ready_event,
-    bool wait_for_compute) {
+    bool wait_for_compute,
+    bool restore_request_state) {
   if (!input.json_object_state_snapshots.empty()) {
     ForwardInput restored_input = input;
     restore_json_object_states(restored_input);
@@ -1233,7 +1234,8 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
                                           processed_input,
                                           prepare_stream,
                                           record_ready_event,
-                                          wait_for_compute);
+                                          wait_for_compute,
+                                          restore_request_state);
     return;
   }
 #if defined(USE_NPU)
@@ -1358,7 +1360,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     // draft operations and fail discover_num_slots().
     if (has_request_state_cache()) {
       prepare_input_params_for_linear_attention(input_params);
-      if (!enable_schedule_overlap()) {
+      if (restore_request_state && !enable_schedule_overlap()) {
         prepare_linear_state_cache(input_params);
       }
     }

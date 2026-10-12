@@ -16,6 +16,7 @@ limitations under the License.
 #include "sequence_kv_state.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 
 namespace xllm {
@@ -126,11 +127,13 @@ std::vector<int32_t> KVCacheState::cache_slots(BlockType type,
   return slots;
 }
 
-void KVCacheState::add_blocks(BlockType type,
-                              const std::vector<Block>& new_blocks) {
+void KVCacheState::add_blocks(BlockType type, std::vector<Block>&& new_blocks) {
   remember_block_size(type, new_blocks);
   std::vector<Block>& bs = composite_blocks_[type];
-  bs.insert(bs.end(), new_blocks.begin(), new_blocks.end());
+  bs.insert(bs.end(),
+            std::make_move_iterator(new_blocks.begin()),
+            std::make_move_iterator(new_blocks.end()));
+  new_blocks.clear();
 }
 
 void KVCacheState::remember_block_size(BlockType type,

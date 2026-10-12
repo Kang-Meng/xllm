@@ -59,7 +59,7 @@ class XTensorBlockManagerImpl : public BlockManager {
   std::vector<Block> allocate(size_t num_blocks) override;
 
   // Deallocate blocks
-  void deallocate(const Slice<Block>& blocks) override;
+  void deallocate(std::vector<Block>&& blocks) override;
 
   // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
   // (physical allocate() maps VMM pages) and return them; the

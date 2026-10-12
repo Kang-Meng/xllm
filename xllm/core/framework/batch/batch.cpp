@@ -240,31 +240,6 @@ void Batch::add(const std::vector<Sequence*>& sequences) {
   }
 }
 
-void Batch::retain_cache_blocks() {
-  constexpr std::array<BlockType, 6> kBlockTypes = {BlockType::KV,
-                                                    BlockType::SWA,
-                                                    BlockType::C4,
-                                                    BlockType::C128,
-                                                    BlockType::EMBEDDING,
-                                                    BlockType::LINEAR};
-  const auto sequences = get_sequences();
-  size_t num_blocks = 0;
-  for (auto* sequence : sequences) {
-    for (const auto type : kBlockTypes) {
-      num_blocks += sequence->kv_state().num_blocks(type);
-    }
-  }
-  std::vector<Block> retained;
-  retained.reserve(num_blocks);
-  for (auto* sequence : sequences) {
-    for (const auto type : kBlockTypes) {
-      const auto blocks = sequence->kv_state().blocks(type);
-      retained.insert(retained.end(), blocks.begin(), blocks.end());
-    }
-  }
-  retained_cache_blocks_ = std::move(retained);
-}
-
 ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                                           uint32_t min_decoding_batch_size,
                                           const ModelArgs& args,

@@ -69,7 +69,8 @@ class KVCacheState {
                                    int32_t pos_start,
                                    int32_t pos_end);
 
-  void add_blocks(BlockType type, const std::vector<Block>& new_blocks);
+  // Append owned blocks and leave new_blocks empty for reuse by the caller.
+  void add_blocks(BlockType type, std::vector<Block>&& new_blocks);
   void add_shared_blocks(BlockType type,
                          std::vector<Block>&& blocks,
                          size_t current_total_num_tokens);

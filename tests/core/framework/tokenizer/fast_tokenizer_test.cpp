@@ -17,6 +17,7 @@ limitations under the License.
 #include "framework/tokenizer/fast_tokenizer.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -183,7 +184,8 @@ class FastTokenizerTest : public ::testing::Test {
  protected:
   void SetUp() override {
     // Create a temporary directory for test files
-    test_dir_ = std::filesystem::temp_directory_path() / "fast_tokenizer_test";
+    test_dir_ = std::filesystem::temp_directory_path() /
+                ("fast_tokenizer_test_" + std::to_string(getpid()));
     std::filesystem::create_directories(test_dir_);
 
     // Create test tokenizer.json file

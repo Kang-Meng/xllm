@@ -99,6 +99,31 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
         validate_input = std::move(*pending_draft_->target_input);
         validate_input.input_params.meta.batch_id =
             input.input_params.meta.batch_id;
+        auto& staged = validate_input.input_params.embedding;
+        const auto& current = input.input_params.embedding;
+        if (staged.linear_state_ids != current.linear_state_ids ||
+            staged.linear_state_read_ids != current.linear_state_read_ids) {
+          // Slot rotation does not invalidate the draft or attention layout.
+          // Refresh only recurrent-state addressing after scheduling; restore
+          // for backends without split read/write support remains deferred to
+          // the target worker's actual execution preparation.
+          c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
+          CHECK(
+              prepare_stream_->wait_event(validate_input.metadata_ready_event));
+          staged.linear_state_ids = current.linear_state_ids;
+          staged.linear_state_read_ids = current.linear_state_read_ids;
+          staged.linear_state_indices = torch::tensor(
+              staged.linear_state_ids, staged.linear_state_indices.options());
+          const auto& read_ids = staged.linear_state_read_ids.empty()
+                                     ? staged.linear_state_ids
+                                     : staged.linear_state_read_ids;
+          staged.linear_state_read_indices =
+              torch::tensor(read_ids, staged.linear_state_indices.options());
+          validate_input.input_params.attn_metadata->linear_state_indices =
+              staged.linear_state_indices;
+          validate_input.metadata_ready_event =
+              prepare_stream_->record_event_or_sync();
+        }
       } else {
         prepare_validate_inputs(input, validate_input);
       }
@@ -525,7 +550,6 @@ bool DFlash2WorkerImpl::pending_draft_matches(const ForwardInput& input) const {
   if (!can_stage_prelaunch_input(input) ||
       old.embedding.embedding_ids != current.embedding.embedding_ids ||
       old.embedding.request_ids != current.embedding.request_ids ||
-      old.embedding.linear_state_ids != current.embedding.linear_state_ids ||
       old.parallel.dp_global_batch_generations !=
           current.parallel.dp_global_batch_generations ||
       old.parallel.dp_global_token_nums !=
@@ -628,12 +652,16 @@ void DFlash2WorkerImpl::prepare_next_target(const ForwardInput& input) {
   // Finish the target worker's input preparation and the C++ -> Python
   // attention metadata here too. In particular, materializing the recurrent
   // validity mask on compute_stream_ would synchronize it behind the draft.
+  // The scheduler has not selected next iteration's state slots yet. Restoring
+  // with this iteration's read/write ids would overwrite its completed verify
+  // state. run_worker_no_sync restores the confirmed input before execution.
   ForwardInput processed_target;
   impl_->prepare_work_before_execute_on_stream(*pending.target_input,
                                                processed_target,
                                                *prepare_stream_,
                                                /*record_ready_event=*/false,
-                                               /*wait_for_compute=*/false);
+                                               /*wait_for_compute=*/false,
+                                               /*restore_request_state=*/false);
   {
     c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
     processed_target.input_params.attn_metadata =

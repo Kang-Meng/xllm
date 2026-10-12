@@ -9,6 +9,7 @@
 #include <limits>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -835,18 +836,16 @@ TEST(ContinuousSchedulerTest, CancelledOverlapRequestReleasesBeforeResult) {
 // worker_impl.h; LLMWorkerImpl::step_for_schedule_overlap chains the deferred
 // linear-state restore and the step on compute_stream_), so a freed block
 // reallocated into the next batch is only written by device work ordered
-// after the in-flight step. That is why LLMEngine::step's
-// retain_cache_blocks guard is DFlash2-only (see
-// llm_engine_host_transfer_test for the engine-side pin): DFlash2's
-// prelaunch enqueues KV writes one additional step ahead, outside this FIFO
-// window. A CP prefill lifting the glm5_next overlap ban (M11.6) relies on
-// exactly this ordering, since the engine broadcasts one batch to every CP
-// rank of the DP group.
+// after the in-flight step. DFlash2's prelaunch enqueues KV writes one
+// additional step ahead, outside this FIFO window, so finish_draft_prelaunch
+// retires those writes before returning accepted tokens. The real-device
+// fence and subsequent reuse are covered by dflash2_prelaunch_lifecycle_test.
 // ===========================================================================
 
 class OverlapFinishEngine final : public FakeEngine {
  public:
-  OverlapFinishEngine() : FakeEngine(32, 4) {}
+  explicit OverlapFinishEngine(int32_t block_size = 4)
+      : FakeEngine(32, block_size) {}
 
   ForwardOutput step(std::vector<Batch>& batches) override {
     ++step_calls_;
@@ -859,6 +858,8 @@ class OverlapFinishEngine final : public FakeEngine {
       for (Sequence* sequence : batch.get_sequences()) {
         // The batch being dispatched still references live blocks.
         EXPECT_TRUE(sequence->has_any_blocks());
+        dispatched_blocks_[sequence->request_id()].emplace_back(
+            block_ids(*sequence));
         RawSampleOutput sample;
         RawToken token;
         // Stage-1 append under overlap: the driver's fake output is a
@@ -881,18 +882,16 @@ class OverlapFinishEngine final : public FakeEngine {
       }
       RawForwardOutput output;
       for (Sequence* sequence : batch.get_sequences()) {
-        if (completed_batches_ == 1u) {
-          // First deferred collection: the request has not been collected as
-          // finished yet, so its blocks are still allocated.
-          EXPECT_TRUE(sequence->has_any_blocks());
-        } else {
-          // Later deferred collections: collect_finished of THIS step
-          // already deallocated the finished request's blocks before the
-          // in-flight batch's result is collected here. The sequence object
-          // itself must still be alive -- last_running_requests_ keeps the
-          // request alive until this collection completes.
+        collected_blocks_[sequence->request_id()].emplace_back(
+            block_ids(*sequence));
+        if (sequence->finished()) {
+          // collect_finished has freed the finished request's blocks. The
+          // scheduler snapshot must still keep the sequence object alive.
+          dispatches_at_finished_collection_ = step_calls_;
           EXPECT_EQ(sequence->kv_cache_tokens_num(), 0u);
           EXPECT_FALSE(sequence->has_any_blocks());
+        } else {
+          EXPECT_TRUE(sequence->has_any_blocks());
         }
         RawSampleOutput sample;
         RawToken token;
@@ -906,10 +905,37 @@ class OverlapFinishEngine final : public FakeEngine {
 
   size_t step_calls() const { return step_calls_; }
   size_t completed_batches() const { return completed_batches_; }
+  size_t dispatches_at_finished_collection() const {
+    return dispatches_at_finished_collection_;
+  }
+
+  const std::vector<std::vector<int32_t>>& dispatched_blocks(
+      const std::string& request_id) const {
+    return dispatched_blocks_.at(request_id);
+  }
+
+  const std::vector<std::vector<int32_t>>& collected_blocks(
+      const std::string& request_id) const {
+    return collected_blocks_.at(request_id);
+  }
 
  private:
+  static std::vector<int32_t> block_ids(Sequence& sequence) {
+    std::vector<int32_t> ids;
+    ids.reserve(sequence.kv_state().num_blocks(BlockType::KV));
+    for (const Block& block : sequence.kv_state().blocks(BlockType::KV)) {
+      ids.emplace_back(block.id());
+    }
+    return ids;
+  }
+
   size_t step_calls_ = 0;
   size_t completed_batches_ = 0;
+  size_t dispatches_at_finished_collection_ = 0;
+  std::unordered_map<std::string, std::vector<std::vector<int32_t>>>
+      dispatched_blocks_;
+  std::unordered_map<std::string, std::vector<std::vector<int32_t>>>
+      collected_blocks_;
 };
 
 TEST(ContinuousSchedulerTest, OverlapFinishedRequestOutlivesInflightResult) {
@@ -971,6 +997,105 @@ TEST(ContinuousSchedulerTest, OverlapFinishedRequestOutlivesInflightResult) {
   // The scheduler no longer holds the request: the deferred pipeline drained
   // and the last_running_requests_ snapshot was replaced.
   EXPECT_TRUE(watch.expired());
+  EXPECT_EQ(engine.block_manager_pool()->num_free_blocks().front(),
+            initial_free_blocks);
+}
+
+TEST(ContinuousSchedulerTest,
+     OverlapMixedBatchReusesFinishedBlocksBeforeInflightCollection) {
+  ScopedConfigValue<bool> overlap(
+      SchedulerConfig::get_instance().enable_schedule_overlap(), true);
+  OverlapFinishEngine engine(/*block_size=*/128);
+  ContinuousScheduler::Options options =
+      create_scheduler_options(16, 4, 0, 4, 1);
+  options.enable_schedule_overlap(true);
+  TestContinuousScheduler scheduler(&engine, options);
+  const auto make_request = [](const std::string& id, int32_t max_tokens) {
+    const std::vector<int32_t> prompt{1, 2, 3, 4};
+    StoppingChecker stopping;
+    stopping.set_max_generated_tokens(max_tokens);
+    stopping.set_max_context_len(32);
+    stopping.set_ignore_eos(true);
+    RequestState state(
+        "x",
+        prompt,
+        RequestSamplingParam(),
+        SchedulerParam(),
+        stopping,
+        /*seq_capacity=*/128,
+        /*n=*/1,
+        /*best_of=*/1,
+        /*logprobs=*/false,
+        /*stream=*/false,
+        /*echo=*/false,
+        /*skip_special_tokens=*/false,
+        /*enable_schedule_overlap=*/true,
+        [](const RequestOutput&) { return true; },
+        /*outputs_func=*/nullptr);
+    return std::make_shared<Request>(id, id, id, std::move(state), id);
+  };
+  auto ending = make_request("ending", 1);
+  auto continuing = make_request("continuing", 3);
+  const std::weak_ptr<Request> ending_watch = ending;
+  const std::weak_ptr<Request> continuing_watch = continuing;
+  const size_t initial_free_blocks =
+      engine.block_manager_pool()->num_free_blocks().front();
+  scheduler.add_request(ending);
+  scheduler.add_request(continuing);
+  ending.reset();
+  continuing.reset();
+
+  scheduler.step(absl::ZeroDuration());
+  // Dispatch the next mixed batch, then commit the first result. Only the
+  // ending request reaches its token limit; both requests still have a
+  // deferred result to collect.
+  scheduler.step(absl::ZeroDuration());
+  ASSERT_FALSE(ending_watch.expired());
+  ASSERT_FALSE(continuing_watch.expired());
+  auto replacement = make_request("replacement", 1);
+  const std::weak_ptr<Request> replacement_watch = replacement;
+  scheduler.add_request(replacement);
+  replacement.reset();
+  // Reclaim the ending request's block and dispatch the replacement before
+  // collecting the old mixed batch. Its finished sequence remains readable.
+  scheduler.step(absl::ZeroDuration());
+
+  const auto& ending_dispatches = engine.dispatched_blocks("ending");
+  const auto& replacement_dispatches = engine.dispatched_blocks("replacement");
+  const auto& continuing_dispatches = engine.dispatched_blocks("continuing");
+  ASSERT_EQ(ending_dispatches.size(), 2u);
+  ASSERT_EQ(ending_dispatches.front().size(), 1u);
+  ASSERT_EQ(replacement_dispatches.size(), 1u);
+  // The replacement's dispatch must already have happened when the finished
+  // row of the previous batch is collected.
+  EXPECT_EQ(engine.dispatches_at_finished_collection(), 3u);
+  EXPECT_EQ(replacement_dispatches.front(), ending_dispatches.front());
+  const auto& ending_collections = engine.collected_blocks("ending");
+  ASSERT_EQ(ending_collections.size(), 2u);
+  EXPECT_EQ(ending_collections.front(), ending_dispatches.front());
+  EXPECT_TRUE(ending_collections.back().empty());
+  ASSERT_EQ(continuing_dispatches.size(), 3u);
+  ASSERT_EQ(continuing_dispatches.front().size(), 1u);
+  for (const auto& ids : continuing_dispatches) {
+    EXPECT_EQ(ids, continuing_dispatches.front());
+    EXPECT_NE(ids, replacement_dispatches.front());
+  }
+  const auto& continuing_collections = engine.collected_blocks("continuing");
+  ASSERT_EQ(continuing_collections.size(), 2u);
+  for (const auto& ids : continuing_collections) {
+    EXPECT_EQ(ids, continuing_dispatches.front());
+  }
+
+  // Finish the continuing and replacement requests and drain the final
+  // deferred batch, checking that every request and block is released.
+  scheduler.step(absl::ZeroDuration());
+  scheduler.step(absl::ZeroDuration());
+  scheduler.wait_for_responses();
+  EXPECT_EQ(engine.step_calls(), 4u);
+  EXPECT_EQ(engine.completed_batches(), 4u);
+  EXPECT_TRUE(ending_watch.expired());
+  EXPECT_TRUE(continuing_watch.expired());
+  EXPECT_TRUE(replacement_watch.expired());
   EXPECT_EQ(engine.block_manager_pool()->num_free_blocks().front(),
             initial_free_blocks);
 }

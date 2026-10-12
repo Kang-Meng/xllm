@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 
 #include "block_manager_impl.h"
@@ -541,7 +542,7 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   std::map<BlockType, std::vector<Block>> staged;
   auto release_staged = [&]() {
     for (auto& [type, blocks] : staged) {
-      leaf_of(type)->deallocate(blocks);
+      leaf_of(type)->deallocate(std::move(blocks));
     }
     staged.clear();
   };
@@ -586,7 +587,7 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   // cursor bounds publication, so newly allocated compute blocks are not
   // cached until their tokens have been forwarded.
   for (auto& [type, blocks] : staged) {
-    kv_state.add_blocks(type, blocks);
+    kv_state.add_blocks(type, std::move(blocks));
   }
   staged.clear();
   cache_full_blocks_for_sequence(seq);
@@ -631,7 +632,7 @@ void CompositeBlockManager::deallocate_for_sequence(Sequence* seq,
   // the pool caller.
   cache_for_sequence(seq);
   for (auto& [type, entry] : leaves_) {
-    entry.leaf->deallocate(kv_state.blocks(type));
+    entry.leaf->deallocate(kv_state.take_blocks(type));
   }
 }
 
@@ -699,8 +700,7 @@ void CompositeBlockManager::release_probes(std::vector<ProbeResult>* probes) {
     if (probe.blocks.empty()) {
       continue;
     }
-    probe.leaf->deallocate(probe.blocks);
-    probe.blocks.clear();
+    probe.leaf->deallocate(std::move(probe.blocks));
   }
   probes->clear();
 }
@@ -1033,38 +1033,25 @@ std::vector<Block> CompositeBlockManager::allocate_blocks(BlockType type,
   return leaf->allocate(num_blocks);
 }
 
-void CompositeBlockManager::deallocate(const Slice<Block>& blocks) {
-  // Route each contiguous run to its owning leaf by Block::manager().
+void CompositeBlockManager::deallocate(std::vector<Block>&& blocks) {
+  // Route each block to its owning leaf while transferring ownership.
   if (blocks.empty()) {
     return;
   }
-  size_t run_start = 0;
-  BlockManager* run_manager = nullptr;
-  for (size_t i = 0; i < blocks.size(); ++i) {
-    const auto& block = blocks[i];
+  std::unordered_map<BlockManager*, std::vector<Block>> grouped;
+  for (auto& block : blocks) {
     if (!block.is_valid()) {
-      if (run_manager != nullptr) {
-        run_manager->deallocate(blocks.slice(run_start, i));
-        run_manager = nullptr;
-      }
-      run_start = i + 1;
       continue;
     }
     BlockManager* manager = block.manager();
     CHECK(manager != nullptr)
         << "CompositeBlockManager got a valid block without owner manager";
-    if (run_manager == nullptr) {
-      run_manager = manager;
-      run_start = i;
-    } else if (run_manager != manager) {
-      run_manager->deallocate(blocks.slice(run_start, i));
-      run_manager = manager;
-      run_start = i;
-    }
+    grouped[manager].emplace_back(std::move(block));
   }
-  if (run_manager != nullptr) {
-    run_manager->deallocate(blocks.slice(run_start, blocks.size()));
+  for (auto& [manager, owned_blocks] : grouped) {
+    manager->deallocate(std::move(owned_blocks));
   }
+  blocks.clear();
 }
 
 std::vector<Block> CompositeBlockManager::allocate(size_t /*num_blocks*/) {

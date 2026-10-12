@@ -89,7 +89,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
                std::move(decoder),
                seq_params);
 
-  seq.add_blocks(BlockType::KV, manager.allocate(1));
+  seq.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
 
   Sequence second_sequence(1,
                            {5, 6, 7, 8},
@@ -97,7 +97,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
                            mm_data,
                            IncrementalDecoder("", 1, false, false),
                            seq_params);
-  second_sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  second_sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
 
   std::vector<Sequence*> sequences = {&seq, &second_sequence};
   std::vector<uint32_t> budgets = {4, 4};
@@ -197,7 +197,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresSampleIdxes) {
                std::move(decoder),
                seq_params);
 
-  seq.add_blocks(BlockType::KV, manager.allocate(1));
+  seq.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
 
   std::vector<Sequence*> sequences = {&seq};
   std::vector<uint32_t> budgets = {4};
@@ -385,7 +385,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyToPreservesJsonMetadata) {
                     mm_data,
                     std::move(decoder),
                     seq_params);
-  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
 
   std::vector<Sequence*> sequences = {&sequence};
   std::vector<uint32_t> allowed_max_tokens = {4};
@@ -465,7 +465,7 @@ TEST(BatchPackedInputTest, PackedProtoRejectsIncompatibleLayoutHeader) {
                     mm_data,
                     std::move(decoder),
                     seq_params);
-  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
 
   std::vector<Sequence*> sequences = {&sequence};
   std::vector<uint32_t> allowed_max_tokens = {4};

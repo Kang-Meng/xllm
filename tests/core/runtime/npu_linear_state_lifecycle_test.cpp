@@ -238,6 +238,21 @@ class LifecycleWorker final : public LLMWorkerImpl {
     prepare_linear_state_cache(params);
   }
 
+  StateSnapshot stage_prelaunch_metadata(const ForwardInput& input) {
+    ForwardInput processed;
+    prepare_work_before_execute_on_stream(input,
+                                          processed,
+                                          *prepare_stream_,
+                                          /*record_ready_event=*/true,
+                                          /*wait_for_compute=*/false,
+                                          /*restore_request_state=*/false);
+    CHECK_EQ(prepare_stream_->synchronize(), 0);
+    auto guard = compute_stream_->set_stream_guard();
+    StateSnapshot snapshot = clone_states(states_);
+    CHECK_EQ(compute_stream_->synchronize(), 0);
+    return snapshot;
+  }
+
   std::optional<ForwardOutput> execute_no_sync_on_stream(
       const ForwardInput& input,
       Stream& compute_stream) override {
@@ -607,6 +622,20 @@ TEST_P(NpuGlm5NextPythonRestoreTest, SpecVerifyPrefillRestoreTakesCopyPath) {
                                /*is_spec_verify=*/true);
   run(input, {1});
   verify();
+}
+
+TEST_P(NpuGlm5NextPythonRestoreTest,
+       PrelaunchMetadataPreservesCompletedVerifyState) {
+  // DFlash's inner target has overlap disabled. Its next-target preparation
+  // uses wait_for_compute=false before the scheduler confirms the next slots.
+  // The old read slot must not overwrite the just-written live state here.
+  ForwardInput input = prepare({2},
+                               {2},
+                               {2050},
+                               BatchForwardType::DECODE,
+                               /*is_spec_verify=*/true);
+  input.input_params.embedding.linear_state_read_ids = {1};
+  expect_bitwise_equal(worker_->stage_prelaunch_metadata(input), reference_);
 }
 
 INSTANTIATE_TEST_SUITE_P(

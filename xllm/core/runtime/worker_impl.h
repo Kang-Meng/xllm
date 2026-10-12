@@ -119,11 +119,14 @@ class WorkerImpl {
   virtual void prepare_work_before_execute(const ForwardInput& inputs,
                                            ForwardInput& processed_inputs);
   virtual void restore_json_object_states(ForwardInput& input);
+  // Speculative metadata staging precedes the scheduler's next slot assignment.
+  // It must defer request-state restoration until the actual execution input.
   void prepare_work_before_execute_on_stream(const ForwardInput& input,
                                              ForwardInput& processed_input,
                                              Stream& prepare_stream,
                                              bool record_ready_event = true,
-                                             bool wait_for_compute = true);
+                                             bool wait_for_compute = true,
+                                             bool restore_request_state = true);
 #if defined(USE_NPU)
   // Per-worker-static configuration handed to NpuCpPlan::prepare(); built once
   // and cached.

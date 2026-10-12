@@ -21,9 +21,9 @@ namespace xllm {
 
 TEST(KVCacheStateTest, KvProgressDoesNotChangeLinearBlocks) {
   KVCacheState state;
-  state.add_blocks(BlockType::LINEAR, {Block(1, nullptr)});
+  state.add_blocks(BlockType::LINEAR, std::vector<Block>{Block(1, nullptr)});
   state.set_kv_cache_tokens_num(4);
-  state.add_blocks(BlockType::LINEAR, {Block(2, nullptr)});
+  state.add_blocks(BlockType::LINEAR, std::vector<Block>{Block(2, nullptr)});
   state.set_kv_cache_tokens_num(8);
   ASSERT_EQ(state.num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(state.blocks(BlockType::LINEAR)[0].id(), 1);
@@ -35,7 +35,8 @@ TEST(KVCacheStateTest, KvProgressDoesNotChangeLinearBlocks) {
 TEST(KVCacheStateTest, LinearBlocksPreserveUnallocatedLogicalIntervals) {
   KVCacheState state;
   state.add_blocks(BlockType::LINEAR,
-                   {Block(1, nullptr), Block(), Block(), Block(2, nullptr)});
+                   std::vector<Block>{
+                       Block(1, nullptr), Block(), Block(), Block(2, nullptr)});
   const Slice<Block> blocks = state.blocks(BlockType::LINEAR);
   ASSERT_EQ(blocks.size(), 4u);
   EXPECT_EQ(blocks[0].id(), 1);
@@ -84,8 +85,10 @@ TEST(KVCacheStateTest, PrefixMatchStateIsIndependentAndMovable) {
   state.set_prefix_cache_matched();
   EXPECT_TRUE(state.prefix_cache_matched());
 
-  Block block(/*id=*/7, /*allocator=*/nullptr);
-  state.add_blocks(BlockType::KV, {block});
+  std::vector<Block> blocks;
+  blocks.emplace_back(/*id=*/7, /*allocator=*/nullptr);
+  state.add_blocks(BlockType::KV, std::move(blocks));
+  EXPECT_TRUE(blocks.empty());
   std::vector<Block> moved = state.take_blocks(BlockType::KV);
   ASSERT_EQ(moved.size(), 1u);
   EXPECT_FALSE(state.has_any_blocks());
@@ -93,6 +96,26 @@ TEST(KVCacheStateTest, PrefixMatchStateIsIndependentAndMovable) {
 
   state.reset();
   EXPECT_FALSE(state.prefix_cache_matched());
+}
+
+TEST(KVCacheStateTest, ReusingConsumedVectorDoesNotAppendMovedFromSlots) {
+  KVCacheState state;
+  std::vector<Block> blocks;
+  blocks.reserve(2);
+  blocks.emplace_back(/*id=*/7, /*allocator=*/nullptr);
+  blocks.emplace_back();
+  state.add_blocks(BlockType::KV, std::move(blocks));
+  ASSERT_TRUE(blocks.empty());
+  blocks.emplace_back(/*id=*/8, /*allocator=*/nullptr);
+  state.add_blocks(BlockType::KV, std::move(blocks));
+  EXPECT_TRUE(blocks.empty());
+  const Slice<Block> owned = state.blocks(BlockType::KV);
+  ASSERT_EQ(owned.size(), 3u);
+  EXPECT_EQ(owned[0].id(), 7);
+  EXPECT_FALSE(owned[1].is_valid());
+  EXPECT_EQ(owned[2].id(), 8);
+  EXPECT_EQ(owned[0].ref_count(), 1u);
+  EXPECT_EQ(owned[2].ref_count(), 1u);
 }
 
 // Finding 2 regression: has_any_blocks() must report true for ANY
