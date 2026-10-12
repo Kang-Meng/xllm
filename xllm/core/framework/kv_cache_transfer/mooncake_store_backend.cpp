@@ -18,8 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <exception>
 #include <limits>
-#include <stdexcept>
 #include <utility>
 
 namespace xllm {
@@ -28,8 +28,8 @@ MooncakeStoreBackend::~MooncakeStoreBackend() { unregister_ranges(); }
 
 bool MooncakeStoreBackend::init(
     const MooncakeStoreBackendConfig& config,
-    const std::vector<MooncakeRegisteredRange>& ranges) {
-  const std::optional<std::vector<MooncakeRegisteredRange>> unique =
+    const std::vector<StoreRegisteredRange>& ranges) {
+  const std::optional<std::vector<StoreRegisteredRange>> unique =
       unique_ranges(ranges);
   if (!unique.has_value()) {
     LOG(ERROR) << "Invalid Mooncake Host tensor registration ranges.";
@@ -59,7 +59,7 @@ bool MooncakeStoreBackend::init(
     }
     rep_config_.replica_num = config.replica_num;
     registered_ranges_.reserve(unique->size());
-    for (const MooncakeRegisteredRange& range : *unique) {
+    for (const StoreRegisteredRange& range : *unique) {
       const int register_result =
           client_ptr_->register_buffer(range.address, range.bytes);
       if (register_result != 0) {
@@ -87,7 +87,7 @@ bool MooncakeStoreBackend::init(
 
 std::vector<uint8_t> MooncakeStoreBackend::batch_put(
     const std::vector<std::string>& keys,
-    const std::vector<MooncakeMultiBuffer>& buffers) {
+    const std::vector<MultiBuffer>& buffers) {
   std::vector<uint8_t> statuses(keys.size(), /*value=*/0);
   if (client_ptr_ == nullptr || keys.size() != buffers.size()) {
     LOG(ERROR) << "Invalid Mooncake multi-buffer Put request.";
@@ -98,7 +98,7 @@ std::vector<uint8_t> MooncakeStoreBackend::batch_put(
   std::vector<std::vector<size_t>> all_sizes;
   all_buffers.reserve(buffers.size());
   all_sizes.reserve(buffers.size());
-  for (const MooncakeMultiBuffer& buffer : buffers) {
+  for (const MultiBuffer& buffer : buffers) {
     all_buffers.emplace_back(buffer.addresses);
     all_sizes.emplace_back(buffer.sizes);
   }
@@ -121,48 +121,71 @@ std::vector<uint8_t> MooncakeStoreBackend::batch_put(
   return statuses;
 }
 
-bool MooncakeStoreBackend::get(const std::string& key,
-                               const MooncakeMultiBuffer& buffer) {
-  if (client_ptr_ == nullptr ||
-      buffer.addresses.size() != buffer.sizes.size()) {
-    LOG(ERROR) << "Invalid Mooncake multi-buffer Get request for key=" << key;
-    return false;
+std::vector<uint8_t> MooncakeStoreBackend::batch_get(
+    const std::vector<std::string>& keys,
+    const std::vector<MultiBuffer>& buffers) {
+  std::vector<uint8_t> statuses(keys.size(), /*value=*/0);
+  if (keys.size() != buffers.size()) {
+    LOG(ERROR) << "Mismatched Mooncake batch Get keys and buffers: keys="
+               << keys.size() << " buffers=" << buffers.size();
+    return statuses;
+  }
+  if (keys.empty()) {
+    return statuses;
+  }
+  if (client_ptr_ == nullptr) {
+    LOG(ERROR) << "Mooncake batch Get client is not initialized: batch_size="
+               << keys.size() << " first_key=" << keys.front();
+    return statuses;
   }
 
-  int64_t expected_bytes = 0;
-  for (const size_t size : buffer.sizes) {
-    if (size > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
-        expected_bytes >
-            std::numeric_limits<int64_t>::max() - static_cast<int64_t>(size)) {
-      LOG(ERROR) << "Mooncake Get size overflows for key=" << key;
-      return false;
+  std::vector<std::string> get_keys;
+  std::vector<std::vector<void*>> all_buffers;
+  std::vector<std::vector<size_t>> all_sizes;
+  std::vector<int32_t> expected_bytes;
+  std::vector<size_t> request_indices;
+  get_keys.reserve(keys.size());
+  all_buffers.reserve(buffers.size());
+  all_sizes.reserve(buffers.size());
+  expected_bytes.reserve(buffers.size());
+  request_indices.reserve(keys.size());
+  for (size_t index = 0; index < buffers.size(); ++index) {
+    const MultiBuffer& buffer = buffers[index];
+    const std::optional<int32_t> bytes = get_bytes(buffer);
+    if (!bytes.has_value()) {
+      LOG(ERROR) << "Invalid Mooncake Get buffer: index=" << index
+                 << " key=" << keys[index] << " batch_size=" << keys.size()
+                 << " addresses=" << buffer.addresses.size()
+                 << " sizes=" << buffer.sizes.size()
+                 << "; requires matching counts and total bytes <= INT32_MAX.";
+      continue;
     }
-    expected_bytes += static_cast<int64_t>(size);
+    get_keys.emplace_back(keys[index]);
+    expected_bytes.emplace_back(*bytes);
+    all_buffers.emplace_back(buffer.addresses);
+    all_sizes.emplace_back(buffer.sizes);
+    request_indices.emplace_back(index);
   }
-  if (expected_bytes > std::numeric_limits<int32_t>::max()) {
-    LOG(ERROR) << "Mooncake Get exceeds int32 result range for key=" << key;
-    return false;
+  if (get_keys.empty()) {
+    return statuses;
   }
 
-  try {
-    const std::vector<std::string> keys = {key};
-    const std::vector<std::vector<void*>> all_buffers = {buffer.addresses};
-    const std::vector<std::vector<size_t>> all_sizes = {buffer.sizes};
-    const std::vector<int> results =
-        client_ptr_->batch_get_into_multi_buffers(keys,
-                                                  all_buffers,
-                                                  all_sizes,
-                                                  /*prefer_same_node=*/false);
-    if (results.size() > 1) {
-      LOG(ERROR) << "Mooncake Get returned extra result items for key=" << key;
-    }
-    return get_succeeded(expected_bytes, results);
-  } catch (const std::exception& error) {
-    LOG(ERROR) << "Mooncake Get failed for key=" << key << ": " << error.what();
-  } catch (...) {
-    LOG(ERROR) << "Mooncake Get failed unexpectedly for key=" << key;
+  // Error codes are per object. Unexpected exceptions cannot identify which
+  // writes completed, so they propagate instead of being converted to misses.
+  const std::vector<int> results = client_ptr_->batch_get_into_multi_buffers(
+      get_keys, all_buffers, all_sizes, /*prefer_same_node=*/false);
+  if (results.size() != get_keys.size()) {
+    LOG(ERROR) << "Mooncake batch Get result count mismatch: batch_size="
+               << keys.size() << " submitted=" << get_keys.size()
+               << " results=" << results.size()
+               << " first_key=" << get_keys.front();
   }
-  return false;
+  const std::vector<uint8_t> get_results =
+      get_statuses(expected_bytes, results);
+  for (size_t index = 0; index < request_indices.size(); ++index) {
+    statuses[request_indices[index]] = get_results[index];
+  }
+  return statuses;
 }
 
 std::vector<MooncakeReplicaTier> MooncakeStoreBackend::batch_query_tiers(
@@ -208,12 +231,12 @@ MooncakeReplicaTier MooncakeStoreBackend::replica_tier(
   return tier;
 }
 
-std::optional<std::vector<MooncakeRegisteredRange>>
+std::optional<std::vector<StoreRegisteredRange>>
 MooncakeStoreBackend::unique_ranges(
-    const std::vector<MooncakeRegisteredRange>& ranges) {
-  std::vector<MooncakeRegisteredRange> unique;
+    const std::vector<StoreRegisteredRange>& ranges) {
+  std::vector<StoreRegisteredRange> unique;
   unique.reserve(ranges.size());
-  for (const MooncakeRegisteredRange& range : ranges) {
+  for (const StoreRegisteredRange& range : ranges) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(range.address);
     if (range.address == nullptr || range.bytes == 0 ||
         range.bytes > std::numeric_limits<uintptr_t>::max() - address) {
@@ -222,7 +245,7 @@ MooncakeStoreBackend::unique_ranges(
     const auto same_address = std::find_if(
         unique.begin(),
         unique.end(),
-        [address](const MooncakeRegisteredRange& item) {
+        [address](const StoreRegisteredRange& item) {
           return reinterpret_cast<uintptr_t>(item.address) == address;
         });
     if (same_address == unique.end()) {
@@ -232,16 +255,16 @@ MooncakeStoreBackend::unique_ranges(
     }
   }
 
-  std::vector<MooncakeRegisteredRange> ordered = unique;
-  std::sort(ordered.begin(),
-            ordered.end(),
-            [](const MooncakeRegisteredRange& lhs,
-               const MooncakeRegisteredRange& rhs) {
-              return reinterpret_cast<uintptr_t>(lhs.address) <
-                     reinterpret_cast<uintptr_t>(rhs.address);
-            });
+  std::vector<StoreRegisteredRange> ordered = unique;
+  std::sort(
+      ordered.begin(),
+      ordered.end(),
+      [](const StoreRegisteredRange& lhs, const StoreRegisteredRange& rhs) {
+        return reinterpret_cast<uintptr_t>(lhs.address) <
+               reinterpret_cast<uintptr_t>(rhs.address);
+      });
   for (size_t range_index = 1; range_index < ordered.size(); ++range_index) {
-    const MooncakeRegisteredRange& previous = ordered[range_index - 1];
+    const StoreRegisteredRange& previous = ordered[range_index - 1];
     const uintptr_t previous_end =
         reinterpret_cast<uintptr_t>(previous.address) + previous.bytes;
     if (reinterpret_cast<uintptr_t>(ordered[range_index].address) <
@@ -252,14 +275,33 @@ MooncakeStoreBackend::unique_ranges(
   return unique;
 }
 
-bool MooncakeStoreBackend::get_succeeded(int64_t expected_bytes,
-                                         const std::vector<int>& results) {
-  if (expected_bytes < 0 ||
-      expected_bytes > std::numeric_limits<int32_t>::max() || results.empty()) {
-    return false;
+std::optional<int32_t> MooncakeStoreBackend::get_bytes(
+    const MultiBuffer& buffer) {
+  if (buffer.addresses.size() != buffer.sizes.size()) {
+    return std::nullopt;
   }
-  const int32_t result = static_cast<int32_t>(results.front());
-  return result >= 0 && result == static_cast<int32_t>(expected_bytes);
+  size_t bytes = 0;
+  const size_t max_bytes =
+      static_cast<size_t>(std::numeric_limits<int32_t>::max());
+  for (const size_t size : buffer.sizes) {
+    if (size > max_bytes - bytes) {
+      return std::nullopt;
+    }
+    bytes += size;
+  }
+  return static_cast<int32_t>(bytes);
+}
+
+std::vector<uint8_t> MooncakeStoreBackend::get_statuses(
+    const std::vector<int32_t>& expected_bytes,
+    const std::vector<int>& results) {
+  std::vector<uint8_t> statuses(expected_bytes.size(), /*value=*/0);
+  const size_t result_count = std::min(expected_bytes.size(), results.size());
+  for (size_t index = 0; index < result_count; ++index) {
+    statuses[index] =
+        results[index] >= 0 && results[index] == expected_bytes[index] ? 1 : 0;
+  }
+  return statuses;
 }
 
 bool MooncakeStoreBackend::put_succeeded(int result) {

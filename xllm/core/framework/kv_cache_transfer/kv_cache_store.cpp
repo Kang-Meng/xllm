@@ -26,6 +26,7 @@ limitations under the License.
 #include <unordered_set>
 #include <utility>
 
+#include "framework/kv_cache_transfer/mooncake_store_backend.h"
 #include "util/hash_util.h"
 #include "util/timer.h"
 
@@ -79,7 +80,7 @@ bool KVCacheStore::init(const KVCacheStoreInitConfig& config,
                  << config_.protocol << ".";
   }
 
-  const std::optional<std::vector<MooncakeRegisteredRange>> ranges =
+  const std::optional<std::vector<StoreRegisteredRange>> ranges =
       collect_ranges();
   if (!ranges.has_value()) {
     LOG(ERROR) << "Failed to collect Mooncake Host tensor ranges.";
@@ -92,12 +93,12 @@ bool KVCacheStore::init(const KVCacheStoreInitConfig& config,
   backend_config.metadata_server = config_.metadata_server;
   backend_config.master_server_address = config_.master_server_address;
   backend_config.replica_num = config_.replica_num;
-  backend_ = std::make_unique<MooncakeStoreBackend>();
-  if (!backend_->init(backend_config, *ranges)) {
-    backend_.reset();
+  auto backend = std::make_unique<MooncakeStoreBackend>();
+  if (!backend->init(backend_config, *ranges)) {
     return false;
   }
 
+  transport_ = std::move(backend);
   is_initialized_ = true;
   return true;
 }
@@ -110,7 +111,7 @@ std::optional<std::string> KVCacheStore::get_store_device_names(
   return config.rdma_devices;
 }
 
-KVCacheStore::~KVCacheStore() { backend_.reset(); }
+KVCacheStore::~KVCacheStore() = default;
 
 void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
   CHECK(store_index_.empty()) << "KVCacheStore index is already initialized.";
@@ -362,7 +363,7 @@ uint32_t KVCacheStore::batch_put(
 
   std::vector<uint8_t> physical_results(requests.size(), /*value=*/0);
   std::vector<std::string> put_keys;
-  std::vector<MooncakeMultiBuffer> put_buffers;
+  std::vector<MultiBuffer> put_buffers;
   std::vector<size_t> put_group_indices;
   put_keys.reserve(groups.size());
   put_buffers.reserve(groups.size());
@@ -376,7 +377,7 @@ uint32_t KVCacheStore::batch_put(
       }
       continue;
     }
-    const std::optional<MooncakeMultiBuffer> buffer = build_multi_buffer(
+    const std::optional<MultiBuffer> buffer = build_multi_buffer(
         *request.entry,
         block_transfer_info[request.logical_index].dst_block_id);
     if (!buffer.has_value()) {
@@ -387,11 +388,11 @@ uint32_t KVCacheStore::batch_put(
     put_group_indices.emplace_back(group_index);
   }
 
-  if (!put_keys.empty() && backend_ != nullptr) {
+  if (!put_keys.empty() && transport_ != nullptr) {
     const std::vector<uint8_t> results =
-        backend_->batch_put(put_keys, put_buffers);
-    for (size_t result_index = 0; result_index < put_group_indices.size() &&
-                                  result_index < results.size();
+        transport_->batch_put(put_keys, put_buffers);
+    CHECK_EQ(results.size(), put_keys.size());
+    for (size_t result_index = 0; result_index < put_group_indices.size();
          ++result_index) {
       if (results[result_index] == 0) {
         continue;
@@ -441,39 +442,54 @@ std::vector<uint8_t> KVCacheStore::batch_get_with_status(
   }
 
   std::vector<MooncakeReplicaTier> tiers;
-  if (stats != nullptr && backend_ != nullptr) {
+  if (stats != nullptr && transport_ != nullptr) {
     std::vector<std::string> keys;
     keys.reserve(requests.size());
     for (const PhysicalRequest& request : requests) {
       keys.emplace_back(request.key);
     }
     const Timer tier_timer;
-    tiers = backend_->batch_query_tiers(keys);
+    tiers = transport_->batch_query_tiers(keys);
+    CHECK_EQ(tiers.size(), keys.size());
     stats->tier_query_us +=
         static_cast<uint64_t>(tier_timer.elapsed_microseconds());
   }
 
   std::vector<uint8_t> physical_results(requests.size(), /*value=*/0);
+  std::vector<std::string> get_keys;
+  std::vector<MultiBuffer> get_buffers;
+  std::vector<size_t> get_request_indices;
+  get_keys.reserve(requests.size());
+  get_buffers.reserve(requests.size());
+  get_request_indices.reserve(requests.size());
   for (size_t request_index = 0; request_index < requests.size();
        ++request_index) {
     const PhysicalRequest& request = requests[request_index];
-    const std::optional<MooncakeMultiBuffer> buffer = build_multi_buffer(
+    std::optional<MultiBuffer> buffer = build_multi_buffer(
         *request.entry,
         block_transfer_info[request.logical_index].dst_block_id);
-    if (!buffer.has_value() || backend_ == nullptr) {
+    if (!buffer.has_value()) {
       continue;
     }
-    physical_results[request_index] =
-        backend_->get(request.key, *buffer) ? 1 : 0;
-    if (stats == nullptr || physical_results[request_index] == 0) {
-      continue;
+    get_keys.emplace_back(request.key);
+    get_buffers.emplace_back(std::move(*buffer));
+    get_request_indices.emplace_back(request_index);
+  }
+  if (!get_keys.empty() && transport_ != nullptr) {
+    const std::vector<uint8_t> results =
+        transport_->batch_get(get_keys, get_buffers);
+    CHECK_EQ(results.size(), get_keys.size());
+    for (size_t index = 0; index < get_request_indices.size(); ++index) {
+      const size_t request_index = get_request_indices[index];
+      physical_results[request_index] = results[index] != 0;
+      if (stats == nullptr || physical_results[request_index] == 0) {
+        continue;
+      }
+      const MultiBuffer& buffer = get_buffers[index];
+      const uint64_t bytes = std::accumulate(
+          buffer.sizes.begin(), buffer.sizes.end(), static_cast<uint64_t>(0));
+      record_get(tiers[request_index], bytes, stats);
     }
-    const uint64_t bytes = std::accumulate(
-        buffer->sizes.begin(), buffer->sizes.end(), static_cast<uint64_t>(0));
-    const MooncakeReplicaTier tier = request_index < tiers.size()
-                                         ? tiers[request_index]
-                                         : MooncakeReplicaTier::MISSING;
-    record_get(tier, bytes, stats);
   }
   return aggregate_results(
       block_transfer_info.size(), requests, physical_results);
@@ -481,7 +497,8 @@ std::vector<uint8_t> KVCacheStore::batch_get_with_status(
 
 std::vector<uint8_t> KVCacheStore::batch_exist(
     Slice<BlockTransferInfo>& block_transfer_info) {
-  if (!is_initialized_ || block_transfer_info.empty() || backend_ == nullptr) {
+  if (!is_initialized_ || block_transfer_info.empty() ||
+      transport_ == nullptr) {
     return std::vector<uint8_t>(block_transfer_info.size(), /*value=*/0);
   }
   const std::vector<PhysicalRequest> requests =
@@ -492,7 +509,7 @@ std::vector<uint8_t> KVCacheStore::batch_exist(
     keys.emplace_back(request.key);
   }
   const std::vector<MooncakeReplicaTier> tiers =
-      backend_->batch_query_tiers(keys);
+      transport_->batch_query_tiers(keys);
   CHECK_EQ(tiers.size(), requests.size());
   return aggregate_results(
       block_transfer_info.size(), requests, present_objects(tiers));
@@ -527,7 +544,7 @@ void KVCacheStore::record_get(MooncakeReplicaTier tier,
   }
 }
 
-std::optional<MooncakeMultiBuffer> KVCacheStore::build_multi_buffer(
+std::optional<MultiBuffer> KVCacheStore::build_multi_buffer(
     const StoreEntry& entry,
     int32_t block_id) const {
   if (entry.block_tensors.empty()) {
@@ -536,7 +553,7 @@ std::optional<MooncakeMultiBuffer> KVCacheStore::build_multi_buffer(
     return std::nullopt;
   }
 
-  MooncakeMultiBuffer buffer;
+  MultiBuffer buffer;
   buffer.addresses.reserve(entry.block_tensors.size());
   buffer.sizes.reserve(entry.block_tensors.size());
   for (const torch::Tensor& tensor : entry.block_tensors) {
@@ -560,9 +577,9 @@ std::optional<MooncakeMultiBuffer> KVCacheStore::build_multi_buffer(
   return buffer;
 }
 
-std::optional<std::vector<MooncakeRegisteredRange>>
-KVCacheStore::collect_ranges() const {
-  std::vector<MooncakeRegisteredRange> ranges;
+std::optional<std::vector<StoreRegisteredRange>> KVCacheStore::collect_ranges()
+    const {
+  std::vector<StoreRegisteredRange> ranges;
   for (const auto& [block_type, entries] : store_index_) {
     for (const StoreEntry& entry : entries) {
       const BlockTypeTensorMap tensors =
@@ -576,7 +593,7 @@ KVCacheStore::collect_ranges() const {
           LOG(ERROR) << "Invalid Host tensor registration range.";
           return std::nullopt;
         }
-        ranges.emplace_back(MooncakeRegisteredRange{
+        ranges.emplace_back(StoreRegisteredRange{
             tensor.data_ptr(),
             static_cast<size_t>(tensor.numel()) *
                 static_cast<size_t>(tensor.element_size())});

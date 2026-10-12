@@ -25,6 +25,8 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "framework/kv_cache_transfer/kv_cache_store_transport.h"
+
 namespace xllm {
 
 struct MooncakeStoreBackendConfig {
@@ -36,50 +38,33 @@ struct MooncakeStoreBackendConfig {
   int32_t replica_num = 1;
 };
 
-struct MooncakeRegisteredRange {
-  void* address = nullptr;
-  size_t bytes = 0;
-};
-
-// Fastest complete replica tier currently holding an object, following
-// Mooncake's read preference: MEMORY before any SSD-backed replica. This is an
-// approximation of the replica Mooncake actually reads: Mooncake also prefers a
-// local NoF SSD replica over a remote MEMORY one, but RealClient does not
-// expose the local endpoints needed to tell them apart.
-enum class MooncakeReplicaTier : uint8_t {
-  MISSING = 0,
-  MEMORY = 1,
-  DISK = 2,
-};
-
-struct MooncakeMultiBuffer {
-  std::vector<void*> addresses;
-  std::vector<size_t> sizes;
-};
-
-class MooncakeStoreBackend final {
+class MooncakeStoreBackend final : public KVCacheStoreTransport {
  public:
   MooncakeStoreBackend() = default;
-  ~MooncakeStoreBackend();
+  ~MooncakeStoreBackend() override;
 
   bool init(const MooncakeStoreBackendConfig& config,
-            const std::vector<MooncakeRegisteredRange>& ranges);
+            const std::vector<StoreRegisteredRange>& ranges);
   std::vector<uint8_t> batch_put(
       const std::vector<std::string>& keys,
-      const std::vector<MooncakeMultiBuffer>& buffers);
-  bool get(const std::string& key, const MooncakeMultiBuffer& buffer);
+      const std::vector<MultiBuffer>& buffers) override;
+  std::vector<uint8_t> batch_get(
+      const std::vector<std::string>& keys,
+      const std::vector<MultiBuffer>& buffers) override;
   // Metadata-only lookup; reads no object data. Returns one tier per key, and
   // MISSING for every key when the query fails.
   std::vector<MooncakeReplicaTier> batch_query_tiers(
-      const std::vector<std::string>& keys);
+      const std::vector<std::string>& keys) override;
 
  private:
   friend class MooncakeStoreBackendTestPeer;
 
-  static std::optional<std::vector<MooncakeRegisteredRange>> unique_ranges(
-      const std::vector<MooncakeRegisteredRange>& ranges);
-  static bool get_succeeded(int64_t expected_bytes,
-                            const std::vector<int>& results);
+  static std::optional<std::vector<StoreRegisteredRange>> unique_ranges(
+      const std::vector<StoreRegisteredRange>& ranges);
+  static std::optional<int32_t> get_bytes(const MultiBuffer& buffer);
+  static std::vector<uint8_t> get_statuses(
+      const std::vector<int32_t>& expected_bytes,
+      const std::vector<int>& results);
   static bool put_succeeded(int result);
   static MooncakeReplicaTier replica_tier(
       const std::vector<mooncake::Replica::Descriptor>& replicas);
@@ -88,7 +73,7 @@ class MooncakeStoreBackend final {
  private:
   mooncake::ReplicateConfig rep_config_;
   std::shared_ptr<mooncake::RealClient> client_ptr_;
-  std::vector<MooncakeRegisteredRange> registered_ranges_;
+  std::vector<StoreRegisteredRange> registered_ranges_;
 };
 
 }  // namespace xllm

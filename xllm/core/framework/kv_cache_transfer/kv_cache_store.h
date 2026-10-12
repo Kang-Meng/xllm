@@ -24,8 +24,8 @@ limitations under the License.
 
 #include "common/types.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/kv_cache_transfer/kv_cache_store_transport.h"
 #include "framework/kv_cache_transfer/kv_transfer_types.h"
-#include "framework/kv_cache_transfer/mooncake_store_backend.h"
 #include "framework/model/model_input_params.h"
 #include "util/slice.h"
 
@@ -161,9 +161,9 @@ class KVCacheStore final {
       const std::vector<uint8_t>& physical_results);
   static std::optional<std::string> get_store_device_names(
       const KVCacheStoreInitConfig& config);
-  std::optional<MooncakeMultiBuffer> build_multi_buffer(const StoreEntry& entry,
-                                                        int32_t block_id) const;
-  std::optional<std::vector<MooncakeRegisteredRange>> collect_ranges() const;
+  std::optional<MultiBuffer> build_multi_buffer(const StoreEntry& entry,
+                                                int32_t block_id) const;
+  std::optional<std::vector<StoreRegisteredRange>> collect_ranges() const;
   static void record_get(MooncakeReplicaTier tier,
                          uint64_t bytes,
                          StoreGetStats* stats);
@@ -176,7 +176,7 @@ class KVCacheStore final {
   KVCacheStoreInitConfig config_;
   std::map<BlockType, std::vector<StoreEntry>> store_index_;
   size_t max_entries_per_type_ = 0;
-  std::unique_ptr<MooncakeStoreBackend> backend_;
+  std::unique_ptr<KVCacheStoreTransport> transport_;
 };
 
 }  // namespace xllm

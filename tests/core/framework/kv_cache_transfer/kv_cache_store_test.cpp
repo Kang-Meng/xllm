@@ -22,8 +22,13 @@ limitations under the License.
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,6 +38,19 @@ namespace xllm {
 
 class KVCacheStoreTestPeer final {
  public:
+  static void attach_transport(
+      KVCacheStore* store,
+      std::unique_ptr<KVCacheStoreTransport> transport) {
+    store->transport_ = std::move(transport);
+    store->is_initialized_ = true;
+  }
+  static std::vector<uint8_t> read_buffers(
+      KVCacheStore* store,
+      const std::vector<std::string>& keys,
+      const std::vector<MultiBuffer>& buffers) {
+    return store->transport_->batch_get(keys, buffers);
+  }
+
   static void initialize_index(KVCacheStore* store,
                                const KVCacheStoreInitConfig& config,
                                HostCacheStoreIndex store_index) {
@@ -101,7 +119,7 @@ class KVCacheStoreTestPeer final {
     return KVCacheStore::get_store_device_names(config);
   }
 
-  static std::optional<MooncakeMultiBuffer> multi_buffer(
+  static std::optional<MultiBuffer> multi_buffer(
       const KVCacheStore& store,
       std::vector<BlockTransferInfo> block_transfer_info) {
     Slice<BlockTransferInfo> slice(block_transfer_info);
@@ -119,14 +137,19 @@ class KVCacheStoreTestPeer final {
 
 class MooncakeStoreBackendTestPeer final {
  public:
-  static std::optional<std::vector<MooncakeRegisteredRange>> unique_ranges(
-      const std::vector<MooncakeRegisteredRange>& ranges) {
+  static std::optional<std::vector<StoreRegisteredRange>> unique_ranges(
+      const std::vector<StoreRegisteredRange>& ranges) {
     return MooncakeStoreBackend::unique_ranges(ranges);
   }
 
-  static bool get_succeeded(int64_t expected_bytes,
-                            const std::vector<int>& results) {
-    return MooncakeStoreBackend::get_succeeded(expected_bytes, results);
+  static std::optional<int32_t> get_bytes(const MultiBuffer& buffer) {
+    return MooncakeStoreBackend::get_bytes(buffer);
+  }
+
+  static std::vector<uint8_t> get_statuses(
+      const std::vector<int32_t>& expected_bytes,
+      const std::vector<int>& results) {
+    return MooncakeStoreBackend::get_statuses(expected_bytes, results);
   }
 
   static bool put_succeeded(int result) {
@@ -140,6 +163,100 @@ class MooncakeStoreBackendTestPeer final {
 };
 
 namespace {
+
+using StoreObjects = std::unordered_map<std::string, std::vector<uint8_t>>;
+class MemoryStoreTransport final : public KVCacheStoreTransport {
+ public:
+  explicit MemoryStoreTransport(std::shared_ptr<StoreObjects> objects)
+      : objects_(std::move(objects)) {}
+  std::vector<uint8_t> batch_put(
+      const std::vector<std::string>& keys,
+      const std::vector<MultiBuffer>& buffers) override {
+    std::vector<uint8_t> results(keys.size(), /*value=*/0);
+    for (size_t index = 0; index < keys.size(); ++index) {
+      if (objects_->count(keys[index]) != 0) {
+        results[index] = 1;
+        continue;
+      }
+      if (failed_puts_.count(keys[index]) != 0) {
+        continue;
+      }
+      const auto& buffer = buffers[index];
+      size_t bytes = 0;
+      for (size_t size : buffer.sizes) {
+        bytes += size;
+      }
+      auto& object = (*objects_)[keys[index]];
+      object.resize(bytes);
+      size_t offset = 0;
+      for (size_t part = 0; part < buffer.sizes.size(); ++part) {
+        std::memcpy(
+            object.data() + offset, buffer.addresses[part], buffer.sizes[part]);
+        offset += buffer.sizes[part];
+      }
+      results[index] = 1;
+    }
+    if (result_count_.has_value()) {
+      results.resize(*result_count_);
+    }
+    return results;
+  }
+  std::vector<uint8_t> batch_get(
+      const std::vector<std::string>& keys,
+      const std::vector<MultiBuffer>& buffers) override {
+    ++batch_get_calls_;
+    last_get_size_ = keys.size();
+    std::vector<uint8_t> results(keys.size(), /*value=*/0);
+    for (size_t index = 0; index < keys.size(); ++index) {
+      if (failed_gets_.count(keys[index]) != 0) {
+        continue;
+      }
+      const auto object = objects_->find(keys[index]);
+      if (object == objects_->end()) {
+        continue;
+      }
+      const auto& buffer = buffers[index];
+      size_t bytes = 0;
+      for (size_t size : buffer.sizes) {
+        bytes += size;
+      }
+      if (object->second.size() != bytes) {
+        continue;
+      }
+      size_t offset = 0;
+      for (size_t part = 0; part < buffer.sizes.size(); ++part) {
+        std::memcpy(buffer.addresses[part],
+                    object->second.data() + offset,
+                    buffer.sizes[part]);
+        offset += buffer.sizes[part];
+      }
+      results[index] = 1;
+    }
+    if (result_count_.has_value()) {
+      results.resize(*result_count_);
+    }
+    return results;
+  }
+  std::vector<MooncakeReplicaTier> batch_query_tiers(
+      const std::vector<std::string>& keys) override {
+    std::vector<MooncakeReplicaTier> tiers;
+    tiers.reserve(keys.size());
+    for (const std::string& key : keys) {
+      tiers.emplace_back(objects_->count(key) != 0
+                             ? MooncakeReplicaTier::MEMORY
+                             : MooncakeReplicaTier::MISSING);
+    }
+    return tiers;
+  }
+  std::optional<size_t> result_count_;
+  std::unordered_set<std::string> failed_gets_;
+  std::unordered_set<std::string> failed_puts_;
+  int32_t batch_get_calls_ = 0;
+  size_t last_get_size_ = 0;
+
+ private:
+  std::shared_ptr<StoreObjects> objects_;
+};
 
 class ScopedEnvVar final {
  public:
@@ -499,6 +616,89 @@ TEST(KVCacheStoreTest, UnsplitPutSkipsOnlySameKeyReplicas) {
   }
 }
 
+TEST_F(KVCacheStoreIntegrationTest, RestoresBatchBlocksWithIndependentMisses) {
+  KVCache cache = make_attention_cache(/*host_blocks=*/5, /*width=*/8);
+  cache.get_k_cache()[0].fill_(7);
+  cache.get_v_cache()[0].fill_(70);
+  cache.get_k_cache()[1].fill_(9);
+  cache.get_v_cache()[1].fill_(90);
+  KVCacheStore store;
+  ASSERT_TRUE(init_store(store, cache, config_));
+  const std::vector<BlockTransferInfo> sources = {
+      make_block_info(/*hash_value=*/94),
+      make_block_info(
+          /*hash_value=*/95, BlockType::KV, /*destination_block_id=*/1)};
+  ASSERT_EQ(store.batch_put(sources), 2U);
+
+  std::vector<BlockTransferInfo> destinations = {
+      make_block_info(
+          /*hash_value=*/97, BlockType::KV, /*destination_block_id=*/99),
+      make_block_info(
+          /*hash_value=*/94, BlockType::KV, /*destination_block_id=*/2),
+      make_block_info(
+          /*hash_value=*/96, BlockType::KV, /*destination_block_id=*/3),
+      make_block_info(
+          /*hash_value=*/95, BlockType::KV, /*destination_block_id=*/4)};
+  Slice<BlockTransferInfo> destination_slice(destinations);
+  EXPECT_EQ(store.batch_get_with_status(destination_slice),
+            std::vector<uint8_t>({0, 1, 0, 1}));
+  EXPECT_TRUE(torch::equal(cache.get_k_cache()[2], cache.get_k_cache()[0]));
+  EXPECT_TRUE(torch::equal(cache.get_v_cache()[2], cache.get_v_cache()[0]));
+  EXPECT_TRUE(torch::equal(cache.get_k_cache()[4], cache.get_k_cache()[1]));
+  EXPECT_TRUE(torch::equal(cache.get_v_cache()[4], cache.get_v_cache()[1]));
+  EXPECT_EQ(cache.get_k_cache()[3].count_nonzero().item<int64_t>(), 0);
+  EXPECT_EQ(cache.get_v_cache()[3].count_nonzero().item<int64_t>(), 0);
+}
+
+TEST_F(KVCacheStoreIntegrationTest, ReadsValidBuffersDespiteInvalidNeighbors) {
+  KVCache cache = make_attention_cache(/*host_blocks=*/3, /*width=*/8);
+  cache.get_k_cache()[0].fill_(7);
+  cache.get_v_cache()[0].fill_(70);
+  KVCacheStore store;
+  ASSERT_TRUE(init_store(store, cache, config_));
+  const std::vector<BlockTransferInfo> sources = {make_block_info(101)};
+  ASSERT_EQ(store.batch_put(sources), 1U);
+  const std::string key =
+      KVCacheStoreTestPeer::build_keys(store, sources).front().second;
+  const auto buffer = KVCacheStoreTestPeer::multi_buffer(
+      store, {make_block_info(101, BlockType::KV, /*destination_block_id=*/2)});
+  ASSERT_TRUE(buffer.has_value());
+  MultiBuffer mismatched = *buffer;
+  mismatched.sizes.clear();
+  MultiBuffer oversized = *buffer;
+  oversized.sizes.front() =
+      static_cast<size_t>(std::numeric_limits<int32_t>::max()) + 1;
+  EXPECT_EQ(KVCacheStoreTestPeer::read_buffers(
+                &store, {key, key, key}, {mismatched, *buffer, oversized}),
+            std::vector<uint8_t>({0, 1, 0}));
+  EXPECT_TRUE(torch::equal(cache.get_k_cache()[0], cache.get_k_cache()[2]));
+  EXPECT_TRUE(torch::equal(cache.get_v_cache()[0], cache.get_v_cache()[2]));
+  EXPECT_EQ(KVCacheStoreTestPeer::read_buffers(&store, {key}, {mismatched}),
+            std::vector<uint8_t>({0}));
+  EXPECT_TRUE(KVCacheStoreTestPeer::read_buffers(&store, {}, {}).empty());
+}
+
+TEST(KVCacheStoreDeathTest, RejectsTransportResultCountMismatch) {
+  KVCache cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
+  KVCacheStore store;
+  HostCacheStoreIndex index;
+  index[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/0, "main", &cache});
+  KVCacheStoreTestPeer::initialize_index(
+      &store, make_store_config(), std::move(index));
+  auto objects = std::make_shared<StoreObjects>();
+  auto transport = std::make_unique<MemoryStoreTransport>(objects);
+  MemoryStoreTransport* transport_ptr = transport.get();
+  KVCacheStoreTestPeer::attach_transport(&store, std::move(transport));
+  std::vector<BlockTransferInfo> infos = {make_block_info(102)};
+  Slice<BlockTransferInfo> slice(infos);
+  for (size_t result_count : {0U, 2U}) {
+    transport_ptr->result_count_ = result_count;
+    EXPECT_DEATH(store.batch_put(slice), "results.size\\(\\)");
+    EXPECT_DEATH(store.batch_get_with_status(slice), "results.size\\(\\)");
+  }
+}
+
 TEST(KVCacheStoreDeathTest, RejectsInvalidSplitTopologyBeforeStoreSetup) {
   for (const auto& [size, rank] : std::vector<std::pair<int32_t, int32_t>>{
            {0, 0}, {-1, 0}, {4, -1}, {4, 4}}) {
@@ -693,9 +893,9 @@ TEST(KVCacheStoreTest, CompressedKPoolRegistersIndexAndTailLayouts) {
       make_block_info(81, BlockType::KV)};
   const std::vector<BlockTransferInfo> tail_info = {
       make_block_info(81, BlockType::LINEAR)};
-  const std::optional<MooncakeMultiBuffer> kv_buffer =
+  const std::optional<MultiBuffer> kv_buffer =
       KVCacheStoreTestPeer::multi_buffer(store, kv_info);
-  const std::optional<MooncakeMultiBuffer> tail_buffer =
+  const std::optional<MultiBuffer> tail_buffer =
       KVCacheStoreTestPeer::multi_buffer(store, tail_info);
   ASSERT_TRUE(kv_buffer.has_value());
   ASSERT_TRUE(tail_buffer.has_value());
@@ -968,7 +1168,7 @@ TEST(KVCacheStoreTest, BuildsMultiBufferForRequestedHostBlock) {
 
   const std::vector<BlockTransferInfo> block_info = {
       make_block_info(12, BlockType::KV, /*destination_block_id=*/1)};
-  const std::optional<MooncakeMultiBuffer> buffer =
+  const std::optional<MultiBuffer> buffer =
       KVCacheStoreTestPeer::multi_buffer(store, block_info);
   ASSERT_TRUE(buffer.has_value());
   ASSERT_EQ(buffer->addresses.size(), 2U);
@@ -1001,22 +1201,46 @@ TEST(KVCacheStoreTest, FailsDuplicateGetKeysWithoutStoreAccess) {
   EXPECT_EQ(store.batch_get_with_status(slice), std::vector<uint8_t>({0, 0}));
 }
 
-TEST(MooncakeStoreBackendTest, AcceptsOnlyExactSingleGetResult) {
-  EXPECT_TRUE(MooncakeStoreBackendTestPeer::get_succeeded(
-      /*expected_bytes=*/32, std::vector<int>{32}));
-  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_succeeded(
-      /*expected_bytes=*/32, std::vector<int>{}));
-  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_succeeded(
-      /*expected_bytes=*/32, std::vector<int>{-1}));
-  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_succeeded(
-      /*expected_bytes=*/32, std::vector<int>{31}));
-  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_succeeded(
-      /*expected_bytes=*/32, std::vector<int>{33}));
-  EXPECT_TRUE(MooncakeStoreBackendTestPeer::get_succeeded(
-      /*expected_bytes=*/32, std::vector<int>{32, 32}));
-  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_succeeded(
-      /*expected_bytes=*/static_cast<int64_t>(INT32_MAX) + 1,
-      std::vector<int>{INT32_MAX}));
+TEST(MooncakeStoreBackendTest, ValidatesGetBufferCountsAndByteLimits) {
+  int32_t value = 0;
+  const size_t max_bytes =
+      static_cast<size_t>(std::numeric_limits<int32_t>::max());
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_bytes({{}, {}}), 0);
+  EXPECT_FALSE(
+      MooncakeStoreBackendTestPeer::get_bytes({{&value}, {}}).has_value());
+  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_bytes({{}, {4}}).has_value());
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_bytes({{&value}, {max_bytes}}),
+            std::numeric_limits<int32_t>::max());
+  EXPECT_FALSE(
+      MooncakeStoreBackendTestPeer::get_bytes({{&value}, {max_bytes + 1}})
+          .has_value());
+  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_bytes(
+                   {{&value, &value}, {max_bytes, 1}})
+                   .has_value());
+  EXPECT_FALSE(MooncakeStoreBackendTestPeer::get_bytes(
+                   {{&value}, {std::numeric_limits<size_t>::max()}})
+                   .has_value());
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_bytes({{&value, &value}, {4, 8}}),
+            12);
+}
+
+TEST(MooncakeStoreBackendTest, MapsExactGetBytesInKeyOrder) {
+  EXPECT_TRUE(MooncakeStoreBackendTestPeer::get_statuses({}, {}).empty());
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_statuses({32}, {32}),
+            std::vector<uint8_t>({1}));
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_statuses({32}, {}),
+            std::vector<uint8_t>({0}));
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_statuses({32}, {32, 32}),
+            std::vector<uint8_t>({1}));
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_statuses({32, 32, 32, 32, 0},
+                                                       {32, -1, 31, 33, 0}),
+            std::vector<uint8_t>({1, 0, 0, 0, 1}));
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_statuses({32, 64}, {32}),
+            std::vector<uint8_t>({1, 0}));
+  EXPECT_EQ(MooncakeStoreBackendTestPeer::get_statuses(
+                {std::numeric_limits<int32_t>::max()},
+                {std::numeric_limits<int32_t>::max()}),
+            std::vector<uint8_t>({1}));
 }
 
 mooncake::Replica::Descriptor make_replica(ReplicaKind kind,
@@ -1112,6 +1336,82 @@ TEST(MooncakeStoreBackendTest, ValidatesRegistrationRangesBeforeSetup) {
   EXPECT_FALSE(MooncakeStoreBackendTestPeer::unique_ranges(
                    {{reinterpret_cast<void*>(UINTPTR_MAX - 7), 8}})
                    .has_value());
+}
+
+TEST(KVCacheStoreTest, RestoresRoleBytesAndRequiresEveryRegisteredShard) {
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  KVCache target(IndexedKVCacheTensors{
+      KVCacheTensors{torch::zeros({3, 2, 8}, options), torch::Tensor()},
+      torch::zeros({3, 2, 4}, options.dtype(torch::kInt8)),
+      torch::zeros({3, 2}, options)});
+  KVCache draft = make_attention_cache(/*host_blocks=*/3, /*width=*/4);
+  HostCacheStoreIndex index;
+  index[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/0, "main", &target});
+  index[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/1, "draft", &draft});
+  KVCacheStore store;
+  KVCacheStoreTestPeer::initialize_index(
+      &store, make_store_config(), std::move(index));
+  auto objects = std::make_shared<StoreObjects>();
+  auto transport = std::make_unique<MemoryStoreTransport>(objects);
+  MemoryStoreTransport* transport_ptr = transport.get();
+  KVCacheStoreTestPeer::attach_transport(&store, std::move(transport));
+
+  const std::vector<KVCache*> caches = {&target, &draft};
+  for (size_t cache_index = 0; cache_index < caches.size(); ++cache_index) {
+    for (const auto& [role, tensor] :
+         caches[cache_index]->get_block_type_tensors(BlockType::KV)) {
+      tensor[0].fill_(1 + cache_index * 10 + static_cast<size_t>(role));
+    }
+  }
+  const std::vector<BlockTransferInfo> put_info = {
+      make_block_info(/*hash_value=*/44)};
+  EXPECT_EQ(store.batch_put(put_info), 1U);
+  EXPECT_EQ(objects->size(), 2U);
+  std::vector<BlockTransferInfo> get_info = {make_block_info(
+      /*hash_value=*/44, BlockType::KV, /*destination_block_id=*/2)};
+  Slice<BlockTransferInfo> get_slice(get_info);
+  EXPECT_EQ(store.batch_get_with_status(get_slice), std::vector<uint8_t>({1}));
+  EXPECT_EQ(store.batch_exist(get_slice), std::vector<uint8_t>({1}));
+  StoreGetStats stats;
+  EXPECT_EQ(store.batch_get_with_status(get_slice, &stats),
+            std::vector<uint8_t>({1}));
+  EXPECT_EQ(stats.memory_objects, 2U);
+  EXPECT_GT(stats.read_bytes, 0U);
+  EXPECT_EQ(transport_ptr->batch_get_calls_, 2);
+  EXPECT_EQ(transport_ptr->last_get_size_, 2u);
+  for (KVCache* cache : caches) {
+    for (const auto& [role, tensor] :
+         cache->get_block_type_tensors(BlockType::KV)) {
+      EXPECT_TRUE(torch::equal(tensor[0], tensor[2]));
+      tensor[2].zero_();
+    }
+  }
+
+  const auto keys = KVCacheStoreTestPeer::build_keys(store, put_info);
+  const std::string draft_key = key_for_component(keys, "draft");
+  transport_ptr->failed_gets_.emplace(draft_key);
+  // Both objects exist, but a failed actual GET must remain a logical miss.
+  EXPECT_EQ(store.batch_get_with_status(get_slice), std::vector<uint8_t>({0}));
+  transport_ptr->failed_gets_.clear();
+  objects->erase(draft_key);
+  target.get_k_cache()[2].zero_();
+  EXPECT_EQ(store.batch_get_with_status(get_slice), std::vector<uint8_t>({0}));
+  // A partial backend GET may write one shard, but the logical block remains
+  // a miss and cannot be published until all registered shards succeed.
+  EXPECT_TRUE(torch::equal(target.get_k_cache()[0], target.get_k_cache()[2]));
+  EXPECT_EQ(draft.get_k_cache()[2].count_nonzero().item<int64_t>(), 0);
+  transport_ptr->failed_puts_.emplace(draft_key);
+  EXPECT_EQ(store.batch_put(put_info), 0U);
+  EXPECT_EQ(store.batch_exist(get_slice), std::vector<uint8_t>({0}));
+  auto replacement = std::make_unique<MemoryStoreTransport>(objects);
+  KVCacheStoreTestPeer::attach_transport(&store, std::move(replacement));
+  EXPECT_EQ(store.batch_exist(get_slice), std::vector<uint8_t>({0}));
+  EXPECT_EQ(store.batch_put(put_info), 1U);
+  EXPECT_EQ(store.batch_exist(get_slice), std::vector<uint8_t>({1}));
+  EXPECT_EQ(store.batch_get_with_status(get_slice), std::vector<uint8_t>({1}));
 }
 
 }  // namespace
