@@ -1481,6 +1481,11 @@ class WanTransformer3DModelImpl : public torch::nn::Module,
       const ModelContext& context,
       const xllm::dit::SparseAttnConfig& sparse_attn_config = {})
       : options_(context.get_tensor_options()) {
+    const std::string& cache_policy =
+        DiTConfig::get_instance().dit_cache_policy();
+    CHECK(cache_policy == "None" || cache_policy == "TaylorSeer")
+        << "WAN supports only None and TaylorSeer cache policies, got "
+        << cache_policy;
     auto model_args = context.get_model_args();
     auto parallel_args = context.get_parallel_args();
     sp_group_ = parallel_args.dit_sp_group_;

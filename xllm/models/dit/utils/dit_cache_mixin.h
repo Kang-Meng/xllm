@@ -152,27 +152,40 @@ class DiTCacheMixin {
   // preceding double-stream loop (keeping ResidualCache's block boundaries
   // accurate across both loops).
   //
-  // NOTE: the after-block map intentionally omits `encoder_hidden_states`. For
-  // FBCache-family policies the absence of that key forces a pass-through on
-  // single-stream blocks (see FBCache::on_after_block). Models that instead
-  // want the cache to engage on the single stream must drive DiTCache directly
-  // rather than use this helper.
-  template <typename BlockFn>
-  void exec_cached_single_blocks(int64_t num_blocks,
-                                 torch::Tensor& hidden_states,
-                                 const torch::Tensor& original_hidden_states,
-                                 const BlockFn& block_fn,
-                                 int64_t block_id_offset = 0,
-                                 bool use_cfg = false) const {
+  // The after-block map intentionally omits `encoder_hidden_states` because
+  // a single-stream block only updates `hidden_states`. Cache policies that
+  // support single-stream inputs operate on that tensor alone.
+  //
+  // Hooks run for every logical block, including cache hits. This keeps
+  // external per-block state machines, such as rolling weight slots, advancing
+  // even when block_fn itself is skipped by DiTCache.
+  class NoOpBlockHook final {
+   public:
+    void operator()(int64_t /*block_index*/) const {}
+  };
+
+  template <typename BlockFn,
+            typename BeforeBlockFn = NoOpBlockHook,
+            typename AfterBlockFn = NoOpBlockHook>
+  void exec_cached_single_blocks(
+      int64_t num_blocks,
+      torch::Tensor& hidden_states,
+      const torch::Tensor& original_hidden_states,
+      const BlockFn& block_fn,
+      int64_t block_id_offset = 0,
+      bool use_cfg = false,
+      const BeforeBlockFn& before_block_fn = BeforeBlockFn{},
+      const AfterBlockFn& after_block_fn = AfterBlockFn{}) const {
     DiTCache& cache = DiTCache::get_instance();
 
-    for (int64_t i = 0; i < num_blocks; ++i) {
-      int64_t block_id = i + block_id_offset;
+    for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
+      before_block_fn(block_index);
+      int64_t block_id = block_index + block_id_offset;
       CacheBlockIn blockin_before(block_id);
       bool use_block_cache = cache.on_before_block(blockin_before, use_cfg);
 
       if (!use_block_cache) {
-        hidden_states = block_fn(i, hidden_states);
+        hidden_states = block_fn(block_index, hidden_states);
       }
 
       TensorMap block_after_map = {
@@ -183,6 +196,7 @@ class DiTCacheMixin {
           cache.on_after_block(blockin_after, use_cfg);
 
       hidden_states = blockout_after.tensors.at("hidden_states");
+      after_block_fn(block_index);
     }
   }
 };

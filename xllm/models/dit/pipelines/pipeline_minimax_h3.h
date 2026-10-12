@@ -338,6 +338,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
                                 layout.video_indices,
                                 layout.audio_indices,
                                 layout.text_indices,
+                                /*step_idx=*/step + 1,
                                 before_layer_cb,
                                 after_layer_cb);
       if (layout.num_condition_video_rows > 0) {

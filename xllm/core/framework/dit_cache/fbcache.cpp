@@ -36,11 +36,9 @@ bool FBCache::on_before_block(const CacheBlockIn& block_input) {
 }
 
 CacheBlockOut FBCache::on_after_block(const CacheBlockIn& block_input) {
-  // If this is not the first transform block
-  // just return the original tensors without caching.
-  if (block_input.block_id != 0 ||
-      block_input.tensors.find("encoder_hidden_states") ==
-          block_input.tensors.end()) {
+  // Only the first transformer block participates in cache validation.
+  // Single-stream inputs do not require encoder_hidden_states.
+  if (block_input.block_id != 0) {
     TensorMap out_map;
     out_map["hidden_states"] =
         get_tensor_or_empty(block_input.tensors, "hidden_states");

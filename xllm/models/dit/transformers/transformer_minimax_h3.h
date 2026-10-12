@@ -37,6 +37,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "models/dit/utils/dit_block_weight_manager.h"
 #endif
+#include "models/dit/utils/dit_cache_mixin.h"
 #include "models/dit/utils/dit_parallel_mixin.h"
 #include "models/model_registry.h"
 
@@ -767,6 +768,7 @@ struct MiniMaxH3TransformerOutput {
 
 class MiniMaxH3Transformer3DModelImpl final
     : public torch::nn::Module,
+      public dit::DiTCacheMixin,
       public dit::SequenceParallelMixin {
  public:
   explicit MiniMaxH3Transformer3DModelImpl(const DiTModelContext& context)
@@ -774,6 +776,13 @@ class MiniMaxH3Transformer3DModelImpl final
             /*process_group=*/context.get_parallel_args().dit_sp_group_),
         options_(context.get_tensor_options()) {
     using namespace minimax_h3;
+    const PolicyType cache_policy = context.get_dit_config().selected_policy;
+    CHECK(cache_policy == PolicyType::None ||
+          cache_policy == PolicyType::TaylorSeer ||
+          cache_policy == PolicyType::FBCache ||
+          cache_policy == PolicyType::FBCacheTaylorSeer)
+        << "MiniMax-H3 supports only None, TaylorSeer, FBCache and "
+           "FBCacheTaylorSeer cache policies";
     const ParallelArgs& parallel_args = context.get_parallel_args();
     CHECK(parallel_args.tp_size() == 1 ||
           parallel_args.dit_tp_group_ != nullptr)
@@ -955,6 +964,7 @@ class MiniMaxH3Transformer3DModelImpl final
       const torch::Tensor& video_indices,
       const torch::Tensor& audio_indices,
       const torch::Tensor& text_indices,
+      int64_t step_idx,
       std::function<void(int32_t)> before_layer_cb = nullptr,
       std::function<void(int32_t)> after_layer_cb = nullptr) {
     torch::Tensor video_embeds =
@@ -989,7 +999,7 @@ class MiniMaxH3Transformer3DModelImpl final
         {{minimax_h3::kPackedSequenceTensorName, {packed, /*dim=*/1}},
          {"adaln_indices", {adaln_indices, /*dim=*/0}},
          {"timestep_indices", {timestep_indices_long, /*dim=*/0}}},
-        [this, &temb, &rotary, &before_layer_cb, &after_layer_cb](
+        [this, step_idx, &temb, &rotary, &before_layer_cb, &after_layer_cb](
             const dit::SequenceParallelTensorMap& model_inputs) {
           torch::Tensor local_packed =
               model_inputs.at(minimax_h3::kPackedSequenceTensorName).first;
@@ -997,22 +1007,36 @@ class MiniMaxH3Transformer3DModelImpl final
               model_inputs.at("adaln_indices").first;
           const torch::Tensor& local_timestep_indices =
               model_inputs.at("timestep_indices").first;
-          int32_t block_index = 0;
-          for (auto& block : *blocks_) {
-            if (before_layer_cb) {
-              before_layer_cb(block_index);
-            }
-            local_packed = block->as<minimax_h3::H3TransformerBlock>()->forward(
+          // Blocks replace their input without modifying it in place, so
+          // this snapshot preserves the local input for residual-based caches.
+          const torch::Tensor original_local_packed = local_packed;
+          exec_cache_step(step_idx, local_packed, original_local_packed, [&]() {
+            exec_cached_single_blocks(
+                static_cast<int64_t>(blocks_->size()),
                 local_packed,
-                temb,
-                local_adaln_indices,
-                rotary.first,
-                rotary.second);
-            if (after_layer_cb) {
-              after_layer_cb(block_index);
-            }
-            ++block_index;
-          }
+                original_local_packed,
+                [&](int64_t block_idx, const torch::Tensor& block_input) {
+                  return blocks_[block_idx]
+                      ->as<minimax_h3::H3TransformerBlock>()
+                      ->forward(block_input,
+                                temb,
+                                local_adaln_indices,
+                                rotary.first,
+                                rotary.second);
+                },
+                /*block_id_offset=*/0,
+                /*use_cfg=*/false,
+                [&before_layer_cb](int64_t block_idx) {
+                  if (before_layer_cb) {
+                    before_layer_cb(static_cast<int32_t>(block_idx));
+                  }
+                },
+                [&after_layer_cb](int64_t block_idx) {
+                  if (after_layer_cb) {
+                    after_layer_cb(static_cast<int32_t>(block_idx));
+                  }
+                });
+          });
 
           local_packed =
               norm_out_->forward(local_packed, temb, local_timestep_indices);
