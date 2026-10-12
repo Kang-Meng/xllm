@@ -52,6 +52,7 @@ class HierarchyKVCacheTransfer final {
 
   struct CacheRegistration {
     CacheRole role = CacheRole::TARGET;
+    bool enable_mla = false;
     std::vector<KVCache>* device_kv_caches = nullptr;
     KVCacheShape kv_cache_shape;
     KVCacheCreateOptions create_options;
@@ -117,6 +118,7 @@ class HierarchyKVCacheTransfer final {
   struct CacheDomain {
     CacheHandle handle = 0;
     CacheRole role = CacheRole::TARGET;
+    bool enable_mla = false;
     std::vector<KVCache>* device_kv_caches = nullptr;
     KVCacheShape kv_cache_shape;
     KVCacheCreateOptions create_options;

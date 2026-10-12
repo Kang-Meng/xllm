@@ -133,7 +133,8 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
       CHECK(key_components.emplace(entry.key_component).second)
           << "Duplicate KVCacheStore key component for BlockType "
           << static_cast<int32_t>(block_type) << ": " << entry.key_component;
-      const StoreTpLayout tp_layout = resolve_tp_layout(block_type);
+      const StoreTpLayout tp_layout = resolve_tp_layout(
+          block_type, entry.enable_mla.value_or(config_.enable_mla));
       std::string schema_hash =
           build_schema_hash(block_type, *entry.cache, tp_layout);
       std::string key_prefix = build_key_prefix(
@@ -157,8 +158,9 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
   }
 }
 
-StoreTpLayout KVCacheStore::resolve_tp_layout(BlockType block_type) const {
-  if (config_.enable_mla && block_type == BlockType::KV) {
+StoreTpLayout KVCacheStore::resolve_tp_layout(BlockType block_type,
+                                              bool enable_mla) const {
+  if (enable_mla && block_type == BlockType::KV) {
     return StoreTpLayout::TP_REPLICATED;
   }
   return StoreTpLayout::TP_SHARDED;
@@ -200,7 +202,7 @@ std::string KVCacheStore::build_schema_hash(BlockType block_type,
   CHECK(!tensors.empty()) << "Host cache has no tensors for BlockType "
                           << static_cast<int32_t>(block_type);
 
-  std::string cache_schema = config_.enable_mla
+  std::string cache_schema = tp_layout == StoreTpLayout::TP_REPLICATED
                                  ? "parallel=mla"
                                  : "tp=" + std::to_string(config_.tp_size);
   cache_schema.append("|type=");

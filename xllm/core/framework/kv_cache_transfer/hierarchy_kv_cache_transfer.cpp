@@ -192,6 +192,7 @@ HierarchyKVCacheTransfer::HierarchyKVCacheTransfer(
     : HierarchyKVCacheTransfer(options, device) {
   CacheRegistration registration;
   registration.role = CacheRole::TARGET;
+  registration.enable_mla = options.enable_mla();
   registration.device_kv_caches = kv_caches_ptr;
   registration.kv_cache_shape = kv_cache_shape;
   registration.create_options = create_options;
@@ -228,6 +229,7 @@ HierarchyKVCacheTransfer::CacheHandle HierarchyKVCacheTransfer::register_cache(
   CacheDomain domain;
   domain.handle = static_cast<CacheHandle>(cache_domains_.size());
   domain.role = registration.role;
+  domain.enable_mla = registration.enable_mla;
   domain.device_kv_caches = registration.device_kv_caches;
   domain.kv_cache_shape = std::move(registration.kv_cache_shape);
   domain.create_options = std::move(registration.create_options);
@@ -285,8 +287,11 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
       CHECK(!domain.store_key_component.empty())
           << "Mooncake Store requires a cache key component.";
       for (auto& [block_type, host_cache] : domain.host_caches_by_type) {
-        store_index[block_type].emplace_back(HostCacheStoreEntry{
-            domain.handle, domain.store_key_component, host_cache.get()});
+        store_index[block_type].emplace_back(
+            HostCacheStoreEntry{domain.handle,
+                                domain.store_key_component,
+                                host_cache.get(),
+                                domain.enable_mla});
       }
     }
     KVCacheStoreInitConfig store_config;

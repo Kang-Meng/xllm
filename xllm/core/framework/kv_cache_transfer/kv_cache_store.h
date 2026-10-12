@@ -35,6 +35,7 @@ struct HostCacheStoreEntry {
   uint32_t cache_handle = 0;
   std::string key_component;
   KVCache* cache = nullptr;
+  std::optional<bool> enable_mla;
 };
 
 enum class StoreTpLayout : uint8_t {
@@ -138,7 +139,7 @@ class KVCacheStore final {
   KVCacheStore& operator=(const KVCacheStore&) = delete;
 
   void initialize_store_index(HostCacheStoreIndex store_index);
-  StoreTpLayout resolve_tp_layout(BlockType block_type) const;
+  StoreTpLayout resolve_tp_layout(BlockType block_type, bool enable_mla) const;
   bool is_put_owner(StoreTpLayout tp_layout) const;
   std::string build_schema_hash(BlockType block_type,
                                 const KVCache& cache,

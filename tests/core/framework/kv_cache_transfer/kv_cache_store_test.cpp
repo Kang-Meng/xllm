@@ -797,6 +797,35 @@ TEST(KVCacheStoreTest, TargetKeyDoesNotDependOnDraftRegistration) {
   EXPECT_EQ(target_only_keys.front().second.find("xllm-kv-v3:"), 0U);
 }
 
+TEST(KVCacheStoreTest, UsesPerCacheMlaLayoutForTargetAndDraft) {
+  KVCache target_cache = make_attention_cache(/*host_blocks=*/2, /*width=*/8);
+  KVCache draft_cache = make_attention_cache(/*host_blocks=*/2, /*width=*/4);
+  KVCacheStore store;
+  HostCacheStoreIndex index;
+  index[BlockType::KV].emplace_back(HostCacheStoreEntry{
+      /*cache_handle=*/0, "main", &target_cache, /*enable_mla=*/true});
+  index[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/1,
+                          "spec_draft::dflash2::draft-model",
+                          &draft_cache,
+                          /*enable_mla=*/false});
+  KVCacheStoreTestPeer::initialize_index(&store,
+                                         make_store_config("target-model",
+                                                           /*tp_rank=*/1,
+                                                           /*tp_size=*/8,
+                                                           /*enable_mla=*/true),
+                                         std::move(index));
+
+  const auto keys = KVCacheStoreTestPeer::build_keys(
+      store, {make_block_info(7, BlockType::KV)});
+  const std::string target_key = key_for_component(keys, "main");
+  const std::string draft_key =
+      key_for_component(keys, "spec_draft::dflash2::draft-model");
+  EXPECT_NE(target_key.find("mla:"), std::string::npos);
+  EXPECT_NE(draft_key.find("8:1:"), std::string::npos);
+  EXPECT_EQ(draft_key.find("mla:"), std::string::npos);
+}
+
 TEST(KVCacheStoreTest, DraftKeyDependsOnTargetDraftAndAlgorithm) {
   KVCache draft_cache = make_attention_cache(/*host_blocks=*/2, /*width=*/4);
   const std::vector<BlockTransferInfo> block_info = {make_block_info(5)};

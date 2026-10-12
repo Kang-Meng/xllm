@@ -2461,6 +2461,7 @@ void WorkerImpl::register_hierarchy_kv_cache(
 
   HierarchyKVCacheTransfer::CacheRegistration registration;
   registration.role = role;
+  registration.enable_mla = context_.get_model_args().enable_mla();
   registration.device_kv_caches = &kv_caches_;
   registration.kv_cache_shape =
       hierarchy_kv_cache_transfer_context_->kv_cache_shape;
