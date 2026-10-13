@@ -22,6 +22,7 @@ limitations under the License.
 #include <memory>
 
 #include "common/macros.h"
+#include "core/runtime/py_multimodal_executor.h"
 #include "executor_impl_factory.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/causal_lm.h"
@@ -58,6 +59,7 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   bool enable_mla_ = false;
 
   pybind11::object py_executor_;
+  std::unique_ptr<PyMultimodalExecutor> multimodal_executor_;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;
 };

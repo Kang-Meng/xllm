@@ -362,6 +362,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
   py::object model_cls = registry.attr("get_model_class")(py::str(module_name));
   config_dict_ = build_config_dict(parallel_args,
                                    context.get_speculative_runtime_config());
+  config_dict_["is_multimodal"] = is_vlm;
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();
 }

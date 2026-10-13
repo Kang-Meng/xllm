@@ -48,6 +48,13 @@ from xllm.python.model_loader import (
     load_causal_lm_weights,
 )
 from xllm.python.models.base import PyModelBase
+from xllm.python.models.multimodal import (
+    EncoderOutputs,
+    EncoderTokenCounts,
+    MultimodalData,
+    MultimodalInputs,
+    merge_multimodal_embeddings,
+)
 from xllm.python.models.qwen3 import (
     Qwen3Config,
     Qwen3DecoderLayer,
@@ -712,20 +719,16 @@ class Qwen3VLModel(nn.Module):
             nn.ModuleList([Qwen3DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)]),
         )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
-        # Set externally by get_input_embeddings before the runner kicks in.
-        self._inputs_embeds: torch.Tensor | None = None
-        self.deepstack_input_embeds: list[torch.Tensor] | None = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        deepstack_input_embeds: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
-        if self._inputs_embeds is not None:
-            hidden = self._inputs_embeds
-            self._inputs_embeds = None
-        else:
-            hidden = self.embed_tokens(input_ids)
+        hidden = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
 
         positions = positions.to(torch.int64).contiguous()
         cos, sin = None, None
@@ -746,12 +749,10 @@ class Qwen3VLModel(nn.Module):
             hidden, residual = layer(hidden, residual, positions, cos_sin_cache, cos, sin, mrope_sec)
             # Deepstack injection: add deepstack embeds after the first
             # N layers.
-            if self.deepstack_input_embeds is not None and i < len(self.deepstack_input_embeds):
-                hidden = hidden + self.deepstack_input_embeds[i]
+            if deepstack_input_embeds is not None and i < len(deepstack_input_embeds):
+                hidden = hidden + deepstack_input_embeds[i]
 
         hidden, _ = self.norm(hidden, residual)
-        # Clear deepstack embeds after use.
-        self.deepstack_input_embeds = None
         return hidden
 
 
@@ -760,46 +761,16 @@ class Qwen3VLModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _scatter_multimodal(
-    inputs_embeds: torch.Tensor,
-    deepstack_acc: torch.Tensor | None,
-    embeds: torch.Tensor,
-    mask: torch.Tensor,
-    visual_dim: int,
-    num_level: int,
-) -> None:
-    """Scatter one modality's embeddings into ``inputs_embeds`` + deepstack buffer.
-
-    Splits ``embeds`` (last dim = ``visual_dim * (1 + num_level)``) into the main
-    projection (``visual_dim``) and the multiscale / deepstack part
-    (``num_level * visual_dim``). The main part overwrites the ``inputs_embeds``
-    rows selected by ``mask``; the multiscale part is written into ``deepstack_acc``
-    at the same rows. ``mask`` is a boolean over the flattened batch selecting one
-    modality's placeholder-token positions; image and video masks are disjoint, so
-    accumulation across modalities never collides.
-
-    Assumes every multimodal token of the modality is in the current batch (i.e.
-    enable_chunked_prefill=False). In-place: both tensors are mutated.
-    """
-    if num_level > 0:
-        main, multiscale = torch.split(embeds, [visual_dim, visual_dim * num_level], dim=-1)
-    else:
-        main = embeds
-        multiscale = None
-    inputs_embeds[mask] = main.to(inputs_embeds.dtype)
-    if multiscale is not None:
-        assert deepstack_acc is not None
-        deepstack_acc[mask] = multiscale.to(deepstack_acc.dtype)
-
-
 class Qwen3VLForConditionalGeneration(PyModelBase):
     """Qwen3-VL top-level model: ViT + LLM + lm_head.
 
     The ``self.model`` attribute (required by ``PyModelBase``) is the
     :class:`Qwen3VLModel` LLM.  Vision encoding and embedding merge happen
-    in :meth:`encode` and :meth:`get_input_embeddings`, which are called
+    in :meth:`encode_multimodal` and :meth:`prepare_multimodal_inputs`, which are called
     before the runner drives ``self.model``.
     """
+
+    cache_multimodal_embeddings = True
 
     model: Qwen3VLModel
     lm_head: ColumnParallelLinear
@@ -829,15 +800,9 @@ class Qwen3VLForConditionalGeneration(PyModelBase):
 
         self.vision_cfg = vision_cfg
         self.text_cfg = text_cfg
-        self.image_token_id = int(config.get("image_token_id", 151655))
-        self.video_token_id = int(config.get("video_token_id", 151656))
-        self.vision_start_token_id = int(config.get("vision_start_token_id", 151652))
-        self.vision_end_token_id = int(config.get("vision_end_token_id", 151653))
 
         # Deepstack parameters
         self.deepstack_num_level = len(vision_cfg.deepstack_visual_indexes)
-        self.visual_dim = vision_cfg.out_hidden_size
-        self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         # Vision tower
         self.vision_model = Qwen3VLVisionTransformer(vision_cfg, dtype=dtype, device=device)
@@ -881,69 +846,29 @@ class Qwen3VLForConditionalGeneration(PyModelBase):
         image_embeds = self.vision_model(pixel_values, grid_thw)
         return image_embeds
 
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        image_embeds: torch.Tensor | None = None,
-        video_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Stage 2: merge text + multimodal embeddings.
-
-        Each present modality's embedding is scattered at its placeholder-token
-        positions (``image_token_id`` for still images, ``video_token_id`` for
-        video) into ``inputs_embeds``; the multiscale part is accumulated into a
-        shared deepstack buffer. The two masks are disjoint, so image and video
-        coexist in one batch.
-
-        This assumes every multimodal token is in the current batch (i.e.
-        enable_chunked_prefill=False): the mask spans the full flattened batch and
-        embedding rows are matched left-to-right. Sets ``_inputs_embeds`` and
-        ``deepstack_input_embeds`` for the runner-driven ``Qwen3VLModel.forward``.
-        """
-        inputs_embeds = self.model.embed_tokens(input_ids)
-
-        modalities: list[tuple[torch.Tensor, int]] = []
-        if image_embeds is not None:
-            modalities.append((image_embeds, self.image_token_id))
-        if video_embeds is not None:
-            modalities.append((video_embeds, self.video_token_id))
-
-        if not modalities:
-            # No multimodal tokens in this step (text-only prefill / decode):
-            # keep the attributes clear so the runner falls back to embed_tokens.
-            self.model._inputs_embeds = None
-            self.model.deepstack_input_embeds = None
-            return inputs_embeds
-
-        visual_dim = self.visual_dim
-        num_level = self.deepstack_num_level
-        seq_len = input_ids.shape[0]
-
-        deepstack_acc: torch.Tensor | None = None
-        if num_level > 0:
-            deepstack_acc = torch.zeros(
-                seq_len,
-                num_level * visual_dim,
-                dtype=inputs_embeds.dtype,
-                device=inputs_embeds.device,
-            )
-
-        for embeds, token_id in modalities:
-            mask = input_ids == token_id
-            if not mask.any():
+    def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs:
+        outputs: EncoderOutputs = {}
+        for modality, pixel_key, grid_key in (
+            ("image", "pixel_values", "image_grid_thw"),
+            ("video", "pixel_values_videos", "video_grid_thw"),
+        ):
+            counts = token_counts.get(modality, [])
+            if not counts:
                 continue
-            _scatter_multimodal(inputs_embeds, deepstack_acc, embeds, mask, visual_dim, num_level)
+            pixels, grid = data[pixel_key], data[grid_key]
+            if not isinstance(pixels, torch.Tensor) or not isinstance(grid, torch.Tensor):
+                raise TypeError("batched vision pixels and grids must be tensors")
+            features = self.encode(pixels, grid)
+            outputs[f"{modality}|embedding"] = list(features.split(counts, dim=0))
+        return outputs
 
-        if deepstack_acc is not None:
-            # Reshape: (seq_len, num_level, visual_dim) -> list of tensors.
-            deepstack_acc = deepstack_acc.view(seq_len, num_level, visual_dim)
-            self.model.deepstack_input_embeds = [deepstack_acc[:, i, :].contiguous() for i in range(num_level)]
-        else:
-            self.model.deepstack_input_embeds = None
-
-        # Store inputs_embeds for the runner to pick up.
-        self.model._inputs_embeds = inputs_embeds
-        return inputs_embeds
+    def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs:
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        if not self.deepstack_num_level:
+            return MultimodalInputs(merge_multimodal_embeddings(inputs_embeds, data))
+        deepstack = tuple(torch.zeros_like(inputs_embeds) for _ in range(self.deepstack_num_level))
+        merge_multimodal_embeddings(inputs_embeds, data, deepstack)
+        return MultimodalInputs(inputs_embeds, deepstack)
 
     # ------------------------------------------------------------------
     # Weight loading

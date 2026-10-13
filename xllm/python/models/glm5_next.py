@@ -2763,11 +2763,6 @@ class Glm5NextModel(nn.Module):
             cfg.layers_to_capture,
             transform=lambda streams: hc_head(streams).reshape(-1, hidden_size),
         )
-        # Set externally by the VL composer (get_input_embeddings) before the
-        # runner drives forward(); when set, it replaces embed_tokens(input_ids)
-        # so image/video embeddings merged into the sequence are used as-is. The
-        # mHC 4-stream expand below applies to the merged hidden identically.
-        self._inputs_embeds: Optional[torch.Tensor] = None
 
     def _sp_layout_and_mask(
         self, hidden: torch.Tensor, attention_mask: torch.Tensor
@@ -2789,6 +2784,8 @@ class Glm5NextModel(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # The C++ EagerRunner passes the flattened token tensor, which is 1-D
         # ``[num_tokens]`` for a single sequence; normalise to ``[B, S]``.
@@ -2796,11 +2793,9 @@ class Glm5NextModel(nn.Module):
             input_ids = input_ids.unsqueeze(0)
         if position_ids is not None and position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
-        if self._inputs_embeds is not None:
-            hidden = self._inputs_embeds
-            self._inputs_embeds = None
-        else:
-            hidden = self.embed_tokens(input_ids)
+        hidden = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+        if hidden.dim() == 2:
+            hidden = hidden.unsqueeze(0)
         batch_size, seq_len = hidden.shape[:2]
         if attention_mask is None:
             attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=hidden.device)

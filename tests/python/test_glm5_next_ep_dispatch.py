@@ -458,7 +458,6 @@ def test_model_rejects_unsupported_execution_before_first_layer(
     model = glm5_next.Glm5NextModel.__new__(glm5_next.Glm5NextModel)
     torch.nn.Module.__init__(model)
     model.cfg = _config(eplv2_sequence_parallel=sequence_parallel)
-    model._inputs_embeds = torch.ones(1, 3, 8)
     model._comm_policy = Eplv2CommPolicy(
         1 if failure == "mc2_capacity" else 512,
         "alltoall" if failure == "alltoall_graph" else "mc2",
@@ -477,7 +476,7 @@ def test_model_rejects_unsupported_execution_before_first_layer(
     monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: context)
     monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: failure in ("alltoall_graph", "graph_mask"))
     with pytest.raises(ValueError, match=message):
-        model(torch.zeros(3, dtype=torch.long), torch.arange(3))
+        model(torch.zeros(3, dtype=torch.long), torch.arange(3), inputs_embeds=torch.ones(1, 3, 8))
     first_layer.forward.assert_not_called()
 
 

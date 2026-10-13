@@ -21,8 +21,8 @@ limitations under the License.
 #include <memory>
 
 #include "common/macros.h"
+#include "core/runtime/encoder_executor.h"
 #include "executor_impl_factory.h"
-#include "framework/encoder_cache/encoder_cache.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/causal_lm.h"
 #include "framework/model/causal_vlm.h"
@@ -64,7 +64,7 @@ class VlmExecutorImpl : public ExecutorImpl {
   torch::Device device_;
   runtime::Options options_;
   std::unique_ptr<ExecutorImpl> llm_executor_;
-  std::unique_ptr<EncoderCache> encoder_cache_;
+  EncoderExecutor encoder_executor_;
 
  private:
   // Collapse mRoPE decode positions from [3, num_tokens] to a 1-D [num_tokens]

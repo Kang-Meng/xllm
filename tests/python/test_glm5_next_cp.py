@@ -139,7 +139,6 @@ def _make_model(events: list[str]) -> tuple[glm5_next.Glm5NextModel, list[_Decod
     model.norm = _Norm(events)
     model.hc_head = _HyperHead()
     model.aux_hidden_capture = AuxHiddenCapture(())
-    model._inputs_embeds = None
     return model, layers
 
 
@@ -1289,11 +1288,11 @@ def test_model_exit_fuses_cp_merges_into_one_all_gather(monkeypatch) -> None:
     expected_h = glm5_next.cp_merge_rows(local_h, cp_context)
     expected_aux = glm5_next.cp_merge_rows(local_aux, cp_context)
 
-    model._inputs_embeds = embeds
     with patch.object(glm5_next, "get_forward_context", return_value=SimpleNamespace(cp_context=cp_context)):
         output = model(
             torch.tensor([0, 1, 2, 3]),
             torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            inputs_embeds=embeds,
         )
 
     assert isinstance(output, tuple)

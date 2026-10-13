@@ -11,6 +11,7 @@ cc_library(
     dit_forward_params.h
     params_utils.h
     executor.h
+    encoder_executor.h
     executor_impl.h
     executor_impl_factory.h
     vlm_executor_impl.h
@@ -24,6 +25,7 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
     py_executor_impl.h
+    py_multimodal_executor.h
     py_attention_metadata.h
     py_input_batch.h
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.h>
@@ -53,6 +55,7 @@ cc_library(
   SRCS
     decode_graph_bucket.cpp
     executor.cpp
+    encoder_executor.cpp
     executor_impl_factory.cpp
     base_executor_impl.cpp
     vlm_executor_impl.cpp
@@ -64,6 +67,7 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
     py_executor_impl.cpp
+    py_multimodal_executor.cpp
     py_attention_metadata.cpp
     py_input_batch.cpp
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
@@ -100,6 +104,7 @@ cc_library(
     :request
     :speculative
     :encoder_cache
+    :multimodal
     :state_dict
     :dit_cache
     :model

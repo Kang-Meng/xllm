@@ -2541,6 +2541,34 @@ def test_eager_runner_rejects_missing_cp_lengths(
 
 
 class TestExecuteRouting:
+    @pytest.mark.parametrize("runner_name", ["eager_runner", "inductor_runner"])
+    @pytest.mark.parametrize("prefill,chunked", [(True, False), (False, True)])
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_multimodal_inputs_reach_selected_runner(
+        self, mock_create: MagicMock, runner_name: str, prefill: bool, chunked: bool
+    ) -> None:
+        from xllm.python.models.multimodal import MultimodalInputs
+
+        mock_create.return_value = StubAttentionBackend()
+        executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+        runner = MagicMock()
+        runner.execute.return_value = torch.ones(1)
+        setattr(executor, runner_name, runner)
+        executor.decode_graph_runner = MagicMock()
+        executor.decode_graph_runner.can_execute.return_value = True
+        prepared = MultimodalInputs(torch.ones(1, 2), (torch.full((1, 2), 2.0),))
+        result = executor.execute(
+            torch.zeros(1),
+            torch.zeros(1),
+            SimpleNamespace(is_prefill=prefill, is_chunked_prefill=chunked),
+            multimodal_inputs=prepared,
+        )
+        assert runner.execute.call_args.kwargs["multimodal_inputs"] is prepared
+        torch.testing.assert_close(result, torch.ones(1))
+        executor.decode_graph_runner.can_execute.assert_not_called()
+        executor.decode_graph_runner.execute.assert_not_called()
+
     @pytest.mark.parametrize(
         ("draft_event_index", "expected_calls"),
         [(2, [2]), (None, [0, 1, 2])],

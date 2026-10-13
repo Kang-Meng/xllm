@@ -154,6 +154,68 @@ NPU) and torch selects it from the device.
 Execution orchestration: eager or graph runners, forward context, attention
 backend setup, cache binding, and lifecycle.
 
+## Multimodal model integration
+
+Multimodal models implement `models.multimodal.SupportsMultimodal`. The C++
+`PyMultimodalExecutor` validates the capability when constructing a VLM executor.
+The execution flow is:
+
+```text
+EncoderExecutor: cache lookup -> gather uncached item inputs
+  model.encode_multimodal(data, token_counts)
+EncoderExecutor: scatter full item outputs -> cache -> gather scheduled rows and masks
+  model.prepare_multimodal_inputs(input_ids, data) -> MultimodalInputs
+ModelExecutor -> eager / Inductor runner
+  language_model(input_ids, positions, inputs_embeds=..., deepstack_input_embeds=...)
+```
+
+`EncoderExecutor` in `core/runtime/` is shared with the C++ VLM path. It owns
+item cache reuse and scheduled-window mapping. Models own encoder computation
+and embedding fusion; they do not slice features by the current prefill chunk
+or infer item positions from placeholder token IDs.
+
+Its C++ entry point is `prepare(params, encode)`. It gathers uncached inputs
+into `params.multimodal.mm_data` before synchronously calling `encode(params)`.
+The callback receives the current execution parameters by reference: native
+models use them directly, while the Python adapter passes their multimodal data
+and per-item token counts to `encode_multimodal`. The executor then replaces the
+multimodal data with the scheduled embeddings and masks for fusion.
+
+- `encode_multimodal` receives concatenated uncached inputs and full token counts
+  per item, grouped by modality. It returns a list of full item tensors under
+  each `<modality>|embedding` key, in the same per-modality item order. It returns
+  an empty dictionary when no items need encoding.
+  Model-specific feature transforms happen before these results enter the cache:
+  GLM applies its checkpoint's hidden-space rotation during encoding. Supplied
+  precomputed embeddings must already use the target language model's hidden
+  space; the merge does not rotate them.
+- `prepare_multimodal_inputs` receives scheduled embedding tensors and boolean
+  `<modality>|mask` tensors over the flattened token batch. It returns
+  `MultimodalInputs`, containing text/feature embeddings and optional deepstack
+  tensors. `merge_multimodal_embeddings` only validates and scatters matching-width
+  feature rows into the input tensor, returning that tensor. Qwen3-VL pads text
+  embeddings to match its concatenated encoder output, then splits the merged
+  tensor into main and deepstack inputs. Each model packages `MultimodalInputs`.
+  `input_ids` is a one-dimensional sequence of scheduled tokens, so text
+  embeddings are `[scheduled_tokens, hidden_size]`, including for Qwen3-VL.
+  Merge modifies its destination in place: callers must supply a writable
+  buffer whose contents may be replaced. Current models use a fresh embedding
+  lookup result or, for Qwen deepstack, a newly concatenated tensor. Cached
+  multimodal features and masks are read-only sources.
+- Qwen3-VL, GLM5-next-VL, and JoyAI-ASR each implement `encode_multimodal`.
+  Each model interprets its processor's input fields and calls its own encoder;
+  the shared protocol does not prescribe pixel, grid, or audio arguments.
+- `cache_multimodal_embeddings` selects the shared cache, whose budget comes from
+  the existing encoder-cache option. ASR disables this cache because its own
+  encoding cache also restores per-audio CTC hypotheses on each encode call.
+
+The language model consumes prepared tensors as explicit keyword arguments;
+model attributes do not carry request inputs between merge and forward. The
+existing `input_embedding` argument retains its speculative-decoding meaning.
+Prepared multimodal inputs use eager execution or the configured Inductor runner.
+Pure decode continues to use the existing decode graph admission path. Supporting
+multimodal prefill graph replay requires a separate static-buffer contract.
+
 ## Import safety
 
 `import xllm.python` is runtime-neutral: it does not detect a platform or import

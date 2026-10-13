@@ -55,6 +55,13 @@ from xllm.python.models.glm5_next import (
     Glm5NextForCausalLM,
     Glm5NextModel,
 )
+from xllm.python.models.multimodal import (
+    EncoderOutputs,
+    EncoderTokenCounts,
+    MultimodalData,
+    MultimodalInputs,
+    merge_multimodal_embeddings,
+)
 
 # ---------------------------------------------------------------------------
 # Position helpers (mirror transformers.vision_utils, pure-tensor, no dep)
@@ -809,9 +816,11 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
 
     The ``self.model`` attribute (required by ``PyModelBase``) is set to the
     language model, so the executor's runner calls
-    ``language_model(inputs_embeds, positions)``. Vision encoding happens in
-    ``encode`` / ``get_input_embeddings`` before the runner kicks in.
+    ``language_model(input_ids, positions, inputs_embeds=...)``. Vision encoding happens in
+    ``encode_multimodal`` / ``prepare_multimodal_inputs`` before the runner kicks in.
     """
+
+    cache_multimodal_embeddings = True
 
     def __init__(self, config: dict) -> None:
         # NOTE: we inherit Glm5NextForCausalLM to reuse its weight-loader helpers
@@ -827,7 +836,6 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         # Glm5NextVisionConfig.from_dict read this flat layout directly.
         # Fall back to nested vision_config/text_config for standalone tests.
         vision_cfg_dict = config.get("vision_config", config)
-        text_cfg_dict = config.get("text_config", config)
 
         vcfg = Glm5NextVisionConfig.from_dict(vision_cfg_dict)
         vcfg.tp_size = int(config.get("tp_size", 1))
@@ -842,17 +850,6 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         device = torch.device(config.get("device", "cuda"))
         self.dtype = dtype
         self.device = device
-
-        # Token IDs (flat or nested)
-        self.image_token_id = int(config.get("image_token_id", text_cfg_dict.get("image_token_id", 154854)))
-        self.vision_start_token_id = int(config.get("image_start_token_id", 154830))
-        self.vision_end_token_id = int(config.get("image_end_token_id", 154831))
-        # Video uses its own placeholder + boundary tokens (distinct from
-        # image): video_token_id is the per-frame feature placeholder that
-        # get_input_embeddings scatters video embeddings into.
-        self.video_token_id = int(config.get("video_token_id", text_cfg_dict.get("video_token_id", 154855)))
-        self.video_start_token_id = int(config.get("video_start_token_id", 154832))
-        self.video_end_token_id = int(config.get("video_end_token_id", 154833))
 
         # --- Vision tower ---
         self.vision_cfg = vcfg
@@ -930,73 +927,26 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         out = self.vision_model(pixel_values, grid_thw)
         return out.pooler_output
 
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.Tensor,
-        image_token_id: int,
-    ) -> torch.Tensor:
-        """Build a boolean mask locating image-token positions.
-
-        Returns ``(seq_len,)`` bool tensor: ``True`` where ``input_ids ==
-        image_token_id``. The caller expands it to ``(seq_len, hidden_size)``
-        for ``masked_scatter``.
-        """
-        return input_ids == image_token_id
-
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        image_embeds: Optional[torch.Tensor] = None,
-        video_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Stage 2: merge text + multimodal embeddings.
-
-        GLM4V placeholder convention: both still images and video frames use
-        ``image_token_id`` as the per-patch placeholder — ``video_token_id``
-        is only a prompt marker that ``GLM4VPromptProcessor`` expands away into
-        ``image_token_id`` frame batches (bounded by begin/end-of-image
-        markers + timestamps). So both modalities scatter at the SAME
-        ``image_token_id`` positions, concatenated in prompt order (images
-        then videos) to match how the placeholders appear left-to-right in
-        ``input_ids``. Both ViT outputs are mapped through the QuaRot hidden
-        rotation (``_hidden_rot``) before scattering so they land in the
-        rotation-quantized LLM's hidden basis.
-        """
-        # Normalise to 2-D [B, S] — the C++ EagerRunner passes a flattened
-        # 1-D [num_tokens] tensor (same convention Glm5NextModel.forward
-        # normalises). Without this, embed_tokens produces a 2-D [S, H] output
-        # and the downstream forward's hc_mult expand hits a shape mismatch.
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        inputs_embeds = self.language_model.embed_tokens(input_ids)
-
-        embeds_list: list[torch.Tensor] = []
-        if image_embeds is not None:
-            embeds_list.append(image_embeds)
-        if video_embeds is not None:
-            embeds_list.append(video_embeds)
-
-        if embeds_list:
-            combined = torch.cat(embeds_list, dim=0)
-            mask = self.get_placeholder_mask(input_ids, self.image_token_id)
-            n_mm_tokens = mask.sum().item()
-            expected = combined.shape[0]
-            if n_mm_tokens != expected:
-                raise ValueError(
-                    f"Multimodal features and tokens do not match: "
-                    f"token_id={self.image_token_id}, tokens={n_mm_tokens}, "
-                    f"features={expected}"
-                )
+    def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs:
+        outputs: EncoderOutputs = {}
+        for modality, pixel_key, grid_key in (
+            ("image", "pixel_values", "image_grid_thw"),
+            ("video", "pixel_values_videos", "video_grid_thw"),
+        ):
+            counts = token_counts.get(modality, [])
+            if not counts:
+                continue
+            pixels, grid = data[pixel_key], data[grid_key]
+            if not isinstance(pixels, torch.Tensor) or not isinstance(grid, torch.Tensor):
+                raise TypeError("batched vision pixels and grids must be tensors")
+            features = self.encode(pixels, grid)
             if self._hidden_rot is not None:
-                # Map the (unrotated) ViT output into the rotation-quantized
-                # LLM's hidden basis — see __init__ for the full rationale.
-                combined = combined @ self._hidden_rot
-            mask = mask.unsqueeze(-1).expand_as(inputs_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(mask, combined.to(inputs_embeds.dtype))
+                features = features @ self._hidden_rot
+            outputs[f"{modality}|embedding"] = list(features.split(counts, dim=0))
+        return outputs
 
-        # Close the loop: store on the LLM so forward() uses the merged embeds.
-        self.model._inputs_embeds = inputs_embeds
-        return inputs_embeds
+    def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs:
+        return MultimodalInputs(merge_multimodal_embeddings(self.language_model.embed_tokens(input_ids), data))
 
     # ------------------------------------------------------------------
     # Weight loading

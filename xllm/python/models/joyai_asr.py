@@ -35,6 +35,13 @@ from scripts.logger import logger
 from xllm.python.layers import ColumnParallelLinear
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader, load_causal_lm_weights
 from xllm.python.models.base import PyModelBase
+from xllm.python.models.multimodal import (
+    EncoderOutputs,
+    EncoderTokenCounts,
+    MultimodalData,
+    MultimodalInputs,
+    merge_multimodal_embeddings,
+)
 from xllm.python.models.qwen2 import Qwen2Config, Qwen2Model
 
 # ---------------------------------------------------------------------------
@@ -394,8 +401,10 @@ class JoyaiASRForConditionalGeneration(PyModelBase):
 
     ``self.model`` (required by PyModelBase / the executor runner) is the
     :class:`Qwen2Model` LLM. Audio encoding and the embedding merge happen in
-    :meth:`encode` / :meth:`get_input_embeddings`, driven by PyExecutorImpl.
+    :meth:`encode_multimodal` / :meth:`prepare_multimodal_inputs`, driven by PyMultimodalExecutor.
     """
+
+    cache_multimodal_embeddings = False
 
     def __init__(self, config: dict) -> None:
         super().__init__()
@@ -627,41 +636,26 @@ class JoyaiASRForConditionalGeneration(PyModelBase):
         """
         return [list(tokens) for tokens in self._ctc_results]
 
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        image_embeds: torch.Tensor | None = None,
-        video_embeds: torch.Tensor | None = None,
-        audio_embeds: torch.Tensor | None = None,
-        audio_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Stage 2: merge text + audio embeddings.
+    def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs:
+        counts = token_counts.get("audio", [])
+        if not counts:
+            return {}
+        input_features = data["input_features"]
+        speech_lengths = data["speech_lengths"]
+        audio_meta = data["audio_encode_meta"]
+        if (
+            not isinstance(input_features, torch.Tensor)
+            or not isinstance(speech_lengths, torch.Tensor)
+            or not isinstance(audio_meta, torch.Tensor)
+        ):
+            raise TypeError("batched audio features, lengths and metadata must be tensors")
+        if audio_meta.ndim != 2 or audio_meta.shape[0] != speech_lengths.numel():
+            raise ValueError("audio metadata rows must match the speech item count")
+        features = self.encode(input_features, speech_lengths, audio_meta)
+        return {"audio|embedding": list(features.split(counts, dim=0))}
 
-        Audio rows scatter at the executor's chunk mask positions — not
-        token-id matching (pad ids also occur as ordinary text). Sets
-        ``model._inputs_embeds`` for the runner-driven forward.
-        """
-        inputs_embeds = self.model.embed_tokens(input_ids)
-
-        if audio_embeds is None:
-            # Text-only step: clear so the runner falls back to embed_tokens.
-            self.model._inputs_embeds = None
-            return inputs_embeds
-
-        assert audio_mask is not None, "audio_embeds requires the executor's chunk scatter mask"
-        # Single host sync guarding the mask/embeds row invariant.
-        num_mask_rows = int(audio_mask.sum().item())
-        if num_mask_rows == 0:
-            # Gap-text-only window: nothing to scatter; hand the runner the
-            # embed_tokens rows instead of making it recompute them.
-            self.model._inputs_embeds = inputs_embeds
-            return inputs_embeds
-        assert num_mask_rows == audio_embeds.size(0), (
-            f"audio scatter mask rows ({num_mask_rows}) != audio embeds rows ({audio_embeds.size(0)})"
-        )
-        inputs_embeds[audio_mask] = audio_embeds.to(inputs_embeds.dtype)
-        self.model._inputs_embeds = inputs_embeds
-        return inputs_embeds
+    def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs:
+        return MultimodalInputs(merge_multimodal_embeddings(self.model.embed_tokens(input_ids), data))
 
     # ------------------------------------------------------------------
     # Weight loading

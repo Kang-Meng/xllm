@@ -2,6 +2,20 @@ include(cc_test)
 
 cc_test(
   NAME
+    encoder_executor_test
+  CPU_ONLY
+  SRCS
+    encoder_executor_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/runtime/encoder_executor.cpp
+  DEPS
+    :multimodal
+    :encoder_cache
+    glog::glog
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     draft_model_config_test
   CPU_ONLY
   SRCS

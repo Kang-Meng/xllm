@@ -285,134 +285,27 @@ bool EncoderOutputScatterVisitor::finish() const {
   return true;
 }
 
-bool ChunkEmbedSliceVisitor::visit(MMDataItem& item) {
-  if (item.type() != modality_ || item.is_embedded()) {
-    return true;
-  }
-  const auto& state = item.state();
-  const int32_t len = state.token_pos().length;
-  if (len <= 0) {
-    return true;
-  }
-  int32_t start_pos = state.schedule_data().start_pos;
-  int32_t end_pos = state.schedule_data().end_pos;
-  const auto& mask = state.mm_token_mask();
-  if (mask.defined() && mask.numel() > 0) {
-    auto mask_cpu = mask.to(torch::kCPU);
-    start_pos = mask_cpu.slice(0, 0, start_pos).sum().item<int32_t>();
-    end_pos = mask_cpu.slice(0, 0, end_pos).sum().item<int32_t>();
-  }
-  if (end_pos > start_pos) {
-    slices_.push_back(embeds_.slice(0, off_ + start_pos, off_ + end_pos));
-  }
-  // Advance by the encoder-output row count (mm_token_num), not the full
-  // token_pos span: video spans carry non-mm markers, so the latter would
-  // misalign every later item.
-  off_ += state.mm_token_num();
-  return true;
-}
-
-torch::Tensor ChunkEmbedSliceVisitor::finish() {
-  torch::Tensor out;
-  if (slices_.empty() || !safe_concat(slices_, out)) {
-    return embeds_;
-  }
-  return out;
-}
-
-AudioScatterMaskVisitor::AudioScatterMaskVisitor(
-    const std::vector<int32_t>& seq_lens,
-    const std::vector<int32_t>& scheduled_seq_lens,
-    const torch::Tensor& tokens)
-    : tokens_(tokens),
-      per_seq_total_lens_(normalize_to_per_seq_lens(seq_lens)),
-      per_seq_scheduled_lens_(normalize_to_per_seq_lens(scheduled_seq_lens)),
-      per_seq_scheduled_offsets_(per_seq_scheduled_lens_.size(), 0) {
-  CHECK_EQ(per_seq_total_lens_.size(), per_seq_scheduled_lens_.size());
-  for (size_t s = 0; s < per_seq_total_lens_.size(); ++s) {
-    CHECK_GE(per_seq_total_lens_[s], per_seq_scheduled_lens_[s])
-        << "kv length below q length for seq " << s;
-  }
-  if (per_seq_scheduled_lens_.size() > 1) {
-    std::partial_sum(per_seq_scheduled_lens_.begin(),
-                     per_seq_scheduled_lens_.end() - 1,
-                     per_seq_scheduled_offsets_.begin() + 1);
-  }
-  const int32_t total_scheduled_tokens = std::accumulate(
-      per_seq_scheduled_lens_.begin(), per_seq_scheduled_lens_.end(), 0);
-  CHECK_EQ(static_cast<int64_t>(total_scheduled_tokens), tokens.numel())
-      << "scheduled token count != tokens tensor size";
-
-  // Host-assembled (item masks are CPU tensors); finish() moves it once.
-  mask_ = torch::zeros(
-      {tokens.numel()},
-      torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
-}
-
-bool AudioScatterMaskVisitor::visit(MMDataItem& item) {
-  if (item.type() != MMType::AUDIO) {
-    return true;
-  }
-  const auto& state = item.state();
-  const int32_t start_pos = state.schedule_data().start_pos;
-  const int32_t end_pos = state.schedule_data().end_pos;
-  if (end_pos <= start_pos) {
-    return true;
-  }
-  const int32_t seq_index = state.seq_index();
-  CHECK_GE(seq_index, 0) << "audio item without a sequence index";
-  CHECK_LT(seq_index, static_cast<int32_t>(per_seq_scheduled_lens_.size()));
-  CHECK(state.mm_token_mask().defined())
-      << "audio item without an mm_token_mask";
-  // In-span position -> batch position, as in EncoderEmbeddingGatherVisitor.
-  const int32_t computed_tokens_num =
-      per_seq_total_lens_[seq_index] - per_seq_scheduled_lens_[seq_index];
-  const int32_t req_start_idx = per_seq_scheduled_offsets_[seq_index];
-  const int32_t req_start_pos = req_start_idx + state.token_pos().offset -
-                                computed_tokens_num + start_pos;
-  const int32_t req_end_pos =
-      req_start_idx + state.token_pos().offset - computed_tokens_num + end_pos;
-  CHECK_GE(req_start_pos, req_start_idx)
-      << "audio scatter range starts before its sequence window";
-  CHECK_LE(req_end_pos, req_start_idx + per_seq_scheduled_lens_[seq_index])
-      << "audio scatter range ends past its sequence window";
-  mask_.slice(0, req_start_pos, req_end_pos)
-      .copy_(state.mm_token_mask().slice(0, start_pos, end_pos));
-  return true;
-}
-
-torch::Tensor AudioScatterMaskVisitor::finish() const {
-  return mask_.to(tokens_.device()).view(tokens_.sizes());
-}
-
 EncoderEmbeddingGatherVisitor::EncoderEmbeddingGatherVisitor(
-    const torch::Device& device,
-    uint32_t mm_type,
     const std::vector<int32_t>& seq_lens,
     const std::vector<int32_t>& scheduled_seq_lens)
-    : device_(device),
-      per_seq_context_lens_(normalize_to_per_seq_lens(seq_lens)),
+    : per_seq_context_lens_(normalize_to_per_seq_lens(seq_lens)),
       per_seq_scheduled_lens_(normalize_to_per_seq_lens(scheduled_seq_lens)),
       per_seq_scheduled_offsets_(per_seq_scheduled_lens_.size(), 0),
       total_scheduled_tokens_(std::accumulate(per_seq_scheduled_lens_.begin(),
                                               per_seq_scheduled_lens_.end(),
                                               0)) {
+  CHECK_EQ(per_seq_context_lens_.size(), per_seq_scheduled_lens_.size())
+      << "sequence length counts do not match";
+  for (size_t seq_index = 0; seq_index < per_seq_context_lens_.size();
+       ++seq_index) {
+    CHECK_GE(per_seq_context_lens_[seq_index],
+             per_seq_scheduled_lens_[seq_index])
+        << "kv length below q length for seq " << seq_index;
+  }
   if (per_seq_scheduled_lens_.size() > 1) {
     std::partial_sum(per_seq_scheduled_lens_.begin(),
                      per_seq_scheduled_lens_.end() - 1,
                      per_seq_scheduled_offsets_.begin() + 1);
-  }
-  if (mm_type & MMType::IMAGE) {
-    image_mask_ = torch::zeros({total_scheduled_tokens_},
-                               torch::dtype(torch::kBool).device(device_));
-  }
-  if (mm_type & MMType::VIDEO) {
-    video_mask_ = torch::zeros({total_scheduled_tokens_},
-                               torch::dtype(torch::kBool).device(device_));
-  }
-  if (mm_type & MMType::AUDIO) {
-    audio_mask_ = torch::zeros({total_scheduled_tokens_},
-                               torch::dtype(torch::kBool).device(device_));
   }
 }
 
@@ -421,6 +314,8 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
 
   int32_t seq_index = state.seq_index();
   CHECK_GE(seq_index, 0);
+  CHECK_LT(static_cast<size_t>(seq_index), per_seq_scheduled_lens_.size())
+      << "item sequence index outside scheduled batch";
 
   auto token_pos = item.state().token_pos();
   int32_t start_pos = state.schedule_data().start_pos;
@@ -440,26 +335,11 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
       req_start_idx_ + token_pos.offset - computed_tokens_num + start_pos;
   int32_t req_end_pos =
       req_start_idx_ + token_pos.offset - computed_tokens_num + end_pos;
+  CHECK_GE(req_start_pos, req_start_idx_)
+      << "scatter range starts before its sequence window";
+  CHECK_LE(req_end_pos, req_start_idx_ + schedule_tokens_num)
+      << "scatter range ends past its sequence window";
 
-  if (item.type() == MMType::IMAGE) {
-    image_mask_.slice(/*dim*/ 0,
-                      /*start*/ req_start_pos,
-                      /*end*/ req_end_pos) =
-        state.mm_token_mask().slice(
-            /*dim*/ 0, /*start*/ start_pos, /*end*/ end_pos);
-  } else if (item.type() == MMType::VIDEO) {
-    video_mask_.slice(/*dim*/ 0,
-                      /*start*/ req_start_pos,
-                      /*end*/ req_end_pos) =
-        state.mm_token_mask().slice(
-            /*dim*/ 0, /*start*/ start_pos, /*end*/ end_pos);
-  } else if (item.type() == MMType::AUDIO) {
-    audio_mask_.slice(/*dim*/ 0,
-                      /*start*/ req_start_pos,
-                      /*end*/ req_end_pos) =
-        state.mm_token_mask().slice(
-            /*dim*/ 0, /*start*/ start_pos, /*end*/ end_pos);
-  }
   const std::string key = get_embedding_key(item.type());
   auto emb = item.get<torch::Tensor>(key);
   if (!emb.has_value()) {
@@ -467,6 +347,27 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
     return false;
   }
   torch::Tensor embedding = emb.value();
+  if (embedding.size(0) != state.mm_token_num()) {
+    LOG(ERROR) << "embedding rows do not match the item token count for key: "
+               << key;
+    return false;
+  }
+  const auto update_mask = [&](torch::Tensor& mask) {
+    if (!mask.defined()) {
+      mask = torch::zeros({total_scheduled_tokens_},
+                          embedding.options().dtype(torch::kBool));
+    }
+    mask.slice(/*dim=*/0, /*start=*/req_start_pos, /*end=*/req_end_pos) =
+        state.mm_token_mask().slice(
+            /*dim=*/0, /*start=*/start_pos, /*end=*/end_pos);
+  };
+  if (item.type() == MMType::IMAGE) {
+    update_mask(image_mask_);
+  } else if (item.type() == MMType::VIDEO) {
+    update_mask(video_mask_);
+  } else if (item.type() == MMType::AUDIO) {
+    update_mask(audio_mask_);
+  }
   datas_[key].push_back(
       embedding.slice(/*dim*/ 0, /*start*/ emb_start, /*end*/ emb_end));
   return true;

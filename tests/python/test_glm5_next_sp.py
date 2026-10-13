@@ -504,11 +504,10 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
     ids = torch.zeros(rows, dtype=torch.long)
     positions = torch.arange(rows)
     cfg.eplv2_sequence_parallel = False
-    model._inputs_embeds = hidden.clone()
     context = _metadata()
     context.execution_contexts = {Glm5NextEplv2Metadata: Glm5NextEplv2Metadata(torch.ones(rows, dtype=torch.bool))}
     monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: context)
-    expected = model(ids, positions)
+    expected = model(ids, positions, inputs_embeds=hidden.clone())
     if capture:
         expected_hidden, expected_aux = expected
     else:
@@ -554,8 +553,7 @@ def test_model_keeps_mhc_and_norm_local_until_attention(
         monkeypatch.setattr(glm5_next.distributed, "reduce_scatter", reduce, raising=False)
         norm_shapes.clear()
         layer_events.reset_mock()
-        model._inputs_embeds = hidden.clone()
-        actual = model(ids, positions)
+        actual = model(ids, positions, inputs_embeds=hidden.clone())
         if capture:
             actual_hidden, actual_aux = actual
             torch.testing.assert_close(actual_aux, expected_aux, rtol=1e-5, atol=1e-6)

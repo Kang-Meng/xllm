@@ -28,9 +28,6 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/kv_cache/kv_shard_layout.h"
-#include "core/framework/multimodal/mm_batch_data.h"
-#include "core/framework/multimodal/mm_data.h"
-#include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
@@ -52,23 +49,6 @@ namespace py = pybind11;
 
 namespace xllm {
 namespace {
-
-// Slice each modality's embedding blocks to the in-chunk subrange on the
-// scheduled items (drives ChunkEmbedSliceVisitor, the host-side twin of the
-// C++ VLM path's gather visitor). Chunked prefill — where a chunk boundary
-// can land inside an item's span — then scatters only the features whose
-// placeholders are in `tokens`; fully scheduled items pass through unchanged,
-// so the non-chunked case is a no-op.
-torch::Tensor slice_chunk_embeds(MMBatchData& mm_data,
-                                 const torch::Tensor& embeds,
-                                 MMType modality) {
-  if (!embeds.defined() || embeds.dim() == 0 || embeds.size(0) == 0) {
-    return embeds;
-  }
-  ChunkEmbedSliceVisitor visitor(embeds, modality);
-  CHECK(mm_data.foreach (visitor));
-  return visitor.finish();
-}
 
 void register_xllm_runtime_module(py::module_& m) {
   register_attention_metadata_views(m);
@@ -166,6 +146,11 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   CHECK(py_causal_lm_ != nullptr) << "PyExecutorImpl requires PyCausalLM";
 
   py::gil_scoped_acquire gil;
+  if (py_causal_lm_->config_dict()["is_multimodal"].cast<bool>()) {
+    multimodal_executor_ = std::make_unique<PyMultimodalExecutor>(
+        py_causal_lm_->python_model(),
+        options.max_encoder_cache_size() * 1024 * 1024);
+  }
   py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
@@ -272,115 +257,10 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       mtp_async::materialize_graph_speculative_verify_tokens(tokens,
                                                              params.graph);
 
-  // --- VLM: vision encode + embedding merge on image/video prefill steps ---
-  // On steps carrying multimodal input, ``params.multimodal.mm_data`` holds the
-  // batched ``pixel_values`` + ``image_grid_thw`` (still images) and/or
-  // ``pixel_values_videos`` + ``video_grid_thw`` (video) — same accessors the
-  // C++ Qwen3-VL base uses in qwen3_vl_base.h. Drive the Python model's
-  // ``encode`` -> ``get_input_embeddings`` pipeline: the latter scatters each
-  // modality's embeddings at its placeholder-token positions and sets
-  // ``model._inputs_embeds`` / ``deepstack_input_embeds`` for the runner-driven
-  // ``Qwen3VLModel.forward``. Decode steps carry no mm_data, so the attributes
-  // stay clear and the aclgraph embed path is used.
-  //
-  // NOTE: this scatters the FULL image/video embedding into the current
-  // forward's tokens, so it assumes every multimodal token is in this batch
-  // (i.e. enable_chunked_prefill=False). Chunked prefill — where a chunk
-  // boundary can land inside an item's token span — needs item-level scatter
-  // (reuse EncoderEmbeddingGatherVisitor + the NPU backend's paged mixed-batch
-  // attention, both tracked for a follow-up PR).
-  //
-  // TODO: refactor the per-modality blocks below into a generic handoff.
-  auto& mm_data = params.multimodal.mm_data;
-  if (mm_data.valid()) {
-    torch::Tensor pixel_values;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values")) {
-      pixel_values = res.value();
-    }
-    torch::Tensor image_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("image_grid_thw")) {
-      image_grid_thw = res.value();
-    }
-    torch::Tensor pixel_values_videos;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values_videos")) {
-      pixel_values_videos = res.value();
-    }
-    torch::Tensor video_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("video_grid_thw")) {
-      video_grid_thw = res.value();
-    }
-    torch::Tensor input_features;
-    if (const auto& res = mm_data.get<torch::Tensor>("input_features")) {
-      input_features = res.value();
-    }
-    torch::Tensor speech_lengths;
-    if (const auto& res = mm_data.get<torch::Tensor>("speech_lengths")) {
-      speech_lengths = res.value();
-    }
-    CHECK(input_features.defined() == speech_lengths.defined())
-        << "input_features and speech_lengths must be provided together";
-
-    if (pixel_values.defined() || pixel_values_videos.defined() ||
-        input_features.defined()) {
-      py::object top_model = py_causal_lm_->python_model();
-      // encode() moves the tensors onto device internally. Slice each block to
-      // the chunk's in-chunk subrange (see slice_chunk_embeds) so chunked
-      // prefill does not feed full image/video features into a partial
-      // placeholder span.
-      py::object image_embeds = py::none();
-      if (pixel_values.defined() && image_grid_thw.defined()) {
-        torch::Tensor raw =
-            top_model.attr("encode")(pixel_values, image_grid_thw)
-                .cast<torch::Tensor>();
-        image_embeds =
-            py::cast(slice_chunk_embeds(mm_data, raw, MMType::IMAGE));
-      }
-      py::object video_embeds = py::none();
-      if (pixel_values_videos.defined() && video_grid_thw.defined()) {
-        torch::Tensor raw =
-            top_model.attr("encode")(pixel_values_videos, video_grid_thw)
-                .cast<torch::Tensor>();
-        video_embeds =
-            py::cast(slice_chunk_embeds(mm_data, raw, MMType::VIDEO));
-      }
-      py::object audio_embeds = py::none();
-      py::object audio_mask = py::none();
-      if (input_features.defined() && speech_lengths.defined()) {
-        // Per-audio [hash, ctc_pad_num] rows, in item order.
-        torch::Tensor audio_meta;
-        if (const auto& res = mm_data.get<torch::Tensor>("audio_encode_meta")) {
-          audio_meta = res.value();
-        }
-        CHECK(audio_meta.defined() &&
-              audio_meta.size(0) == speech_lengths.numel())
-            << "audio_encode_meta missing or misaligned with speech_lengths";
-        torch::Tensor raw =
-            top_model.attr("encode")(input_features, speech_lengths, audio_meta)
-                .cast<torch::Tensor>();
-        audio_embeds =
-            py::cast(slice_chunk_embeds(mm_data, raw, MMType::AUDIO));
-        // Chunk replacement mask: the Python merge scatters the sliced rows
-        // at these positions (item state, not pad-id matching).
-        AudioScatterMaskVisitor mask_visitor(
-            /*seq_lens=*/params.attention.host.kv_seq_lens,
-            /*scheduled_seq_lens=*/params.attention.host.q_seq_lens,
-            execution_tokens);
-        CHECK(mm_data.foreach (mask_visitor));
-        audio_mask = py::cast(mask_visitor.finish());
-      }
-      // Sets top_model.model._inputs_embeds + deepstack_input_embeds.
-      if (audio_embeds.is_none()) {
-        top_model.attr("get_input_embeddings")(
-            execution_tokens, image_embeds, video_embeds);
-      } else {
-        top_model.attr("get_input_embeddings")(execution_tokens,
-                                               image_embeds,
-                                               video_embeds,
-                                               audio_embeds,
-                                               audio_mask);
-      }
-    }
-  }
+  py::object multimodal_inputs =
+      multimodal_executor_
+          ? multimodal_executor_->prepare(execution_tokens, params)
+          : py::none();
 
   // --- mRoPE: collapse [3, N] decode positions to 1-D ---
   // Only PURE decode collapses to 1-D: decode rows are identical
@@ -391,11 +271,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // path, so it is excluded here. The 2-D shape itself is the mRoPE signal:
   // non-mRoPE models never receive 2-D positions, so no config flag is needed.
   torch::Tensor positions_arg = positions;
-  if (positions.dim() == 2 && !attn_metadata->is_prefill &&
-      !attn_metadata->is_chunked_prefill) {
-    positions_arg = positions.slice(/*dim=*/0, /*start=*/0, /*end=*/1)
-                        .squeeze(0)
-                        .contiguous();
+  if (positions.dim() == 2 && params.meta.batch_forward_type.is_decode()) {
+    positions_arg = positions.select(/*dim=*/0, /*index=*/0);
   }
 
   py::object py_sync = py::none();
@@ -416,11 +293,6 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object eplb_decode_token_mask =
       optional_tensor(params.expert.eplb_decode_token_mask);
 
-  // Execute: one C++ -> Python call per step. input_embedding stays None for
-  // the Qwen3-VL python path (embeddings are merged via the attribute set by
-  // get_input_embeddings above), so the runner takes the 2-arg model() branch
-  // and Qwen3VLModel.forward reads _inputs_embeds. positions_arg carries the
-  // mRoPE [3,N]->1-D decode collapse.
   py::object hidden_obj =
       py_executor_.attr("execute")(execution_tokens,
                                    positions_arg,
@@ -433,7 +305,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    py_input_batch_metadata,
                                    py_load_sync,
                                    params.parallel.layers_per_event,
-                                   params.parallel.draft_load_event_index);
+                                   params.parallel.draft_load_event_index,
+                                   multimodal_inputs);
   if (py::isinstance<py::tuple>(hidden_obj)) {
     py::tuple output = hidden_obj.cast<py::tuple>();
     CHECK_EQ(output.size(), 2) << "Python model tuple output must be "

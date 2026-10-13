@@ -25,6 +25,7 @@ from xllm.python.model_executor.forward_context import (
 )
 from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
+from xllm.python.models.multimodal import MultimodalInputs
 
 
 class InductorRunner(BaseRunner):
@@ -41,6 +42,7 @@ class InductorRunner(BaseRunner):
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
+        multimodal_inputs: MultimodalInputs | None = None,
     ) -> ModelExecutionOutput:
         execution_contexts = {}
         if self.execution_metadata_builders:
@@ -63,6 +65,8 @@ class InductorRunner(BaseRunner):
                 execution_contexts=execution_contexts,
             )
         ):
+            if multimodal_inputs is not None:
+                return self.compiled_model(input_ids, positions, **multimodal_inputs.forward_kwargs())
             if input_embedding is None:
                 return self.compiled_model(input_ids, positions)
             return self.compiled_model(input_ids, positions, input_embedding)

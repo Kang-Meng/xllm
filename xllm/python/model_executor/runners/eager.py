@@ -27,6 +27,7 @@ from xllm.python.model_executor.forward_context import (
 )
 from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
+from xllm.python.models.multimodal import MultimodalInputs
 
 
 def _per_seq_lens_from_metadata(
@@ -88,6 +89,7 @@ class EagerRunner(BaseRunner):
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
         layer_load_context: LayerLoadContext | None = None,
+        multimodal_inputs: MultimodalInputs | None = None,
     ) -> ModelExecutionOutput:
         cp_context = None
         is_mla = self.attention_backend.is_mla
@@ -163,6 +165,8 @@ class EagerRunner(BaseRunner):
             # Draft-MTP steps carry the target's (or previous draft step's)
             # hidden state as input_embedding; the MTP body fuses it with the
             # token embedding. Regular steps take the 2-arg path.
+            if multimodal_inputs is not None:
+                return self.model(input_ids, positions, **multimodal_inputs.forward_kwargs())
             if input_embedding is None:
                 return self.model(input_ids, positions)
             return self.model(input_ids, positions, input_embedding)

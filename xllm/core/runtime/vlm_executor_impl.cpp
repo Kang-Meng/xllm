@@ -20,7 +20,6 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
-#include "core/framework/multimodal/mm_visitor.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 
@@ -33,12 +32,8 @@ VlmExecutorImpl::VlmExecutorImpl(CausalLM* model,
     : model_(dynamic_cast<CausalVLM*>(model)),
       args_(args),
       device_(device),
-      options_(options) {
-  if (options_.max_encoder_cache_size() > 0) {
-    encoder_cache_ = std::make_unique<EncoderCache>(
-        options_.max_encoder_cache_size() * 1024 * 1024);
-  }
-
+      options_(options),
+      encoder_executor_(options.max_encoder_cache_size() * 1024 * 1024) {
   if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
     llm_executor_ = ExecutorImplFactory::get_instance().create_executor_impl(
         model, args, device, options, Platform::type_str());
@@ -89,31 +84,9 @@ ModelOutput VlmExecutorImpl::run(const torch::Tensor& tokens,
   // to merge vision tokens into the token stream) and keep the real
   // [3, num_tokens] mRoPE rows. Under graph mode the executor demotes this
   // non-decode batch to eager forward.
-  if (encoder_cache_) {
-    EncoderCacheLookupVisitor lookup(encoder_cache_.get());
-    mm_data.foreach (lookup);
-  }
-
-  EncoderInputGatherVisitor input_gather;
-  mm_data.foreach (input_gather);
-  CHECK(input_gather.finish(mm_data));
-
-  MMDict embedding = encode(params);
-  EncoderOutputScatterVisitor scatter(embedding);
-  mm_data.foreach (scatter);
-  CHECK(scatter.finish());
-
-  if (encoder_cache_) {
-    EncoderCacheInsertVisitor insert(encoder_cache_.get());
-    mm_data.foreach (insert);
-  }
-
-  EncoderEmbeddingGatherVisitor gather(device_,
-                                       mm_data.type(),
-                                       params.attention.host.kv_seq_lens,
-                                       params.attention.host.q_seq_lens);
-  mm_data.foreach (gather);
-  CHECK(gather.finish(mm_data));
+  encoder_executor_.prepare(params, [this](const ModelInputParams& inputs) {
+    return encode(inputs);
+  });
 
   params.embedding.input_embedding =
       model_->get_input_embeddings(tokens, params);

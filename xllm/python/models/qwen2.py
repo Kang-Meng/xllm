@@ -21,8 +21,7 @@ per-head QK-norm) — its ``attention_bias`` covers q/k/v only, and the
 helper skips the absent o_proj bias on its own. RoPE uses the shared
 half-cache helpers in :mod:`xllm.python.layers.rotary_embedding`.
 
-``Qwen2Model.forward`` consumes ``self._inputs_embeds`` when set (multimodal
-merge path), mirroring ``Qwen3VLModel``.
+``Qwen2Model.forward`` accepts explicit ``inputs_embeds`` for multimodal steps.
 """
 
 from __future__ import annotations
@@ -260,19 +259,15 @@ class Qwen2Model(nn.Module):
         )
         self.layers = nn.ModuleList([Qwen2DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
-        # Set by get_input_embeddings (multimodal merge); None on text-only steps.
-        self._inputs_embeds: torch.Tensor | None = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self._inputs_embeds is not None:
-            hidden = self._inputs_embeds
-            self._inputs_embeds = None
-        else:
-            hidden = self.embed_tokens(input_ids)
+        hidden = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
 
         positions = positions.to(torch.int64).contiguous()
         # positions and the rotary cache are invariant across the layer

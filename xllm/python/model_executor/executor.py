@@ -40,6 +40,7 @@ from xllm.python.model_executor.input_batch import (
 )
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
+from xllm.python.models.multimodal import MultimodalInputs
 from xllm.python.platform import current_platform
 from xllm.python.registry import get_execution_metadata_builder_classes
 
@@ -487,9 +488,12 @@ class ModelExecutor:
         layer_load_synchronizer: LayerLoadSynchronizer | None = None,
         layers_per_event: int = 1,
         draft_load_event_index: int | None = None,
+        multimodal_inputs: MultimodalInputs | None = None,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
+        if multimodal_inputs is not None and input_embedding is not None:
+            raise ValueError("multimodal inputs and speculative hidden states cannot share a forward")
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
@@ -524,6 +528,7 @@ class ModelExecutor:
         graph_runner = self.decode_graph_runner
         if (
             graph_runner is not None
+            and multimodal_inputs is None
             and (eplb is None or current_platform.is_npu())
             and graph_runner.can_execute(input_ids, metadata, input_embedding)
         ):
@@ -557,6 +562,7 @@ class ModelExecutor:
                 layer_synchronizer=layer_synchronizer,
                 eplb=eplb,
                 input_batch=input_batch,
+                multimodal_inputs=multimodal_inputs,
             )
         return self.eager_runner.execute(
             input_ids,
@@ -567,4 +573,5 @@ class ModelExecutor:
             eplb=eplb,
             input_batch=input_batch,
             layer_load_context=layer_load_context,
+            multimodal_inputs=multimodal_inputs,
         )
