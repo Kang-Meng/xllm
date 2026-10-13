@@ -35,6 +35,16 @@ struct SamplingParameters;
 
 namespace specBuilder {
 
+// Advance a temporary combined-first-draft Host template for tail-row planning.
+// Clone its CPU int32 token/position tensors to preserve source tensor storage.
+// The first num_sequences entries are decode anchors used by the tail-row
+// builder to rebuild 1-D positions. This is not a full rotary-axis update;
+// the resulting template must not be used directly as replay position input.
+std::vector<EmbeddingCache::DecodeState> advance_first_draft_template(
+    ForwardInput& metadata_template,
+    const torch::Tensor& embedding_placeholder,
+    int32_t num_speculative_tokens);
+
 struct DecodeBuildMeta {
   int32_t kv_max_seq_len = 0;
 };

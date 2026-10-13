@@ -33,9 +33,12 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "distributed_runtime/engine.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/model/model_args.h"
+#include "framework/speculative/spec_input_builder.h"
+#include "runtime/forward_params.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -699,6 +702,142 @@ TEST(SchedulerPolicyTest, DecodeFirstSkipsRedistributionForLinearModels) {
         cached_tokens += expected_tokens;
         sequence->kv_state().set_kv_cache_tokens_num(cached_tokens);
       }
+    }
+  }
+}
+
+TEST(SchedulerPolicyTest, MtpOverlapReservationControlsAdmissionAndPages) {
+  constexpr int32_t kDraftTokens = 3;
+  constexpr int32_t kPageSize = 128;
+  // The old 2N lookahead ends at page 16; the bonus requires page 17.
+  constexpr int32_t kScheduledTokens = 16 * kPageSize - 2 * kDraftTokens;
+  // Admission includes the current token in addition to the 2N+1 lookahead.
+  constexpr int32_t kDecodeBudget = 2 * kDraftTokens + 2;
+  class NoTextTokenizer final : public Tokenizer {
+   public:
+    std::unique_ptr<Tokenizer> clone() const override {
+      return std::make_unique<NoTextTokenizer>();
+    }
+  };
+  class ResourceTestEngine final : public FakeEngine {
+   public:
+    ResourceTestEngine(int32_t num_blocks, int32_t block_size)
+        : FakeEngine(num_blocks, block_size) {}
+    const Tokenizer* tokenizer() const override { return &tokenizer_; }
+
+   private:
+    NoTextTokenizer tokenizer_;
+  };
+  struct TestCase {
+    int32_t token_budget;
+    int32_t request_count;
+  };
+  const TestCase cases[] = {{kDecodeBudget - 1, 1},
+                            {kDecodeBudget, 1},
+                            {2 * kDecodeBudget - 1, 2},
+                            {2 * kDecodeBudget, 2}};
+  ScopedConfigValue<std::string> algorithm(
+      SpeculativeConfig::get_instance().speculative_algorithm(), "MTP");
+  for (const TestCase& test_case : cases) {
+    SCOPED_TRACE(test_case.token_budget);
+    ResourceTestEngine engine(/*num_blocks=*/64, kPageSize);
+    ContinuousScheduler::Options options =
+        create_scheduler_options(test_case.token_budget,
+                                 test_case.request_count,
+                                 kDraftTokens,
+                                 /*max_tokens_per_chunk_for_prefill=*/16,
+                                 /*dp_size=*/1);
+    options.enable_schedule_overlap(true);
+    ContinuousScheduler scheduler(&engine, options);
+    auto requests = generate_request(
+        std::vector<int32_t>(test_case.request_count, kScheduledTokens - 1),
+        std::vector<int32_t>(test_case.request_count, 1024),
+        std::nullopt,
+        std::nullopt,
+        8192);
+    for (size_t index = 0; index < requests.size(); ++index) {
+      const std::string id = std::to_string(index);
+      requests[index] = std::make_shared<Request>(
+          id, id, "", requests[index]->state().clone(), "");
+      requests[index]->state().output_func =
+          [](const RequestOutput& /*output*/) { return true; };
+      Sequence* sequence = requests[index]->sequences().front().get();
+      ASSERT_TRUE(
+          engine.block_manager_pool()->allocate(sequence, kScheduledTokens));
+      sequence->kv_state().set_kv_cache_tokens_num(kScheduledTokens - 1);
+      sequence->append_token(1);
+      ASSERT_EQ(sequence->num_tokens(), kScheduledTokens);
+      ASSERT_EQ(sequence->kv_state().num_blocks(BlockType::KV), 16u);
+      ASSERT_TRUE(scheduler.add_request(requests[index]));
+    }
+    auto batches = scheduler.prepare_batch_test();
+    ASSERT_EQ(batches.size(), 1u);
+    const size_t expected_sequences =
+        std::min(requests.size(),
+                 static_cast<size_t>(test_case.token_budget / kDecodeBudget));
+    ASSERT_EQ(batches.front().size(), expected_sequences);
+    for (const auto& request : requests) {
+      Sequence* sequence = request->sequences().front().get();
+      const bool scheduled =
+          (expected_sequences > 0 && batches.front()[0] == sequence) ||
+          (expected_sequences == 2 && batches.front()[1] == sequence);
+      EXPECT_EQ(sequence->kv_state().num_blocks(BlockType::KV),
+                scheduled ? 17u : 16u);
+      EXPECT_EQ(sequence->num_need_compute_tokens(), 1u);
+    }
+    // Bridge allocation and lookup with real physical block IDs, without
+    // treating this Host-only check as full Batch/Worker table propagation.
+    for (size_t index = 0; index < batches.front().size(); ++index) {
+      Sequence* sequence = batches.front()[index];
+      const auto& blocks = sequence->kv_state().blocks(BlockType::KV);
+      std::vector<int32_t> block_ids;
+      block_ids.reserve(blocks.size());
+      for (const auto& block : blocks) {
+        block_ids.emplace_back(block.id());
+      }
+      ForwardInput metadata_template;
+      metadata_template.input_params.meta.num_sequences = 1;
+      metadata_template.input_params.embedding.request_ids = {"boundary"};
+      metadata_template.token_ids_host = torch::tensor({-1}, torch::kInt32);
+      // The unresolved Host update can advance N before the N+1 template.
+      const int32_t host_kv_len = kScheduledTokens + kDraftTokens;
+      metadata_template.positions_host =
+          torch::tensor({host_kv_len - 1}, torch::kInt32);
+      specBuilder::append_seq_len_by_layout(
+          metadata_template.input_params.attention.host.kv_seq_lens,
+          host_kv_len);
+      const auto states = specBuilder::advance_first_draft_template(
+          metadata_template, torch::Tensor(), kDraftTokens);
+      ASSERT_EQ(states.size(), 1u);
+      const int32_t position =
+          metadata_template.positions_host[0].item<int32_t>();
+      ASSERT_EQ(position, 16 * kPageSize);
+      EXPECT_EQ(
+          specBuilder::calc_kv_len(
+              metadata_template.input_params.attention.host.kv_seq_lens, 0, 0),
+          position + 1);
+      ASSERT_EQ(block_ids.size(), 17u);
+      EXPECT_EQ(specBuilder::calc_slot_id(
+                    position, {block_ids.data(), block_ids.size()}, kPageSize),
+                blocks.back().id() * kPageSize);
+    }
+    for (const uint32_t allowed : batches.front().get_allowed_max_tokens()) {
+      EXPECT_EQ(allowed, static_cast<uint32_t>(kDecodeBudget));
+    }
+    if (requests.size() == 2 && expected_sequences == 1) {
+      const size_t scheduled_index =
+          requests[0]->sequences().front().get() == batches.front()[0] ? 0 : 1;
+      requests[scheduled_index]->set_cancel();
+      auto next_batches = scheduler.prepare_batch_test();
+      ASSERT_EQ(next_batches.size(), 1u);
+      ASSERT_EQ(next_batches.front().size(), 1u);
+      Sequence* pending =
+          requests[1 - scheduled_index]->sequences().front().get();
+      EXPECT_EQ(next_batches.front()[0], pending);
+      EXPECT_EQ(pending->kv_state().num_blocks(BlockType::KV), 17u);
+    }
+    for (const auto& request : requests) {
+      engine.block_manager_pool()->deallocate(request.get());
     }
   }
 }

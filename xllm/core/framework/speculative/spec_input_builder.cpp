@@ -28,6 +28,54 @@ limitations under the License.
 
 namespace xllm::specBuilder {
 
+std::vector<EmbeddingCache::DecodeState> advance_first_draft_template(
+    ForwardInput& metadata_template,
+    const torch::Tensor& embedding_placeholder,
+    int32_t num_speculative_tokens) {
+  CHECK_GT(num_speculative_tokens, 0);
+  CHECK_LT(num_speculative_tokens, std::numeric_limits<int32_t>::max());
+  // The target verifier may accept every proposal and its bonus token.
+  // This N+1 template span fits the scheduler's N+(N+1) overlap reservation.
+  const int32_t advance = num_speculative_tokens + 1;
+  const int32_t num_sequences =
+      metadata_template.input_params.meta.num_sequences;
+  CHECK_GE(num_sequences, 0);
+  for (const torch::Tensor* tensor :
+       {&metadata_template.token_ids_host, &metadata_template.positions_host}) {
+    CHECK(tensor->defined()) << "first-draft host tensor must be defined";
+    CHECK(tensor->device().is_cpu());
+    CHECK_EQ(tensor->scalar_type(), torch::kInt32);
+    CHECK_GE(tensor->numel(), num_sequences);
+  }
+  CHECK_EQ(metadata_template.input_params.embedding.request_ids.size(),
+           static_cast<size_t>(num_sequences));
+  metadata_template.token_ids_host =
+      metadata_template.token_ids_host.clone(torch::MemoryFormat::Contiguous);
+  metadata_template.positions_host =
+      metadata_template.positions_host.clone(torch::MemoryFormat::Contiguous);
+  int32_t* positions = metadata_template.positions_host.data_ptr<int32_t>();
+  int32_t* tokens = metadata_template.token_ids_host.data_ptr<int32_t>();
+  const std::vector<int32_t>& source_kv_lens =
+      metadata_template.input_params.attention.host.kv_seq_lens;
+  std::vector<int32_t> kv_lens;
+  kv_lens.reserve(source_kv_lens.size());
+  std::vector<EmbeddingCache::DecodeState> states(num_sequences);
+  for (int32_t seq = 0; seq < num_sequences; ++seq) {
+    positions[seq] += advance;
+    append_seq_len_by_layout(kv_lens,
+                             calc_kv_len(source_kv_lens, seq, advance));
+    tokens[seq] = std::max(tokens[seq], 0);
+    states[seq].valid = true;
+    states[seq].request_id =
+        metadata_template.input_params.embedding.request_ids[seq];
+    states[seq].token_id = tokens[seq];
+    states[seq].embedding = embedding_placeholder;
+  }
+  metadata_template.input_params.attention.host.kv_seq_lens =
+      std::move(kv_lens);
+  return states;
+}
+
 namespace {
 
 // Builds cumulative seq-lens layout: [0, l0, l0+l1, ...].

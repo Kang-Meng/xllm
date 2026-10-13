@@ -8,6 +8,7 @@
 #include <future>
 #include <limits>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -17,6 +18,7 @@
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "distributed_runtime/engine.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "scheduler_factory.h"
@@ -193,6 +195,10 @@ class TestContinuousScheduler final : public ContinuousScheduler {
   bool in_batch_prefix_cache_enabled() const {
     return enable_in_batch_prefix_cache_;
   }
+
+  int32_t reserved_speculative_tokens() const {
+    return min_speculative_tokens_required_;
+  }
 };
 
 ContinuousScheduler::Options create_scheduler_options(
@@ -218,6 +224,44 @@ ContinuousScheduler::Options create_scheduler_options(
   opt.max_global_ttft_ms_ = max_global_ttft_ms;
   opt.max_global_tpot_ms_ = max_global_tpot_ms;
   return opt;
+}
+
+TEST(ContinuousSchedulerTest, ReservesUniformMtpOverlapUpperBound) {
+  struct TestCase {
+    std::string algorithm;
+    int32_t draft_tokens;
+    bool overlap;
+    int32_t dp_size;
+    int32_t expected_reservation;
+  };
+  const TestCase cases[] = {
+      {"MTP", 3, true, 1, 7},
+      {"MTP", 3, true, 2, 7},
+      {"mtp", 1, true, 1, 3},
+      {"MTP", 7, true, 1, 15},
+      {"MTP", 3, false, 1, 3},
+      {"MTP", 0, true, 1, 0},
+      {"Eagle3", 3, true, 1, 6},
+  };
+  for (const TestCase& test_case : cases) {
+    SCOPED_TRACE(test_case.algorithm);
+    SCOPED_TRACE(test_case.draft_tokens);
+    SCOPED_TRACE(test_case.dp_size);
+    ScopedConfigValue<std::string> algorithm(
+        SpeculativeConfig::get_instance().speculative_algorithm(),
+        test_case.algorithm);
+    FakeEngine engine(/*num_blocks=*/64, /*block_size=*/128);
+    ContinuousScheduler::Options options =
+        create_scheduler_options(/*max_tokens_per_batch=*/64,
+                                 /*max_seqs_per_batch=*/4,
+                                 test_case.draft_tokens,
+                                 /*max_tokens_per_chunk_for_prefill=*/16,
+                                 test_case.dp_size);
+    options.enable_schedule_overlap(test_case.overlap);
+    TestContinuousScheduler scheduler(&engine, options);
+    EXPECT_EQ(scheduler.reserved_speculative_tokens(),
+              test_case.expected_reservation);
+  }
 }
 
 TEST(ContinuousSchedulerBatchModeTest, DcpControlsMixedBatches) {

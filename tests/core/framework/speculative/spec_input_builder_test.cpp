@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <numeric>
 #include <vector>
 
 #include "framework/model/model_input_params.h"
@@ -87,6 +88,155 @@ ForwardInput make_multiblock_forward_input(
   input.input_params.multi_block_tables = multi_block_tables;
   input.input_params.attention.host.kv_seq_lens = kv_seq_lens;
   return input;
+}
+
+TEST(SpecInputBuilderTest,
+     AdvancesFirstDraftHostTemplateWithoutChangingSource) {
+  constexpr int32_t kNumDraftTokens = 3;
+  constexpr int32_t kPageSize = 128;
+  constexpr int32_t kBoundary = 16 * kPageSize;
+  // KV lengths advance across/to the boundary. Positions remain KV length - 1.
+  constexpr int32_t kCrossingSourceKv = kBoundary - kNumDraftTokens;
+  constexpr int32_t kExactSourceKv = kBoundary - kNumDraftTokens - 1;
+  ForwardInput input;
+  input.input_params.meta.num_sequences = 2;
+  input.input_params.embedding.request_ids = {"boundary", "negative"};
+  input.token_ids_host = torch::tensor({-1, 19}, torch::kInt);
+  input.positions_host =
+      torch::tensor({kCrossingSourceKv - 1, kExactSourceKv - 1}, torch::kInt);
+  input.input_params.attention.host.kv_seq_lens =
+      to_layout_seq_lens({kCrossingSourceKv, kExactSourceKv});
+  const torch::Tensor placeholder = torch::zeros({2}, torch::kFloat32);
+
+  ForwardInput metadata_template = input;
+  const std::vector<EmbeddingCache::DecodeState> template_states =
+      advance_first_draft_template(
+          metadata_template, placeholder, kNumDraftTokens);
+
+  ASSERT_EQ(template_states.size(), 2u);
+  EXPECT_NE(metadata_template.token_ids_host.data_ptr<int32_t>(),
+            input.token_ids_host.data_ptr<int32_t>());
+  EXPECT_NE(metadata_template.positions_host.data_ptr<int32_t>(),
+            input.positions_host.data_ptr<int32_t>());
+  EXPECT_EQ(metadata_template.token_ids_host[0].item<int32_t>(), 0);
+  EXPECT_EQ(metadata_template.positions_host[0].item<int32_t>(), kBoundary);
+  EXPECT_EQ(
+      calc_kv_len(
+          metadata_template.input_params.attention.host.kv_seq_lens, 0, 0),
+      kBoundary + 1);
+  EXPECT_EQ(metadata_template.positions_host[1].item<int32_t>(), kBoundary - 1);
+  EXPECT_EQ(
+      calc_kv_len(
+          metadata_template.input_params.attention.host.kv_seq_lens, 1, 0),
+      kBoundary);
+  for (int32_t seq = 0; seq < 2; ++seq) {
+    EXPECT_EQ(
+        metadata_template.positions_host[seq].item<int32_t>() + 1,
+        calc_kv_len(
+            metadata_template.input_params.attention.host.kv_seq_lens, seq, 0));
+  }
+  std::vector<int32_t> pages(17);
+  std::iota(pages.begin(), pages.end(), 0);
+  const int32_t cache_position =
+      calc_kv_len(
+          metadata_template.input_params.attention.host.kv_seq_lens, 0, 0) -
+      1;
+  EXPECT_EQ(calc_slot_id(cache_position, to_slice(pages), kPageSize),
+            kBoundary);
+  pages.resize(16);
+  EXPECT_DEATH(static_cast<void>(
+                   calc_slot_id(cache_position, to_slice(pages), kPageSize)),
+               "block table index out of range");
+
+  EXPECT_EQ(input.token_ids_host[0].item<int32_t>(), -1);
+  EXPECT_EQ(input.positions_host[0].item<int32_t>(), kCrossingSourceKv - 1);
+  EXPECT_EQ(input.positions_host[1].item<int32_t>(), kExactSourceKv - 1);
+  EXPECT_EQ(calc_kv_len(input.input_params.attention.host.kv_seq_lens, 0, 0),
+            kCrossingSourceKv);
+  EXPECT_TRUE(template_states[0].valid);
+  EXPECT_EQ(template_states[0].request_id, "boundary");
+  EXPECT_EQ(template_states[0].token_id, 0);
+  EXPECT_TRUE(torch::equal(template_states[0].embedding, placeholder));
+  EXPECT_TRUE(template_states[1].valid);
+  EXPECT_EQ(template_states[1].request_id, "negative");
+  EXPECT_EQ(template_states[1].token_id, 19);
+}
+
+TEST(SpecInputBuilderTest, FirstDraftMultiAxisAnchorsFeedTailDecodeRows) {
+  constexpr int32_t kNumDraftTokens = 3;
+  constexpr int32_t kPageSize = 128;
+  struct TestCase {
+    std::vector<int32_t> source_kv_lens;
+    std::vector<int32_t> expected_kv_lens;
+    std::vector<int32_t> expected_slots;
+  };
+  // Decode rotary axes share an anchor. KV lengths may be independent of it.
+  const TestCase cases[] = {
+      {{2045, 2201}, {2048, 2049, 2204, 2205}, {2047, 2048, 6299, 6300}},
+      {{2000, 2100}, {2003, 2004, 2103, 2104}, {2002, 2003, 6198, 6199}},
+  };
+  for (const TestCase& test_case : cases) {
+    SCOPED_TRACE(test_case.source_kv_lens.front());
+    ForwardInput input;
+    input.input_params.meta.num_sequences = 2;
+    input.input_params.embedding.request_ids = {"first", "second"};
+    input.token_ids_host = torch::tensor({-1, 12}, torch::kInt32);
+    input.positions_host =
+        torch::tensor({2044, 2200}, torch::kInt32).repeat({3, 1});
+    input.input_params.attention.host.kv_seq_lens =
+        to_layout_seq_lens(test_case.source_kv_lens);
+    // Row 0 uses physical pages 0..31; row 1 uses 32..63 (slot offset 4096).
+    std::vector<int32_t> pages(64);
+    std::iota(pages.begin(), pages.end(), 0);
+    input.input_params.attention.host.block_tables =
+        torch::tensor(pages, torch::kInt32).reshape({2, 32});
+
+    ForwardInput metadata_template = input;
+    const auto states = advance_first_draft_template(
+        metadata_template, torch::Tensor(), kNumDraftTokens);
+    ASSERT_EQ(states.size(), 2u);
+    EXPECT_EQ(tensor_to_vec_int32(metadata_template.positions_host),
+              (std::vector<int32_t>{2048, 2204, 2044, 2200, 2044, 2200}));
+    const auto ctx = make_decode_row_context(metadata_template);
+    ASSERT_EQ(ctx.position_axes, 3);
+    DecodeBuildBuffers rows;
+    // Match tail-extend's repair/current rows. It rebuilds 1D positions from
+    // the advanced anchors, rather than consuming the remaining rotary axes.
+    for (int32_t seq = 0; seq < 2; ++seq) {
+      for (const int32_t offset : {-1, 0}) {
+        RowSpec row;
+        row.seq_id = seq;
+        row.token_id = states[seq].token_id;
+        row.position_offset = offset;
+        row.append_kv_len = true;
+        row.append_block_table = true;
+        append_decode_row(ctx, row, kPageSize, rows);
+      }
+    }
+    EXPECT_EQ(rows.out_positions,
+              (std::vector<int32_t>{2047, 2048, 2203, 2204}));
+    for (int32_t row = 0; row < 4; ++row) {
+      EXPECT_EQ(calc_kv_len(rows.out_kv_seq_lens, row, 0),
+                test_case.expected_kv_lens[row]);
+    }
+    EXPECT_EQ(rows.out_new_cache_slots, test_case.expected_slots);
+    EXPECT_EQ(tensor_to_vec_int32(input.positions_host),
+              (std::vector<int32_t>{2044, 2200, 2044, 2200, 2044, 2200}));
+    EXPECT_EQ(tensor_to_vec_int32(input.token_ids_host),
+              (std::vector<int32_t>{-1, 12}));
+    EXPECT_EQ(input.input_params.attention.host.kv_seq_lens,
+              to_layout_seq_lens(test_case.source_kv_lens));
+  }
+}
+
+TEST(SpecInputBuilderTest, RejectsUndefinedFirstDraftHostInputs) {
+  ForwardInput input;
+  EXPECT_DEATH(static_cast<void>(
+                   advance_first_draft_template(input, torch::Tensor(), 0)),
+               "num_speculative_tokens > 0");
+  EXPECT_DEATH(static_cast<void>(
+                   advance_first_draft_template(input, torch::Tensor(), 3)),
+               "first-draft host tensor must be defined");
 }
 
 TEST(SpecDecodeInputBuilderTest,

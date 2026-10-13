@@ -1655,44 +1655,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   } else if (use_device_target_context) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
 
-    // Clone host tensors before mutating the shallow-copied template.
-    metadata_template.token_ids_host =
-        clone_host_tensor(metadata_template.token_ids_host);
-    metadata_template.positions_host =
-        clone_host_tensor(metadata_template.positions_host);
-
     // Build fixed-shape host metadata immediately while target verification is
     // still running. Use the maximum accepted draft offset for conservative
     // graph planning; actual values replace every device tensor below.
-    int32_t* template_positions =
-        metadata_template.positions_host.data_ptr<int32_t>();
-    int32_t* template_tokens =
-        metadata_template.token_ids_host.data_ptr<int32_t>();
-    auto& template_kv_lens =
-        metadata_template.input_params.attention.host.kv_seq_lens;
-    for (int32_t seq_id = 0;
-         seq_id < metadata_template.input_params.meta.num_sequences;
-         ++seq_id) {
-      template_positions[seq_id] += num_speculative_tokens;
-      template_kv_lens[seq_id] += num_speculative_tokens;
-      if (template_tokens[seq_id] < 0) {
-        template_tokens[seq_id] = 0;
-      }
-    }
-
-    std::vector<EmbeddingCache::DecodeState> template_states(
-        metadata_template.input_params.meta.num_sequences);
-    const torch::Tensor& placeholder =
-        embedding_cache_->embedding_placeholder();
-    for (int32_t seq_id = 0;
-         seq_id < metadata_template.input_params.meta.num_sequences;
-         ++seq_id) {
-      template_states[seq_id].valid = true;
-      template_states[seq_id].request_id =
-          metadata_template.input_params.embedding.request_ids[seq_id];
-      template_states[seq_id].token_id = template_tokens[seq_id];
-      template_states[seq_id].embedding = placeholder;
-    }
+    std::vector<EmbeddingCache::DecodeState> template_states =
+        specBuilder::advance_first_draft_template(
+            metadata_template,
+            embedding_cache_->embedding_placeholder(),
+            num_speculative_tokens);
     prepare_draft_extend_inputs(metadata_template,
                                 template_states,
                                 current_draft_input,
@@ -2952,40 +2922,11 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
   CHECK(embedding_cache_ != nullptr);
 
   ForwardInput metadata_template = input;
-  // Clone host tensors before mutating the shallow-copied template.
-  metadata_template.token_ids_host =
-      clone_host_tensor(metadata_template.token_ids_host);
-  metadata_template.positions_host =
-      clone_host_tensor(metadata_template.positions_host);
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  int32_t* template_positions =
-      metadata_template.positions_host.data_ptr<int32_t>();
-  int32_t* template_tokens =
-      metadata_template.token_ids_host.data_ptr<int32_t>();
-  auto& template_kv_lens =
-      metadata_template.input_params.attention.host.kv_seq_lens;
-  for (int32_t seq_id = 0;
-       seq_id < metadata_template.input_params.meta.num_sequences;
-       ++seq_id) {
-    template_positions[seq_id] += num_speculative_tokens;
-    template_kv_lens[seq_id] += num_speculative_tokens;
-    if (template_tokens[seq_id] < 0) {
-      template_tokens[seq_id] = 0;
-    }
-  }
-
-  std::vector<EmbeddingCache::DecodeState> template_states(
-      metadata_template.input_params.meta.num_sequences);
-  const torch::Tensor& placeholder = embedding_cache_->embedding_placeholder();
-  for (int32_t seq_id = 0;
-       seq_id < metadata_template.input_params.meta.num_sequences;
-       ++seq_id) {
-    template_states[seq_id].valid = true;
-    template_states[seq_id].request_id =
-        metadata_template.input_params.embedding.request_ids[seq_id];
-    template_states[seq_id].token_id = template_tokens[seq_id];
-    template_states[seq_id].embedding = placeholder;
-  }
+  std::vector<EmbeddingCache::DecodeState> template_states =
+      specBuilder::advance_first_draft_template(
+          metadata_template,
+          embedding_cache_->embedding_placeholder(),
+          options_.num_speculative_tokens());
 
   prepare_draft_extend_inputs(metadata_template,
                               template_states,

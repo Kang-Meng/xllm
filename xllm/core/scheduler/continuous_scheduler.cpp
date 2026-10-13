@@ -191,7 +191,19 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
 
   if (options_.enable_schedule_overlap()) {
-    min_speculative_tokens_required_ = options_.num_speculative_tokens() * 2;
+    // MTP overlap reserves N tokens for the unresolved Host update and N+1
+    // for the next first draft, including the verifier bonus. Use this
+    // conservative bound independently of model/backend execution admission.
+    if (options_.num_speculative_tokens() > 0 &&
+        SpeculativeConfig::is_mtp_algorithm(
+            SpeculativeConfig::get_instance().speculative_algorithm())) {
+      CHECK_LE(options_.num_speculative_tokens(),
+               (std::numeric_limits<int32_t>::max() - 1) / 2);
+      min_speculative_tokens_required_ =
+          options_.num_speculative_tokens() * 2 + 1;
+    } else {
+      min_speculative_tokens_required_ = options_.num_speculative_tokens() * 2;
+    }
     // In overlap mode the worker may first correct the scheduler's fake
     // position by N tokens. DFlash2 prelaunch can then accept N+1 and issue
     // another N+1-row proposal, requiring 3*N+1 extra slots beyond the host
