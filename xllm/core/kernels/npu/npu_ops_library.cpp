@@ -1042,6 +1042,12 @@ TORCH_LIBRARY(xllm_ops, m) {
       "sfa_dcp_remap_out(Tensor topk_indices, int physical_block_size, int "
       "shard_size, int shard_rank, Tensor(a!) out, Tensor(b!) idx_scratch) -> "
       "Tensor(a!)");
+  // Engram host-offload int8 lookup: a pure host CPU kernel whose four
+  // operands are all contiguous CPU tensors (see the CPU TORCH_LIBRARY_IMPL
+  // block below for why it is keyed on CPU and not PrivateUse1).
+  m.def(
+      "engram_int8_lookup_cpu(Tensor weight, Tensor scale, Tensor ids, "
+      "Tensor(a!) output) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -1131,4 +1137,16 @@ TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
          TORCH_FN(xllm::kernel::npu::sparse_attn_sharedkv_metadata));
   m.impl("quant_lightning_indexer_metadata",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_metadata));
+}
+
+// The engram int8 lookup is a pure host CPU kernel: all four operands are
+// contiguous CPU tensors and it runs only on the pre-graph host staging pass,
+// never inside an ACL graph. It is registered on the CPU device key rather than
+// CompositeExplicitAutograd so the dispatcher reports a clear error for a
+// non-CPU tensor up front; the kernel's own TORCH_CHECK(device().is_cpu() &&
+// is_contiguous()) at entry would reject such a tensor anyway before any
+// pointer is dereferenced.
+TORCH_LIBRARY_IMPL(xllm_ops, CPU, m) {
+  m.impl("engram_int8_lookup_cpu",
+         TORCH_FN(xllm::kernel::npu::engram_int8_lookup_cpu));
 }

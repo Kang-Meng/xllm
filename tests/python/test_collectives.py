@@ -390,6 +390,166 @@ def test_cp_memberships_reject_invalid_cohorts(stride: int) -> None:
         collectives._group_memberships("cp", 2, 8, stride)
 
 
+# ``_engram_dp_memberships`` slices each (strided) DP membership into consecutive
+# ``shard_size`` blocks, so a sharing group is always a whole node-local block
+# that maps one TP shard. These pin the exact partition, the invariants it must
+# keep, and the invalid shard sizes it must reject -- the function itself is only
+# otherwise exercised indirectly through ``init_engram_dp_group``.
+@pytest.mark.parametrize(
+    "dp_size, shard_size, world, expected",
+    [
+        # world=8, dp=4 -> DP memberships [[0, 2, 4, 6], [1, 3, 5, 7]]; shards of 2.
+        (4, 2, 8, [[0, 2], [4, 6], [1, 3], [5, 7]]),
+        # shard_size == dp_size -> each DP membership is one sharing group.
+        (4, 4, 8, [[0, 2, 4, 6], [1, 3, 5, 7]]),
+        # world=8, dp=8 -> one DP membership [0..7]; shards of 4.
+        (8, 4, 8, [[0, 1, 2, 3], [4, 5, 6, 7]]),
+        # world=8, dp=2 -> DP memberships [[0, 4], [1, 5], [2, 6], [3, 7]].
+        (2, 2, 8, [[0, 4], [1, 5], [2, 6], [3, 7]]),
+        # world=16, dp=4 -> count=4, then shards of 2 across each cohort.
+        (4, 2, 16, [[0, 4], [8, 12], [1, 5], [9, 13], [2, 6], [10, 14], [3, 7], [11, 15]]),
+    ],
+)
+def test_engram_dp_memberships_partition_dp_cohorts(
+    dp_size: int, shard_size: int, world: int, expected: list[list[int]]
+) -> None:
+    assert collectives._engram_dp_memberships(dp_size, shard_size, world) == expected
+
+
+@pytest.mark.parametrize(
+    "dp_size, shard_size, world",
+    [
+        (4, 2, 8),
+        (8, 4, 8),
+        (2, 1, 8),
+        (4, 4, 16),
+        (8, 2, 16),
+        (6, 3, 12),
+    ],
+)
+def test_engram_dp_memberships_are_increasing_shards_of_one_dp_cohort(
+    dp_size: int, shard_size: int, world: int
+) -> None:
+    """Every group is a full, increasing, node-local shard of exactly one DP cohort."""
+    memberships = collectives._engram_dp_memberships(dp_size, shard_size, world)
+    dp_cohorts = collectives._group_memberships("dp", dp_size, world)
+
+    # The groups partition all global ranks exactly once, each a full shard.
+    assert len(memberships) * shard_size == world
+    assert sorted(rank for group in memberships for rank in group) == list(range(world))
+    assert all(len(group) == shard_size for group in memberships)
+    # Increasing (new_group requires a sorted rank list) ...
+    assert all(group == sorted(group) for group in memberships)
+    # ... and each group lies inside exactly one DP membership (node-local + one
+    # TP shard); it never straddles two cohorts.
+    for group in memberships:
+        assert sum(set(group) <= set(cohort) for cohort in dp_cohorts) == 1
+
+
+@pytest.mark.parametrize("dp_size, shard_size, world", [(4, 3, 8), (4, 0, 8), (4, -1, 8), (6, 4, 12)])
+def test_engram_dp_memberships_reject_bad_shard_size(dp_size: int, shard_size: int, world: int) -> None:
+    with pytest.raises(ValueError, match="must divide DP size"):
+        collectives._engram_dp_memberships(dp_size, shard_size, world)
+
+
+@pytest.mark.parametrize("dp_size, world", [(3, 8), (5, 12)])
+def test_engram_dp_memberships_reject_dp_that_does_not_tile_the_world(dp_size: int, world: int) -> None:
+    with pytest.raises(ValueError, match="does not divide the world size"):
+        collectives._engram_dp_memberships(dp_size, 1, world)
+
+
+@pytest.mark.parametrize(
+    "world_size, dp_size, replica_size, expected_shard_size",
+    [
+        (8, 4, 2, 2),
+        (16, 8, 2, 4),
+        (8, 8, 1, 4),
+        (16, 4, 4, 2),
+    ],
+)
+def test_engram_dp_memberships_agree_with_the_topology_shard_size(
+    world_size: int, dp_size: int, replica_size: int, expected_shard_size: int
+) -> None:
+    """The shard size the topology gate returns must yield node-local groups.
+
+    ``init_engram_dp_group`` feeds ``get_engram_dp_shard_size``'s result straight
+    into ``_engram_dp_memberships`` and then re-checks that no group spans hosts,
+    so the two must line up: for a topology the gate accepted, every group the
+    shard size produces is on a single host. Ties the otherwise-separately-tested
+    size function to the membership slicer it drives, and pins the exact shard
+    size instead of accepting the 1 (no sharing) fallback as a pass.
+    """
+    hosts = ["node-0"] * (world_size // 2) + ["node-1"] * (world_size // 2)
+    topology = [{"hostname": host} for host in hosts]
+    shard_size = collectives.get_engram_dp_shard_size(world_size, dp_size, replica_size, topology)
+    assert shard_size == expected_shard_size
+
+    memberships = collectives._engram_dp_memberships(dp_size, shard_size, world_size)
+    for group in memberships:
+        assert len({topology[rank]["hostname"] for rank in group}) == 1
+
+
+def _engram_topology(hosts: str | None) -> list[dict[str, object]] | None:
+    """Per-global-rank topology, one hostname character per rank (``None`` passes through)."""
+    if hosts is None:
+        return None
+    return [{"hostname": host} for host in hosts]
+
+
+# ``get_engram_dp_shard_size`` is a pure function with many "decline to share"
+# fallbacks (return 1). These pin every one of them plus the accepted layouts so
+# a regression cannot silently turn a real shard size into 1 -- or worse, 1 into
+# a bogus sharing group -- on the host that matters.
+@pytest.mark.parametrize(
+    "world_size, dp_size, replica_size, hosts, expected",
+    [
+        # No topology at all: nothing to prove node locality with.
+        (16, 4, 4, None, 1),
+        # Non-positive world / DP / replica sizes cannot describe a split.
+        (0, 4, 4, "", 1),
+        (16, 0, 4, "a" * 16, 1),
+        (16, -4, 4, "a" * 16, 1),
+        (16, 4, 0, "a" * 16, 1),
+        (16, 4, -2, "a" * 16, 1),
+        # Topology shorter than the world it is supposed to describe.
+        (16, 4, 4, "a" * 8, 1),
+        # 6 ranks over 2 nodes of 2 replicas x 2: does not tile whole-node blocks.
+        (6, 3, 2, "aaabbb", 1),
+        # gcd(dp, replicas_per_node) == 1 -> no sharing is possible.
+        (8, 4, 2, "aabbccdd", 1),
+        # One node: every DP rank already shares host memory.
+        (16, 4, 4, "a" * 16, 4),
+        # Two nodes of 8: shard size is gcd(4, 2) == 2.
+        (16, 4, 4, "a" * 8 + "b" * 8, 2),
+        # Non-power-of-two: world 12 over 2 nodes of 6, gcd(6, 3) == 3.
+        (12, 6, 2, "a" * 6 + "b" * 6, 3),
+        # Interleaved hosts: each node's ranks are not a contiguous block.
+        (8, 4, 2, "abababab", 1),
+        # Uneven node sizes: the second node is short, so ranks do not tile.
+        (8, 4, 2, "aaaaaabb", 1),
+    ],
+)
+def test_get_engram_dp_shard_size_accepts_and_declines(
+    world_size: int, dp_size: int, replica_size: int, hosts: str | None, expected: int
+) -> None:
+    topology = _engram_topology(hosts)
+    assert collectives.get_engram_dp_shard_size(world_size, dp_size, replica_size, topology) == expected
+
+
+@pytest.mark.parametrize("hostname", [None, "", 7, 1.5, ["a"]])
+def test_get_engram_dp_shard_size_rejects_nonstring_hostname(hostname: object) -> None:
+    """A bad hostname must not be trusted to prove node locality."""
+    topology: list[dict[str, object]] = [{"hostname": "a"} for _ in range(8)]
+    topology[3] = {"hostname": hostname}
+    assert collectives.get_engram_dp_shard_size(8, 4, 2, topology) == 1
+
+
+def test_get_engram_dp_shard_size_rejects_missing_hostname() -> None:
+    topology: list[dict[str, object]] = [{"hostname": "a"} for _ in range(8)]
+    topology[3] = {}  # no "hostname" key at all
+    assert collectives.get_engram_dp_shard_size(8, 4, 2, topology) == 1
+
+
 def test_cp_group_initialization_uses_tp_stride(monkeypatch: pytest.MonkeyPatch) -> None:
     _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=3)
     group = collectives.init_process_group("cp", "127.0.0.1", 46001, 1, 2, "cuda:0", 3, 4, 1, 1)

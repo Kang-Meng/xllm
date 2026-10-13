@@ -14,8 +14,10 @@
 
 """Tests for the NPU ACL decode-graph runner."""
 
+import logging
 import os
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +30,7 @@ from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadat
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
 )
+from xllm.python.models.engram_config import EngramConfig
 
 
 def _runner() -> DecodeAclGraphRunner:
@@ -1569,3 +1572,437 @@ def test_xfia_graph_accepts_device_only_lengths() -> None:
     )
     runner._fill_host_metadata(entry, None, batch_size=4)
     assert entry.static_metadata.kv_seq_lens_host_values == [1] * 4
+
+
+# ---------------------------------------------------------------------------
+# Engram graph-visible staging capacity hint
+# ---------------------------------------------------------------------------
+
+
+def test_acl_runner_pre_sizes_engram_graph_staging_capacity() -> None:
+    """The runner tells the model its largest decode bucket before capture.
+
+    Capture is lazy and buckets warm up ascending, so without this hint the
+    engram graph-visible block would be fixed at the first (smallest) bucket.
+    """
+    from xllm.python.model_executor.runners.decode_cuda_graph import _decode_bucket
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hints: list[int] = []
+
+        def configure_engram_graph_capacity(self, max_tokens: int) -> bool:
+            self.hints.append(int(max_tokens))
+            return True
+
+    model = _Model()
+    DecodeAclGraphRunner(
+        model,
+        SimpleNamespace(page_size=4, is_mla=False),
+        torch.device("cpu"),
+        max_batch=64,
+        max_model_len=8,
+        num_decoding_tokens=2,
+    )
+    # 64 sequences x 2 token rows, folded through the decode bucket.
+    assert model.hints == [_decode_bucket(64 * 2)]
+    assert model.hints == [128]
+
+    # ``decode_batch_size_limit`` clamps the captured buckets, so the hint too.
+    limited = _Model()
+    DecodeAclGraphRunner(
+        limited,
+        SimpleNamespace(page_size=4, is_mla=False),
+        torch.device("cpu"),
+        max_batch=64,
+        max_model_len=8,
+        decode_batch_size_limit=32,
+        num_decoding_tokens=1,
+    )
+    assert limited.hints == [_decode_bucket(32)]
+
+    # A spec-draft runner emits up to ``draft_query_width`` query rows per
+    # sequence, which can exceed ``num_decoding_tokens``; the graph-visible
+    # engram block must cover that wider bucket, not the narrower MTP one.
+    draft = _Model()
+    DecodeAclGraphRunner(
+        draft,
+        SimpleNamespace(page_size=4, is_mla=False),
+        torch.device("cpu"),
+        max_batch=64,
+        max_model_len=8,
+        num_decoding_tokens=1,
+        is_spec_draft=True,
+        draft_query_width=8,
+    )
+    assert draft.hints == [_decode_bucket(64 * 8)]
+
+    # A model without the hook is untouched.
+    DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=4, is_mla=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+    )
+
+
+def test_acl_runner_warns_once_when_engram_staging_returns_false() -> None:
+    """A False staging result on an offload-active model: capture warns, replay raises.
+
+    The pre-graph staging hook's return value gates whether a replay re-reads
+    the engram staging block. On a capture (``capturing=True``) this helper
+    returns False and latches a single per-runner warning as a companion
+    diagnostic; the runner's ``_engram_first_capture_gate`` then refuses the
+    capture before it is cached (see the gate tests below), so no Engram-less
+    graph is stored. On a replay (``capturing=False``) the graph was already
+    captured *with* engram, so continuing would serve the previous step's stale
+    rows as a silent wrong output (the eager path skips engram in the same
+    condition); that is a fail-fast ``RuntimeError``.
+
+    Discriminating: removing the capture warning makes ``len(warnings) == 1``
+    fail; removing the replay raise makes ``pytest.raises`` fail; dropping the
+    ``engram_offload_active`` gate makes the non-offload model warn/raise. The
+    warning is asserted through the shared ``xllm`` logger (``scripts.logger``),
+    not a per-module logger. That logger sets ``propagate = False``, so a
+    root-attached ``caplog`` handler cannot see its records. Rather than flip the
+    global ``propagate`` (which would leak into other tests, including ones
+    running concurrently), the test attaches its own scoped handler straight to
+    the ``xllm`` logger and removes it in ``finally``.
+    """
+
+    class _Model(nn.Module):
+        def __init__(self, *, staged: bool, offload_active: bool) -> None:
+            super().__init__()
+            self._staged = staged
+            self.engram_offload_active = offload_active
+            self.layers: list = []
+            self.calls = 0
+
+        def stage_engram_rows_outside_graph(self, *args: object) -> bool:
+            self.calls += 1
+            return self._staged
+
+    def make_runner(model: nn.Module) -> DecodeAclGraphRunner:
+        return DecodeAclGraphRunner(
+            model,
+            SimpleNamespace(page_size=4, is_mla=False),
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=8,
+        )
+
+    # Scoped handler on the shared ``xllm`` logger: collect WARNINGs without
+    # touching the logger's global ``propagate`` (see the docstring).
+    xllm_logger = logging.getLogger("xllm")
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    xllm_logger.addHandler(handler)
+    try:
+        # Capture: a not-staged offload model warns exactly once and never
+        # raises, even though a capture walks several buckets (the latch holds).
+        failing = make_runner(_Model(staged=False, offload_active=True))
+        assert failing._stage_engram_rows_outside_graph(None, None, None, capturing=True) is False
+        assert failing._stage_engram_rows_outside_graph(None, None, None, capturing=True) is False
+        assert failing._engram_stage_skip_warned is True
+        warnings = [record for record in captured if "staged nothing" in record.getMessage()]
+        assert len(warnings) == 1, "a capture-stage failure must warn exactly once"
+        assert "capturing=True" in warnings[0].getMessage()
+
+        # Replay: the same condition is a hard error, not a stale-row replay, and
+        # it must not also latch the capture warning.
+        captured.clear()
+        replay = make_runner(_Model(staged=False, offload_active=True))
+        with pytest.raises(RuntimeError, match="previous step's rows"):
+            replay._stage_engram_rows_outside_graph(None, None, None, capturing=False)
+        assert not [record for record in captured if "staged nothing" in record.getMessage()]
+
+        # Legitimate no-ops: a successful stage and a non-offload model stay
+        # silent (neither warning nor raise) on both capture and replay.
+        captured.clear()
+        for model in (_Model(staged=True, offload_active=True), _Model(staged=False, offload_active=False)):
+            runner = make_runner(model)
+            assert runner._stage_engram_rows_outside_graph(None, None, None, capturing=True) == model._staged
+            assert runner._stage_engram_rows_outside_graph(None, None, None, capturing=False) == model._staged
+        assert not [record for record in captured if "staged nothing" in record.getMessage()]
+    finally:
+        xllm_logger.removeHandler(handler)
+
+
+def _engram_gate_runner(*, offload_active: bool) -> DecodeAclGraphRunner:
+    """A CPU ACL runner whose model toggles ``engram_offload_active``."""
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.engram_offload_active = offload_active
+
+    return DecodeAclGraphRunner(
+        _Model(),
+        SimpleNamespace(page_size=4, is_mla=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+    )
+
+
+def test_acl_runner_engram_first_capture_gate_refuses_when_not_staged() -> None:
+    """A first-capture staging failure must fail fast before anything is cached.
+
+    The gate runs before ``_capture`` and before the entry is registered, so a
+    ``False`` stage on an offload-active model must raise and leave ``_graphs``
+    untouched (there is no entry to drop). Discriminating: deleting the raise
+    lets the Engram-less graph be captured and cached.
+    """
+
+    runner = _engram_gate_runner(offload_active=True)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        runner._engram_first_capture_gate(staged=False)
+
+    assert runner._graphs == {}, "the gate refuses before anything is cached"
+    message = str(excinfo.value)
+    assert "first ACL graph capture" in message
+    assert "Engram-less" in message
+    assert "engram_config.cpu_offload=false" in message
+    # The hint must name the copy-pasteable CLI form, and that exact JSON must
+    # parse with both switches off (the HBM path the message points at).
+    example = '{"cpu_offload":false,"dp_shared_memory":false}'
+    assert f"--engram-config '{example}'" in message
+    assert EngramConfig.from_value(example) == EngramConfig(cpu_offload=False, dp_shared_memory=False)
+
+
+def test_acl_runner_engram_first_capture_gate_passes_when_staged() -> None:
+    """A first capture that staged engram is allowed through unchanged.
+
+    ``staged=True`` short-circuits the gate, so a healthy capture proceeds and
+    the gate is a pure pass-through (no raise, no cache mutation).
+    """
+
+    runner = _engram_gate_runner(offload_active=True)
+    runner._engram_first_capture_gate(staged=True)
+    assert runner._graphs == {}
+
+
+def test_acl_runner_engram_first_capture_gate_passes_when_offload_inactive() -> None:
+    """A non-offload model's ``False`` hook must not trip the gate.
+
+    Non-engram / non-offload models legitimately return ``False`` from the
+    staging hook (it is a no-op), so gating only on ``staged`` would raise for
+    them; the ``engram_offload_active`` guard keeps them silent.
+    """
+
+    runner = _engram_gate_runner(offload_active=False)
+    runner._engram_first_capture_gate(staged=False)
+    assert runner._graphs == {}
+
+
+class _StoppedAfterCaptureError(Exception):
+    """Sentinel raised at the replay boundary, after a successful capture."""
+
+
+class _StopAtReplayStream:
+    """``self._stream`` stand-in that stops ``execute`` at the replay.
+
+    ``execute`` only reaches ``self._stream.wait_stream(...)`` after the first
+    capture has completed and been registered, so raising from ``wait_stream``
+    keeps the test device-free while still exercising the capture-then-register
+    ordering.
+    """
+
+    def wait_stream(self, *args: object, **kwargs: object) -> None:
+        raise _StoppedAfterCaptureError
+
+
+def _engram_execute_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    staged: bool,
+    capture_error: Exception | None = None,
+) -> tuple[DecodeAclGraphRunner, Any, list[Any], Any]:
+    """Wire a runner for the real ``DecodeAclGraphRunner.execute`` path.
+
+    Only ``_allocate_entry`` / ``_fill_entry`` / ``_capture`` and the backend
+    ``prepare`` are stubbed; ``execute`` itself -- the gate call, the capture
+    call and the registration that follows it -- runs for real. ``_stream``
+    raises :class:`_StoppedAfterCaptureError` from ``wait_stream`` so a
+    successful capture stops right after registration, before the replay block
+    (no device needed); when ``capture_error`` is set the stubbed ``_capture``
+    raises it instead. ``torch.npu`` is stubbed to the single entry point used
+    on that path so the test does not require an NPU.
+    """
+
+    class _EngramModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.engram_offload_active = True
+            self.layers: list = []
+            self.staged = staged
+            self.stage_calls = 0
+
+        def stage_engram_rows_outside_graph(self, *args: object) -> bool:
+            self.stage_calls += 1
+            return self.staged
+
+    class _KeyRecordingDict(dict):
+        def __init__(self) -> None:
+            super().__init__()
+            self.keys_written: list[Any] = []
+
+        def __setitem__(self, key: Any, value: Any) -> None:
+            self.keys_written.append(key)
+            super().__setitem__(key, value)
+
+    model = _EngramModel()
+    backend = SimpleNamespace(page_size=4, is_mla=False, prepare=lambda *args, **kwargs: None)
+    runner = DecodeAclGraphRunner(model, backend, torch.device("cpu"), max_batch=8, max_model_len=8)
+    runner._stream = _StopAtReplayStream()
+    graphs = _KeyRecordingDict()
+    runner._graphs = graphs
+
+    def fake_allocate_entry(padded_batch_size, input_ids, positions, metadata, input_batch=None, verify_width=1):
+        return SimpleNamespace(
+            static_metadata=SimpleNamespace(),
+            static_input_ids=input_ids,
+            static_positions=positions,
+            execution_state=object(),
+            execution_contexts={},
+            eplb=None,
+            graph=None,
+        )
+
+    capture_calls: list[Any] = []
+
+    def fake_capture(entry):
+        capture_calls.append(entry)
+        if capture_error is not None:
+            raise capture_error
+
+    monkeypatch.setattr(runner, "_allocate_entry", fake_allocate_entry)
+    monkeypatch.setattr(runner, "_fill_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_capture", fake_capture)
+    # The only ``torch.npu`` call reached on this path is the replay-boundary
+    # ``current_stream`` lookup, right before ``_stream.wait_stream`` raises.
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(current_stream=lambda: None), raising=False)
+    return runner, model, capture_calls, graphs
+
+
+def _engram_execute_inputs() -> tuple[torch.Tensor, torch.Tensor, Any]:
+    input_ids = torch.arange(4, dtype=torch.int64)
+    positions = torch.arange(4, dtype=torch.int64)
+    metadata = SimpleNamespace(linear_state_indices=torch.arange(4, dtype=torch.int32))
+    return input_ids, positions, metadata
+
+
+def test_acl_runner_execute_refuses_first_capture_when_engram_staging_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execute() wiring: the gate refuses the first capture before it is cached.
+
+    Drives the real ``execute`` path with a ``False`` stage. Deleting the
+    ``_engram_first_capture_gate`` call turns this red: ``_capture`` would run
+    and the replay-boundary sentinel would surface instead of the expected
+    ``RuntimeError``. The entry must never be written to ``_graphs``.
+    """
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=False)
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        runner.execute(input_ids, positions, metadata)
+
+    assert "first ACL graph capture" in str(excinfo.value)
+    assert model.stage_calls == 1
+    assert capture_calls == [], "_capture must not run when the gate refuses"
+    assert graphs.keys_written == [], "a refused capture must not register anything"
+    assert runner._graphs == {}
+
+
+def test_acl_runner_execute_registers_only_after_successful_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execute() registers the entry only once ``_capture`` has succeeded.
+
+    With staging recovered the first step captures, then registers the entry, so
+    the graph is available for replay. Registering *before* ``_capture`` would
+    cache a half-built entry whenever the capture fails.
+    """
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=True)
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(_StoppedAfterCaptureError):
+        runner.execute(input_ids, positions, metadata)
+
+    assert len(capture_calls) == 1
+    assert len(graphs.keys_written) == 1
+    graph_key = graphs.keys_written[0]
+    assert runner._graphs.get(graph_key) is capture_calls[0]
+    assert len(runner._graphs) == 1
+
+
+def test_acl_runner_execute_leaves_no_entry_when_capture_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``_capture`` failure must not leave a ``graph is None`` entry cached.
+
+    Staging succeeds but ``_capture`` raises; because the entry is registered
+    only after ``_capture`` returns, nothing is cached and the next step can
+    re-capture. Registering before the capture would cache the partial entry
+    (``entry.graph is None``) and the next step's replay branch would dereference
+    ``entry.graph`` -> ``AttributeError``.
+    """
+
+    class _CaptureFailedError(Exception):
+        """Sentinel raised by the stubbed ``_capture``."""
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(
+        monkeypatch,
+        staged=True,
+        capture_error=_CaptureFailedError(),
+    )
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(_CaptureFailedError):
+        runner.execute(input_ids, positions, metadata)
+
+    assert len(capture_calls) == 1
+    assert graphs.keys_written == [], "a failed capture must not register anything"
+    assert runner._graphs == {}
+
+
+def test_acl_runner_execute_recaptures_after_engram_staging_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execute() recovery: once staging succeeds the bucket is re-captured.
+
+    The failing first step must register nothing, so the next step takes the
+    first-capture path again (a fresh staging attempt) and captures the
+    Engram-baked graph. Registering before the capture would leave the refused
+    entry cached, so the second step would take the replay branch and never
+    re-capture.
+    """
+
+    runner, model, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=False)
+    input_ids, positions, metadata = _engram_execute_inputs()
+
+    with pytest.raises(RuntimeError):
+        runner.execute(input_ids, positions, metadata)
+    assert capture_calls == []
+    assert graphs.keys_written == []
+
+    model.staged = True
+    with pytest.raises(_StoppedAfterCaptureError):
+        runner.execute(input_ids, positions, metadata)
+
+    assert len(capture_calls) == 1
+    graph_key = graphs.keys_written[0]
+    assert graph_key in runner._graphs
+    assert len(runner._graphs) == 1
+    assert graphs.keys_written == [graph_key]

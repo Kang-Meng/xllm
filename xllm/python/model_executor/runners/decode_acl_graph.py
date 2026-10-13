@@ -38,6 +38,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from scripts.logger import logger
 from xllm.python import kernels
 from xllm.python.attention.backend import (
     AttentionBackend,
@@ -314,6 +315,47 @@ class DecodeAclGraphRunner(BaseRunner):
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
+        # One-shot latch for the "host-offload staging staged nothing" warning
+        # (see ``_warn_engram_stage_incomplete``): a replay runs once per step,
+        # so an unlatched warning would flood the log for a persistent failure.
+        self._engram_stage_skip_warned = False
+        # Pre-size the host-offloaded engram graph-visible staging block for the
+        # largest decode token bucket this runner can capture. Capture is lazy
+        # and buckets warm up in ascending order, so without this floor the
+        # block would be fixed at the first (smallest) bucket and a later,
+        # larger bucket would overflow it (see EngramEmbedding._ensure_graph_staging).
+        configure_engram = getattr(self.model, "configure_engram_graph_capacity", None)
+        if configure_engram is not None:
+            configure_engram(self._engram_graph_token_capacity())
+
+    def _engram_graph_token_capacity(self) -> int:
+        """Floor, in token rows, for the graph-visible engram staging block.
+
+        ``max_batch`` counts sequences (segments), not token rows: the captured
+        graph packs ``num_decoding_tokens`` token rows per sequence at the
+        verify slots (1 for plain decode) -- the same per-sequence width
+        ``_shared_graph_plan`` folds into ``verify_width``. A spec-draft runner
+        additionally emits up to ``draft_query_width`` query rows per sequence;
+        that is a different quantity from the verify rows and may be
+        larger, so fold the wider of the two, keeping the block from being sized
+        below what a wider draft replay touches. ``decode_batch_size_limit``,
+        when set, keeps larger buckets on the eager path and off this floor.
+
+        This value pre-sizes the graph-visible engram staging block, whose
+        address is baked into the captured ACL graph and never grows afterwards
+        (``EngramEmbedding._ensure_graph_staging`` raises rather than moving it),
+        so it must be a lower bound (floor) covering the worst-case replay:
+        sizing it too small overflows the block on a wider replay, while sizing
+        it large only wastes HBM. ``_decode_bucket`` then aligns this floor to
+        the graph key's padded token-row bucket.
+        """
+        seq_capacity = self.max_batch
+        if self.decode_batch_size_limit > 0:
+            seq_capacity = min(seq_capacity, self.decode_batch_size_limit)
+        rows_per_seq = self.num_decoding_tokens
+        if self._is_spec_draft:
+            rows_per_seq = max(rows_per_seq, self._draft_query_width)
+        return _decode_bucket(seq_capacity * rows_per_seq)
 
     def _eplv2_graph_admits(self, token_rows: int) -> bool:
         """Keep MC2 capture inside the HCCL window; All-to-AllV stays eager."""
@@ -1313,7 +1355,6 @@ class DecodeAclGraphRunner(BaseRunner):
                 getattr(self.attention_backend, "graph_token_capacity_granularity", 0) or 0
             )
             entry.eplb = self._allocate_graph_eplb_state(eplb, padded_batch_size)
-            self._graphs[graph_key] = entry
         entry_eplb = getattr(entry, "eplb", None)
         if not first_capture and (entry_eplb is None) != (eplb is None):
             raise RuntimeError("EPLB state changed after ACL graph capture")
@@ -1370,8 +1411,32 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 if refresh_dsa is not None:
                     refresh_dsa(entry.static_metadata)
+            # Host-offloaded engram tables: the graph only reads the staged
+            # rows, so the gather must run here -- once per step, outside the
+            # captured region (replay does not re-run Python). No-op models
+            # without the hook and non-offload configurations skip it: the hook
+            # existence is checked here so entry.static_input_ids / positions
+            # are not dereferenced at all for models without the hook (the
+            # helper's own early return happens after its arguments are
+            # evaluated, so it cannot protect this call site). The hook's return
+            # value is checked on an offload-active model: a False on a capture
+            # is refused by _engram_first_capture_gate before the graph is
+            # captured or cached (fail-fast, symmetric with the replay raise
+            # below), while a False on a replay is fail-fast -- the helper
+            # raises instead of letting the replay re-read the previous step's
+            # stale rows. Refusing (rather than caching an Engram-less graph)
+            # leaves the bucket re-capturable once staging recovers.
+            staged = False
+            if getattr(self.model, "stage_engram_rows_outside_graph", None) is not None:
+                staged = self._stage_engram_rows_outside_graph(
+                    entry.static_metadata,
+                    entry.static_input_ids,
+                    entry.static_positions,
+                    capturing=first_capture,
+                )
 
         if first_capture:
+            self._engram_first_capture_gate(staged=staged)
             self._capture(entry)
             if capture_metadata is not None:
                 # Capture may still read the persistent indices. Order real
@@ -1392,6 +1457,15 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 with forward_context(prepare_context):
                     self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
+            # Register the entry only once the capture has actually succeeded.
+            # Registering before ``_capture`` would leave a half-built entry
+            # (``entry.graph is None``) cached under ``graph_key`` whenever the
+            # staging gate or ``_capture`` itself raises, and the next step for
+            # this bucket would take the replay branch and dereference
+            # ``entry.graph`` -> ``AttributeError``. Nothing between the
+            # ``_graphs.get`` lookup above and here reads the dict, so deferring
+            # the write is safe.
+            self._graphs[graph_key] = entry
 
         # Besides ordering input updates, this wait protects the output view
         # returned by the previous replay.  The graph cannot overwrite its
@@ -1409,6 +1483,127 @@ class DecodeAclGraphRunner(BaseRunner):
 
         torch.npu.current_stream().wait_stream(self._stream)
         return output
+
+    def _stage_engram_rows_outside_graph(
+        self,
+        static_metadata: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        capturing: bool,
+    ) -> bool:
+        """Run the model's pre-graph host-offload staging pass, once per step.
+
+        Returns the hook's result. ``False`` means nothing was staged this step
+        (e.g. the SWA cache is unbound, or the model is not offloading at all).
+        When the model *is* offloading, a ``False`` result is a correctness
+        hazard: the captured graph reads the persistent staging block, so the
+        replay re-reads whatever rows the previous step left behind. On a
+        replay (``capturing=False``) that is a hard error -- the graph is
+        already captured with engram, so continuing would serve the previous
+        step's stale rows as a silent wrong output (the eager path skips engram
+        in the same condition), hence the fail-fast below. On a capture
+        (``capturing=True``) this helper still returns ``False`` (it only runs
+        the staging plus the replay-side check); the caller refuses the capture
+        via ``_engram_first_capture_gate`` before the graph is captured or
+        cached, so no Engram-less graph is ever stored. Models without the hook,
+        and non-offload configurations, are unaffected.
+        """
+        stage_engram = getattr(self.model, "stage_engram_rows_outside_graph", None)
+        if stage_engram is None:
+            return False
+        staged = bool(stage_engram(self.attention_backend, static_metadata, input_ids, positions))
+        if not staged:
+            if not capturing and bool(getattr(self.model, "engram_offload_active", False)):
+                # Replay of an engram-baked graph with nothing staged this step:
+                # the captured graph would re-read the previous step's rows.
+                raise RuntimeError(
+                    "engram host-offload staging returned False on a replay/reused graph; "
+                    "the captured graph would re-read the previous step's rows"
+                )
+            self._warn_engram_stage_incomplete(capturing=capturing)
+        return staged
+
+    def _warn_engram_stage_incomplete(self, *, capturing: bool) -> None:
+        """Latch one warning when the staging pass staged nothing while offloading.
+
+        Gated on ``engram_offload_active`` so non-offload and engram-off models
+        (whose hook is a legitimate no-op returning ``False``) stay silent. The
+        warning is latched per runner instance: a replay runs once per step and
+        would otherwise flood the log, and the underlying condition (the model
+        keeps offloading but cannot stage) is not per-step diagnosable. It is a
+        companion diagnostic to the capture fail-fast path: this warning is
+        reachable only on a capture, where ``_engram_first_capture_gate`` then
+        raises before the graph is captured or cached -- on a replay
+        ``_stage_engram_rows_outside_graph`` raises *before* this call, so it is
+        never reached there. It names capture-vs-replay, the engram layer count
+        and the graph-capacity hints so the offending model is identifiable from
+        the log alone.
+        """
+        offload_active = bool(getattr(self.model, "engram_offload_active", False))
+        if not offload_active or self._engram_stage_skip_warned:
+            return
+        self._engram_stage_skip_warned = True
+        # Duck-typed, not imported: the runner must not depend on
+        # ``xllm.python.models`` (runners -> models is a layering inversion). The
+        # model exposes the accessor as a method; a model without it (e.g. an
+        # eagerly-run test stub) has no engram layers to name, so fall back to the
+        # empty summary rather than importing the model-side helper.
+        warning_fields = getattr(self.model, "engram_offload_warning_fields", None)
+        if warning_fields is not None:
+            engram_layer_count, capacity_hints = warning_fields()
+        else:
+            engram_layer_count, capacity_hints = 0, []
+        logger.warning(
+            "engram host-offload staging staged nothing "
+            "(stage_engram_rows_outside_graph returned False) on an offload-active "
+            "model: the first capture was refused (engram staging returned False); "
+            "see the accompanying error -- the bucket will re-capture once staging "
+            "recovers. offload_active=%s capturing=%s engram_layers=%d "
+            "graph_capacity_hints=%s",
+            offload_active,
+            capturing,
+            engram_layer_count,
+            capacity_hints,
+        )
+
+    def _engram_first_capture_gate(self, *, staged: bool) -> None:
+        """Refuse a first capture that cannot stage while engram is offloading.
+
+        ``execute`` registers the entry in ``self._graphs`` only after a
+        successful ``_capture``, so this gate runs before anything is cached:
+        refusing simply means never registering. If the first capture cannot
+        stage while the model actively offloads engram rows, the graph being
+        captured would read the persistent staging block that a replay never
+        refreshes -- an Engram-less graph latched forever, silently skipping
+        engram on every later step. This gate raises before ``_capture`` runs,
+        so the next step re-runs the first capture for this bucket (with a fresh
+        staging attempt) and a recovered staging pass captures an engram-baked
+        graph.
+
+        Chosen over silently falling back to eager decode: this runner has no
+        eager decode path (the ACL graph *is* the decode kernel), and a
+        fail-fast refusal is symmetric with the replay-side raise in
+        ``_stage_engram_rows_outside_graph`` -- a staging outage surfaces the
+        same way whether it hits the first capture or a later replay. Refusing
+        before the capture (rather than capturing and caching) is what keeps the
+        bucket re-capturable: nothing is written to ``self._graphs`` on this
+        path.
+        """
+        if staged or not bool(getattr(self.model, "engram_offload_active", False)):
+            return
+        raise RuntimeError(
+            "engram host-offload staging returned False on the first ACL graph "
+            "capture: refusing to cache an Engram-less graph (it would replay "
+            "without engram forever). Likely the SWA group metadata was "
+            "unavailable, the engram ensure_cache() failed, or the host staging "
+            "table was not ready. The graph was not captured or cached, so this "
+            "bucket re-captures on a later step once staging recovers; to disable "
+            "engram host-offload and use the HBM path instead, set "
+            "engram_config.cpu_offload=false. This is a startup/restart "
+            "configuration (it is not switchable online): restart the server with "
+            "--engram-config '{\"cpu_offload\":false,\"dp_shared_memory\":false}'."
+        )
 
     def _allocate_graph_eplb_state(
         self,

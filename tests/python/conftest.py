@@ -114,6 +114,21 @@ def _install_python_package_stub() -> None:
     # single-rank identities (mirroring moe_tp_all_reduce above).
     distributed.tp_all_reduce = lambda x: None
     distributed.tp_all_gather = lambda x, dim, world_size: x
+    # Engram host-offload surface used by deepseek_v41 / engram_shared_memory.
+    # The object collectives are no-ops (the pure-Python tests never join a
+    # real gloo group); ``engram_dp_shard_size`` returns 1 (no sharing) and
+    # ``init_engram_dp_group`` raises, matching the real "no world" behaviour so
+    # a dp_shared_memory request fails loudly instead of silently sharing.
+    distributed.engram_broadcast_object_list = lambda object_list, src=0, group_name=None: None
+    distributed.engram_all_gather_object = lambda object_list, obj, group_name=None: None
+    distributed.engram_barrier = lambda group_name=None, timeout=None: None
+    distributed.world_topology = lambda: None
+    distributed.engram_dp_shard_size = lambda dp_size, replica_size: 1
+
+    def _init_engram_dp_group(_device: str, _dp_size: int, _shard_size: int):
+        raise RuntimeError("engram DP-shared host table requires an initialized process-group world")
+
+    distributed.init_engram_dp_group = _init_engram_dp_group
 
     sys.modules["xllm.python"] = package
     sys.modules["xllm.python.kernels"] = kernels

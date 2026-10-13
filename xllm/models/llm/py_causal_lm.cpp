@@ -369,6 +369,27 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
 
 PyCausalLM::~PyCausalLM() {
   clear_python_object(python_kv_caches_);
+  // Deterministic release of a DP-shared Engram host table before the Python
+  // model is dropped. The Python side owns the shared segments and exposes
+  // ``close_host_offload``; it runs no collective, so it is safe here.
+  // Best-effort only: a failure (or an interpreter already finalizing) must not
+  // abort teardown -- the mappings die with the process regardless.
+  if (py_model_ && Py_IsInitialized() && !python_is_finalizing()) {
+    py::gil_scoped_acquire gil;
+    try {
+      if (py::hasattr(py_model_, "close_host_offload")) {
+        py_model_.attr("close_host_offload")();
+      }
+    } catch (const py::error_already_set& e) {
+      LOG(WARNING) << "PyCausalLM close_host_offload failed: " << e.what();
+    } catch (...) {
+      // A destructor must not propagate: anything the Python call threw beyond
+      // error_already_set (e.g. std::bad_alloc) would otherwise run into
+      // std::terminate. Best-effort only -- never rethrow.
+      LOG(WARNING)
+          << "PyCausalLM close_host_offload failed with a non-Python exception";
+    }
+  }
   clear_python_object(py_model_);
   clear_python_object(config_dict_);
 #if defined(USE_NPU)
@@ -430,6 +451,18 @@ py::dict PyCausalLM::build_config_dict(
       requires_eager_execution
           ? std::string("off")
           : ExecutionConfig::get_instance().python_graph_backend();
+  // Engram host-offload switches, forwarded as the raw JSON string; the Python
+  // executor parses/validates it (xllm/python/models/engram_config.py).
+  d["engram_config"] = ModelConfig::get_instance().engram_config();
+  // Env-driven Python config fields the embedded executor reads. Pipeline
+  // parallelism is not wired through for the Python model yet, so it is pinned
+  // to 1 explicitly (engram requires PP=1). xllm loads .safetensors weights, so
+  // the load format is fixed to "safetensors". DCP is the live KV-split size:
+  // forwarding the effective value lets the Python engram gate reject DCP>1
+  // instead of always seeing a hardcoded 1 (kv_split_size_ defaults to 1).
+  d["pp_size"] = 1;
+  d["dcp_size"] = kv_split_size_;
+  d["load_format"] = std::string("safetensors");
 #if defined(USE_NPU)
   d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
   const auto& eplb_config = EPLBConfig::get_instance();

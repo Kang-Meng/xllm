@@ -36,6 +36,10 @@ namespace {
 
 constexpr const char* kBridgeTestModelType = "py_causal_lm_bridge_test";
 constexpr const char* kBridgeTestModule = "xllm_py_causal_lm_bridge_test";
+// Model type whose name makes PyCausalLM take the deepseek_v4/v41 path. That
+// path skips the TP/CP/DCP process-group init, so the config dict can be
+// inspected with a live DCP (KV-split) size and no rendezvous.
+constexpr const char* kDcpBridgeTestModelType = "deepseek_v41";
 
 void register_bridge_test_model() {
   py::module_ module_type = py::module_::import("types");
@@ -181,6 +185,70 @@ TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {
   EXPECT_EQ(
       bridged_swa.attr("data_ptr")().cast<std::uintptr_t>(),
       reinterpret_cast<std::uintptr_t>(cache_tensors.swa_cache.data_ptr()));
+}
+
+TEST(PyCausalLMDcpBridgeTest, ForwardsEffectiveDcpSizeIntoConfigDict) {
+  py::gil_scoped_acquire gil;
+  register_bridge_test_model();
+  // Only the deepseek_v4/41 model names make PyCausalLM skip the TP/CP/DCP
+  // process-group init, so the config dict is reachable here without a
+  // rendezvous. Those names are builtin registry keys and the registry has no
+  // public unregister, so snapshot the existing entry and restore it once the
+  // model is built: the test class must not leak into later registry lookups.
+  py::module_ registry = py::module_::import("xllm.python.registry");
+  py::object registry_table = registry.attr("_REGISTRY");
+  py::object saved_registration =
+      registry_table.attr("get")(kDcpBridgeTestModelType);
+  ASSERT_FALSE(saved_registration.is_none());
+  py::object bridge_cls =
+      registry.attr("get_model_class")(kBridgeTestModelType);
+  registry.attr("register_model")(kDcpBridgeTestModelType)(bridge_cls);
+
+  try {
+    ProcessGroup process_group(/*rank=*/0,
+                               /*world_size=*/2,
+                               torch::Device(torch::kCPU));
+    ParallelArgs parallel_args(/*rank=*/0,
+                               /*world_size=*/2,
+                               &process_group);
+    parallel_args.tp_group_ = &process_group;
+    parallel_args.moe_tp_group_ = &process_group;
+    parallel_args.python_rendezvous_host_ = "127.0.0.1";
+    parallel_args.python_rendezvous_port_ = 1;
+    // Effective DCP (KV-split) size of 2: the engram config gate on the Python
+    // side rejects DCP>1, and the C++ bridge must forward this real value
+    // instead of a hardcoded 1 so that gate can actually fire. The world size
+    // must cover the split (ParallelArgs::kv_split_rank asserts kv <=
+    // world/dp).
+    parallel_args.kv_split_size(/*value=*/2);
+
+    ModelArgs model_args;
+    model_args.model_type(kDcpBridgeTestModelType);
+    ModelContext context(
+        parallel_args,
+        model_args,
+        QuantArgs(),
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+        /*context=*/nullptr);
+    PyCausalLM model(context, /*is_vlm=*/false);
+    EXPECT_EQ(model.kv_split_size(), 2);
+
+    // Class resolution is done; put the builtin entry back.
+    registry_table.attr("__setitem__")(kDcpBridgeTestModelType,
+                                       saved_registration);
+
+    py::dict config = model.config_dict();
+    ASSERT_TRUE(config.contains("dcp_size"));
+    EXPECT_EQ(config["dcp_size"].cast<int64_t>(), 2);
+  } catch (...) {
+    // If the constructor (or a later call) throws before the builtin entry is
+    // restored, put the snapshot back so the stub cannot leak into later
+    // registry lookups, then rethrow. Restore the saved snapshot itself, not a
+    // re-registration, to keep the builtin metadata-builder intact.
+    registry_table.attr("__setitem__")(kDcpBridgeTestModelType,
+                                       saved_registration);
+    throw;
+  }
 }
 
 }  // namespace

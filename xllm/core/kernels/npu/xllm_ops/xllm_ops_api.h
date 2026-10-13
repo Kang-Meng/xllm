@@ -508,6 +508,15 @@ void scatter_nd_update(torch::Tensor& var,
                        const torch::Tensor& indices,
                        const torch::Tensor& updates);
 
+// Host CPU int8 lookup for the Engram HBM-offload tables: gathers int8 rows by
+// id and applies the FP32 group-32 scale in place into the BF16 pinned staging
+// buffer consumed by the NPU side. Compiled into the xllm_ops library and
+// registered on the CPU device key (see npu_ops_library.cpp).
+void engram_int8_lookup_cpu(const torch::Tensor& weight,
+                            const torch::Tensor& scale,
+                            const torch::Tensor& ids,
+                            torch::Tensor& output);
+
 void reshape_and_cache_a5(const torch::Tensor& key,
                           const torch::Tensor& value,
                           torch::Tensor& key_cache,

@@ -58,6 +58,8 @@ DECLARE_int32(video_max_token_num);
 
 DECLARE_string(mm_download_headers);
 
+DECLARE_string(engram_config);
+
 // --- kvcache config ---
 DECLARE_int32(block_size);
 DECLARE_int64(max_cache_size);

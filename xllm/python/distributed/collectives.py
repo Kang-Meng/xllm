@@ -23,6 +23,7 @@ place instead of splitting around it.
 from __future__ import annotations
 
 import json
+import math
 import socket
 from collections.abc import Sequence
 from datetime import timedelta
@@ -32,7 +33,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed import ProcessGroup
 
-_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp"))
+_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp", "engram_dp"))
 # ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
 # ``moe_ep``, ``cp`` and ``dcp`` stride across those blocks. Context groups also
 # need the within-DP stride when their world contains multiple DP cohorts.
@@ -48,6 +49,8 @@ _groups = {}
 _group_ranks = {}
 _stores = {}
 _world_topology = None
+_world_rank = None
+_world_endpoint = None
 _symm_eligible = {}
 _symm_buffers = {}
 _world_initialized = False
@@ -106,7 +109,7 @@ def _ensure_world(
     instead of constructing communicators directly registers them with c10d,
     which is what lets a group back a symmetric-memory allocation.
     """
-    global _world_initialized, _world_topology
+    global _world_initialized, _world_topology, _world_rank, _world_endpoint
     if _world_initialized:
         return
     store = _shared_store(host, port, global_rank, global_world_size)
@@ -118,6 +121,8 @@ def _ensure_world(
         timeout=timedelta(minutes=5),
     )
     _world_topology = _exchange_world_topology(store, device, global_rank, global_world_size)
+    _world_rank = global_rank
+    _world_endpoint = (host, port)
     _world_initialized = True
 
 
@@ -220,6 +225,7 @@ def init_process_group(
     group_index: int,
     group_stride: int | None = None,
     group_ranks: Sequence[Sequence[int]] | None = None,
+    backend: str | None = None,
 ) -> ProcessGroup:
     """Create a parallel group from explicit memberships or the legacy layout.
 
@@ -227,6 +233,11 @@ def init_process_group(
     processes, not just the current process's peers. Each sorted inner list
     contains global ranks; ``group_index`` selects our list and ``rank`` our
     position in it. None preserves the default layout for ``group_name``.
+
+    ``backend`` overrides the device-derived backend for this group only
+    (default unchanged). The node-local Engram sharing group passes ``"gloo"``
+    because its object collectives are not available on HCCL; a cached group
+    created with a different backend is rejected rather than silently reused.
     """
     if group_name not in _GROUP_NAMES:
         raise ValueError(f"unsupported parallel group: {group_name}")
@@ -258,15 +269,20 @@ def init_process_group(
             )
         if _group_ranks.get(group_key) != tuple(memberships[group_index]):
             raise RuntimeError(f"{group_name} group for {group_key[1]} is already initialized with different members")
+        if backend is not None and dist.get_backend(group) != backend:
+            raise RuntimeError(
+                f"{group_name} group for {group_key[1]} is already initialized with backend "
+                f"{dist.get_backend(group)}, requested {backend}; refusing to reuse it"
+            )
         return group
 
     _ensure_world(host, port, device_obj, global_rank, global_world_size)
-    backend = _backend_for(device_obj)
+    effective_backend = backend if backend is not None else _backend_for(device_obj)
 
     own = None
     own_ranks = None
     for index, ranks in enumerate(memberships):
-        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
+        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=effective_backend)
         if global_rank in ranks:
             own = candidate
             own_index = index
@@ -427,6 +443,182 @@ def moe_ep_group(device: torch.device | str) -> ProcessGroup:
 
 def dcp_group(device: torch.device | str) -> ProcessGroup | None:
     return _groups.get(("dcp", str(torch.device(device))))
+
+
+def world_topology() -> list[dict[str, object]] | None:
+    """Per-global-rank node topology, or None before the world is initialized."""
+    return _world_topology
+
+
+def get_engram_dp_shard_size(
+    world_size: int,
+    dp_size: int,
+    replica_size: int,
+    topology: Sequence[dict[str, object]] | None,
+) -> int:
+    """Size of the node-local DP sharing shards for a DP-shared Engram table.
+
+    :func:`engram_dp_shard_size` calls this with the live world so it stays
+    testable on its own.
+
+    Mirrors vLLM's ``_engram_dp_shard_size``: the DP ranks of one node are
+    grouped in shards of ``gcd(dp_size, replicas_per_node)`` so every sharing
+    group is node-local and (because a DP group already fixes TP) maps the same
+    TP shard. Falls back to 1 -- no sharing -- when the ranks do not tile into
+    whole-node replica blocks, when a node's ranks are not a contiguous
+    global-rank block, or when the topology is unavailable. A return of 1 is
+    the caller's signal that ``dp_shared_memory`` cannot be honored.
+
+    ``topology`` is the per-global-rank ``{"hostname": ...}`` list from
+    ``world_topology``; the hostname is only a precheck -- the authoritative
+    evidence that the sharing group really shares host memory is a successful
+    ``multiprocessing.shared_memory`` attach with a matching token.
+    """
+    if topology is None or world_size <= 0 or dp_size <= 0 or replica_size <= 0 or len(topology) != world_size:
+        return 1
+    hostnames = [entry.get("hostname") for entry in topology]
+    # A missing/empty hostname cannot prove node locality: ``set()`` would treat
+    # None (or "") as a distinct node, inflating ``node_count`` and making the
+    # contiguous-rank check below compare against a bogus host. Fall back to 1
+    # -- no sharing -- instead of deriving a shard size from a bad topology.
+    if any(not isinstance(host, str) or not host for host in hostnames):
+        return 1
+    node_count = len(set(hostnames))
+    replicas_per_node, remainder = divmod(world_size, node_count * replica_size)
+    if remainder:
+        return 1
+    shard_size = math.gcd(dp_size, replicas_per_node)
+    if shard_size == 1 or node_count == 1:
+        return shard_size
+    ranks_per_node = replicas_per_node * replica_size
+    for start in range(0, world_size, ranks_per_node):
+        node_ranks = [rank for rank, host in enumerate(hostnames) if host == hostnames[start]]
+        if node_ranks != list(range(start, start + ranks_per_node)):
+            return 1
+    return shard_size
+
+
+def _engram_dp_memberships(dp_size: int, shard_size: int, global_world_size: int) -> list[list[int]]:
+    """Every node-local Engram sharing group, in a world-agreed order.
+
+    The DP group already fixes the TP shard, so slicing each DP membership into
+    consecutive ``shard_size`` blocks yields groups that share both the node and
+    the TP shard. The slices are increasing (a DP membership strides upward by
+    global rank), which ``new_group`` requires.
+    """
+    # Explicit guard, not ``assert``: an invariant that must hold in production
+    # cannot be dropped by ``python -O``.
+    if not (shard_size > 0 and dp_size % shard_size == 0):
+        raise ValueError(f"engram DP shard size {shard_size} must divide DP size {dp_size}")
+    memberships: list[list[int]] = []
+    for dp_members in _group_memberships("dp", dp_size, global_world_size):
+        for start in range(0, len(dp_members), shard_size):
+            memberships.append(dp_members[start : start + shard_size])
+    return memberships
+
+
+def engram_dp_shard_size(dp_size: int, replica_size: int) -> int:
+    """Effective node-local Engram sharing shard size (1 when unavailable)."""
+    if not _world_initialized or _world_topology is None:
+        return 1
+    return get_engram_dp_shard_size(len(_world_topology), dp_size, replica_size, _world_topology)
+
+
+def init_engram_dp_group(device: str, dp_size: int, shard_size: int) -> ProcessGroup:
+    """Create the node-local gloo DP sharing group for a DP-shared Engram table.
+
+    Object collectives (broadcast/gather of segment descriptors) have no HCCL
+    equivalent, so the group is created with ``backend="gloo"`` (matching
+    vllm-ascend). ``shard_size`` is the caller's :func:`engram_dp_shard_size`
+    result -- this module does not recompute it (a distributed helper must not
+    depend on the caller's world or carry its ``engram_config`` error text).
+    Returns this rank's group; the generic guard below rejects a degenerate
+    single-rank shard so the caller can surface the required configuration
+    error instead of silently running unshared.
+    """
+    if not _world_initialized or _world_topology is None or _world_rank is None or _world_endpoint is None:
+        raise RuntimeError("engram DP-shared host table requires an initialized process-group world")
+    global_world_size = len(_world_topology)
+    if shard_size <= 1:
+        raise RuntimeError(
+            f"engram DP sharing requires more than one rank per shard; got DP={dp_size}, shard_size={shard_size}"
+        )
+    memberships = _engram_dp_memberships(dp_size, shard_size, global_world_size)
+    # Node-locality precheck only; the authoritative proof is a successful
+    # attach with a matching token (SharedHostEngramStorage).
+    for ranks in memberships:
+        hosts = {_world_topology[rank].get("hostname") for rank in ranks}
+        if len(hosts) != 1:
+            raise RuntimeError(
+                "engram DP sharing group spans multiple nodes: "
+                f"ranks {ranks} on hosts {sorted(str(host) for host in hosts)}"
+            )
+    own_index, own_rank = None, None
+    for index, ranks in enumerate(memberships):
+        if _world_rank in ranks:
+            own_index, own_rank = index, ranks.index(_world_rank)
+            break
+    if own_index is None:
+        raise RuntimeError(f"global rank {_world_rank} is missing from the engram DP memberships")
+    assert own_rank is not None
+    host, port = _world_endpoint
+    return init_process_group(
+        "engram_dp",
+        host,
+        port,
+        own_rank,
+        shard_size,
+        device,
+        _world_rank,
+        global_world_size,
+        own_index,
+        group_ranks=memberships,
+        backend="gloo",
+    )
+
+
+def _require_named_group(group_name: str) -> ProcessGroup:
+    for (name, _device), group in _groups.items():
+        if name == group_name:
+            return group
+    raise RuntimeError(f"{group_name} collective called before its process group was initialized")
+
+
+def engram_broadcast_object_list(object_list: list, src: int = 0, group_name: str = "engram_dp") -> None:
+    """Broadcast picklable objects from group rank ``src`` (default leader)."""
+    group = _require_named_group(group_name)
+    global_src = dist.get_global_rank(group, src)
+    dist.broadcast_object_list(object_list, src=global_src, group=group)
+
+
+def engram_all_gather_object(object_list: list, obj: object, group_name: str = "engram_dp") -> None:
+    """Gather one picklable object per group rank into ``object_list``."""
+    group = _require_named_group(group_name)
+    dist.all_gather_object(object_list, obj, group=group)
+
+
+def engram_barrier(group_name: str = "engram_dp", timeout: timedelta | None = None) -> None:
+    """Block until every rank of the named group reaches this point.
+
+    ``timeout`` is ``None`` by default, which is exactly the old behavior: a
+    plain ``dist.barrier`` that keeps the group's own timeout (the 5-minute
+    value ``new_group`` gave it). Passing a ``timeout`` switches to
+    ``dist.monitored_barrier`` -- the c10d barrier with a per-call deadline --
+    with ``wait_all_ranks=True``. ``wait_all_ranks`` only changes how the
+    monitor (group rank 0) aggregates failures: ``True`` lets it report every
+    failed rank in one raise, ``False`` makes it fail-fast on the first miss.
+    It does **not** change *which* ranks raise. The per-call ``timeout`` is
+    likewise enforced on the monitor (group rank 0) only: a non-zero survivor
+    rank whose peer never reaches the fence still blocks until the group's own
+    timeout (5 minutes) before it raises. It is Gloo-only, which is the backend
+    the engram DP sharing group is created with. The deadline bounds this one
+    rendezvous on the monitor; it does not shorten the group's own timeout.
+    """
+    group = _require_named_group(group_name)
+    if timeout is None:
+        dist.barrier(group=group)
+        return
+    dist.monitored_barrier(group=group, timeout=timeout, wait_all_ranks=True)
 
 
 # A one-shot symmetric-memory reduction is an ordinary kernel on the current
@@ -631,6 +823,13 @@ def gather_dp_execution_tokens(
 __all__ = [
     "init_process_group",
     "init_tp_group",
+    "init_engram_dp_group",
+    "engram_dp_shard_size",
+    "get_engram_dp_shard_size",
+    "world_topology",
+    "engram_broadcast_object_list",
+    "engram_all_gather_object",
+    "engram_barrier",
     "tp_rank",
     "cp_rank",
     "cp_world_size",

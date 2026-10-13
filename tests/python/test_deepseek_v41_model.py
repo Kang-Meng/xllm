@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek-V4.1 Python model: config parsing, CSA2 plan, structure, weight
-loading, forward path, and the V4.1 quant kernels inlined in deepseek_v41
-(pure torch; the quant helpers are device-agnostic).
+"""DeepSeek-V4.1 Python model (``deepseek_v41.py``): config parsing, CSA2 plan,
+structure, weight loading, forward path, the V4.1 quant kernels inlined in
+deepseek_v41 (pure torch; the quant helpers are device-agnostic), and the engram
+model integration (decoder routing, graph staging/replay, reconcile, gate).
+Pure ``EngramEmbedding`` component tests live in ``test_deepseek_v41_engram.py``.
 
 The forward tests drive :class:`DeepseekV41ForCausalLM` through
 :class:`ModelExecutor` with the CSA2 attention backend and synthetic cache /
@@ -24,11 +26,14 @@ those tests are marked ``npu_only`` and skip elsewhere.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
+from tests.python._engram_reference import _reference_engram_lookup
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa2_attention import (
     Csa2AttentionBackend,
@@ -47,6 +52,11 @@ from xllm.python.attention.dsa_metadata import (
     build_cache_specs_v41,
 )
 from xllm.python.model_executor.executor import ModelExecutor
+from xllm.python.model_executor.forward_context import (
+    AclGraphExecutionState,
+    ForwardContext,
+    forward_context,
+)
 from xllm.python.models import deepseek_v41 as dq
 from xllm.python.models.deepseek_v41 import (
     CSA2_MODE_FULL,
@@ -56,8 +66,10 @@ from xllm.python.models.deepseek_v41 import (
     V41_QUANT_ASCEND,
     V41_QUANT_FP8,
     V41_QUANT_NONE,
+    CSA2LayerMode,
     CSA2LayerPlan,
     DeepseekV41Config,
+    DeepseekV41DecoderLayer,
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
     DeepseekV41MoE,
@@ -69,13 +81,8 @@ from xllm.python.models.deepseek_v41_engram import (
     ENGRAM_STORAGE_INT8,
     Engram,
     EngramEmbedding,
-    EngramHashState,
     EngramLayout,
-    _load_engram_hash_state_sidecar,
-    build_compressed_token_map_from_texts,
-    build_engram_hash_state,
     load_quarot_gate_unrotate,
-    normalize_token_text,
 )
 from xllm.python.registry import get_model_class
 
@@ -1569,7 +1576,7 @@ def test_indexer_scoring() -> None:
     # Pool-outside rows hold finite positions inside the visible range (the
     # Reindex pool mask), so a pool smaller than index_topk must drop its
     # -inf-scored picks onto the -1 sentinel instead of letting the
-    # visibility check pass them (MR 439 review note 3455352).
+    # visibility check pass them.
     score_pool = torch.tensor([[3.0, float("-inf"), 1.0, 2.0, float("-inf")]])
     idxs_pool = _indexer_topk(score_pool, torch.tensor([5]), index_topk=4, offset=7)
     assert idxs_pool.tolist() == [[7, -1, 9, 10]]
@@ -1654,7 +1661,7 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     picks = topk5[0, 0]
     assert (picks[picks >= 0] - (cfg.window_size + 1)).tolist() == [1, 3, 4, 6]
 
-    # Regression (MR 439 review note 3455352): a candidate pool smaller than
+    # Regression: a candidate pool smaller than
     # index_topk must not leak pool-outside rows into the picks. The pool
     # holds fewer rows than index_topk while every non-pool row still sits
     # inside the visible range, so the visibility filter alone cannot exclude
@@ -1884,46 +1891,176 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Engram (gated n-gram lookup, reference engram.py semantics)
+# Engram host offload (engram_config.cpu_offload)
 # ---------------------------------------------------------------------------
 
 
-def test_engram_layout_prime_buckets() -> None:
-    layout = EngramLayout(
-        layer_ids=[1, 14],
-        num_embeddings=[384006168, 384016682],
-        max_ngram_size=3,
-        n_heads=2,
-        head_dim=32,
-        vocab_size=64,
-        compressed_vocab_size=16,
-        pad_token_id=0,
+@pytest.fixture
+def _engram_offload_lookup_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the CPU lookup op available to the offload cases when it is absent.
+
+    The offload dequant path (:meth:`EngramEmbedding._local_block_offload`)
+    always calls the in-repo ``xllm_ops.engram_int8_lookup_cpu`` op and fails
+    loudly when it is missing (no eager fallback). A standalone pytest process
+    never links the xLLM binary, so every offload case here would otherwise
+    raise. This fixture substitutes the bitwise-equivalent eager reference
+    (:func:`_reference_engram_lookup`) for the duration of each case and
+    restores the real resolver afterwards via ``monkeypatch``.
+
+    Scope and safety (explicit, not ``autouse``): requesting this fixture by
+    name keeps its patch confined to the offload cases that opt in, so it can
+    never fire for an unrelated case in this module or any other -- the concern
+    about an import-time side effect. The patch is also
+    scoped to the offload cases only, and only when the real op is missing:
+
+    * It lives in this file, not ``conftest.py``; the fail-loud contract case
+      ``test_deepseek_v41_engram.py::test_engram_lookup_op_missing_is_loud`` --
+      a different module -- still sees the unpatched resolver and asserts the
+      ``RuntimeError``. No op-missing assertion lives in this module.
+    * When the real op *is* registered (a full xLLM build) the probe succeeds
+      and the fixture is a **no-op**, so those runs keep exercising the real
+      kernel instead of the reference.
+    """
+    import xllm.python.models.deepseek_v41_engram as engram
+
+    try:
+        engram._get_engram_lookup_op()
+    except RuntimeError:
+        monkeypatch.setattr(engram, "_get_engram_lookup_op", lambda: _reference_engram_lookup)
+
+
+def _int8_engram_payload(head_sizes: list[int], dim: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    num_rows = sum(head_sizes)
+    g = torch.Generator().manual_seed(seed)
+    payload = torch.randint(-127, 128, (num_rows, dim), dtype=torch.int8, generator=g)
+    scales = torch.rand(num_rows, dim // 32, generator=g).float() * 0.05 + 0.01
+    return payload, scales
+
+
+def _make_int8_embedding(
+    head_sizes: list[int],
+    dim: int,
+    payload: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    offload: bool = False,
+) -> EngramEmbedding:
+    emb = EngramEmbedding(
+        sum(head_sizes),
+        dim,
+        head_sizes,
+        tp_size,
+        tp_rank,
+        storage=ENGRAM_STORAGE_INT8,
+        device=torch.device("cpu"),
+        offload=offload,
     )
-    # Primes are drawn from 63 upward, never reused across layers/heads.
-    assert layout.primes[0][0] == (67, 71)
-    assert layout.primes[0][1] == (73, 79)
-    # Layer 14 continues the shared search: 83, 89, 97, 101.
-    assert layout.primes[1][0] == (83, 89)
-    assert layout.primes[1][1] == (97, 101)
-    assert layout.n_hash_cols == 4
-    # Offsets are exclusive prefix sums of the flattened head sizes.
-    assert torch.equal(layout.offsets, torch.tensor([[0, 67, 138, 211], [0, 83, 172, 269]]))
+    with torch.no_grad():
+        emb.weight.copy_(payload[emb.vocab_start : emb.vocab_end])
+        emb.weight_scale.copy_(scales[emb.vocab_start : emb.vocab_end])
+    return emb
 
 
-def test_engram_token_map_normalization_chain() -> None:
-    # Case / accent / whitespace folding collapses onto one compressed id.
-    lookup, size = build_compressed_token_map_from_texts(["The", "the", "THE", " thé ", "x", "y"])
-    assert size == 3
-    assert lookup[0] == lookup[1] == lookup[2] == lookup[3]
-    assert lookup[4] != lookup[5]
-    assert normalize_token_text("  A\tB\nC ") == "a b c"
-    # A lone space survives Strip via the private-use sentinel.
-    assert normalize_token_text(" ") == " "
+def _engram_ids(head_sizes: list[int], num_tokens: int, seed: int) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.zeros(num_tokens, len(head_sizes), dtype=torch.int64)
+    for j, size in enumerate(head_sizes):
+        ids[:, j] = torch.randint(0, size, (num_tokens,), generator=g) + sum(head_sizes[:j])
+    return ids
 
 
-def _tiny_engram_hash_state() -> EngramHashState:
-    from xllm.python.models.deepseek_v41_engram import compute_hash_multipliers
+# ---------------------------------------------------------------------------
+# Engram graph-visible staging stability: the graph block address must not move
+# ---------------------------------------------------------------------------
 
+
+def test_engram_graph_staging_address_stable_across_eager_growth(_engram_offload_lookup_op) -> None:
+    """The graph-visible block never moves, even when the eager path grows."""
+    head_sizes = [7, 11]
+    payload, scales = _int8_engram_payload(head_sizes, 32, 11)
+    off = _make_int8_embedding(head_sizes, 32, payload, scales, offload=True)
+
+    ids = _engram_ids(head_sizes, 4, 1)
+    graph_rows = off.local_block(ids, graph_visible=True).clone()
+    graph_ptr = off._graph_staged_device.data_ptr()
+    graph_capacity = off._graph_capacity
+
+    # A much larger eager pass allocates/moves its own block...
+    eager_rows = off.local_block(_engram_ids(head_sizes, 300, 2), graph_visible=False)
+    assert eager_rows.shape[0] == 300
+    assert off._eager_capacity >= 300
+    # ...and leaves the graph-visible block (address and capacity) untouched.
+    assert off._graph_staged_device.data_ptr() == graph_ptr
+    assert off._graph_capacity == graph_capacity
+
+    again = off.local_block(ids, graph_visible=True)
+    assert again.data_ptr() == graph_ptr
+    assert torch.equal(again, graph_rows)
+    # Both staging blocks dequantize bitwise identically.
+    assert torch.equal(off.local_block(ids, graph_visible=False), graph_rows)
+
+
+def test_engram_graph_staging_reserves_the_capacity_hint(_engram_offload_lookup_op) -> None:
+    """A runner-supplied bucket hint pre-sizes the block for every later bucket.
+
+    Regression: capture is lazy and buckets warm up ascending, so
+    without the hint the block would be fixed at the first (smallest) bucket and
+    a larger decode bucket would raise. With the hint the first allocation
+    already covers the largest bucket.
+    """
+    head_sizes = [7, 11]
+    payload, scales = _int8_engram_payload(head_sizes, 32, 12)
+    off = _make_int8_embedding(head_sizes, 32, payload, scales, offload=True)
+
+    off.set_graph_capacity_hint(512)
+    small = off.local_block(_engram_ids(head_sizes, 4, 1), graph_visible=True)
+    ptr = off._graph_staged_device.data_ptr()
+    assert off._graph_capacity == 512  # the hint, not the 256 floor / 4 rows
+
+    # The later, larger bucket stages into the same pre-sized block.
+    larger = off.local_block(_engram_ids(head_sizes, 300, 2), graph_visible=True)
+    assert larger.shape[0] == 300
+    assert off._graph_staged_device.data_ptr() == ptr
+    assert off._graph_capacity == 512
+    assert not torch.equal(larger, small)  # not a stale prefix read
+
+
+def test_engram_graph_staging_fails_loud_beyond_captured_capacity(_engram_offload_lookup_op) -> None:
+    """Beyond even the hint the block still raises instead of moving the address."""
+    head_sizes = [7, 11]
+    payload, scales = _int8_engram_payload(head_sizes, 32, 12)
+    off = _make_int8_embedding(head_sizes, 32, payload, scales, offload=True)
+
+    off.set_graph_capacity_hint(512)
+    _ = off.local_block(_engram_ids(head_sizes, 4, 1), graph_visible=True)
+    ptr = off._graph_staged_device.data_ptr()
+    capacity = off._graph_capacity
+    assert capacity == 512
+
+    with pytest.raises(RuntimeError, match="graph-visible staging capacity exceeded"):
+        off.local_block(_engram_ids(head_sizes, 600, 2), graph_visible=True)
+    # The refusal must not have moved or freed the captured address.
+    assert off._graph_staged_device.data_ptr() == ptr
+    assert off._graph_capacity == capacity
+    # The eager path is unaffected by the refusal.
+    assert off.local_block(_engram_ids(head_sizes, 600, 3), graph_visible=False).shape[0] == 600
+
+
+def test_engram_graph_staging_matches_device_path(_engram_offload_lookup_op) -> None:
+    """Rows staged into the graph-visible block equal the device-path rows."""
+    head_sizes = [7, 11, 13, 5, 3]
+    dim = 32
+    payload, scales = _int8_engram_payload(head_sizes, dim, 13)
+    ref = _make_int8_embedding(head_sizes, dim, payload, scales)
+    off = _make_int8_embedding(head_sizes, dim, payload, scales, offload=True)
+    ids = _engram_ids(head_sizes, 9, 14)
+    assert torch.equal(off.local_block(ids, graph_visible=True), ref.local_block(ids))
+
+
+def test_engram_graph_replay_survives_eager_prefill(_engram_offload_lookup_op) -> None:
+    """A large eager prefill must not disturb what a graph replay reads."""
     layout = EngramLayout(
         layer_ids=[1],
         num_embeddings=[290],
@@ -1934,255 +2071,1002 @@ def _tiny_engram_hash_state() -> EngramHashState:
         compressed_vocab_size=16,
         pad_token_id=0,
     )
-    multipliers = compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, 16)
-    return EngramHashState(layout, torch.tensor(_engram_test_token_map(), dtype=torch.int64), multipliers)
+    dim, hc_mult = 48, 2
+    off = _make_int8_engram(layout, dim, hc_mult, offload=True)
+
+    replay_ids = torch.zeros(4, layout.n_hash_cols, dtype=torch.int64)
+    off.prepare_embeddings(replay_ids, graph_visible=True)
+    graph_ptr = off.embed_tokens._graph_staged_device.data_ptr()
+    replay_rows = off.embed(None).clone()
+
+    # A 300-row eager prefill uses the eager block and leaves the graph one alone.
+    big = torch.zeros(300, layout.n_hash_cols, dtype=torch.int64)
+    off.prepare_embeddings(big, graph_visible=False)
+    assert off.embed_tokens._graph_staged_device.data_ptr() == graph_ptr
+
+    # The runner re-stages before every replay; the replay reads the same rows.
+    off.prepare_embeddings(replay_ids, graph_visible=True)
+    assert torch.equal(off.embed(None), replay_rows)
 
 
-def test_engram_hash_rolling_xor_and_dead_tokens() -> None:
-    state = _tiny_engram_hash_state()
-    pad_id = state.pad_id
-    # Two sequences of 3 tokens; sequence 0's token at position 1 is dead.
-    ids = torch.tensor([5, 6, 7, 10, 11, 12])
-    positions = torch.tensor([0, 1, 2, 0, 1, 2])
-    q_cu = torch.tensor([0, 3, 6])
-    dead = torch.tensor([False, True, False, False, False, False])
-    hashes = state(ids, positions, q_cu, dead, None, None, None, 0)
-    assert hashes.shape == (6, 1, 4)
-
-    comp = torch.tensor(_engram_test_token_map(), dtype=torch.int64)
-    m = state.multipliers[0]
-    # Column layout: shift 1 -> cols 0/1 (primes 67/71), shift 2 -> cols 2/3
-    # (primes 73/79). `blocked` is sticky: once a lookback is out of range or
-    # dead, every further shift pools pad_id into the rolling hash.
-    r_pos0_2gram = (comp[5] * m[0]) ^ (pad_id * m[1])
-    r_pos0_3gram = r_pos0_2gram ^ (pad_id * m[2])
-    assert torch.equal(hashes[0, 0, 0], (r_pos0_2gram % 67).to(torch.int32))
-    assert torch.equal(hashes[0, 0, 2], ((r_pos0_3gram % 73) + 138).to(torch.int32))
-    # Position 2: the dead token at position 1 blocks shifts 1 AND 2 (sticky),
-    # even though position 0 itself is a healthy chunk member.
-    r_pos2_2gram = (comp[7] * m[0]) ^ (pad_id * m[1])
-    r_pos2_3gram = r_pos2_2gram ^ (pad_id * m[2])
-    assert torch.equal(hashes[2, 0, 0], (r_pos2_2gram % 67).to(torch.int32))
-    assert torch.equal(hashes[2, 0, 2], ((r_pos2_3gram % 73) + 138).to(torch.int32))
-    # Sequence 1 (no dead tokens): the 2-gram at position 1 pools position 0.
-    r = (comp[11] * m[0]) ^ (comp[10] * m[1])
-    assert torch.equal(hashes[4, 0, 0], (r % 67).to(torch.int32))
-
-
-def test_engram_hash_slot_cache_roundtrip() -> None:
-    """Generated tokens read their lookback back from the slot cache."""
-    state = _tiny_engram_hash_state()
-    state._cache = torch.zeros(64, dtype=torch.int32)
-    # Step 1: a 2-token chunk parks its compressed ids at slots 0/1.
-    ids1 = torch.tensor([3, 9])
-    bt = torch.tensor([[0, 0]], dtype=torch.int32)
-    slot1 = torch.tensor([0, 1], dtype=torch.int32)
-    q_cu = torch.tensor([0, 2])
-    state(
-        ids1,
-        torch.tensor([0, 1]),
-        q_cu,
-        torch.zeros(2, dtype=torch.bool),
-        None,
-        slot1,
-        bt,
-        32,
+def _graph_forward_context() -> ForwardContext:
+    """A ``ForwardContext`` that makes ``in_acl_graph()`` true (graph warmup)."""
+    return ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=None,
+        layer_caches=[],
+        execution_state=AclGraphExecutionState({}),
     )
-    # Step 2: one more token; positions 0/1 precede the chunk start, so their
-    # compressed ids must come from the slot cache (slots 0/1).
-    comp = torch.tensor(_engram_test_token_map(), dtype=torch.int64)
-    m = state.multipliers[0]
-    ids2 = torch.tensor([20])
-    q_cu2 = torch.tensor([0, 1])
-    slot2 = torch.tensor([2], dtype=torch.int32)
-    hashes = state(
-        ids2,
-        torch.tensor([2]),
-        q_cu2,
-        torch.zeros(1, dtype=torch.bool),
-        None,
-        slot2,
-        bt,
-        32,
-    )
-    r = (comp[20] * m[0]) ^ (comp[9] * m[1]) ^ (comp[3] * m[2])
-    assert torch.equal(hashes[0, 0, 2], ((r % 73) + 138).to(torch.int32))
 
 
-def test_engram_explicit_lookback_beats_slot_cache() -> None:
-    """Resolution order is chunk -> explicit lookback -> slot cache.
+def test_engram_graph_visible_forward_keeps_the_graph_block(_engram_offload_lookup_op) -> None:
+    """Warmup's ``embed(hash_ids)`` must not re-mount onto the eager block.
 
-    A real ``lookback_token_ids`` id must win even when the cache holds a
-    different value for the same position; an unknown (``-1``) id must fall
-    through to the cache; an image-dead id must block the n-gram instead of
-    letting the cache resurrect a live lookback.
+    Audit reproduction chain: runner pre-graph staging -> warmup layer call
+    ``embed(hash_ids)`` under ``in_acl_graph()`` -> capture ``embed(None)``.
+    Before the fix ``embed(hash_ids)`` unconditional re-mounted
+    ``_staged_local`` to the eager block, so the capture read -- and the
+    captured graph baked -- the eager address, which a long-context eager
+    prefill then moves.
     """
-    state = _tiny_engram_hash_state()
-    state._cache = torch.zeros(64, dtype=torch.int32)
-    comp = torch.tensor(_engram_test_token_map(), dtype=torch.int64)
-    m = state.multipliers[0]
-    ids = torch.tensor([5])
-    positions = torch.tensor([1])
-    q_cu = torch.tensor([0, 1])
-    dead = torch.zeros(1, dtype=torch.bool)
-    bt = torch.tensor([[0, 0]], dtype=torch.int32)
-    # Chunk start is position 1, so shift 1 (position 0) is out of chunk and
-    # reads slot 0: seed it with a live value distinct from any lookback id.
-    state._cache[0] = int(comp[9])
+    layout = _engram_test_layout(layer_id=1)
+    off = _make_int8_engram(layout, 48, 2, offload=True)
+    ids = torch.zeros(4, layout.n_hash_cols, dtype=torch.int64)
 
-    def _hash_with_lookback(token_id: int) -> torch.Tensor:
-        return state(
-            ids,
-            positions,
-            q_cu,
-            dead,
-            torch.tensor([[token_id]], dtype=torch.int64),
-            None,
-            bt,
-            32,
+    with forward_context(_graph_forward_context()):
+        off.prepare_embeddings(ids, graph_visible=True)  # runner pre-graph staging
+        graph_ptr = off.embed_tokens._graph_staged_device.data_ptr()
+        _ = off.embed(ids)  # warmup decoder layer call (hash_ids is not None)
+        capture_rows = off.embed(None)  # capture read
+        assert capture_rows.data_ptr() == graph_ptr
+        assert off._staged_local_graph is True
+        assert (
+            off._staged_local.untyped_storage().data_ptr()
+            == off.embed_tokens._graph_staged_device.untyped_storage().data_ptr()
         )
 
-    chunk_roll = comp[5] * m[0]
-    # A supplied id (7) outranks the cache's 9.
-    explicit = _hash_with_lookback(7)
-    explicit_roll = chunk_roll ^ (comp[7] * m[1])
-    assert torch.equal(explicit[0, 0, 0], (explicit_roll % 67).to(torch.int32))
-    assert torch.equal(explicit[0, 0, 1], ((explicit_roll % 71) + 67).to(torch.int32))
-    # -1 means unknown, so the slot cache supplies the lookback (9).
-    unknown = _hash_with_lookback(-1)
-    cache_roll = chunk_roll ^ (comp[9] * m[1])
-    assert torch.equal(unknown[0, 0, 0], (cache_roll % 67).to(torch.int32))
-    assert torch.equal(unknown[0, 0, 1], ((cache_roll % 71) + 67).to(torch.int32))
-    # An image-dead id blocks the n-gram (pads) rather than reading the cache.
-    dead_lookback = _hash_with_lookback(ENGRAM_IMAGE_SENTINEL_BASE_ID)
-    assert torch.equal(dead_lookback[0, 0, 0], (chunk_roll % 67).to(torch.int32))
-    assert not torch.equal(dead_lookback[0, 0, 0], (cache_roll % 67).to(torch.int32))
+    # A long-context eager prefill grows its own block, never the graph's.
+    off.prepare_embeddings(torch.zeros(300, layout.n_hash_cols, dtype=torch.int64), graph_visible=False)
+    assert off.embed_tokens._eager_staged_device.shape[0] >= 300
+    assert off.embed_tokens._graph_staged_device.data_ptr() == graph_ptr
+
+    # Every replay re-stages into the graph block and keeps reading it.
+    with forward_context(_graph_forward_context()):
+        off.prepare_embeddings(ids, graph_visible=True)
+        assert off.embed(None).data_ptr() == graph_ptr
+        assert off.embed(ids).data_ptr() == graph_ptr
 
 
-def test_engram_hash_state_builder_roundtrip(tmp_path) -> None:
-    """build_engram_hash_state() writes a sidecar from_config can load.
+def test_engram_eager_forward_after_graph_staging_uses_the_eager_block(_engram_offload_lookup_op) -> None:
+    """An eager forward must not read the graph-visible block."""
+    layout = _engram_test_layout(layer_id=1)
+    off = _make_int8_engram(layout, 48, 2, offload=True)
+    ids = torch.zeros(4, layout.n_hash_cols, dtype=torch.int64)
 
-    Builds a tiny tokenizer (Hello/hello fold onto one compressed id), runs
-    the in-module builder end to end, and loads the result through the
-    serving path. Guards the builder the from_config error message points at.
-    """
-    pytest.importorskip("tokenizers")
-    pytest.importorskip("numpy")
-    import json
+    with forward_context(_graph_forward_context()):
+        off.prepare_embeddings(ids, graph_visible=True)
+        _ = off.embed(ids)
+        assert off._staged_local_graph is True
 
-    from tokenizers import Tokenizer, models
-
-    tok = Tokenizer(
-        models.WordLevel(
-            vocab={"[PAD]": 0, "Hello": 1, "hello": 2, "WORLD": 3, "x": 4},
-            unk_token="[PAD]",
-        )
+    # Outside the graph the same layer call falls back to the eager block.
+    assert off.embed(ids).data_ptr() == off.embed_tokens._eager_staged_device.data_ptr()
+    assert off._staged_local_graph is False
+    assert (
+        off._staged_local.untyped_storage().data_ptr()
+        == off.embed_tokens._eager_staged_device.untyped_storage().data_ptr()
     )
-    tokenizer_path = tmp_path / "tokenizer.json"
-    tok.save(str(tokenizer_path))
-    config = {
-        "model_type": "deepseek_v41",
-        "vocab_size": 5,
-        "engram_layer_ids": [1],
-        "engram_num_embeddings": [1000],
-        "engram_max_ngram_size": 3,
-        "engram_compressed_vocab_size": 4,  # [pad], hello, world, x
-        "engram_pad_token_id": 0,
-    }
-    (tmp_path / "config.json").write_text(json.dumps(config))
 
-    written = build_engram_hash_state(str(tmp_path))
-    assert written == str(tmp_path / "engram_hash_state.bin")
 
-    # First-seen compressed ids: [PAD]->0, Hello->1, hello->1, WORLD->2, x->3.
-    sidecar = _load_engram_hash_state_sidecar(str(tmp_path))
-    assert sidecar is not None
-    assert sidecar["token_map"].tolist() == [0, 1, 1, 2, 3]
-    assert sidecar["multipliers"].shape == (1, 3)
-    # The serving path accepts the generated sidecar.
-    layout = EngramLayout(
-        layer_ids=[1],
-        num_embeddings=[1000],
+# ---------------------------------------------------------------------------
+# Engram test fixtures
+# ---------------------------------------------------------------------------
+
+
+def _engram_test_layout(layer_id: int) -> EngramLayout:
+    return EngramLayout(
+        layer_ids=[layer_id],
+        num_embeddings=[290],
         max_ngram_size=3,
         n_heads=2,
         head_dim=32,
-        vocab_size=5,
-        compressed_vocab_size=4,
+        vocab_size=64,
+        compressed_vocab_size=16,
         pad_token_id=0,
     )
-    state = EngramHashState.from_config(layout, {"model_path": str(tmp_path)})
-    assert state.token_map.tolist() == [0, 1, 1, 2, 3]
-    assert torch.equal(state.multipliers, sidecar["multipliers"])
 
 
-def test_engram_embedding_tp_sharding_nondivisible() -> None:
-    """Head-column TP shards reassemble exactly when tp_size does not divide.
+def test_close_host_offload_releases_every_layer_despite_one_failure() -> None:
+    """A single layer's close failure must not leak the sibling layers' tables."""
+    closed: list[str] = []
 
-    World sizes leaving a short slice on the last head-owning rank or ranks
-    past the last head (tp_size > n_hash_cols) must still produce uniform
-    blocks; concatenated and trimmed back to n_hash_cols they equal the
-    unsharded lookup. Regression: the uniform block view raised a shape
-    error for such world sizes (e.g. tp_size=16 on the 24-column default).
+    class _Engram:
+        def __init__(self, name: str, *, boom: bool = False) -> None:
+            self._name = name
+            self._boom = boom
+
+        def close_host_offload(self) -> None:
+            if self._boom:
+                raise RuntimeError(f"{self._name} refuses to close")
+            closed.append(self._name)
+
+    class _Layer:
+        def __init__(self, engram: object | None) -> None:
+            self.engram = engram
+
+    model = type("_Model", (), {})()
+    model.layers = [
+        _Layer(_Engram("a")),
+        _Layer(_Engram("b", boom=True)),
+        _Layer(_Engram("c")),
+        _Layer(None),  # a non-engram layer is skipped
+    ]
+    with pytest.raises(RuntimeError, match="layer 1"):
+        dq.DeepseekV41Model.close_host_offload(model)
+    # The failing layer is reported, but the layers on both sides still closed.
+    assert closed == ["a", "c"]
+
+
+def test_engram_fallback_to_device_refused_after_graph_staging() -> None:
+    """``fallback_to_device`` may not run once the graph block is allocated.
+
+    The block's address is baked into a captured ACL graph
+    (``_ensure_graph_staging``), so demoting the table to HBM after capture
+    would leave every replay reading a freed/reused address. Both production
+    call sites (loading-time fallback, post-load reconcile) run before capture,
+    so the guard is never expected to fire there -- pinned by the happy path
+    below.
     """
-    head_sizes = [7, 11, 13, 5, 3]
+    head_sizes = [5, 7]
     dim = 32
-    num_rows = sum(head_sizes)
-    g = torch.Generator().manual_seed(1234)
-    payload = torch.randint(0, 256, (num_rows, dim), dtype=torch.uint8, generator=g)
-    # E4M3FN 0x7F/0xFF decode to NaN; NaN != NaN breaks the exact-equality
-    # checks below, so remap those byte patterns to finite neighbours.
-    payload = torch.where((payload == 0x7F) | (payload == 0xFF), payload - 1, payload)
-    scales = torch.randint(126, 130, (num_rows, dim // 32), dtype=torch.uint8, generator=g)
+    payload, scales = _int8_engram_payload(head_sizes, dim, 6)
 
-    def make(tp_size: int, tp_rank: int) -> EngramEmbedding:
-        emb = EngramEmbedding(num_rows, dim, head_sizes, tp_size, tp_rank)
-        with torch.no_grad():
-            emb.weight.copy_(payload[emb.vocab_start : emb.vocab_end])
-            emb.weight_scale.copy_(scales[emb.vocab_start : emb.vocab_end])
-        return emb
+    # Happy path: a fresh offload table (no graph block) demotes cleanly.
+    fresh = _make_int8_embedding(head_sizes, dim, payload, scales, offload=True)
+    assert fresh.fallback_to_device() is True
+    assert fresh.offload is False
 
-    ref = make(1, 0)
-    t = 6
-    ids = torch.zeros(t, len(head_sizes), dtype=torch.int64)
-    for j, size in enumerate(head_sizes):
-        ids[:, j] = torch.randint(0, size, (t,), generator=g) + sum(head_sizes[:j])
-
-    for tp_size in (2, 3, 5, 8):
-        part = (len(head_sizes) + tp_size - 1) // tp_size
-        blocks = [make(tp_size, rank)._local_block(ids) for rank in range(tp_size)]
-        assert all(block.shape == (t, part, dim) for block in blocks)
-        # Ranks past the last head own no table rows and contribute zeros.
-        for rank in range(tp_size):
-            if rank * part >= len(head_sizes):
-                assert not blocks[rank].any()
-        gathered = torch.cat(blocks, dim=1)[:, : ref.n_hash_cols]
-        assert torch.equal(gathered, ref.lookup(ids))
+    # Once a graph-visible block exists the demotion is refused.
+    captured = _make_int8_embedding(head_sizes, dim, payload, scales, offload=True)
+    captured.set_graph_capacity_hint(16)
+    captured._ensure_graph_staging(4)
+    assert captured._graph_staged_device is not None
+    ptr = captured._graph_staged_device.data_ptr()
+    with pytest.raises(RuntimeError, match="before ACL-graph capture"):
+        captured.fallback_to_device()
+    # The refusal must not have disturbed the captured block.
+    assert captured.offload is True
+    assert captured._graph_staged_device.data_ptr() == ptr
 
 
-def test_engram_embedding_int8_storage_dequant() -> None:
-    """int8_sym storage (Eco-Tech W8A8 export) dequantizes payload * fp32 group scales."""
-    head_sizes = [7, 11, 13, 5, 3]
-    dim = 32
-    num_rows = sum(head_sizes)
-    g = torch.Generator().manual_seed(4321)
-    payload = torch.randint(-127, 128, (num_rows, dim), dtype=torch.int8, generator=g)
-    scales = torch.rand(num_rows, dim // 32, generator=g).float() * 0.05 + 0.01
+def test_engram_private_host_copy_failure_logs_traceback_and_falls_back() -> None:
+    """A host-copy RuntimeError demotes the layer to HBM and logs a traceback.
 
-    emb = EngramEmbedding(num_rows, dim, head_sizes, 1, 0, storage=ENGRAM_STORAGE_INT8)
-    assert emb.weight.dtype == torch.int8
-    assert emb.weight_scale.dtype == torch.float32
+    ``_load_engram_ascend_private`` catches ``RuntimeError`` / ``MemoryError``
+    -- the two host-copy failure shapes -- and falls back to the HBM table.
+    Because ``RuntimeError`` is wider than a host OOM (a weight-path or shape
+    defect raises it too), the warning must carry the full traceback via
+    ``exc_info=True`` so the failing copy is identifiable; the HBM copy then
+    runs and the layer is demoted. If that second copy also fails the loader
+    aborts explicitly instead of serving a half-populated table.
+
+    Discriminating: dropping ``exc_info=True`` leaves ``record.exc_info`` None
+    and the rendered text traceback-free; removing ``fallback_to_device()``
+    leaves ``embed.fallback_calls == 0`` and the retried copy count at 1.
+    """
+
+    class _Embed:
+        """Minimal stand-in: only ``offload`` / ``fallback_to_device`` are read."""
+
+        def __init__(self) -> None:
+            self.offload = True
+            self.fallback_calls = 0
+
+        def fallback_to_device(self) -> bool:
+            self.fallback_calls += 1
+            self.offload = False
+            return True
+
+    table = torch.zeros(1, 32, dtype=torch.int8)
+    scale = torch.zeros(1, 1, dtype=torch.float32)
+
+    def make_self(copy_rows) -> SimpleNamespace:
+        return SimpleNamespace(
+            _load_engram_ascend_table=lambda *args, **kwargs: (table, scale, 0, 1),
+            _copy_engram_rows=copy_rows,
+        )
+
+    xllm_logger = logging.getLogger("xllm")
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    xllm_logger.addHandler(handler)
+    try:
+        # First copy (host) fails, the fallback copy (HBM) succeeds.
+        embed = _Embed()
+        copies = {"count": 0}
+
+        def _fail_first(_embed, _table, _scale, _start, _rows) -> None:
+            copies["count"] += 1
+            if copies["count"] == 1:
+                raise RuntimeError("simulated host copy failure")
+
+        dq.DeepseekV41ForCausalLM._load_engram_ascend_private(make_self(_fail_first), None, "ck.", 7, embed)
+
+        # Both copies fail: abort rather than run on a half-loaded table.
+        embed2 = _Embed()
+
+        def _always_fail(_embed, _table, _scale, _start, _rows) -> None:
+            raise RuntimeError("simulated HBM copy failure")
+
+        with pytest.raises(RuntimeError, match="partially populated"):
+            dq.DeepseekV41ForCausalLM._load_engram_ascend_private(make_self(_always_fail), None, "ck.", 9, embed2)
+    finally:
+        xllm_logger.removeHandler(handler)
+
+    assert copies["count"] == 2, "the fallback must re-run the copy on the HBM path"
+    assert embed.fallback_calls == 1
+    assert embed.offload is False
+    assert embed2.fallback_calls == 1
+
+    warnings = [
+        record
+        for record in records
+        if "host-table load failed" in record.getMessage() and "layer 7" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is not None, "the wide catch must keep the traceback"
+    rendered = logging.Formatter().format(warnings[0])
+    assert "Traceback" in rendered and "simulated host copy failure" in rendered
+
+
+def _fake_v41_layers(*engrams: Engram | None) -> list[SimpleNamespace]:
+    """Minimal ``DeepseekV41DecoderLayer`` stand-ins carrying only ``engram``."""
+    return [SimpleNamespace(engram=engram) for engram in engrams]
+
+
+def test_engram_offload_reconcile_demotes_all_layers_on_fallback() -> None:
+    """One demoted layer must pull the whole model onto the HBM path."""
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    off_b = _make_int8_engram(layout, 48, 2, offload=True)
+    # Simulate ``_load_engram_ascend`` demoting a single layer after a failed
+    # host-table copy.
+    assert off_b.embed_tokens.fallback_to_device() is True
+    assert off_b.offload is False
+
+    fake = SimpleNamespace(
+        engram_offload_active=True, dp_shared_memory=False, layers=_fake_v41_layers(off_a, off_b, None)
+    )
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is True
+    # All-or-nothing: the model flag is cleared AND the remaining offload layer
+    # is demoted, so no layer keeps the (capture-unsafe) host path.
+    assert fake.engram_offload_active is False
+    assert off_a.offload is False
+    assert off_b.offload is False
+
+
+def test_engram_offload_reconcile_skips_already_demoted_layer() -> None:
+    """The layer demoted by the loader must not be demoted a second time.
+
+    ``_load_engram_ascend`` demotes the failed layer before reconcile runs, so
+    reconcile must skip it (its ``offload`` is already False) and only demote
+    the layers that still offload. Discriminating: without the ``offload``
+    guard ``fallback_to_device`` runs on both layers, so the call log is
+    ``["a", "b"]`` instead of ``["a"]``.
+    """
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    off_b = _make_int8_engram(layout, 48, 2, offload=True)
+    # The failed layer is already demoted by the loader.
+    assert off_b.embed_tokens.fallback_to_device() is True
+    assert off_b.offload is False
+
+    calls: list[str] = []
+    real_a = off_a.embed_tokens.fallback_to_device
+    real_b = off_b.embed_tokens.fallback_to_device
+
+    def spy_a() -> bool:
+        calls.append("a")
+        return real_a()
+
+    def spy_b() -> bool:
+        calls.append("b")
+        return real_b()
+
+    off_a.embed_tokens.fallback_to_device = spy_a
+    off_b.embed_tokens.fallback_to_device = spy_b
+
+    fake = SimpleNamespace(
+        engram_offload_active=True, dp_shared_memory=False, layers=_fake_v41_layers(off_a, off_b, None)
+    )
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is True
+    assert calls == ["a"], "only the still-offloading layer may be demoted"
+    assert off_a.offload is False
+    assert fake.engram_offload_active is False
+
+
+def test_engram_offload_reconcile_keeps_offload_when_all_layers_held() -> None:
+    """No per-layer fallback: the model keeps host offload for every layer."""
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    fake = SimpleNamespace(
+        engram_offload_active=True, dp_shared_memory=False, layers=_fake_v41_layers(off_a, None)
+    )
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is False
+    assert fake.engram_offload_active is True
+    assert off_a.offload is True
+    # Inactive models are never touched.
+    inactive = SimpleNamespace(
+        engram_offload_active=False, dp_shared_memory=False, layers=_fake_v41_layers(off_a)
+    )
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(inactive) is False
+
+
+def test_engram_offload_reconcile_skips_demotion_for_dp_shared_memory() -> None:
+    """A DP-shared table never enters the per-layer demotion path.
+
+    With ``dp_shared_memory`` set the shared host load is
+    fail-fast, so no per-layer fallback exists to reconcile. Reconcile must
+    return False and leave every layer offloading -- not even a layer that
+    already fell back may drag the shared model onto the HBM path.
+    Discriminating: without the ``or self.dp_shared_memory`` guard the mixed
+    model would return True and demote ``off_a``, so the spy call log is
+    ``["a"]`` instead of ``[]``.
+    """
+    layout = _engram_test_layout(layer_id=1)
+    off_a = _make_int8_engram(layout, 48, 2, offload=True)
+    off_b = _make_int8_engram(layout, 48, 2, offload=True)
+    # Simulate a shared layer whose host table is already gone (offload False).
+    assert off_b.embed_tokens.fallback_to_device() is True
+    assert off_b.offload is False
+
+    calls: list[str] = []
+    real_a = off_a.embed_tokens.fallback_to_device
+    real_b = off_b.embed_tokens.fallback_to_device
+
+    def spy_a() -> bool:
+        calls.append("a")
+        return real_a()
+
+    def spy_b() -> bool:
+        calls.append("b")
+        return real_b()
+
+    off_a.embed_tokens.fallback_to_device = spy_a
+    off_b.embed_tokens.fallback_to_device = spy_b
+
+    fake = SimpleNamespace(
+        engram_offload_active=True,
+        dp_shared_memory=True,
+        layers=_fake_v41_layers(off_a, off_b, None),
+    )
+    assert dq.DeepseekV41Model._reconcile_engram_offload_active(fake) is False
+    assert calls == [], "a DP-shared table must not trigger any per-layer demotion"
+    assert fake.engram_offload_active is True
+    assert off_a.offload is True
+
+
+def test_engram_fallback_layer_serves_embed_none_from_staged_rows() -> None:
+    """A demoted layer resolves the graph contract (None ids).
+
+    Reproduces the review chain: ``Engram(offload=True)`` ->
+    ``fallback_to_device()`` -> graph-visible ``prepare_embeddings`` (writes
+    ``_staged_rows``) -> ``embed(None)``. Pre-fix this raised ``no staged rows``;
+    post-fix it returns the device-path rows bit-identically.
+    """
+    layout = _engram_test_layout(layer_id=1)
+    dim, hc_mult = 48, 2
+    off = _make_int8_engram(layout, dim, hc_mult, offload=True)
+    dev = _make_int8_engram(layout, dim, hc_mult, offload=False)
     with torch.no_grad():
-        emb.weight.copy_(payload)
-        emb.weight_scale.copy_(scales)
+        dev.embed_tokens.weight.copy_(off.embed_tokens.weight)
+        dev.embed_tokens.weight_scale.copy_(off.embed_tokens.weight_scale)
 
-    t = 9
-    ids = torch.zeros(t, len(head_sizes), dtype=torch.int64)
-    for j, size in enumerate(head_sizes):
-        ids[:, j] = torch.randint(0, size, (t,), generator=g) + sum(head_sizes[:j])
-    out = emb.lookup(ids)
-    expected = (payload[ids].float() * scales[ids].repeat_interleave(32, dim=-1)).to(torch.bfloat16)
-    assert out.shape == (t, len(head_sizes), dim)
-    assert torch.equal(out, expected)
+    assert off.embed_tokens.fallback_to_device() is True
+    assert off.offload is False
+
+    ids = torch.zeros(6, layout.n_hash_cols, dtype=torch.int64)
+    off.prepare_embeddings(ids, graph_visible=True)
+    assert off._staged_local is None
+    assert off._staged_rows is not None
+
+    replay_rows = off.embed(None)
+    dev.prepare_embeddings(ids)
+    assert torch.equal(replay_rows, dev._staged_rows)
+
+
+def test_engram_mixed_mode_embed_none_checks_staged_row_count() -> None:
+    """The mixed-mode ``embed(None)`` branch refuses a wrong-sized staging block.
+
+    That branch (``_staged_rows`` set while ``hash_ids is None``) is
+    production-unreachable today -- the all-or-nothing reconcile clears
+    ``engram_offload_active`` so the capture never passes ``None`` to a
+    fallback layer -- but if a future change revives it, silently returning a
+    block sized for a different batch would feed the graph the wrong rows.
+    ``forward`` passes the step's token count, so the mismatch is refused; the
+    pre-existing ``embed(None)`` callers (no count) keep working.
+    """
+    layout = _engram_test_layout(layer_id=1)
+    eng = _make_int8_engram(layout, 48, 2, offload=False)
+    ids = torch.zeros(6, layout.n_hash_cols, dtype=torch.int64)
+    eng.prepare_embeddings(ids)
+    assert eng._staged_rows is not None and eng._staged_rows.shape[0] == 6
+
+    # Matching token count resolves; a bare ``embed(None)`` (no count) too.
+    assert eng.embed(None, num_tokens=6).shape[0] == 6
+    assert eng.embed(None).shape[0] == 6
+
+    # A mismatched step token count is refused instead of returning stale rows.
+    with pytest.raises(RuntimeError, match="row mismatch"):
+        eng.embed(None, num_tokens=3)
+
+
+def test_engram_embed_re_gathers_for_a_shorter_batch(_engram_offload_lookup_op) -> None:
+    """A smaller explicit batch must re-gather, and
+    the case must actually discriminate the shape judge.
+
+    ``prepare_embeddings`` and ``embed`` run in the SAME graph-visibility regime
+    (the default eager one: ``in_acl_graph()`` is False under plain pytest). If
+    ``prepare`` staged with ``graph_visible=True`` while ``embed`` computed
+    ``graph_visible=False``, the ``_staged_local_graph != graph_visible`` term
+    would be trivially true and force a re-gather regardless of the shape judge
+    -- the buggy ``<`` judge would then still pass, leaving the case with no
+    discriminating power. Keeping both undirected leaves the shape judge as the
+    only trigger, and the direct ``_staged_local`` assertion pins its outcome.
+    """
+    layout = _engram_test_layout(layer_id=1)
+    off = _make_int8_engram(layout, 48, 2, offload=True)
+    g = torch.Generator().manual_seed(31)
+    long_ids = torch.randint(0, layout.num_embeddings[0], (8, layout.n_hash_cols), generator=g)
+    short_ids = torch.randint(0, layout.num_embeddings[0], (3, layout.n_hash_cols), generator=g)
+
+    off.prepare_embeddings(long_ids)
+    assert off._staged_local is not None and off._staged_local.shape[0] == 8
+
+    # A shorter explicit call re-gathers instead of returning the 8-row prefix.
+    short_rows = off.embed(short_ids)
+    assert short_rows.shape[0] == 3
+    # Direct consequence of the judge: the staged block itself is rebuilt at 3
+    # rows. With the buggy ``<`` judge (``8 < 3`` is False) no re-gather happens
+    # and this still holds the 8-row prefix, so the assertion fails there.
+    assert off._staged_local.shape[0] == 3
+    # Content-level evidence: the rows come from re-gathering ``short_ids``, not
+    # the first 3 rows of the ``long_ids`` gather.
+    ref = _make_int8_engram(layout, 48, 2, offload=True)
+    ref.prepare_embeddings(short_ids)
+    assert torch.equal(short_rows, ref.embed(None))
+
+
+class _EngramRoutingAttnStub(nn.Module):
+    """Shape-preserving attention stub so the post-engram path runs on CPU."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((hidden_size,), 0.5), requires_grad=False)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden * self.scale
+
+
+class _EngramRoutingMlpStub(nn.Module):
+    """Dense-MLP stub: not ``DeepseekV41MoE``, so forward takes one argument."""
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden * 0.25
+
+
+def _make_engram_routing_decoder_layer() -> DeepseekV41DecoderLayer:
+    """A real ``DeepseekV41DecoderLayer`` with a real offloaded ``Engram``.
+
+    The engram routing guard is the code under test, so the layer is real and
+    only its attention / MLP -- which need the NPU CSA2 backend -- are stubbed
+    with shape-preserving CPU modules. ``hc_*`` parameters start as
+    ``torch.empty`` in the constructor, so they are seeded with finite values.
+    """
+    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    layout = EngramLayout(
+        layer_ids=[1],
+        num_embeddings=[290],
+        max_ngram_size=3,
+        n_heads=2,
+        head_dim=32,
+        vocab_size=64,
+        compressed_vocab_size=16,
+        pad_token_id=0,
+    )
+    layer = DeepseekV41DecoderLayer(
+        cfg,
+        1,
+        torch.float32,
+        torch.device("cpu"),
+        CSA2LayerMode(layer_id=1, mode=CSA2_MODE_SWA, compress_ratio=0, main_kv_source_layer=-1),
+        engram_layout=layout,
+        engram_storage=ENGRAM_STORAGE_INT8,
+        engram_offload=True,
+    )
+    eng = layer.engram
+    assert eng is not None
+    g = torch.Generator().manual_seed(17)
+    with torch.no_grad():
+        for name in ("hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base"):
+            getattr(layer.hc, name).normal_(0.0, 0.02)
+        for name in ("hc_attn_scale", "hc_ffn_scale"):
+            getattr(layer.hc, name).fill_(1.0)
+        payload = torch.randint(-127, 128, eng.embed_tokens.weight.shape, dtype=torch.int8, generator=g)
+        scales = torch.rand(eng.embed_tokens.weight_scale.shape, generator=g).float() * 0.05 + 0.01
+        eng.embed_tokens.weight.copy_(payload)
+        eng.embed_tokens.weight_scale.copy_(scales)
+        eng.wkv.weight.normal_(0.0, 0.05)
+        eng.q_weight.normal_(0.0, 0.05)
+        eng.k_weight.normal_(0.0, 0.05)
+    layer.self_attn = _EngramRoutingAttnStub(cfg.hidden_size)
+    layer.mlp = _EngramRoutingMlpStub()
+    return layer
+
+
+def test_decoder_layer_routes_none_hashes_to_staged_rows(_engram_offload_lookup_op) -> None:
+    """The offloaded capture/replay call -- ``engram_hashes=None`` plus
+    a computed mask -- must still inject engram, reading the pre-graph staged
+    rows.
+
+    That guard is the capture production entry: the host gather ran outside the
+    graph, so a captured graph passes ``hash_ids=None`` and only the mask. The
+    old guard (``engram_hashes is not None``) silently dropped the injection for
+    that call, so the capture read nothing and every replay diverged from eager.
+    Both halves are pinned here: the mask-only call injects and is bit-identical
+    to the explicit-hashes call, while ``(None, None)`` truly skips engram (equal
+    to the engram-disabled path).
+    """
+    layer = _make_engram_routing_decoder_layer()
+    eng = layer.engram
+    assert eng is not None and eng.offload is True
+
+    hidden_size = layer.input_layernorm.weight.numel()
+    hc_mult = layer.hc.hc_mult
+    t = 5
+    g = torch.Generator().manual_seed(29)
+    hashes = torch.randint(
+        0,
+        eng.embed_tokens.num_embeddings,
+        (t, 1, eng.embed_tokens.n_hash_cols),
+        generator=g,
+    )
+    hidden = torch.randn(t, hc_mult, hidden_size, generator=g)
+    positions = torch.arange(t, dtype=torch.int64)
+    cos_sin_cache = torch.zeros(1)  # the attention stub ignores it
+    mask = torch.tensor([True, True, False, True, True])
+
+    # The runner's pre-graph host staging pass fills the rows a replay reads.
+    eng.prepare_embeddings(hashes[:, 0], graph_visible=False)
+
+    out_hashes, _ = layer(hidden, positions, cos_sin_cache, None, None, hashes, mask)
+    out_none_mask, _ = layer(hidden, positions, cos_sin_cache, None, None, None, mask)
+    out_none_none, _ = layer(hidden, positions, cos_sin_cache, None, None, None, None)
+
+    # (None, mask) reads the staged rows: bitwise equal to the explicit ids.
+    assert torch.equal(out_none_mask, out_hashes)
+
+    # (None, None) skips engram entirely; the output is the residual path.
+    saved = layer.engram
+    layer.engram = None
+    try:
+        ref_none_none, _ = layer(hidden, positions, cos_sin_cache, None, None, None, None)
+    finally:
+        layer.engram = saved
+    assert torch.equal(out_none_none, ref_none_none)
+
+    # Non-vacuity: the mask-only call actually injected (differs from the skip).
+    assert not torch.equal(out_none_mask, out_none_none)
+
+
+def _make_int8_engram(layout: EngramLayout, dim: int, hc_mult: int, offload: bool) -> Engram:
+    eng = Engram(
+        layout,
+        0,
+        dim,
+        hc_mult,
+        rms_norm_eps=1e-6,
+        tp_size=1,
+        tp_rank=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        storage=ENGRAM_STORAGE_INT8,
+        offload=offload,
+    )
+    g = torch.Generator().manual_seed(17)
+    with torch.no_grad():
+        payload = torch.randint(-127, 128, eng.embed_tokens.weight.shape, dtype=torch.int8, generator=g)
+        scales = torch.rand(eng.embed_tokens.weight_scale.shape, generator=g).float() * 0.05 + 0.01
+        eng.embed_tokens.weight.copy_(payload)
+        eng.embed_tokens.weight_scale.copy_(scales)
+        eng.wkv.weight.copy_(torch.randn(eng.wkv.weight.shape, generator=g).bfloat16())
+        eng.q_weight.copy_(torch.randn(eng.q_weight.shape, generator=g).bfloat16())
+        eng.k_weight.copy_(torch.randn(eng.k_weight.shape, generator=g).bfloat16())
+    return eng
+
+
+def test_engram_offload_forward_without_hash_ids_matches_device(_engram_offload_lookup_op) -> None:
+    """A graph-replay forward reads the staged rows (hash_ids=None) bit-identically."""
+    layout = EngramLayout(
+        layer_ids=[1],
+        num_embeddings=[290],
+        max_ngram_size=3,
+        n_heads=2,
+        head_dim=32,
+        vocab_size=64,
+        compressed_vocab_size=16,
+        pad_token_id=0,
+    )
+    dim, hc_mult = 48, 2
+    assert layout.n_hash_cols == 4
+    dev = _make_int8_engram(layout, dim, hc_mult, offload=False)
+    off = _make_int8_engram(layout, dim, hc_mult, offload=True)
+    assert off.offload is True
+    # Same table + gate weights on both paths.
+    with torch.no_grad():
+        off.embed_tokens.weight.copy_(dev.embed_tokens.weight)
+        off.embed_tokens.weight_scale.copy_(dev.embed_tokens.weight_scale)
+        off.wkv.weight.copy_(dev.wkv.weight)
+        off.q_weight.copy_(dev.q_weight)
+        off.k_weight.copy_(dev.k_weight)
+
+    t = 4
+    hash_ids = torch.zeros(t, layout.n_hash_cols, dtype=torch.int64)
+    dev.prepare_embeddings(hash_ids)
+    off.prepare_embeddings(hash_ids)
+    assert dev._staged_rows is not None
+    assert off._staged_local is not None
+    # tp_size is 1 here, so the head gather is the identity: the staged local
+    # block already equals the fully gathered rows.
+    assert torch.equal(off.embed_tokens.gather_heads(off._staged_local), dev._staged_rows)
+
+    hidden = torch.randn(t, hc_mult, dim, generator=torch.Generator().manual_seed(23)).bfloat16()
+    out_dev = dev(hidden, hash_ids)
+    out_off = off(hidden, None)
+    assert torch.equal(out_off, out_dev)
+
+    # Before any staging, the staged-only contract fails fast instead of
+    # falling back to a device lookup.
+    fresh = _make_int8_engram(layout, dim, hc_mult, offload=True)
+    with pytest.raises(RuntimeError, match="no staged rows"):
+        fresh.embed(None)
+
+
+def test_stage_engram_rows_outside_graph_is_noop_when_off() -> None:
+    """The runner hook is inert for non-offload models (OFF zero-behavior change)."""
+    fake = SimpleNamespace(engram_offload_active=False, engram_hash=None, layers=[])
+    assert dq.DeepseekV41Model.stage_engram_rows_outside_graph(fake, None, None, None, None) is False
+
+
+def test_stage_engram_rows_reports_success_for_the_capture_gate(_engram_offload_lookup_op) -> None:
+    """The staging hook records whether engram is usable this step.
+
+    When the SWA cache is unbound (``hashes is None``) the pass stages nothing
+    and reports ``False``; the runner's first-capture gate then refuses the
+    capture, so the graph never reads a stale staging block.
+    """
+    layout = _engram_test_layout(layer_id=1)
+    token_ids = torch.tensor([ENGRAM_IMAGE_SENTINEL_BASE_ID, 0, 0, 0], dtype=torch.int64)
+
+    # Cache unbound -> the hook reports not staged (the runner gate refuses it).
+    unbound = SimpleNamespace(
+        engram_offload_active=True,
+        engram_hash=object(),
+        layers=_fake_v41_layers(_make_int8_engram(layout, 48, 2, offload=True)),
+        cfg=SimpleNamespace(tp_rank=0),
+    )
+    unbound._compute_engram_hashes = lambda *args: (None, None)
+    assert dq.DeepseekV41Model.stage_engram_rows_outside_graph(unbound, None, None, token_ids, token_ids) is False
+
+    # Staging succeeds -> the capture mask is the sentinel complement.
+    staged = SimpleNamespace(
+        engram_offload_active=True,
+        engram_hash=object(),
+        layers=_fake_v41_layers(_make_int8_engram(layout, 48, 2, offload=True)),
+        cfg=SimpleNamespace(tp_rank=0),
+    )
+    staged._compute_engram_hashes = lambda *args: (torch.zeros(4, 1, layout.n_hash_cols, dtype=torch.int32), None)
+    assert dq.DeepseekV41Model.stage_engram_rows_outside_graph(staged, None, None, token_ids, token_ids) is True
+    capture_mask = dq.DeepseekV41Model._engram_capture_mask(staged, token_ids)
+    assert capture_mask is not None
+    assert capture_mask.tolist() == [False, True, True, True]
+    assert torch.equal(capture_mask, ~dq.image_sentinel_mask(token_ids))
+
+
+def test_stage_engram_rows_makes_one_device_sync_for_all_layers(
+    _engram_offload_lookup_op, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-graph staging pass drains the device ONCE for every engram layer.
+
+    The per-layer entry (``prepare_embeddings`` -> ``_local_block_offload``)
+    synchronizes the whole device after queueing each layer's D2H copies, so the
+    old N-layer loop paid N blocking drains where N-1 waited on copies the first
+    drain had already retired. The batched two-phase pass must queue every
+    layer's D2H, drain once, then run each layer's CPU gather. Discriminating:
+    the old per-layer loop makes ``sync_calls == 2`` here, so ``== 1`` fails
+    before the fix.
+
+    The batching only pays off if the queued D2H copies are themselves
+    non-blocking: a blocking ``copy_`` would stall the host on every layer
+    regardless of the drain count. So the test also spies the ``non_blocking``
+    argument of every copy whose destination is one of the two pinned host
+    staging buffers and asserts it is ``True`` -- dropping ``non_blocking=True``
+    from ``stage_ids_offload`` flips these to ``False`` and fails here, while the
+    sync count alone would not notice.
+
+    The protective drain inside ``_ensure_host_scratch`` is deliberately NOT
+    counted: it only fires when the pinned scratch grows, so the layers are
+    pre-warmed (scratch + graph block sized) before the counter is installed.
+    """
+    import xllm.python.models.deepseek_v41_engram as engram_mod
+
+    layout = _engram_test_layout(layer_id=1)
+    first = _make_int8_engram(layout, 48, 2, offload=True)
+    second = _make_int8_engram(layout, 48, 2, offload=True)
+    second.layer_hash_index = 1  # a distinct hash column for the second layer
+
+    t = 4
+    generator = torch.Generator().manual_seed(101)
+    hashes = torch.randint(
+        0,
+        layout.num_embeddings[0],
+        (t, 2, layout.n_hash_cols),
+        generator=generator,
+        dtype=torch.int32,
+    )
+
+    # Pre-warm the pinned scratch and the graph staging block so the counted
+    # pass hits only the batched drain (``_ensure_host_scratch`` syncs only on
+    # growth). These warm-up syncs run before the counter is installed.
+    for engram in (first, second):
+        engram.prepare_embeddings(hashes[:, engram.layer_hash_index], graph_visible=True)
+
+    sync_calls = 0
+    real_sync = engram_mod._sync_accelerator
+
+    def _counting_sync(device: torch.device | None) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        real_sync(device)
+
+    monkeypatch.setattr(engram_mod, "_sync_accelerator", _counting_sync)
+
+    # Spy the D2H ``non_blocking`` argument: the sync count alone would still
+    # pass if the queued copies stayed blocking. Identify the D2H copies by
+    # destination storage -- only the two per-layer pinned host staging buffers
+    # count; the H2D upload (NPU destination) and the reference layers below
+    # (different storages) are filtered out. The buffers exist after the
+    # pre-warm above and are not reallocated by the counted pass.
+    host_storages = {engram.embed_tokens._ids_host.untyped_storage().data_ptr() for engram in (first, second)} | {
+        engram.embed_tokens._owned_host.untyped_storage().data_ptr() for engram in (first, second)
+    }
+    d2h_non_blocking: list[bool] = []
+    real_copy = torch.Tensor.copy_
+
+    def _spy_copy(self: torch.Tensor, src: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        non_blocking = kwargs.get("non_blocking", args[0] if args else False)
+        if self.device.type == "cpu" and self.untyped_storage().data_ptr() in host_storages:
+            d2h_non_blocking.append(bool(non_blocking))
+        return real_copy(self, src, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", _spy_copy)
+
+    model = SimpleNamespace(
+        engram_offload_active=True,
+        engram_hash=object(),
+        layers=_fake_v41_layers(first, second),
+        cfg=SimpleNamespace(tp_rank=0),
+    )
+    model._compute_engram_hashes = lambda *args: (hashes, None)
+
+    token_ids = torch.zeros(t, dtype=torch.int64)
+    assert dq.DeepseekV41Model.stage_engram_rows_outside_graph(model, None, None, token_ids, token_ids) is True
+    assert sync_calls == 1
+    # Two layers x (ids + owned): every queued D2H copy must be non-blocking.
+    assert d2h_non_blocking == [True, True, True, True]
+
+    # Parity + publication: each layer's published block is bit-identical to the
+    # per-layer ``prepare_embeddings`` path and points at the persistent
+    # graph-visible block (not the growable eager one).
+    for column, engram in enumerate((first, second)):
+        reference = _make_int8_engram(layout, 48, 2, offload=True)
+        with torch.no_grad():
+            reference.embed_tokens.weight.copy_(engram.embed_tokens.weight)
+            reference.embed_tokens.weight_scale.copy_(engram.embed_tokens.weight_scale)
+        reference.prepare_embeddings(hashes[:, column].to(torch.int64), graph_visible=True)
+
+        assert engram._staged_local is not None
+        assert engram._staged_local_graph is True
+        assert torch.equal(engram.embed(None), reference.embed(None))
+        staging = engram.embed_tokens._graph_staged_device
+        assert staging is not None
+        assert engram._staged_local.untyped_storage().data_ptr() == staging.untyped_storage().data_ptr()
+
+
+def test_engram_capture_mask_is_unconditional() -> None:
+    """The capture mask is unconditional: it never skips engram.
+
+    The runner's first-capture gate (``_engram_first_capture_gate``) refuses the
+    capture when ``stage_engram_rows_outside_graph`` staged nothing while engram
+    is offloading, so by the time ``_engram_capture_mask`` runs the staged rows
+    are present. The mask therefore always returns the sentinel complement; the
+    fail-fast lives in the runner, never in a silent in-graph skip.
+    """
+    token_ids = torch.tensor([ENGRAM_IMAGE_SENTINEL_BASE_ID, 0, 0, 0], dtype=torch.int64)
+    expected = ~dq.image_sentinel_mask(token_ids)
+    assert expected.tolist() == [False, True, True, True]
+
+    # The mask depends only on the token ids and consults no model state, so a
+    # bare object stands in for ``self``: any attribute lookup would raise.
+    assert torch.equal(dq.DeepseekV41Model._engram_capture_mask(object(), token_ids), expected)
+
+
+def test_stage_engram_rows_builds_dsa_metadata_for_the_first_capture(_engram_offload_lookup_op) -> None:
+    """The FIRST ACL graph capture must still inject Engram.
+
+    The runner calls this staging hook BEFORE ``_capture``; on that first pass
+    ``metadata.dsa_metadata`` has not been built yet, because the capture's
+    warmup forward (which runs inside ``_capture``) is what normally builds it.
+    The hook must build the DSA metadata itself, or the hashing pass finds no
+    SWA group, reports "not staged", and the capture branch bakes an Engram-less
+    graph that every replay reuses (ACL replay never re-runs Python). This case
+    reproduces the first-capture ordering at the hook boundary.
+
+    Discriminating: removing the DSA build makes ``swa_group_metadata(None)``
+    return None, so staging reports False and this case fails.
+    """
+    layout = _engram_test_layout(layer_id=1)
+    token_ids = torch.tensor([ENGRAM_IMAGE_SENTINEL_BASE_ID, 0, 0, 0], dtype=torch.int64)
+    positions = torch.arange(4, dtype=torch.int32)
+
+    class _Metadata:
+        def __init__(self) -> None:
+            # The runner's ``attention_backend.prepare(graph_mode=True)`` set
+            # this before handing the metadata over; DSA metadata is still
+            # absent on the first capture.
+            self.dsa_graph_mode = True
+            self.dsa_metadata = None
+            self.dsa_positions = None
+
+    class _Dsa:
+        seq_lens_q = torch.ones(4, dtype=torch.int32)
+
+    class _SwaGroup:
+        cache = torch.zeros(64, dtype=torch.int32)
+        block_size = 4
+        slot_mapping = torch.zeros(4, dtype=torch.int32)
+        block_table = torch.zeros(4, 1, dtype=torch.int32)
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def reset_forward(self, metadata) -> None:
+            self.calls.append("reset_forward")
+            # Mirror the real backend reset_forward (csa_attention.py): it also
+            # clears dsa_positions/dsa_graph_mode. Without those the metadata
+            # restoration mutations (graph-flag restore, positions-after-reset
+            # ordering) would go unexercised in these cases; the builder-order
+            # case asserts the restored state.
+            metadata.dsa_metadata = None
+            metadata.dsa_positions = None
+            metadata.dsa_graph_mode = False
+
+        def prepare_dsa_metadata_for_forward(self, metadata) -> None:
+            self.calls.append("prepare_dsa_metadata_for_forward")
+            metadata.dsa_metadata = _Dsa()
+
+        def swa_group_metadata(self, dsa):
+            # Real backends return no SWA group while the DSA metadata is
+            # absent, which is what makes the un-built path skip engram.
+            return _SwaGroup() if dsa is not None else None
+
+    class _Hash:
+        def ensure_cache(self, cache, block_size) -> bool:
+            return True
+
+        def __call__(self, *args, **kwargs) -> torch.Tensor:
+            return torch.zeros(4, 1, layout.n_hash_cols, dtype=torch.int32)
+
+    engram = _make_int8_engram(layout, 48, 2, offload=True)
+    backend = _Backend()
+    metadata = _Metadata()
+    model = SimpleNamespace(
+        engram_offload_active=True,
+        engram_hash=_Hash(),
+        layers=_fake_v41_layers(engram),
+        cfg=SimpleNamespace(tp_rank=0),
+    )
+    # Delegate through the class (call-time lookup) exactly like the real bound
+    # methods, so the whole first-capture hook is the production code path and a
+    # class-level mutation of the DSA builder is observable.
+    model._build_dsa_metadata_for_forward = lambda backend, metadata, positions: (
+        dq.DeepseekV41Model._build_dsa_metadata_for_forward(model, backend, metadata, positions)
+    )
+    model._compute_engram_hashes = lambda backend, metadata, input_ids, positions: (
+        dq.DeepseekV41Model._compute_engram_hashes(model, backend, metadata, input_ids, positions)
+    )
+
+    assert metadata.dsa_metadata is None
+    staged = dq.DeepseekV41Model.stage_engram_rows_outside_graph(model, backend, metadata, token_ids, positions)
+    # The hook built the metadata (via the same path ``forward`` uses) before
+    # hashing, then staged the rows into the graph-visible block.
+    assert backend.calls == ["reset_forward", "prepare_dsa_metadata_for_forward"]
+    assert metadata.dsa_metadata is not None
+    assert staged is True
+    assert engram._staged_local is not None
+
+    # The capture branch therefore enters Engram (mask is the sentinel
+    # complement); staging succeeded, so there is no skip path to fall into.
+    capture_mask = dq.DeepseekV41Model._engram_capture_mask(model, token_ids)
+    assert capture_mask is not None
+    assert capture_mask.tolist() == [False, True, True, True]
+
+
+def test_build_dsa_metadata_for_forward_matches_the_forward_path() -> None:
+    """The extracted builder reproduces the forward branch verbatim.
+
+    ``forward`` now delegates its first-build branch to
+    ``_build_dsa_metadata_for_forward`` and the offload staging hook calls the
+    same method, so every consumer of a freshly built DSA metadata sees the
+    identical reset/build/flag sequence.
+    """
+
+    class _Metadata:
+        def __init__(self) -> None:
+            self.dsa_graph_mode = True
+            self.dsa_metadata = None
+            self.dsa_positions = None
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def reset_forward(self, metadata) -> None:
+            self.calls.append("reset_forward")
+            # Mirror the real backend reset_forward (csa_attention.py): it also
+            # clears dsa_positions/dsa_graph_mode, so the graph-flag and positions
+            # restoration the builder performs is actually exercised here.
+            metadata.dsa_metadata = None
+            metadata.dsa_positions = None
+            metadata.dsa_graph_mode = False
+
+        def prepare_dsa_metadata_for_forward(self, metadata) -> None:
+            self.calls.append("prepare_dsa_metadata_for_forward")
+            metadata.dsa_metadata = object()
+
+    backend = _Backend()
+    metadata = _Metadata()
+    model = SimpleNamespace()
+    dq.DeepseekV41Model._build_dsa_metadata_for_forward(model, backend, metadata, torch.arange(4, dtype=torch.int32))
+    assert backend.calls == ["reset_forward", "prepare_dsa_metadata_for_forward"]
+    assert metadata.dsa_metadata is not None
+    # Positions are normalized to int64, and the graph flag survives the build.
+    assert metadata.dsa_positions.dtype == torch.int64
+    assert metadata.dsa_graph_mode is True
+
+    # A missing builder stays a loud error, never a silent skip. Since the
+    # builder is called directly (EAFP), a backend without it raises the
+    # AttributeError naming the missing method rather than a hand-rolled
+    # RuntimeError.
+    class _NoPrepare:
+        def reset_forward(self, metadata) -> None:
+            metadata.dsa_metadata = None
+
+    with pytest.raises(AttributeError, match="prepare_dsa_metadata_for_forward"):
+        dq.DeepseekV41Model._build_dsa_metadata_for_forward(
+            model, _NoPrepare(), _Metadata(), torch.arange(4, dtype=torch.int32)
+        )
 
 
 def _quarot_gate_reference(

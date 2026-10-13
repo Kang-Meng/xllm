@@ -54,11 +54,13 @@ import os
 import re
 import unicodedata
 import weakref
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from xllm.python.model_executor.forward_context import in_acl_graph
+from xllm.python.models.engram_shared_memory import SharedHostEngramStorage
 
 # Cache value for tokens that take no part in an n-gram (image spans).
 ENGRAM_DEAD_ID = -1
@@ -646,6 +648,185 @@ class EngramHashState(nn.Module):
 ENGRAM_STORAGE_FP8 = "fp8"
 ENGRAM_STORAGE_INT8 = "int8"
 
+# Host offloading the int8 tables (W8A8 export) keeps their ~27.7GB/rank
+# resident HBM in host memory instead, at the cost of a per-step NPU->CPU id
+# sync plus a CPU dequant + H2D of the staged rows. Selected through
+# --engram-config (engram_config.cpu_offload); default off so the HBM path
+# stays byte-identical.
+
+# Floor for the pinned host staging buffers; only grown (never shrunk) so the
+# device staging buffer keeps one stable address for ACL-graph capture.
+_ENGRAM_HOST_MIN_CAPACITY = 256
+
+
+def engram_offload_warning_fields(model: Any) -> tuple[int, list[Any]]:
+    """(engram layer count, graph-capacity hints) for the engram-skip warning.
+
+    Feeds the runner-side staging diagnostic
+    (``_warn_engram_stage_incomplete``) so the fields it logs cannot drift apart
+    from the model. Reads the model generically (``layers`` may be absent on
+    test stubs).
+    """
+    engram_layers = [
+        engram
+        for layer in getattr(model, "layers", None) or []
+        if (engram := getattr(layer, "engram", None)) is not None
+    ]
+    hints = [getattr(getattr(engram, "embed_tokens", None), "_graph_capacity_hint", None) for engram in engram_layers]
+    return len(engram_layers), hints
+
+
+# Process-level best-effort log-dedup latch: ``_host_buffer`` warns on the
+# first pin failure of an episode and a successful pin re-arms it. It carries no
+# pinned/buffer *correctness* -- that lives per embedding instance in
+# ``EngramEmbedding._ids_host_pinned`` / ``_rows_host_pinned`` plus the failure
+# cause ``EngramEmbedding._host_pin_failure`` (a module-global cause would be
+# overwritten by a sibling layer's allocation and misreported by
+# :meth:`EngramEmbedding._pin_failure_hint`). It is intentionally unlocked: a
+# lost update at worst logs one extra warning, and the per-instance flags above
+# are what the lookup-op contract reads.
+_host_pin_warned = False
+
+
+def _host_buffer(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[torch.Tensor, bool, str | None]:
+    """A CPU staging buffer, whether it is pinned, and the pin failure cause.
+
+    ``pin_memory`` needs a registered accelerator (CUDA/NPU); a host without one
+    raises, and this returns the cause (``None`` on success) so the caller can
+    record it on the owning embedding. The failure is never silent: the first
+    failure of an episode is warned here (a later allocation that pins again
+    re-arms the warning, so a host that can never pin logs exactly once), and it
+    remains a hard error at the first lookup, where the op contract refuses
+    unpinned staging and names the real cause
+    (:meth:`EngramEmbedding._engram_lookup_op_contract_error`). The returned
+    ``pinned`` bool is the allocation-time outcome, which the caller stores so
+    the op contract can rely on it instead of re-probing ``Tensor.is_pinned()``
+    later (that probe can misreport on hosts/PyTorch versions without a
+    registered accelerator).
+    """
+    global _host_pin_warned
+    try:
+        buffer = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    except (RuntimeError, ValueError) as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        if not _host_pin_warned:
+            _host_pin_warned = True
+            try:
+                from scripts.logger import logger
+
+                logger.warning(
+                    "engram host offload cannot allocate pinned CPU staging "
+                    f"({failure}); the lookup op contract refuses "
+                    "unpinned staging, so set engram_config.cpu_offload=false on "
+                    "a host that cannot pin host memory"
+                )
+            except Exception:  # noqa: BLE001 - logging must never mask the fallback
+                pass
+        return torch.empty(shape, dtype=dtype, device="cpu"), False, failure
+    _host_pin_warned = False
+    return buffer, True, None
+
+
+def _sync_accelerator(device: torch.device | None) -> None:
+    """Block until all queued accelerator work on this device has completed.
+
+    Deliberately a whole-device synchronize, not a per-stream one: this module
+    never creates -- nor keeps a handle to -- a dedicated copy stream, and the
+    copies this drains are issued by plain ``Tensor.copy_`` on the ambient
+    accelerator stream, so there is no narrower stream to target. Two callers
+    rely on the drain: ``_local_block_offload`` must make the id/owned D2H
+    visible to the CPU gather that follows, and ``_ensure_host_scratch`` must
+    not free a pinned buffer that a still-in-flight non-blocking H2D (the
+    staging upload at the end of the previous offload pass) could read. A
+    device-wide synchronize is the portable guarantee for both; the alternative
+    -- a per-copy stream -- would require threading an explicit copy stream
+    through every ``copy_`` here, which the offload path does not use.
+
+    A whole-device synchronize is safe here because this runs only on the
+    single-threaded per-rank Python path -- the load-time staging setup and the
+    per-step pre-graph host staging pass, never inside an already-captured graph
+    -- and the module creates no bypass copy stream, so every drained ``copy_``
+    lands on the ambient accelerator stream. There is no other stream running
+    concurrently with the one being drained, so the device-wide wait cannot
+    deadlock against a stream that is itself waiting on the current stream.
+    A per-stream synchronize would only be possible if each ``copy_`` here were
+    explicitly threaded through a dedicated copy stream (which this offload path
+    does not use), so the whole-device synchronize is deliberate.
+    """
+    if device is None or device.type == "cpu":
+        return
+    if device.type == "npu":
+        torch.npu.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+    else:
+        # Unknown/other device families: best-effort whole-device synchronize
+        # through the device module's own ``synchronize`` if it exposes one; a
+        # device type without it is skipped (there is no narrower fallback).
+        synchronize = getattr(torch, device.type, None)
+        synchronize = getattr(synchronize, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
+
+
+# --- CPU int8 lookup op (the default and only offload dequant path) ---------
+#
+# The host-offload dequant (index_select + repeat_interleave group scale
+# + bf16 cast) would otherwise run on the host channel every layer every step.
+# The in-repo ``xllm_ops.engram_int8_lookup_cpu`` kernel (built from
+# ``core/kernels/npu/xllm_ops/engram_int8_lookup_cpu.cpp``) fuses it into one CPU
+# call writing directly into the pinned staging buffer, and is now the only
+# dequant path for the offloaded table. (The table is pageable host memory; only
+# the staging/scratch buffers are pinned.) It is not graph-safe host work, so
+# this stays inside ``_local_block_offload`` (the pre-graph host staging pass)
+# and MUST NOT move into ACL-graph capture.
+
+_engram_lookup_op: Any = None
+
+
+def _get_engram_lookup_op() -> Any:
+    """Resolve the in-repo CPU lookup op; raise when it is not registered.
+
+    The op is compiled into the xLLM binary from
+    ``core/kernels/npu/xllm_ops/engram_int8_lookup_cpu.cpp`` and registered under
+    ``torch.ops.xllm_ops`` on the CPU device key. It is the one and only
+    dequantizer for the host-offloaded table, so a missing registration is a
+    loud failure (rebuild/reinstall the xLLM binary) rather than a silent
+    fallback to an eager host path.
+    """
+    global _engram_lookup_op
+    if _engram_lookup_op is not None:
+        return _engram_lookup_op
+    try:
+        op = torch.ops.xllm_ops.engram_int8_lookup_cpu
+    except (AttributeError, RuntimeError) as exc:
+        raise RuntimeError(
+            "engram host offload requires the in-repo CPU int8 lookup op "
+            "torch.ops.xllm_ops.engram_int8_lookup_cpu, which is not registered; "
+            "rebuild/reinstall xLLM with core/kernels/npu/xllm_ops/"
+            "engram_int8_lookup_cpu.cpp compiled in (the fused op is the only "
+            "offload dequant path)"
+        ) from exc
+    _engram_lookup_op = op
+    return op
+
+
+_engram_lookup_op_active_logged = False
+
+
+def _log_engram_lookup_op_active() -> None:
+    """One-shot info when the CPU lookup op path first engages."""
+    global _engram_lookup_op_active_logged
+    if _engram_lookup_op_active_logged:
+        return
+    _engram_lookup_op_active_logged = True
+    try:
+        from scripts.logger import logger
+
+        logger.info("engram CPU int8 lookup op active (fused offload dequant)")
+    except Exception:  # noqa: BLE001 - logging must never block the lookup
+        pass
+
 
 def load_quarot_gate_unrotate(model_path: str, device: torch.device) -> torch.Tensor | None:
     """The QuaRot global rotation transpose used to un-rotate the gate input.
@@ -708,10 +889,11 @@ class EngramEmbedding(nn.Module):
 
     Rows stay quantized in memory and are dequantized to bf16 on lookup (a
     3.8e8-row table must not be materialized in bf16). TP ranks own
-    contiguous head-bucket row ranges. World sizes that do not divide the
-    hash-column count (or exceed it) are supported: short head slices are
-    padded and ranks owning no heads contribute all-zero blocks, so the
-    all-gather still reassembles every real column.
+    contiguous head-bucket row ranges. ``tp_size`` must divide the hash-column
+    count so every rank owns the same number of complete heads
+    (``n_hash_cols // tp_size``); a non-dividing shard raises at construction
+    instead of being padded, so the all-gather always reassembles exactly the
+    real columns.
 
     ``storage`` selects the on-device layout: ``fp8`` (official FP8 release:
     FP8-E4M3 payload bytes + ue8m0 scale bytes) or ``int8`` (Eco-Tech W8A8
@@ -728,6 +910,10 @@ class EngramEmbedding(nn.Module):
         quant_block: int = 32,
         storage: str = ENGRAM_STORAGE_FP8,
         device: torch.device | None = None,
+        offload: bool = False,
+        layer_id: int = -1,
+        dp_shared_memory: bool = False,
+        dp_group: Any = None,
     ) -> None:
         super().__init__()
         if not head_sizes or any(size <= 0 for size in head_sizes):
@@ -741,29 +927,131 @@ class EngramEmbedding(nn.Module):
         self.quant_block = int(quant_block)
         self.storage = storage
         self.n_hash_cols = len(head_sizes)
-        self.part_n_hash_cols = (self.n_hash_cols + tp_size - 1) // tp_size
+        if self.n_hash_cols % tp_size != 0:
+            # Uniform TP head shards are a hard requirement: each rank's block
+            # width is n_hash_cols // tp_size, and a short last shard would need
+            # padding the (now strict) gather no longer reassembles. Name the
+            # supported TP sizes that actually divide the head count.
+            supported = sorted(size for size in (1, 2, 4, 8) if self.n_hash_cols % size == 0)
+            raise ValueError(
+                "Engram requires uniform TP head shards: "
+                f"n_hash_cols={self.n_hash_cols} is not divisible by tp_size={tp_size}. "
+                f"Use TP from {supported}. dp_shared_memory does not relax this requirement."
+            )
+        self.part_n_hash_cols = self.n_hash_cols // tp_size
         self.head_start = tp_rank * self.part_n_hash_cols
-        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
+        head_end = self.head_start + self.part_n_hash_cols
         self.vocab_start = sum(head_sizes[: self.head_start])
         self.vocab_end = sum(head_sizes[:head_end])
         self.part_num_embeddings = self.vocab_end - self.vocab_start
         self.tp_size = int(tp_size)
+        self.tp_rank = int(tp_rank)
+        # Model layer id, used to name the layer in the staging-capacity
+        # error; -1 when the caller does not supply one.
+        self.layer_id = int(layer_id)
+        self.setup_device = torch.device(device) if device is not None else torch.device("cpu")
+        # Host offload is int8-only (the fp8 path keeps raw byte tables and has
+        # no CPU decoder); anything else falls back to the HBM path with a
+        # warning rather than silently skipping engram.
+        self.offload = bool(offload) and storage == ENGRAM_STORAGE_INT8
+        if offload and not self.offload:
+            self._warn_offload_unsupported(storage)
+        # Direct-construction mirror of the ``EngramConfig`` invariant: a shared
+        # host table without the host-offload path has nothing to share --
+        # ``self.offload`` would silently AND the request away below -- so reject
+        # it here with the same message the config layer uses instead of dropping
+        # it.
+        if dp_shared_memory and not offload:
+            raise ValueError("engram_config.dp_shared_memory=true requires engram_config.cpu_offload=true")
+        # DP-shared host tables are only meaningful on the int8 (W8A8) path: the
+        # fp8/bf16 tables have no CPU decoder to share. Reject the request
+        # outright instead of inheriting the HBM fallback the offload warning
+        # above uses.
+        if dp_shared_memory and storage != ENGRAM_STORAGE_INT8:
+            raise ValueError(
+                "engram_config.dp_shared_memory=true requires the int8 (W8A8) table "
+                f"storage (the only CPU-shareable format), got storage={storage!r}"
+            )
+        self.dp_shared_memory = bool(dp_shared_memory) and self.offload
+        if self.dp_shared_memory and dp_group is None:
+            raise ValueError("engram_config.dp_shared_memory=true requires an initialized node-local DP group")
+        self._dp_group = dp_group
+        self._shared_storage: SharedHostEngramStorage | None = None
+        # Fail fast at construction: the fused CPU int8 lookup op (the only host
+        # dequant path) hard-codes a group size of 32, so an offloaded table with
+        # any other quant_block can never be served. Without this the mismatch
+        # only surfaced at the first lookup (``_engram_lookup_op_contract_error``)
+        # -- after the whole ~27.7GB/rank host table had been loaded. The
+        # runtime contract check stays as defence in depth.
+        if self.offload and self.quant_block != 32:
+            raise ValueError(
+                "engram host offload requires quant_block=32 (the fused CPU int8 "
+                f"lookup op's fixed group size), got {self.quant_block}; set "
+                "engram_config.cpu_offload=false to use the HBM table path"
+            )
+        table_device: torch.device | str | None = device
+        if self.offload:
+            table_device = "cpu"
+            self._ids_host: torch.Tensor | None = None
+            self._owned_host: torch.Tensor | None = None
+            self._rows_host: torch.Tensor | None = None
+            self._host_capacity = 0
+            # Allocation-time pin records for the staging operands (see
+            # ``_host_buffer``): the op contract reads these instead of
+            # re-probing ``Tensor.is_pinned()`` later.
+            self._ids_host_pinned = False
+            self._rows_host_pinned = False
+            # This instance's most recent pinned-allocation failure cause, if any
+            # (``_pin_failure_hint`` explains an unpinned operand with it).
+            self._host_pin_failure: str | None = None
+            # Two device staging blocks. The graph-visible one is baked into a
+            # captured ACL graph and must never move (``_ensure_graph_staging``
+            # fails loudly instead); the eager one serves prefill / non-graph
+            # decode and may grow freely.
+            self._graph_staged_device: torch.Tensor | None = None
+            self._graph_capacity = 0
+            # Runner-supplied floor for the graph-visible block, set before the
+            # first capture to the largest decode token bucket (see
+            # ``set_graph_capacity_hint``); 0 means "size from the first pass".
+            self._graph_capacity_hint = 0
+            self._eager_staged_device: torch.Tensor | None = None
+            self._eager_capacity = 0
         if storage == ENGRAM_STORAGE_INT8:
             # Symmetric int8 payloads with one float32 scale per 32 columns
-            # (Eco-Tech W8A8 embedding_storage format int8_sym).
-            self.weight = nn.Parameter(
-                torch.empty(self.part_num_embeddings, self.dim, dtype=torch.int8, device=device),
-                requires_grad=False,
-            )
-            self.weight_scale = nn.Parameter(
-                torch.empty(
-                    self.part_num_embeddings,
-                    self.dim // self.quant_block,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                requires_grad=False,
-            )
+            # (Eco-Tech W8A8 embedding_storage format int8_sym). Offloaded
+            # tables stay in *pageable* CPU host memory and never reach the
+            # device; only the staging/scratch buffers handed out by
+            # ``_host_buffer`` are pinned (they are the op's operands and the
+            # source of the non-blocking H2D copy).
+            if self.dp_shared_memory:
+                # One physical host table per node-local DP shard group: the
+                # frombuffer views become the parameters, so every reader in the
+                # group gathers from the same pages.
+                assert self._dp_group is not None
+                self._shared_storage = SharedHostEngramStorage(
+                    layer_id=self.layer_id,
+                    rows=self.part_num_embeddings,
+                    dim=self.dim,
+                    quant_block=self.quant_block,
+                    group=self._dp_group,
+                )
+                self._shared_storage.create_or_attach()
+                self.weight = nn.Parameter(self._shared_storage.codes, requires_grad=False)
+                self.weight_scale = nn.Parameter(self._shared_storage.scales, requires_grad=False)
+            else:
+                self.weight = nn.Parameter(
+                    torch.empty(self.part_num_embeddings, self.dim, dtype=torch.int8, device=table_device),
+                    requires_grad=False,
+                )
+                self.weight_scale = nn.Parameter(
+                    torch.empty(
+                        self.part_num_embeddings,
+                        self.dim // self.quant_block,
+                        dtype=torch.float32,
+                        device=table_device,
+                    ),
+                    requires_grad=False,
+                )
         else:
             # FP8-E4M3 payloads and ue8m0 scales are kept as raw uint8 bytes:
             # index_select stays on a universally supported dtype and the
@@ -782,41 +1070,50 @@ class EngramEmbedding(nn.Module):
                 requires_grad=False,
             )
 
-    def _local_block(self, indices: torch.Tensor) -> torch.Tensor:
-        """This rank's ``[T, part_n_hash_cols, dim]`` block of the lookup.
+    @staticmethod
+    def _warn_offload_unsupported(storage: str) -> None:
+        try:
+            from scripts.logger import logger
+
+            logger.warning(
+                "engram_config.cpu_offload=true ignored for engram storage %r; only the "
+                "int8 (W8A8) tables have a host decoder, falling back to the HBM path",
+                storage,
+            )
+        except Exception:  # pragma: no cover - logging must never block loading
+            pass
+
+    def _owned_local_cols(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """This rank's ``owned`` mask and clamped ``local`` rows for ``indices``.
+
+        ``indices`` holds integer hash ids (an int32/int64 tensor), never floats
+        or a Python list -- the int64 cast below is only to feed
+        ``index_select`` and to keep the subtraction/clamp in one dtype. Slices
+        out this rank's ``part_n_hash_cols`` head columns, marks which hash ids
+        fall inside this rank's row range (``owned``) and clamps the rest into a
+        valid local row (``local``) so the caller can zero the columns it does
+        not own. Shared by the device path and the host-offload staging path so
+        the TP sharding rule lives in exactly one place.
+        """
+        local_cols = indices[:, self.head_start : self.head_start + self.part_n_hash_cols].to(torch.int64)
+        owned = (local_cols >= self.vocab_start) & (local_cols < self.vocab_end)
+        local = (local_cols - self.vocab_start).clamp(0, self.part_num_embeddings - 1)
+        return owned, local
+
+    def _local_block_device(self, indices: torch.Tensor) -> torch.Tensor:
+        """This rank's block from the device-resident quantized table.
 
         Real head columns are dequantized from the quantized table; columns
-        this rank does not own (hash ids outside its row range, slice padding
-        when ``tp_size`` does not divide ``n_hash_cols``, or a rank entirely
-        past the last head) contribute zeros.
+        this rank does not own (hash ids outside its row range) contribute
+        zeros.
         """
         # Deferred: deepseek_v41 imports this module at load time, so the
         # inlined quant decoders are resolved on first use instead.
         from xllm.python.models.deepseek_v41 import _e4m3_to_float, ue8m0_to_scale
 
         num_tokens = indices.shape[0]
-        if self.part_num_embeddings == 0:
-            # tp_size > n_hash_cols: this rank's head slice starts past the
-            # last head, so it owns no table rows; the empty table cannot
-            # serve index_select at all -- contribute an all-zero block.
-            return torch.zeros(
-                num_tokens,
-                self.part_n_hash_cols,
-                self.dim,
-                dtype=torch.bfloat16,
-                device=indices.device,
-            )
-        local_cols = indices[:, self.head_start : self.head_start + self.part_n_hash_cols]
-        if local_cols.size(1) < self.part_n_hash_cols:
-            # tp_size does not divide n_hash_cols: the last head-owning
-            # rank's slice runs short of the uniform block width. Pad with
-            # column 0 (id 0 predates every non-first rank's row range, so
-            # the padding is never owned and is zeroed below) to keep the
-            # gathered blocks shape-uniform.
-            local_cols = F.pad(local_cols, (0, self.part_n_hash_cols - local_cols.size(1)))
-        owned = (local_cols >= self.vocab_start) & (local_cols < self.vocab_end)
-        local = (local_cols - self.vocab_start).clamp(0, self.part_num_embeddings - 1)
-        flat = local.reshape(-1).to(torch.int64)
+        owned, local = self._owned_local_cols(indices)
+        flat = local.reshape(-1)
         payload = self.weight.index_select(0, flat)
         scale = self.weight_scale.index_select(0, flat)
         if self.storage == ENGRAM_STORAGE_INT8:
@@ -829,22 +1126,463 @@ class EngramEmbedding(nn.Module):
         rows = rows.view(num_tokens, self.part_n_hash_cols, self.dim)
         return torch.where(owned.unsqueeze(-1), rows, torch.zeros_like(rows))
 
-    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
-        """``[T, n_hash_cols]`` global row ids -> ``[T, n_hash_cols, dim]`` bf16.
+    # -- host offload -------------------------------------------------------
+
+    def _ensure_host_buffers(self, num_tokens: int, *, graph_visible: bool = False) -> None:
+        """Ensure the host scratch and the staging block for this pass.
+
+        The pinned host scratch (id/owned/rows) is shared and only ever grown.
+        The device staging block is chosen by ``graph_visible``:
+
+        * ``True`` -- the runner's pre-graph pass and the graph warmup/capture
+          forwards. This block is the address an ACL graph bakes in at capture,
+          so it is allocated once and never reallocated.
+        * ``False`` -- eager prefill / non-graph decode, served by a separate
+          block that may grow without disturbing a captured graph.
+        """
+        self._ensure_host_scratch(num_tokens)
+        if graph_visible:
+            self._ensure_graph_staging(num_tokens)
+        else:
+            self._ensure_eager_staging(num_tokens)
+
+    def _ensure_host_scratch(self, num_tokens: int) -> None:
+        """Grow the pinned host scratch (id/owned/rows); never read in-graph."""
+        width = self.part_n_hash_cols
+        if self._ids_host is not None and self._host_capacity >= num_tokens:
+            return
+        # A first allocation (``_ids_host is None``) has no old buffer to drop,
+        # so no copy can still be in flight and the drain is skipped. When the
+        # scratch grows, dropping the old pinned buffers below would free memory
+        # an in-flight H2D copy may still be reading (the copy at the end of the
+        # previous ``_local_block_offload`` is non-blocking), so drain the
+        # accelerator queue first and never recycle a buffer still in use.
+        if self._ids_host is not None:
+            _sync_accelerator(self.setup_device)
+        capacity = max(self._host_capacity, _ENGRAM_HOST_MIN_CAPACITY)
+        while capacity < num_tokens:
+            capacity *= 2
+        self._host_capacity = capacity
+        self._ids_host, self._ids_host_pinned, ids_failure = _host_buffer((capacity, width), torch.int64)
+        self._owned_host, _, owned_failure = _host_buffer((capacity, width), torch.bool)
+        self._rows_host, self._rows_host_pinned, rows_failure = _host_buffer(
+            (capacity, width, self.dim), torch.bfloat16
+        )
+        # Per-instance cause for this (re)allocation episode: a module-global
+        # diagnosis would be overwritten by a sibling layer's allocation and
+        # misreported by ``_pin_failure_hint``. All three buffers target this
+        # host, so the first failure explains every unpinned sibling.
+        self._host_pin_failure = ids_failure or owned_failure or rows_failure
+
+    def set_graph_capacity_hint(self, max_tokens: int) -> None:
+        """Pre-size the graph-visible staging block to the largest bucket.
+
+        ACL-graph capture bakes this block's address, so it is allocated once
+        and never grown. Lazy capture otherwise fixes the size at the FIRST
+        captured bucket, which is normally the smallest (buckets warm up in
+        ascending order), so any later, larger decode bucket would overflow and
+        raise. The runner passes its largest decode token bucket here before
+        the first capture, so the first allocation already covers every bucket.
+        Only ever raises the floor, and is ignored once the block exists.
+        """
+        self._graph_capacity_hint = max(self._graph_capacity_hint, int(max_tokens))
+
+    def _ensure_graph_staging(self, num_tokens: int) -> None:
+        """Allocate the graph-visible staging block exactly once.
+
+        ACL-graph replay reads this exact address every step, so growth is not
+        allowed: a pass that needs more rows than the captured capacity fails
+        loudly instead of silently handing the graph a freed/reused address.
+        The first allocation is sized to ``_graph_capacity_hint`` (the runner's
+        largest decode bucket) so a later bucket never trips the guard.
+        """
+        if self._graph_staged_device is not None:
+            if num_tokens > self._graph_capacity:
+                raise RuntimeError(
+                    "engram graph-visible staging capacity exceeded: "
+                    f"layer={self.layer_id} rank={self.tp_rank} needs {num_tokens} rows "
+                    f"but the block was captured at capacity {self._graph_capacity}. "
+                    "An ACL graph baked in the staging address during capture; growing "
+                    "it would make every replay read freed memory, so this is refused "
+                    "rather than silently corrupting the output. The runner pre-sizes this "
+                    "block to its largest decode bucket via configure_engram_graph_capacity; "
+                    "an overflow means a bucket exceeded that bound."
+                )
+            return
+        capacity = max(num_tokens, self._graph_capacity_hint, _ENGRAM_HOST_MIN_CAPACITY)
+        self._graph_capacity = capacity
+        self._graph_staged_device = self._alloc_staging(capacity)
+
+    def _ensure_eager_staging(self, num_tokens: int) -> None:
+        """Grow the eager staging block; never referenced by a captured graph."""
+        if self._eager_staged_device is not None and self._eager_capacity >= num_tokens:
+            return
+        capacity = max(self._eager_capacity, _ENGRAM_HOST_MIN_CAPACITY)
+        while capacity < num_tokens:
+            capacity *= 2
+        self._eager_capacity = capacity
+        self._eager_staged_device = self._alloc_staging(capacity)
+
+    def _alloc_staging(self, capacity: int) -> torch.Tensor:
+        """A bf16 ``[capacity, part_n_hash_cols, dim]`` accelerator staging block."""
+        return torch.empty(
+            (capacity, self.part_n_hash_cols, self.dim),
+            dtype=torch.bfloat16,
+            device=self.setup_device,
+        )
+
+    def _engram_lookup_op_contract_error(
+        self,
+        ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> str:
+        """Why the CPU int8 lookup op cannot run; ``""`` when the contract holds.
+
+        The fused op is the only dequant path for the host-offloaded table, so
+        every violation here is a hard error (the caller raises loudly). Checks
+        the host-offloaded int8 table and the exact
+        dtype/shape/pinning/contiguity contract of the op's four operands. The
+        offloaded table is pageable host memory by design (the loader copies it
+        straight from the mmap, see
+        ``DeepseekV41ForCausalLM._load_engram_ascend``), so pinning is required
+        only for the ``_host_buffer`` staging operands.
+        """
+        if not self.offload:
+            return "table is not host-offloaded"
+        if self.quant_block != 32:
+            return f"quant_block={self.quant_block} != 32"
+        if self._shared_storage is not None and not self._shared_storage.is_loaded:
+            # The shared table is filled by the leader-only load; reading it
+            # before that would gather the zero-initialized segment. The load
+            # runs before any capture/replay, so this only fires on a wiring
+            # bug (a lookup before load_weights).
+            return f"shared host table is {self._shared_storage.state}, not loaded"
+        weight, scale = self.weight, self.weight_scale
+        if weight.dtype != torch.int8 or weight.dim() != 2 or weight.size(1) != self.dim:
+            return f"weight is {weight.dtype} {tuple(weight.shape)}"
+        if weight.device.type != "cpu" or not weight.is_contiguous():
+            return f"weight is on {weight.device.type} contiguous={weight.is_contiguous()}"
+        if scale.dtype != torch.float32 or scale.dim() != 2 or scale.size(0) != weight.size(0):
+            return f"scale is {scale.dtype} {tuple(scale.shape)}"
+        if scale.size(1) != self.dim // 32:
+            return f"scale has {scale.size(1)} groups, expected {self.dim // 32}"
+        if scale.device.type != "cpu" or not scale.is_contiguous():
+            return f"scale is on {scale.device.type} contiguous={scale.is_contiguous()}"
+        if ids.dtype != torch.int64 or ids.dim() != 1 or ids.numel() != output.size(0):
+            return f"ids is {ids.dtype} {tuple(ids.shape)} for output {tuple(output.shape)}"
+        if (
+            ids.device.type != "cpu"
+            or not ids.is_contiguous()
+            or not self._staging_operand_pinned(ids, self._ids_host, self._ids_host_pinned)
+        ):
+            return (
+                f"ids is on {ids.device.type} contiguous={ids.is_contiguous()} "
+                f"pinned={self._ids_host_pinned}{self._pin_failure_hint(self._ids_host_pinned)}"
+            )
+        if output.dtype != torch.bfloat16 or output.dim() != 2 or output.size(1) != self.dim:
+            return f"output is {output.dtype} {tuple(output.shape)}"
+        if (
+            output.device.type != "cpu"
+            or not output.is_contiguous()
+            or not self._staging_operand_pinned(output, self._rows_host, self._rows_host_pinned)
+        ):
+            return (
+                f"output is on {output.device.type} contiguous={output.is_contiguous()} "
+                f"pinned={self._rows_host_pinned}{self._pin_failure_hint(self._rows_host_pinned)}"
+            )
+        return ""
+
+    @staticmethod
+    def _staging_operand_pinned(
+        operand: torch.Tensor,
+        staging: torch.Tensor | None,
+        pinned: bool,
+    ) -> bool:
+        """Whether ``operand`` is a view of the recorded pinned staging buffer.
+
+        Compared by underlying storage, not by ``data_ptr()``: the op's operands
+        are views of the ``_host_buffer`` staging blocks, and a storage-pointer
+        compare accepts any contiguous view/slice of the same staging block -- a
+        non-zero-offset slice has a different ``data_ptr()`` than the block head,
+        so a plain pointer compare would reject a legitimate staging slice. Still
+        rejects a foreign (pageable or otherwise unrecorded) tensor, whose
+        storage pointer differs. Together with the allocation-time ``pinned``
+        record this replaces the ``Tensor.is_pinned()`` re-probe, whose result
+        can be wrong on hosts/PyTorch versions without a registered accelerator.
+        """
+        return (
+            pinned
+            and staging is not None
+            and operand.untyped_storage().data_ptr() == staging.untyped_storage().data_ptr()
+        )
+
+    def _pin_failure_hint(self, pinned: bool) -> str:
+        """Explain an unpinned staging operand by its real cause, when known.
+
+        ``_host_buffer`` records the ``pin_memory`` failure it swallowed on this
+        embedding (``self._host_pin_failure``); without that the caller only sees
+        a bare ``pinned=False`` and may misread it as a code defect rather than a
+        host that cannot pin host memory at all.
+        """
+        if pinned or self._host_pin_failure is None:
+            return ""
+        return (
+            f" (this host cannot allocate pinned CPU memory: {self._host_pin_failure}; "
+            "the offloaded table needs pinned staging, so set "
+            "engram_config.cpu_offload=false)"
+        )
+
+    def stage_ids_offload(self, indices: torch.Tensor, *, graph_visible: bool = False) -> None:
+        """Queue this rank's async device->host id/owned copies; no drain here.
+
+        The copies are queued on the ambient accelerator stream with
+        ``non_blocking=True`` (valid because the destinations are pinned host
+        buffers), so neither copy stalls the host; the caller drains the device
+        once (:func:`stage_offload_rows` runs :func:`_sync_accelerator`) before
+        the CPU gather reads them. No host-side work runs here either -- only the
+        queued copies.
+
+        The first half of the offload gather (see :meth:`_local_block_offload`),
+        split out so a batch of layers can queue every layer's D2H before a
+        single device drain (:func:`stage_offload_rows`). Only the
+        ``Tensor.copy_`` calls that queue accelerator->host work run here; the
+        CPU gather and the pinned->device upload are deferred to
+        :meth:`finish_stage_offload`, which must run after exactly one
+        :func:`_sync_accelerator` drain.
+        """
+        num_tokens = indices.shape[0]
+        self._ensure_host_buffers(num_tokens, graph_visible=graph_visible)
+        assert self._ids_host is not None
+        assert self._owned_host is not None
+
+        owned, local = self._owned_local_cols(indices)
+
+        # Device -> pinned host: one batched copy per tensor, queued here on the
+        # current accelerator stream with ``non_blocking=True`` so neither copy
+        # stalls the host. ``_ids_host``/``_owned_host`` are pinned host buffers
+        # (``_host_buffer``), which is what makes the async D2H valid. Both are
+        # part of the same batch, so both must be non-blocking -- making only one
+        # of them synchronous would still block on every layer. The caller drains
+        # the device once after every layer has queued its copies (see
+        # :func:`stage_offload_rows`, which runs :func:`_sync_accelerator`), then
+        # the CPU gather reads them; the sync point and its count are unchanged.
+        self._ids_host[:num_tokens].copy_(local, non_blocking=True)
+        self._owned_host[:num_tokens].copy_(owned, non_blocking=True)
+
+    def finish_stage_offload(self, num_tokens: int, *, graph_visible: bool = False) -> torch.Tensor:
+        """CPU gather + pinned->device upload for a staged pass (second half).
+
+        The second half of :meth:`_local_block_offload`; must run after
+        :meth:`stage_ids_offload` staged the same ``num_tokens`` and after
+        exactly one :func:`_sync_accelerator` drain, so every queued D2H is
+        visible to the CPU gather below. ``graph_visible`` selects the same
+        destination staging block :meth:`stage_ids_offload` ensured. Returns the
+        selected staging slice.
+        """
+        assert self._ids_host is not None
+        assert self._owned_host is not None
+        assert self._rows_host is not None
+        staging = self._graph_staged_device if graph_visible else self._eager_staged_device
+        assert staging is not None
+
+        flat = self._ids_host[:num_tokens].reshape(-1).to(torch.int64)
+        # Row-index correspondence for the reset mask below. ``_ids_host`` and
+        # ``_owned_host`` are freshly allocated C-contiguous tensors, so the k-th
+        # flat element maps to ``(token, col) = (k // width, k % width)`` (C
+        # order). ``rows_out = self._rows_host[:num_tokens].view(-1, self.dim)``
+        # has its k-th row produced from ``flat[k]``, and
+        # ``self._owned_host[:num_tokens].reshape(-1, 1)`` flattens ``owned`` in
+        # the same C order, so column k's mask lines up with ``owned[token, col]``
+        # and broadcasts over that row's ``dim`` features.
+        rows_out = self._rows_host[:num_tokens].view(-1, self.dim)
+        reason = self._engram_lookup_op_contract_error(flat, rows_out)
+        if reason:
+            raise RuntimeError(
+                f"engram host offload cannot run the CPU int8 lookup op ({reason}); "
+                "the fused op is the only dequant path for the offloaded table"
+            )
+        # The op dequantizes straight into the pinned staging buffer. It does
+        # not take the ownership mask, so this rank's unowned columns are zeroed
+        # in place, matching the device path's ``torch.where``. Kept here (not
+        # fused into the op, whose contract has no mask operand, nor moved to the
+        # device): it is in-place on the CPU staging buffer already resident at
+        # this point, adds no device round-trip, and costs the same order as the
+        # gather -- not shown to be a hot spot, so an op-contract change is not
+        # warranted before a measured gain.
+        _get_engram_lookup_op()(self.weight, self.weight_scale, flat, rows_out)
+        rows_out.masked_fill_(~self._owned_host[:num_tokens].reshape(-1, 1), 0.0)
+        _log_engram_lookup_op_active()
+
+        # Pinned host -> the selected device staging block.
+        staging[:num_tokens].copy_(self._rows_host[:num_tokens], non_blocking=True)
+        return staging[:num_tokens]
+
+    def _local_block_offload(self, indices: torch.Tensor, *, graph_visible: bool = False) -> torch.Tensor:
+        """Gather + dequantize this rank's block from the host-resident table.
+
+        One NPU->CPU id copy (followed by a single device sync) and one
+        pinned->NPU staged copy per call. The table itself is pageable host
+        memory; only the ``_host_buffer`` staging operands are pinned. The CPU
+        dequant always runs the fused in-repo ``xllm_ops.engram_int8_lookup_cpu``
+        kernel, which writes the bf16 rows straight into the pinned staging
+        buffer and stays bitwise equal to the device path; there is no eager
+        host fallback.
+
+        ``graph_visible`` selects the destination staging block: the persistent
+        graph-visible one (see :meth:`_ensure_graph_staging`) or the growable
+        eager one.
+
+        The single-layer entry point: the two halves
+        (:meth:`stage_ids_offload` + :meth:`finish_stage_offload`) are split so a
+        batch of layers can share one device drain (:func:`stage_offload_rows`);
+        called together here, they are the original one-copy/one-sync/one-upload
+        sequence.
+        """
+        self.stage_ids_offload(indices, graph_visible=graph_visible)
+        _sync_accelerator(self.setup_device)
+        return self.finish_stage_offload(indices.shape[0], graph_visible=graph_visible)
+
+    def fallback_to_device(self) -> bool:
+        """Move an offloaded table onto the accelerator (HBM fallback).
+
+        Used when the host path cannot be set up, the host-table load fails or
+        the pinned staging cannot be set up; engram stays enabled on the device
+        path instead of being silently skipped. Returns True when a fallback
+        happened.
+
+        Contract: this may only run *before* ACL-graph capture. Once a
+        graph-visible staging block exists its address is baked into the
+        captured graph (see :meth:`_ensure_graph_staging`), so dropping the host
+        path here would leave every replay reading a freed/reused address. The
+        guard below therefore fail-fasts (raises ``RuntimeError``) rather than
+        silently corrupting; it is a safety check, not an unreachable no-op.
+
+        The two load-time call sites (the loading-time ``_load_engram_ascend``
+        fallback and the post-load ``_reconcile_engram_offload_active``
+        demotion) run before any capture during the initial load, but they are
+        not the only path. The in-place level-2 reload (``update_weights`` ->
+        ``WorkerImpl::load_model``) re-enters the weight load after capture, so
+        this guard *is* reachable post-capture and must fail-fast there rather
+        than be read as "cannot happen".
+
+        The two-phase commit below only makes the two accelerator copies atomic
+        for this embedding; the surrounding reload / row-copy sequence is not
+        transactional, so a post-capture reload still needs its own quiesce
+        verification (stop replays / drain the device before reloading). This
+        helper makes no safety promise about the reload as a whole.
+
+        Calling convention: load-time only, single-threaded. The
+        ``_graph_capacity`` guard below is a pre-capture check, not a lock, so
+        the caller must not race it from another thread or overlap it with an
+        in-flight capture.
+        """
+        if not self.offload:
+            return False
+        if self._shared_storage is not None:
+            # A DP-shared table is one physical copy per node-local group; a
+            # local per-rank demotion would copy only this rank's alias onto the
+            # device and silently diverge from its peers (which keep reading the
+            # shared segment). The shared load is fail-fast instead, so no
+            # per-layer fallback is ever needed here.
+            raise RuntimeError(
+                "engram fallback_to_device() is not supported for a DP-shared host table: "
+                f"layer={self.layer_id} rank={self.tp_rank} shares its table with its "
+                "node-local DP group, and a per-rank HBM demotion would desynchronize the "
+                "group. engram_config.dp_shared_memory requires the shared host load to succeed"
+            )
+        if self._graph_capacity > 0 or self._graph_staged_device is not None:
+            raise RuntimeError(
+                "engram fallback_to_device() must run before ACL-graph capture: "
+                f"layer={self.layer_id} rank={self.tp_rank} already allocated a "
+                f"graph-visible staging block (capacity={self._graph_capacity}). A "
+                "captured graph has baked that address, so demoting the table to HBM "
+                "here would make every replay read freed memory. Reconcile the "
+                "offload decision before the first capture instead."
+            )
+        # Two-phase commit: run both accelerator copies into locals and mutate
+        # nothing until both have succeeded. A per-parameter commit
+        # (``self.weight.data = ...`` then ``self.weight_scale.data = ...``)
+        # would leave ``weight`` on the device and ``weight_scale`` still on the
+        # host if the second ``.to()`` raised (e.g. device OOM), handing the
+        # caller a half-demoted embedding. With the locals, a raise on either
+        # copy drops the fresh tensor and leaves both parameter storages,
+        # ``offload`` and the host scratch/staging state exactly as they were.
+        # Scope: atomic for these two parameters and this embedding's flags
+        # only; the surrounding reload / row-copy sequence is not covered (see
+        # ``DeepseekV41ForCausalLM._load_engram_ascend_private``).
+        device_weight = self.weight.data.to(self.setup_device)
+        device_weight_scale = self.weight_scale.data.to(self.setup_device)
+        self.weight.data = device_weight
+        self.weight_scale.data = device_weight_scale
+        self.offload = False
+        self._ids_host = None
+        self._owned_host = None
+        self._rows_host = None
+        self._host_capacity = 0
+        self._ids_host_pinned = False
+        self._rows_host_pinned = False
+        self._graph_staged_device = None
+        self._graph_capacity = 0
+        self._eager_staged_device = None
+        self._eager_capacity = 0
+        return True
+
+    def close_host_offload(self) -> None:
+        """Release a DP-shared host table on shutdown / reload.
+
+        Order matters: the ``weight`` / ``weight_scale`` parameters alias the
+        shared mappings, so they are dropped FIRST (no reader follows a freed
+        segment), then the storage closes its handles. A failed close keeps
+        ``_shared_storage`` set so the call is retryable and never leaves a live
+        parameter pointing at unmapped memory. No-op for the private path.
+        """
+        storage = self._shared_storage
+        if storage is None:
+            return
+        self.weight = nn.Parameter(torch.empty(0, dtype=torch.int8, device="cpu"), requires_grad=False)
+        self.weight_scale = nn.Parameter(torch.empty(0, dtype=torch.float32, device="cpu"), requires_grad=False)
+        # A raising ``close`` skips the assignment below, so ``_shared_storage``
+        # stays set and the call is retryable; the parameters are already
+        # detached, so nothing dangles.
+        storage.close()
+        self._shared_storage = None
+
+    def local_block(self, indices: torch.Tensor, *, graph_visible: bool = False) -> torch.Tensor:
+        """This rank's ``[T, part_n_hash_cols, dim]`` rows for ``indices``.
+
+        Device lookup or (offload) pageable-host gather through the pinned
+        staging buffers, per :attr:`offload`.
+        Kept separate from :meth:`gather_heads` so an offloaded graph only
+        stages this rank's block on the host while the TP all-gather stays
+        inside the captured graph (a per-step host collective would desync
+        ranks and change the graph's fixed collective order).
+
+        ``graph_visible`` routes an offload gather into the persistent
+        graph-visible staging block instead of the growable eager one.
+        """
+        if self.offload:
+            return self._local_block_offload(indices, graph_visible=graph_visible)
+        return self._local_block_device(indices)
+
+    def gather_heads(self, local: torch.Tensor) -> torch.Tensor:
+        """Reassemble the full ``[T, n_hash_cols, dim]`` head set from a local block.
 
         Only this rank's head columns are read; foreign rows contribute zeros
-        and the TP all-gather reassembles the full head set. Short or empty
-        head slices (``tp_size`` not dividing ``n_hash_cols``) contribute
-        zero columns; the post-gather trim restores exactly the
-        ``n_hash_cols`` real columns.
+        and the TP all-gather reassembles the full head set. Each rank owns
+        exactly ``n_hash_cols // tp_size`` complete heads (enforced at
+        construction), so the gathered width is exactly ``n_hash_cols`` -- no
+        padding, no post-gather trim.
         """
-        rows = self._local_block(indices)
+        rows = local
         if self.tp_size > 1:
             from xllm.python import distributed as _distributed
 
-            gathered = _distributed.tp_all_gather(rows, dim=1, world_size=self.tp_size)
-            rows = gathered[:, : self.n_hash_cols]
+            rows = _distributed.tp_all_gather(rows, dim=1, world_size=self.tp_size)
         return rows
+
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """``[T, n_hash_cols]`` global row ids -> ``[T, n_hash_cols, dim]`` bf16."""
+        return self.gather_heads(self.local_block(indices))
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1613,9 @@ class Engram(nn.Module):
         device: torch.device,
         storage: str = ENGRAM_STORAGE_FP8,
         gate_unrotate: torch.Tensor | None = None,
+        offload: bool = False,
+        dp_shared_memory: bool = False,
+        dp_group: Any = None,
     ) -> None:
         super().__init__()
         self.layer_hash_index = layer_hash_index
@@ -889,6 +1630,10 @@ class Engram(nn.Module):
             tp_rank,
             storage=storage,
             device=device,
+            offload=offload,
+            layer_id=layout.layer_ids[layer_hash_index],
+            dp_shared_memory=dp_shared_memory,
+            dp_group=dp_group,
         )
         n_hash_cols = layout.n_hash_cols
         # Replicated (not TP-sharded), matching the reference ReplicatedLinear.
@@ -912,12 +1657,161 @@ class Engram(nn.Module):
         # gate dot uses h_rot @ Q.T. None on unrotated checkpoints.
         self.register_buffer("gate_unrotate", gate_unrotate, persistent=False)
         self._staged_rows: torch.Tensor | None = None
+        # Offload: this rank's host-gathered block, staged by the runner outside
+        # the graph. The TP all-gather stays in-graph (gather_heads below).
+        self._staged_local: torch.Tensor | None = None
+        # Whether ``_staged_local`` currently points into the graph-visible
+        # staging block (as opposed to the growable eager one).
+        self._staged_local_graph = False
+        # Row count of the pass ``begin_stage_offload`` last queued, read back by
+        # ``finish_stage_offload`` (the two halves of the batched host staging).
+        self._staging_num_tokens = 0
 
-    def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        """Gather this layer's rows before the decoder layer loop starts."""
-        self._staged_rows = self.embed_tokens.lookup(hash_ids)
+    @property
+    def offload(self) -> bool:
+        """Whether the table lives in host memory (mirrors the embedding's path)."""
+        return self.embed_tokens.offload
 
-    def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+    def close_host_offload(self) -> None:
+        """Release this layer's DP-shared host table (no-op otherwise)."""
+        self.embed_tokens.close_host_offload()
+
+    def prepare_embeddings(self, hash_ids: torch.Tensor, *, graph_visible: bool = False) -> None:
+        """Gather this layer's rows before the decoder layer loop starts.
+
+        Offload mode stages only this rank's block into a persistent device
+        block (the run happens outside the ACL graph); the default path
+        resolves the fully gathered head set eagerly. ``graph_visible`` must be
+        True for any pass whose result a captured graph reads (the runner's
+        pre-graph staging pass and the graph warmup/capture forwards), so those
+        rows land in the address-stable graph staging block.
+        """
+        if self.offload:
+            self._staged_local = self.embed_tokens.local_block(hash_ids, graph_visible=graph_visible)
+            self._staged_local_graph = graph_visible
+        else:
+            self._staged_rows = self.embed_tokens.lookup(hash_ids)
+
+    def begin_stage_offload(self, hash_ids: torch.Tensor, *, graph_visible: bool = False) -> None:
+        """Queue this layer's host-staging D2H copies (offload mode only).
+
+        First phase of the batched host staging (:func:`stage_offload_rows`):
+        every layer queues its D2H copies before the single device drain, so an
+        N-layer pass costs one synchronize instead of one per layer. Records the
+        staged row count for :meth:`finish_stage_offload`. A no-op for the device
+        path (nothing is staged off the device).
+        """
+        if not self.offload:
+            return
+        self.embed_tokens.stage_ids_offload(hash_ids, graph_visible=graph_visible)
+        self._staging_num_tokens = hash_ids.shape[0]
+
+    def finish_stage_offload(self, *, graph_visible: bool = False) -> None:
+        """Run the CPU gather + H2D upload and publish the staged block (offload only).
+
+        Second phase of :func:`stage_offload_rows`; must run after the single
+        device drain that followed :meth:`begin_stage_offload`. A no-op for the
+        device path.
+        """
+        if not self.offload:
+            return
+        self._staged_local = self.embed_tokens.finish_stage_offload(
+            self._staging_num_tokens,
+            graph_visible=graph_visible,
+        )
+        self._staged_local_graph = graph_visible
+
+    def _reject_stale_row_count(self, staged: torch.Tensor, num_tokens: int | None) -> None:
+        """Reject a staging block whose row count does not match this step.
+
+        The graph-replay path (``hash_ids=None``) does not re-run Python, so a
+        staging block sized for a different batch would make the captured graph
+        read the wrong rows.
+        """
+        if num_tokens is not None and staged.shape[0] != num_tokens:
+            raise RuntimeError(
+                "engram mixed-mode staging row mismatch: staged "
+                f"{staged.shape[0]} rows but this step has "
+                f"{num_tokens} tokens; the graph would read the wrong rows"
+            )
+
+    def embed(self, hash_ids: torch.Tensor | None, num_tokens: int | None = None) -> torch.Tensor:
+        """Return the gathered ``[T, n_hash_cols, dim]`` rows for ``hash_ids``.
+
+        ``None`` is the offload graph-replay contract: the local block was
+        staged by the pre-graph host pass, so only the in-graph head all-gather
+        runs (a replay does not re-run Python, and a host collective here would
+        desync the TP ranks). ``num_tokens`` is the current step's token-row
+        count; :meth:`forward` passes it so the mixed-mode branch below can
+        refuse a staging block sized for a different batch. It is optional only
+        so direct/test callers need not supply it.
+        """
+        if hash_ids is None:
+            if self._staged_local is not None:
+                # Same mixed-mode defense as the ``_staged_rows`` branch below:
+                # the graph-replay path (``hash_ids=None``) does not re-run
+                # Python, so a staging block sized for a different batch would
+                # make the graph read the wrong rows. Dead today under the
+                # all-or-nothing reconcile, but required if that is ever relaxed.
+                self._reject_stale_row_count(self._staged_local, num_tokens)
+                return self.embed_tokens.gather_heads(self._staged_local)
+            if self._staged_rows is not None:
+                # Mixed-mode defense (production-unreachable today, kept as
+                # defence in depth). A layer whose host table fell back to HBM
+                # stages its device rows in ``_staged_rows``, so the graph-replay
+                # contract (``hash_ids=None``) could resolve instead of raising
+                # inside the captured region. It is dead today because two gates
+                # exclude it: ``DeepseekV41Model._reconcile_engram_offload_active``
+                # demotes the *whole* model to the device path when any single
+                # layer falls back (all-or-nothing), and the capture branch only
+                # passes ``hash_ids=None`` while ``engram_offload_active``. If a
+                # future change relaxes that all-or-nothing reconcile (e.g. a
+                # per-layer offload decision, or an all-offload-off capture path),
+                # this branch becomes live and must return rows matching the
+                # current batch -- hence the exact shape check below.
+                self._reject_stale_row_count(self._staged_rows, num_tokens)
+                return self._staged_rows
+            raise RuntimeError(
+                "engram embed called without hash ids and no staged rows; "
+                "offload mode requires the pre-graph staging pass"
+            )
+        if self.offload:
+            # Keep ``_staged_local`` on the block that matches this forward's
+            # graph visibility. A graph-visible forward -- the runner's
+            # pre-graph pass and, critically, the graph warmup resolves --
+            # MUST leave ``_staged_local`` on the address-stable graph block:
+            # the subsequent capture reads whatever this pass leaves behind,
+            # so re-mounting to the (growable) eager block here would bake the
+            # eager address into the captured graph; an eager pass that later
+            # grows (or frees) that block would then leave the graph replay
+            # reading a moved or freed address. Only a pass outside the graph
+            # may use the eager block.
+            # NOTE(architecture debt): design doc
+            # docs/src/content/docs/en/design/python_execution_context_design.md rule 7
+            # forbids model code calling in_acl_graph()/get_execution_buffer() to choose an
+            # address source; the compliant end-state is an EngramExecutionMetadataBuilder
+            # owning the staging block (allocate_persistent/update_persistent).
+            # follow-up: migrate to an EngramExecutionMetadataBuilder.
+            # Until that migration (the doc takes an incremental approach and keeps
+            # DeepSeek-V4.x on the legacy path), this probe is the minimal mechanism that
+            # keeps eager/graph staging address-correct: get_execution_buffer is NOT a
+            # drop-in replacement (per-entry buffers => memory blow-up, no shape-drift
+            # guard => silent corruption instead of the loud capacity error, and eager
+            # per-call allocation instead of reuse).
+            graph_visible = in_acl_graph()
+            # Exact shape equality (``!=``), not a capacity ``<`` test: a
+            # smaller ``hash_ids`` must re-gather, otherwise the staged prefix
+            # rows from a larger earlier gather would be silently returned for
+            # a different, shorter batch (with ``<`` a reconstructed 8-row
+            # staging block would be reused verbatim for a 3-row call).
+            if (
+                self._staged_local is None
+                or self._staged_local.shape[0] != hash_ids.shape[0]
+                or self._staged_local_graph != graph_visible
+            ):
+                self._staged_local = self.embed_tokens.local_block(hash_ids, graph_visible=graph_visible)
+                self._staged_local_graph = graph_visible
+            return self.embed_tokens.gather_heads(self._staged_local[: hash_ids.shape[0]])
         if self._staged_rows is None or self._staged_rows.shape[0] < hash_ids.shape[0]:
             self._staged_rows = self.embed_tokens.lookup(hash_ids)
         return self._staged_rows[: hash_ids.shape[0]]
@@ -925,7 +1819,7 @@ class Engram(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        hash_ids: torch.Tensor,
+        hash_ids: torch.Tensor | None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Gated residual injection into the full mHC stream.
@@ -934,11 +1828,12 @@ class Engram(nn.Module):
             hidden_states: ``[T, hc_mult, dim]`` residual stream entering this
                 block (between the previous sublayer's post and this block's
                 pre, so the mix coefficients see the injected stream).
-            hash_ids: ``[T, n_hash_cols]`` row ids of this layer.
+            hash_ids: ``[T, n_hash_cols]`` row ids of this layer, or None when
+                the rows were staged by the pre-graph offload pass.
             token_mask: ``[T]``; False shuts the gate so those positions pass
                 through untouched (image spans).
         """
-        rows = self.embed(hash_ids).to(self.wkv.weight.dtype)
+        rows = self.embed(hash_ids, num_tokens=hidden_states.shape[0]).to(self.wkv.weight.dtype)
         kv = self.wkv(rows.flatten(-2))
         num_tokens, hc_mult, dim = hidden_states.shape
         keys = kv[:, : hc_mult * dim].view(num_tokens, hc_mult, dim).float()
@@ -964,3 +1859,38 @@ class Engram(nn.Module):
         # per-copy ([T, hc]).
         output = hidden + gate.unsqueeze(-1) * value.unsqueeze(1)
         return output.to(hidden_states.dtype)
+
+
+def stage_offload_rows(
+    engrams: Sequence[Engram],
+    hash_ids: Sequence[torch.Tensor],
+    *,
+    graph_visible: bool,
+) -> None:
+    """Two-phase batched host staging for a set of Engram layers.
+
+    Phase 1 (:meth:`Engram.begin_stage_offload`, each layer) queues every
+    layer's async device->host id/owned copies (``non_blocking`` on pinned
+    staging); a single :func:`_sync_accelerator` then drains the device; phase 2
+    (:meth:`Engram.finish_stage_offload`, each layer) runs the CPU gather +
+    pinned->device upload. Per-layer staging would
+    drain the whole device once per layer (see
+    :meth:`EngramEmbedding._local_block_offload`), so an N-layer pass paid N
+    blocking drains where N-1 waited on copies already drained; this pass pays
+    exactly one. The protected drain inside
+    :meth:`EngramEmbedding._ensure_host_scratch` is unchanged: it still runs on
+    the pass that first grows the pinned scratch, guarding that realloc against
+    an in-flight H2D, not the D2H visibility this function batches.
+
+    ``engrams`` and ``hash_ids`` are parallel sequences (each layer with its own
+    ids); ``graph_visible`` selects the persistent graph staging block (True on
+    the runner's pre-graph pass). A no-op for the non-offload path: each
+    ``begin``/``finish`` is a no-op when the layer keeps its table on the device.
+    """
+    if not engrams:
+        return
+    for engram, ids in zip(engrams, hash_ids, strict=True):
+        engram.begin_stage_offload(ids, graph_visible=graph_visible)
+    _sync_accelerator(engrams[0].embed_tokens.setup_device)
+    for engram in engrams:
+        engram.finish_stage_offload(graph_visible=graph_visible)

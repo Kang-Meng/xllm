@@ -56,7 +56,9 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import torch
@@ -64,11 +66,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scripts.logger import logger
+from xllm.python.distributed import (
+    engram_all_gather_object,
+    engram_barrier,
+    engram_dp_shard_size,
+    init_engram_dp_group,
+    world_topology,
+)
 from xllm.python.layers.attention import Attention
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.model_executor.forward_context import (
+    capturing_acl_graph,
     get_forward_context,
+    in_acl_graph,
     record_layer_event,
 )
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
@@ -86,11 +97,16 @@ from xllm.python.models.deepseek_v41_engram import (
     ENGRAM_STORAGE_FP8,
     ENGRAM_STORAGE_INT8,
     Engram,
+    EngramEmbedding,
     EngramHashState,
     EngramLayout,
+    engram_offload_warning_fields,
     image_sentinel_mask,
     load_quarot_gate_unrotate,
+    stage_offload_rows,
 )
+from xllm.python.models.engram_config import EngramConfig
+from xllm.python.models.engram_shared_memory import ensure_dev_shm_capacity, estimate_shared_bytes
 from xllm.python.models.weight_utils import W8A8WeightLoader
 
 if TYPE_CHECKING:
@@ -268,6 +284,17 @@ _V41_FIELD_DEFAULTS: dict[str, Any] = {
     "rms_norm_eps": 1e-20,
 }
 
+# Deadline for the node-local Engram shared-table load fence. The Gloo sharing
+# group keeps the 5-minute timeout ``new_group`` gave it; this shorter deadline
+# only bounds the monitor's (group rank 0) wait at the one post-load rendezvous,
+# turning a crashed or hung peer into a 30s failure on rank 0 (see
+# ``collectives.engram_barrier``). PyTorch's ``monitored_barrier`` enforces the
+# per-call deadline on rank 0 only: a non-zero survivor rank whose peer never
+# reaches the fence still blocks until the group's own 5-minute timeout. It is a
+# candidate value: the real deadline behavior still has to be measured on the
+# NPU host.
+_ENGRAM_SHARED_LOAD_BARRIER_TIMEOUT = timedelta(seconds=30)
+
 
 @dataclass
 class DeepseekV41Config(DeepseekV4Config):
@@ -315,6 +342,18 @@ class DeepseekV41Config(DeepseekV4Config):
     # -- Vision (Phase 4); image_token_id also drives gate.bias_vl --
     # -1 = no image tokens (text-only), matching the C++ loader default.
     image_token_id: int = -1
+    # -- Engram host-offload switches (from --engram-config) --
+    # Parsed strictly from the raw ``engram_config`` JSON string by
+    # EngramConfig.from_value; {} (the C++ default) disables both switches.
+    engram_config: EngramConfig = field(default_factory=EngramConfig)
+    # -- Parallel / weight-format contract --
+    # Passed in by the C++ executor (py_causal_lm.cpp). Engram currently
+    # requires PP=1 and DCP=1 and is only validated against safetensors/dummy
+    # weights; the values are surfaced here so config validation and the
+    # Python executor read them from one place.
+    pp_size: int = 1
+    dcp_size: int = 1
+    load_format: str = "safetensors"
 
     @classmethod
     def from_dict(cls, d: dict) -> DeepseekV41Config:
@@ -327,7 +366,7 @@ class DeepseekV41Config(DeepseekV4Config):
         if merged.get("num_hidden_layers") is None and merged.get("n_layers") is None:
             merged["num_hidden_layers"] = 40
         cfg = super().from_dict(merged)
-        return replace(
+        cfg = replace(
             cfg,
             # Re-parse: V4's from_dict normalized "ratio <= 1 -> 1".
             compress_ratios=_parse_v41_compress_ratios(list(merged.get("compress_ratios") or []), cfg.n_layers),
@@ -355,7 +394,49 @@ class DeepseekV41Config(DeepseekV4Config):
             dspark_n_routed_experts=int(_pick(merged, "dspark_n_routed_experts", default=128)),
             dspark_num_experts_per_tok=int(_pick(merged, "dspark_num_experts_per_tok", default=3)),
             image_token_id=int(_pick(merged, "image_token_id", default=-1)),
+            engram_config=EngramConfig.from_value(merged.get("engram_config", {})),
+            pp_size=int(_pick(merged, "pp_size", default=1)),
+            dcp_size=int(_pick(merged, "dcp_size", default=1)),
+            load_format=str(_pick(merged, "load_format", default="safetensors")),
         )
+        _validate_engram_config(cfg)
+        return cfg
+
+
+def _validate_engram_config(cfg: DeepseekV41Config) -> None:
+    """Reject engram configs the TP-sharding / weight-load contract cannot serve.
+
+    Only checked when the checkpoint actually carries engram layers; a config
+    with an empty ``engram_layer_ids`` ignores the switches entirely, so the
+    validation never blocks non-engram deployments.
+    """
+    if not cfg.engram_layer_ids:
+        return
+    # ``{1, 2, 4, 8}`` is the TP set this model's current configuration and
+    # Engram deployment path support, deliberately stricter than the
+    # uniform-head-shard divisibility rule owned by EngramEmbedding
+    # (``n_hash_cols % tp_size == 0``). Do not relax this to that divisibility
+    # rule alone: an evenly shardable Engram embedding does not mean the whole
+    # model deploys at that TP (this model's head-group layout rules out
+    # TP=3/6/12), and EngramEmbedding repeats the size check for the shard
+    # contract itself.
+    if cfg.tp_size not in (1, 2, 4, 8) or cfg.pp_size != 1 or cfg.dcp_size != 1:
+        raise ValueError(
+            "Engram requires TP in {1, 2, 4, 8} with PP=1 and DCP=1; got "
+            f"TP={cfg.tp_size}, PP={cfg.pp_size}, DCP={cfg.dcp_size}. "
+            "dp_shared_memory does not change TP sharding."
+        )
+    if cfg.load_format not in ("auto", "safetensors", "dummy"):
+        raise ValueError(
+            "Engram requires safetensors weights (load_format=auto/safetensors), "
+            f"or dummy weights; got load_format={cfg.load_format}."
+        )
+    # Shared-without-offload is already rejected by EngramConfig.from_value;
+    # re-checked here so no future construction path can bypass that invariant.
+    if cfg.engram_config.dp_shared_memory and not cfg.engram_config.cpu_offload:
+        raise ValueError("engram_config.dp_shared_memory=true requires engram_config.cpu_offload=true")
+    # TODO: once V4.1 Engram is wired into a P/D-disaggregated topology it will
+    # require dp_shared_memory=true there; not enforced at runtime yet.
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1159,9 @@ class DeepseekV41DecoderLayer(nn.Module):
         engram_layout: EngramLayout | None = None,
         engram_storage: str = ENGRAM_STORAGE_FP8,
         engram_gate_unrotate: torch.Tensor | None = None,
+        engram_offload: bool = False,
+        engram_dp_shared_memory: bool = False,
+        engram_dp_group: Any | None = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1101,6 +1185,9 @@ class DeepseekV41DecoderLayer(nn.Module):
                 device,
                 storage=engram_storage,
                 gate_unrotate=engram_gate_unrotate,
+                offload=engram_offload,
+                dp_shared_memory=engram_dp_shared_memory,
+                dp_group=engram_dp_group,
             )
         # Dense vs MoE by first_k_dense_replace / moe_layer_freq.
         is_dense = (layer_id < cfg.first_k_dense_replace) or (
@@ -1137,10 +1224,13 @@ class DeepseekV41DecoderLayer(nn.Module):
         # Engram injection happens between the previous sublayer's post and
         # this block's pre, on the full hc stream, so the mix coefficients
         # see the injected stream (reference model.py:336-360).
-        if self.engram is not None and engram_hashes is not None:
+        # ``engram_hashes`` is None on an offloaded graph capture/replay, where
+        # the rows were staged by the pre-graph host pass and only the gate
+        # mask is computed in-graph (engram.embed(None) reads the staged rows).
+        if self.engram is not None and (engram_hashes is not None or engram_mask is not None):
             hidden = self.engram(
                 hidden,
-                engram_hashes[:, self.engram.layer_hash_index],
+                None if engram_hashes is None else engram_hashes[:, self.engram.layer_hash_index],
                 engram_mask,
             )
         residual = hidden
@@ -1225,6 +1315,55 @@ class DeepseekV41Model(nn.Module):
         # rotates the residual stream (QuaRot), so the gate dot needs the
         # un-rotated stream; the official FP8/bf16 releases need neither.
         self.engram_storage = ENGRAM_STORAGE_INT8 if quant_mode == V41_QUANT_ASCEND else ENGRAM_STORAGE_FP8
+        # Host offload (engram_config.cpu_offload): the int8 tables stay in
+        # pageable CPU host memory instead of resident HBM (~27.7GB/rank); only
+        # the per-rank staging/scratch buffers are pinned. Only the int8 (W8A8)
+        # tables have a CPU decoder; unsupported requests fall back to the HBM
+        # path (EngramEmbedding warns), never skipping engram.
+        self.engram_offload_active = bool(cfg.engram_layer_ids) and cfg.engram_config.cpu_offload
+        if self.engram_offload_active and self.engram_storage != ENGRAM_STORAGE_INT8:
+            logger.warning(
+                "engram_config.cpu_offload=true requested but engram storage is %r; keeping the table on HBM",
+                self.engram_storage,
+            )
+            self.engram_offload_active = False
+        # DP-shared host table: the node-local DP replicas that map the same TP
+        # shard share one physical copy. Requires the int8 (W8A8) table and the
+        # host-offload path; the gloo sharing group is built before the layers so
+        # every engram layer joins the same group. A shared request against
+        # non-int8 storage is a hard error, not the HBM-fallback warning above.
+        shared_requested = bool(cfg.engram_layer_ids) and cfg.engram_config.dp_shared_memory
+        if shared_requested and self.engram_storage != ENGRAM_STORAGE_INT8:
+            raise ValueError(
+                "engram_config.dp_shared_memory=true requires the int8 (W8A8) engram table "
+                f"storage, got {self.engram_storage!r}"
+            )
+        self.dp_shared_memory = shared_requested and self.engram_offload_active
+        self.engram_dp_group: Any | None = None
+        if self.dp_shared_memory:
+            # Ranks in one DP replica: TP x PP x CP (DCP reuses the TP ranks and
+            # adds none), matching vllm's tp*pp*pcp replica size.
+            replica_size = cfg.tp_size * cfg.pp_size * cfg.cp_size
+            shard_size = engram_dp_shard_size(cfg.dp_size, replica_size)
+            if shard_size <= 1:
+                raise ValueError(
+                    "engram_config.dp_shared_memory=true requires a node-local DP sharing "
+                    f"group with more than one rank; got DP={cfg.dp_size}, shard_size={shard_size}."
+                )
+            # One aggregate /dev/shm precheck for the whole node (the per-storage
+            # check would double-count across layers and TP shards). It is
+            # deliberately best-effort and per-rank: a short host raises only on
+            # the ranks of the failing node, while the other nodes proceed to
+            # ``init_engram_dp_group`` and block on ``new_group`` until they time
+            # out. That is bounded to launch time and every rank fails the job
+            # anyway, so the cheap local check is kept instead of a global vote;
+            # the per-storage ``statvfs`` check at create time stays the
+            # authoritative gate.
+            ensure_dev_shm_capacity(self._engram_shared_node_bytes(cfg.tp_size, replica_size, shard_size))
+            # Pass the shard size already derived above (against the live world)
+            # so the distributed helper does not recompute it or repeat this
+            # engram_config error text at a lower layer.
+            self.engram_dp_group = init_engram_dp_group(str(device), cfg.dp_size, shard_size)
         self.engram_gate_unrotate = None
         if cfg.engram_layer_ids and quant_mode == V41_QUANT_ASCEND:
             self.engram_gate_unrotate = load_quarot_gate_unrotate(str((config or {}).get("model_path") or ""), device)
@@ -1244,6 +1383,9 @@ class DeepseekV41Model(nn.Module):
                     self.engram_layout,
                     engram_storage=self.engram_storage,
                     engram_gate_unrotate=self.engram_gate_unrotate,
+                    engram_offload=self.engram_offload_active,
+                    engram_dp_shared_memory=self.dp_shared_memory,
+                    engram_dp_group=self.engram_dp_group,
                 )
                 for i in range(cfg.n_layers)
             ]
@@ -1308,6 +1450,232 @@ class DeepseekV41Model(nn.Module):
         )
         return hashes, ~dead
 
+    def _engram_shared_node_bytes(self, tp_size: int, replica_size: int, shard_size: int, quant_block: int = 32) -> int:
+        """Estimate this node's shared host-table footprint (precheck only).
+
+        Summed over every engram layer and every TP shard on the node, then
+        scaled by the number of sharing groups that hold a copy of each shard
+        (``replicas_per_node // shard_size``). Every TP shard's rows are summed
+        explicitly: the head buckets are uneven, so one rank's shard bytes is
+        not a sound sample of the others, and ``shard_size < replicas_per_node``
+        would under-count the extra per-node copies. Falls back to a
+        single-replica footprint when the topology is unavailable; the
+        per-storage ``statvfs`` check at create time remains the authoritative
+        gate, so an over-estimate here only errs toward a safer precheck.
+        """
+        assert self.engram_layout is not None
+        head_dim = self.engram_layout.head_dim
+        per_layer = 0
+        for layer_hash_index in range(len(self.engram_layout.layer_ids)):
+            head_sizes = self.engram_layout.head_sizes(layer_hash_index)
+            part = len(head_sizes) // tp_size
+            for shard in range(tp_size):
+                start = shard * part
+                rows = sum(head_sizes[start : start + part])
+                per_layer += estimate_shared_bytes(rows, head_dim, quant_block)
+        copies = 1
+        topology = world_topology()
+        if topology is not None and replica_size > 0 and shard_size > 0:
+            my_host = socket.gethostname()
+            ranks_on_node = sum(1 for entry in topology if entry.get("hostname") == my_host)
+            replicas_per_node = ranks_on_node // replica_size
+            if replicas_per_node > 0:
+                copies = max(replicas_per_node // shard_size, 1)
+        return per_layer * copies
+
+    def _reconcile_engram_offload_active(self) -> bool:
+        """All-or-nothing offload gate, run after weight loading.
+
+        A single layer whose host-table load failed demotes the WHOLE model to
+        the HBM/device path. A mixed model cannot honor the graph-replay
+        contract: the capture branch stages ``hash_ids=None`` for every layer
+        and each layer's ``embed(None)`` reads its own staging block, but the
+        demoted layer has no offload staging block -- and letting the remaining
+        layers keep offloading would make the capture fall back to the
+        offload-aware eager path, which does illegal host work inside the
+        captured region. Demoting every layer keeps one capture-safe path (the
+        all-device baseline). Returns True when a demotion happened.
+
+        A DP-shared table never enters this path: shared layers keep
+        ``offload=True`` (``fallback_to_device`` refuses to demote them), so the
+        shared load is fail-fast and no per-layer demotion exists to reconcile.
+        """
+        if not self.engram_offload_active or self.dp_shared_memory:
+            return False
+        engram_layers = [layer.engram for layer in self.layers if getattr(layer, "engram", None) is not None]
+        fell_back = [engram for engram in engram_layers if not engram.embed_tokens.offload]
+        if not fell_back:
+            return False
+        for engram in engram_layers:
+            if engram.embed_tokens.offload:
+                engram.embed_tokens.fallback_to_device()
+        self.engram_offload_active = False
+        logger.warning(
+            "engram host offload disabled: %d/%d engram layer(s) failed the host-table load; "
+            "falling back the whole model to the HBM table path",
+            len(fell_back),
+            len(engram_layers),
+        )
+        return True
+
+    def close_host_offload(self) -> None:
+        """Release every DP-shared host table this model owns (no-op otherwise).
+
+        Every layer is attempted even when one fails, so a single bad table
+        cannot leak the rest; the collected failures are raised together at the
+        end (the caller is the C++ destructor, which tolerates the raise).
+        """
+        failures: list[str] = []
+        for layer_id, layer in enumerate(self.layers):
+            engram = getattr(layer, "engram", None)
+            if engram is None:
+                continue
+            try:
+                engram.close_host_offload()
+            except Exception as exc:  # noqa: BLE001 - aggregated; keep releasing the rest
+                failures.append(f"layer {layer_id}: {type(exc).__name__}: {exc}")
+        if failures:
+            raise RuntimeError("engram host-table close failed for " + "; ".join(failures))
+
+    def configure_engram_graph_capacity(self, max_decode_tokens: int) -> bool:
+        """Pre-size every graph-visible engram staging block to the largest bucket.
+
+        The ACL-graph runner calls this at construction with its largest decode
+        token-row bucket (``_decode_bucket`` of ``max_seqs_per_batch`` times
+        ``num_decoding_tokens``). Capture bakes the staging address into the
+        graph, so the block is allocated once and never grown; without this
+        floor it would be fixed by the first (smallest) lazily captured bucket,
+        and a later larger bucket would raise. No-op unless host offload is
+        active. Returns True when at least one layer was configured.
+        """
+        if not self.engram_offload_active:
+            return False
+        max_tokens = max(int(max_decode_tokens), 0)
+        if max_tokens <= 0:
+            return False
+        configured = False
+        for layer in self.layers:
+            engram = getattr(layer, "engram", None)
+            if engram is not None and engram.offload:
+                engram.embed_tokens.set_graph_capacity_hint(max_tokens)
+                configured = True
+        return configured
+
+    def engram_offload_warning_fields(self) -> tuple[int, list[Any]]:
+        """(engram layer count, graph-capacity hints) for the engram-skip warnings.
+
+        Method form of the module-level ``engram_offload_warning_fields``
+        helper (:func:`deepseek_v41_engram.engram_offload_warning_fields`) so the
+        decode-graph runner can read these fields off the model by duck typing
+        (``getattr(model, "engram_offload_warning_fields", None)``) without the
+        runner importing this module -- the runner must not depend on
+        ``xllm.python.models``. Delegates to that helper so the model-side and
+        runner-side diagnostics cannot drift apart.
+        """
+        # The bare name resolves to the imported module-level helper, not to
+        # this method (a method body never sees class attributes as globals), so
+        # this is a delegation, not a recursive call.
+        return engram_offload_warning_fields(self)
+
+    def _build_dsa_metadata_for_forward(
+        self,
+        backend: Any,
+        metadata: Any,
+        positions: torch.Tensor,
+    ) -> None:
+        """Publish this forward's DSA metadata (the graph warmup build path).
+
+        Mirrors the ``forward`` branch that runs once per request and is then
+        reused across ACL-graph warmup/capture/replay (``pass`` once
+        ``metadata.dsa_metadata`` is set). Extracted so the offload staging pass
+        can build the metadata before the first capture's warmup (see
+        ``stage_engram_rows_outside_graph``).
+        """
+        graph_mode = bool(getattr(metadata, "dsa_graph_mode", False))
+        backend.reset_forward(metadata)
+        metadata.dsa_graph_mode = graph_mode
+        # Keep the Int64+contiguous normalization here. ``forward`` normalizes
+        # ``positions`` the same way before calling this, so on the forward path
+        # this line is a no-op and both call sites agree. The pre-graph staging
+        # path (``stage_engram_rows_outside_graph``) can reach here before any
+        # ``forward`` has run, so this is the only point that guarantees
+        # ``dsa_positions`` is int64 and contiguous for that path.
+        metadata.dsa_positions = positions.to(torch.int64).contiguous()
+        # DeepseekV41Model requires a backend with prepare_dsa_metadata_for_forward;
+        # call it directly so a wrong backend fails with a clear AttributeError
+        # naming the missing method, rather than a hand-rolled getattr+RuntimeError.
+        backend.prepare_dsa_metadata_for_forward(metadata)
+        if graph_mode:
+            metadata.dsa_graph_mode = True
+
+    def _engram_capture_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Gate mask for the offload capture branch.
+
+        The runner's first-capture gate (``_engram_first_capture_gate``) refuses
+        to capture unless the pre-graph staging pass staged this step's rows
+        while engram is offloading, so by the time this capture branch runs the
+        graph-visible staging block is populated. The mask is therefore always
+        ``~image_sentinel_mask(input_ids)``: the capture never skips engram, and
+        the fail-fast on a failed staging pass lives in the runner.
+        """
+        return ~image_sentinel_mask(input_ids)
+
+    def stage_engram_rows_outside_graph(
+        self,
+        backend: Any,
+        metadata: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> bool:
+        """Host-offload staging pass, to be called OUTSIDE the ACL graph.
+
+        Computes the n-gram hashes and gathers every engram layer's rows from
+        the pageable host tables into their persistent device staging buffers.
+        ACL-graph replay does not re-run Python, so the decode-graph runner
+        calls this once per step before ``replay``; the graph then only reads
+        the staged rows (see ``DeepseekV41Model.forward``). A no-op for every
+        non-offload configuration. The returned bool records that staging
+        succeeded this step; the runner's first-capture gate reads it and refuses
+        the capture when staging could not complete (e.g. the SWA cache is unbound
+        during graph memory profiling), so the capture branch always sees staged
+        rows.
+        """
+        if not self.engram_offload_active or self.engram_hash is None:
+            return False
+        # The DSA metadata this hashing needs is published by the model
+        # forward, but on the FIRST graph capture that forward runs inside
+        # ``_capture`` -- after this staging pass. Build it here, exactly as the
+        # forward would, so the first capture still gathers the engram rows.
+        # Otherwise staging would early-return (``dsa`` None -> no SWA group),
+        # the capture branch would bake an engram-less graph, and every replay
+        # would reuse it (ACL replay does not re-run Python). ``metadata`` is
+        # None only in unit stubs, where there is nothing to build.
+        if metadata is not None and getattr(metadata, "dsa_metadata", None) is None:
+            self._build_dsa_metadata_for_forward(backend, metadata, positions)
+        hashes, _ = self._compute_engram_hashes(backend, metadata, input_ids, positions)
+        if hashes is None:
+            return False
+        # ``engram_offload_active`` is True here (the guard above returned
+        # otherwise), so every engram layer takes the host path. Stage all of
+        # them through the batched two-phase helper: it queues every layer's
+        # D2H copies, drains the device ONCE, then runs each layer's CPU gather +
+        # H2D. A per-layer ``prepare_embeddings`` would drain the whole device
+        # once per engram layer, so an N-layer pass paid N blocking syncs where
+        # N-1 were redundant. The graph-visible staging pass is used because a
+        # captured ACL graph reads this block's address on every replay, so it
+        # must never move (see ``EngramEmbedding._ensure_graph_staging``).
+        pairs = [
+            (engram, hashes[:, engram.layer_hash_index].to(torch.int64))
+            for layer in self.layers
+            if (engram := getattr(layer, "engram", None)) is not None
+        ]
+        stage_offload_rows(
+            [engram for engram, _ in pairs],
+            [ids for _, ids in pairs],
+            graph_visible=True,
+        )
+        return True
+
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         if self.cfg.cp_size > 1:
             raise NotImplementedError(
@@ -1323,27 +1691,52 @@ class DeepseekV41Model(nn.Module):
             # ACL graph replay reuses the metadata captured during warmup.
             pass
         else:
-            backend.reset_forward(metadata)
-            metadata.dsa_graph_mode = graph_mode
-            metadata.dsa_positions = positions
-            prepare_dsa = getattr(backend, "prepare_dsa_metadata_for_forward", None)
-            if prepare_dsa is None:
-                raise RuntimeError("DeepSeek-V4.1 requires prepare_dsa_metadata_for_forward")
-            prepare_dsa(metadata)
-            if graph_mode:
-                metadata.dsa_graph_mode = True
+            self._build_dsa_metadata_for_forward(backend, metadata, positions)
 
         # Engram: compute the n-gram hashes once, on the full token stream,
         # before the layer loop; each engram layer then pre-gathers its rows.
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if self.engram_hash is not None:
-            engram_hashes, engram_mask = self._compute_engram_hashes(backend, metadata, input_ids, positions)
-            if engram_hashes is not None:
-                for layer in self.layers:
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index].to(torch.int64))
+            if self.engram_offload_active and capturing_acl_graph():
+                # Offload contract: ACL-graph replay does not re-run Python, so
+                # the host gather ran in the runner's pre-graph staging pass
+                # (``stage_engram_rows_outside_graph``). Only the gate mask and
+                # the staged rows enter the graph; the layer reads the rows
+                # through ``engram.embed(None)``. The runner's first-capture gate
+                # refuses the capture unless that pass staged, so the mask here
+                # is always real -- running the device path would do illegal host
+                # work inside the captured region.
+                engram_mask = self._engram_capture_mask(input_ids)
+            else:
+                engram_hashes, engram_mask = self._compute_engram_hashes(backend, metadata, input_ids, positions)
+                if engram_hashes is not None:
+                    # Any pass under the graph runner (warmup before capture
+                    # included, i.e. ``in_acl_graph()``) must stage into the
+                    # address-stable graph block, because the captured graph
+                    # reads whatever ``_staged_local`` this pass leaves behind.
+                    # A true eager prefill (no execution state) uses the
+                    # growable eager block instead.
+                    # NOTE(architecture debt): design doc
+                    # docs/src/content/docs/en/design/python_execution_context_design.md rule 7
+                    # forbids model code calling in_acl_graph()/get_execution_buffer() to choose an
+                    # address source; the compliant end-state is an EngramExecutionMetadataBuilder
+                    # owning the staging block (allocate_persistent/update_persistent).
+                    # follow-up: migrate to an EngramExecutionMetadataBuilder.
+                    # Until that migration (the doc takes an incremental approach and keeps
+                    # DeepSeek-V4.x on the legacy path), this probe is the minimal mechanism that
+                    # keeps eager/graph staging address-correct: get_execution_buffer is NOT a
+                    # drop-in replacement (per-entry buffers => memory blow-up, no shape-drift
+                    # guard => silent corruption instead of the loud capacity error, and eager
+                    # per-call allocation instead of reuse).
+                    graph_visible = in_acl_graph()
+                    for layer in self.layers:
+                        engram = getattr(layer, "engram", None)
+                        if engram is not None:
+                            engram.prepare_embeddings(
+                                engram_hashes[:, engram.layer_hash_index].to(torch.int64),
+                                graph_visible=graph_visible,
+                            )
 
         # Expand to hc_mult identical copies; the first pre_mix is one-hot on
         # copy 0 (model.py:1258-1260).
@@ -1422,6 +1815,18 @@ class DeepseekV41ForCausalLM(PyModelBase):
             self._load_weights_ascend(state_dicts, tp_rank, tp_size)
         else:
             self._load_weights_torch(state_dicts, tp_rank, tp_size)
+        # All-or-nothing host offload: a per-layer host-table fallback (see
+        # ``_load_engram_ascend``) demotes the whole model to the HBM path so the
+        # ACL-graph capture never mixes offloaded and device engram layers.
+        self.model._reconcile_engram_offload_active()
+
+    def close_host_offload(self) -> None:
+        """Release DP-shared host tables before this model is dropped.
+
+        Called from the C++ bridge destructor (``PyCausalLM::~PyCausalLM``)
+        under the GIL; it runs no collective, so it is safe during teardown.
+        """
+        self.model.close_host_offload()
 
     def _load_weights_torch(self, state_dicts: list[StateDict], tp_rank: int, tp_size: int) -> None:
         """fp8-block / bf16 loading: dequantized bf16 plain-linear modules."""
@@ -1774,10 +2179,34 @@ class DeepseekV41ForCausalLM(PyModelBase):
         head-bucket row range; ``wkv`` / ``q_weight`` / ``k_weight`` are bf16
         and copied verbatim (the K half and gate stay in the original basis,
         the V half is pre-folded with the QuaRot rotation).
+
+        With host offload the table copy targets host CPU memory (pageable,
+        not pinned); a failure there falls back to the HBM parameter (engram
+        stays enabled) instead of silently skipping the layer. The fallback copy
+        is a hard error: if the HBM table copy also fails, the layer's table is
+        only partially filled and the model cannot serve correctly, so this
+        aborts with an explicit error rather than running on a half-loaded table.
+
+        With ``dp_shared_memory`` the table lives in one shared segment per
+        node-local group, so only the group leader reads the checkpoint and
+        writes its own TP row range; the peers read the shared pages. A leader
+        failure is propagated to every group rank as a hard error (fail-fast)
+        and never demotes to HBM.
         """
         eng = self.model.layers[layer_id].engram
         assert eng is not None
-        table = loader.load_tensor(ck + "engram.embed.weight")
+        embed = eng.embed_tokens
+        if embed._shared_storage is not None:
+            self._load_engram_ascend_shared(loader, ck, layer_id, embed)
+        else:
+            self._load_engram_ascend_private(loader, ck, layer_id, embed)
+        loader.copy_in(pm + "engram.wkv.weight", loader.load_tensor(ck + "engram.wkv.weight"))
+        loader.copy_in(pm + "engram.q_weight", loader.load_tensor(ck + "engram.q_weight"))
+        loader.copy_in(pm + "engram.k_weight", loader.load_tensor(ck + "engram.k_weight"))
+
+    @staticmethod
+    def _validate_engram_table_dtypes(layer_id: int, table: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Common dtype checks; returns the table normalized to int8."""
         if table.dtype == torch.uint8:
             table = table.view(torch.int8)
         if table.dtype != torch.int8:
@@ -1786,27 +2215,194 @@ class DeepseekV41ForCausalLM(PyModelBase):
                 "ascend loader implements the int8_sym export only (fp32 group "
                 "scales, see quant_model_description.json optional.embedding_storage)"
             )
-        scale = loader.load_tensor(ck + "engram.embed.scale")
         if scale.dtype != torch.float32:
             raise NotImplementedError(
                 f"engram table scale for layer {layer_id} has dtype {scale.dtype}; "
                 "expected float32 group scales of the int8_sym export"
             )
-        start = eng.embed_tokens.vocab_start
-        rows = eng.embed_tokens.part_num_embeddings
-        if table.size(0) < eng.embed_tokens.num_embeddings:
+        return table
+
+    @staticmethod
+    def _copy_engram_rows(
+        embed: EngramEmbedding, table: torch.Tensor, scale: torch.Tensor, start: int, rows: int
+    ) -> None:
+        """Copy this rank's narrow row window from the mmap view into ``embed``.
+
+        Shared by the private and DP-shared loaders (and re-run by the private
+        host->HBM fallback); a zero-row rank copies nothing.
+        """
+        if rows <= 0:
+            return
+        embed.weight.data.copy_(table.narrow(0, start, rows))
+        embed.weight_scale.data.copy_(scale.narrow(0, start, rows))
+
+    def _load_engram_ascend_table(
+        self,
+        loader: W8A8WeightLoader,
+        ck: str,
+        layer_id: int,
+        embed: EngramEmbedding,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Load + validate the int8 table and this rank's ``(start, rows)`` window.
+
+        Both Ascend engram loaders read the same keys, enforce the same dtype and
+        row-count contracts and copy the same narrow window; they differ only in
+        where the copy lands and how a failure is handled (host->HBM fallback vs.
+        group-aggregated abort). Extracted so the shared sequence -- and its
+        row-count message -- cannot drift between the two.
+        """
+        table = loader.load_tensor(ck + "engram.embed.weight")
+        scale = loader.load_tensor(ck + "engram.embed.scale")
+        table = self._validate_engram_table_dtypes(layer_id, table, scale)
+        start = embed.vocab_start
+        rows = embed.part_num_embeddings
+        if table.size(0) < embed.num_embeddings:
             raise ValueError(
-                f"engram table for layer {layer_id} has {table.size(0)} rows, "
-                f"config declares {eng.embed_tokens.num_embeddings}"
+                f"engram table for layer {layer_id} has {table.size(0)} rows, config declares {embed.num_embeddings}"
             )
-        if rows > 0:
-            # Direct H2D copy_ from the mmap view; a prior .to(device) would
-            # materialize a 12+GB device temporary on top of the parameter.
-            eng.embed_tokens.weight.data.copy_(table.narrow(0, start, rows))
-            eng.embed_tokens.weight_scale.data.copy_(scale.narrow(0, start, rows))
-        loader.copy_in(pm + "engram.wkv.weight", loader.load_tensor(ck + "engram.wkv.weight"))
-        loader.copy_in(pm + "engram.q_weight", loader.load_tensor(ck + "engram.q_weight"))
-        loader.copy_in(pm + "engram.k_weight", loader.load_tensor(ck + "engram.k_weight"))
+        return table, scale, start, rows
+
+    def _load_engram_ascend_private(
+        self,
+        loader: W8A8WeightLoader,
+        ck: str,
+        layer_id: int,
+        embed: EngramEmbedding,
+    ) -> None:
+        """Per-rank host-table load with the narrow host->HBM fallback."""
+        table, scale, start, rows = self._load_engram_ascend_table(loader, ck, layer_id, embed)
+        # Direct copy_ from the mmap view; a prior .to(device) would materialize
+        # a 12+GB device temporary on top of the parameter. Offload targets the
+        # host table (CPU -> CPU); a failed host copy demotes the layer to the
+        # HBM path, fail-fast instead of loading a half-populated host table.
+        try:
+            self._copy_engram_rows(embed, table, scale, start, rows)
+        except (RuntimeError, MemoryError) as exc:
+            # Narrow on purpose: a host copy fails as RuntimeError (a bad
+            # source / shape / pinning) or MemoryError (host OOM), and only
+            # those justify the HBM fallback. Anything else is an unexpected
+            # defect and must surface instead of being masked as a fallback
+            # (``except Exception`` would have swallowed it). ``BaseException``
+            # control-flow signals (KeyboardInterrupt / SystemExit) are never
+            # caught here either. Because RuntimeError is broader than a host
+            # OOM -- a weight-path or shape defect raises it too -- the warning
+            # below carries ``exc_info=True`` so the full traceback (which
+            # names the failing copy) is always logged, not just the message.
+            # Retained as-is on purpose (not narrowed to a specific OOM type):
+            # the exception an OOM actually raises on the target stack has not
+            # been measured, so narrowing could stop catching the real failure
+            # while widening to ``Exception`` would mask unrelated defects. The
+            # fallback itself no longer half-commits a failure (see
+            # ``EngramEmbedding.fallback_to_device``), so what remains is the
+            # documented RuntimeError-is-broader-than-OOM tradeoff above.
+            if not embed.offload:
+                raise
+            logger.warning(
+                "engram layer %d host-table load failed (%s); falling back to "
+                "the HBM table path for this layer (the model then demotes all "
+                "offload layers to HBM)",
+                layer_id,
+                exc,
+                exc_info=True,
+            )
+            embed.fallback_to_device()
+            try:
+                self._copy_engram_rows(embed, table, scale, start, rows)
+            except (RuntimeError, MemoryError) as exc:
+                # The host->HBM fallback is not a success path on its own: if
+                # the HBM copy fails too, the layer's table is only partially
+                # populated and the model cannot serve correctly
+                # (``fallback_to_device`` has already switched ``offload`` off,
+                # so the state is half-loaded). Abort explicitly instead of
+                # running on a half-loaded table. Narrow on purpose, same as the
+                # first catch: only RuntimeError/MemoryError justify this path;
+                # anything else surfaces unchanged.
+                raise RuntimeError(
+                    f"engram layer {layer_id}: HBM table copy failed even "
+                    f"after the host->HBM fallback ({exc}); the engram table "
+                    "is only partially populated and the model cannot serve "
+                    "correctly, aborting instead of running with a "
+                    "half-loaded table"
+                ) from exc
+
+    def _load_engram_ascend_shared(
+        self,
+        loader: W8A8WeightLoader,
+        ck: str,
+        layer_id: int,
+        embed: EngramEmbedding,
+    ) -> None:
+        """Leader-only load into a shared host table; peers read the pages.
+
+        Only group rank 0 reads the checkpoint and writes this rank's TP row
+        range (all group members map the same segment and the same TP shard, so
+        one writer fills it). The result is propagated as: leader reads/writes
+        -> ``engram_all_gather_object`` of the error -> ``engram_barrier`` fences
+        every rank (success or failure) before any rank acts -> on failure mark
+        FAILED and raise on every rank (fail-fast, never demote); on success mark
+        LOADED. The barrier is entered unconditionally so a failing rank cannot
+        start unwinding into a later collective while a peer is still completing
+        this load (the same choreography ``SharedHostEngramStorage`` uses before
+        the leader unlinks).
+
+        The barrier is an ordering rendezvous for the ordinary failure path
+        only: ``engram_all_gather_object`` already returns the same error list
+        on every rank, and the barrier just guarantees no rank raises or marks
+        the table while a peer is still inside this load. It is **not** crash
+        tolerance: a failed rank may be noticed by the transport or only surface
+        when the fence deadline fires. This one rendezvous runs with the shorter
+        candidate deadline ``_ENGRAM_SHARED_LOAD_BARRIER_TIMEOUT`` (via
+        ``dist.monitored_barrier``), which shortens that wait from the group's
+        full 5-minute Gloo timeout to 30s -- but on the monitor (group rank 0)
+        only: ``monitored_barrier`` enforces the per-call deadline on rank 0, and
+        a non-zero survivor rank whose peer never reaches the fence still blocks
+        until the group's own 5-minute timeout. The ``engram_all_gather_object``
+        above is not governed by this deadline at all and is still bounded only
+        by that group timeout. The group timeout also governs every other
+        collective on the group, so the barrier must still not be read as a
+        liveness guarantee.
+        """
+        storage = embed._shared_storage
+        group = embed._dp_group
+        assert storage is not None and group is not None
+        error: str | None = None
+        if group.rank() == 0:
+            try:
+                table, scale, start, rows = self._load_engram_ascend_table(loader, ck, layer_id, embed)
+                self._copy_engram_rows(embed, table, scale, start, rows)
+            except Exception as exc:  # noqa: BLE001 - propagated to every rank below
+                # Ordinary exception only: a defect (or host OOM) is reported to
+                # the whole group, never swallowed into an HBM fallback.
+                error = f"{type(exc).__name__}: {exc}"
+        errors: list[str | None] = [None] * group.size()
+        engram_all_gather_object(errors, error)
+        failures = "; ".join(f"rank {rank}: {failure}" for rank, failure in enumerate(errors) if failure is not None)
+        # Fence every rank -- success or failure -- before any rank raises or
+        # marks the table loaded. The gather already hands every rank the same
+        # ``failures`` list, but entering the barrier unconditionally means no
+        # rank can begin unwinding (or advance to a later collective) while a
+        # peer is still completing this load; mirrors the unconditional fence in
+        # ``SharedHostEngramStorage._attach_or_create``. Ordering only, not
+        # crash tolerance: a peer that fails mid-collective is not fenced -- the
+        # transport may notice it, and otherwise the shorter fence deadline
+        # below is what unblocks the survivors (see the docstring).
+        try:
+            engram_barrier(timeout=_ENGRAM_SHARED_LOAD_BARRIER_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - re-raised with context below
+            # The fence itself failed, most likely the shorter candidate timeout
+            # firing on a peer that never reached it. Mark this rank FAILED
+            # locally and re-raise with the layer/phase/rank context; never
+            # retry, never keep serving, and never issue a status gather on a
+            # communicator that is already known bad.
+            storage.mark_failed()
+            raise RuntimeError(
+                f"Engram shared host-table load fence failed for layer {layer_id} "
+                f"(phase=barrier, group_rank={group.rank()}): {type(exc).__name__}: {exc}"
+            ) from exc
+        if failures:
+            storage.mark_failed()
+            raise RuntimeError(f"Engram shared host-table load failed for layer {layer_id}: {failures}")
+        storage.mark_loaded()
 
     def _load_ascend_moe(self, loader: W8A8WeightLoader, ck: str, pm: str, layer_id: int) -> None:
         """Ascend MoE: the V4 W8A8 staging plus the V4.1 ``gate.bias_vl``."""
