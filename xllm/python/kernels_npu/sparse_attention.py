@@ -413,15 +413,11 @@ def sparse_flash_attention(
       ``query_rope``/``key_rope``; the op applies it within the absorbed
       MLA contract.
 
-    The legacy custom ``xllm_ops::sparse_flash_attention`` op is deprecated
-    on newer CANN builds (its kernel symbol is no longer loadable); both
-    flavours therefore go through the CANN op.
+    The legacy custom ``xllm_ops::sparse_flash_attention`` op has been
+    removed; both flavours go through the CANN built-in op.
     """
-    # attention_mode=2 = MLA-absorb. query_rope/key_rope carry the decoupled
-    # RoPE for DeepSeek/GLM-5.2 (None for GLM-5.3 NoPE). On older CANN this
-    # combination raised 561002 for the RoPE case; on current CANN the op
-    # supports out-of-band RoPE in absorb mode. If 561002 reappears, fall
-    # back to attention_mode=0 for the RoPE case.
+    # attention_mode=2 = MLA-absorb: KV is a single shared latent tensor and
+    # the rope part is carried out-of-band in query_rope/key_rope.
     attention_mode = 2
     output, _, _ = torch.ops.npu.npu_sparse_flash_attention(
         query,
@@ -462,8 +458,8 @@ def sparse_flash_attention_out(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Attend to selected blocks and write the output into ``output``."""
-    # Route through the CANN npu op; xllm_ops::sparse_flash_attention_out is
-    # deprecated on newer CANN builds (its kernel symbol is no longer loadable).
+    # Route through the CANN npu op; the legacy xllm_ops::sparse_flash_attention_out
+    # op has been removed in favour of the CANN built-in op.
     # attention_mode=2 = MLA-absorb; the caller passes the decoupled RoPE via
     # query_rope/key_rope (None for NoPE models). The npu op returns a fresh
     # output tensor; copy it into the caller-provided ``output`` buffer to
@@ -513,8 +509,7 @@ def sparse_flash_attention_lse(
     """Attend to selected blocks and optionally return softmax max/sum for LSE merge.
 
     Routes through the CANN ``npu_sparse_flash_attention`` op
-    (``return_softmax_lse`` maps 1:1); the legacy ``xllm_ops`` op is
-    deprecated on newer CANN builds.
+    (``return_softmax_lse`` maps 1:1).
     """
     output, softmax_max, softmax_sum = torch.ops.npu.npu_sparse_flash_attention(
         query,

@@ -47,6 +47,9 @@ from xllm.python.layers.npu.mega_moe_metadata import MegaMoeMetadata  # noqa: E4
 from xllm.python.layers.npu.mega_moe_metadata_builder import (  # noqa: E402
     TokenOwnerMegaMoeMetadataBuilder,
 )
+from xllm.python.model_executor.execution_context import (  # noqa: E402
+    LayerCacheAwareExecutionMetadataBuilder,
+)
 from xllm.python.model_executor.executor import (  # noqa: E402
     ModelExecutor,
     _create_attention_backend,
@@ -2179,7 +2182,7 @@ class TestBindKvCaches:
         mock_builder_classes,
     ) -> None:
         mock_create.return_value = StubAttentionBackend()
-        builder = MagicMock()
+        builder = MagicMock(spec=LayerCacheAwareExecutionMetadataBuilder)
         builder.metadata_type = MegaMoeMetadata
         builder_class = MagicMock()
         builder_class.from_config.return_value = builder

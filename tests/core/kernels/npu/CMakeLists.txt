@@ -70,6 +70,33 @@ cc_test(
 
 cc_test(
   NAME
+    atb_sparse_flash_attention_test
+  SRCS
+    atb_sparse_flash_attention_test.cpp
+  DEPS
+    ascendcl
+    xllm_atb_layers
+    nnopbase
+    c_sec
+    opapi
+    torch
+    torch_npu
+    GTest::gtest_main
+    glog::glog
+)
+# The atb adapter headers and libatb runtime are private deps of
+# xllm_atb_layers, so the test wires them explicitly.
+target_include_directories(atb_sparse_flash_attention_test PRIVATE
+  $ENV{ATB_HOME_PATH}/include)
+target_link_libraries(atb_sparse_flash_attention_test PRIVATE
+  $ENV{ATB_HOME_PATH}/lib/libatb.so)
+if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+  target_link_options(atb_sparse_flash_attention_test PRIVATE
+    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+endif()
+
+cc_test(
+  NAME
     mtp_prepare_next_draft_test
   SRCS
     mtp_prepare_next_draft_test.cpp
