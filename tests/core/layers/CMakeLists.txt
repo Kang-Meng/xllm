@@ -51,6 +51,20 @@ cc_test(
     GTest::gtest_main
 )
 
+# Loading-time channel permutations require only CPU tensors.
+cc_test(
+  NAME
+    deepseek_loader_rope_test
+  CPU_ONLY
+  SRCS
+    deepseek_loader_rope_test.cpp
+  DEPS
+    absl::strings
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
 # DeepSeek-V4 prefill CP split arithmetic. Kept outside the platform
 # subdirectories: the split math has no accelerator or ProcessGroup dependency,
 # so every platform build can verify it.

@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -589,6 +590,28 @@ inline torch::Tensor view_tensor(torch::Tensor weight,
         .contiguous();
   }
   return weight;
+}
+
+// Reorder the first rope_dim channels along dim from interleaved
+// [r0, i0, r1, i1, ...] to split-half [r0, r1, ..., i0, i1, ...].
+// Leave the remaining channels unchanged. Clone when the caller must preserve
+// the input storage; otherwise keep the eager loader's in-place behavior.
+inline torch::Tensor trans_front_rope_weight(torch::Tensor weight,
+                                             int64_t dim,
+                                             int64_t rope_dim,
+                                             bool clone_first) {
+  CHECK_GT(rope_dim, 0) << "Front RoPE dim must be positive";
+  CHECK_EQ(rope_dim % 2, 0) << "Front RoPE dim must be even, got " << rope_dim;
+  CHECK_LE(rope_dim, weight.size(dim))
+      << "Front RoPE dim exceeds channel count: dim=" << dim
+      << ", rope_dim=" << rope_dim << ", channels=" << weight.size(dim);
+  torch::Tensor output = clone_first ? weight.clone() : weight;
+  const torch::Tensor real = weight.slice(dim, 0, rope_dim, 2).contiguous();
+  const torch::Tensor imaginary =
+      weight.slice(dim, 1, rope_dim, 2).contiguous();
+  const torch::Tensor combined = torch::cat({real, imaginary}, dim);
+  output.slice(dim, 0, rope_dim).copy_(combined);
+  return output.contiguous();
 }
 
 inline torch::Tensor trans_rope_weight(torch::Tensor weight,

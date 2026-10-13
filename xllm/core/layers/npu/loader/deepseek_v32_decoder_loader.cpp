@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "core/framework/config/eplb_config.h"
 #include "core/kernels/ops_api.h"
+#include "core/layers/npu/loader/deepseek_loader_family_utils.h"
 #include "core/layers/npu/npu_base_layer.h"
 #include "deepseek_decoder_loader_constants.h"
 
@@ -984,6 +985,12 @@ void DeekseekV32DecoderLoader::set_kv_weight(const StateDict& state_dict,
 }
 
 void DeekseekV32DecoderLoader::preprocess_linear_for_rope() {
+  // Check before permuting either attention or indexer channels: an odd
+  // RoPE dimension preserves tensor sizes but breaks real/imaginary pairing.
+  CHECK_EQ(prefill_qkRopeHeadDim_ % 2, 0)
+      << "GLM/DeepSeekV32 layer " << layer_id_
+      << " RoPE dim must be even for channel interleaving, got "
+      << prefill_qkRopeHeadDim_;
   auto& t = working_tensors();
   std::vector<std::string> linear_for_rope;
   linear_for_rope.reserve(6);
@@ -1036,6 +1043,26 @@ void DeekseekV32DecoderLoader::preprocess_linear_for_rope() {
     CHECK_GE(index_head_dim_, prefill_qkRopeHeadDim_)
         << "GLM indexer head dim must be greater than or equal to rope dim";
     CHECK_GT(index_n_heads_, 0) << "GLM indexer head count must be positive";
+
+    // WK is permuted before LayerNorm. Its affine parameters must use
+    // the same channels so the normalized K remains a pure permutation.
+    for (int32_t index : {IN_INDEXER_K_NORM_WEIGHT, IN_INDEXER_K_NORM_BIAS}) {
+      if (is_placeholder_tensor(t[index])) {
+        continue;
+      }
+      CHECK_EQ(t[index].numel(), index_head_dim_)
+          << "GLM/DeepSeekV32 layer " << layer_id_ << " indexer k_norm "
+          << (index == IN_INDEXER_K_NORM_WEIGHT ? "weight" : "bias")
+          << " numel mismatch: got " << t[index].numel() << ", expected "
+          << index_head_dim_ << ", tensor=" << tensor_debug_string(t[index]);
+      // Affine weights are loaded as unsharded contiguous tensors.
+      const torch::Tensor affine = t[index].view({-1});
+      // Convert the first rope_dim channels from interleaved
+      // [r0, i0, r1, i1, ...] to split-half [r0, r1, ..., i0, i1, ...]
+      // to match WK and the ATB RoPE layout; keep non-RoPE channels unchanged.
+      t[index] = deepseek_loader_family_utils::trans_front_rope_weight(
+          affine, /*dim=*/0, prefill_qkRopeHeadDim_, /*clone_first=*/true);
+    }
 
     std::vector<std::string> indexer_linear_for_rope;
     indexer_linear_for_rope.reserve(5);
@@ -1144,13 +1171,11 @@ torch::Tensor DeekseekV32DecoderLoader::trans_rope_weight(
 
 torch::Tensor DeekseekV32DecoderLoader::trans_front_rope_weight(
     torch::Tensor weight) {
-  int64_t rope_dim = prefill_qkRopeHeadDim_;
-  torch::Tensor output = load_to_host() ? weight.clone() : weight;
-  torch::Tensor weight_1 = weight.slice(-2, 0, rope_dim, 2).contiguous();
-  torch::Tensor weight_2 = weight.slice(-2, 1, rope_dim, 2).contiguous();
-  torch::Tensor combined = torch::cat({weight_1, weight_2}, -2);
-  output.slice(-2, 0, rope_dim).copy_(combined);
-  return output.contiguous();
+  return deepseek_loader_family_utils::trans_front_rope_weight(
+      weight,
+      /*dim=*/-2,
+      prefill_qkRopeHeadDim_,
+      /*clone_first=*/load_to_host());
 }
 
 void DeekseekV32DecoderLoader::initialize_device_expert_list(
