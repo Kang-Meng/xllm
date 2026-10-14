@@ -24,6 +24,9 @@ from typing import List
 
 import torch
 
+# Full bidirectional window (INT32_MAX), matching C++ kSwaIntMax.
+_FULL_ATTENTION_WINDOW = 2147483647
+
 reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache
 update_decode_graph_metadata = torch.ops.xllm_ops.update_decode_graph_metadata
 
@@ -66,6 +69,42 @@ def vision_fusion_attention(
     )[0]
 
 
+def packed_infer_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    actual_seq_lengths: list[int],
+    num_heads: int,
+    num_key_value_heads: int,
+    scale: float,
+    input_layout: str = "TND",
+) -> torch.Tensor:
+    """Run bidirectional packed self-attention using fused infer attention.
+
+    Cumulative sequence lengths keep media items independent. This uses the
+    infer-attention operator, distinct from ``vision_fusion_attention``.
+    """
+    import torch_npu
+
+    # No mask or paged KV: sparse_mode=0 selects dense attention, and the
+    # full window states the bidirectional contract explicitly.
+    return torch_npu.npu_fused_infer_attention_score(
+        query=query,
+        key=key.contiguous(),
+        value=value.contiguous(),
+        actual_seq_lengths=actual_seq_lengths,
+        actual_seq_lengths_kv=actual_seq_lengths,
+        num_heads=num_heads,
+        num_key_value_heads=num_key_value_heads,
+        scale=scale,
+        input_layout=input_layout,
+        sparse_mode=0,
+        pre_tokens=_FULL_ATTENTION_WINDOW,
+        next_tokens=_FULL_ATTENTION_WINDOW,
+    )[0]
+
+
 def batch_matmul_transpose(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Project MLA input [T,H,D] with weight [H,D,O] into [T,H,O]."""
     return torch.ops.npu.npu_transpose_batchmatmul(
@@ -81,5 +120,6 @@ __all__ = [
     "reshape_paged_cache",
     "update_decode_graph_metadata",
     "vision_fusion_attention",
+    "packed_infer_attention",
     "batch_matmul_transpose",
 ]

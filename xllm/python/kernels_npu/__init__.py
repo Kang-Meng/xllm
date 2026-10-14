@@ -33,6 +33,7 @@ _EXPORTS = {
         "reshape_paged_cache",
         "update_decode_graph_metadata",
         "vision_fusion_attention",
+        "packed_infer_attention",
     ),
     "causal_conv1d": (
         "causal_conv1d_decode",
@@ -145,6 +146,7 @@ __all__ = [
     "reshape_paged_cache",
     "update_decode_graph_metadata",
     "vision_fusion_attention",
+    "packed_infer_attention",
     "batch_matmul_transpose",
     "fused_qk_norm_rope",
     "build_split_qkv_rmsnorm_mrope_gather_pattern",
