@@ -44,9 +44,9 @@ from xllm.python.attention.backend import (  # noqa: E402
 from xllm.python.attention.sfa_dcp_backend import dcp_layer_options  # noqa: E402
 from xllm.python.layers.attention import Attention  # noqa: E402
 from xllm.python.layers.npu.mega_moe_metadata import MegaMoeMetadata  # noqa: E402
-from xllm.python.layers.npu.mega_moe_metadata_builder import (  # noqa: E402
-    TokenOwnerMegaMoeMetadataBuilder,
-)
+from xllm.python.layers.npu.qwen3_5.moe_metadata import Qwen3_5MoeMetadata  # noqa: E402
+from xllm.python.layers.sequence_parallel import SpMetadataBuilder  # noqa: E402
+from xllm.python.layers.sequence_parallel_metadata import SpMetadata  # noqa: E402
 from xllm.python.model_executor.execution_context import (  # noqa: E402
     LayerCacheAwareExecutionMetadataBuilder,
 )
@@ -1223,7 +1223,7 @@ class TestModelExecutorConstruction:
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor.get_execution_metadata_builder_classes")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
-    def test_acl_graph_qwen_mega_moe_keeps_legacy_mask_with_metadata_builder(
+    def test_acl_graph_qwen_mega_moe_keeps_compat_mask_with_metadata_builder(
         self,
         mock_create,
         mock_builder_classes,
@@ -1231,7 +1231,7 @@ class TestModelExecutorConstruction:
     ) -> None:
         mock_create.return_value = StubAttentionBackend()
         builder = MagicMock()
-        builder.metadata_type = MegaMoeMetadata
+        builder.metadata_type = Qwen3_5MoeMetadata
         builder.bind_layer_caches = MagicMock()
         builder_class = MagicMock()
         builder_class.from_config.return_value = builder
@@ -1928,159 +1928,6 @@ class TestDecodeAclGraphSpeculativeMetadata:
         assert mask is not None
         assert mask.tolist() == [1, 1, 1, 0, 1, 0, 0, 0]
 
-    def test_token_owner_metadata_builder_updates_graph_mask_in_place(self) -> None:
-        builder = TokenOwnerMegaMoeMetadataBuilder(
-            is_token_owner=True,
-            dp_size=1,
-            dp_rank=0,
-            hidden_size=8,
-            top_k=2,
-            token_limit=4096,
-        )
-        input_batch = _make_input_batch((3,), token_capacity=4)
-        runtime_metadata = SimpleNamespace()
-        persistent_metadata = builder.allocate_persistent(input_batch, runtime_metadata)
-        active_token_mask = persistent_metadata.active_token_mask
-        data_ptr = active_token_mask.data_ptr()
-
-        builder.update_persistent(
-            persistent_metadata,
-            input_batch,
-            runtime_metadata,
-        )
-
-        assert active_token_mask.data_ptr() == data_ptr
-        assert active_token_mask.tolist() == [1, 1, 1, 0]
-
-    def test_token_non_owner_graph_metadata_contains_shared_dummy_inputs(self) -> None:
-        builder = TokenOwnerMegaMoeMetadataBuilder(
-            is_token_owner=False,
-            dp_size=1,
-            dp_rank=0,
-            hidden_size=8,
-            top_k=2,
-            token_limit=4096,
-        )
-        input_batch = _make_input_batch((1,), token_capacity=4)
-        runtime_metadata = SimpleNamespace()
-        metadata = builder.allocate_persistent(input_batch, runtime_metadata)
-
-        assert metadata.active_token_mask.tolist() == [1, 0, 0, 0]
-        assert metadata.dummy_input is not None
-        assert metadata.dummy_input.shape == (4, 8)
-        assert metadata.dummy_input.dtype == torch.bfloat16
-        assert metadata.dummy_topk_weights is not None
-        assert metadata.dummy_topk_weights.shape == (4, 2)
-        assert metadata.dummy_topk_weights.dtype == torch.float32
-        assert metadata.dummy_topk_ids is not None
-        assert metadata.dummy_topk_ids.shape == (4, 2)
-        assert metadata.dummy_topk_ids.dtype == torch.int32
-
-        data_ptrs = (
-            metadata.dummy_input.data_ptr(),
-            metadata.dummy_topk_weights.data_ptr(),
-            metadata.dummy_topk_ids.data_ptr(),
-        )
-        builder.update_persistent(metadata, input_batch, runtime_metadata)
-        assert data_ptrs == (
-            metadata.dummy_input.data_ptr(),
-            metadata.dummy_topk_weights.data_ptr(),
-            metadata.dummy_topk_ids.data_ptr(),
-        )
-
-    def test_token_non_owner_skips_dummy_inputs_above_mega_moe_limit(self) -> None:
-        builder = TokenOwnerMegaMoeMetadataBuilder(
-            is_token_owner=False,
-            dp_size=1,
-            dp_rank=0,
-            hidden_size=8,
-            top_k=2,
-            token_limit=2,
-        )
-
-        metadata = builder.build(
-            _make_input_batch((3,)),
-            SimpleNamespace(),
-        )
-
-        assert metadata.dummy_input is None
-        assert metadata.dummy_topk_weights is None
-        assert metadata.dummy_topk_ids is None
-
-    def test_token_owner_builder_returns_same_metadata_type_for_eager_and_graph(self) -> None:
-        builder = TokenOwnerMegaMoeMetadataBuilder(
-            is_token_owner=True,
-            dp_size=2,
-            dp_rank=0,
-            hidden_size=8,
-            top_k=2,
-            token_limit=4096,
-        )
-        eager_batch = _make_input_batch((2,))
-        eager_metadata = builder.build(
-            eager_batch,
-            SimpleNamespace(dp_execution_token_counts=(2, 3)),
-        )
-        graph_metadata = builder.allocate_persistent(
-            _make_input_batch((2,), token_capacity=4),
-            SimpleNamespace(dp_execution_token_counts=(2, 3)),
-        )
-
-        assert isinstance(eager_metadata, MegaMoeMetadata)
-        assert isinstance(graph_metadata, MegaMoeMetadata)
-        assert eager_metadata.active_token_mask.tolist() == [1, 1, 0]
-
-    @pytest.mark.parametrize(
-        ("execution_token_counts", "error"),
-        (
-            ((), "expected 2 DP execution token counts"),
-            ((2,), "expected 2 DP execution token counts"),
-            ((1, 3), "does not match the local input"),
-        ),
-    )
-    def test_token_owner_builder_rejects_invalid_dp_execution_counts(
-        self,
-        execution_token_counts: tuple[int, ...],
-        error: str,
-    ) -> None:
-        builder = TokenOwnerMegaMoeMetadataBuilder(
-            is_token_owner=True,
-            dp_size=2,
-            dp_rank=0,
-            hidden_size=8,
-            top_k=2,
-            token_limit=4096,
-        )
-
-        with pytest.raises(RuntimeError, match=error):
-            builder.build(
-                _make_input_batch((2,)),
-                SimpleNamespace(dp_execution_token_counts=execution_token_counts),
-            )
-
-    def test_token_owner_metadata_builder_uses_one_graph_mask_for_all_layers(self) -> None:
-        builder = TokenOwnerMegaMoeMetadataBuilder(
-            is_token_owner=True,
-            dp_size=1,
-            dp_rank=0,
-            hidden_size=8,
-            top_k=2,
-            token_limit=4096,
-        )
-        input_batch = _make_input_batch((2,), token_capacity=4)
-        runtime_metadata = SimpleNamespace()
-        metadata = builder.allocate_persistent(input_batch, runtime_metadata)
-        active_token_mask = metadata.active_token_mask
-
-        builder.update_persistent(
-            metadata,
-            input_batch,
-            runtime_metadata,
-        )
-
-        assert metadata.active_token_mask.data_ptr() == active_token_mask.data_ptr()
-        assert metadata.active_token_mask.tolist() == [1, 1, 0, 0]
-
 
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor.bind_kv_caches
@@ -2229,8 +2076,8 @@ def test_eager_runner_builds_model_visible_execution_metadata() -> None:
     runner = _make_eager_runner(is_mla=False)
     runner.cp_size = 1
     builder = MagicMock()
-    builder.metadata_type = MegaMoeMetadata
-    eager_metadata = MegaMoeMetadata(
+    builder.metadata_type = Qwen3_5MoeMetadata
+    eager_metadata = Qwen3_5MoeMetadata(
         active_token_mask=torch.tensor([1, 1, 0], dtype=torch.int8),
     )
     builder.build.return_value = eager_metadata
@@ -2247,7 +2094,7 @@ def test_eager_runner_builds_model_visible_execution_metadata() -> None:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        assert get_execution_context(MegaMoeMetadata) is eager_metadata
+        assert get_execution_context(Qwen3_5MoeMetadata) is eager_metadata
         return input_ids + positions
 
     runner.model.side_effect = _execute_model
@@ -2258,6 +2105,37 @@ def test_eager_runner_builds_model_visible_execution_metadata() -> None:
         input_batch=input_batch,
     )
 
+    builder.build.assert_called_once_with(input_batch, metadata)
+    torch.testing.assert_close(output, input_batch.input_ids + input_batch.positions)
+
+
+def test_eager_runner_prepares_sp_ep_layout_once_for_all_layers() -> None:
+    runner = _make_eager_runner(is_mla=False)
+    runner.cp_size = 1
+    builder = SpMetadataBuilder(tp_size=2, tp_rank=1, dp_size=2, dp_rank=0)
+    real_build = builder.build
+    builder.build = MagicMock(wraps=real_build)
+    runner.bind_execution_metadata_builders((builder,))
+    input_batch = _make_input_batch((3,))
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        dp_execution_token_counts=(3, 5),
+        raw_dp_execution_token_counts=(3, 5),
+    )
+
+    def execute_model(input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        first = get_execution_context(SpMetadata).ep_layout
+        assert first.dispatch_counts == (2, 1, 3, 2)
+        for _ in range(3):
+            assert get_execution_context(SpMetadata).ep_layout is first
+        assert get_forward_context().layer_shared_cache == {}
+        return input_ids + positions
+
+    runner.model.side_effect = execute_model
+    output = runner.execute(input_batch.input_ids, input_batch.positions, metadata, input_batch=input_batch)
     builder.build.assert_called_once_with(input_batch, metadata)
     torch.testing.assert_close(output, input_batch.input_ids + input_batch.positions)
 

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -124,6 +126,7 @@ def test_model_records_pd_layer_events_in_order() -> None:
 
     model = Qwen3_5Model.__new__(Qwen3_5Model)
     torch.nn.Module.__init__(model)
+    model.cfg = SimpleNamespace(sequence_parallel_enabled=False)
     model.embed_tokens = torch.nn.Identity()
     model.layers = torch.nn.ModuleList(DecoderLayer() for _ in range(3))
     model.norm = FinalNorm()
@@ -193,6 +196,50 @@ def test_attention_parallel_product_must_equal_world_size():
 
     with pytest.raises(ValueError, match=r"tp_size \* dp_size"):
         cfg.validate()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"hidden_size": 65}, "hidden size must be divisible by tp_size"),
+        ({"vocab_size": 129}, "vocabulary size must be divisible by tp_size"),
+    ],
+)
+def test_model_config_owns_parallel_dimension_validation(overrides: dict[str, object], error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        _config(**overrides).validate()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"sequence_parallel_enabled": False}, "MegaMoe requires sequence parallelism"),
+        (
+            {"num_experts": 0, "num_experts_per_tok": 0},
+            "requires a MoE model",
+        ),
+        ({"dp_size": 1, "world_size": 2, "ep_size": 2}, "requires DP > 1"),
+        ({"ep_size": 2, "moe_tp_size": 2}, "requires MoE-TP = 1 and EP = world_size"),
+        ({"mega_moe_context": None}, "requires a communication context"),
+        ({"mega_moe_ccl_buffer_size": 0}, "requires positive communication capacities"),
+        ({"mega_moe_num_max_tokens_per_rank": 0}, "requires positive communication capacities"),
+    ],
+)
+def test_model_config_owns_mega_moe_validation(overrides: dict[str, object], error: str) -> None:
+    config: dict[str, object] = {
+        "dp_size": 2,
+        "world_size": 4,
+        "moe_tp_size": 1,
+        "ep_size": 4,
+        "enable_mega_moe": True,
+        "sequence_parallel_enabled": True,
+        "mega_moe_context": torch.zeros(1, dtype=torch.int32),
+        "mega_moe_ccl_buffer_size": 1024,
+        "mega_moe_num_max_tokens_per_rank": 4096,
+    }
+    config.update(overrides)
+    with pytest.raises(ValueError, match=error):
+        _config(**config).validate()
 
 
 def test_full_attention_kv_heads_support_replication() -> None:

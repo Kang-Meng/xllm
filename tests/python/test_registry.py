@@ -58,6 +58,8 @@ def test_qwen35_registers_execution_metadata_builder_class() -> None:
     assert tuple(builder_class.__name__ for builder_class in builder_classes) == (
         "DenseDcpMetadataBuilder",
         "TokenOwnerMegaMoeMetadataBuilder",
+        "SpMetadataBuilder",
+        "Qwen3_5MoeMetadataBuilder",
         "Qwen3_5GdnMetadataBuilder",
     )
 

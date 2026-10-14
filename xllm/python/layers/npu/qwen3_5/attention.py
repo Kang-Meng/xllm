@@ -12,27 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NPU-specific Qwen3.5 full-attention fusion."""
+"""NPU-specific Qwen3.5 full-attention implementation."""
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
+import torch.nn as nn
 
 from xllm.python import kernels
+from xllm.python.layers.attention import Attention
+from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.layers.npu.layernorm import NpuGemmaRMSNorm
-from xllm.python.layers.qwen3_5.attention import Qwen3_5Attention
 from xllm.python.layers.qwen3_5.common import (
     PartialRotaryEmbedding,
     Qwen3_5AttentionConfig,
 )
-from xllm.python.model_executor.forward_context import get_forward_context_or_none
-from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
+from xllm.python.layers.sequence_parallel import sp_row_parallel_projection
+from xllm.python.layers.sequence_parallel_metadata import SpMetadata
+from xllm.python.model_executor.forward_context import get_execution_context, get_forward_context_or_none
+from xllm.python.model_loader import (
+    ParallelLoadContext,
+    ScopedWeightLoader,
+    load_gqa_fused_attention,
+)
 
 
-class NpuQwen3_5Attention(Qwen3_5Attention):
-    """Qwen3.5 attention using the same fused QKV kernel as native C++."""
-
-    normalization_cls = NpuGemmaRMSNorm
+class NpuQwen3_5Attention(nn.Module):
+    supports_sequence_parallel = True
+    normalization_cls: type[nn.Module] = NpuGemmaRMSNorm
 
     def __init__(
         self,
@@ -42,13 +51,19 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
         device: torch.device,
         rotary: PartialRotaryEmbedding,
     ) -> None:
-        super().__init__(cfg, layer_id, dtype, device, rotary)
+        super().__init__()
+        self.cfg = cfg
+        self.layer_id = layer_id
+        self.num_heads, self.num_kv_heads = cfg.head_split()
+        self.head_dim = cfg.head_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         rotary_dim = int(self.head_dim * cfg.partial_rotary_factor)
         is_npu = device.type in ("npu", "privateuseone")
-        self.use_fused_qkv = (
+        self._fused_qkv_enabled = (
             is_npu
             and dtype == torch.bfloat16
-            and self.attn_output_gate
+            and cfg.attn_output_gate
             and len(cfg.rope_scaling_mrope_section) == 3
             and rotary_dim > 0
             and kernels.has_split_qkv_rmsnorm_mrope_specialization(
@@ -58,7 +73,7 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
             )
         )
         self._weights_reordered = False
-        if self.use_fused_qkv:
+        if self._fused_qkv_enabled:
             gather_pattern = kernels.build_split_qkv_rmsnorm_mrope_gather_pattern(
                 rotary_dim,
                 cfg.rope_scaling_mrope_section,
@@ -72,18 +87,48 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
             gather_pattern,
             persistent=False,
         )
-
-    def load_weights(
-        self,
-        state: ScopedWeightLoader,
-        context: ParallelLoadContext,
-    ) -> None:
-        self._weights_reordered = False
-        super().load_weights(state, context)
+        q_multiplier = 2 if cfg.attn_output_gate else 1
+        self.qkv_proj = ColumnParallelLinear(
+            cfg.hidden_size,
+            q_multiplier * self.q_size + 2 * self.kv_size,
+            cfg.tp_size,
+            bias=cfg.attention_bias,
+            dtype=dtype,
+            device=device,
+        )
+        self.o_proj = RowParallelLinear(
+            self.q_size,
+            cfg.hidden_size,
+            cfg.tp_size,
+            bias=cfg.attention_bias,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_norm = self.normalization_cls(
+            self.head_dim,
+            cfg.rms_norm_eps,
+            dtype=dtype,
+            device=device,
+        )
+        self.k_norm = self.normalization_cls(
+            self.head_dim,
+            cfg.rms_norm_eps,
+            dtype=dtype,
+            device=device,
+        )
+        self.rotary = rotary
+        self.attn = Attention(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.head_dim**-0.5,
+            0,
+            layer_id,
+        )
 
     def _finish_loading(self) -> None:
         self.o_proj.process_weights_after_loading()
-        if not self.use_fused_qkv or self._weights_reordered:
+        if not self._fused_qkv_enabled or self._weights_reordered:
             return
 
         with torch.no_grad():
@@ -126,6 +171,15 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
             self.k_norm.weight.add_(1.0)
         self._weights_reordered = True
 
+    def load_weights(
+        self,
+        state: ScopedWeightLoader,
+        context: ParallelLoadContext,
+    ) -> None:
+        self._weights_reordered = False
+        load_gqa_fused_attention(self, state, context, self.cfg.n_kv_heads)
+        self._finish_loading()
+
     def _get_mrope_cos_sin(self, positions: torch.Tensor) -> torch.Tensor:
         context = get_forward_context_or_none()
         if context is None:
@@ -136,19 +190,51 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
         if cached is None:
             cached = self.rotary.build_mrope_cos_sin(positions)
             context.layer_shared_cache[cache_key] = cached
-        if not isinstance(cached, torch.Tensor):
-            raise TypeError("invalid cached Qwen3.5 mRoPE cosine/sine tensor")
-        return cached
+        return cast(torch.Tensor, cached)
+
+    def _project_output(self, output: torch.Tensor) -> torch.Tensor:
+        if self.cfg.sequence_parallel_enabled:
+            sp_layout = get_execution_context(SpMetadata)
+            return sp_row_parallel_projection(self.o_proj, output, sp_layout)
+        return self.o_proj(output)
+
+    def _forward_standard(
+        self,
+        positions: torch.Tensor,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv = self.qkv_proj(hidden)
+        if self.cfg.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [2 * self.q_size, self.kv_size, self.kv_size],
+                dim=-1,
+            )
+            q_gate = q_gate.view(-1, self.num_heads, 2 * self.head_dim)
+            q, gate = q_gate.chunk(2, dim=-1)
+        else:
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size],
+                dim=-1,
+            )
+            q = q.view(-1, self.num_heads, self.head_dim)
+            gate = None
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = self.rotary(positions, q).reshape(-1, self.q_size)
+        k = self.rotary(positions, k).reshape(-1, self.kv_size)
+        output = self.attn(q, k, v)
+        if gate is not None:
+            output = output * torch.sigmoid(gate.reshape(-1, self.q_size))
+        return self._project_output(output)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.use_fused_qkv:
-            return super().forward(positions, hidden)
-        if self._mrope_gather_pattern is None:
-            raise RuntimeError("fused QKV mRoPE gather pattern is unavailable")
+        if not self._fused_qkv_enabled:
+            return self._forward_standard(positions, hidden)
 
         mrope_cos_sin = self._get_mrope_cos_sin(positions)
         qkvg = self.qkv_proj(hidden)
@@ -170,4 +256,4 @@ class NpuQwen3_5Attention(Qwen3_5Attention):
             value.view(num_tokens, self.kv_size),
         )
         output = output * torch.sigmoid(gate.view(num_tokens, self.q_size))
-        return self.o_proj(output)
+        return self._project_output(output)

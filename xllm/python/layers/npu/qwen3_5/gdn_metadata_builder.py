@@ -38,37 +38,6 @@ if TYPE_CHECKING:
 
 
 _MEGA_GDN_CHUNK_SIZE = 128
-_MEGA_GDN_CONV_KERNEL_SIZE = 4
-_MEGA_GDN_HEAD_DIM = 128
-_SUPPORTED_MEGA_GDN_PREFILL_HEAD_COUNTS = frozenset((1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64))
-
-
-def _validate_mega_gdn_config(
-    config: Mapping[str, object],
-    num_key_heads: int,
-    num_value_heads: int,
-    key_head_dim: int,
-    value_head_dim: int,
-) -> None:
-    """Reject configurations unsupported by the fused MegaGdn kernels."""
-    if int(config.get("linear_conv_kernel_dim", _MEGA_GDN_CONV_KERNEL_SIZE)) != _MEGA_GDN_CONV_KERNEL_SIZE:
-        raise NotImplementedError("Qwen3.5 MegaGdn requires convolution width 4")
-    if key_head_dim != _MEGA_GDN_HEAD_DIM or value_head_dim != _MEGA_GDN_HEAD_DIM:
-        raise NotImplementedError("Qwen3.5 MegaGdn requires K/V head dimension 128")
-    if num_value_heads not in _SUPPORTED_MEGA_GDN_PREFILL_HEAD_COUNTS:
-        raise NotImplementedError(f"Qwen3.5 MegaGdnPrefill does not support {num_value_heads} local value heads")
-    if num_key_heads <= 0 or num_key_heads > 16:
-        raise NotImplementedError("Qwen3.5 MegaGdnDecode supports 1 to 16 local key heads")
-    if num_key_heads & (num_key_heads - 1):
-        raise NotImplementedError("Qwen3.5 MegaGdnDecode requires a power-of-two local key-head count")
-    if num_value_heads % num_key_heads != 0:
-        raise NotImplementedError("Qwen3.5 MegaGdn requires Nv divisible by Nk")
-    if num_value_heads // num_key_heads > 4:
-        raise NotImplementedError("Qwen3.5 MegaGdnDecode supports at most four value heads per key head")
-
-    dtype = config.get("dtype") or config.get("torch_dtype") or "bfloat16"
-    if dtype != torch.bfloat16 and str(dtype).removeprefix("torch.") != "bfloat16":
-        raise NotImplementedError("Qwen3.5 MegaGdn supports BF16 model weights only")
 
 
 def _build_mega_prefill_indices(
@@ -163,13 +132,6 @@ class Qwen3_5GdnMetadataBuilder:
         num_value_heads = global_num_value_heads // tp_size
         key_head_dim = int(config.get("linear_key_head_dim", 128))
         value_head_dim = int(config.get("linear_value_head_dim", 128))
-        _validate_mega_gdn_config(
-            config,
-            num_key_heads,
-            num_value_heads,
-            key_head_dim,
-            value_head_dim,
-        )
         conv_dim = 2 * num_key_heads * key_head_dim + num_value_heads * value_head_dim
         return cls(
             layer_ids=layer_ids,

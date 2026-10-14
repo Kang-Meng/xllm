@@ -101,8 +101,9 @@ int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
 
   const int64_t speculative_width = num_speculative_tokens + 1;
   const int64_t max_decode_tokens = max_seqs_per_batch * speculative_width;
-  // Qwen3.5 uses MegaMoe for both prefill and token-owner decode. It does not
-  // gather DP tokens before dispatch, so no empty-rank dummy rows are added.
+  // Qwen3.5 uses MegaMoe for both prefill and sequence-parallel decode. It does
+  // not gather DP tokens before dispatch, so no empty-rank dummy rows are
+  // added.
   return std::max(max_tokens_per_batch, max_decode_tokens);
 }
 
@@ -189,14 +190,15 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
       kernel_config.enable_mega_moe() && is_qwen3_5_mega_moe_model;
   if (enable_qwen3_5_mega_moe) {
     CHECK_GT(tp_size_, 1)
-        << "Qwen3.5 MegaMoe token ownership requires attention TP > 1.";
-    CHECK_GT(dp_size_, 1) << "Qwen3.5 MegaMoe token ownership requires DP > 1.";
+        << "Qwen3.5 MegaMoe sequence parallelism requires attention TP > 1.";
+    CHECK_GT(dp_size_, 1)
+        << "Qwen3.5 MegaMoe sequence parallelism requires DP > 1.";
     CHECK_EQ(cp_size_, 1)
-        << "Qwen3.5 MegaMoe token ownership requires CP == 1.";
+        << "Qwen3.5 MegaMoe sequence parallelism requires CP == 1.";
     CHECK_EQ(moe_tp_size_, 1)
-        << "Qwen3.5 MegaMoe token ownership requires MoE TP == 1.";
+        << "Qwen3.5 MegaMoe sequence parallelism requires MoE TP == 1.";
     CHECK_EQ(ep_size_, parallel_args.world_size())
-        << "Qwen3.5 MegaMoe token ownership requires EP == world size.";
+        << "Qwen3.5 MegaMoe sequence parallelism requires EP == world size.";
   }
   const bool enable_mega_moe = enable_glm_mega_moe || enable_qwen3_5_mega_moe;
   if (enable_mega_moe) {
@@ -415,6 +417,9 @@ py::dict PyCausalLM::build_config_dict(
   d["dtype"] = dtype_to_string(options_);
   d["device"] = c10::str(device_);
   d["enable_disagg_pd"] = DisaggPDConfig::get_instance().enable_disagg_pd();
+  if (is_qwen3_5_target_model_type(model_args_.model_type())) {
+    d["instance_role"] = DisaggPDConfig::get_instance().instance_role();
+  }
   d["enable_eplb"] = EPLBConfig::get_instance().enable_eplb();
   d["use_ctc"] = MultimodalConfig::get_instance().use_ctc();
   d["redundant_experts_num"] =

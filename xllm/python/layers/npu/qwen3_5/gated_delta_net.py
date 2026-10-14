@@ -32,9 +32,39 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnSpecVerifyMetadata,
 )
 from xllm.python.layers.qwen3_5.common import Qwen3_5GatedDeltaNetConfig
-from xllm.python.layers.qwen3_5.gated_delta_net import shard_qkv_rows
+from xllm.python.layers.sequence_parallel import sp_row_parallel_projection
+from xllm.python.layers.sequence_parallel_metadata import SpMetadata
 from xllm.python.model_executor.forward_context import get_execution_context
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
+
+
+def _shard_qkv_rows(
+    state: ScopedWeightLoader,
+    tensor: torch.Tensor,
+    local_name: str,
+    cfg: Qwen3_5GatedDeltaNetConfig,
+    context: ParallelLoadContext,
+) -> torch.Tensor:
+    """Split checkpoint Q/K/V rows for this NPU TP rank."""
+    global_key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    global_value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    q, k, v = tensor.split(
+        (global_key_dim, global_key_dim, global_value_dim),
+        dim=0,
+    )
+    return torch.cat(
+        [
+            state.shard_value(
+                part,
+                f"{local_name}[{tag}]",
+                0,
+                context.tp_rank,
+                context.tp_size,
+            )
+            for part, tag in ((q, "q"), (k, "k"), (v, "v"))
+        ]
+    )
+
 
 _MEGA_GDN_MAX_DECODE_BATCH_SIZE = 32
 _MEGA_GDN_FIXED_RMS_NORM_EPS = 1e-6
@@ -62,6 +92,8 @@ def _validate_mega_gdn_head_geometry(
 class NpuQwen3_5GatedDeltaNet(nn.Module):
     """NPU graph whose nodes match the native fused operator boundaries."""
 
+    supports_sequence_parallel = True
+
     def __init__(
         self,
         cfg: Qwen3_5GatedDeltaNetConfig,
@@ -82,6 +114,12 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
             )
         self.cfg = cfg
         self.layer_id = layer_id
+        if dtype != torch.bfloat16:
+            raise NotImplementedError("Qwen3.5 MegaGdn supports BF16 model weights only")
+        if cfg.linear_conv_kernel_dim != 4:
+            raise NotImplementedError("Qwen3.5 MegaGdn requires convolution width 4")
+        if cfg.linear_key_head_dim != 128 or cfg.linear_value_head_dim != 128:
+            raise NotImplementedError("Qwen3.5 MegaGdn requires K/V head dimension 128")
         self.num_k_heads = cfg.linear_num_key_heads // cfg.tp_size
         self.num_v_heads = cfg.linear_num_value_heads // cfg.tp_size
         _validate_mega_gdn_head_geometry(self.num_k_heads, self.num_v_heads)
@@ -147,11 +185,6 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
                 device=device,
             )
         )
-        self.register_buffer(
-            "conv1d_bias",
-            torch.zeros(self.conv_dim, dtype=dtype, device=device),
-            persistent=False,
-        )
 
     def _input_projection_weight_views(
         self,
@@ -170,7 +203,7 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         qkv_weight, z_weight, b_weight, a_weight = self._input_projection_weight_views()
         state.copy(
             qkv_weight,
-            shard_qkv_rows(
+            _shard_qkv_rows(
                 state,
                 state.get_tensor("in_proj_qkv.weight"),
                 "in_proj_qkv.weight",
@@ -192,7 +225,7 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
                 world_size=context.tp_size,
             )
 
-        local_conv = shard_qkv_rows(
+        local_conv = _shard_qkv_rows(
             state,
             state.get_tensor("conv1d.weight").squeeze(1),
             "conv1d.weight",
@@ -260,38 +293,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         mixed_qkv, z = mixed_qkvz.split((self.conv_dim, self.value_dim), dim=-1)
         b, a = mixed_ba.split((self.num_v_heads, self.num_v_heads), dim=-1)
         z = z.view(batch_size, self.num_v_heads, self.value_head_dim)
-        if self.conv_kernel_size != 4:
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode requires convolution width 4")
-        if self.key_head_dim != 128 or self.value_head_dim != 128:
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode requires K/V head dimension 128")
-        if self.num_k_heads <= 0 or self.num_k_heads > 16:
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode supports 1 to 16 local key heads")
-        if self.num_k_heads & (self.num_k_heads - 1):
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode requires a power-of-two local key-head count")
-        if self.num_v_heads % self.num_k_heads != 0:
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode requires Nv divisible by Nk")
-        value_heads_per_key = self.num_v_heads // self.num_k_heads
-        if value_heads_per_key < 1 or value_heads_per_key > 4:
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode supports at most four value heads per key head")
-        if self.conv1d_weight.shape != (self.conv_kernel_size, self.conv_dim):
-            raise ValueError("Qwen3.5 MegaGdnDecode received an invalid Conv weight")
-        if self.conv1d_weight.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode Conv tensors must be BF16")
-        if conv_state.dim() != 3 or conv_state.shape[1:] != (3, self.conv_dim):
+        if conv_state.shape[1] != 3:
             raise ValueError("Qwen3.5 MegaGdnDecode requires a three-token Conv cache")
-        if ssm_state.dim() != 4 or ssm_state.shape != (
-            conv_state.shape[0],
-            self.num_v_heads,
-            self.key_head_dim,
-            self.value_head_dim,
-        ):
-            raise ValueError("Qwen3.5 MegaGdnDecode requires one SSM row per Conv slot")
-        if ssm_state.dtype != torch.float32:
-            raise NotImplementedError("Qwen3.5 MegaGdnDecode SSM cache must be FP32")
-        if self.A_log.dtype != torch.float32 or self.dt_bias.dtype != torch.float32:
-            raise ValueError("Qwen3.5 MegaGdnDecode A_log and dt_bias must be FP32")
-        if self.norm_weight.dtype != torch.bfloat16:
-            raise ValueError("Qwen3.5 MegaGdnDecode norm weight must be BF16")
 
         read_state_indices = read_state_indices.contiguous()
         write_state_indices = write_state_indices.contiguous()
@@ -352,22 +355,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
                 f"to {MEGA_GDN_MTP_MAX_VERIFY_TOKENS} verify tokens"
             )
 
-        if conv_state.dim() != 3 or conv_state.shape[2] != self.conv_dim:
-            raise ValueError("Qwen3.5 MegaGdnMtpDecode received an invalid Conv cache")
         if conv_state.shape[1] != sequence_length + 2:
             raise ValueError("Qwen3.5 MegaGdnMtpDecode requires an S+2 Conv history")
-        if ssm_state.dim() != 4 or ssm_state.shape[1:] != (
-            self.num_v_heads,
-            self.key_head_dim,
-            self.value_head_dim,
-        ):
-            raise ValueError("Qwen3.5 MegaGdnMtpDecode received an invalid SSM cache")
-        if ssm_state.shape[0] != conv_state.shape[0] * sequence_length:
-            raise ValueError("Qwen3.5 MegaGdnMtpDecode requires one SSM checkpoint per verify token")
-        if self.conv1d_weight.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen3.5 MegaGdnMtpDecode Conv tensors must be BF16")
-        if ssm_state.dtype != torch.float32:
-            raise NotImplementedError("Qwen3.5 MegaGdnMtpDecode SSM cache must be FP32")
 
         mixed_qkvz = self.in_proj_qkvz(hidden)
         mixed_ba = self.in_proj_ba(hidden)
@@ -409,9 +398,7 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         metadata = get_execution_context(GdnMetadata)
         if metadata is None:
             raise RuntimeError("Qwen3.5 GDN metadata is unavailable")
-        state_cache = metadata.state_caches.get(self.layer_id)
-        if state_cache is None:
-            raise RuntimeError(f"Qwen3.5 GDN state cache is missing for layer {self.layer_id}")
+        state_cache = metadata.state_caches[self.layer_id]
 
         if isinstance(metadata, GdnPrefillMetadata):
             mixed_qkv, a, b, z = self._project_prefill_inputs(hidden)
@@ -458,4 +445,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             raise TypeError(f"Qwen3.5 GDN received unsupported metadata: {type(metadata).__name__}")
-        return self.out_proj(output.reshape(-1, self.value_dim))
+        projected_input = output.reshape(-1, self.value_dim)
+        if self.cfg.sequence_parallel_enabled:
+            sp_layout = get_execution_context(SpMetadata)
+            return sp_row_parallel_projection(self.out_proj, projected_input, sp_layout)
+        return self.out_proj(projected_input)

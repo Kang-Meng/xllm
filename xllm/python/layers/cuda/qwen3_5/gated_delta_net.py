@@ -22,9 +22,36 @@ import torch.nn as nn
 from xllm.python import kernels
 from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
 from xllm.python.layers.qwen3_5.common import Qwen3_5GatedDeltaNetConfig
-from xllm.python.layers.qwen3_5.gated_delta_net import shard_qkv_rows
 from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
+
+
+def _shard_qkv_rows(
+    state: ScopedWeightLoader,
+    tensor: torch.Tensor,
+    local_name: str,
+    cfg: Qwen3_5GatedDeltaNetConfig,
+    context: ParallelLoadContext,
+) -> torch.Tensor:
+    """Split checkpoint Q/K/V rows for this CUDA TP rank."""
+    global_key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    global_value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    q, k, v = tensor.split(
+        (global_key_dim, global_key_dim, global_value_dim),
+        dim=0,
+    )
+    return torch.cat(
+        [
+            state.shard_value(
+                part,
+                f"{local_name}[{tag}]",
+                0,
+                context.tp_rank,
+                context.tp_size,
+            )
+            for part, tag in ((q, "q"), (k, "k"), (v, "v"))
+        ]
+    )
 
 
 class CudaQwen3_5GatedDeltaNet(nn.Module):
@@ -255,7 +282,7 @@ class CudaQwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         state.copy(
             self.in_proj_qkv.weight,
-            shard_qkv_rows(
+            _shard_qkv_rows(
                 state,
                 state.get_tensor("in_proj_qkv.weight"),
                 "in_proj_qkv.weight",
@@ -273,7 +300,7 @@ class CudaQwen3_5GatedDeltaNet(nn.Module):
                 world_size=context.tp_size,
             )
 
-        local_conv = shard_qkv_rows(
+        local_conv = _shard_qkv_rows(
             state,
             state.get_tensor("conv1d.weight").squeeze(1),
             "conv1d.weight",

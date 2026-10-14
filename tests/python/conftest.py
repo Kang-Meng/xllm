@@ -129,6 +129,8 @@ def _install_python_package_stub() -> None:
         raise RuntimeError("engram DP-shared host table requires an initialized process-group world")
 
     distributed.init_engram_dp_group = _init_engram_dp_group
+    distributed.gather_dp_execution_tokens = lambda *args, **kwargs: None
+    distributed.all_reduce_ = lambda *args, **kwargs: None
 
     sys.modules["xllm.python"] = package
     sys.modules["xllm.python.kernels"] = kernels

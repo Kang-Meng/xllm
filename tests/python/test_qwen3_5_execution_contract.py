@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -25,8 +26,11 @@ import torch
 import torch.nn as nn
 
 from xllm.python.attention.backend import LayerCache
+from xllm.python.layers.cuda.qwen3_5.decoder_layer import CudaQwen3_5DecoderLayer
+from xllm.python.layers.npu.qwen3_5 import decoder_layer as npu_decoder_module
 from xllm.python.layers.npu.qwen3_5 import gated_delta_net
 from xllm.python.layers.npu.qwen3_5.attention import NpuQwen3_5Attention
+from xllm.python.layers.npu.qwen3_5.decoder_layer import NpuQwen3_5DecoderLayer
 from xllm.python.layers.npu.qwen3_5.gated_delta_net import NpuQwen3_5GatedDeltaNet
 from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnDecodeMetadata,
@@ -39,6 +43,7 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata_builder import (
     Qwen3_5GdnMetadataBuilder,
 )
 from xllm.python.layers.npu.qwen3_5.moe import NpuQwen3_5SparseMoEBlock
+from xllm.python.layers.sequence_parallel_metadata import SpMetadata
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -187,32 +192,54 @@ def test_gdn_prefill_builder_reuses_materialized_cu_seqlens() -> None:
 
 
 @pytest.mark.parametrize(
-    ("config_override", "error"),
+    ("config_override", "dtype", "error"),
     (
-        ({"linear_conv_kernel_dim": 3}, "convolution width 4"),
-        ({"linear_key_head_dim": 64}, "head dimension 128"),
-        ({"dtype": "float16"}, "BF16 model weights"),
+        ({"linear_conv_kernel_dim": 3}, torch.bfloat16, "convolution width 4"),
+        ({"linear_key_head_dim": 64}, torch.bfloat16, "head dimension 128"),
+        ({}, torch.float16, "BF16 model weights"),
     ),
 )
-def test_gdn_builder_rejects_unsupported_kernel_config(
+def test_gdn_layer_rejects_unsupported_kernel_config_at_construction(
     config_override: dict[str, object],
+    dtype: torch.dtype,
     error: str,
 ) -> None:
-    config: dict[str, object] = {
-        "device": "npu",
-        "n_layers": 1,
-        "layer_types": ["linear_attention"],
-        "linear_num_key_heads": 2,
-        "linear_num_value_heads": 2,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "dtype": "bfloat16",
-    }
-    config.update(config_override)
+    config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+    for name, value in config_override.items():
+        setattr(config, name, value)
 
     with pytest.raises(NotImplementedError, match=error):
-        Qwen3_5GdnMetadataBuilder.from_config(config)
+        NpuQwen3_5GatedDeltaNet(config, 0, dtype, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    ("cache_overrides", "error"),
+    [
+        ({"conv": None}, "state cache is missing"),
+        ({"conv": torch.zeros(8, 6, 17, dtype=torch.bfloat16)}, "Conv cache has invalid geometry"),
+        ({"ssm": torch.zeros(32, 3, 4, 4)}, "SSM cache has invalid geometry"),
+        ({"conv": torch.zeros(8, 6, 16)}, "state cache has invalid dtype"),
+        ({"conv": torch.zeros(8, 5, 16, dtype=torch.bfloat16)}, "Conv history has invalid geometry"),
+    ],
+)
+def test_gdn_builder_validates_cache_binding_once(cache_overrides: dict[str, object], error: str) -> None:
+    builder = Qwen3_5GdnMetadataBuilder(
+        layer_ids=(0,),
+        num_value_heads=2,
+        key_head_dim=4,
+        value_head_dim=4,
+        conv_dim=16,
+    )
+    cache = replace(_gdn_cache(), **cache_overrides)
+    with pytest.raises(ValueError, match=error):
+        builder.bind_layer_caches([cache])
 
 
 def test_gdn_builder_is_registered_only_for_npu_linear_attention() -> None:
@@ -389,6 +416,7 @@ def test_gdn_prefill_layer_consumes_builder_metadata(
     layer = NpuQwen3_5GatedDeltaNet.__new__(NpuQwen3_5GatedDeltaNet)
     nn.Module.__init__(layer)
     layer.layer_id = 0
+    layer.cfg = SimpleNamespace(sequence_parallel_enabled=False)
     layer.value_dim = 4
     layer.out_proj = nn.Identity()
     layer.conv1d_weight = nn.Parameter(torch.zeros(4, 16, dtype=torch.bfloat16))
@@ -456,12 +484,17 @@ def test_gdn_prefill_layer_consumes_builder_metadata(
     torch.testing.assert_close(output, kernel_output)
 
 
+@pytest.mark.parametrize("sequence_parallel", [False, None])
 def test_gdn_decode_layer_consumes_only_typed_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    sequence_parallel: bool | None,
 ) -> None:
     layer = NpuQwen3_5GatedDeltaNet.__new__(NpuQwen3_5GatedDeltaNet)
     nn.Module.__init__(layer)
     layer.layer_id = 0
+    layer.cfg = SimpleNamespace()
+    if sequence_parallel is not None:
+        layer.cfg.sequence_parallel_enabled = sequence_parallel
     layer.value_dim = 4
     layer.out_proj = nn.Identity()
     read_indices = torch.tensor([2, 3], dtype=torch.int32)
@@ -505,6 +538,10 @@ def test_gdn_decode_layer_consumes_only_typed_metadata(
     hidden = torch.randn(2, 4)
 
     with forward_context(context):
+        if sequence_parallel is None:
+            with pytest.raises(AttributeError, match="sequence_parallel_enabled"):
+                layer(hidden)
+            return
         output = layer(hidden)
 
     assert decode_call["conv_state"] is conv_state
@@ -512,6 +549,55 @@ def test_gdn_decode_layer_consumes_only_typed_metadata(
     assert decode_call["read"] is read_indices
     assert decode_call["write"] is write_indices
     torch.testing.assert_close(output, hidden)
+
+
+@pytest.mark.parametrize(
+    ("decoder_cls", "sequence_parallel"),
+    [(CudaQwen3_5DecoderLayer, False), (NpuQwen3_5DecoderLayer, False), (NpuQwen3_5DecoderLayer, True)],
+)
+@pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
+def test_qwen_decoder_waits_for_layer_load_before_compute(
+    decoder_cls: type[nn.Module],
+    sequence_parallel: bool,
+    layer_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = decoder_cls.__new__(decoder_cls)
+    nn.Module.__init__(layer)
+    layer.layer_id = 3
+    layer.layer_type = layer_type
+    layer.cfg = SimpleNamespace(
+        hidden_size=4,
+        is_moe_layer=lambda layer_id: True,
+        sequence_parallel_enabled=sequence_parallel,
+    )
+    synchronize = MagicMock()
+
+    def normalize(hidden: torch.Tensor) -> torch.Tensor:
+        synchronize.assert_called_once_with(layer.layer_id)
+        return hidden
+
+    layer.input_layernorm = MagicMock(side_effect=normalize)
+    layer.post_attention_layernorm = MagicMock(side_effect=lambda hidden, residual: (hidden, residual))
+    layer.linear_attn = nn.Identity()
+    layer.self_attn = MagicMock(side_effect=lambda positions, hidden: hidden)
+    layer.mlp = nn.Identity()
+    if sequence_parallel:
+        monkeypatch.setattr(npu_decoder_module, "sp_all_gather", lambda hidden, layout: hidden)
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=None,
+        layer_caches=[],
+        execution_contexts={SpMetadata: SpMetadata.from_execution_rows(4, 2, 0)},
+        layer_load_context=SimpleNamespace(synchronize_layer=synchronize),
+    )
+    hidden = torch.ones(2, 4)
+    with forward_context(context):
+        output, residual = layer(hidden, None, torch.arange(4))
+    synchronize.assert_called_once_with(3)
+    torch.testing.assert_close(output, hidden)
+    torch.testing.assert_close(residual, hidden)
 
 
 def test_npu_decoder_reuses_existing_attention_and_mega_moe() -> None:
@@ -536,3 +622,11 @@ def test_qwen35_model_source_has_no_execution_mode_dependencies() -> None:
         "is_padding",
     ):
         assert forbidden_name not in source
+
+
+def test_qwen35_model_does_not_depend_on_npu_metadata() -> None:
+    from xllm.python.models import qwen3_5
+
+    source = inspect.getsource(qwen3_5)
+    assert "layers.npu" not in source
+    assert "Qwen3_5MoeMetadata" not in source

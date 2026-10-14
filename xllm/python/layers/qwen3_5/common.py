@@ -33,6 +33,7 @@ class Qwen3_5AttentionConfig(Protocol):
     attention_bias: bool
     attn_output_gate: bool
     tp_size: int
+    sequence_parallel_enabled: bool
 
     def head_split(self) -> tuple[int, int]: ...
 
@@ -46,6 +47,7 @@ class Qwen3_5GatedDeltaNetConfig(Protocol):
     linear_num_key_heads: int
     linear_num_value_heads: int
     tp_size: int
+    sequence_parallel_enabled: bool
 
 
 class Qwen3_5MoEConfig(Protocol):
@@ -64,6 +66,7 @@ class Qwen3_5MoEConfig(Protocol):
     ep_size: int
     ep_rank: int
     enable_mega_moe: bool
+    sequence_parallel_enabled: bool
     mega_moe_context: torch.Tensor | None
     mega_moe_ccl_buffer_size: int
     mega_moe_num_max_tokens_per_rank: int

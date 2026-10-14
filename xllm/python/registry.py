@@ -139,6 +139,14 @@ def _register_builtin_models() -> None:
                 "TokenOwnerMegaMoeMetadataBuilder",
             ),
             (
+                "xllm.python.layers.sequence_parallel",
+                "SpMetadataBuilder",
+            ),
+            (
+                "xllm.python.layers.npu.qwen3_5.moe_metadata_builder",
+                "Qwen3_5MoeMetadataBuilder",
+            ),
+            (
                 "xllm.python.layers.npu.qwen3_5.gdn_metadata_builder",
                 "Qwen3_5GdnMetadataBuilder",
             ),

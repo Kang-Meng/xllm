@@ -35,7 +35,7 @@ def gemma_rms_norm(
     return normalized * (weight + 1.0)
 
 
-def make_config(**overrides) -> Qwen3_5Config:
+def make_config(**overrides: object) -> Qwen3_5Config:
     values = {
         "hidden_size": 64,
         "num_hidden_layers": 1,

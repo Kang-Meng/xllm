@@ -12,11 +12,121 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA-specific Qwen3.5 full-attention weight preparation."""
+"""CUDA-owned Qwen3.5 full-attention implementation."""
 
-from xllm.python.layers.qwen3_5.attention import Qwen3_5Attention
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from xllm.python.layers.attention import Attention
+from xllm.python.layers.layernorm import GemmaRMSNorm
+from xllm.python.layers.linear import ColumnParallelLinear, RowParallelLinear
+from xllm.python.layers.qwen3_5.common import (
+    PartialRotaryEmbedding,
+    Qwen3_5AttentionConfig,
+)
+from xllm.python.model_loader import (
+    ParallelLoadContext,
+    ScopedWeightLoader,
+    load_gqa_fused_attention,
+)
 
 
-class CudaQwen3_5Attention(Qwen3_5Attention):
+class CudaQwen3_5Attention(nn.Module):
+    normalization_cls: type[nn.Module] = GemmaRMSNorm
+
+    def __init__(
+        self,
+        cfg: Qwen3_5AttentionConfig,
+        layer_id: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        rotary: PartialRotaryEmbedding,
+    ) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.layer_id = layer_id
+        self.num_heads, self.num_kv_heads = cfg.head_split()
+        self.head_dim = cfg.head_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        q_multiplier = 2 if cfg.attn_output_gate else 1
+        self.qkv_proj = ColumnParallelLinear(
+            cfg.hidden_size,
+            q_multiplier * self.q_size + 2 * self.kv_size,
+            cfg.tp_size,
+            bias=cfg.attention_bias,
+            dtype=dtype,
+            device=device,
+        )
+        self.o_proj = RowParallelLinear(
+            self.q_size,
+            cfg.hidden_size,
+            cfg.tp_size,
+            bias=cfg.attention_bias,
+            dtype=dtype,
+            device=device,
+        )
+        self.q_norm = self.normalization_cls(
+            self.head_dim,
+            cfg.rms_norm_eps,
+            dtype=dtype,
+            device=device,
+        )
+        self.k_norm = self.normalization_cls(
+            self.head_dim,
+            cfg.rms_norm_eps,
+            dtype=dtype,
+            device=device,
+        )
+        self.rotary = rotary
+        self.attn = Attention(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.head_dim**-0.5,
+            0,
+            layer_id,
+        )
+
     def _finish_loading(self) -> None:
         self.o_proj.process_weights_after_loading()
+
+    def load_weights(
+        self,
+        state: ScopedWeightLoader,
+        context: ParallelLoadContext,
+    ) -> None:
+        load_gqa_fused_attention(self, state, context, self.cfg.n_kv_heads)
+        self._finish_loading()
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv = self.qkv_proj(hidden)
+        if self.cfg.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [2 * self.q_size, self.kv_size, self.kv_size],
+                dim=-1,
+            )
+            q_gate = q_gate.view(-1, self.num_heads, 2 * self.head_dim)
+            q, gate = q_gate.chunk(2, dim=-1)
+        else:
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size],
+                dim=-1,
+            )
+            q = q.view(-1, self.num_heads, self.head_dim)
+            gate = None
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = self.rotary(positions, q).reshape(-1, self.q_size)
+        k = self.rotary(positions, k).reshape(-1, self.kv_size)
+        output = self.attn(q, k, v)
+        if gate is not None:
+            output = output * torch.sigmoid(gate.reshape(-1, self.q_size))
+        return self.o_proj(output)

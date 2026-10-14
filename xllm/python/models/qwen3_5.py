@@ -16,17 +16,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 import torch.nn as nn
 
 from xllm.python.layers import ColumnParallelLinear, HiddenParallelEmbedding
 from xllm.python.layers.qwen3_5.common import PartialRotaryEmbedding
-from xllm.python.layers.qwen3_5.decoder_layer import Qwen3_5DecoderLayer, get_qwen3_5_decoder_layer_class
-from xllm.python.model_executor.forward_context import record_layer_event
+from xllm.python.layers.qwen3_5.factory import get_qwen3_5_decoder_layer_class
+from xllm.python.layers.sequence_parallel import (
+    resolve_sequence_parallel,
+    sp_all_gather,
+    sp_shard,
+)
+from xllm.python.layers.sequence_parallel_metadata import SpMetadata
+from xllm.python.model_executor.forward_context import get_execution_context, record_layer_event
 from xllm.python.model_loader import (
     ParallelLoadContext,
     ScopedWeightLoader,
@@ -78,6 +83,7 @@ class Qwen3_5Config:
     ep_size: int
     ep_rank: int
     enable_mega_moe: bool
+    sequence_parallel_enabled: bool
     mega_moe_context: torch.Tensor | None
     mega_moe_ccl_buffer_size: int
     mega_moe_num_max_tokens_per_rank: int
@@ -166,6 +172,7 @@ class Qwen3_5Config:
             ep_size=ep_size,
             ep_rank=int(pick("ep_rank", default=0)),
             enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
+            sequence_parallel_enabled=bool(pick("sequence_parallel_enabled", default=False)),
             mega_moe_context=pick("mega_moe_context", default=None),
             mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
             mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
@@ -220,14 +227,18 @@ class Qwen3_5Config:
             if self.shared_expert_intermediate_size % self.tp_size:
                 raise ValueError("shared_expert_intermediate_size must be divisible by tp_size")
         if self.enable_mega_moe:
-            if self.tp_size <= 1 or self.dp_size <= 1:
-                raise ValueError("MegaMoe token ownership requires TP > 1 and DP > 1")
+            if not self.sequence_parallel_enabled:
+                raise ValueError("MegaMoe requires sequence parallelism; the current configuration disables SP")
+            if self.num_experts <= 0:
+                raise ValueError("MegaMoe sequence parallelism requires a MoE model")
+            if self.dp_size <= 1:
+                raise ValueError("MegaMoe sequence parallelism requires DP > 1")
             if self.moe_tp_size != 1 or self.ep_size != self.world_size:
-                raise ValueError("MegaMoe token ownership requires MoE-TP = 1 and EP = world_size")
+                raise ValueError("MegaMoe sequence parallelism requires MoE-TP = 1 and EP = world_size")
             if self.mega_moe_context is None:
-                raise ValueError("MegaMoe token ownership requires a communication context")
+                raise ValueError("MegaMoe sequence parallelism requires a communication context")
             if self.mega_moe_ccl_buffer_size <= 0 or self.mega_moe_num_max_tokens_per_rank <= 0:
-                raise ValueError("MegaMoe token ownership requires positive communication capacities")
+                raise ValueError("MegaMoe sequence parallelism requires positive communication capacities")
 
     def is_moe_layer(self, layer_id: int) -> bool:
         return (
@@ -243,8 +254,7 @@ class Qwen3_5Config:
 class Qwen3_5Model(nn.Module):
     def __init__(self, cfg: Qwen3_5Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
-        if cfg.hidden_size % cfg.tp_size:
-            raise ValueError("hidden_size must be divisible by tp_size")
+        self.cfg = cfg
         self.embed_tokens = HiddenParallelEmbedding(
             cfg.vocab_size,
             cfg.hidden_size // cfg.tp_size,
@@ -262,10 +272,7 @@ class Qwen3_5Model(nn.Module):
             device,
         )
         decoder_layer_cls = get_qwen3_5_decoder_layer_class(device)
-        self.layers = cast(
-            Sequence[Qwen3_5DecoderLayer],
-            nn.ModuleList(decoder_layer_cls(cfg, i, dtype, device, self.rotary) for i in range(cfg.n_layers)),
-        )
+        self.layers = nn.ModuleList(decoder_layer_cls(cfg, i, dtype, device, self.rotary) for i in range(cfg.n_layers))
         self.norm = decoder_layer_cls.normalization_cls(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -291,15 +298,39 @@ class Qwen3_5Model(nn.Module):
         if input_ids is None:
             raise ValueError("input_ids must be provided")
 
+        sequence_parallel_enabled = self.cfg.sequence_parallel_enabled
+        num_tokens = positions.shape[0] if positions.ndim == 1 else positions.shape[-1]
+        sp_layout: SpMetadata | None = None
+        if sequence_parallel_enabled:
+            if input_ids.ndim != 1:
+                raise ValueError("Qwen3.5 SP requires flattened token inputs")
+            if num_tokens != input_ids.shape[0]:
+                raise ValueError("Qwen3.5 SP positions must match the input token rows")
+            sp_layout = get_execution_context(SpMetadata)
+            if sp_layout is None:
+                raise RuntimeError("Qwen3.5 SP layout metadata is unavailable")
+            first_moe_layer = next(
+                (layer for layer in self.layers if layer.cfg.is_moe_layer(layer.layer_id)),
+                None,
+            )
+            if first_moe_layer is not None:
+                first_moe_layer.validate_sp(sp_layout, device=self.embed_tokens.weight.device)
+
         hidden = self.embed_tokens(input_ids)
 
         residual: torch.Tensor | None = None
+        if sequence_parallel_enabled:
+            hidden = sp_shard(hidden, sp_layout)
         aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         for layer_id, layer in enumerate(self.layers):
             hidden, residual = layer(hidden, residual, positions)
             record_layer_event(layer_id)
             self.aux_hidden_capture.capture_layer(layer_id, hidden, residual, aux_hidden_buffer)
         hidden, _ = self.norm(hidden, residual)
+        if sequence_parallel_enabled:
+            hidden = sp_all_gather(hidden, sp_layout)
+            if aux_hidden_buffer is not None:
+                aux_hidden_buffer = sp_all_gather(aux_hidden_buffer, sp_layout)
         return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
 
 
@@ -309,14 +340,14 @@ class Qwen3_5ForCausalLM(PyModelBase):
 
     def __init__(self, config: dict) -> None:
         super().__init__()
-        self.cfg = Qwen3_5Config.from_dict(config)
-        self.cfg.validate()
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "cuda"))
+        decoder_layer_cls = get_qwen3_5_decoder_layer_class(device)
+        config["sequence_parallel_enabled"] = resolve_sequence_parallel(config, decoder_layer_cls)
+        self.cfg = Qwen3_5Config.from_dict(config)
+        self.cfg.validate()
         self.dtype = dtype
         self.device = device
-        if self.cfg.vocab_size % self.cfg.tp_size:
-            raise ValueError("vocab_size must be divisible by tp_size")
         self.model = Qwen3_5Model(self.cfg, dtype, device)  # pyright: ignore[reportIncompatibleVariableOverride]
         self.lm_head = ColumnParallelLinear(  # pyright: ignore[reportIncompatibleVariableOverride]
             self.cfg.hidden_size,

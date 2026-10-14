@@ -23,6 +23,10 @@ relationship:
   family run the experts over the whole DP group's tokens, then slice the result
   back to the rank-local rows. That gather prologue and scatter epilogue are
   identical across backends; only the expert compute between them differs.
+* EP/SP token operations (:func:`ep_gather_tokens`, :func:`ep_reduce_scatter`).
+  Consume builder-prepared SP metadata after the expert input is validated.
+  Qwen3.5 direct EP gathers valid prefixes in eager execution, retains graph
+  capacities during capture, and restores the local SP capacity after reduction.
 * EPLv2 communication admission (:class:`Eplv2CommPolicy`,
   :func:`mc2_buffer_bytes_per_source_row`). Host-only selection between MC2 and
   All-to-AllV for the MoE-TP1 A3 EPLv2 path; no device queries in the selector.
@@ -32,12 +36,14 @@ relationship:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
 from xllm.python import distributed
+from xllm.python.layers.sequence_parallel_metadata import EpSpTokenLayout, SpMetadata
 from xllm.python.model_executor.forward_context import get_forward_context
 
 # ---------------------------------------------------------------------------
@@ -92,6 +98,76 @@ def dp_gather_tokens(
         dp_rank,
     )
     return gathered, DpScatterState(output_offset, local_tokens, True)
+
+
+def _ep_source_tokens(hidden: torch.Tensor, metadata: SpMetadata) -> torch.Tensor:
+    layout = cast(EpSpTokenLayout, metadata.ep_layout)
+    if not layout.compacted or layout.active_rows == metadata.local_rows:
+        return hidden
+    if layout.active_rows == 0:
+        return hidden.new_zeros((1, *hidden.shape[1:]))
+    return hidden.narrow(0, 0, layout.active_rows)
+
+
+def _ep_restore_tokens(output: torch.Tensor, metadata: SpMetadata) -> torch.Tensor:
+    layout = cast(EpSpTokenLayout, metadata.ep_layout)
+    expected_rows = max(1, layout.active_rows) if layout.compacted else metadata.local_rows
+    if output.ndim == 0 or output.shape[0] != expected_rows:
+        raise ValueError(
+            "SP compacted output rows do not match the valid layout: "
+            f"expected {expected_rows}, got {output.shape[0] if output.ndim else 0}"
+        )
+    if not layout.compacted or layout.active_rows == metadata.local_rows:
+        return output
+    restored = output.new_zeros((metadata.local_rows, *output.shape[1:]))
+    if layout.active_rows:
+        restored[: layout.active_rows].copy_(output[: layout.active_rows])
+    return restored
+
+
+def ep_gather_tokens(hidden: torch.Tensor, metadata: SpMetadata) -> torch.Tensor:
+    """Gather valid SP prefixes across EP, retaining graph capacities."""
+    layout = cast(EpSpTokenLayout, metadata.ep_layout)
+    source = _ep_source_tokens(hidden, metadata)
+    if not layout.variable:
+        return distributed.all_gather(source, dim=0, world_size=len(layout.dispatch_counts), group_name="moe_ep")
+    return distributed.all_gather_variable(source, list(layout.dispatch_counts), layout.ep_rank, "moe_ep")
+
+
+def ep_reduce_scatter(output: torch.Tensor, metadata: SpMetadata) -> torch.Tensor:
+    """Sum EP expert contributions and restore this rank's SP capacity."""
+    layout = cast(EpSpTokenLayout, metadata.ep_layout)
+    expected_rows = sum(layout.dispatch_counts)
+    if output.ndim == 0 or output.shape[0] != expected_rows:
+        raise ValueError(
+            "EP/SP MoE output rows do not match the gathered layout: "
+            f"expected {expected_rows}, got {output.shape[0] if output.ndim else 0}"
+        )
+    if not layout.variable:
+        reduced = distributed.reduce_scatter(output, len(layout.dispatch_counts), "moe_ep")
+    else:
+        padded = output.new_zeros((layout.dispatch_rows * len(layout.dispatch_counts), *output.shape[1:]))
+        source_offset = 0
+        for rank, row_count in enumerate(layout.dispatch_counts):
+            source = output.narrow(0, source_offset, row_count)
+            padded.narrow(0, rank * layout.dispatch_rows, row_count).copy_(source)
+            source_offset += row_count
+        reduced = distributed.reduce_scatter(padded, len(layout.dispatch_counts), "moe_ep")
+        reduced = reduced[: layout.dispatch_counts[layout.ep_rank]].contiguous()
+    return _ep_restore_tokens(reduced, metadata)
+
+
+def ep_apply_local(
+    hidden: torch.Tensor,
+    metadata: SpMetadata,
+    operation: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Run local expert work on valid rows and restore the SP capacity."""
+    layout = cast(EpSpTokenLayout, metadata.ep_layout)
+    source = _ep_source_tokens(hidden, metadata)
+    if layout.compacted and layout.active_rows == 0:
+        return torch.zeros_like(hidden)
+    return _ep_restore_tokens(operation(source), metadata)
 
 
 def reduce_and_scatter(

@@ -1947,7 +1947,10 @@ class DecodeAclGraphRunner(BaseRunner):
             has_initial_state=torch.zeros(padded_batch_size, dtype=torch.int32, device=device),
             # DP layers read uniform padded counts off the captured metadata;
             # variable per-rank counts cannot be baked into a graph.
-            dp_execution_token_counts=(padded_batch_size,) * self.dp_size if self.dp_size > 1 else (),
+            # Sequence-parallel model layers also consume the execution row
+            # count when DP=1. Keep the single-DP graph metadata explicit so
+            # those layers use the same authority as DP MoE collectives.
+            dp_execution_token_counts=(padded_batch_size,) * self.dp_size,
             dp_is_decode=tuple([1] * self.dp_size) if self.dp_size > 1 else (),
             is_dummy=bool(getattr(metadata, "is_dummy", False)),
             kpool_query_lens=kpool_query_lens,
