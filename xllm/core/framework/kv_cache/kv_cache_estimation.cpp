@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "framework/kv_cache/kv_cache_estimation.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <limits>
@@ -347,6 +349,21 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
   // is floored above; max_blocks is floored in max_linear_state_blocks), so the
   // min of the two cannot drop below it.
   return std::min<int64_t>(auto_blocks, max_blocks);
+}
+
+int64_t resolve_max_linear_state_cache_slots(
+    const KVCacheEstimateOptions& options) {
+  if (options.max_linear_state_cache_slots != 0) {
+    return options.max_linear_state_cache_slots;
+  }
+  if (options.instance_role != InstanceRole::DECODE ||
+      !options.enable_prefix_cache || options.max_seqs_per_batch <= 0) {
+    return 0;
+  }
+
+  // Decode prefix-cache entries need a rolling LINEAR state slot per active
+  // sequence, plus headroom for a checkpoint that is being offloaded.
+  return (options.max_seqs_per_batch * 3 + 1) / 2;
 }
 
 int64_t dsv4_common_unit_bytes(const Dsv4KVCacheEstimateCost& cache_cost,
@@ -771,20 +788,57 @@ void init_standard_counts(const ModelArgs& model_args,
   const int64_t kpool_state_bytes =
       kv_cache_cap->num_indexer_layers() * kv_cache_cap->kpool_tail_slot_size();
   const int64_t total_state_bytes = gdn_state_bytes + kpool_state_bytes;
-  int64_t num_linear_state_blocks =
-      calculate_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
-                                    total_state_bytes,
-                                    full_cache_block_size_in_bytes,
-                                    options.max_linear_state_cache_slots);
+  const bool auto_linear_state_slots =
+      options.max_linear_state_cache_slots == 0;
+  int64_t effective_max_linear_state_cache_slots =
+      resolve_max_linear_state_cache_slots(options);
+  // A positive value is a hard request inside calculate_linear_state_blocks.
+  // Clamp a derived value before that call; an explicit flag still fails there.
+  if (auto_linear_state_slots && effective_max_linear_state_cache_slots > 0 &&
+      total_state_bytes > 0) {
+    const int64_t budget_slots = std::max<int64_t>(
+        max_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
+                                total_state_bytes,
+                                full_cache_block_size_in_bytes) -
+            kPaddingLinearStateBlocks,
+        0);
+    if (effective_max_linear_state_cache_slots > budget_slots) {
+      LOG(WARNING) << "Derived linear-state cache slots "
+                   << effective_max_linear_state_cache_slots
+                   << " exceed the KV cache budget of " << budget_slots
+                   << " slots; clamping to the budget.";
+      effective_max_linear_state_cache_slots = budget_slots;
+    }
+  }
 #if defined(USE_NPU)
   if (is_qwen3_5_target_model_type(model_args.model_type()) &&
       kv_cache_cap->num_linear_attention_layers() > 0) {
     constexpr int64_t kMegaGdnMaxLinearStateBlocks = 1024;
-    CHECK_LE(options.max_linear_state_cache_slots + kPaddingLinearStateBlocks,
-             kMegaGdnMaxLinearStateBlocks)
+    const int64_t max_effective_slots =
+        kMegaGdnMaxLinearStateBlocks - kPaddingLinearStateBlocks;
+    if (auto_linear_state_slots &&
+        effective_max_linear_state_cache_slots > max_effective_slots) {
+      LOG(WARNING) << "Derived linear-state cache slots "
+                   << effective_max_linear_state_cache_slots
+                   << " exceed the Qwen3.5 MegaGdn limit of "
+                   << max_effective_slots << " slots; clamping to the limit.";
+      effective_max_linear_state_cache_slots = max_effective_slots;
+    }
+    CHECK_LE(effective_max_linear_state_cache_slots, max_effective_slots)
         << "Qwen3.5 MegaGdn supports at most " << kMegaGdnMaxLinearStateBlocks
         << " physical linear-state slots, "
         << "including " << kPaddingLinearStateBlocks << " padding slots.";
+  }
+#endif
+  int64_t num_linear_state_blocks =
+      calculate_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
+                                    total_state_bytes,
+                                    full_cache_block_size_in_bytes,
+                                    effective_max_linear_state_cache_slots);
+#if defined(USE_NPU)
+  if (is_qwen3_5_target_model_type(model_args.model_type()) &&
+      kv_cache_cap->num_linear_attention_layers() > 0) {
+    constexpr int64_t kMegaGdnMaxLinearStateBlocks = 1024;
     num_linear_state_blocks =
         std::min(num_linear_state_blocks, kMegaGdnMaxLinearStateBlocks);
   }

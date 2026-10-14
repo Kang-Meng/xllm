@@ -135,10 +135,17 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
           << static_cast<int32_t>(block_type) << ": " << entry.key_component;
       const StoreTpLayout tp_layout = resolve_tp_layout(
           block_type, entry.enable_mla.value_or(config_.enable_mla));
+      // LINEAR state is not KV-split even when the entry belongs to target.
+      const bool is_split_cache =
+          entry.is_target && block_type != BlockType::LINEAR;
+      const bool put_owner = is_put_owner(tp_layout, is_split_cache);
       std::string schema_hash =
           build_schema_hash(block_type, *entry.cache, tp_layout);
-      std::string key_prefix = build_key_prefix(
-          entry.key_component, block_type, schema_hash, tp_layout);
+      std::string key_prefix = build_key_prefix(entry.key_component,
+                                                block_type,
+                                                schema_hash,
+                                                tp_layout,
+                                                is_split_cache);
       const BlockTypeTensorMap tensors =
           entry.cache->get_block_type_tensors(block_type);
       std::vector<torch::Tensor> block_tensors;
@@ -153,7 +160,7 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
                                             block_type,
                                             std::move(key_prefix),
                                             std::move(block_tensors),
-                                            is_put_owner(tp_layout)});
+                                            put_owner});
     }
   }
 }
@@ -166,33 +173,31 @@ StoreTpLayout KVCacheStore::resolve_tp_layout(BlockType block_type,
   return StoreTpLayout::TP_SHARDED;
 }
 
-bool KVCacheStore::is_put_owner(StoreTpLayout tp_layout) const {
-  // A full-domain DCP rank uniquely identifies every DP-local worker, even
-  // when that domain happens to have the same size as CP.
-  if (config_.kv_split_size == config_.kv_split_full_domain_size) {
-    return true;
-  }
-
-  const bool tp_rank_spans_cp =
-      config_.tp_size ==
+bool KVCacheStore::is_put_owner(StoreTpLayout tp_layout,
+                                bool is_split_cache) const {
+  const uint32_t domain_size =
       static_cast<uint32_t>(config_.kv_split_full_domain_size);
-  // MLU Store TP ranks span the whole DP-local domain. TP-sharded keys are
-  // therefore already unique across CP ranks and must all be published.
-  if (tp_layout == StoreTpLayout::TP_SHARDED && tp_rank_spans_cp) {
-    return true;
+  const uint32_t workers_per_cp = domain_size / config_.cp_size;
+  // Recover the DP-local physical rank even when Store TP spans the DP domain.
+  const uint32_t rank =
+      config_.cp_rank * workers_per_cp + config_.tp_rank % workers_per_cp;
+  // Non-MLA needs a complete TP group in every split. MLA can split the
+  // TP-replicated KV across cards of the same TP group (e.g. decode TP2/S2).
+  const uint32_t tp_group_size =
+      domain_size / (config_.enable_mla
+                         ? config_.cp_size
+                         : std::max(config_.cp_size, config_.kv_split_size));
+  // Draft and Linear publish only the first complete TP group of split0.
+  // Do not filter by target kv_split_rank: decode TP2/S2 needs both cards.
+  if (!is_split_cache) {
+    return rank < tp_group_size;
   }
-
-  // When DCP partitions PCP, multiple CP ranks own replicas of the same split.
-  const int32_t cp_replicas_per_split = config_.cp_size / config_.kv_split_size;
-  const bool is_cp_replica_owner = config_.cp_rank % cp_replicas_per_split == 0;
-  const uint32_t workers_per_cp = static_cast<uint32_t>(
-      config_.kv_split_full_domain_size / config_.cp_size);
-  // TP-sharded Store keys include tp_rank, so every shard is a distinct writer.
-  // TP-replicated keys omit tp_rank; select one representative worker from each
-  // owning CP split to avoid concurrent writes to the same Store key.
-  const bool is_tp_replica_owner = tp_layout == StoreTpLayout::TP_SHARDED ||
-                                   config_.tp_rank % workers_per_cp == 0;
-  return is_cp_replica_owner && is_tp_replica_owner;
+  // Target MLA KV: first card of each split. Target non-MLA KV (and
+  // TP-sharded auxiliary caches): every card of the first TP group per split.
+  const uint32_t ranks_per_split = domain_size / config_.kv_split_size;
+  const uint32_t owner_count =
+      tp_layout == StoreTpLayout::TP_REPLICATED ? 1U : tp_group_size;
+  return rank % ranks_per_split < owner_count;
 }
 
 std::string KVCacheStore::build_schema_hash(BlockType block_type,
@@ -244,7 +249,8 @@ std::string KVCacheStore::build_schema_hash(BlockType block_type,
 std::string KVCacheStore::build_key_prefix(const std::string& key_component,
                                            BlockType block_type,
                                            const std::string& schema_hash,
-                                           StoreTpLayout tp_layout) const {
+                                           StoreTpLayout tp_layout,
+                                           bool is_split_cache) const {
   std::string prefix = "xllm-kv-v3:";
   append_key_field(prefix, config_.model_id);
   append_key_field(prefix, key_component);
@@ -258,7 +264,9 @@ std::string KVCacheStore::build_key_prefix(const std::string& key_component,
   }
   prefix.append(std::to_string(config_.kv_split_size));
   prefix.push_back(':');
-  prefix.append(std::to_string(config_.kv_split_rank));
+  // Draft and LINEAR caches are TP-sharded but not KV-split. Every split
+  // rank addresses the canonical split-0 object for its TP shard.
+  prefix.append(std::to_string(is_split_cache ? config_.kv_split_rank : 0));
   prefix.push_back(':');
   prefix.append(std::to_string(static_cast<int32_t>(block_type)));
   prefix.push_back(':');

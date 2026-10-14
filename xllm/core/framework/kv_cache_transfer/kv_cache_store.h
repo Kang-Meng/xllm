@@ -36,6 +36,9 @@ struct HostCacheStoreEntry {
   std::string key_component;
   KVCache* cache = nullptr;
   std::optional<bool> enable_mla;
+  // Cache registration supplies the role. Key component names do not.
+  // Draft KV omits the split rank from its Store key; target KV keeps it.
+  bool is_target;
 };
 
 enum class StoreTpLayout : uint8_t {
@@ -140,14 +143,15 @@ class KVCacheStore final {
 
   void initialize_store_index(HostCacheStoreIndex store_index);
   StoreTpLayout resolve_tp_layout(BlockType block_type, bool enable_mla) const;
-  bool is_put_owner(StoreTpLayout tp_layout) const;
+  bool is_put_owner(StoreTpLayout tp_layout, bool is_split_cache) const;
   std::string build_schema_hash(BlockType block_type,
                                 const KVCache& cache,
                                 StoreTpLayout tp_layout) const;
   std::string build_key_prefix(const std::string& key_component,
                                BlockType block_type,
                                const std::string& schema_hash,
-                               StoreTpLayout tp_layout) const;
+                               StoreTpLayout tp_layout,
+                               bool is_split_cache) const;
   std::string build_key(const StoreEntry& entry,
                         const BlockTransferInfo& block_info) const;
   std::vector<PhysicalRequest> build_requests(

@@ -285,6 +285,28 @@ TEST(KVCacheEstimationTest, LinearStateCapacityDoesNotDependOnPrefixCache) {
   }
 }
 
+TEST(KVCacheEstimationTest, DecodePrefixCacheResolvesLinearStateSlots) {
+  ModelArgs model_args = make_linear_attention_args(1);
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.instance_role = InstanceRole::DECODE;
+  options.enable_prefix_cache = true;
+  options.max_linear_state_cache_slots = 0;
+
+  for (const auto& [max_seqs, expected_blocks] :
+       std::vector<std::pair<int64_t, int64_t>>{{8, 14}, {9, 16}, {128, 194}}) {
+    SCOPED_TRACE(max_seqs);
+    options.max_seqs_per_batch = max_seqs;
+    const KVCacheCapacity default_capacity =
+        estimate_kv_cache_capacity(model_args, options);
+    EXPECT_EQ(default_capacity.num_linear_state_blocks(), expected_blocks);
+  }
+
+  options.max_linear_state_cache_slots = 5;
+  const KVCacheCapacity explicit_capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(explicit_capacity.num_linear_state_blocks(), 7);
+}
+
 #if defined(USE_MLU)
 TEST(KVCacheEstimationTest, Glm5NextSpecVerifyExpandsHybridState) {
   ModelArgs model_args = make_standard_args();
@@ -451,6 +473,37 @@ TEST(KVCacheEstimationTest, CapsQwen35PhysicalLinearStateSlotsForMegaGdn) {
   KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
 
   EXPECT_EQ(capacity.num_linear_state_blocks(), 1024);
+}
+
+TEST(KVCacheEstimationTest, ClampsDerivedQwen35SlotsToMegaGdnLimit) {
+  ModelArgs model_args = make_linear_attention_args(/*head_dim=*/1);
+  model_args.model_type("qwen3_5");
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.cache_size_in_bytes = 64LL << 30;
+  options.enable_prefix_cache = true;
+  options.instance_role = InstanceRole::DECODE;
+  options.max_linear_state_cache_slots = 0;
+  options.max_seqs_per_batch = 682;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.num_linear_state_blocks(), 1024);
+}
+
+TEST(KVCacheEstimationTest, ClampsDerivedLinearStateSlotsToCacheBudget) {
+  ModelArgs model_args = make_linear_attention_args(/*head_dim=*/16);
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.instance_role = InstanceRole::DECODE;
+  options.enable_prefix_cache = true;
+  options.max_linear_state_cache_slots = 0;
+  options.max_seqs_per_batch = 100000;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.num_linear_state_blocks(), 229);
+  EXPECT_GT(capacity.n_blocks(), 0);
 }
 
 TEST(KVCacheEstimationTest, RejectsQwen35ExplicitSlotsBeyondMegaGdnLimit) {

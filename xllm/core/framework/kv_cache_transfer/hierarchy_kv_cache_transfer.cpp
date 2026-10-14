@@ -291,7 +291,8 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
             HostCacheStoreEntry{domain.handle,
                                 domain.store_key_component,
                                 host_cache.get(),
-                                domain.enable_mla});
+                                domain.enable_mla,
+                                domain.role == CacheRole::TARGET});
       }
     }
     KVCacheStoreInitConfig store_config;

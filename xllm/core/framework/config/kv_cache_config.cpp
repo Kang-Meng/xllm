@@ -59,8 +59,9 @@ DEFINE_bool(enable_in_batch_prefix_cache,
 
 DEFINE_int64(max_linear_state_cache_slots,
              0,
-             "Maximum active linear-attention state cache slots. 0 derives an "
-             "automatic capacity from the available KV cache budget.");
+             "Maximum active linear-attention state cache slots. 0 uses "
+             "ceil(1.5 * max_seqs_per_batch) for Decode with prefix cache, "
+             "otherwise derives capacity from the available KV cache budget.");
 
 DEFINE_uint32(xxh3_128bits_seed, 1024, "Default XXH3 128-bits hash seed.");
 
