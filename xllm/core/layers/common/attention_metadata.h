@@ -143,6 +143,9 @@ struct AttentionMetadata {
   torch::Tensor slot_mapping;
   // Stable per-sequence slot ids for model-owned recurrent state.
   torch::Tensor linear_state_indices;
+  // Optional source slots prepared by models supporting distinct state I/O.
+  // Undefined means the caller consumes the destination slots.
+  torch::Tensor linear_state_read_indices;
   std::vector<int32_t> kpool_query_lens;
   std::shared_ptr<const KPoolBatchMetadata> kpool_batch_metadata;
   // Cache-shard derivations are immutable batch data shared by all layers.

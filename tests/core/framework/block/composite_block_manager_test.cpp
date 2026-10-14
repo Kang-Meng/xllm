@@ -98,7 +98,7 @@ constexpr uint32_t kCompressedUnitTokens = kCompressedBlockTokenSize;
 
 // Shortest repeated prompt, no shorter than `min_units` compressed units, whose
 // exact-repeat hit still spans one SWA window after dropping the last unit.
-inline size_t RepeatHitPromptTokens(size_t min_units, uint32_t window_size) {
+inline size_t repeat_hit_prompt_tokens(size_t min_units, uint32_t window_size) {
   return std::max<size_t>(min_units * kCompressedUnitTokens,
                           window_size + kCompressedUnitTokens);
 }
@@ -868,7 +868,8 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheHitOnRepeatedPrefix) {
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
   // max_tokens_per_batch has to accommodate the prompt so allocate_sequence
   // does not exceed the SWA burst budget.
-  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/2, window_size);
+  const size_t num_tokens =
+      repeat_hit_prompt_tokens(/*min_units=*/2, window_size);
   set_swa_capacity_for_token_budget(
       &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   ASSERT_TRUE(opts.enable_prefix_cache());
@@ -1035,7 +1036,8 @@ TEST(CompositeBlockManagerTest, SlidingWindowSlidOutBlocksEnterPrefixCache) {
   const uint32_t max_seqs_per_batch = 4;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/2, window_size);
+  const size_t num_tokens =
+      repeat_hit_prompt_tokens(/*min_units=*/2, window_size);
   set_swa_capacity_for_token_budget(
       &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   ASSERT_TRUE(opts.enable_prefix_cache());
@@ -1205,7 +1207,8 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheExactRepeatPopsOneC128) {
   const uint32_t max_seqs_per_batch = 4;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/3, window_size);
+  const size_t num_tokens =
+      repeat_hit_prompt_tokens(/*min_units=*/3, window_size);
   set_swa_capacity_for_token_budget(
       &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
@@ -1272,7 +1275,8 @@ TEST(CompositeBlockManagerTest, DecodeRoleSkipsSwaPrefixCache) {
   const uint32_t max_seqs_per_batch = 4;
   BlockManager::Options opts = MakeCompositeOptions(
       base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  const size_t num_tokens = RepeatHitPromptTokens(/*min_units=*/2, window_size);
+  const size_t num_tokens =
+      repeat_hit_prompt_tokens(/*min_units=*/2, window_size);
   set_swa_capacity_for_token_budget(
       &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
   // First seed the cache under a PREFILL role so all three leaves publish

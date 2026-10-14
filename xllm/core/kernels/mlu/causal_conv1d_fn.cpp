@@ -42,11 +42,42 @@ torch::Tensor causal_conv1d_fn(
     const std::optional<torch::Tensor>& has_initial_state_opt,
     const std::optional<torch::Tensor>& initial_state_idx_opt,
     const std::optional<torch::Tensor>& num_accepted_tokens_opt,
-    bool /*inplace_final_state*/) {
+    bool inplace_final_state,
+    const std::optional<torch::Tensor>& read_cache_indices_opt) {
+  CHECK_EQ(weight.dim(), 2);
+  CHECK_GE(weight.size(1), 2);
+  CHECK_LE(weight.size(1), 5);
+  if (read_cache_indices_opt.has_value()) {
+    // Validate the extra state-I/O contract before allocating or launching on
+    // the device. The legacy path retains its existing supported arguments.
+    CHECK(read_cache_indices_opt->defined());
+    CHECK(cache_indices_opt.has_value() && cache_indices_opt->defined());
+    CHECK(has_initial_state_opt.has_value() &&
+          has_initial_state_opt->defined());
+    CHECK_EQ(read_cache_indices_opt->dim(), 1);
+    CHECK_EQ(cache_indices_opt->dim(), 1);
+    CHECK_EQ(has_initial_state_opt->dim(), 1);
+    CHECK_EQ(read_cache_indices_opt->numel(), cache_indices_opt->numel());
+    CHECK_EQ(has_initial_state_opt->numel(), cache_indices_opt->numel());
+    CHECK(read_cache_indices_opt->scalar_type() == torch::kInt32 ||
+          read_cache_indices_opt->scalar_type() == torch::kInt64);
+    CHECK(cache_indices_opt->scalar_type() == torch::kInt32 ||
+          cache_indices_opt->scalar_type() == torch::kInt64);
+    CHECK(read_cache_indices_opt->device() == conv_states.device());
+    CHECK(cache_indices_opt->device() == conv_states.device());
+    CHECK(has_initial_state_opt->device() == conv_states.device());
+    CHECK(has_initial_state_opt->is_contiguous());
+    CHECK(!initial_state_idx_opt.has_value())
+        << "Distinct prefill state I/O does not support checkpoint indices";
+    CHECK(!num_accepted_tokens_opt.has_value())
+        << "Distinct prefill state I/O does not support speculative "
+           "verification";
+    CHECK(inplace_final_state)
+        << "Distinct prefill state I/O writes final state to the cache";
+  }
   torch::Tensor out = torch::zeros_like(x);
   CHECK_GT(nt, 0);
   int32_t dim = static_cast<int32_t>(x.size(0));
-  int32_t cu_seqlen = static_cast<int32_t>(x.size(1));
   int32_t width = static_cast<int32_t>(weight.size(1));
   int32_t state_len = width - 1;
   int32_t num_cache_lines = static_cast<int32_t>(conv_states.size(0));
@@ -86,51 +117,56 @@ torch::Tensor causal_conv1d_fn(
   int32_t num_programs = std::min(nt, core_count);
 
   JITKernel& f = JITKernel::get(
-      /*py_path=*/"torch_mlu_ops.triton.conv.kernels",
-      /*fn_name=*/"tmo_causal_conv1d_fwd_vllm_kernel");
-
-  f.launch(static_cast<void*>(queue),
-           /*grid=*/{static_cast<uint32_t>(num_programs), 1, 1},
-           /*cfg=*/{/*num_warps=*/1, /*num_stages=*/3},
-           x,
-           weight,
-           bias_opt,
-           conv_states,
-           cache_indices_opt,
-           has_initial_state_opt,
-           query_start_loc,
-           batch,
-           token_block_offset,
-           nullptr,
-           nullptr,
-           initial_state_idx_opt,
-           num_accepted_tokens_opt,
-           out,
-           dim,
-           nt,
-           cu_seqlen,
-           num_cache_lines,
-           stride_x_dim,
-           stride_x_token,
-           stride_w_dim,
-           stride_w_width,
-           stride_istate_seq,
-           stride_istate_dim,
-           stride_istate_token,
-           stride_cache_indices,
-           stride_o_dim,
-           stride_o_token,
-           /*stride_block_m=*/0,
-           /*pad_slot_id=*/-1,
-           /*null_block_id=*/0,
-           /*HAS_BIAS=*/bias_opt.has_value() ? 1 : 0,
-           /*KERNEL_WIDTH=*/width,
-           /*SILU_ACTIVATION=*/1,
-           /*IS_APC_ENABLED=*/0,
-           /*HAS_NULL_BLOCK=*/1,
-           /*NP2_STATELEN=*/np2_statelen,
-           /*BLOCK_M=*/kBlockM,
-           /*BLOCK_N=*/kBlockN);
+      /*py_path=*/"xllm.core.kernels.mlu.triton_kernel.causal_conv1d",
+      /*fn_name=*/"causal_conv1d_prefill_kernel");
+  f.launch(
+      static_cast<void*>(queue),
+      /*grid=*/{static_cast<uint32_t>(num_programs), 1, 1},
+      /*cfg=*/{/*num_warps=*/1, /*num_stages=*/3},
+      x,
+      weight,
+      bias_opt,
+      conv_states,
+      cache_indices_opt,
+      read_cache_indices_opt,
+      has_initial_state_opt,
+      query_start_loc,
+      batch,
+      token_block_offset,
+      nullptr,
+      nullptr,
+      initial_state_idx_opt,
+      num_accepted_tokens_opt,
+      out,
+      dim,
+      nt,
+      static_cast<int32_t>(x.size(1)),
+      num_cache_lines,
+      stride_x_dim,
+      stride_x_token,
+      stride_w_dim,
+      stride_w_width,
+      stride_istate_seq,
+      stride_istate_dim,
+      stride_istate_token,
+      stride_cache_indices,
+      read_cache_indices_opt.has_value()
+          ? static_cast<int32_t>(read_cache_indices_opt->stride(0))
+          : 0,
+      stride_o_dim,
+      stride_o_token,
+      /*stride_block_m=*/0,
+      /*pad_slot_id=*/-1,
+      /*null_block_id=*/0,
+      /*HAS_BIAS=*/bias_opt.has_value() ? 1 : 0,
+      /*KERNEL_WIDTH=*/width,
+      /*SILU_ACTIVATION=*/1,
+      /*IS_APC_ENABLED=*/0,
+      /*USE_READ_CACHE_INDICES=*/read_cache_indices_opt.has_value() ? 1 : 0,
+      /*HAS_NULL_BLOCK=*/1,
+      /*NP2_STATELEN=*/np2_statelen,
+      /*BLOCK_M=*/kBlockM,
+      /*BLOCK_N=*/kBlockN);
 
   return out;
 }

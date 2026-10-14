@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <array>
+#include <optional>
 #include <string>
 #include <tuple>
 
@@ -112,6 +113,9 @@ class Glm5NextKDAImpl final : public torch::nn::Module {
  private:
   torch::Tensor get_linear_state_indices(const ModelInputParams& input_params,
                                          const torch::Device& device) const;
+  std::optional<torch::Tensor> get_prefill_read_indices(
+      const ModelInputParams& input_params,
+      const AttentionMetadata& attn_metadata) const;
   int64_t get_checkpoint_stride(const KVCache& kv_cache) const;
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> split_mixed_qkv(
       const torch::Tensor& mixed_qkv) const;

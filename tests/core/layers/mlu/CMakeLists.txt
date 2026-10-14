@@ -412,3 +412,21 @@ cc_test(
     torch
     GTest::gtest_main
 )
+
+# Forks real CP ranks before MLU initialization in the parent process.
+cc_test(
+  NAME
+    glm5_next_state_pcp_test
+  SRCS
+    glm5_next_state_pcp_test.cpp
+  DEPS
+    :mlu_layers
+    :parallel_state
+    :kv_cache
+    :util
+    glog::glog
+    torch
+    GTest::gtest_main
+  ENVIRONMENT
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
+)

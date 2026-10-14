@@ -220,6 +220,178 @@ double tensor_cosine_similarity(const torch::Tensor& actual,
   return numerator / std::max(denominator, std::numeric_limits<double>::min());
 }
 
+TEST(Glm5NextKDATest, DistinctPrefillStatesMatchRestoreCopyAndContinueDecode) {
+  torch::InferenceMode guard;
+  torch::manual_seed(/*seed=*/20261012);
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  const torch::DeviceGuard device_guard(device);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const auto ints = options.dtype(torch::kInt32);
+  test::MockProcessGroup group(device);
+  ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &group);
+  parallel.tp_group_ = &group;
+  ModelArgs args;
+  args.hidden_size(128)
+      .linear_num_key_heads(8)
+      .linear_num_value_heads(8)
+      .linear_key_head_dim(128)
+      .linear_value_head_dim(128)
+      .linear_conv_kernel_dim(4)
+      .rms_norm_eps(1e-6);
+  Glm5NextKDA layer(args, QuantArgs(), parallel, options);
+  for (auto& parameter : layer->named_parameters()) {
+    parameter.value().normal_(0.0, 0.03);
+  }
+  // Two requests share a source, one resumes in place, and one starts cold.
+  // The first two chunks are shorter than the three-token convolution history.
+  const std::vector<int32_t> read_ids{1, 1, 4, 5};
+  const std::vector<int32_t> write_ids{2, 3, 4, 5};
+  const torch::Tensor write_indices = torch::tensor(write_ids, ints);
+  for (const int64_t checkpoint_stride : {1, 4}) {
+    SCOPED_TRACE(checkpoint_stride);
+    torch::Tensor conv =
+        torch::randn({6, checkpoint_stride + 2, 3 * 8 * 128}, options);
+    torch::Tensor ssm = torch::randn({6 * checkpoint_stride, 8, 128, 128},
+                                     options.dtype(torch::kFloat32)) *
+                        0.03f;
+    KVCache copied_cache(
+        LinearAttentionKVCacheTensors{conv.clone(), ssm.clone()});
+    KVCache direct_cache(
+        LinearAttentionKVCacheTensors{conv.clone(), ssm.clone()});
+    for (const int64_t target : {2, 3}) {
+      copied_cache.get_conv_cache()[target].copy_(conv[1]);
+      copied_cache.get_ssm_cache()
+          .narrow(/*dim=*/0, target * checkpoint_stride, checkpoint_stride)
+          .copy_(ssm.narrow(/*dim=*/0, checkpoint_stride, checkpoint_stride));
+    }
+    ModelInputParams direct;
+    direct.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+    direct.embedding.linear_state_ids = write_ids;
+    direct.embedding.linear_state_indices = write_indices;
+    direct.embedding.linear_state_read_ids = read_ids;
+    direct.embedding.linear_state_read_indices = torch::tensor(read_ids, ints);
+    ModelInputParams copied = direct;
+    copied.embedding.linear_state_read_ids = write_ids;
+    copied.embedding.linear_state_read_indices = write_indices;
+    AttentionMetadata metadata{};
+    metadata.is_chunked_prefill = true;
+    metadata.max_query_len = 4;
+    metadata.q_cu_seq_lens = torch::tensor({0, 1, 3, 7, 10}, ints);
+    metadata.has_initial_states =
+        torch::tensor({true, true, true, false}, options.dtype(torch::kBool));
+    metadata.batch = torch::full({2048}, /*fill_value=*/-1, ints);
+    metadata.token_block_offset = torch::full({2048}, /*fill_value=*/-1, ints);
+    metadata.batch.narrow(/*dim=*/0, /*start=*/0, /*length=*/4)
+        .copy_(torch::arange(4, ints));
+    metadata.token_block_offset.narrow(/*dim=*/0, /*start=*/0, /*length=*/4)
+        .zero_();
+    metadata.tot = 4;
+    metadata.chunk_indices = make_chunk_indices(
+        metadata.q_cu_seq_lens,
+        kernel::mlu::kda_prefill_chunk_size(/*num_heads=*/8,
+                                            /*use_qk_l2norm=*/true));
+    const torch::Tensor hidden = torch::randn({10, 128}, options);
+    const torch::Tensor expected =
+        layer->forward(hidden, metadata, copied_cache, copied);
+    AttentionMetadata direct_metadata = metadata;
+    direct_metadata.linear_state_read_indices =
+        direct.embedding.linear_state_read_indices;
+    const torch::Tensor actual =
+        layer->forward(hidden, direct_metadata, direct_cache, direct);
+    EXPECT_TRUE(torch::allclose(actual, expected, /*rtol=*/0.0, /*atol=*/0.0));
+    const torch::Tensor state_indices = write_indices * checkpoint_stride;
+    EXPECT_TRUE(torch::equal(
+        direct_cache.get_ssm_cache().index_select(/*dim=*/0, state_indices),
+        copied_cache.get_ssm_cache().index_select(/*dim=*/0, state_indices)));
+    EXPECT_TRUE(
+        torch::equal(direct_cache.get_conv_cache()
+                         .index_select(/*dim=*/0, write_indices)
+                         .narrow(/*dim=*/1, /*start=*/0, /*length=*/3),
+                     copied_cache.get_conv_cache()
+                         .index_select(/*dim=*/0, write_indices)
+                         .narrow(/*dim=*/1, /*start=*/0, /*length=*/3)));
+    EXPECT_TRUE(torch::equal(direct_cache.get_conv_cache()[1], conv[1]));
+    EXPECT_TRUE(torch::equal(
+        direct_cache.get_ssm_cache().narrow(
+            /*dim=*/0, checkpoint_stride, checkpoint_stride),
+        ssm.narrow(/*dim=*/0, checkpoint_stride, checkpoint_stride)));
+
+    if (checkpoint_stride > 1) {
+      direct.is_spec_verify = true;
+      copied.is_spec_verify = true;
+      direct.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+      copied.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+      AttentionMetadata verify_metadata{};
+      verify_metadata.is_chunked_prefill = true;
+      verify_metadata.max_query_len = checkpoint_stride;
+      verify_metadata.q_cu_seq_lens =
+          torch::arange(5, ints) * checkpoint_stride;
+      // The first verify starts at committed state; the second selects
+      // different accepted-token checkpoints, including the last candidate's
+      // state.
+      for (const bool first_verify : {true, false}) {
+        direct.num_accepted_tokens =
+            first_verify ? torch::ones({4}, ints) : torch::arange(1, 5, ints);
+        copied.num_accepted_tokens = direct.num_accepted_tokens;
+        const torch::Tensor verify_hidden = torch::randn({16, 128}, options);
+        const torch::Tensor expected_verify = layer->forward(
+            verify_hidden, verify_metadata, copied_cache, copied);
+        const torch::Tensor actual_verify = layer->forward(
+            verify_hidden, verify_metadata, direct_cache, direct);
+        EXPECT_TRUE(torch::allclose(actual_verify,
+                                    expected_verify,
+                                    /*rtol=*/0.0,
+                                    /*atol=*/0.0));
+        EXPECT_TRUE(torch::equal(direct_cache.get_ssm_cache().narrow(
+                                     /*dim=*/0, /*start=*/8, /*length=*/16),
+                                 copied_cache.get_ssm_cache().narrow(
+                                     /*dim=*/0, /*start=*/8, /*length=*/16)));
+        EXPECT_TRUE(torch::equal(direct_cache.get_conv_cache().index_select(
+                                     /*dim=*/0, write_indices),
+                                 copied_cache.get_conv_cache().index_select(
+                                     /*dim=*/0, write_indices)));
+      }
+    }
+    direct.is_spec_verify = false;
+    copied.is_spec_verify = false;
+
+    // A mixed batch retains the restore-to-destination contract even though
+    // it executes the chunked-prefill layer branch.
+    direct.meta.batch_forward_type = BatchForwardType::MIXED;
+    copied.meta.batch_forward_type = BatchForwardType::MIXED;
+    metadata.has_initial_states.fill_(true);
+    const torch::Tensor expected_mixed =
+        layer->forward(hidden, metadata, copied_cache, copied);
+    const torch::Tensor actual_mixed =
+        layer->forward(hidden, metadata, direct_cache, direct);
+    EXPECT_TRUE(torch::allclose(actual_mixed,
+                                expected_mixed,
+                                /*rtol=*/0.0,
+                                /*atol=*/0.0));
+
+    // Decode must consume the newly published destination state; stale source
+    // IDs deliberately remain present to verify decode never uses them.
+    direct.meta.batch_forward_type = BatchForwardType::DECODE;
+    copied.meta.batch_forward_type = BatchForwardType::DECODE;
+    AttentionMetadata decode_metadata{};
+    decode_metadata.max_query_len = 1;
+    decode_metadata.q_cu_seq_lens = torch::arange(5, ints);
+    const torch::Tensor decode_hidden = torch::randn({4, 128}, options);
+    const torch::Tensor expected_decode =
+        layer->forward(decode_hidden, decode_metadata, copied_cache, copied);
+    const torch::Tensor actual_decode =
+        layer->forward(decode_hidden, decode_metadata, direct_cache, direct);
+    EXPECT_TRUE(torch::allclose(actual_decode,
+                                expected_decode,
+                                /*rtol=*/0.0,
+                                /*atol=*/0.0));
+    EXPECT_TRUE(torch::equal(
+        direct_cache.get_ssm_cache().index_select(/*dim=*/0, state_indices),
+        copied_cache.get_ssm_cache().index_select(/*dim=*/0, state_indices)));
+  }
+}
+
 TEST(Glm5NextKDATest, PaddedVerifyLayerPreservesStateAndReplays) {
   const torch::NoGradGuard no_grad;
   const torch::Device device(torch::kPrivateUse1, 0);

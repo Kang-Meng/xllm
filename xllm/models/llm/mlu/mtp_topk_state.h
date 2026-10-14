@@ -160,14 +160,16 @@ class MluMtpTopkGraphBuffer final : public MtpTopkGraphBuffer {
       const auto& target = *state_->layer_states()[i];
       const auto& input = *native->layer_states()[i];
       target.block_tables()
-          .narrow(0, 0, rows)
+          .narrow(/*dim=*/0, /*start=*/0, rows)
           .copy_(input.block_tables(), /*non_blocking=*/true);
       target.context_lens()
-          .narrow(0, 0, rows)
+          .narrow(/*dim=*/0, /*start=*/0, rows)
           .copy_(input.context_lens(), /*non_blocking=*/true);
       // Zero-length padded rows cannot read the sentinel block-table entries.
-      target.block_tables().narrow(0, rows, padding).fill_(-1);
-      target.context_lens().narrow(0, rows, padding).zero_();
+      target.block_tables()
+          .narrow(/*dim=*/0, rows, padding)
+          .fill_(/*value=*/-1);
+      target.context_lens().narrow(/*dim=*/0, rows, padding).zero_();
     }
   }
 

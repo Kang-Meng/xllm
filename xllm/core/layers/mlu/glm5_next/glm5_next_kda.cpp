@@ -467,6 +467,24 @@ torch::Tensor Glm5NextKDAImpl::get_linear_state_indices(
       torch::TensorOptions().dtype(torch::kInt).device(device));
 }
 
+std::optional<torch::Tensor> Glm5NextKDAImpl::get_prefill_read_indices(
+    const ModelInputParams& input_params,
+    const AttentionMetadata& attn_metadata) const {
+  if (!input_params.meta.batch_forward_type.no_decode() ||
+      input_params.is_spec_verify) {
+    return std::nullopt;
+  }
+  if (attn_metadata.linear_state_read_indices.defined()) {
+    return attn_metadata.linear_state_read_indices;
+  }
+  const auto& embedding = input_params.embedding;
+  CHECK(embedding.linear_state_read_ids.empty() ||
+        embedding.linear_state_read_ids == embedding.linear_state_ids)
+      << "Distinct prefill state slots require source indices in attention "
+         "metadata; prepare it at the GLM5-Next model entry";
+  return std::nullopt;
+}
+
 int64_t Glm5NextKDAImpl::get_checkpoint_stride(const KVCache& kv_cache) const {
   torch::Tensor conv_cache = kv_cache.get_conv_cache();
   torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
@@ -583,6 +601,8 @@ torch::Tensor Glm5NextKDAImpl::forward(
                       .squeeze(/*dim=*/0)
                       .contiguous();
   } else if (attn_metadata.is_prefill || attn_metadata.is_chunked_prefill) {
+    const auto read_indices =
+        get_prefill_read_indices(input_params, attn_metadata);
     mixed_qkv = mixed_qkv.transpose(/*dim0=*/0, /*dim1=*/1);
     mixed_qkv = xllm::kernel::mlu::causal_conv1d_fn(
         mixed_qkv,
@@ -597,11 +617,16 @@ torch::Tensor Glm5NextKDAImpl::forward(
         attn_metadata.has_initial_states,
         /*initial_state_idx=*/std::nullopt,
         /*num_accepted_tokens=*/std::nullopt,
-        /*inplace_final_state=*/true);
+        /*inplace_final_state=*/true,
+        read_indices);
     mixed_qkv = mixed_qkv.transpose(/*dim0=*/0, /*dim1=*/1);
     std::tie(q, k, v) = split_mixed_qkv(mixed_qkv);
 
-    torch::Tensor initial_state = ssm_cache.index({state_base_indices});
+    const torch::Tensor read_base_indices =
+        read_indices.has_value()
+            ? build_linear_state_base_indices(*read_indices, checkpoint_stride)
+            : state_base_indices;
+    torch::Tensor initial_state = ssm_cache.index({read_base_indices});
     initial_state.index_put_(
         {~attn_metadata.has_initial_states, torch::indexing::Ellipsis}, 0.0f);
     CHECK(attn_metadata.chunk_indices.defined())

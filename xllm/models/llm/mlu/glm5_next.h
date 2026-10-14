@@ -24,6 +24,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/scheduler_config.h"
@@ -195,23 +196,7 @@ class Glm5NextModelImpl final
     std::vector<int32_t>& dp_token_nums =
         modified_input_params.parallel.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
-    if (!modified_input_params.attn_metadata) {
-      modified_input_params.attn_metadata =
-          std::make_shared<layer::AttentionMetadata>(
-              layer::AttentionMetadataBuilder::build(modified_input_params,
-                                                     model_args_.enable_mla(),
-                                                     /*compute_dtype=*/"half",
-                                                     /*attn_mask=*/std::nullopt,
-                                                     /*device=*/device_));
-    }
-    if (!modified_input_params.attn_metadata->is_spec_verify &&
-        (modified_input_params.attn_metadata->is_prefill ||
-         modified_input_params.attn_metadata->is_chunked_prefill)) {
-      layer::AttentionMetadataBuilder::build_linear_prefill(
-          *modified_input_params.attn_metadata,
-          kernel::mlu::kda_prefill_chunk_size(local_linear_heads_,
-                                              /*use_qk_l2norm=*/true));
-    }
+    prepare_attention_metadata(modified_input_params);
     const layer::AttentionMetadata& attn_metadata =
         *modified_input_params.attn_metadata;
 
@@ -294,6 +279,71 @@ class Glm5NextModelImpl final
   }
 
  private:
+  friend class Glm5NextModelTestPeer;
+
+  void prepare_attention_metadata(ModelInputParams& params) const {
+    const bool ordinary_prefill =
+        params.meta.batch_forward_type.no_decode() && !params.is_spec_verify;
+    if (!params.attn_metadata) {
+      params.attn_metadata = std::make_shared<layer::AttentionMetadata>(
+          layer::AttentionMetadataBuilder::build(params,
+                                                 model_args_.enable_mla(),
+                                                 /*compute_dtype=*/"half",
+                                                 /*attn_mask=*/std::nullopt,
+                                                 /*device=*/device_));
+    } else if (ordinary_prefill ||
+               (!params.attn_metadata->is_spec_verify &&
+                (params.attn_metadata->is_prefill ||
+                 params.attn_metadata->is_chunked_prefill)) ||
+               params.attn_metadata->linear_state_read_indices.defined()) {
+      // Own the metadata object before replacing batch fields. Tensor storage
+      // remains shared; normal decode keeps its graph metadata object.
+      params.attn_metadata =
+          std::make_shared<layer::AttentionMetadata>(*params.attn_metadata);
+    }
+    auto& metadata = *params.attn_metadata;
+    if (metadata.linear_state_read_indices.defined()) {
+      metadata.linear_state_read_indices = torch::Tensor();
+    }
+    const auto& embedding = params.embedding;
+    if (ordinary_prefill && !metadata.is_spec_verify &&
+        !embedding.linear_state_read_ids.empty() &&
+        embedding.linear_state_read_ids != embedding.linear_state_ids) {
+      CHECK_EQ(embedding.linear_state_read_ids.size(),
+               embedding.linear_state_ids.size());
+      torch::Tensor read_indices =
+          embedding.linear_state_read_indices.defined()
+              ? embedding.linear_state_read_indices
+              : torch::tensor(embedding.linear_state_read_ids,
+                              torch::TensorOptions()
+                                  .dtype(torch::kInt32)
+                                  .device(device_));
+      CHECK_EQ(read_indices.dim(), 1)
+          << "Linear state source indices must be 1D";
+      CHECK_EQ(read_indices.numel(),
+               static_cast<int64_t>(embedding.linear_state_ids.size()))
+          << "Linear state source index count must match destination slots";
+      CHECK(read_indices.scalar_type() == torch::kInt32 ||
+            read_indices.scalar_type() == torch::kInt64)
+          << "Linear state source indices must be integers";
+      CHECK(read_indices.device() == device_)
+          << "Linear state source indices must be on the model device";
+      if (metadata.linear_state_indices.defined()) {
+        CHECK(read_indices.device() == metadata.linear_state_indices.device())
+            << "Linear state source and destination indices must share a "
+               "device";
+      }
+      metadata.linear_state_read_indices = std::move(read_indices);
+    }
+    if (!metadata.is_spec_verify &&
+        (metadata.is_prefill || metadata.is_chunked_prefill)) {
+      layer::AttentionMetadataBuilder::build_linear_prefill(
+          metadata,
+          kernel::mlu::kda_prefill_chunk_size(local_linear_heads_,
+                                              /*use_qk_l2norm=*/true));
+    }
+  }
+
   torch::Device device_;
   int64_t hc_mult_ = 1;
   AuxHiddenCapture aux_capture_;

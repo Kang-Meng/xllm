@@ -7,6 +7,21 @@ get_filename_component(_xllm_build_import_root
 
 cc_test(
   NAME
+    causal_conv1d_prefill_state_test
+  SRCS
+    causal_conv1d_prefill_state_test.cpp
+  DEPS
+    :mlu_kernels
+    :platform
+    glog::glog
+    torch
+    GTest::gtest_main
+  ENVIRONMENT
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
+)
+
+cc_test(
+  NAME
     pack_cache_blocks_test
   SRCS
     pack_cache_blocks_test.cpp

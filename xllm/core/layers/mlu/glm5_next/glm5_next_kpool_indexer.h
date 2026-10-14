@@ -110,7 +110,8 @@ class Glm5NextKPoolIndexerImpl final : public torch::nn::Module {
                     torch::Tensor& tail_cache,
                     const torch::Tensor& linear_state_indices,
                     const torch::Tensor& block_table,
-                    const Execution& execution);
+                    const Execution& execution,
+                    const torch::Tensor& read_tail_indices);
   torch::Tensor select_pools(const torch::Tensor& hidden_states,
                              const torch::Tensor& q_norm,
                              const torch::Tensor& positions,

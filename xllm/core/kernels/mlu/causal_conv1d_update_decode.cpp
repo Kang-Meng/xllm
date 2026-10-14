@@ -145,7 +145,7 @@ torch::Tensor causal_conv1d_update_decode(
 
   JITKernel& f = JITKernel::get(
       /*py_path=*/
-      "xllm.core.kernels.mlu.triton_kernel.causal_conv1d_update_decode",
+      "xllm.core.kernels.mlu.triton_kernel.causal_conv1d",
       /*fn_name=*/"tmo_causal_conv1d_update_decode_kernel");
 
   f.launch(

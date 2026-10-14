@@ -37,6 +37,7 @@ limitations under the License.
 #include "platform/device.h"
 #include "platform/platform.h"
 #include "runtime/forward_params.h"
+#include "tests/core/layers/mlu/glm5_next_kpool_test_utils.h"
 #include "util/linalg.h"
 
 namespace xllm::layer {
@@ -335,6 +336,12 @@ void check_forward_after_short_prefill(bool graph_decode,
   }
   EXPECT_TRUE(torch::allclose(full_cache, decode_cache, 0.015625, 0.015625));
   KVCacheConfig::get_instance().block_size(saved_block_size);
+}
+
+TEST(Glm5NextKPoolIndexerTest,
+     DistinctPrefillTailMatchesCopyThroughVerifyAndDecode) {
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  ASSERT_TRUE(test::check_kpool_state(device));
 }
 
 TEST(Glm5NextKPoolIndexerTest, PrefillMatchesPagedPathAcrossRaggedTiles) {

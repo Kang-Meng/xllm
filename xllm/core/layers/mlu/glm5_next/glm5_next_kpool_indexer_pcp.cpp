@@ -83,7 +83,8 @@ std::tuple<torch::Tensor, torch::Tensor> Glm5NextKPoolIndexerImpl::forward_pcp(
                tail_cache,
                global_execution.batch->tail_indices,
                global_execution.batch->block_table,
-               global_execution);
+               global_execution,
+               global_metadata.linear_state_read_indices);
 
   const torch::Tensor pools = select_projected_pools(query,
                                                      weights,

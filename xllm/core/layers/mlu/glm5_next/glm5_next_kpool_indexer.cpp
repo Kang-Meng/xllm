@@ -211,7 +211,8 @@ void update_prefill(const torch::Tensor& key,
                     const torch::Tensor& row_batch,
                     const torch::Tensor& starts,
                     int64_t block_size,
-                    int64_t pool_size) {
+                    int64_t pool_size,
+                    const torch::Tensor& read_tail_indices) {
   if (key.size(0) == 0) {
     return;
   }
@@ -220,6 +221,9 @@ void update_prefill(const torch::Tensor& key,
   const torch::Tensor a = ape.to(raw.device(), torch::kFloat32).contiguous();
   const torch::Tensor matrix = hadamard.contiguous();
   const torch::Tensor ids = tail_ids.contiguous();
+  const torch::Tensor read_ids =
+      read_tail_indices.defined() ? read_tail_indices.contiguous() : ids;
+  CHECK_EQ(read_ids.numel(), ids.numel());
   const torch::Tensor table = block_table.contiguous();
   const torch::Tensor pos = positions.contiguous();
   const torch::Tensor rows = row_batch.contiguous();
@@ -243,7 +247,7 @@ void update_prefill(const torch::Tensor& key,
               matrix,
               cache,
               tail,
-              ids,
+              read_ids,
               table,
               pos,
               rows,
@@ -258,6 +262,11 @@ void update_prefill(const torch::Tensor& key,
               /*BLOCK_D=*/static_cast<int32_t>(next_power_of_two(dimension)),
               /*POOL_BLOCK=*/static_cast<int32_t>(block_size / pool_size));
   // Complete all old-tail reads before overwriting the request rings.
+  if (read_tail_indices.defined()) {
+    kernel::mlu::stash_kpool_from_source(
+        raw, gates, tail, ids, read_ids, pos, offsets);
+    return;
+  }
   triton_jit::JITKernel::get(kKPoolKernelPath, "kpool_prefill_stash")
       .launch(queue,
               {static_cast<uint32_t>(ids.numel()), 1, 1},
@@ -563,7 +572,8 @@ void Glm5NextKPoolIndexerImpl::update_cache(
     torch::Tensor& tail_cache,
     const torch::Tensor& linear_state_indices,
     const torch::Tensor& block_table,
-    const Execution& execution) {
+    const Execution& execution,
+    const torch::Tensor& read_tail_indices) {
   const auto& batch = *execution.batch;
   if (execution.prefill && !execution.fused_update) {
     update_prefill(raw_k,
@@ -578,7 +588,8 @@ void Glm5NextKPoolIndexerImpl::update_cache(
                    batch.row_batch,
                    batch.query_starts,
                    block_size_,
-                   index_kpool_);
+                   index_kpool_,
+                   read_tail_indices);
     return;
   }
   const bool decode = execution.fused_update;
@@ -595,7 +606,8 @@ void Glm5NextKPoolIndexerImpl::update_cache(
                             batch.query_starts,
                             block_size_,
                             index_kpool_,
-                            decode);
+                            decode,
+                            read_tail_indices);
 }
 
 torch::Tensor Glm5NextKPoolIndexerImpl::select_pools(
@@ -703,7 +715,8 @@ std::tuple<torch::Tensor, torch::Tensor> Glm5NextKPoolIndexerImpl::forward(
                tail_cache,
                execution.batch->tail_indices,
                execution.batch->block_table,
-               execution);
+               execution,
+               attn_metadata.linear_state_read_indices);
   const torch::Tensor pools = select_pools(hidden_states,
                                            q_norm,
                                            cache_positions,

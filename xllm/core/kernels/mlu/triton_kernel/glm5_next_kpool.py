@@ -489,25 +489,24 @@ def kpool_prefill_stash(
     BLOCK_D: tl.constexpr,
 ) -> None:
     """Stash the final valid prefill tail for each request."""
-    batch = tl.program_id(0)
-    start = tl.load(starts + batch)
-    end = tl.load(starts + batch + 1)
-    last = tl.load(positions + end - 1, end > start, -1).to(tl.int64)
-    while (end > start) & (last < 0):
-        end -= 1
-        last = tl.load(positions + end - 1, end > start, -1).to(tl.int64)
-    if end > start:
-        tail_id = tl.load(tail_ids + batch)
-        if (last >= 0) & (tail_id > 0):
-            d = tl.arange(0, BLOCK_D)
-            r = tl.arange(0, BLOCK_P)
-            source = end - 1 - (last % T - r + T) % T
-            source_pos = tl.load(positions + source, (r < T) & (source >= start), -1)
-            mask = (r[:, None] < T) & (d[None, :] < D) & (source_pos[:, None] >= 0)
-            kv = tl.load(k + source[:, None] * k_stride + d[None, :], mask, 0)
-            gv = tl.load(gate + source[:, None] * gate_stride + d[None, :], mask, 0)
-            tl.store(tail + (tail_id * 2 * T + r[:, None]) * D + d[None, :], kv, mask)
-            tl.store(tail + (tail_id * 2 * T + T + r[:, None]) * D + d[None, :], gv, mask)
+    _stash_from_source(
+        k,
+        gate,
+        tail,
+        tail_ids,
+        tail_ids,
+        positions,
+        starts,
+        tl.program_id(0),
+        0,
+        k_stride,
+        gate_stride,
+        T,
+        D,
+        BLOCK_P,
+        BLOCK_D,
+        INHERIT=False,
+    )
 
 
 @triton.jit
@@ -622,3 +621,158 @@ def score_verify_pools(
                     -float("inf"),
                     pools < capacity,
                 )
+
+
+# Source slots remain immutable while unique destination slots receive the
+# updated ring. A destination must not alias another request's live source.
+@triton.jit
+def _stash_from_source(
+    k: tl.tensor,
+    gate: tl.tensor,
+    tail: tl.tensor,
+    tail_ids: tl.tensor,
+    read_tail_ids: tl.tensor,
+    positions: tl.tensor,
+    starts: tl.tensor,
+    batch: tl.tensor,
+    ring_tile: tl.tensor,
+    k_stride: tl.int64,
+    gate_stride: tl.int64,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    INHERIT: tl.constexpr = True,
+) -> None:
+    start = tl.load(starts + batch)
+    end = tl.load(starts + batch + 1)
+    last = tl.load(positions + end - 1, end > start, -1).to(tl.int64)
+    while (end > start) & (last < 0):
+        end -= 1
+        last = tl.load(positions + end - 1, end > start, -1).to(tl.int64)
+    write_id = tl.load(tail_ids + batch)
+    if write_id > 0:
+        d = tl.arange(0, BLOCK_D)
+        r = ring_tile * BLOCK_P + tl.arange(0, BLOCK_P)
+        source = end - 1 - (last % T - r + T) % T
+        source_pos = tl.load(
+            positions + source,
+            (r < T) & (end > start) & (source >= start),
+            -1,
+        )
+        current = source_pos >= 0
+        layout_mask = (r[:, None] < T) & (d[None, :] < D)
+        new_mask = layout_mask & current[:, None]
+        kv = tl.load(k + source[:, None] * k_stride + d[None, :], new_mask, 0)
+        gv = tl.load(gate + source[:, None] * gate_stride + d[None, :], new_mask, 0)
+        new_base = (write_id * 2 * T + r[:, None]) * D + d[None, :]
+        tl.store(tail + new_base, kv, new_mask)
+        tl.store(tail + new_base + T * D, gv, new_mask)
+        # Fully overwritten tiles need no source read or history merge.
+        # Inspect actual positions so masked holes still inherit old cells.
+        if INHERIT and tl.min(tl.where(r < T, source_pos, 0), 0) < 0:
+            read_id = tl.load(read_tail_ids + batch)
+            inherit = layout_mask & ~current[:, None] & (read_id != write_id)
+            old_base = (read_id * 2 * T + r[:, None]) * D + d[None, :]
+            old_k = tl.load(tail + old_base, inherit & (read_id > 0), 0)
+            old_g = tl.load(tail + old_base + T * D, inherit & (read_id > 0), 0)
+            tl.store(tail + new_base, old_k, inherit)
+            tl.store(tail + new_base + T * D, old_g, inherit)
+
+
+@triton.jit
+def kpool_stash_from_source(
+    k: tl.tensor,
+    gate: tl.tensor,
+    tail: tl.tensor,
+    tail_ids: tl.tensor,
+    read_tail_ids: tl.tensor,
+    positions: tl.tensor,
+    starts: tl.tensor,
+    k_stride: tl.constexpr,
+    gate_stride: tl.constexpr,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    _stash_from_source(
+        k,
+        gate,
+        tail,
+        tail_ids,
+        read_tail_ids,
+        positions,
+        starts,
+        tl.program_id(0),
+        tl.program_id(1),
+        k_stride,
+        gate_stride,
+        T,
+        D,
+        BLOCK_P,
+        BLOCK_D,
+    )
+
+
+@triton.jit
+def kpool_prefill_update_from_source(
+    k: tl.tensor,
+    gate: tl.tensor,
+    ape: tl.tensor,
+    hadamard: tl.tensor,
+    cache: tl.tensor,
+    tail: tl.tensor,
+    tail_ids: tl.tensor,
+    read_tail_ids: tl.tensor,
+    table: tl.tensor,
+    positions: tl.tensor,
+    starts: tl.tensor,
+    k_stride: tl.constexpr,
+    gate_stride: tl.constexpr,
+    table_stride: tl.constexpr,
+    P: tl.constexpr,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    BP: tl.constexpr,
+    BD: tl.constexpr,
+    PB: tl.constexpr,
+    BT: tl.constexpr,
+) -> None:
+    req = tl.program_id(0)
+    state = tl.load(tail_ids + req)
+    read_id = tl.load(read_tail_ids + req)
+    if (state > 0) & (read_id != state):
+        d = tl.arange(0, BD)
+        ring = tl.arange(0, BT)
+        mask = (ring[:, None] < T) & (d[None, :] < D)
+        old_base = (read_id * 2 * T + ring[:, None]) * D + d[None, :]
+        old_k = tl.load(tail + old_base, mask & (read_id > 0), 0)
+        old_g = tl.load(tail + old_base + T * D, mask & (read_id > 0), 0)
+        new_base = (state * 2 * T + ring[:, None]) * D + d[None, :]
+        tl.store(tail + new_base, old_k, mask)
+        tl.store(tail + new_base + T * D, old_g, mask)
+    # Tiny spans retain the original chronological updates, including masked
+    # holes and trailing padding. Fuse history initialization into this launch
+    # to remove the separate restore copy without duplicating pool arithmetic.
+    kpool_decode_update(
+        k,
+        gate,
+        ape,
+        hadamard,
+        cache,
+        tail,
+        tail_ids,
+        table,
+        positions,
+        starts,
+        k_stride,
+        gate_stride,
+        table_stride,
+        P,
+        T,
+        D,
+        BP,
+        BD,
+        PB,
+    )

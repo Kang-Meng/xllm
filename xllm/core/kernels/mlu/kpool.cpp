@@ -37,6 +37,19 @@ int32_t tile_size(int64_t n) {
   }
   return result;
 }
+// These checks inspect metadata only; no device synchronization is required.
+void check_tail_indices(const torch::Tensor& indices,
+                        const torch::Tensor& tail,
+                        int64_t requests) {
+  CHECK(indices.defined());
+  CHECK_EQ(indices.dim(), 1) << "tail indices must be one-dimensional";
+  CHECK_EQ(indices.numel(), requests);
+  CHECK(indices.scalar_type() == torch::kInt32 ||
+        indices.scalar_type() == torch::kInt64)
+      << "tail indices must have integer dtype";
+  CHECK(indices.device() == tail.device());
+}
+
 // Preserve the old integer addressing fast path without restricting layouts.
 torch::Tensor divide(const torch::Tensor& input, int64_t divisor) {
   if ((divisor & (divisor - 1)) != 0) {
@@ -69,7 +82,8 @@ void update_kpool(const torch::Tensor& k,
                   const torch::Tensor& starts,
                   int64_t block_size,
                   int64_t pool_size,
-                  bool decode) {
+                  bool decode,
+                  const torch::Tensor& read_tail_ids) {
   CHECK_GT(pool_size, 0);
   CHECK_EQ(block_size % pool_size, 0);
   CHECK_EQ(k.dim(), 2);
@@ -95,6 +109,10 @@ void update_kpool(const torch::Tensor& k,
   CHECK_EQ(rows.numel(), k.size(0));
   CHECK(cache.is_contiguous());
   CHECK(tail.is_contiguous());
+  if (read_tail_ids.defined()) {
+    check_tail_indices(tail_ids, tail, tail_ids.numel());
+    check_tail_indices(read_tail_ids, tail, tail_ids.numel());
+  }
   if (k.size(0) == 0) {
     return;
   }
@@ -103,6 +121,9 @@ void update_kpool(const torch::Tensor& k,
   const torch::Tensor a = ape.to(k.device(), torch::kFloat32).contiguous();
   const torch::Tensor h = hadamard.contiguous();
   const torch::Tensor ids = tail_ids.contiguous();
+  const torch::Tensor read_ids =
+      read_tail_ids.defined() ? read_tail_ids.contiguous() : ids;
+  CHECK_EQ(read_ids.numel(), ids.numel());
   const torch::Tensor pages = table.contiguous();
   const torch::Tensor pos = positions.contiguous();
   const torch::Tensor batch = rows.contiguous();
@@ -115,6 +136,34 @@ void update_kpool(const torch::Tensor& k,
   // Keep the fused update in its original NRAM range. Larger pools use the
   // same ring protocol through bounded gathers and Torch pooling.
   if (decode && pool_size * d <= 8192) {
+    if (read_tail_ids.defined()) {
+      triton_jit::JITKernel::get(kUpdate, "kpool_prefill_update_from_source")
+          .launch(queue,
+                  {static_cast<uint32_t>(ids.numel()), 1, 1},
+                  {1, 1},
+                  raw,
+                  gates,
+                  a,
+                  h,
+                  cache,
+                  tail,
+                  ids,
+                  read_ids,
+                  pages,
+                  pos,
+                  offsets,
+                  raw.stride(0),
+                  gates.stride(0),
+                  pages.stride(0),
+                  p,
+                  t,
+                  d,
+                  tile_size(p),
+                  tile_size(d),
+                  pb,
+                  tile_size(t));
+      return;
+    }
     triton_jit::JITKernel::get(kUpdate, "kpool_decode_update")
         .launch(queue,
                 {static_cast<uint32_t>(ids.numel()), 1, 1},
@@ -160,7 +209,7 @@ void update_kpool(const torch::Tensor& k,
                 raw,
                 gates,
                 tail,
-                ids,
+                read_ids,
                 pages,
                 pos,
                 batch,
@@ -198,6 +247,10 @@ void update_kpool(const torch::Tensor& k,
                 tile_size(d));
   }
   // All old-tail reads complete before the ring is overwritten.
+  if (read_tail_ids.defined()) {
+    stash_kpool_from_source(raw, gates, tail, ids, read_ids, pos, offsets);
+    return;
+  }
   triton_jit::JITKernel::get(kUpdate, "kpool_stash")
       .launch(queue,
               {static_cast<uint32_t>(ids.numel()),
@@ -215,6 +268,62 @@ void update_kpool(const torch::Tensor& k,
               t,
               d,
               /*BLOCK_P=*/16,
+              tile_size(d));
+}
+
+void stash_kpool_from_source(const torch::Tensor& k,
+                             const torch::Tensor& gate,
+                             torch::Tensor& tail,
+                             const torch::Tensor& tail_ids,
+                             const torch::Tensor& read_tail_ids,
+                             const torch::Tensor& positions,
+                             const torch::Tensor& starts) {
+  CHECK_EQ(k.dim(), 2);
+  CHECK(k.sizes() == gate.sizes());
+  CHECK_EQ(k.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(gate.scalar_type(), k.scalar_type());
+  CHECK_EQ(k.stride(1), 1);
+  CHECK_EQ(gate.stride(1), 1);
+  CHECK_EQ(tail.dim(), 4);
+  CHECK_EQ(tail.size(1), 2);
+  CHECK_GT(tail.size(2), 0);
+  CHECK_EQ(tail.size(3), k.size(1));
+  CHECK_EQ(tail.scalar_type(), k.scalar_type());
+  CHECK(tail.is_contiguous());
+  CHECK(k.device() == tail.device());
+  CHECK(gate.device() == tail.device());
+  check_tail_indices(tail_ids, tail, tail_ids.numel());
+  check_tail_indices(read_tail_ids, tail, tail_ids.numel());
+  check_tail_indices(positions, tail, k.size(0));
+  check_tail_indices(starts, tail, tail_ids.numel() + 1);
+  CHECK(tail_ids.is_contiguous());
+  CHECK(read_tail_ids.is_contiguous());
+  CHECK(positions.is_contiguous());
+  CHECK(starts.is_contiguous());
+  if (tail_ids.numel() == 0) {
+    return;
+  }
+  const int32_t t = static_cast<int32_t>(tail.size(2));
+  const int32_t d = static_cast<int32_t>(tail.size(3));
+  const int32_t block_p = std::min(tile_size(t), 16);
+  triton_jit::JITKernel::get(kUpdate, "kpool_stash_from_source")
+      .launch(static_cast<void*>(torch_mlu::getCurMLUStream()),
+              {static_cast<uint32_t>(tail_ids.numel()),
+               static_cast<uint32_t>((t + block_p - 1) / block_p),
+               1},
+              {1, 1},
+              k,
+              gate,
+              tail,
+              tail_ids,
+              read_tail_ids,
+              positions,
+              starts,
+              k.stride(0),
+              gate.stride(0),
+              t,
+              d,
+              block_p,
               tile_size(d));
 }
 

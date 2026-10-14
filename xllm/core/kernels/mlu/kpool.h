@@ -40,7 +40,20 @@ void update_kpool(const torch::Tensor& k,
                   const torch::Tensor& starts,
                   int64_t block_size,
                   int64_t pool_size,
-                  bool decode = false);
+                  bool decode = false,
+                  const torch::Tensor& read_tail_ids = torch::Tensor());
+
+// Complete the destination ring using surviving source history and new tokens.
+// All pooling reads must finish before this update. Distinct source slots stay
+// immutable; a target must not alias another request's live source. Indices are
+// contiguous integer vectors on the cache device; target slots are unique.
+void stash_kpool_from_source(const torch::Tensor& k,
+                             const torch::Tensor& gate,
+                             torch::Tensor& tail,
+                             const torch::Tensor& tail_ids,
+                             const torch::Tensor& read_tail_ids,
+                             const torch::Tensor& positions,
+                             const torch::Tensor& starts);
 
 // Writes caller-owned FP32 workspace. Positions are causal, zero-based token
 // positions; -1 masks the whole row. Rows map queries to request page tables.

@@ -839,6 +839,9 @@ void WorkerImpl::prepare_linear_state_cache(ModelInputParams& params) {
       (is_python_model && is_glm5_next_target_model(args) &&
        params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) ||
       (!is_python_model && is_qwen_target);
+#elif defined(USE_MLU)
+  reads_distinct_state = is_glm5_next_target_model(context_.get_model_args()) &&
+                         is_prefill && !params.is_spec_verify;
 #endif
   if (is_prefill && params.meta.requires_host_restore) {
     CHECK(hierarchy_kv_cache_transfer_ != nullptr)

@@ -26,6 +26,38 @@ limitations under the License.
 namespace xllm::kernel::mlu {
 namespace {
 
+TEST(KPoolStateIoContractTest, RejectsInvalidSourceMetadataBeforeLaunch) {
+  const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+  const torch::Tensor keys = torch::zeros({2, 128}, options);
+  torch::Tensor tail = torch::zeros({4, 2, 4, 128}, options);
+  const torch::Tensor targets = torch::tensor({2, 3}, torch::kInt32);
+  const torch::Tensor sources = torch::tensor({1, 1}, torch::kInt32);
+  const torch::Tensor positions = torch::tensor({3, 3}, torch::kInt32);
+  const torch::Tensor starts = torch::tensor({0, 1, 2}, torch::kInt32);
+  EXPECT_DEATH(
+      stash_kpool_from_source(
+          keys, keys, tail, targets, sources.view({1, 2}), positions, starts),
+      "one-dimensional");
+  EXPECT_DEATH(stash_kpool_from_source(keys,
+                                       keys,
+                                       tail,
+                                       targets,
+                                       sources.to(torch::kFloat32),
+                                       positions,
+                                       starts),
+               "integer dtype");
+  EXPECT_DEATH(
+      stash_kpool_from_source(
+          keys, keys, tail, targets, sources.slice(0, 0, 1), positions, starts),
+      "requests");
+  const torch::Tensor strided_sources =
+      torch::tensor({1, 0, 1, 0}, torch::kInt32).slice(0, 0, 4, 2);
+  EXPECT_DEATH(
+      stash_kpool_from_source(
+          keys, keys, tail, targets, strided_sources, positions, starts),
+      "is_contiguous");
+}
+
 // Independent sequential CPU reference: write ring, pool across members,
 // round through BF16, rotate, then scatter to the physical pool page.
 void update_reference(const torch::Tensor& raw,

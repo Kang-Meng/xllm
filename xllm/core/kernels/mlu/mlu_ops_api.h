@@ -529,6 +529,12 @@ void fused_compress_multi_kv(const torch::Tensor& kv,
 // Clamp gate/up halves while preserving the layout expected by scaled_quantize.
 torch::Tensor fused_moe_clamp(const torch::Tensor& input, float limit);
 
+// Optional read_cache_indices selects the initial history independently from
+// cache_indices, which selects final-state destinations. This is ordinary
+// prefill only: checkpoint/accepted-token arguments must be absent and final
+// state is written in place. Destinations must be unique and must not alias
+// another row's live source; shared read-only sources are supported. Omitting
+// read_cache_indices uses cache_indices for both initial and final state.
 torch::Tensor causal_conv1d_fn(
     const torch::Tensor& x,
     const torch::Tensor& weight,
@@ -542,7 +548,8 @@ torch::Tensor causal_conv1d_fn(
     const std::optional<torch::Tensor>& has_initial_state_opt = std::nullopt,
     const std::optional<torch::Tensor>& initial_state_idx_opt = std::nullopt,
     const std::optional<torch::Tensor>& num_accepted_tokens_opt = std::nullopt,
-    bool inplace_final_state = true);
+    bool inplace_final_state = true,
+    const std::optional<torch::Tensor>& read_cache_indices_opt = std::nullopt);
 
 std::pair<torch::Tensor, torch::Tensor> fused_recurrent_gated_delta_rule(
     const torch::Tensor& q,

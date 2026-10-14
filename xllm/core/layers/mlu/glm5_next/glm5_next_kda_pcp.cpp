@@ -151,6 +151,12 @@ torch::Tensor Glm5NextKDAImpl::forward_pcp(
       get_linear_state_indices(input_params, mixed_qkv.device());
   torch::Tensor state_base_indices =
       build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
+  const auto read_indices =
+      get_prefill_read_indices(input_params, attn_metadata);
+  const torch::Tensor read_base_indices =
+      read_indices.has_value()
+          ? build_linear_state_base_indices(*read_indices, checkpoint_stride)
+          : state_base_indices;
 
   // Halo depends only on QKV; gate projections can run while it travels.
   torch::Tensor local_tails =
@@ -164,7 +170,7 @@ torch::Tensor Glm5NextKDAImpl::forward_pcp(
   torch::Tensor raw_gate = f_b_proj_->forward(projections[2].contiguous())
                                .view({num_tokens, local_num_heads_, head_dim_})
                                .contiguous();
-  torch::Tensor prefix_state = ssm_cache.index({state_base_indices});
+  torch::Tensor prefix_state = ssm_cache.index({read_base_indices});
   prefix_state.index_put_(
       {~attn_metadata.has_initial_states, torch::indexing::Ellipsis}, 0.0f);
   halo_work->wait();
@@ -174,7 +180,7 @@ torch::Tensor Glm5NextKDAImpl::forward_pcp(
                         gathered_tails,
                         conv_weight,
                         conv_cache,
-                        logical_state_indices,
+                        read_indices.value_or(logical_state_indices),
                         attn_metadata,
                         context);
   auto conv_work = context.cp_group->broadcast_async(

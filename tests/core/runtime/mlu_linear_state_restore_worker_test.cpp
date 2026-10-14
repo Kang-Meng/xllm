@@ -18,9 +18,11 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "framework/config/model_config.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -285,6 +287,126 @@ TEST(MluLinearStateRestoreWorkerTest,
   expect_slot_filled(second, /*slot=*/3, kSecondStride, /*value=*/23.0f);
   expect_slot_filled(first, /*slot=*/5, kFirstStride, /*value=*/-101.0f);
   expect_slot_filled(second, /*slot=*/5, kSecondStride, /*value=*/-202.0f);
+}
+
+class MluGlmPrefillRestoreTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    previous_model_impl_ = ModelConfig::get_instance().model_impl();
+    ModelConfig::get_instance().model_impl("native");
+  }
+
+  void TearDown() override {
+    ModelConfig::get_instance().model_impl(previous_model_impl_);
+  }
+
+  void verify_restore(BatchForwardType forward_type,
+                      bool is_spec_verify,
+                      const std::string& model_type,
+                      bool expect_recurrent_copy,
+                      int32_t cp_size = 1) {
+    const torch::Device device("mlu:0");
+    ParallelArgs parallel_args(
+        /*rank=*/0, /*world_size=*/cp_size, /*process_group=*/nullptr);
+    parallel_args.cp_size(cp_size);
+    ModelArgs model_args;
+    model_args.model_type(model_type);
+    model_args.layer_types({"linear_attention"});
+    runtime::Options runtime_options;
+    runtime_options.enable_schedule_overlap(false);
+    LinearStateRestoreWorker worker(
+        parallel_args, device, runtime_options, model_args);
+    constexpr int64_t kStride = 4;
+    LinearCacheTensors cache =
+        make_linear_cache(device, kStride, /*sentinel=*/-101.0f);
+    fill_slot(cache, kRestoreSourceSlot, kStride, 3.0f, 5.0f);
+    const torch::Tensor original_conv = cache.conv.clone();
+    const torch::Tensor original_ssm = cache.ssm.clone();
+    IndexedKVCacheTensors indexed;
+    indexed.kpool_tail =
+        torch::full({kNumSlots, 2, 16, 8}, -9.0f, cache.conv.options());
+    indexed.kpool_tail[kRestoreSourceSlot].fill_(7.0f);
+    torch::Tensor expected_tail = indexed.kpool_tail.clone();
+    if (expect_recurrent_copy) {
+      expected_tail[1].copy_(expected_tail[kRestoreSourceSlot]);
+      expected_tail[2].copy_(expected_tail[kRestoreSourceSlot]);
+    }
+    // Cold rows reset their tail while padding stays untouched.
+    expected_tail[3].zero_();
+    std::vector<KVCache> caches;
+    caches.reserve(2);
+    caches.emplace_back(LinearAttentionKVCacheTensors{cache.conv, cache.ssm});
+    caches.emplace_back(indexed);
+    worker.set_kv_caches(std::move(caches));
+
+    ForwardInput input;
+    input.token_ids = torch::ones(
+        {4}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+    input.positions = torch::zeros_like(input.token_ids);
+    input.device_tensors_ready = true;
+    input.input_params.meta.num_sequences = 4;
+    input.input_params.meta.batch_forward_type = forward_type;
+    input.input_params.is_spec_verify = is_spec_verify;
+    input.input_params.attention.host.q_seq_lens = {0, 1, 2, 3, 4};
+    input.input_params.attention.host.kv_cache_tokens_nums = {8, 8, 0, 0};
+    input.input_params.embedding.linear_state_ids = {1, 2, 3, 0};
+    input.input_params.embedding.linear_state_read_ids = {
+        kRestoreSourceSlot, kRestoreSourceSlot, 3, 0};
+    Device xllm_device(device);
+    std::unique_ptr<Stream> stream = xllm_device.current_stream();
+    xllm_device.synchronize_default_stream();
+    input.metadata_ready_event = stream->record_event();
+    ForwardInput processed;
+    worker.prepare_work_before_execute(input, processed);
+    ASSERT_NE(processed.metadata_ready_event, nullptr);
+    ASSERT_TRUE(stream->wait_event(processed.metadata_ready_event));
+    ASSERT_EQ(stream->synchronize(), 0);
+    EXPECT_EQ(processed.input_params.linear_state_validity_mask,
+              std::vector<int64_t>({1, 1, 0, 0}));
+    EXPECT_TRUE(torch::equal(indexed.kpool_tail, expected_tail));
+    EXPECT_TRUE(torch::equal(cache.conv[kRestoreSourceSlot],
+                             original_conv[kRestoreSourceSlot]));
+    EXPECT_TRUE(torch::equal(
+        cache.ssm.narrow(0, kRestoreSourceSlot * kStride, kStride),
+        original_ssm.narrow(0, kRestoreSourceSlot * kStride, kStride)));
+    if (expect_recurrent_copy) {
+      expect_slot_matches(cache, 1, kRestoreSourceSlot, kStride);
+      expect_slot_matches(cache, 2, kRestoreSourceSlot, kStride);
+    } else {
+      EXPECT_TRUE(torch::equal(cache.conv, original_conv));
+      EXPECT_TRUE(torch::equal(cache.ssm, original_ssm));
+    }
+  }
+
+ private:
+  std::string previous_model_impl_;
+};
+
+TEST_F(MluGlmPrefillRestoreTest, PrefillPreservesAllStateUntilComputation) {
+  for (const BatchForwardType forward_type :
+       {BatchForwardType::PREFILL, BatchForwardType::CHUNKED_PREFILL}) {
+    for (const std::string model_type : {"glm5_next", "glm5_3_flash"}) {
+      verify_restore(forward_type, false, model_type, false);
+    }
+  }
+}
+
+TEST_F(MluGlmPrefillRestoreTest, DecodeAndVerifyRetainFullRestore) {
+  verify_restore(BatchForwardType::DECODE, false, "glm5_next", true);
+  verify_restore(BatchForwardType::MIXED, false, "glm5_next", true);
+  verify_restore(BatchForwardType::CHUNKED_PREFILL, true, "glm5_next", true);
+}
+
+TEST_F(MluGlmPrefillRestoreTest, ContextParallelPrefillSkipsStateCopies) {
+  verify_restore(BatchForwardType::CHUNKED_PREFILL,
+                 false,
+                 "glm5_next",
+                 false,
+                 /*cp_size=*/2);
+}
+
+TEST_F(MluGlmPrefillRestoreTest, OtherModelsRetainFullRestore) {
+  verify_restore(BatchForwardType::CHUNKED_PREFILL, false, "qwen3_5", true);
 }
 
 TEST(MluLinearStateRestoreWorkerTest,
