@@ -217,6 +217,9 @@ def test_pool_selection_length_input_matches_dense_fallback() -> None:
         index_kpool_compress=True,
         index_kpool_always_select_tail=True,
         topk=4,
+        # Mirrors Glm5NextIndexer.topk_output_width for this fake's fields
+        # (topk 4 + kpool tail 4 - 1); select_topk reads the property.
+        topk_output_width=4 + (4 - 1),
         softmax_scale=1.0,
     )
     pool_data = (

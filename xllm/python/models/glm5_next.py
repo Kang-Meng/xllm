@@ -66,7 +66,9 @@ from xllm.python.attention.backend import MlaIndexContext
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.npu.glm5_next_metadata import Glm5NextEplv2Metadata
 from xllm.python.model_executor.cp_utils import (
+    cp_index_write_replicated,
     cp_merge_rows,
+    cp_real_query_rows,
     cp_shard_positions,
     cp_shard_rows,
 )
@@ -144,6 +146,15 @@ except ImportError:  # pragma: no cover - stub-loader path
 
 # Paged pool cache: write-time incremental compression + direct pool read
 # (see glm5_next_kpool.py).
+
+# Indexer query-row partition under prefill CP (the alpha plan): when enabled, the
+# kPool indexer scores only this rank's real query rows instead of the full
+# merged stream. Key-side pool writes stay full-stream. ON by default
+# (bit-exact vs the full stream on the non-fused path and on the fixed
+# fused kernel, eager CP prefill, single-sequence, kv_split replicated);
+# set XLLM_INDEXER_CP_QUERY_PARTITION=0 to disable. The engine passes a
+# uniform env to every CP rank, so gating cannot desynchronize the group.
+_INDEXER_CP_QUERY_PARTITION = os.environ.get("XLLM_INDEXER_CP_QUERY_PARTITION", "1") != "0"
 
 
 class Glm5NextRMSNorm(nn.Module):
@@ -1067,9 +1078,14 @@ class Glm5NextIndexer(nn.Module):
             layout_k="PA_BBND",
         )
 
-        output_width = self.topk + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
+        output_width = self.topk_output_width
         indices = indices.reshape(batch_size, query_len, -1)[..., :output_width]
         return indices.masked_fill(~attention_mask[..., None], -1).long()
+
+    @property
+    def topk_output_width(self) -> int:
+        """Width of the topk output's last dim, tail pools included."""
+        return self.topk + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
 
     def select_topk(
         self,
@@ -1085,6 +1101,7 @@ class Glm5NextIndexer(nn.Module):
         pool_cache: torch.Tensor | None = None,
         kv_seq_lens: torch.Tensor | None = None,
         projected_weights: torch.Tensor | None = None,
+        projected_q: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         pool_query_block_table: torch.Tensor | None = None,
         append_unscored_tail: bool = False,
@@ -1097,7 +1114,9 @@ class Glm5NextIndexer(nn.Module):
         ``hidden_states`` are the CURRENT query tokens ``[B, S_q, ...]``.
         Alternatively, pass ``pool_data``/``key_valid`` from the paged pool
         cache (read_pools) to skip both the dense gather and the per-step
-        re-pooling. Paged decode can pass ``kv_seq_lens`` instead of a dense
+        re-pooling. ``projected_q`` mirrors ``projected_weights`` — the
+        full-batch ``wq_b`` output sliced to the query rows. Paged decode can
+        pass ``kv_seq_lens`` instead of a dense
         ``key_valid`` mask; only the non-fused fallback materializes that mask,
         while ``query_positions`` preserves exact causal visibility for packed
         or variable-length query rows.
@@ -1108,7 +1127,13 @@ class Glm5NextIndexer(nn.Module):
         batch_size, seq_len = q_resid.shape[:2]
         device = q_resid.device
 
-        q = self.wq_b(q_resid).view(batch_size, seq_len, self.n_heads, self.head_dim)
+        # ``projected_q`` lets CP callers reuse the full-batch wq_b GEMM
+        # verbatim (M-invariant bits) and slice its rows, mirroring
+        # ``projected_weights``: NPU GEMMs are not row-slice bit-exact at
+        # every M, so re-projecting a sliced batch can flip top-k ties.
+        q = (self.wq_b(q_resid) if projected_q is None else projected_q).view(
+            batch_size, seq_len, self.n_heads, self.head_dim
+        )
 
         raw_key_cache = packed_states is not None and packed_states.shape[-1] == self.head_dim
         if raw_key_cache and self.index_kpool != 1:
@@ -1292,7 +1317,7 @@ class Glm5NextIndexer(nn.Module):
 
         if append_unscored_tail:
             topk_indices = append_causal_tail(topk_indices, q_pos, self.index_kpool)
-        output_width = self.topk + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
+        output_width = self.topk_output_width
         if topk_indices.shape[-1] < output_width:
             topk_indices = F.pad(topk_indices, (0, output_width - topk_indices.shape[-1]), value=-1)
         topk_indices = topk_indices[..., :output_width]
@@ -1308,15 +1333,32 @@ class Glm5NextIndexer(nn.Module):
         ctx: MlaIndexContext,
         layer: Attention,
         backend,
+        query_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Update the selected KPool layout and return SFA token indices.
 
-        Context parallelism is a no-op here: the owning ``Glm5NextMlaAttention``
-        merges its rows to global token order before calling the indexer, so the
-        key-side cache write and the query-side top-k both run on the complete
-        logical stream exactly as in the ``cp_size == 1`` path. Only the sparse
-        MLA call is CP-partitioned, and that happens inside the attention
-        backend (see ``NpuPagedAttentionBackend._mla_cp_partitioned_query``).
+        Context parallelism is a no-op here by default: the owning
+        ``Glm5NextMlaAttention`` merges its rows to global token order before
+        calling the indexer, so the key-side cache write and the query-side
+        top-k both run on the complete logical stream exactly as in the
+        ``cp_size == 1`` path. Only the sparse MLA call is CP-partitioned, and
+        that happens inside the attention backend (see
+        ``NpuPagedAttentionBackend._mla_cp_partitioned_query``).
+
+        Under ``XLLM_INDEXER_CP_QUERY_PARTITION=1`` (the alpha plan) the caller passes
+        this rank's real merged-stream rows via ``query_rows``: the key-side
+        pool write still runs on the full stream, while the query side scores
+        only those rows -- bit-exact on the non-fused path, where each row's
+        pool scores are independent of every other row -- and scatters the
+        selected rows back into the full-layout tensor, so every downstream
+        consumer (backend row select, ``cp_shard_rows``, the shared-layer
+        merge) keeps the exact legacy contract. On by default
+        (``XLLM_INDEXER_CP_QUERY_PARTITION=0`` disables). Active under
+        ``kv_split_size > 1`` as long as the index write mode is the default
+        replicated one (full per-rank index replica, per-sequence
+        page-expanded read tables); the non-default sharded mode, acl_graph
+        capture, varlen batches and non-uniform query spans fall back to the
+        full stream.
         """
         batch_size, seq_len = hidden_states.shape[:2]
         num_tokens = batch_size * seq_len
@@ -1570,22 +1612,94 @@ class Glm5NextIndexer(nn.Module):
         else:
             key_valid = torch.arange(kv_len, device=packed_history.device)[None, :] < logical_kv_lens[:, None]
             kv_seq_lens = None
+        alpha_active = (
+            query_rows is not None
+            and _INDEXER_CP_QUERY_PARTITION
+            and not in_acl_graph()
+            and (not ctx.has_kv_shard or cp_index_write_replicated())
+            and num_seqs == 1
+            and not is_varlen
+        )
+        if alpha_active:
+            # The alpha plan: score only this rank's real CP query rows. The pool
+            # write above ran on the full merged stream; the query side is
+            # row-independent (bit-exact on the non-fused path), so a row
+            # subset with its true global positions selects the same top-k.
+            # Scatter the rows back into the full-layout tensor so every
+            # downstream consumer (backend row select, cp_shard_rows, the
+            # shared-layer merge) keeps its exact legacy contract.
+            # Under kv_split > 1 the DEFAULT replicated write mode keeps the
+            # index cache a full per-rank replica read through per-sequence
+            # page-expanded tables (materialized_block_table is [num_seqs,
+            # blocks * kv_split]; the fused path broadcasts it per row), so
+            # the query-side slice stays exact there too. The non-default
+            # sharded mode (cross-rank reconstructed reads), acl_graph
+            # capture, varlen batches and non-uniform query spans fall back
+            # to the full stream.
+            rows = query_rows.to(device=qr_bsd.device, dtype=torch.long)
+            rows = rows[rows < num_tokens]  # bucket padding beyond the spans keeps -1
+            if rows.numel() == 0:
+                topk_indices = torch.full(
+                    (num_tokens, 1, self.topk_output_width), -1, dtype=torch.int32, device=qr_bsd.device
+                )
+                if num_tokens < full_num_tokens:
+                    topk_indices = F.pad(topk_indices, (0, 0, 0, 0, 0, full_num_tokens - num_tokens), value=-1)
+                return topk_indices
+            # Full-M wq_b projection, sliced afterwards: select_topk consumes
+            # it via projected_q so the sliced batch reuses these exact bits.
+            q_full = self.wq_b(qr_bsd)
+            q_sub = q_full[:, rows]
+            select_q = q_sub
+            select_hidden = hidden_bsd[:, rows]
+            # All sliced rows belong to one causal batch, so a uniform mask
+            # reproduces the full-stream mask rows for the subset.
+            select_mask = torch.ones(1, rows.numel(), dtype=mask_bsd.dtype, device=mask_bsd.device)
+            select_weights = weights_bsd[:, rows]
+            select_positions = positions_bsd[:, rows]
+            select_kv_seq_lens = kv_seq_lens
+            if rows.numel() == 1:
+                # A single row enters the fused path's query_len == 1 branch,
+                # which reads visibility from kv_seq_lens instead of the
+                # per-row positions: pass the row's own causal length.
+                select_kv_seq_lens = (select_positions.reshape(-1) + 1).to(torch.int32)
+            select_projected_q = q_sub
+        else:
+            select_q = qr_bsd
+            select_hidden = hidden_bsd
+            select_mask = mask_bsd
+            select_weights = weights_bsd
+            select_positions = positions_bsd
+            select_kv_seq_lens = kv_seq_lens
+            select_projected_q = None
+        # One keyword table for both paths so the alpha branch cannot drift
+        # from the full-stream semantics (CP only runs in multi-card
+        # prefill, which single-card regression does not cover).
         topk_indices = self.select_topk(
-            qr_bsd,
-            hidden_bsd,
-            mask_bsd,
+            select_q,
+            select_hidden,
+            select_mask,
             kv_len=kv_len,
             current_length=kv_len,
             packed_states=packed_history,
-            projected_weights=weights_bsd,
+            projected_weights=select_weights,
+            projected_q=select_projected_q,
             key_valid=key_valid,
-            kv_seq_lens=kv_seq_lens,
+            kv_seq_lens=select_kv_seq_lens,
             pool_cache=pool_cache,
             pool_block_table=pool_read_block_table,
-            query_positions=positions_bsd,
+            query_positions=select_positions,
             pool_query_block_table=pool_query_block_table,
             append_unscored_tail=uses_compressed_tail and self.index_kpool_always_select_tail,
         )
+        if alpha_active:
+            # [1, n_real, W] -> scatter into a -1-filled full-layout tensor
+            # (padding rows carry -1 exactly like the legacy padded path).
+            topk_indices = topk_indices.reshape(rows.numel(), 1, -1).to(torch.int32)
+            scattered = torch.full(
+                (num_tokens, 1, topk_indices.shape[-1]), -1, dtype=torch.int32, device=topk_indices.device
+            )
+            scattered[rows] = topk_indices
+            topk_indices = scattered
         if is_varlen:
             topk_indices = topk_indices[valid]
         topk_indices = topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
@@ -1809,7 +1923,12 @@ class Glm5NextMlaAttention(Attention):
         topk = None
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
-            topk = self.indexer.select_qli(hidden_states, q_c, position_ids, attention_mask, ctx, self, backend)
+            query_rows = (
+                cp_real_query_rows(cp_context) if _INDEXER_CP_QUERY_PARTITION and cp_context is not None else None
+            )
+            topk = self.indexer.select_qli(
+                hidden_states, q_c, position_ids, attention_mask, ctx, self, backend, query_rows=query_rows
+            )
         else:
             if prev_topk_indices is None:
                 raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")

@@ -1991,6 +1991,7 @@ def _index_writer_with_attend_all_topk(
     attention_mask: torch.Tensor,
     ctx: object,
     *rest: object,
+    **kwargs: object,
 ) -> torch.Tensor:
     """``select_qli`` stand-in: writes real, content-derived rows into the
     real index cache via ``ctx.update_index_cache`` (exercising the real
@@ -1999,9 +2000,11 @@ def _index_writer_with_attend_all_topk(
     This sidesteps kPool's compression/Triton machinery (out of scope for
     A3, which targets the KV/latent-cache and raw index-cache *write* paths,
     not the indexer's internal selection logic) while still genuinely
-    writing and later comparing the index cache's content.
+    writing and later comparing the index cache's content. Keyword-only
+    arguments such as the CP ``query_rows`` row plan are accepted and
+    ignored, matching the real signature's defaults.
     """
-    del qr, attention_mask
+    del qr, attention_mask, kwargs
     num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
     packed = hidden_states.reshape(num_tokens, -1) * 1000  # distinguishable from raw hidden values
     ctx.update_index_cache(packed, None)

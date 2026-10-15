@@ -44,7 +44,7 @@ from xllm.python.attention.kv_shard_layout import (
     localize_pool_write_block_table,
     replicate_pool_write_block_table,
 )
-from xllm.python.model_executor.cp_utils import cp_gather_kv, cp_index_write_replicated
+from xllm.python.model_executor.cp_utils import cp_gather_kv, cp_index_write_replicated, cp_real_query_rows
 from xllm.python.model_executor.forward_context import (
     AclGraphTask,
     get_execution_buffer,
@@ -1131,7 +1131,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # by construction. A duplicate here would mean a broken CpContext
         # upstream (not a shape this function defends against at a
         # per-forward device-sync cost).
-        real_rows = cp_context.shard_index.index_select(0, cp_context.query_index)
+        real_rows = cp_real_query_rows(cp_context)
         return self._mla_cp_sparse_scatter(
             q_latent,
             None,

@@ -253,6 +253,18 @@ def cp_shard_rows(x: torch.Tensor, ctx: CpContext) -> torch.Tensor:
     return local * ctx.shard_valid_mask.view(mask_shape).to(local.dtype)
 
 
+def cp_real_query_rows(ctx: CpContext) -> torch.Tensor:
+    """Global merged-stream row indices owned (really queried) by this CP rank.
+
+    ``shard_index`` maps this rank's local rows onto their global rows and
+    ``query_index`` selects the non-padding ones, so the result rows are
+    unique and in local order -- the same rows the attention backend's
+    partitioned sparse call attends (see
+    ``NpuPagedAttentionBackend._mla_cp_partitioned_query``).
+    """
+    return ctx.shard_index.index_select(0, ctx.query_index)
+
+
 def cp_shard_positions(positions: torch.Tensor, ctx: CpContext) -> torch.Tensor:
     """Shard 1-D position ids; padding positions become 0."""
     local = positions.index_select(0, ctx.shard_gather_index)
