@@ -724,6 +724,34 @@ def _(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> tor
     return x.new_empty(shape)
 
 
+@torch.library.custom_op("xllm_ops::all_to_all", mutates_args=())
+def all_to_all(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    """Exchange equally sized rank-major row blocks without reducing values."""
+    if world_size <= 0 or x.ndim == 0 or x.shape[0] % world_size:
+        raise ValueError("all_to_all requires row blocks divisible by world size")
+    if world_size == 1:
+        return x.clone()
+    if group_name == "tp":
+        op = _native_runtime_op("tp_all_to_all")
+        if op is not None:
+            output = op(x, world_size)
+            if output is not None:
+                return output
+    group = _require_group(x, group_name)
+    if group.size() != world_size:
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    input_tensor = x.contiguous()
+    output = torch.empty_like(input_tensor)
+    dist.all_to_all_single(output, input_tensor, group=group)
+    return output
+
+
+@all_to_all.register_fake
+def _all_to_all_fake(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    # TP=1 clones with preserved strides; a multi-rank exchange returns contiguous rows.
+    return torch.empty_like(x) if world_size == 1 else x.new_empty(x.shape)
+
+
 def _reduce_scatter_shape(x: torch.Tensor, world_size: int) -> tuple[int, ...]:
     if world_size <= 0 or x.ndim == 0 or x.shape[0] <= 0 or x.shape[0] % world_size:
         raise ValueError("reduce_scatter requires a positive world size dividing nonempty input rows")

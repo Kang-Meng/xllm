@@ -470,6 +470,8 @@ py::dict PyCausalLM::build_config_dict(
   d["load_format"] = std::string("safetensors");
 #if defined(USE_NPU)
   d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
+  d["enable_dsa_cp"] = KernelConfig::get_instance().enable_dsa_cp() &&
+                       !speculative_runtime_config.is_draft_engine;
   const auto& eplb_config = EPLBConfig::get_instance();
   if (model_args_.model_type() == "glm5_next" ||
       model_args_.model_type() == "glm5_next_text") {
@@ -691,6 +693,21 @@ torch::Tensor PyCausalLM::tp_all_gather(const torch::Tensor& tensor,
   auto output_shape = tensor.sizes().vec();
   output_shape[dim] *= world_size;
   return gathered.reshape(output_shape).contiguous();
+}
+
+torch::Tensor PyCausalLM::tp_all_to_all(const torch::Tensor& tensor,
+                                        int64_t world_size) {
+  CHECK(tp_group_ != nullptr)
+      << "TP all-to-all requires its native process group";
+  CHECK_EQ(world_size, tp_group_->world_size())
+      << "TP all-to-all world-size mismatch";
+  CHECK_EQ(world_size, tp_size_) << "TP all-to-all topology mismatch";
+  CHECK_GT(tensor.dim(), 0);
+  CHECK_EQ(tensor.size(0) % tp_group_->world_size(), 0);
+  torch::Tensor input = tensor.contiguous();
+  torch::Tensor output = torch::empty_like(input);
+  tp_group_->all_to_all_single(output, input);
+  return output;
 }
 
 torch::Tensor PyCausalLM::dp_all_gather(

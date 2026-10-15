@@ -36,7 +36,7 @@ weight helpers on the V4.1 attention layer.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
 import torch
@@ -56,6 +56,7 @@ from xllm.python.attention.dsa_metadata import (
     DsaMetadataBuilder,
     build_cache_specs_v41,
 )
+from xllm.python.model_executor.dsa_cp import DsaCpContext, get_current_dsa_cp_runtime
 from xllm.python.models.deepseek_v41 import (
     V41_QUANT_ASCEND,
     V41_QUANT_NONE,
@@ -592,7 +593,11 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         ctx = layer._csa2_ctx
         if ctx is None:
             raise RuntimeError(f"DeepSeek-V4.1 layer {layer_id} ran without its CSA2 context")
-        if dsa.is_acl_graph:
+        cp_runtime = get_current_dsa_cp_runtime()
+        cp_context = cp_runtime.plan if cp_runtime is not None else None
+        if cp_context is not None:
+            q_lens = list(cp_context.global_q_lens)
+        elif dsa.is_acl_graph:
             # Decode-graph contract: one token row per sequence. The host list
             # is a capture-stable constant, so never sync-read the device
             # tensor inside the captured stream (aclrtMemcpy on a captured
@@ -611,6 +616,19 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # 2) Compressor: only kv-source (Full) layers produce the shared main KV.
         if mode.is_full:
             self._run_compressor(layer, ctx, dsa, layer_cache, mapping, q_lens, ctx_lens, shared)
+        # Cache producers own the complete token stream. Query/indexer work
+        # owns a contiguous query token interval, including decode graph rows.
+        if cp_runtime is not None:
+            ctx_lens = cp_runtime.local_context_lengths
+            q_lens = list(cp_context.local_q_lens)
+            ctx = replace(
+                ctx,
+                x=cp_context.shard(ctx.x),
+                qr=cp_context.shard(ctx.qr),
+                positions=cp_context.shard(ctx.positions),
+            )
+            # DSA metadata remains global for cache layout. Query consumers
+            # receive local q_lens/ctx_lens explicitly.
         # 3) Indexer: Full/Reindex layers compute a fresh top-k; Reuse layers
         #    consume the tensor object their group source published.
         if mode.is_full or mode.is_reindex:
@@ -628,7 +646,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             topk = None
         layer._csa2_used_topk = topk
         # 4) Sparse attention over [window rows ; top-k compressed rows].
-        return self._csa2_attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared)
+        return self._csa2_attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared, cp_context)
 
     # -- compressor ---------------------------------------------------------
 
@@ -825,6 +843,14 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # the sparse attention runs the plain window path. Reuse layers
             # degrade the same way via the empty dsa.block_tables check.
             return None
+        if ctx.qr.size(0) == 0:
+            topk = torch.empty((len(q_lens), 0, 0), dtype=torch.int32, device=ctx.x.device)
+            shared.topk_idxs = topk
+            shared.topk_layer = layer_id
+            if layer_id == self.candidate_source_layer_id:
+                shared.candidates = [None] * len(q_lens)
+                shared.candidates_layer = layer_id
+            return topk
         index_cache = shared.index_cache
         block_table = shared.index_block_table
         block_size = index_cache.size(1)
@@ -841,6 +867,9 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         rows_per_seq: list[torch.Tensor] = []
         token_offset = 0
         for seq, q_len in enumerate(q_lens):
+            if q_len == 0:
+                rows_per_seq.append(torch.empty((0, 0), dtype=torch.int32, device=q_idx.device))
+                continue
             q_seq = q_idx[token_offset : token_offset + q_len]
             w_seq = weights[token_offset : token_offset + q_len]
             positions_seq = ctx.positions[token_offset : token_offset + q_len].to(torch.int64)
@@ -936,6 +965,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         ctx_lens: torch.Tensor,
         topk: torch.Tensor | None,
         shared: CSA2SharedRuntime,
+        cp_context: DsaCpContext | None = None,
     ) -> torch.Tensor:
         """Gather ``[window rows ; top-k compressed rows]`` and run the sink softmax.
 
@@ -960,18 +990,26 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         swa_flat = layer_cache.swa.view(-1, head_dim) if layer_cache.swa is not None else None
         swa_bt = _get_layer_cache_tensor(dsa.block_tables, layer_id, mapping.ori_cache_idx)
         swa_bs = layer_cache.swa.size(1) if layer_cache.swa is not None else win
+        global_q_lens = list(cp_context.global_q_lens) if cp_context is not None else q_lens
+        global_ctx_lens = _ensure_seq_lens_tensor(dsa.seq_lens, q.device) if cp_context is not None else ctx_lens
 
         out = torch.empty_like(q)
         token_offset = 0
+        global_token_offset = 0
         for seq, q_len in enumerate(q_lens):
+            global_q_len = global_q_lens[seq]
+            global_prev_ctx = global_ctx_lens[seq] - global_q_len
+            kv_seq = kv[global_token_offset : global_token_offset + global_q_len]
+            global_token_offset += global_q_len
+            if q_len == 0:
+                continue
             ctx_len = ctx_lens[seq]
             prev_ctx = ctx_len - q_len
             q_seq = q[token_offset : token_offset + q_len]
-            kv_seq = kv[token_offset : token_offset + q_len]
             # Window rows at fixed capacity: [win ring candidates ; chunk].
             # Ring candidate c sits at absolute position prev - win + c; which
             # candidates a given query may read is decided per query below.
-            ring_pos = (prev_ctx - win) + torch.arange(win, device=q.device)
+            ring_pos = (global_prev_ctx - win) + torch.arange(win, device=q.device)
             if swa_flat is not None and swa_bt is not None:
                 ring_rows = self._gather_swa_positions(swa_flat, swa_bt, seq, ring_pos.clamp_min(0), swa_bs)
             else:
@@ -985,7 +1023,10 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # [max(p - win + 1, 0), p]; the lower bound tightens with the query
             # (only the chunk's first token shares the chunk-level bound).
             positions_seq = prev_ctx + torch.arange(q_len, device=q.device)
-            col_pos = torch.cat((ring_pos, positions_seq), dim=0)
+            chunk_positions = (
+                positions_seq if cp_context is None else global_prev_ctx + torch.arange(global_q_len, device=q.device)
+            )
+            col_pos = torch.cat((ring_pos, chunk_positions), dim=0)
             cols = torch.arange(n_w, device=q.device)
             window_idxs = _window_visible_idxs(positions_seq, col_pos, cols, win)
 
@@ -1016,7 +1057,12 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             if compress_kv is not None:
                 assert topk is not None
                 kv_cat = torch.cat((window_kv, compress_kv), dim=0)
-                idxs = torch.cat((window_idxs, topk[seq][:q_len]), dim=-1)
+                compressed_idxs = topk[seq][:q_len]
+                if cp_context is not None:
+                    compressed_idxs = torch.where(
+                        compressed_idxs >= 0, compressed_idxs + global_q_len - q_len, compressed_idxs
+                    )
+                idxs = torch.cat((window_idxs, compressed_idxs), dim=-1)
             else:
                 kv_cat = window_kv
                 idxs = window_idxs
