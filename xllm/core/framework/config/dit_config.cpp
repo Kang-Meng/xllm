@@ -64,7 +64,7 @@ DEFINE_bool(dit_debug_print,
 DEFINE_bool(dit_laser_attention_enabled,
             false,
             "whether to use the laser attention kernel (MindIE-SD, tuned for "
-            "Wan2.2) in place of npu_fusion_attention for DiT attention.");
+            "Wan2.2) for WAN and MiniMax-H3 attention.");
 
 DEFINE_string(dit_h3_task_type,
               "fl2va",

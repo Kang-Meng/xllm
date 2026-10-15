@@ -17,12 +17,16 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <torch/torch.h>
+#if defined(USE_NPU)
+#include <torch_npu/csrc/aten/CustomFunctions.h>
+#endif
 
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -35,6 +39,7 @@ limitations under the License.
 #include "core/framework/state_dict/utils.h"
 #include "core/layers/common/linear.h"
 #if defined(USE_NPU)
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "models/dit/utils/dit_block_weight_manager.h"
 #endif
 #include "models/dit/utils/dit_cache_mixin.h"
@@ -420,8 +425,32 @@ class H3AttentionImpl final : public torch::nn::Module,
     q = q.permute({0, 2, 1, 3}).contiguous();
     k = k.permute({0, 2, 1, 3}).contiguous();
     v = v.permute({0, 2, 1, 3}).contiguous();
-    torch::Tensor out = torch::scaled_dot_product_attention(
+    torch::Tensor out;
+#if defined(USE_NPU)
+    const int64_t head_num = q.size(1);
+    const double scale = std::pow(static_cast<double>(q.size(-1)), -0.5);
+    if (DiTConfig::get_instance().dit_laser_attention_enabled()) {
+      out = xllm::kernel::npu::laser_attention(q, k, v, scale, head_num);
+    } else {
+      const auto results = at_npu::native::custom_ops::npu_fusion_attention_v3(
+          q,
+          k,
+          v,
+          head_num,
+          /*input_layout=*/"BNSD",
+          /*pse=*/torch::nullopt,
+          /*padding_mask=*/torch::nullopt,
+          /*atten_mask=*/torch::nullopt,
+          scale,
+          /*keep_prob=*/1.0,
+          /*pre_tockens=*/65535,
+          /*next_tockens=*/65535);
+      out = std::get<0>(results);
+    }
+#else
+    out = torch::scaled_dot_product_attention(
         q, k, v, torch::nullopt, /*dropout_p=*/0.0, /*is_causal=*/false);
+#endif
     out = out.permute({0, 2, 1, 3}).contiguous();
     if (sp_size_ > 1) {
       out = pad_tensor(out, kPackedSequenceTensorName, /*dim=*/1);
