@@ -654,11 +654,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     }
 #endif
 
-#if defined(USE_NPU) || defined(USE_MUSA)
     state_.kv_cache_tokens_nums.insert(state_.kv_cache_tokens_nums.end(),
                                        state.kv_cache_tokens_nums.begin(),
                                        state.kv_cache_tokens_nums.end());
-#endif
     state_.new_token_slot_ids.insert(state_.new_token_slot_ids.end(),
                                      state.new_token_slot_ids.begin(),
                                      state.new_token_slot_ids.end());
@@ -1195,6 +1193,7 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   input_params.execution_batch.is_prefilling = std::move(state_.is_prefilling);
   CHECK_EQ(input_params.execution_batch.is_prefilling.size(),
            static_cast<size_t>(num_reqs));
+  CHECK_EQ(state_.kv_cache_tokens_nums.size(), static_cast<size_t>(num_reqs));
   input_params.attention.device.kv_seq_lens =
       torch::tensor(state_.seq_lens, torch::kInt);
   input_params.attention.device.kv_cache_tokens_nums =

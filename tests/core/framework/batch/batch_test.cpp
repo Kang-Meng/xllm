@@ -54,6 +54,7 @@ limitations under the License.
 #include "platform/platform.h"
 #include "runtime/forward_shared_memory_manager.h"
 #include "util/tensor_helper.h"
+#include "util/threadpool.h"
 
 namespace xllm {
 
@@ -687,6 +688,81 @@ TEST(BatchInputBuilderTest, RecordsPrefillStageBeforeAdvancingKvCount) {
             (std::vector<int32_t>{0, 4}));
   EXPECT_EQ(input.input_params.execution_batch.is_prefilling,
             (std::vector<uint8_t>{1, 1}));
+}
+
+TEST(BatchInputBuilderTest, MultithreadedBuildMatchesSingleThreaded) {
+  // The builder only parallelizes batches with at least thread-pool-size
+  // sequences and 65536 query tokens, so build a prefill batch above both.
+  constexpr int32_t kNumSequences = 4;
+  constexpr int32_t kNumTokens = 20480;
+  constexpr int32_t kCachedTokensStep = 1024;
+  constexpr int32_t kBlockSize = 128;
+  const std::vector<int32_t> token_ids(kNumTokens, /*value=*/7);
+
+  auto build_input = [&](ThreadPool* thread_pool) {
+    BlockManager::Options options;
+    options.num_blocks(kNumSequences * kNumTokens / kBlockSize + 1)
+        .block_size(kBlockSize);
+    BlockManagerImpl manager(options);
+
+    std::vector<Sequence> sequences;
+    sequences.reserve(kNumSequences);
+    std::vector<Sequence*> sequence_ptrs;
+    sequence_ptrs.reserve(kNumSequences);
+    std::vector<uint32_t> allowed_max_tokens;
+    allowed_max_tokens.reserve(kNumSequences);
+    for (int32_t i = 0; i < kNumSequences; ++i) {
+      Sequence& sequence =
+          sequences.emplace_back(make_basic_sequence(token_ids, i));
+      sequence.kv_state().add_blocks(BlockType::KV,
+                                     manager.allocate(kNumTokens / kBlockSize));
+      const int32_t cached_tokens = i * kCachedTokensStep;
+      sequence.kv_state().incr_kv_cache_tokens_num(cached_tokens);
+      sequence_ptrs.emplace_back(&sequence);
+      allowed_max_tokens.emplace_back(kNumTokens - cached_tokens);
+    }
+
+    std::vector<torch::Tensor> input_embeddings;
+    std::vector<MMData> mm_data;
+    BatchInputBuilder builder(sequence_ptrs,
+                              allowed_max_tokens,
+                              input_embeddings,
+                              mm_data,
+                              /*swap_block_transfer_infos=*/nullptr,
+                              /*batch_id=*/0,
+                              /*args=*/nullptr,
+                              BatchForwardType::PREFILL,
+                              /*cp_size=*/1,
+                              thread_pool);
+    return builder.build_forward_input(/*num_decoding_tokens=*/1,
+                                       /*min_decoding_batch_size=*/0);
+  };
+
+  ThreadPool thread_pool(/*num_threads=*/2);
+  const ForwardInput single = build_input(/*thread_pool=*/nullptr);
+  const ForwardInput multi = build_input(&thread_pool);
+
+  const auto& single_params = single.input_params;
+  const auto& multi_params = multi.input_params;
+  EXPECT_EQ(multi_params.attention.host.kv_cache_tokens_nums,
+            (std::vector<int32_t>{0, 1024, 2048, 3072}));
+  EXPECT_EQ(multi_params.attention.host.kv_cache_tokens_nums,
+            single_params.attention.host.kv_cache_tokens_nums);
+  EXPECT_TRUE(
+      torch::equal(multi_params.attention.device.kv_cache_tokens_nums,
+                   single_params.attention.device.kv_cache_tokens_nums));
+  EXPECT_EQ(multi_params.attention.host.q_seq_lens,
+            single_params.attention.host.q_seq_lens);
+  EXPECT_EQ(multi_params.attention.host.kv_seq_lens,
+            single_params.attention.host.kv_seq_lens);
+  EXPECT_EQ(multi_params.execution_batch.num_scheduled_tokens,
+            single_params.execution_batch.num_scheduled_tokens);
+  EXPECT_EQ(multi_params.execution_batch.num_computed_tokens,
+            single_params.execution_batch.num_computed_tokens);
+  EXPECT_EQ(multi_params.embedding.linear_state_ids,
+            single_params.embedding.linear_state_ids);
+  EXPECT_TRUE(torch::equal(multi.token_ids, single.token_ids));
+  EXPECT_TRUE(torch::equal(multi.positions, single.positions));
 }
 
 namespace {
