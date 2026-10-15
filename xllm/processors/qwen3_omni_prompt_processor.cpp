@@ -282,6 +282,7 @@ bool Qwen3OmniPromptProcessor::find_mm_spans(const std::vector<int32_t>& prompt,
           {static_cast<int64_t>(length)},
           torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
     }
+    item.mutable_state().mutable_mm_token_num() = item.state().token_pos().length;
     global_mm_index++;
     start = std::next(min_end_it);
   }

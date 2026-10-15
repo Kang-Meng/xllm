@@ -740,6 +740,8 @@ struct RawSampleOutput {
 
 struct RawForwardOutput {
   std::vector<RawSampleOutput> outputs;  // num seqs
+  // CTC outputs indexed by batch position, independent of sampled rows.
+  std::vector<MMDict> mm_dict_vec;
   std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<std::string> failed_request_ids;
   std::vector<int64_t> expert_load_data;

@@ -2823,6 +2823,11 @@ size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
     size += get_dit_forward_output_size(output.dit_forward_output);
   }
 
+  size += type_size<uint64_t>;  // mm_dict_vec count
+  for (const auto& dict : output.mm_dict_vec) {
+    size += get_mm_dict_size(dict);
+  }
+
   return size;
 }
 
@@ -2924,6 +2929,14 @@ void deserialize_raw_forward_output(const char* buffer,
   if (has_dit_forward_output) {
     read_dit_forward_output(buffer, output.dit_forward_output);
   }
+
+  uint64_t mm_dict_count = 0;
+  read_data(buffer, mm_dict_count);
+  output.mm_dict_vec.resize(mm_dict_count);
+  for (auto& dict : output.mm_dict_vec) {
+    const char* no_device_buffer = nullptr;
+    read_mm_dict(buffer, dict, no_device_buffer);
+  }
 }
 
 void serialize_raw_forward_output(const RawForwardOutput& output,
@@ -2948,6 +2961,11 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
   write_data(buffer, has_dit_forward_output);
   if (has_dit_forward_output) {
     write_dit_forward_output(buffer, output.dit_forward_output);
+  }
+
+  write_data(buffer, static_cast<uint64_t>(output.mm_dict_vec.size()));
+  for (const auto& dict : output.mm_dict_vec) {
+    write_mm_dict(buffer, dict);
   }
 }
 
@@ -3592,7 +3610,8 @@ bool ForwardSharedMemoryManager::raw_output_write(
     const torch::Tensor& out_tokens,
     const torch::Tensor& out_logprobs,
     const std::vector<JsonObjectOutputError>& json_object_errors,
-    const std::vector<std::string>& failed_request_ids) {
+    const std::vector<std::string>& failed_request_ids,
+    const std::vector<MMDict>& mm_dict_vec) {
   RawForwardOutput output;
   convert_tensor_to_raw_output(next_tokens,
                                logprobs,
@@ -3618,6 +3637,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
   }
   output.json_object_errors = json_object_errors;
   output.failed_request_ids = failed_request_ids;
+  output.mm_dict_vec = mm_dict_vec;
   const uint64_t payload_size = calculate_raw_forward_output_size(output);
   const uint64_t total_size = sizeof(ControlMetadata) + payload_size;
   if (unlikely(total_size > size())) {

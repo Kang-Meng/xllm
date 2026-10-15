@@ -23,6 +23,8 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/multimodal/mm_data_item.h"
+
 namespace xllm {
 
 struct RequestSamplingParam {
@@ -218,6 +220,10 @@ struct SampleOutput {
 
   std::vector<std::vector<torch::Tensor>> mm_embeddings;
   std::vector<SpeculativeTokenStats> speculative_token_stats;
+
+  // Multimodal side outputs indexed by batch position; an empty dict means
+  // the sequence has none this step.
+  std::vector<MMDict> mm_dict_vec;
 };
 
 }  // namespace xllm

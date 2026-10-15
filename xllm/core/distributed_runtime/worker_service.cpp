@@ -289,8 +289,10 @@ void WorkerService::step(
     torch::Tensor& out_tokens,
     torch::Tensor& out_logprobs,
     std::vector<JsonObjectOutputError>& json_object_errors,
-    std::vector<std::string>& failed_request_ids) {
+    std::vector<std::string>& failed_request_ids,
+    std::vector<MMDict>& mm_dict_vec) {
   speculative_token_stats.clear();
+  mm_dict_vec.clear();
   const bool use_default_stream =
       !options_.enable_schedule_overlap() && options_.backend() == "llm";
   if (options_.enable_schedule_overlap()) {
@@ -303,7 +305,7 @@ void WorkerService::step(
     // convert ForwardOutput to proto::ForwardOutput which contain Tokens.
     if (forward_outputs) {
       DCHECK(forward_outputs.has_value()) << "Failed to execute model";
-      const auto& sample_output = forward_outputs.value().sample_output;
+      auto& sample_output = forward_outputs.value().sample_output;
       const auto& beam_search_output =
           forward_outputs.value().beam_search_output;
       const auto& dit_forward_output =
@@ -314,6 +316,7 @@ void WorkerService::step(
       prepared_token = forward_outputs.value().prepared_token;
       json_object_errors = forward_outputs.value().json_object_errors;
       failed_request_ids = forward_outputs.value().failed_request_ids;
+      mm_dict_vec = std::move(sample_output.mm_dict_vec);
 
       {
         auto copy_output_to_host = [&]() {
@@ -464,6 +467,7 @@ void WorkerService::create_polling_shm_thread(
           torch::Tensor out_logprobs;
           std::vector<JsonObjectOutputError> json_object_errors;
           std::vector<std::string> failed_request_ids;
+          std::vector<MMDict> mm_dict_vec;
 
           step(fwd_input,
                next_tokens,
@@ -482,7 +486,8 @@ void WorkerService::create_polling_shm_thread(
                out_tokens,
                out_logprobs,
                json_object_errors,
-               failed_request_ids);
+               failed_request_ids,
+               mm_dict_vec);
 
           const bool shm_write_ok =
               output_shm_manager->raw_output_write(next_tokens,
@@ -501,7 +506,8 @@ void WorkerService::create_polling_shm_thread(
                                                    out_tokens,
                                                    out_logprobs,
                                                    json_object_errors,
-                                                   failed_request_ids);
+                                                   failed_request_ids,
+                                                   mm_dict_vec);
           CHECK(shm_write_ok) << "Worker output shared memory write failed.";
           COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
         }
@@ -913,6 +919,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         torch::Tensor out_logprobs;
         std::vector<JsonObjectOutputError> json_object_errors;
         std::vector<std::string> failed_request_ids;
+        std::vector<MMDict> mm_dict_vec;
 
         step(forward_input,
              next_tokens,
@@ -931,7 +938,8 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
              out_tokens,
              out_logprobs,
              json_object_errors,
-             failed_request_ids);
+             failed_request_ids,
+             mm_dict_vec);
         // convert to proto output
         forward_output_to_proto(next_tokens,
                                 logprobs,
@@ -950,7 +958,8 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                                 dit_audio,
                                 json_object_errors,
                                 failed_request_ids,
-                                pb_forward_output);
+                                pb_forward_output,
+                                mm_dict_vec);
         COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
       });
 }
@@ -1078,7 +1087,8 @@ void WorkerService::GetLastStepResult(
               !dit_text_output.empty() || !dit_audio.empty() ||
               ::xllm::EPLBConfig::get_instance().enable_eplb() ||
               !forward_output.json_object_errors.empty() ||
-              !forward_output.failed_request_ids.empty()) {
+              !forward_output.failed_request_ids.empty() ||
+              !sample_output.mm_dict_vec.empty()) {
             const std::vector<std::vector<torch::Tensor>> mm_embeddings;
             forward_output_to_proto(next_tokens,
                                     logprobs,
@@ -1097,7 +1107,8 @@ void WorkerService::GetLastStepResult(
                                     dit_audio,
                                     forward_output.json_object_errors,
                                     forward_output.failed_request_ids,
-                                    pb_forward_output);
+                                    pb_forward_output,
+                                    sample_output.mm_dict_vec);
           }
         }
       });

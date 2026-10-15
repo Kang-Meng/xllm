@@ -94,7 +94,6 @@ ModelOutput VlmExecutorImpl::run(const torch::Tensor& tokens,
   if (llm_executor_) {
     return llm_executor_->run(tokens, positions, kv_caches, params);
   }
-
   return model_->forward(tokens, positions, kv_caches, params);
 }
 

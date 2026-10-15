@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "executor.h"
 #include "forward_params.h"
+#include "framework/encoder_cache/encoder_cache.h"
 #include "framework/model/causal_vlm.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -73,6 +74,8 @@ class VLMWorkerImpl : public WorkerImpl {
       const ForwardInput& input,
       ForwardSyncPolicy sync_policy = ForwardSyncPolicy::LEGACY,
       bool record_ready_event = true);
+
+  MMSideOutputCache mm_side_output_cache_{/*max_size=*/64 * 1024 * 1024};
 };
 
 }  // namespace xllm

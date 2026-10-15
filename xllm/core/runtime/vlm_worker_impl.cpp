@@ -29,6 +29,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/multimodal/mm_visitor.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
@@ -245,6 +246,16 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     output.do_sample = sampling_params.do_sample;
     output.logprobs = sampling_params.logprobs;
     output.max_top_logprobs = sampling_params.max_top_logprobs;
+  }
+  // Keep CTC side outputs independently of the encoder embedding cache.
+  // Restore outputs by key for audio items carried in this step.
+  auto& mm_data = input.input_params.multimodal.mm_data;
+  if (mm_data.valid()) {
+    MMSideOutputCacheVisitor cache_visitor(mm_side_output_cache_);
+    mm_data.foreach (static_cast<MMData::IVisitor&>(cache_visitor));
+    MMSideOutputCollectVisitor ctc_output(input.input_params.meta.num_sequences);
+    mm_data.foreach (static_cast<MMData::IVisitor&>(ctc_output));
+    output.sample_output.mm_dict_vec = ctc_output.finish();
   }
 
   if (options_.enable_speculative_decode()) {

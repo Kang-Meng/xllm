@@ -20,6 +20,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/multimodal/mm_data_item.h"
 #include "runtime/forward_shared_memory_manager.h"
 #include "runtime/worker.h"
 #include "worker.pb.h"
@@ -181,7 +182,8 @@ class WorkerService : public proto::DistributeWorker {
             torch::Tensor& out_tokens,
             torch::Tensor& out_logprobs,
             std::vector<JsonObjectOutputError>& json_object_errors,
-            std::vector<std::string>& failed_request_ids);
+            std::vector<std::string>& failed_request_ids,
+            std::vector<MMDict>& mm_dict_vec);
   std::vector<SpeculativeTokenStats> record_speculative_metrics_from_output(
       const torch::Tensor& next_tokens,
       const std::vector<SpeculativeTokenStats>& output_stats,

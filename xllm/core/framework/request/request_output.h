@@ -84,6 +84,10 @@ struct SequenceOutput {
 
   // the embedding of multimodal output
   std::optional<std::vector<EmbeddingOutput>> mm_embeddings;
+
+  // Decoded CTC text and mean confidence (omni-duplex only).
+  std::optional<std::string> text_ctc;
+  std::optional<float> confidence_ctc;
 };
 
 struct RequestOutput {

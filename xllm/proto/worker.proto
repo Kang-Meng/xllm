@@ -420,8 +420,20 @@ message JsonObjectOutputError {
   string message = 2;
 }
 
+// One multimodal side-output dict per batch position (e.g. the audio
+// encoder's CTC head: "audio|ctc_ids" = one id tensor per clip,
+// "audio|ctc_conf" = a [num_clips] fp32 tensor).
+message MMSideOutput {
+  map<string, MMValue> mm_dict = 1;
+}
+
 message ForwardOutput {
   repeated SquenceOutput outputs = 2;
+  reserved 11;
+  // Multimodal side outputs aligned with batch positions (an empty entry
+  // means the sequence has none this step); decoupled from the sampled rows
+  // so non-final prefill chunks (no sample target) still deliver.
+  repeated MMSideOutput mm_dict_vec = 12;
   repeated int64 expert_load_data = 3;
   int64 prepared_token = 4;
   repeated int32 src_seq_idxes = 5;

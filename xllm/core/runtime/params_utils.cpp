@@ -161,6 +161,19 @@ void proto_to_forward_output(const proto::ForwardOutput& pb_output,
         pb_seq_out.speculative_token_stats().proposed_tokens();
     raw_forward_output.outputs.emplace_back(s);
   }
+  raw_forward_output.mm_dict_vec.resize(pb_output.mm_dict_vec_size());
+  for (int32_t pos = 0; pos < pb_output.mm_dict_vec_size(); ++pos) {
+    MMDict dict;
+    for (const auto& [key, pb_value] : pb_output.mm_dict_vec(pos).mm_dict()) {
+      std::vector<torch::Tensor> vec;
+      vec.reserve(pb_value.tensor_list().tensors_size());
+      for (const auto& pb_tensor : pb_value.tensor_list().tensors()) {
+        vec.push_back(util::proto_to_torch(pb_tensor));
+      }
+      dict[key] = std::move(vec);
+    }
+    raw_forward_output.mm_dict_vec[pos] = std::move(dict);
+  }
   proto_to_dit_forward_output(pb_output.dit_forward_output(),
                               raw_forward_output.dit_forward_output);
   COUNTER_ADD(proto_latency_seconds_proto2o, timer.elapsed_seconds());
@@ -184,7 +197,8 @@ void forward_output_to_proto(
     const std::vector<torch::Tensor>& dit_audio,
     const std::vector<JsonObjectOutputError>& json_object_errors,
     const std::vector<std::string>& failed_request_ids,
-    proto::ForwardOutput* pb_forward_output) {
+    proto::ForwardOutput* pb_forward_output,
+    const std::vector<MMDict>& mm_dict_vec) {
   Timer timer;
   // LLM decode fills next_tokens; DiT text diffusion (e.g. Cola-DLM) may leave
   // it undefined and only populate dit_text_output. Guard before
@@ -321,6 +335,18 @@ void forward_output_to_proto(
               ->mutable_speculative_token_stats();
       pb_stats->set_accepted_tokens(stats.accepted_tokens);
       pb_stats->set_proposed_tokens(stats.proposed_tokens);
+    }
+  }
+
+  // Dense batch-position alignment, including non-final prefill chunks.
+  for (size_t pos = 0; pos < mm_dict_vec.size(); ++pos) {
+    auto* pb_map = pb_forward_output->add_mm_dict_vec()->mutable_mm_dict();
+    for (const auto& [key, value] : mm_dict_vec[pos]) {
+      auto& pb_value = (*pb_map)[key];
+      for (const auto& t : std::get<std::vector<torch::Tensor>>(value)) {
+        torch_tensor_to_proto_tensor(
+            t.to(torch::kCPU), pb_value.mutable_tensor_list()->add_tensors());
+      }
     }
   }
 

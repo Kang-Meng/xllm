@@ -19,6 +19,7 @@ option go_package = "jd.com/jd-infer/xllm;xllm";
 package xllm.proto;
 
 import "common.proto";
+import "tensor.proto";
 import "google/protobuf/struct.proto";
 
 message ChatMessage {
@@ -232,6 +233,12 @@ message ChatChoice {
   optional ChatLogProbs logprobs = 5;
 }
 
+// Generic extension slot for side outputs (e.g. the audio CTC
+// transcript/confidence), values carried as typed Parameters.
+message ExternalData {
+  map<string, Parameter> parameters = 1;
+}
+
 message ChatResponse {
   // unique id for the chat completion.
   string id = 1;
@@ -250,4 +257,8 @@ message ChatResponse {
 
   // usage statistics for the completion request.
   Usage usage = 6;
+
+  // Generic extension slot for side outputs (e.g. the audio CTC
+  // transcript/confidence).
+  ExternalData external_data = 7;
 }

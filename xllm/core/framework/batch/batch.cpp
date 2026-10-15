@@ -604,6 +604,14 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
   const std::unordered_set<std::string> failed_request_ids =
       collect_failed_request_ids(sequences, raw_output);
 
+  for (size_t pos = 0;
+       pos < raw_output.mm_dict_vec.size() && pos < sequences.size();
+       ++pos) {
+    if (!raw_output.mm_dict_vec[pos].empty()) {
+      sequences[pos]->set_mm_dict(raw_output.mm_dict_vec[pos]);
+    }
+  }
+
   for (size_t output_idx = 0; output_idx < output_targets_.size();
        ++output_idx) {
     const auto& target = output_targets_[output_idx];
@@ -801,6 +809,13 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   // sample_output.next_tokens.size(0) value is 0,
   // this means all sequences are in prefill stage status.
   const int64_t num_outputs = sample_output.next_tokens.size(0);
+  for (size_t pos = 0;
+       pos < sample_output.mm_dict_vec.size() && pos < sequences_.size();
+       ++pos) {
+    if (!sample_output.mm_dict_vec[pos].empty()) {
+      sequences_[pos]->set_mm_dict(sample_output.mm_dict_vec[pos]);
+    }
+  }
   for (size_t output_idx = 0; output_idx < output_targets_.size();
        ++output_idx) {
     const auto& target = output_targets_[output_idx];
@@ -960,6 +975,14 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
   const std::vector<Sequence*> sequences = get_sequences();
   const std::unordered_set<std::string> failed_request_ids =
       collect_failed_request_ids(sequences, raw_output);
+
+  for (size_t pos = 0;
+       pos < raw_output.mm_dict_vec.size() && pos < sequences.size();
+       ++pos) {
+    if (!raw_output.mm_dict_vec[pos].empty()) {
+      sequences[pos]->set_mm_dict(raw_output.mm_dict_vec[pos]);
+    }
+  }
 
   const int32_t beam_width = sequences_[0]->sampling_param()->beam_width;
   if (beam_width <= 1) {

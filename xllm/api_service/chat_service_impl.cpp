@@ -437,6 +437,19 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
     auto* proto_usage = response.mutable_usage();
     api_service::set_proto_usage(proto_usage, usage);
   }
+  for (const auto& output : req_output.outputs) {
+    if (output.text_ctc.has_value() || output.confidence_ctc.has_value()) {
+      auto* parameters = response.mutable_external_data()->mutable_parameters();
+      if (output.text_ctc.has_value()) {
+        (*parameters)["text_ctc"].set_string_param(output.text_ctc.value());
+      }
+      if (output.confidence_ctc.has_value()) {
+        (*parameters)["confidence_ctc"].set_double_param(
+            output.confidence_ctc.value());
+      }
+      break;
+    }
+  }
 
   return call->write_and_finish(response);
 }

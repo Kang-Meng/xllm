@@ -84,4 +84,57 @@ void EncoderCache::evict_until_fit(int64_t size) {
   }
 }
 
+MMSideOutputCache::MMSideOutputCache(int64_t max_size) : max_size_(max_size) {
+  CHECK_GE(max_size, 0) << "MMSideOutputCache max_size must be non-negative";
+}
+
+std::optional<MMSideOutputCache::SideOutput> MMSideOutputCache::lookup(
+    const XXH3Key& key) {
+  auto it = entries_.find(key);
+  if (it == entries_.end()) {
+    return std::nullopt;
+  }
+  lru_keys_.splice(lru_keys_.end(), lru_keys_, it->second.lru_it);
+  return it->second.output;
+}
+
+void MMSideOutputCache::insert(const XXH3Key& key,
+                              torch::Tensor ids,
+                              torch::Tensor conf) {
+  // Empty but defined IDs are valid for all-blank CTC output.
+  if (!ids.defined() || !conf.defined() || max_size_ == 0) {
+    return;
+  }
+  if (entries_.find(key) != entries_.end()) {
+    return;
+  }
+
+  int64_t size = static_cast<int64_t>(ids.nbytes() + conf.nbytes());
+  if (size > max_size_) {
+    return;
+  }
+  // Own the tensors even when the incoming tensors are already on CPU.
+  ids = ids.cpu().contiguous().clone();
+  conf = conf.cpu().contiguous().clone();
+  while (!lru_keys_.empty() && current_size_ + size > max_size_) {
+    auto it = entries_.find(lru_keys_.front());
+    CHECK(it != entries_.end());
+    current_size_ -= it->second.size;
+    entries_.erase(it);
+    lru_keys_.pop_front();
+  }
+  lru_keys_.push_back(key);
+  entries_.emplace(key,
+                   Entry{SideOutput{std::move(ids), std::move(conf)},
+                         size,
+                         std::prev(lru_keys_.end())});
+  current_size_ += size;
+}
+
+void MMSideOutputCache::clear() {
+  entries_.clear();
+  lru_keys_.clear();
+  current_size_ = 0;
+}
+
 }  // namespace xllm

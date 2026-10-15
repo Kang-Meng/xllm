@@ -21,6 +21,7 @@ limitations under the License.
 #include <list>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 
 #include "util/hash_util.h"
 
@@ -50,6 +51,34 @@ class EncoderCache {
   void touch(EntryMap::iterator it);
   void erase(EntryMap::iterator it);
   void evict_until_fit(int64_t size);
+
+  int64_t max_size_ = 0;
+  int64_t current_size_ = 0;
+  LruList lru_keys_;
+  EntryMap entries_;
+};
+
+// Stores CTC side outputs independently of the encoder embedding cache.
+class MMSideOutputCache final {
+ public:
+  using SideOutput = std::pair<torch::Tensor, torch::Tensor>;
+
+  explicit MMSideOutputCache(int64_t max_size);
+  std::optional<SideOutput> lookup(const XXH3Key& key);
+  void insert(const XXH3Key& key, torch::Tensor ids, torch::Tensor conf);
+  void clear();
+
+ private:
+  using LruList = std::list<XXH3Key>;
+
+  struct Entry {
+    SideOutput output;
+    int64_t size = 0;
+    LruList::iterator lru_it;
+  };
+
+  using EntryMap = std::
+      unordered_map<XXH3Key, Entry, FixedStringKeyHash, FixedStringKeyEqual>;
 
   int64_t max_size_ = 0;
   int64_t current_size_ = 0;

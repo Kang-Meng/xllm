@@ -367,6 +367,7 @@ Sequence::Sequence(const Sequence& other, size_t index)
       is_pre_scheduled_step_prefill_(other.is_pre_scheduled_step_prefill_),
       updated_since_last_beam_search_(other.updated_since_last_beam_search_) {
   logprob_state_ = other.logprob_state_;
+  mm_dict_ = other.mm_dict_;
   // A forked sequence (beam / best_of) shares the prompt KV prefix by
   // ref-counting those blocks, but its linear-state / embedding resource block
   // is private: drop the copied Embedding and Linear blocks so this sequence
@@ -792,6 +793,7 @@ void Sequence::generate_sample_outputs(std::vector<SequenceOutput>& outputs,
     }
 
     output.text = output.logprobs->front().token;
+    fill_ctc_output(tokenizer, output);
     outputs.push_back(std::move(output));
   }
 }
@@ -921,7 +923,59 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   output.token_ids = ids.slice(start, end);
   generate_output_tokens_logprobs(start, end, tokenizer, output.logprobs);
 
+  fill_ctc_output(tokenizer, output);
+
   return output;
+}
+
+void Sequence::fill_ctc_output(const Tokenizer& tokenizer,
+                               SequenceOutput& output) const {
+  if (mm_dict_.empty()) {
+    return;
+  }
+  // Report only the last (current-turn) clip.
+  const auto ids_it = mm_dict_.find("audio|ctc_ids");
+  if (ids_it == mm_dict_.end()) {
+    return;
+  }
+  // The shm codec collapses a one-element vector into a single tensor on the
+  // wire; accept both shapes.
+  torch::Tensor ids;
+  if (std::holds_alternative<std::vector<torch::Tensor>>(ids_it->second)) {
+    const auto& ids_vec = std::get<std::vector<torch::Tensor>>(ids_it->second);
+    if (ids_vec.empty()) {
+      return;
+    }
+    ids = ids_vec.back();
+  } else {
+    ids = std::get<torch::Tensor>(ids_it->second);
+  }
+  if (ids.defined() && ids.numel() > 0) {
+    const auto cpu = ids.to(torch::kCPU).contiguous();
+    const Slice<int32_t> slice{cpu.data_ptr<int32_t>(),
+                               static_cast<size_t>(cpu.numel())};
+    const std::string text =
+        tokenizer.decode(slice, /*skip_special_tokens=*/true);
+    if (!text.empty()) {
+      output.text_ctc = text;
+    }
+  }
+  const auto conf_it = mm_dict_.find("audio|ctc_conf");
+  if (conf_it != mm_dict_.end()) {
+    torch::Tensor confs;
+    if (std::holds_alternative<std::vector<torch::Tensor>>(conf_it->second)) {
+      const auto& conf_vec = std::get<std::vector<torch::Tensor>>(conf_it->second);
+      if (conf_vec.empty()) {
+        return;
+      }
+      confs = conf_vec.back();
+    } else {
+      confs = std::get<torch::Tensor>(conf_it->second);
+    }
+    if (confs.defined() && confs.numel() > 0) {
+      output.confidence_ctc = confs.reshape({-1})[-1].item<float>();
+    }
+  }
 }
 
 size_t Sequence::num_prefix_cache_tokens() const {

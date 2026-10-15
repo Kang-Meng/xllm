@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -110,13 +111,15 @@ class EncoderInputGatherVisitor : public MMDataItem::IVisitor {
   std::string filter_prefix_ = "embedding";
 };
 
+// Distributes the encoder output dict onto freshly-encoded items. Every
+// "<modality>|<field>" key is per-item: a vector<Tensor> contributes its i-th
+// element, a Tensor its i-th row; all keys of a modality advance in lockstep.
 class EncoderOutputScatterVisitor : public MMDataItem::IVisitor {
  public:
   EncoderOutputScatterVisitor(const MMDict& data) : data_(data) {}
 
   bool visit(MMDataItem& data) override;
   bool finish() const;
-
  public:
   const MMDict& data_;
   int32_t image_idx = 0;
@@ -162,6 +165,7 @@ class UpdateMMItemScheduleStateVisitor : public MMDataItem::IVisitor {
 };
 
 class EncoderCache;
+class MMSideOutputCache;
 class ProcessorCache;
 
 class ProcessorCacheLookupVisitor final : public MMInputItem::IVisitor {
@@ -201,6 +205,31 @@ class EncoderCacheInsertVisitor : public MMDataItem::IVisitor {
 
  private:
   EncoderCache* cache_;
+};
+
+// Restores missing CTC tensors or caches newly computed outputs on each item.
+class MMSideOutputCacheVisitor final : public MMData::IVisitor,
+                                       public MMDataItem::IVisitor {
+ public:
+  explicit MMSideOutputCacheVisitor(MMSideOutputCache& cache);
+  bool visit(MMData& data) override;
+  bool visit(MMDataItem& item) override;
+
+ private:
+  MMSideOutputCache& cache_;
+};
+
+// Collects CTC tensors by sequence index, preserving full-batch empty slots.
+class MMSideOutputCollectVisitor final : public MMData::IVisitor,
+                          public MMDataItem::IVisitor {
+ public:
+  explicit MMSideOutputCollectVisitor(int32_t num_sequences);
+  bool visit(MMData& data) override;
+  bool visit(MMDataItem& item) override;
+  std::vector<MMDict> finish();
+
+ private:
+  std::vector<MMDict> outputs_;
 };
 
 }  // namespace xllm

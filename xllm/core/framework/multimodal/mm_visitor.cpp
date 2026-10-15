@@ -245,7 +245,6 @@ bool EncoderOutputScatterVisitor::visit(MMDataItem& item) {
   if (item.is_embedded()) return true;
 
   int32_t* idx = nullptr;
-
   if (item.type() == MMType::IMAGE) {
     idx = &image_idx;
   } else if (item.type() == MMType::VIDEO) {
@@ -261,6 +260,16 @@ bool EncoderOutputScatterVisitor::visit(MMDataItem& item) {
   const auto& vec =
       std::get<std::vector<torch::Tensor>>(data_.at(embedding_key));
   item.add(embedding_key, vec[*idx]);
+
+  if (item.type() == MMType::AUDIO && data_.count("audio|ctc_ids") &&
+      data_.count("audio|ctc_conf")) {
+    item.add(
+        "audio|ctc_ids",
+        std::get<std::vector<torch::Tensor>>(data_.at("audio|ctc_ids"))[*idx]);
+    item.add(
+        "audio|ctc_conf",
+        std::get<std::vector<torch::Tensor>>(data_.at("audio|ctc_conf"))[*idx]);
+  }
   ++(*idx);
   return true;
 }
@@ -480,6 +489,78 @@ bool EncoderCacheInsertVisitor::visit(MMDataItem& item) {
   }
   cache_->insert(key, std::move(embedding.value()));
   return true;
+}
+
+MMSideOutputCacheVisitor::MMSideOutputCacheVisitor(MMSideOutputCache& cache)
+    : cache_(cache) {}
+
+bool MMSideOutputCacheVisitor::visit(MMData& data) {
+  if (!data.valid() || !data.hold<MMItemVec>()) {
+    return true;
+  }
+  return data.foreach (static_cast<MMDataItem::IVisitor&>(*this));
+}
+
+bool MMSideOutputCacheVisitor::visit(MMDataItem& item) {
+  if (item.type() != MMType::AUDIO) {
+    return true;
+  }
+  const XXH3Key& key = item.state().schedule_data().key;
+  auto ids = item.get<torch::Tensor>("audio|ctc_ids");
+  auto conf = item.get<torch::Tensor>("audio|ctc_conf");
+  if (ids.has_value() && ids->defined() && conf.has_value() && conf->defined()) {
+    cache_.insert(key, std::move(*ids), std::move(*conf));
+    return true;
+  }
+  auto cached = cache_.lookup(key);
+  if (cached.has_value()) {
+    item.add("audio|ctc_ids", cached->first);
+    item.add("audio|ctc_conf", cached->second);
+  }
+  return true;
+}
+
+MMSideOutputCollectVisitor::MMSideOutputCollectVisitor(int32_t num_sequences) {
+  CHECK_GE(num_sequences, 0);
+  outputs_.resize(num_sequences);
+}
+
+bool MMSideOutputCollectVisitor::visit(MMData& data) {
+  if (!data.valid() || !data.hold<MMItemVec>()) {
+    return true;
+  }
+  return data.foreach (static_cast<MMDataItem::IVisitor&>(*this));
+}
+
+bool MMSideOutputCollectVisitor::visit(MMDataItem& item) {
+  if (item.type() != MMType::AUDIO) {
+    return true;
+  }
+  const auto ids = item.get<torch::Tensor>("audio|ctc_ids");
+  const auto conf = item.get<torch::Tensor>("audio|ctc_conf");
+  if (!ids.has_value() || !ids->defined() || !conf.has_value() ||
+      !conf->defined()) {
+    return true;
+  }
+  // Text-only sequences have no items here, so traversal cannot advance past
+  // their batch slots. Use seq_index to avoid shifting CTC outputs to them.
+  int32_t seq_index = item.state().seq_index();
+  CHECK_GE(seq_index, 0);
+  CHECK_LT(static_cast<size_t>(seq_index), outputs_.size());
+  auto& output = outputs_[seq_index];
+  std::get<std::vector<torch::Tensor>>(
+      output.try_emplace("audio|ctc_ids", std::vector<torch::Tensor>())
+          .first->second)
+      .push_back(*ids);
+  std::get<std::vector<torch::Tensor>>(
+      output.try_emplace("audio|ctc_conf", std::vector<torch::Tensor>())
+          .first->second)
+      .push_back(*conf);
+  return true;
+}
+
+std::vector<MMDict> MMSideOutputCollectVisitor::finish() {
+  return std::move(outputs_);
 }
 
 }  // namespace xllm

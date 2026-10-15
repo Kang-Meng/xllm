@@ -243,6 +243,7 @@ class Sequence final {
   // update mm embeddings to the sequence
   void update_mm_embeddings(const std::vector<torch::Tensor>& mm_embeddings,
                             OptionalModelArgsRef model_args = std::nullopt);
+  void set_mm_dict(MMDict mm_dict) { mm_dict_ = std::move(mm_dict); }
   // update embeddings to the sequence
   void update_embeddings(const torch::Tensor& embedding);
   void update_mtp_bootstrap_embedding(const torch::Tensor& embedding);
@@ -555,6 +556,8 @@ class Sequence final {
   SequenceOutputType output_type();
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
+  void fill_ctc_output(const Tokenizer& tokenizer,
+                       SequenceOutput& output) const;
   torch::Tensor generate_mm_embeddings_tags(const ModelArgs& model_args) const;
 
   void init_onerec_sequence(const std::vector<int32_t>& prompt_token_ids,
@@ -643,6 +646,8 @@ class Sequence final {
   // mm embedding of the sequence
   std::vector<torch::Tensor> output_mm_embeddings_;
   torch::Tensor output_mm_embeddings_tags_;
+
+  MMDict mm_dict_;
 
   // embeddings of the sequence
   torch::Tensor output_embedding_;
