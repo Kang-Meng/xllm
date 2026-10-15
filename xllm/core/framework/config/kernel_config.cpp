@@ -46,6 +46,13 @@ DEFINE_bool(enable_split_rmsnorm_rope,
             false,
             "enable fused split rmsnorm rope ops.");
 
+DEFINE_bool(enable_split_rmsnorm_rope_prefill,
+            false,
+            "allow the fused split rmsnorm rope path on prefill in the Qwen3 "
+            "MoE decoder layer. Only read when enable_split_rmsnorm_rope=true; "
+            "decode always takes the fused path once it is enabled. Off by "
+            "default because prefill regresses long-prompt TTFT.");
+
 DEFINE_bool(enable_aclnn_matmul,
             false,
             "enable ACLNN matmul backend for supported NPU ATB layers.");
@@ -119,6 +126,7 @@ void KernelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_fused_mc2);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_interlayer_addnorm);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_split_rmsnorm_rope);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_split_rmsnorm_rope_prefill);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_aclnn_matmul);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_aclnn_swiglu);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mega_moe);
@@ -139,6 +147,7 @@ void KernelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_fused_mc2);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_interlayer_addnorm);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_split_rmsnorm_rope);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_split_rmsnorm_rope_prefill);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_aclnn_matmul);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_aclnn_swiglu);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mega_moe);
@@ -172,6 +181,8 @@ void KernelConfig::append_config_json(
       config_json, default_config, enable_interlayer_addnorm);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_split_rmsnorm_rope);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_split_rmsnorm_rope_prefill);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_aclnn_matmul);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

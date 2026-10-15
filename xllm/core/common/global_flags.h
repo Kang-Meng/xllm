@@ -429,6 +429,8 @@ DECLARE_bool(enable_interlayer_addnorm);
 
 DECLARE_bool(enable_split_rmsnorm_rope);
 
+DECLARE_bool(enable_split_rmsnorm_rope_prefill);
+
 DECLARE_bool(enable_aclnn_matmul);
 
 DECLARE_bool(enable_aclnn_swiglu);

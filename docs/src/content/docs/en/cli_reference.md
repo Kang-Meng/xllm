@@ -235,6 +235,7 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `enable_fused_mc2` | `int32` | `-1` | Fused MC2 mode for NPU. `-1` uses the auto default, `0` disables fused MC2, positive values enable dense matmul-allreduce, `1` uses DispatchFFNCombine for MoE, `2` uses DispatchGmmCombineDecode for MoE. |
 | `enable_interlayer_addnorm` | `bool` | `false` | Whether to enable fused interlayer addnorm ops. |
 | `enable_split_rmsnorm_rope` | `bool` | `false` | Whether to enable fused split rmsnorm rope ops. |
+| `enable_split_rmsnorm_rope_prefill` | `bool` | `false` | Whether to also take the fused split rmsnorm rope path on prefill in the Qwen3 MoE decoder layer. Only read when `enable_split_rmsnorm_rope` is enabled; decode always uses the fused path once it is. |
 | `enable_aclnn_matmul` | `bool` | `false` | Whether to enable the ACLNN matmul backend for supported NPU ATB layers. |
 | `enable_aclnn_swiglu` | `bool` | `false` | Whether to enable the ACLNN SwiGLU backend for supported NPU ATB layers. |
 | `enable_dspark_native_sas` | `bool` | `false` | Enable native NPU DSpark SparseAttnSharedkv semantics. Older operators that reject non-empty `ori_sparse_indices` may terminate during tiling; keep this disabled to use q_len=1 compatibility mode. |

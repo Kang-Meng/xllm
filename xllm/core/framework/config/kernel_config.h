@@ -46,6 +46,7 @@ class KernelConfig final {
          "enable_fused_mc2",
          "enable_interlayer_addnorm",
          "enable_split_rmsnorm_rope",
+         "enable_split_rmsnorm_rope_prefill",
          "enable_aclnn_matmul",
          "enable_aclnn_swiglu",
          "enable_mega_moe",
@@ -70,6 +71,8 @@ class KernelConfig final {
   PROPERTY(bool, enable_interlayer_addnorm) = false;
 
   PROPERTY(bool, enable_split_rmsnorm_rope) = false;
+
+  PROPERTY(bool, enable_split_rmsnorm_rope_prefill) = false;
 
   PROPERTY(bool, enable_aclnn_matmul) = false;
 

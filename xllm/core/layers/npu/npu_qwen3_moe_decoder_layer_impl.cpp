@@ -128,10 +128,18 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_basic_parameters(
 
   // Can be applied to prefill, but has not been tested yet
   param.enableFusedReducesumDiv = !is_prefill;
-  param.enableAclnnExternelAddRmsNorm =
-      ::xllm::KernelConfig::get_instance().enable_intralayer_addnorm() &&
-      !is_prefill;
-  param.enableAclnnAddRmsNorm = !is_prefill;
+  // Fused AddRmsNorm kernels, both driven by --enable_intralayer_addnorm.
+  // enableAclnnExternelAddRmsNorm is the inter-layer fold: the attention node
+  // consumes the running residual and re-emits it as an extra graph output, so
+  // the standalone residual add at the end of the layer disappears.
+  // enableAclnnAddRmsNorm is the intra-layer fold: it replaces the post-
+  // attention ElewiseAdd + RmsNorm pair with a single aclnnAddRmsNorm. The
+  // latter stays on for decode even without the flag, which is the historical
+  // behaviour. Both kernels take 1-8 dim inputs, so prefill shapes are fine.
+  const bool enable_addnorm =
+      ::xllm::KernelConfig::get_instance().enable_intralayer_addnorm();
+  param.enableAclnnExternelAddRmsNorm = enable_addnorm;
+  param.enableAclnnAddRmsNorm = enable_addnorm || !is_prefill;
 
   param.swigluBackend = atb_speed::common::OpBackend::ACLNN;
   param.mlpLinearTransposeType = {static_cast<int>(TransposeType::INVALID),
@@ -189,6 +197,25 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_basic_parameters(
 
   if (is_prefill) {
     param.enableAclnnRmsNorm = quantize_type_.empty();
+  }
+
+  // Fused packed-QKV split + per-head QK-RMSNorm + RoPE, mirroring
+  // NpuQwen3DecoderLayerImpl. Decode always takes the fused path once the
+  // kernel is enabled; prefill is opt-in through
+  // --enable_split_rmsnorm_rope_prefill, because it regresses long-prompt TTFT
+  // on some models. The guard must stay in lockstep with the fused branch
+  // condition in qkv_linear_split.cpp: Attention() skips its standalone RoPE
+  // node whenever this flag is set, so it may only be set when QKVLinearSplit
+  // really takes the fused path (packed GQA). isPack is not checked because
+  // both pack types this model can use (ALL_FP, ALL_W8A8_DYNAMIC_ANTI) are in
+  // PackableQuantTypes.
+  const auto& kernel_config = ::xllm::KernelConfig::get_instance();
+  const bool enable_prefill_fusion =
+      !is_prefill || kernel_config.enable_split_rmsnorm_rope_prefill();
+  if (kernel_config.enable_split_rmsnorm_rope() && enable_prefill_fusion &&
+      param.useQKNorm && !param.enableRopeQuantKvcache &&
+      param.numAttentionHeadsPerRank != param.numKeyValueHeadsPerRank) {
+    param.enableSplitRmsNormRope = true;
   }
 }
 
@@ -468,8 +495,7 @@ void NpuQwen3MoeDecoderLayerImpl::build_node_variant_pack(
         atb_speed::Utils::AtTensor2Tensor(input_params.graph.tiling_data);
   }
 
-  if (input_params.meta.batch_forward_type.is_decode() &&
-      ::xllm::KernelConfig::get_instance().enable_intralayer_addnorm() &&
+  if (::xllm::KernelConfig::get_instance().enable_intralayer_addnorm() &&
       residual.has_value()) {
     // input
     auto& residual_tensor = residual.value();
