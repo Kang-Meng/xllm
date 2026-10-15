@@ -591,10 +591,6 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   }
   staged.clear();
   cache_full_blocks_for_sequence(seq);
-
-  // Release slid-out SWA blocks only after they have had a chance to enter the
-  // prefix cache. Other leaves are no-ops here.
-  release_out_of_window_for_sequence(seq, kv_state);
   return true;
 }
 

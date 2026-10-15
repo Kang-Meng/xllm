@@ -72,7 +72,6 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
 
  private:
   friend class HierarchyPoolTestPeer;
-  void release_host_match(Sequence* sequence, int32_t dp_rank);
   void collect_load_block_transfer_infos(Sequence* sequence);
   void collect_offload_pairs(Sequence* sequence);
   bool should_probe_prefix_cache(Sequence* sequence) const;

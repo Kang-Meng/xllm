@@ -496,17 +496,6 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
   offload_block_pair_queues_.resize(host_block_managers_.size());
 }
 
-void HierarchyBlockManagerPool::release_host_match(Sequence* sequence,
-                                                   int32_t dp_rank) {
-  CHECK(sequence != nullptr);
-  KVCacheState& host_state = sequence->host_kv_state();
-  auto* host_manager = host_block_managers_[dp_rank].get();
-  CHECK(host_manager);
-  host_manager->deallocate_for_sequence(sequence, host_state);
-  host_state.reset();
-  sequence->clear_host_cache_match();
-}
-
 void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   DCHECK(sequence != nullptr);
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
@@ -535,6 +524,12 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
 
   KVCacheState& hbm_state = sequence->kv_state();
   KVCacheState& host_state = sequence->host_kv_state();
+  // The first allocate can see a longer HBM prefix while the previous D2H is
+  // still in flight. Collecting that prefix again would offload the same span.
+  if (hbm_state.shared_tokens_num() > host_state.shared_tokens_num() &&
+      hbm_state.kv_cache_tokens_num() == hbm_state.shared_tokens_num()) {
+    return;
+  }
   bool queued_offload = false;
   size_t completed_tokens = hbm_state.kv_cache_tokens_num();
   size_t cache_unit_size = 0;
@@ -770,7 +765,6 @@ void HierarchyBlockManagerPool::trim_host_cache(
 bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
                                          size_t num_tokens) {
   CHECK(sequence != nullptr);
-  const bool had_device_blocks = sequence->kv_state().has_any_blocks();
   const int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
   if (should_probe_prefix_cache(sequence)) {
     allocate_shared(sequence);
@@ -791,33 +785,20 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
   // HBM leaf trims it, select the exact speculative checkpoint, pin it through
   // D2H, then publish it to Host/Store. FLAT_KV_LINEAR remains unsupported by
   // the hierarchy manager until that ownership and transfer protocol exists.
-  if (composite->leaf_combination() ==
-      CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
-    composite->cache_full_blocks_for_sequence(sequence);
-    collect_offload_pairs(sequence);
-  }
   if (!composite->allocate_sequence(sequence, num_tokens)) {
-    release_host_match(sequence, dp_rank);
-    if (!had_device_blocks) {
-      composite->deallocate_for_sequence(sequence);
-      sequence->reset();
-    }
     return false;
   }
 
   if (!host_manager->allocate_sequence(sequence, host_state, num_tokens)) {
-    host_manager->release_out_of_window_for_sequence(sequence, host_state);
-    if (!had_device_blocks) {
-      host_manager->deallocate_for_sequence(sequence, host_state);
-      composite->deallocate_for_sequence(sequence);
-      sequence->reset();
-    }
     return false;
   }
 
   collect_load_block_transfer_infos(sequence);
   CHECK_GE(hbm_state.current_max_tokens_capacity(), restore_tokens);
   collect_offload_pairs(sequence);
+  // Drop the SWA block retained from this tier's old window after D2H has
+  // copied it. KV and LINEAR have no out-of-window release.
+  composite->release_out_of_window_for_sequence(sequence);
   sequence->clear_host_cache_match();
   return true;
 }
