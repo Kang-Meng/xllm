@@ -148,6 +148,7 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
       "deepseek_v32_mtp",
       "kimi_k2",
       "kimi_k25",
+      "kimi_k3",
       "glm4_moe_lite",
       "glm_moe_dsa",  // glm5 model type
       "glm_moe_dsa_mtp",
@@ -187,6 +188,7 @@ inline bool is_deepseek_v4_dspark_model_type(std::string_view model_type) {
 
 inline constexpr std::string_view kDeepseekV4ModelType = "deepseek_v4";
 inline constexpr std::string_view kDeepseekV41ModelType = "deepseek_v41";
+inline constexpr std::string_view kKimiK3ModelType = "kimi_k3";
 
 inline bool is_deepseek_v41_model_type(std::string_view model_type) {
   return model_type == kDeepseekV41ModelType;

@@ -390,6 +390,13 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
   py::object model_cls = registry.attr("get_model_class")(py::str(module_name));
   config_dict_ = build_config_dict(parallel_args,
                                    context.get_speculative_runtime_config());
+  // Publish the loader's authoritative quantization contract to Python models.
+  // Model construction must choose packed parameter dtypes before load_weights.
+  const auto& quant_args = context.get_quant_args();
+  config_dict_["quantize_type"] = quant_args.quantize_type();
+  config_dict_["quant_method"] = quant_args.quant_method();
+  config_dict_["quant_group_size"] = quant_args.group_size();
+  config_dict_["quant_version"] = quant_args.quant_version();
   config_dict_["is_multimodal"] = is_vlm;
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();

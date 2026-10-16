@@ -83,18 +83,20 @@ DEFINE_string(engram_config,
 
 // NOTE: This is an experimental flag,
 //       it needs to be removed after the function is stable.
-DEFINE_bool(use_cpp_chat_template,
-            true,
-            "Use native C++ chat template for supported models "
-            "(e.g. deepseek_v32, deepseek_v4, deepseek_v41) instead of "
-            "Jinja. Set to false to fallback to Jinja for debugging.");
+DEFINE_bool(
+    use_cpp_chat_template,
+    true,
+    "Use native C++ chat template for supported models "
+    "(e.g. deepseek_v32, deepseek_v4, deepseek_v41, kimi_k3) instead of "
+    "Jinja. Set to false to fallback to Jinja for debugging.");
 
 namespace xllm {
 namespace {
 
 bool is_cpp_chat_template_supported_model(const std::string& model_type) {
   return model_type == "deepseek_v32" || model_type == "deepseek_v4" ||
-         model_type == util::kDeepseekV41ModelType;
+         model_type == util::kDeepseekV41ModelType ||
+         model_type == util::kKimiK3ModelType;
 }
 
 bool is_qwen3_5_model_type(std::string_view model_type) {

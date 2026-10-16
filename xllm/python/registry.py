@@ -113,6 +113,14 @@ def get_model_class(name: str) -> type[nn.Module]:
 
 def _register_builtin_models() -> None:
     _register_model_path(
+        "xllm.python.models.kimi_k3",
+        "KimiK3ForConditionalGeneration",
+        "kimi_k3",
+        "KimiK3ForConditionalGeneration",
+    )
+    # KimiK3ForCausalLM is an internal component constructed by kimi_k3's VLM
+    # adapter. It has no standalone C++ model-args loader or serving alias.
+    _register_model_path(
         "xllm.python.models.qwen3",
         "Qwen3ForCausalLM",
         "Qwen3ForCausalLM",

@@ -85,7 +85,8 @@ bool is_torch_only_model_type(const std::string& model_type) {
       "qwen3_5_mtp",
       "qwen3_5_moe_mtp",
       "qwen3_next",
-      "minimax_m2"};
+      "minimax_m2",
+      "kimi_k3"};
   return kTorchOnlyModelTypes.count(model_type) != 0 ||
          is_dflash2_draft_model_type(model_type);
 }

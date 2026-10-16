@@ -152,9 +152,8 @@ def test_vlm_dispatches_weights_to_vision_and_text(vlm: KimiK3ForConditionalGene
 
 
 @pytest.mark.parametrize("name", ["kimi_k3", "KimiK3ForConditionalGeneration"])
-def test_incomplete_vlm_is_not_registered_as_a_service(name: str) -> None:
-    with pytest.raises(KeyError, match="not registered"):
-        registry.get_model_class(name)
+def test_vlm_service_registry_resolves_config_only_factory(name: str) -> None:
+    assert registry.get_model_class(name) is KimiK3ForConditionalGeneration
 
 
 @pytest.mark.parametrize("include_image", [False, True])

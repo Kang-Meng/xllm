@@ -34,6 +34,7 @@ from xllm.python.attention.backend import (
     LayerCache,
     MlaIndexContext,
     MlaPreprocessContext,
+    MlaUnabsorbedPrefill,
     build_speculative_ssm_state_indices,
     linear_state_checkpoint_stride,
     resolve_linear_state_io_indices,
@@ -60,6 +61,53 @@ if TYPE_CHECKING:
 from xllm.python.attention.kda_linear_attention import (
     KdaLinearAttentionMixin,
 )
+
+_DENSE_MLA_512_HEAD_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def _pad_dense_mla_queries(
+    q_latent: torch.Tensor,
+    q_pe: torch.Tensor,
+    *,
+    layer_id: int = -1,
+    eager_buffers: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad unsupported dense-512 head counts into reusable zero-tail buffers.
+
+    Captured inputs belong to their graph entry and layer: task-update closures
+    retain these tensors, so a backend-global scratch buffer cannot be shared
+    across captured layers or graph shapes. Eager calls reuse one shape bucket
+    on the execution stream; replacing it bounds retention for variable prefill.
+    """
+    heads = q_latent.shape[1]
+    if q_latent.shape[-1] != 512 or heads in _DENSE_MLA_512_HEAD_COUNTS:
+        return q_latent, q_pe
+    padded_heads = next((count for count in _DENSE_MLA_512_HEAD_COUNTS if count > heads), None)
+    if padded_heads is None:
+        raise ValueError(f"Dense MLA FIA does not support {heads} query heads")
+    shapes = ((q_latent.shape[0], padded_heads, q_latent.shape[2]), (q_pe.shape[0], padded_heads, q_pe.shape[2]))
+    key = (tuple(q_latent.shape), tuple(q_pe.shape), q_latent.dtype, q_pe.dtype, q_latent.device, q_pe.device)
+    context = get_forward_context_or_none()
+    if context is not None and context.execution_state is not None:
+        padded = tuple(
+            get_execution_buffer(
+                ("MLA_DENSE_QUERY_PADDING", layer_id, part, *key),
+                lambda source=source, shape=shape: source.new_zeros(shape),
+            )
+            for part, (source, shape) in enumerate(zip((q_latent, q_pe), shapes))
+        )
+    else:
+        padded = eager_buffers.get(key) if eager_buffers is not None else None
+        if padded is None:
+            padded = (q_latent.new_zeros(shapes[0]), q_pe.new_zeros(shapes[1]))
+            if eager_buffers is not None:
+                eager_buffers.clear()
+                eager_buffers[key] = padded
+    # FIA only reads the queries. Padding is zeroed once on allocation; copy
+    # just the real heads on each forward, leaving the tail initialized.
+    padded[0][:, :heads].copy_(q_latent)
+    padded[1][:, :heads].copy_(q_pe)
+    return padded
 
 
 def _is_dflash_proposal(metadata: object) -> bool:
@@ -276,6 +324,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._mla_graph_workspaces: dict[tuple[int, ...], torch.Tensor] = {}
         self._mla_graph_outputs: dict[tuple[int, ...], torch.Tensor] = {}
         self._mla_graph_lses: dict[tuple[int, ...], torch.Tensor] = {}
+        self._mla_eager_query_buffers: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
         self._mla_quant_indexer_metadata: dict[tuple[int, int, int, int], torch.Tensor] = {}
         self._mla_max_seqlen_q = 0
         self._mla_max_seqlen_k = 0
@@ -825,6 +874,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         layer: Attention,
         topk: torch.Tensor | None = None,
         cache_is_preprocessed: bool = False,
+        unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
     ) -> torch.Tensor:
         """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
         metadata = self._metadata
@@ -949,6 +999,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 # alongside the sparse/KDA path so the non-sparse MLA config still
                 # works. Only models with rope (qk_rope_head_dim > 0) reach here.
                 if topk is None:
+                    if unabsorbed_prefill is not None:
+                        if not metadata.is_prefill or metadata.is_chunked_prefill:
+                            raise ValueError("Unabsorbed MLA requires full prefill without a cached prefix")
+                        return self._mla_unabsorbed_prefill(unabsorbed_prefill, q_pe, k_pe_3d, layer)
                     return self._mla_dense_fia_v2(
                         q_latent,
                         q_pe,
@@ -956,6 +1010,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                         rope_cache,
                         self._block_table_i32,
                         layer_id,
+                        pad_query_heads=bool(getattr(layer, "requires_dense_mla_head_padding", False)),
                     )
                 if c8_enabled:
                     return self._mla_sparse_c8(
@@ -1884,6 +1939,34 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             rope_head_dim=q_pe.shape[-1],
         )  # [T, H, kv_lora]
 
+    def _mla_unabsorbed_prefill(
+        self,
+        inputs: MlaUnabsorbedPrefill,
+        query_position: torch.Tensor,
+        key_position: torch.Tensor,
+        layer: Attention,
+    ) -> torch.Tensor:
+        """Keep expanded K/V rounding before attention for full MLA prefill."""
+        query = torch.cat((inputs.query_nope, query_position), dim=-1)
+        key = torch.cat((inputs.key_nope, key_position.expand(-1, layer.num_heads, -1)), dim=-1)
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query.contiguous(),
+            key.contiguous(),
+            inputs.value.contiguous(),
+            num_heads=layer.num_heads,
+            num_key_value_heads=layer.num_heads,
+            input_layout="TND",
+            atten_mask=self._causal_mask,
+            sparse_mode=_SPARSE_MODE_RIGHT_DOWN_CAUSAL,
+            scale=layer.scale,
+            block_table=None,
+            block_size=0,
+            softmax_lse_flag=True,
+            actual_seq_lengths=self._mla_actual_seq_q_host,
+            actual_seq_lengths_kv=self._mla_actual_seq_q_host,
+        )
+        return output.reshape(query.shape[0], layer.num_heads, -1)
+
     def _mla_dense_fia_v2_out(
         self,
         q_latent: torch.Tensor,
@@ -1916,7 +1999,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             actual_seq_qlen=self._mla_actual_seq_q_host,
             actual_seq_kvlen=self._mla_actual_seq_kv_host,
             block_table=block_table,
-            num_query_heads=self.num_heads,
+            num_query_heads=q_latent.shape[1],
             num_key_value_heads=1,
             softmax_scale=self.scale,
             input_layout="TND",
@@ -1935,6 +2018,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         rope_cache: torch.Tensor,
         block_table: torch.Tensor,
         layer_id: int,
+        *,
+        pad_query_heads: bool = False,
     ) -> torch.Tensor:
         """Run dense absorbed MLA with FIA v2 and separate RoPE caches."""
         if not self._use_fia_v2:
@@ -1944,6 +2029,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if self._mla_actual_seq_kv_host is None:
             raise RuntimeError("dense MLA requires KV sequence lengths")
 
+        original_heads = q_latent.shape[1]
+        # Preserve the mainline query layout unless the layer explicitly opts
+        # into head padding. Kimi's 96 heads need this for dense-512 FIA.
+        if pad_query_heads:
+            q_latent, q_pe = _pad_dense_mla_queries(
+                q_latent, q_pe, layer_id=layer_id, eager_buffers=self._mla_eager_query_buffers
+            )
         block_size = nope_cache.size(1)
         nope_flat = nope_cache.view(nope_cache.size(0), block_size, -1)
         rope_flat = rope_cache.view(rope_cache.size(0), block_size, -1)
@@ -1958,7 +2050,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             "actual_seq_qlen": self._mla_actual_seq_q_host,
             "actual_seq_kvlen": self._mla_actual_seq_kv_host,
             "block_table": block_table,
-            "num_query_heads": self.num_heads,
+            "num_query_heads": q_latent.shape[1],
             "num_key_value_heads": 1,
             "softmax_scale": self.scale,
             "input_layout": "TND",
@@ -1975,7 +2067,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 nope_flat,
                 **common_kwargs,
             )
-            return output
+            return output[:, :original_heads] if pad_query_heads else output
 
         output_key = ("MLA_DENSE_OUTPUT", layer_id) + tuple(q_latent.shape)
         output = self._mla_graph_outputs.get(output_key)
@@ -2028,7 +2120,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             )
 
         graph_context.tasks.append(AclGraphTask(event, handle, _update_mla_fia_v2_args))
-        return output
+        return output[:, :original_heads] if pad_query_heads else output
 
     # ------------------------------------------------------------------
     # Prefill: packed TND with causal mask

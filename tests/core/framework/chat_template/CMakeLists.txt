@@ -3,6 +3,17 @@ include(cc_test)
 cc_test (
   CPU_ONLY
   NAME
+    kimi_k3_cpp_template_test
+  SRCS
+    kimi_k3_cpp_template_test.cpp
+  DEPS
+    :kimi_k3_cpp_template
+    GTest::gtest_main
+)
+
+cc_test (
+  CPU_ONLY
+  NAME
     chat_template_test
   SRCS
     chat_template_test.cpp

@@ -298,6 +298,14 @@ class ModelExecutor:
         # import glm5_next (that import pulls KDA kernel transitive deps and
         # fails on builds without them).
         dsa_layers = [layer for layer in attention_layers if getattr(layer, "is_glm_next_mla", False)]
+        # Hybrid models may declare attention_kind without GLM-specific tags.
+        # Existing untagged models retain the identical-configuration contract.
+        if not dsa_layers and any(getattr(layer, "attention_kind", None) == "linear" for layer in attention_layers):
+            dsa_layers = [layer for layer in attention_layers if getattr(layer, "attention_kind", None) == "mla"]
+            if dsa_layers:
+                expected_config = self._attention_config(dsa_layers[0])
+                if any(self._attention_config(layer) != expected_config for layer in dsa_layers[1:]):
+                    raise ValueError("Attention backend requires identical MLA configuration across hybrid layers")
         has_kda_layers = any(getattr(layer, "is_glm_next_kda", False) for layer in attention_layers)
         is_draft_engine = bool(config.get("is_draft_engine", False))
         adaptive_speculative_decode_enabled = bool(config.get("runtime_adaptive_speculative_decode_enabled", False))

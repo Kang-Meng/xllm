@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -38,14 +40,22 @@ class KimiK3ForConditionalGeneration(PyModelBase):
     the scheduler's item masks rather than token-ID matching. The mainline
     multimodal executor owns encoding, caching and chunk slicing, and passes
     MultimodalInputs to the text runner.
-    The following text integration supplies the config-only registry factory;
-    this component remains unregistered while the branches are split.
     """
 
     cache_multimodal_embeddings: bool = True
 
-    def __init__(self, config: dict[str, Any], language_model: PyModelBase) -> None:
+    def __init__(self, config: dict[str, Any], language_model: PyModelBase | None = None) -> None:
         super().__init__()
+        if language_model is None:
+            from xllm.python.models.kimi_k3_text import KimiK3ForCausalLM
+
+            # C++ publishes flat runtime/topology fields. Keep checkpoint-only
+            # nested configuration within this model's config-only factory.
+            model_path = config.get("model_path")
+            if model_path is not None:
+                with (Path(model_path) / "config.json").open() as source:
+                    config = {**json.load(source), **config}
+            language_model = KimiK3ForCausalLM(config)
         self.vision_model = KimiK3VisionModel(config)
         self.language_model = language_model
 

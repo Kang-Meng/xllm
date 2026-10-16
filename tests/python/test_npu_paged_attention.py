@@ -27,7 +27,10 @@ from xllm.python.attention.backend import (  # noqa: E402
     LayerCache,
     build_speculative_ssm_state_indices,
 )
-from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend  # noqa: E402
+from xllm.python.attention.npu_paged_attention import (  # noqa: E402
+    NpuPagedAttentionBackend,
+    _pad_dense_mla_queries,
+)
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     AclGraphExecutionState,
     ForwardContext,
@@ -44,6 +47,102 @@ def test_speculative_ssm_indices_keep_all_bootstrap_checkpoints() -> None:
 
 
 pytestmark = pytest.mark.usefixtures("causal_conv1d_reference")
+
+
+@pytest.mark.parametrize("heads,padded_heads", [(6, 8), (24, 32), (32, 32), (96, 128)])
+def test_dense_mla_padding_preserves_real_heads(heads: int, padded_heads: int) -> None:
+    query = torch.randn(2, heads, 512)
+    position = torch.randn(2, heads, 64)
+    padded_query, padded_position = _pad_dense_mla_queries(query, position)
+    assert padded_query.shape == (2, padded_heads, 512)
+    torch.testing.assert_close(padded_query[:, :heads], query)
+    torch.testing.assert_close(padded_position[:, :heads], position)
+    assert torch.count_nonzero(padded_query[:, heads:]) == 0
+    if heads == padded_heads:
+        assert padded_query is query and padded_position is position
+
+
+def test_dense_mla_padding_leaves_other_head_dimensions_unchanged() -> None:
+    query, position = torch.randn(2, 24, 128), torch.randn(2, 24, 64)
+    padded_query, padded_position = _pad_dense_mla_queries(query, position)
+    assert padded_query is query and padded_position is position
+
+
+def test_dense_mla_padding_reuses_one_eager_bucket_and_refreshes_inputs() -> None:
+    buffers: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+    query, position = torch.randn(2, 24, 512), torch.randn(2, 24, 64)
+    first = _pad_dense_mla_queries(query, position, eager_buffers=buffers)
+    query.add_(1)
+    position.sub_(1)
+    second = _pad_dense_mla_queries(query, position, eager_buffers=buffers)
+    assert all(a.data_ptr() == b.data_ptr() for a, b in zip(first, second))
+    torch.testing.assert_close(second[0][:, :24], query)
+    torch.testing.assert_close(second[1][:, :24], position)
+    assert torch.count_nonzero(second[0][:, 24:]) == 0
+    assert torch.count_nonzero(second[1][:, 24:]) == 0
+    _pad_dense_mla_queries(query[:1], position[:1], eager_buffers=buffers)
+    assert len(buffers) == 1
+
+
+def test_dense_mla_padding_graph_storage_is_owned_by_entry_and_layer() -> None:
+    query, position = torch.randn(2, 24, 512), torch.randn(2, 24, 64)
+    states = [AclGraphExecutionState(persistent_buffers={}) for _ in range(2)]
+    storage: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for state in states:
+        context = ForwardContext(None, torch.device("cpu"), None, [], execution_state=state)
+        with forward_context(context):
+            first = _pad_dense_mla_queries(query, position, layer_id=0)
+            again = _pad_dense_mla_queries(query + 1, position + 1, layer_id=0)
+            other_layer = _pad_dense_mla_queries(query, position, layer_id=1)
+        assert first[0].data_ptr() == again[0].data_ptr()
+        assert first[0].data_ptr() != other_layer[0].data_ptr()
+        torch.testing.assert_close(first[0][:, :24], query + 1)
+        storage.append(first)
+    assert storage[0][0].data_ptr() != storage[1][0].data_ptr()
+
+
+@pytest.mark.parametrize("pad_query_heads", [False, True])
+def test_dense_mla_backend_preserves_queries_without_padding_opt_in(
+    monkeypatch: pytest.MonkeyPatch, pad_query_heads: bool
+) -> None:
+    backend = object.__new__(NpuPagedAttentionBackend)
+    backend._use_fia_v2 = True
+    backend._mla_actual_seq_q_host = [2]
+    backend._mla_actual_seq_kv_host = [2]
+    backend._mla_eager_query_buffers = {}
+    backend._metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False)
+    backend._causal_mask = None
+    backend.scale = 0.125
+    query, position = torch.randn(2, 6, 512), torch.randn(2, 6, 64)
+    seen: list[torch.Tensor] = []
+    kernel_outputs: list[torch.Tensor] = []
+
+    def attention(q: torch.Tensor, *args: object, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+        seen.append(q)
+        assert kwargs["num_query_heads"] == q.shape[1]
+        result = q.clone()
+        kernel_outputs.append(result)
+        return result, torch.empty(0)
+
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score_v2", attention, raising=False)
+    # Omitting the argument exercises the default used by existing callers.
+    options = {"pad_query_heads": True} if pad_query_heads else {}
+    with forward_context(ForwardContext(backend, torch.device("cpu"), None, [])):
+        output = backend._mla_dense_fia_v2(
+            query,
+            position,
+            torch.empty(1, 128, 1, 512),
+            torch.empty(1, 128, 1, 64),
+            torch.zeros(1, 1, dtype=torch.int32),
+            0,
+            **options,
+        )
+    assert seen[0].shape[1] == (8 if pad_query_heads else 6)
+    if not pad_query_heads:
+        assert seen[0] is query
+        assert output is kernel_outputs[0]
+        assert not backend._mla_eager_query_buffers
+    torch.testing.assert_close(output, query, rtol=0, atol=0)
 
 
 def test_uses_first_nonempty_key_cache() -> None:

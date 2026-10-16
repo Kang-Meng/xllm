@@ -21,6 +21,7 @@ limitations under the License.
 #include "framework/chat_template/deepseek_v32_cpp_template.h"
 #include "framework/chat_template/deepseek_v4_cpp_template.h"
 #include "framework/chat_template/jinja_chat_template.h"
+#include "framework/chat_template/kimi_k3_cpp_template.h"
 
 namespace xllm {
 namespace {
@@ -39,6 +40,28 @@ class ScopedUseCppChatTemplate final {
  private:
   bool old_value_;
 };
+
+TEST(ChatTemplateFactory, KimiK3UsesCppTemplateWhenFlagEnabled) {
+  ScopedUseCppChatTemplate scoped_flag(/*enabled=*/true);
+  TokenizerArgs args;
+  ModelConfig::get_instance().normalize_cpp_chat_template("kimi_k3");
+  ASSERT_TRUE(ModelConfig::get_instance().use_cpp_chat_template());
+  auto impl = ChatTemplate::create(args, /*model_type=*/"kimi_k3");
+  ASSERT_NE(dynamic_cast<KimiK3CppTemplate*>(impl.get()), nullptr);
+  const ChatMessages messages = {
+      Message("user", MMContentVec{MMContent("text", std::string("hello"))})};
+  ASSERT_TRUE(impl->apply(messages).has_value());
+}
+
+TEST(ChatTemplateFactory, KimiK3FallsBackToJinjaWhenFlagDisabled) {
+  ScopedUseCppChatTemplate scoped_flag(/*enabled=*/false);
+  TokenizerArgs args;
+  ModelConfig::get_instance().normalize_cpp_chat_template("kimi_k3");
+  ASSERT_FALSE(ModelConfig::get_instance().use_cpp_chat_template());
+  auto impl = ChatTemplate::create(args, /*model_type=*/"kimi_k3");
+  EXPECT_NE(dynamic_cast<JinjaChatTemplate*>(impl.get()), nullptr);
+  EXPECT_EQ(dynamic_cast<KimiK3CppTemplate*>(impl.get()), nullptr);
+}
 
 TEST(ChatTemplateFactory, DeepseekV32FallsBackToJinjaWhenFlagDisabled) {
   ScopedUseCppChatTemplate scoped_flag(/*enabled=*/false);
@@ -79,11 +102,12 @@ TEST(ChatTemplateFactory, DeepseekV4UsesCppTemplateWhenFlagEnabled) {
   EXPECT_NE(dynamic_cast<DeepseekV4CppTemplate*>(impl.get()), nullptr);
 }
 
-TEST(ChatTemplateFactory, NonDeepseekModelUsesJinjaWhenFlagEnabled) {
+TEST(ChatTemplateFactory, UnsupportedModelUsesJinjaAfterNormalization) {
   ScopedUseCppChatTemplate scoped_flag(/*enabled=*/true);
   TokenizerArgs args;
 
-  ModelConfig::get_instance().use_cpp_chat_template(false);
+  ModelConfig::get_instance().normalize_cpp_chat_template("qwen3");
+  ASSERT_FALSE(ModelConfig::get_instance().use_cpp_chat_template());
   std::unique_ptr<ChatTemplate> impl =
       ChatTemplate::create(args, /*model_type=*/"qwen3");
 

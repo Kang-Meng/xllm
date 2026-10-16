@@ -15,6 +15,7 @@
 """Python model support declared by implementation and platform."""
 
 MODEL_PLATFORM_SUPPORT: dict[str, dict[str, bool]] = {
+    "kimi_k3": {"cuda": False, "npu": True},
     "qwen3": {"cuda": True, "npu": True},
     "qwen3_5": {"cuda": True, "npu": True},
     "qwen3_dflash": {"cuda": False, "npu": True},

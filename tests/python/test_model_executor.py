@@ -914,6 +914,30 @@ class TestModelExecutorConstruction:
         assert first_attention.head_dim == 512
 
     @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+        return_value=StubAttentionBackend(),
+    )
+    def test_hybrid_attention_builds_paged_backend_from_mla(self, mock_backend: MagicMock) -> None:
+        model = _FakeModel(num_layers=2)
+        model.layers[0].attention_kind = "linear"
+        model.layers[1].attention_kind = "mla"
+        model.layers[0].head_dim = 128
+        model.layers[1].head_dim = 512
+        ModelExecutor(model, {"python_graph_backend": "off"}, max_seqs_per_batch=4)
+        assert mock_backend.call_args.args[0] is model.layers[1]
+
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_hybrid_attention_still_validates_mla_configuration(self, mock_backend: MagicMock) -> None:
+        model = _FakeModel(num_layers=3)
+        model.layers[0].attention_kind = "linear"
+        for layer in model.layers[1:]:
+            layer.attention_kind = "mla"
+        model.layers[2].head_dim *= 2
+        with pytest.raises(ValueError, match="identical MLA configuration"):
+            ModelExecutor(model, {"python_graph_backend": "off"}, max_seqs_per_batch=4)
+        mock_backend.assert_not_called()
+
+    @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,
     )

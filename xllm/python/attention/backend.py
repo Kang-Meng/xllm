@@ -317,6 +317,15 @@ class CsaIndexContext:
     qli_metadata: torch.Tensor | None
 
 
+@dataclass(frozen=True)
+class MlaUnabsorbedPrefill:
+    """Expanded MLA projections for a full prefill without cached prefix."""
+
+    query_nope: torch.Tensor
+    key_nope: torch.Tensor
+    value: torch.Tensor
+
+
 class AttentionBackend(ABC):
     def reset_forward(self, metadata: AttentionMetadata | None = None) -> None:
         """Reset request-owned state before a model attaches current inputs."""
@@ -369,6 +378,7 @@ class AttentionBackend(ABC):
         layer: Attention,
         topk: torch.Tensor | None = None,
         cache_is_preprocessed: bool = False,
+        unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
     ) -> torch.Tensor:
         """Absorbed-MLA attention over paged latent (nope) + rope caches.
 
@@ -376,6 +386,10 @@ class AttentionBackend(ABC):
         provided, dispatches to the sparse SFA path driven by an optional
         LightningIndexer; otherwise a dense MLA path is requested. Backends
         that do not implement MLA raise.
+
+        ``unabsorbed_prefill`` explicitly requests expanded K/V for full
+        prefill and returns ``[T, H, value_dim]`` instead; the caller must not
+        apply ``W_UV`` again. Existing callers leave this argument unset.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support MLA")
 
