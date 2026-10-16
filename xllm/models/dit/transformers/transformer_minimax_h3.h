@@ -315,10 +315,12 @@ class H3AttentionImpl final : public torch::nn::Module,
                   int64_t dim_head,
                   double qk_norm_eps,
                   const ModelContext& context,
-                  ProcessGroup* sp_group)
+                  ProcessGroup* sp_group,
+                  bool use_laser_attention)
       : dit::SequenceParallelMixin(/*process_group=*/sp_group),
         dim_head_(dim_head),
-        sp_size_(sp_group == nullptr ? 1 : sp_group->world_size()) {
+        sp_size_(sp_group == nullptr ? 1 : sp_group->world_size()),
+        use_laser_attention_(use_laser_attention) {
     norm_q_ = register_module("norm_q", H3RMSNorm(dim_head, qk_norm_eps));
     norm_k_ = register_module("norm_k", H3RMSNorm(dim_head, qk_norm_eps));
     ProcessGroup* tp_group = context.get_parallel_args().dit_tp_group_;
@@ -429,7 +431,7 @@ class H3AttentionImpl final : public torch::nn::Module,
 #if defined(USE_NPU)
     const int64_t head_num = q.size(1);
     const double scale = std::pow(static_cast<double>(q.size(-1)), -0.5);
-    if (DiTConfig::get_instance().dit_laser_attention_enabled()) {
+    if (use_laser_attention_) {
       out = xllm::kernel::npu::laser_attention(q, k, v, scale, head_num);
     } else {
       const auto results = at_npu::native::custom_ops::npu_fusion_attention_v3(
@@ -492,6 +494,7 @@ class H3AttentionImpl final : public torch::nn::Module,
   int64_t local_heads_;
   int64_t dim_head_;
   int64_t sp_size_;
+  bool use_laser_attention_;
   layer::ColumnParallelLinear to_q_{nullptr};
   layer::ColumnParallelLinear to_k_{nullptr};
   layer::ColumnParallelLinear to_v_{nullptr};
@@ -517,7 +520,8 @@ class H3TokenRefinerBlockImpl final : public torch::nn::Module {
                                         dim_head,
                                         qk_norm_eps,
                                         context,
-                                        /*sp_group=*/nullptr));
+                                        /*sp_group=*/nullptr,
+                                        /*use_laser_attention=*/false));
     norm2_ = register_module("norm2", H3RMSNorm(hidden_size, norm_eps));
     ff_ = register_module("ff",
                           H3SwiGLUFFN(hidden_size, ffn_dim, false, context));
@@ -664,8 +668,13 @@ class H3TransformerBlockImpl final : public torch::nn::Module {
     norm1_ = register_module("norm1", H3RMSNorm(hidden_size, norm_eps));
     attn_ = register_module(
         "attn",
-        H3Attention(
-            hidden_size, heads, dim_head, qk_norm_eps, context, sp_group));
+        H3Attention(hidden_size,
+                    heads,
+                    dim_head,
+                    qk_norm_eps,
+                    context,
+                    sp_group,
+                    DiTConfig::get_instance().dit_laser_attention_enabled()));
     norm2_ = register_module("norm2", H3RMSNorm(hidden_size, norm_eps));
     ff_ = register_module("ff",
                           H3SwiGLUFFN(hidden_size, ffn_dim, false, context));
