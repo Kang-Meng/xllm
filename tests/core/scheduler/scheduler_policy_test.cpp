@@ -586,6 +586,8 @@ TEST(SchedulerPolicyTest,
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(engine.block_manager_pool(),
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -603,6 +605,7 @@ TEST(SchedulerPolicyTest,
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = false,
+      .decode_admission = &decode_admission,
   };
   for (const bool enable_prefix_cache : {false, true}) {
     state.enable_prefix_cache = enable_prefix_cache;
@@ -1003,6 +1006,8 @@ TEST(SchedulerPolicyTest, KvlessCompositeReprobesAfterPartialAllocation) {
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1020,6 +1025,7 @@ TEST(SchedulerPolicyTest, KvlessCompositeReprobesAfterPartialAllocation) {
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
 
   policy.allocate_shared_blocks_for_test(sequence, state);
@@ -1067,6 +1073,8 @@ TEST(SchedulerPolicyTest, UnifiedRetryRefreshesHostRestoreBeforeChunkSizing) {
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1084,6 +1092,7 @@ TEST(SchedulerPolicyTest, UnifiedRetryRefreshesHostRestoreBeforeChunkSizing) {
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget budget{
       .remaining_token_budget = 16384,
@@ -1127,8 +1136,9 @@ TEST(SchedulerPolicyTest, DecodeRestoreRetrySizesChunkAfterHostMatch) {
       .enable_chunked_prefill = true,
       .priority_strategy = "fcfs",
   };
-  DecodeFirstPolicy policy(mode, options);
   RetryRestoreBlockManagerPool block_manager_pool;
+  // Declared after the pool: the policy keeps restored requests alive.
+  DecodeFirstPolicy policy(mode, options);
   std::vector<std::shared_ptr<Request>> requests = generate_request(
       {40001}, {1}, std::nullopt, std::nullopt, /*max_context_len=*/50000);
   Sequence* sequence = requests.front()->sequences().front().get();
@@ -1153,6 +1163,8 @@ TEST(SchedulerPolicyTest, DecodeRestoreRetrySizesChunkAfterHostMatch) {
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1170,6 +1182,7 @@ TEST(SchedulerPolicyTest, DecodeRestoreRetrySizesChunkAfterHostMatch) {
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget budget{
       .remaining_token_budget = kChunkTokens,
@@ -1253,6 +1266,8 @@ TEST_P(AsyncBlockReleasePolicyTest, WaitsWithoutPreemptionThenRetries) {
   bool last_step_prefill = false;
   ModelArgs model_args;
   model_args.layer_types({"linear_attention"});
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1270,6 +1285,7 @@ TEST_P(AsyncBlockReleasePolicyTest, WaitsWithoutPreemptionThenRetries) {
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = false,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget budget{
       .remaining_token_budget = 1024,
@@ -1337,6 +1353,8 @@ TEST(SchedulerPolicyTest, DefersWhileAsyncBlockReleaseIsPending) {
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1354,6 +1372,7 @@ TEST(SchedulerPolicyTest, DefersWhileAsyncBlockReleaseIsPending) {
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget budget{
       .remaining_token_budget = 16384,
@@ -1387,13 +1406,13 @@ TEST(SchedulerPolicyTest,
       .enable_chunked_prefill = true,
       .priority_strategy = "fcfs",
   };
-  PrefillFirstPolicy policy(mode, options);
   RestoreWaitingBlockManagerPool block_manager_pool;
   BlockManagerPool::Options prefix_cache_options;
   prefix_cache_options.num_blocks_ = 4;
   prefix_cache_options.block_size_ = 128;
   prefix_cache_options.max_seqs_per_batch_ = 16;
   BlockManagerPool prefix_cache_pool(prefix_cache_options, /*dp_size=*/1);
+  PrefillFirstPolicy policy(mode, options);
 
   std::vector<std::shared_ptr<Request>> requests =
       generate_request({kPromptTokens},
@@ -1434,6 +1453,8 @@ TEST(SchedulerPolicyTest,
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1451,6 +1472,7 @@ TEST(SchedulerPolicyTest,
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget budget{
       .remaining_token_budget = 16384,
@@ -1527,6 +1549,8 @@ TEST(SchedulerPolicyTest, PendingDecodeReleaseStopsFurtherPreemption) {
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1544,6 +1568,7 @@ TEST(SchedulerPolicyTest, PendingDecodeReleaseStopsFurtherPreemption) {
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget budget{
       .remaining_token_budget = 16384,
@@ -1650,6 +1675,8 @@ TEST(SchedulerPolicyTest, RetriesBlockedDecodeBeforeRestoringVictim) {
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1667,6 +1694,7 @@ TEST(SchedulerPolicyTest, RetriesBlockedDecodeBeforeRestoringVictim) {
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget initial_budget{
       .remaining_token_budget = 16384,
@@ -1752,6 +1780,8 @@ TEST(SchedulerPolicyTest,
   std::vector<size_t> running_sequence_budgets;
   bool last_step_prefill = false;
   ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
   SchedulerState state{
       .prefill_queue = prefill_queue,
       .chunk_queue = chunk_queue,
@@ -1769,6 +1799,7 @@ TEST(SchedulerPolicyTest,
       .options = options,
       .min_speculative_tokens_required = 0,
       .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
   };
   ScheduleBudget initial_budget{
       .remaining_token_budget = 16384,
@@ -2200,6 +2231,472 @@ TEST(SchedulerPolicyTest, FullFootprintAdmitsBothWhenFits) {
   auto batch = scheduler->prepare_batch_test();
   ASSERT_EQ(batch.size(), 1);
   EXPECT_EQ(batch[0].size(), 2);  // Both admitted.
+}
+
+namespace {
+
+// Real block accounting on a backend that permits Host restore. Device prefix
+// caching is off so requests with identical test tokens never share blocks.
+class HostRestoreBlockPool final : public BlockManagerPool {
+ public:
+  HostRestoreBlockPool(int32_t num_blocks, int32_t dp_size)
+      : BlockManagerPool(make_options(num_blocks), dp_size) {}
+
+  bool supports_host_cache_restore() const override { return true; }
+
+ private:
+  static BlockManagerPool::Options make_options(int32_t num_blocks) {
+    BlockManagerPool::Options options;
+    options.num_blocks_ = num_blocks;
+    options.block_size_ = 16;
+    options.max_seqs_per_batch_ = 16;
+    options.enable_prefix_cache_ = false;
+    return options;
+  }
+};
+
+ContinuousScheduler::Options make_restore_options(int32_t token_budget,
+                                                  int32_t dp_size) {
+  ContinuousScheduler::Options options =
+      create_scheduler_options(token_budget,
+                               /*max_seqs_per_batch=*/16,
+                               /*num_speculative_tokens=*/0,
+                               token_budget,
+                               dp_size);
+  options.enable_disagg_pd() = true;
+  options.enable_pd_ooc() = false;
+  options.instance_role() = InstanceRole::DECODE;
+  options.enable_schedule_overlap() = false;
+  return options;
+}
+
+// Owns the queues a policy schedules against across steps.
+class RestoreHarness final {
+ public:
+  RestoreHarness(BlockManagerPool* block_manager_pool,
+                 const ContinuousScheduler::Options& options)
+      : options_(options),
+        admission_(block_manager_pool,
+                   DecodeAdmission::Options{
+                       .dp_size = options.dp_size(),
+                       .reserved_tokens_per_request =
+                           SchedulerConfig::get_instance()
+                               .decode_reserved_tokens_per_request(),
+                   }),
+        state_{
+            .prefill_queue = prefill_queue_,
+            .chunk_queue = chunk_queue_,
+            .decode_queue = decode_queue_,
+            .unified_queue = unified_queue_,
+            .decode_restore_waiting = waiting_,
+            .running_requests = running_requests_,
+            .running_sequences = running_sequences_,
+            .running_sequences_budgets = running_budgets_,
+            .kv_cache_manager = block_manager_pool,
+            .profile_manager = nullptr,
+            .response_processor = nullptr,
+            .model_args = model_args_,
+            .last_step_prefill = last_step_prefill_,
+            .options = options_,
+            .min_speculative_tokens_required = 0,
+            .enable_prefix_cache = true,
+            .decode_admission = &admission_,
+        } {}
+
+  void schedule(SchedulerPolicy& policy, size_t token_budget) {
+    ScheduleBudget budget{
+        .remaining_token_budget = token_budget,
+        .remaining_seq_budget = 16,
+        .latency_budget = std::numeric_limits<double>::max(),
+        .estimate_latency = 0,
+        .num_preempted_requests = 0,
+    };
+    std::vector<std::shared_ptr<Request>> finished;
+    policy.schedule(state_, budget, finished);
+  }
+
+  // Applies the scheduled step: each sequence caches its budget of tokens.
+  void advance() {
+    for (size_t i = 0; i < running_sequences_.size(); ++i) {
+      running_sequences_[i]->kv_state().incr_kv_cache_tokens_num(
+          running_budgets_[i]);
+    }
+  }
+
+  void add_waiter(std::shared_ptr<Request> request) {
+    waiting_.emplace_back(DecodeRestoreEntry{.request = std::move(request),
+                                             .started_at = absl::Now()});
+  }
+
+  SchedulerState& state() { return state_; }
+  DecodeAdmission& admission() { return admission_; }
+  DequeQueue& decode_queue() { return decode_queue_; }
+  DequeQueue& chunk_queue() { return chunk_queue_; }
+  std::deque<DecodeRestoreEntry>& waiting() { return waiting_; }
+  const std::vector<Sequence*>& running_sequences() const {
+    return running_sequences_;
+  }
+
+ private:
+  ContinuousScheduler::Options options_;
+  DecodeAdmission admission_;
+  DequeQueue prefill_queue_;
+  DequeQueue chunk_queue_;
+  DequeQueue decode_queue_;
+  std::list<std::shared_ptr<Request>> unified_queue_;
+  std::deque<DecodeRestoreEntry> waiting_;
+  std::vector<std::shared_ptr<Request>> running_requests_;
+  std::vector<Sequence*> running_sequences_;
+  std::vector<size_t> running_budgets_;
+  bool last_step_prefill_ = false;
+  ModelArgs model_args_;
+  SchedulerState state_;
+};
+
+// A preempted decode: one generated token, no blocks, waiting for restore.
+std::shared_ptr<Request> make_restore_waiter(int32_t prompt_len,
+                                             int32_t max_tokens,
+                                             int32_t dp_rank) {
+  std::shared_ptr<Request> request = generate_request({prompt_len},
+                                                      {max_tokens},
+                                                      std::nullopt,
+                                                      std::nullopt,
+                                                      /*max_context_len=*/4096)
+                                         .front();
+  Sequence* sequence = request->sequences().front().get();
+  sequence->kv_state().set_kv_cache_tokens_num(prompt_len);
+  sequence->append_token(Token(1));
+  sequence->reset();
+  sequence->set_dp_rank(dp_rank);
+  request->set_preempted();
+  return request;
+}
+
+// A decode-stage request holding device blocks for its prompt.
+std::shared_ptr<Request> make_running_decode(BlockManagerPool& pool,
+                                             int32_t prompt_len,
+                                             int32_t max_tokens,
+                                             int32_t dp_rank) {
+  std::shared_ptr<Request> request = generate_request({prompt_len},
+                                                      {max_tokens},
+                                                      std::nullopt,
+                                                      std::nullopt,
+                                                      /*max_context_len=*/4096)
+                                         .front();
+  Sequence* sequence = request->sequences().front().get();
+  sequence->set_dp_rank(dp_rank);
+  EXPECT_TRUE(pool.BlockManagerPool::allocate(sequence, prompt_len));
+  sequence->kv_state().set_kv_cache_tokens_num(prompt_len);
+  sequence->append_token(Token(1));
+  return request;
+}
+
+// Holds `num_blocks` device blocks on `dp_rank` outside the scheduler, like a
+// PD reservation whose KV is still in transfer.
+std::shared_ptr<Request> hold_blocks(BlockManagerPool& pool,
+                                     int32_t num_blocks,
+                                     int32_t dp_rank) {
+  std::shared_ptr<Request> request = generate_request({num_blocks * 16},
+                                                      {1},
+                                                      std::nullopt,
+                                                      std::nullopt,
+                                                      /*max_context_len=*/4096)
+                                         .front();
+  Sequence* sequence = request->sequences().front().get();
+  sequence->set_dp_rank(dp_rank);
+  EXPECT_TRUE(pool.BlockManagerPool::allocate(sequence, num_blocks * 16));
+  return request;
+}
+
+BatchMode decode_first_mode() {
+  return BatchMode{.enable_mix_batch = true,
+                   .enable_chunked_prefill = true,
+                   .priority_strategy = "fcfs"};
+}
+
+class HostRestoreConfig final {
+ private:
+  ScopedConfigValue<double> host_blocks_factor_{
+      KVCacheStoreConfig::get_instance().host_blocks_factor(),
+      2.0};
+  ScopedConfigValue<int32_t> reserved_tokens_{
+      SchedulerConfig::get_instance().decode_reserved_tokens_per_request(),
+      0};
+};
+
+}  // namespace
+
+TEST(DecodeRestoreTest, BatchesRestoresAlongsideRunningDecodes) {
+  HostRestoreConfig config;
+  HostRestoreBlockPool pool(/*num_blocks=*/64, /*dp_size=*/1);
+  ContinuousScheduler::Options options =
+      make_restore_options(/*token_budget=*/256, /*dp_size=*/1);
+  DecodeFirstPolicy policy(decode_first_mode(), options);
+  RestoreHarness harness(&pool, options);
+  auto decode = make_running_decode(pool, 32, 64, /*dp_rank=*/0);
+  harness.decode_queue().push(decode);
+  std::vector<std::shared_ptr<Request>> waiters;
+  for (int32_t i = 0; i < 3; ++i) {
+    waiters.emplace_back(make_restore_waiter(32, 8, /*dp_rank=*/0));
+    harness.add_waiter(waiters.back());
+  }
+
+  harness.schedule(policy, 256);
+
+  EXPECT_EQ(harness.running_sequences(),
+            (std::vector<Sequence*>{decode->sequences()[0].get(),
+                                    waiters[0]->sequences()[0].get(),
+                                    waiters[1]->sequences()[0].get(),
+                                    waiters[2]->sequences()[0].get()}));
+  EXPECT_TRUE(harness.waiting().empty());
+  // Restores are still in prefill stage, so admission stays closed.
+  EXPECT_TRUE(harness.admission().paused());
+
+  harness.advance();
+  harness.schedule(policy, 256);
+
+  EXPECT_EQ(harness.running_sequences().size(), 4u);
+  EXPECT_FALSE(harness.admission().paused());
+}
+
+TEST(DecodeRestoreTest, PerRankFifoDoesNotBlockOtherRank) {
+  HostRestoreConfig config;
+  HostRestoreBlockPool pool(/*num_blocks=*/6, /*dp_size=*/2);
+  ContinuousScheduler::Options options =
+      make_restore_options(/*token_budget=*/256, /*dp_size=*/2);
+  DecodeFirstPolicy policy(decode_first_mode(), options);
+  RestoreHarness harness(&pool, options);
+  auto decode = make_running_decode(pool, 48, 64, /*dp_rank=*/0);
+  harness.decode_queue().push(decode);
+  auto blocked = make_restore_waiter(32, 8, /*dp_rank=*/0);
+  auto other = make_restore_waiter(32, 8, /*dp_rank=*/1);
+  harness.add_waiter(blocked);
+  harness.add_waiter(other);
+
+  harness.schedule(policy, 256);
+
+  // Rank 0 has one free block left after the decode grows; the rank-1 waiter
+  // behind the blocked head still restores in the same step.
+  EXPECT_EQ(harness.running_sequences(),
+            (std::vector<Sequence*>{decode->sequences()[0].get(),
+                                    other->sequences()[0].get()}));
+  ASSERT_EQ(harness.waiting().size(), 1u);
+  EXPECT_EQ(harness.waiting().front().request, blocked);
+  EXPECT_FALSE(blocked->sequences()[0]->kv_state().has_any_blocks());
+}
+
+TEST(DecodeRestoreTest, RestoreKeepsDecodeReserve) {
+  for (int32_t reserved_tokens : {0, 96}) {
+    HostRestoreConfig config;
+    ScopedConfigValue<int32_t> reserve(
+        SchedulerConfig::get_instance().decode_reserved_tokens_per_request(),
+        reserved_tokens);
+    HostRestoreBlockPool pool(/*num_blocks=*/11, /*dp_size=*/1);
+    ContinuousScheduler::Options options =
+        make_restore_options(/*token_budget=*/256, /*dp_size=*/1);
+    DecodeFirstPolicy policy(decode_first_mode(), options);
+    RestoreHarness harness(&pool, options);
+    auto decode = make_running_decode(pool, 32, 64, /*dp_rank=*/0);
+    harness.decode_queue().push(decode);
+    auto waiter = make_restore_waiter(32, 8, /*dp_rank=*/0);
+    harness.add_waiter(waiter);
+
+    harness.schedule(policy, 256);
+
+    // 7 free blocks: the waiter needs 3 for its tokens, plus 1 of its own
+    // reserve and 4 for the running decode when the reserve is enabled.
+    EXPECT_EQ(harness.waiting().empty(), reserved_tokens == 0)
+        << "reserved_tokens=" << reserved_tokens;
+  }
+}
+
+TEST(DecodeRestoreTest, PreemptedInflightRestoreReturnsToQueueFront) {
+  HostRestoreConfig config;
+  HostRestoreBlockPool pool(/*num_blocks=*/8, /*dp_size=*/1);
+  ContinuousScheduler::Options options =
+      make_restore_options(/*token_budget=*/17, /*dp_size=*/1);
+  options.max_tokens_per_chunk_for_prefill() = 16;
+  DecodeFirstPolicy policy(decode_first_mode(), options);
+  RestoreHarness harness(&pool, options);
+  auto decode = make_running_decode(pool, 47, 64, /*dp_rank=*/0);
+  harness.decode_queue().push(decode);
+  auto inflight = make_restore_waiter(48, 8, /*dp_rank=*/0);
+  harness.add_waiter(inflight);
+
+  harness.schedule(policy, 17);
+  ASSERT_EQ(harness.running_sequences().size(), 2u);
+  ASSERT_EQ(harness.running_sequences()[1], inflight->sequences()[0].get());
+  harness.advance();
+  ASSERT_TRUE(inflight->sequences()[0]->is_chunked_prefill_stage());
+
+  // The decode crosses into a new block while every free block is held.
+  decode->sequences()[0]->append_token(Token(2));
+  const int32_t free_blocks = static_cast<int32_t>(pool.num_free_blocks()[0]);
+  ASSERT_GT(free_blocks, 0);
+  auto held = hold_blocks(pool, free_blocks, /*dp_rank=*/0);
+  auto later = make_restore_waiter(32, 8, /*dp_rank=*/0);
+  harness.add_waiter(later);
+  harness.schedule(policy, 17);
+
+  EXPECT_EQ(harness.running_sequences(),
+            (std::vector<Sequence*>{decode->sequences()[0].get()}));
+  ASSERT_EQ(harness.waiting().size(), 2u);
+  EXPECT_EQ(harness.waiting()[0].request, inflight);
+  EXPECT_EQ(harness.waiting()[1].request, later);
+  EXPECT_TRUE(inflight->preempted());
+  EXPECT_FALSE(inflight->sequences()[0]->kv_state().has_any_blocks());
+  EXPECT_TRUE(harness.chunk_queue().empty());
+}
+
+TEST(DecodeRestoreTest, PrefillFirstContinuesInflightRestoreFirst) {
+  HostRestoreConfig config;
+  HostRestoreBlockPool pool(/*num_blocks=*/32, /*dp_size=*/1);
+  ContinuousScheduler::Options options =
+      make_restore_options(/*token_budget=*/16, /*dp_size=*/1);
+  options.max_tokens_per_chunk_for_prefill() = 16;
+  BatchMode mode{.enable_mix_batch = false,
+                 .enable_chunked_prefill = true,
+                 .priority_strategy = "fcfs"};
+  PrefillFirstPolicy policy(mode, options);
+  RestoreHarness harness(&pool, options);
+  auto first = make_restore_waiter(48, 8, /*dp_rank=*/0);
+  harness.add_waiter(first);
+  harness.schedule(policy, 16);
+  ASSERT_EQ(harness.running_sequences(),
+            (std::vector<Sequence*>{first->sequences()[0].get()}));
+  harness.advance();
+  auto next = make_restore_waiter(32, 8, /*dp_rank=*/0);
+  harness.add_waiter(next);
+
+  harness.schedule(policy, 16);
+
+  EXPECT_EQ(harness.running_sequences(),
+            (std::vector<Sequence*>{first->sequences()[0].get()}));
+  ASSERT_EQ(harness.waiting().size(), 1u);
+  EXPECT_EQ(harness.waiting().front().request, next);
+}
+
+TEST(DecodeRestoreTest, ServedBlockedDecodeNoLongerHoldsRestore) {
+  HostRestoreConfig config;
+  HostRestoreBlockPool pool(/*num_blocks=*/8, /*dp_size=*/1);
+  ContinuousScheduler::Options options =
+      make_restore_options(/*token_budget=*/256, /*dp_size=*/1);
+  BatchMode mode{.enable_mix_batch = false,
+                 .enable_chunked_prefill = true,
+                 .priority_strategy = "fcfs"};
+  PrefillFirstPolicy policy(mode, options);
+  RestoreHarness harness(&pool, options);
+  // `first` crosses into a third block; `victim` still fits in two.
+  auto first = make_running_decode(pool, 32, 64, /*dp_rank=*/0);
+  auto victim = make_running_decode(pool, 31, 64, /*dp_rank=*/0);
+  // push() inserts at the head: `first` is scheduled first, `victim` is the
+  // preemption candidate at the back.
+  harness.decode_queue().push(victim);
+  harness.decode_queue().push(first);
+  const int32_t free_blocks = static_cast<int32_t>(pool.num_free_blocks()[0]);
+  auto held = hold_blocks(pool, free_blocks, /*dp_rank=*/0);
+
+  harness.schedule(policy, 256);
+  ASSERT_EQ(harness.running_sequences(),
+            (std::vector<Sequence*>{first->sequences()[0].get()}));
+  ASSERT_EQ(harness.waiting().size(), 1u);
+  harness.advance();
+
+  // `first` got its block by preempting `victim`, so once room frees up the
+  // restore no longer waits behind it.
+  pool.deallocate(held.get());
+  harness.schedule(policy, 256);
+
+  EXPECT_EQ(harness.running_sequences(),
+            (std::vector<Sequence*>{victim->sequences()[0].get()}));
+  EXPECT_TRUE(harness.waiting().empty());
+}
+
+TEST(DecodeRestoreTest, ComputesDecodeRankLoad) {
+  HostRestoreBlockPool pool(/*num_blocks=*/32, /*dp_size=*/2);
+  ContinuousScheduler::Options options =
+      make_restore_options(/*token_budget=*/256, /*dp_size=*/2);
+  RestoreHarness harness(&pool, options);
+  // 63 tokens left, capped at 20: 2 blocks.
+  harness.decode_queue().push(make_running_decode(pool, 32, 64, 0));
+  // 1 token left: 1 block.
+  harness.decode_queue().push(make_running_decode(pool, 32, 2, 1));
+  // In-flight restore on rank 1 holding 1 of its 4 blocks: 3 blocks to grow
+  // plus min(20, 7) reserved tokens in 1 block.
+  auto inflight = make_restore_waiter(48, 8, /*dp_rank=*/1);
+  ASSERT_TRUE(
+      pool.BlockManagerPool::allocate(inflight->sequences()[0].get(), 16));
+  inflight->sequences()[0]->kv_state().set_kv_cache_tokens_num(16);
+  harness.chunk_queue().push(inflight);
+
+  const DecodeRankLoad load = compute_decode_rank_load(harness.state(), 20);
+  EXPECT_EQ(load.reserved_blocks, (std::vector<size_t>{2, 5}));
+  EXPECT_EQ(load.num_requests, (std::vector<size_t>{1, 2}));
+  EXPECT_EQ(load.requests.size(), 3u);
+  EXPECT_EQ(compute_decode_rank_load(harness.state(), 0).reserved_blocks,
+            (std::vector<size_t>{0, 3}));
+}
+
+TEST(DecodeRestoreTest, PrefillHandoffKeepsGrowthReserve) {
+  ScopedConfigValue<int32_t> reserve_guard(
+      SchedulerConfig::get_instance().decode_reserved_tokens_per_request(), 16);
+  HostRestoreBlockPool pool(/*num_blocks=*/8, /*dp_size=*/1);
+  RestoreHarness harness(
+      &pool, make_restore_options(/*token_budget=*/256, /*dp_size=*/1));
+  auto request = generate_request({32},
+                                  {32},
+                                  std::nullopt,
+                                  std::nullopt,
+                                  /*max_context_len=*/4096)
+                     .front();
+  Sequence* sequence = request->sequences().front().get();
+  sequence->set_dp_rank(0);
+  ASSERT_EQ(harness.admission().admit(request),
+            DecodeAdmissionResult::ADMITTED);
+
+  // The request retains its prompt allocation while it needs local prefill.
+  sequence->kv_state().set_kv_cache_tokens_num(16);
+  ASSERT_TRUE(sequence->is_prefill_stage());
+  ASSERT_FALSE(request->preempted());
+  for (int32_t phase = 0; phase < 3; ++phase) {
+    SCOPED_TRACE(phase);
+    if (phase == 1) {
+      harness.chunk_queue().push(request);
+    }
+    if (phase == 2) {
+      harness.chunk_queue().pop_top();
+      sequence->kv_state().set_kv_cache_tokens_num(32);
+      sequence->append_token(Token(/*token_id=*/1));
+      ASSERT_FALSE(sequence->is_prefill_stage());
+      harness.decode_queue().push(request);
+    }
+    const DecodeRankLoad load = compute_decode_rank_load(harness.state(), 16);
+    harness.admission().publish(load);
+    EXPECT_EQ(load.reserved_blocks[0], phase == 0 ? 0u : 1u);
+    EXPECT_EQ(harness.admission().unscheduled_reserve_blocks(load)[0],
+              phase == 0 ? 1u : 0u);
+
+    // Seven usable blocks: two held, one reserved. A four-block arrival
+    // with its own reserve cannot fit; a three-block arrival fits exactly.
+    for (int32_t prompt_tokens : {64, 48}) {
+      auto probe = generate_request({prompt_tokens},
+                                    {32},
+                                    std::nullopt,
+                                    std::nullopt,
+                                    /*max_context_len=*/4096)
+                       .front();
+      probe->sequences().front()->set_dp_rank(0);
+      const DecodeAdmissionResult result = harness.admission().admit(probe);
+      EXPECT_EQ(result,
+                prompt_tokens == 64 ? DecodeAdmissionResult::RETRY_LATER
+                                    : DecodeAdmissionResult::ADMITTED);
+      pool.deallocate_without_cache(probe->sequences().front().get());
+      probe.reset();
+      harness.admission().publish(load);
+      EXPECT_EQ(pool.num_used_blocks()[0], 2u);
+    }
+  }
+  pool.deallocate_without_cache(sequence);
 }
 
 }  // namespace xllm

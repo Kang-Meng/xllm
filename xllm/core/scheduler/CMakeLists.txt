@@ -8,6 +8,7 @@ cc_library(
     scheduler
   HDRS
     scheduler_policy.h
+    decode_admission.h
     zero_eviction_scheduler.h
     continuous_scheduler.h
     disagg_pd_scheduler.h
@@ -21,6 +22,7 @@ cc_library(
     fixed_steps_scheduler.h
   SRCS
     scheduler_policy.cpp
+    decode_admission.cpp
     prefill_first_policy.cpp
     decode_first_policy.cpp
     unified_policy.cpp

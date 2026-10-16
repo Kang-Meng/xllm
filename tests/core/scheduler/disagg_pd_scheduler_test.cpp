@@ -969,7 +969,7 @@ TEST(DisaggPDSchedulerTest, TemporaryDecodeBlockPressureIsNotPermanent) {
   std::shared_ptr<Request> request = make_request({7, 8});
   Sequence* sequence = request->sequences()[0].get();
 
-  EXPECT_FALSE(scheduler.try_allocate(sequence));
+  EXPECT_EQ(scheduler.try_admit(request), DecodeAdmissionResult::REJECTED);
   EXPECT_FALSE(scheduler.exceeds_decode_capacity(sequence));
 
   block_manager->deallocate(holder.get());
@@ -982,7 +982,7 @@ TEST(DisaggPDSchedulerTest, OversizedDecodePromptIsPermanent) {
   std::shared_ptr<Request> request = make_request({1, 2, 3, 4, 5, 6, 7});
   Sequence* sequence = request->sequences()[0].get();
 
-  EXPECT_FALSE(scheduler.try_allocate(sequence));
+  EXPECT_EQ(scheduler.try_admit(request), DecodeAdmissionResult::REJECTED);
   EXPECT_TRUE(scheduler.exceeds_decode_capacity(sequence));
 
   block_manager->deallocate(request.get());
@@ -1119,7 +1119,7 @@ TEST(DisaggPDSchedulerTest, LocalFailureReturnsDecodeReservation) {
   auto remote = make_request({1, 2, 3, 4, 5, 6, 7, 8});
   auto* pool = decode_engine.block_manager_pool();
   const auto free_before = pool->num_free_blocks();
-  ASSERT_TRUE(decode.try_allocate(remote->sequences()[0].get()));
+  ASSERT_EQ(decode.try_admit(remote), DecodeAdmissionResult::ADMITTED);
   remote->state().pd_reservation_id = "reservation";
   ASSERT_TRUE(decode.decode_schedule(remote, "prefill"));
   ASSERT_GE(remote->sequences()[0]->get_embedding_block_id(), 0);
@@ -1160,11 +1160,11 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   TestDisaggPDScheduler decode(&decode_engine, make_decode_options());
   auto remote_failed = make_request({1, 2, 3, 4, 5, 6, 7, 8}, "failed");
   remote_failed->state().pd_reservation_id = "failed-reservation";
-  ASSERT_TRUE(decode.try_allocate(remote_failed->sequences()[0].get()));
+  ASSERT_EQ(decode.try_admit(remote_failed), DecodeAdmissionResult::ADMITTED);
   ASSERT_TRUE(decode.decode_schedule(remote_failed, "prefill"));
   auto remote_healthy = make_request({11, 12}, "healthy");
   remote_healthy->state().stream = true;
-  ASSERT_TRUE(decode.try_allocate(remote_healthy->sequences()[0].get()));
+  ASSERT_EQ(decode.try_admit(remote_healthy), DecodeAdmissionResult::ADMITTED);
   ASSERT_TRUE(decode.decode_schedule(remote_healthy, "prefill"));
 
   DelayedReservationService service(&decode);
@@ -1259,7 +1259,7 @@ class ReservationTest : public ::testing::Test {
       const std::string& identity = "reservation") {
     auto request = make_request({1, 2, 3, 4, 5, 6, 7, 8}, id);
     request->state().pd_reservation_id = identity;
-    CHECK(decode_.try_allocate(request->sequences()[0].get()));
+    CHECK(decode_.try_admit(request) == DecodeAdmissionResult::ADMITTED);
     CHECK(decode_.decode_schedule(request, "prefill"));
     return request;
   }
@@ -1410,7 +1410,7 @@ TEST_F(ReservationTest, ReleasePreservesValidPrefixOnly) {
   auto request = make_request({1, 2, 3, 4, 5, 6, 7, 8});
   request->state().pd_reservation_id = "reservation";
   request->sequences()[0]->set_dp_rank(dp_rank);
-  ASSERT_TRUE(decode_.try_allocate(request->sequences()[0].get()));
+  ASSERT_EQ(decode_.try_admit(request), DecodeAdmissionResult::ADMITTED);
   ASSERT_EQ(
       request->sequences()[0]->kv_state().shared_blocks_num(BlockType::KV), 2u);
   ASSERT_TRUE(decode_.decode_schedule(request, "prefill"));
@@ -1429,7 +1429,7 @@ TEST_F(ReservationTest, RejectedAllocationRollsBackWithoutReservation) {
   auto* pool = engine_.block_manager_pool();
   const auto free_before = pool->num_free_blocks();
   auto rejected = make_request(std::vector<int32_t>(40, 1));
-  EXPECT_FALSE(decode_.try_allocate(rejected->sequences()[0].get()));
+  EXPECT_NE(decode_.try_admit(rejected), DecodeAdmissionResult::ADMITTED);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
   EXPECT_EQ(pool->num_used_blocks(), (std::vector<size_t>{0, 0}));
   EXPECT_EQ(rejected->sequences()[0]->get_embedding_block_id(), -1);
@@ -1529,7 +1529,7 @@ TEST_F(ReservationTest, DuplicateAdmissionRollsBackUncomputedResources) {
   auto original = reserve();
   auto duplicate = make_request({11, 12, 13, 14});
   duplicate->state().pd_reservation_id = "duplicate";
-  ASSERT_TRUE(decode_.try_allocate(duplicate->sequences()[0].get()));
+  ASSERT_EQ(decode_.try_admit(duplicate), DecodeAdmissionResult::ADMITTED);
   BlockManager* embedding = duplicate->sequences()[0]
                                 ->kv_state()
                                 .blocks(BlockType::EMBEDDING)[0]
@@ -1552,12 +1552,12 @@ TEST(DisaggPDSchedulerTest, MtpExhaustionRollsBackKvReservation) {
   TestDisaggPDScheduler decode(&engine, make_mtp_decode_options());
   auto original = make_request({1, 2, 3, 4});
   original->state().pd_reservation_id = "reservation";
-  ASSERT_TRUE(decode.try_allocate(original->sequences()[0].get()));
+  ASSERT_EQ(decode.try_admit(original), DecodeAdmissionResult::ADMITTED);
   ASSERT_TRUE(decode.decode_schedule(original, "prefill"));
   auto* pool = engine.block_manager_pool();
   const auto free_before = pool->num_free_blocks();
   auto rejected = make_request({11, 12, 13, 14}, "rejected");
-  EXPECT_FALSE(decode.try_allocate(rejected->sequences()[0].get()));
+  EXPECT_NE(decode.try_admit(rejected), DecodeAdmissionResult::ADMITTED);
   EXPECT_EQ(rejected->sequences()[0]->get_embedding_block_id(), -1);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
   EXPECT_EQ(pool->num_used_blocks()[0], 2u);

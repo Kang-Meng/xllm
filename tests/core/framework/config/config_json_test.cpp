@@ -468,6 +468,7 @@ TEST(ConfigJsonTest, LoadJsonFileReadsConfigFixture) {
   EXPECT_TRUE(scheduler_config.enable_schedule_overlap());
   EXPECT_DOUBLE_EQ(scheduler_config.prefill_scheduling_memory_usage_threshold(),
                    0.75);
+  EXPECT_EQ(scheduler_config.decode_reserved_tokens_per_request(), 256);
   EXPECT_FALSE(scheduler_config.enable_chunked_prefill());
   EXPECT_EQ(scheduler_config.max_tokens_per_chunk_for_prefill(), 512);
   EXPECT_EQ(scheduler_config.chunked_match_frequency(), 3);

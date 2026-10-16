@@ -92,6 +92,17 @@ size_t get_sequence_free_blocks_for_rank(KVCacheManager* kv_cache_manager,
   return util::max(free_blocks);
 }
 
+// Blocks a prefill-stage sequence (e.g. an in-flight host restore) still
+// needs to reach its full length.
+size_t missing_footprint_blocks(Sequence& sequence, size_t block_size) {
+  if (!sequence.is_prefill_stage()) {
+    return 0;
+  }
+  const size_t footprint = util::ceil_div(sequence.num_tokens(), block_size);
+  const size_t held = sequence.kv_state().num_blocks(BlockType::KV);
+  return footprint > held ? footprint - held : 0;
+}
+
 void restore_skipped_requests(
     RequestPriorityQueue* queue,
     const std::vector<std::shared_ptr<Request>>& skipped) {
@@ -486,30 +497,20 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
                                            size_t* actual_tokens,
                                            SchedulerState& state,
                                            bool skip_shared) {
-  if (!batch_mode_.enable_chunked_prefill) {
-    // Full prefill: match prefix cache first.
-    if (!skip_shared) {
-      allocate_shared_blocks_for(seq, state);
-    }
-    // Full prefill: allocate for full prompt.
-    *actual_tokens = seq->num_need_compute_tokens();
-    const size_t target = seq->kv_cache_tokens_num() + *actual_tokens;
-    return state.kv_cache_manager->allocate(seq, target);
-  }
-
-  // Chunked prefill: allocate shared blocks first (skip during redistribution
-  // to avoid matching a sequence's own in-batch-published blocks).
   if (!skip_shared) {
     allocate_shared_blocks_for(seq, state);
   }
-
-  const size_t kv_cache_tokens_num = seq->kv_cache_tokens_num();
-  const size_t max_handle_num_tokens =
-      std::min(kv_cache_tokens_num + token_budget, seq->num_tokens());
-
-  CHECK_GT(max_handle_num_tokens, kv_cache_tokens_num);
-  *actual_tokens = max_handle_num_tokens - kv_cache_tokens_num;
-  return state.kv_cache_manager->allocate(seq, max_handle_num_tokens);
+  const size_t cached_tokens = seq->kv_cache_tokens_num();
+  size_t target_tokens = 0;
+  if (!batch_mode_.enable_chunked_prefill) {
+    *actual_tokens = seq->num_need_compute_tokens();
+    target_tokens = cached_tokens + *actual_tokens;
+  } else {
+    target_tokens = std::min(cached_tokens + token_budget, seq->num_tokens());
+    CHECK_GT(target_tokens, cached_tokens);
+    *actual_tokens = target_tokens - cached_tokens;
+  }
+  return state.kv_cache_manager->allocate(seq, target_tokens);
 }
 
 void SchedulerPolicy::allocate_shared_blocks_for(Sequence* seq,
@@ -554,31 +555,244 @@ void SchedulerPolicy::allocate_shared_blocks_for(Sequence* seq,
   }
 }
 
+DecodeRankLoad compute_decode_rank_load(const SchedulerState& state,
+                                        int32_t reserved_tokens) {
+  const size_t dp_size =
+      static_cast<size_t>(std::max(state.options.dp_size(), 1));
+  DecodeRankLoad load{.reserved_blocks = std::vector<size_t>(dp_size, 0),
+                      .num_requests = std::vector<size_t>(dp_size, 0)};
+  const size_t block_size =
+      static_cast<size_t>(state.kv_cache_manager->block_size());
+  auto add_request = [&](const std::shared_ptr<Request>& request) {
+    if (request == nullptr || request->sequences().empty()) {
+      return;
+    }
+    load.requests.insert(request.get());
+    const int32_t dp_rank = request->sequences()[0]->dp_rank();
+    if (request->finished() || request->cancelled() || dp_rank < 0 ||
+        static_cast<size_t>(dp_rank) >= dp_size) {
+      return;
+    }
+    ++load.num_requests[dp_rank];
+    for (const auto& sequence : request->sequences()) {
+      if (sequence->finished()) {
+        continue;
+      }
+      load.reserved_blocks[dp_rank] +=
+          decode_reserve_blocks(*sequence, reserved_tokens, block_size) +
+          missing_footprint_blocks(*sequence, block_size);
+    }
+  };
+  for (const auto& request : state.running_requests) {
+    add_request(request);
+  }
+  for (auto it = state.decode_queue.begin(); it != state.decode_queue.end();
+       ++it) {
+    add_request(*it);
+  }
+  for (auto it = state.chunk_queue.begin(); it != state.chunk_queue.end();
+       ++it) {
+    add_request(*it);
+  }
+  // Restore waiters hold no device blocks; they are only owned.
+  for (const DecodeRestoreEntry& entry : state.decode_restore_waiting) {
+    load.requests.insert(entry.request.get());
+  }
+  return load;
+}
+
+void SchedulerPolicy::publish_decode_load(const SchedulerState& state) {
+  DecodeAdmission* admission = state.decode_admission;
+  if (admission == nullptr || admission->reserved_tokens_per_request() <= 0) {
+    return;
+  }
+  admission->publish(compute_decode_rank_load(
+      state, admission->reserved_tokens_per_request()));
+}
+
+void SchedulerPolicy::maybe_reopen_decode_admission(SchedulerState& state) {
+  if (!state.decode_restore_waiting.empty() || !inflight_restores_.empty() ||
+      state.kv_cache_manager->has_pending_async_block_release()) {
+    return;
+  }
+  state.decode_admission->reopen();
+}
+
+void SchedulerPolicy::prune_inflight_restores() {
+  inflight_restores_.erase(
+      std::remove_if(inflight_restores_.begin(),
+                     inflight_restores_.end(),
+                     [](const std::shared_ptr<Request>& request) {
+                       return request->finished() || request->cancelled() ||
+                              !request->sequences()[0]->is_prefill_stage();
+                     }),
+      inflight_restores_.end());
+}
+
+bool SchedulerPolicy::is_inflight_restore(const Request* request) const {
+  return std::any_of(inflight_restores_.begin(),
+                     inflight_restores_.end(),
+                     [request](const std::shared_ptr<Request>& inflight) {
+                       return inflight.get() == request;
+                     });
+}
+
+void SchedulerPolicy::forget_inflight_restore(const Request* request) {
+  inflight_restores_.erase(
+      std::remove_if(inflight_restores_.begin(),
+                     inflight_restores_.end(),
+                     [request](const std::shared_ptr<Request>& inflight) {
+                       return inflight.get() == request;
+                     }),
+      inflight_restores_.end());
+}
+
+void SchedulerPolicy::requeue_preempted(const std::shared_ptr<Request>& request,
+                                        SchedulerState& state) {
+  const bool inflight = is_inflight_restore(request.get());
+  forget_inflight_restore(request.get());
+  enqueue_decode_restore(request, state, /*to_front=*/inflight);
+}
+
+void SchedulerPolicy::fail_decode_restore(std::shared_ptr<Request> request,
+                                          absl::Time started_at,
+                                          SchedulerState& state) {
+  LOG(WARNING) << "Decode restore failed, request_id=" << request->request_id()
+               << ", dp=" << request->sequences()[0]->dp_rank()
+               << ", tokens=" << request->sequences()[0]->num_tokens()
+               << ", waiting_seconds="
+               << absl::ToDoubleSeconds(absl::Now() - started_at);
+  forget_inflight_restore(request.get());
+  clear_mtp_bootstrap(request.get(), state);
+  state.kv_cache_manager->deallocate(request.get());
+  state.response_processor->process_failed_request(
+      std::move(request),
+      {StatusCode::RESOURCE_EXHAUSTED,
+       "Insufficient device KV cache to restore preempted decode request"});
+}
+
+bool SchedulerPolicy::has_blocked_decode(const SchedulerState& state) const {
+  const std::shared_ptr<Request> blocked = blocked_decode_.lock();
+  if (blocked == nullptr || blocked->finished() || blocked->cancelled()) {
+    return false;
+  }
+  for (auto it = state.decode_queue.begin(); it != state.decode_queue.end();
+       ++it) {
+    if (*it == blocked) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void SchedulerPolicy::schedule_decode_restore(SchedulerState& state,
                                               ScheduleBudget& budget) {
-  if (state.decode_restore_waiting.empty() ||
-      state.kv_cache_manager->has_pending_async_block_release() ||
-      budget_exhausted(budget)) {
+  prune_inflight_restores();
+  DecodeAdmission* admission = state.decode_admission;
+  if (admission == nullptr) {
+    return;
+  }
+  auto& waiting = state.decode_restore_waiting;
+  if (waiting.empty()) {
+    maybe_reopen_decode_admission(state);
+    return;
+  }
+  admission->pause();
+  // Blocks freed by a preemption belong to the decode that needed them; a
+  // restore only starts once that decode has been served.
+  if (state.kv_cache_manager->has_pending_async_block_release() ||
+      has_blocked_decode(state) || budget.num_preempted_requests > 0) {
     return;
   }
 
-  DecodeRestoreEntry& entry = state.decode_restore_waiting.front();
-  const std::shared_ptr<Request>& request = entry.request;
-  CHECK(request != nullptr);
+  // Committed blocks per rank: the scheduled load plus the reserve of
+  // admitted requests whose KV is still in transfer.
+  DecodeRankLoad load =
+      compute_decode_rank_load(state, admission->reserved_tokens_per_request());
+  const std::vector<size_t> unscheduled =
+      admission->unscheduled_reserve_blocks(load);
+  CHECK_EQ(unscheduled.size(), load.reserved_blocks.size());
+  for (size_t rank = 0; rank < unscheduled.size(); ++rank) {
+    load.reserved_blocks[rank] += unscheduled[rank];
+  }
+  const std::vector<size_t> used_blocks =
+      state.kv_cache_manager->num_used_blocks();
+  std::vector<bool> rank_blocked(load.reserved_blocks.size(), false);
+
+  size_t num_restored = 0;
+  for (auto it = waiting.begin();
+       it != waiting.end() && !budget_exhausted(budget);) {
+    Sequence* sequence = it->request->sequences().front().get();
+    if (sequence->dp_rank() < 0) {
+      // Never allocated (no host copy to tie it to a rank): place it like a
+      // fresh sequence.
+      sequence->set_dp_rank(state.kv_cache_manager->select_dp_rank());
+    }
+    const int32_t dp_rank = sequence->dp_rank();
+    CHECK(dp_rank >= 0 && static_cast<size_t>(dp_rank) < rank_blocked.size())
+        << "restore dp_rank=" << dp_rank << " out of range";
+    if (rank_blocked[dp_rank]) {
+      ++it;
+      continue;
+    }
+    // Nothing else holds blocks on an idle rank, so no future release can
+    // make room for a request that does not fit now.
+    const bool rank_idle =
+        used_blocks[dp_rank] == 0 && load.num_requests[dp_rank] == 0;
+    const RestoreOutcome outcome =
+        try_restore(it->request, rank_idle, load, state, budget);
+    if (outcome == RestoreOutcome::OUT_OF_BUDGET) {
+      break;
+    }
+    if (outcome == RestoreOutcome::RESTORED) {
+      it = waiting.erase(it);
+      ++num_restored;
+      continue;
+    }
+    rank_blocked[dp_rank] = true;
+    if (!rank_idle) {
+      ++it;
+      continue;
+    }
+    std::shared_ptr<Request> request = std::move(it->request);
+    const absl::Time started_at = it->started_at;
+    it = waiting.erase(it);
+    fail_decode_restore(std::move(request), started_at, state);
+  }
+  if (num_restored > 0) {
+    LOG(INFO) << "Decode restore batch, restored=" << num_restored
+              << ", waiting=" << waiting.size()
+              << ", inflight=" << inflight_restores_.size();
+  }
+}
+
+SchedulerPolicy::RestoreOutcome SchedulerPolicy::try_restore(
+    const std::shared_ptr<Request>& request,
+    bool rank_idle,
+    DecodeRankLoad& load,
+    SchedulerState& state,
+    ScheduleBudget& budget) {
   CHECK_EQ(request->sequences().size(), 1u);
   Sequence* sequence = request->sequences().front().get();
-  CHECK(sequence != nullptr);
-
+  const int32_t dp_rank = sequence->dp_rank();
+  const size_t block_size =
+      static_cast<size_t>(state.kv_cache_manager->block_size());
+  const size_t footprint = util::ceil_div(sequence->num_tokens(), block_size);
+  const size_t own_reserve =
+      state.decode_admission->own_reserve_blocks(*sequence, rank_idle);
+  if (decode_headroom_blocks(*state.kv_cache_manager, dp_rank) <
+      load.reserved_blocks[dp_rank] + footprint + own_reserve) {
+    return RestoreOutcome::NO_ROOM;
+  }
   const size_t num_tokens =
       compute_prefill_tokens(sequence, budget.remaining_token_budget, state);
   if (num_tokens == 0 || num_tokens > budget.remaining_token_budget ||
       budget.remaining_seq_budget == 0) {
-    return;
+    return RestoreOutcome::OUT_OF_BUDGET;
   }
-
   size_t actual_tokens = 0;
   if (!allocate_for_prefill(sequence, num_tokens, &actual_tokens, state)) {
-    return;
+    return RestoreOutcome::NO_ROOM;
   }
 
   CHECK_LE(actual_tokens, budget.remaining_token_budget);
@@ -588,7 +802,11 @@ void SchedulerPolicy::schedule_decode_restore(SchedulerState& state,
   budget.remaining_token_budget -= actual_tokens;
   --budget.remaining_seq_budget;
   cache_in_batch_prefix({sequence}, {actual_tokens}, state);
-  state.decode_restore_waiting.pop_front();
+  load.reserved_blocks[dp_rank] +=
+      missing_footprint_blocks(*sequence, block_size) + own_reserve;
+  ++load.num_requests[dp_rank];
+  inflight_restores_.emplace_back(request);
+  return RestoreOutcome::RESTORED;
 }
 
 // =============================================================================
@@ -598,6 +816,7 @@ void SchedulerPolicy::schedule_decode_restore(SchedulerState& state,
 void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
                                                  SchedulerState& state,
                                                  ScheduleBudget& budget) {
+  blocked_decode_.reset();
   if (queue == nullptr || queue->empty()) {
     return;
   }
@@ -780,6 +999,9 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
     }
 
     if (has_enough_budget && has_enough_blocks) {
+      if (blocked_decode_.lock() == request) {
+        blocked_decode_.reset();
+      }
       queue->pop_top();
       state.running_requests.emplace_back(request);
       state.running_sequences.insert(state.running_sequences.end(),
@@ -812,20 +1034,20 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
 
     // Blocks exhausted: wait for an in-flight async release before selecting
     // another victim. The released blocks remain unavailable until the
-    // transfer completes.
+    // transfer completes. The mark clears once the request gets its blocks.
+    blocked_decode_ = request;
     if (state.kv_cache_manager->has_pending_async_block_release()) {
       return;
     }
 
     // First try preempting from chunk_queue (has KV blocks to free), then
-    // from the decode queue's lowest priority.
+    // from the decode queue's lowest priority. A preempted in-flight restore
+    // goes back to the head of the restore queue to keep FIFO order.
     if (!has_enough_blocks && !state.chunk_queue.empty()) {
       std::shared_ptr<Request> request_to_preempt = state.chunk_queue.back();
       ++budget.num_preempted_requests;
-      state.kv_cache_manager->deallocate(request_to_preempt.get());
       state.chunk_queue.pop_back();
-      request_to_preempt->set_preempted();
-      state.prefill_queue.push(request_to_preempt);
+      requeue_preempted(request_to_preempt, state);
       if (state.kv_cache_manager->has_pending_async_block_release()) {
         return;
       }
@@ -835,7 +1057,7 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
       std::shared_ptr<Request> request_to_preempt = queue->back();
       if (request_to_preempt.get() != request.get()) {
         ++budget.num_preempted_requests;
-        enqueue_decode_restore(request_to_preempt, state);
+        requeue_preempted(request_to_preempt, state);
         queue->pop_back();
         if (state.kv_cache_manager->has_pending_async_block_release()) {
           return;
@@ -862,7 +1084,8 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
 bool SchedulerPolicy::should_wait_for_decode_restore(
     const std::shared_ptr<Request>& request,
     const SchedulerState& state) const {
-  if (!state.options.enable_disagg_pd() || state.options.enable_pd_ooc() ||
+  if (state.decode_admission == nullptr || !state.options.enable_disagg_pd() ||
+      state.options.enable_pd_ooc() ||
       !state.options.instance_role().has_value() ||
       state.options.instance_role().value() != InstanceRole::DECODE ||
       !state.enable_prefix_cache || state.options.enable_schedule_overlap() ||
@@ -880,16 +1103,26 @@ bool SchedulerPolicy::should_wait_for_decode_restore(
 
 void SchedulerPolicy::enqueue_decode_restore(
     const std::shared_ptr<Request>& request,
-    SchedulerState& state) {
+    SchedulerState& state,
+    bool to_front) {
   const bool should_wait = should_wait_for_decode_restore(request, state);
   if (should_wait) {
+    // Pause before the blocks free up so no admission can take them.
+    state.decode_admission->pause();
     clear_mtp_bootstrap(request.get(), state);
   }
   state.kv_cache_manager->deallocate(request.get());
   request->set_preempted();
   if (should_wait) {
-    state.decode_restore_waiting.emplace_back(
-        DecodeRestoreEntry{request, absl::Now()});
+    DecodeRestoreEntry entry{request, absl::Now()};
+    if (to_front) {
+      state.decode_restore_waiting.emplace_front(std::move(entry));
+    } else {
+      state.decode_restore_waiting.emplace_back(std::move(entry));
+    }
+    VLOG(1) << "Decode restore queued, request_id=" << request->request_id()
+            << ", dp=" << request->sequences()[0]->dp_rank()
+            << ", waiting=" << state.decode_restore_waiting.size();
     return;
   }
   state.prefill_queue.push(request);
@@ -927,6 +1160,7 @@ void SchedulerPolicy::handle_abnormal_decode_request(
   } else if (candidate_sequences.empty() && state.running_sequences.empty()) {
     // Nothing scheduled at all -- request is unschedulable.
     queue->pop_top();
+    forget_inflight_restore(request.get());
     clear_mtp_bootstrap(request.get(), state);
     state.kv_cache_manager->deallocate(request.get());
     if (budget_exhausted) {
@@ -957,6 +1191,14 @@ void SchedulerPolicy::handle_unschedulable_head(
       state.decode_queue.empty()) {
     std::shared_ptr<Request> request(queue->top());
     queue->pop_top();
+    if (blocks_exhausted && is_inflight_restore(request.get())) {
+      // Blocks held elsewhere (e.g. PD reservations) will be released, so a
+      // blocked restore waits at the head of the restore queue. It fails
+      // there only if its rank turns idle and it still cannot fit.
+      requeue_preempted(request, state);
+      return;
+    }
+    forget_inflight_restore(request.get());
     if (state.release_failed_request) {
       state.release_failed_request(request);
     }

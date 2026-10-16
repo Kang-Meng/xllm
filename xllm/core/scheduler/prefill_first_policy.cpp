@@ -100,27 +100,6 @@ void PrefillFirstPolicy::schedule(
     }
   }
 
-  // A completed D2H release must first be available to the decode request
-  // that triggered preemption. Do not let the restore waiter reclaim the
-  // released blocks before that request can retry.
-  const bool retry_decode_before_restore =
-      !state.decode_restore_waiting.empty() &&
-      !state.kv_cache_manager->has_pending_async_block_release();
-  if (retry_decode_before_restore) {
-    budget.latency_budget = options_.max_global_tpot_ms();
-    adjust_latency_budget_and_reorder(&state.decode_queue,
-                                      /*second_queue=*/nullptr,
-                                      budget.latency_budget,
-                                      /*for_prefill=*/false,
-                                      state);
-    schedule_decode_from_queue(&state.decode_queue, state, budget);
-    if (!state.running_sequences.empty() ||
-        state.kv_cache_manager->has_pending_async_block_release()) {
-      return;
-    }
-  }
-  schedule_decode_restore(state, budget);
-
   // === Schedule phase ===
   budget.latency_budget = options_.max_global_ttft_ms();
 
@@ -137,6 +116,8 @@ void PrefillFirstPolicy::schedule(
       static_cast<size_t>(state.options.dp_size()), 0);
   schedule_prefill_from_queue(
       &state.chunk_queue, state, budget, finished, reserved_full_footprint);
+  // Then host restores, after in-flight restores in chunk_queue progressed.
+  schedule_decode_restore(state, budget);
   // Then new prefill requests.
   schedule_prefill_from_queue(
       &state.prefill_queue, state, budget, finished, reserved_full_footprint);
@@ -146,7 +127,7 @@ void PrefillFirstPolicy::schedule(
   }
 
   // If no prefill sequences were scheduled, try decode.
-  if (!retry_decode_before_restore && state.running_sequences.empty()) {
+  if (state.running_sequences.empty()) {
     budget.latency_budget = options_.max_global_tpot_ms();
     adjust_latency_budget_and_reorder(&state.decode_queue,
                                       /*second_queue=*/nullptr,

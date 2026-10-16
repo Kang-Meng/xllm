@@ -29,6 +29,7 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
 #include "scheduler/continuous_scheduler.h"
+#include "scheduler/decode_admission.h"
 #include "scheduler/profile/profile_manager.h"
 #include "scheduler/request_priority_queue.h"
 
@@ -72,6 +73,8 @@ struct SchedulerState {
   bool enable_prefix_cache;
   std::function<void(const std::shared_ptr<Request>&)> release_failed_request =
       {};
+  // PD decode admission gate; nullptr when host restore is not available.
+  DecodeAdmission* decode_admission = nullptr;
 };
 
 // ScheduleBudget tracks the remaining resources for the current scheduling
@@ -95,6 +98,12 @@ inline bool budget_exhausted(const ScheduleBudget& budget) {
          budget.remaining_seq_budget == 0 ||
          budget.latency_budget <= budget.estimate_latency;
 }
+
+// Per-DP-rank decode work of every running or queued request: the decode
+// reserve of each sequence, plus the blocks a prefill-stage sequence (e.g. an
+// in-flight host restore) still needs to reach its full length.
+DecodeRankLoad compute_decode_rank_load(const SchedulerState& state,
+                                        int32_t reserved_tokens);
 
 // Selects which concrete policy to instantiate.
 // Determined by BatchMode: enable_mix_batch × priority_strategy.
@@ -136,6 +145,8 @@ class SchedulerPolicy {
   void report_metrics(const SchedulerState& state,
                       double elapsed_seconds,
                       size_t num_preempted_requests);
+  // Publishes this step's decode load to the PD decode admission gate.
+  void publish_decode_load(const SchedulerState& state);
 
  protected:
   // ===== Common phases (internal) =====
@@ -174,7 +185,22 @@ class SchedulerPolicy {
                             SchedulerState& state,
                             bool skip_shared = false);
   void allocate_shared_blocks_for(Sequence* seq, SchedulerState& state);
+  // Restores preempted PD decode requests from host cache in FIFO order per
+  // DP rank, as many per step as headroom and budget allow.
   void schedule_decode_restore(SchedulerState& state, ScheduleBudget& budget);
+  enum class RestoreOutcome : int8_t {
+    RESTORED = 0,
+    NO_ROOM = 1,
+    OUT_OF_BUDGET = 2,
+  };
+  // Restores `request` into this step's batch when its rank has headroom for
+  // the blocks `load` already commits plus the request's full footprint and
+  // own reserve. `load` then accounts for the restored request.
+  RestoreOutcome try_restore(const std::shared_ptr<Request>& request,
+                             bool rank_idle,
+                             DecodeRankLoad& load,
+                             SchedulerState& state,
+                             ScheduleBudget& budget);
 
   // ===== Decode scheduling =====
   void schedule_decode_from_queue(RequestPriorityQueue* queue,
@@ -202,7 +228,20 @@ class SchedulerPolicy {
   bool should_wait_for_decode_restore(const std::shared_ptr<Request>& request,
                                       const SchedulerState& state) const;
   void enqueue_decode_restore(const std::shared_ptr<Request>& request,
-                              SchedulerState& state);
+                              SchedulerState& state,
+                              bool to_front = false);
+  // Preempts `request` to the restore queue. An in-flight restore goes back
+  // to the head so restores stay FIFO.
+  void requeue_preempted(const std::shared_ptr<Request>& request,
+                         SchedulerState& state);
+  void maybe_reopen_decode_admission(SchedulerState& state);
+  void prune_inflight_restores();
+  bool is_inflight_restore(const Request* request) const;
+  void forget_inflight_restore(const Request* request);
+  void fail_decode_restore(std::shared_ptr<Request> request,
+                           absl::Time started_at,
+                           SchedulerState& state);
+  bool has_blocked_decode(const SchedulerState& state) const;
 
   // ===== Helpers =====
   void cache_in_batch_prefix(const std::vector<Sequence*>& sequences,
@@ -212,6 +251,12 @@ class SchedulerPolicy {
 
   BatchMode batch_mode_;
   const ContinuousScheduler::Options& options_;
+  // Restored requests still in prefill stage. Admission stays paused until
+  // they reach decode so new arrivals cannot take their blocks.
+  std::vector<std::shared_ptr<Request>> inflight_restores_;
+  // The decode the last decode pass could not give blocks to. Freed blocks go
+  // to it before any restore starts.
+  std::weak_ptr<Request> blocked_decode_;
 };
 
 // =============================================================================

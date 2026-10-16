@@ -979,10 +979,11 @@ void Sequence::fill_ctc_output(const Tokenizer& tokenizer,
 }
 
 size_t Sequence::num_prefix_cache_tokens() const {
-  size_t cached_tokens = std::max(kv_state_.shared_tokens_num(),
-                                  host_kv_state_.shared_tokens_num());
-  DCHECK_LE(cached_tokens, num_prompt_tokens_);
-  return cached_tokens;
+  const size_t cached_tokens = std::max(kv_state_.shared_tokens_num(),
+                                        host_kv_state_.shared_tokens_num());
+  // A restored preempted sequence also matches its generated tokens; usage
+  // only reports cached prompt tokens.
+  return std::min(cached_tokens, num_prompt_tokens_);
 }
 
 void Sequence::set_host_cache_match(size_t restore_tokens, size_t copy_units) {

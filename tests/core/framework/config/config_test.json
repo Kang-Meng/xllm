@@ -12,6 +12,7 @@
   "max_seqs_per_batch": 32,
   "enable_schedule_overlap": true,
   "prefill_scheduling_memory_usage_threshold": 0.75,
+  "decode_reserved_tokens_per_request": 256,
   "enable_chunked_prefill": false,
   "max_tokens_per_chunk_for_prefill": 512,
   "chunked_match_frequency": 3,

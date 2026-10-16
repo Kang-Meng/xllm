@@ -177,6 +177,44 @@ TEST(RequestCachedTokensTest, CachedTokensSurvivesKVBlockRelease) {
   EvictPrefixCache(pool, options);
 }
 
+TEST(RequestCachedTokensTest, RestoredSequenceReportsAtMostPromptTokens) {
+  ScopedValue<int32_t> max_seqs_guard(
+      &SchedulerConfig::get_instance().max_seqs_per_batch(), 2);
+
+  BlockManagerPool::Options options;
+  options.num_blocks(16).host_num_blocks(0).block_size(4).enable_prefix_cache(
+      true);
+  options.max_seqs_per_batch(1024);
+  BlockManagerPool pool(options, /*dp_size=*/1);
+
+  {
+    // Cache the 8-token prompt plus 5 generated tokens; full blocks cover 12.
+    Sequence cached = MakeSequence(
+        0, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14});
+    ASSERT_TRUE(pool.allocate(&cached));
+    cached.kv_state().set_kv_cache_tokens_num(cached.num_prompt_tokens());
+    pool.cache(&cached);
+
+    // A preempted request re-matches its prompt and generated tokens.
+    auto request = MakeRequest({1, 2, 3, 4, 5, 6, 7, 8});
+    auto* seq = request->sequences()[0].get();
+    seq->kv_state().set_kv_cache_tokens_num(seq->num_prompt_tokens());
+    for (int32_t token_id : {9, 10, 11, 12, 13}) {
+      seq->append_token(Token(token_id));
+    }
+    seq->reset();
+    ASSERT_TRUE(pool.allocate(seq, seq->num_tokens()));
+    ASSERT_EQ(seq->kv_state().shared_tokens_num(), 12u);
+
+    EXPECT_EQ(seq->num_prefix_cache_tokens(), 8u);
+    request->record_num_prefix_cache_tokens();
+    EXPECT_EQ(request->num_prefix_cache_tokens(), 8u);
+    pool.deallocate(seq);
+  }
+
+  EvictPrefixCache(pool, options);
+}
+
 TEST(RequestCachedTokensTest, ZeroWhenPrefixCacheDisabled) {
   ScopedValue<int32_t> max_seqs_guard(
       &SchedulerConfig::get_instance().max_seqs_per_batch(), 2);

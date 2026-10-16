@@ -18,11 +18,27 @@ cc_test(
     GTest::gtest_main
     $<$<BOOL:${USE_NPU}>:nnopbase>
 )
-target_link_libraries(scheduler_test
-                      PUBLIC
-                      Python::Python
-                      $<$<BOOL:${USE_NPU}>:ascendcl>
-                      $<$<BOOL:${USE_NPU}>:hccl>
-                      $<$<BOOL:${USE_NPU}>:c_sec>)
-target_link_libraries(scheduler_test PRIVATE
-  "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")
+# BatchFactory fixes DP size on first use; keep DP=2 restore scenarios isolated.
+cc_test(
+  NAME
+    pd_decode_restore_test
+  SRCS
+    pd_decode_restore_test.cpp
+  DEPS
+    :config
+    :scheduler
+    :xllm_server
+    :block
+    GTest::gtest_main
+    $<$<BOOL:${USE_NPU}>:nnopbase>
+)
+foreach(test_target scheduler_test pd_decode_restore_test)
+  target_link_libraries(${test_target}
+                        PUBLIC
+                        Python::Python
+                        $<$<BOOL:${USE_NPU}>:ascendcl>
+                        $<$<BOOL:${USE_NPU}>:hccl>
+                        $<$<BOOL:${USE_NPU}>:c_sec>)
+  target_link_libraries(${test_target} PRIVATE
+    "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")
+endforeach()

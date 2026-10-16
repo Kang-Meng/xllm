@@ -109,6 +109,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `max_seqs_per_batch` | `int32` | `200` | 每个 batch 可处理的最大 sequence 数。 |
 | `enable_schedule_overlap` | `bool` | `false` | 是否启用 schedule overlap（异步调度）；详见 [异步调度](/zh/features/async_schedule/)。 |
 | `prefill_scheduling_memory_usage_threshold` | `double` | `0.95` | prefill 调度时的内存使用阈值。 |
+| `decode_reserved_tokens_per_request` | `int32` | `512` | 仅 PD decode 生效。准入新请求或恢复被抢占请求时，为每个已准入的 decode 请求预留的后续生成 token 数；0 表示不预留。不计入线性状态和 embedding slot。 |
 | `enable_chunked_prefill` | `bool` | `true` | 是否启用 chunked prefill。 |
 | `max_tokens_per_chunk_for_prefill` | `int32` | `-1` | prefill 阶段每个 chunk 的最大 token 数；`-1` 表示使用默认策略。 |
 | `chunked_match_frequency` | `int32` | `2` | sequence prefix cache 匹配频率。 |

@@ -39,6 +39,7 @@ limitations under the License.
 #include "framework/request/sequence.h"
 #include "runtime/xservice_client.h"
 #include "scheduler.h"
+#include "scheduler/decode_admission.h"
 #include "scheduler/profile/profile_manager.h"
 #include "scheduler/request_priority_queue.h"
 
@@ -364,6 +365,9 @@ class ContinuousScheduler : public Scheduler {
   // Decode victims that wait for D2H publication and device KV capacity before
   // re-entering the existing Prefill/H2D restore path.
   std::deque<DecodeRestoreEntry> decode_restore_waiting_;
+  // PD decode admission gate, set by DisaggPDScheduler. Host restore pauses
+  // it while decode_restore_waiting_ drains.
+  std::unique_ptr<DecodeAdmission> decode_admission_;
 
   // Unified queue: used by UnifiedPolicy only (all requests in one queue).
   std::list<std::shared_ptr<Request>> unified_queue_;

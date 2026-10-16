@@ -195,14 +195,36 @@ KvSplitDispatchPlan resolve_kv_split_plan(
 }
 
 DisaggPDScheduler::DisaggPDScheduler(Engine* engine, const Options& options)
+    : DisaggPDScheduler(engine, options, /*start_services=*/true) {}
+
+DisaggPDScheduler::DisaggPDScheduler(Engine* engine,
+                                     const Options& options,
+                                     bool start_services)
     : ContinuousScheduler(engine, options), server_name_("DisaggPDServer") {
   if (!options_.instance_role().has_value()) {
     LOG(FATAL) << "Instance type is not set in disagg pd mode.";
   }
+  // The reserve keeps room for admitted decodes to grow; PD OOC keeps its
+  // own admission and never restores from host.
+  const bool reserve_decode = !options_.enable_pd_ooc() &&
+                              options_.instance_role() == InstanceRole::DECODE;
+  const ::xllm::SchedulerConfig& scheduler_config =
+      ::xllm::SchedulerConfig::get_instance();
+  decode_admission_ = std::make_unique<DecodeAdmission>(
+      engine_->block_manager_pool(),
+      DecodeAdmission::Options{
+          .dp_size = options_.dp_size(),
+          .reserved_tokens_per_request =
+              reserve_decode
+                  ? scheduler_config.decode_reserved_tokens_per_request()
+                  : 0,
+          .num_speculative_tokens = options_.num_speculative_tokens(),
+          .max_kv_cache_utilization =
+              scheduler_config.prefill_scheduling_memory_usage_threshold()});
 
   // Only initialize for non-OOC mode
   // OOC mode (PDOOCScheduler) will handle initialization in its own constructor
-  if (!options_.enable_pd_ooc()) {
+  if (start_services && !options_.enable_pd_ooc()) {
     // Start dispatch thread for prefill instance
     dispatch_thread_ = std::make_unique<std::thread>(
         &DisaggPDScheduler::dispatch_requests, this);
@@ -1345,16 +1367,9 @@ void DisaggPDScheduler::restore_disaggregated_latency(
   }
 }
 
-bool DisaggPDScheduler::try_allocate(Sequence* sequence) {
-  // When the KV Cache usage reaches the threshold, prefill requests will no
-  // longer be scheduled to avoid frequent preemption.
-  if (kv_cache_manager_->kv_cache_utilization() <
-      ::xllm::SchedulerConfig::get_instance()
-          .prefill_scheduling_memory_usage_threshold()) {
-    return kv_cache_manager_->try_allocate(sequence);
-  } else {
-    return false;
-  }
+DecodeAdmissionResult DisaggPDScheduler::try_admit(
+    const std::shared_ptr<Request>& request) {
+  return decode_admission_->admit(request);
 }
 
 bool DisaggPDScheduler::exceeds_decode_capacity(Sequence* sequence) const {

@@ -134,8 +134,9 @@ class DisaggPDScheduler : public ContinuousScheduler {
   bool release_reservation(const std::string& req_id,
                            const std::string& reservation_id);
 
-  // decode allocate blocks with prefix cache.
-  bool try_allocate(Sequence* sequence);
+  // Decode admits a request from Prefill and allocates its prompt blocks
+  // with prefix cache.
+  DecodeAdmissionResult try_admit(const std::shared_ptr<Request>& request);
 
   // Classifies a failed allocation as permanently oversized.
   // DSV4 multi-manager and XTensor layouts conservatively return false because
@@ -162,6 +163,10 @@ class DisaggPDScheduler : public ContinuousScheduler {
                        const int32_t src_kv_split_size);
 
  protected:
+  DisaggPDScheduler(Engine* engine,
+                    const Options& options,
+                    bool start_services);
+
   void release_failed_request(const std::shared_ptr<Request>& request) override;
 
   // Fail a request whose kv_split pair resolve_kv_split_plan marked

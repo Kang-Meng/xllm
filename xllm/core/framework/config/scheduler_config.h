@@ -45,6 +45,7 @@ class SchedulerConfig final {
          "max_seqs_per_batch",
          "enable_schedule_overlap",
          "prefill_scheduling_memory_usage_threshold",
+         "decode_reserved_tokens_per_request",
          "enable_chunked_prefill",
          "max_tokens_per_chunk_for_prefill",
          "chunked_match_frequency",
@@ -67,6 +68,11 @@ class SchedulerConfig final {
   PROPERTY(bool, enable_schedule_overlap) = false;
 
   PROPERTY(double, prefill_scheduling_memory_usage_threshold) = 0.95;
+
+  // PD DECODE only. Tokens of growth kept free per admitted decode request
+  // when admitting new requests or restoring preempted ones; 0 disables it.
+  // Linear-state and embedding slots are not counted.
+  PROPERTY(int32_t, decode_reserved_tokens_per_request) = 512;
 
   PROPERTY(bool, enable_chunked_prefill) = true;
 

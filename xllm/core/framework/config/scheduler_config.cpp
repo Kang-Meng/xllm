@@ -30,6 +30,12 @@ DEFINE_double(prefill_scheduling_memory_usage_threshold,
               0.95,
               "The memory usage threshold during prefill scheduling.");
 
+DEFINE_int32(decode_reserved_tokens_per_request,
+             512,
+             "PD decode only: tokens of growth kept free per admitted decode "
+             "request when admitting new requests or restoring preempted "
+             "ones. 0 disables the reserve.");
+
 DEFINE_bool(enable_chunked_prefill, true, "Whether to enable chunked prefill.");
 
 DEFINE_int32(max_tokens_per_chunk_for_prefill,
@@ -87,6 +93,7 @@ void SchedulerConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_seqs_per_batch);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_schedule_overlap);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(prefill_scheduling_memory_usage_threshold);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(decode_reserved_tokens_per_request);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_chunked_prefill);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_tokens_per_chunk_for_prefill);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(chunked_match_frequency);
@@ -106,6 +113,7 @@ void SchedulerConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_seqs_per_batch);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_schedule_overlap);
   XLLM_CONFIG_ASSIGN_FROM_JSON(prefill_scheduling_memory_usage_threshold);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(decode_reserved_tokens_per_request);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_chunked_prefill);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_tokens_per_chunk_for_prefill);
   XLLM_CONFIG_ASSIGN_FROM_JSON(chunked_match_frequency);
@@ -131,6 +139,8 @@ void SchedulerConfig::append_config_json(
       config_json, default_config, enable_schedule_overlap);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, prefill_scheduling_memory_usage_threshold);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, decode_reserved_tokens_per_request);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_chunked_prefill);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

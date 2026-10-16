@@ -109,6 +109,7 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `max_seqs_per_batch` | `int32` | `200` | Maximum number of sequences per batch. |
 | `enable_schedule_overlap` | `bool` | `false` | Whether to enable schedule overlap, also known as asynchronous scheduling. See [Async Scheduling](/en/features/async_schedule/). |
 | `prefill_scheduling_memory_usage_threshold` | `double` | `0.95` | Memory usage threshold during prefill scheduling. |
+| `decode_reserved_tokens_per_request` | `int32` | `512` | PD decode only. Tokens of growth kept free per admitted decode request when admitting new requests or restoring preempted ones; 0 disables the reserve. Linear-state and embedding slots are not counted. |
 | `enable_chunked_prefill` | `bool` | `true` | Whether to enable chunked prefill. |
 | `max_tokens_per_chunk_for_prefill` | `int32` | `-1` | Maximum number of tokens per chunk in the prefill stage. `-1` uses the default policy. |
 | `chunked_match_frequency` | `int32` | `2` | Sequence prefix-cache match frequency. |

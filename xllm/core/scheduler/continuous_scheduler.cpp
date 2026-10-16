@@ -54,14 +54,6 @@ limitations under the License.
 
 namespace xllm {
 
-namespace {
-
-constexpr absl::Duration kDecodeRestoreTimeout = absl::Seconds(60);
-constexpr char kDecodeRestoreTimeoutMessage[] =
-    "Decode request could not reacquire device KV cache within 60 seconds";
-
-}  // namespace
-
 void CancelRequestQueue::submit(std::shared_ptr<Request> request) {
   std::lock_guard<std::mutex> lock(mutex_);
   requests_.emplace_back(std::move(request));
@@ -314,29 +306,22 @@ void ContinuousScheduler::clear_mtp_bootstrap(Request* request) {
 
 void ContinuousScheduler::drain_decode_restore_waiting(
     std::vector<std::shared_ptr<Request>>& finished) {
-  const absl::Time now = absl::Now();
   for (auto it = decode_restore_waiting_.begin();
        it != decode_restore_waiting_.end();) {
     std::shared_ptr<Request>& request = it->request;
     CHECK(request != nullptr);
     request->update_connection_status();
-    if (request->finished() || request->cancelled()) {
-      clear_mtp_bootstrap(request.get());
-      kv_cache_manager_->deallocate(request.get());
-      finished.emplace_back(request);
-      it = decode_restore_waiting_.erase(it);
-      continue;
-    }
-    if (now - it->started_at < kDecodeRestoreTimeout) {
+    if (!request->finished() && !request->cancelled()) {
       ++it;
       continue;
     }
-
+    LOG(INFO) << "Decode restore waiter ended, request_id="
+              << request->request_id() << ", cancelled=" << request->cancelled()
+              << ", waiting_seconds="
+              << absl::ToDoubleSeconds(absl::Now() - it->started_at);
     clear_mtp_bootstrap(request.get());
     kv_cache_manager_->deallocate(request.get());
-    response_processor_->process_failed_request(
-        request,
-        {StatusCode::RESOURCE_EXHAUSTED, kDecodeRestoreTimeoutMessage});
+    finished.emplace_back(request);
     it = decode_restore_waiting_.erase(it);
   }
 }
@@ -394,6 +379,7 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
 
   // Strategy-driven scheduling
   policy_->schedule(state, budget, finished);
+  policy_->publish_decode_load(state);
 
   // Finalize
   if (!finished.empty()) {
@@ -443,6 +429,7 @@ SchedulerState ContinuousScheduler::make_state() {
           [this](const std::shared_ptr<Request>& request) {
             release_failed_request(request);
           },
+      .decode_admission = decode_admission_.get(),
   };
 }
 
@@ -468,7 +455,8 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
       return batch;
     }
 
-    if (if_queue_not_empty()) {
+    // Restore waiters only progress once blocks free up; do not spin on them.
+    if (if_queue_not_empty() && decode_restore_waiting_.empty()) {
       continue;
     }
 
