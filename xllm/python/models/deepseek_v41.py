@@ -356,6 +356,20 @@ class DeepseekV41Config(DeepseekV4Config):
     dcp_size: int = 1
     load_format: str = "safetensors"
 
+    @property
+    def uses_mx_formats(self) -> bool:
+        """V4.1 never takes the V4 MXFP8/MXFP4 execution path.
+
+        V4.1 reuses the V4 machinery (``DeepseekV4MoE`` and the shared
+        loaders) but serves official FP8 checkpoints through its own
+        load-time dequantization (``V41_QUANT_FP8``), and its dense layers
+        are fixed-format. A checkpoint with ``weight_quant_method == "fp8"``
+        must therefore NOT enable the V4 MXFP modules here -- that would
+        build a half-format model (MXFP4 experts beside non-MXFP dense
+        projections).
+        """
+        return False
+
     @classmethod
     def from_dict(cls, d: dict) -> DeepseekV41Config:
         merged = dict(d)

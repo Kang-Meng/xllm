@@ -19,6 +19,10 @@ https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8
 Pro weights:
 https://modelers.cn/models/Eco-Tech/DeepSeek-V4-Pro-w4a8-mtp
 
+Official FP8 weights (MXFP8/MXFP4, Ascend 950 / A5 only): served out of
+the box, no export or re-quantization needed.
+https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash
+
 
 ## 1. Pull the Docker Image
 

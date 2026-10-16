@@ -292,7 +292,7 @@ class DeepseekV4MtpForCausalLM(DeepseekV4ForCausalLM):
     ) -> None:
         """Load one draft decoder layer with the target model's aliases."""
 
-        def _w8a8(
+        def _load_w8a8_projection(
             checkpoint_module: str,
             parameter_module: str,
             shard_dims: dict[str, int] | None = None,
@@ -309,11 +309,11 @@ class DeepseekV4MtpForCausalLM(DeepseekV4ForCausalLM):
             checkpoint_prefix=checkpoint_prefix,
             parameter_prefix=parameter_prefix,
             layer_id=layer_id,
-            w8a8_loader=_w8a8,
+            projection_loader=_load_w8a8_projection,
         )
         indexer_prefix = attention_prefix + "indexer."
         if attention.indexer is not None and loader.has(indexer_prefix + "wq_b.weight"):
-            _w8a8(
+            _load_w8a8_projection(
                 indexer_prefix + "wq_b",
                 parameter_prefix + "self_attn.indexer.wq_b",
             )

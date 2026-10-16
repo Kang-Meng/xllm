@@ -27,7 +27,10 @@ from xllm.python.attention.backend import LayerCacheInput, normalize_layer_cache
 from xllm.python.layers.layernorm import RMSNorm
 from xllm.python.layers.qlinear import QLinear
 from xllm.python.model_executor.forward_context import LayerSynchronizer
-from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
+from xllm.python.model_loader.module_loaders import (
+    load_block_projection_mxfp8,
+    load_w8a8_dynamic_projection,
+)
 from xllm.python.models.deepseek_v4 import (
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
@@ -35,9 +38,18 @@ from xllm.python.models.deepseek_v4 import (
     _expand_half_rope_cos_sin,
     _find_checkpoint_prefix,
     _require_checkpoint_key,
+    _require_mx_runtime,
 )
 from xllm.python.models.dspark import DSparkForCausalLMBase
 from xllm.python.models.weight_utils import W8A8WeightLoader
+
+# MXFP8 modules only exist for FP8 checkpoints; the guarded import keeps
+# W8A8-only deployments working when the MX dtypes or compiled kernels are
+# unavailable.
+try:
+    from xllm.python.layers.npu.deepseek_v4 import NpuDeepseekV4DynamicLinearMXFP8
+except Exception:  # pragma: no cover - MXFP unavailable on this build
+    NpuDeepseekV4DynamicLinearMXFP8 = None  # type: ignore[assignment,misc]
 
 
 class _DSparkQuantAwareLinear(QLinear):
@@ -130,14 +142,24 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
     ) -> None:
         super().__init__(cfg, dtype, device)
         self.cfg = cfg
-        self.main_proj = _DSparkQuantAwareLinear(
-            cfg.hidden_size * cfg.dspark_num_layers,
-            cfg.hidden_size,
-            tp_size=1,
-            gather_output=False,
-            dtype=dtype,
-            device=device,
-        )
+        if cfg.uses_mx_formats:
+            # Official FP8 drafts store main_proj as e4m3 + ue8m0 block
+            # scale; the MXFP8 linear handles its own transposition.
+            self.main_proj = NpuDeepseekV4DynamicLinearMXFP8(
+                cfg.hidden_size * cfg.dspark_num_layers,
+                cfg.hidden_size,
+                device,
+                transpose_weight_after_loading=False,
+            )
+        else:
+            self.main_proj = _DSparkQuantAwareLinear(
+                cfg.hidden_size * cfg.dspark_num_layers,
+                cfg.hidden_size,
+                tp_size=1,
+                gather_output=False,
+                dtype=dtype,
+                device=device,
+            )
         self.main_norm = RMSNorm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -192,6 +214,8 @@ class DeepseekV4DSparkForCausalLM(
     def __init__(self, config: dict[str, Any]) -> None:
         cfg = DeepseekV4DSparkConfig.from_dict(config)
         cfg.validate()
+        if cfg.uses_mx_formats:
+            _require_mx_runtime()
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "npu:0"))
         DSparkForCausalLMBase.__init__(
@@ -242,27 +266,44 @@ class DeepseekV4DSparkForCausalLM(
     ) -> None:
         """Load one draft decoder layer without requiring the target MTP model."""
 
-        def _w8a8(
-            checkpoint_module: str,
-            parameter_module: str,
-            shard_dims: dict[str, int] | None = None,
-        ) -> None:
-            load_w8a8_dynamic_projection(
-                loader,
-                checkpoint_module,
-                parameter_module,
-                shard_dims,
-                require_weight_and_scale=True,
-                fill_missing_offset=True,
-                description=f"DeepSeek-V4 DSpark {checkpoint_module}",
-            )
+        if self.cfg.uses_mx_formats:
+
+            def _projection(
+                checkpoint_module: str,
+                parameter_module: str,
+                shard_dims: dict[str, int] | None = None,
+            ) -> None:
+                load_block_projection_mxfp8(
+                    loader,
+                    checkpoint_module,
+                    parameter_module,
+                    shard_dims,
+                    description=f"DeepSeek-V4 DSpark FP8 projection {checkpoint_module}",
+                )
+
+        else:
+
+            def _projection(
+                checkpoint_module: str,
+                parameter_module: str,
+                shard_dims: dict[str, int] | None = None,
+            ) -> None:
+                load_w8a8_dynamic_projection(
+                    loader,
+                    checkpoint_module,
+                    parameter_module,
+                    shard_dims,
+                    require_weight_and_scale=True,
+                    fill_missing_offset=True,
+                    description=f"DeepSeek-V4 DSpark {checkpoint_module}",
+                )
 
         attention, _ = self._load_dsv4_attention(
             loader,
             checkpoint_prefix=checkpoint_prefix,
             parameter_prefix=parameter_prefix,
             layer_id=layer_id,
-            w8a8_loader=_w8a8,
+            projection_loader=_projection,
         )
         attention.process_weights_after_loading()
 
@@ -366,12 +407,22 @@ class DeepseekV4DSparkForCausalLM(
             (first_prefix + "main_proj.weight",),
             "DeepSeek-V4 DSpark main projection",
         )
-        self._load_quant_aware_linear(
-            loader,
-            main_proj_key.removesuffix(".weight"),
-            "model.main_proj",
-            self.model.main_proj,
-        )
+        if self.cfg.uses_mx_formats:
+            load_block_projection_mxfp8(
+                loader,
+                main_proj_key.removesuffix(".weight"),
+                "model.main_proj",
+                None,
+                description="DeepSeek-V4 DSpark FP8 main projection",
+            )
+            self.model.main_proj.process_weights_after_loading()
+        else:
+            self._load_quant_aware_linear(
+                loader,
+                main_proj_key.removesuffix(".weight"),
+                "model.main_proj",
+                self.model.main_proj,
+            )
         main_norm_key = _require_checkpoint_key(
             loader,
             (first_prefix + "main_norm.weight",),

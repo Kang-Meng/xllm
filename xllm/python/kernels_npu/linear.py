@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import torch_npu
 
-_FRACTAL_NZ_FORMAT = 29
+from xllm.python.kernels_npu.constants import FRACTAL_NZ_FORMAT
 
 
 def prepare_row_parallel_weight(
@@ -41,7 +41,7 @@ def prepare_row_parallel_weight(
     if weight.device.type == "cpu":
         return weight, False
     transposed = weight.transpose(0, 1).contiguous()
-    return torch_npu.npu_format_cast(transposed, _FRACTAL_NZ_FORMAT), True
+    return torch_npu.npu_format_cast(transposed, FRACTAL_NZ_FORMAT), True
 
 
 def prepare_quant_weight(
@@ -59,7 +59,7 @@ def prepare_quant_weight(
     transposed = weight.transpose(0, 1).contiguous()
     if weight.device.type == "cpu":
         return transposed
-    return torch_npu.npu_format_cast(transposed, _FRACTAL_NZ_FORMAT)
+    return torch_npu.npu_format_cast(transposed, FRACTAL_NZ_FORMAT)
 
 
 __all__ = [

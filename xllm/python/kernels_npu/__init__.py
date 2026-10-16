@@ -75,8 +75,19 @@ _EXPORTS = {
         "moe_gmm1",
         "moe_gmm2_combine",
         "moe_token_dispatch",
+        "moe_with_selected_experts_mxfp4",
         "prepare_grouped_moe_weights",
         "supports_cutlass_moe",
+    ),
+    "mxfp": (
+        "clipped_swiglu",
+        "dynamic_mx_quant",
+        "expand_dense_block_scale",
+        "has_mx_dtypes",
+        "prepare_scale_mxfp4",
+        "prepare_weight_mxfp4",
+        "quant_matmul_mx",
+        "rms_norm_dynamic_mx_quant",
     ),
     "normalization": (
         "fused_add_rms_norm",
@@ -174,6 +185,7 @@ __all__ = [
     "moe_gmm1",
     "moe_gmm2_combine",
     "grouped_moe_with_selected_experts",
+    "moe_with_selected_experts_mxfp4",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",
@@ -214,6 +226,14 @@ __all__ = [
     "mega_gdn_decode",
     "mega_gdn_mtp_decode",
     "mega_gdn_prefill",
+    "clipped_swiglu",
+    "dynamic_mx_quant",
+    "expand_dense_block_scale",
+    "has_mx_dtypes",
+    "prepare_scale_mxfp4",
+    "prepare_weight_mxfp4",
+    "quant_matmul_mx",
+    "rms_norm_dynamic_mx_quant",
 ]
 _runtime_initialized = False
 

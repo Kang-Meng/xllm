@@ -24,7 +24,11 @@ from xllm.python.model_executor.forward_context import ForwardContext, forward_c
 from xllm.python.model_executor.runners.decode_acl_graph import _StaticAttentionMetadata
 from xllm.python.models import deepseek_v4, deepseek_v4_mtp
 from xllm.python.models.deepseek_v4 import DeepseekV4Model
-from xllm.python.models.deepseek_v4_mtp import DeepseekV4MtpLayer, DeepseekV4MtpModel
+from xllm.python.models.deepseek_v4_mtp import (
+    DeepseekV4MtpForCausalLM,
+    DeepseekV4MtpLayer,
+    DeepseekV4MtpModel,
+)
 
 
 def _fusion_layer() -> DeepseekV4MtpLayer:
@@ -155,6 +159,76 @@ def test_mtp_dummy_embedding_matches_target_hidden_width() -> None:
     assert tuple(embedding.shape) == (2, 6)
     assert embedding.dtype == torch.float32
     assert torch.count_nonzero(embedding) == 0
+
+
+def test_mtp_decoder_layer_loader_uses_projection_loader_contract() -> None:
+    """Lock the shared attention loader's renamed keyword for MTP."""
+    checkpoint_prefix = "mtp.0."
+    attention_prefix = checkpoint_prefix + "attn."
+    tensors = {
+        attention_prefix + "wq_a.weight": torch.empty(128, 128, dtype=torch.int8),
+        attention_prefix + "wq_a.weight_scale": torch.empty(128, 1),
+        attention_prefix + "wq_b.weight": torch.empty(128, 128, dtype=torch.int8),
+        attention_prefix + "wq_b.weight_scale": torch.empty(128, 1),
+        attention_prefix + "wkv.weight": torch.empty(128, 128, dtype=torch.int8),
+        attention_prefix + "wkv.weight_scale": torch.empty(128, 1),
+        attention_prefix + "wo_a.weight": torch.empty(128, 128),
+        attention_prefix + "wo_b.weight": torch.empty(128, 128),
+        attention_prefix + "q_norm.weight": torch.empty(128),
+        attention_prefix + "kv_norm.weight": torch.empty(128),
+        checkpoint_prefix + "attn_norm.weight": torch.empty(128),
+        checkpoint_prefix + "ffn_norm.weight": torch.empty(128),
+        checkpoint_prefix + "hc_attn_fn": torch.empty(1),
+        checkpoint_prefix + "hc_attn_scale": torch.empty(1),
+        checkpoint_prefix + "hc_attn_base": torch.empty(1),
+        checkpoint_prefix + "hc_ffn_fn": torch.empty(1),
+        checkpoint_prefix + "hc_ffn_scale": torch.empty(1),
+        checkpoint_prefix + "hc_ffn_base": torch.empty(1),
+        checkpoint_prefix + "ffn.gate_proj.weight": torch.empty(128, 128, dtype=torch.int8),
+        checkpoint_prefix + "ffn.up_proj.weight": torch.empty(128, 128, dtype=torch.int8),
+        checkpoint_prefix + "ffn.down_proj.weight": torch.empty(128, 128, dtype=torch.int8),
+        checkpoint_prefix + "ffn.gate_proj.weight_scale": torch.empty(128, 1),
+        checkpoint_prefix + "ffn.up_proj.weight_scale": torch.empty(128, 1),
+        checkpoint_prefix + "ffn.down_proj.weight_scale": torch.empty(128, 1),
+        checkpoint_prefix + "ffn.gate_proj.weight_offset": torch.empty(128, 1),
+        checkpoint_prefix + "ffn.up_proj.weight_offset": torch.empty(128, 1),
+        checkpoint_prefix + "ffn.down_proj.weight_offset": torch.empty(128, 1),
+    }
+    copied: dict[str, torch.Tensor] = {}
+    loader = SimpleNamespace(
+        has=tensors.__contains__,
+        load_tensor=tensors.__getitem__,
+        shard=lambda tensor, dim: tensor,
+        copy_in=copied.__setitem__,
+    )
+    attention = SimpleNamespace(
+        indexer=None,
+        attn_sink_loaded=False,
+        process_weights_after_loading=lambda: None,
+    )
+    mlp = SimpleNamespace(process_weights_after_loading=lambda: None)
+    owner = DeepseekV4MtpForCausalLM.__new__(DeepseekV4MtpForCausalLM)
+    owner.cfg = SimpleNamespace(n_heads=1, tp_size=1, tp_rank=0, uses_mx_formats=False)
+    owner.model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attention, mlp=mlp)])
+
+    DeepseekV4MtpForCausalLM._load_dsv4_decoder_layer(
+        owner,
+        loader,
+        checkpoint_prefix,
+        "model.layers.0.",
+        0,
+    )
+
+    assert copied["model.layers.0.self_attn.q_a_proj.weight"] is tensors[attention_prefix + "wq_a.weight"]
+    torch.testing.assert_close(
+        copied["model.layers.0.mlp.gate_up_proj.weight"],
+        torch.cat(
+            [
+                tensors[checkpoint_prefix + "ffn.gate_proj.weight"],
+                tensors[checkpoint_prefix + "ffn.up_proj.weight"],
+            ]
+        ),
+    )
 
 
 def test_mtp_forward_uses_dummy_flag_from_graph_metadata() -> None:

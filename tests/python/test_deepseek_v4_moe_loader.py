@@ -146,6 +146,197 @@ def test_moe_loader_uses_native_projection_names_and_local_expert_range() -> Non
     )
 
 
+def test_moe_loader_shards_mxfp4_gate_and_up_before_fusion() -> None:
+    """MXFP4 MoE-TP must shard gate/up independently, not the fused tensor."""
+    prefix = "layers.0.mlp."
+    expert_prefix = prefix + "experts.0."
+    shared_prefix = prefix + "shared_experts."
+    tensors = {
+        prefix + "gate.weight": torch.arange(6).reshape(2, 3),
+        prefix + "gate.tid2eid": torch.arange(2),
+        expert_prefix + "gate_proj.weight": torch.arange(256 * 128).reshape(256, 128).to(torch.uint8),
+        expert_prefix + "up_proj.weight": torch.arange(1, 256 * 128 + 1).reshape(256, 128).to(torch.uint8),
+        expert_prefix + "down_proj.weight": torch.arange(256 * 128).reshape(256, 128).to(torch.uint8),
+        expert_prefix + "gate_proj.scale": torch.arange(256 * 8).reshape(256, 8).to(torch.uint8),
+        expert_prefix + "up_proj.scale": torch.arange(1, 256 * 8 + 1).reshape(256, 8).to(torch.uint8),
+        expert_prefix + "down_proj.scale": torch.arange(256 * 8).reshape(256, 8).to(torch.uint8),
+        shared_prefix + "gate_proj.weight": torch.arange(256 * 256).reshape(256, 256).to(torch.uint8),
+        shared_prefix + "up_proj.weight": torch.arange(1, 256 * 256 + 1).reshape(256, 256).to(torch.uint8),
+        shared_prefix + "down_proj.weight": torch.arange(256 * 256).reshape(256, 256).to(torch.uint8),
+        shared_prefix + "gate_proj.scale": torch.arange(2 * 2).reshape(2, 2),
+        shared_prefix + "up_proj.scale": torch.arange(1, 2 * 2 + 1).reshape(2, 2),
+        shared_prefix + "down_proj.scale": torch.arange(2 * 2).reshape(2, 2),
+    }
+
+    copied: dict[str, torch.Tensor] = {}
+    loader = SimpleNamespace(
+        has=tensors.__contains__,
+        load_tensor=tensors.__getitem__,
+        shard=lambda tensor, dim, world=None, rank=None: tensor.chunk(world or 2, dim=dim)[
+            1 if rank is None else rank
+        ].contiguous(),
+        copy_in=copied.__setitem__,
+    )
+    mlp = SimpleNamespace(
+        hash_layer=True,
+        uses_mx_formats=True,
+        moe_tp_size=2,
+        moe_tp_rank=1,
+        start_expert_id=0,
+        num_experts_per_rank=1,
+    )
+    parameters = {
+        "model.layers.0.mlp.experts_w13": torch.nn.Parameter(
+            torch.empty(1, 256, 128, dtype=torch.uint8), requires_grad=False
+        ),
+        "model.layers.0.mlp.experts_w2": torch.nn.Parameter(
+            torch.empty(1, 256, 64, dtype=torch.uint8), requires_grad=False
+        ),
+    }
+    buffers = {
+        "model.layers.0.mlp.experts_w13_scale": torch.empty(1, 256, 8, dtype=torch.uint8),
+        "model.layers.0.mlp.experts_w2_scale": torch.empty(1, 256, 4, dtype=torch.uint8),
+    }
+    owner = SimpleNamespace(
+        cfg=SimpleNamespace(moe_intermediate_size=256, hidden_size=256, n_shared_experts=1),
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        get_parameter=parameters.__getitem__,
+        get_buffer=buffers.__getitem__,
+        _load_dsv4_moe_routing=DeepseekV4ForCausalLM._load_dsv4_moe_routing,
+    )
+    owner._load_deepseek_v4_moe_experts_mxfp4 = MethodType(
+        DeepseekV4ForCausalLM._load_deepseek_v4_moe_experts_mxfp4,
+        owner,
+    )
+
+    DeepseekV4ForCausalLM._load_dsv4_moe(
+        owner,
+        loader,
+        "layers.0.",
+        "model.layers.0.",
+        layer_id=0,
+        source_prefix=prefix,
+    )
+
+    torch.testing.assert_close(
+        parameters["model.layers.0.mlp.experts_w13"][0],
+        torch.cat(
+            [
+                tensors[expert_prefix + "gate_proj.weight"][128:],
+                tensors[expert_prefix + "up_proj.weight"][128:],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        buffers["model.layers.0.mlp.experts_w13_scale"][0],
+        torch.cat(
+            [
+                tensors[expert_prefix + "gate_proj.scale"][128:],
+                tensors[expert_prefix + "up_proj.scale"][128:],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        parameters["model.layers.0.mlp.experts_w2"][0],
+        tensors[expert_prefix + "down_proj.weight"][:, 64:],
+    )
+    torch.testing.assert_close(
+        buffers["model.layers.0.mlp.experts_w2_scale"][0],
+        tensors[expert_prefix + "down_proj.scale"][:, 4:],
+    )
+    torch.testing.assert_close(
+        copied["model.layers.0.mlp.shared_experts.gate_up_proj.weight"],
+        torch.cat(
+            [
+                tensors[shared_prefix + "gate_proj.weight"][128:],
+                tensors[shared_prefix + "up_proj.weight"][128:],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        copied["model.layers.0.mlp.shared_experts.gate_up_proj.weight_scale"],
+        torch.cat(
+            [
+                tensors[shared_prefix + "gate_proj.scale"][1:],
+                tensors[shared_prefix + "up_proj.scale"][1:],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        copied["model.layers.0.mlp.shared_experts.down_proj.weight"],
+        tensors[shared_prefix + "down_proj.weight"][:, 128:],
+    )
+    torch.testing.assert_close(
+        copied["model.layers.0.mlp.shared_experts.down_proj.weight_scale"],
+        tensors[shared_prefix + "down_proj.scale"][:, 1:],
+    )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "bad_shape"),
+    [
+        ("gate_proj.weight", (1, 256)),
+        ("up_proj.weight", (257, 256)),
+        ("gate_proj.scale", (1, 2)),
+        ("up_proj.scale", (2, 1)),
+        ("down_proj.weight", (256, 255)),
+        ("down_proj.scale", (1, 2)),
+    ],
+)
+def test_moe_loader_validates_shared_mxfp8_shapes(
+    checkpoint_name: str,
+    bad_shape: tuple[int, ...],
+) -> None:
+    """Shared MXFP8 loads report the checkpoint key and expected geometry."""
+    prefix = "layers.0.mlp."
+    shared_prefix = prefix + "shared_experts."
+    tensors = {
+        prefix + "gate.weight": torch.arange(6).reshape(2, 3),
+        prefix + "gate.tid2eid": torch.arange(2),
+        prefix + "experts.0.gate_proj.weight": torch.empty(256, 128, dtype=torch.float8_e4m3fn),
+        prefix + "experts.0.up_proj.weight": torch.empty(256, 128, dtype=torch.float8_e4m3fn),
+        prefix + "experts.0.down_proj.weight": torch.empty(256, 128, dtype=torch.float8_e4m3fn),
+        shared_prefix + "gate_proj.weight": torch.empty(256, 256, dtype=torch.float8_e4m3fn),
+        shared_prefix + "up_proj.weight": torch.empty(256, 256, dtype=torch.float8_e4m3fn),
+        shared_prefix + "down_proj.weight": torch.empty(256, 256, dtype=torch.float8_e4m3fn),
+        shared_prefix + "gate_proj.scale": torch.empty(2, 2, dtype=torch.uint8),
+        shared_prefix + "up_proj.scale": torch.empty(2, 2, dtype=torch.uint8),
+        shared_prefix + "down_proj.scale": torch.empty(2, 2, dtype=torch.uint8),
+    }
+    tensors[shared_prefix + checkpoint_name] = torch.empty(
+        bad_shape,
+        dtype=tensors[shared_prefix + checkpoint_name].dtype,
+    )
+    mlp = SimpleNamespace(
+        hash_layer=True,
+        uses_mx_formats=True,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        start_expert_id=0,
+        num_experts_per_rank=0,
+    )
+    owner = SimpleNamespace(
+        cfg=SimpleNamespace(moe_intermediate_size=256, hidden_size=256, n_shared_experts=1),
+        model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        get_parameter=lambda _name: torch.empty(0),
+        get_buffer=lambda _name: torch.empty(0),
+    )
+
+    with pytest.raises(ValueError, match="shared expert tensor"):
+        DeepseekV4ForCausalLM._load_deepseek_v4_moe_experts_mxfp4(
+            owner,
+            SimpleNamespace(
+                has=tensors.__contains__,
+                load_tensor=tensors.__getitem__,
+                shard=lambda tensor, dim, world=None, rank=None: tensor,
+                copy_in=lambda *_args: None,
+            ),
+            "model.layers.0.",
+            0,
+            prefix,
+        )
+
+
 @pytest.mark.parametrize("module_name", ["ffn", "mlp"])
 @pytest.mark.parametrize(
     ("gate_name", "up_name", "down_name"),

@@ -157,6 +157,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   torch::TensorOptions options_;
   torch::Device device_;
   bool enable_mla_ = false;
+  std::string weight_quant_method_;
 
   int64_t tp_size_ = 1;
   int64_t tp_rank_ = 0;

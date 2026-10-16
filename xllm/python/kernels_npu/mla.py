@@ -21,10 +21,10 @@ import torch.nn.functional as F
 import torch_npu
 
 from .attention import batch_matmul_transpose
+from .constants import FRACTAL_NZ_FORMAT
 from .normalization import rms_norm
 from .quantization import quant_matmul, quantize_per_tensor
 
-_FRACTAL_NZ_FORMAT = 29
 _KROPE_CTKV_CACHE_MODE = 1
 _NZ_CACHE_MODE = 3
 _PER_TENSOR_QUANT_ASYMM_MODE = 0
@@ -108,7 +108,7 @@ def prepare_mla_preprocess_v2_qkv(
 
     prepared_weight = _prepare(weight)
     if prepared_weight.device.type != "cpu":
-        prepared_weight = torch_npu.npu_format_cast(prepared_weight, _FRACTAL_NZ_FORMAT)
+        prepared_weight = torch_npu.npu_format_cast(prepared_weight, FRACTAL_NZ_FORMAT)
     return prepared_weight, _prepare(descale), _prepare(bias)
 
 
@@ -131,7 +131,7 @@ def prepare_mla_preprocess_v2_q_b(
 
     prepared_weight = _pack_mla_int8_weight(_prepare(weight))
     if prepared_weight.device.type != "cpu":
-        prepared_weight = torch_npu.npu_format_cast(prepared_weight, _FRACTAL_NZ_FORMAT)
+        prepared_weight = torch_npu.npu_format_cast(prepared_weight, FRACTAL_NZ_FORMAT)
     return prepared_weight, _prepare(descale), _prepare(bias)
 
 
@@ -212,7 +212,7 @@ def deepseek_mla_preprocess_decode_v2(
 def _mla_cache_mode(kv_cache: torch.Tensor) -> str:
     """Return the cache layout name expected by the fused KV operator."""
     get_npu_format = getattr(torch_npu, "get_npu_format", None)
-    if get_npu_format is not None and get_npu_format(kv_cache) == _FRACTAL_NZ_FORMAT:
+    if get_npu_format is not None and get_npu_format(kv_cache) == FRACTAL_NZ_FORMAT:
         return "PA_NZ"
     return "PA"
 

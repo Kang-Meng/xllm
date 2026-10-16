@@ -131,7 +131,8 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
     : model_args_(context.get_model_args()),
       options_(context.get_tensor_options()),
       device_(context.get_tensor_options().device()),
-      enable_mla_(context.get_model_args().enable_mla()) {
+      enable_mla_(context.get_model_args().enable_mla()),
+      weight_quant_method_(context.get_quant_args().quant_method()) {
   ensure_python_interpreter();
 
   const ParallelArgs& parallel_args = context.get_parallel_args();
@@ -440,6 +441,9 @@ py::dict PyCausalLM::build_config_dict(
   visit_properties(model_args_, visitor);
   visit_properties(parallel_args, visitor);
   d["dtype"] = dtype_to_string(options_);
+  // quantization_config.quant_method from the shared quant-args load; Python
+  // models use it to select their weight-format path.
+  d["weight_quant_method"] = weight_quant_method_;
   d["device"] = c10::str(device_);
   d["enable_disagg_pd"] = DisaggPDConfig::get_instance().enable_disagg_pd();
   if (is_qwen3_5_target_model_type(model_args_.model_type())) {

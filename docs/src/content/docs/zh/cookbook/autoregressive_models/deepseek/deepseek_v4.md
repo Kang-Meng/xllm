@@ -19,6 +19,9 @@ https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8
 Pro权重:
 https://modelers.cn/models/Eco-Tech/DeepSeek-V4-Pro-w4a8-mtp
 
+官方 FP8 权重（MXFP8/MXFP4，仅支持昇腾 950 / A5）：开箱即用，无需导出或重量化。
+https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash
+
 
 ## 1. 拉取镜像环境
 
