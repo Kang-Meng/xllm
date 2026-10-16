@@ -128,12 +128,6 @@ void ConcurrentBlockManagerImpl::trim_prefetch_blocks(Sequence* seq,
   }
 }
 
-void ConcurrentBlockManagerImpl::release_out_of_window(Sequence* seq,
-                                                       KVCacheState& kv_state) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  inner_->release_out_of_window(seq, kv_state);
-}
-
 void ConcurrentBlockManagerImpl::reset_prefix_cache() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   inner_->reset_prefix_cache();

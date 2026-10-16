@@ -86,9 +86,6 @@ class CompositeBlockManager : public BlockManager {
   bool allocate_sequence(Sequence* seq,
                          KVCacheState& kv_state,
                          size_t num_tokens);
-  void release_out_of_window_for_sequence(Sequence* seq);
-  void release_out_of_window_for_sequence(Sequence* seq,
-                                          KVCacheState& kv_state);
   void deallocate_for_sequence(Sequence* seq);
   void deallocate_for_sequence(Sequence* seq, KVCacheState& kv_state);
   void allocate_shared_for_sequence(Sequence* seq);

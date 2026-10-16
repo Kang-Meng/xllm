@@ -209,13 +209,6 @@ class BlockManager {
   virtual void trim_prefetch_blocks(Sequence* /*seq*/,
                                     size_t /*max_hit_tokens*/) {}
 
-  // Sliding-window hook: release leading blocks that have slid out of the
-  // window. The composite calls this on every leaf after a successful commit;
-  // the SWA leaf may also call it after an allocation shortage before retrying.
-  // Non-SWA leaves keep the empty default (no-op).
-  virtual void release_out_of_window(Sequence* /*seq*/,
-                                     KVCacheState& /*kv_state*/) {}
-
   // Post-construction init hook: only the xtensor leaf needs it (KV tensors
   // must be created on the worker before VMM physical pages can be mapped to
   // reserve the padding block). Empty base default; the composite fans it out

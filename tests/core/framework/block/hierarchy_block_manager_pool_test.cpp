@@ -1142,14 +1142,20 @@ TEST(HierarchyBlockManagerPoolTest, HostAllocationFailureRejectsHbmAllocation) {
 
   std::vector<int32_t> tokens(257, 71);
   Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+  // The sequence starts empty, so a Host shortage rolls the HBM blocks this
+  // call committed back out. Neither tier stays mounted and no transfer is
+  // queued.
   EXPECT_FALSE(pool.allocate(&sequence, /*num_tokens=*/256));
-  EXPECT_TRUE(sequence.kv_state().has_any_blocks());
+  EXPECT_FALSE(sequence.kv_state().has_any_blocks());
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 0u);
   EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
   EXPECT_FALSE(sequence.has_host_cache_match());
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
 
   pool.deallocate(&sequence);
+  EXPECT_FALSE(sequence.kv_state().has_any_blocks());
+  EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
 }
 
 // Decode scheduling leaves the request that failed allocate mounted. It
@@ -1264,7 +1270,9 @@ TEST(HierarchyBlockManagerPoolTest,
             before.host_front_id);
   EXPECT_GE(sequence.host_kv_state().current_max_tokens_capacity(),
             kFailedChunk);
-  EXPECT_GT(HierarchyPoolTestPeer::pending_offload_pair_count(pool),
+  // Both cursors are still at the forwarded prefix. The retried tail is not
+  // offloaded until that cursor moves past it.
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool),
             transfers_before);
 
   pool.deallocate(&sequence);
@@ -1736,8 +1744,10 @@ TEST(HierarchyBlockManagerPoolTest,
     sequence.kv_state().set_kv_cache_tokens_num(target_tokens);
   }
 
+  // The new chunk holds one compressed unit of SWA blocks. Blocks before the
+  // window start are released, and the previous checkpoint was offloaded.
   EXPECT_EQ(count_valid_blocks(sequence.host_kv_state().blocks(BlockType::SWA)),
-            2 * kChunkTokens / 128 - 1);
+            kChunkTokens / kBaseBlockSize);
   EXPECT_EQ(count_valid_blocks(sequence.host_kv_state().blocks(BlockType::C4)),
             kChunkTokens / kUnitTokens);
   EXPECT_EQ(
@@ -3205,6 +3215,229 @@ TEST(HierarchyBlockManagerPoolTest,
   pool.deallocate(&sequence);
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
   HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+}
+
+TEST(HierarchyBlockManagerPoolTest, TryAllocateMatchesHbmAndFloorsHostCursor) {
+  BlockManagerPool::Options options = make_typed_cache_options();
+  options.instance_is_decode(true).enable_prefix_cache(false);
+  constexpr size_t kPromptTokens = 10000;
+  const std::vector<int32_t> prompt(kPromptTokens, 17);
+
+  BlockManagerPool base_pool(options, /*dp_size=*/1);
+  Sequence base = make_test_sequence(/*index=*/0, prompt);
+  ASSERT_TRUE(base_pool.try_allocate(&base));
+
+  HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+  Sequence sequence = make_test_sequence(/*index=*/1, prompt);
+  ASSERT_TRUE(pool.try_allocate(&sequence));
+
+  const KVCacheState& hbm = sequence.kv_state();
+  const KVCacheState& base_hbm = base.kv_state();
+  EXPECT_EQ(hbm.kv_cache_tokens_num(), base_hbm.kv_cache_tokens_num());
+  EXPECT_EQ(hbm.kv_cache_tokens_num(), kPromptTokens);
+  for (const BlockType type :
+       {BlockType::SWA, BlockType::C4, BlockType::C128}) {
+    const Slice<Block> got = hbm.blocks(type);
+    const Slice<Block> expected = base_hbm.blocks(type);
+    ASSERT_EQ(got.size(), expected.size()) << static_cast<int>(type);
+    for (size_t i = 0; i < got.size(); ++i) {
+      EXPECT_EQ(got[i].is_valid(), expected[i].is_valid())
+          << static_cast<int>(type) << " block " << i;
+    }
+  }
+
+  const size_t c128_block_size = HierarchyPoolTestPeer::host_leaves(pool)
+                                     .at(BlockType::C128)
+                                     .leaf->block_size();
+  EXPECT_EQ(sequence.host_kv_state().kv_cache_tokens_num(),
+            kPromptTokens / c128_block_size * c128_block_size);
+  EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
+
+  const Slice<Block> host_swa = sequence.host_kv_state().blocks(BlockType::SWA);
+  ASSERT_EQ(host_swa.size(),
+            (kPromptTokens + kBaseBlockSize - 1) / kBaseBlockSize);
+  const size_t window_start =
+      kPromptTokens -
+      std::min<size_t>(kPromptTokens, options.sliding_window_size());
+  const size_t inactive_blocks = window_start / kBaseBlockSize;
+  for (size_t i = 0; i < host_swa.size(); ++i) {
+    EXPECT_EQ(host_swa[i].is_valid(), i >= inactive_blocks) << i;
+  }
+
+  pool.deallocate(&sequence);
+  base_pool.deallocate(&base);
+}
+
+void mount_typed_prefix(CompositeBlockManager* composite,
+                        KVCacheState* state,
+                        const std::vector<int32_t>& tokens,
+                        size_t cached_tokens,
+                        size_t sequence_tokens) {
+  ASSERT_NE(composite, nullptr);
+  ASSERT_NE(state, nullptr);
+  for (const BlockType type :
+       {BlockType::SWA, BlockType::C4, BlockType::C128}) {
+    BlockManager* leaf = composite->leaf_entries().at(type).leaf.get();
+    const size_t block_count = cached_tokens / leaf->block_size();
+    std::vector<Block> blocks = leaf->allocate(block_count);
+    ASSERT_EQ(blocks.size(), block_count);
+    leaf->cache(tokens, blocks);
+    // Pass the live sequence length. An exact match against that length drops
+    // the last block so the next forward can recompute it.
+    state->add_shared_blocks(type, std::move(blocks), sequence_tokens);
+  }
+  state->set_kv_cache_tokens_num(cached_tokens);
+}
+
+TEST(HierarchyBlockManagerPoolTest, ChunkedPrefillSwaCoversHostHitPlusChunk) {
+  constexpr size_t kPromptTokens = 8193;
+  constexpr size_t kHostHitTokens = 4096;
+  constexpr size_t kHbmHitTokens = 2048;
+  constexpr size_t kChunkTokens = 1024;
+  constexpr size_t kWindowTokens = 128;
+  constexpr size_t kSwaBlockSize = 128;
+  constexpr size_t kTargetTokens = kHostHitTokens + kChunkTokens;
+
+  BlockManagerPool::Options options = make_typed_cache_options();
+  options.sliding_window_size(kWindowTokens)
+      .swa_blocks_per_seq(1)
+      .enable_prefix_cache(true);
+  HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+  const std::vector<int32_t> tokens(kPromptTokens, 19);
+  auto* device = HierarchyPoolTestPeer::device_composite(pool);
+  for (const BlockType type :
+       {BlockType::SWA, BlockType::C4, BlockType::C128}) {
+    seed_host_prefix(
+        device->leaf_entries().at(type).leaf.get(),
+        std::vector<int32_t>(tokens.begin(), tokens.begin() + kHbmHitTokens));
+  }
+  auto* host = HierarchyPoolTestPeer::host_block_managers(pool).front().get();
+  for (const BlockType type :
+       {BlockType::SWA, BlockType::C4, BlockType::C128}) {
+    // One token past the hit keeps the last full C128 block mounted.
+    seed_host_prefix(host->leaf_entries().at(type).leaf.get(),
+                     std::vector<int32_t>(tokens.begin(),
+                                          tokens.begin() + kHostHitTokens + 1));
+  }
+
+  Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+  pool.allocate_shared(&sequence);
+  ASSERT_EQ(sequence.kv_state().kv_cache_tokens_num(), kHbmHitTokens);
+  ASSERT_EQ(sequence.host_kv_state().kv_cache_tokens_num(), kHostHitTokens);
+  const HostCacheRestorePoint selected = pool.select_host_cache_restore(
+      &sequence, /*max_copy_units=*/kHostHitTokens / kUnitTokens);
+  ASSERT_EQ(selected.restore_target_tokens, kHostHitTokens);
+  pool.trim_host_cache(&sequence, selected);
+
+  ASSERT_TRUE(pool.allocate(&sequence, kTargetTokens));
+
+  const Slice<Block> hbm_swa = sequence.kv_state().blocks(BlockType::SWA);
+  const size_t expected_blocks =
+      (kTargetTokens + kSwaBlockSize - 1) / kSwaBlockSize;
+  ASSERT_EQ(hbm_swa.size(), expected_blocks);
+  const size_t first_live =
+      (kTargetTokens - (kWindowTokens + kChunkTokens)) / kSwaBlockSize;
+  for (size_t i = 0; i < hbm_swa.size(); ++i) {
+    EXPECT_EQ(hbm_swa[i].is_valid(), i >= first_live) << i;
+  }
+
+  pool.deallocate(&sequence);
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     DecodeStepReleasesSwaAndOffloadsCompletedUnit) {
+  constexpr size_t kCachedTokens = 8192;
+  constexpr size_t kPromptTokens = kCachedTokens + 1;
+  constexpr size_t kWindowTokens = 128;
+  constexpr size_t kSwaBlockSize = 128;
+  constexpr size_t kUnitTokens = 2048;
+
+  BlockManagerPool::Options options = make_typed_cache_options();
+  options.instance_is_decode(true)
+      .enable_prefix_cache(false)
+      .num_speculative_tokens(0)
+      .sliding_window_size(kWindowTokens)
+      .swa_blocks_per_seq(kWindowTokens / kSwaBlockSize);
+  HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+  const std::vector<int32_t> tokens(kPromptTokens, 23);
+  Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+  mount_typed_prefix(HierarchyPoolTestPeer::device_composite(pool),
+                     &sequence.kv_state(),
+                     tokens,
+                     kCachedTokens,
+                     sequence.num_tokens());
+  mount_typed_prefix(
+      HierarchyPoolTestPeer::host_block_managers(pool).front().get(),
+      &sequence.host_kv_state(),
+      tokens,
+      kCachedTokens,
+      sequence.num_tokens());
+  sequence.host_kv_state().set_kv_cache_tokens_num(kCachedTokens - kUnitTokens);
+
+  const size_t mounted_blocks = kCachedTokens / kSwaBlockSize;
+  ASSERT_EQ(sequence.kv_state().blocks(BlockType::SWA).size(), mounted_blocks);
+  ASSERT_EQ(sequence.host_kv_state().blocks(BlockType::SWA).size(),
+            mounted_blocks);
+  EXPECT_EQ(count_valid_blocks(sequence.kv_state().blocks(BlockType::SWA)),
+            mounted_blocks);
+  EXPECT_EQ(count_valid_blocks(sequence.host_kv_state().blocks(BlockType::SWA)),
+            mounted_blocks);
+  EXPECT_EQ(sequence.host_kv_state().kv_cache_tokens_num(),
+            kCachedTokens - kUnitTokens);
+  const int32_t moved_host_swa_id =
+      sequence.host_kv_state().blocks(BlockType::SWA)[mounted_blocks - 1].id();
+  ASSERT_NE(moved_host_swa_id, -1);
+
+  ASSERT_TRUE(pool.allocate(&sequence, kPromptTokens));
+
+  // cached=8192, window=128: index 63 holds the window start and stays.
+  // Host moves that block into the offload pair; HBM keeps it.
+  const size_t window_block = mounted_blocks - 1;
+  const Slice<Block> hbm_swa = sequence.kv_state().blocks(BlockType::SWA);
+  ASSERT_EQ(hbm_swa.size(), mounted_blocks + 1);
+  for (size_t i = 0; i < hbm_swa.size(); ++i) {
+    EXPECT_EQ(hbm_swa[i].is_valid(), i >= window_block) << i;
+  }
+  const Slice<Block> host_swa = sequence.host_kv_state().blocks(BlockType::SWA);
+  ASSERT_EQ(host_swa.size(), mounted_blocks + 1);
+  for (size_t i = 0; i + 1 < host_swa.size(); ++i) {
+    EXPECT_FALSE(host_swa[i].is_valid()) << i;
+  }
+  EXPECT_TRUE(host_swa.back().is_valid());
+  EXPECT_EQ(sequence.host_kv_state().kv_cache_tokens_num(), kCachedTokens);
+
+  size_t swa_pairs = 0;
+  size_t c4_pairs = 0;
+  size_t c128_pairs = 0;
+  bool moved_host_swa = false;
+  const size_t pair_count =
+      HierarchyPoolTestPeer::pending_offload_pair_count(pool);
+  for (size_t i = 0; i < pair_count; ++i) {
+    const std::shared_ptr<OffloadBlockPair> pair =
+        HierarchyPoolTestPeer::take_pending_offload_pair(pool);
+    ASSERT_NE(pair, nullptr);
+    switch (pair->block_type) {
+      case BlockType::SWA:
+        ++swa_pairs;
+        moved_host_swa = moved_host_swa || pair->dst.id() == moved_host_swa_id;
+        break;
+      case BlockType::C4:
+        ++c4_pairs;
+        break;
+      case BlockType::C128:
+        ++c128_pairs;
+        break;
+      default:
+        ADD_FAILURE() << static_cast<int>(pair->block_type);
+    }
+  }
+  EXPECT_EQ(swa_pairs, 1u);
+  EXPECT_TRUE(moved_host_swa);
+  EXPECT_EQ(c4_pairs, 1u);
+  EXPECT_EQ(c128_pairs, 1u);
+
+  pool.deallocate(&sequence);
 }
 
 }  // namespace xllm

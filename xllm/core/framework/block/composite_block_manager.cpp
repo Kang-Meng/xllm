@@ -583,33 +583,12 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
     }
   }
 
-  // Commit staged blocks before publishing the completed prefix. The token
-  // cursor bounds publication, so newly allocated compute blocks are not
-  // cached until their tokens have been forwarded.
   for (auto& [type, blocks] : staged) {
     kv_state.add_blocks(type, std::move(blocks));
   }
   staged.clear();
   cache_full_blocks_for_sequence(seq);
   return true;
-}
-
-void CompositeBlockManager::release_out_of_window_for_sequence(Sequence* seq) {
-  if (seq == nullptr) {
-    return;
-  }
-  release_out_of_window_for_sequence(seq, seq->kv_state());
-}
-
-void CompositeBlockManager::release_out_of_window_for_sequence(
-    Sequence* seq,
-    KVCacheState& kv_state) {
-  if (seq == nullptr) {
-    return;
-  }
-  for (auto& [type, entry] : leaves_) {
-    entry.leaf->release_out_of_window(seq, kv_state);
-  }
 }
 
 void CompositeBlockManager::deallocate_for_sequence(Sequence* seq) {

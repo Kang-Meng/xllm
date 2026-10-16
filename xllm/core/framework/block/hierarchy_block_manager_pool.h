@@ -49,6 +49,7 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   ~HierarchyBlockManagerPool() override;
 
   bool allocate(Sequence* sequence, size_t num_tokens) override;
+  bool try_allocate(Sequence* sequence) override;
 
   void allocate_shared(Sequence* sequence) override;
   bool needs_shared_reprobe(Sequence* sequence) const override {
