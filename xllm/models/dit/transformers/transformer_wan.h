@@ -394,9 +394,7 @@ class WanFeedForwardImpl : public torch::nn::Module {
                      int64_t dim,
                      int64_t dim_out = -1,
                      int64_t mult = 4,
-                     float dropout = 0.0f,
                      const std::string& activation_fn = "geglu",
-                     bool final_dropout = false,
                      int64_t inner_dim = -1,
                      bool with_bias = true)
       : options_(context.get_tensor_options()), parallel_args_(parallel_args) {
@@ -431,8 +429,6 @@ class WanFeedForwardImpl : public torch::nn::Module {
                                         parallel_args));
     }
 
-    dropout_ = register_module("dropout", torch::nn::Dropout(dropout));
-
     proj_out_ = register_module(
         "proj_out",
         layer::RowParallelLinear(actual_inner_dim,
@@ -443,20 +439,11 @@ class WanFeedForwardImpl : public torch::nn::Module {
                                  quant_args_,
                                  parallel_args_.dit_tp_group_,
                                  options_));
-
-    if (final_dropout) {
-      final_dropout_ =
-          register_module("final_dropout", torch::nn::Dropout(dropout));
-    }
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) {
     auto output = act_fn_->forward(hidden_states);
-    output = dropout_->forward(output);
     output = proj_out_->forward(output);
-    if (final_dropout_) {
-      output = final_dropout_->forward(output);
-    }
     return output;
   }
 
@@ -475,9 +462,7 @@ class WanFeedForwardImpl : public torch::nn::Module {
   torch::TensorOptions options_;
   ParallelArgs parallel_args_;
   WanGELU act_fn_{nullptr};
-  torch::nn::Dropout dropout_{nullptr};
   layer::RowParallelLinear proj_out_{nullptr};
-  torch::nn::Dropout final_dropout_{nullptr};
 };
 TORCH_MODULE(WanFeedForward);
 
@@ -564,7 +549,6 @@ class WanAttentionImpl : public torch::nn::Module {
     dim_head_ = model_args.head_dim();
     added_kv_proj_dim_ = model_args.added_kv_proj_dim();
     eps_ = 1e-6f;
-    dropout_ = 0.0f;
 
     int64_t cross_dim_head = (cross_attention_dim_head > 0)
                                  ? cross_attention_dim_head
@@ -933,7 +917,6 @@ class WanAttentionImpl : public torch::nn::Module {
   int64_t kv_inner_dim_;
   int64_t added_kv_proj_dim_;
   float eps_;
-  float dropout_;
   bool is_cross_attention_;
 
   layer::ColumnParallelLinear to_q_{nullptr};
@@ -974,9 +957,7 @@ class WanImageEmbeddingImpl : public torch::nn::Module {
                                          in_features_,
                                          out_features_,
                                          1,
-                                         0.0f,
                                          "gelu",
-                                         false,
                                          -1,
                                          true));
     norm2_ =
@@ -1329,9 +1310,7 @@ class WanTransformerBlockImpl : public torch::nn::Module {
                                          dim_,
                                          dim_,
                                          1,
-                                         0.0f,
                                          "gelu-approximate",
-                                         false,
                                          ffn_dim_,
                                          true));
     ada_norm3_ = register_module(

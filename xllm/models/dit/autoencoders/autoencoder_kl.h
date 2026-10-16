@@ -15,7 +15,6 @@ limitations under the License.
 
 #pragma once
 #include <torch/nn/modules/conv.h>
-#include <torch/nn/modules/dropout.h>
 #include <torch/nn/modules/linear.h>
 #include <torch/nn/modules/normalization.h>
 #include <torch/torch.h>

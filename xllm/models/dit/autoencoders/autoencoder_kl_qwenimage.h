@@ -14,7 +14,6 @@ limitations under the License.
 ==============================================================================*/
 #pragma once
 #include <torch/nn/modules/conv.h>
-#include <torch/nn/modules/dropout.h>
 #include <torch/nn/modules/linear.h>
 #include <torch/nn/modules/normalization.h>
 #include <torch/torch.h>
@@ -523,7 +522,6 @@ class QwenImageResidualBlockImpl : public QwenImageBaseModule {
   QwenImageResidualBlockImpl(const ModelContext& context,
                              int64_t in_dim,
                              int64_t out_dim,
-                             double dropout = 0.0,
                              const std::string& non_linearity = "silu")
       : in_dim_(in_dim), out_dim_(out_dim) {
     activation_ = register_module("silu", torch::nn::SiLU());
@@ -550,7 +548,6 @@ class QwenImageResidualBlockImpl : public QwenImageBaseModule {
                                                /*images=*/false,
                                                /*is_bias=*/false,
                                                /*fused=*/false));
-    dropout_layer_ = register_module("dropout", torch::nn::Dropout(dropout));
     conv2_ = register_module(
         "conv2",
         QwenImageCausalConv3d(context,
@@ -620,7 +617,6 @@ class QwenImageResidualBlockImpl : public QwenImageBaseModule {
     }
     result_x = norm2_->forward(result_x);
     result_x = activation_->forward(result_x);
-    result_x = dropout_layer_->forward(result_x);
 
     if (feat_cache && feat_idx) {
       auto idx = (*feat_idx)[0];
@@ -680,7 +676,6 @@ class QwenImageResidualBlockImpl : public QwenImageBaseModule {
   QwenImageRMS_norm norm1_{nullptr}, norm2_{nullptr};
   QwenImageCausalConv3d conv1_{nullptr}, conv2_{nullptr};
   QwenImageCausalConv3d conv_shortcut_{nullptr};
-  torch::nn::Dropout dropout_layer_{nullptr};
   torch::nn::SiLU activation_{nullptr};
   torch::nn::Identity identity_{nullptr};
 };
@@ -831,23 +826,20 @@ class QwenImageMidBlockImpl : public torch::nn::Module {
  public:
   QwenImageMidBlockImpl(const ModelContext& context,
                         int64_t dim,
-                        double dropout = 0.0,
                         const std::string& non_linearity = "silu",
                         int64_t num_layers = 1)
       : dim_(dim) {
     resnets_ = register_module("resnets", torch::nn::ModuleList());
     attentions_ = register_module("attentions", torch::nn::ModuleList());
 
-    auto resnet_0 =
-        QwenImageResidualBlock(context, dim, dim, dropout, non_linearity);
+    auto resnet_0 = QwenImageResidualBlock(context, dim, dim, non_linearity);
     resnets_->push_back(resnet_0);
 
     for (int64_t i = 0; i < num_layers; i++) {
       auto attention = QwenImageAttentionBlock(context, dim);
       attentions_->push_back(attention);
 
-      auto resnet =
-          QwenImageResidualBlock(context, dim, dim, dropout, non_linearity);
+      auto resnet = QwenImageResidualBlock(context, dim, dim, non_linearity);
       resnets_->push_back(resnet);
     }
   }
@@ -920,7 +912,6 @@ class QwenImageEncoder3dImpl : public torch::nn::Module {
                          std::vector<bool> temperal_downsample = {true,
                                                                   true,
                                                                   false},
-                         double dropout = 0.0,
                          int64_t input_channels = 3,
                          const std::string& non_linearity = "silu")
       : dim_(dim),
@@ -955,8 +946,8 @@ class QwenImageEncoder3dImpl : public torch::nn::Module {
       int64_t out_dim = dims[i + 1];
 
       for (int64_t j = 0; j < num_res_blocks_; j++) {
-        auto res_block = QwenImageResidualBlock(
-            context, in_dim, out_dim, dropout, non_linearity);
+        auto res_block =
+            QwenImageResidualBlock(context, in_dim, out_dim, non_linearity);
         down_blocks_->push_back(res_block);
         resnet_blocks_idx_.push_back(counter);
         counter += 1;
@@ -985,7 +976,7 @@ class QwenImageEncoder3dImpl : public torch::nn::Module {
     mid_block_ = register_module(
         "mid_block",
         QwenImageMidBlock(
-            context, dims.back(), dropout, non_linearity, /*num_layers=*/1));
+            context, dims.back(), non_linearity, /*num_layers=*/1));
 
     norm_out_ = register_module("norm_out",
                                 QwenImageRMS_norm(context,
@@ -1168,7 +1159,6 @@ class QwenImageUpBlockImpl : public torch::nn::Module {
                        int64_t in_dim,
                        int64_t out_dim,
                        int64_t num_res_blocks,
-                       double dropout = 0.0,
                        const std::string& upsample_mode = "",
                        const std::string& non_linearity = "silu")
       : in_dim_(in_dim), out_dim_(out_dim) {
@@ -1176,8 +1166,8 @@ class QwenImageUpBlockImpl : public torch::nn::Module {
     int64_t current_dim = in_dim;
 
     for (int64_t i = 0; i < num_res_blocks + 1; i++) {
-      auto resnet = QwenImageResidualBlock(
-          context, current_dim, out_dim, dropout, non_linearity);
+      auto resnet =
+          QwenImageResidualBlock(context, current_dim, out_dim, non_linearity);
       resnets_->push_back(resnet);
       current_dim = out_dim;
     }
@@ -1276,7 +1266,6 @@ class QwenImageDecoder3dImpl : public torch::nn::Module {
                          std::vector<bool> temperal_upsample = {false,
                                                                 true,
                                                                 true},
-                         double dropout = 0.0,
                          int64_t input_channels = 3,
                          const std::string& non_linearity = "silu")
       : dim_(dim),
@@ -1305,8 +1294,7 @@ class QwenImageDecoder3dImpl : public torch::nn::Module {
 
     mid_block_ = register_module(
         "mid_block",
-        QwenImageMidBlock(
-            context, dims[0], dropout, non_linearity, /*num_layers=*/1));
+        QwenImageMidBlock(context, dims[0], non_linearity, /*num_layers=*/1));
 
     up_blocks_ = register_module("up_blocks", torch::nn::ModuleList());
     for (size_t i = 0; i < dims.size() - 1; i++) {
@@ -1326,7 +1314,6 @@ class QwenImageDecoder3dImpl : public torch::nn::Module {
                                        in_dim,
                                        out_dim,
                                        num_res_blocks,
-                                       dropout,
                                        upsample_mode,
                                        non_linearity);
       up_blocks_->push_back(up_block);
@@ -1485,8 +1472,7 @@ class AutoencoderKLQwenImageImpl : public torch::nn::Module,
         base_dim_(context.get_model_args().base_dim()),
         dim_mult_(context.get_model_args().dim_mult()),
         num_res_blocks_(context.get_model_args().num_res_blocks()),
-        attn_scales_(context.get_model_args().attn_scales()),
-        dropout_(context.get_model_args().dropout()) {
+        attn_scales_(context.get_model_args().attn_scales()) {
     temperal_upsample_ = std::vector<bool>(temperal_downsample_.rbegin(),
                                            temperal_downsample_.rend());
 
@@ -1499,7 +1485,6 @@ class AutoencoderKLQwenImageImpl : public torch::nn::Module,
                                                   num_res_blocks_,
                                                   attn_scales_,
                                                   temperal_downsample_,
-                                                  dropout_,
                                                   input_channels));
 
     quant_conv_ =
@@ -1528,7 +1513,6 @@ class AutoencoderKLQwenImageImpl : public torch::nn::Module,
                                                   num_res_blocks_,
                                                   attn_scales_,
                                                   temperal_upsample_,
-                                                  dropout_,
                                                   input_channels));
 
     spatial_compression_ratio_ =
@@ -2029,7 +2013,6 @@ class AutoencoderKLQwenImageImpl : public torch::nn::Module,
   std::vector<double> attn_scales_;
   std::vector<bool> temperal_downsample_;
   std::vector<bool> temperal_upsample_;
-  double dropout_;
 
   int64_t spatial_compression_ratio_;
   bool use_slicing_, use_tiling_;
@@ -2067,7 +2050,6 @@ REGISTER_MODEL_ARGS(AutoencoderKLQwenImage, [&] {
               "temperal_downsample",
               (std::vector<bool>{false, true, true}));
   LOAD_ARG_OR(num_res_blocks, "num_res_blocks", 2);
-  LOAD_ARG_OR(dropout, "dropout", 0);
   LOAD_ARG_OR(latents_mean,
               "latents_mean",
               (std::vector<double>{-0.7571,

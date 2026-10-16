@@ -482,7 +482,6 @@ class AttentionImpl final : public torch::nn::Module {
                 int64_t heads = 8,
                 std::optional<int64_t> kv_heads = std::nullopt,
                 int64_t dim_head = 64,
-                double dropout = 0.0,
                 bool bias = false,
                 const std::string& qk_norm = "",
                 const std::string& cross_attention_norm = "",
@@ -688,8 +687,6 @@ class AttentionImpl final : public torch::nn::Module {
                                                       out_sp_option,
                                                       /*tp=*/std::nullopt,
                                                       quant_args_));
-      to_out_->push_back(
-          torch::nn::Dropout(torch::nn::DropoutOptions(dropout)));
     }
 
     // Additional output for context
@@ -804,8 +801,7 @@ class FeedForwardImpl final : public torch::nn::Module {
   explicit FeedForwardImpl(const ModelContext& context,
                            int64_t dim,
                            int64_t dim_out,
-                           int64_t mult = 4,
-                           double dropout = 0.0)
+                           int64_t mult = 4)
       : options_(context.get_tensor_options()) {
     auto model_args = context.get_model_args();
     quant_args_ = context.get_quant_args();
@@ -1947,7 +1943,6 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
                              /*heads=*/num_attention_heads,
                              /*kv_heads=*/std::nullopt,
                              /*dim_head=*/attention_head_dim,
-                             /*drop_out=*/0.0,
                              /*bias=*/true,
                              /*qk_norm=*/qk_norm,
                              /*cross_attention_norm=*/"",

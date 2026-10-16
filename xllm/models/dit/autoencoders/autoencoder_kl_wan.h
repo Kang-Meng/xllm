@@ -15,7 +15,6 @@ limitations under the License.
 
 #pragma once
 #include <torch/nn/modules/conv.h>
-#include <torch/nn/modules/dropout.h>
 #include <torch/nn/modules/linear.h>
 #include <torch/nn/modules/normalization.h>
 #include <torch/torch.h>
@@ -576,8 +575,7 @@ class WanResidualBlockImpl : public torch::nn::Module {
  public:
   WanResidualBlockImpl(const ModelContext& context,
                        int64_t in_dim,
-                       int64_t out_dim,
-                       float dropout = 0.0f)
+                       int64_t out_dim)
       : in_dim_(in_dim), out_dim_(out_dim) {
     nonlinearity_ = torch::nn::Functional(torch::silu);
     norm1_ = register_module("norm1", WanRMSNorm(in_dim, true, false, false));
@@ -589,7 +587,6 @@ class WanResidualBlockImpl : public torch::nn::Module {
                                              std::vector<int64_t>{1, 1, 1},
                                              std::vector<int64_t>{1, 1, 1}));
     norm2_ = register_module("norm2", WanRMSNorm(out_dim, true, false, false));
-    dropout_layer_ = register_module("dropout", torch::nn::Dropout(dropout));
     conv2_ = register_module("conv2",
                              WanCausalConv3D(context,
                                              out_dim,
@@ -654,7 +651,6 @@ class WanResidualBlockImpl : public torch::nn::Module {
 
     x = norm2_->forward(x);
     x = nonlinearity_(x);
-    x = dropout_layer_->forward(x);
 
     if (feat_cache) {
       int64_t idx = (*feat_idx)[0];
@@ -718,7 +714,6 @@ class WanResidualBlockImpl : public torch::nn::Module {
   torch::nn::Functional nonlinearity_{nullptr};
   WanRMSNorm norm1_{nullptr}, norm2_{nullptr};
   WanCausalConv3D conv1_{nullptr}, conv2_{nullptr}, conv_shortcut_{nullptr};
-  torch::nn::Dropout dropout_layer_{nullptr};
 };
 TORCH_MODULE(WanResidualBlock);
 
@@ -851,15 +846,14 @@ class WanMidBlockImpl : public torch::nn::Module {
  public:
   WanMidBlockImpl(const ModelContext& context,
                   int64_t dim,
-                  float dropout = 0.0f,
                   int64_t num_layers = 1)
       : dim_(dim) {
     resnets_ = register_module("resnets", torch::nn::ModuleList());
     attentions_ = register_module("attentions", torch::nn::ModuleList());
-    resnets_->push_back(WanResidualBlock(context, dim, dim, dropout));
+    resnets_->push_back(WanResidualBlock(context, dim, dim));
     for (int64_t i = 0; i < num_layers; ++i) {
       attentions_->push_back(WanAttentionBlock(context, dim));
-      resnets_->push_back(WanResidualBlock(context, dim, dim, dropout));
+      resnets_->push_back(WanResidualBlock(context, dim, dim));
     }
   }
 
@@ -920,13 +914,11 @@ class WanResidualDownBlockImpl : public torch::nn::Module {
   WanResidualDownBlockImpl(const ModelContext& context,
                            int64_t in_dim,
                            int64_t out_dim,
-                           float dropout,
                            int64_t num_res_blocks,
                            bool temperal_downsample = false,
                            bool down_flag = false)
       : in_dim_(in_dim),
         out_dim_(out_dim),
-        dropout_(dropout),
         num_res_blocks_(num_res_blocks),
         temperal_downsample_(temperal_downsample),
         down_flag_(down_flag) {
@@ -935,8 +927,7 @@ class WanResidualDownBlockImpl : public torch::nn::Module {
     resnets_ = register_module("resnets", torch::nn::ModuleList());
     int64_t cur_in_dim = in_dim;
     for (int64_t i = 0; i < num_res_blocks; ++i) {
-      resnets_->push_back(
-          WanResidualBlock(context, cur_in_dim, out_dim, dropout));
+      resnets_->push_back(WanResidualBlock(context, cur_in_dim, out_dim));
       cur_in_dim = out_dim;
     }
     if (down_flag) {
@@ -989,7 +980,6 @@ class WanResidualDownBlockImpl : public torch::nn::Module {
 
  private:
   int64_t in_dim_, out_dim_;
-  float dropout_;
   int64_t num_res_blocks_;
   bool temperal_downsample_, down_flag_;
   AvgDown3D avg_shortcut_{nullptr};
@@ -1010,7 +1000,6 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
                       std::vector<bool> temperal_downsample = {true,
                                                                true,
                                                                false},
-                      float dropout = 0.0f,
                       bool is_residual = false) {
     nonlinearity_ = torch::nn::Functional(torch::silu);
     std::vector<int64_t> dims;
@@ -1033,7 +1022,6 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
             context,
             in_dim,
             out_dim,
-            dropout,
             num_res_blocks,
             (i != dim_mult.size() - 1) ? temperal_downsample[i] : false,
             (i != dim_mult.size() - 1)));
@@ -1041,7 +1029,7 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
         int64_t current_dim = in_dim;
         for (int64_t j = 0; j < num_res_blocks; ++j) {
           down_blocks_->push_back(
-              WanResidualBlock(context, current_dim, out_dim, dropout));
+              WanResidualBlock(context, current_dim, out_dim));
           if (std::find(attn_scales.begin(), attn_scales.end(), scale) !=
               attn_scales.end()) {
             down_blocks_->push_back(WanAttentionBlock(context, out_dim));
@@ -1056,8 +1044,8 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
         }
       }
     }
-    mid_block_ = register_module("mid_block",
-                                 WanMidBlock(context, dims.back(), dropout, 1));
+    mid_block_ =
+        register_module("mid_block", WanMidBlock(context, dims.back(), 1));
     norm_out_ = register_module("norm_out",
                                 WanRMSNorm(dims.back(), true, false, false));
     conv_out_ = register_module("conv_out",
@@ -1211,7 +1199,6 @@ class WanResidualUpBlockImpl : public torch::nn::Module {
                          int64_t in_dim,
                          int64_t out_dim,
                          int64_t num_res_blocks,
-                         float dropout = 0.0f,
                          bool temperal_upsample = false,
                          bool up_flag = false)
       : in_dim_(in_dim), out_dim_(out_dim), num_res_blocks_(num_res_blocks) {
@@ -1226,8 +1213,7 @@ class WanResidualUpBlockImpl : public torch::nn::Module {
     resnets_ = register_module("resnets", torch::nn::ModuleList());
     int64_t current_dim = in_dim;
     for (int64_t i = 0; i < num_res_blocks + 1; ++i) {
-      resnets_->push_back(
-          WanResidualBlock(context, current_dim, out_dim, dropout));
+      resnets_->push_back(WanResidualBlock(context, current_dim, out_dim));
       current_dim = out_dim;
     }
     if (up_flag) {
@@ -1306,14 +1292,12 @@ class WanUpBlockImpl : public torch::nn::Module {
                  int64_t in_dim,
                  int64_t out_dim,
                  int64_t num_res_blocks,
-                 float dropout = 0.0f,
                  const std::optional<std::string>& upsample_mode = std::nullopt)
       : in_dim_(in_dim), out_dim_(out_dim), num_res_blocks_(num_res_blocks) {
     resnets_ = register_module("resnets", torch::nn::ModuleList());
     int64_t current_dim = in_dim;
     for (int64_t i = 0; i < num_res_blocks + 1; ++i) {
-      resnets_->push_back(
-          WanResidualBlock(context, current_dim, out_dim, dropout));
+      resnets_->push_back(WanResidualBlock(context, current_dim, out_dim));
       current_dim = out_dim;
     }
     if (upsample_mode.has_value()) {
@@ -1397,7 +1381,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
                       const std::vector<bool>& temperal_upsample = {false,
                                                                     true,
                                                                     true},
-                      float dropout = 0.0f,
                       int64_t out_channels = 3,
                       bool is_residual = false) {
     std::vector<int64_t> dims;
@@ -1412,8 +1395,7 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
                                                std::vector<int64_t>{3, 3, 3},
                                                std::vector<int64_t>{1, 1, 1},
                                                std::vector<int64_t>{1, 1, 1}));
-    mid_block_ =
-        register_module("mid_block", WanMidBlock(context, dims[0], dropout, 1));
+    mid_block_ = register_module("mid_block", WanMidBlock(context, dims[0], 1));
     up_blocks_ = register_module("up_blocks", torch::nn::ModuleList());
     for (size_t i = 0; i < dims.size() - 1; ++i) {
       int64_t in_dim = dims[i];
@@ -1434,7 +1416,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
                                in_dim,
                                out_dim,
                                num_res_blocks,
-                               dropout,
                                (up_flag ? temperal_upsample[i] : false),
                                up_flag));
       } else {
@@ -1443,7 +1424,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
                        in_dim,
                        out_dim,
                        num_res_blocks,
-                       dropout,
                        up_flag ? std::optional<std::string>(upsample_mode)
                                : std::nullopt));
       }
@@ -1605,7 +1585,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module,
                                                args_.num_res_blocks(),
                                                args_.attn_scales(),
                                                args_.temperal_downsample(),
-                                               args_.dropout(),
                                                args_.vae_is_residual()));
 
     auto decoder_temporal = args_.temperal_downsample();
@@ -1619,7 +1598,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module,
                                                args_.num_res_blocks(),
                                                args_.attn_scales(),
                                                decoder_temporal,
-                                               args_.dropout(),
                                                args_.out_channels(),
                                                args_.vae_is_residual()));
 
@@ -1832,7 +1810,6 @@ REGISTER_MODEL_ARGS(AutoencoderKLWan, [&] {
               (std::vector<bool>{true, true, false}));
   LOAD_ARG_OR(attn_scales, "attn_scales", (std::vector<double>{}));
   LOAD_ARG_OR(dim_mult, "dim_mult", (std::vector<int64_t>{1, 2, 4, 4}));
-  LOAD_ARG_OR(dropout, "dropout", 0.0f);
   LOAD_ARG_OR(in_channels, "in_channels", 3);
   LOAD_ARG_OR(out_channels, "out_channels", 3);
   LOAD_ARG_OR(vae_is_residual, "is_residual", false);
