@@ -157,18 +157,19 @@ def test_ordinary_model_does_not_construct_eplv2_policy(degree: int, monkeypatch
 
 @pytest.mark.parametrize("capture,state", [(False, False), (True, False), (False, True), (True, True)])
 @pytest.mark.parametrize("rows", [4, 5])
+@pytest.mark.parametrize("mega_moe_capacity", [0, 4])
 def test_shared_backend_selector_preserves_graph_admission(
-    capture: bool, state: bool, rows: int, monkeypatch: pytest.MonkeyPatch
+    capture: bool, state: bool, rows: int, mega_moe_capacity: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: capture)
     context = SimpleNamespace(execution_state=object()) if state else None
-    policy = Eplv2CommPolicy(4)
+    policy = Eplv2CommPolicy(8 if mega_moe_capacity else 4, mega_moe_capacity=mega_moe_capacity)
     if rows > 4 and (capture or state):
         with pytest.raises(ValueError, match="All-to-AllV requires eager"):
             glm5_next._select_eplv2_backend(policy, context, rows)
     else:
         assert glm5_next._select_eplv2_backend(policy, context, rows) == (
-            "mc2" if rows <= 4 else "alltoall",
+            ("megamoe" if mega_moe_capacity else "mc2") if rows <= 4 else "alltoall",
             capture or state,
         )
 

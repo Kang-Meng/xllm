@@ -388,15 +388,18 @@ class ModelExecutor:
                 DecodeAclGraphRunner,
             )
 
-            # EPLv2 uses MC2 only while the per-TP-rank dispatch fits the HCCL
-            # window. Larger batches must take the eager All-to-AllV path
-            # before graph capture, including expanded DFlash2 verify rows.
+            # Per-rank Graph-safe cap, times TP for the runner's pre-shard rows.
             eplv2_policy = getattr(execution_model, "_comm_policy", None)
             eplv2_graph_kwargs: dict[str, int] = {}
             if eplv2_policy is not None and int(config.get("expert_parallel_degree", 0)) == 2:
                 tp_size = int(config.get("tp_size", 1))
-                capacity = 0 if eplv2_policy.mode == "alltoall" else eplv2_policy.mc2_capacity * tp_size
-                eplv2_graph_kwargs["eplv2_graph_token_limit"] = capacity
+                per_rank_rows = eplv2_policy.graph_token_limit
+                eplv2_graph_kwargs["eplv2_graph_token_limit"] = per_rank_rows * tp_size
+            glm_eplv2 = (
+                config.get("model_type") in ("glm5_next", "glm5_next_text")
+                and int(config.get("expert_parallel_degree", 0)) == 2
+                and int(config.get("ep_size", 1)) > 1
+            )
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
@@ -414,7 +417,7 @@ class ModelExecutor:
                 # width so a caller that passes num_decoding_tokens still wins
                 # (single source of truth, no param/config divergence).
                 num_decoding_tokens=num_decoding_tokens,
-                enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
+                enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False) and not glm_eplv2),
                 is_spec_draft=is_spec_draft,
                 draft_query_width=int(config.get("draft_query_width", 1) or 1),
                 **eplv2_graph_kwargs,

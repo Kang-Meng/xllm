@@ -124,15 +124,18 @@ def test_alltoall_empty_edges_have_transport_rows_but_no_expert_rows(
     torch.testing.assert_close(actual, torch.cat(pieces))
 
 
+@pytest.mark.parametrize("routing_dtype", (torch.float32, torch.bfloat16))
 @pytest.mark.parametrize("has_active_source", (True, False))
 def test_ep_moe_w8a8_preserves_dispatch_compute_combine_contract(
     monkeypatch: pytest.MonkeyPatch,
     has_active_source: bool,
+    routing_dtype: torch.dtype,
 ) -> None:
     from xllm.python import kernels
 
     moe = _load_npu_moe_module()
     inputs = _make_inputs()
+    inputs["topk_weights"] = inputs["topk_weights"].to(routing_dtype)
     hidden = inputs["hidden"]
     topk_weights = inputs["topk_weights"]
     topk_ids = inputs["topk_ids"]
@@ -246,9 +249,8 @@ def test_ep_moe_w8a8_preserves_dispatch_compute_combine_contract(
     assert normalized_mask is not active_mask
     torch.testing.assert_close(normalized_hidden, hidden.reshape(-1, 8))
     torch.testing.assert_close(normalized_ids, topk_ids.reshape(-1, 2).to(torch.int32))
-    expected_weights = topk_weights.reshape(-1, 2).to(hidden.dtype).float()
+    expected_weights = topk_weights.reshape(-1, 2).float()
     torch.testing.assert_close(normalized_weights, expected_weights, rtol=0, atol=0)
-    assert not torch.equal(normalized_weights, topk_weights.reshape(-1, 2).float())
     torch.testing.assert_close(normalized_mask, active_mask)
     assert dispatch_kwargs["scales"] is None
     assert dispatch_kwargs["group_ep"] == "ep_group"

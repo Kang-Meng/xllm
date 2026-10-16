@@ -45,14 +45,75 @@ def test_operator_token_limit_independent_of_phase(rows: int, expected: str) -> 
     assert policy.select(rows) == expected
 
 
-def test_explicit_modes_fail_before_execution_not_after_collectives() -> None:
-    mc2 = Eplv2CommPolicy.from_geometry(4096, 288, 8, 8, 200, mode="mc2")
-    with pytest.raises(ValueError, match="exceed capacity"):
-        mc2.select(512)
-    a2a = Eplv2CommPolicy.from_geometry(4096, 288, 8, 8, 200, mode="alltoall")
-    assert a2a.select(1) == "alltoall"
-    with pytest.raises(ValueError, match="eager"):
-        a2a.select(1, graph=True)
+@pytest.mark.parametrize(
+    ("mc2_capacity", "mega_moe_capacity", "backend", "graph_limit"),
+    [(3, 0, "mc2", 3), (8, 4, "megamoe", 4)],
+)
+def test_graph_limit_matches_auto_backend(
+    mc2_capacity: int, mega_moe_capacity: int, backend: str, graph_limit: int
+) -> None:
+    policy = Eplv2CommPolicy(mc2_capacity, mega_moe_capacity=mega_moe_capacity)
+    assert policy.graph_token_limit == graph_limit
+    assert policy.select(graph_limit, graph=True) == backend
+    assert policy.select(graph_limit + 1) == "alltoall"
+    with pytest.raises(ValueError, match="requires eager execution"):
+        policy.select(graph_limit + 1, graph=True)
+
+
+@pytest.mark.parametrize(
+    "mc2_capacity,mega_moe_capacity,expected_backend,capacity",
+    [(4, 0, "mc2", 4), (8, 4, "megamoe", 4), (2, 4, "megamoe", 4)],
+)
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("graph", [False, True])
+def test_auto_selection_at_capacity_boundary(
+    mc2_capacity: int, mega_moe_capacity: int, expected_backend: str, capacity: int, offset: int, graph: bool
+) -> None:
+    policy = Eplv2CommPolicy(mc2_capacity, mega_moe_capacity=mega_moe_capacity)
+    rows = capacity + offset
+    assert policy.graph_token_limit == capacity
+    if graph and offset > 0:
+        with pytest.raises(ValueError, match="requires eager execution"):
+            policy.select(rows, graph=True)
+    else:
+        assert policy.select(rows, graph=graph) == (expected_backend if offset <= 0 else "alltoall")
+
+
+def test_zero_capacity_only_admits_eager_alltoall() -> None:
+    policy = Eplv2CommPolicy(0)
+    assert policy.graph_token_limit == 0
+    assert policy.select(1) == "alltoall"
+    with pytest.raises(ValueError, match="requires eager execution"):
+        policy.select(1, graph=True)
+
+
+@pytest.mark.parametrize("mc2_capacity,mega_moe_capacity", [(-1, 0), (3, -1)])
+def test_negative_communication_capacity_fails_during_construction(mc2_capacity: int, mega_moe_capacity: int) -> None:
+    with pytest.raises(ValueError, match="nonnegative"):
+        Eplv2CommPolicy(mc2_capacity, mega_moe_capacity=mega_moe_capacity)
+
+
+@pytest.mark.parametrize("mega_moe_capacity", [0, 4])
+@pytest.mark.parametrize("rows", [0, -1])
+@pytest.mark.parametrize("graph", [False, True])
+def test_nonpositive_source_rows_rejected(mega_moe_capacity: int, rows: int, graph: bool) -> None:
+    with pytest.raises(ValueError, match="source rows"):
+        Eplv2CommPolicy(3, mega_moe_capacity=mega_moe_capacity).select(rows, graph=graph)
+
+
+def test_replacing_capacity_recomputes_backend_and_graph_limit() -> None:
+    from dataclasses import replace
+
+    policy = Eplv2CommPolicy(3, mega_moe_capacity=4)
+    resized = replace(policy, mega_moe_capacity=8)
+    assert resized.graph_token_limit == 8
+    assert resized.select(8, graph=True) == "megamoe"
+    off = replace(resized, mega_moe_capacity=0)
+    assert off.graph_token_limit == 3
+    assert off.select(3, graph=True) == "mc2"
+    assert off.select(4) == "alltoall"
+    assert policy.graph_token_limit == 4
+    assert policy.select(4, graph=True) == "megamoe"
 
 
 @pytest.mark.parametrize("limit", [0, 513, -1])
@@ -64,6 +125,8 @@ def test_invalid_token_limit(limit: int) -> None:
 def test_invalid_geometry_never_enters_mc2() -> None:
     policy = Eplv2CommPolicy.from_geometry(16, 32, 2, 2, 3072)
     assert policy.select(1) == "alltoall"
+    with pytest.raises(ValueError, match="MC2 capacity"):
+        policy.select(1, graph=True)
     with pytest.raises(ValueError, match="source rows"):
         policy.select(0)
 

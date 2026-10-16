@@ -81,7 +81,7 @@ def _config(**overrides: object) -> glm5_next.Glm5NextConfig:
         ({"tp_size": 4, "ep_size": 2, "moe_tp_size": 1}, "must equal"),
         ({"expert_parallel_degree": 2}, "requires EP > 1"),
         ({"expert_parallel_degree": 3}, "must be 0, 1 or 2"),
-        ({"enable_mega_moe": True}, "does not support enable_mega_moe"),
+        ({"enable_mega_moe": True}, "requires expert_parallel_degree=2"),
         ({"enable_fused_mc2": True}, "does not support enable_fused_mc2"),
     ],
 )

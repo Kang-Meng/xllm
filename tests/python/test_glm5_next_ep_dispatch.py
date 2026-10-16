@@ -354,7 +354,6 @@ def test_tp_route_keeps_main_unified_w8a8_path(monkeypatch: pytest.MonkeyPatch) 
 def test_ordinary_ep_does_not_inherit_eplv2_policy_or_shared_layout(
     monkeypatch: pytest.MonkeyPatch, degree: int, dp: int, tp: int, ep: int
 ) -> None:
-    monkeypatch.setenv("XLLM_EPLV2_COMM_MODE", "invalid-for-eplv2")
     monkeypatch.setenv("XLLM_EPLV2_MC2_MAX_TOKENS", "not-an-integer")
     monkeypatch.setenv("HCCL_BUFFSIZE", "not-an-integer")
     cfg = glm5_next.Glm5NextConfig.from_dict(
@@ -444,29 +443,40 @@ def test_eplv2_rejects_mismatched_pcp_context_before_selecting_backend(monkeypat
 
 
 @pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("enable_mega_moe", [False, True])
+@pytest.mark.parametrize("capture,state", [(True, False), (False, True)])
 @pytest.mark.parametrize(
     "failure,message",
-    [
-        ("mc2_capacity", "exceed capacity"),
-        ("alltoall_graph", "requires eager"),
-        ("graph_mask", "stable active-token mask"),
-    ],
+    [("graph_capacity", "requires eager"), ("graph_mask", "stable active-token mask")],
 )
 def test_model_rejects_unsupported_execution_before_first_layer(
-    monkeypatch: pytest.MonkeyPatch, sequence_parallel: bool, failure: str, message: str
+    monkeypatch: pytest.MonkeyPatch,
+    sequence_parallel: bool,
+    enable_mega_moe: bool,
+    capture: bool,
+    state: bool,
+    failure: str,
+    message: str,
 ) -> None:
     model = glm5_next.Glm5NextModel.__new__(glm5_next.Glm5NextModel)
     torch.nn.Module.__init__(model)
-    model.cfg = _config(eplv2_sequence_parallel=sequence_parallel)
+    model.cfg = _config(
+        eplv2_sequence_parallel=sequence_parallel,
+        enable_mega_moe=enable_mega_moe,
+        mega_moe_context=torch.zeros(8, dtype=torch.int32),
+        mega_moe_ccl_buffer_size=1024,
+        mega_moe_num_max_tokens_per_rank=1 if failure == "graph_capacity" else 512,
+    )
+    capacity = 1 if failure == "graph_capacity" else 512
     model._comm_policy = Eplv2CommPolicy(
-        1 if failure == "mc2_capacity" else 512,
-        "alltoall" if failure == "alltoall_graph" else "mc2",
+        512 if enable_mega_moe else capacity, mega_moe_capacity=capacity if enable_mega_moe else 0
     )
     first_layer = torch.nn.Module()
     first_layer.forward = Mock(side_effect=AssertionError("Admission must precede Attention/KV updates"))
     model.layers = torch.nn.ModuleList([first_layer])
     context = SimpleNamespace(
         metadata=_metadata(),
+        execution_state=object() if state else None,
         execution_contexts=(
             {}
             if failure == "graph_mask"
@@ -474,9 +484,11 @@ def test_model_rejects_unsupported_execution_before_first_layer(
         ),
     )
     monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: context)
-    monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: failure in ("alltoall_graph", "graph_mask"))
+    monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: capture)
     with pytest.raises(ValueError, match=message):
-        model(torch.zeros(3, dtype=torch.long), torch.arange(3), inputs_embeds=torch.ones(1, 3, 8))
+        model(
+            torch.zeros(3, dtype=torch.long), torch.arange(3), inputs_embeds=torch.ones(1, 3, 8, dtype=torch.bfloat16)
+        )
     first_layer.forward.assert_not_called()
 
 
@@ -497,21 +509,69 @@ def test_full_layout_mode_keeps_supported_execution_without_sp(monkeypatch: pyte
     assert model._sp_layout_and_mask(torch.ones(1, 3, 8), torch.ones(1, 3, dtype=torch.bool)) == (None, None)
 
 
-def test_direct_moe_rejects_capacity_before_shared_execution(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = _moe(_config())
-    model._comm_policy = Eplv2CommPolicy(1, "mc2")
+@pytest.mark.parametrize("enable_mega_moe", [False, True])
+@pytest.mark.parametrize("capture,state", [(True, False), (False, True)])
+def test_direct_moe_rejects_graph_capacity_before_shared_and_routed_execution(
+    monkeypatch: pytest.MonkeyPatch, enable_mega_moe: bool, capture: bool, state: bool
+) -> None:
+    model = _moe(
+        _config(
+            enable_mega_moe=enable_mega_moe,
+            mega_moe_context=torch.zeros(8, dtype=torch.int32),
+            mega_moe_ccl_buffer_size=1024,
+            mega_moe_num_max_tokens_per_rank=1,
+        ),
+        dtype=torch.bfloat16,
+    )
+    model._comm_policy = Eplv2CommPolicy(8 if enable_mega_moe else 1, mega_moe_capacity=1 if enable_mega_moe else 0)
     model.shared_experts = _Shared()
     shared = Mock(side_effect=AssertionError("Validate routed capacity before launching shared work"))
+    routed = Mock(side_effect=AssertionError("Reject unsupported Graph before routed execution"))
     monkeypatch.setattr(model.shared_experts, "forward", shared)
-    monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: None)
-    monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
-    with pytest.raises(ValueError, match="exceed capacity"):
+    monkeypatch.setattr(model, "_run_routed_sp", routed)
+    context = SimpleNamespace(execution_state=object()) if state else None
+    monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: context)
+    monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: capture)
+    with pytest.raises(ValueError, match="requires eager execution"):
         model(
-            torch.ones(2, 8),
+            torch.ones(2, 8, dtype=torch.bfloat16),
             token_layout=TokenParallelLayout(4, 2, 0),
             token_mask=torch.ones(2, dtype=torch.bool),
         )
     shared.assert_not_called()
+    routed.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_mega_moe", [False, True])
+def test_direct_moe_over_capacity_automatically_executes_eager_alltoall(
+    monkeypatch: pytest.MonkeyPatch, enable_mega_moe: bool
+) -> None:
+    model = _moe(
+        _config(
+            enable_mega_moe=enable_mega_moe,
+            mega_moe_context=torch.zeros(8, dtype=torch.int32),
+            mega_moe_ccl_buffer_size=1024,
+            mega_moe_num_max_tokens_per_rank=1,
+        ),
+        dtype=torch.bfloat16,
+    )
+    model._comm_policy = Eplv2CommPolicy(8 if enable_mega_moe else 1, mega_moe_capacity=1 if enable_mega_moe else 0)
+    model.shared_experts = _Shared()
+    monkeypatch.setattr(model, "_route_ep", _routing)
+    alltoall = Mock(side_effect=lambda hidden, *args, **kwargs: hidden * 5)
+    unsupported = Mock(side_effect=AssertionError("Over-capacity batches must not execute MC2 or MegaMoE"))
+    monkeypatch.setattr(glm5_next.kernels, "ep_moe_w8a8_alltoall", alltoall, raising=False)
+    monkeypatch.setattr(glm5_next.kernels, "ep_moe_w8a8", unsupported, raising=False)
+    monkeypatch.setattr(glm5_next.kernels, "mega_moe", unsupported, raising=False)
+    monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: None)
+    monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    mask = torch.ones(2, dtype=torch.bool)
+    output = model(hidden, token_layout=TokenParallelLayout(4, 2, 0), token_mask=mask)
+    torch.testing.assert_close(output, hidden * (3 + 5 * model.routed_scaling))
+    alltoall.assert_called_once()
+    torch.testing.assert_close(alltoall.call_args.kwargs["x_active_mask"], mask)
+    unsupported.assert_not_called()
 
 
 def test_eplv2_full_layout_entry_rejects_unsharded_pcp_prefill_before_experts(monkeypatch: pytest.MonkeyPatch) -> None:

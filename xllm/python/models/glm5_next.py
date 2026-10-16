@@ -255,12 +255,14 @@ class Glm5NextConfig:
     expert_parallel_degree: int = 0
     enable_mega_moe: bool = False
     enable_fused_mc2: bool = False
+    mega_moe_context: torch.Tensor | None = None
+    mega_moe_ccl_buffer_size: int = 0
+    mega_moe_num_max_tokens_per_rank: int = 0
     # 0-based post-layer indices threaded from the draft's target_layer_ids
     # (via ModelArgs). Empty => capture disabled (non-speculative serving).
     layers_to_capture: tuple[int, ...] = ()
     eplv2_sequence_parallel: bool = True
     eplv2_shared_overlap: bool = True
-    eplv2_comm_mode: str = "auto"
     eplv2_mc2_max_tokens_per_rank: int = 512
 
     def __post_init__(self) -> None:
@@ -360,9 +362,6 @@ class Glm5NextConfig:
             cp_rank=int(pick("cp_rank", default=0)),
             eplv2_sequence_parallel=bool(pick("eplv2_sequence_parallel", default=True)),
             eplv2_shared_overlap=bool(pick("eplv2_shared_overlap", default=True)),
-            eplv2_comm_mode=str(
-                pick("eplv2_comm_mode", default=os.getenv("XLLM_EPLV2_COMM_MODE", "auto") if degree == 2 else "auto")
-            ),
             eplv2_mc2_max_tokens_per_rank=int(
                 pick(
                     "eplv2_mc2_max_tokens_per_rank",
@@ -374,6 +373,9 @@ class Glm5NextConfig:
             expert_parallel_degree=degree,
             enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
             enable_fused_mc2=bool(pick("enable_fused_mc2", default=False)),
+            mega_moe_context=pick("mega_moe_context", default=None),
+            mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
+            mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
             # mHC fields: ModelArgs may emit a 0 default (un-plumbed); treat 0
             # /None as unset and fall back to the real 300B defaults.
@@ -389,7 +391,19 @@ class Glm5NextConfig:
         if self.expert_parallel_degree not in (0, 1, 2):
             raise ValueError("expert_parallel_degree must be 0, 1 or 2")
         if self.enable_mega_moe:
-            raise ValueError("GLM-5.3-Flash ordinary EP does not support enable_mega_moe")
+            if self.expert_parallel_degree != 2:
+                raise ValueError("GLM MegaMoE requires expert_parallel_degree=2")
+            if (
+                not isinstance(self.mega_moe_context, torch.Tensor)
+                or self.mega_moe_context.ndim != 1
+                or self.mega_moe_context.numel() == 0
+                or self.mega_moe_context.dtype != torch.int32
+            ):
+                raise ValueError("GLM MegaMoE requires a one-dimensional int32 communication context")
+            if self.mega_moe_ccl_buffer_size <= 0 or self.mega_moe_num_max_tokens_per_rank <= 0:
+                raise ValueError("GLM MegaMoE requires positive communication capacities")
+            if self.swiglu_limit > torch.finfo(torch.float32).max:
+                raise ValueError("GLM MegaMoE SwiGLU clamp limit must fit float32")
         if self.enable_fused_mc2:
             raise ValueError("GLM-5.3-Flash ordinary EP does not support enable_fused_mc2")
         for name in ("tp", "ep", "dp", "cp", "moe_tp"):
@@ -410,8 +424,6 @@ class Glm5NextConfig:
             self._validate_eplv2_parallelism()
 
     def _validate_eplv2_parallelism(self) -> None:
-        if self.eplv2_comm_mode not in ("auto", "mc2", "alltoall"):
-            raise ValueError("eplv2_comm_mode must be auto, mc2 or alltoall")
         if not 0 < self.eplv2_mc2_max_tokens_per_rank <= 512:
             raise ValueError("eplv2_mc2_max_tokens_per_rank must be in [1, 512]")
         if self.ep_size <= 1:
@@ -2175,7 +2187,7 @@ def _eplv2_comm_policy(cfg: Glm5NextConfig) -> Eplv2CommPolicy | None:
         cfg.num_experts_per_tok,
         int(os.getenv("HCCL_BUFFSIZE", "200")),
         cfg.eplv2_mc2_max_tokens_per_rank,
-        cfg.eplv2_comm_mode,
+        mega_moe_capacity=cfg.mega_moe_num_max_tokens_per_rank if cfg.enable_mega_moe else 0,
     )
 
 
@@ -2279,6 +2291,12 @@ class Glm5NextMoE(nn.Module):
         assert self.moe_inter % tp == 0, f"moe_intermediate_size {self.moe_inter} not divisible by tp {tp}"
         self.inter_local = self.moe_inter // tp
         self.use_w8a8: bool = False  # set in load_weights via probe_quant
+        if cfg.enable_mega_moe:
+            if dtype != torch.bfloat16 or cfg.mega_moe_context.device != device:
+                raise ValueError("GLM MegaMoE requires BF16 hidden states and a context on the model device")
+            self.register_buffer("mega_moe_context", cfg.mega_moe_context, persistent=False)
+            self.register_buffer("mega_moe_w13_scale", None, persistent=False)
+            self.register_buffer("mega_moe_w2_scale", None, persistent=False)
 
         self.gate = nn.Linear(cfg.hidden_size, cfg.n_routed_experts, bias=False, dtype=torch.float32, device=device)
         self.register_buffer(
@@ -2311,6 +2329,8 @@ class Glm5NextMoE(nn.Module):
         """W8A8: transpose + NZ-format expert weights (ported from DeepseekV3MoE).
         bf16: no-op on int8 expert weights, only shared experts processed."""
         if not self.use_w8a8:
+            if self.cfg.enable_mega_moe:
+                raise ValueError("GLM MegaMoE requires W8A8 expert weights")
             # bf16 branch: int8 experts not loaded, leave untouched; shared goes through its own process
             _call_process_weights_after_loading(self.shared_experts)
             return
@@ -2335,6 +2355,13 @@ class Glm5NextMoE(nn.Module):
         self.experts_w13_offset.data = self.experts_w13_offset.data.view(self.num_local_experts, -1).contiguous()
         self.experts_w2_scale.data = self.experts_w2_scale.data.view(self.num_local_experts, -1).contiguous()
         self.experts_w2_offset.data = self.experts_w2_offset.data.view(self.num_local_experts, -1).contiguous()
+        if self.cfg.enable_mega_moe:
+            # W13 scales load as FP32. W2 scales retain the ordinary GMM2's
+            # BF16 loading-rounding before promotion to FP32 for encoding.
+            self.mega_moe_w13_scale = kernels.encode_mega_moe_scale(self.experts_w13_scale, self.experts_w13_offset)
+            self.mega_moe_w2_scale = kernels.encode_mega_moe_scale(
+                self.experts_w2_scale.float(), self.experts_w2_offset
+            )
         _call_process_weights_after_loading(self.shared_experts)
         if self.cfg.expert_parallel_degree == 2:
             # Resolve the communication name before graph capture, not on replay.
@@ -2488,7 +2515,7 @@ class Glm5NextMoE(nn.Module):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         backend = layout.routed_backend
-        if backend not in ("mc2", "alltoall"):
+        if backend not in ("mc2", "alltoall", "megamoe"):
             raise ValueError(f"Unknown EPLv2 routed backend: {backend}")
         if layout.valid_tokens:
             weights, indices = self._route_ep(hidden)
@@ -2510,25 +2537,54 @@ class Glm5NextMoE(nn.Module):
                 x_active_mask=mask,
                 swiglu_limit=self.cfg.swiglu_limit,
             )
-        group_info = self._ep_dispatch_group_info
-        if group_info is None:
-            raise RuntimeError("GLM EPLv2 communication group must be initialized before execution")
-        output = kernels.ep_moe_w8a8(
-            layout.pad_dispatch(hidden),
-            layout.pad_dispatch(weights),
-            layout.pad_dispatch(indices),
-            self.experts_w13,
-            self.experts_w2,
-            self.experts_w13_scale,
-            self.experts_w2_scale,
-            group_ep=group_info[0],
-            ep_size=self.cfg.ep_size,
-            ep_rank=self.cfg.ep_rank,
-            num_experts=self.num_experts,
-            global_bs=0,
-            x_active_mask=layout.pad_dispatch(mask),
-            swiglu_limit=self.cfg.swiglu_limit,
-        )
+        if backend == "megamoe":
+            if not self.cfg.enable_mega_moe or layout.dispatch_tokens > self.cfg.mega_moe_num_max_tokens_per_rank:
+                raise ValueError("GLM MegaMoE must be enabled and fit the communication capacity")
+            if self.mega_moe_w13_scale is None or self.mega_moe_w2_scale is None:
+                raise RuntimeError("GLM MegaMoE scales must be encoded before execution")
+        else:
+            group_info = self._ep_dispatch_group_info
+            if group_info is None:
+                raise RuntimeError("GLM EPLv2 communication group must be initialized before execution")
+        # Both fixed-capacity backends consume the same EP-wide padded rows.
+        dispatch_hidden = layout.pad_dispatch(hidden)
+        dispatch_weights = layout.pad_dispatch(weights)
+        dispatch_indices = layout.pad_dispatch(indices)
+        dispatch_mask = layout.pad_dispatch(mask)
+        if backend == "megamoe":
+            output = kernels.mega_moe(
+                self.mega_moe_context,
+                dispatch_hidden,
+                dispatch_indices.to(torch.int32),
+                dispatch_weights.float(),
+                self.experts_w13,
+                self.experts_w2,
+                self.mega_moe_w13_scale,
+                self.mega_moe_w2_scale,
+                self.num_experts,
+                self.cfg.ep_size,
+                self.cfg.mega_moe_ccl_buffer_size,
+                self.cfg.mega_moe_num_max_tokens_per_rank,
+                x_active_mask=dispatch_mask,
+                swiglu_limit=self.cfg.swiglu_limit,
+            )
+        else:
+            output = kernels.ep_moe_w8a8(
+                dispatch_hidden,
+                dispatch_weights,
+                dispatch_indices,
+                self.experts_w13,
+                self.experts_w2,
+                self.experts_w13_scale,
+                self.experts_w2_scale,
+                group_ep=group_info[0],
+                ep_size=self.cfg.ep_size,
+                ep_rank=self.cfg.ep_rank,
+                num_experts=self.num_experts,
+                global_bs=0,
+                x_active_mask=dispatch_mask,
+                swiglu_limit=self.cfg.swiglu_limit,
+            )
         return output[: layout.shard_tokens]
 
     def _forward_sp(

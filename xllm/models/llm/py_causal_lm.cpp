@@ -179,7 +179,9 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
   const auto& kernel_config = KernelConfig::get_instance();
   const auto& eplb_config = EPLBConfig::get_instance();
   const auto& model_type = model_args_.model_type();
-  const bool is_glm_mega_moe_model = model_type == "glm_moe_dsa";
+  const bool is_glm_mega_moe_model = model_type == "glm_moe_dsa" ||
+                                     model_type == "glm5_next" ||
+                                     model_type == "glm5_next_text";
   const bool is_qwen3_5_mega_moe_model =
       model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text";
   const bool enable_glm_mega_moe = kernel_config.enable_mega_moe() &&
@@ -188,6 +190,14 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
                                    !eplb_config.enable_eplb();
   const bool enable_qwen3_5_mega_moe =
       kernel_config.enable_mega_moe() && is_qwen3_5_mega_moe_model;
+  if (kernel_config.enable_mega_moe() && !enable_glm_mega_moe &&
+      (model_type == "glm5_next" || model_type == "glm5_next_text")) {
+    LOG(WARNING) << "GLM-5.3 MegaMoE requested=true, effective=false: ep_size="
+                 << ep_size_ << ", expert_parallel_degree="
+                 << eplb_config.expert_parallel_degree()
+                 << ", enable_eplb=" << eplb_config.enable_eplb()
+                 << "; requires EP > 1, expert_parallel_degree=2 and EPLB off.";
+  }
   if (enable_qwen3_5_mega_moe) {
     CHECK_GT(tp_size_, 1)
         << "Qwen3.5 MegaMoe sequence parallelism requires attention TP > 1.";
@@ -219,6 +229,21 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
               static_cast<int64_t>(
                   SchedulerConfig::get_instance().max_seqs_per_batch()),
               static_cast<int64_t>(model_args_.num_speculative_tokens()));
+    } else if (model_type == "glm5_next" || model_type == "glm5_next_text") {
+      // One DP rank can own every scheduled sequence. TP then splits those
+      // rows, and MegaMoE is invoked on the padded per-TP-rank shard.
+      const int64_t max_seqs = static_cast<int64_t>(
+          SchedulerConfig::get_instance().max_seqs_per_batch());
+      CHECK_GT(max_seqs, 0);
+      const int64_t speculative_width =
+          static_cast<int64_t>(model_args_.num_speculative_tokens()) + 1;
+      const int64_t token_rows = max_seqs * speculative_width;
+      int64_t per_rank_rows = (token_rows + tp_size_ - 1) / tp_size_;
+      // PCP zigzag padding can make one local shard twice the global row count.
+      if (cp_size_ > 1) {
+        per_rank_rows *= 2;
+      }
+      comm_spec.max_num_tokens_per_rank = per_rank_rows;
     } else {
       const int64_t dp_factor =
           std::max(static_cast<int64_t>(dp_size_), int64_t{1});

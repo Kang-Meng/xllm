@@ -333,6 +333,9 @@ bool has_mega_moe() {
 // https://www.hiascend.com/cann/download?versionId=767&ids=d802%2Ch0501%2Ch0601%2Ch0703
 // If you are using CANN 9.0.0 and an A3 environment, you can upgrade only the
 // ops package to CANN 9.1.0.
+// This low-level adapter may mutate inactive topk_ids when x_active_mask is
+// supplied. Callers must provide private routing storage. The public Python
+// MegaMoE custom op performs that clone inside its functional graph boundary.
 std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
     const torch::Tensor& context,
     const torch::Tensor& x,

@@ -25,6 +25,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <string>
@@ -479,11 +480,15 @@ std::tuple<torch::Tensor, torch::Tensor> mega_moe_npu(
     int64_t ep_world_size,
     int64_t ccl_buffer_size,
     int64_t num_max_tokens_per_rank,
-    const std::optional<torch::Tensor>& x_active_mask) {
+    const std::optional<torch::Tensor>& x_active_mask,
+    double swiglu_limit) {
   CHECK_EQ(weight_scales1.empty(), weight_scales2.empty())
       << "MegaMoe weight scales must be provided for both projections or "
          "neither.";
   const bool use_w8a8 = !weight_scales1.empty();
+  CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0 &&
+        swiglu_limit <= std::numeric_limits<float>::max())
+      << "MegaMoe SwiGLU limit must be finite, nonnegative and fit float32.";
   return xllm::kernel::npu::apply_npu_mega_moe(
       context,
       x,
@@ -508,7 +513,8 @@ std::tuple<torch::Tensor, torch::Tensor> mega_moe_npu(
       /*comm_alg=*/"",
       num_max_tokens_per_rank,
       /*activation=*/"swiglu",
-      /*activation_clamp=*/std::numeric_limits<float>::max(),
+      /*activation_clamp=*/swiglu_limit > 0 ? static_cast<float>(swiglu_limit)
+                                            : std::numeric_limits<float>::max(),
       use_w8a8 ? xllm::kernel::npu::kMegaMoeDtypeInt8
                : xllm::kernel::npu::kMegaMoeDtypeBFloat16);
 }
@@ -874,11 +880,11 @@ TORCH_LIBRARY(xllm_ops, m) {
       "str rotary_mode, int[] partial_slice) -> ()");
   m.def("silu_and_mul(Tensor input) -> Tensor");
   m.def(
-      "mega_moe(Tensor context, Tensor x, Tensor topk_ids, Tensor "
+      "mega_moe(Tensor context, Tensor x, Tensor(a!) topk_ids, Tensor "
       "topk_weights, Tensor[] weight1, Tensor[] weight2, Tensor[] "
       "weight_scales1, Tensor[] weight_scales2, int moe_expert_num, int "
       "ep_world_size, int ccl_buffer_size, int num_max_tokens_per_rank, "
-      "Tensor? x_active_mask=None) -> (Tensor, Tensor)");
+      "Tensor? x_active_mask=None, float swiglu_limit=0.) -> (Tensor, Tensor)");
   m.def(
       "inplace_partial_rotary_mul(Tensor(a!) input, Tensor cosine, Tensor "
       "sine, str rotary_mode, int[] partial_slice) -> ()");

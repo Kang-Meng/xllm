@@ -347,6 +347,65 @@ def test_qwen35_bf16_grouped_moe_uses_native_layout(
     )
 
 
+@pytest.mark.parametrize("routing_dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("hidden_dtype", (torch.bfloat16, torch.float16))
+def test_alltoall_unpermute_preserves_fp32_router_weights(
+    monkeypatch: pytest.MonkeyPatch, routing_dtype: torch.dtype, hidden_dtype: torch.dtype
+) -> None:
+    from xllm.python import distributed, kernels
+    from xllm.python.model_executor import forward_context
+
+    moe = _load_npu_moe_module()
+    hidden = torch.ones(1, 8, dtype=hidden_dtype)
+    weights = torch.tensor([[0.12345679, 0.87654321]], dtype=routing_dtype)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    monkeypatch.setattr(distributed, "moe_ep_group", lambda _device: group, raising=False)
+    monkeypatch.setattr(forward_context, "in_acl_graph", lambda: False)
+    monkeypatch.setattr(
+        moe.torch_npu,
+        "npu_moe_init_routing_v2",
+        MagicMock(
+            return_value=(
+                torch.ones(2, 8, dtype=hidden_dtype),
+                torch.arange(2, dtype=torch.int32),
+                torch.tensor([1, 1, 0, 0], dtype=torch.int64),
+                None,
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kernels,
+        "dynamic_quant",
+        MagicMock(return_value=(torch.ones(2, 8, dtype=torch.int8), torch.ones(2))),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda received, sent, **_kwargs: received.copy_(sent))
+    monkeypatch.setattr(moe, "_alltoall_variable_rows", lambda value, *_args: value)
+    monkeypatch.setattr(moe, "_ep_grouped_w8a8", lambda *_args: torch.ones(2, 8, dtype=hidden_dtype))
+    unpermute = MagicMock(return_value=hidden)
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_token_unpermute", unpermute, raising=False)
+    result = moe._ep_moe_w8a8_alltoall_impl(
+        hidden,
+        weights,
+        ids,
+        torch.empty(2, 8, 16, dtype=torch.int8),
+        torch.empty(2, 8, 8, dtype=torch.int8),
+        torch.ones(2, 16),
+        torch.ones(2, 8),
+        2,
+        0,
+        4,
+    )
+    torch.testing.assert_close(result, hidden, rtol=0, atol=0)
+    actual = unpermute.call_args.kwargs["probs"]
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, weights.float(), rtol=0, atol=0)
+    if routing_dtype == torch.float32:
+        assert not torch.equal(actual, weights.to(hidden_dtype).float())
+
+
 @pytest.mark.parametrize("noncontiguous", (False, True))
 def test_encode_mega_moe_scale_uses_prepared_fp32_inputs(
     monkeypatch: pytest.MonkeyPatch,
@@ -475,3 +534,111 @@ def test_moe_weight_format_cast_enables_internal_format(
     assert moe.format_cast_nz(weight) is weight
     assert config.allow_internal_format is True
     assert calls == [(weight, 29)]
+
+
+@pytest.mark.parametrize("limit", [0.0, 10.0])
+def test_megamoe_forwards_clamp_and_preserves_default(limit: float, monkeypatch: pytest.MonkeyPatch) -> None:
+    moe = _load_npu_moe_module()
+    hidden = torch.ones(3, 16, dtype=torch.bfloat16)
+    context = torch.zeros(4, dtype=torch.int32)
+    ids = torch.zeros(3, 2, dtype=torch.int32)
+    weights = torch.ones(3, 2, dtype=torch.float32)
+    w13 = torch.empty(4, 16, 32, dtype=torch.int8)
+    w2 = torch.empty(4, 16, 16, dtype=torch.int8)
+    s13 = torch.ones(4, 32, dtype=torch.int64)
+    s2 = torch.ones(4, 16, dtype=torch.int64)
+    active = torch.ones(3, dtype=torch.int8)
+    native = MagicMock(return_value=(hidden, torch.empty(4, dtype=torch.int32)))
+    monkeypatch.setattr(torch.ops.xllm_ops, "mega_moe", native, raising=False)
+    # Invoke the custom-op body on CPU; real NPU dispatch is tested by the
+    # separate device validation, not by this argument contract.
+    options = {} if limit == 0.0 else {"swiglu_limit": limit}
+    output = moe.mega_moe._init_fn(context, hidden, ids, weights, w13, w2, s13, s2, 8, 2, 256, 16, active, **options)
+    torch.testing.assert_close(output, hidden, rtol=0, atol=0)
+    args = native.call_args.args
+    assert args[-1] == limit
+    torch.testing.assert_close(args[-2], active, rtol=0, atol=0)
+    assert args[4][0] is w13 and args[5][0] is w2
+    assert args[6][0] is s13 and args[7][0] is s2
+    fake = moe._mega_moe_python_fake(context, hidden, ids, weights, w13, w2, s13, s2, 8, 2, 256, 16, active, **options)
+    assert fake.shape == hidden.shape and fake.dtype == hidden.dtype
+
+
+@pytest.mark.parametrize(
+    "active",
+    [
+        torch.tensor([1, 0], dtype=torch.int8),
+        torch.tensor([True, False], dtype=torch.bool),
+        torch.zeros(2, dtype=torch.bool),
+    ],
+)
+def test_megamoe_clones_routing_before_native_mutation_and_clears_padding(
+    active: torch.Tensor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    moe = _load_npu_moe_module()
+    hidden = torch.tensor([[1.0, 2.0], [float("nan"), float("inf")]], dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    weights = torch.ones(2, 2)
+
+    def invoke(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
+        # Model the A3 native kernel's in-place sentinel writes. Only the
+        # wrapper's private routing copy may change, including under Graph.
+        assert args[2] is not ids
+        assert args[2].data_ptr() != ids.data_ptr()
+        args[2][~args[-2].bool()] = 4
+        return hidden.clone(), torch.empty(2, dtype=torch.int32)
+
+    native = MagicMock(side_effect=invoke)
+    monkeypatch.setattr(torch.ops.xllm_ops, "mega_moe", native, raising=False)
+    output = moe.mega_moe._init_fn(
+        torch.zeros(4, dtype=torch.int32),
+        hidden,
+        ids,
+        weights,
+        torch.empty(2, 2, 4, dtype=torch.int8),
+        torch.empty(2, 2, 2, dtype=torch.int8),
+        torch.ones(2, 4, dtype=torch.int64),
+        torch.ones(2, 2, dtype=torch.int64),
+        4,
+        2,
+        256,
+        16,
+        active,
+        10.0,
+    )
+    args = native.call_args.args
+    inactive = ~active.bool()
+    torch.testing.assert_close(args[-2], active.to(torch.int8), rtol=0, atol=0)
+    assert args[2] is not ids
+    assert args[2].data_ptr() != ids.data_ptr()
+    torch.testing.assert_close(args[2][inactive], torch.full_like(ids[inactive], 4), rtol=0, atol=0)
+    assert args[1] is hidden and args[3] is weights
+    torch.testing.assert_close(ids, torch.tensor([[0, 1], [1, 0]], dtype=torch.int32), rtol=0, atol=0)
+    torch.testing.assert_close(output[inactive], torch.zeros_like(hidden[inactive]), rtol=0, atol=0)
+    torch.testing.assert_close(output[~inactive], hidden[~inactive], rtol=0, atol=0)
+    assert torch.isnan(hidden[1, 0])  # Caller storage is never modified.
+
+
+@pytest.mark.parametrize("limit", [-1.0, float("nan"), float("inf"), 1e40])
+def test_megamoe_rejects_invalid_clamp_before_native_call(monkeypatch: pytest.MonkeyPatch, limit: float) -> None:
+    moe = _load_npu_moe_module()
+    native = MagicMock(side_effect=AssertionError("Invalid clamp must not reach the device"))
+    monkeypatch.setattr(torch.ops.xllm_ops, "mega_moe", native, raising=False)
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="SwiGLU limit"):
+        moe.mega_moe._init_fn(
+            torch.zeros(4, dtype=torch.int32),
+            hidden,
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+            torch.empty(2, 8, 16, dtype=torch.int8),
+            torch.empty(2, 8, 8, dtype=torch.int8),
+            torch.ones(2, 16, dtype=torch.int64),
+            torch.ones(2, 8, dtype=torch.int64),
+            4,
+            2,
+            256,
+            16,
+            swiglu_limit=limit,
+        )
+    native.assert_not_called()

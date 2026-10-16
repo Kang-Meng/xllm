@@ -349,6 +349,7 @@ def _mega_moe_fake(
     ccl_buffer_size: int,
     num_max_tokens_per_rank: int,
     x_active_mask: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     y = torch.empty_like(x)
     expert_token_nums = torch.empty(
@@ -357,7 +358,7 @@ def _mega_moe_fake(
         device=x.device,
     )
     del context, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2
-    del ccl_buffer_size, num_max_tokens_per_rank, x_active_mask
+    del ccl_buffer_size, num_max_tokens_per_rank, x_active_mask, swiglu_limit
     return y, expert_token_nums
 
 

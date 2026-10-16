@@ -187,17 +187,26 @@ def test_invalid_dp_counts_fail_without_device_queries(counts: object) -> None:
 
 
 @pytest.mark.parametrize("dp", [2, 4])
-@pytest.mark.parametrize("mode", ["mc2", "alltoall"])
+@pytest.mark.parametrize("enable_mega_moe", [False, True])
+@pytest.mark.parametrize("within_capacity", [False, True])
 def test_global_counts_select_one_backend_and_keep_empty_dp_inactive(
-    dp: int, mode: str, monkeypatch: pytest.MonkeyPatch
+    dp: int, enable_mega_moe: bool, within_capacity: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     raw = (9,) + (0,) * (dp - 1)
     counts = tuple(max(1, value) for value in raw)
-    # With capacity1, locally empty ranks must still follow the larger DP's
-    # All-to-All choice, rather than independently choosing MC2.
-    policy = Eplv2CommPolicy(32 if mode == "mc2" else 1)
+    # Empty ranks use the busy DP group's padded rows, not their local rows.
+    # ON over its own cap must choose All-to-AllV even if MC2 would fit.
+    capacity = 32 if within_capacity else 1
+    policy = Eplv2CommPolicy(32 if enable_mega_moe else capacity, mega_moe_capacity=capacity if enable_mega_moe else 0)
+    expected_backend = ("megamoe" if enable_mega_moe else "mc2") if within_capacity else "alltoall"
     for rank in range(8):
         cfg = _cfg(dp, rank)
+        cfg.enable_mega_moe = enable_mega_moe
+        if enable_mega_moe:
+            cfg.mega_moe_context = torch.zeros(8, dtype=torch.int32)
+            cfg.mega_moe_ccl_buffer_size = 1024
+            cfg.mega_moe_num_max_tokens_per_rank = capacity
+        cfg._validate_moe_parallelism()
         context = _context(counts, raw)
         rows = counts[cfg.dp_rank]
         mask = torch.arange(rows) < raw[cfg.dp_rank]
@@ -206,7 +215,7 @@ def test_global_counts_select_one_backend_and_keep_empty_dp_inactive(
         monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
         hidden = torch.ones(rows, 8)
         layout, mask = glm5_next._eplv2_token_layout(cfg, hidden, policy)
-        assert layout.routed_backend == mode
+        assert layout.routed_backend == expected_backend
         assert mask.sum().item() == (layout.valid_tokens if cfg.dp_rank == 0 else 0)
 
 

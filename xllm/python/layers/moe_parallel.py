@@ -28,8 +28,8 @@ relationship:
   Qwen3.5 direct EP gathers valid prefixes in eager execution, retains graph
   capacities during capture, and restores the local SP capacity after reduction.
 * EPLv2 communication admission (:class:`Eplv2CommPolicy`,
-  :func:`mc2_buffer_bytes_per_source_row`). Host-only selection between MC2 and
-  All-to-AllV for the MoE-TP1 A3 EPLv2 path; no device queries in the selector.
+  :func:`mc2_buffer_bytes_per_source_row`). Host-only selection between MegaMoE,
+  MC2 and All-to-AllV for the MoE-TP1 A3 EPLv2 path; no device queries in the selector.
 * TP/SP source-token ownership (:class:`TokenParallelLayout`). Unique
   source-token ownership inside an attention-TP MoE boundary.
 """
@@ -37,7 +37,7 @@ relationship:
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 import torch
@@ -212,10 +212,22 @@ def mc2_buffer_bytes_per_source_row(hidden_size: int, local_experts: int, ep_siz
 
 @dataclass(frozen=True)
 class Eplv2CommPolicy:
-    """Choose MC2 or All-to-AllV from host-side capacity and execution mode."""
+    """Precompute the enabled backend; over-capacity batches use eager All-to-AllV."""
 
     mc2_capacity: int
-    mode: str = "auto"
+    mega_moe_capacity: int = 0
+    graph_token_limit: int = field(init=False)
+    _routed_backend: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.mc2_capacity < 0 or self.mega_moe_capacity < 0:
+            raise ValueError("EPLv2 communication capacities must be nonnegative")
+        if self.mega_moe_capacity > 0:
+            backend, capacity = "megamoe", self.mega_moe_capacity
+        else:
+            backend, capacity = "mc2", self.mc2_capacity
+        object.__setattr__(self, "_routed_backend", backend)
+        object.__setattr__(self, "graph_token_limit", capacity)
 
     @classmethod
     def from_geometry(
@@ -226,11 +238,10 @@ class Eplv2CommPolicy:
         topk: int,
         buffer_mb: int,
         token_limit: int = 512,
-        mode: str = "auto",
+        *,
+        mega_moe_capacity: int = 0,
     ) -> Eplv2CommPolicy:
         """Validate EPLv2 geometry and calculate the maximum MC2 source rows."""
-        if mode not in ("auto", "mc2", "alltoall"):
-            raise ValueError("EPLv2 communication mode must be auto, mc2 or alltoall")
         if buffer_mb <= 0 or not 0 < token_limit <= 512:
             raise ValueError("EPLv2 requires positive HCCL buffer MB and a MC2 token limit in [1, 512]")
         if ep_size <= 1 or num_experts <= 0 or num_experts % ep_size or not 0 < topk <= num_experts:
@@ -239,19 +250,20 @@ class Eplv2CommPolicy:
         capacity = min(token_limit, buffer_mb * 1024 * 1024 // row_bytes)
         if not 1024 <= hidden_size <= 8192 or topk > 16:
             capacity = 0
-        return cls(capacity, mode)
+        return cls(capacity, mega_moe_capacity=mega_moe_capacity)
 
     def select(self, source_rows: int, *, graph: bool = False) -> str:
-        """Select a transport; reject Graph execution when MC2 cannot fit."""
+        """Select a transport; reject Graph execution when All-to-AllV is required."""
         if source_rows <= 0:
             raise ValueError("EPLv2 source rows must include at least one padded row")
-        eligible = source_rows <= self.mc2_capacity
-        if self.mode == "mc2" and not eligible:
-            raise ValueError(f"EPLv2 MC2 source rows {source_rows} exceed capacity {self.mc2_capacity}")
-        backend = "mc2" if self.mode != "alltoall" and eligible else "alltoall"
-        if graph and backend != "mc2":
-            raise ValueError("EPLv2 All-to-AllV requires eager execution; Graph rows must fit MC2 capacity")
-        return backend
+        if source_rows <= self.graph_token_limit:
+            return self._routed_backend
+        if graph:
+            capacity_name = "MegaMoE" if self._routed_backend == "megamoe" else "MC2"
+            raise ValueError(
+                f"EPLv2 All-to-AllV requires eager execution; Graph rows must fit {capacity_name} capacity"
+            )
+        return "alltoall"
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch_npu
 
@@ -772,9 +774,9 @@ def _ep_moe_w8a8_impl(
     topk = topk_ids.shape[-1]
     hidden_2d = hidden.reshape(-1, hidden.shape[-1]).contiguous()
     topk_ids_2d = topk_ids.reshape(-1, topk).to(torch.int32).contiguous()
-    # Match selected-expert unpermute rounding before converting to the FP32
-    # scales required by dispatch/combine. Do not apply routed scaling here.
-    topk_weights_2d = topk_weights.reshape(-1, topk).to(hidden.dtype).to(torch.float32).contiguous()
+    # Preserve router precision for the FP32 scales required by combine.
+    # Do not apply routed scaling here.
+    topk_weights_2d = topk_weights.reshape(-1, topk).to(torch.float32).contiguous()
     active_mask = x_active_mask.contiguous() if x_active_mask is not None else None
 
     if hidden_2d.shape[0] > 512:
@@ -1005,7 +1007,7 @@ def _ep_moe_w8a8_alltoall_impl(
         mask = torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device)
     active = flat[mask]
     ids = topk_ids.reshape(flat.shape[0], -1)[mask].to(torch.int32).contiguous()
-    weights = topk_weights.reshape(flat.shape[0], -1)[mask].to(hidden.dtype).contiguous()
+    weights = topk_weights.reshape(flat.shape[0], -1)[mask].to(torch.float32).contiguous()
     local_experts = num_experts // ep_size
     width = flat.shape[-1]
 
@@ -1263,10 +1265,32 @@ def mega_moe(
     ccl_buffer_size: int,
     num_max_tokens_per_rank: int,
     x_active_mask: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
-    """Fuse EP dispatch, SwiGLU experts, and combine for BF16 or W8A8."""
+    """Fuse EP dispatch, experts and combine without mutating caller inputs.
+
+    The native operator may rewrite inactive routing IDs when an active mask
+    is supplied. Clone at this Python custom-op boundary so PyTorch graph
+    capture and replay preserve the functional API. Direct native callers
+    must supply their own private routing storage.
+    """
+    if not math.isfinite(swiglu_limit) or not 0 <= swiglu_limit <= torch.finfo(torch.float32).max:
+        raise ValueError("MegaMoe SwiGLU limit must be finite, nonnegative and fit float32")
     if (w13_scale is None) != (w2_scale is None):
         raise ValueError("MegaMoe weight scales must be provided for both projections or neither")
+    mask_bool: torch.Tensor | None = None
+    if x_active_mask is not None:
+        if (
+            x_active_mask.shape != hidden_states.shape[:1]
+            or x_active_mask.dtype not in (torch.int8, torch.bool)
+            or x_active_mask.device != hidden_states.device
+        ):
+            raise ValueError("MegaMoe active mask must have one INT8/BOOL value per source row on the same device")
+        # Keep mutation isolation inside this functional custom op, not in
+        # the native launch callback's queue-retained tensor captures.
+        topk_ids = topk_ids.clone()
+        mask_bool = x_active_mask if x_active_mask.dtype == torch.bool else x_active_mask.bool()
+        x_active_mask = x_active_mask.to(torch.int8).contiguous()
     use_w8a8 = w13_scale is not None
     weight1 = [w13] if use_w8a8 else list(w13.unbind(dim=0))
     weight2 = [w2] if use_w8a8 else list(w2.unbind(dim=0))
@@ -1286,7 +1310,10 @@ def mega_moe(
         ccl_buffer_size,
         num_max_tokens_per_rank,
         x_active_mask,
+        swiglu_limit,
     )
+    if mask_bool is not None:
+        output.masked_fill_(~mask_bool.unsqueeze(-1), 0)
     return output
 
 
@@ -1305,6 +1332,7 @@ def _mega_moe_python_fake(
     ccl_buffer_size: int,
     num_max_tokens_per_rank: int,
     x_active_mask: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     del (
         context,
@@ -1319,6 +1347,7 @@ def _mega_moe_python_fake(
         ccl_buffer_size,
         num_max_tokens_per_rank,
         x_active_mask,
+        swiglu_limit,
     )
     return torch.empty_like(hidden_states)
 
