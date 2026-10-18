@@ -701,7 +701,12 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
     const ForwardInput& raw_input) {
   ForwardInput input = raw_input;
   ForwardInput validate_input;
+  prepare_decode_input(input);
+  DraftBlock draft_block = run_decode_draft(input, validate_input);
+  return run_validate(input, draft_block, validate_input);
+}
 
+void DFlashWorkerImpl::prepare_decode_input(ForwardInput& input) {
   CHECK(embedding_cache_ != nullptr)
       << "DFlash embedding cache is not allocated";
 
@@ -752,8 +757,6 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
       << "DFlash decode target state count mismatch";
 
   update_decode_step_input(input, last_states);
-  DraftBlock draft_block = run_decode_draft(input, validate_input);
-  return run_validate(input, draft_block, validate_input);
 }
 
 DFlashWorkerImpl::DraftBlock DFlashWorkerImpl::run_decode_draft(
@@ -924,7 +927,8 @@ void DFlashWorkerImpl::fill_validate_input_from_draft_outputs_varlen(
 std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
     const ForwardInput& input,
     const DraftBlock& draft_block_in,
-    ForwardInput& validate_input) {
+    ForwardInput& validate_input,
+    bool async_output) {
   c10::StreamGuard compute_guard = compute_stream_->set_stream_guard();
   Timer timer;
   // Adaptive-speculative per-seq varlen validate:
@@ -997,7 +1001,13 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
                                         local_total_val_tokens);
   // Stage host-originating template data before target launch: a nominally
   // asynchronous pageable H2D can otherwise drain target's execution stream.
-  const bool prelaunch = !did_prune && prepare_draft_prelaunch(input);
+  CHECK(!async_output || !did_prune)
+      << "Asynchronous decode output does not support adaptive pruning";
+  if (async_output) {
+    prepare_validate_output_async(input);
+  }
+  const bool prelaunch =
+      !async_output && !did_prune && prepare_draft_prelaunch(input);
   ForwardOutput target_output =
       speculative_worker::run_worker_no_sync(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
@@ -1067,6 +1077,18 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   // serialize without a cross-stream wait; the sync below only makes the
   // accepted tokens host-visible for the D2H copy and context-cache write.
   maybe_broadcast_spec_tokens(val_output.next_tokens);
+  if (async_output) {
+    finalize_validate_output_async(input, val_output, target_output);
+    target_output.retained_inputs.insert(target_output.retained_inputs.end(),
+                                         draft_block.retained_inputs.begin(),
+                                         draft_block.retained_inputs.end());
+    if (!draft_block.retained_tensors.empty()) {
+      auto retained_draft = std::make_shared<ForwardInput>();
+      retained_draft->retained_device_tensors = draft_block.retained_tensors;
+      target_output.retained_inputs.emplace_back(std::move(retained_draft));
+    }
+    return target_output;
+  }
   if (prelaunch) {
     torch::Tensor accepted_host = torch::empty(val_output.next_tokens.sizes(),
                                                val_output.next_tokens.options()

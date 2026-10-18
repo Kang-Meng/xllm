@@ -281,6 +281,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self.dtype = dtype
         self.device = device
         self._use_xfia_decode = use_xfia_decode
+        self._device_only_decode_inputs = False
         self._xfia_query_width = xfia_query_width
         self._xfia_query_ends: torch.Tensor | None = None
         self._xfia_kv_lengths: torch.Tensor | None = None
@@ -339,6 +340,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._causal_mask = (
             torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1).to(torch.int8).contiguous().to(device)
         )
+
+    def set_device_only_decode_inputs(self, enabled: bool, query_width: int) -> None:
+        if self._kv_caches or self._metadata is not None:
+            raise RuntimeError("Decode input mode must be selected before binding caches or preparing a forward")
+        self._use_xfia_decode = enabled
+        self._device_only_decode_inputs = enabled
+        self._xfia_query_width = query_width
 
     @property
     def num_kv_blocks(self) -> int:
@@ -495,6 +503,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         graph_mode: bool = False,
     ) -> None:
         self._metadata = metadata
+        if self._device_only_decode_inputs and _is_dflash_proposal(metadata):
+            if metadata.is_prefill:
+                raise ValueError("Device-only draft proposals cannot use prefill metadata")
+            self._prepare_xfia_decode(metadata, graph_mode=graph_mode)
+            return
         if self._use_xfia_decode and (
             not (metadata.is_prefill or metadata.is_chunked_prefill)
             or (
@@ -840,6 +853,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             return self._prefill_cp(q_3d, k_3d, v_3d, metadata, cp_context, k_cache, v_cache)
 
         kernels.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
+
+        if self._device_only_decode_inputs and _is_dflash_proposal(metadata):
+            return self._xfia_decode(q_3d, k_cache, v_cache, layer_id)
 
         if metadata.is_prefill or metadata.is_chunked_prefill:
             if (

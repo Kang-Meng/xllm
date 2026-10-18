@@ -55,6 +55,10 @@ class SpeculativeEngineBase : public Engine {
 
   runtime::DecodeGraphWarmupConfig decode_graph_warmup_config() const override;
 
+  bool start_profile() override { return engine_->start_profile(); }
+
+  bool stop_profile() override { return engine_->stop_profile(); }
+
   const TokenizerArgs& tokenizer_args() const override {
     return engine_->tokenizer_args();
   }

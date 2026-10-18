@@ -17,7 +17,35 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <vector>
+
 namespace xllm::dflash_async {
+
+struct DraftCacheBlockTable {
+  torch::Tensor blocks;
+  bool is_circular = false;
+};
+
+DraftCacheBlockTable prepare_draft_cache_block_table(
+    const torch::Tensor& block_table,
+    const std::vector<torch::Tensor>& multi_block_tables,
+    int64_t num_sequences,
+    const torch::Device& device);
+
+struct ContextKvInputs {
+  torch::Tensor positions;
+  torch::Tensor slots;
+};
+
+ContextKvInputs prepare_context_kv(const torch::Tensor& accepted_tokens,
+                                   const torch::Tensor& base_positions,
+                                   const torch::Tensor& block_table,
+                                   int64_t block_size);
+
+ContextKvInputs prepare_context_kv(const torch::Tensor& accepted_tokens,
+                                   const torch::Tensor& base_positions,
+                                   const DraftCacheBlockTable& block_table,
+                                   int64_t block_size);
 
 struct NextDraftInputs {
   torch::Tensor accepted_counts;
@@ -37,5 +65,19 @@ NextDraftInputs prepare_next_draft(const torch::Tensor& accepted_tokens,
                                    const torch::Tensor& block_table,
                                    int64_t mask_token_id,
                                    int64_t block_size);
+
+NextDraftInputs prepare_next_draft(const torch::Tensor& accepted_tokens,
+                                   const torch::Tensor& base_positions,
+                                   const torch::Tensor& block_table,
+                                   int64_t mask_token_id,
+                                   int64_t block_size,
+                                   int64_t query_width);
+
+NextDraftInputs prepare_next_draft(const torch::Tensor& accepted_tokens,
+                                   const torch::Tensor& base_positions,
+                                   const DraftCacheBlockTable& block_table,
+                                   int64_t mask_token_id,
+                                   int64_t block_size,
+                                   int64_t query_width);
 
 }  // namespace xllm::dflash_async

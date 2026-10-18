@@ -279,10 +279,19 @@ void materialize_linear_state_validity(
     options = torch::TensorOptions().device(device.value());
   }
   options = options.dtype(torch::kBool);
-  attn_metadata.has_initial_states =
-      attn_metadata.is_dummy && mask_rows == 0
-          ? torch::zeros({1}, options)
-          : torch::tensor(params.linear_state_validity_mask, options);
+  if (attn_metadata.is_dummy && mask_rows == 0) {
+    attn_metadata.has_initial_states = torch::zeros({1}, options);
+    return;
+  }
+
+  torch::Tensor host_mask = torch::empty(
+      {mask_rows},
+      options.device(torch::kCPU).pinned_memory(!options.device().is_cpu()));
+  std::transform(params.linear_state_validity_mask.begin(),
+                 params.linear_state_validity_mask.end(),
+                 host_mask.data_ptr<bool>(),
+                 [](int64_t value) { return value != 0; });
+  attn_metadata.has_initial_states = host_mask.to(options, true);
 }
 
 AttentionMetadata build_attention_metadata(

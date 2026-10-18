@@ -232,9 +232,12 @@ def _create_attention_backend(
             NpuPagedAttentionBackend,
         )
 
-        dflash2_block_size = int(config.get("dflash2_block_size", 0))
+        proposal_width = int(config.get("dflash2_block_size", 0))
+        dflash_xfia_enabled = bool(config.get("dflash_xfia_enabled", False))
+        if dflash_xfia_enabled:
+            proposal_width = int(config.get("draft_query_width", proposal_width))
         use_xfia_decode = False
-        if dflash2_block_size > 0 and bool(config.get("dflash_xfia_enabled", False)):
+        if proposal_width > 0 and dflash_xfia_enabled:
             import xllm_runtime
 
             # C++ enable_dflash_proposal_xfia already applied the prelaunch gate.
@@ -250,7 +253,7 @@ def _create_attention_backend(
             device=device,
             dtype=dtype,
             num_decoding_tokens=num_decoding_tokens,
-            xfia_query_width=max(dflash2_block_size, 1),
+            xfia_query_width=max(proposal_width, 1),
             use_xfia_decode=use_xfia_decode,
         )
     if current_platform.is_cuda():
@@ -282,6 +285,7 @@ class ModelExecutor:
         self.model = model
         self._kv_bound = False
         self._is_spec_draft = is_spec_draft
+        self._draft_query_width = max(1, int(config.get("draft_query_width", 1) or 1))
         self._requires_framework_kpool_tail = bool(config.get("requires_framework_kpool_tail", False))
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
@@ -451,6 +455,14 @@ class ModelExecutor:
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
             self.inductor_runner.bind_execution_metadata_builders(execution_metadata_builders)
+
+    def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
+        return self.model.supports_device_only_decode_inputs(kv_page_size)
+
+    def set_device_only_decode_inputs(self, enabled: bool) -> None:
+        if self._kv_bound:
+            raise RuntimeError("Decode input mode must be selected before KV binding and graph warmup")
+        self.attention_backend.set_device_only_decode_inputs(enabled, self._draft_query_width)
 
     @staticmethod
     def _attention_config(layer: Attention) -> tuple[int, int, int, float, int]:

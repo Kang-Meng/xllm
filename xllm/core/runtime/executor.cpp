@@ -40,6 +40,14 @@ Executor::Executor(CausalLM* model,
       model, args, device, options, backend);
 }
 
+bool Executor::supports_device_only_decode_inputs() const {
+  return impl_->supports_device_only_decode_inputs();
+}
+
+void Executor::set_device_only_decode_inputs(bool enabled) {
+  impl_->set_device_only_decode_inputs(enabled);
+}
+
 ForwardInput Executor::prepare_inputs(Batch& batch) {
   return impl_->prepare_inputs(batch);
 }

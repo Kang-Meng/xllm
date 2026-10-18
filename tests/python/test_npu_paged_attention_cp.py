@@ -757,6 +757,7 @@ def _shard_prepared_backend(nope_cache: torch.Tensor, metadata: SimpleNamespace)
     # speculative checkpointing, and the logical-block fallback needs a page
     # size).
     backend._use_xfia_decode = False
+    backend._device_only_decode_inputs = False
     backend._linear_state_checkpoint_stride = None
     backend._page_size = 2
     backend._block_table_i32 = None

@@ -87,6 +87,19 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         self.model = Qwen3DSparkModel(cfg, dtype, device)  # pyright: ignore[reportIncompatibleVariableOverride]
         self.lm_head: nn.Module | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
 
+    def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
+        import xllm_runtime
+
+        return (
+            type(self) is Qwen3DSparkForCausalLM
+            and not self.cfg.use_sliding_window
+            and self.cfg.n_heads % self.cfg.tp_size == 0
+            and self.cfg.n_kv_heads % self.cfg.tp_size == 0
+            and self.cfg.head_dim == 128
+            and kv_page_size == 128
+            and xllm_runtime.is_ascend_a3()
+        )
+
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         all_weights = self.model.load_weights(state_dicts, tp_rank, tp_size)
         load_draft_lm_head_if_present(

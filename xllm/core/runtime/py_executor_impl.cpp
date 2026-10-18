@@ -184,6 +184,18 @@ PyExecutorImpl::~PyExecutorImpl() {
   clear_python_object(py_executor_);
 }
 
+bool PyExecutorImpl::supports_device_only_decode_inputs() const {
+  py::gil_scoped_acquire gil;
+  return py_executor_
+      .attr("supports_device_only_decode_inputs")(options_.block_size())
+      .cast<bool>();
+}
+
+void PyExecutorImpl::set_device_only_decode_inputs(bool enabled) {
+  py::gil_scoped_acquire gil;
+  py_executor_.attr("set_device_only_decode_inputs")(enabled);
+}
+
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {
   return batch.prepare_forward_input(
       options_.num_decoding_tokens(), 0, args_, options_.cp_size());

@@ -327,6 +327,10 @@ class MlaUnabsorbedPrefill:
 
 
 class AttentionBackend(ABC):
+    def set_device_only_decode_inputs(self, enabled: bool, query_width: int) -> None:
+        if enabled:
+            raise NotImplementedError("This attention backend does not support device-only decode inputs")
+
     def reset_forward(self, metadata: AttentionMetadata | None = None) -> None:
         """Reset request-owned state before a model attaches current inputs."""
         del metadata

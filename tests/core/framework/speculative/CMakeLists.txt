@@ -120,6 +120,7 @@ target_link_libraries(embedding_cache_test
 
 cc_test(
   NAME dflash_async_input_builder_test
+  CPU_ONLY
   SRCS dflash_async_input_builder_test.cpp
        "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/dflash_async_input_builder.cpp"
        "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_cache_utils.cpp"

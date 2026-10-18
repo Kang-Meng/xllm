@@ -187,7 +187,8 @@ class WorkerService : public proto::DistributeWorker {
   std::vector<SpeculativeTokenStats> record_speculative_metrics_from_output(
       const torch::Tensor& next_tokens,
       const std::vector<SpeculativeTokenStats>& output_stats,
-      bool is_graph_warmup);
+      bool is_graph_warmup,
+      bool defer_block_metrics = false);
   DISALLOW_COPY_AND_ASSIGN(WorkerService);
 
  private:

@@ -668,6 +668,8 @@ struct ForwardOutput {
   // Device-side readiness dependency for no-sync outputs. This local runtime
   // handle is intentionally not included in proto or shared-memory transport.
   StreamEventPtr ready_event;
+  bool requires_host_retirement = false;
+  bool defer_block_speculative_metrics = false;
   torch::Tensor logits;
   torch::Tensor embedding;
   // Selected hidden states matching `logits` layout: [num_selected,

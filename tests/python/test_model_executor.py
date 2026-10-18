@@ -417,8 +417,10 @@ class TestCreateAttentionBackend:
         else:
             native_query.assert_not_called()
 
-    def test_dflash2_xfia_stays_off_without_prelaunch_gate(self) -> None:
-        native_query = MagicMock(return_value=True)
+    @pytest.mark.parametrize("is_ascend_a3", [False, True])
+    @pytest.mark.parametrize("proposal_width", [0, 8, 15])
+    def test_dflash2_xfia_uses_draft_query_width(self, is_ascend_a3: bool, proposal_width: int) -> None:
+        native_query = MagicMock(return_value=is_ascend_a3)
         runtime = types.ModuleType("xllm_runtime")
         runtime.is_ascend_a3 = native_query
         with (
@@ -430,10 +432,74 @@ class TestCreateAttentionBackend:
                 _make_attention_layer(num_kv_heads=1, head_dim=128),
                 torch.device("npu"),
                 torch.bfloat16,
-                {"dflash2_block_size": 8, "dflash_xfia_enabled": False},
+                {
+                    "draft_query_width": proposal_width,
+                    "dflash2_block_size": 16,
+                    "dflash_xfia_enabled": True,
+                },
+            )
+        assert backend.init_kwargs["use_xfia_decode"] == (is_ascend_a3 and proposal_width > 0)
+        assert backend.init_kwargs["xfia_query_width"] == max(proposal_width, 1)
+        if proposal_width > 0:
+            native_query.assert_called_once_with()
+        else:
+            native_query.assert_not_called()
+
+    @pytest.mark.parametrize("draft_query_width", [None, 15])
+    def test_dflash2_xfia_stays_off_without_prelaunch_gate(self, draft_query_width: int | None) -> None:
+        native_query = MagicMock(return_value=True)
+        runtime = types.ModuleType("xllm_runtime")
+        runtime.is_ascend_a3 = native_query
+        config = {"dflash2_block_size": 8, "dflash_xfia_enabled": False}
+        if draft_query_width is not None:
+            config["draft_query_width"] = draft_query_width
+        with (
+            patch.dict(sys.modules, {"xllm_runtime": runtime}),
+            patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
+            patch("xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend", StubAttentionBackend),
+        ):
+            backend = _create_attention_backend(
+                _make_attention_layer(num_kv_heads=1, head_dim=128),
+                torch.device("npu"),
+                torch.bfloat16,
+                config,
             )
         assert backend.init_kwargs["use_xfia_decode"] is False
+        assert backend.init_kwargs["xfia_query_width"] == 8
         native_query.assert_not_called()
+
+    @pytest.mark.parametrize("is_ascend_a3", [False, True])
+    @pytest.mark.parametrize("dflash_xfia_enabled", [False, True])
+    def test_dspark_xfia_uses_generic_proposal_width(
+        self,
+        is_ascend_a3: bool,
+        dflash_xfia_enabled: bool,
+    ) -> None:
+        native_query = MagicMock(return_value=is_ascend_a3)
+        runtime = types.ModuleType("xllm_runtime")
+        runtime.is_ascend_a3 = native_query
+        with (
+            patch.dict(sys.modules, {"xllm_runtime": runtime}),
+            patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
+            patch("xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend", StubAttentionBackend),
+        ):
+            backend = _create_attention_backend(
+                _make_attention_layer(num_kv_heads=1, head_dim=128),
+                torch.device("npu"),
+                torch.bfloat16,
+                {
+                    "speculative_algorithm": "DSpark",
+                    "draft_query_width": 15,
+                    "dflash2_block_size": 0,
+                    "dflash_xfia_enabled": dflash_xfia_enabled,
+                },
+            )
+        assert backend.init_kwargs["use_xfia_decode"] == (is_ascend_a3 and dflash_xfia_enabled)
+        assert backend.init_kwargs["xfia_query_width"] == (15 if dflash_xfia_enabled else 1)
+        if dflash_xfia_enabled:
+            native_query.assert_called_once_with()
+        else:
+            native_query.assert_not_called()
 
     @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
@@ -789,6 +855,26 @@ class TestCreateAttentionBackend:
 
 
 class TestModelExecutorConstruction:
+    @pytest.mark.parametrize("kv_page_size", [64, 128])
+    @pytest.mark.parametrize("supported", [False, True])
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+        return_value=StubAttentionBackend(),
+    )
+    def test_device_only_decode_capability_forwards_runtime_page_size(
+        self,
+        mock_backend: MagicMock,
+        kv_page_size: int,
+        supported: bool,
+    ) -> None:
+        model = _FakeModel(num_layers=1)
+        capability = MagicMock(return_value=supported)
+        model.supports_device_only_decode_inputs = capability
+        executor = ModelExecutor(model, {"python_graph_backend": "off"}, max_seqs_per_batch=4)
+
+        assert executor.supports_device_only_decode_inputs(kv_page_size) is supported
+        capability.assert_called_once_with(kv_page_size)
+
     @pytest.mark.parametrize("graph_backend", ["off", "aclgraph"])
     @pytest.mark.parametrize(
         "explicit_width,config_depth,expected_width",

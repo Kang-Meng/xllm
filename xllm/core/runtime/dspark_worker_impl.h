@@ -15,6 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <optional>
+#include <string_view>
+#include <vector>
+
+#include "core/framework/speculative/dflash_async_input_builder.h"
 #include "runtime/dflash_worker_impl.h"
 
 namespace xllm {
@@ -24,25 +29,22 @@ class ProcessGroup;
 // DSpark = DFlash block-diffusion draft + a low-rank Markov head that adds a
 // prefix-dependent bias to each block position's draft logits. It reuses the
 // entire DFlash pipeline (prefill, context-K/V injection, validate, cache
-// writes) and overrides only:
-//   1. sample_from_anchor() — returns true, so the shared query builder makes
-//      an N-wide block (every position predicts, anchor predicts the first
-//      draft token) instead of DFlash's (1 + N) anchor + masks.
-//   2. run_decode_draft — performs the logits-only block forward and sequential
-//      Markov sampling before returning proposals to the shared validator.
+// writes).
 class DSparkWorkerImpl final : public DFlashWorkerImpl {
  public:
   DSparkWorkerImpl(const ParallelArgs& parallel_args,
                    const torch::Device& device,
                    const runtime::Options& options);
 
-  ~DSparkWorkerImpl() override = default;
+  ~DSparkWorkerImpl() override;
 
   // Load the draft weights, then (for reduced-vocabulary drafts) precompute the
   // draft-to-target id map from the checkpoint's ``d2t`` table.
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
                   MasterStatus master_status) override;
+  void prepare_work_before_execute(const ForwardInput& input,
+                                   ForwardInput& processed_input) override;
 
  protected:
   // N-wide query block: anchor (slot 0) carries the last real token and
@@ -54,7 +56,52 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
   DraftBlock run_decode_draft(const ForwardInput& input,
                               ForwardInput& validate_input) override;
 
+  std::optional<ForwardOutput> step_decode(const ForwardInput& input) override;
+  void prepare_validate_output_async(const ForwardInput& input) override;
+  void finalize_validate_output_async(const ForwardInput& input,
+                                      const SampleOutput& output,
+                                      ForwardOutput& target_output) override;
+  std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
+  std::optional<ForwardOutput> step_empty(const ForwardInput& input) override;
+  bool can_prepare_without_compute_stream_wait(
+      const ForwardInput& input) const override;
+
  private:
+  friend class DSparkWorkerImplTestPeer;
+
+  void validate_draft_prelaunch_config(bool supports_device_inputs) const;
+  void validate_decode_input(const ForwardInput& input) const;
+  std::string_view draft_prelaunch_input_error(const ForwardInput& input) const;
+  bool can_prelaunch_draft(const ForwardInput& input) const;
+  std::vector<int64_t> build_batch_to_pending_row_mapping(
+      const ForwardInput& input) const;
+  DraftBlock run_decode_draft_from_pending(const ForwardInput& input,
+                                           const std::vector<int64_t>& rows);
+  void commit_pending_context();
+  DraftBlock execute_draft_query(const ForwardInput& input,
+                                 ForwardInput query,
+                                 const torch::Tensor& anchor_token_ids,
+                                 bool prepared,
+                                 ForwardInput* validate_input = nullptr);
+
+  struct PendingContext {
+    ForwardInput identity;
+    torch::Tensor accepted_device;
+    torch::Tensor accepted_host;
+    torch::Tensor embeddings;
+    torch::Tensor base_positions;
+    StreamEventPtr d2h_ready;
+    StreamEventPtr context_ready;
+  };
+
+  bool async_output_enabled_ = false;
+  bool draft_prelaunch_enabled_ = false;
+  std::optional<PendingContext> pending_context_;
+  torch::Tensor prepared_base_positions_;
+  dflash_async::DraftCacheBlockTable prepared_context_block_table_;
+  StreamEventPtr prepared_context_ready_;
+  std::vector<torch::Tensor> consumed_context_tensors_;
+
   // sample_block's two outputs: the sampled draft proposal and, when a
   // confidence head is active, its per-step confidence probs (empty otherwise).
   struct BlockSample {

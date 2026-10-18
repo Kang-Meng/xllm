@@ -2075,6 +2075,7 @@ def _mla_handoff_backend(nope_cache: torch.Tensor, index_cache: torch.Tensor) ->
     backend._graph_lses = {}
     backend._page_size = _MLA_HANDOFF_BLOCK_SIZE
     backend._kpool_cache_triton_compatible = (False,)
+    backend._device_only_decode_inputs = False
     # ``prepare`` reads these two regardless of the metadata shape; the XFIA
     # decode fast path stays off and no KDA speculative checkpointing runs.
     backend._use_xfia_decode = False

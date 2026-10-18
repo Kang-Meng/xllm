@@ -174,7 +174,8 @@ std::vector<SpeculativeTokenStats>
 WorkerService::record_speculative_metrics_from_output(
     const torch::Tensor& next_tokens,
     const std::vector<SpeculativeTokenStats>& output_stats,
-    bool is_graph_warmup) {
+    bool is_graph_warmup,
+    bool defer_block_metrics) {
   // Synthetic graph-warmup batches carry no real accept/reject signal; skip
   // them so they do not pollute the cumulative acceptance stats.
   if (is_graph_warmup || !options_.enable_speculative_decode()) {
@@ -195,7 +196,36 @@ WorkerService::record_speculative_metrics_from_output(
   // so this generic per-tensor count would double-count them.
   if (SpeculativeConfig::is_block_diffusion_algorithm(
           options_.speculative_algorithm())) {
-    return output_stats;
+    if (!defer_block_metrics) {
+      return output_stats;
+    }
+    CHECK(output_stats.empty());
+    CHECK_EQ(next_tokens.size(1), options_.num_speculative_tokens() + 1);
+    const std::vector<int32_t> proposed_tokens(
+        static_cast<size_t>(next_tokens.size(0)),
+        options_.num_speculative_tokens());
+    std::vector<SpeculativeTokenStats> block_stats =
+        calculate_block_speculative_token_stats(next_tokens, proposed_tokens);
+    std::vector<int64_t> accepted_per_position(
+        static_cast<size_t>(options_.num_speculative_tokens()), 0);
+    int64_t proposed_total = 0;
+    int64_t accepted_total = 0;
+    for (const SpeculativeTokenStats& stats : block_stats) {
+      proposed_total += stats.proposed_tokens;
+      accepted_total += stats.accepted_tokens;
+      for (int64_t position = 0; position < stats.accepted_tokens; ++position) {
+        ++accepted_per_position[static_cast<size_t>(position)];
+      }
+    }
+    for (size_t position = 0; position < accepted_per_position.size();
+         ++position) {
+      MULTI_COUNTER_ADD(speculative_num_accepted_tokens_per_pos,
+                        speculative_position_labels_[position],
+                        accepted_per_position[position]);
+    }
+    COUNTER_ADD(speculative_num_draft_tokens_total, proposed_total);
+    COUNTER_ADD(speculative_num_accepted_tokens_total, accepted_total);
+    return block_stats;
   }
 
   const int64_t batch_size = next_tokens.size(0);
@@ -1081,7 +1111,8 @@ void WorkerService::GetLastStepResult(
           speculative_token_stats = record_speculative_metrics_from_output(
               next_tokens,
               sample_output.speculative_token_stats,
-              forward_output.is_graph_warmup);
+              forward_output.is_graph_warmup,
+              forward_output.defer_block_speculative_metrics);
 
           if (next_tokens.defined() || !dit_images.empty() ||
               !dit_text_output.empty() || !dit_audio.empty() ||

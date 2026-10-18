@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/torch.h>
 
 #include <cstdint>
@@ -47,6 +48,12 @@ struct SpecVerifyGraphTaskSignal {
 class ExecutorImpl {
  public:
   virtual ~ExecutorImpl() = default;
+
+  virtual bool supports_device_only_decode_inputs() const { return false; }
+
+  virtual void set_device_only_decode_inputs(bool enabled) {
+    CHECK(!enabled) << "Device-only decode inputs are not supported";
+  }
 
   virtual void set_dp_process_group(ProcessGroup* /*group*/) {}
 

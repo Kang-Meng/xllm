@@ -88,6 +88,8 @@ struct Options {
 
   PROPERTY(bool, speculative_suffix_use_tree_spec) = false;
 
+  PROPERTY(bool, enable_dspark_prelaunch) = false;
+
   PROPERTY(bool, enable_adaptive_speculative_decode) = false;
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;

@@ -75,6 +75,16 @@ class PyModelBase(nn.Module):
         """
         raise NotImplementedError
 
+    def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
+        """Declare whether the complete decode path needs no unready Host inputs.
+
+        Model authors own this contract for input preparation and the selected
+        operator and runner implementations. Ready Host shapes and configuration
+        are allowed. kv_page_size is the physical tokens-per-page selected by
+        the runtime, available before KV cache binding.
+        """
+        return False
+
     def adapt_weights_for_reference_model(
         self,
         reference_model_path: str,

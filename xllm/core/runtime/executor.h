@@ -38,6 +38,9 @@ class Executor final {
 
   virtual ~Executor() = default;
 
+  bool supports_device_only_decode_inputs() const;
+  void set_device_only_decode_inputs(bool enabled);
+
   void set_dp_process_group(ProcessGroup* group);
 
   ForwardInput prepare_inputs(Batch& batch);

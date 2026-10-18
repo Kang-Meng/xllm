@@ -903,8 +903,15 @@ void WorkerImpl::update_json_object_states_by_last_step_output(
         << "JSON grammar overlap update requires a compute stream";
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     if (last_step_output_.ready_event != nullptr) {
-      CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
-          << "failed to wait for last-step output before JSON grammar update";
+      if (last_step_output_.requires_host_retirement &&
+          last_step_output_.sample_output.next_tokens.device().is_cpu()) {
+        CHECK(last_step_output_.ready_event->synchronize())
+            << "failed to wait for accepted-token D2H before JSON grammar "
+               "update";
+      } else {
+        CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
+            << "failed to wait for last-step output before JSON grammar update";
+      }
     }
     next_tokens =
         safe_to(last_step_output_.sample_output.next_tokens,
@@ -1654,19 +1661,17 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
 #if defined(USE_NPU)
           // Driver outputs are copied by GetLastStepResult, which waits for the
           // ready event before the retained no-sync inputs can be released.
-          // Non-driver ranks are not queried by LLMEngine. In eager DP MTP,
-          // overwriting their previous output can therefore release temporary
-          // DP/EP padding tensors while ATB still holds their device addresses.
-          // Keep one-step scheduler overlap, but retire the previous eager
-          // output only after its compute event has completed.
-          const bool wait_for_eager_dp_spec_input_lifetime =
+          // Non-driver ranks are not queried by LLMEngine. Retire the previous
+          // output after its ready event before releasing retained inputs,
+          // regardless of model execution mode.
+          const bool wait_for_previous_spec_input_lifetime =
               last_step_output_valid_ && options_.enable_speculative_decode() &&
-              parallel_args_.dp_size() > 1 &&
-              !::xllm::ExecutionConfig::get_instance().enable_graph() &&
+              (parallel_args_.dp_size() > 1 ||
+               last_step_output_.requires_host_retirement) &&
               last_step_output_.ready_event != nullptr;
-          if (wait_for_eager_dp_spec_input_lifetime) {
+          if (wait_for_previous_spec_input_lifetime) {
             CHECK(last_step_output_.ready_event->synchronize())
-                << "failed to retire previous eager DP speculative input";
+                << "failed to retire previous speculative input";
           }
 #endif
           update_last_step_output(output,
@@ -1674,6 +1679,11 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
                                   input.sample_sequence_ids);
         }
       } else {
+        if (last_step_output_.requires_host_retirement &&
+            last_step_output_.ready_event != nullptr) {
+          CHECK(last_step_output_.ready_event->synchronize())
+              << "failed to retire asynchronous output before clearing it";
+        }
         if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
           std::unique_lock<std::mutex> lock(mtx_);
           cv_.wait(lock, [this] { return !is_recorded_; });

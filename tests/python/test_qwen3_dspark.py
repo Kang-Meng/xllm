@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from unittest.mock import Mock
 
 import pytest
@@ -72,6 +74,44 @@ class _StateDict:
 def test_config_requires_positive_markov_rank() -> None:
     with pytest.raises(ValueError, match="markov_rank > 0"):
         _config(markov_rank=0)
+
+
+@pytest.mark.parametrize("is_ascend_a3", [False, True])
+def test_device_only_decode_capability_requires_a3(
+    monkeypatch: pytest.MonkeyPatch,
+    is_ascend_a3: bool,
+) -> None:
+    runtime = types.ModuleType("xllm_runtime")
+    runtime.is_ascend_a3 = Mock(return_value=is_ascend_a3)
+    monkeypatch.setitem(sys.modules, "xllm_runtime", runtime)
+    model = Qwen3DSparkForCausalLM(_config_dict(hidden_size=128, head_dim=128, dtype="bfloat16"))
+
+    assert model.supports_device_only_decode_inputs(kv_page_size=128) is is_ascend_a3
+
+
+@pytest.mark.parametrize(
+    "head_dim,kv_page_size,expected",
+    [
+        (64, 128, False),
+        (256, 128, False),
+        (128, 64, False),
+        (128, 256, False),
+        (64, 64, False),
+        (128, 128, True),
+    ],
+)
+def test_device_only_decode_capability_requires_supported_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    head_dim: int,
+    kv_page_size: int,
+    expected: bool,
+) -> None:
+    runtime = types.ModuleType("xllm_runtime")
+    runtime.is_ascend_a3 = Mock(return_value=True)
+    monkeypatch.setitem(sys.modules, "xllm_runtime", runtime)
+    model = Qwen3DSparkForCausalLM(_config_dict(hidden_size=head_dim, head_dim=head_dim, dtype="bfloat16"))
+
+    assert model.supports_device_only_decode_inputs(kv_page_size) is expected
 
 
 def test_checkpoint_loads_dspark_heads(monkeypatch: pytest.MonkeyPatch) -> None:

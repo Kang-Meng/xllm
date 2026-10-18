@@ -68,6 +68,10 @@ DEFINE_bool(enable_atb_spec_kernel,
             false,
             "Whether to use ATB speculative kernel.");
 
+DEFINE_bool(enable_dspark_prelaunch,
+            false,
+            "Whether to enable DSpark draft prelaunch.");
+
 DEFINE_bool(enable_adaptive_speculative_decode,
             false,
             "Whether to enable adaptive speculative length for MTP decode.");
@@ -93,6 +97,7 @@ void SpeculativeConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(draft_sampling_mode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_atb_spec_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dspark_prelaunch);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_speculative_min_gain);
 }
@@ -110,6 +115,7 @@ void SpeculativeConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(draft_sampling_mode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_atb_spec_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dspark_prelaunch);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_speculative_min_gain);
 }
@@ -142,6 +148,8 @@ void SpeculativeConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_atb_spec_kernel);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_dspark_prelaunch);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_adaptive_speculative_decode);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_speculative_min_gain);
@@ -164,6 +172,12 @@ void SpeculativeConfig::validate() const {
   const DraftSamplingMode mode =
       parse_draft_sampling_mode(draft_sampling_mode());
   const std::string& algorithm = speculative_algorithm();
+  if (enable_dspark_prelaunch()) {
+    CHECK(is_dspark_algorithm(algorithm))
+        << "--enable_dspark_prelaunch requires speculative_algorithm=DSpark, "
+           "got "
+        << algorithm;
+  }
   if (mode == DraftSamplingMode::PROBABILISTIC) {
     CHECK(is_probabilistic_draft_sampling_supported(algorithm))
         << algorithm << " does not support draft_sampling_mode="

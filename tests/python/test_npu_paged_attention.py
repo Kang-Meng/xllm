@@ -369,7 +369,8 @@ def test_xfia_single_token_decode_uses_actual_window(
 
 
 @pytest.mark.parametrize("sliding_window", [0, 2048])
-def test_xfia_dflash2_chunked_query_keeps_band_window(sliding_window: int) -> None:
+@pytest.mark.parametrize("proposal_width", [8, 15])
+def test_xfia_dflash2_chunked_query_keeps_band_window(sliding_window: int, proposal_width: int) -> None:
     backend = NpuPagedAttentionBackend(
         num_heads=4,
         num_kv_heads=1,
@@ -380,7 +381,7 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(sliding_window: int) -> No
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
         use_xfia_decode=True,
-        xfia_query_width=8,
+        xfia_query_width=proposal_width,
     )
     cache = torch.empty(40, 128, 1, 128, dtype=torch.bfloat16)
     backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
@@ -392,14 +393,18 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(sliding_window: int) -> No
         is_dflash_proposal=True,
         block_table=table,
         kv_seq_lens=torch.tensor([2055, 2305], dtype=torch.int32),
-        slot_mapping=torch.arange(16),
+        slot_mapping=torch.arange(2 * proposal_width),
     )
     backend.prepare(metadata)
-    assert backend._xfia_query_ends.tolist() == list(range(1, 17))
-    assert backend._xfia_kv_lengths.tolist() == [2055] * 8 + [2305] * 8
-    expected_starts = list(range(8)) + list(range(250, 258)) if sliding_window else [0] * 16
+    assert backend._xfia_query_ends.tolist() == list(range(1, 2 * proposal_width + 1))
+    assert backend._xfia_kv_lengths.tolist() == [2055] * proposal_width + [2305] * proposal_width
+    expected_starts = [
+        max(0, length - proposal_width + offset - sliding_window + 1) if sliding_window else 0
+        for length in [2055, 2305]
+        for offset in range(proposal_width)
+    ]
     assert backend._xfia_kv_starts.tolist() == expected_starts
-    torch.testing.assert_close(backend._block_table_i32, table.repeat_interleave(8, dim=0))
+    torch.testing.assert_close(backend._block_table_i32, table.repeat_interleave(proposal_width, dim=0))
 
 
 def test_target_spec_verify_chunk_does_not_use_xfia(monkeypatch: pytest.MonkeyPatch) -> None:

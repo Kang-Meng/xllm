@@ -90,6 +90,14 @@ class LLMWorkerImpl : public WorkerImpl {
     return model_->has_dspark_confidence_head();
   }
 
+  bool supports_device_only_decode_inputs() const {
+    return model_executor_->supports_device_only_decode_inputs();
+  }
+
+  void set_device_only_decode_inputs(bool enabled) {
+    model_executor_->set_device_only_decode_inputs(enabled);
+  }
+
   DFlash2CandidateOutput dflash2_candidates(
       const torch::Tensor& hidden_states,
       const torch::Tensor& unary_logits,

@@ -110,6 +110,14 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   virtual DraftBlock run_decode_draft(const ForwardInput& input,
                                       ForwardInput& validate_input);
 
+  virtual void prepare_validate_output_async(const ForwardInput&) {}
+
+  virtual void finalize_validate_output_async(const ForwardInput&,
+                                              const SampleOutput&,
+                                              ForwardOutput&) {
+    LOG(FATAL) << "Asynchronous validate output was not implemented";
+  }
+
   virtual bool prepare_draft_prelaunch(const ForwardInput& /*input*/) {
     return false;
   }
@@ -143,10 +151,15 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // Shared with subclasses (DSpark): build the N/N+1-wide draft query block and
   // the target validate input. A DSpark override of run_decode_draft calls both
   // before its draft forward.
+  void prepare_decode_input(ForwardInput& input);
   void prepare_query_inputs(const ForwardInput& input,
                             ForwardInput& query_input);
   void prepare_validate_inputs(const ForwardInput& input,
                                ForwardInput& validate_input);
+  std::optional<ForwardOutput> run_validate(const ForwardInput& input,
+                                            const DraftBlock& draft_block,
+                                            ForwardInput& validate_input,
+                                            bool async_output = false);
 
   // A replicated draft pool stores kv_split physical pages per logical block,
   // so the draft's own block table has to be expanded to address them. The
@@ -179,10 +192,6 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
       ForwardInput& validate_input,
       Stream& compute_stream,
       const std::vector<int32_t>& per_seq_val_tokens);
-
-  std::optional<ForwardOutput> run_validate(const ForwardInput& input,
-                                            const DraftBlock& draft_block,
-                                            ForwardInput& validate_input);
 
   // `per_seq_val_tokens` (optional): when non-empty, the target output was
   // scattered from a per-seq varlen batch and each seq's bonus lives at
