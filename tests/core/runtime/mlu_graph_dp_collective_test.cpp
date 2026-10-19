@@ -55,10 +55,12 @@ enum class Scenario : int8_t {
   ALL_SUPPORTED,
   ONE_REJECTED,
   PLAN_MISMATCH,
+  HISTORY_MISMATCH,
   EMBEDDING_MISMATCH,
   PARTIAL_HIT,
   MTP_MODE_MISMATCH,
   MTP_SCHEMA_MISMATCH,
+  MTP_FIELD_BOUNDARY_MISMATCH,
   MTP_PARTIAL_HIT,
   VLM_ALL_SUPPORTED,
   VLM_ONE_REJECTED,
@@ -240,7 +242,7 @@ void set_topk_input(StepInput& input,
                     int32_t rank,
                     int32_t step,
                     bool reuse,
-                    int64_t columns) {
+                    const std::vector<int64_t>& schema) {
   set_embedding(input, rank, step);
   input.tokens.fill_(rank + step + 10);
   input.params.mtp_topk_state.reset();
@@ -248,12 +250,14 @@ void set_topk_input(StepInput& input,
     return;
   }
   model::MluMtpTopkState::LayerStates layers;
-  layers.reserve(1);
-  layers.emplace_back(
-      layer::DsaTopkState(torch::full({input.tokens.size(0), columns},
-                                      rank + step + 20,
-                                      input.tokens.options()),
-                          torch::ones_like(input.tokens)));
+  layers.reserve(schema.size());
+  for (int64_t columns : schema) {
+    layers.emplace_back(
+        layer::DsaTopkState(torch::full({input.tokens.size(0), columns},
+                                        rank + step + 20,
+                                        input.tokens.options()),
+                            torch::ones_like(input.tokens)));
+  }
   input.params.mtp_topk_state =
       std::make_shared<model::MluMtpTopkState>(std::move(layers));
 }
@@ -305,21 +309,32 @@ void run_topk_scenario(Scenario scenario,
   MluGraphExecutorImpl executor(&model, args, device, options);
   StepInput input = make_input(rank, device, /*batch_size=*/3);
   const bool reuse = scenario != Scenario::MTP_MODE_MISMATCH || rank != 0;
-  const int64_t columns =
-      scenario == Scenario::MTP_SCHEMA_MISMATCH && rank == 1 ? 4 : 2;
+  std::vector<int64_t> schema{
+      scenario == Scenario::MTP_SCHEMA_MISMATCH && rank == 1 ? 4 : 2};
+  if (scenario == Scenario::MTP_FIELD_BOUNDARY_MISMATCH) {
+    // Flattened payload values match across ranks, but their field boundaries
+    // describe distinct multi-table and selection layouts.
+    schema = rank == 0 ? std::vector<int64_t>{3, 4} : std::vector<int64_t>{4};
+    input.params.multi_block_tables = {
+        torch::zeros({3, 2}, input.tokens.options())};
+    if (rank == 1) {
+      input.params.multi_block_tables.emplace_back(
+          torch::zeros({3, 3}, input.tokens.options()));
+    }
+  }
   const bool partial_hit = scenario == Scenario::MTP_PARTIAL_HIT;
   // Prove each mismatching layout works locally. For partial hits only rank 0
   // owns a graph before attaching the real two-rank agreement group.
   if (!partial_hit || rank == 0) {
-    set_topk_input(input, rank, /*step=*/0, reuse, columns);
+    set_topk_input(input, rank, /*step=*/0, reuse, schema);
     run_topk_step(executor, input);
-    set_topk_input(input, rank, /*step=*/1, reuse, columns);
+    set_topk_input(input, rank, /*step=*/1, reuse, schema);
     run_topk_step(executor, input);
     CHECK_EQ(model.forward_count(), 1) << "Local MTP replay must work first";
   }
   executor.set_dp_process_group(&group);
   for (int32_t step = 2; step <= 3; ++step) {
-    set_topk_input(input, rank, step, reuse, columns);
+    set_topk_input(input, rank, step, reuse, schema);
     run_topk_step(executor, input);
     const int32_t expected_calls = partial_hit ? (rank == 0 ? 2 : 1) : step;
     CHECK_EQ(model.forward_count(), expected_calls)
@@ -349,6 +364,7 @@ int32_t run_child(Scenario scenario, int32_t rank, int32_t port) {
     verify_group(*group, rank, device);
     if (scenario == Scenario::MTP_MODE_MISMATCH ||
         scenario == Scenario::MTP_SCHEMA_MISMATCH ||
+        scenario == Scenario::MTP_FIELD_BOUNDARY_MISMATCH ||
         scenario == Scenario::MTP_PARTIAL_HIT) {
       run_topk_scenario(scenario, rank, device, *group);
       return 0;
@@ -361,7 +377,8 @@ int32_t run_child(Scenario scenario, int32_t rank, int32_t port) {
     args.model_type("qwen3_5_text")
         .dtype("bfloat16")
         .hidden_size(kHiddenSize)
-        .max_position_embeddings(8192);
+        .max_position_embeddings(
+            scenario == Scenario::HISTORY_MISMATCH ? 8192 + rank * 16 : 8192);
     runtime::Options options;
     options.block_size(16).dp_size(kWorldSize).world_size(kWorldSize);
     if (scenario == Scenario::VLM_ALL_SUPPORTED ||
@@ -427,8 +444,9 @@ int32_t run_child(Scenario scenario, int32_t rank, int32_t port) {
       return 0;
     }
 
-    if (scenario == Scenario::PLAN_MISMATCH) {
-      if (rank == 1) {
+    if (scenario == Scenario::PLAN_MISMATCH ||
+        scenario == Scenario::HISTORY_MISMATCH) {
+      if (scenario == Scenario::PLAN_MISMATCH && rank == 1) {
         const auto ints =
             torch::TensorOptions().dtype(torch::kInt32).device(device);
         input.params.multi_block_tables.emplace_back(
@@ -571,6 +589,10 @@ TEST(MluGraphDpCollectiveTest, DifferentPlansMakeAllRunEager) {
   run_scenario(Scenario::PLAN_MISMATCH);
 }
 
+TEST(MluGraphDpCollectiveTest, DifferentHistoryCapacityMakesAllRunEager) {
+  run_scenario(Scenario::HISTORY_MISMATCH);
+}
+
 TEST(MluGraphDpCollectiveTest, DifferentEmbeddingPresenceMakesAllRunEager) {
   run_scenario(Scenario::EMBEDDING_MISMATCH);
 }
@@ -585,6 +607,10 @@ TEST(MluGraphDpCollectiveTest, MtpProducerAndReuseRanksBothRunEager) {
 
 TEST(MluGraphDpCollectiveTest, DifferentMtpSchemasMakeAllRanksRunEager) {
   run_scenario(Scenario::MTP_SCHEMA_MISMATCH);
+}
+
+TEST(MluGraphDpCollectiveTest, DifferentKeyFieldBoundariesMakeAllRunEager) {
+  run_scenario(Scenario::MTP_FIELD_BOUNDARY_MISMATCH);
 }
 
 TEST(MluGraphDpCollectiveTest, MtpPartialCacheHitRecapturesThenReplays) {

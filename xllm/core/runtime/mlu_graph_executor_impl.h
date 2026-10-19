@@ -27,6 +27,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/mtp_topk_state.h"
+#include "core/kernels/mlu/piecewise_graph.h"
 #include "core/runtime/executor_impl.h"
 #include "core/runtime/executor_impl_factory.h"
 #include "core/runtime/mlu_graph_planner.h"
@@ -69,7 +70,8 @@ class GraphPersistentParam final {
 // MLUGraph provides mempool to manage temporary tensors during forward pass
 class MluGraph final {
  public:
-  explicit MluGraph(std::unique_ptr<GraphPersistentParam> persistent_param);
+  explicit MluGraph(std::unique_ptr<GraphPersistentParam> persistent_param,
+                    bool piecewise = false);
 
   // Capture computation graph for given bucket num_tokens.
   // All buckets must capture on the same MLU stream so the caching allocator
@@ -90,6 +92,8 @@ class MluGraph final {
                            const GraphLayout& layout);
 
   std::size_t owned_persistent_tensor_bytes() const;
+  std::size_t num_graphs() const;
+  std::size_t num_eager_segments() const;
 
   // Independent copy of the leading rows a producer step emitted, or nullptr
   // when this graph emits no MTP top-k state.
@@ -111,6 +115,7 @@ class MluGraph final {
 
   // Destroy the graph before releasing tensors referenced by captured kernels.
   torch_mlu::MLUGraph graph_;
+  std::unique_ptr<kernel::mlu::PiecewiseGraph> piecewise_graph_;
 };
 
 // Executor implementation using MLU graph optimization

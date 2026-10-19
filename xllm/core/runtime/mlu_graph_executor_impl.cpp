@@ -126,33 +126,21 @@ GraphAction agree_graph_action(const xllm::mlu::GraphDecision& decision,
   const auto* plan = std::get_if<xllm::mlu::GraphPlan>(&decision);
   std::array<int64_t, kGraphPacketSize> packet{};
   if (plan != nullptr) {
-    const std::vector<int64_t>& table_columns =
-        plan->key.multi_block_table_column_counts;
-    const std::vector<int64_t>& topk_schema = plan->key.mtp_topk_schema;
     // Admission and cache state lead the packet; every later value is compared
     // across ranks.
     const int64_t fields[] = {
         1,
         cache_hit ? 1 : 0,
-        plan->layout.padded_num_tokens,
-        plan->layout.padded_num_reqs,
-        plan->layout.tokens_per_request,
-        plan->layout.attention_row_query_len,
         plan->layout.cache_pad_slot,
         plan->history_capacity,
         plan->main_block_table_columns,
-        plan->key.has_input_embedding ? 1 : 0,
-        static_cast<int64_t>(table_columns.size()),
-        static_cast<int64_t>(topk_schema.size()),
     };
-    static_assert(std::size(fields) + xllm::mlu::kMaxGraphKeyLayoutFields <=
+    static_assert(std::size(fields) + xllm::mlu::kMaxGraphKeyFields <=
                   static_cast<std::size_t>(kGraphPacketSize));
-    CHECK_LE(table_columns.size() + topk_schema.size(),
-             xllm::mlu::kMaxGraphKeyLayoutFields);
+    CHECK_LE(get_key_size(plan->key), xllm::mlu::kMaxGraphKeyFields);
     auto cursor =
         std::copy(std::begin(fields), std::end(fields), packet.begin());
-    cursor = std::copy(table_columns.begin(), table_columns.end(), cursor);
-    std::copy(topk_schema.begin(), topk_schema.end(), cursor);
+    visit_graph_key(plan->key, [&cursor](int64_t value) { *cursor++ = value; });
   }
   if (dp_group == nullptr || dp_group->world_size() <= 1) {
     return packet[0] == 0
@@ -318,6 +306,9 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
                                                const torch::Tensor& positions,
                                                const ModelInputParams& params,
                                                const GraphLayout& layout) {
+  if (params_.graph.eager_context != nullptr) {
+    params_.meta.kv_max_seq_len = params.meta.kv_max_seq_len;
+  }
   if (mtp_topk_input_ != nullptr) {
     CHECK(params.mtp_topk_state != nullptr);
     mtp_topk_input_->update(*params.mtp_topk_state);
@@ -610,8 +601,24 @@ std::size_t GraphPersistentParam::get_persistent_tensor_bytes() const {
   return total;
 }
 
-MluGraph::MluGraph(std::unique_ptr<GraphPersistentParam> persistent_param)
-    : persistent_param_(std::move(persistent_param)) {}
+MluGraph::MluGraph(std::unique_ptr<GraphPersistentParam> persistent_param,
+                   bool piecewise)
+    : persistent_param_(std::move(persistent_param)) {
+  if (piecewise) {
+    piecewise_graph_ = std::make_unique<kernel::mlu::PiecewiseGraph>(
+        persistent_param_->params_.meta.kv_max_seq_len);
+    persistent_param_->params_.graph.eager_context = piecewise_graph_.get();
+  }
+}
+
+std::size_t MluGraph::num_graphs() const {
+  return piecewise_graph_ == nullptr ? 1 : piecewise_graph_->num_graphs();
+}
+
+std::size_t MluGraph::num_eager_segments() const {
+  return piecewise_graph_ == nullptr ? 0
+                                     : piecewise_graph_->num_eager_segments();
+}
 
 std::size_t MluGraph::owned_persistent_tensor_bytes() const {
   return persistent_param_->get_persistent_tensor_bytes();
@@ -693,21 +700,31 @@ ModelOutput MluGraph::capture(CausalLM* model,
   inputs_ready.wait(capture_stream);
   {
     torch_mlu::mlu::MLUStreamGuard guard(capture_stream);
-    graph_.capture_begin(pool, cnrtQueueCaptureModeRelaxed);
-    store_output(forward());
-    graph_.capture_end();
+    if (piecewise_graph_ != nullptr) {
+      piecewise_graph_->capture_begin(pool);
+      store_output(forward());
+      piecewise_graph_->capture_end();
+    } else {
+      graph_.capture_begin(pool, cnrtQueueCaptureModeRelaxed);
+      store_output(forward());
+      graph_.capture_end();
+    }
   }
   torch_mlu::MLUEvent capture_ready;
   capture_ready.place(capture_stream);
   capture_ready.wait(caller_stream);
   if (!has_state) {
-    graph_.replay();
+    return replay();
   }
   return output();
 }
 
 ModelOutput MluGraph::replay() {
-  graph_.replay();
+  if (piecewise_graph_ != nullptr) {
+    piecewise_graph_->replay();
+  } else {
+    graph_.replay();
+  }
   return output();
 }
 
@@ -734,13 +751,11 @@ MluGraphExecutorImpl::MluGraphExecutorImpl(CausalLM* model,
   mtp_capabilities_ = ModelRegistry::get_mtp_capabilities(args_.model_type());
   int64_t history_capacity =
       ordinary_graph_capacity(args_, options_.block_size());
-  if (mtp_capabilities_.graph_history == MtpGraphHistoryPolicy::KPOOL_FIXED) {
-    history_capacity = ModelRegistry::get_graph_history_capacity(
-        args_.model_type(), args_, history_capacity);
-  } else if (mtp_capabilities_.graph_history ==
-             MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION) {
+  if (mtp_capabilities_.graph_history ==
+          MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION ||
+      mtp_capabilities_.graph_history == MtpGraphHistoryPolicy::MODEL_CONTEXT) {
     CHECK_GT(args_.max_position_embeddings(), 0)
-        << "Qwen3.5 graph requires positive max_position_embeddings";
+        << "Context-bounded graph requires positive max_position_embeddings";
     history_capacity = args_.max_position_embeddings();
   }
   const int64_t max_tokens = std::max<int64_t>(
@@ -884,7 +899,8 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
                                                layout,
                                                graph_max_kv_seq_len,
                                                plan->main_block_table_columns);
-    auto graph = std::make_unique<MluGraph>(std::move(buffers));
+    auto graph = std::make_unique<MluGraph>(
+        std::move(buffers), mtp_capabilities_.enable_piecewise_graph);
     active_graph = graph.get();
     graph->update_input_buffer(model_, tokens, positions, params, layout);
     if (!graph_capture_stream_.has_value()) {
@@ -913,7 +929,9 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
               << ", draft=" << options_.is_draft_engine()
               << ", verify=" << params.is_spec_verify
               << ", mtp_topk_reuse=" << !key.mtp_topk_schema.empty()
-              << ", padded_num_tokens=" << graph_tokens;
+              << ", padded_num_tokens=" << graph_tokens
+              << ", graph_segments=" << active_graph->num_graphs()
+              << ", eager_segments=" << active_graph->num_eager_segments();
     log_memory_after_capture();
   }
   ModelOutput output = make_graph_output(

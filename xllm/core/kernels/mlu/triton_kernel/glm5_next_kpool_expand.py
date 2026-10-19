@@ -32,7 +32,6 @@ def expand_compact(
     block_table_row_stride: tl.int64,
     block_table_column_stride: tl.int64,
     block_table_width: tl.int64,
-    BLOCK_TABLE: tl.constexpr,
     ALWAYS_SELECT_TAIL: tl.constexpr,
 ) -> None:
     """Compact 512 pools, append tail, and map to 16-token physical blocks."""
@@ -45,20 +44,15 @@ def expand_compact(
     valid_pools = (pool_ids >= 0) & (pool_ids * 4 <= position)
     valid_pools &= pool_ids // 4 < block_table_width
     batch = tl.load(row_batch + query * row_batch_stride).to(tl.int64)
-    table_columns = tl.arange(0, BLOCK_TABLE)
-    physical_table = tl.load(
-        block_table + batch * block_table_row_stride + table_columns * block_table_column_stride,
-        mask=table_columns < block_table_width,
+    # Read only selected pages; graph capacity must not scale expansion work.
+    physical_blocks = tl.load(
+        block_table + batch * block_table_row_stride + (pool_ids // 4) * block_table_column_stride,
+        mask=valid_pools,
         other=-1,
     ).to(tl.int64)
-    logical_blocks = tl.minimum(
-        tl.where(valid_pools, pool_ids // 4, 0),
-        block_table_width - 1,
-    )
-    physical_blocks = tl.gather(physical_table, logical_blocks, axis=0)
     valid_pools &= physical_blocks >= 0
     member_count = tl.where(valid_pools, tl.minimum(4, position - pool_ids * 4 + 1), 0).to(tl.int32)
-    pool_prefix = tl.cumsum(member_count, axis=0)
+    pool_prefix = _prefix(member_count, 512)
     selected_tokens = tl.sum(member_count, axis=0)
     members = tl.arange(0, 4)
     slots = physical_blocks[:, None] * 16 + pool_ids[:, None] % 4 * 4 + members[None, :]
@@ -77,9 +71,14 @@ def expand_compact(
         tail_count = tl.full((), 0, tl.int64)
     tail_offsets = tl.arange(0, 4)
     tail_tokens = tail_begin + tail_offsets
-    tail_blocks = tl.minimum(tail_tokens // 16, block_table_width - 1)
-    tail_physical = tl.gather(physical_table, tl.maximum(tail_blocks, 0), axis=0)
-    tail_valid = (tail_offsets < tail_count) & (tail_tokens // 16 < block_table_width) & (tail_physical >= 0)
+    tail_blocks = tail_tokens // 16
+    tail_valid = (tail_offsets < tail_count) & (tail_blocks >= 0) & (tail_blocks < block_table_width)
+    tail_physical = tl.load(
+        block_table + batch * block_table_row_stride + tail_blocks * block_table_column_stride,
+        mask=tail_valid,
+        other=-1,
+    ).to(tl.int64)
+    tail_valid &= tail_physical >= 0
     tail_prefix = tl.cumsum(tail_valid.to(tl.int32), 0) - 1
     tl.store(
         physical_slots + query * 2051 + selected_tokens + tail_prefix,

@@ -37,6 +37,10 @@ class AclGraphTaskUpdateContext;
 }
 #endif
 
+namespace xllm {
+class GraphEagerContext;
+}
+
 namespace xllm::layer {
 
 struct ExpandedDecodeMetadata {
@@ -226,6 +230,8 @@ struct AttentionMetadata {
   // mode: paged_kv_indptr on CPU torch::Tensor kv_seq_lens_host;        //
   // Decode mode (tensor_core) / NPU: kv_seq_lens on CPU for CUDA graph
   bool enable_cuda_graph = false;
+  // Non-owning context for history-dependent operations between graph segments.
+  GraphEagerContext* eager_context = nullptr;
 
   // for xattention
   torch::Tensor full_k_cache;

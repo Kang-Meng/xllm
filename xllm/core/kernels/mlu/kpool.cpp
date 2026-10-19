@@ -488,14 +488,13 @@ KPoolSelection expand_kpool(const torch::Tensor& ids,
   const int64_t width = token_budget + pool_size - 1;
   const auto options = ids.options().dtype(torch::kInt64);
   KPoolSelection result{
-      torch::full({ids.size(0), width}, -1, options.dtype(torch::kInt32)),
-      torch::zeros({ids.size(0)}, options.dtype(torch::kInt32))};
-  if (ids.size(0) == 0 || width == 0 || table.size(1) == 0) {
-    return result;
-  }
-  // The old fused shape is an optimization, not a production restriction.
+      torch::empty({ids.size(0), width}, options.dtype(torch::kInt32)),
+      torch::empty({ids.size(0)}, options.dtype(torch::kInt32))};
+  // The fused kernel writes every output and reads only selected table entries,
+  // including when piecewise graphs reserve a long-context block table.
   if (ids.size(1) == 512 && token_budget == 2048 && pool_size == 4 &&
-      block_size == 16 && ids.size(0) <= 256 && table.size(1) <= 8192) {
+      block_size == 16 && ids.size(0) > 0 && ids.size(0) <= 256 &&
+      table.size(1) > 0) {
     triton_jit::JITKernel::get(kExpand, "expand_compact")
         .launch(static_cast<void*>(torch_mlu::getCurMLUStream()),
                 {static_cast<uint32_t>(ids.size(0)), 1, 1},
@@ -513,8 +512,12 @@ KPoolSelection expand_kpool(const torch::Tensor& ids,
                 table.stride(0),
                 table.stride(1),
                 table.size(1),
-                tile_size(table.size(1)),
                 always_tail ? 1 : 0);
+    return result;
+  }
+  result.physical_slots.fill_(-1);
+  result.context_lens.zero_();
+  if (ids.size(0) == 0 || width == 0 || table.size(1) == 0) {
     return result;
   }
   const torch::Tensor members = torch::arange(pool_size, options);

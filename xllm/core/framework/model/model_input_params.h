@@ -50,6 +50,7 @@ limitations under the License.
 #include "util/tensor_helper.h"
 
 namespace xllm {
+class GraphEagerContext;
 namespace npu {
 struct AclGraphTaskUpdateContext;
 }  // namespace npu
@@ -964,6 +965,7 @@ struct ExpertInput {
 };
 
 struct GraphInput {
+  GraphEagerContext* eager_context = nullptr;
   torch::Tensor attn_mask;
   torch::Tensor tiling_data;
   torch::Tensor num_valid_token_rows;

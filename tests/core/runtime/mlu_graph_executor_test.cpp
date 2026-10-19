@@ -33,7 +33,9 @@ limitations under the License.
 #include "core/distributed_runtime/engine.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/model/graph_eager_context.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/parallel_state/process_group.h"
@@ -48,7 +50,6 @@ limitations under the License.
 #include "runtime/decode_graph_bucket.h"
 #include "runtime/options.h"
 #include "tests/core/layers/mlu/tests_utils.h"
-#include "util/env_var.h"
 
 namespace xllm {
 namespace {
@@ -527,7 +528,6 @@ class StatefulVerifyModel final : public GroupedCausalLM {
 };
 
 TEST(MluSpecVerifyGraphTest, ReplaysUpdatedInputsAndAdvancesStateExactlyOnce) {
-  ScopedEnvVar graph_kv_cap("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "4096");
   const torch::NoGradGuard no_grad;
   const torch::Device device("mlu:0");
   const auto floats =
@@ -732,15 +732,9 @@ class MluGraphExecutorTest : public ::testing::Test {
         model_args_.index_kpool() > 0) {
       MtpModelCapabilities capabilities;
       capabilities.supports_grouped_mtp_graph = true;
-      capabilities.graph_history = MtpGraphHistoryPolicy::KPOOL_FIXED;
+      capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
       ModelRegistry::register_mtp_capabilities("test_grouped_model",
                                                capabilities);
-      ModelRegistry::register_graph_history_capacity(
-          "test_grouped_model", [](const ModelArgs& args) {
-            return std::min<int64_t>(
-                util::get_int_env("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", 32768),
-                args.max_position_embeddings());
-          });
       model_args_.model_type("test_grouped_model");
     }
     const torch::Device device("mlu:0");
@@ -1421,17 +1415,10 @@ TEST_F(MluGraphExecutorTest, Glm52DecodeReusesGraphAcrossBlockTableWidths) {
   EXPECT_EQ(model_->forward_cnt(), 1);
 }
 
-TEST(ModelRegistryGraphHistoryTest, UsesDefaultCapacityWithoutAdapter) {
-  const ModelArgs args{};
-  EXPECT_EQ(ModelRegistry::get_graph_history_capacity(
-                "unregistered_graph_history_capacity", args, 128),
-            128);
-}
-
 TEST_F(MluGraphExecutorTest,
-       KPoolDecodeUsesFixedHistoryCapacityAndFallsBackAboveIt) {
-  ScopedEnvVar graph_kv_cap("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "64");
-  model_args_.index_kpool(4).index_kpool_compress(true);
+       ModelContextHistoryFallsBackAboveCapacityThenReplays) {
+  model_args_.index_kpool(4).index_kpool_compress(true).max_position_embeddings(
+      64);
   model_ = std::make_unique<GroupedCausalLM>(tensor_options_);
   options_.is_draft_engine(false);
   rebuild_impl();
@@ -1464,10 +1451,12 @@ TEST_F(MluGraphExecutorTest,
           /*dim=*/1, /*start=*/0, /*length=*/5);
   over_cap.input_params.meta.kv_max_seq_len = 65;
 
-  impl_->run({short_history.token_ids},
-             {short_history.positions},
-             kv_caches_,
-             {short_history.input_params});
+  const torch::Tensor first = impl_
+                                  ->run(short_history.token_ids,
+                                        short_history.positions,
+                                        kv_caches_,
+                                        short_history.input_params)
+                                  .hidden_states.clone();
   EXPECT_EQ(model_->forward_cnt(), 2);
   EXPECT_EQ(model_->last_kv_max_seq_len(), 64);
   EXPECT_EQ(model_->last_block_table_width(), 4);
@@ -1487,6 +1476,15 @@ TEST_F(MluGraphExecutorTest,
              kv_caches_,
              {over_cap.input_params});
   EXPECT_EQ(model_->forward_cnt(), 4);
+
+  const torch::Tensor again = impl_
+                                  ->run(short_history.token_ids,
+                                        short_history.positions,
+                                        kv_caches_,
+                                        short_history.input_params)
+                                  .hidden_states.clone();
+  EXPECT_EQ(model_->forward_cnt(), 4);
+  EXPECT_TRUE(torch::equal(first, again));
 }
 
 TEST_F(MluGraphExecutorTest, UnsupportedVerifyUsesEagerAndDecodeCaptures) {
@@ -2799,6 +2797,329 @@ TEST_F(MluGraphExecutorTest,
       snapshot->layer_states()[0]->block_tables(),
       torch::full({1, 2}, 17, tensor_options_.dtype(torch::kInt32))));
   EXPECT_FALSE(snapshot->layer_states()[1].has_value());
+}
+
+namespace {
+class PiecewiseHistoryModel final : public MockCausalLM {
+ public:
+  explicit PiecewiseHistoryModel(const torch::TensorOptions& options,
+                                 int32_t num_layers = 1)
+      : MockCausalLM(options), num_layers_(num_layers) {}
+
+  ModelOutput forward(const torch::Tensor& /*tokens*/,
+                      const torch::Tensor& /*positions*/,
+                      std::vector<KVCache>& /*kv_caches*/,
+                      const ModelInputParams& params) override {
+    ++calls_;
+    torch::Tensor hidden = params.embedding.input_embedding.to(torch::kFloat32);
+    for (int32_t layer = 0; layer < num_layers_; ++layer) {
+      torch::Tensor projected = hidden * 2;
+      torch::Tensor selected = torch::empty_like(projected);
+      auto selection =
+          [this, projected, selected, layer](int64_t kv_max_seq_len) mutable {
+            EXPECT_EQ(eager_calls_ % num_layers_, layer);
+            ++eager_calls_;
+            // The eager workspace changes shape across replays of the same
+            // graph.
+            auto workspace = torch::ones({kv_max_seq_len}, projected.options());
+            selected.copy_(projected + workspace.sum());
+          };
+      if (params.graph.eager_context != nullptr) {
+        params.graph.eager_context->run_eager(std::move(selection));
+      } else {
+        selection(params.meta.kv_max_seq_len);
+      }
+      hidden = selected * 3;
+    }
+    return ModelOutput(hidden);
+  }
+
+  int32_t calls() const { return calls_; }
+  int32_t eager_calls() const { return eager_calls_; }
+
+ private:
+  int32_t calls_ = 0;
+  int32_t eager_calls_ = 0;
+  int32_t num_layers_;
+};
+}  // namespace
+
+TEST_F(MluGraphExecutorTest, PiecewiseReplayRefreshesHistoryAndPreservesOrder) {
+  MtpModelCapabilities capabilities;
+  capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
+  capabilities.enable_piecewise_graph = true;
+  ModelRegistry::register_mtp_capabilities("test_piecewise_history",
+                                           capabilities);
+  model_args_.model_type("test_piecewise_history")
+      .max_position_embeddings(8192);
+  auto model = std::make_unique<PiecewiseHistoryModel>(tensor_options_);
+  options_.enable_graph_mode_decode_no_padding(false);
+  mlu::MluGraphExecutorImpl executor(
+      model.get(), model_args_, tensor_options_.device(), options_);
+  const std::vector<int32_t> histories = {16, 2047, 2049, 4097, 8192, 16};
+  const std::vector<int32_t> batches = {3, 2, 4, 3, 2, 4};
+  for (std::size_t i = 0; i < histories.size(); ++i) {
+    auto input = prepare_inputs(batches[i], 300 + i);
+    auto& params = input.input_params;
+    params.meta.kv_max_seq_len = histories[i];
+    auto expected = (params.embedding.input_embedding.to(torch::kFloat32) * 2 +
+                     histories[i]) *
+                    3;
+    auto actual =
+        executor.run(input.token_ids, input.positions, kv_caches_, params);
+    EXPECT_TRUE(torch::equal(actual.hidden_states, expected)) << i;
+    // Eager callbacks run exactly once per request, including first capture.
+    EXPECT_EQ(model->eager_calls(), i + 1);
+  }
+  EXPECT_EQ(model->calls(), 2);
+}
+
+TEST_F(MluGraphExecutorTest, MultilayerPiecewiseReplayPreservesDependencies) {
+  constexpr int32_t kNumLayers = 3;
+  PiecewiseHistoryModel model(tensor_options_, kNumLayers);
+  auto input = prepare_inputs(/*batch_size=*/2, /*seed=*/317);
+  mlu::GraphLayout layout;
+  layout.num_reqs = 2;
+  layout.padded_num_reqs = 2;
+  layout.padded_num_tokens = 2;
+  auto persistent = std::make_unique<mlu::GraphPersistentParam>(
+      input.token_ids,
+      input.positions,
+      input.input_params,
+      layout,
+      /*graph_max_kv_seq_len=*/2048,
+      input.input_params.attention.device.block_tables.size(1));
+  mlu::MluGraph graph(std::move(persistent), /*piecewise=*/true);
+  const auto pool = torch_mlu::graph_pool_handle();
+  const auto capture_stream = torch_mlu::getStreamFromPool(
+      /*isHighPriority=*/false, tensor_options_.device().index());
+  const std::vector<int32_t> histories = {16, 63, 17};
+  for (std::size_t step = 0; step < histories.size(); ++step) {
+    input.input_params.meta.kv_max_seq_len = histories[step];
+    input.input_params.embedding.input_embedding.fill_(step + 1);
+    graph.update_input_buffer(
+        &model, input.token_ids, input.positions, input.input_params, layout);
+    const ModelOutput actual =
+        step == 0
+            ? graph.capture(&model, kv_caches_, pool, capture_stream, options_)
+            : graph.replay();
+    torch::Tensor expected =
+        input.input_params.embedding.input_embedding.to(torch::kFloat32);
+    for (int32_t layer = 0; layer < kNumLayers; ++layer) {
+      expected = (expected * 2 + histories[step]) * 3;
+    }
+    EXPECT_TRUE(torch::equal(actual.hidden_states, expected)) << step;
+    EXPECT_EQ(graph.num_graphs(), kNumLayers + 1);
+    EXPECT_EQ(graph.num_eager_segments(), kNumLayers);
+    EXPECT_EQ(model.eager_calls(), (step + 1) * kNumLayers);
+    EXPECT_EQ(model.calls(), 1);
+  }
+}
+
+TEST_F(MluGraphExecutorTest,
+       ModelContextHistoryUsesFullGraphUnlessPiecewiseIsEnabled) {
+  MtpModelCapabilities capabilities;
+  capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
+  ModelRegistry::register_mtp_capabilities("test_model_context_history",
+                                           capabilities);
+  model_args_.model_type("test_model_context_history")
+      .max_position_embeddings(8192);
+  auto model = std::make_unique<PiecewiseHistoryModel>(tensor_options_);
+  options_.enable_graph_mode_decode_no_padding(false);
+  mlu::MluGraphExecutorImpl executor(
+      model.get(), model_args_, tensor_options_.device(), options_);
+  for (const int32_t history : {16, 4097}) {
+    auto input = prepare_inputs(/*batch_size=*/3, /*seed=*/303);
+    input.input_params.meta.kv_max_seq_len = history;
+    auto expected =
+        (input.input_params.embedding.input_embedding.to(torch::kFloat32) * 2 +
+         8192) *
+        3;
+    auto actual = executor.run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_TRUE(torch::equal(actual.hidden_states, expected));
+  }
+  // Model-context history alone keeps the selection inside the captured graph.
+  EXPECT_EQ(model->calls(), 1);
+  EXPECT_EQ(model->eager_calls(), 1);
+}
+
+namespace {
+// Run the real indexer through the executor so graph boundaries, live metadata,
+// padded requests, and the first stateful capture are checked together.
+class GlmPiecewiseIndexerModel final : public GroupedCausalLM {
+ public:
+  GlmPiecewiseIndexerModel(const ModelArgs& args,
+                           const torch::TensorOptions& options)
+      : GroupedCausalLM(options),
+        indexer_(args,
+                 QuantArgs(),
+                 ParallelArgs(/*rank=*/0, /*world_size=*/1, nullptr),
+                 nullptr,
+                 options) {
+    Device(options.device()).set_seed(/*seed=*/20261015);
+    for (auto& parameter : indexer_->named_parameters()) {
+      parameter.value().normal_(0.0, 0.1);
+    }
+    const int64_t pages = args.max_position_embeddings() / 16;
+    index_cache_ = torch::randn({4 * pages + 1, 1, 4, 32}, options);
+    tail_ = torch::zeros({5, 2, 8, 32}, options);
+    steps_ = torch::zeros({1}, options.dtype(torch::kInt32));
+  }
+
+  void copy_from(const GlmPiecewiseIndexerModel& source) {
+    const auto source_parameters = source.indexer_->named_parameters();
+    for (auto& parameter : indexer_->named_parameters()) {
+      parameter.value().copy_(source_parameters[parameter.key()]);
+    }
+    index_cache_.copy_(source.index_cache_);
+    tail_.copy_(source.tail_);
+    steps_.copy_(source.steps_);
+  }
+
+  ModelOutput forward(const torch::Tensor& /*tokens*/,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>& /*caches*/,
+                      const ModelInputParams& params) override {
+    ++calls_;
+    const auto metadata = params.attn_metadata
+                              ? params.attn_metadata
+                              : std::make_shared<layer::AttentionMetadata>(
+                                    layer::AttentionMetadataBuilder::build(
+                                        params, /*enable_mla=*/true));
+    const auto& hidden = params.embedding.input_embedding;
+    auto [slots, lengths] = indexer_->forward(
+        hidden, hidden, positions, index_cache_, tail_, *metadata);
+    // A second state mutation after selection exposes capture-time execution
+    // or duplicate first-request replay even when a tail overwrite is
+    // idempotent.
+    steps_.add_(1);
+    return ModelOutput(torch::cat(
+        {slots.to(torch::kInt64), lengths.unsqueeze(1).to(torch::kInt64)}, 1));
+  }
+
+  const torch::Tensor& index_cache() const { return index_cache_; }
+  const torch::Tensor& tail() const { return tail_; }
+  const torch::Tensor& steps() const { return steps_; }
+  int32_t calls() const { return calls_; }
+
+ private:
+  layer::Glm5NextKPoolIndexer indexer_;
+  torch::Tensor index_cache_;
+  torch::Tensor tail_;
+  torch::Tensor steps_;
+  int32_t calls_ = 0;
+};
+}  // namespace
+
+TEST(MluSpecVerifyGraphTest,
+     GlmPiecewiseIndexerCrosses32KAnd64KWithoutRecapture) {
+  const torch::NoGradGuard no_grad;
+  // The legacy fixed-workspace limit must no longer bound GLM graph replay.
+  ScopedEnvVar graph_kv_cap("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "32768");
+  ScopedConfigSnapshot config_snapshot;
+  ExecutionConfig::get_instance().max_tokens_for_graph_mode(64);
+  const int64_t old_block_size = KVCacheConfig::get_instance().block_size();
+  KVCacheConfig::get_instance().block_size(16);
+  const torch::Device device("mlu:0");
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const auto ints = options.dtype(torch::kInt32);
+  constexpr int64_t kCapacity = 65552;
+  constexpr int64_t kPages = kCapacity / 16;
+  for (int32_t stage = 0; stage < 3; ++stage) {
+    SCOPED_TRACE(stage);
+    const bool verify = stage == 1;
+    const bool draft = stage == 2;
+    const int32_t width = verify ? 4 : 1;
+    ModelArgs args;
+    args.model_type(draft ? "glm5_next_mtp" : "glm5_next")
+        .hidden_size(128)
+        .q_lora_rank(128)
+        .index_n_heads(2)
+        .index_head_dim(32)
+        .qk_rope_head_dim(0)
+        .index_topk(16)
+        .index_kpool(4)
+        .index_kpool_compress(true)
+        .index_kpool_always_select_tail(true)
+        .max_position_embeddings(kCapacity);
+    GlmPiecewiseIndexerModel graph_model(args, options);
+    GlmPiecewiseIndexerModel eager_model(args, options);
+    eager_model.copy_from(graph_model);
+    runtime::Options runtime_options;
+    runtime_options.block_size(16)
+        .num_decoding_tokens(width)
+        .enable_graph_mode_decode_no_padding(false)
+        .enable_speculative_decode(verify || draft)
+        .speculative_algorithm("MTP")
+        .is_draft_engine(draft);
+    mlu::MluGraphExecutorImpl executor(
+        &graph_model, args, device, runtime_options);
+    std::vector<KVCache> caches;
+    caches.emplace_back(
+        LinearAttentionKVCacheTensors{torch::Tensor(), graph_model.steps()});
+    const std::vector<int32_t> histories{16, 32768, 32769, 65536, 65537, 16};
+    for (std::size_t step = 0; step < histories.size(); ++step) {
+      SCOPED_TRACE(step);
+      const int32_t requests = step % 2 == 0 ? 3 : 4;
+      const int32_t history = histories[step];
+      const int64_t columns = (history + 15) / 16;
+      ModelInputParams params;
+      params.meta.batch_forward_type =
+          verify ? BatchForwardType::CHUNKED_PREFILL : BatchForwardType::DECODE;
+      params.is_spec_verify = verify;
+      params.meta.num_sequences = requests;
+      params.meta.q_max_seq_len = width;
+      params.meta.kv_max_seq_len = history;
+      params.attention.host.q_seq_lens.resize(requests + 1);
+      params.attention.host.kv_seq_lens.resize(requests + 1);
+      for (int32_t row = 0; row <= requests; ++row) {
+        params.attention.host.q_seq_lens[row] = row * width;
+        params.attention.host.kv_seq_lens[row] = row * history;
+      }
+      params.attention.device.q_seq_lens =
+          torch::tensor(params.attention.host.q_seq_lens, ints);
+      params.attention.device.kv_seq_lens =
+          torch::tensor(params.attention.host.kv_seq_lens, ints);
+      auto table = torch::arange(columns, ints).repeat({requests, 1}) +
+                   torch::arange(requests, ints).unsqueeze(1) * kPages + 1;
+      params.attention.device.block_tables =
+          step >= 3 ? table.flip({1}) : table;
+      params.attention.device.new_cache_slots =
+          torch::ones({requests * width}, ints);
+      params.embedding.linear_state_ids.resize(requests);
+      std::iota(params.embedding.linear_state_ids.begin(),
+                params.embedding.linear_state_ids.end(),
+                1);
+      params.embedding.linear_state_indices =
+          torch::tensor(params.embedding.linear_state_ids, ints);
+      params.embedding.input_embedding =
+          torch::randn({requests * width, 128}, options);
+      params.linear_state_validity_mask.assign(requests, 1);
+      if (verify) {
+        params.num_accepted_tokens = torch::ones({requests}, ints);
+      }
+      auto tokens = torch::zeros({requests * width}, ints);
+      auto positions =
+          (torch::arange(width, ints) + history - width).repeat({requests});
+      const auto expected =
+          eager_model.forward(tokens, positions, caches, params);
+      const auto actual = executor.run(tokens, positions, caches, params);
+      EXPECT_TRUE(torch::equal(actual.hidden_states, expected.hidden_states));
+      EXPECT_TRUE(torch::equal(graph_model.tail(), eager_model.tail()));
+      EXPECT_TRUE(torch::allclose(graph_model.index_cache(),
+                                  eager_model.index_cache(),
+                                  0.015625,
+                                  0.015625));
+      EXPECT_TRUE(torch::equal(graph_model.steps(), eager_model.steps()));
+      EXPECT_EQ(graph_model.tail()[0].count_nonzero().item<int64_t>(), 0);
+    }
+    // One request bucket: warmup advances state once, capture records once,
+    // and every later request replays even when history exceeds the old limit.
+    EXPECT_EQ(graph_model.calls(), 2);
+  }
+  KVCacheConfig::get_instance().block_size(old_block_size);
 }
 
 }  // namespace xllm

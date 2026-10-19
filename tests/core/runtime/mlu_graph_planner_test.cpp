@@ -19,6 +19,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <memory>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -214,6 +215,42 @@ TEST(MluGraphPlannerTest, KeyLayoutBeyondAgreementPacketStaysEager) {
   params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>(
       std::vector<int64_t>(kMaxGraphKeyLayoutFields + 1, /*value=*/8));
   expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+TEST(MluGraphPlannerTest, MixedKeyFieldsKeepAgreementBudget) {
+  const MluGraphPlanner planner(topk_reuse_config());
+  ModelInputParams params = grouped_input();
+  params.multi_block_tables = {torch::zeros({3, 2}, torch::kInt32)};
+  params.mtp_topk_state = std::make_shared<PlannerGraphTopkState>(
+      std::vector<int64_t>(kMaxGraphKeyLayoutFields - 1, /*value=*/8));
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({3, params})));
+  params.multi_block_tables.emplace_back(torch::zeros({3, 4}, torch::kInt32));
+  expect_eager(planner, 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+TEST(MluGraphPlannerTest, KeyVectorsKeepFieldBoundariesAndOrder) {
+  const MluGraphPlanner planner(topk_reuse_config());
+  ModelInputParams params = grouped_input();
+  params.multi_block_tables = {torch::zeros({3, 2}, torch::kInt32)};
+  params.mtp_topk_state =
+      std::make_shared<PlannerGraphTopkState>(std::vector<int64_t>{3, 4});
+  const GraphKey first = std::get<GraphPlan>(planner.plan({3, params})).key;
+  const GraphKey copy = std::get<GraphPlan>(planner.plan({3, params})).key;
+  EXPECT_TRUE(first == copy);
+  EXPECT_EQ(GraphKeyHash{}(first), GraphKeyHash{}(copy));
+
+  params.multi_block_tables.emplace_back(torch::zeros({3, 3}, torch::kInt32));
+  params.mtp_topk_state =
+      std::make_shared<PlannerGraphTopkState>(std::vector<int64_t>{4});
+  const GraphKey split = std::get<GraphPlan>(planner.plan({3, params})).key;
+  params.multi_block_tables = {torch::zeros({3, 3}, torch::kInt32),
+                               torch::zeros({3, 2}, torch::kInt32)};
+  const GraphKey reordered = std::get<GraphPlan>(planner.plan({3, params})).key;
+  EXPECT_FALSE(first == split);
+  EXPECT_FALSE(split == reordered);
+  const std::unordered_set<GraphKey, GraphKeyHash> keys{
+      first, copy, split, reordered};
+  EXPECT_EQ(keys.size(), 3);
 }
 
 // The empty schema keys producer graphs, so a reuse step reporting it must not
@@ -565,6 +602,30 @@ TEST(MluGraphPlannerTest, NativeDraftSharingSeparatesProducerAndReuseGraphs) {
   config.options.is_draft_engine(false);
   expect_eager(
       MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
+}
+
+TEST(MluGraphPlannerTest, ModelContextHistoryReusesKeyAcrossContextLengths) {
+  auto config = qwen_config();
+  config.history_capacity = 32768;
+  config.capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
+  MluGraphPlanner planner(config);
+  std::optional<GraphKey> first_key;
+  for (int64_t history : {1, 2048, 2049, 4097, 32768, 16}) {
+    auto params = decode_input(history);
+    params.attention.device.block_tables =
+        torch::zeros({3, (history + 15) / 16}, torch::kInt32);
+    const auto decision = planner.plan({3, params});
+    ASSERT_TRUE(std::holds_alternative<GraphPlan>(decision));
+    const auto& plan = std::get<GraphPlan>(decision);
+    EXPECT_EQ(plan.history_capacity, config.history_capacity);
+    EXPECT_EQ(plan.main_block_table_columns, 2048);
+    if (first_key.has_value()) {
+      EXPECT_TRUE(*first_key == plan.key);
+    } else {
+      first_key = plan.key;
+    }
+  }
+  expect_eager(planner, 3, decode_input(32769), EagerReason::HISTORY_LIMIT);
 }
 
 }  // namespace

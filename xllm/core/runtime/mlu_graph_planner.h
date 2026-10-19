@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -46,12 +48,48 @@ struct GraphKey {
   std::vector<int64_t> mtp_topk_schema;
 };
 
+inline auto get_key_fields(const GraphKey& key) {
+  return std::tie(key.padded_num_tokens,
+                  key.padded_num_reqs,
+                  key.attention_row_query_len,
+                  key.has_input_embedding,
+                  key.multi_block_table_column_counts,
+                  key.mtp_topk_schema);
+}
+
+// Lengths preserve vector boundaries in the scalar stream used by hashing and
+// DP agreement. Visiting fields never allocates intermediate key storage.
+template <typename Visitor>
+void visit_graph_key(const GraphKey& key, Visitor&& visitor) {
+  const auto visit_field = [&visitor](const auto& field) {
+    using Field = std::decay_t<decltype(field)>;
+    if constexpr (std::is_same_v<Field, std::vector<int64_t>>) {
+      visitor(static_cast<int64_t>(field.size()));
+      for (int64_t value : field) {
+        visitor(value);
+      }
+    } else {
+      visitor(static_cast<int64_t>(field));
+    }
+  };
+  std::apply(
+      [&visit_field](const auto&... fields) { (visit_field(fields), ...); },
+      get_key_fields(key));
+}
+
 // Data-parallel ranks agree on a plan through a fixed-size packet, so the
 // variable-length key fields share this budget.
 constexpr std::size_t kMaxGraphKeyLayoutFields = 20;
+constexpr std::size_t kMaxGraphKeyFields =
+    std::tuple_size_v<decltype(get_key_fields(GraphKey{}))> +
+    kMaxGraphKeyLayoutFields;
+
+std::size_t get_key_size(const GraphKey& key);
 
 bool operator==(const GraphKey& lhs, const GraphKey& rhs);
 
+// Hashes are process-local lookup values, not stable identifiers across
+// releases. Do not persist them or compare them across versions.
 class GraphKeyHash final {
  public:
   std::size_t operator()(const GraphKey& key) const;

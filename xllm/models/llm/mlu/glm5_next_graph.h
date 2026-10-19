@@ -44,10 +44,10 @@ class Glm5NextGraphMetadata final {
                                                  /*compute_dtype=*/"half",
                                                  /*attn_mask=*/std::nullopt,
                                                  positions.device()));
-      // A captured score workspace must cover future context growth. Zero
-      // selects KPool's static capacity from the persistent block-table width,
-      // rather than freezing capacity at the first request's current length.
+      // Full-graph callers use the persistent block-table width for scores.
+      // Piecewise callbacks instead read the live history from graph inputs.
       graph_state->metadata->max_seq_len = 0;
+      graph_state->metadata->eager_context = params.graph.eager_context;
       params.attn_metadata = graph_state->metadata;
       layer::prepare_glm5_next_kpool_metadata(*params.attn_metadata,
                                               positions.device());

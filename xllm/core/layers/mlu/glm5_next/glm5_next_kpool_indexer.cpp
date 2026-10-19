@@ -28,6 +28,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/constants.h"
+#include "core/framework/model/graph_eager_context.h"
 #include "framework/config/kv_cache_config.h"
 #include "framework/core/MLUStream.h"
 #include "kernels/mlu/kpool.h"
@@ -658,20 +659,44 @@ torch::Tensor Glm5NextKPoolIndexerImpl::select_projected_pools(
       std::all_of(execution.batch->q_seq_lens.begin(),
                   execution.batch->q_seq_lens.end(),
                   [](int32_t length) { return length == 4; });
-  return glm5_next_kpool_select(
-      query,
-      weights,
-      score_positions,
-      execution.batch->row_batch,
-      index_cache,
-      execution.batch->block_table,
-      execution.score_capacity,
-      block_size_,
-      index_kpool_,
-      index_topk_,
-      softmax_scale_,
-      /*workspace_bytes=*/kWorkspaceBytes,
-      four_query_verify ? execution.batch->query_starts : torch::Tensor());
+  auto select = [this,
+                 query,
+                 weights,
+                 score_positions,
+                 index_cache,
+                 batch = execution.batch,
+                 four_query_verify](int64_t kv_max_seq_len) {
+    return glm5_next_kpool_select(
+        query,
+        weights,
+        score_positions,
+        batch->row_batch,
+        index_cache,
+        batch->block_table,
+        kv_max_seq_len,
+        block_size_,
+        index_kpool_,
+        index_topk_,
+        softmax_scale_,
+        /*workspace_bytes=*/kWorkspaceBytes,
+        four_query_verify ? batch->query_starts : torch::Tensor());
+  };
+  if (metadata.eager_context != nullptr) {
+    // The score workspace grows with live history; only the fixed-width pool
+    // IDs cross the graph boundary. The callback owns the projected inputs and
+    // selected tensor by value, keeping their storage alive across shared-pool
+    // captures and replays. Copy into selected without replacing its storage so
+    // the following graph segment keeps reading the same address.
+    torch::Tensor selected =
+        torch::empty({query.size(0), index_topk_ / index_kpool_},
+                     query.options().dtype(torch::kInt64));
+    metadata.eager_context->run_eager(
+        [select = std::move(select), selected](int64_t kv_max_seq_len) mutable {
+          selected.copy_(select(kv_max_seq_len));
+        });
+    return selected;
+  }
+  return select(execution.score_capacity);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> Glm5NextKPoolIndexerImpl::forward(

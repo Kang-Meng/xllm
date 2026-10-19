@@ -23,7 +23,6 @@ limitations under the License.
 #include <functional>
 #include <numeric>
 #include <optional>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -304,19 +303,14 @@ int64_t get_block_capacity(int64_t max_kv_seq_len, int32_t block_size) {
   return (max_kv_seq_len + block_size - 1) / block_size;
 }
 
+std::size_t get_key_size(const GraphKey& key) {
+  std::size_t size = 0;
+  visit_graph_key(key, [&size](int64_t /*value*/) { ++size; });
+  return size;
+}
+
 bool operator==(const GraphKey& lhs, const GraphKey& rhs) {
-  return std::tie(lhs.padded_num_tokens,
-                  lhs.padded_num_reqs,
-                  lhs.attention_row_query_len,
-                  lhs.has_input_embedding,
-                  lhs.multi_block_table_column_counts,
-                  lhs.mtp_topk_schema) ==
-         std::tie(rhs.padded_num_tokens,
-                  rhs.padded_num_reqs,
-                  rhs.attention_row_query_len,
-                  rhs.has_input_embedding,
-                  rhs.multi_block_table_column_counts,
-                  rhs.mtp_topk_schema);
+  return get_key_fields(lhs) == get_key_fields(rhs);
 }
 
 std::size_t GraphKeyHash::operator()(const GraphKey& key) const {
@@ -325,18 +319,7 @@ std::size_t GraphKeyHash::operator()(const GraphKey& key) const {
     seed ^=
         std::hash<int64_t>{}(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
   };
-  hash_value(key.padded_num_tokens);
-  hash_value(key.padded_num_reqs);
-  hash_value(key.attention_row_query_len);
-  hash_value(key.has_input_embedding);
-  for (int64_t column_count : key.multi_block_table_column_counts) {
-    hash_value(column_count);
-  }
-  hash_value(key.multi_block_table_column_counts.size());
-  for (int64_t value : key.mtp_topk_schema) {
-    hash_value(value);
-  }
-  hash_value(key.mtp_topk_schema.size());
+  visit_graph_key(key, hash_value);
   return seed;
 }
 
@@ -392,8 +375,7 @@ GraphDecision MluGraphPlanner::plan(const GraphStepMetadata& step) const {
     CHECK_EQ(table.dim(), 2);
     key.multi_block_table_column_counts.push_back(table.size(1));
   }
-  if (key.multi_block_table_column_counts.size() + key.mtp_topk_schema.size() >
-      kMaxGraphKeyLayoutFields) {
+  if (get_key_size(key) > kMaxGraphKeyFields) {
     return EagerReason::UNSUPPORTED_INPUT;
   }
   const int64_t main_columns =

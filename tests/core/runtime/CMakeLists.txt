@@ -250,6 +250,8 @@ if(USE_MLU)
     MluGraphDpCollectiveTest.AllRanksCaptureThenReplay
     MluGraphDpCollectiveTest.OneRankRejectsSoAllRunEager
     MluGraphDpCollectiveTest.DifferentPlansMakeAllRunEager
+    MluGraphDpCollectiveTest.DifferentHistoryCapacityMakesAllRunEager
+    MluGraphDpCollectiveTest.DifferentKeyFieldBoundariesMakeAllRunEager
     MluGraphDpCollectiveTest.DifferentEmbeddingPresenceMakesAllRunEager
     MluGraphDpCollectiveTest.PartialCacheHitRecapturesThenReplays
     MluGraphDpCollectiveTest.VlmAllRanksCaptureThenReplay

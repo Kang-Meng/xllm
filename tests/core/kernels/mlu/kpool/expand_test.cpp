@@ -80,6 +80,72 @@ TEST(KPoolKernelTest, ExpansionMasksFuturePoolsAndMissingPages) {
   EXPECT_TRUE(torch::equal(actual.context_lens.cpu(),
                            torch::tensor({2, 0, 4}, torch::kInt32)));
 }
+TEST(KPoolKernelTest, ExpansionSupportsWideTablesAndPartialPools) {
+  const torch::Device device(Platform::type_torch(), 0);
+  for (const int64_t width : {8192, 8193, 65536}) {
+    const torch::Tensor table =
+        torch::arange(width * 2, torch::kInt64).flip({0}).view({2, width});
+    table[0][1] = -1;
+    table[1][2] = -1;
+    for (const int64_t position : {-1, 1, 32767, 32768, 65537, 1048574}) {
+      torch::Tensor ids = torch::full({2, 512}, -1, torch::kInt64);
+      for (int64_t r = 0; r < 2; ++r) {
+        for (int64_t c = 0; c < 512; ++c) {
+          ids[r][c] = c % 7 == 0 ? -1 : (c * 131 + r) % (width * 4);
+        }
+        ids[r][31] = position >= 0 ? position / 4 : 0;
+        ids[r][32] = width * 4;
+        ids[r][33] = 4;
+        ids[r][34] = 8;
+      }
+      const torch::Tensor rows = torch::tensor({1, 0}, torch::kInt64);
+      for (const bool always_tail : {false, true}) {
+        torch::Tensor expected = torch::full({2, 2051}, -1, torch::kInt32);
+        torch::Tensor lengths = torch::zeros({2}, torch::kInt32);
+        for (int64_t r = 0; r < 2; ++r) {
+          int64_t written = 0;
+          const auto append_token = [&](int64_t token) {
+            if (token < 0 || token > position || token / 16 >= width) {
+              return;
+            }
+            const int64_t page = table[1 - r][token / 16].item<int64_t>();
+            if (page >= 0) {
+              expected[r][written++] = page * 16 + token % 16;
+            }
+          };
+          for (int64_t c = 0; c < 512; ++c) {
+            const int64_t pool = ids[r][c].item<int64_t>();
+            for (int64_t member = 0; member < 4; ++member) {
+              append_token(pool * 4 + member);
+            }
+          }
+          if (always_tail) {
+            for (int64_t token = (position + 1) / 4 * 4; token <= position;
+                 ++token) {
+              append_token(token);
+            }
+          }
+          lengths[r] = written;
+        }
+        const auto actual =
+            expand_kpool(ids.to(device),
+                         torch::full({2}, position, torch::kInt64).to(device),
+                         rows.to(device),
+                         table.to(device),
+                         /*block_size=*/16,
+                         /*token_budget=*/2048,
+                         /*pool_size=*/4,
+                         always_tail);
+        SCOPED_TRACE(::testing::Message()
+                     << "width=" << width << " position=" << position
+                     << " tail=" << always_tail);
+        EXPECT_TRUE(torch::equal(actual.physical_slots.cpu(), expected));
+        EXPECT_TRUE(torch::equal(actual.context_lens.cpu(), lengths));
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace xllm::kernel::mlu
 
