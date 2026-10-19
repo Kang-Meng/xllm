@@ -38,11 +38,6 @@ class SlidingWindowBlockManager : public BlockManagerImpl {
   bool allocate_for_prefetch(Sequence* seq, size_t num_tokens) override;
   void trim_prefetch_blocks(Sequence* seq, size_t max_hit_tokens) override;
 
-  // Deallocate leading blocks that have slid out of the window; leaves
-  // invalid placeholders in their slots. Called by the composite after a
-  // successful allocate commit.
-  void release_out_of_window(Sequence* seq, KVCacheState& kv_state) override;
-
   // Gap-tolerant SWA probe. Delegates to LinearStatePrefixCache::match; see
   // that class for the shape returned. Composite owns the tail-continuity
   // check and the min-across-leaves clamp.
@@ -57,11 +52,7 @@ class SlidingWindowBlockManager : public BlockManagerImpl {
  private:
   size_t num_out_of_window_blocks(const KVCacheState& kv_state,
                                   size_t cached_tokens) const;
-  size_t num_reclaimable_out_of_window_blocks(const KVCacheState& kv_state,
-                                              size_t cached_tokens) const;
-  void release_out_of_window(Sequence* seq,
-                             KVCacheState& kv_state,
-                             size_t cached_tokens);
+  void release_out_of_window(Sequence* seq, KVCacheState& kv_state);
 };
 
 }  // namespace xllm

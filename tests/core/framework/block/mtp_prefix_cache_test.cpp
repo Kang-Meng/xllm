@@ -521,9 +521,10 @@ TEST(TypedMtpPrefixCacheTest, DecodeOffloadUsesConfirmedMtpIdentity) {
   const XXH3Key expected_hash = sequence.block_hashes()[swa_blocks - 1];
   pool.deallocate(&sequence);
   pool.transfer_blocks();
-  ASSERT_EQ(engine.offloads().size(), 3u);
+  ASSERT_EQ(engine.offloads().size(), 4u);
   EXPECT_EQ(engine.offloads()[0].block_type, BlockType::SWA);
-  EXPECT_EQ(XXH3Key(engine.offloads()[0].hash_key), expected_hash);
+  EXPECT_EQ(engine.offloads()[1].block_type, BlockType::SWA);
+  EXPECT_EQ(XXH3Key(engine.offloads()[1].hash_key), expected_hash);
 }
 
 TEST(TypedPrefixCacheTest, DecodeOffloadUsesContentIdentityWithoutDeviceStamp) {
@@ -554,9 +555,10 @@ TEST(TypedPrefixCacheTest, DecodeOffloadUsesContentIdentityWithoutDeviceStamp) {
     EXPECT_NE(expected_hash, previous_hash);
     pool.deallocate(&sequence);
     pool.transfer_blocks();
-    ASSERT_EQ(engine.offloads().size(), 3u);
+    ASSERT_EQ(engine.offloads().size(), 4u);
     EXPECT_EQ(engine.offloads()[0].block_type, BlockType::SWA);
-    EXPECT_EQ(XXH3Key(engine.offloads()[0].hash_key), expected_hash);
+    EXPECT_EQ(engine.offloads()[1].block_type, BlockType::SWA);
+    EXPECT_EQ(XXH3Key(engine.offloads()[1].hash_key), expected_hash);
     previous_hash = expected_hash;
   }
 }

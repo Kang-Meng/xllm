@@ -496,17 +496,6 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
   offload_block_pair_queues_.resize(host_block_managers_.size());
 }
 
-void HierarchyBlockManagerPool::release_host_match(Sequence* sequence,
-                                                   int32_t dp_rank) {
-  CHECK(sequence != nullptr);
-  KVCacheState& host_state = sequence->host_kv_state();
-  auto* host_manager = host_block_managers_[dp_rank].get();
-  CHECK(host_manager);
-  host_manager->deallocate_for_sequence(sequence, host_state);
-  host_state.reset();
-  sequence->clear_host_cache_match();
-}
-
 void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   DCHECK(sequence != nullptr);
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
@@ -535,7 +524,14 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
 
   KVCacheState& hbm_state = sequence->kv_state();
   KVCacheState& host_state = sequence->host_kv_state();
+  // The first allocate can see a longer HBM prefix while the previous D2H is
+  // still in flight. Collecting that prefix again would offload the same span.
+  if (hbm_state.shared_tokens_num() > host_state.shared_tokens_num() &&
+      hbm_state.kv_cache_tokens_num() == hbm_state.shared_tokens_num()) {
+    return;
+  }
   bool queued_offload = false;
+  const size_t host_cached_tokens = host_state.kv_cache_tokens_num();
   size_t completed_tokens = hbm_state.kv_cache_tokens_num();
   size_t cache_unit_size = 0;
   const auto c128_entry = host_manager->leaf_entries().find(BlockType::C128);
@@ -616,7 +612,6 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
         continue;
       }
 
-      const size_t host_cached_tokens = host_state.kv_cache_tokens_num();
       const size_t hbm_cached_tokens = hbm_state.kv_cache_tokens_num();
       // Host already covers an equal restore boundary or has reserved its
       // D2H checkpoint. Only a checkpoint ahead of Host needs writeback.
@@ -653,6 +648,14 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
       continue;
     }
 
+    const size_t unit_size = cache_unit_size > 0 ? cache_unit_size : block_size;
+    CHECK_EQ(unit_size % block_size, 0u);
+    // The Host cursor may be inside a unit after an earlier pair was queued.
+    if (completed_tokens / unit_size <= host_cached_tokens / unit_size) {
+      continue;
+    }
+    const size_t first_block =
+        (host_cached_tokens / unit_size) * (unit_size / block_size);
     size_t completed_blocks = completed_tokens / block_size;
     const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
     if (block_hash_lookahead(hasher_type) > 0) {
@@ -672,7 +675,7 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
     }
     const size_t comparable_blocks =
         std::min({hbm_blocks->size(), host_blocks->size(), completed_blocks});
-    for (size_t i = 0; i < comparable_blocks; ++i) {
+    for (size_t i = first_block; i < comparable_blocks; ++i) {
       if (type == BlockType::SWA && cache_unit_size > 0) {
         CHECK_EQ(cache_unit_size % block_size, 0u);
         const size_t blocks_per_unit = cache_unit_size / block_size;
@@ -767,11 +770,47 @@ void HierarchyBlockManagerPool::trim_host_cache(
   sequence->set_host_cache_restore(restore_tokens, selected_restore.copy_units);
 }
 
+bool HierarchyBlockManagerPool::try_allocate(Sequence* sequence) {
+  CHECK(sequence != nullptr);
+  if (!BlockManagerPool::try_allocate(sequence)) {
+    return false;
+  }
+
+  const int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+  auto* host_manager = host_block_managers_[dp_rank].get();
+  CHECK(host_manager);
+  KVCacheState& host_state = sequence->host_kv_state();
+  const size_t num_tokens = sequence->num_tokens();
+  const size_t hbm_cached_tokens = sequence->kv_state().kv_cache_tokens_num();
+  if (!host_manager->allocate_sequence(sequence, host_state, num_tokens)) {
+    auto* composite =
+        static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
+    composite->deallocate_for_sequence(sequence);
+    host_manager->deallocate_for_sequence(sequence, host_state);
+    sequence->reset();
+    return false;
+  }
+  // Prefill already offloaded this prompt. Advance the Host cursor to the
+  // last complete KV or C128 block so the first compute step does not collect
+  // that span again. A partial trailing block stays below the cursor.
+  const auto& host_leaves = host_manager->leaf_entries();
+  auto unit_leaf = host_leaves.find(BlockType::C128);
+  if (unit_leaf == host_leaves.end()) {
+    unit_leaf = host_leaves.find(BlockType::KV);
+  }
+  CHECK(unit_leaf != host_leaves.end());
+  const size_t unit_block_size = unit_leaf->second.leaf->block_size();
+  CHECK_GT(unit_block_size, 0u);
+  host_state.set_kv_cache_tokens_num(hbm_cached_tokens / unit_block_size *
+                                     unit_block_size);
+  return true;
+}
+
 bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
                                          size_t num_tokens) {
   CHECK(sequence != nullptr);
-  const bool had_device_blocks = sequence->kv_state().has_any_blocks();
   const int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+  const bool started_empty = !sequence->has_any_blocks();
   if (should_probe_prefix_cache(sequence)) {
     allocate_shared(sequence);
   }
@@ -787,29 +826,19 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
   auto* host_manager = host_block_managers_[dp_rank].get();
   CHECK(host_manager);
 
-  // TODO: LINEAR offload must retain the confirmed historical slot before the
-  // HBM leaf trims it, select the exact speculative checkpoint, pin it through
-  // D2H, then publish it to Host/Store. FLAT_KV_LINEAR remains unsupported by
-  // the hierarchy manager until that ownership and transfer protocol exists.
-  if (composite->leaf_combination() ==
-      CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
-    composite->cache_full_blocks_for_sequence(sequence);
-    collect_offload_pairs(sequence);
-  }
   if (!composite->allocate_sequence(sequence, num_tokens)) {
-    release_host_match(sequence, dp_rank);
-    if (!had_device_blocks) {
+    if (started_empty) {
       composite->deallocate_for_sequence(sequence);
+      host_manager->deallocate_for_sequence(sequence, host_state);
       sequence->reset();
     }
     return false;
   }
 
   if (!host_manager->allocate_sequence(sequence, host_state, num_tokens)) {
-    host_manager->release_out_of_window_for_sequence(sequence, host_state);
-    if (!had_device_blocks) {
-      host_manager->deallocate_for_sequence(sequence, host_state);
+    if (started_empty) {
       composite->deallocate_for_sequence(sequence);
+      host_manager->deallocate_for_sequence(sequence, host_state);
       sequence->reset();
     }
     return false;

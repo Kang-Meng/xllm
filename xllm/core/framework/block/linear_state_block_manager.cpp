@@ -109,11 +109,7 @@ LinearStateBlockManager::allocate_for_sequence(Sequence* seq,
     return std::nullopt;
   }
   if (seq->is_prefill_stage()) {
-    if (!options_.instance_is_decode()) {
-      return allocate_prefill(seq, kv_state);
-    }
-    retain_read_source(kv_state);
-    return allocate_decode(seq, kv_state);
+    return allocate_prefill(seq, kv_state);
   }
   return allocate_decode(seq, kv_state);
 }
@@ -320,12 +316,15 @@ void LinearStateBlockManager::cache_read_source(Sequence* seq,
 std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
     Sequence* seq,
     KVCacheState& kv_state) {
-  // If the sequence's effective restore boundary is ahead of this tier's
-  // cursor, the existing slot belongs to a shorter cache hit. Drop it without
-  // inserting into this tier's prefix cache, then build the two-slot
-  // [restore, live] window. The rule applies identically to HBM and Host
-  // states; the caller identifies the tier by the KVCacheState reference.
-  if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num()) {
+  // A longer sequence cursor means another tier has the usable checkpoint.
+  // Replace this tier's shorter hit once. A retry that already built the
+  // two-slot window keeps it instead of dropping the new slots.
+  const Slice<Block> existing = kv_state.blocks(BlockType::LINEAR);
+  const bool tier_already_aligned =
+      existing.size() >= 2 &&
+      kv_state.shared_blocks_num(BlockType::LINEAR) == 0;
+  if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num() &&
+      !tier_already_aligned) {
     std::vector<Block> old_blocks = kv_state.take_blocks(BlockType::LINEAR);
     deallocate(std::move(old_blocks));
     std::vector<Block> allocated = BlockManagerImpl::allocate(2);

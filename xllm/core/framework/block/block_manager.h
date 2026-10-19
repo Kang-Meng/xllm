@@ -97,8 +97,7 @@ class BlockManager {
     // pair it with a Host LINEAR destination.
     PROPERTY(bool, preserve_decode_checkpoint) = false;
     // Number of speculative tokens for MTP decode (passed from
-    // runtime::Options). Used by CompositeBlockManager to adjust SWA block
-    // release accounting.
+    // runtime::Options).
     PROPERTY(uint32_t, num_speculative_tokens) = 0;
     // Role flag: true on the DECODE side of disaggregated PD. In that role
     // the composite skips prefix cache on leaves whose data forward never
@@ -208,13 +207,6 @@ class BlockManager {
   // `max_hit_tokens` is the common gate-derived logical boundary.
   virtual void trim_prefetch_blocks(Sequence* /*seq*/,
                                     size_t /*max_hit_tokens*/) {}
-
-  // Sliding-window hook: release leading blocks that have slid out of the
-  // window. The composite calls this on every leaf after a successful commit;
-  // the SWA leaf may also call it after an allocation shortage before retrying.
-  // Non-SWA leaves keep the empty default (no-op).
-  virtual void release_out_of_window(Sequence* /*seq*/,
-                                     KVCacheState& /*kv_state*/) {}
 
   // Post-construction init hook: only the xtensor leaf needs it (KV tensors
   // must be created on the worker before VMM physical pages can be mapped to

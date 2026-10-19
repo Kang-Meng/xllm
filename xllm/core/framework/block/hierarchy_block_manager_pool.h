@@ -49,6 +49,7 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   ~HierarchyBlockManagerPool() override;
 
   bool allocate(Sequence* sequence, size_t num_tokens) override;
+  bool try_allocate(Sequence* sequence) override;
 
   void allocate_shared(Sequence* sequence) override;
   bool needs_shared_reprobe(Sequence* sequence) const override {
@@ -72,7 +73,6 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
 
  private:
   friend class HierarchyPoolTestPeer;
-  void release_host_match(Sequence* sequence, int32_t dp_rank);
   void collect_load_block_transfer_infos(Sequence* sequence);
   void collect_offload_pairs(Sequence* sequence);
   bool should_probe_prefix_cache(Sequence* sequence) const;
