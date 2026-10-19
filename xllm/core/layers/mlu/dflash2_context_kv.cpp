@@ -174,12 +174,6 @@ class DFlash2ContextKV::Impl final {
       CHECK(value_cache.device() == projected_hidden.device());
     }
 
-    // Temporary storage is O(L * N * local_kv_heads * head_dim), where N is
-    // this write's token count, not the accumulated context length. On MLU590,
-    // a standalone BF16 write with L=5, N=8192, TP=8, local_kv_heads=1 and
-    // head_dim=128 peaked at 90.5 MiB above preallocated weights, inputs and
-    // caches. Reassess this workspace when increasing the per-rank batch or
-    // KV head count; the fused projection and FP32 norm span all draft layers.
     const int64_t num_context = projected_hidden.size(0);
     torch::Tensor all_kv =
         torch::nn::functional::linear(projected_hidden, fused_kv_weight_)

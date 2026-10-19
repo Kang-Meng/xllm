@@ -1,0 +1,422 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cstdint>
+namespace {
+constexpr int32_t kD = 10240;
+template <int32_t Block>
+__mlu_func__ void cached_history_load(bfloat16_t* dst, const bfloat16_t* src) {
+  // Copy 9 history rows: the final operand is repeat count minus one (8).
+  // Each row copies Block BF16 elements; source rows are kD elements apart.
+  asm volatile("ld.async.stride.nram.gdram.scmnormal [%0], [%1], %2, %2, %3, 8;"
+               :
+               : "r"(dst), "r"(src), "r"(Block * 2), "r"(kD * 2)
+               : "memory");
+}
+template <int32_t Block>
+__mlu_func__ void cached_weight_load(float* dst, const float* src) {
+  // Copy 4 convolution taps: the final operand is repeat count minus one (3).
+  // Each tap copies Block FP32 elements; source taps are kD elements apart.
+  asm volatile(
+      "ld.async.stride.nram.gdram.io1.scmnormal [%0], [%1], %2, %2, %3, 3;"
+      :
+      : "r"(dst), "r"(src), "r"(Block * 4), "r"(kD * 4)
+      : "memory");
+}
+__mlu_func__ void round_bf16(float* value, bfloat16_t* scratch, int32_t n) {
+  __bang_float2bfloat16_rn(scratch, value, n);
+  __bang_bfloat162float(value, scratch, n);
+}
+template <int32_t Block>
+__mlu_global__ void ple_tail(const bfloat16_t* values,
+                             const bfloat16_t* normalized,
+                             bfloat16_t* history,
+                             const float* weights,
+                             const bfloat16_t* hidden,
+                             bfloat16_t* output,
+                             int32_t batch) {
+  __nram__ bfloat16_t windows[2 * 13 * Block];
+  __nram__ bfloat16_t residuals[2 * 8 * Block];
+  __nram__ bfloat16_t narrow_ring[2 * 4 * Block];
+  __nram__ bfloat16_t narrow_weights[4 * Block];
+  __nram__ float tap_weight[4 * Block];
+  __nram__ float accumulator[4 * Block];
+  __nram__ float temporary[4 * Block];
+  __nram__ float temporary2[4 * Block];
+  if (!__is_ipu()) {
+    return;
+  }
+  if (taskId >= batch * (kD / Block)) {
+    return;
+  }
+  const int32_t weight_channel = (taskId % (kD / Block)) * Block;
+  cached_weight_load<Block>(tap_weight, weights + weight_channel);
+  bfloat16_t* window = windows;
+  bfloat16_t* residual = residuals;
+  int32_t request = taskId / (kD / Block);
+  const int32_t channel = weight_channel;
+  cached_history_load<Block>(window, history + request * 13 * kD + channel);
+  __memcpy_async(window + 9 * Block,
+                 normalized + request * 4 * kD + channel,
+                 Block * sizeof(bfloat16_t),
+                 GDRAM2NRAM,
+                 Block * sizeof(bfloat16_t),
+                 kD * sizeof(bfloat16_t),
+                 3);
+  __memcpy_async(residual,
+                 values + request * 4 * kD + channel,
+                 Block * sizeof(bfloat16_t),
+                 GDRAM2NRAM,
+                 Block * sizeof(bfloat16_t),
+                 kD * sizeof(bfloat16_t),
+                 3);
+  __memcpy_async(residual + 4 * Block,
+                 hidden + request * 4 * kD + channel,
+                 Block * sizeof(bfloat16_t),
+                 GDRAM2NRAM,
+                 Block * sizeof(bfloat16_t),
+                 kD * sizeof(bfloat16_t),
+                 3);
+
+  asm volatile("sync.pio1.csimd;" : : : "memory");
+  __bang_float2bfloat16_rn(narrow_weights, tap_weight, 4 * Block);
+
+  for (int32_t job = taskId; job < batch * (kD / Block); job += taskDim) {
+    request = job / (kD / Block);
+    const int32_t stage = ((job - taskId) / taskDim) % 2;
+    window = windows + stage * 13 * Block;
+    residual = residuals + stage * 8 * Block;
+    bfloat16_t* narrow = narrow_ring + stage * 4 * Block;
+    asm volatile("sync.pio0.csimd;\n sync.pio1.cio0;" : : : "memory");
+    asm volatile("sync.pio0.cio1;" : : : "memory");
+    __memcpy_io1_async(history + (request * 13 + 9) * kD + channel,
+                       window + 9 * Block,
+                       Block * sizeof(bfloat16_t),
+                       NRAM2GDRAM,
+                       kD * sizeof(bfloat16_t),
+                       Block * sizeof(bfloat16_t),
+                       3);
+    if (job + taskDim < batch * (kD / Block)) {
+      bfloat16_t* next_window = windows + (1 - stage) * 13 * Block;
+      bfloat16_t* next_residual = residuals + (1 - stage) * 8 * Block;
+      const int32_t next_request = (job + taskDim) / (kD / Block);
+      cached_history_load<Block>(next_window,
+                                 history + next_request * 13 * kD + channel);
+      __memcpy_async(next_window + 9 * Block,
+                     normalized + next_request * 4 * kD + channel,
+                     Block * sizeof(bfloat16_t),
+                     GDRAM2NRAM,
+                     Block * sizeof(bfloat16_t),
+                     kD * sizeof(bfloat16_t),
+                     3);
+      __memcpy_async(next_residual,
+                     values + next_request * 4 * kD + channel,
+                     Block * sizeof(bfloat16_t),
+                     GDRAM2NRAM,
+                     Block * sizeof(bfloat16_t),
+                     kD * sizeof(bfloat16_t),
+                     3);
+      __memcpy_async(next_residual + 4 * Block,
+                     hidden + next_request * 4 * kD + channel,
+                     Block * sizeof(bfloat16_t),
+                     GDRAM2NRAM,
+                     Block * sizeof(bfloat16_t),
+                     kD * sizeof(bfloat16_t),
+                     3);
+    }
+
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(accumulator),
+                   "r"(window),
+                   "r"(narrow_weights),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(temporary),
+                   "r"(window + 3 * Block),
+                   "r"(narrow_weights + Block),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(temporary2),
+                   "r"(window + 6 * Block),
+                   "r"(narrow_weights + 2 * Block),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile(
+        "addadd.nram.f32 [%0], [%0], [%1], [%2], %3;"
+        :
+        : "r"(accumulator), "r"(temporary), "r"(temporary2), "r"(4 * Block)
+        : "memory");
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(temporary),
+                   "r"(window + 9 * Block),
+                   "r"(narrow_weights + 3 * Block),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile("add.nram.bf16.f32 [%0], [%1], [%2], %3;"
+                 :
+                 : "r"(narrow), "r"(accumulator), "r"(temporary), "r"(4 * Block)
+                 : "memory");
+    __bang_bfloat162float(accumulator, narrow, 4 * Block);
+    __bang_active_sigmoid(temporary, accumulator, 4 * Block);
+    asm volatile("mult.nram.bf16.f32 [%0], [%1], [%2], %3;"
+                 :
+                 : "r"(narrow), "r"(accumulator), "r"(temporary), "r"(4 * Block)
+                 : "memory");
+    __bang_fusion(FUSION_FAA,
+                  narrow,
+                  narrow,
+                  residual,
+                  residual + 4 * Block,
+                  4 * Block,
+                  4 * Block);
+    asm volatile("sync.psimd.cio1;" : : : "memory");
+    __memcpy_io1_async(output + request * 4 * kD + channel,
+                       narrow,
+                       Block * sizeof(bfloat16_t),
+                       NRAM2GDRAM,
+                       kD * sizeof(bfloat16_t),
+                       Block * sizeof(bfloat16_t),
+                       3);
+  }
+}
+template <int32_t Block>
+__mlu_global__ void ple_tail_residual_io1(const bfloat16_t* values,
+                                          const bfloat16_t* normalized,
+                                          bfloat16_t* history,
+                                          const float* weights,
+                                          const bfloat16_t* hidden,
+                                          bfloat16_t* output,
+                                          int32_t batch) {
+  __nram__ bfloat16_t windows[2 * 13 * Block];
+  __nram__ bfloat16_t residuals[2 * 8 * Block];
+  __nram__ bfloat16_t narrow_ring[2 * 4 * Block];
+  __nram__ bfloat16_t narrow_weights[4 * Block];
+  __nram__ float tap_weight[4 * Block];
+  __nram__ float accumulator[4 * Block];
+  __nram__ float temporary[4 * Block];
+  __nram__ float temporary2[4 * Block];
+  if (!__is_ipu()) {
+    return;
+  }
+  if (taskId >= batch * (kD / Block)) {
+    return;
+  }
+  const int32_t weight_channel = (taskId % (kD / Block)) * Block;
+  cached_weight_load<Block>(tap_weight, weights + weight_channel);
+  bfloat16_t* window = windows;
+  bfloat16_t* residual = residuals;
+  int32_t request = taskId / (kD / Block);
+  const int32_t channel = weight_channel;
+  cached_history_load<Block>(window, history + request * 13 * kD + channel);
+  __memcpy_async(window + 9 * Block,
+                 normalized + request * 4 * kD + channel,
+                 Block * sizeof(bfloat16_t),
+                 GDRAM2NRAM,
+                 Block * sizeof(bfloat16_t),
+                 kD * sizeof(bfloat16_t),
+                 3);
+
+  asm volatile("sync.pio1.csimd;" : : : "memory");
+  __bang_float2bfloat16_rn(narrow_weights, tap_weight, 4 * Block);
+
+  __memcpy_io1_async(residual,
+                     values + request * 4 * kD + channel,
+                     Block * sizeof(bfloat16_t),
+                     GDRAM2NRAM,
+                     Block * sizeof(bfloat16_t),
+                     kD * sizeof(bfloat16_t),
+                     3);
+  __memcpy_io1_async(residual + 4 * Block,
+                     hidden + request * 4 * kD + channel,
+                     Block * sizeof(bfloat16_t),
+                     GDRAM2NRAM,
+                     Block * sizeof(bfloat16_t),
+                     kD * sizeof(bfloat16_t),
+                     3);
+
+  for (int32_t job = taskId; job < batch * (kD / Block); job += taskDim) {
+    request = job / (kD / Block);
+    const int32_t stage = ((job - taskId) / taskDim) % 2;
+    window = windows + stage * 13 * Block;
+    residual = residuals + stage * 8 * Block;
+    bfloat16_t* narrow = narrow_ring + stage * 4 * Block;
+    asm volatile("sync.pio0.csimd;\n sync.pio1.cio0;" : : : "memory");
+    asm volatile("sync.pio0.cio1;" : : : "memory");
+    __memcpy_io1_async(history + (request * 13 + 9) * kD + channel,
+                       window + 9 * Block,
+                       Block * sizeof(bfloat16_t),
+                       NRAM2GDRAM,
+                       kD * sizeof(bfloat16_t),
+                       Block * sizeof(bfloat16_t),
+                       3);
+    if (job + taskDim < batch * (kD / Block)) {
+      bfloat16_t* next_window = windows + (1 - stage) * 13 * Block;
+      bfloat16_t* next_residual = residuals + (1 - stage) * 8 * Block;
+      const int32_t next_request = (job + taskDim) / (kD / Block);
+      cached_history_load<Block>(next_window,
+                                 history + next_request * 13 * kD + channel);
+      __memcpy_async(next_window + 9 * Block,
+                     normalized + next_request * 4 * kD + channel,
+                     Block * sizeof(bfloat16_t),
+                     GDRAM2NRAM,
+                     Block * sizeof(bfloat16_t),
+                     kD * sizeof(bfloat16_t),
+                     3);
+      __memcpy_io1_async(next_residual,
+                         values + next_request * 4 * kD + channel,
+                         Block * sizeof(bfloat16_t),
+                         GDRAM2NRAM,
+                         Block * sizeof(bfloat16_t),
+                         kD * sizeof(bfloat16_t),
+                         3);
+      __memcpy_io1_async(next_residual + 4 * Block,
+                         hidden + next_request * 4 * kD + channel,
+                         Block * sizeof(bfloat16_t),
+                         GDRAM2NRAM,
+                         Block * sizeof(bfloat16_t),
+                         kD * sizeof(bfloat16_t),
+                         3);
+    }
+
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(accumulator),
+                   "r"(window),
+                   "r"(narrow_weights),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(temporary),
+                   "r"(window + 3 * Block),
+                   "r"(narrow_weights + Block),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(temporary2),
+                   "r"(window + 6 * Block),
+                   "r"(narrow_weights + 2 * Block),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile(
+        "addadd.nram.f32 [%0], [%0], [%1], [%2], %3;"
+        :
+        : "r"(accumulator), "r"(temporary), "r"(temporary2), "r"(4 * Block)
+        : "memory");
+    asm volatile("mult.cycle.nram.f32.bf16 [%0], [%1], [%2], %3, %4;"
+                 :
+                 : "r"(temporary),
+                   "r"(window + 9 * Block),
+                   "r"(narrow_weights + 3 * Block),
+                   "r"(4 * Block),
+                   "r"(Block)
+                 : "memory");
+    asm volatile("add.nram.bf16.f32 [%0], [%1], [%2], %3;"
+                 :
+                 : "r"(narrow), "r"(accumulator), "r"(temporary), "r"(4 * Block)
+                 : "memory");
+    __bang_bfloat162float(accumulator, narrow, 4 * Block);
+    __bang_active_sigmoid(temporary, accumulator, 4 * Block);
+    asm volatile("mult.nram.bf16.f32 [%0], [%1], [%2], %3;"
+                 :
+                 : "r"(narrow), "r"(accumulator), "r"(temporary), "r"(4 * Block)
+                 : "memory");
+    asm volatile("sync.pio1.csimd;" : : : "memory");
+    __bang_fusion(FUSION_FAA,
+                  narrow,
+                  narrow,
+                  residual,
+                  residual + 4 * Block,
+                  4 * Block,
+                  4 * Block);
+    asm volatile("sync.psimd.cio1;" : : : "memory");
+    __memcpy_io1_async(output + request * 4 * kD + channel,
+                       narrow,
+                       Block * sizeof(bfloat16_t),
+                       NRAM2GDRAM,
+                       kD * sizeof(bfloat16_t),
+                       Block * sizeof(bfloat16_t),
+                       3);
+  }
+}
+}  // namespace
+extern "C" void launch_tail(void* queue,
+                            const void* values,
+                            const void* normalized,
+                            void* history,
+                            const void* weights,
+                            const void* hidden,
+                            void* output,
+                            int32_t batch) {
+  const cnrtDim3_t grid = {4, 8, 1};
+  if (batch == 1) {
+    ple_tail_residual_io1<320>
+        <<<grid, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(values),
+            static_cast<const bfloat16_t*>(normalized),
+            static_cast<bfloat16_t*>(history),
+            static_cast<const float*>(weights),
+            static_cast<const bfloat16_t*>(hidden),
+            static_cast<bfloat16_t*>(output),
+            batch);
+  } else if (batch == 2) {
+    ple_tail_residual_io1<640>
+        <<<grid, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(values),
+            static_cast<const bfloat16_t*>(normalized),
+            static_cast<bfloat16_t*>(history),
+            static_cast<const float*>(weights),
+            static_cast<const bfloat16_t*>(hidden),
+            static_cast<bfloat16_t*>(output),
+            batch);
+  } else if (batch <= 8) {
+    ple_tail_residual_io1<1280>
+        <<<grid, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(values),
+            static_cast<const bfloat16_t*>(normalized),
+            static_cast<bfloat16_t*>(history),
+            static_cast<const float*>(weights),
+            static_cast<const bfloat16_t*>(hidden),
+            static_cast<bfloat16_t*>(output),
+            batch);
+  } else {
+    ple_tail<1280>
+        <<<grid, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(values),
+            static_cast<const bfloat16_t*>(normalized),
+            static_cast<bfloat16_t*>(history),
+            static_cast<const float*>(weights),
+            static_cast<const bfloat16_t*>(hidden),
+            static_cast<bfloat16_t*>(output),
+            batch);
+  }
+}

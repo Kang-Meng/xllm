@@ -1,0 +1,339 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cmath>
+#include <cstdint>
+
+namespace {
+// PLE dot-product scaling uses 1 / sqrt(2560), where 2560 is the head width.
+constexpr float kInvSqrtH = 0.01976423537605237f;
+// Convert the sigmoid's natural exponential to the kernel's base-2 exp2f.
+constexpr float kLog2E = 1.4426950408889634f;
+}  // namespace
+
+namespace coop_prepared {
+constexpr int32_t kH = 2560;
+constexpr int32_t kPart = 1280;
+constexpr int32_t kD = 10240;
+constexpr int32_t kN = 12800;
+
+__mlu_global__ void ple_head(const bfloat16_t* kv,
+                             const bfloat16_t* hidden,
+                             const bfloat16_t* packed,
+                             bfloat16_t* values,
+                             bfloat16_t* normalized,
+                             int32_t rows) {
+  __mlu_shared__ float shared_partial[16];
+  __nram__ bfloat16_t inputs[3 * kPart];
+  __nram__ bfloat16_t out_u[kPart];
+  __nram__ bfloat16_t out_z[kPart];
+  __nram__ bfloat16_t affine[2 * kPart];
+  __nram__ float partial[4];
+  __nram__ bfloat16_t narrow[3 * kPart];
+  __nram__ float combined[8];
+  if (!__is_ipu()) {
+    return;
+  }
+  const int32_t lane = taskId % 2;
+  const int32_t first_group = taskId / 2;
+  const int32_t hc = first_group % 4;
+  const int32_t part_offset = lane * kPart;
+  __memcpy_async(affine,
+                 packed + hc * 2 * kH + part_offset,
+                 kPart * sizeof(bfloat16_t),
+                 GDRAM2NRAM,
+                 kPart * sizeof(bfloat16_t),
+                 kH * sizeof(bfloat16_t),
+                 1);
+  __asm__ volatile("sync.pio0.csimd;" ::: "memory");
+
+  const int32_t group = first_group;
+  {
+    const int32_t row = group / 4;
+    __memcpy_async(inputs,
+                   kv + row * kN + hc * kH + part_offset,
+                   kPart * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+    __memcpy_async(inputs + kPart,
+                   hidden + group * kH + part_offset,
+                   kPart * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+    __memcpy_async(inputs + 2 * kPart,
+                   kv + row * kN + kD + part_offset,
+                   kPart * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+    __asm__ volatile("sync.pio0.csimd;" ::: "memory");
+
+    __bang_mul(narrow, inputs, inputs, 3 * kPart);
+    for (int32_t i = 0; i < 3; ++i) {
+      __asm__ volatile(
+          "sum.nram.precvt.f32.bf16 [%[dst]], [%[src]], %[n];\n\t" ::[dst] "r"(
+              partial + i),
+          [src] "r"(narrow + i * kPart),
+          [n] "r"(kPart)
+          : "memory");
+    }
+    __bang_mul(narrow, inputs, inputs + kPart, kPart);
+    __bang_mul(narrow, narrow, affine, kPart);
+    __asm__ volatile(
+        "sum.nram.precvt.f32.bf16 [%[dst]], [%[src]], %[n];\n\t" ::[dst] "r"(
+            partial + 3),
+        [src] "r"(narrow),
+        [n] "r"(kPart)
+        : "memory");
+    __sync_compute();
+    __memcpy_async(
+        shared_partial + coreId * 4, partial, 4 * sizeof(float), NRAM2SRAM);
+    __sync_move();
+    __sync_all_ipu_within_cluster();
+    __memcpy_async(combined,
+                   shared_partial + (coreId / 2) * 8,
+                   8 * sizeof(float),
+                   SRAM2NRAM);
+    __sync_move();
+    __bang_add(combined, combined, combined + 4, 4);
+    __sync_compute();
+    const float key_inv = 1.0f / sqrtf(combined[0] / kH + 1.0e-6f);
+    const float query_inv = 1.0f / sqrtf(combined[1] / kH + 1.0e-6f);
+    const float value_mean = combined[2] / kH;
+    const float divided = combined[3] * key_inv * query_inv * kInvSqrtH;
+    const float magnitude = sqrtf(fmaxf(fabsf(divided), 1.0e-6f));
+    const float signed_gate =
+        divided > 0.0f ? magnitude : (divided < 0.0f ? -magnitude : 0.0f);
+    const float gate = 1.0f / (1.0f + exp2f(-signed_gate * kLog2E));
+    const float conv_inv = gate / sqrtf(value_mean * gate * gate + 1.0e-6f);
+    __bang_mul_scalar(
+        out_u, inputs + 2 * kPart, static_cast<bfloat16_t>(gate), kPart);
+    __bang_mul_scalar(
+        out_z, inputs + 2 * kPart, static_cast<bfloat16_t>(conv_inv), kPart);
+    __bang_mul(out_z, out_z, affine + kPart, kPart);
+    __asm__ volatile("sync.psimd.cio1;" ::: "memory");
+    __memcpy_io1_async(values + group * kH + part_offset,
+                       out_u,
+                       kPart * sizeof(bfloat16_t),
+                       NRAM2GDRAM);
+    __memcpy_io1_async(normalized + group * kH + part_offset,
+                       out_z,
+                       kPart * sizeof(bfloat16_t),
+                       NRAM2GDRAM);
+    __sync();
+  }
+}
+}  // namespace coop_prepared
+
+namespace prepared_head {
+constexpr int32_t kH = 2560;
+constexpr int32_t kD = 4 * kH;
+constexpr int32_t kN = 5 * kH;
+__mlu_func__ void load_group(bfloat16_t* input,
+                             const bfloat16_t* kv,
+                             const bfloat16_t* hidden,
+                             int32_t group) {
+  if (group % 4 == 3) {
+    __memcpy_async(input,
+                   kv + (group / 4) * kN + 3 * kH,
+                   2 * kH * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+  } else {
+    __memcpy_async(input,
+                   kv + (group / 4) * kN + (group % 4) * kH,
+                   kH * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+    __asm__ volatile(
+        "ld.async.nram.gdram.scmnormal [%[dst]], [%[src]], %[bytes];\n\t" ::
+            [dst] "r"(input + kH),
+        [src] "r"(kv + (group / 4) * kN + kD),
+        [bytes] "r"(kH * sizeof(bfloat16_t))
+        : "memory");
+  }
+  __memcpy_async(
+      input + 2 * kH, hidden + group * kH, kH * sizeof(bfloat16_t), GDRAM2NRAM);
+}
+__mlu_global__ void ple_head_prepared(const bfloat16_t* kv,
+                                      const bfloat16_t* hidden,
+                                      const bfloat16_t* packed,
+                                      bfloat16_t* values,
+                                      bfloat16_t* normalized,
+                                      int32_t rows) {
+  __nram__ bfloat16_t storage[kH];
+  __nram__ bfloat16_t out_u[kH];
+  __nram__ bfloat16_t inputs[6 * kH];
+  __nram__ bfloat16_t squares[3 * kH];
+  __nram__ bfloat16_t affine_cache[2 * kH];
+  bfloat16_t* conv_scale_narrow = affine_cache + kH;
+  __nram__ bfloat16_t dot_narrow[kH];
+  bfloat16_t* scale_narrow = affine_cache;
+  if (!__is_ipu()) {
+    return;
+  }
+  if (rows == 4 && coreId >= 2) {
+    return;
+  }
+  const int32_t logical_task =
+      rows == 4 ? (taskId / 4) * 2 + (taskId % 4) : taskId;
+  const int32_t logical_dim = rows == 4 ? 16 : taskDim;
+  const int32_t fixed_hc = logical_task % 4;
+  __memcpy_async(affine_cache,
+                 packed + fixed_hc * 2 * kH,
+                 2 * kH * sizeof(bfloat16_t),
+                 GDRAM2NRAM);
+
+  if (logical_task < rows * 4) {
+    load_group(inputs, kv, hidden, logical_task);
+  }
+  int32_t iteration = 0;
+  for (int32_t group = logical_task; group < rows * 4;
+       group += logical_dim, ++iteration) {
+    __asm__ volatile("sync.pio0.csimd;\n\t" ::: "memory");
+    bfloat16_t* current = inputs + (iteration % 2) * 3 * kH;
+
+    if (group + logical_dim < rows * 4) {
+      __asm__ volatile("sync.psimd.cio0;\n\t" ::: "memory");
+      load_group(inputs + ((iteration + 1) % 2) * 3 * kH,
+                 kv,
+                 hidden,
+                 group + logical_dim);
+    }
+    __asm__ volatile(
+        "mult.nram.bf16 [%[dst]], [%[src]], [%[src]], "
+        "%[count];\n\t" ::[dst] "r"(squares),
+        [src] "r"(current),
+        [count] "r"(3 * kH)
+        : "memory");
+    float key_sum, query_sum, value_sum;
+    __asm__ volatile("sum.nram.precvt.f32.bf16 %[out], [%[src]], %[count];\n\t"
+                     : [out] "=r"(key_sum)
+                     : [src] "r"(squares), [count] "r"(kH)
+                     : "memory");
+    __asm__ volatile("sum.nram.precvt.f32.bf16 %[out], [%[src]], %[count];\n\t"
+                     : [out] "=r"(query_sum)
+                     : [src] "r"(squares + 2 * kH), [count] "r"(kH)
+                     : "memory");
+    __asm__ volatile("sum.nram.precvt.f32.bf16 %[out], [%[src]], %[count];\n\t"
+                     : [out] "=r"(value_sum)
+                     : [src] "r"(squares + kH), [count] "r"(kH)
+                     : "memory");
+    const float key_inv = 1.0f / sqrtf(key_sum * 0.000390625f + 1.0e-6f);
+    const float query_inv = 1.0f / sqrtf(query_sum * 0.000390625f + 1.0e-6f);
+    const float value_mean = value_sum * 0.000390625f;
+
+    __bang_mul(dot_narrow, current, current + 2 * kH, kH);
+    __bang_mul(dot_narrow, dot_narrow, scale_narrow, kH);
+    float raw_dot;
+    __asm__ volatile("sum.nram.precvt.f32.bf16 %[out], [%[src]], %[count];\n\t"
+                     : [out] "=r"(raw_dot)
+                     : [src] "r"(dot_narrow), [count] "r"(kH)
+                     : "memory");
+    const float dot = raw_dot * key_inv * query_inv;
+    const float divided = dot * kInvSqrtH;
+    const float magnitude = sqrtf(fmaxf(fabsf(divided), 1.0e-6f));
+    const float signed_gate =
+        divided > 0.0f ? magnitude : (divided < 0.0f ? -magnitude : 0.0f);
+    const float gate = 1.0f / (1.0f + exp2f(-signed_gate * kLog2E));
+    __asm__ volatile("sync.pio1.csimd;\n\t" ::: "memory");
+    __bang_mul_scalar(out_u, current + kH, static_cast<bfloat16_t>(gate), kH);
+    __asm__ volatile("sync.psimd.cio1;\n\t" ::: "memory");
+    __memcpy_io1_async(
+        values + group * kH, out_u, kH * sizeof(bfloat16_t), NRAM2GDRAM);
+    const float conv_inv = gate / sqrtf(value_mean * gate * gate + 1.0e-6f);
+    __bang_mul_scalar(
+        storage, current + kH, static_cast<bfloat16_t>(conv_inv), kH);
+    __bang_mul(storage, storage, conv_scale_narrow, kH);
+    __asm__ volatile("sync.psimd.cio1;\n\t" ::: "memory");
+    __memcpy_io1_async(
+        normalized + group * kH, storage, kH * sizeof(bfloat16_t), NRAM2GDRAM);
+  }
+  __sync();
+}
+__mlu_global__ void prepare_head_scale(const float* ks,
+                                       const float* qs,
+                                       const float* cs,
+                                       bfloat16_t* packed,
+                                       int32_t count) {
+  __nram__ float key[320];
+  __nram__ float query[320];
+  __nram__ float conv[320];
+  __nram__ bfloat16_t narrow[320];
+  if (!__is_ipu()) {
+    return;
+  }
+  for (int32_t start = taskId * 320; start < count; start += taskDim * 320) {
+    const int32_t n = count - start < 320 ? count - start : 320;
+    __memcpy(key, ks + start, n * sizeof(float), GDRAM2NRAM);
+    __memcpy(query, qs + start, n * sizeof(float), GDRAM2NRAM);
+    __memcpy(conv, cs + start, n * sizeof(float), GDRAM2NRAM);
+    __bang_mul(key, key, query, n);
+    __bang_float2bfloat16(narrow, key, n);
+    __memcpy(packed + (start / kH) * 2 * kH + start % kH,
+             narrow,
+             n * sizeof(bfloat16_t),
+             NRAM2GDRAM);
+    __bang_float2bfloat16(narrow, conv, n);
+    __memcpy(packed + (start / kH) * 2 * kH + kH + start % kH,
+             narrow,
+             n * sizeof(bfloat16_t),
+             NRAM2GDRAM);
+  }
+}
+}  // namespace prepared_head
+
+extern "C" void launch_prepare_head_scale_packed_hc(void* queue,
+                                                    const void* ks,
+                                                    const void* qs,
+                                                    const void* cs,
+                                                    void* affine_pair_bf16,
+                                                    int32_t count) {
+  const cnrtDim3_t grid = {4, 8, 1};
+  prepared_head::prepare_head_scale<<<grid,
+                                      cnrtFuncTypeUnion1,
+                                      static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const float*>(ks),
+      static_cast<const float*>(qs),
+      static_cast<const float*>(cs),
+      static_cast<bfloat16_t*>(affine_pair_bf16),
+      count);
+}
+extern "C" void launch_head_prepared_packed_hc(void* queue,
+                                               const void* kv,
+                                               const void* hidden,
+                                               const void* affine_pair_bf16,
+                                               void* values,
+                                               void* normalized,
+                                               int32_t rows) {
+  const cnrtDim3_t grid = {32, 1, 1};
+  if (rows == 4) {
+    coop_prepared::
+        ple_head<<<grid, cnrtFuncTypeUnion8, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(kv),
+            static_cast<const bfloat16_t*>(hidden),
+            static_cast<const bfloat16_t*>(affine_pair_bf16),
+            static_cast<bfloat16_t*>(values),
+            static_cast<bfloat16_t*>(normalized),
+            rows);
+  } else {
+    prepared_head::ple_head_prepared<<<grid,
+                                       cnrtFuncTypeUnion8,
+                                       static_cast<cnrtQueue_t>(queue)>>>(
+        static_cast<const bfloat16_t*>(kv),
+        static_cast<const bfloat16_t*>(hidden),
+        static_cast<const bfloat16_t*>(affine_pair_bf16),
+        static_cast<bfloat16_t*>(values),
+        static_cast<bfloat16_t*>(normalized),
+        rows);
+  }
+}

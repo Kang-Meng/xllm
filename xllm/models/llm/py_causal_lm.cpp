@@ -499,13 +499,15 @@ py::dict PyCausalLM::build_config_dict(
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
   d["layerwise_split_rank"] = layerwise_split_rank_;
+  bool requires_eager_execution = model_args_.requires_eager_execution();
+#if defined(USE_NPU)
   const bool is_glm52_eplv2 =
       model_args_.model_type() == "glm_moe_dsa" &&
       EPLBConfig::get_instance().expert_parallel_degree() == 2 &&
       !KernelConfig::get_instance().enable_mega_moe();
   // AllToAllV uses host variable split sizes and cannot be graph captured.
-  const bool requires_eager_execution =
-      model_args_.requires_eager_execution() || is_glm52_eplv2;
+  requires_eager_execution = requires_eager_execution || is_glm52_eplv2;
+#endif
   d["enable_graph"] = requires_eager_execution
                           ? false
                           : ExecutionConfig::get_instance().enable_graph();

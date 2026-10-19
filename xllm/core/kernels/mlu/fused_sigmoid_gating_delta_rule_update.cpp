@@ -496,8 +496,6 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
     block_v = std::min<int64_t>(head_v_dim, kSplitBlockV);
   }
   int64_t block_n = 1;
-  // KDA carries an additional gate tile per sequence. Keeping one sequence per
-  // tile prevents the GLM5 graph warmup shape from exceeding MLU590 NRAM.
   if (!is_kda) {
     if (num_sequences > core_count * 2) {
       block_n = kMaxBlockN;
@@ -506,8 +504,6 @@ std::pair<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule_update(
     }
   }
   int64_t max_block_hv = kMaxBlockHv / block_n;
-  // Bound head tiles for four-token updates within MLU590 NRAM. TP4 and TP2
-  // increase the local KDA head count beyond the optimized eight-head path.
   if (is_kda) {
     max_block_hv = std::min(max_block_hv, kMaxKdaBlockHv);
   } else {

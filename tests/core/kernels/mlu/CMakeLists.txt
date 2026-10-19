@@ -78,3 +78,16 @@ set_tests_properties(
 )
 
 add_subdirectory(kpool)
+
+# The BangC library is built from the imported MLU sources, with no gen/ ELF.
+cc_test(
+  NAME
+    qwen4_ple_bangc_test
+  SRCS
+    qwen4_ple_bangc_test.cpp
+  DEPS
+    xllm_mlu_ops
+    torch
+    glog::glog
+    GTest::gtest_main
+)

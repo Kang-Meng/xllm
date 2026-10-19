@@ -1,0 +1,293 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cstdint>
+namespace {
+constexpr int32_t kH = 2560, kN = 12800, kTileN = 1600, kTileK = 256;
+__mlu_func__ void load_weight_cached(bfloat16_t* dst,
+                                     const bfloat16_t* src,
+                                     int32_t bytes,
+                                     bool cache) {
+  if (cache) {
+    asm volatile(
+        "ld.async.sram.gdram.scmnormal [%[d]], [%[s]], %[b];" ::[d] "r"(dst),
+        [s] "r"(src),
+        [b] "r"(bytes)
+        : "memory");
+  } else {
+    __memcpy_async(dst, src, bytes, GDRAM2SRAM);
+  }
+}
+__mlu_func__ void final_conv_bf16(bfloat16_t* dst,
+                                  const bfloat16_t* a,
+                                  const bfloat16_t* w,
+                                  const float* partial,
+                                  int32_t m,
+                                  int32_t k,
+                                  int32_t n) {
+  asm volatile(
+      "conv.nram.f32.bf16.bf16 [%[dst]], [%[a]], [%[w]], %[k], %[m], 0x1, 0x1, "
+      "0x1, 0x1, 0x1, %[n], .add.partial.rn([%[partial]]), "
+      ".cvt.dst.rn.bf16();" ::[dst] "r"(dst),
+      [a] "r"(a),
+      [w] "r"(w),
+      [partial] "r"(partial),
+      [m] "r"(m),
+      [k] "r"(k),
+      [n] "r"(n)
+      : "memory");
+}
+template <int32_t RowsTile, int32_t SplitN, bool CacheInput>
+__mlu_global__ void ple_projection_packed(const bfloat16_t* e,
+                                          const bfloat16_t* w,
+                                          bfloat16_t* out,
+                                          int32_t rows) {
+  constexpr int32_t kRowsPerCore = RowsTile / (4 / SplitN),
+                    kColsPerCore = kTileN / SplitN,
+                    kWeightCols = ((kColsPerCore + 63) / 64) * 64;
+  __mlu_shared__ bfloat16_t
+      sa[CacheInput ? RowsTile * kH : 2 * RowsTile * kTileK];
+  __mlu_shared__ bfloat16_t sb[2 * kTileN * kTileK];
+  __nram__ bfloat16_t left[2 * kRowsPerCore * kTileK];
+  __nram__ float acc[kRowsPerCore * kColsPerCore];
+  __nram__ bfloat16_t result[kRowsPerCore * kColsPerCore];
+  __wram__ bfloat16_t right[512 * 1024 / sizeof(bfloat16_t)];
+  const int32_t nj = (kN / kTileN - taskIdY + taskDimY - 1) / taskDimY;
+  const int32_t kChunks = kH / kTileK, stages = nj * kChunks;
+  const int32_t k_phase = taskIdY % kChunks;
+  const int32_t mi = coreId / SplitN * kRowsPerCore,
+                ni = coreId % SplitN * kColsPerCore,
+                cm = rows - mi < kRowsPerCore ? rows - mi : kRowsPerCore;
+  if (__is_mpu()) {
+    if constexpr (CacheInput) {
+      __memcpy_async(sa, e, rows * kH * sizeof(bfloat16_t), GDRAM2SRAM);
+    } else {
+      __memcpy_async(sa,
+                     e + k_phase * kTileK,
+                     kTileK * sizeof(bfloat16_t),
+                     GDRAM2SRAM,
+                     kTileK * sizeof(bfloat16_t),
+                     kH * sizeof(bfloat16_t),
+                     rows - 1);
+    }
+    load_weight_cached(
+        sb,
+        w + (k_phase * (kN / kTileN) + taskIdY) * kTileN * kTileK,
+        kTileN * kTileK * sizeof(bfloat16_t),
+        taskIdY * kTileN >= 4 * kH);
+  }
+  __sync_cluster();
+  for (int32_t stage = 0; stage < stages + 1; ++stage) {
+    const int32_t parity = stage % 2;
+    if (__is_mpu() && stage + 1 < stages) {
+      int32_t next = stage + 1, nj = (next / kChunks) * taskDimY + taskIdY,
+              ko = ((next % kChunks + k_phase) % kChunks) * kTileK;
+      load_weight_cached(
+          sb + (1 - parity) * kTileN * kTileK,
+          w + (((next % kChunks + k_phase) % kChunks) * (kN / kTileN) + nj) *
+                  kTileN * kTileK,
+          kTileN * kTileK * sizeof(bfloat16_t),
+          nj * kTileN >= 4 * kH);
+      if constexpr (!CacheInput) {
+        __memcpy_async(sa + (1 - parity) * RowsTile * kTileK,
+                       e + ko,
+                       kTileK * sizeof(bfloat16_t),
+                       GDRAM2SRAM,
+                       kTileK * sizeof(bfloat16_t),
+                       kH * sizeof(bfloat16_t),
+                       rows - 1);
+      }
+    }
+    if (__is_ipu() && cm > 0) {
+      if (stage < stages) {
+        int32_t ko = stage % kChunks * kTileK;
+        asm volatile("sync.psimd.cmv;" ::: "memory");
+        if constexpr (CacheInput) {
+          __memcpy_async(
+              left + parity * kRowsPerCore * kTileK,
+              sa + mi * kH + ((stage % kChunks + k_phase) % kChunks) * kTileK,
+              kTileK * sizeof(bfloat16_t),
+              SRAM2NRAM,
+              kTileK * sizeof(bfloat16_t),
+              kH * sizeof(bfloat16_t),
+              cm - 1);
+        } else {
+          __memcpy_async(left + parity * kRowsPerCore * kTileK,
+                         sa + parity * RowsTile * kTileK + mi * kTileK,
+                         cm * kTileK * sizeof(bfloat16_t),
+                         SRAM2NRAM);
+        }
+        constexpr int32_t kGroups = kColsPerCore / 64,
+                          kExtra = (kColsPerCore % 64) / 4;
+        bfloat16_t* dst = right + parity * kWeightCols * kTileK / 16;
+        const bfloat16_t* src = sb + parity * kTileN * kTileK +
+                                (coreId % SplitN) * (kGroups + 1) * 4 * kTileK;
+        if (kExtra > 0) {
+          __memcpy_async(
+              dst,
+              src,
+              (kGroups + 1) * 4 * kTileK * sizeof(bfloat16_t),
+              SRAM2WRAM,
+              32768,
+              SplitN * (kGroups + 1) * 4 * kTileK * sizeof(bfloat16_t),
+              kExtra - 1);
+        }
+        if (kExtra < 16 && kGroups > 0) {
+          __memcpy_async(reinterpret_cast<char*>(dst) + kExtra * 32768,
+                         sb + parity * kTileN * kTileK +
+                             kExtra * SplitN * (kGroups + 1) * 4 * kTileK +
+                             (coreId % SplitN) * kGroups * 4 * kTileK,
+                         kGroups * 4 * kTileK * sizeof(bfloat16_t),
+                         SRAM2WRAM,
+                         32768,
+                         SplitN * kGroups * 4 * kTileK * sizeof(bfloat16_t),
+                         15 - kExtra);
+        }
+      }
+      if (stage > 0) {
+        const int32_t prev = stage - 1, pp = 1 - parity, pk = prev % kChunks;
+        if (pk == kChunks - 1) {
+          final_conv_bf16(result,
+                          left + pp * kRowsPerCore * kTileK,
+                          right + pp * kWeightCols * kTileK / 16,
+                          acc,
+                          cm,
+                          kTileK,
+                          kColsPerCore);
+        } else if (pk == 0) {
+          __bang_conv(acc,
+                      left + pp * kRowsPerCore * kTileK,
+                      right + pp * kWeightCols * kTileK / 16,
+                      kTileK,
+                      cm,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      kColsPerCore);
+        } else {
+          __bang_conv_partial(acc,
+                              left + pp * kRowsPerCore * kTileK,
+                              right + pp * kWeightCols * kTileK / 16,
+                              acc,
+                              kTileK,
+                              cm,
+                              1,
+                              1,
+                              1,
+                              1,
+                              1,
+                              kColsPerCore);
+        }
+        if (pk == kChunks - 1) {
+          __sync();
+          const int32_t no = ((prev / kChunks) * taskDimY + taskIdY) * kTileN;
+          // Weight stage buffers are dead after the final Move. Gather each
+          // core's result into one contiguous MPU output stripe.
+          __memcpy_async(sb + mi * kTileN + ni,
+                         result,
+                         kColsPerCore * sizeof(bfloat16_t),
+                         NRAM2SRAM,
+                         kTileN * sizeof(bfloat16_t),
+                         kColsPerCore * sizeof(bfloat16_t),
+                         cm - 1);
+        }
+      }
+    }
+    if (__is_mpu()) {
+      asm volatile("barrier.sync.local.pio.cio 7, 5;" ::: "memory");
+    } else {
+      asm volatile("barrier.sync.local.pmv.cmv.csimd 7, 5;" ::: "memory");
+    }
+  }
+  if (__is_mpu()) {
+    __memcpy_async(out + taskIdY * kTileN,
+                   sb,
+                   kTileN * sizeof(bfloat16_t),
+                   SRAM2GDRAM,
+                   kN * sizeof(bfloat16_t),
+                   kTileN * sizeof(bfloat16_t),
+                   rows - 1);
+  }
+  __sync_cluster();
+}
+__mlu_global__ void pack_bf16(const bfloat16_t* w, bfloat16_t* p) {
+  __nram__ bfloat16_t tmp[4 * kTileK];
+  if (!__is_ipu()) {
+    return;
+  }
+  constexpr int32_t kChunks = kH / kTileK;
+  for (int32_t task = taskId; task < (kN / kTileN) * kChunks * (kTileN / 4);
+       task += taskDim) {
+    int32_t group = task % (kTileN / 4), tile = task / (kTileN / 4),
+            ni = tile / kChunks, ki = tile % kChunks;
+    constexpr int32_t kPerCore = kTileN / 4 / 4, kChannelsPerCore = kTileN / 4,
+                      kBase = kChannelsPerCore / 64,
+                      kExtra = kChannelsPerCore % 64 / 4;
+    const bool is_long = group < kExtra * 4 * (kBase + 1);
+    const int32_t adjusted = is_long ? group : group - kExtra * 4 * (kBase + 1);
+    const int32_t width = is_long ? kBase + 1 : kBase;
+    const int32_t lane = (is_long ? 0 : kExtra) + adjusted / (4 * width);
+    const int32_t core = adjusted / width % 4;
+    const int32_t ngroup = adjusted % width;
+    const int32_t channel =
+        ni * kTileN + core * kChannelsPerCore + ngroup * 64 + lane * 4;
+    __memcpy(tmp,
+             w + channel * kH + ki * kTileK,
+             kTileK * sizeof(bfloat16_t),
+             GDRAM2NRAM,
+             kTileK * sizeof(bfloat16_t),
+             kH * sizeof(bfloat16_t),
+             3);
+    __memcpy(
+        p + (ki * (kN / kTileN) + ni) * kTileN * kTileK + group * 4 * kTileK,
+        tmp,
+        4 * kTileK * sizeof(bfloat16_t),
+        NRAM2GDRAM);
+  }
+}
+}  // namespace
+extern "C" void launch_projection_packed_bf16(void* q,
+                                              const void* e,
+                                              const void* w,
+                                              void* out,
+                                              int32_t rows) {
+  cnrtDim3_t d = {4, 8, 1};
+  if (rows <= 64) {
+    ple_projection_packed<64, 4, true>
+        <<<d, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(q)>>>(
+            static_cast<const bfloat16_t*>(e),
+            static_cast<const bfloat16_t*>(w),
+            static_cast<bfloat16_t*>(out),
+            rows);
+  } else {
+    ple_projection_packed<128, 4, false>
+        <<<d, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(q)>>>(
+            static_cast<const bfloat16_t*>(e),
+            static_cast<const bfloat16_t*>(w),
+            static_cast<bfloat16_t*>(out),
+            rows);
+  }
+}
+
+extern "C" void launch_pack_projection_bf16(void* q, const void* w, void* p) {
+  cnrtDim3_t d = {4, 8, 1};
+  pack_bf16<<<d, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(q)>>>(
+      static_cast<const bfloat16_t*>(w), static_cast<bfloat16_t*>(p));
+}

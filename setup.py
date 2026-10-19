@@ -269,6 +269,36 @@ def _stage_mlu_triton_kernels(base_dir: str, extdir: str, device: str) -> None:
     logger.info(f"Staged {copied_count} MLU triton kernel(s) into {dest_dir}")
 
 
+def _stage_mlu_bangc_runtime(base_dir: str, extdir: str, device: str) -> None:
+    """Package the in-tree BangC library and its ordinary torch.ops loader."""
+    if device != "mlu":
+        return
+
+    library = os.path.join(extdir, "libxllm_mlu_ops.so")
+    if not os.path.isfile(library):
+        raise RuntimeError(
+            f"The xllm_mlu_ops CMake target did not produce {library}. "
+            "Build the in-tree BangC sources with --device mlu."
+        )
+    source_init = os.path.join(base_dir, "xllm", "core", "kernels", "mlu", "bangc", "__init__.py")
+    if not os.path.isfile(source_init):
+        raise RuntimeError(f"The BangC runtime loader is missing: {source_init}")
+    package_dir = os.path.join(extdir, "core", "kernels", "mlu", "bangc")
+    os.makedirs(package_dir, exist_ok=True)
+    shutil.copy2(source_init, os.path.join(package_dir, "__init__.py"))
+    marker = (
+        "# Copyright 2026 The xLLM Authors. All Rights Reserved.\n"
+        '# Licensed under the Apache License, Version 2.0 (the "License").\n'
+        '"""xllm internal package marker."""\n'
+    )
+    for parts in [("core",), ("core", "kernels"), ("core", "kernels", "mlu")]:
+        init_path = os.path.join(extdir, *parts, "__init__.py")
+        if not os.path.exists(init_path):
+            with open(init_path, "w", encoding="utf-8") as output:
+                output.write(marker)
+    logger.info("Staged BangC loader and in-tree library: %s", library)
+
+
 def _stage_triton_jit_scripts(base_dir: str, extdir: str) -> None:
     """Stage the triton_jit compile script as an importable package module.
 
@@ -500,6 +530,8 @@ class ExtBuild(build_ext):
             _maybe_compile_tilelang_kernels(self.device, self.tilelang_jobs)
         elif self.device == "mlu":
             cmake_args += ["-DUSE_MLU=ON"]
+            bangc_arch = os.environ.get("XLLM_MLU_ARCHITECTURES") or "mtp_592"
+            cmake_args += [f"-DXLLM_MLU_ARCHITECTURES={bangc_arch}"]
             set_mlu_envs()
         elif self.device == "musa":
             torch_cuda_architectures = os.getenv("TORCH_CUDA_ARCH_LIST")
@@ -628,6 +660,8 @@ class ExtBuild(build_ext):
         # Build every native executable shipped in the wheel so stale Mooncake
         # binaries cannot be reused from a previous build directory.
         build_targets = [ext.name, "mooncake_master", "mooncake_client", "stage_mooncake_etcd_runtime"]
+        if self.device == "mlu":
+            build_targets.append("xllm_mlu_ops")
         build_args += ["--target", *build_targets]
         subprocess.check_call([cmake_cmd, "--build", ".", "--verbose"] + build_args, cwd=cmake_dir, env=env)
 
@@ -637,6 +671,9 @@ class ExtBuild(build_ext):
             os.path.join(extdir, product),
             server_output_dir,
         )
+        _stage_mlu_bangc_runtime(self.base_dir, extdir, self.device)
+        if self.device == "mlu":
+            shutil.copy2(os.path.join(extdir, "libxllm_mlu_ops.so"), server_output_dir)
         etcd_wrapper = os.path.join(extdir, "libetcd_wrapper.so")
         if not os.path.isfile(etcd_wrapper):
             raise RuntimeError(f"Mooncake etcd runtime library was not staged: {etcd_wrapper}")
