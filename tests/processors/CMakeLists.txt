@@ -48,3 +48,36 @@ cc_test(
     :processors
     GTest::gtest_main
 )
+
+cc_test(
+  NAME
+    deepseek_v41_prompt_processor_test
+  CPU_ONLY
+  SRCS
+    deepseek_v41_prompt_processor_test.cpp
+  DEPS
+    :processors
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    transforms_test
+  CPU_ONLY
+  SRCS
+    transforms_test.cpp
+  DEPS
+    :processors
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    deepseek_v41_image_processor_test
+  CPU_ONLY
+  SRCS
+    deepseek_v41_image_processor_test.cpp
+  DEPS
+    :processors
+    GTest::gtest_main
+)

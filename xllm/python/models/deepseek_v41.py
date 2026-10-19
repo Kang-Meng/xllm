@@ -112,6 +112,13 @@ from xllm.python.models.deepseek_v41_engram import (
 )
 from xllm.python.models.engram_config import EngramConfig
 from xllm.python.models.engram_shared_memory import ensure_dev_shm_capacity, estimate_shared_bytes
+from xllm.python.models.multimodal import (
+    EncoderOutputs,
+    EncoderTokenCounts,
+    MultimodalData,
+    MultimodalInputs,
+    merge_multimodal_embeddings,
+)
 from xllm.python.models.swa_bounded_replay import (
     SWA_BOUNDED_FIRST_CONSUMER,
     run_swa_bounded_consumers,
@@ -3019,13 +3026,19 @@ class DeepseekV41Model(nn.Module):
         return True
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.cfg.cp_size > 1:
             raise NotImplementedError(
                 "DeepSeek-V4.1 context parallelism is scheduled with the Phase-6 distributed work"
             )
-        hidden = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            hidden = inputs_embeds
+        else:
+            hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
         context = get_forward_context()
         backend = context.attention_backend
@@ -3142,8 +3155,250 @@ class _PlainRotaryEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Vision tower (DeepSeek-V4.1-Flash; multimodal Phase 4)
+# ---------------------------------------------------------------------------
+# Ported from the vllm DSV4 vision reference
+# (vllm/models/deepseek_v4/common/vision.py): patch-embed → bidirectional ViT
+# with 2D RoPE (theta 10000) → spatial-merge aligner projecting vision features
+# back to the language width. The tower + aligner are replicated across TP ranks
+# (no sharding) and are bf16 (not quantized) in both the fp8 and ascend exports.
+# Sentinel injection is handled by ``prepare_multimodal_inputs`` via
+# ``merge_multimodal_embeddings`` once ``encode_multimodal`` has produced rows.
+
+
+@dataclass
+class DeepseekV41VisionConfig:
+    n_layers: int = 0
+    hidden_size: int = 1024
+    num_heads: int = 16
+    intermediate_size: int = 2816
+    patch_size: int = 14
+    num_channels: int = 3
+    out_hidden_size: int = 5120
+    rope_theta: float = 10000.0
+    downsample_ratio: int = 3
+    head_dim: int = 64
+    norm_eps: float = 1e-6
+
+    @property
+    def enabled(self) -> bool:
+        return self.n_layers > 0 and self.hidden_size > 0 and self.num_heads > 0
+
+    @classmethod
+    def from_dict(cls, config: dict) -> DeepseekV41VisionConfig:
+        vc = config.get("vision_config") or {}
+
+        def pick(mm_key: str, vc_key: str, default: Any) -> Any:
+            # Service path: flat ``mm_*`` keys from the C++ ModelArgs reflection.
+            # Standalone tests may pass the nested HF ``vision_config.*`` layout.
+            for source, key in ((config, mm_key), (vc, vc_key)):
+                value = source.get(key)
+                if value is not None:
+                    return value
+            return default
+
+        hidden = int(pick("mm_hidden_size", "hidden_size", 1024))
+        heads = int(pick("mm_num_attention_heads", "num_attention_heads", 16))
+        head_dim = int(pick("mm_head_dim", "head_dim", 0)) or (hidden // heads if heads else 0)
+        return cls(
+            n_layers=int(pick("mm_num_hidden_layers", "num_hidden_layers", 0)),
+            hidden_size=hidden,
+            num_heads=heads,
+            intermediate_size=int(pick("mm_intermediate_size", "intermediate_size", 2816)),
+            patch_size=int(pick("mm_patch_size", "patch_size", 14)),
+            num_channels=int(pick("mm_num_channels", "num_channels", 3)),
+            out_hidden_size=int(pick("mm_projection_dim", "out_hidden_size", 5120)),
+            rope_theta=float(pick("mm_rope_theta", "rope_theta", 10000.0)),
+            downsample_ratio=int(pick("mm_downsample_ratio", "downsample_ratio", 3)),
+            head_dim=head_dim,
+        )
+
+
+class DeepseekV41VisionNorm(nn.Module):
+    """RMSNorm with fp32 weight and the vision eps (1e-6, not the text 1e-20)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6, device=None) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32, device=device))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight * x).to(dtype)
+
+
+def _vision_cos_sin(
+    n_h: int, n_w: int, dim: int, theta: float, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+    hpos = torch.arange(n_h, device=device).unsqueeze(1).expand(n_h, n_w)
+    wpos = torch.arange(n_w, device=device).unsqueeze(0).expand(n_h, n_w)
+    freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float()
+    freqs = (freqs * inv_freq).flatten(1)
+    # Keep the rotary basis in float32: ``_apply_vision_rotary`` upcasts ``x`` to
+    # float32 before multiplying, so rounding cos/sin to the model dtype first
+    # would only lose precision for nothing.
+    return freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
+
+
+def _apply_vision_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
+    x1, x2 = x.float().chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
+
+
+class DeepseekV41VisionAttention(nn.Module):
+    def __init__(self, cfg: DeepseekV41VisionConfig, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__()
+        self.num_heads = cfg.num_heads
+        self.head_dim = cfg.head_dim
+        self.wqkv = nn.Linear(cfg.hidden_size, 3 * cfg.num_heads * cfg.head_dim, bias=True, dtype=dtype, device=device)
+        self.wo = nn.Linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size, bias=True, dtype=dtype, device=device)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        n = x.size(0)
+        q, k, v = (t.view(n, self.num_heads, self.head_dim) for t in self.wqkv(x).chunk(3, -1))
+        q = _apply_vision_rotary(q, cos, sin)
+        k = _apply_vision_rotary(k, cos, sin)
+        # One image per call: dense bidirectional attention, no varlen metadata.
+        q, k, v = (t.transpose(0, 1) for t in (q, k, v))
+        o = F.scaled_dot_product_attention(q, k, v)
+        return self.wo(o.transpose(0, 1).reshape(n, -1))
+
+
+class DeepseekV41VisionMLP(nn.Module):
+    def __init__(self, cfg: DeepseekV41VisionConfig, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__()
+        # w1 is the fused gate|up projection (checkpoint shape [2*inter, hidden]).
+        self.w1 = nn.Linear(cfg.hidden_size, 2 * cfg.intermediate_size, bias=False, dtype=dtype, device=device)
+        self.w2 = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False, dtype=dtype, device=device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.w1(x)
+        gate, up = gate_up.chunk(2, -1)
+        return self.w2(F.silu(gate) * up)
+
+
+class DeepseekV41VisionBlock(nn.Module):
+    def __init__(self, cfg: DeepseekV41VisionConfig, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__()
+        self.norm1 = DeepseekV41VisionNorm(cfg.hidden_size, cfg.norm_eps, device)
+        self.attn = DeepseekV41VisionAttention(cfg, dtype, device)
+        self.norm2 = DeepseekV41VisionNorm(cfg.hidden_size, cfg.norm_eps, device)
+        self.mlp = DeepseekV41VisionMLP(cfg, dtype, device)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), cos, sin)
+        return x + self.mlp(self.norm2(x))
+
+
+class DeepseekV41VisionTower(nn.Module):
+    """ViT: patch-embed + N bidirectional blocks + final norm (replicated)."""
+
+    def __init__(self, cfg: DeepseekV41VisionConfig, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.rope_dim = cfg.head_dim // 2
+        self.patch_embed = nn.Linear(
+            cfg.num_channels * cfg.patch_size**2, cfg.hidden_size, bias=True, dtype=dtype, device=device
+        )
+        self.blocks = nn.ModuleList(DeepseekV41VisionBlock(cfg, dtype, device) for _ in range(cfg.n_layers))
+        self.norm = DeepseekV41VisionNorm(cfg.hidden_size, cfg.norm_eps, device)
+
+    def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        x = self.patch_embed(patches.flatten(1))
+        cos, sin = _vision_cos_sin(n_h, n_w, self.rope_dim, self.cfg.rope_theta, x.device)
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        return self.norm(x)
+
+
+class DeepseekV41Aligner(nn.Module):
+    """Spatial merge (downsample_ratio × downsample_ratio) + 2-layer MLP."""
+
+    def __init__(self, cfg: DeepseekV41VisionConfig, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__()
+        self.r = cfg.downsample_ratio
+        self.in_dim = cfg.hidden_size * self.r**2
+        self.out_dim = cfg.out_hidden_size
+        self.w1 = nn.Linear(self.in_dim, self.out_dim, bias=True, dtype=dtype, device=device)
+        self.w2 = nn.Linear(self.out_dim, self.out_dim, bias=True, dtype=dtype, device=device)
+
+    def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        r = self.r
+        x = x.view(n_h, n_w, -1).permute(2, 0, 1)  # (C, H, W)
+        x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
+        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)  # (L, C*r*r)
+        return self.w2(F.gelu(self.w1(x)))
+
+
+# Image-block layout (vllm deepseek_v4/common/mm_preprocess.py:54-237, ported).
+# Roles are laid out in the "N order" the attention compressor expects; the
+# xllm convention folds every non-pad role onto the single sentinel id 129264
+# and leaves 129265 for the compressor-alignment pads (deepseek_v41_engram.py).
+#
+# LOCKED PAIR: this layout is implemented twice — here (Python, consumed by
+# `encode`) and in C++ `DeepseekV41PromptProcessor::image_block_roles`
+# (xllm/processors/deepseek_v41_prompt_processor.cpp, consumed by `process` /
+# `adjust_token_layout` / `find_mm_spans`). The two MUST stay byte-for-byte
+# consistent: a mismatch shifts token positions vs embed rows silently.
+# tests/python/test_deepseek_v41_vision_layout.py and
+# tests/processors/deepseek_v41_prompt_processor_test.cpp pin
+# both sides to the same golden role sequences — update them together.
+_IMAGE_START, _IMAGE_PAD, _IMAGE, _IMAGE_NEWLINE, _IMAGE_END = range(5)
+
+
+def _vision_block_slots(n_llm_h: int, n_llm_w: int, compress_pad: int = 0) -> list[tuple[int, int]]:
+    """Return ``[(role, feature_row_index), ...]`` for one image's LLM block.
+
+    ``feature_row_index`` indexes the aligner rows (``n_llm_h * n_llm_w``);
+    pad roles carry ``-1``. The image feature slots are interleaved row-pair
+    (``order``) exactly as the reference so the compressor sees them correctly;
+    ``compress_pad`` leading pad slots are position-dependent and added by the
+    prompt processor at splice time.
+    """
+    pad_h = n_llm_h % 2
+    rows = n_llm_h + pad_h
+    row_len = n_llm_w + 1
+    pad_last = rows // 2 * row_len % 2 * 2
+    pre = torch.tensor(
+        ([_IMAGE] * n_llm_w + [_IMAGE_NEWLINE]) * n_llm_h + [_IMAGE_PAD] * (row_len * pad_h),
+        dtype=torch.int64,
+    )
+    order = torch.arange(rows * row_len).view(rows // 2, 2, row_len).transpose(1, 2).reshape(-1)
+    image_idx = torch.full((rows * row_len,), -1, dtype=torch.int64)
+    image_idx.view(rows, row_len)[:n_llm_h, :n_llm_w] = torch.arange(n_llm_h * n_llm_w).view(n_llm_h, n_llm_w)
+    perm = image_idx[order]
+    perm = perm[perm >= 0]
+    types = torch.cat(
+        [
+            torch.full((compress_pad,), _IMAGE_PAD, dtype=torch.int64),
+            torch.tensor([_IMAGE_START], dtype=torch.int64),
+            pre[order],
+            torch.full((pad_last,), _IMAGE_PAD, dtype=torch.int64),
+            torch.tensor([_IMAGE_END], dtype=torch.int64),
+        ]
+    )
+    slots = []
+    feat = 0
+    for role in types.tolist():
+        if role == _IMAGE:
+            slots.append((_IMAGE, int(perm[feat])))
+            feat += 1
+        else:
+            slots.append((role, -1))
+    return slots
+
+
 class DeepseekV41ForCausalLM(PyModelBase):
     """DeepSeek-V4.1 causal LM driven by the C++ PyCausalLM bridge."""
+
+    # Selected by the C++ PyMultimodalExecutor: image encoder outputs are
+    # stateless per request, so the shared encoder cache may retain them.
+    cache_multimodal_embeddings: bool = True
 
     # ``_load_dsv4_moe`` is borrowed from ``DeepseekV4ForCausalLM`` by calling
     # it unbound with this instance (V4.1 does not inherit the V4 LM), and it
@@ -3168,6 +3423,185 @@ class DeepseekV41ForCausalLM(PyModelBase):
             device=device,
         )
 
+        # Vision tower (multimodal Phase 4). Built only when the checkpoint
+        # carries a vision_config; text-only runs keep these as None and load
+        # no vision tensors.
+        self.vision_cfg = DeepseekV41VisionConfig.from_dict(config)
+        self.vision_model: Optional[DeepseekV41VisionTower] = None
+        self.aligner: Optional[DeepseekV41Aligner] = None
+        if self.vision_cfg.enabled:
+            self.vision_model = DeepseekV41VisionTower(self.vision_cfg, dtype, device)
+            self.aligner = DeepseekV41Aligner(self.vision_cfg, dtype, device)
+            out_dim = self.vision_cfg.out_hidden_size
+            for name in ("image_start", "image_end", "image_newline"):
+                self.register_parameter(
+                    name,
+                    nn.Parameter(torch.zeros(out_dim, dtype=dtype, device=device), requires_grad=False),
+                )
+            logger.info(
+                "DeepSeek-V4.1 vision tower enabled: layers=%d hidden=%d heads=%d patch=%d downsample=%d out=%d",
+                self.vision_cfg.n_layers,
+                self.vision_cfg.hidden_size,
+                self.vision_cfg.num_heads,
+                self.vision_cfg.patch_size,
+                self.vision_cfg.downsample_ratio,
+                out_dim,
+            )
+
+    # -- multimodal encode ------------------------------------------------------
+
+    def encode(self, pixel_values: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+        """Encode images into the concatenated image-block embeddings.
+
+        Emits one row per **sentinel (129264)** position of every image block,
+        in prompt order: ``image_start`` → the aligner feature rows (row-pair
+        interleaved, N order) each followed by ``image_newline`` → ``image_end``.
+        Compressor-alignment pads (129265) are not emitted here;
+        ``prepare_multimodal_inputs`` scatters these rows at the matching
+        id-129264 positions (``merge_multimodal_embeddings``) and the C++ bridge
+        slices them per chunk.
+
+        ``pixel_values`` is the flattened patch batch (``(N, C, p, p)`` or
+        ``(N, C*p*p)``); ``grid`` is ``(num_images, 2)`` ``[n_vit_h, n_vit_w]``,
+        or a single flat row that is promoted to ``(1, -1)``. A row may carry a
+        leading THW column; only its last two entries (``n_vit_h, n_vit_w``) are
+        used.
+        """
+        if self.vision_model is None or self.aligner is None:
+            return torch.empty(0)
+        ref = next(self.vision_model.parameters())
+        patches = pixel_values.to(device=ref.device, dtype=ref.dtype)
+        if patches.dim() == 2:
+            patches = patches.reshape(
+                -1, self.vision_cfg.num_channels, self.vision_cfg.patch_size, self.vision_cfg.patch_size
+            )
+        if not torch.is_tensor(grid):
+            grid = torch.tensor(grid, device=ref.device)
+        grid = grid.to(device=ref.device, dtype=torch.int64)
+        if grid.dim() == 1:
+            # A single flat [n_vit_h, n_vit_w] (or THW) row: promote it to
+            # (1, -1) so the per-image loop below can index it.
+            grid = grid.reshape(1, -1)
+        if grid.dim() != 2:
+            raise ValueError(
+                f"DeepSeek-V4.1 image_grid_thw must be 1D or 2D, got {grid.dim()}D with shape {tuple(grid.shape)}",
+            )
+        # Each row is read from its trailing [n_vit_h, n_vit_w]; a leading THW
+        # column is tolerated and ignored. Reject short rows here instead of
+        # letting `row[-2]` silently read across rows below.
+        if grid.size(1) < 2:
+            raise ValueError(
+                "DeepSeek-V4.1 image_grid_thw rows need at least 2 columns "
+                f"[n_vit_h, n_vit_w], got shape {tuple(grid.shape)}"
+            )
+        r = self.vision_cfg.downsample_ratio
+        embeds = []
+        offset = 0
+        for row in grid.tolist():
+            n_vit_h, n_vit_w = int(row[-2]), int(row[-1])
+            n_patches = n_vit_h * n_vit_w
+            image = patches[offset : offset + n_patches]
+            offset += n_patches
+            vit = self.vision_model(image, n_vit_h, n_vit_w)
+            feats = self.aligner(vit, n_vit_h, n_vit_w)
+            n_llm_h = -(-n_vit_h // r)
+            n_llm_w = -(-n_vit_w // r)
+            rows = []
+            for role, feat_idx in _vision_block_slots(n_llm_h, n_llm_w):
+                if role == _IMAGE_PAD:
+                    continue
+                if role == _IMAGE_START:
+                    rows.append(self.image_start)
+                elif role == _IMAGE_END:
+                    rows.append(self.image_end)
+                elif role == _IMAGE_NEWLINE:
+                    rows.append(self.image_newline)
+                else:
+                    rows.append(feats[feat_idx])
+            embeds.append(torch.stack(rows))
+        return torch.cat(embeds, dim=0) if embeds else torch.empty(0)
+
+    # -- SupportsMultimodal protocol (xllm.python.models.multimodal) -------------
+
+    def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs:
+        """Encode every uncached image item into full image-block rows."""
+        counts = token_counts.get("image", [])
+        if not counts:
+            return {}
+        if self.vision_model is None or self.aligner is None:
+            raise ValueError("DeepSeek-V4.1 vision checkpoint is not loaded")
+        pixels = data.get("pixel_values")
+        grids = data.get("image_grid_thw")
+        if not isinstance(pixels, torch.Tensor) or not isinstance(grids, torch.Tensor):
+            raise TypeError("DeepSeek-V4.1 pixel_values and image_grid_thw must be tensors")
+        if any(count < 0 for count in counts):
+            raise ValueError("DeepSeek-V4.1 image token counts must not be negative")
+        # ``counts`` is one entry per image (consumed as ``features.split``
+        # sections), so it must line up with the ``image_grid_thw`` rows; a
+        # mismatch would mis-group the rows even if the totals happened to agree.
+        # Resolve the row count up front and reject a malformed grid here, so the
+        # check never silently skips for a 0-dim or 3D+ ``image_grid_thw``.
+        if grids.dim() not in (1, 2):
+            raise ValueError(
+                f"DeepSeek-V4.1 image_grid_thw must be 1D or 2D, got {grids.dim()}D with shape {tuple(grids.shape)}"
+            )
+        num_images = 1 if grids.dim() == 1 else grids.shape[0]
+        if len(counts) != num_images:
+            raise ValueError(
+                f"DeepSeek-V4.1 image token counts {len(counts)} do not match "
+                f"the {num_images} image(s) in image_grid_thw"
+            )
+        features = self.encode(pixels, grids)
+        if features.ndim != 2 or features.shape[0] != sum(counts):
+            raise ValueError(
+                f"DeepSeek-V4.1 encoder rows {features.shape[0]} do not match the "
+                f"scheduled image token counts {sum(counts)}"
+            )
+        return {"image|embedding": list(features.split(counts, dim=0))}
+
+    def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs:
+        """Scatter the scheduled image rows into the text embeddings."""
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        if "image|embedding" in data:
+            merge_multimodal_embeddings(inputs_embeds, data)
+        return MultimodalInputs(inputs_embeds=inputs_embeds)
+
+    def _load_vision_weights(self, loader: W8A8WeightLoader) -> None:
+        """Load vision.* + aligner.* + image_* (bf16, replicated) from the checkpoint."""
+        if self.vision_model is None or self.aligner is None:
+            return
+        copy = loader.copy_in
+        load = loader.load_tensor
+        # The checkpoint stores the patch embedding as a Conv2d weight
+        # [hidden, C, patch, patch]; the tower keeps it as an nn.Linear, so
+        # flatten the patch block to [hidden, C*patch*patch] (copy_ matches
+        # shapes only, it does not flatten).
+        patch_area = self.vision_cfg.num_channels * self.vision_cfg.patch_size**2
+        copy(
+            "vision_model.patch_embed.weight",
+            load("vision.patch_embed.proj.weight").reshape(self.vision_cfg.hidden_size, patch_area),
+        )
+        copy("vision_model.patch_embed.bias", load("vision.patch_embed.proj.bias"))
+        for i in range(self.vision_cfg.n_layers):
+            ck, pm = f"vision.blocks.{i}", f"vision_model.blocks.{i}"
+            for suffix in (
+                "attn.wqkv.weight",
+                "attn.wqkv.bias",
+                "attn.wo.weight",
+                "attn.wo.bias",
+                "mlp.w1.weight",
+                "mlp.w2.weight",
+                "norm1.weight",
+                "norm2.weight",
+            ):
+                copy(f"{pm}.{suffix}", load(f"{ck}.{suffix}"))
+        copy("vision_model.norm.weight", load("vision.norm.weight"))
+        for name in ("w1", "w2"):
+            copy(f"aligner.{name}.weight", load(f"aligner.{name}.weight"))
+            copy(f"aligner.{name}.bias", load(f"aligner.{name}.bias"))
+        for name in ("image_start", "image_end", "image_newline"):
+            copy(name, load(name))
+
     # -- weight loading ---------------------------------------------------------
 
     def load_weights(self, state_dicts: list[StateDict], tp_rank: int, tp_size: int) -> None:
@@ -3175,6 +3609,9 @@ class DeepseekV41ForCausalLM(PyModelBase):
             self._load_weights_ascend(state_dicts, tp_rank, tp_size)
         else:
             self._load_weights_torch(state_dicts, tp_rank, tp_size)
+        # Vision tower + aligner are bf16 and identical across quant modes.
+        if self.vision_model is not None:
+            self._load_vision_weights(W8A8WeightLoader(self, state_dicts, tp_size, tp_rank))
         # All-or-nothing host offload: a per-layer host-table fallback (see
         # ``_load_engram_ascend``) demotes the whole model to the HBM path so the
         # ACL-graph capture never mixes offloaded and device engram layers.

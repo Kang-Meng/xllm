@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -179,10 +180,10 @@ inline size_t ExpectedSwaLogicalBlocks(size_t num_tokens) {
 }
 
 // Creates a minimal Sequence for testing (same pattern as batch_test.cpp).
-Sequence MakeTestSequence(
-    size_t index,
-    const std::vector<int32_t>& prompt_token_ids,
-    const std::vector<SampleSlot>* sample_slots = nullptr) {
+Sequence MakeTestSequence(size_t index,
+                          const std::vector<int32_t>& prompt_token_ids,
+                          const std::vector<SampleSlot>* sample_slots = nullptr,
+                          const MMData* input_mm_data = nullptr) {
   torch::Device device(Platform::type_torch(), 0);
   // Sequence keeps non-owning pointers to these parameters after this helper
   // returns, so they must outlive every sequence created here.
@@ -206,7 +207,9 @@ Sequence MakeTestSequence(
   seq_params.sample_slots = sample_slots;
 
   torch::Tensor input_embedding;
-  MMData mm_data;
+  const MMData empty_mm_data;
+  const MMData& mm_data =
+      input_mm_data == nullptr ? empty_mm_data : *input_mm_data;
   IncrementalDecoder decoder("", 1, false, false);
   return Sequence(index,
                   prompt_token_ids,
@@ -2511,6 +2514,16 @@ BlockManager::Options make_v41_prefix_options(uint32_t window_size = 128) {
   return options;
 }
 
+MMData make_image_mm_data(int32_t offset, int32_t length, uint8_t key_byte) {
+  MMData mm_data;
+  auto& item = mm_data.add(MMType::IMAGE);
+  item.mutable_state().mutable_token_pos() = {offset, length};
+  std::memset(item.mutable_state().mutable_schedule_data().key.data,
+              key_byte,
+              XXH3_128BITS_HASH_VALUE_LEN);
+  return mm_data;
+}
+
 BlockManagerPool::Options make_v41_prefix_pool_options() {
   const BlockManager::Options source = make_v41_prefix_options();
   BlockManagerPool::Options options;
@@ -2530,8 +2543,10 @@ BlockManagerPool::Options make_v41_prefix_pool_options() {
 using V41PrefixCacheTest = ::testing::Test;
 
 void publish_v41_prompt(CompositeBlockManager& manager,
-                        const std::vector<int32_t>& tokens) {
-  Sequence cold = MakeTestSequence(/*index=*/0, tokens);
+                        const std::vector<int32_t>& tokens,
+                        const MMData& mm_data = MMData()) {
+  Sequence cold = MakeTestSequence(
+      /*index=*/0, tokens, /*sample_slots=*/nullptr, &mm_data);
   ASSERT_TRUE(manager.allocate_sequence(&cold, tokens.size()));
   cold.kv_state().incr_kv_cache_tokens_num(tokens.size());
   manager.deallocate_for_sequence(&cold);
@@ -3198,10 +3213,85 @@ TEST_F(V41PrefixCacheTest, V41HostAndStoreLeavesUseValidatedOptions) {
   EXPECT_NO_FATAL_FAILURE(build_composite_leaves(options));
 }
 
-TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsMultimodalHasher) {
+TEST_F(V41PrefixCacheTest, V41PrefixCacheAcceptsMultimodalHasher) {
   BlockManager::Options options = make_v41_prefix_options();
   options.hasher_type(BlockHasherType::MM);
-  EXPECT_DEATH(build_composite_leaves(options), "text prompts only");
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  EXPECT_EQ(manager.leaf_combination(),
+            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
+  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+    EXPECT_TRUE(manager.leaf_entries().at(type).supports_prefix_cache);
+    EXPECT_EQ(manager.leaf_entries().at(type).leaf->options().hasher_type(),
+              BlockHasherType::MM);
+  }
+}
+
+TEST_F(V41PrefixCacheTest, V41MMPrefixCacheHitsSameImageAndTextOnly) {
+  for (const bool with_image : {false, true}) {
+    SCOPED_TRACE(with_image);
+    BlockManager::Options options = make_v41_prefix_options();
+    options.hasher_type(BlockHasherType::MM);
+    CompositeBlockManager manager(build_composite_leaves(options), options);
+    const std::vector<int32_t> tokens(769, /*value=*/7);
+    const MMData mm_data =
+        with_image ? make_image_mm_data(/*offset=*/0, /*length=*/512, 3)
+                   : MMData();
+    publish_v41_prompt(manager, tokens, mm_data);
+    Sequence hot = MakeTestSequence(
+        /*index=*/1, tokens, /*sample_slots=*/nullptr, &mm_data);
+    manager.allocate_shared_for_sequence(&hot);
+    EXPECT_EQ(hot.kv_cache_tokens_num(), 768u);
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1), 6u);
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2), 3u);
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::SWA), 6u);
+    manager.deallocate_for_sequence(&hot);
+  }
+}
+
+TEST_F(V41PrefixCacheTest, V41MMPrefixCacheUsesImageIdentityAtBlockBoundary) {
+  struct Case {
+    int32_t offset;
+    int32_t length;
+    size_t expected_hit;
+  };
+  for (const Case test :
+       {Case{0, 512, 0}, Case{300, 400, 256}, Case{512, 128, 512}}) {
+    SCOPED_TRACE(test.offset);
+    BlockManager::Options options = make_v41_prefix_options();
+    options.hasher_type(BlockHasherType::MM);
+    CompositeBlockManager manager(build_composite_leaves(options), options);
+    const std::vector<int32_t> tokens(769, /*value=*/7);
+    publish_v41_prompt(
+        manager,
+        tokens,
+        make_image_mm_data(test.offset, test.length, /*key_byte=*/3));
+    const MMData changed =
+        make_image_mm_data(test.offset, test.length, /*key_byte=*/4);
+    Sequence hot = MakeTestSequence(
+        /*index=*/1, tokens, /*sample_slots=*/nullptr, &changed);
+    manager.allocate_shared_for_sequence(&hot);
+    EXPECT_EQ(hot.kv_cache_tokens_num(), test.expected_hit);
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2),
+              test.expected_hit / (2 * kBaseBlockSize));
+    manager.deallocate_for_sequence(&hot);
+  }
+}
+
+TEST_F(V41PrefixCacheTest, V41MMPrefixCacheStillHashesTextSuffix) {
+  BlockManager::Options options = make_v41_prefix_options();
+  options.hasher_type(BlockHasherType::MM);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  const std::vector<int32_t> tokens(769, /*value=*/7);
+  const MMData mm_data = make_image_mm_data(/*offset=*/0, /*length=*/512, 3);
+  publish_v41_prompt(manager, tokens, mm_data);
+  std::vector<int32_t> divergent = tokens;
+  divergent[600] = 11;
+  Sequence hot = MakeTestSequence(
+      /*index=*/1, divergent, /*sample_slots=*/nullptr, &mm_data);
+  manager.allocate_shared_for_sequence(&hot);
+  EXPECT_EQ(hot.kv_cache_tokens_num(), 512u);
+  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2), 2u);
+  manager.deallocate_for_sequence(&hot);
 }
 
 TEST_F(V41PrefixCacheTest, TokenRatiosDoNotImplyV41Identity) {
@@ -3234,15 +3324,25 @@ TEST_F(V41SpecPrefixCacheTest, SpecKeepsAllPrefixLeavesEnabled) {
   }
 }
 
-TEST_F(V41SpecPrefixCacheTest, SpecRejectsNonTextHasher) {
-  tests::ScopedEnvironmentVariable env{
-      "XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE"};
-  ASSERT_TRUE(env.set("1"));
+TEST_F(V41SpecPrefixCacheTest, SpecAllowsMMWithoutLookahead) {
+  BlockManager::Options options = make_v41_prefix_options();
+  options.num_speculative_tokens(5).hasher_type(BlockHasherType::MM);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  EXPECT_EQ(manager.leaf_combination(),
+            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
+  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+    EXPECT_TRUE(BlockManagerPoolTestPeer::leaf_of(manager, type)
+                    ->options()
+                    .enable_prefix_cache());
+  }
+}
+
+TEST_F(V41SpecPrefixCacheTest, SpecRejectsMtpLookaheadHashers) {
   BlockManager::Options options = make_v41_prefix_options();
   options.num_speculative_tokens(5).hasher_type(BlockHasherType::MTP_TEXT);
-  EXPECT_DEATH(build_composite_leaves(options), "text prompts only");
-  options.hasher_type(BlockHasherType::MM);
-  EXPECT_DEATH(build_composite_leaves(options), "text prompts only");
+  EXPECT_DEATH(build_composite_leaves(options), "TEXT/MM hashers only");
+  options.hasher_type(BlockHasherType::MTP_MM);
+  EXPECT_DEATH(build_composite_leaves(options), "TEXT/MM hashers only");
 }
 
 TEST_F(V41SpecPrefixCacheTest, SpecSupportsHostOffloadAndStore) {

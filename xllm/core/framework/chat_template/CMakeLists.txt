@@ -83,6 +83,7 @@ cc_library (
   DEPS
     :chat_template_base
     :tokenizer
+    :common
     nlohmann_json::nlohmann_json
     glog::glog
     absl::strings

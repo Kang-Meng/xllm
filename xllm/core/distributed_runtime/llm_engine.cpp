@@ -35,6 +35,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/options.h"
 #include "core/common/global_flags.h"
+#include "core/distributed_runtime/engine_utils.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
@@ -710,83 +711,11 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     options.linear_state_num_slots(
         static_cast<int32_t>(kv_cache_cap.num_linear_state_blocks()));
   }
-  if (util::is_deepseek_v4_model_type(args_.model_type())) {
-    constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
-    constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
-
-    std::vector<uint32_t> manager_types{kManagerTypeSlidingWindowBlockManager};
-    std::vector<uint32_t> manager_compress_ratios{
-        0};  // unused for sliding window manager
-    std::vector<uint32_t> token_manager_ratios;
-    token_manager_ratios.reserve(2);
-    if (util::is_deepseek_v41_model_type(args_.model_type())) {
-      // V4.1: one TOKEN manager per distinct kv-source compress ratio, in
-      // first-kv-source-appearance order (contract §2: group order
-      // [SWA, TOKEN(2), TOKEN(1)] for the standard layer plan). Reuse layers
-      // read the source layer's tensors and the TOKEN group's block table,
-      // so only the kv-source ratios get managers.
-      const std::vector<int32_t>& compress_ratios = args_.compress_ratios();
-      for (const int32_t layer_id : args_.kv_source_layer_ids()) {
-        if (layer_id < 0 ||
-            layer_id >= static_cast<int64_t>(compress_ratios.size())) {
-          continue;
-        }
-        const int32_t ratio = compress_ratios[static_cast<size_t>(layer_id)];
-        if (ratio != 2 && ratio != 1) {
-          continue;
-        }
-        const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
-        if (std::find(token_manager_ratios.begin(),
-                      token_manager_ratios.end(),
-                      ratio_u32) == token_manager_ratios.end()) {
-          token_manager_ratios.push_back(ratio_u32);
-        }
-      }
-    } else {
-      for (const int32_t ratio : args_.compress_ratios()) {
-        if (ratio == 4 || ratio == 128) {
-          const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
-          if (std::find(token_manager_ratios.begin(),
-                        token_manager_ratios.end(),
-                        ratio_u32) == token_manager_ratios.end()) {
-            token_manager_ratios.push_back(ratio_u32);
-          }
-        }
-      }
-    }
-    for (const uint32_t ratio : token_manager_ratios) {
-      manager_types.push_back(kManagerTypeBlockManagerImpl);
-      manager_compress_ratios.push_back(ratio);
-    }
-
-    const int64_t semantic_window = std::max(args_.window_size(), 1);
-    const int64_t max_model_len = args_.max_seq_len();
-    const int64_t effective_window =
-        max_model_len > 0 ? std::min<int64_t>(semantic_window, max_model_len)
-                          : semantic_window;
-    const uint32_t swa_blocks_per_seq = static_cast<uint32_t>(
-        get_swa_blocks_per_seq(effective_window, block_size));
-    CHECK_LE(kv_cache_cap.swa_count(),
-             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-        << "DSV4 swa_count exceeds uint32_t range: "
-        << kv_cache_cap.swa_count();
-    CHECK_LE(kv_cache_cap.c4_count(),
-             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-        << "DSV4 c4_count exceeds uint32_t range: " << kv_cache_cap.c4_count();
-    CHECK_LE(kv_cache_cap.c128_count(),
-             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-        << "DSV4 c128_count exceeds uint32_t range: "
-        << kv_cache_cap.c128_count();
-
-    options.sliding_window_size(static_cast<uint32_t>(effective_window))
-        .swa_blocks_per_seq(swa_blocks_per_seq)
-        .swa_num_blocks(static_cast<uint32_t>(kv_cache_cap.swa_count()))
-        .c4_num_blocks(static_cast<uint32_t>(kv_cache_cap.c4_count()))
-        .c128_num_blocks(static_cast<uint32_t>(kv_cache_cap.c128_count()))
-        .max_tokens_per_batch(options_.max_tokens_per_batch())
-        .manager_types(std::move(manager_types))
-        .compress_ratios(std::move(manager_compress_ratios));
-  }
+  configure_dsv4_block_manager_options(args_,
+                                       options,
+                                       kv_cache_cap,
+                                       block_size,
+                                       options_.max_tokens_per_batch());
 
   if (options_.enable_kvcache_store()) {
     CHECK_GT(options_.host_blocks_factor(), 1.0)

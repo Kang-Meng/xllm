@@ -58,3 +58,14 @@ cc_test (
     :deepseek_v4_cpp_template
     GTest::gtest_main
 )
+
+cc_test (
+  CPU_ONLY
+  NAME
+    deepseek_v41_cpp_template_test
+  SRCS
+    deepseek_v41_cpp_template_test.cpp
+  DEPS
+    :deepseek_v41_cpp_template
+    GTest::gtest_main
+)

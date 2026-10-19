@@ -25,7 +25,8 @@ namespace xllm {
 //     positions stay as invalid placeholders so DSA modulo indexing
 //     (`(pos/block_size) % semantic_cols`) remains stable.
 //   - Prefix cache is gap-tolerant (LinearStatePrefixCache backend); the
-//     tail-continuity check lives on the composite. TEXT hasher only.
+//     tail-continuity check lives on the composite. Supports TEXT, MTP_TEXT,
+//     and MM hashers; MTP_MM is rejected.
 class SlidingWindowBlockManager : public BlockManagerImpl {
  public:
   explicit SlidingWindowBlockManager(const Options& options);

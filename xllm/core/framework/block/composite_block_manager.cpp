@@ -188,8 +188,9 @@ CompositeBlockManager::LeafMap build_composite_leaves(
       util::is_deepseek_v41_model_type(options.model_type());
   bool prefix_cache_on = options.enable_prefix_cache();
   if (is_v41_token && prefix_cache_on && !is_decode) {
-    CHECK(options.hasher_type() == BlockHasherType::TEXT)
-        << "V4.1 TOKEN prefix cache supports text prompts only";
+    CHECK(options.hasher_type() == BlockHasherType::TEXT ||
+          options.hasher_type() == BlockHasherType::MM)
+        << "V4.1 TOKEN prefix cache supports TEXT/MM hashers only";
   }
   // Anchor the prefix cache only on cache groups this instance actually
   // registers. leaf_participates_in_prefix_cache reports C4/C128 as true

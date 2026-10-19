@@ -28,6 +28,16 @@ torch::Tensor resize(const torch::Tensor& image,
                      int32_t resample,
                      bool antialias = true);
 
+// Bit-exact re-implementation of Pillow's BICUBIC resize for 8-bit (C, H, W)
+// images (see libImaging/Resample.c). Pillow resamples 8-bit samples, so this
+// port does too: uint8 input is used as-is, any other dtype is clamped to
+// [0, 255] and quantized to uint8 first, and the result is always uint8. That
+// quantization is lossy for genuinely sub-8-bit float images, which are out of
+// scope here; the vision pipeline feeds 8-bit image data, where it is exact.
+torch::Tensor resize_pil_bicubic(const torch::Tensor& image,
+                                 int64_t out_h,
+                                 int64_t out_w);
+
 torch::Tensor center_crop(const torch::Tensor& image,
                           const std::pair<int32_t, int32_t>& crop_size);
 

@@ -44,6 +44,8 @@ cc_library(
     processor_config.h
     clip_image_processor.h
     clip_prompt_processor.h
+    deepseek_v41_image_processor.h
+    deepseek_v41_prompt_processor.h
     glm4v_image_processor.h
     joyai_asr_audio_processor.h
     joyai_asr_prompt_processor.h
@@ -69,6 +71,8 @@ cc_library(
     multimodal_processor.cpp
     clip_image_processor.cpp
     clip_prompt_processor.cpp
+    deepseek_v41_image_processor.cpp
+    deepseek_v41_prompt_processor.cpp
     glm4v_image_processor.cpp
     joyai_asr_audio_processor.cpp
     joyai_asr_prompt_processor.cpp

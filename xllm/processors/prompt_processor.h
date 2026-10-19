@@ -33,6 +33,17 @@ class PromptProcessor {
 
   // false rejects the request at construction.
   virtual bool process(std::string& prompt, const MMData& mm_data) = 0;
+
+  // Optional token-level fixup, run after tokenization and before
+  // find_mm_spans. Used by models whose placeholder blocks need
+  // position-dependent padding (e.g. DeepSeek-V4.1 compressor alignment).
+  virtual bool adjust_token_layout(std::vector<int32_t>& token_ids,
+                                   const MMData& mm_data) {
+    (void)token_ids;
+    (void)mm_data;
+    return true;
+  }
+
   virtual bool find_mm_spans(const std::vector<int32_t>& token_ids,
                              MMData& mm_data) = 0;
 };

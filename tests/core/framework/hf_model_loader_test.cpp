@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/platform/device.h"
 #include "core/runtime/options.h"
 #include "core/util/model_config_utils.h"
+#include "models/llm/deepseek_v41.h"
 #include "models/llm/glm5_next_mtp_args.h"
 #if defined(USE_MLU)
 #include "models/llm/mlu/glm5_next_mtp.h"
@@ -1794,6 +1795,57 @@ TEST(HFModelLoaderTest, RejectMixedPrecisionMalformedRegex) {
     QuantArgs args;
     EXPECT_FALSE(load_quant_cfg(reader, args));
   }
+}
+
+TEST(HFModelLoaderTest, DeepseekV41RejectsInvalidVisionArgs) {
+  auto make_args = [] {
+    ModelArgs args;
+    args.model_type("deepseek_v41");
+    args.n_layers(1);
+    args.compress_ratios({0});
+    args.window_size(128);
+    args.n_routed_experts(1);
+    args.n_activated_experts(1);
+    args.n_hash_layers(0);
+    args.routed_scaling_factor(1.0f);
+    args.swiglu_limit(1.0f);
+    args.scoring_func("softmax");
+    args.index_head_dim(1);
+    args.index_n_heads(1);
+    args.index_topk(1);
+    args.hc_mult(1);
+    args.hc_sinkhorn_iters(0);
+    args.hc_eps(1.0f);
+    args.factor(1.0f);
+    args.rope_scaling_attn_factor(1.0f);
+    args.rope_theta(1.0f);
+    args.compress_rope_theta(1.0f);
+    args.mm_num_hidden_layers(1);
+    args.image_token_id(129264);
+    return args;
+  };
+  const auto policy = build_deepseek_v41_args_policy();
+
+  auto missing_hidden = make_args();
+  EXPECT_DEATH(validate_deepseek_v41_args(missing_hidden, policy),
+               "mm_hidden_size");
+
+  auto missing_patch = make_args();
+  missing_patch.mm_hidden_size(1024);
+  missing_patch.mm_num_attention_heads(16);
+  missing_patch.mm_head_dim(64);
+  missing_patch.mm_intermediate_size(2816);
+  missing_patch.mm_num_channels(3);
+  missing_patch.mm_downsample_ratio(3);
+  missing_patch.mm_projection_dim(5120);
+  missing_patch.mm_rope_theta(10000.0f);
+  EXPECT_DEATH(validate_deepseek_v41_args(missing_patch, policy),
+               "mm_patch_size");
+
+  auto valid = missing_patch;
+  valid.mm_patch_size(14);
+  valid.mm_image_patch_size(14);
+  EXPECT_NO_FATAL_FAILURE(validate_deepseek_v41_args(valid, policy));
 }
 
 }  // namespace xllm

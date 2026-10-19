@@ -11,6 +11,7 @@ cc_library(
     distributed_runtime
   HDRS
     engine.h
+    engine_utils.h
     master.h
     dit_engine.h
     dit_master.h
@@ -34,6 +35,7 @@ cc_library(
     shm_channel.h
   SRCS
     master.cpp
+    engine_utils.cpp
     dit_engine.cpp
     dit_master.cpp
     llm_engine.cpp

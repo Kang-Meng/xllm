@@ -193,6 +193,52 @@ inline void validate_deepseek_v41_args(const ModelArgs& args,
   CHECK_GT(args.compress_rope_theta(), 0.0f)
       << "deepseek_v41 requires positive compress_rope_theta, got "
       << args.compress_rope_theta();
+
+  // Vision is optional, but once the checkpoint declares vision layers every
+  // dimension needed to build the ViT/aligner must be present. Leaving one at
+  // its loader default would otherwise fail much later in the Python model or
+  // silently produce a zero-sized tower.
+  if (args.mm_num_hidden_layers() > 0) {
+    CHECK_GE(args.image_token_id(), 0)
+        << "deepseek_v41 vision requires image_token_id >= 0, got "
+        << args.image_token_id();
+    CHECK_GT(args.mm_hidden_size(), 0)
+        << "deepseek_v41 vision requires mm_hidden_size > 0, got "
+        << args.mm_hidden_size();
+    CHECK_GT(args.mm_num_attention_heads(), 0)
+        << "deepseek_v41 vision requires mm_num_attention_heads > 0, got "
+        << args.mm_num_attention_heads();
+    CHECK_GT(args.mm_head_dim(), 0)
+        << "deepseek_v41 vision requires mm_head_dim > 0, got "
+        << args.mm_head_dim();
+    CHECK_GT(args.mm_intermediate_size(), 0)
+        << "deepseek_v41 vision requires mm_intermediate_size > 0, got "
+        << args.mm_intermediate_size();
+    CHECK_GT(args.mm_patch_size(), 0)
+        << "deepseek_v41 vision requires mm_patch_size > 0, got "
+        << args.mm_patch_size();
+    CHECK_GT(args.mm_image_patch_size(), 0)
+        << "deepseek_v41 vision requires mm_image_patch_size > 0, got "
+        << args.mm_image_patch_size();
+    CHECK_GT(args.mm_num_channels(), 0)
+        << "deepseek_v41 vision requires mm_num_channels > 0, got "
+        << args.mm_num_channels();
+    CHECK_GT(args.mm_downsample_ratio(), 0)
+        << "deepseek_v41 vision requires mm_downsample_ratio > 0, got "
+        << args.mm_downsample_ratio();
+    CHECK_GT(args.mm_projection_dim(), 0)
+        << "deepseek_v41 vision requires mm_projection_dim > 0, got "
+        << args.mm_projection_dim();
+    CHECK_GT(args.mm_rope_theta(), 0.0f)
+        << "deepseek_v41 vision requires mm_rope_theta > 0, got "
+        << args.mm_rope_theta();
+    CHECK_GE(args.mm_image_min_pixels(), 0)
+        << "deepseek_v41 vision requires mm_image_min_pixels >= 0, got "
+        << args.mm_image_min_pixels();
+    CHECK_GE(args.mm_image_max_tokens(), 0)
+        << "deepseek_v41 vision requires mm_image_max_tokens >= 0, got "
+        << args.mm_image_max_tokens();
+  }
 }
 
 inline bool load_deepseek_v41_model_args(const JsonReader& json,
@@ -351,6 +397,37 @@ inline bool load_deepseek_v41_model_args(const JsonReader& json,
   LOAD_ARG_OR(pad_token_id, "text_config.pad_token_id", args->pad_token_id());
   // -1 = no image tokens (text-only run); the released config sets 129264.
   LOAD_ARG_OR(image_token_id, "image_token_id", -1);
+
+  // --------------------------------------------------------------------------
+  // Vision tower (DeepSeek-V4.1-Flash vision). Read from vision_config.* so the
+  // Python vision model can build the ViT + aligner. All mm_* accessors are
+  // reflected into the Python config dict under the same names. Defaults keep
+  // mm_num_hidden_layers == 0 for text-only checkpoints, which disables vision.
+  // --------------------------------------------------------------------------
+  LOAD_ARG_OR(mm_num_hidden_layers, "vision_config.num_hidden_layers", 0);
+  LOAD_ARG_OR(mm_hidden_size, "vision_config.hidden_size", 0);
+  LOAD_ARG_OR(mm_num_attention_heads, "vision_config.num_attention_heads", 0);
+  LOAD_ARG_OR(mm_intermediate_size, "vision_config.intermediate_size", 0);
+  LOAD_ARG_OR(mm_patch_size, "vision_config.patch_size", 0);
+  // Image-preprocessor contract: patch size (also mirrored into the generic
+  // mm_image_patch_size the processor reads), pixel floor and LLM-token budget.
+  LOAD_ARG_OR(mm_image_patch_size, "vision_config.patch_size", 0);
+  LOAD_ARG_OR(mm_image_min_pixels, "vision_config.min_pixels", 0);
+  LOAD_ARG_OR(mm_image_max_tokens, "vision_config.max_image_tokens", 0);
+  // vision_config has no channel field; the patch-embed weight is
+  // [hidden, patch*patch*3], so 3 is the released contract.
+  LOAD_ARG_OR(mm_num_channels, "vision_config.num_channels", 3);
+  // Aligner output dim == text hidden (vision features are projected back to
+  // the language-model width, 5120 for the released config).
+  LOAD_ARG_OR(
+      mm_projection_dim, "text_config.hidden_size", args->hidden_size());
+  LOAD_ARG_OR(mm_rope_theta, "vision_config.rope_theta", 10000.0f);
+  LOAD_ARG_OR(mm_downsample_ratio, "vision_config.downsample_ratio", 3);
+  LOAD_ARG_OR_FUNC(mm_head_dim, "vision_config.head_dim", [&] {
+    return args->mm_num_attention_heads() > 0
+               ? args->mm_hidden_size() / args->mm_num_attention_heads()
+               : int64_t{0};
+  });
 
   process_deepseek_v41_args(args);
   validate_deepseek_v41_args(*args, build_deepseek_v41_args_policy());

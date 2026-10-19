@@ -123,6 +123,9 @@ class MultimodalProcessor final : public MultimodalProcessorBase {
     if (!tokenize(prompt, token_ids)) {
       return false;
     }
+    if (!prompt_processor_->adjust_token_layout(token_ids, mm_data)) {
+      return false;
+    }
     if (!prompt_processor_->find_mm_spans(token_ids, mm_data)) {
       return false;
     }

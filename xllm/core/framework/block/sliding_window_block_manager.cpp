@@ -30,12 +30,12 @@ SlidingWindowBlockManager::SlidingWindowBlockManager(const Options& options)
   CHECK_GT(options_.swa_blocks_per_seq(), 0u)
       << "swa_blocks_per_seq must be positive";
   if (options_.enable_prefix_cache()) {
-    // SWA prefix cache uses Sequence::block_hashes_ (TEXT chain). VLM MM
-    // hasher is not compatible; fail loud instead of silently corrupting hits.
+    // TEXT/MTP_TEXT keep the LLM hash chain; MM adds multimodal item identity
+    // to the SWA chain. MTP_MM is not supported by this layout.
     CHECK(options_.hasher_type() == BlockHasherType::TEXT ||
-          options_.hasher_type() == BlockHasherType::MTP_TEXT)
-        << "SWA prefix cache does not yet support VLM (MM hasher). "
-           "Disable prefix cache for VLM DSV4 or wait for VLM support.";
+          options_.hasher_type() == BlockHasherType::MTP_TEXT ||
+          options_.hasher_type() == BlockHasherType::MM)
+        << "SWA prefix cache supports TEXT/MM hashers only";
   }
 }
 

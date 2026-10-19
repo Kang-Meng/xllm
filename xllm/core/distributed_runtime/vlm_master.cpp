@@ -39,6 +39,8 @@ limitations under the License.
 #include "core/scheduler/scheduler_factory.h"
 #include "core/util/scope_guard.h"
 #include "core/util/timer.h"
+#include "core/util/utils.h"
+#include "processors/deepseek_v41_prompt_processor.h"
 #include "server/xllm_server_registry.h"
 
 namespace xllm {
@@ -179,9 +181,21 @@ VLMMaster::VLMMaster(const Options& options)
     XServiceClient::get_instance()->register_instance(instance_info);
   }
 
+  // Match LLMMaster: honour the native C++ template for supported models
+  // (deepseek_v32/v4/v41) and fall back to Jinja otherwise. DeepSeek-V4.1
+  // ships no Jinja chat_template, so the hardcoded Jinja path could not even
+  // render a text-only prompt.
   chat_template_ =
       ChatTemplate::create(engine_->tokenizer_args(), model_args_.model_type());
   tokenizer_ = engine_->tokenizer()->clone();
+  if (util::is_deepseek_v41_family_model_type(model_args_.model_type())) {
+    CHECK(validate_deepseek_v41_tokenizer_binding(*tokenizer_,
+                                                  model_args_.image_token_id()))
+        << "DeepSeek-V4.1 tokenizer does not bind "
+        << kDeepseekV41ImagePlaceholder
+        << " to image_token_id=" << model_args_.image_token_id() << " / "
+        << kDeepseekV41ImagePadPlaceholder << " to id+1";
+  }
   processor_ = create_multimodal_processor(model_args_,
                                            tokenizer_,
                                            options_.max_processor_cache_items(),

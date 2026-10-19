@@ -363,6 +363,12 @@ struct ModelArgs {
   PROPERTY(int64_t, mm_spatial_merge_size) = 0;
   PROPERTY(int64_t, mm_spatial_patch_size) = 0;
 
+  // DeepSeek-V4.1 vision tower: spatial merge ratio + 2D-RoPE theta.
+  // Defaults mirror the vision_config fallbacks used by the loader
+  // (deepseek_v41.h) and the Python side (deepseek_v41.py).
+  PROPERTY(int64_t, mm_downsample_ratio) = 3;
+  PROPERTY(float, mm_rope_theta) = 10000.0f;
+
   // Vision model's mm_remove_invalid_values
   PROPERTY(bool, mm_remove_invalid_values) = false;
 
@@ -951,6 +957,8 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", mm_projection_dim: " << args.mm_projection_dim();
   os << ", mm_spatial_merge_size: " << args.mm_spatial_merge_size();
   os << ", mm_spatial_patch_size: " << args.mm_spatial_patch_size();
+  os << ", mm_downsample_ratio: " << args.mm_downsample_ratio();
+  os << ", mm_rope_theta: " << args.mm_rope_theta();
   os << ", mm_remove_invalid_values: " << args.mm_remove_invalid_values();
   os << ", mm_repetition_penalty: " << args.mm_repetition_penalty();
   os << ", mm_return_dict: " << args.mm_return_dict();

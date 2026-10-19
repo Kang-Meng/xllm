@@ -29,6 +29,7 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "core/common/constants.h"
 #include "core/framework/chat_template/deepseek_v4_thinking_mode.h"
 
 namespace xllm {
@@ -170,7 +171,7 @@ std::string to_json(const nlohmann::ordered_json& value) {
 }
 
 // Lenient contract: never throws on malformed input; valid non-object JSON
-// collapses to an empty object and unparseable text is kept as
+// collapses to an empty object and unparsable text is kept as
 // {"arguments": <text>}.
 // Parity with the upstream V4 official template's parse_json_object_or_empty
 // (identical implementation): dropping the arguments of a valid non-object
@@ -240,9 +241,9 @@ std::string resolve_reasoning_effort(const std::string& reasoning_effort) {
     } catch (const std::exception&) {
       // Fall through to the default tier below.
     }
-    LOG_FIRST_N(WARNING, 1) << "Unrecognized reasoning effort \""
-                            << reasoning_effort
-                            << "\"; falling back to " << kEffortWeightHigh;
+    LOG_FIRST_N(WARNING, 1)
+        << "Unrecognized reasoning effort \"" << reasoning_effort
+        << "\"; falling back to " << kEffortWeightHigh;
   }
   return kEffortWeightHigh;
 }
@@ -319,11 +320,112 @@ int32_t find_last_user_index(const nlohmann::ordered_json& messages) {
   return -1;
 }
 
+// `count_image_placeholders` advances its search cursor by
+// `sizeof(marker) - 1`; an empty marker would make that step 0 and spin
+// forever, so pin the non-empty invariant of both literals at compile time.
+static_assert(sizeof(kDeepseekV41ImageAlias) > 1,
+              "DeepSeek-V4.1 image alias must be non-empty");
+static_assert(sizeof(kDeepseekV41ImagePlaceholder) > 1,
+              "DeepSeek-V4.1 image placeholder must be non-empty");
+
+// Replace an escaped alias (`\<image>`) with the internal sentinel before
+// counting/rendering. The sentinel is not an image marker, so escaped text is
+// treated as plain text and is restored by the prompt processor after image
+// expansion.
+std::string protect_image_literals(const std::string& text) {
+  return absl::StrReplaceAll(
+      text, {{kDeepseekV41ImageAliasEscape, kDeepseekV41ImageLiteralSentinel}});
+}
+
+std::string restore_image_literals(const std::string& text) {
+  return absl::StrReplaceAll(
+      text, {{kDeepseekV41ImageLiteralSentinel, kDeepseekV41ImageAlias}});
+}
+
+// True when any message carries an image part. The escaped marker must stay
+// protected until the prompt processor runs whenever an image may expand it;
+// for a text-only request the template restores it directly.
+bool has_image_content(const ChatMessages& messages) {
+  for (const Message& message : messages) {
+    if (!std::holds_alternative<MMContentVec>(message.content)) {
+      continue;
+    }
+    for (const auto& item : std::get<MMContentVec>(message.content)) {
+      if (item.type == "image_url") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Number of image placeholders the text already provides, counting both the
+// "<image>" alias and the native placeholder. The prompt processor expands both
+// forms, so a single text run may cover several images.
+size_t count_image_placeholders(const std::string& text) {
+  size_t count = 0;
+  for (size_t pos = text.find(kDeepseekV41ImageAlias); pos != std::string::npos;
+       pos = text.find(kDeepseekV41ImageAlias,
+                       pos + sizeof(kDeepseekV41ImageAlias) - 1)) {
+    ++count;
+  }
+  for (size_t pos = text.find(kDeepseekV41ImagePlaceholder);
+       pos != std::string::npos;
+       pos = text.find(kDeepseekV41ImagePlaceholder,
+                       pos + sizeof(kDeepseekV41ImagePlaceholder) - 1)) {
+    ++count;
+  }
+  return count;
+}
+
 std::string get_text_content(const Message::Content& content) {
   if (std::holds_alternative<std::string>(content)) {
-    return std::get<std::string>(content);
+    // A different message may still carry the image that expands this alias, so
+    // keep the escape protected until the prompt processor has run.
+    return protect_image_literals(std::get<std::string>(content));
   }
-  return "";
+  // Multimodal content: render in content order with exactly one placeholder
+  // per collected image. Two marker conventions are accepted:
+  //  * The text carries explicit markers (e.g. "<image>", as most vision
+  //    harnesses emit). The processor matches placeholders to images in
+  //    document order, so those markers cover the first N images.
+  //  * A backslash-escaped marker (`\<image>`) is literal text: it is protected
+  //    with an internal sentinel before counting and is restored by the prompt
+  //    processor after image expansion.
+  //  * Any image not covered by a text marker gets one injected native
+  //    placeholder, or it would be silently dropped.
+  // Keying off the marker *count* (not a have-any-marker boolean) keeps the
+  // emitted placeholder count equal to the image count for content-only,
+  // marker-only, and mixed content alike: e.g. one "<image>" plus two
+  // image_urls now yields two placeholders. The previous all-or-nothing switch
+  // under-counted mixed content, and the multimodal executor rejected the
+  // request (image rows != placeholder slots). Surplus markers (more text
+  // markers than images) are stripped by the prompt processor.
+  // Video/audio parts have no DeepSeek-V4 model support yet and contribute no
+  // text (there is no processor placeholder they could match).
+  const auto& items = std::get<MMContentVec>(content);
+  size_t marker_count = 0;
+  for (const auto& item : items) {
+    if (item.type == "text") {
+      marker_count +=
+          count_image_placeholders(protect_image_literals(item.text));
+    }
+  }
+  std::string text;
+  size_t image_index = 0;
+  for (const auto& item : items) {
+    if (item.type == "text") {
+      text += protect_image_literals(item.text);
+    } else if (item.type == "image_url") {
+      // Text markers cover the first `marker_count` images in document order;
+      // inject a native placeholder only for the remaining ones.
+      if (image_index >= marker_count) {
+        text += kDeepseekV41ImagePlaceholder;
+      }
+      ++image_index;
+    }
+  }
+  return text;
 }
 
 // ============================================================
@@ -471,22 +573,19 @@ nlohmann::ordered_json sort_tool_results_by_call_order(
             tool_blocks.emplace_back(b);
           }
         }
-        std::stable_sort(tool_blocks.begin(),
-                         tool_blocks.end(),
-                         [&](const nlohmann::ordered_json& a,
-                             const nlohmann::ordered_json& b) {
-                           auto ia = last_tc_order.find(
-                               a.value("tool_use_id", ""));
-                           auto ib = last_tc_order.find(
-                               b.value("tool_use_id", ""));
-                           int32_t oa = ia != last_tc_order.end()
-                                            ? ia->second
-                                            : kUnknownToolCallOrder;
-                           int32_t ob = ib != last_tc_order.end()
-                                            ? ib->second
-                                            : kUnknownToolCallOrder;
-                           return oa < ob;
-                         });
+        std::stable_sort(
+            tool_blocks.begin(),
+            tool_blocks.end(),
+            [&](const nlohmann::ordered_json& a,
+                const nlohmann::ordered_json& b) {
+              auto ia = last_tc_order.find(a.value("tool_use_id", ""));
+              auto ib = last_tc_order.find(b.value("tool_use_id", ""));
+              int32_t oa = ia != last_tc_order.end() ? ia->second
+                                                     : kUnknownToolCallOrder;
+              int32_t ob = ib != last_tc_order.end() ? ib->second
+                                                     : kUnknownToolCallOrder;
+              return oa < ob;
+            });
         int32_t si = 0;
         nlohmann::ordered_json new_blocks = nlohmann::json::array();
         for (const auto& b : blocks) {
@@ -793,6 +892,7 @@ std::optional<std::string> DeepseekV41CppTemplate::apply(
   int32_t render_idx = -1;
   std::string render_role;
   try {
+    const bool has_images = has_image_content(messages);
     nlohmann::ordered_json normalized =
         normalize_messages(messages, json_tools);
     std::string thinking_mode =
@@ -836,8 +936,14 @@ std::optional<std::string> DeepseekV41CppTemplate::apply(
     for (render_idx = 0; render_idx < static_cast<int32_t>(normalized.size());
          ++render_idx) {
       render_role = normalized[render_idx].value("role", "");
-      prompt += render_message(normalized, render_idx, thinking_mode,
-                                drop_thinking, reasoning_effort);
+      prompt += render_message(normalized,
+                               render_idx,
+                               thinking_mode,
+                               drop_thinking,
+                               reasoning_effort);
+    }
+    if (!has_images) {
+      prompt = restore_image_literals(prompt);
     }
     return prompt;
   } catch (const std::exception& e) {

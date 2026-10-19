@@ -33,6 +33,7 @@ limitations under the License.
 #include "common/interruption_bus.h"
 #include "common/metrics.h"
 #include "core/common/global_flags.h"
+#include "core/distributed_runtime/engine_utils.h"
 #include "core/distributed_runtime/master.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
@@ -155,6 +156,7 @@ bool VLMEngine::init_model(MasterStatus master_status) {
 
   args_ = model_loader->model_args();
   configure_prefix_cache(options_);
+
   quant_args_ = model_loader->quant_args();
   tokenizer_args_ = model_loader->tokenizer_args();
 
@@ -385,6 +387,11 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
       .instance_is_decode(options_.instance_role() == InstanceRole::DECODE)
       .enable_schedule_overlap(options_.enable_schedule_overlap());
+  configure_dsv4_block_manager_options(args_,
+                                       options,
+                                       kv_cache_cap,
+                                       block_size,
+                                       options_.max_tokens_per_batch());
   if (enable_state_cache) {
     // The unified state slot pool spans all physical slots [0, N); it can
     // contain GDN state and KPool tail state.
