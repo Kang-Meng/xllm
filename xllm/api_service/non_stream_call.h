@@ -113,7 +113,7 @@ class NonStreamCall : public Call {
   }
 
   bool finish_with_error(const Status& status) {
-    record_error(status);
+    record_error();
     XLLM_VERBOSE_TRACE() << "event=request_error x-request-id=" << x_request_id_
                          << " message=" << status.message();
     if (!is_http_request_) {

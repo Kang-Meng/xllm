@@ -24,10 +24,176 @@ limitations under the License.
 #include <string>
 
 #include "api_service/http_auth.h"
+#include "api_service/non_stream_call.h"
+#include "api_service/rpc_request_metrics.h"
+#include "api_service/stream_call.h"
+#include "completion.pb.h"
+#include "core/common/metrics.h"
 #include "core/framework/config/service_config.h"
+#include "core/util/closure_guard.h"
 
 namespace xllm {
 namespace {
+
+class CountingClosure final : public google::protobuf::Closure {
+ public:
+  void Run() override { ++count_; }
+
+  int32_t count() const { return count_; }
+
+ private:
+  int32_t count_ = 0;
+};
+
+class RateLimitMetricsTest : public testing::Test {
+ protected:
+  void SetUp() override {
+    previous_limit_ = ServiceConfig::get_instance().max_concurrent_requests();
+    ServiceConfig::get_instance().max_concurrent_requests(1);
+  }
+
+  void TearDown() override {
+    ServiceConfig::get_instance().max_concurrent_requests(previous_limit_);
+  }
+
+  template <typename CallType>
+  void finish_rejection(const Status& status, bool streaming, bool http) {
+    brpc::Controller controller;
+    controller.http_request().SetHeader("x-request-id", "limit-metrics-test");
+    proto::CompletionRequest request;
+    request.set_stream(streaming);
+    proto::CompletionResponse response;
+    CountingClosure done;
+    const double limited_before = COUNTER_VALUE(server_request_total_limit);
+    const double failed_before = COUNTER_VALUE(server_request_total_fail);
+    const double ok_before = COUNTER_VALUE(server_request_total_ok);
+    ClosureGuard guard(
+        &done,
+        [](void* context) { request_in_metric(context); },
+        [&controller](void* /*unused*/) { request_out_metric(&controller); });
+    {
+      CallType call(&controller,
+                    guard.release(),
+                    &request,
+                    &response,
+                    /*use_arena=*/true,
+                    http);
+      EXPECT_TRUE(call.finish_with_error(status));
+      EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
+      EXPECT_EQ(call.finish_with_error(status), !streaming);
+      EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
+      if (http) {
+        EXPECT_FALSE(controller.Failed());
+        EXPECT_EQ(controller.http_response().status_code(),
+                  api_service::public_error_from_status(status).status_code);
+      } else {
+        EXPECT_TRUE(controller.Failed());
+      }
+    }
+    EXPECT_EQ(done.count(), 1);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failed_before + 1);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), ok_before);
+  }
+
+ private:
+  int32_t previous_limit_ = 0;
+};
+
+TEST_F(RateLimitMetricsTest, NonStreamConcurrencyRejectionCountsOnce) {
+  using CompletionCall =
+      NonStreamCall<proto::CompletionRequest, proto::CompletionResponse>;
+  RateLimiter rate_limiter;
+  const absl::flat_hash_set<std::string> models = {"supported-model"};
+  const double limited_before = COUNTER_VALUE(server_request_total_limit);
+  ASSERT_TRUE(api_service_internal::admit_rpc_request(
+                  "supported-model", models, &rate_limiter)
+                  .ok());
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
+  for (bool http : {false, true}) {
+    const double before_rejection = COUNTER_VALUE(server_request_total_limit);
+    const Status status = api_service_internal::admit_rpc_request(
+        "supported-model", models, &rate_limiter);
+    ASSERT_EQ(status.reason(), FailureReason::CONCURRENCY_LIMIT_REACHED);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), before_rejection + 1);
+    finish_rejection<CompletionCall>(status, /*streaming=*/false, http);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), before_rejection + 1);
+    EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
+  }
+  rate_limiter.decrease_one_request();
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(RateLimitMetricsTest, StreamCallConcurrencyRejectionCountsOnce) {
+  using CompletionCall =
+      StreamCall<proto::CompletionRequest, proto::CompletionResponse>;
+  RateLimiter rate_limiter;
+  const absl::flat_hash_set<std::string> models = {"supported-model"};
+  ASSERT_TRUE(api_service_internal::admit_rpc_request(
+                  "supported-model", models, &rate_limiter)
+                  .ok());
+  for (bool streaming : {false, true}) {
+    const double before_rejection = COUNTER_VALUE(server_request_total_limit);
+    const Status status = api_service_internal::admit_rpc_request(
+        "supported-model", models, &rate_limiter);
+    ASSERT_EQ(status.reason(), FailureReason::CONCURRENCY_LIMIT_REACHED);
+    finish_rejection<CompletionCall>(status, streaming, /*http=*/true);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), before_rejection + 1);
+    EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
+  }
+  rate_limiter.decrease_one_request();
+}
+
+TEST_F(RateLimitMetricsTest, SleepingModelDoesNotCountAsConcurrencyLimit) {
+  using CompletionCall =
+      NonStreamCall<proto::CompletionRequest, proto::CompletionResponse>;
+  RateLimiter rate_limiter;
+  const absl::flat_hash_set<std::string> models = {"supported-model"};
+  ASSERT_TRUE(rate_limiter.try_set_sleeping());
+  const double limited_before = COUNTER_VALUE(server_request_total_limit);
+  const Status status = api_service_internal::admit_rpc_request(
+      "supported-model", models, &rate_limiter);
+  ASSERT_EQ(status.code(), StatusCode::UNAVAILABLE);
+  finish_rejection<CompletionCall>(status, /*streaming=*/false, /*http=*/true);
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
+  EXPECT_TRUE(rate_limiter.is_sleeping());
+  EXPECT_TRUE(rate_limiter.try_wakeup());
+}
+
+TEST_F(RateLimitMetricsTest, UnsupportedModelDoesNotCountAsConcurrencyLimit) {
+  using CompletionCall =
+      NonStreamCall<proto::CompletionRequest, proto::CompletionResponse>;
+  RateLimiter rate_limiter;
+  const absl::flat_hash_set<std::string> models = {"supported-model"};
+  const double limited_before = COUNTER_VALUE(server_request_total_limit);
+  const Status status = api_service_internal::admit_rpc_request(
+      "unsupported-model", models, &rate_limiter);
+  ASSERT_EQ(status.reason(), FailureReason::MODEL_NOT_FOUND);
+  finish_rejection<CompletionCall>(status, /*streaming=*/false, /*http=*/true);
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(RateLimitMetricsTest, EarlyHttp429WithoutCallCountsOnce) {
+  brpc::Controller controller;
+  CountingClosure done;
+  const double limited_before = COUNTER_VALUE(server_request_total_limit);
+  const double failed_before = COUNTER_VALUE(server_request_total_fail);
+  {
+    ClosureGuard guard(
+        &done,
+        [](void* context) { request_in_metric(context); },
+        [&controller](void* /*unused*/) { request_out_metric(&controller); });
+    api_service::write_http_error(
+        &controller,
+        Status(StatusCode::RESOURCE_EXHAUSTED,
+               "concurrency limit reached",
+               FailureReason::CONCURRENCY_LIMIT_REACHED));
+  }
+  EXPECT_EQ(done.count(), 1);
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before + 1);
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failed_before + 1);
+}
 
 TEST(RequestAdmissionTest, UnsupportedModelDoesNotConsumeConcurrencySlot) {
   ServiceConfig::get_instance().max_concurrent_requests(1);

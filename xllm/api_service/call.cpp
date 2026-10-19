@@ -22,11 +22,10 @@ limitations under the License.
 #include "core/util/verbose_trace_logger.h"
 
 namespace xllm {
-void Call::record_error(const Status& status) {
+void Call::record_error() {
   response_complete_ = false;
-  if (status.reason() == FailureReason::CONCURRENCY_LIMIT_REACHED) {
-    COUNTER_INC(server_request_total_limit);
-  }
+  // RateLimiter counts admission rejections; rendering the error must not
+  // count the same request again.
 }
 
 void Call::record_result(bool connected) const {

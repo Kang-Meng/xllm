@@ -112,7 +112,7 @@ class StreamCall : public Call {
     if (stream_ && stream_finished_) {
       return false;
     }
-    record_error(status);
+    record_error();
     if (!is_http_request_) {
       controller_->SetFailed(status.message());
       return true;

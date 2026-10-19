@@ -66,7 +66,7 @@ class Call {
  protected:
   void init(std::string body_x_request_id, bool is_http_request);
   void record_result(bool connected) const;
-  void record_error(const Status& status);
+  void record_error();
 
  protected:
   brpc::Controller* controller_;
