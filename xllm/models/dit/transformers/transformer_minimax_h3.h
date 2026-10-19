@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/framework/state_dict/utils.h"
 #include "core/layers/common/linear.h"
 #if defined(USE_NPU)
+#include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "models/dit/utils/dit_block_weight_manager.h"
 #endif
@@ -72,7 +73,25 @@ class H3RMSNormImpl final : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& input) const {
+#if defined(USE_NPU)
+    return kernel::npu::rms_norm(input, weight_, eps_, /*mode=*/"rmsnorm");
+#else
     return rms_norm(input, weight_, eps_);
+#endif
+  }
+
+  // Returns the normalized output and the residual sum for the next branch.
+  std::pair<torch::Tensor, torch::Tensor> forward_with_residual(
+      const torch::Tensor& input,
+      const torch::Tensor& residual) const {
+#if defined(USE_NPU)
+    const auto outputs =
+        kernel::npu::add_rms_norm(input, residual, weight_, eps_);
+    return {std::get<0>(outputs), std::get<2>(outputs)};
+#else
+    torch::Tensor residual_sum = input + residual;
+    return {forward(residual_sum), residual_sum};
+#endif
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -124,8 +143,12 @@ class H3SwiGLUFFNImpl final : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& hidden_states) {
     torch::Tensor x = proj_in_->forward(hidden_states);
-    std::vector<torch::Tensor> chunks = x.chunk(2, -1);
+#if defined(USE_NPU)
+    torch::Tensor activation = kernel::npu::active(x, /*act_mode=*/"swiglu");
+#else
+    std::vector<torch::Tensor> chunks = x.chunk(2, /*dim=*/-1);
     torch::Tensor activation = chunks[0] * torch::silu(chunks[1]);
+#endif
     return proj_out_->forward(activation);
   }
 
@@ -134,7 +157,24 @@ class H3SwiGLUFFNImpl final : public torch::nn::Module {
         state_dict.get_dict_with_prefix("net.0.proj.");
     const int64_t tp_size = tp_group_ == nullptr ? 1 : tp_group_->world_size();
     if (tp_size == 1) {
+#if defined(USE_NPU)
+      // NPU SwiGLU consumes [gate, up]; the checkpoint stores [up, gate].
+      const StateDict reordered_proj_in_state =
+          proj_in_state.get_dict_with_prefix(
+              /*prefix=*/"",
+              [](const std::string& name,
+                 const torch::Tensor& tensor) -> torch::Tensor {
+                if (name != "weight") {
+                  return tensor;
+                }
+                const std::vector<torch::Tensor> chunks =
+                    tensor.chunk(/*chunks=*/2, /*dim=*/0);
+                return torch::cat({chunks[1], chunks[0]}, /*dim=*/0);
+              });
+      proj_in_->load_state_dict(reordered_proj_in_state);
+#else
       proj_in_->load_state_dict(proj_in_state);
+#endif
     } else {
       const int64_t tp_rank = tp_group_->rank();
       torch::Tensor weight = proj_in_state.get_tensor("weight");
@@ -146,9 +186,15 @@ class H3SwiGLUFFNImpl final : public torch::nn::Module {
             weight.slice(0, 0, ffn_dim).chunk(tp_size, 0);
         std::vector<torch::Tensor> gate_shards =
             weight.slice(0, ffn_dim).chunk(tp_size, 0);
+#if defined(USE_NPU)
         torch::Tensor local_weight =
-            torch::cat({up_shards[tp_rank], gate_shards[tp_rank]}, 0)
+            torch::cat({gate_shards[tp_rank], up_shards[tp_rank]}, /*dim=*/0)
                 .to(options_);
+#else
+        torch::Tensor local_weight =
+            torch::cat({up_shards[tp_rank], gate_shards[tp_rank]}, /*dim=*/0)
+                .to(options_);
+#endif
         for (auto& parameter : proj_in_->named_parameters()) {
           if (parameter.key() == "weight") {
             CHECK_EQ(parameter.value().sizes(), local_weight.sizes());
@@ -297,13 +343,19 @@ inline torch::Tensor h3_apply_rotary(const torch::Tensor& hidden_states,
   int64_t rotary_dim = cos.size(-1);
   torch::Tensor rotary = hidden_states.slice(-1, 0, rotary_dim);
   torch::Tensor pass = hidden_states.slice(-1, rotary_dim);
-  auto chunks = rotary.chunk(2, -1);
-  torch::Tensor rotated = torch::cat({-chunks[1], chunks[0]}, -1);
   torch::Tensor cos_b =
       cos.to(hidden_states.scalar_type()).unsqueeze(0).unsqueeze(2);
   torch::Tensor sin_b =
       sin.to(hidden_states.scalar_type()).unsqueeze(0).unsqueeze(2);
+#if defined(USE_NPU)
+  rotary = at_npu::native::custom_ops::npu_rotary_mul(
+      rotary, cos_b, sin_b, /*rotary_mode=*/"half");
+#else
+  const std::vector<torch::Tensor> chunks =
+      rotary.chunk(/*chunks=*/2, /*dim=*/-1);
+  torch::Tensor rotated = torch::cat({-chunks[1], chunks[0]}, /*dim=*/-1);
   rotary = rotary * cos_b + rotated * sin_b;
+#endif
   return torch::cat({rotary, pass}, -1).contiguous();
 }
 
@@ -530,8 +582,7 @@ class H3TokenRefinerBlockImpl final : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& hidden_states) {
     torch::Tensor norm1 = norm1_->forward(hidden_states);
     torch::Tensor attention = attn_->forward(norm1);
-    torch::Tensor h = hidden_states + attention;
-    torch::Tensor norm2 = norm2_->forward(h);
+    auto [norm2, h] = norm2_->forward_with_residual(hidden_states, attention);
     h = h + ff_->forward(norm2);
     return h;
   }
@@ -704,11 +755,12 @@ class H3TransformerBlockImpl final : public torch::nn::Module {
 
     torch::Tensor norm_h = norm1_->forward(hidden_states);
     norm_h = norm_h * (1.0 + scale_msa) + shift_msa;
-    torch::Tensor h =
-        hidden_states + gate_msa * attn_->forward(norm_h, cos, sin);
-    norm_h = norm2_->forward(h);
-    norm_h = norm_h * (1.0 + scale_mlp) + shift_mlp;
-    h = h + gate_mlp * ff_->forward(norm_h);
+    torch::Tensor attention_update =
+        gate_msa * attn_->forward(norm_h, cos, sin);
+    auto [norm_mlp, h] =
+        norm2_->forward_with_residual(hidden_states, attention_update);
+    norm_mlp = norm_mlp * (1.0 + scale_mlp) + shift_mlp;
+    h = h + gate_mlp * ff_->forward(norm_mlp);
     return h;
   }
 
