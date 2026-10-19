@@ -45,6 +45,29 @@ TEST(KVCacheStateTest, LinearBlocksPreserveUnallocatedLogicalIntervals) {
   EXPECT_EQ(state.get_linear_block_id(), 2);
 }
 
+TEST(KVCacheStateTest, SparseNonLinearMountKeepsLogicalLength) {
+  KVCacheState state;
+  state.mount_composite_shared(
+      BlockType::SWA,
+      {Block(), Block(), Block(/*id=*/4, /*allocator=*/nullptr)});
+
+  EXPECT_EQ(state.shared_blocks_num(BlockType::SWA), 3u);
+  EXPECT_EQ(state.num_cached_blocks(BlockType::SWA), 3u);
+}
+
+TEST(KVCacheStateTest, SparseReplacementSeparatesSharedCountFromCacheCursor) {
+  KVCacheState state;
+  state.replace_composite_blocks(
+      BlockType::LINEAR,
+      {Block(), Block(), Block(/*id=*/9, /*allocator=*/nullptr)},
+      /*num_shared_blocks=*/1,
+      /*cache_publish_cursor=*/3);
+
+  EXPECT_EQ(state.shared_blocks_num(BlockType::LINEAR), 1u);
+  EXPECT_EQ(state.num_cached_blocks(BlockType::LINEAR), 3u);
+  EXPECT_EQ(state.shared_tokens_num(), 0u);
+}
+
 TEST(KVCacheStateTest, TransferCursorTracksAndResets) {
   KVCacheState state;
   EXPECT_EQ(state.next_transfer_block_idx(), 0u);

@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/request/sequence.h"
 
 namespace xllm {
@@ -212,6 +213,19 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
   std::vector<Block> blocks = host_state.take_blocks(BlockType::LINEAR);
   const size_t keep = std::min(max_hit_tokens / block_size(), blocks.size());
 
+  if (VLOG_IS_ON(10)) {
+    size_t valid_count = 0;
+    for (const auto& block : blocks) {
+      if (block.is_valid()) {
+        ++valid_count;
+      }
+    }
+    VLOG(10) << "[trim_prefetch_blocks] max_hit_tokens=" << max_hit_tokens
+             << " block_size=" << block_size() << " keep=" << keep
+             << " blocks.size=" << blocks.size()
+             << " valid_count=" << valid_count;
+  }
+
   // A Linear checkpoint vector is a logical index space. Keep only the
   // deepest valid checkpoint in the accepted gate range; all other physical
   // aliases, including valid blocks after the range, are temporary Store
@@ -224,11 +238,16 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
     }
   }
 
+  VLOG(10) << "[trim_prefetch_blocks] source_index=" << source_index
+           << " (source_index < keep)=" << (source_index < keep);
+
   std::vector<Block> to_release;
   to_release.reserve(blocks.size());
   Block source;
   if (source_index < keep) {
     source = blocks[source_index];
+    VLOG(10) << "[trim_prefetch_blocks] source extracted, is_valid="
+             << source.is_valid();
   }
   for (size_t index = 0; index < blocks.size(); ++index) {
     if (!blocks[index].is_valid() || index == source_index) {
@@ -244,6 +263,8 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
     host_state.erase_blocks(BlockType::LINEAR);
     return;
   }
+
+  VLOG(10) << "[trim_prefetch_blocks] retaining source, publishing to cache";
 
   // LinearStatePrefixCache needs the absolute checkpoint index to derive the
   // chained key. Publish through a sparse logical vector, then collapse the

@@ -181,7 +181,9 @@ class FakeOffloadEngine final : public Engine {
   std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
       uint32_t,
       const std::vector<BlockTransferInfo>& transfer_infos) override {
+    transfer_infos_ = transfer_infos;
     transfer_count_ = static_cast<uint32_t>(transfer_infos.size());
+    promises_.clear();
     promises_.resize(2);
     std::vector<folly::SemiFuture<uint32_t>> results;
     results.reserve(promises_.size());
@@ -195,8 +197,13 @@ class FakeOffloadEngine final : public Engine {
     promises_.at(index).setValue(success ? transfer_count_ : 0u);
   }
 
+  const std::vector<BlockTransferInfo>& transfer_infos() const {
+    return transfer_infos_;
+  }
+
  private:
   uint32_t transfer_count_ = 0;
+  std::vector<BlockTransferInfo> transfer_infos_;
   std::vector<folly::Promise<uint32_t>> promises_;
 };
 
@@ -480,6 +487,32 @@ bool allocate_with_host_cache_budget(HierarchyBlockManagerPool* pool,
   pool->trim_host_cache(sequence, selected);
   return pool->allocate(sequence, num_tokens);
 }
+
+struct LinearTailPrefetchCase {
+  int32_t chunk_stride;
+  int32_t kv_block_size;
+  size_t prompt_tokens;
+  bool seed_regular_checkpoints;
+};
+
+class LinearTailHostPrefetchTest
+    : public ::testing::TestWithParam<LinearTailPrefetchCase> {
+ protected:
+  void SetUp() override {
+    int32_t& chunk_stride =
+        SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+    original_chunk_stride_ = chunk_stride;
+    chunk_stride = GetParam().chunk_stride;
+  }
+
+  void TearDown() override {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride_;
+  }
+
+ private:
+  int32_t original_chunk_stride_ = 0;
+};
 
 }  // namespace
 
@@ -2900,13 +2933,381 @@ TEST(HierarchyBlockManagerPoolTest,
 }
 
 TEST(HierarchyBlockManagerPoolTest,
+     LinearTailHostPrefetchKeepsMatchedStateWithoutRegularUnit) {
+  constexpr size_t kChunkStride = 8192;
+  constexpr size_t kPromptTokens = 8191;
+  constexpr size_t kTailTokens = 8064;
+  constexpr size_t kKvBlockSize = 128;
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.enable_linear_state(true)
+      .linear_state_num_slots(80)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 80}})
+      .enable_kvcache_store(true);
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      static_cast<int32_t>(kChunkStride);
+
+  HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+  const auto& host = HierarchyPoolTestPeer::host_leaves(pool);
+  const std::vector<int32_t> tokens(kPromptTokens, 7);
+  seed_host_prefix(host.at(BlockType::KV).leaf.get(), tokens);
+
+  Sequence hash_sequence = make_test_sequence(/*index=*/0, tokens);
+  hash_sequence.update_block_hashes(kKvBlockSize, BlockHasherType::TEXT);
+  std::vector<Block> tail_blocks = host.at(BlockType::LINEAR).leaf->allocate(1);
+  ASSERT_EQ(tail_blocks.size(), 1u);
+  ASSERT_GE(hash_sequence.block_hashes().size(), kTailTokens / kKvBlockSize);
+  tail_blocks.front().set_hash_value(
+      hash_sequence.block_hashes()[kTailTokens / kKvBlockSize - 1].data);
+  host.at(BlockType::LINEAR).leaf->cache(tail_blocks);
+  host.at(BlockType::LINEAR).leaf->deallocate(std::move(tail_blocks));
+
+  std::shared_ptr<Request> request = make_test_request(tokens);
+  Sequence* sequence = request->sequences().front().get();
+  bool completed = false;
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(sequence->host_kv_state().prefix_cache_matched());
+  EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), kTailTokens);
+  EXPECT_EQ(sequence->host_kv_state().shared_blocks_num(BlockType::KV),
+            kTailTokens / kKvBlockSize);
+  ASSERT_EQ(sequence->host_kv_state().num_blocks(BlockType::LINEAR),
+            kTailTokens / kKvBlockSize);
+  EXPECT_TRUE(
+      sequence->host_kv_state().blocks(BlockType::LINEAR).back().is_valid());
+  EXPECT_EQ(sequence->host_kv_state().num_cached_blocks(BlockType::LINEAR),
+            kTailTokens / kKvBlockSize);
+
+  pool.deallocate(sequence);
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      original_chunk_stride;
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     LinearStorePrefetchRestoresPartialTailCheckpoint) {
+  constexpr int32_t kChunkStride = 2048;
+  constexpr int32_t kKvBlockSize = 128;
+  constexpr size_t kPromptTokens = 10067;
+  constexpr size_t kTailTokens = 9984;
+  constexpr size_t kTailUnitTokens = kTailTokens - 4 * kChunkStride;
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  auto restore_chunk_stride = folly::makeGuard([original_chunk_stride]() {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kChunkStride;
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(kKvBlockSize)
+      .enable_linear_state(true)
+      .linear_state_num_slots(80)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 80}})
+      .enable_kvcache_store(true)
+      .prefetch_batch_size(8);
+  FakePrefetchEngine engine(/*worker_count=*/1,
+                            /*timeout_ms=*/-1,
+                            /*batch_size=*/8);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  std::shared_ptr<Request> request =
+      make_test_request(std::vector<int32_t>(kPromptTokens, 17));
+  Sequence* sequence = request->sequences().front().get();
+  bool completed = false;
+
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+
+  ASSERT_NE(engine.result(), nullptr);
+  ASSERT_EQ(engine.request().units.size(), 5u);
+  EXPECT_EQ(engine.request().units.back().gated_blocks.size() * kKvBlockSize,
+            kTailUnitTokens);
+  EXPECT_EQ(engine.request().units.back().non_gated_blocks.size(), 1u);
+
+  const size_t transfer_count =
+      engine.request().batch_transfer_count(0, engine.request().units.size());
+  engine.finish_worker_with_logical_hits(
+      /*worker_index=*/0, std::vector<uint8_t>(transfer_count, 1));
+
+  ASSERT_TRUE(completed);
+  EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), kTailTokens);
+  EXPECT_EQ(sequence->host_kv_state().num_cached_blocks(BlockType::LINEAR),
+            kTailTokens / kKvBlockSize);
+  const Slice<Block> linear_blocks =
+      sequence->host_kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(linear_blocks.size(), kTailTokens / kKvBlockSize);
+  EXPECT_TRUE(linear_blocks.back().is_valid());
+  pool.deallocate(sequence);
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     LinearStorePrefetchDoesNotRepeatMatchedPartialUnit) {
+  constexpr int32_t kChunkStride = 2048;
+  constexpr int32_t kKvBlockSize = 128;
+  constexpr size_t kPromptTokens = 10195;
+  constexpr size_t kMatchedTailTokens = 9984;
+  constexpr size_t kTargetTailTokens = 10112;
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  auto restore_chunk_stride = folly::makeGuard([original_chunk_stride]() {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kChunkStride;
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(kKvBlockSize)
+      .enable_linear_state(true)
+      .linear_state_num_slots(80)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 80}})
+      .enable_kvcache_store(true)
+      .prefetch_batch_size(8);
+  FakePrefetchEngine engine(/*worker_count=*/1,
+                            /*timeout_ms=*/-1,
+                            /*batch_size=*/8);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const auto& host = HierarchyPoolTestPeer::host_leaves(pool);
+  const std::vector<int32_t> cached_tokens(kMatchedTailTokens, 17);
+  seed_host_prefix(host.at(BlockType::KV).leaf.get(), cached_tokens);
+
+  Sequence hash_sequence = make_test_sequence(
+      /*index=*/0, std::vector<int32_t>(kPromptTokens, 17));
+  hash_sequence.update_block_hashes(kKvBlockSize, BlockHasherType::TEXT);
+  std::vector<Block> tail_blocks = host.at(BlockType::LINEAR).leaf->allocate(1);
+  ASSERT_EQ(tail_blocks.size(), 1u);
+  tail_blocks.front().set_hash_value(
+      hash_sequence.block_hashes()[kMatchedTailTokens / kKvBlockSize - 1].data);
+  host.at(BlockType::LINEAR).leaf->cache(tail_blocks);
+  host.at(BlockType::LINEAR).leaf->deallocate(std::move(tail_blocks));
+
+  std::shared_ptr<Request> request =
+      make_test_request(std::vector<int32_t>(kPromptTokens, 17));
+  Sequence* sequence = request->sequences().front().get();
+  bool completed = false;
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+
+  ASSERT_NE(engine.result(), nullptr);
+  ASSERT_EQ(engine.request().units.size(), 1u);
+  EXPECT_EQ(engine.request().units.front().gated_blocks.size() * kKvBlockSize,
+            kTargetTailTokens - kMatchedTailTokens);
+  EXPECT_EQ(engine.request().units.front().non_gated_blocks.size(), 1u);
+
+  const size_t transfer_count =
+      engine.request().batch_transfer_count(0, engine.request().units.size());
+  engine.finish_worker_with_logical_hits(
+      /*worker_index=*/0, std::vector<uint8_t>(transfer_count, 1));
+
+  ASSERT_TRUE(completed);
+  EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), kTargetTailTokens);
+  EXPECT_EQ(sequence->host_kv_state().num_cached_blocks(BlockType::LINEAR),
+            kTargetTailTokens / kKvBlockSize);
+  pool.deallocate(sequence);
+}
+
+TEST_P(LinearTailHostPrefetchTest,
+       RetainsTailBoundaryWithoutPublishingRegularCheckpoint) {
+  const LinearTailPrefetchCase& test_case = GetParam();
+  const size_t kv_block_size = static_cast<size_t>(test_case.kv_block_size);
+  const size_t chunk_stride = static_cast<size_t>(test_case.chunk_stride);
+  const size_t tail_tokens =
+      test_case.prompt_tokens / kv_block_size * kv_block_size;
+  const size_t checkpoint_count = tail_tokens / chunk_stride;
+  ASSERT_GT(tail_tokens, chunk_stride);
+  ASSERT_NE(tail_tokens % chunk_stride, 0u);
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(test_case.kv_block_size)
+      .enable_linear_state(true)
+      .linear_state_num_slots(80)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 80}})
+      .enable_kvcache_store(true);
+  FakePrefetchEngine engine(/*worker_count=*/1);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const auto& host = HierarchyPoolTestPeer::host_leaves(pool);
+  BlockManager* linear_leaf = host.at(BlockType::LINEAR).leaf.get();
+  const std::vector<int32_t> tokens(test_case.prompt_tokens, 7);
+  seed_host_prefix(host.at(BlockType::KV).leaf.get(), tokens);
+
+  Sequence hash_sequence = make_test_sequence(/*index=*/0, tokens);
+  hash_sequence.update_block_hashes(test_case.kv_block_size,
+                                    BlockHasherType::TEXT);
+  std::vector<int32_t> regular_block_ids;
+  regular_block_ids.reserve(checkpoint_count);
+  if (test_case.seed_regular_checkpoints) {
+    // The cache API keeps the final slot live and publishes preceding slots.
+    std::vector<Block> regular_blocks =
+        linear_leaf->allocate(checkpoint_count + 1);
+    ASSERT_EQ(regular_blocks.size(), checkpoint_count + 1);
+    for (size_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+      regular_block_ids.emplace_back(regular_blocks[checkpoint].id());
+    }
+    linear_leaf->cache(tokens,
+                       regular_blocks,
+                       /*existed_shared_blocks_num=*/0,
+                       hash_sequence.mm_data(),
+                       hash_sequence.block_hashes());
+    linear_leaf->deallocate(std::move(regular_blocks));
+  }
+
+  std::vector<Block> tail_blocks = linear_leaf->allocate(1);
+  ASSERT_EQ(tail_blocks.size(), 1u);
+  const int32_t tail_block_id = tail_blocks.front().id();
+  tail_blocks.front().set_hash_value(
+      hash_sequence.block_hashes()[tail_tokens / kv_block_size - 1].data);
+  linear_leaf->cache(tail_blocks);
+  linear_leaf->deallocate(std::move(tail_blocks));
+
+  std::shared_ptr<Request> request = make_test_request(tokens);
+  Sequence* sequence = request->sequences().front().get();
+  bool completed = false;
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+
+  ASSERT_TRUE(completed);
+  EXPECT_TRUE(sequence->host_kv_state().prefix_cache_matched());
+  EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), tail_tokens);
+  EXPECT_EQ(sequence->host_kv_state().num_cached_blocks(BlockType::LINEAR),
+            tail_tokens / kv_block_size);
+  const Slice<Block> retained =
+      sequence->host_kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(retained.size(), tail_tokens / kv_block_size);
+  ASSERT_TRUE(retained.back().is_valid());
+  EXPECT_EQ(retained.back().id(), tail_block_id);
+  EXPECT_TRUE(XXH3Key(retained.back().get_immutable_hash_value()) ==
+              hash_sequence.block_hashes()[tail_tokens / kv_block_size - 1]);
+  pool.deallocate(sequence);
+
+  // Each shorter prompt ends one token beyond a regular boundary, so a hit
+  // must restore that exact checkpoint rather than the deeper tail state.
+  CompositeBlockManager* host_manager =
+      HierarchyPoolTestPeer::host_block_managers(pool).front().get();
+  for (size_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+    const size_t boundary = (checkpoint + 1) * chunk_stride;
+    SCOPED_TRACE(boundary);
+    const std::vector<int32_t> shorter_tokens(tokens.begin(),
+                                              tokens.begin() + boundary + 1);
+    Sequence shorter = make_test_sequence(/*index=*/1, shorter_tokens);
+    host_manager->allocate_shared_for_sequence(&shorter,
+                                               shorter.host_kv_state());
+    const Slice<Block> source =
+        shorter.host_kv_state().blocks(BlockType::LINEAR);
+    if (test_case.seed_regular_checkpoints) {
+      EXPECT_EQ(shorter.host_kv_state().kv_cache_tokens_num(), boundary);
+      ASSERT_FALSE(source.empty());
+      EXPECT_EQ(source.back().id(), regular_block_ids[checkpoint]);
+      EXPECT_NE(source.back().id(), tail_block_id);
+    } else {
+      EXPECT_EQ(shorter.host_kv_state().kv_cache_tokens_num(), 0u);
+      EXPECT_TRUE(source.empty());
+    }
+    pool.deallocate(&shorter);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MultiChunkTail,
+    LinearTailHostPrefetchTest,
+    ::testing::Values(LinearTailPrefetchCase{8, 4, 13, false},
+                      LinearTailPrefetchCase{8, 4, 13, true},
+                      LinearTailPrefetchCase{8, 4, 21, false},
+                      LinearTailPrefetchCase{8, 4, 21, true},
+                      LinearTailPrefetchCase{8192, 128, 9000, false},
+                      LinearTailPrefetchCase{8192, 128, 9000, true}));
+
+TEST(HierarchyBlockManagerPoolTest,
+     LinearTailHostOffloadBecomesVisibleAfterAllWorkersComplete) {
+  constexpr int32_t kChunkStride = 8;
+  constexpr int32_t kKvBlockSize = 4;
+  constexpr size_t kTailTokens = 12;
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  auto restore_chunk_stride = folly::makeGuard([original_chunk_stride]() {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kChunkStride;
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(kKvBlockSize)
+      .enable_linear_state(true)
+      .linear_state_num_slots(64)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 64}});
+  FakeOffloadEngine engine;
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const std::vector<int32_t> tokens(kTailTokens + 1, 19);
+  Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+
+  ASSERT_TRUE(pool.allocate(&sequence, kChunkStride));
+  sequence.kv_state().set_kv_cache_tokens_num(kChunkStride);
+  ASSERT_TRUE(pool.allocate(&sequence, kTailTokens));
+  pool.transfer_blocks();
+  engine.finish_worker(/*index=*/0, /*success=*/true);
+  engine.finish_worker(/*index=*/1, /*success=*/true);
+
+  sequence.kv_state().set_kv_cache_tokens_num(kTailTokens);
+  ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
+  const Slice<Block> device_linear =
+      sequence.kv_state().blocks(BlockType::LINEAR);
+  const Slice<Block> host_linear =
+      sequence.host_kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(device_linear.size(), 2u);
+  ASSERT_EQ(host_linear.size(), 2u);
+  const int32_t source_id = device_linear.front().id();
+  const int32_t destination_id = host_linear.front().id();
+  pool.transfer_blocks();
+  const auto linear_transfer =
+      std::find_if(engine.transfer_infos().begin(),
+                   engine.transfer_infos().end(),
+                   [](const BlockTransferInfo& info) {
+                     return info.block_type == BlockType::LINEAR;
+                   });
+  ASSERT_NE(linear_transfer, engine.transfer_infos().end());
+  EXPECT_EQ(linear_transfer->src_block_id, source_id);
+  EXPECT_EQ(linear_transfer->dst_block_id, destination_id);
+  engine.finish_worker(/*index=*/0, /*success=*/true);
+  engine.finish_worker(/*index=*/1, /*success=*/true);
+
+  Sequence restored = make_test_sequence(/*index=*/2, tokens);
+  CompositeBlockManager* host_manager =
+      HierarchyPoolTestPeer::host_block_managers(pool).front().get();
+  host_manager->allocate_shared_for_sequence(&restored,
+                                             restored.host_kv_state());
+  EXPECT_EQ(restored.host_kv_state().kv_cache_tokens_num(), kTailTokens);
+  const Slice<Block> restored_linear =
+      restored.host_kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(restored_linear.size(), kTailTokens / kKvBlockSize);
+  ASSERT_TRUE(restored_linear.back().is_valid());
+  EXPECT_EQ(restored_linear.back().id(), destination_id);
+  EXPECT_FALSE(pool.has_pending_async_block_release());
+  pool.deallocate(&restored);
+  pool.deallocate(&sequence);
+  HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+}
+
+TEST(HierarchyBlockManagerPoolTest,
      DecodeLinearOffloadUsesCanonicalMtpCheckpointHash) {
   constexpr int32_t kCheckpointStride = 8;
+  constexpr int32_t kKvBlockSize = 2;
   constexpr size_t kAcceptedLength = 3;
   BlockManagerPool::Options options = make_flat_kv_options();
   options.enable_linear_state(true)
+      .block_size(kKvBlockSize)
       .linear_state_num_slots(64)
-      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 64}})
+      .host_num_blocks_by_type({{BlockType::LINEAR, 64}})
       .enable_prefix_cache(false)
       .enable_disagg_pd(true)
       .instance_is_decode(true)
@@ -2947,9 +3348,11 @@ TEST(HierarchyBlockManagerPoolTest,
   sequence.set_accepted_length(kAcceptedLength);
   ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
 
+  sequence.update_linear_state_hashes(static_cast<uint32_t>(kKvBlockSize));
   const Slice<XXH3Key> checkpoint_hashes = sequence.linear_state_hashes();
-  ASSERT_EQ(checkpoint_hashes.size(), 1u);
-  const XXH3Key expected_hash = checkpoint_hashes.front();
+  const size_t checkpoint_hash_index = kCheckpointStride / kKvBlockSize - 1;
+  ASSERT_GT(checkpoint_hashes.size(), checkpoint_hash_index);
+  const XXH3Key expected_hash = checkpoint_hashes[checkpoint_hash_index];
 
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
@@ -3044,9 +3447,9 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_EQ(sequence->kv_cache_tokens_num(), 512u);
   const Slice<Block> linear_blocks =
       sequence->host_kv_state().blocks(BlockType::LINEAR);
-  ASSERT_EQ(linear_blocks.size(), 1u);
-  EXPECT_TRUE(linear_blocks[0].is_valid());
-  EXPECT_EQ(sequence->host_kv_state().num_cached_blocks(BlockType::LINEAR), 1u);
+  ASSERT_EQ(linear_blocks.size(), 4u);
+  EXPECT_TRUE(linear_blocks.back().is_valid());
+  EXPECT_EQ(sequence->host_kv_state().num_cached_blocks(BlockType::LINEAR), 4u);
 
   const HostCacheRestorePoint restore =
       pool.select_host_cache_restore(sequence, /*max_copy_units=*/4);
@@ -3084,7 +3487,7 @@ TEST(HierarchyBlockManagerPoolTest,
   // Host while its KV prefix is absent, then fetch a private duplicate.
   std::shared_ptr<Request> request = make_test_request(tokens);
   Sequence* sequence = request->sequences().front().get();
-  sequence->update_linear_state_hashes(/*chunk_stride=*/128);
+  sequence->update_block_hashes(/*block_size=*/128, BlockHasherType::TEXT);
   BlockManager* linear_leaf = host.at(BlockType::LINEAR).leaf.get();
   std::vector<Block> checkpoints = linear_leaf->allocate(/*n_blocks=*/5);
   ASSERT_EQ(checkpoints.size(), 5u);
@@ -3092,7 +3495,7 @@ TEST(HierarchyBlockManagerPoolTest,
                      checkpoints,
                      /*existed_shared_blocks_num=*/0,
                      MMData(),
-                     sequence->linear_state_hashes());
+                     sequence->block_hashes());
   linear_leaf->deallocate(std::move(checkpoints));
   bool completed = false;
   pool.prefetch_from_storage(
@@ -3108,10 +3511,12 @@ TEST(HierarchyBlockManagerPoolTest,
       pool.select_host_cache_restore(sequence, /*max_copy_units=*/4);
   ASSERT_EQ(restore.restore_target_tokens, 512u);
   pool.trim_host_cache(sequence, restore);
-  ASSERT_EQ(sequence->host_kv_state().num_blocks(BlockType::LINEAR), 1u);
-  ASSERT_EQ(
-      sequence->host_kv_state().blocks(BlockType::LINEAR).front().ref_count(),
-      1u);
+  const Slice<Block> host_linear_blocks =
+      sequence->host_kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(host_linear_blocks.size(), 4u);
+  EXPECT_EQ(count_valid_blocks(host_linear_blocks), 1u);
+  ASSERT_TRUE(host_linear_blocks.back().is_valid());
+  EXPECT_EQ(host_linear_blocks.back().ref_count(), 1u);
   ASSERT_TRUE(pool.allocate(sequence, tokens.size()));
   EXPECT_EQ(sequence->kv_state().kv_cache_tokens_num(), 512u);
   EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), 512u);
@@ -3201,11 +3606,11 @@ TEST(HierarchyBlockManagerPoolTest,
 
     const auto stored_keys =
         HierarchyPoolTestPeer::complete_offload_pairs(pool);
-    sequence.update_linear_state_hashes(kCheckpointStride);
+    sequence.update_block_hashes(kCheckpointStride, BlockHasherType::TEXT);
     const size_t checkpoint_index = completed_tokens / kCheckpointStride - 1;
     const std::string checkpoint_key(
         reinterpret_cast<const char*>(
-            sequence.linear_state_hashes()[checkpoint_index].data),
+            sequence.block_hashes()[checkpoint_index].data),
         XXH3_128BITS_HASH_VALUE_LEN);
     EXPECT_TRUE(stored_keys.contains({BlockType::LINEAR, checkpoint_key}));
     HierarchyPoolTestPeer::collect_offload_pairs(pool, &sequence);

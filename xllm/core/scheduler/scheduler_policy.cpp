@@ -111,6 +111,54 @@ void restore_skipped_requests(
   }
 }
 
+size_t maybe_cap_linear_state_prefill_chunk(size_t current_tokens,
+                                            size_t candidate_tokens,
+                                            const SchedulerState& state,
+                                            size_t prompt_tokens) {
+  if (candidate_tokens == 0 || !state.enable_prefix_cache ||
+      !has_linear_attention_layers(state.model_args) ||
+      state.kv_cache_manager == nullptr) {
+    return candidate_tokens;
+  }
+  // Decode does not publish LINEAR checkpoints, so its prefill chunks stay
+  // on the normal token budget.
+  if (state.options.instance_role().has_value() &&
+      state.options.instance_role().value() == InstanceRole::DECODE) {
+    return candidate_tokens;
+  }
+
+  const int32_t checkpoint_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const int32_t block_size = state.kv_cache_manager->block_size();
+  if (checkpoint_stride <= 0 || block_size <= 0) {
+    return candidate_tokens;
+  }
+
+  // Align to next checkpoint boundary
+  const size_t stride = static_cast<size_t>(checkpoint_stride);
+  const size_t offset = current_tokens % stride;
+  size_t tokens_to_next_checkpoint = (offset == 0) ? stride : (stride - offset);
+
+  // Handle tail checkpoint (unaligned prompt end)
+  // If prompt length is not aligned to checkpoint_stride and exceeds one block,
+  // we need to stop at the last block-aligned position before the prompt end.
+  const size_t block_aligned_tail =
+      (prompt_tokens / static_cast<size_t>(block_size)) *
+      static_cast<size_t>(block_size);
+
+  const bool has_unaligned_tail =
+      (prompt_tokens > static_cast<size_t>(block_size)) &&
+      (block_aligned_tail != prompt_tokens) &&
+      (block_aligned_tail % stride != 0);
+
+  if (has_unaligned_tail && block_aligned_tail > current_tokens) {
+    tokens_to_next_checkpoint = std::min(tokens_to_next_checkpoint,
+                                         block_aligned_tail - current_tokens);
+  }
+
+  return std::min(candidate_tokens, tokens_to_next_checkpoint);
+}
+
 }  // namespace
 
 // =============================================================================
@@ -495,7 +543,8 @@ size_t SchedulerPolicy::compute_prefill_tokens(Sequence* seq,
                                            state.kv_cache_manager->block_size(),
                                            remaining_in_seq);
 
-  return num_tokens;
+  return maybe_cap_linear_state_prefill_chunk(
+      kv_cache_tokens_num, num_tokens, state, seq->num_prompt_tokens());
 }
 
 bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
@@ -512,6 +561,10 @@ bool SchedulerPolicy::allocate_for_prefill(Sequence* seq,
     *actual_tokens = seq->num_need_compute_tokens();
     target_tokens = cached_tokens + *actual_tokens;
   } else {
+    // Shared prefix matching can advance cached tokens after the chunk budget
+    // was computed. Recap so the chunk still ends on a linear checkpoint.
+    token_budget = maybe_cap_linear_state_prefill_chunk(
+        cached_tokens, token_budget, state, seq->num_prompt_tokens());
     target_tokens = std::min(cached_tokens + token_budget, seq->num_tokens());
     CHECK_GT(target_tokens, cached_tokens);
     *actual_tokens = target_tokens - cached_tokens;

@@ -39,6 +39,7 @@ limitations under the License.
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/config/scheduler_config.h"
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request.h"
@@ -47,6 +48,30 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+// allocate_decode reads the process-global chunk size. Scheduler Options do
+// not publish it, so a test that declares a chunk must install the same value
+// here and restore the previous one when it returns.
+class ScopedPrefillChunkSize final {
+ public:
+  explicit ScopedPrefillChunkSize(int32_t chunk_size)
+      : previous_(SchedulerConfig::get_instance()
+                      .max_tokens_per_chunk_for_prefill()) {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        chunk_size;
+  }
+
+  ~ScopedPrefillChunkSize() {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        previous_;
+  }
+
+  ScopedPrefillChunkSize(const ScopedPrefillChunkSize&) = delete;
+  ScopedPrefillChunkSize& operator=(const ScopedPrefillChunkSize&) = delete;
+
+ private:
+  int32_t previous_;
+};
 
 class FakeTokenizer final : public Tokenizer {
  public:
@@ -608,6 +633,7 @@ TEST(DisaggPDSchedulerTest, GroupedPullAlignsActiveSwaSuffix) {
 }
 
 TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
+  ScopedPrefillChunkSize chunk_size(/*chunk_size=*/32);
   FakeEngine engine(/*num_blocks=*/8,
                     /*block_size=*/2,
                     /*num_speculative_tokens=*/1,

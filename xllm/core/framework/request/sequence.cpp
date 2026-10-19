@@ -1082,11 +1082,11 @@ void Sequence::invalidate_block_hashes_from(size_t token_index) {
   }
 }
 
-void Sequence::update_linear_state_hashes(uint32_t chunk_stride) {
-  if (chunk_stride == 0) {
+void Sequence::update_linear_state_hashes(uint32_t block_size) {
+  if (block_size == 0) {
     return;
   }
-  linear_hash_stride_ = chunk_stride;
+  linear_hash_stride_ = block_size;
   // Cover only whole chunks; the trailing partial chunk carries no checkpoint.
   // Fold multimodal content into the chunk digest whenever this sequence
   // carries it, so a linear-state checkpoint keyed on a chunk that spans image
@@ -1101,8 +1101,8 @@ void Sequence::update_linear_state_hashes(uint32_t chunk_stride) {
   extend_prefix_hashes(hasher_type,
                        mm_data_,
                        this->tokens(),
-                       chunk_stride,
-                       /*boundary_blocks=*/num_tokens_ / chunk_stride,
+                       block_size,
+                       /*boundary_blocks=*/num_tokens_ / block_size,
                        linear_state_hashes_);
 }
 

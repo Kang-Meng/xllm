@@ -3269,8 +3269,19 @@ TEST(BatchTest, OverlapDecodeProtectsPrefillTailNearCheckpoint) {
 
       ASSERT_TRUE(
           manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
-      ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
-      EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+      if (prefix_cache) {
+        // Decode checkpoints follow the KV block size. The unconfirmed overlap
+        // step already crosses a block, so the prefill source stays in front
+        // and a second slot is opened for the in-flight write.
+        ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+        EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+                  source_id);
+        EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
+      } else {
+        ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+        EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+      }
+      const int32_t decode_slot_id = sequence.get_linear_state_slot_id();
       Batch first_decode;
       first_decode.add(&sequence, 1);
       first_decode.prepare_forward_input(1, 0, args);
@@ -3282,9 +3293,18 @@ TEST(BatchTest, OverlapDecodeProtectsPrefillTailNearCheckpoint) {
       ASSERT_TRUE(
           manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
       ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
-      EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
-                source_id);
-      EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
+      if (prefix_cache) {
+        // The confirmed block boundary retires the prefill source and opens a
+        // new slot. That slot may reuse the source id.
+        EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+                  decode_slot_id);
+        EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+        EXPECT_NE(decode_slot_id, source_id);
+      } else {
+        EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+                  source_id);
+        EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
+      }
       manager.deallocate_for_sequence(&sequence);
     }
   }

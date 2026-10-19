@@ -32,6 +32,7 @@ limitations under the License.
 #include "continuous_scheduler.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "distributed_runtime/engine.h"
@@ -667,6 +668,148 @@ TEST(SchedulerPolicyTest, LinearSchedulingPreservesReadSourceAcrossPolicies) {
   }
 }
 
+TEST(SchedulerPolicyTest, LinearTailPrefillPreservesKvSplitBoundaries) {
+  constexpr int32_t kPhysicalBlockSize = 128;
+  constexpr int32_t kKvSplitSize = 2;
+  constexpr int32_t kEffectiveBlockSize = kPhysicalBlockSize * kKvSplitSize;
+  constexpr int32_t kChunkSize = 8192;
+  ScopedConfigValue<bool> chunked_guard(
+      SchedulerConfig::get_instance().enable_chunked_prefill(), true);
+  ScopedConfigValue<bool> prefix_guard(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  ScopedConfigValue<bool> mix_guard(
+      SchedulerConfig::get_instance().enable_mix_batch(), false);
+  ScopedConfigValue<int32_t> chunk_guard(
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(),
+      kChunkSize);
+  ScopedConfigValue<int32_t> cp_guard(ParallelConfig::get_instance().cp_size(),
+                                      kKvSplitSize);
+  ScopedConfigValue<int32_t> split_guard(
+      ParallelConfig::get_instance().kv_split_size(), kKvSplitSize);
+
+  const std::vector<std::tuple<int32_t, std::vector<size_t>>> test_cases = {
+      {8191, {7936, 255}}, {16383, {8192, 7936, 255}}};
+  for (const std::string strategy : {"fcfs", "multi_slo_and_prio"}) {
+    SCOPED_TRACE(strategy);
+    for (const auto& [prompt_tokens, expected_chunks] : test_cases) {
+      SCOPED_TRACE(prompt_tokens);
+      ContinuousScheduler::Options options =
+          create_scheduler_options(kChunkSize, 16, 0, kChunkSize, 1, strategy);
+      // LLM initialization passes a logical block size that already includes
+      // KV split. The tail cap and LINEAR hash chain must use that same size.
+      FakeEngine engine(/*num_blocks=*/128,
+                        /*block_size=*/kEffectiveBlockSize,
+                        /*enable_prefix_cache=*/true,
+                        /*enable_linear_attention=*/true);
+      ContinuousScheduler scheduler(&engine, options);
+      auto requests = generate_request(
+          {prompt_tokens}, {1}, std::nullopt, std::nullopt, 32768);
+      Sequence* sequence = requests.front()->sequences().front().get();
+      scheduler.add_request(requests.front());
+
+      size_t cached_tokens = 0;
+      for (const size_t expected_tokens : expected_chunks) {
+        auto batches = scheduler.prepare_batch_test();
+        ASSERT_EQ(batches.size(), 1u);
+        ASSERT_EQ(batches.front().size(), 1u);
+        ASSERT_EQ(batches.front().get_allowed_max_tokens().front(),
+                  expected_tokens);
+        if (expected_tokens == 255) {
+          const Slice<Block> linear_blocks =
+              sequence->kv_state().blocks(BlockType::LINEAR);
+          ASSERT_EQ(linear_blocks.size(), 2u);
+          sequence->update_block_hashes(kEffectiveBlockSize,
+                                        BlockHasherType::TEXT);
+          const size_t hash_index = cached_tokens / kEffectiveBlockSize - 1;
+          const Slice<XXH3Key> hashes = sequence->block_hashes();
+          ASSERT_LT(hash_index, hashes.size());
+          EXPECT_TRUE(
+              XXH3Key(linear_blocks.front().get_immutable_hash_value()) ==
+              hashes[hash_index]);
+        }
+        cached_tokens += expected_tokens;
+        if (cached_tokens < static_cast<size_t>(prompt_tokens)) {
+          EXPECT_EQ(cached_tokens % kEffectiveBlockSize, 0u);
+          EXPECT_EQ((cached_tokens / kKvSplitSize) % kPhysicalBlockSize, 0u);
+        }
+        sequence->kv_state().set_kv_cache_tokens_num(cached_tokens);
+      }
+      EXPECT_EQ(cached_tokens, static_cast<size_t>(prompt_tokens));
+    }
+  }
+}
+
+TEST(SchedulerPolicyTest, LinearWarmPrefixPrefillPreservesTailCheckpoint) {
+  constexpr int32_t kBlockSize = 128;
+  constexpr int32_t kChunkSize = 8192;
+  constexpr int32_t kPromptTokens = 9314;
+  constexpr size_t kTailCheckpoint = 9216;
+  ScopedConfigValue<bool> chunked_guard(
+      SchedulerConfig::get_instance().enable_chunked_prefill(), true);
+  ScopedConfigValue<bool> prefix_guard(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  ScopedConfigValue<int32_t> chunk_guard(
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(),
+      kChunkSize);
+
+  for (const std::string strategy : {"fcfs", "multi_slo_and_prio"}) {
+    SCOPED_TRACE(strategy);
+    for (const bool mix_batch : {false, true}) {
+      SCOPED_TRACE(mix_batch);
+      ScopedConfigValue<bool> mix_guard(
+          SchedulerConfig::get_instance().enable_mix_batch(), mix_batch);
+      ContinuousScheduler::Options options =
+          create_scheduler_options(kChunkSize, 16, 0, kChunkSize, 1, strategy);
+      FakeEngine engine(/*num_blocks=*/128,
+                        kBlockSize,
+                        /*enable_prefix_cache=*/true,
+                        /*enable_linear_attention=*/true);
+
+      auto cached_requests = generate_request(
+          {kChunkSize}, {1}, std::nullopt, std::nullopt, 32768);
+      Sequence* cached_sequence =
+          cached_requests.front()->sequences().front().get();
+      ASSERT_TRUE(engine.block_manager_pool()->allocate(cached_sequence));
+      cached_sequence->kv_state().set_kv_cache_tokens_num(kChunkSize);
+      engine.block_manager_pool()->deallocate(cached_sequence);
+
+      ContinuousScheduler scheduler(&engine, options);
+      auto requests = generate_request(
+          {kPromptTokens}, {1}, std::nullopt, std::nullopt, 32768);
+      Sequence* sequence = requests.front()->sequences().front().get();
+      ASSERT_EQ(sequence->kv_cache_tokens_num(), 0u);
+      scheduler.add_request(requests.front());
+
+      // A deallocated full-stride checkpoint is not restored before the first
+      // chunk budget. That forward takes the whole stride. The next chunk
+      // must still stop at the tail checkpoint, leaving the final 98 tokens
+      // for a separate forward.
+      auto batches = scheduler.prepare_batch_test();
+      ASSERT_EQ(batches.size(), 1u);
+      ASSERT_EQ(batches.front().size(), 1u);
+      ASSERT_EQ(sequence->kv_cache_tokens_num(), 0u);
+      ASSERT_EQ(batches.front().get_allowed_max_tokens().front(),
+                static_cast<size_t>(kChunkSize));
+      sequence->kv_state().set_kv_cache_tokens_num(kChunkSize);
+
+      batches = scheduler.prepare_batch_test();
+      ASSERT_EQ(batches.size(), 1u);
+      ASSERT_EQ(batches.front().size(), 1u);
+      ASSERT_EQ(batches.front().get_allowed_max_tokens().front(), 1024u);
+      ASSERT_EQ(sequence->kv_state().current_max_tokens_capacity(),
+                kTailCheckpoint);
+      sequence->kv_state().set_kv_cache_tokens_num(kTailCheckpoint);
+
+      batches = scheduler.prepare_batch_test();
+      ASSERT_EQ(batches.size(), 1u);
+      ASSERT_EQ(batches.front().size(), 1u);
+      ASSERT_EQ(batches.front().get_allowed_max_tokens().front(), 98u);
+      sequence->kv_state().set_kv_cache_tokens_num(kPromptTokens);
+      engine.block_manager_pool()->deallocate(sequence);
+    }
+  }
+}
+
 TEST(SchedulerPolicyTest, DecodeFirstSkipsRedistributionForLinearModels) {
   ScopedConfigValue<bool> chunked_guard(
       SchedulerConfig::get_instance().enable_chunked_prefill(), true);
@@ -964,9 +1107,14 @@ TEST(SchedulerPolicyTest, LinearLatencySchedulingRespectsRemainingTokenBudget) {
         batches = scheduler.prepare_batch_test();
         ASSERT_EQ(batches.size(), 1u);
         ASSERT_EQ(batches.front().size(), 2u);
+        const std::vector<uint32_t> expected_second_step =
+            prefix_cache
+                ? (token_budget == 288 ? std::vector<uint32_t>{224, 64}
+                                       : std::vector<uint32_t>{128, 256})
+                : std::vector<uint32_t>{
+                      256, static_cast<uint32_t>(token_budget - 256)};
         EXPECT_EQ(batches.front().get_allowed_max_tokens(),
-                  (std::vector<uint32_t>{
-                      256, static_cast<uint32_t>(token_budget - 256)}));
+                  expected_second_step);
       }
     }
   }

@@ -995,9 +995,8 @@ TEST(CompositeBlockManagerTest,
     manager.deallocate_for_sequence(&cold);
     cold.reset();
 
-    // Publication follows the completed cold prompt; the hot prompt is one
-    // token shorter and can still miss at the exact-repeat boundary.
-    const size_t published_units = cold_prompt.size() / unit_tokens;
+    // The cold sequence processes prompt_tokens plus one extra token.
+    const size_t published_units = (prompt_tokens + 1) / unit_tokens;
     EXPECT_EQ(manager.leaf_entries()
                   .at(BlockType::C4)
                   .leaf->num_blocks_in_prefix_cache(),
@@ -1688,7 +1687,7 @@ TEST_P(LinearStateWindowTest,
        HostDecodeCheckpointDoesNotAdvanceSequenceHashes) {
   LinearStateBlockManager host_manager(
       /*num_slots=*/8,
-      /*chunk_stride=*/4,
+      /*block_size=*/4,
       GetParam(),
       /*instance_is_decode=*/true,
       /*num_speculative_tokens=*/0,
@@ -1710,7 +1709,7 @@ TEST_P(LinearStateWindowTest,
 
   ASSERT_TRUE(allocated.has_value());
   EXPECT_TRUE(allocated->empty());
-  EXPECT_TRUE(sequence.linear_state_hashes().empty());
+  EXPECT_TRUE(sequence.block_hashes().empty());
   ASSERT_EQ(sequence.host_kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).front().id(),
             checkpoint_id);
@@ -1727,7 +1726,7 @@ TEST_P(LinearStateWindowTest,
        DecodeCheckpointPreserveRebuildsWindowAfterCrossingWithOneBlock) {
   LinearStateBlockManager manager(
       /*num_slots=*/8,
-      /*chunk_stride=*/4,
+      /*block_size=*/4,
       GetParam(),
       /*instance_is_decode=*/true,
       /*num_speculative_tokens=*/0,
@@ -1852,16 +1851,18 @@ TEST_P(LinearStateWindowTest,
       EXPECT_EQ(blocks.front().id(), previous_id);
       if (GetParam()) {
         EXPECT_EQ(XXH3Key(blocks.front().get_immutable_hash_value()),
-                  sequence.linear_state_hashes()[output_index - 1]);
+                  sequence.block_hashes()[output_index * 2 - 1]);
       }
     }
     const int32_t output_id = blocks.back().id();
+    // The prefix cursor is measured in shared KV/hash-block positions. The
+    // linear checkpoint stride is two hash blocks in this fixture.
     EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::LINEAR),
-              GetParam() ? output_index : 0u);
+              GetParam() ? output_index * 2 : 0u);
     finish_input(sequence, target);
     manager->cache_for_sequence(&sequence);
     EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::LINEAR),
-              GetParam() ? output_index : 0u);
+              GetParam() ? output_index * 2 : 0u);
     previous_id = output_id;
   }
   sequence.append_token(8);
@@ -1896,7 +1897,7 @@ TEST_P(LinearStateWindowTest, ExhaustionPreservesSourceAndRollsBackKvGrowth) {
     EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
     EXPECT_EQ(sequence.kv_cache_tokens_num(), 8u);
     EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::LINEAR),
-              GetParam() ? 2u : 0u);
+              GetParam() ? 4u : 0u);
     EXPECT_EQ(manager->leaf_entries().at(BlockType::KV).leaf->num_used_blocks(),
               kv_used);
   }
@@ -2010,7 +2011,7 @@ TEST_P(LinearStateWindowTest, PrefillCapacityIsIndependentOfCheckpointStride) {
     EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR),
               target == 3 ? 1u : 2u);
     EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::LINEAR),
-              GetParam() && target == 13 ? 2u : 0u);
+              GetParam() && target == 13 ? 4u : 0u);
     finish_input(sequence, target);
   }
   manager->deallocate_for_sequence(&sequence);
@@ -2052,7 +2053,7 @@ TEST_P(LinearStateWindowTest, ColdPrefillNeedsOnlyOneSlot) {
   EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::LINEAR),
-            GetParam() ? 1u : 0u);
+            GetParam() ? 2u : 0u);
   Sequence consumer = make_sequence(1, std::vector<int32_t>(9, 7));
   manager->allocate_shared_for_sequence(&consumer);
   EXPECT_EQ(consumer.kv_cache_tokens_num(), GetParam() ? 4u : 0u);
@@ -2119,8 +2120,18 @@ TEST_P(LinearStateWindowTest, OverlapDecodePredictsAndResolvesCheckpoint) {
     sequence.kv_state().set_kv_cache_tokens_num(checkpoint_hit ? 9 : 8);
     ASSERT_TRUE(manager->allocate_sequence(&sequence, 12));
     if (checkpoint_hit) {
-      ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
-      EXPECT_EQ(sequence.get_linear_state_slot_id(), initial_id);
+      if (GetParam()) {
+        // Prefix cache rolls decode checkpoints on the KV block grid. The
+        // confirmed step retires the historical slot and opens another one.
+        // The pool may hand that freed id back, so the live slot can match it.
+        ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+        EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+                  initial_id);
+        EXPECT_EQ(sequence.get_linear_state_slot_id(), historical_id);
+      } else {
+        ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+        EXPECT_EQ(sequence.get_linear_state_slot_id(), initial_id);
+      }
     } else {
       ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
       EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
@@ -2143,7 +2154,7 @@ TEST_P(LinearStateWindowTest, NullSequenceDoesNotAllocate) {
 
 TEST_P(LinearStateWindowTest, AllowsSpeculativeSpanAboveHalfStride) {
   LinearStateBlockManager manager(/*num_slots=*/3,
-                                  /*chunk_stride=*/4,
+                                  /*block_size=*/4,
                                   /*enable_prefix_cache=*/GetParam(),
                                   /*instance_is_decode=*/false,
                                   /*num_speculative_tokens=*/2);
@@ -2177,7 +2188,7 @@ TEST_P(LinearStateWindowTest, PrefixMountIsSparseAndMatchedOnlyOnce) {
   EXPECT_EQ(consumer.kv_cache_tokens_num(), GetParam() ? 12u : 0u);
   EXPECT_EQ(consumer.last_confirmed_cached_tokens_num(), 0u);
   EXPECT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR),
-            GetParam() ? 3u : 0u);
+            GetParam() ? 6u : 0u);
   const int32_t source_id = consumer.get_linear_state_slot_id();
   if (GetParam()) {
     const Slice<Block> blocks = consumer.kv_state().blocks(BlockType::LINEAR);

@@ -834,6 +834,8 @@ TEST(ContinuousSchedulerTest, DecodeLinearEnablesInBatchPrefixReuse) {
   ScopedConfigValue<bool> xtensor(
       KVCacheConfig::get_instance().enable_xtensor(), false);
   FakeEngine engine(32, 4, true, true, InstanceRole::DECODE);
+  // Decode keeps KV prefix reuse. LINEAR checkpoints are not published on
+  // this role, and the prefill cap below stays off for DECODE.
   ContinuousScheduler::Options options =
       create_scheduler_options(16, 4, 0, 4, 1);
   options.instance_role(InstanceRole::DECODE).enable_disagg_pd(true);

@@ -232,13 +232,17 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     } else if (chunk_stride <= 0) {
       chunk_stride = 1;
     }
+    // Use KV block_size as LINEAR checkpoint granularity for tail prefix cache.
+    const int32_t linear_block_size =
+        linear_prefix_cache ? static_cast<int32_t>(options.block_size())
+                            : chunk_stride;
     leaves.emplace(
         BlockType::LINEAR,
         CompositeBlockManager::LeafEntry{
             maybe_concurrent(
                 std::make_unique<LinearStateBlockManager>(
                     static_cast<uint32_t>(options.linear_state_num_slots()),
-                    chunk_stride,
+                    linear_block_size,
                     linear_prefix_cache,
                     is_decode,
                     options.num_speculative_tokens(),

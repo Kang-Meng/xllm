@@ -46,8 +46,9 @@ class PrefixCache {
     PROPERTY(BlockHasherType, hasher_type) = BlockHasherType::TEXT;
     // Picks the concrete cache in create_prefix_cache: LINEAR / SWA build
     // LinearStatePrefixCache (gap-tolerant), everything else this base class.
-    // A prefix cache indexes on a single stride (block_size above): KV block
-    // size for KV, prefill chunk stride for LINEAR, SWA base block for SWA.
+    // block_size is this cache's only stride: the step used to chain hashes.
+    // KV and LINEAR use the KV block size. SWA uses its base block. The LINEAR
+    // checkpoint stride stays on the block manager.
     PROPERTY(BlockType, block_type) = BlockType::KV;
   };
 

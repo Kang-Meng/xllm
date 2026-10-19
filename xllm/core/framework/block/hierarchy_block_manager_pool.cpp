@@ -29,6 +29,7 @@ limitations under the License.
 #include "block_manager_impl.h"
 #include "composite_block_manager.h"
 #include "concurrent_block_manager_impl.h"
+#include "core/framework/config/scheduler_config.h"
 #include "linear_state_block_manager.h"
 #include "sliding_window_block_manager.h"
 #include "util/env_var.h"
@@ -191,40 +192,25 @@ StoragePrefetchRequest build_flat_kv_linear_prefetch_request(
   const Slice<Block> kv_blocks = host_state.blocks(BlockType::KV);
   const Slice<Block> linear_blocks = host_state.blocks(BlockType::LINEAR);
   const size_t kv_block_size = valid_block_size(kv_blocks);
-  size_t unit_size = valid_block_size(linear_blocks);
-  // A capacity miss can leave the optional Linear vector entirely invalid;
-  // both vectors still cover the same target range, so their logical lengths
-  // preserve the KV-per-Linear unit ratio.
-  if (unit_size == 0 && !linear_blocks.empty() &&
-      kv_blocks.size() % linear_blocks.size() == 0) {
-    unit_size = kv_block_size * (kv_blocks.size() / linear_blocks.size());
-  }
-  if (kv_block_size == 0 || unit_size == 0 || linear_blocks.empty() ||
-      unit_size % kv_block_size != 0) {
+  if (kv_block_size == 0 || linear_blocks.empty()) {
     return {};
   }
-  const size_t base_units = host_state.shared_tokens_num() / unit_size;
-  if (base_units >= linear_blocks.size()) {
+  const size_t base_units = host_state.shared_tokens_num() / kv_block_size;
+  if (base_units >= kv_blocks.size()) {
     return {};
   }
 
   StoragePrefetchRequest request;
-  request.units.reserve(linear_blocks.size() - base_units);
-  for (size_t unit = base_units; unit < linear_blocks.size(); ++unit) {
+  request.units.reserve(kv_blocks.size() - base_units);
+  for (size_t unit = base_units; unit < kv_blocks.size(); ++unit) {
     PrefetchUnit prefetch_unit;
     prefetch_unit.has_non_gated = true;
-    const size_t kv_begin = unit * unit_size / kv_block_size;
-    const size_t kv_end = (unit + 1) * unit_size / kv_block_size;
-    bool gate_available = true;
-    for (size_t block_index = kv_begin; block_index < kv_end; ++block_index) {
-      const bool available = append_prefetch_transfer(
-          &prefetch_unit, BlockType::KV, block_index, host_state);
-      gate_available = gate_available && available;
-    }
-    if (!gate_available) {
+    const bool available = append_prefetch_transfer(
+        &prefetch_unit, BlockType::KV, unit, host_state);
+    if (!available) {
       break;
     }
-    if (linear_blocks[unit].is_valid()) {
+    if (unit < linear_blocks.size() && linear_blocks[unit].is_valid()) {
       append_prefetch_transfer(
           &prefetch_unit, BlockType::LINEAR, unit, host_state);
     }

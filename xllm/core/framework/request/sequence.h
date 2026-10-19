@@ -27,6 +27,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -315,9 +316,9 @@ class Sequence final {
   // Extend `linear_state_hashes_` to cover any newly completed full chunks at
   // the given stride. Cheap (no-op) when no new full chunk is available, so it
   // is safe to call before every match()/save-boundary check.
-  void update_linear_state_hashes(uint32_t chunk_stride);
+  void update_linear_state_hashes(uint32_t block_size);
 
-  // whether the prefill stage has been cached.
+  // Whether the prefill stage has been cached.
   bool if_cache_block_for_prefill() {
     bool if_cache =
         !is_cache_block_for_prefill_ && num_tokens() > num_prompt_tokens();
