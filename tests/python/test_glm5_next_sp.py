@@ -191,8 +191,14 @@ def test_sp_scales_and_merges_in_fp32_before_final_cast(
     layer = _moe(_config(routed_scaling_factor=2.5))
     routed = torch.full((2, 8), routed_value, dtype=dtype)
     shared = torch.full_like(routed, shared_value)
+
+    def shared_forward(packed: torch.Tensor) -> torch.Tensor:
+        # The compression path may feed only the active rows; keep the
+        # per-row value so the fp32-merge contract holds at any row count.
+        return shared[: packed.shape[0]]
+
     layer.shared_experts = nn.Identity()
-    monkeypatch.setattr(layer.shared_experts, "forward", lambda x: shared)
+    monkeypatch.setattr(layer.shared_experts, "forward", shared_forward)
     monkeypatch.setattr(layer, "_run_routed_sp", lambda *args: routed)
     monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: None)
     mask = torch.tensor([True, False])
@@ -279,7 +285,10 @@ def test_sp_decode_keeps_output_local_and_skips_empty_source_shared(
         local, mask = layout.shard(full), layout.shard(active)
         result = layer(local, token_layout=layout, token_mask=mask)
         torch.testing.assert_close(result, local * 8 * mask[:, None], rtol=0, atol=0)
-        assert len(shared.rows) == int(layout.valid_tokens > 0)
+        # Shared experts run only when this rank owns real ACTIVE rows: a
+        # structurally non-empty shard whose mask is all-false (padding or a
+        # dummy rank) skips the shared GEMMs entirely.
+        assert len(shared.rows) == int(bool(mask.any()))
         assert route.call_count == int(layout.valid_tokens > 0)
         outputs.append(result)
     assert sorted(seen) == full[active, 0].tolist()

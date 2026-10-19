@@ -74,6 +74,15 @@ def test_qwen35_uses_official_model(
     assert model_class.__name__ == "Qwen3_5ForCausalLM"
 
 
-@pytest.mark.parametrize("model_type", ["qwen3", "deepseek_v32", "deepseek_v4", "glm_moe_dsa"])
+def test_glm52_registers_typed_ep_metadata_for_all_ep_degrees() -> None:
+    builder_classes = registry.get_execution_metadata_builder_classes("glm_moe_dsa")
+    assert tuple(builder_class.__name__ for builder_class in builder_classes) == ("Glm52EpMetadataBuilder",)
+    builder_class = builder_classes[0]
+    for degree in (0, 1, 2):
+        assert builder_class.from_config({"model_type": "glm_moe_dsa", "ep_size": 8, "expert_parallel_degree": degree})
+    assert builder_class.from_config({"model_type": "glm_moe_dsa", "ep_size": 1}) is None
+
+
+@pytest.mark.parametrize("model_type", ["qwen3", "deepseek_v32", "deepseek_v4"])
 def test_model_without_execution_metadata_builder_returns_empty_tuple(model_type: str) -> None:
     assert registry.get_execution_metadata_builder_classes(model_type) == ()

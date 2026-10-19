@@ -192,6 +192,12 @@ def _register_builtin_models() -> None:
         "xllm.python.models.glm5_2",
         "Glm52ForCausalLM",
         "glm_moe_dsa",
+        execution_metadata_builders=(
+            (
+                "xllm.python.layers.npu.glm5_2_metadata",
+                "Glm52EpMetadataBuilder",
+            ),
+        ),
     )
     _register_model_path(
         "xllm.python.models.deepseek_v4",

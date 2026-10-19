@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn
 
-from xllm.python.models import glm5_2
+from xllm.python.models import deepseek_v32, glm5_2, glm5_2_moe
 
 
 class _Embedding(nn.Module):
@@ -214,35 +214,27 @@ def test_cp_one_preserves_aux_hidden_capture() -> None:
     )
 
 
-def test_cp_ep_moe_materializes_global_rows_before_expert_reduction() -> None:
+def test_cp_ep_moe_dispatches_local_rows_without_cp_merge_or_grouped_reduce() -> None:
     moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
     nn.Module.__init__(moe)
     moe.ep_size = 4
-    cp_context = object()
+    moe.dp_size = 1
+    moe.cfg = SimpleNamespace(cp_size=2, expert_parallel_degree=0)
     local_hidden = torch.tensor([[30.0], [10.0]])
-    global_hidden = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
-    global_output = global_hidden + 100.0
+    local_output = local_hidden + 100.0
 
     with (
-        patch.object(
-            glm5_2,
-            "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context),
-        ),
-        patch.object(glm5_2, "cp_gather_kv", return_value=global_hidden) as gather,
-        patch.object(glm5_2.DeepseekV3MoE, "forward", return_value=global_output) as ep_forward,
-        patch.object(
-            glm5_2,
-            "cp_shard_rows",
-            return_value=torch.tensor([[130.0], [110.0]]),
-        ) as shard,
+        patch.object(glm5_2_moe, "get_forward_context", return_value=SimpleNamespace(cp_context=object())),
+        patch.object(glm5_2, "cp_gather_kv") as gather,
+        patch.object(deepseek_v32.DeepseekV3MoE, "forward") as grouped,
+        patch.object(moe, "_forward_alltoall", return_value=local_output) as dispatch,
     ):
         output = moe(local_hidden)
 
-    gather.assert_called_once_with(local_hidden, cp_context)
-    ep_forward.assert_called_once_with(global_hidden)
-    shard.assert_called_once_with(global_output, cp_context)
-    torch.testing.assert_close(output, torch.tensor([[130.0], [110.0]]))
+    dispatch.assert_called_once_with(local_hidden)
+    gather.assert_not_called()
+    grouped.assert_not_called()
+    torch.testing.assert_close(output, local_output)
 
 
 def test_glm_ep1_moe_reduces_only_on_ordinary_tp_group() -> None:
@@ -270,7 +262,7 @@ def test_glm_ep_moe_preserves_parent_combine_behavior() -> None:
     expected = torch.tensor([[3.0]])
 
     with patch.object(
-        glm5_2.DeepseekV3MoE,
+        deepseek_v32.DeepseekV3MoE,
         "_combine_expert_outputs",
         return_value=expected,
     ) as parent_combine:
@@ -285,6 +277,10 @@ def test_glm_dense_mlp_fused_path_reduces_in_fp32() -> None:
     nn.Module.__init__(mlp)
     mlp.tp = 2
     mlp.skip_tp_reduce = False
+    mlp.fused_swiglu = False
+    mlp.clamp_precision = "native"
+    mlp.swiglu_limit = 0.0
+    mlp.tp_reduce = "fp32"
     mlp.gate_up_proj = SimpleNamespace(
         weight_scale=torch.ones(1),
         forward_accumulated=MagicMock(return_value=torch.ones(2, 4)),
@@ -310,7 +306,7 @@ def test_glm_dense_mlp_fused_path_reduces_in_fp32() -> None:
             "dequant_swiglu_quant",
             return_value=(torch.ones(2, 2, dtype=torch.int8), torch.ones(2)),
             create=True,
-        ),
+        ) as swiglu_quant,
         patch.object(
             glm5_2.distributed,
             "tp_all_reduce",
@@ -320,6 +316,7 @@ def test_glm_dense_mlp_fused_path_reduces_in_fp32() -> None:
     ):
         output = mlp.forward_dequant_swiglu_quant(torch.ones(2, 2))
 
+    assert swiglu_quant.call_args.kwargs["swiglu_mode"] == 0
     reduce.assert_called_once()
     assert output.dtype == torch.bfloat16
     torch.testing.assert_close(output, reduced_input + 1)
@@ -331,6 +328,8 @@ def test_glm_dense_mlp_unfused_path_reduces_in_fp32() -> None:
     mlp.tp = 2
     mlp.skip_tp_reduce = False
     mlp.swiglu_limit = 0.0
+    mlp.clamp_precision = "native"
+    mlp.tp_reduce = "fp32"
     reduced_input = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
     mlp.down_proj = MagicMock(return_value=reduced_input)
     activation = torch.ones(2, 2, dtype=torch.bfloat16)
@@ -340,7 +339,7 @@ def test_glm_dense_mlp_unfused_path_reduces_in_fp32() -> None:
         output.add_(1.0)
 
     with (
-        patch.object(glm5_2, "_swiglu_with_clamp", return_value=activation) as swiglu,
+        patch.object(glm5_2.kernels, "silu_and_mul", return_value=activation, create=True) as swiglu,
         patch.object(
             glm5_2.distributed,
             "tp_all_reduce",

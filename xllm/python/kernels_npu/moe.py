@@ -833,8 +833,9 @@ def _ep_grouped_w8a8(
     w2_scale: torch.Tensor,
     output_dtype: torch.dtype,
     swiglu_limit: float,
+    swiglu_mode: int = 1,
 ) -> torch.Tensor:
-    """Common expert math for MC2 and explicit All-to-AllV."""
+    """Common expert math; GLM5.2 uses standard SwiGLU (mode 0)."""
     from xllm.python import kernels as _kernels
 
     if quantized_expand_x.dtype != torch.int8 or input_scale.dtype != torch.float32:
@@ -866,7 +867,7 @@ def _ep_grouped_w8a8(
         group_index=group_list,
         activate_left=True,
         quant_mode=1,
-        swiglu_mode=1,
+        swiglu_mode=swiglu_mode,
         clamp_limit=swiglu_limit,
         glu_alpha=1.0,
         glu_bias=0.0,
@@ -1130,6 +1131,7 @@ def _ep_moe_w8a8_alltoall_impl(
     num_experts: int,
     x_active_mask: torch.Tensor | None = None,
     swiglu_limit: float = 10.0,
+    swiglu_mode: int = 1,
 ) -> torch.Tensor:
     """Quantized variable-size EP exchange; eager only, all ranks participate."""
     from xllm.python import kernels as _kernels
@@ -1138,6 +1140,8 @@ def _ep_moe_w8a8_alltoall_impl(
 
     if in_acl_graph():
         raise ValueError("Variable-size All-to-AllV requires eager execution")
+    if swiglu_mode not in (0, 1):
+        raise ValueError("AllToAllV SwiGLU mode must be 0 (standard) or 1 (clamped)")
     _validate_ep_moe_w8a8_inputs(
         hidden,
         topk_weights,
@@ -1221,6 +1225,7 @@ def _ep_moe_w8a8_alltoall_impl(
         w2_scale,
         hidden.dtype,
         swiglu_limit,
+        swiglu_mode,
     )
     unsorted = torch.empty_like(expert_output)
     unsorted.index_copy_(0, order, expert_output)
@@ -1250,6 +1255,7 @@ def ep_moe_w8a8_alltoall(
     num_experts: int,
     x_active_mask: torch.Tensor | None = None,
     swiglu_limit: float = 10.0,
+    swiglu_mode: int = 1,
 ) -> torch.Tensor:
     return _ep_moe_w8a8_alltoall_impl(
         hidden,
@@ -1264,6 +1270,7 @@ def ep_moe_w8a8_alltoall(
         num_experts,
         x_active_mask,
         swiglu_limit,
+        swiglu_mode,
     )
 
 
@@ -1281,6 +1288,7 @@ def _ep_moe_w8a8_alltoall_fake(
     num_experts: int,
     x_active_mask: torch.Tensor | None = None,
     swiglu_limit: float = 10.0,
+    swiglu_mode: int = 1,
 ) -> torch.Tensor:
     return torch.empty_like(hidden)
 

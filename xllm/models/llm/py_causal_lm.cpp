@@ -183,6 +183,21 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
   const bool is_glm_mega_moe_model = model_type == "glm_moe_dsa" ||
                                      model_type == "glm5_next" ||
                                      model_type == "glm5_next_text";
+  // GLM5.2 AllToAllV EPLv2 geometry admission (mirrors the Python-side
+  // validate_glm52_ep_config; fail at startup instead of computing wrong).
+  if (model_type == "glm_moe_dsa" &&
+      eplb_config.expert_parallel_degree() == 2) {
+    CHECK_GT(ep_size_, 1) << "GLM5.2 AllToAllV EPLv2 requires EP > 1.";
+    CHECK_EQ(ep_size_, parallel_args.world_size())
+        << "GLM5.2 AllToAllV EPLv2 requires EP == world size.";
+    CHECK_EQ(moe_tp_size_, 1) << "GLM5.2 AllToAllV EPLv2 requires MoE TP == 1.";
+    if (cp_size_ > 1) {
+      CHECK(!kernel_config.enable_mega_moe())
+          << "GLM5.2 CP AllToAllV EPLv2 does not support enable_mega_moe.";
+    }
+    CHECK(!eplb_config.enable_eplb())
+        << "GLM5.2 AllToAllV EPLv2 does not support EPLB.";
+  }
   const bool is_qwen3_5_mega_moe_model =
       model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text";
   const bool enable_glm_mega_moe = kernel_config.enable_mega_moe() &&
@@ -484,7 +499,13 @@ py::dict PyCausalLM::build_config_dict(
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
   d["layerwise_split_rank"] = layerwise_split_rank_;
-  const bool requires_eager_execution = model_args_.requires_eager_execution();
+  const bool is_glm52_eplv2 =
+      model_args_.model_type() == "glm_moe_dsa" &&
+      EPLBConfig::get_instance().expert_parallel_degree() == 2 &&
+      !KernelConfig::get_instance().enable_mega_moe();
+  // AllToAllV uses host variable split sizes and cannot be graph captured.
+  const bool requires_eager_execution =
+      model_args_.requires_eager_execution() || is_glm52_eplv2;
   d["enable_graph"] = requires_eager_execution
                           ? false
                           : ExecutionConfig::get_instance().enable_graph();
@@ -509,7 +530,10 @@ py::dict PyCausalLM::build_config_dict(
   d["enable_dsa_cp"] = KernelConfig::get_instance().enable_dsa_cp() &&
                        !speculative_runtime_config.is_draft_engine;
   const auto& eplb_config = EPLBConfig::get_instance();
-  if (model_args_.model_type() == "glm5_next" ||
+  // Typed GLM5.2 EP metadata is registered from ep_size; the degree selects
+  // eager-only EPLv2 even when no MegaMoE resource is requested.
+  if (model_args_.model_type() == "glm_moe_dsa" ||
+      model_args_.model_type() == "glm5_next" ||
       model_args_.model_type() == "glm5_next_text") {
     d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
     d["enable_eplb"] = eplb_config.enable_eplb();

@@ -24,7 +24,7 @@ import torch
 
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import deepseek_v32, glm5_2
-from xllm.python.models.glm5_2 import Glm52Config, Glm52ForCausalLM, Glm52MoE
+from xllm.python.models.glm5_2 import Glm52Config, Glm52ForCausalLM
 from xllm.python.models.weight_utils import W8A8WeightLoader
 
 
@@ -240,9 +240,11 @@ def _expanded_decode_metadata(num_tokens: int) -> SimpleNamespace:
     )
 
 
-def _make_mega_moe_layer() -> Glm52MoE:
+def _make_mega_moe_layer() -> deepseek_v32.DeepseekV3MoE:
+    # These retained tests cover the inherited legacy helper only. Public
+    # GLM5.2 EPLv2 now explicitly rejects the incompatible MegaMoE mode.
     cfg = Glm52Config.from_dict(_config())
-    moe = Glm52MoE(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
+    moe = deepseek_v32.DeepseekV3MoE(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
     moe._mega_moe_enabled = True
     moe._mega_moe_ccl_buffer_size = 8192
     moe._mega_moe_num_max_tokens_per_rank = 32
@@ -310,13 +312,13 @@ def test_shared_moe_mega_moe_enable_conditions(
     values = _config(model_type=model_type, **overrides)
     cfg = Glm52Config.from_dict(values)
     device = _npu_device() if device_type == "npu" else torch.device("cpu")
-    assert Glm52MoE._can_enable_mega_moe(cfg, device) is expected
+    assert deepseek_v32.DeepseekV3MoE._can_enable_mega_moe(cfg, device) is expected
 
 
 def test_shared_moe_mega_moe_ignores_speculative_token_count() -> None:
     cfg = Glm52Config.from_dict(_config(enable_mega_moe=True, ep_size=4, expert_parallel_degree=2))
     cfg.num_speculative_tokens = 4
-    assert Glm52MoE._can_enable_mega_moe(cfg, _npu_device()) is True
+    assert deepseek_v32.DeepseekV3MoE._can_enable_mega_moe(cfg, _npu_device()) is True
 
 
 def test_prefill_keeps_grouped_moe_and_skips_mega_moe(monkeypatch) -> None:

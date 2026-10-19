@@ -2379,21 +2379,17 @@ def test_model_restores_aux_hidden_under_cp_reflects_model_attribute() -> None:
     runner.model.restores_aux_hidden_under_cp = True
     assert runner.model_restores_aux_hidden_under_cp is True
 
-    # A model with no such attribute at all (e.g. a Python model type that
-    # never wired the capability, or glm_moe_dsa whose aux rows stay
-    # CP-sharded) must not raise and must stay refused.
+    # A model that never wired this capability must not raise and must
+    # stay refused, even if its configuration enables auxiliary capture.
     del runner.model.restores_aux_hidden_under_cp
     assert runner.model_restores_aux_hidden_under_cp is False
 
 
 def test_cp_aux_restore_capability_is_an_explicit_model_opt_in() -> None:
     """The capability the CP spec-verify gate keys on is an explicit class
-    attribute only the proven models set: glm5_next and deepseek_v4 merge
-    the aux-hidden buffer back to global row order at the CP exit, while
-    glm_moe_dsa (glm5_2) captures aux rows but merges only ``hidden``,
-    leaving them CP-sharded. A reachable glm_moe_dsa + DFlash + CP shape
-    must therefore stay refused even though worker_impl auto-fills its
-    layers_to_capture (making capture ``enabled``).
+    attribute only the proven models set: glm5_next, deepseek_v4 and
+    glm_moe_dsa (glm5_2) merge both target hidden and the auxiliary buffer
+    back to global row order at the CP exit.
 
     deepseek_v4 imports torch_npu unconditionally at module level, so the
     model-class pins skip on hosts without torch_npu (mirroring
@@ -2406,9 +2402,7 @@ def test_cp_aux_restore_capability_is_an_explicit_model_opt_in() -> None:
 
     assert Glm5NextModel.restores_aux_hidden_under_cp is True
     assert DeepseekV4Model.restores_aux_hidden_under_cp is True
-    # glm_moe_dsa merges only ``hidden`` under CP; the attribute must stay
-    # unset so the eager gate keeps refusing its spec-verify CP forwards.
-    assert not hasattr(Glm52Model, "restores_aux_hidden_under_cp")
+    assert Glm52Model.restores_aux_hidden_under_cp is True
 
 
 @pytest.mark.parametrize(

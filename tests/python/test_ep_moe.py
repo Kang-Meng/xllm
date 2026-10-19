@@ -407,8 +407,9 @@ def test_ep_moe_w8a8_propagates_clamped_activation_failure(
 
 
 @pytest.mark.parametrize("has_active_source", (True, False))
+@pytest.mark.parametrize("swiglu_mode", (None, 0, 1))
 def test_alltoall_uses_canonical_quantizer_but_transports_int8(
-    monkeypatch: pytest.MonkeyPatch, has_active_source: bool
+    monkeypatch: pytest.MonkeyPatch, has_active_source: bool, swiglu_mode: int | None
 ) -> None:
     from xllm.python import distributed, kernels
 
@@ -458,6 +459,7 @@ def test_alltoall_uses_canonical_quantizer_but_transports_int8(
 
     def experts(q: torch.Tensor, scale: torch.Tensor, groups: torch.Tensor, *args: Any) -> torch.Tensor:
         calls.append("experts")
+        assert args[-1] == (1 if swiglu_mode is None else swiglu_mode)
         order = torch.tensor([0, 2, 1, 3])
         if has_active_source:
             torch.testing.assert_close(q, codes[order])
@@ -487,6 +489,8 @@ def test_alltoall_uses_canonical_quantizer_but_transports_int8(
         ep_rank=0,
         x_active_mask=torch.full((2,), has_active_source, dtype=torch.bool),
     )
+    if swiglu_mode is not None:
+        inputs["swiglu_mode"] = swiglu_mode
     output = moe._ep_moe_w8a8_alltoall_impl(**inputs)
     torch.testing.assert_close(output, torch.zeros_like(hidden))
     assert calls == (
@@ -494,6 +498,30 @@ def test_alltoall_uses_canonical_quantizer_but_transports_int8(
         if has_active_source
         else ["dispatch", "experts", "combine"]
     )
+
+
+@pytest.mark.parametrize("mode", (0, 1))
+def test_alltoall_fake_accepts_activation_mode(mode: int) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    moe = _load_npu_moe_module()
+    with FakeTensorMode():
+        hidden = torch.empty(3, 8, dtype=torch.bfloat16)
+        output = moe.ep_moe_w8a8_alltoall(
+            hidden,
+            torch.empty(3, 2, dtype=torch.float32),
+            torch.empty(3, 2, dtype=torch.int32),
+            torch.empty(4, 8, 12, dtype=torch.int8),
+            torch.empty(4, 6, 8, dtype=torch.int8),
+            torch.empty(4, 12, dtype=torch.float32),
+            torch.empty(4, 8, dtype=torch.float32),
+            2,
+            0,
+            8,
+            swiglu_mode=mode,
+        )
+    assert output.shape == hidden.shape
+    assert output.dtype == hidden.dtype
 
 
 def test_ep_moe_w8a8_fake_preserves_hidden_metadata() -> None:

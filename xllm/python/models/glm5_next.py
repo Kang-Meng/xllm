@@ -63,6 +63,7 @@ except ImportError:
 
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import MlaIndexContext
+from xllm.python.layers.moe import MoECore, clamped_silu_and_mul
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.npu.glm5_next_metadata import Glm5NextEplv2Metadata
 from xllm.python.model_executor.cp_utils import (
@@ -2040,11 +2041,7 @@ class Glm5NextMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        # GLM-5.3-Flash SwiGLU clamp (matches HF Glm5NextTextMLP).
-        gate = gate.clamp(min=None, max=self.swiglu_limit)
-        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        out = self.down_proj(F.silu(gate) * up)
+        out = self.down_proj(clamped_silu_and_mul(gate_up, self.swiglu_limit))
         if self.tp_size > 1 and not self.skip_tp_reduce:
             distributed.all_reduce_(out)
         return out
@@ -2112,11 +2109,7 @@ class Glm5NextExperts(nn.Module):
             expert_idx = expert_idx[0]
             top_k_pos, token_idx = torch.where(mask[expert_idx])
             gate_up = F.linear(hidden_states[token_idx], self.gate_up_proj[expert_idx])
-            gate, up = gate_up.chunk(2, dim=-1)
-            # GLM-5.3-Flash SwiGLU clamp (matches HF Glm5NextTextExperts).
-            gate = gate.clamp(min=None, max=self.swiglu_limit)
-            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            current = F.linear(F.silu(gate) * up, self.down_proj[expert_idx])
+            current = F.linear(clamped_silu_and_mul(gate_up, self.swiglu_limit), self.down_proj[expert_idx])
             current = current * top_k_weights[token_idx, top_k_pos, None]
             final_f32[token_idx, top_k_pos] += current.float()
         return final_f32.sum(1).to(hidden_states.dtype)
@@ -2160,14 +2153,12 @@ class Glm5NextExperts(nn.Module):
             gate_up_w.transpose(1, 2),
         ).squeeze(1)  # [N, 2*inter_dim]
 
-        gate, up = gate_up.chunk(2, dim=-1)
-        gate = gate.clamp(min=None, max=self.swiglu_limit)
-        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        activated = clamped_silu_and_mul(gate_up, self.swiglu_limit)
 
         # Batched down projection.
         # [N, 1, inter_dim] × [N, inter_dim, hidden] → [N, 1, hidden]
         current = torch.bmm(
-            (F.silu(gate) * up).unsqueeze(1),
+            activated.unsqueeze(1),
             down_w.transpose(1, 2),
         ).squeeze(1)  # [N, hidden]
 
@@ -2262,7 +2253,7 @@ def _eplv2_token_layout(
     return replace(layout, routed_backend=backend), layout.shard(mask).to(torch.bool)
 
 
-class Glm5NextMoE(nn.Module):
+class Glm5NextMoE(MoECore, nn.Module):
     def __init__(
         self,
         cfg: Glm5NextConfig,
@@ -2371,30 +2362,13 @@ class Glm5NextMoE(nn.Module):
             if self.cfg.eplv2_shared_overlap and self.gate.weight.device.type in ("npu", "privateuseone"):
                 self._shared_stream = shared_expert_stream(self.gate.weight.device)
 
-    def _topk(self, hidden_states: torch.Tensor):
-        cfg = self.cfg
-        hidden_states = hidden_states.view(-1, cfg.hidden_size)
-        router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
-        scores = router_logits.sigmoid()
-        scores_for_choice = scores + self.e_score_correction_bias
-        group_scores = (
-            scores_for_choice.view(-1, cfg.n_group, cfg.n_routed_experts // cfg.n_group).topk(2, dim=-1)[0].sum(dim=-1)
-        )
-        group_idx = torch.topk(group_scores, k=cfg.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
-        score_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(-1, cfg.n_group, cfg.n_routed_experts // cfg.n_group)
-            .reshape(-1, cfg.n_routed_experts)
-        )
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
-        topk_indices = torch.topk(scores_for_choice, k=cfg.num_experts_per_tok, dim=-1, sorted=False)[1]
-        topk_weights = scores.gather(1, topk_indices)
-        if cfg.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * cfg.routed_scaling_factor
-        return router_logits, topk_weights, topk_indices
+    @property
+    def _ep_w2_scale(self) -> torch.Tensor:
+        return self.experts_w2_scale
+
+    @property
+    def _swiglu_limit(self) -> float:
+        return self.cfg.swiglu_limit
 
     def forward(
         self,
@@ -2488,104 +2462,12 @@ class Glm5NextMoE(nn.Module):
             out = cp_shard_rows(out, cp_context)
         return out.to(hidden_states.dtype).view(*orig_shape)
 
-    def _route_ep(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Match the FP32 router in _forward_w8a8 without changing expert inputs.
-        # Apply routed_scaling once after expert computation.
-        return kernels.moe_gate_routing(
-            self.gate(hidden.float()),
-            self.e_score_correction_bias,
-            self.topk,
-            self.topk_group,
-            self.n_group,
-            self.cfg.norm_topk_prob,
-            routed_scaling_factor=1.0,
-        )
-
     def _forward_ep(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Full-layout compatibility entry; use the same source-SP experts."""
         flat = hidden_states.reshape(-1, self.hidden)
         layout, mask = _eplv2_token_layout(self.cfg, flat, self._comm_policy)
         local = self._forward_sp(layout.shard(flat), layout, mask)
         return layout.gather(local).reshape(hidden_states.shape)
-
-    def _run_routed_sp(
-        self,
-        hidden: torch.Tensor,
-        layout: TokenParallelLayout,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        backend = layout.routed_backend
-        if backend not in ("mc2", "alltoall", "megamoe"):
-            raise ValueError(f"Unknown EPLv2 routed backend: {backend}")
-        if layout.valid_tokens:
-            weights, indices = self._route_ep(hidden)
-        else:
-            weights = hidden.new_zeros((layout.shard_tokens, self.topk), dtype=torch.float32)
-            indices = hidden.new_zeros((layout.shard_tokens, self.topk), dtype=torch.int32)
-        if backend == "alltoall":
-            return kernels.ep_moe_w8a8_alltoall(
-                hidden,
-                weights,
-                indices,
-                self.experts_w13,
-                self.experts_w2,
-                self.experts_w13_scale,
-                self.experts_w2_scale,
-                ep_size=self.cfg.ep_size,
-                ep_rank=self.cfg.ep_rank,
-                num_experts=self.num_experts,
-                x_active_mask=mask,
-                swiglu_limit=self.cfg.swiglu_limit,
-            )
-        if backend == "megamoe":
-            if not self.cfg.enable_mega_moe or layout.dispatch_tokens > self.cfg.mega_moe_num_max_tokens_per_rank:
-                raise ValueError("GLM MegaMoE must be enabled and fit the communication capacity")
-            if self.mega_moe_w13_scale is None or self.mega_moe_w2_scale is None:
-                raise RuntimeError("GLM MegaMoE scales must be encoded before execution")
-        else:
-            group_info = self._ep_dispatch_group_info
-            if group_info is None:
-                raise RuntimeError("GLM EPLv2 communication group must be initialized before execution")
-        # Both fixed-capacity backends consume the same EP-wide padded rows.
-        dispatch_hidden = layout.pad_dispatch(hidden)
-        dispatch_weights = layout.pad_dispatch(weights)
-        dispatch_indices = layout.pad_dispatch(indices)
-        dispatch_mask = layout.pad_dispatch(mask)
-        if backend == "megamoe":
-            output = kernels.mega_moe(
-                self.mega_moe_context,
-                dispatch_hidden,
-                dispatch_indices.to(torch.int32),
-                dispatch_weights.float(),
-                self.experts_w13,
-                self.experts_w2,
-                self.mega_moe_w13_scale,
-                self.mega_moe_w2_scale,
-                self.num_experts,
-                self.cfg.ep_size,
-                self.cfg.mega_moe_ccl_buffer_size,
-                self.cfg.mega_moe_num_max_tokens_per_rank,
-                x_active_mask=dispatch_mask,
-                swiglu_limit=self.cfg.swiglu_limit,
-            )
-        else:
-            output = kernels.ep_moe_w8a8(
-                dispatch_hidden,
-                dispatch_weights,
-                dispatch_indices,
-                self.experts_w13,
-                self.experts_w2,
-                self.experts_w13_scale,
-                self.experts_w2_scale,
-                group_ep=group_info[0],
-                ep_size=self.cfg.ep_size,
-                ep_rank=self.cfg.ep_rank,
-                num_experts=self.num_experts,
-                global_bs=0,
-                x_active_mask=dispatch_mask,
-                swiglu_limit=self.cfg.swiglu_limit,
-            )
-        return output[: layout.shard_tokens]
 
     def _forward_sp(
         self,
@@ -2615,27 +2497,8 @@ class Glm5NextMoE(nn.Module):
             # before launching shared work on either stream.
             backend, _ = _select_eplv2_backend(self._comm_policy, context, layout.dispatch_tokens)
             layout = replace(layout, routed_backend=backend)
-        if not layout.valid_tokens:
-            shared = torch.zeros_like(flat)
-            routed = self._run_routed_sp(flat, layout, token_mask)
-        elif self._shared_stream is None or not self.cfg.eplv2_shared_overlap:
-            shared = self.shared_experts(flat)
-            routed = self._run_routed_sp(flat, layout, token_mask)
-        else:
-            current = torch.npu.current_stream(flat.device)
-            auxiliary = self._shared_stream
-            auxiliary.wait_stream(current)
-            flat.record_stream(auxiliary)
-            with torch.npu.stream(auxiliary):
-                shared = self.shared_experts(flat)
-            routed = self._run_routed_sp(flat, layout, token_mask)
-            current.wait_stream(auxiliary)
-            shared.record_stream(current)
-        # Scale before the final cast: BF16/FP16 scaling would otherwise round
-        # away small residuals when routed and shared contributions cancel.
-        output = torch.add(shared.float(), routed.float(), alpha=self.routed_scaling).to(flat.dtype)
-        output.masked_fill_(~token_mask[:, None], 0)
-        return output.reshape(hidden_states.shape)
+        stream = self._shared_stream if self.cfg.eplv2_shared_overlap else None
+        return self._forward_source(flat, layout, token_mask, shared_stream=stream).reshape(hidden_states.shape)
 
 
 # ---------------------------------------------------------------------------

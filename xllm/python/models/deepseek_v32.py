@@ -38,6 +38,7 @@ from xllm.python.layers import (
     RotaryEmbedding,
     RowParallelLinear,
 )
+from xllm.python.layers.moe import QuantGatedMLP
 from xllm.python.model_executor.forward_context import (
     get_execution_buffer,
     get_forward_context,
@@ -496,17 +497,16 @@ class W8A8DynamicLinear(nn.Module):
         )
 
 
-def _swiglu_with_clamp(x: torch.Tensor, limit: float) -> torch.Tensor:
-    gate, up = x.chunk(2, dim=-1)
-    if 0.0 < limit < 1_000_000.0:
-        gate = gate.float().clamp_max(limit)
-        up = up.float().clamp(min=-limit, max=limit)
-        return (torch.nn.functional.silu(gate) * up).to(x.dtype)
-    return kernels.silu_and_mul(x)
+class DeepseekV3MLP(QuantGatedMLP):
+    """Dense gated-SiLU FFN (layers < first_k_dense_replace).
 
-
-class DeepseekV3MLP(nn.Module):
-    """Dense gated-SiLU FFN (layers < first_k_dense_replace)."""
+    Thin alias over QuantGatedMLP keeping the config-object constructor
+    that DeepSeek-V4/V4.1 and the checkpoint loaders already target.
+    A nonzero ``swiglu_limit`` keeps the historical fp32-upcast clamp (the
+    ``_swiglu_with_clamp`` semantics this alias replaced); ``limit == 0``
+    keeps the unclamped fused silu_and_mul fast path, the native TP
+    reduction and the fused requant path exactly as before.
+    """
 
     def __init__(
         self,
@@ -518,96 +518,17 @@ class DeepseekV3MLP(nn.Module):
         tp_override: Optional[int] = None,
         swiglu_limit: float = 0.0,
     ) -> None:
-        super().__init__()
-        tp = tp_override if tp_override is not None else cfg.tp_size
-        assert intermediate_size % tp == 0, f"intermediate_size {intermediate_size} not divisible by tp {tp}"
-        inter_local = intermediate_size // tp
-        self.tp = tp
-        self.skip_tp_reduce = skip_tp_reduce
-        self.swiglu_limit = swiglu_limit
-        self.gate_up_proj = W8A8DynamicLinear(cfg.hidden_size, 2 * inter_local, device)
-        self.down_proj = W8A8DynamicLinear(
-            inter_local,
+        super().__init__(
             cfg.hidden_size,
+            intermediate_size,
             device,
+            tp_size=tp_override if tp_override is not None else cfg.tp_size,
+            skip_tp_reduce=skip_tp_reduce,
+            swiglu_limit=swiglu_limit,
+            # Historical semantics: a nonzero limit clamps in fp32 (the
+            # pre-refactor _swiglu_with_clamp), not the native dtype.
+            clamp_precision="fp32" if swiglu_limit > 0 else "native",
         )
-
-    def process_weights_after_loading(self) -> None:
-        self.gate_up_proj.process_weights_after_loading()
-        self.down_proj.process_weights_after_loading()
-
-    def load_from_checkpoint(
-        self,
-        loader: W8A8WeightLoader,
-        mlp_prefix: str,
-        *,
-        world: int | None = None,
-        rank: int | None = None,
-    ) -> None:
-        """Load a dense W8A8 MLP; ``world``/``rank`` = ``None`` means use the loader's TP."""
-        loader.load_w8a8_mlp(mlp_prefix, world=world, rank=rank)
-        self.process_weights_after_loading()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        gate_up = self.gate_up_proj(x)
-        return self._forward_gate_up(gate_up, tp_reduce_add)
-
-    def forward_quantized(
-        self,
-        x_int8: torch.Tensor,
-        pertoken: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        gate_up = self.gate_up_proj.forward_quantized(x_int8, pertoken)
-        return self._forward_gate_up(gate_up, tp_reduce_add)
-
-    def forward_dequant_swiglu_quant(
-        self,
-        x: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x_int8, pertoken = kernels.dynamic_quant(x)
-        gate_up = self.gate_up_proj.forward_accumulated(x_int8)
-        act_int8, act_scale = kernels.dequant_swiglu_quant(
-            gate_up,
-            self.gate_up_proj.weight_scale,
-            pertoken,
-        )
-        reduce_result = self.tp > 1 and (not self.skip_tp_reduce or tp_reduce_add is not None)
-        out = self.down_proj.forward_quantized(act_int8, act_scale)
-        if tp_reduce_add is not None:
-            out = out + tp_reduce_add
-        if reduce_result:
-            distributed.tp_all_reduce(out)
-        return out
-
-    def quantize_and_project_gate_up(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x_int8, pertoken = kernels.dynamic_quant(x)
-        return self.gate_up_proj.forward_accumulated(x_int8), pertoken
-
-    def activate_and_quantize(self, gate_up: torch.Tensor, pertoken: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return kernels.dequant_swiglu_quant(gate_up, self.gate_up_proj.weight_scale, pertoken)
-
-    def project_down(self, act_int8: torch.Tensor, act_scale: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward_quantized(act_int8, act_scale)
-
-    def _forward_gate_up(
-        self,
-        gate_up: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None,
-    ) -> torch.Tensor:
-        act = _swiglu_with_clamp(gate_up, self.swiglu_limit)
-        reduce_result = self.tp > 1 and (not self.skip_tp_reduce or tp_reduce_add is not None)
-        out = self.down_proj(act)
-        if tp_reduce_add is not None:
-            out = out + tp_reduce_add
-        if reduce_result:
-            distributed.tp_all_reduce(out)
-        return out
 
 
 def _mlapo_v2_enabled(fused_mla_decode: bool) -> bool:

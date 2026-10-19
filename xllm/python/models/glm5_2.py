@@ -51,6 +51,7 @@ from xllm.python.layers import (
     HiddenParallelEmbedding,
     RMSNorm,
 )
+from xllm.python.layers.moe import QuantGatedMLP
 from xllm.python.model_executor.cp_utils import (
     cp_gather_kv,
     cp_merge_rows,
@@ -65,19 +66,21 @@ from xllm.python.model_executor.forward_context import (
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
-    DeepseekV3MLP,
-    DeepseekV3MoE,
+    DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
+)
+from xllm.python.models.deepseek_v32 import (
     W8A8StaticLinear,
     _apply_half_rope,
     _create_hadamard_matrix,
     _gather_interleave_cos_sin,
     _interleave_rope_with,
-    _swiglu_with_clamp,
     _tp_rank_from_device,
     _yarn_get_mscale,
 )
-from xllm.python.models.deepseek_v32 import (
-    DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
+from xllm.python.models.glm5_2_moe import (
+    Glm52MoE,
+    validate_glm52_ep_config,
+    validate_glm52_ep_execution_config,
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader, effective_moe_tp, mla_head_split
 
@@ -303,6 +306,7 @@ class Glm52Config:
             raise ValueError("layerwise_split_rank must be in [0, layerwise_split_size)")
         if self.layerwise_split_size > 1 and self.cp_size > 1:
             raise ValueError("GLM5.2 Python does not support CP and layerwise split together")
+        validate_glm52_ep_config(self)
 
     def _resolve_indexer_types(self) -> None:
         """Derive per-layer indexer mode (full/shared)."""
@@ -333,46 +337,28 @@ class Glm52Config:
         return mla_head_split(self.n_heads, self.tp_size)
 
 
-class Glm52MLP(DeepseekV3MLP):
-    """GLM dense MLP with numerically stable FP32 TP reduction."""
+class Glm52MLP(QuantGatedMLP):
+    """GLM-5.2 dense MLP: fp32 TP reduction, split-path fused requant."""
 
-    def _reduce_output(
+    def __init__(
         self,
-        out: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if tp_reduce_add is not None:
-            out = out + tp_reduce_add
-        if self.tp > 1 and (not self.skip_tp_reduce or tp_reduce_add is not None):
-            output_dtype = out.dtype
-            out = out.to(torch.float32)
-            distributed.tp_all_reduce(out)
-            out = out.to(output_dtype)
-        return out
-
-    def _forward_gate_up(
-        self,
-        gate_up: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None,
-    ) -> torch.Tensor:
-        act = _swiglu_with_clamp(gate_up, self.swiglu_limit)
-        out = self.down_proj(act)
-        return self._reduce_output(out, tp_reduce_add)
-
-    def forward_dequant_swiglu_quant(
-        self,
-        x: torch.Tensor,
-        tp_reduce_add: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x_int8, pertoken = kernels.dynamic_quant(x)
-        gate_up = self.gate_up_proj.forward_accumulated(x_int8)
-        act_int8, act_scale = kernels.dequant_swiglu_quant(
-            gate_up,
-            self.gate_up_proj.weight_scale,
-            pertoken,
+        cfg,
+        intermediate_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        super().__init__(
+            cfg.hidden_size,
+            intermediate_size,
+            device,
+            tp_size=cfg.tp_size,
+            # GLM-5.2 reduces the TP partial sum in fp32 (numerical-stability
+            # fix validated against the pre-refactor implementation).
+            tp_reduce="fp32",
+            # Historical split path: requantize returns raw gate|up int8 and
+            # activation happens via the explicit silu_and_mul fast path.
+            fused_swiglu=False,
         )
-        out = self.down_proj.forward_quantized(act_int8, act_scale)
-        return self._reduce_output(out, tp_reduce_add)
 
 
 class Glm52MLAAttention(Attention):
@@ -471,7 +457,6 @@ class Glm52MLAAttention(Attention):
         q_c = self.q_a_layernorm(q_a)
         forward_ctx = get_forward_context()
         backend = forward_ctx.attention_backend
-        cp_context = forward_ctx.cp_context
         layerwise = self.cfg.layerwise_split_size > 1 and not (
             forward_ctx.metadata.is_prefill or forward_ctx.metadata.is_chunked_prefill
         )
@@ -489,22 +474,12 @@ class Glm52MLAAttention(Attention):
                         device=hidden.device,
                     )
                 distributed.broadcast_(topk, layer_owner, "layerwise")
-            elif cp_context is None:
-                topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
             else:
-                # Indexer queries are packed to real CP-owned rows.  The key
-                # side is all-gathered inside the indexer so the paged index
-                # cache remains globally addressable.
-                query_index = cp_context.query_index
-                topk = self.indexer.select_qli(
-                    hidden.index_select(0, query_index),
-                    q_c.index_select(0, query_index),
-                    positions.index_select(0, query_index),
-                    ctx,
-                    cos_sin_cache,
-                    cache_hidden=hidden,
-                    cache_positions=positions,
-                )
+                # The replicated indexer gathers Q/K/weights in global order.
+                # Keep the complete padded CP-local layout here: real-query
+                # packing has unequal row counts on ragged zigzag shards and
+                # violates cp_gather_kv's all-gather/restore-index contract.
+                topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
         else:
             if prev_topk_indices is None:
                 raise ValueError(
@@ -613,8 +588,10 @@ class Glm52Indexer(nn.Module):
             [q, torch.zeros((q.size(0), pad_heads, q.size(2)), dtype=q.dtype, device=q.device)],
             dim=1,
         )
+        # Zero Q/weight heads contribute nothing; a neutral nonzero scale
+        # is safe for either multiplying or reciprocal dequantization.
         q_scale = torch.cat(
-            [q_scale, torch.zeros((q_scale.size(0), pad_heads), dtype=q_scale.dtype, device=q_scale.device)],
+            [q_scale, torch.ones((q_scale.size(0), pad_heads), dtype=q_scale.dtype, device=q_scale.device)],
             dim=1,
         )
         weights = torch.cat(
@@ -718,33 +695,6 @@ class Glm52Indexer(nn.Module):
         return topk
 
 
-class Glm52MoE(DeepseekV3MoE):
-    """EP MoE with CP rows materialized before expert reduction."""
-
-    def _combine_expert_outputs(
-        self,
-        routed: torch.Tensor,
-        shared: torch.Tensor,
-        use_mega_moe: bool,
-    ) -> torch.Tensor:
-        if self.ep_size > 1:
-            return super()._combine_expert_outputs(routed, shared, use_mega_moe)
-
-        final = routed + shared
-        if self.cfg.tp_size > 1:
-            distributed.all_reduce_(final, "tp")
-        return final
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        cp_context = get_forward_context().cp_context
-        if cp_context is None or self.ep_size == 1:
-            return super().forward(hidden)
-
-        global_hidden = cp_gather_kv(hidden, cp_context)
-        global_output = super().forward(global_hidden)
-        return cp_shard_rows(global_output, cp_context)
-
-
 class Glm52DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -788,6 +738,9 @@ class Glm52DecoderLayer(nn.Module):
 
 
 class Glm52Model(nn.Module):
+    # DFlash consumes captured target states in the original packed row order.
+    restores_aux_hidden_under_cp = True
+
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         tp = cfg.tp_size
@@ -835,7 +788,15 @@ class Glm52Model(nn.Module):
             record_layer_event(layer_id)
         hidden, _ = self.norm(hidden, residual)
         if cp_context is not None:
-            hidden = cp_merge_rows(hidden, cp_context)
+            if aux_hidden_buffer is not None:
+                # Merge target output and DFlash captures with the same row
+                # permutation in one collective, including padded/empty ranks.
+                width = hidden.shape[-1]
+                merged = cp_merge_rows(torch.cat((hidden, aux_hidden_buffer), dim=-1), cp_context)
+                hidden = merged[..., :width]
+                aux_hidden_buffer = merged[..., width:]
+            else:
+                hidden = cp_merge_rows(hidden, cp_context)
         return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
 
 
@@ -859,6 +820,7 @@ class Glm52ForCausalLM(PyModelBase):
         self.cfg.moe_tp_rank = int(config.get("moe_tp_rank", 0))
         self.cfg.world_size = int(config.get("world_size", self.cfg.tp_size * self.cfg.dp_size * self.cfg.cp_size))
         self.cfg.validate()
+        validate_glm52_ep_execution_config(config, self.cfg)
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "cuda"))
         self.dtype = dtype

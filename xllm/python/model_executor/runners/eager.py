@@ -63,9 +63,9 @@ class EagerRunner(BaseRunner):
 
         Having capture layers configured is NOT sufficient: a model may
         capture aux rows yet leave them in CP-sharded order at the model
-        exit (glm_moe_dsa merges only ``hidden``; glm5_next and
-        deepseek_v4 merge the aux buffer too), and a draft reading
-        sharded rows silently consumes token-misaligned hidden.
+        exit, and a draft reading sharded rows silently consumes
+        token-misaligned hidden. GLM-5.2, GLM-5 Next and DeepSeek-V4
+        explicitly restore both buffers before opting into this capability.
 
         Necessary, NOT sufficient. This attribute is the model-side half of
         the admission only: whether a given model+algorithm pairing may run
@@ -103,9 +103,8 @@ class EagerRunner(BaseRunner):
         # mechanism DFlash2's target-verify path uses -- are both CP-safe.
         # Gate on the model's explicit CP aux-restore capability rather
         # than capture configuration: only a model that merges the aux
-        # buffer back to global row order (glm5_next, deepseek_v4) feeds a
-        # draft token-aligned rows; capture configured but sharded
-        # (glm_moe_dsa) or absent must both stay refused.
+        # buffer back to global row order feeds a draft token-aligned rows.
+        # Capture configured but sharded, or absent, must both stay refused.
         if is_mla_cp_prefill and metadata.is_spec_verify and not self.model_restores_aux_hidden_under_cp:
             raise NotImplementedError(
                 "Python Context-Parallel does not support this target-side speculative verification path"

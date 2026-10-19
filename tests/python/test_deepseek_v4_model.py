@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from xllm.python.layers.moe import clamped_silu_and_mul_fp32
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import deepseek_v4, deepseek_v32
 from xllm.python.models.deepseek_v4 import (
@@ -38,7 +39,7 @@ from xllm.python.models.deepseek_v4 import (
     DeepseekV4MoE,
     DeepseekV4RotaryEmbedding,
 )
-from xllm.python.models.deepseek_v32 import DeepseekV3MLP, W8A8DynamicLinear, _swiglu_with_clamp
+from xllm.python.models.deepseek_v32 import DeepseekV3MLP, W8A8DynamicLinear
 from xllm.python.registry import get_model_class
 
 _DSV4_CONFIG = {
@@ -343,7 +344,7 @@ def test_clamped_swiglu_matches_cpp_activation_formula() -> None:
         x.dtype
     )
 
-    torch.testing.assert_close(_swiglu_with_clamp(x, 10.0), expected)
+    torch.testing.assert_close(clamped_silu_and_mul_fp32(x, 10.0), expected)
 
 
 def test_dynamic_linear_preserves_v3_and_v4_weight_layout_contracts(
@@ -385,10 +386,13 @@ def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
     mlp = DeepseekV3MLP(cfg, cfg.moe_intermediate_size, torch.float32, torch.device("cpu"))
     mlp.gate_up_proj.forward = MagicMock(return_value=torch.ones(1, 2 * mlp.gate_up_proj.out_features))
     mlp.down_proj.forward = MagicMock(return_value=torch.ones(1, cfg.hidden_size))
+    # DSV3MLP defaults to limit=0 and the fused silu_and_mul; mock the lazy
+    # kernel so the patch attaches despite kernels' __getattr__ export.
     monkeypatch.setattr(
-        deepseek_v32,
-        "_swiglu_with_clamp",
-        lambda tensor, limit: tensor[..., : tensor.shape[-1] // 2],
+        deepseek_v32.kernels,
+        "silu_and_mul",
+        lambda tensor: tensor[..., : tensor.shape[-1] // 2],
+        raising=False,
     )
     tp_reduce = MagicMock()
     monkeypatch.setattr(deepseek_v32.distributed, "tp_all_reduce", tp_reduce, raising=False)
