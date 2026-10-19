@@ -33,6 +33,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "api_service/request_admission.h"
 #include "core/common/instance_name.h"
 #include "core/common/message.h"
 #include "core/common/types.h"
@@ -517,7 +518,7 @@ void SpeechToTextServiceImpl::process_async_impl(
     model = *models_.begin();
   }
   if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
@@ -579,7 +580,7 @@ void SpeechToTextServiceImpl::process_async_impl(
   const Status language_status =
       adapter_->validate_language(rpc_request.language());
   if (!language_status.ok()) {
-    call->finish_with_error(language_status.code(), language_status.message());
+    call->finish_with_error(language_status);
     return;
   }
   if (!rpc_request.has_file() || (rpc_request.file().type() != "binary" &&
@@ -590,14 +591,8 @@ void SpeechToTextServiceImpl::process_async_impl(
   }
 
   if (master_->get_rate_limiter()->is_limited()) {
-    if (master_->get_rate_limiter()->is_sleeping()) {
-      call->finish_with_error(StatusCode::UNAVAILABLE,
-                              "Model is currently in sleep state.");
-    } else {
-      call->finish_with_error(
-          StatusCode::RESOURCE_EXHAUSTED,
-          "The number of concurrent requests has reached the limit.");
-    }
+    call->finish_with_error(api_service_internal::rate_limiter_rejection_status(
+        *master_->get_rate_limiter()));
     return;
   }
   ScopeGuard admission_guard(
@@ -611,7 +606,7 @@ void SpeechToTextServiceImpl::process_async_impl(
   const Status audio_status = load_speech_audio(
       rpc_request, call->take_request_iobuf(), max_bytes, audio_bytes);
   if (!audio_status.ok()) {
-    call->finish_with_error(audio_status.code(), audio_status.message());
+    call->finish_with_error(audio_status);
     return;
   }
 
@@ -700,7 +695,7 @@ void SpeechToTextServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
         if (req_output.cancelled) {

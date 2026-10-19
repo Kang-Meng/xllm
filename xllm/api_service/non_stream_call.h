@@ -22,10 +22,10 @@ limitations under the License.
 
 #include <atomic>
 #include <memory>
-#include <optional>
 #include <string>
 
-#include "call.h"
+#include "api_service/call.h"
+#include "api_service/public_error.h"
 #include "core/common/types.h"
 #include "core/util/verbose_trace_logger.h"
 
@@ -47,7 +47,8 @@ class NonStreamCall : public Call {
         request_(request),
         response_(response),
         use_arena_(use_arena) {
-    controller_->http_response().set_content_type("application/json");
+    controller_->http_response().set_content_type(
+        "application/json; charset=utf-8");
 
     json_options_.bytes_to_base64 = false;
     json_options_.jsonify_empty_array = true;
@@ -55,6 +56,7 @@ class NonStreamCall : public Call {
   }
 
   ~NonStreamCall() override {
+    record_result(!controller_->Failed() && !controller_->IsCanceled());
     done_->Run();
 
     if (!use_arena_) {
@@ -79,6 +81,7 @@ class NonStreamCall : public Call {
 
     XLLM_VERBOSE_TRACE() << "event=response_serialized x-request-id="
                          << x_request_id_;
+    response_complete_ = true;
     return true;
   }
 
@@ -106,9 +109,18 @@ class NonStreamCall : public Call {
   // For non stream response
   bool finish_with_error(const StatusCode& code,
                          const std::string& error_message) {
+    return finish_with_error(Status(code, error_message));
+  }
+
+  bool finish_with_error(const Status& status) {
+    record_error(status);
     XLLM_VERBOSE_TRACE() << "event=request_error x-request-id=" << x_request_id_
-                         << " message=" << error_message;
-    controller_->SetFailed(error_message);
+                         << " message=" << status.message();
+    if (!is_http_request_) {
+      controller_->SetFailed(status.message());
+      return true;
+    }
+    api_service::write_http_error(controller_, status);
     return true;
   }
 

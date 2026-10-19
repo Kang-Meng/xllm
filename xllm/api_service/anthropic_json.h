@@ -23,8 +23,24 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <string>
 
+#include "anthropic.pb.h"
+#include "core/common/types.h"
+
 namespace xllm {
 namespace api_service {
+
+inline Status validate_anthropic_request(
+    const proto::AnthropicMessagesRequest& request) {
+  if (request.max_tokens() < 0) {
+    return Status(StatusCode::INVALID_ARGUMENT,
+                  "Anthropic max_tokens must be non-negative.");
+  }
+  if (request.messages_size() == 0) {
+    return Status(StatusCode::INVALID_ARGUMENT, "Messages is empty!");
+  }
+  return Status();
+}
+
 namespace detail {
 
 inline bool has_only_key(const nlohmann::json& value, const char* key) {
@@ -128,7 +144,29 @@ inline bool proto_to_anthropic_json(const google::protobuf::Message& message,
 
   try {
     nlohmann::json parsed = nlohmann::json::parse(raw_buf.to_string());
-    *json = detail::normalize_json(parsed).dump();
+    parsed = detail::normalize_json(parsed);
+    const auto* event =
+        dynamic_cast<const proto::AnthropicStreamEvent*>(&message);
+    if (event != nullptr) {
+      if (event->type() == "message_start" && event->has_message()) {
+        nlohmann::json& start = parsed["message"];
+        if (!event->message().has_stop_reason()) {
+          start["stop_reason"] = nullptr;
+        }
+        if (!event->message().has_stop_sequence()) {
+          start["stop_sequence"] = nullptr;
+        }
+        start["usage"]["input_tokens"] =
+            event->message().usage().input_tokens();
+        start["usage"]["output_tokens"] =
+            event->message().usage().output_tokens();
+      } else if (event->type() == "message_delta" && event->has_delta()) {
+        if (!event->delta().has_stop_sequence()) {
+          parsed["delta"]["stop_sequence"] = nullptr;
+        }
+      }
+    }
+    *json = parsed.dump();
   } catch (const std::exception& e) {
     *err_msg = e.what();
     return false;

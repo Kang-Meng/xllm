@@ -17,11 +17,46 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
 namespace xllm {
 namespace {
+
+TEST(AnthropicUsageTest, SplitsPromptTokensIntoUncachedAndCachedUsage) {
+  for (const int32_t cached_tokens : {int32_t{0}, int32_t{6}, int32_t{10}}) {
+    const proto::AnthropicUsage usage = api_service::make_anthropic_usage(
+        /*prompt_tokens=*/10, /*generated_tokens=*/3, cached_tokens);
+    EXPECT_EQ(usage.input_tokens(), 10 - cached_tokens);
+    EXPECT_EQ(usage.output_tokens(), 3);
+    ASSERT_TRUE(usage.has_cache_read_input_tokens());
+    EXPECT_EQ(usage.cache_read_input_tokens(), cached_tokens);
+  }
+}
+
+TEST(AnthropicUsageTest, ExcessiveCacheHitsDoNotProduceNegativeInputTokens) {
+  const proto::AnthropicUsage usage = api_service::make_anthropic_usage(
+      /*prompt_tokens=*/10, /*generated_tokens=*/3, /*cached_tokens=*/11);
+  EXPECT_EQ(usage.input_tokens(), 0);
+  EXPECT_EQ(usage.output_tokens(), 3);
+  EXPECT_EQ(usage.cache_read_input_tokens(), 10);
+}
+
+TEST(AnthropicUsageTest, InvalidCountsAreClampedBeforeArithmetic) {
+  const proto::AnthropicUsage negative = api_service::make_anthropic_usage(
+      /*prompt_tokens=*/-1, /*generated_tokens=*/-2, /*cached_tokens=*/-3);
+  EXPECT_EQ(negative.input_tokens(), 0);
+  EXPECT_EQ(negative.output_tokens(), 0);
+  EXPECT_EQ(negative.cache_read_input_tokens(), 0);
+
+  const int32_t max_tokens = std::numeric_limits<int32_t>::max();
+  const proto::AnthropicUsage boundary = api_service::make_anthropic_usage(
+      max_tokens, /*generated_tokens=*/0, std::numeric_limits<int32_t>::min());
+  EXPECT_EQ(boundary.input_tokens(), max_tokens);
+  EXPECT_EQ(boundary.cache_read_input_tokens(), 0);
+}
 
 TEST(AnthropicStreamUtilsTest, MapsToolFinishReasonsToToolUse) {
   EXPECT_EQ(api_service::convert_finish_reason_to_anthropic("tool_calls"),

@@ -575,7 +575,9 @@ std::shared_ptr<Request> RecRequestFactory::build_request_common(
   }
   if (prompt_tokens.size() >= max_context_len) {
     LOG(ERROR) << "Prompt is too long: " << prompt_tokens.size();
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, "Prompt is too long");
+    callback(Status{StatusCode::INVALID_ARGUMENT,
+                    "Prompt is too long",
+                    FailureReason::PROMPT_TOO_LONG});
     return nullptr;
   }
 

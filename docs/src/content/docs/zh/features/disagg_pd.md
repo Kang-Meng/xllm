@@ -20,6 +20,14 @@ xLLM PD分离功能主要通过以下三个模块实现：
 - **xLLM**: 参见[安装编译](/zh/getting_started/quick_start/)
 - **xLLM Service**: 参见[xLLM Service](https://github.com/xLLM-AI/xllm-service)
 
+#### 统一 API 错误兼容性
+
+先升级 xLLM Service，再升级 xLLM。`GenerationStatus.error`（字段 5）传递完整
+公开错误：HTTP 状态、type、code、message、可选 param 和 retryable。xLLM 只映射
+一次，Service 直接渲染为 HTTP/SSE，不再二次映射。字段 1–4 保留内部状态语义；
+没有 `error` 时使用旧版映射。旧版读取端会忽略新字段，因此混合版本期间不能保证
+完整错误一致性。回调 RPC 的接收确认不代表业务成功。
+
 ### 启动PD分离服务
 1. 启动etcd
 ```

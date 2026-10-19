@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "llm_master.h"
+#include "core/distributed_runtime/llm_master.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -27,18 +27,18 @@ limitations under the License.
 #include <vector>
 
 #include "api_service/call.h"
-#include "common/metrics.h"
+#include "core/common/metrics.h"
+#include "core/distributed_runtime/speculative_engine.h"
+#include "core/framework/model/model_args.h"
+#include "core/framework/request/request.h"
 #include "core/platform/device_name_utils.h"
-#include "framework/model/model_args.h"
-#include "framework/request/request.h"
+#include "core/runtime/xservice_client.h"
+#include "core/scheduler/scheduler_factory.h"
+#include "core/util/net.h"
+#include "core/util/scope_guard.h"
+#include "core/util/timer.h"
 #include "models/model_registry.h"
-#include "runtime/xservice_client.h"
-#include "scheduler/scheduler_factory.h"
 #include "server/xllm_server_registry.h"
-#include "speculative_engine.h"
-#include "util/net.h"
-#include "util/scope_guard.h"
-#include "util/timer.h"
 
 namespace xllm {
 namespace {
@@ -235,10 +235,11 @@ void LLMMaster::handle_request(std::string prompt,
     }
 
     if (!scheduler_->add_request(request)) {
-      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
-                          "No available resources to schedule request",
-                          sp.service_request_id,
-                          sp.source_xservice_addr);
+      callback({Status(StatusCode::RESOURCE_EXHAUSTED,
+                       "No available resources to schedule request",
+                       FailureReason::TEMPORARY_OVERLOAD),
+                sp.service_request_id,
+                sp.source_xservice_addr});
     }
   });
 }
@@ -278,10 +279,11 @@ void LLMMaster::handle_request(std::vector<Message> messages,
     }
 
     if (!scheduler_->add_request(request)) {
-      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
-                          "No available resources to schedule request",
-                          sp.service_request_id,
-                          sp.source_xservice_addr);
+      callback({Status(StatusCode::RESOURCE_EXHAUSTED,
+                       "No available resources to schedule request",
+                       FailureReason::TEMPORARY_OVERLOAD),
+                sp.service_request_id,
+                sp.source_xservice_addr});
     }
   });
 }

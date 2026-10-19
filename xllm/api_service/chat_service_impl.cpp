@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "chat_service_impl.h"
+#include "api_service/chat_service_impl.h"
 
 #include <absl/strings/escaping.h>
 #include <absl/time/clock.h>
@@ -29,6 +29,7 @@ limitations under the License.
 #include <string>
 #include <unordered_set>
 
+#include "api_service/mm_service_utils.h"
 #include "api_service/request_admission.h"
 #include "api_service/stream_output_parser.h"
 #include "api_service/utils.h"
@@ -42,7 +43,6 @@ limitations under the License.
 #include "core/util/binary_payload.h"
 #include "core/util/utils.h"
 #include "core/util/uuid.h"
-#include "mm_service_utils.h"
 
 #ifdef unlikely
 #undef unlikely
@@ -509,9 +509,8 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
   }
 
   if (rec_master_->get_rate_limiter()->is_limited()) {
-    call->finish_with_error(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.");
+    call->finish_with_error(api_service_internal::rate_limiter_rejection_status(
+        *rec_master_->get_rate_limiter()));
     return;
   }
 
@@ -584,7 +583,7 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 
@@ -615,13 +614,12 @@ void ChatServiceImpl::process_async_rpc_impl(
   CHECK(master_ != nullptr);
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  const Status admission_status = api_service_internal::admit_rpc_request(
+  Status admission_status = api_service_internal::admit_rpc_request(
       model, models_, master_->get_rate_limiter());
   if (unlikely(!admission_status.ok())) {
-    CALLBACK_WITH_ERROR(admission_status.code(),
-                        admission_status.message(),
-                        service_request_id,
-                        target_xservice_addr);
+    callback({std::move(admission_status),
+              service_request_id,
+              target_xservice_addr});
     return;
   }
 
@@ -687,7 +685,8 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   // Route to RecMaster if configured
   if (rec_master_) {
     if (unlikely(!models_.contains(model))) {
-      call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+      call->finish_with_error(
+          api_service_internal::model_not_supported_status());
       return;
     }
     process_rec_chat_request(call);
@@ -696,21 +695,15 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
   LLMMaster* master = get_model_master(model);
   if (unlikely(master == nullptr)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
   // LLMMaster path (existing logic)
-  // Check if the request is being rate-limited or model is sleeping.
-  // is_limited() returns true if sleeping or rate-limited.
+  // The limiter distinguishes a sleeping model from an exhausted concurrency
+  // allowance; clients must not treat both failures as the same retry cause.
   if (unlikely(master->get_rate_limiter()->is_limited())) {
-    if (master->get_rate_limiter()->is_sleeping()) {
-      call->finish_with_error(StatusCode::UNAVAILABLE,
-                              "Model is currently in sleep state.");
-    } else {
-      call->finish_with_error(
-          StatusCode::RESOURCE_EXHAUSTED,
-          "The number of concurrent requests has reached the limit.");
-    }
+    call->finish_with_error(api_service_internal::rate_limiter_rejection_status(
+        *master->get_rate_limiter()));
     return;
   }
 
@@ -805,7 +798,7 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 
@@ -847,7 +840,7 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   const auto& req_messages = rpc_request.messages();
   const auto& model = rpc_request.model();
   if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
@@ -859,9 +852,8 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
 
   // Check if the request is being rate-limited.
   if (master_->get_rate_limiter()->is_limited()) {
-    call->finish_with_error(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.");
+    call->finish_with_error(api_service_internal::rate_limiter_rejection_status(
+        *master_->get_rate_limiter()));
     return;
   }
 
@@ -916,7 +908,7 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 

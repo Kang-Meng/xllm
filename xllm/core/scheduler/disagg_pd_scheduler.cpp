@@ -17,11 +17,13 @@ limitations under the License.
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
+#include <brpc/errno.pb.h>
 #include <brpc/server.h>
 #include <butil/endpoint.h>
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <iomanip>
 #include <limits>
 #include <queue>
@@ -58,6 +60,27 @@ namespace xllm {
 namespace {
 
 using RequestPtr = std::shared_ptr<Request>;
+
+Status rpc_failure_status(const brpc::Controller& controller) {
+  switch (controller.ErrorCode()) {
+    case brpc::ERPCTIMEDOUT:
+      return {StatusCode::DEADLINE_EXCEEDED, controller.ErrorText()};
+    case ECONNREFUSED:
+    case ECONNRESET:
+    case ENOTCONN:
+    case EHOSTDOWN:
+    case EHOSTUNREACH:
+    case ENETUNREACH:
+    case EPIPE:
+    case brpc::EFAILEDSOCKET:
+    case brpc::EEOF:
+    case brpc::ELOGOFF:
+    case brpc::ECLOSE:
+      return {StatusCode::UNAVAILABLE, controller.ErrorText()};
+    default:
+      return {StatusCode::UNKNOWN, controller.ErrorText()};
+  }
+}
 
 // Returns true when |a| has lower scheduling priority than |b| (i.e. |a|
 // should be dispatched after |b|).  std::priority_queue is a max-heap, so the
@@ -542,7 +565,8 @@ void DisaggPDScheduler::dispatch_requests() {
     if (remote_info.name.empty()) {
       response_processor_->process_failed_request(
           request,
-          {StatusCode::UNKNOWN, "failed to fetch remote decode instance info"});
+          {StatusCode::UNAVAILABLE,
+           "failed to fetch remote decode instance info"});
       continue;
     }
     remote_instances_info_[selected_instance] = remote_info;
@@ -704,10 +728,8 @@ void DisaggPDScheduler::dispatch_requests() {
       LOG(ERROR) << "Failed to add new requests to decode instance : "
                  << selected_instance << ", error text : " << cntl.ErrorText();
       for (auto& request : requests) {
-        response_processor_->process_failed_request(
-            request,
-            {StatusCode::UNKNOWN,
-             "Failed to add new requests to decode instance"});
+        response_processor_->process_failed_request(request,
+                                                    rpc_failure_status(cntl));
 
         {
           std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
@@ -1395,7 +1417,8 @@ void DisaggPDScheduler::do_permanent_rejection(
   response_processor_->process_failed_request(
       request,
       {StatusCode::RESOURCE_EXHAUSTED,
-       "Request prompt exceeds decode KV cache capacity"});
+       "Request prompt exceeds decode KV cache capacity",
+       FailureReason::PROMPT_TOO_LONG});
   kv_cache_manager_->deallocate(request.get());
   std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
   req_to_channel_map_.erase(request->request_id());

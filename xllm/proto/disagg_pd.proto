@@ -205,9 +205,24 @@ message SequenceOutput {
   repeated LogProb logprobs = 5;
 }
 
+message PublicError {
+  int32 http_status_code = 1;
+  string type = 2;
+  string code = 3;
+  string message = 4;
+  optional string param = 5;
+  bool retryable = 6;
+}
+
 message GenerationStatus {
   int32 status_code = 1;
   string status_msg = 2;
+  // Legacy classification: keep fields 3/4 until readers without error retire.
+  // Never reuse their field numbers after retirement.
+  optional int32 failure_reason = 3;
+  optional string param = 4;
+  // Public business failure; not the status of the callback RPC.
+  PublicError error = 5;
 }
 
 // Stream response token to prefill instance from decode.

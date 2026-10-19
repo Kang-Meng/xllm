@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "completion_service_impl.h"
+#include "api_service/completion_service_impl.h"
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
@@ -25,8 +25,9 @@ limitations under the License.
 #include <string>
 
 #include "api_service/request_admission.h"
-#include "common/instance_name.h"
+#include "api_service/utils.h"
 #include "completion.pb.h"
+#include "core/common/instance_name.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/framework/request/request_output.h"
 #include "core/util/utils.h"
@@ -106,9 +107,7 @@ bool send_delta_to_client_brpc(std::shared_ptr<CompletionCall> call,
     response.set_model(model);
     response.mutable_choices();
     auto* proto_usage = response.mutable_usage();
-    proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
-    proto_usage->set_completion_tokens(usage.num_generated_tokens);
-    proto_usage->set_total_tokens(usage.num_total_tokens);
+    api_service::set_proto_usage(proto_usage, usage);
     if (!call->write(response)) {
       return false;
     }
@@ -146,9 +145,7 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
   if (req_output.usage.has_value()) {
     const auto& usage = req_output.usage.value();
     auto* proto_usage = response.mutable_usage();
-    proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
-    proto_usage->set_completion_tokens(usage.num_generated_tokens);
-    proto_usage->set_total_tokens(usage.num_total_tokens);
+    api_service::set_proto_usage(proto_usage, usage);
   }
 
   return call->write_and_finish(response);
@@ -194,13 +191,12 @@ void CompletionServiceImpl::process_async_rpc_impl(
 
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  const Status admission_status = api_service_internal::admit_rpc_request(
+  Status admission_status = api_service_internal::admit_rpc_request(
       model, models_, master_->get_rate_limiter());
   if (unlikely(!admission_status.ok())) {
-    CALLBACK_WITH_ERROR(admission_status.code(),
-                        admission_status.message(),
-                        service_request_id,
-                        target_xservice_addr);
+    callback({std::move(admission_status),
+              service_request_id,
+              target_xservice_addr});
     return;
   }
 
@@ -230,21 +226,15 @@ void CompletionServiceImpl::process_async_impl(
   const auto& model = rpc_request.model();
   LLMMaster* master = get_model_master(model);
   if (unlikely(master == nullptr)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
-  // Check if the request is being rate-limited or model is sleeping.
-  // is_limited() returns true if sleeping or rate-limited.
+  // Preserve the rejection cause: sleep and configured concurrency are not
+  // interchangeable from the caller's perspective.
   if (unlikely(master->get_rate_limiter()->is_limited())) {
-    if (master->get_rate_limiter()->is_sleeping()) {
-      call->finish_with_error(StatusCode::UNAVAILABLE,
-                              "Model is currently in sleep state.");
-    } else {
-      call->finish_with_error(
-          StatusCode::RESOURCE_EXHAUSTED,
-          "The number of concurrent requests has reached the limit.");
-    }
+    call->finish_with_error(api_service_internal::rate_limiter_rejection_status(
+        *master->get_rate_limiter()));
     return;
   }
 
@@ -284,7 +274,7 @@ void CompletionServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 

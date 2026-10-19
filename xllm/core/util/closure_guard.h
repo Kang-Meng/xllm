@@ -53,10 +53,9 @@ class ClosureGuard {
     _done = done;
   }
 
-  // Return and set internal closure to nullptr.
+  // Transfer the closure and completion accounting to the new owner.
+  // Admission/handoff is not completion, so do not run _after_done here.
   google::protobuf::Closure* release() {
-    _after_done(nullptr);
-
     google::protobuf::Closure* const prev_done = _done;
     _done = nullptr;
     return prev_done;

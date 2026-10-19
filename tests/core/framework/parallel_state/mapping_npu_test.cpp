@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "mapping_npu.h"
+#include "core/framework/parallel_state/mapping_npu.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -21,6 +21,8 @@ limitations under the License.
 #include <cstdlib>
 #include <optional>
 #include <string>
+
+#include "xllm_atb_layers/core/include/atb_speed/base/external_comm_manager.h"
 
 namespace xllm {
 namespace {
@@ -97,6 +99,54 @@ TEST(TestMappingNPU, ToJsonUsesHcclBuffsizeEnv) {
   nlohmann::json mlp_tp = data["mlpTp"];
   int32_t mlp_tp_buffer_size = mlp_tp["bufferSize"];
   EXPECT_EQ(mlp_tp_buffer_size, 128);
+}
+
+TEST(TestMappingNPU, BufferOffsetIsExplicitAndRankIndependent) {
+  ScopedEnvVar hccl_buffsize("HCCL_BUFFSIZE");
+  hccl_buffsize.set("128");
+  MappingNPU::Options options = get_mapping_options();
+  MappingNPU first("", /*world_size=*/16, /*rank=*/0, options);
+  MappingNPU second("", /*world_size=*/16, /*rank=*/1, options);
+  EXPECT_EQ(first.to_json()["attnTp"]["bufferSize"], 128);
+  EXPECT_EQ(second.to_json()["attnTp"]["bufferSize"], 128);
+  options.buffer_offset(1);
+  MappingNPU draft("", /*world_size=*/16, /*rank=*/1, options);
+  EXPECT_EQ(draft.to_json()["attnTp"]["bufferSize"], 129);
+  EXPECT_EQ(first.to_json()["attnTp"]["bufferSize"], 128);
+  options.buffer_offset(2);
+  MappingNPU second_model("", /*world_size=*/16, /*rank=*/0, options);
+  EXPECT_EQ(second_model.to_json()["attnTp"]["bufferSize"], 130);
+  options.buffer_offset(3);
+  MappingNPU second_model_draft("", /*world_size=*/16, /*rank=*/1, options);
+  EXPECT_EQ(second_model_draft.to_json()["attnTp"]["bufferSize"], 131);
+}
+
+TEST(TestMappingNPU, ModelOffsetsSeparateActualAtbCommunicationCache) {
+  atb_speed::ExternalCommManager manager;
+  manager.SetLcclCommDomainRange(/*lowerBound=*/0, /*upperBound=*/65536);
+  manager.Init(/*worldSize=*/2,
+               /*subCommRankId=*/0,
+               /*backend=*/"lccl",
+               /*rankTableFile=*/"",
+               /*streamId=*/0);
+  const auto domain = [&manager](uint32_t buffer_size) {
+    return manager.GetCommDomain(/*groupId=*/0,
+                                 /*rankIds=*/{0, 1},
+                                 /*subCommRankId=*/0,
+                                 /*backend=*/"lccl",
+                                 buffer_size,
+                                 /*streamId=*/0);
+  };
+  const std::string target = domain(128);
+  const std::string draft = domain(129);
+  const std::string second_target = domain(130);
+  const std::string second_draft = domain(131);
+  EXPECT_EQ(domain(128), target);
+  EXPECT_EQ(domain(130), second_target);
+  EXPECT_NE(target, draft);
+  EXPECT_NE(target, second_target);
+  EXPECT_NE(draft, second_target);
+  EXPECT_NE(second_target, second_draft);
 }
 
 }  // namespace xllm

@@ -3,6 +3,7 @@
 #include <absl/time/clock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <future>
@@ -21,6 +22,7 @@
 #include "core/framework/config/speculative_config.h"
 #include "distributed_runtime/engine.h"
 #include "framework/kv_cache/kv_cache_utils.h"
+#include "scheduler/async_response_processor.h"
 #include "scheduler_factory.h"
 #include "util/utils.h"
 
@@ -358,7 +360,8 @@ std::vector<std::shared_ptr<Request>> generate_request(
 std::shared_ptr<Request> generate_request_with_prompt_tokens(
     const std::vector<int32_t>& prompt_token_ids,
     int32_t max_tokens,
-    int32_t max_context_len) {
+    int32_t max_context_len,
+    const std::string& service_request_id = "1") {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
 
@@ -383,7 +386,51 @@ std::shared_ptr<Request> generate_request_with_prompt_tokens(
                          nullptr,
                          nullptr);
 
-  return std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
+  return std::make_shared<Request>(
+      "1", "1", "1", std::move(req_state), service_request_id);
+}
+
+TEST(AsyncResponseProcessorTest, MixedRequestsKeepTheirOwnRoutes) {
+  for (const bool stream : {false, true}) {
+    FakeTokenizer tokenizer;
+    AsyncResponseProcessor processor(
+        &tokenizer,
+        std::nullopt,
+        /*enable_service_routing=*/true,
+        /*disable_log_stats=*/true,
+        [](std::shared_ptr<Request> /*unused*/) {});
+    auto direct = generate_request_with_prompt_tokens(
+        {1, 2}, 1, 32, /*service_request_id=*/"");
+    auto service = generate_request_with_prompt_tokens(
+        {1, 2}, 1, 32, /*service_request_id=*/"service-1");
+    direct->state().stream = stream;
+    service->state().stream = stream;
+    direct->set_cancel();
+    service->set_cancel();
+    std::atomic<int32_t> direct_outputs{0};
+    std::atomic<int32_t> service_outputs{0};
+    direct->state().output_func = [&](const RequestOutput& output) {
+      EXPECT_TRUE(output.service_request_id.empty());
+      ++direct_outputs;
+      return true;
+    };
+    service->state().outputs_func =
+        [&](const std::vector<RequestOutput>& outputs) {
+          EXPECT_EQ(outputs.size(), 1u);
+          EXPECT_EQ(outputs.front().service_request_id, "service-1");
+          ++service_outputs;
+          return std::vector<bool>{true};
+        };
+    std::vector<std::shared_ptr<Request>> requests{direct, service};
+    if (stream) {
+      processor.process_stream_requests(requests);
+    } else {
+      processor.process_completed_requests(requests);
+    }
+    processor.wait_completion();
+    EXPECT_EQ(direct_outputs.load(), 1);
+    EXPECT_EQ(service_outputs.load(), 1);
+  }
 }
 
 std::shared_ptr<Request> generate_request_with_best_of(

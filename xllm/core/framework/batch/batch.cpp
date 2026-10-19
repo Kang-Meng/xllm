@@ -160,7 +160,7 @@ std::unordered_set<std::string> fail_kv_push_requests(
     if (!sequence->cancelled() &&
         matched_request_ids.find(sequence->request_id()) !=
             matched_request_ids.end()) {
-      sequence->fail(Status(StatusCode::UNKNOWN, "KV cache push failed"));
+      sequence->fail(Status(StatusCode::UNAVAILABLE, "KV cache push failed"));
     }
   }
   return matched_request_ids;

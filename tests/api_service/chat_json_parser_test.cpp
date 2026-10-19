@@ -51,6 +51,17 @@ class PreprocessChatJsonTest : public ::testing::Test {
         << "' does not contain expected substring '" << expected_error_substring
         << "'";
   }
+
+  void expect_parameter_error(const std::string& input,
+                              const ChatJsonParser& parser,
+                              const std::string& expected_param) {
+    auto [status, result] = parser.preprocess(input);
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(status.reason(), FailureReason::INVALID_PARAMETER);
+    EXPECT_EQ(status.param(), expected_param);
+    EXPECT_TRUE(result.empty());
+  }
 };
 
 // =============================================================================
@@ -371,6 +382,8 @@ TEST_F(PreprocessChatJsonTest, RejectsNonObjectChatTemplateKwargsWithEffort) {
         kwargs + "}";
     auto [status, result] = parser.preprocess(input);
     EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT) << input;
+    EXPECT_EQ(status.reason(), FailureReason::INVALID_PARAMETER) << input;
+    EXPECT_EQ(status.param(), "chat_template_kwargs") << input;
     EXPECT_NE(status.message().find("chat_template_kwargs must be an object"),
               std::string::npos)
         << input;
@@ -573,7 +586,20 @@ TEST_F(PreprocessChatJsonTest, InvalidObjectToolChoiceReturnsError) {
   })";
 
   LlmChatJsonParser parser;
-  expect_error(input, parser, "function.name");
+  expect_parameter_error(input, parser, "tool_choice.function.name");
+}
+
+TEST_F(PreprocessChatJsonTest, VlmToolChoiceErrorNamesTheNestedField) {
+  VlmChatJsonParser parser;
+  expect_parameter_error(
+      R"({"tool_choice":{"type":"function"}})", parser, "tool_choice.function");
+}
+
+TEST_F(PreprocessChatJsonTest, InvalidMessageObjectNamesMessages) {
+  LlmChatJsonParser llm_parser;
+  VlmChatJsonParser vlm_parser;
+  expect_parameter_error(R"({"messages":[42]})", llm_parser, "messages");
+  expect_parameter_error(R"({"messages":[42]})", vlm_parser, "messages");
 }
 
 TEST_F(PreprocessChatJsonTest, UnknownContentTypeOnMultimodal) {
@@ -597,7 +623,7 @@ TEST_F(PreprocessChatJsonTest, UnknownContentTypeErrorsOnTextOnly) {
     }]
   })";
   LlmChatJsonParser llm_parser;
-  expect_error(input, llm_parser, "multimodal backend");
+  expect_parameter_error(input, llm_parser, "messages.content.type");
 }
 
 // =============================================================================
@@ -796,6 +822,53 @@ TEST_F(PreprocessChatJsonTest, AnthropicIgnoreEosParsedAfterRemap) {
   EXPECT_TRUE(request.ignore_eos());
   ASSERT_EQ(request.messages_size(), 1);
   EXPECT_EQ(request.messages(0).content_string(), "Hello");
+}
+
+TEST_F(PreprocessChatJsonTest, ToolHistoryArgumentsKeepOriginalWireString) {
+  const std::string arguments = R"( { "z": 2, "a": {"z":1,"a":2} } )";
+  const nlohmann::json body = {
+      {"messages",
+       {{{"role", "assistant"},
+         {"content", nullptr},
+         {"tool_calls",
+          {{{"type", "function"},
+            {"function", {{"name", "probe"}, {"arguments", arguments}}}}}}}}}};
+  for (const ServingMode mode : {ServingMode::LLM, ServingMode::VLM}) {
+    auto [status, result] = ChatJsonParser::get(mode).preprocess(body.dump());
+    ASSERT_TRUE(status.ok()) << status.message();
+    const auto json = nlohmann::json::parse(result);
+    EXPECT_EQ(json["messages"][0]["tool_calls"][0]["function"]["arguments"],
+              arguments);
+    proto::ChatRequest request;
+    ASSERT_TRUE(
+        google::protobuf::util::JsonStringToMessage(result, &request).ok());
+    EXPECT_EQ(request.messages(0).tool_calls(0).function().arguments(),
+              arguments);
+  }
+}
+
+TEST_F(PreprocessChatJsonTest, InvalidToolHistoryNamesExactArgumentParameter) {
+  for (const nlohmann::json arguments : {nlohmann::json(""),
+                                         nlohmann::json("{"),
+                                         nlohmann::json("[]"),
+                                         nlohmann::json("null"),
+                                         nlohmann::json("42"),
+                                         nlohmann::json("\"text\""),
+                                         nlohmann::json::object(),
+                                         nlohmann::json::array(),
+                                         nlohmann::json(nullptr)}) {
+    const nlohmann::json body = {
+        {"messages",
+         {{{"role", "assistant"},
+           {"tool_calls",
+            {{{"function",
+               {{"name", "probe"}, {"arguments", arguments}}}}}}}}}};
+    for (const ServingMode mode : {ServingMode::LLM, ServingMode::VLM}) {
+      expect_parameter_error(body.dump(),
+                             ChatJsonParser::get(mode),
+                             "messages[0].tool_calls[0].function.arguments");
+    }
+  }
 }
 
 }  // namespace xllm

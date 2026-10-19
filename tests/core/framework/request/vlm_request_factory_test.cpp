@@ -242,7 +242,9 @@ TEST_F(VLMRequestFactoryTest, RejectsPromptLongerThanContext) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(), "Prompt is too long");
+  EXPECT_EQ(capture.status->reason(), FailureReason::PROMPT_TOO_LONG);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
@@ -330,4 +332,25 @@ TEST_F(VLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
 }
 
 }  // namespace
+TEST_F(VLMRequestFactoryTest, InvalidHistoryReleasesSlot) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  Message assistant("assistant", "");
+  Message::ToolCall call;
+  call.function.arguments = "null";
+  assistant.tool_calls = Message::ToolCallVec{call};
+  auto request = factory->create(ChatMessages{assistant},
+                                 sp,
+                                 /*payload=*/BinaryPayload(),
+                                 make_capture_callback(&capture),
+                                 /*apply_chat_template=*/false);
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->reason(), FailureReason::INVALID_PARAMETER);
+  EXPECT_EQ(capture.status->param(),
+            "messages[0].tool_calls[0].function.arguments");
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
 }  // namespace xllm

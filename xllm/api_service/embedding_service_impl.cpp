@@ -13,22 +13,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "embedding_service_impl.h"
+#include "api_service/embedding_service_impl.h"
 
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <string>
 
-#include "common/instance_name.h"
+#include "api_service/embedding_output_builder.h"
+#include "api_service/mm_service_utils.h"
+#include "api_service/request_admission.h"
+#include "core/common/instance_name.h"
+#include "core/distributed_runtime/llm_master.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/request/request_params.h"
 #include "core/util/binary_payload.h"
-#include "distributed_runtime/llm_master.h"
-#include "embedding_output_builder.h"
-#include "framework/config/model_config.h"
-#include "framework/request/request_params.h"
-#include "mm_service_utils.h"
-#include "util/utils.h"
-#include "util/uuid.h"
+#include "core/util/utils.h"
+#include "core/util/uuid.h"
 
 namespace xllm {
 namespace {
@@ -100,7 +101,7 @@ void EmbeddingServiceImpl::process_async_impl(
   // check if model is supported
   const auto& model = rpc_request.model();
   if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
@@ -127,7 +128,7 @@ void EmbeddingServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 
@@ -149,7 +150,7 @@ void MMEmbeddingServiceImpl::process_async_impl(
   // check if model is supported
   const auto& model = rpc_request.model();
   if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
@@ -197,7 +198,7 @@ void MMEmbeddingServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 

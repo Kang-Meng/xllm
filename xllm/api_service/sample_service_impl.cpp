@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "sample_service_impl.h"
+#include "api_service/sample_service_impl.h"
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
@@ -23,7 +23,8 @@ limitations under the License.
 #include <condition_variable>
 #include <mutex>
 
-#include "common/instance_name.h"
+#include "api_service/request_admission.h"
+#include "core/common/instance_name.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/framework/request/request_output.h"
 #include "core/framework/request/request_params.h"
@@ -113,12 +114,8 @@ Status get_rate_limit_status(LLMMaster* master) {
     return Status();
   }
 
-  if (master->get_rate_limiter()->is_sleeping()) {
-    return Status(StatusCode::UNAVAILABLE,
-                  "Model is currently in sleep state.");
-  }
-  return Status(StatusCode::RESOURCE_EXHAUSTED,
-                "The number of concurrent requests has reached the limit.");
+  return api_service_internal::rate_limiter_rejection_status(
+      *master->get_rate_limiter());
 }
 
 }  // namespace
@@ -127,25 +124,26 @@ namespace sample_service_internal {
 
 Status validate_request(const proto::SampleRequest& request) {
   if (request.model().empty()) {
-    return Status(StatusCode::INVALID_ARGUMENT, "model is required");
+    return Status::invalid_parameter("model is required", "model");
   }
   if (request.prompt().empty()) {
-    return Status(StatusCode::INVALID_ARGUMENT, "prompt is required");
+    return Status::invalid_parameter("prompt is required", "prompt");
   }
   if (!request.has_selector()) {
-    return Status(StatusCode::INVALID_ARGUMENT, "selector is required");
+    return Status::invalid_parameter("selector is required", "selector");
   }
   if (request.selector().type() != "literal") {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "selector.type must be literal");
+    return Status::invalid_parameter("selector.type must be literal",
+                                     "selector.type");
   }
   if (request.selector().value().empty()) {
-    return Status(StatusCode::INVALID_ARGUMENT, "selector.value is required");
+    return Status::invalid_parameter("selector.value is required",
+                                     "selector.value");
   }
   if (request.has_logprobs() && (request.logprobs() < kMinSampleLogprobs ||
                                  request.logprobs() > kMaxSampleLogprobs)) {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "logprobs must be between 1 and 5");
+    return Status::invalid_parameter("logprobs must be between 1 and 5",
+                                     "logprobs");
   }
   return Status();
 }
@@ -282,7 +280,7 @@ bool SampleServiceImpl::process_request(const proto::SampleRequest& request,
   }
 
   if (!models_.contains(request.model())) {
-    *status = Status(StatusCode::UNKNOWN, "Model not supported");
+    *status = api_service_internal::model_not_supported_status();
     return false;
   }
 
@@ -379,19 +377,19 @@ void SampleServiceImpl::process_async_impl(std::shared_ptr<SampleCall> call) {
   const auto& request = call->request();
   Status status = sample_service_internal::validate_request(request);
   if (!status.ok()) {
-    call->finish_with_error(status.code(), status.message());
+    call->finish_with_error(status);
     return;
   }
 
   if (!models_.contains(request.model())) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
   status = sample_service_internal::validate_runtime_config(
       master_->options().enable_schedule_overlap());
   if (!status.ok()) {
-    call->finish_with_error(status.code(), status.message());
+    call->finish_with_error(status);
     return;
   }
 
@@ -420,7 +418,7 @@ void SampleServiceImpl::process_async_impl(std::shared_ptr<SampleCall> call) {
 
   status = get_rate_limit_status(master_);
   if (!status.ok()) {
-    call->finish_with_error(status.code(), status.message());
+    call->finish_with_error(status);
     return;
   }
 
@@ -444,8 +442,7 @@ void SampleServiceImpl::process_async_impl(std::shared_ptr<SampleCall> call) {
         if (req_output.status.has_value()) {
           const auto& output_status = req_output.status.value();
           if (!output_status.ok()) {
-            return call->finish_with_error(output_status.code(),
-                                           output_status.message());
+            return call->finish_with_error(output_status);
           }
         }
 

@@ -48,6 +48,7 @@ class ServiceConfig final {
          "max_reconnect_count",
          "num_threads",
          "max_concurrent_requests",
+         "api_key",
          "num_request_handling_threads",
          "num_response_handling_threads",
          "health_check_interval_ms",
@@ -72,6 +73,10 @@ class ServiceConfig final {
   PROPERTY(int32_t, num_threads) = 8;
 
   PROPERTY(int32_t, max_concurrent_requests) = 200;
+
+  // Used only by public HTTP endpoints. Never include this secret in a
+  // startup-config dump or send it to worker nodes.
+  PROPERTY(std::string, api_key);
 
   PROPERTY(int32_t, num_request_handling_threads) = 4;
 

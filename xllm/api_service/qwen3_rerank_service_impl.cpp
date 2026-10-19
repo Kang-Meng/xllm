@@ -15,8 +15,9 @@ limitations under the License.
 
 #include "api_service/qwen3_rerank_service_impl.h"
 
-#include "distributed_runtime/llm_master.h"
-#include "framework/request/request_params.h"
+#include "api_service/request_admission.h"
+#include "core/distributed_runtime/llm_master.h"
+#include "core/framework/request/request_params.h"
 
 namespace xllm {
 
@@ -30,7 +31,7 @@ void Qwen3RerankServiceImpl::process_async_impl(
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
   if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 

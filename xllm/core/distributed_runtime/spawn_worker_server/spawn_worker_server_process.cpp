@@ -133,9 +133,14 @@ int main(int argc, char* argv[]) {
           ? static_cast<int32_t>(atoi(
                 argv[xllm::spawn_worker_protocol::kKvSplitSizeArgumentIndex]))
           : 1;
+  const int32_t comm_buffer_offset =
+      argc > xllm::spawn_worker_protocol::kCommBufferOffsetArgumentIndex
+          ? static_cast<int32_t>(atoi(argv[xllm::spawn_worker_protocol::
+                                               kCommBufferOffsetArgumentIndex]))
+          : 0;
   if (world_size < 1 || global_rank < 0 || global_rank >= world_size ||
       cp_size < 1 || ep_size < 1 || text_encoder_tp_size < 1 ||
-      kv_split_size < 0 ||
+      kv_split_size < 0 || comm_buffer_offset < 0 ||
       (instance_role_str != "DEFAULT" && instance_role_str != "PREFILL" &&
        instance_role_str != "DECODE")) {
     LOG(ERROR) << "Invalid spawn worker topology: global_rank=" << global_rank
@@ -219,7 +224,8 @@ int main(int argc, char* argv[]) {
                                  instance_role,
                                  enable_mtp_draft_body_tp1,
                                  draft_sampling_mode,
-                                 kv_split_size);
+                                 kv_split_size,
+                                 comm_buffer_offset);
 
   worker.run();
 

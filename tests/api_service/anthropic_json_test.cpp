@@ -41,6 +41,29 @@ json2pb::Pb2JsonOptions json_options() {
   return options;
 }
 
+TEST(AnthropicJsonTest, RejectsNegativeGenerationBudgetBeforeConversion) {
+  proto::AnthropicMessagesRequest request;
+  request.set_max_tokens(-1);
+  request.add_messages()->set_role("user");
+  const Status status = api_service::validate_anthropic_request(request);
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "Anthropic max_tokens must be non-negative.");
+}
+
+TEST(AnthropicJsonTest, RejectsEmptyMessagesBeforeInference) {
+  proto::AnthropicMessagesRequest request;
+  const Status status = api_service::validate_anthropic_request(request);
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.message(), "Messages is empty!");
+}
+
+TEST(AnthropicJsonTest, AcceptsValidGenerationBudgetAndMessages) {
+  proto::AnthropicMessagesRequest request;
+  request.set_max_tokens(8);
+  request.add_messages()->set_role("user");
+  EXPECT_TRUE(api_service::validate_anthropic_request(request).ok());
+}
+
 TEST(AnthropicJsonTest, ExpandsToolUseInputStruct) {
   proto::AnthropicMessagesResponse response;
   response.set_id("msg_123");
@@ -71,6 +94,24 @@ TEST(AnthropicJsonTest, ExpandsToolUseInputStruct) {
   EXPECT_EQ(input["city"], "San Francisco");
   EXPECT_EQ(input["unit"], "celsius");
   EXPECT_EQ(parsed["stop_reason"], "tool_use");
+}
+
+TEST(AnthropicJsonTest, MessageStartPreservesZeroUsageAndNullableStops) {
+  proto::AnthropicStreamEvent event;
+  event.set_type("message_start");
+  auto* message = event.mutable_message();
+  message->set_type("message");
+  message->mutable_usage()->set_input_tokens(0);
+  message->mutable_usage()->set_output_tokens(0);
+  std::string json;
+  std::string error;
+  ASSERT_TRUE(api_service::proto_to_anthropic_json(
+      event, json_options(), &json, &error));
+  const nlohmann::json parsed = nlohmann::json::parse(json);
+  EXPECT_EQ(parsed["message"]["usage"]["input_tokens"], 0);
+  EXPECT_EQ(parsed["message"]["usage"]["output_tokens"], 0);
+  EXPECT_TRUE(parsed["message"]["stop_reason"].is_null());
+  EXPECT_TRUE(parsed["message"]["stop_sequence"].is_null());
 }
 
 TEST(AnthropicJsonTest, ExpandsNestedToolInputStruct) {

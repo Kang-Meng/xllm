@@ -190,7 +190,9 @@ TEST_F(RecRequestFactoryTest, LlmRecRejectsPromptLongerThanContext) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(), "Prompt is too long");
+  EXPECT_EQ(capture.status->reason(), FailureReason::PROMPT_TOO_LONG);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 

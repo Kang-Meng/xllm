@@ -38,6 +38,7 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "core/framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
@@ -178,6 +179,13 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
     return move_result;
   }
 
+  bool move_memory_regions(const std::string& remote_addr,
+                           const std::vector<ByteRegion>& /*regions*/,
+                           MoveOpcode opcode) override {
+    move_calls.emplace_back(MoveCall{remote_addr, {}, opcode});
+    return move_result;
+  }
+
   bool has_reshard_plan(const std::string& remote_addr) const override {
     return planned_addrs.find(remote_addr) != planned_addrs.end();
   }
@@ -198,7 +206,8 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
                        const WorkerCacheLayoutManifest& /*manifest*/,
                        CachePeerMode mode) override {
     peer_calls.emplace_back(PeerCall{remote_addr, mode});
-    return mode == CachePeerMode::ABSENT || remote_addr != failed_peer;
+    return (mode == CachePeerMode::ABSENT && close_result) ||
+           remote_addr != failed_peer;
   }
 
   bool set_local_peer(const WorkerCacheLayoutManifest& manifest,
@@ -208,6 +217,7 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
   }
 
   bool move_result = true;
+  bool close_result = true;
   std::unordered_set<std::string> planned_addrs;
   std::unordered_map<std::string, WorkerCacheLayoutManifest> remote_layouts;
   std::string failed_peer;
@@ -513,6 +523,26 @@ TEST(MooncakeTransferEngineTest, LinkFailureRollsBackEveryPcpSource) {
       8);
 }
 
+TEST(MooncakeTransferEngineTest, RemoteCloseFailureStillCleansLocalPeer) {
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  const WorkerCacheLayoutManifest local =
+      make_peer_manifest("close-source", "close-source-incarnation", 1);
+  ASSERT_TRUE(core.set_local_cache_layout(local).ok());
+  const WorkerCacheLayoutManifest remote = make_peer_manifest(
+      "close-destination", "close-destination-incarnation", 1);
+  RecordingMooncakeTransferEngine transfer(/*listen_port=*/0,
+                                           torch::Device(torch::kCPU));
+  transfer.remote_layouts.emplace(remote.addr, remote);
+  ASSERT_TRUE(transfer.link_sessions({remote.cluster_id}, {remote.addr}));
+  transfer.failed_peer = remote.addr;
+  transfer.close_result = false;
+  EXPECT_FALSE(transfer.close_session(remote.cluster_id, remote.addr));
+  ASSERT_EQ(transfer.local_peer_calls.size(), 2U);
+  EXPECT_EQ(transfer.local_peer_calls.back().mode, CachePeerMode::ABSENT);
+  EXPECT_TRUE(transfer.close_session(remote.cluster_id, remote.addr));
+  EXPECT_EQ(transfer.local_peer_calls.size(), 2U);
+}
+
 TEST(MooncakeKVCacheTransferDefaultTest,
      MergeIncludesActiveAndPlanOnlyDestinations) {
   auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
@@ -696,13 +726,19 @@ struct NpuMixedTransferCaches {
 NpuMixedTransferCaches make_npu_mixed_transfer_caches(
     const torch::Device& device) {
   NpuMixedTransferCaches tensors;
-  const auto options = torch::dtype(torch::kBFloat16).device(device);
-  tensors.conv = torch::zeros({2, 1024, 384}, options);
-  tensors.ssm = torch::zeros({2, 1, 128, 384}, options);
-  tensors.key = torch::zeros({2, 1024, 1, 384}, options);
-  tensors.value = torch::zeros({2, 1024, 1, 384}, options);
-  tensors.index = torch::zeros({2, 1024, 1, 384}, options);
-  tensors.index_scale = torch::zeros({2, 1024, 1, 384}, options);
+  // Match production KV memory: HCCL IPC requires exportable huge-page buffers.
+  const auto allocate = [&device](const std::vector<int64_t>& shape) {
+    torch::Tensor tensor =
+        alloc_npu_huge_page_tensor(shape, torch::kBFloat16, ACL_FORMAT_ND);
+    CHECK_EQ(tensor.device(), device);
+    return tensor.zero_();
+  };
+  tensors.conv = allocate({2, 1024, 384});
+  tensors.ssm = allocate({2, 1, 128, 384});
+  tensors.key = allocate({2, 1024, 1, 384});
+  tensors.value = allocate({2, 1024, 1, 384});
+  tensors.index = allocate({2, 1024, 1, 384});
+  tensors.index_scale = allocate({2, 1024, 1, 384});
   tensors.caches.emplace_back(
       LinearAttentionKVCacheTensors{tensors.conv, tensors.ssm});
   tensors.caches.emplace_back(
@@ -2642,6 +2678,73 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                    /*kv_split_size=*/1)
                    .empty());
   EXPECT_TRUE(engine_observer->move_calls.empty());
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest, PushStopsAfterLayerFailure) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "NPU device is required for the layer synchronizer.";
+  }
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      ([&] {
+        Device device(/*device_id=*/0);
+        device.set_device();
+        MooncakeTransferEngineCore& core =
+            MooncakeTransferEngineCore::get_instance();
+        ASSERT_TRUE(core.initialize(/*listen_port=*/0, device.unwrap()));
+        WorkerCacheLayoutManifest local =
+            make_peer_manifest("push-source", "push-source-incarnation", 1);
+        for (int64_t layer_id = 1; layer_id < 3; ++layer_id) {
+          CacheTensorManifest tensor = local.tensors.front();
+          tensor.layer_id = layer_id;
+          local.tensors.emplace_back(std::move(tensor));
+        }
+        ASSERT_TRUE(core.set_local_cache_layout(local).ok());
+        WorkerCacheLayoutManifest remote = local;
+        remote.addr = core.addr();
+        remote.incarnation_id = "push-destination-incarnation";
+        ASSERT_TRUE(core.set_cache_peer(remote, CachePeerMode::ACTIVE).ok());
+        auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+            /*listen_port=*/0, torch::Device(torch::kCPU));
+        RecordingMooncakeTransferEngine* observer = engine.get();
+        observer->move_result = false;
+        MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                                /*listen_port=*/0,
+                                                torch::Device(torch::kCPU),
+                                                /*model_type=*/"test",
+                                                std::move(engine));
+        transfer.main_layout_.registered = true;
+        transfer.main_layout_.num_layers = 3;
+        KVCacheTransfer::KVCacheInfo info;
+        info.dst_addr = remote.addr;
+        info.request_ids = {"failed-request"};
+        KVTransferMapping mapping;
+        mapping.group_id = cache_group_id(BlockType::KV);
+        mapping.local_ids = {0};
+        mapping.remote_ids = {1};
+        info.mappings.emplace_back(std::move(mapping));
+        std::unordered_map<std::string, KVCacheTransfer::KVCacheInfo> infos;
+        infos.emplace(remote.addr, std::move(info));
+        std::shared_ptr<KVPushSynchronizerImpl> synchronizer =
+            std::make_shared<KVPushSynchronizerImpl>(/*num_layers=*/3);
+        for (int64_t layer_id = 0; layer_id < 3; ++layer_id) {
+          ASSERT_TRUE(synchronizer->record_event(layer_id, /*device_index=*/0));
+        }
+        const auto results = transfer.push_kv_blocks(infos,
+                                                     synchronizer,
+                                                     /*is_spec_draft=*/false,
+                                                     /*kv_split_rank=*/0,
+                                                     /*kv_split_size=*/1);
+        ASSERT_EQ(results.size(), 1U);
+        EXPECT_EQ(results.front().request_ids,
+                  (std::vector<std::string>{"failed-request"}));
+        EXPECT_EQ(observer->move_calls.size(), 1U);
+        EXPECT_TRUE(core.set_cache_peer(remote, CachePeerMode::ABSENT).ok());
+        // Match the isolated NPU round-trip test: ADXL owns process threads.
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+      }()),
+      ::testing::ExitedWithCode(0),
+      "");
 }
 
 #endif

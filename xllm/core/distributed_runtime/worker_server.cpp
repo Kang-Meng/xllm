@@ -178,7 +178,12 @@ void WorkerServer::create_server(const runtime::Options& options,
     comm = std::move(dit_comm);
   } else {
     auto common_comm = std::make_unique<CollectiveCommunicator>(
-        worker_global_rank, world_size, dp_size, ep_size, cp_size);
+        worker_global_rank,
+        world_size,
+        dp_size,
+        ep_size,
+        cp_size,
+        options.comm_buffer_offset() + (options.is_draft_engine() ? 1 : 0));
     comm = std::move(common_comm);
   }
 
@@ -331,6 +336,8 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
       enable_mtp_draft_body_tp1_str.c_str();
   std::string draft_sampling_mode_str = options.draft_sampling_mode();
   const char* draft_sampling_mode_ptr = draft_sampling_mode_str.c_str();
+  const std::string comm_buffer_offset_str =
+      std::to_string(options.comm_buffer_offset());
   const char* worker_type_ptr = worker_type.to_string();
   std::string spawn_worker_bin_path =
       options.spawn_worker_path() + "/spawn_worker";
@@ -384,6 +391,7 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
                         text_encoder_tp_size_ptr,
                         draft_sampling_mode_ptr,
                         kv_split_size_ptr,
+                        comm_buffer_offset_str.c_str(),
                         nullptr};
   static_assert(std::size(argv) == spawn_worker_protocol::kArgumentCount + 1);
   pid_t pid;

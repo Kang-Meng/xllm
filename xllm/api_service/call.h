@@ -21,6 +21,8 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "core/common/types.h"
+
 namespace xllm {
 
 template <typename Request>
@@ -45,6 +47,9 @@ class Call {
 
   const std::string& get_x_request_id() const { return x_request_id_; }
   const std::string& get_x_request_time() const { return x_request_time_; }
+  const Status& request_payload_status() const {
+    return request_payload_status_;
+  }
 
   butil::IOBuf take_request_iobuf() {
     return butil::IOBuf(request_payload_.movable());
@@ -60,14 +65,20 @@ class Call {
 
  protected:
   void init(std::string body_x_request_id, bool is_http_request);
+  void record_result(bool connected) const;
+  void record_error(const Status& status);
 
  protected:
   brpc::Controller* controller_;
+
+  bool is_http_request_ = false;
+  bool response_complete_ = false;
 
   std::string x_request_id_;
   std::string x_request_time_;
 
   butil::IOBuf request_payload_;
+  Status request_payload_status_;
 };
 
 }  // namespace xllm

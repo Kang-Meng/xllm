@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "vlm_master.h"
+#include "core/distributed_runtime/vlm_master.h"
 
 #include <glog/logging.h>
 #include <pybind11/pybind11.h>
@@ -26,20 +26,20 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "common/metrics.h"
 #include "core/common/message.h"
+#include "core/common/metrics.h"
+#include "core/distributed_runtime/speculative_engine.h"
+#include "core/distributed_runtime/vlm_engine.h"
+#include "core/framework/chat_template/chat_template.h"
+#include "core/framework/model/model_args.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/request/request.h"
 #include "core/platform/device_name_utils.h"
-#include "framework/chat_template/chat_template.h"
-#include "framework/model/model_args.h"
-#include "framework/request/request.h"
-#include "runtime/xservice_client.h"
-#include "scheduler/scheduler_factory.h"
+#include "core/runtime/xservice_client.h"
+#include "core/scheduler/scheduler_factory.h"
+#include "core/util/scope_guard.h"
+#include "core/util/timer.h"
 #include "server/xllm_server_registry.h"
-#include "speculative_engine.h"
-#include "util/scope_guard.h"
-#include "util/timer.h"
-#include "vlm_engine.h"
 
 namespace xllm {
 
@@ -258,15 +258,17 @@ void VLMMaster::handle_request(std::string prompt,
     }
 
     rate_limit_guard.dismiss();
+    // Retain a callback for rejection if the scheduler queue is full.
     auto request = request_factory_->create(
-        std::move(prompt), std::move(mm_data), sp, std::move(callback));
+        std::move(prompt), std::move(mm_data), sp, callback);
     if (!request) {
       return;
     }
 
     if (!scheduler_->add_request(request)) {
-      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
-                          "No available resources to schedule request");
+      callback(Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "No available resources to schedule request",
+                      FailureReason::TEMPORARY_OVERLOAD));
     }
   });
 }
@@ -316,18 +318,20 @@ void VLMMaster::handle_request(std::vector<Message> messages,
     }
 
     rate_limit_guard.dismiss();
+    // Retain a callback for rejection if the scheduler queue is full.
     auto request = request_factory_->create(std::move(messages),
                                             sp,
                                             std::move(payload),
-                                            std::move(callback),
+                                            callback,
                                             use_prompt_as_is);
     if (!request) {
       return;
     }
 
     if (!scheduler_->add_request(request)) {
-      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
-                          "No available resources to schedule request");
+      callback(Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "No available resources to schedule request",
+                      FailureReason::TEMPORARY_OVERLOAD));
     }
   });
 }

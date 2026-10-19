@@ -27,6 +27,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/common/message.h"
+#include "core/framework/chat_template/tool_call_arguments.h"
 #include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
@@ -162,7 +163,9 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   }
   if (prompt_tokens.size() >= static_cast<size_t>(prompt_token_limit)) {
     LOG(ERROR) << "Prompt is too long: " << prompt_tokens.size();
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, "Prompt is too long");
+    callback(Status{StatusCode::INVALID_ARGUMENT,
+                    "Prompt is too long",
+                    FailureReason::PROMPT_TOO_LONG});
     return nullptr;
   }
 
@@ -277,6 +280,14 @@ std::shared_ptr<Request> VLMRequestFactory::create(
       [this] { rate_limiter_->decrease_one_request(); });
 
   static MMInputTransfer mm_input_transfer;
+
+  Status arguments_status = validate_tool_call_arguments(messages);
+  if (!arguments_status.ok()) {
+    callback({std::move(arguments_status),
+              sp.service_request_id,
+              sp.source_xservice_addr});
+    return nullptr;
+  }
 
   MMInput mm_inputs(std::move(payload));
   Timer load_timer;

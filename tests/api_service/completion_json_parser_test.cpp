@@ -29,6 +29,8 @@ void expect_error(const std::string& input,
   ASSERT_FALSE(status.ok()) << "Expected error but got success";
   EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(status.message(), expected_message);
+  EXPECT_EQ(status.reason(), FailureReason::INVALID_PARAMETER);
+  EXPECT_EQ(status.param(), "prompt");
 }
 
 }  // namespace
@@ -49,12 +51,11 @@ TEST(PreprocessCompletionPromptTest, MissingPromptPassThroughUnchanged) {
   EXPECT_EQ(result, input);
 }
 
-// Scalar integer prompt is left to json2pb, passed through unchanged.
-TEST(PreprocessCompletionPromptTest, ScalarPromptPassThroughUnchanged) {
-  std::string input = R"({"prompt": 785})";
-  auto [status, result] = preprocess_completion_prompt(input);
-  ASSERT_TRUE(status.ok()) << status.message();
-  EXPECT_EQ(result, input);
+TEST(PreprocessCompletionPromptTest, ScalarAndObjectPromptsAreRejected) {
+  for (const std::string& input :
+       {R"({"prompt":785})", R"({"prompt":{}})", R"({"prompt":true})"}) {
+    expect_error(input, "prompt must be a string or an array of token ids.");
+  }
 }
 
 // Integer array prompt is moved into token_ids and prompt is cleared.
@@ -79,6 +80,17 @@ TEST(PreprocessCompletionPromptTest, Int32BoundaryValuesAccepted) {
 
 TEST(PreprocessCompletionPromptTest, EmptyArrayRejected) {
   expect_error(R"({"prompt": []})", "prompt array is empty");
+}
+
+TEST(PreprocessCompletionPromptTest, EmptyTextNamesPrompt) {
+  expect_error(R"({"prompt":""})", "Prompt is empty!");
+}
+
+TEST(PreprocessCompletionPromptTest, EmptyTextWithTokensRemainsValid) {
+  const std::string input = R"({"prompt":"","token_ids":[9707]})";
+  auto [status, result] = preprocess_completion_prompt(input);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(result, input);
 }
 
 TEST(PreprocessCompletionPromptTest, ArrayOfStringsRejected) {
@@ -123,6 +135,8 @@ TEST(PreprocessCompletionPromptTest, InvalidJsonRejected) {
   auto [status, result] = preprocess_completion_prompt("{not valid json");
   ASSERT_FALSE(status.ok());
   EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.reason(), FailureReason::UNSPECIFIED);
+  EXPECT_FALSE(status.param().has_value());
 }
 
 }  // namespace xllm

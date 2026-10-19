@@ -950,7 +950,7 @@ TEST(BatchTest, ProcessRawOutputFailsRequestForKVPushFailure) {
   batch.process_sample_output(raw_output, /*replace_fake_token=*/false);
 
   ASSERT_TRUE(sequence.error_status().has_value());
-  EXPECT_EQ(sequence.error_status()->code(), StatusCode::UNKNOWN);
+  EXPECT_EQ(sequence.error_status()->code(), StatusCode::UNAVAILABLE);
   EXPECT_EQ(sequence.error_status()->message(), "KV cache push failed");
 }
 

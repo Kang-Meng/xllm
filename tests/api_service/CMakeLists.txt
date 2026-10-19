@@ -72,6 +72,7 @@ cc_test(
   DEPS
     api_service
     GTest::gtest_main
+    nlohmann_json::nlohmann_json
 )
 
 cc_test(

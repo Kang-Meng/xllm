@@ -40,7 +40,8 @@ class CollectiveCommunicator : public CollectiveCommunicatorBase {
                          int world_size,
                          int dp_size,
                          int ep_size,
-                         int cp_size);
+                         int cp_size,
+                         int32_t buffer_offset = 0);
   ~CollectiveCommunicator() = default;
 
   void create_process_groups(const std::string& master_addr,

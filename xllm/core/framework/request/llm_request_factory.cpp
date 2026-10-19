@@ -25,6 +25,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/framework/chat_template/thinking_mode_resolver.h"
+#include "core/framework/chat_template/tool_call_arguments.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/service_config.h"
 #include "framework/request/request_state.h"
@@ -134,10 +135,11 @@ std::optional<std::vector<int>> LLMRequestFactory::encode_and_validate_prompt(
   }
   if (local_prompt_tokens.size() >= prompt_token_limit) {
     LOG(ERROR) << "Prompt is too long: " << local_prompt_tokens.size();
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "Prompt is too long",
-                        sp.service_request_id,
-                        sp.source_xservice_addr);
+    callback({Status{StatusCode::INVALID_ARGUMENT,
+                     "Prompt is too long",
+                     FailureReason::PROMPT_TOO_LONG},
+              sp.service_request_id,
+              sp.source_xservice_addr});
     return std::nullopt;
   }
 
@@ -393,6 +395,14 @@ std::shared_ptr<Request> LLMRequestFactory::create(
       [this] { rate_limiter_->decrease_one_request(); });
 
   Timer timer;
+
+  Status arguments_status = validate_tool_call_arguments(messages);
+  if (!arguments_status.ok()) {
+    callback({std::move(arguments_status),
+              sp.service_request_id,
+              sp.source_xservice_addr});
+    return nullptr;
+  }
 
   const std::optional<ChatTemplateRenderResult> render_result =
       chat_template_->apply_with_generation_mode(

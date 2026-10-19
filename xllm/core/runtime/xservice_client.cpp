@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "xservice_client.h"
+#include "core/runtime/xservice_client.h"
 
 #include <absl/strings/str_split.h>
 #include <absl/time/clock.h>
@@ -24,6 +24,7 @@ limitations under the License.
 #include <algorithm>
 #include <unordered_map>
 
+#include "core/common/public_error.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/service_config.h"
 #include "util/env_var.h"
@@ -537,6 +538,25 @@ std::vector<bool> XServiceClient::generations(
       gen_status->set_status_code(
           static_cast<int32_t>(output.status.value().code()));
       gen_status->set_status_msg(output.status.value().message());
+      if (output.status.value().reason() != FailureReason::UNSPECIFIED) {
+        gen_status->set_failure_reason(
+            static_cast<int32_t>(output.status.value().reason()));
+      }
+      if (output.status.value().param().has_value()) {
+        gen_status->set_param(*output.status.value().param());
+      }
+      if (!output.status->ok()) {
+        const PublicHttpError error = public_error_from_status(*output.status);
+        auto* public_error = gen_status->mutable_error();
+        public_error->set_http_status_code(error.status_code);
+        public_error->set_type(error.type);
+        public_error->set_code(error.code);
+        public_error->set_message(error.message);
+        public_error->set_retryable(error.retryable);
+        if (error.param.has_value()) {
+          public_error->set_param(*error.param);
+        }
+      }
     }
     req->set_finished(output.finished);
     req->set_finished_on_prefill_instance(output.finished_on_prefill_instance);

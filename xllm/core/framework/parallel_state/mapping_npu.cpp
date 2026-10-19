@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "mapping_npu.h"
+#include "core/framework/parallel_state/mapping_npu.h"
 
 #include <glog/logging.h>
 
@@ -56,19 +56,13 @@ int32_t get_hccl_buffer_size_or_default(int32_t default_buffer_size) {
 
 namespace xllm {
 
-// HACK: Static counter for auto-assigning buffer_offset in multi-model
-// scenarios. This is a hack solution and should be refactored later.
-int32_t MappingNPU::s_buffer_offset_counter_ = 0;
-
 MappingNPU::MappingNPU(const std::string rank_table_file,
                        const int32_t world_size,
                        const int32_t rank,
                        const Options& options)
     : rank_table_file_(rank_table_file), rank_(rank), options_(options) {
-  // HACK: Auto-assign buffer_offset for multi-model scenarios.
-  // Increments for each MappingNPU instance. This is a hack and should be
-  // refactored later.
-  buffer_offset_ = s_buffer_offset_counter_++;
+  buffer_offset_ = options.buffer_offset();
+  CHECK_GE(buffer_offset_, 0);
   num_nodes_ = get_num_nodes();
   world_size_ = world_size;
   local_world_size_ = world_size / num_nodes_;

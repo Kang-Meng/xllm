@@ -13,13 +13,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "call.h"
+#include "api_service/call.h"
 
+#include "api_service/http_request_body.h"
 #include "api_service/request_id.h"
 #include "core/common/constants.h"
+#include "core/common/metrics.h"
 #include "core/util/verbose_trace_logger.h"
 
 namespace xllm {
+void Call::record_error(const Status& status) {
+  response_complete_ = false;
+  if (status.reason() == FailureReason::CONCURRENCY_LIMIT_REACHED) {
+    COUNTER_INC(server_request_total_limit);
+  }
+}
+
+void Call::record_result(bool connected) const {
+  if (response_complete_ && connected) {
+    COUNTER_INC(server_request_total_ok);
+  } else {
+    COUNTER_INC(server_request_total_fail);
+  }
+}
 
 Call::Call(brpc::Controller* controller,
            std::string body_x_request_id,
@@ -29,6 +45,7 @@ Call::Call(brpc::Controller* controller,
 }
 
 void Call::init(std::string body_x_request_id, bool is_http_request) {
+  is_http_request_ = is_http_request;
   if (controller_->http_request().GetHeader("x-request-time")) {
     x_request_time_ = *controller_->http_request().GetHeader("x-request-time");
   } else if (controller_->http_request().GetHeader("x-request-timems")) {
@@ -50,30 +67,20 @@ void Call::init(std::string body_x_request_id, bool is_http_request) {
 }
 
 void Call::init_request_payload() {
-  const auto infer_content_len =
-      controller_->http_request().GetHeader(kInferContentLength);
-  const auto content_len =
-      controller_->http_request().GetHeader(kContentLength);
-
-  if (infer_content_len == nullptr || content_len == nullptr) return;
-
-  auto infer_len = std::stoul(*infer_content_len);
-  auto len = std::stoul(*content_len);
-
-  if (infer_len > len) {
-    LOG(ERROR) << " content length is invalid:"
-               << " infer content len is " << infer_len
-               << " , content length is " << len;
+  request_payload_.clear();
+  auto [status, json_size] = api_service::http_json_body_length(*controller_);
+  request_payload_status_ = std::move(status);
+  if (!request_payload_status_.ok()) {
     return;
   }
-
-  const size_t payload_size = len - infer_len;
+  const size_t payload_size =
+      controller_->request_attachment().size() - json_size;
   const size_t appended = controller_->request_attachment().append_to(
-      &request_payload_, payload_size, infer_len);
+      &request_payload_, payload_size, json_size);
   if (appended != payload_size) {
     request_payload_.clear();
-    LOG(ERROR) << "failed to retain binary request payload: expected "
-               << payload_size << " bytes, got " << appended;
+    request_payload_status_ = Status::invalid_parameter(
+        "Failed to read the binary request payload.", kInferContentLength);
   }
 }
 

@@ -249,7 +249,8 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
                                                int world_size,
                                                int dp_size,
                                                int ep_size,
-                                               int cp_size)
+                                               int cp_size,
+                                               int32_t buffer_offset)
     : CollectiveCommunicatorBase(global_rank, world_size) {
 #if defined(USE_NPU)
   // create hccl process group with hccl_root_info
@@ -281,9 +282,6 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
   }
 
   // comunicator will be inited in atb.
-  // HACK: MappingNPU internally uses a static counter to auto-assign
-  // buffer_offset for multi-model scenarios. This is a hack and should be
-  // refactored later.
   const int32_t normalized_cp_size = cp_size > 0 ? cp_size : 1;
   const int32_t attn_tp_size = world_size / (dp_size * normalized_cp_size);
   // FLAGS_kv_split_size: 0 -> leave Options::kv_split_size = -1 so that
@@ -293,7 +291,8 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
       ::xllm::ParallelConfig::get_instance().kv_split_size();
   const int32_t mapping_kv_split_size = kv_split_size > 0 ? kv_split_size : -1;
   MappingNPU::Options mapping_options;
-  mapping_options.dp_size(dp_size)
+  mapping_options.buffer_offset(buffer_offset)
+      .dp_size(dp_size)
       .tp_size(attn_tp_size)
       .moe_tp_size(world_size / ep_size)
       .moe_ep_size(ep_size)

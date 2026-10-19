@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "rec_master.h"
+#include "core/distributed_runtime/rec_master.h"
 
 #include <absl/time/time.h>
 #include <gflags/gflags.h>
@@ -23,18 +23,18 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "common/macros.h"
-#include "common/metrics.h"
-#include "common/types.h"
+#include "core/common/macros.h"
+#include "core/common/metrics.h"
+#include "core/common/types.h"
+#include "core/distributed_runtime/rec_engine.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/runtime/xservice_client.h"
+#include "core/scheduler/scheduler_factory.h"
+#include "core/util/rec_model_utils.h"
+#include "core/util/scope_guard.h"
+#include "core/util/threadpool.h"
+#include "core/util/timer.h"
 #include "models/model_registry.h"
-#include "rec_engine.h"
-#include "runtime/xservice_client.h"
-#include "scheduler/scheduler_factory.h"
-#include "util/rec_model_utils.h"
-#include "util/scope_guard.h"
-#include "util/threadpool.h"
-#include "util/timer.h"
 
 namespace xllm {
 
@@ -295,14 +295,16 @@ void RecMaster::schedule_request(RequestParams sp,
       return;
     }
 
-    auto request = build_request(sp, std::move(callback));
+    // Keep the callback alive for a queue-full rejection after construction.
+    auto request = build_request(sp, callback);
     if (!request) {
       return;
     }
 
     if (!scheduler_->add_request(request)) {
-      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
-                          "No available resources to schedule request");
+      callback(Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "No available resources to schedule request",
+                      FailureReason::TEMPORARY_OVERLOAD));
     }
   });
 }

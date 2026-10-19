@@ -13,9 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "jinja_chat_template.h"
+#include "core/framework/chat_template/jinja_chat_template.h"
 
 #include <gtest/gtest.h>
+
+#include "core/framework/chat_template/tool_call_arguments.h"
 
 namespace xllm {
 
@@ -155,6 +157,143 @@ TEST(JinjaChatTemplate, SupportsUndefinedTests) {
   EXPECT_EQ(configured_result.value(),
             "plain text: value is undefined|quoted value is undefined|"
             "configured|present");
+}
+
+TEST(JinjaChatTemplate, ProjectsTextBlocksWithoutLosingReasoning) {
+  TokenizerArgs args;
+  args.chat_template(
+      "{{ messages[0].content }}|{{ messages[0].reasoning_content }}");
+  JinjaChatTemplate tmpl(args);
+  Message message(
+      "assistant",
+      MMContentVec{MMContent("text", "first"), MMContent("text", "second")});
+  message.reasoning_content = "plan";
+  const auto prompt = tmpl.apply(ChatMessages{message});
+  ASSERT_TRUE(prompt.has_value());
+  EXPECT_EQ(*prompt, "first\nsecond|plan");
+  EXPECT_TRUE(std::holds_alternative<MMContentVec>(message.content));
+}
+
+TEST(JinjaChatTemplate, PreservesReasoningAcrossMultipleHistoryMessages) {
+  TokenizerArgs args;
+  args.chat_template(
+      "{% for message in messages %}{{ message.content }}|{% endfor %}");
+  JinjaChatTemplate tmpl(args);
+  Message first("assistant", "answer");
+  first.reasoning_content = "plan";
+  Message second("assistant", "");
+  second.reasoning_content = "next";
+  const auto prompt = tmpl.apply(ChatMessages{first, second});
+  ASSERT_TRUE(prompt.has_value());
+  EXPECT_EQ(*prompt, "<think>plan</think>\nanswer|<think>next</think>|");
+  EXPECT_EQ(std::get<std::string>(first.content), "answer");
+}
+
+namespace {
+
+TokenizerArgs tool_history_args(const std::string& template_text) {
+  TokenizerArgs args;
+  args.chat_template(template_text);
+  args.bos_token("");
+  args.eos_token("");
+  return args;
+}
+
+ChatMessages tool_history_messages(const std::string& arguments) {
+  Message assistant("assistant", "");
+  Message::ToolCall call;
+  call.id = "call_history";
+  call.type = "function";
+  call.function.name = "get_weather";
+  call.function.arguments = arguments;
+  assistant.tool_calls = Message::ToolCallVec{call};
+  Message tool("tool", "Sunny, 20 C.");
+  tool.tool_call_id = "call_history";
+  return {Message("user", "Weather in Beijing?"),
+          assistant,
+          tool,
+          Message("user", "Summarize.")};
+}
+
+}  // namespace
+
+TEST(JinjaChatTemplate, ToolArgumentsAreCanonicalObjectsWithoutMutatingApi) {
+  const std::string template_text =
+      "{% for call in messages[1].tool_calls %}"
+      "{% if call.function.arguments is string %}string"
+      "{% else %}{{ call.function.arguments | tojson }}{% endif %}"
+      "{% endfor %}";
+  TestableJinjaChatTemplate tmpl(tool_history_args(template_text));
+  const std::string arguments = R"({"z":0,"z":{"z":2,"a":1},"a":[3,2,1]})";
+  const auto messages = tool_history_messages(arguments);
+  const auto result = tmpl.apply(messages);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, R"({"a": [3, 2, 1], "z": {"a": 1, "z": 2}})");
+  EXPECT_EQ(messages[1].tool_calls->front().function.arguments, arguments);
+
+  auto reordered = tool_history_messages(R"({"a":[3,2,1],"z":{"a":1,"z":2}})");
+  EXPECT_EQ(tmpl.apply(reordered), result);
+}
+
+TEST(JinjaChatTemplate, GlmArgumentsItemsUsesSortedKeys) {
+  const std::string template_text =
+      "{% for k, v in messages[1].tool_calls[0].function.arguments.items() %}"
+      "<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson }}</arg_value>"
+      "{% endfor %}";
+  TestableJinjaChatTemplate tmpl(tool_history_args(template_text));
+  const auto result =
+      tmpl.apply(tool_history_messages(R"({"z":2,"a":"北京"})"));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(
+      *result,
+      R"(<arg_key>a</arg_key><arg_value>"北京"</arg_value><arg_key>z</arg_key><arg_value>2</arg_value>)");
+}
+
+TEST(JinjaChatTemplate, InvalidToolArgumentsNeverRenderEmptyFallback) {
+  TestableJinjaChatTemplate tmpl(tool_history_args("otherwise valid"));
+  for (const std::string arguments : {"",
+                                      " ",
+                                      "{",
+                                      "{\"a\":1} trailing",
+                                      "[]",
+                                      "[{}]",
+                                      "null",
+                                      "true",
+                                      "42",
+                                      "\"text\""}) {
+    SCOPED_TRACE(arguments);
+    const auto messages = tool_history_messages(arguments);
+    EXPECT_FALSE(tmpl.apply(messages).has_value());
+    const Status status = validate_tool_call_arguments(messages);
+    EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(status.reason(), FailureReason::INVALID_PARAMETER);
+    EXPECT_EQ(status.param(), "messages[1].tool_calls[0].function.arguments");
+  }
+  EXPECT_TRUE(tmpl.apply(tool_history_messages("{}")).has_value());
+}
+
+TEST(JinjaChatTemplate, RawInputsFollowSameContractAndPreserveCaller) {
+  TestableJinjaChatTemplate tmpl(
+      tool_history_args("{% for message in messages %}"
+                        "{% for call in message.tool_calls %}"
+                        "{{ call.function.arguments | tojson }}"
+                        "{% endfor %}{% endfor %}"));
+  nlohmann::ordered_json messages = {
+      {{"role", "assistant"},
+       {"content", ""},
+       {"tool_calls",
+        {{{"function",
+           {{"name", "probe"}, {"arguments", R"({"z":2,"a":1})"}}}}}}}};
+  const auto original = messages;
+  auto result = tmpl.apply(messages);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, R"({"a": 1, "z": 2})");
+  EXPECT_EQ(messages, original);
+  messages[0]["tool_calls"][0]["function"]["arguments"] =
+      nlohmann::ordered_json{{"z", 2}, {"a", 1}};
+  EXPECT_EQ(tmpl.apply(messages), result);
+  messages[0]["tool_calls"][0]["function"]["arguments"] = 1;
+  EXPECT_FALSE(tmpl.apply(messages).has_value());
 }
 
 }  // namespace xllm

@@ -34,6 +34,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/metrics.h"
+#include "core/common/public_error.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_impl.h"
@@ -57,7 +58,7 @@ class FakeTokenizer final : public Tokenizer {
 
   std::string decode(const Slice<int32_t>& /*ids*/,
                      bool /*skip_special_tokens*/) const override {
-    NOT_IMPLEMENTED();
+    return "";
   }
 
   std::optional<int32_t> token_to_id(
@@ -198,6 +199,8 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
   void cache_prefill_blocks_for_test(Request* request) {
     cache_prefill_blocks(request);
   }
+
+  using DisaggPDScheduler::do_permanent_rejection;
 
   bool pop_decode_request_for_test(std::shared_ptr<Request>* request) {
     return request_queue_.read(*request);
@@ -988,6 +991,28 @@ TEST(DisaggPDSchedulerTest, OversizedDecodePromptIsPermanent) {
   block_manager->deallocate(request.get());
 }
 
+TEST(DisaggPDSchedulerTest, PermanentDecodeRejectionIsPublicContextError) {
+  FakeEngine engine(/*num_blocks=*/4, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4, 5, 6, 7});
+  std::promise<Status> result;
+  auto future = result.get_future();
+  request->state().output_func = [&result](const RequestOutput& output) {
+    result.set_value(output.status.value());
+    return true;
+  };
+  scheduler.do_permanent_rejection(request);
+  ASSERT_EQ(future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const Status status = future.get();
+  EXPECT_EQ(status.code(), StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_EQ(status.reason(), FailureReason::PROMPT_TOO_LONG);
+  const PublicHttpError error = public_error_from_status(status);
+  EXPECT_EQ(error.status_code, 400);
+  EXPECT_EQ(error.code, "context_length_exceeded");
+  EXPECT_FALSE(scheduler.has_channel(request->request_id()));
+}
+
 TEST(DisaggPDSchedulerTest, InvalidPrefillCachedTokensFallBackToZero) {
   for (int32_t num_cached_tokens : {-1, 5}) {
     FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
@@ -1154,6 +1179,48 @@ TEST(DisaggPDSchedulerTest, LocalFailureReturnsDecodeReservation) {
   EXPECT_EQ(first_cache_size(*pool), 0u);
   server.Stop(0);
   server.Join();
+}
+
+TEST(DisaggPDSchedulerTest, CancelledPrefillReturnsDecodeReservation) {
+  for (const bool running : {false, true}) {
+    SCOPED_TRACE(running);
+    FakeEngine decode_engine(/*num_blocks=*/16, /*block_size=*/2);
+    TestDisaggPDScheduler decode(&decode_engine, make_decode_options());
+    auto remote = make_request({1, 2, 3, 4, 5, 6, 7, 8});
+    remote->state().pd_reservation_id = "reservation";
+    const auto free_before =
+        decode_engine.block_manager_pool()->num_free_blocks();
+    ASSERT_EQ(decode.try_admit(remote), DecodeAdmissionResult::ADMITTED);
+    ASSERT_TRUE(decode.decode_schedule(remote, "prefill"));
+    ReservationService service(&decode);
+    brpc::Server server;
+    ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+    ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+
+    FakeEngine prefill_engine(/*num_blocks=*/16, /*block_size=*/2);
+    TestDisaggPDScheduler prefill(&prefill_engine, make_options());
+    auto local = make_request({1, 2, 3, 4, 5, 6, 7, 8});
+    local->state().pd_reservation_id = "reservation";
+    local->state().decode_rpc_address =
+        "127.0.0.1:" + std::to_string(server.listen_address().port);
+    local->state().output_func = [](const RequestOutput&) { return true; };
+    prefill.admit_prefill(local);
+    if (running) {
+      auto batch = prefill.prepare_batch_test();
+      ASSERT_FALSE(batch[0].empty());
+    }
+    local->set_cancel();
+    auto batch = prefill.prepare_batch_test();
+    EXPECT_TRUE(batch[0].empty());
+    prefill.wait_notifications();
+    EXPECT_EQ(service.calls, 1);
+    EXPECT_TRUE(decode.reservations_empty());
+    EXPECT_EQ(decode_engine.block_manager_pool()->num_free_blocks(),
+              free_before);
+    EXPECT_FALSE(prefill.has_channel(local->request_id()));
+    server.Stop(0);
+    server.Join();
+  }
 }
 TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   FakeEngine decode_engine(/*num_blocks=*/16, /*block_size=*/2);

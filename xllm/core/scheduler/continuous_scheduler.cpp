@@ -656,10 +656,7 @@ void ContinuousScheduler::process_batch_output(bool enable_schedule_overlap) {
   std::vector<std::shared_ptr<Request>> stream_requests;
   // process request output in batch
   for (auto request : to_be_processed_requests) {
-    if (request->cancelled()) {
-      continue;
-    }
-    if (request->error_status().has_value()) {
+    if (request->cancelled() || request->error_status().has_value()) {
       release_failed_request(request);
       continue;
     }

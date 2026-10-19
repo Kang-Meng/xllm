@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "anthropic_service_impl.h"
+#include "api_service/anthropic_service_impl.h"
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
@@ -26,6 +26,7 @@ limitations under the License.
 #include <unordered_set>
 
 #include "api_service/anthropic_stream_utils.h"
+#include "api_service/request_admission.h"
 #include "api_service/stream_output_parser.h"
 #include "api_service/utils.h"
 #include "core/common/types.h"
@@ -88,12 +89,15 @@ std::vector<Message> build_messages(
         // Handle complex content blocks
         std::vector<MMContent> content_parts;
         Message::ToolCallVec tool_calls;
+        std::string reasoning_content;
 
         for (const auto& block : msg.content_blocks().blocks()) {
           if (block.type() == "text" && block.has_text()) {
             // Text content block
             content_parts.emplace_back("text", block.text());
 
+          } else if (block.type() == "thinking" && block.has_thinking()) {
+            reasoning_content += block.thinking();
           } else if (block.type() == "image" && block.has_source()) {
             // Image content block - convert source to image_url
             std::string image_url;
@@ -129,6 +133,17 @@ std::vector<Message> build_messages(
               tool_msg.tool_call_id = block.has_id() ? block.id() : "";
               if (block.has_content_string()) {
                 tool_msg.content = block.content_string();
+              } else if (block.has_content_list()) {
+                std::string text;
+                bool first = true;
+                for (const auto& item : block.content_list().items()) {
+                  if (!first) {
+                    text += '\n';
+                  }
+                  text += api_service::struct_to_json(item).value("text", "");
+                  first = false;
+                }
+                tool_msg.content = std::move(text);
               }
               messages.emplace_back(std::move(tool_msg));
             } else {
@@ -142,8 +157,12 @@ std::vector<Message> build_messages(
           }
         }
 
-        if (!tool_calls.empty() || !content_parts.empty()) {
+        if (!tool_calls.empty() || !content_parts.empty() ||
+            !reasoning_content.empty()) {
           Message new_msg(role, "");
+          if (!reasoning_content.empty()) {
+            new_msg.reasoning_content = std::move(reasoning_content);
+          }
 
           if (!tool_calls.empty()) {
             new_msg.tool_calls = std::move(tool_calls);
@@ -245,9 +264,7 @@ void generate_chat_response(proto::ChatResponse& response,
   if (req_output.usage.has_value()) {
     const auto& usage = req_output.usage.value();
     auto* proto_usage = response.mutable_usage();
-    proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
-    proto_usage->set_completion_tokens(usage.num_generated_tokens);
-    proto_usage->set_total_tokens(usage.num_total_tokens);
+    api_service::set_proto_usage(proto_usage, usage);
   }
 }
 
@@ -266,9 +283,10 @@ bool send_result_to_client(std::shared_ptr<AnthropicCall> call,
 
   // Set usage
   if (chat_response.has_usage()) {
-    auto* usage = anthropic_response.mutable_usage();
-    usage->set_input_tokens(chat_response.usage().prompt_tokens());
-    usage->set_output_tokens(chat_response.usage().completion_tokens());
+    *anthropic_response.mutable_usage() = api_service::make_anthropic_usage(
+        chat_response.usage().prompt_tokens(),
+        chat_response.usage().completion_tokens(),
+        chat_response.usage().prompt_tokens_details().cached_tokens());
   }
 
   // Process first choice
@@ -599,9 +617,10 @@ bool send_delta_to_client(
     delta->set_stop_reason(finish_reason);
     // Set usage information
     if (output.usage.has_value()) {
-      auto* usage = message_delta.mutable_usage();
-      usage->set_input_tokens(output.usage.value().num_prompt_tokens);
-      usage->set_output_tokens(output.usage.value().num_generated_tokens);
+      *message_delta.mutable_usage() = api_service::make_anthropic_usage(
+          output.usage.value().num_prompt_tokens,
+          output.usage.value().num_generated_tokens,
+          output.usage.value().num_cached_tokens);
     } else {
       auto* usage = message_delta.mutable_usage();
       usage->set_input_tokens(0);
@@ -644,15 +663,14 @@ void AnthropicServiceImpl::process_async_impl(
   const auto& model = rpc_request.model();
   // Check if model is supported
   if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
   // Check rate limit
   if (master_->get_rate_limiter()->is_limited()) {
-    call->finish_with_error(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.");
+    call->finish_with_error(api_service_internal::rate_limiter_rejection_status(
+        *master_->get_rate_limiter()));
     return;
   }
 
@@ -712,7 +730,7 @@ void AnthropicServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 

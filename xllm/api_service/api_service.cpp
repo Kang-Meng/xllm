@@ -13,9 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "api_service.h"
+#include "api_service/api_service.h"
 
-#include <butil/strings/string_number_conversions.h>
 #include <glog/logging.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/util/json_util.h>
@@ -25,18 +24,18 @@ limitations under the License.
 #include <filesystem>
 #include <limits>
 
+#include "api_service/call.h"
 #include "api_service/chat_json_parser.h"
 #include "api_service/completion_json_parser.h"
+#include "api_service/http_request_body.h"
 #include "api_service/multipart_parser.h"
-#include "api_service/request_id.h"
+#include "api_service/public_error.h"
 #include "api_service/rpc_request_metrics.h"
 #include "api_service/service_impl_factory.h"
 #include "api_service/serving_mode.h"
-#include "call.h"
 #include "chat.pb.h"
 #include "common.pb.h"
 #include "completion.pb.h"
-#include "core/common/constants.h"
 #include "core/common/metrics.h"
 #include "core/common/types.h"
 #include "core/distributed_runtime/dit_master.h"
@@ -44,13 +43,14 @@ limitations under the License.
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/config/distributed_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/profile_config.h"
+#include "core/framework/config/service_config.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
 #include "image_generation.pb.h"
 #include "models.pb.h"
-#include "service_impl_factory.h"
 #include "text_generation.pb.h"
 #include "video_generation.pb.h"
 namespace xllm {
@@ -125,10 +125,15 @@ APIService::APIService(Master* master,
                        const std::vector<std::string>& model_names,
                        const std::vector<std::string>& model_repository_names,
                        const std::vector<std::string>& model_versions)
-    : master_(master) {
+    : master_(master), http_auth_(ServiceConfig::get_instance().api_key()) {
   set_model_master(model_names[0], master);
   if (::xllm::DistributedConfig::get_instance().node_rank() != 0) {
     return;
+  }
+  if (ServiceConfig::get_instance().api_key().empty()) {
+    LOG(WARNING)
+        << "HTTP authentication is disabled because api_key is empty. "
+           "Restrict access at the deployment boundary or set api_key.";
   }
   ServiceImplFactory::create(
       this, master, model_names, model_repository_names, model_versions);
@@ -164,12 +169,9 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
                              const proto::CompletionRequest* request,
                              proto::CompletionResponse* response,
                              ::google::protobuf::Closure* done) {
-  xllm::ClosureGuard done_guard(
-      done,
-      [](void* /*unused*/) { request_in_metric(nullptr); },
-      [controller](void* /*unused*/) {
-        request_out_metric(static_cast<void*>(controller));
-      });
+  // Service RPC only acknowledges admission. The external Service owns the
+  // request in/ok/fail counters for this dispatch path, not the engine ACK.
+  brpc::ClosureGuard done_guard(done);
   if (!request || !response || !controller) {
     LOG(ERROR) << "brpc request | response | controller is null.";
     return;
@@ -179,6 +181,7 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
   if (completion_service_impl_) {
     completion_service_impl_->process_async_rpc_impl(request);
   } else if (rec_completion_service_impl_) {
+    request_in_metric(nullptr);
     auto arena = GetArenaWithCheck<CompletionCall>(response);
     std::shared_ptr<Call> call = std::make_shared<CompletionCall>(
         ctrl,
@@ -212,12 +215,21 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
       google::protobuf::Arena::CreateMessage<proto::CompletionResponse>(arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
 
+  auto [body_status, body_length] = api_service::http_json_body_length(*ctrl);
+  if (!body_status.ok()) {
+    api_service::write_http_error(ctrl, body_status);
+    return;
+  }
+  std::string attachment;
+  ctrl->request_attachment().copy_to(&attachment, body_length, 0);
   auto [preprocess_status, processed_json] =
-      preprocess_completion_prompt(ctrl->request_attachment().to_string());
+      preprocess_completion_prompt(std::move(attachment));
   if (!preprocess_status.ok()) {
-    ctrl->SetFailed(preprocess_status.message());
+    api_service::write_http_error(ctrl, preprocess_status);
     LOG(ERROR) << "completion prompt preprocessing failed: "
                << preprocess_status.message();
     return;
@@ -228,8 +240,20 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
   auto st =
       json2pb::JsonToProtoMessage(processed_json, req_pb, options, &error);
   if (!st) {
-    ctrl->SetFailed(error);
+    api_service::write_bad_request(ctrl, error);
     LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+
+  if (!completion_service_impl_ && !rec_completion_service_impl_) {
+    api_service::write_bad_request(
+        ctrl, "Completions service is not available on this server.");
+    return;
+  }
+
+  if (req_pb->prompt().empty() && req_pb->token_ids_size() == 0) {
+    api_service::write_http_error(
+        ctrl, Status::invalid_parameter("Prompt is empty!", "prompt"));
     return;
   }
 
@@ -291,9 +315,11 @@ void APIService::SampleHttp(::google::protobuf::RpcController* controller,
   }
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
   if (!sample_service_impl_) {
-    ctrl->SetFailed(kSampleNotSupportedError);
+    api_service::write_bad_request(ctrl, kSampleNotSupportedError);
     return;
   }
 
@@ -309,7 +335,7 @@ void APIService::SampleHttp(::google::protobuf::RpcController* controller,
   butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
   auto st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
   if (!st) {
-    ctrl->SetFailed(error);
+    api_service::write_bad_request(ctrl, error);
     LOG(ERROR) << "parse json to proto failed: " << error;
     return;
   }
@@ -326,25 +352,6 @@ void APIService::SampleHttp(::google::protobuf::RpcController* controller,
 
 namespace {
 
-bool get_json_content_length(const brpc::Controller* ctrl,
-                             size_t* content_length) {
-  const std::string* header =
-      ctrl->http_request().GetHeader(kInferContentLength);
-  if (header == nullptr) {
-    header = ctrl->http_request().GetHeader(kContentLength);
-  }
-  if (header == nullptr) {
-    LOG(ERROR) << "Content-Length header is missing.";
-    return false;
-  }
-
-  if (!butil::StringToSizeT(*header, content_length)) {
-    LOG(ERROR) << "Content-Length header is invalid.";
-    return false;
-  }
-  return true;
-}
-
 template <typename CallT, typename Service>
 void media_generation_http_impl(std::unique_ptr<Service>& service,
                                 xllm::ClosureGuard& guard,
@@ -357,16 +364,17 @@ void media_generation_http_impl(std::unique_ptr<Service>& service,
   auto resp_pb =
       google::protobuf::Arena::CreateMessage<typename CallT::ResType>(arena);
 
-  size_t json_content_length = 0;
-  if (!get_json_content_length(ctrl, &json_content_length)) {
-    ctrl->SetFailed("Content-Length header is missing or invalid.");
+  auto [body_status, json_content_length] =
+      api_service::http_json_body_length(*ctrl);
+  if (!body_status.ok()) {
+    api_service::write_http_error(ctrl, body_status);
     return;
   }
   const butil::IOBuf& attachment = ctrl->request_attachment();
-  if (json_content_length > attachment.size() ||
-      json_content_length >
-          static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-    ctrl->SetFailed("JSON content length exceeds request attachment.");
+  if (json_content_length >
+      static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    api_service::write_bad_request(
+        ctrl, "JSON content length exceeds request attachment.");
     return;
   }
 
@@ -376,7 +384,7 @@ void media_generation_http_impl(std::unique_ptr<Service>& service,
   std::string error;
   json2pb::Json2PbOptions options;
   if (!json2pb::JsonToProtoMessage(&json_stream, req_pb, options, &error)) {
-    ctrl->SetFailed(error);
+    api_service::write_bad_request(ctrl, error);
     LOG(ERROR) << "parse json to proto failed: " << error;
     return;
   }
@@ -402,7 +410,8 @@ void speech_to_text_http_impl(std::unique_ptr<SpeechToTextServiceImpl>& service,
                               brpc::Controller* ctrl) {
   const std::string content_type = ctrl->http_request().content_type();
   if (content_type.rfind("multipart/form-data", 0) != 0) {
-    ctrl->SetFailed(
+    api_service::write_bad_request(
+        ctrl,
         "Content-Type must be multipart/form-data for speech-to-text "
         "requests.");
     return;
@@ -422,7 +431,7 @@ void speech_to_text_http_impl(std::unique_ptr<SpeechToTextServiceImpl>& service,
           1024 * 1024,
       form);
   if (!parse_status.ok()) {
-    ctrl->SetFailed(parse_status.message());
+    api_service::write_bad_request(ctrl, parse_status.message());
     LOG(ERROR) << "parse multipart form data failed: "
                << parse_status.message();
     return;
@@ -430,14 +439,15 @@ void speech_to_text_http_impl(std::unique_ptr<SpeechToTextServiceImpl>& service,
 
   const auto file_idx = api_service::find_multipart_field(form, "file");
   if (!file_idx.has_value()) {
-    ctrl->SetFailed("Expected `file` to be a file-like object.");
+    api_service::write_bad_request(ctrl,
+                                   "Expected `file` to be a file-like object.");
     return;
   }
   api_service::MultipartPart& file_part = form.parts[*file_idx];
 
   std::string error;
   if (!fill_request_from_multipart_form(form, file_part, *req_pb, &error)) {
-    ctrl->SetFailed(error);
+    api_service::write_bad_request(ctrl, error);
     LOG(ERROR) << "invalid speech-to-text form fields: " << error;
     return;
   }
@@ -476,9 +486,9 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
   auto resp_pb =
       google::protobuf::Arena::CreateMessage<typename ChatCall::ResType>(arena);
 
-  size_t content_len = 0;
-  if (!get_json_content_length(ctrl, &content_len)) {
-    ctrl->SetFailed("Content-Length header is missing or invalid.");
+  auto [body_status, content_len] = api_service::http_json_body_length(*ctrl);
+  if (!body_status.ok()) {
+    api_service::write_http_error(ctrl, body_status);
     return;
   }
 
@@ -488,7 +498,7 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
   auto [preprocess_status, processed_json] =
       chat_json_parser.preprocess(std::move(attachment));
   if (!preprocess_status.ok()) {
-    ctrl->SetFailed(preprocess_status.message());
+    api_service::write_http_error(ctrl, preprocess_status);
     LOG(ERROR) << "Complex message preprocessing failed: "
                << preprocess_status.message();
     return;
@@ -499,11 +509,16 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
   auto status = google::protobuf::util::JsonStringToMessage(
       processed_json, req_pb, options);
   if (!status.ok()) {
-    ctrl->SetFailed(status.ToString());
+    api_service::write_bad_request(ctrl, status.ToString());
     LOG(ERROR) << "parse json to proto failed: " << status.ToString();
     return;
   }
 
+  if (req_pb->messages_size() == 0) {
+    api_service::write_http_error(
+        ctrl, Status::invalid_parameter("Messages is empty!", "messages"));
+    return;
+  }
   auto call = std::make_shared<ChatCall>(ctrl,
                                          guard.release(),
                                          req_pb,
@@ -549,13 +564,8 @@ void APIService::ChatCompletions(::google::protobuf::RpcController* controller,
                                  const proto::ChatRequest* request,
                                  proto::ChatResponse* response,
                                  ::google::protobuf::Closure* done) {
-  // TODO with xllm-service
-  xllm::ClosureGuard done_guard(
-      done,
-      [](void* /*unused*/) { request_in_metric(nullptr); },
-      [controller](void* /*unused*/) {
-        request_out_metric(static_cast<void*>(controller));
-      });
+  // Service RPC only acknowledges admission; the Service owns completion.
+  brpc::ClosureGuard done_guard(done);
   if (!request || !response || !controller) {
     LOG(ERROR) << "brpc request | response | controller is null";
     return;
@@ -584,10 +594,14 @@ void APIService::ChatCompletionsHttp(
   }
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
 
   if (!chat_completions_handler_) {
     LOG(ERROR) << "No chat completions handler registered";
+    api_service::write_bad_request(
+        ctrl, "Chat completions service is not available on this server.");
     return;
   }
   chat_completions_handler_(done_guard, ctrl, request, response);
@@ -634,6 +648,7 @@ void APIService::Embeddings(::google::protobuf::RpcController* controller,
 namespace {
 template <typename EmbeddingCall, typename Service>
 void handle_embedding_request(std::unique_ptr<Service>& embedding_service_impl_,
+                              const api_service::HttpBearerAuthenticator& auth,
                               ::google::protobuf::RpcController* controller,
                               const proto::HttpRequest* request,
                               proto::HttpResponse* response,
@@ -657,17 +672,20 @@ void handle_embedding_request(std::unique_ptr<Service>& embedding_service_impl_,
           arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
-  size_t json_content_length = 0;
-  if (!get_json_content_length(ctrl, &json_content_length)) {
-    ctrl->SetFailed("Content-Length header is missing or invalid.");
+  if (!auth.prepare_request(ctrl)) {
+    return;
+  }
+  auto [body_status, json_content_length] =
+      api_service::http_json_body_length(*ctrl);
+  if (!body_status.ok()) {
+    api_service::write_http_error(ctrl, body_status);
     return;
   }
   const butil::IOBuf& attachment = ctrl->request_attachment();
-  if (json_content_length > attachment.size() ||
-      json_content_length >
-          static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-    ctrl->SetFailed("JSON content length exceeds request attachment.");
+  if (json_content_length >
+      static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    api_service::write_bad_request(
+        ctrl, "JSON content length exceeds request attachment.");
     return;
   }
 
@@ -678,7 +696,7 @@ void handle_embedding_request(std::unique_ptr<Service>& embedding_service_impl_,
   json2pb::Json2PbOptions options;
   auto st = json2pb::JsonToProtoMessage(&json_stream, req_pb, options, &error);
   if (!st) {
-    ctrl->SetFailed(error);
+    api_service::write_bad_request(ctrl, error);
     LOG(ERROR) << "parse json to proto failed: " << error;
     return;
   }
@@ -705,10 +723,32 @@ void APIService::EmbeddingsHttp(::google::protobuf::RpcController* controller,
                                 ::google::protobuf::Closure* done) {
   if (embedding_service_impl_) {
     handle_embedding_request<EmbeddingCall, EmbeddingServiceImpl>(
-        embedding_service_impl_, controller, request, response, done);
+        embedding_service_impl_,
+        http_auth_,
+        controller,
+        request,
+        response,
+        done);
   } else if (mm_embedding_service_impl_) {
     handle_embedding_request<MMEmbeddingCall, MMEmbeddingServiceImpl>(
-        mm_embedding_service_impl_, controller, request, response, done);
+        mm_embedding_service_impl_,
+        http_auth_,
+        controller,
+        request,
+        response,
+        done);
+  } else {
+    brpc::ClosureGuard done_guard(done);
+    if (controller == nullptr) {
+      LOG(ERROR) << "brpc controller is null";
+      return;
+    }
+    auto* ctrl = static_cast<brpc::Controller*>(controller);
+    if (!http_auth_.prepare_request(ctrl)) {
+      return;
+    }
+    api_service::write_bad_request(
+        ctrl, "Embeddings service is not available on this server.");
   }
 }
 
@@ -742,9 +782,12 @@ void APIService::ImageGenerationHttp(
   }
 
   auto* ctrl = static_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
   if (!image_generation_service_impl_) {
-    ctrl->SetFailed("ImageGeneration service is not available on this server");
+    api_service::write_bad_request(
+        ctrl, "ImageGeneration service is not available on this server");
     return;
   }
   media_generation_http_impl<ImageGenerationCall>(
@@ -781,9 +824,12 @@ void APIService::AudioGenerationHttp(
   }
 
   auto* ctrl = static_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
   if (!audio_generation_service_impl_) {
-    ctrl->SetFailed("AudioGeneration service is not available on this server");
+    api_service::write_bad_request(
+        ctrl, "AudioGeneration service is not available on this server");
     return;
   }
   media_generation_http_impl<AudioGenerationCall>(
@@ -821,10 +867,12 @@ void APIService::AudioTranscriptionHttp(
   }
 
   auto* ctrl = static_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
   if (!audio_transcription_service_impl_) {
-    ctrl->SetFailed(
-        "AudioTranscription service is not available on this server");
+    api_service::write_bad_request(
+        ctrl, "AudioTranscription service is not available on this server");
     return;
   }
   speech_to_text_http_impl(audio_transcription_service_impl_, done_guard, ctrl);
@@ -860,9 +908,12 @@ void APIService::AudioTranslationHttp(
   }
 
   auto* ctrl = static_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
   if (!audio_translation_service_impl_) {
-    ctrl->SetFailed("AudioTranslation service is not available on this server");
+    api_service::write_bad_request(
+        ctrl, "AudioTranslation service is not available on this server");
     return;
   }
   speech_to_text_http_impl(audio_translation_service_impl_, done_guard, ctrl);
@@ -906,14 +957,21 @@ void APIService::TextGenerationHttp(
           arena);
 
   brpc::Controller* ctrl = static_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
+  if (!text_generation_service_impl_) {
+    api_service::write_bad_request(
+        ctrl, "TextGeneration service is not available on this server.");
+    return;
+  }
   std::string error;
   json2pb::Json2PbOptions options;
   butil::IOBuf& buf = ctrl->request_attachment();
   butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
   bool st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
   if (!st) {
-    ctrl->SetFailed(error);
+    api_service::write_bad_request(ctrl, error);
     LOG(ERROR) << "parse json to proto failed: " << error;
     return;
   }
@@ -957,9 +1015,12 @@ void APIService::VideoGenerationHttp(
   }
 
   auto* ctrl = static_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
   if (!video_generation_service_impl_) {
-    ctrl->SetFailed("VideoGeneration service is not available on this server");
+    api_service::write_bad_request(
+        ctrl, "VideoGeneration service is not available on this server");
     return;
   }
   media_generation_http_impl<VideoGenerationCall>(
@@ -996,14 +1057,21 @@ void APIService::RerankHttp(::google::protobuf::RpcController* controller,
       google::protobuf::Arena::CreateMessage<proto::RerankResponse>(arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
+  if (!rerank_service_impl_) {
+    api_service::write_bad_request(
+        ctrl, "Rerank service is not available on this server.");
+    return;
+  }
   std::string error;
   json2pb::Json2PbOptions options;
   butil::IOBuf& buf = ctrl->request_attachment();
   butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
   auto st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
   if (!st) {
-    ctrl->SetFailed(error);
+    api_service::write_bad_request(ctrl, error);
     LOG(ERROR) << "parse json to proto failed: " << error;
     return;
   }
@@ -1053,19 +1121,26 @@ void APIService::ModelsHttp(::google::protobuf::RpcController* controller,
   auto resp_pb =
       google::protobuf::Arena::CreateMessage<proto::ModelListResponse>(arena);
 
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  if (!http_auth_.prepare_request(ctrl)) {
+    return;
+  }
   bool st_models = models_service_impl_->list_models(nullptr, resp_pb);
   if (!st_models) {
+    api_service::write_http_error(
+        ctrl, Status(StatusCode::UNKNOWN, "list models failed."));
     LOG(ERROR) << "list models failed.";
     return;
   }
 
-  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
   json2pb::Pb2JsonOptions json_options;
   json_options.bytes_to_base64 = false;
   std::string err_msg;
+  ctrl->http_response().set_content_type("application/json; charset=utf-8");
   butil::IOBufAsZeroCopyOutputStream json_output(&ctrl->response_attachment());
   if (!json2pb::ProtoMessageToJson(
           *resp_pb, &json_output, json_options, &err_msg)) {
+    api_service::write_http_error(ctrl, Status(StatusCode::UNKNOWN, err_msg));
     LOG(ERROR) << "proto to json failed";
     return;
   }
@@ -1104,9 +1179,9 @@ void handle_anthropic_messages(std::unique_ptr<AnthropicServiceImpl>& service,
       google::protobuf::Arena::CreateMessage<typename AnthropicCall::ResType>(
           arena);
 
-  size_t content_len = 0;
-  if (!get_json_content_length(ctrl, &content_len)) {
-    ctrl->SetFailed("Content-Length header is missing or invalid.");
+  auto [body_status, content_len] = api_service::http_json_body_length(*ctrl);
+  if (!body_status.ok()) {
+    api_service::write_http_error(ctrl, body_status, /*anthropic=*/true);
     return;
   }
   std::string attachment;
@@ -1115,7 +1190,7 @@ void handle_anthropic_messages(std::unique_ptr<AnthropicServiceImpl>& service,
   auto [preprocess_status, processed_json] =
       ChatJsonParser::anthropic().preprocess(std::move(attachment));
   if (!preprocess_status.ok()) {
-    ctrl->SetFailed(preprocess_status.message());
+    api_service::write_http_error(ctrl, preprocess_status, /*anthropic=*/true);
     LOG(ERROR) << "Anthropic JSON preprocessing failed: "
                << preprocess_status.message();
     return;
@@ -1126,8 +1201,15 @@ void handle_anthropic_messages(std::unique_ptr<AnthropicServiceImpl>& service,
   auto status = google::protobuf::util::JsonStringToMessage(
       processed_json, req_pb, options);
   if (!status.ok()) {
-    ctrl->SetFailed(status.ToString());
+    api_service::write_bad_request(ctrl, status.ToString(), /*anthropic=*/true);
     LOG(ERROR) << "parse json to proto failed: " << status.ToString();
+    return;
+  }
+
+  const Status request_status =
+      api_service::validate_anthropic_request(*req_pb);
+  if (!request_status.ok()) {
+    api_service::write_http_error(ctrl, request_status, /*anthropic=*/true);
     return;
   }
 
@@ -1161,13 +1243,18 @@ void APIService::AnthropicMessagesHttp(
   }
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
-  api_service::ensure_http_x_request_id(ctrl);
+  if (!http_auth_.prepare_request(ctrl, /*anthropic=*/true)) {
+    return;
+  }
 
   if (anthropic_service_impl_) {
     handle_anthropic_messages(
         anthropic_service_impl_, done_guard, ctrl, request, response);
   } else {
-    ctrl->SetFailed("Anthropic messages API is only supported for LLM engine");
+    api_service::write_bad_request(
+        ctrl,
+        "Anthropic messages API is only supported for LLM engine",
+        /*anthropic=*/true);
     LOG(ERROR) << "Anthropic messages API is only supported for LLM engine";
   }
 }
@@ -1333,6 +1420,19 @@ bool APIService::do_sleep(const proto::MasterInfos& request,
     LOG(INFO) << "Master for model " << request.model_id()
               << " is already sleeping";
     *error_message = "Master for model is already sleeping";
+    return false;
+  }
+
+  // A rejected sleep must not leave the admission gate in its sleeping state.
+  // Check the supported execution paths before changing the rate limiter.
+  if (master->engine_type() != EngineType::LLM) {
+    *error_message = "Sleep is only supported for LLM models";
+    return false;
+  }
+  if (!master->options().enable_sleep_mode() &&
+      !KVCacheConfig::get_instance().enable_xtensor()) {
+    *error_message =
+        "Sleep requires --enable_sleep_mode=true or --enable_xtensor=true";
     return false;
   }
 

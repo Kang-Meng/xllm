@@ -90,6 +90,7 @@ class MappingNPU final {
   struct Options {
     PROPERTY(int32_t, num_lccl_comm_shards) = 1;
     PROPERTY(int32_t, lccl_comm_shard_id) = 0;
+    PROPERTY(int32_t, buffer_offset) = 0;
     // dp size
     PROPERTY(int32_t, dp_size) = -1;
     // tp size
@@ -152,10 +153,6 @@ class MappingNPU final {
   nlohmann::json to_json();
 
  private:
-  // HACK: Static counter for auto-assigning buffer_offset in multi-model
-  // scenarios. Increments for each MappingNPU instance. This is a hack and
-  // should be refactored later.
-  static int32_t s_buffer_offset_counter_;
   int32_t buffer_offset_ = 0;
   Options options_;
   std::string rank_table_file_;

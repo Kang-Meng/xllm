@@ -274,6 +274,9 @@ struct Options {
   // if the model supports multiple version or there are multiple models.
   PROPERTY(int64_t, server_idx) = 0;
 
+  // Rank-independent ATB cache namespace; reserve two offsets per model.
+  PROPERTY(int32_t, comm_buffer_offset) = 0;
+
   // enable CUDA graph/ACL graph for performance optimization
   PROPERTY(bool, enable_graph) = false;
   // enable graph-mode decode without padding

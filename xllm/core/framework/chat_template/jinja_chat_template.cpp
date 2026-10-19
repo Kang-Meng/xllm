@@ -22,6 +22,8 @@ limitations under the License.
 #include <optional>
 #include <string>
 
+#include "core/framework/chat_template/tool_call_arguments.h"
+
 namespace xllm {
 
 namespace {
@@ -136,6 +138,8 @@ std::optional<std::string> JinjaChatTemplate::apply(
     const nlohmann::ordered_json& chat_template_kwargs) const {
   // convert the messages to json object
   nlohmann::ordered_json messages_json = nlohmann::json::array();
+  const bool template_has_reasoning_content =
+      template_->source().find("reasoning_content") != std::string::npos;
   for (const auto& message : messages) {
     nlohmann::ordered_json message_json;
     message_json["role"] = message.role;
@@ -153,6 +157,35 @@ std::optional<std::string> JinjaChatTemplate::apply(
 
     if (message.reasoning_content.has_value()) {
       message_json["reasoning_content"] = *message.reasoning_content;
+    }
+
+    if (message_json["content"].is_array()) {
+      const auto& content = message_json["content"];
+      const bool text_only =
+          std::all_of(content.begin(), content.end(), [](const auto& item) {
+            return item.value("type", "") == "text";
+          });
+      if (text_only) {
+        std::string text;
+        bool first = true;
+        for (const auto& item : content) {
+          if (!first) {
+            text += '\n';
+          }
+          text += item.value("text", "");
+          first = false;
+        }
+        message_json["content"] = std::move(text);
+      }
+    }
+    if (message.reasoning_content.has_value() &&
+        !message.reasoning_content->empty() &&
+        !template_has_reasoning_content &&
+        message_json["content"].is_string()) {
+      const std::string& text =
+          message_json["content"].get_ref<const std::string&>();
+      message_json["content"] = "<think>" + *message.reasoning_content +
+                                "</think>" + (text.empty() ? "" : "\n" + text);
     }
 
     if (message.tool_calls.has_value()) {
@@ -196,6 +229,9 @@ std::optional<std::string> JinjaChatTemplate::apply(
   try {
     minja::chat_template_inputs input;
     input.messages = messages;
+    if (!normalize_template_tool_call_arguments(&input.messages)) {
+      return std::nullopt;
+    }
     input.tools = tools;
     input.add_generation_prompt = true;
     input.extra_context = chat_template_kwargs;

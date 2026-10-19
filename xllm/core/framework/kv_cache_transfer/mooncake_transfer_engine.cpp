@@ -772,19 +772,17 @@ bool MooncakeTransferEngine::close_session(const uint64_t cluster_id,
     }
   }
   if (cache_peer.has_value()) {
-    if (!set_remote_peer(cluster_id,
-                         remote_addr,
-                         cache_peer->local_manifest,
-                         CachePeerMode::ABSENT)) {
-      return false;
-    }
+    const bool remote_closed = set_remote_peer(cluster_id,
+                                               remote_addr,
+                                               cache_peer->local_manifest,
+                                               CachePeerMode::ABSENT);
     if (!set_local_peer(cache_peer->remote_manifest, CachePeerMode::ABSENT)) {
       LOG(ERROR) << "Local cache peer cleanup failed for " << remote_addr;
       return false;
     }
     std::lock_guard<std::mutex> lock(session_mutex_);
     cache_peers_.erase(remote_addr);
-    return true;
+    return remote_closed;
   }
 
   {

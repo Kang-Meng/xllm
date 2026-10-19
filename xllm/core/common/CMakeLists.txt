@@ -13,6 +13,7 @@ cc_library(
     metrics.h
     $<$<BOOL:${USE_NPU}>:mspti_helper.h>
     options.h
+    public_error.h
     rate_limiter.h
     types.h
     device_monitor.h
@@ -23,6 +24,7 @@ cc_library(
     metrics.cpp
     $<$<BOOL:${USE_NPU}>:mspti_helper.cpp>
     options.cpp
+    public_error.cpp
     rate_limiter.cpp
     device_monitor.cpp
     flash_comm1_context.cpp

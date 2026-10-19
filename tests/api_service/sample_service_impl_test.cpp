@@ -108,13 +108,20 @@ proto::SampleRequest make_valid_request() {
   return request;
 }
 
+void expect_invalid_parameter(const Status& status, const std::string& param) {
+  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(status.reason(), FailureReason::INVALID_PARAMETER);
+  ASSERT_TRUE(status.param().has_value());
+  EXPECT_EQ(status.param().value(), param);
+}
+
 TEST(SampleServiceImplTest, ValidateRequestRejectsUnsupportedSelectorType) {
   auto request = make_valid_request();
   request.mutable_selector()->set_type("regex");
 
   const Status status = sample_service_internal::validate_request(request);
 
-  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  expect_invalid_parameter(status, "selector.type");
   EXPECT_NE(status.message().find("literal"), std::string::npos);
 }
 
@@ -123,12 +130,12 @@ TEST(SampleServiceImplTest, ValidateRequestRejectsOutOfRangeLogprobs) {
   request.set_logprobs(0);
 
   Status status = sample_service_internal::validate_request(request);
-  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  expect_invalid_parameter(status, "logprobs");
   EXPECT_NE(status.message().find("between 1 and 5"), std::string::npos);
 
   request.set_logprobs(6);
   status = sample_service_internal::validate_request(request);
-  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  expect_invalid_parameter(status, "logprobs");
   EXPECT_NE(status.message().find("between 1 and 5"), std::string::npos);
 }
 
@@ -137,25 +144,25 @@ TEST(SampleServiceImplTest, ValidateRequestRejectsMissingRequiredFields) {
   request.clear_model();
 
   Status status = sample_service_internal::validate_request(request);
-  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  expect_invalid_parameter(status, "model");
   EXPECT_EQ(status.message(), "model is required");
 
   request = make_valid_request();
   request.clear_prompt();
   status = sample_service_internal::validate_request(request);
-  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  expect_invalid_parameter(status, "prompt");
   EXPECT_EQ(status.message(), "prompt is required");
 
   request = make_valid_request();
   request.clear_selector();
   status = sample_service_internal::validate_request(request);
-  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  expect_invalid_parameter(status, "selector");
   EXPECT_EQ(status.message(), "selector is required");
 
   request = make_valid_request();
   request.mutable_selector()->clear_value();
   status = sample_service_internal::validate_request(request);
-  EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
+  expect_invalid_parameter(status, "selector.value");
   EXPECT_EQ(status.message(), "selector.value is required");
 }
 

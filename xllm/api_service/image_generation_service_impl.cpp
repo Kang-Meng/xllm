@@ -13,22 +13,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "image_generation_service_impl.h"
+#include "api_service/image_generation_service_impl.h"
 
 #include <glog/logging.h>
 
 #include <string>
 
+#include "api_service/mm_service_utils.h"
 #include "api_service/request_admission.h"
 #include "butil/base64.h"
-#include "common/instance_name.h"
+#include "core/common/instance_name.h"
+#include "core/distributed_runtime/dit_master.h"
+#include "core/framework/request/dit_request_output.h"
+#include "core/framework/request/dit_request_params.h"
 #include "core/util/binary_payload.h"
-#include "distributed_runtime/dit_master.h"
-#include "framework/request/dit_request_output.h"
-#include "framework/request/dit_request_params.h"
-#include "mm_service_utils.h"
-#include "util/utils.h"
-#include "util/uuid.h"
+#include "core/util/utils.h"
+#include "core/util/uuid.h"
 
 namespace xllm {
 namespace {
@@ -97,8 +97,7 @@ void ImageGenerationServiceImpl::process_async_impl(
   const Status admission_status = api_service_internal::admit_rpc_request(
       model, models_, master_->get_rate_limiter());
   if (!admission_status.ok()) {
-    call->finish_with_error(admission_status.code(),
-                            admission_status.message());
+    call->finish_with_error(admission_status);
     return;
   }
 
@@ -123,7 +122,7 @@ void ImageGenerationServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 

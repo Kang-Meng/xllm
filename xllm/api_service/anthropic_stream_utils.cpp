@@ -15,8 +15,24 @@ limitations under the License.
 
 #include "api_service/anthropic_stream_utils.h"
 
+#include <algorithm>
+
 namespace xllm {
 namespace api_service {
+
+proto::AnthropicUsage make_anthropic_usage(int32_t prompt_tokens,
+                                           int32_t generated_tokens,
+                                           int32_t cached_tokens) {
+  // Cache hits are a subset of prompt tokens. Clamp before subtracting so
+  // inconsistent cross-component counts cannot produce negative usage.
+  prompt_tokens = std::max(int32_t{0}, prompt_tokens);
+  cached_tokens = std::clamp(cached_tokens, int32_t{0}, prompt_tokens);
+  proto::AnthropicUsage usage;
+  usage.set_input_tokens(prompt_tokens - cached_tokens);
+  usage.set_output_tokens(std::max(int32_t{0}, generated_tokens));
+  usage.set_cache_read_input_tokens(cached_tokens);
+  return usage;
+}
 
 std::string convert_finish_reason_to_anthropic(
     const std::string& finish_reason) {

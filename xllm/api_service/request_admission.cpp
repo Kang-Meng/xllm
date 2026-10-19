@@ -19,17 +19,31 @@ limitations under the License.
 
 namespace xllm::api_service_internal {
 
+Status rate_limiter_rejection_status(const RateLimiter& rate_limiter) {
+  if (rate_limiter.is_sleeping()) {
+    return {StatusCode::UNAVAILABLE, "Model is currently in sleep state."};
+  }
+  return {StatusCode::RESOURCE_EXHAUSTED,
+          "The number of concurrent requests has reached the limit.",
+          FailureReason::CONCURRENCY_LIMIT_REACHED};
+}
+
+Status model_not_supported_status() {
+  return {StatusCode::UNKNOWN,
+          "Model not supported",
+          FailureReason::MODEL_NOT_FOUND};
+}
+
 Status admit_rpc_request(const std::string& model,
                          const absl::flat_hash_set<std::string>& models,
                          RateLimiter* rate_limiter) {
   if (!models.contains(model)) {
-    return {StatusCode::UNKNOWN, "Model not supported"};
+    return model_not_supported_status();
   }
 
   CHECK(rate_limiter != nullptr);
   if (rate_limiter->is_limited()) {
-    return {StatusCode::RESOURCE_EXHAUSTED,
-            "The number of concurrent requests has reached the limit."};
+    return rate_limiter_rejection_status(*rate_limiter);
   }
   return {};
 }

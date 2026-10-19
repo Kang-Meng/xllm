@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#pragma once
+
 #include <brpc/server.h>
 #include <google/protobuf/service.h>
 
@@ -20,22 +22,24 @@ limitations under the License.
 
 namespace xllm {
 
-static void request_in_metric(void* context) {
+inline void request_in_metric(void* /*context*/) {
   COUNTER_INC(server_request_in_total);
 }
 
-static void request_out_metric(void* context) {
-  auto ctrl = reinterpret_cast<brpc::Controller*>(context);
+inline void request_out_metric(void* context) {
+  auto* ctrl = static_cast<brpc::Controller*>(context);
   if (ctrl == nullptr) {
     LOG(ERROR) << "ctrl is nullptr";
     return;
   }
 
-  if (!ctrl->Failed()) {
+  if (!ctrl->Failed() && !ctrl->IsCanceled() &&
+      ctrl->http_response().status_code() < 400) {
     COUNTER_INC(server_request_total_ok);
   } else {
     COUNTER_INC(server_request_total_fail);
-    if (ctrl->ErrorCode() == brpc::ELIMIT) {
+    if (ctrl->ErrorCode() == brpc::ELIMIT ||
+        ctrl->http_response().status_code() == 429) {
       COUNTER_INC(server_request_total_limit);
     }
   }

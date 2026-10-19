@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "dit_master.h"
+#include "core/distributed_runtime/dit_master.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -26,14 +26,14 @@ limitations under the License.
 #include <vector>
 
 #include "api_service/call.h"
-#include "common/metrics.h"
+#include "core/common/metrics.h"
+#include "core/distributed_runtime/dit_engine.h"
+#include "core/framework/request/dit_request.h"
 #include "core/platform/device_name_utils.h"
-#include "dit_engine.h"
-#include "framework/request/dit_request.h"
+#include "core/scheduler/scheduler_factory.h"
+#include "core/util/scope_guard.h"
+#include "core/util/timer.h"
 #include "models/model_registry.h"
-#include "scheduler/scheduler_factory.h"
-#include "util/scope_guard.h"
-#include "util/timer.h"
 
 namespace xllm {
 DiTMaster::DiTMaster(const Options& options)
@@ -118,8 +118,9 @@ void DiTMaster::handle_request(DiTRequestParams params,
     rate_limit_guard.dismiss();
 
     if (!scheduler_->add_request(request)) {
-      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
-                          "No available resources to schedule request");
+      callback(Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "No available resources to schedule request",
+                      FailureReason::TEMPORARY_OVERLOAD));
     }
   });
 }

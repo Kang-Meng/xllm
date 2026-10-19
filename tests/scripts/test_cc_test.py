@@ -327,10 +327,17 @@ file(WRITE "${{CMAKE_BINARY_DIR}}/npu_layers.links" "${{links}}")
                 "speculative/mtp_async_state.cpp",
                 "speculative/adaptive_speculative_controller.cpp",
                 "speculative/speculative_profile_registry.cpp",
+                "speculative/speculative_cache_utils.cpp",
+                "speculative/mtp_execution_policy.cpp",
+                "speculative/dflash_async_input_builder.cpp",
             ):
                 test_source = source / "xllm/core/framework" / relative_source
                 test_source.parent.mkdir(parents=True, exist_ok=True)
                 test_source.touch()
+            for relative_source in ("encoder_executor.cpp", "draft_model_config.cpp"):
+                runtime_source = source / "xllm/core/runtime" / relative_source
+                runtime_source.parent.mkdir(parents=True, exist_ok=True)
+                runtime_source.touch()
             (source / "CMakeLists.txt").write_text(
                 f"""cmake_minimum_required(VERSION 3.24)
 project(host_metadata_test_contract LANGUAGES CXX)

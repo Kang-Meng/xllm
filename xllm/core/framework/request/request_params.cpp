@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "request_params.h"
+#include "core/framework/request/request_params.h"
 
+#include <string>
 #include <type_traits>
+#include <utility>
 
 #include "core/common/global_flags.h"
 #include "core/common/instance_name.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/request/request.h"
 #include "core/util/uuid.h"
-#include "request.h"
 // Pulls in RequestSamplingParam and SchedulerParam definitions for the
 // projection helpers below.
-#include "request_state.h"
+#include "core/framework/request/request_state.h"
 
 namespace xllm {
 namespace {
@@ -595,81 +597,55 @@ RequestParams::RequestParams(const proto::AnthropicMessagesRequest& request,
 }
 
 bool RequestParams::verify_params(OutputCallback callback) const {
-  if (!response_format_error.empty()) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        response_format_error,
-                        service_request_id,
-                        source_xservice_addr);
+  const auto reject_parameter = [this, &callback](std::string param,
+                                                  std::string message) {
+    callback({Status::invalid_parameter(std::move(message), std::move(param)),
+              service_request_id,
+              source_xservice_addr});
     return false;
+  };
+
+  if (!response_format_error.empty()) {
+    return reject_parameter("response_format", response_format_error);
   }
   if (n == 0) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "n should be greater than 0",
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
+    return reject_parameter("n", "n should be greater than 0");
   }
-  if (best_of.has_value()) {
-    if (n > best_of.value()) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "n should be less than or equal to best_of",
-                          service_request_id,
-                          source_xservice_addr);
-      return false;
-    }
+  if (best_of.has_value() && n > best_of.value()) {
+    return reject_parameter("best_of",
+                            "n should be less than or equal to best_of");
   }
 
   // up to 4 stop sequences
   if (stop.has_value() && stop.value().size() > 4) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "stop size is too large",
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
+    return reject_parameter("stop", "stop size is too large");
   }
 
   // temperature between [0.0, 2.0]
   if (temperature < 0.0 || temperature > 2.0) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "temperature must be between 0.0 and 2.0",
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
+    return reject_parameter("temperature",
+                            "temperature must be between 0.0 and 2.0");
   }
 
   // top_p between [0.0, 1.0]
   if (top_p < 0.0 || top_p > 1.0) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "top_p must be between 0.0 and 1.0",
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
+    return reject_parameter("top_p", "top_p must be between 0.0 and 1.0");
   }
 
   if (num_return_sequences > 0) {
     if (beam_width <= 0) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "num_return_sequences requires beam_width > 0",
-                          service_request_id,
-                          source_xservice_addr);
-      return false;
+      return reject_parameter("beam_width",
+                              "num_return_sequences requires beam_width > 0");
     }
     if (num_return_sequences < beam_width) {
-      CALLBACK_WITH_ERROR(
-          StatusCode::INVALID_ARGUMENT,
-          "num_return_sequences must be greater than or equal to beam_width",
-          service_request_id,
-          source_xservice_addr);
-      return false;
+      return reject_parameter(
+          "num_return_sequences",
+          "num_return_sequences must be greater than or equal to beam_width");
     }
   }
 
   if (logprobs && echo) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "logprobs is not supported with echo",
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
+    return reject_parameter("echo", "logprobs is not supported with echo");
   }
 
   // top_logprobs becomes the k of torch::topk() whenever logprobs are in
@@ -681,11 +657,8 @@ bool RequestParams::verify_params(OutputCallback callback) const {
   // rather than silently repaired by the beam normalization.
   if (logprobs || beam_width > 1) {
     if (top_logprobs < 0 || top_logprobs > 2000) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "logprobs must be between 0 and 2000",
-                          service_request_id,
-                          source_xservice_addr);
-      return false;
+      return reject_parameter("top_logprobs",
+                              "logprobs must be between 0 and 2000");
     }
     // Beam search raises top_logprobs to at least beam_width, so also validate
     // the value that will actually be used. Derive it through the same helper
@@ -695,31 +668,22 @@ bool RequestParams::verify_params(OutputCallback callback) const {
     effective.top_logprobs = top_logprobs;
     effective.enable_beam_search(beam_width);
     if (effective.top_logprobs > 2000) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "beam_width must be at most 2000 (it sets the "
-                          "top_logprobs used for beam expansion)",
-                          service_request_id,
-                          source_xservice_addr);
-      return false;
+      return reject_parameter("beam_width",
+                              "beam_width must be at most 2000 (it sets the "
+                              "top_logprobs used for beam expansion)");
     }
   }
 
   // presence_penalty between [-2.0, 2.0]
   if (presence_penalty < -2.0 || presence_penalty > 2.0) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "presence_penalty must be between -2.0 and 2.0",
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
+    return reject_parameter("presence_penalty",
+                            "presence_penalty must be between -2.0 and 2.0");
   }
 
   // frequency_penalty between [0.0, 2.0]
   if (frequency_penalty < 0.0 || frequency_penalty > 2.0) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "frequency_penalty must be between 0.0 and 2.0",
-                        service_request_id,
-                        source_xservice_addr);
-    return false;
+    return reject_parameter("frequency_penalty",
+                            "frequency_penalty must be between 0.0 and 2.0");
   }
   return true;
 }

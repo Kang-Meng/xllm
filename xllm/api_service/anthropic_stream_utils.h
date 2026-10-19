@@ -24,6 +24,10 @@ limitations under the License.
 namespace xllm {
 namespace api_service {
 
+proto::AnthropicUsage make_anthropic_usage(int32_t prompt_tokens,
+                                           int32_t generated_tokens,
+                                           int32_t cached_tokens);
+
 std::string convert_finish_reason_to_anthropic(
     const std::string& finish_reason);
 

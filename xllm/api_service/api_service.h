@@ -21,6 +21,7 @@ limitations under the License.
 #include <unordered_map>
 
 #include "anthropic_service_impl.h"
+#include "api_service/http_auth.h"
 #include "audio_generation_service_impl.h"
 #include "chat_service_impl.h"
 #include "completion_service_impl.h"
@@ -287,6 +288,7 @@ class APIService : public proto::XllmAPIService {
   bool do_wakeup(const proto::MasterInfos& request, std::string* error_message);
 
   Master* master_;
+  api_service::HttpBearerAuthenticator http_auth_;
   ChatHttpHandler chat_completions_handler_;
   mutable std::shared_mutex masters_mutex_;
   std::unordered_map<std::string, Master*> masters_;

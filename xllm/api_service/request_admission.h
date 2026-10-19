@@ -24,6 +24,12 @@ limitations under the License.
 
 namespace xllm::api_service_internal {
 
+// Call only after is_limited() rejects the request; it already holds no slot.
+Status rate_limiter_rejection_status(const RateLimiter& rate_limiter);
+
+// Shared rejection for an unknown model name across all API services.
+Status model_not_supported_status();
+
 Status admit_rpc_request(const std::string& model,
                          const absl::flat_hash_set<std::string>& models,
                          RateLimiter* rate_limiter);

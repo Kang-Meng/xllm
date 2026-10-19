@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <limits>
+
 #include "comm_channel.h"
 #include "common/health_check_manager.h"
 #include "core/framework/config/service_config.h"
@@ -212,6 +214,11 @@ void DistManager::setup_multi_node_workers(
 
   runtime::Options worker_server_options = options;
   worker_server_options.world_size(world_size);
+  CHECK_GE(options.server_idx(), 0);
+  CHECK_LE(options.server_idx(), (std::numeric_limits<int32_t>::max() - 1) / 2);
+  // Preserve the model namespace before server_idx becomes a local rank.
+  worker_server_options.comm_buffer_offset(
+      static_cast<int32_t>(options.server_idx() * 2));
   WorkerType worker_type("LLM");
   if (model_backend == "llm") {
     if (options.task_type() == "generate") {

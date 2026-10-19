@@ -94,7 +94,8 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
                                      const InstanceRole& instance_role,
                                      bool enable_mtp_draft_body_tp1,
                                      const std::string& draft_sampling_mode,
-                                     int32_t kv_split_size) {
+                                     int32_t kv_split_size,
+                                     int32_t comm_buffer_offset) {
   // TODO: pass whole xllm::runtime::Options here from main process.
   xllm::runtime::Options runner_options;
   const std::string backend = get_backend_from_worker_type(worker_type);
@@ -106,6 +107,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
   const int32_t effective_text_encoder_tp_size =
       is_dit_backend ? text_encoder_tp_size : 1;
   runner_options.block_size(block_size)
+      .comm_buffer_offset(comm_buffer_offset)
       .backend(backend)
       .world_size(world_size)
       .max_tokens_per_batch(max_tokens_per_batch)

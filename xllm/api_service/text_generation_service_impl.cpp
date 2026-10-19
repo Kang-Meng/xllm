@@ -13,14 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "text_generation_service_impl.h"
+#include "api_service/text_generation_service_impl.h"
 
 #include <glog/logging.h>
 
 #include "api_service/request_admission.h"
-#include "distributed_runtime/dit_master.h"
-#include "framework/request/dit_request_output.h"
-#include "framework/request/dit_request_params.h"
+#include "core/distributed_runtime/dit_master.h"
+#include "core/framework/request/dit_request_output.h"
+#include "core/framework/request/dit_request_params.h"
 
 namespace xllm {
 namespace {
@@ -66,8 +66,7 @@ void TextGenerationServiceImpl::process_async_impl(
   const Status admission_status = api_service_internal::admit_rpc_request(
       model, models_, master_->get_rate_limiter());
   if (!admission_status.ok()) {
-    call->finish_with_error(admission_status.code(),
-                            admission_status.message());
+    call->finish_with_error(admission_status);
     return;
   }
 
@@ -87,7 +86,7 @@ void TextGenerationServiceImpl::process_async_impl(
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
         return send_result_to_client_brpc(

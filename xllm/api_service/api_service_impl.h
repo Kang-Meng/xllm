@@ -40,6 +40,10 @@ class APIServiceImpl {
   void process_async(std::shared_ptr<Call> call) {
     std::shared_ptr<CallType> call_cast =
         std::dynamic_pointer_cast<CallType>(call);
+    if (!call_cast->request_payload_status().ok()) {
+      call_cast->finish_with_error(call_cast->request_payload_status());
+      return;
+    }
     process_async_impl(call_cast);
   }
 

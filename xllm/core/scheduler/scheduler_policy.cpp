@@ -233,6 +233,9 @@ std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
     std::shared_ptr<Request> request = *it;
     request->update_connection_status();
     if (request->finished() || request->cancelled()) {
+      if (state.release_failed_request) {
+        state.release_failed_request(request);
+      }
       clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
       finished_requests.emplace_back(request);
@@ -283,6 +286,9 @@ void SchedulerPolicy::schedule_prefill_from_queue(
 
     std::shared_ptr<Request> request(queue->top());
     if (request->finished() || request->cancelled()) {
+      if (state.release_failed_request) {
+        state.release_failed_request(request);
+      }
       clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
       finished.emplace_back(request);

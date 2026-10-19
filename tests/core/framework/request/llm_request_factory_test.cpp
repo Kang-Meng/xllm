@@ -103,12 +103,16 @@ class FakeChatTemplate final : public ChatTemplate {
 struct CallbackCapture {
   bool called = false;
   std::optional<Status> status;
+  std::string service_request_id;
+  std::string target_xservice_addr;
 };
 
 OutputCallback make_capture_callback(CallbackCapture* capture) {
   return [capture](RequestOutput output) {
     capture->called = true;
     capture->status = output.status;
+    capture->service_request_id = output.service_request_id;
+    capture->target_xservice_addr = output.target_xservice_addr;
     return false;
   };
 }
@@ -211,6 +215,8 @@ TEST_F(LLMRequestFactoryTest, RejectsPromptLongerThanContext) {
   auto factory = make_factory(/*vocab_size=*/1000, /*max_position=*/8);
   CallbackCapture capture;
   RequestParams sp;
+  sp.service_request_id = "service-req";
+  sp.source_xservice_addr = "service-address";
 
   auto request = factory->create(
       /*prompt=*/"",
@@ -221,7 +227,11 @@ TEST_F(LLMRequestFactoryTest, RejectsPromptLongerThanContext) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(), "Prompt is too long");
+  EXPECT_EQ(capture.status->reason(), FailureReason::PROMPT_TOO_LONG);
+  EXPECT_EQ(capture.service_request_id, sp.service_request_id);
+  EXPECT_EQ(capture.target_xservice_addr, sp.source_xservice_addr);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
@@ -334,4 +344,25 @@ TEST_F(LLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
 }
 
 }  // namespace
+TEST_F(LLMRequestFactoryTest, InvalidHistoryReleasesSlot) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  Message assistant("assistant", "");
+  Message::ToolCall call;
+  call.function.arguments = "[]";
+  assistant.tool_calls = Message::ToolCallVec{call};
+  auto request = factory->create(ChatMessages{assistant},
+                                 std::nullopt,
+                                 sp,
+                                 std::nullopt,
+                                 make_capture_callback(&capture));
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->reason(), FailureReason::INVALID_PARAMETER);
+  EXPECT_EQ(capture.status->param(),
+            "messages[0].tool_calls[0].function.arguments");
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
 }  // namespace xllm

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "async_response_processor.h"
+#include "core/scheduler/async_response_processor.h"
 
 #include <absl/synchronization/notification.h>
 #include <absl/time/clock.h>
@@ -184,13 +184,17 @@ void AsyncResponseProcessor::batch_process_completed_requests(
 // process non-stream requests
 void AsyncResponseProcessor::process_completed_requests(
     std::vector<std::shared_ptr<Request>>& requests) {
-  if (!enable_batch_response_) {
-    for (size_t i = 0; i < requests.size(); ++i) {
-      process_completed_request(std::move(requests[i]));
+  std::vector<std::shared_ptr<Request>> service_requests;
+  service_requests.reserve(enable_batch_response_ ? requests.size() : 0);
+  for (std::shared_ptr<Request>& request : requests) {
+    if (!enable_batch_response_ || request->service_request_id().empty()) {
+      process_completed_request(std::move(request));
+    } else {
+      service_requests.emplace_back(std::move(request));
     }
-  } else {
-    // send request response to xllm service in batch through rpc
-    batch_process_completed_requests(requests);
+  }
+  if (!service_requests.empty()) {
+    batch_process_completed_requests(service_requests);
   }
 }
 
@@ -364,13 +368,17 @@ void AsyncResponseProcessor::batch_process_stream_requests(
 // process stream requests
 void AsyncResponseProcessor::process_stream_requests(
     std::vector<std::shared_ptr<Request>>& requests) {
-  if (!enable_batch_response_) {
-    for (auto& req : requests) {
-      process_stream_request(req);
+  std::vector<std::shared_ptr<Request>> service_requests;
+  service_requests.reserve(enable_batch_response_ ? requests.size() : 0);
+  for (std::shared_ptr<Request>& request : requests) {
+    if (!enable_batch_response_ || request->service_request_id().empty()) {
+      process_stream_request(std::move(request));
+    } else {
+      service_requests.emplace_back(std::move(request));
     }
-  } else {
-    // send request response to xllm service in batch through rpc
-    batch_process_stream_requests(requests);
+  }
+  if (!service_requests.empty()) {
+    batch_process_stream_requests(service_requests);
   }
 }
 

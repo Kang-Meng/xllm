@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "rec_completion_service_impl.h"
+#include "api_service/rec_completion_service_impl.h"
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
@@ -25,15 +25,16 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "common/global_flags.h"
-#include "common/instance_name.h"
-#include "common/metrics.h"
+#include "api_service/request_admission.h"
 #include "completion.pb.h"
+#include "core/common/global_flags.h"
+#include "core/common/instance_name.h"
+#include "core/common/metrics.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/request/request_output.h"
-#include "util/timer.h"
+#include "core/util/timer.h"
 
 #ifdef likely
 #undef likely
@@ -273,15 +274,14 @@ void RecCompletionServiceImpl::process_async_impl(
   // check if model is supported
   const auto& model = rpc_request.model();
   if (unlikely(!models_.contains(model))) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 
   // Check if the request is being rate-limited.
   if (unlikely(master_->get_rate_limiter()->is_limited())) {
-    call->finish_with_error(
-        StatusCode::RESOURCE_EXHAUSTED,
-        "The number of concurrent requests has reached the limit.");
+    call->finish_with_error(api_service_internal::rate_limiter_rejection_status(
+        *master_->get_rate_limiter()));
     return;
   }
 
@@ -353,7 +353,7 @@ void RecCompletionServiceImpl::process_async_impl(
                 rec_total_latency_microseconds,
                 static_cast<int64_t>(request_timer.elapsed_microseconds()));
 
-            return call->finish_with_error(status.code(), status.message());
+            return call->finish_with_error(status);
           }
         }
 

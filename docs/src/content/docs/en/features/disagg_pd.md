@@ -22,6 +22,16 @@ The overall architecture is shown below:
 - **xLLM**: Refer to [Installation && Compilation](/en/getting_started/quick_start/)
 - **xLLM Service**: Refer to [xLLM Service](https://github.com/xLLM-AI/xllm-service)
 
+#### Unified API error compatibility
+
+Upgrade xLLM Service before xLLM. `GenerationStatus.error` (field 5) carries the
+complete public error: HTTP status, type, code, message, optional parameter, and
+retryability. xLLM maps the business error once; Service renders that object for
+HTTP/SSE without remapping it. Fields 1–4 retain their internal-status semantics;
+when `error` is absent, Service uses the legacy mapping. Older readers ignore the
+new field, so complete error parity is not guaranteed during a mixed-version
+rollout. The callback RPC acknowledgement is not the business success status.
+
 #### Obtain Environment Information  
 Deploying Disaggregated PD Service requires obtaining the Device IP of the machine to create communication resources. Execute the command `cat /etc/hccn.conf | grep address` on the current AI Server to get the Device IP, for example:
 ```

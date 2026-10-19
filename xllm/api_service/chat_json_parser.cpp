@@ -19,10 +19,16 @@ limitations under the License.
 
 #include <nlohmann/json.hpp>
 
+#include "core/framework/chat_template/tool_call_arguments.h"
+
 namespace xllm {
 namespace {
 
 Status normalize_tool_choice(nlohmann::json* json, bool* modified) {
+  Status arguments_status = validate_wire_tool_call_arguments(*json);
+  if (!arguments_status.ok()) {
+    return arguments_status;
+  }
   if (!json->contains("tool_choice")) {
     return Status();
   }
@@ -32,33 +38,35 @@ Status normalize_tool_choice(nlohmann::json* json, bool* modified) {
     return Status();
   }
   if (!tool_choice.is_object()) {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "tool_choice must be a string or an object.");
+    return Status::invalid_parameter(
+        "tool_choice must be a string or an object.", "tool_choice");
   }
 
   if (!tool_choice.contains("type") || !tool_choice["type"].is_string()) {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "Object tool_choice must contain a string 'type' field.");
+    return Status::invalid_parameter(
+        "Object tool_choice must contain a string 'type' field.",
+        "tool_choice.type");
   }
 
   const std::string type = tool_choice["type"].get<std::string>();
   if (type != "function") {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "Unsupported object tool_choice type: " + type);
+    return Status::invalid_parameter(
+        "Unsupported object tool_choice type: " + type, "tool_choice.type");
   }
 
   if (!tool_choice.contains("function") ||
       !tool_choice["function"].is_object()) {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "Function tool_choice must contain a function object.");
+    return Status::invalid_parameter(
+        "Function tool_choice must contain a function object.",
+        "tool_choice.function");
   }
 
   const nlohmann::json& function = tool_choice["function"];
   if (!function.contains("name") || !function["name"].is_string() ||
       function["name"].get_ref<const std::string&>().empty()) {
-    return Status(
-        StatusCode::INVALID_ARGUMENT,
-        "Function tool_choice must contain a non-empty function.name string.");
+    return Status::invalid_parameter(
+        "Function tool_choice must contain a non-empty function.name string.",
+        "tool_choice.function.name");
   }
 
   nlohmann::json normalized_tool_choice = {
@@ -102,9 +110,10 @@ std::pair<Status, std::string> VlmChatJsonParser::preprocess(
 
     for (auto& msg : json["messages"]) {
       if (!msg.is_object()) {
-        return {Status(StatusCode::INVALID_ARGUMENT,
-                       "Message in 'messages' array must be an object."),
-                ""};
+        return {
+            Status::invalid_parameter(
+                "Message in 'messages' array must be an object.", "messages"),
+            ""};
       }
       if (msg.contains("content") && msg["content"].is_string()) {
         nlohmann::json content = nlohmann::json::array();
@@ -144,8 +153,9 @@ std::pair<Status, std::string> LlmChatJsonParser::preprocess(
     const auto kwargs_it = json.find("chat_template_kwargs");
     if (kwargs_it != json.end() && !kwargs_it->is_null() &&
         !kwargs_it->is_object()) {
-      return {Status(StatusCode::INVALID_ARGUMENT,
-                     "chat_template_kwargs must be an object or null."),
+      return {Status::invalid_parameter(
+                  "chat_template_kwargs must be an object or null.",
+                  "chat_template_kwargs"),
               ""};
     }
 
@@ -175,48 +185,45 @@ std::pair<Status, std::string> LlmChatJsonParser::preprocess(
 
     for (auto& msg : json["messages"]) {
       if (!msg.is_object()) {
-        return {Status(StatusCode::INVALID_ARGUMENT,
-                       "Message in 'messages' array must be an object."),
-                ""};
+        return {
+            Status::invalid_parameter(
+                "Message in 'messages' array must be an object.", "messages"),
+            ""};
       }
       if (msg.contains("content") && msg["content"].is_array()) {
+        size_t total_size =
+            msg["content"].empty() ? 0 : msg["content"].size() - 1;
         for (const auto& item : msg["content"]) {
           if (!item.is_object()) {
-            return {Status(StatusCode::INVALID_ARGUMENT,
-                           "Content array item must be an object."),
+            return {Status::invalid_parameter(
+                        "Content array item must be an object.",
+                        "messages.content"),
                     ""};
           }
           if (!item.contains("type") || item["type"] != "text") {
-            return {Status(StatusCode::INVALID_ARGUMENT,
-                           "Non-text content (e.g., image_url) requires "
-                           "multimodal backend (-backend vlm)"),
+            return {Status::invalid_parameter(
+                        "Non-text content (e.g., image_url) requires "
+                        "multimodal backend (-backend vlm)",
+                        "messages.content.type"),
                     ""};
           }
           if (!item.contains("text") || !item["text"].is_string()) {
-            return {Status(StatusCode::INVALID_ARGUMENT,
-                           "Missing or invalid 'text' field in content item."),
+            return {Status::invalid_parameter(
+                        "Missing or invalid 'text' field in content item.",
+                        "messages.content.text"),
                     ""};
           }
-        }
-
-        size_t total_size = 0;
-        size_t num_items = msg["content"].size();
-        for (const auto& item : msg["content"]) {
           total_size += item["text"].get_ref<const std::string&>().size();
-        }
-        if (num_items > 1) {
-          total_size += num_items - 1;
         }
 
         std::string combined_text;
         combined_text.reserve(total_size);
-        bool first = true;
-        for (const auto& item : msg["content"]) {
-          if (!first) {
+        const auto& content = msg["content"];
+        for (size_t i = 0; i < content.size(); ++i) {
+          if (i != 0) {
             combined_text += '\n';
           }
-          combined_text += item["text"].get_ref<const std::string&>();
-          first = false;
+          combined_text += content[i]["text"].get_ref<const std::string&>();
         }
         msg["content"] = combined_text;
         modified = true;

@@ -13,17 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "rerank_service_impl.h"
+#include "api_service/rerank_service_impl.h"
 
 #include <torch/torch.h>
 
 #include <string>
 
-#include "common/instance_name.h"
-#include "distributed_runtime/llm_master.h"
-#include "framework/request/request_params.h"
-#include "util/utils.h"
-#include "util/uuid.h"
+#include "api_service/request_admission.h"
+#include "core/common/instance_name.h"
+#include "core/distributed_runtime/llm_master.h"
+#include "core/framework/request/request_params.h"
+#include "core/util/utils.h"
+#include "core/util/uuid.h"
 
 namespace xllm {
 
@@ -86,7 +87,7 @@ void RerankServiceImpl::process_async_impl(std::shared_ptr<RerankCall> call) {
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
   if (!models_.contains(model)) {
-    call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
+    call->finish_with_error(api_service_internal::model_not_supported_status());
     return;
   }
 

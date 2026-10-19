@@ -7,6 +7,9 @@ cc_library(
     api_service.h
     api_service_impl.h
     call.h
+    http_auth.h
+    http_request_body.h
+    public_error.h
     request_id.h
     request_admission.h
     chat_json_parser.h

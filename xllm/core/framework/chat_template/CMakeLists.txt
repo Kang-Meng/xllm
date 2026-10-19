@@ -8,6 +8,7 @@ cc_library (
     chat_template.h
     deepseek_v4_thinking_mode.h
     thinking_mode_resolver.h
+    tool_call_arguments.h
   DEPS
     :tokenizer
     nlohmann_json::nlohmann_json

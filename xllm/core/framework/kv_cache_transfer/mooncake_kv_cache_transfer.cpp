@@ -766,6 +766,9 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
       continue;
     }
     for (const std::string& key : keys) {
+      if (failed_keys.find(key) != failed_keys.end()) {
+        continue;
+      }
       const KVCacheInfo& kv_info = merged_kv_infos.at(key);
       std::vector<ByteRegion> regions;
       const Status bind_status =

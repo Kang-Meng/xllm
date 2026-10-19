@@ -24,8 +24,8 @@ limitations under the License.
 #include <vector>
 
 #include "common.pb.h"
+#include "core/util/slice.h"
 #include "nlohmann/json.hpp"
-#include "util/slice.h"
 
 namespace xllm {
 
@@ -108,24 +108,57 @@ enum class StatusCode : uint8_t {
   UNAVAILABLE = 6,
 };
 
+// A stable cause is needed when one broad StatusCode covers failures with
+// different client actions (for example, a too-long prompt and temporary
+// capacity exhaustion). UNSPECIFIED preserves existing Status producers.
+enum class FailureReason : uint8_t {
+  UNSPECIFIED = 0,
+  INVALID_PARAMETER = 1,
+  MODEL_NOT_FOUND = 2,
+  PROMPT_TOO_LONG = 3,
+  TEMPORARY_OVERLOAD = 4,
+  CONCURRENCY_LIMIT_REACHED = 5,
+  UNAUTHENTICATED = 6,
+  PERMISSION_DENIED = 7,
+};
+
 class Status final {
  public:
   Status() = default;
 
   Status(StatusCode code) : code_(code) {}
 
-  Status(StatusCode code, std::string msg)
-      : code_(code), msg_(std::move(msg)) {}
+  static Status invalid_parameter(std::string message, std::string param) {
+    return Status(StatusCode::INVALID_ARGUMENT,
+                  std::move(message),
+                  FailureReason::INVALID_PARAMETER,
+                  std::move(param));
+  }
+
+  Status(StatusCode code,
+         std::string msg,
+         FailureReason reason = FailureReason::UNSPECIFIED,
+         std::optional<std::string> param = std::nullopt)
+      : code_(code),
+        msg_(std::move(msg)),
+        reason_(reason),
+        param_(std::move(param)) {}
 
   StatusCode code() const { return code_; }
 
   const std::string& message() const { return msg_; }
+
+  FailureReason reason() const { return reason_; }
+
+  const std::optional<std::string>& param() const { return param_; }
 
   bool ok() const { return code_ == StatusCode::OK; }
 
  private:
   StatusCode code_ = StatusCode::OK;
   std::string msg_;
+  FailureReason reason_ = FailureReason::UNSPECIFIED;
+  std::optional<std::string> param_;
 };
 
 class InstanceRole {
