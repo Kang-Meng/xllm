@@ -272,6 +272,17 @@ bool LLMEngine::init_model(MasterStatus master_status) {
       is_glm5_next_target_model(args_)) {
     args_.num_speculative_tokens(options_.num_speculative_tokens());
   }
+  // Block-diffusion targets (DFlash2/DSpark) run spec-verify batches of
+  // (num_speculative_tokens + 1) rows per sequence. Mirror the
+  // WorkerImpl::init_model sync so engine-form deployments that read
+  // ModelArgs (e.g. the C++ model impl sizing the MegaMoE communication
+  // capacity) see the live width as well.
+  if (options_.enable_speculative_decode() &&
+      SpeculativeConfig::is_block_diffusion_algorithm(
+          options_.speculative_algorithm()) &&
+      !options_.is_draft_engine()) {
+    args_.num_speculative_tokens(options_.num_speculative_tokens());
+  }
 
   // A draft engine is fed token ids and detokenized by the target, so it
   // shares the target vocabulary and loads no tokenizer of its own.

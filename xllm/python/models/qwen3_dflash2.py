@@ -51,13 +51,28 @@ class DFlash2Qwen3Config(DFlashQwen3Config):
     @classmethod
     def from_dict(cls, d: dict) -> DFlash2Qwen3Config:
         base = DFlashQwen3Config.from_dict(d)
+        # Community DFlash2 checkpoints (incoai/GLM-5.3-DFlash2 and the
+        # GLM-5.3-Flash pairing) nest the geometry under "dflash_config"
+        # (block_size, conv_group_size, ...); our own exports use flat
+        # top-level dflash2_* keys. Accept either, flat first. The C++
+        # qwen3.h ModelArgs loader reads only the nested dflash_config.*
+        # path; the flat-key preference is a Python-side extension.
+        nested = d.get("dflash_config") or {}
+        if not isinstance(nested, dict):
+            raise ValueError(f"dflash_config must be a dict when present, got {type(nested).__name__}")
+
+        def pick(flat_key: str, nested_key: str) -> int:
+            if flat_key in d:
+                return int(d[flat_key])
+            return int(nested.get(nested_key, 0))
+
         return cls(
             **base.__dict__,
-            dflash2_block_size=int(d.get("dflash2_block_size", 0)),
-            dflash2_conv_group_size=int(d.get("dflash2_conv_group_size", 0)),
-            dflash2_conv_kernel_size=int(d.get("dflash2_conv_kernel_size", 0)),
-            dflash2_selector_rank=int(d.get("dflash2_selector_rank", 0)),
-            dflash2_selector_top_k=int(d.get("dflash2_selector_top_k", 0)),
+            dflash2_block_size=pick("dflash2_block_size", "block_size"),
+            dflash2_conv_group_size=pick("dflash2_conv_group_size", "conv_group_size"),
+            dflash2_conv_kernel_size=pick("dflash2_conv_kernel_size", "conv_kernel_size"),
+            dflash2_selector_rank=pick("dflash2_selector_rank", "selector_rank"),
+            dflash2_selector_top_k=pick("dflash2_selector_top_k", "selector_top_k"),
         )
 
     def validate(self) -> None:

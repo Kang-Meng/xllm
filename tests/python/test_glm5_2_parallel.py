@@ -208,6 +208,159 @@ def test_glm_weight_loader_reads_only_local_ep_experts(monkeypatch) -> None:
     assert loader.shared_shards == [("model.layers.0.mlp.shared_experts.", 1, 0)]
 
 
+def test_qlinear_loader_rejects_missing_required_w8a8_suffix() -> None:
+    """A checkpoint passing the model-level probe but dropping a required
+    suffix on another projection must fail loudly with the missing key name,
+    not silently leave torch.empty garbage in the W8A8 buffers forward reads.
+
+    The glm5_2 probe only inspects layer-0 q_a_proj; a truncated/mixed export
+    that keeps q_a_proj.weight_scale but drops q_b_proj.weight_scale would
+    otherwise pass the probe and ship uninitialized scales.
+    """
+    from xllm.python.layers.qlinear import QLinearWeightLoader
+
+    class _StubLoader(QLinearWeightLoader):
+        """Bypasses __init__; answers find() from a fixed key set."""
+
+        def __init__(self, keys: set[str]) -> None:
+            self._keys = keys
+
+        def find(self, name: str):
+            return object() if name in self._keys else None
+
+        def load_tensor(self, name: str) -> torch.Tensor:
+            return torch.zeros(4, 4)
+
+        def shard(self, t, dim, world=None, rank=None):
+            return t
+
+        def copy_in(self, name, tensor) -> None:
+            pass
+
+    truncated = _StubLoader(
+        {
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "model.layers.0.self_attn.q_b_proj.weight_offset",
+            # weight_scale deliberately absent
+        }
+    )
+    with pytest.raises(KeyError, match=r"q_b_proj\.weight_scale"):
+        truncated.load_w8a8_into_qlinear(
+            "model.layers.0.self_attn.q_b_proj",
+            "model.layers.0.self_attn.",
+            "q_b_proj",
+            {"weight": 0, "weight_scale": 0, "weight_offset": 0},
+            quant_format="dynamic",
+        )
+
+    # A truncated export that keeps the scales but drops ``weight`` itself
+    # must also fail: the gate fires on any known suffix being present, and
+    # the required-set check names the missing weight key (weight is the
+    # first entry of both formats' required sets).
+    no_weight = _StubLoader(
+        {
+            "model.layers.0.self_attn.q_b_proj.weight_scale",
+            "model.layers.0.self_attn.q_b_proj.weight_offset",
+        }
+    )
+    with pytest.raises(KeyError, match=r"q_b_proj\.weight\b"):
+        no_weight.load_w8a8_into_qlinear(
+            "model.layers.0.self_attn.q_b_proj",
+            "model.layers.0.self_attn.",
+            "q_b_proj",
+            {"weight": 0, "weight_scale": 0, "weight_offset": 0},
+            quant_format="dynamic",
+        )
+
+    # An unrecognized format string fails with a clear ValueError instead of
+    # a bare KeyError from the suffix-table lookup.
+    with pytest.raises(ValueError, match="unknown W8A8 quant_format"):
+        truncated.load_w8a8_into_qlinear(
+            "model.layers.0.self_attn.q_b_proj",
+            "model.layers.0.self_attn.",
+            "q_b_proj",
+            None,
+            quant_format="int4",
+        )
+
+    # A symmetric dynamic export may omit weight_offset: it is outside the
+    # dynamic required set and the buffer zero-initializes, so "absent"
+    # means symmetric instead of garbage.
+    symmetric = _StubLoader(
+        {
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "model.layers.0.self_attn.q_b_proj.weight_scale",
+        }
+    )
+    symmetric.load_w8a8_into_qlinear(
+        "model.layers.0.self_attn.q_b_proj",
+        "model.layers.0.self_attn.",
+        "q_b_proj",
+        {"weight": 0, "weight_scale": 0, "weight_offset": 0},
+        quant_format="dynamic",
+    )
+
+    # Structure-only loads (empty state dicts: not even ``weight`` exists)
+    # keep the silent skip so unit-test harnesses can build models.
+    empty = _StubLoader(set())
+    empty.load_w8a8_into_qlinear(
+        "model.layers.0.self_attn.q_b_proj",
+        "model.layers.0.self_attn.",
+        "q_b_proj",
+        None,
+        quant_format="static",
+    )
+
+
+def test_glm_weight_probe_rejects_mixed_format(monkeypatch) -> None:
+    """A checkpoint whose layer-0 probe projection carries both static
+    (deq_scale) and dynamic (weight_scale) suffixes is malformed and must
+    fail loudly instead of guessing a format."""
+    model = Glm52ForCausalLM(_config())
+    monkeypatch.setattr(glm5_2, "W8A8WeightLoader", _RecordingLoader)
+
+    class _FakeStateDict:
+        def __init__(self, keys: set[str]) -> None:
+            self._keys = keys
+
+        def has(self, name: str) -> bool:
+            return name in self._keys
+
+    probe = "model.layers.0.self_attn.q_a_proj."
+    sd = _FakeStateDict({probe + "deq_scale", probe + "weight_scale"})
+    with pytest.raises(ValueError, match="both"):
+        model.load_weights([sd], tp_rank=0, tp_size=1)
+
+
+def test_qlinear_resolve_quant_format_override_semantics() -> None:
+    """The load-time quant_format override rebinds kind, builds the matching
+    W8A8 submodule, releases the dead fp weight, and refuses to pin a format
+    on an fp projection."""
+    from xllm.python.layers.qlinear import QLinear
+    from xllm.python.models.deepseek_v32 import W8A8DynamicLinear, W8A8StaticLinear
+
+    cpu = torch.device("cpu")
+    q = QLinear(8, 16, device=cpu, dtype=torch.float32, kind="static")
+    q.resolve_quant(True, quant_format="dynamic")
+    assert q.kind == "dynamic"
+    assert isinstance(q._w8a8, W8A8DynamicLinear)
+    assert bool(torch.all(q._w8a8.weight_offset == 0))  # symmetric default
+    assert q.weight.data.numel() == 0  # dead fp storage released
+
+    q2 = QLinear(16, 8, device=cpu, dtype=torch.float32, kind="dynamic")
+    q2.resolve_quant(True, quant_format="static")
+    assert q2.kind == "static"
+    assert isinstance(q2._w8a8, W8A8StaticLinear)
+    assert q2.weight.data.numel() == 0
+
+    fp = QLinear(8, 8, device=cpu, dtype=torch.float32)
+    fp.resolve_quant(False)
+    assert fp.weight.data.numel() == 8 * 8  # fp path keeps the weight
+
+    with pytest.raises(ValueError, match="has_quant_tensors=True"):
+        QLinear(8, 8, device=cpu, dtype=torch.float32).resolve_quant(False, quant_format="dynamic")
+
+
 def _npu_device() -> object:
     return SimpleNamespace(type="npu")
 

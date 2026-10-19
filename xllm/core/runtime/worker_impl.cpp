@@ -2080,6 +2080,17 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
        is_glm5_next_target_model(args))) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
   }
+  // Block-diffusion targets (DFlash2/DSpark) run spec-verify batches of
+  // (num_speculative_tokens + 1) rows per sequence. ModelArgs must carry the
+  // live width even for non-MTP algorithms: the Python MegaMoE capacity
+  // formula reads ModelArgs, not the runtime options, and a stale 0 caps
+  // the communication buffer below the real spec-verify width (glm_moe_dsa
+  // hits "token count exceeds the communication cap: 8 > 4"). C++ KV cache
+  // sizing reads the runtime options and is unaffected by this sync.
+  if (options_.enable_speculative_decode() && is_block_diffusion &&
+      !options_.is_draft_engine()) {
+    args.num_speculative_tokens(options_.num_speculative_tokens());
+  }
   if (is_block_diffusion) {
     configure_block_diffusion_model(args, options_);
   } else if (options_.enable_speculative_decode() &&

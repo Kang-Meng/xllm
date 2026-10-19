@@ -264,3 +264,88 @@ def test_checkpoint_weight_names_load_into_fused_modules(monkeypatch: pytest.Mon
     assert model.model.embed_tokens is None
     assert model.lm_head is None
     assert prepare_row_parallel_weight.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# DFlash2 nested dflash_config parsing (incoai/GLM-5.3-DFlash2 layout).
+# ---------------------------------------------------------------------------
+
+
+def test_dflash2_nested_dflash_config_geometry_is_parsed() -> None:
+    """Community DFlash2 checkpoints nest geometry under dflash_config.
+
+    incoai/GLM-5.3-DFlash2 and the GLM-5.3-Flash pairing keep block_size,
+    conv_* and selector_* inside a nested "dflash_config" object while our
+    own exports use flat top-level dflash2_* keys. Both must parse to the
+    same config values (the C++ qwen3.h loader reads only the nested path;
+    the flat-key preference is a Python-side extension).
+    """
+    from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3Config
+
+    geometry = {
+        "block_size": 8,
+        "conv_group_size": 16,
+        "conv_kernel_size": 2,
+        "selector_rank": 256,
+        "selector_top_k": 16,
+    }
+    base = _config_dict(
+        model_type="qwen3",
+        sliding_window=2048,
+        use_sliding_window=True,
+        hidden_size=16,
+    )
+    nested = dict(base, dflash_config=dict(geometry))
+    flat = dict(base, **{f"dflash2_{k}": v for k, v in geometry.items()})
+
+    nested_cfg = DFlash2Qwen3Config.from_dict(nested)
+    flat_cfg = DFlash2Qwen3Config.from_dict(flat)
+    for key in (
+        "dflash2_block_size",
+        "dflash2_conv_group_size",
+        "dflash2_conv_kernel_size",
+        "dflash2_selector_rank",
+        "dflash2_selector_top_k",
+    ):
+        assert getattr(nested_cfg, key) == getattr(flat_cfg, key), key
+    assert nested_cfg.dflash2_block_size == 8
+    assert nested_cfg.dflash2_conv_group_size == 16
+    assert nested_cfg.dflash2_conv_kernel_size == 2
+    assert nested_cfg.dflash2_selector_rank == 256
+    assert nested_cfg.dflash2_selector_top_k == 16
+
+
+def test_dflash2_flat_keys_take_precedence_over_nested_geometry() -> None:
+    """A config carrying both forms must resolve to the flat top-level key."""
+    from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3Config
+
+    base = _config_dict(model_type="qwen3", sliding_window=2048, use_sliding_window=True, hidden_size=16)
+    cfg_dict = dict(
+        base,
+        dflash_config={
+            "block_size": 8,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 256,
+            "selector_top_k": 16,
+        },
+        dflash2_block_size=4,
+    )
+    cfg = DFlash2Qwen3Config.from_dict(cfg_dict)
+    assert cfg.dflash2_block_size == 4
+    assert cfg.dflash2_selector_rank == 256
+
+
+def test_dflash2_non_dict_dflash_config_raises() -> None:
+    """A malformed dflash_config (truthy non-dict) must fail loudly.
+
+    ``or {}`` alone cannot recover from e.g. a string value; the explicit
+    isinstance check turns a downstream AttributeError into a clear config
+    error.
+    """
+    from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3Config
+
+    base = _config_dict(model_type="qwen3", sliding_window=2048, use_sliding_window=True, hidden_size=16)
+    cfg_dict = dict(base, dflash_config="not-a-dict")
+    with pytest.raises(ValueError, match="dflash_config must be a dict"):
+        DFlash2Qwen3Config.from_dict(cfg_dict)

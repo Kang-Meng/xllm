@@ -450,7 +450,10 @@ class W8A8DynamicLinear(nn.Module):
             requires_grad=False,
         )
         self.register_buffer("weight_scale", torch.empty(out_features, 1, dtype=torch.float32, device=device))
-        self.register_buffer("weight_offset", torch.empty(out_features, 1, dtype=torch.float32, device=device))
+        # Zero-initialized: a symmetric per-channel export may omit
+        # weight_offset entirely, and "not provided" must read as symmetric
+        # (== 0) rather than uninitialized memory.
+        self.register_buffer("weight_offset", torch.zeros(out_features, 1, dtype=torch.float32, device=device))
 
     def process_weights_after_loading(self) -> None:
         if not bool(torch.all(self.weight_offset == 0)):

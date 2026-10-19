@@ -52,6 +52,7 @@ from xllm.python.layers import (
     RMSNorm,
 )
 from xllm.python.layers.moe import QuantGatedMLP
+from xllm.python.layers.qlinear import QLinear, QLinearWeightLoader
 from xllm.python.model_executor.cp_utils import (
     cp_gather_kv,
     cp_merge_rows,
@@ -69,7 +70,6 @@ from xllm.python.models.deepseek_v32 import (
     DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
 )
 from xllm.python.models.deepseek_v32 import (
-    W8A8StaticLinear,
     _apply_half_rope,
     _create_hadamard_matrix,
     _gather_interleave_cos_sin,
@@ -82,6 +82,7 @@ from xllm.python.models.glm5_2_moe import (
     validate_glm52_ep_config,
     validate_glm52_ep_execution_config,
 )
+from xllm.python.models.glm5_next import _resolve_module
 from xllm.python.models.weight_utils import W8A8WeightLoader, effective_moe_tp, mla_head_split
 
 # aclnnQuantLightningIndexer tiling hard-requires n_heads_q / n_heads_k == 64
@@ -395,11 +396,17 @@ class Glm52MLAAttention(Attention):
         self.kv_lora_rank = kv_lora
         self.num_heads_local = num_heads
 
-        self.q_a_proj = W8A8StaticLinear(cfg.hidden_size, cfg.q_lora_rank, device)
-        self.kv_a_proj_with_mqa = W8A8StaticLinear(cfg.hidden_size, kv_lora + qk_rope, device)
+        # QLinear defers the static/dynamic W8A8 choice to load time: the
+        # loader probes whether the checkpoint carries deq_scale (internal
+        # static exports, GLM-5.2) or weight_scale (HF per-channel dynamic
+        # exports, GLM-5.3) suffixes.
+        self.q_a_proj = QLinear(cfg.hidden_size, cfg.q_lora_rank, device=device, dtype=dtype, kind="static")
+        self.kv_a_proj_with_mqa = QLinear(cfg.hidden_size, kv_lora + qk_rope, device=device, dtype=dtype, kind="static")
         self.q_a_layernorm = RMSNorm(cfg.q_lora_rank, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.kv_a_layernorm = RMSNorm(kv_lora, cfg.rms_norm_eps, dtype=dtype, device=device)
-        self.q_b_proj = W8A8StaticLinear(cfg.q_lora_rank, num_heads * (qk_nope + qk_rope), device)
+        self.q_b_proj = QLinear(
+            cfg.q_lora_rank, num_heads * (qk_nope + qk_rope), device=device, dtype=dtype, kind="static"
+        )
         self.kv_b_proj = ColumnParallelLinear(
             kv_lora,
             num_heads * (qk_nope + v_head),
@@ -407,7 +414,9 @@ class Glm52MLAAttention(Attention):
             dtype=dtype,
             device=device,
         )
-        self.o_proj = W8A8StaticLinear(num_heads * v_head, cfg.hidden_size, device, row_parallel=True)
+        self.o_proj = QLinear(
+            num_heads * v_head, cfg.hidden_size, device=device, dtype=dtype, kind="static", row_parallel=True
+        )
         self.register_buffer(
             "W_UK",
             torch.empty(num_heads, qk_nope, kv_lora, dtype=dtype, device=device),
@@ -552,7 +561,7 @@ class Glm52Indexer(nn.Module):
         self.rope_dim = cfg.qk_rope_head_dim
         self.topk = cfg.index_topk
         self.indexer_rope_interleave = cfg.indexer_rope_interleave
-        self.wq_b = W8A8StaticLinear(cfg.q_lora_rank, self.n_head * self.head_dim, device)
+        self.wq_b = QLinear(cfg.q_lora_rank, self.n_head * self.head_dim, device=device, dtype=dtype, kind="static")
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim, bias=False, dtype=dtype, device=device)
         self.weights_proj = nn.Linear(cfg.hidden_size, self.n_head, bias=False, dtype=dtype, device=device)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype, device=device)
@@ -800,6 +809,13 @@ class Glm52Model(nn.Module):
         return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
 
 
+def _resolve_qlinear(model: nn.Module, dotted: str) -> QLinear:
+    """Resolve ``dotted`` to the QLinear, reusing GLM-Next's dotted-path walk."""
+    mod = _resolve_module(model, dotted)
+    assert isinstance(mod, QLinear), f"{dotted} is not a QLinear"
+    return mod
+
+
 class Glm52ForCausalLM(PyModelBase):
     """GLM-5.2 causal LM. Registered under ``model_type='glm_moe_dsa'``."""
 
@@ -846,6 +862,38 @@ class Glm52ForCausalLM(PyModelBase):
         cfg = self.cfg
         loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
 
+        # Quant-format probe, decided once from the first attention projection:
+        # internal static exports (GLM-5.2-w8a8) carry q_a_proj.deq_scale, HF
+        # per-channel dynamic exports (GLM-5.3-w8a8) carry
+        # q_a_proj.weight_scale. Every W8A8 projection in the model uses the
+        # same format, so the probe result pins every QLinear's kind. The
+        # dense/shared MLP branch below is always dynamic-layout (both export
+        # flavors ship MLP weight_scale/weight_offset) and does not read the
+        # probe result.
+        probe = "model.layers.0.self_attn.q_a_proj."
+        has_deq_scale = loader.has(probe + "deq_scale")
+        has_weight_scale = loader.has(probe + "weight_scale")
+        if has_deq_scale and has_weight_scale:
+            raise ValueError(
+                "glm_moe_dsa q_a_proj carries both deq_scale (internal static "
+                "export) and weight_scale (per-channel dynamic export) suffixes"
+            )
+        if not has_deq_scale and not has_weight_scale and len(state_dicts) > 0:
+            raise ValueError(
+                "glm_moe_dsa requires W8A8 projections: neither "
+                "q_a_proj.deq_scale (internal static export) nor "
+                "q_a_proj.weight_scale (per-channel dynamic export) was found"
+            )
+        # Empty state dicts (structure-only loads in unit tests) keep the
+        # construction-time static default.
+        quant_format = "dynamic" if has_weight_scale else "static"
+        q_loader = QLinearWeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
+
+        def load_qlinear(prefix: str, proj: str, shard_dims: dict[str, int] | None) -> None:
+            module = _resolve_qlinear(self, prefix + proj)
+            module.resolve_quant(True, quant_format=quant_format)
+            module.load_w8a8(q_loader, prefix, proj, shard_dims, quant_format=quant_format)
+
         loader.copy_shard("model.embed_tokens.weight", dim=1)
 
         for i in range(cfg.n_layers):
@@ -853,16 +901,20 @@ class Glm52ForCausalLM(PyModelBase):
             loader.copy_replicated(p + "input_layernorm.weight")
             loader.copy_replicated(p + "post_attention_layernorm.weight")
             attn = p + "self_attn."
-            loader.load_w8a8_projection(attn, "q_a_proj")
+            load_qlinear(attn, "q_a_proj", None)
             loader.copy_replicated(attn + "q_a_layernorm.weight")
-            loader.load_w8a8_projection(attn, "q_b_proj", {"weight": 0, "deq_scale": 0, "quant_bias": 0})
-            loader.load_w8a8_projection(attn, "kv_a_proj_with_mqa")
+            load_qlinear(
+                attn, "q_b_proj", {"weight": 0, "deq_scale": 0, "quant_bias": 0, "weight_scale": 0, "weight_offset": 0}
+            )
+            load_qlinear(attn, "kv_a_proj_with_mqa", None)
             loader.copy_replicated(attn + "kv_a_layernorm.weight")
             loader.copy_shard(attn + "kv_b_proj.weight", dim=0)
-            loader.load_w8a8_projection(attn, "o_proj", {"weight": 1})
+            # Row-parallel o_proj shards only the weight (dim 1); the
+            # per-output-channel scale/bias suffixes stay replicated.
+            load_qlinear(attn, "o_proj", {"weight": 1})
             if not self.model.layers[i].self_attn.is_shared:
                 idx = attn + "indexer."
-                loader.load_w8a8_projection(idx, "wq_b")
+                load_qlinear(idx, "wq_b", None)
                 loader.copy_replicated(idx + "wk.weight")
                 loader.copy_replicated(idx + "k_norm.weight")
                 loader.copy_replicated(idx + "k_norm.bias")

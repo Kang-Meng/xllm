@@ -52,9 +52,31 @@ class QLinear(nn.Module):
             self.register_parameter("bias", None)
         self._w8a8: nn.Module | None = None  # built in Task 2
 
-    def resolve_quant(self, has_quant_tensors: bool) -> None:
+    def resolve_quant(self, has_quant_tensors: bool, *, quant_format: str | None = None) -> None:
+        """Resolve fp vs W8A8 and (optionally) pin the quant format.
+
+        ``quant_format`` overrides the construction-time ``kind`` when the
+        loader has probed the checkpoint: ``"static"`` (deq_scale/input_scale
+        suffixes, internal exports) or ``"dynamic"`` (weight_scale/
+        weight_offset suffixes, HF-ecosystem per-channel exports such as
+        GLM-5.3-w8a8). Without it the constructor's ``kind`` stands, preserving
+        existing GLM-5.3-Flash call sites that pin static/dynamic per
+        projection.
+        """
+        if quant_format is not None and not has_quant_tensors:
+            raise ValueError(
+                f"resolve_quant(quant_format={quant_format!r}) requires "
+                "has_quant_tensors=True: pinning a quant format on an fp "
+                "projection is a caller bug"
+            )
         self.use_w8a8 = bool(has_quant_tensors)
         if self.use_w8a8:
+            if quant_format is not None:
+                self.kind = quant_format
+            # The fp weight is dead in W8A8 mode (forward reads only the
+            # _w8a8 submodule); release its storage so quantized deployments
+            # do not pay for both layouts.
+            self.weight.data = torch.empty(0, dtype=self.weight.dtype, device=self.weight.device)
             self._build_w8a8()
 
     def _build_w8a8(self) -> None:
@@ -73,17 +95,19 @@ class QLinear(nn.Module):
     def load_weight(self, tensor: torch.Tensor) -> None:
         self.weight.data.copy_(tensor.to(dtype=self.weight.dtype, device=self.weight.device))
 
-    def load_w8a8(self, loader, prefix: str, proj: str, shard_dims=None) -> None:
+    def load_w8a8(self, loader, prefix: str, proj: str, shard_dims=None, *, quant_format: str | None = None) -> None:
         """Load w8a8 tensors into this QLinear's ``_w8a8`` submodule.
 
         ``prefix + proj`` is this module's dotted path inside the model (the
         caller passes the path up to the projection attribute, e.g. ``attn`` +
         ``o_proj``). The loader targets ``<prefix+proj>._w8a8.<suffix>`` so the
         int8 weights land on the submodule ``forward`` actually reads, not this
-        QLinear's fp ``weight`` slot.
+        QLinear's fp ``weight`` slot. ``quant_format`` (when the caller has
+        probed the checkpoint) makes the loader validate that the projection
+        ships the full suffix set of that format.
         """
         assert self._w8a8 is not None, "resolve_quant(True) before load_w8a8"
-        loader.load_w8a8_into_qlinear(prefix + proj, prefix, proj, shard_dims)
+        loader.load_w8a8_into_qlinear(prefix + proj, prefix, proj, shard_dims, quant_format=quant_format)
 
     def process_weights_after_loading(self) -> None:
         if self.use_w8a8:
@@ -99,6 +123,19 @@ class QLinear(nn.Module):
 
 class QLinearWeightLoader:
     """Probe-driven fp/w8a8 load router + TP shard, reusing W8A8WeightLoader."""
+
+    # Required suffixes per W8A8 checkpoint format. A projection shipping one
+    # format's scale suffix must carry the full set; a mixed or truncated
+    # export would otherwise leave the torch.empty buffers uninitialized and
+    # silently corrupt forward numerics (the pre-QLinear loader failed loudly
+    # with KeyError instead). weight_offset is deliberately outside the
+    # dynamic required set: a symmetric per-channel export may omit it, and
+    # W8A8DynamicLinear zero-initializes the buffer so "not provided" reads
+    # as symmetric.
+    _W8A8_REQUIRED_SUFFIXES = {
+        "static": ("weight", "deq_scale", "quant_bias", "input_scale", "input_offset"),
+        "dynamic": ("weight", "weight_scale"),
+    }
 
     def __init__(self, model: nn.Module, state_dicts, tp_size: int, tp_rank: int):
         from xllm.python.models.glm5_next_weight import W8A8WeightLoader
@@ -139,6 +176,8 @@ class QLinearWeightLoader:
         prefix: str,
         proj: str,
         shard_dims=None,
+        *,
+        quant_format: str | None = None,
     ) -> None:
         """Load static W8A8 projection tensors into a QLinear's ``_w8a8`` module.
 
@@ -151,10 +190,46 @@ class QLinearWeightLoader:
         must be populated. Unlike a loader that targets the module's own name,
         this lands on the ``_w8a8`` path segment.
         """
-        for suffix in ("weight", "deq_scale", "quant_bias", "input_scale", "input_offset"):
+        # Internal static exports carry deq_scale/quant_bias/input_scale/
+        # input_offset; HF-ecosystem dynamic exports (GLM-5.3-w8a8) carry
+        # per-channel weight_scale/weight_offset. Load whichever suffix set the
+        # checkpoint provides -- resolve_quant has already built the matching
+        # W8A8StaticLinear or W8A8DynamicLinear submodule. The suffix-skip
+        # below is only meant for the *other* format's keys; when the caller
+        # probed the format, require this projection to ship the full suffix
+        # set of that format. Structure-only loads (no W8A8 key at all, e.g.
+        # empty state dicts in unit tests) keep the silent skip; a projection
+        # carrying any known suffix but missing a required one (including
+        # weight itself) fails loudly instead of shipping torch.empty
+        # garbage into forward.
+        if quant_format is not None:
+            if quant_format not in self._W8A8_REQUIRED_SUFFIXES:
+                raise ValueError(
+                    f"unknown W8A8 quant_format {quant_format!r}; expected one of "
+                    f"{sorted(self._W8A8_REQUIRED_SUFFIXES)}"
+                )
+            known_suffixes = (
+                self._W8A8_REQUIRED_SUFFIXES["static"] + self._W8A8_REQUIRED_SUFFIXES["dynamic"] + ("weight_offset",)
+            )
+            if any(self.find(f"{prefix}{proj}.{s}") is not None for s in known_suffixes):
+                for suffix in self._W8A8_REQUIRED_SUFFIXES[quant_format]:
+                    key = f"{prefix}{proj}.{suffix}"
+                    if self.find(key) is None:
+                        raise KeyError(
+                            f"checkpoint tensor not found: {key} (required by the {quant_format} W8A8 format)"
+                        )
+        for suffix in (
+            "weight",
+            "deq_scale",
+            "quant_bias",
+            "input_scale",
+            "input_offset",
+            "weight_scale",
+            "weight_offset",
+        ):
             key = f"{prefix}{proj}.{suffix}"
             if self.find(key) is None:
-                continue  # optional suffix (e.g. dynamic uses weight_scale)
+                continue  # absent in this checkpoint format
             t = self.load_tensor(key)
             dim = (shard_dims or {}).get(suffix)
             if dim is not None:
