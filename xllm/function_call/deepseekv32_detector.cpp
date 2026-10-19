@@ -234,34 +234,6 @@ static std::string strip_trailing_placeholder_punctuation(
   return text.substr(0, remove_start);
 }
 
-static std::string strip_leading_placeholder_punctuation(
-    const std::string& text) {
-  size_t line_end = 0;
-  while (line_end < text.size() && text[line_end] != '\n' &&
-         text[line_end] != '\r') {
-    ++line_end;
-  }
-
-  if (!is_placeholder_only_segment(
-          std::string_view(text).substr(0, line_end))) {
-    return text;
-  }
-
-  size_t remove_end = line_end;
-  if (remove_end < text.size() && text[remove_end] == '\r') {
-    ++remove_end;
-  }
-  if (remove_end < text.size() && text[remove_end] == '\n') {
-    ++remove_end;
-  }
-  while (remove_end < text.size() && is_ascii_whitespace(text[remove_end]) &&
-         text[remove_end] != '\n' && text[remove_end] != '\r') {
-    ++remove_end;
-  }
-
-  return text.substr(remove_end);
-}
-
 static std::string trim_line_trailing_spaces(const std::string& text) {
   static const std::regex kSpacesBeforeNewlineRegex(
       R"([ \t]+(\r?\n))", std::regex_constants::ECMAScript);
@@ -287,58 +259,6 @@ static std::string sanitize_text_before_tool_block(const std::string& text) {
     sanitized = updated;
   }
   return trim_line_trailing_spaces(sanitized);
-}
-
-static bool ends_with_markdown_fence_prefix(const std::string& text) {
-  static const std::regex kTrailingFencePrefixRegex(
-      R"((?:\r?\n)?```[^\n\r`]*\s*$)", std::regex_constants::ECMAScript);
-  return std::regex_search(text, kTrailingFencePrefixRegex);
-}
-
-static bool split_trailing_empty_markdown_fence_block(
-    const std::string& text,
-    std::string* leading_text,
-    std::string* trailing_fence_block) {
-  static const std::regex kTrailingEmptyFenceBlockRegex(
-      R"(^([\s\S]*?)(```[^\n\r`]*\r?\n(?:\s*\r?\n)*```)[ \t\r\n]*$)",
-      std::regex_constants::ECMAScript);
-
-  std::smatch match;
-  if (!std::regex_match(text, match, kTrailingEmptyFenceBlockRegex) ||
-      match.size() < 3) {
-    return false;
-  }
-
-  if (leading_text != nullptr) {
-    *leading_text = match[1].str();
-  }
-  if (trailing_fence_block != nullptr) {
-    *trailing_fence_block = match[2].str();
-  }
-  return true;
-}
-
-static size_t find_trailing_whitespace_start(const std::string& text) {
-  size_t idx = text.size();
-  while (idx > 0 &&
-         std::isspace(static_cast<unsigned char>(text[idx - 1])) != 0) {
-    --idx;
-  }
-  return idx;
-}
-
-static std::string normalize_deferred_whitespace(const std::string& text) {
-  if (text.empty()) {
-    return text;
-  }
-
-  bool has_newline = (text.find('\n') != std::string::npos ||
-                      text.find('\r') != std::string::npos);
-  if (has_newline) {
-    return "\n";
-  }
-
-  return " ";
 }
 
 std::string DeepSeekV32Detector::trim_whitespace(std::string_view str) const {
@@ -834,16 +754,6 @@ StreamingParseResult DeepSeekV32Detector::parse_streaming_increment(
   bool ends_with_open_brace =
       (!current_text_rstrip.empty() && current_text_rstrip.back() == '{');
 
-  bool ends_with_markdown_fence_hint =
-      ends_with_markdown_fence_prefix(current_text_rstrip);
-
-  std::string text_before_empty_fence_block;
-  std::string trailing_empty_fence_block;
-  bool has_trailing_empty_fence_block =
-      split_trailing_empty_markdown_fence_block(current_text,
-                                                &text_before_empty_fence_block,
-                                                &trailing_empty_fence_block);
-
   bool has_json_tool_calls =
       (current_text.find("\"tool_calls\"") != std::string::npos ||
        current_text.find("'tool_calls'") != std::string::npos);
@@ -888,72 +798,22 @@ StreamingParseResult DeepSeekV32Detector::parse_streaming_increment(
     }
 
     if (has_tool_call(current_text) || potentially_dsml ||
-        has_json_tool_calls || ends_with_prefix || potentially_json_block ||
-        ends_with_open_brace) {
+        has_json_tool_calls) {
       buffer_.clear();
       return StreamingParseResult("", {});
     }
 
-    std::string output_text = has_trailing_empty_fence_block
-                                  ? text_before_empty_fence_block
-                                  : current_text;
-    output_text = sanitize_text_before_tool_block(output_text);
-    output_text = strip_leading_markdown_fence(output_text);
-    output_text = strip_leading_placeholder_punctuation(output_text);
     buffer_.clear();
-    return StreamingParseResult(output_text, {});
+    return StreamingParseResult(current_text, {});
   }
 
   if (!has_tool_call(current_text) && !potentially_dsml && !ends_with_prefix &&
       !has_json_tool_calls && !ends_with_open_brace &&
       !potentially_json_block) {
-    if (has_trailing_empty_fence_block) {
-      buffer_ = trailing_empty_fence_block;
-      std::string leading_text =
-          sanitize_text_before_tool_block(text_before_empty_fence_block);
-      leading_text = trim_whitespace(leading_text);
-      if (!leading_text.empty()) {
-        return StreamingParseResult(leading_text, {});
-      }
-      return StreamingParseResult("", {});
-    }
-
-    if (ends_with_markdown_fence_hint) {
-      return StreamingParseResult("", {});
-    }
-
-    // Remove any stray closing tags
-    std::string output_text = current_text;
-    size_t pos = 0;
-    while ((pos = output_text.find(eot_token_, pos)) != std::string::npos) {
-      output_text.erase(pos, eot_token_.length());
-    }
-    pos = 0;
-    while ((pos = output_text.find(invoke_end_token_, pos)) !=
-           std::string::npos) {
-      output_text.erase(pos, invoke_end_token_.length());
-    }
-
-    output_text = sanitize_text_before_tool_block(output_text);
-    output_text = strip_leading_markdown_fence(output_text);
-    output_text = strip_leading_placeholder_punctuation(output_text);
-
-    // Keep minimal trailing whitespace in buffer to preserve token boundaries
-    // across chunks without accumulating excessive blank lines/spaces.
-    size_t trailing_ws_start = find_trailing_whitespace_start(output_text);
-    if (trailing_ws_start < output_text.size()) {
-      std::string emit_text = output_text.substr(0, trailing_ws_start);
-      buffer_ =
-          normalize_deferred_whitespace(output_text.substr(trailing_ws_start));
-      if (!emit_text.empty()) {
-        return StreamingParseResult(emit_text, {});
-      }
-      return StreamingParseResult("", {});
-    }
-
+    // Chunk boundaries carry no formatting semantics. Only recognized tool
+    // blocks may be sanitized; ordinary text must retain its original bytes.
     buffer_.clear();
-
-    return StreamingParseResult(output_text, {});
+    return StreamingParseResult(current_text, {});
   }
 
   // Initialize tool indices if needed

@@ -80,6 +80,102 @@ class DeepSeekV4DetectorTest : public DeepSeek32DetectorTest {
   std::unique_ptr<DeepSeekV4Detector> v4_detector_;
 };
 
+template <typename Detector>
+class DeepSeekTextStreamingTest : public DeepSeek32DetectorTest {};
+
+using DeepSeekTextDetectors =
+    ::testing::Types<DeepSeekV32Detector, DeepSeekV4Detector>;
+TYPED_TEST_SUITE(DeepSeekTextStreamingTest, DeepSeekTextDetectors);
+
+TYPED_TEST(DeepSeekTextStreamingTest,
+           PreservesStandaloneWhitespaceImmediately) {
+  TypeParam detector;
+  for (const std::string& chunk : {" ", "\n", "\n\n", "\t", "\r\n", "  "}) {
+    StreamingParseResult result =
+        detector.parse_streaming_increment(chunk, this->tools_);
+    EXPECT_EQ(result.normal_text, chunk);
+    EXPECT_TRUE(result.calls.empty());
+  }
+  EXPECT_TRUE(
+      detector.parse_streaming_increment("", this->tools_).normal_text.empty());
+}
+
+TYPED_TEST(DeepSeekTextStreamingTest, PreservesMarkdownAcrossChunkSizes) {
+  const std::string text =
+      "  测试。\n\n## Heading\n\n"
+      "First line  \nSecond line\n\n"
+      "- list item\n\tindented\n\n"
+      "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
+      "```python\nprint(1)\n```\n\n"
+      "```json\n{\"answer\": 42}\n```\n\n"
+      "```\n\n```\n、、、\n...\r\n\t  ";
+  for (size_t chunk_size = 1; chunk_size <= text.size(); ++chunk_size) {
+    SCOPED_TRACE(chunk_size);
+    TypeParam detector;
+    std::string output;
+    for (size_t offset = 0; offset < text.size(); offset += chunk_size) {
+      StreamingParseResult result = detector.parse_streaming_increment(
+          text.substr(offset, chunk_size), this->tools_);
+      output += result.normal_text;
+      EXPECT_TRUE(result.calls.empty());
+    }
+    // Ordinary text, including trailing whitespace, is emitted before flush.
+    EXPECT_EQ(output, text);
+    EXPECT_TRUE(detector.parse_streaming_increment("", this->tools_)
+                    .normal_text.empty());
+  }
+}
+
+TYPED_TEST(DeepSeekTextStreamingTest,
+           PreservesTextEndingInPossibleMarkerPrefix) {
+  for (const std::string& text : {"text <", "code {", "{\"answer\": "}) {
+    TypeParam detector;
+    StreamingParseResult result =
+        detector.parse_streaming_increment(text, this->tools_);
+    StreamingParseResult flushed =
+        detector.parse_streaming_increment("", this->tools_);
+    EXPECT_EQ(result.normal_text + flushed.normal_text, text);
+    EXPECT_TRUE(result.calls.empty());
+    EXPECT_TRUE(flushed.calls.empty());
+  }
+}
+
+TYPED_TEST(DeepSeekTextStreamingTest, ParsesToolCallsAcrossChunkSizes) {
+  TypeParam marker_detector;
+  const std::string wrapper =
+      marker_detector.has_tool_call("<｜DSML｜tool_calls>") ? "tool_calls"
+                                                            : "function_calls";
+  const std::string text =
+      "<｜DSML｜" + wrapper +
+      "><｜DSML｜invoke name=\"get_weather\">"
+      "<｜DSML｜parameter name=\"city\" string=\"true\">北京"
+      "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜" +
+      wrapper + ">";
+  for (size_t chunk_size = 1; chunk_size <= text.size(); ++chunk_size) {
+    SCOPED_TRACE(chunk_size);
+    TypeParam detector;
+    std::string output;
+    std::string arguments;
+    int32_t name_events = 0;
+    for (size_t offset = 0; offset < text.size(); offset += chunk_size) {
+      StreamingParseResult result = detector.parse_streaming_increment(
+          text.substr(offset, chunk_size), this->tools_);
+      output += result.normal_text;
+      for (const ToolCallItem& call : result.calls) {
+        if (call.name.has_value()) {
+          ++name_events;
+          EXPECT_EQ(call.name.value(), "get_weather");
+        }
+        arguments += call.parameters;
+      }
+    }
+    output += detector.parse_streaming_increment("", this->tools_).normal_text;
+    EXPECT_TRUE(output.empty());
+    EXPECT_EQ(name_events, 1);
+    EXPECT_EQ(nlohmann::json::parse(arguments).at("city"), "北京");
+  }
+}
+
 // Test constructor and basic properties
 TEST_F(DeepSeek32DetectorTest, ConstructorInitializesCorrectly) {
   EXPECT_NE(detector_, nullptr);
@@ -848,10 +944,8 @@ TEST_F(DeepSeek32DetectorTest, StreamingMultipleToolCalls) {
       << "Should find 2 tool calls in streaming mode";
 }
 
-// Test streaming response with trailing empty markdown json fence before
-// tool-call chunks. The empty fence should not leak to normal_text.
-TEST_F(DeepSeek32DetectorTest,
-       StreamingSkipsTrailingEmptyJsonFenceBeforeToolCall) {
+// Formatting emitted before a tool marker remains ordinary text.
+TEST_F(DeepSeek32DetectorTest, StreamingPreservesEmptyJsonFenceBeforeToolCall) {
   std::vector<std::string> chunks = {
       "Let me break this down.\n\nNow I'll call the tool.\n\n```json\n",
       "\n```",
@@ -875,16 +969,12 @@ TEST_F(DeepSeek32DetectorTest,
   }
 
   EXPECT_EQ(tool_name_events, 1);
-  EXPECT_TRUE(accumulated_normal_text.find("```json") == std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("```") == std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("Now I'll call the tool") !=
-              std::string::npos);
+  EXPECT_EQ(accumulated_normal_text, chunks[0] + chunks[1]);
 }
 
-// Test streaming response with trailing placeholder punctuation and fence at
-// stream end. These artifacts should be removed from flushed normal_text.
+// A stream without a tool marker preserves punctuation and unfinished fences.
 TEST_F(DeepSeek32DetectorTest,
-       StreamingFlushStripsTrailingPlaceholderAndFence) {
+       StreamingFlushPreservesTrailingPunctuationAndFence) {
   std::vector<std::string> chunks = {
       "Let me break this down.\n\n"
       "The user is asking for weather info.\n\n"
@@ -905,19 +995,12 @@ TEST_F(DeepSeek32DetectorTest,
     accumulated_normal_text += flush_result.normal_text;
   }
 
-  EXPECT_TRUE(accumulated_normal_text.find(
-                  "I will call the weather tool now.") != std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("、、、") == std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("```") == std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("\n\n\n") == std::string::npos);
-  EXPECT_TRUE(!accumulated_normal_text.empty() &&
-              accumulated_normal_text.back() != ' ');
+  EXPECT_EQ(accumulated_normal_text, chunks[0]);
 }
 
-// Test standalone placeholder/fence chunks right before invoke start.
-// They should not leak into streamed normal_text.
+// Standalone punctuation and fences must not depend on chunk boundaries.
 TEST_F(DeepSeek32DetectorTest,
-       StreamingDropsStandalonePlaceholderChunkBeforeToolCall) {
+       StreamingPreservesStandalonePunctuationBeforeToolCall) {
   std::vector<std::string> chunks = {
       "I'll use the weather tool for Boston.\n\n",
       "、、、",
@@ -942,17 +1025,11 @@ TEST_F(DeepSeek32DetectorTest,
   }
 
   EXPECT_EQ(tool_name_events, 1);
-  EXPECT_TRUE(
-      accumulated_normal_text.find("I'll use the weather tool for Boston.") !=
-      std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("、、、") == std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("```") == std::string::npos);
+  EXPECT_EQ(accumulated_normal_text, chunks[0] + chunks[1] + chunks[2]);
 }
 
-// Test that deferred trailing whitespace does not grow into large blank blocks
-// across chunks.
-TEST_F(DeepSeek32DetectorTest,
-       StreamingDeferredWhitespaceDoesNotAccumulateBlankLines) {
+// Consecutive blank lines are meaningful document content.
+TEST_F(DeepSeek32DetectorTest, StreamingPreservesConsecutiveBlankLines) {
   std::vector<std::string> chunks = {"First line.\n\n\n", "Second line."};
 
   std::string accumulated_normal_text;
@@ -963,10 +1040,7 @@ TEST_F(DeepSeek32DetectorTest,
     }
   }
 
-  EXPECT_TRUE(accumulated_normal_text.find("First line.") != std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("Second line.") !=
-              std::string::npos);
-  EXPECT_TRUE(accumulated_normal_text.find("\n\n\n") == std::string::npos);
+  EXPECT_EQ(accumulated_normal_text, chunks[0] + chunks[1]);
 }
 
 // Test tool call without function_calls wrapper
@@ -1027,7 +1101,7 @@ TEST_F(DeepSeekV4DetectorTest, StreamingHandlesToolCallsTokenSplit) {
     }
   }
 
-  EXPECT_EQ(accumulated_normal_text, "Thinking...");
+  EXPECT_EQ(accumulated_normal_text, "Thinking... ");
   EXPECT_EQ(tool_calls_found, 1);
   nlohmann::json params = nlohmann::json::parse(accumulated_args);
   EXPECT_EQ(params["city"], "Beijing");
