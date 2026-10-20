@@ -58,7 +58,7 @@ class DiTConfig final {
          "dit_generation_image_area_max",
          "dit_vae_image_size",
          "dit_enable_vae_tiling",
-         "dit_enable_joyo_text_encoder",
+         "dit_enable_text_encoder",
          "dit_sparse_attention_enabled",
          "dit_sparse_attention_sparsity",
          "dit_sparse_attention_pool_size",
@@ -103,7 +103,7 @@ class DiTConfig final {
 
   PROPERTY(bool, dit_enable_vae_tiling) = false;
 
-  PROPERTY(bool, dit_enable_joyo_text_encoder) = true;
+  PROPERTY(bool, dit_enable_text_encoder) = true;
 
   PROPERTY(bool, dit_sparse_attention_enabled) = false;
 

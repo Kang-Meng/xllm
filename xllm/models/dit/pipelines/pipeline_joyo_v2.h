@@ -20,7 +20,7 @@ limitations under the License.
 //   - Requests MUST supply prompt_embed (proto VideoInput.prompt_embed).
 //   - CFG seqlens: negative_prompt_embed sizes, else
 //     prompt_embed.parameters["joyo_text_seqlens"].
-//   - --dit_enable_joyo_text_encoder: load Qwen3-VL with
+//   - --dit_enable_text_encoder: load Qwen3-VL with
 //     dit_text_encoder_tp_group_ (requires explicit --text_encoder_tp_size).
 //     Resident, no rolling. prompt_embed still overrides in-process encode
 //     when present.
@@ -382,10 +382,10 @@ class JoyOV2PipelineImpl : public torch::nn::Module {
     }
 
     enable_joyo_text_encoder_ =
-        DiTConfig::get_instance().dit_enable_joyo_text_encoder();
+        DiTConfig::get_instance().dit_enable_text_encoder();
     if (enable_joyo_text_encoder_) {
       CHECK(context.has_component("text_encoder"))
-          << "JoyOV2 --dit_enable_joyo_text_encoder requires a text_encoder "
+          << "JoyOV2 --dit_enable_text_encoder requires a text_encoder "
              "component";
 #if defined(USE_NPU)
       CHECK_EQ(KernelConfig::get_instance().npu_kernel_backend(), "TORCH")
@@ -424,7 +424,7 @@ class JoyOV2PipelineImpl : public torch::nn::Module {
                 << " (resident, no rolling)";
     } else if (context.has_component("text_encoder")) {
       LOG(INFO) << "JoyOV2Pipeline: model tree has text_encoder but it is not "
-                   "loaded (use --dit_enable_joyo_text_encoder, or "
+                   "loaded (use --dit_enable_text_encoder, or "
                    "external prompt_embed)";
     }
 
@@ -836,7 +836,7 @@ class JoyOV2PipelineImpl : public torch::nn::Module {
 
     CHECK(enable_joyo_text_encoder_)
         << "JoyOV2 T2VA requires prompt_embed (external encoder) or "
-           "--dit_enable_joyo_text_encoder";
+           "--dit_enable_text_encoder";
     CHECK(!text_encoder_.is_empty())
         << "JoyOV2 in-process encoder is enabled but not constructed";
     CHECK(!input.prompts.empty())

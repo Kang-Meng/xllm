@@ -22,6 +22,7 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,10 +30,23 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/common/message.h"
+#include "core/framework/chat_template/jinja_chat_template.h"
 #include "core/framework/config/dit_config.h"
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/dit_model_context.h"
 #include "core/framework/dit_model_loader.h"
+#include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/model/model_input_params.h"
+#include "core/framework/model/model_output.h"
+#include "core/framework/model_context.h"
+#include "core/framework/model_loader.h"
+#include "core/framework/multimodal/mm_input.h"
+#include "core/framework/multimodal/mm_visitor.h"
+#include "core/framework/parallel_state/process_group.h"
+#include "core/framework/request/dit_input_sources.h"
 #if defined(USE_NPU)
 #include "core/layers/npu/loader/rolling_weight_buffer.h"
 #endif
@@ -47,6 +61,9 @@ limitations under the License.
 #include "models/dit/utils/dit_block_weight_manager.h"
 #endif
 #include "models/model_registry.h"
+#include "models/vlm/mposition/mposition.h"
+#include "models/vlm/qwen3_vl.h"
+#include "processors/multimodal_processor.h"
 
 namespace xllm {
 
@@ -60,6 +77,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   explicit MiniMaxH3PipelineImpl(const DiTModelContext& context)
       : options_(context.get_tensor_options()),
         tp_group_(context.get_parallel_args().dit_tp_group_),
+        text_encoder_tp_group_(
+            context.get_parallel_args().dit_text_encoder_tp_group_),
         vae_group_(context.get_parallel_args().dit_vae_group_),
         is_tp_driver_(tp_group_ == nullptr || tp_group_->rank() == 0),
         is_vae_parallel_enabled_(vae_group_ != nullptr &&
@@ -149,16 +168,24 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
         << "MiniMax-H3 native T2VA currently supports batch_size=1";
     CHECK_EQ(input.generation_params.num_videos_per_prompt, 1)
         << "MiniMax-H3 currently supports num_videos_per_prompt=1";
-    const std::optional<NamedTensorConstRef> prompt_embed =
+    std::optional<NamedTensor> encoded_prompt;
+    std::optional<NamedTensorConstRef> prompt_embed =
         input.tensor_sources.get_named_tensor("prompt_embed");
-    CHECK(prompt_embed.has_value())
-        << "MiniMax-H3 T2VA requires prompt_embed from the encoder service";
+    if (!prompt_embed.has_value()) {
+      CHECK(!text_encoder_.is_empty()) << "MiniMax-H3 requires prompt_embed or "
+                                          "--dit_enable_text_encoder=true";
+      CHECK(!input.prompts.empty())
+          << "MiniMax-H3 in-process encode requires input.prompts";
+      CHECK_LE(input.prompts.size(), static_cast<size_t>(1));
+      encoded_prompt.emplace(
+          encode_prompt(input.prompts.front(), input.media_sources));
+      prompt_embed = std::cref(*encoded_prompt);
+    }
     const std::vector<int64_t>* prompt_token_tags =
         get_tensor_parameter<std::vector<int64_t>>(
             prompt_embed->get().parameters, "prompt_token_tags");
     CHECK(prompt_token_tags != nullptr)
-        << "MiniMax-H3 T2VA requires prompt_token_tags from the encoder "
-           "service";
+        << "MiniMax-H3 prompt_embed requires prompt_token_tags";
     const torch::Tensor& prompt_embeds = prompt_embed->get().tensor;
     CHECK(prompt_embeds.is_floating_point())
         << "MiniMax-H3 prompt_embed must be floating point";
@@ -520,10 +547,266 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     if (is_tp_driver_) {
       audio_vae_->to(options_.device(), torch::kFloat32);
     }
+    if (DiTConfig::get_instance().dit_enable_text_encoder()) {
+      CHECK(loader->has_component("text_encoder"))
+          << "MiniMax-H3 in-process encoder requires the text_encoder "
+             "component";
+      std::unique_ptr<DiTFolderLoader> component_loader =
+          loader->take_component_loader("text_encoder");
+      load_text_encoder(
+          ModelLoader::create(component_loader->model_weights_path()));
+    }
     LOG(INFO) << "MiniMax-H3 " << task_type_ << " native components loaded";
   }
 
  private:
+  static constexpr int32_t kTextEncoderCaptureLayer = 50;
+
+  void load_text_encoder(std::unique_ptr<ModelLoader> loader) {
+    CHECK(loader != nullptr);
+    const int32_t max_tokens =
+        SchedulerConfig::get_instance().max_tokens_per_batch();
+    CHECK(text_encoder_tp_group_ != nullptr)
+        << "MiniMax-H3 in-process encoder requires --text_encoder_tp_size";
+    CHECK_GT(max_tokens, 0);
+#if defined(USE_NPU)
+    CHECK_EQ(KernelConfig::get_instance().npu_kernel_backend(), "TORCH")
+        << "MiniMax-H3 in-process encoder requires --npu_kernel_backend=TORCH";
+#endif
+    const ModelArgs& model_args = loader->model_args();
+    const TokenizerArgs& tokenizer_args = loader->tokenizer_args();
+    std::shared_ptr<Tokenizer> tokenizer = loader->tokenizer();
+    CHECK_EQ(model_args.model_type(), "qwen3_vl");
+    CHECK_EQ(model_args.dtype(), "bfloat16");
+    CHECK_GT(model_args.n_layers(), kTextEncoderCaptureLayer);
+    CHECK(!tokenizer_args.chat_template().empty())
+        << "MiniMax-H3 encoder requires its checkpoint chat template";
+    CHECK(tokenizer != nullptr);
+
+    text_encoder_max_tokens_ = max_tokens;
+    text_encoder_model_args_ = model_args;
+    text_encoder_model_args_.layers_to_capture({kTextEncoderCaptureLayer});
+    text_encoder_model_args_.encoder_embedding_mode(/*value=*/false);
+    text_encoder_model_args_.embedding_mode(/*value=*/true);
+    ParallelArgs parallel_args(text_encoder_tp_group_->rank(),
+                               text_encoder_tp_group_->world_size(),
+                               text_encoder_tp_group_);
+    parallel_args.tp_size(text_encoder_tp_group_->world_size());
+    parallel_args.tp_group_ = text_encoder_tp_group_;
+    const ModelContext context(parallel_args,
+                               text_encoder_model_args_,
+                               loader->quant_args(),
+                               torch::TensorOptions()
+                                   .device(options_.device())
+                                   .dtype(torch::kBFloat16));
+    text_encoder_ = Qwen3_VLForConditionalGeneration(context);
+    text_encoder_empty_kv_caches_.resize(
+        static_cast<size_t>(text_encoder_model_args_.n_layers()));
+    text_encoder_chat_template_ =
+        std::make_unique<JinjaChatTemplate>(tokenizer_args);
+    text_encoder_processor_ =
+        create_multimodal_processor(text_encoder_model_args_,
+                                    std::move(tokenizer),
+                                    /*max_cache_items=*/0,
+                                    tokenizer_args);
+    CHECK(text_encoder_processor_ != nullptr);
+    text_encoder_->load_model(std::move(loader));
+    LOG(INFO) << "MiniMax-H3 in-process encoder loaded: TP="
+              << text_encoder_tp_group_->world_size()
+              << " capture_layer=" << kTextEncoderCaptureLayer;
+  }
+
+  NamedTensor encode_prompt(const std::string& prompt,
+                            const DiTMediaSources& media_sources) {
+    MMContentVec content;
+    content.reserve(media_sources.size() * 2 + 1);
+    MMInput mm_input;
+    prepare_text_encoder_media(media_sources, content, mm_input);
+    content.emplace_back(/*type=*/"text", prompt);
+    ChatMessages messages;
+    messages.reserve(/*new_cap=*/1);
+    messages.emplace_back(/*role=*/"user", content);
+    std::optional<std::string> chat_prompt =
+        text_encoder_chat_template_->apply(messages);
+    CHECK(chat_prompt.has_value()) << "MiniMax-H3 chat template failed";
+    MMData mm_data;
+    CHECK(text_encoder_processor_->process_multimodal(mm_input, mm_data))
+        << "MiniMax-H3 encoder media preprocessing failed";
+    std::vector<int32_t> token_ids;
+    CHECK(text_encoder_processor_->process_prompt(
+        *chat_prompt, mm_data, token_ids))
+        << "MiniMax-H3 encoder prompt processing failed";
+    CHECK(!token_ids.empty());
+    CHECK_LE(token_ids.size(), static_cast<size_t>(text_encoder_max_tokens_))
+        << "MiniMax-H3 encoder prompt exceeds max_tokens_per_batch";
+    if (mm_data.valid()) {
+      UpdateMMItemScheduleStateVisitor schedule_visitor(
+          /*computed_token_num=*/0,
+          static_cast<int32_t>(token_ids.size()),
+          /*seq_idx=*/0);
+      CHECK(mm_data.foreach (schedule_visitor))
+          << "MiniMax-H3 failed to schedule encoder multimodal inputs";
+    }
+    auto [positions, position_delta] =
+        text_encoder_position_generator_.generate(
+            token_ids, mm_data, text_encoder_model_args_);
+    static_cast<void>(position_delta);
+    const torch::Tensor tokens =
+        torch::tensor(token_ids, torch::TensorOptions().dtype(torch::kInt32))
+            .to(options_.device());
+    ModelInputParams params = build_text_encoder_input(tokens, mm_data);
+    const ModelOutput output =
+        text_encoder_->forward(tokens,
+                               positions.to(options_.device()),
+                               text_encoder_empty_kv_caches_,
+                               params);
+    return build_text_encoder_output(output.aux_hidden_states, token_ids);
+  }
+
+  NamedTensor build_text_encoder_output(
+      const torch::Tensor& hidden_states,
+      const std::vector<int32_t>& token_ids) const {
+    CHECK(hidden_states.defined());
+    CHECK_EQ(hidden_states.dim(), 2);
+    CHECK_EQ(hidden_states.size(0), static_cast<int64_t>(token_ids.size()));
+    CHECK_EQ(hidden_states.size(1), text_encoder_model_args_.hidden_size());
+
+    std::vector<int64_t> token_tags;
+    token_tags.reserve(token_ids.size());
+    for (const int32_t token_id : token_ids) {
+      const bool is_visual =
+          token_id == text_encoder_model_args_.vision_start_token_id() ||
+          token_id == text_encoder_model_args_.vision_end_token_id() ||
+          token_id == text_encoder_model_args_.image_token_id() ||
+          token_id == text_encoder_model_args_.video_token_id();
+      token_tags.emplace_back(is_visual ? 0 : 1);
+    }
+    return NamedTensor{
+        .name = "prompt_embed",
+        .tensor = hidden_states.unsqueeze(/*dim=*/0),
+        .parameters = {{"prompt_token_tags", std::move(token_tags)}}};
+  }
+
+  void validate_text_encoder_media(const DiTMediaSources& media_sources) const {
+    validate_media_sources(media_sources);
+    for (const MediaNamedTensor& source : media_sources.entries()) {
+      if (source.name == "image") {
+        CHECK(source.tensor.defined());
+        CHECK_EQ(source.tensor.dim(), 4);
+        CHECK_EQ(source.tensor.size(0), 1);
+      } else if (source.name == "prompt_video") {
+        CHECK(source.tensor.defined());
+        CHECK_EQ(source.tensor.dim(), 5);
+        CHECK_EQ(source.tensor.size(0), 1);
+        CHECK_GT(source.tensor.size(1), 0);
+        CHECK_LE(source.tensor.size(1), std::numeric_limits<int32_t>::max());
+        const double* fps =
+            get_tensor_parameter<double>(source.parameters, "prompt_video_fps");
+        CHECK(fps != nullptr);
+        CHECK(std::isfinite(*fps) && *fps > 0.0);
+      }
+    }
+  }
+
+  void prepare_text_encoder_media(const DiTMediaSources& media_sources,
+                                  MMContentVec& content,
+                                  MMInput& mm_input) const {
+    validate_text_encoder_media(media_sources);
+
+    std::vector<MMInputItem> items;
+    items.reserve(media_sources.size());
+    int32_t image_index = 0;
+    int32_t audio_index = 0;
+    const std::vector<MediaNamedTensor>& sources = media_sources.entries();
+    for (size_t index = 0; index < sources.size(); ++index) {
+      const MediaNamedTensor& source = sources[index];
+      if (source.name == "image") {
+        content.emplace_back(
+            /*type=*/"text",
+            "<Picture " + std::to_string(++image_index) + ">: ");
+        content.emplace_back(/*type=*/"image_url", ImageURL{});
+        MMInputItem item;
+        item.type = MMType::IMAGE;
+        item.decode_image =
+            source.tensor.select(/*dim=*/0, /*index=*/0).to(torch::kCPU);
+        items.emplace_back(std::move(item));
+      } else if (source.name == "prompt_video") {
+        if (index + 1 < sources.size() &&
+            sources[index + 1].name == "prompt_audio_in_video") {
+          content.emplace_back(
+              /*type=*/"text",
+              "<Audio " + std::to_string(++audio_index) + ">: ");
+        }
+        content.emplace_back(/*type=*/"text", /*text=*/"<Video 1>: ");
+        content.emplace_back(/*type=*/"video_url", VideoURL{});
+        MMInputItem item;
+        item.type = MMType::VIDEO;
+        item.decode_video =
+            source.tensor.select(/*dim=*/0, /*index=*/0).to(torch::kCPU);
+        item.video_meta.fps = *get_tensor_parameter<double>(source.parameters,
+                                                            "prompt_video_fps");
+        item.video_meta.total_num_frames =
+            static_cast<int32_t>(source.tensor.size(1));
+        items.emplace_back(std::move(item));
+      } else if (source.name == "prompt_audio") {
+        content.emplace_back(/*type=*/"text",
+                             "<Audio " + std::to_string(++audio_index) + ">: ");
+      }
+    }
+    mm_input.insert(items);
+  }
+
+  ModelInputParams build_text_encoder_input(const torch::Tensor& tokens,
+                                            const MMData& mm_data) {
+    const int32_t length = static_cast<int32_t>(tokens.numel());
+    ModelInputParams params;
+    params.meta.num_sequences = 1;
+    params.meta.actual_num_sequences = 1;
+    params.meta.q_max_seq_len = length;
+    params.meta.kv_max_seq_len = length;
+    params.meta.batch_forward_type = BatchForwardType::PREFILL;
+    params.prefill_without_cache = true;
+    params.attention.host.q_seq_lens = {length};
+    params.attention.host.kv_seq_lens = {length};
+#if defined(USE_NPU)
+    params.attention.host.q_cu_seq_lens = {length};
+#else
+    params.attention.host.q_cu_seq_lens = {0, length};
+#endif
+    const torch::TensorOptions int_options =
+        torch::TensorOptions().dtype(torch::kInt32).device(options_.device());
+    params.attention.device.q_seq_lens = torch::tensor({length}, int_options);
+    params.attention.device.kv_seq_lens = torch::tensor({length}, int_options);
+    params.attention.device.q_cu_seq_lens =
+        torch::tensor(params.attention.host.q_cu_seq_lens, int_options);
+    if (!mm_data.valid()) {
+      params.embedding.input_embedding =
+          text_encoder_->get_input_embeddings(tokens, params);
+      return params;
+    }
+    MMBatchData mm_batch(std::vector<MMData>{mm_data});
+    EncoderInputGatherVisitor input_gather;
+    CHECK(mm_batch.foreach (input_gather) && input_gather.finish(mm_batch))
+        << "MiniMax-H3 encoder input gathering failed";
+    mm_batch.to(options_.device());
+    ModelInputParams multimodal_params;
+    multimodal_params.multimodal.mm_data = mm_batch;
+    const MMDict embeddings =
+        text_encoder_->get_multimodal_embeddings(multimodal_params);
+    EncoderOutputScatterVisitor output_scatter(embeddings);
+    CHECK(mm_batch.foreach (output_scatter) && output_scatter.finish())
+        << "MiniMax-H3 encoder output scattering failed";
+    EncoderEmbeddingGatherVisitor embedding_gather(
+        params.attention.host.kv_seq_lens, params.attention.host.q_seq_lens);
+    CHECK(mm_batch.foreach (embedding_gather) &&
+          embedding_gather.finish(mm_batch))
+        << "MiniMax-H3 encoder embedding gathering failed";
+    params.multimodal.mm_data = std::move(mm_batch);
+    params.embedding.input_embedding =
+        text_encoder_->get_input_embeddings(tokens, params);
+    return params;
+  }
+
 #if defined(USE_NPU)
   void init_rolling_transformer() {
     torch::DeviceGuard guard(options_.device());
@@ -1436,6 +1719,14 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   torch::TensorOptions options_;
   ProcessGroup* tp_group_ = nullptr;
+  ProcessGroup* text_encoder_tp_group_ = nullptr;
+  int32_t text_encoder_max_tokens_ = 0;
+  ModelArgs text_encoder_model_args_;
+  Qwen3_VLForConditionalGeneration text_encoder_{nullptr};
+  std::vector<KVCache> text_encoder_empty_kv_caches_;
+  std::unique_ptr<JinjaChatTemplate> text_encoder_chat_template_;
+  std::unique_ptr<MultimodalProcessorBase> text_encoder_processor_;
+  Qwen3VLMPositionGenerator text_encoder_position_generator_;
   ProcessGroup* vae_group_ = nullptr;
   bool is_tp_driver_ = true;
   bool use_rolling_load_ = false;

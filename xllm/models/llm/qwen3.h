@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/nn/functional/normalization.h>
 
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_output.h"
 #include "core/util/rec_model_utils.h"
 #if defined(USE_NPU)
@@ -31,7 +33,10 @@ template <typename DecoderLayer>
 class QWen3ModelImplBase : public LlmModelImplBase<DecoderLayer> {
  public:
   explicit QWen3ModelImplBase(const ModelContext& context)
-      : LlmModelImplBase<DecoderLayer>("qwen3", context.get_model_args()) {
+      : LlmModelImplBase<DecoderLayer>("qwen3", context.get_model_args()),
+        aux_capture_(context.get_model_args(),
+                     context.get_tensor_options(),
+                     SchedulerConfig::get_instance().max_tokens_per_batch()) {
     // register submodules
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
@@ -183,9 +188,12 @@ class QWen3ModelImplBase : public LlmModelImplBase<DecoderLayer> {
           h = h + deep_stacks[i];
         }
       }
+      if (aux_capture_.enabled()) {
+        aux_capture_.capture_layer(static_cast<int32_t>(i), h, residual);
+      }
     }
     auto [hidden_states, residual_out] = norm_(h, residual);
-    return ModelOutput(hidden_states, residual_out);
+    return aux_capture_.finalize(hidden_states, residual_out);
   }
 
  protected:
@@ -253,6 +261,7 @@ class QWen3ModelImplBase : public LlmModelImplBase<DecoderLayer> {
 #endif
 
  private:
+  AuxHiddenCapture aux_capture_;
 #if defined(USE_NPU)
   layer::AttentionMask attn_mask_;
   layer::AttentionMask dense_attn_mask_;
