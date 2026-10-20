@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 
 #include "block_manager_impl.h"
 #include "common/global_flags.h"
@@ -28,6 +29,7 @@ limitations under the License.
 #include "framework/xtensor/phy_page_pool.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
 #include "linear_state_block_manager.h"
+#include "util/utils.h"
 
 namespace xllm {
 
@@ -356,11 +358,10 @@ void BlockManagerPool::cache(Sequence* sequence, size_t num_tokens) {
 }
 
 float BlockManagerPool::get_gpu_cache_usage_perc() const {
-  float perc = 0.0;
-  for (int32_t i = 0; i < block_managers_.size(); ++i) {
-    perc += block_managers_[i]->kv_cache_utilization();
-  }
-  return perc / block_managers_.size();
+  // Preserve the legacy routing value: each DP has equal weight regardless of
+  // its admission-cache capacity. Per-DP monitoring uses separate metrics.
+  return static_cast<float>(util::sum(kv_cache_utilization_per_dp()) /
+                            block_managers_.size());
 }
 
 uint32_t BlockManagerPool::num_blocks() const { return options_.num_blocks(); }
@@ -414,6 +415,26 @@ double BlockManagerPool::kv_cache_utilization() const {
         std::min(min_utilization, block_managers_[i]->kv_cache_utilization());
   }
   return min_utilization;
+}
+
+std::vector<double> BlockManagerPool::kv_cache_utilization_per_dp() const {
+  std::vector<double> utilization(block_managers_.size());
+  for (size_t dp_rank = 0; dp_rank < block_managers_.size(); ++dp_rank) {
+    utilization[dp_rank] = block_managers_[dp_rank]->kv_cache_utilization();
+  }
+  return utilization;
+}
+
+std::vector<std::unordered_map<BlockType, double>>
+BlockManagerPool::block_utilization_by_type_per_dp() const {
+  std::vector<std::unordered_map<BlockType, double>> utilization;
+  utilization.reserve(block_managers_.size());
+  for (const auto& manager : block_managers_) {
+    utilization.emplace_back(
+        static_cast<const CompositeBlockManager*>(manager.get())
+            ->block_utilization_by_type());
+  }
+  return utilization;
 }
 
 // currently use only for profile, which not need prefix cache.

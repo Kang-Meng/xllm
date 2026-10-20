@@ -24,6 +24,29 @@ limitations under the License.
 #include "block_manager.h"
 
 namespace xllm {
+const char* block_type_label(BlockType type) {
+  switch (type) {
+    case BlockType::KV:
+      return "kv";
+    case BlockType::SWA:
+      return "swa";
+    case BlockType::C4:
+      return "c4";
+    case BlockType::C128:
+      return "c128";
+    case BlockType::EMBEDDING:
+      return "embedding";
+    case BlockType::LINEAR:
+      return "linear";
+    case BlockType::C1:
+      return "c1";
+    case BlockType::C2:
+      return "c2";
+  }
+  LOG(FATAL) << "Unhandled block type " << static_cast<int32_t>(type);
+  return "";
+}
+
 Block::Block(int32_t id, BlockManager* manager)
     : id_(id), ref_count_(new std::atomic<uint32_t>(1)), manager_(manager) {
   // get the block size from the manager

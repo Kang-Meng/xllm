@@ -19,6 +19,8 @@ limitations under the License.
 #include <bvar/multi_dimension.h>
 
 #include <cstddef>
+#include <initializer_list>
+#include <string>
 
 #include "common/macros.h"
 #include "util/timer.h"
@@ -47,11 +49,19 @@ class AutoCounter final {
 // Records one admitted request in the process-cumulative token hit rate.
 void record_prefix_cache_hit_metrics(size_t prompt_tokens, size_t hit_tokens);
 
+// Set a labeled gauge, reporting failures instead of silently dropping a
+// monitoring sample when bvar cannot create or retrieve the series.
+void set_multi_gauge_value(bvar::MultiDimension<bvar::Status<double>>& metric,
+                           std::initializer_list<std::string> labels,
+                           double value);
+
 }  // namespace xllm
 
 // define helpful macros to hide boilerplate code
 // NOLINTBEGIN(bugprone-macro-parentheses)
 
+// desc documents metrics in source only; these bvar constructors do not
+// export descriptions to monitoring consumers.
 // define gauge (using bvar::Status for single values)
 #define DEFINE_GAUGE(name, desc) bvar::Status<double> GAUGE_##name(#name, 0.0);
 
@@ -126,13 +136,19 @@ void record_prefix_cache_hit_metrics(size_t prompt_tokens, size_t hit_tokens);
   bvar::MultiDimension<bvar::Status<double>> MULTI_GAUGE_##name(#name, \
                                                                 {(label)});
 
-#define MULTI_GAUGE_SET(name, key, value)      \
-  do {                                         \
-    bvar::Status<double>* gauge_##name =       \
-        MULTI_GAUGE_##name.get_stats({(key)}); \
-    if (gauge_##name) {                        \
-      gauge_##name->set_value(value);          \
-    }                                          \
+#define DEFINE_MULTI_GAUGE_2_LABELS(name, label1, label2, desc)  \
+  bvar::MultiDimension<bvar::Status<double>> MULTI_GAUGE_##name( \
+      #name, {(label1), (label2)});
+
+#define MULTI_GAUGE_SET(name, key, value)                              \
+  do {                                                                 \
+    xllm::set_multi_gauge_value(MULTI_GAUGE_##name, {(key)}, (value)); \
+  } while (false)
+
+#define MULTI_GAUGE_SET_2_LABELS(name, key1, key2, value) \
+  do {                                                    \
+    xllm::set_multi_gauge_value(                          \
+        MULTI_GAUGE_##name, {(key1), (key2)}, (value));   \
   } while (false)
 
 // declare gauge
@@ -240,8 +256,17 @@ DECLARE_GAUGE(num_online_decode_preempt_online_requests);
 DECLARE_GAUGE(num_online_prefill_preempt_offline_requests);
 DECLARE_GAUGE(num_online_decode_preempt_offline_requests);
 DECLARE_GAUGE(num_running_sequences);
+// Legacy unscaled admission-pressure ratio of the least-loaded DP; unlike the
+// new per-DP and max gauges, this existing metric is not multiplied by 100.
+// Composite admission-leaf ratios can exceed 1.
 DECLARE_GAUGE(kv_cache_utilization_perc);
+DECLARE_MULTI_GAUGE(kv_cache_dp_utilization_perc);
+// Per-leaf effective block/slot usage (non-evictable), not physical occupancy.
+// Each series identifies one DP rank and one allocated block pool.
+DECLARE_MULTI_GAUGE(block_type_dp_utilization_perc);
+DECLARE_GAUGE(kv_cache_max_utilization_perc);
 DECLARE_GAUGE(num_blocks_in_prefix_cache);
+// Legacy least-loaded DP views: maximum free and minimum used block counts.
 DECLARE_GAUGE(num_free_blocks);
 DECLARE_GAUGE(num_used_blocks);
 DECLARE_COUNTER(scheduling_latency_seconds);

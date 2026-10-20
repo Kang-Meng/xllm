@@ -19,6 +19,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <string>
 
 #include "common/metrics.h"
 #include "continuous_scheduler.h"
@@ -238,6 +239,12 @@ TEST(FixedStepsSchedulerTest, ReportsBlockCountsInsteadOfRankCount) {
                    static_cast<double>(used_blocks[0]));
   EXPECT_DOUBLE_EQ(GAUGE_num_blocks_in_prefix_cache.get_value(),
                    static_cast<double>(prefix_blocks[0]));
+  EXPECT_DOUBLE_EQ(GAUGE_kv_cache_utilization_perc.get_value(),
+                   engine->block_manager_pool()->kv_cache_utilization());
+  EXPECT_DOUBLE_EQ(
+      GAUGE_kv_cache_max_utilization_perc.get_value(),
+      engine->block_manager_pool()->kv_cache_utilization_per_dp().front() *
+          100.0);
 }
 
 TEST(FixedStepsSchedulerTest, ReportsBlockCountsAcrossMultipleRanks) {
@@ -287,6 +294,21 @@ TEST(FixedStepsSchedulerTest, ReportsBlockCountsAcrossMultipleRanks) {
   EXPECT_LT(used_blocks[lightly_loaded_rank], used_blocks[heavily_loaded_rank]);
   EXPECT_EQ(prefix_blocks[lightly_loaded_rank], 0u);
   EXPECT_EQ(prefix_blocks[heavily_loaded_rank], 2u);
+  const std::vector<double> dp_utilization =
+      block_manager_pool->kv_cache_utilization_per_dp();
+  ASSERT_EQ(dp_utilization.size(), 2u);
+  EXPECT_GT(dp_utilization[heavily_loaded_rank],
+            block_manager_pool->kv_cache_utilization());
+  EXPECT_DOUBLE_EQ(GAUGE_kv_cache_utilization_perc.get_value(),
+                   block_manager_pool->kv_cache_utilization());
+  EXPECT_DOUBLE_EQ(GAUGE_kv_cache_max_utilization_perc.get_value(),
+                   dp_utilization[heavily_loaded_rank] * 100.0);
+  for (size_t dp_rank = 0; dp_rank < 2; ++dp_rank) {
+    auto* dp_gauge = MULTI_GAUGE_kv_cache_dp_utilization_perc.get_stats(
+        {std::to_string(dp_rank)});
+    ASSERT_NE(dp_gauge, nullptr);
+    EXPECT_DOUBLE_EQ(dp_gauge->get_value(), dp_utilization[dp_rank] * 100.0);
+  }
   EXPECT_DOUBLE_EQ(GAUGE_num_free_blocks.get_value(),
                    static_cast<double>(free_blocks[lightly_loaded_rank]));
   EXPECT_DOUBLE_EQ(GAUGE_num_used_blocks.get_value(),
@@ -295,6 +317,101 @@ TEST(FixedStepsSchedulerTest, ReportsBlockCountsAcrossMultipleRanks) {
                    static_cast<double>(prefix_blocks[lightly_loaded_rank]));
 
   block_manager_pool->reset_prefix_cache();
+}
+
+TEST(FixedStepsSchedulerTest, ReportsFullHotRankAsOneHundredPercent) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), false);
+  auto engine = std::make_unique<FakeEngine>(/*num_blocks=*/5,
+                                             /*block_size=*/1,
+                                             /*linear_state=*/false,
+                                             /*dp_size=*/2);
+  BlockManagerPool* pool = engine->block_manager_pool();
+  int32_t hot_rank = -1;
+  auto held_blocks = pool->allocate(/*num_tokens=*/4, hot_rank);
+  ASSERT_EQ(held_blocks.size(), 4u);
+  ASSERT_GE(hot_rank, 0);
+  ASSERT_LT(hot_rank, 2);
+  EXPECT_DOUBLE_EQ(pool->kv_cache_utilization(), 0.0);
+  EXPECT_DOUBLE_EQ(pool->kv_cache_utilization_per_dp()[hot_rank], 1.0);
+
+  auto options = CreateOptions(/*max_tokens_per_batch=*/10000,
+                               /*max_seqs_per_batch=*/256,
+                               /*dp_size=*/2);
+  FixedStepsScheduler scheduler(engine.get(), options);
+  ContinuousScheduler* base = &scheduler;
+  base->prepare_batch_test();
+
+  EXPECT_DOUBLE_EQ(GAUGE_VALUE(kv_cache_utilization_perc), 0.0);
+  EXPECT_DOUBLE_EQ(GAUGE_VALUE(kv_cache_max_utilization_perc), 100.0);
+  EXPECT_DOUBLE_EQ(GAUGE_VALUE(num_free_blocks), 4.0);
+  EXPECT_DOUBLE_EQ(GAUGE_VALUE(num_used_blocks), 0.0);
+  auto* hot_gauge = MULTI_GAUGE_kv_cache_dp_utilization_perc.get_stats(
+      {std::to_string(hot_rank)});
+  ASSERT_NE(hot_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(hot_gauge->get_value(), 100.0);
+  auto* idle_gauge = MULTI_GAUGE_kv_cache_dp_utilization_perc.get_stats(
+      {std::to_string(1 - hot_rank)});
+  ASSERT_NE(idle_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(idle_gauge->get_value(), 0.0);
+  auto* hot_kv_gauge = MULTI_GAUGE_block_type_dp_utilization_perc.get_stats(
+      {"kv", std::to_string(hot_rank)});
+  ASSERT_NE(hot_kv_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(hot_kv_gauge->get_value(), 100.0);
+  auto* idle_kv_gauge = MULTI_GAUGE_block_type_dp_utilization_perc.get_stats(
+      {"kv", std::to_string(1 - hot_rank)});
+  ASSERT_NE(idle_kv_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(idle_kv_gauge->get_value(), 0.0);
+}
+
+TEST(FixedStepsSchedulerTest, ReportsIndependentKvAndLinearUtilization) {
+  auto engine = std::make_unique<FakeEngine>(/*num_blocks=*/5,
+                                             /*block_size=*/1,
+                                             /*linear_state=*/true,
+                                             /*dp_size=*/2);
+  BlockManagerPool* pool = engine->block_manager_pool();
+  auto requests = GenRequests({2}, {2}, RecType::kNone);
+  Sequence* active = requests.front()->sequences().front().get();
+  active->set_dp_rank(0);
+  ASSERT_TRUE(pool->try_allocate(active));
+
+  report_kv_cache_metrics(*pool);
+  auto* kv_gauge =
+      MULTI_GAUGE_block_type_dp_utilization_perc.get_stats({"kv", "0"});
+  auto* linear_gauge =
+      MULTI_GAUGE_block_type_dp_utilization_perc.get_stats({"linear", "0"});
+  ASSERT_NE(kv_gauge, nullptr);
+  ASSERT_NE(linear_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(kv_gauge->get_value(), 50.0);
+  EXPECT_DOUBLE_EQ(linear_gauge->get_value(), 100.0 / 7.0);
+
+  pool->deallocate(active);
+}
+
+TEST(FixedStepsSchedulerTest, ReportsUpdatedUtilizationAcrossSteps) {
+  auto engine = std::make_unique<FakeEngine>(/*num_blocks=*/5,
+                                             /*block_size=*/1);
+  BlockManagerPool* pool = engine->block_manager_pool();
+  report_kv_cache_metrics(*pool);
+
+  auto requests = GenRequests({2}, {2}, RecType::kNone);
+  Sequence* active = requests.front()->sequences().front().get();
+  active->set_dp_rank(0);
+  ASSERT_TRUE(pool->try_allocate(active));
+  report_kv_cache_metrics(*pool);
+
+  auto* dp_gauge = MULTI_GAUGE_kv_cache_dp_utilization_perc.get_stats({"0"});
+  auto* kv_gauge =
+      MULTI_GAUGE_block_type_dp_utilization_perc.get_stats({"kv", "0"});
+  ASSERT_NE(dp_gauge, nullptr);
+  ASSERT_NE(kv_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(dp_gauge->get_value(), 50.0);
+  EXPECT_DOUBLE_EQ(kv_gauge->get_value(), 50.0);
+
+  pool->deallocate(active);
+  report_kv_cache_metrics(*pool);
+  EXPECT_DOUBLE_EQ(dp_gauge->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(kv_gauge->get_value(), 0.0);
 }
 
 TEST(FixedStepsSchedulerTest, PrepareBatchOneRecSchedulesRequest) {

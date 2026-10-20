@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -141,6 +142,7 @@ class CompositeBlockManager : public BlockManager {
   size_t num_free_blocks() const override;
   size_t num_used_blocks() const override;
   double kv_cache_utilization() const override;
+  std::unordered_map<BlockType, double> block_utilization_by_type() const;
   void free(int32_t block_id) override;
   Block allocate() override;
   size_t num_total_blocks() const override;

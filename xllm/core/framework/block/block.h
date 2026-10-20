@@ -123,6 +123,10 @@ inline constexpr bool is_prefetch_gate_block_type(BlockType type) {
   return false;
 }
 
+// Canonical lowercase label for a block type, used as a monitoring-series key.
+// Declared beside the enum so every exporter shares one spelling.
+const char* block_type_label(BlockType type);
+
 inline constexpr std::optional<BlockType> block_type_from_cache_group_id(
     int32_t group_id) {
   switch (group_id) {

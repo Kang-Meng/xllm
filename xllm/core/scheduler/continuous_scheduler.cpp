@@ -28,7 +28,10 @@ limitations under the License.
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/metrics.h"
@@ -99,6 +102,38 @@ BatchMode resolve_batch_mode(const ContinuousScheduler::Options& options) {
   }
 
   return mode;
+}
+
+void report_kv_cache_metrics(const KVCacheManager& kv_cache_manager) {
+  const std::vector<double> dp_utilization =
+      kv_cache_manager.kv_cache_utilization_per_dp();
+  CHECK(!dp_utilization.empty()) << "KV cache manager must expose a DP pool";
+  const std::vector<std::unordered_map<BlockType, double>> type_utilization =
+      kv_cache_manager.block_utilization_by_type_per_dp();
+  CHECK_EQ(dp_utilization.size(), type_utilization.size());
+  // Process-global gauges assume one reporting manager with fixed DP/leaf
+  // topology per process. Replacing it requires separate series cleanup.
+  for (size_t dp_rank = 0; dp_rank < dp_utilization.size(); ++dp_rank) {
+    const std::string rank_label = std::to_string(dp_rank);
+    MULTI_GAUGE_SET(kv_cache_dp_utilization_perc,
+                    rank_label,
+                    dp_utilization[dp_rank] * 100.0);
+    for (const auto& [type, ratio] : type_utilization[dp_rank]) {
+      MULTI_GAUGE_SET_2_LABELS(block_type_dp_utilization_perc,
+                               block_type_label(type),
+                               rank_label,
+                               ratio * 100.0);
+    }
+  }
+  // Reuse the DP samples for the legacy least-loaded view instead of querying
+  // all managers a second time within the same report.
+  GAUGE_SET(kv_cache_utilization_perc, util::min(dp_utilization));
+  GAUGE_SET(kv_cache_max_utilization_perc, util::max(dp_utilization) * 100.0);
+  // Prefix residency keeps its historical minimum; it is not KV pressure.
+  GAUGE_SET(num_blocks_in_prefix_cache,
+            util::min(kv_cache_manager.num_blocks_in_prefix_cache()));
+  GAUGE_SET(num_free_blocks, util::max(kv_cache_manager.num_free_blocks()));
+  GAUGE_SET(num_used_blocks, util::min(kv_cache_manager.num_used_blocks()));
 }
 
 ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)

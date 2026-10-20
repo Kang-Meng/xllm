@@ -18,6 +18,7 @@ limitations under the License.
 #include <atomic>
 #include <map>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 #include "block_manager.h"
@@ -109,6 +110,8 @@ class BlockManagerPool : public KVCacheManager {
   std::vector<std::vector<BlockTransferInfo>>* get_swap_block_transfer_infos()
       override;
 
+  // Legacy heartbeat field: arithmetic mean of DP-local admission-cache
+  // utilization ratios, not a physical device-memory percentage.
   virtual float get_gpu_cache_usage_perc() const;
 
   uint32_t num_blocks() const override;
@@ -118,6 +121,9 @@ class BlockManagerPool : public KVCacheManager {
   std::vector<size_t> num_free_blocks() const override;
   std::vector<size_t> num_used_blocks() const override;
   double kv_cache_utilization() const override;
+  std::vector<double> kv_cache_utilization_per_dp() const override;
+  std::vector<std::unordered_map<BlockType, double>>
+  block_utilization_by_type_per_dp() const override;
 
   int32_t select_dp_rank() const override;
 

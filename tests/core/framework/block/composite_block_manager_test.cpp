@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -78,6 +79,70 @@ BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
                       kManagerTypeBlockManagerImpl})
       .compress_ratios({0, 4, 128});
   return opts;
+}
+
+TEST(CompositeBlockManagerTest, BlockUtilizationUsesIndividualLeafCapacity) {
+  BlockManager::Options options = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      /*block_size=*/128,
+      /*window_size=*/256,
+      /*max_seqs_per_batch=*/2);
+  options.enable_prefix_cache(false);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+
+  const std::unordered_map<BlockType, double> initial =
+      manager.block_utilization_by_type();
+  EXPECT_EQ(initial.size(), 3u);
+  EXPECT_DOUBLE_EQ(initial.at(BlockType::SWA), 0.0);
+  EXPECT_DOUBLE_EQ(initial.at(BlockType::C4), 0.0);
+  EXPECT_DOUBLE_EQ(initial.at(BlockType::C128), 0.0);
+
+  std::vector<Block> allocated =
+      manager.allocate_blocks(BlockType::C4, /*num_blocks=*/1);
+  ASSERT_EQ(allocated.size(), 1u);
+  const std::unordered_map<BlockType, double> utilization =
+      manager.block_utilization_by_type();
+  EXPECT_GT(utilization.at(BlockType::C4), 0.0);
+  EXPECT_DOUBLE_EQ(utilization.at(BlockType::SWA), 0.0);
+  EXPECT_DOUBLE_EQ(utilization.at(BlockType::C128), 0.0);
+  allocated.clear();
+
+  options.model_type("deepseek_v41");
+  options.compress_ratios({0, 2, 1});
+  CompositeBlockManager v41_manager(build_composite_leaves(options), options);
+  allocated = v41_manager.allocate_blocks(BlockType::C2, /*num_blocks=*/1);
+  ASSERT_EQ(allocated.size(), 1u);
+  const std::unordered_map<BlockType, double> v41_utilization =
+      v41_manager.block_utilization_by_type();
+  EXPECT_EQ(v41_utilization.size(), 3u);
+  EXPECT_DOUBLE_EQ(v41_utilization.at(BlockType::SWA), 0.0);
+  EXPECT_GT(v41_utilization.at(BlockType::C2), 0.0);
+  EXPECT_DOUBLE_EQ(v41_utilization.at(BlockType::C1), 0.0);
+  allocated.clear();
+}
+
+TEST(CompositeBlockManagerTest, ZeroCapacityLeafStillReportsItsType) {
+  BlockManager::Options options = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      /*block_size=*/128,
+      /*window_size=*/256,
+      /*max_seqs_per_batch=*/2);
+  options.enable_prefix_cache(false);
+  auto leaves = build_composite_leaves(options);
+  BlockManager::Options c4_options = leaves.at(BlockType::C4).leaf->options();
+  // Block 0 is reserved for padding; one physical block has zero capacity.
+  c4_options.num_blocks(1);
+  auto empty_c4 = std::make_unique<BlockManagerImpl>(c4_options);
+  ASSERT_EQ(empty_c4->num_total_blocks(), 0u);
+  leaves.at(BlockType::C4).leaf = std::move(empty_c4);
+
+  CompositeBlockManager manager(std::move(leaves), options);
+  const std::unordered_map<BlockType, double> utilization =
+      manager.block_utilization_by_type();
+  ASSERT_EQ(utilization.size(), 3u);
+  EXPECT_DOUBLE_EQ(utilization.at(BlockType::C4), 0.0);
+  EXPECT_DOUBLE_EQ(utilization.at(BlockType::SWA), 0.0);
+  EXPECT_DOUBLE_EQ(utilization.at(BlockType::C128), 0.0);
 }
 
 void set_swa_capacity_for_token_budget(BlockManager::Options* options,

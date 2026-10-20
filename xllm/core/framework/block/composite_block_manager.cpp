@@ -1117,6 +1117,21 @@ double CompositeBlockManager::kv_cache_utilization() const {
   return static_cast<double>(num_used_blocks()) / static_cast<double>(total);
 }
 
+std::unordered_map<BlockType, double>
+CompositeBlockManager::block_utilization_by_type() const {
+  std::unordered_map<BlockType, double> utilization;
+  utilization.reserve(leaves_.size());
+  for (const auto& [type, entry] : leaves_) {
+    // Leaf utilization counts effective used blocks, not evictable prefix
+    // residents. Retain a zero-capacity leaf's type with a zero sample;
+    // BlockManagerImpl does not guard against division by zero.
+    const size_t total = entry.leaf->num_total_blocks();
+    utilization.emplace(type,
+                        total == 0 ? 0.0 : entry.leaf->kv_cache_utilization());
+  }
+  return utilization;
+}
+
 void CompositeBlockManager::free(int32_t /*block_id*/) {
   LOG(FATAL) << "CompositeBlockManager::free should not be called";
 }

@@ -21,6 +21,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "async_response_processor.h"
 #include "common/metrics.h"
@@ -1296,14 +1297,7 @@ void SchedulerPolicy::report_metrics(const SchedulerState& state,
             state.prefill_queue.size() + state.decode_restore_waiting.size());
   GAUGE_SET(num_preempted_requests, num_preempted_requests);
   GAUGE_SET(num_running_sequences, state.running_sequences.size());
-  GAUGE_SET(kv_cache_utilization_perc,
-            state.kv_cache_manager->kv_cache_utilization());
-  GAUGE_SET(num_blocks_in_prefix_cache,
-            util::min(state.kv_cache_manager->num_blocks_in_prefix_cache()));
-  GAUGE_SET(num_free_blocks,
-            util::max(state.kv_cache_manager->num_free_blocks()));
-  GAUGE_SET(num_used_blocks,
-            util::min(state.kv_cache_manager->num_used_blocks()));
+  report_kv_cache_metrics(*state.kv_cache_manager);
 }
 
 // =============================================================================

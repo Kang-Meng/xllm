@@ -27,6 +27,7 @@ limitations under the License.
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <vector>
 
 #include "common/metrics.h"
 #include "common/types.h"
@@ -299,12 +300,7 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
 
   GAUGE_SET(num_running_sequences, running_sequences_.size());
 
-  GAUGE_SET(kv_cache_utilization_perc,
-            kv_cache_manager_->kv_cache_utilization());
-  GAUGE_SET(num_blocks_in_prefix_cache,
-            util::min(kv_cache_manager_->num_blocks_in_prefix_cache()));
-  GAUGE_SET(num_free_blocks, util::max(kv_cache_manager_->num_free_blocks()));
-  GAUGE_SET(num_used_blocks, util::min(kv_cache_manager_->num_used_blocks()));
+  report_kv_cache_metrics(*kv_cache_manager_);
 
   return batches;
 }

@@ -442,4 +442,11 @@ class ContinuousScheduler : public Scheduler {
 // Maps the old scheduler-selection logic (factory) to a BatchMode value.
 BatchMode resolve_batch_mode(const ContinuousScheduler::Options& options);
 
+// Emits KV-cache monitoring gauges from the given manager. Maximum
+// utilization tracks the hottest DP rank; legacy free/used counts keep their
+// maximum-free/minimum-used semantics and may come from different ranks.
+// The legacy utilization gauge remains an unscaled least-loaded ratio.
+// Centralized so the three scheduler report sites cannot drift.
+void report_kv_cache_metrics(const KVCacheManager& kv_cache_manager);
+
 }  // namespace xllm

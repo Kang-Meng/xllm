@@ -14,7 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+
 #include <memory>
+#include <unordered_map>
 
 #include "framework/block/kv_cache_manager.h"
 #include "xtensor_manager_client.h"
@@ -39,6 +41,17 @@ class XTensorManagerPool final : public KVCacheManager {
   double kv_cache_utilization() const override;
 
   // unimplemented functions
+  std::vector<double> kv_cache_utilization_per_dp() const override {
+    NOT_IMPLEMENTED();
+    return {};
+  }
+
+  std::vector<std::unordered_map<BlockType, double>>
+  block_utilization_by_type_per_dp() const override {
+    NOT_IMPLEMENTED();
+    return {};
+  }
+
   void cache(Sequence* sequence) override { NOT_IMPLEMENTED(); }
   void cache(Sequence* sequence, size_t num_tokens) override {
     NOT_IMPLEMENTED();

@@ -67,6 +67,11 @@ message KvCacheEvent {
 
 message LoadMetrics {
   uint64 waiting_requests_num = 1;
+  // Legacy name: arithmetic mean of DP-local logical admission-cache usage
+  // ratios, not a percentage or physical device-memory usage. Composite
+  // managers count max(used) / min(total) across admission leaves, so a
+  // DP-local ratio may exceed 1 when leaf occupancies diverge.
+  // Used for service routing; unlike monitoring, not a DP maximum.
   float gpu_cache_usage_perc = 2;
 }
 

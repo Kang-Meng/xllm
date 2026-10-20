@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include "common/macros.h"
@@ -93,6 +94,15 @@ class KVCacheManager {
   virtual std::vector<size_t> num_free_blocks() const = 0;
   virtual std::vector<size_t> num_used_blocks() const = 0;
   virtual double kv_cache_utilization() const = 0;
+  // Per-DP KV-pool usage ratios for monitoring. Values are not device-memory
+  // percentages; presentation layers may render them as percentages.
+  virtual std::vector<double> kv_cache_utilization_per_dp() const = 0;
+  // Per-DP effective utilization of each block/slot leaf: used / capacity.
+  // Evictable prefix-cache residents do not count as used where supported.
+  // This reflects resource pressure, not physical slot or memory occupancy;
+  // some leaf types do not participate in KV admission.
+  virtual std::vector<std::unordered_map<BlockType, double>>
+  block_utilization_by_type_per_dp() const = 0;
 
   // Predict which DP rank a fresh sequence would be assigned to during
   // allocation. Uses the same effective-headroom metric and round-robin

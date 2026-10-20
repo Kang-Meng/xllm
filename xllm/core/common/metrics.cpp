@@ -15,8 +15,29 @@ limitations under the License.
 
 #include "common/metrics.h"
 
+#include <absl/strings/str_join.h>
+#include <glog/logging.h>
+
 #include <algorithm>
+#include <initializer_list>
 #include <mutex>
+#include <string>
+
+namespace xllm {
+
+void set_multi_gauge_value(bvar::MultiDimension<bvar::Status<double>>& metric,
+                           std::initializer_list<std::string> labels,
+                           double value) {
+  bvar::Status<double>* gauge = metric.get_stats(labels);
+  if (gauge == nullptr) {
+    LOG_EVERY_N(WARNING, 100) << "Failed to update multi gauge for labels "
+                              << absl::StrJoin(labels, ", ");
+    return;
+  }
+  gauge->set_value(value);
+}
+
+}  // namespace xllm
 
 // llm server impl metrics
 DEFINE_COUNTER(request_status_total_ok, "Total number of request status OK");
@@ -184,11 +205,29 @@ DEFINE_GAUGE(num_online_decode_preempt_offline_requests,
 DEFINE_GAUGE(num_running_sequences, "Number of running sequences");
 
 DEFINE_GAUGE(kv_cache_utilization_perc,
-             "Utilization of the kv cache in percentage");
+             "Minimum DP admission pressure as an unscaled ratio: maximum "
+             "used / minimum capacity across admission leaves; may exceed 1, "
+             "not physical device memory occupancy");
+DEFINE_MULTI_GAUGE(kv_cache_dp_utilization_perc,
+                   "dp_rank",
+                   "DP admission pressure in percent: maximum used / minimum "
+                   "capacity across admission leaves; may exceed 100, not "
+                   "physical device memory occupancy");
+DEFINE_MULTI_GAUGE_2_LABELS(block_type_dp_utilization_perc,
+                            "block_type",
+                            "dp_rank",
+                            "Effective per-leaf block/slot utilization per DP "
+                            "in percent: evictable prefix-cache residents "
+                            "excluded, not physical slot or memory occupancy");
+DEFINE_GAUGE(kv_cache_max_utilization_perc,
+             "Maximum DP admission pressure in percent: maximum used / "
+             "minimum capacity across admission leaves; may exceed 100, not "
+             "physical device memory occupancy");
 DEFINE_GAUGE(num_blocks_in_prefix_cache,
              "Number of blocks in the prefix cache");
-DEFINE_GAUGE(num_free_blocks, "Number of free blocks in the block allocator");
-DEFINE_GAUGE(num_used_blocks, "Effective number of blocks in use");
+DEFINE_GAUGE(num_free_blocks, "Maximum free admission-cache blocks across DP");
+DEFINE_GAUGE(num_used_blocks,
+             "Minimum effective used admission-cache blocks across DP");
 
 DEFINE_COUNTER(scheduling_latency_seconds, "Latency of scheduling in seconds");
 

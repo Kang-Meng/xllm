@@ -16,7 +16,9 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,7 @@ limitations under the License.
 #include "core/framework/batch/batch.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/block/block_manager_pool_test_peer.h"
+#include "framework/block/composite_block_manager.h"
 #include "framework/block/linear_state_block_manager.h"
 #include "framework/model/model_input_params.h"
 #include "framework/prefix_cache/block_hasher.h"
@@ -392,9 +395,77 @@ TEST_F(BlockManagerPoolTest, DpSelectionCountsEvictablePrefixBlocks) {
   EXPECT_GT(free_blocks[0], free_blocks[1]);
   EXPECT_GT(used_blocks[0], used_blocks[1]);
   EXPECT_DOUBLE_EQ(pool.kv_cache_utilization(), 0.0);
+  const std::vector<double> utilization = pool.kv_cache_utilization_per_dp();
+  ASSERT_EQ(utilization.size(), 2u);
+  EXPECT_DOUBLE_EQ(std::max(utilization[0], utilization[1]), 1.0 / 3.0);
+  // Cached blocks still occupy rank 1's physical slots, but are evictable and
+  // must not count toward its effective per-type admission pressure.
+  EXPECT_GT(pool.num_blocks_in_prefix_cache()[1], 0u);
+  const auto type_utilization = pool.block_utilization_by_type_per_dp();
+  ASSERT_EQ(type_utilization.size(), 2u);
+  EXPECT_DOUBLE_EQ(type_utilization[1].at(BlockType::KV), 0.0);
   EXPECT_EQ(BlockManagerPoolTestPeer::select_dp_rank(pool), 1);
 
   pool.deallocate(&active);
+}
+
+TEST_F(BlockManagerPoolTest, MonitoringPressurePreservesHotRankAndAdmission) {
+  BlockManagerPool::Options options;
+  options.num_blocks(5).block_size(1).enable_prefix_cache(false);
+  BlockManagerPool pool(options, /*dp_size=*/2);
+
+  for (int32_t hot_rank : {0, 1}) {
+    Sequence active = make_sequence(0, /*prompt_tokens=*/{1, 2, 3, 4});
+    active.set_dp_rank(hot_rank);
+    ASSERT_TRUE(pool.try_allocate(&active));
+    const KVCacheManager& manager = pool;
+    EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 0.0);
+    const std::vector<double> utilization =
+        manager.kv_cache_utilization_per_dp();
+    ASSERT_EQ(utilization.size(), 2u);
+    EXPECT_DOUBLE_EQ(utilization[hot_rank], 1.0);
+    EXPECT_DOUBLE_EQ(utilization[1 - hot_rank], 0.0);
+    EXPECT_FLOAT_EQ(pool.get_gpu_cache_usage_perc(), 0.5f);
+    EXPECT_EQ(pool.select_dp_rank(), 1 - hot_rank);
+
+    pool.deallocate(&active);
+    EXPECT_EQ(manager.kv_cache_utilization_per_dp(),
+              (std::vector<double>{0.0, 0.0}));
+    EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 0.0);
+  }
+}
+
+TEST_F(BlockManagerPoolTest, ReportsEachBlockTypeAndDpIndependently) {
+  BlockManagerPool::Options options;
+  options.num_blocks(5)
+      .block_size(1)
+      .enable_prefix_cache(false)
+      .enable_linear_state(true)
+      .linear_state_num_slots(9)
+      .num_speculative_tokens(1)
+      .num_embedding_blocks(3);
+  BlockManagerPool pool(options, /*dp_size=*/2);
+
+  Sequence active = make_sequence(0, /*prompt_tokens=*/{1, 2});
+  active.set_dp_rank(0);
+  ASSERT_TRUE(pool.try_allocate(&active));
+
+  // Each pool reserves block/slot 0 for padding: KV has 4 usable blocks,
+  // LINEAR has 8 usable slots, and EMBEDDING has 2 usable slots. The sequence
+  // uses 2 KV blocks and one slot in each of the other two pools.
+  const auto utilization = pool.block_utilization_by_type_per_dp();
+  ASSERT_EQ(utilization.size(), 2u);
+  EXPECT_DOUBLE_EQ(utilization[0].at(BlockType::KV), 0.5);
+  EXPECT_DOUBLE_EQ(utilization[0].at(BlockType::LINEAR), 1.0 / 8.0);
+  EXPECT_DOUBLE_EQ(utilization[0].at(BlockType::EMBEDDING), 0.5);
+  EXPECT_DOUBLE_EQ(utilization[1].at(BlockType::KV), 0.0);
+  EXPECT_DOUBLE_EQ(utilization[1].at(BlockType::LINEAR), 0.0);
+  EXPECT_DOUBLE_EQ(utilization[1].at(BlockType::EMBEDDING), 0.0);
+
+  pool.deallocate(&active);
+  for (const auto& [type, ratio] : pool.block_utilization_by_type_per_dp()[0]) {
+    EXPECT_DOUBLE_EQ(ratio, 0.0) << static_cast<int32_t>(type);
+  }
 }
 
 TEST_F(BlockManagerPoolTest, DeallocateReleasesSingleBlockId) {
