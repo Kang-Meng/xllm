@@ -846,6 +846,22 @@ class BuildDistWheel(bdist_wheel):
         logger.info("🔨 build project...")
         self.run_command("build")
 
+        if BUILD_EXPORT and "SKIP_TEST" not in os.environ:
+            subprocess.check_call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    os.path.join(get_base_dir(), "tests", "pybind_runtime_registration_test.py"),
+                ],
+                env={
+                    **os.environ,
+                    "XLLM_EXPORT_PATH": os.path.abspath(build_ext_cmd.get_ext_fullpath("xllm.xllm_export")),
+                    "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+                },
+            )
+
         if "SKIP_TEST" in os.environ:
             logger.info("⏭️ skipping UT because SKIP_TEST is set")
         else:

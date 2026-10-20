@@ -16,7 +16,6 @@ limitations under the License.
 #include "core/runtime/py_executor_impl.h"
 
 #include <glog/logging.h>
-#include <pybind11/embed.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/python.h>
@@ -141,9 +140,24 @@ void register_xllm_runtime_module(py::module_& m) {
 #endif
 }
 
-}  // namespace
+// The caller must hold the GIL.
+void ensure_xllm_runtime_module() {
+  CHECK(Py_IsInitialized())
+      << "Python must be initialized before binding xllm_runtime";
+  py::dict modules = py::module_::import("sys").attr("modules");
+  const py::str module_name("xllm_runtime");
+  if (modules.contains(module_name)) {
+    return;
+  }
 
-PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) { register_xllm_runtime_module(m); }
+  py::object module_object =
+      py::module_::import("types").attr("ModuleType")(module_name);
+  py::module_ module = py::reinterpret_borrow<py::module_>(module_object);
+  register_xllm_runtime_module(module);
+  modules[module_name] = module;
+}
+
+}  // namespace
 
 PyExecutorImpl::PyExecutorImpl(CausalLM* model,
                                const ModelArgs& args,
@@ -157,12 +171,12 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   CHECK(py_causal_lm_ != nullptr) << "PyExecutorImpl requires PyCausalLM";
 
   py::gil_scoped_acquire gil;
+  ensure_xllm_runtime_module();
   if (py_causal_lm_->config_dict()["is_multimodal"].cast<bool>()) {
     multimodal_executor_ = std::make_unique<PyMultimodalExecutor>(
         py_causal_lm_->python_model(),
         options.max_encoder_cache_size() * 1024 * 1024);
   }
-  py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
   const bool is_spec_draft =
