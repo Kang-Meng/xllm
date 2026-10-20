@@ -250,6 +250,19 @@ def build_cache_specs(
     return caches_info, group_infos
 
 
+def last_ring_writes(slots: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep V4.1's latest valid SWA/Engram ring write; eager chunks only."""
+    slots = slots.reshape(-1)
+    if slots.numel() != values.size(0):
+        raise ValueError("cache slot and value row counts must match")
+    order = torch.argsort(slots, stable=True)
+    sorted_slots = slots[order]
+    keep = sorted_slots >= 0
+    keep[:-1] &= sorted_slots[:-1] != sorted_slots[1:]
+    rows = order[keep]
+    return slots[rows], values[rows]
+
+
 def build_cache_specs_v41(
     compress_ratios: Sequence[int],
     kv_source_layer_ids: Sequence[int],

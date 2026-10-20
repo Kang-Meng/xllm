@@ -56,9 +56,7 @@ def _npu_ready() -> bool:
 def _fake_compressor_module(calls: list) -> SimpleNamespace:
     """Recording stand-in for the triton compressor module."""
 
-    def fake_from_projected(
-        kv, scores, kv_state, score_state, meta, out, **launch
-    ):
+    def fake_from_projected(kv, scores, kv_state, score_state, meta, out, **launch):
         calls.append(
             {
                 "kv": kv,
@@ -73,9 +71,7 @@ def _fake_compressor_module(calls: list) -> SimpleNamespace:
         out.fill_(1.5)
         return out
 
-    module = SimpleNamespace(
-        compressor_from_projected=fake_from_projected, _cube_core_num=lambda: 8
-    )
+    module = SimpleNamespace(compressor_from_projected=fake_from_projected, _cube_core_num=lambda: 8)
     return module
 
 
@@ -87,6 +83,7 @@ def _pool(
     start_pos: int,
     used_len: int,
     block_id: int,
+    output_dtype: torch.dtype = torch.bfloat16,
 ):
     """Thin wrapper so every decline-path call site stays short."""
     return csa2._v41_compressor_pool_triton(
@@ -97,10 +94,12 @@ def _pool(
         start_pos=torch.tensor(start_pos, dtype=torch.int64),
         used_len=used_len,
         block_id=torch.tensor(block_id, dtype=torch.int64),
+        output_dtype=output_dtype,
     )
 
 
-def test_pool_wiring_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])
+def test_pool_wiring_contract(monkeypatch: pytest.MonkeyPatch, output_dtype: torch.dtype) -> None:
     """The pool path forwards the documented op contract verbatim."""
     head_dim, q_len = WIDTH, 5
     kv = torch.randn(q_len, head_dim, dtype=torch.float32)
@@ -111,7 +110,7 @@ def test_pool_wiring_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _fake_compressor_module(calls)
     monkeypatch.setattr(csa2, "_V41_COMPRESSOR_MODULE", fake)
 
-    out = _pool(kv, scores, kv_state, score_state, 7, q_len, 3)
+    out = _pool(kv, scores, kv_state, score_state, 7, q_len, 3, output_dtype)
 
     assert len(calls) == 1
     got = calls[0]
@@ -127,8 +126,8 @@ def test_pool_wiring_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     assert meta.dtype == torch.int32 and meta.shape == (5, 1)
     assert meta.is_contiguous()
     assert meta[:, 0].tolist() == [7, q_len, 0, 0, 3]
-    # Token-aligned BF16 output, launch bounds from the segment shape.
-    assert got["out"].dtype == torch.bfloat16
+    # Preserve activation dtype; FP32 must not be rounded before RMSNorm.
+    assert got["out"].dtype == output_dtype
     assert got["out"].shape == (q_len, head_dim)
     assert got["max_query_len"] == q_len and got["num_cores"] == 8
     # The caller returns the op's own output tensor.
@@ -147,15 +146,11 @@ def test_pool_declines_safely(monkeypatch: pytest.MonkeyPatch) -> None:
     def _raise(*args, **kwargs):
         raise RuntimeError("boom")
 
-    raising = SimpleNamespace(
-        compressor_from_projected=_raise, _cube_core_num=lambda: 8
-    )
+    raising = SimpleNamespace(compressor_from_projected=_raise, _cube_core_num=lambda: 8)
     monkeypatch.setattr(csa2, "_V41_COMPRESSOR_MODULE", raising)
     assert _pool(kv, scores, kv_state, score_state, 0, 4, 1) is None
 
-    zero_cores = SimpleNamespace(
-        compressor_from_projected=lambda *a, **k: None, _cube_core_num=lambda: 0
-    )
+    zero_cores = SimpleNamespace(compressor_from_projected=lambda *a, **k: None, _cube_core_num=lambda: 0)
     monkeypatch.setattr(csa2, "_V41_COMPRESSOR_MODULE", zero_cores)
     assert _pool(kv, scores, kv_state, score_state, 0, 4, 1) is None
 
@@ -201,14 +196,14 @@ def test_swa_gate_static() -> None:
 # ============================================================================
 
 
-def _reference_from_projected(kv, scores, kv_state, score_state, metadata):
+def _reference_from_projected(kv, scores, kv_state, score_state, metadata, output_dtype=torch.bfloat16):
     """Pure-torch mirror of the K2 pool and K3 ring-update kernels.
 
     Adapts vllm-ascend's ``compressor_ratio2_reference`` to the xLLM planes:
-    two split FP32 state rings, a token-aligned BF16 output, and PROTECT_NULL
+    two split FP32 state rings, activation-typed pooled output, and PROTECT_NULL
     semantics (block id 0 padding rows neither pool nor write).
     """
-    out = torch.zeros_like(kv, dtype=torch.bfloat16)
+    out = torch.zeros_like(kv, dtype=output_dtype)
     starts = metadata[0].tolist()
     used = metadata[1].tolist()
     in_bases = metadata[3].tolist()
@@ -235,7 +230,7 @@ def _reference_from_projected(kv, scores, kv_state, score_state, metadata):
             ss = torch.stack(member_score).float()
             pooled = (kk * ss.softmax(dim=0)).sum(dim=0)
             out_row = base + (gidx + 1) * 2 - 1 - s
-            out[out_row] = pooled.to(torch.bfloat16)
+            out[out_row] = pooled.to(output_dtype)
         tail = min(u, RING_ROWS)
         for w in range(tail):
             seg_row = u - tail + w
@@ -245,7 +240,7 @@ def _reference_from_projected(kv, scores, kv_state, score_state, metadata):
     return out
 
 
-def _run_parity_case(starts, used, blocks, *, seed: int, width: int = WIDTH):
+def _run_parity_case(starts, used, blocks, *, seed: int, width: int = WIDTH, output_dtype=torch.bfloat16):
     """Drive one kernel-vs-reference parity batch on the NPU."""
     torch.manual_seed(seed)
     requests = len(starts)
@@ -276,13 +271,11 @@ def _run_parity_case(starts, used, blocks, *, seed: int, width: int = WIDTH):
     ref_kv_state = kv_state.clone()
     ref_score_state = score_state.clone()
 
-    ref_out = _reference_from_projected(
-        kv, scores, ref_kv_state, ref_score_state, metadata
-    )
+    ref_out = _reference_from_projected(kv, scores, ref_kv_state, ref_score_state, metadata, output_dtype)
 
     from xllm.python.kernels_npu.triton import compressor
 
-    out = torch.zeros(tokens, width, dtype=torch.bfloat16, device=dev)
+    out = torch.zeros(tokens, width, dtype=output_dtype, device=dev)
     got = compressor.compressor_from_projected(
         kv.contiguous(),
         scores.contiguous(),
@@ -295,25 +288,30 @@ def _run_parity_case(starts, used, blocks, *, seed: int, width: int = WIDTH):
     )
     assert got is out
     torch.testing.assert_close(
-        out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
+        out.float(),
+        ref_out.float(),
+        rtol=2e-5 if output_dtype == torch.float32 else 2e-2,
+        atol=2e-5 if output_dtype == torch.float32 else 2e-2,
     )
     torch.testing.assert_close(kv_state, ref_kv_state)
     torch.testing.assert_close(score_state, ref_score_state)
 
 
 @pytest.mark.skipif(not _npu_ready(), reason="NPU is not available")
-def test_parity_multi_request_random() -> None:
+@pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])
+def test_parity_multi_request_random(output_dtype: torch.dtype) -> None:
     """Random multi-request batches: odd/even starts, mixed lengths."""
     for seed, starts, used in (
         (0, [0, 3, 29, 64, 97], [32, 5, 8, 17, 1]),
         (1, [11, 40, 7, 100, 61], [9, 48, 3, 2, 33]),
         (2, [5, 16, 71, 33, 90], [40, 6, 12, 31, 4]),
     ):
-        _run_parity_case(starts, used, [1, 2, 3, 4, 5], seed=seed)
+        _run_parity_case(starts, used, [1, 2, 3, 4, 5], seed=seed, output_dtype=output_dtype)
 
 
 @pytest.mark.skipif(not _npu_ready(), reason="NPU is not available")
-def test_parity_ring_boundaries_and_padding() -> None:
+@pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])
+def test_parity_ring_boundaries_and_padding(output_dtype: torch.dtype) -> None:
     """Exactly-full ring, wrap-around, residual group, empty and padded rows."""
     # Full ring (start 0, 32 rows), wrap-around (start 29), residual group
     # (odd start reads the ring before writing), empty request, block-id-0
@@ -321,4 +319,4 @@ def test_parity_ring_boundaries_and_padding() -> None:
     starts = [0, 29, 3, 65, 0, 12]
     used = [32, 8, 4, 7, 0, 5]
     blocks = [1, 2, 3, 4, 5, 0]
-    _run_parity_case(starts, used, blocks, seed=3)
+    _run_parity_case(starts, used, blocks, seed=3, output_dtype=output_dtype)

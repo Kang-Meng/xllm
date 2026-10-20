@@ -282,7 +282,9 @@ def _pool_kernel(
                 # Keep Aurora's existing RMSNorm outside this kernel. Place
                 # each completed pair at its original completion-token row.
                 out_row = seg_row_base + (group_idx + 1) * RATIO - 1 - start_pos
-                tl.store(out_ptr + out_row * HEAD_DIM + offs_h, pooled.to(tl.bfloat16))
+                # Store in the caller's activation dtype. FP32 reference/model
+                # paths must not acquire an extra BF16 rounding before RMSNorm.
+                tl.store(out_ptr + out_row * HEAD_DIM + offs_h, pooled)
             else:
                 pooled_bf16 = pooled.to(tl.bfloat16).to(tl.float32)
                 var = tl.sum(pooled_bf16 * pooled_bf16, axis=0) / HEAD_DIM
@@ -307,7 +309,7 @@ def _cache_update_kernel(
     block_table_ptr,
     total_write_slots,
     WRITE_SLOTS_PER_BATCH,  # per-batch write slot bound,
-                            # min(max_used_len, CACHE_SIZE)
+    # min(max_used_len, CACHE_SIZE)
     NUM_BATCH,
     CACHE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -387,8 +389,8 @@ def compressor_from_projected(kv, scores, kv_state, score_state, metadata, out, 
         raise ValueError("Expected [blocks, 32, width] score ring state")
     if kv_state.shape[0] != score_state.shape[0]:
         raise ValueError("Compressor kv/score ring state must have the same block count")
-    if out.dtype != torch.bfloat16 or out.shape != kv.shape:
-        raise ValueError("Expected token-aligned BF16 pooled output")
+    if out.dtype not in (torch.float32, torch.bfloat16) or out.shape != kv.shape:
+        raise ValueError("Expected token-aligned FP32 or BF16 pooled output")
     if metadata.dtype != torch.int32 or metadata.ndim != 2 or metadata.shape[0] != 5:
         raise ValueError("Expected INT32 [5, requests] device metadata")
     tensors = (kv, scores, kv_state, score_state, metadata, out)

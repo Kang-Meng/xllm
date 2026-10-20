@@ -34,6 +34,7 @@ from xllm.python.models.deepseek_v41_engram import (
     ENGRAM_IMAGE_SENTINEL_BASE_ID,
     ENGRAM_STORAGE_FP8,
     ENGRAM_STORAGE_INT8,
+    Engram,
     EngramEmbedding,
     EngramHashState,
     EngramLayout,
@@ -330,17 +331,13 @@ def test_engram_lookup_op_kernel_matches_golden() -> None:
     scale_rows = scale.tolist()
     expected = torch.tensor(
         [
-            [
-                weight_rows[id_row][column] * scale_rows[id_row][column // 32]
-                for column in range(width)
-            ]
+            [weight_rows[id_row][column] * scale_rows[id_row][column // 32] for column in range(width)]
             for id_row in ids.tolist()
         ],
         dtype=torch.bfloat16,
     )
     assert torch.equal(out, expected), (
-        f"parallel golden mismatch (numel={ids.numel()}): "
-        f"{out[0, :4].tolist()} vs {expected[0, :4].tolist()}"
+        f"parallel golden mismatch (numel={ids.numel()}): {out[0, :4].tolist()} vs {expected[0, :4].tolist()}"
     )
 
 
@@ -380,9 +377,7 @@ def test_engram_lookup_op_kernel_boundary_goldens() -> None:
     for numel in (0, 1, 255, 256, 257):
         ids = torch.zeros(numel, dtype=torch.int64)
         if numel:
-            ids = torch.randint(
-                0, rows, (numel,), dtype=torch.int64, generator=torch.Generator().manual_seed(numel)
-            )
+            ids = torch.randint(0, rows, (numel,), dtype=torch.int64, generator=torch.Generator().manual_seed(numel))
         out = torch.empty(numel, width, dtype=torch.bfloat16)
         op(weight, scale, ids, out)
 
@@ -390,17 +385,13 @@ def test_engram_lookup_op_kernel_boundary_goldens() -> None:
         # kernel under test nor the eager reference helper is reused.
         expected = torch.tensor(
             [
-                [
-                    weight_rows[id_row][column] * scale_rows[id_row][column // 32]
-                    for column in range(width)
-                ]
+                [weight_rows[id_row][column] * scale_rows[id_row][column // 32] for column in range(width)]
                 for id_row in ids.tolist()
             ],
             dtype=torch.bfloat16,
         ).reshape(numel, width)
         assert torch.equal(out, expected), (
-            f"boundary golden mismatch (numel={numel}): "
-            f"{out[0, :4].tolist()} vs {expected[0, :4].tolist()}"
+            f"boundary golden mismatch (numel={numel}): {out[0, :4].tolist()} vs {expected[0, :4].tolist()}"
         )
 
 
@@ -878,6 +869,168 @@ def test_engram_hash_slot_cache_roundtrip() -> None:
     assert torch.equal(hashes[0, 0, 2], ((r % 73) + 138).to(torch.int32))
 
 
+def test_engram_mixed_batch_deduplicates_ring_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty sequences must not hide a multi-token ring collision."""
+    import xllm.python.models.deepseek_v41_engram as engram
+
+    state = _tiny_engram_hash_state()
+    state._cache = torch.zeros(16, dtype=torch.int32)
+    ids = torch.tensor([3, 9, 20])
+    # q_lens=[2, 0, 1]: total tokens equals batch size, which made the old
+    # aggregate-count heuristic incorrectly classify this as decode-only.
+    query_start_loc = torch.tensor([0, 2, 2, 3])
+    slots = torch.tensor([4, 4, 5], dtype=torch.int32)
+    calls: list[torch.Tensor] = []
+    original = engram.last_ring_writes
+
+    def recording_last_writes(physical_slots: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(physical_slots.clone())
+        return original(physical_slots, values)
+
+    monkeypatch.setattr(engram, "last_ring_writes", recording_last_writes)
+    state(
+        ids,
+        torch.tensor([0, 1, 0]),
+        query_start_loc,
+        torch.zeros(3, dtype=torch.bool),
+        None,
+        slots,
+        None,
+        8,
+    )
+
+    assert len(calls) == 1
+    compressed = state.token_map[ids].to(torch.int32)
+    assert state._cache[4] == compressed[1]
+    assert state._cache[5] == compressed[2]
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "npu"])
+def test_engram_graph_writes_keep_active_slots_and_repeated_padding(
+    device_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise deduplicate=False and real graph replay on valid row slots.
+
+    Active decode/verify rows address distinct slots. Multiple padding rows
+    may map to reserved slot 0, but all publish its unchanged value. Conflicting
+    active slots are not a valid input and have no last-writer graph guarantee.
+    """
+    import xllm.python.models.deepseek_v41_engram as engram
+    from xllm.python.model_executor.forward_context import (
+        AclGraphCaptureContext,
+        AclGraphExecutionState,
+        ForwardContext,
+        forward_context,
+    )
+
+    if device_name == "npu" and not (hasattr(torch, "npu") and torch.npu.is_available()):
+        pytest.skip("NPU is unavailable")
+    device = torch.device("npu:0" if device_name == "npu" else "cpu")
+    state = _tiny_engram_hash_state().to(device)
+    state._cache = torch.full((24,), 91, dtype=torch.int32, device=device)
+    ids = torch.tensor([3, 9, 20, 7, 11, 12], device=device)
+    positions = torch.zeros(6, dtype=torch.int64, device=device)
+    starts = torch.arange(7, device=device)
+    dead = torch.tensor([False, True, False, False, False, False], device=device)
+    slots = torch.tensor([8, 11, -1, -1, 14, -1], dtype=torch.int32, device=device)
+
+    def unexpected_eager_dedup(*args: object) -> None:
+        raise AssertionError("Graph writes must retain their fixed operand shapes")
+
+    monkeypatch.setattr(engram, "last_ring_writes", unexpected_eager_dedup)
+    context = ForwardContext(None, device, None, [], execution_state=AclGraphExecutionState({}))
+
+    def execute() -> torch.Tensor:
+        with forward_context(context):
+            return state(ids, positions, starts, dead, None, slots, None, 8)
+
+    def check_cache() -> None:
+        valid = slots >= 0
+        expected = torch.full_like(state._cache, 91)
+        compressed = state.token_map[ids].to(torch.int32)
+        compressed = torch.where(dead, -1, compressed)
+        expected[slots[valid].long()] = compressed[valid]
+        torch.testing.assert_close(state._cache, expected, atol=0, rtol=0)
+
+    with torch.inference_mode():
+        execute()
+        check_cache()
+        if device_name == "cpu":
+            return
+        graph = torch.npu.NPUGraph()
+        stream = torch.npu.Stream()
+        torch.npu.synchronize()
+        context = ForwardContext(
+            None,
+            device,
+            None,
+            [],
+            execution_state=AclGraphExecutionState({}),
+            acl_graph=AclGraphCaptureContext(stream, []),
+        )
+        with torch.npu.graph(graph, stream=stream):
+            captured = execute()
+        for active_slots, next_ids in (
+            ([9, 12, -1, -1, 15, -1], [5, 6, 7, 8, 9, 10]),
+            ([8, 11, -1, -1, 14, -1], [10, 9, 8, 7, 6, 5]),
+        ):
+            state._cache.fill_(91)
+            slots.copy_(torch.tensor(active_slots, dtype=torch.int32, device=device))
+            ids.copy_(torch.tensor(next_ids, device=device))
+            graph.replay()
+            torch.npu.synchronize()
+            check_cache()
+            # With position=0 each request's history is padding; hashes are
+            # independently computed without a slot cache or graph dedup.
+            reference = _tiny_engram_hash_state().to(device)
+            expected_hashes = reference(ids, positions, starts, dead, None, None, None, 8)
+            torch.testing.assert_close(captured, expected_hashes, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "prefix,chunk,window", [(7, 2, 8), (8, 8, 8), (9, 17, 8), (31, 33, 8), (129, 3, 128), (5000, 3, 128)]
+)
+@pytest.mark.parametrize("dead_prefix", [False, True])
+def test_engram_chunked_hash_preserves_history_across_ring_wrap(
+    prefix: int,
+    chunk: int,
+    window: int,
+    dead_prefix: bool,
+) -> None:
+    """Chunk history and following decode retain absolute ring addressing."""
+    state = _tiny_engram_hash_state()
+    reference = _tiny_engram_hash_state()
+    torch.manual_seed(611)
+    ids = torch.randint(1, 64, (prefix + chunk + 3,))
+    dead = torch.zeros_like(ids, dtype=torch.bool)
+    dead[prefix - 1] = dead_prefix
+    state._cache = torch.zeros(window * 2, dtype=torch.int32)
+    table = torch.tensor([[1]], dtype=torch.int32)
+    contexts = [0, prefix, prefix + chunk, prefix + chunk + 1, prefix + chunk + 2, prefix + chunk + 3]
+    for start, end in zip(contexts, contexts[1:]):
+        positions = torch.arange(start, end)
+        actual = state(
+            ids[start:end],
+            positions,
+            torch.tensor([0, end - start]),
+            dead[start:end],
+            None,
+            window + positions % window,
+            table,
+            window,
+        )
+        expected = reference(
+            ids[:end], torch.arange(end), torch.tensor([0, end]), dead[:end], None, None, None, window
+        )[start:end]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        tail = torch.arange(max(0, end - window), end)
+        compressed = state.token_map[ids[tail]].to(torch.int32)
+        compressed = torch.where(dead[tail], torch.full_like(compressed, -1), compressed)
+        torch.testing.assert_close(state._cache[window + tail % window], compressed, atol=0, rtol=0)
+
+
 def test_engram_explicit_lookback_beats_slot_cache() -> None:
     """Resolution order is chunk -> explicit lookback -> slot cache.
 
@@ -1114,7 +1267,6 @@ def test_engram_offload_active_is_config_controlled() -> None:
     assert bool(on.engram_layer_ids) and on.engram_config.cpu_offload is True
     assert bool(off.engram_layer_ids) and off.engram_config.cpu_offload is False
     assert bool(default.engram_layer_ids) and default.engram_config.cpu_offload is False
-
 
 
 # ``_int8_engram_payload`` / ``_make_int8_embedding`` / ``_engram_ids`` are
@@ -1460,3 +1612,21 @@ def test_host_pin_failure_warns_once_and_raises_with_cause(monkeypatch: pytest.M
     assert other._ids_host_pinned is True
     assert other._host_pin_failure is None
     assert emb._host_pin_failure is not None
+
+
+@pytest.mark.parametrize("with_chunk", [False, True])
+def test_engram_cache_writes_use_resolved_compressed_ids(with_chunk: bool) -> None:
+    state = _tiny_engram_hash_state()
+    reference = _tiny_engram_hash_state()
+    state._cache = torch.full((16,), 91, dtype=torch.int32)
+    ids = torch.tensor([ENGRAM_IMAGE_SENTINEL_BASE_ID, -3, 7, 100])
+    positions = torch.arange(4) if with_chunk else torch.zeros(4, dtype=torch.int64)
+    query_start_loc = torch.tensor([0, 4]) if with_chunk else torch.arange(5)
+    dead = torch.tensor([True, False, False, False])
+    slots = torch.tensor([8, 9, 10, 11], dtype=torch.int32)
+    actual = state(ids, positions, query_start_loc, dead, None, slots, None, 8)
+    expected = reference(ids, positions, query_start_loc, dead, None, None, None, 8)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    compressed = torch.tensor([-1, state.token_map[0], state.token_map[7], state.token_map[-1]], dtype=torch.int32)
+    torch.testing.assert_close(state._cache[slots.long()], compressed, atol=0, rtol=0)
+    assert torch.equal(state._cache[:8], torch.full((8,), 91, dtype=torch.int32))

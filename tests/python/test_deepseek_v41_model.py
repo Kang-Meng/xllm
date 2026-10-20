@@ -1282,15 +1282,16 @@ def _allocate_v41_layer_caches(
 ) -> list[LayerCache]:
     """LayerCache tensors for the contract-section-2 layout.
 
-    With ``reserve_token_sink`` the TOKEN pools carry one extra leading block
+    With ``reserve_token_sink`` every pool carries one extra leading block
     (block 0) that is never written, so real per-sequence blocks are addressed
-    1-based. This mirrors the production invariant that block 0 is a reserved
-    zero padding sink, which the padded (``-1``) rows clamp to.
+    1-based. The same reservation applies to SWA and compressor state: native
+    decode pooling explicitly treats block 0 as padding.
     """
     device = device or torch.device("cpu")
 
     def swa(dtype_: torch.dtype = dtype) -> torch.Tensor:
-        return torch.zeros(_SWA_RING_BLOCKS * n_seqs, cfg.window_size, cfg.head_dim, dtype=dtype_, device=device)
+        blocks = _SWA_RING_BLOCKS * n_seqs + int(reserve_token_sink)
+        return torch.zeros(blocks, cfg.window_size, cfg.head_dim, dtype=dtype_, device=device)
 
     token_blocks = n_seqs + 1 if reserve_token_sink else n_seqs
     caches: list[LayerCache] = []
@@ -1337,8 +1338,10 @@ class _V41ForwardHarness:
         self.n_seqs = n_seqs
         self.dtype = dtype
         self.device = device or torch.device("cpu")
-        self.swa_bt = torch.arange(_SWA_RING_BLOCKS * n_seqs, dtype=torch.int32, device=self.device).view(n_seqs, -1)
-        # Block 0 of the TOKEN pools is a reserved zero padding sink, so real
+        self.swa_bt = (torch.arange(_SWA_RING_BLOCKS * n_seqs, dtype=torch.int32, device=self.device) + 1).view(
+            n_seqs, -1
+        )
+        # Block 0 of every pool is a reserved zero padding sink, so real
         # per-sequence blocks are addressed 1-based (matching production).
         self.tok2_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
         self.tok1_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
@@ -1905,8 +1908,8 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     # holds fewer rows than index_topk while every non-pool row still sits
     # inside the visible range, so the visibility filter alone cannot exclude
     # them -- only the -inf pool mask can, and the picks it cuts must land on
-    # the -1 sentinel (which _picked_row_mask drops, so attention reads pool
-    # rows + window rows only).
+    # the -1 sentinel (which attention masks before reading values, so it
+    # reads pool rows + window rows only).
     backend.index_topk = 512
     topk_wide = backend._run_indexer(layer5, ctx_late, None, [1], [ctx_len], shared5)
     picks_wide = topk_wide[0, 0]
@@ -1961,7 +1964,7 @@ def test_swa_window_lower_bound_is_per_query() -> None:
     """The SWA window a query reads is bounded per query, not per chunk.
 
     Regression guard for :func:`_window_visible_idxs` (the ``_csa2_attention``
-    window mask): query ``p`` must see exactly the window columns at absolute
+    chronological picks): query ``p`` must see exactly the window columns at absolute
     positions ``[max(p - win + 1, 0), p]``. A chunk-level bound shared by the
     whole chunk (only query index 0 sits at the chunk start) would let every
     later query read positions older than its window.
@@ -1978,9 +1981,8 @@ def test_swa_window_lower_bound_is_per_query() -> None:
         ring_pos = (prev_ctx - win) + torch.arange(win, dtype=torch.int64)
         positions_seq = prev_ctx + torch.arange(q_len, dtype=torch.int64)
         col_pos = torch.cat((ring_pos, positions_seq), dim=0)
-        cols = torch.arange(col_pos.numel(), dtype=torch.int64)
-        idxs = _window_visible_idxs(positions_seq, col_pos, cols, win)
-        assert idxs.shape == (q_len, win + q_len)
+        idxs = _window_visible_idxs(positions_seq, torch.tensor(prev_ctx), win)
+        assert idxs.shape == (q_len, win)
         for i in range(q_len):
             p = prev_ctx + i
             picked = idxs[i][idxs[i] >= 0]
@@ -2089,12 +2091,13 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
     # SWA ring writes: positions 0-7 fill the first ring block of each
     # sequence; position 8 opens the second ring block.
     swa = harness.layer_caches[0].swa
-    assert (swa[0].abs().sum(dim=-1) > 0).all()
-    assert (swa[2].abs().sum(dim=-1) > 0).all()
-    assert swa[1, 0].abs().sum(dim=-1) > 0
-    assert (swa[1, 1:] == 0).all()
-    assert swa[3, 0].abs().sum(dim=-1) > 0
-    assert (swa[3, 1:] == 0).all()
+    assert (swa[0] == 0).all()
+    first_blocks = harness.swa_bt[:, 0].tolist()
+    second_blocks = harness.swa_bt[:, 1].tolist()
+    for first, second in zip(first_blocks, second_blocks):
+        assert (swa[first].abs().sum(dim=-1) > 0).all()
+        assert swa[second, 0].abs().sum(dim=-1) > 0
+        assert (swa[second, 1:] == 0).all()
 
     # Committed compressed rows = ctx // ratio for both kv sources. Block 0 is
     # the reserved zero padding sink, so sequence 0's real block is index 1.
@@ -2139,9 +2142,10 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
     # Ring writes for positions 8-12 fill the second ring block rows 0-4
     # (position 8 from the prefill, 9-12 from the decode steps).
     second_block_rows = prompt_len - cfg.window_size + decode_steps
-    assert (swa[1, :second_block_rows].abs().sum(dim=-1) > 0).all()
-    assert (swa[1, second_block_rows:] == 0).all()
-    assert (swa[3, :second_block_rows].abs().sum(dim=-1) > 0).all()
+    assert (swa[0] == 0).all()
+    for second in second_blocks:
+        assert (swa[second, :second_block_rows].abs().sum(dim=-1) > 0).all()
+        assert (swa[second, second_block_rows:] == 0).all()
     # Committed rows follow ctx // ratio at ctx = prompt_len + decode_steps.
     # Block 0 is the reserved zero padding sink; sequence 0's block is index 1.
     ctx_len = prompt_len + decode_steps

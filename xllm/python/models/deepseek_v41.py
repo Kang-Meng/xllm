@@ -540,80 +540,10 @@ def _make_v41_linear(
 # Pure-torch RMSNorm / RoPE tables / mHC
 # ---------------------------------------------------------------------------
 
-# --- Fused RMSNorm path (always on) ------------------------------------------
-#
-# Replaces the eager ``_rms_norm`` with the registered NPU op behind
-# ``kernels_npu.normalization.rms_norm`` (CANN ``npu_rms_norm``); both compute
-# fp32 statistics on bf16 and differ only in internal rounding order (bf16
-# mixed tolerance).
-
-_rms_norm_op: Any = None
-
-
-def _get_rms_norm_op() -> Any:
-    """Resolve the semantic RMSNorm wrapper once its op is registered."""
-    global _rms_norm_op
-    if _rms_norm_op is None:
-        if getattr(torch.ops.xllm_ops, "rms_norm", None) is None:
-            return None
-        try:
-            from xllm.python.kernels_npu.normalization import rms_norm as _kernel
-        except Exception:  # noqa: BLE001 - torch_npu absent on CPU-only hosts.
-            return None
-        _rms_norm_op = _kernel
-    return _rms_norm_op
-
-
-def _rms_norm_fused_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Guards for the fused RMSNorm op."""
-    return (
-        x.device.type in ("npu", "privateuseone")
-        and x.dim() in (2, 3)
-        and x.dtype == torch.bfloat16
-        and weight.dtype == torch.bfloat16
-        and weight.dim() == 1
-        and weight.numel() == x.size(-1)
-        and _get_rms_norm_op() is not None
-    )
-
-
-_fused_norm_active_logged = False
-_fused_norm_fallback_logged = False
-
-
-def _log_fused_norm_active() -> None:
-    """One-shot info when the fused RMSNorm path first engages."""
-    global _fused_norm_active_logged
-    if not _fused_norm_active_logged:
-        _fused_norm_active_logged = True
-        logger.info("RMSNorm fused path active")
-
-
-def _log_fused_norm_fallback(x: torch.Tensor, weight: torch.Tensor) -> None:
-    """One-shot warning when the fused path is requested but guards fail."""
-    global _fused_norm_fallback_logged
-    if _fused_norm_fallback_logged:
-        return
-    _fused_norm_fallback_logged = True
-    logger.warning(
-        "the fused RMSNorm op is unavailable "
-        f"(device={x.device.type} dim={x.dim()} dtype={x.dtype} "
-        f"weight_dtype={weight.dtype} op_registered={_get_rms_norm_op() is not None}); "
-        "staying on the eager path"
-    )
-
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Reference RMSNorm (model.py:281-293): fp32 statistics, cast back."""
-    if _rms_norm_fused_supported(x, weight):
-        _log_fused_norm_active()
-        return _get_rms_norm_op()(x, weight, eps)
-    _log_fused_norm_fallback(x, weight)
-    dtype = x.dtype
-    xf = x.float()
-    var = xf.square().mean(-1, keepdim=True)
-    xf = xf * torch.rsqrt(var + eps)
-    return (weight * xf).to(dtype)
+    """Normalize in FP32 with the existing native row reduction, then cast once."""
+    return kernels.rms_norm(x.float(), weight.float(), eps).to(x.dtype)
 
 
 # --- Fused RMSNorm+cast path (always on) -------------------------------------
@@ -1279,6 +1209,20 @@ class DeepseekV41HyperConnection(nn.Module):
                 nn.Parameter(torch.empty(3, dtype=torch.float32, device=device)),
             )
 
+    def _project_mixes(self, flattened: torch.Tensor, hc_fn: torch.Tensor) -> torch.Tensor:
+        """Keep the small HC projection's FP32 GEMM geometry fixed across chunks."""
+        output = flattened.new_empty((flattened.size(0), hc_fn.size(0)))
+        if flattened.size(0) == 0:
+            return output
+        # Reuse one call-local tile; every GEMM retains the same 128-row shape.
+        # Padding rows are independent and their outputs are discarded.
+        tile = flattened.new_empty((128, flattened.size(1)))
+        for start in range(0, flattened.size(0), 128):
+            count = min(128, flattened.size(0) - start)
+            tile[:count].copy_(flattened[start : start + count])
+            output[start : start + count].copy_(F.linear(tile, hc_fn)[:count])
+        return output
+
     def hc_mixes(
         self,
         x: torch.Tensor,
@@ -1289,7 +1233,7 @@ class DeepseekV41HyperConnection(nn.Module):
         """x ``[T, hc, d]`` -> (pre, post, comb) per token."""
         flattened = x.flatten(-2).float()
         rsqrt = torch.rsqrt(flattened.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(flattened, hc_fn) * rsqrt
+        mixes = self._project_mixes(flattened, hc_fn) * rsqrt
         return _hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.sinkhorn_iters, self.hc_eps)
 
     def hc_pre_fused(
@@ -1328,7 +1272,11 @@ class DeepseekV41HyperConnection(nn.Module):
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
         """Collapse the hc copies: ``sum_j pre[j] * x[j]`` (model.py:957-960)."""
-        y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=-2)
+        # A fixed FP32 order avoids token-count-dependent BF16 rounding.
+        contributions = (pre_mix.unsqueeze(-1) * x.float()).unbind(dim=-2)
+        y = contributions[0]
+        for contribution in contributions[1:]:
+            y = y + contribution
         return y.to(x.dtype)
 
     def hc_post(
@@ -1611,7 +1559,10 @@ class DeepseekV41Attention(Attention):
             cos_sin_cache=cos_sin_cache,
             qr_scale=qr_scale,
         )
-        attn_out = execute_csa2(q, kv, self)
+        try:
+            attn_out = execute_csa2(q, kv, self)
+        finally:
+            self._csa2_ctx = None
         # De-rotate the rope dims by the query's own rotation (conjugate)
         # BEFORE the o path (model.py:781).
         if attn_out.size(0) > 0:

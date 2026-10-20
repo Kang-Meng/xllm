@@ -36,6 +36,7 @@ from tests.python._deepseek_v41_fused_testkit import (
 )
 from tests.python.test_deepseek_v41_hc import _make_stubbed_layer, _run_layer
 from tests.python.test_deepseek_v41_model import _DEEPSEEK_V41_TINY_CONFIG
+from xllm.python import kernels
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -44,6 +45,34 @@ from xllm.python.model_executor.forward_context import (
 # ---------------------------------------------------------------------------
 # R8: rms_norm (module level)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rms_norm_uses_batch_stable_fp32_kernel(dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch) -> None:
+    """V4.1 RMSNorm delegates FP32 inputs/weights and casts exactly once."""
+    calls: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+
+    def fake_rms_norm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        calls.append((value.clone(), weight.clone(), eps))
+        return value * weight + eps
+
+    monkeypatch.setattr(kernels, "rms_norm", fake_rms_norm)
+    norm = v41.DeepseekV41RMSNorm(8, 1e-5, dtype, "cpu")
+    with torch.no_grad():
+        norm.weight.copy_(torch.linspace(0.5, 1.2, 8, dtype=dtype))
+    value = torch.linspace(-1.0, 1.0, 24, dtype=dtype).reshape(3, 8)
+
+    actual = norm(value)
+
+    assert len(calls) == 1
+    kernel_value, kernel_weight, kernel_eps = calls[0]
+    assert kernel_value.dtype == torch.float32
+    assert kernel_weight.dtype == torch.float32
+    assert kernel_eps == norm.eps
+    expected = (value.float() * norm.weight.float() + norm.eps).to(dtype)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # R9: fused RMSNorm+cast MoE norm (always on)
 # ---------------------------------------------------------------------------

@@ -20,11 +20,13 @@ validation, and execution routing — using CPU mocks so no GPU/NPU required.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from importlib import import_module
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -148,6 +150,105 @@ class _FakeModel(nn.Module):
 
     def forward(self, input_ids, positions):
         return input_ids
+
+
+@pytest.fixture
+def _v41_backend_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, object]:
+    from xllm.python.model_executor import executor as executor_module
+
+    monkeypatch.setattr(executor_module.current_platform, "is_npu", lambda: True)
+    return {
+        "model_path": str(tmp_path),
+        "model_type": "deepseek_v41",
+        "weight_quant_method": "ascend",
+        "quantization_config": {"quant_method": "ascend"},
+        "max_position_embeddings": 1024,
+        "compress_ratios": [0],
+        "n_layers": 1,
+    }
+
+
+@pytest.mark.parametrize("graph_backend", ["off", "aclgraph"])
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_v41_executor_preserves_csa2_dispatch_after_main_integration(
+    graph_backend: str, dp_size: int, tmp_path: Path, _v41_backend_config: dict[str, object]
+) -> None:
+    """Exercise real CSA2 construction without launching NPU graph execution."""
+    from xllm.python.attention.csa2_attention import Csa2AttentionBackend
+
+    model = _FakeModel(num_layers=1, num_heads=2, num_kv_heads=1, head_dim=64)
+    (tmp_path / "quant_model_description.json").write_text("{}", encoding="utf-8")
+    config = {
+        **_v41_backend_config,
+        "python_graph_backend": graph_backend,
+        "window_size": 128,
+        "index_topk": 8,
+        "index_n_heads": 2,
+        "index_head_dim": 64,
+        "qk_rope_head_dim": 32,
+        "dp_size": dp_size,
+        "dp_rank": 0,
+        "ep_size": 16,
+        "expert_parallel_degree": 2,
+        "enable_mega_moe": False,
+        "num_speculative_tokens": 0,
+    }
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner") as graph_runner:
+        executor = ModelExecutor(model, config, max_seqs_per_batch=8, acl_graph_decode_batch_size_limit=4)
+
+    backend = executor.attention_backend
+    assert isinstance(backend, Csa2AttentionBackend)
+    assert backend.quant_mode == "ascend"
+    assert backend.moe_graph_capturable is True
+    assert backend.graph_token_capacity_granularity == 1024
+    assert executor._execution_metadata_builders == ()
+    assert executor.eager_runner.cp_size == 1
+    assert executor.inductor_runner is None
+    if graph_backend == "off":
+        graph_runner.assert_not_called()
+        assert executor.decode_graph_runner is None
+    else:
+        graph_runner.assert_called_once_with(
+            model.model,
+            backend,
+            torch.device("cpu"),
+            8,
+            1024,
+            dp_size,
+            0,
+            4,
+            num_decoding_tokens=1,
+            enable_mega_moe_token_mask=False,
+            is_spec_draft=False,
+            draft_query_width=1,
+        )
+        executor.decode_graph_runner.bind_execution_metadata_builders.assert_called_once_with(())
+
+
+@pytest.mark.parametrize(("quant_method", "graph_capturable"), [("ascend", True), ("fp8", False), ("none", False)])
+def test_v41_backend_keeps_checkpoint_specific_graph_capability(
+    quant_method: str, graph_capturable: bool, tmp_path: Path, _v41_backend_config: dict[str, object]
+) -> None:
+    from xllm.python.attention.csa2_attention import Csa2AttentionBackend
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": quant_method}}), encoding="utf-8"
+    )
+    backend = _create_attention_backend(
+        _make_attention_layer(num_heads=2, num_kv_heads=1, head_dim=64),
+        torch.device("cpu"),
+        torch.bfloat16,
+        {
+            **_v41_backend_config,
+            "weight_quant_method": quant_method,
+            "quantization_config": {"quant_method": quant_method},
+        },
+        num_decoding_tokens=1,
+        acl_graph_enabled=True,
+    )
+    assert isinstance(backend, Csa2AttentionBackend)
+    assert backend.quant_mode == quant_method
+    assert backend.moe_graph_capturable is graph_capturable
 
 
 class _FakeModelHeterogeneous(nn.Module):

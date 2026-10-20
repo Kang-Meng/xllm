@@ -54,6 +54,7 @@ from xllm.python.attention.dsa_metadata import (
     DsaMetadata,
     DsaMetadataBuilder,
     build_cache_specs_v41,
+    last_ring_writes,
 )
 from xllm.python.model_executor.dsa_cp import DsaCpContext, get_current_dsa_cp_runtime
 from xllm.python.models.deepseek_v41 import (
@@ -63,9 +64,11 @@ from xllm.python.models.deepseek_v41 import (
 
 # Softmax-scale exponent base of the sparse kernel's running-max floor.
 _NEG_INF_FLOOR = -1e30
-# Query rows per attention tile (the reference kernel processes 64 gathered
-# rows per tile; a few hundred rows keep the [s, H, n] score tile bounded).
+# Maximum query rows per attention tile. CSA2 materializes selected KV per
+# query, unlike V4's shared-KV tail: bound the two simultaneous FP32 copies
+# (cast gather and masked result) as well as retaining the score-row cap.
 _ATTENTION_QUERY_TILE = 256
+_ATTENTION_KV_TILE_BYTES = 32 * 1024 * 1024
 # Query rows per indexer scoring tile. The fp32 score intermediate is
 # [tile, index_heads, capacity]; a whole-prompt chunk against a long-context
 # committed capacity reaches multiple GiB per layer (30k ctx x 2k chunk x 32
@@ -567,10 +570,11 @@ def _v41_compressor_pool_triton(
     start_pos: torch.Tensor,
     used_len: int,
     block_id: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor | None:
     """Pool one segment's ratio-2 groups with the Triton kernel.
 
-    Returns the token-aligned bf16 pooled rows ``[q_len, head_dim]`` (the caller
+    Returns token-aligned pooled rows in the activation dtype (the caller
     gathers the committed group rows and applies RMSNorm), or None when the op
     declines so the caller keeps the pure-torch path. ``start_pos`` / ``block_id``
     are device scalars, so the control metadata is built with device arithmetic
@@ -596,7 +600,7 @@ def _v41_compressor_pool_triton(
             block_id.to(torch.int32).reshape(()),
         )
     ).reshape(5, 1)
-    out = torch.empty(q_len, head_dim, dtype=torch.bfloat16, device=dev)
+    out = torch.empty(q_len, head_dim, dtype=output_dtype, device=dev)
     try:
         module.compressor_from_projected(
             kv_seq.contiguous(),
@@ -766,47 +770,24 @@ def _rebase_qli_picks(
     return torch.where(picks >= 0, picks + offset, torch.full_like(picks, -1)).to(torch.int32)
 
 
-def _picked_row_mask(idxs: torch.Tensor, num_rows: int) -> torch.Tensor:
-    """Row mask of each query's index picks, with static output shapes.
-
-    Equivalent to the nonzero formulation
-    ``row_mask[q, idxs[q, j]] = idxs[q, j] >= 0`` but ACL-graph-safe:
-    ``torch.nonzero`` and boolean-mask indexing produce data-dependent
-    output shapes (the pick count varies with window visibility and top-k
-    results across replays), which a captured graph cannot re-shape.
-    Instead the pick bits scatter into a mask one column wider and invalid
-    picks (-1, or past the gathered row count when the capacity bound is
-    narrower than a replay's context) route to the never-read dummy column;
-    duplicate picks write the same True bit.
-    """
-    picked = idxs >= 0
-    valid = picked & (idxs < num_rows)
-    safe_idxs = torch.where(valid, idxs, torch.full_like(idxs, num_rows))
-    wide_mask = torch.zeros(idxs.shape[0], num_rows + 1, dtype=torch.bool, device=idxs.device)
-    wide_mask.scatter_(1, safe_idxs, valid)
-    return wide_mask[:, :num_rows]
-
-
 def _window_visible_idxs(
     positions_seq: torch.Tensor,
-    col_pos: torch.Tensor,
-    cols: torch.Tensor,
+    previous_context: torch.Tensor,
     win: int,
 ) -> torch.Tensor:
-    """Per-query SWA window index matrix over the fixed-capacity window columns.
+    """Fixed chronological SWA picks into ``[win ring rows; current chunk]``.
 
-    The window columns are ``[win ring candidates ; current chunk]``: a ring
-    candidate's absolute position may be negative (before the sequence start)
-    and the chunk columns follow it. Query ``i`` sits at absolute position
-    ``positions_seq[i]`` and must see exactly the columns whose absolute
-    position lies in ``[max(p - win + 1, 0), p]`` -- a *per-query* lower bound
-    (only the chunk's first token shares the chunk-level
-    ``max(prev - win + 1, 0)``). Masked columns become the ``-1`` sentinel,
-    which :func:`_picked_row_mask` drops.
+    The caller gathers ring rows at increasing absolute positions
+    ``previous_context - win .. previous_context - 1`` before appending the
+    current chunk. Physical block IDs may wrap or be unordered; gather output
+    still follows the supplied positions, not physical block order.
+    Each query has exactly ``win`` columns independent of the chunk length.
+    Negative positions are padding; every real position maps to its ring or
+    current-chunk row. Keeping this reduction support fixed avoids summing
+    over additional masked columns as chunk/batch sizes change.
     """
-    window_lo = torch.clamp(positions_seq - win + 1, min=0)
-    valid = (col_pos.unsqueeze(0) >= window_lo.unsqueeze(-1)) & (col_pos.unsqueeze(0) <= positions_seq.unsqueeze(-1))
-    return torch.where(valid, cols.unsqueeze(0).expand(positions_seq.numel(), col_pos.numel()), -1)
+    window_positions = positions_seq.unsqueeze(-1) - win + 1 + torch.arange(win, device=positions_seq.device)
+    return torch.where(window_positions >= 0, window_positions - previous_context + win, -1)
 
 
 def _token_cache_slots(
@@ -1251,7 +1232,6 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         for state in self._qli_replay_states(dsa):
             self._refresh_qli_state(dsa, state)
 
-
     def _qli_replay_states(self, dsa: DsaMetadata) -> list[_QliGraphState]:
         """The QLI states matching one replay's (rows, capacity) bucket, if any."""
         key = (
@@ -1260,6 +1240,29 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         )
         state = self._qli_state.get(key)
         return [state] if state is not None else []
+
+    def _build_dsa_metadata_for_forward(self, metadata: Any, *, group_limit: int | None = None) -> DsaMetadata:
+        dsa = super()._build_dsa_metadata_for_forward(metadata, group_limit=group_limit)
+        if bool(getattr(metadata, "is_dummy", False)):
+            # The shared V4 builder gives empty-DP rows a synthetic 512-token
+            # context for native operator tiling. CSA2 runs tensor attention:
+            # that context would expose uninitialized reserved-block history.
+            # Retain one query row for collective symmetry, but no committed
+            # history or writes. These persistent values refresh on every
+            # graph replay, including empty -> active -> empty transitions.
+            dsa.seq_lens.zero_()
+            dsa.actual_seq_lengths_kv.zero_()
+            dsa.kv_cu_seq_lens.zero_()
+            dsa.max_seqlen_kv.zero_()
+            dsa.max_seq_len = 0
+            # Preserve start_pos = KV length - query length, including the
+            # synthetic query. CSA2 RoPE uses ctx.positions instead; negative
+            # history is clamped for gathers and masked before cache writes.
+            dsa.start_pos.copy_(-dsa.seq_lens_q)
+            for layer_slots in dsa.slot_mappings:
+                for slots in layer_slots:
+                    slots.fill_(-1)
+        return dsa
 
     def _build_precomputed_metadata(
         self,
@@ -1426,7 +1429,8 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # 4) Sparse attention over [window rows ; top-k compressed rows].
         output = self._csa2_attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared, cp_context)
         if defer_swa_write and layer_cache.swa is not None and swa_slot is not None:
-            _scatter_by_slot(layer_cache.swa, swa_slot, kv)
+            slots, values = last_ring_writes(swa_slot, kv)
+            _scatter_by_slot(layer_cache.swa, slots, values)
         return output
 
     # -- compressor ---------------------------------------------------------
@@ -1449,9 +1453,8 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         parking partial-group tokens in the state ring (reference model.py:458-485,
         chunked-prefill generalization per the semantics doc section 4).
 
-        ACL-graph safety: parking runs unconditionally (a completed group's
-        members are never re-read from the ring, so the extra writes are
-        harmless) and the commit uses a fixed ``q_len // ratio + 1`` row
+        ACL-graph safety: at most ``ratio - 1`` tail rows per sequence are
+        parked with a tensor mask; commits use a fixed ``q_len // ratio + 1`` row
         capacity per sequence with a tensor ``commit_mask``; member values are
         selected between the current chunk and the parked ring with
         ``torch.where`` instead of host branches, and every cache slot is
@@ -1476,6 +1479,10 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         slot_masks: list[torch.Tensor] = []
         token_offset = 0
         for seq, q_len in enumerate(q_lens):
+            if q_len == 0:
+                # No chunk members exist to pool or park for this request.
+                # Decode graphs retain one synthetic row instead.
+                continue
             ctx_len = ctx_lens[seq]
             prev_ctx = ctx_len - q_len
             # Padded graph rows (ctx <= 0) stay fully inert: no parking, no
@@ -1526,6 +1533,9 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                             dsa, layer_id, mapping.ori_cache_idx, self._swa_ring_blocks
                         )
                         if block_table is not None and reason is None:
+                            # Empty-DP tables contain only zero/padding blocks:
+                            # even start_pos=-1 resolves block 0, protected by
+                            # the Triton pool/write kernels before state access.
                             triton_pooled = _v41_compressor_pool_triton(
                                 kv_seq,
                                 score_seq,
@@ -1540,6 +1550,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                                     state_rows,
                                     rounding_mode="floor",
                                 ),
+                                output_dtype=torch.float32 if ctx.x.dtype == torch.float32 else torch.bfloat16,
                             )
                             if triton_pooled is None:
                                 reason = "op declined"
@@ -1772,10 +1783,15 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 token_offset += q_len
                 continue
             index_k = self._gather_cache_rows(index_cache, block_table, seq, capacity, block_size)
+            # Capacity gathers may read uninitialized tail rows. Mask their
+            # values before math, not only the later attention/indexer scores.
+            committed_rows = torch.arange(capacity, device=q_idx.device) < committed
+            index_k = torch.where(committed_rows.unsqueeze(-1), index_k, 0)
             # The index plane is always INT8 (NPU platform policy): the cache
             # holds per-row codes; dequantize with the per-token scale plane
             # (same physical slots, gathered the same way).
             index_scales = self._gather_cache_rows(shared.index_scale, block_table, seq, capacity, block_size)
+            index_scales = torch.where(committed_rows.unsqueeze(-1), index_scales, 0)
             index_k = index_k.float() * index_scales.float()
             # A compressed group is visible to query p once p has passed its
             # last token: visible(p) = (p + 1) // ratio (model.py:562-567);
@@ -2471,19 +2487,22 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 # Profiling / warmup batches carry no block tables: keep the
                 # traced shapes intact with zeros; the mask below drops them.
                 ring_rows = q.new_zeros((win, kv_seq.size(-1)))
+            # The production ring is allocated with empty(), not zeros().
+            # Negative history candidates (and padded graph requests) are not
+            # real KV. Masking only scores is insufficient: 0 * NaN in the
+            # value reduction still poisons every output, even on first prefill.
+            ring_rows = torch.where((ring_pos >= 0).unsqueeze(-1), ring_rows, 0)
+            kv_seq = torch.where(global_ctx_lens[seq] > 0, kv_seq, 0)
             window_kv = torch.cat((ring_rows, kv_seq), dim=0)
-            n_w = window_kv.size(0)
             # Window index matrix: query p (position prev+i) sees exactly the
             # window rows whose absolute position lies in
             # [max(p - win + 1, 0), p]; the lower bound tightens with the query
             # (only the chunk's first token shares the chunk-level bound).
             positions_seq = prev_ctx + torch.arange(q_len, device=q.device)
-            chunk_positions = (
-                positions_seq if cp_context is None else global_prev_ctx + torch.arange(global_q_len, device=q.device)
-            )
-            col_pos = torch.cat((ring_pos, chunk_positions), dim=0)
-            cols = torch.arange(n_w, device=q.device)
-            window_idxs = _window_visible_idxs(positions_seq, col_pos, cols, win)
+            # Fixed, chronological window picks avoid reducing over every
+            # masked column of a variable-size chunk. Negative history is
+            # padding; all other picks map into [ring candidates ; chunk].
+            window_idxs = _window_visible_idxs(positions_seq, global_prev_ctx, win)
 
             # Compressed rows for the top-k picks (shared group cache),
             # gathered at the committed capacity; padding rows are unreachable
@@ -2509,6 +2528,9 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                     capacity,
                     shared_key_cache.size(1),
                 )
+                committed = torch.div(ctx_len, ratio, rounding_mode="floor")
+                valid_rows = torch.arange(capacity, device=q.device) < committed
+                compress_kv = torch.where(valid_rows.unsqueeze(-1), compress_kv, 0)
             if compress_kv is not None:
                 assert topk is not None
                 kv_cat = torch.cat((window_kv, compress_kv), dim=0)
@@ -2521,42 +2543,35 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             else:
                 kv_cat = window_kv
                 idxs = window_idxs
-            kv_cat_f = kv_cat.to(torch.float32)
-            # Empty/padded DP-shard rows carry a context length but no written
-            # SWA history, so the gathered ring rows read uninitialized HBM and
-            # come back as NaN/Inf or huge *finite* garbage. Clear the
-            # non-finite entries and bound everything to the magnitude of the
-            # always-written current-token rows (kv_seq): a real row's history
-            # is in range already (no-op for it), a fake row becomes finite
-            # instead of poisoning the softmax and the DP-gathered MoE. Derive
-            # the bound from a *sanitized* kv_seq so a non-finite
-            # current-token row cannot make the bound itself NaN.
-            kv_seq_f = torch.nan_to_num(kv_seq.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
-            bound = kv_seq_f.abs().amax().clamp_min(1.0) * 32.0
-            kv_cat_f = torch.nan_to_num(kv_cat_f, nan=0.0, posinf=0.0, neginf=0.0)
-            kv_cat_f = kv_cat_f.clamp(-bound, bound)
-            # Each query attends exactly the rows its index list selects
-            # (window picks + compressed top-k picks), while the gathered
-            # tensor holds every committed row: expand the per-query index
-            # list into a row mask with static shapes (see _picked_row_mask)
-            # so the block replays inside a captured ACL graph.
-            row_mask = _picked_row_mask(idxs, kv_cat.size(0))
-
-            for tile_start in range(0, q_len, _ATTENTION_QUERY_TILE):
-                tile_end = min(tile_start + _ATTENTION_QUERY_TILE, q_len)
-                scores = torch.einsum("shd,nd->shn", q_seq[tile_start:tile_end].to(torch.float32), kv_cat_f)
+            # Keep top-k padding width independent of committed capacity.
+            # Padding and unreachable cache rows are zeroed before *any* math:
+            # score masking alone cannot stop 0 * NaN in the value reduction.
+            pick_width = win + (self.index_topk if ratio > 0 else 0)
+            idxs = torch.nn.functional.pad(idxs, (0, pick_width - idxs.size(-1)), value=-1)
+            # Shape-only budget: no device reads or data-dependent graph branch.
+            # Keep every query's picks/reduction unchanged; split query rows only.
+            kv_bytes_per_query = 2 * pick_width * head_dim * 4
+            query_tile = max(1, min(_ATTENTION_QUERY_TILE, _ATTENTION_KV_TILE_BYTES // kv_bytes_per_query))
+            for tile_start in range(0, q_len, query_tile):
+                tile_end = min(tile_start + query_tile, q_len)
+                picks = idxs[tile_start:tile_end].to(torch.int64)
+                valid = (picks >= 0) & (picks < kv_cat.size(0))
+                picked_kv = kv_cat[picks.clamp(0, kv_cat.size(0) - 1)].float()
+                picked_kv = torch.where(valid.unsqueeze(-1), picked_kv, 0)
+                scores = torch.einsum("shd,snd->shn", q_seq[tile_start:tile_end].float(), picked_kv)
                 scores = scores * self.scale
-                scores = scores.masked_fill(~row_mask[tile_start:tile_end].unsqueeze(1), float("-inf"))
+                scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
                 row_max = scores.amax(dim=-1).clamp_min(_NEG_INF_FLOOR)
                 probs = torch.exp(scores - row_max.unsqueeze(-1))
                 # The sink adds exp(sink - row_max) to the normalizer only.
                 sum_exp = probs.sum(dim=-1) + torch.exp(sinks - row_max)
-                tile_out = torch.einsum("shn,nd->shd", probs, kv_cat_f)
+                tile_out = torch.einsum("shn,snd->shd", probs, picked_kv)
                 tile_out = tile_out / sum_exp.unsqueeze(-1)
                 out[token_offset + tile_start : token_offset + tile_end] = tile_out.to(q.dtype)
+                # Do not retain this large tensor during the next tile's gather.
+                del picked_kv
             token_offset += q_len
         return out
-
 
     # -- cache gather helpers -------------------------------------------------
 
@@ -2625,8 +2640,10 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         positions: torch.Tensor,
         block_size: int,
     ) -> torch.Tensor:
-        """Read ring rows by absolute position (SWA-group slot semantics).
+        """Read ring rows in the supplied absolute-position order.
 
+        Each position resolves its own physical slot; index_select preserves
+        that order even when block IDs wrap or are non-monotonic.
         Unassigned blocks clamp to block 0: the resulting garbage rows are
         produced only for out-of-window / padded candidates whose mask keeps
         them out of every score, but the clamped gather never indexes below

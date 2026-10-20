@@ -1139,6 +1139,8 @@ def test_qli_v3_fallback_and_active_logging_is_one_shot(monkeypatch: pytest.Monk
     csa2._log_qli_v3_active()
     csa2._log_qli_v3_active()
     assert len([message for message in spy.infos if "QLI v3" in message]) == 1
+
+
 # ---------------------------------------------------------------------------
 # 5c) native ``xllm_ops`` QLI v3 op resolver
 # ---------------------------------------------------------------------------
@@ -1348,6 +1350,8 @@ def _reference_rebase(
         sortable = sortable.sort(dim=-1).values
     picks = torch.where(sortable >= sentinel, torch.full_like(sortable, -1), sortable)
     return torch.where(picks >= 0, picks + offset, torch.full_like(picks, -1)).to(torch.int32)
+
+
 def test_qli_rebase_always_matches_the_sorted_reference() -> None:
     """The reverted helper sorts unconditionally (bitwise the sorted reference)."""
     generator = torch.Generator().manual_seed(0)
@@ -1371,22 +1375,6 @@ def test_qli_rebase_ignores_the_removed_no_sort_env(
     assert not hasattr(csa2, "_qli_picks_no_sort_enabled")
 
 
-def test_qli_picks_order_does_not_change_pure_torch_contract() -> None:
-    """Unsorted picks build an identical pure-torch mask (scatter is order-free).
-    This only covers ``_picked_row_mask``, the pure-torch tail."""
-    picks = torch.tensor([[3, 0, -1, 7, 1], [2, 1, -1, -1, -1]], dtype=torch.int32)
-    visible = torch.tensor([[4], [2]], dtype=torch.int32)
-    offset = 16
-
-    sorted_picks = csa2._rebase_qli_picks(picks, visible, offset=offset)
-    unsorted_picks = _reference_rebase(picks, visible, offset, sort=False)
-    assert not torch.equal(sorted_picks, unsorted_picks)  # order really differs
-
-    num_rows = offset + int(visible.max())
-    assert torch.equal(
-        csa2._picked_row_mask(sorted_picks, num_rows),
-        csa2._picked_row_mask(unsorted_picks, num_rows),
-    )
 # ---------------------------------------------------------------------------
 # 8) QLI v3 prefill extension (default ON; kept A/B switches)
 # ---------------------------------------------------------------------------
@@ -1705,5 +1693,3 @@ def test_qli_v3_prefill_leaves_decode_graph_steps_on_the_decode_path(
     assert recorder.metadata_calls[0][1]["max_seqlen_q"] == 1
     assert recorder.metadata_calls[0][1]["max_seqlen_k"] == _CAPACITY
     assert recorder.indexer_calls[0]["cu_seqlens_q"].tolist() == [0, 1, 2, 3, 4]
-
-

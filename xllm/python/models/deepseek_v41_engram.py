@@ -59,6 +59,7 @@ from typing import Any, Callable, Sequence
 import torch
 import torch.nn as nn
 
+from xllm.python.attention.dsa_metadata import last_ring_writes
 from xllm.python.model_executor.forward_context import in_acl_graph
 from xllm.python.models.engram_shared_memory import SharedHostEngramStorage
 
@@ -67,6 +68,8 @@ ENGRAM_DEAD_ID = -1
 # Image sentinel / padding token ids that break an n-gram (mm_preprocess.py).
 ENGRAM_IMAGE_SENTINEL_BASE_ID = 129264
 ENGRAM_IMAGE_PAD_ID = 129265
+
+
 # Signed-sqrt clamp of the gate input (reference kernel clamp_value).
 _ENGRAM_GATE_CLAMP = 1e-6
 
@@ -497,9 +500,6 @@ class EngramHashState(nn.Module):
         output = torch.zeros(num_tokens, num_layers, self.layout.n_hash_cols, dtype=torch.int32, device=device)
         if num_tokens == 0:
             return output
-        if slot_mapping is not None and self._cache is not None:
-            self._write_hash_cache(input_ids, dead_mask, slot_mapping)
-
         pos = positions.reshape(-1).to(torch.int64)
         ids = input_ids.reshape(-1).to(torch.int64)
         req = self._sequence_index(pos, query_start_loc)
@@ -536,18 +536,40 @@ class EngramHashState(nn.Module):
                 offset = self.offsets[:, lo : lo + n_heads]  # [L, n_heads]
                 hashed = rolling.unsqueeze(-1) % prime.unsqueeze(0) + offset.unsqueeze(0)
                 output[:, :, lo : lo + n_heads] = hashed.to(torch.int32)
+        # The first n-grams in a chunk may still read the previous ring tail.
+        # Publish current ids only after those lookbacks have been consumed;
+        # a chunk longer than the ring must not overwrite its own history.
+        if slot_mapping is not None and self._cache is not None:
+            self._write_hash_cache(
+                comp,
+                slot_mapping,
+                # Eager chunks may revisit a physical ring slot, including
+                # mixed batches whose empty rows hide that fact from aggregate
+                # token counts. Graph decode/verify uses fixed row-aligned
+                # slots: active writes must be distinct; padded rows use -1.
+                deduplicate=not in_acl_graph(),
+            )
         return output
 
     def _write_hash_cache(
         self,
-        input_ids: torch.Tensor,
-        dead_mask: torch.Tensor,
+        comp: torch.Tensor,
         slot_mapping: torch.Tensor,
+        *,
+        deduplicate: bool = False,
     ) -> None:
+        """Publish resolved ids; graph callers supply distinct nonnegative slots.
+
+        Repeated padding slots are allowed: they write the same preserved
+        value to reserved slot 0. Arbitrary conflicting active slots are not
+        a supported graph input; eager chunks select their last valid writes.
+        """
         assert self._cache is not None
-        comp = self.token_map[input_ids.reshape(-1).to(torch.int64)]
-        comp = torch.where(dead_mask.reshape(-1), ENGRAM_DEAD_ID, comp).to(torch.int32)
+        # Reuse the resolved ids, including clamping and dead-token masking.
+        comp = comp.reshape(-1).to(torch.int32)
         slots = slot_mapping.reshape(-1).to(torch.int64)
+        if deduplicate:
+            slots, comp = last_ring_writes(slots, comp)
         valid = slots >= 0
         safe = torch.where(valid, slots, torch.zeros_like(slots))
         keep = self._cache.index_select(0, safe)
@@ -626,7 +648,10 @@ class EngramHashState(nn.Module):
         """
         assert self._cache is not None
         table_cols = block_table.shape[1]
-        clamped = lookback.clamp(0, table_cols * swa_block_size - 1)
+        # Ring positions are absolute: only negative lookbacks are padding.
+        # Clamping the upper bound aliases every later position to the final
+        # slot when the table contains just the physical ring columns.
+        clamped = lookback.clamp_min(0)
         col = torch.div(clamped, swa_block_size, rounding_mode="floor") % table_cols
         req_safe = req.clamp(0, block_table.shape[0] - 1)
         block = block_table.to(torch.int64)[req_safe, col]
