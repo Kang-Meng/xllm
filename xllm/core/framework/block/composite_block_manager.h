@@ -66,10 +66,7 @@ class CompositeBlockManager : public BlockManager {
     UNSUPPORTED,
   };
 
-  enum class PrefixCachePublishMode : int8_t {
-    AUTOMATIC,
-    EXPLICIT,
-  };
+  using PrefixCachePublishMode = ::xllm::PrefixCachePublishMode;
 
   CompositeBlockManager(
       LeafMap leaves,

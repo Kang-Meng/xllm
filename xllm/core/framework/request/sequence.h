@@ -218,13 +218,6 @@ class Sequence final {
                      effective_restore_tokens_.value_or(0)});
   }
 
-  size_t last_confirmed_cached_tokens_num() const {
-    return last_confirmed_cached_tokens_num_;
-  }
-  void set_last_confirmed_cached_tokens_num(size_t num_tokens) {
-    last_confirmed_cached_tokens_num_ = num_tokens;
-  }
-
   size_t accepted_length() const { return accepted_length_; }
   void set_accepted_length(size_t length) { accepted_length_ = length; }
 
@@ -290,33 +283,20 @@ class Sequence final {
   // Precomputed chained block hashes used by the prefix cache. Covers all full
   // blocks with available token dependencies; reused by match()/insert() so the
   // hash is computed once per sequence instead of recomputed on every call.
-  // Returns the chain for the stride set by the most recent
-  // update_block_hashes() call.
-  Slice<XXH3Key> block_hashes() const;
+  // Returns the chain stored for `block_size`, including the LINEAR checkpoint
+  // chain when that leaf uses the same stride.
+  Slice<XXH3Key> block_hashes(uint32_t block_size) const;
 
   // MTP identity must never include overlap placeholders or unverified tokens.
   Slice<int32_t> hash_tokens(BlockHasherType hasher_type) const;
 
   // Extend the per-stride chain for `block_size` to cover any newly completed
-  // full blocks, and select it as the one block_hashes() returns. Cheap (no-op)
-  // when no new full block is available, so it is safe to call before every
-  // match()/cache(). DSV4 admission probes SWA / C4 / C128 back-to-back with
-  // different strides (base / 4*base / 128*base); each stride keeps its own
-  // chain so switching strides no longer discards and rebuilds the whole chain.
+  // full blocks. Cheap (no-op) when no new full block is available, so it is
+  // safe to call before every match()/cache(). DSV4 admission probes SWA / C4 /
+  // C128 back-to-back with different strides (base / 4*base / 128*base); each
+  // stride keeps its own chain so switching strides no longer discards and
+  // rebuilds the whole chain. LINEAR checkpoints use this same table.
   void update_block_hashes(uint32_t block_size, BlockHasherType hasher_type);
-
-  // Precomputed chained per-chunk hashes for the linear-state checkpoint index.
-  // Separate hash domain from the KV block-hash chains: the stride is one
-  // prefill chunk (a multiple of the KV block size), not a KV block, so a
-  // linear checkpoint is a sparse overlay on the per-block KV cache. Consumed
-  // by the batch builder (save/restore boundaries) and the LINEAR leaf's match
-  // probe.
-  Slice<XXH3Key> linear_state_hashes() const { return linear_state_hashes_; }
-
-  // Extend `linear_state_hashes_` to cover any newly completed full chunks at
-  // the given stride. Cheap (no-op) when no new full chunk is available, so it
-  // is safe to call before every match()/save-boundary check.
-  void update_linear_state_hashes(uint32_t block_size);
 
   // Whether the prefill stage has been cached.
   bool if_cache_block_for_prefill() {
@@ -408,6 +388,7 @@ class Sequence final {
   }
 
   KVCacheState& kv_state() { return kv_state_; }
+  const KVCacheState& kv_state() const { return kv_state_; }
 
   bool has_any_blocks() const {
     return kv_state_.has_any_blocks() || host_kv_state_.has_any_blocks();
@@ -545,10 +526,6 @@ class Sequence final {
   // `token_index` was rewritten (beam search / speculative / disagg PD).
   void invalidate_block_hashes_from(size_t token_index);
 
-  // Same as above for the linear-state hash domain: drop cached chunk hashes
-  // from the chunk containing `token_index` onward.
-  void invalidate_linear_state_hashes_from(size_t token_index);
-
   // Number of tokens available to the decoder after applying stop-output
   // suppression and streaming buffering. The underlying sequence retains all
   // generated tokens for usage and scheduling accounting.
@@ -590,10 +567,6 @@ class Sequence final {
 
   std::optional<size_t> effective_restore_tokens_;
   size_t host_cache_copy_units_ = 0;
-
-  // Real-result cursor used by LINEAR decode rolling. Sequence result commits
-  // update it; builder pre-advancement and overlap placeholders do not.
-  size_t last_confirmed_cached_tokens_num_ = 0;
 
   // Maximum accepted draft offset in the most recent sample. A regular decode
   // target occupies offset zero, so it records zero here.
@@ -675,19 +648,7 @@ class Sequence final {
   // other strides.
   std::map<uint32_t, std::vector<XXH3Key>> block_hashes_by_stride_;
 
-  // Stride selected by the most recent update_block_hashes() call; keys
-  // block_hashes() into `block_hashes_by_stride_` (0 until first computed).
-  uint32_t hash_block_size_ = 0;
   BlockHasherType hash_type_ = BlockHasherType::TEXT;
-
-  // Precomputed chained per-chunk hashes for the linear-state checkpoint index
-  // (own hash domain, chunk-strided). Extended incrementally, invalidated on
-  // token rewrite; see linear_state_hashes()/update_linear_state_hashes().
-  std::vector<XXH3Key> linear_state_hashes_;
-
-  // Chunk stride used to compute `linear_state_hashes_` (0 until first
-  // computed).
-  uint32_t linear_hash_stride_ = 0;
 
   std::optional<OneRecState> onerec_state_;
 

@@ -37,12 +37,7 @@ std::optional<size_t> last_decode_step_checkpoint_row(const Sequence& sequence,
 
 class LinearStateBlockManager final : public BlockManagerImpl {
  public:
-  explicit LinearStateBlockManager(uint32_t num_slots,
-                                   int32_t chunk_stride,
-                                   bool enable_prefix_cache = true,
-                                   bool instance_is_decode = false,
-                                   uint32_t num_speculative_tokens = 0,
-                                   bool preserve_decode_checkpoint = false);
+  explicit LinearStateBlockManager(const Options& options);
   ~LinearStateBlockManager() override = default;
 
   std::optional<std::vector<Block>> allocate_for_sequence(
@@ -68,17 +63,10 @@ class LinearStateBlockManager final : public BlockManagerImpl {
   using BlockManagerImpl::cache;
 
  private:
-  void cache_read_source(Sequence* seq, KVCacheState& kv_state);
-  void retain_read_source(KVCacheState& kv_state);
   std::optional<std::vector<Block>> allocate_prefill(Sequence* seq,
                                                      KVCacheState& kv_state);
   std::optional<std::vector<Block>> allocate_decode(Sequence* seq,
                                                     KVCacheState& kv_state);
-
-  // Host offload consumes a completed Decode checkpoint after both the HBM
-  // and Host leaves finish allocation. Keep the source in the rolling vector
-  // until HierarchyBlockManagerPool moves it into an OffloadBlockPair.
-  bool preserve_decode_checkpoint_ = false;
 
   friend class BlockManagerPoolTestPeer;
 };

@@ -345,8 +345,7 @@ void UnifiedPolicy::schedule_from_unified_queue(
     // No enough memory to preempt.
     if (candidate_sequences.empty() && state.running_sequences.empty()) {
       if (state.kv_cache_manager->has_pending_async_block_release()) {
-        VLOG(1) << "[HostCache][AdmissionDeferred] request="
-                << request->request_id()
+        VLOG(1) << "[AdmissionDeferred] request=" << request->request_id()
                 << " waiting for asynchronous block release";
       } else {
         LOG(ERROR)

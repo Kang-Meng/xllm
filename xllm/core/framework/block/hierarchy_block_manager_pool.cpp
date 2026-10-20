@@ -449,14 +449,14 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
       if (type == BlockType::SWA) {
         leaf = std::make_unique<SlidingWindowBlockManager>(host_options);
       } else if (type == BlockType::LINEAR) {
-        leaf = std::make_unique<LinearStateBlockManager>(
-            num_blocks,
-            host_options.block_size(),
-            host_options.enable_prefix_cache(),
-            host_options.instance_is_decode(),
-            host_options.num_speculative_tokens(),
+        host_options.num_blocks(num_blocks);
+        host_options.block_type(BlockType::LINEAR);
+        host_options.preserve_decode_checkpoint(
             host_options.instance_is_decode() &&
-                options_.enable_host_offload());
+            options_.enable_host_offload());
+        host_options.prefix_cache_publish_mode(
+            PrefixCachePublishMode::EXPLICIT);
+        leaf = std::make_unique<LinearStateBlockManager>(host_options);
       } else {
         leaf = std::make_unique<BlockManagerImpl>(host_options);
       }
@@ -549,86 +549,52 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
               << " host_tokens=" << host_state.kv_cache_tokens_num()
               << " hbm_blocks=" << hbm_blocks->size()
               << " host_blocks=" << host_blocks->size();
+      auto two_valid_blocks = [](const std::vector<Block>* blocks) {
+        return blocks->size() == 2 && blocks->front().is_valid() &&
+               blocks->back().is_valid();
+      };
+      if (!two_valid_blocks(hbm_blocks) || !two_valid_blocks(host_blocks)) {
+        continue;
+      }
+
+      // Both stages offload the front slot. Prefill's front slot is the
+      // completed chunk. Decode offloads only after the latest step crossed
+      // a checkpoint, and that step's row selects the linear-state row.
+      size_t checkpoint_row = 0;
       if (!sequence->is_prefill_stage()) {
-        const size_t confirmed_tokens =
-            sequence->last_confirmed_cached_tokens_num();
-        const std::optional<size_t> checkpoint_row =
+        const size_t cached_tokens = hbm_state.kv_cache_tokens_num();
+        const std::optional<size_t> crossed_row =
             last_decode_step_checkpoint_row(*sequence, block_size);
-        const bool hbm_checkpoint_ready =
-            checkpoint_row.has_value() && hbm_blocks->size() == 2 &&
-            hbm_blocks->front().is_valid() && hbm_blocks->back().is_valid();
-        const bool host_checkpoint_ready = host_blocks->size() == 2 &&
-                                           host_blocks->front().is_valid() &&
-                                           host_blocks->back().is_valid();
-        if (!hbm_checkpoint_ready || !host_checkpoint_ready) {
+        if (!crossed_row.has_value() || cached_tokens < block_size) {
           continue;
         }
+        checkpoint_row = crossed_row.value();
+      }
 
-        const size_t checkpoint_count = confirmed_tokens / block_size;
-        CHECK_GT(checkpoint_count, 0u);
-        const size_t checkpoint_index = checkpoint_count - 1;
-        sequence->update_linear_state_hashes(static_cast<uint32_t>(block_size));
+      Block& hbm_source = hbm_blocks->front();
+      if (!sequence->is_prefill_stage()) {
+        const size_t checkpoint_index =
+            hbm_state.kv_cache_tokens_num() / block_size - 1;
+        sequence->update_block_hashes(static_cast<uint32_t>(block_size),
+                                      BlockHasherType::TEXT);
         const Slice<XXH3Key> checkpoint_hashes =
-            sequence->linear_state_hashes();
+            sequence->block_hashes(static_cast<uint32_t>(block_size));
         CHECK_GT(checkpoint_hashes.size(), checkpoint_index);
-        hbm_blocks->front().set_hash_value(
-            checkpoint_hashes[checkpoint_index].data);
-
-        auto pair = std::make_shared<OffloadBlockPair>();
-        pair->src = std::move(hbm_blocks->front());
-        pair->dst = std::move(host_blocks->front());
-        pair->block_type = BlockType::LINEAR;
-        pair->checkpoint_row = checkpoint_row.value();
-        pair->dst.set_hash_value(pair->src.get_immutable_hash_value());
-        CHECK(!hbm_blocks->front().is_valid());
-        CHECK(!host_blocks->front().is_valid());
-
-        // The pair, rather than either rolling vector, owns both blocks until
-        // the asynchronous D2H completion releases or publishes them.
-        hbm_blocks->erase(hbm_blocks->begin());
-        host_blocks->erase(host_blocks->begin());
-        hbm_state.set_shared_blocks_num(BlockType::LINEAR, 0);
-        host_state.set_shared_blocks_num(BlockType::LINEAR, 0);
-        offload_block_pair_queues_[dp_rank].enqueue(std::move(pair));
-        queued_offload = true;
-        continue;
+        hbm_source.set_hash_value(checkpoint_hashes[checkpoint_index].data);
       }
 
-      if (hbm_blocks->empty()) {
-        continue;
-      }
+      auto pair = std::make_shared<OffloadBlockPair>();
+      pair->src = hbm_source;
+      pair->dst = std::move(host_blocks->front());
+      pair->block_type = BlockType::LINEAR;
+      pair->checkpoint_row = checkpoint_row;
+      pair->dst.set_hash_value(pair->src.get_immutable_hash_value());
+      CHECK(hbm_blocks->front().is_valid());
+      CHECK(!host_blocks->front().is_valid());
 
-      const size_t hbm_cached_tokens = hbm_state.kv_cache_tokens_num();
-      // Host already covers an equal restore boundary or has reserved its
-      // D2H checkpoint. Only a checkpoint ahead of Host needs writeback.
-      if (host_cached_tokens >= hbm_cached_tokens || hbm_blocks->size() <= 1) {
-        continue;
-      }
-
-      // Prefill keeps at most two LINEAR slots: blocks[0] is the completed
-      // checkpoint being read by the current chunk, while back() is the live
-      // write destination. Only the former is eligible for Host offload.
-      const size_t source_index = 0;
-
-      Block& hbm_block = (*hbm_blocks)[source_index];
-      if (!hbm_block.is_valid()) {
-        continue;
-      }
-      if (host_blocks->size() <= 1 || !host_blocks->front().is_valid()) {
-        continue;
-      }
-      // Host allocation follows the same two-slot rolling pattern. The first
-      // slot is the restore destination for this checkpoint; back() remains
-      // the next forward write slot.
-      Block& host_destination = host_blocks->front();
-      host_destination.set_hash_value(hbm_block.get_immutable_hash_value());
-      auto pair = std::make_shared<OffloadBlockPair>(
-          OffloadBlockPair{/*src=*/hbm_block,
-                           /*dst=*/host_destination,
-                           /*block_type=*/BlockType::LINEAR,
-                           /*checkpoint_row=*/0});
       VLOG(1) << "[HostCache][LinearOffloadEnqueue] seq=" << sequence->seq_id()
-              << " src=" << hbm_block.id() << " dst=" << host_destination.id();
+              << " src=" << pair->src.id() << " dst=" << pair->dst.id()
+              << " row=" << pair->checkpoint_row;
       offload_block_pair_queues_[dp_rank].enqueue(std::move(pair));
       queued_offload = true;
       continue;
@@ -656,7 +622,7 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
     if (needs_sequence_hash) {
       sequence->update_block_hashes(static_cast<uint32_t>(block_size),
                                     hasher_type);
-      hashes = sequence->block_hashes();
+      hashes = sequence->block_hashes(static_cast<uint32_t>(block_size));
       completed_blocks = std::min(completed_blocks, hashes.size());
     }
     const size_t comparable_blocks =
@@ -870,6 +836,16 @@ void HierarchyBlockManagerPool::collect_load_block_transfer_infos(
 
       Block& restore_block = (*hbm_blocks)[0];
       restore_block.set_hash_value(host_source->get_immutable_hash_value());
+      // The loaded HBM slot is the checkpoint for this prefix. Publish it so
+      // the next HBM match can hit the block just restored from Host.
+      auto* hbm_manager =
+          static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
+      const auto hbm_linear = hbm_manager->leaf_entries().find(type);
+      CHECK(hbm_linear != hbm_manager->leaf_entries().end());
+      std::vector<Block> publish_blocks{restore_block};
+      hbm_linear->second.leaf->cache(publish_blocks);
+      VLOG(1) << "[HostCache][LinearLoadEnqueue] seq=" << sequence->seq_id()
+              << " src=" << host_source->id() << " dst=" << restore_block.id();
       load_infos.emplace_back(host_source->id(),
                               restore_block.id(),
                               host_source->get_immutable_hash_value(),
@@ -1070,29 +1046,22 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
   const size_t unit_size = prefetch_unit_size(combination, host_leaves);
   const size_t max_prefix_tokens =
       sequence->tokens().empty() ? 0 : sequence->tokens().size() - 1;
-  size_t cacheable_tokens = max_prefix_tokens;
-  for (const auto& [type, entry] : host_leaves) {
-    const BlockHasherType hasher_type = entry.leaf->options().hasher_type();
-    const size_t block_size = entry.leaf->block_size();
-    const size_t hashable_tokens =
-        num_hash_blocks(hasher_type,
-                        sequence->hash_tokens(hasher_type).size(),
-                        block_size) *
-        block_size;
-    cacheable_tokens = std::min(cacheable_tokens, hashable_tokens);
-  }
-  const size_t target_tokens = (cacheable_tokens / unit_size) * unit_size;
+  const size_t target_tokens = (max_prefix_tokens / unit_size) * unit_size;
 
   // Host admission owns the shared-prefix probe and cross-leaf trim. Keep
   // that transaction in the composite so prefetch sees the same shared
   // cursors as ordinary Host prefix-cache admission.
   host_manager->allocate_shared_for_sequence(sequence,
                                              sequence->host_kv_state());
-  // Composite admission has completed the physical shared probe, but the
-  // Host tier is not publishable until the Store callback validates the
-  // requested units. Keep the tier-match flag private to this transaction.
-  sequence->host_kv_state().set_prefix_cache_matched(false);
   const size_t base_tokens = sequence->host_kv_state().kv_cache_tokens_num();
+  // Host already covers every cacheable token. Nothing remains to fetch.
+  if (base_tokens >= target_tokens) {
+    done(std::move(request));
+    const size_t previous =
+        prefetching_requests_.fetch_sub(1, std::memory_order_acq_rel);
+    CHECK_GT(previous, 0u);
+    return;
+  }
 
   // Prefetch allocation is a Host-only transaction. Every leaf receives the
   // full target once. The resulting state vectors carry both the shared

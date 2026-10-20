@@ -327,8 +327,6 @@ Sequence::Sequence(const Sequence& other, size_t index)
       host_kv_state_(other.host_kv_state_),
       effective_restore_tokens_(other.effective_restore_tokens_),
       host_cache_copy_units_(other.host_cache_copy_units_),
-      last_confirmed_cached_tokens_num_(
-          other.last_confirmed_cached_tokens_num_),
       accepted_length_(other.accepted_length_),
       latest_generate_time_(other.latest_generate_time_),
       time_to_first_token_latency_seconds_(
@@ -349,10 +347,7 @@ Sequence::Sequence(const Sequence& other, size_t index)
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
       block_hashes_by_stride_(other.block_hashes_by_stride_),
-      hash_block_size_(other.hash_block_size_),
       hash_type_(other.hash_type_),
-      linear_state_hashes_(other.linear_state_hashes_),
-      linear_hash_stride_(other.linear_hash_stride_),
       onerec_state_(other.onerec_state_),
       json_object_state_(other.json_object_state_),
       volatile_num_prompt_tokens_(other.volatile_num_prompt_tokens_),
@@ -509,8 +504,6 @@ void Sequence::append_token(const Token& token) {
     return;
   }
 
-  set_last_confirmed_cached_tokens_num(cur_idx);
-
   // A real token was committed (overlap-fake placeholders returned above).
   ++generated_tokens_since_latency_;
   if (need_unique_tokens_) {
@@ -561,18 +554,12 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
 
   // A real token is committed here (one per call, including the extra accepted
   // MTP token when token_offset > 0); preempted MTP steps returned above.
-  // kv_cache_tokens_num may already include later overlap placeholders, while
-  // cur_generated_token_idx_ identifies this result's confirmed cache cursor.
-  if (kv_state_.current_max_tokens_capacity() > 0) {
-    set_last_confirmed_cached_tokens_num(cur_generated_token_idx_);
-  }
   ++generated_tokens_since_latency_;
 
   tokens_[cur_generated_token_idx_] = token_id;
   // Overlap/MTP may rewrite tokens at decode positions; drop any cached block
   // hash from this position onward so it is recomputed when next needed.
   invalidate_block_hashes_from(cur_generated_token_idx_);
-  invalidate_linear_state_hashes_from(cur_generated_token_idx_);
   if (need_unique_tokens_) {
     token_to_count_map_[token_id]++;
   }
@@ -599,7 +586,6 @@ void Sequence::update_token(size_t index, const Token& token) {
   // A rewritten token invalidates the cached hash of its block and all
   // subsequent blocks; recompute lazily on the next update_block_hashes().
   invalidate_block_hashes_from(index);
-  invalidate_linear_state_hashes_from(index);
   if (need_unique_tokens_) {
     --token_to_count_map_[origin_token_id];
     ++token_to_count_map_[token_id];
@@ -964,7 +950,8 @@ void Sequence::fill_ctc_output(const Tokenizer& tokenizer,
   if (conf_it != mm_dict_.end()) {
     torch::Tensor confs;
     if (std::holds_alternative<std::vector<torch::Tensor>>(conf_it->second)) {
-      const auto& conf_vec = std::get<std::vector<torch::Tensor>>(conf_it->second);
+      const auto& conf_vec =
+          std::get<std::vector<torch::Tensor>>(conf_it->second);
       if (conf_vec.empty()) {
         return;
       }
@@ -1014,7 +1001,6 @@ void Sequence::reset() {
   kv_state_.reset();
   host_kv_state_.reset();
   clear_host_cache_match();
-  set_last_confirmed_cached_tokens_num(0);
   accepted_length_ = 0;
   volatile_num_prompt_tokens_ = num_tokens_;
 }
@@ -1024,8 +1010,8 @@ void Sequence::add_shared_host_blocks(BlockType type,
   host_kv_state_.add_shared_blocks(type, std::move(blocks), num_tokens_);
 }
 
-Slice<XXH3Key> Sequence::block_hashes() const {
-  const auto it = block_hashes_by_stride_.find(hash_block_size_);
+Slice<XXH3Key> Sequence::block_hashes(uint32_t block_size) const {
+  const auto it = block_hashes_by_stride_.find(block_size);
   if (it == block_hashes_by_stride_.end()) {
     return {};
   }
@@ -1054,8 +1040,7 @@ void Sequence::update_block_hashes(uint32_t block_size,
   // (base / 4*base / 128*base). Each stride keeps its own chain in
   // `block_hashes_by_stride_`, so switching strides extends that stride's chain
   // incrementally instead of discarding and rebuilding the whole prompt chain
-  // every probe. Select this stride as the one block_hashes() returns.
-  hash_block_size_ = block_size;
+  // every probe.
   const Slice<int32_t> tokens = hash_tokens(hasher_type);
   extend_prefix_hashes(hasher_type,
                        mm_data_,
@@ -1079,40 +1064,6 @@ void Sequence::invalidate_block_hashes_from(size_t token_index) {
     if (first_stale_block < hashes.size()) {
       hashes.resize(first_stale_block);
     }
-  }
-}
-
-void Sequence::update_linear_state_hashes(uint32_t block_size) {
-  if (block_size == 0) {
-    return;
-  }
-  linear_hash_stride_ = block_size;
-  // Cover only whole chunks; the trailing partial chunk carries no checkpoint.
-  // Fold multimodal content into the chunk digest whenever this sequence
-  // carries it, so a linear-state checkpoint keyed on a chunk that spans image
-  // tokens cannot collide with a text-only chunk (or a different image) at the
-  // same token boundary. The digest is chosen from mm_data_ rather than an
-  // engine-bound type because the linear hash is only ever computed here, in
-  // the sequence's own context, where mm_data_ is in hand -- and with an empty
-  // mm_data_ the MM hasher is byte-identical to TEXT, so text-only sequences
-  // are unaffected.
-  const BlockHasherType hasher_type =
-      mm_data_.valid() ? BlockHasherType::MM : BlockHasherType::TEXT;
-  extend_prefix_hashes(hasher_type,
-                       mm_data_,
-                       this->tokens(),
-                       block_size,
-                       /*boundary_blocks=*/num_tokens_ / block_size,
-                       linear_state_hashes_);
-}
-
-void Sequence::invalidate_linear_state_hashes_from(size_t token_index) {
-  if (linear_state_hashes_.empty() || linear_hash_stride_ == 0) {
-    return;
-  }
-  const size_t first_stale_chunk = token_index / linear_hash_stride_;
-  if (first_stale_chunk < linear_state_hashes_.size()) {
-    linear_state_hashes_.resize(first_stale_chunk);
   }
 }
 

@@ -852,12 +852,31 @@ void WorkerImpl::prepare_linear_state_cache(ModelInputParams& params) {
     CHECK(params.synchronize_all_layers())
         << "failed to wait for Host cache load before LINEAR state restore";
   }
+  const std::vector<int32_t>& write_ids = params.embedding.linear_state_ids;
+  const std::vector<int32_t>& read_ids = params.embedding.linear_state_read_ids;
+  const int32_t kernel_dim = context_.get_model_args().linear_conv_kernel_dim();
+  const int64_t conv_history_len =
+      kernel_dim > 1 ? static_cast<int64_t>(kernel_dim - 1) : 0;
+  std::vector<int32_t> accepted_rows;
+  if (!reads_distinct_state) {
+    accepted_rows.assign(write_ids.size(), 0);
+    if (!params.num_accepted_tokens_host.empty()) {
+      CHECK_EQ(params.num_accepted_tokens_host.size(), write_ids.size())
+          << "accepted token counts must match linear-state rows";
+      for (size_t row = 0; row < write_ids.size(); ++row) {
+        accepted_rows[row] =
+            static_cast<int32_t>(params.num_accepted_tokens_host[row] - 1);
+      }
+    }
+  }
   // TODO: need remove when all device support none D2D
   restore_linear_state_slots(kv_caches_,
-                             params.embedding.linear_state_ids,
-                             params.embedding.linear_state_read_ids,
+                             write_ids,
+                             read_ids,
                              params.linear_state_validity_mask,
-                             reads_distinct_state);
+                             reads_distinct_state,
+                             accepted_rows,
+                             conv_history_len);
 #endif
 }
 

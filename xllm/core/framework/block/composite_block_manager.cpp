@@ -38,8 +38,8 @@ namespace {
 constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
 constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
 
-// KV completion bounds the block contents; confirmed tokens independently
-// provide the hasher's lookahead. The lookahead token needs no completed KV.
+// KV completion bounds the block contents. The hasher's lookahead token needs
+// no completed KV.
 size_t publishable_tokens(const Sequence& seq, const BlockManager& leaf) {
   const BlockHasherType type = leaf.options().hasher_type();
   const size_t token_count = seq.hash_tokens(type).size();
@@ -71,7 +71,7 @@ void publish_blocks(Sequence* seq,
              *blocks,
              begin,
              seq->mm_data(),
-             seq->block_hashes());
+             seq->block_hashes(static_cast<uint32_t>(block_size)));
   kv.set_num_cached_blocks(type, end);
 }
 
@@ -236,17 +236,19 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     const int32_t linear_block_size =
         linear_prefix_cache ? static_cast<int32_t>(options.block_size())
                             : chunk_stride;
+    BlockManager::Options linear_options = options;
+    linear_options.num_blocks(
+        static_cast<uint32_t>(options.linear_state_num_slots()));
+    linear_options.block_size(linear_block_size);
+    linear_options.enable_prefix_cache(linear_prefix_cache);
+    linear_options.block_type(BlockType::LINEAR);
+    linear_options.preserve_decode_checkpoint(
+        is_decode && options.preserve_decode_checkpoint());
     leaves.emplace(
         BlockType::LINEAR,
         CompositeBlockManager::LeafEntry{
             maybe_concurrent(
-                std::make_unique<LinearStateBlockManager>(
-                    static_cast<uint32_t>(options.linear_state_num_slots()),
-                    linear_block_size,
-                    linear_prefix_cache,
-                    is_decode,
-                    options.num_speculative_tokens(),
-                    is_decode && options.preserve_decode_checkpoint()),
+                std::make_unique<LinearStateBlockManager>(linear_options),
                 options),
             /*participates_in_admission=*/false,
             /*supports_prefix_cache=*/linear_prefix_cache});
@@ -646,13 +648,10 @@ CompositeBlockManager::probe_prefix_cache(Sequence* seq,
     BlockManager& leaf = *entry.leaf;
     Slice<XXH3Key> hashes;
     Slice<Block> existed;
-    if (type == BlockType::LINEAR) {
-      seq->update_linear_state_hashes(static_cast<uint32_t>(leaf.block_size()));
-      hashes = seq->linear_state_hashes();
-    } else {
-      seq->update_block_hashes(static_cast<uint32_t>(leaf.block_size()),
-                               leaf.options().hasher_type());
-      hashes = seq->block_hashes();
+    seq->update_block_hashes(static_cast<uint32_t>(leaf.block_size()),
+                             leaf.options().hasher_type());
+    hashes = seq->block_hashes(static_cast<uint32_t>(leaf.block_size()));
+    if (type != BlockType::LINEAR) {
       existed = existing_state.blocks(type).slice(
           0, existing_state.shared_blocks_num(type));
     }
@@ -762,8 +761,11 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
   if (linear.has_value()) {
     if (out.safe_hit_tokens > 0) {
       const size_t source_index = out.safe_hit_tokens / linear->block_size - 1;
-      std::vector<Block> source_blocks(source_index + 1);
-      source_blocks.back() = std::move(linear->blocks[source_index]);
+      // A linear model keeps only the deepest checkpoint. Logical placeholders
+      // before that checkpoint must not stay on the sequence: allocate_prefill
+      // allows at most two LINEAR blocks.
+      std::vector<Block> source_blocks(1);
+      source_blocks.front() = std::move(linear->blocks[source_index]);
       out.to_mount.emplace_back(ProbeResult{linear->type,
                                             linear->leaf,
                                             std::move(source_blocks),

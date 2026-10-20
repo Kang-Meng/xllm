@@ -274,6 +274,14 @@ void KVCacheState::mount_composite_shared(BlockType type,
                     << static_cast<int32_t>(type);
   const size_t count = shared_blocks.size();
   bs = std::move(shared_blocks);
+  // LINEAR's vector is a fixed checkpoint slot, not a token-growing block
+  // table. The shared and cached block counts record how far a growing table
+  // has been inserted into the prefix cache, so they do not apply.
+  if (type == BlockType::LINEAR) {
+    num_owned_shared_blocks_.erase(type);
+    num_cached_blocks_.erase(type);
+    return;
+  }
   num_owned_shared_blocks_[type] = static_cast<uint32_t>(count);
   // The probe vector length is the actual matched logical reach for this
   // state and BlockType. For SWA it may include invalid placeholders before
@@ -290,6 +298,13 @@ void KVCacheState::replace_composite_blocks(BlockType type,
   CHECK_LE(cache_publish_cursor, blocks.size());
   remember_block_size(type, blocks);
   composite_blocks_[type] = std::move(blocks);
+  // LINEAR does not use the prefix-cache insertion cursors. Its vector length
+  // stays fixed as tokens grow, so neither count has a position to record.
+  if (type == BlockType::LINEAR) {
+    num_owned_shared_blocks_.erase(type);
+    num_cached_blocks_.erase(type);
+    return;
+  }
   num_owned_shared_blocks_[type] = static_cast<uint32_t>(num_shared_blocks);
   num_cached_blocks_[type] = cache_publish_cursor;
 }
