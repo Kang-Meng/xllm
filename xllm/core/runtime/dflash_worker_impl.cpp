@@ -332,20 +332,32 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
           [&parallel_args, &device, &options] {
             // The draft consumes the target's aux hidden states, which the
             // worker does not expose under CP; reject cp_size > 1 except
-            // DeepSeek-V4 on NPU, or GLM-5-Next on NPU with the DFlash2
-            // algorithm specifically (design.md §3.1 Gate B4). GLM-5-Next's
+            // the proven aux-hidden CP restore pairings (design.md §3.1
+            // Gate B4): DeepSeek-V4 on NPU, or GLM-5-Next / glm_moe_dsa on
+            // NPU with the DFlash2 algorithm specifically. GLM-5-Next's
             // aux-hidden-buffer CP restore is proven correct
             // (test_glm5_next_cp.py's
             // test_layer_capture_restores_global_rows_with_context_parallelism)
             // but was only verified for DFlash2's dispatch path; other
             // block-diffusion algorithms (DFlash(1), DSpark) stay rejected.
+            // glm_moe_dsa (GLM-5.2/5.3) joins the same exemption: glm5_2.py
+            // merges the target output and the aux-hidden buffer with one
+            // cp_merge_rows permutation (test_glm5_2_cp_ragged.py's
+            // test_cp_aux_hidden_is_merged_with_target_in_capture_order),
+            // so the DFlash2 draft consumes token-aligned global rows. Its
+            // exemption is python-impl only -- the native/ATB glm_moe_dsa
+            // has no aux capture and keeps the startup-time rejection.
             bool allow_cp = false;
             if (parallel_args.cp_size() > 1 && Platform::is_npu()) {
               const std::string model_type =
                   util::get_model_type(options.model_path(), options.backend());
               allow_cp = util::is_deepseek_v4_model_type(model_type) ||
                          SpeculativeConfig::is_glm5_next_dflash2(
-                             model_type, options.speculative_algorithm());
+                             model_type, options.speculative_algorithm()) ||
+                         SpeculativeConfig::is_glm_moe_dsa_dflash2(
+                             model_type,
+                             options.speculative_algorithm(),
+                             ModelConfig::get_instance().model_impl());
             }
             if (!allow_cp) {
               CHECK_LE(parallel_args.cp_size(), 1)

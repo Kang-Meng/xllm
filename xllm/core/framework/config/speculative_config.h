@@ -22,6 +22,7 @@ limitations under the License.
 #include <string_view>
 
 #include "core/common/macros.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/option_category.h"
 #include "core/framework/sampling/draft_sampling_mode.h"
 
@@ -63,6 +64,27 @@ class SpeculativeConfig final {
   static bool is_glm5_next_dflash2(std::string_view model_type,
                                    std::string_view algorithm) {
     return model_type == "glm5_next" && is_dflash2_algorithm(algorithm);
+  }
+
+  // The glm_moe_dsa (GLM-5.2/5.3) + DFlash2 pairing, the mirror of
+  // is_glm5_next_dflash2: glm5_2.py restores the aux-hidden buffer to
+  // global row order under CP by cp_merge_rows on the concatenated
+  // (hidden, aux_hidden_buffer) pair, unit-tested in
+  // test_glm5_2_cp_ragged.py::
+  // test_cp_aux_hidden_is_merged_with_target_in_capture_order. Consumed by
+  // the same master admission and draft worker gates. Unlike
+  // is_glm5_next_dflash2 the admission is python-impl only (the native/ATB
+  // glm_moe_dsa has no aux capture and keeps the startup-time rejection),
+  // so the impl restriction is folded into the predicate itself: leaving it
+  // in the gates would let the two whitelists drift apart. The impl stays
+  // an explicit argument rather than a singleton read so a spawned worker
+  // can classify from its own Options, matching the convention of
+  // requires_aux_hidden_capture.
+  static bool is_glm_moe_dsa_dflash2(std::string_view model_type,
+                                     std::string_view algorithm,
+                                     std::string_view model_impl) {
+    return model_type == "glm_moe_dsa" && is_dflash2_algorithm(algorithm) &&
+           ModelConfig::is_python_model_impl(model_impl);
   }
 
   static bool is_mtp_algorithm(std::string_view algorithm) {

@@ -332,7 +332,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     lm_head_selected_token_idxes = selected_token_idxes;
     const bool need_selected_hidden =
         input.return_selected_hidden ||
-        (options_.cp_size() > 1 && options_.enable_speculative_decode());
+        (options_.cp_size() > 1 && options_.enable_speculative_decode() &&
+         !model_output.aux_hidden_states.defined());
     if (need_selected_hidden) {
       // Emit both selected hidden and logits from a single lm_head pass so the
       // ConfidenceHead and CP speculative paths can consume hidden without a
@@ -467,12 +468,26 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       // Target prefill: keep full embeddings (global-real under model-side CP).
       output.sample_output.embeddings = embeddings;
     } else if (sampling_params.selected_token_idxes.defined()) {
-      if (options_.cp_size() > 1) {
+      if (options_.cp_size() > 1 && !model_output.aux_hidden_states.defined()) {
+        // CP speculative decode without aux capture (e.g. the MTP draft,
+        // which feeds these embeddings back as its input_embedding): reuse
+        // the lm_head's selected hidden rows.
         CHECK(selected_hidden.defined())
             << "selected_hidden must be defined when "
                "selected_token_idxes is defined.";
         output.sample_output.embeddings = selected_hidden;
       } else {
+        // Aux-hidden-capture algorithms (DFlash/DFlash2/Eagle3/DSpark)
+        // consume the captured columns from the aux embeddings, so select
+        // their rows from that tensor. selected_hidden is not the fallback
+        // here: need_selected_hidden above excludes the aux path (its CP
+        // branch requires !aux_hidden_states.defined()), so unless a caller
+        // separately requested return_selected_hidden the lm_head pass
+        // never produced it -- and even then it would carry the hidden rows
+        // only, without the captured aux columns the draft consumes. Under
+        // CP the decode batch runs without a cp_context (EagerRunner only
+        // builds one for prefill batches), so the rows are already
+        // global-ordered and the selection matches the non-CP path.
         output.sample_output.embeddings = embeddings.index_select(
             /*dim=*/0, lm_head_selected_token_idxes);
       }

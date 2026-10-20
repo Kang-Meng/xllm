@@ -201,14 +201,25 @@ std::optional<std::string> validate_model_cp(const Options& options,
     // DeepseekV4CpContext.gather_restore) and unit-tested
     // (test_glm5_next_cp.py's
     // test_layer_capture_restores_global_rows_with_context_parallelism).
-    // Eagle3/DFlash(1)/DSpark are not exempted here: their glm5_next-specific
+    // glm_moe_dsa is exempted for DFlash2 by the same mechanism, python
+    // model impl only (the native/ATB glm_moe_dsa has no aux capture):
+    // glm5_2.py merges the target output and the aux-hidden buffer with
+    // one cp_merge_rows permutation (unit-tested in
+    // test_glm5_2_cp_ragged.py's
+    // test_cp_aux_hidden_is_merged_with_target_in_capture_order).
+    // Eagle3/DFlash(1)/DSpark are not exempted here: their model-specific
     // dispatch paths were not individually verified (design.md §3.1 Gate B1).
     const bool is_glm5_next_dflash2 = SpeculativeConfig::is_glm5_next_dflash2(
         model_type, options.speculative_algorithm());
+    const bool is_glm_moe_dsa_dflash2 =
+        SpeculativeConfig::is_glm_moe_dsa_dflash2(
+            model_type,
+            options.speculative_algorithm(),
+            ModelConfig::get_instance().model_impl());
     if (engine_type == EngineType::SSM &&
         SpeculativeConfig::requires_aux_hidden_capture(
             options.speculative_algorithm()) &&
-        !is_dsv4_model && !is_glm5_next_dflash2) {
+        !is_dsv4_model && !is_glm5_next_dflash2 && !is_glm_moe_dsa_dflash2) {
       return "Current model-side CP does not support aux-hidden-capture "
              "speculative algorithms (Eagle3/DFlash/DSpark); run speculative "
              "decoding on a cp_size=1 Decode instance.";

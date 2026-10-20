@@ -204,6 +204,43 @@ TEST(NpuCpCapabilityTest, PythonCpPreservesQwenAndRestrictsGlm) {
                 "speculative algorithms (Eagle3/DFlash/DSpark); run "
                 "speculative decoding on a cp_size=1 Decode instance."));
 
+  // glm_moe_dsa + DFlash2 is admitted for the python impl: glm5_2.py
+  // restores the aux-hidden buffer to global row order under CP.
+  options.speculative_algorithm("DFlash2");
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::SSM,
+                                 "glm_moe_dsa",
+                                 /*global_world_size=*/16)
+                   .has_value());
+  options.speculative_algorithm("dflash2");
+  EXPECT_FALSE(validate_model_cp(options,
+                                 EngineType::SSM,
+                                 "glm_moe_dsa",
+                                 /*global_world_size=*/16)
+                   .has_value());
+  // The native/ATB impl keeps the rejection: it has no aux capture.
+  model_config.model_impl("atb");
+  EXPECT_EQ(validate_model_cp(options,
+                              EngineType::SSM,
+                              "glm_moe_dsa",
+                              /*global_world_size=*/16),
+            std::optional<std::string>(
+                "Current model-side CP does not support aux-hidden-capture "
+                "speculative algorithms (Eagle3/DFlash/DSpark); run "
+                "speculative decoding on a cp_size=1 Decode instance."));
+  model_config.model_impl("python");
+  options.speculative_algorithm("DSpark");
+  // The exemption is DFlash2-only: with the impl restored to python, the
+  // non-DFlash2 aux-capture algorithm is still rejected.
+  EXPECT_EQ(validate_model_cp(options,
+                              EngineType::SSM,
+                              "glm_moe_dsa",
+                              /*global_world_size=*/16),
+            std::optional<std::string>(
+                "Current model-side CP does not support aux-hidden-capture "
+                "speculative algorithms (Eagle3/DFlash/DSpark); run "
+                "speculative decoding on a cp_size=1 Decode instance."));
+
   options.cp_size(1).instance_role(InstanceRole::DECODE).enable_disagg_pd(true);
   EXPECT_FALSE(validate_model_cp(options,
                                  EngineType::LLM,

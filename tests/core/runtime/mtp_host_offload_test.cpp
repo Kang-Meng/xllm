@@ -29,6 +29,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/kv_cache/kv_cache_capacity.h"
 #include "core/framework/kv_cache/kv_cache_shape.h"
 #include "core/framework/model/model_args.h"
@@ -41,6 +42,7 @@ limitations under the License.
 #include "core/runtime/mtp_worker_impl.h"
 #include "core/runtime/options.h"
 #include "core/runtime/speculative_worker_impl.h"
+#include "core/util/scope_guard.h"
 #include "core/util/slice.h"
 #include "models/model_registry.h"
 
@@ -1197,6 +1199,49 @@ TEST_F(MTPHostOffloadTest, DeepseekV4StillAllowsContextParallelism) {
   const ScopedModelTypeConfig model_config("deepseek_v4");
   options.model_path(model_config.path().string());
 
+  auto worker = std::make_unique<TestDFlashWorker>(
+      parallel_args, device.unwrap(), options);
+  EXPECT_NE(worker, nullptr);
+}
+
+// glm_moe_dsa (GLM-5.2/5.3) + cp_size>1 + DFlash2 must not CHECK-fail in
+// DFlashWorkerImpl's allow_cp gate. Model-level correctness of the
+// aux-hidden-buffer CP restore this relies on is proven separately in
+// tests/python/test_glm5_2_cp_ragged.py::
+// test_cp_aux_hidden_is_merged_with_target_in_capture_order.
+TEST_F(MTPHostOffloadTest, DFlash2AllowsGlmMoeDsaContextParallelism) {
+  if (!Platform::is_npu()) {
+    GTEST_SKIP() << "allow_cp's glm_moe_dsa exemption is NPU-only.";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  // cp_size=2, dp_size=1, ep_size=1: exercises the parallel_args.cp_size() > 1
+  // branch of DFlashWorkerImpl's allow_cp lambda.
+  const ParallelArgs parallel_args(
+      /*rank=*/0,
+      /*world_size=*/2,
+      /*dp_size=*/1,
+      /*cp_size=*/2,
+      /*process_group=*/nullptr,
+      /*ep_size=*/1);
+  runtime::Options options = make_runtime_options(2.0);
+  options.speculative_algorithm("DFlash2");
+  const ScopedModelTypeConfig model_config("glm_moe_dsa");
+  options.model_path(model_config.path().string());
+  // The glm_moe_dsa exemption is python-impl only; the ModelConfig singleton
+  // defaults elsewhere, so pin and restore it around the construction. The
+  // ScopeGuard keeps the restore on early returns and exceptions, so a
+  // construction failure cannot leak "python" into later tests.
+  ModelConfig& global_model_config = ModelConfig::get_instance();
+  const std::string original_model_impl = global_model_config.model_impl();
+  global_model_config.model_impl("python");
+  const ScopeGuard model_impl_guard(
+      [&] { global_model_config.model_impl(original_model_impl); });
+
+  // Construction must not CHECK-fail: allow_cp resolves true because
+  // model_type == "glm_moe_dsa" && is_dflash2_algorithm("DFlash2") under the
+  // python model impl.
   auto worker = std::make_unique<TestDFlashWorker>(
       parallel_args, device.unwrap(), options);
   EXPECT_NE(worker, nullptr);
