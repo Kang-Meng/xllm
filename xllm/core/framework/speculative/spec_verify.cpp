@@ -15,12 +15,26 @@ limitations under the License.
 
 #include "core/framework/speculative/spec_verify.h"
 
+#include <glog/logging.h>
+
 #include <memory>
 
 #include "framework/sampling/rejection_sampler.h"
 #include "runtime/forward_params.h"
 
 namespace xllm::spec_verify {
+
+void check_target_masks(const ForwardOutput& target_output,
+                        const torch::Tensor& filter_mask,
+                        const torch::Tensor& filter_bitmask) {
+  if (filter_bitmask.defined()) {
+    CHECK(target_output.filter_bitmask_applied_to_logits)
+        << "packed target logits must be filtered by the target sampler";
+  } else if (filter_mask.defined()) {
+    CHECK(target_output.filter_mask_applied_to_logits)
+        << "dense target logits must be filtered by the target sampler";
+  }
+}
 
 SampleOutput run_rejection_sampling(const SamplerPolicy& policy,
                                     const DraftProposal& draft_proposal,

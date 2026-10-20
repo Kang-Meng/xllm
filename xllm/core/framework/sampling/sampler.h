@@ -33,16 +33,22 @@ class Sampler final {
     return this->forward(::std::forward<Args>(args)...);
   }
 
-  // logits: [batch_size, vocab_size]
+  // logits: [batch_size, vocab_size], updated with the processed sampling rows.
+  // The Tensor may be rebound or promoted in dtype; consumers must read it
+  // after forward() returns; cached aliases may still refer to old storage.
+  // Returned probabilities retain the input dtype.
+  // Equal selected/sample index counts mean all logits rows are sampled in
+  // their existing order; only unequal counts select rows by sample_idxes.
   SampleOutput forward(
       torch::Tensor& logits,
       const SamplingParameters& params,
       const torch::Tensor& filter_mask = torch::Tensor()) const;
 
-  // Applies every in-place logit processor from the sampling parameters
+  // Applies the logit processors from the sampling parameters
   // (frequency/presence penalties, repetition penalties, then the token
   // bitmask or the dense filter mask) and returns the row subset to sample
-  // from: `logits` itself unless the parameters select sample indices.
+  // from. Masks or sample indices may produce a new Tensor; callers must use
+  // the returned scores.
   // forward() builds on this; callers that only need the processed logits
   // (e.g. greedy speculative verification, which samples separately) can
   // call it directly and skip the sampling passes.
@@ -50,6 +56,12 @@ class Sampler final {
       torch::Tensor& logits,
       const SamplingParameters& params,
       const torch::Tensor& filter_mask = torch::Tensor());
+
+  // Publishes processed rows using the same selection decision as the caller.
+  static void publish_logits(torch::Tensor& logits,
+                             const torch::Tensor& sample_logits,
+                             const torch::Tensor& sample_idxes,
+                             bool use_sample_indices);
 
   // helper functions
   // probs: [..., vocab_size]

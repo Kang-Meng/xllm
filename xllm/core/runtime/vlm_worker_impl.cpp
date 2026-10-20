@@ -236,10 +236,15 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
 
   ForwardOutput output;
   if (sampling_params.selected_token_idxes.defined()) {
-    output.logits = logits;
     if (!input.skip_sampling_for_logits_only) {
       output.sample_output = sampler_->forward(logits, sampling_params);
+      output.filter_bitmask_applied_to_logits =
+          sampling_params.filter_bitmask.defined();
+      output.filter_mask_applied_to_logits =
+          !sampling_params.filter_bitmask.defined() &&
+          sampling_params.filter_mask.defined();
     }
+    output.logits = logits;
     COUNTER_ADD(execution_latency_seconds_sampling, timer.elapsed_seconds());
 
     // carry over the sampling params
@@ -253,7 +258,8 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   if (mm_data.valid()) {
     MMSideOutputCacheVisitor cache_visitor(mm_side_output_cache_);
     mm_data.foreach (static_cast<MMData::IVisitor&>(cache_visitor));
-    MMSideOutputCollectVisitor ctc_output(input.input_params.meta.num_sequences);
+    MMSideOutputCollectVisitor ctc_output(
+        input.input_params.meta.num_sequences);
     mm_data.foreach (static_cast<MMData::IVisitor&>(ctc_output));
     output.sample_output.mm_dict_vec = ctc_output.finish();
   }

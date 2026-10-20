@@ -655,10 +655,11 @@ struct ForwardOutput {
   // max number of top logprobs in the batch
   int64_t max_top_logprobs = 0;
   SampleOutput sample_output;
-  // The target sampler applies packed token masks in-place before returning
-  // sampled tokens. MTP validation uses this local contract to avoid applying
-  // the same mask to target logits a second time.
+  // The target sampler publishes masked logits before returning sampled tokens.
+  // MTP validation uses these local flags to enforce filtering without applying
+  // the same mask twice. Logits-only execution leaves both flags false.
   bool filter_bitmask_applied_to_logits = false;
+  bool filter_mask_applied_to_logits = false;
   std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<std::string> failed_request_ids;
   // Keep no-sync input tensor handles alive until downstream consumers finish
@@ -670,6 +671,8 @@ struct ForwardOutput {
   StreamEventPtr ready_event;
   bool requires_host_retirement = false;
   bool defer_block_speculative_metrics = false;
+  // Sampling publishes processed logits, possibly with a promoted dtype.
+  // Logits-only execution returns raw model logits instead.
   torch::Tensor logits;
   torch::Tensor embedding;
   // Selected hidden states matching `logits` layout: [num_selected,

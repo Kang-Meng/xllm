@@ -28,6 +28,17 @@ limitations under the License.
 #include "sampling_params.h"
 
 namespace xllm {
+void Sampler::publish_logits(torch::Tensor& logits,
+                             const torch::Tensor& sample_logits,
+                             const torch::Tensor& sample_idxes,
+                             bool use_sample_indices) {
+  if (!use_sample_indices) {
+    logits = sample_logits;
+    return;
+  }
+  logits = logits.to(sample_logits.scalar_type());
+  logits.index_copy_(/*dim=*/0, sample_idxes, sample_logits);
+}
 
 torch::Tensor Sampler::apply_logits_processors(
     torch::Tensor& logits,
@@ -83,6 +94,7 @@ torch::Tensor Sampler::apply_logits_processors(
 SampleOutput Sampler::forward(torch::Tensor& logits,
                               const SamplingParameters& params,
                               const torch::Tensor& filter_mask) const {
+  const torch::ScalarType prob_dtype = logits.scalar_type();
   SampleOutput output;
   torch::Tensor sample_logits =
       apply_logits_processors(logits, params, filter_mask);
@@ -108,6 +120,8 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   if (params.all_greedy_sample && !params.logprobs && !params.return_probs &&
       !use_sample_indices && !filter_mask.defined()) {
     output.next_tokens = greedy_sample(sample_logits).to(torch::kLong);
+    publish_logits(
+        logits, sample_logits, params.sample_idxes, use_sample_indices);
     return output;
   }
 
@@ -123,16 +137,17 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
                                            /*dim=*/-1,
                                            /*keepdim=*/true);
     output.next_tokens = sample_indices;
-    output.probs = log_probs.exp().view({-1}).to(logits.dtype());
+    output.probs = log_probs.exp().view({-1}).to(prob_dtype);
+    publish_logits(
+        logits, sample_logits, params.sample_idxes, use_sample_indices);
     return output;
   }
 
   // apply temperatures, top-k and top-p
   apply_top_k_top_p(
       sample_logits, sample_temperatures, sample_top_k, sample_top_p);
-  if (use_sample_indices) {
-    logits.index_copy_(/*dim=*/0, params.sample_idxes, sample_logits);
-  }
+  publish_logits(
+      logits, sample_logits, params.sample_idxes, use_sample_indices);
 
   CHECK(params.do_sample.defined()) << "params.do_sample must be defined";
   CHECK_EQ(params.do_sample.dim(), 1)
@@ -155,7 +170,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
     samples = torch::where(params.do_sample, random, greedy);
   }
   auto sample_indices = samples.to(torch::kLong);
-  output.probs = probs.to(logits.dtype());
+  output.probs = probs.to(prob_dtype);
   output.next_tokens = sample_indices;
 
   if (params.logprobs) {

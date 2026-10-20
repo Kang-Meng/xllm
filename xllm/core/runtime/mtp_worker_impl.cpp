@@ -4486,9 +4486,9 @@ SampleOutput MTPWorkerImpl::validate(
     sample_output.next_tokens = masked_accepted_token_ids;
     sample_output.embeddings = target_embeddings;
   } else {
+    spec_verify::check_target_masks(
+        target_output, target_filter_mask, target_filter_bitmask);
     if (target_filter_bitmask.defined()) {
-      CHECK(target_output.filter_bitmask_applied_to_logits)
-          << "packed target logits must be filtered by the target sampler";
       CHECK_EQ(target_filter_bitmask.dim(), 2)
           << "MTP JSON filter bitmask must be 2-D";
       CHECK_EQ(target_filter_bitmask.size(0), num_target_tokens)
@@ -4502,9 +4502,6 @@ SampleOutput MTPWorkerImpl::validate(
           << "MTP JSON filter mask row count mismatch";
       CHECK_EQ(target_filter_mask.size(1), vocab_size)
           << "MTP JSON filter mask vocabulary mismatch";
-      target_logits =
-          target_logits +
-          target_filter_mask.view({batch_size, num_val_tokens, vocab_size});
     }
 
     const torch::Tensor& draft_token_ids = draft_proposal.token_ids();

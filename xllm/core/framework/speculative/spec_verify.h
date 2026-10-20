@@ -33,6 +33,11 @@ struct SamplerPolicy {
   bool all_greedy_sample = false;
 };
 
+// Enforces that validation consumes masks already published by the sampler.
+void check_target_masks(const ForwardOutput& target_output,
+                        const torch::Tensor& filter_mask,
+                        const torch::Tensor& filter_bitmask);
+
 SampleOutput run_rejection_sampling(const SamplerPolicy& policy,
                                     const DraftProposal& draft_proposal,
                                     const torch::Tensor& target_logits,

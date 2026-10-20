@@ -219,6 +219,7 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
         logits, params.unique_token_ids, params.repetition_penalties);
   }
 
+  const torch::ScalarType prob_dtype = logits.scalar_type();
   torch::Tensor sample_logits = logits;
   torch::Tensor sample_temperatures = params.temperatures;
   torch::Tensor sample_top_k = params.top_k;
@@ -255,9 +256,8 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
 
   apply_top_k_top_p(
       sample_logits, sample_temperatures, sample_top_k, sample_top_p);
-  if (use_sample_indices) {
-    logits.index_copy_(/*dim=*/0, params.sample_idxes, sample_logits);
-  }
+  Sampler::publish_logits(
+      logits, sample_logits, params.sample_idxes, use_sample_indices);
 
   CHECK(params.do_sample.defined()) << "params.do_sample must be defined";
   CHECK_EQ(params.do_sample.dim(), 1)
@@ -268,7 +268,7 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
   SampleOutput output;
   auto probs =
       torch::softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
-  output.probs = probs.to(logits.dtype());
+  output.probs = probs.to(prob_dtype);
   auto logprobs =
       torch::log_softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
 

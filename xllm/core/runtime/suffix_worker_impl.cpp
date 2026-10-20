@@ -505,12 +505,12 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
 
   if (vlm_greedy_verify) {
     // The target returned raw logits; apply the original request's
-    // processors in place, using the history of each verification position.
+    // processors using the history of each verification position.
     // validate() below samples the processed logits (bonus argmax plus the
     // rejection sampler's greedy compare), so the sampler's own argmax and
     // softmax passes would be discarded work.
-    Sampler::apply_logits_processors(target_output.logits,
-                                     validate_input.sampling_params);
+    target_output.logits = Sampler::apply_logits_processors(
+        target_output.logits, validate_input.sampling_params);
   }
 
   torch::Tensor draft_token_ids =

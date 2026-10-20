@@ -385,7 +385,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 
   // driver prepare model output
   if (sampling_params.selected_token_idxes.defined()) {
-    output.logits = logits;
     output.selected_hidden = selected_hidden;
     output.do_sample = sampling_params.do_sample;
     output.logprobs = sampling_params.logprobs;
@@ -437,6 +436,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       }
       output.filter_bitmask_applied_to_logits =
           sampling_params.filter_bitmask.defined();
+      output.filter_mask_applied_to_logits =
+          !sampling_params.filter_bitmask.defined() &&
+          sampling_params.filter_mask.defined();
 
       // beam search kernel
       BeamSearchOutput beam_search_output;
@@ -454,6 +456,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       // set beam search output to output
       output.beam_search_output = beam_search_output;
     }
+    output.logits = logits;
   }
 
   if (options_.enable_speculative_decode()) {
