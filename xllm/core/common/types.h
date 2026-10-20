@@ -255,10 +255,11 @@ struct WeightSegment {
 
 // Values of InstanceInfo.cp_index_write_mode (InstanceMetaInfo.
 // cp_index_write_mode on the wire): which pages of each INDEX resource a
-// CP/KV-split instance actually writes. Mirrors XLLM_CP_INDEX_WRITE_MODE
-// (xllm/python/model_executor/cp_utils.py) -- the mode decides INDEX page
-// validity semantics, so it is declared at registration and consulted by
-// plan_kv_split_widths before a PD link is admitted.
+// CP/KV-split instance actually writes. The local process fixes this to
+// replicated (xllm/python/model_executor/cp_utils.py); a peer may still
+// declare sharded. The mode decides INDEX page validity semantics, so it is
+// declared at registration and consulted by plan_kv_split_widths before a PD
+// link is admitted.
 inline constexpr int32_t kCpIndexWriteModeUnspecified = 0;
 inline constexpr int32_t kCpIndexWriteModeReplicated = 1;
 inline constexpr int32_t kCpIndexWriteModeSharded = 2;

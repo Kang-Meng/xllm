@@ -188,6 +188,11 @@ at::Tensor hc_post(const at::Tensor& x,
                    const at::Tensor& post,
                    const at::Tensor& comb);
 
+torch::Tensor hc_post_va(const torch::Tensor& x,
+                         const torch::Tensor& residual,
+                         const torch::Tensor& post,
+                         const torch::Tensor& comb);
+
 std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -249,6 +254,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gamma_add_rms_norm(
     double epsilon,
     bool add_gamma_offset);
 
+// DeepSeek-V4.1 RMSNorm + cast: normalises ``x`` over its last axis and returns
+// both the cast-normalised output ``y`` and its FP32 copy ``y_fp32``.
+// Dispatched to the migrated ACLNN entry point ``aclnnRmsNormCastVa``
+// (third_party/xllm_ops, op name ``RmsNormCastVa``).
+std::tuple<torch::Tensor, torch::Tensor> rms_norm_cast_va(
+    const torch::Tensor& x,
+    const torch::Tensor& gamma,
+    double epsilon);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_sinkhorn(
     const at::Tensor& mixes,
     const at::Tensor& rsqrt,
@@ -278,6 +292,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre_fused(
     int64_t hc_sinkhorn_iters,
     double norm_eps,
     double hc_eps);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+hc_pre_va(const torch::Tensor& hidden,
+          const torch::Tensor& hc_fn,
+          const torch::Tensor& hc_scale,
+          const torch::Tensor& hc_base,
+          const std::optional<torch::Tensor>& pre_mix,
+          int64_t hc_mult,
+          int64_t hc_sinkhorn_iters,
+          double norm_eps,
+          double hc_eps);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     const at::Tensor& x,
@@ -473,6 +498,62 @@ at::Tensor quant_lightning_indexer_metadata(
     int64_t next_tokens,
     int64_t cmp_ratio,
     const c10::string_view device);
+
+// QuantLightningIndexerV2 metadata factory, DeepSeek-V4.1 migration (1024 x
+// int32), the companion of quant_lightning_indexer_v2_va, dispatched to the
+// migrated hand-written ACLNN entry point
+// ``aclnnQuantLightningIndexerV2MetadataVa``. Every Tensor argument is
+// optional, so the dispatcher may have no device key to route on.
+torch::Tensor quant_lightning_indexer_v2_metadata_va(
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t topk,
+    int64_t quant_mode,
+    const std::optional<torch::Tensor>& cu_seqlens_q,
+    const std::optional<torch::Tensor>& cu_seqlens_k,
+    const std::optional<torch::Tensor>& seqused_q,
+    const std::optional<torch::Tensor>& seqused_k,
+    const std::optional<torch::Tensor>& cmp_residual_k,
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
+    int64_t cmp_ratio,
+    c10::string_view device);
+
+// QuantLightningIndexerV2Va, DeepSeek-V4.1 migration: the fused candidate entry
+// of the two-level top-k index pool (candidate_mode 1=source / 2=consumer /
+// 3=off), dispatched to the hand-written ACLNN entry point
+// aclnnQuantLightningIndexerV2Va.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+quant_lightning_indexer_v2_va(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& weights,
+    const torch::Tensor& query_dequant_scale,
+    const torch::Tensor& key_dequant_scale,
+    int64_t topk,
+    int64_t quant_mode,
+    const std::optional<torch::Tensor>& candidate_topk_index,
+    const std::optional<torch::Tensor>& cu_seqlens_q,
+    const std::optional<torch::Tensor>& cu_seqlens_k,
+    const std::optional<torch::Tensor>& seqused_q,
+    const std::optional<torch::Tensor>& seqused_k,
+    const std::optional<torch::Tensor>& cmp_residual_k,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& output_idx_offset,
+    const std::optional<torch::Tensor>& metadata,
+    int64_t max_seqlen_q,
+    c10::string_view layout_q,
+    c10::string_view layout_k,
+    int64_t mask_mode,
+    int64_t cmp_ratio,
+    int64_t candidate_mode,
+    int64_t candidate_topk_blocks,
+    int64_t candidate_block_size);
 
 at::Tensor sparse_attn_sharedkv_metadata(
     int64_t num_heads_q,

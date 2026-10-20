@@ -357,5 +357,30 @@ TEST(SamplerFilterMaskTest, MixedTopKOnlyUsesModelVocabulary) {
   check_request_filters(/*top_k=*/-1, /*top_p=*/1.F, /*mixed=*/true);
 }
 
+TEST(SamplerFilterMaskTest, TopPFilteringPreservesTargetLogitsAlias) {
+  if (uses_device_random_sample() && Platform::device_count() == 0) {
+    GTEST_SKIP() << "Random sampling backend device is unavailable";
+  }
+
+  SamplingParameters params = make_greedy_params(/*batch_size=*/1);
+  params.do_sample = torch::ones({1}, torch::kBool);
+  params.all_greedy_sample = false;
+  params.all_random_sample = true;
+  params.top_p = torch::tensor({0.95F});
+  const torch::Device device = get_random_sample_device();
+  params = params.to(device, torch::kFloat32);
+  torch::Tensor logits = torch::tensor({{3.0F, 2.0F, 1.0F, 0.0F}}).to(device);
+  // The target worker retains this alias before sampling. Speculative
+  // verification must see the same filtered distribution as the sampler.
+  const torch::Tensor target_logits = logits;
+
+  Sampler sampler;
+  SampleOutput output = sampler.forward(logits, params);
+
+  EXPECT_EQ(target_logits.data_ptr(), logits.data_ptr());
+  EXPECT_TRUE(torch::allclose(output.probs, target_logits.softmax(-1)));
+  EXPECT_EQ(target_logits.softmax(-1).index({0, 3}).item<float>(), 0.0F);
+}
+
 }  // namespace
 }  // namespace xllm

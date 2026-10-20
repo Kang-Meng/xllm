@@ -14,17 +14,21 @@
 
 """Unit tests for the DeepSeek-V4 CSA/HCA attention backend.
 
-Pure-Python: does not load compiled operators.
+Pure-Python: does not load compiled operators. Covers DSA metadata build,
+decode-graph device refresh, and fused inverse RoPE wiring (see the
+per-section notes below).
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
 from xllm.python import kernels
+import xllm.python.attention.csa2_attention as csa2
 from xllm.python.attention import csa_attention as csa_attention_module
 from xllm.python.attention import dsa_metadata as dsa_metadata_module
 from xllm.python.attention.backend import LayerCache
@@ -33,6 +37,7 @@ from xllm.python.attention.csa_attention import (
     HEAVILY_COMPRESSED_ATTENTION,
     SLIDING_ATTENTION,
     CsaAttentionBackend,
+    DsaAttentionBackend,
     _attention_type_for_compress_ratio,
     _build_dspark_swa_indices,
     _CompressedAttentionCacheMapping,
@@ -40,13 +45,16 @@ from xllm.python.attention.csa_attention import (
     _get_layer_cache_tensor,
     _scatter_by_slot,
 )
-from xllm.python.attention.dsa_metadata import build_cache_specs
+from xllm.python.attention.dsa_metadata import (
+    DsaMetadataBuilder,
+    build_cache_specs,
+)
 from xllm.python.model_executor.v4_cp_context import (
     build_deepseek_v4_cp_context,
 )
 
 
-def _make_backend() -> CsaAttentionBackend:
+def _make_backend(device: torch.device | None = None) -> CsaAttentionBackend:
     compress_ratios = [0, 4, 128]
     caches_info, group_infos = build_cache_specs(compress_ratios, 128, 3)
     return CsaAttentionBackend(
@@ -59,7 +67,7 @@ def _make_backend() -> CsaAttentionBackend:
         index_n_heads=64,
         index_head_dim=128,
         rope_head_dim=64,
-        device=torch.device("cpu"),
+        device=device or torch.device("cpu"),
         dtype=torch.bfloat16,
     )
 
@@ -507,6 +515,147 @@ def test_prepare_clears_previous_forward_state() -> None:
     assert not hasattr(backend, "_indexer_fn")
 
 
+# -- sequence-length supply: expanded spec-verify + idle-shard dummy ---------
+
+
+def _sequence_metadata(**overrides) -> SimpleNamespace:
+    """The minimal metadata surface the DSA builder reads.
+
+    The three DSA compression levels are named c1/c4/c128 by their ratio
+    (1/4/128): ``dsa_cos_sin`` is the full-resolution (c1) table and
+    ``dsa_c4_cos_sin``/``dsa_c128_cos_sin`` the compressed ones. Upstream
+    numbered naming (c0/c1/c2) maps to c1/c4/c128 here. The AICPU tiling
+    fields (``c1_metadata``/``c4_metadata``/``c128_metadata``) are filled by
+    the backend on the DSAMetadata object, not read by this builder surface.
+    """
+    values = {
+        "multi_block_tables": [],
+        "kv_seq_lens_host": None,
+        "q_seq_lens_host": None,
+        "q_seq_lens": None,
+        "is_prefill": False,
+        "is_chunked_prefill": False,
+        "dsa_metadata": None,
+        "dsa_positions": torch.tensor([0]),
+        "dsa_cos_sin": None,
+        "dsa_c4_cos_sin": None,
+        "dsa_c128_cos_sin": None,
+        "dsa_graph_block_table_cols": 0,
+        "dsa_graph_mode": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _prepared_metadata(backend, metadata) -> None:
+    backend.prepare_dsa_metadata_for_forward(metadata)
+
+
+def test_idle_shard_without_host_lengths_keeps_one_dummy_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle DP shard runs the forward with no sequences; stay at batch 1.
+
+    Without the fallback the DSA metadata degenerates to batch_size == 0 and the
+    model's attention does a bare ``max(q_lens)`` on an empty list
+    (csa2_attention.py), which is the B4 smoke signature.
+    """
+    backend = _make_backend()
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    metadata = _sequence_metadata()  # one fake query row, no sequence lengths
+
+    _prepared_metadata(backend, metadata)
+
+    dsa = metadata.dsa_metadata
+    assert dsa.seq_lens_q.tolist() == [1]
+    assert dsa.seq_lens.tolist() == [1]
+    assert dsa.seq_lens_q.numel() == 1
+    assert dsa.block_tables == []
+    # The literal B4 raise point: csa2_attention maxes the per-sequence q lens.
+    assert max(int(value) for value in dsa.seq_lens_q.tolist()) == 1
+
+
+def test_idle_shard_dummy_rows_follow_the_query_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dummy sequence count stays aligned with the padded query rows."""
+    backend = _make_backend()
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    metadata = _sequence_metadata(dsa_positions=torch.tensor([0, 1, 2]))
+
+    _prepared_metadata(backend, metadata)
+
+    assert metadata.dsa_metadata.seq_lens_q.tolist() == [1]
+    assert metadata.dsa_metadata.max_query_len >= 1
+
+
+def test_expanded_spec_verify_lengths_supply_the_missing_host_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A packed verify batch keeps its lengths in the expanded view."""
+    backend = _make_backend()
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    expanded = SimpleNamespace(
+        enabled=True,
+        kv_seq_lens=torch.tensor([7, 9], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([7, 9], dtype=torch.int32),
+        kv_seq_lens_host_values=[7, 9],
+        q_seq_lens_host=None,
+        q_seq_lens_host_values=None,
+    )
+    metadata = _sequence_metadata(expanded_decode_metadata=expanded)
+
+    _prepared_metadata(backend, metadata)
+
+    dsa = metadata.dsa_metadata
+    assert dsa.seq_lens.tolist() == [7, 9]
+    assert dsa.seq_lens_q.tolist() == [1, 1]
+
+
+def test_real_host_lengths_are_never_replaced_by_the_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal batch keeps the C++ host view verbatim (no dummy, no expanded)."""
+    backend = _make_backend()
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    expanded = SimpleNamespace(
+        enabled=True,
+        kv_seq_lens=torch.tensor([99], dtype=torch.int32),
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=[99],
+        q_seq_lens_host=None,
+        q_seq_lens_host_values=None,
+    )
+    metadata = _sequence_metadata(
+        kv_seq_lens_host=torch.tensor([5, 6], dtype=torch.int32),
+        q_seq_lens_host=torch.tensor([1, 1], dtype=torch.int32),
+        expanded_decode_metadata=expanded,
+    )
+
+    _prepared_metadata(backend, metadata)
+
+    assert metadata.dsa_metadata.seq_lens.tolist() == [5, 6]
+    assert metadata.dsa_metadata.seq_lens_q.tolist() == [1, 1]
+
+
+def test_empty_forward_without_positions_stays_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No query rows at all -> no synthetic sequence (nothing to align to)."""
+    backend = _make_backend()
+    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
+    metadata = _sequence_metadata(dsa_positions=torch.empty(0, dtype=torch.int64))
+
+    _prepared_metadata(backend, metadata)
+
+    assert metadata.dsa_metadata.seq_lens_q.numel() == 0
+
+
 def test_dsa_api_aliases_are_equivalent(monkeypatch) -> None:
     backend = _make_backend()
     monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
@@ -528,7 +677,13 @@ def test_dsa_api_aliases_are_equivalent(monkeypatch) -> None:
     canonical = metadata.dsa_metadata
     metadata.dsa_metadata = None
     backend.prepare_csa_metadata_for_forward(metadata)
-    assert metadata.dsa_metadata is not canonical
+    aliased = metadata.dsa_metadata
+    # The alias must resolve to the canonical DSA build semantics, not
+    # merely produce a fresh object: field-by-field equality is the real
+    # contract of ``prepare_csa_metadata_for_forward`` (a pure delegation).
+    assert aliased is not canonical
+    assert aliased.seq_lens.tolist() == canonical.seq_lens.tolist() == [1]
+    assert aliased.seq_lens_q.tolist() == canonical.seq_lens_q.tolist() == [1]
 
 
 def test_graph_mode_is_recorded_on_metadata() -> None:
@@ -1203,3 +1358,1018 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
     prepare_step(kv_len=3, q_len=1, is_prefill=False)
     backend.execute(torch.zeros(1, 8, 512), decode_kv, decode_kv, layer)
     assert torch.equal(calls[-1]["sinks"], layer.attn_sink)
+
+
+# ---- graph device refresh ----
+# Decode-graph DSA refresh chain (pure Python, CPU): replay alias dedup and
+# the in-place refresh mechanism (driven by the builder's ``inplace_target`` /
+# ``dst`` parameters directly).
+
+# --- [S4a] Alias dedup ------------------------------------------------------
+# Mirrors ``dsa_metadata.py`` block/slot assembly: one manager tensor per group
+# is appended into every layer's list, so layers alias the same object.
+_N_LAYERS = 4
+_GROUPS = 3
+_PERSISTENT_ROWS = 4
+_REFRESHED_ROWS = 2
+_COLS = 3
+
+_TENSOR_FIELDS = (
+    "seq_lens",
+    "seq_lens_q",
+    "actual_seq_lengths_kv",
+    "actual_seq_lengths_query",
+    "kv_cu_seq_lens",
+    "max_seqlen_kv",
+    "max_seqlen_q",
+    "input_positions",
+    "c4_pad_positions",
+    "c128_pad_positions",
+    "start_pos",
+    "c4_cos",
+    "c4_sin",
+    "c128_cos",
+    "c128_sin",
+    "c4_input_cos",
+    "c4_input_sin",
+    "c128_input_cos",
+    "c128_input_sin",
+)
+
+# --- [Candidate A] In-place refresh ----------------------------------------
+_GRAPH_COLS = 8
+
+# Value-derived fields the candidate writes in place on this graph path.
+_INPLACE_FIELDS = (
+    "seq_lens",
+    "seq_lens_q",
+    "actual_seq_lengths_kv",
+    "actual_seq_lengths_query",
+    "kv_cu_seq_lens",
+    "max_seqlen_kv",
+    "max_seqlen_q",
+    "input_positions",
+    "c4_pad_positions",
+    "c128_pad_positions",
+    "start_pos",
+)
+
+# --- [SWA device slot-mapping cases] ---------------------------------------
+# (raw_bt, block_size, ctx_lens, q_lens, new_cache_slots)
+_SWA_CASES = [
+    # Plain two-row table; seq1's q_start crosses a block boundary.
+    (torch.tensor([[0, 1], [2, 3]], dtype=torch.int32), 4, [5, 9], [1, 1], []),
+    # Negative (placeholder) ring blocks must map to -1.
+    (torch.tensor([[-1, 1], [2, -1]], dtype=torch.int32), 4, [3, 8], [1, 1], []),
+    # q_start at the last position of a block and at position 0.
+    (torch.tensor([[0, 1], [2, 3]], dtype=torch.int32), 4, [8, 1], [1, 1], []),
+    # Production shape: one ring block per sequence (semantic_cols == 1).
+    (torch.tensor([[5], [6]], dtype=torch.int32), 128, [130, 7], [1, 1], []),
+    # Scheduler-provided slots short-circuit the ring formula (H2D, no D2H).
+    (torch.tensor([[0, 1]], dtype=torch.int32), 4, [5], [1], [42]),
+]
+
+# --- [S4a] Alias dedup helpers ---------------------------------------------
+
+
+def _make_metadata(persistent_seed: int, refreshed_seed: int) -> tuple[SimpleNamespace, SimpleNamespace]:
+    """Persistent/refreshed DSA metadata with group-level per-layer aliasing."""
+
+    def persistent_tensor(value: int, dtype: torch.dtype = torch.int32) -> torch.Tensor:
+        return torch.full((_PERSISTENT_ROWS,), value, dtype=dtype)
+
+    def refreshed_tensor(value: int, dtype: torch.dtype = torch.int32) -> torch.Tensor:
+        return torch.full((_REFRESHED_ROWS,), value, dtype=dtype)
+
+    p_block = [
+        torch.full((_PERSISTENT_ROWS, _COLS), persistent_seed * 100 + group, dtype=torch.int32)
+        for group in range(_GROUPS)
+    ]
+    p_slots = [
+        torch.full((_PERSISTENT_ROWS,), persistent_seed * 100 + group, dtype=torch.int32) for group in range(_GROUPS)
+    ]
+    r_block = [
+        torch.full((_REFRESHED_ROWS, _COLS), refreshed_seed * 10 + group, dtype=torch.int32) for group in range(_GROUPS)
+    ]
+    r_slots = [
+        torch.full((_REFRESHED_ROWS,), refreshed_seed * 10 + group, dtype=torch.int32) for group in range(_GROUPS)
+    ]
+
+    meta = SimpleNamespace(
+        explicit_swa_indices=torch.full((_PERSISTENT_ROWS, 1, 128), persistent_seed, dtype=torch.int32),
+        # New list objects per layer, but the *same* tensor object per group --
+        # exactly the alias relation produced by ``dsa_metadata.py``:553-564.
+        block_tables=[[p_block[group] for group in range(_GROUPS)] for _ in range(_N_LAYERS)],
+        slot_mappings=[[p_slots[group] for group in range(_GROUPS)] for _ in range(_N_LAYERS)],
+        input_rope_by_ratio={
+            1: (persistent_tensor(persistent_seed, torch.float32), persistent_tensor(persistent_seed, torch.float32))
+        },
+        sparse_metadata_ori_win_left=persistent_seed,
+        max_query_len=persistent_seed,
+        max_seq_len=persistent_seed,
+        is_acl_graph=True,
+        graph_token_capacity=persistent_seed,
+        precomputed_metadata_inputs=(),
+    )
+    for name in _TENSOR_FIELDS:
+        dtype = torch.float32 if "cos" in name or "sin" in name else torch.int32
+        setattr(meta, name, persistent_tensor(persistent_seed, dtype))
+    # Attach the refreshed side under distinct names for readability; the copy
+    # helpers only read the fields listed above, so we stage a second namespace.
+    refreshed = SimpleNamespace(
+        explicit_swa_indices=torch.full((_REFRESHED_ROWS, 1, 128), refreshed_seed, dtype=torch.int32),
+        block_tables=[[r_block[group] for group in range(_GROUPS)] for _ in range(_N_LAYERS)],
+        slot_mappings=[[r_slots[group] for group in range(_GROUPS)] for _ in range(_N_LAYERS)],
+        input_rope_by_ratio={
+            1: (refreshed_tensor(refreshed_seed, torch.float32), refreshed_tensor(refreshed_seed, torch.float32))
+        },
+        sparse_metadata_ori_win_left=refreshed_seed,
+        max_query_len=refreshed_seed,
+        max_seq_len=refreshed_seed,
+        is_acl_graph=True,
+        graph_token_capacity=refreshed_seed,
+        precomputed_metadata_inputs=(),
+    )
+    for name in _TENSOR_FIELDS:
+        dtype = torch.float32 if "cos" in name or "sin" in name else torch.int32
+        setattr(refreshed, name, refreshed_tensor(refreshed_seed, dtype))
+    return meta, refreshed
+
+
+def _legacy_copy_graph_dsa_metadata(persistent: SimpleNamespace, refreshed: SimpleNamespace) -> None:
+    """Pre-change behaviour: per-layer copy with no alias dedup."""
+
+    for field_name in _TENSOR_FIELDS:
+        CsaAttentionBackend._copy_graph_tensor(
+            getattr(persistent, field_name, None),
+            getattr(refreshed, field_name, None),
+            field_name,
+        )
+    CsaAttentionBackend._copy_graph_tensor(
+        persistent.explicit_swa_indices,
+        refreshed.explicit_swa_indices,
+        "explicit_swa_indices",
+        pad_value=-1,
+    )
+    for layer_id, (p_layer, r_layer) in enumerate(zip(persistent.block_tables, refreshed.block_tables)):
+        CsaAttentionBackend._copy_graph_tensor_list(p_layer, r_layer, f"block_tables[{layer_id}]", pad_value=-1)
+    for layer_id, (p_layer, r_layer) in enumerate(zip(persistent.slot_mappings, refreshed.slot_mappings)):
+        CsaAttentionBackend._copy_graph_tensor_list(p_layer, r_layer, f"slot_mappings[{layer_id}]", pad_value=-1)
+    for ratio, p_pair in persistent.input_rope_by_ratio.items():
+        r_pair = refreshed.input_rope_by_ratio[ratio]
+        CsaAttentionBackend._copy_graph_tensor(p_pair[0], r_pair[0], f"input_rope[{ratio}].cos")
+        CsaAttentionBackend._copy_graph_tensor(p_pair[1], r_pair[1], f"input_rope[{ratio}].sin")
+    persistent.max_query_len = refreshed.max_query_len
+    persistent.max_seq_len = refreshed.max_seq_len
+    persistent.sparse_metadata_ori_win_left = getattr(refreshed, "sparse_metadata_ori_win_left", -1)
+    persistent.is_acl_graph = refreshed.is_acl_graph
+    persistent.graph_token_capacity = int(getattr(refreshed, "graph_token_capacity", 0) or 0)
+    persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
+
+
+# --- [Candidate A] In-place refresh helpers ---------------------------------
+
+
+# Separate from plain ``_make_backend``: this variant additionally stubs
+# ``_build_precomputed_metadata`` -- the AICPU metadata kernels are not
+# available on CPU; the base builder only consumes them later, so a no-op
+# keeps the field set under test intact.
+def _inplace_make_backend(device: torch.device | None = None) -> CsaAttentionBackend:
+    backend = _make_backend(device=device)
+    backend._build_precomputed_metadata = lambda *args, **kwargs: None  # noqa: SLF001
+    return backend
+
+
+def _multi_block_tables(batch: int, seed: int) -> tuple[torch.Tensor, ...]:
+    """One manager table per group in the fixed export order (SWA first)."""
+    tables = (
+        torch.full((batch, 2), seed + 1, dtype=torch.int32),
+        torch.full((batch, 4), seed + 2, dtype=torch.int32),
+        torch.full((batch, 2), seed + 3, dtype=torch.int32),
+    )
+    return tables
+
+
+def _inplace_forward_metadata(
+    kv_seq_lens: list[int],
+    seed: int,
+    *,
+    positions: torch.Tensor | None = None,
+    is_dummy: bool = False,
+) -> SimpleNamespace:
+    batch = len(kv_seq_lens)
+    return SimpleNamespace(
+        multi_block_tables=_multi_block_tables(batch, seed),
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=list(kv_seq_lens),
+        new_cache_slots_host_values=None,
+        dsa_positions=positions if positions is not None else torch.arange(batch, dtype=torch.int64) + seed,
+        q_seq_lens_host=None,
+        q_seq_lens=None,
+        dsa_cos_sin=None,
+        dsa_c4_cos_sin=None,
+        dsa_c128_cos_sin=None,
+        dsa_graph_mode=True,
+        dsa_graph_block_table_cols=_GRAPH_COLS,
+        dsa_graph_token_capacity=_GRAPH_COLS * 2,
+        is_dummy=is_dummy,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        expanded_decode_metadata=None,
+    )
+
+
+def _paired_metadata(seed: int) -> tuple[SimpleNamespace, SimpleNamespace]:
+    """Capture/replay metadata with the same graph bucket shapes.
+
+    ``dsa_positions`` is one shared, stable tensor whose contents the runner
+    rewrites in place every step (``_fill_graph_dsa_positions``), so the capture
+    and the replay observe the same object -- exactly the graph contract.
+    """
+    batch = 4
+    positions = torch.arange(batch, dtype=torch.int64)
+    capture = _inplace_forward_metadata([3, 5, 7, 9], seed, positions=positions)
+    positions.copy_(torch.arange(batch, dtype=torch.int64) + (seed + 1))
+    replay = _inplace_forward_metadata([4, 6, 8, 10], seed + 1, positions=positions)
+    return capture, replay
+
+
+def _tensor_signature(value: torch.Tensor) -> tuple[int, tuple[int, ...], torch.dtype]:
+    return (value.data_ptr(), tuple(value.shape), value.dtype)
+
+
+def _persistent_field_tensors(dsa) -> dict[str, torch.Tensor]:
+    tensors: dict[str, torch.Tensor] = {}
+    for name in _INPLACE_FIELDS:
+        tensors[name] = getattr(dsa, name)
+    for lid, layer in enumerate(dsa.block_tables):
+        for ci, tensor in enumerate(layer):
+            if tensor is not None and tensor.numel() > 0:
+                tensors[f"block_tables[{lid}][{ci}]"] = tensor
+    for lid, layer in enumerate(dsa.slot_mappings):
+        for ci, tensor in enumerate(layer):
+            if tensor is not None and tensor.numel() > 0:
+                tensors[f"slot_mappings[{lid}][{ci}]"] = tensor
+    return tensors
+
+
+def _run_copy(persistent, refreshed, inplace_fields=None) -> None:
+    CsaAttentionBackend._copy_graph_dsa_metadata(  # noqa: SLF001 - tested unit
+        persistent, refreshed, inplace_fields=inplace_fields
+    )
+
+
+def _assert_fields_equal(left, right) -> None:
+    # Scalar attributes.
+    for name in ("max_query_len", "max_seq_len", "graph_token_capacity", "is_acl_graph"):
+        assert getattr(left, name) == getattr(right, name), name
+    # Value-derived tensors.
+    for name in _INPLACE_FIELDS:
+        a = getattr(left, name)
+        b = getattr(right, name)
+        if a is None or b is None:
+            assert a is None and b is None, name
+            continue
+        assert torch.equal(a, b), name
+    # Per-layer manager tables (alias-aware, compare by storage contents).
+    assert len(left.block_tables) == len(right.block_tables)
+    seen: set[tuple[int, int]] = set()
+    for lid, (ll, rr) in enumerate(zip(left.block_tables, right.block_tables)):
+        for ci, (a, b) in enumerate(zip(ll, rr)):
+            if a.numel() == 0 and b.numel() == 0:
+                continue
+            key = (a.data_ptr(), b.data_ptr())
+            if key in seen:
+                continue
+            seen.add(key)
+            assert torch.equal(a, b), f"block_tables[{lid}][{ci}]"
+    seen = set()
+    for lid, (ll, rr) in enumerate(zip(left.slot_mappings, right.slot_mappings)):
+        for ci, (a, b) in enumerate(zip(ll, rr)):
+            if a.numel() == 0 and b.numel() == 0:
+                continue
+            key = (a.data_ptr(), b.data_ptr())
+            if key in seen:
+                continue
+            seen.add(key)
+            assert torch.equal(a, b), f"slot_mappings[{lid}][{ci}]"
+
+
+# --- [SWA device refresh helpers] ------------------------------------------
+
+
+def _builder() -> DsaMetadataBuilder:
+    caches_info, group_infos = build_cache_specs([0, 4, 128], 128, 3)
+    return DsaMetadataBuilder(caches_info, group_infos)
+
+
+def _run_swa(
+    raw_bt: torch.Tensor,
+    block_size: int,
+    ctx_lens: list[int],
+    q_lens: list[int],
+    new_cache_slots: list[int],
+    *,
+    device_ctx_lens: torch.Tensor | None,
+    graph_slot_capacity: int | None = None,
+    graph_block_table_capacity_cols: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    builder = _builder()
+    return builder._process_swa_group(  # noqa: SLF001 - exercise the unit directly
+        raw_bt,
+        block_size,
+        ctx_lens,
+        q_lens,
+        batch_size=len(ctx_lens),
+        graph_slot_capacity=len(ctx_lens) if graph_slot_capacity is None else graph_slot_capacity,
+        graph_block_table_capacity_cols=(
+            int(raw_bt.size(1)) if graph_block_table_capacity_cols is None else graph_block_table_capacity_cols
+        ),
+        new_cache_slots=new_cache_slots,
+        swa_device_ctx_lens=device_ctx_lens,
+    )
+
+
+# === [S4a] Alias dedup ===
+
+
+def test_alias_dedup_matches_legacy_bitwise_and_preserves_addresses() -> None:
+    p_new, r_new = _make_metadata(persistent_seed=1, refreshed_seed=7)
+    p_legacy, r_legacy = _make_metadata(persistent_seed=1, refreshed_seed=7)
+
+    addresses_before = [[tensor.data_ptr() for tensor in layer] for layer in p_new.block_tables]
+
+    CsaAttentionBackend._copy_graph_dsa_metadata(p_new, r_new)
+    _legacy_copy_graph_dsa_metadata(p_legacy, r_legacy)
+
+    # Addresses must be untouched: the dedup copies into the captured storage.
+    for layer_id, layer in enumerate(p_new.block_tables):
+        for cache_id, tensor in enumerate(layer):
+            assert tensor.data_ptr() == addresses_before[layer_id][cache_id]
+
+    # Aliasing preserved: same group across layers is still one storage.
+    for cache_id in range(_GROUPS):
+        ptr = p_new.block_tables[0][cache_id].data_ptr()
+        for layer_id in range(_N_LAYERS):
+            assert p_new.block_tables[layer_id][cache_id].data_ptr() == ptr
+
+    for field_name in _TENSOR_FIELDS + ("explicit_swa_indices",):
+        assert torch.equal(getattr(p_new, field_name), getattr(p_legacy, field_name)), field_name
+    for layer_id in range(_N_LAYERS):
+        for cache_id in range(_GROUPS):
+            assert torch.equal(p_new.block_tables[layer_id][cache_id], p_legacy.block_tables[layer_id][cache_id])
+            assert torch.equal(p_new.slot_mappings[layer_id][cache_id], p_legacy.slot_mappings[layer_id][cache_id])
+    for ratio in p_new.input_rope_by_ratio:
+        for index in (0, 1):
+            assert torch.equal(p_new.input_rope_by_ratio[ratio][index], p_legacy.input_rope_by_ratio[ratio][index])
+    assert p_new.max_query_len == p_legacy.max_query_len
+    assert p_new.max_seq_len == p_legacy.max_seq_len
+    assert p_new.graph_token_capacity == p_legacy.graph_token_capacity
+
+    # Spot-check the prefix-pad semantics survived dedup: rows past the
+    # refreshed prefix keep the -1 pad, the prefix carries refreshed values.
+    expected_block = torch.full((_PERSISTENT_ROWS, _COLS), 70, dtype=torch.int32)
+    expected_block[_REFRESHED_ROWS:] = -1
+    assert torch.equal(p_new.block_tables[0][0], expected_block)
+    expected_slots = torch.full((_PERSISTENT_ROWS,), 70, dtype=torch.int32)
+    expected_slots[_REFRESHED_ROWS:] = -1
+    assert torch.equal(p_new.slot_mappings[0][0], expected_slots)
+
+
+def test_alias_dedup_skips_only_duplicate_pairs(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+    monkeypatch.setattr(
+        csa_attention_module,
+        "_log_dsa_alias_dedup_once",
+        lambda total, skipped: captured.update(total=total, skipped=skipped),
+    )
+    persistent, refreshed = _make_metadata(persistent_seed=1, refreshed_seed=7)
+    CsaAttentionBackend._copy_graph_dsa_metadata(persistent, refreshed)
+
+    total = _N_LAYERS * _GROUPS * 2  # block tables + slot mappings
+    unique_pairs = _GROUPS * 2  # one per (group, list)
+    assert captured == {"total": total, "skipped": total - unique_pairs}
+
+
+def test_alias_dedup_keeps_last_write_for_shared_target_distinct_sources() -> None:
+    # One target shared by two *distinct* refreshed sources must still be
+    # written by every source in order (last write wins), as before dedup.
+    target = torch.zeros((4, 2), dtype=torch.int32)
+    source_a = torch.full((2, 2), 11, dtype=torch.int32)
+    source_b = torch.full((2, 2), 22, dtype=torch.int32)
+    seen: set[tuple[int, int]] = set()
+    CsaAttentionBackend._copy_graph_tensor_list(
+        [target, target], [source_a, source_b], "block_tables[0]", pad_value=-1, seen=seen
+    )
+    expected = torch.full((4, 2), -1, dtype=torch.int32)
+    expected[:2] = 22
+    assert torch.equal(target, expected)
+def test_move_metadata_to_device_still_moves_cpu_fields(monkeypatch) -> None:
+    # A differing backend device must still trigger a real move for every
+    # tensor, so eager (CPU-pinned scheduler tables) keeps working.
+    backend = _make_backend(torch.device("meta"))
+    metadata = SimpleNamespace(
+        block_tables=[[torch.zeros((2, 2), dtype=torch.int32)]],
+        slot_mappings=[[torch.zeros((2,), dtype=torch.int32)]],
+        seq_lens=torch.zeros((2,), dtype=torch.int32),
+    )
+    original_to = torch.Tensor.to
+    calls: list[str] = []
+
+    def counting_to(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(args[0]) if args else "")
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    backend._move_metadata_to_device(metadata)
+
+    # seq_lens + one block table + one slot mapping.
+    assert calls == ["meta", "meta", "meta"]
+
+
+# === [Candidate A] In-place refresh ===
+
+
+# -- (a) off path equivalence ------------------------------------------------
+
+
+def test_off_path_matches_plain_build_and_copy() -> None:
+    backend = _inplace_make_backend()
+    capture_meta, replay_meta = _paired_metadata(seed=0)
+
+    persistent_ref = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+    persistent_off = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+
+    refreshed_ref = backend._build_dsa_metadata_for_forward(replay_meta)  # noqa: SLF001
+    refreshed_off = backend._build_dsa_metadata_for_forward(replay_meta)  # noqa: SLF001
+
+    _run_copy(persistent_ref, refreshed_ref)
+    _run_copy(persistent_off, refreshed_off)
+
+    _assert_fields_equal(persistent_ref, persistent_off)
+    # The off path never aliases: refreshed tensors are fresh storage.
+    assert refreshed_off.seq_lens is not persistent_off.seq_lens
+    assert refreshed_off.refresh_inplace_fields == frozenset()
+
+
+# -- (b) on/off numerical equivalence ---------------------------------------
+
+
+def test_inplace_refresh_matches_off_path_bitwise() -> None:
+    backend = _inplace_make_backend()
+    capture_meta, replay_meta = _paired_metadata(seed=0)
+
+    persistent_on = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+    persistent_off = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+
+    refreshed_on = backend._build_dsa_metadata_for_forward(  # noqa: SLF001
+        replay_meta, inplace_target=persistent_on
+    )
+    assert refreshed_on.refresh_inplace_fields == frozenset(_INPLACE_FIELDS)
+
+    refreshed_off = backend._build_dsa_metadata_for_forward(replay_meta)  # noqa: SLF001
+
+    _run_copy(persistent_on, refreshed_on, refreshed_on.refresh_inplace_fields)
+    _run_copy(persistent_off, refreshed_off)
+
+    _assert_fields_equal(persistent_on, persistent_off)
+    # Legacy values (built independently) must also match byte-for-byte.
+    for name in _INPLACE_FIELDS:
+        assert torch.equal(getattr(persistent_on, name), getattr(refreshed_off, name)), name
+
+
+def test_inplace_refresh_matches_capture_values_for_same_metadata() -> None:
+    backend = _inplace_make_backend()
+    capture_meta, _ = _paired_metadata(seed=0)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+    snapshot = {name: getattr(persistent, name).clone() for name in _INPLACE_FIELDS}
+
+    refreshed = backend._build_dsa_metadata_for_forward(  # noqa: SLF001
+        capture_meta, inplace_target=persistent
+    )
+    _run_copy(persistent, refreshed, refreshed.refresh_inplace_fields)
+
+    for name in _INPLACE_FIELDS:
+        assert torch.equal(getattr(persistent, name), snapshot[name]), name
+
+
+# -- (c) captured-address stability -----------------------------------------
+
+
+def test_inplace_refresh_preserves_captured_addresses() -> None:
+    backend = _inplace_make_backend()
+    capture_meta, replay_meta = _paired_metadata(seed=0)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+
+    before = {name: _tensor_signature(t) for name, t in _persistent_field_tensors(persistent).items()}
+
+    refreshed = backend._build_dsa_metadata_for_forward(  # noqa: SLF001
+        replay_meta, inplace_target=persistent
+    )
+    _run_copy(persistent, refreshed, refreshed.refresh_inplace_fields)
+
+    after = {name: _tensor_signature(t) for name, t in _persistent_field_tensors(persistent).items()}
+    assert before == after
+
+    # The value-derived fields alias the captured objects, not copies.
+    for name in _INPLACE_FIELDS:
+        assert getattr(persistent, name) is getattr(refreshed, name), name
+
+
+# -- (d) no host sync / no new per-field ops --------------------------------
+
+
+def test_inplace_refresh_does_not_host_sync_or_move_fields(monkeypatch) -> None:
+    backend = _inplace_make_backend()
+    capture_meta, replay_meta = _paired_metadata(seed=0)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+
+    def _forbidden_cpu(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError(f"unexpected host sync .cpu() on {self.shape}")
+
+    original_to = torch.Tensor.to
+    to_calls: list[int] = []
+
+    def counting_to(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        to_calls.append(id(self))
+        return original_to(self, *args, **kwargs)
+
+    copy_calls: list[int] = []
+    original_copy = torch.Tensor.copy_
+
+    def counting_copy(self, src, *args, **kwargs):  # type: ignore[no-untyped-def]
+        copy_calls.append(id(self))
+        return original_copy(self, src, *args, **kwargs)
+
+    alias_checks: list[str] = []
+    original_assert = CsaAttentionBackend._assert_graph_tensor_alias  # noqa: SLF001
+
+    def counting_assert(persistent_t, refreshed_t, name):  # type: ignore[no-untyped-def]
+        alias_checks.append(name)
+        return original_assert(persistent_t, refreshed_t, name)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _forbidden_cpu)
+    monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    monkeypatch.setattr(torch.Tensor, "copy_", counting_copy)
+    monkeypatch.setattr(CsaAttentionBackend, "_assert_graph_tensor_alias", staticmethod(counting_assert))
+
+    refreshed = backend._build_dsa_metadata_for_forward(  # noqa: SLF001
+        replay_meta, inplace_target=persistent
+    )
+    inplace_ids = {id(getattr(persistent, name)) for name in _INPLACE_FIELDS}
+    moved = [ptr for ptr in to_calls if ptr in inplace_ids]
+    assert moved == [], "in-place fields must not be moved with .to()"
+
+    # Only the replay pass matters here: the build itself legitimately writes
+    # the captured buffers (one ``copy_`` per in-place field).
+    build_copy_count = len(copy_calls)
+    _run_copy(persistent, refreshed, refreshed.refresh_inplace_fields)
+
+    copied = [ptr for ptr in copy_calls[build_copy_count:] if ptr in inplace_ids]
+    assert copied == [], "in-place fields must not be copied on the replay path"
+    assert set(alias_checks) == set(_INPLACE_FIELDS)
+
+
+def test_inplace_refresh_uses_no_device_d2h_in_device_slot_path() -> None:
+    # The SWA device slot build, when handed a captured buffer, must not call
+    # ``.tolist()`` (a D2H sync) and must write the target buffer in place.
+    raw_bt = torch.tensor([[5], [7]], dtype=torch.int32)
+    ctx = torch.tensor([3, 4], dtype=torch.int32)
+    target = torch.full((4,), -1, dtype=torch.int32)
+
+    original_tolist = torch.Tensor.tolist
+
+    def _forbidden_tolist(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("unexpected .tolist() in the device slot path")
+
+    torch.Tensor.tolist = _forbidden_tolist
+    try:
+        out = DsaMetadataBuilder._swa_slots_on_device(  # noqa: SLF001
+            raw_bt,
+            block_size=128,
+            semantic_cols=1,
+            out_slot_rows=4,
+            batch_size=2,
+            q_lens=[1, 1],
+            new_cache_slots=None,
+            query_total_tokens=2,
+            device_ctx_lens=ctx,
+            dst_slots=target,
+        )
+    finally:
+        torch.Tensor.tolist = original_tolist
+
+    assert out is target
+    assert torch.equal(target[:2], torch.tensor([5 * 128 + 2, 7 * 128 + 3], dtype=torch.int32))
+
+
+# -- (e) ownership conflicts -------------------------------------------------
+
+
+def test_reset_forward_does_not_touch_captured_tensors() -> None:
+    backend = _inplace_make_backend()
+    capture_meta, _ = _paired_metadata(seed=0)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+    before = {name: _tensor_signature(t) for name, t in _persistent_field_tensors(persistent).items()}
+    contents = {name: t.clone() for name, t in _persistent_field_tensors(persistent).items()}
+
+    backend.reset_forward(capture_meta)
+
+    assert capture_meta.dsa_metadata is None
+    assert capture_meta.dsa_positions is None
+    after = {name: _tensor_signature(t) for name, t in _persistent_field_tensors(persistent).items()}
+    assert before == after
+    for name, value in contents.items():
+        assert torch.equal(_persistent_field_tensors(persistent)[name], value), name
+
+
+def test_shared_metadata_draft_group_limit_is_eager_and_isolated() -> None:
+    # The DSpark draft shares the request's multi_block_tables but owns one SWA
+    # group and is always eager (no graph target): its build must never write
+    # into the target's captured persistent metadata.
+    backend = _inplace_make_backend()
+    capture_meta, replay_meta = _paired_metadata(seed=0)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+    before = {name: t.clone() for name, t in _persistent_field_tensors(persistent).items()}
+
+    draft = backend._build_dsa_metadata_for_forward(replay_meta, group_limit=1)  # noqa: SLF001
+    assert draft.refresh_inplace_fields == frozenset()
+    assert draft is not persistent
+
+    after = _persistent_field_tensors(persistent)
+    for name, value in before.items():
+        assert torch.equal(after[name], value), name
+
+
+def test_inplace_falls_back_when_shapes_do_not_match() -> None:
+    backend = _inplace_make_backend()
+    capture_meta, _ = _paired_metadata(seed=0)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+    before = _tensor_signature(persistent.seq_lens)
+
+    # A different batch size cannot alias the captured buffer; the builder must
+    # allocate fresh and let the copy path handle it, leaving the address alone.
+    other_meta = _inplace_forward_metadata([1, 2, 3], seed=9)
+    refreshed = backend._build_dsa_metadata_for_forward(  # noqa: SLF001
+        other_meta, inplace_target=persistent
+    )
+    assert refreshed.seq_lens is not persistent.seq_lens
+    assert "seq_lens" not in refreshed.refresh_inplace_fields
+    assert _tensor_signature(persistent.seq_lens) == before
+
+
+# -- (f) capture-time gating -------------------------------------------------
+
+
+def test_capture_path_never_uses_inplace_target() -> None:
+    # The capture entry point must build a fresh metadata that never aliases or
+    # writes into an existing persistent object; the in-place mechanism is a
+    # replay-time concern only.
+    backend = _inplace_make_backend()
+    capture_meta, _ = _paired_metadata(seed=0)
+
+    backend.prepare_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001 - capture entry
+    captured = capture_meta.dsa_metadata
+    assert captured is not None
+    assert captured.refresh_inplace_fields == frozenset()
+
+    other_meta = _inplace_forward_metadata([3, 5, 7, 9], seed=7)
+    fresh = backend._build_dsa_metadata_for_forward(other_meta)  # noqa: SLF001
+    assert fresh.refresh_inplace_fields == frozenset()
+    for name in _INPLACE_FIELDS:
+        assert getattr(fresh, name) is not getattr(captured, name), name
+
+
+# -- (g) known boundary: host-path .item() D2H -------------------------------
+
+
+def test_host_path_item_d2h_is_a_known_boundary(monkeypatch) -> None:
+    # The candidate removes allocations/copies, not the per-row ``.item()`` on
+    # the host SWA/token slot loop (the device slot path is what removes that).
+    # This pins the boundary so a later reader does not mis-attribute the win.
+    backend = _inplace_make_backend()
+    capture_meta, replay_meta = _paired_metadata(seed=0)
+    persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
+
+    original_item = torch.Tensor.item
+    calls: list[int] = []
+
+    def counting_item(self):  # type: ignore[no-untyped-def]
+        calls.append(1)
+        return original_item(self)
+
+    monkeypatch.setattr(torch.Tensor, "item", counting_item)
+    backend._build_dsa_metadata_for_forward(replay_meta, inplace_target=persistent)  # noqa: SLF001
+    assert calls, "expected the host slot loop to keep its per-row .item()"
+
+
+def test_replay_copy_guard_skips_alias_and_copies_disjoint(monkeypatch) -> None:
+    calls: list[int] = []
+    original = torch.Tensor.copy_
+
+    def counting_copy(self, src, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(self.data_ptr())
+        return original(self, src, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", counting_copy)
+    aliased = torch.tensor([3, 3, 3], dtype=torch.int32)
+    # Same storage -> data_ptr equality -> an aliased field needs no write.
+    DsaAttentionBackend._copy_graph_tensor(aliased, aliased, "seq_lens")
+    assert calls == []
+
+    persistent = torch.tensor([0, 0, 0], dtype=torch.int32)
+    refreshed = torch.tensor([1, 2, 3], dtype=torch.int32)
+    DsaAttentionBackend._copy_graph_tensor(persistent, refreshed, "seq_lens")
+    assert calls == [persistent.data_ptr()]
+    assert torch.equal(persistent, refreshed)
+
+
+# === SWA device refresh mechanism ===
+
+
+def test_swa_device_slots_bit_identical_to_host_path() -> None:
+    for raw_bt, block_size, ctx_lens, q_lens, new_cache_slots in _SWA_CASES:
+        device_ctx = torch.tensor(ctx_lens, dtype=torch.int32)
+        off_bt, off_slots = _run_swa(
+            raw_bt.clone(),
+            block_size,
+            ctx_lens,
+            q_lens,
+            new_cache_slots,
+            device_ctx_lens=None,
+        )
+        on_bt, on_slots = _run_swa(
+            raw_bt.clone(),
+            block_size,
+            ctx_lens,
+            q_lens,
+            new_cache_slots,
+            device_ctx_lens=device_ctx,
+        )
+        assert torch.equal(off_bt, on_bt), (raw_bt.tolist(), ctx_lens)
+        assert torch.equal(off_slots, on_slots), (raw_bt.tolist(), ctx_lens)
+
+
+def test_swa_device_slots_expected_values() -> None:
+    raw_bt = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    _bt, slots = _run_swa(
+        raw_bt,
+        4,
+        [5, 9],
+        [1, 1],
+        [],
+        device_ctx_lens=torch.tensor([5, 9], dtype=torch.int32),
+    )
+    # seq0: pos 4 -> block 1 col 1, offset 0 -> 4; seq1: pos 8 -> block 2 col 0 -> 8.
+    assert torch.equal(slots, torch.tensor([4, 8], dtype=torch.int32))
+
+
+def test_swa_device_refresh_writes_into_captured_storage_in_place() -> None:
+    persistent_bt = torch.full((2, 3), -7, dtype=torch.int32)
+    persistent_slots = torch.full((2,), -7, dtype=torch.int32)
+    bt_ptr = persistent_bt.data_ptr()
+    slots_ptr = persistent_slots.data_ptr()
+
+    raw_bt = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    on_bt, on_slots = _run_swa(
+        raw_bt,
+        4,
+        [5, 9],
+        [1, 1],
+        [],
+        device_ctx_lens=torch.tensor([5, 9], dtype=torch.int32),
+    )
+    CsaAttentionBackend._copy_graph_tensor_list([persistent_bt], [on_bt], "block_tables[0]", pad_value=-1)
+    CsaAttentionBackend._copy_graph_tensor_list([persistent_slots], [on_slots], "slot_mappings[0]", pad_value=-1)
+
+    assert persistent_bt.data_ptr() == bt_ptr
+    assert persistent_slots.data_ptr() == slots_ptr
+    assert torch.equal(persistent_bt, on_bt)
+    assert torch.equal(persistent_slots, on_slots)
+
+
+
+
+# ---- rope inverse fusion ----
+# R2: fused inverse interleaved RoPE on the V4.1 output de-rotation; a CPU
+# stand-in exercises the dispatch wiring and the |x|<=8 tolerance boundary
+# (scale-8/16). The fused path engages whenever the op is registered and the
+# structural guards pass.
+
+# bf16 acceptance tolerance (matches the repo's fused-op suite).
+_TOL = 2**-6
+
+
+def _build_cache(max_pos: int, rotary_dim: int) -> torch.Tensor:
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+    pos = torch.arange(max_pos, dtype=torch.float32)
+    freqs = torch.outer(pos, inv_freq)
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1).contiguous()
+
+
+def _stub_partial_rotary() -> Any:
+    """CPU stand-in for ``npu_inplace_partial_rotary_mul``'s contract.
+
+    Mirrors the wrapper: 3D ``[M, H, head_dim]`` input rotated in place over
+    the trailing ``rope_head_dim`` slice with the per-element duplicated
+    interleave cos/sin; ``inverse`` conjugates the rotation by negating sin.
+    Records ``(inverse, shape, start, head)`` per call so tests can assert the
+    dispatcher reached it (and with which sign).
+    """
+    calls: list[tuple[bool, tuple[int, ...], int, int]] = []
+
+    def op(
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rope_start_dim: int,
+        rope_head_dim: int,
+        inverse: bool = False,
+    ) -> None:
+        calls.append((bool(inverse), tuple(x.shape), int(rope_start_dim), int(rope_head_dim)))
+        start = int(rope_start_dim)
+        end = start + int(rope_head_dim)
+        signed_sin = -sin if inverse else sin
+        rope = x[..., start:end]
+        even = rope[..., 0::2].float()
+        odd = rope[..., 1::2].float()
+        cos_pair = cos[..., 0::2].float().unsqueeze(1)
+        sin_pair = signed_sin[..., 0::2].float().unsqueeze(1)
+        rotated = torch.stack(
+            (even * cos_pair - odd * sin_pair, even * sin_pair + odd * cos_pair),
+            dim=-1,
+        ).flatten(-2)
+        x[..., start:end] = rotated.to(x.dtype)
+
+    op.calls = calls  # type: ignore[attr-defined]
+    return op
+
+
+def _install_fused_stub(monkeypatch: Any) -> Any:
+    op = _stub_partial_rotary()
+    monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: op)
+    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda x: True)
+    monkeypatch.setattr(csa2, "_log_fused_rope_inverse_active", lambda: None)
+    return op
+
+
+def _eager_reference(
+    monkeypatch: Any,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    inverse: bool,
+) -> torch.Tensor:
+    """Force the eager path (device guard off) on an identical input."""
+    original = csa2._rope_fused_device_supported
+    csa2._rope_fused_device_supported = lambda x: False
+    try:
+        return csa2.apply_interleaved_rope(
+            x.clone(), positions, cache, inverse=inverse
+        )
+    finally:
+        csa2._rope_fused_device_supported = original
+
+
+def test_fused_inverse_matches_eager(monkeypatch: Any) -> None:
+    op = _install_fused_stub(monkeypatch)
+
+    cache = _build_cache(256, 64)
+    cases = [
+        (8, 4, 512),  # 3D q-like, partial [448:512)
+        (8, 1, 512),  # 3D single-head
+        (5, 128),  # 2D latent-like, partial [64:128)
+    ]
+    for shape in cases:
+        torch.manual_seed(sum(shape) + 11)
+        x = (torch.randn(*shape) * 0.9).to(torch.bfloat16)
+        positions = torch.randint(0, 200, (shape[0],), dtype=torch.int32)
+
+        fused = csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=True)
+        eager = _eager_reference(monkeypatch, x, positions, cache, inverse=True)
+
+        assert op.calls[-1][0] is True, "the dispatcher must forward inverse=True"
+        assert fused.shape == eager.shape
+        diff = (fused.float() - eager.float()).abs()
+        budget = _TOL + _TOL * eager.float().abs()
+        assert (diff <= budget).all(), f"shape={shape} max_abs={diff.max().item():.3e}"
+        # The un-rotated prefix must survive the in-place kernel untouched.
+        rope_width = cache.size(-1)
+        if shape[-1] > rope_width:
+            assert torch.equal(fused[..., : shape[-1] - rope_width], eager[..., : shape[-1] - rope_width])
+
+
+def test_fused_forward_unchanged_by_r2(monkeypatch: Any) -> None:
+    op = _install_fused_stub(monkeypatch)
+
+    cache = _build_cache(128, 64)
+    torch.manual_seed(5)
+    x = (torch.randn(6, 3, 256) * 0.9).to(torch.bfloat16)
+    positions = torch.arange(6, dtype=torch.int32)
+
+    fused = csa2.apply_interleaved_rope(x.clone(), positions, cache)
+    eager = _eager_reference(monkeypatch, x, positions, cache, inverse=False)
+    assert op.calls[-1][0] is False
+    diff = (fused.float() - eager.float()).abs()
+    assert (diff <= _TOL + _TOL * eager.float().abs()).all()
+
+
+def test_inverse_guard_matrix(monkeypatch: Any) -> None:
+    monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: (lambda *a, **k: None))
+    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda x: True)
+
+    cache = _build_cache(64, 64)
+    x = torch.zeros(4, 2, 256, dtype=torch.bfloat16)
+    positions = torch.arange(4, dtype=torch.int32)
+
+    assert csa2._rope_fused_supported(x, positions, cache, True) is True
+    assert csa2._rope_fused_supported(x, positions, cache, False) is True
+
+    # dtype / rope width / cache dtype / contiguity / rank / device.
+    assert csa2._rope_fused_supported(x.to(torch.float16), positions, cache, True) is False
+    assert csa2._rope_fused_supported(x, positions, _build_cache(64, 16), True) is False
+    assert csa2._rope_fused_supported(x, positions, cache.to(torch.bfloat16), True) is False
+    assert csa2._rope_fused_supported(x.transpose(0, 1), positions, cache, True) is False
+    assert csa2._rope_fused_supported(torch.zeros(4, 2, 256, 1, dtype=torch.bfloat16), positions, cache, True) is False
+    # P2-a: an ODD table width (65 // 2 == 32, so the old 2*half == 64 passed).
+    odd_cache = torch.randn(64, 65)
+    assert csa2._rope_fused_supported(x, positions, odd_cache, True) is False
+    assert csa2._rope_fused_supported(x, positions, odd_cache, False) is False
+    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda x: False)
+    assert csa2._rope_fused_supported(x, positions, cache, True) is False
+
+
+def test_inverse_falls_back_when_op_missing(monkeypatch: Any) -> None:
+    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda x: True)
+    monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: None)
+    monkeypatch.setattr(csa2, "_log_fused_rope_fallback", lambda *a, **k: None)
+
+    cache = _build_cache(64, 64)
+    x = (torch.randn(4, 2, 256) * 0.9).to(torch.bfloat16)
+    positions = torch.arange(4, dtype=torch.int32)
+
+    fallback = csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=True)
+    eager = _eager_reference(monkeypatch, x, positions, cache, inverse=True)
+    assert torch.equal(fallback, eager)
+
+
+# ---------------------------------------------------------------------------
+# P1-b: amplitude domain of the mixed tolerance
+# ---------------------------------------------------------------------------
+
+# Deterministic hash-like pattern (no RNG) so the scale boundary is stable
+# across torch builds; found by the rev-3 stress sweep (scale=8 -> ratio ~0.82,
+# scale=16 -> ~1.39).
+_AMP_HASH = (7.31, 78.233, 9876.54321)
+_AMP_SHAPE = (8, 4, 512)
+
+
+def _amplitude_input(scale: float) -> torch.Tensor:
+    n = 1
+    for dim in _AMP_SHAPE:
+        n *= dim
+    idx = torch.arange(n, dtype=torch.float32)
+    a, b, c = _AMP_HASH
+    h = torch.sin(idx * a + b) * c
+    h = (h - torch.floor(h)) * 2.0 - 1.0
+    return (h.reshape(_AMP_SHAPE) * scale).to(torch.bfloat16)
+
+
+def _amplitude_positions() -> torch.Tensor:
+    return (torch.arange(_AMP_SHAPE[0], dtype=torch.int32) * 7) % 200
+
+
+def _inverse_tolerance_ratio(monkeypatch: Any, scale: float) -> float:
+    """Worst ``diff / (2**-6 + 2**-6 * |eager|)`` over the amplitude case.
+
+    Reusable on-device check: the real run should sample ``attn_out`` absmax
+    once at the inverse call; if it is materially above ~8, this ratio-based
+    re-evaluation (swap the stub for the real op) decides the bound.
+    """
+    cache = _build_cache(256, 64)
+    x = _amplitude_input(scale)
+    positions = _amplitude_positions()
+    fused = csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=True)
+    eager = _eager_reference(monkeypatch, x, positions, cache, inverse=True)
+    diff = (fused.float() - eager.float()).abs()
+    bound = _TOL + _TOL * eager.float().abs()
+    return (diff / bound).max().item()
+
+
+def test_inverse_tolerance_holds_at_scale8(monkeypatch: Any) -> None:
+    _install_fused_stub(monkeypatch)
+    ratio = _inverse_tolerance_ratio(monkeypatch, 8.0)
+    assert ratio <= 1.0, f"scale=8 ratio={ratio:.3f} (mixed tolerance must hold)"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P1-b: near-cancellation + scale=16 exceeds the mixed tolerance; "
+    "re-evaluate the bound against the real attn_out amplitude domain; "
+    "strict=True pins this boundary: if upstream precision improves past the "
+    "bound this test turns XPASS and goes red",
+)
+def test_inverse_tolerance_breaks_at_scale16(monkeypatch: Any) -> None:
+    _install_fused_stub(monkeypatch)
+    ratio = _inverse_tolerance_ratio(monkeypatch, 16.0)
+    assert ratio <= 1.0, f"scale=16 ratio={ratio:.3f} (expected to break the bound)"

@@ -73,6 +73,21 @@ cc_library (
     glog::glog
 )
 
+cc_library (
+  NAME
+    deepseek_v41_cpp_template
+  HDRS
+    deepseek_v41_cpp_template.h
+  SRCS
+    deepseek_v41_cpp_template.cpp
+  DEPS
+    :chat_template_base
+    :tokenizer
+    nlohmann_json::nlohmann_json
+    glog::glog
+    absl::strings
+)
+
 # Factory (depends on all implementations)
 cc_library (
   NAME
@@ -85,6 +100,7 @@ cc_library (
     :deepseek_v32_cpp_template
     :deepseek_v4_cpp_template
     :kimi_k3_cpp_template
+    :deepseek_v41_cpp_template
     nlohmann_json::nlohmann_json
     glog::glog
     gflags

@@ -933,6 +933,34 @@ TORCH_LIBRARY(xllm_ops, m) {
       "batch_size, int max_seqlen_q, int max_seqlen_k, str layout_query, "
       "str layout_key, int sparse_count, int sparse_mode, int pre_tokens, "
       "int next_tokens, int cmp_ratio, str device) -> Tensor");
+  // DeepSeek-V4.1 QuantLightningIndexerV2 metadata producer, dispatched to
+  // the migrated ACLNN "_va" entry point
+  // (aclnnQuantLightningIndexerV2MetadataVa). This is the only registered name
+  // for the V2 metadata producer; there is no non-"_va" alias.
+  m.def(
+      "quant_lightning_indexer_v2_metadata_va(int num_heads_q, int "
+      "num_heads_k, int head_dim, int topk, int quant_mode, *, Tensor? "
+      "cu_seqlens_q=None, Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, "
+      "Tensor? seqused_k=None, Tensor? cmp_residual_k=None, "
+      "int batch_size=0, int max_seqlen_q=0, int max_seqlen_k=0, "
+      "str layout_q='TND', str layout_k='PA_BBND', int mask_mode=3, "
+      "int cmp_ratio=1, str device='npu') -> Tensor");
+  // DeepSeek-V4.1 QuantLightningIndexerV2 candidate entry, dispatched to the
+  // migrated ACLNN "_va" entry point (aclnnQuantLightningIndexerV2Va). This is
+  // the single fused op behind the QLI v3 candidate pool: candidate_mode
+  // 1=source (publishes the block-index pool on the third output), 2=consumer
+  // (restricts its top-k to the supplied pool), 3=off.
+  m.def(
+      "quant_lightning_indexer_v2_va(Tensor query, Tensor key, Tensor "
+      "weights, Tensor query_dequant_scale, Tensor key_dequant_scale, int "
+      "topk, int quant_mode, *, Tensor? candidate_topk_index=None, Tensor? "
+      "cu_seqlens_q=None, Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, "
+      "Tensor? seqused_k=None, Tensor? cmp_residual_k=None, Tensor? "
+      "block_table=None, Tensor? output_idx_offset=None, Tensor? "
+      "metadata=None, int max_seqlen_q=-1, str layout_q='TND', str "
+      "layout_k='PA_BBND', int mask_mode=3, int cmp_ratio=1, int "
+      "candidate_mode=3, int candidate_topk_blocks=2048, int "
+      "candidate_block_size=8) -> (Tensor, Tensor, Tensor)");
   m.def(
       "lightning_indexer(Tensor query, Tensor key, Tensor weights, "
       "Tensor? query_seq_lengths, Tensor? key_seq_lengths, Tensor? "
@@ -1012,9 +1040,21 @@ TORCH_LIBRARY(xllm_ops, m) {
       "hc_post(Tensor x, Tensor residual, Tensor post, Tensor comb) -> "
       "Tensor");
   m.def(
+      "hc_post_va(Tensor x, Tensor residual, Tensor post, Tensor comb) -> "
+      "Tensor");
+  m.def(
       "hc_pre_fused(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
       "int hc_mult, int hc_sinkhorn_iters, float norm_eps, float hc_eps) "
       "-> (Tensor, Tensor, Tensor)");
+  m.def(
+      "hc_pre_va(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "Tensor? pre_mix, int hc_mult, int hc_sinkhorn_iters, float norm_eps, "
+      "float hc_eps) -> (Tensor, Tensor, Tensor, Tensor)");
+  // DeepSeek-V4.1 RMSNorm + cast: returns the cast-normalised output and its
+  // FP32 copy (the fused RmsNormCastVa kernel).
+  m.def(
+      "rms_norm_cast_va(Tensor x, Tensor gamma, float eps) -> (Tensor, "
+      "Tensor)");
   // Compressor: NSA-style KV pooling. kv_state/score_state are in-place (Ref).
   // Returns (cmp_kv, wkv_proj, softmax_res, norm_x, norm_rstd).
   m.def(
@@ -1116,7 +1156,12 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("dequant_situ_quant", TORCH_FN(xllm::kernel::npu::dequant_situ_quant));
   m.impl("hc_pre", TORCH_FN(xllm::kernel::npu::hc_pre));
   m.impl("hc_pre_fused", TORCH_FN(xllm::kernel::npu::hc_pre_fused));
+  m.impl("hc_pre_va", TORCH_FN(xllm::kernel::npu::hc_pre_va));
   m.impl("hc_post", TORCH_FN(xllm::kernel::npu::hc_post));
+  m.impl("hc_post_va", TORCH_FN(xllm::kernel::npu::hc_post_va));
+  m.impl("rms_norm_cast_va", TORCH_FN(xllm::kernel::npu::rms_norm_cast_va));
+  m.impl("quant_lightning_indexer_v2_va",
+         TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_v2_va));
   m.impl("compressor", TORCH_FN(xllm::kernel::npu::compressor));
   m.impl("sparse_attn_sharedkv",
          TORCH_FN(xllm::kernel::npu::sparse_attn_sharedkv));
@@ -1143,6 +1188,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
          TORCH_FN(xllm::kernel::npu::sparse_attn_sharedkv_metadata));
   m.impl("quant_lightning_indexer_metadata",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_metadata));
+  m.impl("quant_lightning_indexer_v2_metadata_va",
+         TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_v2_metadata_va));
 }
 
 // The engram int8 lookup is a pure host CPU kernel: all four operands are

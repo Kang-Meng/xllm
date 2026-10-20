@@ -21,6 +21,23 @@ limitations under the License.
 
 namespace xllm {
 
+// DeepSeek V4.1 index-plane policy (production).
+//
+// INT8 plane + FP16 per-token scale: the only encoding on NPU, so the INT8-only
+// fused ``quant_lightning_indexer_v2_va`` op is always usable. All dtype
+// resolution is centralized in ``get_dsv4_cache_policy`` so the allocator, the
+// estimator and the Python write/read paths agree. MLU is the one exception:
+// it keeps the index plane in the model dtype with no per-token scale.
+
+// DeepSeek V4.1 compressor state ring length (V4.1-only).
+//
+// The ratio-2 compressor parks each span's trailing partial group in a
+// per-sequence ring; only the final ``ratio - 1`` tokens are ever re-read, so
+// the ring is fixed to 32 rows to match vllm-ascend's ``STATE_RING_ROWS`` and
+// the Triton ``CACHE_SIZE``. Addressing: ``ring_block *
+// kDsv41CompressStateRows + (position % kDsv41CompressStateRows)``.
+constexpr int64_t kDsv41CompressStateRows = 32;
+
 struct DeepSeekV4CachePolicy {
   torch::ScalarType index_dtype = torch::kInt8;
   int64_t index_dtype_size = 1;
@@ -30,20 +47,19 @@ struct DeepSeekV4CachePolicy {
 };
 
 inline DeepSeekV4CachePolicy get_dsv4_cache_policy(
-    torch::ScalarType model_dtype) {
+    [[maybe_unused]] torch::ScalarType model_dtype) {
   DeepSeekV4CachePolicy policy;
 #if defined(USE_MLU)
+  // MLU keeps the index plane in the model dtype with no per-token scale.
   policy.index_dtype = model_dtype;
-  policy.index_dtype_size =
-      static_cast<int64_t>(torch::elementSize(model_dtype));
   policy.has_indexer_cache_scale = false;
-  policy.scale_dtype_size = 0;
-#else
+#endif
   policy.index_dtype_size =
       static_cast<int64_t>(torch::elementSize(policy.index_dtype));
   policy.scale_dtype_size =
-      static_cast<int64_t>(torch::elementSize(policy.scale_dtype));
-#endif
+      policy.has_indexer_cache_scale
+          ? static_cast<int64_t>(torch::elementSize(policy.scale_dtype))
+          : 0;
   return policy;
 }
 

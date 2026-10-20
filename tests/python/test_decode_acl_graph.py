@@ -25,7 +25,13 @@ import torch
 import torch.nn as nn
 
 from xllm.python.attention.backend import LayerCache
-from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
+from xllm.python.attention.csa2_attention import _v41_compressor_swa_gate
+from xllm.python.attention.dsa_metadata import (
+    READ_TABLE_LAYOUT_RING,
+    DsaMetadataBuilder,
+    build_cache_specs,
+    build_cache_specs_v41,
+)
 from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadata
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
@@ -481,8 +487,8 @@ def test_dsa_graph_refreshes_every_manager_and_clears_tails() -> None:
     )
 
     assert static_metadata.multi_block_tables[0].tolist() == [
-        [10, 11, 0, 0],
-        [12, 13, 0, 0],
+        [10, 11, 10, 11],
+        [12, 13, 12, 13],
         [0, 0, 0, 0],
         [0, 0, 0, 0],
     ]
@@ -507,7 +513,7 @@ def test_dsa_graph_refreshes_every_manager_and_clears_tails() -> None:
     )
 
     assert static_metadata.multi_block_tables[0].tolist() == [
-        [40, 0, 0, 0],
+        [40, 40, 40, 40],
         [0, 0, 0, 0],
         [0, 0, 0, 0],
         [0, 0, 0, 0],
@@ -547,8 +553,8 @@ def test_dsa_graph_clamps_target_tables_to_draft_groups() -> None:
     )
 
     assert static_metadata.multi_block_tables[0].tolist() == [
-        [10, 0],
-        [11, 0],
+        [10, 10],
+        [11, 11],
         [0, 0],
         [0, 0],
     ]
@@ -2009,3 +2015,112 @@ def test_acl_runner_execute_recaptures_after_engram_staging_recovers(
     assert graph_key in runner._graphs
     assert len(runner._graphs) == 1
     assert graphs.keys_written == [graph_key]
+
+
+@pytest.mark.parametrize("ring_blocks", [1, 2])
+def test_dsa_graph_swa_capacity_padding_preserves_ring_addresses(ring_blocks: int) -> None:
+    """Graph capacity must not turn positions after the ring into block zero."""
+    caches_info, group_infos = build_cache_specs_v41(
+        compress_ratios=[0], kv_source_layer_ids=[], index_source_layer_ids=[], window_size=128, n_layers=1
+    )
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False, group_infos=group_infos),
+        torch.device("cpu"),
+        max_batch=4,
+        max_model_len=1024,
+    )
+    runner._max_blocks_per_sequence = 8
+    tables = runner._build_static_multi_block_tables(4, torch.device("cpu"))
+    source = torch.arange(7, 7 + ring_blocks, dtype=torch.int32).view(1, -1)
+    runner._fill_dsa_block_tables(
+        SimpleNamespace(multi_block_tables=tables),
+        SimpleNamespace(multi_block_tables=(source,)),
+        torch.empty(0, dtype=torch.int32),
+        batch_size=1,
+    )
+    for position in [127, 128, 255, 256, 511, 512, 1023]:
+        builder = DsaMetadataBuilder(caches_info, group_infos, read_table_layout=READ_TABLE_LAYOUT_RING)
+        dsa = builder.build(
+            multi_block_tables=list(tables),
+            kv_seq_lens=[position + 1, 1, 1, 1],
+            q_seq_lens=[1] * 4,
+            positions=torch.tensor([position, 0, 0, 0]),
+            dsa_cos_sin=None,
+            is_prefill=False,
+            is_chunked_prefill=False,
+            enable_graph=True,
+            graph_block_table_capacity_cols=8,
+        )
+        expected_block = source[0, (position // 128) % ring_blocks]
+        assert dsa.slot_mappings[0][0][0] == expected_block * 128 + position % 128
+        assert dsa.block_tables[0][0][0, position // 128] == expected_block
+    assert torch.all(tables[0][1:] == 0)
+
+
+def test_v41_compressor_admits_capacity_wide_graph_swa_table() -> None:
+    """The fused compressor gate admits the ACL-graph capacity-wide SWA table.
+
+    The graph runner feeds the builder a SWA manager padded to the bucket
+    capacity (``_build_static_multi_block_tables``), then ``_fill_dsa_block_tables``
+    repeats the width-1 scheduler ring table across the capacity. The gate must key
+    on the config ring count (1), never on that padded width, so column 0 stays
+    the sequence's ring block throughout.
+    """
+    cap = 16
+    caches_info, group_infos = build_cache_specs_v41(
+        compress_ratios=[0, 2],
+        kv_source_layer_ids=[1],
+        index_source_layer_ids=[1],
+        window_size=128,
+        n_layers=2,
+    )
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False, group_infos=group_infos),
+        torch.device("cpu"),
+        max_batch=4,
+        max_model_len=512,
+    )
+    runner._max_blocks_per_sequence = cap
+
+    static_tables = runner._build_static_multi_block_tables(4, torch.device("cpu"))
+    swa_static = static_tables[0]
+    assert tuple(swa_static.shape) == (4, cap)
+
+    ring = torch.tensor([[7], [9], [11], [13]], dtype=torch.int32)  # width-1 source
+    token_src = torch.zeros((4, 1), dtype=torch.int32)
+    runner._fill_dsa_block_tables(
+        SimpleNamespace(multi_block_tables=static_tables),
+        SimpleNamespace(multi_block_tables=(ring, token_src)),
+        torch.empty(0, dtype=torch.int32),
+        batch_size=4,
+    )
+
+    # Every capacity column retains the physical ring's addressing semantics.
+    assert swa_static[:, 0].tolist() == [7, 9, 11, 13]
+    torch.testing.assert_close(swa_static, ring.expand_as(swa_static))
+
+    builder = DsaMetadataBuilder(caches_info, group_infos)
+    dsa = builder.build(
+        multi_block_tables=list(static_tables),
+        kv_seq_lens=[5, 5, 5, 5],
+        q_seq_lens=[1, 1, 1, 1],
+        positions=torch.arange(4, dtype=torch.int64),
+        dsa_cos_sin=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        enable_graph=True,
+        graph_block_table_capacity_cols=cap,
+    )
+
+    swa_idx = 2  # Layer 1's SWA entry (cache order: key, index, swa, kv_state...).
+    read_table = dsa.block_tables[1][swa_idx]
+    assert read_table[:, 0].tolist() == ring[:, 0].tolist()
+
+    block_table, reason = _v41_compressor_swa_gate(dsa, 1, swa_idx, 1)
+    assert block_table is read_table and reason is None
+    _, reason = _v41_compressor_swa_gate(dsa, 1, swa_idx, 2)
+    assert reason == "swa ring blocks per sequence 2 != 1"
+    _, reason = _v41_compressor_swa_gate(dsa, -1, 0, 1)
+    assert reason == "no swa block table"

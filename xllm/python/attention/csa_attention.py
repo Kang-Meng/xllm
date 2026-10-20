@@ -68,6 +68,68 @@ _MASK_MODE_RIGHT_DOWN_CAUSAL = 3
 _MASK_MODE_COMPRESS = 4
 _DSPARK_SWA_INDEX_ALIGNMENT = 128
 
+# One-time diagnostic latch for the ACL-graph replay alias dedup in
+# :meth:`DsaAttentionBackend._copy_graph_dsa_metadata`.
+_dsa_alias_dedup_diag_logged = False
+
+
+def _log_dsa_alias_dedup_once(total_entries: int, skipped_entries: int) -> None:
+    """Report the DSA replay alias-dedup effect once per process.
+
+    The dedup collapses the per-layer ``copy_`` of a shared manager tensor
+    down to one call per distinct ``(source, target)`` storage pair. Logging a
+    single line after the first replay keeps a busy decode loop quiet while
+    leaving a greppable milestone for profiling/acceptance runs.
+    """
+    global _dsa_alias_dedup_diag_logged
+    if _dsa_alias_dedup_diag_logged:
+        return
+    _dsa_alias_dedup_diag_logged = True
+    logger.info(
+        "DSA graph replay alias dedup: copied %d unique (source, target) "
+        "block/slot pairs, skipped %d duplicate aliases",
+        total_entries - skipped_entries,
+        skipped_entries,
+    )
+
+
+# Candidate A: in-place DSA refresh: the builder writes the value-derived
+# fields (seq-lens family, compressed positions, block/slot tables) straight
+# into the captured buffers, so the replay copy degenerates to a shape/alias
+# assertion for those fields. The default replay path keeps the host
+# build+copy byte-for-byte; the mechanism stays exposed through the
+# ``inplace_target`` parameter of
+# :meth:`DsaAttentionBackend._build_dsa_metadata_for_forward` and is pinned by
+# its tests.
+_DSA_INPLACE_TENSOR_FIELDS = (
+    "seq_lens",
+    "seq_lens_q",
+    "actual_seq_lengths_kv",
+    "actual_seq_lengths_query",
+    "kv_cu_seq_lens",
+    "max_seqlen_kv",
+    "max_seqlen_q",
+    "input_positions",
+    "c4_pad_positions",
+    "c128_pad_positions",
+    "start_pos",
+)
+
+
+def _aliased_graph_fields(persistent: DsaMetadata, refreshed: DsaMetadata) -> frozenset[str]:
+    """Value-derived fields the in-place builder wrote into the captured buffers."""
+    aliased: set[str] = set()
+    for name in _DSA_INPLACE_TENSOR_FIELDS:
+        target = getattr(persistent, name, None)
+        current = getattr(refreshed, name, None)
+        if target is None or current is None:
+            continue
+        if target.shape != current.shape:
+            continue
+        if target.data_ptr() == current.data_ptr():
+            aliased.add(name)
+    return frozenset(aliased)
+
 
 def _uses_prefill_attention(metadata: AttentionMetadata) -> bool:
     """Match the runtime's full/chunked prefill contract on dummy ranks."""
@@ -166,6 +228,61 @@ def _attention_type_for_compress_ratio(compress_ratio: int) -> str:
         return attention_types[compress_ratio]
     except KeyError as error:
         raise ValueError(f"unsupported DeepSeek-V4 compression ratio: {compress_ratio}") from error
+
+
+def _host_seq_lens(metadata: AttentionMetadata, field: str) -> list[int]:
+    """Per-sequence host lengths the C++ builder published for this forward."""
+    host = getattr(metadata, f"{field}_seq_lens_host", None)
+    if host is not None and host.numel() > 0:
+        return [int(value) for value in host.cpu().tolist()]
+    values = getattr(metadata, f"{field}_seq_lens_host_values", None)
+    return [int(value) for value in values] if values else []
+
+
+def _expanded_host_seq_lens(metadata: AttentionMetadata, field: str) -> list[int]:
+    """Per-sequence lengths carried by the request's expanded spec-verify view.
+
+    A packed expanded batch keeps its lengths in ``expanded_decode_metadata``
+    and leaves the owning model's flat host view empty, so a sibling model
+    consuming the same request metadata (the DSpark draft) has to resolve them
+    from there instead of degenerating to zero sequences.
+    """
+    expanded = getattr(metadata, "expanded_decode_metadata", None)
+    if expanded is None or not bool(getattr(expanded, "enabled", False)):
+        return []
+    for name in (
+        f"{field}_seq_lens_host_values",
+        f"{field}_seq_lens_host",
+        f"{field}_seq_lens",
+    ):
+        value = getattr(expanded, name, None)
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                continue
+            return [int(item) for item in value.cpu().tolist()]
+        values = list(value)
+        if values:
+            return [int(item) for item in values]
+    return []
+
+
+_DUMMY_METADATA_WARNED = False
+
+
+def _warn_dummy_metadata_once(rows: int) -> None:
+    """Report the framework's dummy-row fallback exactly once per process."""
+    global _DUMMY_METADATA_WARNED
+    if _DUMMY_METADATA_WARNED:
+        return
+    _DUMMY_METADATA_WARNED = True
+    logger.warning(
+        "DSA metadata carries no host sequence lengths (idle DP shard / dummy batch); "
+        "synthesizing one dummy sequence for %d query row(s) to mirror "
+        "AttentionMetadataBuilder's q_max_seq_len==0 dummy branch",
+        rows,
+    )
 
 
 @dataclass
@@ -299,18 +416,38 @@ class DsaAttentionBackend(AttentionBackend):
     def prepare_dsa_metadata_for_forward(
         self,
         metadata: AttentionMetadata | None = None,
+        *,
+        group_limit: int | None = None,
     ) -> None:
-        """Build compressed-attention metadata in the current model forward."""
+        """Build compressed-attention metadata in the current model forward.
+
+        ``group_limit`` is for a model that shares this request's metadata but
+        owns fewer cache groups than its owner (the DSpark draft): it consumes
+        only its own leading manager tables instead of the request's full list.
+        ``None`` (the owning model) keeps the previous behaviour.
+        """
         metadata = self._metadata if metadata is None else metadata
         assert metadata is not None
-        compressed_metadata = self._build_dsa_metadata_for_forward(metadata)
+        compressed_metadata = self._build_dsa_metadata_for_forward(metadata, group_limit=group_limit)
         metadata.dsa_metadata = compressed_metadata
 
     def _build_dsa_metadata_for_forward(
         self,
         metadata: AttentionMetadata,
+        *,
+        group_limit: int | None = None,
+        inplace_target: DsaMetadata | None = None,
     ) -> DsaMetadata:
-        """Build one request's complete DSA metadata without publishing it."""
+        """Build one request's complete DSA metadata without publishing it.
+
+        ``inplace_target`` (candidate A) is the graph-captured ``DsaMetadata``
+        whose tensor buffers were baked into the ACL graph. When set, the
+        value-derived fields are written straight into those buffers and the
+        returned metadata aliases them; the caller's replay copy then
+        degenerates to a shape/alias assertion for them. ``None`` (the default
+        and the only value the replay path passes) keeps the historical build
+        byte-for-byte.
+        """
         multi_block_tables = list(metadata.multi_block_tables)
         # Speculative draft inputs inherit the target model's SWA/C4/C128
         # manager tables.  A draft model can register only the SWA group, so
@@ -318,21 +455,10 @@ class DsaAttentionBackend(AttentionBackend):
         # deepseek_v4_clamp_multi_block_tables behavior.
         if len(multi_block_tables) > len(self.group_infos):
             multi_block_tables = multi_block_tables[: len(self.group_infos)]
+        # The raw host tensor stays available for the dummy-row fallback below;
+        # the sequence lengths themselves are resolved after ``positions`` so
+        # the expanded spec-verify view and the dummy row can be consulted.
         kv_seq_lens_host = getattr(metadata, "kv_seq_lens_host", None)
-        if kv_seq_lens_host is not None and kv_seq_lens_host.numel() > 0:
-            kv_seq_lens = kv_seq_lens_host.cpu().tolist()
-        else:
-            kv_seq_lens = list(getattr(metadata, "kv_seq_lens_host_values", None) or [])
-        q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
-        if q_seq_lens_host is not None and q_seq_lens_host.numel() > 0:
-            q_seq_lens = q_seq_lens_host.cpu().tolist()
-        else:
-            q_seq_lens_tensor = getattr(metadata, "q_seq_lens", None)
-            q_seq_lens = (
-                q_seq_lens_tensor.cpu().tolist()
-                if q_seq_lens_tensor is not None and q_seq_lens_tensor.numel() > 0
-                else None
-            )
         new_cache_slots = getattr(metadata, "new_cache_slots_host_values", None)
         if new_cache_slots is not None:
             new_cache_slots = list(new_cache_slots)
@@ -341,6 +467,27 @@ class DsaAttentionBackend(AttentionBackend):
         positions = getattr(metadata, "dsa_positions", None)
         if positions is None:
             positions = torch.empty(0, dtype=torch.int64)
+        # Sequence lengths: the flat host view the C++ builder publishes, then
+        # the expanded spec-verify view a sibling model may be reading the
+        # request through, then the framework's single dummy row. The last case
+        # is the idle DP shard: the forward still runs for EP-collective
+        # symmetry (DSparkWorkerImpl::step_empty) but carries no sequences, and
+        # the C++ dummy branch only fires for q_max_seq_len == 0, which the
+        # DSpark draft overrides to its block width. Without the dummy row the
+        # metadata degenerates to batch_size == 0 and the attention crashes on
+        # an empty per-sequence length list.
+        kv_seq_lens = _host_seq_lens(metadata, "kv") or _expanded_host_seq_lens(metadata, "kv")
+        if not kv_seq_lens and positions.numel() > 0:
+            kv_seq_lens = [1]
+            _warn_dummy_metadata_once(int(positions.numel()))
+        q_seq_lens = _host_seq_lens(metadata, "q") or _expanded_host_seq_lens(metadata, "q")
+        if not q_seq_lens:
+            q_seq_lens_tensor = getattr(metadata, "q_seq_lens", None)
+            q_seq_lens = (
+                [int(value) for value in q_seq_lens_tensor.cpu().tolist()]
+                if q_seq_lens_tensor is not None and q_seq_lens_tensor.numel() > 0
+                else None
+            )
         base_cos_sin = getattr(metadata, "dsa_cos_sin", None)
         enable_graph = bool(getattr(metadata, "dsa_graph_mode", False))
         graph_capacity_cols = int(getattr(metadata, "dsa_graph_block_table_cols", 0))
@@ -375,6 +522,8 @@ class DsaAttentionBackend(AttentionBackend):
             new_cache_slots=new_cache_slots,
             enable_graph=enable_graph,
             graph_block_table_capacity_cols=graph_capacity_cols,
+            group_limit=group_limit,
+            dst=inplace_target,
         )
         # Capacity-bucket bound (token rows) baked into the captured graph's
         # committed-row gathers. The decode-graph runner fixes it once per graph
@@ -390,6 +539,10 @@ class DsaAttentionBackend(AttentionBackend):
             compressed_metadata.input_rope_by_ratio = self._build_dsa_rope_metadata(compressed_metadata, metadata)
         self._move_metadata_to_device(compressed_metadata)
         self._build_precomputed_metadata(compressed_metadata, metadata)
+        if inplace_target is not None:
+            # Record the value-derived fields the builder actually aliased, so
+            # the replay copy can assert shape/alias for them instead of copying.
+            compressed_metadata.refresh_inplace_fields = _aliased_graph_fields(inplace_target, compressed_metadata)
         return compressed_metadata
 
     def _build_empty_dp_block_tables(
@@ -455,7 +608,21 @@ class DsaAttentionBackend(AttentionBackend):
         self,
         metadata: AttentionMetadata | None = None,
     ) -> None:
-        """Refresh dynamic DSA values while preserving graph-captured storage."""
+        """Refresh dynamic DSA values while preserving graph-captured storage.
+
+        The host-build path is self-healing: it rebuilds the seq-lens family
+        from the current host sequence lengths on every forward and copies the
+        fresh values into the graph-captured storage
+        (:meth:`_copy_graph_dsa_metadata`).
+
+        Candidate A (the in-place refresh mechanism, driven by the
+        ``inplace_target`` parameter of
+        :meth:`_build_dsa_metadata_for_forward`): building straight into the
+        captured operands makes the copy below assert alias (no bytes moved)
+        for the fields the builder wrote in place, copying only the remaining
+        fresh fields. The replay path itself passes no ``inplace_target``; the
+        mechanism stays exposed to callers and pinned by its tests.
+        """
         metadata = self._metadata if metadata is None else metadata
         if metadata is None or metadata.dsa_metadata is None:
             raise RuntimeError("ACL graph DSA metadata must be captured before replay")
@@ -468,8 +635,16 @@ class DsaAttentionBackend(AttentionBackend):
         cls,
         persistent: DsaMetadata,
         refreshed: DsaMetadata,
+        inplace_fields: frozenset[str] | None = None,
     ) -> None:
-        """Copy replay values into the tensors retained by ACL graph capture."""
+        """Copy replay values into the tensors retained by ACL graph capture.
+
+        ``inplace_fields`` names the value-derived fields the in-place builder
+        already wrote into the captured buffers. For those, no bytes move: the
+        pass degenerates to a shape / dtype / alias assertion. Every other field
+        keeps the historical copy behaviour.
+        """
+        inplace = inplace_fields or frozenset()
         tensor_fields = (
             "seq_lens",
             "seq_lens_q",
@@ -496,11 +671,23 @@ class DsaAttentionBackend(AttentionBackend):
             "qli_metadata",
         )
         for field_name in tensor_fields:
-            cls._copy_graph_tensor(
-                getattr(persistent, field_name, None),
-                getattr(refreshed, field_name, None),
-                field_name,
-            )
+            if field_name in inplace:
+                cls._assert_graph_tensor_alias(
+                    getattr(persistent, field_name, None),
+                    getattr(refreshed, field_name, None),
+                    field_name,
+                )
+            else:
+                cls._copy_graph_tensor(
+                    getattr(persistent, field_name, None),
+                    getattr(refreshed, field_name, None),
+                    field_name,
+                )
+        # ``explicit_swa_indices`` is never in-place: it is a derived native-SAS
+        # kernel output (``_build_dspark_swa_metadata``), not part of
+        # ``_DSA_INPLACE_TENSOR_FIELDS``, so the builder cannot write it into the
+        # captured buffer. It therefore always takes the historical copy path
+        # (and is ``None`` on the production V4.1/csa2 graph path).
         cls._copy_graph_tensor(
             getattr(persistent, "explicit_swa_indices", None),
             getattr(refreshed, "explicit_swa_indices", None),
@@ -512,24 +699,40 @@ class DsaAttentionBackend(AttentionBackend):
             raise RuntimeError("ACL graph DSA block-table layer count changed")
         if len(persistent.slot_mappings) != len(refreshed.slot_mappings):
             raise RuntimeError("ACL graph DSA slot-mapping layer count changed")
+        # ``dsa_metadata`` aliases one manager tensor across every layer (and
+        # cache) that shares its group, so a single (source, target) storage
+        # pair recurs once per layer. Copy each unique pair once: the remaining
+        # aliases already point at the identical storage, so their repeated
+        # ``copy_`` re-wrote the same bytes. Dedup is keyed on the
+        # (source, target) ``data_ptr`` pair and preserves first-seen order, so
+        # a target shared by several *distinct* sources is still written by
+        # every distinct source in order (last write wins, exactly as before).
+        seen_pairs: set[tuple[int, int]] = set()
+        total_entries = 0
+        skipped_entries = 0
         for layer_id, (persistent_layer, refreshed_layer) in enumerate(
             zip(persistent.block_tables, refreshed.block_tables, strict=True)
         ):
-            cls._copy_graph_tensor_list(
+            total_entries += len(persistent_layer)
+            skipped_entries += cls._copy_graph_tensor_list(
                 persistent_layer,
                 refreshed_layer,
                 f"block_tables[{layer_id}]",
                 pad_value=-1,
+                seen=seen_pairs,
             )
         for layer_id, (persistent_layer, refreshed_layer) in enumerate(
             zip(persistent.slot_mappings, refreshed.slot_mappings, strict=True)
         ):
-            cls._copy_graph_tensor_list(
+            total_entries += len(persistent_layer)
+            skipped_entries += cls._copy_graph_tensor_list(
                 persistent_layer,
                 refreshed_layer,
                 f"slot_mappings[{layer_id}]",
                 pad_value=-1,
+                seen=seen_pairs,
             )
+        _log_dsa_alias_dedup_once(total_entries, skipped_entries)
 
         if persistent.input_rope_by_ratio.keys() != refreshed.input_rope_by_ratio.keys():
             raise RuntimeError("ACL graph DSA RoPE ratio set changed")
@@ -555,16 +758,25 @@ class DsaAttentionBackend(AttentionBackend):
         name: str,
         *,
         pad_value: int = 0,
-    ) -> None:
+        seen: set[tuple[int, int]] | None = None,
+    ) -> int:
         if len(persistent) != len(refreshed):
             raise RuntimeError(f"ACL graph DSA {name} count changed")
+        skipped = 0
         for index, (persistent_tensor, refreshed_tensor) in enumerate(zip(persistent, refreshed, strict=True)):
+            if seen is not None and persistent_tensor is not None and refreshed_tensor is not None:
+                alias_key = (persistent_tensor.data_ptr(), refreshed_tensor.data_ptr())
+                if alias_key in seen:
+                    skipped += 1
+                    continue
+                seen.add(alias_key)
             cls._copy_graph_tensor(
                 persistent_tensor,
                 refreshed_tensor,
                 f"{name}[{index}]",
                 pad_value=pad_value,
             )
+        return skipped
 
     @staticmethod
     def _copy_graph_tensor(
@@ -596,6 +808,32 @@ class DsaAttentionBackend(AttentionBackend):
             )
         persistent.fill_(pad_value)
         persistent[: refreshed.shape[0]].copy_(refreshed, non_blocking=True)
+
+    @staticmethod
+    def _assert_graph_tensor_alias(
+        persistent: torch.Tensor | None,
+        refreshed: torch.Tensor | None,
+        name: str,
+    ) -> None:
+        """Pure-host assertion for a field the in-place refresh wrote directly.
+
+        No bytes move here. The builder already wrote the captured buffer, so
+        the refreshed value must be the same storage: a shape/dtype/device
+        mismatch or a moved address is a graph-address-contract violation.
+        """
+        if persistent is None and refreshed is None:
+            return
+        if persistent is None or refreshed is None:
+            raise RuntimeError(f"ACL graph DSA tensor availability changed for {name}")
+        if persistent.shape != refreshed.shape:
+            raise RuntimeError(
+                f"ACL graph DSA in-place refresh shape changed for {name}: "
+                f"{tuple(persistent.shape)} != {tuple(refreshed.shape)}"
+            )
+        if persistent.dtype != refreshed.dtype or persistent.device != refreshed.device:
+            raise RuntimeError(f"ACL graph DSA in-place refresh tensor type changed for {name}")
+        if persistent.data_ptr() != refreshed.data_ptr():
+            raise RuntimeError(f"ACL graph DSA in-place refresh did not alias the captured storage for {name}")
 
     def localize_dsa_metadata_for_cp(
         self,
@@ -1304,14 +1542,17 @@ class DsaAttentionBackend(AttentionBackend):
         )
         for name in tensor_fields:
             tensor = getattr(compressed_metadata, name, None)
-            if tensor is not None:
+            if tensor is not None and tensor.device != self.device:
                 setattr(compressed_metadata, name, tensor.to(self.device))
-        for layer_tensors in compressed_metadata.block_tables:
-            for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
-        for layer_tensors in compressed_metadata.slot_mappings:
-            for index, tensor in enumerate(layer_tensors):
-                layer_tensors[index] = tensor.to(self.device)
+        # Skip the per-entry ``.to()`` dispatch when the entry already lives on
+        # ``self.device`` (ACL-graph replay feeds device-resident stable tables,
+        # and the in-place refresh must leave those captured buffers untouched);
+        # eager builds from CPU-pinned scheduler tables still get a real move.
+        for per_layer_lists in (compressed_metadata.block_tables, compressed_metadata.slot_mappings):
+            for layer_tensors in per_layer_lists:
+                for index, tensor in enumerate(layer_tensors):
+                    if tensor.device != self.device:
+                        layer_tensors[index] = tensor.to(self.device)
 
 
 # Keep the historical import stable.  There is one implementation and one

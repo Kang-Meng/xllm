@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "common/metrics.h"
@@ -111,6 +112,26 @@ void register_xllm_runtime_module(py::module_& m) {
       py_causal_lm->moe_ep_all_reduce(tensor);
     }
     return tensor;
+  });
+  // The C++ side owns the MoE EP process group on the V4-family Python path
+  // (they manage their own TP/moe_tp/EP splits), so expose its HCCL
+  // communicator name for the MC2 guard. An empty string means unavailable.
+  m.def("moe_ep_comm_name", []() {
+    PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
+    if (py_causal_lm == nullptr) {
+      return std::string();
+    }
+    return py_causal_lm->moe_ep_comm_name();
+  });
+  // The MC2 dispatch/combine kernels take this rank as ``ep_rank_id``. The
+  // V4-family Python models own their EP split in C++, so expose the native
+  // rank; a host without an active instance reads as the single-replica 0.
+  m.def("moe_ep_rank", []() -> int64_t {
+    PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
+    if (py_causal_lm == nullptr) {
+      return 0;
+    }
+    return py_causal_lm->moe_ep_rank();
   });
   m.def("eplb_batch_isend_irecv",
         [](py::list operation_types, py::list tensors, py::list remote_ranks) {

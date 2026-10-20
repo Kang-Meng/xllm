@@ -182,8 +182,17 @@ inline bool is_target_mtp_model_type(std::string_view model_type,
 inline constexpr std::string_view kDeepseekV4DSparkModelType =
     "deepseek_v4_dspark";
 
+// Python-path V4.1 DSpark draft. The draft body is the checkpoint's
+// mtp.0/1/2 block drafter; the C++ executor implements it as the C++ TORCH
+// model above, while the embedded interpreter implements it as
+// xllm/python/models/deepseek_v41_dspark.py, registered under this name in
+// xllm/python/registry.py. Both names select the same runtime behaviour.
+inline constexpr std::string_view kDeepseekV41DSparkModelType =
+    "deepseek_v41_dspark";
+
 inline bool is_deepseek_v4_dspark_model_type(std::string_view model_type) {
-  return model_type == kDeepseekV4DSparkModelType;
+  return model_type == kDeepseekV4DSparkModelType ||
+         model_type == kDeepseekV41DSparkModelType;
 }
 
 inline constexpr std::string_view kDeepseekV4ModelType = "deepseek_v4";
@@ -192,6 +201,14 @@ inline constexpr std::string_view kKimiK3ModelType = "kimi_k3";
 
 inline bool is_deepseek_v41_model_type(std::string_view model_type) {
   return model_type == kDeepseekV41ModelType;
+}
+
+// The V4.1 cache-policy family: the target checkpoint and its python-path
+// DSpark draft share the platform index-cache policy (int8 + fp16 per-token
+// scale on NPU), so configuration exemptions must cover both spellings.
+inline bool is_deepseek_v41_family_model_type(std::string_view model_type) {
+  return model_type == kDeepseekV41ModelType ||
+         model_type == kDeepseekV41DSparkModelType;
 }
 
 inline bool is_deepseek_v4_model_type(std::string_view model_type) {

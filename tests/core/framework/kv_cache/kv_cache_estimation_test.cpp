@@ -1158,14 +1158,37 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV41Pools) {
 
   // Cost model (see estimate_dsv41_kv_cache_cost): every layer pays
   // 128 * 16 * 4 = 8192 B of SWA window per block and the single ratio-2
-  // kv source adds 2 * 128 * 16 * 4 = 16384 B of fp32 kv/score state, so
-  // swa_bytes_per_block = 5 * 8192 + (8192 + 16384) = 65536 B. One TOKEN
-  // block is 128 * (16 + 8) * 4 = 12288 B; a 2-engine-block unit holds one
-  // c2 block plus two c1 blocks = 36864 B.
+  // kv source adds 2 * 32 * 16 * 4 = 4096 B of fp32 kv/score state (the
+  // ring is fixed to kDsv41CompressStateRows = 32 rows), so
+  // swa_bytes_per_block = 5 * 8192 + (8192 + 4096) = 53248 B. One TOKEN
+  // block is 128 * (16 * 4 + 8 * index_dtype_size + scale_bytes): the index
+  // plane follows the platform policy, so NPU keeps int8 codes plus a 2 B
+  // fp16 per-token scale while MLU keeps the model dtype with no scale
+  // (get_dsv4_cache_policy). A 2-engine-block unit holds one c2 block plus
+  // two c1 blocks = 3 * bytes_per_token_block.
   KVCacheEstimateOptions options;
   options.dtype = torch::kFloat32;
   options.kv_cache_dtype = "auto";
-  options.cache_size_in_bytes = /*swa=*/27 * 65536 + /*ten units=*/10 * 36864;
+
+  const DeepSeekV4CachePolicy cache_policy =
+      get_dsv4_cache_policy(options.dtype);
+  const int64_t index_scale_bytes =
+      cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
+  const int64_t bytes_per_token_block =
+      128 * (16 * 4 + 8 * cache_policy.index_dtype_size + index_scale_bytes);
+  const int64_t token_unit_bytes = 3 * bytes_per_token_block;
+#if defined(USE_MLU)
+  EXPECT_FALSE(cache_policy.has_indexer_cache_scale);
+  EXPECT_EQ(bytes_per_token_block, 128 * (16 * 4 + 8 * 4));
+#else
+  EXPECT_TRUE(cache_policy.has_indexer_cache_scale);
+  EXPECT_EQ(cache_policy.index_dtype, torch::kInt8);
+  EXPECT_EQ(cache_policy.scale_dtype, torch::kFloat16);
+  EXPECT_EQ(bytes_per_token_block, 128 * (16 * 4 + 8 * 1 + 2));
+#endif
+
+  options.cache_size_in_bytes =
+      /*swa=*/27 * 53248 + /*ten units=*/10 * token_unit_bytes;
   options.block_size = 128;
   options.max_seqs_per_batch = 4;
   options.max_tokens_per_batch = 2176;
@@ -1224,7 +1247,7 @@ TEST(KVCacheEstimationTest, DeepSeekV41RejectsBudgetWithoutTokenCacheUnit) {
   KVCacheEstimateOptions options;
   options.dtype = torch::kFloat32;
   options.kv_cache_dtype = "auto";
-  options.cache_size_in_bytes = /*swa=*/27 * 65536 + /*remaining_bytes=*/1;
+  options.cache_size_in_bytes = /*swa=*/27 * 53248 + /*remaining_bytes=*/1;
   options.block_size = 128;
   options.max_seqs_per_batch = 4;
   options.max_tokens_per_batch = 2176;

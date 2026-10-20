@@ -23,7 +23,7 @@ import torch.distributed as dist
 
 from xllm.python.models import kimi_k3_moe as dispatcher
 
-from .test_moe_all_to_all import _load_module
+from .conftest import load_source_module
 
 
 def _set_group(monkeypatch: pytest.MonkeyPatch, size: int) -> None:
@@ -82,9 +82,11 @@ def test_all_to_all_makes_strided_inputs_contiguous(monkeypatch: pytest.MonkeyPa
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_all_to_all_preserves_uninitialized_group_error(monkeypatch: pytest.MonkeyPatch, asynchronous: bool) -> None:
     # CPU conftest stubs the distributed package; load its real owner module
-    # as the existing Gloo transport tests do, without changing that stub.
-    collectives = _load_module(
-        "_kimi_moe_collectives_contract", Path(__file__).parents[2] / "xllm/python/distributed/collectives.py"
+    # as the existing Gloo transport tests do, without changing that stub. The
+    # shared loader reuses the single instance so re-registering the module's
+    # ``xllm_ops::*`` operators cannot void another suite's monkeypatches.
+    collectives = load_source_module(
+        Path(__file__).parents[2] / "xllm/python/distributed/collectives.py", "_xllm_collectives_under_test"
     )
 
     monkeypatch.setattr(collectives, "_groups", {})

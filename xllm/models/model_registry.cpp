@@ -75,6 +75,7 @@ bool is_torch_only_model_type(const std::string& model_type) {
   static const std::unordered_set<std::string> kTorchOnlyModelTypes = {
       "deepseek_v4",
       "deepseek_v4_dspark",
+      "deepseek_v41_dspark",
       "deepseek_v4_mtp",
       "deepseek_v41",
       "glm5_next_mtp",

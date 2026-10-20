@@ -350,6 +350,110 @@ def quant_lightning_indexer_metadata(
     )
 
 
+def quant_lightning_indexer_v2_va(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    query_dequant_scale: torch.Tensor,
+    key_dequant_scale: torch.Tensor,
+    topk: int,
+    *,
+    candidate_topk_index: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    output_idx_offset: torch.Tensor | None = None,
+    metadata: torch.Tensor | None = None,
+    max_seqlen_q: int = -1,
+    layout_q: str = "TND",
+    layout_k: str = "PA_BBND",
+    mask_mode: int = 3,
+    cmp_ratio: int = 1,
+    candidate_mode: int = 3,
+    candidate_topk_blocks: int = 2048,
+    candidate_block_size: int = 8,
+) -> torch.Tensor:
+    """Run the DeepSeek-V4.1 fused INT8 QuantLightningIndexerV2 "_va" entry.
+
+    Single call that collapses the legacy (indexer / metadata / candidate)
+    trio; dispatches ``aclnnQuantLightningIndexerV2Va``. ``quant_mode`` is
+    pinned to 2 (INT8 per-token-head). Returns the sparse row selection; the
+    values output is always empty (the op def pins ``return_value`` off) and
+    the third output only materialises for ``candidate_mode == 1``.
+    """
+    indices, _values, _candidate_out = torch.ops.xllm_ops.quant_lightning_indexer_v2_va(
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        topk,
+        2,
+        candidate_topk_index=candidate_topk_index,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        cmp_residual_k=cmp_residual_k,
+        block_table=block_table,
+        output_idx_offset=output_idx_offset,
+        metadata=metadata,
+        max_seqlen_q=max_seqlen_q,
+        layout_q=layout_q,
+        layout_k=layout_k,
+        mask_mode=mask_mode,
+        cmp_ratio=cmp_ratio,
+        candidate_mode=candidate_mode,
+        candidate_topk_blocks=candidate_topk_blocks,
+        candidate_block_size=candidate_block_size,
+    )
+    return indices
+
+
+def quant_lightning_indexer_v2_metadata_va(
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    topk: int,
+    *,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    cmp_residual_k: torch.Tensor | None = None,
+    batch_size: int = 0,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
+    layout_q: str = "TND",
+    layout_k: str = "PA_BBND",
+    mask_mode: int = 3,
+    cmp_ratio: int = 1,
+) -> torch.Tensor:
+    """Build the 1024 x int32 tiling-metadata schedule buffer for the "_va" V2 indexer."""
+    return torch.ops.xllm_ops.quant_lightning_indexer_v2_metadata_va(
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        topk,
+        2,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        cmp_residual_k=cmp_residual_k,
+        batch_size=batch_size,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        layout_q=layout_q,
+        layout_k=layout_k,
+        mask_mode=mask_mode,
+        cmp_ratio=cmp_ratio,
+    )
+
+
 def scatter_nd_update(
     value: torch.Tensor,
     indices: torch.Tensor,

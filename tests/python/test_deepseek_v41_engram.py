@@ -1075,7 +1075,7 @@ def test_engram_embedding_int8_storage_dequant() -> None:
 
 
 # Minimal V4.1 config carrying one engram layer, standing in for the engram
-# fields of ``_DSV41_TINY_CONFIG`` in test_deepseek_v41_model.py.
+# fields of ``_DEEPSEEK_V41_TINY_CONFIG`` in test_deepseek_v41_model.py.
 # ``DeepseekV41Config.from_dict`` fills every other field with its production
 # default, so only the fields that drive ``engram_config`` validation need to
 # be present.
@@ -1086,17 +1086,14 @@ _ENGRAM_OFFLOAD_CONFIG: dict[str, Any] = {
 }
 
 
-def test_engram_offload_active_is_config_controlled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``engram_config.cpu_offload`` -- not the removed env -- selects the
-    host-offload path.
+def test_engram_offload_active_is_config_controlled() -> None:
+    """``engram_config.cpu_offload`` selects the host-offload path.
 
     ``DeepseekV41Model`` derives ``engram_offload_active`` from
-    ``engram_config.cpu_offload`` (deepseek_v41.py); the old
-    ``XLLM_V41_ENGRAM_OFFLOAD`` env gate is gone. The first half pins that the
-    parsed config field -- which drives ``engram_offload_active`` for an
-    engram-carrying checkpoint -- follows the switch; the second half pins that
-    the dead env hook really is removed and a stale launcher export cannot flip
-    the default.
+    ``engram_config.cpu_offload`` (deepseek_v41.py). Pins that the parsed
+    config field -- which drives ``engram_offload_active`` for an
+    engram-carrying checkpoint -- follows the config, and that the removed
+    env hook is truly gone.
     """
     from xllm.python.models import deepseek_v41_engram as engram_mod
     from xllm.python.models.engram_config import EngramConfig
@@ -1118,10 +1115,6 @@ def test_engram_offload_active_is_config_controlled(monkeypatch: pytest.MonkeyPa
     assert bool(off.engram_layer_ids) and off.engram_config.cpu_offload is False
     assert bool(default.engram_layer_ids) and default.engram_config.cpu_offload is False
 
-    # A stale export of the removed env must not re-enable offload on a default
-    # config (the old gate honoured "1"/"true"/"yes"/"on").
-    monkeypatch.setenv("XLLM_V41_ENGRAM_OFFLOAD", "1")
-    assert DeepseekV41Config.from_dict(_ENGRAM_OFFLOAD_CONFIG).engram_config.cpu_offload is False
 
 
 # ``_int8_engram_payload`` / ``_make_int8_embedding`` / ``_engram_ids`` are

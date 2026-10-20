@@ -169,6 +169,12 @@ class DsaMetadata:
     # prefill when cp_size > 1 and must never survive into a later forward.
     v4_cp_context: object | None = None
 
+    # Candidate A: names of the value-derived fields a graph-replay build wrote
+    # directly into the captured operands. Populated only on the in-place
+    # refresh path; empty otherwise. The replay copy asserts these alias their
+    # captured storage instead of copying them.
+    refresh_inplace_fields: frozenset[str] = field(default_factory=frozenset)
+
 
 def _normalize_compress_ratio(ratio: int) -> int:
     """Mirrors ``deepseek_v4_normalize_compress_ratio``."""
@@ -386,7 +392,25 @@ class DsaMetadataBuilder:
         graph_block_table_capacity_cols: int = 0,
         max_query_len: int = 0,
         max_seq_len: int = 0,
+        group_limit: int | None = None,
+        swa_device_ctx_lens: torch.Tensor | None = None,
+        dst: DsaMetadata | None = None,
     ) -> DsaMetadata:
+        """Build one forward's DSA metadata.
+
+        ``swa_device_ctx_lens`` opts the SWA group's slot mapping into the
+        pure-device path: it is the device-resident per-sequence KV length
+        truth (``metadata.kv_seq_lens``). ``None`` (the default) keeps the
+        historical host-loop build.
+
+        ``dst`` opts the whole build into the in-place refresh path: the
+        graph-captured ``DsaMetadata`` whose tensor buffers were baked into
+        the ACL graph. When every shape matches, the value-derived fields are
+        written straight into those buffers and the returned metadata aliases
+        them, so the replay copy chain degenerates to a shape/alias
+        assertion. ``None`` (the default and the only value the replay path
+        passes) keeps the historical build byte-for-byte.
+        """
         batch_size = len(kv_seq_lens)
         if q_seq_lens is None or len(q_seq_lens) != batch_size:
             if is_prefill or is_chunked_prefill:
@@ -401,6 +425,7 @@ class DsaMetadataBuilder:
             q_lens,
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
+            dst=dst,
         )
         dsa.input_positions = positions
         dsa.is_acl_graph = enable_graph
@@ -409,8 +434,14 @@ class DsaMetadataBuilder:
             dsa.cos_table = cos_sin_chunks[0].contiguous()
             dsa.sin_table = cos_sin_chunks[1].contiguous()
         if positions is not None and positions.numel() > 0:
-            self._build_positions(dsa, kv_seq_lens, q_lens, enable_graph)
-        dsa.start_pos = (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch.int32)
+            self._build_positions(dsa, kv_seq_lens, q_lens, enable_graph, dst=dst)
+        if dst is not None and self._start_pos_dst_ok(dst, dsa):
+            # ``out=`` writes the captured buffer and leaves the value identical
+            # to the allocating ``(a - b).to(int32)`` on int32 operands.
+            torch.sub(dsa.actual_seq_lengths_kv, dsa.seq_lens_q, out=dst.start_pos)
+            dsa.start_pos = dst.start_pos
+        else:
+            dsa.start_pos = (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch.int32)
 
         self._build_block_tables_and_slots(
             multi_block_tables,
@@ -422,8 +453,22 @@ class DsaMetadataBuilder:
             graph_block_table_capacity_cols,
             new_cache_slots,
             dsa,
+            group_limit=group_limit,
+            swa_device_ctx_lens=swa_device_ctx_lens,
+            dst=dst,
         )
         return dsa
+
+    # -- in-place refresh destination compatibility (candidate A) --
+
+    @staticmethod
+    def _start_pos_dst_ok(dst: DsaMetadata, dsa: DsaMetadata) -> bool:
+        target = getattr(dst, "start_pos", None)
+        if target is None or target.dtype != torch.int32:
+            return False
+        if target.shape != dsa.seq_lens_q.shape:
+            return False
+        return target.device == dsa.seq_lens_q.device == dsa.actual_seq_lengths_kv.device
 
     # -- step 1: sequence lengths (build_seq_lengths, cpp:574-661) ----------
 
@@ -434,6 +479,7 @@ class DsaMetadataBuilder:
         *,
         max_query_len: int,
         max_seq_len: int,
+        dst: DsaMetadata | None = None,
     ) -> DsaMetadata:
         device = torch.device("cpu")
         kv = torch.tensor(kv_seq_lens, dtype=torch.int32, device=device)
@@ -448,6 +494,51 @@ class DsaMetadataBuilder:
             int(max_seq_len),
             max((int(value) for value in kv_seq_lens), default=0),
         )
+        if dst is not None and self._seq_lengths_dst_ok(
+            dst,
+            kv,
+            q,
+            actual_seq_lengths_query,
+            kv_cu,
+            max_kv,
+            max_q,
+        ):
+            # In-place refresh: write the host-derived values straight into the
+            # graph-captured buffers (addresses never move); ``seq_lens`` /
+            # ``actual_seq_lengths_kv`` already alias one captured storage
+            # (checked by ``_seq_lengths_dst_ok``), so one write updates both
+            # operands without rebinding either.
+            #
+            # ``kv_cu_seq_lens`` here carries the HOST cumsum semantics: its
+            # padded tail keeps advancing, unlike the C++ op which re-broadcasts
+            # the last real value. Harmless today (the decode ACL path never
+            # consumes ``kv_cu_seq_lens``) but MUST be revisited if a future
+            # consumer reads the cumulative axis across pad lanes.
+            dst.seq_lens.copy_(kv, non_blocking=True)
+            dst.seq_lens_q.copy_(q, non_blocking=True)
+            dst.actual_seq_lengths_query.copy_(actual_seq_lengths_query, non_blocking=True)
+            dst.kv_cu_seq_lens.copy_(kv_cu, non_blocking=True)
+            dst.max_seqlen_kv.copy_(max_kv, non_blocking=True)
+            dst.max_seqlen_q.copy_(max_q, non_blocking=True)
+            dst.max_query_len = max_query_len
+            dst.max_seq_len = max_seq_len
+            dst.layer_id = -1
+            return DsaMetadata(
+                layer_id=-1,
+                seq_lens=dst.seq_lens,
+                seq_lens_q=dst.seq_lens_q,
+                actual_seq_lengths_kv=dst.seq_lens,
+                actual_seq_lengths_query=dst.actual_seq_lengths_query,
+                kv_cu_seq_lens=dst.kv_cu_seq_lens,
+                max_seqlen_kv=dst.max_seqlen_kv,
+                max_seqlen_q=dst.max_seqlen_q,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                input_positions=torch.empty(0),
+                c4_pad_positions=torch.empty(0, dtype=torch.int64),
+                c128_pad_positions=torch.empty(0, dtype=torch.int64),
+                start_pos=torch.empty(0),
+            )
         return DsaMetadata(
             layer_id=-1,
             seq_lens=kv,
@@ -465,6 +556,36 @@ class DsaMetadataBuilder:
             start_pos=torch.empty(0),
         )
 
+    @staticmethod
+    def _seq_lengths_dst_ok(
+        dst: DsaMetadata,
+        kv: torch.Tensor,
+        q: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        kv_cu: torch.Tensor,
+        max_kv: torch.Tensor,
+        max_q: torch.Tensor,
+    ) -> bool:
+        """Whether the captured buffers can absorb the seq-lens family in place."""
+        for name, source in (
+            ("seq_lens", kv),
+            ("seq_lens_q", q),
+            ("actual_seq_lengths_query", actual_seq_lengths_query),
+            ("kv_cu_seq_lens", kv_cu),
+            ("max_seqlen_kv", max_kv),
+            ("max_seqlen_q", max_q),
+        ):
+            target = getattr(dst, name, None)
+            if target is None or target.dtype != torch.int32 or target.shape != source.shape:
+                return False
+        alias = getattr(dst, "actual_seq_lengths_kv", None)
+        if alias is None or alias.data_ptr() != dst.seq_lens.data_ptr():
+            # The capture contract aliases seq_lens / actual_seq_lengths_kv onto
+            # one storage; an unaliased destination would lose one of the two
+            # captured operands, so fall back to the copy path.
+            return False
+        return True
+
     # -- step 2: positions (build_positions, cpp:663-777) ------------------
 
     def _build_positions(
@@ -473,6 +594,7 @@ class DsaMetadataBuilder:
         kv_seq_lens: Sequence[int],
         q_lens: Sequence[int],
         enable_graph: bool,
+        dst: DsaMetadata | None = None,
     ) -> None:
         """Collect c4/c128 compressed RoPE positions.
 
@@ -513,8 +635,19 @@ class DsaMetadataBuilder:
                 out[idx] = p
             return out
 
-        dsa.c4_pad_positions = _pad(c4_positions, 4)
-        dsa.c128_pad_positions = _pad(c128_positions, 128)
+        dsa.c4_pad_positions = self._write_positions(dst, "c4_pad_positions", _pad(c4_positions, 4))
+        dsa.c128_pad_positions = self._write_positions(dst, "c128_pad_positions", _pad(c128_positions, 128))
+
+    @staticmethod
+    def _write_positions(dst: DsaMetadata | None, name: str, source: torch.Tensor) -> torch.Tensor:
+        """Write a compressed-position vector into its captured buffer if possible."""
+        if dst is None:
+            return source
+        target = getattr(dst, name, None)
+        if target is None or target.dtype != source.dtype or target.shape != source.shape:
+            return source
+        target.copy_(source, non_blocking=True)
+        return target
 
     # -- step 3: block_tables / slot_mappings (build_dsa_fields, cpp:169-264)
 
@@ -529,11 +662,29 @@ class DsaMetadataBuilder:
         graph_block_table_capacity_cols: int,
         new_cache_slots: Sequence[int] | None,
         dsa: DsaMetadata,
+        group_limit: int | None = None,
+        swa_device_ctx_lens: torch.Tensor | None = None,
+        dst: DsaMetadata | None = None,
     ) -> None:
+        """Expand the request's per-group block tables into per-layer metadata.
+
+        ``group_limit`` is for a model that shares this request's metadata but
+        owns fewer cache groups than its owner (the DSpark draft reads the
+        target's metadata): the request's tables follow the fixed export order
+        (SWA first), so a model's own deduplicated groups are its leading
+        entries. ``None`` (the owning model) consumes every table.
+
+        ``dst`` (in-place refresh) supplies the graph-captured per-group tensor
+        that each manager's table is written into directly.
+        """
         if not multi_block_tables or not self.caches_info:
             return
 
         active = list(multi_block_tables)
+        if group_limit is not None:
+            if group_limit < 0:
+                raise ValueError(f"group_limit must be non-negative, got {group_limit}")
+            active = active[:group_limit]
         manager_num = len(active)
         # Packed [manager, blocks] auto-unpack when batch_size == 1.
         if (
@@ -565,6 +716,12 @@ class DsaMetadataBuilder:
         graph_slot_capacity = int(positions.numel()) if enable_graph and positions.numel() > 0 else 0
         total_tokens = sum(int(x) for x in ctx_lens)
 
+        dst_bt: list[torch.Tensor | None] = [None] * manager_num
+        dst_slots: list[torch.Tensor | None] = [None] * manager_num
+        if dst is not None:
+            for m in range(manager_num):
+                dst_bt[m], dst_slots[m] = self._find_group_dst(dst, m)
+
         proc_bt: list[torch.Tensor] = [torch.empty(0)] * manager_num
         proc_slots: list[torch.Tensor] = [torch.empty(0)] * manager_num
         for m in range(manager_num):
@@ -579,6 +736,9 @@ class DsaMetadataBuilder:
                 graph_slot_capacity,
                 graph_block_table_capacity_cols,
                 new_cache_slots,
+                swa_device_ctx_lens,
+                dst_bt=dst_bt[m],
+                dst_slots=dst_slots[m],
             )
 
         n_layers = len(self.caches_info)
@@ -594,6 +754,56 @@ class DsaMetadataBuilder:
                     dsa.block_tables[lid].append(torch.empty(0))
                     dsa.slot_mappings[lid].append(torch.empty(0))
 
+    def _find_group_dst(
+        self,
+        dst: DsaMetadata,
+        manager_id: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Locate the captured block-table / slot buffer of one manager group.
+
+        Every layer/cache in a group aliases one tensor, so the first entry for
+        ``manager_id`` is the captured buffer the in-place refresh writes into.
+        """
+        block_tables = getattr(dst, "block_tables", None) or []
+        slot_mappings = getattr(dst, "slot_mappings", None) or []
+        for lid, layer in enumerate(block_tables):
+            if lid >= len(self.caches_info):
+                break
+            for ci, cache_info in enumerate(self.caches_info[lid]):
+                if cache_info.group_id != manager_id or ci >= len(layer):
+                    continue
+                block = layer[ci]
+                slot = None
+                if lid < len(slot_mappings) and ci < len(slot_mappings[lid]):
+                    slot = slot_mappings[lid][ci]
+                return block, slot
+        return None, None
+
+    @staticmethod
+    def _block_table_dst_ok(
+        dst_bt: torch.Tensor | None,
+        raw_bt: torch.Tensor,
+        batch_size: int,
+        cols: int,
+    ) -> bool:
+        return (
+            dst_bt is not None
+            and dst_bt.dtype == torch.int32
+            and dst_bt.dim() == 2
+            and dst_bt.device == raw_bt.device
+            and dst_bt.size(0) >= batch_size
+            and dst_bt.size(1) == cols
+        )
+
+    @staticmethod
+    def _slot_dst_ok(dst_slots: torch.Tensor | None, raw_bt: torch.Tensor, rows: int) -> bool:
+        return (
+            dst_slots is not None
+            and dst_slots.dtype == torch.int32
+            and dst_slots.device == raw_bt.device
+            and dst_slots.numel() == rows
+        )
+
     # -- per-group processing (process_group, cpp:323-362) -----------------
 
     def _process_group(
@@ -607,6 +817,9 @@ class DsaMetadataBuilder:
         graph_slot_capacity: int,
         graph_block_table_capacity_cols: int,
         new_cache_slots: Sequence[int] | None,
+        swa_device_ctx_lens: torch.Tensor | None = None,
+        dst_bt: torch.Tensor | None = None,
+        dst_slots: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if gi.cache_type == DSA_CACHE_TOKEN:
             return self._process_token_group(
@@ -618,6 +831,8 @@ class DsaMetadataBuilder:
                 batch_size,
                 graph_slot_capacity,
                 graph_block_table_capacity_cols,
+                dst_bt=dst_bt,
+                dst_slots=dst_slots,
             )
         if gi.cache_type == DSA_CACHE_SLIDING_WINDOW:
             return self._process_swa_group(
@@ -629,6 +844,9 @@ class DsaMetadataBuilder:
                 graph_slot_capacity,
                 graph_block_table_capacity_cols,
                 new_cache_slots,
+                swa_device_ctx_lens,
+                dst_bt=dst_bt,
+                dst_slots=dst_slots,
             )
         # SEQUENCE: expand the whole context.
         return self._expand_blocks_to_slots(raw_bt, gi, ctx_lens, batch_size, total_tokens)
@@ -646,6 +864,8 @@ class DsaMetadataBuilder:
         batch_size: int,
         graph_slot_capacity: int,
         graph_block_table_capacity_cols: int,
+        dst_bt: torch.Tensor | None = None,
+        dst_slots: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         committed_rows = 0
         for seq in range(batch_size):
@@ -655,7 +875,14 @@ class DsaMetadataBuilder:
             committed_rows += ctx_len // ratio - prev_ctx_len // ratio
 
         out_slot_rows = max(graph_slot_capacity, committed_rows) if graph_slot_capacity > 0 else committed_rows
-        out_slots = torch.full((out_slot_rows,), -1, dtype=torch.int32, device=raw_bt.device)
+        use_dst_slots = self._slot_dst_ok(dst_slots, raw_bt, out_slot_rows)
+        if use_dst_slots:
+            # In-place: seed the host list directly (no device ``torch.full`` +
+            # ``.tolist()`` D2H) and write once into the captured buffer.
+            slots_list = [-1] * out_slot_rows
+        else:
+            out_slots = torch.full((out_slot_rows,), -1, dtype=torch.int32, device=raw_bt.device)
+            slots_list = out_slots.tolist()
         semantic_cols = int(raw_bt.size(1))
 
         def slot_for_compressed_index(seq: int, compressed_idx: int) -> int:
@@ -671,7 +898,6 @@ class DsaMetadataBuilder:
             return block_id * block_size + block_offset
 
         write_idx = 0
-        slots_list = out_slots.tolist()
         for seq in range(batch_size):
             ctx_len = int(ctx_lens[seq])
             q_len = max(0, min(int(q_lens[seq]), ctx_len))
@@ -682,12 +908,24 @@ class DsaMetadataBuilder:
             for i in range(new_committed):
                 slots_list[write_idx] = slot_for_compressed_index(seq, prev_committed + i)
                 write_idx += 1
-        out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
+        if use_dst_slots:
+            out_slots = dst_slots
+            out_slots.copy_(torch.tensor(slots_list, dtype=torch.int32), non_blocking=True)
+        else:
+            out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
         out_bt = raw_bt
         if graph_slot_capacity > 0 and graph_block_table_capacity_cols > 0:
             cap = max(graph_block_table_capacity_cols, int(raw_bt.size(1)))
-            out_bt = self._pad_block_table(raw_bt, batch_size, cap, -1)
+            if self._block_table_dst_ok(dst_bt, raw_bt, batch_size, cap):
+                out_bt = dst_bt
+                out_bt.fill_(-1)
+                rows = min(batch_size, int(raw_bt.size(0)))
+                copy_cols = min(int(raw_bt.size(1)), cap)
+                if rows > 0 and copy_cols > 0:
+                    out_bt[:rows, :copy_cols] = raw_bt[:rows, :copy_cols]
+            else:
+                out_bt = self._pad_block_table(raw_bt, batch_size, cap, -1)
         return out_bt, out_slots
 
     # -- SWA group (process_swa_group, cpp:466-572) ------------------------
@@ -703,42 +941,72 @@ class DsaMetadataBuilder:
         graph_slot_capacity: int,
         graph_block_table_capacity_cols: int,
         new_cache_slots: Sequence[int] | None,
+        swa_device_ctx_lens: torch.Tensor | None = None,
+        dst_bt: torch.Tensor | None = None,
+        dst_slots: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         query_total_tokens = 0
         for seq in range(batch_size):
             query_total_tokens += max(0, min(int(q_lens[seq]), int(ctx_lens[seq])))
 
         out_slot_rows = max(graph_slot_capacity, query_total_tokens) if graph_slot_capacity > 0 else query_total_tokens
-        out_slots = torch.full((out_slot_rows,), -1, dtype=torch.int32, device=raw_bt.device)
         semantic_cols = int(raw_bt.size(1))
+        use_dst_slots = self._slot_dst_ok(dst_slots, raw_bt, out_slot_rows)
 
-        def slot_for_position(seq: int, pos: int) -> int:
-            if semantic_cols <= 0 or seq >= raw_bt.size(0):
-                return -1
-            block_idx = (pos // block_size) % semantic_cols
-            block_id = int(raw_bt[seq, block_idx].item())
-            if block_id < 0:
-                return -1
-            block_offset = pos % block_size
-            return block_id * block_size + block_offset
-
-        write_idx = 0
-        slots_list = out_slots.tolist()
-        if new_cache_slots is not None and len(new_cache_slots) == query_total_tokens:
-            slots_list[:query_total_tokens] = [int(slot) for slot in new_cache_slots]
-            write_idx = query_total_tokens
+        if swa_device_ctx_lens is not None:
+            # Pure-device slot mapping. Uses the device KV-length truth
+            # (bit-equal to the host ``ctx_lens`` on the decode graph path) so
+            # there is no per-token ``.item()`` / ``.tolist()`` D2H here.
+            out_slots = self._swa_slots_on_device(
+                raw_bt,
+                block_size,
+                semantic_cols,
+                out_slot_rows,
+                batch_size,
+                q_lens,
+                new_cache_slots,
+                query_total_tokens,
+                swa_device_ctx_lens,
+                dst_slots=dst_slots if use_dst_slots else None,
+            )
         else:
-            for seq in range(batch_size):
-                ctx_len = int(ctx_lens[seq])
-                q_len = max(0, min(int(q_lens[seq]), ctx_len))
-                if seq >= raw_bt.size(0):
-                    write_idx += q_len
-                    continue
-                q_start = ctx_len - q_len
-                for i in range(q_len):
-                    slots_list[write_idx] = slot_for_position(seq, q_start + i)
-                    write_idx += 1
-        out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
+            if use_dst_slots:
+                out_slots = dst_slots
+                out_slots.fill_(-1)
+                slots_list = [-1] * out_slot_rows
+            else:
+                out_slots = torch.full((out_slot_rows,), -1, dtype=torch.int32, device=raw_bt.device)
+                slots_list = out_slots.tolist()
+
+            def slot_for_position(seq: int, pos: int) -> int:
+                if semantic_cols <= 0 or seq >= raw_bt.size(0):
+                    return -1
+                block_idx = (pos // block_size) % semantic_cols
+                block_id = int(raw_bt[seq, block_idx].item())
+                if block_id < 0:
+                    return -1
+                block_offset = pos % block_size
+                return block_id * block_size + block_offset
+
+            write_idx = 0
+            if new_cache_slots is not None and len(new_cache_slots) == query_total_tokens:
+                slots_list[:query_total_tokens] = [int(slot) for slot in new_cache_slots]
+                write_idx = query_total_tokens
+            else:
+                for seq in range(batch_size):
+                    ctx_len = int(ctx_lens[seq])
+                    q_len = max(0, min(int(q_lens[seq]), ctx_len))
+                    if seq >= raw_bt.size(0):
+                        write_idx += q_len
+                        continue
+                    q_start = ctx_len - q_len
+                    for i in range(q_len):
+                        slots_list[write_idx] = slot_for_position(seq, q_start + i)
+                        write_idx += 1
+            if use_dst_slots:
+                out_slots.copy_(torch.tensor(slots_list, dtype=torch.int32), non_blocking=True)
+            else:
+                out_slots = torch.tensor(slots_list, dtype=torch.int32, device=raw_bt.device)
 
         # Rebuild the read-side block table with the SWA ring semantics.
         #
@@ -779,12 +1047,16 @@ class DsaMetadataBuilder:
         if graph_slot_capacity > 0 and graph_block_table_capacity_cols > 0:
             storage_cols = max(graph_block_table_capacity_cols, int(raw_bt.size(1)))
             max_dst_len = max(max_dst_len, storage_cols)
-        new_bt = torch.full(
-            (batch_size, max_dst_len),
-            -1,
-            dtype=torch.int32,
-            device=raw_bt.device,
-        )
+        if self._block_table_dst_ok(dst_bt, raw_bt, batch_size, max_dst_len):
+            new_bt = dst_bt
+            new_bt.fill_(-1)
+        else:
+            new_bt = torch.full(
+                (batch_size, max_dst_len),
+                -1,
+                dtype=torch.int32,
+                device=raw_bt.device,
+            )
         rows = min(batch_size, int(raw_bt.size(0)))
         if self.read_table_layout == READ_TABLE_LAYOUT_RING:
             if rows > 0 and max_dst_len > 0 and semantic_cols > 0:
@@ -804,6 +1076,73 @@ class DsaMetadataBuilder:
                     physical_col = logical_col % semantic_cols
                     new_bt[s, logical_col] = raw_bt[s, physical_col]
         return new_bt, out_slots
+
+    @staticmethod
+    def _swa_slots_on_device(
+        raw_bt: torch.Tensor,
+        block_size: int,
+        semantic_cols: int,
+        out_slot_rows: int,
+        batch_size: int,
+        q_lens: Sequence[int],
+        new_cache_slots: Sequence[int] | None,
+        query_total_tokens: int,
+        device_ctx_lens: torch.Tensor,
+        dst_slots: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Device-only form of the SWA slot mapping.
+
+        Vectorized equivalent of the host loop: for every committed token row
+        ``slot = block_id * block_size + pos % block_size`` where
+        ``block_id = raw_bt[row, (pos // block_size) % semantic_cols]`` and a
+        negative block maps to ``-1``. ``pos`` is the row's last query position
+        ``ctx_len - q_len``; ``device_ctx_lens`` is the device truth equal to the
+        host ``ctx_lens`` on the decode graph path.
+
+        ``new_cache_slots`` (host, from the C++ scheduler) still uploads via a
+        one-shot H2D -- it is an H2D, not the D2H sync this path removes. The
+        device branch is only selected after the caller proves the ``q == 1``
+        decode contract and ``ctx_len >= 1`` for every row, so the host loop's
+        monotonic ``write_idx`` degenerates to the row index and the row-aligned
+        write below is bit-identical.
+        """
+        use_dst = (
+            dst_slots is not None
+            and dst_slots.dtype == torch.int32
+            and dst_slots.device == raw_bt.device
+            and dst_slots.numel() == out_slot_rows
+        )
+        if use_dst:
+            out_slots = dst_slots
+            out_slots.fill_(-1)
+        else:
+            out_slots = torch.full((out_slot_rows,), -1, dtype=torch.int32, device=raw_bt.device)
+        if new_cache_slots is not None and len(new_cache_slots) == query_total_tokens:
+            out_slots[:query_total_tokens] = torch.tensor(
+                [int(slot) for slot in new_cache_slots],
+                dtype=torch.int32,
+                device=raw_bt.device,
+            )
+            return out_slots
+        rows = min(batch_size, int(raw_bt.size(0)), int(device_ctx_lens.numel()))
+        if rows <= 0 or semantic_cols <= 0 or block_size <= 0:
+            return out_slots
+        ctx = device_ctx_lens[:rows].to(torch.int32)
+        query_lens = torch.tensor(
+            [max(0, int(q_lens[seq])) for seq in range(rows)],
+            dtype=torch.int32,
+            device=raw_bt.device,
+        )
+        q_eff = torch.minimum(query_lens, ctx.clamp_min(0))
+        q_start = ctx - q_eff
+        block_idx = ((q_start // block_size) % semantic_cols).to(torch.int64)
+        block_id = raw_bt[:rows].gather(1, block_idx.unsqueeze(1)).squeeze(1)
+        offset = q_start % block_size
+        slot = block_id * block_size + offset
+        slot = torch.where(block_id < 0, torch.full_like(slot, -1), slot)
+        slot = torch.where(q_eff > 0, slot, torch.full_like(slot, -1))
+        out_slots[:rows] = slot.to(torch.int32)
+        return out_slots
 
     # -- SEQUENCE group (expand_blocks_to_slots, cpp:270-307) --------------
 

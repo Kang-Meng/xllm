@@ -54,6 +54,42 @@ TEST(ModelRegistryTest, DeepseekV4DSparkUsesTorchBackend) {
             "--npu_kernel_backend=TORCH.");
 }
 
+// The Python-path V4.1 DSpark draft is registered under its own model_type (see
+// xllm/python/registry.py) and must resolve as a TORCH-only model type like its
+// C++ counterpart, so a stray ATB request fails with a clear message instead of
+// silently selecting the ATB kernels.
+TEST(ModelRegistryTest, DeepseekV41DSparkUsesTorchBackend) {
+  std::string effective_backend;
+  std::string resolved_name;
+  std::string error_message;
+
+  EXPECT_TRUE(resolve_model_registration("deepseek_v41_dspark",
+                                         "AUTO",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(effective_backend, "TORCH");
+  EXPECT_EQ(resolved_name, "deepseek_v41_dspark");
+  EXPECT_TRUE(error_message.empty());
+
+  EXPECT_TRUE(resolve_model_registration("deepseek_v41_dspark",
+                                         "TORCH",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(effective_backend, "TORCH");
+  EXPECT_EQ(resolved_name, "deepseek_v41_dspark");
+
+  EXPECT_FALSE(resolve_model_registration("deepseek_v41_dspark",
+                                          "ATB",
+                                          &effective_backend,
+                                          &resolved_name,
+                                          &error_message));
+  EXPECT_EQ(error_message,
+            "Model type deepseek_v41_dspark only supports "
+            "--npu_kernel_backend=TORCH.");
+}
+
 TEST(ModelRegistryTest, DeepseekV41UsesTorchBackend) {
   std::string effective_backend;
   std::string resolved_name;

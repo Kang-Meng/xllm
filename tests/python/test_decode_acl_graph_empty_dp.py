@@ -298,10 +298,12 @@ def test_busy_dsa_rank_admits_without_flat_scheduler_slots() -> None:
         runner._fill_entry(entry, input_ids, positions, metadata, batch_size=1, input_embedding=None)
     # Empty host slots let the DSA builder recompute the slot from the table.
     assert entry.static_metadata.new_cache_slots_host_values == []
-    # The live row keeps block 3; spare columns and padded rows stay at the
-    # reserved block 0 (gatherable) instead of the old -1 pads.
+    # The live row keeps block 3; its SWA ring block repeats to the capacity
+    # columns per the ring-address semantics (b53efb7a7, GPQA 11/30 -> 18/30),
+    # while padded rows stay at the reserved block 0 (gatherable) instead of
+    # the old -1 pads.
     zero_row = [0] * 4
-    assert entry.static_metadata.multi_block_tables[0].tolist() == [[3, 0, 0, 0], zero_row, zero_row, zero_row]
+    assert entry.static_metadata.multi_block_tables[0].tolist() == [[3, 3, 3, 3], zero_row, zero_row, zero_row]
     assert entry.static_metadata.multi_block_tables[1].tolist() == [[3], [0], [0], [0]]
 
 

@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "core/framework/model/model_args.h"
 #include "core/runtime/options.h"
+#include "core/util/json_reader.h"
 
 namespace xllm {
 namespace {
@@ -195,6 +196,59 @@ TEST(DraftModelConfigDeathTest, RequiresDraftPathForTargetCapture) {
   options.is_draft_engine(false);
   EXPECT_DEATH(configure_block_diffusion_model(args, options),
                "requires --draft_model");
+}
+
+TEST_F(DraftCaptureConfigTest, MaskRootAliasWinsOverTheTextConfigValue) {
+  write_config(R"({"dspark_noise_token_id": 128799,
+                    "text_config": {"dspark_noise_token_id": 1}})");
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse(model_path_ + "/config.json"));
+  EXPECT_EQ(read_mask_token_id(reader), 128799);
+}
+
+TEST_F(DraftCaptureConfigTest, MaskTextConfigFallbackResolves) {
+  write_config(R"({"text_config": {"mask_token_id": 128799}})");
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse(model_path_ + "/config.json"));
+  EXPECT_EQ(read_mask_token_id(reader), 128799);
+}
+
+TEST_F(DraftCaptureConfigTest, MaskMissingEverywhereReturnsInvalid) {
+  write_config(R"({"text_config": {"num_hidden_layers": 40}})");
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse(model_path_ + "/config.json"));
+  EXPECT_EQ(read_mask_token_id(reader), -1);
+}
+
+TEST_F(DraftCaptureConfigTest, MaskRootAliasesKeepTheirPrecedence) {
+  write_config(R"({"dflash_config": {"mask_token_id": 1},
+                    "mask_token_id": 2,
+                    "dspark_noise_token_id": 3})");
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse(model_path_ + "/config.json"));
+  EXPECT_EQ(read_mask_token_id(reader), 1);
+  write_config(R"({"mask_token_id": 2, "dspark_noise_token_id": 3})");
+  ASSERT_TRUE(reader.parse(model_path_ + "/config.json"));
+  EXPECT_EQ(read_mask_token_id(reader), 2);
+  write_config(R"({"dspark_noise_token_id": 3})");
+  ASSERT_TRUE(reader.parse(model_path_ + "/config.json"));
+  EXPECT_EQ(read_mask_token_id(reader), 3);
+}
+
+TEST_F(DraftCaptureConfigTest, BlockSizeRootKeyWinsOverTheTextConfigValue) {
+  write_config(R"({"dspark_block_size": 5,
+                    "text_config": {"dspark_block_size": 7}})");
+  EXPECT_EQ(read_block_size(model_path_), 5);
+}
+
+TEST_F(DraftCaptureConfigTest, BlockSizeTextConfigFallbackResolves) {
+  write_config(R"({"text_config": {"dspark_block_size": 5}})");
+  EXPECT_EQ(read_block_size(model_path_), 5);
+}
+
+TEST_F(DraftCaptureConfigTest, BlockSizeMissingEverywhereStaysZero) {
+  write_config(R"({"text_config": {"num_hidden_layers": 40}})");
+  EXPECT_EQ(read_block_size(model_path_), 0);
 }
 
 #if defined(USE_NPU)

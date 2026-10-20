@@ -1327,6 +1327,11 @@ class DeepseekV4MoE(nn.Module):
     FusedMoEImpl::forward_with_selected_experts.
     """
 
+    # Shared-expert MLP type; V4.1's W8A8 MoE overrides this with its own
+    # subclass that can carry the grouped-clamped fused activation
+    # (``deepseek_v41.DeepseekV41SharedMLP``).
+    _SHARED_MLP_CLS = DeepseekV3MLP
+
     def __init__(self, cfg: DeepseekV4Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
@@ -1432,7 +1437,7 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=cfg.swiglu_limit,
             )
         else:
-            self.shared_experts = DeepseekV3MLP(
+            self.shared_experts = self._SHARED_MLP_CLS(
                 shared_cfg,
                 cfg.moe_intermediate_size * cfg.n_shared_experts,
                 dtype,
@@ -1512,7 +1517,47 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts.gate_up_proj.process_weights_after_loading()
         self.shared_experts.down_proj.process_weights_after_loading()
 
-    def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def _gate_logits(
+        self,
+        gate_input: torch.Tensor,
+        gate_input_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Gate logits hook; subclasses may shift the scores (V4.1 bias_vl)."""
+        del gate_input_ids
+        return self.gate(gate_input)
+
+    def _ep_local_masked_weights(self, topk_weights: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
+        """Zero the gate weights of the experts this rank does not own.
+
+        Mirrors C++ ``fused_moe.cpp:843-850``.
+        """
+        local_mask = (topk_idx >= self.start_expert_id) & (
+            topk_idx < self.start_expert_id + self.num_experts_per_rank
+        )
+        return topk_weights * local_mask.to(topk_weights.dtype)
+
+    def _apply_post_norm(
+        self,
+        hidden: torch.Tensor,
+        post_norm: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalise the MoE FFN input, returning ``(y, y.float())``.
+
+        ``y`` feeds the experts and the widened fp32 result feeds the gate.
+        The base implementation is the eager RMSNorm; ``DeepseekV41W8A8MoE``
+        overrides it to fuse the norm with the gate's fp32 widening. Callers
+        that pass no ``post_norm`` keep their pre-normalised ``hidden`` and the
+        gate widens it itself, so this is never reached.
+        """
+        y = post_norm(hidden)
+        return y, y.to(torch.float32)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        post_norm: nn.Module | None = None,
+    ) -> torch.Tensor:
         from xllm.python import kernels
 
         # DP + EP MoE: every rank runs the gate and experts on the rank-gathered
@@ -1579,9 +1624,17 @@ class DeepseekV4MoE(nn.Module):
             if gate_input_ids is not None:
                 gate_input_ids = gate_input_ids.reshape(-1).to(hidden.device)
 
-        # 1) Gate: compute logits + moe_gating_top_k_hash.
-        gate_input = hidden.to(torch.float32)
-        logits = self.gate(gate_input)
+        # 1) FFN RMSNorm: when the caller delegates it (``post_norm``), run it on
+        # this already pad+all-gathered input so ``y`` feeds the experts and the
+        # exact fp32 widening feeds the gate -- once, on the same row set. The
+        # base method is the eager norm; ``DeepseekV41W8A8MoE`` fuses it. With no
+        # ``post_norm`` the caller pre-normalised ``hidden`` and the gate widens
+        # it itself (the pre-move behaviour).
+        if post_norm is not None:
+            hidden, gate_input = self._apply_post_norm(hidden, post_norm)
+        else:
+            gate_input = hidden.to(torch.float32)
+        logits = self._gate_logits(gate_input, gate_input_ids)
         norm_type = {"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}.get(self.scoring_func, 2)
         renorm = 0 if norm_type == 2 else 1
 
@@ -1624,10 +1677,7 @@ class DeepseekV4MoE(nn.Module):
         # 2) EP: zero out non-local expert weights (C++ fused_moe.cpp:843-850).
         ep_size = self.cfg.ep_size if self.cfg.ep_size > 0 else self.cfg.tp_size
         if ep_size > 1:
-            local_mask = (topk_idx >= self.start_expert_id) & (
-                topk_idx < self.start_expert_id + self.num_experts_per_rank
-            )
-            topk_weights = topk_weights * local_mask.to(topk_weights.dtype)
+            topk_weights = self._ep_local_masked_weights(topk_weights, topk_idx)
 
         # 3) Expert computation with pre-selected routing (EP-sharded).
         if self.uses_mx_formats:
@@ -1734,7 +1784,7 @@ class DeepseekV4MoE(nn.Module):
                 self.cfg.swiglu_limit,
             )
         # 4) Shared experts + C++-ordered TP/EP reductions.
-        shared_out = self.shared_experts(hidden)
+        shared_out = self._run_shared_experts(hidden)
         if self.shared_expert_gate_is_loaded:
             shared_gate = torch.sigmoid(self.shared_expert_gate(hidden))
             shared_out = shared_gate * shared_out
@@ -1749,6 +1799,15 @@ class DeepseekV4MoE(nn.Module):
             start = self.dp_rank * padded_tokens
             output = output.narrow(0, start, token_counts[self.dp_rank])
         return output
+
+    def _run_shared_experts(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Run the shared expert on the MoE input.
+
+        The base implementation is the eager ``DeepseekV3MLP`` forward;
+        ``DeepseekV41W8A8MoE`` overrides it to fuse the clamped SwiGLU into
+        the W8A8 operator tail when the static guards hold.
+        """
+        return self.shared_experts(hidden)
 
     def _reduce_moe_outputs(self, routed_out: torch.Tensor, shared_out: torch.Tensor) -> torch.Tensor:
         """Reduce routed/shared results in the C++ ``FusedMoEImpl`` order.

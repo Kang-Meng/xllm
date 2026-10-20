@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/util/pybind_helper.h"
+#include "core/util/utils.h"
 #include "models/py_model_helper.h"
 
 #if defined(USE_NPU)
@@ -111,16 +112,29 @@ int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
 
 namespace {
 
+// Positional tuple form of a ``LayerCache`` (see
+// xllm/python/attention/backend.py::_LAYER_CACHE_SLOTS). The order is a
+// cross-language contract: every slot must be passed through, otherwise a model
+// that reads a trailing slot sees ``None`` and silently skips its cache (the
+// DSpark draft reads its SWA pool from slot 5). Getters a cache does not own
+// return an empty tensor, which ``optional_tensor`` maps back to ``None``, so
+// models using only the leading slots keep the exact same Python objects.
 py::list build_python_kv_caches(std::vector<KVCache>& kv_caches) {
   py::list python_caches;
   for (KVCache& kv_cache : kv_caches) {
-    python_caches.append(
-        py::make_tuple(optional_tensor(kv_cache.get_k_cache()),
-                       optional_tensor(kv_cache.get_v_cache()),
-                       optional_tensor(kv_cache.get_index_cache()),
-                       optional_tensor(kv_cache.get_conv_cache()),
-                       optional_tensor(kv_cache.get_ssm_cache()),
-                       optional_tensor(kv_cache.get_swa_cache())));
+    python_caches.append(py::make_tuple(
+        optional_tensor(kv_cache.get_k_cache()),
+        optional_tensor(kv_cache.get_v_cache()),
+        optional_tensor(kv_cache.get_index_cache()),
+        optional_tensor(kv_cache.get_conv_cache()),
+        optional_tensor(kv_cache.get_ssm_cache()),
+        optional_tensor(kv_cache.get_swa_cache()),
+        optional_tensor(kv_cache.get_compress_kv_state()),
+        optional_tensor(kv_cache.get_compress_score_state()),
+        optional_tensor(kv_cache.get_compress_index_kv_state()),
+        optional_tensor(kv_cache.get_compress_index_score_state()),
+        optional_tensor(kv_cache.get_indexer_cache_scale()),
+        optional_tensor(kv_cache.get_kpool_tail())));
   }
   return python_caches;
 }
@@ -279,9 +293,12 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
 
   py::gil_scoped_acquire gil;
   // deepseek_v4 and deepseek_v41 python models own their TP/moe_tp/EP splits
-  // internally, so PyCausalLM must not init those process groups here.
-  const bool is_deepseek_v4 = model_args_.model_type() == "deepseek_v4" ||
-                              model_args_.model_type() == "deepseek_v41";
+  // internally, so PyCausalLM must not init those process groups here. The
+  // DSpark drafts are V4-family drafts and own their splits the same way.
+  const bool is_deepseek_v4 =
+      model_args_.model_type() == "deepseek_v4" ||
+      model_args_.model_type() == "deepseek_v41" ||
+      util::is_deepseek_v4_dspark_model_type(model_args_.model_type());
   const bool needs_python_process_group =
       !is_deepseek_v4 || dp_size_ > 1 || cp_size_ > 1;
   if (needs_python_process_group) {
@@ -499,7 +516,35 @@ py::dict PyCausalLM::build_config_dict(
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
   d["layerwise_split_rank"] = layerwise_split_rank_;
-  bool requires_eager_execution = model_args_.requires_eager_execution();
+  // Every block-diffusion draft stays eager: its query block is non-causal and
+  // its context-KV injection is a data-dependent scatter, neither of which the
+  // decode graph runner can capture. The reflected ModelArgs property is the
+  // base-branch mechanism (the worker sets it while routing drafts); the
+  // explicit model-type set is kept alongside it so the contract also holds for
+  // callers that build the config dict without going through the worker.
+  const bool eager_draft_model =
+      model_args_.requires_eager_execution() ||
+      model_args_.model_type() == kDFlashDraftModelType ||
+      model_args_.model_type() == kDSparkDraftModelType ||
+      util::is_deepseek_v4_dspark_model_type(model_args_.model_type());
+  // A *target* that captures aux hidden states is normally pinned to eager too:
+  // the plain capture returns a tuple while the graph runner only accepts a
+  // single Tensor output. The opt-in flag lets the whitelisted target publish
+  // the capture through the runner's persistent aux buffer instead, so the
+  // graph can be captured; every other aux-capture target stays eager.
+  const bool allow_graph_aux_hidden_states =
+      ExecutionConfig::get_instance().enable_graph_aux_hidden_states();
+  // The aux-capture graph opt-in only matters for a model that actually
+  // captures aux hidden states: without layers to capture there is no tuple
+  // output problem to work around, so the flag alone must not force eager.
+  // An aux-capture target goes eager unless the flag is on AND it is the
+  // whitelisted deepseek_v41 target (single condition: the empty layer set
+  // never forces eager, the flag-off capture always does).
+  bool requires_eager_execution =
+      eager_draft_model ||
+      (!model_args_.layers_to_capture().empty() &&
+       (!allow_graph_aux_hidden_states ||
+        model_args_.model_type() != "deepseek_v41"));
 #if defined(USE_NPU)
   const bool is_glm52_eplv2 =
       model_args_.model_type() == "glm_moe_dsa" &&
@@ -515,6 +560,10 @@ py::dict PyCausalLM::build_config_dict(
       requires_eager_execution
           ? std::string("off")
           : ExecutionConfig::get_instance().python_graph_backend();
+  // Bridge the aux-capture graph opt-in to the Python model: the graph-capable
+  // target reads this to publish its capture through a persistent buffer
+  // instead of returning the tuple the graph runner cannot accept.
+  d["enable_graph_aux_hidden_states"] = allow_graph_aux_hidden_states;
   // Engram host-offload switches, forwarded as the raw JSON string; the Python
   // executor parses/validates it (xllm/python/models/engram_config.py).
   d["engram_config"] = ModelConfig::get_instance().engram_config();
@@ -789,6 +838,21 @@ void PyCausalLM::moe_ep_all_reduce(torch::Tensor& tensor) {
   if (moe_ep_group_ != nullptr) {
     moe_ep_group_->allreduce(tensor);
   }
+}
+
+std::string PyCausalLM::moe_ep_comm_name() {
+  // Callers probe this to decide whether the MC2 all-to-all kernels can run;
+  // an absent group must read as "unavailable" (empty string), never throw.
+  if (moe_ep_group_ == nullptr) {
+    return std::string();
+  }
+  return moe_ep_group_->hccl_comm_name(/*init_comm=*/true);
+}
+
+int64_t PyCausalLM::moe_ep_rank() {
+  // Ranks are fixed when the parallel groups are built; probing this for the
+  // MC2 kernels must never throw, so an absent EP group reads as rank 0.
+  return ep_rank_;
 }
 
 void PyCausalLM::eplb_batch_isend_irecv(const py::list& operation_types,

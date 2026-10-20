@@ -170,6 +170,8 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::is_spec_verify)
       .def_property_readonly("is_dflash_proposal",
                              &PyAttentionMetadataView::is_dflash_proposal)
+      .def_property_readonly("spec_verify_width",
+                             &PyAttentionMetadataView::spec_verify_width)
       .def_property_readonly("is_dummy", &PyAttentionMetadataView::is_dummy);
 }
 
@@ -267,6 +269,10 @@ PyAttentionMetadataView::PyAttentionMetadataView(
   // Empty DP shards retain zero history, even when they execute a dummy row.
   dp_global_kv_max_seq_lens_ = params.parallel.dp_global_kv_max_seq_lens;
   dp_is_decode_ = params.parallel.dp_is_decode;
+  // Truth source for the graph runner's verify admission/key: the validate
+  // builder exports the packed rows-per-sequence here, so a non-expanded
+  // verify batch is never confused with a plain decode of the same row count.
+  spec_verify_width_ = std::max(1, params.meta.spec_verify_width);
 }
 
 const torch::Tensor& PyAttentionMetadataView::slot_mapping() const {
@@ -510,6 +516,10 @@ bool PyAttentionMetadataView::is_dflash_proposal() const {
 }
 
 bool PyAttentionMetadataView::is_dummy() const { return metadata_->is_dummy; }
+
+int32_t PyAttentionMetadataView::spec_verify_width() const {
+  return spec_verify_width_;
+}
 
 torch::Tensor PyAttentionMetadataView::make_host_int32_view(
     const std::shared_ptr<layer::AttentionMetadata>& metadata,

@@ -8,6 +8,7 @@ cc_test(
     binary_payload_test.cpp
     blocking_counter_test.cpp
     device_name_utils_test.cpp
+    dspark_model_type_test.cpp
     http_downloader_test.cpp
     model_path_utils_test.cpp
     net_test.cpp

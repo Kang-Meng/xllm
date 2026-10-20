@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <unordered_map>
 #include <vector>
@@ -132,6 +133,16 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
       const std::vector<int32_t>& execution_token_counts);
   void moe_tp_all_reduce(torch::Tensor& tensor);
   void moe_ep_all_reduce(torch::Tensor& tensor);
+
+  // HCCL communicator name of the MoE EP group, or an empty string when the
+  // group is absent. The MC2 dispatch/combine kernels take this raw name
+  // (``group_ep``); an empty string means "unavailable" and must not raise.
+  std::string moe_ep_comm_name();
+
+  // Rank in the MoE EP group, or 0 when the group is absent. The MC2
+  // dispatch/combine kernels take this rank as ``ep_rank_id``; an absent group
+  // reads as the single-replica rank 0 and must not raise.
+  int64_t moe_ep_rank();
   void eplb_batch_isend_irecv(const pybind11::list& operation_types,
                               const pybind11::list& tensors,
                               const pybind11::list& remote_ranks);

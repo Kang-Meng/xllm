@@ -30,8 +30,10 @@ from xllm.python.attention.dsa_metadata import (
     DSA_CACHE_TOKEN,
     READ_TABLE_LAYOUT_RIGHT_ALIGNED,
     READ_TABLE_LAYOUT_RING,
+    DsaMetadata,
     DsaMetadataBuilder,
     build_cache_specs,
+    build_cache_specs_v41,
 )
 
 
@@ -248,6 +250,57 @@ def test_build_swa_group_uses_scheduler_resolved_slots_for_expanded_decode() -> 
     assert dsa.slot_mappings[0][0].tolist() == [301, 302, 401, 402]
 
 
+def test_swa_device_path_routes_through_dst_slots_kwarg() -> None:
+    """The device SWA branch must call a single ``_swa_slots_on_device``.
+
+    Regression: a stale second definition without the ``dst_slots`` parameter
+    shadowed the current one, so every call on the device branch
+    (``swa_device_ctx_lens is not None`` -> ``dst_slots=...``) raised
+    ``TypeError: _swa_slots_on_device() got an unexpected keyword argument
+    'dst_slots'``. This drives that branch end to end and checks the slot.
+    """
+    builder, _, _ = _make_builder()
+    raw_bt = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    device_ctx_lens = torch.tensor([8], dtype=torch.int32)
+    dst_slots = torch.full((1,), -1, dtype=torch.int32)
+
+    _, out_slots = builder._process_swa_group(
+        raw_bt=raw_bt,
+        block_size=128,
+        ctx_lens=[8],
+        q_lens=[1],
+        batch_size=1,
+        graph_slot_capacity=0,
+        graph_block_table_capacity_cols=0,
+        new_cache_slots=None,
+        swa_device_ctx_lens=device_ctx_lens,
+        dst_slots=dst_slots,
+    )
+
+    assert out_slots is dst_slots
+    # kv_len=8, q_len=1 -> q_start=7, block_idx=0, block_id=10 -> 10*128+7.
+    assert out_slots[0].item() == 10 * 128 + 7
+
+
+def test_swa_slots_on_device_static_signature_accepts_dst_slots() -> None:
+    """The device slot mapper must expose the ``dst_slots`` parameter."""
+    raw_bt = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    out_slots = DsaMetadataBuilder._swa_slots_on_device(
+        raw_bt,
+        128,
+        4,
+        1,
+        1,
+        [1],
+        None,
+        1,
+        torch.tensor([8], dtype=torch.int32),
+        dst_slots=torch.full((1,), -1, dtype=torch.int32),
+    )
+
+    assert out_slots[0].item() == 10 * 128 + 7
+
+
 def _swa_read_table(
     raw_bt: torch.Tensor,
     ctx_lens: list[int],
@@ -381,6 +434,123 @@ def test_build_block_tables_shared_within_group() -> None:
     assert dsa.slot_mappings[1][2].data_ptr() == dsa.slot_mappings[1][3].data_ptr()
 
 
+# -- group_limit: a sibling model that owns fewer groups than the request ----
+
+
+def _make_builder_v41(n_layers: int = 3):
+    """A V4.1 cache-spec builder (SWA + one TOKEN group per kv-source ratio)."""
+    caches_info, group_infos = build_cache_specs_v41([0, 2, 1], [1, 2], [1, 2], window_size=128, n_layers=n_layers)
+    return DsaMetadataBuilder(caches_info, group_infos), caches_info, group_infos
+
+
+def _make_swa_only_builder(n_layers: int = 3):
+    """A pure-SWA model (the DSpark draft): exactly one deduplicated group."""
+    caches_info, group_infos = build_cache_specs_v41([0] * n_layers, [], [], window_size=128, n_layers=n_layers)
+    assert len(group_infos) == 1
+    return DsaMetadataBuilder(caches_info, group_infos), caches_info, group_infos
+
+
+def _v41_tables() -> list[torch.Tensor]:
+    """The request's tables in the fixed export order [SWA, C2, C1]."""
+    return [
+        torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+        torch.tensor([[20, 21]], dtype=torch.int32),
+        torch.tensor([[30, 31]], dtype=torch.int32),
+    ]
+
+
+def _build_v41(builder: DsaMetadataBuilder, group_limit: int | None = None) -> DsaMetadata:
+    """One decode step over the fixed V4.1 tables, optionally group-limited."""
+    return builder.build(
+        multi_block_tables=_v41_tables(),
+        kv_seq_lens=[8],
+        q_seq_lens=[1],
+        positions=torch.tensor([7], dtype=torch.int64),
+        dsa_cos_sin=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+        group_limit=group_limit,
+    )
+
+
+def test_manager_count_beyond_the_model_groups_is_rejected() -> None:
+    """The invariant the DSpark draft tripped: managers > own deduplicated groups."""
+    builder, _, _ = _make_swa_only_builder()
+    with pytest.raises(ValueError, match="manager count 3 exceeds group count 1"):
+        _build_v41(builder)
+
+
+def test_group_limit_selects_only_the_leading_managers() -> None:
+    """A one-group draft consumes just the request's leading SWA manager."""
+    builder, _, _ = _make_swa_only_builder()
+    dsa = _build_v41(builder, group_limit=1)
+    # Every draft layer owns one SWA cache -> the same processed manager tensor.
+    for layer_bt in dsa.block_tables:
+        assert len(layer_bt) == 1
+        assert layer_bt[0].data_ptr() == dsa.block_tables[0][0].data_ptr()
+    for layer_slots in dsa.slot_mappings:
+        assert len(layer_slots) == 1
+    # Slot math comes from the SWA table (block 10, ring offset 7), never C2/C1.
+    assert dsa.slot_mappings[0][0].tolist() == [10 * 128 + 7]
+    assert dsa.block_tables[0][0][0, 0].item() == 10
+
+
+def test_group_limit_equal_to_all_groups_is_the_default() -> None:
+    """The owning model (no limit) and an explicit full limit agree exactly."""
+    builder, _, _ = _make_builder_v41()
+    default = _build_v41(builder)
+    explicit = _build_v41(builder, group_limit=3)
+    assert len(default.block_tables) == len(explicit.block_tables)
+    for layer_default, layer_explicit in zip(default.block_tables, explicit.block_tables, strict=True):
+        assert len(layer_default) == len(layer_explicit)
+        for a, b in zip(layer_default, layer_explicit, strict=True):
+            assert a.shape == b.shape
+            assert torch.equal(a, b)
+
+
+def test_group_limit_partial_owner_leaves_later_groups_unmapped() -> None:
+    """A two-group owner reads managers 0..1; layers in group 2 get empty slots."""
+    builder, _, group_infos = _make_builder_v41()
+    assert len(group_infos) == 3
+    dsa = _build_v41(builder, group_limit=2)
+    # Layer 1 is the ratio-2 kv-source: entries [C2 key, C2 index, swa, swa, swa].
+    assert dsa.block_tables[1][0].data_ptr() == dsa.block_tables[1][1].data_ptr()
+    assert dsa.block_tables[1][2].data_ptr() == dsa.block_tables[0][0].data_ptr()
+    # Layer 2 is the ratio-1 kv-source: its two TOKEN entries (group 2, beyond
+    # the limit) stay unmapped while its SWA entry (group 0) is mapped.
+    assert dsa.block_tables[2][0].numel() == 0
+    assert dsa.block_tables[2][1].numel() == 0
+    assert dsa.block_tables[2][2].data_ptr() == dsa.block_tables[0][0].data_ptr()
+
+
+def test_group_limit_rejects_a_negative_value() -> None:
+    builder, _, _ = _make_swa_only_builder()
+    with pytest.raises(ValueError, match="group_limit must be non-negative"):
+        _build_v41(builder, group_limit=-1)
+
+
+def test_batchless_build_is_the_b4_empty_length_signature() -> None:
+    """A zero-sequence build is what the idle DP shard used to hand the model.
+
+    The builder itself accepts it; the model's attention then maxes an empty
+    per-sequence length list. csa_attention now synthesizes the framework dummy
+    row before this state can reach the model, so this test pins the raw
+    signature the fix has to avoid.
+    """
+    builder, _, _ = _make_swa_only_builder()
+    dsa = builder.build(
+        multi_block_tables=[],
+        kv_seq_lens=[],
+        q_seq_lens=None,
+        positions=torch.tensor([0], dtype=torch.int64),
+        dsa_cos_sin=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+    )
+    assert dsa.seq_lens_q.numel() == 0
+    # CPython 3.11: "max() arg is an empty sequence"; 3.12: "iterable argument is empty".
+    with pytest.raises(ValueError, match="empty"):
+        max(int(value) for value in dsa.seq_lens_q.tolist())
 def test_build_c4_pad_positions() -> None:
     """c4_pad_positions records next_pos-4 when (pos+1) % 4 == 0."""
     builder, _, _ = _make_builder()

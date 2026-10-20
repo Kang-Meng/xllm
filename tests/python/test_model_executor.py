@@ -556,6 +556,123 @@ class TestCreateAttentionBackend:
         "xllm.python.model_executor.executor.current_platform.is_npu",
         return_value=True,
     )
+    def test_deepseek_v41_creates_csa2_backend(self, _mock_is_npu):
+        attn = _make_attention_layer(head_dim=512)
+        module = types.ModuleType("xllm.python.attention.csa2_attention")
+        module.Csa2AttentionBackend = StubAttentionBackend
+        config = {
+            "model_type": "deepseek_v41",
+            "compress_ratios": [0, 2, 1],
+            "n_layers": 3,
+            "window_size": 128,
+            "index_topk": 512,
+            "index_n_heads": 32,
+            "index_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "kv_source_layer_ids": [1, 2],
+            "index_source_layer_ids": [1, 2],
+            "candidate_source_layer_id": 2,
+        }
+        with patch.dict(sys.modules, {module.__name__: module}):
+            # The device only reaches the stubbed backend: the dispatch under
+            # test keys on current_platform.is_npu(), and "cpu" keeps this
+            # test runnable on hosts without torch_npu.
+            backend = _create_attention_backend(attn, torch.device("cpu"), torch.bfloat16, config)
+
+        assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["attn_head_dim"] == 512
+        assert backend.init_kwargs["compress_ratios"] == [0, 2, 1]
+
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
+    def test_deepseek_v41_dspark_creates_csa2_backend(self, _mock_is_npu):
+        """The V4.1 DSpark draft must reuse the target's CSA2 backend.
+
+        The C++ side routes --model_impl=python drafts to the
+        deepseek_v41_dspark model_type (xllm/python/registry.py) instead of the
+        C++ TORCH deepseek_v4_dspark name. The draft is still a V4.1-family
+        model, so it must dispatch to CSA2 and see its own pure-SWA cache plan:
+        3 draft layers with compress ratio 0 and no compressed-KV sources.
+        """
+        attn = _make_attention_layer(head_dim=512)
+        module = types.ModuleType("xllm.python.attention.csa2_attention")
+        module.Csa2AttentionBackend = StubAttentionBackend
+        config = {
+            "model_type": "deepseek_v41_dspark",
+            "compress_ratios": [0, 0, 0],
+            "n_layers": 3,
+            "window_size": 128,
+            "index_topk": 512,
+            "index_n_heads": 32,
+            "index_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            # Cleared by configure_deepseek_v4_dspark_args: draft stage ids are
+            # decoder ids and would fall outside the draft's layer range.
+            "kv_source_layer_ids": [],
+            "index_source_layer_ids": [],
+            "candidate_source_layer_id": -1,
+            "candidate_topk_blocks": 0,
+            "candidate_block_size": 0,
+        }
+        with patch.dict(sys.modules, {module.__name__: module}):
+            # The device only reaches the stubbed backend: the dispatch under
+            # test keys on current_platform.is_npu(), and "cpu" keeps this
+            # test runnable on hosts without torch_npu.
+            backend = _create_attention_backend(attn, torch.device("cpu"), torch.bfloat16, config)
+
+        assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["n_layers"] == 3
+        assert backend.init_kwargs["compress_ratios"] == [0, 0, 0]
+        assert backend.init_kwargs["kv_source_layer_ids"] == []
+        assert backend.init_kwargs["candidate_source_layer_id"] == -1
+
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
+    def test_deepseek_v4_dspark_does_not_reuse_v41_csa2_backend(self, _mock_is_npu):
+        """Guard: the C++ TORCH draft name must not silently pick up CSA2.
+
+        Only the Python-registered V4.1 draft name maps to the CSA2 backend; the
+        C++ TORCH deepseek_v4_dspark name keeps its own V4 DSA backend, so a
+        mis-routed draft is caught here instead of running the V4.1 draft body
+        against a non-V4.1 cache plan.
+        """
+
+        class _Csa2Stub(StubAttentionBackend):
+            pass
+
+        class _DsaStub(StubAttentionBackend):
+            pass
+
+        attn = _make_attention_layer(head_dim=512)
+        csa2_module = types.ModuleType("xllm.python.attention.csa2_attention")
+        csa2_module.Csa2AttentionBackend = _Csa2Stub
+        dsa_module = types.ModuleType("xllm.python.attention.dsa_attention")
+        dsa_module.DsaAttentionBackend = _DsaStub
+        config = {
+            "model_type": "deepseek_v4_dspark",
+            "compress_ratios": [0, 0, 0],
+            "n_layers": 3,
+        }
+        with patch.dict(
+            sys.modules,
+            {csa2_module.__name__: csa2_module, dsa_module.__name__: dsa_module},
+        ):
+            # The device only reaches the stubbed backend: the dispatch under
+            # test keys on current_platform.is_npu(), and "cpu" keeps this
+            # test runnable on hosts without torch_npu.
+            backend = _create_attention_backend(attn, torch.device("cpu"), torch.bfloat16, config)
+
+        assert isinstance(backend, _DsaStub)
+        assert not isinstance(backend, _Csa2Stub)
+
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
     @patch(
         "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
         StubAttentionBackend,

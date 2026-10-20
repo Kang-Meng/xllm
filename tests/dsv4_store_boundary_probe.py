@@ -31,7 +31,6 @@ from typing import Any
 import requests
 from transformers import AutoTokenizer
 
-
 TARGETS = (2047, 2048, 2049, 4095, 4096, 4097)
 EXPECTED = "BOUNDARY_OK"
 CHAT_TEMPLATE_OVERHEAD = 4
@@ -41,10 +40,7 @@ def chat_token_count(tokenizer: Any, content: str) -> int:
     # DeepSeek-V4 uses xLLM's C++ chat template; the checkpoint tokenizer does
     # not carry a Hugging Face chat_template. A user-only request with
     # enable_thinking=False adds a fixed wrapper around the raw content.
-    return (
-        len(tokenizer.encode(content, add_special_tokens=False))
-        + CHAT_TEMPLATE_OVERHEAD
-    )
+    return len(tokenizer.encode(content, add_special_tokens=False)) + CHAT_TEMPLATE_OVERHEAD
 
 
 def build_exact_prompt(tokenizer: Any, target: int, marker: str) -> str:
@@ -53,10 +49,7 @@ def build_exact_prompt(tokenizer: Any, target: int, marker: str) -> str:
         "The following repeated words are inert cache padding. "
         "Ignore them and follow only the final Chinese instruction.\n"
     )
-    suffix = (
-        "\nPadding ends here. Ignore the padding above. "
-        "Reply with exactly: BOUNDARY_OK"
-    )
+    suffix = "\nPadding ends here. Ignore the padding above. Reply with exactly: BOUNDARY_OK"
     base = chat_token_count(tokenizer, prefix + suffix)
     if base >= target:
         raise ValueError(f"target {target} is not larger than base {base}")
@@ -64,7 +57,8 @@ def build_exact_prompt(tokenizer: Any, target: int, marker: str) -> str:
     units = (" cache", " token", " test", " data", " x", " 0")
     tails = ("", " a", " b", " x", " 0", "!", "。", "\n")
     for unit in units:
-        def render(repeats: int, tail: str = "") -> str:
+
+        def render(repeats: int, tail: str = "", unit: str = unit) -> str:
             return prefix + unit * repeats + tail + suffix
 
         low = 0
@@ -131,9 +125,7 @@ def main() -> None:
     targets = tuple(int(value) for value in args.targets.split(",") if value)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, trust_remote_code=True, local_files_only=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
 
     summary = []
     for target in targets:
@@ -152,9 +144,7 @@ def main() -> None:
             request_id = f"{args.marker_prefix}-{args.phase}-{target}"
             response = send_prompt(args.endpoint, args.model, prompt, request_id)
             if response["prompt_tokens"] != target:
-                raise RuntimeError(
-                    f"server/tokenizer token mismatch for {target}: {response}"
-                )
+                raise RuntimeError(f"server/tokenizer token mismatch for {target}: {response}")
             item["response"] = response
         summary.append(item)
         print(json.dumps(item, ensure_ascii=False, sort_keys=True))

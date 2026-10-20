@@ -552,11 +552,11 @@ Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
 //   compress_kv_state / compress_score_state, each [swa_count, bs, head_dim]
 //   fp32 (ring slot = pos % bs), adding 2 * bs * head_dim * 4 bytes to the
 //   SWA-group per-block cost.
-// - A TOKEN block stores bs compressed rows of key [head_dim] plus index
-//   [index_head_dim], both in the MODEL dtype (the V4.1 indexer cache is
-//   bf16, unlike V4's int8 index cache), so
-//   bytes_per_token_block = bs * (head_dim + index_head_dim) * dtype_size
-//   for both ratios.
+// - A TOKEN block stores bs compressed rows of key [head_dim] in the MODEL
+//   dtype plus index [index_head_dim] in the platform policy's index dtype
+//   (NPU: int8 with an fp16 per-token scale; MLU: the model dtype, no scale),
+//   so bytes_per_token_block = bs * (head_dim * dtype_size
+//   + index_head_dim * index_dtype_size + scale_bytes) for both ratios.
 //
 // Allocation unit: one c2 block spans bs*2 tokens = 2 engine blocks, one c1
 // block spans bs*1 tokens = 1 engine block, so the common unit is
@@ -593,8 +593,14 @@ Dsv4KVCacheEstimateCost estimate_dsv41_kv_cache_cost(
   }
 
   const int64_t swa_bytes_per_plain_block = block_size * head_dim * dtype_size;
+  // The ratio-2 compressor parks at most the trailing partial group, so its
+  // fp32 kv/score ring is fixed to kDsv41CompressStateRows rows per block
+  // (matching vllm-ascend's STATE_RING_ROWS), independent of the engine block
+  // size. Keep this in lockstep with the V4.1 allocation in
+  // deepseek_v4_kv_cache_impl.cpp.
   const int64_t swa_bytes_per_c2_block =
-      swa_bytes_per_plain_block + 2 * block_size * head_dim * float32_size;
+      swa_bytes_per_plain_block +
+      2 * kDsv41CompressStateRows * head_dim * float32_size;
   cache_cost.swa_bytes_per_block =
       (model_args.n_layers() - cache_cost.n_c2_layers) *
           swa_bytes_per_plain_block +
@@ -602,8 +608,14 @@ Dsv4KVCacheEstimateCost estimate_dsv41_kv_cache_cost(
   cache_cost.constant_swa_bytes =
       cache_cost.swa_count * cache_cost.swa_bytes_per_block;
 
+  const DeepSeekV4CachePolicy cache_policy =
+      get_dsv4_cache_policy(options.dtype);
+  const int64_t index_scale_bytes =
+      cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
   const int64_t bytes_per_token_block =
-      block_size * (head_dim + index_head_dim) * dtype_size;
+      block_size *
+      (head_dim * dtype_size + index_head_dim * cache_policy.index_dtype_size +
+       index_scale_bytes);
   cache_cost.manager_blocks_per_unit = 2;
   cache_cost.token_unit_bytes =
       cache_cost.n_c2_layers * (cache_cost.manager_blocks_per_unit / 2) *

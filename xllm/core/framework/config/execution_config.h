@@ -55,7 +55,8 @@ class ExecutionConfig final {
          "output_shm_size",
          "random_seed",
          "python_graph_backend",
-         "enable_fia_decode"}};
+         "enable_fia_decode",
+         "enable_graph_aux_hidden_states"}};
     return kOptionCategory;
   }
 
@@ -88,6 +89,13 @@ class ExecutionConfig final {
   PROPERTY(std::string, python_graph_backend) = "off";
 
   PROPERTY(bool, enable_fia_decode) = false;
+
+  // Allows a graph-captured Python target to publish its aux hidden states to
+  // the draft model instead of being forced onto the eager runner. Only the
+  // deepseek_v41 target is whitelisted; every other aux-capture target (and
+  // every draft) stays eager. Off by default so the runtime behaviour is
+  // unchanged until the graph path is validated on hardware.
+  PROPERTY(bool, enable_graph_aux_hidden_states) = false;
 };
 
 }  // namespace xllm

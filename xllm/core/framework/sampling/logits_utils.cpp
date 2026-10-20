@@ -167,10 +167,11 @@ void apply_top_k_top_p(torch::Tensor& logits,
 
       sorted_logits.masked_fill_(mask, filter_value);
     }
-    logits = torch::empty_like(sorted_logits)
-                 .scatter_(/*dim=*/-1,
-                           /*index=*/logits_idx,
-                           /*core=*/sorted_logits.to(logits.scalar_type()));
+    // Speculative verification retains an alias of the target logits before
+    // sampling. Preserve that storage so it sees the filtered distribution.
+    logits.scatter_(/*dim=*/-1,
+                    /*index=*/logits_idx,
+                    /*core=*/sorted_logits.to(logits.scalar_type()));
   }
 }
 

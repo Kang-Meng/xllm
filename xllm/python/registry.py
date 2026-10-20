@@ -211,6 +211,11 @@ def _register_builtin_models() -> None:
         "DeepseekV41ForCausalLM",
         "deepseek_v41",
     )
+    _register_model_path(
+        "xllm.python.models.deepseek_v41_dspark",
+        "DeepseekV41DSparkForCausalLM",
+        "deepseek_v41_dspark",
+    )
 
     _register_model_path(
         "xllm.python.models.deepseek_v4_dspark",

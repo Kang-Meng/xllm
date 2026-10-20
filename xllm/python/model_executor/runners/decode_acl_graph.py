@@ -44,7 +44,7 @@ from xllm.python.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
 )
-from xllm.python.attention.dsa_metadata import DSA_CACHE_TOKEN
+from xllm.python.attention.dsa_metadata import DSA_CACHE_SLIDING_WINDOW, DSA_CACHE_TOKEN
 from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
@@ -367,15 +367,17 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         batch_size: int,
         local_expanded: bool | None = None,
+        packed_verify_width: int = 1,
     ) -> tuple[bool, int, int | None]:
         """Return the graph layout every DP rank must capture.
 
         ``(is_expanded, verify_width, admission_batch)``. ``admission_batch`` is
         ``None`` when active token counts are not whole verify groups. Under DP
-        the width comes only from ``is_spec_verify`` and ``num_decoding_tokens``,
-        so an empty rank and a busy rank share one graph key. A local expanded
-        layout that is not that group-wide verify raises instead of capturing
-        a private graph. Plain decode stays width 1.
+        the width comes only from ``is_spec_verify`` and ``num_decoding_tokens``
+        (or the exported DSpark packed width below), so an empty rank and a busy
+        rank share one graph key. A local expanded layout that is not that
+        group-wide verify raises instead of capturing a private graph. Plain
+        decode stays width 1.
         """
         if local_expanded is None:
             local_expanded = resolve_expanded_decode_metadata(metadata) is not None
@@ -387,6 +389,7 @@ class DecodeAclGraphRunner(BaseRunner):
             seq_count = linear_idx.numel() if linear_idx is not None and linear_idx.numel() > 0 else batch_size
             if batch_size % seq_count == 0:
                 local_width = batch_size // seq_count
+        packed_plan = False
         if self.dp_size > 1:
             # Local expanded rows must not choose a width the empty rank cannot see.
             if marked_spec_verify and self.num_decoding_tokens > 1:
@@ -396,6 +399,14 @@ class DecodeAclGraphRunner(BaseRunner):
                         f"measured={local_width}, num_decoding_tokens={self.num_decoding_tokens}"
                     )
                 verify_width = self.num_decoding_tokens
+            elif packed_verify_width > 1:
+                # Non-expanded packed verify (V4.1 DSpark): the C++-exported
+                # width folds every rank's rows — including the empty shard's
+                # single fake row — to one group-wide sequence count, so all DP
+                # ranks still derive the same graph layout without the
+                # scheduler marking the batch.
+                verify_width = packed_verify_width
+                packed_plan = True
             else:
                 if local_width > 1:
                     raise RuntimeError(
@@ -405,17 +416,30 @@ class DecodeAclGraphRunner(BaseRunner):
                 verify_width = 1
         elif local_width > 1:
             verify_width = local_width
+        elif packed_verify_width > 1:
+            verify_width = packed_verify_width
         elif spec_verify and self.num_decoding_tokens > 1:
             verify_width = self.num_decoding_tokens
         else:
             verify_width = 1
         is_expanded = verify_width > 1
         if self.dp_size > 1:
-            admission_batch = _dp_spec_sequence_batch(
-                metadata.dp_execution_token_counts,
-                getattr(metadata, "raw_dp_execution_token_counts", None),
-                verify_width,
-            )
+            if packed_plan:
+                # Fold the packed pack the way every rank does: the floored
+                # empty-rank placeholders (count 1) never divide by the packed
+                # width, so fold the replicated global max and floor it by this
+                # rank's local sequence count. Never returns None.
+                max_global_tokens = max(int(c) for c in metadata.dp_execution_token_counts)
+                admission_batch = max(
+                    (max_global_tokens + verify_width - 1) // verify_width,
+                    self._spec_verify_sequence_count(metadata, batch_size, False, verify_width),
+                )
+            else:
+                admission_batch = _dp_spec_sequence_batch(
+                    metadata.dp_execution_token_counts,
+                    getattr(metadata, "raw_dp_execution_token_counts", None),
+                    verify_width,
+                )
         elif verify_width > 1 and batch_size % verify_width == 0:
             admission_batch = batch_size // verify_width
         else:
@@ -441,8 +465,7 @@ class DecodeAclGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
     ) -> bool:
         metadata = self._normalize_dsa_metadata(metadata)
-        ok = self._can_execute_inner(input_ids, metadata, input_embedding)
-        return ok
+        return self._can_execute_inner(input_ids, metadata, input_embedding)
 
     def _normalize_dsa_metadata(
         self,
@@ -503,6 +526,59 @@ class DecodeAclGraphRunner(BaseRunner):
             tuple(tables),
         )
 
+    def _spec_verify_width(
+        self,
+        batch_size: int,
+        metadata: AttentionMetadata | None = None,
+    ) -> int:
+        """Row multiplier of a NON-expanded packed spec-verify batch (1 = none).
+
+        MTP-style spec-verify packs ``num_decoding_tokens`` (num_spec+1) token
+        rows per logical sequence. The expanded (chunked-typed) flows expose
+        that packing through ``linear_state_indices``, but the V4.1 DSpark
+        verify batch does not: V4.1 has no linear-attention layers, so no
+        per-sequence state tensor is exported and ``is_spec_verify`` stays
+        False. Its paging metadata is per token row, i.e. it looks exactly like
+        a plain decode of ``batch_size`` sequences whose count is
+        ``row_multiplier`` times too large.
+
+        The C++ validate builder exports the true width on
+        ``AttentionMetadata.spec_verify_width``; use it when present. Older C++
+        binaries without the field keep the conservative width-1 decode path:
+        a plain decode is never shape-guessed into a packed verify, so the
+        historical group-wide plain-decode admission holds.
+        """
+        explicit = None if metadata is None else getattr(metadata, "spec_verify_width", None)
+        if explicit is not None:
+            return max(1, int(explicit))
+        return 1
+
+    def _spec_verify_sequence_count(
+        self,
+        metadata: AttentionMetadata,
+        batch_size: int,
+        is_expanded_spec_verify: bool,
+        verify_width: int,
+    ) -> int:
+        """Logical sequence count (SEQS) of a decode step.
+
+        ``input_ids.numel()`` counts TOKEN rows for a spec-verify batch while
+        the capacity gates (``max_batch``, ``decode_batch_size_limit``) are in
+        SEQS. Expanded verify carries one ``linear_state_indices`` entry per
+        logical sequence; the non-expanded packed verify folds via the exported
+        width. An empty DP shard executes a single fake row (batch_size <
+        width), which still stands for one logical sequence. Plain decode keeps
+        the row count.
+        """
+        if not is_expanded_spec_verify:
+            if verify_width <= 1:
+                return batch_size
+            return max(1, batch_size // verify_width)
+        lsi = getattr(metadata, "linear_state_indices", None)
+        if lsi is not None and lsi.numel() > 0:
+            return int(lsi.numel())
+        return batch_size
+
     def _can_execute_inner(
         self,
         input_ids: torch.Tensor,
@@ -520,14 +596,42 @@ class DecodeAclGraphRunner(BaseRunner):
             return False
         if self.dp_size == 1 and input_ids.dim() != 1:
             return False
+        batch_size = input_ids.numel()
+        expanded_view = resolve_expanded_decode_metadata(metadata)
+        is_expanded_spec_verify = expanded_view is not None
+        marked_spec_verify = bool(getattr(metadata, "is_spec_verify", False))
+        # Non-expanded packed spec-verify width (V4.1 DSpark), resolved by
+        # ``_spec_verify_width``. Expanded (chunked-typed) and scheduler-marked
+        # MTP verify are NOT affected: they keep the mainline group-wide
+        # admission below.
+        verify_width = self._spec_verify_width(batch_size, metadata)
+        verify_graph_enabled = verify_width > 1
         # Debug switch. Under DP every rank must see it, not only the expanded one.
         disable_verify_graph = os.environ.get("XLLM_NO_VERIFY_GRAPH") == "1"
         if disable_verify_graph and self.dp_size > 1 and self.num_decoding_tokens > 1:
             return False
-        batch_size = input_ids.numel()
-        expanded_view = resolve_expanded_decode_metadata(metadata)
-        is_expanded_spec_verify = expanded_view is not None
-        if disable_verify_graph and is_expanded_spec_verify:
+        # Expanded (chunked-typed), scheduler-marked, and packed DSpark verify
+        # all publish a group-wide admission decision; DP multi-token decode
+        # steps share one graph bucket because the buckets derive from the
+        # DP-visible workloads. A decode-typed batch the C++ DSpark exporter
+        # classified but never folded (exported spec_verify_width 1, so the
+        # packed width never materialises) is not a verifiable pack: the DP
+        # group cannot prove uniform shape for it, so it keeps the fail-closed
+        # eager gate. A legacy batch without the exported field keeps the
+        # historical group-wide plain-decode admission below.
+        if (
+            self.dp_size > 1
+            and self.num_decoding_tokens > 1
+            and not is_expanded_spec_verify
+            and not marked_spec_verify
+            and not verify_graph_enabled
+            and getattr(metadata, "spec_verify_width", None) is not None
+        ):
+            return False
+        # Debug isolation switch: force spec-verify batches through the eager
+        # runner while keeping the chunked-typed (expanded) layout, to A/B the
+        # typed-eager semantics against the graph capture/replay path.
+        if disable_verify_graph and (is_expanded_spec_verify or verify_graph_enabled):
             return False
         # MTP spec-verify packs (num_speculative_tokens+1) token-rows per
         # sequence, so batch_size (input_ids.numel()) is in TOKENS while
@@ -535,16 +639,26 @@ class DecodeAclGraphRunner(BaseRunner):
         # tokens to seqs wrongly rejects an 8-seq × 4-row verify (32 tokens,
         # 8 seqs ≤ 16) as bucket-overflow, forcing eager (~10x slower) under
         # concurrency. For expanded verify, gate on the actual SEQUENCE count
-        # (linear_state_indices is per-seq) — the graph still captures/replays
-        # at the full token bucket (keyed by padded_batch_size below), this
-        # only fixes the graph-vs-eager admission decision.
-        if self.dp_size == 1 and is_expanded_spec_verify:
+        # (linear_state_indices is per-seq); for the non-expanded V4.1 verify
+        # batch derive it from the exported width. The graph still
+        # captures/replays at the full token bucket (keyed by padded_batch_size
+        # below); this only fixes the graph-vs-eager admission decision.
+        if is_expanded_spec_verify:
             lsi = getattr(metadata, "linear_state_indices", None)
             has_kda_layers = lsi is not None and lsi.numel() > 0
             seq_count = lsi.numel() if has_kda_layers else batch_size
             size_check_bs = seq_count
-        elif self.dp_size == 1:
-            size_check_bs = batch_size
+        else:
+            # Non-expanded packed verify (V4.1 DSpark): fold the token rows
+            # back to sequences via the exported width so the capacity gates
+            # below compare SEQS to SEQS. Width 1 (plain decode) keeps
+            # ``size_check_bs == batch_size`` exactly as before.
+            size_check_bs = self._spec_verify_sequence_count(
+                metadata,
+                batch_size,
+                False,
+                verify_width,
+            )
         if self.dp_size == 1 and self._is_spec_draft and self._draft_query_width > 1:
             if size_check_bs % self._draft_query_width != 0:
                 return False
@@ -625,6 +739,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 metadata,
                 batch_size,
                 local_expanded=is_expanded_spec_verify,
+                packed_verify_width=verify_width,
             )
             if global_batch is None:
                 return False
@@ -654,6 +769,7 @@ class DecodeAclGraphRunner(BaseRunner):
                     dp_all_decode=True,
                     local_expanded=is_expanded_spec_verify,
                     expanded_view=expanded_view,
+                    verify_width=verify_width,
                 )
                 and _decode_bucket(global_batch) <= self.max_batch
                 and (self.decode_batch_size_limit <= 0 or _decode_bucket(global_batch) <= self.decode_batch_size_limit)
@@ -669,6 +785,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 metadata,
                 local_expanded=is_expanded_spec_verify,
                 expanded_view=expanded_view,
+                verify_width=verify_width,
             )
             and (input_embedding is None or input_embedding.shape[0] == batch_size)
             and bucket_size <= self.max_batch
@@ -861,6 +978,7 @@ class DecodeAclGraphRunner(BaseRunner):
         dp_all_decode: bool = False,
         local_expanded: bool | None = None,
         expanded_view: object | None = None,
+        verify_width: int = 1,
     ) -> bool:
         """Check the one-token-per-sequence contract of ACL decode graphs.
 
@@ -869,6 +987,12 @@ class DecodeAclGraphRunner(BaseRunner):
         return False explicitly; genuinely unexpected/malformed states are left
         to raise from _decode_metadata/_validate during fill, propagating rather
         than being swallowed into a silent eager fallback).
+
+        ``verify_width`` describes the non-expanded packed verify (one
+        ``spec_verify_width`` token rows per logical sequence, decode-typed). It
+        carries several per-sequence tensors (``linear_state_indices`` /
+        ``has_initial_state`` / cumulative lengths) exactly like the expanded
+        verify does, so those accept one entry per logical sequence too.
         """
         if not self._is_shape_compatible(
             input_ids,
@@ -883,32 +1007,35 @@ class DecodeAclGraphRunner(BaseRunner):
         is_expanded = (
             local_expanded if local_expanded is not None else resolve_expanded_decode_metadata(metadata) is not None
         )
+        is_packed_verify = not is_expanded and verify_width > 1
+
+        def _accepts_per_sequence(numel: int) -> bool:
+            # One entry per logical sequence for a packed verify, expanded or
+            # non-expanded (the fill expands it back per token row).
+            return (is_expanded or is_packed_verify) and numel > 0 and batch_size % numel == 0
+
         if not is_expanded and metadata.kv_cu_seq_lens is not None:
-            if metadata.kv_cu_seq_lens.numel() not in (
-                batch_size,
-                batch_size + 1,
-            ):
+            kv_cu_numel = metadata.kv_cu_seq_lens.numel()
+            if kv_cu_numel not in (batch_size, batch_size + 1) and not _accepts_per_sequence(kv_cu_numel):
                 self._reject_dp_all_decode(
                     dp_all_decode,
                     "DP decode kv_cu_seq_lens does not match token rows: "
-                    f"rank={self.dp_rank}, tokens={batch_size}, kv_cu={metadata.kv_cu_seq_lens.numel()}",
+                    f"rank={self.dp_rank}, tokens={batch_size}, kv_cu={kv_cu_numel}",
                 )
                 return False
         if metadata.q_cu_seq_lens is not None and not is_expanded:
-            if metadata.q_cu_seq_lens.numel() not in (
-                batch_size,
-                batch_size + 1,
-            ):
+            q_cu_numel = metadata.q_cu_seq_lens.numel()
+            if q_cu_numel not in (batch_size, batch_size + 1) and not _accepts_per_sequence(q_cu_numel):
                 self._reject_dp_all_decode(
                     dp_all_decode,
                     "DP decode q_cu_seq_lens does not match token rows: "
-                    f"rank={self.dp_rank}, tokens={batch_size}, q_cu={metadata.q_cu_seq_lens.numel()}",
+                    f"rank={self.dp_rank}, tokens={batch_size}, q_cu={q_cu_numel}",
                 )
                 return False
         has_initial_state = getattr(metadata, "has_initial_state", None)
         if has_initial_state is not None:
             state_count = has_initial_state.numel()
-            if state_count != batch_size and not (is_expanded and state_count > 0 and batch_size % state_count == 0):
+            if state_count != batch_size and not _accepts_per_sequence(state_count):
                 self._reject_dp_all_decode(
                     dp_all_decode,
                     "DP decode has_initial_state does not match token rows: "
@@ -919,7 +1046,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if (
             linear_idx is not None
             and linear_idx.numel() != batch_size
-            and not (is_expanded and linear_idx.numel() > 0 and batch_size % linear_idx.numel() == 0)
+            and not _accepts_per_sequence(linear_idx.numel())
         ):
             self._reject_dp_all_decode(
                 dp_all_decode,
@@ -1207,6 +1334,27 @@ class DecodeAclGraphRunner(BaseRunner):
         return True
 
     @staticmethod
+    def _row_kv_cu_seq_lens(
+        metadata: AttentionMetadata,
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        """Per-token-row cumulative KV lengths, or None to derive from kv_seq_lens.
+
+        A non-expanded packed verify (V4.1 DSpark) may export one cumulative
+        length per LOGICAL sequence even though the graph's cumulative buffer is
+        per token row. In that case the row-wise cumulative is derived from the
+        per-row ``kv_seq_lens`` instead (mirrors the expanded-verify path, which
+        always derives it). ``None`` from here means "derive it".
+        """
+        kv_cu = getattr(metadata, "kv_cu_seq_lens", None)
+        if kv_cu is None:
+            return None
+        numel = kv_cu.numel()
+        if numel in (batch_size, batch_size + 1):
+            return kv_cu
+        return None
+
+    @staticmethod
     def _cumulative_lengths(
         sequence_lengths: torch.Tensor,
         cumulative_lengths: torch.Tensor | None,
@@ -1259,6 +1407,7 @@ class DecodeAclGraphRunner(BaseRunner):
             metadata,
             batch_size,
             local_expanded=resolve_expanded_decode_metadata(metadata) is not None,
+            packed_verify_width=self._spec_verify_width(batch_size, metadata),
         )
         if admission_batch is None or _decode_bucket(admission_batch) > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
@@ -1285,7 +1434,10 @@ class DecodeAclGraphRunner(BaseRunner):
         # Same seq-vs-token admission as can_execute: MTP verify packs
         # (num_spec+1) token-rows per seq, so the capacity gate (max_batch, in
         # seqs) must compare SEQUENCE count, not token count. The graph is still
-        # keyed/captured at the full token bucket (padded_batch_size).
+        # keyed/captured at the full token bucket (padded_batch_size), and the
+        # verify width (expanded, marked, or the exported DSpark pack) partitions
+        # its key so a verify graph is never replayed for a plain decode of the
+        # same row count.
         if self.dp_size > 1:
             # DP ranks share one captured graph shape: the bucket must be the
             # GLOBAL max token count, not this rank's local batch_size, so
@@ -1320,7 +1472,14 @@ class DecodeAclGraphRunner(BaseRunner):
             metadata,
             batch_size,
             local_expanded=expanded_view is not None,
+            packed_verify_width=self._spec_verify_width(batch_size, metadata),
         )
+        # The persistent aux-hidden buffer an ACL-graph replay writes into is
+        # the one its captured forward allocated, i.e. the buffer keyed by this
+        # bucket's row count. Expose it so the executor can pick that buffer
+        # instead of the "most recently created" one, which an interleaved
+        # 1-row forward may have replaced with a smaller buffer.
+        self.last_padded_batch_size = padded_batch_size
         if admission_batch is None or _decode_bucket(admission_batch) > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
 
@@ -1602,7 +1761,7 @@ class DecodeAclGraphRunner(BaseRunner):
             "engram host-offload and use the HBM path instead, set "
             "engram_config.cpu_offload=false. This is a startup/restart "
             "configuration (it is not switchable online): restart the server with "
-            "--engram-config '{\"cpu_offload\":false,\"dp_shared_memory\":false}'."
+            '--engram-config \'{"cpu_offload":false,"dp_shared_memory":false}\'.'
         )
 
     def _allocate_graph_eplb_state(
@@ -2132,7 +2291,7 @@ class DecodeAclGraphRunner(BaseRunner):
         )
         cumulative_kv_seq_lens = self._cumulative_lengths(
             kv_seq_lens,
-            None if is_expanded else metadata.kv_cu_seq_lens,
+            None if is_expanded else self._row_kv_cu_seq_lens(metadata, batch_size),
         )
         graph_positions = positions.to(torch.int32).contiguous()
         kernels.update_decode_graph_metadata(
@@ -2328,7 +2487,16 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"ACL graph DSA manager {manager_id} requires {source.shape[1]} "
                     f"columns, capacity is {target.shape[1]}"
                 )
-            target[:batch_size, : source.shape[1]].copy_(source[:batch_size])
+            group_infos = getattr(self.attention_backend, "group_infos", None)
+            is_swa = group_infos is not None and group_infos[manager_id].cache_type == DSA_CACHE_SLIDING_WINDOW
+            if is_swa and source.shape[1] > 0:
+                # DSA interprets the table width as the physical ring period.
+                # Capacity padding must repeat that ring; zero-filled columns
+                # would redirect later positions to the reserved block zero.
+                cols = torch.arange(target.shape[1], device=source.device) % source.shape[1]
+                target[:batch_size].copy_(source[:batch_size, cols])
+            else:
+                target[:batch_size, : source.shape[1]].copy_(source[:batch_size])
 
     def _fill_graph_dsa_positions(
         self,

@@ -24,6 +24,12 @@ fused_add_rms_norm = torch.ops.xllm_ops.fused_add_rms_norm
 fused_add_gemma_rms_norm = torch.ops.xllm_ops.fused_add_gemma_rms_norm
 _FUSED_ADD_RMS_NORM_DYNAMIC_QUANT = torch_npu.npu_add_rms_norm_dynamic_quant
 
+# DSV4.1 ``RmsNormCastVa`` (third_party/xllm_ops, ACLNN ``aclnnRmsNormCastVa``):
+# ``rms_norm_cast_va(x, gamma, eps) -> (y, y_fp32)`` where ``y`` is the
+# RMSNorm result cast back to the input dtype and ``y_fp32`` is the widened
+# ROUNDED result (``y.float()``), i.e. ``RMSNorm`` + ``Tensor.float()``.
+rms_norm_cast_va = torch.ops.xllm_ops.rms_norm_cast_va
+
 
 def gemma_rms_norm(
     value: torch.Tensor,
@@ -153,4 +159,5 @@ __all__ = [
     "rms_norm_gated",
     "rms_norm_sigmoid_gated",
     "fused_eh_norm",
+    "rms_norm_cast_va",
 ]

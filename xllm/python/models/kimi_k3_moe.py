@@ -912,6 +912,8 @@ def _all_to_all(
     if group_name != "moe_ep":
         raise ValueError("Kimi MoE uses the mainline moe_ep group")
     group = distributed.moe_ep_group(x.device)
+    if group is None:
+        raise RuntimeError(f"MoE EP group is not initialized for {x.device}")
     world_size = group.size()
     if len(output_split_sizes) != world_size:
         raise ValueError("all-to-all output splits must match group size")
@@ -947,6 +949,8 @@ def _async_all_to_all(
     if group_name != "moe_ep":
         raise ValueError("Kimi MoE uses the mainline moe_ep group")
     group = distributed.moe_ep_group(input_tensor.device)
+    if group is None:
+        raise RuntimeError(f"MoE EP group is not initialized for {input_tensor.device}")
     if group.size() == 1:
         # Reuse the synchronous adapter's split validation and local copy.
         return _all_to_all(input_tensor, output_split_sizes, input_split_sizes, group_name), None

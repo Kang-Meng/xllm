@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 import time
@@ -32,11 +31,14 @@ import torch.distributed as dist
 
 from xllm.python.models import glm5_2
 
+from .conftest import load_source_module
+
+# The conftest stubs ``xllm.python.distributed``, so the real module is loaded
+# from its file. The shared loader keeps this instance across every suite that
+# needs it: re-executing the file would re-register the global ``xllm_ops::*``
+# operators and void the monkeypatches made here.
 _MODULE_PATH = Path(__file__).parents[2] / "xllm" / "python" / "distributed" / "collectives.py"
-_SPEC = importlib.util.spec_from_file_location("_xllm_collectives_under_test", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-collectives = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(collectives)
+collectives = load_source_module(_MODULE_PATH, "_xllm_collectives_under_test")
 
 
 def test_tp_all_to_all_uses_native_group_without_python_rendezvous(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -155,6 +157,7 @@ def _clear_collective_state():
         collectives._stores.clear()
         collectives._symm_eligible.clear()
         collectives._symm_buffers.clear()
+        collectives._moe_ep_comm_name_cache.clear()
         collectives._world_topology = None
         collectives._world_initialized = False
 
@@ -409,6 +412,157 @@ def _run_gloo_workers(worker: Callable[[int, str], None], nprocs: int, rendezvou
             if process.is_alive():
                 process.kill()
                 process.join(timeout=5.0)
+
+
+def test_moe_ep_comm_name_prefers_native_runtime(monkeypatch):
+    """The C++-held EP group wins over any Python-created one."""
+    native_calls: list[str] = []
+
+    def native_comm_name() -> str:
+        native_calls.append("native")
+        return "hccl-native"
+
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(moe_ep_comm_name=native_comm_name))
+    collectives._groups[("moe_ep", "cpu")] = _FakeGroup(0, 2)
+
+    assert collectives.moe_ep_comm_name("cpu") == "hccl-native"
+    assert collectives.moe_ep_comm_name("cpu") == "hccl-native"
+    # Cached after the first probe.
+    assert native_calls == ["native"]
+
+
+def test_moe_ep_comm_name_falls_back_to_python_group(monkeypatch):
+    """Without the native binding, the Python-created HCCL group is used."""
+    monkeypatch.setitem(sys.modules, "xllm_runtime", None)
+    monkeypatch.setattr(collectives, "_moe_ep_backend_device", lambda: torch.device("cpu"))
+    backend_calls: list[int] = []
+    group = _FakeGroup(1, 2)
+    group._get_backend = lambda device: SimpleNamespace(
+        get_hccl_comm_name=lambda rank: (backend_calls.append(rank), f"hccl-{rank}")[1]
+    )
+    collectives._groups[("moe_ep", "cpu")] = group
+
+    assert collectives.moe_ep_comm_name("cpu") == "hccl-1"
+    assert collectives.moe_ep_comm_name("cpu") == "hccl-1"
+    # Cached: the communicator is built once, not once per layer/step.
+    assert backend_calls == [1]
+
+
+def test_moe_ep_comm_name_returns_none_without_any_group(monkeypatch):
+    monkeypatch.setitem(sys.modules, "xllm_runtime", None)
+    monkeypatch.setattr(collectives, "_moe_ep_backend_device", lambda: torch.device("cpu"))
+
+    assert collectives.moe_ep_comm_name("cpu") is None
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [None, SimpleNamespace(moe_ep_comm_name=lambda: "")],
+    ids=["absent", "empty"],
+)
+def test_moe_ep_comm_name_ignores_unusable_native_binding(monkeypatch, runtime):
+    """A missing binding, or one that reports no name, falls through."""
+    monkeypatch.setitem(sys.modules, "xllm_runtime", runtime)
+    monkeypatch.setattr(collectives, "_moe_ep_backend_device", lambda: torch.device("cpu"))
+    group = _FakeGroup(0, 2)
+    group._get_backend = lambda device: SimpleNamespace(get_hccl_comm_name=lambda rank: "hccl-python")
+    collectives._groups[("moe_ep", "cpu")] = group
+
+    assert collectives.moe_ep_comm_name("cpu") == "hccl-python"
+
+
+def test_moe_ep_comm_name_falls_back_when_native_raises(monkeypatch):
+    def explode() -> str:
+        raise RuntimeError("stale binding")
+
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(moe_ep_comm_name=explode))
+    monkeypatch.setattr(collectives, "_moe_ep_backend_device", lambda: torch.device("cpu"))
+
+    assert collectives.moe_ep_comm_name("cpu") is None
+
+
+def test_moe_ep_rank_prefers_native_runtime(monkeypatch):
+    """The C++-held EP group's rank wins over any Python-created one."""
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(moe_ep_rank=lambda: 3))
+    collectives._groups[("moe_ep", "cpu")] = _FakeGroup(1, 4)
+
+    assert collectives.moe_ep_rank("cpu") == 3
+
+
+def test_moe_ep_rank_falls_back_to_python_group(monkeypatch):
+    """Without the native binding, the Python-created group's rank is used."""
+    monkeypatch.setitem(sys.modules, "xllm_runtime", None)
+    collectives._groups[("moe_ep", "cpu")] = _FakeGroup(2, 4)
+
+    assert collectives.moe_ep_rank("cpu") == 2
+
+
+def test_moe_ep_rank_returns_zero_without_any_group(monkeypatch):
+    monkeypatch.setitem(sys.modules, "xllm_runtime", None)
+
+    assert collectives.moe_ep_rank("cpu") == 0
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [None, SimpleNamespace(), SimpleNamespace(moe_ep_rank=lambda: None)],
+    ids=["absent", "missing-attr", "null"],
+)
+def test_moe_ep_rank_ignores_unusable_native_binding(monkeypatch, runtime):
+    """A missing binding, or one that reports no rank, falls through safely."""
+    monkeypatch.setitem(sys.modules, "xllm_runtime", runtime)
+    collectives._groups[("moe_ep", "cpu")] = _FakeGroup(1, 4)
+
+    assert collectives.moe_ep_rank("cpu") == 1
+
+
+def test_moe_ep_rank_falls_back_when_native_raises(monkeypatch):
+    """A present-but-broken native binding must not raise; fall back to the group."""
+
+    def explode() -> int:
+        raise RuntimeError("stale binding")
+
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(moe_ep_rank=explode))
+    collectives._groups[("moe_ep", "cpu")] = _FakeGroup(2, 4)
+
+    assert collectives.moe_ep_rank("cpu") == 2
+
+
+def test_moe_ep_rank_falls_back_when_native_raises_without_group(monkeypatch):
+    """A broken native binding with no Python group resolves to the 0 fallback."""
+
+    def explode() -> int:
+        raise RuntimeError("stale binding")
+
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(moe_ep_rank=explode))
+
+    assert collectives.moe_ep_rank("cpu") == 0
+
+
+def test_moe_ep_rank_from_native_returns_native_value(monkeypatch):
+    """The probe reports the native rank, including a legitimate rank 0."""
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(moe_ep_rank=lambda: 0))
+
+    assert collectives.moe_ep_rank_from_native("cpu") == 0
+
+
+def test_moe_ep_rank_from_native_rejects_python_group_fallback(monkeypatch):
+    """Without the native binding the probe is ``None`` -- it must not leak the
+    ``_groups`` rank that ``moe_ep_rank`` would silently return."""
+    monkeypatch.setitem(sys.modules, "xllm_runtime", None)
+    collectives._groups[("moe_ep", "cpu")] = _FakeGroup(2, 4)
+
+    assert collectives.moe_ep_rank("cpu") == 2
+    assert collectives.moe_ep_rank_from_native("cpu") is None
+
+
+def test_moe_ep_rank_from_native_none_when_native_raises(monkeypatch):
+    def explode() -> int:
+        raise RuntimeError("stale binding")
+
+    monkeypatch.setitem(sys.modules, "xllm_runtime", SimpleNamespace(moe_ep_rank=explode))
+
+    assert collectives.moe_ep_rank_from_native("cpu") is None
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo backend is unavailable")

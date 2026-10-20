@@ -22,6 +22,7 @@ limitations under the License.
 #include <type_traits>
 
 #include "common/metrics.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
@@ -163,8 +164,16 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
   // taking the C4/C128-only grouped accounting below. DeepSeek-V4.1 groups its
   // KV cache as TOKEN (C1/C2), which that accounting does not recognize.
   if (util::is_deepseek_v41_model_type(model_args_.model_type())) {
-    LOG(FATAL) << "DeepSeek-V4.1 grouped KV (C1/C2) is not supported in the "
-                  "speculative path";
+    // The python-path DSpark draft is the only V4.1 speculative setup the
+    // grouped-KV (C1/C2) accounting below supports; every other algorithm and
+    // the native executor still fail fast here.
+    LOG_IF(FATAL,
+           !SpeculativeConfig::is_v41_python_dspark_spec(
+               ModelConfig::get_instance().model_impl(),
+               options_.speculative_algorithm()))
+        << "DeepSeek-V4.1 grouped KV (C1/C2) is not supported in the "
+           "speculative path except for the DSpark algorithm on the python "
+           "model implementation";
   }
 
   if (!use_draft_engine_) {

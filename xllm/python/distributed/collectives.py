@@ -54,6 +54,10 @@ _world_endpoint = None
 _symm_eligible = {}
 _symm_buffers = {}
 _world_initialized = False
+# Resolved MoE EP communicator names, keyed by device string. The group
+# topology is fixed at rendezvous and ``get_hccl_comm_name`` lazily builds the
+# communicator, so a per-layer/per-step probe must resolve at most once.
+_moe_ep_comm_name_cache: dict[str, str] = {}
 
 
 def _backend_for(device: torch.device) -> str:
@@ -433,16 +437,139 @@ def moe_ep_hccl_info(device: torch.device | str) -> tuple[str, int, int]:
     return comm_name, rank, world_size
 
 
-def moe_ep_group(device: torch.device | str) -> ProcessGroup:
-    """Return the existing EP group without creating a second communicator."""
-    group = _groups.get(("moe_ep", str(torch.device(device))))
-    if group is None:
-        raise RuntimeError(f"MoE EP group is not initialized for {device}")
-    return group
-
-
 def dcp_group(device: torch.device | str) -> ProcessGroup | None:
     return _groups.get(("dcp", str(torch.device(device))))
+
+
+def moe_ep_group(device: torch.device | str) -> ProcessGroup | None:
+    """The MoE EP process group for ``device`` (``None`` when EP is not initialized)."""
+    return _groups.get(("moe_ep", str(torch.device(device))))
+
+
+def moe_ep_rank(device: torch.device | str) -> int:
+    """Rank in the MoE EP group for ``device`` (0 when no EP group exists).
+
+    The V4-family Python models own their EP split in C++, so the native
+    runtime's rank is preferred: no Python ``moe_ep`` group exists there and
+    the ``_groups`` fallback would silently report 0. The Python-created group
+    is the fallback for the models whose groups this module builds; ``0`` is
+    the final fallback.
+    """
+    native_rank = _native_moe_ep_rank()
+    if native_rank is not None:
+        return native_rank
+    group = moe_ep_group(device)
+    return group.rank() if group is not None else 0
+
+
+def moe_ep_rank_from_native(device: torch.device | str) -> int | None:
+    """MoE EP rank held by the embedded C++ runtime, or ``None`` when only a fallback could answer.
+
+    ``moe_ep_rank`` deliberately collapses three sources (native runtime,
+    Python ``_groups``, hard ``0``) into one int. The V4-family models own their
+    EP split in C++, so a caller that routes on the value -- the MC2 guard -- must
+    NOT accept the ``_groups``/``0`` fallback as authoritative: it would silently
+    pin every rank to ``0`` and dispatch to the wrong rank. This probe keeps the
+    source distinction without changing ``moe_ep_rank``'s contract.
+
+    ``None`` means no usable native rank (binding absent, present-but-failing,
+    or reporting ``None``); ``0`` is a legitimate native answer (rank 0).
+    """
+    return _native_moe_ep_rank()
+
+
+def _native_moe_ep_rank() -> int | None:
+    """MoE EP rank held by the embedded C++ runtime, or ``None``.
+
+    The binding lives in ``xllm_runtime``; a build that predates it -- or a
+    host without the embedded runtime -- simply has no attribute, which
+    ``_native_runtime_op`` reports as ``None``. A present binding that fails is
+    treated the same way: this is a capability probe on a path that has a
+    supported fallback, so no exception may escape the guard.
+    """
+    op = _native_runtime_op("moe_ep_rank")
+    if op is None:
+        return None
+    try:
+        rank = op()
+    except Exception:  # noqa: BLE001 - capability probe, fallback is defined.
+        return None
+    if rank is None:
+        return None
+    return int(rank)
+
+
+def _native_moe_ep_comm_name() -> str | None:
+    """HCCL communicator name held by the embedded C++ runtime, or ``None``.
+
+    The binding lives in ``xllm_runtime``; a build that predates it -- or a
+    host without the embedded runtime -- simply has no attribute, which
+    ``_native_runtime_op`` reports as ``None``. A present binding that fails is
+    treated the same way: this is a capability probe on a path that has a
+    supported fallback, so no exception may escape the guard.
+    """
+    op = _native_runtime_op("moe_ep_comm_name")
+    if op is None:
+        return None
+    try:
+        name = op()
+    except Exception:  # noqa: BLE001 - capability probe, fallback is defined.
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    return name
+
+
+def _moe_ep_backend_device() -> torch.device:
+    """Device whose registered backend the MoE EP group's HCCL wrapper lives in.
+
+    Broken out so the Python fallback can be exercised on a host without
+    torch_npu (which is what makes ``torch.device("npu")`` constructible).
+    """
+    return torch.device("npu")
+
+
+def _python_moe_ep_comm_name(device: torch.device | str) -> str | None:
+    """HCCL communicator name of the Python-created MoE EP process group."""
+    group = moe_ep_group(device)
+    if group is None:
+        return None
+    # ``_get_backend`` is the only handle torch gives on the HCCL wrapper; the
+    # same idiom is used by vllm-ascend's token dispatcher. A backend without
+    # the accessor simply cannot serve the MC2 kernels, so report that as
+    # "unavailable" rather than guessing a name.
+    backend = group._get_backend(_moe_ep_backend_device())  # noqa: SLF001
+    get_comm_name = getattr(backend, "get_hccl_comm_name", None)
+    if get_comm_name is None:
+        return None
+    return get_comm_name(group.rank())
+
+
+def moe_ep_comm_name(device: torch.device | str) -> str | None:
+    """HCCL communicator name of the MoE EP group, or ``None`` when unavailable.
+
+    The ``npu_moe_distribute_{dispatch,combine}_v2`` kernels take the raw HCCL
+    communicator name (``group_ep``), not a ``ProcessGroup``. The V4-family
+    Python models own their EP split in C++, so the native runtime's group is
+    preferred; the Python-created group is the fallback for the models whose
+    groups this module builds. ``None`` means the caller must fall back to the
+    portable expert path -- no EP group on either side, a non-HCCL backend, or
+    a torch build without ``get_hccl_comm_name``.
+
+    A resolved name is cached per device: unlike a ``None`` result, the name is
+    only meaningful once the group exists, and ``get_hccl_comm_name`` lazily
+    builds the communicator on its first call.
+    """
+    cache_key = str(torch.device(device))
+    cached = _moe_ep_comm_name_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    name = _native_moe_ep_comm_name()
+    if name is None:
+        name = _python_moe_ep_comm_name(device)
+    if name is not None:
+        _moe_ep_comm_name_cache[cache_key] = name
+    return name
 
 
 def world_topology() -> list[dict[str, object]] | None:

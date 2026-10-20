@@ -26,11 +26,25 @@ namespace runtime {
 struct Options;
 }
 
+class JsonReader;
+
 // Reads 0-based post-layer capture indices. Missing capture configuration is
 // fatal when required; Eagle3 may omit it and use its default capture layers.
 std::vector<int32_t> read_capture_layer_ids(
     const std::string& model_weights_path,
     bool required = true);
+
+// Reads the block-diffusion draft's mask token id from a parsed config. The
+// checkpoint nests the key under ``text_config`` while the deployment side may
+// patch it at the config root through any alias; the root-level aliases are
+// listed first so an existing patch keeps winning. Returns -1 when no alias is
+// present, for the caller to validate.
+int32_t read_mask_token_id(const JsonReader& reader);
+
+// Reads the DSpark draft's block size (which includes the anchor token) from
+// the draft's config.json. The root key wins over the nested ``text_config``
+// key. Returns 0 when no key is present, for the caller to default.
+int32_t read_block_size(const std::string& model_weights_path);
 
 // Apply before model construction so draft layers and dummy inputs use the
 // same geometry. The caller selects a block-diffusion algorithm.

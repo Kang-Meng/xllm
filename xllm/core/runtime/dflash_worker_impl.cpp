@@ -50,6 +50,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/platform/platform.h"
+#include "runtime/draft_model_config.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/speculative_worker_utils.h"
 #include "util/json_reader.h"
@@ -483,13 +484,13 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
     const std::string config_path = model_weights_path + "/config.json";
     CHECK(reader.parse(config_path))
         << "Failed to parse block-diffusion draft config: " << config_path;
-    mask_token_id_ = reader.value_or<int32_t>({"dflash_config.mask_token_id",
-                                               "mask_token_id",
-                                               "dspark_noise_token_id"},
-                                              /*default=*/-1);
+    // The root-level aliases win over the ``text_config`` fallback and any
+    // drift surfaces as a WARNING (see read_mask_token_id).
+    mask_token_id_ = read_mask_token_id(reader);
     CHECK_GE(mask_token_id_, 0)
         << "Block-diffusion draft config requires mask_token_id, "
-           "dflash_config.mask_token_id, or dspark_noise_token_id.";
+           "dflash_config.mask_token_id, dspark_noise_token_id, "
+           "text_config.dspark_noise_token_id, or text_config.mask_token_id.";
 
     const int64_t draft_vocab_size = draft_args.vocab_size();
     CHECK_GT(draft_vocab_size, 0)
@@ -605,6 +606,22 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   // anchor + drafts forward.
   scale_speculative_parallel_token_counts(
       validate_input.input_params, options_.num_speculative_tokens() + 1);
+  // Mirror prepare_validate_inputs on the idle shard: a NON-expanded verify
+  // pack must export its rows-per-sequence so this fake-single-row batch folds
+  // to the same sequence bucket as the busy ranks. Both runners derive the
+  // graph key from the SAME group-wide token counts, so a missing width would
+  // size this rank locally (width 1 -> 1 sequence-in-1-row vs the busy rank's
+  // one-sequence-in-(N+1)-rows) and desynchronize the runner choice: busy
+  // ranks replay the target verify graph while this rank falls to eager, and
+  // the HCCL collectives in the target forward deadlock. The chunked/expanded
+  // layout keeps width 1 (its width is carried by the query-chunk metadata).
+  const bool use_chunked_spec_verify =
+      SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
+      validate_input.input_params.is_spec_verify;
+  if (!use_chunked_spec_verify) {
+    validate_input.input_params.meta.spec_verify_width =
+        options_.num_speculative_tokens() + 1;
+  }
   // Deadlock-safety under DP: when all ranks decode but this rank's shard is
   // empty (fake input), busy peers reach run_validate and allgather their
   // pruned validate counts before the target forward. This idle rank runs the

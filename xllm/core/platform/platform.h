@@ -66,7 +66,7 @@ class Platform final {
 
   // Under KV splitting, each NPU rank retains the full indexer cache.
   // Logical block B maps to index pages [B * split, (B + 1) * split).
-  // XLLM_CP_INDEX_WRITE_MODE=replicated (the Python-side default) writes
+  // The replicated mode (the fixed default) writes
   // every stripe's page at that natural row, so each rank's tensor is a
   // physical full replica and any single transfer writer supplies every
   // valid page. The sharded mode stores each rank's valid stripe at the

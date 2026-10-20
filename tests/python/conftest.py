@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -24,6 +25,35 @@ import pytest
 import torch
 
 _PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
+_SHARED_SOURCE_MODULES: dict[Path, types.ModuleType] = {}
+
+
+def load_source_module(path: str | Path, name: str) -> types.ModuleType:
+    """Load a source file once per resolved path and share that one instance.
+
+    Suites that need the real implementation behind the stubs below load it
+    straight from its file rather than importing it. ``distributed/collectives.py``
+    registers the global ``xllm_ops::*`` operators while it executes, so loading
+    it twice in one process silently re-registers them and hands dispatch to the
+    latest module object: monkeypatches made through the first instance stop
+    applying and the suites become order dependent. Keying the cache on the
+    resolved path, and reusing the module already registered under ``name``,
+    keeps every caller on the same instance.
+    """
+    resolved = Path(path).resolve()
+    module = _SHARED_SOURCE_MODULES.get(resolved)
+    if module is None:
+        registered = sys.modules.get(name)
+        if registered is not None and Path(getattr(registered, "__file__", "") or "").resolve() == resolved:
+            module = registered
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, resolved)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    _SHARED_SOURCE_MODULES[resolved] = module
+    return module
 
 
 def _rms_norm(

@@ -86,13 +86,19 @@ void WorkerServer::create_server(const runtime::Options& options,
                                  int32_t cp_size,
                                  WorkerType worker_type) {
   if (options.enable_offline_inference()) {
+    // Backfill every execution option the workers write into runtime::Options
+    // (the speculative targets set enable_graph_aux_hidden_states there), so
+    // ExecutionConfig stays the single authority for downstream readers
+    // (py_causal_lm.cpp build_config_dict) instead of diverging per source.
     ExecutionConfig::get_instance()
         .enable_graph(options.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options.enable_graph_mode_decode_no_padding())
         .enable_prefill_piecewise_graph(
             options.enable_prefill_piecewise_graph())
-        .max_tokens_for_graph_mode(options.max_tokens_for_graph_mode());
+        .max_tokens_for_graph_mode(options.max_tokens_for_graph_mode())
+        .enable_graph_aux_hidden_states(
+            options.enable_graph_aux_hidden_states());
   }
 #if defined(USE_NPU)
   KernelConfig::get_instance().npu_kernel_backend(options.npu_kernel_backend());

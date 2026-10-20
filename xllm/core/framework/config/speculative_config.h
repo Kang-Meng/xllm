@@ -96,6 +96,19 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "DSpark");
   }
 
+  // True for the only DeepSeek-V4.1 speculative setup the grouped KV (C1/C2)
+  // paths support: the DSpark draft on the python model implementation. The
+  // master admission gate and the speculative engine's defense-in-depth gate
+  // both consume this predicate so the pairing cannot drift. Both values are
+  // taken explicitly, mirroring requires_aux_hidden_capture: callers keep the
+  // ModelConfig singleton lookup at their own call sites.
+  static bool is_v41_python_dspark_spec(
+      std::string_view model_impl,
+      std::string_view speculative_algorithm) {
+    return ModelConfig::is_python_model_impl(model_impl) &&
+           is_dspark_algorithm(speculative_algorithm);
+  }
+
   // True for the block-diffusion draft algorithms (DFlash, DSpark) that record
   // validate metrics inline per-seq and drive the adaptive per-seq varlen
   // prune. Case-insensitive so it matches however the flag was cased. MTP is

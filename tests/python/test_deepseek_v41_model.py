@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 
 from tests.python._engram_reference import _reference_engram_lookup
+from xllm.python.attention import csa2_attention
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa2_attention import (
     Csa2AttentionBackend,
@@ -42,13 +43,17 @@ from xllm.python.attention.csa2_attention import (
     _derive_graph_token_capacity_granularity,
     _indexer_score,
     _indexer_topk,
+    _quantize_indexer_rows_int8,
     _select_candidate_blocks,
+    _v41_compressor_swa_gate,
     _window_visible_idxs,
     apply_interleaved_rope,
 )
 from xllm.python.attention.dsa_metadata import (
     DSA_CACHE_SLIDING_WINDOW,
     DSA_CACHE_TOKEN,
+    DsaMetadata,
+    DsaMetadataBuilder,
     build_cache_specs_v41,
 )
 from xllm.python.model_executor.executor import ModelExecutor
@@ -73,8 +78,6 @@ from xllm.python.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
     DeepseekV41MoE,
-    fp4_act_qdq_e4m3_scale,
-    fp4_act_qdq_e8m0,
 )
 from xllm.python.models.deepseek_v41_engram import (
     ENGRAM_IMAGE_SENTINEL_BASE_ID,
@@ -107,7 +110,7 @@ def _active_device() -> torch.device:
 
 # Reference V4.1 Flash config fields (adaptation report 1.4), with the full
 # 43-entry compress_ratios layout: [0,0] + [2]*18 + [1]*20 + draft tail [0,0,0].
-_DSV41_CONFIG = {
+_DEEPSEEK_V41_CONFIG = {
     "model_type": "deepseek_v41",
     "architectures": ["DeepseekV41ForCausalLM"],
     "hidden_size": 5120,
@@ -188,8 +191,8 @@ _ENGRAM_TINY_OVERRIDE = {
     "engram_token_map": _engram_test_token_map(),
 }
 
-_DSV41_TINY_CONFIG = {
-    **_DSV41_CONFIG,
+_DEEPSEEK_V41_TINY_CONFIG = {
+    **_DEEPSEEK_V41_CONFIG,
     **_ENGRAM_TINY_OVERRIDE,
     "num_hidden_layers": 6,
     "hidden_size": 128,
@@ -214,8 +217,8 @@ _DSV41_TINY_CONFIG = {
 # Forward-path geometry (contract section 5): head_dim 64 and index_head_dim 32
 # satisfy the QDQ group divisibility; index sources [2, 4, 5] make layer 5 a
 # Reindex layer consuming layer 4's candidate pool.
-_DSV41_FORWARD_CONFIG = {
-    **_DSV41_TINY_CONFIG,
+_DEEPSEEK_V41_FORWARD_CONFIG = {
+    **_DEEPSEEK_V41_TINY_CONFIG,
     "num_attention_heads": 2,
     "head_dim": 64,
     "qk_rope_head_dim": 16,
@@ -231,7 +234,7 @@ _DSV41_FORWARD_CONFIG = {
 
 
 def test_config_from_dict_and_defaults() -> None:
-    cfg = DeepseekV41Config.from_dict(_DSV41_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_CONFIG)
     assert cfg.model_type == "deepseek_v41"
     assert cfg.n_layers == 40
     assert cfg.q_lora_rank == 1280
@@ -257,7 +260,7 @@ def test_config_preserves_v41_compress_ratios() -> None:
     V4's ``<= 1 -> 1`` normalization would erase the SWA/decoder distinction;
     the trailing draft entries (3 zeros) are dropped for the 40-layer model.
     """
-    cfg = DeepseekV41Config.from_dict(_DSV41_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_CONFIG)
     assert cfg.compress_ratios == [0, 0] + [2] * 18 + [1] * 20
     assert len(cfg.compress_ratios) == cfg.n_layers
 
@@ -265,7 +268,7 @@ def test_config_preserves_v41_compress_ratios() -> None:
 @pytest.mark.parametrize("ratio", [-1, 3, 8, 128])
 def test_config_rejects_unsupported_compress_ratios(ratio: int) -> None:
     with pytest.raises(ValueError, match="unsupported DeepSeek-V4.1 compression ratio"):
-        DeepseekV41Config.from_dict({**_DSV41_CONFIG, "compress_ratios": [ratio] * 40})
+        DeepseekV41Config.from_dict({**_DEEPSEEK_V41_CONFIG, "compress_ratios": [ratio] * 40})
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +277,7 @@ def test_config_rejects_unsupported_compress_ratios(ratio: int) -> None:
 
 
 def test_csa2_plan_matches_reference_layer_assignment() -> None:
-    cfg = DeepseekV41Config.from_dict(_DSV41_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_CONFIG)
     plan = CSA2LayerPlan.build(cfg.n_layers, cfg.compress_ratios, cfg.kv_source_layer_ids, cfg.index_source_layer_ids)
     # No cross-layer CED hidden capture exists in the reference: every
     # kv-source layer compresses its OWN attention input.
@@ -329,7 +332,7 @@ def test_csa2_plan_rejects_invalid_source_layouts(
 
 
 def test_dsa_cp_replicates_query_weights_and_keeps_output_sharded() -> None:
-    config = {**_DSV41_TINY_CONFIG, "enable_dsa_cp": True, "tp_size": 2, "tp_rank": 0, "engram_layer_ids": []}
+    config = {**_DEEPSEEK_V41_TINY_CONFIG, "enable_dsa_cp": True, "tp_size": 2, "tp_rank": 0, "engram_layer_ids": []}
     cfg = DeepseekV41Config.from_dict(config)
     model = DeepseekV41Model(cfg, torch.float32, torch.device("cpu"), config=config)
     attn = model.layers[0].self_attn
@@ -341,7 +344,7 @@ def test_dsa_cp_replicates_query_weights_and_keeps_output_sharded() -> None:
 
 
 def test_dsa_cp_rejects_pcp_topology() -> None:
-    config = {**_DSV41_TINY_CONFIG, "enable_dsa_cp": True, "cp_size": 2, "engram_layer_ids": []}
+    config = {**_DEEPSEEK_V41_TINY_CONFIG, "enable_dsa_cp": True, "cp_size": 2, "engram_layer_ids": []}
     cfg = DeepseekV41Config.from_dict(config)
     with pytest.raises(ValueError, match="enable_dsa_cp cannot be combined with cp_size"):
         DeepseekV41Model(cfg, torch.float32, torch.device("cpu"), config=config)
@@ -349,7 +352,7 @@ def test_dsa_cp_rejects_pcp_topology() -> None:
 
 def test_dsa_cp_rejects_uneven_head_shards_at_construction() -> None:
     config = {
-        **_DSV41_TINY_CONFIG,
+        **_DEEPSEEK_V41_TINY_CONFIG,
         "enable_dsa_cp": True,
         "tp_size": 2,
         "num_attention_heads": 3,
@@ -366,7 +369,7 @@ def test_dsa_cp_all_batch_types_match_original_tp(monkeypatch: pytest.MonkeyPatc
     from xllm.python import distributed
     from xllm.python.model_executor.dsa_cp import get_current_dsa_cp_runtime
 
-    config = {**_DSV41_TINY_CONFIG, "tp_size": 2, "tp_rank": rank, "engram_layer_ids": []}
+    config = {**_DEEPSEEK_V41_TINY_CONFIG, "tp_size": 2, "tp_rank": rank, "engram_layer_ids": []}
     enabled_config = {**config, "enable_dsa_cp": True}
     enabled_model = DeepseekV41Model(
         DeepseekV41Config.from_dict(enabled_config), torch.float32, torch.device("cpu"), config=enabled_config
@@ -395,7 +398,6 @@ def test_dsa_cp_all_batch_types_match_original_tp(monkeypatch: pytest.MonkeyPatc
     backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
     backend._current_forward_metadata = lambda: context.metadata
     backend._shared_runtime = CSA2SharedRuntime
-    backend._smla_fallback_reason = lambda *_: "switch off"
     reference = None
     exchange_calls = 0
 
@@ -439,7 +441,6 @@ def test_dsa_cp_all_batch_types_match_original_tp(monkeypatch: pytest.MonkeyPatc
         received[:tokens] = reference[:, rank * heads : (rank + 1) * heads]
         return received
 
-    monkeypatch.setattr(dq, "fp8_act_qdq", lambda x, *_: x)
     monkeypatch.setattr(distributed, "all_to_all", _exchange, raising=False)
     monkeypatch.setattr(distributed, "tp_all_reduce", lambda x: x)
     metadata = SimpleNamespace(
@@ -470,15 +471,15 @@ def test_dsa_cp_all_batch_types_match_original_tp(monkeypatch: pytest.MonkeyPatc
 def _tiny_model() -> DeepseekV41Model:
     """Tiny model with the injected engram token map (construction tests)."""
     return DeepseekV41Model(
-        DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG),
+        DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG),
         torch.float32,
         torch.device("cpu"),
-        config=_DSV41_TINY_CONFIG,
+        config=_DEEPSEEK_V41_TINY_CONFIG,
     )
 
 
 def test_module_layout_matches_csa2_modes() -> None:
-    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG)
     model = _tiny_model()
     swa = model.layers[0].self_attn
     full_encoder = model.layers[2].self_attn
@@ -501,7 +502,7 @@ def test_module_layout_matches_csa2_modes() -> None:
 
 
 def test_v41_indexer_uses_independent_key_path() -> None:
-    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG)
     model = _tiny_model()
     indexer = model.layers[2].self_attn.indexer
     assert indexer is not None
@@ -514,7 +515,7 @@ def test_v41_indexer_uses_independent_key_path() -> None:
 
 
 def test_moe_bias_vl_shifts_only_visual_tokens() -> None:
-    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG)
     model = _tiny_model()
     moe = model.layers[2].mlp
     # gate_bias_vl exists but is unloaded until the checkpoint provides it;
@@ -559,7 +560,7 @@ def test_moe_active_segments_match_all_expert_reference(
     torch.manual_seed(41)
     cfg = DeepseekV41Config.from_dict(
         {
-            **_DSV41_TINY_CONFIG,
+            **_DEEPSEEK_V41_TINY_CONFIG,
             "hidden_size": 8,
             "moe_intermediate_size": 6,
             "n_routed_experts": 384,
@@ -770,8 +771,8 @@ def _build_tiny_checkpoint(cfg: DeepseekV41Config) -> dict[str, torch.Tensor]:
 
 
 def test_load_weights_maps_v41_checkpoint_layout() -> None:
-    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
-    lm = DeepseekV41ForCausalLM({**_DSV41_TINY_CONFIG, "device": "cpu", "dtype": "float32"})
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG)
+    lm = DeepseekV41ForCausalLM({**_DEEPSEEK_V41_TINY_CONFIG, "device": "cpu", "dtype": "float32"})
     tensors = _build_tiny_checkpoint(cfg)
     lm.load_weights([_FakeStateDict(tensors)], 0, 1)
 
@@ -810,10 +811,10 @@ def test_load_weights_requires_attention_projections() -> None:
     unconditionally, so an export that omits one must raise instead of leaving
     the parameter at uninitialized values.
     """
-    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG)
     tensors = _build_tiny_checkpoint(cfg)
     del tensors["layers.0.attn.wq_a.weight"]
-    lm = DeepseekV41ForCausalLM({**_DSV41_TINY_CONFIG, "device": "cpu", "dtype": "float32"})
+    lm = DeepseekV41ForCausalLM({**_DEEPSEEK_V41_TINY_CONFIG, "device": "cpu", "dtype": "float32"})
     with pytest.raises(KeyError, match=r"layers\.0\.attn\.wq_a\.weight"):
         lm.load_weights([_FakeStateDict(tensors)], 0, 1)
 
@@ -825,10 +826,10 @@ def test_load_weights_requires_moe_gate() -> None:
     surface from ``_load_torch_moe`` instead of silently skipping the MLP
     (the old ``_has(ffn.gate.weight)`` dispatch left the layer uninitialized).
     """
-    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG)
     tensors = _build_tiny_checkpoint(cfg)
     del tensors["layers.5.ffn.gate.weight"]
-    lm = DeepseekV41ForCausalLM({**_DSV41_TINY_CONFIG, "device": "cpu", "dtype": "float32"})
+    lm = DeepseekV41ForCausalLM({**_DEEPSEEK_V41_TINY_CONFIG, "device": "cpu", "dtype": "float32"})
     with pytest.raises(KeyError):
         lm.load_weights([_FakeStateDict(tensors)], 0, 1)
 
@@ -840,8 +841,8 @@ def test_load_weights_requires_moe_gate() -> None:
 
 # Minimal ascend geometry: one SWA (no compressor/indexer) dense layer, so the
 # loader stays small; the W8A8DynamicLinear buffers are the point of the test.
-_DSV41_ASCEND_CONFIG = {
-    **_DSV41_CONFIG,
+_DEEPSEEK_V41_ASCEND_CONFIG = {
+    **_DEEPSEEK_V41_CONFIG,
     "num_hidden_layers": 1,
     "hidden_size": 32,
     "num_attention_heads": 2,
@@ -878,7 +879,7 @@ def _make_ascend_lm(tmp_path, monkeypatch: pytest.MonkeyPatch) -> DeepseekV41For
     monkeypatch.setattr(kernels, "prepare_quant_weight", lambda weight: weight, raising=False)
     (tmp_path / "quant_model_description.json").write_text("{}")
     lm = DeepseekV41ForCausalLM(
-        {**_DSV41_ASCEND_CONFIG, "device": "cpu", "dtype": "float32", "model_path": str(tmp_path)}
+        {**_DEEPSEEK_V41_ASCEND_CONFIG, "device": "cpu", "dtype": "float32", "model_path": str(tmp_path)}
     )
     assert lm.quant_mode == "ascend"
     return lm
@@ -886,7 +887,7 @@ def _make_ascend_lm(tmp_path, monkeypatch: pytest.MonkeyPatch) -> DeepseekV41For
 
 def _ascend_tensors(omit_attn_offsets: bool = False) -> dict[str, torch.Tensor]:
     """W8A8 export layout for the minimal ascend config (dense, one SWA layer)."""
-    cfg = _DSV41_ASCEND_CONFIG
+    cfg = _DEEPSEEK_V41_ASCEND_CONFIG
     hidden = cfg["hidden_size"]
     q_lora = cfg["q_lora_rank"]
     head_dim = cfg["head_dim"]
@@ -984,59 +985,6 @@ def test_ascend_load_rejects_missing_weight_and_scale(tmp_path, monkeypatch: pyt
 # V4.1 quant kernels, inlined in deepseek_v41 (semantics doc sections 2.1-2.5)
 # ---------------------------------------------------------------------------
 
-_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def _round_e2m1_slow(value: float) -> float:
-    """Independent slow E2M1 rounding: nearest value, ties to even mantissa."""
-    magnitude = abs(value)
-    below = max((g for g in _E2M1_GRID if g <= magnitude), default=0.0)
-    above = min((g for g in _E2M1_GRID if g >= magnitude), default=6.0)
-    if magnitude - below < above - magnitude:
-        nearest = below
-    elif magnitude - below > above - magnitude:
-        nearest = above
-    else:
-        nearest = below if _E2M1_GRID.index(below) % 2 == 0 else above
-    return -nearest if value < 0 else nearest
-
-
-def _expected_fp8_act_qdq(x: torch.Tensor, group: int) -> torch.Tensor:
-    shape = x.shape
-    grouped = x.float().reshape(-1, group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(1e-4)
-    t = amax * torch.tensor(1.0 / 448.0, dtype=torch.float32)
-    scale = torch.exp2(torch.ceil(torch.log2(t.double()))).float()
-    normalized = (grouped / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
-    return (normalized.to(torch.float8_e4m3fn).float() * scale.unsqueeze(-1)).reshape(shape)
-
-
-def _expected_fp4_e8m0(x: torch.Tensor, group: int) -> torch.Tensor:
-    shape = x.shape
-    grouped = x.float().reshape(-1, group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(6.0 * 2.0**-126)
-    t = amax * torch.tensor(1.0 / 6.0, dtype=torch.float32)
-    scale = torch.exp2(torch.ceil(torch.log2(t.double()))).float()
-    normalized = (grouped / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
-    rounded = torch.tensor(
-        [_round_e2m1_slow(v) for v in normalized.flatten().tolist()],
-        dtype=torch.float32,
-    ).reshape(normalized.shape)
-    return (rounded * scale.unsqueeze(-1)).reshape(shape)
-
-
-def _expected_fp4_e4m3(x: torch.Tensor, group: int) -> torch.Tensor:
-    shape = x.shape
-    grouped = x.float().reshape(-1, group)
-    amax = grouped.abs().amax(dim=-1).clamp_min(6.0 * 2.0**-9)
-    scale = (amax / 6.0).to(torch.float8_e4m3fn).float()
-    normalized = (grouped / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
-    rounded = torch.tensor(
-        [_round_e2m1_slow(v) for v in normalized.flatten().tolist()],
-        dtype=torch.float32,
-    ).reshape(normalized.shape)
-    return (rounded * scale.unsqueeze(-1)).reshape(shape)
-
 
 def _make_block_quantized(out_dim: int, in_dim: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Builds a synthetic 32x32-block FP8 weight that round-trips exactly."""
@@ -1115,70 +1063,6 @@ def test_dequant_fp4_group_known_scales() -> None:
     assert torch.equal(zero_out, (unpacked[:, :32] * 2.0**-127).to(torch.bfloat16))
 
 
-def test_fp8_act_qdq_known_and_reference() -> None:
-    # amax = 448 gives scale exactly 1: values round straight through the e4m3
-    # grid (100 -> 96, 300 -> 288, round-to-nearest-even; 449 saturates).
-    x = torch.tensor([[448.0, 224.0, 1.0, 0.0, -448.0, 100.0, 0.5, 300.0]])
-    expected = torch.tensor([[448.0, 224.0, 1.0, 0.0, -448.0, 96.0, 0.5, 288.0]])
-    assert torch.equal(dq.fp8_act_qdq(x, group=8), expected)
-    assert torch.all(dq.fp8_act_qdq(torch.full((1, 32), 449.0), group=32) == 448.0)
-    torch.manual_seed(6)
-    xr = (torch.randn(4, 128) * 7).to(torch.bfloat16)
-    xr[:, :5] = 0
-    out = dq.fp8_act_qdq(xr, group=32)
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out.float(), _expected_fp8_act_qdq(xr, 32))
-    assert torch.all(out[:, :5] == 0)
-
-
-def test_fp4_act_qdq_e8m0_known_and_reference() -> None:
-    # amax = 12 -> s = 2; includes every tie case, which must round to the
-    # even E2M1 neighbor (0.75 -> 1, 1.25 -> 1, 1.75 -> 2, 2.5 -> 2 after /s).
-    x = torch.tensor(
-        [[6.0, 3.0, 1.5, 0.75, 0.25, 0.0, -6.0, -0.75, 12.0, 5.0, 2.5, 3.5, 0.5, 1.0, 4.0, 0.26]],
-        dtype=torch.bfloat16,
-    )
-    expected = torch.tensor([[6, 3, 2, 1, 0, 0, -6, -1, 12, 4, 2, 4, 0, 1, 4, 0]], dtype=torch.bfloat16)
-    assert torch.equal(dq.fp4_act_qdq_e8m0(x, group=16), expected)
-    torch.manual_seed(8)
-    xr = (torch.randn(4, 128) * 3).to(torch.bfloat16)
-    xr[:, :5] = 0
-    out = dq.fp4_act_qdq_e8m0(xr, group=32)
-    assert torch.equal(out.float(), _expected_fp4_e8m0(xr, 32))
-    # All-zero group stays zero.
-    assert torch.all(dq.fp4_act_qdq_e8m0(torch.zeros(2, 32, dtype=torch.bfloat16), group=32) == 0)
-
-
-def test_fp4_act_qdq_e4m3_scale_known_and_reference() -> None:
-    # s = e4m3(amax / 6) is NOT a power of two (e.g. 1 -> 0.171875).
-    cases = [
-        (6.0, 6.0),  # s = e4m3(1) = 1
-        (1.0, 1.03125),  # s = e4m3(1/6) = 0.171875
-        (0.0234375, 0.0234375),  # 6 * 2**-8: s = 2**-8 exactly
-        (5.0, 4.875),  # s = e4m3(5/6) = 0.8125; 5/0.8125 rounds to 6
-        (0.0, 0.0),  # all-zero group: amax floor 6 * 2**-9
-    ]
-    for value, expected in cases:
-        out = dq.fp4_act_qdq_e4m3_scale(torch.tensor([value]), group=1)
-        assert out.item() == expected, (value, out.item(), expected)
-    torch.manual_seed(9)
-    xr = (torch.randn(4, 128) * 2).to(torch.bfloat16)
-    xr[:, :3] = 0
-    out = dq.fp4_act_qdq_e4m3_scale(xr, group=16)
-    assert out.dtype == torch.bfloat16
-    assert torch.equal(out.float(), _expected_fp4_e4m3(xr, 16))
-
-
-def test_qdq_rejects_indivisible_group() -> None:
-    x = torch.randn(2, 40)
-    with pytest.raises(ValueError):
-        dq.fp8_act_qdq(x, group=32)
-    with pytest.raises(ValueError):
-        dq.fp4_act_qdq_e8m0(x, group=32)
-    with pytest.raises(ValueError):
-        dq.fp4_act_qdq_e4m3_scale(x, group=16)
-
-
 # ---------------------------------------------------------------------------
 # Cache layout (adaptation contract section 2)
 # ---------------------------------------------------------------------------
@@ -1235,7 +1119,7 @@ def test_build_cache_specs_v41() -> None:
     assert entries(4) == [(DSA_CACHE_TOKEN, 1, 2), (DSA_CACHE_TOKEN, 1, 2), swa]
 
     # The backend resolves the LayerCache slot layout from the same specs.
-    backend = _make_csa2_backend(DeepseekV41Config.from_dict(_DSV41_FORWARD_CONFIG))
+    backend = _make_csa2_backend(DeepseekV41Config.from_dict(_DEEPSEEK_V41_FORWARD_CONFIG))
     full_r2 = backend._resolve_cache_mapping(2, 2)
     assert (
         full_r2.cmp_cache_idx,
@@ -1303,7 +1187,7 @@ def _make_csa2_backend(
 
 
 def _graph_admission_cfg() -> DeepseekV41Config:
-    return DeepseekV41Config.from_dict(_DSV41_FORWARD_CONFIG)
+    return DeepseekV41Config.from_dict(_DEEPSEEK_V41_FORWARD_CONFIG)
 
 
 @pytest.mark.parametrize(
@@ -1317,13 +1201,12 @@ def test_csa2_marks_moe_graph_capability_from_quant_mode(quant_mode: str, expect
     assert backend.moe_graph_capturable is expected
 
 
-def test_csa2_acl_graph_capacity_is_checked_at_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_csa2_acl_graph_capacity_is_checked_at_construction() -> None:
     """C: fail at startup, not at the first captured forward.
 
-    A derivable ``max_model_len`` or an explicit env value satisfies the check;
-    a non-capturable quant mode never reaches it (graph is disabled anyway).
+    A derivable ``max_model_len`` satisfies the check; a non-capturable quant
+    mode never reaches it (graph is disabled anyway).
     """
-    monkeypatch.delenv("XLLM_V41_GRAPH_CAPACITY_GRANULARITY", raising=False)
     cfg = _graph_admission_cfg()
 
     derived = _make_csa2_backend(
@@ -1352,17 +1235,6 @@ def test_csa2_acl_graph_capacity_is_checked_at_construction(monkeypatch: pytest.
         acl_graph_enabled=True,
         max_model_len=0,
     )
-
-    # An explicit env value overrides the derivation and satisfies the check.
-    monkeypatch.setenv("XLLM_V41_GRAPH_CAPACITY_GRANULARITY", "8192")
-    explicit = _make_csa2_backend(
-        cfg,
-        torch.device("cpu"),
-        quant_mode=V41_QUANT_ASCEND,
-        acl_graph_enabled=True,
-        max_model_len=0,
-    )
-    assert explicit.graph_token_capacity_granularity == 8192
 
 
 def test_graph_token_capacity_granularity_caps_the_serving_bound() -> None:
@@ -1432,10 +1304,13 @@ def _allocate_v41_layer_caches(
             LayerCache(
                 key=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.head_dim, dtype=dtype, device=device),
                 value=None,
-                index=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.index_head_dim, dtype=dtype, device=device),
+                # The NPU platform policy keeps the index plane in INT8 plus an
+                # FP16 per-token scale; the pure-Python tests mirror it.
+                index=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.index_head_dim, dtype=torch.int8, device=device),
                 swa=swa(),
                 compress_kv_state=swa(torch.float32) if states else None,
                 compress_score_state=swa(torch.float32) if states else None,
+                indexer_scale=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, 1, dtype=torch.float16, device=device),
             )
         )
     return caches
@@ -1507,7 +1382,7 @@ def _make_forward_lm(
     device: torch.device | None = None,
 ) -> DeepseekV41ForCausalLM:
     torch.manual_seed(seed)
-    lm = DeepseekV41ForCausalLM({**_DSV41_FORWARD_CONFIG, "device": str(device or "cpu"), "dtype": dtype})
+    lm = DeepseekV41ForCausalLM({**_DEEPSEEK_V41_FORWARD_CONFIG, "device": str(device or "cpu"), "dtype": dtype})
     _random_init_v41(lm)
     return lm
 
@@ -1545,11 +1420,13 @@ def test_compressor_math() -> None:
 
     def expected_key_row(latent: torch.Tensor, position: int) -> torch.Tensor:
         rotated = apply_interleaved_rope(latent.unsqueeze(0), torch.tensor([position]), cos_sin)
-        return fp4_act_qdq_e4m3_scale(rotated, 16)[0]
+        return rotated[0]
 
-    def expected_index_rows(latent: torch.Tensor, starts: list[int]) -> torch.Tensor:
+    def expected_index_rows(latent: torch.Tensor, starts: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        # The native INT8 plane stores per-row symmetric codes + FP16 scales.
         index_k = layer.indexer_key(latent)
-        return fp4_act_qdq_e8m0(apply_interleaved_rope(index_k, torch.tensor(starts), cos_sin), 32)
+        index_k = apply_interleaved_rope(index_k, torch.tensor(starts), cos_sin)
+        return _quantize_indexer_rows_int8(index_k)
 
     # Step 1: 3 tokens (positions 0-2). Group (0, 1) commits; position 2 is
     # parked in the state ring.
@@ -1569,7 +1446,9 @@ def test_compressor_math() -> None:
     latent0 = layer.compress_rmsnorm(pooled0.unsqueeze(0))[0]
     key_cache = layer_caches[2].key
     assert torch.allclose(key_cache[0, 0], expected_key_row(latent0, 0), atol=1e-6)
-    assert torch.allclose(layer_caches[2].index[0, 0], expected_index_rows(latent0.unsqueeze(0), [0])[0], atol=1e-6)
+    exp_codes0, exp_scales0 = expected_index_rows(latent0.unsqueeze(0), [0])
+    assert torch.equal(layer_caches[2].index[0, 0], exp_codes0[0])
+    assert torch.allclose(layer_caches[2].indexer_scale[0, 0, 0].float(), exp_scales0[0].float())
     # One committed row after 3 tokens (ctx // ratio); the partial group's
     # members are parked in the state ring at their SWA slots.
     assert (key_cache[0, : 3 // 2].abs().sum(dim=-1) > 0).all()
@@ -1601,8 +1480,9 @@ def test_compressor_math() -> None:
     # RMSNorm sits AFTER pooling; RoPE uses the group-start position.
     assert torch.allclose(key_cache[0, 1], expected_key_row(latent1, 2), atol=1e-6)
     assert torch.allclose(key_cache[0, 2], expected_key_row(latent2, 4), atol=1e-6)
-    expected_index = expected_index_rows(torch.stack((latent1, latent2)), [2, 4])
-    assert torch.allclose(layer_caches[2].index[0, 1:3], expected_index, atol=1e-6)
+    exp_codes, exp_scales = expected_index_rows(torch.stack((latent1, latent2)), [2, 4])
+    assert torch.equal(layer_caches[2].index[0, 1:3], exp_codes)
+    assert torch.allclose(layer_caches[2].indexer_scale[0, 1:3, 0].float(), exp_scales.float())
     assert (key_cache[0, : 6 // 2].abs().sum(dim=-1) > 0).all()
     assert (key_cache[0, 6 // 2 :] == 0).all()
 
@@ -1620,7 +1500,7 @@ def test_compressor_math() -> None:
     backend._run_compressor(layer4, ctx, build_dsa(5, 5, 0), layer_caches[4], mapping4, [5], [5], shared4)
     kv, _ = layer4.compress_kv_score(x)
     latent = layer4.compress_rmsnorm(kv)
-    expected = fp4_act_qdq_e4m3_scale(apply_interleaved_rope(latent, torch.arange(5), cos_sin), 16)
+    expected = apply_interleaved_rope(latent, torch.arange(5), cos_sin)
     assert torch.allclose(layer_caches[4].key[0, :5], expected, atol=1e-6)
     assert (layer_caches[4].key[0, 5:] == 0).all()
     # Ratio 1 keeps no pooling states and no gate.
@@ -1683,6 +1563,222 @@ def test_compressor_padded_row_uses_nonnegative_rope_position() -> None:
     assert torch.equal(layer_caches[2].index, index_before)
 
 
+def test_compressor_state_ring_read_before_write() -> None:
+    """Ring=32 fallback must read the residual BEFORE it re-parks (K2 -> K3).
+
+    Reproduces the ring-32 hazard: with ``prev_ctx`` odd and ``q_len >= ring``,
+    the chunk re-parks position ``prev_ctx + ring - 1`` into the same ring slot
+    as the residual position ``prev_ctx - 1`` that this forward's group pooling
+    must read. If the park scatter runs first (the pre-fix order) it clobbers
+    the residual and group 0 pools the wrong member. The Triton kernel keeps the
+    read-before-write order, so the torch fallback must match it.
+    """
+    torch.manual_seed(7)
+    # window_size == state ring rows (see kDsv41CompressStateRows = 32);
+    # production fixes it at 32, here it is the model's window size.
+    fwd_cfg = {**_DEEPSEEK_V41_FORWARD_CONFIG, "window_size": 32, "sliding_window": 32}
+    lm = DeepseekV41ForCausalLM({**fwd_cfg, "device": "cpu", "dtype": torch.float32})
+    _random_init_v41(lm)
+    cfg = lm.cfg
+    assert cfg.window_size == 32
+    model = lm.model
+    backend = _make_csa2_backend(cfg)
+    layer_caches = _allocate_v41_layer_caches(cfg, n_seqs=1, dtype=torch.float32)
+    backend.bind_kv_caches(layer_caches)
+    layer = model.layers[2].self_attn
+    assert layer.mode.compress_ratio == 2
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    cos_sin = model.compress_rotary.cos_sin_cache
+    state_rows = layer_caches[2].compress_kv_state.size(1)
+    assert state_rows == 32
+    state_kv = layer_caches[2].compress_kv_state.view(-1, cfg.head_dim)
+    state_score = layer_caches[2].compress_score_state.view(-1, cfg.head_dim)
+
+    def build_dsa(kv_len: int, q_len: int, start: int) -> SimpleNamespace:
+        # One SWA ring block per sequence (production V4.1: window == block size),
+        # so the state slot is exactly ``position % state_rows``.
+        return backend._builder.build(
+            multi_block_tables=[
+                torch.tensor([[0]], dtype=torch.int32),
+                torch.tensor([[0]], dtype=torch.int32),
+                torch.tensor([[0]], dtype=torch.int32),
+            ],
+            kv_seq_lens=[kv_len],
+            q_seq_lens=[q_len],
+            positions=torch.arange(start, start + q_len, dtype=torch.int64),
+            dsa_cos_sin=None,
+            is_prefill=False,
+            is_chunked_prefill=True,
+        )
+
+    def expected_key_row(latent: torch.Tensor, position: int) -> torch.Tensor:
+        rotated = apply_interleaved_rope(latent.unsqueeze(0), torch.tensor([position]), cos_sin)
+        return rotated[0]
+
+    shared = CSA2SharedRuntime()
+
+    # Step A: position 0 alone (prev_ctx=0, even). No group commits; position 0
+    # is parked into ring slot 0 as the residual for the next chunk.
+    x_a = torch.randn(1, cfg.hidden_size)
+    ctx_a = Csa2LayerContext(
+        x=x_a,
+        qr=torch.randn(1, cfg.q_lora_rank),
+        positions=torch.arange(1),
+        cos_sin_cache=cos_sin,
+    )
+    backend._run_compressor(layer, ctx_a, build_dsa(1, 1, 0), layer_caches[2], mapping, [1], [1], shared)
+    kv_a, score_a = layer.compress_kv_score(x_a)
+    assert torch.allclose(state_kv[0], kv_a[0], atol=1e-6)
+    assert torch.allclose(state_score[0], score_a[0], atol=1e-6)
+
+    # Step B: positions 1..32 (prev_ctx=1 odd, q_len=32 >= ring). Group 0 = (0, 1)
+    # completes: member 0 reads step A's parked residual (slot 0), member 1 is
+    # fresh row 0. Position 32 re-parks into slot 0 as well.
+    x_b = torch.randn(32, cfg.hidden_size)
+    ctx_b = Csa2LayerContext(
+        x=x_b,
+        qr=torch.randn(32, cfg.q_lora_rank),
+        positions=torch.arange(1, 33),
+        cos_sin_cache=cos_sin,
+    )
+    backend._run_compressor(layer, ctx_b, build_dsa(33, 32, 1), layer_caches[2], mapping, [32], [33], shared)
+    kv_b, score_b = layer.compress_kv_score(x_b)
+
+    # Group 0's pooled row must use the step-A residual, not the step-B position
+    # 32 value that lands in the same ring slot.
+    members = torch.stack((kv_a[0].clone(), kv_b[0]))
+    gates = torch.stack((score_a[0].clone(), score_b[0])).softmax(dim=0)
+    pooled0 = (members * gates).sum(dim=0)
+    latent0 = layer.compress_rmsnorm(pooled0.unsqueeze(0))[0]
+    assert torch.allclose(layer_caches[2].key[0, 0], expected_key_row(latent0, 0), atol=1e-6)
+
+    # Sanity: group 0 did NOT read position 32's projection (the buggy value).
+    buggy_members = torch.stack((kv_b[31], kv_b[0]))
+    buggy_gates = torch.stack((score_b[31], score_b[0])).softmax(dim=0)
+    buggy_latent = layer.compress_rmsnorm((buggy_members * buggy_gates).sum(dim=0).unsqueeze(0))[0]
+    assert not torch.allclose(layer_caches[2].key[0, 0], expected_key_row(buggy_latent, 0), atol=1e-4)
+
+    # The re-park still lands in slot 0 (last writer wins), now AFTER the read.
+    assert torch.allclose(state_kv[0], kv_b[31], atol=1e-6)
+    assert torch.allclose(state_score[0], score_b[31], atol=1e-6)
+
+
+def test_compressor_state_park_tail_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """q_len > ring must park only the trailing window (one writer per slot).
+
+    The Triton kernel's K3 writes only the last ``min(used_len, CACHE_SIZE)``
+    tokens, so each ring slot has a single writer. The torch fallback parks the
+    whole chunk, so with ``q_len > state_rows`` the positions ``p`` and
+    ``p + state_rows`` address the SAME ring slot inside one scatter; the NPU
+    scatter's duplicate-index write order is unspecified. This test spies on the
+    park scatter and asserts no slot is targeted twice in a single call (fails
+    on the whole-chunk park, passes with the trailing window), plus that the
+    trailing residual the next chunk reads stays correct.
+    """
+
+    import xllm.python.attention.csa2_attention as csa2_mod
+
+    torch.manual_seed(13)
+    fwd_cfg = {**_DEEPSEEK_V41_FORWARD_CONFIG, "window_size": 32, "sliding_window": 32}
+    lm = DeepseekV41ForCausalLM({**fwd_cfg, "device": "cpu", "dtype": torch.float32})
+    _random_init_v41(lm)
+    cfg = lm.cfg
+    model = lm.model
+    backend = _make_csa2_backend(cfg)
+    layer_caches = _allocate_v41_layer_caches(cfg, n_seqs=1, dtype=torch.float32)
+    backend.bind_kv_caches(layer_caches)
+    layer = model.layers[2].self_attn
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    cos_sin = model.compress_rotary.cos_sin_cache
+    state_rows = layer_caches[2].compress_kv_state.size(1)
+    assert state_rows == 32
+    state_kv = layer_caches[2].compress_kv_state.view(-1, cfg.head_dim)
+
+    def build_dsa(kv_len: int, q_len: int, start: int) -> SimpleNamespace:
+        # One SWA ring block per sequence, so a state slot is ``position % 32``.
+        return backend._builder.build(
+            multi_block_tables=[
+                torch.tensor([[0]], dtype=torch.int32),
+                torch.tensor([[0]], dtype=torch.int32),
+                torch.tensor([[0]], dtype=torch.int32),
+            ],
+            kv_seq_lens=[kv_len],
+            q_seq_lens=[q_len],
+            positions=torch.arange(start, start + q_len, dtype=torch.int64),
+            dsa_cos_sin=None,
+            is_prefill=False,
+            is_chunked_prefill=True,
+        )
+
+    recorded: list[tuple[tuple[int, ...], torch.Tensor]] = []
+    orig_scatter = csa2_mod._scatter_by_slot
+
+    def spy(cache, slot_mapping, value):  # noqa: ANN001 - mirrors the patched signature
+        if slot_mapping is not None and cache is not None:
+            recorded.append((tuple(cache.shape), slot_mapping.detach().reshape(-1).clone()))
+        return orig_scatter(cache, slot_mapping, value)
+
+    monkeypatch.setattr(csa2_mod, "_scatter_by_slot", spy)
+
+    shared = CSA2SharedRuntime()
+
+    # Step A: position 0 parks ring slot 0 as the residual.
+    x_a = torch.randn(1, cfg.hidden_size)
+    ctx_a = Csa2LayerContext(
+        x=x_a,
+        qr=torch.randn(1, cfg.q_lora_rank),
+        positions=torch.arange(1),
+        cos_sin_cache=cos_sin,
+    )
+    backend._run_compressor(layer, ctx_a, build_dsa(1, 1, 0), layer_caches[2], mapping, [1], [1], shared)
+
+    # Step B: q_len=40 > state_rows, prev_ctx=1 (odd).
+    q_len = 40
+    prev_ctx = 1
+    x_b = torch.randn(q_len, cfg.hidden_size)
+    ctx_b = Csa2LayerContext(
+        x=x_b,
+        qr=torch.randn(q_len, cfg.q_lora_rank),
+        positions=torch.arange(prev_ctx, prev_ctx + q_len),
+        cos_sin_cache=cos_sin,
+    )
+    recorded.clear()
+    backend._run_compressor(
+        layer,
+        ctx_b,
+        build_dsa(prev_ctx + q_len, q_len, prev_ctx),
+        layer_caches[2],
+        mapping,
+        [q_len],
+        [prev_ctx + q_len],
+        shared,
+    )
+
+    assert len(recorded) >= 2
+    # The park scatter targets the flat state ring plane
+    # (_SWA_RING_BLOCKS * state_rows, head_dim); the layer also scatters its
+    # key/index token caches (different shapes) through the same helper.
+    state_shape = (_SWA_RING_BLOCKS * state_rows, cfg.head_dim)
+    park_scatters = [s for (shape, s) in recorded if shape == state_shape]
+    assert len(park_scatters) == 2  # kv-state + score-state plane
+    for slots in park_scatters:
+        valid = slots[slots >= 0].tolist()
+        # One writer per ring slot inside a single scatter.
+        assert len(valid) == len(set(valid)), f"duplicate park slot in one scatter: {valid}"
+
+    tail_rows = torch.arange(q_len - state_rows, q_len)
+    tail_positions = prev_ctx + tail_rows
+    tail_parked = tail_positions[(tail_positions + 1) % 2 != 0]
+    expected_slots = sorted(torch.unique(tail_parked % state_rows).tolist())
+    valid_union = sorted({int(s) for s in torch.cat(park_scatters).tolist() if s >= 0})
+    assert valid_union == expected_slots
+
+    # The last parked position (prev_ctx + q_len - 1 = 40, row 39) is the tail
+    # residual the next chunk reads; it must survive (last writer is the tail).
+    kv_b, _ = layer.compress_kv_score(x_b)
+    assert torch.allclose(state_kv[(prev_ctx + q_len - 1) % state_rows], kv_b[q_len - 1], atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Indexer scoring (semantics doc section 5)
 # ---------------------------------------------------------------------------
@@ -1741,9 +1837,11 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     # valid pick must address a compressed group the query has fully passed
     # (t < (p + 1) // ratio) and land inside the window-row offset.
     layer2 = lm.model.layers[2].self_attn
-    index_cache = torch.randn(1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim) * 0.5
+    index_cache = torch.randint(-127, 128, (1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim), dtype=torch.int8)
+    index_scale = (torch.rand(1, _TOKEN_BLOCK_SIZE, 1) + 0.1).to(torch.float16)
     shared = CSA2SharedRuntime(
         index_cache=index_cache,
+        index_scale=index_scale,
         index_block_table=torch.tensor([[0]], dtype=torch.int32),
         compress_ratio=2,
     )
@@ -1770,7 +1868,8 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     # Candidate-source layer 4 publishes the per-sequence pool.
     layer4 = lm.model.layers[4].self_attn
     shared4 = CSA2SharedRuntime(
-        index_cache=torch.randn(1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim) * 0.5,
+        index_cache=torch.randint(-127, 128, (1, _TOKEN_BLOCK_SIZE, cfg.index_head_dim), dtype=torch.int8),
+        index_scale=(torch.rand(1, _TOKEN_BLOCK_SIZE, 1) + 0.1).to(torch.float16),
         index_block_table=torch.tensor([[0]], dtype=torch.int32),
         compress_ratio=1,
     )
@@ -1786,6 +1885,7 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     pool[0, [1, 3, 4, 6]] = True
     shared5 = CSA2SharedRuntime(
         index_cache=shared4.index_cache,
+        index_scale=shared4.index_scale,
         index_block_table=shared4.index_block_table,
         compress_ratio=1,
         candidates=[pool],
@@ -1813,6 +1913,48 @@ def test_indexer_causal_visibility_and_candidate_pool() -> None:
     assert picks_wide.numel() == ctx_len
     assert (picks_wide[picks_wide >= 0] - (cfg.window_size + 1)).tolist() == [1, 3, 4, 6]
     assert (picks_wide == -1).sum().item() == ctx_len - 4
+
+
+@pytest.mark.parametrize("query_len", [1, 3, 9])
+def test_swa_chunk_reads_history_before_overwriting_ring(query_len: int) -> None:
+    """Later verification/prefill tokens must not overwrite earlier queries' KV."""
+    window, previous = 4, 8
+    backend = object.__new__(Csa2AttentionBackend)
+    backend.window_size, backend.scale = window, 1.0
+    history = torch.arange(previous - window, previous, dtype=torch.float32).view(1, window, 1)
+    cache = history.clone()
+    backend._kv_caches = [SimpleNamespace(swa=cache)]
+    backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
+    backend._shared_runtime = CSA2SharedRuntime
+    positions = torch.arange(previous, previous + query_len)
+    # Keep only the last writer per ring slot, matching metadata construction.
+    slots = positions % window
+    slots = torch.where(torch.arange(query_len) >= max(0, query_len - window), slots, -1)
+    dsa = SimpleNamespace(
+        seq_lens_q=torch.tensor([query_len]),
+        seq_lens=torch.tensor([previous + query_len]),
+        is_acl_graph=False,
+        block_tables=[[torch.tensor([[0]])]],
+        slot_mappings=[[slots]],
+    )
+    metadata = SimpleNamespace(dsa_metadata=dsa)
+    backend._current_forward_metadata = lambda: metadata
+    layer = SimpleNamespace(
+        layer_id=0,
+        mode=CSA2LayerMode(0, CSA2_MODE_SWA, 0, -1),
+        attn_sink=torch.tensor([-100.0]),
+        _csa2_ctx=SimpleNamespace(x=torch.zeros(query_len, 1)),
+    )
+    q = torch.zeros(query_len, 1, 1)
+    kv = (100 + torch.arange(query_len, dtype=torch.float32)).view(query_len, 1)
+    context = ForwardContext(backend, torch.device("cpu"), metadata, [])
+    with forward_context(context):
+        actual = backend.execute_csa2_layer(q, kv, layer)
+    logical_kv = torch.cat((history.view(-1), kv.view(-1)))
+    expected = torch.stack([logical_kv[i + 1 : i + window + 1].mean() for i in range(query_len)])
+    torch.testing.assert_close(actual.flatten(), expected)
+    for i in range(max(0, query_len - window), query_len):
+        torch.testing.assert_close(cache[0, positions[i] % window], kv[i])
 
 
 def test_swa_window_lower_bound_is_per_query() -> None:
@@ -1866,7 +2008,7 @@ def test_mhc_final_merge_is_learned_weighted_sum() -> None:
             layer.hc.hc_ffn_base.normal_(mean=0.0, std=1.5)
             layer.hc.hc_attn_scale.fill_(1.0)
             layer.hc.hc_ffn_scale.fill_(1.0)
-    harness = _V41ForwardHarness(lm, _DSV41_FORWARD_CONFIG, n_seqs=1, dtype=torch.float32, device=device)
+    harness = _V41ForwardHarness(lm, _DEEPSEEK_V41_FORWARD_CONFIG, n_seqs=1, dtype=torch.float32, device=device)
     assert harness.layer_caches[0].swa.device.type == "npu"
 
     captured: dict[int, dict[str, torch.Tensor]] = {}
@@ -1925,7 +2067,7 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
     # inside the window (prompt_len == window_size is the boundary that a
     # chunk-level window bound would still mask identically).
     n_seqs, prompt_len, decode_steps = 2, cfg.window_size + 1, 4
-    harness = _V41ForwardHarness(lm, _DSV41_FORWARD_CONFIG, n_seqs, torch.bfloat16, device=device)
+    harness = _V41ForwardHarness(lm, _DEEPSEEK_V41_FORWARD_CONFIG, n_seqs, torch.bfloat16, device=device)
     assert harness.layer_caches[0].swa.device.type == "npu"
     input_ids = torch.randint(0, cfg.vocab_size, (n_seqs, prompt_len)).to(device)
 
@@ -2010,7 +2152,7 @@ def test_forward_smoke_and_prefill_decode_consistency() -> None:
 
     # -- Consistency: the same prompt re-run token by token as decode steps
     # with fresh caches reproduces the prefill logits.
-    replay = _V41ForwardHarness(lm, _DSV41_FORWARD_CONFIG, n_seqs, torch.bfloat16, device=device)
+    replay = _V41ForwardHarness(lm, _DEEPSEEK_V41_FORWARD_CONFIG, n_seqs, torch.bfloat16, device=device)
     replay_logits = []
     for position in range(prompt_len):
         with torch.inference_mode():
@@ -2708,7 +2850,7 @@ def _make_engram_routing_decoder_layer() -> DeepseekV41DecoderLayer:
     with shape-preserving CPU modules. ``hc_*`` parameters start as
     ``torch.empty`` in the constructor, so they are seeded with finite values.
     """
-    cfg = DeepseekV41Config.from_dict(_DSV41_TINY_CONFIG)
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG)
     layout = EngramLayout(
         layer_ids=[1],
         num_embeddings=[290],
@@ -3403,7 +3545,7 @@ def test_engram_injection_shifts_residual_stream() -> None:
     assert lm.model.norm.weight.device.type == "npu"
     cfg = lm.cfg
     n_seqs, prompt_len = 1, 6
-    harness = _V41ForwardHarness(lm, _DSV41_FORWARD_CONFIG, n_seqs, torch.float32, device=device)
+    harness = _V41ForwardHarness(lm, _DEEPSEEK_V41_FORWARD_CONFIG, n_seqs, torch.float32, device=device)
     assert harness.layer_caches[0].swa.device.type == "npu"
     input_ids = torch.randint(0, cfg.vocab_size, (n_seqs, prompt_len)).to(device)
     with torch.inference_mode():
@@ -3446,3 +3588,171 @@ def test_engram_injection_shifts_residual_stream() -> None:
         0,
     )
     assert (hashes >= 0).all() and (hashes < cfg.engram_num_embeddings[0]).all()
+
+
+# ---------------------------------------------------------------------------
+# Fused V4.1 compressor: SWA ring-block gate + decode scope (perf)
+# ---------------------------------------------------------------------------
+
+
+def test_v41_compressor_swa_gate_uses_config_ring_blocks() -> None:
+    """The gate keys on the config ring count, not the physical table width."""
+    table = torch.tensor([[7], [9]], dtype=torch.int32)
+    wide = torch.tensor([[7, 0, 0, 0], [9, 0, 0, 0]], dtype=torch.int32)
+    # Production ring (one block per sequence) admits the fused op even when
+    # the ACL-graph read table is padded to the graph capacity.
+    block_table, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0, 1)
+    assert block_table is table and reason is None
+    block_table, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[wide]]), 0, 0, 1)
+    assert block_table is wide and reason is None
+    # A genuine multi-block ring keeps the torch path and names the count.
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0, 2)
+    assert reason == "swa ring blocks per sequence 2 != 1"
+    # A missing count is 0 (conservative fallback).
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0)
+    assert reason == "swa ring blocks per sequence 0 != 1"
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), 0, 0, 0)
+    assert reason == "swa ring blocks per sequence 0 != 1"
+    # An absent table and an empty placeholder are the "table missing" arm.
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[table]]), -1, 0, 1)
+    assert reason == "no swa block table"
+    _, reason = _v41_compressor_swa_gate(SimpleNamespace(block_tables=[[torch.empty(0)]]), 0, 0, 1)
+    assert reason == "no swa block table"
+
+
+def test_v41_compressor_swa_ring_blocks_derivation() -> None:
+    """_swa_ring_blocks = (window - 1) // swa_block + 1 (block_utils.cpp)."""
+    cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_FORWARD_CONFIG)
+    backend = _make_csa2_backend(cfg)
+    # Before the caches are bound the window_size fallback yields production 1.
+    assert backend._swa_ring_blocks == 1
+    backend.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
+    assert backend._swa_ring_blocks == 1
+
+    def with_window(window: int) -> Csa2AttentionBackend:
+        return _make_csa2_backend(SimpleNamespace(**{**vars(cfg), "window_size": window}))
+
+    wide_window = with_window(256)
+    wide_window.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
+    assert wide_window._swa_ring_blocks == 2
+    wider_window = with_window(384)
+    wider_window.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
+    assert wider_window._swa_ring_blocks == 3
+    # A block smaller than the window also widens the ring.
+    small_block = with_window(128)
+    small_block.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 64, 8))])
+    assert small_block._swa_ring_blocks == 2
+
+
+def test_v41_compressor_gate_is_decode_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any q_len > 1 row falls back to torch before the ring-block gate."""
+    lm = _make_forward_lm(torch.float32, seed=17)
+    cfg = lm.cfg
+    model = lm.model
+    backend = _make_csa2_backend(cfg)
+    layer_caches = _allocate_v41_layer_caches(cfg, n_seqs=1, dtype=torch.float32)
+    backend.bind_kv_caches(layer_caches)
+    layer = model.layers[2].self_attn
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    dsa = backend._builder.build(
+        multi_block_tables=[
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.tensor([[0]], dtype=torch.int32),
+            torch.tensor([[0]], dtype=torch.int32),
+        ],
+        kv_seq_lens=[3],
+        q_seq_lens=[3],
+        positions=torch.arange(3, dtype=torch.int64),
+        dsa_cos_sin=None,
+        is_prefill=False,
+        is_chunked_prefill=True,
+    )
+    reasons: list[str] = []
+    op_calls: list[int] = []
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_triton_reason", lambda *a, **k: None)
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_pool_triton", lambda *a, **k: op_calls.append(1))
+    monkeypatch.setattr(csa2_attention, "_log_v41_compressor_fallback", reasons.append)
+    ctx = Csa2LayerContext(
+        x=torch.randn(3, cfg.hidden_size),
+        qr=torch.randn(3, cfg.q_lora_rank),
+        positions=torch.arange(3),
+        cos_sin_cache=model.compress_rotary.cos_sin_cache,
+    )
+    backend._run_compressor(layer, ctx, dsa, layer_caches[2], mapping, [3], [3], CSA2SharedRuntime())
+    assert reasons == ["non-decode row"]
+    assert op_calls == []
+
+
+@pytest.mark.parametrize("position", [8, 15, 16, 23])
+def test_v41_compressor_uses_current_position_state_block(monkeypatch: pytest.MonkeyPatch, position: int) -> None:
+    """A released first SWA block must not disable later compressor commits."""
+    lm = _make_forward_lm(torch.float32, seed=17)
+    cfg = lm.cfg
+    backend = _make_csa2_backend(cfg)
+    caches = _allocate_v41_layer_caches(cfg, n_seqs=2, dtype=torch.float32)
+    backend.bind_kv_caches(caches)
+    layer = lm.model.layers[2].self_attn
+    mapping = backend._resolve_cache_mapping(2, layer.mode.compress_ratio)
+    dsa = backend._builder.build(
+        multi_block_tables=[
+            torch.tensor([[-1, 1, 2]], dtype=torch.int32),
+            torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        ],
+        kv_seq_lens=[position + 1],
+        q_seq_lens=[1],
+        positions=torch.tensor([position]),
+        dsa_cos_sin=None,
+        is_prefill=False,
+        is_chunked_prefill=True,
+    )
+    blocks: list[int] = []
+
+    def pool(*args: object, block_id: torch.Tensor, **kwargs: object) -> None:
+        blocks.append(int(block_id))
+
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_triton_reason", lambda *args: None)
+    monkeypatch.setattr(csa2_attention, "_v41_compressor_pool_triton", pool)
+    ctx = Csa2LayerContext(
+        x=torch.randn(1, cfg.hidden_size),
+        qr=torch.randn(1, cfg.q_lora_rank),
+        positions=torch.tensor([position]),
+        cos_sin_cache=lm.model.compress_rotary.cos_sin_cache,
+    )
+    backend._run_compressor(layer, ctx, dsa, caches[2], mapping, [1], [position + 1], CSA2SharedRuntime())
+    assert blocks == [position // cfg.window_size]
+
+
+def test_v41_compressor_swa_table_column0_matches_across_widths() -> None:
+    """Column 0 is the sequence's ring block in eager and graph-width tables."""
+    caches_info, group_infos = build_cache_specs_v41(
+        compress_ratios=[0, 2],
+        kv_source_layer_ids=[1],
+        index_source_layer_ids=[1],
+        window_size=128,
+        n_layers=2,
+    )
+    builder = DsaMetadataBuilder(caches_info, group_infos)
+    ring = torch.tensor([[7], [9]], dtype=torch.int32)  # width-1 eager source
+    cap = 16
+    wide = torch.zeros((2, cap), dtype=torch.int32)  # graph-capacity table
+    wide[:, 0] = ring[:, 0]
+
+    def build(swa_bt: torch.Tensor, enable_graph: bool, capacity: int) -> DsaMetadata:
+        return builder.build(
+            multi_block_tables=[swa_bt, torch.zeros((2, 1), dtype=torch.int32)],
+            kv_seq_lens=[5, 5],
+            q_seq_lens=[1, 1],
+            positions=torch.arange(2, dtype=torch.int64) if enable_graph else torch.empty(0, dtype=torch.int64),
+            dsa_cos_sin=None,
+            is_prefill=False,
+            is_chunked_prefill=True,
+            enable_graph=enable_graph,
+            graph_block_table_capacity_cols=capacity,
+        )
+
+    eager = build(ring, False, 0)
+    graph = build(wide, True, cap)
+    # Layer 1's SWA read table is cache entry 2 (key, index, swa, kv_state, ...).
+    assert eager.block_tables[1][2][:, 0].tolist() == [7, 9]
+    assert graph.block_tables[1][2][:, 0].tolist() == [7, 9]

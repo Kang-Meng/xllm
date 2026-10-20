@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 
@@ -46,6 +48,9 @@ from xllm.python.registry import get_execution_metadata_builder_classes
 
 # Backend strings that mean "no graph execution" (matched case-insensitively).
 _DISABLED_GRAPH_BACKENDS = ("", "off", "none", "0")
+
+if TYPE_CHECKING:
+    from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 
 
 def _is_deepseek_v4_model_type(model_type: str) -> bool:
@@ -119,17 +124,20 @@ def _create_attention_backend(
             f"DeepSeek-V4.1 runs on NPU only; no attention backend available for device type '{device.type}'"
         )
     if _is_deepseek_v4_model_type(model_type) and current_platform.is_npu():
-        if model_type == "deepseek_v41":
-            # The V4.1 CSA2 backend is NPU-only; it runs eagerly on NPU until
-            # the kernel milestone replaces its internals.
+        # The DSpark draft is a V4.1-family model (its classes live in
+        # xllm/python/models/deepseek_v41_dspark.py and reuse the V4.1 decoder),
+        # so it needs the same CSA2 backend as the deepseek_v41 target. The C++
+        # side routes --model_impl=python drafts to this name.
+        if model_type in ("deepseek_v41", "deepseek_v41_dspark"):
+            # The V4.1 CSA2 backend is NPU-only; its pure-torch reference tail
+            # runs eagerly on NPU, and the decode ACL-graph path can route
+            # its indexer chain through the official QLI v3 op.
             from xllm.python.attention.csa2_attention import Csa2AttentionBackend
             from xllm.python.models.deepseek_v41 import _detect_v41_quant_mode
 
-            # Derive the served context length here so the backend can default
-            # its ACL-graph token-capacity granularity when the deployment does
-            # not set XLLM_V41_GRAPH_CAPACITY_GRANULARITY explicitly (an empty
-            # env value counts as unset). Same source as the decode graph
-            # runner's max_model_len below.
+            # Derive the served context length here so the backend can derive
+            # its ACL-graph token-capacity granularity. Same source as the
+            # decode graph runner's max_model_len below.
             serving_len = int(config.get("max_position_embeddings", 0) or 0)
             # Register the checkpoint's quantization mode so the backend can
             # reject the fp8/none torch MoE from ACL-graph capture (51361671).
@@ -496,6 +504,63 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         self._kv_bound = True
 
+    @staticmethod
+    def _resolve_aux_hidden_capture(model: nn.Module) -> AuxHiddenCapture | None:
+        """Locate the target's aux-hidden capture, if the model owns one.
+
+        The executor holds the top-level ``...ForCausalLM`` bridge while the
+        capture lives on its ``.model`` body (``DeepseekV41Model``), so look
+        through the body when the wrapper does not expose it directly. Models
+        without a drafter capture return None.
+        """
+        for candidate in (model, getattr(model, "model", None)):
+            capture = getattr(candidate, "aux_hidden_capture", None)
+            if capture is not None:
+                return capture
+        return None
+
+    def _attach_persistent_aux_hidden_states(
+        self,
+        output: ModelExecutionOutput,
+        rows: int,
+        graph_rows: int | None = None,
+    ) -> ModelExecutionOutput:
+        """Publish a persistent aux-hidden capture as the output's second Tensor.
+
+        A graph-captured target must return a single Tensor, so the capture is
+        written into a persistent buffer as a side channel instead of riding in
+        the returned tuple. Hand it back to the C++ bridge here so both the
+        eager prefill/fallback and the graph replay expose the aux rows the
+        drafter's ``main_proj`` consumes.
+
+        Slice to the REAL local row count: the persistent buffer is sized by
+        the padded graph shape (or the captured forward's shape), whose tail
+        rows are scratch. A transient capture already returns its tuple, and a
+        model without capture keeps its output unchanged.
+
+        ``graph_rows`` is the row count of the buffer the ACL graph actually
+        captured. An interleaved 1-row forward (e.g. the empty DP shard's dummy
+        row) can replace ``capture.buffer`` with a SMALLER buffer while the
+        graph replay -- which does not re-run Python -- still produces a
+        ``rows``-row output. Slicing ``[:rows]`` off that smaller buffer clamps
+        to its row count and yields a 1-row source against a ``rows``-element
+        index (the gather_v3 range assertion). Pick the captured buffer for the
+        graph replay instead.
+        """
+        capture = self._resolve_aux_hidden_capture(getattr(self, "model", None))
+        if capture is None or isinstance(output, tuple):
+            return output
+        if not capture.enabled or not capture.persistent_buffer:
+            return output
+        buffer = capture.buffer
+        if graph_rows is not None and graph_rows > 0:
+            graph_buffer = capture.persistent_buffer_for(graph_rows)
+            if graph_buffer is not None:
+                buffer = graph_buffer
+        if buffer is None:
+            return output
+        return output, buffer[:rows]
+
     @torch.inference_mode()
     def execute(
         self,
@@ -527,7 +592,6 @@ class ModelExecutor:
                 decode_token_mask=eplb_decode_token_mask,
                 is_graph_warmup=is_graph_warmup,
             )
-
         input_batch = None
         if self._execution_metadata_builders:
             if input_batch_metadata is None:
@@ -548,6 +612,7 @@ class ModelExecutor:
             else:
                 layer_load_context.synchronize_event(draft_load_event_index)
             layer_load_context = None
+        rows = input_ids.numel()
         graph_runner = self.decode_graph_runner
         if (
             graph_runner is not None
@@ -565,7 +630,7 @@ class ModelExecutor:
                 metadata,
                 input_embedding,
             )
-            return graph_runner.execute(
+            output = graph_runner.execute(
                 input_ids,
                 positions,
                 metadata,
@@ -573,11 +638,16 @@ class ModelExecutor:
                 eplb=eplb,
                 input_batch=input_batch,
             )
+            return self._attach_persistent_aux_hidden_states(
+                output,
+                rows,
+                graph_rows=getattr(graph_runner, "last_padded_batch_size", None),
+            )
         if self.inductor_runner is not None:
             # Compiled execution must not capture request-specific Host events.
             if layer_load_context is not None:
                 layer_load_context.synchronize_all_layers()
-            return self.inductor_runner.execute(
+            output = self.inductor_runner.execute(
                 input_ids,
                 positions,
                 metadata,
@@ -587,7 +657,8 @@ class ModelExecutor:
                 input_batch=input_batch,
                 multimodal_inputs=multimodal_inputs,
             )
-        return self.eager_runner.execute(
+            return self._attach_persistent_aux_hidden_states(output, rows)
+        output = self.eager_runner.execute(
             input_ids,
             positions,
             metadata,
@@ -598,3 +669,4 @@ class ModelExecutor:
             layer_load_context=layer_load_context,
             multimodal_inputs=multimodal_inputs,
         )
+        return self._attach_persistent_aux_hidden_states(output, rows)

@@ -552,6 +552,16 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   align_execution_batch_query_widths(
       input_params.execution_batch,
       std::vector<int32_t>(static_cast<size_t>(num_sequences), num_val_tokens));
+  if (!use_chunked_spec_verify) {
+    // The rows above were expanded to num_val_tokens per sequence, so this is a
+    // NON-expanded verify pack: its per-token-row paging metadata is shaped
+    // exactly like a plain decode of num_sequences*num_val_tokens rows. Export
+    // the true width here (and only here) as the graph runner's admission/key
+    // truth source. The chunked/expanded layout keeps the default 1 because its
+    // width is already expressed by the per-sequence linear-state / query-chunk
+    // metadata.
+    input_params.meta.spec_verify_width = num_val_tokens;
+  }
   validate_input.device_tensors_ready = true;
 }
 

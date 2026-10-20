@@ -179,7 +179,10 @@ TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {
   py::list python_caches = model.python_model().attr("last_caches");
   ASSERT_EQ(py::len(python_caches), 1);
   py::tuple layer_cache = python_caches[0].cast<py::tuple>();
-  ASSERT_EQ(py::len(layer_cache), 6);
+  // The C++ executor emits the full 12-slot LayerCache tuple (see
+  // xllm/python/attention/backend.py::_LAYER_CACHE_SLOTS); the SWA pool is the
+  // sixth slot (index 5).
+  ASSERT_EQ(py::len(layer_cache), 12);
   py::object bridged_swa = model.python_model().attr("last_swa");
   EXPECT_TRUE(bridged_swa.is(layer_cache[5]));
   EXPECT_EQ(

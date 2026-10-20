@@ -30,6 +30,9 @@ MODEL_PLATFORM_SUPPORT: dict[str, dict[str, bool]] = {
     # backend has no CPU fallback, so requesting v41 on a non-NPU platform
     # fails fast at registry lookup.
     "deepseek_v41": {"cuda": False, "npu": True},
+    # The DSpark draft reuses the V4.1 decoder layers; it is eager-only and
+    # runs on CPU for unit tests and on NPU for serving.
+    "deepseek_v41_dspark": {"cuda": False, "npu": True, "cpu": True},
     "glm5_2": {"cuda": False, "npu": True},
     "glm5_next": {"cuda": False, "npu": True},
     "glm5_next_vl": {"cuda": False, "npu": True},

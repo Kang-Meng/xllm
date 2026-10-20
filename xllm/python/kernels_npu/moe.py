@@ -426,8 +426,7 @@ def _grouped_moe_with_selected_experts_impl(
     BF16 down scales.
     """
     num_tokens = hidden_states.shape[0]
-    expert_num = num_total_experts if num_total_experts > 0 else w13.shape[0]
-    local_expert_count = num_experts_per_rank if num_experts_per_rank > 0 else w13.shape[0]
+    expert_num, local_expert_count = _ep_local_expert_counts(num_total_experts, num_experts_per_rank, w13.shape[0])
     active_range = [start_expert_id, start_expert_id + local_expert_count]
     if start_expert_id < 0 or active_range[1] > expert_num:
         raise ValueError(f"active expert range {active_range} is outside [0, {expert_num})")
@@ -497,6 +496,23 @@ def _grouped_moe_with_selected_experts_impl(
         sorted_indices=expanded_row_idx.abs(),
         probs=local_topk_weights.to(output.dtype),
     )
+
+
+def _ep_local_expert_counts(num_total_experts: int, num_experts_per_rank: int, local_rows: int) -> tuple[int, int]:
+    """Resolve ``(expert_num, local_expert_count)`` for the EP-sharded experts.
+
+    Single source of truth for the EP expert window. ``local_expert_count`` fixes
+    the ``[start_expert_id, start_expert_id + local_expert_count)`` range this
+    module masks ``topk_weights`` with (``local_mask`` below), so anything that
+    has to reason about that mask -- including a caller checking whether its own
+    mask will be re-applied here -- must resolve the same numbers through this
+    helper instead of re-deriving the fallbacks. A non-positive count falls back
+    to ``local_rows`` (``w13.shape[0]``), the long-standing kernel behaviour that
+    ``DeepseekV4MoE``'s reuse guard rejects.
+    """
+    expert_num = num_total_experts if num_total_experts > 0 else local_rows
+    local_expert_count = num_experts_per_rank if num_experts_per_rank > 0 else local_rows
+    return expert_num, local_expert_count
 
 
 @torch.library.custom_op("xllm_python::grouped_moe_with_selected_experts", mutates_args=())
@@ -1363,6 +1379,8 @@ def _ep_moe_w8a8_alltoall_impl(
         x_active_mask,
     )
     group = moe_ep_group(hidden.device)
+    if group is None:
+        raise RuntimeError(f"MoE EP group is not initialized for {hidden.device}")
     if group.size() != ep_size or group.rank() != ep_rank:
         raise ValueError("All-to-AllV process group does not match the configured EP layout")
     flat = hidden.reshape(-1, hidden.shape[-1])

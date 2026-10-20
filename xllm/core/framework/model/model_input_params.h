@@ -780,6 +780,13 @@ struct BatchInputMeta {
   uint64_t batch_id = 0;
   bool requires_host_restore = false;
   bool is_graph_warmup = false;
+  // Rows per logical sequence of a NON-expanded spec-verify batch (1 = not a
+  // packed verify). The validate builder that expands each sequence into
+  // num_speculative_tokens+1 q=1 decode rows sets this so the graph runner can
+  // tell such a batch apart from a plain decode whose token-row count happens
+  // to be the same; the chunked/expanded layout keeps 1 because its width is
+  // already carried by the per-sequence linear-state / query-chunk metadata.
+  int32_t spec_verify_width = 1;
 };
 
 // Stable, model-execution view of the logical batch. Unlike
