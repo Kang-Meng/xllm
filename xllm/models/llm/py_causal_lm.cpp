@@ -536,7 +536,8 @@ py::dict PyCausalLM::build_config_dict(
   // eager-only EPLv2 even when no MegaMoE resource is requested.
   if (model_args_.model_type() == "glm_moe_dsa" ||
       model_args_.model_type() == "glm5_next" ||
-      model_args_.model_type() == "glm5_next_text") {
+      model_args_.model_type() == "glm5_next_text" ||
+      is_qwen3_5_target_model_type(model_args_.model_type())) {
     d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
     d["enable_eplb"] = eplb_config.enable_eplb();
   }

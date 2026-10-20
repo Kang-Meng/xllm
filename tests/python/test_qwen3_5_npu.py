@@ -40,6 +40,7 @@ from xllm.python import distributed, kernels
 from xllm.python.kernels_npu.causal_conv1d import (
     causal_conv1d_decode as npu_causal_conv1d_decode,
 )
+from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.npu.layernorm import NpuGemmaRMSNorm
 from xllm.python.layers.npu.qwen3_5.attention import NpuQwen3_5Attention
 from xllm.python.layers.npu.qwen3_5.decoder_layer import (
@@ -59,6 +60,7 @@ from xllm.python.layers.npu.qwen3_5.moe import (
     _NpuQwen3_5Experts,
 )
 from xllm.python.layers.npu.qwen3_5.moe_metadata import Qwen3_5MoeMetadata
+from xllm.python.layers.npu.qwen3_5.moe_metadata_builder import Qwen3_5MoeMetadataBuilder
 from xllm.python.layers.qwen3_5.decoder_layer import (
     get_qwen3_5_decoder_layer_class,
 )
@@ -639,7 +641,8 @@ def test_npu_moe_loads_native_weight_order() -> None:
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])
-def test_npu_sp_shared_expert_loads_full_checkpoint_on_each_rank(tp_rank: int) -> None:
+@pytest.mark.parametrize("lv2", [False, True])
+def test_npu_shared_expert_loads_full_checkpoint_on_each_rank(tp_rank: int, lv2: bool) -> None:
     cfg = _config(
         tp_rank=tp_rank,
         dp_size=2,
@@ -647,9 +650,10 @@ def test_npu_sp_shared_expert_loads_full_checkpoint_on_each_rank(tp_rank: int) -
         moe_tp_size=1,
         ep_size=4,
         ep_rank=tp_rank,
-        sequence_parallel_enabled=True,
+        sequence_parallel_enabled=not lv2,
     )
-    block = NpuQwen3_5SparseMoEBlock(cfg, torch.bfloat16, torch.device("cpu"))
+    policy = Eplv2CommPolicy(32) if lv2 else None
+    block = NpuQwen3_5SparseMoEBlock(cfg, torch.bfloat16, torch.device("cpu"), comm_policy=policy)
     gate = (
         torch.arange(cfg.shared_expert_intermediate_size * cfg.hidden_size)
         .reshape(cfg.shared_expert_intermediate_size, cfg.hidden_size)
@@ -1118,6 +1122,139 @@ def test_npu_moe_uses_direct_ep_when_capacity_exceeds_limit(
     assert output is expected
     direct.assert_called_once_with(hidden, context.execution_contexts[SpMetadata])
     mega_moe.assert_not_called()
+
+
+@pytest.mark.parametrize(("sp", "lv2"), [(False, False), (False, True), (True, False), (True, True)])
+def test_npu_shared_stream_is_initialized_only_for_lv2_sp(monkeypatch: pytest.MonkeyPatch, sp: bool, lv2: bool) -> None:
+    from xllm.python.layers.npu.qwen3_5 import moe as qwen_moe
+
+    cfg = _config(tp_size=2, ep_size=2, moe_tp_size=1, sequence_parallel_enabled=sp)
+    policy = Eplv2CommPolicy(mc2_capacity=86) if lv2 else None
+    stream = object()
+    stream_factory = MagicMock(return_value=stream)
+    monkeypatch.setattr(qwen_moe, "shared_expert_stream", stream_factory)
+    monkeypatch.setattr(distributed, "moe_ep_hccl_info", MagicMock(return_value=("test-ep", 0, 2)), raising=False)
+    block = NpuQwen3_5SparseMoEBlock(cfg, torch.bfloat16, torch.device("cpu"), comm_policy=policy)
+    stream_factory.assert_not_called()
+    assert block._shared_stream is None
+
+    block.process_weights_after_loading()
+
+    if sp and lv2:
+        stream_factory.assert_called_once_with(block.experts.w13.device)
+        assert block._shared_stream is stream
+    else:
+        stream_factory.assert_not_called()
+        assert block._shared_stream is None
+
+
+def test_npu_lv2_persistent_mask_reaches_mc2_without_active_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _config(tp_size=2, tp_rank=1, ep_size=2, ep_rank=1, moe_tp_size=1)
+    policy = Eplv2CommPolicy(mc2_capacity=2)
+    monkeypatch.setattr(distributed, "moe_ep_hccl_info", MagicMock(return_value=("test-ep", 1, 2)), raising=False)
+    block = NpuQwen3_5SparseMoEBlock(cfg, torch.bfloat16, torch.device("cpu"), comm_policy=policy)
+    block.process_weights_after_loading()
+    hidden = torch.ones(2, cfg.hidden_size, dtype=torch.bfloat16)
+    route = MagicMock(
+        return_value=(
+            torch.ones(2, cfg.num_experts_per_tok),
+            torch.zeros(2, cfg.num_experts_per_tok, dtype=torch.int32),
+        )
+    )
+    monkeypatch.setattr(block.experts, "_route", route)
+    mc2 = MagicMock(return_value=hidden)
+    alltoall = MagicMock()
+    monkeypatch.setattr(kernels, "ep_moe_bf16", mc2, raising=False)
+    monkeypatch.setattr(kernels, "ep_moe_bf16_alltoall", alltoall, raising=False)
+    builder = Qwen3_5MoeMetadataBuilder(2, 1, 1, 0, mask_dtype=torch.bool)
+    batch = SimpleNamespace(
+        num_tokens=3,
+        num_tokens_after_padding=4,
+        input_ids=torch.zeros(4, dtype=torch.int32),
+        is_padding=torch.arange(4) >= 3,
+        is_dummy=False,
+    )
+    metadata = SimpleNamespace()
+    persistent = builder.allocate_persistent(batch, metadata)
+    mask = persistent.active_token_mask
+    context = ForwardContext(
+        attention_backend=SimpleNamespace(),
+        device=torch.device("cpu"),
+        metadata=metadata,
+        layer_caches=[],
+        execution_state=AclGraphExecutionState({}),
+        execution_contexts={Qwen3_5MoeMetadata: persistent},
+    )
+    for rows in (3, 1, 3):
+        batch.num_tokens = rows
+        batch.is_padding = torch.arange(4) >= rows
+        builder.update_persistent(persistent, batch, metadata)
+        assert persistent.active_rows is None
+        assert persistent.active_token_mask is mask
+        with forward_context(context):
+            NpuQwen3_5DecoderLayer.validate_ep_level2(policy, force_mc2=False)
+            torch.testing.assert_close(block.experts(hidden), hidden)
+        assert mc2.call_args.args[-1] is mask
+        assert mc2.call_args.args[5] == "test-ep"
+        assert mask.tolist() == ([True, False] if rows == 3 else [False, False])
+    assert mc2.call_count == 3
+    alltoall.assert_not_called()
+
+
+@pytest.mark.parametrize("physical_rows", [0, 1])
+def test_npu_lv2_alltoall_forwards_empty_source(monkeypatch: pytest.MonkeyPatch, physical_rows: int) -> None:
+    cfg = _config(moe_tp_size=1, ep_size=2)
+    experts = _NpuQwen3_5Experts(
+        cfg, torch.bfloat16, torch.device("cpu"), reduce_results=True, comm_policy=Eplv2CommPolicy(mc2_capacity=0)
+    )
+    hidden = torch.ones(physical_rows, cfg.hidden_size, dtype=torch.bfloat16)
+    route = MagicMock(
+        return_value=(
+            torch.ones(physical_rows, cfg.num_experts_per_tok),
+            torch.zeros(physical_rows, cfg.num_experts_per_tok, dtype=torch.int32),
+        )
+    )
+    monkeypatch.setattr(experts, "_route", route)
+    alltoall = MagicMock(return_value=hidden[:0])
+    monkeypatch.setattr(kernels, "ep_moe_bf16_alltoall", alltoall, raising=False)
+    context = ForwardContext(
+        SimpleNamespace(),
+        torch.device("cpu"),
+        SimpleNamespace(),
+        [],
+        execution_contexts={Qwen3_5MoeMetadata: Qwen3_5MoeMetadata(torch.zeros(1, dtype=torch.bool), active_rows=0)},
+    )
+    with forward_context(context):
+        output = experts(hidden)
+    alltoall.assert_called_once()
+    assert [tensor.shape for tensor in alltoall.call_args.args[:3]] == [
+        (0, cfg.hidden_size),
+        (0, cfg.num_experts_per_tok),
+        (0, cfg.num_experts_per_tok),
+    ]
+    torch.testing.assert_close(output, torch.zeros_like(hidden))
+
+
+@pytest.mark.parametrize(
+    ("rows", "force_mc2", "error"),
+    [
+        (None, False, "metadata is unavailable"),
+        (4, True, "source rows 4 exceed capacity 3"),
+        (4, False, None),
+        (3, True, None),
+    ],
+)
+def test_npu_lv2_transport_admission(rows: int | None, force_mc2: bool, error: str | None) -> None:
+    metadata = (
+        {} if rows is None else {Qwen3_5MoeMetadata: Qwen3_5MoeMetadata(torch.ones(rows, dtype=torch.bool), rows)}
+    )
+    context = ForwardContext(SimpleNamespace(), torch.device("cpu"), SimpleNamespace(), [], execution_contexts=metadata)
+    with forward_context(context):
+        if error is not None:
+            with pytest.raises(RuntimeError if rows is None else ValueError, match=error):
+                NpuQwen3_5DecoderLayer.validate_ep_level2(Eplv2CommPolicy(mc2_capacity=3), force_mc2=force_mc2)
+        else:
+            NpuQwen3_5DecoderLayer.validate_ep_level2(Eplv2CommPolicy(mc2_capacity=3), force_mc2=force_mc2)
 
 
 @pytest.mark.parametrize(("raw_rows", "graph"), [(3, False), (0, False), (3, True), (0, True)])

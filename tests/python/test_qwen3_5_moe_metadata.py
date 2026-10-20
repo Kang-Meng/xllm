@@ -116,8 +116,8 @@ def test_eager_dispatches_every_real_token_exactly_once(counts: tuple[int, ...],
     assert sorted(ownership) == [(rank, row) for rank, count in enumerate(raw_counts) for row in range(count)]
 
 
-def test_token_layout_belongs_to_sp_metadata_not_moe_metadata() -> None:
-    assert tuple(field.name for field in fields(Qwen3_5MoeMetadata)) == ("active_token_mask",)
+def test_global_ep_layout_belongs_to_sp_metadata_not_moe_metadata() -> None:
+    assert tuple(field.name for field in fields(Qwen3_5MoeMetadata)) == ("active_token_mask", "active_rows")
     assert "ep_layout" in tuple(field.name for field in fields(SpMetadata))
     assert tuple(field.name for field in fields(EpSpTokenLayout)) == (
         "dispatch_counts",
@@ -404,6 +404,36 @@ def test_moe_builder_does_not_own_model_or_sp_policy_validation(overrides: dict[
     assert isinstance(builder, Qwen3_5MoeMetadataBuilder)
 
 
+@pytest.mark.parametrize("sp", [False, True])
+def test_lv2_prepares_bool_mask_once_for_eager_and_persistent_batches(sp: bool) -> None:
+    builder = Qwen3_5MoeMetadataBuilder.from_config(
+        _config(expert_parallel_degree=2, enable_mega_moe=False, sequence_parallel_enabled=sp, tp_rank=1)
+    )
+    eager = builder.build(_batch(5), _metadata((5, 17)))
+    assert eager.active_rows == 2
+    assert builder.build(_batch(1, dummy=True), _metadata((1, 17), (0, 17))).active_rows == 0
+    mask = eager.active_token_mask
+    assert mask.dtype == torch.bool
+    assert mask.tolist() == [True, True] + [False] * 7
+    assert mask.to(torch.bool).contiguous() is mask
+
+    persistent = builder.allocate_persistent(_batch(17, bucket=18), _metadata((17, 17)))
+    assert persistent.active_rows is None
+    mask = persistent.active_token_mask
+    pointer = mask.data_ptr()
+    assert mask.dtype == torch.bool
+    for rows, real_rows in ((17, 17), (1, 0), (5, 5)):
+        builder.update_persistent(
+            persistent,
+            _batch(rows, dummy=real_rows == 0, bucket=18),
+            _metadata((rows, 17), (real_rows, 17)),
+        )
+        assert persistent.active_token_mask is mask
+        assert mask.data_ptr() == pointer
+        assert mask.to(torch.bool).contiguous() is mask
+        assert mask.tolist() == [9 + row < real_rows for row in range(9)]
+
+
 def test_builder_accepts_supported_npu_topology() -> None:
     builder = Qwen3_5MoeMetadataBuilder.from_config(_config())
     assert isinstance(builder, Qwen3_5MoeMetadataBuilder)
@@ -414,6 +444,7 @@ def _dispatch_test_experts() -> _NpuQwen3_5Experts:
     experts = _NpuQwen3_5Experts.__new__(_NpuQwen3_5Experts)
     nn.Module.__init__(experts)
     experts._sequence_parallel_enabled = True
+    experts._comm_policy = None
     experts._mega_moe_enabled = False
     experts._mega_moe_num_max_tokens_per_rank = MEGA_MOE_MAX_TOKENS
     experts.tp_size = 2

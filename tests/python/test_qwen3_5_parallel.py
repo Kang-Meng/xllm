@@ -127,6 +127,7 @@ def test_model_records_pd_layer_events_in_order() -> None:
     model = Qwen3_5Model.__new__(Qwen3_5Model)
     torch.nn.Module.__init__(model)
     model.cfg = SimpleNamespace(sequence_parallel_enabled=False)
+    model._comm_policy = None
     model.embed_tokens = torch.nn.Identity()
     model.layers = torch.nn.ModuleList(DecoderLayer() for _ in range(3))
     model.norm = FinalNorm()

@@ -823,6 +823,134 @@ def _validate_ep_moe_w8a8_inputs(
             raise ValueError(f"EP MoE x_active_mask must be on {hidden.device}, got {x_active_mask.device}")
 
 
+def _ep_grouped_bf16(
+    expanded: torch.Tensor,
+    expert_token_nums: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+) -> torch.Tensor:
+    """Compute BF16 experts for rows already grouped by local expert."""
+    if expanded.shape[0] == 0:
+        return expanded.new_empty((0, w2.shape[-1]))
+
+    from xllm.python import kernels as _kernels
+
+    # Dispatch and GMM both use per-expert counts, not cumulative offsets.
+    group_list = expert_token_nums.to(torch.int64).contiguous()
+    gate_up = _group_gemm(
+        x=expanded,
+        weight=w13,
+        scale=None,
+        per_token_scale=None,
+        group_list=group_list,
+        split_item=2,
+        group_type=0,
+        group_list_type=1,
+        output_dtype=expanded.dtype,
+    )
+    activated = _kernels.silu_and_mul(gate_up)
+    return _group_gemm(
+        x=activated,
+        weight=w2,
+        scale=None,
+        per_token_scale=None,
+        group_list=group_list,
+        split_item=2,
+        group_type=0,
+        group_list_type=1,
+        output_dtype=expanded.dtype,
+    )
+
+
+@torch.library.custom_op("xllm_python::ep_moe_bf16", mutates_args=())
+def ep_moe_bf16(
+    hidden: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    group_ep: str,
+    ep_size: int,
+    ep_rank: int,
+    num_experts: int,
+    x_active_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch BF16 source rows, compute local experts, and combine to source.
+
+    The caller supplies uniform padded source rows and owns capacity admission,
+    source ownership, shared experts, and output cropping. Every rank participates
+    even when its source mask is empty or its local experts receive no work.
+    """
+    expert_ids = topk_ids.to(torch.int32).contiguous()
+    # Preserve Qwen's BF16 routing-weight rounding before MC2's FP32 interface.
+    expert_scales = topk_weights.to(hidden.dtype).to(torch.float32).contiguous()
+    active_mask = x_active_mask.to(torch.bool).contiguous()
+    dispatch_output = torch_npu.npu_moe_distribute_dispatch_v2(
+        x=hidden.contiguous(),
+        expert_ids=expert_ids,
+        scales=None,
+        x_active_mask=active_mask,
+        expert_scales=None,
+        group_ep=group_ep,
+        ep_world_size=ep_size,
+        ep_rank_id=ep_rank,
+        moe_expert_num=num_experts,
+        group_tp="",
+        tp_world_size=0,
+        tp_rank_id=0,
+        expert_shard_type=0,
+        shared_expert_num=1,
+        shared_expert_rank_num=0,
+        quant_mode=0,
+        global_bs=0,
+        expert_token_nums_type=1,
+        comm_alg="",
+    )
+    expanded, _, assist_info, expert_token_nums, ep_recv_counts, tp_recv_counts, _ = dispatch_output[:7]
+    expert_output = _ep_grouped_bf16(expanded, expert_token_nums, w13, w2)
+    return torch_npu.npu_moe_distribute_combine_v2(
+        expand_x=expert_output,
+        expert_ids=expert_ids,
+        assist_info_for_combine=assist_info,
+        ep_send_counts=ep_recv_counts,
+        expert_scales=expert_scales,
+        tp_send_counts=tp_recv_counts,
+        x_active_mask=active_mask,
+        expand_scales=None,
+        shared_expert_x=None,
+        group_ep=group_ep,
+        ep_world_size=ep_size,
+        ep_rank_id=ep_rank,
+        moe_expert_num=num_experts,
+        group_tp="",
+        tp_world_size=0,
+        tp_rank_id=0,
+        expert_shard_type=0,
+        shared_expert_num=1,
+        shared_expert_rank_num=0,
+        global_bs=0,
+        comm_quant_mode=0,
+        comm_alg="",
+    )
+
+
+@ep_moe_bf16.register_fake
+def _ep_moe_bf16_fake(
+    hidden: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    group_ep: str,
+    ep_size: int,
+    ep_rank: int,
+    num_experts: int,
+    x_active_mask: torch.Tensor,
+) -> torch.Tensor:
+    del topk_weights, topk_ids, w13, w2, group_ep, ep_size, ep_rank, num_experts, x_active_mask
+    return torch.empty_like(hidden)
+
+
 def _ep_grouped_w8a8(
     quantized_expand_x: torch.Tensor,
     input_scale: torch.Tensor,
@@ -1116,6 +1244,83 @@ def _alltoall_variable_rows(
         pieces.append(received[offset : offset + count])
         offset += capacity
     return torch.cat(pieces, dim=0)
+
+
+@torch.library.custom_op("xllm_python::ep_moe_bf16_alltoall", mutates_args=())
+def ep_moe_bf16_alltoall(
+    hidden: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Exchange valid BF16 source rows and return weighted outputs; eager only."""
+    from xllm.python.distributed import moe_ep_group
+    from xllm.python.model_executor.forward_context import in_acl_graph
+
+    if in_acl_graph():
+        raise ValueError("Variable-size All-to-AllV requires eager execution")
+    group = moe_ep_group(hidden.device)
+    ep_size = group.size()
+    local_experts = num_experts // ep_size
+    ids = topk_ids.to(torch.int32).contiguous()
+    weights = topk_weights.to(hidden.dtype).contiguous()
+    if hidden.shape[0]:
+        expanded, row_map, counts, _ = torch_npu.npu_moe_init_routing_v2(
+            hidden,
+            ids,
+            scale=None,
+            active_num=ids.numel(),
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, num_experts],
+            quant_mode=-1,
+        )
+        counts = counts[:num_experts].to(torch.int64).contiguous()
+    else:
+        counts = torch.zeros(num_experts, dtype=torch.int64, device=hidden.device)
+        row_map = torch.empty(0, dtype=torch.int32, device=hidden.device)
+        expanded = hidden.new_empty((0, hidden.shape[1]))
+
+    received_counts = torch.empty_like(counts)
+    torch.distributed.all_to_all_single(received_counts, counts, group=group)
+    # PyTorch's variable split-size ABI requires host counts in eager mode.
+    host_counts = torch.stack((counts, received_counts)).cpu().reshape(2, ep_size, local_experts)
+    send_splits = host_counts[0].sum(1).tolist()
+    recv_splits = host_counts[1].sum(1).tolist()
+    received = _alltoall_variable_rows(expanded, send_splits, recv_splits, group)
+
+    # Reuse the source-major/expert-minor ordering and AiCore sort of W8A8 A2AV.
+    expert_ids = torch.arange(local_experts, dtype=torch.float32, device=hidden.device).repeat(ep_size)
+    recv_experts = torch.repeat_interleave(expert_ids, received_counts, output_size=sum(recv_splits))
+    order = torch.argsort(recv_experts, stable=True)
+    grouped = received.index_select(0, order)
+    group_list = received_counts.reshape(ep_size, local_experts).sum(0)
+    expert_output = _ep_grouped_bf16(grouped, group_list, w13, w2)
+    unsorted = torch.empty_like(expert_output)
+    unsorted.index_copy_(0, order, expert_output)
+    returned = _alltoall_variable_rows(unsorted, recv_splits, send_splits, group)
+    if hidden.shape[0]:
+        return torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=returned,
+            sorted_indices=row_map.abs().to(torch.int32),
+            probs=weights,
+        )
+    return torch.empty_like(hidden)
+
+
+@ep_moe_bf16_alltoall.register_fake
+def _ep_moe_bf16_alltoall_fake(
+    hidden: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    return torch.empty_like(hidden)
 
 
 def _ep_moe_w8a8_alltoall_impl(
@@ -1705,6 +1910,7 @@ def _moe_gmm2_combine_fake(
 
 
 __all__ = [
+    "ep_moe_bf16_alltoall",
     "ep_moe_w8a8",
     "dequant_swiglu_quant",
     "moe_gating_top_k_hash",

@@ -41,6 +41,7 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnStateCache,
 )
 from xllm.python.layers.npu.qwen3_5.moe_metadata import Qwen3_5MoeMetadata
+from xllm.python.layers.npu.qwen3_5.moe_metadata_builder import Qwen3_5MoeMetadataBuilder
 from xllm.python.layers.sequence_parallel import (
     resolve_sequence_parallel,
     sp_local_rows,
@@ -139,6 +140,71 @@ def test_sequence_parallel_layers_and_builder_read_resolved_state(config: dict[s
     assert sequence_parallel_ops.sequence_parallel_enabled(SimpleNamespace(**config)) is expected
     builder = sequence_parallel_ops.SpMetadataBuilder.from_config({"device": "privateuseone", **config})
     assert (builder is not None) is expected
+
+
+@pytest.mark.parametrize("sp", [False, True])
+@pytest.mark.parametrize("enable_fused_mc2", [False, True])
+def test_lv2_resolves_sp_and_metadata_before_model_construction(
+    monkeypatch: pytest.MonkeyPatch, sp: bool, enable_fused_mc2: bool
+) -> None:
+    config = {
+        **vars(make_config(hidden_size=1024, moe_tp_size=1, ep_size=2)),
+        "device": "privateuseone",
+        "dtype": "bfloat16",
+        "expert_parallel_degree": 2,
+        "eplv2_sequence_parallel": sp,
+        # C++ resolves enable_fused_mc2=auto to true for degree=2.
+        "enable_fused_mc2": enable_fused_mc2,
+        "instance_role": "DEFAULT",
+    }
+    monkeypatch.setattr(qwen3_5_model, "Qwen3_5Model", MagicMock(return_value=torch.nn.Identity()))
+    monkeypatch.setattr(qwen3_5_model, "ColumnParallelLinear", MagicMock(return_value=torch.nn.Identity()))
+    model = qwen3_5_model.Qwen3_5ForCausalLM(config)
+    assert model.cfg.sequence_parallel_enabled is sp
+    assert config["sequence_parallel_enabled"] is sp
+    assert (sequence_parallel_ops.SpMetadataBuilder.from_config(config) is not None) is sp
+    assert Qwen3_5MoeMetadataBuilder.from_config(config) is not None
+
+
+def test_lv2_rejects_eplb_before_model_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = {
+        **vars(make_config(hidden_size=1024, moe_tp_size=1, ep_size=2)),
+        "device": "privateuseone",
+        "dtype": "bfloat16",
+        "expert_parallel_degree": 2,
+        "enable_fused_mc2": True,
+        "enable_eplb": True,
+    }
+    model_factory = MagicMock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(qwen3_5_model, "Qwen3_5Model", model_factory)
+    monkeypatch.setattr(qwen3_5_model, "ColumnParallelLinear", MagicMock(return_value=torch.nn.Identity()))
+    with pytest.raises(NotImplementedError, match="EPLB to be disabled"):
+        qwen3_5_model.Qwen3_5ForCausalLM(config)
+    model_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["", "auto"])
+def test_lv2_mc2_token_limit_reports_invalid_environment(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("XLLM_EPLV2_MC2_MAX_TOKENS", value)
+    with pytest.raises(ValueError, match="XLLM_EPLV2_MC2_MAX_TOKENS.*integer"):
+        make_config(device="privateuseone", expert_parallel_degree=2, moe_tp_size=1, ep_size=2)
+
+
+def test_sp_shard_allocates_only_the_local_tail() -> None:
+    hidden = torch.arange(17 * 4, dtype=torch.bfloat16).view(17, 4)
+    first = sp_shard(hidden, 2, 0)
+    last = sp_shard(hidden, 2, 1)
+    torch.testing.assert_close(first, hidden[:9])
+    torch.testing.assert_close(last[:8], hidden[9:])
+    assert torch.count_nonzero(last[8:]) == 0
+    assert first.untyped_storage().data_ptr() == hidden.untyped_storage().data_ptr()
+    assert last.untyped_storage().nbytes() == 9 * 4 * hidden.element_size()
+    torch.testing.assert_close(sp_shard(hidden[:1], 4, 3), torch.zeros(1, 4, dtype=hidden.dtype))
+
+    strided = sp_shard(hidden[:, ::2], 2, 0)
+    torch.testing.assert_close(strided, hidden[:9, ::2])
+    assert strided.is_contiguous()
+    assert strided.untyped_storage().nbytes() == 9 * 2 * hidden.element_size()
 
 
 class _Collectives:
@@ -357,6 +423,7 @@ def test_sp_model_matches_full_residual_reference(
         model = Qwen3_5Model.__new__(Qwen3_5Model)
         torch.nn.Module.__init__(model)
         model.cfg = SimpleNamespace(sequence_parallel_enabled=True)
+        model._comm_policy = None
         model.embed_tokens = torch.nn.Embedding.from_pretrained(hidden.clone())
         model.layers = torch.nn.ModuleList(
             _layer(index, rank, tp_size, rows, moe_layers, mega_moe, sequence_parallel=True)
@@ -487,9 +554,9 @@ def test_dense_ffn_sp_keeps_tp_weights_and_defers_down_reduction() -> None:
     [
         (None, RuntimeError, "execution metadata is unavailable"),
         (torch.ones(1, dtype=torch.int8), ValueError, "capacity must cover"),
-        (torch.ones(2), ValueError, "contiguous int8"),
-        (torch.ones(2, 1, dtype=torch.int8), ValueError, "contiguous int8"),
-        (torch.ones(4, dtype=torch.int8)[::2], ValueError, "contiguous int8"),
+        (torch.ones(2), ValueError, "contiguous torch.int8"),
+        (torch.ones(2, 1, dtype=torch.int8), ValueError, "contiguous torch.int8"),
+        (torch.ones(4, dtype=torch.int8)[::2], ValueError, "contiguous torch.int8"),
     ],
 )
 @pytest.mark.parametrize("mega_moe", [False, True])

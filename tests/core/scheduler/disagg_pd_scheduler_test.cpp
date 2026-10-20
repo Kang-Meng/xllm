@@ -81,9 +81,13 @@ class FakeTokenizer final : public Tokenizer {
     NOT_IMPLEMENTED();
   }
 
-  std::string decode(const Slice<int32_t>& /*ids*/,
+  std::string decode(const Slice<int32_t>& ids,
                      bool /*skip_special_tokens*/) const override {
-    return "";
+    std::string text;
+    for (int32_t id : ids) {
+      text += std::to_string(id);
+    }
+    return text;
   }
 
   std::optional<int32_t> token_to_id(
@@ -182,8 +186,10 @@ class FakeEngine final : public Engine {
 
 class TestDisaggPDScheduler final : public DisaggPDScheduler {
  public:
-  TestDisaggPDScheduler(Engine* engine, const Options& options)
-      : DisaggPDScheduler(engine, options) {}
+  TestDisaggPDScheduler(Engine* engine,
+                        const Options& options,
+                        bool start_services = true)
+      : DisaggPDScheduler(engine, options, start_services) {}
 
   void admit_prefill(std::shared_ptr<Request> request,
                      proto::DisaggPDService_Stub* stub = nullptr) {
@@ -221,6 +227,11 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
     return future;
   }
 
+  void emit_stream_for_test(const std::shared_ptr<Request>& request) {
+    std::vector<std::shared_ptr<Request>> requests{request};
+    response_processor_->process_stream_requests(requests);
+  }
+
   void cache_prefill_blocks_for_test(Request* request) {
     cache_prefill_blocks(request);
   }
@@ -239,6 +250,23 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
   void update_metrics(std::vector<Sequence*>& sequences) {
     update_token_latency_metrics(sequences);
   }
+};
+
+class FirstGenerationOrderService final : public proto::DisaggPDService {
+ public:
+  std::future<void> received() { return received_.get_future(); }
+
+  void FirstGeneration(google::protobuf::RpcController* /*controller*/,
+                       const proto::DisaggGenerationsRequests* /*request*/,
+                       proto::Status* response,
+                       google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    received_.set_value();
+    response->set_ok(true);
+  }
+
+ private:
+  std::promise<void> received_;
 };
 
 class DelayedReservationService final : public proto::DisaggPDService {
@@ -1659,5 +1687,66 @@ TEST(DisaggPDSchedulerTest, MtpExhaustionRollsBackKvReservation) {
   EXPECT_TRUE(decode.release_reservation("req", "reservation"));
   EXPECT_TRUE(decode.reservations_empty());
   EXPECT_EQ(pool->num_used_blocks()[0], 0u);
+}
+
+TEST(DisaggPDSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
+  FirstGenerationOrderService service;
+  auto received = service.received();
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  const std::string address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  brpc::Channel channel;
+  ASSERT_EQ(channel.Init(address.c_str(), nullptr), 0);
+  proto::DisaggPDService_Stub stub(&channel);
+
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  auto options = make_options();
+  options.enable_chunked_prefill(false).kv_cache_transfer_mode("PUSH");
+  TestDisaggPDScheduler prefill(&engine, options, /*start_services=*/false);
+  auto request = make_request({11, 12}, "first-token-order");
+  request->state().stream = true;
+  std::atomic<bool> first_token_observed{false};
+  std::promise<void> response_started;
+  auto started = response_started.get_future();
+  std::promise<void> release_response;
+  auto released = release_response.get_future().share();
+  request->state().output_func = [&response_started,
+                                  &first_token_observed,
+                                  released](const RequestOutput& output) {
+    first_token_observed =
+        output.outputs.size() == 1 && output.outputs[0].text == "999";
+    response_started.set_value();
+    released.wait();
+    return true;
+  };
+  prefill.admit_prefill(request, &stub);
+  auto batch = prefill.prepare_batch_test();
+  ASSERT_FALSE(batch[0].empty());
+  finish_prefill(request->sequences()[0].get());
+  request->sequences()[0]->first_token() = RemoteToken{.token_id = 999};
+  prefill.emit_stream_for_test(request);
+  const bool output_started =
+      started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  EXPECT_TRUE(output_started);
+  EXPECT_TRUE(first_token_observed.load());
+  if (output_started) {
+    prefill.prefill_send_first_generation();
+    const std::future_status before_response_completed =
+        received.wait_for(std::chrono::milliseconds(250));
+    EXPECT_EQ(before_response_completed, std::future_status::timeout)
+        << "Decode received FirstGeneration while the Prefill response "
+           "callback "
+           "was still blocked; its later output can overtake the first token.";
+  }
+  release_response.set_value();
+  if (output_started) {
+    EXPECT_EQ(received.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    prefill.prefill_completion().get();
+  }
+  server.Stop(0);
+  server.Join();
 }
 }  // namespace xllm

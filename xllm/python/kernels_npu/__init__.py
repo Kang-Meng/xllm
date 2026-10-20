@@ -57,6 +57,8 @@ _EXPORTS = {
         "prepare_mla_preprocess_v2_qkv",
     ),
     "moe": (
+        "ep_moe_bf16",
+        "ep_moe_bf16_alltoall",
         "ep_moe_w8a8",
         "ep_moe_w8a8_alltoall",
         "cutlass_fused_moe",
@@ -140,6 +142,8 @@ _EXPORTS = {
 }
 
 __all__ = [
+    "ep_moe_bf16",
+    "ep_moe_bf16_alltoall",
     "ep_moe_w8a8",
     "ep_moe_w8a8_alltoall",
     "rms_norm",

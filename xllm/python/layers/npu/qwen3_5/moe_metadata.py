@@ -25,6 +25,8 @@ MEGA_MOE_MAX_TOKENS = 4096
 
 @dataclass(frozen=True, slots=True)
 class Qwen3_5MoeMetadata:
-    """External token validity shared by EPLv1 and MegaMoE SP layers."""
+    """Token validity: bool for ordinary EPLv2, int8 for EPLv1/MegaMoE SP."""
 
     active_token_mask: torch.Tensor
+    # Eager sources are valid prefixes; Graph keeps fixed rows and uses the mask.
+    active_rows: int | None = None

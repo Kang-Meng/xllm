@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python.layers import ColumnParallelLinear, HiddenParallelEmbedding
+from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.qwen3_5.common import PartialRotaryEmbedding
 from xllm.python.layers.qwen3_5.factory import get_qwen3_5_decoder_layer_class
 from xllm.python.layers.sequence_parallel import (
@@ -87,6 +89,11 @@ class Qwen3_5Config:
     mega_moe_context: torch.Tensor | None
     mega_moe_ccl_buffer_size: int
     mega_moe_num_max_tokens_per_rank: int
+    expert_parallel_degree: int = 0
+    # Ordinary Lv2 uses cross-layer SP and shared/routed overlap when TP>1.
+    eplv2_sequence_parallel: bool = True
+    eplv2_comm_mode: str = "auto"
+    eplv2_mc2_max_tokens_per_rank: int = 512
     layers_to_capture: tuple[int, ...] = ()
 
     @classmethod
@@ -111,6 +118,33 @@ class Qwen3_5Config:
         dp_size = int(pick("dp_size", default=1))
         world_size = int(pick("world_size", default=tp_size * dp_size))
         ep_size = int(pick("ep_size", default=1))
+        num_experts = int(pick("num_experts", "n_routed_experts", default=0))
+        degree = int(pick("expert_parallel_degree", default=0))
+        enable_mega_moe = bool(pick("enable_mega_moe", default=False))
+        eplv2_sp = True
+        eplv2_mode = "auto"
+        eplv2_token_limit = 512
+        if (
+            str(pick("device", default="cuda")).split(":", 1)[0] in ("npu", "privateuseone")
+            and num_experts > 0
+            and degree == 2
+            and not enable_mega_moe
+        ):
+            sp_value = int(pick("eplv2_sequence_parallel", default=os.getenv("XLLM_EPLV2_SEQUENCE_PARALLEL", "1")))
+            if sp_value not in (0, 1):
+                raise ValueError("Qwen3.5 EPLv2 sequence parallelism must be 0 or 1")
+            eplv2_sp = bool(sp_value)
+            eplv2_mode = str(pick("eplv2_comm_mode", default=os.getenv("XLLM_EPLV2_COMM_MODE", "auto")))
+            if eplv2_mode not in ("auto", "mc2", "alltoall"):
+                raise ValueError("Qwen3.5 EPLv2 communication mode must be auto, mc2 or alltoall")
+            try:
+                eplv2_token_limit = int(
+                    pick("eplv2_mc2_max_tokens_per_rank", default=os.getenv("XLLM_EPLV2_MC2_MAX_TOKENS", "512"))
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "eplv2_mc2_max_tokens_per_rank (XLLM_EPLV2_MC2_MAX_TOKENS) must be an integer"
+                ) from error
         rope_parameters = pick("rope_parameters", default={})
         if not isinstance(rope_parameters, dict):
             rope_parameters = {}
@@ -155,7 +189,7 @@ class Qwen3_5Config:
             attention_bias=bool(pick("attention_bias", default=False)),
             attn_output_gate=bool(pick("attn_output_gate", default=True)),
             tie_word_embeddings=bool(pick("tie_word_embeddings", default=False)),
-            num_experts=int(pick("num_experts", "n_routed_experts", default=0)),
+            num_experts=num_experts,
             num_experts_per_tok=int(pick("num_experts_per_tok", default=0)),
             decoder_sparse_step=int(pick("decoder_sparse_step", default=1)),
             mlp_only_layers=[int(layer_id) for layer_id in pick("mlp_only_layers", default=[])],
@@ -171,11 +205,15 @@ class Qwen3_5Config:
             moe_tp_rank=int(pick("moe_tp_rank", default=0)),
             ep_size=ep_size,
             ep_rank=int(pick("ep_rank", default=0)),
-            enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
+            enable_mega_moe=enable_mega_moe,
             sequence_parallel_enabled=bool(pick("sequence_parallel_enabled", default=False)),
             mega_moe_context=pick("mega_moe_context", default=None),
             mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
             mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
+            expert_parallel_degree=degree,
+            eplv2_sequence_parallel=eplv2_sp,
+            eplv2_comm_mode=eplv2_mode,
+            eplv2_mc2_max_tokens_per_rank=eplv2_token_limit,
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
         )
 
@@ -255,6 +293,23 @@ class Qwen3_5Model(nn.Module):
     def __init__(self, cfg: Qwen3_5Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
+        self._comm_policy = None
+        if (
+            device.type in ("npu", "privateuseone")
+            and cfg.num_experts > 0
+            and cfg.expert_parallel_degree == 2
+            and not cfg.enable_mega_moe
+        ):
+            self._comm_policy = Eplv2CommPolicy.from_geometry(
+                cfg.hidden_size,
+                cfg.num_experts,
+                cfg.ep_size,
+                cfg.num_experts_per_tok,
+                int(os.getenv("HCCL_BUFFSIZE", "200")),
+                cfg.eplv2_mc2_max_tokens_per_rank,
+            )
+            if cfg.eplv2_comm_mode == "alltoall":
+                self._comm_policy = Eplv2CommPolicy(mc2_capacity=0)
         self.embed_tokens = HiddenParallelEmbedding(
             cfg.vocab_size,
             cfg.hidden_size // cfg.tp_size,
@@ -272,7 +327,12 @@ class Qwen3_5Model(nn.Module):
             device,
         )
         decoder_layer_cls = get_qwen3_5_decoder_layer_class(device)
-        self.layers = nn.ModuleList(decoder_layer_cls(cfg, i, dtype, device, self.rotary) for i in range(cfg.n_layers))
+        self.layers = nn.ModuleList(
+            decoder_layer_cls(cfg, i, dtype, device, self.rotary, comm_policy=self._comm_policy)
+            if self._comm_policy is not None
+            else decoder_layer_cls(cfg, i, dtype, device, self.rotary)
+            for i in range(cfg.n_layers)
+        )
         self.norm = decoder_layer_cls.normalization_cls(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -297,6 +357,9 @@ class Qwen3_5Model(nn.Module):
             raise NotImplementedError("Qwen3.5 does not support inputs_embeds")
         if input_ids is None:
             raise ValueError("input_ids must be provided")
+
+        if self._comm_policy is not None:
+            self.layers[0].validate_ep_level2(self._comm_policy, force_mc2=self.cfg.eplv2_comm_mode == "mc2")
 
         sequence_parallel_enabled = self.cfg.sequence_parallel_enabled
         num_tokens = positions.shape[0] if positions.ndim == 1 else positions.shape[-1]
@@ -343,8 +406,30 @@ class Qwen3_5ForCausalLM(PyModelBase):
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "cuda"))
         decoder_layer_cls = get_qwen3_5_decoder_layer_class(device)
-        config["sequence_parallel_enabled"] = resolve_sequence_parallel(config, decoder_layer_cls)
         self.cfg = Qwen3_5Config.from_dict(config)
+        ordinary_lv2 = (
+            device.type in ("npu", "privateuseone")
+            and self.cfg.num_experts > 0
+            and self.cfg.expert_parallel_degree == 2
+            and not self.cfg.enable_mega_moe
+        )
+        if ordinary_lv2:
+            if int(config.get("cp_size", 1)) != 1 or int(config.get("num_speculative_tokens", 0)) != 0:
+                raise NotImplementedError("Qwen3.5 EPLv2 requires CP=1 and no speculative decoding")
+            if bool(config.get("is_draft_engine", False)):
+                raise NotImplementedError("Qwen3.5 EPLv2 does not support draft engines")
+            # Python BF16 EP does not use the C++ fused-MC2 mode.
+            if bool(config.get("enable_eplb", False)):
+                raise NotImplementedError("Qwen3.5 EPLv2 requires EPLB to be disabled")
+            if self.cfg.moe_tp_size != 1 or self.cfg.ep_size <= 1:
+                raise ValueError("Qwen3.5 EPLv2 requires MoE-TP=1 and EP>1")
+            if self.cfg.ep_rank != self.cfg.dp_rank * self.cfg.tp_size + self.cfg.tp_rank:
+                raise ValueError("Qwen3.5 EPLv2 EP rank must match the DP/TP coordinates")
+            # Explicit Lv2 owns the token layout for every instance role.
+            self.cfg.sequence_parallel_enabled = self.cfg.eplv2_sequence_parallel and self.cfg.tp_size > 1
+        else:
+            self.cfg.sequence_parallel_enabled = resolve_sequence_parallel(config, decoder_layer_cls)
+        config["sequence_parallel_enabled"] = self.cfg.sequence_parallel_enabled
         self.cfg.validate()
         self.dtype = dtype
         self.device = device

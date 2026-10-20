@@ -1040,6 +1040,9 @@ void DisaggPDScheduler::prefill_send_first_generation() {
         stub = req_to_channel_map_[request->request_id()];
       }
 
+      // Finish the Prefill response before Decode can produce later tokens.
+      response_processor_->wait_completion();
+
       // TODO: Async call later
       proto::Status resp;
       brpc::Controller cntl;
@@ -1072,7 +1075,6 @@ void DisaggPDScheduler::prefill_send_first_generation() {
         std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
         req_to_channel_map_.erase(request->request_id());
       }
-      response_processor_->wait_completion();
       cache_prefill_blocks(request.get());
       kv_cache_manager_->deallocate(request.get());
     }

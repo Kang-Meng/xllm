@@ -40,7 +40,10 @@ class Qwen3_5MoeMetadataBuilder:
         cls,
         config: Mapping[str, object],
     ) -> Qwen3_5MoeMetadataBuilder | None:
-        if not sequence_parallel_enabled(config):
+        ordinary_lv2 = int(config.get("expert_parallel_degree", 0)) == 2 and not bool(
+            config.get("enable_mega_moe", False)
+        )
+        if not sequence_parallel_enabled(config) and not ordinary_lv2:
             return None
         if str(config.get("device", "cuda")).split(":", 1)[0] not in ("npu", "privateuseone"):
             return None
@@ -54,6 +57,7 @@ class Qwen3_5MoeMetadataBuilder:
             tp_rank=int(config.get("tp_rank", 0)),
             dp_size=dp_size,
             dp_rank=int(config.get("dp_rank", 0)),
+            mask_dtype=torch.bool if ordinary_lv2 else torch.int8,
         )
 
     def __init__(
@@ -62,6 +66,7 @@ class Qwen3_5MoeMetadataBuilder:
         tp_rank: int,
         dp_size: int,
         dp_rank: int,
+        mask_dtype: torch.dtype = torch.int8,
     ) -> None:
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
             raise ValueError(f"invalid SP TP geometry: size={tp_size}, rank={tp_rank}")
@@ -71,6 +76,7 @@ class Qwen3_5MoeMetadataBuilder:
         self._tp_rank = tp_rank
         self._dp_size = dp_size
         self._dp_rank = dp_rank
+        self._mask_dtype = mask_dtype
 
     def build(
         self,
@@ -81,10 +87,10 @@ class Qwen3_5MoeMetadataBuilder:
         execution_counts, valid_rows = self._token_counts(input_batch, metadata)
         local_capacity = self._shard_capacity(input_batch.num_tokens)
         dispatch_capacity = self._shard_capacity(max(execution_counts))
-        mask = torch.zeros(dispatch_capacity, dtype=torch.int8, device=input_batch.input_ids.device)
+        mask = torch.zeros(dispatch_capacity, dtype=self._mask_dtype, device=input_batch.input_ids.device)
         local_valid_rows = self._local_valid_rows(valid_rows, local_capacity)
         mask[:local_valid_rows].fill_(1)
-        return Qwen3_5MoeMetadata(active_token_mask=mask)
+        return Qwen3_5MoeMetadata(active_token_mask=mask, active_rows=local_valid_rows)
 
     def allocate_persistent(
         self,
@@ -96,7 +102,7 @@ class Qwen3_5MoeMetadataBuilder:
         return Qwen3_5MoeMetadata(
             active_token_mask=torch.zeros(
                 self._shard_capacity(input_batch.num_tokens_after_padding),
-                dtype=torch.int8,
+                dtype=self._mask_dtype,
                 device=input_batch.input_ids.device,
             )
         )
@@ -121,8 +127,8 @@ class Qwen3_5MoeMetadataBuilder:
         mask = persistent_metadata.active_token_mask
         if mask.shape != (local_capacity,):
             raise ValueError("Qwen3.5 SP mask shape does not match the graph capacity")
-        if mask.dtype != torch.int8:
-            raise TypeError("Qwen3.5 SP mask must use int8")
+        if mask.dtype != self._mask_dtype:
+            raise TypeError(f"Qwen3.5 SP mask must use {self._mask_dtype}")
         if mask.device != input_batch.input_ids.device or not mask.is_contiguous():
             raise ValueError("Qwen3.5 SP mask must be contiguous and on the input device")
 

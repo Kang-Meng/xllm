@@ -44,7 +44,7 @@ def resolve_sequence_parallel(
     config: Mapping[str, object],
     decoder_layer_cls: type[torch.nn.Module],
 ) -> bool:
-    """Resolve Qwen3.5 SP from decoder capability and runtime policy.
+    """Resolve role-based SP from decoder capability and runtime policy.
 
     The instance role is supplied by the PD launcher.  There is deliberately
     no user-facing environment switch here.  The resolved state is the source
@@ -268,8 +268,8 @@ def sp_shard(
         raise ValueError(
             f"cannot shard {tensor.shape[0]} rows into sequence-parallel execution capacity {layout.execution_rows}"
         )
-    padded = _pad_rows(tensor, layout.padded_rows)
-    return padded.narrow(0, layout.local_offset, layout.local_rows).contiguous()
+    local = tensor[layout.local_offset : layout.local_offset + layout.local_rows]
+    return _pad_rows(local, layout.local_rows)
 
 
 def sp_all_gather(

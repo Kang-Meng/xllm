@@ -1311,29 +1311,39 @@ class TestModelExecutorConstruction:
         )
         assert mock_graph_runner.call_args.kwargs["enable_mega_moe_token_mask"] is (enable_mega_moe and not expected)
 
+    @pytest.mark.parametrize(
+        ("model_type", "tp_size", "mc2_capacity", "speculative_tokens"),
+        [("glm5_next", 8, 3, 7), ("qwen3_5_moe", 4, 86, 0)],
+    )
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
-    def test_glm_eplv2_graph_uses_model_mc2_capacity(
-        self, mock_create: MagicMock, mock_graph_runner: MagicMock
+    def test_eplv2_graph_uses_model_mc2_capacity(
+        self,
+        mock_create: MagicMock,
+        mock_graph_runner: MagicMock,
+        model_type: str,
+        tp_size: int,
+        mc2_capacity: int,
+        speculative_tokens: int,
     ) -> None:
         mock_create.return_value = StubAttentionBackend()
         model = _FakeModel(num_layers=1)
-        model.model._comm_policy = Eplv2CommPolicy(mc2_capacity=3)
+        model.model._comm_policy = Eplv2CommPolicy(mc2_capacity=mc2_capacity)
         ModelExecutor(
             model,
             {
-                "model_type": "glm5_next",
+                "model_type": model_type,
                 "expert_parallel_degree": 2,
-                "tp_size": 8,
-                "ep_size": 8,
-                "num_speculative_tokens": 7,
+                "tp_size": tp_size,
+                "ep_size": tp_size,
+                "num_speculative_tokens": speculative_tokens,
                 "max_position_embeddings": 128,
                 "python_graph_backend": "aclgraph",
             },
             max_seqs_per_batch=128,
         )
-        assert mock_graph_runner.call_args.kwargs["eplv2_graph_token_limit"] == 24
-        assert mock_graph_runner.call_args.kwargs["num_decoding_tokens"] == 8
+        assert mock_graph_runner.call_args.kwargs["eplv2_graph_token_limit"] == mc2_capacity * tp_size
+        assert mock_graph_runner.call_args.kwargs["num_decoding_tokens"] == speculative_tokens + 1
 
     @pytest.mark.parametrize("mc2_capacity", [3, 8])
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
@@ -1740,6 +1750,34 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 ),
             )
             assert not rejected
+
+    @pytest.mark.parametrize("dp_size", [1, 2])
+    @pytest.mark.parametrize(("rows", "limit", "expected"), [(336, 344, True), (337, 344, False), (1, 0, False)])
+    def test_eplv2_graph_admission_uses_padded_ep_group_capacity(
+        self, dp_size: int, rows: int, limit: int, expected: bool
+    ) -> None:
+        runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            _PagedStubAttentionBackend(),
+            torch.device("cpu"),
+            max_batch=512,
+            max_model_len=8,
+            dp_size=dp_size,
+            dp_rank=0,
+            eplv2_graph_token_limit=limit,
+        )
+        # 337 rows pad to 352, exceeding TP4 * 86 even though 337 <= 344.
+        # The empty DP's dummy row must follow the busy peer's padded bucket.
+        local_rows = rows if dp_size == 1 else 1
+        metadata = SimpleNamespace(
+            is_prefill=False,
+            is_chunked_prefill=False,
+            dp_execution_token_counts=(rows,) if dp_size == 1 else (1, rows),
+            raw_dp_execution_token_counts=(rows,) if dp_size == 1 else (0, rows),
+            dp_is_decode=(1,) * dp_size,
+        )
+        with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
+            assert runner.can_execute(torch.zeros(local_rows, dtype=torch.int32), metadata) is expected
 
     def test_mtp3_batch_eight_uses_32_row_graph_bucket(self) -> None:
         runner = DecodeAclGraphRunner(

@@ -20,10 +20,12 @@ import torch
 import torch.nn as nn
 
 from xllm.python.layers.gated_mlp import GatedMLP
+from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.npu.layernorm import NpuGemmaRMSNorm
 from xllm.python.layers.npu.qwen3_5.attention import NpuQwen3_5Attention
 from xllm.python.layers.npu.qwen3_5.gated_delta_net import NpuQwen3_5GatedDeltaNet
 from xllm.python.layers.npu.qwen3_5.moe import NpuQwen3_5SparseMoEBlock
+from xllm.python.layers.npu.qwen3_5.moe_metadata import Qwen3_5MoeMetadata
 from xllm.python.layers.qwen3_5.common import (
     PartialRotaryEmbedding,
     Qwen3_5DecoderConfig,
@@ -50,6 +52,7 @@ class NpuQwen3_5DecoderLayer(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         rotary: PartialRotaryEmbedding,
+        comm_policy: Eplv2CommPolicy | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -90,6 +93,7 @@ class NpuQwen3_5DecoderLayer(nn.Module):
                 dtype,
                 device,
                 layer_id=layer_id,
+                comm_policy=comm_policy,
             )
         else:
             self.mlp = GatedMLP(
@@ -100,6 +104,21 @@ class NpuQwen3_5DecoderLayer(nn.Module):
                 device,
                 reduce_results=not cfg.sequence_parallel_enabled,
             )
+
+    @staticmethod
+    def validate_ep_level2(comm_policy: Eplv2CommPolicy, *, force_mc2: bool) -> None:
+        """Admit the NPU transport before embedding or stateful layers run.
+
+        The executor admits ACL Graph buckets against this policy before capture.
+        Persistent graph metadata uses the mask; eager also supplies active_rows.
+        """
+        metadata = get_execution_context(Qwen3_5MoeMetadata)
+        if metadata is None:
+            raise RuntimeError("Qwen3.5 EPLv2 execution metadata is unavailable")
+        source_rows = metadata.active_token_mask.shape[0]
+        if force_mc2 and source_rows > comm_policy.mc2_capacity:
+            raise ValueError(f"Qwen3.5 EPLv2 MC2 source rows {source_rows} exceed capacity {comm_policy.mc2_capacity}")
+        comm_policy.select(source_rows)
 
     def validate_sp(
         self,

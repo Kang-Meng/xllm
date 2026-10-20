@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-mocked contracts for the NPU EP2 W8A8 MoE helper."""
+"""CPU-mocked contracts for the NPU EP2 BF16 and W8A8 MoE helpers."""
 
 from __future__ import annotations
 
@@ -91,6 +91,97 @@ def _make_inputs() -> dict[str, Any]:
 
 def _call_impl(moe: ModuleType, inputs: dict[str, Any]) -> torch.Tensor:
     return moe._ep_moe_w8a8_impl(**inputs)
+
+
+def _make_bf16_inputs() -> dict[str, Any]:
+    generator = torch.Generator().manual_seed(35)
+    return {
+        "hidden": torch.randn(4, 8, generator=generator, dtype=torch.bfloat16),
+        "topk_weights": torch.tensor([[0.123, 0.877]] * 4),
+        "topk_ids": torch.tensor([[0, 3], [2, 1], [1, 2], [3, 0]], dtype=torch.int32),
+        "w13": torch.randn(2, 8, 12, generator=generator, dtype=torch.bfloat16),
+        "w2": torch.randn(2, 6, 8, generator=generator, dtype=torch.bfloat16),
+        "group_ep": "ep_group",
+        "ep_size": 2,
+        "ep_rank": 1,
+        "num_experts": 4,
+        "x_active_mask": torch.tensor([1, 0, 1, 0], dtype=torch.int8),
+    }
+
+
+@pytest.mark.parametrize("has_source,received_rows", [(True, 3), (False, 3), (False, 0)])
+def test_ep_moe_bf16_preserves_expert_math_and_dispatch_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    has_source: bool,
+    received_rows: int,
+) -> None:
+    from xllm.python import kernels
+
+    moe = _load_npu_moe_module()
+    inputs = _make_bf16_inputs()
+    if not has_source:
+        inputs["x_active_mask"].zero_()
+    expanded = torch.arange(received_rows * 8, dtype=torch.bfloat16).reshape(received_rows, 8) / 16
+    counts = torch.tensor([received_rows, 0], dtype=torch.int64)
+    assist = torch.tensor([3, 1, 2, 0], dtype=torch.int32)
+    ep_counts = torch.tensor([1, 2], dtype=torch.int32)
+    tp_counts = torch.empty(0, dtype=torch.int32)
+    empty = torch.empty(0)
+    returned = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
+    dispatch_calls: list[dict[str, Any]] = []
+    combine_calls: list[dict[str, Any]] = []
+    gemm_calls: list[dict[str, Any]] = []
+
+    def dispatch(**kwargs: Any) -> tuple[torch.Tensor, ...]:
+        dispatch_calls.append(kwargs)
+        return expanded, empty, assist, counts, ep_counts, tp_counts, empty
+
+    def group_gemm(**kwargs: Any) -> torch.Tensor:
+        gemm_calls.append(kwargs)
+        assert kwargs["scale"] is None
+        assert kwargs["per_token_scale"] is None
+        assert kwargs["group_list_type"] == 1
+        assert kwargs["output_dtype"] == torch.bfloat16
+        torch.testing.assert_close(kwargs["group_list"], counts)
+        return kwargs["x"] @ kwargs["weight"][0]
+
+    def silu_and_mul(value: torch.Tensor) -> torch.Tensor:
+        gate, up = value.float().chunk(2, dim=-1)
+        return (torch.nn.functional.silu(gate) * up).to(value.dtype)
+
+    def combine(**kwargs: Any) -> torch.Tensor:
+        combine_calls.append(kwargs)
+        assert kwargs["assist_info_for_combine"] is assist
+        assert kwargs["ep_send_counts"] is ep_counts
+        assert kwargs["tp_send_counts"] is tp_counts
+        assert kwargs["x_active_mask"] is dispatch_calls[0]["x_active_mask"]
+        assert kwargs["expert_ids"] is dispatch_calls[0]["expert_ids"]
+        expected = torch.empty(0, 8, dtype=torch.bfloat16)
+        if received_rows:
+            gate_up = (expanded.float() @ inputs["w13"][0].float()).bfloat16()
+            gate, up = gate_up.float().chunk(2, dim=-1)
+            activated = (torch.nn.functional.silu(gate) * up).bfloat16()
+            expected = (activated.float() @ inputs["w2"][0].float()).bfloat16()
+        torch.testing.assert_close(kwargs["expand_x"], expected, rtol=0, atol=0)
+        torch.testing.assert_close(kwargs["expert_scales"], inputs["topk_weights"].bfloat16().float())
+        return returned.clone()
+
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_distribute_dispatch_v2", dispatch, raising=False)
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_distribute_combine_v2", combine, raising=False)
+    monkeypatch.setattr(moe, "_group_gemm", group_gemm)
+    monkeypatch.setattr(kernels, "silu_and_mul", silu_and_mul, raising=False)
+    output = moe.ep_moe_bf16(**inputs)
+
+    torch.testing.assert_close(output, returned)
+    assert len(dispatch_calls) == len(combine_calls) == 1
+    assert len(gemm_calls) == (2 if received_rows else 0)
+    dispatch_kwargs = dispatch_calls[0]
+    assert dispatch_kwargs["quant_mode"] == 0
+    assert dispatch_kwargs["expert_token_nums_type"] == 1
+    assert dispatch_kwargs["global_bs"] == 0
+    assert dispatch_kwargs["expert_ids"].dtype == torch.int32
+    assert dispatch_kwargs["x_active_mask"].dtype == torch.bool
+    torch.testing.assert_close(dispatch_kwargs["x_active_mask"], inputs["x_active_mask"].bool())
 
 
 @pytest.mark.parametrize("send,recv", [([2, 0], [0, 3]), ([0, 0], [0, 0]), ([1, 2], [2, 1])])
@@ -404,6 +495,76 @@ def test_ep_moe_w8a8_propagates_clamped_activation_failure(
     dequant.assert_called_once()
     assert dequant.call_args.kwargs["clamp_limit"] == inputs["swiglu_limit"]
     combine.assert_not_called()
+
+
+@pytest.mark.parametrize("has_source,has_received", [(True, True), (False, True), (False, False)])
+def test_bf16_alltoall_preserves_splits_and_expert_return_order(
+    monkeypatch: pytest.MonkeyPatch, has_source: bool, has_received: bool
+) -> None:
+    from xllm.python import distributed
+
+    moe = _load_npu_moe_module()
+    inputs = _make_bf16_inputs()
+    for name in ("group_ep", "ep_size", "ep_rank"):
+        inputs.pop(name)
+    mask = inputs.pop("x_active_mask").bool() & has_source
+    for name in ("hidden", "topk_ids", "topk_weights"):
+        inputs[name] = inputs[name][mask]
+    active = inputs["hidden"]
+    expanded = active[[0, 1, 1, 0]] if has_source else active
+    counts = torch.ones(4, dtype=torch.int64) if has_source else torch.zeros(4, dtype=torch.int64)
+    received_counts = torch.tensor([1, 2, 1, 0]) if has_received else torch.zeros(4, dtype=torch.int64)
+    received = torch.arange(32, dtype=torch.bfloat16).view(4, 8) if has_received else active.new_empty((0, 8))
+    send_splits = [2, 2] if has_source else [0, 0]
+    recv_splits = [3, 1] if has_received else [0, 0]
+    group = MagicMock()
+    group.size.return_value = 2
+    monkeypatch.setattr(distributed, "moe_ep_group", lambda device: group, raising=False)
+
+    def route(value: torch.Tensor, ids: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, ...]:
+        torch.testing.assert_close(value, active)
+        torch.testing.assert_close(ids, inputs["topk_ids"])
+        assert kwargs["quant_mode"] == -1 and kwargs["active_num"] == 4
+        return expanded, torch.arange(4, dtype=torch.int32), counts, torch.empty(0)
+
+    def exchange_counts(out: torch.Tensor, value: torch.Tensor, **kwargs: Any) -> None:
+        assert kwargs["group"] is group
+        torch.testing.assert_close(value, counts)
+        out.copy_(received_counts)
+
+    exchanges: list[torch.Tensor] = []
+
+    def exchange_rows(value: torch.Tensor, send: list[int], recv: list[int], comm: Any) -> torch.Tensor:
+        assert comm is group and value.dtype == torch.bfloat16
+        exchanges.append(value)
+        if len(exchanges) == 1:
+            assert (send, recv) == (send_splits, recv_splits)
+            torch.testing.assert_close(value, expanded)
+            return received
+        assert (send, recv) == (recv_splits, send_splits)
+        torch.testing.assert_close(value, received + 1)
+        return expanded + 2
+
+    def experts(value: torch.Tensor, groups: torch.Tensor, *weights: torch.Tensor) -> torch.Tensor:
+        order = [0, 3, 1, 2] if has_received else []
+        torch.testing.assert_close(value, received[order])
+        torch.testing.assert_close(groups, received_counts.view(2, 2).sum(0))
+        assert weights[0] is inputs["w13"] and weights[1] is inputs["w2"]
+        return value + 1
+
+    def unpermute(**kwargs: Any) -> torch.Tensor:
+        torch.testing.assert_close(kwargs["permuted_tokens"], expanded + 2)
+        torch.testing.assert_close(kwargs["sorted_indices"], torch.arange(4, dtype=torch.int32))
+        torch.testing.assert_close(kwargs["probs"], inputs["topk_weights"].bfloat16())
+        return active + 2
+
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_init_routing_v2", route, raising=False)
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_token_unpermute", unpermute, raising=False)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange_counts)
+    monkeypatch.setattr(moe, "_alltoall_variable_rows", exchange_rows)
+    monkeypatch.setattr(moe, "_ep_grouped_bf16", experts)
+    torch.testing.assert_close(moe.ep_moe_bf16_alltoall(**inputs), active + 2)
+    assert len(exchanges) == 2
 
 
 @pytest.mark.parametrize("has_active_source", (True, False))

@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from xllm.python import distributed, kernels
 from xllm.python.layers.gated_mlp import GatedMLP
 from xllm.python.layers.moe_parallel import (
+    Eplv2CommPolicy,
     dp_gather_tokens,
     ep_apply_local,
     ep_gather_tokens,
@@ -35,9 +36,11 @@ from xllm.python.layers.moe_parallel import (
 from xllm.python.layers.npu.mega_moe_metadata import MegaMoeMetadata
 from xllm.python.layers.npu.qwen3_5.moe_metadata import MEGA_MOE_MAX_TOKENS, Qwen3_5MoeMetadata
 from xllm.python.layers.qwen3_5.common import Qwen3_5MoEConfig
+from xllm.python.layers.sequence_parallel import sp_all_gather, sp_shard
 from xllm.python.layers.sequence_parallel_metadata import SpMetadata
 from xllm.python.model_executor.forward_context import get_execution_context
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
+from xllm.python.npu_streams import shared_expert_stream
 
 
 def _pad_token_rows(tensor: torch.Tensor, token_capacity: int) -> torch.Tensor:
@@ -58,6 +61,7 @@ class _NpuQwen3_5Experts(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         reduce_results: bool,
+        comm_policy: Eplv2CommPolicy | None = None,
     ) -> None:
         super().__init__()
         if dtype != torch.bfloat16:
@@ -77,6 +81,8 @@ class _NpuQwen3_5Experts(nn.Module):
         self.tp_size = cfg.tp_size
         self.tp_rank = cfg.tp_rank
         self.reduce_results = reduce_results
+        self._comm_policy = comm_policy
+        self._ep_group_name: str
         self._mega_moe_ccl_buffer_size = cfg.mega_moe_ccl_buffer_size
         self._mega_moe_num_max_tokens_per_rank = cfg.mega_moe_num_max_tokens_per_rank
         self._mega_moe_enabled = cfg.enable_mega_moe
@@ -95,7 +101,6 @@ class _NpuQwen3_5Experts(nn.Module):
         )
         if self._mega_moe_enabled and cfg.mega_moe_context is None:
             raise ValueError("MegaMoe token ownership requires a communication context")
-
 
         self.gate = nn.Linear(
             cfg.hidden_size,
@@ -122,6 +127,14 @@ class _NpuQwen3_5Experts(nn.Module):
                 device=device,
             )
         )
+
+    def process_weights_after_loading(self) -> None:
+        if self._comm_policy is None:
+            return
+        group_name, ep_rank, ep_size = distributed.moe_ep_hccl_info(self.w13.device)
+        if (ep_rank, ep_size) != (self.ep_rank, self.ep_size):
+            raise ValueError("Qwen3.5 EPLv2 communication group must match the expert weight partition")
+        self._ep_group_name = group_name
 
     def _require_mega_moe_context(self) -> torch.Tensor:
         context = self._mega_moe_context
@@ -218,6 +231,35 @@ class _NpuQwen3_5Experts(nn.Module):
         )
         return ep_reduce_scatter(output, sp_metadata)
 
+    def _forward_ep_level2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        metadata = cast(Qwen3_5MoeMetadata, get_execution_context(Qwen3_5MoeMetadata))
+        capacity = metadata.active_token_mask.shape[0]
+        topk_weights, topk_ids = self._route(self.gate(hidden_states))
+        if self._comm_policy.select(capacity) == "alltoall":
+            active_rows = cast(int, metadata.active_rows)
+            output = kernels.ep_moe_bf16_alltoall(
+                hidden_states.narrow(0, 0, active_rows),
+                topk_weights.narrow(0, 0, active_rows),
+                topk_ids.narrow(0, 0, active_rows),
+                self.w13,
+                self.w2,
+                self.num_experts,
+            )
+            return _pad_token_rows(output, hidden_states.shape[0])
+        output = kernels.ep_moe_bf16(
+            _pad_token_rows(hidden_states, capacity),
+            _pad_token_rows(topk_weights, capacity),
+            _pad_token_rows(topk_ids, capacity),
+            self.w13,
+            self.w2,
+            self._ep_group_name,
+            self.ep_size,
+            self.ep_rank,
+            self.num_experts,
+            metadata.active_token_mask,
+        )
+        return output[: hidden_states.shape[0]].contiguous()
+
     def _forward_sp_mega_moe(
         self,
         hidden_states: torch.Tensor,
@@ -258,8 +300,9 @@ class _NpuQwen3_5Experts(nn.Module):
         if moe_metadata is None:
             raise RuntimeError("Qwen3.5 SP execution metadata is unavailable")
         mask = moe_metadata.active_token_mask
-        if mask.ndim != 1 or mask.dtype != torch.int8 or not mask.is_contiguous():
-            raise ValueError("Qwen3.5 SP active_token_mask must be contiguous int8[C]")
+        mask_dtype = torch.bool if self._comm_policy is not None else torch.int8
+        if mask.ndim != 1 or mask.dtype != mask_dtype or not mask.is_contiguous():
+            raise ValueError(f"Qwen3.5 SP active_token_mask must be contiguous {mask_dtype}[C]")
         if mask.device != device:
             raise ValueError("Qwen3.5 SP active_token_mask and hidden states must share a device")
         if mask.shape[0] < sp_metadata.local_rows:
@@ -268,6 +311,8 @@ class _NpuQwen3_5Experts(nn.Module):
             raise RuntimeError("Qwen3.5 SP EP token layout is unavailable")
 
     def forward(self, hidden_states: torch.Tensor, sp_metadata: SpMetadata | None = None) -> torch.Tensor:
+        if self._comm_policy is not None:
+            return self._forward_ep_level2(hidden_states)
         if self._sequence_parallel_enabled:
             sp_metadata = cast(SpMetadata, sp_metadata)
             if hidden_states.shape != (sp_metadata.local_rows, self.w13.shape[1]):
@@ -300,11 +345,15 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
         device: torch.device,
         *,
         layer_id: int = 0,
+        comm_policy: Eplv2CommPolicy | None = None,
     ) -> None:
         super().__init__()
         del layer_id
         self._sequence_parallel_enabled = cfg.sequence_parallel_enabled
-        shared_tp_size = 1 if self._sequence_parallel_enabled else cfg.tp_size
+        self._comm_policy = comm_policy
+        self._shared_stream: torch.npu.Stream | None = None
+        self._replicate_shared_expert = self._sequence_parallel_enabled or comm_policy is not None
+        shared_tp_size = 1 if self._replicate_shared_expert else cfg.tp_size
         self._fused_reductions_enabled = (
             not self._sequence_parallel_enabled
             and cfg.dp_size == 1
@@ -325,6 +374,7 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
             dtype,
             device,
             reduce_results=not self._fused_reductions_enabled,
+            comm_policy=comm_policy,
         )
         self.shared_expert_gate = nn.Linear(
             cfg.hidden_size,
@@ -398,11 +448,14 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
             context.moe_tp_size,
         )
         state.copy(self.experts.w2, self._pack_down(down), "experts.down_proj")
-        shared_context = replace(context, tp_size=1, tp_rank=0) if self._sequence_parallel_enabled else context
+        shared_context = replace(context, tp_size=1, tp_rank=0) if self._replicate_shared_expert else context
         self.shared_expert.load_weights(state.with_prefix("shared_expert."), shared_context)
 
     def process_weights_after_loading(self) -> None:
         self.shared_expert.process_weights_after_loading()
+        self.experts.process_weights_after_loading()
+        if self._comm_policy is not None and self._sequence_parallel_enabled:
+            self._shared_stream = shared_expert_stream(self.experts.w13.device)
 
     def validate_sp(
         self,
@@ -417,10 +470,26 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
         return self.shared_expert(hidden) * torch.sigmoid(self.shared_expert_gate(hidden))
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self._comm_policy is not None and not self._sequence_parallel_enabled:
+            layout = SpMetadata.from_execution_rows(hidden.shape[0], self.experts.tp_size, self.experts.tp_rank)
+            hidden = sp_shard(hidden, layout)
+            output = self.experts(hidden) + self._forward_shared_expert(hidden)
+            return sp_all_gather(output, layout)
         if self._sequence_parallel_enabled:
             sp_metadata = cast(SpMetadata, get_execution_context(SpMetadata))
-            routed = self.experts(hidden, sp_metadata=sp_metadata)
-            shared = ep_apply_local(hidden, sp_metadata, self._forward_shared_expert)
+            if self._shared_stream is None:
+                routed = self.experts(hidden, sp_metadata=sp_metadata)
+                shared = ep_apply_local(hidden, sp_metadata, self._forward_shared_expert)
+            else:
+                current = torch.npu.current_stream(hidden.device)
+                auxiliary = self._shared_stream
+                auxiliary.wait_stream(current)
+                hidden.record_stream(auxiliary)
+                with torch.npu.stream(auxiliary):
+                    shared = ep_apply_local(hidden, sp_metadata, self._forward_shared_expert)
+                routed = self.experts(hidden, sp_metadata=sp_metadata)
+                current.wait_stream(auxiliary)
+                shared.record_stream(current)
         else:
             routed = self.experts(hidden)
             shared = self._forward_shared_expert(hidden)
