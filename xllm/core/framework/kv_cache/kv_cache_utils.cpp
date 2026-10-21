@@ -605,24 +605,6 @@ int64_t dsv4_host_swa_block_count(int64_t c128_block_count,
   return host_c128_blocks * blocks_per_checkpoint;
 }
 
-int64_t linear_state_block_count(int64_t kv_block_count,
-                                 int64_t chunk_size,
-                                 int64_t block_size) {
-  CHECK_GT(kv_block_count, 0) << "kv_block_count must be positive.";
-  CHECK_GT(chunk_size, 0) << "chunk_size must be positive.";
-  CHECK_GT(block_size, 0) << "block_size must be positive.";
-  CHECK_EQ(chunk_size % block_size, 0)
-      << "chunk_size must be a multiple of block_size.";
-  const int64_t kv_blocks_per_chunk = chunk_size / block_size;
-  CHECK_GT(kv_blocks_per_chunk, 0);
-  const int64_t linear_blocks = kv_block_count / kv_blocks_per_chunk;
-  CHECK_GT(linear_blocks, 0)
-      << "KV capacity is too small for one linear-state checkpoint: "
-      << "kv_block_count=" << kv_block_count
-      << ", kv_blocks_per_chunk=" << kv_blocks_per_chunk;
-  return linear_blocks;
-}
-
 std::optional<std::string> validate_host_cache_options(
     const HostCacheValidationOptions& options) {
   if (!std::isfinite(options.host_blocks_factor) ||

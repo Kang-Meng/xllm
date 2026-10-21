@@ -1330,18 +1330,45 @@ TEST_F(HostKVCacheConfigTest, AcceptsFractalNzPoolWithoutTransferFolding) {
   EXPECT_FALSE(validate_host_cache_options(options).has_value());
 }
 
-TEST(KVCacheTest, LinearStateCapacityUsesChunkGranularity) {
-  EXPECT_EQ(linear_state_block_count(/*kv_block_count=*/5216,
-                                     /*chunk_size=*/1024,
-                                     /*block_size=*/128),
-            652);
-  EXPECT_EQ(linear_state_block_count(/*kv_block_count=*/5219,
-                                     /*chunk_size=*/1024,
-                                     /*block_size=*/128),
-            652);
+#if !defined(USE_NPU)
+TEST(KVCacheTest, HostLinearCacheUsesKvCountOnPrefillAndTwiceHbmOnDecode) {
+  KVCacheCapacity capacity;
+  capacity.n_blocks(8).block_size(16).num_linear_state_blocks(4);
+  ModelArgs model_args;
+  model_args.model_type("qwen3_5_text")
+      .n_layers(1)
+      .n_heads(2)
+      .n_kv_heads(1)
+      .head_dim(4)
+      .full_attention_interval(2)
+      .linear_conv_kernel_dim(4)
+      .linear_num_key_heads(1)
+      .linear_num_value_heads(1)
+      .linear_key_head_dim(2)
+      .linear_value_head_dim(2);
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+
+  KVCacheCreateOptions prefill_options;
+  prefill_options.device(torch::Device(torch::kCPU))
+      .dtype(torch::kFloat32)
+      .ssm_dtype(torch::kFloat32)
+      .block_size(16)
+      .host_blocks_factor(2.0)
+      .is_decode(false)
+      .model_type("qwen3_5_text");
+  KVCache prefill_cache(
+      shape, prefill_options, BlockType::LINEAR, /*layer_count=*/2);
+  EXPECT_EQ(prefill_cache.get_conv_cache().size(0), 16);
+  EXPECT_EQ(prefill_cache.get_ssm_cache().size(0), 16);
+
+  KVCacheCreateOptions decode_options = prefill_options;
+  decode_options.is_decode(true);
+  KVCache decode_cache(
+      shape, decode_options, BlockType::LINEAR, /*layer_count=*/2);
+  EXPECT_EQ(decode_cache.get_conv_cache().size(0), 8);
+  EXPECT_EQ(decode_cache.get_ssm_cache().size(0), 8);
 }
 
-#if !defined(USE_NPU)
 TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
   torch::Tensor context_tensor;
   if (Platform::is_mlu()) {
@@ -1392,14 +1419,14 @@ TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
 
   ASSERT_TRUE(conv.is_contiguous());
   ASSERT_TRUE(ssm.is_contiguous());
-  EXPECT_EQ(conv.size(0), 8);
+  EXPECT_EQ(conv.size(0), 16);
   EXPECT_EQ(conv.size(1), 2);
 #if defined(USE_MUSA)
   EXPECT_EQ(conv.size(3), 3);
 #else
   EXPECT_EQ(conv.size(2), 3);
 #endif
-  EXPECT_EQ(ssm.size(0), 8);
+  EXPECT_EQ(ssm.size(0), 16);
   EXPECT_EQ(ssm.size(1), 2);
   EXPECT_EQ(ssm.size(2), 1);
 }

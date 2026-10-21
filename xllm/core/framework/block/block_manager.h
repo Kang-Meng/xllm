@@ -104,6 +104,9 @@ class BlockManager {
     // Keep a completed Decode LINEAR checkpoint until the hierarchy pool can
     // pair it with a Host LINEAR destination.
     PROPERTY(bool, preserve_decode_checkpoint) = false;
+    // Decode schedule overlap. The completed LINEAR result sits on the front
+    // block. Overlap off writes that result into the back block.
+    PROPERTY(bool, enable_schedule_overlap) = false;
     // Number of speculative tokens for MTP decode (passed from
     // runtime::Options).
     PROPERTY(uint32_t, num_speculative_tokens) = 0;

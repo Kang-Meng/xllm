@@ -1019,8 +1019,7 @@ Slice<XXH3Key> Sequence::block_hashes(uint32_t block_size) const {
 }
 
 Slice<int32_t> Sequence::hash_tokens(BlockHasherType hasher_type) const {
-  if (block_hash_lookahead(hasher_type) == 0 ||
-      !sequence_params_.enable_schedule_overlap) {
+  if (!sequence_params_.enable_schedule_overlap) {
     return tokens();
   }
   return tokens().slice(

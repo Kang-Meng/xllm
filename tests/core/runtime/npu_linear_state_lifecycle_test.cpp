@@ -77,6 +77,9 @@ StateSnapshot clone_states(const StateSnapshot& states) {
   return snapshot;
 }
 
+// Mirrors copy_linear_state_row: one accepted SSM row, and the conv history
+// starting at that row. The worker passes accepted_row 0 when the batch has
+// no num_accepted_tokens_host.
 void apply_reference(StateSnapshot& states,
                      const ModelInputParams& params,
                      int64_t stride,
@@ -84,6 +87,8 @@ void apply_reference(StateSnapshot& states,
   if (reads_distinct_state) {
     return;
   }
+  constexpr int64_t kAcceptedRow = 0;
+  constexpr int64_t kConvHistoryLen = 3;
   for (size_t row = 0; row < params.embedding.linear_state_ids.size(); ++row) {
     const int32_t write_id = params.embedding.linear_state_ids[row];
     const int32_t read_id = params.embedding.linear_state_read_ids.empty()
@@ -93,11 +98,11 @@ void apply_reference(StateSnapshot& states,
       continue;
     }
     for (LayerState& state : states) {
-      state.conv[write_id].copy_(state.conv[read_id]);
-      for (int64_t checkpoint = 0; checkpoint < stride; ++checkpoint) {
-        state.ssm[write_id * stride + checkpoint].copy_(
-            state.ssm[read_id * stride + checkpoint]);
-      }
+      state.conv[write_id]
+          .narrow(0, kAcceptedRow, kConvHistoryLen)
+          .copy_(state.conv[read_id].narrow(0, kAcceptedRow, kConvHistoryLen));
+      state.ssm[write_id * stride + kAcceptedRow].copy_(
+          state.ssm[read_id * stride + kAcceptedRow]);
     }
   }
 }

@@ -721,7 +721,8 @@ TEST(SchedulerPolicyTest, LinearTailPrefillPreservesKvSplitBoundaries) {
           sequence->update_block_hashes(kEffectiveBlockSize,
                                         BlockHasherType::TEXT);
           const size_t hash_index = cached_tokens / kEffectiveBlockSize - 1;
-          const Slice<XXH3Key> hashes = sequence->block_hashes();
+          const Slice<XXH3Key> hashes =
+              sequence->block_hashes(kEffectiveBlockSize);
           ASSERT_LT(hash_index, hashes.size());
           EXPECT_TRUE(
               XXH3Key(linear_blocks.front().get_immutable_hash_value()) ==

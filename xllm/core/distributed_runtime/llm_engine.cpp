@@ -705,7 +705,8 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_speculative_tokens(options_.num_speculative_tokens())
       .num_embedding_blocks(
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
-      .instance_is_decode(options_.instance_role() == InstanceRole::DECODE);
+      .instance_is_decode(options_.instance_role() == InstanceRole::DECODE)
+      .enable_schedule_overlap(options_.enable_schedule_overlap());
   if (enable_state_cache) {
     // The unified state slot pool spans all physical slots [0, N); it can
     // contain GDN state and KPool tail state.
@@ -810,8 +811,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       std::map<BlockType, uint32_t> host_capacities;
       const int64_t host_kv_block_count = scale_host_block_count(
           kv_cache_cap.n_blocks(), options_.host_blocks_factor());
-      const int64_t chunk_size =
-          SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
       // Hybrid linear-attention models use a flat KV pool plus a separate
       // recurrent-state slot pool.
       if (options.manager_types().empty()) {
@@ -819,10 +818,12 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
                                 static_cast<uint32_t>(host_kv_block_count));
       }
       if (has_gdn_state) {
-        host_capacities.emplace(
-            BlockType::LINEAR,
-            static_cast<uint32_t>(linear_state_block_count(
-                host_kv_block_count, chunk_size, block_size)));
+        int64_t host_linear_blocks = host_kv_block_count;
+        if (options_.instance_role() == InstanceRole::DECODE) {
+          host_linear_blocks = kv_cache_cap.num_linear_state_blocks() * 2;
+        }
+        host_capacities.emplace(BlockType::LINEAR,
+                                static_cast<uint32_t>(host_linear_blocks));
       }
       uint32_t host_c128_blocks = 0;
       if (kv_cache_cap.c128_count() > 0) {

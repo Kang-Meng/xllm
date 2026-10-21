@@ -2468,6 +2468,7 @@ WorkerImpl::create_hierarchy_kv_cache_transfer() {
       .kv_split_rank(parallel_args.kv_split_rank())
       .layers(context_.get_model_args().n_layers())
       .host_blocks_factor(options_.host_blocks_factor())
+      .instance_role(options_.instance_role())
       .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())
       .enable_mla(options_.enable_mla())
       .enable_kvcache_store(options_.enable_kvcache_store())

@@ -63,8 +63,8 @@ TEST(KVCacheStateTest, SparseReplacementSeparatesSharedCountFromCacheCursor) {
       /*num_shared_blocks=*/1,
       /*cache_publish_cursor=*/3);
 
-  EXPECT_EQ(state.shared_blocks_num(BlockType::LINEAR), 1u);
-  EXPECT_EQ(state.num_cached_blocks(BlockType::LINEAR), 3u);
+  EXPECT_EQ(state.shared_blocks_num(BlockType::LINEAR), 0u);
+  EXPECT_EQ(state.num_cached_blocks(BlockType::LINEAR), 0u);
   EXPECT_EQ(state.shared_tokens_num(), 0u);
 }
 

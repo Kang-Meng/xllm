@@ -70,6 +70,7 @@ class HierarchyKVCacheTransfer final {
     PROPERTY(int32_t, kv_split_rank) = 0;
     PROPERTY(uint32_t, layers);
     PROPERTY(double, host_blocks_factor) = 0.0;
+    PROPERTY(InstanceRole, instance_role) = InstanceRole::DEFAULT;
     PROPERTY(uint32_t, layers_wise_copy_batchs) = 1;
     PROPERTY(bool, enable_mla) = false;
     PROPERTY(bool, enable_kvcache_store) = false;

@@ -266,16 +266,19 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
       blocks->size() == 2 &&
       last_decode_step_crosses_checkpoint(*seq, checkpoint_stride);
 
-  if (options_.preserve_decode_checkpoint() && completed_checkpoint) {
-    // HierarchyBlockManagerPool owns the transfer boundary. It moves the
-    // HBM and Host front blocks into an OffloadBlockPair after both tiers
-    // preserve the same logical checkpoint. Hashing happens once at that
-    // ownership boundary.
-    return std::vector<Block>{};
-  }
-
   if (blocks->size() == 2) {
     if (completed_checkpoint) {
+      if (options_.preserve_decode_checkpoint()) {
+        // Host cache is on. collect_offload_pairs runs after allocate and
+        // moves the front slot. Overlap keeps the n-2 result on the front
+        // block, so that slot is already the one to save. Overlap off writes
+        // the previous step into the back block, so swap that block to the
+        // front before collect moves it.
+        if (!options_.enable_schedule_overlap()) {
+          std::iter_swap(blocks->begin(), blocks->begin() + 1);
+        }
+        return std::vector<Block>{};
+      }
       std::vector<Block> to_release;
       to_release.emplace_back(std::move((*blocks)[0]));
       deallocate(std::move(to_release));

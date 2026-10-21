@@ -101,7 +101,9 @@ TEST(SequenceGeneratedTokensTest, IgnoresOverlapFakeTokens) {
   sequence.append_token(Token(-1));
 
   EXPECT_EQ(sequence.generated_tokens_since_latency(), 0u);
-  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 5u);
+  // Each placeholder returns before the cache cursor moves, so two fakes
+  // leave the decode-ready cursor unchanged.
+  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 4u);
 }
 
 TEST(SequenceGeneratedTokensTest, CountsOverlapCommittedTokens) {

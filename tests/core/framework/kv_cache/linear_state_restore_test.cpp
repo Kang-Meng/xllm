@@ -72,7 +72,7 @@ struct LinearStateTestCache {
 LinearStateTestCache make_cache(int64_t num_slots = 4,
                                 int64_t checkpoint_stride = 1) {
   LinearStateTestCache cache;
-  cache.conv_cache = torch::full({num_slots, 2, 3}, 7.0, torch::kFloat32);
+  cache.conv_cache = torch::full({num_slots, 8, 3}, 7.0, torch::kFloat32);
   cache.ssm_cache =
       torch::full({num_slots * checkpoint_stride, 2, 2}, 11.0, torch::kFloat32);
   cache.kv_caches.emplace_back(
@@ -83,7 +83,7 @@ LinearStateTestCache make_cache(int64_t num_slots = 4,
 TEST(LinearStateRestoreTest, PartialLinearCacheLayoutFailsClosed) {
   LinearStateTestCache cache = make_cache();
   cache.kv_caches.emplace_back(LinearAttentionKVCacheTensors{
-      torch::zeros({4, 2, 3}, torch::kFloat32), torch::Tensor()});
+      torch::zeros({4, 8, 3}, torch::kFloat32), torch::Tensor()});
 
   EXPECT_DEATH(restore_linear_state_slot(cache.kv_caches, 2, 1),
                "must provide both conv and ssm caches");
@@ -93,7 +93,7 @@ TEST(LinearStateRestoreTest, EmptySsmCheckpointLayoutFailsClosed) {
   LinearStateTestCache cache = make_cache();
   cache.kv_caches.clear();
   cache.kv_caches.emplace_back(
-      LinearAttentionKVCacheTensors{torch::zeros({4, 2, 3}, torch::kFloat32),
+      LinearAttentionKVCacheTensors{torch::zeros({4, 8, 3}, torch::kFloat32),
                                     torch::zeros({0, 2, 2}, torch::kFloat32)});
 
   EXPECT_DEATH(restore_linear_state_slot(cache.kv_caches, 2, 1),
@@ -103,7 +103,7 @@ TEST(LinearStateRestoreTest, EmptySsmCheckpointLayoutFailsClosed) {
 TEST(LinearStateRestoreTest, RejectsNonDivisibleCheckpointLayout) {
   LinearStateTestCache cache = make_cache();
   cache.kv_caches.emplace_back(
-      LinearAttentionKVCacheTensors{torch::zeros({4, 2, 3}, torch::kFloat32),
+      LinearAttentionKVCacheTensors{torch::zeros({4, 8, 3}, torch::kFloat32),
                                     torch::zeros({5, 2, 2}, torch::kFloat32)});
   EXPECT_DEATH(restore_linear_state_slot(cache.kv_caches, 2, 1),
                "checkpoint layout mismatch");
@@ -112,7 +112,7 @@ TEST(LinearStateRestoreTest, RejectsNonDivisibleCheckpointLayout) {
 TEST(LinearStateRestoreTest, RejectsDifferentLayerSlotCounts) {
   LinearStateTestCache cache = make_cache();
   cache.kv_caches.emplace_back(
-      LinearAttentionKVCacheTensors{torch::zeros({5, 2, 3}, torch::kFloat32),
+      LinearAttentionKVCacheTensors{torch::zeros({5, 8, 3}, torch::kFloat32),
                                     torch::zeros({5, 2, 2}, torch::kFloat32)});
   EXPECT_DEATH(restore_linear_state_slot(cache.kv_caches, 2, 1),
                "slot count must match across layers");
@@ -120,12 +120,12 @@ TEST(LinearStateRestoreTest, RejectsDifferentLayerSlotCounts) {
 
 TEST(LinearStateRestoreTest, CopiesOnlyDestinationAcrossLayers) {
   LinearStateTestCache cache = make_cache(6, 3);
-  cache.conv_cache[1].fill_(19.0);
-  cache.ssm_cache.narrow(0, 3, 3).fill_(23.0);
-  torch::Tensor second_conv = torch::full({6, 2, 3}, 29.0, torch::kFloat32);
+  cache.conv_cache[1][0].fill_(19.0);
+  cache.ssm_cache[3].fill_(23.0);
+  torch::Tensor second_conv = torch::full({6, 8, 3}, 29.0, torch::kFloat32);
   torch::Tensor second_ssm = torch::full({12, 2, 2}, 31.0, torch::kFloat32);
-  second_conv[1].fill_(37.0);
-  second_ssm.narrow(0, 2, 2).fill_(41.0);
+  second_conv[1][0].fill_(37.0);
+  second_ssm[2].fill_(41.0);
   cache.kv_caches.emplace_back();
   cache.kv_caches.emplace_back(
       LinearAttentionKVCacheTensors{second_conv, second_ssm});
@@ -133,11 +133,10 @@ TEST(LinearStateRestoreTest, CopiesOnlyDestinationAcrossLayers) {
   torch::Tensor expected_ssm = cache.ssm_cache.clone();
   torch::Tensor expected_second_conv = second_conv.clone();
   torch::Tensor expected_second_ssm = second_ssm.clone();
-  expected_conv[4].copy_(expected_conv[1]);
-  expected_ssm.narrow(0, 12, 3).copy_(expected_ssm.narrow(0, 3, 3));
-  expected_second_conv[4].copy_(expected_second_conv[1]);
-  expected_second_ssm.narrow(0, 8, 2).copy_(
-      expected_second_ssm.narrow(0, 2, 2));
+  expected_conv[4][0].copy_(expected_conv[1][0]);
+  expected_ssm[12].copy_(expected_ssm[3]);
+  expected_second_conv[4][0].copy_(expected_second_conv[1][0]);
+  expected_second_ssm[8].copy_(expected_second_ssm[2]);
 
   restore_linear_state_slot(cache.kv_caches, 4, 1);
 
@@ -201,16 +200,16 @@ TEST(LinearStateRestoreTest, BatchDirectReadPreservesAllSlots) {
 
 TEST(LinearStateRestoreTest, BatchInPlaceRestoresExpandedMixedRows) {
   LinearStateTestCache cache = make_cache(6, 3);
-  cache.conv_cache[3].fill_(19.0);
-  cache.ssm_cache.narrow(0, 9, 3).fill_(23.0);
-  cache.conv_cache[5].fill_(29.0);
-  cache.ssm_cache.narrow(0, 15, 3).fill_(31.0);
+  cache.conv_cache[3][0].fill_(19.0);
+  cache.ssm_cache[9].fill_(23.0);
+  cache.conv_cache[5][0].fill_(29.0);
+  cache.ssm_cache[15].fill_(31.0);
   torch::Tensor expected_conv = cache.conv_cache.clone();
   torch::Tensor expected_ssm = cache.ssm_cache.clone();
-  expected_conv[1].copy_(expected_conv[3]);
-  expected_conv[4].copy_(expected_conv[5]);
-  expected_ssm.narrow(0, 3, 3).copy_(expected_ssm.narrow(0, 9, 3));
-  expected_ssm.narrow(0, 12, 3).copy_(expected_ssm.narrow(0, 15, 3));
+  expected_conv[1][0].copy_(expected_conv[3][0]);
+  expected_conv[4][0].copy_(expected_conv[5][0]);
+  expected_ssm[3].copy_(expected_ssm[9]);
+  expected_ssm[12].copy_(expected_ssm[15]);
   std::vector<int64_t> validity_mask = {0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1};
 
   restore_linear_state_slots(
@@ -311,7 +310,7 @@ TEST(LinearStateRestoreTest, BatchRejectsMissingCache) {
 TEST(LinearStateRestoreTest, BatchValidatesAllLayersBeforeDirectRead) {
   LinearStateTestCache cache = make_cache();
   cache.kv_caches.emplace_back(
-      LinearAttentionKVCacheTensors{torch::zeros({5, 2, 3}, torch::kFloat32),
+      LinearAttentionKVCacheTensors{torch::zeros({5, 8, 3}, torch::kFloat32),
                                     torch::zeros({5, 2, 2}, torch::kFloat32)});
   std::vector<int64_t> validity_mask = {0};
   EXPECT_DEATH(restore_linear_state_slots(

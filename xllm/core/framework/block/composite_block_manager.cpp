@@ -223,19 +223,24 @@ CompositeBlockManager::LeafMap build_composite_leaves(
   if (options.enable_linear_state()) {
     CHECK_GT(options.linear_state_num_slots(), 0)
         << "linear_state_num_slots must be set when linear state is enabled";
+    // PD Decode HBM never probes LINEAR prefix cache. Prefill follows the
+    // composite switch. Decode Host forces the switch on after this builder
+    // and then selects the KV block size itself.
     const bool linear_prefix_cache = prefix_cache_on && linear_participates;
+    CHECK_GT(options.block_size(), 0u)
+        << "KV block_size must be positive for linear state";
+    // Prefix cache matches on the KV block. Without it, one linear slot
+    // covers the larger of the KV block and the prefill chunk.
     int32_t chunk_stride =
         SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
-    if (linear_prefix_cache) {
-      CHECK_GT(chunk_stride, 0) << "max_tokens_per_chunk_for_prefill must be "
-                                   "positive for linear state prefix cache";
-    } else if (chunk_stride <= 0) {
-      chunk_stride = 1;
+    if (chunk_stride <= 0) {
+      chunk_stride = static_cast<int32_t>(options.block_size());
     }
-    // Use KV block_size as LINEAR checkpoint granularity for tail prefix cache.
     const int32_t linear_block_size =
-        linear_prefix_cache ? static_cast<int32_t>(options.block_size())
-                            : chunk_stride;
+        linear_prefix_cache
+            ? static_cast<int32_t>(options.block_size())
+            : std::max(static_cast<int32_t>(options.block_size()),
+                       chunk_stride);
     BlockManager::Options linear_options = options;
     linear_options.num_blocks(
         static_cast<uint32_t>(options.linear_state_num_slots()));
