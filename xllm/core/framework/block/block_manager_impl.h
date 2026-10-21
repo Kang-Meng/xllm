@@ -104,9 +104,6 @@ class BlockManagerImpl : public BlockManager {
   // to reproduce the base allocate_shared refcount bookkeeping over their own
   // custom probe path. Static-friendly signature keeps callers free of `this`.
   static bool mark_used(std::vector<uint8_t>* usage_ids, int32_t block_id);
-  bool allocate_prefetch_range(Sequence* seq,
-                               size_t num_tokens,
-                               size_t required_begin_block);
 
  private:
   // check if has enough slots, if not, try to evict some blocks

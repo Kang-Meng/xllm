@@ -200,22 +200,25 @@ TEST(SequenceMtpPrefixCacheTest, BoundaryRewriteInvalidatesEveryStride) {
   std::vector<int32_t> tokens(65, 7);
   Sequence sequence = make_mtp_sequence(tokens);
   sequence.update_block_hashes(/*block_size=*/16, BlockHasherType::MTP_TEXT);
-  ASSERT_EQ(sequence.block_hashes().size(), 4u);
-  const XXH3Key first_hash = sequence.block_hashes()[0];
+  ASSERT_EQ(sequence.block_hashes(16).size(), 4u);
+  const XXH3Key first_hash = sequence.block_hashes(16)[0];
   sequence.update_block_hashes(/*block_size=*/32, BlockHasherType::MTP_TEXT);
-  ASSERT_EQ(sequence.block_hashes().size(), 2u);
+  ASSERT_EQ(sequence.block_hashes(32).size(), 2u);
 
   sequence.update_token(/*index=*/32, Token(8));
-  EXPECT_TRUE(sequence.block_hashes().empty());
+  // MTP hashes look one token ahead, so rewriting token 32 also drops the
+  // stride-16 block that ends at token 32.
+  EXPECT_EQ(sequence.block_hashes(16).size(), 1u);
+  EXPECT_TRUE(sequence.block_hashes(32).empty());
   tokens[32] = 8;
   Sequence fresh = make_mtp_sequence(tokens);
   for (uint32_t stride : {16u, 32u}) {
     sequence.update_block_hashes(stride, BlockHasherType::MTP_TEXT);
     fresh.update_block_hashes(stride, BlockHasherType::MTP_TEXT);
-    EXPECT_TRUE(sequence.block_hashes() == fresh.block_hashes());
+    EXPECT_TRUE(sequence.block_hashes(stride) == fresh.block_hashes(stride));
   }
   sequence.update_block_hashes(/*block_size=*/16, BlockHasherType::MTP_TEXT);
-  EXPECT_EQ(sequence.block_hashes()[0], first_hash);
+  EXPECT_EQ(sequence.block_hashes(16)[0], first_hash);
 }
 
 TEST(SequenceMtpPrefixCacheTest, OverlapPlaceholdersNeverEnterHashChain) {
@@ -224,10 +227,10 @@ TEST(SequenceMtpPrefixCacheTest, OverlapPlaceholdersNeverEnterHashChain) {
   sequence.kv_state().set_kv_cache_tokens_num(16);
   sequence.append_token(Token(-1));
   sequence.update_block_hashes(/*block_size=*/16, BlockHasherType::MTP_TEXT);
-  EXPECT_TRUE(sequence.block_hashes().empty());
+  EXPECT_TRUE(sequence.block_hashes(16).empty());
   sequence.update_last_step_token(Token(8), /*token_offset=*/0);
   sequence.update_block_hashes(/*block_size=*/16, BlockHasherType::MTP_TEXT);
-  EXPECT_EQ(sequence.block_hashes().size(), 1u);
+  EXPECT_EQ(sequence.block_hashes(16).size(), 1u);
 }
 
 TEST(SequenceMtpPrefixCacheTest, CopyRetainsMtpInvalidationPolicy) {
@@ -236,15 +239,15 @@ TEST(SequenceMtpPrefixCacheTest, CopyRetainsMtpInvalidationPolicy) {
   source.update_block_hashes(/*block_size=*/16, BlockHasherType::MTP_TEXT);
   Sequence copy(source);
   copy.update_token(/*index=*/16, Token(8));
-  EXPECT_TRUE(copy.block_hashes().empty());
-  EXPECT_EQ(source.block_hashes().size(), 2u);
+  EXPECT_TRUE(copy.block_hashes(16).empty());
+  EXPECT_EQ(source.block_hashes(16).size(), 2u);
 
   Sequence ordinary = make_mtp_sequence(tokens);
   ordinary.update_block_hashes(/*block_size=*/16, BlockHasherType::TEXT);
-  const XXH3Key first = ordinary.block_hashes()[0];
+  const XXH3Key first = ordinary.block_hashes(16)[0];
   ordinary.update_token(/*index=*/16, Token(8));
-  ASSERT_EQ(ordinary.block_hashes().size(), 1u);
-  EXPECT_EQ(ordinary.block_hashes()[0], first);
+  ASSERT_EQ(ordinary.block_hashes(16).size(), 1u);
+  EXPECT_EQ(ordinary.block_hashes(16)[0], first);
 }
 
 TEST(CompositeMtpPrefixCacheTest, PublishesCompletedKvWithConfirmedLookahead) {
@@ -408,6 +411,59 @@ TEST(CompositeMtpPrefixCacheTest, NeverPublishesOverlapPlaceholderIdentity) {
   manager.deallocate_for_sequence(&sequence);
 }
 
+// DFlash overlap uses the TEXT hasher. A placeholder sitting in tokens_ must
+// not enter a published block. After the real id is committed, a fresh
+// sequence of the same ids matches past the prompt boundary.
+TEST(CompositeMtpPrefixCacheTest, TextOverlapHashStopsBeforePlaceholder) {
+  BlockManager::Options options;
+  options.num_blocks(32).block_size(4).enable_prefix_cache(true).hasher_type(
+      BlockHasherType::TEXT);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+
+  const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+  Sequence sequence = make_mtp_sequence(prompt, /*overlap=*/true);
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, /*num_tokens=*/8));
+  sequence.kv_state().set_kv_cache_tokens_num(prompt.size());
+  sequence.append_token(Token(-1));
+  EXPECT_EQ(sequence.hash_tokens(BlockHasherType::TEXT).size(), prompt.size());
+  manager.cache_for_sequence(&sequence);
+  EXPECT_EQ(manager.num_blocks_in_prefix_cache(), 1u);
+
+  // Each incr is the forward that writes the token still held as a placeholder.
+  // The following update commits the real id. A trailing placeholder stays out
+  // of the hash.
+  sequence.kv_state().incr_kv_cache_tokens_num(1);
+  sequence.update_last_step_token(Token(9), /*token_offset=*/0);
+  sequence.append_token(Token(-1));
+  sequence.kv_state().incr_kv_cache_tokens_num(1);
+  sequence.update_last_step_token(Token(10), /*token_offset=*/0);
+  sequence.append_token(Token(-1));
+  sequence.kv_state().incr_kv_cache_tokens_num(1);
+  sequence.update_last_step_token(Token(11), /*token_offset=*/0);
+  sequence.append_token(Token(-1));
+  ASSERT_EQ(sequence.hash_tokens(BlockHasherType::TEXT).size(), 8u);
+  ASSERT_EQ(sequence.num_tokens(), 9u);
+  ASSERT_EQ(sequence.kv_cache_tokens_num(), 8u);
+  manager.cache_for_sequence(&sequence);
+  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::KV), 2u)
+      << "hash=" << sequence.hash_tokens(BlockHasherType::TEXT).size()
+      << " kv=" << sequence.kv_cache_tokens_num() << " cached_blocks="
+      << sequence.kv_state().num_cached_blocks(BlockType::KV)
+      << " prefix=" << manager.num_blocks_in_prefix_cache();
+
+  // One token past the published prefix. An exact-length replay drops the
+  // last block so the model still has a token to compute; a later prefill is
+  // longer than the cached span.
+  std::vector<int32_t> replay = prompt;
+  replay.insert(replay.end(), {9, 10, 11, 12});
+  Sequence later = make_mtp_sequence(replay, /*overlap=*/false);
+  manager.allocate_shared_for_sequence(&later);
+  EXPECT_GT(later.kv_cache_tokens_num(), prompt.size());
+  EXPECT_EQ(later.kv_cache_tokens_num(), 8u);
+  manager.deallocate_for_sequence(&later);
+  manager.deallocate_for_sequence(&sequence);
+}
+
 TEST(HierarchyMtpPrefixCacheTest, RestoresEveryBlockProvenByStoreHash) {
   CacheTransferEngine engine;
   HierarchyBlockManagerPool pool(hierarchy_mtp_options(), &engine);
@@ -517,8 +573,9 @@ TEST(TypedMtpPrefixCacheTest, DecodeOffloadUsesConfirmedMtpIdentity) {
             unit_tokens + 1);
   sequence.update_block_hashes(options.block_size(), BlockHasherType::MTP_TEXT);
   const size_t swa_blocks = unit_tokens / options.block_size();
-  ASSERT_EQ(sequence.block_hashes().size(), swa_blocks);
-  const XXH3Key expected_hash = sequence.block_hashes()[swa_blocks - 1];
+  ASSERT_EQ(sequence.block_hashes(options.block_size()).size(), swa_blocks);
+  const XXH3Key expected_hash =
+      sequence.block_hashes(options.block_size())[swa_blocks - 1];
   pool.deallocate(&sequence);
   pool.transfer_blocks();
   ASSERT_EQ(engine.offloads().size(), 4u);
@@ -550,8 +607,8 @@ TEST(TypedPrefixCacheTest, DecodeOffloadUsesContentIdentityWithoutDeviceStamp) {
         ->back()
         .set_hash_value(unstamped_hash.data());
     sequence.update_block_hashes(options.block_size(), BlockHasherType::TEXT);
-    const XXH3Key expected_hash =
-        sequence.block_hashes()[unit_tokens / options.block_size() - 1];
+    const XXH3Key expected_hash = sequence.block_hashes(
+        options.block_size())[unit_tokens / options.block_size() - 1];
     EXPECT_NE(expected_hash, previous_hash);
     pool.deallocate(&sequence);
     pool.transfer_blocks();
@@ -578,7 +635,7 @@ TEST(HierarchyMtpPrefixCacheTest,
   const XXH3Key device_hash(
       sequence.kv_state().blocks(BlockType::KV)[0].get_immutable_hash_value());
   sequence.update_block_hashes(/*block_size=*/16, BlockHasherType::MTP_TEXT);
-  EXPECT_EQ(device_hash, sequence.block_hashes()[0]);
+  EXPECT_EQ(device_hash, sequence.block_hashes(16)[0]);
   pool.deallocate(&sequence);
   pool.transfer_blocks();
   ASSERT_EQ(engine.offloads().size(), 1u);

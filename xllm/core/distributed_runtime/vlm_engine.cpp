@@ -383,7 +383,8 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .model_type(args_.model_type())
       .num_embedding_blocks(
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
-      .instance_is_decode(options_.instance_role() == InstanceRole::DECODE);
+      .instance_is_decode(options_.instance_role() == InstanceRole::DECODE)
+      .enable_schedule_overlap(options_.enable_schedule_overlap());
   if (enable_state_cache) {
     // The unified state slot pool spans all physical slots [0, N); it can
     // contain GDN state and KPool tail state.

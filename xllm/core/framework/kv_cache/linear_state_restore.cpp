@@ -61,24 +61,53 @@ int32_t discover_num_slots(const std::vector<KVCache>& kv_caches) {
   return num_slots;
 }
 
+void copy_kpool_tail(const KVCache& kv_cache,
+                     int32_t write_id,
+                     int32_t read_id) {
+  const torch::Tensor kpool_tail = kv_cache.get_kpool_tail();
+  if (!kpool_tail.defined()) {
+    return;
+  }
+  kpool_tail.select(0, write_id).copy_(kpool_tail.select(0, read_id));
+}
+
+void copy_linear_state_row(const KVCache& kv_cache,
+                           int32_t write_id,
+                           int32_t read_id,
+                           int32_t accepted_row,
+                           int64_t conv_history_len) {
+  copy_kpool_tail(kv_cache, write_id, read_id);
+  const torch::Tensor conv_cache = kv_cache.get_conv_cache();
+  const torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
+  if (!conv_cache.defined()) {
+    return;
+  }
+  const int64_t stride = ssm_cache.size(0) / conv_cache.size(0);
+  CHECK_GE(accepted_row, 0);
+  CHECK_LT(accepted_row, stride)
+      << "accepted linear-state row exceeds the SSM checkpoint stride";
+  ssm_cache[static_cast<int64_t>(write_id) * stride + accepted_row].copy_(
+      ssm_cache[static_cast<int64_t>(read_id) * stride + accepted_row]);
+
+  const int64_t history_len =
+      conv_history_len > 0 ? conv_history_len : conv_cache.size(1);
+  CHECK_LE(accepted_row + history_len, conv_cache.size(1))
+      << "accepted linear-state row exceeds the conv history";
+  conv_cache.select(0, write_id)
+      .narrow(0, accepted_row, history_len)
+      .copy_(
+          conv_cache.select(0, read_id).narrow(0, accepted_row, history_len));
+}
+
 void copy_linear_state_slot(std::vector<KVCache>& kv_caches,
                             int32_t write_id,
                             int32_t read_id) {
   for (const KVCache& kv_cache : kv_caches) {
-    const torch::Tensor kpool_tail = kv_cache.get_kpool_tail();
-    const torch::Tensor conv_cache = kv_cache.get_conv_cache();
-    const torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
-    if (kpool_tail.defined()) {
-      kpool_tail.select(0, write_id).copy_(kpool_tail.select(0, read_id));
-    }
-    if (!conv_cache.defined()) {
-      continue;
-    }
-    const int64_t stride = ssm_cache.size(0) / conv_cache.size(0);
-    conv_cache.select(0, write_id).copy_(conv_cache.select(0, read_id));
-    ssm_cache.narrow(0, static_cast<int64_t>(write_id) * stride, stride)
-        .copy_(ssm_cache.narrow(
-            0, static_cast<int64_t>(read_id) * stride, stride));
+    copy_linear_state_row(kv_cache,
+                          write_id,
+                          read_id,
+                          /*accepted_row=*/0,
+                          /*conv_history_len=*/0);
   }
 }
 
@@ -126,7 +155,9 @@ void restore_linear_state_slots(std::vector<KVCache>& kv_caches,
                                 const std::vector<int32_t>& write_ids,
                                 const std::vector<int32_t>& read_ids,
                                 std::vector<int64_t>& validity_mask,
-                                bool reads_distinct_state) {
+                                bool reads_distinct_state,
+                                const std::vector<int32_t>& accepted_rows,
+                                int64_t conv_history_len) {
   if (write_ids.empty() || validity_mask.empty()) {
     return;
   }
@@ -134,6 +165,10 @@ void restore_linear_state_slots(std::vector<KVCache>& kv_caches,
   const auto& source_ids = read_ids.empty() ? write_ids : read_ids;
   CHECK_EQ(source_ids.size(), write_ids.size())
       << "linear-state read/write rows must match";
+  if (!accepted_rows.empty()) {
+    CHECK_EQ(accepted_rows.size(), write_ids.size())
+        << "accepted linear-state rows must match the slot rows";
+  }
   CHECK_GE(validity_mask.size(), write_ids.size())
       << "linear-state validity mask must cover every logical row";
   CHECK_EQ(validity_mask.size() % write_ids.size(), 0u)
@@ -180,7 +215,15 @@ void restore_linear_state_slots(std::vector<KVCache>& kv_caches,
       continue;
     }
     if (!reads_distinct_state) {
-      copy_linear_state_slot(kv_caches, write_ids[row], source_ids[row]);
+      const int32_t accepted_row =
+          accepted_rows.empty() ? 0 : accepted_rows[row];
+      for (const KVCache& kv_cache : kv_caches) {
+        copy_linear_state_row(kv_cache,
+                              write_ids[row],
+                              source_ids[row],
+                              accepted_row,
+                              conv_history_len);
+      }
     }
     std::fill(mask_begin, mask_end, 1);
   }

@@ -105,82 +105,63 @@ bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
   const size_t block_size = options_.block_size();
   CHECK_GT(block_size, 0u);
   const size_t target_blocks = num_tokens / block_size;
-  size_t checkpoint_span_blocks = 1;
-  size_t checkpoint_window_blocks = 1;
-  for (uint32_t compress_ratio : options_.compress_ratios()) {
-    if (compress_ratio == kDsv4C128CompressRatio) {
-      const int64_t compressed_unit_tokens = KVCacheConfig::get_instance()
-                                                 .dsv4_cache_geometry()
-                                                 .compressed_block_token_size();
-      CHECK_GT(compressed_unit_tokens, 0);
-      CHECK_EQ(compressed_unit_tokens % block_size, 0);
-      checkpoint_span_blocks =
-          static_cast<size_t>(compressed_unit_tokens / block_size);
-      checkpoint_window_blocks = std::min<size_t>(
-          checkpoint_span_blocks, options_.swa_blocks_per_seq());
-      break;
-    }
+  const size_t cached_blocks =
+      seq->host_kv_state().num_cached_blocks(BlockType::SWA);
+  CHECK_LT(cached_blocks, target_blocks);
+
+  const int64_t compressed_unit_tokens = KVCacheConfig::get_instance()
+                                             .dsv4_cache_geometry()
+                                             .compressed_block_token_size();
+  CHECK_GT(compressed_unit_tokens, 0);
+  CHECK_EQ(compressed_unit_tokens % block_size, 0);
+  const size_t blocks_per_unit =
+      static_cast<size_t>(compressed_unit_tokens / block_size);
+  const size_t valid_per_unit =
+      static_cast<size_t>(options_.swa_blocks_per_seq());
+  const size_t placeholders_per_unit = blocks_per_unit - valid_per_unit;
+  // Host admission ends on a compressed-unit boundary, and the prefetch target
+  // does too, so the tail is a whole number of units.
+  CHECK_EQ(cached_blocks % blocks_per_unit, 0u);
+  CHECK_EQ(target_blocks % blocks_per_unit, 0u);
+  const size_t units = (target_blocks - cached_blocks) / blocks_per_unit;
+  const size_t needed = units * valid_per_unit;
+
+  std::vector<Block> allocated = allocate(needed);
+  if (allocated.empty()) {
+    allocated = allocate(std::min(needed, num_free_blocks()));
   }
 
   KVCacheState& host_state = seq->host_kv_state();
-  const size_t cached_cursor =
-      std::min(host_state.num_cached_blocks(BlockType::SWA), target_blocks);
-  const size_t shared_blocks = host_state.shared_blocks_num(BlockType::SWA);
-  std::vector<Block> old = host_state.take_blocks(BlockType::SWA);
-  old.resize(target_blocks);
-
-  std::vector<Block> blocks(target_blocks);
-  std::vector<Block> dropped;
-  dropped.reserve(old.size());
-  auto is_checkpoint = [checkpoint_span_blocks,
-                        checkpoint_window_blocks](size_t index) {
-    return index % checkpoint_span_blocks >=
-           checkpoint_span_blocks - checkpoint_window_blocks;
-  };
-  for (size_t index = 0; index < old.size(); ++index) {
-    if (!old[index].is_valid()) {
-      continue;
+  std::vector<Block> blocks = host_state.take_blocks(BlockType::SWA);
+  CHECK_EQ(blocks.size(), cached_blocks);
+  blocks.reserve(cached_blocks + units * blocks_per_unit);
+  size_t used = 0;
+  for (size_t unit = 0; unit < units && used < allocated.size(); ++unit) {
+    blocks.resize(blocks.size() + placeholders_per_unit);
+    const size_t take = std::min(valid_per_unit, allocated.size() - used);
+    for (size_t index = 0; index < take; ++index) {
+      blocks.emplace_back(std::move(allocated[used + index]));
     }
-    // Keep the window tail at each compressed boundary. Existing prefix
-    // probes may be dense, so collapse them before adding Store destinations.
-    if (is_checkpoint(index)) {
-      blocks[index] = std::move(old[index]);
-    } else {
-      dropped.emplace_back(std::move(old[index]));
-    }
+    used += take;
   }
-  if (!dropped.empty()) {
-    deallocate(std::move(dropped));
-  }
+  allocated.clear();
 
   seq->update_block_hashes(static_cast<uint32_t>(block_size),
                            options_.hasher_type());
-  const Slice<XXH3Key> hashes = seq->block_hashes();
-  CHECK_GE(hashes.size(), target_blocks);
-  std::vector<size_t> missing;
-  for (size_t index = cached_cursor; index < target_blocks; ++index) {
-    if (is_checkpoint(index) && !blocks[index].is_valid()) {
-      missing.emplace_back(index);
+  const Slice<XXH3Key> hashes =
+      seq->block_hashes(static_cast<uint32_t>(block_size));
+  CHECK_GE(hashes.size(), blocks.size());
+  for (size_t index = cached_blocks; index < blocks.size(); ++index) {
+    if (!blocks[index].is_valid()) {
+      continue;
     }
-  }
-
-  const size_t allocatable = std::min(
-      missing.size(), num_free_blocks() + num_blocks_in_prefix_cache());
-  std::vector<Block> allocated = allocate(allocatable);
-  if (allocated.empty() && allocatable > 0) {
-    allocated = allocate(std::min(missing.size(), num_free_blocks()));
-  }
-  for (size_t i = 0; i < allocated.size(); ++i) {
-    allocated[i].set_hash_value(hashes[missing[i]].data);
-    blocks[missing[i]] = std::move(allocated[i]);
+    blocks[index].set_hash_value(hashes[index].data);
   }
   if (!blocks.empty()) {
-    host_state.replace_composite_blocks(BlockType::SWA,
-                                        std::move(blocks),
-                                        std::min(shared_blocks, target_blocks),
-                                        target_blocks);
+    host_state.replace_composite_blocks(
+        BlockType::SWA, std::move(blocks), cached_blocks, cached_blocks);
   }
-  return allocated.size() == missing.size();
+  return used == needed;
 }
 
 void SlidingWindowBlockManager::trim_prefetch_blocks(Sequence* seq,
@@ -211,7 +192,8 @@ void SlidingWindowBlockManager::trim_prefetch_blocks(Sequence* seq,
   std::vector<Block> published;
   seq->update_block_hashes(static_cast<uint32_t>(block_size()),
                            options_.hasher_type());
-  const Slice<XXH3Key> hashes = seq->block_hashes();
+  const Slice<XXH3Key> hashes =
+      seq->block_hashes(static_cast<uint32_t>(block_size()));
   for (size_t index = window_begin; index < keep; ++index) {
     if (!blocks[index].is_valid()) {
       continue;

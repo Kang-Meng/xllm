@@ -69,6 +69,7 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       .linear_state_num_slots(options_.linear_state_num_slots())
       .preserve_decode_checkpoint(options_.enable_host_offload() &&
                                   has_host_linear_destination)
+      .enable_schedule_overlap(options_.enable_schedule_overlap())
       .num_speculative_tokens(options_.num_speculative_tokens())
       .instance_is_decode(options_.instance_is_decode());
 

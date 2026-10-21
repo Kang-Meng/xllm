@@ -40,6 +40,14 @@ limitations under the License.
 
 namespace xllm {
 
+// AUTOMATIC publishes a completed block during allocation. EXPLICIT waits for
+// an explicit cache() call. Host uses EXPLICIT so a D2H copy becomes visible
+// only after the transfer succeeds.
+enum class PrefixCachePublishMode : int8_t {
+  AUTOMATIC,
+  EXPLICIT,
+};
+
 class BlockManager {
  public:
   struct Options {
@@ -96,6 +104,9 @@ class BlockManager {
     // Keep a completed Decode LINEAR checkpoint until the hierarchy pool can
     // pair it with a Host LINEAR destination.
     PROPERTY(bool, preserve_decode_checkpoint) = false;
+    // Decode schedule overlap. The completed LINEAR result sits on the front
+    // block. Overlap off writes that result into the back block.
+    PROPERTY(bool, enable_schedule_overlap) = false;
     // Number of speculative tokens for MTP decode (passed from
     // runtime::Options).
     PROPERTY(uint32_t, num_speculative_tokens) = 0;
@@ -105,6 +116,10 @@ class BlockManager {
     // future host offload participation -- see
     // leaf_participates_in_prefix_cache in composite_block_manager.cpp.
     PROPERTY(bool, instance_is_decode) = false;
+    // AUTOMATIC publishes a completed LINEAR read source during allocation.
+    // EXPLICIT waits for cache(). Host uses EXPLICIT.
+    PROPERTY(PrefixCachePublishMode,
+             prefix_cache_publish_mode) = PrefixCachePublishMode::AUTOMATIC;
   };
 
   explicit BlockManager(Options options) : options_(options) {}

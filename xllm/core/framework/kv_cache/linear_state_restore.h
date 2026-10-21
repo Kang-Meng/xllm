@@ -37,6 +37,8 @@ void restore_linear_state_slots(std::vector<KVCache>& kv_caches,
                                 const std::vector<int32_t>& write_ids,
                                 const std::vector<int32_t>& read_ids,
                                 std::vector<int64_t>& validity_mask,
-                                bool reads_distinct_state);
+                                bool reads_distinct_state,
+                                const std::vector<int32_t>& accepted_rows = {},
+                                int64_t conv_history_len = 0);
 
 }  // namespace xllm

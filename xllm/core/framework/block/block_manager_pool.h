@@ -82,6 +82,9 @@ class BlockManagerPool : public KVCacheManager {
     // cache participation goes through the shared predicate (see
     // composite_block_manager.cpp::leaf_participates_in_prefix_cache).
     PROPERTY(bool, instance_is_decode) = false;
+    // Decode schedule overlap. Forwarded to every composite leaf. LINEAR
+    // uses it to decide which slot holds the completed checkpoint.
+    PROPERTY(bool, enable_schedule_overlap) = false;
   };
 
   explicit BlockManagerPool(const Options& options, int32_t dp_size = 1);

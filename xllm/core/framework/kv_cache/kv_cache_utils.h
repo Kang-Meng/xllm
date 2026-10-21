@@ -100,6 +100,7 @@ struct KVCacheCreateOptions {
 
   // DeepSeek V4 cache allocation metadata.
   PROPERTY(int64_t, block_size) = 0;
+  PROPERTY(bool, is_decode) = false;
   PROPERTY(int64_t, head_dim) = 0;
   PROPERTY(int64_t, index_head_dim) = 0;
   PROPERTY(int64_t, window_size) = 0;
@@ -240,13 +241,6 @@ int64_t dsv4_host_swa_block_count(int64_t c128_block_count,
                                   double host_blocks_factor,
                                   int64_t window_size,
                                   int64_t block_size);
-
-// Convert a KV block capacity into logical linear-state checkpoint slots.
-// Each slot covers one prefill chunk, which contains chunk_size / block_size
-// KV blocks.
-int64_t linear_state_block_count(int64_t kv_block_count,
-                                 int64_t chunk_size,
-                                 int64_t block_size);
 
 // Return an actionable error for an unsupported host prefix-cache
 // configuration, or std::nullopt when the configuration is valid.

@@ -29,23 +29,6 @@ namespace xllm {
 
 namespace {
 
-BlockManager::Options make_linear_state_options(
-    uint32_t num_slots,
-    int32_t chunk_stride,
-    bool enable_prefix_cache,
-    bool instance_is_decode,
-    uint32_t num_speculative_tokens) {
-  BlockManager::Options options;
-  options.num_blocks(num_slots);
-  options.block_size(chunk_stride);
-  options.enable_prefix_cache(enable_prefix_cache);
-  options.enable_disagg_pd(false);
-  options.block_type(BlockType::LINEAR);
-  options.instance_is_decode(instance_is_decode);
-  options.num_speculative_tokens(num_speculative_tokens);
-  return options;
-}
-
 bool crosses_checkpoint(size_t begin, size_t end, size_t checkpoint_stride) {
   CHECK_LE(begin, end);
   CHECK_GT(checkpoint_stride, 0u);
@@ -64,41 +47,28 @@ std::optional<size_t> last_decode_step_checkpoint_row(
     const Sequence& sequence,
     size_t checkpoint_stride) {
   CHECK_GT(checkpoint_stride, 0u);
-  const size_t confirmed_tokens = sequence.last_confirmed_cached_tokens_num();
+  // HBM cache only. Host cache is a separate tier and does not decide the
+  // decode checkpoint row.
+  const size_t cached_tokens = sequence.kv_state().kv_cache_tokens_num();
   const size_t accepted_length = sequence.accepted_length();
-  // accepted_length is the maximum accepted draft offset. The preceding bonus
-  // token also advances the recurrent cache, so the confirmed span is one
-  // larger than that offset.
-  if (confirmed_tokens <= accepted_length) {
+  if (cached_tokens <= accepted_length + 1) {
     return std::nullopt;
   }
-  const size_t confirmed_span = accepted_length + 1;
-  const size_t begin = confirmed_tokens - confirmed_span;
-  if (!crosses_checkpoint(begin, confirmed_tokens, checkpoint_stride)) {
+  const size_t begin = cached_tokens - accepted_length - 1;
+  if (!crosses_checkpoint(begin, cached_tokens, checkpoint_stride)) {
     return std::nullopt;
   }
-  const size_t checkpoint_tokens =
-      (confirmed_tokens / checkpoint_stride) * checkpoint_stride;
-  CHECK_GT(checkpoint_tokens, begin);
-  return checkpoint_tokens - begin - 1;
+  return accepted_length;
 }
 
-LinearStateBlockManager::LinearStateBlockManager(
-    uint32_t num_slots,
-    int32_t chunk_stride,
-    bool enable_prefix_cache,
-    bool instance_is_decode,
-    uint32_t num_speculative_tokens,
-    bool preserve_decode_checkpoint)
-    : BlockManagerImpl(make_linear_state_options(num_slots,
-                                                 chunk_stride,
-                                                 enable_prefix_cache,
-                                                 instance_is_decode,
-                                                 num_speculative_tokens)),
-      preserve_decode_checkpoint_(preserve_decode_checkpoint) {
-  CHECK_GT(num_slots, 1u)
+LinearStateBlockManager::LinearStateBlockManager(const Options& options)
+    : BlockManagerImpl(([](Options linear_options) {
+        linear_options.block_type(BlockType::LINEAR);
+        return linear_options;
+      })(options)) {
+  CHECK_GT(options_.num_blocks(), 1u)
       << "linear-state leaf needs at least one usable slot (plus padding)";
-  CHECK_GT(chunk_stride, 0)
+  CHECK_GT(options_.block_size(), 0)
       << "linear-state leaf needs a positive chunk stride";
 }
 
@@ -123,84 +93,25 @@ bool LinearStateBlockManager::allocate_for_prefetch(Sequence* seq,
 
   KVCacheState& host_state = seq->host_kv_state();
   const size_t target_blocks = num_tokens / block_size();
-  const size_t cached_blocks = host_state.num_cached_blocks(BlockType::LINEAR);
-  const size_t shared_blocks = host_state.shared_blocks_num(BlockType::LINEAR);
-  const size_t cursor = std::min(cached_blocks, target_blocks);
-  const bool source_in_target =
-      cached_blocks > 0 && cached_blocks <= target_blocks;
+  const size_t matched_blocks = host_state.kv_cache_tokens_num() / block_size();
+  // The caller only reaches here when the host hit is shorter than the target.
+  CHECK_LT(matched_blocks, target_blocks);
 
-  std::vector<Block> old_blocks = host_state.take_blocks(BlockType::LINEAR);
-  // The vector is indexed by logical checkpoint, while only the deepest
-  // matched checkpoint has a physical source after prefix-cache admission.
-  // Keep the earlier positions as invalid placeholders so Store transfers and
-  // restore selection continue to use absolute checkpoint indices.
-  std::vector<Block> blocks(target_blocks);
-  Block source;
-  if (source_in_target) {
-    for (size_t index = std::min(cached_blocks, old_blocks.size()); index > 0;
-         --index) {
-      Block& candidate = old_blocks[index - 1];
-      if (candidate.is_valid()) {
-        source = std::move(candidate);
-        break;
-      }
-    }
+  std::vector<Block> blocks = host_state.take_blocks(BlockType::LINEAR);
+  if (matched_blocks == 0) {
+    CHECK(blocks.empty());
+  } else {
+    // Host admission keeps one restore source. Place matched_blocks - 1
+    // invalid placeholders before it, then let the base fill the tail.
+    CHECK_EQ(blocks.size(), 1u);
+    CHECK(blocks.front().is_valid());
+    blocks.insert(blocks.begin(), matched_blocks - 1, Block());
+    host_state.replace_composite_blocks(BlockType::LINEAR,
+                                        std::move(blocks),
+                                        /*num_shared_blocks=*/0,
+                                        /*cache_publish_cursor=*/0);
   }
-  std::vector<Block> dropped;
-  dropped.reserve(old_blocks.size());
-  for (size_t index = 0; index < old_blocks.size(); ++index) {
-    Block& block = old_blocks[index];
-    if (!block.is_valid()) {
-      continue;
-    }
-    if (index >= cursor && index < target_blocks) {
-      blocks[index] = std::move(block);
-    } else {
-      dropped.emplace_back(std::move(block));
-    }
-  }
-  if (!dropped.empty()) {
-    deallocate(std::move(dropped));
-  }
-
-  const bool has_source = source_in_target && source.is_valid();
-  if (has_source) {
-    blocks[cached_blocks - 1] = std::move(source);
-  }
-
-  seq->update_linear_state_hashes(static_cast<uint32_t>(block_size()));
-  const Slice<XXH3Key> hashes = seq->linear_state_hashes();
-  CHECK_GE(hashes.size(), target_blocks);
-
-  std::vector<size_t> missing;
-  missing.reserve(target_blocks > cursor ? target_blocks - cursor : 0);
-  for (size_t index = cursor; index < target_blocks; ++index) {
-    if (!blocks[index].is_valid()) {
-      missing.emplace_back(index);
-    }
-  }
-
-  size_t allocatable = std::min(
-      missing.size(), num_free_blocks() + num_blocks_in_prefix_cache());
-  std::vector<Block> allocated = allocate(allocatable);
-  if (allocated.empty() && allocatable > 0) {
-    allocatable = std::min(missing.size(), num_free_blocks());
-    allocated = allocate(allocatable);
-  }
-  for (size_t index = 0; index < allocated.size(); ++index) {
-    const size_t block_index = missing[index];
-    allocated[index].set_hash_value(hashes[block_index].data);
-    blocks[block_index] = std::move(allocated[index]);
-  }
-
-  if (!blocks.empty()) {
-    host_state.replace_composite_blocks(
-        BlockType::LINEAR,
-        std::move(blocks),
-        has_source ? std::min(shared_blocks, target_blocks) : 0,
-        cursor);
-  }
-  return allocated.size() == missing.size();
+  return BlockManagerImpl::allocate_for_prefetch(seq, num_tokens);
 }
 
 void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
@@ -270,8 +181,10 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
   // chained key. Publish through a sparse logical vector, then collapse the
   // sequence-owned view to the single restore source required by Linear
   // runtime allocation.
-  seq->update_linear_state_hashes(static_cast<uint32_t>(block_size()));
-  const Slice<XXH3Key> hashes = seq->linear_state_hashes();
+  seq->update_block_hashes(static_cast<uint32_t>(block_size()),
+                           options_.hasher_type());
+  const Slice<XXH3Key> hashes =
+      seq->block_hashes(static_cast<uint32_t>(block_size()));
   CHECK_GT(hashes.size(), source_index);
   std::vector<Block> publish(source_index + 1);
   publish[source_index] = source;
@@ -285,67 +198,16 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
   retained[0] = std::move(source);
   host_state.replace_composite_blocks(BlockType::LINEAR,
                                       std::move(retained),
-                                      /*num_shared_blocks=*/1,
-                                      /*cache_publish_cursor=*/1);
-}
-
-void LinearStateBlockManager::retain_read_source(KVCacheState& kv_state) {
-  std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::LINEAR);
-  if (blocks->empty()) {
-    return;
-  }
-  CHECK(blocks->back().is_valid());
-  const bool shared_source =
-      kv_state.shared_blocks_num(BlockType::LINEAR) == blocks->size();
-  const size_t keep_begin = blocks->size() - 1;
-  std::vector<Block> to_release;
-  to_release.reserve(keep_begin);
-  for (size_t i = 0; i < keep_begin; ++i) {
-    to_release.emplace_back(std::move((*blocks)[i]));
-  }
-  deallocate(std::move(to_release));
-  blocks->erase(blocks->begin(), blocks->begin() + keep_begin);
-  kv_state.set_shared_blocks_num(BlockType::LINEAR, shared_source ? 1 : 0);
-}
-
-void LinearStateBlockManager::cache_read_source(Sequence* seq,
-                                                KVCacheState& kv_state) {
-  const Slice<Block> blocks = kv_state.blocks(BlockType::LINEAR);
-  if (seq->is_graph_warmup() || prefix_cache_ == nullptr || blocks.empty()) {
-    return;
-  }
-  const size_t chunk_stride = block_size();
-  const size_t cached_tokens = seq->kv_cache_tokens_num();
-  if (cached_tokens % chunk_stride != 0) {
-    return;
-  }
-  const size_t checkpoint_index = cached_tokens / chunk_stride;
-  if (checkpoint_index <= kv_state.num_cached_blocks(BlockType::LINEAR)) {
-    return;
-  }
-  seq->update_linear_state_hashes(block_size());
-  const Slice<XXH3Key> hashes = seq->linear_state_hashes();
-  CHECK_GE(hashes.size(), checkpoint_index);
-  auto* source = kv_state.mutable_blocks(BlockType::LINEAR);
-  CHECK(source->back().is_valid());
-  source->back().set_hash_value(hashes[checkpoint_index - 1].data);
-  prefix_cache_->insert(
-      Slice<Block>(*source).slice(source->size() - 1, source->size()));
-  kv_state.set_num_cached_blocks(BlockType::LINEAR, checkpoint_index);
+                                      /*num_shared_blocks=*/0,
+                                      /*cache_publish_cursor=*/0);
 }
 
 std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
     Sequence* seq,
     KVCacheState& kv_state) {
-  // A longer sequence cursor means another tier has the usable checkpoint.
-  // Replace this tier's shorter hit once. A retry that already built the
-  // two-slot window keeps it instead of dropping the new slots.
-  const Slice<Block> existing = kv_state.blocks(BlockType::LINEAR);
-  const bool tier_already_aligned =
-      existing.size() >= 2 &&
-      kv_state.shared_blocks_num(BlockType::LINEAR) == 0;
-  if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num() &&
-      !tier_already_aligned) {
+  CHECK_LE(kv_state.blocks(BlockType::LINEAR).size(), 2u);
+
+  if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num()) {
     std::vector<Block> old_blocks = kv_state.take_blocks(BlockType::LINEAR);
     deallocate(std::move(old_blocks));
     std::vector<Block> allocated = BlockManagerImpl::allocate(2);
@@ -356,11 +218,39 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
     return allocated;
   }
 
-  cache_read_source(seq, kv_state);
-  retain_read_source(kv_state);
+  std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::LINEAR);
+  if (blocks->size() == 2) {
+    std::vector<Block> released;
+    released.emplace_back(std::move(blocks->front()));
+    blocks->erase(blocks->begin());
+    deallocate(std::move(released));
+  }
+
   std::vector<Block> allocated = BlockManagerImpl::allocate(1);
   if (allocated.empty()) {
-    return std::nullopt;
+    return std::vector<Block>{};
+  }
+
+  // The block that remains is the completed read source. Publish it only when
+  // this leaf owns automatic prefix-cache insertion and the HBM cache lands
+  // on a checkpoint boundary.
+  if (options_.prefix_cache_publish_mode() ==
+          PrefixCachePublishMode::AUTOMATIC &&
+      !seq->is_graph_warmup() && prefix_cache_ != nullptr && !blocks->empty()) {
+    const size_t stride = block_size();
+    const size_t cached_tokens = seq->kv_cache_tokens_num();
+    if (stride > 0 && cached_tokens % stride == 0) {
+      const size_t checkpoint_index = cached_tokens / stride;
+      if (checkpoint_index > 0) {
+        seq->update_block_hashes(static_cast<uint32_t>(stride),
+                                 options_.hasher_type());
+        const Slice<XXH3Key> hashes =
+            seq->block_hashes(static_cast<uint32_t>(stride));
+        CHECK(blocks->front().is_valid());
+        blocks->front().set_hash_value(hashes[checkpoint_index - 1].data);
+        prefix_cache_->insert(Slice<Block>(*blocks).slice(0, 1));
+      }
+    }
   }
   return allocated;
 }
@@ -370,48 +260,29 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
     KVCacheState& kv_state) {
   std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::LINEAR);
   CHECK_LE(blocks->size(), 2u);
-  if (seq->is_prefill_stage()) {
-    if (!blocks->empty()) {
-      return std::vector<Block>{};
-    }
-    std::vector<Block> allocated = BlockManagerImpl::allocate(1);
-    return allocated.empty()
-               ? std::nullopt
-               : std::optional<std::vector<Block>>(std::move(allocated));
-  }
 
-  const size_t confirmed_tokens = seq->last_confirmed_cached_tokens_num();
-  const size_t tokens_per_step =
-      static_cast<size_t>(options_.num_speculative_tokens()) + 1;
   const size_t checkpoint_stride = block_size();
   const bool completed_checkpoint =
       blocks->size() == 2 &&
       last_decode_step_crosses_checkpoint(*seq, checkpoint_stride);
 
-  if (preserve_decode_checkpoint_ && completed_checkpoint) {
-    // HierarchyBlockManagerPool owns the transfer boundary. It moves the
-    // HBM and Host front blocks into an OffloadBlockPair after both tiers
-    // preserve the same logical checkpoint. Hashing happens once at that
-    // ownership boundary.
-    return std::vector<Block>{};
-  }
-
-  // Prefill may leave its read source in front of the newest write block.
-  // Decode starts from the newest state, so discard that historical prefill
-  // source before applying the decode rolling rules.  In particular, do not
-  // treat the prefill pair as a pending decode window.
-  if (blocks->size() == 2 &&
-      kv_state.kv_cache_tokens_num() <= seq->num_prompt_tokens()) {
-    retain_read_source(kv_state);
-  }
-
   if (blocks->size() == 2) {
     if (completed_checkpoint) {
+      if (options_.preserve_decode_checkpoint()) {
+        // Host cache is on. collect_offload_pairs runs after allocate and
+        // moves the front slot. Overlap keeps the n-2 result on the front
+        // block, so that slot is already the one to save. Overlap off writes
+        // the previous step into the back block, so swap that block to the
+        // front before collect moves it.
+        if (!options_.enable_schedule_overlap()) {
+          std::iter_swap(blocks->begin(), blocks->begin() + 1);
+        }
+        return std::vector<Block>{};
+      }
       std::vector<Block> to_release;
       to_release.emplace_back(std::move((*blocks)[0]));
       deallocate(std::move(to_release));
       blocks->erase(blocks->begin());
-      kv_state.set_shared_blocks_num(BlockType::LINEAR, 0);
     } else {
       // The previous decode step has not yet confirmed a checkpoint. Keep
       // both slots alive and alternate their roles so the next out-of-place
@@ -430,18 +301,13 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
                : std::optional<std::vector<Block>>(std::move(allocated));
   }
 
-  // A stride of one is the legacy fallback when chunked prefill is disabled.
-  // It does not describe a persistent LINEAR checkpoint window to roll.
-  if (checkpoint_stride == 1) {
-    return std::vector<Block>{};
-  }
-
-  CHECK_LE(tokens_per_step,
-           std::numeric_limits<size_t>::max() - confirmed_tokens)
-      << "linear-state confirmed-token cursor overflow";
-  const size_t predicted_tokens = confirmed_tokens + tokens_per_step;
-  if (!crosses_checkpoint(
-          confirmed_tokens, predicted_tokens, checkpoint_stride)) {
+  // The sequence's HBM cache decides the next checkpoint. The KVCacheState
+  // argument may be the Host tier, whose cached length is independent.
+  const size_t cached_tokens = seq->kv_state().kv_cache_tokens_num();
+  const size_t predicted_tokens =
+      cached_tokens + static_cast<size_t>(options_.num_speculative_tokens()) +
+      1;
+  if (!crosses_checkpoint(cached_tokens, predicted_tokens, checkpoint_stride)) {
     return std::vector<Block>{};
   }
 
@@ -474,7 +340,7 @@ std::vector<Block> LinearStateBlockManager::allocate_shared(
   }
   std::vector<Block> blocks = prefix_cache_->match(
       token_ids.slice(0, token_ids.size() - 1), {}, MMData(), block_hashes);
-  VLOG(1) << "[HostCache][LinearMatch] manager=" << this
+  VLOG(1) << "[LinearMatch] manager=" << this
           << " decode=" << options_.instance_is_decode()
           << " blocks=" << blocks.size();
   for (const Block& block : blocks) {
@@ -495,7 +361,7 @@ void LinearStateBlockManager::cache(const Slice<int32_t>& token_ids,
   }
   const size_t publish_end =
       std::min(token_ids.size() / block_size(), blocks.size() - 1);
-  VLOG(1) << "[HostCache][LinearCache] manager=" << this
+  VLOG(1) << "[LinearCache] manager=" << this
           << " decode=" << options_.instance_is_decode()
           << " blocks=" << blocks.size() << " publish_end=" << publish_end;
   if (publish_end <= existed_shared_blocks_num) {

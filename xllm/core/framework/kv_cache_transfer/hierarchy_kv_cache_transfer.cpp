@@ -439,7 +439,8 @@ void HierarchyKVCacheTransfer::create_host_cache(CacheDomain* domain) {
     host_options.device(torch::Device(torch::kCPU))
         .enable_xtensor(false)
         .tensor_allocator(nullptr)
-        .host_blocks_factor(options_.host_blocks_factor());
+        .host_blocks_factor(options_.host_blocks_factor())
+        .is_decode(options_.instance_role() == InstanceRole::DECODE);
 #if defined(USE_NPU)
     host_options.enable_kv_cache_huge_page_allocator(false);
 #endif

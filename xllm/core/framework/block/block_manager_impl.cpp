@@ -262,57 +262,43 @@ std::optional<std::vector<Block>> BlockManagerImpl::allocate_for_sequence(
 }
 
 bool BlockManagerImpl::allocate_for_prefetch(Sequence* seq, size_t num_tokens) {
-  return allocate_prefetch_range(seq, num_tokens, /*required_begin_block=*/0);
-}
-
-bool BlockManagerImpl::allocate_prefetch_range(Sequence* seq,
-                                               size_t num_tokens,
-                                               size_t required_begin_block) {
   if (seq == nullptr || block_size_ == 0) {
     return false;
   }
 
   KVCacheState& host_state = seq->host_kv_state();
   const size_t target_blocks = num_tokens / block_size_;
-  required_begin_block = std::min(required_begin_block, target_blocks);
-  const size_t shared_blocks = host_state.shared_blocks_num(block_type());
-  const size_t cached_blocks = host_state.num_cached_blocks(block_type());
+  const size_t cached_blocks = host_state.kv_cache_tokens_num() / block_size_;
+  // prefetch_from_storage already returns when the host hit covers the target.
+  CHECK_LT(cached_blocks, target_blocks);
+  // The existing vector is the matched prefix. Extend only past its length.
   std::vector<Block> blocks = host_state.take_blocks(block_type());
+  CHECK_LE(blocks.size(), cached_blocks);
   blocks.resize(target_blocks);
-
-  std::vector<size_t> missing;
-  missing.reserve(target_blocks - required_begin_block);
-  for (size_t index = required_begin_block; index < target_blocks; ++index) {
-    if (!blocks[index].is_valid()) {
-      missing.emplace_back(index);
-    }
-  }
-
-  size_t allocatable = std::min(
-      missing.size(), num_free_blocks() + num_blocks_in_prefix_cache());
-  std::vector<Block> allocated = allocate(allocatable);
-  if (allocated.empty() && allocatable > 0) {
-    allocatable = std::min(missing.size(), num_free_blocks());
-    allocated = allocate(allocatable);
-  }
 
   seq->update_block_hashes(static_cast<uint32_t>(block_size_),
                            options_.hasher_type());
-  const Slice<XXH3Key> hashes = seq->block_hashes();
+  const Slice<XXH3Key> hashes =
+      seq->block_hashes(static_cast<uint32_t>(block_size_));
   CHECK_GE(hashes.size(), target_blocks);
+
+  const size_t needed = target_blocks - cached_blocks;
+  std::vector<Block> allocated = allocate(needed);
+  if (allocated.empty()) {
+    allocated = allocate(std::min(needed, num_free_blocks()));
+  }
+
   for (size_t index = 0; index < allocated.size(); ++index) {
-    const size_t block_index = missing[index];
+    const size_t block_index = cached_blocks + index;
     allocated[index].set_hash_value(hashes[block_index].data);
     blocks[block_index] = std::move(allocated[index]);
   }
 
   if (!blocks.empty()) {
-    host_state.replace_composite_blocks(block_type(),
-                                        std::move(blocks),
-                                        std::min(shared_blocks, target_blocks),
-                                        std::min(cached_blocks, target_blocks));
+    host_state.replace_composite_blocks(
+        block_type(), std::move(blocks), cached_blocks, cached_blocks);
   }
-  return allocated.size() == missing.size();
+  return allocated.size() == needed;
 }
 
 void BlockManagerImpl::trim_prefetch_blocks(Sequence* seq,
@@ -353,7 +339,7 @@ void BlockManagerImpl::trim_prefetch_blocks(Sequence* seq,
         blocks,
         /*existed_shared_blocks_num=*/0,
         seq->mm_data(),
-        seq->block_hashes());
+        seq->block_hashes(static_cast<uint32_t>(block_size_)));
   host_state.replace_composite_blocks(
       block_type(), std::move(blocks), keep, keep);
 }

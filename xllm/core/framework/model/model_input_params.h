@@ -761,13 +761,25 @@ struct BlockTransferInfo {
     return *this;
   }
 
-  std::string to_string() const {
-    std::string rt = ", has_key:";
-    for (int i = 0; i < 16; i++) {
-      rt += std::to_string(int64_t(hash_key[i])) + " ";
+  // Hex of the 16-byte XXH3 block hash, matching the hash suffix of a
+  // Store key. Decimal byte dumps are not comparable across Prefill GET and
+  // Decode PUT logs.
+  std::string hash_hex() const {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string hex(XXH3_128BITS_HASH_VALUE_LEN * 2, '0');
+    for (uint32_t i = 0; i < XXH3_128BITS_HASH_VALUE_LEN; ++i) {
+      hex[i * 2] = kHex[hash_key[i] >> 4];
+      hex[i * 2 + 1] = kHex[hash_key[i] & 0x0f];
     }
+    return hex;
+  }
+
+  std::string to_string() const {
     return std::to_string(src_block_id) + "->" + std::to_string(dst_block_id) +
-           ", " + std::to_string(uint32_t(transfer_type)) + rt;
+           ", type=" + std::to_string(static_cast<uint32_t>(block_type)) +
+           ", transfer=" +
+           std::to_string(static_cast<uint32_t>(transfer_type)) +
+           ", hash=" + hash_hex();
   }
 };
 
