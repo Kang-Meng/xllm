@@ -519,6 +519,8 @@ class JoyOV2PipelineImpl : public torch::nn::Module {
         params.guidance_scale > 0 ? params.guidance_scale : 4.0;
     const double timeshift =
         params.flow_shift > 0 ? static_cast<double>(params.flow_shift) : 8.0;
+    // SGLang 6e87627 / Joytron stage4 default.
+    constexpr double audio_timeshift = 3.0;
     const double fps = params.video_fps > 0 ? params.video_fps : 16.0;
     const bool do_cfg = guidance > 1.0;
     const int64_t zero_cfg_star_step = 0;
@@ -606,7 +608,7 @@ class JoyOV2PipelineImpl : public torch::nn::Module {
     auto t_lin = torch::linspace(1, 0, num_steps + 1, device);
     auto sigmas = joyo_v2::sd3_timeshift(t_lin, timeshift);
     if (audio_hidden_states.defined()) {
-      audio_sigmas = joyo_v2::sd3_timeshift(t_lin, timeshift);
+      audio_sigmas = joyo_v2::sd3_timeshift(t_lin, audio_timeshift);
     }
 
     for (int64_t step_idx = 0; step_idx < num_steps; ++step_idx) {
@@ -615,6 +617,11 @@ class JoyOV2PipelineImpl : public torch::nn::Module {
           audio_hidden_states.defined()
               ? std::optional<torch::Tensor>(audio_hidden_states)
               : std::nullopt;
+      std::optional<torch::Tensor> audio_timestep;
+      if (audio_hidden_states.defined()) {
+        audio_timestep =
+            audio_sigmas[step_idx].reshape({1}).expand({num_samples});
+      }
       std::pair<torch::Tensor, torch::Tensor> preds;
 #if defined(USE_NPU)
       if (use_rolling_load_) {
@@ -625,14 +632,27 @@ class JoyOV2PipelineImpl : public torch::nn::Module {
             rope_meta,
             audio_in,
             [this](int32_t i) { rolling_transformer_.wait_h2d(i); },
-            [this](int32_t i) { rolling_transformer_.schedule_next_h2d(i); });
+            [this](int32_t i) { rolling_transformer_.schedule_next_h2d(i); },
+            audio_timestep);
       } else {
-        preds = transformer_->forward(
-            hidden_states, text_embeddings, timestep, rope_meta, audio_in);
+        preds = transformer_->forward(hidden_states,
+                                      text_embeddings,
+                                      timestep,
+                                      rope_meta,
+                                      audio_in,
+                                      /*before_layer_cb=*/nullptr,
+                                      /*after_layer_cb=*/nullptr,
+                                      audio_timestep);
       }
 #else
-      preds = transformer_->forward(
-          hidden_states, text_embeddings, timestep, rope_meta, audio_in);
+      preds = transformer_->forward(hidden_states,
+                                    text_embeddings,
+                                    timestep,
+                                    rope_meta,
+                                    audio_in,
+                                    /*before_layer_cb=*/nullptr,
+                                    /*after_layer_cb=*/nullptr,
+                                    audio_timestep);
 #endif
       auto& noise_pred = preds.first;
       auto& audio_pred = preds.second;

@@ -22,12 +22,15 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "core/framework/config/dit_config.h"
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model_context.h"
 #include "core/framework/state_dict/state_dict.h"
@@ -539,6 +542,15 @@ class XVAEDecoderImpl : public torch::nn::Module {
     mid_blocks_->push_back(ResidualBlock(context, block_in0, block_in0));
     mid_is_attn_ = {false, true, false};
 
+    // Read the chunking flag before building up_blocks so the spatial-only
+    // split constraint applies only when chunking is enabled. When disabled,
+    // tail_start_idx_ == up_blocks_->size() and forward_tail is just
+    // norm_out + conv_out (pre-chunking behavior).
+    tail_chunk_frames_ = DiTConfig::get_instance().dit_vae_tail_chunk_frames();
+    CHECK_GE(tail_chunk_frames_, 0)
+        << "--dit_vae_tail_chunk_frames must be >= 0, got "
+        << tail_chunk_frames_;
+
     up_blocks_ = register_module("up_blocks", torch::nn::ModuleList());
     for (size_t i_level = 0; i_level < block_in_channels_.size(); ++i_level) {
       const int64_t block_in = block_in_channels_[i_level];
@@ -553,9 +565,24 @@ class XVAEDecoderImpl : public torch::nn::Module {
         up_blocks_->push_back(UpsampleBlock(
             context, block_in, out_ch, temporal_upsample_[i_level]));
         up_is_upsample_.push_back(true);
+        if (tail_chunk_frames_ > 0 &&
+            i_level + 2 == block_in_channels_.size()) {
+          // Split immediately before the final spatial upsample. This block
+          // does not change T, so chunk input/output indices stay aligned.
+          CHECK(!temporal_upsample_[i_level])
+              << "XVAE tail chunking requires the final upsample to be "
+                 "spatial-only";
+          tail_start_idx_ = up_blocks_->size() - 1;
+        }
       }
     }
     CHECK_EQ(up_is_upsample_.size(), up_blocks_->size());
+    if (tail_chunk_frames_ > 0) {
+      CHECK_LT(tail_start_idx_, up_blocks_->size())
+          << "XVAE decoder must contain a final spatial upsample";
+    } else {
+      tail_start_idx_ = up_blocks_->size();
+    }
 
     const int64_t block_in_last = block_in_channels_.back();
     norm_out_ = register_module("norm_out", XVAERMSNorm(block_in_last));
@@ -580,7 +607,7 @@ class XVAEDecoderImpl : public torch::nn::Module {
       }
     }
 
-    for (size_t i = 0; i < up_blocks_->size(); ++i) {
+    for (size_t i = 0; i < tail_start_idx_; ++i) {
       if (up_is_upsample_[i]) {
         x = up_blocks_[i]->as<UpsampleBlock>()->forward(x);
       } else {
@@ -588,8 +615,55 @@ class XVAEDecoderImpl : public torch::nn::Module {
       }
     }
 
-    x = swish(norm_out_->forward(x));
-    return conv_out_->forward(x);
+    if (tail_chunk_frames_ > 0 && x.size(2) > tail_chunk_frames_) {
+      return forward_tail_chunked(x);
+    }
+    return forward_tail(x);
+  }
+
+  torch::Tensor forward_tail(const torch::Tensor& x) {
+    torch::Tensor h = x;
+    for (size_t i = tail_start_idx_; i < up_blocks_->size(); ++i) {
+      if (up_is_upsample_[i]) {
+        h = up_blocks_[i]->as<UpsampleBlock>()->forward(h);
+      } else {
+        h = up_blocks_[i]->as<ResidualBlock>()->forward(h);
+      }
+    }
+    h = swish(norm_out_->forward(h));
+    return conv_out_->forward(h);
+  }
+
+  torch::Tensor forward_tail_chunked(const torch::Tensor& x) {
+    // Tail after the final spatial-only upsample:
+    //   (num_res_blocks + 1) residual blocks * 2 causal kT=3 convs
+    //   + one causal kT=3 conv_out.
+    // Each convolution consumes two frames of left context.
+    const int64_t overlap = 2 * (2 * (num_res_blocks_ + 1) + 1);
+    const int64_t total_t = x.size(2);
+
+    LOG(INFO) << "XVAE tail temporal chunking: T=" << total_t
+              << " chunk=" << tail_chunk_frames_ << " left_overlap=" << overlap
+              << " input=" << x.sizes();
+
+    // Preallocate the full output and copy each valid slice in-place so peak
+    // memory is one output buffer, not chunks + cat.
+    torch::Tensor out;
+    for (int64_t start = 0; start < total_t; start += tail_chunk_frames_) {
+      const int64_t end = std::min(start + tail_chunk_frames_, total_t);
+      const int64_t context_start = std::max<int64_t>(0, start - overlap);
+      auto chunk = x.slice(/*dim=*/2, context_start, end);
+      auto decoded = forward_tail(chunk);
+      const int64_t discard = start - context_start;
+      auto valid = decoded.slice(/*dim=*/2, discard, discard + (end - start));
+      if (!out.defined()) {
+        auto sizes = valid.sizes().vec();
+        sizes[2] = total_t;
+        out = torch::empty(sizes, valid.options());
+      }
+      out.slice(/*dim=*/2, start, end).copy_(valid);
+    }
+    return out;
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -649,6 +723,8 @@ class XVAEDecoderImpl : public torch::nn::Module {
   std::vector<int64_t> block_in_channels_;
   std::vector<bool> temporal_upsample_;
   bool channel_doubling_ = false;
+  size_t tail_start_idx_ = std::numeric_limits<size_t>::max();
+  int64_t tail_chunk_frames_ = 0;
 
   CausalConv3d conv_in_{nullptr};
   torch::nn::ModuleList mid_blocks_{nullptr};
@@ -688,7 +764,8 @@ class AutoencoderKLXVAEImpl : public torch::nn::Module,
       // VAE checkpoint + nn::Conv3d weights are fp32. Pipeline root options_
       // may be bf16 (DiT); keep activations in weight dtype for decode.
       : dit::VaeParallelMixin(context),
-        options_(context.get_tensor_options().dtype(torch::kFloat)) {
+        options_(context.get_tensor_options().dtype(torch::kFloat)),
+        vae_size_(context.get_parallel_args().vae_size()) {
     const ModelArgs& args = context.get_model_args();
     latent_channels_ =
         args.latent_channels() > 0 ? args.latent_channels() : 128;
@@ -794,10 +871,26 @@ class AutoencoderKLXVAEImpl : public torch::nn::Module,
     // Match Conv3d weight/bias dtype (fp32). Casting to DiT bf16 mismatches
     // bias and can fall back to CPU aten.
     auto z = latent.to(options_.device(), torch::kFloat);
+    // VAE W-split needs W >= vae_size; pad on the right and crop pixels later.
+    const int64_t orig_w = z.size(-1);
+    int64_t pad_w = 0;
+    if (vae_size_ > 1 && orig_w < vae_size_) {
+      pad_w = vae_size_ - orig_w;
+      LOG(INFO) << "XVAE decode: pad latent W " << orig_w << " -> " << vae_size_
+                << " for vae parallel";
+      z = torch::nn::functional::pad(
+          z, torch::nn::functional::PadFuncOptions({0, pad_w}));
+    }
     z = vae_parallel_split(z);
     auto decoded = decoder_->forward(z);
     decoded = vae_parallel_merge(decoded);
-    return joyo_xvae::unpatchify(decoded, patch_size_);
+    auto pixels = joyo_xvae::unpatchify(decoded, patch_size_);
+    if (pad_w > 0) {
+      const int64_t keep_w = orig_w * scale_factor_spatial_;
+      CHECK_GE(pixels.size(-1), keep_w);
+      pixels = pixels.narrow(/*dim=*/-1, /*start=*/0, /*length=*/keep_w);
+    }
+    return pixels;
   }
 
   int64_t latent_channels() const { return latent_channels_; }
@@ -806,6 +899,7 @@ class AutoencoderKLXVAEImpl : public torch::nn::Module,
 
  private:
   torch::TensorOptions options_;
+  int64_t vae_size_ = 1;
   int64_t latent_channels_ = 128;
   int64_t out_channels_ = 3;
   int64_t scale_factor_spatial_ = 32;

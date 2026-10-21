@@ -81,6 +81,13 @@ DEFINE_bool(
     false,
     "whether enable vae tiling, currently only support qwen-image-edit-plus");
 
+DEFINE_int64(
+    dit_vae_tail_chunk_frames,
+    0,
+    "DiT VAE decode: temporal chunk size for the post-final-spatial-upsample "
+    "tail. 0 = disable (full sequence); >0 trades compute for lower peak "
+    "activation memory.");
+
 DEFINE_bool(dit_enable_text_encoder,
             true,
             "JoyOV2/MiniMax-H3: load in-process Qwen3-VL "
@@ -148,6 +155,7 @@ void DiTConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_generation_image_area_max);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_image_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_enable_vae_tiling);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_tail_chunk_frames);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_enable_text_encoder);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_sparse_attention_enabled);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_sparse_attention_sparsity);
@@ -176,6 +184,7 @@ void DiTConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_generation_image_area_max);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_image_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_enable_vae_tiling);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_tail_chunk_frames);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_enable_text_encoder);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_sparse_attention_enabled);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_sparse_attention_sparsity);
@@ -222,6 +231,8 @@ void DiTConfig::append_config_json(nlohmann::ordered_json& config_json) const {
       config_json, default_config, dit_vae_image_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_enable_vae_tiling);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_vae_tail_chunk_frames);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_enable_text_encoder);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

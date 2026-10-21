@@ -395,6 +395,8 @@ DECLARE_bool(dit_debug_print);
 
 DECLARE_bool(dit_enable_vae_tiling);
 
+DECLARE_int64(dit_vae_tail_chunk_frames);
+
 DECLARE_bool(dit_enable_text_encoder);
 
 DECLARE_bool(dit_sparse_attention_enabled);

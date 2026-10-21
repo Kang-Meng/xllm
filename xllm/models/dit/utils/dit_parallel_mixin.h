@@ -209,6 +209,8 @@ class SequenceParallelMixin {
 // vae_parallel_exchange(). Ops needing the full global tensor use
 // vae_parallel_merge() then vae_parallel_split() to restore the local view.
 // When vae_size == 1 every op is identity.
+// vae_parallel_split checks global W >= vae_size; callers that need smaller
+// widths must pad upstream before split.
 //
 // Usage:
 //   class MyModule : public torch::nn::Module,
@@ -243,12 +245,15 @@ class VaeParallelMixin {
     if (!vae_parallel_enabled()) {
       return x;
     }
-    int64_t width = x.size(-1);
-    int64_t base_w = width / vae_size();
-    int64_t rem_w = width % vae_size();
-    int64_t start_w =
+    const int64_t width = x.size(-1);
+    CHECK_GE(width, vae_size())
+        << "VAE W split requires global W >= vae_size, got W=" << width
+        << " vae_size=" << vae_size();
+    const int64_t base_w = width / vae_size();
+    const int64_t rem_w = width % vae_size();
+    const int64_t start_w =
         vae_rank() * base_w + std::min<int64_t>(vae_rank(), rem_w);
-    int64_t w_local = base_w + (vae_rank() < rem_w ? 1 : 0);
+    const int64_t w_local = base_w + (vae_rank() < rem_w ? 1 : 0);
     return x.slice(/*dim=*/-1, start_w, start_w + w_local).contiguous();
   }
 

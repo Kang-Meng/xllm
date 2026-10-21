@@ -17,11 +17,15 @@ limitations under the License.
 //   x_embedder / context_embedder / time_embedder / audio_embedder
 //   noise_refiner / context_text_refiner / audio_refiner
 //   transformer_blocks / proj_out / audio_proj_out
-// Reference: tools/SglangXvideo-f3a6983/.../models/dits/joyo_v2.py
+// Reference: local/SglangXvideo-6e87627/.../models/dits/joyo_v2.py
+// (ported from f3a6983; 6e87627: non-affine RMSNorm + independent
+// audio_timestep)
 //
 // MoE on transformer_blocks.1+ (layer 0 stays dense). Experts are EP-sharded
-// on dit_tp_group (ep=1 keeps all experts local). Attention / dense FFN are
-// TP-sharded (ColumnParallel QKV + RowParallel out).
+// across world/dp (= tp*sp*cfg; dp=1 => world). Attention / dense FFN are
+// TP-sharded on dit_tp_group. SP uses dit_sp_group. With EP>1 on an SP shard,
+// MoE token all2all uses SP×CFG sequence owners (TP replicas do not
+// re-dispatch; primary TP rank broadcasts routed outputs within the TP group).
 
 #pragma once
 
@@ -32,6 +36,7 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -89,6 +94,17 @@ inline void empty_device_cache(const torch::Device& device) {
   }
 }
 
+// Joytron / SGLang 6e87627: non-affine RMSNorm (no γ). Existing
+// layer::RMSNorm already hits fused / npu_rms_norm; it just always
+// multiplies weight. γ=1 ≡ skip affine.
+// Call after load_state_dict and before BlockWeightLoader::build_from_module
+// so rolling H2D snapshots the ones (it never reloads γ from the checkpoint).
+inline void force_identity_rms_weight(layer::RMSNorm& norm) {
+  if (norm && norm->weight().defined()) {
+    norm->weight().fill_(1);
+  }
+}
+
 }  // namespace joyo_v2
 
 struct JoyOV2RopeMeta {
@@ -108,6 +124,7 @@ struct JoyOV2PackedRopeMeta {
 // JoyOV2 block primitives (model-local; unified layers live in core/layers).
 // Module names match the Diffusers checkpoint: norm1 / attn / ff / mod.
 // MoE FFN for transformer_blocks.1+.
+// Norms use layer::RMSNorm (fused); non-affine via force_identity_rms_weight.
 
 class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
  public:
@@ -127,15 +144,46 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
         share_expert_dim_(share_expert_dim),
         routed_scaling_factor_(routed_scaling_factor),
         options_(options) {
+    // EP = world/dp (= tp*sp*cfg). dp>1 needs a non-DP process group; not yet.
     ProcessGroup* tp = parallel_args.dit_tp_group_;
-    ep_size_ = tp != nullptr ? static_cast<int64_t>(tp->world_size()) : 1;
-    ep_rank_ = tp != nullptr ? static_cast<int64_t>(tp->rank()) : 0;
+    tp_group_ = tp;
+    tp_size_ = tp != nullptr
+                   ? static_cast<int64_t>(tp->world_size())
+                   : std::max<int64_t>(
+                         1, static_cast<int64_t>(parallel_args.tp_size()));
+    // Prefer ParallelConfig (--sp_size); fall back to ParallelArgs.
+    sp_size_ = std::max<int64_t>(
+        1, static_cast<int64_t>(ParallelConfig::get_instance().sp_size()));
+    if (sp_size_ <= 1) {
+      sp_size_ =
+          std::max<int64_t>(1, static_cast<int64_t>(parallel_args.sp_size()));
+    }
+    cfg_size_ =
+        std::max<int64_t>(1, static_cast<int64_t>(parallel_args.cfg_size()));
+    dp_size_ =
+        std::max<int64_t>(1, static_cast<int64_t>(parallel_args.dp_size()));
+    const int64_t world =
+        std::max<int64_t>(1, static_cast<int64_t>(parallel_args.world_size()));
+    CHECK_EQ(world % dp_size_, 0);
+    CHECK_EQ(dp_size_, 1) << "JoyOV2 MoE EP all2all requires dp_size=1 "
+                             "(EP group is world/dp; no non-DP PG yet)";
+    ep_size_ = world / dp_size_;
+    CHECK_EQ(ep_size_, tp_size_ * sp_size_ * cfg_size_)
+        << "EP(world/dp)=" << ep_size_
+        << " != tp*sp*cfg=" << tp_size_ * sp_size_ * cfg_size_;
+    ep_group_ = parallel_args.process_group_;
+    ep_rank_ = static_cast<int64_t>(parallel_args.rank());
+    if (ep_group_ != nullptr) {
+      ep_rank_ = static_cast<int64_t>(ep_group_->rank());
+    }
+    const int64_t tp_rank = tp != nullptr ? static_cast<int64_t>(tp->rank())
+                                          : (ep_rank_ % tp_size_);
+    CHECK_EQ(tp_rank, ep_rank_ % tp_size_);
     CHECK_GT(ep_size_, 0);
     CHECK_EQ(num_experts_ % ep_size_, 0)
         << "num_experts=" << num_experts_
         << " not divisible by ep_size=" << ep_size_;
     num_local_experts_ = num_experts_ / ep_size_;
-    tp_group_ = tp;
 
     gate_ = register_module(
         "gate",
@@ -152,7 +200,7 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
         torch::empty({num_local_experts_, hidden_size, moe_hidden_size},
                      options));
 
-    // Shared expert: TP-sharded (same process group as EP in JoyO eval)
+    // Shared expert: TP-sharded on dit_tp_group (tp=1 => replicated).
     shared_w1_ =
         register_module("shared_expert_w1",
                         layer::ColumnParallelLinear(hidden_size,
@@ -179,8 +227,14 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states,
-                        const std::optional<torch::Tensor>& seqlens) {
-    // hidden_states: [B, S, D] (B=1 packed)
+                        const std::optional<torch::Tensor>& seqlens,
+                        bool sp_sharded = false,
+                        int64_t s_orig = -1) {
+    // hidden_states: [B, S, D] (B=1 packed). Under Ulysses SP, S is the local
+    // shard; EP>1 then token-all2alls to expert owners (no full-seq gather).
+    // sp_sharded is set by the caller (ulysses_sp); do not infer from shapes.
+    // s_orig: unpadded token count for SP+EP all2all; pass once per forward
+    // from the model to avoid a D2H sync in every MoE block.
     const int64_t b = hidden_states.size(0);
     const int64_t s = hidden_states.size(1);
     const int64_t d = hidden_states.size(2);
@@ -190,12 +244,10 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
     auto gate_logits = gate_->forward(x);
     auto gate_prob = torch::sigmoid(gate_logits.to(torch::kFloat));
 
-    auto [expert_token_ids, expert_token_weights] =
-        expert_chosen_routing(gate_prob, num_tokens, seqlens);
-
     torch::Tensor routed;
     if (ep_size_ == 1) {
-      // All experts local: gather → bmm → index_add
+      auto [expert_token_ids, expert_token_weights] =
+          expert_chosen_routing(gate_prob, num_tokens, seqlens);
       auto expert_input = x.index({expert_token_ids});  // [E, C, D]
       auto expert_out =
           local_expert_compute(expert_input, expert_token_weights);
@@ -203,12 +255,14 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
       routed.index_add_(/*dim=*/0,
                         expert_token_ids.reshape({-1}),
                         expert_out.reshape({-1, d}).to(x.dtype()));
+    } else if (sp_sharded) {
+      routed = forward_ep_token_all2all(x, gate_prob, seqlens, s_orig);
     } else {
-      // EP>1 without Joytron dispatcher yet: each rank runs local experts on
-      // tokens it was assigned, then all_reduce the dense output. Correctness
-      // for multi-rank lands with the EC dispatcher; this keeps EP shard load
-      // + local compute wired.
-      CHECK(tp_group_ != nullptr);
+      // Full sequence replicated on every EP rank (no SP): local experts +
+      // dense allreduce.
+      CHECK(ep_group_ != nullptr);
+      auto [expert_token_ids, expert_token_weights] =
+          expert_chosen_routing(gate_prob, num_tokens, seqlens);
       auto local_ids =
           expert_token_ids.slice(/*dim=*/0,
                                  ep_rank_ * num_local_experts_,
@@ -223,7 +277,7 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
       routed.index_add_(/*dim=*/0,
                         local_ids.reshape({-1}),
                         expert_out.reshape({-1, d}).to(x.dtype()));
-      tp_group_->allreduce(routed);
+      ep_group_->allreduce(routed);
     }
 
     routed = routed * routed_scaling_factor_;
@@ -286,6 +340,196 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
     auto out = torch::bmm(h, experts_w2_.transpose(1, 2));
     out = out * expert_weights.unsqueeze(-1).to(out.dtype());
     return out.to(in_dtype);
+  }
+
+  static int64_t seqlens_token_sum(
+      const std::optional<torch::Tensor>& seqlens) {
+    if (!seqlens.has_value() || !seqlens->defined()) {
+      return -1;
+    }
+    // One tiny host sync for a scalar (or n_cfg ints); avoid per-slot D2H.
+    return seqlens->to(torch::kLong).sum().item<int64_t>();
+  }
+
+  // Expert-chosen routing on deduped (TP-primary) gate scores, AllToAllV tokens
+  // to expert-owner EP ranks, local GEMM, AllToAllV back to sequence-owner
+  // primaries, then TP broadcast so replicas share the same routed shard.
+  // Packing stays on-device; only ep_size split vectors go to host for HCCL.
+  torch::Tensor forward_ep_token_all2all(
+      const torch::Tensor& x,                // [S_loc, D]
+      const torch::Tensor& gate_prob_local,  // [S_loc, E] fp32
+      const std::optional<torch::Tensor>& seqlens,
+      int64_t s_orig = -1) {
+    CHECK(ep_group_ != nullptr);
+    const int64_t s_loc = x.size(0);
+    const int64_t d = x.size(1);
+    CHECK_GT(s_loc, 0) << "forward_ep_token_all2all requires non-empty shard";
+    CHECK_GT(d, 0);
+    // Unique sequence shards in EP mesh: SP × CFG (TP replicates each shard).
+    const int64_t seq_owner_count = sp_size_ * cfg_size_;
+    CHECK_EQ(ep_size_, tp_size_ * seq_owner_count);
+    const int64_t s_pad = s_loc * seq_owner_count;
+    if (s_orig < 0) {
+      // Prefer an explicit unpadded count from the model forward; otherwise
+      // require seqlens. Do not silently fall back to s_pad (includes SP pad).
+      const int64_t from_seqlens = seqlens_token_sum(seqlens);
+      CHECK_GT(from_seqlens, 0)
+          << "forward_ep_token_all2all needs s_orig or valid seqlens "
+             "(refusing padded s_pad fallback)";
+      s_orig = from_seqlens;
+    }
+    CHECK_LE(s_orig, s_pad);
+    CHECK_GT(s_orig, 0);
+
+    // Allgather gates on EP, then keep only TP-primary ranks (tp==0) so the
+    // concatenated sequence matches SP×CFG owners — not TP duplicates.
+    // DiT rank: ep = tp + sp*tp + cfg*tp*sp.
+    torch::Tensor gate_stacked =
+        ep_group_->allgather_base_sync(gate_prob_local.contiguous());
+    CHECK_EQ(gate_stacked.size(0), ep_size_);
+    std::vector<torch::Tensor> unique_gates;
+    unique_gates.reserve(static_cast<size_t>(seq_owner_count));
+    for (int64_t cfg = 0; cfg < cfg_size_; ++cfg) {
+      for (int64_t sp = 0; sp < sp_size_; ++sp) {
+        const int64_t primary_ep = sp * tp_size_ + cfg * tp_size_ * sp_size_;
+        unique_gates.push_back(gate_stacked[primary_ep]);
+      }
+    }
+    auto gate_full = torch::cat(unique_gates, /*dim=*/0);  // [S_pad, E]
+    auto gate_route = gate_full.narrow(/*dim=*/0, /*start=*/0, s_orig);
+    auto [expert_token_ids, expert_token_weights] =
+        expert_chosen_routing(gate_route, s_orig, seqlens);
+    // ids/weights: [E, C]
+    CHECK_EQ(expert_token_ids.size(0), num_experts_);
+    const int64_t capacity = expert_token_ids.size(1);
+    CHECK_GT(capacity, 0);
+
+    auto opts_long =
+        torch::TensorOptions().dtype(torch::kLong).device(x.device());
+    auto opts_fp32 =
+        torch::TensorOptions().dtype(torch::kFloat).device(x.device());
+
+    auto ids = expert_token_ids.to(torch::kLong).contiguous();
+    auto weights = expert_token_weights.to(torch::kFloat).contiguous();
+    auto e_grid =
+        torch::arange(num_experts_, opts_long).unsqueeze(1).expand_as(ids);
+    auto c_grid =
+        torch::arange(capacity, opts_long).unsqueeze(0).expand_as(ids);
+    auto dest = torch::floor_divide(e_grid, num_local_experts_);
+    // Sequence-owner EP rank = TP-primary of (sp, cfg) for this token shard.
+    auto shard = torch::floor_divide(ids, s_loc);
+    auto sp_idx = shard.remainder(sp_size_);
+    auto cfg_idx = torch::floor_divide(shard, sp_size_);
+    auto src = sp_idx * tp_size_ + cfg_idx * (tp_size_ * sp_size_);
+    auto local_mask = src.eq(ep_rank_);
+
+    auto g_local = ids.masked_select(local_mask);
+    auto dest_local = dest.masked_select(local_mask);
+    auto e_local =
+        e_grid.remainder(num_local_experts_).masked_select(local_mask);
+    auto c_local = c_grid.masked_select(local_mask);
+    auto w_local = weights.masked_select(local_mask);
+    auto tok_local = g_local.remainder(s_loc);
+
+    // Dest-major order so alltoall splits are contiguous.
+    if (tok_local.numel() > 0) {
+      auto order = dest_local.argsort(/*stable=*/true);
+      dest_local = dest_local.index({order});
+      tok_local = tok_local.index({order});
+      e_local = e_local.index({order});
+      c_local = c_local.index({order});
+      w_local = w_local.index({order});
+    }
+
+    auto send_splits_t =
+        torch::bincount(dest_local, /*weights=*/{}, /*minlength=*/ep_size_)
+            .to(torch::kLong);
+    CHECK_EQ(send_splits_t.numel(), ep_size_);
+    // Row r = rank r's send_splits → recv_splits[j] = matrix[j, ep_rank].
+    auto splits_mat =
+        ep_group_->allgather_base_sync(send_splits_t.contiguous());
+    CHECK_EQ(splits_mat.dim(), 2);
+    CHECK_EQ(splits_mat.size(0), ep_size_);
+    CHECK_EQ(splits_mat.size(1), ep_size_);
+    auto recv_splits_t =
+        splits_mat.select(/*dim=*/1, /*index=*/ep_rank_).contiguous();
+
+    auto send_splits_cpu = send_splits_t.to(torch::kCPU).contiguous();
+    auto recv_splits_cpu = recv_splits_t.to(torch::kCPU).contiguous();
+    const int64_t* send_ptr = send_splits_cpu.data_ptr<int64_t>();
+    const int64_t* recv_ptr = recv_splits_cpu.data_ptr<int64_t>();
+    std::vector<int64_t> send_splits(send_ptr, send_ptr + ep_size_);
+    std::vector<int64_t> recv_splits(recv_ptr, recv_ptr + ep_size_);
+    const int64_t send_total =
+        std::accumulate(send_splits.begin(), send_splits.end(), int64_t{0});
+    const int64_t recv_total =
+        std::accumulate(recv_splits.begin(), recv_splits.end(), int64_t{0});
+    CHECK_EQ(send_total, tok_local.numel());
+    CHECK_EQ(recv_total, num_local_experts_ * capacity);
+
+    torch::Tensor send_local_idx = tok_local.contiguous();
+    torch::Tensor send_tokens = send_total > 0
+                                    ? x.index({send_local_idx}).contiguous()
+                                    : torch::empty({0, d}, x.options());
+    torch::Tensor send_weights =
+        send_total > 0 ? w_local.contiguous() : torch::empty({0}, opts_fp32);
+    torch::Tensor send_meta =
+        send_total > 0
+            ? torch::stack({e_local, c_local}, /*dim=*/1).contiguous()
+            : torch::empty({0, 2}, opts_long);
+
+    auto recv_tokens = torch::empty({recv_total, d}, x.options());
+    auto recv_weights = torch::empty({recv_total}, opts_fp32);
+    auto recv_meta = torch::empty({recv_total, 2}, opts_long);
+    if (send_total > 0 || recv_total > 0) {
+      ep_group_->all_to_all_single(
+          recv_tokens, send_tokens, recv_splits, send_splits);
+      ep_group_->all_to_all_single(
+          recv_weights, send_weights, recv_splits, send_splits);
+      ep_group_->all_to_all_single(
+          recv_meta, send_meta, recv_splits, send_splits);
+    }
+
+    // Scatter recv rows into dense [E_loc, C, ...] for batched expert GEMM.
+    auto expert_input =
+        torch::zeros({num_local_experts_, capacity, d}, x.options());
+    auto expert_w = torch::zeros({num_local_experts_, capacity}, opts_fp32);
+    // Empty recv_meta yields an empty index; safe when recv_total == 0.
+    auto flat_e = recv_meta.select(/*dim=*/1, /*index=*/0);
+    auto flat_c = recv_meta.select(/*dim=*/1, /*index=*/1);
+    auto flat_idx = flat_e * capacity + flat_c;
+    if (recv_total > 0) {
+      expert_input.view({num_local_experts_ * capacity, d})
+          .index_copy_(/*dim=*/0, flat_idx, recv_tokens);
+      expert_w.view({num_local_experts_ * capacity})
+          .index_copy_(/*dim=*/0, flat_idx, recv_weights);
+    }
+    auto expert_out = local_expert_compute(expert_input, expert_w);
+
+    // Gather expert outputs back into alltoall recv order for combine.
+    torch::Tensor send_back =
+        recv_total > 0 ? expert_out.reshape({num_local_experts_ * capacity, d})
+                             .index({flat_idx})
+                             .contiguous()
+                       : torch::empty({0, d}, x.options());
+
+    // Combine: swap splits so outputs return to token owners (send order).
+    auto recv_back = torch::empty({send_total, d}, x.options());
+    if (send_total > 0 || recv_total > 0) {
+      ep_group_->all_to_all_single(
+          recv_back, send_back, send_splits, recv_splits);
+    }
+
+    auto routed = torch::zeros_like(x);
+    if (send_total > 0) {
+      routed.index_add_(/*dim=*/0, send_local_idx, recv_back.to(x.dtype()));
+    }
+    // TP replicas hold the same sequence shard; only tp0 dispatched — share
+    // the combined routed activations with the rest of the TP group.
+    if (tp_size_ > 1 && tp_group_ != nullptr) {
+      tp_group_->broadcast(routed, /*root_rank=*/0);
+    }
+    return routed;
   }
 
   std::pair<torch::Tensor, torch::Tensor> expert_chosen_routing(
@@ -378,11 +622,16 @@ class JoyOV2MoEFeedForwardImpl : public torch::nn::Module {
   int64_t num_local_experts_ = 0;
   int64_t ep_size_ = 1;
   int64_t ep_rank_ = 0;
+  int64_t tp_size_ = 1;
+  int64_t sp_size_ = 1;
+  int64_t cfg_size_ = 1;
+  int64_t dp_size_ = 1;
   float top_p_ = 0.125f;
   int64_t share_expert_dim_ = 0;
   float routed_scaling_factor_ = 10.0f;
   torch::TensorOptions options_;
   ProcessGroup* tp_group_ = nullptr;
+  ProcessGroup* ep_group_ = nullptr;
 
   layer::ReplicatedLinear gate_{nullptr};
   torch::Tensor experts_w1_;
@@ -684,8 +933,7 @@ class JoyOV2AttentionImpl : public torch::nn::Module {
     return torch::cat(outs, /*dim=*/2);  // [1, H, S, D]
   }
 
-  // ulysses_sp: caller already SP-split the sequence (mix blocks only).
-  // Refiners must pass false — all2all on a full sequence doubles S.
+  // ulysses_sp: caller already SP-split the sequence (refiners + mix blocks).
   torch::Tensor forward(const torch::Tensor& x,
                         const std::optional<torch::Tensor>& freqs_cis,
                         const std::optional<torch::Tensor>& cu_seqlens,
@@ -800,6 +1048,8 @@ class JoyOV2AttentionImpl : public torch::nn::Module {
     to_out_->load_state_dict(state_dict.get_dict_with_prefix("to_out."));
     norm_q_->load_state_dict(state_dict.get_dict_with_prefix("norm_q."));
     norm_k_->load_state_dict(state_dict.get_dict_with_prefix("norm_k."));
+    joyo_v2::force_identity_rms_weight(norm_q_);
+    joyo_v2::force_identity_rms_weight(norm_k_);
   }
 
  private:
@@ -897,12 +1147,25 @@ class JoyOV2TransformerBlockImpl : public torch::nn::Module {
       const std::optional<torch::Tensor>& /*attn_mask*/,
       bool ulysses_sp = false,
       const std::optional<torch::Tensor>& attn_seqlens = std::nullopt,
-      const std::optional<torch::Tensor>& token_sample_ids = std::nullopt) {
+      const std::optional<torch::Tensor>& token_sample_ids = std::nullopt,
+      const std::optional<torch::Tensor>& audio_timestep_emb = std::nullopt,
+      const std::optional<torch::Tensor>& modulation_sample_ids = std::nullopt,
+      int64_t moe_s_orig = -1) {
     torch::Tensor scale_msa, gate_msa, shift_msa, scale_mlp, gate_mlp,
         shift_mlp;
     bool modulated = false;
     if (modulation_ && timestep_emb.has_value() && timestep_emb->defined()) {
       auto mods = mod_->forward(*timestep_emb);
+      if (audio_timestep_emb.has_value() && audio_timestep_emb->defined()) {
+        CHECK(modulation_sample_ids.has_value() &&
+              modulation_sample_ids->defined())
+            << "audio_timestep_emb requires modulation_sample_ids";
+        auto audio_mods = mod_->forward(*audio_timestep_emb);
+        CHECK_EQ(mods.size(), audio_mods.size());
+        for (size_t i = 0; i < mods.size(); ++i) {
+          mods[i] = torch::cat({mods[i], audio_mods[i]}, /*dim=*/0);
+        }
+      }
       CHECK_EQ(mods.size(), 6u);
       scale_msa = mods[0];
       gate_msa = mods[1];
@@ -915,6 +1178,11 @@ class JoyOV2TransformerBlockImpl : public torch::nn::Module {
 
     const int64_t s = x.size(1);
     auto expand = [&](const torch::Tensor& t) {
+      if (modulation_sample_ids.has_value() &&
+          modulation_sample_ids->defined()) {
+        CHECK_EQ(modulation_sample_ids->numel(), s);
+        return t.index_select(/*dim=*/0, *modulation_sample_ids).unsqueeze(0);
+      }
       if (token_sample_ids.has_value() && token_sample_ids->defined()) {
         CHECK_EQ(token_sample_ids->numel(), s);
         return t.index_select(/*dim=*/0, *token_sample_ids).unsqueeze(0);
@@ -961,7 +1229,9 @@ class JoyOV2TransformerBlockImpl : public torch::nn::Module {
     }
     torch::Tensor ffn_out;
     if (use_moe_) {
-      ffn_out = moe_ff_->forward(ffn_in, ulysses_sp ? std::nullopt : seqlens);
+      // MoE runs on the SP shard directly; EP>1 uses token all2all.
+      ffn_out = moe_ff_->forward(
+          ffn_in, seqlens, /*sp_sharded=*/ulysses_sp, moe_s_orig);
     } else {
       ffn_out = ff_->forward(ffn_in);
     }
@@ -977,11 +1247,15 @@ class JoyOV2TransformerBlockImpl : public torch::nn::Module {
   void load_state_dict(const StateDict& state_dict) {
     norm1_->load_state_dict(state_dict.get_dict_with_prefix("norm1."));
     norm2_->load_state_dict(state_dict.get_dict_with_prefix("norm2."));
+    joyo_v2::force_identity_rms_weight(norm1_);
+    joyo_v2::force_identity_rms_weight(norm2_);
     if (sandwich_norm_) {
       norm1_post_->load_state_dict(
           state_dict.get_dict_with_prefix("norm1_post."));
       norm2_post_->load_state_dict(
           state_dict.get_dict_with_prefix("norm2_post."));
+      joyo_v2::force_identity_rms_weight(norm1_post_);
+      joyo_v2::force_identity_rms_weight(norm2_post_);
     }
     if (modulation_) {
       mod_->load_state_dict(state_dict.get_dict_with_prefix("mod."));
@@ -1144,8 +1418,14 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
                                                     tp,
                                                     options_));
 
-    const int64_t ep_size =
+    const int64_t dp_size =
+        std::max<int64_t>(1, static_cast<int64_t>(parallel_args_.dp_size()));
+    const int64_t world =
+        std::max<int64_t>(1, static_cast<int64_t>(parallel_args_.world_size()));
+    const int64_t ep_size = world / dp_size;  // EP = world/dp (= tp*sp*cfg)
+    const int64_t tp_size =
         tp != nullptr ? static_cast<int64_t>(tp->world_size()) : 1;
+    const int64_t sp_size = joyo_sp_world();
     // Layer 1+ always use Expert-Chosen MoE (ep=1 = all experts on this rank).
     JoyOV2TransformerBlockImpl::MoEArgs moe_args;
     moe_args.moe_hidden_size = moe_hidden_size_;
@@ -1212,7 +1492,9 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
     sp_world_ = joyo_sp_world();
     LOG(INFO) << "JoyOV2Transformer3DModel: layers=" << num_layers_
               << " hidden=" << hidden_size_ << " experts=" << num_experts_
-              << " ep_size=" << ep_size
+              << " ep_size=" << ep_size << " (world/dp)"
+              << " tp_size=" << tp_size << " sp_size=" << sp_size
+              << " dp_size=" << dp_size
               << " rolling=" << dit_rolling_load_enabled();
   }
 
@@ -1329,7 +1611,10 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
       const torch::Tensor& seqlens,
       bool ulysses_sp = false,
       const std::optional<torch::Tensor>& attn_seqlens = std::nullopt,
-      const std::optional<torch::Tensor>& token_sample_ids = std::nullopt) {
+      const std::optional<torch::Tensor>& token_sample_ids = std::nullopt,
+      const std::optional<torch::Tensor>& audio_timestep_emb = std::nullopt,
+      const std::optional<torch::Tensor>& modulation_sample_ids = std::nullopt,
+      int64_t moe_s_orig = -1) {
     return block->forward(x,
                           timestep_emb,
                           freqs,
@@ -1337,7 +1622,120 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
                           /*attn_mask=*/std::nullopt,
                           ulysses_sp,
                           attn_seqlens,
-                          token_sample_ids);
+                          token_sample_ids,
+                          audio_timestep_emb,
+                          modulation_sample_ids,
+                          moe_s_orig);
+  }
+
+  // Audio tokens are the last segment of each packed sample; map them onto
+  // the second half of the doubled (video || audio) adaLN table.
+  static torch::Tensor build_audio_modulation_ids(
+      const torch::Tensor& sample_ids,
+      const torch::Tensor& mix_cu_seqlens,
+      const torch::Tensor& audio_cu_seqlens) {
+    CHECK_GE(mix_cu_seqlens.numel(), 2)
+        << "mix_cu_seqlens must have at least 2 elements";
+    CHECK_GE(audio_cu_seqlens.numel(), 2)
+        << "audio_cu_seqlens must have at least 2 elements";
+    CHECK_EQ(mix_cu_seqlens.numel(), audio_cu_seqlens.numel())
+        << "mix/audio cu_seqlens must describe the same sample count";
+    const int64_t num_samples = mix_cu_seqlens.numel() - 1;
+    auto audio_lengths = audio_cu_seqlens.slice(/*dim=*/0, 1) -
+                         audio_cu_seqlens.slice(
+                             /*dim=*/0, 0, audio_cu_seqlens.size(0) - 1);
+    auto audio_starts = mix_cu_seqlens.slice(/*dim=*/0, 1) - audio_lengths;
+    auto positions = torch::arange(sample_ids.numel(), sample_ids.options());
+    auto is_audio =
+        positions >= audio_starts.index_select(/*dim=*/0, sample_ids);
+    return sample_ids + is_audio.to(sample_ids.dtype()) * num_samples;
+  }
+
+  // Run a refiner/mix-style stack. When SP>1, scatter the sequence, run blocks
+  // with Ulysses attention, then gather — same boundary as mix blocks.
+  template <typename LayerList>
+  torch::Tensor run_layers_maybe_sp(
+      LayerList& layers,
+      const torch::Tensor& emb,  // [S, D]
+      const std::optional<torch::Tensor>& timestep_emb,
+      const torch::Tensor& freqs,  // [S, rope_dim]
+      const torch::Tensor& seqlens,
+      const std::function<void()>& invoke_before,
+      const std::function<void()>& invoke_after) {
+    auto x = emb.unsqueeze(0);
+    const bool use_sp = sp_world_ > 1 && dit_sp_group_ != nullptr;
+    if (!use_sp) {
+      for (size_t i = 0; i < layers.size(); ++i) {
+        invoke_before();
+        x = run_block(layers[i],
+                      x,
+                      timestep_emb,
+                      freqs,
+                      seqlens,
+                      /*ulysses_sp=*/false);
+        invoke_after();
+      }
+      return x.squeeze(0);
+    }
+
+    const int64_t s_orig = x.size(1);
+    const int64_t pad = (sp_world_ - (s_orig % sp_world_)) % sp_world_;
+    auto mix_lens_cpu = seqlens.to(torch::kCPU).to(torch::kInt64);
+    const int64_t n = mix_lens_cpu.numel();
+    CHECK_GT(n, 0) << "run_layers_maybe_sp requires non-empty seqlens";
+    const auto device = x.device();
+    auto sample_ids =
+        torch::repeat_interleave(
+            torch::arange(n, torch::TensorOptions().dtype(torch::kLong)),
+            mix_lens_cpu,
+            /*dim=*/0)
+            .to(device);
+    torch::Tensor attn_seqlens = seqlens;
+    torch::Tensor freqs_padded = freqs;
+    if (pad > 0) {
+      auto attn_lens = mix_lens_cpu.clone();
+      attn_lens[-1] += pad;
+      attn_seqlens = attn_lens.to(torch::kInt32).to(device);
+      freqs_padded = torch::nn::functional::pad(
+          freqs,
+          torch::nn::functional::PadFuncOptions({0, 0, 0, pad})
+              .mode(torch::kConstant));
+    }
+
+    dit::SequenceParallelTensorMap sp_outputs = sequence_parallel_forward(
+        {{"x", {x, /*sequence_dim=*/1}},
+         {"sample_ids", {sample_ids.unsqueeze(0), /*sequence_dim=*/1}}},
+        [this,
+         &layers,
+         &timestep_emb,
+         &seqlens,
+         &attn_seqlens,
+         &freqs_padded,
+         s_orig,
+         &invoke_before,
+         &invoke_after](const dit::SequenceParallelTensorMap& local_inputs) {
+          torch::Tensor local_x = local_inputs.at("x").first;
+          std::optional<torch::Tensor> local_sample_ids =
+              local_inputs.at("sample_ids").first.squeeze(0);
+          for (size_t i = 0; i < layers.size(); ++i) {
+            invoke_before();
+            local_x = run_block(layers[i],
+                                local_x,
+                                timestep_emb,
+                                freqs_padded,
+                                seqlens,
+                                /*ulysses_sp=*/true,
+                                attn_seqlens,
+                                local_sample_ids,
+                                /*audio_timestep_emb=*/std::nullopt,
+                                /*modulation_sample_ids=*/std::nullopt,
+                                s_orig);
+            invoke_after();
+          }
+          return dit::SequenceParallelTensorMap{
+              {"x", {local_x, /*sequence_dim=*/1}}};
+        });
+    return sp_outputs.at("x").first.squeeze(0);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -1347,6 +1745,7 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
         state_dict.get_dict_with_prefix("audio_embedder."));
     context_norm_->load_state_dict(
         state_dict.get_dict_with_prefix("context_embedder.norm."));
+    joyo_v2::force_identity_rms_weight(context_norm_);
     context_proj_->load_state_dict(
         state_dict.get_dict_with_prefix("context_embedder.proj."));
     time_linear_1_->load_state_dict(
@@ -1355,10 +1754,12 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
         state_dict.get_dict_with_prefix("time_embedder.linear_2."));
     proj_out_norm_->load_state_dict(
         state_dict.get_dict_with_prefix("proj_out.norm."));
+    joyo_v2::force_identity_rms_weight(proj_out_norm_);
     proj_out_linear_->load_state_dict(
         state_dict.get_dict_with_prefix("proj_out.linear."));
     audio_proj_out_norm_->load_state_dict(
         state_dict.get_dict_with_prefix("audio_proj_out.norm."));
+    joyo_v2::force_identity_rms_weight(audio_proj_out_norm_);
     audio_proj_out_linear_->load_state_dict(
         state_dict.get_dict_with_prefix("audio_proj_out.linear."));
 
@@ -1431,6 +1832,8 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
   // Optional before/after callbacks index blocks in forward order
   // (context_text_refiner → noise_refiner → audio_refiner → layers_), matching
   // get_block_weight_loaders() for DitRollingLoadManager wait/schedule.
+  // audio_timestep: independent audio condition (SGLang 6e87627); when unset
+  // with audio present, audio shares the video timestep.
   std::pair<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& hidden_states,
       const torch::Tensor& text_embeddings,
@@ -1438,7 +1841,8 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
       const JoyOV2PackedRopeMeta& rope_meta,
       const std::optional<torch::Tensor>& audio_hidden_states,
       std::function<void(int32_t)> before_layer_cb = nullptr,
-      std::function<void(int32_t)> after_layer_cb = nullptr) {
+      std::function<void(int32_t)> after_layer_cb = nullptr,
+      const std::optional<torch::Tensor>& audio_timestep = std::nullopt) {
     CHECK(rope_meta.mix.has_value());
     CHECK(rope_meta.pixel.has_value());
 
@@ -1459,6 +1863,17 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
         timestep_embedding(timestep * 1000.0, 256).to(options_.dtype());
     auto timestep_emb =
         time_linear_2_->forward(torch::silu(time_linear_1_->forward(t_emb)));
+    // Independent audio condition; falls back to sharing video timestep_emb.
+    torch::Tensor audio_timestep_emb = timestep_emb;
+    const bool has_independent_audio_t =
+        audio_hidden_states.has_value() && audio_hidden_states->defined() &&
+        audio_timestep.has_value() && audio_timestep->defined();
+    if (has_independent_audio_t) {
+      auto audio_t_emb = timestep_embedding(*audio_timestep * 1000.0, 256)
+                             .to(options_.dtype());
+      audio_timestep_emb = time_linear_2_->forward(
+          torch::silu(time_linear_1_->forward(audio_t_emb)));
+    }
 
     auto pixel_emb = x_embedder_->forward(hidden_states);
     auto text_in = text_embeddings;
@@ -1470,53 +1885,34 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
       audio_emb = audio_embedder_->forward(*audio_hidden_states);
     }
 
-    // Refine text (no modulation). Refiners stay full-sequence (no Ulysses).
+    // Refine text / pixel / audio. With SP>1 each stack scatters → Ulysses →
+    // gather so shared-expert / FFN peaks stay on the local shard.
     auto text_freqs = compute_freqs_cis(rope_meta.text.position_id);
     const auto device = hidden_states.device();
-    {
-      auto x = text_emb.unsqueeze(0);
-      for (size_t i = 0; i < context_text_refiner_layers_.size(); ++i) {
-        invoke_before();
-        x = run_block(context_text_refiner_layers_[i],
-                      x,
-                      /*timestep_emb=*/std::nullopt,
-                      text_freqs,
-                      rope_meta.text.seqlens,
-                      /*ulysses_sp=*/false);
-        invoke_after();
-      }
-      text_emb = x.squeeze(0);
-    }
-    // Refine pixel
+    text_emb = run_layers_maybe_sp(context_text_refiner_layers_,
+                                   text_emb,
+                                   /*timestep_emb=*/std::nullopt,
+                                   text_freqs,
+                                   rope_meta.text.seqlens,
+                                   invoke_before,
+                                   invoke_after);
     auto pixel_freqs = compute_freqs_cis(rope_meta.pixel->position_id);
-    {
-      auto x = pixel_emb.unsqueeze(0);
-      for (size_t i = 0; i < noise_refiner_layers_.size(); ++i) {
-        invoke_before();
-        x = run_block(noise_refiner_layers_[i],
-                      x,
-                      timestep_emb,
-                      pixel_freqs,
-                      rope_meta.pixel->seqlens,
-                      /*ulysses_sp=*/false);
-        invoke_after();
-      }
-      pixel_emb = x.squeeze(0);
-    }
+    pixel_emb = run_layers_maybe_sp(noise_refiner_layers_,
+                                    pixel_emb,
+                                    timestep_emb,
+                                    pixel_freqs,
+                                    rope_meta.pixel->seqlens,
+                                    invoke_before,
+                                    invoke_after);
     if (audio_emb.defined() && rope_meta.audio.has_value()) {
       auto audio_freqs = compute_freqs_cis(rope_meta.audio->position_id);
-      auto x = audio_emb.unsqueeze(0);
-      for (size_t i = 0; i < audio_refiner_layers_.size(); ++i) {
-        invoke_before();
-        x = run_block(audio_refiner_layers_[i],
-                      x,
-                      timestep_emb,
-                      audio_freqs,
-                      rope_meta.audio->seqlens,
-                      /*ulysses_sp=*/false);
-        invoke_after();
-      }
-      audio_emb = x.squeeze(0);
+      audio_emb = run_layers_maybe_sp(audio_refiner_layers_,
+                                      audio_emb,
+                                      audio_timestep_emb,
+                                      audio_freqs,
+                                      rope_meta.audio->seqlens,
+                                      invoke_before,
+                                      invoke_after);
     } else if (before_layer_cb || after_layer_cb) {
       // Keep rolling indices aligned with get_block_weight_loaders().
       for (size_t i = 0; i < audio_refiner_layers_.size(); ++i) {
@@ -1571,7 +1967,42 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
     auto x = torch::cat(pieces, /*dim=*/0).unsqueeze(0);
     auto mix_freqs = compute_freqs_cis(mix.position_id);
 
+    std::optional<torch::Tensor> audio_timestep_emb_mix;
+    std::optional<torch::Tensor> modulation_sample_ids;
+    const int64_t num_mix_samples = mix.seqlens.numel();
+    auto pad_timestep_rows = [](const torch::Tensor& emb, int64_t target_rows) {
+      if (target_rows <= emb.size(0)) {
+        return emb;
+      }
+      const int64_t pad_rows = target_rows - emb.size(0);
+      auto last = emb.slice(/*dim=*/0, emb.size(0) - 1, emb.size(0));
+      return torch::cat({emb, last.expand({pad_rows, -1})}, /*dim=*/0);
+    };
+    const torch::Tensor timestep_emb_mix =
+        pad_timestep_rows(timestep_emb, num_mix_samples);
     const bool use_sp = sp_world_ > 1 && dit_sp_group_ != nullptr;
+    const bool need_mix_sample_ids =
+        use_sp || (audio_emb.defined() && has_independent_audio_t);
+    torch::Tensor mix_lens_cpu;
+    torch::Tensor sample_ids;
+    if (need_mix_sample_ids) {
+      mix_lens_cpu = mix.seqlens.to(torch::kCPU).to(torch::kInt64);
+      sample_ids =
+          torch::repeat_interleave(
+              torch::arange(n, torch::TensorOptions().dtype(torch::kLong)),
+              mix_lens_cpu,
+              /*dim=*/0)
+              .to(device);
+    }
+    if (audio_emb.defined() && has_independent_audio_t) {
+      audio_timestep_emb_mix =
+          pad_timestep_rows(audio_timestep_emb, num_mix_samples);
+      modulation_sample_ids =
+          build_audio_modulation_ids(sample_ids,
+                                     mix.cu_seqlens.to(device),
+                                     rope_meta.audio->cu_seqlens.to(device));
+    }
+
     torch::Tensor mix_attn_seqlens = mix.seqlens;
     if (use_sp) {
       // JoyO-only: pad length must also be reflected in the last sample's
@@ -1579,14 +2010,9 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
       // stay on the host side of the boundary.
       const int64_t s_orig = x.size(1);
       const int64_t pad = (sp_world_ - (s_orig % sp_world_)) % sp_world_;
-      auto mix_lens_cpu = mix.seqlens.to(torch::kCPU).to(torch::kInt64);
-      auto sample_ids =
-          torch::repeat_interleave(
-              torch::arange(n, torch::TensorOptions().dtype(torch::kLong)),
-              mix_lens_cpu,
-              /*dim=*/0)
-              .to(device);
       if (pad > 0) {
+        CHECK_GT(mix_lens_cpu.numel(), 0)
+            << "mix SP pad requires non-empty mix_lens_cpu";
         auto attn_lens = mix_lens_cpu.clone();
         attn_lens[-1] += pad;
         mix_attn_seqlens = attn_lens.to(torch::kInt32).to(device);
@@ -1598,29 +2024,46 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
                 .mode(torch::kConstant));
       }
 
+      dit::SequenceParallelTensorMap sp_inputs = {
+          {"x", {x, /*sequence_dim=*/1}},
+          {"sample_ids", {sample_ids.unsqueeze(0), /*sequence_dim=*/1}}};
+      if (modulation_sample_ids.has_value() &&
+          modulation_sample_ids->defined()) {
+        sp_inputs["mod_sample_ids"] = {modulation_sample_ids->unsqueeze(0),
+                                       /*sequence_dim=*/1};
+      }
       dit::SequenceParallelTensorMap sp_outputs = sequence_parallel_forward(
-          {{"x", {x, /*sequence_dim=*/1}},
-           {"sample_ids", {sample_ids.unsqueeze(0), /*sequence_dim=*/1}}},
+          sp_inputs,
           [this,
-           &timestep_emb,
+           &timestep_emb_mix,
+           &audio_timestep_emb_mix,
            &mix,
            &mix_attn_seqlens,
            &mix_freqs,
+           s_orig,
            &invoke_before,
            &invoke_after](const dit::SequenceParallelTensorMap& local_inputs) {
             torch::Tensor local_x = local_inputs.at("x").first;
             std::optional<torch::Tensor> local_sample_ids =
                 local_inputs.at("sample_ids").first.squeeze(0);
+            std::optional<torch::Tensor> local_mod_ids;
+            if (local_inputs.count("mod_sample_ids") > 0) {
+              local_mod_ids =
+                  local_inputs.at("mod_sample_ids").first.squeeze(0);
+            }
             for (size_t i = 0; i < layers_.size(); ++i) {
               invoke_before();
               local_x = run_block(layers_[i],
                                   local_x,
-                                  timestep_emb,
+                                  timestep_emb_mix,
                                   mix_freqs,
                                   mix.seqlens,
                                   /*ulysses_sp=*/true,
                                   mix_attn_seqlens,
-                                  local_sample_ids);
+                                  local_sample_ids,
+                                  audio_timestep_emb_mix,
+                                  local_mod_ids,
+                                  s_orig);
               invoke_after();
             }
             return dit::SequenceParallelTensorMap{
@@ -1632,12 +2075,14 @@ class JoyOV2Transformer3DModelImpl : public torch::nn::Module,
         invoke_before();
         x = run_block(layers_[i],
                       x,
-                      timestep_emb,
+                      timestep_emb_mix,
                       mix_freqs,
                       mix.seqlens,
                       /*ulysses_sp=*/false,
                       mix_attn_seqlens,
-                      /*token_sample_ids=*/std::nullopt);
+                      /*token_sample_ids=*/std::nullopt,
+                      audio_timestep_emb_mix,
+                      modulation_sample_ids);
         invoke_after();
       }
     }
