@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@ limitations under the License.
 
 #pragma once
 
+#include <optional>
 #include <unordered_map>
 
-#include "runtime/dflash_worker_impl.h"
+#include "runtime/dflash/dflash_worker_impl.h"
 
 namespace xllm {
 
@@ -100,6 +101,13 @@ class DFlash2WorkerImpl final : public DFlashWorkerImpl {
     torch::Tensor token_ids;
     torch::Tensor dense_probs;
   };
+
+  static std::optional<BlockSampleOutput> fused_sample(
+      const torch::Tensor& candidate_ids,
+      const torch::Tensor& edge_log_probs,
+      const torch::Tensor& gumbel_noise,
+      const SamplingParameters& sampling_params,
+      int64_t vocab_size);
 
   BlockSampleOutput sample_path(const DFlash2CandidateOutput& candidates,
                                 const SamplingParameters& sampling_params,

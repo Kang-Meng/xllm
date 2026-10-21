@@ -18,7 +18,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <optional>
-#include <tuple>
 
 #include "common/dense_mlp.h"
 #include "common/dflash2_grouped_conv.h"
@@ -60,12 +59,6 @@ class Qwen2DecoderLayerImpl : public torch::nn::Module {
   bool use_dflash2_conv_ = false;
 
   ParallelArgs parallel_args_;
-
-  std::tuple<torch::Tensor, std::optional<torch::Tensor>> apply_norm(
-      RMSNorm& norm,
-      torch::Tensor& input,
-      std::optional<torch::Tensor>& residual,
-      const std::optional<torch::Tensor>& fp8_scale);
 };
 TORCH_MODULE(Qwen2DecoderLayer);
 

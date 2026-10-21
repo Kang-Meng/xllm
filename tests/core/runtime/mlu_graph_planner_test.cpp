@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -626,6 +626,74 @@ TEST(MluGraphPlannerTest, ModelContextHistoryReusesKeyAcrossContextLengths) {
     }
   }
   expect_eager(planner, 3, decode_input(32769), EagerReason::HISTORY_LIMIT);
+}
+
+TEST(MluGraphPlannerTest, Dflash2VerifyPreservesB16GroupsAt64kHistory) {
+  GraphPlannerConfig config = qwen_config();
+  config.options.enable_speculative_decode(true)
+      .speculative_algorithm("DFlash2")
+      .num_decoding_tokens(4)
+      .world_size(8);
+  config.capabilities.supports_grouped_mtp_graph = true;
+  config.capabilities.replay_family = MtpReplayFamily::GLM5;
+  config.capabilities.graph_history = MtpGraphHistoryPolicy::MAX_CONTEXT;
+  config.state_required = true;
+  config.history_capacity = 73728;
+  config.max_tokens = 64;
+  ModelInputParams params = grouped_input(/*rows=*/16);
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.meta.q_max_seq_len = 4;
+  params.meta.kv_max_seq_len = 65536;
+  params.is_spec_verify = true;
+  params.attention.host.q_seq_lens.clear();
+  for (int32_t row = 0; row <= 16; ++row) {
+    params.attention.host.q_seq_lens.emplace_back(row * 4);
+  }
+  params.attention.host.kpool_query_lens.assign(16, 4);
+  params.attention.device.q_seq_lens =
+      torch::tensor(params.attention.host.q_seq_lens, torch::kInt32);
+  params.attention.device.kv_seq_lens = torch::zeros({17}, torch::kInt32);
+  params.attention.device.new_cache_slots = torch::zeros({64}, torch::kInt32);
+  params.attention.device.block_tables =
+      torch::zeros({16, 4608}, torch::kInt32);
+  params.embedding.linear_state_ids.assign(16, 1);
+  params.num_accepted_tokens = torch::ones({16}, torch::kInt32);
+  params.parallel.dp_global_token_nums = {64};
+  const MluGraphPlanner planner(config);
+  const GraphDecision first = planner.plan({64, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(first));
+  const GraphPlan& plan = std::get<GraphPlan>(first);
+  EXPECT_EQ(plan.layout.num_reqs, 16);
+  EXPECT_EQ(plan.layout.tokens_per_request, 4);
+  EXPECT_EQ(plan.layout.padded_num_tokens, 64);
+  EXPECT_EQ(plan.main_block_table_columns, 4608);
+  params.meta.kv_max_seq_len = 73728;
+  const GraphDecision boundary = planner.plan({64, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(boundary));
+  EXPECT_TRUE(plan.key == std::get<GraphPlan>(boundary).key);
+  params.meta.kv_max_seq_len = 73729;
+  expect_eager(planner, 64, params, EagerReason::HISTORY_LIMIT);
+  params.meta.kv_max_seq_len = 65536;
+  params.num_accepted_tokens = torch::Tensor();
+  expect_eager(planner, 64, params, EagerReason::INVALID_LAYOUT);
+  params.num_accepted_tokens = torch::ones({16}, torch::kInt32);
+  params.embedding.linear_state_ids.clear();
+  expect_eager(planner, 64, params, EagerReason::INVALID_LAYOUT);
+  params.embedding.linear_state_ids.assign(16, 1);
+  params.attention.host.kpool_query_lens.assign(16, 1);
+  expect_eager(planner, 64, params, EagerReason::INVALID_LAYOUT);
+  params.attention.host.kpool_query_lens.assign(16, 4);
+  params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  expect_eager(planner, 64, params, EagerReason::NON_DECODE);
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  config.capabilities.replay_family = MtpReplayFamily::QWEN35;
+  expect_eager(MluGraphPlanner(config), 64, params, EagerReason::NON_DECODE);
+  config.capabilities.replay_family = MtpReplayFamily::GLM5;
+  config.options.speculative_algorithm("DFlash");
+  expect_eager(MluGraphPlanner(config), 64, params, EagerReason::NON_DECODE);
+  config.options.speculative_algorithm("DFlash2").is_draft_engine(true);
+  params.is_spec_verify = false;
+  expect_eager(MluGraphPlanner(config), 64, params, EagerReason::NON_DECODE);
 }
 
 }  // namespace

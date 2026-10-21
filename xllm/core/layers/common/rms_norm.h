@@ -17,6 +17,9 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <optional>
+#include <tuple>
+
 #include "core/framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
 #include "framework/state_dict/utils.h"
@@ -42,6 +45,12 @@ class RMSNormImpl : public torch::nn::Module {
       torch::Tensor& input,
       const torch::Tensor& fp8_scale,
       std::optional<torch::Tensor> residual = std::nullopt);
+
+  // Initializes a missing residual as an alias of input before normalization.
+  std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward_with_residual(
+      torch::Tensor& input,
+      const std::optional<torch::Tensor>& residual,
+      const std::optional<torch::Tensor>& fp8_scale = std::nullopt);
 
   void set_layernorm_mode();
 

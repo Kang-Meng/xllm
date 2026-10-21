@@ -55,7 +55,7 @@ limitations under the License.
 #include "core/runtime/acl_graph_persistent_param.h"
 #include "core/runtime/base_executor_impl.h"
 #include "core/runtime/decode_graph_bucket.h"
-#include "core/runtime/dflash_worker_impl.h"
+#include "core/runtime/dflash/dflash_worker_impl.h"
 #include "core/runtime/mtp_worker_impl.h"
 #include "core/runtime/options.h"
 #include "core/runtime/speculative_worker_impl.h"

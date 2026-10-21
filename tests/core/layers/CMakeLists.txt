@@ -2,6 +2,20 @@ include(cc_test)
 
 cc_test(
   NAME
+    dflash2_grouped_conv_common_test
+  CPU_ONLY
+  SRCS
+    dflash2_grouped_conv_test.cpp
+  DEPS
+    :common_layers
+    :state_dict
+    torch
+    glog::glog
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     compressed_tensors_test
   CPU_ONLY
   SRCS

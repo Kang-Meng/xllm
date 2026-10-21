@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "qwen2_decoder_layer.h"
+#include "core/layers/qwen2_decoder_layer.h"
 
 namespace xllm {
 namespace layer {
@@ -97,28 +97,6 @@ void Qwen2DecoderLayerImpl::verify_loaded_weights(
   }
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>>
-Qwen2DecoderLayerImpl::apply_norm(
-    RMSNorm& norm,
-    torch::Tensor& input,
-    std::optional<torch::Tensor>& residual,
-    const std::optional<torch::Tensor>& fp8_scale) {
-  const bool use_fp8_fusion = fp8_scale.has_value();
-
-  if (!residual.has_value()) {
-    // First layer: initialize residual from input
-    auto new_residual = input;
-    auto output = use_fp8_fusion
-                      ? std::get<0>(norm->forward_fp8(input, fp8_scale.value()))
-                      : std::get<0>(norm->forward(input));
-    return {output, new_residual};
-  }
-
-  // Subsequent layers: fused add + norm
-  return use_fp8_fusion ? norm->forward_fp8(input, fp8_scale.value(), residual)
-                        : norm->forward(input, residual);
-}
-
 torch::Tensor Qwen2DecoderLayerImpl::forward(
     torch::Tensor& x,
     std::optional<torch::Tensor>& residual,
@@ -130,7 +108,8 @@ torch::Tensor Qwen2DecoderLayerImpl::forward(
   auto post_fp8_scale = mlp_->get_fp8_input_scale();
 
   // Pre-attention norm
-  std::tie(x, residual) = apply_norm(input_norm_, x, residual, pre_fp8_scale);
+  std::tie(x, residual) =
+      input_norm_->forward_with_residual(x, residual, pre_fp8_scale);
 
   torch::Tensor attention_coefficients;
   if (use_dflash2_conv_) {
@@ -144,7 +123,8 @@ torch::Tensor Qwen2DecoderLayerImpl::forward(
   }
 
   // Post-attention norm
-  std::tie(x, residual) = apply_norm(post_norm_, x, residual, post_fp8_scale);
+  std::tie(x, residual) =
+      post_norm_->forward_with_residual(x, residual, post_fp8_scale);
 
   torch::Tensor mlp_coefficients;
   if (use_dflash2_conv_) {

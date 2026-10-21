@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "runtime/dflash2_worker_impl.h"
+#include "runtime/dflash/dflash2_worker_impl.h"
 
 #include <glog/logging.h>
 
@@ -739,6 +739,14 @@ DFlash2WorkerImpl::BlockSampleOutput DFlash2WorkerImpl::sample_path(
         edge_log_probs, sampling_params.temperatures, batch_size);
   }
   edge_log_probs = torch::log_softmax(edge_log_probs, /*dim=*/-1);
+
+  if (auto sampled = fused_sample(candidates.candidate_ids,
+                                  edge_log_probs,
+                                  gumbel_noise,
+                                  sampling_params,
+                                  vocab_size)) {
+    return std::move(*sampled);
+  }
 
   torch::Tensor token_ids =
       torch::empty({batch_size, num_steps}, candidates.candidate_ids.options());

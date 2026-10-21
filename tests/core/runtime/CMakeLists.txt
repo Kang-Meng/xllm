@@ -225,6 +225,18 @@ endif()
 if(USE_MLU)
   cc_test(
     NAME
+      mlu_dflash2_sampling_test
+    SRCS
+      mlu_dflash2_sampling_test.cpp
+    DEPS
+      :runtime
+      :platform
+      GTest::gtest_main
+      torch_mlu
+  )
+
+  cc_test(
+    NAME
       mlu_graph_executor_test
     SRCS
       mlu_graph_executor_test.cpp

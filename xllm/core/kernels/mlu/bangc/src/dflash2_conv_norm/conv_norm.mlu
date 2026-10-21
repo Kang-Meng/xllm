@@ -1,0 +1,326 @@
+/* Copyright 2026 The xLLM Authors.
+ * Licensed under the Apache License, Version 2.0. */
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cmath>
+#include <cstdint>
+
+#include "kernels/mlu/bangc/src/dflash2_conv_norm/launch.h"
+namespace {
+__mlu_shared__ uint8_t shared_base[32768];
+__mlu_shared__ uint8_t shared_history[524288];
+__mlu_shared__ uint8_t shared_delta[98304];
+__mlu_shared__ bfloat16_t shared_residual[48 * 4096];
+__mlu_shared__ bfloat16_t shared_weight[4096];
+template <typename Dtype>
+__mlu_func__ void transpose_both(Dtype* coefficient, const Dtype* transposed) {
+  if constexpr (sizeof(Dtype) == 2) {
+    asm volatile(
+        "trans.tiling.async.nram.nram.b16 [%0], [%1], "
+        "64,16,1024,1,0,16,64,1,0,1,0, 32,32,32,1,0,16,1024,1,0,1,0;" ::"r"(
+            coefficient),
+        "r"(transposed));
+  } else {
+    asm volatile(
+        "trans.tiling.async.nram.nram.b32 [%0], [%1], "
+        "64,16,2048,1,0,32,64,1,0,1,0, 64,16,64,1,0,32,1024,1,0,1,0;" ::"r"(
+            coefficient),
+        "r"(transposed));
+  }
+}
+// Independent token chunks share history and coalesce both input tap producers.
+template <typename Dtype, int32_t Rows, int32_t Block, bool BalanceTail = false>
+__mlu_global__ void conv_norm_shared(const Dtype* hidden,
+                                     const Dtype* delta,
+                                     const Dtype* base,
+                                     const Dtype* residual,
+                                     const Dtype* weight,
+                                     Dtype* output,
+                                     Dtype* residual_out,
+                                     int64_t tokens,
+                                     int32_t block_size,
+                                     int64_t delta_row,
+                                     float eps) {
+  constexpr int32_t kWidth = 4096;
+  constexpr int32_t kGroups = kWidth / 16;
+  constexpr int32_t kRows = Rows;
+  __nram__ Dtype cached_transposed[2 * kWidth];
+  __nram__ Dtype history[(kRows + 1) * kWidth];
+  __nram__ Dtype coefficient_storage[4 * kWidth];
+  __nram__ Dtype contribution[kWidth];
+  Dtype* result = history + kWidth;
+  __nram__ Dtype tap_delta[kRows * 2 * kGroups];
+  __nram__ Dtype transposed_storage[4 * kWidth];
+  __nram__ Dtype residual_storage[kRows * kWidth];
+  __nram__ Dtype weight_n[kWidth];
+  __nram__ float norm_weight[kWidth];
+  __nram__ float norm_value[kWidth];
+  __nram__ float norm_temp[kWidth];
+  // Keep complete waves unchanged. Spread an incomplete final wave over all
+  // IPUs instead of assigning an entire Rows tile to the first IPU.
+  for (int64_t wave_start = 0; wave_start < tokens; wave_start += 32 * kRows) {
+    int32_t cluster_rows = 4 * kRows;
+    int32_t core_rows = kRows;
+    int32_t core_offset = coreId * kRows;
+    int64_t cluster_start = wave_start + taskIdY * 4 * kRows;
+    const int64_t remaining = tokens - wave_start;
+    if constexpr (BalanceTail) {
+      if (remaining < 32 * kRows) {
+        const int32_t rows_per_cluster = static_cast<int32_t>(remaining / 8);
+        const int32_t extra_clusters = static_cast<int32_t>(remaining % 8);
+        cluster_rows = rows_per_cluster + (taskIdY < extra_clusters ? 1 : 0);
+        cluster_start = wave_start + taskIdY * rows_per_cluster +
+                        (taskIdY < extra_clusters ? taskIdY : extra_clusters);
+        const int32_t rows_per_core = cluster_rows / 4;
+        const int32_t extra_cores = cluster_rows % 4;
+        core_rows = rows_per_core + (coreId < extra_cores ? 1 : 0);
+        core_offset = coreId * rows_per_core +
+                      (coreId < extra_cores ? coreId : extra_cores);
+      }
+    } else {
+      cluster_rows = static_cast<int32_t>(tokens - cluster_start < 4 * kRows
+                                              ? tokens - cluster_start
+                                              : 4 * kRows);
+      const int64_t start = cluster_start + core_offset;
+      core_rows =
+          static_cast<int32_t>(tokens - start < kRows ? tokens - start : kRows);
+    }
+    if (cluster_start >= tokens || cluster_rows <= 0) {
+      break;
+    }
+    if (__is_mpu()) {
+      if (wave_start == 0) {
+        __memcpy_io1_async(
+            shared_base, base, 2 * kWidth * sizeof(Dtype), GDRAM2SRAM);
+        __memcpy_io1_async(
+            shared_weight, weight, kWidth * sizeof(Dtype), GDRAM2SRAM);
+      }
+      Dtype* shared_h = reinterpret_cast<Dtype*>(shared_history);
+      Dtype* shared_d = reinterpret_cast<Dtype*>(shared_delta);
+      if (cluster_start > 0) {
+        __memcpy_async(shared_h,
+                       hidden + (cluster_start - 1) * kWidth,
+                       (cluster_rows + 1) * kWidth * sizeof(Dtype),
+                       GDRAM2SRAM);
+      } else {
+        __memcpy_async(shared_h + kWidth,
+                       hidden,
+                       cluster_rows * kWidth * sizeof(Dtype),
+                       GDRAM2SRAM);
+      }
+      __memcpy_io1_async(shared_d,
+                         delta + cluster_start * delta_row,
+                         2 * kGroups * sizeof(Dtype),
+                         GDRAM2SRAM,
+                         2 * kGroups * sizeof(Dtype),
+                         delta_row * sizeof(Dtype),
+                         cluster_rows - 1);
+      __memcpy_io1_async(shared_residual,
+                         residual + cluster_start * kWidth,
+                         cluster_rows * kWidth * sizeof(Dtype),
+                         GDRAM2SRAM);
+    }
+    __sync_cluster();
+    const int64_t start = cluster_start + core_offset;
+    if (!__is_mpu() && core_rows > 0) {
+      if (wave_start == 0) {
+        if constexpr (sizeof(Dtype) == 2) {
+          asm volatile(
+              "trans.tiling.async.nram.sram.b16 [%0], [%1], "
+              "32,32,32,1,0,16,1024,1,0,1,0, 64,16,1024,1,0,16,64,1,0,1,0;" ::
+                  "r"(cached_transposed),
+              "r"(shared_base));
+        } else {
+          asm volatile(
+              "trans.tiling.async.nram.sram.b32 [%0], [%1], "
+              "64,16,64,1,0,32,1024,1,0,1,0, 64,16,2048,1,0,32,64,1,0,1,0;" ::
+                  "r"(cached_transposed),
+              "r"(shared_base));
+        }
+        __memcpy_async(
+            weight_n, shared_weight, kWidth * sizeof(Dtype), SRAM2NRAM);
+        asm volatile("sync.pmv.csimd;");
+        __bang_bfloat162float(norm_weight, weight_n, kWidth);
+      }
+      const int32_t rows = core_rows;
+      Dtype* shared_h = reinterpret_cast<Dtype*>(shared_history);
+      Dtype* shared_d = reinterpret_cast<Dtype*>(shared_delta);
+      if (start > 0) {
+        __memcpy_async(history,
+                       shared_h + core_offset * kWidth,
+                       (rows + 1) * kWidth * sizeof(Dtype),
+                       SRAM2NRAM);
+      } else {
+        __memcpy_async(history + kWidth,
+                       shared_h + kWidth,
+                       rows * kWidth * sizeof(Dtype),
+                       SRAM2NRAM);
+      }
+      __memcpy_async(tap_delta,
+                     shared_d + core_offset * 2 * kGroups,
+                     rows * 2 * kGroups * sizeof(Dtype),
+                     SRAM2NRAM);
+      __memcpy_async(residual_storage,
+                     shared_residual + core_offset * kWidth,
+                     rows * kWidth * sizeof(Dtype),
+                     SRAM2NRAM);
+      asm volatile("sync.pmv.csimd;");
+    }
+    if (wave_start + 32 * kRows < tokens) {
+      __sync_cluster();
+    }
+    if (!__is_mpu() && core_rows > 0) {
+      const int32_t rows = core_rows;
+      const int32_t initial_slot = (rows - 1) & 1;
+      __bang_cycle_add(transposed_storage + initial_slot * 2 * kWidth,
+                       cached_transposed,
+                       tap_delta + (rows - 1) * 2 * kGroups,
+                       2 * kWidth,
+                       2 * kGroups);
+      asm volatile("sync.psimd.cmv;");
+      transpose_both(coefficient_storage + initial_slot * 2 * kWidth,
+                     transposed_storage + initial_slot * 2 * kWidth);
+
+#pragma unroll
+      for (int32_t row = kRows - 1; row >= 0; --row) {
+        if (row < rows) {
+          int32_t position;
+          if constexpr (Block > 0) {
+            if constexpr (!BalanceTail && Rows % Block == 0) {
+              position = row % Block;
+            } else {
+              position = static_cast<int32_t>(start + row) % Block;
+            }
+          } else {
+            position = static_cast<int32_t>(start + row) % block_size;
+          }
+          const int64_t token = start + row;
+          Dtype* coefficient = coefficient_storage + (row & 1) * 2 * kWidth;
+          if (row > 0) {
+            __bang_cycle_add(transposed_storage + ((row - 1) & 1) * 2 * kWidth,
+                             cached_transposed,
+                             tap_delta + (row - 1) * 2 * kGroups,
+                             2 * kWidth,
+                             2 * kGroups);
+          }
+          asm volatile("sync.pmv.csimd;");
+          if (row > 0) {
+            asm volatile("sync.psimd.cmv;");
+            transpose_both(coefficient_storage + ((row - 1) & 1) * 2 * kWidth,
+                           transposed_storage + ((row - 1) & 1) * 2 * kWidth);
+          }
+#pragma unroll
+          for (int32_t tap = 0; tap < 2; ++tap) {
+            if (tap > token) {
+              continue;
+            }
+            if (tap == 0) {
+              __bang_mul(result + row * kWidth,
+                         coefficient + tap * kWidth,
+                         history + (row + 1 - tap) * kWidth,
+                         kWidth);
+            } else {
+              __bang_mul(contribution,
+                         coefficient + tap * kWidth,
+                         history + (row + 1 - tap) * kWidth,
+                         kWidth);
+              if (position == 0) {
+                __bang_mul_scalar(
+                    contribution, contribution, static_cast<Dtype>(0), kWidth);
+              }
+              __bang_add(result + row * kWidth,
+                         result + row * kWidth,
+                         contribution,
+                         kWidth);
+            }
+          }
+          Dtype* row_result = result + row * kWidth;
+          Dtype* row_residual = residual_storage + row * kWidth;
+          asm volatile(
+              "add.nram.f32.bf16 [%0], [%1], [%2], 4096;" ::"r"(norm_value),
+              "r"(row_result),
+              "r"(row_residual)
+              : "memory");
+          __bang_float2bfloat16_rn(row_residual, norm_value, kWidth);
+          asm volatile("sync.psimd.cio;" ::: "memory");
+          __memcpy_async(residual_out + token * kWidth,
+                         row_residual,
+                         kWidth * sizeof(Dtype),
+                         NRAM2GDRAM);
+          __bang_mul(norm_temp, norm_value, norm_value, kWidth);
+          const float sum = __bang_sum(norm_temp, kWidth);
+          const float scale = 1.0f / sqrtf(sum / kWidth + eps);
+          __bang_mul_scalar(norm_value, norm_value, scale, kWidth);
+          asm volatile(
+              "mult.nram.bf16.f32 [%0], [%1], [%2], 4096;" ::"r"(row_result),
+              "r"(norm_value),
+              "r"(norm_weight)
+              : "memory");
+          asm volatile("sync.psimd.cio;" ::: "memory");
+          __memcpy_async(output + (start + row) * kWidth,
+                         result + row * kWidth,
+                         kWidth * sizeof(Dtype),
+                         NRAM2GDRAM);
+        }
+      }
+    }
+  }
+  __sync();
+}
+}  // namespace
+extern "C" void dflash2_conv_norm_launch(void* queue,
+                                         const void* hidden,
+                                         const void* delta,
+                                         const void* base,
+                                         const void* residual,
+                                         const void* weight,
+                                         void* output,
+                                         void* residual_out,
+                                         int32_t tokens,
+                                         int32_t block_size,
+                                         int64_t delta_row,
+                                         float eps) {
+  const cnrtDim3_t grid = {4, 8, 1};
+#define LAUNCH_IMPL(Rows, Block, Balance)                              \
+  conv_norm_shared<bfloat16_t, Rows, Block, Balance>                   \
+      <<<grid, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>( \
+          static_cast<const bfloat16_t*>(hidden),                      \
+          static_cast<const bfloat16_t*>(delta),                       \
+          static_cast<const bfloat16_t*>(base),                        \
+          static_cast<const bfloat16_t*>(residual),                    \
+          static_cast<const bfloat16_t*>(weight),                      \
+          static_cast<bfloat16_t*>(output),                            \
+          static_cast<bfloat16_t*>(residual_out),                      \
+          tokens,                                                      \
+          block_size,                                                  \
+          delta_row,                                                   \
+          eps)
+#define LAUNCH(Rows, Block)            \
+  do {                                 \
+    if (tokens % (32 * Rows) != 0) {   \
+      LAUNCH_IMPL(Rows, Block, true);  \
+    } else {                           \
+      LAUNCH_IMPL(Rows, Block, false); \
+    }                                  \
+  } while (false)
+  if (block_size == 6) {
+    if (tokens >= 384) {
+      LAUNCH(12, 6);
+    } else if (tokens >= 128) {
+      LAUNCH(6, 6);
+    } else {
+      LAUNCH(3, 6);
+    }
+  } else {
+    if (tokens >= 256) {
+      LAUNCH(8, 4);
+    } else if (tokens >= 128) {
+      LAUNCH(4, 4);
+    } else {
+      LAUNCH(2, 4);
+    }
+  }
+#undef LAUNCH
+#undef LAUNCH_IMPL
+}

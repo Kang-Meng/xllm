@@ -41,6 +41,22 @@ if(USE_NPU)
 endif()
 
 if(USE_MLU)
+  cc_test(
+    NAME
+      dflash2_mlu_model_test
+    SRCS
+      dflash2_mlu_model_test.cpp
+    DEPS
+      models
+      :mlu_layers
+      :common_layers
+      :parallel_state
+      :model_context
+      :state_dict
+      GTest::gtest_main
+      torch_mlu
+  )
+
   # Uses CPU tensors and forks before any MLU device initialization.
   cc_test(
     NAME

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ torch::Tensor dflash2_grouped_conv(const torch::Tensor& hidden_states,
                                    int32_t group_size,
                                    int32_t taps);
 
-class DFlash2GroupedConvImpl final : public torch::nn::Module {
+class DFlash2GroupedConvImpl : public torch::nn::Module {
  public:
   DFlash2GroupedConvImpl(int64_t hidden_size,
                          int32_t taps,
@@ -50,11 +50,20 @@ class DFlash2GroupedConvImpl final : public torch::nn::Module {
   void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights(const std::string& prefix) const;
 
- private:
-  torch::Tensor convolve(const torch::Tensor& hidden_states,
-                         const torch::Tensor& delta,
-                         int32_t side) const;
+ protected:
+  virtual torch::Tensor convolve(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& delta,
+                                 const torch::Tensor& base) const;
 
+  torch::Tensor output_kernel() const {
+    return base_kernel_.select(/*dim=*/0, /*index=*/1);
+  }
+  int32_t block_size() const { return block_size_; }
+  int32_t group_size() const { return group_size_; }
+  int32_t num_groups() const { return num_groups_; }
+  int32_t taps() const { return taps_; }
+
+ private:
   AddMatmul kernel_projection_{nullptr};
   torch::Tensor base_kernel_;
   bool base_kernel_is_loaded_ = false;

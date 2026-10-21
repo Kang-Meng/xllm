@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "rms_norm.h"
+#include "core/layers/common/rms_norm.h"
 
 #include <glog/logging.h>
 
@@ -126,6 +126,23 @@ RMSNormImpl::forward_fp8(torch::Tensor& input,
 
     return std::make_tuple(output, std::nullopt);
   }
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>>
+RMSNormImpl::forward_with_residual(
+    torch::Tensor& input,
+    const std::optional<torch::Tensor>& residual,
+    const std::optional<torch::Tensor>& fp8_scale) {
+  if (!residual.has_value()) {
+    auto new_residual = input;
+    auto output = fp8_scale.has_value()
+                      ? std::get<0>(forward_fp8(input, fp8_scale.value()))
+                      : std::get<0>(forward(input));
+    return {output, new_residual};
+  }
+
+  return fp8_scale.has_value() ? forward_fp8(input, fp8_scale.value(), residual)
+                               : forward(input, residual);
 }
 
 void RMSNormImpl::load_state_dict(const StateDict& state_dict) {

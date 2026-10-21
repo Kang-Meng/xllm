@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ limitations under the License.
 #include "framework/request/stopping_checker.h"
 #include "layers/common/attention_metadata.h"
 #include "platform/device.h"
-#include "runtime/dflash2_worker_impl.h"
+#include "runtime/dflash/dflash2_worker_impl.h"
 #include "runtime/dspark_worker_impl.h"
 #include "torch_npu/csrc/core/npu/NPUGraph.h"
 

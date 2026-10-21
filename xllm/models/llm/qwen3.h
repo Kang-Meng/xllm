@@ -27,11 +27,11 @@ limitations under the License.
 
 namespace xllm {
 
-class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
+template <typename DecoderLayer>
+class QWen3ModelImplBase : public LlmModelImplBase<DecoderLayer> {
  public:
-  QWen3ModelImpl(const ModelContext& context)
-      : LlmModelImplBase<layer::Qwen3DecoderLayer>("qwen3",
-                                                   context.get_model_args()) {
+  explicit QWen3ModelImplBase(const ModelContext& context)
+      : LlmModelImplBase<DecoderLayer>("qwen3", context.get_model_args()) {
     // register submodules
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
@@ -45,15 +45,15 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
     }
 
     layers_.reserve(model_args.n_layers());
-    norm_ = register_module("norm", layer::RMSNorm(context));
+    norm_ = this->register_module("norm", layer::RMSNorm(context));
     // DFlash2 consumes the target model's embedding table.  Do not allocate a
     // draft-local copy here: set_word_embedding() binds the shared target
     // module after both workers finish loading.  Merely replacing the holder
-    // after register_module() would leave the original large-vocabulary module
-    // owned by torch::nn::Module and keep its device memory alive.
+    // after register_module() would leave the original large-vocabulary
+    // module owned by torch::nn::Module and keep its device memory alive.
     if (!is_dflash2_draft_model_type(model_args.model_type())) {
       embed_tokens_ =
-          register_module("embed_tokens", layer::WordEmbedding(context));
+          this->register_module("embed_tokens", layer::WordEmbedding(context));
     }
 #if defined(USE_NPU)
     attn_mask_ = layer::AttentionMask(
@@ -62,7 +62,7 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
         options.device(), options.dtype().toScalarType(), /*mask_value=*/1);
 #endif
     for (int32_t i = 0; i < model_args.n_layers(); i++) {
-      auto layer = layer::Qwen3DecoderLayer(context, i);
+      auto layer = DecoderLayer(context, i);
       layers_.push_back(layer);
     }
   }
@@ -189,6 +189,14 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
   }
 
  protected:
+  using LlmModelImplBase<DecoderLayer>::cos_sin_;
+  using LlmModelImplBase<DecoderLayer>::embed_tokens_;
+  using LlmModelImplBase<DecoderLayer>::layers_;
+  using LlmModelImplBase<DecoderLayer>::max_seq_len_;
+  using LlmModelImplBase<DecoderLayer>::model_args_;
+  using LlmModelImplBase<DecoderLayer>::mrope_section_;
+  using LlmModelImplBase<DecoderLayer>::norm_;
+
   virtual layer::AttentionMetadata get_attention_metadata(
       const ModelInputParams& params,
       const torch::Tensor& h) {
@@ -249,6 +257,12 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
   layer::AttentionMask attn_mask_;
   layer::AttentionMask dense_attn_mask_;
 #endif
+};
+
+class QWen3ModelImpl : public QWen3ModelImplBase<layer::Qwen3DecoderLayer> {
+ public:
+  explicit QWen3ModelImpl(const ModelContext& context)
+      : QWen3ModelImplBase<layer::Qwen3DecoderLayer>(context) {}
 };
 TORCH_MODULE(QWen3Model);
 

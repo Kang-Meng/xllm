@@ -1,0 +1,430 @@
+/* Copyright 2026 The xLLM Authors.
+ * Licensed under the Apache License, Version 2.0. */
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cstdint>
+
+#include "kernels/mlu/bangc/src/dflash2_grouped_conv/launcher.h"
+
+namespace {
+constexpr int32_t kCapacity = 4096;
+__mlu_shared__ uint8_t shared_base[32768];
+__mlu_shared__ uint8_t shared_history[524288];
+__mlu_shared__ uint8_t shared_delta[98304];
+
+template <typename Dtype>
+__mlu_func__ void load_channels(Dtype* dst,
+                                const Dtype* src,
+                                int32_t length,
+                                int64_t stride) {
+  if (stride == 1) {
+    __memcpy_async(dst, src, length * sizeof(Dtype), GDRAM2NRAM);
+  } else if (stride <= INT32_MAX / static_cast<int64_t>(sizeof(Dtype))) {
+    __memcpy_async(dst,
+                   src,
+                   sizeof(Dtype),
+                   GDRAM2NRAM,
+                   sizeof(Dtype),
+                   static_cast<int32_t>(stride * sizeof(Dtype)),
+                   length - 1);
+  } else {
+    // The 2D DMA byte stride is int32; Tensor offsets remain int64.
+    for (int32_t channel = 0; channel < length; ++channel) {
+      __memcpy_async(
+          dst + channel, src + channel * stride, sizeof(Dtype), GDRAM2NRAM);
+    }
+  }
+}
+
+template <typename Dtype>
+__mlu_global__ void grouped_conv(const Dtype* hidden,
+                                 const Dtype* delta,
+                                 const Dtype* base,
+                                 Dtype* output,
+                                 int64_t tokens,
+                                 int64_t channels,
+                                 int32_t block_size,
+                                 int32_t group_size,
+                                 int32_t taps,
+                                 int64_t hidden_row,
+                                 int64_t hidden_channel,
+                                 int64_t delta_row,
+                                 int64_t delta_tap,
+                                 int64_t delta_group,
+                                 int64_t base_tap,
+                                 int64_t base_channel) {
+  __nram__ Dtype history[kCapacity];
+  __nram__ Dtype coefficient[kCapacity];
+  __nram__ Dtype contribution[kCapacity];
+  __nram__ Dtype result[kCapacity];
+  __nram__ Dtype tap_delta[kCapacity];
+  __nram__ Dtype transposed[kCapacity];
+  const int64_t groups = channels / group_size;
+  const int32_t tile_groups = kCapacity / group_size;
+  const int64_t group_tiles = (groups + tile_groups - 1) / tile_groups;
+  for (int64_t tile = taskId; tile < tokens * group_tiles; tile += taskDim) {
+    const int64_t token = tile / group_tiles;
+    const int64_t first_group = (tile % group_tiles) * tile_groups;
+    const int32_t count_groups = static_cast<int32_t>(
+        groups - first_group < tile_groups ? groups - first_group
+                                           : tile_groups);
+    const int32_t count = count_groups * group_size;
+    const int64_t channel = first_group * group_size;
+    for (int32_t tap = 0; tap < taps && tap <= token; ++tap) {
+      asm volatile("sync.psimd.cio;");
+      load_channels(
+          history,
+          hidden + (token - tap) * hidden_row + channel * hidden_channel,
+          count,
+          hidden_channel);
+      load_channels(coefficient,
+                    base + tap * base_tap + channel * base_channel,
+                    count,
+                    base_channel);
+      load_channels(tap_delta,
+                    delta + token * delta_row + tap * delta_tap +
+                        first_group * delta_group,
+                    count_groups,
+                    delta_group);
+      asm volatile("sync.pio.csimd;");
+      if (count_groups >= 4) {
+        __bang_transpose(transposed, coefficient, count_groups, group_size);
+        __bang_cycle_add(
+            transposed, transposed, tap_delta, count, count_groups);
+        __bang_transpose(coefficient, transposed, group_size, count_groups);
+      } else {
+        for (int32_t group = 0; group < count_groups; ++group) {
+          __bang_add_scalar(coefficient + group * group_size,
+                            coefficient + group * group_size,
+                            tap_delta[group],
+                            group_size);
+        }
+      }
+      if (tap == 0) {
+        __bang_mul(result, coefficient, history, count);
+      } else {
+        __bang_mul(contribution, coefficient, history, count);
+        if (token % block_size < tap) {
+          __bang_mul_scalar(
+              contribution, contribution, static_cast<Dtype>(0), count);
+        }
+        __bang_add(result, result, contribution, count);
+      }
+    }
+    __memcpy(output + token * channels + channel,
+             result,
+             count * sizeof(Dtype),
+             NRAM2GDRAM);
+  }
+}
+template <typename Dtype>
+__mlu_func__ void transpose_both(Dtype* coefficient, const Dtype* transposed) {
+  if constexpr (sizeof(Dtype) == 2) {
+    asm volatile(
+        "trans.tiling.async.nram.nram.b16 [%0], [%1], "
+        "64,16,1024,1,0,16,64,1,0,1,0, 32,32,32,1,0,16,1024,1,0,1,0;" ::"r"(
+            coefficient),
+        "r"(transposed));
+  } else {
+    asm volatile(
+        "trans.tiling.async.nram.nram.b32 [%0], [%1], "
+        "64,16,2048,1,0,32,64,1,0,1,0, 64,16,64,1,0,32,1024,1,0,1,0;" ::"r"(
+            coefficient),
+        "r"(transposed));
+  }
+}
+// Independent token chunks share history and coalesce both input tap producers.
+template <typename Dtype, int32_t Rows, int32_t Block>
+__mlu_global__ void grouped_conv_cached(const Dtype* hidden,
+                                        const Dtype* delta,
+                                        const Dtype* base,
+                                        Dtype* output,
+                                        int64_t tokens,
+                                        int32_t block_size,
+                                        int64_t delta_row) {
+  constexpr int32_t kWidth = 4096;
+  constexpr int32_t kGroups = kWidth / 16;
+  constexpr int32_t kRows = Rows;
+  __nram__ Dtype cached_transposed[2 * kWidth];
+  __nram__ Dtype history[(kRows + 1) * kWidth];
+  __nram__ Dtype coefficient_storage[4 * kWidth];
+  __nram__ Dtype contribution[kWidth];
+  Dtype* result = history + kWidth;
+  __nram__ Dtype tap_delta[kRows * 2 * kGroups];
+  __nram__ Dtype transposed_storage[4 * kWidth];
+  for (int64_t cluster_start = taskIdY * 4 * kRows; cluster_start < tokens;
+       cluster_start += 32 * kRows) {
+    const int32_t cluster_rows = static_cast<int32_t>(
+        tokens - cluster_start < 4 * kRows ? tokens - cluster_start
+                                           : 4 * kRows);
+    if (__is_mpu()) {
+      if (cluster_start == taskIdY * 4 * kRows) {
+        __memcpy_io1_async(
+            shared_base, base, 2 * kWidth * sizeof(Dtype), GDRAM2SRAM);
+      }
+      Dtype* shared_h = reinterpret_cast<Dtype*>(shared_history);
+      Dtype* shared_d = reinterpret_cast<Dtype*>(shared_delta);
+      if (cluster_start > 0) {
+        __memcpy_async(shared_h,
+                       hidden + (cluster_start - 1) * kWidth,
+                       (cluster_rows + 1) * kWidth * sizeof(Dtype),
+                       GDRAM2SRAM);
+      } else {
+        __memcpy_async(shared_h + kWidth,
+                       hidden,
+                       cluster_rows * kWidth * sizeof(Dtype),
+                       GDRAM2SRAM);
+      }
+      __memcpy_io1_async(shared_d,
+                         delta + cluster_start * delta_row,
+                         2 * kGroups * sizeof(Dtype),
+                         GDRAM2SRAM,
+                         2 * kGroups * sizeof(Dtype),
+                         static_cast<int32_t>(delta_row * sizeof(Dtype)),
+                         cluster_rows - 1);
+    }
+    __sync_cluster();
+    const int64_t start = cluster_start + coreId * kRows;
+    if (!__is_mpu() && start < tokens) {
+      if (cluster_start == taskIdY * 4 * kRows) {
+        if constexpr (sizeof(Dtype) == 2) {
+          asm volatile(
+              "trans.tiling.async.nram.sram.b16 [%0], [%1], "
+              "32,32,32,1,0,16,1024,1,0,1,0, 64,16,1024,1,0,16,64,1,0,1,0;" ::
+                  "r"(cached_transposed),
+              "r"(shared_base));
+        } else {
+          asm volatile(
+              "trans.tiling.async.nram.sram.b32 [%0], [%1], "
+              "64,16,64,1,0,32,1024,1,0,1,0, 64,16,2048,1,0,32,64,1,0,1,0;" ::
+                  "r"(cached_transposed),
+              "r"(shared_base));
+        }
+        asm volatile("sync.pmv.csimd;");
+      }
+      const int32_t rows =
+          static_cast<int32_t>(tokens - start < kRows ? tokens - start : kRows);
+      Dtype* shared_h = reinterpret_cast<Dtype*>(shared_history);
+      Dtype* shared_d = reinterpret_cast<Dtype*>(shared_delta);
+      if (start > 0) {
+        __memcpy_async(history,
+                       shared_h + coreId * kRows * kWidth,
+                       (rows + 1) * kWidth * sizeof(Dtype),
+                       SRAM2NRAM);
+      } else {
+        __memcpy_async(history + kWidth,
+                       shared_h + kWidth,
+                       rows * kWidth * sizeof(Dtype),
+                       SRAM2NRAM);
+      }
+      __memcpy_async(tap_delta,
+                     shared_d + coreId * kRows * 2 * kGroups,
+                     rows * 2 * kGroups * sizeof(Dtype),
+                     SRAM2NRAM);
+      asm volatile("sync.pmv.csimd;");
+    }
+    if (cluster_start + 32 * kRows < tokens) {
+      __sync_cluster();
+    }
+    if (!__is_mpu() && start < tokens) {
+      const int32_t rows =
+          static_cast<int32_t>(tokens - start < kRows ? tokens - start : kRows);
+      const int32_t initial_slot = (rows - 1) & 1;
+      __bang_cycle_add(transposed_storage + initial_slot * 2 * kWidth,
+                       cached_transposed,
+                       tap_delta + (rows - 1) * 2 * kGroups,
+                       2 * kWidth,
+                       2 * kGroups);
+      asm volatile("sync.psimd.cmv;");
+      transpose_both(coefficient_storage + initial_slot * 2 * kWidth,
+                     transposed_storage + initial_slot * 2 * kWidth);
+
+#pragma unroll
+      for (int32_t row = kRows - 1; row >= 0; --row) {
+        if (row < rows) {
+          int32_t position;
+          if constexpr (Block > 0) {
+            if constexpr (Rows % Block == 0) {
+              position = row % Block;
+            } else {
+              position = static_cast<int32_t>(start + row) % Block;
+            }
+          } else {
+            position = static_cast<int32_t>(start + row) % block_size;
+          }
+          const int64_t token = start + row;
+          Dtype* coefficient = coefficient_storage + (row & 1) * 2 * kWidth;
+          if (row > 0) {
+            __bang_cycle_add(transposed_storage + ((row - 1) & 1) * 2 * kWidth,
+                             cached_transposed,
+                             tap_delta + (row - 1) * 2 * kGroups,
+                             2 * kWidth,
+                             2 * kGroups);
+          }
+          asm volatile("sync.pmv.csimd;");
+          if (row > 0) {
+            asm volatile("sync.psimd.cmv;");
+            transpose_both(coefficient_storage + ((row - 1) & 1) * 2 * kWidth,
+                           transposed_storage + ((row - 1) & 1) * 2 * kWidth);
+          }
+#pragma unroll
+          for (int32_t tap = 0; tap < 2; ++tap) {
+            if (tap > token) {
+              continue;
+            }
+            if (tap == 0) {
+              __bang_mul(result + row * kWidth,
+                         coefficient + tap * kWidth,
+                         history + (row + 1 - tap) * kWidth,
+                         kWidth);
+            } else {
+              __bang_mul(contribution,
+                         coefficient + tap * kWidth,
+                         history + (row + 1 - tap) * kWidth,
+                         kWidth);
+              if (position == 0) {
+                __bang_mul_scalar(
+                    contribution, contribution, static_cast<Dtype>(0), kWidth);
+              }
+              __bang_add(result + row * kWidth,
+                         result + row * kWidth,
+                         contribution,
+                         kWidth);
+            }
+          }
+          asm volatile("sync.psimd.cio;");
+          __memcpy_async(output + (start + row) * kWidth,
+                         result + row * kWidth,
+                         kWidth * sizeof(Dtype),
+                         NRAM2GDRAM);
+        }
+      }
+    }
+  }
+  __sync();
+}
+}  // namespace
+
+extern "C" void dflash2_conv_launch(void* queue,
+                                    const void* hidden,
+                                    const void* delta,
+                                    const void* base,
+                                    void* output,
+                                    int32_t dtype,
+                                    int64_t tokens,
+                                    int64_t channels,
+                                    int32_t block_size,
+                                    int32_t group_size,
+                                    int32_t taps,
+                                    int64_t hidden_row,
+                                    int64_t hidden_channel,
+                                    int64_t delta_row,
+                                    int64_t delta_tap,
+                                    int64_t delta_group,
+                                    int64_t base_tap,
+                                    int64_t base_channel) {
+  const cnrtDim3_t grid = {32, 1, 1};
+  const cnrtDim3_t union_grid = {4, 8, 1};
+  if (tokens <= 2147483647 && channels == 4096 && group_size == 16 &&
+      taps == 2 && hidden_row == 4096 && hidden_channel == 1 &&
+      delta_tap == 256 && delta_group == 1 && base_tap == 4096 &&
+      base_channel == 1 && delta_row <= INT32_MAX / (dtype == 2 ? 4 : 2)) {
+#define LAUNCH_CACHED_BLOCK(Dtype, Rows, Block)                              \
+  grouped_conv_cached<Dtype, Rows, Block>                                    \
+      <<<union_grid, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>( \
+          static_cast<const Dtype*>(hidden),                                 \
+          static_cast<const Dtype*>(delta),                                  \
+          static_cast<const Dtype*>(base),                                   \
+          static_cast<Dtype*>(output),                                       \
+          tokens,                                                            \
+          block_size,                                                        \
+          delta_row)
+#define LAUNCH_CACHED(Dtype, Rows)         \
+  do {                                     \
+    if (block_size == 4) {                 \
+      LAUNCH_CACHED_BLOCK(Dtype, Rows, 4); \
+    } else if (block_size == 6) {          \
+      LAUNCH_CACHED_BLOCK(Dtype, Rows, 6); \
+    } else {                               \
+      LAUNCH_CACHED_BLOCK(Dtype, Rows, 0); \
+    }                                      \
+  } while (0)
+    if (tokens >= 384 && block_size == 6 && dtype != 2) {
+      if (dtype == 0) {
+        LAUNCH_CACHED(half, 12);
+      } else {
+        LAUNCH_CACHED(bfloat16_t, 12);
+      }
+    } else if (tokens >= 256 && block_size != 6 && dtype != 2) {
+      if (dtype == 0) {
+        LAUNCH_CACHED(half, 8);
+      } else {
+        LAUNCH_CACHED(bfloat16_t, 8);
+      }
+    } else if (tokens >= 128 && block_size == 6) {
+      if (dtype == 0) {
+        LAUNCH_CACHED(half, 6);
+      } else if (dtype == 1) {
+        LAUNCH_CACHED(bfloat16_t, 6);
+      } else {
+        LAUNCH_CACHED(float, 6);
+      }
+    } else if (tokens >= 128) {
+      if (dtype == 0) {
+        LAUNCH_CACHED(half, 4);
+      } else if (dtype == 1) {
+        LAUNCH_CACHED(bfloat16_t, 4);
+      } else {
+        LAUNCH_CACHED(float, 4);
+      }
+    } else if (block_size == 6) {
+      if (dtype == 0) {
+        LAUNCH_CACHED(half, 3);
+      } else if (dtype == 1) {
+        LAUNCH_CACHED(bfloat16_t, 3);
+      } else {
+        LAUNCH_CACHED(float, 3);
+      }
+    } else {
+      if (dtype == 0) {
+        LAUNCH_CACHED(half, 2);
+      } else if (dtype == 1) {
+        LAUNCH_CACHED(bfloat16_t, 2);
+      } else {
+        LAUNCH_CACHED(float, 2);
+      }
+    }
+#undef LAUNCH_CACHED
+#undef LAUNCH_CACHED_BLOCK
+    return;
+  }
+
+#define LAUNCH_CONV(Dtype)                                            \
+  grouped_conv<Dtype>                                                 \
+      <<<grid, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(queue)>>>( \
+          static_cast<const Dtype*>(hidden),                          \
+          static_cast<const Dtype*>(delta),                           \
+          static_cast<const Dtype*>(base),                            \
+          static_cast<Dtype*>(output),                                \
+          tokens,                                                     \
+          channels,                                                   \
+          block_size,                                                 \
+          group_size,                                                 \
+          taps,                                                       \
+          hidden_row,                                                 \
+          hidden_channel,                                             \
+          delta_row,                                                  \
+          delta_tap,                                                  \
+          delta_group,                                                \
+          base_tap,                                                   \
+          base_channel)
+  if (dtype == 0) {
+    LAUNCH_CONV(half);
+  } else if (dtype == 1) {
+    LAUNCH_CONV(bfloat16_t);
+  } else {
+    LAUNCH_CONV(float);
+  }
+#undef LAUNCH_CONV
+}

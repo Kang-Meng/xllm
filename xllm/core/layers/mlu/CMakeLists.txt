@@ -4,6 +4,8 @@ cc_library(
   NAME
     mlu_layers
   HDRS
+    dflash2_grouped_conv.h
+    dflash2_decoder_layer.h
     dflash2_context_kv.h
     attention.h
     dcp_batch_metadata.h
@@ -40,6 +42,8 @@ cc_library(
     qwen3_5/qwen3_next_rms_norm.h
     moe_softplus_topk.h
   SRCS
+    dflash2_grouped_conv.cpp
+    dflash2_decoder_layer.cpp
     dflash2_context_kv.cpp
     attention.cpp
     dcp_batch_metadata.cpp

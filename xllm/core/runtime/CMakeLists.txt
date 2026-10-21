@@ -46,9 +46,9 @@ cc_library(
     mtp_worker_impl.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
-    dflash_worker_impl.h
+    dflash/dflash_worker_impl.h
     draft_model_config.h
-    dflash2_worker_impl.h
+    dflash/dflash2_worker_impl.h
     dspark_worker_impl.h
     forward_shared_memory_manager.h
     worker_rendezvous.h
@@ -91,8 +91,10 @@ cc_library(
     mtp_worker_impl.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp
-    dflash_worker_impl.cpp
-    dflash2_worker_impl.cpp
+    dflash/dflash_worker_impl.cpp
+    dflash/dflash2_worker_impl.cpp
+    $<$<BOOL:${USE_MLU}>:dflash/mlu_fused_sampling.cpp>
+    $<$<NOT:$<BOOL:${USE_MLU}>>:dflash/default_fused_sampling.cpp>
     dspark_worker_impl.cpp
     forward_shared_memory_manager.cpp
   DEPS

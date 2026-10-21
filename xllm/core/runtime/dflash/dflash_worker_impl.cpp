@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "runtime/dflash_worker_impl.h"
+#include "runtime/dflash/dflash_worker_impl.h"
 
 #include <c10/util/SmallVector.h>
 #include <glog/logging.h>
@@ -1344,6 +1344,13 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   validate_input.input_params.embedding.input_embedding = torch::Tensor();
   if (use_linear_spec_verify) {
     ModelInputParams& input_params = validate_input.input_params;
+    if (Platform::uses_compressed_kpool_cache() &&
+        impl_->has_request_state_cache()) {
+      specBuilder::set_kpool_verify_metadata(
+          input_params,
+          std::vector<int32_t>(input.input_params.meta.num_sequences,
+                               options_.num_speculative_tokens() + 1));
+    }
     std::vector<int32_t> accepted_prefix_lengths(
         input.input_params.meta.num_sequences, 1);
     if (embedding_cache_ != nullptr &&

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -73,6 +73,8 @@ bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
                                  const runtime::Options& options);
 
 class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
+  friend class DFlashWorkerImplTestPeer;
+
  public:
   DFlashWorkerImpl(const ParallelArgs& parallel_args,
                    const torch::Device& device,

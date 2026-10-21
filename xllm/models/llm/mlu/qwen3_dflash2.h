@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/layers/common/add_matmul.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/mlu/dflash2_context_kv.h"
+#include "core/layers/mlu/dflash2_decoder_layer.h"
 #include "framework/model_loader.h"
 #include "models/llm/qwen3.h"
 #include "models/model_registry.h"
@@ -127,10 +128,13 @@ class DFlash2CandidateSelector final {
   int64_t top_k_ = 0;
 };
 
-class DFlash2Qwen3ModelImpl final : public ::xllm::QWen3ModelImpl {
+class DFlash2Qwen3ModelImpl final
+    : public ::xllm::QWen3ModelImplBase<layer::mlu::DFlash2DecoderLayer> {
  public:
+  using Base = ::xllm::QWen3ModelImplBase<layer::mlu::DFlash2DecoderLayer>;
+
   explicit DFlash2Qwen3ModelImpl(const ModelContext& context)
-      : ::xllm::QWen3ModelImpl(validate_context(context)),
+      : Base(validate_context(context)),
         selector_(context.get_model_args(), context.get_tensor_options()),
         context_kv_(context) {
     const ModelArgs& args = context.get_model_args();
@@ -201,8 +205,7 @@ class DFlash2Qwen3ModelImpl final : public ::xllm::QWen3ModelImpl {
   layer::AttentionMetadata get_attention_metadata(
       const ModelInputParams& params,
       const torch::Tensor& h) override {
-    layer::AttentionMetadata metadata =
-        QWen3ModelImpl::get_attention_metadata(params, h);
+    layer::AttentionMetadata metadata = Base::get_attention_metadata(params, h);
     // DFlash2 jointly denoises a complete proposal block within the
     // checkpoint's sliding window.
     metadata.non_causal_window_right = block_size_ - 1;

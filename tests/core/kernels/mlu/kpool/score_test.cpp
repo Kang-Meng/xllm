@@ -14,7 +14,6 @@ limitations under the License.
 ==============================================================================*/
 
 #include <framework/core/MLUStream.h>
-#include <framework/core/device.h>
 #include <framework/core/stream_guard.h>
 #include <framework/graphs/MLUGraph.h>
 #include <gtest/gtest.h>
@@ -179,6 +178,20 @@ TEST(KPoolKernelTest, VerifyScoresPreserveFp32WeightsPagesAndCausality) {
 
 TEST(KPoolKernelTest, VerifyScoresMatchAtBatch16Context64K) {
   check_verify_scores(/*requests=*/16, /*capacity=*/16384);
+}
+
+TEST(KPoolKernelTest, VerifyScoresMatchAtCapacityBoundaries) {
+  for (const int64_t capacity : {4095, 4096, 4097, 32767, 32768, 32769}) {
+    SCOPED_TRACE(capacity);
+    check_verify_scores(/*requests=*/16, capacity);
+  }
+}
+
+TEST(KPoolKernelTest, VerifyScoresMatchAtAdjacentBatchSizes) {
+  for (const int64_t requests : {15, 17}) {
+    SCOPED_TRACE(requests);
+    check_verify_scores(requests, /*capacity=*/4097);
+  }
 }
 
 TEST(KPoolKernelTest, VerifyGraphReadsLiveOffsetsAndClearsUnassignedPadding) {

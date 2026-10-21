@@ -485,8 +485,10 @@ class RequestSlotsModel final : public GroupedCausalLM {
 
 class StatefulVerifyModel final : public GroupedCausalLM {
  public:
-  explicit StatefulVerifyModel(const torch::TensorOptions& options)
+  explicit StatefulVerifyModel(const torch::TensorOptions& options,
+                               bool with_aux = false)
       : GroupedCausalLM(options),
+        with_aux_(with_aux),
         state_(torch::zeros({64}, options.dtype(torch::kFloat32))) {}
 
   ModelOutput forward(const torch::Tensor& tokens,
@@ -516,13 +518,18 @@ class StatefulVerifyModel final : public GroupedCausalLM {
                 history + params.attention.device.block_tables.select(1, 0);
     state_.index_copy_(
         0, ids, torch::where(ids > 0, next + 1, state_.index_select(0, ids)));
-    return ModelOutput((value + next.unsqueeze(1)).reshape({-1, 1}));
+    ModelOutput output((value + next.unsqueeze(1)).reshape({-1, 1}));
+    if (with_aux_) {
+      output.aux_hidden_states = output.hidden_states * 2 + 7;
+    }
+    return output;
   }
 
   int32_t calls() const { return calls_; }
   const torch::Tensor& state() const { return state_; }
 
  private:
+  bool with_aux_ = false;
   torch::Tensor state_;
   int32_t calls_ = 0;
 };
@@ -601,6 +608,87 @@ TEST(MluSpecVerifyGraphTest, ReplaysUpdatedInputsAndAdvancesStateExactlyOnce) {
   }
   // One fixed-capacity graph per width, each with warmup and capture only.
   EXPECT_EQ(graph_model.calls(), 8);
+}
+
+TEST(MluSpecVerifyGraphTest, Dflash2B16RefreshesAcceptedStateAndAuxAt64k) {
+  ScopedEnvVar graph_kv_cap("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "73728");
+  const torch::NoGradGuard no_grad;
+  const torch::Device device("mlu:0");
+  const auto floats =
+      torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  const auto ints = floats.dtype(torch::kInt32);
+  StatefulVerifyModel graph_model(floats, /*with_aux=*/true);
+  StatefulVerifyModel eager_model(floats, /*with_aux=*/true);
+  ModelArgs args;
+  args.index_kpool(4).index_kpool_compress(true);
+  args.model_type("glm5_next")
+      .dtype("float32")
+      .hidden_size(1)
+      .max_position_embeddings(73728);
+  runtime::Options options;
+  options.block_size(16)
+      .num_decoding_tokens(4)
+      .num_speculative_tokens(3)
+      .dp_size(1)
+      .cp_size(1)
+      .enable_speculative_decode(true)
+      .speculative_algorithm("DFlash2")
+      .enable_graph_aux_hidden_states(true)
+      .is_draft_engine(false);
+  mlu::MluGraphExecutorImpl executor(&graph_model, args, device, options);
+  std::vector<KVCache> caches;
+  caches.emplace_back(
+      LinearAttentionKVCacheTensors{torch::Tensor(), graph_model.state()});
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.is_spec_verify = true;
+  params.meta.q_max_seq_len = 4;
+  const void* aux_buffer = nullptr;
+  for (int32_t round = 0; round < 6; ++round) {
+    const int32_t requests = round == 2 ? 15 : 16;
+    params.meta.num_sequences = requests;
+    params.meta.kv_max_seq_len = 65536 + round * 4;
+    params.attention.host.q_seq_lens.resize(requests + 1);
+    for (int32_t row = 0; row <= requests; ++row) {
+      params.attention.host.q_seq_lens[row] = row * 4;
+    }
+    params.attention.host.kpool_query_lens.assign(requests, 4);
+    params.attention.device.q_seq_lens =
+        torch::tensor(params.attention.host.q_seq_lens, ints);
+    params.attention.device.kv_seq_lens =
+        torch::arange(requests + 1, ints) * (65536 + round * 4);
+    params.attention.device.block_tables =
+        torch::full({requests, 4098}, round + 1, ints);
+    auto tokens = torch::arange(requests * 4, ints) + round;
+    auto positions = tokens + 65536;
+    params.attention.device.new_cache_slots = tokens + round * 64;
+    params.embedding.linear_state_ids.resize(requests);
+    std::iota(params.embedding.linear_state_ids.begin(),
+              params.embedding.linear_state_ids.end(),
+              1);
+    params.embedding.linear_state_indices =
+        torch::tensor(params.embedding.linear_state_ids, ints);
+    params.linear_state_validity_mask.assign(requests, 1);
+    params.num_accepted_tokens =
+        (torch::arange(requests, ints) + round).remainder(4) + 1;
+    const ModelOutput expected =
+        eager_model.forward(tokens, positions, caches, params);
+    const ModelOutput actual = executor.run(tokens, positions, caches, params);
+    Device(device).synchronize_default_stream();
+    EXPECT_TRUE(torch::equal(actual.hidden_states, expected.hidden_states));
+    EXPECT_TRUE(torch::equal(graph_model.state(), eager_model.state()));
+    ASSERT_TRUE(actual.aux_hidden_states.defined());
+    EXPECT_EQ(actual.aux_hidden_states.size(0), requests * 4);
+    EXPECT_TRUE(
+        torch::equal(actual.aux_hidden_states, expected.aux_hidden_states));
+    if (round == 0) {
+      aux_buffer = actual.aux_hidden_states.data_ptr();
+    } else {
+      EXPECT_EQ(actual.aux_hidden_states.data_ptr(), aux_buffer);
+    }
+  }
+  // All six rounds, including B15 padding, use one graph's warmup/capture.
+  EXPECT_EQ(graph_model.calls(), 2);
 }
 
 TEST(MluSpecVerifyGraphTest, OrdinaryStatefulDecodeAdvancesOncePerRun) {

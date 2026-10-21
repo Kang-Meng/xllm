@@ -1,0 +1,422 @@
+/* Copyright 2026 The xLLM Authors.
+Licensed under the Apache License, Version 2.0 (the "License"). */
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cmath>
+#include <cstdint>
+
+#include "kernels/mlu/bangc/src/dflash2/sample_path_launchers.h"
+
+namespace xllm::kernel::mlu::bangc {
+
+namespace {
+template <typename Value>
+__mlu_func__ void load_strided(Value* destination,
+                               const Value* source,
+                               int64_t stride,
+                               int64_t count) {
+  if (stride <= INT32_MAX / static_cast<int64_t>(sizeof(Value))) {
+    __memcpy_async(destination,
+                   source,
+                   sizeof(Value),
+                   GDRAM2NRAM,
+                   sizeof(Value),
+                   static_cast<int32_t>(stride * sizeof(Value)),
+                   static_cast<int32_t>(count - 1));
+  } else {
+    // BANG's 2D DMA stride is 32-bit; retain the Tensor ABI's 64-bit
+    // addressing.
+    for (int64_t column = 0; column < count; ++column) {
+      __memcpy_async(destination + column,
+                     source + column * stride,
+                     sizeof(Value),
+                     GDRAM2NRAM);
+    }
+  }
+}
+
+template <typename IdType, int32_t TopK = 0, int32_t Steps = 0>
+__mlu_global__ void dflash2_sample_path_kernel(const IdType* ids,
+                                               const float* edge,
+                                               const float* noise,
+                                               const bool* mask,
+                                               IdType* tokens,
+                                               float* proposal,
+                                               DFlash2SamplePathShape shape,
+                                               bool all_random) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int64_t top_k = TopK > 0 ? TopK : shape.top_k;
+  const int64_t steps = Steps > 0 ? Steps : shape.steps;
+  __nram__ float logs_storage[4096];
+  __nram__ float proposal_buf[4096];
+  __nram__ float edge_buf[16384];
+  __nram__ float scores[4096];
+  __nram__ float noise_buf[4096];
+  __nram__ IdType ids_buf[4096];
+  __nram__ IdType token_buf[32];
+  for (int64_t row = taskId; row < shape.batch; row += taskDim) {
+    const bool random = all_random || mask[row * shape.ms];
+    const bool preload_noise =
+        shape.nk == 1 && shape.ns == top_k && steps <= 4096 / top_k;
+    if (preload_noise) {
+      __memcpy_async(noise_buf,
+                     noise + row * shape.nb,
+                     steps * top_k * sizeof(float),
+                     GDRAM2NRAM);
+    }
+    const bool preload_ids =
+        shape.ck == 1 && shape.cs == top_k && steps <= 4096 / top_k;
+    if (preload_ids) {
+      __memcpy_async(ids_buf,
+                     ids + row * shape.cb,
+                     steps * top_k * sizeof(IdType),
+                     GDRAM2NRAM);
+    }
+    const bool buffer_proposal = steps <= 4096 / top_k;
+    const bool preload_edge = shape.ek == 1 && shape.ep == top_k &&
+                              shape.es == top_k * top_k && top_k <= 128 &&
+                              steps <= 16384 / (top_k * top_k);
+    if (preload_edge) {
+      __memcpy_async(edge_buf,
+                     edge + row * shape.eb,
+                     steps * top_k * top_k * sizeof(float),
+                     GDRAM2NRAM);
+      __sync_io();
+    }
+    int64_t predecessor = 0;
+    for (int64_t step = 0; step < steps; ++step) {
+      float* logs =
+          buffer_proposal ? proposal_buf + step * top_k : logs_storage;
+      const float* edge_row =
+          edge + row * shape.eb + step * shape.es + predecessor * shape.ep;
+      const float* noise_row = noise + row * shape.nb + step * shape.ns;
+      if (preload_edge) {
+        __memcpy_async(logs,
+                       edge_buf + (step * top_k + predecessor) * top_k,
+                       top_k * sizeof(float),
+                       NRAM2NRAM);
+      } else if (shape.ek == 1) {
+        __memcpy_async(logs, edge_row, top_k * sizeof(float), GDRAM2NRAM);
+      } else {
+        load_strided(logs, edge_row, shape.ek, top_k);
+      }
+      if (!preload_noise) {
+        if (shape.nk == 1) {
+          __memcpy_async(
+              noise_buf, noise_row, top_k * sizeof(float), GDRAM2NRAM);
+        } else {
+          load_strided(noise_buf, noise_row, shape.nk, top_k);
+        }
+      }
+      const IdType* id_row = ids + row * shape.cb + step * shape.cs;
+      if (!preload_ids) {
+        if (shape.ck == 1) {
+          __memcpy_async(ids_buf, id_row, top_k * sizeof(IdType), GDRAM2NRAM);
+        } else {
+          load_strided(ids_buf, id_row, shape.ck, top_k);
+        }
+      }
+      if (!(preload_edge && preload_noise && preload_ids)) {
+        __sync_io();
+        asm volatile("sync.pio.csimd;");
+      }
+      __bang_add(
+          scores, logs, noise_buf + (preload_noise ? step * top_k : 0), top_k);
+      int32_t selected = 0;
+      float maximum = 0;
+      asm volatile("argmax.nan.nram.f32 %0, %1, [%2], %3;"
+                   : "=&r"(maximum), "=&r"(selected)
+                   : "p"(scores), "r"(static_cast<int32_t>(top_k)));
+      const int64_t successor = selected;
+      if (steps <= 32) {
+        token_buf[step] = ids_buf[(preload_ids ? step * top_k : 0) + successor];
+      } else {
+        tokens[row * steps + step] =
+            ids_buf[(preload_ids ? step * top_k : 0) + successor];
+      }
+      if (!random) {
+        __bang_write_value(logs, top_k, -INFINITY);
+        __sync_compute();
+        logs[successor] = 0.0f;
+      }
+      if (!buffer_proposal) {
+        __memcpy(proposal + (row * steps + step) * top_k,
+                 logs,
+                 top_k * sizeof(float),
+                 NRAM2GDRAM);
+      }
+      predecessor = successor;
+    }
+    if (buffer_proposal) {
+      __memcpy(proposal + row * steps * top_k,
+               proposal_buf,
+               steps * top_k * sizeof(float),
+               NRAM2GDRAM);
+    }
+    if (steps <= 32) {
+      __memcpy(
+          tokens + row * steps, token_buf, steps * sizeof(IdType), NRAM2GDRAM);
+    }
+  }
+}
+}  // namespace
+namespace {
+template <int32_t Steps, int32_t Rows, bool AllRandom>
+__mlu_global__ void compact_sample_path_kernel(const int64_t* ids,
+                                               const float* edge,
+                                               const float* noise,
+                                               const bool* mask,
+                                               int64_t* tokens,
+                                               float* proposal,
+                                               int64_t batch,
+                                               bool /*all_random*/) {
+  constexpr bool all_random = AllRandom;
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ bool sampling_masks[Rows];
+  __nram__ float edges[Rows * Steps * 256];
+  __nram__ float noises[Rows * Steps * 16];
+  __nram__ float proposals[Rows * Steps * 16];
+  __nram__ float all_scores[Rows * Steps * 256];
+  __nram__ int64_t candidates[Rows * Steps * 16];
+  __nram__ int64_t selected_tokens[Rows * Steps];
+  __nram__ uint32_t token_offsets[Rows * Steps];
+  for (int64_t first = taskId * Rows; first < batch; first += taskDim * Rows) {
+    constexpr int32_t count = Rows;
+    __memcpy_async(edges,
+                   edge + first * Steps * 256,
+                   count * Steps * 256 * sizeof(float),
+                   GDRAM2NRAM);
+    __memcpy_async(noises,
+                   noise + first * Steps * 16,
+                   count * Steps * 16 * sizeof(float),
+                   GDRAM2NRAM);
+    if (!all_random) {
+      __memcpy_async(
+          sampling_masks, mask + first, count * sizeof(bool), GDRAM2NRAM);
+    }
+    if (!all_random) {
+      __bang_write_value(proposals, count * Steps * 16, -INFINITY);
+    }
+    __sync_io();
+    __memcpy_io1_async(candidates,
+                       ids + first * Steps * 16,
+                       count * Steps * 16 * sizeof(int64_t),
+                       GDRAM2NRAM);
+    if (!all_random) {
+      __sync_compute();
+    }
+    for (int32_t item = 0; item < count * Steps; ++item) {
+      __bang_cycle_add(all_scores + item * 256,
+                       edges + item * 256,
+                       noises + item * 16,
+                       256,
+                       16);
+    }
+    for (int32_t local = 0; local < count; ++local) {
+      const bool random = all_random || sampling_masks[local];
+      int32_t predecessor = 0;
+      for (int32_t step = 0; step < Steps; ++step) {
+        float* logs = edges + ((local * Steps + step) * 16 + predecessor) * 16;
+        float* scores =
+            all_scores + ((local * Steps + step) * 16 + predecessor) * 16;
+        int32_t successor = 0;
+        float maximum = 0;
+        asm volatile("argmax.nan.nram.f32 %0, %1, [%2], 16;"
+                     : "=&r"(maximum), "=&r"(successor)
+                     : "p"(scores));
+        token_offsets[local * Steps + step] =
+            ((local * Steps + step) * 16 + successor) * sizeof(int64_t);
+        float* output = proposals + (local * Steps + step) * 16;
+        if (random) {
+          __memcpy_async(output, logs, 16 * sizeof(float), NRAM2NRAM);
+        } else {
+          output[successor] = 0;
+        }
+        predecessor = successor;
+      }
+    }
+    __sync_io();
+    __gather(selected_tokens,
+             candidates,
+             token_offsets,
+             sizeof(int64_t),
+             NRAM2NRAM,
+             sizeof(int64_t),
+             count * Steps);
+    __sync_compute();
+    __memcpy_io1_async(tokens + first * Steps,
+                       selected_tokens,
+                       count * Steps * sizeof(int64_t),
+                       NRAM2GDRAM);
+    __memcpy_async(proposal + first * Steps * 16,
+                   proposals,
+                   count * Steps * 16 * sizeof(float),
+                   NRAM2GDRAM);
+    __sync_io();
+  }
+}
+template <int32_t Steps, int32_t Rows, bool AllRandom>
+void launch_compact(cnrtQueue_t queue,
+                    cnrtDim3_t dim,
+                    cnrtFunctionType_t function_type,
+                    const int64_t* ids,
+                    const float* edge,
+                    const float* noise,
+                    const bool* mask,
+                    int64_t* tokens,
+                    float* proposal,
+                    int64_t batch) {
+  compact_sample_path_kernel<Steps, Rows, AllRandom>
+      <<<dim, function_type, queue>>>(
+          ids, edge, noise, mask, tokens, proposal, batch, AllRandom);
+}
+
+template <int32_t Rows>
+void dispatch_compact(cnrtQueue_t queue,
+                      cnrtDim3_t dim,
+                      cnrtFunctionType_t function_type,
+                      const int64_t* ids,
+                      const float* edge,
+                      const float* noise,
+                      const bool* mask,
+                      int64_t* tokens,
+                      float* proposal,
+                      int64_t batch,
+                      int64_t steps,
+                      bool all_random) {
+  const auto launch = all_random
+                          ? (steps == 3 ? launch_compact<3, Rows, true>
+                                        : launch_compact<5, Rows, true>)
+                          : (steps == 3 ? launch_compact<3, Rows, false>
+                                        : launch_compact<5, Rows, false>);
+  launch(queue,
+         dim,
+         function_type,
+         ids,
+         edge,
+         noise,
+         mask,
+         tokens,
+         proposal,
+         batch);
+}
+}  // namespace
+void launch_dflash2_sample_path(void* queue,
+                                const void* ids,
+                                const float* edge,
+                                const float* noise,
+                                const bool* mask,
+                                void* tokens,
+                                float* proposal,
+                                const DFlash2SamplePathShape* shape,
+                                bool ids_int64,
+                                bool all_random) {
+  cnrtDim3_t dim = {static_cast<uint32_t>(
+                        shape->batch < 32 ? ((shape->batch + 3) / 4) * 4 : 32),
+                    1,
+                    1};
+  if (shape->batch == 0) {
+    return;
+  }
+  const cnrtFunctionType_t function_type =
+      shape->batch >= 32 ? cnrtFuncTypeUnion8 : cnrtFuncTypeUnion1;
+  const bool compact =
+      ids_int64 && shape->top_k == 16 &&
+      (shape->steps == 3 || shape->steps == 5) && shape->ck == 1 &&
+      shape->cs == 16 && shape->cb == shape->steps * 16 && shape->ek == 1 &&
+      shape->ep == 16 && shape->es == 256 && shape->eb == shape->steps * 256 &&
+      shape->nk == 1 && shape->ns == 16 && shape->nb == shape->steps * 16 &&
+      (all_random || shape->ms == 1);
+  if (compact) {
+    const auto launch = shape->batch >= 128 && shape->batch % 4 == 0
+                            ? dispatch_compact<4>
+                            : (shape->batch >= 64 && shape->batch % 2 == 0
+                                   ? dispatch_compact<2>
+                                   : dispatch_compact<1>);
+    launch(static_cast<cnrtQueue_t>(queue),
+           dim,
+           function_type,
+           static_cast<const int64_t*>(ids),
+           edge,
+           noise,
+           mask,
+           static_cast<int64_t*>(tokens),
+           proposal,
+           shape->batch,
+           shape->steps,
+           all_random);
+  } else if (shape->top_k == 16 && shape->steps == 3 && ids_int64) {
+    dflash2_sample_path_kernel<int64_t, 16, 3>
+        <<<dim, function_type, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const int64_t*>(ids),
+            edge,
+            noise,
+            mask,
+            static_cast<int64_t*>(tokens),
+            proposal,
+            *shape,
+            all_random);
+  } else if (shape->top_k == 16 && shape->steps == 5 && ids_int64) {
+    dflash2_sample_path_kernel<int64_t, 16, 5>
+        <<<dim, function_type, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const int64_t*>(ids),
+            edge,
+            noise,
+            mask,
+            static_cast<int64_t*>(tokens),
+            proposal,
+            *shape,
+            all_random);
+  } else if (shape->top_k == 16 && ids_int64) {
+    dflash2_sample_path_kernel<int64_t, 16>
+        <<<dim, function_type, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const int64_t*>(ids),
+            edge,
+            noise,
+            mask,
+            static_cast<int64_t*>(tokens),
+            proposal,
+            *shape,
+            all_random);
+  } else if (shape->top_k == 16) {
+    dflash2_sample_path_kernel<int32_t, 16>
+        <<<dim, function_type, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const int32_t*>(ids),
+            edge,
+            noise,
+            mask,
+            static_cast<int32_t*>(tokens),
+            proposal,
+            *shape,
+            all_random);
+  } else if (ids_int64) {
+    dflash2_sample_path_kernel<int64_t>
+        <<<dim, function_type, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const int64_t*>(ids),
+            edge,
+            noise,
+            mask,
+            static_cast<int64_t*>(tokens),
+            proposal,
+            *shape,
+            all_random);
+  } else {
+    dflash2_sample_path_kernel<int32_t>
+        <<<dim, function_type, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const int32_t*>(ids),
+            edge,
+            noise,
+            mask,
+            static_cast<int32_t*>(tokens),
+            proposal,
+            *shape,
+            all_random);
+  }
+}
+
+}  // namespace xllm::kernel::mlu::bangc

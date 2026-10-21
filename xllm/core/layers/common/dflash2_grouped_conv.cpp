@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -107,14 +107,14 @@ std::tuple<torch::Tensor, torch::Tensor> DFlash2GroupedConvImpl::prepare(
           .view({hidden_states.size(0), 2, taps_, num_groups_});
   return {convolve(hidden_states,
                    coefficients.select(/*dim=*/1, /*index=*/0),
-                   /*side=*/0),
+                   base_kernel_.select(/*dim=*/0, /*index=*/0)),
           coefficients.select(/*dim=*/1, /*index=*/1)};
 }
 
 torch::Tensor DFlash2GroupedConvImpl::finish(
     const torch::Tensor& hidden_states,
     const torch::Tensor& coefficients) {
-  return convolve(hidden_states, coefficients, /*side=*/1);
+  return convolve(hidden_states, coefficients, output_kernel());
 }
 
 void DFlash2GroupedConvImpl::load_state_dict(const StateDict& state_dict) {
@@ -134,14 +134,9 @@ void DFlash2GroupedConvImpl::verify_loaded_weights(
 torch::Tensor DFlash2GroupedConvImpl::convolve(
     const torch::Tensor& hidden_states,
     const torch::Tensor& delta,
-    int32_t side) const {
-  return dflash2_grouped_conv(hidden_states,
-                              delta,
-                              base_kernel_.select(/*dim=*/0, side),
-                              block_size_,
-                              num_groups_,
-                              group_size_,
-                              taps_);
+    const torch::Tensor& base) const {
+  return dflash2_grouped_conv(
+      hidden_states, delta, base, block_size_, num_groups_, group_size_, taps_);
 }
 
 }  // namespace xllm::layer

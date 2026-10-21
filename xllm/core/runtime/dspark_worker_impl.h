@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/speculative/dflash_async_input_builder.h"
-#include "runtime/dflash_worker_impl.h"
+#include "runtime/dflash/dflash_worker_impl.h"
 
 namespace xllm {
 

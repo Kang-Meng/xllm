@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -93,9 +93,13 @@ bool allows_graph_mode(const xllm::runtime::Options& options,
   if (options.is_draft_engine()) {
     return params.meta.batch_forward_type.is_decode();
   }
-  if (options.enable_speculative_decode() &&
+  const bool supports_target_verify =
       xllm::SpeculativeConfig::is_mtp_algorithm(
-          options.speculative_algorithm()) &&
+          options.speculative_algorithm()) ||
+      (xllm::SpeculativeConfig::is_dflash2_algorithm(
+           options.speculative_algorithm()) &&
+       capabilities.replay_family == xllm::MtpReplayFamily::GLM5);
+  if (options.enable_speculative_decode() && supports_target_verify &&
       capabilities.supports_grouped_mtp_graph) {
     return params.is_spec_verify &&
            params.meta.batch_forward_type.is_chunked_prefill();

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ limitations under the License.
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
-#include "core/runtime/dflash_worker_impl.h"
+#include "core/runtime/dflash/dflash_worker_impl.h"
 #include "core/runtime/llm_worker_impl.h"
 #include "core/runtime/mtp_worker_impl.h"
 #include "core/runtime/options.h"

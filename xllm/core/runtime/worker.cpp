@@ -1,5 +1,5 @@
 /* Copyright 2025-2026 The xLLM Authors.
-Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
+Copyright 2024 The ScaleLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,8 +30,8 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
-#include "runtime/dflash2_worker_impl.h"
-#include "runtime/dflash_worker_impl.h"
+#include "runtime/dflash/dflash2_worker_impl.h"
+#include "runtime/dflash/dflash_worker_impl.h"
 #include "runtime/dit_worker_impl.h"
 #include "runtime/dspark_worker_impl.h"
 #include "runtime/eagle3_worker_impl.h"
