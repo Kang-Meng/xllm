@@ -150,15 +150,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre_fused(
   return {output, post, combination};
 }
 
-// DeepSeek-V4.1-only "_va" variant of hc_pre_fused, dispatched to the ACLNN
-// entry point aclnnHcPreVa (third_party/xllm_ops). Two additions over
-// hc_pre_fused: (1) the ``pre_mix`` input, an external collapse vector (FP32,
-// ``[tokens, hc_mult]``) used in place of the internally computed ``pre``;
-// ``None`` makes the kernel take its one-hot first-block path; (2) the ``pre``
-// output, this block's internally computed mix, returned so the next
-// sub-block can feed it back as its ``pre_mix``. Call contract: DSV4.1 always
-// calls this op with ``pre_mix``; callers without an external mix use
-// hc_pre_fused.
+// The "_va" variant of hc_pre_fused, dispatched to the ACLNN entry point
+// aclnnHcPreVa (third_party/xllm_ops) and consumed by DeepSeek-V4.1 as well as
+// by GLM5.3 Flash. Two additions over hc_pre_fused: (1) the ``pre_mix`` input,
+// an external collapse vector (FP32, ``[tokens, hc_mult]``) used in place of
+// the internally computed ``pre``; ``None`` keeps the internal mix -- the
+// tiling enables the external mix only when the optional input is present
+// (``hasPreMix``) and the kernel then collapses with the very vector it exports
+// as ``pre``, so ``None`` gives the same collapse as hc_pre_fused; (2) the
+// ``pre`` output, this block's internally computed mix, returned so the next
+// sub-block can feed it back as its ``pre_mix``. Call contract: DeepSeek-V4.1
+// always passes ``pre_mix`` (its first block uses an explicit one-hot mix);
+// GLM5.3 Flash passes ``None``, since it does not chain mixes between
+// sub-blocks; other callers without an external mix may do the same.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 hc_pre_va(const torch::Tensor& hidden,
           const torch::Tensor& hc_fn,

@@ -27,18 +27,22 @@ def full_hc_pre(monkeypatch: pytest.MonkeyPatch) -> list[tuple[torch.Tensor, ...
         weight: torch.Tensor,
         scale: torch.Tensor,
         base: torch.Tensor,
+        pre_mix: torch.Tensor | None,
         hc_mult: int,
         iterations: int,
         norm_eps: float,
         hc_eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         calls.append((weight, scale, base))
+        assert pre_mix is None
         assert weight.dtype == scale.dtype == base.dtype == torch.float32
         assert hc_mult == 4 and iterations == 20
         assert norm_eps == 1e-5 and hc_eps == 1e-6
-        return hidden[:, :, 0], scale, base
+        collapsed = hidden[:, :, 0]
+        pre = torch.zeros((*hidden.shape[:-2], hc_mult), dtype=torch.float32)
+        return collapsed, scale, base, pre
 
-    monkeypatch.setattr(glm5_next.kernels, "hc_pre_fused", run, raising=False)
+    monkeypatch.setattr(glm5_next, "_get_hc_pre_va_op", lambda: run)
     return calls
 
 
@@ -56,8 +60,8 @@ def _forward(layer: glm5_next.Glm5NextHyperConnection) -> None:
 
 
 def test_full_hc_pre_requires_native_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delattr(glm5_next.kernels, "hc_pre_fused", raising=False)
-    with pytest.raises(RuntimeError, match="requires native hc_pre_fused support"):
+    monkeypatch.setattr(glm5_next, "_get_hc_pre_va_op", lambda: None)
+    with pytest.raises(RuntimeError, match="requires native hc_pre_va support"):
         _layer()
 
 

@@ -35,27 +35,29 @@ from xllm.python.models import glm5_next
 def _cpu_hc_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide deterministic CPU substitutes for the NPU-only mHC kernels."""
 
-    def hc_pre_fused(
+    def hc_pre_va(
         hidden: torch.Tensor,
         fn: torch.Tensor,
         scale: torch.Tensor,
         base: torch.Tensor,
+        pre_mix: torch.Tensor | None,
         hc_mult: int,
         iterations: int,
         norm_eps: float,
         hc_eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         del fn, scale, base, iterations, norm_eps, hc_eps
+        assert pre_mix is None
         post = hidden.new_ones((*hidden.shape[:-2], hc_mult))
         comb = torch.eye(hc_mult, dtype=hidden.dtype, device=hidden.device).expand(*hidden.shape[:-2], hc_mult, hc_mult)
-        return hidden.mean(dim=-2), post, comb
+        return hidden.mean(dim=-2), post, comb, torch.zeros_like(post)
 
     def hc_post(output: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
         return post.to(output.dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(
             comb.to(output.dtype).transpose(-1, -2), residual
         )
 
-    monkeypatch.setattr(glm5_next.kernels, "hc_pre_fused", hc_pre_fused, raising=False)
+    monkeypatch.setattr(glm5_next, "_get_hc_pre_va_op", lambda: hc_pre_va)
     monkeypatch.setattr(glm5_next.kernels, "hc_post", hc_post, raising=False)
 
 

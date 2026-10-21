@@ -18,13 +18,13 @@
 normalisation + weighted-sum reduction into a single call. ``hc_post``
 applies the post-attention/FFN recombination (post * x + comb^T @ residual).
 ``hc_pre_va`` (aclnnHcPreVa, sourced from the vllm-ascend open AscendC tree)
-also returns the block's own ``pre`` vector and collapses with an EXTERNAL
-``pre_mix``.
+also returns the block's own ``pre`` vector and collapses with an external
+``pre_mix`` when one is supplied, otherwise with its internally computed mix.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -39,12 +39,15 @@ except (AttributeError, RuntimeError):
     hc_post = None
 
 
-# The DSV4.1 ``hc_pre_va`` op (aclnnHcPreVa, from the vllm-ascend open AscendC
-# tree, registered as ``xllm_ops::hc_pre_va``) consumes an optional external
-# ``pre_mix`` for the collapse and additionally returns the block's own
-# ``pre``:
+# The ``hc_pre_va`` op (aclnnHcPreVa, from the vllm-ascend open AscendC tree,
+# registered as ``xllm_ops::hc_pre_va``), consumed by DeepSeek-V4.1 and GLM5.3
+# Flash, takes an optional external ``pre_mix`` for the collapse and additionally
+# returns the block's own ``pre``:
 # ``hc_pre_va(x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult,
 #            hc_sinkhorn_iters, norm_eps, hc_eps) -> (y, post, comb_frag, pre)``.
+# ``pre_mix=None`` keeps the internal mix -- the tiling enables the external mix
+# only when the optional input is present -- i.e. the same collapse as
+# ``hc_pre_fused``.
 #
 # The op's schema declares all nine parameters positional-or-keyword (there is
 # no ``*``), so callers may pass them either positionally or by keyword. The thin
@@ -52,7 +55,13 @@ except (AttributeError, RuntimeError):
 # unambiguous and independent of argument ordering; its own defaults mirror the
 # op's public signature so external callers can still omit ``pre_mix`` and the
 # geometry knobs.
-def _make_hc_pre_va_forward(op: Any) -> Any:
+HcPreVaKernel = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, int, int, float, float],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+]
+
+
+def _make_hc_pre_va_forward(op: Any) -> HcPreVaKernel:
     """Bind the registered op into a wrapper that always forwards positionally."""
 
     def hc_pre_va(
@@ -85,10 +94,10 @@ def _make_hc_pre_va_forward(op: Any) -> Any:
 # kernels_npu module-load order is not a stable contract, so an eager probe
 # here could latch ``None`` before the ops library is loaded. Only a successful
 # resolution is cached, so a later registration is picked up.
-_hc_pre_va_ = None
+_hc_pre_va_: HcPreVaKernel | None = None
 
 
-def _resolve_hc_pre_va():
+def _resolve_hc_pre_va() -> HcPreVaKernel | None:
     """Probe the ``xllm_ops::hc_pre_va`` op, returning the positional wrapper or ``None``.
 
     A failed probe is NOT cached: the op is registered by the NPU ops library
@@ -115,6 +124,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "HcPreVaKernel",
     "hc_pre",
     "hc_pre_va",  # noqa: F822
     "hc_post",

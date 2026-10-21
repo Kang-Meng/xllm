@@ -50,7 +50,7 @@ import os
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -2501,6 +2501,24 @@ class Glm5NextMoE(MoECore, nn.Module):
         return self._forward_source(flat, layout, token_mask, shared_stream=stream).reshape(hidden_states.shape)
 
 
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from xllm.python.kernels_npu.hyper_connection import HcPreVaKernel
+
+
+def _get_hc_pre_va_op() -> HcPreVaKernel | None:
+    """Resolve the published ``hc_pre_va`` wrapper, or ``None`` when it is absent.
+
+    Imported lazily because the operator is registered when the NPU ops library
+    loads, which is not a stable import-order contract; the wrapper module itself
+    only needs ``torch``, so it imports on any host and simply yields ``None``
+    where the operator is not registered.  The operator contract is documented in
+    :mod:`xllm.python.kernels_npu.hyper_connection`.
+    """
+    from xllm.python.kernels_npu.hyper_connection import hc_pre_va
+
+    return hc_pre_va
+
+
 # ---------------------------------------------------------------------------
 # mHC (Manifold-constrained Hyper-Connection) residual — faithful port of
 # transformers Glm5NextTextHyperConnection / Glm5NextTextHyperHead.
@@ -2517,8 +2535,11 @@ class Glm5NextHyperConnection(nn.Module):
 
     def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
-        if getattr(kernels, "hc_pre_fused", None) is None:
-            raise RuntimeError("GLM5.3 Flash requires native hc_pre_fused support")
+        hc_pre_va_op = _get_hc_pre_va_op()
+        if hc_pre_va_op is None:
+            raise RuntimeError("GLM5.3 Flash requires native hc_pre_va support")
+        # Bind once: forward() must not re-read the module-level cache.
+        self.hc_pre_va_op = hc_pre_va_op
         self.hc_mult = cfg.hc_mult
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
@@ -2560,11 +2581,16 @@ class Glm5NextHyperConnection(nn.Module):
 
         if self._fn_compute is None or self._scale_compute is None or self._base_compute is None:
             raise RuntimeError("Full HcPre requires prepared kernel parameters")
-        collapsed, post, comb = kernels.hc_pre_fused(
+        # Nine operands, ALL positional: the PrivateUse1 dispatch drops keyword
+        # arguments, so a keyword tail would silently lose the geometry/eps knobs.
+        # No external mix here, and GLM5.3 does not chain mixes between sub-blocks,
+        # so the fourth output (this block's own pre) is left unused.
+        collapsed, post, comb, _pre = self.hc_pre_va_op(
             hidden_streams,
             self._fn_compute,
             self._scale_compute,
             self._base_compute,
+            None,
             hc,
             self.hc_sinkhorn_iters,
             self.rms_norm_eps,
