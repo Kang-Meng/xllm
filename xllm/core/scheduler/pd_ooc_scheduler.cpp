@@ -19,6 +19,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <brpc/server.h>
+#include <butil/endpoint.h>
 
 #include <chrono>
 #include <random>
@@ -43,7 +44,9 @@ limitations under the License.
 #include "runtime/xservice_client.h"
 #include "scheduler/continuous_scheduler.h"
 #include "util/env_var.h"
+#include "util/scope_guard.h"
 #include "util/utils.h"
+#include "util/uuid.h"
 
 namespace xllm {
 
@@ -214,8 +217,10 @@ void PDOOCScheduler::handle_running_requests(std::shared_ptr<Request> request) {
   }
 }
 
-PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
-    : DisaggPDScheduler(engine, options),
+PDOOCScheduler::PDOOCScheduler(Engine* engine,
+                               const Options& options,
+                               bool start_services)
+    : DisaggPDScheduler(engine, options, start_services),
       llm_flops_(engine->model_args().n_layers(),
                  engine->model_args().vocab_size(),
                  engine->model_args().hidden_size(),
@@ -257,6 +262,10 @@ PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
   // Create offline queues for online/offline batch exclusivity.
   prefill_queue_offline_ = std::make_unique<DequeQueue>();
   decode_queue_offline_ = std::make_unique<DequeQueue>();
+
+  if (!start_services) {
+    return;
+  }
 
   server_name_.append(std::to_string(options.server_idx()));
 
@@ -582,8 +591,6 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
     kv_cache_manager_->transfer_blocks();
   }
 
-  GAUGE_SET(num_pending_requests,
-            pending_requests_.load(std::memory_order_relaxed));
   GAUGE_SET(num_running_requests, running_requests_.size());
   GAUGE_SET(num_waiting_requests,
             prefill_queue_->size() + decode_queue_->size());
@@ -601,7 +608,17 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
   GAUGE_SET(num_running_sequences, running_sequences_.size());
 
   report_kv_cache_metrics(*kv_cache_manager_);
+  report_request_queue_metrics();
   return batches;
+}
+
+void PDOOCScheduler::append_request_queue_metrics(
+    std::vector<std::pair<std::string, size_t>>& queues) {
+  DisaggPDScheduler::append_request_queue_metrics(queues);
+  queues.emplace_back(scheduler_queue_metric::kOfflinePrefill,
+                      prefill_queue_offline_->size());
+  queues.emplace_back(scheduler_queue_metric::kOfflineDecode,
+                      decode_queue_offline_->size());
 }
 
 void PDOOCScheduler::handle_prefill_interruption() {
@@ -1414,6 +1431,15 @@ void PDOOCScheduler::dispatch_requests() {
       break;
     }
 
+    dispatch_active_requests_.fetch_add(1, std::memory_order_relaxed);
+    dispatch_waiting_requests_.fetch_sub(1, std::memory_order_relaxed);
+    ScopeGuard dispatch_guard([this] {
+      dispatch_active_requests_.fetch_sub(1, std::memory_order_relaxed);
+    });
+    if (discard_cancelled_dispatch_request(request)) {
+      continue;
+    }
+
     if (request->offline()) {
       // Handle offline requests locally. No need to dispatch them to decoding
       // instances.
@@ -1493,6 +1519,9 @@ void PDOOCScheduler::dispatch_requests() {
     for (size_t i = 0; i < requests.size(); ++i) {
       CHECK(!requests[i]->offline());
       if (resps.resps()[i].status_code() != 200) {
+        if (discard_cancelled_dispatch_request(requests[i])) {
+          continue;
+        }
         if (is_permanent_rejection(resps.resps()[i].status_code())) {
           LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
                      << requests[i]->request_id() << ", prompt_tokens="
@@ -1502,13 +1531,14 @@ void PDOOCScheduler::dispatch_requests() {
           continue;
         }
         // push back to prefill_request_queue_
-        if (requests[i]->offline()) {
-          prefill_request_queue_offline_.enqueue(requests[i]);
-        } else {
-          prefill_request_queue_.enqueue(requests[i]);
-        }
+        enqueue_ready_request(requests[i]);
 
       } else {
+        requests[i]->state().decode_rpc_address =
+            butil::endpoint2str(cntl.remote_side()).c_str();
+        if (discard_cancelled_dispatch_request(requests[i])) {
+          continue;
+        }
         for (auto& sequence : requests[i]->sequences()) {
           TransferKVInfo info;
           info.request_id = requests[i]->request_id();
@@ -1734,6 +1764,8 @@ bool PDOOCScheduler::decode_schedule(std::shared_ptr<Request>& request,
       LOG(FATAL) << "Decode receive same request_id from prefill.";
     }
     received_request_map_[request->request_id()] = request;
+    reservation_waiting_requests_.store(received_request_map_.size(),
+                                        std::memory_order_relaxed);
   }
 
   {
@@ -1769,7 +1801,13 @@ bool PDOOCScheduler::decode_recv_multi_generations(
     }
     request = it->second;
     received_request_map_.erase(it);
+    reservation_waiting_requests_.store(received_request_map_.size(),
+                                        std::memory_order_relaxed);
   }
+  kv_preparing_requests_.fetch_add(1, std::memory_order_relaxed);
+  ScopeGuard prepare_guard([this] {
+    kv_preparing_requests_.fetch_sub(1, std::memory_order_relaxed);
+  });
 
   // Enable checking whether to skip the prefill token
   if (request->state().stream) {
@@ -1970,10 +2008,16 @@ void PDOOCScheduler::dispatch_offline_requests() {
     }
 
     // Create a RPC stub with the target decoding instance
+    if (discard_cancelled_dispatch_request(request)) {
+      continue;
+    }
     proto::DisaggPDService_Stub* stub = create_rpc_channel(target_instance);
     if (!stub) {
       LOG(ERROR) << "Failed to create RPC channel to target instance: "
                  << target_instance;
+      if (discard_cancelled_dispatch_request(request)) {
+        continue;
+      }
       // Put the request back to dispatch queue for retry
       offline_requests_to_dispatch_.enqueue(dispatch_pair);
       absl::SleepFor(absl::Milliseconds(100));
@@ -2015,6 +2059,11 @@ void PDOOCScheduler::dispatch_offline_requests() {
     stub->AddNewRequests(&cntl, &reqs, &resps, nullptr);
 
     // Check response and handle accordingly
+    if ((cntl.Failed() || resps.resps().empty() ||
+         resps.resps()[0].status_code() != 200) &&
+        discard_cancelled_dispatch_request(request)) {
+      continue;
+    }
     const bool prompt_too_long =
         !cntl.Failed() && !resps.resps().empty() &&
         is_permanent_rejection(resps.resps()[0].status_code());
@@ -2037,6 +2086,11 @@ void PDOOCScheduler::dispatch_offline_requests() {
       offline_requests_to_dispatch_.enqueue(dispatch_pair);
     } else {
       // Successfully dispatched, set up KV transfer info
+      request->state().decode_rpc_address =
+          butil::endpoint2str(cntl.remote_side()).c_str();
+      if (discard_cancelled_dispatch_request(request)) {
+        continue;
+      }
       for (auto& sequence : request->sequences()) {
         TransferKVInfo info;
         info.request_id = request->request_id();
@@ -2277,6 +2331,10 @@ void PDOOCScheduler::build_disagg_requests(
   for (size_t i = 0; i < requests.size(); ++i) {
     auto req = reqs.mutable_reqs()->Add();
     req->set_req_id(requests[i]->request_id());
+    if (requests[i]->state().pd_reservation_id.empty()) {
+      requests[i]->state().pd_reservation_id = ShortUUID().random();
+    }
+    req->set_reservation_id(requests[i]->state().pd_reservation_id);
     req->set_service_req_id(requests[i]->service_request_id());
     req->set_source_xservice_addr(requests[i]->source_xservice_addr());
     req->set_tokens_num(requests[i]->state().prompt_tokens.size());

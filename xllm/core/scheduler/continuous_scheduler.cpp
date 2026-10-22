@@ -138,6 +138,7 @@ void report_kv_cache_metrics(const KVCacheManager& kv_cache_manager) {
 
 ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
     : options_(options),
+      server_label_(std::to_string(options.server_idx())),
       batch_mode_(resolve_batch_mode(options)),
       engine_(engine),
       request_queue_(::xllm::RecConfig::get_instance().request_queue_size()) {
@@ -194,6 +195,15 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
         cancel_request_queue->submit(std::move(request));
       });
   create_queues(options);
+  request_queue_samples_.reserve(12);
+  preprocessing_requests_metric_ =
+      std::make_unique<bvar::PassiveStatus<size_t>>(
+          "scheduler_preprocessing_requests_" + server_label_,
+          [](void* counter) {
+            return static_cast<std::atomic<size_t>*>(counter)->load(
+                std::memory_order_relaxed);
+          },
+          &pending_requests_);
   if (options_.enable_service_routing()) {
     // connect to master service
     xservice_client_ = XServiceClient::get_instance();
@@ -264,6 +274,12 @@ ContinuousScheduler::~ContinuousScheduler() {
   CHECK_EQ(prefetching_requests_.load(std::memory_order_acquire), 0u)
       << "ContinuousScheduler destroyed with pending prefetch callbacks";
   running_requests_.clear();
+  for (const auto& [queue_name, metric] : request_queue_metrics_) {
+    metric->set_value(0.0);
+  }
+  if (waiting_requests_metric_ != nullptr) {
+    waiting_requests_metric_->set_value(0.0);
+  }
 }
 
 bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
@@ -310,6 +326,62 @@ bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
 void ContinuousScheduler::enqueue_ready_request(
     std::shared_ptr<Request> request) {
   request_queue_.blockingWrite(std::move(request));
+}
+
+void ContinuousScheduler::report_request_queue_metrics() {
+  GAUGE_SET(num_pending_requests,
+            pending_requests_.load(std::memory_order_relaxed));
+  request_queue_samples_.clear();
+  request_queue_samples_.emplace_back(
+      scheduler_queue_metric::kIngress,
+      static_cast<size_t>(std::max<ssize_t>(request_queue_.size(), 0)));
+  request_queue_samples_.emplace_back(scheduler_queue_metric::kPrefill,
+                                      prefill_queue_->size());
+  request_queue_samples_.emplace_back(scheduler_queue_metric::kChunk,
+                                      chunk_queue_->size());
+  request_queue_samples_.emplace_back(scheduler_queue_metric::kDecode,
+                                      decode_queue_->size());
+  request_queue_samples_.emplace_back(scheduler_queue_metric::kUnified,
+                                      unified_queue_.size());
+  request_queue_samples_.emplace_back(scheduler_queue_metric::kRestore,
+                                      decode_restore_waiting_.size());
+  request_queue_samples_.emplace_back(
+      scheduler_queue_metric::kPrefetch,
+      prefetching_requests_.load(std::memory_order_relaxed));
+  append_request_queue_metrics(request_queue_samples_);
+  size_t waiting_requests = 0;
+  for (const auto& [queue_name, count] : request_queue_samples_) {
+    if (queue_name != scheduler_queue_metric::kPdDispatchActive &&
+        queue_name != scheduler_queue_metric::kPdKvPrepare &&
+        queue_name != scheduler_queue_metric::kPrefetch) {
+      waiting_requests += count;
+    }
+    auto metric = request_queue_metrics_.find(queue_name);
+    if (metric == request_queue_metrics_.end()) {
+      bvar::Status<double>* gauge =
+          MULTI_GAUGE_scheduler_queue_requests.get_stats(
+              {queue_name, server_label_});
+      if (gauge == nullptr) {
+        LOG_EVERY_N(WARNING, 100)
+            << "Failed to register scheduler queue metric: " << queue_name
+            << ", server_idx=" << server_label_;
+        continue;
+      }
+      metric = request_queue_metrics_.emplace(queue_name, gauge).first;
+    }
+    metric->second->set_value(static_cast<double>(count));
+  }
+  if (waiting_requests_metric_ == nullptr) {
+    waiting_requests_metric_ =
+        MULTI_GAUGE_scheduler_waiting_requests.get_stats({server_label_});
+  }
+  if (waiting_requests_metric_ != nullptr) {
+    waiting_requests_metric_->set_value(static_cast<double>(waiting_requests));
+  } else {
+    LOG_EVERY_N(WARNING, 100)
+        << "Failed to register scheduler waiting metric, server_idx="
+        << server_label_;
+  }
 }
 
 void ContinuousScheduler::create_queues(const Options& options) {
@@ -439,6 +511,7 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
 
   policy_->report_metrics(
       state, timer.elapsed_seconds(), budget.num_preempted_requests);
+  report_request_queue_metrics();
   return batches;
 }
 
@@ -521,6 +594,7 @@ void ContinuousScheduler::apply_cancel_requests() {
 // may get blocked if there are no requests to process
 void ContinuousScheduler::step(const absl::Duration& timeout) {
   if (try_complete_pause()) {
+    report_request_queue_metrics();
     return;
   }
 
@@ -538,6 +612,7 @@ void ContinuousScheduler::step(const absl::Duration& timeout) {
   // engine is destroyed while paused. The timeout lets the loop periodically
   // fall through so the `stoped_` check in LLMMaster::run() can break the loop.
   if (pause_state_.load(std::memory_order_acquire) == PauseState::PAUSED) {
+    report_request_queue_metrics();
     std::unique_lock<std::mutex> lock(pause_mutex_);
     pause_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
       return pause_state_.load(std::memory_order_acquire) != PauseState::PAUSED;

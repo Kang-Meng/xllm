@@ -8,6 +8,7 @@ cc_test(
   SRCS
     disagg_pd_scheduler_test.cpp
     continuous_scheduler_test.cpp
+    dit_scheduler_test.cpp
     fixed_steps_scheduler_test.cpp
     scheduler_policy_test.cpp
   DEPS

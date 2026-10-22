@@ -188,7 +188,21 @@ DEFINE_COUNTER(json_object_mask_build_constrained_rows_target_total,
                "JSON object constrained rows in target mask builds");
 
 // scheduler metrics
-DEFINE_GAUGE(num_pending_requests, "Number of pending requests in scheduler");
+DEFINE_GAUGE(num_pending_requests,
+             "Requests queued or executing in master preprocessing, sampled "
+             "at scheduler reporting time");
+DEFINE_MULTI_GAUGE_2_LABELS(scheduler_queue_requests,
+                            "queue",
+                            "server_idx",
+                            "Scheduler-owned queue and preparation entries, "
+                            "excluding selected batch requests; asynchronous "
+                            "entries are sampled");
+DEFINE_MULTI_GAUGE(scheduler_waiting_requests,
+                   "server_idx",
+                   "Sampled queued scheduler entries, excluding active "
+                   "dispatch, resource preparation, master preprocessing and "
+                   "selected batches; "
+                   "asynchronous handoff samples are not transactional");
 DEFINE_GAUGE(num_running_requests, "Number of running requests in scheduler");
 DEFINE_GAUGE(num_waiting_requests, "Number of waiting requests in scheduler");
 DEFINE_GAUGE(num_preempted_requests,

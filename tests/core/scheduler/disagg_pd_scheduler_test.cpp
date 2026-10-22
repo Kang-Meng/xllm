@@ -26,11 +26,13 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/metrics.h"
@@ -45,6 +47,9 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
 #include "framework/tokenizer/tokenizer.h"
+#include "runtime/xservice_client.h"
+#include "scheduler/pd_ooc_scheduler.h"
+#include "util/scope_guard.h"
 
 namespace xllm {
 namespace {
@@ -158,6 +163,10 @@ class FakeEngine final : public Engine {
 
   const ModelArgs& model_args() const override { return model_args_; }
 
+  void set_model_args(ModelArgs model_args) {
+    model_args_ = std::move(model_args);
+  }
+
   const TokenizerArgs& tokenizer_args() const override { NOT_IMPLEMENTED(); }
 
   std::vector<int64_t> get_active_activation_memory() const override {
@@ -166,6 +175,14 @@ class FakeEngine final : public Engine {
 
   bool init() override { return true; }
 
+  bool unlink_cluster(const std::vector<uint64_t>&,
+                      const std::vector<std::string>&,
+                      const std::vector<uint16_t>&,
+                      int32_t,
+                      int32_t) override {
+    return true;
+  }
+
   bool pull_kv_blocks(int32_t /*src_dp_size*/,
                       int32_t /*src_dp_rank*/,
                       const std::vector<uint64_t>& /*src_cluster_ids*/,
@@ -173,9 +190,13 @@ class FakeEngine final : public Engine {
                       int32_t /*dst_dp_rank*/,
                       const std::vector<KVTransferMapping>& mappings) override {
     pulled_mappings = mappings;
+    if (pull) {
+      return pull();
+    }
     return true;
   }
 
+  std::function<bool()> pull;
   std::vector<KVTransferMapping> pulled_mappings;
 
  private:
@@ -210,6 +231,18 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
     return received_request_map_.empty() &&
            instance_to_received_requests_map_.empty() &&
            request_to_instance_map_.empty();
+  }
+
+  void report_queues() { report_request_queue_metrics(); }
+
+  void enqueue_dispatch(std::shared_ptr<Request> request) {
+    enqueue_ready_request(std::move(request));
+  }
+
+  void stop_dispatch() { prefill_request_queue_.enqueue(nullptr); }
+  size_t dispatch_waiting() const {
+    return dispatch_waiting_requests_.load(std::memory_order_relaxed) +
+           dispatch_active_requests_.load(std::memory_order_relaxed);
   }
 
   void wait_notifications() {
@@ -397,6 +430,73 @@ class ReservationService final : public proto::DisaggPDService {
   DisaggPDScheduler* scheduler_;
 };
 
+class TestPDOOCScheduler final : public PDOOCScheduler {
+ public:
+  TestPDOOCScheduler(Engine* engine, const Options& options)
+      : PDOOCScheduler(engine, options, false) {}
+
+  void enqueue_dispatch(std::shared_ptr<Request> request) {
+    enqueue_ready_request(std::move(request));
+  }
+  void report_queues() { report_request_queue_metrics(); }
+  bool enqueue_ingress(std::shared_ptr<Request> request) {
+    return request_queue_.write(std::move(request));
+  }
+  void stop_dispatch() { prefill_request_queue_.enqueue(nullptr); }
+  size_t dispatch_waiting() const {
+    return dispatch_waiting_requests_.load(std::memory_order_relaxed) +
+           dispatch_active_requests_.load(std::memory_order_relaxed);
+  }
+  void set_prefill_channel(const std::string& name,
+                           proto::DisaggPDService_Stub* stub) {
+    instance_channel_map_[name] = stub;
+  }
+  void set_decode_channel(const std::string& name,
+                          proto::DisaggPDService_Stub* stub) {
+    set_prefill_channel(name, stub);
+    InstanceInfo remote;
+    remote.name = name;
+    remote_instances_info_[name] = std::move(remote);
+    xservice_client_ = XServiceClient::get_instance();
+  }
+  bool pop_decode_request_for_test(std::shared_ptr<Request>* request) {
+    return request_queue_.read(*request);
+  }
+};
+
+class RetryingAllocationChannel final : public google::protobuf::RpcChannel {
+ public:
+  explicit RetryingAllocationChannel(
+      int32_t retry_status = kDecodeAddNewPromptTooLongStatusCode)
+      : retry_status_(retry_status) {}
+  std::future<void> retry_started() { return retry_started_.get_future(); }
+  void finish_retry() { finish_retry_.set_value(); }
+  int32_t attempts() const { return attempts_.load(); }
+
+  void CallMethod(const google::protobuf::MethodDescriptor*,
+                  google::protobuf::RpcController*,
+                  const google::protobuf::Message*,
+                  google::protobuf::Message* response,
+                  google::protobuf::Closure* done) override {
+    const int32_t attempt = attempts_.fetch_add(1) + 1;
+    if (attempt == 2) {
+      retry_started_.set_value();
+      finish_retry_.get_future().wait();
+    }
+    auto* responses = static_cast<proto::DisaggResponses*>(response);
+    responses->add_resps()->set_status_code(attempt == 1 ? 503 : retry_status_);
+    if (done != nullptr) {
+      done->Run();
+    }
+  }
+
+ private:
+  const int32_t retry_status_;
+  std::atomic<int32_t> attempts_{0};
+  std::promise<void> retry_started_;
+  std::promise<void> finish_retry_;
+};
+
 DisaggPDScheduler::Options make_options() {
   DisaggPDScheduler::Options options;
   options.enable_pd_ooc(true)
@@ -491,7 +591,8 @@ bool recv_first_generation(DisaggPDScheduler* scheduler,
                            const torch::Tensor& mtp_embedding,
                            int32_t num_cached_tokens = 0,
                            double time_to_first_token_latency_seconds = 0.1,
-                           double upstream_elapsed_seconds = 0.0) {
+                           double upstream_elapsed_seconds = 0.0,
+                           const std::string& transfer_mode = "PUSH") {
   return scheduler->decode_recv_first_generation(
       "req",
       /*token_id=*/42,
@@ -501,7 +602,7 @@ bool recv_first_generation(DisaggPDScheduler* scheduler,
       upstream_elapsed_seconds,
       /*top_tokens=*/{},
       /*top_logprobs=*/{},
-      /*kv_cache_transfer_mode=*/"PUSH",
+      transfer_mode,
       /*src_cluster_ids=*/{},
       /*src_addrs=*/{},
       /*source_mappings=*/{},
@@ -511,7 +612,270 @@ bool recv_first_generation(DisaggPDScheduler* scheduler,
       num_cached_tokens);
 }
 
+void expect_queue_sample(
+    const std::string& label,
+    std::initializer_list<std::pair<std::string, double>> queues,
+    double waiting_count) {
+  for (const auto& [queue, count] : queues) {
+    auto* gauge =
+        MULTI_GAUGE_scheduler_queue_requests.get_stats({queue, label});
+    ASSERT_NE(gauge, nullptr);
+    EXPECT_DOUBLE_EQ(gauge->get_value(), count) << queue;
+  }
+  auto* waiting = MULTI_GAUGE_scheduler_waiting_requests.get_stats({label});
+  ASSERT_NE(waiting, nullptr);
+  EXPECT_DOUBLE_EQ(waiting->get_value(), waiting_count);
+}
+
+void set_metrics_model(FakeEngine& engine) {
+  ModelArgs model;
+  model.n_layers(1)
+      .vocab_size(128)
+      .hidden_size(64)
+      .intermediate_size(128)
+      .n_heads(4)
+      .n_kv_heads(4);
+  engine.set_model_args(std::move(model));
+}
+
+template <typename Scheduler, typename Receive>
+void check_kv_prepare_metrics(Scheduler& scheduler,
+                              FakeEngine& engine,
+                              const std::string& label,
+                              bool succeeds,
+                              Receive receive) {
+  scheduler.report_queues();
+  expect_queue_sample(label, {{"pd_reservation", 1}, {"pd_kv_prepare", 0}}, 1);
+  engine.pull = [&] {
+    scheduler.report_queues();
+    expect_queue_sample(
+        label,
+        {{"pd_reservation", 0}, {"pd_kv_prepare", 1}, {"ingress", 0}},
+        0);
+    return succeeds;
+  };
+  ScopeGuard clear_pull([&] { engine.pull = nullptr; });
+  EXPECT_EQ(receive(), succeeds);
+  scheduler.report_queues();
+  expect_queue_sample(label,
+                      {{"pd_reservation", 0},
+                       {"pd_kv_prepare", 0},
+                       {"ingress", succeeds ? 1.0 : 0.0}},
+                      succeeds ? 1.0 : 0.0);
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0],
+            succeeds ? 1u : 0u);
+  std::shared_ptr<Request> queued;
+  EXPECT_EQ(scheduler.pop_decode_request_for_test(&queued), succeeds);
+  if (queued != nullptr) {
+    engine.block_manager_pool()->deallocate(queued.get());
+  }
+  scheduler.report_queues();
+  expect_queue_sample(label, {{"ingress", 0}}, 0);
+}
+
 }  // namespace
+
+class KVPrepareMetricsTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(KVPrepareMetricsTest, FirstGenerationTracksPullUntilCompletion) {
+  FakeEngine engine(8, 2);
+  auto options = make_decode_options();
+  options.server_idx(421);
+  TestDisaggPDScheduler scheduler(&engine, options, false);
+  auto request = make_request({1, 2});
+  request->sequences().front()->kv_state().set_kv_cache_tokens_num(
+      request->sequences().front()->num_prompt_tokens());
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  check_kv_prepare_metrics(scheduler, engine, "421", GetParam(), [&] {
+    return recv_first_generation(
+        &scheduler, torch::Tensor(), 0, 0.0, 0.0, "PULL");
+  });
+}
+
+TEST_P(KVPrepareMetricsTest, OfflineMigrationTracksPullUntilCompletion) {
+  FakeEngine engine(8, 2);
+  set_metrics_model(engine);
+  auto options = make_decode_options();
+  options.server_idx(422).nnodes(1);
+  TestPDOOCScheduler scheduler(&engine, options);
+  proto::DisaggPDService_Stub stub(nullptr);
+  scheduler.set_prefill_channel("prefill", &stub);
+  auto request = make_request({1, 2});
+  request->state().scheduler_param.offline = true;
+  request->sequences().front()->kv_state().set_kv_cache_tokens_num(
+      request->sequences().front()->num_prompt_tokens());
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  proto::RemoteToken token;
+  token.set_token_id(42);
+  check_kv_prepare_metrics(scheduler, engine, "422", GetParam(), [&] {
+    return scheduler.decode_recv_multi_generations(
+        request->request_id(), {token}, 0.0, "PULL", {}, {}, {}, 1, 0);
+  });
+}
+
+INSTANTIATE_TEST_SUITE_P(PullResults, KVPrepareMetricsTest, ::testing::Bool());
+
+class DispatchRetryMetricsTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(DispatchRetryMetricsTest, RetryStopsOnRejectionOrCancellation) {
+  FakeEngine engine(8, 2);
+  set_metrics_model(engine);
+  auto options = make_options();
+  options.server_idx(423).nnodes(1);
+  RetryingAllocationChannel channel(
+      GetParam() ? 503 : kDecodeAddNewPromptTooLongStatusCode);
+  proto::DisaggPDService_Stub stub(&channel);
+  TestPDOOCScheduler scheduler(&engine, options);
+  scheduler.set_decode_channel("decode", &stub);
+  auto request = make_request({1, 2});
+  request->state().decode_address = "decode";
+  auto failed = std::make_shared<std::promise<Status>>();
+  auto failure = failed->get_future();
+  request->state().output_func = [failed](const RequestOutput& output) {
+    failed->set_value(output.status.value());
+    return true;
+  };
+  scheduler.enqueue_dispatch(request);
+  scheduler.report_queues();
+  expect_queue_sample(
+      "423", {{"pd_dispatch", 1}, {"pd_dispatch_active", 0}}, 1);
+  auto retry = channel.retry_started();
+  auto result =
+      std::async(std::launch::async, [&] { scheduler.dispatch_requests(); });
+  bool retry_finished = false;
+  ScopeGuard stop_dispatch([&] {
+    scheduler.stop_dispatch();
+    if (!retry_finished) {
+      channel.finish_retry();
+    }
+    result.get();
+  });
+  ASSERT_EQ(retry.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_EQ(channel.attempts(), 2);
+  scheduler.report_queues();
+  expect_queue_sample(
+      "423", {{"pd_dispatch", 0}, {"pd_dispatch_active", 1}}, 0);
+  if (GetParam()) {
+    request->set_cancel();
+  }
+  channel.finish_retry();
+  retry_finished = true;
+  ASSERT_EQ(failure.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const Status status = failure.get();
+  if (GetParam()) {
+    EXPECT_EQ(status.code(), StatusCode::CANCELLED);
+  } else {
+    EXPECT_EQ(status.reason(), FailureReason::PROMPT_TOO_LONG);
+  }
+  scheduler.stop_dispatch();
+  result.get();
+  stop_dispatch.dismiss();
+  EXPECT_EQ(channel.attempts(), 2);
+  scheduler.report_queues();
+  EXPECT_EQ(scheduler.dispatch_waiting(), 0u);
+  expect_queue_sample(
+      "423", {{"pd_dispatch", 0}, {"pd_dispatch_active", 0}}, 0);
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+}
+
+INSTANTIATE_TEST_SUITE_P(TerminalResults,
+                         DispatchRetryMetricsTest,
+                         ::testing::Bool());
+
+class DispatchRemovalMetricsTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(DispatchRemovalMetricsTest, CancelledOrInvalidDispatchFallsBackToIdle) {
+  FakeEngine engine(8, 2);
+  auto options = make_options();
+  options.server_idx(424);
+  TestDisaggPDScheduler scheduler(&engine, options, false);
+  auto request = make_request({1, 2});
+  auto failed = std::make_shared<std::promise<Status>>();
+  auto failure = failed->get_future();
+  request->state().output_func = [failed](const RequestOutput& output) {
+    failed->set_value(output.status.value());
+    return true;
+  };
+  if (GetParam()) {
+    ASSERT_TRUE(
+        engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+    request->set_cancel();
+  }
+  scheduler.enqueue_dispatch(request);
+  scheduler.report_queues();
+  expect_queue_sample("424", {{"pd_dispatch", 1}}, 1);
+  auto result =
+      std::async(std::launch::async, [&] { scheduler.dispatch_requests(); });
+  ScopeGuard stop_dispatch([&] {
+    scheduler.stop_dispatch();
+    result.get();
+  });
+  ASSERT_EQ(failure.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_EQ(failure.get().code(),
+            GetParam() ? StatusCode::CANCELLED : StatusCode::INVALID_ARGUMENT);
+  scheduler.stop_dispatch();
+  result.get();
+  stop_dispatch.dismiss();
+  scheduler.report_queues();
+  expect_queue_sample(
+      "424", {{"pd_dispatch", 0}, {"pd_dispatch_active", 0}}, 0);
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(TerminalStates,
+                         DispatchRemovalMetricsTest,
+                         ::testing::Bool());
+
+TEST(PDOOCSchedulerTest, OfflineRequestMovesBetweenDistinctWaitingQueues) {
+  auto previous_perf_model = perf_model::get_perf_model();
+  ScopeGuard restore_perf_model(
+      [&] { perf_model::set_perf_model(previous_perf_model); });
+  FakeEngine engine(8, 2);
+  set_metrics_model(engine);
+  auto options = make_options();
+  options.server_idx(419).nnodes(1);
+  TestPDOOCScheduler scheduler(&engine, options);
+  auto offline = make_request({1, 2, 3, 4}, "offline_metrics");
+  offline->state().scheduler_param.offline = true;
+  offline->state().output_func = [](const RequestOutput&) { return true; };
+  scheduler.enqueue_dispatch(offline);
+  scheduler.report_queues();
+  expect_queue_sample(
+      "419", {{"pd_dispatch", 1}, {"ingress", 0}, {"offline_prefill", 0}}, 1);
+  auto result =
+      std::async(std::launch::async, [&] { scheduler.dispatch_requests(); });
+  ScopeGuard stop_dispatch([&] {
+    scheduler.stop_dispatch();
+    result.get();
+  });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (scheduler.dispatch_waiting() != 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_EQ(scheduler.dispatch_waiting(), 0u);
+  scheduler.report_queues();
+  expect_queue_sample("419", {{"pd_dispatch", 0}, {"ingress", 1}}, 1);
+  auto online = make_request({11, 12}, "online_metrics");
+  online->state().output_func = [](const RequestOutput&) { return true; };
+  ASSERT_TRUE(scheduler.enqueue_ingress(online));
+  ASSERT_EQ(scheduler.prepare_batch_test().front().size(), 1u);
+  expect_queue_sample("419", {{"ingress", 0}, {"offline_prefill", 1}}, 1);
+  online->set_cancel();
+  ASSERT_EQ(scheduler.prepare_batch_test().front().size(), 1u);
+  expect_queue_sample("419", {{"offline_prefill", 0}}, 0);
+  offline->set_cancel();
+  scheduler.prepare_batch_test();
+  expect_queue_sample("419", {{"offline_prefill", 0}}, 0);
+}
 
 TEST(DisaggPDSchedulerTest, CachesPrefillBlocksBeforeRelease) {
   FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
@@ -1458,11 +1822,18 @@ TEST_F(ReservationTest, UnsupportedRpcHasBoundedRetries) {
 TEST_F(ReservationTest, ReleaseNeverConsumesAnotherReservation) {
   auto first = reserve();
   auto other = reserve("other");
+  decode_.report_queues();
+  auto* reservations =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_reservation", "0"});
+  ASSERT_NE(reservations, nullptr);
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 2.0);
   EXPECT_FALSE(decode_.release_reservation("unknown", "reservation"));
   EXPECT_FALSE(decode_.release_reservation("req", "wrong"));
   EXPECT_FALSE(decode_.release_reservation("req", ""));
   EXPECT_TRUE(decode_.release_reservation("req", "reservation"));
   EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
+  decode_.report_queues();
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 1.0);
   auto replacement = reserve("req", "replacement");
   EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
   EXPECT_GE(replacement->sequences()[0]->get_embedding_block_id(), 0);
@@ -1470,13 +1841,43 @@ TEST_F(ReservationTest, ReleaseNeverConsumesAnotherReservation) {
   EXPECT_TRUE(decode_.release_reservation("other", "reservation"));
   EXPECT_TRUE(decode_.release_reservation("req", "replacement"));
   EXPECT_TRUE(decode_.reservations_empty());
+  decode_.report_queues();
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 0.0);
   EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks(),
             (std::vector<size_t>{0, 0}));
 }
 
+TEST_F(ReservationTest, UnlinkClearsOnlyMatchingReservationMetrics) {
+  auto first = reserve();
+  auto other = make_request({11, 12}, "other");
+  other->state().pd_reservation_id = "other_reservation";
+  ASSERT_EQ(decode_.try_admit(other), DecodeAdmissionResult::ADMITTED);
+  ASSERT_TRUE(decode_.decode_schedule(other, "other_prefill"));
+  decode_.report_queues();
+  auto* reservations =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_reservation", "0"});
+  ASSERT_NE(reservations, nullptr);
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 2.0);
+  EXPECT_TRUE(decode_.unlink_instance("prefill", {}, {}, {}, 1, 1));
+  decode_.report_queues();
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 1.0);
+  EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
+  engine_.block_manager_pool()->deallocate(first.get());
+  EXPECT_TRUE(decode_.release_reservation("other", "other_reservation"));
+  decode_.report_queues();
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 0.0);
+}
+
 TEST_F(ReservationTest, ReleasePreventsLateHandoff) {
   auto request = reserve();
+  decode_.report_queues();
+  auto* reservations =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_reservation", "0"});
+  ASSERT_NE(reservations, nullptr);
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 1.0);
   EXPECT_TRUE(decode_.release_reservation("req", "reservation"));
+  decode_.report_queues();
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 0.0);
   EXPECT_FALSE(recv_first_generation(&decode_, torch::tensor({1.0f})));
   std::shared_ptr<Request> queued;
   EXPECT_FALSE(decode_.pop_decode_request_for_test(&queued));
@@ -1486,6 +1887,15 @@ TEST_F(ReservationTest, ReleasePreventsLateHandoff) {
 TEST_F(ReservationTest, HandoffPreventsReleaseOfRunningResources) {
   auto request = reserve();
   EXPECT_TRUE(recv_first_generation(&decode_, torch::tensor({1.0f})));
+  decode_.report_queues();
+  auto* reservations =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_reservation", "0"});
+  auto* ingress =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"ingress", "0"});
+  ASSERT_NE(reservations, nullptr);
+  ASSERT_NE(ingress, nullptr);
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(ingress->get_value(), 1.0);
   EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
   EXPECT_GE(request->sequences()[0]->get_embedding_block_id(), 0);
   std::shared_ptr<Request> queued;
@@ -1657,6 +2067,11 @@ TEST_F(ReservationTest, DuplicateAdmissionRollsBackUncomputedResources) {
                                 .manager();
   const size_t embedding_used = embedding->num_used_blocks();
   EXPECT_FALSE(decode_.decode_schedule(duplicate, "prefill"));
+  decode_.report_queues();
+  auto* reservations =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_reservation", "0"});
+  ASSERT_NE(reservations, nullptr);
+  EXPECT_DOUBLE_EQ(reservations->get_value(), 1.0);
   EXPECT_EQ(duplicate->sequences()[0]->get_embedding_block_id(), -1);
   EXPECT_EQ(embedding->num_used_blocks(), embedding_used - 1);
   EXPECT_EQ(engine_.block_manager_pool()->num_blocks_in_prefix_cache(),

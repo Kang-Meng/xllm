@@ -301,8 +301,24 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   GAUGE_SET(num_running_sequences, running_sequences_.size());
 
   report_kv_cache_metrics(*kv_cache_manager_);
+  report_request_queue_metrics();
 
   return batches;
+}
+
+void FixedStepsScheduler::append_request_queue_metrics(
+    std::vector<std::pair<std::string, size_t>>& queues) {
+  queues.emplace_back(scheduler_queue_metric::kFixedPrefetched,
+                      prefetched_request_ ? 1u : 0u);
+}
+
+void FixedStepsScheduler::prefetch_request(
+    const std::chrono::steady_clock::time_point& deadline) {
+  std::shared_ptr<Request> request;
+  if (request_queue_.tryReadUntil(deadline, request)) {
+    prefetched_request_ = std::move(request);
+    report_request_queue_metrics();
+  }
 }
 
 ScheduleResult FixedStepsScheduler::schedule_request(
@@ -330,12 +346,9 @@ ScheduleResult FixedStepsScheduler::schedule_request(
     // This wakes up immediately on arrival, avoiding the extra latency and CPU
     // spinning of a fixed sleep under high concurrency. The prefetched request
     // is consumed by the next prepare_batch() call.
-    std::shared_ptr<Request> request;
     const auto wait_deadline = std::chrono::steady_clock::now() +
                                absl::ToChronoNanoseconds(deadline - now);
-    if (request_queue_.tryReadUntil(wait_deadline, request)) {
-      prefetched_request_ = std::move(request);
-    }
+    prefetch_request(wait_deadline);
   }
   // return empty result
   return result;

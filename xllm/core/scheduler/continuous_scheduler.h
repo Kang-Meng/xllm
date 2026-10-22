@@ -16,6 +16,8 @@ limitations under the License.
 #pragma once
 
 #include <absl/time/time.h>
+#include <bvar/passive_status.h>
+#include <bvar/status.h>
 #include <folly/MPMCQueue.h>
 #include <folly/futures/Future.h>
 
@@ -26,7 +28,10 @@ limitations under the License.
 #include <list>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "async_response_processor.h"
 #include "common/macros.h"
@@ -292,6 +297,9 @@ class ContinuousScheduler : public Scheduler {
   void abort_all_running_requests();
 
  protected:
+  void report_request_queue_metrics();
+  virtual void append_request_queue_metrics(
+      std::vector<std::pair<std::string, size_t>>&) {}
   void clear_mtp_bootstrap(Request* request);
   virtual void enqueue_ready_request(std::shared_ptr<Request> request);
   virtual void release_failed_request(const std::shared_ptr<Request>& request) {
@@ -302,6 +310,11 @@ class ContinuousScheduler : public Scheduler {
   static int64_t amortized_token_latency(int64_t latency, size_t num_tokens);
 
   const Options options_;
+
+  const std::string server_label_;
+  std::vector<std::pair<std::string, size_t>> request_queue_samples_;
+  std::unordered_map<std::string, bvar::Status<double>*> request_queue_metrics_;
+  bvar::Status<double>* waiting_requests_metric_ = nullptr;
 
   // BatchMode resolved from options/global config (subsumes old scheduler
   // hierarchy selection).
@@ -348,6 +361,7 @@ class ContinuousScheduler : public Scheduler {
 
   // the number of requests that are waiting to be scheduled
   std::atomic<size_t> pending_requests_{0};
+  std::unique_ptr<bvar::PassiveStatus<size_t>> preprocessing_requests_metric_;
 
   // Prefill queue: holds new prefill requests (kv_cache_tokens_num == 0).
   std::unique_ptr<RequestPriorityQueue> prefill_queue_;

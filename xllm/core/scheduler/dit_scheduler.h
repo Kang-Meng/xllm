@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <absl/time/time.h>
+#include <bvar/status.h>
 #include <folly/MPMCQueue.h>
 #include <folly/futures/Future.h>
 
@@ -23,6 +24,7 @@ limitations under the License.
 #include <limits>
 #include <memory>
 #include <queue>
+#include <string>
 #include <unordered_map>
 
 #include "common/macros.h"
@@ -65,6 +67,7 @@ class DiTScheduler : public SchedulerBase {
     // the request per batch
     PROPERTY(int32_t, max_request_per_batch) = 4;
     PROPERTY(bool, disable_log_stats) = false;
+    PROPERTY(int64_t, server_idx) = 0;
   };
 
   ~DiTScheduler() override = default;
@@ -104,10 +107,14 @@ class DiTDynamicBatchScheduler : public DiTScheduler {
   }
 
  protected:
+  explicit DiTDynamicBatchScheduler(const Options& options);
+
+  void report_request_queue_metrics();
+
   const Options options_;
 
   // the engine to run the batch
-  DiTEngine* engine_;
+  DiTEngine* engine_ = nullptr;
 
   // a thread safe queue of requests, bounded by kRequestQueueSize
   // the schedule owns the requests and manages their lifetimes.
@@ -130,6 +137,11 @@ class DiTDynamicBatchScheduler : public DiTScheduler {
   virtual std::vector<DiTBatch> prepare_batch();
 
  private:
+  const std::string server_label_;
+  bvar::Status<double>* ingress_requests_metric_ = nullptr;
+  bvar::Status<double>* deferred_requests_metric_ = nullptr;
+  bvar::Status<double>* waiting_requests_metric_ = nullptr;
+
   std::vector<DiTBatch> schedule_request(const absl::Duration& timeout);
 
   // process the batch output

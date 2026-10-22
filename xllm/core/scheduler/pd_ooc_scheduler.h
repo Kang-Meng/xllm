@@ -45,7 +45,9 @@ enum class StepStatus { ONLINE_PREFILL, OFFLINE_PREFILL, DECODE, IDLE };
 // Online-offline co-location scheduler in Disaggregated PD mode
 class PDOOCScheduler : public DisaggPDScheduler {
  public:
-  PDOOCScheduler(Engine* engine, const Options& options);
+  PDOOCScheduler(Engine* engine,
+                 const Options& options,
+                 bool start_services = true);
 
   ~PDOOCScheduler() override;
 
@@ -53,6 +55,8 @@ class PDOOCScheduler : public DisaggPDScheduler {
 
   // prefill-1: for prefill send new request to decode
   void dispatch_requests() override;
+  void append_request_queue_metrics(
+      std::vector<std::pair<std::string, size_t>>& queues) override;
   // prefill-2: for prefill send first token to decode
   void prefill_send_first_generation() override;
   // prefill-2b: for prefill send multiple tokens to decode

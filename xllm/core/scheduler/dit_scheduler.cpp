@@ -144,11 +144,15 @@ void DiTAsyncResponseProcessor::process_failed_request(
 
 DiTDynamicBatchScheduler::DiTDynamicBatchScheduler(Engine* engine,
                                                    const Options& options)
-    : options_(options),
-      engine_(dynamic_cast<DiTEngine*>(engine)),
-      request_queue_(kRequestQueueSize) {
+    : DiTDynamicBatchScheduler(options) {
+  engine_ = dynamic_cast<DiTEngine*>(engine);
   CHECK(engine_ != nullptr);
+}
 
+DiTDynamicBatchScheduler::DiTDynamicBatchScheduler(const Options& options)
+    : options_(options),
+      request_queue_(kRequestQueueSize),
+      server_label_(std::to_string(options.server_idx())) {
   response_handler_ =
       std::make_unique<DiTAsyncResponseProcessor>(options_.disable_log_stats());
 }
@@ -156,6 +160,51 @@ DiTDynamicBatchScheduler::DiTDynamicBatchScheduler(Engine* engine,
 DiTDynamicBatchScheduler::~DiTDynamicBatchScheduler() {
   abort_all_requests();
   response_handler_->wait_completion();
+  if (ingress_requests_metric_ != nullptr) {
+    ingress_requests_metric_->set_value(0.0);
+  }
+  if (deferred_requests_metric_ != nullptr) {
+    deferred_requests_metric_->set_value(0.0);
+  }
+  if (waiting_requests_metric_ != nullptr) {
+    waiting_requests_metric_->set_value(0.0);
+  }
+}
+
+void DiTDynamicBatchScheduler::report_request_queue_metrics() {
+  if (ingress_requests_metric_ == nullptr) {
+    ingress_requests_metric_ = MULTI_GAUGE_scheduler_queue_requests.get_stats(
+        {scheduler_queue_metric::kIngress, server_label_});
+  }
+  if (deferred_requests_metric_ == nullptr) {
+    deferred_requests_metric_ = MULTI_GAUGE_scheduler_queue_requests.get_stats(
+        {scheduler_queue_metric::kDiTDeferred, server_label_});
+  }
+  if (waiting_requests_metric_ == nullptr) {
+    waiting_requests_metric_ =
+        MULTI_GAUGE_scheduler_waiting_requests.get_stats({server_label_});
+  }
+  const size_t ingress_requests =
+      static_cast<size_t>(std::max<ssize_t>(request_queue_.size(), 0));
+  const size_t deferred_requests = deferred_requests_.size();
+  if (ingress_requests_metric_ != nullptr) {
+    ingress_requests_metric_->set_value(static_cast<double>(ingress_requests));
+  }
+  if (deferred_requests_metric_ != nullptr) {
+    deferred_requests_metric_->set_value(
+        static_cast<double>(deferred_requests));
+  }
+  if (waiting_requests_metric_ != nullptr) {
+    waiting_requests_metric_->set_value(
+        static_cast<double>(ingress_requests + deferred_requests));
+  }
+  if (ingress_requests_metric_ == nullptr ||
+      deferred_requests_metric_ == nullptr ||
+      waiting_requests_metric_ == nullptr) {
+    LOG_EVERY_N(WARNING, 100)
+        << "Failed to register DiT scheduler queue metrics, server_idx="
+        << server_label_;
+  }
 }
 
 bool DiTDynamicBatchScheduler::add_request(
@@ -244,6 +293,7 @@ std::vector<DiTBatch> DiTDynamicBatchScheduler::prepare_batch() {
   GAUGE_SET(num_running_requests, running_requests_.size());
   GAUGE_SET(num_waiting_requests,
             request_queue_.size() + deferred_requests_.size());
+  report_request_queue_metrics();
 
   return {batches};
 }

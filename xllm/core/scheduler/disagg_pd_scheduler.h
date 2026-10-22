@@ -275,6 +275,13 @@ class DisaggPDScheduler : public ContinuousScheduler {
       prefill_request_queue_;
   moodycamel::BlockingConcurrentQueue<std::shared_ptr<Request>>
       prefill_request_queue_offline_;
+  std::atomic<size_t> dispatch_waiting_requests_{0};
+  std::atomic<size_t> dispatch_active_requests_{0};
+  std::atomic<size_t> kv_preparing_requests_{0};
+  bool discard_cancelled_dispatch_request(
+      const std::shared_ptr<Request>& request);
+  void append_request_queue_metrics(
+      std::vector<std::pair<std::string, size_t>>& queues) override;
 
   // use threadpool to handle prefill-completed request
   ThreadPool prefill_threadpool_{/*num_threads=*/1,
@@ -297,6 +304,7 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // request_id -> Request object
   std::unordered_map<std::string, std::shared_ptr<Request>>
       received_request_map_;
+  std::atomic<size_t> reservation_waiting_requests_{0};
   // prefill_instance_name -> set of request_ids.
   // Used for bulk cleanup when a prefill instance is unlinked.
   std::unordered_map<std::string, std::unordered_set<std::string>>

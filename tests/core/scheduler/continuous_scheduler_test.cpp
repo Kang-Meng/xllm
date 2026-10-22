@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/rec_config.h"
@@ -24,6 +25,7 @@
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "scheduler/async_response_processor.h"
 #include "scheduler_factory.h"
+#include "util/scope_guard.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -182,6 +184,28 @@ class TestContinuousScheduler final : public ContinuousScheduler {
 
   size_t scheduler_queue_size() { return request_queue_.size(); }
 
+  void report_queues() { report_request_queue_metrics(); }
+  void set_extra_queue(size_t count, bool report = true) {
+    extra_queue_size_ = count;
+    report_extra_queue_ = report;
+  }
+  void populate_observed_queues(
+      const std::vector<std::shared_ptr<Request>>& requests) {
+    prefill_queue_->push(requests[0]);
+    chunk_queue_->push(requests[1]);
+    decode_queue_->push(requests[2]);
+    unified_queue_.emplace_back(requests[3]);
+    decode_restore_waiting_.emplace_back(
+        DecodeRestoreEntry{requests[4], absl::Now()});
+  }
+  void clear_observed_queues() {
+    prefill_queue_->pop_top();
+    chunk_queue_->pop_top();
+    decode_queue_->pop_top();
+    unified_queue_.clear();
+    decode_restore_waiting_.clear();
+  }
+
   bool enqueue_direct(std::shared_ptr<Request> request) {
     return request_queue_.write(std::move(request));
   }
@@ -201,6 +225,18 @@ class TestContinuousScheduler final : public ContinuousScheduler {
   int32_t reserved_speculative_tokens() const {
     return min_speculative_tokens_required_;
   }
+
+ protected:
+  void append_request_queue_metrics(
+      std::vector<std::pair<std::string, size_t>>& queues) override {
+    if (report_extra_queue_) {
+      queues.emplace_back("test_extension", extra_queue_size_);
+    }
+  }
+
+ private:
+  size_t extra_queue_size_ = 0;
+  bool report_extra_queue_ = false;
 };
 
 ContinuousScheduler::Options create_scheduler_options(
@@ -1271,6 +1307,14 @@ TEST(ContinuousSchedulerTest, PrefetchCompletesBeforeSchedulerQueueAdmission) {
                        /*max_context_len=*/30000)[0];
 
   ASSERT_TRUE(scheduler->add_request(request));
+  scheduler->report_queues();
+  auto* prefetch_gauge =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"prefetch", "0"});
+  ASSERT_NE(prefetch_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(prefetch_gauge->get_value(), 1.0);
+  auto* waiting_gauge = MULTI_GAUGE_scheduler_waiting_requests.get_stats({"0"});
+  ASSERT_NE(waiting_gauge, nullptr);
+  EXPECT_DOUBLE_EQ(waiting_gauge->get_value(), 0.0);
   EXPECT_EQ(engine->prefetch_calls(), 1u);
   EXPECT_EQ(scheduler->scheduler_queue_size(), 0u);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 1u);
@@ -1282,12 +1326,155 @@ TEST(ContinuousSchedulerTest, PrefetchCompletesBeforeSchedulerQueueAdmission) {
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 1u);
 
   engine->set_prefetch_ready(true);
+  scheduler->report_queues();
+  EXPECT_DOUBLE_EQ(prefetch_gauge->get_value(), 0.0);
+  auto* ingress =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"ingress", "0"});
+  ASSERT_NE(ingress, nullptr);
+  EXPECT_DOUBLE_EQ(ingress->get_value(), 1.0);
   batches = scheduler->prepare_batch_test();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 1u);
   EXPECT_EQ(batches.front()[0], request->sequences().front().get());
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0u);
   EXPECT_EQ(scheduler->scheduler_queue_size(), 0u);
+  auto* waiting = MULTI_GAUGE_scheduler_waiting_requests.get_stats({"0"});
+  ASSERT_NE(waiting, nullptr);
+  EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
+}
+
+TEST(ContinuousSchedulerTest, ReportsQueuesAndIsolatesInstanceLifecycle) {
+  const double previous_waiting = GAUGE_VALUE(num_waiting_requests);
+  ScopeGuard restore_metrics(
+      [&] { GAUGE_SET(num_waiting_requests, previous_waiting); });
+  GAUGE_SET(num_waiting_requests, 17.0);
+  auto options = create_scheduler_options(64, 4, 0, 64, 1);
+  options.server_idx(410);
+  FakeEngine engine(64, 32);
+  TestContinuousScheduler other(&engine, options);
+  other.set_extra_queue(2);
+  other.report_queues();
+  auto* other_waiting =
+      MULTI_GAUGE_scheduler_waiting_requests.get_stats({"410"});
+  ASSERT_NE(other_waiting, nullptr);
+  options.server_idx(415);
+  auto* waiting = MULTI_GAUGE_scheduler_waiting_requests.get_stats({"415"});
+  auto* extra =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"test_extension", "415"});
+  ASSERT_NE(waiting, nullptr);
+  ASSERT_NE(extra, nullptr);
+  {
+    TestContinuousScheduler scheduler(&engine, options);
+    auto requests = generate_request({8, 8, 8, 8, 8, 8},
+                                     {4, 4, 4, 4, 4, 4},
+                                     std::nullopt,
+                                     std::nullopt,
+                                     std::nullopt,
+                                     std::nullopt,
+                                     30000);
+    scheduler.populate_observed_queues(requests);
+    ASSERT_TRUE(scheduler.enqueue_direct(requests.back()));
+    scheduler.report_queues();
+    EXPECT_DOUBLE_EQ(waiting->get_value(), 6.0);
+    for (const std::string& queue :
+         {"ingress", "prefill", "chunk", "decode", "unified", "restore"}) {
+      auto* gauge =
+          MULTI_GAUGE_scheduler_queue_requests.get_stats({queue, "415"});
+      ASSERT_NE(gauge, nullptr);
+      EXPECT_DOUBLE_EQ(gauge->get_value(), 1.0);
+    }
+    scheduler.clear_observed_queues();
+    std::shared_ptr<Request> dequeued;
+    ASSERT_TRUE(scheduler.dequeue_direct(dequeued));
+    scheduler.report_queues();
+    EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
+    scheduler.set_extra_queue(3);
+    scheduler.report_queues();
+    EXPECT_DOUBLE_EQ(extra->get_value(), 3.0);
+    scheduler.set_extra_queue(0, false);
+    scheduler.report_queues();
+  }
+  EXPECT_DOUBLE_EQ(extra->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(other_waiting->get_value(), 2.0);
+  EXPECT_DOUBLE_EQ(GAUGE_VALUE(num_waiting_requests), 17.0);
+}
+
+class DeferredQueueMetricsTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(DeferredQueueMetricsTest,
+       CancelledIngressAndDeferredRequestsFallBackToIdle) {
+  ScopedConfigValue<bool> mix_batch(
+      SchedulerConfig::get_instance().enable_mix_batch(), GetParam());
+  auto options = create_scheduler_options(8, 1, 0, 8, 1);
+  options.priority_strategy(GetParam() ? "multi_slo_and_prio" : "fcfs")
+      .enable_chunked_prefill(true)
+      .server_idx(417);
+  FakeEngine engine(64, 32);
+  TestContinuousScheduler scheduler(&engine, options);
+  auto requests = generate_request({8, 8, 8},
+                                   {4, 4, 4},
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   30000);
+  for (auto& request : requests) {
+    request->state().output_func = [](const RequestOutput&) { return true; };
+    ASSERT_TRUE(scheduler.add_request(request));
+  }
+  requests.front()->set_cancel();
+  auto batches = scheduler.prepare_batch_test();
+  ASSERT_EQ(batches.front().size(), 1u);
+  auto* deferred = MULTI_GAUGE_scheduler_queue_requests.get_stats(
+      {GetParam() ? "unified" : "prefill", "417"});
+  auto* waiting = MULTI_GAUGE_scheduler_waiting_requests.get_stats({"417"});
+  ASSERT_NE(deferred, nullptr);
+  ASSERT_NE(waiting, nullptr);
+  EXPECT_DOUBLE_EQ(deferred->get_value(), 1.0);
+  EXPECT_DOUBLE_EQ(waiting->get_value(), 1.0);
+  for (auto& request : requests) {
+    request->set_cancel();
+  }
+  EXPECT_TRUE(scheduler.prepare_batch_test().front().empty());
+  EXPECT_DOUBLE_EQ(deferred->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
+  scheduler.wait_for_responses();
+}
+
+INSTANTIATE_TEST_SUITE_P(Policies, DeferredQueueMetricsTest, ::testing::Bool());
+
+TEST(ContinuousSchedulerTest, PendingIsLiveWithoutPreparingBatches) {
+  const double previous_pending = GAUGE_VALUE(num_pending_requests);
+  ScopeGuard restore_metrics(
+      [&] { GAUGE_SET(num_pending_requests, previous_pending); });
+  ContinuousScheduler::Options options =
+      create_scheduler_options(64, 4, 0, 64, 1);
+  options.server_idx_ = 411;
+  auto engine = std::make_unique<FakeEngine>(64, 32);
+  {
+    TestContinuousScheduler scheduler(engine.get(), options);
+    const std::string metric = "scheduler_preprocessing_requests_411";
+    EXPECT_EQ(bvar::Variable::describe_exposed(metric), "0");
+    scheduler.incr_pending_requests(2);
+    EXPECT_EQ(bvar::Variable::describe_exposed(metric), "2");
+    scheduler.prepare_batch_test();
+    EXPECT_DOUBLE_EQ(GAUGE_VALUE(num_pending_requests), 2.0);
+    scheduler.pause();
+    scheduler.step(absl::ZeroDuration());
+    ASSERT_TRUE(scheduler.is_paused());
+    scheduler.decr_pending_requests();
+    EXPECT_EQ(bvar::Variable::describe_exposed(metric), "1");
+    scheduler.step(absl::ZeroDuration());
+    EXPECT_DOUBLE_EQ(GAUGE_VALUE(num_pending_requests), 1.0);
+    scheduler.decr_pending_requests();
+    EXPECT_EQ(bvar::Variable::describe_exposed(metric), "0");
+    scheduler.step(absl::ZeroDuration());
+    EXPECT_DOUBLE_EQ(GAUGE_VALUE(num_pending_requests), 0.0);
+  }
+  EXPECT_TRUE(
+      bvar::Variable::describe_exposed("scheduler_preprocessing_requests_411")
+          .empty());
 }
 
 TEST(ContinuousSchedulerTest,
@@ -1323,6 +1510,13 @@ TEST(ContinuousSchedulerTest,
   EXPECT_TRUE(batches.front().empty());
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0u);
   EXPECT_EQ(scheduler->scheduler_queue_size(), 0u);
+  auto* waiting = MULTI_GAUGE_scheduler_waiting_requests.get_stats({"0"});
+  auto* prefetch =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"prefetch", "0"});
+  ASSERT_NE(waiting, nullptr);
+  ASSERT_NE(prefetch, nullptr);
+  EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(prefetch->get_value(), 0.0);
 }
 
 TEST(ContinuousSchedulerTest, QueueCapacityRejectsBeforePrefetchStarts) {

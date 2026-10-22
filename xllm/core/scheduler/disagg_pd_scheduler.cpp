@@ -51,6 +51,7 @@ limitations under the License.
 #include "runtime/xservice_client.h"
 #include "scheduler/continuous_scheduler.h"
 #include "util/env_var.h"
+#include "util/scope_guard.h"
 #include "util/timer.h"
 #include "util/utils.h"
 #include "util/uuid.h"
@@ -506,11 +507,40 @@ void DisaggPDScheduler::step(const absl::Duration& timeout) {
 
 void DisaggPDScheduler::enqueue_ready_request(
     std::shared_ptr<Request> request) {
+  dispatch_waiting_requests_.fetch_add(1, std::memory_order_relaxed);
   if (request->offline()) {
     prefill_request_queue_offline_.enqueue(std::move(request));
     return;
   }
   prefill_request_queue_.enqueue(std::move(request));
+}
+
+void DisaggPDScheduler::append_request_queue_metrics(
+    std::vector<std::pair<std::string, size_t>>& queues) {
+  queues.emplace_back(
+      scheduler_queue_metric::kPdDispatch,
+      dispatch_waiting_requests_.load(std::memory_order_relaxed));
+  queues.emplace_back(
+      scheduler_queue_metric::kPdDispatchActive,
+      dispatch_active_requests_.load(std::memory_order_relaxed));
+  queues.emplace_back(scheduler_queue_metric::kPdKvPrepare,
+                      kv_preparing_requests_.load(std::memory_order_relaxed));
+  queues.emplace_back(
+      scheduler_queue_metric::kPdReservation,
+      reservation_waiting_requests_.load(std::memory_order_relaxed));
+}
+
+bool DisaggPDScheduler::discard_cancelled_dispatch_request(
+    const std::shared_ptr<Request>& request) {
+  request->update_connection_status();
+  if (!request->cancelled()) {
+    return false;
+  }
+  release_failed_request(request);
+  kv_cache_manager_->deallocate(request.get());
+  response_processor_->process_failed_request(
+      request, {StatusCode::CANCELLED, "Request cancelled before PD dispatch"});
+  return true;
 }
 
 // prefill send new request to remote instance
@@ -547,6 +577,14 @@ void DisaggPDScheduler::dispatch_requests() {
 
     std::shared_ptr<Request> request = pending.top();
     pending.pop();
+    dispatch_active_requests_.fetch_add(1, std::memory_order_relaxed);
+    dispatch_waiting_requests_.fetch_sub(1, std::memory_order_relaxed);
+    ScopeGuard dispatch_guard([this] {
+      dispatch_active_requests_.fetch_sub(1, std::memory_order_relaxed);
+    });
+    if (discard_cancelled_dispatch_request(request)) {
+      continue;
+    }
 
     std::string selected_instance = request->state().decode_address;
     if (selected_instance.empty()) {
@@ -750,6 +788,9 @@ void DisaggPDScheduler::dispatch_requests() {
     }
     for (size_t i = 0; i < requests.size(); ++i) {
       if (resps.resps()[i].status_code() != 200) {
+        if (discard_cancelled_dispatch_request(requests[i])) {
+          continue;
+        }
         if (is_permanent_rejection(resps.resps()[i].status_code())) {
           LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
                      << requests[i]->request_id() << ", prompt_tokens="
@@ -760,6 +801,7 @@ void DisaggPDScheduler::dispatch_requests() {
         }
         // Keep created_time order: retry from the local pending queue instead
         // of the MPMC queue, which is not FIFO across HTTP threads.
+        dispatch_waiting_requests_.fetch_add(1, std::memory_order_relaxed);
         pending.push(requests[i]);
 
       } else {
@@ -846,6 +888,9 @@ void DisaggPDScheduler::dispatch_requests() {
         // changes before the asynchronous release task runs.
         requests[i]->state().decode_rpc_address =
             butil::endpoint2str(cntl.remote_side()).c_str();
+        if (discard_cancelled_dispatch_request(requests[i])) {
+          continue;
+        }
         // Push to request_queue_; it will be executed by the engine.
         request_queue_.write(requests[i]);
       }
@@ -1120,6 +1165,8 @@ std::shared_ptr<Request> DisaggPDScheduler::take_waiting_request(
   }
   auto request = std::move(it->second);
   received_request_map_.erase(it);
+  reservation_waiting_requests_.store(received_request_map_.size(),
+                                      std::memory_order_relaxed);
   auto inst_it = request_to_instance_map_.find(req_id);
   if (inst_it != request_to_instance_map_.end()) {
     auto reverse_it = instance_to_received_requests_map_.find(inst_it->second);
@@ -1175,6 +1222,8 @@ bool DisaggPDScheduler::decode_schedule(
     instance_to_received_requests_map_[prefill_instance_name].insert(
         request->request_id());
     request_to_instance_map_[request->request_id()] = prefill_instance_name;
+    reservation_waiting_requests_.store(received_request_map_.size(),
+                                        std::memory_order_relaxed);
   }
 
   return true;
@@ -1210,6 +1259,10 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     request = take_waiting_request(req_id);
   }
   auto& sequences = request->sequences();
+  kv_preparing_requests_.fetch_add(1, std::memory_order_relaxed);
+  ScopeGuard prepare_guard([this] {
+    kv_preparing_requests_.fetch_sub(1, std::memory_order_relaxed);
+  });
   if (sequences.empty() || sequences[0] == nullptr) {
     LOG(ERROR) << "Request has no valid sequences, request_id: " << req_id;
     for (auto& sequence : sequences) {
@@ -1592,6 +1645,8 @@ bool DisaggPDScheduler::unlink_instance(
       }
       instance_to_received_requests_map_.erase(it);
     }
+    reservation_waiting_requests_.store(received_request_map_.size(),
+                                        std::memory_order_relaxed);
   }
 
   std::lock_guard<std::mutex> lock(linked_instances_mutex_);

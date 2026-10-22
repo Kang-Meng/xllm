@@ -21,7 +21,67 @@ limitations under the License.
 #include <pthread.h>
 #include <sched.h>
 
+#include <new>
+
+#include "util/scope_guard.h"
+
 namespace xllm {
+
+TEST(ConcurrentQueueTest, PushFailureDoesNotInvokeCallback) {
+  class ThrowOnMove final {
+   public:
+    ThrowOnMove() = default;
+    ThrowOnMove(ThrowOnMove&&) { throw std::bad_alloc(); }
+  };
+
+  ConcurrentQueue<ThrowOnMove> queue;
+  int64_t queued = 0;
+  EXPECT_THROW(queue.push(ThrowOnMove{}, [&queued]() noexcept { ++queued; }),
+               std::bad_alloc);
+  EXPECT_EQ(queued, 0);
+  EXPECT_TRUE(queue.empty());
+}
+
+TEST(ThreadPoolTest, QueueMetricsTrackTasksAndUnregisterAfterDrain) {
+  absl::Notification started;
+  absl::Notification release;
+  std::atomic<int64_t> final_queued{-1};
+  std::atomic<int64_t> final_running{-1};
+  {
+    ThreadPool threadpool(1, false, "", "threadpool_queue_metrics_test");
+    threadpool.schedule([&] {
+      started.Notify();
+      release.WaitForNotification();
+    });
+    ScopeGuard release_guard([&] {
+      if (!release.HasBeenNotified()) {
+        release.Notify();
+      }
+    });
+    ASSERT_TRUE(started.WaitForNotificationWithTimeout(absl::Seconds(5)));
+    EXPECT_EQ(threadpool.queued_tasks(), 0);
+    EXPECT_EQ(threadpool.running_tasks(), 1);
+    threadpool.schedule([] {});
+    threadpool.schedule_with_tid(
+        [&] {
+          final_queued.store(threadpool.queued_tasks());
+          final_running.store(threadpool.running_tasks());
+        },
+        0);
+    EXPECT_EQ(threadpool.schedule(nullptr), -1);
+    threadpool.schedule_with_tid(ThreadPool::Runnable{}, 0);
+    EXPECT_EQ(threadpool.queued_tasks(), 2);
+    EXPECT_EQ(threadpool.running_tasks(), 1);
+  }
+  EXPECT_EQ(final_queued.load(), 0);
+  EXPECT_EQ(final_running.load(), 1);
+  EXPECT_TRUE(bvar::Variable::describe_exposed(
+                  "threadpool_queue_metrics_test_queued_tasks")
+                  .empty());
+  EXPECT_TRUE(bvar::Variable::describe_exposed(
+                  "threadpool_queue_metrics_test_running_tasks")
+                  .empty());
+}
 
 TEST(ThreadPoolTest, ScheduleEmptyTask) {
   ThreadPool threadpool(1);

@@ -29,6 +29,24 @@ namespace xllm {
 
 using bvar::Adder;
 
+namespace scheduler_queue_metric {
+inline constexpr char kIngress[] = "ingress";
+inline constexpr char kPrefill[] = "prefill";
+inline constexpr char kChunk[] = "chunk";
+inline constexpr char kDecode[] = "decode";
+inline constexpr char kUnified[] = "unified";
+inline constexpr char kRestore[] = "restore";
+inline constexpr char kPrefetch[] = "prefetch";
+inline constexpr char kPdDispatch[] = "pd_dispatch";
+inline constexpr char kPdDispatchActive[] = "pd_dispatch_active";
+inline constexpr char kPdKvPrepare[] = "pd_kv_prepare";
+inline constexpr char kPdReservation[] = "pd_reservation";
+inline constexpr char kOfflinePrefill[] = "offline_prefill";
+inline constexpr char kOfflineDecode[] = "offline_decode";
+inline constexpr char kDiTDeferred[] = "dit_deferred";
+inline constexpr char kFixedPrefetched[] = "fixed_prefetched";
+}  // namespace scheduler_queue_metric
+
 class AutoCounter final {
  public:
   AutoCounter(bvar::Adder<double>& counter) : counter_(counter) {}
@@ -248,6 +266,8 @@ DECLARE_COUNTER(json_object_mask_build_constrained_rows_draft_total);
 DECLARE_COUNTER(json_object_mask_build_constrained_rows_target_total);
 
 DECLARE_GAUGE(num_pending_requests);
+DECLARE_MULTI_GAUGE(scheduler_queue_requests);
+DECLARE_MULTI_GAUGE(scheduler_waiting_requests);
 DECLARE_GAUGE(num_running_requests);
 DECLARE_GAUGE(num_waiting_requests);
 DECLARE_GAUGE(num_preempted_requests);

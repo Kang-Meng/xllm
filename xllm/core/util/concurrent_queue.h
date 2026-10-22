@@ -21,6 +21,8 @@ limitations under the License.
 
 #include <optional>
 #include <queue>
+#include <type_traits>
+#include <utility>
 
 #if __has_attribute(guarded_by)
 #define GUARDED_BY(x) __attribute__((guarded_by(x)))
@@ -46,12 +48,19 @@ class ConcurrentQueue {
 
   // push an element to the queue
   void push(T value) {
+    push(std::move(value), []() noexcept {});
+  }
+
+  template <typename OnPushed>
+  void push(T value, OnPushed&& on_pushed) {
+    static_assert(std::is_nothrow_invocable_v<OnPushed&>);
     absl::MutexLock lock(&mutex_);
     if (capacity_ > 0) {
       auto not_full = [this]() { return queue_.size() < capacity_; };
       mutex_.Await(absl::Condition(&not_full));
     }
     queue_.push(std::move(value));
+    on_pushed();
   }
 
   template <typename... Args>

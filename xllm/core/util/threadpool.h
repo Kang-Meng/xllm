@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+#include <bvar/bvar.h>
 #include <folly/Function.h>
 
 #include <algorithm>
@@ -122,11 +123,13 @@ class ThreadPool final {
 
   explicit ThreadPool(size_t num_threads,
                       bool cpu_binding = false,
-                      const std::string& pool_name = "");
+                      const std::string& pool_name = "",
+                      const std::string& metrics_prefix = "");
   explicit ThreadPool(size_t num_threads,
                       Runnable init_func,
                       bool cpu_binding = false,
-                      const std::string& pool_name = "");
+                      const std::string& pool_name = "",
+                      const std::string& metrics_prefix = "");
   // Bind each worker thread to the corresponding CPU core in cpu_cores.
   // cpu_cores[i] is the CPU core ID for thread i. If cpu_cores is empty,
   // no binding is performed. If cpu_cores.size() does not equal num_threads,
@@ -141,6 +144,9 @@ class ThreadPool final {
 
   void schedule_with_tid(Runnable runnable, size_t tid);
 
+  int64_t queued_tasks() const;
+  int64_t running_tasks() const;
+
   bool empty() {
     return std::all_of(queues_.begin(), queues_.end(), [](auto& queue) {
       return queue.empty();
@@ -154,6 +160,11 @@ class ThreadPool final {
                      std::shared_ptr<Runnable> init_func,
                      std::shared_ptr<BlockingCounter> block_counter,
                      int32_t cpu_core);
+
+  Runnable observe_task(Runnable runnable);
+  void initialize_queue_metrics(const std::string& prefix);
+  std::unique_ptr<bvar::Adder<int64_t>> queued_tasks_metric_;
+  std::unique_ptr<bvar::Adder<int64_t>> running_tasks_metric_;
 
   std::vector<std::thread> threads_;
   std::vector<ConcurrentQueue<Runnable>> queues_;

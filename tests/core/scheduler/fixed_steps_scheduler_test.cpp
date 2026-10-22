@@ -19,6 +19,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 
 #include "common/metrics.h"
@@ -29,6 +30,17 @@ limitations under the License.
 #include "framework/request/rec_type.h"
 
 namespace xllm {
+
+class FixedStepsSchedulerTestPeer final {
+ public:
+  static void prefetch(FixedStepsScheduler& scheduler) {
+    scheduler.prefetch_request(std::chrono::steady_clock::now());
+  }
+
+  static void report_queues(FixedStepsScheduler& scheduler) {
+    scheduler.report_request_queue_metrics();
+  }
+};
 
 namespace {
 
@@ -207,6 +219,55 @@ TEST(FixedStepsSchedulerTest, PrepareBatchEmptyWhenNoRequests) {
   EXPECT_FALSE(batches.empty());
   EXPECT_TRUE(batches[0].empty());
 }
+
+class PrefetchedQueueMetricsTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(PrefetchedQueueMetricsTest, WaitingEndsOnSelectionOrCancellation) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), false);
+  FakeEngine engine(32, 32);
+  auto options = CreateOptions();
+  options.server_idx(431);
+  auto* ingress =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"ingress", "431"});
+  auto* prefetched = MULTI_GAUGE_scheduler_queue_requests.get_stats(
+      {"fixed_prefetched", "431"});
+  auto* waiting = MULTI_GAUGE_scheduler_waiting_requests.get_stats({"431"});
+  ASSERT_NE(ingress, nullptr);
+  ASSERT_NE(prefetched, nullptr);
+  ASSERT_NE(waiting, nullptr);
+  {
+    FixedStepsScheduler scheduler(&engine, options);
+    auto requests = GenRequests({64}, {10}, RecType::kOneRec);
+    requests.front()->state().output_func = [](const RequestOutput&) {
+      return true;
+    };
+    ASSERT_TRUE(scheduler.add_request(requests.front()));
+    FixedStepsSchedulerTestPeer::report_queues(scheduler);
+    EXPECT_DOUBLE_EQ(ingress->get_value(), 1.0);
+    FixedStepsSchedulerTestPeer::prefetch(scheduler);
+    EXPECT_DOUBLE_EQ(ingress->get_value(), 0.0);
+    EXPECT_DOUBLE_EQ(prefetched->get_value(), 1.0);
+    EXPECT_DOUBLE_EQ(waiting->get_value(), 1.0);
+    if (GetParam()) {
+      requests.front()->set_cancel();
+    }
+    EXPECT_EQ(scheduler.prepare_batch_test().front().empty(), GetParam());
+    EXPECT_DOUBLE_EQ(prefetched->get_value(), 0.0);
+    EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
+    requests.front()->set_cancel();
+    scheduler.prepare_batch_test();
+    auto remaining = GenRequests({32}, {10}, RecType::kOneRec);
+    ASSERT_TRUE(scheduler.add_request(remaining.front()));
+    FixedStepsSchedulerTestPeer::prefetch(scheduler);
+  }
+  EXPECT_DOUBLE_EQ(prefetched->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
+}
+
+INSTANTIATE_TEST_SUITE_P(TerminalStates,
+                         PrefetchedQueueMetricsTest,
+                         ::testing::Bool());
 
 TEST(FixedStepsSchedulerTest, ReportsBlockCountsInsteadOfRankCount) {
   ScopedConfigValue<bool> prefix_cache(

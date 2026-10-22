@@ -19,6 +19,7 @@ limitations under the License.
 #include <folly/MPMCQueue.h>
 #include <folly/futures/Future.h>
 
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <queue>
@@ -56,6 +57,13 @@ class FixedStepsScheduler final : public ContinuousScheduler {
   void step(const absl::Duration& timeout) override;
 
  private:
+  friend class FixedStepsSchedulerTestPeer;
+
+  void append_request_queue_metrics(
+      std::vector<std::pair<std::string, size_t>>& queues) override;
+
+  void prefetch_request(const std::chrono::steady_clock::time_point& deadline);
+
   // Scheduler pipeline for different rec types
   class SchedulerPipeline {
    public:

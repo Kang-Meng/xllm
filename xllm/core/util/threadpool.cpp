@@ -20,6 +20,7 @@ limitations under the License.
 #include <thread>
 
 #include "core/util/cpu_affinity.h"
+#include "core/util/scope_guard.h"
 
 namespace xllm {
 namespace {
@@ -37,16 +38,22 @@ void log_threadpool_creation(size_t num_threads,
 
 ThreadPool::ThreadPool(size_t num_threads,
                        bool cpu_binding,
-                       const std::string& pool_name)
-    : ThreadPool(num_threads, nullptr, cpu_binding, pool_name) {}
+                       const std::string& pool_name,
+                       const std::string& metrics_prefix)
+    : ThreadPool(num_threads, nullptr, cpu_binding, pool_name, metrics_prefix) {
+}
 
 ThreadPool::ThreadPool(size_t num_threads,
                        Runnable init_func,
                        bool cpu_binding,
                        //  const char* fn,
                        //  int32_t ln,
-                       const std::string& pool_name)
+                       const std::string& pool_name,
+                       const std::string& metrics_prefix)
     : queues_(num_threads), pool_name_(pool_name) {
+  if (!metrics_prefix.empty()) {
+    initialize_queue_metrics(metrics_prefix);
+  }
   log_threadpool_creation(
       num_threads,
       pool_name,
@@ -124,7 +131,11 @@ int32_t ThreadPool::schedule(Runnable runnable) {
     next = (current + 1) % queues_.size();
   } while (!index_.compare_exchange_weak(
       current, next, std::memory_order_relaxed, std::memory_order_relaxed));
-  queues_[current].push(std::move(runnable));
+  queues_[current].push(observe_task(std::move(runnable)), [this]() noexcept {
+    if (queued_tasks_metric_) {
+      *queued_tasks_metric_ << 1;
+    }
+  });
   return current;
 }
 
@@ -135,7 +146,38 @@ void ThreadPool::schedule_with_tid(Runnable runnable, size_t tid) {
 
   // LOG(INFO) << "ThreadPool " << pool_name_ << " schedule.";
 
-  queues_[tid].push(std::move(runnable));
+  queues_[tid].push(observe_task(std::move(runnable)), [this]() noexcept {
+    if (queued_tasks_metric_) {
+      *queued_tasks_metric_ << 1;
+    }
+  });
+}
+
+void ThreadPool::initialize_queue_metrics(const std::string& prefix) {
+  queued_tasks_metric_ =
+      std::make_unique<bvar::Adder<int64_t>>(prefix + "_queued_tasks");
+  running_tasks_metric_ =
+      std::make_unique<bvar::Adder<int64_t>>(prefix + "_running_tasks");
+}
+
+int64_t ThreadPool::queued_tasks() const {
+  return queued_tasks_metric_ ? queued_tasks_metric_->get_value() : 0;
+}
+
+int64_t ThreadPool::running_tasks() const {
+  return running_tasks_metric_ ? running_tasks_metric_->get_value() : 0;
+}
+
+ThreadPool::Runnable ThreadPool::observe_task(Runnable runnable) {
+  if (runnable == nullptr || !queued_tasks_metric_) {
+    return runnable;
+  }
+  return [this, runnable = std::move(runnable)]() mutable {
+    *queued_tasks_metric_ << -1;
+    *running_tasks_metric_ << 1;
+    ScopeGuard running_guard([this] { *running_tasks_metric_ << -1; });
+    runnable();
+  };
 }
 
 void ThreadPool::internal_loop(size_t index,
