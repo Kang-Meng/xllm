@@ -291,6 +291,9 @@ TEST(KVCacheEstimationTest, DecodePrefixCacheResolvesLinearStateSlots) {
   options.instance_role = InstanceRole::DECODE;
   options.enable_prefix_cache = true;
   options.max_linear_state_cache_slots = 0;
+  // 64 GiB keeps the proportional share above the 1.5x requests below, so
+  // the batch cap is the binding constraint.
+  options.cache_size_in_bytes = 64LL << 30;
 
   for (const auto& [max_seqs, expected_blocks] :
        std::vector<std::pair<int64_t, int64_t>>{{8, 14}, {9, 16}, {128, 194}}) {
@@ -305,6 +308,35 @@ TEST(KVCacheEstimationTest, DecodePrefixCacheResolvesLinearStateSlots) {
   const KVCacheCapacity explicit_capacity =
       estimate_kv_cache_capacity(model_args, options);
   EXPECT_EQ(explicit_capacity.num_linear_state_blocks(), 7);
+}
+
+TEST(KVCacheEstimationTest, DecodePrefixCacheTakesMinOfBatchAndRatio) {
+  ModelArgs model_args = make_linear_attention_args(1);
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.instance_role = InstanceRole::DECODE;
+  options.enable_prefix_cache = true;
+  options.max_linear_state_cache_slots = 0;
+  options.cache_size_in_bytes = 1024 * 1024;
+
+  options.max_seqs_per_batch = 0;
+  const KVCacheCapacity ratio_capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  // ceil(1.5 * 8) + 2 = 14, below the 1 MiB proportional share.
+  options.max_seqs_per_batch = 8;
+  const KVCacheCapacity small_batch =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(small_batch.num_linear_state_blocks(), 14);
+  EXPECT_LT(small_batch.num_linear_state_blocks(),
+            ratio_capacity.num_linear_state_blocks());
+
+  // ceil(1.5 * 100000) + 2 exceeds the proportional share, so the ratio wins.
+  options.max_seqs_per_batch = 100000;
+  const KVCacheCapacity large_batch =
+      estimate_kv_cache_capacity(model_args, options);
+  EXPECT_EQ(large_batch.num_linear_state_blocks(),
+            ratio_capacity.num_linear_state_blocks());
+  EXPECT_GT(large_batch.n_blocks(), 0);
 }
 
 #if defined(USE_MLU)
@@ -501,7 +533,12 @@ TEST(KVCacheEstimationTest, ClampsDerivedLinearStateSlotsToCacheBudget) {
 
   const KVCacheCapacity capacity =
       estimate_kv_cache_capacity(model_args, options);
+  options.max_seqs_per_batch = 0;
+  const KVCacheCapacity ratio_capacity =
+      estimate_kv_cache_capacity(model_args, options);
 
+  EXPECT_EQ(capacity.num_linear_state_blocks(),
+            ratio_capacity.num_linear_state_blocks());
   EXPECT_EQ(capacity.num_linear_state_blocks(), 229);
   EXPECT_GT(capacity.n_blocks(), 0);
 }

@@ -15,11 +15,29 @@ limitations under the License.
 
 #include "options.h"
 
+#include <sstream>
+
+namespace {
+
+// Unset optionals print as "null" so a missing value is distinct from a
+// default such as 0 or false.
+template <typename T>
+std::string optional_to_string(const std::optional<T>& value) {
+  if (!value.has_value()) {
+    return "null";
+  }
+  std::ostringstream oss;
+  oss << value.value();
+  return oss.str();
+}
+
+}  // namespace
+
 namespace xllm {
 std::string Options::to_string() const {
   std::stringstream ss;
   ss << "Options: [";
-  ss << "model_path: " << model_path()
+  ss << "model_path: " << model_path() << ", model_id: " << model_id()
      << ", draft_model_path: " << draft_model_path().value_or("null")
      << ", backend: " << backend()
      << ", limit_image_per_prompt: " << limit_image_per_prompt()
@@ -55,15 +73,27 @@ std::string Options::to_string() const {
      << enable_adaptive_speculative_decode()
      << ", adaptive_speculative_min_gain: " << adaptive_speculative_min_gain()
      << ", num_request_handling_threads: " << num_request_handling_threads()
+     << ", enable_eplb: " << optional_to_string(enable_eplb())
+     << ", redundant_experts_num: "
+     << optional_to_string(redundant_experts_num())
+     << ", eplb_update_interval: " << optional_to_string(eplb_update_interval())
+     << ", eplb_min_peak_load_improvement: "
+     << optional_to_string(eplb_min_peak_load_improvement())
      << ", communication_backend: " << communication_backend().value_or("null")
      << ", rank_tablefile: " << rank_tablefile().value_or("null")
      << ", expert_parallel_degree: " << expert_parallel_degree().value_or(0)
      << ", task_type: " << task_type() << ", enable_mla: " << enable_mla()
+     << ", npu_kernel_backend: " << npu_kernel_backend()
      << ", enable_chunked_prefill: " << enable_chunked_prefill()
      << ", enable_flashcomm1: " << enable_flashcomm1()
      << ", flashcomm1_min_prefill_tokens: " << flashcomm1_min_prefill_tokens()
      << ", enable_mmrs_fusion: " << enable_mmrs_fusion()
-     << ", mmrs_comm_mode: " << mmrs_comm_mode() << ", cp_size: " << cp_size()
+     << ", mmrs_comm_mode: " << mmrs_comm_mode() << ", dp_size: " << dp_size()
+     << ", cp_size: " << cp_size() << ", ep_size: " << ep_size()
+     << ", tp_size: " << tp_size() << ", sp_size: " << sp_size()
+     << ", cfg_size: " << cfg_size() << ", vae_size: " << vae_size()
+     << ", text_encoder_tp_size: " << text_encoder_tp_size()
+     << ", instance_name: " << optional_to_string(instance_name())
      << ", master_node_addr: " << master_node_addr().value_or("null")
      << ", instance_role: " << instance_role().to_string()
      << ", transfer_listen_port: " << transfer_listen_port()
@@ -71,12 +101,19 @@ std::string Options::to_string() const {
      << ", enable_schedule_overlap: " << enable_schedule_overlap()
      << ", enable_disagg_pd: " << enable_disagg_pd()
      << ", enable_pd_ooc: " << enable_pd_ooc()
+     << ", enable_offline_inference: " << enable_offline_inference()
+     << ", enable_sleep_mode: " << enable_sleep_mode()
      << ", disable_log_stats: " << disable_log_stats()
      << ", kv_cache_dtype: " << kv_cache_dtype()
      << ", kv_cache_transfer_mode: " << kv_cache_transfer_mode()
      << ", etcd_addr: " << etcd_addr().value_or("null")
      << ", etcd_namespace: " << etcd_namespace().value_or("null")
      << ", enable_service_routing: " << enable_service_routing()
+     << ", tool_call_parser: " << optional_to_string(tool_call_parser())
+     << ", reasoning_parser: " << optional_to_string(reasoning_parser())
+     << ", priority_strategy: " << priority_strategy()
+     << ", enable_online_preempt_offline: " << enable_online_preempt_offline()
+     << ", host_blocks_factor: " << host_blocks_factor()
      << ", enable_kvcache_store: " << enable_kvcache_store()
      << ", prefetch_timeout: " << prefetch_timeout()
      << ", prefetch_batch_size: " << prefetch_batch_size()
@@ -87,6 +124,11 @@ std::string Options::to_string() const {
      << ", store_metadata_server: " << store_metadata_server()
      << ", store_local_hostname: " << store_local_hostname()
      << ", enable_multi_stream_parallel: " << enable_multi_stream_parallel()
+     << ", enable_profile_step_time: " << enable_profile_step_time()
+     << ", enable_profile_token_budget: " << enable_profile_token_budget()
+     << ", enable_latency_aware_schedule: " << enable_latency_aware_schedule()
+     << ", profile_max_prompt_length: " << profile_max_prompt_length()
+     << ", enable_profile_kv_blocks: " << enable_profile_kv_blocks()
      << ", disable_ttft_profiling: " << disable_ttft_profiling()
      << ", enable_forward_interruption: " << enable_forward_interruption()
      << ", enable_graph: " << enable_graph()
@@ -94,6 +136,16 @@ std::string Options::to_string() const {
      << enable_graph_mode_decode_no_padding()
      << ", enable_prefill_piecewise_graph: " << enable_prefill_piecewise_graph()
      << ", max_tokens_for_graph_mode: " << max_tokens_for_graph_mode()
+     << ", max_global_ttft_ms: " << max_global_ttft_ms()
+     << ", max_global_tpot_ms: " << max_global_tpot_ms()
+     << ", max_requests_per_batch: " << max_requests_per_batch()
+     << ", spawn_worker_path: " << spawn_worker_path()
+     << ", enable_shm: " << enable_shm()
+     << ", input_shm_size: " << input_shm_size()
+     << ", output_shm_size: " << output_shm_size()
+     << ", is_local: " << is_local() << ", beam_width: " << beam_width()
+     << ", rec_worker_max_concurrency: " << rec_worker_max_concurrency()
+     << ", master_status: " << master_status().to_string()
      << ", server_idx: " << server_idx();
   ss << "]";
   return ss.str();

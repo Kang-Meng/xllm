@@ -587,6 +587,25 @@ int64_t scale_host_block_count(int64_t block_count, double host_blocks_factor) {
                            static_cast<int64_t>(scaled_block_count));
 }
 
+int64_t prefill_host_linear_block_count(int64_t host_kv_block_count,
+                                        int64_t kv_block_size,
+                                        int64_t chunk_size) {
+  CHECK_GT(host_kv_block_count, 0) << "host KV block count must be positive.";
+  CHECK_GT(kv_block_size, 0) << "KV block size must be positive.";
+  CHECK_GT(chunk_size, 0)
+      << "max_tokens_per_chunk_for_prefill must be positive to size the "
+         "prefill Host linear pool.";
+  CHECK_LE(host_kv_block_count,
+           std::numeric_limits<int64_t>::max() / kv_block_size)
+      << "Host KV token capacity exceeds the int64 limit.";
+  const int64_t host_token_capacity = host_kv_block_count * kv_block_size;
+  const int64_t linear_blocks = host_token_capacity / chunk_size;
+  CHECK_GT(linear_blocks, 1)
+      << "prefill Host linear pool needs more than one slot; host KV holds "
+      << host_token_capacity << " tokens and chunk size is " << chunk_size;
+  return linear_blocks;
+}
+
 int64_t dsv4_host_swa_block_count(int64_t c128_block_count,
                                   double host_blocks_factor,
                                   int64_t window_size,

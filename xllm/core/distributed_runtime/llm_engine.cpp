@@ -818,10 +818,22 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
                                 static_cast<uint32_t>(host_kv_block_count));
       }
       if (has_gdn_state) {
-        int64_t host_linear_blocks = host_kv_block_count;
+        int64_t host_linear_blocks = 0;
         if (options_.instance_role() == InstanceRole::DECODE) {
           host_linear_blocks = kv_cache_cap.num_linear_state_blocks() * 2;
+        } else {
+          // One Host linear checkpoint per prefill chunk that fits in the
+          // Host KV token capacity.
+          const int64_t chunk_size =
+              static_cast<int64_t>(SchedulerConfig::get_instance()
+                                       .max_tokens_per_chunk_for_prefill());
+          host_linear_blocks = prefill_host_linear_block_count(
+              host_kv_block_count, kv_cache_cap.block_size(), chunk_size);
         }
+        CHECK_LE(host_linear_blocks,
+                 static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+            << "prefill Host linear block count exceeds uint32_t range: "
+            << host_linear_blocks;
         host_capacities.emplace(BlockType::LINEAR,
                                 static_cast<uint32_t>(host_linear_blocks));
       }

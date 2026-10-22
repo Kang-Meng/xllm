@@ -62,7 +62,9 @@ struct Options {
   // maximum processor cache item count (default 256; 0 disables)
   PROPERTY(int64_t, max_processor_cache_items) = 256;
 
-  // active linear-state slots. 0 derives capacity from the KV cache budget.
+  // Active linear-state slots. 0 uses min(ceil(1.5 * max_seqs_per_batch),
+  // proportional KV cache budget) for Decode with prefix cache, and the
+  // proportional budget otherwise.
   PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
 
   // number of decoding tokens per sequence

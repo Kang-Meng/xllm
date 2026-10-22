@@ -235,6 +235,12 @@ LinearAttentionKVCacheTensors create_linear_attention_kv_cache_tensors(
 // (clamped to >= 1.0 so the host pool is never smaller than the device pool).
 int64_t scale_host_block_count(int64_t block_count, double host_blocks_factor);
 
+// Prefill Host LINEAR slots: one checkpoint per chunk that fits in the Host
+// KV token capacity. Decode keeps its own sizing and does not use this.
+int64_t prefill_host_linear_block_count(int64_t host_kv_block_count,
+                                        int64_t kv_block_size,
+                                        int64_t chunk_size);
+
 // Reserve one SWA window tail per compressed unit; keep the Host tensor and
 // typed block pool in sync.
 int64_t dsv4_host_swa_block_count(int64_t c128_block_count,

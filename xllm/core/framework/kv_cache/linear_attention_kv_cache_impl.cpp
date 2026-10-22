@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "framework/kv_cache/linear_attention_kv_cache_impl.h"
 
+#include "core/framework/config/scheduler_config.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "util/tensor_helper.h"
@@ -60,9 +61,14 @@ LinearAttentionKVCacheImpl::LinearAttentionKVCacheImpl(
       kv_cache_shape.key_cache_shape()[0], create_options.host_blocks_factor());
 
   CHECK(!kv_cache_shape.conv_cache_shape().empty());
-  int64_t host_linear_count = host_kv_block_count;
+  int64_t host_linear_count = 0;
   if (create_options.is_decode()) {
     host_linear_count = kv_cache_shape.conv_cache_shape()[0] * 2;
+  } else {
+    const int64_t chunk_size = static_cast<int64_t>(
+        SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill());
+    host_linear_count = prefill_host_linear_block_count(
+        host_kv_block_count, create_options.block_size(), chunk_size);
   }
 
   host_page_aligned_regions_.reserve(2);

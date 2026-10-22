@@ -311,6 +311,31 @@ int64_t max_linear_state_blocks(int64_t cache_size_in_bytes,
   return std::max<int64_t>(max_linear_blocks, kPaddingLinearStateBlocks);
 }
 
+// ~47% of cache bytes (ratio 0.9 means linear fraction = 0.9 / 1.9), floored
+// at the padding baseline and capped so one full-attention block still fits.
+int64_t proportional_linear_state_blocks(
+    int64_t cache_size_in_bytes,
+    int64_t state_slot_bytes,
+    int64_t full_cache_block_size_in_bytes) {
+  if (state_slot_bytes <= 0) {
+    return kPaddingLinearStateBlocks;
+  }
+  constexpr double kLinearStateFullKvMemoryRatio = 0.9;
+  const double linear_memory_fraction =
+      kLinearStateFullKvMemoryRatio / (1.0 + kLinearStateFullKvMemoryRatio);
+  const double linear_memory_bytes =
+      static_cast<double>(cache_size_in_bytes) * linear_memory_fraction;
+  const int64_t auto_blocks = std::max<int64_t>(
+      static_cast<int64_t>(linear_memory_bytes / state_slot_bytes),
+      kPaddingLinearStateBlocks);
+  const int64_t max_blocks = max_linear_state_blocks(
+      cache_size_in_bytes, state_slot_bytes, full_cache_block_size_in_bytes);
+  // Both bounds already sit at or above kPaddingLinearStateBlocks (auto_blocks
+  // is floored above; max_blocks is floored in max_linear_state_blocks), so the
+  // min of the two cannot drop below it.
+  return std::min<int64_t>(auto_blocks, max_blocks);
+}
+
 int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
                                       int64_t state_slot_bytes,
                                       int64_t full_cache_block_size_in_bytes,
@@ -332,23 +357,8 @@ int64_t calculate_linear_state_blocks(int64_t cache_size_in_bytes,
     return requested_blocks;
   }
 
-  // Auto-size: allocate ~47% of cache bytes to linear-state slots (ratio 0.9
-  // means linear fraction = 0.9 / 1.9).
-  constexpr double kLinearStateFullKvMemoryRatio = 0.9;
-  int64_t auto_blocks = kPaddingLinearStateBlocks;
-  if (state_slot_bytes > 0) {
-    const double linear_memory_fraction =
-        kLinearStateFullKvMemoryRatio / (1.0 + kLinearStateFullKvMemoryRatio);
-    const double linear_memory_bytes =
-        static_cast<double>(cache_size_in_bytes) * linear_memory_fraction;
-    auto_blocks = std::max<int64_t>(
-        static_cast<int64_t>(linear_memory_bytes / state_slot_bytes),
-        kPaddingLinearStateBlocks);
-  }
-  // Both bounds already sit at or above kPaddingLinearStateBlocks (auto_blocks
-  // is floored above; max_blocks is floored in max_linear_state_blocks), so the
-  // min of the two cannot drop below it.
-  return std::min<int64_t>(auto_blocks, max_blocks);
+  return proportional_linear_state_blocks(
+      cache_size_in_bytes, state_slot_bytes, full_cache_block_size_in_bytes);
 }
 
 int64_t resolve_max_linear_state_cache_slots(
@@ -847,6 +857,19 @@ void init_standard_counts(const ModelArgs& model_args,
                                     total_state_bytes,
                                     full_cache_block_size_in_bytes,
                                     effective_max_linear_state_cache_slots);
+  // Decode with prefix cache asks for ceil(1.5 * max_seqs_per_batch) live
+  // slots. Keep that request only when it is smaller than the proportional
+  // share of the KV cache; a large batch must not outgrow the ratio.
+  if (auto_linear_state_slots &&
+      options.instance_role == InstanceRole::DECODE &&
+      options.enable_prefix_cache && options.max_seqs_per_batch > 0 &&
+      total_state_bytes > 0) {
+    const int64_t ratio_blocks =
+        proportional_linear_state_blocks(kv_cache_cap->cache_size_in_bytes(),
+                                         total_state_bytes,
+                                         full_cache_block_size_in_bytes);
+    num_linear_state_blocks = std::min(num_linear_state_blocks, ratio_blocks);
+  }
 #if defined(USE_NPU)
   if (is_qwen3_5_target_model_type(model_args.model_type()) &&
       kv_cache_cap->num_linear_attention_layers() > 0) {

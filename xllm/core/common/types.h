@@ -481,6 +481,19 @@ class MasterStatus {
     }
   }
 
+  const char* to_string() const {
+    switch (value_) {
+      case WAKEUP:
+        return "WAKEUP";
+      case LIGHT_SLEEP:
+        return "LIGHT_SLEEP";
+      case DEEP_SLEEP:
+        return "DEEP_SLEEP";
+      default:
+        return "INVALID";
+    }
+  }
+
  private:
   Value value_;
 };

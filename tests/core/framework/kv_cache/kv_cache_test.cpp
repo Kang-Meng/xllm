@@ -461,11 +461,11 @@ TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
   EXPECT_EQ(shape_vec(caches[2].get_swa_cache()),
             dsv4_block_shape(kSwaCount, kBlockSize, 1, kHeadDim));
   EXPECT_EQ(shape_vec(caches[2].get_compress_kv_state()),
-            (std::vector<int64_t>{kSwaCount, xllm::kDsv41CompressStateRows,
-                                  kHeadDim}));
+            (std::vector<int64_t>{
+                kSwaCount, xllm::kDsv41CompressStateRows, kHeadDim}));
   EXPECT_EQ(shape_vec(caches[2].get_compress_score_state()),
-            (std::vector<int64_t>{kSwaCount, xllm::kDsv41CompressStateRows,
-                                  kHeadDim}));
+            (std::vector<int64_t>{
+                kSwaCount, xllm::kDsv41CompressStateRows, kHeadDim}));
   EXPECT_EQ(caches[2].get_compress_kv_state().dtype(), torch::kFloat32);
   EXPECT_EQ(caches[2].get_compress_score_state().dtype(), torch::kFloat32);
   // The V4.1 index plane follows the platform policy: int8 + fp16 per-token
@@ -1352,7 +1352,8 @@ TEST_F(HostKVCacheConfigTest, AcceptsFractalNzPoolWithoutTransferFolding) {
 }
 
 #if !defined(USE_NPU)
-TEST(KVCacheTest, HostLinearCacheUsesKvCountOnPrefillAndTwiceHbmOnDecode) {
+TEST(KVCacheTest,
+     HostLinearCacheUsesChunkCapacityOnPrefillAndTwiceHbmOnDecode) {
   KVCacheCapacity capacity;
   capacity.n_blocks(8).block_size(16).num_linear_state_blocks(4);
   ModelArgs model_args;
@@ -1377,10 +1378,16 @@ TEST(KVCacheTest, HostLinearCacheUsesKvCountOnPrefillAndTwiceHbmOnDecode) {
       .host_blocks_factor(2.0)
       .is_decode(false)
       .model_type("qwen3_5_text");
+  // Host KV holds 16 blocks * 16 tokens. One linear slot per 32-token chunk.
+  const int32_t old_chunk_size =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(32);
   KVCache prefill_cache(
       shape, prefill_options, BlockType::LINEAR, /*layer_count=*/2);
-  EXPECT_EQ(prefill_cache.get_conv_cache().size(0), 16);
-  EXPECT_EQ(prefill_cache.get_ssm_cache().size(0), 16);
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(
+      old_chunk_size);
+  EXPECT_EQ(prefill_cache.get_conv_cache().size(0), 8);
+  EXPECT_EQ(prefill_cache.get_ssm_cache().size(0), 8);
 
   KVCacheCreateOptions decode_options = prefill_options;
   decode_options.is_decode(true);
@@ -1440,14 +1447,14 @@ TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
 
   ASSERT_TRUE(conv.is_contiguous());
   ASSERT_TRUE(ssm.is_contiguous());
-  EXPECT_EQ(conv.size(0), 16);
+  EXPECT_EQ(conv.size(0), 8);
   EXPECT_EQ(conv.size(1), 2);
 #if defined(USE_MUSA)
   EXPECT_EQ(conv.size(3), 3);
 #else
   EXPECT_EQ(conv.size(2), 3);
 #endif
-  EXPECT_EQ(ssm.size(0), 16);
+  EXPECT_EQ(ssm.size(0), 8);
   EXPECT_EQ(ssm.size(1), 2);
   EXPECT_EQ(ssm.size(2), 1);
 }
