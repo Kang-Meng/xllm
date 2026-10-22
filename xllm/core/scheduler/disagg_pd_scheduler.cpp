@@ -595,6 +595,14 @@ void DisaggPDScheduler::dispatch_requests() {
       continue;
     }
 
+    // Stamp the reservation attempt before the RPC: unlink may arrive while
+    // AddNewRequests is in flight, even if the name is later linked again.
+    {
+      std::lock_guard<std::mutex> lock(decode_availability_mutex_);
+      request->state().decode_link_epoch =
+          decode_link_epochs_[selected_instance];
+    }
+
     std::vector<std::shared_ptr<Request>> requests;
     requests.emplace_back(request);
 
@@ -918,7 +926,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
     // Check if the request is a recently completed prefill request
     if (request->sequences()[0]->num_generated_tokens() == 1) {
       if (!options_.disable_log_stats()) {
-        request->log_statistic(request->elapsed_seconds());
+        request->log_prefill_statistic(request->elapsed_seconds());
       }
       requests.emplace_back(request);
       if (!request->state().stream) {
@@ -929,7 +937,8 @@ void DisaggPDScheduler::prefill_send_first_generation() {
   }
   // call non_stream_request's callback in P instance when its prefill ends
   if (!non_stream_requests.empty()) {
-    response_processor_->process_completed_requests(non_stream_requests);
+    response_processor_->process_completed_requests(non_stream_requests,
+                                                    /*terminal=*/false);
   }
 
   // No prefill request needs to be transferred to decode.
@@ -962,6 +971,9 @@ void DisaggPDScheduler::prefill_send_first_generation() {
         fail_request(request, status);
         return;
       }
+      response_processor_->process_failed_request(request,
+                                                  status,
+                                                  /*send_response=*/false);
       response_processor_->wait_completion();
       kv_cache_manager_->deallocate(request.get());
     };
@@ -1155,6 +1167,40 @@ void DisaggPDScheduler::release_failed_request(
   reservation_release_threadpool_.schedule([req_id, reservation_id, address] {
     send_reservation_release(req_id, reservation_id, address);
   });
+}
+
+bool DisaggPDScheduler::reject_queued_request(
+    const std::shared_ptr<Request>& request) {
+  // Only the normal Prefill dispatch queue holds a Decode reservation but
+  // has not yet entered a forward. Do not release an OOC transfer or an
+  // already scheduled chunk whose source KV may still be in use.
+  if (options_.enable_pd_ooc() ||
+      options_.instance_role() == InstanceRole::DECODE ||
+      request->cancelled() || request->has_terminal_outcome() ||
+      request->state().decode_address.empty() ||
+      request->state().pd_reservation_id.empty()) {
+    return false;
+  }
+  const std::string& decode_name = request->state().decode_address;
+  {
+    std::lock_guard<std::mutex> lock(decode_availability_mutex_);
+    const auto it = decode_link_epochs_.find(decode_name);
+    if (!unlinked_instances_.contains(decode_name) &&
+        (it == decode_link_epochs_.end() ||
+         request->state().decode_link_epoch >= it->second)) {
+      return false;
+    }
+  }
+  LOG(WARNING) << "Decode instance unlinked before Prefill scheduling, "
+               << "request_id=" << request->request_id()
+               << ", decode_instance=" << decode_name;
+  release_failed_request(request);
+  kv_cache_manager_->deallocate(request.get());
+  response_processor_->process_failed_request(
+      request,
+      {StatusCode::UNAVAILABLE,
+       "Decode instance unlinked before Prefill KV transfer"});
+  return true;
 }
 
 std::shared_ptr<Request> DisaggPDScheduler::take_waiting_request(
@@ -1603,6 +1649,11 @@ bool DisaggPDScheduler::link_instance(const std::string& instance_name,
                                       const int32_t dp_size,
                                       const int32_t src_kv_split_size) {
   std::lock_guard<std::mutex> lock(linked_instances_mutex_);
+  uint64_t observed_epoch;
+  {
+    std::lock_guard<std::mutex> lock(decode_availability_mutex_);
+    observed_epoch = decode_link_epochs_[instance_name];
+  }
   // proto3's 0 means the peer's registration (or the service that served it)
   // predates the kv_split_size field entirely. Such a peer never splits KV,
   // so its effective TOPOLOGY width is 1 for the layout negotiation; the
@@ -1624,6 +1675,16 @@ bool DisaggPDScheduler::link_instance(const std::string& instance_name,
                     ? ""
                     : " (undeclared; negotiated as 1 for legacy topology)");
   linked_instance_.emplace(instance_name);
+  {
+    std::lock_guard<std::mutex> availability_lock(decode_availability_mutex_);
+    // A queued unlink may have published down but not yet acquired the link
+    // lock. Do not admit requests until that unlink finishes and a later link
+    // succeeds.
+    if (decode_link_epochs_[instance_name] == observed_epoch &&
+        !pending_unlinks_.contains(instance_name)) {
+      unlinked_instances_.erase(instance_name);
+    }
+  }
   return true;
 }
 
@@ -1634,6 +1695,14 @@ bool DisaggPDScheduler::unlink_instance(
     const std::vector<uint16_t>& ports,
     const int32_t dp_size,
     const int32_t src_kv_split_size) {
+  // Publish down before any cleanup or unlink_cluster waits for workers; a
+  // slow worker must not block rejection of unscheduled reservations.
+  {
+    std::lock_guard<std::mutex> availability_lock(decode_availability_mutex_);
+    ++decode_link_epochs_[instance_name];
+    unlinked_instances_.emplace(instance_name);
+    ++pending_unlinks_[instance_name];
+  }
   // Clear received requests from this instance
   {
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
@@ -1658,8 +1727,17 @@ bool DisaggPDScheduler::unlink_instance(
   // and linked_instance_ would never release the name.
   const int32_t topology_kv_split_size =
       src_kv_split_size > 0 ? src_kv_split_size : 1;
-  if (!engine_->unlink_cluster(
-          cluster_ids, addrs, ports, dp_size, topology_kv_split_size)) {
+  const bool unlinked = engine_->unlink_cluster(
+      cluster_ids, addrs, ports, dp_size, topology_kv_split_size);
+  {
+    std::lock_guard<std::mutex> availability_lock(decode_availability_mutex_);
+    auto it = pending_unlinks_.find(instance_name);
+    CHECK(it != pending_unlinks_.end());
+    if (--it->second == 0) {
+      pending_unlinks_.erase(it);
+    }
+  }
+  if (!unlinked) {
     LOG(ERROR) << "Unlink instance failed, instance_name: " << instance_name;
     return false;
   }

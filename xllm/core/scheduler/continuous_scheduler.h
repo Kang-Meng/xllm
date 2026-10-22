@@ -304,6 +304,9 @@ class ContinuousScheduler : public Scheduler {
   virtual void enqueue_ready_request(std::shared_ptr<Request> request);
   virtual void release_failed_request(const std::shared_ptr<Request>& request) {
   }
+  virtual bool reject_queued_request(const std::shared_ptr<Request>& request) {
+    return false;
+  }
 
   static int64_t microseconds_to_milliseconds(int64_t microseconds);
   // i.e. round(latency / num_tokens). num_tokens must be > 0.

@@ -25,6 +25,7 @@ namespace xllm {
 
 class BlockManager;
 class Request;
+struct RequestOutput;
 class Sequence;
 class Tokenizer;
 class AsyncResponseProcessor final {
@@ -37,13 +38,17 @@ class AsyncResponseProcessor final {
       std::function<void(std::shared_ptr<Request>)> cancel_request);
   ~AsyncResponseProcessor();
 
-  void process_completed_request(std::shared_ptr<Request> request);
+  void process_completed_request(std::shared_ptr<Request> request,
+                                 bool terminal = true);
 
-  void process_failed_request(std::shared_ptr<Request> request, Status status);
+  void process_failed_request(std::shared_ptr<Request> request,
+                              Status status,
+                              bool send_response = true);
 
   // in disagg pd mode, decode send requests' responses to prefill
   void process_completed_requests(
-      std::vector<std::shared_ptr<Request>>& requests);
+      std::vector<std::shared_ptr<Request>>& requests,
+      bool terminal = true);
 
   void process_stream_request(std::shared_ptr<Request> request);
 
@@ -54,12 +59,27 @@ class AsyncResponseProcessor final {
       std::vector<std::shared_ptr<Request>>& requests);
 
   void batch_process_completed_requests(
-      std::vector<std::shared_ptr<Request>>& requests);
+      std::vector<std::shared_ptr<Request>>& requests,
+      bool terminal = true);
   // wait for all responses in queue to be handled
   void wait_completion();
 
  private:
   DISALLOW_COPY_AND_ASSIGN(AsyncResponseProcessor);
+
+  // Claim the request's single terminal outcome and, unless logging is
+  // disabled, emit its terminal statistic. Returns false when another callback
+  // already claimed the outcome, so the caller skips the rest of its response.
+  bool claim_and_log_terminal(Request& request,
+                              const std::optional<Status>& status,
+                              double total_latency);
+
+  // Returns false when a terminal response cannot be emitted.
+  bool prepare_completed_output(Request& request,
+                                bool terminal,
+                                ThreadPool* generation_threadpool,
+                                RequestOutput* output);
+
   // the threadpool to handle responses
   ThreadPool response_threadpool_;
 

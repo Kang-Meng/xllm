@@ -173,6 +173,8 @@ class RequestState final {
   // populated only after Decode explicitly accepts the reservation.
   std::string pd_reservation_id;
   std::string decode_rpc_address;
+  // P-side link generation observed before requesting a Decode reservation.
+  uint64_t decode_link_epoch = 0;
 
   torch::Tensor input_embedding;
 

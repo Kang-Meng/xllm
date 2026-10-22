@@ -25,6 +25,15 @@ void RequestOutput::log_request_status() const {
     return;
   }
 
+  // The PD Prefill first-token response is not the request's final result.
+  if (finished_on_prefill_instance && status->ok() && !cancelled) {
+    return;
+  }
+  if (cancelled && status->ok()) {
+    COUNTER_INC(request_status_total_cancelled);
+    return;
+  }
+
   auto code = status.value().code();
   switch (code) {
     case StatusCode::OK:

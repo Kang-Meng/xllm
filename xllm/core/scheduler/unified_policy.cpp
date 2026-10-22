@@ -38,6 +38,9 @@ void UnifiedPolicy::drain_request_queue(
   std::shared_ptr<Request> request;
   while (request_queue.read(request)) {
     CHECK(request);
+    if (state.reject_queued_request && state.reject_queued_request(request)) {
+      continue;
+    }
     if (!state.enable_prefix_cache) {
       request->expand_sequences(/*force=*/false);
     }

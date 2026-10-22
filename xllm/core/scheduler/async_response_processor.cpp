@@ -19,6 +19,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <memory>
 
 #include "common/global_flags.h"
@@ -58,14 +59,54 @@ AsyncResponseProcessor::AsyncResponseProcessor(
 
 AsyncResponseProcessor::~AsyncResponseProcessor() { wait_completion(); }
 
+bool AsyncResponseProcessor::claim_and_log_terminal(
+    Request& request,
+    const std::optional<Status>& status,
+    double total_latency) {
+  const RequestTerminalOutcome outcome = request.claim_terminal_outcome(status);
+  if (outcome == RequestTerminalOutcome::NONE) {
+    return false;
+  }
+  if (!disable_log_stats_) {
+    request.log_terminal_statistic(outcome, status.value(), total_latency);
+  }
+  return true;
+}
+
+bool AsyncResponseProcessor::prepare_completed_output(
+    Request& request,
+    bool terminal,
+    ThreadPool* generation_threadpool,
+    RequestOutput* output) {
+  if (terminal && request.has_terminal_outcome()) {
+    return false;
+  }
+  const double end_2_end_latency_seconds = request.end_to_end_latency_seconds();
+  *output = request.generate_output(*tokenizer_, generation_threadpool);
+  if (terminal && !claim_and_log_terminal(
+                      request, output->status, end_2_end_latency_seconds)) {
+    return false;
+  }
+  if (!terminal && output->status.has_value() && output->status->ok()) {
+    output->finished_on_prefill_instance = true;
+  }
+  HISTOGRAM_OBSERVE(end_2_end_latency_milliseconds,
+                    static_cast<int64_t>(end_2_end_latency_seconds * 1000.0));
+  return true;
+}
+
 void AsyncResponseProcessor::process_failed_request(
     std::shared_ptr<Request> request,
-    Status status) {
+    Status status,
+    bool send_response) {
   // schedule the response handling
-  const bool disable_log_stats = disable_log_stats_;
-  auto runnable = [disable_log_stats, request = request, status = status]() {
-    if (!disable_log_stats) {
-      request->log_error_statistic(status);
+  auto runnable = [this, request, status = std::move(status), send_response]() {
+    if (!claim_and_log_terminal(
+            *request, status, request->end_to_end_latency_seconds())) {
+      return;
+    }
+    if (!send_response) {
+      return;
     }
     RequestOutput output;
     output.request_id = request->request_id();
@@ -84,7 +125,8 @@ void AsyncResponseProcessor::process_failed_request(
 }
 
 void AsyncResponseProcessor::process_completed_request(
-    std::shared_ptr<Request> request) {
+    std::shared_ptr<Request> request,
+    bool terminal) {
   // schedule the response handling
 
   // NOTE: Maybe refactor later.
@@ -102,21 +144,13 @@ void AsyncResponseProcessor::process_completed_request(
   // to be destructed. To prevent the scenario where the request is recycled
   // before the response is fully returned to the xLLM service, the Output
   // object must be detached to avoid premature destruction.
-  auto runnable = [this, request = request]() mutable {
+  auto runnable = [this, request, terminal]() mutable {
     AUTO_COUNTER(responsing_latency_seconds_non_stream);
 
-    double end_2_end_latency_seconds = request->end_to_end_latency_seconds();
-    // update the metrics for the request
-    HISTOGRAM_OBSERVE(end_2_end_latency_milliseconds,
-                      static_cast<int64_t>(end_2_end_latency_seconds * 1000.0));
-    RequestOutput req_output =
-        request->generate_output(*tokenizer_, &generate_output_threadpool_);
-    if (!disable_log_stats_) {
-      if (req_output.status.has_value() && !req_output.status->ok()) {
-        request->log_error_statistic(req_output.status.value());
-      } else {
-        request->log_statistic(end_2_end_latency_seconds);
-      }
+    RequestOutput req_output;
+    if (!prepare_completed_output(
+            *request, terminal, &generate_output_threadpool_, &req_output)) {
+      return;
     }
     request->state().output_func(req_output);
   };
@@ -130,35 +164,27 @@ void AsyncResponseProcessor::process_completed_request(
 }
 
 void AsyncResponseProcessor::batch_process_completed_requests(
-    std::vector<std::shared_ptr<Request>>& requests) {
+    std::vector<std::shared_ptr<Request>>& requests,
+    bool terminal) {
   size_t requests_size = requests.size();
   auto counter = new BlockingCounter(requests_size);
   std::vector<RequestOutput> request_outputs;
   request_outputs.resize(requests_size);
-  for (int i = 0; i < requests_size; ++i) {
+  std::vector<uint8_t> valid_outputs(requests_size, 0);
+  for (size_t i = 0; i < requests_size; ++i) {
     auto& request = requests[i];
     auto runnable = [counter,
                      this,
                      request = request,
+                     terminal,
+                     valid_output = &valid_outputs[i],
                      request_output = &request_outputs[i]]() mutable {
       AUTO_COUNTER(responsing_latency_seconds_non_stream);
-      double end_2_end_latency_seconds = request->end_to_end_latency_seconds();
-      // update the metrics for the request
-      HISTOGRAM_OBSERVE(
-          end_2_end_latency_milliseconds,
-          static_cast<int64_t>(end_2_end_latency_seconds * 1000.0));
-      *request_output = std::move(request->generate_output(*tokenizer_));
-      if (!disable_log_stats_) {
-        if (request_output->status.has_value() &&
-            !request_output->status->ok()) {
-          request->log_error_statistic(request_output->status.value());
-        } else if (request->finished() || request->cancelled()) {
-          request->log_statistic(end_2_end_latency_seconds);
-        }
-      }
-      if (request->sequences()[0]->num_generated_tokens() == 1) {
-        // currently only support one sequence when enable_service_routing
-        request_output->finished_on_prefill_instance = true;
+      if (prepare_completed_output(*request,
+                                   terminal,
+                                   /*generation_threadpool=*/nullptr,
+                                   request_output)) {
+        *valid_output = 1;
       }
       counter->decrement_count();
     };
@@ -174,27 +200,47 @@ void AsyncResponseProcessor::batch_process_completed_requests(
   rpc_threadpool_.schedule(
       [counter = std::unique_ptr<BlockingCounter>(counter),
        requests = std::move(requests),
-       request_outputs = std::move(request_outputs)]() mutable {
+       request_outputs = std::move(request_outputs),
+       valid_outputs = std::move(valid_outputs)]() mutable {
         counter->wait();
         auto& resp_callback = requests[0]->state().outputs_func;
-        resp_callback(request_outputs);
+        // Common case: no request was skipped, so forward in place and avoid
+        // re-moving every RequestOutput into a filtered vector.
+        if (std::all_of(valid_outputs.begin(),
+                        valid_outputs.end(),
+                        [](uint8_t valid) { return valid != 0; })) {
+          resp_callback(request_outputs);
+          return;
+        }
+        std::vector<RequestOutput> outputs;
+        outputs.reserve(request_outputs.size());
+        for (size_t i = 0; i < request_outputs.size(); ++i) {
+          if (valid_outputs[i] != 0) {
+            outputs.emplace_back(std::move(request_outputs[i]));
+          }
+        }
+        if (outputs.empty()) {
+          return;
+        }
+        resp_callback(outputs);
       });
 }
 
 // process non-stream requests
 void AsyncResponseProcessor::process_completed_requests(
-    std::vector<std::shared_ptr<Request>>& requests) {
+    std::vector<std::shared_ptr<Request>>& requests,
+    bool terminal) {
   std::vector<std::shared_ptr<Request>> service_requests;
   service_requests.reserve(enable_batch_response_ ? requests.size() : 0);
   for (std::shared_ptr<Request>& request : requests) {
     if (!enable_batch_response_ || request->service_request_id().empty()) {
-      process_completed_request(std::move(request));
+      process_completed_request(std::move(request), terminal);
     } else {
       service_requests.emplace_back(std::move(request));
     }
   }
   if (!service_requests.empty()) {
-    batch_process_completed_requests(service_requests);
+    batch_process_completed_requests(service_requests, terminal);
   }
 }
 

@@ -522,6 +522,64 @@ TEST(SchedulerPolicyTest, AddNewRequestBase) {
   }
 }
 
+TEST(SchedulerPolicyTest, UnifiedDrainRejectsBeforeQueueingRequest) {
+  ContinuousScheduler::Options options =
+      create_scheduler_options(1024, 16, 0, 256, 1, "multi_slo_and_prio");
+  BatchMode mode{
+      .enable_mix_batch = true,
+      .enable_chunked_prefill = true,
+      .priority_strategy = "multi_slo_and_prio",
+  };
+  std::unique_ptr<SchedulerPolicy> policy =
+      create_scheduler_policy(mode, options);
+  FakeEngine engine(16, 128);
+  auto requests =
+      generate_request({16, 16}, {1, 1}, std::nullopt, std::nullopt, 10000);
+  DequeQueue prefill_queue;
+  DequeQueue chunk_queue;
+  DequeQueue decode_queue;
+  std::list<std::shared_ptr<Request>> unified_queue;
+  std::deque<DecodeRestoreEntry> decode_restore_waiting;
+  std::vector<std::shared_ptr<Request>> running_requests;
+  std::vector<Sequence*> running_sequences;
+  std::vector<size_t> running_sequence_budgets;
+  bool last_step_prefill = false;
+  ModelArgs model_args;
+  int32_t reject_calls = 0;
+  SchedulerState state{
+      .prefill_queue = prefill_queue,
+      .chunk_queue = chunk_queue,
+      .decode_queue = decode_queue,
+      .unified_queue = unified_queue,
+      .decode_restore_waiting = decode_restore_waiting,
+      .running_requests = running_requests,
+      .running_sequences = running_sequences,
+      .running_sequences_budgets = running_sequence_budgets,
+      .kv_cache_manager = engine.block_manager_pool(),
+      .profile_manager = nullptr,
+      .response_processor = nullptr,
+      .model_args = model_args,
+      .last_step_prefill = last_step_prefill,
+      .options = options,
+      .min_speculative_tokens_required = 0,
+      .enable_prefix_cache = false,
+      .reject_queued_request =
+          [&](const std::shared_ptr<Request>& request) {
+            ++reject_calls;
+            return request == requests[0];
+          },
+  };
+  folly::MPMCQueue<std::shared_ptr<Request>> request_queue(2);
+  ASSERT_TRUE(request_queue.write(requests[0]));
+  ASSERT_TRUE(request_queue.write(requests[1]));
+
+  policy->drain_request_queue(state, request_queue);
+
+  EXPECT_EQ(reject_calls, 2);
+  ASSERT_EQ(unified_queue.size(), 1u);
+  EXPECT_EQ(unified_queue.front(), requests[1]);
+}
+
 TEST(SchedulerPolicyTest, UnifiedPrefixHitIncludesScheduledSuffixCapacity) {
   ScopedConfigValue<bool> mix_batch_guard(
       SchedulerConfig::get_instance().enable_mix_batch(), true);

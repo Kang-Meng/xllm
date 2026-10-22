@@ -253,6 +253,9 @@ void SchedulerPolicy::drain_request_queue(
   }
 
   for (std::shared_ptr<Request>& queued : incoming) {
+    if (state.reject_queued_request && state.reject_queued_request(queued)) {
+      continue;
+    }
     if (!state.enable_prefix_cache &&
         !(state.options.enable_disagg_pd() &&
           state.options.instance_role().has_value() &&

@@ -73,6 +73,9 @@ struct SchedulerState {
   bool enable_prefix_cache;
   std::function<void(const std::shared_ptr<Request>&)> release_failed_request =
       {};
+  // Reject a newly drained request before it enters a scheduling queue.
+  std::function<bool(const std::shared_ptr<Request>&)> reject_queued_request =
+      {};
   // PD decode admission gate; nullptr when host restore is not available.
   DecodeAdmission* decode_admission = nullptr;
 };

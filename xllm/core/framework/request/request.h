@@ -35,6 +35,8 @@ namespace xllm {
 
 enum class Urgency { STARVED = 2, URGENT = 1, NORMAL = 0 };
 
+enum class RequestTerminalOutcome { NONE, SUCCESS, FAILURE, CANCELLED };
+
 class Request : public RequestBase {
  public:
   Request(const std::string& request_id,
@@ -73,14 +75,26 @@ class Request : public RequestBase {
 
   bool preempted() const { return state_.preempted; }
 
-  void log_statistic(double total_latency);
+  // The first terminal callback owns the request-level summary and response.
+  RequestTerminalOutcome claim_terminal_outcome(
+      const std::optional<Status>& status);
+
+  bool has_terminal_outcome() const {
+    return terminal_outcome_.load(std::memory_order_relaxed) !=
+           RequestTerminalOutcome::NONE;
+  }
+
+  void log_terminal_statistic(RequestTerminalOutcome outcome,
+                              const Status& status,
+                              double total_latency);
+
+  // PD Prefill's first token is a stage event, not a terminal success.
+  void log_prefill_statistic(double total_latency);
 
   // Rebase local elapsed time with cumulative upstream latency at handoff.
   void set_upstream_latency_seconds(double upstream_latency_seconds);
 
   double end_to_end_latency_seconds() const;
-
-  void log_error_statistic(Status status);
 
   absl::Time created_time() const { return created_time_; }
 
@@ -191,6 +205,10 @@ class Request : public RequestBase {
 
   std::atomic<bool> cancelled_{false};
 
+  std::atomic<RequestTerminalOutcome> terminal_outcome_{
+      RequestTerminalOutcome::NONE};
+  std::atomic<bool> prefill_statistic_logged_{false};
+
   int32_t elapsed_time_ms_ = 0;
 
   int32_t deadline_ms_ = 0;
@@ -210,6 +228,9 @@ class Request : public RequestBase {
   double end_to_end_latency_offset_seconds_ = 0.0;
 
   void create_sequences_group();
+
+  void log_statistic(double total_latency, bool prefill_stage);
+  void log_error_statistic(const Status& status, const char* outcome_name);
 };
 
 }  // namespace xllm

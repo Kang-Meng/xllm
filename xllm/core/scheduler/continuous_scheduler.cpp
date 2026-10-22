@@ -537,6 +537,10 @@ SchedulerState ContinuousScheduler::make_state() {
           [this](const std::shared_ptr<Request>& request) {
             release_failed_request(request);
           },
+      .reject_queued_request =
+          [this](const std::shared_ptr<Request>& request) {
+            return reject_queued_request(request);
+          },
       .decode_admission = decode_admission_.get(),
   };
 }

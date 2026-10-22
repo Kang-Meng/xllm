@@ -24,6 +24,7 @@ limitations under the License.
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "disagg_pd.pb.h"
@@ -168,6 +169,7 @@ class DisaggPDScheduler : public ContinuousScheduler {
                     bool start_services);
 
   void release_failed_request(const std::shared_ptr<Request>& request) override;
+  bool reject_queued_request(const std::shared_ptr<Request>& request) override;
 
   // Fail a request whose kv_split pair resolve_kv_split_plan marked
   // UNRECONCILABLE. Shared by every dispatch path (the online dispatch
@@ -323,6 +325,12 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // Lock for multi-threaded read-write linked instances
   std::mutex linked_instances_mutex_;
   std::unordered_set<std::string> linked_instance_;
+  // Kept separate from linked_instances_mutex_: unlink_cluster waits for
+  // workers, but queue admission must observe the down event immediately.
+  std::mutex decode_availability_mutex_;
+  std::unordered_map<std::string, uint64_t> decode_link_epochs_;
+  std::unordered_set<std::string> unlinked_instances_;
+  std::unordered_map<std::string, size_t> pending_unlinks_;
 
   std::string server_name_;
 };

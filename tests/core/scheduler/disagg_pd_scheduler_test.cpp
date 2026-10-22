@@ -17,9 +17,11 @@ limitations under the License.
 
 #include <brpc/closure_guard.h>
 #include <brpc/server.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -32,10 +34,10 @@ limitations under the License.
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
-#include "common/metrics.h"
 #include "core/common/public_error.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch.h"
@@ -48,6 +50,7 @@ limitations under the License.
 #include "framework/request/request_state.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "runtime/xservice_client.h"
+#include "scheduler/async_response_processor.h"
 #include "scheduler/pd_ooc_scheduler.h"
 #include "util/scope_guard.h"
 
@@ -139,6 +142,7 @@ class FakeEngine final : public Engine {
 
   std::function<ForwardOutput(std::vector<Batch>&)> forward;
   std::function<void(std::vector<Batch>&)> complete_forward;
+  std::function<void()> on_link_cluster;
 
   ForwardOutput step(std::vector<Batch>& batch) override {
     if (forward) {
@@ -175,11 +179,22 @@ class FakeEngine final : public Engine {
 
   bool init() override { return true; }
 
-  bool unlink_cluster(const std::vector<uint64_t>&,
-                      const std::vector<std::string>&,
-                      const std::vector<uint16_t>&,
-                      int32_t,
-                      int32_t) override {
+  bool link_cluster(const std::vector<uint64_t>& /*cluster_ids*/,
+                    const std::vector<std::string>& /*addrs*/,
+                    const std::vector<uint16_t>& /*ports*/,
+                    int32_t /*src_dp_size*/,
+                    int32_t /*src_kv_split_size*/) override {
+    if (on_link_cluster) {
+      on_link_cluster();
+    }
+    return true;
+  }
+
+  bool unlink_cluster(const std::vector<uint64_t>& /*cluster_ids*/,
+                      const std::vector<std::string>& /*addrs*/,
+                      const std::vector<uint16_t>& /*ports*/,
+                      int32_t /*src_dp_size*/,
+                      int32_t /*src_kv_split_size*/) override {
     return true;
   }
 
@@ -221,6 +236,10 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
     request_queue_.write(std::move(request));
   }
 
+  bool reject_queued_for_test(const std::shared_ptr<Request>& request) {
+    return reject_queued_request(request);
+  }
+
   bool has_channel(const std::string& req_id) {
     std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
     return req_to_channel_map_.contains(req_id);
@@ -251,6 +270,8 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
     reservation_release_threadpool_.schedule([&done] { done.set_value(); });
     future.get();
   }
+
+  void wait_responses() { response_processor_->wait_completion(); }
 
   std::future<void> prefill_completion() {
     std::promise<void> done;
@@ -526,7 +547,8 @@ DisaggPDScheduler::Options make_decode_options() {
 
 std::shared_ptr<Request> make_request(
     const std::vector<int32_t>& prompt_token_ids,
-    const std::string& req_id = "req") {
+    const std::string& req_id = "req",
+    size_t num_sequences = 1) {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
 
@@ -541,8 +563,8 @@ std::shared_ptr<Request> make_request(
                      scheduler_param,
                      stopping_checker,
                      prompt_token_ids.size() + 8,
-                     /*n=*/1,
-                     /*best_of=*/1,
+                     /*n=*/num_sequences,
+                     /*best_of=*/num_sequences,
                      /*stream=*/false,
                      /*echo=*/false,
                      /*logprobs=*/false,
@@ -563,6 +585,36 @@ void finish_prefill(Sequence* sequence) {
   sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
   sequence->append_token(Token(999));
 }
+
+class TerminalLogSink final : public google::LogSink {
+ public:
+  TerminalLogSink() { google::AddLogSink(this); }
+  ~TerminalLogSink() override { google::RemoveLogSink(this); }
+
+  void send(google::LogSeverity severity,
+            const char* /*full_filename*/,
+            const char* /*base_filename*/,
+            int /*line*/,
+            const google::LogMessageTime& /*logmsgtime*/,
+            const char* message,
+            size_t message_len) override {
+    if (severity != google::GLOG_INFO) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    messages_.append(message, message_len);
+    messages_.push_back('\n');
+  }
+
+  std::string messages() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return messages_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::string messages_;
+};
 
 size_t first_cache_size(const BlockManagerPool& block_manager) {
   const std::vector<size_t> cache_sizes =
@@ -875,6 +927,211 @@ TEST(PDOOCSchedulerTest, OfflineRequestMovesBetweenDistinctWaitingQueues) {
   offline->set_cancel();
   scheduler.prepare_batch_test();
   expect_queue_sample("419", {{"offline_prefill", 0}}, 0);
+}
+
+TEST(DisaggPDSchedulerTest, RelinkedDecodeRetainsOldEpochRejection) {
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  auto options = make_options();
+  options.enable_pd_ooc(false).disable_log_stats(true);
+  TestDisaggPDScheduler scheduler(&engine, options, /*start_services=*/false);
+  auto old_request = make_request({11, 12}, "old-reservation");
+  old_request->state().decode_address = "decode-1";
+  old_request->state().pd_reservation_id = "old-reservation";
+  old_request->state().output_func = [](const RequestOutput&) { return true; };
+  scheduler.admit_prefill(old_request);
+
+  ASSERT_TRUE(scheduler.unlink_instance("decode-1",
+                                        /*cluster_ids=*/{},
+                                        /*addrs=*/{},
+                                        /*ports=*/{},
+                                        /*dp_size=*/1,
+                                        /*src_kv_split_size=*/1));
+  ASSERT_TRUE(scheduler.link_instance("decode-1",
+                                      /*cluster_ids=*/{},
+                                      /*addrs=*/{},
+                                      /*ports=*/{},
+                                      /*dp_size=*/1,
+                                      /*src_kv_split_size=*/1));
+
+  auto new_request = make_request({21, 22}, "new-reservation");
+  new_request->state().decode_address = "decode-1";
+  new_request->state().pd_reservation_id = "new-reservation";
+  new_request->state().decode_link_epoch = 1;
+  scheduler.admit_prefill(new_request);
+  const auto batches = scheduler.prepare_batch_test();
+  scheduler.wait_responses();
+
+  EXPECT_TRUE(old_request->has_terminal_outcome());
+  EXPECT_FALSE(new_request->has_terminal_outcome());
+  EXPECT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_TRUE(std::any_of(batches.begin(),
+                          batches.end(),
+                          [](const Batch& batch) { return !batch.empty(); }));
+}
+
+TEST(DisaggPDSchedulerTest, LinkBeforePendingUnlinkKeepsDecodeDown) {
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  auto options = make_options();
+  options.enable_pd_ooc(false).disable_log_stats(true);
+  TestDisaggPDScheduler scheduler(&engine, options, /*start_services=*/false);
+
+  std::promise<void> link_entered;
+  std::promise<void> release_link;
+  engine.on_link_cluster = [&] {
+    link_entered.set_value();
+    release_link.get_future().wait();
+  };
+  auto link = std::async(std::launch::async, [&] {
+    return scheduler.link_instance("decode-1", {}, {}, {}, 1, 1);
+  });
+  link_entered.get_future().wait();
+  auto unlink = std::async(std::launch::async, [&] {
+    return scheduler.unlink_instance("decode-1", {}, {}, {}, 1, 1);
+  });
+
+  auto reserved = [](const std::string& id) {
+    auto request = make_request({1, 2}, id);
+    request->state().decode_address = "decode-1";
+    request->state().pd_reservation_id = id;
+    request->state().decode_link_epoch = 1;
+    request->state().output_func = [](const RequestOutput&) { return true; };
+    return request;
+  };
+  auto probe = reserved("probe");
+  bool saw_down = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!saw_down && std::chrono::steady_clock::now() < deadline) {
+    saw_down = scheduler.reject_queued_for_test(probe);
+    std::this_thread::yield();
+  }
+  release_link.set_value();
+  EXPECT_TRUE(link.get());
+  EXPECT_TRUE(unlink.get());
+  EXPECT_TRUE(saw_down);
+  EXPECT_TRUE(scheduler.reject_queued_for_test(reserved("after-link")));
+  scheduler.wait_responses();
+}
+
+TEST(RequestTerminalOutcomeTest, FirstTerminalEventWins) {
+  auto failed = make_request({1, 2}, "failed");
+  failed->log_prefill_statistic(/*total_latency=*/0.01);
+  EXPECT_EQ(failed->claim_terminal_outcome(std::nullopt),
+            RequestTerminalOutcome::NONE);
+  EXPECT_EQ(failed->claim_terminal_outcome(
+                Status(StatusCode::UNAVAILABLE, "handoff failed")),
+            RequestTerminalOutcome::FAILURE);
+  EXPECT_EQ(failed->claim_terminal_outcome(Status(StatusCode::OK)),
+            RequestTerminalOutcome::NONE);
+
+  auto cancelled = make_request({1, 2}, "cancelled");
+  cancelled->set_cancel();
+  EXPECT_EQ(cancelled->claim_terminal_outcome(Status(StatusCode::OK)),
+            RequestTerminalOutcome::CANCELLED);
+  EXPECT_EQ(cancelled->claim_terminal_outcome(
+                Status(StatusCode::UNAVAILABLE, "late error")),
+            RequestTerminalOutcome::NONE);
+
+  auto status_cancelled = make_request({1, 2}, "status-cancelled");
+  EXPECT_EQ(
+      status_cancelled->claim_terminal_outcome(Status(StatusCode::CANCELLED)),
+      RequestTerminalOutcome::CANCELLED);
+
+  auto multi = make_request({1, 2}, "multi", /*num_sequences=*/2);
+  ASSERT_TRUE(multi->expand_sequences(/*share_prefix=*/false));
+  ASSERT_EQ(multi->sequences().size(), 2u);
+  finish_prefill(multi->sequences()[0].get());
+  for (int32_t i = 1; i < 4; ++i) {
+    multi->sequences()[0]->append_token(Token(100 + i));
+  }
+  EXPECT_EQ(multi->claim_terminal_outcome(Status(StatusCode::OK)),
+            RequestTerminalOutcome::NONE);
+  finish_prefill(multi->sequences()[1].get());
+  for (int32_t i = 1; i < 4; ++i) {
+    multi->sequences()[1]->append_token(Token(100 + i));
+  }
+  EXPECT_EQ(multi->claim_terminal_outcome(Status(StatusCode::OK)),
+            RequestTerminalOutcome::SUCCESS);
+  EXPECT_EQ(multi->claim_terminal_outcome(Status(StatusCode::CANCELLED)),
+            RequestTerminalOutcome::NONE);
+}
+
+TEST(AsyncResponseProcessorTest,
+     BatchedDuplicatePreservesValidRequestIdentity) {
+  FakeTokenizer tokenizer;
+  AsyncResponseProcessor processor(&tokenizer,
+                                   std::nullopt,
+                                   /*enable_service_routing=*/true,
+                                   /*disable_log_stats=*/true,
+                                   [](std::shared_ptr<Request>) {});
+  auto duplicate = make_request({1, 2}, "already-claimed");
+  auto valid = make_request({1, 2}, "still-valid");
+  duplicate->set_cancel();
+  valid->set_cancel();
+  ASSERT_EQ(duplicate->claim_terminal_outcome(Status(StatusCode::OK)),
+            RequestTerminalOutcome::CANCELLED);
+
+  std::atomic<int32_t> callbacks{0};
+  duplicate->state().outputs_func =
+      [&callbacks](const std::vector<RequestOutput>& outputs) {
+        EXPECT_EQ(outputs.size(), 1u);
+        if (!outputs.empty()) {
+          EXPECT_EQ(outputs[0].request_id, "still-valid");
+        }
+        ++callbacks;
+        return std::vector<bool>{true};
+      };
+  std::vector<std::shared_ptr<Request>> requests{duplicate, valid};
+  processor.process_completed_requests(requests);
+  processor.wait_completion();
+  std::vector<std::shared_ptr<Request>> invalid_only{duplicate};
+  processor.process_completed_requests(invalid_only);
+  processor.wait_completion();
+  EXPECT_EQ(callbacks.load(), 1);
+}
+
+TEST(DisaggPDSchedulerTest, NonStreamHandoffFailureHasOneTerminalOutcome) {
+  TerminalLogSink sink;
+  FakeEngine engine(
+      /*num_blocks=*/16, /*block_size=*/2, /*num_speculative_tokens=*/1);
+  auto options = make_options();
+  options.enable_chunked_prefill(false)
+      .kv_cache_transfer_mode("PUSH")
+      .num_speculative_tokens(1);
+  TestDisaggPDScheduler prefill(&engine, options, /*start_services=*/false);
+  auto request = make_request({11, 12}, "failed-nonstream-handoff");
+  std::atomic<int32_t> callbacks{0};
+  request->state().output_func = [&callbacks](const RequestOutput& output) {
+    EXPECT_TRUE(output.status.has_value());
+    EXPECT_TRUE(output.status->ok());
+    EXPECT_TRUE(output.finished_on_prefill_instance);
+    ++callbacks;
+    return true;
+  };
+  prefill.admit_prefill(request);
+  auto batches = prefill.prepare_batch_test();
+  ASSERT_FALSE(batches[0].empty());
+  finish_prefill(request->sequences()[0].get());
+  prefill.prefill_send_first_generation();
+  prefill.prefill_completion().get();
+
+  EXPECT_EQ(callbacks.load(), 1);
+  EXPECT_TRUE(request->has_terminal_outcome());
+  EXPECT_FALSE(prefill.has_channel(request->request_id()));
+  const std::string logged = sink.messages();
+  const std::string terminal_record =
+      "request_id: failed-nonstream-handoff, record_type: request_terminal";
+  const size_t first = logged.find(terminal_record);
+  ASSERT_NE(first, std::string::npos) << logged;
+  EXPECT_EQ(logged.find(terminal_record, first + 1), std::string::npos)
+      << logged;
+  EXPECT_NE(logged.find(terminal_record + ", outcome: failure"),
+            std::string::npos)
+      << logged;
+  EXPECT_NE(logged.find("request_id: failed-nonstream-handoff, sequence 0, "
+                        "record_type: pd_prefill_stage"),
+            std::string::npos)
+      << logged;
 }
 
 TEST(DisaggPDSchedulerTest, CachesPrefillBlocksBeforeRelease) {
@@ -1780,6 +2037,49 @@ class ReservationTest : public ::testing::Test {
   }
 };
 }  // namespace
+
+TEST_F(ReservationTest, UnlinkedDecodeReleasesAcceptedQueuedReservation) {
+  auto remote = reserve();
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  auto options = make_options();
+  options.enable_pd_ooc(false).disable_log_stats(true);
+  TestDisaggPDScheduler prefill(&engine, options, /*start_services=*/false);
+  auto local = accepted();
+  local->state().decode_address = "decode-1";
+  auto* pool = engine.block_manager_pool();
+  ASSERT_TRUE(pool->allocate(local->sequences()[0].get(), /*num_tokens=*/4));
+  ASSERT_GT(pool->num_used_blocks()[0], 0u);
+  std::atomic<int32_t> failures{0};
+  local->state().output_func = [&failures](const RequestOutput& output) {
+    EXPECT_TRUE(output.status.has_value());
+    if (output.status.has_value()) {
+      EXPECT_EQ(output.status->code(), StatusCode::UNAVAILABLE);
+    }
+    ++failures;
+    return true;
+  };
+  prefill.admit_prefill(local);
+  ASSERT_TRUE(prefill.unlink_instance("decode-1",
+                                      /*cluster_ids=*/{},
+                                      /*addrs=*/{},
+                                      /*ports=*/{},
+                                      /*dp_size=*/1,
+                                      /*src_kv_split_size=*/1));
+  const auto batches = prefill.prepare_batch_test();
+  EXPECT_TRUE(std::all_of(batches.begin(),
+                          batches.end(),
+                          [](const Batch& batch) { return batch.empty(); }));
+  prefill.wait_notifications();
+  prefill.wait_responses();
+  EXPECT_EQ(failures.load(), 1);
+  EXPECT_TRUE(local->has_terminal_outcome());
+  EXPECT_EQ(service_.released, 1);
+  EXPECT_TRUE(decode_.reservations_empty());
+  EXPECT_FALSE(prefill.has_channel(local->request_id()));
+  EXPECT_TRUE(prefill.get_running_requests().empty());
+  EXPECT_EQ(pool->num_used_blocks()[0], 0u);
+  EXPECT_EQ(remote->sequences()[0]->get_embedding_block_id(), -1);
+}
 
 TEST_F(ReservationTest, LostConfirmationRetriesWithoutDoubleFree) {
   auto request = reserve();

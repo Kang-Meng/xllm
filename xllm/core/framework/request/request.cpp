@@ -122,7 +122,63 @@ double Request::end_to_end_latency_seconds() const {
   return elapsed_seconds() + end_to_end_latency_offset_seconds_;
 }
 
-void Request::log_statistic(double total_latency) {
+RequestTerminalOutcome Request::claim_terminal_outcome(
+    const std::optional<Status>& status) {
+  RequestTerminalOutcome outcome = RequestTerminalOutcome::NONE;
+  if (status.has_value() && !status->ok()) {
+    outcome = status->code() == StatusCode::CANCELLED
+                  ? RequestTerminalOutcome::CANCELLED
+                  : RequestTerminalOutcome::FAILURE;
+  } else if (cancelled()) {
+    outcome = RequestTerminalOutcome::CANCELLED;
+  } else if (finished()) {
+    outcome = RequestTerminalOutcome::SUCCESS;
+  }
+  if (outcome == RequestTerminalOutcome::NONE) {
+    return outcome;
+  }
+  RequestTerminalOutcome expected = RequestTerminalOutcome::NONE;
+  if (!terminal_outcome_.compare_exchange_strong(expected, outcome)) {
+    return RequestTerminalOutcome::NONE;
+  }
+  return outcome;
+}
+
+void Request::log_terminal_statistic(RequestTerminalOutcome outcome,
+                                     const Status& status,
+                                     double total_latency) {
+  // Client-side cancellation can leave the output status OK. Normalize the
+  // terminal log without changing the status sent to the caller.
+  std::optional<Status> cancelled_status;
+  if (outcome == RequestTerminalOutcome::CANCELLED && status.ok()) {
+    cancelled_status.emplace(StatusCode::CANCELLED, "Cancelled");
+  }
+  const Status& logged_status =
+      cancelled_status.has_value() ? *cancelled_status : status;
+  const char* outcome_name =
+      outcome == RequestTerminalOutcome::SUCCESS     ? "success"
+      : outcome == RequestTerminalOutcome::CANCELLED ? "cancelled"
+                                                     : "failure";
+  LOG(INFO) << "x-request-id: " << x_request_id_ << ", "
+            << "x-request-time: " << x_request_time_ << ", "
+            << "request_id: " << request_id_ << ", "
+            << "record_type: request_terminal, outcome: " << outcome_name
+            << ", status_code: " << static_cast<int32_t>(logged_status.code());
+  if (outcome == RequestTerminalOutcome::SUCCESS) {
+    log_statistic(total_latency, /*prefill_stage=*/false);
+  } else {
+    log_error_statistic(logged_status, outcome_name);
+  }
+}
+
+void Request::log_prefill_statistic(double total_latency) {
+  if (prefill_statistic_logged_.exchange(true)) {
+    return;
+  }
+  log_statistic(total_latency, /*prefill_stage=*/true);
+}
+
+void Request::log_statistic(double total_latency, bool prefill_stage) {
   // log the request statistics
   int idx = 0;
   for (const auto& seq : sequences()) {
@@ -162,6 +218,9 @@ void Request::log_statistic(double total_latency) {
               << "x-request-time: " << x_request_time_ << ", "
               << "request_id: " << request_id_ << ", "
               << "sequence " << idx++ << ", "
+              << "record_type: "
+              << (prefill_stage ? "pd_prefill_stage" : "terminal_sequence")
+              << ", "
               << "max_tokens: "
               << seq->stopping_checker()->get_max_generated_tokens() << ", "
               << "temperature: " << seq->sampling_param()->temperature << ", "
@@ -182,7 +241,8 @@ void Request::log_statistic(double total_latency) {
   }
 }
 
-void Request::log_error_statistic(Status status) {
+void Request::log_error_statistic(const Status& status,
+                                  const char* outcome_name) {
   // log the request statistics
   int idx = 0;
   for (const auto& seq : sequences()) {
@@ -190,6 +250,8 @@ void Request::log_error_statistic(Status status) {
               << "x-request-time: " << x_request_time_ << ", "
               << "request_id: " << request_id_ << ", "
               << "sequence " << idx++ << ", "
+              << "record_type: terminal_sequence, "
+              << "outcome: " << outcome_name << ", "
               << "max_tokens: "
               << seq->stopping_checker()->get_max_generated_tokens() << ", "
               << "temperature: " << seq->sampling_param()->temperature << ", "
