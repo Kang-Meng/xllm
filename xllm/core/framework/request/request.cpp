@@ -309,6 +309,10 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
     output.status = request_error.value();
     return output;
   }
+  if (output.cancelled) {
+    output.status = Status(StatusCode::CANCELLED);
+    return output;
+  }
   output.status = Status(StatusCode::OK);
   sequences_group_->generate_outputs(output.outputs, tokenizer, thread_pool);
   return output;

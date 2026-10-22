@@ -286,5 +286,64 @@ TEST(RequestCachedTokensTest, AdmissionRecordsFinalMaximumOnlyOnce) {
                    hit_before + 6.0);
 }
 
+TEST(RequestCachedTokensTest, CancelledOutputPreservesUsageAndStatus) {
+  for (const int32_t generated_tokens : {0, 1}) {
+    SCOPED_TRACE(generated_tokens);
+    auto request = MakeRequest({1, 2, 3, 4, 5, 6, 7, 8, 9});
+    request->record_num_prefix_cache_tokens(/*num_prefix_cache_tokens=*/8);
+    auto& sequence = *request->sequences().front();
+    sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+    if (generated_tokens != 0) {
+      sequence.append_token(Token(10));
+    }
+    request->set_cancel();
+
+    const Tokenizer tokenizer;
+    const RequestOutput output = request->generate_output(tokenizer);
+    EXPECT_TRUE(output.cancelled);
+    ASSERT_TRUE(output.status.has_value());
+    EXPECT_EQ(output.status->code(), StatusCode::CANCELLED);
+    EXPECT_TRUE(output.outputs.empty());
+    ASSERT_TRUE(output.usage.has_value());
+    EXPECT_EQ(output.usage->num_prompt_tokens, 9);
+    EXPECT_EQ(output.usage->num_generated_tokens, generated_tokens);
+    EXPECT_EQ(output.usage->num_cached_tokens, 8);
+    EXPECT_EQ(output.usage->num_total_tokens, 9 + generated_tokens);
+
+    const double cancelled_before =
+        COUNTER_VALUE(request_status_total_cancelled);
+    const double ok_before = COUNTER_VALUE(request_status_total_ok);
+    output.log_request_status();
+    EXPECT_DOUBLE_EQ(COUNTER_VALUE(request_status_total_cancelled),
+                     cancelled_before + 1.0);
+    EXPECT_DOUBLE_EQ(COUNTER_VALUE(request_status_total_ok), ok_before);
+  }
+}
+
+TEST(RequestCachedTokensTest, RequestErrorTakesPrecedenceOverCancellation) {
+  auto request = MakeRequest({1, 2, 3});
+  request->record_num_prefix_cache_tokens(/*num_prefix_cache_tokens=*/2);
+  request->sequences().front()->fail(Status(StatusCode::INVALID_ARGUMENT));
+  request->set_cancel();
+
+  const Tokenizer tokenizer;
+  const RequestOutput output = request->generate_output(tokenizer);
+  EXPECT_TRUE(output.cancelled);
+  ASSERT_TRUE(output.status.has_value());
+  EXPECT_EQ(output.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_TRUE(output.outputs.empty());
+  ASSERT_TRUE(output.usage.has_value());
+  EXPECT_EQ(output.usage->num_cached_tokens, 2);
+}
+
+TEST(RequestCachedTokensTest, NonCancelledOutputKeepsOkStatus) {
+  auto request = MakeRequest({1, 2, 3});
+  const Tokenizer tokenizer;
+  const RequestOutput output = request->generate_output(tokenizer);
+  EXPECT_FALSE(output.cancelled);
+  ASSERT_TRUE(output.status.has_value());
+  EXPECT_EQ(output.status->code(), StatusCode::OK);
+}
+
 }  // namespace
 }  // namespace xllm
