@@ -143,7 +143,8 @@ REGISTER_MODEL_ARGS(kimi_k3, [&] {
   SET_ARG(video_token_id, 163605);
   SET_ARG(mm_km_patch_size, 14);
   SET_ARG(mm_km_merge_kernel_size, 2);
-  SET_ARG(stop_token_ids, std::unordered_set<int32_t>({0, 163585, 163586}));
+  // TikToken token 0 is ordinary punctuation ("!"), not an end marker.
+  SET_ARG(stop_token_ids, std::unordered_set<int32_t>({163585, 163586}));
 });
 
 REGISTER_TOKENIZER_ARGS(kimi_k3, [&] {

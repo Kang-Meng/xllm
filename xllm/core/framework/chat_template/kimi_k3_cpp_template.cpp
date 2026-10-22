@@ -25,6 +25,9 @@ limitations under the License.
 #include <utility>
 #include <variant>
 
+#include "core/framework/chat_template/thinking_mode_resolver.h"
+#include "core/util/utils.h"
+
 namespace xllm {
 namespace {
 
@@ -32,6 +35,7 @@ constexpr const char* kOpenToken = "<|open|>";
 constexpr const char* kCloseToken = "<|close|>";
 constexpr const char* kSepToken = "<|sep|>";
 constexpr const char* kEndOfMessageToken = "<|end_of_msg|>";
+
 constexpr const char* kImagePrompt =
     "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>";
 constexpr const char* kVideoPrompt =
@@ -98,18 +102,6 @@ bool append_content(std::ostringstream& output,
                  << item.type;
       return false;
     }
-  }
-  return true;
-}
-
-bool get_thinking(const nlohmann::ordered_json& kwargs) {
-  auto thinking = kwargs.find("thinking");
-  if (thinking != kwargs.end() && thinking->is_boolean()) {
-    return thinking->get<bool>();
-  }
-  thinking = kwargs.find("enable_thinking");
-  if (thinking != kwargs.end() && thinking->is_boolean()) {
-    return thinking->get<bool>();
   }
   return true;
 }
@@ -238,7 +230,8 @@ std::optional<std::string> KimiK3CppTemplate::apply(
     const ChatMessages& messages,
     const std::vector<xllm::JsonTool>& json_tools,
     const nlohmann::ordered_json& chat_template_kwargs) const {
-  const bool thinking = get_thinking(chat_template_kwargs);
+  const bool thinking = thinking_mode::is_enabled(
+      chat_template_kwargs, std::string(util::kKimiK3ModelType));
   const std::optional<std::string> thinking_effort =
       get_thinking_effort(chat_template_kwargs);
   if (thinking && !thinking_effort.has_value()) {

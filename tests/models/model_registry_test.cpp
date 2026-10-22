@@ -18,6 +18,10 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <string>
+#include <vector>
+
+#include "core/framework/request/stopping_checker.h"
+#include "core/util/json_reader.h"
 
 namespace xllm {
 namespace {
@@ -126,6 +130,34 @@ TEST(ModelRegistryTest, DeepseekV41RegistersArgsLoaderAndLlmBackend) {
   EXPECT_TRUE(
       static_cast<bool>(ModelRegistry::get_model_args_loader("deepseek_v41")));
   EXPECT_EQ(ModelRegistry::get_model_backend("deepseek_v41"), "llm");
+}
+
+TEST(ModelRegistryTest, KimiK3StopsOnEndMarkersButNotOrdinaryTokenZero) {
+  ModelArgsLoader loader = ModelRegistry::get_model_args_loader("kimi_k3");
+  ASSERT_TRUE(static_cast<bool>(loader));
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"({"model_type":"kimi_k3"})"));
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+
+  EXPECT_EQ(args.stop_token_ids().count(0), 0u);
+  StoppingChecker checker(/*max_generated_tokens=*/32,
+                          /*max_context_len=*/128,
+                          args.eos_token_id(),
+                          /*ignore_eos=*/false,
+                          args.stop_token_ids(),
+                          /*stop_sequences=*/{});
+  const std::vector<int32_t> punctuation{163584, 0};
+  EXPECT_EQ(checker.check(punctuation, /*num_prompt_tokens=*/1),
+            FinishReason::NONE);
+  const std::vector<int32_t> continued{163584, 0, 100};
+  EXPECT_EQ(checker.check(continued, /*num_prompt_tokens=*/1),
+            FinishReason::NONE);
+  for (const int32_t end_marker : {163585, 163586}) {
+    const std::vector<int32_t> completed{163584, 0, 100, end_marker};
+    EXPECT_EQ(checker.check(completed, /*num_prompt_tokens=*/1),
+              FinishReason::STOP);
+  }
 }
 
 }  // namespace

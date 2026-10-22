@@ -63,6 +63,25 @@ inline bool get_enable_thinking_from_request(
                                    reasoning_parser_format);
 }
 
+inline bool should_run_tool_call_parser(
+    const std::vector<xllm::JsonTool>& tools,
+    const function_call::FunctionCallParser& parser) {
+  return !tools.empty() || parser.parses_response_envelope();
+}
+
+inline bool should_run_tool_call_parser(
+    const std::vector<xllm::JsonTool>& tools,
+    const std::string& parser_format) {
+  if (parser_format.empty()) {
+    return false;
+  }
+  if (!tools.empty()) {
+    return true;
+  }
+  return should_run_tool_call_parser(
+      tools, function_call::FunctionCallParser(tools, parser_format));
+}
+
 inline bool check_for_unstreamed_tool_args(
     std::shared_ptr<StreamOutputParser> stream_parser,
     size_t index,
@@ -119,7 +138,7 @@ inline ToolCallResult process_tool_calls(
 
   function_call::FunctionCallParser parser(tools, parser_format);
 
-  if (!parser.has_tool_call(text)) {
+  if (!parser.has_tool_call(text) && !parser.parses_response_envelope()) {
     result.text = std::move(text);
     result.finish_reason = std::move(finish_reason);
     return result;

@@ -16,6 +16,10 @@ limitations under the License.
 
 #include "stream_output_parser.h"
 
+#include <utility>
+
+#include "api_service/utils.h"
+
 namespace xllm {
 StreamOutputParser::StreamOutputParser(
     const std::vector<function_call::JsonTool>& tools,
@@ -27,10 +31,14 @@ StreamOutputParser::StreamOutputParser(
       reasoning_parser_format_(reasoning_parser_format),
       force_reasoning_(force_reasoning) {
   sequence_parsers_.resize(1);
-  if (is_tool_call()) {
-    sequence_parsers_[0].tool_call_parser =
-        std::make_unique<function_call::FunctionCallParser>(
-            tools_, tool_call_parser_format_);
+  if (!tool_call_parser_format_.empty()) {
+    auto parser = std::make_unique<function_call::FunctionCallParser>(
+        tools_, tool_call_parser_format_);
+    tool_call_parser_enabled_ =
+        api_service::should_run_tool_call_parser(tools_, *parser);
+    if (tool_call_parser_enabled_) {
+      sequence_parsers_[0].tool_call_parser = std::move(parser);
+    }
   }
   if (is_reasoning()) {
     sequence_parsers_[0].reasoning_parser_ = std::make_unique<ReasoningParser>(
@@ -38,9 +46,7 @@ StreamOutputParser::StreamOutputParser(
   }
 }
 
-bool StreamOutputParser::is_tool_call() {
-  return !tools_.empty() && !tool_call_parser_format_.empty();
-}
+bool StreamOutputParser::is_tool_call() { return tool_call_parser_enabled_; }
 
 bool StreamOutputParser::is_reasoning() {
   return !reasoning_parser_format_.empty();

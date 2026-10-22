@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/request/request_params.h"
 #include "core/util/uuid.h"
 #include "function_call/function_call.h"
+#include "parser/detector_registry.h"
 
 namespace xllm {
 namespace {
@@ -230,7 +231,8 @@ void generate_chat_response(proto::ChatResponse& response,
     }
 
     // 2) handle tool call output
-    if (!tools.empty() && !tool_call_parser_format.empty() &&
+    if (api_service::should_run_tool_call_parser(tools,
+                                                 tool_call_parser_format) &&
         !cur_text.empty()) {
       auto* arena = response.GetArena();
       auto result =
@@ -678,6 +680,19 @@ void AnthropicServiceImpl::process_async_impl(
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
 
+  if (api_service::should_run_tool_call_parser(request_params.tools,
+                                               tool_call_parser_format_)) {
+    request_params.skip_special_tokens = false;
+  }
+
+  // Force reasoning only for formats whose prompt already opens the block.
+  // Other formats retain their existing Anthropic parsing defaults.
+  const bool is_force_reasoning =
+      DetectorRegistry::get_instance().prompt_opens_think(
+          reasoning_parser_format_) &&
+      api_service::get_enable_thinking_from_request(
+          request_params.chat_template_kwargs, reasoning_parser_format_);
+
   // Build messages
   std::vector<Message> messages = build_messages(rpc_request);
 
@@ -689,7 +704,7 @@ void AnthropicServiceImpl::process_async_impl(
         std::make_shared<StreamOutputParser>(request_params.tools,
                                              tool_call_parser_format_,
                                              reasoning_parser_format_,
-                                             false /*is_force_reasoning_*/);
+                                             is_force_reasoning);
   }
 
   auto saved_streaming = request_params.streaming;
@@ -716,6 +731,7 @@ void AnthropicServiceImpl::process_async_impl(
        model,
        master = master_,
        stream = saved_streaming,
+       is_force_reasoning,
        message_id = std::move(message_id),
        message_started = false,
        content_block_started = false,
@@ -783,7 +799,7 @@ void AnthropicServiceImpl::process_async_impl(
                                req_output,
                                tool_call_parser_format,
                                reasoning_parser_format,
-                               false /*is_force_reasoning_*/,
+                               is_force_reasoning,
                                tools);
         return send_result_to_client(call, chat_response);
       });

@@ -25,16 +25,29 @@ limitations under the License.
 namespace xllm {
 
 namespace {
-#define REGISTER_DETECTOR_DEFAULT_FORCE(name, start, end, default_force) \
-  {name, [](bool stream, bool force) {                                   \
-     return std::make_unique<ReasoningDetector>(                         \
-         start, end, default_force, stream);                             \
-   }}
+struct DetectorRegistration {
+  DetectorFactory factory;
+  bool prompt_opens_think = false;
+};
 
-#define REGISTER_DETECTOR(name, start, end)                                 \
-  {name, [](bool stream, bool force) {                                      \
-     return std::make_unique<ReasoningDetector>(start, end, force, stream); \
-   }}
+#define REGISTER_DETECTOR_DEFAULT_FORCE(name, start, end, default_force) \
+  {                                                                      \
+    name, {                                                              \
+      [](bool stream, bool force) {                                      \
+        return std::make_unique<ReasoningDetector>(                      \
+            start, end, default_force, stream);                          \
+      }                                                                  \
+    }                                                                    \
+  }
+
+#define REGISTER_DETECTOR(name, start, end)                                    \
+  {                                                                            \
+    name, {                                                                    \
+      [](bool stream, bool force) {                                            \
+        return std::make_unique<ReasoningDetector>(start, end, force, stream); \
+      }                                                                        \
+    }                                                                          \
+  }
 
 // Maps reasoning_parser name to supported model_types
 const std::unordered_map<std::string, std::string> auto_paser_map = {
@@ -44,6 +57,7 @@ const std::unordered_map<std::string, std::string> auto_paser_map = {
     {"deepseek_v32", "deepseekv32"},
     {"kimi_k2", "kimi"},
     {"kimi_k25", "kimi_k25"},
+    {"kimi_k3", "kimi_k3"},
     {"step3", "step3"},
 };
 
@@ -56,7 +70,7 @@ std::string get_auto_paser_map_supported() {
   return absl::StrJoin(keys, ", ");
 }
 
-const std::unordered_map<std::string, DetectorFactory> paser_factories = {
+const std::unordered_map<std::string, DetectorRegistration> paser_factories = {
     REGISTER_DETECTOR_DEFAULT_FORCE("deepseek-r1", "<think>", "</think>", true),
     REGISTER_DETECTOR("deepseek-v3", "<think>", "</think>"),
     REGISTER_DETECTOR("glm45", "<think>", "</think>"),
@@ -65,6 +79,12 @@ const std::unordered_map<std::string, DetectorFactory> paser_factories = {
     REGISTER_DETECTOR("deepseek-v4", "<think>", "</think>"),
     REGISTER_DETECTOR_DEFAULT_FORCE("kimi", "◁think▷", "◁/think▷", false),
     REGISTER_DETECTOR("kimi_k25", "<think>", "</think>"),
+    {"kimi_k3",
+     {[](bool stream, bool force) {
+        return std::make_unique<ReasoningDetector>(
+            "<|open|>think<|sep|>", "<|close|>think<|sep|>", force, stream);
+      },
+      /*prompt_opens_think=*/true}},
     REGISTER_DETECTOR("qwen3", "<think>", "</think>"),
     REGISTER_DETECTOR("qwen35", "<think>", "</think>"),
     REGISTER_DETECTOR_DEFAULT_FORCE("qwen3-thinking",
@@ -94,8 +114,14 @@ std::unique_ptr<ReasoningDetector> DetectorRegistry::get_detector(
                << "\nAvailable model types are: " << absl::StrJoin(keys, ", ");
   }
 
-  return it->second(stream_reasoning, force_reasoning);
+  return it->second.factory(stream_reasoning, force_reasoning);
 };
+
+bool DetectorRegistry::prompt_opens_think(
+    const std::string& parser_name) const {
+  const auto it = paser_factories.find(parser_name);
+  return it != paser_factories.end() && it->second.prompt_opens_think;
+}
 
 bool DetectorRegistry::has_detector(const std::string& parser_name) const {
   return paser_factories.find(parser_name) != paser_factories.end();

@@ -64,6 +64,7 @@ class StreamOutputParser {
   std::string tool_call_parser_format_;
   std::string reasoning_parser_format_;
   bool force_reasoning_;
+  bool tool_call_parser_enabled_ = false;
 };
 
 }  // namespace xllm

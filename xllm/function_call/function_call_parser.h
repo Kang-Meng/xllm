@@ -38,6 +38,10 @@ class FunctionCallParser {
 
   bool has_tool_call(const std::string& text) const;
 
+  bool parses_response_envelope() const {
+    return detector_->parses_response_envelope();
+  }
+
   std::tuple<std::string, std::vector<ToolCallItem>> parse_non_stream(
       const std::string& full_text);
 

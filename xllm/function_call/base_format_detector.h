@@ -50,6 +50,9 @@ class BaseFormatDetector {
 
   virtual bool has_tool_call(const std::string& text) = 0;
 
+  // Some formats wrap ordinary responses even when no tool call is present.
+  virtual bool parses_response_envelope() const { return false; }
+
   virtual StreamingParseResult parse_streaming_increment(
       const std::string& new_text,
       const std::vector<JsonTool>& tools);

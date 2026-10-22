@@ -39,6 +39,9 @@ class DetectorRegistry {
 
   bool has_detector(const std::string& parser_name) const;
 
+  // Whether this format's generation prompt already opens the think block.
+  bool prompt_opens_think(const std::string& parser_name) const;
+
   std::string get_supported_parsers() const;
 
   // Get the reasoning parser name for auto mode based on model_type

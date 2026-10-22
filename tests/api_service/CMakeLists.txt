@@ -187,3 +187,10 @@ cc_test(
 )
 target_link_libraries(openai_service_test PRIVATE brpc leveldb::leveldb OpenSSL::SSL OpenSSL::Crypto protobuf::libprotobuf)
 add_dependencies(openai_service_test brpc-static)
+
+cc_test(
+  NAME kimi_k3_output_protocol_test
+  CPU_ONLY
+  SRCS kimi_k3_output_protocol_test.cpp
+  DEPS api_service GTest::gtest_main nlohmann_json::nlohmann_json
+)

@@ -405,7 +405,8 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
     }
 
     // handle tool call output
-    if (!tools.empty() && !tool_call_parser_format.empty() &&
+    if (api_service::should_run_tool_call_parser(tools,
+                                                 tool_call_parser_format) &&
         !cur_text.empty()) {
       auto* arena = response.GetArena();
       auto result =
@@ -666,7 +667,8 @@ void ChatServiceImpl::process_async_rpc_impl(
   // Preserve parser-relevant special tokens in decoded output
   // so tool call detectors can match their control markers.
   // Aligns with vLLM parser adjust_request behavior.
-  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+  if (api_service::should_run_tool_call_parser(request_params.tools,
+                                               tool_call_parser_format_)) {
     request_params.skip_special_tokens = false;
   }
 
@@ -753,7 +755,8 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     request_params.decode_address = rpc_request.routing().decode_name();
   }
 
-  if (!tool_call_parser_format_.empty() && !request_params.tools.empty()) {
+  if (api_service::should_run_tool_call_parser(request_params.tools,
+                                               tool_call_parser_format_)) {
     request_params.skip_special_tokens = false;
   }
 
