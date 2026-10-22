@@ -104,15 +104,18 @@ DEFINE_bool(
 DEFINE_bool(
     enable_graph_aux_hidden_states,
     false,
-    "Allow a graph-captured Python target to publish its aux hidden states "
-    "to the draft model through a persistent graph buffer. Off by default: "
-    "the transient aux capture returns a (hidden, aux) tuple while the ACL "
-    "decode graph runner replays a single output tensor, so aux-capture "
-    "targets stay eager. When enabled the capture buffer becomes persistent "
-    "(fixed address, graph-capturable) and the executor re-attaches the aux "
-    "slice to the graph output; only the deepseek_v41 target is "
-    "graph-eligible (gate chain: py_causal_lm -> deepseek_v41.py "
-    "AuxHiddenCapture -> decode_acl_graph -> executor aux publish).");
+    "Let the deepseek_v41 target publish its transiently-incompatible aux "
+    "capture through a persistent graph buffer instead of staying eager. "
+    "The transient aux capture returns a (hidden, aux) tuple; the "
+    "deepseek_v41 graph path (CSA2 backend + fused ops) cannot replay that "
+    "tuple, so with this flag off that one target is pinned to eager. "
+    "Every other aux-capture target replays the transient tuple through "
+    "the graph fine (fixed-address pool allocation since #240) and is "
+    "never affected by this flag. When enabled the v41 capture buffer "
+    "becomes persistent (fixed address, graph-capturable) and the "
+    "executor re-attaches the aux slice to the graph output (gate chain: "
+    "py_causal_lm -> deepseek_v41.py AuxHiddenCapture -> "
+    "decode_acl_graph -> executor aux publish).");
 
 namespace xllm {
 

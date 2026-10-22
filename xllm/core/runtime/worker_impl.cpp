@@ -872,7 +872,10 @@ void WorkerImpl::prepare_linear_state_cache(ModelInputParams& params) {
   const int64_t conv_history_len =
       kernel_dim > 1 ? static_cast<int64_t>(kernel_dim - 1) : 0;
   std::vector<int32_t> accepted_rows;
-  if (!reads_distinct_state) {
+  // An empty DP/EP shard gets a fabricated linear-state row that carries
+  // accepted-token counts without any host write id, so there is nothing to
+  // restore and no row for the counts to line up with.
+  if (!reads_distinct_state && !write_ids.empty()) {
     accepted_rows.assign(write_ids.size(), 0);
     if (!params.num_accepted_tokens_host.empty()) {
       CHECK_EQ(params.num_accepted_tokens_host.size(), write_ids.size())

@@ -527,23 +527,29 @@ py::dict PyCausalLM::build_config_dict(
       model_args_.model_type() == kDFlashDraftModelType ||
       model_args_.model_type() == kDSparkDraftModelType ||
       util::is_deepseek_v4_dspark_model_type(model_args_.model_type());
-  // A *target* that captures aux hidden states is normally pinned to eager too:
-  // the plain capture returns a tuple while the graph runner only accepts a
-  // single Tensor output. The opt-in flag lets the whitelisted target publish
-  // the capture through the runner's persistent aux buffer instead, so the
-  // graph can be captured; every other aux-capture target stays eager.
+  // A *target* whose transient capture cannot ride the graph is pinned to
+  // eager: the plain capture returns a tuple, and that tuple has to survive
+  // the model's graph path. The opt-in flag lets such a target publish the
+  // capture through the runner's persistent aux buffer instead, so the graph
+  // can be captured.
   const bool allow_graph_aux_hidden_states =
       ExecutionConfig::get_instance().enable_graph_aux_hidden_states();
-  // The aux-capture graph opt-in only matters for a model that actually
-  // captures aux hidden states: without layers to capture there is no tuple
-  // output problem to work around, so the flag alone must not force eager.
-  // An aux-capture target goes eager unless the flag is on AND it is the
-  // whitelisted deepseek_v41 target (single condition: the empty layer set
-  // never forces eager, the flag-off capture always does).
+  // That incompatibility is a per-model property, not a universal one: only
+  // the deepseek_v41 family (CSA2 backend + fused-ops graph-task-update path)
+  // fails to replay the transient tuple. Every other capture target - e.g.
+  // the glm5_next DFlash2 draft tap - allocates its fresh per-forward buffer
+  // inside the graph's private memory pool at fixed addresses, and the runner
+  // replays the tuple fine. Scope the aux-capture eager gate to the v41 family
+  // so the gate never spills onto models whose capture coexists with the
+  // graph; the flag alone (or an empty layer set) forces nothing. The family
+  // predicate (not a bare string) covers future v41-variant spellings that
+  // share the CSA2 stack; the family's python-path DSpark draft is eager
+  // anyway through the draft set above.
   bool requires_eager_execution =
-      eager_draft_model || (!model_args_.layers_to_capture().empty() &&
-                            (!allow_graph_aux_hidden_states ||
-                             model_args_.model_type() != "deepseek_v41"));
+      eager_draft_model ||
+      (!model_args_.layers_to_capture().empty() &&
+       util::is_deepseek_v41_family_model_type(model_args_.model_type()) &&
+       !allow_graph_aux_hidden_states);
   // GLM5.2 degree-2 EPLv2 decode admits the fixed-capacity MC2 transport
   // (graph-capturable) inside the HCCL window; the Python executor gates
   // capture on the same policy and over-capacity steps stay on the
