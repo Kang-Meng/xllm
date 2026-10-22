@@ -254,7 +254,7 @@ def test_layout_reduces_partials_but_only_slices_replicas(
 
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("rows", [1, 3, 9, 16])
-def test_sp_decode_keeps_output_local_and_skips_empty_source_shared(
+def test_sp_decode_keeps_output_local_and_masks_inactive_rows(
     world: int, rows: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     full = torch.arange(1, rows * 8 + 1, dtype=torch.float32).reshape(rows, 8)
@@ -287,10 +287,11 @@ def test_sp_decode_keeps_output_local_and_skips_empty_source_shared(
         local, mask = layout.shard(full), layout.shard(active)
         result = layer(local, token_layout=layout, token_mask=mask)
         torch.testing.assert_close(result, local * 8 * mask[:, None], rtol=0, atol=0)
-        # Shared experts run only when this rank owns real ACTIVE rows: a
-        # structurally non-empty shard whose mask is all-false (padding or a
-        # dummy rank) skips the shared GEMMs entirely.
-        assert len(shared.rows) == int(bool(mask.any()))
+        # Shared experts run whenever this rank structurally owns rows:
+        # runtime activity is not a GEMM gate (that would need a
+        # device->host sync); the final masked_fill drops the inactive
+        # rows' contribution instead, exactly as the pre-refactor code did.
+        assert len(shared.rows) == int(layout.valid_tokens > 0)
         assert route.call_count == int(layout.valid_tokens > 0)
         outputs.append(result)
     assert sorted(seen) == full[active, 0].tolist()

@@ -181,13 +181,13 @@ def test_cp1_degree2_mega_pure_decode_preserves_base_and_graph(
     base = Mock(return_value=torch.ones(1, 8))
     monkeypatch.setattr(deepseek_v32.DeepseekV3MoE, "forward", base)
     alltoall = Mock(side_effect=AssertionError("pure legacy Mega decode must not enter AllToAllV"))
-    monkeypatch.setattr(moe, "_forward_alltoall", alltoall)
+    monkeypatch.setattr(moe, "_forward_source_sp", alltoall)
     hidden = torch.ones(1, 8)
     ctx = _context(None, is_prefill=False, dp_is_decode=(1,) * dp_size)
     if graph:
         ctx = replace(ctx, execution_state=object())
     with forward_context(ctx):
-        assert not moe._uses_alltoall()
+        assert not moe._uses_source_sp()
         assert moe(hidden) is base.return_value
     base.assert_called_once_with(hidden)
     alltoall.assert_not_called()
@@ -203,7 +203,7 @@ def test_cp1_degree2_mega_prefill_always_selects_alltoall(
     base = Mock(side_effect=AssertionError("Mega configuration must not send prefill to base grouped EP"))
     monkeypatch.setattr(deepseek_v32.DeepseekV3MoE, "forward", base)
     alltoall = Mock(return_value=torch.ones(1, 8))
-    monkeypatch.setattr(moe, "_forward_alltoall", alltoall)
+    monkeypatch.setattr(moe, "_forward_source_sp", alltoall)
     hidden = torch.ones(1, 8)
     # DP2 rank0 may be pure decode, but a peer prefills: all ranks use A2A.
     ctx = _context(
@@ -213,7 +213,7 @@ def test_cp1_degree2_mega_prefill_always_selects_alltoall(
         dp_is_decode=(1, 0) if dp_size == 2 else (),
     )
     with forward_context(ctx):
-        assert moe._uses_alltoall()
+        assert moe._uses_source_sp()
         assert moe(hidden) is alltoall.return_value
     alltoall.assert_called_once_with(hidden)
     base.assert_not_called()
@@ -224,9 +224,9 @@ def test_mixed_dp_step_selects_alltoall_even_on_decode_rank() -> None:
         _config(tp=2, cp=1, degree=0, dp_size=2, world_size=4, ep_size=4), 0, torch.bfloat16, torch.device("cpu")
     )
     with forward_context(_context(None, is_prefill=False, dp_is_decode=(1, 0))):
-        assert moe._uses_alltoall()
+        assert moe._uses_source_sp()
     with forward_context(_context(None, is_prefill=False)), pytest.raises(ValueError, match="replicated DP"):
-        moe._uses_alltoall()
+        moe._uses_source_sp()
 
 
 @pytest.mark.parametrize("rank", (0, 1))
@@ -235,7 +235,7 @@ def test_cp_mixed_dp_real_decode_rejected_before_collectives(rank: int, monkeypa
         _config(tp=2, dp_size=2, dp_rank=rank, world_size=8, ep_size=8), 0, torch.bfloat16, torch.device("cpu")
     )
     forbidden = Mock(side_effect=AssertionError("must reject before collective"))
-    monkeypatch.setattr(moe, "_uses_alltoall", forbidden)
+    monkeypatch.setattr(moe, "_uses_source_sp", forbidden)
     with (
         forward_context(_context(None, dp_is_decode=(0, 1), raw_dp_execution_token_counts=(3, 1))),
         pytest.raises(ValueError, match="real decode DP ranks"),

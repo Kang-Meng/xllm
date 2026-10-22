@@ -41,7 +41,6 @@ import torch.nn.functional as F
 
 from xllm.python import distributed, kernels
 from xllm.python.layers.moe_parallel import TokenParallelLayout
-from xllm.python.model_executor.forward_context import in_acl_graph
 
 
 def clamped_silu_and_mul(gate_up: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
@@ -325,8 +324,6 @@ class MoECore:
         backend = layout.routed_backend
         if backend not in ("mc2", "alltoall", "megamoe"):
             raise ValueError(f"Unknown GLM source-owned routed backend: {backend}")
-        if backend == "mc2" and self._swiglu_mode != 1:
-            raise ValueError("Standard GLM SwiGLU is not admitted by the MC2 provider")
         if layout.valid_tokens:
             weights, indices = self._route_ep(hidden)
         else:
@@ -403,6 +400,7 @@ class MoECore:
                 global_bs=0,
                 x_active_mask=dispatch_mask,
                 swiglu_limit=self._swiglu_limit,
+                swiglu_mode=self._swiglu_mode,
             )
         return output[: layout.shard_tokens]
 
@@ -417,71 +415,36 @@ class MoECore:
         *,
         shared_stream: torch.npu.Stream | None = None,
     ) -> torch.Tensor:
-        """Compute source rows once; dispatch/combine already completes EP sum."""
+        """Compute source rows once; dispatch/combine already completes EP sum.
+
+        Shared experts are per-row MLPs, so every local row -- including
+        zigzag/DP padding rows -- runs the shared GEMMs and the final
+        masked_fill drops the padding, exactly as the pre-refactor code
+        did. There is no device->host activity sync and no dynamically
+        shaped row compression: both would only save GEMM work on padding
+        rows, and the verdict machinery needed to skip the sync safely
+        costs more complexity than the padding it saves. Shared and routed
+        run concurrently when the adapter provides an auxiliary stream
+        (GLM5-next's eplv2_shared_overlap); the fork/join stream
+        dependencies record into captured ACL graphs, so graph capture,
+        warmup, replay and eager execution all take this one path.
+        """
         if not layout.valid_tokens:
+            # Structurally empty rank (pure host arithmetic): no shared GEMM.
             shared = torch.zeros_like(source)
             routed = self._run_routed_sp(source, layout, mask)
+        elif shared_stream is None:
+            shared = self._run_shared_source(source)
+            routed = self._run_routed_sp(source, layout, mask)
         else:
-            # Shared experts are pure local GEMMs; run them only on the real
-            # source rows and scatter the result back so zigzag/DP padding
-            # rows never pay two W8A8 GEMMs per layer. The routed side
-            # already filters dispatch by the same mask inside the kernel.
-            #
-            # Eager only: ``mask.all()`` is a device->host sync and
-            # ``nonzero`` is dynamically shaped, so an ACL-graph capture
-            # (the degree-2 MC2/MegaMoE graph path) must keep the fixed
-            # full-bucket shape -- run the shared GEMMs over every padded
-            # row and let the final masked_fill drop the padding, exactly
-            # as the pre-refactor code did.
-            if in_acl_graph():
-                # Fixed-shape graph execution (warmup and capture): no
-                # auxiliary-stream fork, no row compression (nonzero is
-                # dynamically shaped), no mask sync to the host. Run shared
-                # and routed serially on the captured stream; masked_fill
-                # drops the padding rows, exactly as the pre-refactor code
-                # did. Warmup must take this same branch so replay matches
-                # what was warmed.
+            current = torch.npu.current_stream(source.device)
+            shared_stream.wait_stream(current)
+            source.record_stream(shared_stream)
+            with torch.npu.stream(shared_stream):
                 shared = self._run_shared_source(source)
-                routed = self._run_routed_sp(source, layout, mask)
-                output = torch.add(shared.float(), routed.float(), alpha=self.routed_scaling).to(source.dtype)
-                output.masked_fill_(~mask[:, None], 0)
-                return output
-            # Pure eager execution (the eager runner sets neither an
-            # execution_state nor an acl_graph context): compression is safe.
-            # Graph warmup executes the fixed-shape branch above instead.
-            rows = None
-            if not bool(mask.all()):
-                rows = mask.nonzero(as_tuple=False).flatten()
-                if rows.numel() == 0:
-                    # An empty rank (all rows inactive): no shared GEMM at all.
-                    shared = torch.zeros_like(source)
-                    routed = self._run_routed_sp(source, layout, mask)
-                    output = torch.add(shared.float(), routed.float(), alpha=self.routed_scaling).to(source.dtype)
-                    output.masked_fill_(~mask[:, None], 0)
-                    return output
-                packed = source.index_select(0, rows)
-            else:
-                packed = source
-            if shared_stream is None:
-                shared_packed = self._run_shared_source(packed)
-            else:
-                current = torch.npu.current_stream(source.device)
-                shared_stream.wait_stream(current)
-                source.record_stream(shared_stream)
-                with torch.npu.stream(shared_stream):
-                    shared_packed = self._run_shared_source(packed)
-                # Keep the routed dispatch on the main stream, concurrent
-                # with the auxiliary shared work, then join before merging.
-                routed = self._run_routed_sp(source, layout, mask)
-                current.wait_stream(shared_stream)
-                shared_packed.record_stream(current)
-            if rows is not None:
-                shared = torch.zeros_like(source)
-                shared.index_copy_(0, rows, shared_packed)
-            else:
-                shared = shared_packed
-            if shared_stream is None:
-                routed = self._run_routed_sp(source, layout, mask)
+            routed = self._run_routed_sp(source, layout, mask)
+            current.wait_stream(shared_stream)
+            shared.record_stream(current)
         output = torch.add(shared.float(), routed.float(), alpha=self.routed_scaling).to(source.dtype)
         output.masked_fill_(~mask[:, None], 0)
         return output

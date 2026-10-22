@@ -360,7 +360,20 @@ class DecodeAclGraphRunner(BaseRunner):
     def _eplv2_graph_admits(self, token_rows: int) -> bool:
         """Keep MC2 capture inside the HCCL window; All-to-AllV stays eager."""
         limit = self._eplv2_graph_token_limit
-        return limit is None or _decode_bucket(token_rows) <= limit
+        if limit is None or _decode_bucket(token_rows) <= limit:
+            return True
+        # Latch one debug line per runner instead of one per rejected step:
+        # the fallback itself is by design (over-capacity buckets run the
+        # eager AllToAllV transport), so flooding the log would only hide
+        # real regressions.
+        if not getattr(self, "_eplv2_reject_logged", False):
+            logger.debug(
+                "EPLv2 graph window exceeded: bucket=%d limit=%d -> eager AllToAllV",
+                _decode_bucket(token_rows),
+                limit,
+            )
+            self._eplv2_reject_logged = True
+        return False
 
     def _shared_graph_plan(
         self,

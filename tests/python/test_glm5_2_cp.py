@@ -227,7 +227,7 @@ def test_cp_ep_moe_dispatches_local_rows_without_cp_merge_or_grouped_reduce() ->
         patch.object(glm5_2_moe, "get_forward_context", return_value=SimpleNamespace(cp_context=object())),
         patch.object(glm5_2, "cp_gather_kv") as gather,
         patch.object(deepseek_v32.DeepseekV3MoE, "forward") as grouped,
-        patch.object(moe, "_forward_alltoall", return_value=local_output) as dispatch,
+        patch.object(moe, "_forward_source_sp", return_value=local_output) as dispatch,
     ):
         output = moe(local_hidden)
 

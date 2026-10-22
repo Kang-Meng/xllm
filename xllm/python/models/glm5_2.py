@@ -31,6 +31,7 @@ GLM-5.2 structural deltas live here:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +53,7 @@ from xllm.python.layers import (
     RMSNorm,
 )
 from xllm.python.layers.moe import QuantGatedMLP
+from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.qlinear import QLinear, QLinearWeightLoader
 from xllm.python.model_executor.cp_utils import (
     cp_gather_kv,
@@ -79,6 +81,7 @@ from xllm.python.models.deepseek_v32 import (
 )
 from xllm.python.models.glm5_2_moe import (
     Glm52MoE,
+    glm52_eplv2_comm_policy,
     validate_glm52_ep_config,
     validate_glm52_ep_execution_config,
 )
@@ -162,6 +165,7 @@ class Glm52Config:
     mega_moe_context: torch.Tensor | None = None
     mega_moe_ccl_buffer_size: int = 0
     mega_moe_num_max_tokens_per_rank: int = 0
+    eplv2_mc2_max_tokens_per_rank: int = 512
 
     @classmethod
     def from_dict(cls, d: dict) -> Glm52Config:
@@ -202,6 +206,7 @@ class Glm52Config:
         dp_size = int(pick("dp_size", default=1))
         cp_size = int(pick("cp_size", default=1))
         world_size = int(pick("world_size", default=tp_size * dp_size * cp_size))
+        expert_parallel_degree = int(pick("expert_parallel_degree", default=0))
         rope_scaling_factor = float(rpick_nz("factor", "rope_scaling_factor", default=1.0))
         original_max = int(rpick_nz("original_max_position_embeddings", default=max_pe))
 
@@ -266,11 +271,17 @@ class Glm52Config:
             index_share_for_mtp_iteration=bool(pick("index_share_for_mtp_iteration", default=False)),
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
             enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
-            expert_parallel_degree=int(pick("expert_parallel_degree", default=0)),
+            expert_parallel_degree=expert_parallel_degree,
             enable_eplb=bool(pick("enable_eplb", default=False)),
             mega_moe_context=pick("mega_moe_context", default=None),
             mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
             mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
+            eplv2_mc2_max_tokens_per_rank=int(
+                pick(
+                    "eplv2_mc2_max_tokens_per_rank",
+                    default=os.getenv("XLLM_EPLV2_MC2_MAX_TOKENS", "512") if expert_parallel_degree == 2 else "512",
+                )
+            ),
         )
         cfg._resolve_indexer_types()
         cfg._resolve_mlp_layer_types()
@@ -711,6 +722,7 @@ class Glm52DecoderLayer(nn.Module):
         layer_id: int,
         dtype: torch.dtype,
         device: torch.device,
+        comm_policy: Eplv2CommPolicy | None = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -725,7 +737,7 @@ class Glm52DecoderLayer(nn.Module):
         if mlp_type == "dense":
             self.mlp = Glm52MLP(cfg, cfg.intermediate_size, dtype, device)
         else:
-            self.mlp = Glm52MoE(cfg, layer_id, dtype, device)
+            self.mlp = Glm52MoE(cfg, layer_id, dtype, device, comm_policy=comm_policy)
 
     def forward(
         self,
@@ -762,7 +774,13 @@ class Glm52Model(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.layers = nn.ModuleList([Glm52DecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)])
+        # MC2 admission window consumed by the decode graph runner's capture
+        # gating (executor reads _comm_policy from the execution model); every
+        # MoE layer shares the same frozen policy object.
+        self._comm_policy = glm52_eplv2_comm_policy(cfg)
+        self.layers = nn.ModuleList(
+            [Glm52DecoderLayer(cfg, i, dtype, device, comm_policy=self._comm_policy) for i in range(cfg.n_layers)]
+        )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
         self.rotary = Glm52YarnRotaryEmbedding(
             cfg.qk_rope_head_dim,

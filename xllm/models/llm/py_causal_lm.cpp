@@ -541,18 +541,13 @@ py::dict PyCausalLM::build_config_dict(
   // whitelisted deepseek_v41 target (single condition: the empty layer set
   // never forces eager, the flag-off capture always does).
   bool requires_eager_execution =
-      eager_draft_model ||
-      (!model_args_.layers_to_capture().empty() &&
-       (!allow_graph_aux_hidden_states ||
-        model_args_.model_type() != "deepseek_v41"));
-#if defined(USE_NPU)
-  const bool is_glm52_eplv2 =
-      model_args_.model_type() == "glm_moe_dsa" &&
-      EPLBConfig::get_instance().expert_parallel_degree() == 2 &&
-      !KernelConfig::get_instance().enable_mega_moe();
-  // AllToAllV uses host variable split sizes and cannot be graph captured.
-  requires_eager_execution = requires_eager_execution || is_glm52_eplv2;
-#endif
+      eager_draft_model || (!model_args_.layers_to_capture().empty() &&
+                            (!allow_graph_aux_hidden_states ||
+                             model_args_.model_type() != "deepseek_v41"));
+  // GLM5.2 degree-2 EPLv2 decode admits the fixed-capacity MC2 transport
+  // (graph-capturable) inside the HCCL window; the Python executor gates
+  // capture on the same policy and over-capacity steps stay on the
+  // variable-length AllToAllV transport, which remains eager-only.
   d["enable_graph"] = requires_eager_execution
                           ? false
                           : ExecutionConfig::get_instance().enable_graph();
@@ -581,8 +576,9 @@ py::dict PyCausalLM::build_config_dict(
   d["enable_dsa_cp"] = KernelConfig::get_instance().enable_dsa_cp() &&
                        !speculative_runtime_config.is_draft_engine;
   const auto& eplb_config = EPLBConfig::get_instance();
-  // Typed GLM5.2 EP metadata is registered from ep_size; the degree selects
-  // eager-only EPLv2 even when no MegaMoE resource is requested.
+  // Typed GLM5.2 EP metadata is registered from ep_size; degree-2 decode
+  // admits the graph-capturable MC2 transport inside the capacity window,
+  // while prefill and over-capacity steps stay on eager AllToAllV.
   if (model_args_.model_type() == "glm_moe_dsa" ||
       model_args_.model_type() == "glm5_next" ||
       model_args_.model_type() == "glm5_next_text" ||

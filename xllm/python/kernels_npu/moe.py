@@ -1045,6 +1045,7 @@ def _ep_moe_w8a8_impl(
     global_bs: int = 0,
     x_active_mask: torch.Tensor | None = None,
     swiglu_limit: float = 10.0,
+    swiglu_mode: int = 1,
 ) -> torch.Tensor:
     """Run routed W8A8 experts with separate MC2 dispatch and combine.
 
@@ -1123,7 +1124,16 @@ def _ep_moe_w8a8_impl(
         quantized_x = torch.empty_like(expand_x, dtype=torch.int8)
         input_scale = torch.empty(0, dtype=torch.float32, device=hidden.device)
     expert_output = _ep_grouped_w8a8(
-        quantized_x, input_scale, expert_token_nums, w13, w2, w13_scale, w2_scale, hidden.dtype, swiglu_limit
+        quantized_x,
+        input_scale,
+        expert_token_nums,
+        w13,
+        w2,
+        w13_scale,
+        w2_scale,
+        hidden.dtype,
+        swiglu_limit,
+        swiglu_mode=swiglu_mode,
     )
     routed_output = torch_npu.npu_moe_distribute_combine_v2(
         expand_x=expert_output,
@@ -1168,6 +1178,7 @@ def ep_moe_w8a8(
     global_bs: int = 0,
     x_active_mask: torch.Tensor | None = None,
     swiglu_limit: float = 10.0,
+    swiglu_mode: int = 1,
 ) -> torch.Tensor:
     """Return the routed W8A8 expert result produced by EP2 dispatch/combine."""
     return _ep_moe_w8a8_impl(
@@ -1185,6 +1196,7 @@ def ep_moe_w8a8(
         global_bs,
         x_active_mask,
         swiglu_limit,
+        swiglu_mode,
     )
 
 
@@ -1204,6 +1216,7 @@ def _ep_moe_w8a8_fake(
     global_bs: int = 0,
     x_active_mask: torch.Tensor | None = None,
     swiglu_limit: float = 10.0,
+    swiglu_mode: int = 1,
 ) -> torch.Tensor:
     del (
         topk_weights,
