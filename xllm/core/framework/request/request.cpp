@@ -37,21 +37,6 @@ limitations under the License.
 
 namespace xllm {
 
-namespace {
-
-size_t count_committed_generated_tokens(const Sequence& sequence) {
-  const auto token_ids = sequence.tokens();
-  const size_t num_prompt_tokens = sequence.num_prompt_tokens();
-  size_t num_committed_tokens = token_ids.size();
-  while (num_committed_tokens > num_prompt_tokens &&
-         token_ids[num_committed_tokens - 1] < 0) {
-    --num_committed_tokens;
-  }
-  return num_committed_tokens - num_prompt_tokens;
-}
-
-}  // namespace
-
 Request::Request(const std::string& request_id,
                  const std::string& x_request_id,
                  const std::string& x_request_time,
@@ -183,7 +168,7 @@ void Request::log_statistic(double total_latency, bool prefill_stage) {
   int idx = 0;
   for (const auto& seq : sequences()) {
     double ttft = seq->time_to_first_token_latency_seconds();
-    const size_t gen_tokens = count_committed_generated_tokens(*seq);
+    const size_t gen_tokens = seq->num_committed_generated_tokens();
     double tpot = 0.0;
     double gen_speed = 0.0;
     if (gen_tokens > 1 && total_latency > ttft && ttft > 0) {
@@ -290,7 +275,7 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
   usage.num_prompt_tokens = state_.prompt_tokens.size();
   for (const auto& seq : sequences()) {
     usage.num_generated_tokens +=
-        static_cast<int32_t>(count_committed_generated_tokens(*seq));
+        static_cast<int32_t>(seq->num_committed_generated_tokens());
   }
   CHECK_LE(num_prefix_cache_tokens_,
            static_cast<size_t>(std::numeric_limits<int32_t>::max()));

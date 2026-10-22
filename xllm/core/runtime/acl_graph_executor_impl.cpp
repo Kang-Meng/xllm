@@ -53,8 +53,7 @@ constexpr uint64_t kSpecVerifyQMaxSeqLenShift = 32;
 constexpr uint64_t kSpecVerifyBucketMask = (1ull << 16) - 1;
 constexpr uint64_t kSpecVerifyFieldMask = (1ull << 16) - 1;
 constexpr uint64_t kSpecVerifyExpandedBlockMask = (1ull << 15) - 1;
-constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
-constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
+constexpr size_t kMaxSpecVerifyGraphVariantsPerSlot = 16;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
 
@@ -278,22 +277,6 @@ uint64_t spec_verify_attention_plan_lookup_key(uint32_t bucket_num_tokens,
       static_cast<uint64_t>(params.graph.expanded_block_tables.size(1)));
   return spec_verify_attention_plan_lookup_key(
       packed_key, params.graph.expanded_kv_seq_lens_vec, block_size);
-}
-
-uint64_t static_mtp_graph_task_key(uint64_t base_key,
-                                   const StaticGraphTaskSignature& signature) {
-  uint64_t hash = mix_graph_key(kStaticGraphTaskHashSeed, base_key);
-  hash = mix_graph_key(hash, static_cast<uint64_t>(signature.linear_state_id));
-  hash =
-      mix_graph_key(hash, static_cast<uint64_t>(signature.num_accepted_tokens));
-  hash = mix_graph_key(hash,
-                       static_cast<uint64_t>(signature.query_start_loc_begin));
-  hash =
-      mix_graph_key(hash, static_cast<uint64_t>(signature.query_start_loc_end));
-  // Retain the spec-verify namespace bit. A signature comparison on replay
-  // guards correctness even in the astronomically unlikely event of a hash
-  // collision.
-  return hash | kSpecVerifyGraphKeyMask;
 }
 
 std::pair<torch::Tensor, torch::Tensor> find_attention_plan_kv_cache(
@@ -975,6 +958,7 @@ ModelOutput AclGraph::replay(CausalLM* model,
       first_hybrid_replay_after_capture_) {
     make_graph_wait_for_current_stream(stream);
   }
+  std::lock_guard<std::mutex> graph_task_lock(graph_task_mutex_);
   first_hybrid_replay_after_capture_ = false;
   const bool use_static_graph_tasks =
       graph_params.has_value() &&
@@ -994,6 +978,14 @@ ModelOutput AclGraph::replay(CausalLM* model,
     update_graph_tasks(
         graph_params.value(),
         /*update_causal_conv1d_tasks=*/!causal_conv1d_tasks_prepared);
+    if (static_graph_task_signature_.has_value()) {
+      // Task updates change the host arguments of this graph. The prelaunch
+      // fast path may signal it only when its most recently installed state
+      // matches the next request.
+      static_graph_task_signature_ =
+          make_static_graph_task_signature(graph_params.value());
+      CHECK(static_graph_task_signature_.has_value());
+    }
   }
   make_current_stream_wait_for_graph(stream);
 
@@ -1033,6 +1025,7 @@ void AclGraph::prepare_replay_inputs(const torch::Tensor& tokens,
 bool AclGraph::prepare_static_mtp_graph_tasks(
     const SpecVerifyGraphTaskSignal& signal,
     const c10_npu::NPUStream& signal_stream) {
+  std::lock_guard<std::mutex> graph_task_lock(graph_task_mutex_);
   if (static_graph_task_signature_ !=
       make_static_graph_task_signature(signal)) {
     return false;
@@ -1368,12 +1361,20 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   const uint64_t graph_key =
       get_graph_key(bucket_num_tokens, params_single, attention_plan_class);
+  const bool bounded_spec_graph =
+      model_->is_hybrid_linear_attention() && params_single.is_spec_verify;
   std::shared_ptr<AclGraph> replay_graph;
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
     auto it = active_slot.graphs.find(graph_key);
     if (it != active_slot.graphs.end()) {
       replay_graph = it->second;
+      auto& keys = active_slot.spec_verify_graph_keys;
+      auto key_it = std::find(keys.begin(), keys.end(), graph_key);
+      if (key_it != keys.end()) {
+        keys.erase(key_it);
+        keys.emplace_back(graph_key);
+      }
     }
   }
 
@@ -1429,6 +1430,24 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     }
   }
 
+  // Release a cold variant before capturing the next graph. Destruction
+  // synchronizes its stream and must happen outside the cache lock. Keep the
+  // per-slot shared graph pool used by main; do not restore private pools.
+  std::shared_ptr<AclGraph> evicted_graph;
+  if (bounded_spec_graph) {
+    std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+    auto& keys = active_slot.spec_verify_graph_keys;
+    if (keys.size() >= kMaxSpecVerifyGraphVariantsPerSlot) {
+      const uint64_t evicted_key = keys.front();
+      keys.pop_front();
+      auto it = active_slot.graphs.find(evicted_key);
+      CHECK(it != active_slot.graphs.end());
+      evicted_graph = std::move(it->second);
+      active_slot.graphs.erase(it);
+    }
+  }
+  evicted_graph.reset();
+
   // Graph doesn't exist for this bucket num_tokens, try to create it lazily
   if (!active_slot.graph_capture_stream.has_value()) {
     active_slot.graph_capture_stream =
@@ -1456,21 +1475,13 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
             << bucket_num_tokens << " (actual num_tokens: " << n_tokens
             << ") done";
 
-  const bool static_mtp_variant = uses_static_mtp_graph_task_variant(
-      params_single, bucket_num_tokens, options_.block_size());
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
-    if (static_mtp_variant) {
-      while (active_slot.static_mtp_graph_keys.size() >=
-             kMaxStaticMtpGraphVariantsPerSlot) {
-        const uint64_t evicted_key = active_slot.static_mtp_graph_keys.front();
-        active_slot.static_mtp_graph_keys.pop_front();
-        active_slot.graphs.erase(evicted_key);
-      }
-      active_slot.static_mtp_graph_keys.push_back(graph_key);
+    if (bounded_spec_graph) {
+      active_slot.spec_verify_graph_keys.emplace_back(graph_key);
     }
     // shared_ptr keeps a replay/prepare that already left the map alive if a
-    // later capture evicts this static variant.
+    // later capture evicts this variant.
     active_slot.graphs[graph_key] = graph;
   }
 
@@ -1573,10 +1584,8 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
 bool AclGraphExecutorImpl::prepare_static_mtp_graph_tasks(
     const SpecVerifyGraphTaskSignal& signal,
     const Stream& signal_stream) {
-  // FIA disables the static MTP graph-task variant entirely (see
-  // uses_static_mtp_graph_task_variant), so stored graphs never carry a
-  // signature-wrapped key and the lookup below is a guaranteed miss. Mirror
-  // the same contract explicitly and skip the pointless computation.
+  // FIA disables the static MTP prelaunch signal (see
+  // uses_static_mtp_graph_task_variant). Its replays update tasks dynamically.
   if (::xllm::ExecutionConfig::get_instance().enable_fia_decode()) {
     return false;
   }
@@ -1606,8 +1615,7 @@ bool AclGraphExecutorImpl::prepare_static_mtp_graph_tasks(
       attention_plan_class.value(),
       args_.model_type(),
       ::xllm::ExecutionConfig::get_instance().enable_fia_decode());
-  const uint64_t graph_key = static_mtp_graph_task_key(
-      base_key, make_static_graph_task_signature(signal));
+  const uint64_t graph_key = base_key | kSpecVerifyGraphKeyMask;
   std::shared_ptr<AclGraph> graph;
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
@@ -1694,13 +1702,9 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
           attention_plan_class,
           args_.model_type(),
           ::xllm::ExecutionConfig::get_instance().enable_fia_decode());
-      if (uses_static_mtp_graph_task_variant(
-              params, bucket_num_tokens, options_.block_size())) {
-        const auto signature = make_static_graph_task_signature(params);
-        CHECK(signature.has_value());
-        return static_mtp_graph_task_key(base_key, signature.value());
-      }
-      return base_key;
+      // State slots and accepted lengths are mutable task arguments, not
+      // tensor shapes. update_graph_tasks() installs them on each replay.
+      return base_key | kSpecVerifyGraphKeyMask;
     }
     return static_cast<uint64_t>(bucket_num_tokens) | kSpecVerifyGraphKeyMask |
            (q_max_seq_len << kSpecVerifyQMaxSeqLenShift);

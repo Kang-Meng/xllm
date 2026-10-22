@@ -175,6 +175,7 @@ class AclGraph {
   std::atomic<bool> replay_inputs_prepared_{false};
   bool first_hybrid_replay_after_capture_ = false;
   std::optional<StaticGraphTaskSignature> static_graph_task_signature_;
+  std::mutex graph_task_mutex_;
   std::optional<std::array<const void*, 12>>
       spec_verify_input_addresses_at_capture_;
   torch::Tensor graph_paged_attention_tiling_data_;
@@ -240,7 +241,7 @@ class AclGraphExecutorImpl : public ExecutorImpl {
     c10_npu::MempoolId_t graph_pool{0, 0};
     std::optional<c10_npu::NPUStream> graph_capture_stream;
     absl::flat_hash_map<uint64_t, std::shared_ptr<AclGraph>> graphs;
-    std::deque<uint64_t> static_mtp_graph_keys;
+    std::deque<uint64_t> spec_verify_graph_keys;
     bool is_prepared = false;
   };
   std::array<GraphSlot, 2> graph_slots_;
