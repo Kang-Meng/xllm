@@ -315,7 +315,7 @@ TORCH_MODULE(Qwen3_5ForConditionalGeneration);
 REGISTER_CAUSAL_VLM_MODEL(qwen3_5, Qwen3_5ForConditionalGeneration);
 REGISTER_MPOSITION_GENERATOR(qwen3_5, Qwen3VLMPositionGenerator);
 using Qwen35MultimodalProcessor = MultimodalProcessor<Qwen3VLPromptProcessor,
-                                                      Qwen2VLImageProcessor,
+                                                      Qwen35ImageProcessor,
                                                       Qwen3VLVideoProcessor>;
 REGISTER_MULTIMODAL_PROCESSOR(qwen3_5, Qwen35MultimodalProcessor);
 REGISTER_MODEL_ARGS(qwen3_5, [&] {

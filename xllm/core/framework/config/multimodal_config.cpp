@@ -40,7 +40,8 @@ DEFINE_int32(image_max_tokens_num,
              "Maximum image tokens used by image preprocessing. The "
              "pixel budget is this value multiplied by "
              "(patch_size * merge_size)^2. Zero uses the model's configured "
-             "max_pixels.");
+             "max_pixels. Supported by Qwen3.5 (preserves the model minimum) "
+             "and Qwen3-Omni (sets the minimum to 4 tokens).");
 
 DEFINE_int32(fps_min_frames,
              4,

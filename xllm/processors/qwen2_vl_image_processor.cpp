@@ -30,6 +30,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/util/pybind_helper.h"
 #include "processors/transforms.h"
 
@@ -119,7 +120,8 @@ std::optional<Size> smart_resize(int32_t height,
                                  int32_t width,
                                  int32_t factor = 28,
                                  int32_t min_pixels = 56 * 56,
-                                 int32_t max_pixels = 14 * 14 * 4 * 1280) {
+                                 int32_t max_pixels = 14 * 14 * 4 * 1280,
+                                 bool enforce_max_pixels = false) {
   if (static_cast<double>(std::max(height, width)) / std::min(height, width) >
       200) {
     LOG(ERROR) << "Absolute aspect ratio must be smaller than 200, height: "
@@ -155,6 +157,35 @@ std::optional<Size> smart_resize(int32_t height,
             factor;
   }
 
+  // Alignment can cross tight pixel bounds or collapse a narrow dimension.
+  // Select the closest aspect ratio among grids that satisfy both bounds.
+  resized_pixels = static_cast<int64_t>(h_bar) * w_bar;
+  if (enforce_max_pixels &&
+      (resized_pixels < min_pixels || resized_pixels > max_pixels)) {
+    const int64_t pixels_per_token = static_cast<int64_t>(factor) * factor;
+    const int64_t min_tokens =
+        (min_pixels + pixels_per_token - 1) / pixels_per_token;
+    const int64_t max_tokens = max_pixels / pixels_per_token;
+    const double aspect = static_cast<double>(width) / height;
+    double best_error = std::numeric_limits<double>::infinity();
+    for (int64_t grid_h = 1; grid_h <= max_tokens; ++grid_h) {
+      const int64_t min_w = (min_tokens + grid_h - 1) / grid_h;
+      const int64_t max_w = max_tokens / grid_h;
+      if (min_w > max_w) {
+        continue;
+      }
+      const int64_t grid_w = std::clamp(
+          static_cast<int64_t>(std::round(grid_h * aspect)), min_w, max_w);
+      const double error =
+          std::abs(std::log(static_cast<double>(grid_w) / grid_h / aspect));
+      if (error >= best_error) {
+        continue;
+      }
+      best_error = error;
+      h_bar = static_cast<int32_t>(grid_h * factor);
+      w_bar = static_cast<int32_t>(grid_w * factor);
+    }
+  }
   return std::make_pair(h_bar, w_bar);
 }
 
@@ -248,7 +279,11 @@ std::optional<Size> smart_resize_tokens(int32_t num_frames,
 
 }  // namespace
 
-Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args) {
+Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args)
+    : Qwen2VLImageProcessor(args, /*max_image_tokens=*/0) {}
+
+Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args,
+                                             int32_t max_image_tokens) {
   image_mean_ = torch::tensor(args.mm_image_normalize_mean(),
                               torch::dtype(torch::kFloat32));
   image_std_ = torch::tensor(args.mm_image_normalize_std(),
@@ -272,11 +307,44 @@ Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args) {
   min_tokens_ = args.mm_image_min_tokens();
   max_tokens_ = args.mm_image_max_tokens();
 
+  CHECK_GE(max_image_tokens, 0) << "image_max_tokens_num must be nonnegative";
+  if (max_image_tokens > 0) {
+    CHECK(min_tokens_ <= 0 || max_tokens_ <= 0)
+        << "image_max_tokens_num requires pixel-budget resizing";
+    const int64_t factor = static_cast<int64_t>(patch_size_) * merge_size_;
+    const int64_t pixel_limit = std::numeric_limits<int32_t>::max();
+    CHECK_LE(factor, pixel_limit / factor)
+        << "image_max_tokens_num pixel budget exceeds int32 range";
+    const int64_t pixels_per_token = factor * factor;
+    CHECK_LE(max_image_tokens, pixel_limit / pixels_per_token)
+        << "image_max_tokens_num pixel budget exceeds int32 range";
+    const int64_t max_pixels = max_image_tokens * pixels_per_token;
+    CHECK_GE(max_pixels, min_pixels_)
+        << "image_max_tokens_num pixel budget is below the model minimum";
+    max_pixels_ = static_cast<int32_t>(max_pixels);
+    enforce_max_pixels_ = true;
+  }
+
   if (do_rescale_ && do_normalize_) {
     image_mean_.mul_(1.0 / rescale_factor_);
     image_std_.mul_(1.0 / rescale_factor_);
     do_rescale_ = false;
   }
+}
+
+Qwen35ImageProcessor::Qwen35ImageProcessor(const ModelArgs& args)
+    : Qwen35ImageProcessor(
+          args,
+          MultimodalConfig::get_instance().image_max_tokens_num()) {}
+
+Qwen35ImageProcessor::Qwen35ImageProcessor(const ModelArgs& args,
+                                           int32_t max_image_tokens)
+    : Qwen2VLImageProcessor(args, max_image_tokens) {
+  LOG(INFO) << "Qwen3.5 image preprocessing: min_pixels=" << min_pixels_
+            << ", max_pixels=" << max_pixels_ << ", patch_size=" << patch_size_
+            << ", merge_size=" << merge_size_ << ", budget_source="
+            << (max_image_tokens > 0 ? "image_max_tokens_num" : "model")
+            << ", image_max_tokens_num=" << max_image_tokens;
 }
 
 bool Qwen2VLImageProcessor::process_image(
@@ -306,7 +374,8 @@ bool Qwen2VLImageProcessor::process_image(
                           static_cast<int32_t>(resized_width),
                           patch_size_ * merge_size_,
                           min_pixels_,
-                          max_pixels_);
+                          max_pixels_,
+                          enforce_max_pixels_);
     }
     if (!size) {
       return false;
@@ -337,6 +406,9 @@ bool Qwen2VLImageProcessor::process_image(
   const int64_t grid_t = patch_shape[1] / temporal_patch_size_;
   const int64_t grid_h = resized_height / patch_size_;
   const int64_t grid_w = resized_width / patch_size_;
+  VLOG(1) << "Image preprocessing: grid_thw=[" << grid_t << "," << grid_h << ","
+          << grid_w << "], visual_tokens="
+          << grid_t * grid_h * grid_w / (merge_size_ * merge_size_);
 
   patches = patches.view({batch_size,
                           grid_t,

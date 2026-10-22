@@ -37,8 +37,8 @@ class Qwen2VLImageProcessor : public ImageProcessor {
                      std::vector<torch::Tensor>& thw) const;
 
  protected:
-  // per-token resize budget (token units). When both are > 0 the
-  // token-budget smart_resize is used; otherwise the legacy pixel-budget path.
+  Qwen2VLImageProcessor(const ModelArgs& args, int32_t max_image_tokens);
+
   int32_t max_pixels_ = 12845056;
   int32_t min_pixels_ = 3136;
 
@@ -52,6 +52,7 @@ class Qwen2VLImageProcessor : public ImageProcessor {
   bool do_normalize_ = true;
   bool do_rescale_ = true;
   bool do_resize_ = true;
+  bool enforce_max_pixels_ = false;
 
   torch::Tensor image_mean_;
   torch::Tensor image_std_;
@@ -63,6 +64,12 @@ class Qwen2VLImageProcessor : public ImageProcessor {
   double rescale_factor_ = 0.00392156862745098;
 
   int32_t temporal_patch_size_ = 2;
+};
+
+class Qwen35ImageProcessor final : public Qwen2VLImageProcessor {
+ public:
+  explicit Qwen35ImageProcessor(const ModelArgs& args);
+  Qwen35ImageProcessor(const ModelArgs& args, int32_t max_image_tokens);
 };
 
 }  // namespace xllm
