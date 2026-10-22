@@ -163,6 +163,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   DiTForwardOutput forward(const DiTForwardInput& input) {
     torch::NoGradGuard no_grad;
+    prepare_vae_constants();
     // 1. Prepare Parameters
     CHECK_EQ(input.batch_size, 1)
         << "MiniMax-H3 native T2VA currently supports batch_size=1";
@@ -414,20 +415,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
               : video_rows;
       video_latent = unpatchify_video(
           generated_video_rows, latent_frames, latent_height, latent_width);
-      torch::Tensor video_latent_mean =
-          torch::tensor(vae_->latents_mean(),
-                        torch::TensorOptions()
-                            .dtype(torch::kFloat32)
-                            .device(video_latent.device()))
-              .view({1, video_latent_channels_, 1, 1, 1});
-      torch::Tensor video_latent_std =
-          torch::tensor(vae_->latents_std(),
-                        torch::TensorOptions()
-                            .dtype(torch::kFloat32)
-                            .device(video_latent.device()))
-              .view({1, video_latent_channels_, 1, 1, 1});
-      video_latent = video_latent.to(torch::kFloat32) * video_latent_std +
-                     video_latent_mean;
+      video_latent = video_latent.to(torch::kFloat32) * video_latent_std_ +
+                     video_latent_mean_;
     } else {
       video_latent = torch::empty(
           {1,
@@ -460,36 +449,12 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
         unpatchify_audio(generated_audio_rows, audio_latents);
 
     // Denormalize audio latents.
-    torch::Tensor audio_latent_mean =
-        torch::tensor(audio_vae_->latents_mean(),
-                      torch::TensorOptions()
-                          .dtype(torch::kFloat32)
-                          .device(audio_latent.device()))
-            .view({1, audio_latent_channels_, 1});
-    torch::Tensor audio_latent_std =
-        torch::tensor(audio_vae_->latents_std(),
-                      torch::TensorOptions()
-                          .dtype(torch::kFloat32)
-                          .device(audio_latent.device()))
-            .view({1, audio_latent_channels_, 1});
-    audio_latent =
-        audio_latent.to(torch::kFloat32) * audio_latent_std + audio_latent_mean;
+    audio_latent = audio_latent.to(torch::kFloat32) * audio_latent_std_ +
+                   audio_latent_mean_;
 
     // Convert decoded video to RGB pixels.
-    torch::Tensor pixel_mean =
-        torch::tensor(std::vector<float>{0.485f, 0.456f, 0.406f},
-                      torch::TensorOptions()
-                          .dtype(torch::kFloat32)
-                          .device(video.device()))
-            .view({1, 3, 1, 1, 1});
-    torch::Tensor pixel_std =
-        torch::tensor(std::vector<float>{0.229f, 0.224f, 0.225f},
-                      torch::TensorOptions()
-                          .dtype(torch::kFloat32)
-                          .device(video.device()))
-            .view({1, 3, 1, 1, 1});
     video = torch::clamp(
-                video.to(torch::kFloat32) * pixel_std + pixel_mean, 0.0, 1.0)
+                video.to(torch::kFloat32) * pixel_std_ + pixel_mean_, 0.0, 1.0)
                 .permute({0, 2, 1, 3, 4})
                 .contiguous();
     torch::Tensor audio = audio_vae_->decode(audio_latent.to(torch::kFloat32));
@@ -508,6 +473,14 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
   void load_model(std::unique_ptr<DiTModelLoader> loader) {
     CHECK(loader != nullptr) << "MiniMax-H3 loader must not be null";
+    video_latent_mean_ = torch::Tensor();
+    video_latent_std_ = torch::Tensor();
+    audio_latent_mean_ = torch::Tensor();
+    audio_latent_std_ = torch::Tensor();
+    reference_audio_mean_ = torch::Tensor();
+    reference_audio_std_ = torch::Tensor();
+    pixel_mean_ = torch::Tensor();
+    pixel_std_ = torch::Tensor();
     LOG(INFO) << "MiniMax-H3 " << task_type_ << " loading model from "
               << loader->model_root_path();
     const std::string transformer_component =
@@ -805,6 +778,37 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     params.embedding.input_embedding =
         text_encoder_->get_input_embeddings(tokens, params);
     return params;
+  }
+
+  void prepare_vae_constants() {
+    if (!is_tp_driver_ ||
+        (pixel_mean_.defined() && pixel_mean_.device() == options_.device())) {
+      return;
+    }
+    const auto device_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(options_.device());
+    video_latent_mean_ = torch::tensor(vae_->latents_mean(), device_options)
+                             .view({1, video_latent_channels_, 1, 1, 1});
+    video_latent_std_ = torch::tensor(vae_->latents_std(), device_options)
+                            .view({1, video_latent_channels_, 1, 1, 1});
+    audio_latent_mean_ =
+        torch::tensor(audio_vae_->latents_mean(), device_options)
+            .view({1, audio_latent_channels_, 1});
+    audio_latent_std_ = torch::tensor(audio_vae_->latents_std(), device_options)
+                            .view({1, audio_latent_channels_, 1});
+    const auto cpu_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    reference_audio_mean_ =
+        torch::tensor(audio_vae_->latents_mean(), cpu_options)
+            .view({1, 1, audio_latent_channels_});
+    reference_audio_std_ = torch::tensor(audio_vae_->latents_std(), cpu_options)
+                               .view({1, 1, audio_latent_channels_});
+    pixel_mean_ = torch::tensor(std::vector<float>{0.485f, 0.456f, 0.406f},
+                                device_options)
+                      .view({1, 3, 1, 1, 1});
+    pixel_std_ = torch::tensor(std::vector<float>{0.229f, 0.224f, 0.225f},
+                               device_options)
+                     .view({1, 3, 1, 1, 1});
   }
 
 #if defined(USE_NPU)
@@ -1469,16 +1473,6 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
 
     // Encode reference audio conditions.
     if (is_tp_driver_ && !reference_audio_inputs.empty()) {
-      torch::Tensor mean =
-          torch::tensor(
-              audio_vae_->latents_mean(),
-              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
-              .view({1, 1, audio_latent_channels_});
-      torch::Tensor std =
-          torch::tensor(
-              audio_vae_->latents_std(),
-              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
-              .view({1, 1, audio_latent_channels_});
       audio_rows.reserve(reference_audio_inputs.size());
       for (torch::Tensor waveform : reference_audio_inputs) {
         waveform =
@@ -1487,10 +1481,12 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
         torch::Tensor latent = audio_vae_->encode_mode(waveform.unsqueeze(1))
                                    .to(torch::kCPU, torch::kFloat32)
                                    .transpose(1, 2);
-        audio_rows.emplace_back(((latent.to(torch::kFloat32) - mean) / std)
-                                    .reshape({1, -1, audio_latent_channels_})
-                                    .contiguous()
-                                    .to(options_.device()));
+        audio_rows.emplace_back(
+            ((latent.to(torch::kFloat32) - reference_audio_mean_) /
+             reference_audio_std_)
+                .reshape({1, -1, audio_latent_channels_})
+                .contiguous()
+                .to(options_.device()));
       }
     }
 
@@ -1718,6 +1714,14 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   }
 
   torch::TensorOptions options_;
+  torch::Tensor video_latent_mean_;
+  torch::Tensor video_latent_std_;
+  torch::Tensor audio_latent_mean_;
+  torch::Tensor audio_latent_std_;
+  torch::Tensor reference_audio_mean_;
+  torch::Tensor reference_audio_std_;
+  torch::Tensor pixel_mean_;
+  torch::Tensor pixel_std_;
   ProcessGroup* tp_group_ = nullptr;
   ProcessGroup* text_encoder_tp_group_ = nullptr;
   int32_t text_encoder_max_tokens_ = 0;

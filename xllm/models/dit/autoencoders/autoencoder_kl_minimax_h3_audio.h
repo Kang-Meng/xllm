@@ -18,6 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#if defined(USE_NPU)
+#include <torch_npu/csrc/aten/CustomFunctions.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -113,10 +117,15 @@ class WeightNormConv1dImpl final : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) const {
-    torch::Tensor norm = weight_v_.pow(2).sum({1, 2}, true).sqrt();
-    torch::Tensor weight = weight_v_ * weight_g_ / norm;
+    if (!cached_weight_.defined() ||
+        cached_weight_.device() != weight_v_.device() ||
+        cached_weight_.scalar_type() != weight_v_.scalar_type()) {
+      torch::NoGradGuard no_grad;
+      torch::Tensor norm = weight_v_.pow(2).sum({1, 2}, true).sqrt();
+      cached_weight_ = weight_v_ * weight_g_ / norm;
+    }
     return torch::conv1d(hidden_states,
-                         weight,
+                         cached_weight_,
                          bias_,
                          /*stride=*/{stride_},
                          /*padding=*/{padding_},
@@ -125,6 +134,7 @@ class WeightNormConv1dImpl final : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
+    cached_weight_ = torch::Tensor();
     weight::load_weight(state_dict, "weight_g", weight_g_, is_weight_g_loaded_);
     weight::load_weight(state_dict, "weight_v", weight_v_, is_weight_v_loaded_);
     if (bias_.defined()) {
@@ -148,6 +158,8 @@ class WeightNormConv1dImpl final : public torch::nn::Module {
   int64_t dilation_;
   torch::Tensor weight_g_;
   torch::Tensor weight_v_;
+  // Derived inference weights are rebuilt after loading or moving parameters.
+  mutable torch::Tensor cached_weight_;
   torch::Tensor bias_;
   bool is_weight_g_loaded_ = false;
   bool is_weight_v_loaded_ = false;
@@ -162,11 +174,18 @@ class Snake1dImpl final : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) const {
-    return hidden_states + torch::reciprocal(alpha_ + 1e-9) *
-                               torch::sin(alpha_ * hidden_states).pow(2);
+    if (!cached_alpha_reciprocal_.defined() ||
+        cached_alpha_reciprocal_.device() != alpha_.device() ||
+        cached_alpha_reciprocal_.scalar_type() != alpha_.scalar_type()) {
+      torch::NoGradGuard no_grad;
+      cached_alpha_reciprocal_ = torch::reciprocal(alpha_ + 1e-9);
+    }
+    return hidden_states +
+           cached_alpha_reciprocal_ * torch::sin(alpha_ * hidden_states).pow(2);
   }
 
   void load_state_dict(const StateDict& state_dict) {
+    cached_alpha_reciprocal_ = torch::Tensor();
     weight::load_weight(state_dict, "alpha", alpha_, is_alpha_loaded_);
   }
 
@@ -176,6 +195,7 @@ class Snake1dImpl final : public torch::nn::Module {
 
  private:
   torch::Tensor alpha_;
+  mutable torch::Tensor cached_alpha_reciprocal_;
   bool is_alpha_loaded_ = false;
 };
 TORCH_MODULE(Snake1d);
@@ -465,18 +485,35 @@ class CausalAttentionImpl final : public torch::nn::Module {
     torch::Tensor query = chunks[0].permute({0, 2, 1, 3});
     torch::Tensor key = chunks[1].permute({0, 2, 1, 3});
     torch::Tensor value = chunks[2].permute({0, 2, 1, 3});
-    torch::Tensor scores = torch::matmul(query, key.transpose(-2, -1)) /
-                           std::sqrt(static_cast<double>(head_dim_));
     torch::Tensor causal_mask = torch::ones({sequence_length, sequence_length},
                                             torch::TensorOptions()
                                                 .dtype(torch::kBool)
                                                 .device(hidden_states.device()))
                                     .triu(1);
+    torch::Tensor attended;
+#if defined(USE_NPU)
+    const auto results = at_npu::native::custom_ops::npu_fusion_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        num_heads_,
+        /*input_layout=*/"BNSD",
+        /*pse=*/torch::nullopt,
+        /*padding_mask=*/torch::nullopt,
+        causal_mask,
+        /*scale=*/1.0 / std::sqrt(static_cast<double>(head_dim_)),
+        /*keep_prob=*/1.0,
+        /*pre_tockens=*/sequence_length,
+        /*next_tockens=*/0);
+    attended = std::get<0>(results);
+#else
+    torch::Tensor scores = torch::matmul(query, key.transpose(-2, -1)) /
+                           std::sqrt(static_cast<double>(head_dim_));
     scores = scores.masked_fill(causal_mask,
                                 -std::numeric_limits<float>::infinity());
-    torch::Tensor attended = torch::matmul(torch::softmax(scores, -1), value)
-                                 .permute({0, 2, 1, 3})
-                                 .mean(2);
+    attended = torch::matmul(torch::softmax(scores, -1), value);
+#endif
+    attended = attended.permute({0, 2, 1, 3}).mean(2);
     attended = torch::adaptive_avg_pool1d(attended, {output_dim_});
     return proj_->forward(attended);
   }
@@ -639,10 +676,15 @@ class WeightNormConvTranspose1dImpl final : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) const {
-    torch::Tensor norm = weight_v_.pow(2).sum({1, 2}, true).sqrt();
-    torch::Tensor weight = weight_v_ * weight_g_ / norm;
+    if (!cached_weight_.defined() ||
+        cached_weight_.device() != weight_v_.device() ||
+        cached_weight_.scalar_type() != weight_v_.scalar_type()) {
+      torch::NoGradGuard no_grad;
+      torch::Tensor norm = weight_v_.pow(2).sum({1, 2}, true).sqrt();
+      cached_weight_ = weight_v_ * weight_g_ / norm;
+    }
     return torch::conv_transpose1d(hidden_states,
-                                   weight,
+                                   cached_weight_,
                                    bias_,
                                    /*stride=*/{stride_},
                                    /*padding=*/{padding_},
@@ -652,6 +694,7 @@ class WeightNormConvTranspose1dImpl final : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
+    cached_weight_ = torch::Tensor();
     weight::load_weight(state_dict, "weight_g", weight_g_, is_weight_g_loaded_);
     weight::load_weight(state_dict, "weight_v", weight_v_, is_weight_v_loaded_);
     weight::load_weight(state_dict, "bias", bias_, is_bias_loaded_);
@@ -670,6 +713,8 @@ class WeightNormConvTranspose1dImpl final : public torch::nn::Module {
   int64_t padding_;
   torch::Tensor weight_g_;
   torch::Tensor weight_v_;
+  // Derived inference weights are rebuilt after loading or moving parameters.
+  mutable torch::Tensor cached_weight_;
   torch::Tensor bias_;
   bool is_weight_g_loaded_ = false;
   bool is_weight_v_loaded_ = false;
@@ -685,13 +730,20 @@ class SnakeBetaImpl final : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) const {
-    torch::Tensor alpha = torch::exp(alpha_.view({1, -1, 1}));
-    torch::Tensor beta = torch::exp(beta_.view({1, -1, 1}));
-    return hidden_states + torch::reciprocal(beta + 1e-9) *
-                               torch::sin(alpha * hidden_states).pow(2);
+    if (!cached_alpha_.defined() || cached_alpha_.device() != alpha_.device() ||
+        cached_alpha_.scalar_type() != alpha_.scalar_type()) {
+      torch::NoGradGuard no_grad;
+      cached_alpha_ = torch::exp(alpha_.view({1, -1, 1}));
+      cached_beta_reciprocal_ =
+          torch::reciprocal(torch::exp(beta_.view({1, -1, 1})) + 1e-9);
+    }
+    return hidden_states + cached_beta_reciprocal_ *
+                               torch::sin(cached_alpha_ * hidden_states).pow(2);
   }
 
   void load_state_dict(const StateDict& state_dict) {
+    cached_alpha_ = torch::Tensor();
+    cached_beta_reciprocal_ = torch::Tensor();
     weight::load_weight(state_dict, "alpha", alpha_, is_alpha_loaded_);
     weight::load_weight(state_dict, "beta", beta_, is_beta_loaded_);
   }
@@ -704,6 +756,8 @@ class SnakeBetaImpl final : public torch::nn::Module {
  private:
   torch::Tensor alpha_;
   torch::Tensor beta_;
+  mutable torch::Tensor cached_alpha_;
+  mutable torch::Tensor cached_beta_reciprocal_;
   bool is_alpha_loaded_ = false;
   bool is_beta_loaded_ = false;
 };

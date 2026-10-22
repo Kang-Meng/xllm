@@ -18,6 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#if defined(USE_NPU)
+#include <torch_npu/csrc/aten/CustomFunctions.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -27,6 +31,7 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <numbers>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -35,6 +40,9 @@ limitations under the License.
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
+#if defined(USE_NPU)
+#include "core/kernels/npu/npu_ops_api.h"
+#endif
 #include "models/dit/transformers/transformer_minimax_h3.h"
 #include "models/model_registry.h"
 
@@ -517,18 +525,14 @@ class AttentionImpl final : public torch::nn::Module {
                 double norm_eps)
       : heads_(heads), head_dim_(head_dim), norm_eps_(norm_eps) {
     const int64_t inner_dim = heads_ * head_dim_;
-    to_q_ = register_module(
-        "to_q",
+    to_qkv_ = register_module(
+        "to_qkv",
         torch::nn::Linear(
-            torch::nn::LinearOptions(hidden_size, inner_dim).bias(true)));
-    to_k_ = register_module(
-        "to_k",
-        torch::nn::Linear(
-            torch::nn::LinearOptions(hidden_size, inner_dim).bias(true)));
-    to_v_ = register_module(
-        "to_v",
-        torch::nn::Linear(
-            torch::nn::LinearOptions(hidden_size, inner_dim).bias(true)));
+            torch::nn::LinearOptions(hidden_size, 3 * inner_dim).bias(true)));
+#if defined(USE_NPU)
+    qk_norm_weight_ =
+        register_buffer("qk_norm_weight", torch::ones({head_dim_}));
+#endif
     to_out_ = register_module(
         "to_out",
         torch::nn::Linear(
@@ -540,25 +544,48 @@ class AttentionImpl final : public torch::nn::Module {
                         const torch::Tensor& sin) {
     const int64_t batch_size = hidden_states.size(0);
     const int64_t sequence_length = hidden_states.size(1);
+    std::vector<torch::Tensor> qkv =
+        to_qkv_->forward(hidden_states).chunk(/*chunks=*/3, /*dim=*/-1);
     torch::Tensor query =
-        to_q_->forward(hidden_states)
-            .view({batch_size, sequence_length, heads_, head_dim_});
+        qkv[0].view({batch_size, sequence_length, heads_, head_dim_});
     torch::Tensor key =
-        to_k_->forward(hidden_states)
-            .view({batch_size, sequence_length, heads_, head_dim_});
+        qkv[1].view({batch_size, sequence_length, heads_, head_dim_});
     torch::Tensor value =
-        to_v_->forward(hidden_states)
-            .view({batch_size, sequence_length, heads_, head_dim_});
+        qkv[2].view({batch_size, sequence_length, heads_, head_dim_});
+#if defined(USE_NPU)
+    query = kernel::npu::rms_norm(
+        query.contiguous(), qk_norm_weight_, norm_eps_, /*mode=*/"rmsnorm");
+    key = kernel::npu::rms_norm(
+        key.contiguous(), qk_norm_weight_, norm_eps_, /*mode=*/"rmsnorm");
+#else
     query =
         minimax_h3::H3RMSNormImpl::rms_norm(query, torch::Tensor(), norm_eps_);
     key = minimax_h3::H3RMSNormImpl::rms_norm(key, torch::Tensor(), norm_eps_);
+#endif
     query = apply_rotary(query, cos, sin);
     key = apply_rotary(key, cos, sin);
     query = query.permute({0, 2, 1, 3}).contiguous();
     key = key.permute({0, 2, 1, 3}).contiguous();
     value = value.permute({0, 2, 1, 3}).contiguous();
+#if defined(USE_NPU)
+    const auto results = at_npu::native::custom_ops::npu_fusion_attention(
+        query,
+        key,
+        value,
+        heads_,
+        /*input_layout=*/"BNSD",
+        /*pse=*/torch::nullopt,
+        /*padding_mask=*/torch::nullopt,
+        /*atten_mask=*/torch::nullopt,
+        /*scale=*/1.0 / std::sqrt(static_cast<double>(head_dim_)),
+        /*keep_prob=*/1.0,
+        /*pre_tockens=*/sequence_length,
+        /*next_tockens=*/sequence_length);
+    torch::Tensor output = std::get<0>(results);
+#else
     torch::Tensor output = torch::scaled_dot_product_attention(
         query, key, value, torch::nullopt, 0.0, false);
+#endif
     output = output.permute({0, 2, 1, 3}).contiguous();
     output = output.view({batch_size, sequence_length, heads_ * head_dim_});
     output = to_out_->forward(output);
@@ -566,18 +593,27 @@ class AttentionImpl final : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    weight::load_weight(
-        state_dict, "to_q.weight", to_q_->weight, is_to_q_weight_loaded_);
-    weight::load_weight(
-        state_dict, "to_q.bias", to_q_->bias, is_to_q_bias_loaded_);
-    weight::load_weight(
-        state_dict, "to_k.weight", to_k_->weight, is_to_k_weight_loaded_);
-    weight::load_weight(
-        state_dict, "to_k.bias", to_k_->bias, is_to_k_bias_loaded_);
-    weight::load_weight(
-        state_dict, "to_v.weight", to_v_->weight, is_to_v_weight_loaded_);
-    weight::load_weight(
-        state_dict, "to_v.bias", to_v_->bias, is_to_v_bias_loaded_);
+    const int64_t inner_dim = heads_ * head_dim_;
+    // Copy each checkpoint tensor into its slice so shards can arrive
+    // separately.
+    const auto load_projection = [&](const std::string& name,
+                                     int64_t offset,
+                                     bool& weight_loaded,
+                                     bool& bias_loaded) {
+      torch::Tensor weight_slice =
+          to_qkv_->weight.narrow(/*dim=*/0, offset, inner_dim);
+      torch::Tensor bias_slice =
+          to_qkv_->bias.narrow(/*dim=*/0, offset, inner_dim);
+      weight::load_weight(
+          state_dict, name + ".weight", weight_slice, weight_loaded);
+      weight::load_weight(state_dict, name + ".bias", bias_slice, bias_loaded);
+    };
+    load_projection(
+        "to_q", /*offset=*/0, is_to_q_weight_loaded_, is_to_q_bias_loaded_);
+    load_projection(
+        "to_k", inner_dim, is_to_k_weight_loaded_, is_to_k_bias_loaded_);
+    load_projection(
+        "to_v", 2 * inner_dim, is_to_v_weight_loaded_, is_to_v_bias_loaded_);
     weight::load_weight(state_dict,
                         "to_out.0.weight",
                         to_out_->weight,
@@ -609,9 +645,10 @@ class AttentionImpl final : public torch::nn::Module {
   int64_t heads_;
   int64_t head_dim_;
   double norm_eps_;
-  torch::nn::Linear to_q_{nullptr};
-  torch::nn::Linear to_k_{nullptr};
-  torch::nn::Linear to_v_{nullptr};
+  torch::nn::Linear to_qkv_{nullptr};
+#if defined(USE_NPU)
+  torch::Tensor qk_norm_weight_;
+#endif
   torch::nn::Linear to_out_{nullptr};
   bool is_to_q_weight_loaded_ = false;
   bool is_to_q_bias_loaded_ = false;
@@ -639,18 +676,38 @@ class FeedForwardImpl final : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& hidden_states) {
     torch::Tensor fused = proj_in_->forward(hidden_states);
+#if defined(USE_NPU)
+    torch::Tensor activated = kernel::npu::active(fused, /*act_mode=*/"swiglu");
+#else
     std::vector<torch::Tensor> chunks = fused.chunk(2, -1);
     torch::Tensor activated = chunks[0] * torch::silu(chunks[1]);
+#endif
     return proj_out_->forward(activated);
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    weight::load_weight(state_dict,
-                        "net.0.proj.weight",
-                        proj_in_->weight,
-                        is_proj_in_weight_loaded_);
+#if defined(USE_NPU)
+    // NPU SwiGLU expects [gate, up]; reorder both weight and bias from [up,
+    // gate].
+    const StateDict proj_in_state = state_dict.get_dict_with_prefix(
+        "net.0.proj.",
+        [](const std::string& name,
+           const torch::Tensor& tensor) -> torch::Tensor {
+          if (name != "weight" && name != "bias") {
+            return tensor;
+          }
+          const std::vector<torch::Tensor> chunks =
+              tensor.chunk(/*chunks=*/2, /*dim=*/0);
+          return torch::cat({chunks[1], chunks[0]}, /*dim=*/0);
+        });
+#else
+    const StateDict proj_in_state =
+        state_dict.get_dict_with_prefix("net.0.proj.");
+#endif
     weight::load_weight(
-        state_dict, "net.0.proj.bias", proj_in_->bias, is_proj_in_bias_loaded_);
+        proj_in_state, "weight", proj_in_->weight, is_proj_in_weight_loaded_);
+    weight::load_weight(
+        proj_in_state, "bias", proj_in_->bias, is_proj_in_bias_loaded_);
     weight::load_weight(state_dict,
                         "net.2.weight",
                         proj_out_->weight,
@@ -702,12 +759,22 @@ class TransformerBlockImpl final : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const torch::Tensor& cos,
                         const torch::Tensor& sin) {
+#if defined(USE_NPU)
+    torch::Tensor normalized = kernel::npu::rms_norm(
+        hidden_states, norm1_weight_, norm_eps_, /*mode=*/"rmsnorm");
+#else
     torch::Tensor normalized = minimax_h3::H3RMSNormImpl::rms_norm(
         hidden_states, norm1_weight_, norm_eps_);
+#endif
     torch::Tensor output =
         hidden_states + attention_->forward(normalized, cos, sin) * scale1_;
+#if defined(USE_NPU)
+    normalized = kernel::npu::rms_norm(
+        output, norm2_weight_, norm_eps_, /*mode=*/"rmsnorm");
+#else
     normalized =
         minimax_h3::H3RMSNormImpl::rms_norm(output, norm2_weight_, norm_eps_);
+#endif
     output = output + feed_forward_->forward(normalized) * scale2_;
     return output;
   }
@@ -826,39 +893,48 @@ class ViTDecoder3dImpl final : public torch::nn::Module {
     hidden_states =
         torch::cat({hidden_states, register_tokens, class_token}, 1);
 
-    torch::TensorOptions position_options =
-        torch::TensorOptions().dtype(torch::kFloat32).device(latent.device());
-    torch::Tensor grid_t =
-        2.0 *
-            (torch::arange(
-                 0.5, static_cast<double>(num_frames), 1.0, position_options) /
-             static_cast<double>(num_frames)) -
-        1.0;
-    torch::Tensor grid_h =
-        2.0 * (torch::arange(
-                   0.5, static_cast<double>(height), 1.0, position_options) /
-               static_cast<double>(height)) -
-        1.0;
-    torch::Tensor grid_w =
-        2.0 * (torch::arange(
-                   0.5, static_cast<double>(width), 1.0, position_options) /
-               static_cast<double>(width)) -
-        1.0;
-    torch::Tensor position_ids = torch::stack(
-        {grid_t.view({num_frames, 1, 1}).expand({num_frames, height, width}),
-         grid_h.view({1, height, 1}).expand({num_frames, height, width}),
-         grid_w.view({1, 1, width}).expand({num_frames, height, width})},
-        -1);
-    position_ids =
-        position_ids.reshape({1, num_patches, 3}).expand({batch_size, -1, -1});
-    torch::Tensor suffix = torch::zeros(
-        {batch_size, register_tokens_count_ + 1, 3}, position_options);
-    position_ids = torch::cat({position_ids, suffix}, 1);
-    std::pair<torch::Tensor, torch::Tensor> rotary =
-        rope_->forward(position_ids);
+    const std::array<int64_t, 5> rotary_shape = {
+        batch_size, latent_channels_, num_frames, height, width};
+    if (!rotary_cos_.defined() || rotary_shape_ != rotary_shape ||
+        rotary_cos_.device() != latent.device() ||
+        rotary_dtype_ != latent.scalar_type()) {
+      torch::NoGradGuard no_grad;
+      torch::TensorOptions position_options =
+          torch::TensorOptions().dtype(torch::kFloat32).device(latent.device());
+      torch::Tensor grid_t =
+          2.0 * (torch::arange(0.5,
+                               static_cast<double>(num_frames),
+                               1.0,
+                               position_options) /
+                 static_cast<double>(num_frames)) -
+          1.0;
+      torch::Tensor grid_h =
+          2.0 * (torch::arange(
+                     0.5, static_cast<double>(height), 1.0, position_options) /
+                 static_cast<double>(height)) -
+          1.0;
+      torch::Tensor grid_w =
+          2.0 * (torch::arange(
+                     0.5, static_cast<double>(width), 1.0, position_options) /
+                 static_cast<double>(width)) -
+          1.0;
+      torch::Tensor position_ids = torch::stack(
+          {grid_t.view({num_frames, 1, 1}).expand({num_frames, height, width}),
+           grid_h.view({1, height, 1}).expand({num_frames, height, width}),
+           grid_w.view({1, 1, width}).expand({num_frames, height, width})},
+          -1);
+      position_ids = position_ids.reshape({1, num_patches, 3})
+                         .expand({batch_size, -1, -1});
+      torch::Tensor suffix = torch::zeros(
+          {batch_size, register_tokens_count_ + 1, 3}, position_options);
+      position_ids = torch::cat({position_ids, suffix}, 1);
+      std::tie(rotary_cos_, rotary_sin_) = rope_->forward(position_ids);
+      rotary_shape_ = rotary_shape;
+      rotary_dtype_ = latent.scalar_type();
+    }
     for (size_t layer = 0; layer < blocks_->size(); ++layer) {
       hidden_states = blocks_[layer]->as<TransformerBlock>()->forward(
-          hidden_states, rotary.first, rotary.second);
+          hidden_states, rotary_cos_, rotary_sin_);
     }
     hidden_states = norm_out_->forward(hidden_states);
     hidden_states = proj_out_->forward(hidden_states);
@@ -882,6 +958,8 @@ class ViTDecoder3dImpl final : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
+    rotary_cos_ = torch::Tensor();
+    rotary_sin_ = torch::Tensor();
     weight::load_weight(state_dict,
                         "proj_in.weight",
                         proj_in_->weight,
@@ -956,6 +1034,10 @@ class ViTDecoder3dImpl final : public torch::nn::Module {
   double rope_theta_ = 100.0;
   double norm_eps_ = 1e-5;
   RotaryPosEmbed rope_{nullptr};
+  std::array<int64_t, 5> rotary_shape_{};
+  torch::ScalarType rotary_dtype_ = torch::kFloat32;
+  torch::Tensor rotary_cos_;
+  torch::Tensor rotary_sin_;
   torch::nn::Linear proj_in_{nullptr};
   torch::Tensor register_tokens_;
   torch::nn::ModuleList blocks_{nullptr};
@@ -1022,21 +1104,10 @@ class AutoencoderKLMiniMaxH3Impl final : public torch::nn::Module {
     CHECK_EQ(pixels.size(0), 1);
     CHECK_EQ(pixels.size(1), 3);
     CHECK_GT(pixels.size(2), 0);
-    torch::Tensor pixel_mean =
-        torch::tensor(
-            std::vector<float>(pixel_mean_.begin(), pixel_mean_.end()),
-            torch::TensorOptions()
-                .dtype(torch::kFloat32)
-                .device(pixels.device()))
-            .view({1, 3, 1, 1, 1});
-    torch::Tensor pixel_std =
-        torch::tensor(std::vector<float>(pixel_std_.begin(), pixel_std_.end()),
-                      torch::TensorOptions()
-                          .dtype(torch::kFloat32)
-                          .device(pixels.device()))
-            .view({1, 3, 1, 1, 1});
+    prepare_normalization_tensors(pixels.device());
     torch::Tensor normalized_pixels =
-        (pixels.to(torch::kFloat32) / 255.0 - pixel_mean) / pixel_std;
+        (pixels.to(torch::kFloat32) / 255.0 - pixel_mean_tensor_) /
+        pixel_std_tensor_;
     torch::Tensor moments = encode_moments(normalized_pixels);
     std::vector<torch::Tensor> chunks = moments.chunk(/*chunks=*/2, /*dim=*/1);
     torch::Tensor mean = chunks[0];
@@ -1052,17 +1123,7 @@ class AutoencoderKLMiniMaxH3Impl final : public torch::nn::Module {
             .to(mean.device());
     torch::Tensor latent = mean + torch::exp(0.5 * logvar) * noise;
     latent = latent.to(torch::kFloat16).to(torch::kFloat32);
-    torch::Tensor latents_mean = torch::tensor(latents_mean_,
-                                               torch::TensorOptions()
-                                                   .dtype(torch::kFloat32)
-                                                   .device(latent.device()))
-                                     .view({1, -1, 1, 1, 1});
-    torch::Tensor latents_std = torch::tensor(latents_std_,
-                                              torch::TensorOptions()
-                                                  .dtype(torch::kFloat32)
-                                                  .device(latent.device()))
-                                    .view({1, -1, 1, 1, 1});
-    return ((latent - latents_mean) / latents_std).contiguous();
+    return ((latent - latents_mean_tensor_) / latents_std_tensor_).contiguous();
   }
 
   torch::Tensor decode(const torch::Tensor& latent) {
@@ -1126,6 +1187,10 @@ class AutoencoderKLMiniMaxH3Impl final : public torch::nn::Module {
 
   void load_model(std::unique_ptr<DiTFolderLoader> loader) {
     CHECK(loader != nullptr) << "MiniMax-H3 video VAE loader must not be null";
+    pixel_mean_tensor_ = torch::Tensor();
+    pixel_std_tensor_ = torch::Tensor();
+    latents_mean_tensor_ = torch::Tensor();
+    latents_std_tensor_ = torch::Tensor();
     load_config(loader->model_weights_path() + "/config.json");
     for (const auto& state_dict : loader->get_state_dicts()) {
       encoder_->load_state_dict(state_dict->get_dict_with_prefix("encoder."));
@@ -1154,6 +1219,32 @@ class AutoencoderKLMiniMaxH3Impl final : public torch::nn::Module {
   int64_t token_drop() const { return token_drop_; }
 
  private:
+  void prepare_normalization_tensors(const torch::Device& device) {
+    if (pixel_mean_tensor_.defined() && pixel_mean_tensor_.device() == device) {
+      return;
+    }
+    pixel_mean_tensor_ =
+        torch::tensor(
+            std::vector<float>(pixel_mean_.begin(), pixel_mean_.end()),
+            torch::TensorOptions().dtype(torch::kFloat32).device(device))
+            .view({1, 3, 1, 1, 1});
+    pixel_std_tensor_ =
+        torch::tensor(
+            std::vector<float>(pixel_std_.begin(), pixel_std_.end()),
+            torch::TensorOptions().dtype(torch::kFloat32).device(device))
+            .view({1, 3, 1, 1, 1});
+    latents_mean_tensor_ =
+        torch::tensor(
+            latents_mean_,
+            torch::TensorOptions().dtype(torch::kFloat32).device(device))
+            .view({1, -1, 1, 1, 1});
+    latents_std_tensor_ =
+        torch::tensor(
+            latents_std_,
+            torch::TensorOptions().dtype(torch::kFloat32).device(device))
+            .view({1, -1, 1, 1, 1});
+  }
+
   struct TileLayout {
     std::vector<int64_t> starts;
     std::vector<int64_t> lengths;
@@ -1447,6 +1538,10 @@ class AutoencoderKLMiniMaxH3Impl final : public torch::nn::Module {
   int64_t token_drop_ = 0;
   std::vector<double> latents_mean_;
   std::vector<double> latents_std_;
+  torch::Tensor pixel_mean_tensor_;
+  torch::Tensor pixel_std_tensor_;
+  torch::Tensor latents_mean_tensor_;
+  torch::Tensor latents_std_tensor_;
 };
 TORCH_MODULE(AutoencoderKLMiniMaxH3);
 
