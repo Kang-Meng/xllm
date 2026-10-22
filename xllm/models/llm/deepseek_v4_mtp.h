@@ -355,7 +355,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
         // pair it with the global table of the same ratio for the KV path.
         auto& dsa = *(modified_input_params.attn_metadata->dsa_metadata);
         auto [kv_cos, kv_sin] =
-            cp_ctx.global_rope(deepseek_v4_normalize_compress_ratio(
+            cp_ctx.global_rope(util::deepseek_v4_normalize_compress_ratio(
                 (layer_id <
                  static_cast<int32_t>(model_args_.compress_ratios().size()))
                     ? model_args_
@@ -469,7 +469,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
                     {DSACacheType::TOKEN, 128, c128_physical_dim}};
     caches_info_.assign(static_cast<size_t>(model_args_.n_layers()), {});
     for (int32_t layer_id = 0; layer_id < model_args_.n_layers(); ++layer_id) {
-      const int32_t cr = deepseek_v4_normalize_compress_ratio(
+      const int32_t cr = util::deepseek_v4_normalize_compress_ratio(
           layer_id < static_cast<int32_t>(model_args_.compress_ratios().size())
               ? model_args_.compress_ratios()[static_cast<size_t>(layer_id)]
               : 1);
@@ -1064,10 +1064,12 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     auto& dsa = *(attn_metadata.dsa_metadata);
     dsa.layer_id = layer_id;
 
-    const int32_t layer_compress_ratio = deepseek_v4_normalize_compress_ratio(
-        (layer_id < static_cast<int32_t>(model_args_.compress_ratios().size()))
-            ? model_args_.compress_ratios()[static_cast<size_t>(layer_id)]
-            : 1);
+    const int32_t layer_compress_ratio =
+        util::deepseek_v4_normalize_compress_ratio(
+            (layer_id <
+             static_cast<int32_t>(model_args_.compress_ratios().size()))
+                ? model_args_.compress_ratios()[static_cast<size_t>(layer_id)]
+                : 1);
 
     if (layer_compress_ratio == 4 && dsa.c4_cos.defined()) {
       dsa.cos = dsa.c4_cos;

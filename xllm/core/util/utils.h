@@ -222,6 +222,17 @@ inline bool is_deepseek_v4_model_type(std::string_view model_type) {
          is_target_mtp_model_type(model_type, kDeepseekV4ModelType);
 }
 
+// Semantic contract for DeepSeek-V4 compress ratios shared by the target
+// loader chain (models/llm/deepseek_v4.h) and the DSpark draft config
+// (core/runtime/draft_model_config.cpp): pure SWA is encoded as ratio 0 in
+// V4.1 checkpoints and as ratio 1 in V4, while the C++ DSAttention
+// constructor only accepts {1, 4, 128}. Any consumer that feeds ratios into
+// the C++ V4 attention path must map <= 1 to 1 through this helper; only the
+// python V4.1 draft keeps the checkpoint's raw 0 encoding.
+inline int32_t deepseek_v4_normalize_compress_ratio(int32_t ratio) {
+  return ratio <= 1 ? 1 : ratio;
+}
+
 // Returns whether a model's KV cache can be transferred between different TP
 // sizes without concatenating TP-local head shards. This is a PD cache-layout
 // capability, not an attention-runtime classification: DeepSeek-V4 DSA has

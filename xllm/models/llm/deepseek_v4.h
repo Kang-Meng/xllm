@@ -46,6 +46,7 @@ limitations under the License.
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
 #include "core/util/tensor_helper.h"
+#include "core/util/utils.h"
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
 #include "layers/npu_torch/deepseek_v4_cp_context.h"
 #include "llm_model_base.h"
@@ -339,10 +340,6 @@ class DSAGroupKeyHash {
   }
 };
 
-inline int32_t deepseek_v4_normalize_compress_ratio(int32_t ratio) {
-  return ratio <= 1 ? 1 : ratio;
-}
-
 inline void deepseek_v4_build_cache_specs(
     const ModelArgs& model_args,
     std::vector<std::vector<DSACacheInfo>>& caches_info,
@@ -375,7 +372,7 @@ inline void deepseek_v4_build_cache_specs(
 
   register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
   for (const int32_t ratio : compress_ratios) {
-    const int32_t cr = deepseek_v4_normalize_compress_ratio(ratio);
+    const int32_t cr = util::deepseek_v4_normalize_compress_ratio(ratio);
     if (cr == 4 || cr == 128) {
       register_group(
           DSACacheType::TOKEN,
@@ -389,7 +386,7 @@ inline void deepseek_v4_build_cache_specs(
     int32_t cr = (layer_id < static_cast<int32_t>(compress_ratios.size()))
                      ? compress_ratios[layer_id]
                      : 1;
-    cr = deepseek_v4_normalize_compress_ratio(cr);
+    cr = util::deepseek_v4_normalize_compress_ratio(cr);
 
     struct CacheEntry {
       DSACacheType type;
@@ -562,7 +559,7 @@ class DeepseekV4ModelImpl
     // 2) token managers in first-seen compress_ratio order
     register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
     for (const auto ratio : compress_ratios) {
-      const int32_t cr = deepseek_v4_normalize_compress_ratio(ratio);
+      const int32_t cr = util::deepseek_v4_normalize_compress_ratio(ratio);
       if (cr == 4 || cr == 128) {
         register_group(
             DSACacheType::TOKEN,
@@ -577,7 +574,7 @@ class DeepseekV4ModelImpl
       int32_t cr = (layer_id < static_cast<int32_t>(compress_ratios.size()))
                        ? compress_ratios[layer_id]
                        : 1;
-      cr = deepseek_v4_normalize_compress_ratio(cr);
+      cr = util::deepseek_v4_normalize_compress_ratio(cr);
       // Build per-layer cache specs based on compress_ratio
       struct CacheEntry {
         DSACacheType type;
@@ -943,7 +940,7 @@ class DeepseekV4ModelImpl
         // to 1.
         dsa.layer_id = layer_id;
         const int32_t layer_compress_ratio =
-            deepseek_v4_normalize_compress_ratio(
+            util::deepseek_v4_normalize_compress_ratio(
                 (layer_id <
                  static_cast<int32_t>(model_args_.compress_ratios().size()))
                     ? model_args_
@@ -2168,7 +2165,8 @@ inline void normalize_deepseek_v4_args(ModelArgs* args) {
     auto& ratios = args->compress_ratios();
     for (int64_t i = 0; i < args->n_layers(); ++i) {
       ratios[static_cast<size_t>(i)] =
-          deepseek_v4_normalize_compress_ratio(ratios[static_cast<size_t>(i)]);
+          util::deepseek_v4_normalize_compress_ratio(
+              ratios[static_cast<size_t>(i)]);
     }
   }
 }

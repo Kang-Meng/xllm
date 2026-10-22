@@ -59,9 +59,13 @@ void apply_dflash2_runtime_block_size(ModelArgs& args,
 }
 
 #if defined(USE_NPU)
+// `python_v41_draft` must mirror the draft model_type selection below: it is
+// true exactly when the draft resolves the python DeepseekV41DSparkForCausalLM
+// class, and every other DSpark draft (any checkpoint generation under the
+// native executor) resolves the C++ TORCH deepseek_v4_dspark model.
 void configure_deepseek_v4_dspark_args(ModelArgs& args,
                                        const runtime::Options& options,
-                                       bool v41_draft) {
+                                       bool python_v41_draft) {
   CHECK_GT(args.dspark_num_layers(), 0)
       << "DeepSeek-V4 DSpark requires at least one draft layer.";
   // The checkpoint lists the decoder layers first and appends the draft stages,
@@ -86,11 +90,22 @@ void configure_deepseek_v4_dspark_args(ModelArgs& args,
   // checkpoint appends one entry per draft stage to compress_ratios
   // (V4.1-Flash ships 40 decoder + 3 draft entries, the trailing three zero),
   // so prefer that tail when the config actually carries it and fall back to
-  // the family-default pure-SWA ratio otherwise.
+  // the family-default pure-SWA ratio otherwise. The C++ TORCH
+  // deepseek_v4_dspark model constructs DSAttentionImpl per layer, whose
+  // constructor rejects any compress ratio outside {1, 4, 128}
+  // (deepseek_sparse_attention.cpp); unlike the target loader chain
+  // (normalize_deepseek_v4_args), nothing else normalizes the draft's ratios.
+  // Normalize the tail through the shared deepseek_v4_normalize_compress_ratio
+  // contract whenever the draft takes the C++ path -- including a V4.1
+  // checkpoint under a non-python model_impl, whose draft still resolves the
+  // C++ deepseek_v4_dspark model. Only the python-path V4.1 draft keeps the
+  // checkpoint's 0 encoding: its attention treats 0 as a distinct SWA group
+  // identity.
   const size_t draft_layer_count =
       static_cast<size_t>(args.dspark_num_layers());
-  std::vector<int32_t> draft_compress_ratios(draft_layer_count,
-                                             /*value=*/v41_draft ? 0 : 1);
+  std::vector<int32_t> draft_compress_ratios(
+      draft_layer_count,
+      /*value=*/python_v41_draft ? 0 : 1);
   const std::vector<int32_t>& ckpt_compress_ratios = args.compress_ratios();
   bool compress_ratios_from_ckpt = false;
   if (ckpt_compress_ratios.size() ==
@@ -99,17 +114,23 @@ void configure_deepseek_v4_dspark_args(ModelArgs& args,
               ckpt_compress_ratios.end(),
               draft_compress_ratios.begin());
     compress_ratios_from_ckpt = true;
+    if (!python_v41_draft) {
+      std::transform(draft_compress_ratios.begin(),
+                     draft_compress_ratios.end(),
+                     draft_compress_ratios.begin(),
+                     util::deepseek_v4_normalize_compress_ratio);
+    }
   } else if (!ckpt_compress_ratios.empty()) {
     LOG(WARNING) << "DSpark draft compress_ratios size "
                  << ckpt_compress_ratios.size() << " != decoder_layers("
                  << decoder_layers << ") + draft_layers(" << draft_layer_count
                  << "); falling back to the family default ("
-                 << (v41_draft ? 0 : 1) << ") for all draft layers.";
+                 << (python_v41_draft ? 0 : 1) << ") for all draft layers.";
   }
   LOG(INFO) << "DSpark draft compress_ratios=["
             << absl::StrJoin(draft_compress_ratios, ",") << "] over "
-            << draft_layer_count << " draft layers (v41=" << v41_draft
-            << ", from "
+            << draft_layer_count
+            << " draft layers (python_v41=" << python_v41_draft << ", from "
             << (compress_ratios_from_ckpt ? "checkpoint tail"
                                           : "fallback default")
             << ")";
@@ -282,6 +303,15 @@ void configure_block_diffusion_model(ModelArgs& args,
   const bool is_deepseek_v41_dspark =
       is_deepseek_v4_dspark &&
       util::is_deepseek_v41_model_type(args.model_type());
+  // Both decisions below -- the draft model_type override and the draft
+  // compress-ratio encoding -- must consume the same predicate: a V4.1
+  // checkpoint under a non-python model_impl still resolves the C++ TORCH
+  // deepseek_v4_dspark model, so its draft tail must be normalized too
+  // instead of keeping the 0 encoding that fails DSAttention's
+  // {1, 4, 128} CHECK at layer 0.
+  const bool python_model_impl = ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl());
+  const bool python_v41_draft = python_model_impl && is_deepseek_v41_dspark;
   std::string draft_model_type = std::string(kDFlashDraftModelType);
   if (is_dspark) {
     draft_model_type = std::string(kDSparkDraftModelType);
@@ -297,9 +327,7 @@ void configure_block_diffusion_model(ModelArgs& args,
     // deepseek_v41_dspark and DeepseekV4DSparkForCausalLM (V4 draft) as
     // deepseek_v4_dspark, so the python path routes by checkpoint
     // generation -- only a V4.1 DSpark draft takes the V4.1 class.
-    const bool python_model_impl = ModelConfig::is_python_model_impl(
-        ModelConfig::get_instance().model_impl());
-    draft_model_type = python_model_impl && is_deepseek_v41_dspark
+    draft_model_type = python_v41_draft
                            ? std::string(util::kDeepseekV41DSparkModelType)
                            : std::string(util::kDeepseekV4DSparkModelType);
   }
@@ -311,7 +339,7 @@ void configure_block_diffusion_model(ModelArgs& args,
   args.requires_eager_execution(!is_deepseek_v4_dspark);
 #if defined(USE_NPU)
   if (is_deepseek_v4_dspark) {
-    configure_deepseek_v4_dspark_args(args, options, is_deepseek_v41_dspark);
+    configure_deepseek_v4_dspark_args(args, options, python_v41_draft);
   }
 #endif
 }

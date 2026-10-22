@@ -24,6 +24,8 @@ limitations under the License.
 #include <string_view>
 #include <vector>
 
+#include "core/common/global_flags.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/runtime/options.h"
 #include "core/util/json_reader.h"
@@ -407,6 +409,170 @@ TEST(DraftModelConfigTest, PreservesNpuCheckpointBlockGeometry) {
   EXPECT_EQ(args.num_speculative_tokens(), 7);
   EXPECT_EQ(args.dummy_token_count(), 8);
   EXPECT_EQ(args.model_type(), "DFlash2DraftModel");
+}
+
+namespace {
+
+// Fixed inputs shared by the DSpark draft-geometry tests: a 40-decoder V4
+// checkpoint whose compress_ratios carries 43 entries -- 40 decoder ratios
+// plus a three-entry draft tail encoded V4.1-style as 0 (pure SWA) -- plus
+// the DSpark draft fields the config reader consumes. The config file on
+// disk stays required even though ModelArgs carries the same geometry
+// in memory: configure_deepseek_v4_dspark_args re-reads config.json for the
+// draft block size (read_block_size), mirroring how the deployment loader
+// points options.model_path() at the real checkpoint directory.
+bool write_v4_dspark_config(const std::string& model_path) {
+  std::ofstream file(model_path + "/config.json");
+  if (!file.is_open()) {
+    return false;
+  }
+  file << R"json({
+    "model_type": "deepseek_v4",
+    "num_hidden_layers": 40,
+    "compress_ratios": [1, 4, 128, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "dspark_block_size": 5,
+    "dspark_markov_rank": 256,
+    "dspark_noise_token_id": 128799,
+    "dspark_target_layer_ids": [40, 41, 42]
+  })json";
+  return file.good();
+}
+
+// RAII guard for the process-wide model_impl selection. The draft
+// model_type override consults both FLAGS_model_impl and the cached
+// ModelConfig singleton, so the guard saves and restores both values
+// directly (never re-deriving them via from_flags(), which would rewrite
+// every ModelConfig field and clobber state other tests rely on). Without
+// it, an ASSERT_* early return would leave the process on "python" and
+// silently reroute later tests through the python draft path.
+class ModelImplGuard final {
+ public:
+  explicit ModelImplGuard(const std::string& model_impl) {
+    old_flag_ = FLAGS_model_impl;
+    old_config_impl_ = ModelConfig::get_instance().model_impl();
+    FLAGS_model_impl = model_impl;
+    ModelConfig::get_instance().model_impl(model_impl);
+  }
+
+  ModelImplGuard(const ModelImplGuard&) = delete;
+  ModelImplGuard& operator=(const ModelImplGuard&) = delete;
+
+  ~ModelImplGuard() {
+    FLAGS_model_impl = old_flag_;
+    ModelConfig::get_instance().model_impl(old_config_impl_);
+  }
+
+ private:
+  std::string old_flag_;
+  std::string old_config_impl_;
+};
+
+}  // namespace
+
+// The C++ deepseek_v4_dspark draft constructs DSAttentionImpl per layer, and
+// its constructor CHECKs the layer's compress ratio against {1, 4, 128}. A V4
+// checkpoint that encodes its trailing draft-stage entries as 0 (the V4.1
+// pure-SWA spelling) must therefore have the checkpoint-tail ratios
+// normalized to 1 for the V4 draft, instead of passing the raw 0 through and
+// failing at layer 0.
+TEST(DraftModelConfigTest, NormalizesV4DraftTailZeroCompressRatios) {
+  const std::string model_path =
+      testing::TempDir() + "xllm-draft-v4-dspark-ratios";
+  std::filesystem::remove_all(model_path);
+  ASSERT_TRUE(std::filesystem::create_directories(model_path));
+  ASSERT_TRUE(write_v4_dspark_config(model_path));
+
+  ModelArgs args;
+  args.model_type("deepseek_v4")
+      .n_layers(40)
+      .dspark_num_layers(3)
+      .compress_ratios({1, 4, 128, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 0, 0, 0});
+  runtime::Options options;
+  options.is_draft_engine(true).speculative_algorithm("DSpark").model_path(
+      model_path);
+
+  configure_block_diffusion_model(args, options);
+
+  ASSERT_EQ(args.compress_ratios().size(), 3U);
+  for (const int32_t ratio : args.compress_ratios()) {
+    EXPECT_TRUE(ratio == 1 || ratio == 4 || ratio == 128)
+        << "DSpark draft ratio " << ratio
+        << " must satisfy DSAttention's compress_ratio CHECK";
+  }
+  EXPECT_EQ(args.compress_ratios(), (std::vector<int32_t>{1, 1, 1}))
+      << "V4.1-style 0 draft tail must normalize to pure-SWA ratio 1 for the "
+         "C++ V4 draft";
+  EXPECT_EQ(args.model_type(), "deepseek_v4_dspark");
+}
+
+// The V4.1 python-path draft keeps the checkpoint's 0 pure-SWA encoding: its
+// attention path treats 0 as a distinct SWA group identity, so the tail must
+// be copied verbatim. The python-path draft is only selected when the
+// executor's model_impl is python, so the guard pins the selection for the
+// duration of the test and restores both the flag and the cached
+// ModelConfig value even on early returns.
+TEST(DraftModelConfigTest, PreservesV41DraftTailZeroCompressRatios) {
+  const ModelImplGuard model_impl_guard("python");
+  const std::string model_path =
+      testing::TempDir() + "xllm-draft-v41-dspark-ratios";
+  std::filesystem::remove_all(model_path);
+  ASSERT_TRUE(std::filesystem::create_directories(model_path));
+  ASSERT_TRUE(write_v4_dspark_config(model_path));
+
+  ModelArgs args;
+  args.model_type("deepseek_v41")
+      .n_layers(40)
+      .dspark_num_layers(3)
+      .compress_ratios({1, 4, 128, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 0, 0, 0});
+  runtime::Options options;
+  options.is_draft_engine(true).speculative_algorithm("DSpark").model_path(
+      model_path);
+
+  configure_block_diffusion_model(args, options);
+
+  EXPECT_EQ(args.compress_ratios(), (std::vector<int32_t>{0, 0, 0}))
+      << "V4.1 draft keeps the checkpoint's 0 pure-SWA encoding verbatim";
+  EXPECT_EQ(args.model_type(), "deepseek_v41_dspark");
+}
+
+// A V4.1 DSpark checkpoint under a non-python model_impl resolves the C++
+// deepseek_v4_dspark draft (see the model_type override in
+// configure_block_diffusion_model), so the 0-encoded tail must be
+// normalized to 1 exactly like a V4 checkpoint. The normalization decision
+// follows the resolved draft model type, not the checkpoint generation:
+// otherwise the combination would carry a 0 ratio into DSAttentionImpl's
+// {1, 4, 128} CHECK and crash at layer 0.
+TEST(DraftModelConfigTest, NormalizesV41DraftTailForNativeImpl) {
+  const ModelImplGuard model_impl_guard("TORCH");
+  const std::string model_path =
+      testing::TempDir() + "xllm-draft-v41-native-dspark-ratios";
+  std::filesystem::remove_all(model_path);
+  ASSERT_TRUE(std::filesystem::create_directories(model_path));
+  ASSERT_TRUE(write_v4_dspark_config(model_path));
+
+  ModelArgs args;
+  args.model_type("deepseek_v41")
+      .n_layers(40)
+      .dspark_num_layers(3)
+      .compress_ratios({1, 4, 128, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 0, 0, 0});
+  runtime::Options options;
+  options.is_draft_engine(true).speculative_algorithm("DSpark").model_path(
+      model_path);
+
+  configure_block_diffusion_model(args, options);
+
+  EXPECT_EQ(args.compress_ratios(), (std::vector<int32_t>{1, 1, 1}))
+      << "A V4.1 checkpoint on the native impl takes the C++ V4 draft, whose "
+         "0-encoded tail must normalize to the pure-SWA ratio 1";
+  EXPECT_EQ(args.model_type(), "deepseek_v4_dspark");
 }
 #endif
 
