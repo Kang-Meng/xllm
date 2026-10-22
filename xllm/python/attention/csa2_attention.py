@@ -29,13 +29,16 @@ DeepSeek-V4.1 is NPU-only (no CPU/CUDA fallback). The decode ACL-graph path
 routes through the official fused ops, selected by their static guards and
 registration state (no env gating): ``quant_lightning_indexer_v2_va``
 (QLI v3) replaces the indexer chain, and the interleaved RoPE has a fused
-partial-rotary path. The model owns all weights; the backend only
+partial-rotary path. On A3, BF16 sparse attention uses the migrated DSV4.1
+SMLA kernel; the reference implementation remains available for other shapes
+and numerical validation. The model owns all weights; the backend only
 orchestrates caches and math.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any, Sequence
 
 import torch
@@ -57,6 +60,7 @@ from xllm.python.attention.dsa_metadata import (
     last_ring_writes,
 )
 from xllm.python.model_executor.dsa_cp import DsaCpContext, get_current_dsa_cp_runtime
+from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.models.deepseek_v41 import (
     V41_QUANT_ASCEND,
     V41_QUANT_NONE,
@@ -87,6 +91,41 @@ class _SwaGroupMetadata:
     block_table: torch.Tensor
     block_size: int
     cache: torch.Tensor
+
+
+@lru_cache(maxsize=1)
+def _is_smla_a3() -> bool:
+    import xllm_runtime
+
+    return xllm_runtime.is_ascend_a3()
+
+
+# The A3 metadata validator accepts sparse compressed widths of 512 or 1024.
+_SMLA_CMP_TOPK_BLOCK = 512
+_SMLA_CMP_TOPK_MAX = 1024
+_SMLA_ORI_MASK_MODE = 4  # Window/compress masking over original KV rows.
+_SMLA_CMP_MASK_MODE = 3  # Right-down causal masking over compressed rows.
+_SMLA_NO_MASK_MODE = 0
+
+
+def _supports_smla_va() -> bool:
+    """Check schemas and SoC; the linked OPP must also provide the ACLNN APIs.
+
+    Probe registration on each call so a late-loaded extension can be used.
+    ACLNN symbol or execution failures remain deployment errors.
+    """
+    return (
+        getattr(torch.ops.xllm_ops, "smla_va", None) is not None
+        and getattr(torch.ops.xllm_ops, "smla_va_metadata", None) is not None
+        and _is_smla_a3()
+    )
+
+
+@dataclass
+class _SmlaForwardState:
+    """Layer-shared inputs owned by one ForwardContext, never a request cache."""
+
+    inputs: dict[tuple[object, ...], dict[str, Any]]
 
 
 @dataclass
@@ -2471,9 +2510,6 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         global_q_lens = list(cp_context.global_q_lens) if cp_context is not None else q_lens
         global_ctx_lens = _ensure_seq_lens_tensor(dsa.seq_lens, q.device) if cp_context is not None else ctx_lens
 
-        # TODO(smla-fused): integrate the SMLA fused decode tail (sparse_flash_mla
-        # + metadata via the ops-transformer mainline registration) in a follow-up
-        # PR; this branch keeps the pure-torch path only.
         sinks = layer.attn_sink.to(torch.float32)
         swa_flat = layer_cache.swa.view(-1, head_dim) if layer_cache.swa is not None else None
         out = torch.empty_like(q)
@@ -2506,6 +2542,29 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             ring_rows = torch.where((ring_pos >= 0).unsqueeze(-1), ring_rows, 0)
             kv_seq = torch.where(global_ctx_lens[seq] > 0, kv_seq, 0)
             window_kv = torch.cat((ring_rows, kv_seq), dim=0)
+            if (
+                q.device.type == "npu"
+                and head_dim == 512
+                and q.dtype == torch.bfloat16
+                and win == 128
+                and (topk is None or topk.size(-1) <= _SMLA_CMP_TOPK_MAX)
+                and _supports_smla_va()
+            ):
+                out[token_offset : token_offset + q_len] = self._smla_attention(
+                    q_seq,
+                    window_kv,
+                    layer,
+                    ctx_lens,
+                    global_ctx_lens,
+                    global_q_len,
+                    q_len,
+                    seq,
+                    topk,
+                    shared,
+                    sinks,
+                )
+                token_offset += q_len
+                continue
             # Window index matrix: query p (position prev+i) sees exactly the
             # window rows whose absolute position lies in
             # [max(p - win + 1, 0), p]; the lower bound tightens with the query
@@ -2584,6 +2643,160 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 del picked_kv
             token_offset += q_len
         return out
+
+    def _smla_attention(
+        self,
+        q: torch.Tensor,
+        window_kv: torch.Tensor,
+        layer: Any,
+        ctx_lens: torch.Tensor,
+        global_ctx_lens: torch.Tensor,
+        global_q_len: int,
+        q_len: int,
+        seq: int,
+        topk: torch.Tensor | None,
+        shared: CSA2SharedRuntime,
+        sinks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the vLLM DSV4.1 A3 SMLA kernel with the existing cache layout.
+
+        The SWA ring and current chunk form one temporary paged KV view.
+        Compressed KV stays in its shared paged cache. Independent compressed
+        lengths/residuals preserve causal positions even for a CP query shard.
+        Inference length tensors must remain immutable between layers of one
+        ForwardContext; start a new context before updating their values.
+        """
+        ratio = layer.mode.compress_ratio
+        # Ratio 1 uses the separate projected KV cache without pooling; it
+        # still needs the compressed-cache input of the SMLA interface.
+        has_compressed = ratio > 0 and topk is not None and topk.size(-1) > 0 and shared.key_cache is not None
+        if has_compressed and (shared.key_cache.ndim != 3 or shared.key_cache.size(-1) != q.size(-1)):
+            raise ValueError("SMLA compressed KV cache must have shape [num_blocks, block_size, head_dim]")
+        ratio = ratio if has_compressed else 0
+        compressed_width = (
+            (topk.size(-1) + _SMLA_CMP_TOPK_BLOCK - 1) // _SMLA_CMP_TOPK_BLOCK * _SMLA_CMP_TOPK_BLOCK
+            if has_compressed
+            else 0
+        )
+        context = get_forward_context()
+        state = context.layer_shared_cache.get(_SmlaForwardState)
+        if state is None:
+            state = _SmlaForwardState({})
+            context.layer_shared_cache[_SmlaForwardState] = state
+        compressed_capacity = shared.key_block_table.size(1) * shared.key_cache.size(1) if has_compressed else 0
+        # Keep tensor identities and available version counters so distinct
+        # CP plans and eager in-place updates cannot reuse stale inputs.
+        # Inference tensors have no version counter and follow the immutable
+        # per-forward length contract documented above.
+        # Graph replay recomputes the captured device arithmetic from live
+        # lengths; reading values with .item() here would break capture.
+        key = (
+            seq,
+            q_len,
+            global_q_len,
+            q.size(1),
+            q.size(2),
+            q.device,
+            self.window_size,
+            window_kv.size(0),
+            ratio,
+            compressed_width,
+            compressed_capacity,
+            ctx_lens,
+            global_ctx_lens,
+            None if torch.is_inference(ctx_lens) else ctx_lens._version,
+            None if torch.is_inference(global_ctx_lens) else global_ctx_lens._version,
+        )
+        inputs = state.inputs.get(key)
+        if inputs is None:
+            # Device arithmetic creates graph-safe constants and live lengths.
+            starts = torch.arange(2, device=q.device, dtype=torch.int32) * q_len
+            previous = global_ctx_lens[seq : seq + 1] - global_q_len
+            local_end = ctx_lens[seq : seq + 1].to(torch.int32)
+            ori_lens = (self.window_size + local_end - previous).clamp(min=0, max=window_kv.size(0)).to(torch.int32)
+            visible = (
+                (local_end - q_len + torch.arange(1, q_len + 1, device=q.device, dtype=torch.int32))
+                .clamp(min=0, max=self.window_size)
+                .view(-1, 1)
+            )
+            cmp_lens = torch.div(local_end, ratio, rounding_mode="floor") if ratio else None
+            residual = local_end % ratio if ratio else None
+            inputs = dict(
+                cu_seqlens_q=starts,
+                seqused_ori_kv=ori_lens,
+                seqused_cmp_kv=cmp_lens,
+                cmp_residual_kv=residual,
+                ori_topk_length=visible,
+            )
+            inputs["metadata"] = torch.ops.xllm_ops.smla_va_metadata(
+                q.size(1),
+                1,
+                q.size(2),
+                **inputs,
+                batch_size=1,
+                max_seqlen_q=q_len,
+                max_seqlen_ori_kv=window_kv.size(0),
+                max_seqlen_cmp_kv=compressed_capacity,
+                cmp_topk=compressed_width,
+                cmp_ratio=ratio,
+                ori_mask_mode=_SMLA_ORI_MASK_MODE,
+                cmp_mask_mode=_SMLA_CMP_MASK_MODE if ratio else _SMLA_NO_MASK_MODE,
+                ori_win_left=self.window_size - 1,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_BBND",
+                has_ori_kv=True,
+                has_cmp_kv=has_compressed,
+            )
+            state.inputs[key] = inputs
+        block_size = self.window_size
+        padding = (-window_kv.size(0)) % block_size
+        ori_kv = torch.nn.functional.pad(window_kv, (0, 0, 0, padding)).view(-1, block_size, 1, q.size(-1))
+        ori_table = torch.arange(ori_kv.size(0), device=q.device, dtype=torch.int32).view(1, -1)
+        cmp_kv = cmp_table = cmp_indices = None
+        if has_compressed:
+            assert topk is not None and shared.key_cache is not None and shared.key_block_table is not None
+            cmp_kv = shared.key_cache.view(*shared.key_cache.shape[:2], 1, q.size(-1))
+            cmp_table = shared.key_block_table[seq : seq + 1]
+            indices = topk[seq, :q_len]
+            # The indexer encodes compressed picks after window_size + local
+            # q_len rows. Under CP, window_kv also contains the full global
+            # chunk, so its row count is NOT the indexer's offset.
+            # The reference adds global_q_len - q_len to address the global
+            # chunk, then subtracting window_size + global_q_len to address
+            # the separate cache cancels that shift exactly.
+            # SMLA consumes logical compressed rows and -1 padding. Reject
+            # window picks and out-of-range rows instead of clamping them to
+            # an unrelated valid KV row; all checks stay on the device.
+            indexer_offset = self.window_size + q_len
+            logical_indices = indices - indexer_offset
+            valid_indices = (
+                (indices >= indexer_offset)
+                & (logical_indices < inputs["seqused_cmp_kv"].view(1, 1))
+                & (logical_indices < compressed_capacity)
+            )
+            cmp_indices = torch.where(valid_indices, logical_indices, -1)
+            cmp_indices = torch.nn.functional.pad(cmp_indices, (0, compressed_width - indices.size(-1)), value=-1)
+            cmp_indices = cmp_indices.to(torch.int32).unsqueeze(1).contiguous()
+        output, _ = torch.ops.xllm_ops.smla_va(
+            q,
+            ori_kv=ori_kv,
+            cmp_kv=cmp_kv,
+            cmp_sparse_indices=cmp_indices,
+            ori_block_table=ori_table,
+            cmp_block_table=cmp_table,
+            **inputs,
+            sinks=sinks,
+            softmax_scale=self.scale,
+            cmp_ratio=ratio,
+            ori_mask_mode=_SMLA_ORI_MASK_MODE,
+            cmp_mask_mode=_SMLA_CMP_MASK_MODE if ratio else _SMLA_NO_MASK_MODE,
+            ori_win_left=self.window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+        )
+        return output
 
     # -- cache gather helpers -------------------------------------------------
 

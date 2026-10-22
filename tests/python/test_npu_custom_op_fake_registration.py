@@ -84,3 +84,13 @@ def test_dequant_situ_quant_fake_output_contract(dtype: torch.dtype) -> None:
         assert scale.shape == (7,)
         assert scale.dtype == torch.float32
         assert y.device == scale.device == x.device
+
+
+@pytest.mark.parametrize("layout", ["TND", "BSND"])
+def test_smla_fake_rejects_nondivisible_query_heads(layout: str) -> None:
+    with FakeTensorMode():
+        shape = (3, 15, 512) if layout == "TND" else (1, 3, 15, 512)
+        q = torch.empty(shape, dtype=torch.bfloat16)
+        kv = torch.empty((1, 128, 2, 512), dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="query heads must be divisible"):
+            _custom_op._smla_va_fake(q, ori_kv=kv, layout_q=layout, layout_kv="PA_BBND", return_softmax_lse=True)

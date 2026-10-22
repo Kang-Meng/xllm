@@ -207,6 +207,7 @@ def test_sparse_attention_query_tiles_bound_kv_memory(
     """
     if device_name == "npu" and _active_device().type == "cpu":
         pytest.skip("NPU is unavailable")
+    monkeypatch.setattr(csa2, "_supports_smla_va", lambda: False)
     device = torch.device("cpu") if device_name == "cpu" else _active_device()
     window, width, heads, topk, length = (8, 8, 2, 32, 37) if device_name == "cpu" else (128, 512, 8, 512, 256)
     backend = Csa2AttentionBackend(
