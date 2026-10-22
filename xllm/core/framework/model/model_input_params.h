@@ -835,6 +835,10 @@ struct ModelEmbeddingInput {
   // extra token ids for each sequence, and -1 for last chunk
   std::vector<int32_t> extra_token_ids;
 
+  // Prompt-tail bootstrap pairs: [receiver-local SWA slot, token id].
+  // Engram history is Python-owned and is not part of the transferred KV.
+  std::vector<int32_t> engram_history;
+
   // Precomputed shifted token ids for MTP prefill, aligned with tokens.
   torch::Tensor mtp_shifted_token_ids;
 
@@ -853,6 +857,7 @@ struct ModelEmbeddingInput {
         safe_to(linear_state_read_indices, device, true);
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
+    out.engram_history = engram_history;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
     out.mtp_bootstrap_row_idxes = mtp_bootstrap_row_idxes;
     out.mtp_bootstrap_embeddings =

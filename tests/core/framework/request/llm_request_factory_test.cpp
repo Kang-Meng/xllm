@@ -192,6 +192,42 @@ TEST_F(LLMRequestFactoryTest, FailsWhenPromptEncodingFails) {
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
+TEST_F(LLMRequestFactoryTest, TokenizesTextWhenRoutedTokensAreEmpty) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.request_id = "routed-text";
+  sp.max_tokens = 16;
+
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::vector<int32_t>{},
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+TEST_F(LLMRequestFactoryTest, RejectsEmptyTextWithEmptyRoutedTokens) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+
+  auto request = factory->create(/*prompt=*/"",
+                                 /*prompt_tokens=*/std::vector<int32_t>{},
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(capture.status->message(), "Prompt is empty");
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
 TEST_F(LLMRequestFactoryTest, RejectsPromptTokensOutOfVocabulary) {
   auto factory = make_factory(/*vocab_size=*/100);
   CallbackCapture capture;

@@ -127,6 +127,7 @@ class BatchInputBuilder {
     std::vector<int32_t> linear_state_read_ids;
     std::vector<std::string> request_ids;
     std::vector<int32_t> extra_token_ids;
+    std::vector<int32_t> engram_history;
     std::vector<int32_t> mtp_shifted_token_ids;
     std::vector<int32_t> eplb_decode_token_mask;
     std::vector<int32_t> mtp_bootstrap_row_idxes;

@@ -114,6 +114,17 @@ inline void validate_deepseek_v41_args(const ModelArgs& args,
   CHECK_GT(args.window_size(), 0)
       << "deepseek_v41 config window_size/sliding_window must be > 0, got "
       << args.window_size();
+  if (!args.engram_layer_ids().empty()) {
+    CHECK_GT(args.engram_max_ngram_size(), 0)
+        << "deepseek_v41 config engram_max_ngram_size must be > 0 when "
+           "engram_layer_ids is enabled, got "
+        << args.engram_max_ngram_size();
+    CHECK_LE(args.engram_max_ngram_size() - 1, args.window_size())
+        << "deepseek_v41 config engram_max_ngram_size - 1 must fit within "
+           "window_size/sliding_window; got engram_max_ngram_size="
+        << args.engram_max_ngram_size()
+        << ", window_size=" << args.window_size();
+  }
   // SWA group chunk width is taken from window_size while the device block
   // width is taken from block_size; anchoring the two (equality) is pending
   // confirmation of the online config's window_size, so only block_size is

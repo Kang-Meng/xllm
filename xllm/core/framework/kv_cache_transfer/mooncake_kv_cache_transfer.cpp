@@ -23,6 +23,7 @@ limitations under the License.
 #include <sstream>
 #include <unordered_set>
 
+#include "absl/strings/str_join.h"
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kv_cache_config.h"
@@ -236,6 +237,26 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
                 << geometry.compressed_block_token_size() << ":"
                 << geometry.c4_physical_dim() << ":"
                 << geometry.c128_physical_dim();
+  }
+  if (util::is_deepseek_v41_model_type(model_args.model_type())) {
+    // V4.1 grouped pools: the kv-source layer list and the per-kv-source
+    // compress ratios decide which layers export C2/C1 groups and the fp32
+    // compressor state ring (KV_STATE/SCORE_STATE under SWA). Like the V4
+    // physical dims above they are model-config derived, so peers built from
+    // the same weights agree; a peer running a different V4.1 layer plan now
+    // fails pairing here with an explicit fingerprint mismatch instead of a
+    // resource-semantics error at the first transfer.
+    auto append_list = [&fingerprint](const char* name, const auto& values) {
+      fingerprint << "|" << name << ":" << absl::StrJoin(values, ",");
+      if (!values.empty()) {
+        fingerprint << ",";
+      }
+    };
+    append_list("dsv41_grouped_geometry", model_args.kv_source_layer_ids());
+    append_list("dsv41_compress_ratios", model_args.compress_ratios());
+    append_list("dsv41_engram_layers", model_args.engram_layer_ids());
+    fingerprint << "|dsv41_engram_max_ngram_size:"
+                << model_args.engram_max_ngram_size();
   }
   if (!is_spec_draft && uses_npu_compressed_kpool_tail(model_args)) {
     fingerprint << "|compressed_kpool_tail:" << model_args.index_head_dim()

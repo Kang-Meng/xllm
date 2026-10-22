@@ -8,6 +8,7 @@ if(USE_NPU)
     COMMAND
       "${CMAKE_COMMAND}" -E env
       "PYTHONPATH=${PROJECT_SOURCE_DIR}:$ENV{PYTHONPATH}"
+      "XLLM_BATCH_TEST_BINARY=$<TARGET_FILE:batch_test>"
       "${Python3_EXECUTABLE}" -m pytest -q "${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   set_tests_properties(

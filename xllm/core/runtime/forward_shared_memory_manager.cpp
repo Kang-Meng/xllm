@@ -113,7 +113,9 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // self-description), so the tag MUST bump with every descriptor change --
 // a mixed-version master/worker pair now fails this check loudly instead of
 // misparsing the tail of every TransferKVInfo.
-constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000002ULL;
+// v3: embedding.engram_history follows extra_token_ids and precedes the
+// root and embedding mtp_shifted_token_ids tensors.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000003ULL;
 
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
@@ -2627,6 +2629,7 @@ inline void deserialize_forward_input_payload(
   }
   read_string_vector(context, input_params.embedding.request_ids);
   read_vector(context, input_params.embedding.extra_token_ids);
+  read_vector(context, input_params.embedding.engram_history);
   // Keep upstream's root mtp_shifted_token_ids serialization (consumed by
   // non-CP MTP paths + minimax / qwen3-next models). The CP path additionally
   // reads embedding.mtp_shifted_token_ids below. shared_blocks_num was
@@ -3121,6 +3124,7 @@ inline void serialize_forward_input_sections(
                input_params.embedding.linear_state_read_ids);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);
+  write_vector(context.descriptor, input_params.embedding.engram_history);
   // Mirror the read_* layout: write root + embedding mtp paths so the
   // deserializer sees both fields. Order MUST match the read_* sequence.
   write_tensor(context, input_params.mtp_shifted_token_ids);

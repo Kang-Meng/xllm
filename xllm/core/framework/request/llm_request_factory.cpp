@@ -84,7 +84,13 @@ std::optional<std::vector<int>> LLMRequestFactory::encode_and_validate_prompt(
     const OutputCallback& callback) {
   // A request is valid as long as it carries either text or pre-tokenized
   // prompt tokens; pure-token input (no text) is a first-class input.
-  const bool has_prompt_tokens = prompt_tokens.has_value();
+  // A present-but-empty token vector counts as absent: routed requests carry
+  // an empty token_ids whenever the dispatcher did not tokenize (no matching
+  // tokenizer on the service side), and the prompt text must then be
+  // tokenized locally -- forwarding an empty vector reached the stopping
+  // checker and aborted the whole process on CHECK(!token_ids.empty()).
+  const bool has_prompt_tokens =
+      prompt_tokens.has_value() && !prompt_tokens->empty();
   if (prompt.empty() && !has_prompt_tokens) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "Prompt is empty",

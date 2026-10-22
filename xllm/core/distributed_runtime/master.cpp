@@ -608,12 +608,12 @@ Master::Master(const Options& options, EngineType type)
     model_type = util::get_model_type(model_path, options_.backend());
   }
   // V4.1 does not support KV cache Store (the grouped-KV C1/C2 restore is not
-  // implemented) or disaggregated PD (the grouped TOKEN KV C1/C2 transfer path
-  // is not implemented). Speculative decoding is implemented only for the
-  // python-path DSpark draft; every other V4.1 speculative setup is rejected
-  // before any engine/worker is built. Prefix-cache support is a property of
-  // the cache groups and is resolved in the block layer
-  // (leaf_participates_in_prefix_cache), not here.
+  // implemented). Disaggregated PD is supported through Mooncake. Speculative
+  // decoding is implemented only for the python-path DSpark draft; every
+  // other V4.1 speculative setup is rejected before any engine/worker is
+  // built. Prefix-cache support is a property of the cache groups and is
+  // resolved in the block layer (leaf_participates_in_prefix_cache), not
+  // here.
   if (util::is_deepseek_v41_model_type(model_type)) {
     CHECK(!options_.enable_kvcache_store())
         << "DeepSeek-V4.1 does not support KV cache Store: restore for the "
@@ -644,12 +644,6 @@ Master::Master(const Options& options, EngineType type)
              "for the DSpark algorithm: the grouped KV (C1/C2) is not "
              "implemented in the other speculative paths.";
     }
-    // TODO: implement disaggregated PD for DeepSeek-V4.1. The grouped TOKEN KV
-    // (C1/C2) transfer path is not wired through the disagg PD scheduler yet
-    // (see disagg_pd_service_impl / pd_ooc_service).
-    CHECK(!options_.enable_disagg_pd())
-        << "DeepSeek-V4.1 does not support disaggregated PD: the grouped "
-           "TOKEN KV (C1/C2) transfer path is not implemented.";
   }
   const std::optional<std::string> speculative_error =
       ModelConfig::validate_python_speculative_decode(

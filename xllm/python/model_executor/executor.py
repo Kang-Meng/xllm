@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -291,6 +291,9 @@ class ModelExecutor:
         is_spec_draft: bool = False,
     ) -> None:
         self.model = model
+        # The model's Engram restore capability is fixed after construction;
+        # cache it so non-V4.1 models avoid an exception-based probe per step.
+        self._restore_engram_history = self._resolve_engram_restore(self.model)
         self._kv_bound = False
         self._is_spec_draft = is_spec_draft
         self._draft_query_width = max(1, int(config.get("draft_query_width", 1) or 1))
@@ -505,6 +508,15 @@ class ModelExecutor:
         self._kv_bound = True
 
     @staticmethod
+    def _resolve_engram_restore(model: nn.Module) -> Any | None:
+        """Find the optional Engram hook on the model or its body wrapper."""
+        for candidate in (model, getattr(model, "model", None)):
+            hook = getattr(candidate, "restore_engram_history", None)
+            if hook is not None:
+                return hook
+        return None
+
+    @staticmethod
     def _resolve_aux_hidden_capture(model: nn.Module) -> AuxHiddenCapture | None:
         """Locate the target's aux-hidden capture, if the model owns one.
 
@@ -613,6 +625,7 @@ class ModelExecutor:
                 layer_load_context.synchronize_event(draft_load_event_index)
             layer_load_context = None
         rows = input_ids.numel()
+        restore_history = self._restore_engram_history
         graph_runner = self.decode_graph_runner
         if (
             graph_runner is not None
@@ -630,6 +643,8 @@ class ModelExecutor:
                 metadata,
                 input_embedding,
             )
+            if restore_history is not None:
+                restore_history(self.attention_backend, metadata)
             output = graph_runner.execute(
                 input_ids,
                 positions,
@@ -643,6 +658,8 @@ class ModelExecutor:
                 rows,
                 graph_rows=getattr(graph_runner, "last_padded_batch_size", None),
             )
+        if restore_history is not None:
+            restore_history(self.attention_backend, metadata)
         if self.inductor_runner is not None:
             # Compiled execution must not capture request-specific Host events.
             if layer_load_context is not None:

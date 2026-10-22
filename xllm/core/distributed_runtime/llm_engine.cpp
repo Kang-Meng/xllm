@@ -660,8 +660,9 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .has_grouped_cache_layout = kv_cache_shape.has_grouped_cache_layout(),
       // TODO(V4.1): grouped host offload for the V4.1 TOKEN groups (C1/C2)
       // is deferred; keep it rejected so the unextended host paths cannot be
-      // reached. The V4.1 milestone runs with prefix cache / PD / host
-      // offload disabled.
+      // reached. The V4.1 milestone keeps prefix cache and grouped host
+      // offload disabled; disaggregated PD is supported separately
+      // (master.cpp).
       .supports_grouped_cache_offload =
           util::is_deepseek_v4_model_type(args_.model_type()) &&
           !util::is_deepseek_v41_model_type(args_.model_type()),

@@ -487,6 +487,14 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     thread_state.linear_state_read_ids.reserve(sequences_per_thread);
     thread_state.request_ids.reserve(sequences_per_thread);
     thread_state.extra_token_ids.reserve(sequences_per_thread);
+    size_t max_engram_history_per_sequence = 0;
+    if (args_ && !args_->engram_layer_ids().empty()) {
+      const size_t depth =
+          static_cast<size_t>(std::max(args_->engram_max_ngram_size() - 1, 0));
+      max_engram_history_per_sequence = 2 * depth;
+    }
+    thread_state.engram_history.reserve(sequences_per_thread *
+                                        max_engram_history_per_sequence);
     thread_state.scheduled_mm_data_vec.reserve(sequences_per_thread);
   }
 
@@ -536,11 +544,13 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   size_t total_seqs = 0;
   size_t total_slots = 0;
   size_t total_paged_indices = 0;
+  size_t total_engram_history = 0;
   for (const auto& state : thread_builder_states) {
     total_tokens += state.flatten_tokens_vec.size();
     total_seqs += state.block_tables_vec.size();
     total_slots += state.new_token_slot_ids.size();
     total_paged_indices += state.paged_kv_indices.size();
+    total_engram_history += state.engram_history.size();
   }
   state_.flatten_tokens_vec.reserve(total_tokens);
   if (!use_mrope_) {
@@ -563,6 +573,7 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   state_.linear_state_read_ids.reserve(total_seqs);
   state_.request_ids.reserve(total_seqs);
   state_.extra_token_ids.reserve(total_seqs);
+  state_.engram_history.reserve(total_engram_history);
   state_.paged_kv_indices.reserve(total_paged_indices);
   state_.paged_kv_indptr.reserve(total_seqs + 1);
   state_.paged_kv_last_page_len.reserve(total_seqs);
@@ -677,6 +688,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.extra_token_ids.insert(state_.extra_token_ids.end(),
                                   state.extra_token_ids.begin(),
                                   state.extra_token_ids.end());
+    state_.engram_history.insert(state_.engram_history.end(),
+                                 state.engram_history.begin(),
+                                 state.engram_history.end());
     state_.mtp_shifted_token_ids.insert(state_.mtp_shifted_token_ids.end(),
                                         state.mtp_shifted_token_ids.begin(),
                                         state.mtp_shifted_token_ids.end());
@@ -819,6 +833,45 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
 
   const auto& token_ids = sequence->tokens();
   const uint32_t n_tokens = token_ids.size();
+  if (args_ && !args_->engram_layer_ids().empty() &&
+      !sequence->is_prefill_stage() &&
+      !sequence->is_engram_history_restored() &&
+      n_kv_cache_tokens >= sequence->num_prompt_tokens()) {
+    const int32_t depth = std::max(args_->engram_max_ngram_size() - 1, 0);
+    const uint32_t start =
+        n_kv_cache_tokens -
+        std::min(n_kv_cache_tokens, static_cast<uint32_t>(depth));
+    const Slice<Block> blocks = sequence->kv_state().blocks(BlockType::SWA);
+    const size_t history_begin = state.engram_history.size();
+    // Decode SWA tables retain invalid placeholders for expired prompt blocks.
+    const auto live_block =
+        std::find_if(blocks.begin(), blocks.end(), [](const Block& block) {
+          return block.is_valid();
+        });
+    if (live_block != blocks.end() && live_block->size() > 0) {
+      const uint32_t block_size = live_block->size();
+      for (uint32_t position = start; position < n_kv_cache_tokens;
+           ++position) {
+        CHECK_LT(position, n_tokens)
+            << "Engram history position exceeds sequence token count";
+        // Logical SWA columns retain placeholders; modulo is currently a no-op.
+        // A bounded ring must use identical rotation and table width in Python.
+        const Block& block = blocks[(position / block_size) % blocks.size()];
+        if (!block.is_valid()) {
+          // Missing history is resolved with the model's pad token.
+          continue;
+        }
+        const int64_t slot = static_cast<int64_t>(block.id()) * block_size +
+                             position % block_size;
+        CHECK_LE(slot, std::numeric_limits<int32_t>::max());
+        state.engram_history.emplace_back(static_cast<int32_t>(slot));
+        state.engram_history.emplace_back(token_ids[position]);
+      }
+    }
+    if (state.engram_history.size() > history_begin) {
+      sequence->mark_engram_history_restored();
+    }
+  }
   const auto& sample_slots = sequence->sample_slots();
   size_t sample_slot_idx = 0;
 
@@ -1283,6 +1336,7 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   }
   input_params.embedding.request_ids = std::move(state_.request_ids);
   input_params.embedding.extra_token_ids = std::move(state_.extra_token_ids);
+  input_params.embedding.engram_history = std::move(state_.engram_history);
   if (!state_.mtp_shifted_token_ids.empty()) {
     // Write both the upstream "root" path (consumed by non-CP MTP code paths
     // and by the existing shm serializer) and the CP-specific embedding path

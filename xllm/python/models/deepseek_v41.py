@@ -2732,6 +2732,19 @@ class DeepseekV41Model(nn.Module):
         """Per-layer RoPE table: compress theta for CSA2 layers, plain otherwise."""
         return self.compress_rotary.cos_sin_cache if mode.is_csa2 else self.rotary.cos_sin_cache
 
+    def restore_engram_history(self, backend: Any, metadata: Any) -> None:
+        """Restore PD prompt history before eager execution or graph replay."""
+        history = getattr(metadata, "engram_history", ())
+        if not history or self.engram_hash is None:
+            return
+        if len(history) % 2 != 0:
+            raise ValueError(f"Engram history must contain [slot, token] pairs, got {len(history)} values")
+        cache = backend.swa_history_cache()
+        if not self.engram_hash.ensure_cache(cache, cache.shape[1]):
+            raise RuntimeError("Cannot restore Engram history before cache binding")
+        pairs = torch.tensor(history, dtype=torch.int64).reshape(-1, 2)
+        self.engram_hash.restore_history(pairs)
+
     def _compute_engram_hashes(
         self,
         backend: Any,
@@ -2753,6 +2766,7 @@ class DeepseekV41Model(nn.Module):
         seq_lens_q = dsa.seq_lens_q.reshape(-1).to(torch.int64)
         q_cu = torch.cat((torch.zeros(1, dtype=torch.int64, device=seq_lens_q.device), seq_lens_q.cumsum(0)))
         dead = image_sentinel_mask(input_ids)
+        max_chunk_len = getattr(dsa, "max_query_len", None)
         hashes = self.engram_hash(
             input_ids,
             positions,
@@ -2762,6 +2776,7 @@ class DeepseekV41Model(nn.Module):
             swa_group.slot_mapping,
             swa_group.block_table,
             swa_group.block_size,
+            max_chunk_len=max_chunk_len,
         )
         return hashes, ~dead
 

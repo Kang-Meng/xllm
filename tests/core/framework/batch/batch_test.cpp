@@ -21,9 +21,13 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <nlohmann/json.hpp>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -39,6 +43,7 @@ limitations under the License.
 #include "framework/block/block_utils.h"
 #include "framework/block/composite_block_manager.h"
 #include "framework/block/hierarchy_block_manager_pool.h"
+#include "framework/block/sliding_window_block_manager.h"
 #include "framework/config/beam_search_config.h"
 #include "framework/config/service_config.h"
 #include "framework/config/speculative_config.h"
@@ -2153,6 +2158,7 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
                                   /*min_decoding_batch_size=*/0);
   input.input_params.parallel.dp_global_batch_generations = {3, 7};
   input.input_params.embedding.mtp_bootstrap_row_idxes = {0};
+  input.input_params.embedding.engram_history = {129, 21, 130, 22, 131, 23};
   input.input_params.embedding.mtp_bootstrap_embeddings =
       torch::tensor({{3.0f, 4.0f}});
   input.sample_sequence_ids = {"req-packed#0"};
@@ -2195,6 +2201,8 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       kCpIndexWriteModeSharded);
   EXPECT_EQ(round_trip.input_params.embedding.mtp_bootstrap_row_idxes,
             std::vector<int32_t>{0});
+  EXPECT_EQ(round_trip.input_params.embedding.engram_history,
+            (std::vector<int32_t>{129, 21, 130, 22, 131, 23}));
   EXPECT_EQ(round_trip.input_params.parallel.dp_global_batch_generations,
             (std::vector<uint64_t>{3, 7}));
   EXPECT_EQ(round_trip.sample_sequence_ids,
@@ -2537,6 +2545,9 @@ TEST(BatchTest, DecodeMinBatchSizeDoesNotPadTransportState) {
                std::move(decoder),
                seq_params);
   seq.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
+  seq.kv_state().add_blocks(BlockType::SWA, manager.allocate(1));
+  const int32_t swa_block_id =
+      seq.kv_state().blocks(BlockType::SWA).front().id();
   seq.kv_state().incr_kv_cache_tokens_num(/*size=*/3);
   seq.append_token(4);
 
@@ -2545,6 +2556,8 @@ TEST(BatchTest, DecodeMinBatchSizeDoesNotPadTransportState) {
   std::vector<torch::Tensor> input_embeddings_vec;
   std::vector<MMData> mm_data_vec;
   ModelArgs args;
+  args.engram_layer_ids({1});
+  args.engram_max_ngram_size(4);
   BatchInputBuilder builder(sequences,
                             allowed_max_tokens,
                             input_embeddings_vec,
@@ -2559,10 +2572,226 @@ TEST(BatchTest, DecodeMinBatchSizeDoesNotPadTransportState) {
                                   /*min_decoding_batch_size=*/3);
 
   EXPECT_EQ(forward_input.input_params.meta.num_sequences, 1);
+  EXPECT_EQ(forward_input.input_params.embedding.engram_history,
+            (std::vector<int32_t>{swa_block_id * 4,
+                                  1,
+                                  swa_block_id * 4 + 1,
+                                  2,
+                                  swa_block_id * 4 + 2,
+                                  3}));
   EXPECT_EQ(forward_input.input_params.embedding.linear_state_ids,
             std::vector<int32_t>({-1}));
   EXPECT_EQ(forward_input.input_params.embedding.embedding_ids,
             std::vector<int32_t>({-1}));
+}
+
+TEST(BatchTest, DecodeEngramHistoryPreservesSparseSwaColumns) {
+  const uint32_t block_size = 4;
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(block_size).enable_prefix_cache(false);
+  BlockManagerImpl kv_manager(options);
+  options.block_type(BlockType::SWA)
+      .instance_is_decode(true)
+      .sliding_window_size(4)
+      .swa_blocks_per_seq(2);
+  SlidingWindowBlockManager swa_manager(options);
+
+  for (const uint32_t prompt_size : {11u, 12u, 13u}) {
+    SCOPED_TRACE(prompt_size);
+    std::vector<int32_t> tokens(prompt_size);
+    std::iota(tokens.begin(), tokens.end(), 1);
+    Sequence seq = make_basic_sequence(tokens);
+    seq.kv_state().add_blocks(
+        BlockType::KV,
+        kv_manager.allocate((prompt_size + block_size) / block_size));
+    auto swa_blocks = swa_manager.allocate_for_sequence(
+        &seq, seq.kv_state(), prompt_size + 1);
+    ASSERT_TRUE(swa_blocks.has_value());
+    seq.kv_state().add_blocks(BlockType::SWA, std::move(*swa_blocks));
+    const auto& swa_table = seq.kv_state().blocks(BlockType::SWA);
+    ASSERT_FALSE(swa_table.front().is_valid());
+    std::vector<int32_t> swa_block_ids;
+    swa_block_ids.reserve(swa_table.size());
+    for (const Block& block : swa_table) {
+      swa_block_ids.emplace_back(block.id());
+    }
+    seq.kv_state().incr_kv_cache_tokens_num(prompt_size);
+    seq.append_token(99);
+
+    std::vector<Sequence*> sequences = {&seq};
+    std::vector<uint32_t> allowed_max_tokens = {1};
+    std::vector<torch::Tensor> input_embeddings_vec;
+    std::vector<MMData> mm_data_vec;
+    ModelArgs args;
+    args.engram_layer_ids({1});
+    args.engram_max_ngram_size(4);
+    BatchInputBuilder builder(sequences,
+                              allowed_max_tokens,
+                              input_embeddings_vec,
+                              mm_data_vec,
+                              /*swap_block_transfer_infos=*/nullptr,
+                              /*batch_id=*/1,
+                              &args,
+                              BatchForwardType::DECODE);
+    const ForwardInput input = builder.build_forward_input(
+        /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
+
+    std::vector<int32_t> expected;
+    expected.reserve(6);
+    for (uint32_t position = prompt_size - 3; position < prompt_size;
+         ++position) {
+      const int32_t block_id = swa_block_ids[position / block_size];
+      ASSERT_GE(block_id, 0);
+      expected.emplace_back(block_id * block_size + position % block_size);
+      expected.emplace_back(tokens[position]);
+    }
+    EXPECT_EQ(input.input_params.embedding.engram_history, expected);
+
+    // Export real builder output after the production shared-memory codec.
+    const std::string shm_name = ForwardSharedMemoryManager::create_unique_name(
+        "engram_contract", 0, ForwardType::RAW_INPUT, 0);
+    bool writer_creator = false;
+    ForwardSharedMemoryManager writer(
+        shm_name, 1 << 20, writer_creator, ForwardType::RAW_INPUT);
+    bool reader_creator = false;
+    ForwardSharedMemoryManager reader(
+        shm_name, 1 << 20, reader_creator, ForwardType::RAW_INPUT);
+    ASSERT_TRUE(writer.input_write(input));
+    ForwardInput restored;
+    reader.input_read(restored, torch::Device(torch::kCPU));
+    EXPECT_EQ(restored.input_params.embedding.engram_history, expected);
+
+    const char* fixture_path = std::getenv("XLLM_ENGRAM_CONTRACT_OUTPUT");
+    if (fixture_path != nullptr) {
+      std::vector<int32_t> block_ids;
+      block_ids = swa_block_ids;
+      const nlohmann::json record = {
+          {"tokens", tokens},
+          {"next_token", restored.token_ids[0].item<int32_t>()},
+          {"block_size", block_size},
+          {"num_blocks", options.num_blocks()},
+          {"block_table", block_ids},
+          {"history", restored.input_params.embedding.engram_history}};
+      std::ofstream output(fixture_path, std::ios::app);
+      ASSERT_TRUE(output.is_open());
+      output << record.dump() << "\n";
+      ASSERT_TRUE(output.good());
+    }
+  }
+}
+
+TEST(BatchTest, DecodeEngramHistoryRestoresMigratedGeneratedPrefix) {
+  const uint32_t block_size = 4;
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(block_size).enable_prefix_cache(false);
+  BlockManagerImpl manager(options);
+
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(20);
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 32;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+
+  torch::Tensor input_embedding;
+  MMData mm_data;
+  IncrementalDecoder decoder("", 1, false, false);
+  Sequence seq(/*index=*/0,
+               /*token_ids=*/{1, 2, 3},
+               input_embedding,
+               mm_data,
+               std::move(decoder),
+               seq_params);
+  seq.kv_state().add_blocks(BlockType::KV, manager.allocate(2));
+  seq.kv_state().add_blocks(BlockType::SWA, manager.allocate(2));
+  seq.kv_state().incr_kv_cache_tokens_num(/*size=*/3);
+  seq.append_token(4);
+  seq.append_token(5);
+  seq.append_token(6);
+
+  const auto& swa_blocks = seq.kv_state().blocks(BlockType::SWA);
+  const int32_t first_block_id = swa_blocks.front().id();
+  std::vector<Sequence*> sequences = {&seq};
+  std::vector<uint32_t> allowed_max_tokens = {1};
+  std::vector<torch::Tensor> input_embeddings_vec;
+  std::vector<MMData> mm_data_vec;
+  ModelArgs args;
+  args.engram_layer_ids({1});
+  args.engram_max_ngram_size(4);
+  BatchInputBuilder builder(sequences,
+                            allowed_max_tokens,
+                            input_embeddings_vec,
+                            mm_data_vec,
+                            /*swap_block_transfer_infos=*/nullptr,
+                            /*batch_id=*/1,
+                            &args,
+                            BatchForwardType::DECODE);
+
+  const ForwardInput input = builder.build_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
+
+  EXPECT_EQ(input.input_params.embedding.engram_history,
+            (std::vector<int32_t>{first_block_id * 4 + 2,
+                                  3,
+                                  first_block_id * 4 + 3,
+                                  4,
+                                  swa_blocks[1].id() * 4,
+                                  5}));
+
+  seq.append_token(7);
+  BatchInputBuilder second_builder(sequences,
+                                   allowed_max_tokens,
+                                   input_embeddings_vec,
+                                   mm_data_vec,
+                                   /*swap_block_transfer_infos=*/nullptr,
+                                   /*batch_id=*/2,
+                                   &args,
+                                   BatchForwardType::DECODE);
+  const ForwardInput second_input = second_builder.build_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
+  EXPECT_TRUE(second_input.input_params.embedding.engram_history.empty());
+}
+
+TEST(BatchTest, DecodeEngramHistorySkipsInvalidSwaPlaceholder) {
+  const uint32_t block_size = 4;
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(block_size).enable_prefix_cache(false);
+  BlockManagerImpl kv_manager(options);
+  options.block_type(BlockType::SWA)
+      .instance_is_decode(true)
+      .sliding_window_size(4)
+      .swa_blocks_per_seq(2);
+  SlidingWindowBlockManager swa_manager(options);
+
+  Sequence seq = make_basic_sequence({1});
+  seq.kv_state().add_blocks(BlockType::KV, kv_manager.allocate(1));
+  auto swa_blocks =
+      swa_manager.allocate_for_sequence(&seq, seq.kv_state(), /*num_tokens=*/9);
+  ASSERT_TRUE(swa_blocks.has_value());
+  seq.kv_state().add_blocks(BlockType::SWA, std::move(*swa_blocks));
+  const auto& swa_table = seq.kv_state().blocks(BlockType::SWA);
+  ASSERT_FALSE(swa_table.front().is_valid());
+  seq.kv_state().incr_kv_cache_tokens_num(1);
+  seq.append_token(2);
+
+  ModelArgs args;
+  args.engram_layer_ids({1});
+  args.engram_max_ngram_size(4);
+  std::vector<Sequence*> sequences = {&seq};
+  std::vector<uint32_t> allowed_max_tokens = {1};
+  std::vector<torch::Tensor> input_embeddings_vec;
+  std::vector<MMData> mm_data_vec;
+  BatchInputBuilder builder(sequences,
+                            allowed_max_tokens,
+                            input_embeddings_vec,
+                            mm_data_vec,
+                            nullptr,
+                            1,
+                            &args,
+                            BatchForwardType::DECODE);
+  const ForwardInput input = builder.build_forward_input(1, 0);
+  EXPECT_TRUE(input.input_params.embedding.engram_history.empty());
 }
 
 TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {

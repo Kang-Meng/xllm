@@ -473,6 +473,29 @@ class EngramHashState(nn.Module):
         del block_size
         return True
 
+    def restore_history(
+        self,
+        history: torch.Tensor,
+    ) -> None:
+        """Seed prompt-tail [receiver-local slot, token] pairs before decode."""
+        if self._cache is None:
+            raise RuntimeError("Engram history restore requires a bound cache")
+        if history.ndim != 2 or history.shape[1] != 2:
+            raise ValueError("Engram history must contain [slot, token] pairs")
+        history = history.to(device=self._cache.device, dtype=torch.int64)
+        slots, tokens = history.unbind(dim=1)
+        comp = self.token_map[tokens.clamp(0, self.token_map.numel() - 1)]
+        comp = torch.where(
+            image_sentinel_mask(tokens).reshape(-1),
+            ENGRAM_DEAD_ID,
+            comp,
+        ).to(torch.int64)
+        self._write_hash_cache(
+            comp,
+            slots,
+            deduplicate=not in_acl_graph(),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -483,6 +506,8 @@ class EngramHashState(nn.Module):
         slot_mapping: torch.Tensor | None,
         block_table: torch.Tensor | None,
         swa_block_size: int,
+        *,
+        max_chunk_len: int | None = None,
     ) -> torch.Tensor:
         """Compute ``[T, n_engram_layers, n_hash_cols]`` int32 n-gram hashes.
 
@@ -507,6 +532,23 @@ class EngramHashState(nn.Module):
 
         comp = self.token_map[ids.clamp(0, self.token_map.numel() - 1)]
         comp = torch.where(dead_mask.reshape(-1), ENGRAM_DEAD_ID, comp).to(torch.int64)
+        # Expanded verify presents each candidate as a one-token sequence, so
+        # later candidates must see earlier ones through the slot cache. A
+        # chunk longer than the ring must not overwrite its own pre-chunk
+        # history, so publish before hashing only chunks that fit
+        # (length + lookback depth <= ring); the rest publish after the loop.
+        early_slots = None
+        if slot_mapping is not None and self._cache is not None:
+            q_cu = query_start_loc.to(torch.int64).reshape(-1)
+            q_lens = q_cu[1:] - q_cu[:-1]
+            fits_ring = q_lens[req] + self.lookback_depth <= swa_block_size
+            slots = slot_mapping.reshape(-1).to(torch.int64)
+            early_slots = torch.where(fits_ring, slots, torch.full_like(slots, -1))
+            self._write_hash_cache(
+                comp,
+                early_slots,
+                deduplicate=not in_acl_graph(),
+            )
 
         rows = torch.arange(num_tokens, device=device)
         rolling = torch.zeros(num_tokens, num_layers, dtype=torch.int64, device=device)
@@ -537,12 +579,20 @@ class EngramHashState(nn.Module):
                 hashed = rolling.unsqueeze(-1) % prime.unsqueeze(0) + offset.unsqueeze(0)
                 output[:, :, lo : lo + n_heads] = hashed.to(torch.int32)
         # The first n-grams in a chunk may still read the previous ring tail.
-        # Publish current ids only after those lookbacks have been consumed;
-        # a chunk longer than the ring must not overwrite its own history.
-        if slot_mapping is not None and self._cache is not None:
+        # Publish the chunks that do not fit the ring only after those
+        # lookbacks have been consumed; the others were published up front so
+        # expanded-verify candidates could read each other.
+        # ``max_chunk_len`` is the host-side longest chunk
+        # (``dsa.max_query_len``); it uses the same criterion as the per-token
+        # ``fits_ring`` mask above without a device-to-host sync.
+        chunk_len_bound = num_tokens if max_chunk_len is None else max_chunk_len
+        all_chunks_fit_ring = chunk_len_bound + self.lookback_depth <= swa_block_size
+        if early_slots is not None and not all_chunks_fit_ring:
+            slots = slot_mapping.reshape(-1).to(torch.int64)
+            late_slots = torch.where(early_slots >= 0, torch.full_like(slots, -1), slots)
             self._write_hash_cache(
                 comp,
-                slot_mapping,
+                late_slots,
                 # Eager chunks may revisit a physical ring slot, including
                 # mixed batches whose empty rows hide that fact from aggregate
                 # token counts. Graph decode/verify uses fixed row-aligned
@@ -648,15 +698,23 @@ class EngramHashState(nn.Module):
         """
         assert self._cache is not None
         table_cols = block_table.shape[1]
-        # Ring positions are absolute: only negative lookbacks are padding.
-        # Clamping the upper bound aliases every later position to the final
-        # slot when the table contains just the physical ring columns.
+        # Lookbacks are absolute token positions; clamp only negative padding.
+        # An upper clamp would alias later positions to the final table column.
+        # Logical SWA tables retain placeholders, so modulo is normally a no-op.
+        # Bounded rings must match the C++ writer's rotation and table width.
         clamped = lookback.clamp_min(0)
         col = torch.div(clamped, swa_block_size, rounding_mode="floor") % table_cols
         req_safe = req.clamp(0, block_table.shape[0] - 1)
         block = block_table.to(torch.int64)[req_safe, col]
-        slot = (block * swa_block_size + clamped % swa_block_size).clamp(0, self._cache.numel() - 1)
+        missing = block < 0
+        safe_block = torch.where(missing, torch.zeros_like(block), block)
+        slot = (safe_block * swa_block_size + clamped % swa_block_size).clamp(0, self._cache.numel() - 1)
         fallback = self._cache.index_select(0, slot).to(torch.int64)
+        fallback = torch.where(
+            missing,
+            torch.full_like(fallback, ENGRAM_DEAD_ID),
+            fallback,
+        )
         resolved = in_batch if known is None else (in_batch | known)
         return torch.where(resolved, source, fallback)
 

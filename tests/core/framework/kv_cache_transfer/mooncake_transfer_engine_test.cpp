@@ -1519,6 +1519,199 @@ TEST(MooncakeKVCacheTransferDefaultTest,
             std::string::npos);
 }
 
+TEST(MooncakeKVCacheTransferDefaultTest,
+     Dsv41FingerprintIncludesGroupedCacheGeometry) {
+  auto v41_fingerprint = [](std::vector<int32_t> ratios,
+                            std::vector<int32_t> kv_source_layers,
+                            std::vector<int32_t> engram_layers = {},
+                            int32_t max_ngram_size = 0) {
+    auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+        /*listen_port=*/0, torch::Device(torch::kCPU));
+    MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                            /*listen_port=*/0,
+                                            torch::Device(torch::kCPU),
+                                            /*model_type=*/"deepseek_v41",
+                                            std::move(engine));
+    ModelArgs model_args;
+    model_args.model_type("deepseek_v41")
+        .n_layers(43)
+        .n_heads(64)
+        .head_dim(512)
+        .index_n_heads(64)
+        .compress_ratios(std::move(ratios))
+        .kv_source_layer_ids(std::move(kv_source_layers))
+        .engram_layer_ids(std::move(engram_layers))
+        .engram_max_ngram_size(max_ngram_size);
+    transfer.configure_cache_layout(make_args(/*rank=*/0,
+                                              /*world_size=*/1,
+                                              /*dp_size=*/1),
+                                    model_args,
+                                    /*block_token_capacity=*/128,
+                                    /*is_spec_draft=*/false);
+    // configure_cache_layout always publishes a pending context; guard the
+    // deref anyway so a regression fails the EXPECTs below with the actual
+    // (empty) fingerprint instead of crashing.
+    return transfer.pending_registration_context_.has_value()
+               ? transfer.pending_registration_context_->fingerprint
+               : std::string();
+  };
+
+  const std::string fingerprint =
+      v41_fingerprint(/*ratios=*/{2, 1}, /*kv_source_layers=*/{2, 8, 14, 20});
+  EXPECT_NE(fingerprint.find("|dsv41_grouped_geometry:2,8,14,20,"),
+            std::string::npos);
+  EXPECT_NE(fingerprint.find("|dsv41_compress_ratios:2,1,"), std::string::npos);
+
+  // The fingerprint is the first cross-side pairing gate
+  // (same_instance_layout in reshard_planner). A peer running a different
+  // V4.1 layer plan must fail it explicitly instead of pairing and hitting a
+  // resource-semantics error at the first block transfer.
+  const std::string other_plan =
+      v41_fingerprint(/*ratios=*/{1}, /*kv_source_layers=*/{2, 8, 14, 20});
+  EXPECT_NE(fingerprint, other_plan);
+  const std::string engram_enabled =
+      v41_fingerprint({2, 1}, {2, 8, 14, 20}, {1}, 4);
+  EXPECT_NE(fingerprint, engram_enabled);
+  EXPECT_NE(engram_enabled, v41_fingerprint({2, 1}, {2, 8, 14, 20}, {2}, 4));
+  EXPECT_NE(engram_enabled, v41_fingerprint({2, 1}, {2, 8, 14, 20}, {1}, 5));
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     Dsv41GroupedPoolsCarryStateRingWithSwa) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"deepseek_v41",
+                                          std::move(engine));
+  transfer.addr_ = "local";
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v41")
+      .n_layers(3)
+      .n_heads(1)
+      .head_dim(64)
+      .index_n_heads(1)
+      .index_head_dim(32)
+      .compress_ratios({2, 0, 0})
+      .kv_source_layer_ids({0});
+  transfer.configure_cache_layout(make_args(/*rank=*/0,
+                                            /*world_size=*/1,
+                                            /*dp_size=*/1),
+                                  model_args,
+                                  /*block_token_capacity=*/128,
+                                  /*is_spec_draft=*/false);
+
+  // Layer composition mirrors create_dsv4_cache_tensors' V4.1 branch on NPU:
+  // one ratio-2 kv-source layer (C2 pool + fp32 compressor state ring) and
+  // two SWA-only reuse layers.
+  const int64_t block_size = 128;
+  const int64_t head_dim = 64;
+  const int64_t index_head_dim = 32;
+  KVCacheCapacity capacity;
+  capacity.block_size(block_size).swa_count(4).c2_count(8).c1_count(8);
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+  std::vector<KVCache> caches;
+  DeepSeekV4KVCacheTensors c2_layer;
+  c2_layer.compressed_block_type = BlockType::C2;
+  c2_layer.key_cache =
+      torch::zeros({8, block_size, 1, head_dim}, torch::kBFloat16);
+  c2_layer.index_cache =
+      torch::zeros({8, block_size, 1, index_head_dim}, torch::kBFloat16);
+  c2_layer.swa_cache =
+      torch::zeros({4, block_size, 1, head_dim}, torch::kBFloat16);
+  c2_layer.compress_kv_state =
+      torch::zeros({4, block_size, head_dim}, torch::kFloat32);
+  c2_layer.compress_score_state =
+      torch::zeros({4, block_size, head_dim}, torch::kFloat32);
+  caches.emplace_back(c2_layer);
+  for (int32_t layer = 1; layer < 3; ++layer) {
+    DeepSeekV4KVCacheTensors reuse_layer;
+    reuse_layer.swa_cache =
+        torch::zeros({4, block_size, 1, head_dim}, torch::kBFloat16);
+    caches.emplace_back(reuse_layer);
+  }
+
+  transfer.register_kv_cache(caches, shape, torch::kBFloat16);
+
+  // C2 kv-source layer: KEY + INDEX under the C2 group; WINDOW and the two
+  // fp32 state-ring planes under the SWA group. The reuse layers contribute
+  // only their WINDOW.
+  ASSERT_EQ(engine_observer->registered_block_bytes.size(), 1U);
+  ASSERT_EQ(engine_observer->registered_block_bytes[0].size(), 7U);
+  const auto& manifests = transfer.local_cache_layout_.tensors;
+  ASSERT_EQ(manifests.size(), 7U);
+  const auto find_manifest = [&manifests](int64_t layer_id,
+                                          KVCacheTensorRole role) {
+    return std::find_if(manifests.begin(),
+                        manifests.end(),
+                        [layer_id, role](const CacheTensorManifest& manifest) {
+                          return manifest.layer_id == layer_id &&
+                                 manifest.role == static_cast<int32_t>(role);
+                        });
+  };
+  const auto expect_manifest_group = [&](KVCacheTensorRole role,
+                                         BlockType expected_block_type) {
+    const auto manifest = find_manifest(0, role);
+    ASSERT_NE(manifest, manifests.end()) << role.to_string();
+    EXPECT_EQ(manifest->group_id, cache_group_id(expected_block_type))
+        << role.to_string();
+  };
+  expect_manifest_group(KVCacheTensorRole::KEY, BlockType::C2);
+  expect_manifest_group(KVCacheTensorRole::INDEX, BlockType::C2);
+  expect_manifest_group(KVCacheTensorRole::WINDOW, BlockType::SWA);
+  expect_manifest_group(KVCacheTensorRole::KV_STATE, BlockType::SWA);
+  expect_manifest_group(KVCacheTensorRole::SCORE_STATE, BlockType::SWA);
+  // The state ring is one resource per SWA block row, not per token.
+  const auto kv_state = find_manifest(0, KVCacheTensorRole::KV_STATE);
+  ASSERT_NE(kv_state, manifests.end());
+  EXPECT_EQ(kv_state->physical_rows_per_resource, 1U);
+  EXPECT_EQ(kv_state->shape, (std::vector<int64_t>{4, block_size, head_dim}));
+
+  // The load-bearing PD invariant: a SWA-group block mapping fans out to
+  // every buffer registered under that group, so the parked partial-group
+  // state rows transfer with the SWA blocks without any extra mapping.
+  std::vector<KVTransferMapping> mappings;
+  KVTransferMapping swa_mapping;
+  swa_mapping.group_id = cache_group_id(BlockType::SWA);
+  swa_mapping.local_ids = {1};
+  swa_mapping.remote_ids = {2};
+  KVTransferMapping c2_mapping;
+  c2_mapping.group_id = cache_group_id(BlockType::C2);
+  c2_mapping.local_ids = {3};
+  c2_mapping.remote_ids = {4};
+  mappings.emplace_back(swa_mapping);
+  mappings.emplace_back(c2_mapping);
+  std::vector<MooncakeTransferEngine::BufferTransferMapping> buffer_mappings;
+  ASSERT_TRUE(transfer.append_buffer_mappings(transfer.main_layout_,
+                                              /*layer_ids=*/{},
+                                              mappings,
+                                              &buffer_mappings));
+  const auto& layer_buffers = transfer.main_layout_.layers[0];
+  const auto find_buffer = [&layer_buffers](KVCacheTensorRole role) {
+    return std::find_if(
+        layer_buffers.begin(),
+        layer_buffers.end(),
+        [role](const MooncakeKVCacheTransferDefault::RegisteredBufferDesc&
+                   buffer) { return buffer.role == role; });
+  };
+  for (const KVCacheTensorRole role :
+       {KVCacheTensorRole::KV_STATE, KVCacheTensorRole::SCORE_STATE}) {
+    const auto buffer = find_buffer(role);
+    ASSERT_NE(buffer, layer_buffers.end()) << role.to_string();
+    const auto mapped = std::find_if(
+        buffer_mappings.begin(),
+        buffer_mappings.end(),
+        [&buffer](const MooncakeTransferEngine::BufferTransferMapping& m) {
+          return m.buf_id == buffer->buf_id;
+        });
+    ASSERT_NE(mapped, buffer_mappings.end()) << role.to_string();
+    EXPECT_EQ(mapped->local_ids, std::vector<uint64_t>{1}) << role.to_string();
+    EXPECT_EQ(mapped->remote_ids, std::vector<uint64_t>{2}) << role.to_string();
+  }
+}
+
 TEST(MooncakeKVCacheTransferDefaultTest, RegistersCompressedIndexAndKpoolTail) {
   for (const int32_t pool_size : {1, 4}) {
     SCOPED_TRACE(pool_size);
