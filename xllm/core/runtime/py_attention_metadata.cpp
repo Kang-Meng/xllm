@@ -91,6 +91,9 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly(
           "q_cu_seq_lens_host_values",
           &PyAttentionMetadataView::q_cu_seq_lens_host_values)
+      .def_property_readonly(
+          "linear_state_validity_host_values",
+          &PyAttentionMetadataView::linear_state_validity_host_values)
 #endif
       .def_property_readonly("kv_cu_seq_lens",
                              &PyAttentionMetadataView::kv_cu_seq_lens)
@@ -236,6 +239,18 @@ PyAttentionMetadataView::PyAttentionMetadataView(
     : PyAttentionMetadataView(std::move(metadata)) {
   CHECK_GT(dummy_token_count, 0);
   new_cache_slots_host_values_ = params.attention.host.new_cache_slots;
+#if defined(USE_NPU)
+  // Host twin of has_initial_states, populated only when the materialized
+  // device tensor exists and carries exactly one row per validity entry --
+  // the NPU builder's verbatim torch::tensor(params mask) form. Dummy or
+  // graph-padded forms leave the twin empty so Python falls back to reading
+  // the tensor itself.
+  if (metadata_->has_initial_states.defined() &&
+      static_cast<int64_t>(params.linear_state_validity_mask.size()) ==
+          metadata_->has_initial_states.numel()) {
+    linear_state_validity_host_values_ = params.linear_state_validity_mask;
+  }
+#endif
   multi_block_tables_ = params.multi_block_tables;
   linear_state_indices_ = params.embedding.linear_state_indices;
   num_accepted_tokens_ = params.num_accepted_tokens;
@@ -334,6 +349,11 @@ py::object PyAttentionMetadataView::q_cu_seq_lens() const {
 const std::vector<int64_t>& PyAttentionMetadataView::q_cu_seq_lens_host_values()
     const {
   return metadata_->q_cu_seq_lens_host_vec;
+}
+
+const std::vector<int64_t>&
+PyAttentionMetadataView::linear_state_validity_host_values() const {
+  return linear_state_validity_host_values_;
 }
 #endif
 

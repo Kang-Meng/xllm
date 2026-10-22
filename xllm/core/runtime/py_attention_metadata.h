@@ -79,6 +79,12 @@ class PyAttentionMetadataView final {
   pybind11::object q_cu_seq_lens() const;
 #if defined(USE_NPU)
   const std::vector<int64_t>& q_cu_seq_lens_host_values() const;
+  // Host twin of has_initial_state: the same host validity vector the NPU
+  // metadata builder materialized the device tensor from. Empty when the
+  // materialized tensor is absent or its row count diverges from the host
+  // vector (dummy / graph-padded forms), so callers must length-check
+  // before trusting it and fall back to the tensor otherwise.
+  const std::vector<int64_t>& linear_state_validity_host_values() const;
 #endif
   pybind11::object kv_cu_seq_lens() const;
   pybind11::object kv_seq_lens_host() const;
@@ -136,6 +142,9 @@ class PyAttentionMetadataView final {
   torch::Tensor kv_seq_lens_host_;
   torch::Tensor q_seq_lens_host_;
   std::vector<int32_t> new_cache_slots_host_values_;
+#if defined(USE_NPU)
+  std::vector<int64_t> linear_state_validity_host_values_;
+#endif
   std::vector<torch::Tensor> multi_block_tables_;
   torch::Tensor linear_state_indices_;
   torch::Tensor linear_state_read_indices_;

@@ -331,13 +331,22 @@ def test_merged_input_forward_preserves_backend_arguments_and_output(
     reductions = []
 
     def _execute_linear(
-        mixed_qkv: torch.Tensor, beta_raw_arg: torch.Tensor, layer: torch.nn.Module, *, raw_gate_proj: torch.Tensor
+        mixed_qkv: torch.Tensor,
+        beta_raw_arg: torch.Tensor,
+        layer: torch.nn.Module,
+        *,
+        raw_gate_proj: torch.Tensor,
+        cp_context: object = None,
     ) -> torch.Tensor:
         assert layer is attention
         torch.testing.assert_close(mixed_qkv, expected_qkv)
         assert beta_raw_arg.dtype == beta_raw.dtype
         torch.testing.assert_close(beta_raw_arg, beta_raw)
         torch.testing.assert_close(raw_gate_proj, expected_raw)
+        # With no CP context in this test (enable_kda_cp defaults true but
+        # the forward context carries no cp_context) the model hands the
+        # backend the legacy merged-row contract: no cp_context rides along.
+        assert cp_context is None
         return core_output
 
     backend = SimpleNamespace(execute_linear=_execute_linear)

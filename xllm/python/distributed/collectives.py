@@ -355,6 +355,21 @@ def cp_world_size(device: torch.device | str) -> int:
     return group.size() if group is not None else 1
 
 
+def cp_process_group(device: torch.device | str) -> ProcessGroup:
+    """The CP group for direct ``torch.distributed`` calls.
+
+    The graph-operator collectives above (``all_gather`` / ``broadcast_``)
+    are synchronous by construction; callers that need an async work handle
+    or point-to-point ops resolve the raw ProcessGroup here. Raises when
+    the CP group was never initialized for ``device`` -- the same contract
+    ``_require_group`` gives the wrapped collectives.
+    """
+    group = _groups.get(("cp", str(torch.device(device))))
+    if group is None:
+        raise RuntimeError(f"cp process group was not initialized for {device}")
+    return group
+
+
 def layerwise_rank(device: torch.device | str) -> int:
     """Rank in the layerwise split group, or zero when disabled."""
     group = _groups.get(("layerwise", str(torch.device(device))))

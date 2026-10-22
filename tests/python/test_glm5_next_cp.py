@@ -367,6 +367,9 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     attention.conv_dim = 3
     attention.num_heads_local = 1
     attention.tp = 1
+    # The config-channel switch (the ctor normally stores it from
+    # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
         dim=-1,
@@ -389,7 +392,7 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     gather = _patch_cp_gather(monkeypatch, remote_by_local)
 
     backend = MagicMock()
-    backend.execute_linear.side_effect = lambda mixed_qkv, _beta, _layer, *, raw_gate_proj: (
+    backend.execute_linear.side_effect = lambda mixed_qkv, _beta, _layer, *, raw_gate_proj, cp_context=None: (
         mixed_qkv[:, :1].transpose(1, 2).unsqueeze(2)
     )
     with patch.object(
@@ -421,6 +424,9 @@ def test_kda_cp_one_keeps_full_postprocessing() -> None:
     attention.conv_dim = 3
     attention.num_heads_local = 1
     attention.tp = 1
+    # The config-channel switch (the ctor normally stores it from
+    # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
         dim=-1,
@@ -518,6 +524,9 @@ def test_kda_cp_projects_only_local_rows_and_overwrites_padding(monkeypatch) -> 
     attention.conv_dim = 12
     attention.num_heads_local = 2
     attention.tp = 2
+    # The config-channel switch (the ctor normally stores it from
+    # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.enable_kda_cp = False
     attention.input_projection_sizes = (12, 2, 4)
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (
@@ -577,6 +586,9 @@ def test_kda_pcp_eplv2_sp_masks_padding_before_reducing() -> None:
     attention.conv_dim = 12
     attention.num_heads_local = 2
     attention.input_projection_sizes = (12, 2, 4)
+    # The config-channel switch (the ctor normally stores it from
+    # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.enable_kda_cp = False
     attention.cfg = SimpleNamespace(hidden_size=3)
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (
@@ -1756,6 +1768,9 @@ def _make_kda_attention_for_cross_rank_test() -> glm5_next.Glm5NextKdaAttention:
     attention.conv_dim = 3
     attention.num_heads_local = 1
     attention.tp = 1
+    # The config-channel switch (the ctor normally stores it from
+    # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
         dim=-1,
@@ -1786,6 +1801,9 @@ def _make_kda_attention_for_handoff_test() -> glm5_next.Glm5NextKdaAttention:
     attention.activation = "identity"
     attention.num_heads_local = 1
     attention.tp = 1
+    # The config-channel switch (the ctor normally stores it from
+    # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
         dim=-1,

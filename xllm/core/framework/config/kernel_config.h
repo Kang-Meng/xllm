@@ -53,6 +53,7 @@ class KernelConfig final {
          "enable_dspark_native_sas",
          "enable_flashcomm1",
          "enable_dsa_cp",
+         "enable_kda_cp",
          "flashcomm1_min_prefill_tokens",
          "enable_mmrs_fusion",
          "mmrs_comm_mode"}};
@@ -85,6 +86,8 @@ class KernelConfig final {
   PROPERTY(bool, enable_flashcomm1) = false;
 
   PROPERTY(bool, enable_dsa_cp) = false;
+
+  PROPERTY(bool, enable_kda_cp) = true;
 
   PROPERTY(int32_t, flashcomm1_min_prefill_tokens) = 8192;
 

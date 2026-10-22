@@ -63,6 +63,7 @@ except ImportError:
 
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import MlaIndexContext
+from xllm.python.attention.kda_linear_attention import kda_cp_prefill_eligible
 from xllm.python.layers.moe import MoECore, clamped_silu_and_mul
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.npu.glm5_next_metadata import Glm5NextEplv2Metadata
@@ -130,6 +131,37 @@ from xllm.python.models.glm5_next_kpool import (
     pooled_states as _kpool_pooled_states,
 )
 from xllm.python.npu_streams import shared_expert_stream
+
+# KDA context-parallel prefill (two-pass scheme): when enabled AND the shared
+# eligibility gate passes (prefill-shaped step under cp_size>1, not
+# spec-verify/mixed, every zigzag segment a whole 64-token KDA chunk, the
+# xllm CP ops available -- the standard custom_xllm_math vendor resolved by
+# the gate's probe), the KDA forward skips the cp_merge_rows of
+# mixed_qkv/g_raw/beta_raw and hands the backend LOCAL zigzag rows plus the
+# cp_context; the backend runs per-segment conv with halo exchange, WY-factor
+# summaries (from the standalone prepare op), one summary all-gather, a
+# causal-order fp32 merge, a local replay, and a final-state broadcast from
+# the causally-last segment owner so every rank still writes bit-identical
+# conv/ssm replicas (the invariant PD transfer, MTP checkpoints and the
+# prefix cache rely on). The output rows come back already local, so the
+# cp_shard_rows re-shard is skipped too.
+#
+# NUMERICS: the two-pass compose is NOT bit-exact against the merged path for
+# segments with >= 2 prior segments (~6.6e-4 rel_fro at toy shapes, task
+# research m1; acceptance budget 8e-3, the fla KDA recipe's bf16 tolerance —
+# every measurement sits >= 5x inside it), and since ma2-2 the prepare-only
+# summary factors differ from the fused emission at 1-ulp (hm shift ~1.7e-4
+# rel_fro, 4x inside that compose divergence), so no segment is bit-exact —
+# the flag-on oracle is tolerance-based (greedy text equality + logprobs
+# bound), unlike the indexer alpha partition's bit-exact gate. Every rank of
+# the CP group evaluates the same gate over the same rank-uniform metadata,
+# so gating cannot desynchronize the group; short/unaligned segments take the
+# legacy merged path on ALL ranks. The switch is the engine deployment gflag
+# --enable_kda_cp (bool, default true — the two-pass scheme is the ONLY
+# shipped KDA CP implementation, so the bounded divergence above is the
+# shipped behavior; KernelConfig, forwarded through the model config dict —
+# static and rank-uniform because gflags parse once per process).
+# --enable_kda_cp=false keeps the byte-identical legacy path.
 
 # xllm Attention base — present in the real engine (full xllm.python package).
 # Under the standalone stub-loader align path the package is not wired, so fall
@@ -256,6 +288,10 @@ class Glm5NextConfig:
     expert_parallel_degree: int = 0
     enable_mega_moe: bool = False
     enable_fused_mc2: bool = False
+    # KDA context-parallel prefill switch (the --enable_kda_cp engine gflag,
+    # forwarded via the model config dict; the two-pass scheme is the only
+    # shipped implementation, so the default is true).
+    enable_kda_cp: bool = True
     mega_moe_context: torch.Tensor | None = None
     mega_moe_ccl_buffer_size: int = 0
     mega_moe_num_max_tokens_per_rank: int = 0
@@ -374,6 +410,7 @@ class Glm5NextConfig:
             expert_parallel_degree=degree,
             enable_mega_moe=bool(pick("enable_mega_moe", default=False)),
             enable_fused_mc2=bool(pick("enable_fused_mc2", default=False)),
+            enable_kda_cp=bool(pick("enable_kda_cp", default=True)),
             mega_moe_context=pick("mega_moe_context", default=None),
             mega_moe_ccl_buffer_size=int(pick("mega_moe_ccl_buffer_size", default=0)),
             mega_moe_num_max_tokens_per_rank=int(pick("mega_moe_num_max_tokens_per_rank", default=0)),
@@ -625,6 +662,18 @@ class Glm5NextKdaAttention(Attention):
         if self.activation not in ("identity", "silu"):
             raise ValueError(f"Unsupported KDA convolution activation: {self.activation}")
         self.eps = cfg.rms_norm_eps
+        # KDA context-parallel prefill switch (the --enable_kda_cp engine
+        # gflag via the model config dict). Static and rank-uniform: gflags
+        # parse once per process and every CP rank builds the same config
+        # dict from the same engine flags, so the switch cannot diverge
+        # mid-group. The two-pass scheme is the only shipped KDA CP
+        # implementation (the fused summary operator stayed out of the
+        # standard custom_xllm_math vendor per the G5 verdict), so the flag
+        # is a plain boolean with no value surface to validate; when the CP
+        # ops are unavailable, the shared eligibility gate's process-global
+        # probe declines on every rank alike and the legacy merged path
+        # runs (the designed graceful fallback).
+        self.enable_kda_cp = cfg.enable_kda_cp
 
         projection_sizes = tuple(getattr(self, size_attr) for _, size_attr, _ in _KDA_IN_PROJ)
         # Follow checkpoint row order; equal-sized f_a/g_a blocks must not be exchanged.
@@ -700,7 +749,17 @@ class Glm5NextKdaAttention(Attention):
                 "Glm5NextKdaAttention requires an attention backend with execute_linear; run inside the engine."
             )
         cp_context = getattr(ctx, "cp_context", None)
-        if cp_context is not None:
+        # KDA CP eligibility comes only from rank-uniform state (batch
+        # metadata + zigzag chunk arithmetic + the one-time CP-ops probe in
+        # the shared helper), so every CP rank takes the same branch here.
+        # The switch itself is the static, rank-uniform enable_kda_cp config
+        # (--enable_kda_cp; false keeps the byte-identical legacy path).
+        kda_cp_active = (
+            self.enable_kda_cp
+            and cp_context is not None
+            and kda_cp_prefill_eligible(cp_context, getattr(ctx, "metadata", None), self)
+        )
+        if cp_context is not None and not kda_cp_active:
             # Merging to global rows is also what makes the per-sequence conv/ssm
             # state safe to *replicate* across the CP ranks when KV is
             # owner-sharded (BlockType::LINEAR is not a kv-split block type):
@@ -715,9 +774,20 @@ class Glm5NextKdaAttention(Attention):
             ).unsqueeze(0)
             beta_raw = cp_merge_rows(beta_raw.reshape(-1, self.num_heads_local), cp_context).unsqueeze(0)
 
-        core_attn_out = backend.execute_linear(mixed_qkv, beta_raw, self, raw_gate_proj=g_raw)
+        # cp_context rides along ONLY on the CP branch: the backend then
+        # receives LOCAL zigzag rows (the merge above was skipped) and
+        # returns local rows directly, so the cp_shard_rows re-shard below
+        # is skipped as well. The legacy path passes None and stays
+        # byte-identical to the pre-flag behavior.
+        core_attn_out = backend.execute_linear(
+            mixed_qkv,
+            beta_raw,
+            self,
+            raw_gate_proj=g_raw,
+            cp_context=cp_context if kda_cp_active else None,
+        )
 
-        if cp_context is not None:
+        if cp_context is not None and not kda_cp_active:
             core_attn_out = cp_shard_rows(
                 core_attn_out.reshape(-1, self.num_heads_local, self.head_dim),
                 cp_context,

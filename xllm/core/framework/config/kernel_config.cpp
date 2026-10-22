@@ -83,6 +83,18 @@ DEFINE_bool(enable_dsa_cp,
             "prefill and chunked prefill. Requires cp_size=1; decode keeps "
             "the original TP path.");
 
+DEFINE_bool(enable_kda_cp,
+            true,
+            "Enable the two-pass KDA context-parallel prefill for the Python "
+            "glm5_next model over the CP group. The two-pass scheme is the "
+            "only shipped KDA CP implementation, hence the default true; "
+            "when the shared eligibility gate declines (cp_size=1, decode, "
+            "spec-verify/mixed batches, non-64-multiple zigzag segments, or "
+            "the standard custom_xllm_math vendor unavailable) every rank "
+            "takes the legacy merged full-stream prefill. Set false to force "
+            "the byte-identical legacy path. Only read on NPU; rank-uniform "
+            "by construction (gflags parse once per process).");
+
 DEFINE_int32(flashcomm1_min_prefill_tokens,
              8192,
              "Minimum prefill token count to activate FC1.");
@@ -133,6 +145,7 @@ void KernelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dspark_native_sas);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_flashcomm1);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dsa_cp);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_kda_cp);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(flashcomm1_min_prefill_tokens);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mmrs_fusion);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(mmrs_comm_mode);
@@ -154,6 +167,7 @@ void KernelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dspark_native_sas);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_flashcomm1);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dsa_cp);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_kda_cp);
   XLLM_CONFIG_ASSIGN_FROM_JSON(flashcomm1_min_prefill_tokens);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mmrs_fusion);
   XLLM_CONFIG_ASSIGN_FROM_JSON(mmrs_comm_mode);
@@ -162,6 +176,8 @@ void KernelConfig::from_json(const JsonReader& json) {
       << "enable_dspark_native_sas is only supported on NPU.";
   CHECK(!json.value_or<bool>("enable_dsa_cp", false))
       << "enable_dsa_cp is only supported on NPU.";
+  CHECK(!json.value_or<bool>("enable_kda_cp", false))
+      << "enable_kda_cp is only supported on NPU.";
 #endif
 }
 
@@ -195,6 +211,8 @@ void KernelConfig::append_config_json(
       config_json, default_config, enable_flashcomm1);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dsa_cp);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_kda_cp);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, flashcomm1_min_prefill_tokens);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

@@ -581,6 +581,11 @@ py::dict PyCausalLM::build_config_dict(
   d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
   d["enable_dsa_cp"] = KernelConfig::get_instance().enable_dsa_cp() &&
                        !speculative_runtime_config.is_draft_engine;
+  // KDA CP prefill switch for glm5_next (the two-pass scheme is the only
+  // shipped implementation); the Python model gate reads it at build time.
+  // Missing key = true (non-NPU builds do not emit it; the Python gate then
+  // declines via the CP-ops availability branch and takes the legacy path).
+  d["enable_kda_cp"] = KernelConfig::get_instance().enable_kda_cp();
   const auto& eplb_config = EPLBConfig::get_instance();
   // Typed GLM5.2 EP metadata is registered from ep_size; degree-2 decode
   // admits the graph-capturable MC2 transport inside the capacity window,
