@@ -122,10 +122,8 @@ int32_t BlockManagerPool::get_manager_with_max_available_blocks() const {
   std::vector<size_t> candidate_indices;
   candidate_indices.reserve(block_managers_.size());
   for (size_t i = 0; i < block_managers_.size(); ++i) {
-    const size_t total_blocks = block_managers_[i]->num_total_blocks();
-    const size_t used_blocks = block_managers_[i]->num_used_blocks();
-    CHECK_LE(used_blocks, total_blocks);
-    const size_t available_blocks = total_blocks - used_blocks;
+    const size_t available_blocks = block_managers_[i]->num_available_blocks();
+    CHECK_LE(available_blocks, block_managers_[i]->num_total_blocks());
     if (candidate_indices.empty() || available_blocks > max_available) {
       max_available = available_blocks;
       candidate_indices.clear();
@@ -398,6 +396,14 @@ std::vector<size_t> BlockManagerPool::num_free_blocks() const {
   return num_free_blocks;
 }
 
+std::vector<size_t> BlockManagerPool::num_available_blocks() const {
+  std::vector<size_t> available(block_managers_.size());
+  for (size_t dp_rank = 0; dp_rank < block_managers_.size(); ++dp_rank) {
+    available[dp_rank] = block_managers_[dp_rank]->num_available_blocks();
+  }
+  return available;
+}
+
 std::vector<size_t> BlockManagerPool::num_used_blocks() const {
   std::vector<size_t> num_used_blocks(block_managers_.size());
   for (size_t dp_rank = 0; dp_rank < block_managers_.size(); ++dp_rank) {
@@ -436,26 +442,6 @@ BlockManagerPool::block_utilization_by_type_per_dp() const {
             ->block_utilization_by_type());
   }
   return utilization;
-}
-
-// currently use only for profile, which not need prefix cache.
-// If more often used in the future, can be integrated into deallocate function.
-void BlockManagerPool::deallocate_without_cache(Sequence* sequence) {
-  DCHECK(sequence != nullptr);
-  int32_t dp_rank = get_dp_rank(sequence);
-  // Release every leaf's blocks directly (no prefix-cache final flush).
-  for (const BlockType type : {BlockType::KV,
-                               BlockType::SWA,
-                               BlockType::C4,
-                               BlockType::C128,
-                               BlockType::EMBEDDING,
-                               BlockType::LINEAR}) {
-    std::vector<Block> blocks = sequence->kv_state().take_blocks(type);
-    if (!blocks.empty()) {
-      block_managers_[dp_rank]->deallocate(std::move(blocks));
-    }
-  }
-  sequence->reset();
 }
 
 void BlockManagerPool::reserve_xtensor_padding_blocks() {

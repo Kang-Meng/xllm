@@ -2897,13 +2897,13 @@ TEST(DecodeRestoreTest, PrefillHandoffKeepsGrowthReserve) {
       EXPECT_EQ(result,
                 prompt_tokens == 64 ? DecodeAdmissionResult::RETRY_LATER
                                     : DecodeAdmissionResult::ADMITTED);
-      pool.deallocate_without_cache(probe->sequences().front().get());
+      probe->sequences().front()->reset();
       probe.reset();
       harness.admission().publish(load);
       EXPECT_EQ(pool.num_used_blocks()[0], 2u);
     }
   }
-  pool.deallocate_without_cache(sequence);
+  sequence->reset();
 }
 
 }  // namespace xllm

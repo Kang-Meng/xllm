@@ -209,8 +209,9 @@ class Block final {
   // increase reference count
   void inc_ref_count();
 
-  // decrease reference count
-  void dec_ref_count();
+  // Decrement the shared refcount, then free(this). free() reads the
+  // post-decrement refcount from this block.
+  void release();
 
   // block id
   int32_t id_ = -1;

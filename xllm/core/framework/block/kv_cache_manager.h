@@ -92,6 +92,11 @@ class KVCacheManager {
   virtual void reset_prefix_cache() {}
   virtual std::vector<size_t> num_blocks_in_prefix_cache() const = 0;
   virtual std::vector<size_t> num_free_blocks() const = 0;
+  // Per-DP admission headroom: free blocks plus evictable prefix-cache
+  // residents. Managers without a prefix cache report the free-block count.
+  virtual std::vector<size_t> num_available_blocks() const {
+    return num_free_blocks();
+  }
   virtual std::vector<size_t> num_used_blocks() const = 0;
   virtual double kv_cache_utilization() const = 0;
   // Per-DP KV-pool usage ratios for monitoring. Values are not device-memory

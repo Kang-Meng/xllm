@@ -54,8 +54,8 @@ Block::Block(int32_t id, BlockManager* manager)
 }
 
 Block::~Block() {
-  // decrease reference count
-  dec_ref_count();
+  // Decrement first. free() then sees the post-decrement count.
+  release();
 }
 
 // copy constructor
@@ -73,7 +73,7 @@ Block::Block(const Block& other)
 // copy assignment
 Block& Block::operator=(const Block& other) {
   if (this != &other) {
-    dec_ref_count();
+    release();
 
     id_ = other.id_;
     size_ = other.size_;
@@ -103,7 +103,7 @@ Block::Block(Block&& other) noexcept
 
 Block& Block::operator=(Block&& other) noexcept {
   if (this != &other) {
-    dec_ref_count();
+    release();
 
     id_ = other.id_;
     size_ = other.size_;
@@ -122,13 +122,14 @@ Block& Block::operator=(Block&& other) noexcept {
 }
 
 void Block::inc_ref_count() {
-  if (ref_count_ != nullptr) {
-    // Another alias appearing only needs atomicity, not ordering, so relaxed.
-    ref_count_->fetch_add(1, std::memory_order_relaxed);
+  if (ref_count_ == nullptr) {
+    return;
   }
+  // Another alias appearing only needs atomicity, not ordering, so relaxed.
+  ref_count_->fetch_add(1, std::memory_order_relaxed);
 }
 
-void Block::dec_ref_count() {
+void Block::release() {
   if (ref_count_ == nullptr) {
     return;
   }
@@ -136,13 +137,15 @@ void Block::dec_ref_count() {
   // thread that drives the count to zero observes all prior alias writes before
   // it frees. fetch_sub returns the previous value; == 1 means we just hit
   // zero.
-  if (ref_count_->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-    // release the reference count memory
+  const uint32_t previous = ref_count_->fetch_sub(1, std::memory_order_acq_rel);
+  if (previous == 1) {
     delete ref_count_;
-    // return the block id to the manager
-    if (manager_ != nullptr) {
-      manager_->free(id_);
-    }
+    ref_count_ = nullptr;
+  }
+  // free() reads this block after the decrement. refcount() is 0 when this
+  // alias was the last one.
+  if (manager_ != nullptr) {
+    manager_->free(this);
   }
 }
 

@@ -38,15 +38,6 @@ class SlidingWindowBlockManager : public BlockManagerImpl {
   bool allocate_for_prefetch(Sequence* seq, size_t num_tokens) override;
   void trim_prefetch_blocks(Sequence* seq, size_t max_hit_tokens) override;
 
-  // Gap-tolerant SWA probe. Delegates to LinearStatePrefixCache::match; see
-  // that class for the shape returned. Composite owns the tail-continuity
-  // check and the min-across-leaves clamp.
-  std::vector<Block> allocate_shared(
-      const Slice<int32_t>& token_ids,
-      const Slice<Block>& existed_shared_blocks = {},
-      const MMData& mm_data = MMData(),
-      const Slice<XXH3Key>& block_hashes = {}) override;
-
   uint32_t swa_blocks_per_seq() const { return options_.swa_blocks_per_seq(); }
 
  private:

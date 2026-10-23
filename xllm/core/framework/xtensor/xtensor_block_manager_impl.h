@@ -58,9 +58,6 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Allocate num_blocks blocks
   std::vector<Block> allocate(size_t num_blocks) override;
 
-  // Deallocate blocks
-  void deallocate(std::vector<Block>&& blocks) override;
-
   // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
   // (physical allocate() maps VMM pages) and return them; the
   // CompositeBlockManager commits them under BlockType::KV. std::nullopt on
@@ -99,8 +96,8 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Get KV cache utilization
   double kv_cache_utilization() const override;
 
-  // Free a single block by id
-  void free(int32_t block_id) override;
+  // XTensor has no prefix cache. Recycle the page only when refcount is 0.
+  void free(const Block* block) override;
 
   // Allocate a single block
   Block allocate() override;

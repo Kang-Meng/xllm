@@ -33,8 +33,6 @@ class BlockManagerImpl : public BlockManager {
   // return {} if not enough blocks
   std::vector<Block> allocate(size_t num_blocks) override;
 
-  void deallocate(std::vector<Block>&& blocks) override;
-
   // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
   // and return them (does not insert into the sequence). The shared default for
   // flat-KV / compressed / xtensor leaves; SlidingWindow and Single override.
@@ -77,16 +75,17 @@ class BlockManagerImpl : public BlockManager {
   // free blocks num
   size_t num_free_blocks() const override { return num_free_blocks_; }
 
-  // used blocks num
-  size_t num_used_blocks() const override { return num_used_blocks_; }
+  // Sequence-held blocks: the usable pool fixed at init, minus free blocks,
+  // minus prefix-cache residents that can be evicted.
+  size_t num_used_blocks() const override;
+
+  size_t num_evictable_blocks() const override;
 
   // current kv cache utilization.
-  double kv_cache_utilization() const override {
-    return static_cast<double>(num_used_blocks_) / num_total_blocks();
-  }
+  double kv_cache_utilization() const override;
 
-  // call BlockManager to free block used by Block.
-  void free(int32_t block_id) override;
+  // See BlockManager::free.
+  void free(const Block* block) override;
 
   // allocate a list of blocks
   // std::vector<Block> allocate(uint32_t n_blocks) override;
@@ -96,14 +95,6 @@ class BlockManagerImpl : public BlockManager {
 
   // total blocks num
   size_t num_total_blocks() const override { return free_blocks_.size() - 1; }
-
- protected:
-  // Flip a block's entry in `usage_ids` from 0 to 1. Returns true if the flip
-  // happened; false if the entry was already 1 (i.e. block was already marked
-  // used). Shared with subclasses (e.g. SlidingWindowBlockManager) that need
-  // to reproduce the base allocate_shared refcount bookkeeping over their own
-  // custom probe path. Static-friendly signature keeps callers free of `this`.
-  static bool mark_used(std::vector<uint8_t>* usage_ids, int32_t block_id);
 
  private:
   // check if has enough slots, if not, try to evict some blocks
@@ -117,9 +108,6 @@ class BlockManagerImpl : public BlockManager {
   // reserved block id for padding
   Block padding_block_;
 
-  // number of used blocks
-  std::atomic<size_t> num_used_blocks_{0};
-
   // free block count
   std::atomic<size_t> num_free_blocks_{0};
 
@@ -129,7 +117,8 @@ class BlockManagerImpl : public BlockManager {
   // free block list
   std::vector<int32_t> free_blocks_;
 
-  // Whether a block is already counted in num_used_blocks_.
+  // 1 once a block id has been handed out and not yet returned to the free
+  // list.
   std::vector<uint8_t> usage_accounted_ids_;
 };
 

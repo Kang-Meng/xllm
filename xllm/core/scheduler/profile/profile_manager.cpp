@@ -997,8 +997,7 @@ int32_t ProfileManager::measure_graph_decode_capacity(
 
   const int32_t allocatable_sequences = static_cast<int32_t>(requests.size());
   for (const std::shared_ptr<Request>& request : requests) {
-    block_manager_pool_->deallocate_without_cache(
-        request->sequences()[0].get());
+    request->sequences()[0]->reset();
   }
   return allocatable_sequences;
 }
@@ -1046,8 +1045,7 @@ double ProfileManager::run_request(int32_t token_length,
   }
   double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
   for (auto& request : requests) {
-    block_manager_pool_->deallocate_without_cache(
-        request->sequences()[0].get());
+    request->sequences()[0]->reset();
   }
 
   return latency;
@@ -1089,8 +1087,7 @@ double ProfileManager::run_request(
   }
   double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
   for (auto& request : requests) {
-    block_manager_pool_->deallocate_without_cache(
-        request->sequences()[0].get());
+    request->sequences()[0]->reset();
   }
 
   return latency;
@@ -1121,8 +1118,7 @@ double ProfileManager::run_decode_request(
   }
   double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
   for (auto& request : requests) {
-    block_manager_pool_->deallocate_without_cache(
-        request->sequences()[0].get());
+    request->sequences()[0]->reset();
   }
 
   return latency;
@@ -1159,8 +1155,7 @@ double ProfileManager::run_graph_decode_request(
   }
   double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
   for (auto& request : requests) {
-    block_manager_pool_->deallocate_without_cache(
-        request->sequences()[0].get());
+    request->sequences()[0]->reset();
   }
 
   return latency;

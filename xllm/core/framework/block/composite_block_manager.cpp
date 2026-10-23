@@ -551,17 +551,10 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
   // on failure). Stage keyed by BlockType; commit only after every leaf
   // succeeds so a failure rolls back cleanly.
   std::map<BlockType, std::vector<Block>> staged;
-  auto release_staged = [&]() {
-    for (auto& [type, blocks] : staged) {
-      leaf_of(type)->deallocate(std::move(blocks));
-    }
-    staged.clear();
-  };
 
   for (auto& [type, entry] : leaves_) {
     auto blocks = entry.leaf->allocate_for_sequence(seq, kv_state, num_tokens);
     if (!blocks.has_value()) {
-      release_staged();
       return false;
     }
     if (!blocks->empty()) {
@@ -589,7 +582,6 @@ bool CompositeBlockManager::allocate_sequence(Sequence* seq,
         staged_it == staged.end() ? 0 : staged_it->second.size();
     const size_t total = kv_state.num_blocks(type) + staged_for_type;
     if (total < needed) {
-      release_staged();
       return false;
     }
   }
@@ -617,8 +609,9 @@ void CompositeBlockManager::deallocate_for_sequence(Sequence* seq,
   // Publish prefix cache first, then release blocks. seq->reset() belongs to
   // the pool caller.
   cache_for_sequence(seq);
-  for (auto& [type, entry] : leaves_) {
-    entry.leaf->deallocate(kv_state.take_blocks(type));
+  for (const auto& [type, entry] : leaves_) {
+    (void)entry;
+    kv_state.erase_blocks(type);
   }
 }
 
@@ -673,27 +666,12 @@ CompositeBlockManager::probe_prefix_cache(Sequence* seq,
   return probes;
 }
 
-void CompositeBlockManager::release_probes(std::vector<ProbeResult>* probes) {
-  if (probes == nullptr) {
-    return;
-  }
-  // Clear aliases immediately after returning them. Concurrent deallocate
-  // accounting depends on observing only the cache and current caller refs.
-  for (ProbeResult& probe : *probes) {
-    if (probe.blocks.empty()) {
-      continue;
-    }
-    probe.leaf->deallocate(std::move(probe.blocks));
-  }
-  probes->clear();
-}
-
 namespace {
 
 using ProbeResult = CompositeBlockManager::ProbeResult;
 
-// Trim outcome. `to_mount` feeds the shape's mount step; `to_drop` goes to
-// leaf->deallocate() (cache release, not physical free).
+// Trim outcome. `to_mount` feeds the shape's mount step; `to_drop` is
+// destroyed with the probe so its Block references fall on their own.
 struct TrimOutcome {
   std::vector<ProbeResult> to_mount;
   std::vector<ProbeResult> to_drop;
@@ -913,7 +891,7 @@ void CompositeBlockManager::allocate_shared_for_sequence(
       return;
   }
 
-  release_probes(&trimmed.to_drop);
+  trimmed.to_drop.clear();
 
   // FLAT_KV{,_LINEAR} let KVCacheState own replace and exact-repeat. Composite
   // layouts mount every leaf before advancing the sequence-level token count
@@ -1019,25 +997,23 @@ std::vector<Block> CompositeBlockManager::allocate_blocks(BlockType type,
   return leaf->allocate(num_blocks);
 }
 
-void CompositeBlockManager::deallocate(std::vector<Block>&& blocks) {
-  // Route each block to its owning leaf while transferring ownership.
-  if (blocks.empty()) {
-    return;
-  }
-  std::unordered_map<BlockManager*, std::vector<Block>> grouped;
-  for (auto& block : blocks) {
-    if (!block.is_valid()) {
+size_t CompositeBlockManager::num_available_blocks() const {
+  size_t available = std::numeric_limits<size_t>::max();
+  bool any_leaf = false;
+  for (const auto& [type, entry] : leaves_) {
+    (void)type;
+    if (!entry.participates_in_admission || entry.leaf == nullptr) {
       continue;
     }
-    BlockManager* manager = block.manager();
-    CHECK(manager != nullptr)
-        << "CompositeBlockManager got a valid block without owner manager";
-    grouped[manager].emplace_back(std::move(block));
+    any_leaf = true;
+    CHECK_GT(options_.block_size(), 0);
+    CHECK_EQ(entry.leaf->block_size() % options_.block_size(), 0u);
+    const size_t scale = entry.leaf->block_size() / options_.block_size();
+    const size_t leaf_available =
+        entry.leaf->num_free_blocks() + entry.leaf->num_evictable_blocks();
+    available = std::min(available, leaf_available * scale);
   }
-  for (auto& [manager, owned_blocks] : grouped) {
-    manager->deallocate(std::move(owned_blocks));
-  }
-  blocks.clear();
+  return any_leaf ? available : 0;
 }
 
 std::vector<Block> CompositeBlockManager::allocate(size_t /*num_blocks*/) {
@@ -1139,7 +1115,7 @@ CompositeBlockManager::block_utilization_by_type() const {
   return utilization;
 }
 
-void CompositeBlockManager::free(int32_t /*block_id*/) {
+void CompositeBlockManager::free(const Block* block) {
   LOG(FATAL) << "CompositeBlockManager::free should not be called";
 }
 

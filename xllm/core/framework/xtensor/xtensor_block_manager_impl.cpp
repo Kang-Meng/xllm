@@ -257,14 +257,9 @@ void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {
   }
 }
 
-void XTensorBlockManagerImpl::deallocate(std::vector<Block>&& blocks) {
-  // Block destructors call free() when the last reference is released.
-  // Prefix cache is not supported in XTensor mode.
-  blocks.clear();
-}
-
-void XTensorBlockManagerImpl::free(int32_t block_id) {
-  free_blocks({block_id});
+void XTensorBlockManagerImpl::free(const Block* block) {
+  CHECK(block != nullptr && block->id() != 0);
+  free_blocks({block->id()});
 }
 
 std::vector<Block> XTensorBlockManagerImpl::allocate_shared(

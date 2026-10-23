@@ -43,7 +43,7 @@ class CompositeBlockManager : public BlockManager {
   using LeafMap = std::map<BlockType, LeafEntry>;
 
   // Raw prefix-cache aliases returned by one leaf. The caller must either
-  // mount every valid alias or return it with release_probes().
+  // mount every valid alias or destroy the vector so the references drop.
   struct ProbeResult {
     BlockType type = BlockType::KV;
     BlockManager* leaf = nullptr;
@@ -103,7 +103,6 @@ class CompositeBlockManager : public BlockManager {
       Sequence* seq,
       const LeafMap& leaves,
       const KVCacheState& existing_state);
-  static void release_probes(std::vector<ProbeResult>* probes);
 
   const LeafMap& leaf_entries() const { return leaves_; }
   LeafCombination leaf_combination() const { return combination_; }
@@ -112,8 +111,11 @@ class CompositeBlockManager : public BlockManager {
   // beam copy-on-write.
   std::vector<Block> allocate_blocks(BlockType type, size_t num_blocks);
 
+  // Admission headroom: physically free blocks plus prefix-cache residents
+  // whose only reference is the cache, scaled like num_free_blocks().
+  size_t num_available_blocks() const override;
+
   // Type-ambiguous block-level primitives are not meaningful on a composition.
-  void deallocate(std::vector<Block>&& blocks) override;
   std::vector<Block> allocate(size_t num_blocks) override;
   std::optional<std::vector<Block>> allocate_for_sequence(
       Sequence* seq,
@@ -140,7 +142,7 @@ class CompositeBlockManager : public BlockManager {
   size_t num_used_blocks() const override;
   double kv_cache_utilization() const override;
   std::unordered_map<BlockType, double> block_utilization_by_type() const;
-  void free(int32_t block_id) override;
+  void free(const Block* block) override;
   Block allocate() override;
   size_t num_total_blocks() const override;
 

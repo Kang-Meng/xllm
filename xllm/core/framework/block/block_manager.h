@@ -125,11 +125,6 @@ class BlockManager {
   explicit BlockManager(Options options) : options_(options) {}
   virtual ~BlockManager() = default;
 
-  // Release ownership of these blocks. The caller must move the vector so
-  // that the manager can account for the ownership transition exactly once.
-  // The vector is empty on return, including any invalid placeholders.
-  virtual void deallocate(std::vector<Block>&& blocks) = 0;
-
   virtual std::vector<Block> allocate(size_t num_blocks) = 0;
 
   // Returns the shared-prefix vector for the caller's Sequence. The vector's
@@ -164,6 +159,12 @@ class BlockManager {
   virtual size_t num_blocks_in_prefix_cache() const = 0;
   virtual size_t num_free_blocks() const = 0;
   virtual size_t num_used_blocks() const = 0;
+  // Prefix-cache residents whose only remaining reference is the cache node.
+  virtual size_t num_evictable_blocks() const { return 0; }
+  // Physically free blocks plus evictable prefix-cache residents.
+  virtual size_t num_available_blocks() const {
+    return num_free_blocks() + num_evictable_blocks();
+  }
   virtual double kv_cache_utilization() const = 0;
 
   // Evict all entries from the prefix cache (returning their blocks to the free
@@ -184,8 +185,12 @@ class BlockManager {
   // this type. Carried via Options by the spec builder.
   BlockType block_type() const { return options_.block_type(); }
 
-  // call BlockManager to free block used by Block.
-  virtual void free(int32_t block_id) = 0;
+  // Called only after Block has already decremented the shared refcount.
+  // The pointer stays valid for this call. refcount 0 may enter the free list.
+  // refcount 1 asks the prefix cache and does not recycle. XTensor has no
+  // prefix cache and recycles only at refcount 0. ConcurrentBlockManagerImpl
+  // forwards this call under its lock.
+  virtual void free(const Block* block) = 0;
 
   // allocate a list of blocks, used for unit test
   // virtual std::vector<Block> allocate(uint32_t n_blocks) = 0;

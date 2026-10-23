@@ -33,7 +33,7 @@ void release_prefix_cache(ConcurrentBlockManagerImpl* manager) {
   CHECK(manager != nullptr);
   std::vector<Block> blocks = manager->allocate(manager->num_total_blocks());
   EXPECT_EQ(blocks.size(), manager->num_total_blocks());
-  manager->deallocate(std::move(blocks));
+  blocks.clear();
 }
 
 }  // namespace
@@ -55,14 +55,14 @@ TEST(ConcurrentBlockManagerTest,
   ASSERT_EQ(second.front().ref_count(), 3u);
   EXPECT_EQ(manager.num_used_blocks(), 1u);
 
-  manager.deallocate(std::move(first));
+  first.clear();
   EXPECT_TRUE(first.empty());
   EXPECT_EQ(second.front().ref_count(), 2u);
   EXPECT_EQ(manager.num_used_blocks(), 1u);
   EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 0.5);
   EXPECT_TRUE(manager.allocate(manager.num_total_blocks()).empty());
 
-  manager.deallocate(std::move(second));
+  second.clear();
   EXPECT_TRUE(second.empty());
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   release_prefix_cache(&manager);
@@ -92,7 +92,7 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
   tail_blocks.reserve(1);
   tail_blocks.emplace_back(std::move(seed_blocks[1]));
   manager.cache(tail_blocks);
-  manager.deallocate(std::move(tail_blocks));
+  tail_blocks.clear();
   tail_blocks.clear();
   seed_blocks.clear();
 
@@ -107,8 +107,8 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
     EXPECT_EQ(matched_blocks[1].id(), second_block_id);
   }
 
-  manager.deallocate(std::move(matched_blocks));
-  manager.deallocate(std::move(existed_blocks));
+  matched_blocks.clear();
+  existed_blocks.clear();
   matched_blocks.clear();
   existed_blocks.clear();
   release_prefix_cache(&manager);
@@ -142,7 +142,7 @@ TEST(ConcurrentBlockManagerTest, AllocatesWhileBlocksReleaseConcurrently) {
           continue;
         }
 
-        manager.deallocate(std::move(blocks));
+        blocks.clear();
         blocks.clear();
       }
     });
@@ -198,7 +198,7 @@ TEST_P(LinearConcurrentAllocationTest, KeepsLiveSlotsUniqueUntilFinalRelease) {
         ASSERT_LE(block_id, kNumSlots);
         EXPECT_EQ(live_ids[block_id].fetch_add(1), 0);
         Block inflight = blocks.front();
-        manager->deallocate(std::move(blocks));
+        blocks.clear();
         blocks.clear();
         EXPECT_EQ(live_ids[block_id].fetch_sub(1), 1);
         inflight = Block();
@@ -336,7 +336,7 @@ TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
   ASSERT_EQ(seed.size(), 4u);
   PrefixCache::compute_hash_keys(token_ids, seed);
   manager->cache(seed);
-  manager->deallocate(std::move(seed));
+  seed.clear();
   seed.clear();
   ASSERT_EQ(manager->num_blocks_in_prefix_cache(), 4u);
 
@@ -359,7 +359,7 @@ TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
           continue;
         }
         // Finish: deallocate exactly the sequence's blocks (under lock) ...
-        manager->deallocate(std::move(seq_blocks));
+        seq_blocks.clear();
         // ... then sequence->reset() drops the alias OUTSIDE the manager lock
         // -- the dec that races other threads' matches on the same cached
         // block.

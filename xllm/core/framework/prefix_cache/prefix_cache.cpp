@@ -25,6 +25,60 @@ limitations under the License.
 
 namespace xllm {
 
+PrefixCache::~PrefixCache() {
+  Node* node = lru_lst_.get_first();
+  while (!lru_lst_.is_last(node)) {
+    Node* next = lru_lst_.remove_node(node);
+    if (node->evictable) {
+      node->evictable = false;
+      CHECK_GT(num_evictable_, 0u);
+      --num_evictable_;
+    }
+    if (node->block.is_valid()) {
+      blocks_by_id_.erase(node->block.id());
+    }
+    delete node;
+    node = next;
+  }
+  cached_blocks_.clear();
+  blocks_by_id_.clear();
+  num_blocks_ = 0;
+}
+
+void PrefixCache::check_cached_block_count() const {
+  CHECK_EQ(blocks_by_id_.size(), cached_blocks_.size());
+}
+
+void PrefixCache::update_evictable(const Block* block) {
+  if (block == nullptr || block->id() < 0 || block->ref_count() != 1) {
+    return;
+  }
+  if (blocks_by_id_.find(block->id()) == blocks_by_id_.end()) {
+    return;
+  }
+  XXH3Key token_hash_key(block->get_immutable_hash_value());
+  auto iter = cached_blocks_.find(token_hash_key);
+  if (iter == cached_blocks_.end()) {
+    return;
+  }
+  Node* node = iter->second;
+  if (node->evictable || node->block.id() != block->id()) {
+    return;
+  }
+  node->evictable = true;
+  ++num_evictable_;
+}
+
+void PrefixCache::claim_matched_block(Node* node) {
+  if (node == nullptr || !node->block.is_valid() ||
+      node->block.ref_count() != 1 || !node->evictable) {
+    return;
+  }
+  node->evictable = false;
+  CHECK_GT(num_evictable_, 0u);
+  --num_evictable_;
+}
+
 std::vector<Block> PrefixCache::match(const Slice<int32_t>& token_ids,
                                       const Slice<Block>& existed_shared_blocks,
                                       const MMData& mm_data,
@@ -53,6 +107,7 @@ std::vector<Block> PrefixCache::match(const Slice<int32_t>& token_ids,
     if (iter == cached_blocks_.end()) {
       return false;
     }
+    claim_matched_block(iter->second);
     blocks.emplace_back(iter->second->block);
     lru_lst_.remove_node(iter->second);
     node_list.push_front(iter->second);
@@ -102,6 +157,7 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
                            size_t existed_shared_blocks_num,
                            const MMData& mm_data,
                            const Slice<XXH3Key>& block_hashes) {
+  check_cached_block_count();
   const int64_t now = absl::ToUnixMicros(absl::Now());
   // align tokens to block boundary
   const size_t n_blocks =
@@ -109,6 +165,7 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
                blocks.size());
 
   if (n_blocks <= existed_shared_blocks_num) {
+    check_cached_block_count();
     return n_blocks * block_size_;
   }
   // truncate the token ids and blocks to boundary
@@ -163,6 +220,7 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
       node_list.push_front(new_node);
 
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
+      blocks_by_id_.insert(new_node->block.id());
 
       num_blocks_++;
     }
@@ -174,6 +232,7 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
     lru_lst_.push_back(node);
   }
 
+  check_cached_block_count();
   return n_tokens;
 }
 
@@ -183,6 +242,7 @@ size_t PrefixCache::insert(const std::vector<Block>& blocks) {
 }
 
 size_t PrefixCache::insert(Slice<Block>& blocks) {
+  check_cached_block_count();
   const int64_t now = absl::ToUnixMicros(absl::Now());
   DNodeList node_list;
   XXH3Key token_hash_key;
@@ -208,6 +268,7 @@ size_t PrefixCache::insert(Slice<Block>& blocks) {
       node_list.push_front(new_node);
 
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
+      blocks_by_id_.insert(new_node->block.id());
 
       num_blocks_++;
     }
@@ -218,6 +279,7 @@ size_t PrefixCache::insert(Slice<Block>& blocks) {
     lru_lst_.push_back(node);
   }
 
+  check_cached_block_count();
   return blocks.size() * block_size_;
 }
 
@@ -235,7 +297,9 @@ bool PrefixCache::contains(const XXH3Key& hash) const {
 }
 
 size_t PrefixCache::evict(size_t n_blocks) {
+  check_cached_block_count();
   if (num_blocks_ == 0 || lru_lst_.is_empty()) {
+    check_cached_block_count();
     return 0;
   }
 
@@ -258,6 +322,12 @@ size_t PrefixCache::evict(size_t n_blocks) {
 
     XXH3Key token_hash_key(del_node->block.get_immutable_hash_value());
 
+    if (del_node->evictable) {
+      del_node->evictable = false;
+      CHECK_GT(num_evictable_, 0u);
+      --num_evictable_;
+    }
+    blocks_by_id_.erase(del_node->block.id());
     cached_blocks_.erase(token_hash_key);
 
     delete del_node;
@@ -265,6 +335,7 @@ size_t PrefixCache::evict(size_t n_blocks) {
     --num_blocks_;
   }
 
+  check_cached_block_count();
   return evict_count;
 }
 

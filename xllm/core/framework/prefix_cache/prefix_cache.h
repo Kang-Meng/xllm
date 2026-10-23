@@ -24,6 +24,7 @@ limitations under the License.
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "block_hasher.h"
@@ -61,7 +62,7 @@ class PrefixCache {
                        BlockHasherType hasher_type = BlockHasherType::TEXT)
       : block_size_(block_size), hasher_type_(hasher_type), num_blocks_(0) {}
 
-  virtual ~PrefixCache() = default;
+  virtual ~PrefixCache();
 
   // Solid-prefix probe: walks the chain per block position, stops on the
   // first miss. Reach in tokens is `returned.size() * block_size_`.
@@ -104,6 +105,14 @@ class PrefixCache {
     return num_blocks_;
   }
 
+  // Cache nodes whose block refcount is 1. Those nodes are the only owner.
+  size_t num_evictable() const { return num_evictable_; }
+
+  // Called from BlockManagerImpl::free after the refcount has been decremented.
+  // If this block is cached and its refcount is 1, the cache node is the only
+  // remaining owner and becomes evictable.
+  void update_evictable(const Block* block);
+
   float block_match_rate() {
     if (total_blocks_.load() == 0) {
       return 0;
@@ -120,9 +129,17 @@ class PrefixCache {
   struct Node {
     Block block;
     int64_t last_access_time = 0;
+    bool evictable = false;
     Node* prev = nullptr;
     Node* next = nullptr;
   };
+
+  // A prefix hit is about to copy this node. A refcount of 1 means the cache
+  // was the only owner, so the hit takes it out of the evictable set.
+  void claim_matched_block(Node* node);
+
+  // blocks_by_id_ and cached_blocks_ describe the same residents.
+  void check_cached_block_count() const;
 
   struct DNodeList {
     DNodeList() {
@@ -189,8 +206,12 @@ class PrefixCache {
   uint32_t block_size_;
   BlockHasherType hasher_type_;
   size_t num_blocks_ = 0;
+  size_t num_evictable_ = 0;
   std::unordered_map<XXH3Key, Node*, FixedStringKeyHash, FixedStringKeyEqual>
       cached_blocks_;
+  // Block ids currently resident in this cache. Membership is a set lookup.
+  // Its size matches cached_blocks_ across insert and evict.
+  std::unordered_set<int32_t> blocks_by_id_;
 
   std::atomic<uint64_t> total_blocks_{0}, matched_blocks_{0};
 };

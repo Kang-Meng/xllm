@@ -350,7 +350,7 @@ TEST(CompositeBlockManagerTest, FailedHostGrowthRollsBackAllStagedLeaves) {
   for (const auto& [type, entry] : host.leaf_entries()) {
     EXPECT_EQ(entry.leaf->num_used_blocks(), used_before.at(type));
   }
-  host.deallocate(std::move(held_blocks));
+  held_blocks.clear();
   held_blocks.clear();
   ASSERT_TRUE(host.allocate_sequence(&sequence, sequence.host_kv_state(), 128));
   for (const auto& [type, entry] : host.leaf_entries()) {
@@ -440,9 +440,9 @@ TEST(CompositeBlockManagerTest, EmbeddingLeafUsesExplicitState) {
     EXPECT_EQ(kv_state.num_blocks(BlockType::EMBEDDING), 1u);
     EXPECT_EQ(sequence.kv_state().blocks(BlockType::EMBEDDING)[0].id(),
               sequence_block_id);
-    manager->deallocate(kv_state.take_blocks(BlockType::EMBEDDING));
+    (void)kv_state.take_blocks(BlockType::EMBEDDING);
     kv_state.reset();
-    manager->deallocate(sequence.kv_state().take_blocks(BlockType::EMBEDDING));
+    (void)sequence.kv_state().take_blocks(BlockType::EMBEDDING);
     sequence.reset();
     EXPECT_EQ(manager->num_used_blocks(), 0u);
     EXPECT_EQ(manager->num_free_blocks(), manager->num_total_blocks());
@@ -874,7 +874,7 @@ TEST(CompositeBlockManagerTest,
   // Once Host capacity returns, the same target fills the logical tail. The
   // released prefix stays an invalid placeholder, and the retained window is
   // the same four blocks HBM holds.
-  host.deallocate(std::move(exhausted));
+  exhausted.clear();
   host_growth = host.allocate_for_sequence(
       &sequence, sequence.host_kv_state(), 4 * kBaseBlockSize);
   ASSERT_TRUE(host_growth.has_value());
@@ -884,9 +884,8 @@ TEST(CompositeBlockManagerTest,
   EXPECT_FALSE(sequence.host_kv_state().blocks(BlockType::SWA)[1].is_valid());
   EXPECT_TRUE(sequence.host_kv_state().blocks(BlockType::SWA)[2].is_valid());
 
-  device.deallocate(std::move(sequence.kv_state().take_blocks(BlockType::SWA)));
-  host.deallocate(
-      std::move(sequence.host_kv_state().take_blocks(BlockType::SWA)));
+  (void)sequence.kv_state().take_blocks(BlockType::SWA);
+  (void)sequence.host_kv_state().take_blocks(BlockType::SWA);
 }
 
 TEST(CompositeBlockManagerTest, DeallocateConsumesBlocksFromOwnerManagers) {
@@ -912,7 +911,7 @@ TEST(CompositeBlockManagerTest, DeallocateConsumesBlocksFromOwnerManagers) {
     }
   }
 
-  manager.deallocate(std::move(flat_blocks));
+  flat_blocks.clear();
   EXPECT_TRUE(flat_blocks.empty());
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   for (const auto& [type, entry] : manager.leaf_entries()) {
@@ -944,7 +943,7 @@ TEST(CompositeBlockManagerTest, DeallocateDispatchesWithoutInflatingRefCount) {
     EXPECT_EQ(block.ref_count(), 1u);
   }
 
-  manager.deallocate(std::move(owned_blocks));
+  owned_blocks.clear();
   EXPECT_TRUE(owned_blocks.empty());
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 
@@ -1729,7 +1728,7 @@ TEST_P(LinearStateWindowTest, PrefillLeafUsesExplicitState) {
     EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
     EXPECT_EQ(sequence.get_linear_state_slot_id(), sequence_source_id);
     allocated.reset();
-    leaf->deallocate(kv_state.take_blocks(BlockType::LINEAR));
+    (void)kv_state.take_blocks(BlockType::LINEAR);
     kv_state.reset();
     manager->deallocate_for_sequence(&sequence);
     sequence.reset();
@@ -1772,9 +1771,9 @@ TEST_P(LinearStateWindowTest, DecodeReceiverUsesExplicitState) {
               retained_source_id);
     EXPECT_EQ(sequence.get_linear_state_slot_id(), sequence_source_id);
     EXPECT_EQ(manager->num_used_blocks(), 2u);
-    manager->deallocate(kv_state.take_blocks(BlockType::LINEAR));
+    (void)kv_state.take_blocks(BlockType::LINEAR);
     kv_state.reset();
-    manager->deallocate(sequence.kv_state().take_blocks(BlockType::LINEAR));
+    (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
     sequence.reset();
     EXPECT_EQ(manager->num_used_blocks(), 0u);
     EXPECT_EQ(manager->num_free_blocks(), manager->num_total_blocks());
@@ -1815,8 +1814,7 @@ TEST_P(LinearStateWindowTest,
   EXPECT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).back().id(),
             checkpoint_id);
 
-  host_manager.deallocate(
-      sequence.host_kv_state().take_blocks(BlockType::LINEAR));
+  (void)sequence.host_kv_state().take_blocks(BlockType::LINEAR);
   sequence.host_kv_state().reset();
   EXPECT_EQ(host_manager.num_used_blocks(), 0u);
 }
@@ -1857,8 +1855,8 @@ TEST_P(LinearStateWindowTest,
   EXPECT_TRUE(
       sequence.host_kv_state().blocks(BlockType::LINEAR).front().is_valid());
 
-  manager.deallocate(sequence.kv_state().take_blocks(BlockType::LINEAR));
-  manager.deallocate(sequence.host_kv_state().take_blocks(BlockType::LINEAR));
+  (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
+  (void)sequence.host_kv_state().take_blocks(BlockType::LINEAR);
   sequence.reset();
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 }
@@ -1900,7 +1898,7 @@ TEST_P(LinearStateWindowTest, DecodeReceiverAllocationIsOwnedByLeaf) {
               received_id);
     EXPECT_EQ(sequence.get_linear_state_slot_id(), received_id);
     EXPECT_EQ(manager.num_used_blocks(), 1u);
-    manager.deallocate(sequence.kv_state().take_blocks(BlockType::LINEAR));
+    (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
   }
 }
 
@@ -1918,9 +1916,10 @@ TEST_P(LinearStateWindowTest, DecodeReceiverNeedsOnlyOneAvailableSlot) {
   auto held_slots = linear_leaf->allocate(2);
   ASSERT_EQ(held_slots.size(), 2u);
   Sequence sequence = make_sequence(0, std::vector<int32_t>(12, 7));
-  // KV grows. With two slots held, the linear leaf does not mount a block.
-  EXPECT_TRUE(manager.allocate_sequence(&sequence, 12));
-  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 6u);
+  // No free linear slot, and the sequence holds none. Prefill returns
+  // nullopt, so the composite rolls KV back instead of admitting the sequence.
+  EXPECT_FALSE(manager.allocate_sequence(&sequence, 12));
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 0u);
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 0u);
   EXPECT_EQ(sequence.kv_cache_tokens_num(), 0u);
 
@@ -2415,7 +2414,7 @@ TEST_P(LinearStateWindowTest, PoolReleasesCancelledSequenceBeforeResults) {
     sequence.kv_state().set_kv_cache_tokens_num(8);
     sequence.set_cancel();
     if (discard) {
-      pool.deallocate_without_cache(&sequence);
+      sequence.reset();
     } else {
       pool.deallocate(&sequence);
     }
@@ -2424,7 +2423,7 @@ TEST_P(LinearStateWindowTest, PoolReleasesCancelledSequenceBeforeResults) {
     EXPECT_EQ(sequence.kv_cache_tokens_num(), 0u);
     Sequence replacement = make_sequence(1, {9, 9, 9, 9});
     EXPECT_TRUE(pool.allocate(&replacement, 4));
-    pool.deallocate_without_cache(&replacement);
+    replacement.reset();
   }
 }
 

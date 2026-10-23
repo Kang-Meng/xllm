@@ -39,8 +39,8 @@ class ConcurrentBlockManagerImpl : public BlockManager {
   // Block-level primitives.
   std::vector<Block> allocate(size_t num_blocks) override;
   Block allocate() override;
-  void deallocate(std::vector<Block>&& blocks) override;
-  void free(int32_t block_id) override;
+  void free(const Block* block) override;
+  size_t num_evictable_blocks() const override;
 
   std::vector<Block> allocate_shared(
       const Slice<int32_t>& token_ids,

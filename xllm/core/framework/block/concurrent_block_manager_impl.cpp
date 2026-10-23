@@ -44,14 +44,14 @@ Block ConcurrentBlockManagerImpl::allocate() {
   return block;
 }
 
-void ConcurrentBlockManagerImpl::deallocate(std::vector<Block>&& blocks) {
+void ConcurrentBlockManagerImpl::free(const Block* block) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  inner_->deallocate(std::move(blocks));
+  inner_->free(block);
 }
 
-void ConcurrentBlockManagerImpl::free(int32_t block_id) {
+size_t ConcurrentBlockManagerImpl::num_evictable_blocks() const {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  inner_->free(block_id);
+  return inner_->num_evictable_blocks();
 }
 
 std::vector<Block> ConcurrentBlockManagerImpl::allocate_shared(

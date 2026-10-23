@@ -152,22 +152,11 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
   VLOG(10) << "[trim_prefetch_blocks] source_index=" << source_index
            << " (source_index < keep)=" << (source_index < keep);
 
-  std::vector<Block> to_release;
-  to_release.reserve(blocks.size());
   Block source;
   if (source_index < keep) {
     source = blocks[source_index];
     VLOG(10) << "[trim_prefetch_blocks] source extracted, is_valid="
              << source.is_valid();
-  }
-  for (size_t index = 0; index < blocks.size(); ++index) {
-    if (!blocks[index].is_valid() || index == source_index) {
-      continue;
-    }
-    to_release.emplace_back(std::move(blocks[index]));
-  }
-  if (!to_release.empty()) {
-    deallocate(std::move(to_release));
   }
 
   if (!source.is_valid()) {
@@ -208,11 +197,9 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
   CHECK_LE(kv_state.blocks(BlockType::LINEAR).size(), 2u);
 
   if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num()) {
-    std::vector<Block> old_blocks = kv_state.take_blocks(BlockType::LINEAR);
-    deallocate(std::move(old_blocks));
+    kv_state.erase_blocks(BlockType::LINEAR);
     std::vector<Block> allocated = BlockManagerImpl::allocate(2);
     if (allocated.size() != 2) {
-      deallocate(std::move(allocated));
       return std::nullopt;
     }
     return allocated;
@@ -220,14 +207,16 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
 
   std::vector<Block>* blocks = kv_state.mutable_blocks(BlockType::LINEAR);
   if (blocks->size() == 2) {
-    std::vector<Block> released;
-    released.emplace_back(std::move(blocks->front()));
     blocks->erase(blocks->begin());
-    deallocate(std::move(released));
   }
 
   std::vector<Block> allocated = BlockManagerImpl::allocate(1);
   if (allocated.empty()) {
+    if (blocks->empty()) {
+      LOG(ERROR)
+          << "LinearStateBlockManager::allocate_prefill: no blocks to allocate";
+      return std::nullopt;
+    }
     return std::vector<Block>{};
   }
 
@@ -279,9 +268,6 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
         }
         return std::vector<Block>{};
       }
-      std::vector<Block> to_release;
-      to_release.emplace_back(std::move((*blocks)[0]));
-      deallocate(std::move(to_release));
       blocks->erase(blocks->begin());
     } else {
       // The previous decode step has not yet confirmed a checkpoint. Keep
@@ -328,27 +314,6 @@ Block LinearStateBlockManager::allocate() {
     return Block();
   }
   return std::move(blocks[0]);
-}
-
-std::vector<Block> LinearStateBlockManager::allocate_shared(
-    const Slice<int32_t>& token_ids,
-    const Slice<Block>& /*existed_shared_blocks*/,
-    const MMData& /*mm_data*/,
-    const Slice<XXH3Key>& block_hashes) {
-  if (token_ids.size() == 0 || prefix_cache_ == nullptr) {
-    return {};
-  }
-  std::vector<Block> blocks = prefix_cache_->match(
-      token_ids.slice(0, token_ids.size() - 1), {}, MMData(), block_hashes);
-  VLOG(1) << "[LinearMatch] manager=" << this
-          << " decode=" << options_.instance_is_decode()
-          << " blocks=" << blocks.size();
-  for (const Block& block : blocks) {
-    if (block.is_valid() && mark_used(&usage_accounted_ids_, block.id())) {
-      num_used_blocks_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-  return blocks;
 }
 
 void LinearStateBlockManager::cache(const Slice<int32_t>& token_ids,

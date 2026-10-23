@@ -56,7 +56,6 @@ void finalize_host_blocks(bool publish,
     if (publish) {
       host_manager->cache_blocks(type, blocks);
     }
-    host_manager->deallocate(std::move(blocks));
   }
 }
 
@@ -69,23 +68,6 @@ std::unique_ptr<BlockManager> wrap_for_offload(std::unique_ptr<BlockManager> l,
     return std::make_unique<ConcurrentBlockManagerImpl>(std::move(l));
   }
   return l;
-}
-
-void trim_blocks_from_back(BlockManager* leaf,
-                           std::vector<Block>* blocks,
-                           size_t keep) {
-  CHECK(leaf != nullptr);
-  CHECK(blocks != nullptr);
-  if (blocks->size() <= keep) {
-    return;
-  }
-  std::vector<Block> dropped;
-  dropped.reserve(blocks->size() - keep);
-  for (size_t i = keep; i < blocks->size(); ++i) {
-    dropped.emplace_back(std::move((*blocks)[i]));
-  }
-  blocks->resize(keep);
-  leaf->deallocate(std::move(dropped));
 }
 
 bool has_valid_swa_window(size_t tokens,
@@ -311,10 +293,6 @@ void finalize_prefetch(Sequence* sequence,
   const auto& leaves = host_manager->leaf_entries();
   KVCacheState& host_state = sequence->host_kv_state();
   if (!publish) {
-    for (const auto& [type, entry] : leaves) {
-      std::vector<Block> blocks = host_state.take_blocks(type);
-      entry.leaf->deallocate(std::move(blocks));
-    }
     host_state.reset();
     return;
   }
@@ -704,7 +682,7 @@ void HierarchyBlockManagerPool::trim_host_cache(
     const size_t shared = std::min(hbm_state.shared_blocks_num(type), keep);
     const size_t cached = std::min(hbm_state.num_cached_blocks(type), keep);
     std::vector<Block> blocks = std::move(*hbm_state.mutable_blocks(type));
-    trim_blocks_from_back(entry.leaf.get(), &blocks, keep);
+    blocks.resize(keep);
     if (blocks.empty()) {
       hbm_state.erase_blocks(type);
     } else {
@@ -1197,7 +1175,6 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
           .thenValue([device_blocks = std::move(src_blocks),
                       host_blocks = std::move(dst_blocks),
                       block_types_vec = std::move(block_types),
-                      device_block_mgr_ptr = block_managers_[i].get(),
                       host_manager = host_block_managers_[i].get(),
                       dp_rank = i,
                       expected_workers](
@@ -1227,7 +1204,7 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
             }
 
             // Always release the reserved ids so the block pools do not leak.
-            device_block_mgr_ptr->deallocate(std::move(device_blocks));
+            device_blocks.clear();
 
             // Successful copies become visible in the Host prefix cache.
             // Failures publish nothing, but both paths release every reserved

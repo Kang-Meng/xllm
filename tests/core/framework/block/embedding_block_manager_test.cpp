@@ -39,7 +39,7 @@ TEST(EmbeddingBlockManagerTest, AllocateAndFreeRoundTrip) {
   EXPECT_EQ(manager.num_used_blocks(), 2);
   EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 2.0 / 3.0);
 
-  manager.deallocate(std::move(blocks));
+  blocks.clear();
   EXPECT_TRUE(blocks.empty());
   EXPECT_EQ(manager.num_free_blocks(), 3);
   EXPECT_EQ(manager.num_used_blocks(), 0);
@@ -98,7 +98,7 @@ TEST(EmbeddingBlockManagerTest, UsedBlocksAccountingRoundTrips) {
     // Deallocate the owning reference: effective usage drops immediately.
     std::vector<Block> owned_blocks;
     owned_blocks.emplace_back(std::move(block));
-    manager.deallocate(std::move(owned_blocks));
+    owned_blocks.clear();
     EXPECT_EQ(manager.num_used_blocks(), 0u);
 
     EXPECT_TRUE(owned_blocks.empty());

@@ -903,12 +903,12 @@ void DisaggPDScheduler::dispatch_requests() {
         request_queue_.write(requests[i]);
       }
     }
-    VLOG(1) << "Prefill Decode allocation request_id="
-            << requests.front()->request_id()
-            << ", request_count=" << requests.size()
-            << ", prepare_ms=" << allocation_prepare_seconds * 1000.0
-            << ", rpc_ms=" << allocation_rpc_seconds * 1000.0 << ", total_ms="
-            << decode_allocation_timer.elapsed_seconds() * 1000.0;
+    VLOG(20) << "Prefill Decode allocation request_id="
+             << requests.front()->request_id()
+             << ", request_count=" << requests.size()
+             << ", prepare_ms=" << allocation_prepare_seconds * 1000.0
+             << ", rpc_ms=" << allocation_rpc_seconds * 1000.0 << ", total_ms="
+             << decode_allocation_timer.elapsed_seconds() * 1000.0;
   }
 }
 
@@ -1240,7 +1240,7 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
     request = take_waiting_request(req_id);
   }
   for (const auto& sequence : request->sequences()) {
-    engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+    sequence->reset();
   }
   return true;
 }
@@ -1260,7 +1260,7 @@ bool DisaggPDScheduler::decode_schedule(
                  << request->request_id();
       lock.unlock();
       for (const auto& sequence : request->sequences()) {
-        engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+        sequence->reset();
       }
       return false;
     }

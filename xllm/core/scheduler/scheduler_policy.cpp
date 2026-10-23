@@ -204,18 +204,19 @@ int32_t SchedulerPolicy::select_prefill_dp_rank(
     return per_dp_counts[current_dp_rank] < cap ? current_dp_rank : -1;
   }
 
-  const std::vector<size_t> free_blocks =
-      state.kv_cache_manager->num_free_blocks();
+  const std::vector<size_t> available_blocks =
+      state.kv_cache_manager->num_available_blocks();
   int32_t selected_dp_rank = -1;
-  size_t selected_free_blocks = 0;
+  size_t selected_available_blocks = 0;
   for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
-    if (static_cast<size_t>(dp_rank) >= free_blocks.size() ||
+    if (static_cast<size_t>(dp_rank) >= available_blocks.size() ||
         per_dp_counts[dp_rank] >= cap) {
       continue;
     }
-    if (selected_dp_rank < 0 || free_blocks[dp_rank] > selected_free_blocks) {
+    if (selected_dp_rank < 0 ||
+        available_blocks[dp_rank] > selected_available_blocks) {
       selected_dp_rank = dp_rank;
-      selected_free_blocks = free_blocks[dp_rank];
+      selected_available_blocks = available_blocks[dp_rank];
     }
   }
   return selected_dp_rank;
