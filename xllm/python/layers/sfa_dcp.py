@@ -180,7 +180,9 @@ class AscendSFADCPMetadataBuilder:
         self,
         dcp_block_table: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        valid_block_ids, compact_block_table = dcp_block_table.flatten().unique(return_inverse=True)
+        # index_select rejects the DSA padding sentinel -1. Tables that already
+        # use block 0 for padding are unchanged.
+        valid_block_ids, compact_block_table = dcp_block_table.flatten().clamp_min(0).unique(return_inverse=True)
         compact_block_table = compact_block_table.view_as(dcp_block_table)
         num_blocks = valid_block_ids.shape[0]
         remapped_block_table = (
