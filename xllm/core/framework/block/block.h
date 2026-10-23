@@ -170,7 +170,8 @@ class Block final {
   // get the block size
   constexpr uint32_t size() const { return size_; }
 
-  // get the reference count, 0 if the block is invalid after move
+  // Shared refcount. 0 when the block was moved from, or when it has no
+  // manager. A manager-less block does not own a counter.
   uint32_t ref_count() const {
     return ref_count_ == nullptr ? 0
                                  : ref_count_->load(std::memory_order_acquire);
@@ -179,8 +180,9 @@ class Block final {
   // check if the block is shared
   bool is_shared() const { return ref_count() > 1; }
 
-  // check if the block is valid
-  bool is_valid() const { return id_ >= 0 && ref_count_ != nullptr; }
+  // Valid when this alias still owns an id. A manager-less block can be valid
+  // without a refcount. Move clears the id.
+  bool is_valid() const { return id_ >= 0; }
 
   // owner manager that allocated this block.
   BlockManager* manager() const { return manager_; }
@@ -206,12 +208,20 @@ class Block final {
   }
 
  private:
-  // increase reference count
+  // Asks the manager to fetch_add the shared count. A null manager has no
+  // shared counter and returns without touching one.
   void inc_ref_count();
 
-  // Decrement the shared refcount, then free(this). free() reads the
-  // post-decrement refcount from this block.
+  // Asks the manager to fetch_sub the shared count, then deletes the atomic
+  // when this alias was the last one. A null manager returns immediately.
+  void dec_ref_count();
+
+  // With a manager, free() reads this alias and calls dec_ref_count() before
+  // returning. The concurrent wrapper holds its lock across that whole call.
+  // The padding block has no manager and does not enter free().
   void release();
+
+  friend class BlockManager;
 
   // block id
   int32_t id_ = -1;
@@ -220,9 +230,7 @@ class Block final {
   uint32_t size_ = 0;
 
   // reference count, shared across Block aliases of the same physical block.
-  // Atomic because aliases are copied/destroyed across threads outside the
-  // owning BlockManager's lock (e.g. disagg-PD scheduler match vs. prefill
-  // threadpool sequence teardown), so inc/dec must not race.
+  // Atomic because aliases are copied and destroyed across threads.
   std::atomic<uint32_t>* ref_count_ = nullptr;
 
   // manager that manages this block

@@ -185,12 +185,23 @@ class BlockManager {
   // this type. Carried via Options by the spec builder.
   BlockType block_type() const { return options_.block_type(); }
 
-  // Called only after Block has already decremented the shared refcount.
-  // The pointer stays valid for this call. refcount 0 may enter the free list.
-  // refcount 1 asks the prefix cache and does not recycle. XTensor has no
-  // prefix cache and recycles only at refcount 0. ConcurrentBlockManagerImpl
-  // forwards this call under its lock.
-  virtual void free(const Block* block) = 0;
+  // BlockManagerImpl performs the atomic update. ConcurrentBlockManagerImpl
+  // holds its recursive mutex and forwards here, including the re-entry from
+  // free(). CompositeBlockManager does not override these.
+  virtual void incr_ref_count(std::atomic<uint32_t>* /*ref_count*/) {
+    NOT_IMPLEMENTED();
+  }
+  virtual uint32_t dec_ref_count(std::atomic<uint32_t>* /*ref_count*/) {
+    NOT_IMPLEMENTED();
+    return 0;
+  }
+
+  // Called with this alias still counted. refcount 2 and membership in the
+  // prefix cache means the cache will be the only owner after the drop.
+  // refcount 1 is the last alias and may return the id to the free list.
+  // XTensor has no prefix cache and recycles only the last alias.
+  // The leaf then calls release_block_ref(), which calls dec_ref_count().
+  virtual void free(Block* block) = 0;
 
   // allocate a list of blocks, used for unit test
   // virtual std::vector<Block> allocate(uint32_t n_blocks) = 0;
@@ -236,6 +247,9 @@ class BlockManager {
   virtual void reserve_xtensor_padding_blocks() {}
 
  protected:
+  // Drops the alias after free() has read the pre-drop refcount.
+  void release_block_ref(Block* block) { block->dec_ref_count(); }
+
   // the options for the block manager
   Options options_;
 };

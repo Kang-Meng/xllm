@@ -48,19 +48,26 @@ class BlockManagerPoolTestPeer final {
     return composite.leaf_of(type);
   }
 
-  // Assert by-hash checkpoint presence/lookup directly against the LINEAR
-  // leaf's inherited prefix_cache_. Production has no by-hash probe on the leaf
-  // (restore sources are mounted through allocate_shared); the peer is a friend
-  // of the leaf, so it reaches the protected index through the sanctioned test
-  // seam instead of a public probe surface. match() mirrors PrefixCache::find
-  // (refcount+1, LRU-promoted); contains() only reports presence.
+  // By-hash checkpoint probe against the LINEAR leaf's prefix cache.
+  // Production mounts restore sources through allocate_shared and has no
+  // point lookup. contains() only reports presence. match() copies the
+  // resident (refcount + 1) and promotes it in the LRU, which is how tests
+  // pin a checkpoint against eviction.
   static bool contains(const LinearStateBlockManager* leaf,
                        const XXH3Key& prefix_hash) {
-    return leaf->prefix_cache_->contains(prefix_hash);
+    const auto& cached = leaf->prefix_cache_->cached_blocks_;
+    return cached.find(prefix_hash) != cached.end();
   }
   static Block match(LinearStateBlockManager* leaf,
                      const XXH3Key& prefix_hash) {
-    return leaf->prefix_cache_->find(prefix_hash);
+    PrefixCache& cache = *leaf->prefix_cache_;
+    auto iter = cache.cached_blocks_.find(prefix_hash);
+    if (iter == cache.cached_blocks_.end()) {
+      return Block();
+    }
+    cache.claim_matched_block(iter->second);
+    cache.lru_lst_.move_back(iter->second);
+    return iter->second->block;
   }
 };
 

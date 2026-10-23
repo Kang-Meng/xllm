@@ -84,8 +84,11 @@ class BlockManagerImpl : public BlockManager {
   // current kv cache utilization.
   double kv_cache_utilization() const override;
 
-  // See BlockManager::free.
-  void free(const Block* block) override;
+  // Atomic refcount update. ConcurrentBlockManagerImpl holds its lock and
+  // forwards here.
+  void incr_ref_count(std::atomic<uint32_t>* ref_count) override;
+  uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
+  void free(Block* block) override;
 
   // allocate a list of blocks
   // std::vector<Block> allocate(uint32_t n_blocks) override;

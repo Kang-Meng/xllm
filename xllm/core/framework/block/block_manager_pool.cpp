@@ -83,10 +83,8 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
     // spec decode needs it. Every leaf is routed by its BlockType.
     auto leaves = build_composite_leaves(block_options, /*dp_rank=*/i);
     if (options_.num_speculative_tokens() > 0) {
-      // EMBEDDING leaf needs the same concurrency wrapper as the other leaves
-      // when sequence-level entry points run off the scheduler thread (disagg
-      // PD / kvcache store prefill threadpools call try_allocate concurrently,
-      // and the host-offload D2H callback frees blocks off-thread).
+      // EMBEDDING uses the same wrapper as the other leaves when sequence-level
+      // entry points run off the scheduler thread.
       std::unique_ptr<BlockManager> embedding_leaf =
           std::make_unique<EmbeddingBlockManager>(
               /*num_blocks=*/options_.num_embedding_blocks(),

@@ -213,7 +213,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
   std::vector<Block> allocated = BlockManagerImpl::allocate(1);
   if (allocated.empty()) {
     if (blocks->empty()) {
-      LOG(ERROR)
+      VLOG(1)
           << "LinearStateBlockManager::allocate_prefill: no blocks to allocate";
       return std::nullopt;
     }

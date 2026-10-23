@@ -257,9 +257,26 @@ void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {
   }
 }
 
-void XTensorBlockManagerImpl::free(const Block* block) {
+void XTensorBlockManagerImpl::incr_ref_count(std::atomic<uint32_t>* ref_count) {
+  CHECK(ref_count != nullptr);
+  ref_count->fetch_add(1, std::memory_order_relaxed);
+}
+
+uint32_t XTensorBlockManagerImpl::dec_ref_count(
+    std::atomic<uint32_t>* ref_count) {
+  CHECK(ref_count != nullptr);
+  return ref_count->fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void XTensorBlockManagerImpl::free(Block* block) {
   CHECK(block != nullptr && block->id() != 0);
-  free_blocks({block->id()});
+  // No prefix cache. refcount 1 is the last alias. The drop goes through the
+  // block so ConcurrentBlockManagerImpl::dec_ref_count runs under the same
+  // lock that covers this read.
+  release_block_ref(block);
+  if (block->ref_count() == 0) {
+    free_blocks({block->id()});
+  }
 }
 
 std::vector<Block> XTensorBlockManagerImpl::allocate_shared(

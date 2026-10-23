@@ -91,12 +91,6 @@ class PrefixCache {
   virtual size_t insert(Slice<Block>& blocks);
   virtual size_t insert(const std::vector<Block>& blocks);
 
-  // Point-lookup by chained hash key. `find` hits refresh LRU recency and
-  // return the block; `contains` is LRU-neutral. Both return an invalid
-  // Block / false on miss.
-  Block find(const XXH3Key& hash);
-  bool contains(const XXH3Key& hash) const;
-
   // Evict up to `n_blocks` LRU-oldest entries. Returns the number evicted.
   virtual size_t evict(size_t n_blocks);
 
@@ -108,9 +102,10 @@ class PrefixCache {
   // Cache nodes whose block refcount is 1. Those nodes are the only owner.
   size_t num_evictable() const { return num_evictable_; }
 
-  // Called from BlockManagerImpl::free after the refcount has been decremented.
-  // If this block is cached and its refcount is 1, the cache node is the only
-  // remaining owner and becomes evictable.
+  // Called from BlockManagerImpl::free before that alias's refcount is
+  // dropped. A resident whose refcount is 2 has this alias plus the cache
+  // node; after the drop the cache is the only owner and the block becomes
+  // evictable.
   void update_evictable(const Block* block);
 
   float block_match_rate() {
@@ -129,7 +124,6 @@ class PrefixCache {
   struct Node {
     Block block;
     int64_t last_access_time = 0;
-    bool evictable = false;
     Node* prev = nullptr;
     Node* next = nullptr;
   };
@@ -137,6 +131,10 @@ class PrefixCache {
   // A prefix hit is about to copy this node. A refcount of 1 means the cache
   // was the only owner, so the hit takes it out of the evictable set.
   void claim_matched_block(Node* node);
+
+  // Undo one update_evictable() increment. A PrefixCache that is not the
+  // owning manager's cache never receives that increment.
+  void release_evictable_slot();
 
   // blocks_by_id_ and cached_blocks_ describe the same residents.
   void check_cached_block_count() const;
@@ -214,6 +212,9 @@ class PrefixCache {
   std::unordered_set<int32_t> blocks_by_id_;
 
   std::atomic<uint64_t> total_blocks_{0}, matched_blocks_{0};
+
+  // Tests probe a resident by hash. Production match/insert do not.
+  friend class BlockManagerPoolTestPeer;
 };
 
 }  // namespace xllm

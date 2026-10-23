@@ -73,9 +73,11 @@ BlockManagerImpl::BlockManagerImpl(const Options& options)
     free_blocks_.push_back(total_blocks - i - 1);
   }
 
-  // reserve block 0 for padding
+  // reserve block 0 for padding. It stays off the free list for the manager's
+  // lifetime, and free() rejects id 0, so this block must not call free.
   padding_block_ = allocate();
   CHECK_EQ(padding_block_.id(), 0) << "Padding block id should be 0";
+  padding_block_.set_manager(nullptr);
 }
 
 std::vector<Block> BlockManagerImpl::allocate(size_t num_blocks) {
@@ -214,23 +216,33 @@ Block BlockManagerImpl::allocate() {
   return {block_id, this};
 }
 
-// caller should make sure the block_id is valid
-void BlockManagerImpl::free(const Block* block) {
-  CHECK(block != nullptr && block->id() != 0);
+void BlockManagerImpl::incr_ref_count(std::atomic<uint32_t>* ref_count) {
+  CHECK(ref_count != nullptr);
+  ref_count->fetch_add(1, std::memory_order_relaxed);
+}
 
-  // Refcount was already decremented. A prefix-cache resident (refcount > 0)
-  // stays marked used and off the free list. clear_used runs only at 0.
+uint32_t BlockManagerImpl::dec_ref_count(std::atomic<uint32_t>* ref_count) {
+  CHECK(ref_count != nullptr);
+  return ref_count->fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// caller should make sure the block_id is valid
+void BlockManagerImpl::free(Block* block) {
+  CHECK(block != nullptr && block->id() != 0);
+  release_block_ref(block);
+
   if (prefix_cache_ != nullptr) {
     prefix_cache_->update_evictable(block);
   }
-  if (block->ref_count() != 0) {
-    return;
+  if (block->ref_count() == 0) {
+    const int32_t block_id = block->id();
+    CHECK(clear_used(&usage_accounted_ids_, block_id))
+        << "Block " << block_id << " freed twice";
+    size_t prev_count =
+        num_free_blocks_.fetch_add(1, std::memory_order_relaxed);
+    CHECK(prev_count < free_blocks_.size());
+    free_blocks_[prev_count] = block_id;
   }
-  const int32_t block_id = block->id();
-  clear_used(&usage_accounted_ids_, block_id);
-  size_t prev_count = num_free_blocks_.fetch_add(1, std::memory_order_relaxed);
-  CHECK(prev_count < free_blocks_.size());
-  free_blocks_[prev_count] = block_id;
 }
 
 // Flat incremental growth (the default sequence-level policy). Reads how many

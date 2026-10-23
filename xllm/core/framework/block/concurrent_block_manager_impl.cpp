@@ -44,7 +44,19 @@ Block ConcurrentBlockManagerImpl::allocate() {
   return block;
 }
 
-void ConcurrentBlockManagerImpl::free(const Block* block) {
+void ConcurrentBlockManagerImpl::incr_ref_count(
+    std::atomic<uint32_t>* ref_count) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  inner_->incr_ref_count(ref_count);
+}
+
+uint32_t ConcurrentBlockManagerImpl::dec_ref_count(
+    std::atomic<uint32_t>* ref_count) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  return inner_->dec_ref_count(ref_count);
+}
+
+void ConcurrentBlockManagerImpl::free(Block* block) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   inner_->free(block);
 }

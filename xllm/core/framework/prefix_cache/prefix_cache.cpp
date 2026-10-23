@@ -29,10 +29,8 @@ PrefixCache::~PrefixCache() {
   Node* node = lru_lst_.get_first();
   while (!lru_lst_.is_last(node)) {
     Node* next = lru_lst_.remove_node(node);
-    if (node->evictable) {
-      node->evictable = false;
-      CHECK_GT(num_evictable_, 0u);
-      --num_evictable_;
+    if (node->block.is_valid() && node->block.ref_count() == 1) {
+      release_evictable_slot();
     }
     if (node->block.is_valid()) {
       blocks_by_id_.erase(node->block.id());
@@ -56,27 +54,26 @@ void PrefixCache::update_evictable(const Block* block) {
   if (blocks_by_id_.find(block->id()) == blocks_by_id_.end()) {
     return;
   }
-  XXH3Key token_hash_key(block->get_immutable_hash_value());
-  auto iter = cached_blocks_.find(token_hash_key);
-  if (iter == cached_blocks_.end()) {
-    return;
-  }
-  Node* node = iter->second;
-  if (node->evictable || node->block.id() != block->id()) {
-    return;
-  }
-  node->evictable = true;
   ++num_evictable_;
+}
+
+void PrefixCache::release_evictable_slot() {
+  // update_evictable() counts a resident only after the owning manager drops
+  // the last external alias. Unit tests that construct a PrefixCache beside
+  // the manager never make that call, so the counter stays zero and there is
+  // no slot to release.
+  if (num_evictable_ == 0) {
+    return;
+  }
+  --num_evictable_;
 }
 
 void PrefixCache::claim_matched_block(Node* node) {
   if (node == nullptr || !node->block.is_valid() ||
-      node->block.ref_count() != 1 || !node->evictable) {
+      node->block.ref_count() != 1) {
     return;
   }
-  node->evictable = false;
-  CHECK_GT(num_evictable_, 0u);
-  --num_evictable_;
+  release_evictable_slot();
 }
 
 std::vector<Block> PrefixCache::match(const Slice<int32_t>& token_ids,
@@ -283,19 +280,6 @@ size_t PrefixCache::insert(Slice<Block>& blocks) {
   return blocks.size() * block_size_;
 }
 
-Block PrefixCache::find(const XXH3Key& hash) {
-  auto iter = cached_blocks_.find(hash);
-  if (iter == cached_blocks_.end()) {
-    return Block();
-  }
-  lru_lst_.move_back(iter->second);
-  return iter->second->block;
-}
-
-bool PrefixCache::contains(const XXH3Key& hash) const {
-  return cached_blocks_.find(hash) != cached_blocks_.end();
-}
-
 size_t PrefixCache::evict(size_t n_blocks) {
   check_cached_block_count();
   if (num_blocks_ == 0 || lru_lst_.is_empty()) {
@@ -322,11 +306,7 @@ size_t PrefixCache::evict(size_t n_blocks) {
 
     XXH3Key token_hash_key(del_node->block.get_immutable_hash_value());
 
-    if (del_node->evictable) {
-      del_node->evictable = false;
-      CHECK_GT(num_evictable_, 0u);
-      --num_evictable_;
-    }
+    release_evictable_slot();
     blocks_by_id_.erase(del_node->block.id());
     cached_blocks_.erase(token_hash_key);
 

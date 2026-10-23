@@ -1115,7 +1115,7 @@ CompositeBlockManager::block_utilization_by_type() const {
   return utilization;
 }
 
-void CompositeBlockManager::free(const Block* block) {
+void CompositeBlockManager::free(Block* /*block*/) {
   LOG(FATAL) << "CompositeBlockManager::free should not be called";
 }
 

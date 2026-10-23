@@ -96,8 +96,10 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Get KV cache utilization
   double kv_cache_utilization() const override;
 
-  // XTensor has no prefix cache. Recycle the page only when refcount is 0.
-  void free(const Block* block) override;
+  // XTensor has no prefix cache. Recycle the page only when refcount is 1.
+  void incr_ref_count(std::atomic<uint32_t>* ref_count) override;
+  uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
+  void free(Block* block) override;
 
   // Allocate a single block
   Block allocate() override;
