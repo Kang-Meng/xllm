@@ -81,6 +81,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
             context.get_parallel_args().dit_text_encoder_tp_group_),
         vae_group_(context.get_parallel_args().dit_vae_group_),
         is_tp_driver_(tp_group_ == nullptr || tp_group_->rank() == 0),
+        is_output_rank_(context.get_parallel_args().rank() == 0),
         is_vae_parallel_enabled_(vae_group_ != nullptr &&
                                  vae_group_->world_size() > 1),
         is_video_vae_worker_(is_vae_parallel_enabled_ || is_tp_driver_),
@@ -349,6 +350,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       };
     }
 #endif
+    const H3PreparedInputs prepared_inputs =
+        transformer_->prepare_inputs(prompt_embeds, layout.position_ids);
     for (int64_t step = 0; step < scheduler_.timesteps().numel(); ++step) {
       torch::Tensor video_timestep = scheduler_.timesteps()[step];
       torch::Tensor audio_timestep = audio_scheduler_.timesteps()[step];
@@ -358,7 +361,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
       MiniMaxH3TransformerOutput prediction =
           transformer_->forward(video_rows,
                                 audio_rows,
-                                prompt_embeds,
+                                prepared_inputs,
                                 timestep_layout.timesteps,
                                 timestep_layout.indices,
                                 layout.position_ids,
@@ -436,7 +439,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     }
 
     torch::Tensor video = vae_->decode(video_latent);
-    if (!is_tp_driver_) {
+    if (!is_output_rank_) {
       synchronize_tp_ranks();
       return DiTForwardOutput();
     }
@@ -1733,6 +1736,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
   Qwen3VLMPositionGenerator text_encoder_position_generator_;
   ProcessGroup* vae_group_ = nullptr;
   bool is_tp_driver_ = true;
+  bool is_output_rank_ = false;
   bool use_rolling_load_ = false;
   bool is_vae_parallel_enabled_ = false;
   bool is_video_vae_worker_ = true;

@@ -683,11 +683,14 @@ class H3AdaLayerNormModulationImpl final : public torch::nn::Module {
                                     context.get_tensor_options()));
   }
 
-  std::vector<torch::Tensor> forward(const torch::Tensor& temb) {
+  std::vector<torch::Tensor> forward(const torch::Tensor& temb,
+                                     const torch::Tensor& adaln_indices) {
     torch::Tensor x =
         linear_->forward(torch::silu(temb).to(linear_->weight().scalar_type()));
-    x = x.view({-1, 6 * hidden_size_});
-    return x.chunk(6, -1);
+    x = x.view({-1, 6 * hidden_size_})
+            .index_select(/*dim=*/0, adaln_indices)
+            .unsqueeze(/*dim=*/0);
+    return x.chunk(/*chunks=*/6, /*dim=*/-1);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -739,19 +742,14 @@ class H3TransformerBlockImpl final : public torch::nn::Module {
                         const torch::Tensor& adaln_indices,
                         const torch::Tensor& cos,
                         const torch::Tensor& sin) {
-    auto chunks = adaln_->forward(temb);
-    torch::Tensor shift_msa =
-        chunks[0].index_select(0, adaln_indices).unsqueeze(0);
-    torch::Tensor scale_msa =
-        chunks[1].index_select(0, adaln_indices).unsqueeze(0);
-    torch::Tensor gate_msa =
-        chunks[2].index_select(0, adaln_indices).unsqueeze(0);
-    torch::Tensor shift_mlp =
-        chunks[3].index_select(0, adaln_indices).unsqueeze(0);
-    torch::Tensor scale_mlp =
-        chunks[4].index_select(0, adaln_indices).unsqueeze(0);
-    torch::Tensor gate_mlp =
-        chunks[5].index_select(0, adaln_indices).unsqueeze(0);
+    const std::vector<torch::Tensor> chunks =
+        adaln_->forward(temb, adaln_indices);
+    const torch::Tensor& shift_msa = chunks[0];
+    const torch::Tensor& scale_msa = chunks[1];
+    const torch::Tensor& gate_msa = chunks[2];
+    const torch::Tensor& shift_mlp = chunks[3];
+    const torch::Tensor& scale_mlp = chunks[4];
+    const torch::Tensor& gate_mlp = chunks[5];
 
     torch::Tensor norm_h = norm1_->forward(hidden_states);
     norm_h = norm_h * (1.0 + scale_msa) + shift_msa;
@@ -854,6 +852,11 @@ TORCH_MODULE(H3AdaLayerNormOut);
 struct MiniMaxH3TransformerOutput {
   torch::Tensor sample;
   torch::Tensor audio_sample;
+};
+
+struct H3PreparedInputs {
+  torch::Tensor text_embeds;
+  std::pair<torch::Tensor, torch::Tensor> rotary;
 };
 
 class MiniMaxH3Transformer3DModelImpl final
@@ -1043,10 +1046,18 @@ class MiniMaxH3Transformer3DModelImpl final
     validate_module_dtype("norm_out", *norm_out_, torch::kBFloat16);
   }
 
+  H3PreparedInputs prepare_inputs(const torch::Tensor& encoder_hidden_states,
+                                  const torch::Tensor& position_ids) {
+    torch::Tensor text_embeds = context_embedder_->forward(
+        encoder_hidden_states.to(context_embedder_->weight.scalar_type()));
+    text_embeds = token_refiner_->forward(text_embeds);
+    return {std::move(text_embeds), rope_->forward(position_ids)};
+  }
+
   MiniMaxH3TransformerOutput forward(
       const torch::Tensor& hidden_states,
       const torch::Tensor& audio_hidden_states,
-      const torch::Tensor& encoder_hidden_states,
+      const H3PreparedInputs& prepared_inputs,
       const torch::Tensor& timestep,
       const torch::Tensor& timestep_indices,
       const torch::Tensor& position_ids,
@@ -1061,10 +1072,7 @@ class MiniMaxH3Transformer3DModelImpl final
         proj_in_->forward(hidden_states.to(proj_in_->weight.scalar_type()));
     torch::Tensor audio_embeds = audio_proj_in_->forward(
         audio_hidden_states.to(audio_proj_in_->weight.scalar_type()));
-    torch::Tensor text_embeds = context_embedder_->forward(
-        encoder_hidden_states.to(context_embedder_->weight.scalar_type()));
-    text_embeds = token_refiner_->forward(text_embeds);
-
+    const torch::Tensor& text_embeds = prepared_inputs.text_embeds;
     const int64_t batch = text_embeds.size(0);
     const int64_t sequence_length = position_ids.size(0);
     torch::Tensor packed = torch::zeros({batch, sequence_length, hidden_size_},
@@ -1081,7 +1089,7 @@ class MiniMaxH3Transformer3DModelImpl final
                                           /*downscale_freq_shift=*/0.0);
     torch::Tensor temb =
         time_embedder_->forward(timestep_proj.to(torch::kFloat32));
-    auto rotary = rope_->forward(position_ids);
+    const auto& rotary = prepared_inputs.rotary;
     torch::Tensor timestep_indices_long = timestep_indices.to(torch::kLong);
     torch::Tensor adaln_indices =
         timestep_indices_long * 3 + token_tags.to(torch::kLong);
