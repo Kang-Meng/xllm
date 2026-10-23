@@ -41,6 +41,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
+#include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
@@ -1603,45 +1604,62 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                   /*block_token_capacity=*/128,
                                   /*is_spec_draft=*/false);
 
-  // Layer composition mirrors create_dsv4_cache_tensors' V4.1 branch on NPU:
-  // one ratio-2 kv-source layer (C2 pool + fp32 compressor state ring) and
-  // two SWA-only reuse layers.
+  // One ratio-2 kv-source layer owns the C2 pool and fp32 compressor state
+  // ring; the other two layers reuse it and own only SWA buffers.
   const int64_t block_size = 128;
   const int64_t head_dim = 64;
   const int64_t index_head_dim = 32;
+  const auto make_block_cache = [block_size](int64_t block_count, int64_t dim) {
+#if defined(USE_MLU) || defined(USE_ILU)
+    return torch::zeros({block_count, 1, block_size, dim}, torch::kBFloat16);
+#else
+    return torch::zeros({block_count, block_size, 1, dim}, torch::kBFloat16);
+#endif
+  };
   KVCacheCapacity capacity;
   capacity.block_size(block_size).swa_count(4).c2_count(8).c1_count(8);
   const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
   std::vector<KVCache> caches;
+  caches.reserve(3);
   DeepSeekV4KVCacheTensors c2_layer;
   c2_layer.compressed_block_type = BlockType::C2;
-  c2_layer.key_cache =
-      torch::zeros({8, block_size, 1, head_dim}, torch::kBFloat16);
-  c2_layer.index_cache =
-      torch::zeros({8, block_size, 1, index_head_dim}, torch::kBFloat16);
-  c2_layer.swa_cache =
-      torch::zeros({4, block_size, 1, head_dim}, torch::kBFloat16);
+  c2_layer.key_cache = make_block_cache(/*block_count=*/8, head_dim);
+  c2_layer.index_cache = make_block_cache(/*block_count=*/8, index_head_dim);
+  c2_layer.swa_cache = make_block_cache(/*block_count=*/4, head_dim);
+#if defined(USE_MLU)
+  const int64_t state_width = 2 * head_dim;
+  c2_layer.compress_state =
+      torch::zeros({4, kDsv41CompressStateRows, state_width}, torch::kFloat32);
+  const std::vector<KVCacheTensorRole> state_roles = {
+      KVCacheTensorRole::COMPRESS_STATE};
+#else
+  const int64_t state_width = head_dim;
   c2_layer.compress_kv_state =
-      torch::zeros({4, block_size, head_dim}, torch::kFloat32);
+      torch::zeros({4, kDsv41CompressStateRows, state_width}, torch::kFloat32);
   c2_layer.compress_score_state =
-      torch::zeros({4, block_size, head_dim}, torch::kFloat32);
+      torch::zeros({4, kDsv41CompressStateRows, state_width}, torch::kFloat32);
+  const std::vector<KVCacheTensorRole> state_roles = {
+      KVCacheTensorRole::KV_STATE, KVCacheTensorRole::SCORE_STATE};
+#endif
   caches.emplace_back(c2_layer);
   for (int32_t layer = 1; layer < 3; ++layer) {
     DeepSeekV4KVCacheTensors reuse_layer;
-    reuse_layer.swa_cache =
-        torch::zeros({4, block_size, 1, head_dim}, torch::kBFloat16);
+    reuse_layer.swa_cache = make_block_cache(/*block_count=*/4, head_dim);
     caches.emplace_back(reuse_layer);
   }
 
   transfer.register_kv_cache(caches, shape, torch::kBFloat16);
 
-  // C2 kv-source layer: KEY + INDEX under the C2 group; WINDOW and the two
-  // fp32 state-ring planes under the SWA group. The reuse layers contribute
-  // only their WINDOW.
+  // C2 kv-source layer: KEY + INDEX under the C2 group; WINDOW and fp32
+  // state-ring buffers under the SWA group. MLU exports one packed state
+  // buffer, while other backends export separate KV and score planes.
+  // The reuse layers contribute only their WINDOW.
+  const size_t expected_buffer_count = 5u + state_roles.size();
   ASSERT_EQ(engine_observer->registered_block_bytes.size(), 1U);
-  ASSERT_EQ(engine_observer->registered_block_bytes[0].size(), 7U);
+  ASSERT_EQ(engine_observer->registered_block_bytes[0].size(),
+            expected_buffer_count);
   const auto& manifests = transfer.local_cache_layout_.tensors;
-  ASSERT_EQ(manifests.size(), 7U);
+  ASSERT_EQ(manifests.size(), expected_buffer_count);
   const auto find_manifest = [&manifests](int64_t layer_id,
                                           KVCacheTensorRole role) {
     return std::find_if(manifests.begin(),
@@ -1661,13 +1679,20 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   expect_manifest_group(KVCacheTensorRole::KEY, BlockType::C2);
   expect_manifest_group(KVCacheTensorRole::INDEX, BlockType::C2);
   expect_manifest_group(KVCacheTensorRole::WINDOW, BlockType::SWA);
-  expect_manifest_group(KVCacheTensorRole::KV_STATE, BlockType::SWA);
-  expect_manifest_group(KVCacheTensorRole::SCORE_STATE, BlockType::SWA);
   // The state ring is one resource per SWA block row, not per token.
-  const auto kv_state = find_manifest(0, KVCacheTensorRole::KV_STATE);
-  ASSERT_NE(kv_state, manifests.end());
-  EXPECT_EQ(kv_state->physical_rows_per_resource, 1U);
-  EXPECT_EQ(kv_state->shape, (std::vector<int64_t>{4, block_size, head_dim}));
+  for (const KVCacheTensorRole role : state_roles) {
+    expect_manifest_group(role, BlockType::SWA);
+    const auto state = find_manifest(/*layer_id=*/0, role);
+    ASSERT_NE(state, manifests.end()) << role.to_string();
+    EXPECT_EQ(state->resource_count, 4U);
+    EXPECT_EQ(state->physical_rows_per_resource, 1U);
+    EXPECT_EQ(state->shape,
+              (std::vector<int64_t>{4, kDsv41CompressStateRows, state_width}));
+    EXPECT_EQ(state->scalar_type, static_cast<int32_t>(torch::kFloat32));
+    EXPECT_EQ(state->resource_stride_bytes,
+              static_cast<uint64_t>(kDsv41CompressStateRows * state_width) *
+                  sizeof(float));
+  }
 
   // The load-bearing PD invariant: a SWA-group block mapping fans out to
   // every buffer registered under that group, so the parked partial-group
@@ -1696,8 +1721,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
         [role](const MooncakeKVCacheTransferDefault::RegisteredBufferDesc&
                    buffer) { return buffer.role == role; });
   };
-  for (const KVCacheTensorRole role :
-       {KVCacheTensorRole::KV_STATE, KVCacheTensorRole::SCORE_STATE}) {
+  for (const KVCacheTensorRole role : state_roles) {
     const auto buffer = find_buffer(role);
     ASSERT_NE(buffer, layer_buffers.end()) << role.to_string();
     const auto mapped = std::find_if(

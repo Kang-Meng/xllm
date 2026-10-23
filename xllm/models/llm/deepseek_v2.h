@@ -27,8 +27,6 @@ limitations under the License.
 #include "framework/kv_cache/kv_shard_layout.h"
 #if defined(USE_DCU)
 #include "core/layers/dcu/deepseek_v2_decoder_layer_impl.h"
-#elif defined(USE_MLU)
-#include "core/layers/mlu/deepseek_v2_decoder_layer_impl.h"
 #endif
 #include "llm_model_base.h"
 

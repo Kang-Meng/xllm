@@ -686,15 +686,47 @@ TEST(HierarchyBlockManagerPoolTest,
   const size_t completed_units = kPromptTokens / unit_tokens;
   const size_t checkpoint_block =
       completed_units * unit_tokens / options.block_size() - 1;
-  const bool has_checkpoint =
-      sequence.kv_state().blocks(BlockType::SWA)[checkpoint_block].is_valid();
+  const Slice<Block> swa_blocks = sequence.kv_state().blocks(BlockType::SWA);
+  ASSERT_GT(swa_blocks.size(), checkpoint_block);
+  const bool has_checkpoint = swa_blocks[checkpoint_block].is_valid();
+  const int32_t checkpoint_id =
+      has_checkpoint ? swa_blocks[checkpoint_block].id() : -1;
+  ASSERT_TRUE(swa_blocks.back().is_valid());
+  const int32_t partial_block_id = swa_blocks.back().id();
   pool.deallocate(&sequence);
 
-  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool),
-            2 * completed_units +
-                (has_checkpoint
-                     ? static_cast<size_t>(options.swa_blocks_per_seq()) + 8
-                     : 0));
+  const size_t pair_count =
+      HierarchyPoolTestPeer::pending_offload_pair_count(pool);
+  EXPECT_EQ(pair_count,
+            2 * completed_units + static_cast<size_t>(has_checkpoint));
+  size_t swa_pairs = 0;
+  size_t c4_pairs = 0;
+  size_t c128_pairs = 0;
+  for (size_t i = 0; i < pair_count; ++i) {
+    const std::shared_ptr<OffloadBlockPair> pair =
+        HierarchyPoolTestPeer::take_pending_offload_pair(pool);
+    ASSERT_NE(pair, nullptr);
+    EXPECT_TRUE(pair->src.is_valid());
+    EXPECT_TRUE(pair->dst.is_valid());
+    switch (pair->block_type) {
+      case BlockType::SWA:
+        ++swa_pairs;
+        EXPECT_EQ(pair->src.id(), checkpoint_id);
+        EXPECT_NE(pair->src.id(), partial_block_id);
+        break;
+      case BlockType::C4:
+        ++c4_pairs;
+        break;
+      case BlockType::C128:
+        ++c128_pairs;
+        break;
+      default:
+        ADD_FAILURE() << static_cast<int32_t>(pair->block_type);
+    }
+  }
+  EXPECT_EQ(swa_pairs, static_cast<size_t>(has_checkpoint));
+  EXPECT_EQ(c4_pairs, completed_units);
+  EXPECT_EQ(c128_pairs, completed_units);
 }
 
 TEST(HierarchyBlockManagerPoolTest, AllocateSharedMountsMatchesWithoutH2d) {
@@ -4208,7 +4240,6 @@ TEST(HierarchyBlockManagerPoolTest,
   constexpr size_t kPromptTokens = kCachedTokens + 1;
   constexpr size_t kWindowTokens = 128;
   constexpr size_t kSwaBlockSize = 128;
-  constexpr size_t kUnitTokens = 2048;
 
   BlockManagerPool::Options options = make_typed_cache_options();
   options.instance_is_decode(true)

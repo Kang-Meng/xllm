@@ -14,9 +14,9 @@ limitations under the License.
 ==============================================================================*/
 #pragma once
 
-#include "models/llm/deepseek_v2.h"
 #include "models/llm/llm_model_base.h"
 #include "models/llm/mlu/deepseek_mtp.h"
+#include "models/llm/mlu/deepseek_v2.h"
 
 namespace xllm::mlu::model {
 

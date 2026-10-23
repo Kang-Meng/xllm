@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "attention.h"
+#include "core/layers/mlu/attention.h"
 
 #include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"

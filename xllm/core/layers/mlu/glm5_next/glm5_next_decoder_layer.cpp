@@ -101,7 +101,7 @@ Glm5NextDecoderLayerImpl::Glm5NextDecoderLayerImpl(const ModelContext& context,
   if (role_.attention == Glm5NextAttentionRole::KDA) {
     kda_ = register_module("self_attn", Glm5NextKDA(context));
   } else {
-    dsa_ = register_module("self_attn", DeepseekV2Attention(context));
+    dsa_ = register_module("self_attn", DeepseekV32Attention(context));
   }
 
   if (role_.mlp == Glm5NextMlpRole::DENSE) {

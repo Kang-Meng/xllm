@@ -20,8 +20,8 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/layers/common/kv_shard_batch_metadata.h"
-#include "core/layers/mlu/dcp_batch_metadata.h"
-#include "core/layers/mlu/dsa_topk_relay.h"
+#include "core/layers/mlu/deepseek_v32/dcp_batch_metadata.h"
+#include "core/layers/mlu/deepseek_v32/dsa_topk_relay.h"
 #include "models/llm/glm5.h"
 
 // GLM5.2 shares model_type "glm_moe_dsa" with GLM5.0/5.1 and is told apart by

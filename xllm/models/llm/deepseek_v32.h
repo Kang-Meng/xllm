@@ -20,7 +20,7 @@ limitations under the License.
 
 #include "deepseek_v2.h"
 #include "layers/common/attention_metadata_builder.h"
-#include "layers/mlu/deepseek_v32_cp_context.h"
+#include "layers/mlu/deepseek_v32/deepseek_v32_cp_context.h"
 #include "platform/platform.h"
 
 namespace xllm {
@@ -127,16 +127,6 @@ class DeepseekV32ModelImpl : public DeepseekV2ModelImpl {
     auto [h, res] = norm_mod()(hidden_states, residual);
     active_cp_context_ = nullptr;
     return ModelOutput(h, res);
-  }
-
- protected:
-  void prepare_decoder_layer_for_forward(
-      size_t /*layer_id*/,
-      layer::DeepseekV2DecoderLayer& layer,
-      const layer::AttentionMetadata& /*attn_metadata*/) override {
-#if defined(USE_MLU)
-    layer->set_context_parallel_context(active_cp_context_);
-#endif
   }
 
  private:

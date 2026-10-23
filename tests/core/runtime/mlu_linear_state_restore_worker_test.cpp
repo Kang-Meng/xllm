@@ -91,15 +91,52 @@ void fill_slot(LinearCacheTensors& cache,
   cache.ssm.narrow(/*dim=*/0, slot * ssm_stride, ssm_stride).fill_(ssm_value);
 }
 
-void expect_slot_matches(const LinearCacheTensors& cache,
-                         int64_t destination,
-                         int64_t source,
-                         int64_t ssm_stride) {
-  EXPECT_TRUE(torch::equal(cache.conv.select(/*dim=*/0, destination),
-                           cache.conv.select(/*dim=*/0, source)));
+void expect_restored_slot(const LinearCacheTensors& cache,
+                          int64_t destination,
+                          int64_t source,
+                          int64_t ssm_stride,
+                          float unchanged_value,
+                          int64_t accepted_row = 0,
+                          int64_t conv_history_len = 0) {
+  const torch::Tensor conv_slot = cache.conv.select(/*dim=*/0, destination);
+  const int64_t history_len =
+      conv_history_len > 0 ? conv_history_len : conv_slot.size(0);
+  EXPECT_TRUE(
+      torch::equal(conv_slot.narrow(/*dim=*/0, accepted_row, history_len),
+                   cache.conv.select(/*dim=*/0, source)
+                       .narrow(/*dim=*/0, accepted_row, history_len)));
+  if (accepted_row > 0) {
+    EXPECT_TRUE(
+        torch::all(conv_slot.narrow(/*dim=*/0, /*start=*/0, accepted_row) ==
+                   unchanged_value)
+            .item<bool>());
+  }
+  const int64_t history_end = accepted_row + history_len;
+  if (history_end < conv_slot.size(0)) {
+    EXPECT_TRUE(torch::all(conv_slot.narrow(/*dim=*/0,
+                                            history_end,
+                                            conv_slot.size(0) - history_end) ==
+                           unchanged_value)
+                    .item<bool>());
+  }
+  const torch::Tensor ssm_slot =
+      cache.ssm.narrow(/*dim=*/0, destination * ssm_stride, ssm_stride);
   EXPECT_TRUE(torch::equal(
-      cache.ssm.narrow(/*dim=*/0, destination * ssm_stride, ssm_stride),
-      cache.ssm.narrow(/*dim=*/0, source * ssm_stride, ssm_stride)));
+      ssm_slot.select(/*dim=*/0, accepted_row),
+      cache.ssm.select(/*dim=*/0, source * ssm_stride + accepted_row)));
+  if (accepted_row > 0) {
+    EXPECT_TRUE(
+        torch::all(ssm_slot.narrow(/*dim=*/0, /*start=*/0, accepted_row) ==
+                   unchanged_value)
+            .item<bool>());
+  }
+  if (accepted_row + 1 < ssm_stride) {
+    EXPECT_TRUE(torch::all(ssm_slot.narrow(/*dim=*/0,
+                                           accepted_row + 1,
+                                           ssm_stride - accepted_row - 1) ==
+                           unchanged_value)
+                    .item<bool>());
+  }
 }
 
 void expect_slot_filled(const LinearCacheTensors& cache,
@@ -271,14 +308,16 @@ TEST(MluLinearStateRestoreWorkerTest,
 
   EXPECT_EQ(processed_input.input_params.linear_state_validity_mask,
             std::vector<int64_t>({1, 1, 0, 0}));
-  expect_slot_matches(first,
-                      /*destination=*/1,
-                      kRestoreSourceSlot,
-                      kFirstStride);
-  expect_slot_matches(second,
-                      /*destination=*/1,
-                      kRestoreSourceSlot,
-                      kSecondStride);
+  expect_restored_slot(first,
+                       /*destination=*/1,
+                       kRestoreSourceSlot,
+                       kFirstStride,
+                       /*unchanged_value=*/-101.0f);
+  expect_restored_slot(second,
+                       /*destination=*/1,
+                       kRestoreSourceSlot,
+                       kSecondStride,
+                       /*unchanged_value=*/-202.0f);
   expect_slot_filled(first, /*slot=*/2, kFirstStride, /*value=*/13.0f);
   expect_slot_filled(second, /*slot=*/2, kSecondStride, /*value=*/17.0f);
   // Cold rows retain their stored values; the validity mask tells the kernels
@@ -304,7 +343,8 @@ class MluGlmPrefillRestoreTest : public ::testing::Test {
                       bool is_spec_verify,
                       const std::string& model_type,
                       bool expect_recurrent_copy,
-                      int32_t cp_size = 1) {
+                      int32_t cp_size = 1,
+                      int32_t accepted_tokens = 1) {
     const torch::Device device("mlu:0");
     ParallelArgs parallel_args(
         /*rank=*/0, /*world_size=*/cp_size, /*process_group=*/nullptr);
@@ -312,6 +352,9 @@ class MluGlmPrefillRestoreTest : public ::testing::Test {
     ModelArgs model_args;
     model_args.model_type(model_type);
     model_args.layer_types({"linear_attention"});
+    if (accepted_tokens > 1) {
+      model_args.linear_conv_kernel_dim(3);
+    }
     runtime::Options runtime_options;
     runtime_options.enable_schedule_overlap(false);
     LinearStateRestoreWorker worker(
@@ -320,6 +363,9 @@ class MluGlmPrefillRestoreTest : public ::testing::Test {
     LinearCacheTensors cache =
         make_linear_cache(device, kStride, /*sentinel=*/-101.0f);
     fill_slot(cache, kRestoreSourceSlot, kStride, 3.0f, 5.0f);
+    const int64_t accepted_row = accepted_tokens - 1;
+    cache.ssm.select(/*dim=*/0, kRestoreSourceSlot * kStride + accepted_row)
+        .fill_(5.0f + static_cast<float>(accepted_row));
     const torch::Tensor original_conv = cache.conv.clone();
     const torch::Tensor original_ssm = cache.ssm.clone();
     IndexedKVCacheTensors indexed;
@@ -352,6 +398,13 @@ class MluGlmPrefillRestoreTest : public ::testing::Test {
     input.input_params.embedding.linear_state_ids = {1, 2, 3, 0};
     input.input_params.embedding.linear_state_read_ids = {
         kRestoreSourceSlot, kRestoreSourceSlot, 3, 0};
+    if (accepted_tokens > 1) {
+      input.input_params.num_accepted_tokens_host = {
+          accepted_tokens, accepted_tokens, 1, 1};
+      input.input_params.num_accepted_tokens = torch::tensor(
+          input.input_params.num_accepted_tokens_host,
+          torch::TensorOptions().dtype(torch::kInt32).device(device));
+    }
     Device xllm_device(device);
     std::unique_ptr<Stream> stream = xllm_device.current_stream();
     xllm_device.synchronize_default_stream();
@@ -370,8 +423,23 @@ class MluGlmPrefillRestoreTest : public ::testing::Test {
         cache.ssm.narrow(0, kRestoreSourceSlot * kStride, kStride),
         original_ssm.narrow(0, kRestoreSourceSlot * kStride, kStride)));
     if (expect_recurrent_copy) {
-      expect_slot_matches(cache, 1, kRestoreSourceSlot, kStride);
-      expect_slot_matches(cache, 2, kRestoreSourceSlot, kStride);
+      const int64_t conv_history_len = accepted_tokens > 1 ? 2 : 0;
+      expect_restored_slot(cache,
+                           /*destination=*/1,
+                           kRestoreSourceSlot,
+                           kStride,
+                           /*unchanged_value=*/-101.0f,
+                           accepted_row,
+                           conv_history_len);
+      expect_restored_slot(cache,
+                           /*destination=*/2,
+                           kRestoreSourceSlot,
+                           kStride,
+                           /*unchanged_value=*/-101.0f,
+                           accepted_row,
+                           conv_history_len);
+      expect_slot_filled(cache, /*slot=*/0, kStride, /*value=*/-101.0f);
+      expect_slot_filled(cache, /*slot=*/3, kStride, /*value=*/-101.0f);
     } else {
       EXPECT_TRUE(torch::equal(cache.conv, original_conv));
       EXPECT_TRUE(torch::equal(cache.ssm, original_ssm));
@@ -391,7 +459,7 @@ TEST_F(MluGlmPrefillRestoreTest, PrefillPreservesAllStateUntilComputation) {
   }
 }
 
-TEST_F(MluGlmPrefillRestoreTest, DecodeAndVerifyRetainFullRestore) {
+TEST_F(MluGlmPrefillRestoreTest, DecodeAndVerifyRestoreAcceptedCheckpoint) {
   verify_restore(BatchForwardType::DECODE, false, "glm5_next", true);
   verify_restore(BatchForwardType::MIXED, false, "glm5_next", true);
   verify_restore(BatchForwardType::CHUNKED_PREFILL, true, "glm5_next", true);
@@ -405,8 +473,17 @@ TEST_F(MluGlmPrefillRestoreTest, ContextParallelPrefillSkipsStateCopies) {
                  /*cp_size=*/2);
 }
 
-TEST_F(MluGlmPrefillRestoreTest, OtherModelsRetainFullRestore) {
+TEST_F(MluGlmPrefillRestoreTest, OtherModelsRestoreAcceptedCheckpoint) {
   verify_restore(BatchForwardType::CHUNKED_PREFILL, false, "qwen3_5", true);
+}
+
+TEST_F(MluGlmPrefillRestoreTest, DecodeRestoresNonzeroAcceptedCheckpoint) {
+  verify_restore(BatchForwardType::DECODE,
+                 /*is_spec_verify=*/false,
+                 "glm5_next",
+                 /*expect_recurrent_copy=*/true,
+                 /*cp_size=*/1,
+                 /*accepted_tokens=*/2);
 }
 
 TEST(MluLinearStateRestoreWorkerTest,
@@ -474,12 +551,14 @@ TEST(MluLinearStateRestoreWorkerTest,
             /*slot=*/1,
             kFirstStride,
             /*conv_value=*/3.0f,
-            /*ssm_value=*/5.0f);
+            /*ssm_value=*/-101.0f);
   fill_slot(second_baseline,
             /*slot=*/1,
             kSecondStride,
             /*conv_value=*/7.0f,
-            /*ssm_value=*/11.0f);
+            /*ssm_value=*/-202.0f);
+  first_baseline.ssm.select(/*dim=*/0, kFirstStride).fill_(5.0f);
+  second_baseline.ssm.select(/*dim=*/0, kSecondStride).fill_(11.0f);
   first_baseline.conv.select(/*dim=*/0, /*index=*/1).add_(2.0f);
   first_baseline.ssm
       .narrow(/*dim=*/0, /*start=*/kFirstStride, /*length=*/kFirstStride)

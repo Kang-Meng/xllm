@@ -1,4 +1,12 @@
 include(cc_test)
+include(cc_library)
+
+cc_library(
+  NAME tests_utils
+  SRCS tests_utils.cpp
+  INCLUDES "${PROJECT_SOURCE_DIR}/tests/core" "${PROJECT_SOURCE_DIR}/xllm"
+  DEPS :model :model_context :state_dict :parallel_state :platform :util torch glog::glog GTest::gtest
+)
 
 get_filename_component(_xllm_build_import_root
   "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}" DIRECTORY)
@@ -14,8 +22,8 @@ cc_test(
     qwen3_5_attention_test.cpp
     qwen3_5_fused_moe_test.cpp
     qwen3_next_rms_norm_test.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :config
     :mlu_layers
     :common_layers
@@ -57,8 +65,8 @@ cc_test(
     glm5_next_decoder_layer_test
   SRCS
     glm5_next_decoder_layer_test.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :config
     :mlu_layers
     :common_layers
@@ -90,6 +98,7 @@ cc_test(
   SRCS
     glm5_next_kpool_indexer_test.cpp
   DEPS
+    :tests_utils
     :speculative
     :config
     :mlu_layers
@@ -113,17 +122,19 @@ cc_test(
   SRCS
     dense_mlp_test.cpp
     mla_decode_lse_test.cpp
-    dcp_indexer_candidate_test.cpp
-    dcp_decode_context_test.cpp
-    tests_utils.cpp
-    deepseek_v32_cp_utils_test.cpp
+    deepseek_v32/dcp_indexer_candidate_test.cpp
+    deepseek_v32/dcp_decode_context_test.cpp
+    deepseek_v32/deepseek_v32_cp_utils_test.cpp
     dp_utils_test.cpp
-    indexer_test.cpp
-    mla_test.cpp
-    deepseek_v2_decoder_layer_test.cpp
+    deepseek_v32/indexer_test.cpp
+    deepseek_v32/mla_test.cpp
+    deepseek_v32/dsa_characterization_test.cpp
+    deepseek_v32/deepseek_v32_decoder_layer_test.cpp
+    deepseek_v32/dsa_decoder_math_test.cpp
     qwen2_attention_test.cpp
     qwen2_vision_attention_test.cpp
   DEPS
+    :tests_utils
     :config
     :mlu_layers
     :common_layers
@@ -135,6 +146,8 @@ cc_test(
     glog::glog
     torch
     GTest::gtest_main
+  ENVIRONMENT
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
 )
 
 cc_test(
@@ -145,8 +158,8 @@ cc_test(
     deepseek_v4_compressor_test.cpp
     deepseek_v4_indexer_test.cpp
     deepseek_v4_ref_utils.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :mlu_layers
     :common_layers
     :block
@@ -165,8 +178,8 @@ cc_test(
     hyper_connection_test
   SRCS
     hyper_connection_test.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :mlu_layers
     :common_layers
     :block
@@ -185,8 +198,8 @@ cc_test(
   SRCS
     deepseek_v4_decoder_layer_test.cpp
     deepseek_v4_ref_utils.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :mlu_layers
     :common_layers
     :block
@@ -231,10 +244,10 @@ cc_test(
     moe_gate_test.cpp
     fused_moe_test.cpp
     moe_weight_loader_helper_test.cpp
-    deepseek_v2_sparse_moe_block_test.cpp
+    deepseek_v32/deepseek_v32_sparse_moe_block_test.cpp
     deepseek_v4_sparse_moe_block_test.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :config
     :mlu_layers
     :common_layers
@@ -274,8 +287,8 @@ cc_test(
     deep_ep_test
   SRCS
     deep_ep_test.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :mlu_layers
     :common_layers
     :parallel_state
@@ -295,8 +308,8 @@ cc_test(
     fused_moe_all2all_test
   SRCS
     fused_moe_all2all_test.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :config
     :mlu_layers
     :common_layers
@@ -312,59 +325,11 @@ cc_test(
 
 cc_test(
   NAME
-    deepseek_v2_attention_multi_device_test
-  SRCS
-    deepseek_v2_attention_multi_device_test.cpp
-    tests_utils.cpp
-  DEPS
-    :config
-    :block
-    :mlu_layers
-    :model_context
-    :parallel_state
-    :state_dict
-    GTest::gtest_main
-    torch
-    glog::glog
-)
-
-# This target forks MLU ranks and must remain isolated from layer_test, which
-# may initialize an MLU device before the candidate collective test runs.
-cc_test(
-  NAME
-    dcp_indexer_candidate_multi_device_test
-  SRCS
-    dcp_indexer_candidate_multi_device_test.cpp
-  DEPS
-    :mlu_layers
-    :parallel_state
-    :util
-    GTest::gtest_main
-    torch
-    glog::glog
-)
-
-# Cross-layer DSA top-k relay state is pure CPU logic, but the protocol belongs
-# to the MLU decoder/attention boundary.
-cc_test(
-  NAME
-    dsa_topk_relay_test
-  SRCS
-    dsa_topk_relay_test.cpp
-  DEPS
-    :mlu_layers
-    GTest::gtest_main
-    torch
-    glog::glog
-)
-
-cc_test(
-  NAME
     compressed_tensors_mlu_test
   SRCS
     compressed_tensors_test.cpp
-    tests_utils.cpp
   DEPS
+    :tests_utils
     :config
     :mlu_layers
     :common_layers
@@ -374,27 +339,6 @@ cc_test(
     glog::glog
     torch
     GTest::gtest_main
-)
-
-# Forks four ranks; keep separate from binaries that initialize MLU in the parent.
-cc_test(
-  NAME
-    glm5_attention_dcp_test
-  SRCS
-    glm5_attention_dcp_test.cpp
-  DEPS
-    :config
-    :block
-    :mlu_layers
-    :model_context
-    :parallel_state
-    :state_dict
-    :util
-    GTest::gtest_main
-    torch
-    glog::glog
-  ENVIRONMENT
-    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
 )
 
 cc_test(
@@ -430,3 +374,5 @@ cc_test(
   ENVIRONMENT
     "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
 )
+
+add_subdirectory(deepseek_v32)

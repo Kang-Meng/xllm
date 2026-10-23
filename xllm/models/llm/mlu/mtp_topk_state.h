@@ -26,7 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/mtp_topk_state.h"
-#include "core/layers/mlu/dsa_topk_state.h"
+#include "core/layers/mlu/deepseek_v32/dsa_topk_state.h"
 
 namespace xllm::mlu::model {
 

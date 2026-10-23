@@ -8,15 +8,16 @@ cc_library(
     dflash2_decoder_layer.h
     dflash2_context_kv.h
     attention.h
-    dcp_batch_metadata.h
-    dcp_decode_context.h
-    dcp_indexer_candidate.h
-    dsa_topk_relay.h
-    dsa_topk_state.h
-    deepseek_v2_attention.h
-    deepseek_v2_decoder_layer_impl.h
-    deepseek_v2_sparse_moe_block.h
-    indexer.h
+    deepseek_v32/dcp_batch_metadata.h
+    deepseek_v32/dcp_decode_context.h
+    deepseek_v32/dcp_indexer_candidate.h
+    deepseek_v32/dsa_topk_relay.h
+    deepseek_v32/dsa_topk_state.h
+    deepseek_v32/deepseek_v32_attention.h
+    deepseek_v32/post_attn_layout.h
+    deepseek_v32/deepseek_v32_decoder_layer.h
+    deepseek_v32/deepseek_v32_sparse_moe_block.h
+    deepseek_v32/deepseek_v32_indexer.h
     deepseek_v4/compressor.h
     deepseek_v4/dsa_cache_mapping.h
     deepseek_v4/dsa_empty_dp_input.h
@@ -31,8 +32,8 @@ cc_library(
     glm5_next/glm5_next_kda.h
     glm5_next/glm5_next_kpool_indexer.h
     glm5_next/glm5_next_pcp_context.h
-    deepseek_v32_cp_context.h
-    deepseek_v32_cp_plan.h
+    deepseek_v32/deepseek_v32_cp_context.h
+    deepseek_v32/deepseek_v32_cp_plan.h
     moe_gate.h
     fused_moe.h
     qwen3_5/qwen3_5_fused_moe.h
@@ -46,16 +47,16 @@ cc_library(
     dflash2_decoder_layer.cpp
     dflash2_context_kv.cpp
     attention.cpp
-    dcp_batch_metadata.cpp
-    dcp_decode_context.cpp
-    dcp_indexer_candidate.cpp
-    deepseek_v2_attention.cpp
-    deepseek_v2_attention_dcp.cpp
-    deepseek_v2_attention_cp.cpp
-    deepseek_v2_attention_glm5_next_pcp.cpp
-    deepseek_v2_decoder_layer_impl.cpp
-    deepseek_v2_sparse_moe_block.cpp
-    indexer.cpp
+    deepseek_v32/dcp_batch_metadata.cpp
+    deepseek_v32/dcp_decode_context.cpp
+    deepseek_v32/dcp_indexer_candidate.cpp
+    deepseek_v32/deepseek_v32_attention.cpp
+    deepseek_v32/deepseek_v32_attention_dcp.cpp
+    deepseek_v32/deepseek_v32_attention_cp.cpp
+    deepseek_v32/deepseek_v32_attention_glm5_next_pcp.cpp
+    deepseek_v32/deepseek_v32_decoder_layer.cpp
+    deepseek_v32/deepseek_v32_sparse_moe_block.cpp
+    deepseek_v32/deepseek_v32_indexer.cpp
     deepseek_v4/compressor.cpp
     deepseek_v4/dsa_empty_dp_input.cpp
     deepseek_v4/dsa_metadata_builder_mlu.cpp

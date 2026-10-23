@@ -17,15 +17,94 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <unordered_map>
 
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/model_context.h"
 #include "core/layers/common/linear.h"
-#include "core/layers/mlu/deepseek_v2_attention.h"
+#include "core/layers/mlu/deepseek_v32/deepseek_v32_attention.h"
 #include "core/layers/mlu/fused_moe.h"
 #include "layers/mlu/tests_utils.h"
 
 namespace xllm::layer {
 namespace {
+using Weights = std::unordered_map<std::string, torch::Tensor>;
+
+Weights create_compressed_weights(int64_t out, int64_t in, bool smooth);
+ModelArgs create_compressed_mla_args(bool nope);
+Weights create_compressed_mla_weights(const ModelArgs& args, bool compressed);
+
+Weights create_compressed_weights(int64_t out, int64_t in, bool smooth) {
+  Weights result;
+  result["weight"] =
+      torch::arange(out * in).remainder(15).sub(7).reshape({out, in}).to(
+          torch::kInt8);
+  result["weight_scale"] =
+      torch::linspace(0.01, 0.03, out).reshape({out, 1}).to(torch::kBFloat16);
+  if (smooth) {
+    result["smooth"] = torch::linspace(0.5, 1.5, in).to(torch::kBFloat16);
+  }
+  return result;
+}
+
+ModelArgs create_compressed_mla_args(bool nope) {
+  ModelArgs args;
+  args.hidden_size() = 128;
+  args.n_heads() = 2;
+  args.q_lora_rank() = 128;
+  args.kv_lora_rank() = 128;
+  args.qk_nope_head_dim() = 64;
+  args.qk_rope_head_dim() = nope ? 0 : 64;
+  args.v_head_dim() = 64;
+  args.max_position_embeddings() = 128;
+  args.rms_norm_eps() = 1e-5;
+  args.rope_theta() = 10000;
+  args.enable_mla() = true;
+  return args;
+}
+
+Weights create_compressed_mla_weights(const ModelArgs& args, bool compressed) {
+  Weights weights;
+  auto add =
+      [&](const std::string& name, int64_t out, int64_t in, bool quantized) {
+        if (!quantized) {
+          weights.emplace(name + ".weight",
+                          torch::full({out, in}, 0.01, torch::kBFloat16));
+          return;
+        }
+        for (const auto& [key, tensor] :
+             create_compressed_weights(out, in, true)) {
+          std::string suffix = key;
+          auto value = tensor;
+          if (!compressed && key == "weight") {
+            suffix = "qweight";
+          } else if (!compressed && key == "weight_scale") {
+            suffix = "per_channel_scale";
+            value = tensor.flatten();
+          }
+          weights.emplace(name + "." + suffix, value);
+        }
+      };
+  add("q_a_proj", args.q_lora_rank(), args.hidden_size(), compressed);
+  add("q_b_proj",
+      args.n_heads() * (args.qk_nope_head_dim() + args.qk_rope_head_dim()),
+      args.q_lora_rank(),
+      true);
+  add("kv_a_proj_with_mqa",
+      args.kv_lora_rank() + args.qk_rope_head_dim(),
+      args.hidden_size(),
+      compressed);
+  add("kv_b_proj",
+      args.n_heads() * (args.qk_nope_head_dim() + args.v_head_dim()),
+      args.kv_lora_rank(),
+      false);
+  add("o_proj", args.hidden_size(), args.n_heads() * args.v_head_dim(), true);
+  weights.emplace("q_a_layernorm.weight",
+                  torch::ones({args.q_lora_rank()}, torch::kBFloat16));
+  weights.emplace("kv_a_layernorm.weight",
+                  torch::ones({args.kv_lora_rank()}, torch::kBFloat16));
+  return weights;
+}
 
 QuantArgs ct_args() {
   QuantArgs args;
@@ -46,16 +125,7 @@ torch::TensorOptions mlu_options() {
 using Weights = std::unordered_map<std::string, torch::Tensor>;
 
 Weights ct_weights(int64_t out, int64_t in, bool smooth) {
-  Weights result;
-  result["weight"] =
-      torch::arange(out * in).remainder(15).sub(7).reshape({out, in}).to(
-          torch::kInt8);
-  result["weight_scale"] =
-      torch::linspace(0.01, 0.03, out).reshape({out, 1}).to(torch::kBFloat16);
-  if (smooth) {
-    result["smooth"] = torch::linspace(0.5, 1.5, in).to(torch::kBFloat16);
-  }
-  return result;
+  return create_compressed_weights(out, in, smooth);
 }
 
 // Independent per-token INT8 reference using the checkpoint's dequant scales.
@@ -99,21 +169,7 @@ ModelArgs moe_model_args() {
   return model;
 }
 
-ModelArgs attention_args(bool nope) {
-  ModelArgs args;
-  args.hidden_size() = 128;
-  args.n_heads() = 2;
-  args.q_lora_rank() = 128;
-  args.kv_lora_rank() = 128;
-  args.qk_nope_head_dim() = 64;
-  args.qk_rope_head_dim() = nope ? 0 : 64;
-  args.v_head_dim() = 64;
-  args.max_position_embeddings() = 128;
-  args.rms_norm_eps() = 1e-5;
-  args.rope_theta() = 10000;
-  args.enable_mla() = true;
-  return args;
-}
+ModelArgs attention_args(bool nope) { return create_compressed_mla_args(nope); }
 
 QuantArgs attention_quant(bool compressed) {
   auto quant = ct_args();
@@ -132,45 +188,7 @@ QuantArgs attention_quant(bool compressed) {
 }
 
 Weights attention_weights(const ModelArgs& args, bool compressed) {
-  Weights weights;
-  auto add =
-      [&](const std::string& name, int64_t out, int64_t in, bool quantized) {
-        if (!quantized) {
-          weights.emplace(name + ".weight",
-                          torch::full({out, in}, 0.01, torch::kBFloat16));
-          return;
-        }
-        for (const auto& [key, tensor] : ct_weights(out, in, true)) {
-          std::string suffix = key;
-          auto value = tensor;
-          if (!compressed && key == "weight") {
-            suffix = "qweight";
-          } else if (!compressed && key == "weight_scale") {
-            suffix = "per_channel_scale";
-            value = tensor.flatten();
-          }
-          weights.emplace(name + "." + suffix, value);
-        }
-      };
-  add("q_a_proj", args.q_lora_rank(), args.hidden_size(), compressed);
-  add("q_b_proj",
-      args.n_heads() * (args.qk_nope_head_dim() + args.qk_rope_head_dim()),
-      args.q_lora_rank(),
-      true);
-  add("kv_a_proj_with_mqa",
-      args.kv_lora_rank() + args.qk_rope_head_dim(),
-      args.hidden_size(),
-      compressed);
-  add("kv_b_proj",
-      args.n_heads() * (args.qk_nope_head_dim() + args.v_head_dim()),
-      args.kv_lora_rank(),
-      false);
-  add("o_proj", args.hidden_size(), args.n_heads() * args.v_head_dim(), true);
-  weights.emplace("q_a_layernorm.weight",
-                  torch::ones({args.q_lora_rank()}, torch::kBFloat16));
-  weights.emplace("kv_a_layernorm.weight",
-                  torch::ones({args.kv_lora_rank()}, torch::kBFloat16));
-  return weights;
+  return create_compressed_mla_weights(args, compressed);
 }
 
 TEST(CompressedTensorsMluTest, AttentionPreservesBothCheckpointFormats) {
@@ -188,12 +206,12 @@ TEST(CompressedTensorsMluTest, AttentionPreservesBothCheckpointFormats) {
           std::to_string(layer) + ".self_attn.";
       OptimizationConfig optimization;
       optimization.enable_fused_mla_kernel = true;
-      DeepseekV2Attention attention(args,
-                                    quant,
-                                    parallel,
-                                    mlu_options(),
-                                    optimization,
-                                    /*enable_indexer=*/false);
+      DeepseekV32Attention attention(args,
+                                     quant,
+                                     parallel,
+                                     mlu_options(),
+                                     optimization,
+                                     /*enable_indexer=*/false);
       const auto weights = attention_weights(args, compressed);
       // Load scale/smooth separately from weights, as safetensors shards can.
       Weights tensors;
@@ -288,12 +306,12 @@ TEST(CompressedTensorsMluDeathTest, AttentionRejectsIncompleteCheckpoint) {
     for (const std::string& missing :
          {compressed ? "q_a_proj.weight_scale" : "q_b_proj.qweight",
           compressed ? "q_a_proj.smooth" : "o_proj.smooth"}) {
-      DeepseekV2Attention attention(args,
-                                    attention_quant(compressed),
-                                    parallel,
-                                    mlu_options(),
-                                    OptimizationConfig(),
-                                    /*enable_indexer=*/false);
+      DeepseekV32Attention attention(args,
+                                     attention_quant(compressed),
+                                     parallel,
+                                     mlu_options(),
+                                     OptimizationConfig(),
+                                     /*enable_indexer=*/false);
       auto weights = attention_weights(args, compressed);
       weights.erase(missing);
       attention->load_state_dict(

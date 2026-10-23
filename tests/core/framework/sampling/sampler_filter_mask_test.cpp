@@ -357,7 +357,7 @@ TEST(SamplerFilterMaskTest, MixedTopKOnlyUsesModelVocabulary) {
   check_request_filters(/*top_k=*/-1, /*top_p=*/1.F, /*mixed=*/true);
 }
 
-TEST(SamplerFilterMaskTest, TopPFilteringPreservesTargetLogitsAlias) {
+TEST(SamplerFilterMaskTest, TopPFilteringPublishesTargetDistribution) {
   if (uses_device_random_sample() && Platform::device_count() == 0) {
     GTEST_SKIP() << "Random sampling backend device is unavailable";
   }
@@ -370,16 +370,19 @@ TEST(SamplerFilterMaskTest, TopPFilteringPreservesTargetLogitsAlias) {
   const torch::Device device = get_random_sample_device();
   params = params.to(device, torch::kFloat32);
   torch::Tensor logits = torch::tensor({{3.0F, 2.0F, 1.0F, 0.0F}}).to(device);
-  // The target worker retains this alias before sampling. Speculative
-  // verification must see the same filtered distribution as the sampler.
-  const torch::Tensor target_logits = logits;
-
   Sampler sampler;
   SampleOutput output = sampler.forward(logits, params);
 
-  EXPECT_EQ(target_logits.data_ptr(), logits.data_ptr());
-  EXPECT_TRUE(torch::allclose(output.probs, target_logits.softmax(-1)));
-  EXPECT_EQ(target_logits.softmax(-1).index({0, 3}).item<float>(), 0.0F);
+  const torch::Tensor target_logits = logits;
+  const torch::Tensor target_probs = target_logits.softmax(/*dim=*/-1);
+  const torch::Tensor expected_probs =
+      torch::tensor(
+          {{3.0F, 2.0F, 1.0F, -std::numeric_limits<float>::infinity()}})
+          .to(device)
+          .softmax(/*dim=*/-1);
+  EXPECT_TRUE(torch::allclose(target_probs, expected_probs));
+  EXPECT_TRUE(torch::allclose(output.probs, target_probs));
+  EXPECT_EQ(target_probs.index({0, 3}).item<float>(), 0.0F);
 }
 
 }  // namespace

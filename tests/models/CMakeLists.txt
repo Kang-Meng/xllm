@@ -41,6 +41,8 @@ if(USE_NPU)
 endif()
 
 if(USE_MLU)
+  get_filename_component(_xllm_model_import_root
+    "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}" DIRECTORY)
   cc_test(
     NAME
       dflash2_mlu_model_test
@@ -55,6 +57,16 @@ if(USE_MLU)
       :state_dict
       GTest::gtest_main
       torch_mlu
+  )
+
+  # Parent stays device-free; every model run initializes its own fork rank.
+  cc_test(
+    NAME glm52_mlu_forward_test
+    SRCS glm52_mlu_forward_test.cpp
+    DEPS models :tests_utils :mlu_layers :common_layers :parallel_state
+         :model_context :state_dict GTest::gtest_main torch_mlu
+    ENVIRONMENT
+      "PYTHONPATH=${_xllm_model_import_root}:$ENV{PYTHONPATH}"
   )
 
   # Uses CPU tensors and forks before any MLU device initialization.

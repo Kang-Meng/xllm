@@ -19,7 +19,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "core/layers/mlu/deepseek_v2_decoder_layer_impl.h"
+#include "core/layers/mlu/deepseek_v32/deepseek_v32_decoder_layer.h"
 #include "models/llm/llm_model_base.h"
 #include "models/llm/mlu/mtp_model_base.h"
 
@@ -30,13 +30,13 @@ limitations under the License.
 namespace xllm::mlu::model {
 
 class DeepseekMultiTokenPredictorLayerImpl
-    : public MluMtpDecoderLayerImplBase<layer::DeepseekV2DecoderLayer> {
+    : public MluMtpDecoderLayerImplBase<layer::DeepseekV32DecoderLayer> {
  public:
   DeepseekMultiTokenPredictorLayerImpl(const ModelContext& context,
                                        const int32_t layer_index)
-      : MluMtpDecoderLayerImplBase<layer::DeepseekV2DecoderLayer>(context,
-                                                                  layer_index) {
-  }
+      : MluMtpDecoderLayerImplBase<layer::DeepseekV32DecoderLayer>(
+            context,
+            layer_index) {}
 };
 TORCH_MODULE(DeepseekMultiTokenPredictorLayer);
 

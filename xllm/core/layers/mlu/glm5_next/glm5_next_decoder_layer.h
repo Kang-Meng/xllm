@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 
+#include "core/layers/mlu/deepseek_v32/deepseek_v32_attention.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -28,7 +29,6 @@ limitations under the License.
 #include "layers/common/attention_metadata.h"
 #include "layers/common/dense_mlp.h"
 #include "layers/common/rms_norm.h"
-#include "layers/mlu/deepseek_v2_attention.h"
 #include "layers/mlu/deepseek_v4/deepseek_v4_sparse_moe_block.h"
 #include "layers/mlu/glm5_next/glm5_next_kda.h"
 #include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
@@ -97,7 +97,7 @@ class Glm5NextDecoderLayerImpl final : public torch::nn::Module {
   RMSNorm post_norm_{nullptr};
 
   Glm5NextKDA kda_{nullptr};
-  DeepseekV2Attention dsa_{nullptr};
+  DeepseekV32Attention dsa_{nullptr};
   DenseMLP dense_mlp_{nullptr};
   DeepseekV4SparseMoEBlock sparse_moe_{nullptr};
 };

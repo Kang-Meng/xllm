@@ -25,23 +25,170 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
 
+#include "core/framework/config/kv_cache_config.h"
 #include "framework/config/kv_cache_config.h"
 #include "framework/speculative/spec_input_builder.h"
 #include "kernels/mlu/kpool.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "layers/common/attention_metadata_builder.h"
 #include "layers/mlu/attention.h"
-#include "layers/mlu/deepseek_v2_attention.h"
+#include "layers/mlu/deepseek_v32/deepseek_v32_attention.h"
+#include "layers/mlu/tests_utils.h"
 #include "models/llm/mlu/glm5_next_graph.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 #include "runtime/forward_params.h"
 #include "tests/core/layers/mlu/glm5_next_kpool_test_utils.h"
+#include "tests/core/layers/mlu/tests_utils.h"
 #include "util/linalg.h"
 
 namespace xllm::layer {
 namespace {
+torch::Tensor active_topk(const torch::Tensor& table,
+                          const torch::Tensor& lengths) {
+  const auto columns = torch::arange(table.size(1), lengths.options());
+  return torch::where(
+      columns < lengths.unsqueeze(1), table, torch::full_like(table, -1));
+}
+
+enum class DsaWeightFormat { BF16, SMOOTHQUANT, COMPRESSED_TENSORS };
+
+using Weights = std::unordered_map<std::string, torch::Tensor>;
+
+Weights create_seeded_linear_weights(int64_t out,
+                                     int64_t in,
+                                     DsaWeightFormat format,
+                                     const torch::TensorOptions& options,
+                                     const std::string& seed,
+                                     const std::string& prefix = "");
+Weights create_seeded_indexer_weights(const ModelArgs& args,
+                                      const torch::TensorOptions& options,
+                                      const std::string& prefix = "");
+Weights create_seeded_mla_weights(const ModelArgs& args,
+                                  DsaWeightFormat format,
+                                  const torch::TensorOptions& options,
+                                  const std::string& prefix = "");
+void expect_close(const torch::Tensor& actual,
+                  const torch::Tensor& expected,
+                  double rtol = 0.02,
+                  double atol = 0.025,
+                  const std::string& label = "");
+
+Weights create_seeded_linear_weights(int64_t out,
+                                     int64_t in,
+                                     DsaWeightFormat format,
+                                     const torch::TensorOptions& options,
+                                     const std::string& seed,
+                                     const std::string& prefix) {
+  Weights weights;
+  if (format == DsaWeightFormat::BF16) {
+    weights[prefix + "weight"] =
+        ::xllm::layer::test::seeded_tensor(
+            seed + ".weight", {out, in}, torch::kBFloat16, options.device()) *
+        0.01f;
+    return weights;
+  }
+  const bool compressed = format == DsaWeightFormat::COMPRESSED_TENSORS;
+  weights[prefix + (compressed ? "weight" : "qweight")] =
+      ::xllm::layer::test::seeded_tensor(
+          seed + ".qweight", {out, in}, torch::kInt8, options.device());
+  torch::Tensor scale =
+      ::xllm::layer::test::seeded_tensor(
+          seed + ".scale", {out}, torch::kFloat32, options.device())
+              .abs() *
+          0.01f +
+      0.03f;
+  weights[prefix + (compressed ? "weight_scale" : "per_channel_scale")] =
+      compressed ? scale.reshape({out, 1}) : scale;
+  weights[prefix + "smooth"] =
+      ::xllm::layer::test::seeded_tensor(
+          seed + ".smooth", {in}, torch::kFloat32, options.device())
+              .abs() *
+          0.01f +
+      0.03f;
+  return weights;
+}
+
+Weights create_seeded_indexer_weights(const ModelArgs& args,
+                                      const torch::TensorOptions& options,
+                                      const std::string& prefix) {
+  Weights weights;
+  auto add = [&](const std::string& name, std::vector<int64_t> shape) {
+    weights[prefix + name] =
+        ::xllm::layer::test::seeded_tensor(
+            prefix + name, shape, torch::kBFloat16, options.device()) *
+            0.01f +
+        0.02f;
+  };
+  add("wq_b.weight",
+      {args.index_n_heads() * args.index_head_dim(), args.q_lora_rank()});
+  add("wk.weight", {args.index_head_dim(), args.hidden_size()});
+  add("weights_proj.weight", {args.index_n_heads(), args.hidden_size()});
+  add("k_norm.weight", {args.index_head_dim()});
+  add("k_norm.bias", {args.index_head_dim()});
+  return weights;
+}
+
+Weights create_seeded_mla_weights(const ModelArgs& args,
+                                  DsaWeightFormat format,
+                                  const torch::TensorOptions& options,
+                                  const std::string& prefix) {
+  Weights weights;
+  auto add = [&](const std::string& name,
+                 int64_t out,
+                 int64_t in,
+                 DsaWeightFormat projection_format) {
+    weights.merge(create_seeded_linear_weights(out,
+                                               in,
+                                               projection_format,
+                                               options,
+                                               prefix + name,
+                                               prefix + name + "."));
+  };
+  add("q_a_proj",
+      args.q_lora_rank(),
+      args.hidden_size(),
+      DsaWeightFormat::BF16);
+  add("q_b_proj",
+      args.n_heads() * (args.qk_nope_head_dim() + args.qk_rope_head_dim()),
+      args.q_lora_rank(),
+      format);
+  add("kv_a_proj_with_mqa",
+      args.kv_lora_rank() + args.qk_rope_head_dim(),
+      args.hidden_size(),
+      DsaWeightFormat::BF16);
+  add("kv_b_proj",
+      args.n_heads() * (args.qk_nope_head_dim() + args.v_head_dim()),
+      args.kv_lora_rank(),
+      DsaWeightFormat::BF16);
+  add("o_proj", args.hidden_size(), args.n_heads() * args.v_head_dim(), format);
+  weights[prefix + "q_a_layernorm.weight"] =
+      torch::ones({args.q_lora_rank()}, options.dtype(torch::kFloat32));
+  weights[prefix + "kv_a_layernorm.weight"] =
+      torch::ones({args.kv_lora_rank()}, options.dtype(torch::kFloat32));
+  weights.merge(
+      create_seeded_indexer_weights(args, options, prefix + "indexer."));
+  return weights;
+}
+
+void expect_close(const torch::Tensor& actual,
+                  const torch::Tensor& expected,
+                  double rtol,
+                  double atol,
+                  const std::string& label) {
+  const torch::Tensor ref = expected.cpu().to(torch::kFloat32);
+  const torch::Tensor value = actual.cpu().to(torch::kFloat32);
+  ASSERT_GT(ref.abs().max().item<float>(), atol)
+      << label << " reference is too small for a meaningful absolute tolerance";
+  EXPECT_TRUE(torch::allclose(value, ref, rtol, atol))
+      << label << " max error " << (value - ref).abs().max().item<float>();
+}
+
 // GLM-5.3-Flash-W4A8 text_config (2026-09-17), SHA256
 // 07c7491191283d15537bb54351c98570e94e72207a25445bbb39b019acff3bb5.
 constexpr int64_t kHidden = 4096;
@@ -1991,7 +2138,7 @@ TEST(Glm5NextKPoolIndexerTest, LongPrefillKeepsTopScoringPoolsBeyondBudget) {
 
 class DeepseekV2AttentionTestPeer final {
  public:
-  static void install_indexer(DeepseekV2AttentionImpl& attention,
+  static void install_indexer(DeepseekV32AttentionImpl& attention,
                               Glm5NextKPoolIndexer indexer) {
     attention.has_indexer_ = true;
     attention.use_kpool_indexer_ = true;
@@ -1999,7 +2146,7 @@ class DeepseekV2AttentionTestPeer final {
   }
 
   static std::optional<DsaTopkState> resolve(
-      DeepseekV2AttentionImpl& attention,
+      DeepseekV32AttentionImpl& attention,
       const torch::Tensor& positions,
       const torch::Tensor& hidden,
       const torch::Tensor& queries,
@@ -2044,7 +2191,7 @@ TEST(Glm5NextKPoolIndexerTest,
   for (auto& parameter : indexer->named_parameters()) {
     parameter.value().normal_(/*mean=*/0.0, /*std=*/0.1);
   }
-  DeepseekV2AttentionImpl attention;
+  DeepseekV32AttentionImpl attention;
   DeepseekV2AttentionTestPeer::install_indexer(attention, indexer);
   const torch::Tensor hidden = torch::randn({16, kHidden}, options);
   const torch::Tensor queries = torch::randn({16, kRank}, options);
@@ -2163,4 +2310,240 @@ TEST(Glm5NextKPoolIndexerTest,
   }
   KVCacheConfig::get_instance().block_size(saved_block_size);
 }
+
+namespace {
+class KPoolBlockGuard final {
+ public:
+  KPoolBlockGuard() : saved_(KVCacheConfig::get_instance().block_size()) {
+    KVCacheConfig::get_instance().block_size(/*value=*/16);
+  }
+  ~KPoolBlockGuard() { KVCacheConfig::get_instance().block_size(saved_); }
+
+ private:
+  int64_t saved_;
+};
+}  // namespace
+
+TEST(Glm5NextKPoolIndexerTest,
+     PublicAttentionFreezesMtpAndReplaysAcceptedSpan) {
+  torch::NoGradGuard no_grad;
+  const KPoolBlockGuard block_guard;
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const auto ints = options.dtype(torch::kInt32);
+  ModelArgs args;
+  args.model_type(/*value=*/"glm5_next")
+      .hidden_size(kHidden)
+      .n_heads(/*value=*/4)
+      .q_lora_rank(kRank)
+      .kv_lora_rank(/*value=*/512)
+      .qk_nope_head_dim(/*value=*/128)
+      .qk_rope_head_dim(/*value=*/0)
+      .v_head_dim(/*value=*/128)
+      .enable_mla(/*value=*/true)
+      .rms_norm_eps(/*value=*/1e-6)
+      .index_n_heads(kHeads)
+      .index_head_dim(/*value=*/128)
+      .index_topk(kTopk)
+      .index_kpool(/*value=*/4)
+      .index_kpool_compress(/*value=*/true)
+      .index_kpool_always_select_tail(/*value=*/true)
+      .max_position_embeddings(/*value=*/128);
+  std::unique_ptr<ProcessGroup> process_group;
+  const ParallelArgs parallel =
+      test::create_default_parallel_args(process_group);
+  DeepseekV32Attention attention(
+      args, QuantArgs(), parallel, options, OptimizationConfig());
+  Weights weights = create_seeded_mla_weights(
+      args, DsaWeightFormat::BF16, options, /*prefix=*/"");
+  weights["indexer.index_kpool_compress_gate"] =
+      test::seeded_tensor("c13.public_attention.compress_gate",
+                          {128, kHidden},
+                          torch::kBFloat16,
+                          device) *
+      0.01;
+  weights["indexer.index_kpool_compress_ape"] =
+      test::seeded_tensor("c13.public_attention.compress_ape",
+                          {4, 128},
+                          torch::kFloat32,
+                          device) *
+      0.01;
+  attention->load_state_dict(StateDict(weights));
+  attention->verify_loaded_weights();
+  const torch::Tensor hidden = test::seeded_tensor(
+      "c13.public_attention.hidden", {16, kHidden}, torch::kBFloat16, device);
+  const torch::Tensor positions = torch::arange(/*end=*/16, ints);
+  const torch::Tensor table = torch::tensor(/*data=*/{{2, 0, 1, 3}}, ints);
+  const auto make_cache = [&]() {
+    return KVCache(IndexedKVCacheTensors{
+        .kv_cache_tensors = {.key_cache = torch::zeros(/*size=*/{4, 1, 16, 512},
+                                                       options)},
+        .index_cache = torch::zeros(/*size=*/{4, 1, 4, 128}, options),
+        .kpool_tail = torch::zeros(/*size=*/{2, 2, 16, 128}, options)});
+  };
+  const auto make_metadata = [&](int64_t begin, int64_t count, bool prefill) {
+    AttentionMetadata metadata{};
+    const int64_t length = begin + count;
+    metadata.block_table = table;
+    metadata.linear_state_indices = torch::tensor(/*data=*/{1}, ints);
+    metadata.q_seq_lens = torch::tensor(/*data=*/{count}, ints);
+    metadata.kv_seq_lens = torch::tensor(/*data=*/{length}, ints);
+    metadata.q_seq_lens_vec = {static_cast<int32_t>(count)};
+    metadata.kv_seq_lens_vec = {static_cast<int32_t>(length)};
+    metadata.q_cu_seq_lens = torch::tensor(/*data=*/{int64_t{0}, count}, ints);
+    metadata.kv_cu_seq_lens =
+        torch::tensor(/*data=*/{int64_t{0}, length}, ints);
+    metadata.slot_mapping = torch::arange(32 + begin, 32 + length, ints);
+    metadata.max_query_len = count;
+    metadata.max_seq_len = length;
+    metadata.total_kv_len = length;
+    metadata.compute_dtype = "bfloat16";
+    metadata.is_prefill = prefill;
+    return metadata;
+  };
+  for (const int64_t prefix : {6, 7}) {
+    for (const int64_t accepted : {0, 1, 3}) {
+      const std::string label = "c13_public_mtp_p" + std::to_string(prefix) +
+                                "_accepted" + std::to_string(accepted);
+      SCOPED_TRACE(label);
+
+      KVCache cache = make_cache();
+      AttentionMetadata prefill =
+          make_metadata(/*begin=*/0, prefix, /*prefill=*/true);
+      DsaTopkTransfer prefix_transfer = DsaTopkTransfer::capture_output();
+      const auto prefix_output =
+          attention->forward(positions.narrow(/*dim=*/0, /*start=*/0, prefix),
+                             hidden.narrow(/*dim=*/0, /*start=*/0, prefix),
+                             prefill,
+                             cache,
+                             /*cp_ctx=*/nullptr,
+                             &prefix_transfer);
+      ASSERT_NE(prefix_transfer.output(), nullptr);
+      ASSERT_TRUE(torch::isfinite(prefix_output.output).all().item<bool>());
+      EXPECT_GT(prefix_output.output.abs().max().item<float>(), 0);
+      AttentionMetadata draft =
+          make_metadata(prefix, /*count=*/1, /*prefill=*/false);
+      DsaTopkTransfer first_draft =
+          DsaTopkTransfer::prepare_mtp_step(/*state=*/std::nullopt, device);
+      const auto first_output =
+          attention->forward(positions.narrow(/*dim=*/0, prefix, /*length=*/1),
+                             hidden.narrow(/*dim=*/0, prefix, /*length=*/1),
+                             draft,
+                             cache,
+                             /*cp_ctx=*/nullptr,
+                             &first_draft);
+      const std::optional<DsaTopkState> frozen = first_draft.mtp_output_state();
+      ASSERT_TRUE(frozen.has_value());
+      EXPECT_EQ(frozen->context_lens()[0].item<int32_t>(), prefix + 1);
+      const torch::Tensor frozen_slots = frozen->block_tables().clone();
+      const torch::Tensor frozen_lengths = frozen->context_lens().clone();
+      const torch::Tensor saved_index = cache.get_index_cache().clone();
+      const torch::Tensor saved_tail = cache.get_kpool_tail().clone();
+      EXPECT_GT(saved_tail[1].abs().max().item<float>(), 0);
+
+      for (int64_t step = 1; step <= 3; ++step) {
+        const int64_t begin = prefix + step;
+        draft = make_metadata(begin, /*count=*/1, /*prefill=*/false);
+        const torch::Tensor before = cache.get_k_cache().clone();
+        DsaTopkTransfer transfer =
+            DsaTopkTransfer::prepare_mtp_step(frozen, device);
+        const auto output =
+            attention->forward(positions.narrow(/*dim=*/0, begin, /*length=*/1),
+                               hidden.narrow(/*dim=*/0, begin, /*length=*/1),
+                               draft,
+                               cache,
+                               /*cp_ctx=*/nullptr,
+                               &transfer);
+        ASSERT_NE(transfer.output(), nullptr);
+        EXPECT_TRUE(
+            torch::equal(transfer.output()->block_tables(), frozen_slots));
+        EXPECT_TRUE(
+            torch::equal(transfer.output()->context_lens(), frozen_lengths));
+        EXPECT_TRUE(torch::equal(frozen->block_tables(), frozen_slots));
+        EXPECT_TRUE(torch::equal(frozen->context_lens(), frozen_lengths));
+        EXPECT_TRUE(torch::equal(cache.get_index_cache(), saved_index));
+        EXPECT_TRUE(torch::equal(cache.get_kpool_tail(), saved_tail));
+        EXPECT_FALSE(torch::equal(cache.get_k_cache(), before));
+        EXPECT_TRUE(torch::isfinite(output.output).all().item<bool>());
+      }
+      const int64_t replay_begin = prefix + 1;
+      const int64_t replay_count = accepted + 1;
+      const int64_t length = replay_begin + replay_count;
+      const torch::Tensor before_replay = cache.get_k_cache().clone();
+      AttentionMetadata replay =
+          make_metadata(replay_begin, replay_count, /*prefill=*/false);
+      replay.is_spec_verify = true;
+      DsaTopkTransfer actual_transfer = DsaTopkTransfer::capture_output();
+      const auto actual = attention->forward(
+          positions.narrow(/*dim=*/0, replay_begin, replay_count),
+          hidden.narrow(/*dim=*/0, replay_begin, replay_count),
+          replay,
+          cache,
+          /*cp_ctx=*/nullptr,
+          &actual_transfer);
+      KVCache reference = make_cache();
+      AttentionMetadata whole =
+          make_metadata(/*begin=*/0, length, /*prefill=*/true);
+      DsaTopkTransfer expected_transfer = DsaTopkTransfer::capture_output();
+      const auto expected =
+          attention->forward(positions.narrow(/*dim=*/0, /*start=*/0, length),
+                             hidden.narrow(/*dim=*/0, /*start=*/0, length),
+                             whole,
+                             reference,
+                             /*cp_ctx=*/nullptr,
+                             &expected_transfer);
+      ASSERT_NE(actual_transfer.output(), nullptr);
+      ASSERT_NE(expected_transfer.output(), nullptr);
+      const torch::Tensor actual_slots =
+          std::get<0>(active_topk(actual_transfer.output()->block_tables(),
+                                  actual_transfer.output()->context_lens())
+                          .sort(/*dim=*/-1));
+      const torch::Tensor expected_slots =
+          std::get<0>(active_topk(expected_transfer.output()->block_tables(),
+                                  expected_transfer.output()->context_lens())
+                          .sort(/*dim=*/-1));
+      EXPECT_TRUE(torch::equal(
+          actual_slots,
+          expected_slots.narrow(/*dim=*/0, replay_begin, replay_count)));
+      EXPECT_TRUE(
+          torch::equal(actual_transfer.output()->context_lens(),
+                       expected_transfer.output()->context_lens().narrow(
+                           /*dim=*/0, replay_begin, replay_count)));
+      expect_close(
+          actual.output,
+          expected.output.narrow(/*dim=*/0, replay_begin, replay_count),
+          /*rtol=*/0.02,
+          /*atol=*/0.025,
+          "accepted replay attention output");
+      expect_close(cache.get_index_cache(),
+                   reference.get_index_cache(),
+                   /*rtol=*/0.015625,
+                   /*atol=*/0.015625,
+                   "accepted replay index cache");
+      expect_close(cache.get_kpool_tail(),
+                   reference.get_kpool_tail(),
+                   /*rtol=*/0.015625,
+                   /*atol=*/0.015625,
+                   "accepted replay tail");
+      expect_close(
+          cache.get_k_cache()[2][0].narrow(/*dim=*/0, /*start=*/0, length),
+          reference.get_k_cache()[2][0].narrow(/*dim=*/0, /*start=*/0, length),
+          /*rtol=*/0.02,
+          /*atol=*/0.025,
+          "accepted replay resident MLA keys");
+      EXPECT_TRUE(torch::equal(
+          cache.get_k_cache()[2][0].narrow(/*dim=*/0, length, 16 - length),
+          before_replay[2][0].narrow(/*dim=*/0, length, 16 - length)));
+      for (const int64_t page : {0, 1, 3}) {
+        EXPECT_TRUE(
+            torch::equal(cache.get_k_cache()[page], before_replay[page]));
+        EXPECT_TRUE(
+            torch::equal(cache.get_index_cache()[page], saved_index[page]));
+      }
+      EXPECT_EQ(cache.get_kpool_tail()[0].count_nonzero().item<int64_t>(), 0);
+    }
+  }
+}
+
 }  // namespace xllm::layer
