@@ -180,14 +180,19 @@ except ImportError:  # pragma: no cover - stub-loader path
 # Paged pool cache: write-time incremental compression + direct pool read
 # (see glm5_next_kpool.py).
 
-# Indexer query-row partition under prefill CP (the alpha plan): when enabled, the
-# kPool indexer scores only this rank's real query rows instead of the full
-# merged stream. Key-side pool writes stay full-stream. ON by default
-# (bit-exact vs the full stream on the non-fused path and on the fixed
-# fused kernel, eager CP prefill, single-sequence, kv_split replicated);
-# set XLLM_INDEXER_CP_QUERY_PARTITION=0 to disable. The engine passes a
-# uniform env to every CP rank, so gating cannot desynchronize the group.
-_INDEXER_CP_QUERY_PARTITION = os.environ.get("XLLM_INDEXER_CP_QUERY_PARTITION", "1") != "0"
+# Indexer query-row partition under prefill CP: the kPool indexer scores only
+# this rank's real query rows instead of the full merged stream. Key-side pool
+# writes stay full-stream. Bit-exact vs the full stream on the non-fused path
+# and on the fixed fused kernel (eager CP prefill, single-sequence, kv_split
+# replicated).
+#
+# ALWAYS ON in a shipped build, and deliberately NOT an environment variable: a
+# process-wide knob that silently changes numerics is a footgun (it would also
+# let one rank of a CP group differ from its peers). The remaining terms of the
+# gate are correctness conditions, not toggles. This constant exists only as a
+# test seam so the CPU suite can exercise the byte-identical full-stream path --
+# nothing outside tests may assign it.
+_INDEXER_CP_QUERY_PARTITION = True
 
 
 class Glm5NextRMSNorm(nn.Module):
@@ -1428,7 +1433,7 @@ class Glm5NextIndexer(nn.Module):
         that happens inside the attention backend (see
         ``NpuPagedAttentionBackend._mla_cp_partitioned_query``).
 
-        Under ``XLLM_INDEXER_CP_QUERY_PARTITION=1`` (the alpha plan) the caller passes
+        Under the query-row partition the caller passes
         this rank's real merged-stream rows via ``query_rows``: the key-side
         pool write still runs on the full stream, while the query side scores
         only those rows -- bit-exact on the non-fused path, where each row's
@@ -1436,7 +1441,7 @@ class Glm5NextIndexer(nn.Module):
         selected rows back into the full-layout tensor, so every downstream
         consumer (backend row select, ``cp_shard_rows``, the shared-layer
         merge) keeps the exact legacy contract. On by default
-        (``XLLM_INDEXER_CP_QUERY_PARTITION=0`` disables). Active under
+        (a test-only seam can turn it off for the full-stream comparison). Active under
         ``kv_split_size > 1`` as long as the index write mode is the default
         replicated one (full per-rank index replica, per-sequence
         page-expanded read tables); the non-default sharded mode, acl_graph

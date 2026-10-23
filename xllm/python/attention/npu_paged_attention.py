@@ -327,6 +327,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._mla_graph_lses: dict[tuple[int, ...], torch.Tensor] = {}
         self._mla_eager_query_buffers: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
         self._mla_quant_indexer_metadata: dict[tuple[int, int, int, int], torch.Tensor] = {}
+        # CP-partitioned sibling: the per-segment lengths (not just the padded
+        # width) shape this metadata, so the key carries the geometry, the two
+        # maxima and the live segment tensors' identity -- see
+        # _get_cp_quant_indexer_metadata.
+        self._mla_cp_quant_indexer_metadata: dict[tuple[object, ...], torch.Tensor] = {}
         self._mla_max_seqlen_q = 0
         self._mla_max_seqlen_k = 0
         self._kv_owner_representatives: torch.Tensor | None = None
@@ -658,6 +663,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # for every model; the graph_mode sub-branches only swap the tensors
         # into static execution buffers and derive replay-stable bounds.
         self._mla_quant_indexer_metadata.clear()
+        self._mla_cp_quant_indexer_metadata.clear()
         if metadata.kv_seq_lens is not None:
             kv_seq_lens = metadata.kv_seq_lens
             mla_device = kv_seq_lens.device
@@ -1416,6 +1422,34 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 if index_write_replicated
                 else getattr(self, "_materialized_block_table", None)
             )
+        # The CP plan for this forward. The partitioned quant tiling metadata
+        # is keyed off its per-segment tensors, so the getter only exists when
+        # a plan does (the partition gate already requires a real CpContext;
+        # without one the model stays on the full-stream route).
+        cp_plan = get_forward_context().cp_context
+
+        def cp_quant_indexer_metadata(
+            num_heads_q: int,
+            num_heads_k: int,
+            head_dim: int,
+            max_seqlen_q: int,
+            max_seqlen_kv: int,
+            sparse_count: int,
+            cmp_ratio: int,
+        ) -> torch.Tensor:
+            assert cp_plan is not None
+            return self._get_cp_quant_indexer_metadata(
+                num_heads_q,
+                num_heads_k,
+                head_dim,
+                cp_plan.q_cu_seqlens_tensor,
+                cp_plan.segment_kv_seq_lens_tensor,
+                max_seqlen_q,
+                max_seqlen_kv,
+                sparse_count,
+                cmp_ratio,
+            )
+
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=slot_mapping,
@@ -1433,6 +1467,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                     cmp_ratio,
                 )
             ),
+            # CP-partitioned sibling: same per-step cache, but built from THIS
+            # forward's per-segment lengths (the partition scores per-segment
+            # rows, so the full-stream metadata above would be wrong for it).
+            get_cp_quant_indexer_metadata=cp_quant_indexer_metadata,
             update_index_cache=lambda values, scales: self._update_mla_index_cache(
                 index_cache,
                 index_cache_scale,
@@ -1446,7 +1484,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 metadata,
                 get_forward_context().cp_context,
             ),
-            cp_context=get_forward_context().cp_context,
+            cp_context=cp_plan,
             kpool_tail=layer_cache.kpool_tail,
             kpool_tail_read_indices=kpool_tail_read_indices,
             kpool_tail_write_indices=kpool_tail_write_indices,
@@ -1502,6 +1540,67 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 cmp_ratio,
             )
             self._mla_quant_indexer_metadata[cache_key] = metadata
+        return metadata
+
+    def _get_cp_quant_indexer_metadata(
+        self,
+        num_heads_q: int,
+        num_heads_k: int,
+        head_dim: int,
+        q_cu_seqlens: torch.Tensor,
+        segment_kv_seq_lens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_kv: int,
+        sparse_count: int,
+        cmp_ratio: int,
+    ) -> torch.Tensor:
+        """Per-step cache for the CP per-segment quant tiling metadata.
+
+        The CP query-row partition feeds ``quant_lightning_indexer`` per-segment
+        seq tensors instead of the backend's full-stream ones, so the metadata
+        cannot come from :meth:`_get_quant_indexer_metadata` (which is closed
+        over ``_mla_actual_seq_q``/``_mla_actual_seq_kv``). But within one step
+        every indexer layer sees the same ``CpContext`` -- the per-segment
+        lengths, their maxima and the fixed (heads, head_dim, sparse_count,
+        cmp_ratio) geometry are layer-independent -- while ``MlaIndexContext`` is
+        rebuilt per layer. Without this cache the default-on partition path would
+        pay the host-side tiling and its 1024-int32 allocation once per layer per
+        step, cancelling part of the query-partition win.
+
+        ``_mla_cp_quant_indexer_metadata`` is cleared in ``prepare()`` next to the
+        full-stream cache, so no entry can leak across steps.
+        """
+        # The segment tensors themselves are not hashable, but their shape,
+        # data pointers and maxima identify the live layout: the CpContext is
+        # rebuilt per forward and this cache is cleared per step, so an entry
+        # can only be reused by another layer of the SAME forward.
+        cache_key = (
+            num_heads_q,
+            num_heads_k,
+            head_dim,
+            sparse_count,
+            cmp_ratio,
+            max_seqlen_q,
+            max_seqlen_kv,
+            int(q_cu_seqlens.numel()),
+            int(segment_kv_seq_lens.numel()),
+            q_cu_seqlens.data_ptr(),
+            segment_kv_seq_lens.data_ptr(),
+        )
+        metadata = self._mla_cp_quant_indexer_metadata.get(cache_key)
+        if metadata is None:
+            metadata = kernels.quant_lightning_indexer_metadata(
+                num_heads_q,
+                num_heads_k,
+                head_dim,
+                q_cu_seqlens,
+                segment_kv_seq_lens,
+                max_seqlen_q,
+                max_seqlen_kv,
+                sparse_count,
+                cmp_ratio,
+            )
+            self._mla_cp_quant_indexer_metadata[cache_key] = metadata
         return metadata
 
     @staticmethod

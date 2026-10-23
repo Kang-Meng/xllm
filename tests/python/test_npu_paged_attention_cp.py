@@ -765,6 +765,7 @@ def _shard_prepared_backend(nope_cache: torch.Tensor, metadata: SimpleNamespace)
     backend._materialized_block_table = None
     backend._sfa_page_layout = None
     backend._mla_quant_indexer_metadata = {}
+    backend._mla_cp_quant_indexer_metadata = {}
     backend._mla_actual_seq_q = None
     backend._mla_actual_seq_kv = None
     backend._mla_actual_seq_q_host = None

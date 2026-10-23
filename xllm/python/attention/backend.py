@@ -271,6 +271,15 @@ class MlaIndexContext:
     kpool_query_lens: Sequence[int] = ()
     kpool_query_lens_device: torch.Tensor | None = None
     kpool_cache_triton_compatible: bool = False
+    # Per-STEP cache for the CP per-segment quant tiling metadata. ``cp_context``
+    # is rebuilt per forward and the backend clears the cache in ``prepare()``,
+    # so one entry is live per prefill step: the per-segment seq lengths and
+    # their maxima are identical for every indexer layer in that step, and only
+    # a sliced (partitioned) call can build this metadata — the backend's
+    # full-stream ``get_quant_indexer_metadata`` describes the unpartitioned seq
+    # tensors and must not be reused here. ``None`` on backends that do not
+    # expose it; callers then fall back to the direct kernel call.
+    get_cp_quant_indexer_metadata: Callable[..., torch.Tensor] | None = None
     # True only when the index cache really needs shard-aware views (an
     # owner-sharded cache in sharded mode, a physically full replica that
     # still reads through page-expanded tables in replicated mode); the

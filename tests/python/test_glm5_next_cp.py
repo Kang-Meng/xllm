@@ -2088,6 +2088,7 @@ def _mla_handoff_backend(nope_cache: torch.Tensor, index_cache: torch.Tensor) ->
     backend.scale = 1.0
     backend._block_table_i32 = None
     backend._mla_quant_indexer_metadata = {}
+    backend._mla_cp_quant_indexer_metadata = {}
     backend._graph_workspace = None
     backend._graph_outputs = {}
     backend._graph_lses = {}

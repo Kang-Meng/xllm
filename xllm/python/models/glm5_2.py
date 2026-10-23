@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -56,13 +56,17 @@ from xllm.python.layers.moe import QuantGatedMLP
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.qlinear import QLinear, QLinearWeightLoader
 from xllm.python.model_executor.cp_utils import (
+    CpContext,
     cp_gather_kv,
+    cp_index_write_replicated,
     cp_merge_rows,
+    cp_real_query_rows,
     cp_shard_positions,
     cp_shard_rows,
 )
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
+    in_acl_graph,
     record_layer_event,
     wait_for_layer_load,
 )
@@ -94,6 +98,36 @@ from xllm.python.models.weight_utils import W8A8WeightLoader, effective_moe_tp, 
 # shapes; other gSize values are neither exposed nor tested. GLM-5.2 is 32/1 and pads Q
 # up to 64 heads at the caller (see Glm52Indexer._pad_q_heads_to_kernel_gsize).
 _QLI_KERNEL_GSIZE = 64
+
+# lightning_indexer sparse-mask contract, shared by the full-stream and the
+# CP-partitioned calls. ``sparse_mode=3`` is right-down-causal: the causal mask
+# aligns to the KV tail, which is what a prefix-cache / chunked-prefill batch
+# needs (``q_len < kv_len``; the left-up mode only aligns when they are equal).
+# The INT64_MAX pair is the CANN "no window bound" sentinel -- it is the op
+# schema's own default for ``pre_tokens``/``next_tokens`` (npu_ops_library.cpp
+# registers ``int pre_tokens=9223372036854775807``), so the mask stays a pure
+# causal mask without extra sliding-window clipping. Named so the two call
+# sites cannot drift apart: they must differ only in WHICH query rows are
+# scored, never in mask policy.
+_QLI_SPARSE_MODE_RIGHT_DOWN_CAUSAL = 3
+_QLI_NO_WINDOW_LIMIT = 9223372036854775807
+
+# Indexer query-row partition under prefill CP: Glm52Indexer.select_qli scores
+# only this rank's real CP query rows instead of the full merged stream;
+# key-side index cache writes stay full-stream. The S0 probe verified that the
+# lightning_indexer / quant_lightning_indexer kernels are row-independent and
+# that the per-segment varlen suffix layout reproduces the full-stream top-k at
+# set level (row-internal order can vary; downstream sparse attention sums by
+# index, so its output stays bit-exact; see research/s0-probe-results.md, task
+# 10-19-glm52-indexer-cp).
+#
+# ALWAYS ON in a shipped build, and deliberately NOT an environment variable: a
+# process-wide knob that silently changes numerics is a footgun (it would also
+# let one rank of a CP group differ from its peers). The remaining terms of the
+# gate below are correctness conditions, not toggles. This constant exists only
+# as a test seam so the CPU suite can exercise the byte-identical full-stream
+# path for comparison -- nothing outside tests may assign it.
+_INDEXER_CP_QUERY_PARTITION = True
 
 
 @dataclass
@@ -620,6 +654,197 @@ class Glm52Indexer(nn.Module):
         )
         return q, q_scale, weights
 
+    def _cp_partitioned_topk(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cp_context: CpContext,
+    ) -> torch.Tensor:
+        """Score only this rank's real CP query rows (alpha plan, non-quant).
+
+        ``q``/``weights`` are the CP-merged global-stream tensors. The rows
+        this rank really owns (``cp_real_query_rows``: ``shard_index``
+        gathered at ``query_index``) are packed per (sequence, half) segment,
+        which is exactly the order ``q_cu_seqlens`` counts, so one varlen
+        ``lightning_indexer`` call over the per-segment lengths reproduces
+        the full-stream top-k of those rows at set level (the S0 probe
+        contract: row-internal order varies with batch composition while the
+        selected index set does not; downstream sparse attention sums by
+        index, so its output stays bit-exact -- research/s0-probe-results.md).
+        Rows this rank does not own stay -1 in the returned full-layout
+        tensor and never reach a consumer: ``cp_shard_rows`` selects only
+        this rank's local rows (dropping the peer-owned -1 rows) and
+        zeroes the padding ones, so no -1 escapes and the sharded output
+        differs from the full-stream path only in the row-internal top-k
+        order that S0 contract #6 already covers (byte-identical for an
+        empty rank, whose every local row is zeroed padding).
+        """
+        rows = cp_real_query_rows(cp_context)
+        # index_cache here is the materialized paged MLA index cache, which the
+        # backend pins to 4-D ``[blocks, block_size, num_heads_k, head_dim]``
+        # with ``num_heads_k == 1``: `_is_compact_kpool_cache_compatible`
+        # asserts ``shape[2] == 1`` and `materialize_index_cache`'s consumers
+        # read the width from ``shape[3]``. The layerwise branch above and the
+        # backend's metadata getter use the same ``size(2)`` accessor. Assert
+        # the rank so a layout change fails loudly here instead of silently
+        # sizing the output as ``[rows, head_dim, topk]``.
+        assert index_cache.dim() == 4, (
+            f"paged MLA index cache must be 4-D [blocks, block_size, num_heads_k, head_dim], "
+            f"got {tuple(index_cache.shape)}"
+        )
+        topk = torch.full(
+            (q.size(0), index_cache.size(2), self.topk),
+            -1,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        if rows.numel() == 0:
+            # An empty rank owns no real query row, so there is nothing to
+            # score: every local row is padding and cp_shard_rows zeroes it,
+            # matching the full-stream path's output exactly.
+            return topk
+        # key_seq_lengths takes segment_kv_seq_lens -- the ABSOLUTE
+        # per-segment KV length, paged prefix included -- not kv_cu_seqlens
+        # (the causal prefix inside the gathered chunk stream): the
+        # materialized index-cache block table covers the whole paged
+        # sequence, the same absolute lengths ctx.actual_seq_kv pairs with
+        # that table on the full-stream path. With sparse_mode=3
+        # (right-aligned causal) a segment's query row i then attends
+        # exactly [0, segment_start + i] of its own sequence.
+        # The ``.contiguous()`` calls below are a layout GUARANTEE for the
+        # kernel, not an extra copy: ``index_select`` returns a freshly
+        # materialized tensor and ``.contiguous()`` is a no-op on it
+        # (``x.contiguous() is x``), so this path allocates only the gathered
+        # rows themselves -- no second buffer. They stay because the kernel
+        # entry contract requires contiguous inputs, and a source tensor with a
+        # non-trivial stride (or a future gather that returns a view) must not
+        # silently produce a strided argument.
+        topk_rows = kernels.lightning_indexer(
+            q.index_select(0, rows).contiguous(),
+            index_cache,
+            weights.index_select(0, rows).contiguous(),
+            cp_context.q_cu_seqlens_tensor,
+            cp_context.segment_kv_seq_lens_tensor,
+            block_table.index_select(0, cp_context.segment_seq_indices).contiguous(),
+            "TND",
+            "PA_BSND",
+            self.topk,
+            _QLI_SPARSE_MODE_RIGHT_DOWN_CAUSAL,
+            _QLI_NO_WINDOW_LIMIT,
+            _QLI_NO_WINDOW_LIMIT,
+            False,
+        )
+        topk.index_copy_(0, rows, topk_rows)
+        return topk
+
+    def _cp_partitioned_quant_topk(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        weight_scale: float,
+        index_cache: torch.Tensor,
+        index_cache_scale: torch.Tensor,
+        block_table: torch.Tensor,
+        cp_context: CpContext,
+        cmp_ratio: int,
+        get_cp_metadata: Callable[..., torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Score only this rank's real CP query rows (alpha plan, quant).
+
+        Quant sibling of :meth:`_cp_partitioned_topk` over the head-padded
+        int8 ``q``/fp16 ``q_scale``/``weights``: the same global-row
+        slicing, per-segment seq tensors, per-segment block-table rows and
+        -1-filled full-layout scatter. Slicing by query rows preserves the
+        padded 64-head per-token-per-head ``q_scale`` layout (S0 contract
+        #10: the row axis is orthogonal to the head axis), while the key
+        side (int8 ``index_cache``, paged 3-D ``index_cache_scale``,
+        ``block_table``) stays full-stream exactly as on the non-quant
+        path. One quant-specific duty: the tiling metadata must describe
+        THIS sliced call's seq tensors (S0 contract #7), so it cannot reuse
+        the backend's full-stream metadata -- it is built from the
+        per-segment seq tensors and their maxima instead. ``get_cp_metadata``
+        is the backend's per-STEP cache for exactly that metadata (the
+        segment lengths and maxima are identical for every indexer layer in
+        one step, so recomputing per layer would burn host-side tiling and a
+        1024-int32 allocation per layer); the direct kernel call remains the
+        fallback for a context that does not expose it.
+        """
+        rows = cp_real_query_rows(cp_context)
+        # Same 4-D paged index cache contract as the non-quant partition; see
+        # the assertion comment there (_is_compact_kpool_cache_compatible pins
+        # ``shape[2] == 1``).
+        assert index_cache.dim() == 4, (
+            f"paged MLA index cache must be 4-D [blocks, block_size, num_heads_k, head_dim], "
+            f"got {tuple(index_cache.shape)}"
+        )
+        topk = torch.full(
+            (q.size(0), index_cache.size(2), self.topk),
+            -1,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        if rows.numel() == 0:
+            # Same empty-rank contract as the non-quant partition: no real
+            # row to score, so neither the metadata nor the scoring kernel
+            # runs and cp_shard_rows zeroes the padding output.
+            return topk
+        q_cu_seqlens = cp_context.q_cu_seqlens
+        # build_cp_context_npu appends one cumulative entry per NON-EMPTY
+        # segment and one query_index entry per real row, so a non-empty
+        # ``rows`` above implies at least one segment -- and therefore a
+        # non-empty q_cu_seqlens. Pin that cross-file invariant instead of
+        # letting a future builder change surface as a bare IndexError.
+        assert q_cu_seqlens, "non-empty owned query rows require at least one CP segment"
+        # q_cu_seqlens holds cumulative ENDS (no leading zero), so the first
+        # entry is already segment 0's length.
+        segment_q_lens = [q_cu_seqlens[0]] + [end - begin for begin, end in zip(q_cu_seqlens, q_cu_seqlens[1:])]
+        max_q = max(segment_q_lens)
+        max_kv = max(cp_context.segment_kv_seq_lens)
+        if get_cp_metadata is not None:
+            qli_metadata = get_cp_metadata(
+                q.size(1),
+                index_cache.size(2),
+                self.head_dim,
+                max_q,
+                max_kv,
+                self.topk,
+                cmp_ratio,
+            )
+        else:
+            qli_metadata = kernels.quant_lightning_indexer_metadata(
+                q.size(1),
+                index_cache.size(2),
+                self.head_dim,
+                cp_context.q_cu_seqlens_tensor,
+                cp_context.segment_kv_seq_lens_tensor,
+                max_q,
+                max_kv,
+                self.topk,
+                cmp_ratio,
+            )
+        # Same layout guarantee as the non-quant call site: ``index_select``
+        # already materializes a contiguous result, so ``.contiguous()`` adds no
+        # copy; the fused ``* weight_scale -> .to(float16)`` chain is likewise
+        # contiguous. Kept for the kernel's contiguous-input contract.
+        topk_rows = kernels.quant_lightning_indexer(
+            q.index_select(0, rows).contiguous(),
+            index_cache,
+            (weights.index_select(0, rows) * weight_scale).to(torch.float16).contiguous(),
+            q_scale.index_select(0, rows).contiguous(),
+            index_cache_scale,
+            qli_metadata,
+            cp_context.q_cu_seqlens_tensor,
+            cp_context.segment_kv_seq_lens_tensor,
+            block_table.index_select(0, cp_context.segment_seq_indices).contiguous(),
+            self.topk,
+            cmp_ratio,
+        )
+        topk.index_copy_(0, rows, topk_rows)
+        return topk
+
     def select_qli(
         self,
         hidden: torch.Tensor,
@@ -650,6 +875,35 @@ class Glm52Indexer(nn.Module):
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
         weights = self.weights_proj(hidden)
+        # Alpha-plan gate for the CP query-row partition (design.md): when
+        # active, both scoring branches below (quant and non-quant) score
+        # only this rank's real CP query rows instead of the full merged
+        # stream. Beyond the env flag and CP being active, the gate
+        # requires a real CpContext -- the per-segment metadata the varlen
+        # call consumes is part of that dataclass, so duck-typed stand-ins
+        # without it stay on the full stream -- plus acl_graph capture
+        # being off (capture would bake the host-side segment lists) and,
+        # under kv_split, the DEFAULT replicated index-write mode (a full
+        # per-rank replica; the sharded-mode cross-rank reconstruction is
+        # unverified for the per-segment call). design.md's num_seqs == 1
+        # and n_real > 0 are deliberately NOT gated: the per-segment
+        # metadata packs two segments per sequence in batch order, so the
+        # varlen call is batch-composition-agnostic (covered by the
+        # multi-sequence test), and an empty rank skips the scoring call
+        # with byte-identical output (cp_shard_rows zeroes its padding
+        # rows).
+        # ``isinstance`` must be tested BEFORE any attribute access on the
+        # plan: a duck-typed stand-in (tests, an older host shim) has no real
+        # ``cp_size``, and probing it first raised TypeError instead of falling
+        # back to the full stream -- the opposite of what this gate is for. The
+        # CPU suite caught it (test_sfa_dcp.py passes a MagicMock plan).
+        alpha_active = (
+            _INDEXER_CP_QUERY_PARTITION
+            and isinstance(ctx.cp_context, CpContext)
+            and ctx.cp_context.cp_size > 1
+            and not in_acl_graph()
+            and (not ctx.has_kv_shard or cp_index_write_replicated())
+        )
         if ctx.cp_context is not None:
             q = cp_gather_kv(q, ctx.cp_context).contiguous()
             k = cp_gather_kv(k, ctx.cp_context).contiguous()
@@ -678,38 +932,61 @@ class Glm52Indexer(nn.Module):
             required_q_heads = index_cache.size(2) * _QLI_KERNEL_GSIZE
             q, q_scale, weights_padded = self._pad_q_heads_to_kernel_gsize(q, q_scale, weights, required_q_heads)
 
-            qli_metadata = ctx.get_quant_indexer_metadata(required_q_heads, self.head_dim, self.topk, cmp_ratio)
-            topk = kernels.quant_lightning_indexer(
-                q,
-                index_cache,
-                (weights_padded * weight_scale).to(torch.float16),
-                q_scale,
-                index_cache_scale,
-                qli_metadata,
-                actual_seq_q,
-                actual_seq_kv,
-                block_table,
-                self.topk,
-                cmp_ratio,
-            )
+            if alpha_active:
+                assert ctx.cp_context is not None
+                topk = self._cp_partitioned_quant_topk(
+                    q,
+                    q_scale,
+                    weights_padded,
+                    weight_scale,
+                    index_cache,
+                    index_cache_scale,
+                    block_table,
+                    ctx.cp_context,
+                    cmp_ratio,
+                    # Backend's per-step cache for the CP per-segment metadata.
+                    # Without it every indexer layer rebuilds the same host-side
+                    # tiling (and its 1024-int32 allocation) inside one step,
+                    # eating the query-partition win.
+                    get_cp_metadata=ctx.get_cp_quant_indexer_metadata,
+                )
+            else:
+                qli_metadata = ctx.get_quant_indexer_metadata(required_q_heads, self.head_dim, self.topk, cmp_ratio)
+                topk = kernels.quant_lightning_indexer(
+                    q,
+                    index_cache,
+                    (weights_padded * weight_scale).to(torch.float16),
+                    q_scale,
+                    index_cache_scale,
+                    qli_metadata,
+                    actual_seq_q,
+                    actual_seq_kv,
+                    block_table,
+                    self.topk,
+                    cmp_ratio,
+                )
         else:
             ctx.update_index_cache(k, None)
             index_cache, _, block_table = ctx.materialize_index_cache()
-            topk = kernels.lightning_indexer(
-                q,
-                index_cache,
-                weights,
-                actual_seq_q,
-                actual_seq_kv,
-                block_table,
-                "TND",
-                "PA_BSND",
-                self.topk,
-                3,
-                9223372036854775807,
-                9223372036854775807,
-                False,
-            )
+            if alpha_active:
+                assert ctx.cp_context is not None
+                topk = self._cp_partitioned_topk(q, weights, index_cache, block_table, ctx.cp_context)
+            else:
+                topk = kernels.lightning_indexer(
+                    q,
+                    index_cache,
+                    weights,
+                    actual_seq_q,
+                    actual_seq_kv,
+                    block_table,
+                    "TND",
+                    "PA_BSND",
+                    self.topk,
+                    _QLI_SPARSE_MODE_RIGHT_DOWN_CAUSAL,
+                    _QLI_NO_WINDOW_LIMIT,
+                    _QLI_NO_WINDOW_LIMIT,
+                    False,
+                )
         if ctx.cp_context is not None:
             topk = cp_shard_rows(topk, ctx.cp_context)
         return topk
