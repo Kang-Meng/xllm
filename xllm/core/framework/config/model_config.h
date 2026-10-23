@@ -62,6 +62,7 @@ class ModelConfig final {
          "tool_call_parser",
          "enable_qwen3_reranker",
          "engram_config",
+         "enable_swa_bounded_replay",
          "flashinfer_workspace_buffer_size",
          "use_cpp_chat_template"}};
     return kOptionCategory;
@@ -92,6 +93,9 @@ class ModelConfig final {
   // Python executor verbatim; parsing/validation lives there
   // (xllm/python/models/engram_config.py). "{}" disables both switches.
   PROPERTY(std::string, engram_config) = "{}";
+
+  // Lossy V4.1 prefill experiment; enabled only by explicit runtime opt-in.
+  PROPERTY(bool, enable_swa_bounded_replay) = false;
 
   PROPERTY(int32_t, flashinfer_workspace_buffer_size) = 128 * 1024 * 1024;
 

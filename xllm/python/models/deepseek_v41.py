@@ -111,6 +111,12 @@ from xllm.python.models.deepseek_v41_engram import (
 )
 from xllm.python.models.engram_config import EngramConfig
 from xllm.python.models.engram_shared_memory import ensure_dev_shm_capacity, estimate_shared_bytes
+from xllm.python.models.swa_bounded_replay import (
+    SWA_BOUNDED_FIRST_CONSUMER,
+    run_swa_bounded_consumers,
+    should_run_swa_bounded_replay,
+    validate_swa_bounded_replay,
+)
 from xllm.python.models.weight_utils import W8A8WeightLoader
 
 if TYPE_CHECKING:
@@ -344,6 +350,8 @@ class DeepseekV41Config(DeepseekV4Config):
     dspark_n_routed_experts: int = 128
     dspark_num_experts_per_tok: int = 3
     enable_dsa_cp: bool = False
+    # Explicit runtime opt-in: approximate prefill, default full computation.
+    enable_swa_bounded_replay: bool = False
     # ``--enable_fused_mc2`` flag (PyCausalLM::build_config_dict bridges the
     # C++ ``enable_fused_mc2`` gflag - kernel_config.cpp: -1 auto / 0 off /
     # 1 DFC / 2 MegaMoe - as >0). Decode-only slice: the dispatch/combine
@@ -432,6 +440,7 @@ class DeepseekV41Config(DeepseekV4Config):
             dspark_n_routed_experts=int(_pick(merged, "dspark_n_routed_experts", default=128)),
             dspark_num_experts_per_tok=int(_pick(merged, "dspark_num_experts_per_tok", default=3)),
             enable_dsa_cp=bool(_pick(merged, "enable_dsa_cp", default=False)),
+            enable_swa_bounded_replay=bool(_pick(merged, "enable_swa_bounded_replay", default=False)),
             enable_fused_mc2=bool(_pick(merged, "enable_fused_mc2", default=False)),
             layers_to_capture=_int_list(merged, "layers_to_capture"),
             enable_graph_aux_hidden_states=bool(_pick(merged, "enable_graph_aux_hidden_states", default=False)),
@@ -2590,6 +2599,7 @@ class DeepseekV41Model(nn.Module):
             cfg.kv_source_layer_ids,
             cfg.index_source_layer_ids,
         )
+        validate_swa_bounded_replay(cfg, self.csa2_plan)
         # Engram layout (None when the checkpoint has no engram layers).
         self.engram_layout: EngramLayout | None = None
         self.engram_hash: EngramHashState | None = None
@@ -3082,6 +3092,12 @@ class DeepseekV41Model(nn.Module):
         aux_capture = self.aux_hidden_capture
         aux_hidden_buffer = aux_capture.create_buffer(hidden.mean(dim=1)) if aux_capture.enabled else None
         for layer_id, layer in enumerate(self.layers):
+            if layer_id == SWA_BOUNDED_FIRST_CONSUMER and should_run_swa_bounded_replay(
+                self.cfg.enable_swa_bounded_replay, context
+            ):
+                return run_swa_bounded_consumers(
+                    self, context, hidden, pre_mix, positions, input_ids, aux_hidden_buffer
+                )
             layer_cos_sin_cache = self._layer_rope_cache(self.csa2_plan.mode(layer_id))
             hidden, pre_mix = layer(
                 hidden,

@@ -1059,6 +1059,9 @@ def _log_qli_v3_fallback(reason: str) -> None:
     logger.warning(f"the QLI v3 indexer path is inactive ({reason}); staying on the pure-torch indexer")
 
 
+_indexer_quant_fused_logged = False
+
+
 def _quantize_indexer_rows_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row symmetric INT8 quantization of the last axis.
 
@@ -1073,6 +1076,15 @@ def _quantize_indexer_rows_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     ``quantize_indexer_query`` -- no inf/NaN input defense is performed here;
     evaluating such defenses is deferred to a later round.
     """
+    # The fused kernel is validated for contiguous BF16 rows of width 128.
+    if x.device.type == "npu" and x.dtype == torch.bfloat16 and x.ndim >= 2 and x.size(-1) == 128 and x.is_contiguous():
+        from xllm.python.kernels_npu.triton.indexer_quant import quantize_indexer_rows_int8
+
+        global _indexer_quant_fused_logged
+        if not _indexer_quant_fused_logged:
+            logger.info("DeepSeek-V4.1 fused INT8 indexer quantization active")
+            _indexer_quant_fused_logged = True
+        return quantize_indexer_rows_int8(x)
     absmax = x.float().abs().amax(dim=-1)
     scale = (absmax / _QLI_V3_INT8_MAX).to(torch.float16).to(torch.float32).clamp_min(_QLI_V3_MIN_SCALE)
     normalized = x.float() / scale.unsqueeze(-1)
@@ -2528,6 +2540,38 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # Window rows at fixed capacity: [win ring candidates ; chunk].
             # Ring candidate c sits at absolute position prev - win + c; which
             # candidates a given query may read is decided per query below.
+            # Native SMLA is selected only for the validated V4.1 Flash dimensions.
+            use_smla = (
+                q.device.type == "npu"
+                and head_dim == 512
+                and q.dtype == torch.bfloat16
+                and win == 128
+                and (topk is None or topk.size(-1) <= _SMLA_CMP_TOPK_MAX)
+                and _supports_smla_va()
+            )
+            if use_smla and global_q_len == 1 and swa_flat is not None and swa_bt is not None:
+                from xllm.python.kernels_npu.triton.smla_window_pack import (
+                    can_pack_smla_window,
+                    pack_smla_window,
+                )
+
+                if can_pack_smla_window(swa_flat, swa_bt, kv_seq, global_ctx_lens, seq, swa_bs, win):
+                    window_kv = pack_smla_window(swa_flat, swa_bt, kv_seq, global_ctx_lens, seq, swa_bs, win)
+                    out[token_offset : token_offset + q_len] = self._smla_attention(
+                        q_seq,
+                        window_kv,
+                        layer,
+                        ctx_lens,
+                        global_ctx_lens,
+                        global_q_len,
+                        q_len,
+                        seq,
+                        topk,
+                        shared,
+                        sinks,
+                    )
+                    token_offset += q_len
+                    continue
             ring_pos = (global_prev_ctx - win) + torch.arange(win, device=q.device)
             if swa_flat is not None and swa_bt is not None:
                 ring_rows = self._gather_swa_positions(swa_flat, swa_bt, seq, ring_pos.clamp_min(0), swa_bs)
@@ -2542,14 +2586,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             ring_rows = torch.where((ring_pos >= 0).unsqueeze(-1), ring_rows, 0)
             kv_seq = torch.where(global_ctx_lens[seq] > 0, kv_seq, 0)
             window_kv = torch.cat((ring_rows, kv_seq), dim=0)
-            if (
-                q.device.type == "npu"
-                and head_dim == 512
-                and q.dtype == torch.bfloat16
-                and win == 128
-                and (topk is None or topk.size(-1) <= _SMLA_CMP_TOPK_MAX)
-                and _supports_smla_va()
-            ):
+            if use_smla:
                 out[token_offset : token_offset + q_len] = self._smla_attention(
                     q_seq,
                     window_kv,
@@ -2670,8 +2707,14 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # Ratio 1 uses the separate projected KV cache without pooling; it
         # still needs the compressed-cache input of the SMLA interface.
         has_compressed = ratio > 0 and topk is not None and topk.size(-1) > 0 and shared.key_cache is not None
-        if has_compressed and (shared.key_cache.ndim != 3 or shared.key_cache.size(-1) != q.size(-1)):
-            raise ValueError("SMLA compressed KV cache must have shape [num_blocks, block_size, head_dim]")
+        if has_compressed:
+            cache = shared.key_cache
+            valid_layout = cache.ndim == 3 or (cache.ndim == 4 and cache.size(2) == 1)
+            if not valid_layout or cache.size(-1) != q.size(-1):
+                raise ValueError(
+                    "SMLA compressed KV cache must have shape [num_blocks, block_size, head_dim] "
+                    "or [num_blocks, block_size, 1, head_dim]"
+                )
         ratio = ratio if has_compressed else 0
         compressed_width = (
             (topk.size(-1) + _SMLA_CMP_TOPK_BLOCK - 1) // _SMLA_CMP_TOPK_BLOCK * _SMLA_CMP_TOPK_BLOCK
@@ -2719,6 +2762,12 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 .clamp(min=0, max=self.window_size)
                 .view(-1, 1)
             )
+            dropped_rows = getattr(context.metadata, "swa_bounded_replay_dropped_rows", ())
+            if seq < len(dropped_rows) and dropped_rows[seq] > 0:
+                # The retained suffix has no preceding consumer-layer rows.
+                # Mask that missing prefix even when absolute positions are high.
+                retained = torch.arange(1, q_len + 1, device=q.device, dtype=torch.int32).view(-1, 1)
+                visible = torch.minimum(visible, retained)
             cmp_lens = torch.div(local_end, ratio, rounding_mode="floor") if ratio else None
             residual = local_end % ratio if ratio else None
             inputs = dict(

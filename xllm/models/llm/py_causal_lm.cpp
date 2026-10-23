@@ -39,7 +39,6 @@ limitations under the License.
 #include "models/py_model_helper.h"
 
 #if defined(USE_NPU)
-#include "core/framework/config/eplb_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/parallel_state/mega_moe_comm_resource.h"
 #include "core/kernels/npu/npu_ops_api.h"
@@ -568,6 +567,8 @@ py::dict PyCausalLM::build_config_dict(
   // Engram host-offload switches, forwarded as the raw JSON string; the Python
   // executor parses/validates it (xllm/python/models/engram_config.py).
   d["engram_config"] = ModelConfig::get_instance().engram_config();
+  d["enable_swa_bounded_replay"] =
+      ModelConfig::get_instance().enable_swa_bounded_replay();
   // Env-driven Python config fields the embedded executor reads. Pipeline
   // parallelism is not wired through for the Python model yet, so it is pinned
   // to 1 explicitly (engram requires PP=1). xllm loads .safetensors weights, so

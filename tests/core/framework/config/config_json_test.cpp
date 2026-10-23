@@ -37,6 +37,41 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(ModelConfigJsonTest, SwaBoundedReplayFlagAndHelp) {
+  google::FlagSaver flag_saver;
+  EXPECT_FALSE(ModelConfig().enable_swa_bounded_replay());
+  google::SetCommandLineOption("enable_swa_bounded_replay", "true");
+  ModelConfig enabled;
+  enabled.from_flags();
+  EXPECT_TRUE(enabled.enable_swa_bounded_replay());
+  google::SetCommandLineOption("enable_swa_bounded_replay", "false");
+  ModelConfig disabled;
+  disabled.from_flags();
+  EXPECT_FALSE(disabled.enable_swa_bounded_replay());
+  const auto& names = ModelConfig::option_category().option_names;
+  EXPECT_NE(std::find(names.begin(), names.end(), "enable_swa_bounded_replay"),
+            names.end());
+}
+
+TEST(ModelConfigJsonTest, SwaBoundedReplayIsExplicitOptIn) {
+  google::FlagSaver flag_saver;
+  EXPECT_FALSE(ModelConfig().enable_swa_bounded_replay());
+  {
+    google::FlagSaver enabled_flag_saver;
+    ModelConfig enabled;
+    enabled.from_json(config::parse_json_string(
+        R"json({"enable_swa_bounded_replay":true})json"));
+    EXPECT_TRUE(enabled.enable_swa_bounded_replay());
+    nlohmann::ordered_json output;
+    enabled.append_config_json(output);
+    EXPECT_TRUE(output.at("enable_swa_bounded_replay").get<bool>());
+  }
+  ModelConfig disabled;
+  disabled.from_json(config::parse_json_string(
+      R"json({"enable_swa_bounded_replay":false})json"));
+  EXPECT_FALSE(disabled.enable_swa_bounded_replay());
+}
+
 TEST(SpeculativeConfigJsonTest, DsParkPrelaunchIsOptInAndRoundTrips) {
   google::FlagSaver flag_saver;
   EXPECT_FALSE(SpeculativeConfig().enable_dspark_prelaunch());

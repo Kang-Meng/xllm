@@ -68,6 +68,12 @@ DEFINE_string(tool_call_parser,
 
 DEFINE_bool(enable_qwen3_reranker, false, "Whether to enable qwen3 reranker.");
 
+DEFINE_bool(
+    enable_swa_bounded_replay,
+    false,
+    "Enable lossy DeepSeek-V4.1 SWA bounded replay during prefill. "
+    "Experimental approximate prefill optimization; disabled by default.");
+
 DEFINE_int32(flashinfer_workspace_buffer_size,
              128 * 1024 * 1024,
              "The user reserved workspace buffer used to store intermediate "
@@ -119,6 +125,7 @@ void ModelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(tool_call_parser);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_qwen3_reranker);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(engram_config);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_swa_bounded_replay);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(flashinfer_workspace_buffer_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_cpp_chat_template);
 }
@@ -177,6 +184,7 @@ void ModelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(tool_call_parser);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_qwen3_reranker);
   XLLM_CONFIG_ASSIGN_FROM_JSON(engram_config);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_swa_bounded_replay);
   XLLM_CONFIG_ASSIGN_FROM_JSON(flashinfer_workspace_buffer_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_cpp_chat_template);
 }
@@ -200,6 +208,8 @@ void ModelConfig::append_config_json(
       config_json, default_config, enable_qwen3_reranker);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, engram_config);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_swa_bounded_replay);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, flashinfer_workspace_buffer_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

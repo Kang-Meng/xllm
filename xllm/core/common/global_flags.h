@@ -59,6 +59,7 @@ DECLARE_int32(video_max_token_num);
 DECLARE_string(mm_download_headers);
 
 DECLARE_string(engram_config);
+DECLARE_bool(enable_swa_bounded_replay);
 
 // --- kvcache config ---
 DECLARE_int32(block_size);
