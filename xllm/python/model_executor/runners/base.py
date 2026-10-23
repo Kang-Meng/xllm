@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -29,7 +30,15 @@ from xllm.python.model_executor.execution_context import ExecutionMetadataBuilde
 from xllm.python.model_executor.forward_context import EplbRuntimeState, LayerSynchronizer
 from xllm.python.model_executor.input_batch import InputBatch
 
-ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+@dataclass(frozen=True)
+class DraftProposalOutput:
+    """An explicit proposal result whose rows are token IDs, not hidden states."""
+
+    token_ids: torch.Tensor
+
+
+ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor] | DraftProposalOutput
 
 
 class BaseRunner(ABC):
@@ -69,6 +78,8 @@ class BaseRunner(ABC):
             tensor = tensor[:batch_size]
             return tensor.clone() if clone else tensor
 
+        if isinstance(output, DraftProposalOutput):
+            return DraftProposalOutput(_trim(output.token_ids))
         if isinstance(output, tuple):
             return _trim(output[0]), _trim(output[1])
         return _trim(output)

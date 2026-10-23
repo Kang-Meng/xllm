@@ -37,6 +37,57 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(SpeculativeConfigJsonTest, DsparkDraftGraphRoundTripsAndAppearsInHelp) {
+  google::FlagSaver flag_saver;
+  EXPECT_FALSE(SpeculativeConfig().enable_dspark_draft_graph());
+  nlohmann::ordered_json output;
+  {
+    // JSON loading writes back to gflags; restore those flags before testing
+    // the exported config as a fresh initialization.
+    google::FlagSaver enabled_flag_saver;
+    SpeculativeConfig config;
+    config.from_flags();
+    config.from_json(config::parse_json_string(
+        R"json({"enable_dspark_draft_graph":true})json"));
+    EXPECT_TRUE(config.enable_dspark_draft_graph());
+    config.append_config_json(output);
+  }
+  EXPECT_TRUE(output.at("enable_dspark_draft_graph").get<bool>());
+  SpeculativeConfig restored;
+  restored.from_flags();
+  restored.from_json(config::parse_json_string(output.dump()));
+  EXPECT_TRUE(restored.enable_dspark_draft_graph());
+  const auto& names = SpeculativeConfig::option_category().option_names;
+  EXPECT_NE(std::find(names.begin(), names.end(), "enable_dspark_draft_graph"),
+            names.end());
+}
+
+TEST(SpeculativeConfigValidationTest, DsparkDraftGraphRejectsUnsupportedModes) {
+  SpeculativeConfig config;
+  config.enable_dspark_draft_graph(true);
+  config.num_speculative_tokens(5);
+  EXPECT_DEATH(
+      config.validate(),
+      "--enable_dspark_draft_graph requires speculative_algorithm=DSpark");
+  config.speculative_algorithm("DSpark");
+  config.num_speculative_tokens(0);
+  EXPECT_DEATH(
+      config.validate(),
+      "--enable_dspark_draft_graph requires num_speculative_tokens > 0");
+  config.num_speculative_tokens(5);
+  config.draft_sampling_mode("probabilistic");
+  EXPECT_DEATH(
+      config.validate(),
+      "--enable_dspark_draft_graph requires draft_sampling_mode=greedy");
+  config.draft_sampling_mode("Greedy");
+  config.enable_adaptive_speculative_decode(true);
+  EXPECT_DEATH(
+      config.validate(),
+      "--enable_dspark_draft_graph does not support adaptive decoding");
+  config.enable_adaptive_speculative_decode(false);
+  EXPECT_NO_FATAL_FAILURE(config.validate());
+}
+
 TEST(ModelConfigJsonTest, SwaBoundedReplayFlagAndHelp) {
   google::FlagSaver flag_saver;
   EXPECT_FALSE(ModelConfig().enable_swa_bounded_replay());

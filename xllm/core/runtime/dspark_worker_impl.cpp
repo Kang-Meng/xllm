@@ -97,9 +97,57 @@ bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
         break;
       }
     }
+    if (draft_graph_enabled()) {
+      CHECK(!hot_token_id_.defined()) << "DSpark full graph requires a "
+                                         "full-vocabulary draft (no d2t table)";
+    }
+    if (util::is_deepseek_v41_dspark_model_type(
+            draft_impl_->context_.get_model_args().model_type())) {
+      LOG(INFO) << "DeepSeek-V4.1 DSpark draft query geometry: gamma-wide "
+                   "non-causal block; proposal ACL graph="
+                << draft_graph_enabled();
+    }
   }
 
   return result;
+}
+
+bool DSparkWorkerImpl::draft_graph_enabled() const {
+  return draft_impl_->context_.get_speculative_runtime_config()
+      .draft_graph_enabled;
+}
+
+bool DSparkWorkerImpl::draft_use_block_parallel_rows() const {
+  if (util::is_deepseek_v41_dspark_model_type(
+          draft_impl_->context_.get_model_args().model_type())) {
+    return draft_graph_enabled();
+  }
+  return DFlashWorkerImpl::draft_use_block_parallel_rows();
+}
+
+BatchForwardType DSparkWorkerImpl::draft_batch_forward_type() const {
+  if (util::is_deepseek_v41_dspark_model_type(
+          draft_impl_->context_.get_model_args().model_type())) {
+    return draft_graph_enabled() ? BatchForwardType::DECODE
+                                 : BatchForwardType::CHUNKED_PREFILL;
+  }
+  return DFlashWorkerImpl::draft_batch_forward_type();
+}
+
+void DSparkWorkerImpl::validate_draft_graph_input(
+    const ForwardInput& input) const {
+  if (!draft_graph_enabled()) {
+    return;
+  }
+  const SamplingParameters& sampling = input.sampling_params;
+  CHECK(!sampling.frequency_penalties.defined() &&
+        !sampling.presence_penalties.defined() &&
+        !sampling.repetition_penalties.defined() &&
+        !sampling.filter_mask.defined() && !sampling.filter_bitmask.defined() &&
+        input.json_object_states.empty() &&
+        input.json_object_state_snapshots.empty())
+      << "DSpark full graph does not support sampling penalties or token "
+         "filters; disable --enable_dspark_draft_graph for these requests";
 }
 
 void DSparkWorkerImpl::prepare_work_before_execute(
@@ -116,6 +164,9 @@ void DSparkWorkerImpl::validate_draft_prelaunch_config(
   if (!options_.enable_dspark_prelaunch()) {
     return;
   }
+  CHECK(!draft_graph_enabled())
+      << "--enable_dspark_prelaunch cannot be combined with an active "
+         "--enable_dspark_draft_graph";
   CHECK(async_output_enabled_)
       << "--enable_dspark_prelaunch requires schedule overlap, an NPU Python "
          "DSpark draft, num_speculative_tokens > 0, CP=1, KV split=1, "
@@ -133,6 +184,7 @@ void DSparkWorkerImpl::validate_decode_input(const ForwardInput& input) const {
       meta.is_graph_warmup) {
     return;
   }
+  validate_draft_graph_input(input);
   if (options_.enable_dspark_prelaunch()) {
     const std::string_view error = draft_prelaunch_input_error(input);
     CHECK(error.empty()) << "--enable_dspark_prelaunch: " << error;
@@ -204,6 +256,7 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::execute_draft_query(
 
   CHECK_GT(num_speculative_tokens, 0)
       << "DSpark requires num_speculative_tokens > 0.";
+  validate_draft_graph_input(input);
   ForwardInput logits_input = query_input;
   logits_input.skip_sampling_for_logits_only = true;
   // Request pre-lm_head hidden alongside logits so ConfidenceHead can consume
@@ -230,6 +283,33 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::execute_draft_query(
                                              /*record_ready_event=*/false);
   CHECK(draft_output.has_value())
       << "DSpark draft forward must return an output.";
+  if (draft_output->draft_proposal_token_ids.defined()) {
+    // The eager path remaps draft-space ids through hot_token_id_ (d2t); the
+    // graph proposal chain emits draft-space ids directly and has no remap, so
+    // a reduced-vocabulary draft would silently feed draft-space ids to the
+    // target verify. Fail closed instead.
+    CHECK(!hot_token_id_.defined())
+        << "DSpark full graph requires a full-vocabulary draft (no d2t table): "
+           "the captured proposal chain cannot remap hot token ids.";
+    // Completed token proposals do not carry the hidden states or confidence
+    // probabilities needed by adaptive pruning.
+    CHECK(!want_confidence)
+        << "DSpark full graph does not support adaptive confidence pruning.";
+    torch::Tensor proposal_ids = draft_output->draft_proposal_token_ids;
+    CHECK_EQ(proposal_ids.numel(),
+             static_cast<int64_t>(batch_size) * num_speculative_tokens)
+        << "DSpark graph proposal size must match batch * num_spec.";
+    DraftBlock draft_block;
+    draft_block.proposal = DraftProposal(proposal_ids.view(
+        {batch_size, static_cast<int64_t>(num_speculative_tokens)}));
+    draft_block.retained_inputs = take_retained_inputs(*draft_output);
+    if (validate_input != nullptr) {
+      prepare_validate_inputs(input, *validate_input);
+    }
+    COUNTER_ADD(speculative_execution_latency_seconds_draft,
+                timer.elapsed_seconds());
+    return draft_block;
+  }
   CHECK(draft_output->logits.defined())
       << "DSpark draft forward must return logits.";
   // Match DFlash's host/device overlap: validation input construction only

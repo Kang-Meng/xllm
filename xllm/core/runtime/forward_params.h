@@ -680,6 +680,9 @@ struct ForwardOutput {
   // hidden (e.g. DSpark's ConfidenceHead needs the draft-step hidden). Only
   // computed when `input.return_selected_hidden` is true.
   torch::Tensor selected_hidden;
+  // Completed draft proposals, flattened in request-major order.
+  // Undefined when the worker returns logits for proposal generation.
+  torch::Tensor draft_proposal_token_ids;
   // Backend-neutral state for the next MTP draft step.
   MtpTopkStatePtr mtp_topk_state;
 

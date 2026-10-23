@@ -31,9 +31,10 @@ The DSpark draft is the checkpoint's ``mtp.0/1/2`` block drafter (contract:
     ``head``), the replicated markov head (``markov_w1`` embedding +
     ``markov_w2`` low-rank projection) and the replicated confidence head.
 
-Draft forward is forced **eager**: the Python executor never captures it in an
-ACL graph, and the heads stay replicated (never TP-sharded) so the per-step
-draft sampling needs no collectives (lessons ``8e8d1cb28`` / ``beedc8b8d``).
+Draft forward is eager by default. ``--enable_dspark_draft_graph=true`` lets the
+Python executor capture it in an ACL graph; the heads stay replicated (never
+TP-sharded) so the per-step draft sampling needs no collectives (lessons
+``8e8d1cb28`` / ``beedc8b8d``).
 The draft query block is anchor-first and non-causal; the SWA window semantics
 live in the CSA2 attention backend, this module only feeds the block and the
 pre-injected context rows.
@@ -44,16 +45,22 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
 
 from scripts.logger import logger
 from xllm.python import distributed
+from xllm.python.attention.csa2_attention import Csa2QueryLayout
+from xllm.python.attention.dsa_metadata import DSA_CACHE_SLIDING_WINDOW
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.linear import ColumnParallelLinear
-from xllm.python.model_executor.forward_context import LayerSynchronizer, get_forward_context
+from xllm.python.model_executor.forward_context import (
+    LayerSynchronizer,
+    get_forward_context,
+    in_acl_graph,
+)
 from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4MoE
 from xllm.python.models.deepseek_v32 import W8A8DynamicLinear
 from xllm.python.models.deepseek_v41 import (
@@ -74,6 +81,9 @@ from xllm.python.models.deepseek_v41 import (
 )
 from xllm.python.models.dspark import DSparkForCausalLMBase
 from xllm.python.models.weight_utils import W8A8WeightLoader
+
+if TYPE_CHECKING:
+    from xllm.python.model_executor.executor import DecodeGraphAdapter
 
 #: Draft stage count when the checkpoint/config does not say otherwise.
 DSPARK_DEFAULT_LAYERS = 3
@@ -423,12 +433,13 @@ class DeepseekV41DSparkModel(nn.Module):
     # -- forward ---------------------------------------------------------------
 
     def _prepare_attention(self, positions: torch.Tensor) -> None:
-        """Per-step CSA2 metadata for the draft's own SWA caches (always eager).
+        """Per-step CSA2 metadata for the draft's own SWA caches.
 
         The draft shares the request's ``AttentionMetadata`` with the target,
         whose ``multi_block_tables`` carries the *target's* deduplicated cache
         groups in the fixed export order (SWA first, see
-        ``kMultiBlockExportOrder``). The draft owns exactly one SWA group
+        ``kMultiBlockExportOrder``), matching group zero registered by
+        ``build_cache_specs_v41``. The draft owns exactly one SWA group
         (:func:`dspark_swa_mode`), so it consumes only its own leading manager
         table; passing the target's full list would trip the builder's
         ``manager_num <= len(group_infos)`` invariant.
@@ -436,9 +447,6 @@ class DeepseekV41DSparkModel(nn.Module):
         context = get_forward_context()
         backend = context.attention_backend
         metadata = context.metadata
-        backend.reset_forward(metadata)
-        metadata.dsa_graph_mode = False
-        metadata.dsa_positions = positions
         prepare = getattr(backend, "prepare_dsa_metadata_for_forward", None)
         if prepare is None:
             raise RuntimeError("DeepSeek-V4.1 DSpark requires prepare_dsa_metadata_for_forward")
@@ -453,15 +461,52 @@ class DeepseekV41DSparkModel(nn.Module):
                 "DeepSeek-V4.1 DSpark is a pure-SWA draft and must expose exactly "
                 f"one cache group, got {len(group_infos)}"
             )
+        if group_infos[0].cache_type != DSA_CACHE_SLIDING_WINDOW:
+            raise RuntimeError("DeepSeek-V4.1 DSpark requires its only cache group to be SWA")
+        # Each query sees the same trailing context and the complete block.
+        # The typed context works with both native metadata views and static
+        # graph metadata, without adding attributes to either representation.
+        context.execution_contexts[Csa2QueryLayout] = Csa2QueryLayout(
+            query_width=self.block_size,
+            token_rows=(
+                int(getattr(metadata, "max_query_len", 0)) == 1
+                and not bool(getattr(metadata, "is_prefill", False))
+                and not bool(getattr(metadata, "is_chunked_prefill", False))
+                and not bool(getattr(metadata, "is_dummy", False))
+            ),
+            shared_window=True,
+        )
+        capture = in_acl_graph()
+        existing_dsa = getattr(metadata, "dsa_metadata", None)
+        if capture and existing_dsa is not None:
+            # _capture runs ordinary warmup forwards before entering the NPU
+            # capture context. Those forwards build the fixed-shape graph DSA
+            # metadata once, outside capture where host table reads are legal.
+            # Rebuilding here would call .tolist()/.item() on the captured
+            # stream and fail with aclrtMemcpy 107030. Replay refreshes these
+            # same persistent tensors before launching the graph.
+            if not bool(getattr(existing_dsa, "is_acl_graph", False)):
+                raise RuntimeError("DSpark ACL capture requires graph-mode DSA metadata from warmup")
+            metadata.dsa_graph_mode = True
+            metadata.dsa_positions = positions
+            return
+        backend.reset_forward(metadata)
+        # A pre-capture warmup is not itself inside NPUGraph, but its static
+        # entry advertises graph block-table capacity. Build graph-mode DSA
+        # metadata there so the capture branch above can safely reuse it.
+        metadata.dsa_graph_mode = capture or int(getattr(metadata, "dsa_graph_block_table_cols", 0) or 0) > 0
+        metadata.dsa_positions = positions
         prepare(metadata, group_limit=len(group_infos))
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """One eager draft block step (never ACL-graph captured).
+        """One draft block step (eager by default, graph-capturable opt-in).
 
         ``input_ids`` is the anchor-first query block (see
         :func:`anchor_first_query_block`); the trailing context window comes
         from the rows :meth:`write_context_kv` pre-injected into the draft SWA
-        caches, which is what makes the block non-causal in the backend.
+        caches, and ``_prepare_attention`` switches the backend to the block
+        window so every query attends the context plus the whole block,
+        non-causal.
         """
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
@@ -572,6 +617,18 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         # or the shared ``head``; None lets the C++ bridge share the target's.
         self.lm_head: nn.Module | None = None
         self._lm_head_source: str | None = None
+        self._draft_graph_enabled = bool(config.get("draft_graph_enabled", False))
+
+    def create_decode_graph_adapter(
+        self,
+        config: dict,
+        graph_backend: str,
+        *,
+        is_spec_draft: bool = False,
+    ) -> DecodeGraphAdapter | None:
+        from xllm.python.models.deepseek_v41_dspark_graph import create_dspark_decode_graph_adapter
+
+        return create_dspark_decode_graph_adapter(self, config, graph_backend, is_spec_draft=is_spec_draft)
 
     # -- names ----------------------------------------------------------------
 
@@ -599,6 +656,8 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         )
         self._load_body(loader)
         self._load_dspark_heads(loader)
+        if self._draft_graph_enabled and self.lm_head is None:
+            raise ValueError("DSpark proposal graph requires the draft checkpoint's own LM head")
 
     def _prepare_own_lm_head(self, state_dicts: list) -> None:
         """Create the draft's own lm_head when the checkpoint ships one."""

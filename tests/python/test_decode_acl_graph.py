@@ -36,6 +36,7 @@ from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadat
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
 )
+from xllm.python.models.deepseek_v41_dspark_graph import DeepseekV41DSparkGraphRunner
 from xllm.python.models.engram_config import EngramConfig
 
 
@@ -1024,6 +1025,97 @@ def test_dflash_draft_graph_capacity_uses_sequence_count() -> None:
         assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), dummy)
         assert runners[0].can_execute(torch.zeros(10, dtype=torch.int32), misaligned) is False
         assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), misaligned) is False
+
+
+@pytest.mark.parametrize("dspark", [False, True])
+def test_dspark_draft_graph_uses_leading_swa_table_from_target_metadata(dspark: bool) -> None:
+    _, group_infos = build_cache_specs_v41([0], [], [], 128, 1)
+    model = nn.Identity()
+    runner_class = DeepseekV41DSparkGraphRunner if dspark else DecodeAclGraphRunner
+    runner = runner_class(
+        model,
+        SimpleNamespace(page_size=128, is_mla=False, group_infos=group_infos),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+        is_spec_draft=True,
+        draft_query_width=5,
+    )
+    metadata = _metadata(torch.empty(0, dtype=torch.int32))
+    swa = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+    metadata.multi_block_tables = (
+        swa,
+        torch.tensor([[30], [40]], dtype=torch.int32),
+        torch.tensor([[50], [60]], dtype=torch.int32),
+    )
+    metadata.block_table = None
+    metadata.slot_mapping = torch.empty(0, dtype=torch.int64)
+    original_tables = metadata.multi_block_tables
+    original_slots = metadata.slot_mapping
+
+    normalized = runner._normalize_dsa_metadata(metadata)
+
+    if not dspark:
+        assert normalized is metadata
+        return
+    assert normalized.block_table is swa
+    assert normalized.multi_block_tables == (swa,)
+    assert normalized.slot_mapping.tolist() == [0, 0]
+    assert metadata.multi_block_tables is original_tables
+    assert metadata.block_table is None
+    assert metadata.slot_mapping is original_slots
+
+
+@pytest.mark.parametrize("group_indices", [[], [1], [0, 1]])
+def test_dspark_draft_graph_rejects_non_swa_cache_groups(group_indices: list[int]) -> None:
+    _, target_groups = build_cache_specs_v41([0, 2], [1], [1], 128, 2)
+    runner = DeepseekV41DSparkGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False, group_infos=[target_groups[i] for i in group_indices]),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+        is_spec_draft=True,
+        draft_query_width=5,
+    )
+    metadata = _metadata(torch.empty(0, dtype=torch.int32))
+    original_tables = metadata.multi_block_tables
+    with pytest.raises(ValueError, match="exactly one SWA cache group"):
+        runner._normalize_dsa_metadata(metadata)
+    assert metadata.multi_block_tables is original_tables
+
+
+@pytest.mark.parametrize("dspark", [False, True])
+def test_dspark_draft_graph_padding_keeps_complete_query_blocks(dspark: bool) -> None:
+    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
+    model = nn.Identity()
+    runner_class = DeepseekV41DSparkGraphRunner if dspark else DecodeAclGraphRunner
+    runner = runner_class(
+        model,
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+        is_spec_draft=True,
+        draft_query_width=5,
+    )
+    captured_keys = []
+
+    def capture_key(key: tuple) -> None:
+        captured_keys.append(key)
+        raise LookupError("graph key recorded")
+
+    runner._graphs = SimpleNamespace(get=capture_key)
+    metadata = SimpleNamespace()
+    for sequence_count in (2, 3):
+        input_ids = torch.arange(sequence_count * 5, dtype=torch.int32)
+        with pytest.raises(LookupError, match="graph key recorded"):
+            runner.execute(input_ids, input_ids, metadata)
+
+    # Sequence buckets 2 and 4 become 10 and 20 token rows. A raw token
+    # bucket would produce 16 rows for both cases and split a gamma=5 block.
+    assert captured_keys[0][0] == (10 if dspark else 16)
+    assert captured_keys[1][0] == (20 if dspark else 16)
 
 
 def test_dp_uneven_sequences_stay_in_graph_with_full_batch_capacity() -> None:

@@ -195,6 +195,10 @@ inline bool is_deepseek_v4_dspark_model_type(std::string_view model_type) {
          model_type == kDeepseekV41DSparkModelType;
 }
 
+inline bool is_deepseek_v41_dspark_model_type(std::string_view model_type) {
+  return model_type == kDeepseekV41DSparkModelType;
+}
+
 inline constexpr std::string_view kDeepseekV4ModelType = "deepseek_v4";
 inline constexpr std::string_view kDeepseekV41ModelType = "deepseek_v41";
 inline constexpr std::string_view kKimiK3ModelType = "kimi_k3";

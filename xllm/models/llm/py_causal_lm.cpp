@@ -515,22 +515,14 @@ py::dict PyCausalLM::build_config_dict(
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
   d["layerwise_split_rank"] = layerwise_split_rank_;
-  // Every block-diffusion draft stays eager: its query block is non-causal and
-  // its context-KV injection is a data-dependent scatter, neither of which the
-  // decode graph runner can capture. The reflected ModelArgs property is the
-  // base-branch mechanism (the worker sets it while routing drafts); the
-  // explicit model-type set is kept alongside it so the contract also holds for
-  // callers that build the config dict without going through the worker.
+  // Draft graph support is resolved by the model's runtime policy before
+  // construction. The bridge only forwards that decision.
   const bool eager_draft_model =
-      model_args_.requires_eager_execution() ||
-      model_args_.model_type() == kDFlashDraftModelType ||
-      model_args_.model_type() == kDSparkDraftModelType ||
-      util::is_deepseek_v4_dspark_model_type(model_args_.model_type());
-  // A *target* whose transient capture cannot ride the graph is pinned to
-  // eager: the plain capture returns a tuple, and that tuple has to survive
-  // the model's graph path. The opt-in flag lets such a target publish the
-  // capture through the runner's persistent aux buffer instead, so the graph
-  // can be captured.
+      (model_args_.requires_eager_execution() ||
+       model_args_.model_type() == kDFlashDraftModelType ||
+       model_args_.model_type() == kDSparkDraftModelType ||
+       util::is_deepseek_v4_dspark_model_type(model_args_.model_type())) &&
+      !speculative_runtime_config.draft_graph_enabled;
   const bool allow_graph_aux_hidden_states =
       ExecutionConfig::get_instance().enable_graph_aux_hidden_states();
   // That incompatibility is a per-model property, not a universal one: only
@@ -542,8 +534,7 @@ py::dict PyCausalLM::build_config_dict(
   // so the gate never spills onto models whose capture coexists with the
   // graph; the flag alone (or an empty layer set) forces nothing. The family
   // predicate (not a bare string) covers future v41-variant spellings that
-  // share the CSA2 stack; the family's python-path DSpark draft is eager
-  // anyway through the draft set above.
+  // share the CSA2 stack. Draft graph admission is resolved separately above.
   bool requires_eager_execution =
       eager_draft_model ||
       (!model_args_.layers_to_capture().empty() &&
@@ -553,9 +544,9 @@ py::dict PyCausalLM::build_config_dict(
   // (graph-capturable) inside the HCCL window; the Python executor gates
   // capture on the same policy and over-capacity steps stay on the
   // variable-length AllToAllV transport, which remains eager-only.
-  d["enable_graph"] = requires_eager_execution
-                          ? false
-                          : ExecutionConfig::get_instance().enable_graph();
+  d["enable_graph"] = !requires_eager_execution &&
+                      (speculative_runtime_config.draft_graph_enabled ||
+                       ExecutionConfig::get_instance().enable_graph());
   d["python_graph_backend"] =
       requires_eager_execution
           ? std::string("off")
@@ -564,6 +555,7 @@ py::dict PyCausalLM::build_config_dict(
   // target reads this to publish its capture through a persistent buffer
   // instead of returning the tuple the graph runner cannot accept.
   d["enable_graph_aux_hidden_states"] = allow_graph_aux_hidden_states;
+  d["draft_graph_enabled"] = speculative_runtime_config.draft_graph_enabled;
   // Engram host-offload switches, forwarded as the raw JSON string; the Python
   // executor parses/validates it (xllm/python/models/engram_config.py).
   d["engram_config"] = ModelConfig::get_instance().engram_config();

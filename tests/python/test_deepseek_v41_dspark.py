@@ -30,7 +30,11 @@ import pytest
 import torch
 
 from xllm.python import kernels
-from xllm.python.attention.csa2_attention import apply_interleaved_rope
+from xllm.python.attention.csa2_attention import (
+    Csa2QueryLayout,
+    _block_query_lens,
+    apply_interleaved_rope,
+)
 from xllm.python.models import deepseek_v41_dspark as dsp
 from xllm.python.models.deepseek_v41_dspark import (
     CSA2_MODE_SWA,
@@ -39,6 +43,8 @@ from xllm.python.models.deepseek_v41_dspark import (
     anchor_first_query_block,
     dspark_swa_mode,
 )
+from xllm.python.models.deepseek_v41_dspark_graph import DSparkGreedyGraphModel
+from xllm.python.models.dspark import DSparkMarkovHead
 from xllm.python.registry import get_model_class
 
 # Tiny draft geometry: hidden 32 / head_dim 64 (QDQ group 32) / rope 16 /
@@ -220,7 +226,7 @@ def _with_patched_forward_context(monkeypatch: pytest.MonkeyPatch, backend) -> N
     """Point both the draft module and the V4.1 attention at a stub backend."""
     import xllm.python.models.deepseek_v41 as v41
 
-    context = SimpleNamespace(attention_backend=backend, metadata=SimpleNamespace())
+    context = SimpleNamespace(attention_backend=backend, metadata=SimpleNamespace(), execution_contexts={})
     monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
     monkeypatch.setattr(v41, "get_forward_context", lambda: context)
 
@@ -978,6 +984,7 @@ def test_draft_attention_consumes_only_its_own_manager_tables(
 
     backend = _RecordingBackend()
     context = SimpleNamespace(
+        execution_contexts={},
         attention_backend=backend,
         metadata=SimpleNamespace(multi_block_tables=[object(), object(), object()]),
     )
@@ -989,6 +996,385 @@ def test_draft_attention_consumes_only_its_own_manager_tables(
     assert seen["tables"] == 3
     assert seen["group_limit"] == 1
     assert backend.group_limits == [1]
+
+
+def test_draft_attention_marks_acl_graph_and_exports_query_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
+    lm = DeepseekV41DSparkForCausalLM(_config_dict())
+    backend = _DraftStubBackend()
+    metadata = SimpleNamespace(multi_block_tables=[object()])
+    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
+    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
+    monkeypatch.setattr(dsp, "in_acl_graph", lambda: True)
+
+    lm.model._prepare_attention(torch.arange(cfg.dspark_block_size, dtype=torch.int64))
+
+    assert metadata.dsa_graph_mode is True
+    assert context.execution_contexts[Csa2QueryLayout] == Csa2QueryLayout(cfg.dspark_block_size, shared_window=True)
+
+
+def test_draft_acl_capture_reuses_graph_metadata_built_by_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
+    lm = DeepseekV41DSparkForCausalLM(_config_dict())
+    backend = _DraftStubBackend()
+    persistent = SimpleNamespace(is_acl_graph=True)
+    metadata = SimpleNamespace(
+        multi_block_tables=[object()],
+        dsa_metadata=persistent,
+        dsa_graph_block_table_cols=4,
+    )
+    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
+    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
+    monkeypatch.setattr(dsp, "in_acl_graph", lambda: True)
+    positions = torch.arange(cfg.dspark_block_size, dtype=torch.int64)
+
+    lm.model._prepare_attention(positions)
+
+    assert metadata.dsa_metadata is persistent
+    assert metadata.dsa_graph_mode is True
+    assert metadata.dsa_positions is positions
+    assert backend.group_limits == []
+    assert context.execution_contexts[Csa2QueryLayout] == Csa2QueryLayout(cfg.dspark_block_size, shared_window=True)
+
+
+def test_draft_graph_warmup_builds_graph_mode_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
+    lm = DeepseekV41DSparkForCausalLM(_config_dict())
+    backend = _DraftStubBackend()
+    metadata = SimpleNamespace(
+        multi_block_tables=[object()],
+        dsa_metadata=None,
+        dsa_graph_block_table_cols=4,
+    )
+    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
+    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
+    monkeypatch.setattr(dsp, "in_acl_graph", lambda: False)
+
+    lm.model._prepare_attention(torch.arange(cfg.dspark_block_size, dtype=torch.int64))
+
+    assert metadata.dsa_graph_mode is True
+    assert backend.group_limits == [1]
+
+
+def test_draft_graph_query_rows_regroup_into_complete_blocks() -> None:
+    assert _block_query_lens(20, 5) == [5, 5, 5, 5]
+    with pytest.raises(RuntimeError, match="complete blocks"):
+        _block_query_lens(16, 5)
+
+
+@pytest.mark.parametrize("prev_ctx", [0, 1, 8, 11])
+@pytest.mark.parametrize("width", [1, 3, 5])
+def test_draft_window_includes_all_context_and_all_block_queries(prev_ctx: int, width: int) -> None:
+    from xllm.python.attention.csa2_attention import _block_visible_idxs
+
+    win = 8
+    positions = torch.arange(-win, prev_ctx + width + 2)
+    cols = torch.arange(positions.numel())
+    actual = _block_visible_idxs(torch.tensor(prev_ctx), width, positions, cols, win)
+    expected = [
+        index if max(0, prev_ctx - win) <= position < prev_ctx + width else -1
+        for index, position in enumerate(positions.tolist())
+    ]
+    assert actual.tolist() == [expected] * width
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_draft_token_rows_are_grouped_before_attention(graph: bool) -> None:
+    from xllm.python.attention.csa2_attention import Csa2AttentionBackend, CSA2SharedRuntime
+    from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+
+    backend = object.__new__(Csa2AttentionBackend)
+    query_layout = Csa2QueryLayout(3, token_rows=not graph, shared_window=True)
+    backend._kv_caches = [SimpleNamespace(swa=None)]
+    backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
+    backend._shared_runtime = CSA2SharedRuntime
+    dsa = SimpleNamespace(
+        is_acl_graph=graph,
+        seq_lens_q=torch.ones(6, dtype=torch.int32),
+        seq_lens=torch.tensor([11, 11, 11, 17, 17, 17]),
+        slot_mappings=[],
+    )
+    backend._current_forward_metadata = lambda: SimpleNamespace(dsa_metadata=dsa)
+    mode = SimpleNamespace(compress_ratio=0, is_full=False, is_reindex=False, is_reuse=False)
+    layer = SimpleNamespace(layer_id=0, mode=mode, _csa2_ctx=SimpleNamespace(x=torch.zeros(6, 4)))
+    seen = {}
+
+    def attention(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        layer: SimpleNamespace,
+        dsa: SimpleNamespace,
+        q_lens: list[int],
+        ctx_lens: torch.Tensor,
+        topk: torch.Tensor | None,
+        shared: CSA2SharedRuntime,
+        cp_context: object | None,
+    ) -> torch.Tensor:
+        seen["q_lens"] = q_lens
+        seen["ctx_lens"] = ctx_lens.tolist()
+        return torch.zeros_like(q)
+
+    backend._csa2_attention = attention
+    context = ForwardContext(
+        backend,
+        torch.device("cpu"),
+        SimpleNamespace(dsa_metadata=dsa),
+        [],
+        execution_contexts={Csa2QueryLayout: query_layout},
+    )
+    with forward_context(context):
+        backend.execute_csa2_layer(torch.zeros(6, 1, 4), torch.zeros(6, 4), layer)
+    assert seen == {"q_lens": [3, 3], "ctx_lens": [11, 17]}
+
+
+@pytest.mark.parametrize("graph,token_rows", [(False, False), (True, False), (False, True)])
+def test_draft_swa_tail_matches_explicit_context_plus_block(graph: bool, token_rows: bool) -> None:
+    from xllm.python.attention.csa2_attention import Csa2AttentionBackend, CSA2SharedRuntime
+
+    torch.manual_seed(37)
+    width, win, dim = 3, 4, 2
+    backend = object.__new__(Csa2AttentionBackend)
+    backend.window_size, backend.scale = win, dim**-0.5
+    query_layout = Csa2QueryLayout(width, token_rows=token_rows, shared_window=True)
+    backend._smla_fallback_reason = lambda *_: "CPU oracle"
+    backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
+    history = torch.randn(2, win, dim)
+    cache = torch.zeros(2, win, 1, dim)
+    previous = [6, 9]
+    for seq in range(2):
+        for row in range(win):
+            cache[seq, (previous[seq] - win + row) % win, 0] = history[seq, row]
+    backend._kv_caches = [SimpleNamespace(swa=cache)]
+    tables = torch.tensor([[0], [1]], dtype=torch.int32)
+    if graph or token_rows:
+        tables = tables.repeat_interleave(width, dim=0)
+    dsa = SimpleNamespace(is_acl_graph=graph, block_tables=[[tables]])
+    layer = SimpleNamespace(layer_id=0, mode=SimpleNamespace(compress_ratio=0), attn_sink=torch.zeros(1))
+    q = torch.randn(2 * width, 1, dim)
+    kv = torch.randn(2 * width, dim)
+    actual = backend._csa2_attention(
+        q, kv, layer, dsa, [width, width], torch.tensor([9, 12]), None, CSA2SharedRuntime(query_layout=query_layout)
+    )
+    expected = torch.empty_like(q)
+    for seq in range(2):
+        keys = torch.cat((history[seq], kv[seq * width : (seq + 1) * width]))
+        for row in range(width):
+            index = seq * width + row
+            scores = keys @ q[index, 0] * backend.scale
+            probabilities = torch.softmax(torch.cat((scores, torch.zeros(1))), dim=0)[:-1]
+            expected[index, 0] = probabilities @ keys
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.fixture
+def _draft_ring_attention() -> SimpleNamespace:
+    from xllm.python.attention.csa2_attention import Csa2AttentionBackend, CSA2SharedRuntime
+
+    width, win, dim, previous = 5, 4, 2, 11
+    backend = object.__new__(Csa2AttentionBackend)
+    backend.window_size, backend.scale = win, dim**-0.5
+    backend._resolve_cache_mapping = lambda *_: SimpleNamespace(ori_cache_idx=0)
+    backend._shared_runtime = CSA2SharedRuntime
+    cache = torch.zeros(3, win, 1, dim)
+    table = torch.tensor([[2, 1]], dtype=torch.int32)
+    history = torch.tensor([[1.0, -1.0], [2.0, -2.0], [3.0, -3.0], [4.0, -4.0]])
+    for row, position in enumerate(range(previous - win, previous)):
+        block = int(table[0, (position // win) % table.size(1)])
+        cache[block, position % win, 0] = history[row]
+    positions = torch.arange(previous, previous + width)
+    slots = table[0, (positions // win) % table.size(1)] * win + positions % win
+    dsa = SimpleNamespace(
+        is_acl_graph=True,
+        block_tables=[[table.repeat_interleave(width, dim=0)]],
+        slot_mappings=[[slots]],
+        seq_lens_q=torch.ones(width, dtype=torch.int32),
+        seq_lens=torch.full((width,), previous + width, dtype=torch.int32),
+    )
+    backend._kv_caches = [SimpleNamespace(swa=cache)]
+    backend._current_forward_metadata = lambda: SimpleNamespace(dsa_metadata=dsa)
+    layer = SimpleNamespace(
+        layer_id=0,
+        mode=SimpleNamespace(compress_ratio=0, is_full=False, is_reindex=False, is_reuse=False),
+        attn_sink=torch.zeros(1),
+        _csa2_ctx=SimpleNamespace(x=torch.zeros(width, dim)),
+    )
+    kv = torch.zeros(width, dim)
+    kv[-1] = torch.tensor([64.0, -32.0])
+    return SimpleNamespace(
+        backend=backend,
+        cache=cache,
+        dsa=dsa,
+        layer=layer,
+        q=torch.zeros(width, 1, dim),
+        kv=kv,
+        history=history,
+        slots=slots,
+        query_layout=Csa2QueryLayout(width, shared_window=True),
+        width=width,
+        win=win,
+        previous=previous,
+    )
+
+
+def test_draft_swa_tail_keeps_final_block_row_after_ring_wrap(_draft_ring_attention: SimpleNamespace) -> None:
+    from xllm.python.attention.csa2_attention import CSA2SharedRuntime
+
+    case = _draft_ring_attention
+    actual = case.backend._csa2_attention(
+        case.q,
+        case.kv,
+        case.layer,
+        case.dsa,
+        [case.width],
+        torch.tensor([case.previous + case.width]),
+        None,
+        CSA2SharedRuntime(query_layout=case.query_layout),
+    )
+
+    # Zero queries and a zero sink give every history/block row equal weight.
+    # The final block row must also contribute to the first non-causal query.
+    keys = torch.cat((case.history, case.kv))
+    expected = keys.sum(dim=0) / (case.win + case.width + 1)
+    torch.testing.assert_close(actual, expected.view(1, 1, -1).expand_as(actual))
+
+
+def test_draft_graph_defers_ring_writes_without_dynamic_filter(
+    _draft_ring_attention: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xllm.python.attention import csa2_attention as csa2
+    from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+
+    case = _draft_ring_attention
+    events: list[str] = []
+    attention = case.backend._csa2_attention
+    scatter = csa2._scatter_by_slot
+
+    def record_attention(*args: object, **kwargs: object) -> torch.Tensor:
+        events.append("attention")
+        return attention(*args, **kwargs)
+
+    def record_scatter(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
+        events.append("scatter")
+        assert slots is case.slots
+        assert values is case.kv
+        scatter(cache, slots, values)
+
+    def reject_dynamic_filter(slots: torch.Tensor, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pytest.fail("graph block writes must not use data-dependent ring deduplication")
+
+    monkeypatch.setattr(case.backend, "_csa2_attention", record_attention)
+    monkeypatch.setattr(csa2, "_scatter_by_slot", record_scatter)
+    monkeypatch.setattr(csa2, "last_ring_writes", reject_dynamic_filter)
+    context = ForwardContext(
+        case.backend,
+        torch.device("cpu"),
+        SimpleNamespace(dsa_metadata=case.dsa),
+        [],
+        execution_contexts={Csa2QueryLayout: case.query_layout},
+    )
+    with forward_context(context):
+        actual = case.backend.execute_csa2_layer(case.q, case.kv, case.layer)
+
+    # The last new row overwrites an old history slot: writing before attention
+    # would change this oracle even if the final cache contents looked correct.
+    keys = torch.cat((case.history, case.kv))
+    expected = keys.sum(dim=0) / (case.win + case.width + 1)
+    torch.testing.assert_close(actual, expected.view(1, 1, -1).expand_as(actual))
+    assert events == ["attention", "scatter"]
+    torch.testing.assert_close(case.cache.view(-1, case.kv.size(-1))[case.slots.long()], case.kv)
+
+
+@pytest.mark.parametrize("dummy,chunked,expected", [(False, False, True), (True, False, False), (False, True, False)])
+def test_draft_token_row_contract_is_explicit(
+    monkeypatch: pytest.MonkeyPatch, dummy: bool, chunked: bool, expected: bool
+) -> None:
+    lm = DeepseekV41DSparkForCausalLM(_config_dict())
+    backend = _DraftStubBackend()
+    metadata = SimpleNamespace(max_query_len=1, is_prefill=False, is_chunked_prefill=chunked, is_dummy=dummy)
+    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
+    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
+    lm.model._prepare_attention(torch.arange(3))
+    assert context.execution_contexts[Csa2QueryLayout].token_rows is expected
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_draft_query_layout_uses_forward_context_with_slotted_metadata(capture: bool) -> None:
+    from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+    from xllm.python.model_executor.runners.decode_acl_graph import _StaticAttentionMetadata
+
+    model = DeepseekV41DSparkForCausalLM(_config_dict())
+    metadata = _StaticAttentionMetadata(
+        slot_mapping=torch.empty(0, dtype=torch.int64),
+        paged_kv_indptr=torch.empty(0, dtype=torch.int32),
+        paged_kv_indices=torch.empty(0, dtype=torch.int32),
+        paged_kv_last_page_len=torch.empty(0, dtype=torch.int32),
+        multi_block_tables=(torch.zeros(1, 1, dtype=torch.int32),),
+    )
+    context = ForwardContext(
+        _DraftStubBackend(),
+        torch.device("cpu"),
+        metadata,
+        [],
+        acl_graph=object() if capture else None,
+    )
+    with forward_context(context):
+        model.model._prepare_attention(torch.arange(model.cfg.dspark_block_size))
+    assert context.execution_contexts[Csa2QueryLayout] == Csa2QueryLayout(
+        model.cfg.dspark_block_size, shared_window=True
+    )
+    assert not hasattr(metadata, "csa2_query_layout")
+    assert metadata.dsa_graph_mode is capture
+
+
+def test_graph_checkpoint_without_own_head_is_rejected_during_weight_load() -> None:
+    config = {**_config_dict(), "draft_graph_enabled": True}
+    model = DeepseekV41DSparkForCausalLM(config)
+    tensors = _build_checkpoint(model.cfg, lambda key, shape: torch.randn(shape))
+    del tensors[f"mtp.{model.cfg.num_draft_layers - 1}.head.weight"]
+    with pytest.raises(ValueError, match="own LM head"):
+        _load(model, tensors)
+
+
+def test_full_graph_model_matches_sequential_greedy_markov() -> None:
+    class _Body(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            del positions
+            return torch.stack((input_ids.float(), torch.ones_like(input_ids).float()), dim=-1)
+
+    owner = torch.nn.Module()
+    owner.model = _Body()
+    owner.lm_head = torch.nn.Linear(2, 7, bias=False)
+    owner.markov_head = DSparkMarkovHead(7, 7, 3, torch.float32, torch.device("cpu"))
+    torch.manual_seed(29)
+    with torch.no_grad():
+        owner.lm_head.weight.normal_()
+        owner.markov_head.markov_w1.weight.normal_()
+        owner.markov_head.markov_w2.weight.normal_()
+
+    model = DSparkGreedyGraphModel(owner, query_width=3)
+    input_ids = torch.tensor([2, 0, 0, 4, 0, 0], dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
+    actual = model(input_ids, positions).view(2, 3)
+
+    hidden = owner.model(input_ids, positions)
+    base_logits = owner.lm_head(hidden).view(2, 3, 7)
+    previous = input_ids.view(2, 3)[:, 0]
+    expected_steps = []
+    for token_idx in range(3):
+        previous = torch.argmax(
+            base_logits[:, token_idx] + owner.markov_head.bias(previous),
+            dim=-1,
+        )
+        expected_steps.append(previous)
+    expected = torch.stack(expected_steps, dim=1)
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_draft_attention_rejects_a_multi_group_backend(
@@ -1008,6 +1394,7 @@ def test_draft_attention_rejects_a_multi_group_backend(
     backend = _TwoGroupBackend()
     assert len(backend.group_infos) == 2
     context = SimpleNamespace(
+        execution_contexts={},
         attention_backend=backend,
         metadata=SimpleNamespace(multi_block_tables=[object(), object(), object()]),
     )
@@ -1037,6 +1424,23 @@ def test_draft_attention_requires_the_backend_groups(
     monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
     with pytest.raises(RuntimeError, match="exposing group_infos"):
         lm.model._prepare_attention(torch.arange(cfg.dspark_block_size, dtype=torch.int64))
+
+
+def test_draft_attention_rejects_a_single_token_cache_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    from xllm.python.attention.dsa_metadata import DSA_CACHE_TOKEN, build_cache_specs_v41
+
+    lm = DeepseekV41DSparkForCausalLM(_config_dict())
+    backend = _DraftStubBackend()
+    _, target_groups = build_cache_specs_v41([0, 2], [1], [1], 8, 2)
+    backend.group_infos = [group for group in target_groups if group.cache_type == DSA_CACHE_TOKEN]
+    assert len(backend.group_infos) == 1
+    metadata = SimpleNamespace(multi_block_tables=[object()])
+    context = SimpleNamespace(execution_contexts={}, attention_backend=backend, metadata=metadata)
+    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
+
+    with pytest.raises(RuntimeError, match="only cache group to be SWA"):
+        lm.model._prepare_attention(torch.arange(lm.cfg.dspark_block_size, dtype=torch.int64))
+    assert context.execution_contexts == {}
 
 
 def test_draft_group_infos_is_a_single_swa_group() -> None:

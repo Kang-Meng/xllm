@@ -23,6 +23,7 @@ import torch
 from xllm.python.attention import csa2_attention as csa2
 from xllm.python.attention.csa2_attention import (
     Csa2AttentionBackend,
+    Csa2QueryLayout,
     CSA2SharedRuntime,
     _rebase_qli_picks,
     _supports_smla_va,
@@ -93,6 +94,37 @@ def _context(backend: Csa2AttentionBackend, dsa: Any) -> ForwardContext:
         metadata=SimpleNamespace(dsa_metadata=dsa),
         layer_caches=[],
     )
+
+
+@pytest.mark.parametrize("shared_window", [False, True])
+def test_smla_dispatch_preserves_non_causal_block_attention(
+    shared_window: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    query_lens = [3]
+
+    def make_case(device: str) -> tuple[Any, ...]:
+        backend, layer, dsa, shared, q, kv, _ = _case(query_lens, device, ratio=1)
+        layer.mode.compress_ratio = 0
+        dsa.is_acl_graph = False
+        shared.query_layout = Csa2QueryLayout(3, shared_window=shared_window)
+        return backend, layer, dsa, shared, q, kv
+
+    backend, layer, dsa, shared, q, kv = make_case("cpu")
+    expected = backend._csa2_attention(q, kv, layer, dsa, query_lens, dsa.seq_lens, None, shared)
+    backend, layer, dsa, shared, q, kv = make_case("npu")
+    calls = []
+    native_attention = backend._smla_attention
+
+    def tracked(*args: Any, **kwargs: Any) -> torch.Tensor:
+        calls.append(True)
+        return native_attention(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_smla_attention", tracked)
+    with forward_context(_context(backend, dsa)):
+        actual = backend._csa2_attention(q, kv, layer, dsa, query_lens, dsa.seq_lens, None, shared)
+    torch.npu.synchronize()
+    assert len(calls) == (0 if shared_window else 1)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.003)
 
 
 @pytest.mark.parametrize("q_lens", [[1], [3, 8], [1, 3, 1, 2]])

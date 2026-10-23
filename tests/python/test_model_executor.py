@@ -54,6 +54,7 @@ from xllm.python.model_executor.execution_context import (  # noqa: E402
     LayerCacheAwareExecutionMetadataBuilder,
 )
 from xllm.python.model_executor.executor import (  # noqa: E402
+    DecodeGraphAdapter,
     ModelExecutor,
     _create_attention_backend,
     _resolve_graph_backend,
@@ -1689,6 +1690,21 @@ class TestModelExecutorConstruction:
         )
 
         assert mock_graph_runner.call_args.kwargs["draft_query_width"] == 8
+
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_model_provided_graph_runner_keeps_default_execution_contract(self, mock_create: MagicMock) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+        runner_type = MagicMock()
+        model.create_decode_graph_adapter = MagicMock(return_value=DecodeGraphAdapter(model.model, runner_type, 1))
+        executor = ModelExecutor(
+            model,
+            {"max_position_embeddings": 128, "python_graph_backend": "aclgraph"},
+            max_seqs_per_batch=8,
+        )
+        assert runner_type.call_args.args[0] is model.model
+        assert executor.eager_runner.model is model.model
+        assert executor.decode_graph_runner is runner_type.return_value
 
 
 class TestDecodeCudaGraphDataParallelKeys:

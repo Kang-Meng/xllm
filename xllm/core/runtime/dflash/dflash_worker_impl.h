@@ -171,16 +171,18 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // No-op when the draft follows the target's kv_split sharding.
   void expand_draft_block_tables(ModelInputParams& input_params) const;
 
- private:
-  bool draft_use_block_parallel_rows() const {
+  // Geometry is selected by the drafter; shared builders consume it without
+  // depending on model-specific execution backends.
+  virtual bool draft_use_block_parallel_rows() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
   }
-  BatchForwardType draft_batch_forward_type() const {
+  virtual BatchForwardType draft_batch_forward_type() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::NATIVE
                ? BatchForwardType::DECODE
                : BatchForwardType::CHUNKED_PREFILL;
   }
 
+ private:
   void fill_validate_input_from_draft_outputs(const DraftBlock& draft_block,
                                               ForwardInput& validate_input,
                                               Stream& compute_stream,

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -40,7 +41,7 @@ from xllm.python.model_executor.input_batch import (
     InputBatch,
     InputBatchMetadata,
 )
-from xllm.python.model_executor.runners.base import ModelExecutionOutput
+from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.models.multimodal import MultimodalInputs
 from xllm.python.platform import current_platform
@@ -279,6 +280,15 @@ def _create_attention_backend(
     raise NotImplementedError(f"No attention backend available for device type '{device.type}'")
 
 
+@dataclass(frozen=True)
+class DecodeGraphAdapter:
+    """Model-owned graph implementation and its token-row geometry."""
+
+    model: nn.Module
+    runner_type: type[BaseRunner]
+    num_decoding_tokens: int
+
+
 class ModelExecutor:
     def __init__(
         self,
@@ -340,14 +350,22 @@ class ModelExecutor:
         first_parameter = next(model.parameters())
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
-        num_decoding_tokens = max(
-            int(num_decoding_tokens),
-            int(config.get("num_speculative_tokens", 0)) + 1,
+        graph_backend = _resolve_graph_backend(config)
+        adapter_factory = getattr(model, "create_decode_graph_adapter", None)
+        graph_adapter = (
+            adapter_factory(config, graph_backend, is_spec_draft=is_spec_draft) if adapter_factory is not None else None
         )
+        # Models may provide explicit draft geometry instead of deriving a
+        # target verify width from the speculative decoding configuration.
+        decode_width = (
+            graph_adapter.num_decoding_tokens
+            if graph_adapter is not None
+            else int(config.get("num_speculative_tokens", 0)) + 1
+        )
+        num_decoding_tokens = max(int(num_decoding_tokens), decode_width)
         # Resolve the graph backend before the attention backend so the V4.1
         # CSA2 backend can validate its ACL-graph capacity at startup (C of
         # 51361671) instead of at the first captured forward.
-        graph_backend = _resolve_graph_backend(config)
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
@@ -423,8 +441,10 @@ class ModelExecutor:
                 and int(config.get("expert_parallel_degree", 0)) == 2
                 and int(config.get("ep_size", 1)) > 1
             )
-            self.decode_graph_runner = DecodeAclGraphRunner(
-                execution_model,
+            runner_type = graph_adapter.runner_type if graph_adapter is not None else DecodeAclGraphRunner
+            graph_model = graph_adapter.model if graph_adapter is not None else execution_model
+            self.decode_graph_runner = runner_type(
+                graph_model,
                 self.attention_backend,
                 device,
                 max_seqs_per_batch,
@@ -560,7 +580,7 @@ class ModelExecutor:
         graph replay instead.
         """
         capture = self._resolve_aux_hidden_capture(getattr(self, "model", None))
-        if capture is None or isinstance(output, tuple):
+        if capture is None or not isinstance(output, torch.Tensor):
             return output
         if not capture.enabled or not capture.persistent_buffer:
             return output
@@ -653,11 +673,12 @@ class ModelExecutor:
                 eplb=eplb,
                 input_batch=input_batch,
             )
-            return self._attach_persistent_aux_hidden_states(
+            output = self._attach_persistent_aux_hidden_states(
                 output,
                 rows,
                 graph_rows=getattr(graph_runner, "last_padded_batch_size", None),
             )
+            return output
         if restore_history is not None:
             restore_history(self.attention_backend, metadata)
         if self.inductor_runner is not None:

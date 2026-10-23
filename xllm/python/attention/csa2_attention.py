@@ -60,7 +60,7 @@ from xllm.python.attention.dsa_metadata import (
     last_ring_writes,
 )
 from xllm.python.model_executor.dsa_cp import DsaCpContext, get_current_dsa_cp_runtime
-from xllm.python.model_executor.forward_context import get_forward_context
+from xllm.python.model_executor.forward_context import get_forward_context, get_forward_context_or_none
 from xllm.python.models.deepseek_v41 import (
     V41_QUANT_ASCEND,
     V41_QUANT_NONE,
@@ -149,6 +149,15 @@ class Csa2LayerContext:
     qr_scale: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class Csa2QueryLayout:
+    """Immutable query geometry supplied by the model for one forward."""
+
+    query_width: int = 1
+    token_rows: bool = False
+    shared_window: bool = False
+
+
 @dataclass
 class CSA2SharedRuntime:
     """Cross-layer hand-off state for one model forward.
@@ -161,6 +170,7 @@ class CSA2SharedRuntime:
     order, so one rolling slot per field is enough.
     """
 
+    query_layout: Csa2QueryLayout | None = None
     key_cache: torch.Tensor | None = None
     key_block_table: torch.Tensor | None = None
     index_cache: torch.Tensor | None = None
@@ -829,6 +839,35 @@ def _window_visible_idxs(
     return torch.where(window_positions >= 0, window_positions - previous_context + win, -1)
 
 
+def _block_query_lens(token_rows: int, query_width: int) -> list[int]:
+    """Regroup token-row metadata into complete query blocks."""
+    if query_width <= 0 or token_rows % query_width:
+        raise RuntimeError(f"Token rows must contain complete blocks: rows={token_rows}, width={query_width}")
+    return [query_width] * (token_rows // query_width)
+
+
+def _block_visible_idxs(
+    prev_ctx: torch.Tensor,
+    q_len: int,
+    col_pos: torch.Tensor,
+    cols: torch.Tensor,
+    win: int,
+) -> torch.Tensor:
+    """A non-causal block shares one context window across its queries.
+
+    A draft block is sampled in parallel, so all ``q_len`` queries condition
+    on the same rows: the trailing ``win`` context rows before the block plus
+    the whole block itself (``[prev_ctx - win, prev_ctx + q_len - 1]``),
+    non-causal within the block. The target's per-query causal SWA window
+    (:func:`_window_visible_idxs`) must not be used for the draft block.
+    Masked columns use the same ``-1`` padding sentinel as causal window picks.
+    """
+    window_lo = torch.clamp(prev_ctx - win, min=0)
+    window_hi = prev_ctx + q_len - 1
+    valid = (col_pos >= window_lo) & (col_pos <= window_hi)
+    return torch.where(valid, cols, -1).unsqueeze(0).expand(q_len, col_pos.numel())
+
+
 def _token_cache_slots(
     block_table: torch.Tensor | None,
     cache: torch.Tensor | None,
@@ -1435,17 +1474,24 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             raise RuntimeError(f"DeepSeek-V4.1 layer {layer_id} ran without its CSA2 context")
         cp_runtime = get_current_dsa_cp_runtime()
         cp_context = cp_runtime.plan if cp_runtime is not None else None
+        context = get_forward_context_or_none()
+        query_layout = context.execution_contexts.get(Csa2QueryLayout) if context is not None else None
+        shared_window = query_layout is not None and query_layout.shared_window
+        token_rows = query_layout is not None and (dsa.is_acl_graph or query_layout.token_rows)
+        if shared_window and cp_context is not None:
+            raise RuntimeError("Block attention does not support context parallelism")
         if cp_context is not None:
             q_lens = list(cp_context.global_q_lens)
-        elif dsa.is_acl_graph:
-            # Decode-graph contract: one token row per sequence. The host list
-            # is a capture-stable constant, so never sync-read the device
-            # tensor inside the captured stream (aclrtMemcpy on a captured
-            # stream fails with 107030).
-            q_lens = [1] * dsa.seq_lens_q.numel()
+        elif dsa.is_acl_graph or token_rows:
+            # Row counts and the model's query layout are capture-stable host
+            # metadata. Never copy device sequence lengths back during capture.
+            width = query_layout.query_width if query_layout is not None else 1
+            q_lens = _block_query_lens(int(dsa.seq_lens_q.numel()), width)
         else:
             q_lens = [int(value) for value in dsa.seq_lens_q.tolist()]
         ctx_lens = _ensure_seq_lens_tensor(dsa.seq_lens, ctx.x.device)
+        if token_rows:
+            ctx_lens = ctx_lens[:: query_layout.query_width]
 
         # A multi-token query reads history that later tokens would overwrite
         # in the SWA ring. The torch tail already reads this chunk directly
@@ -1457,6 +1503,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             _scatter_by_slot(layer_cache.swa, swa_slot, kv)
 
         shared = self._shared_runtime()
+        shared.query_layout = query_layout
         # 2) Compressor: only kv-source (Full) layers produce the shared main KV.
         if mode.is_full:
             self._run_compressor(layer, ctx, dsa, layer_cache, mapping, q_lens, ctx_lens, shared)
@@ -1492,7 +1539,9 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # 4) Sparse attention over [window rows ; top-k compressed rows].
         output = self._csa2_attention(q, kv, layer, dsa, q_lens, ctx_lens, topk, shared, cp_context)
         if defer_swa_write and layer_cache.swa is not None and swa_slot is not None:
-            slots, values = last_ring_writes(swa_slot, kv)
+            # Captured blocks keep fixed row counts; eager chunks may wrap
+            # the ring and must select the latest write for each slot.
+            slots, values = (swa_slot, kv) if dsa.is_acl_graph else last_ring_writes(swa_slot, kv)
             _scatter_by_slot(layer_cache.swa, slots, values)
         return output
 
@@ -2518,6 +2567,11 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         layer_cache = self._kv_caches[layer_id]
         mapping = self._resolve_cache_mapping(layer_id, ratio)
         swa_bt = _get_layer_cache_tensor(dsa.block_tables, layer_id, mapping.ori_cache_idx)
+        query_layout = shared.query_layout
+        shared_window = query_layout is not None and query_layout.shared_window
+        token_rows = query_layout is not None and (dsa.is_acl_graph or query_layout.token_rows)
+        if token_rows and swa_bt is not None:
+            swa_bt = swa_bt[:: query_layout.query_width]
         swa_bs = layer_cache.swa.size(1) if layer_cache.swa is not None else win
         global_q_lens = list(cp_context.global_q_lens) if cp_context is not None else q_lens
         global_ctx_lens = _ensure_seq_lens_tensor(dsa.seq_lens, q.device) if cp_context is not None else ctx_lens
@@ -2541,8 +2595,11 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # Ring candidate c sits at absolute position prev - win + c; which
             # candidates a given query may read is decided per query below.
             # Native SMLA is selected only for the validated V4.1 Flash dimensions.
+            # SMLA uses a causal window; shared-window blocks also need future
+            # rows within the block and retain the non-causal reference path.
             use_smla = (
-                q.device.type == "npu"
+                not shared_window
+                and q.device.type == "npu"
                 and head_dim == 512
                 and q.dtype == torch.bfloat16
                 and win == 128
@@ -2607,10 +2664,14 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # [max(p - win + 1, 0), p]; the lower bound tightens with the query
             # (only the chunk's first token shares the chunk-level bound).
             positions_seq = prev_ctx + torch.arange(q_len, device=q.device)
-            # Fixed, chronological window picks avoid reducing over every
-            # masked column of a variable-size chunk. Negative history is
-            # padding; all other picks map into [ring candidates ; chunk].
-            window_idxs = _window_visible_idxs(positions_seq, global_prev_ctx, win)
+            if shared_window:
+                col_pos = torch.cat((ring_pos, positions_seq), dim=0)
+                cols = torch.arange(window_kv.size(0), device=q.device)
+                window_idxs = _block_visible_idxs(prev_ctx, q_len, col_pos, cols, win)
+            else:
+                # Fixed chronological picks keep target reductions independent
+                # of chunk length; the draft retains its complete query block.
+                window_idxs = _window_visible_idxs(positions_seq, global_prev_ctx, win)
 
             # Compressed rows for the top-k picks (shared group cache),
             # gathered at the committed capacity; padding rows are unreachable
@@ -2654,7 +2715,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # Keep top-k padding width independent of committed capacity.
             # Padding and unreachable cache rows are zeroed before *any* math:
             # score masking alone cannot stop 0 * NaN in the value reduction.
-            pick_width = win + (self.index_topk if ratio > 0 else 0)
+            pick_width = window_idxs.size(-1) + (self.index_topk if ratio > 0 else 0)
             idxs = torch.nn.functional.pad(idxs, (0, pick_width - idxs.size(-1)), value=-1)
             # Shape-only budget: no device reads or data-dependent graph branch.
             # Keep every query's picks/reduction unchanged; split query rows only.

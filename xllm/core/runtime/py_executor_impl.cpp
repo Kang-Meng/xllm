@@ -23,6 +23,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/metrics.h"
@@ -203,13 +204,18 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   const bool is_spec_draft =
       options_.is_draft_engine() || (options_.enable_speculative_decode() &&
                                      options_.num_decoding_tokens() == 1);
-  py_executor_ = executor_module.attr("ModelExecutor")(
+  py::object draft_proposal_output_type =
+      py::module_::import("xllm.python.model_executor.runners.base")
+          .attr("DraftProposalOutput");
+  py::object executor = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),
       py_causal_lm_->config_dict(),
       options_.max_seqs_per_batch(),
       options_.num_decoding_tokens(),
       ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit(),
       py::arg("is_spec_draft") = is_spec_draft);
+  py_draft_proposal_output_type_ = std::move(draft_proposal_output_type);
+  py_executor_ = std::move(executor);
 }
 
 PyExecutorImpl::~PyExecutorImpl() {
@@ -217,6 +223,7 @@ PyExecutorImpl::~PyExecutorImpl() {
     PyCausalLM::set_active_instance(nullptr);
   }
   clear_python_object(py_executor_);
+  clear_python_object(py_draft_proposal_output_type_);
 }
 
 bool PyExecutorImpl::supports_device_only_decode_inputs() const {
@@ -365,6 +372,17 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    params.parallel.layers_per_event,
                                    params.parallel.draft_load_event_index,
                                    multimodal_inputs);
+  if (py::isinstance(hidden_obj, py_draft_proposal_output_type_)) {
+    ModelOutput output;
+    output.draft_proposal_token_ids =
+        hidden_obj.attr("token_ids").cast<torch::Tensor>();
+    CHECK(options_.is_draft_engine())
+        << "Only a draft model may return completed proposals";
+    CHECK(output.draft_proposal_token_ids.defined());
+    CHECK_EQ(output.draft_proposal_token_ids.scalar_type(), torch::kLong);
+    CHECK_EQ(output.draft_proposal_token_ids.dim(), 1);
+    return output;
+  }
   if (py::isinstance<py::tuple>(hidden_obj)) {
     py::tuple output = hidden_obj.cast<py::tuple>();
     CHECK_EQ(output.size(), 2) << "Python model tuple output must be "

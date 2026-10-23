@@ -467,6 +467,14 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 if active_counts and all(count % self._draft_query_width == 0 for count in active_counts):
                     admission_batch = max(active_counts) // self._draft_query_width
+                else:
+                    # ``admission_batch`` is in SEQUENCES. The value inherited
+                    # from the verify fold is the max TOKEN row count (the
+                    # empty shard's dummy row breaks the modulo), and folding a
+                    # token count as a sequence count would inflate the graph
+                    # bucket by up to the query width. Refuse the graph step so
+                    # the caller keeps the eager path.
+                    admission_batch = None
             elif batch_size % self._draft_query_width == 0:
                 admission_batch = batch_size // self._draft_query_width
         return is_expanded, verify_width, admission_batch
@@ -517,7 +525,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 # non-dummy batch is an exporter regression, not an empty shard.
                 return metadata
             tables = [torch.zeros((1, 1), dtype=torch.int32) for _ in group_infos]
-        elif len(tables) != len(group_infos) or tables[0].dim() != 2:
+        if len(tables) != len(group_infos) or tables[0].dim() != 2:
             return metadata
         block_table = metadata.block_table
         if block_table is None:
@@ -1432,6 +1440,10 @@ class DecodeAclGraphRunner(BaseRunner):
         # ``execute``'s first-capture path; deferring keeps a single capture
         # code path and matches the lazy-capture V3 wiring.
 
+    def _padded_token_rows(self, token_rows: int, admission_batch: int | None) -> int:
+        """Return the static token-row capacity for one admitted graph step."""
+        return _decode_bucket(token_rows)
+
     def execute(
         self,
         input_ids: torch.Tensor,
@@ -1477,9 +1489,6 @@ class DecodeAclGraphRunner(BaseRunner):
                     "by the shared counts so they must agree per rank."
                 )
             max_global_tokens = max(int(c) for c in execution_counts)
-            padded_batch_size = _decode_bucket(max_global_tokens)
-        else:
-            padded_batch_size = _decode_bucket(batch_size)
         expanded_view = resolve_expanded_decode_metadata(metadata)
         is_expanded, verify_width, admission_batch = self._shared_graph_plan(
             metadata,
@@ -1487,6 +1496,8 @@ class DecodeAclGraphRunner(BaseRunner):
             local_expanded=expanded_view is not None,
             packed_verify_width=self._spec_verify_width(batch_size, metadata),
         )
+        token_rows = max_global_tokens if self.dp_size > 1 else batch_size
+        padded_batch_size = self._padded_token_rows(token_rows, admission_batch)
         # The persistent aux-hidden buffer an ACL-graph replay writes into is
         # the one its captured forward allocated, i.e. the buffer keyed by this
         # bucket's row count. Expose it so the executor can pick that buffer

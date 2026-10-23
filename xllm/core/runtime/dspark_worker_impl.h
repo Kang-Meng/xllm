@@ -29,7 +29,8 @@ class ProcessGroup;
 // DSpark = DFlash block-diffusion draft + a low-rank Markov head that adds a
 // prefix-dependent bias to each block position's draft logits. It reuses the
 // entire DFlash pipeline (prefill, context-K/V injection, validate, cache
-// writes).
+// writes). Its proposal stage consumes eager logits or the opt-in full-step
+// ACL graph output before returning the block to the shared validator.
 class DSparkWorkerImpl final : public DFlashWorkerImpl {
  public:
   DSparkWorkerImpl(const ParallelArgs& parallel_args,
@@ -52,6 +53,9 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
   // prepare_query_inputs reads this hook to pick the block layout.
   bool sample_from_anchor() const override { return true; }
 
+  bool draft_use_block_parallel_rows() const override;
+  BatchForwardType draft_batch_forward_type() const override;
+
   // Build the DSpark query and produce the complete proposal block.
   DraftBlock run_decode_draft(const ForwardInput& input,
                               ForwardInput& validate_input) override;
@@ -71,6 +75,8 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
 
   void validate_draft_prelaunch_config(bool supports_device_inputs) const;
   void validate_decode_input(const ForwardInput& input) const;
+  bool draft_graph_enabled() const;
+  void validate_draft_graph_input(const ForwardInput& input) const;
   std::string_view draft_prelaunch_input_error(const ForwardInput& input) const;
   bool can_prelaunch_draft(const ForwardInput& input) const;
   std::vector<int64_t> build_batch_to_pending_row_mapping(

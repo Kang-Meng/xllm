@@ -28,6 +28,8 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "framework/model/mtp_utils.h"
 #include "llm_engine.h"
+#include "models/llm/deepseek_v41_dspark_graph_policy.h"
+#include "platform/platform.h"
 #include "util/utils.h"
 #include "vlm_engine.h"
 
@@ -95,7 +97,20 @@ SuffixVLMSpeculativeEngine::SuffixVLMSpeculativeEngine(
 template <typename TargetEngine>
 runtime::DecodeGraphWarmupConfig
 SpeculativeEngineBase<TargetEngine>::decode_graph_warmup_config() const {
-  return engine_->decode_graph_warmup_config();
+  runtime::DecodeGraphWarmupConfig warmup_config =
+      engine_->decode_graph_warmup_config();
+  const std::vector<int32_t> additional_batch_sizes =
+      deepseek_v41::additional_draft_graph_warmup_batches(
+          options_,
+          draft_model_args(),
+          ModelConfig::get_instance().model_impl(),
+          Platform::is_npu(),
+          warmup_config.max_graph_batch_size);
+  warmup_config.additional_batch_sizes.insert(
+      warmup_config.additional_batch_sizes.end(),
+      additional_batch_sizes.begin(),
+      additional_batch_sizes.end());
+  return warmup_config;
 }
 
 template <typename TargetEngine>
@@ -114,6 +129,7 @@ bool SpeculativeEngineBase<TargetEngine>::init(MasterStatus master_status) {
 template <typename TargetEngine>
 bool SpeculativeEngineBase<TargetEngine>::init_model(
     MasterStatus master_status) {
+  draft_model_initialized_ = false;
   if (!engine_->init_model(master_status)) {
     return false;
   }
@@ -124,6 +140,7 @@ bool SpeculativeEngineBase<TargetEngine>::init_model(
     if (!draft_engine_->init_model()) {
       return false;
     }
+    draft_model_initialized_ = true;
 
     // Draft tokens are detokenized by the target, so the draft engine needs no
     // tokenizer and no draft/target vocab-compatibility check (not universal;

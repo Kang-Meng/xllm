@@ -304,7 +304,15 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   if (eplb_executor_ != nullptr) {
     eplb_executor_->finish_eplb_step();
   }
-  if (!model_output.hidden_states.defined()) {
+  const bool has_draft_proposal =
+      model_output.draft_proposal_token_ids.defined();
+  if (has_draft_proposal) {
+    CHECK(options_.is_draft_engine() || is_spec_draft_)
+        << "Only draft workers may publish proposals";
+    CHECK(!model_output.hidden_states.defined())
+        << "Model output cannot contain both hidden states and proposals";
+  }
+  if (!model_output.hidden_states.defined() && !has_draft_proposal) {
     wait_kv_push();
     if (!failed_request_ids.empty()) {
       return make_failed_output(std::move(failed_request_ids));
@@ -315,7 +323,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   torch::Tensor logits;
   torch::Tensor lm_head_selected_token_idxes;
   torch::Tensor selected_hidden;
-  if (sampling_params.selected_token_idxes.defined()) {
+  if (sampling_params.selected_token_idxes.defined() && !has_draft_proposal) {
     torch::Tensor selected_token_idxes = choose_lm_head_selected_token_idxes(
         sampling_params.selected_token_idxes,
         input.input_params,
@@ -360,6 +368,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
 
   ForwardOutput output;
+  if (has_draft_proposal) {
+    output.draft_proposal_token_ids =
+        std::move(model_output.draft_proposal_token_ids);
+  }
   output.mtp_topk_state = std::move(model_output.mtp_topk_state);
   if (eplb_executor_ != nullptr) {
     output.expert_load_data = expert_load_data_;
@@ -384,7 +396,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
 
   // driver prepare model output
-  if (sampling_params.selected_token_idxes.defined()) {
+  // Completed proposals do not require another projection or sampling pass.
+  if (sampling_params.selected_token_idxes.defined() && !has_draft_proposal) {
     output.selected_hidden = selected_hidden;
     output.do_sample = sampling_params.do_sample;
     output.logprobs = sampling_params.logprobs;
@@ -459,7 +472,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     output.logits = logits;
   }
 
-  if (options_.enable_speculative_decode()) {
+  if (options_.enable_speculative_decode() && !has_draft_proposal) {
     torch::Tensor embeddings;
     if (model_output.aux_hidden_states.defined()) {
       embeddings = model_output.aux_hidden_states;

@@ -30,6 +30,9 @@ struct ModelOutput {
   torch::Tensor residual;
   // [num_tokens, ...]
   torch::Tensor aux_hidden_states;
+  // Completed draft proposals, when the model owns proposal generation.
+  // Mutually exclusive with hidden_states.
+  torch::Tensor draft_proposal_token_ids;
   // Backend-neutral state emitted for the next MTP draft step.
   MtpTopkStatePtr mtp_topk_state;
 

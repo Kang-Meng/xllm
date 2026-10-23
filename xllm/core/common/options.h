@@ -86,6 +86,8 @@ class Options {
 
   PROPERTY(bool, enable_dspark_prelaunch) = false;
 
+  PROPERTY(bool, enable_dspark_draft_graph) = false;
+
   PROPERTY(int32_t, speculative_suffix_cache_max_depth) = 64;
 
   PROPERTY(double, speculative_suffix_max_spec_factor) = 1.0;

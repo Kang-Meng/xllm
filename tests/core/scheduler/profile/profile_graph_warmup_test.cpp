@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "models/llm/deepseek_v41_dspark_graph_policy.h"
 #include "platform/platform.h"
 #include "runtime/decode_graph_bucket.h"
 #include "scheduler/profile/decode_graph_warmup_plan.h"
@@ -522,6 +523,221 @@ TEST(DecodeGraphWarmupPlanTest, GraphLimitIsLocalAcrossDpGroups) {
         << "local batch " << local_batch_size
         << " maps to unwarmed token bucket " << bucket;
   }
+}
+
+TEST(DecodeGraphWarmupPlanTest, DraftSequenceBucketsCompleteDp4Warmup) {
+  if (!Platform::supports_mtp_decode_graph_warmup()) {
+    GTEST_SKIP() << "MTP decode graph warmup is not supported.";
+  }
+  runtime::DecodeGraphWarmupConfig warmup_config =
+      make_decode_graph_warmup_config(/*num_decoding_tokens=*/6,
+                                      /*num_speculative_tokens=*/5,
+                                      /*enable_no_padding=*/false,
+                                      /*max_graph_batch_size=*/16);
+  const DecodeGraphWarmupPlan target_plan = build_decode_graph_warmup_plan(
+      warmup_config, /*max_global_batch_size=*/32, /*dp_size=*/4);
+  EXPECT_EQ(target_plan.batch_sizes, (std::vector<int32_t>{4, 8, 20, 32}));
+
+  warmup_config.additional_batch_sizes =
+      deepseek_v41::draft_graph_warmup_batch_sizes(
+          /*max_global_batch_size=*/32,
+          /*dp_size=*/4,
+          /*max_graph_batch_size=*/16);
+  const DecodeGraphWarmupPlan joint_plan = build_decode_graph_warmup_plan(
+      warmup_config, /*max_global_batch_size=*/32, /*dp_size=*/4);
+  EXPECT_EQ(joint_plan.batch_sizes, (std::vector<int32_t>{4, 8, 12, 20, 32}));
+  EXPECT_EQ(joint_plan.warmup_config.additional_batch_sizes,
+            warmup_config.additional_batch_sizes);
+}
+
+TEST(DecodeGraphWarmupPlanTest, DraftBucketsDoNotDependOnTargetTokenPadding) {
+  if (!Platform::supports_mtp_decode_graph_warmup()) {
+    GTEST_SKIP() << "MTP decode graph warmup is not supported.";
+  }
+  runtime::DecodeGraphWarmupConfig warmup_config =
+      make_decode_graph_warmup_config(/*num_decoding_tokens=*/6,
+                                      /*num_speculative_tokens=*/5,
+                                      /*enable_no_padding=*/true,
+                                      /*max_graph_batch_size=*/16);
+  warmup_config.additional_batch_sizes =
+      deepseek_v41::draft_graph_warmup_batch_sizes(
+          /*max_global_batch_size=*/32,
+          /*dp_size=*/4,
+          /*max_graph_batch_size=*/16);
+  const DecodeGraphWarmupPlan plan = build_decode_graph_warmup_plan(
+      warmup_config, /*max_global_batch_size=*/32, /*dp_size=*/4);
+  // The target does not admit all intermediate exact token-row shapes, but
+  // draft sequence buckets still need their own representatives.
+  for (const int32_t batch_size : {4, 8, 12, 20}) {
+    EXPECT_NE(
+        std::find(plan.batch_sizes.begin(), plan.batch_sizes.end(), batch_size),
+        plan.batch_sizes.end());
+  }
+}
+
+TEST(DecodeGraphWarmupPlanTest, JointPlanCoversEveryAdmissibleDraftBucket) {
+  if (!Platform::supports_mtp_decode_graph_warmup()) {
+    GTEST_SKIP() << "MTP decode graph warmup is not supported.";
+  }
+  for (const int32_t dp_size : {1, 2, 3, 4, 8}) {
+    for (const int32_t gamma : {1, 3, 5, 7}) {
+      for (const int32_t graph_limit : {0, 4, 10, 16}) {
+        for (const bool no_padding : {false, true}) {
+          for (int32_t capacity = 0; capacity <= 67; ++capacity) {
+            SCOPED_TRACE(::testing::Message()
+                         << "dp=" << dp_size << " gamma=" << gamma << " limit="
+                         << graph_limit << " no_padding=" << no_padding
+                         << " capacity=" << capacity);
+            runtime::DecodeGraphWarmupConfig warmup_config =
+                make_decode_graph_warmup_config(
+                    gamma + 1, gamma, no_padding, graph_limit);
+            const DecodeGraphWarmupPlan target_plan =
+                build_decode_graph_warmup_plan(
+                    warmup_config, capacity, dp_size);
+            // Build the model plan at its configured capacity, then reduce
+            // the planner capacity to simulate KV allocation constraints.
+            warmup_config.additional_batch_sizes =
+                deepseek_v41::draft_graph_warmup_batch_sizes(
+                    /*max_global_batch_size=*/67, dp_size, graph_limit);
+            const DecodeGraphWarmupPlan joint_plan =
+                build_decode_graph_warmup_plan(
+                    warmup_config, capacity, dp_size);
+            EXPECT_TRUE(std::includes(joint_plan.batch_sizes.begin(),
+                                      joint_plan.batch_sizes.end(),
+                                      target_plan.batch_sizes.begin(),
+                                      target_plan.batch_sizes.end()));
+            EXPECT_EQ(std::adjacent_find(joint_plan.batch_sizes.begin(),
+                                         joint_plan.batch_sizes.end()),
+                      joint_plan.batch_sizes.end());
+            std::vector<int64_t> warmed_draft_buckets;
+            warmed_draft_buckets.reserve(joint_plan.batch_sizes.size());
+            for (const int32_t batch_size : joint_plan.batch_sizes) {
+              EXPECT_GT(batch_size, 0);
+              EXPECT_LE(batch_size, capacity);
+              const int64_t shared_local_batch =
+                  (static_cast<int64_t>(batch_size) + dp_size - 1) / dp_size;
+              warmed_draft_buckets.emplace_back(
+                  runtime::get_decode_graph_token_bucket(
+                      shared_local_batch, /*enable_no_padding=*/false));
+            }
+            for (int32_t local_batch = 1; local_batch <= capacity / dp_size;
+                 ++local_batch) {
+              const int64_t draft_bucket =
+                  runtime::get_decode_graph_token_bucket(
+                      local_batch, /*enable_no_padding=*/false);
+              if (graph_limit > 0 && draft_bucket > graph_limit) {
+                continue;
+              }
+              EXPECT_NE(std::find(warmed_draft_buckets.begin(),
+                                  warmed_draft_buckets.end(),
+                                  draft_bucket),
+                        warmed_draft_buckets.end());
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(DecodeGraphWarmupPlanTest, JointPlanHandlesInvalidAndReducedCapacity) {
+  runtime::DecodeGraphWarmupConfig warmup_config =
+      make_decode_graph_warmup_config(/*num_decoding_tokens=*/6,
+                                      /*num_speculative_tokens=*/5,
+                                      /*enable_no_padding=*/false,
+                                      /*max_graph_batch_size=*/16);
+  warmup_config.additional_batch_sizes = {4, 8, 12, 20};
+  EXPECT_TRUE(build_decode_graph_warmup_plan(
+                  warmup_config, /*max_global_batch_size=*/-1, /*dp_size=*/4)
+                  .batch_sizes.empty());
+  EXPECT_TRUE(build_decode_graph_warmup_plan(
+                  warmup_config, /*max_global_batch_size=*/32, /*dp_size=*/0)
+                  .batch_sizes.empty());
+  EXPECT_TRUE(build_decode_graph_warmup_plan(
+                  warmup_config, /*max_global_batch_size=*/2, /*dp_size=*/4)
+                  .batch_sizes.empty());
+}
+
+TEST(DecodeGraphWarmupPlanTest, AdditionalBatchSizesAreBoundedSortedAndUnique) {
+  runtime::DecodeGraphWarmupConfig warmup_config =
+      make_decode_graph_warmup_config(/*num_decoding_tokens=*/1,
+                                      /*num_speculative_tokens=*/0,
+                                      /*enable_no_padding=*/false);
+  warmup_config.additional_batch_sizes = {20, 12, 12, 4, -1, 0, 2, 100};
+  const DecodeGraphWarmupPlan plan = build_decode_graph_warmup_plan(
+      warmup_config, /*max_global_batch_size=*/16, /*dp_size=*/4);
+  EXPECT_EQ(plan.batch_sizes, (std::vector<int32_t>{4, 8, 12, 16}));
+}
+
+TEST(DeepseekV41DraftWarmupTest, BlockBucketsRespectCapacityAndGraphLimit) {
+  EXPECT_EQ(deepseek_v41::draft_graph_warmup_batch_sizes(
+                /*max_global_batch_size=*/32,
+                /*dp_size=*/4,
+                /*max_graph_batch_size=*/16),
+            (std::vector<int32_t>{4, 8, 12, 20}));
+  EXPECT_EQ(deepseek_v41::draft_graph_warmup_batch_sizes(
+                /*max_global_batch_size=*/32,
+                /*dp_size=*/4,
+                /*max_graph_batch_size=*/4),
+            (std::vector<int32_t>{4, 8, 12}));
+  EXPECT_TRUE(deepseek_v41::draft_graph_warmup_batch_sizes(
+                  /*max_global_batch_size=*/2,
+                  /*dp_size=*/4,
+                  /*max_graph_batch_size=*/16)
+                  .empty());
+  EXPECT_TRUE(deepseek_v41::draft_graph_warmup_batch_sizes(
+                  /*max_global_batch_size=*/32,
+                  /*dp_size=*/0,
+                  /*max_graph_batch_size=*/16)
+                  .empty());
+}
+
+TEST(DeepseekV41DraftWarmupTest, OnlyAnEnabledDraftGraphAddsBatches) {
+  runtime::Options options;
+  options.speculative_algorithm("DSpark")
+      .num_speculative_tokens(5)
+      .enable_dspark_draft_graph(true)
+      .enable_graph(true)
+      .draft_sampling_mode("greedy")
+      .max_seqs_per_batch(32)
+      .dp_size(4);
+  ModelArgs draft_args;
+  draft_args.model_type("deepseek_v41");
+  EXPECT_EQ(deepseek_v41::additional_draft_graph_warmup_batches(
+                options, &draft_args, "python", /*is_npu=*/true, 16),
+            (std::vector<int32_t>{4, 8, 12, 20}));
+  EXPECT_TRUE(deepseek_v41::additional_draft_graph_warmup_batches(
+                  options, nullptr, "python", /*is_npu=*/true, 16)
+                  .empty());
+  EXPECT_TRUE(deepseek_v41::additional_draft_graph_warmup_batches(
+                  options, &draft_args, "python", /*is_npu=*/false, 16)
+                  .empty());
+  options.enable_dspark_draft_graph(false);
+  EXPECT_TRUE(deepseek_v41::additional_draft_graph_warmup_batches(
+                  options, &draft_args, "python", /*is_npu=*/true, 16)
+                  .empty());
+}
+
+TEST(DeepseekV41DraftWarmupTest, UsesLoadedDraftInsteadOfTargetCheckpoint) {
+  runtime::Options options;
+  options.speculative_algorithm("DSpark")
+      .num_speculative_tokens(5)
+      .enable_dspark_draft_graph(true)
+      .enable_graph(true)
+      .draft_sampling_mode("greedy")
+      .max_seqs_per_batch(32)
+      .dp_size(4)
+      .model_path("/different-target-checkpoint");
+  ModelArgs draft_args;
+  draft_args.model_type("deepseek_v41");
+  EXPECT_FALSE(deepseek_v41::additional_draft_graph_warmup_batches(
+                   options, &draft_args, "python", /*is_npu=*/true, 16)
+                   .empty());
+  draft_args.model_type("qwen3");
+  options.model_path("/deepseek-v41-target-checkpoint");
+  EXPECT_TRUE(deepseek_v41::additional_draft_graph_warmup_batches(
+                  options, &draft_args, "python", /*is_npu=*/true, 16)
+                  .empty());
 }
 
 TEST(DecodeGraphWarmupPlanTest, NoPaddingKeepsCompatibilityBatches) {

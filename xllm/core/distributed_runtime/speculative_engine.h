@@ -49,6 +49,10 @@ class SpeculativeEngineBase : public Engine {
 
   const ModelArgs& model_args() const override { return model_args_; }
 
+  const ModelArgs* draft_model_args() const override {
+    return draft_model_initialized_ ? &draft_engine_->model_args() : nullptr;
+  }
+
   bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
       override;
@@ -119,6 +123,8 @@ class SpeculativeEngineBase : public Engine {
 
   // whether this speculative engine uses an external draft engine
   const bool use_draft_engine_;
+
+  bool draft_model_initialized_ = false;
 
   // whether target and draft engine are sharing the same device
   bool share_device_ = false;

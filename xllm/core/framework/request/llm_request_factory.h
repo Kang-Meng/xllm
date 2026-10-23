@@ -57,13 +57,18 @@ class LLMRequestFactory final {
   using RpcResponseHandler =
       std::function<std::vector<bool>(const std::vector<RequestOutput>&)>;
 
+  // Optional model capability validation before encoding or admission.
+  using RequestValidator =
+      std::function<std::optional<std::string>(const RequestParams&)>;
+
   LLMRequestFactory(const Tokenizer* tokenizer,
                     const ChatTemplate* chat_template,
                     const ModelArgs* model_args,
                     const Options* options,
                     RateLimiter* rate_limiter,
                     std::string task_type,
-                    RpcResponseHandler rpc_response_handler);
+                    RpcResponseHandler rpc_response_handler,
+                    RequestValidator request_validator = {});
 
   // completion / encode: prompt carries text and/or pre-tokenized tokens.
   std::shared_ptr<Request> create(
@@ -131,6 +136,7 @@ class LLMRequestFactory final {
   RateLimiter* rate_limiter_ = nullptr;
   std::string task_type_;
   RpcResponseHandler rpc_response_handler_;
+  RequestValidator request_validator_;
 
   std::mutex json_object_grammar_mutex_;
   std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;

@@ -95,6 +95,7 @@ limitations under the License.
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
 #include "layers/common/kv_shard_batch_metadata.h"
+#include "models/llm/deepseek_v41_dspark_graph_policy.h"
 #include "models/model_registry.h"
 #include "runtime/forward_params.h"
 #if defined(USE_NPU)
@@ -2241,6 +2242,13 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   speculative_runtime_config.is_draft_engine = options_.is_draft_engine();
   speculative_runtime_config.adaptive_enabled =
       options_.enable_adaptive_speculative_decode();
+  speculative_runtime_config.draft_graph_enabled =
+      deepseek_v41::resolve_model_draft_graph(
+          options_,
+          args.model_type(),
+          ModelConfig::get_instance().model_impl(),
+          Platform::is_npu(),
+          parallel_args_.cp_size());
   speculative_runtime_config.draft_query_width =
       std::max<int32_t>(1, options_.draft_graph_query_width());
   speculative_runtime_config.dflash_xfia_enabled =

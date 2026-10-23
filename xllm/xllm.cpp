@@ -169,6 +169,7 @@ Options create_options(const std::string& instance_name, bool is_local) {
           speculative_config.speculative_suffix_use_tree_spec())
       .enable_mtp_draft_body_tp1(speculative_config.enable_mtp_draft_body_tp1())
       .enable_dspark_prelaunch(speculative_config.enable_dspark_prelaunch())
+      .enable_dspark_draft_graph(speculative_config.enable_dspark_draft_graph())
       .enable_adaptive_speculative_decode(
           speculative_config.enable_adaptive_speculative_decode())
       .adaptive_speculative_min_gain(
