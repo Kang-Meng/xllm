@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/distributed_runtime/master.h"
 #include "core/framework/config/execution_config.h"
 #include "core/platform/device.h"
+#include "core/util/model_config_utils.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "runtime/worker.h"
@@ -84,6 +85,9 @@ bool DiTEngine::init() {
 
 bool DiTEngine::init_model() {
   const std::string& model_path = options_.model_path();
+  // The engine only stores the top-level pipeline identity. Component args
+  // remain in each worker's DiTModelContext.
+  args_.model_type() = util::get_model_type(model_path, "dit");
 
   // init model for each worker in parallel
   // multiple workers, call async init

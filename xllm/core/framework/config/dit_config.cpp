@@ -79,7 +79,8 @@ DEFINE_int64(dit_generation_image_area_max,
 DEFINE_bool(
     dit_enable_vae_tiling,
     false,
-    "whether enable vae tiling, currently only support qwen-image-edit-plus");
+    "whether enable vae tiling, currently support qwen-image-edit-plus and "
+    "qwen-image-21");
 
 DEFINE_int64(
     dit_vae_tail_chunk_frames,
@@ -90,7 +91,7 @@ DEFINE_int64(
 
 DEFINE_bool(dit_enable_text_encoder,
             true,
-            "JoyOV2/MiniMax-H3: load in-process Qwen3-VL "
+            "JoyOV2/MiniMax-H3/Qwen-Image-2.1: load in-process Qwen3-VL "
             "(set --text_encoder_tp_size explicitly). "
             "Off: require external prompt_embed.");
 

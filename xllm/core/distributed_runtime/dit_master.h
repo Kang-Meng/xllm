@@ -20,7 +20,6 @@ limitations under the License.
 #include <functional>
 #include <future>
 #include <memory>
-#include <string>
 #include <vector>
 
 #include "framework/request/dit_request_params.h"

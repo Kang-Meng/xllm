@@ -34,7 +34,8 @@ class ThreadPool;
 
 class DiTSourceDecoder final {
  public:
-  explicit DiTSourceDecoder(const BinaryPayload& request_payload);
+  explicit DiTSourceDecoder(const BinaryPayload& request_payload,
+                            bool preserve_image_alpha = false);
 
   bool add_source(const proto::MediaSource& source, Status& status);
   bool add_source(const proto::MediaSource& source,
@@ -82,6 +83,7 @@ class DiTSourceDecoder final {
                      Status& status) const;
 
   const BinaryPayload& request_payload_;
+  bool preserve_image_alpha_ = false;
   std::vector<Input> inputs_;
 };
 

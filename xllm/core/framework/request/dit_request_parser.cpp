@@ -165,7 +165,8 @@ bool ImageRequestParser::parse_input(
     const DiTRawInputParams& raw_input_params,
     const DiTGenerationParams& /*generation_params*/,
     DiTInputParams& input_params,
-    Status& status) const {
+    Status& status,
+    bool preserve_image_alpha) const {
   const auto* proto_ptr =
       get_proto<proto::Input>(raw_input_params.input, "input", status);
   if (proto_ptr == nullptr) {
@@ -225,7 +226,7 @@ bool ImageRequestParser::parse_input(
     return false;
   }
 
-  DiTSourceDecoder decoder(binary_payload);
+  DiTSourceDecoder decoder(binary_payload, preserve_image_alpha);
   // Preserve reference-image order: media_sources before legacy images.
   if (!decoder.add_sources(input.media_sources(), status)) {
     return false;
@@ -335,7 +336,8 @@ bool AudioRequestParser::parse_input(
     const DiTRawInputParams& raw_input_params,
     const DiTGenerationParams& generation_params,
     DiTInputParams& input_params,
-    Status& status) const {
+    Status& status,
+    bool /*preserve_image_alpha*/) const {
   const auto* proto_ptr =
       get_proto<proto::AudioInput>(raw_input_params.input, "input", status);
   if (proto_ptr == nullptr) {
@@ -449,7 +451,8 @@ bool VideoRequestParser::parse_input(
     const DiTRawInputParams& raw_input_params,
     const DiTGenerationParams& generation_params,
     DiTInputParams& input_params,
-    Status& status) const {
+    Status& status,
+    bool /*preserve_image_alpha*/) const {
   const auto* proto_ptr =
       get_proto<proto::VideoInput>(raw_input_params.input, "input", status);
   if (proto_ptr == nullptr) {
@@ -586,7 +589,8 @@ bool TextRequestParser::parse_input(
     const DiTRawInputParams& raw_input_params,
     const DiTGenerationParams& /*generation_params*/,
     DiTInputParams& input_params,
-    Status& status) const {
+    Status& status,
+    bool /*preserve_image_alpha*/) const {
   const auto* proto_ptr =
       get_proto<proto::TextInput>(raw_input_params.input, "input", status);
   if (proto_ptr == nullptr) {

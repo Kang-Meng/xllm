@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -559,12 +560,19 @@ class MemoryAudioReader : public MemoryMediaReader {
   std::vector<float> pcm_;
 };
 
-bool OpenCVImageDecoder::decode(std::string_view raw_data, torch::Tensor& t) {
-  cv::Mat buffer(1, raw_data.size(), CV_8UC1, (void*)raw_data.data());
-  if (raw_data.empty()) {
-    LOG(ERROR) << "opencv image decode got empty data";
+bool OpenCVImageDecoder::decode(std::string_view raw_data,
+                                torch::Tensor& t,
+                                bool preserve_alpha) {
+  if (raw_data.empty() ||
+      raw_data.size() >
+          static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+    LOG(ERROR) << "opencv image decode got empty or oversized data";
     return false;
   }
+  cv::Mat buffer(1,
+                 static_cast<int32_t>(raw_data.size()),
+                 CV_8UC1,
+                 const_cast<char*>(raw_data.data()));
   cv::Mat image = cv::imdecode(buffer, cv::IMREAD_UNCHANGED);
   if (image.empty()) {
     LOG(INFO) << "opencv image decode failed";
@@ -572,11 +580,28 @@ bool OpenCVImageDecoder::decode(std::string_view raw_data, torch::Tensor& t) {
   }
 
   cv::Mat rgb_image;
-  convert_decoded_image_to_rgb(image, rgb_image);
+  if (preserve_alpha) {
+    if (image.channels() == 4) {
+      cv::cvtColor(image, rgb_image, cv::COLOR_BGRA2RGBA);
+    } else if (image.channels() == 3) {
+      cv::cvtColor(image, rgb_image, cv::COLOR_BGR2RGBA);
+    } else if (image.channels() == 1) {
+      cv::cvtColor(image, rgb_image, cv::COLOR_GRAY2RGBA);
+    } else {
+      LOG(ERROR) << "Unsupported image channel count: " << image.channels();
+      return false;
+    }
+    if (rgb_image.depth() != CV_8U) {
+      LOG(ERROR) << "RGBA DiT inputs currently require 8-bit pixels";
+      return false;
+    }
+  } else {
+    convert_decoded_image_to_rgb(image, rgb_image);
+  }
 
   torch::Tensor tensor =
       torch::from_blob(rgb_image.data,
-                       {rgb_image.rows, rgb_image.cols, 3},
+                       {rgb_image.rows, rgb_image.cols, rgb_image.channels()},
                        torch::TensorOptions().dtype(torch::kUInt8));
 
   t = tensor.permute({2, 0, 1}).clone();  // [C, H, W]
@@ -589,13 +614,16 @@ bool OpenCVImageEncoder::encode(const torch::Tensor& t, std::string& raw_data) {
   }
 
   auto img = t.permute({1, 2, 0}).contiguous();
-  cv::Mat mat(img.size(0), img.size(1), CV_32FC3, img.data_ptr<float>());
+  const int32_t channels = static_cast<int32_t>(t.size(0));
+  cv::Mat mat(static_cast<int32_t>(img.size(0)),
+              static_cast<int32_t>(img.size(1)),
+              CV_MAKETYPE(CV_32F, channels),
+              img.data_ptr<float>());
 
   cv::Mat mat_8u;
-  mat.convertTo(mat_8u, CV_8UC3, 255.0);
-
-  // rgb -> bgr
-  cv::cvtColor(mat_8u, mat_8u, cv::COLOR_RGB2BGR);
+  mat.convertTo(mat_8u, CV_MAKETYPE(CV_8U, channels), 255.0);
+  cv::cvtColor(
+      mat_8u, mat_8u, channels == 4 ? cv::COLOR_RGBA2BGRA : cv::COLOR_RGB2BGR);
 
   std::vector<uchar> data;
   if (!cv::imencode(".png", mat_8u, data)) {
@@ -608,8 +636,8 @@ bool OpenCVImageEncoder::encode(const torch::Tensor& t, std::string& raw_data) {
 }
 
 bool OpenCVImageEncoder::valid(const torch::Tensor& t) {
-  if (t.dim() != 3 || t.size(0) != 3) {
-    LOG(ERROR) << "input tensor must be 3HW  tensor";
+  if (t.dim() != 3 || (t.size(0) != 3 && t.size(0) != 4)) {
+    LOG(ERROR) << "input tensor must be RGB/RGBA CHW tensor";
     return false;
   }
 

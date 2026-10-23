@@ -4,8 +4,8 @@
 
 #include "audio_generation.pb.h"
 #include "core/common/types.h"
+#include "core/framework/request/dit_request_state.h"
 #include "core/util/binary_payload.h"
-#include "dit_request_state.h"
 #include "image_generation.pb.h"
 #include "text_generation.pb.h"
 #include "video_generation.pb.h"
@@ -50,7 +50,7 @@ class DiTRequestParams final {
 
   DiTRequestKind request_kind() const { return request_kind_; }
 
-  bool parse_input_params(Status& status);
+  bool parse_input_params(Status& status, bool preserve_image_alpha = false);
   bool verify_params(Status& status) const;
 
   // request id

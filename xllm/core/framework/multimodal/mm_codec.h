@@ -30,7 +30,9 @@ class OpenCVImageDecoder {
   OpenCVImageDecoder() = default;
   ~OpenCVImageDecoder() = default;
 
-  bool decode(std::string_view raw_data, torch::Tensor& t);
+  bool decode(std::string_view raw_data,
+              torch::Tensor& t,
+              bool preserve_alpha = false);
 };
 
 class OpenCVImageEncoder {

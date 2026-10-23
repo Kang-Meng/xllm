@@ -25,6 +25,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/dit_model_context.h"
 #include "core/framework/model_context.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "framework/parallel_state/parallel_state.h"
@@ -242,19 +243,19 @@ class VaeParallelMixin {
 
   /// Split global tensor along the last (W) dimension into this rank's slice.
   torch::Tensor vae_parallel_split(torch::Tensor x) const {
-    if (!vae_parallel_enabled()) {
-      return x;
+    return split_width(std::move(x), /*alignment=*/1);
+  }
+
+  /// Partition whole spatial cells to preserve downsample stride alignment.
+  /// Unlike the legacy overload, requires at least one cell per parallel rank.
+  torch::Tensor vae_parallel_split(torch::Tensor x, int64_t alignment) const {
+    CHECK_GT(alignment, 0);
+    CHECK_EQ(x.size(-1) % alignment, 0);
+    if (vae_parallel_enabled()) {
+      CHECK_GE(x.size(-1) / alignment, vae_size())
+          << "VAE width must provide at least one aligned column per rank";
     }
-    const int64_t width = x.size(-1);
-    CHECK_GE(width, vae_size())
-        << "VAE W split requires global W >= vae_size, got W=" << width
-        << " vae_size=" << vae_size();
-    const int64_t base_w = width / vae_size();
-    const int64_t rem_w = width % vae_size();
-    const int64_t start_w =
-        vae_rank() * base_w + std::min<int64_t>(vae_rank(), rem_w);
-    const int64_t w_local = base_w + (vae_rank() < rem_w ? 1 : 0);
-    return x.slice(/*dim=*/-1, start_w, start_w + w_local).contiguous();
+    return split_width(std::move(x), alignment);
   }
 
   /// All-gather local slices along W, concatenate back to global tensor.
@@ -370,6 +371,21 @@ class VaeParallelMixin {
   }
 
  private:
+  torch::Tensor split_width(torch::Tensor x, int64_t alignment) const {
+    if (!vae_parallel_enabled()) {
+      return x;
+    }
+    const int64_t cells = x.size(-1) / alignment;
+    const int64_t base = cells / vae_size();
+    const int64_t remainder = cells % vae_size();
+    const int64_t start =
+        (vae_rank() * base + std::min<int64_t>(vae_rank(), remainder)) *
+        alignment;
+    const int64_t length =
+        (base + (vae_rank() < remainder ? 1 : 0)) * alignment;
+    return x.narrow(/*dim=*/-1, start, length).contiguous();
+  }
+
   // Valid only when vae_parallel_enabled(); pg_ is null for vae_size == 1.
   int32_t vae_size() const { return pg_->world_size(); }
   int32_t vae_rank() const { return pg_->rank(); }

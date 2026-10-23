@@ -112,6 +112,7 @@ struct ModelMeta {
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
   CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
+  bool preserve_image_alpha = false;
 };
 
 // Model registry is a singleton class that registers all models with the
@@ -131,6 +132,13 @@ class ModelRegistry {
 
   static void register_dit_model_factory(const std::string& name,
                                          DiTModelFactory factory);
+
+  // Register image decoding policy at startup; absent policies keep RGB.
+  static void register_preserve_image_alpha(const std::string& name,
+                                            bool enabled);
+
+  // Read-only query by the server's registered model type, not a public alias.
+  static bool get_preserve_image_alpha(const std::string& name);
 
   static void register_model_backend(const std::string& name,
                                      const std::string& backend);
@@ -283,6 +291,15 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 
 #define REGISTER_DIT_MODEL(ModelType, ModelClass) \
   REGISTER_DIT_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
+
+#define REGISTER_IMAGE_ALPHA_POLICY(ModelType, PreserveAlpha)                  \
+  namespace {                                                                  \
+  [[maybe_unused]] const bool ModelType##_image_alpha_policy_registered = [] { \
+    ::xllm::ModelRegistry::register_preserve_image_alpha(#ModelType,           \
+                                                         PreserveAlpha);       \
+    return true;                                                               \
+  }();                                                                         \
+  }
 
 #define REGISTER_MODEL_BACKEND_WITH_VARNAME(VarName, ModelType, Backend) \
   const bool VarName##_backend_registered = []() {                       \

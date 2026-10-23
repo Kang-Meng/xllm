@@ -94,7 +94,9 @@ void DiTMaster::handle_request(DiTRequestParams params,
 
     Timer timer;
     Status parse_status;
-    if (!params.parse_input_params(parse_status)) {
+    const bool preserve_image_alpha = ModelRegistry::get_preserve_image_alpha(
+        engine_->model_args().model_type());
+    if (!params.parse_input_params(parse_status, preserve_image_alpha)) {
       callback(DiTRequestOutput(std::move(parse_status)));
       return;
     }

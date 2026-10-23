@@ -23,6 +23,7 @@ limitations under the License.
 #include "dit/pipelines/pipeline_joyimage_edit_plus.h"   // IWYU pragma: keep
 #include "dit/pipelines/pipeline_joyo_v2.h"              // IWYU pragma: keep
 #include "dit/pipelines/pipeline_minimax_h3.h"           // IWYU pragma: keep
+#include "dit/pipelines/pipeline_qwenimage_21.h"         // IWYU pragma: keep
 #include "dit/pipelines/pipeline_qwenimage_edit_plus.h"  // IWYU pragma: keep
 #include "dit/pipelines/pipeline_wan_i2v.h"              // IWYU pragma: keep
 #include "llm/deepseek_v4.h"                             // IWYU pragma: keep

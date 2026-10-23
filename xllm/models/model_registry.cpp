@@ -383,6 +383,17 @@ void ModelRegistry::register_tokenizer_args_loader(const std::string& name,
   }
 }
 
+void ModelRegistry::register_preserve_image_alpha(const std::string& name,
+                                                  bool enabled) {
+  get_instance()->model_registry_[name].preserve_image_alpha = enabled;
+}
+
+bool ModelRegistry::get_preserve_image_alpha(const std::string& name) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(name);
+  return it != registry.end() && it->second.preserve_image_alpha;
+}
+
 void ModelRegistry::register_cp_sharding_mode(const std::string& name,
                                               CpShardingMode mode) {
   ModelRegistry* instance = get_instance();

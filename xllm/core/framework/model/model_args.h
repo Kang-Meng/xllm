@@ -638,6 +638,12 @@ struct ModelArgs {
   PROPERTY(float, batch_norm_momentum) = 0.1f;
   PROPERTY(std::vector<int64_t>, ae_patch_size) = {};
 
+  // Qwen-Image-2.1 component-specific configuration.
+  PROPERTY(int64_t, context_in_dim) = 4096;
+  PROPERTY(bool, causal_condition) = true;
+  PROPERTY(bool, causal_block) = true;
+  PROPERTY(int64_t, decoder_base_dim) = 144;
+
   // dit related args
   PROPERTY(int64_t, joint_attention_dim) = 0;
   PROPERTY(int64_t, pooled_projection_dim) = 0;

@@ -26,8 +26,10 @@ limitations under the License.
 
 namespace xllm {
 
-DiTSourceDecoder::DiTSourceDecoder(const BinaryPayload& request_payload)
-    : request_payload_(request_payload) {}
+DiTSourceDecoder::DiTSourceDecoder(const BinaryPayload& request_payload,
+                                   bool preserve_image_alpha)
+    : request_payload_(request_payload),
+      preserve_image_alpha_(preserve_image_alpha) {}
 
 ThreadPool& DiTSourceDecoder::thread_pool() {
   static ThreadPool thread_pool(/*num_threads=*/8,
@@ -139,7 +141,7 @@ bool DiTSourceDecoder::decode(std::vector<MediaNamedTensor>& outputs,
     }
     if (modality == "image") {
       OpenCVImageDecoder decoder;
-      return decoder.decode(raw_bytes, tensor);
+      return decoder.decode(raw_bytes, tensor, preserve_image_alpha_);
     }
     return false;
   };

@@ -157,7 +157,8 @@ DiTRequestParams::DiTRequestParams(const proto::VideoGenerationRequest& request,
   }
 }
 
-bool DiTRequestParams::parse_input_params(Status& status) {
+bool DiTRequestParams::parse_input_params(Status& status,
+                                          bool preserve_image_alpha) {
   if (std::holds_alternative<std::monostate>(raw_input_params.input)) {
     return true;
   }
@@ -168,8 +169,11 @@ bool DiTRequestParams::parse_input_params(Status& status) {
   }
 
   DiTInputParams parsed_input_params;
-  if (!parser_->parse_input(
-          raw_input_params, generation_params, parsed_input_params, status)) {
+  if (!parser_->parse_input(raw_input_params,
+                            generation_params,
+                            parsed_input_params,
+                            status,
+                            preserve_image_alpha)) {
     return false;
   }
 

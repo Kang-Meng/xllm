@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -26,8 +27,10 @@ limitations under the License.
 
 #include "audio_generation.pb.h"
 #include "butil/base64.h"
+#include "core/framework/multimodal/mm_codec.h"
 #include "core/util/binary_payload.h"
 #include "image_generation.pb.h"
+#include "models/model_registry.h"
 #include "text_generation.pb.h"
 #include "video_generation.pb.h"
 
@@ -1126,5 +1129,149 @@ TEST(DiTGenerationParamsEqualityTest, DifferentRepetitionPenaltyAreNotEqual) {
   EXPECT_NE(a, b);
 }
 
+}  // namespace
+}  // namespace xllm
+
+namespace xllm {
+namespace {
+// Keep decoder tests independent of which model backends were built.
+REGISTER_IMAGE_ALPHA_POLICY(TestRgbaPipeline, true);
+
+DiTRequestParams parse_model_image_request(
+    const proto::ImageGenerationRequest& request,
+    const std::string& rid,
+    const std::string& rtime,
+    const std::string& model_type = "TestRgbaPipeline") {
+  DiTRequestParams params(request, rid, rtime);
+  Status status;
+  params.parse_input_params(
+      status, ModelRegistry::get_preserve_image_alpha(model_type));
+  params.request_parse_status = status;
+  return params;
+}
+
+proto::ImageGenerationRequest make_qwen_image_21_request(int64_t length = 2) {
+  proto::ImageGenerationRequest request;
+  request.set_model("QwenImage21Pipeline");
+  auto* embed = request.mutable_input()->mutable_prompt_embed();
+  embed->set_datatype("FP32");
+  embed->add_shape(length);
+  embed->add_shape(4096);
+  for (int64_t i = 0; i < length * 4096; ++i) {
+    embed->mutable_contents()->add_fp32_contents(0.0f);
+  }
+  return request;
+}
+
+TEST(DiTRequestParamsTest, QwenImage21DoesNotApplyModelAdmissionRules) {
+  auto request = make_qwen_image_21_request();
+  request.mutable_parameters()->set_size("33*32");
+  request.mutable_parameters()->set_true_cfg_scale(4.0f);
+  auto params = parse_model_image_request(request, "rid", "time");
+  ASSERT_TRUE(params.request_parse_status.ok());
+  // Model constraints are enforced by the pipeline, not the transport parser.
+  Status status;
+  EXPECT_TRUE(params.verify_params(status));
+  EXPECT_EQ(params.generation_params.width, 33);
+  EXPECT_FALSE(
+      params.input_params.tensor_sources.contains("negative_prompt_embed"));
+}
+
+TEST(DiTRequestParamsTest, QwenImage21PreservesClientTensorShapes) {
+  for (bool client_batch : {false, true}) {
+    auto request = make_qwen_image_21_request();
+    request.mutable_parameters()->set_size("32*32");
+    auto* embedding = request.mutable_input()->mutable_prompt_embed();
+    embedding->clear_shape();
+    auto* latent = request.mutable_input()->mutable_latent();
+    latent->set_datatype("FP32");
+    if (client_batch) {
+      embedding->add_shape(1);
+      latent->add_shape(1);
+    }
+    embedding->add_shape(2);
+    embedding->add_shape(4096);
+    latent->add_shape(4);
+    latent->add_shape(64);
+    for (int64_t i = 0; i < 4 * 64; ++i) {
+      latent->mutable_contents()->add_fp32_contents(0.0f);
+    }
+    (*embedding->mutable_parameters())["enable_prefix_kv_cache"].set_bool_param(
+        false);
+    auto params = parse_model_image_request(request, "rid", "time");
+    ASSERT_TRUE(params.request_parse_status.ok());
+    const auto parsed_embedding =
+        params.input_params.tensor_sources.get("prompt_embed");
+    const auto parsed_latent = params.input_params.tensor_sources.get("latent");
+    ASSERT_TRUE(parsed_embedding.has_value());
+    ASSERT_TRUE(parsed_latent.has_value());
+    EXPECT_EQ(parsed_embedding->dim(), client_batch ? 3 : 2);
+    EXPECT_EQ(parsed_latent->dim(), client_batch ? 3 : 2);
+    const auto named_embedding =
+        params.input_params.tensor_sources.get_named_tensor("prompt_embed");
+    ASSERT_TRUE(named_embedding.has_value());
+    EXPECT_FALSE(std::get<bool>(
+        named_embedding->get().parameters.at("enable_prefix_kv_cache")));
+  }
+}
+
+TEST(DiTRequestParamsTest, QwenImage21LeavesEmptyNegativePromptForPipeline) {
+  auto request = make_qwen_image_21_request();
+  request.mutable_input()->clear_prompt_embed();
+  request.mutable_input()->set_prompt("draw a cat");
+  request.mutable_parameters()->set_true_cfg_scale(4.0f);
+  auto params = parse_model_image_request(request, "rid", "time");
+  ASSERT_TRUE(params.request_parse_status.ok());
+  EXPECT_EQ(params.input_params.prompt, "draw a cat");
+  EXPECT_TRUE(params.input_params.negative_prompt.empty());
+  Status status;
+  EXPECT_TRUE(params.verify_params(status));
+}
+
+TEST(DiTRequestParamsTest,
+     QwenImage21PreservesAlphaWithoutInferringOutputSize) {
+  OpenCVImageEncoder encoder;
+  auto rgba = torch::zeros({4, 32, 32}, torch::kFloat32);
+  rgba[0].fill_(1.0f);
+  rgba[3].fill_(0.25f);
+  std::string png;
+  ASSERT_TRUE(encoder.encode(rgba, png));
+  OpenCVImageDecoder decoder;
+  torch::Tensor roundtrip, legacy_rgb;
+  ASSERT_TRUE(decoder.decode(png, roundtrip, /*preserve_alpha=*/true));
+  ASSERT_EQ(roundtrip.size(0), 4);
+  EXPECT_EQ(roundtrip[3][0][0].item<int64_t>(), 64);
+  ASSERT_TRUE(decoder.decode(png, legacy_rgb));
+  EXPECT_EQ(legacy_rgb.size(0), 3);
+  EXPECT_EQ(legacy_rgb[1][0][0].item<int64_t>(), 191);
+
+  auto request = make_qwen_image_21_request(3);
+  request.set_model("my-image-service");
+  std::string encoded;
+  butil::Base64Encode(png, &encoded);
+  request.mutable_input()->add_images(encoded);
+  auto* parameters =
+      request.mutable_input()->mutable_prompt_embed()->mutable_parameters();
+  for (int64_t bit : {0, 1, 0}) {
+    (*parameters)["image_pad_mask"].add_int64_tensor_param(bit);
+  }
+  (*parameters)["input_image_sizes"].add_int64_tensor_param(32);
+  (*parameters)["input_image_sizes"].add_int64_tensor_param(32);
+  auto params = parse_model_image_request(request, "rid", "time");
+  ASSERT_TRUE(params.request_parse_status.ok())
+      << params.request_parse_status.message();
+  const auto& image = params.input_params.media_sources.at(0).tensor;
+  EXPECT_EQ(image.sizes(), (torch::IntArrayRef{4, 32, 32}));
+  EXPECT_EQ(image[3][0][0].item<int64_t>(), 64);
+  EXPECT_EQ(params.generation_params.width, 512);
+  EXPECT_EQ(params.generation_params.height, 512);
+
+  auto rgb_params = parse_model_image_request(
+      request, "rid", "time", "UnregisteredRgbPipeline");
+  ASSERT_TRUE(rgb_params.request_parse_status.ok());
+  const auto& rgb = rgb_params.input_params.media_sources.at(0).tensor;
+  EXPECT_EQ(rgb.sizes(), (torch::IntArrayRef{3, 32, 32}));
+  EXPECT_EQ(rgb[1][0][0].item<int64_t>(), 191);
+}
 }  // namespace
 }  // namespace xllm

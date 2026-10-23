@@ -26,6 +26,18 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(ModelRegistryTest, ImageAlphaPolicyDefaultsToFalse) {
+  EXPECT_FALSE(ModelMeta{}.preserve_image_alpha);
+  EXPECT_FALSE(ModelRegistry::get_preserve_image_alpha("unknown_alpha_policy"));
+  EXPECT_FALSE(
+      ModelRegistry::get_preserve_image_alpha("QwenImageEditPlusPipeline"));
+}
+
+TEST(ModelRegistryTest, QwenImage21RegistersImageAlphaPolicy) {
+  ASSERT_TRUE(ModelRegistry::has_dit_model_factory("QwenImage21Pipeline"));
+  EXPECT_TRUE(ModelRegistry::get_preserve_image_alpha("QwenImage21Pipeline"));
+}
+
 TEST(ModelRegistryTest, DeepseekV4DSparkUsesTorchBackend) {
   std::string effective_backend;
   std::string resolved_name;

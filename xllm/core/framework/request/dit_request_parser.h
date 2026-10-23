@@ -43,10 +43,12 @@ class DiTRequestParser {
   virtual bool parse_parameters(const DiTParametersProto& parameters,
                                 DiTGenerationParams& generation_params,
                                 Status& status) const = 0;
+  // Only image parsing uses the model-selected alpha policy.
   virtual bool parse_input(const DiTRawInputParams& raw_input_params,
                            const DiTGenerationParams& generation_params,
                            DiTInputParams& input_params,
-                           Status& status) const = 0;
+                           Status& status,
+                           bool preserve_image_alpha = false) const = 0;
 
   virtual bool verify_params(const DiTGenerationParams& generation_params,
                              Status& status) const = 0;
@@ -60,7 +62,8 @@ class ImageRequestParser final : public DiTRequestParser {
   bool parse_input(const DiTRawInputParams& raw_input_params,
                    const DiTGenerationParams& generation_params,
                    DiTInputParams& input_params,
-                   Status& status) const override;
+                   Status& status,
+                   bool preserve_image_alpha = false) const override;
   bool verify_params(const DiTGenerationParams& generation_params,
                      Status& status) const override;
 };
@@ -73,7 +76,8 @@ class AudioRequestParser final : public DiTRequestParser {
   bool parse_input(const DiTRawInputParams& raw_input_params,
                    const DiTGenerationParams& generation_params,
                    DiTInputParams& input_params,
-                   Status& status) const override;
+                   Status& status,
+                   bool preserve_image_alpha = false) const override;
   bool verify_params(const DiTGenerationParams& generation_params,
                      Status& status) const override;
 };
@@ -86,7 +90,8 @@ class VideoRequestParser final : public DiTRequestParser {
   bool parse_input(const DiTRawInputParams& raw_input_params,
                    const DiTGenerationParams& generation_params,
                    DiTInputParams& input_params,
-                   Status& status) const override;
+                   Status& status,
+                   bool preserve_image_alpha = false) const override;
   bool verify_params(const DiTGenerationParams& generation_params,
                      Status& status) const override;
 };
@@ -99,7 +104,8 @@ class TextRequestParser final : public DiTRequestParser {
   bool parse_input(const DiTRawInputParams& raw_input_params,
                    const DiTGenerationParams& generation_params,
                    DiTInputParams& input_params,
-                   Status& status) const override;
+                   Status& status,
+                   bool preserve_image_alpha = false) const override;
   bool verify_params(const DiTGenerationParams& generation_params,
                      Status& status) const override;
 };
