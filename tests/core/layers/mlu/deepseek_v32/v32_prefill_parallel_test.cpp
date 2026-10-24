@@ -32,6 +32,7 @@ limitations under the License.
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -740,6 +741,7 @@ struct PrefillCase {
   Topology topology;
   Shape shape;
   std::string name;
+  bool check_shared = false;
 };
 
 ::testing::AssertionResult bf16_output_close(const torch::Tensor& actual,
@@ -1459,6 +1461,29 @@ void run_prefill_case(const PrefillCase& config,
         << "Every reference token must carry a nonzero signal";
     EXPECT_TRUE(bf16_output_close(actual, fixed_output))
         << "Fixed actual-selection output engineering guard";
+    if (config.check_shared && prefix > 0) {
+      DeepseekV32Attention shared(context, /*enable_indexer=*/false);
+      shared->load_state_dict(weights);
+      shared->verify_loaded_weights();
+      KVCache shared_cache = create_indexed_kv_cache(
+          cache.get_k_cache().clone(), cache.get_index_cache().clone());
+      const torch::Tensor shared_index = shared_cache.get_index_cache().clone();
+      auto reused = DsaTopkTransfer::reuse(*transfer.output());
+      const torch::Tensor shared_output =
+          restore_output(shared->forward(local_positions,
+                                         local_input,
+                                         metadata,
+                                         shared_cache,
+                                         cp ? &cp.value() : nullptr,
+                                         &reused),
+                         cp,
+                         groups.tp.get());
+      EXPECT_TRUE(bf16_output_close(shared_output, fixed_output))
+          << "Shared CP+DCP attention versus fixed-selection reference";
+      EXPECT_TRUE(
+          torch::equal(shared_cache.get_k_cache(), cache.get_k_cache()));
+      EXPECT_TRUE(torch::equal(shared_cache.get_index_cache(), shared_index));
+    }
 
     torch::Tensor projected = query_projection(input);
     const torch::Tensor normalized = std::get<0>(query_norm(projected));
@@ -1708,6 +1733,256 @@ void run_prefill_cases(const std::vector<PrefillCase>& cases) {
     EXPECT_EQ(children_ok, true)
         << "forked ranks failed, timed out, or require more physical MLU cards";
   }
+}
+
+void check_packed_values(const torch::Tensor& actual,
+                         const torch::Tensor& expected,
+                         const std::string& label) {
+  const torch::Tensor a = actual.cpu().to(torch::kFloat32);
+  const torch::Tensor b = expected.cpu().to(torch::kFloat32);
+  ASSERT_EQ(a.sizes(), b.sizes()) << label;
+  ASSERT_TRUE(torch::equal(torch::isfinite(a), torch::isfinite(b))) << label;
+  ASSERT_TRUE(torch::equal(torch::isneginf(a), torch::isneginf(b))) << label;
+  ASSERT_TRUE(torch::equal(torch::isposinf(a), torch::isposinf(b))) << label;
+  ASSERT_FALSE(torch::isnan(a).any().item<bool>()) << label;
+  const torch::Tensor finite = torch::isfinite(b);
+  const torch::Tensor av = a.masked_select(finite);
+  const torch::Tensor bv = b.masked_select(finite);
+  ASSERT_TRUE(torch::allclose(av, bv, /*rtol=*/1e-2, /*atol=*/1e-3)) << label;
+  const float error =
+      av.numel() > 0 ? (av - bv).abs().max().item<float>() : 0.0f;
+  LOG(INFO) << label << " bitwise_equal=" << torch::equal(a, b)
+            << " max_abs_error=" << error;
+}
+
+std::pair<torch::Tensor, torch::Tensor> packed_local_attention(
+    torch::Tensor query,
+    const DsaTopkState& topk,
+    torch::Tensor key_cache) {
+  Attention attention(/*num_heads=*/32,
+                      /*head_size=*/576,
+                      /*num_kv_heads=*/1,
+                      /*v_head_dim=*/512,
+                      /*sliding_window=*/-1,
+                      /*scale=*/0.0625f,
+                      /*use_fused_mla_qkv=*/true,
+                      /*enable_lighting_indexer=*/true,
+                      /*enable_mla=*/true);
+  AttentionMetadata metadata{};
+  metadata.is_chunked_prefill = true;
+  metadata.compute_dtype = "half";
+  metadata.max_seq_len = 2048;
+  metadata.block_table = topk.block_tables();
+  metadata.kv_seq_lens = topk.context_lens();
+  KVCache cache(KVCacheTensors{std::move(key_cache), torch::Tensor()});
+  torch::Tensor unused;
+  auto [output, lse] = attention(metadata,
+                                 query,
+                                 unused,
+                                 unused,
+                                 cache,
+                                 /*return_lse=*/true);
+  CHECK(lse.has_value());
+  return {output.view({query.size(0), 1, 32, 512}), lse.value()};
+}
+
+void check_sparse_reference(const torch::Tensor& output,
+                            const torch::Tensor& query,
+                            const torch::Tensor& full_cache,
+                            const DsaTopkState& topk,
+                            const torch::Tensor& slots) {
+  const torch::Tensor values =
+      full_cache.cpu().view({512, 576}).to(torch::kFloat64);
+  const torch::Tensor q = query.cpu().to(torch::kFloat64);
+  const torch::Tensor table = topk.block_tables().cpu().to(torch::kInt64);
+  const torch::Tensor lengths = topk.context_lens().cpu();
+  const torch::Tensor mapping = slots.cpu();
+  const torch::Tensor result = output.cpu().view({query.size(0), 32, 512});
+  for (int64_t row : {int64_t{0},
+                      int64_t{1},
+                      int64_t{3},
+                      int64_t{4},
+                      int64_t{15},
+                      int64_t{31},
+                      query.size(0) - 2,
+                      query.size(0) - 1}) {
+    const int64_t length = lengths[row].item<int32_t>();
+    torch::Tensor expected = torch::zeros({32, 512}, torch::kFloat64);
+    if (length > 0 && mapping[row].item<int32_t>() >= 0) {
+      const torch::Tensor keys =
+          values.index_select(0, table[row].narrow(0, 0, length));
+      const torch::Tensor scores =
+          torch::matmul(q[row], keys.transpose(0, 1)) * 0.0625;
+      expected =
+          torch::matmul(torch::softmax(scores, -1), keys.narrow(1, 0, 512));
+    }
+    check_packed_values(result[row],
+                        expected,
+                        "FP64 sparse reference row=" + std::to_string(row));
+  }
+}
+
+void run_packed_chain(int32_t rank, int32_t port) {
+  torch::NoGradGuard no_grad;
+  torch::set_num_threads(1);
+  Device device(rank);
+  device.set_device();
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
+  auto groups = create_cp_tp_groups(rank,
+                                    /*world_size=*/8,
+                                    /*cp_size=*/4,
+                                    port,
+                                    "127.0.0.1",
+                                    device.unwrap());
+  const int32_t shard_rank = groups.cp->rank();
+  DcpDecodeContext dcp(KVShardLayout(/*physical_block_size=*/16,
+                                     /*dcp_size=*/4,
+                                     shard_rank),
+                       groups.cp.get());
+  for (const std::vector<int32_t>& lengths : {std::vector<int32_t>{64},
+                                              std::vector<int32_t>{33, 34},
+                                              std::vector<int32_t>{8192}}) {
+    const int32_t rows =
+        std::accumulate(lengths.begin(), lengths.end(), int32_t{0});
+    SCOPED_TRACE("rank=" + std::to_string(rank) +
+                 " rows=" + std::to_string(rows));
+    const auto segments = v32_cp::build_all_cp_segments(4, lengths, lengths);
+    const auto artifacts =
+        v32_cp::build_cp_runtime_artifacts(shard_rank, 4, segments, rows);
+    v32_cp::DeepseekV32CPContext cp;
+    cp.rank = shard_rank;
+    cp.total_tokens = rows;
+    cp.process_group = groups.cp.get();
+    cp.comm_plan = artifacts.comm_plan;
+    cp.gathered_reorder_index =
+        torch::tensor(artifacts.gathered_reorder_index_cpu, torch::kInt64)
+            .to(device.unwrap());
+    torch::manual_seed(530053);
+    const torch::Tensor query =
+        (torch::randn({rows, 32, 576}, torch::kFloat32) * 0.1).to(options);
+    const torch::Tensor full_cache =
+        (torch::randn({32, 1, 16, 576}, torch::kFloat32) * 0.1).to(options);
+    const torch::Tensor cache = full_cache.view({8, 4, 16, 576})
+                                    .select(1, shard_rank)
+                                    .contiguous()
+                                    .view({8, 1, 16, 576});
+    const auto ints = torch::TensorOptions().dtype(torch::kInt32);
+    const torch::Tensor indices = torch::arange(rows, ints);
+    torch::Tensor table =
+        (indices.unsqueeze(1) * 17 + torch::arange(2048, ints) * 7)
+            .remainder(512);
+    torch::Tensor lens = indices.remainder(193);
+    table[1].copy_(torch::arange(2048, ints).remainder(16));
+    lens[1].fill_(8);
+    torch::Tensor slots = indices.clone();
+    slots[3].fill_(-1);
+    slots[rows - 1].fill_(-1);
+    table = table.to(device.unwrap());
+    lens = lens.to(device.unwrap());
+    slots = slots.to(device.unwrap());
+    cp.gathered_slot_mapping = slots.index_select(0, cp.gathered_reorder_index);
+    const DsaTopkState global_topk(table, lens);
+    const DsaTopkState local_topk(v32_cp::reorder_to_local_shard(table, cp),
+                                  v32_cp::reorder_to_local_shard(lens, cp));
+    const torch::Tensor local_q = v32_cp::reorder_to_local_shard(query, cp);
+    const torch::Tensor original_q =
+        v32_cp::gather_and_restore_global(local_q, cp);
+    const DsaTopkState original_topk(
+        v32_cp::gather_and_restore_global(local_topk.block_tables(), cp),
+        v32_cp::gather_and_restore_global(local_topk.context_lens(), cp));
+    const torch::Tensor packed_q = v32_cp::all_gather_across_ranks(local_q, cp);
+    const DsaTopkState packed_topk(
+        v32_cp::all_gather_across_ranks(local_topk.block_tables(), cp),
+        v32_cp::all_gather_across_ranks(local_topk.context_lens(), cp));
+    EXPECT_TRUE(torch::equal(packed_q,
+                             query.index_select(0, cp.gathered_reorder_index)));
+    EXPECT_TRUE(torch::equal(original_q, query));
+    const DsaTopkState original_local = dcp.localize_topk(original_topk);
+    const DsaTopkState packed_local = dcp.localize_topk(packed_topk);
+    EXPECT_TRUE(torch::equal(packed_local.block_tables(),
+                             original_local.block_tables().index_select(
+                                 0, cp.gathered_reorder_index)));
+    EXPECT_TRUE(torch::equal(packed_local.context_lens(),
+                             original_local.context_lens().index_select(
+                                 0, cp.gathered_reorder_index)));
+    auto [original_output, original_lse] =
+        packed_local_attention(original_q, original_local, cache);
+    auto [packed_output, packed_lse] =
+        packed_local_attention(packed_q, packed_local, cache);
+    check_packed_values(
+        packed_output,
+        original_output.index_select(0, cp.gathered_reorder_index),
+        "local attention rows=" + std::to_string(rows));
+    check_packed_values(packed_lse,
+                        original_lse.index_select(0, cp.gathered_reorder_index),
+                        "local LSE rows=" + std::to_string(rows));
+    const torch::Tensor original_merged =
+        dcp.merge(original_output, original_lse, slots, /*head_sharded=*/false);
+    const torch::Tensor packed_merged = dcp.merge(packed_output,
+                                                  packed_lse,
+                                                  cp.gathered_slot_mapping,
+                                                  /*head_sharded=*/false);
+    check_packed_values(
+        packed_merged,
+        original_merged.index_select(0, cp.gathered_reorder_index),
+        "merged attention rows=" + std::to_string(rows));
+    check_packed_values(v32_cp::slice_local_packed(packed_merged, cp),
+                        v32_cp::reorder_to_local_shard(original_merged, cp),
+                        "local slice rows=" + std::to_string(rows));
+    check_sparse_reference(
+        original_merged, query, full_cache, global_topk, slots);
+  }
+}
+
+TEST(PackedAttentionParallelTest, EightRanksMatchGlobalOrderAndFp64Reference) {
+  constexpr int32_t kRanks = 8;
+  const int32_t port = parallel_base_port(kRanks, /*cp_size=*/4);
+  const int32_t initial_parts = ::testing::UnitTest::GetInstance()
+                                    ->current_test_info()
+                                    ->result()
+                                    ->total_part_count();
+  std::vector<pid_t> pids;
+  pids.reserve(kRanks);
+  for (int32_t rank = 0; rank < kRanks; ++rank) {
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+      try {
+        if (Platform::device_count() < kRanks) {
+          ::_exit(77);
+        }
+        run_packed_chain(rank, port);
+        std::fflush(nullptr);
+        ::_exit(child_failed(initial_parts) ? 1 : 0);
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "Packed attention rank " << rank << ": " << error.what();
+        ::_exit(1);
+      }
+    }
+    if (pid < 0) {
+      stop_ranks(pids, std::vector<bool>(pids.size(), false));
+      FAIL() << "fork failed: " << std::strerror(errno);
+    }
+    pids.emplace_back(pid);
+  }
+  bool skipped = false;
+  ASSERT_TRUE(wait_ranks(pids, std::chrono::milliseconds{300000}, skipped));
+  ASSERT_FALSE(skipped) << "Eight physical MLU devices are required";
+}
+
+TEST(PackedAttentionParallelTest, FullAndSharedHistoryMatchSingleRank) {
+  run_prefill_cases({
+      {DsaModelVariant::GLM5,
+       Topology::CP4TP2DCP4,
+       Shape::CHUNKS,
+       "Glm5_CP4TP2DCP4_PackedShared",
+       true},
+      {DsaModelVariant::GLM5,
+       Topology::CPTPDCP4,
+       Shape::CHUNKS,
+       "Glm5_CP2TP2DCP4_PackedShared",
+       true},
+  });
 }
 
 TEST(AttentionPrefillParallelTest,

@@ -190,23 +190,24 @@ torch::Tensor DeepseekV32AttentionImpl::forward_cp(
 
   torch::Tensor attn_output_local;
   if (use_dcp && attn_metadata.is_chunked_prefill) {
-    torch::Tensor gathered_q =
-        v32_cp::gather_and_restore_global(mla_inputs.q_input, cp_ctx);
+    torch::Tensor packed_q =
+        v32_cp::all_gather_across_ranks(mla_inputs.q_input, cp_ctx);
     DsaTopkState gathered_topk(
-        v32_cp::gather_and_restore_global(topk_state->block_tables(), cp_ctx),
-        v32_cp::gather_and_restore_global(topk_state->context_lens(), cp_ctx));
+        v32_cp::all_gather_across_ranks(topk_state->block_tables(), cp_ctx),
+        v32_cp::all_gather_across_ranks(topk_state->context_lens(), cp_ctx));
     DsaTopkState gathered_local_topk =
         dcp_decode_context_->localize_topk(gathered_topk);
-    auto query_gather = launch_dcp_query(gathered_q);
-    torch::Tensor global_output =
-        run_dcp_chunked_prefill_attention(gathered_q,
+    auto query_gather = launch_dcp_query(packed_q);
+    // Query rows, top-k rows and merge padding slots share the CP rank order.
+    torch::Tensor packed_output =
+        run_dcp_chunked_prefill_attention(packed_q,
                                           gathered_local_topk,
                                           query_gather,
                                           kv_cache,
                                           attn_metadata,
-                                          attn_metadata.slot_mapping)
+                                          cp_ctx.gathered_slot_mapping)
             .view({cp_ctx.total_tokens, local_heads() * kv_lora_rank_});
-    attn_output_local = v32_cp::reorder_to_local_shard(global_output, cp_ctx);
+    attn_output_local = v32_cp::slice_local_packed(packed_output, cp_ctx);
   } else if (use_dcp) {
     torch::Tensor k_cache = kv_cache.get_k_cache();
     torch::Tensor mapped_blocks;

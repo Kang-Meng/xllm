@@ -230,7 +230,7 @@ torch::Tensor DeepseekV32AttentionImpl::run_dcp_chunked_prefill_attention(
     std::optional<parallel_state::GatherAsyncCtx>& query_gather,
     KVCache& kv_cache,
     const AttentionMetadata& local_cache_metadata,
-    const torch::Tensor& global_slot_mapping) {
+    const torch::Tensor& query_slot_mapping) {
   CHECK(dcp_decode_context_ != nullptr);
   const int64_t heads = local_heads();
   AttentionMetadata local_metadata =
@@ -256,12 +256,12 @@ torch::Tensor DeepseekV32AttentionImpl::run_dcp_chunked_prefill_attention(
   const bool head_sharded =
       gathers_tp_heads &&
       tp_group_->world_size() == dcp_decode_context_->world_size();
-  // Only the global mapping marks graph-padding rows. The localized mapping
-  // contains -1 for valid queries whose KV slots belong to another DCP rank.
+  // Global slot addresses in query row order distinguish padding from valid
+  // queries whose KV slots belong to another DCP rank.
   torch::Tensor merged_output = dcp_decode_context_->merge(
       local_output.view({q_input.size(0), 1, attention_heads, kv_lora_rank_}),
       local_lse.value(),
-      global_slot_mapping,
+      query_slot_mapping,
       /*head_sharded=*/head_sharded);
   if (!gathers_tp_heads) {
     return merged_output;

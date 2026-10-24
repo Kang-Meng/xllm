@@ -225,7 +225,7 @@ class DeepseekV32AttentionImpl : public torch::nn::Module {
       std::optional<parallel_state::GatherAsyncCtx>& query_gather,
       KVCache& kv_cache,
       const AttentionMetadata& local_cache_metadata,
-      const torch::Tensor& global_slot_mapping);
+      const torch::Tensor& query_slot_mapping);
 
   // Resolves the rank-local projection of the global top-k for the DCP
   // local-KV paths. Reuses the forward-scoped view relayed by the transfer
