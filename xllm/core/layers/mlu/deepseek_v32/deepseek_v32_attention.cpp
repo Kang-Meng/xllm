@@ -19,7 +19,6 @@ limitations under the License.
 
 #include "core/framework/config/kv_cache_config.h"
 #include "kernels/ops_api.h"
-#include "platform/platform.h"
 
 namespace xllm {
 namespace layer {
@@ -77,16 +76,6 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
     dcp_spans_tp_ =
         parallel_args.dcp_group_->world_size() > parallel_args.cp_size();
   }
-  // Attention weights are replicated (each rank computes all heads) only when
-  // there is no tensor-parallel dimension to shard heads across (world == cp)
-  // or when the DCP KV-split path (which assumes full heads) is active.
-  // Otherwise, when CP x TP are orthogonal (world > cp), context-parallel
-  // attention TP-shards the heads: each rank computes heads / tp_size on its
-  // local sequence shard and a TP all-reduce merges the head shards.
-  use_full_replicated_attention_weights_ =
-      parallel_args.cp_size() > 1 && Platform::uses_model_cp_sharding() &&
-      (parallel_args.world_size() == parallel_args.cp_size() ||
-       parallel_args.kv_split_size_effective() > 1);
   const int64_t tp_size = parallel_args.tp_group_->world_size();
   int64_t hidden_size = args.hidden_size();
   int64_t num_heads = args.n_heads();
@@ -99,11 +88,6 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
   full_heads_ = num_heads;
   float scaling = std::pow(qk_head_dim_, -0.5f);
 
-  ProcessGroup* weight_group =
-      use_replicated_attn_weights() &&
-              parallel_args.single_rank_group_ != nullptr
-          ? parallel_args.single_rank_group_
-          : parallel_args.tp_group_;
   const LinearExtraArgs attention_linear_extra_args("none", false);
   // Expert grouping does not describe attention precision. SmoothQuant uses
   // mixed BF16/INT8 projections; compressed-tensors resolves each module from
@@ -122,7 +106,7 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
                                              /*bias=*/false,
                                              /*gather_output=*/false,
                                              quant_args,
-                                             weight_group,
+                                             tp_group_,
                                              options,
                                              attention_linear_extra_args));
   } else {
@@ -133,7 +117,7 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
                                              /*bias=*/false,
                                              /*gather_output=*/false,
                                              quant_args,
-                                             weight_group,
+                                             tp_group_,
                                              options,
                                              attention_linear_extra_args));
   }
@@ -154,7 +138,7 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
                            /*bias=*/false,
                            /*gather_output=*/false,
                            QuantArgs(),
-                           weight_group,
+                           tp_group_,
                            options,
                            attention_linear_extra_args));
 
@@ -227,7 +211,7 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
   }
 
   attn_ = register_module("attn",
-                          Attention(active_heads(),
+                          Attention(local_heads(),
                                     kv_lora_rank_ + qk_rope_head_dim_,
                                     /*num_local_heads=*/1,
                                     kv_lora_rank_,
@@ -236,7 +220,7 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
                                     use_fused_mla_qkv_,
                                     enable_lighting_indexer_,
                                     args.enable_mla()));
-  if (dcp_spans_tp_ && !use_replicated_attn_weights()) {
+  if (dcp_spans_tp_) {
     dcp_full_head_attn_ =
         register_module("dcp_full_head_attn",
                         Attention(full_heads(),
@@ -250,16 +234,18 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
                                   args.enable_mla()));
   }
 
-  o_proj_ = register_module("o_proj",
-                            RowParallelLinear(full_heads() * v_head_dim_,
-                                              hidden_size,
-                                              /*bias=*/false,
-                                              /*input_is_parallelized=*/true,
-                                              /*reduce=*/false,
-                                              quant_args,
-                                              weight_group,
-                                              options,
-                                              attention_linear_extra_args));
+  o_proj_ = register_module(
+      "o_proj",
+      RowParallelLinear(full_heads() * v_head_dim_,
+                        hidden_size,
+                        /*bias=*/false,
+                        /*input_is_parallelized=*/true,
+                        /*reduce=*/false,
+                        quant_args,
+                        tp_group_,
+                        options,
+                        attention_linear_extra_args,
+                        /*share_token_scale=*/parallel_args.cp_size() > 1));
 }
 
 DeepseekV32AttentionImpl::QueryPrep DeepseekV32AttentionImpl::prep_query(
@@ -363,7 +349,7 @@ void DeepseekV32AttentionImpl::prepare_mla_query_side(
     const AttentionMetadata& attn_metadata,
     bool enable_fused_qkv,
     bool use_prompt_rope) {
-  const int64_t heads = active_heads();
+  const int64_t heads = local_heads();
   if (!enable_fused_qkv) {
     auto query_prep = prep_query(hidden_states, heads);
     q = query_prep.q;
@@ -589,8 +575,7 @@ DeepseekV32AttentionImpl::ForwardResult DeepseekV32AttentionImpl::forward(
                                   kv_cache,
                                   is_prefill_or_chunked_prefill,
                                   topk_transfer),
-      .layout = use_replicated_attn_weights() ? PostAttnLayout::REPLICATED
-                                              : PostAttnLayout::TP_SHARD,
+      .layout = PostAttnLayout::TP_SHARD,
   };
 }
 
@@ -610,7 +595,7 @@ torch::Tensor DeepseekV32AttentionImpl::forward_normal_tp(
                        topk_transfer);
   }
 
-  const int64_t heads = active_heads();
+  const int64_t heads = local_heads();
   torch::Tensor q;
   torch::Tensor q_norm;
   torch::Tensor q_input = torch::empty(

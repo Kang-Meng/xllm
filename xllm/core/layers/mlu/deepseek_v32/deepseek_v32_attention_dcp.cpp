@@ -34,24 +34,6 @@ inline bool needs_local_topk_view(bool enable_dcp_decode,
   return enable_dcp_chunked_prefill || enable_dcp_decode;
 }
 
-inline bool needs_tp_query_gather(bool dcp_spans_tp,
-                                  bool enable_dcp_decode,
-                                  bool enable_dcp_chunked_prefill) {
-  return dcp_spans_tp && (enable_dcp_chunked_prefill || enable_dcp_decode);
-}
-
-parallel_state::GatherAsyncCtx launch_tp_query_gather(
-    const torch::Tensor& q_input,
-    ProcessGroup* tp_group) {
-  parallel_state::GatherAsyncCtx ctx;
-  ctx.input = q_input;
-  std::vector<int64_t> stacked_shape = q_input.sizes().vec();
-  stacked_shape.insert(stacked_shape.begin(), tp_group->world_size());
-  ctx.stacked = torch::empty(stacked_shape, q_input.options());
-  ctx.work = tp_group->allgather_base_async(q_input, ctx.stacked);
-  return ctx;
-}
-
 torch::Tensor finish_tp_query_gather(parallel_state::GatherAsyncCtx ctx) {
   if (ctx.work.defined()) {
     ctx.work->wait();
@@ -60,6 +42,20 @@ torch::Tensor finish_tp_query_gather(parallel_state::GatherAsyncCtx ctx) {
 }
 
 }  // namespace
+
+std::optional<parallel_state::GatherAsyncCtx>
+DeepseekV32AttentionImpl::launch_dcp_query(const torch::Tensor& q_input) const {
+  if (!dcp_spans_tp_) {
+    return std::nullopt;
+  }
+  parallel_state::GatherAsyncCtx ctx;
+  ctx.input = q_input;
+  std::vector<int64_t> stacked_shape = q_input.sizes().vec();
+  stacked_shape.insert(stacked_shape.begin(), tp_group_->world_size());
+  ctx.stacked = torch::empty(stacked_shape, q_input.options());
+  ctx.work = tp_group_->allgather_base_async(q_input, ctx.stacked);
+  return ctx;
+}
 
 torch::Tensor DeepseekV32AttentionImpl::remap_prefill_blocks(
     const torch::Tensor& sorted_slots,
@@ -155,7 +151,7 @@ torch::Tensor DeepseekV32AttentionImpl::run_dcp_paged_attention_local(
     KVCache& kv_cache,
     const AttentionMetadata& base_metadata) {
   CHECK(dcp_decode_context_ != nullptr);
-  const int64_t heads = active_heads();
+  const int64_t heads = local_heads();
   const int64_t token_count = q_input.size(0);
   CHECK_EQ(local_topk.block_tables().size(0), token_count);
 
@@ -165,7 +161,7 @@ torch::Tensor DeepseekV32AttentionImpl::run_dcp_paged_attention_local(
   local_metadata.is_chunked_prefill = false;
 
   torch::Tensor query = q_input;
-  const bool gathers_tp_heads = dcp_spans_tp_ && !use_replicated_attn_weights();
+  const bool gathers_tp_heads = dcp_spans_tp_;
   if (gathers_tp_heads) {
     CHECK(query_gather.has_value())
         << "DCP local decode attention requires the early-launched TP query "
@@ -236,11 +232,11 @@ torch::Tensor DeepseekV32AttentionImpl::run_dcp_chunked_prefill_attention(
     const AttentionMetadata& local_cache_metadata,
     const torch::Tensor& global_slot_mapping) {
   CHECK(dcp_decode_context_ != nullptr);
-  const int64_t heads = active_heads();
+  const int64_t heads = local_heads();
   AttentionMetadata local_metadata =
       build_mla_attention_metadata(local_cache_metadata, local_topk);
   torch::Tensor query = q_input;
-  const bool gathers_tp_heads = dcp_spans_tp_ && !use_replicated_attn_weights();
+  const bool gathers_tp_heads = dcp_spans_tp_;
   if (gathers_tp_heads) {
     CHECK(query_gather.has_value())
         << "DCP chunked prefill requires the early-launched TP query gather";
@@ -295,7 +291,7 @@ torch::Tensor DeepseekV32AttentionImpl::forward_dcp(
     return torch::empty_like(hidden_states);
   }
 
-  const int64_t heads = active_heads();
+  const int64_t heads = local_heads();
   const bool enable_dcp_decode = !is_prefill_or_chunked_prefill;
   const bool enable_dcp_chunked_prefill = attn_metadata.is_chunked_prefill;
   const bool enable_dcp_paged_attention =
@@ -335,10 +331,8 @@ torch::Tensor DeepseekV32AttentionImpl::forward_dcp(
   q_input = q_input.view({q_input.size(0), -1});
 
   std::optional<parallel_state::GatherAsyncCtx> query_gather;
-  if (needs_tp_query_gather(dcp_spans_tp_ && !use_replicated_attn_weights(),
-                            enable_dcp_decode,
-                            enable_dcp_chunked_prefill)) {
-    query_gather = launch_tp_query_gather(q_input, tp_group_);
+  if (enable_dcp_paged_attention) {
+    query_gather = launch_dcp_query(q_input);
   }
 
   const DsaTopkState* external_topk =

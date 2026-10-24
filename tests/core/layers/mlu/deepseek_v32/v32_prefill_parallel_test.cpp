@@ -724,7 +724,16 @@ namespace fixture = ::xllm::layer::test;
 constexpr int32_t kBlock = 16;
 constexpr int32_t kSuperblocks = 8;
 constexpr std::array<int32_t, 3> kPages = {3, 1, 5};
-enum class Topology { CP, CPTP, DCP, CPDCP, DCP4, CPTPDCP4 };
+enum class Topology {
+  CP,
+  CPTP,
+  DCP,
+  CPDCP,
+  DCP4,
+  CPTPDCP4,
+  CPTPDCP2,
+  CP4TP2DCP4
+};
 enum class Shape { PREFILL, CHUNKS, BOUNDARY15, BOUNDARY16, BOUNDARY33 };
 struct PrefillCase {
   DsaModelVariant variant;
@@ -1155,6 +1164,40 @@ torch::Tensor restore_output(
   return result.output;
 }
 
+void check_projection_shards(const DeepseekV32Attention& attention,
+                             const DeepseekV32Attention& reference,
+                             int32_t tp_rank,
+                             int32_t tp_size) {
+  const auto local_modules = attention->named_children();
+  const auto full_modules = reference->named_children();
+  for (const std::string& name : {"q_b_proj", "kv_b_proj"}) {
+    const auto local = local_modules[name]->as<ColumnParallelLinearImpl>();
+    const auto full = full_modules[name]->as<ColumnParallelLinearImpl>();
+    EXPECT_TRUE(torch::equal(local->weight(),
+                             full->weight().chunk(tp_size, /*dim=*/0)[tp_rank]))
+        << name;
+    if (full->per_channel_scale().defined()) {
+      EXPECT_TRUE(
+          torch::equal(local->per_channel_scale(),
+                       full->per_channel_scale().chunk(tp_size)[tp_rank]))
+          << name;
+      ASSERT_TRUE(local->smooth().has_value());
+      EXPECT_TRUE(torch::equal(*local->smooth(), *full->smooth())) << name;
+    }
+  }
+  const auto local = local_modules["o_proj"]->as<RowParallelLinearImpl>();
+  const auto full = full_modules["o_proj"]->as<RowParallelLinearImpl>();
+  EXPECT_TRUE(torch::equal(local->weight(),
+                           full->weight().chunk(tp_size, /*dim=*/1)[tp_rank]));
+  if (full->per_channel_scale().defined()) {
+    EXPECT_TRUE(
+        torch::equal(local->per_channel_scale(), full->per_channel_scale()));
+    ASSERT_TRUE(local->smooth().has_value());
+    EXPECT_TRUE(torch::equal(*local->smooth(),
+                             full->smooth()->chunk(tp_size)[tp_rank]));
+  }
+}
+
 void run_prefill_case(const PrefillCase& config,
                       int32_t rank,
                       int32_t world_size,
@@ -1167,23 +1210,32 @@ void run_prefill_case(const PrefillCase& config,
   KVCacheConfig::get_instance().block_size(kBlock);
   const bool cp_enabled =
       config.topology != Topology::DCP && config.topology != Topology::DCP4;
-  const int32_t dcp_size =
-      config.topology == Topology::DCP4 || config.topology == Topology::CPTPDCP4
-          ? 4
-          : 2;
+  const int32_t cp_size =
+      config.topology == Topology::CP4TP2DCP4 ? 4 : (cp_enabled ? 2 : 1);
+  const int32_t dcp_size = config.topology == Topology::DCP4 ||
+                                   config.topology == Topology::CPTPDCP4 ||
+                                   config.topology == Topology::CP4TP2DCP4
+                               ? 4
+                               : 2;
   const bool sharded = config.topology == Topology::DCP ||
                        config.topology == Topology::CPDCP ||
                        config.topology == Topology::DCP4 ||
-                       config.topology == Topology::CPTPDCP4;
+                       config.topology == Topology::CPTPDCP4 ||
+                       config.topology == Topology::CPTPDCP2 ||
+                       config.topology == Topology::CP4TP2DCP4;
   auto groups = create_cp_tp_groups(rank,
                                     world_size,
-                                    /*cp_size=*/cp_enabled ? 2 : 1,
+                                    cp_size,
                                     port,
                                     /*host=*/"127.0.0.1",
                                     device.unwrap());
   ParallelArgs parallel = *groups.parallel_args;
   parallel.kv_split_size() = sharded ? dcp_size : 1;
-  parallel.dcp_group_ = sharded ? groups.world.get() : groups.self.get();
+  const bool dcp_within_cp = config.topology == Topology::CPTPDCP2 ||
+                             config.topology == Topology::CP4TP2DCP4;
+  parallel.dcp_group_ =
+      dcp_within_cp ? groups.cp.get()
+                    : (sharded ? groups.world.get() : groups.self.get());
   ParallelArgs single(/*rank=*/0, /*world_size=*/1, groups.self.get());
   single.tp_group_ = groups.self.get();
   single.cp_group_ = groups.self.get();
@@ -1200,10 +1252,6 @@ void run_prefill_case(const PrefillCase& config,
   const ModelContext reference_context(single, args, QuantArgs(), options);
   DeepseekV32Attention attention(context);
   DeepseekV32Attention reference(reference_context);
-  if (config.topology == Topology::CPTP) {
-    EXPECT_FALSE(attention->use_replicated_attn_weights())
-        << "CP2 x TP2 must shard the attention heads";
-  }
   if (config.topology == Topology::CPTPDCP4) {
     EXPECT_EQ(parallel.cp_size(), 2);
     EXPECT_EQ(parallel.tp_size(), 2);
@@ -1212,12 +1260,30 @@ void run_prefill_case(const PrefillCase& config,
     EXPECT_EQ(groups.tp->world_size(), 2);
     EXPECT_EQ(parallel.dcp_group_->world_size(), 4);
     EXPECT_GT(parallel.dcp_group_->world_size(), parallel.cp_size());
-    EXPECT_TRUE(attention->use_replicated_attn_weights());
   }
   attention->load_state_dict(weights);
   reference->load_state_dict(weights);
   attention->verify_loaded_weights();
   reference->verify_loaded_weights();
+  check_projection_shards(
+      attention, reference, groups.tp->rank(), groups.tp->world_size());
+  if (groups.tp->world_size() > 1) {
+    const QuantArgs quant = create_default_quant_args();
+    const StateDict quant_weights(create_seeded_mla_weights(
+        args, DsaWeightFormat::SMOOTHQUANT, options.device(torch::kCPU)));
+    DeepseekV32Attention quant_attention(
+        ModelContext(parallel, args, quant, options));
+    DeepseekV32Attention quant_reference(
+        ModelContext(single, args, quant, options));
+    quant_attention->load_state_dict(quant_weights);
+    quant_reference->load_state_dict(quant_weights);
+    quant_attention->verify_loaded_weights();
+    quant_reference->verify_loaded_weights();
+    check_projection_shards(quant_attention,
+                            quant_reference,
+                            groups.tp->rank(),
+                            groups.tp->world_size());
+  }
   KVCache cache = initial_cache(args, options, shard_rank, dcp_size);
   KVCache reference_cache =
       initial_cache(args, options, /*shard_rank=*/-1, dcp_size);
@@ -1275,7 +1341,7 @@ void run_prefill_case(const PrefillCase& config,
   std::optional<DcpDecodeContext> dcp;
   if (sharded) {
     dcp.emplace(KVShardLayout(kBlock, dcp_size, shard_rank),
-                groups.world.get());
+                parallel.dcp_group_);
   }
   const torch::Tensor hidden = (seeded_tensor("v32.parallel.centered.hidden",
                                               {72, args.hidden_size()},
@@ -1307,15 +1373,14 @@ void run_prefill_case(const PrefillCase& config,
     const torch::Tensor tokens = torch::arange(count, ints);
     std::optional<v32_cp::DeepseekV32CPContext> cp;
     if (cp_enabled) {
-      cp = v32_cp::build_deepseek_v32_cp_context(
-          /*cp_size=*/2,
-          metadata,
-          params.meta.batch_forward_type,
-          tokens,
-          groups.cp.get(),
-          groups.cp->rank(),
-          groups.cp->world_size(),
-          layout);
+      cp = v32_cp::build_deepseek_v32_cp_context(cp_size,
+                                                 metadata,
+                                                 params.meta.batch_forward_type,
+                                                 tokens,
+                                                 groups.cp.get(),
+                                                 groups.cp->rank(),
+                                                 groups.cp->world_size(),
+                                                 layout);
       CHECK(cp.has_value()) << "Expected a real CP forward";
     }
     const torch::Tensor key_before = cache.get_k_cache().clone();
@@ -1579,14 +1644,19 @@ std::vector<PrefillCase> prefill_cases() {
   return result;
 }
 
-TEST(AttentionPrefillParallelTest,
-     MatchesSingleRankAndPreservesUnwrittenSlots) {
-  for (const auto& param : prefill_cases()) {
+void run_prefill_cases(const std::vector<PrefillCase>& cases) {
+  for (const auto& param : cases) {
     const PrefillCase config = param;
-    // CP2 x TP2 requires four distinct cards; all other topologies require two.
-    const int32_t ranks = config.topology == Topology::CPTP ? 4 : 2;
+    const bool tp2 = config.topology == Topology::CPTP ||
+                     config.topology == Topology::CPTPDCP2 ||
+                     config.topology == Topology::CPTPDCP4;
+    const int32_t ranks =
+        config.topology == Topology::CP4TP2DCP4 ? 8 : (tp2 ? 4 : 2);
     const int32_t port =
-        parallel_base_port(ranks, config.topology == Topology::DCP ? 1 : 2);
+        parallel_base_port(ranks,
+                           config.topology == Topology::CP4TP2DCP4
+                               ? 4
+                               : (config.topology == Topology::DCP ? 1 : 2));
     LOG(INFO) << config.name << " base_port=" << port;
 
     const int32_t child_count = ranks;
@@ -1638,6 +1708,28 @@ TEST(AttentionPrefillParallelTest,
     EXPECT_EQ(children_ok, true)
         << "forked ranks failed, timed out, or require more physical MLU cards";
   }
+}
+
+TEST(AttentionPrefillParallelTest,
+     MatchesSingleRankAndPreservesUnwrittenSlots) {
+  run_prefill_cases(prefill_cases());
+}
+
+TEST(AttentionCpTpDcpTest, HistoryMatchesSingleRankAndPreservesUnwrittenSlots) {
+  run_prefill_cases({
+      {DsaModelVariant::GLM5,
+       Topology::CPTPDCP2,
+       Shape::CHUNKS,
+       "Glm5_CP2TP2DCP2_Chunks3"},
+      {DsaModelVariant::GLM5,
+       Topology::CPTPDCP4,
+       Shape::CHUNKS,
+       "Glm5_CP2TP2DCP4_Chunks3"},
+      {DsaModelVariant::GLM5,
+       Topology::CP4TP2DCP4,
+       Shape::CHUNKS,
+       "Glm5_CP4TP2DCP4_Chunks3"},
+  });
 }
 
 TEST(DcpChunkedParallelTest, HistoryMatchesSingleRankAcrossFourShards) {
@@ -2515,6 +2607,144 @@ TEST(V32AttentionParallelTest, CpDcpDummyPreservesCachesAndPublishesNothing) {
   }
   EXPECT_EQ(children_ok, true)
       << "forked ranks failed, timed out, or require more physical MLU cards";
+}
+
+void run_row_quantization(int32_t rank, int32_t port) {
+  torch::set_num_threads(1);
+  torch::NoGradGuard no_grad;
+  Device dev(rank);
+  dev.set_device();
+  const torch::Device device = dev.unwrap();
+  auto groups = create_cp_tp_groups(rank,
+                                    /*world_size=*/2,
+                                    /*cp_size=*/1,
+                                    port,
+                                    "127.0.0.1",
+                                    device);
+  constexpr int64_t kInputs = 256;
+  constexpr int64_t kOutputs = 128;
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  QuantArgs quant;
+  quant.quant_method() = "smoothquant";
+  quant.bits() = 8;
+  quant.activation_dynamic() = true;
+  RowParallelLinear full(kInputs,
+                         kOutputs,
+                         /*bias=*/false,
+                         /*input_is_parallelized=*/true,
+                         /*enable_result_reduction=*/false,
+                         quant,
+                         groups.self.get(),
+                         options,
+                         LinearExtraArgs(),
+                         /*share_token_scale=*/true);
+  RowParallelLinear sharded(kInputs,
+                            kOutputs,
+                            /*bias=*/false,
+                            /*input_is_parallelized=*/true,
+                            /*enable_result_reduction=*/false,
+                            quant,
+                            groups.tp.get(),
+                            options,
+                            LinearExtraArgs(),
+                            /*share_token_scale=*/true);
+  RowParallelLinear local(kInputs,
+                          kOutputs,
+                          /*bias=*/false,
+                          /*input_is_parallelized=*/true,
+                          /*enable_result_reduction=*/false,
+                          quant,
+                          groups.tp.get(),
+                          options);
+  torch::Tensor weight = torch::zeros({kOutputs, kInputs}, torch::kInt8);
+  weight.index_put_({0, kInputs / 2}, 127);
+  weight.index_put_({1, 0}, 1);
+  StateDict weights(
+      Weights{{"qweight", weight},
+              {"per_channel_scale", torch::ones({kOutputs}, torch::kFloat32)},
+              {"smooth", torch::ones({kInputs}, torch::kFloat32)}});
+  full->load_state_dict(weights);
+  sharded->load_state_dict(weights);
+  local->load_state_dict(weights);
+  ASSERT_TRUE(full->is_weight_loaded());
+  ASSERT_TRUE(sharded->is_weight_loaded());
+  torch::Tensor input = torch::zeros({4, kInputs}, torch::kBFloat16);
+  input.index_put_({0, 0}, 1.0);
+  input.index_put_({0, kInputs / 2}, 1.0 / 256.0);
+  input.index_put_({1, 0}, 1.0 / 256.0);
+  input.index_put_({1, kInputs / 2}, 1.0);
+  input.index_put_({2, 0}, 1.0);
+  input.index_put_({2, kInputs / 2}, 1.0);
+  input = input.to(device);
+  torch::Tensor expected = torch::zeros({4, kOutputs}, torch::kBFloat16);
+  expected.index_put_({0, 1}, 1.0);
+  expected.index_put_({1, 0}, 127.0);
+  expected.index_put_({2, 0}, 127.0);
+  expected.index_put_({2, 1}, 1.0);
+  const torch::Tensor reference = full->forward(input);
+  // Each output channel selects one input channel, so partial GEMM rounding
+  // cannot hide a change in the per-token activation quantization domain.
+  ASSERT_TRUE(torch::equal(reference.cpu(), expected));
+  const torch::Tensor local_input =
+      input.chunk(/*chunks=*/2, /*dim=*/1)[rank].contiguous();
+  torch::Tensor local_expected = expected.clone();
+  local_expected.index_put_({0, 0}, 127.0 / 256.0);
+  local_expected.index_put_({1, 1}, 1.0 / 256.0);
+  torch::Tensor local_output = local->forward(local_input);
+  groups.tp->allreduce(local_output);
+  EXPECT_TRUE(torch::equal(local_output.cpu(), local_expected));
+  torch::Tensor actual = sharded->forward(local_input);
+  groups.tp->allreduce(actual);
+  dev.synchronize_default_stream();
+  EXPECT_EQ(actual.scalar_type(), torch::kBFloat16);
+  EXPECT_TRUE(torch::isfinite(actual).all().item<bool>());
+  EXPECT_TRUE(torch::equal(actual.cpu(), expected))
+      << "Row-parallel INT8 quantization changed the full-token scale domain: "
+      << actual.cpu().slice(/*dim=*/1, /*start=*/0, /*end=*/2);
+}
+
+TEST(RowParallelLinearTest, PreservesGlobalTokenQuantization) {
+  constexpr int32_t kRanks = 2;
+  const int32_t port = parallel_base_port(kRanks, /*cp_size=*/1);
+  const int32_t initial_parts = ::testing::UnitTest::GetInstance()
+                                    ->current_test_info()
+                                    ->result()
+                                    ->total_part_count();
+  std::vector<pid_t> pids;
+  pids.reserve(kRanks);
+  bool passed = true;
+  bool skipped = false;
+  for (int32_t rank = 0; rank < kRanks; ++rank) {
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+      try {
+        if (Platform::device_count() < kRanks) {
+          ::_exit(77);
+        }
+        run_row_quantization(rank, port);
+        std::fflush(nullptr);
+        ::_exit(child_failed(initial_parts) ? 1 : 0);
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "Rank " << rank << ": " << error.what();
+        ::_exit(1);
+      }
+    }
+    if (pid < 0) {
+      passed = false;
+      break;
+    }
+    pids.emplace_back(pid);
+  }
+  if (passed) {
+    passed = wait_ranks(pids, std::chrono::milliseconds{180000}, skipped);
+  } else {
+    stop_ranks(pids, std::vector<bool>(pids.size(), false));
+  }
+  if (passed && skipped) {
+    GTEST_SKIP() << "Two physical MLU cards are required";
+  }
+  EXPECT_TRUE(passed) << "Row-parallel quantization ranks failed or timed out";
 }
 
 }  // namespace

@@ -78,10 +78,6 @@ class DeepseekV32AttentionImpl : public torch::nn::Module {
                                       KVCache& kv_cache,
                                       const glm5_next_pcp::Context& context);
 
-  bool use_replicated_attn_weights() const {
-    return use_full_replicated_attention_weights_;
-  }
-
   void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights() const;
 
@@ -206,6 +202,9 @@ class DeepseekV32AttentionImpl : public torch::nn::Module {
       const AttentionMetadata& attn_metadata,
       const std::optional<DsaTopkState>& topk_state) const;
 
+  std::optional<parallel_state::GatherAsyncCtx> launch_dcp_query(
+      const torch::Tensor& q_input) const;
+
   torch::Tensor run_dcp_paged_attention(
       const torch::Tensor& q_input,
       const std::optional<DsaTopkState>& local_topk,
@@ -241,19 +240,13 @@ class DeepseekV32AttentionImpl : public torch::nn::Module {
   bool can_use_cp(const DsaTopkTransfer* topk_transfer) const {
     const bool reuses_topk =
         topk_transfer != nullptr && topk_transfer->input() != nullptr;
-    // Context-parallel attention works with both replicated (all heads per
-    // rank) and TP-sharded (heads / tp_size per rank) attention weights; the
-    // top-k metadata (indexer or reused state) is the only hard requirement.
     return !use_kpool_indexer_ && (has_indexer_ || reuses_topk);
   }
 
   int64_t full_heads() const { return full_heads_; }
-  int64_t active_heads() const {
-    return use_replicated_attn_weights() ? full_heads_ : tp_heads_;
-  }
+  int64_t local_heads() const { return tp_heads_; }
 
  private:
-  bool use_full_replicated_attention_weights_ = false;
   bool use_fused_mla_qkv_ = false;
   bool enable_lighting_indexer_ = false;
   bool dcp_spans_tp_ = false;

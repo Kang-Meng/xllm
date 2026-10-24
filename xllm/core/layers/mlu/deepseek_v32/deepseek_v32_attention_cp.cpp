@@ -37,7 +37,7 @@ torch::Tensor DeepseekV32AttentionImpl::forward_cp(
       << "deepseek_v32 context parallel only supports prefill batches.";
   const bool use_dcp = enable_mla_cache_sharding_ && !attn_metadata.is_dummy;
   std::optional<torch::Tensor> k_cache_scale = kv_cache.get_k_cache_scale();
-  QueryPrep query_prep = prep_query(hidden_states, active_heads());
+  QueryPrep query_prep = prep_query(hidden_states, local_heads());
 
   std::optional<DsaTopkState> topk_state;
   std::optional<DsaTopkState> local_topk;
@@ -197,7 +197,7 @@ torch::Tensor DeepseekV32AttentionImpl::forward_cp(
         v32_cp::gather_and_restore_global(topk_state->context_lens(), cp_ctx));
     DsaTopkState gathered_local_topk =
         dcp_decode_context_->localize_topk(gathered_topk);
-    std::optional<parallel_state::GatherAsyncCtx> query_gather;
+    auto query_gather = launch_dcp_query(gathered_q);
     torch::Tensor global_output =
         run_dcp_chunked_prefill_attention(gathered_q,
                                           gathered_local_topk,
@@ -205,7 +205,7 @@ torch::Tensor DeepseekV32AttentionImpl::forward_cp(
                                           kv_cache,
                                           attn_metadata,
                                           attn_metadata.slot_mapping)
-            .view({cp_ctx.total_tokens, active_heads() * kv_lora_rank_});
+            .view({cp_ctx.total_tokens, local_heads() * kv_lora_rank_});
     attn_output_local = v32_cp::reorder_to_local_shard(global_output, cp_ctx);
   } else if (use_dcp) {
     torch::Tensor k_cache = kv_cache.get_k_cache();
@@ -254,14 +254,8 @@ torch::Tensor DeepseekV32AttentionImpl::forward_cp(
                                                      mla_inputs.v_input,
                                                      kv_cache);
   }
-  torch::Tensor output = project_output(attn_output_local, active_heads());
-  if (!use_replicated_attn_weights()) {
-    // TP-sharded context-parallel attention: each rank computes its head
-    // shard on the local sequence shard, so merge the head shards across the
-    // TP group to recover the full hidden state before returning the packed
-    // local layout. No-op when tp_size == 1 (replicated path never enters).
-    output = parallel_state::reduce(output, tp_group_);
-  }
+  torch::Tensor output = project_output(attn_output_local, local_heads());
+  output = parallel_state::reduce(output, tp_group_);
   return output;
 }
 
@@ -272,10 +266,9 @@ DeepseekV32AttentionImpl::build_cp_mla_inputs(
     const QueryPrep& query_prep,
     const v32_cp::DeepseekV32CPContext& cp_ctx) {
   MlaInputs out;
-  out.q_input = torch::empty({hidden_states.size(0),
-                              active_heads(),
-                              kv_lora_rank_ + qk_rope_head_dim_},
-                             hidden_states.options());
+  out.q_input = torch::empty(
+      {hidden_states.size(0), local_heads(), kv_lora_rank_ + qk_rope_head_dim_},
+      hidden_states.options());
   out.q_norm = query_prep.q_norm;
   torch::Tensor latent_cache = kv_a_proj_with_mqa_(hidden_states);
   fill_q_input(out.q_input,

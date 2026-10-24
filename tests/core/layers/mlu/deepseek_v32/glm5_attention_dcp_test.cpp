@@ -36,6 +36,7 @@ limitations under the License.
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/model_context.h"
@@ -467,6 +468,42 @@ torch::Tensor forward(DeepseekV32Attention& attention,
   return output;
 }
 
+void check_projection_shards(const DeepseekV32Attention& actual,
+                             const DeepseekV32Attention& reference,
+                             int32_t rank) {
+  const auto local_params = actual->named_parameters();
+  const auto full_params = reference->named_parameters();
+  const std::array<std::pair<std::string, int64_t>, 7> partitions = {{
+      {"q_b_proj.qweight", 0},
+      {"q_b_proj.per_channel_scale", 0},
+      {"q_b_proj.smooth", -1},
+      {"kv_b_proj.weight", 0},
+      {"o_proj.qweight", 1},
+      {"o_proj.per_channel_scale", -1},
+      {"o_proj.smooth", 0},
+  }};
+  for (const auto& [name, dim] : partitions) {
+    const torch::Tensor& local = local_params[name];
+    const torch::Tensor& full = full_params[name];
+    CHECK(local.scalar_type() == full.scalar_type()) << name;
+    if (dim < 0) {
+      CHECK(torch::equal(local, full)) << name;
+      continue;
+    }
+    CHECK_EQ(full.size(dim) % kRanks, 0) << name;
+    const int64_t shard_size = full.size(dim) / kRanks;
+    CHECK_EQ(local.size(dim), shard_size) << name;
+    CHECK(torch::equal(local, full.narrow(dim, rank * shard_size, shard_size)))
+        << name << " must contain this TP rank's complementary head slice";
+  }
+  CHECK(local_params["q_b_proj.qweight"].scalar_type() == torch::kInt8);
+  CHECK(local_params["kv_b_proj.weight"].scalar_type() == torch::kBFloat16);
+  CHECK(local_params["o_proj.qweight"].scalar_type() == torch::kInt8);
+  CHECK_EQ(local_params["q_b_proj.qweight"].size(0), 4096);
+  CHECK_EQ(local_params["kv_b_proj.weight"].size(0), 7168);
+  CHECK_EQ(local_params["o_proj.qweight"].size(1), 4096);
+}
+
 void run_attention(int32_t rank,
                    int32_t port,
                    int32_t width,
@@ -525,12 +562,11 @@ void run_attention(int32_t rank,
       config.args, config.quant, base, options, optimization, !sparse);
   DeepseekV32Attention actual(
       config.args, config.quant, sharded, options, optimization, !sparse);
-  CHECK(!reference->use_replicated_attn_weights());
-  CHECK(!actual->use_replicated_attn_weights());
   reference->load_state_dict(weights);
   actual->load_state_dict(weights);
   reference->verify_loaded_weights();
   actual->verify_loaded_weights();
+  check_projection_shards(actual, reference, rank);
   Batch batch(width, sparse ? 4096 : 1152, config);
   AttentionMetadata ref_meta = batch.metadata(1, device);
   AttentionMetadata dcp_meta = batch.metadata(kRanks, device);

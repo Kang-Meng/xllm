@@ -32,9 +32,9 @@ torch::Tensor DeepseekV32AttentionImpl::forward_glm5_next_pcp(
       local_k, local_positions, local_metadata, /*use_prompt_rope=*/false);
   auto pending_k = parallel_state::launch_gather(
       local_k, context.cp_group, context.geometry.tokens_per_rank);
-  QueryPrep query = prep_query(local_hidden_states, active_heads());
+  QueryPrep query = prep_query(local_hidden_states, local_heads());
   torch::Tensor q_input = torch::empty({local_hidden_states.size(0),
-                                        active_heads(),
+                                        local_heads(),
                                         kv_lora_rank_ + qk_rope_head_dim_},
                                        local_hidden_states.options());
   fill_q_input(q_input,
@@ -70,10 +70,8 @@ torch::Tensor DeepseekV32AttentionImpl::forward_glm5_next_pcp(
   torch::Tensor global_v = global_k.slice(-1, 0, kv_lora_rank_);
   std::tie(attention_output, std::ignore) =
       attn_(kernel_metadata, q_input, global_k, global_v, kv_cache);
-  torch::Tensor output = project_output(attention_output, active_heads());
-  if (!use_replicated_attn_weights()) {
-    output = parallel_state::reduce(output, tp_group_);
-  }
+  torch::Tensor output = project_output(attention_output, local_heads());
+  output = parallel_state::reduce(output, tp_group_);
   return output;
 }
 
