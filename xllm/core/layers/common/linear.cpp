@@ -474,7 +474,6 @@ torch::Tensor npu_w8a8_linear_forward(
   return xllm::kernel::quant_matmul(quant_matmul_params);
 }
 
-#if defined(USE_MLU)
 std::tuple<torch::Tensor, torch::Tensor> quantize_row_input(
     const torch::Tensor& input,
     const torch::Tensor& smooth,
@@ -516,7 +515,6 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_row_input(
                                 .to(torch::kInt8);
   return std::make_tuple(std::move(quantized), std::move(scale));
 }
-#endif
 
 torch::Tensor scaled_w8a8_linear(
     const torch::Tensor& input,
@@ -526,7 +524,7 @@ torch::Tensor scaled_w8a8_linear(
     const std::optional<torch::Tensor>& bias,
     torch::ScalarType output_dtype,
     const LinearExtraArgs& extra = LinearExtraArgs(),
-    [[maybe_unused]] ProcessGroup* input_group = nullptr) {
+    ProcessGroup* input_group = nullptr) {
   kernel::ScaledQuantizeParams quantize;
   quantize.x = input.reshape({-1, input.size(-1)});
   quantize.smooth = smooth;
@@ -534,14 +532,11 @@ torch::Tensor scaled_w8a8_linear(
   quantize.is_gated = extra.is_gated;
   torch::Tensor quantized;
   torch::Tensor token_scale;
-#if defined(USE_MLU)
   if (input_group != nullptr && input_group->world_size() > 1 &&
       quantize.x.size(0) > 0) {
     std::tie(quantized, token_scale) =
         quantize_row_input(quantize.x, smooth, extra, input_group);
-  } else
-#endif
-  {
+  } else {
     std::tie(quantized, token_scale) = kernel::scaled_quantize(quantize);
   }
   kernel::ScaledMatmulParams matmul;
