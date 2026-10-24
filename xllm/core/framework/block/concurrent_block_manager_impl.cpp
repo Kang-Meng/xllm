@@ -23,25 +23,20 @@ ConcurrentBlockManagerImpl::ConcurrentBlockManagerImpl(
     std::unique_ptr<BlockManager> inner)
     : BlockManager(inner->options()), inner_(std::move(inner)) {
   CHECK(inner_ != nullptr) << "ConcurrentBlockManagerImpl needs an inner leaf";
+  // Leaf allocate calls go through this wrapper, which stamps its own
+  // manager onto each block before returning.
+  inner_->set_block_allocator(this);
 }
 
 std::vector<Block> ConcurrentBlockManagerImpl::allocate(size_t num_blocks) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
+  // BlockManagerImpl::allocate is final and pops its own free list.
+  // XTensor::allocate does its own page allocation. Neither calls back here.
   std::vector<Block> blocks = inner_->allocate(num_blocks);
-  // Route Block dtor -> free through this wrapper so the wrapper's lock covers
-  // the free path. inner_ remains the physical owner; free(id) re-acquires the
-  // wrapper lock and forwards.
   for (Block& block : blocks) {
     block.set_manager(this);
   }
   return blocks;
-}
-
-Block ConcurrentBlockManagerImpl::allocate() {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  Block block = inner_->allocate();
-  block.set_manager(this);
-  return block;
 }
 
 void ConcurrentBlockManagerImpl::incr_ref_count(
@@ -72,12 +67,8 @@ std::vector<Block> ConcurrentBlockManagerImpl::allocate_shared(
     const MMData& mm_data,
     const Slice<XXH3Key>& block_hashes) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  std::vector<Block> blocks = inner_->allocate_shared(
+  return inner_->allocate_shared(
       token_ids, existed_shared_blocks, mm_data, block_hashes);
-  for (Block& block : blocks) {
-    block.set_manager(this);
-  }
-  return blocks;
 }
 
 void ConcurrentBlockManagerImpl::cache(const Slice<int32_t>& token_ids,
@@ -100,44 +91,19 @@ ConcurrentBlockManagerImpl::allocate_for_sequence(Sequence* seq,
                                                   KVCacheState& kv_state,
                                                   size_t num_tokens) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  auto blocks = inner_->allocate_for_sequence(seq, kv_state, num_tokens);
-  if (blocks.has_value()) {
-    for (Block& block : *blocks) {
-      block.set_manager(this);
-    }
-  }
-  return blocks;
+  return inner_->allocate_for_sequence(seq, kv_state, num_tokens);
 }
 
 bool ConcurrentBlockManagerImpl::allocate_for_prefetch(Sequence* seq,
                                                        size_t num_tokens) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  const bool complete = inner_->allocate_for_prefetch(seq, num_tokens);
-  if (seq != nullptr) {
-    std::vector<Block>* blocks =
-        seq->host_kv_state().mutable_blocks(block_type());
-    for (Block& block : *blocks) {
-      if (block.is_valid()) {
-        block.set_manager(this);
-      }
-    }
-  }
-  return complete;
+  return inner_->allocate_for_prefetch(seq, num_tokens);
 }
 
 void ConcurrentBlockManagerImpl::trim_prefetch_blocks(Sequence* seq,
                                                       size_t max_hit_tokens) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   inner_->trim_prefetch_blocks(seq, max_hit_tokens);
-  if (seq != nullptr) {
-    std::vector<Block>* blocks =
-        seq->host_kv_state().mutable_blocks(block_type());
-    for (Block& block : *blocks) {
-      if (block.is_valid()) {
-        block.set_manager(this);
-      }
-    }
-  }
 }
 
 void ConcurrentBlockManagerImpl::reset_prefix_cache() {

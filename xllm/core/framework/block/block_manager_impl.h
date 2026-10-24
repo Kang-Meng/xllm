@@ -30,8 +30,9 @@ class BlockManagerImpl : public BlockManager {
   };
 
   // Try to allocate blocks with num_blocks,
-  // return {} if not enough blocks
-  std::vector<Block> allocate(size_t num_blocks) override;
+  // return {} if not enough blocks. final: a derived leaf must not route
+  // this back through block_allocator(), or the wrapper recurses forever.
+  std::vector<Block> allocate(size_t num_blocks) final;
 
   // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
   // and return them (does not insert into the sequence). The shared default for
@@ -90,21 +91,27 @@ class BlockManagerImpl : public BlockManager {
   uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
   void free(Block* block) override;
 
-  // allocate a list of blocks
-  // std::vector<Block> allocate(uint32_t n_blocks) override;
-
-  // allocate a block
-  Block allocate() override;
-
   // total blocks num
   size_t num_total_blocks() const override { return free_blocks_.size() - 1; }
 
+  void set_block_allocator(BlockManager* allocator) override {
+    block_allocator_ = allocator;
+  }
+
  private:
+  // Every valid block must belong to this leaf. A wrapper's allocate() stamps
+  // itself as the manager, and that wrapper is block_allocator_.
+  void check_owned(const std::vector<Block>& blocks) const;
   // check if has enough slots, if not, try to evict some blocks
   // from the prefix cache
   bool has_enough_blocks(uint32_t num_blocks);
 
  protected:
+  BlockManager* block_allocator() const {
+    return block_allocator_ == nullptr ? const_cast<BlockManagerImpl*>(this)
+                                       : block_allocator_;
+  }
+
   // prefix cache
   std::unique_ptr<PrefixCache> prefix_cache_;
 
@@ -119,6 +126,9 @@ class BlockManagerImpl : public BlockManager {
 
   // free block list
   std::vector<int32_t> free_blocks_;
+
+  // Null until a wrapper claims the allocate path.
+  BlockManager* block_allocator_ = nullptr;
 
   // 1 once a block id has been handed out and not yet returned to the free
   // list.

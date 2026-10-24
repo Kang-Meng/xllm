@@ -25,6 +25,7 @@ limitations under the License.
 #include "block_manager_impl.h"
 #include "block_manager_pool.h"
 #include "common/global_flags.h"
+#include "concurrent_block_manager_impl.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/block/block_manager_pool_test_peer.h"
@@ -91,10 +92,11 @@ int32_t insert_linear_state_checkpoint(LinearStateBlockManager* cache,
     Block matched = BlockManagerPoolTestPeer::match(cache, hash);
     return matched.is_valid() ? matched.id() : -1;
   }
-  Block slot_block = cache->allocate();
-  if (!slot_block.is_valid()) {
+  std::vector<Block> allocated = cache->allocate(1);
+  if (allocated.empty()) {
     return -1;
   }
+  Block slot_block = std::move(allocated.front());
   const int32_t slot = slot_block.id();
   slot_block.set_hash_value(hash.data);
   std::vector<Block> checkpoint;
@@ -196,7 +198,9 @@ TEST(BlockManagerTest, Basic) {
 
   // Allocate a block
   {
-    Block block = manager.allocate();
+    std::vector<Block> allocated = manager.allocate(1);
+    ASSERT_EQ(allocated.size(), 1u);
+    Block block = std::move(allocated.front());
     EXPECT_EQ(block.id(), 1);
     EXPECT_EQ(block.size(), block_size);
     EXPECT_EQ(block.is_shared(), false);
@@ -211,7 +215,9 @@ TEST(BlockManagerTest, Basic) {
   {
     std::vector<Block> blocks;
     for (uint32_t i = 1; i < n_blocks; ++i) {
-      auto block = manager.allocate();
+      auto allocated = manager.allocate(1);
+      ASSERT_EQ(allocated.size(), 1u);
+      Block block = std::move(allocated.front());
       EXPECT_EQ(block.id(), i);
       EXPECT_EQ(block.size(), block_size);
       EXPECT_EQ(block.is_shared(), false);
@@ -225,7 +231,7 @@ TEST(BlockManagerTest, Basic) {
     }
 
     // Test CHECK failure
-    EXPECT_DEATH(manager.allocate(), "No more blocks available");
+    EXPECT_TRUE(manager.allocate(1).empty());
   }
 
   // all blocks should be freed after the scope
@@ -233,7 +239,9 @@ TEST(BlockManagerTest, Basic) {
 
   // Test shared blocks
   {
-    Block block = manager.allocate();
+    std::vector<Block> allocated = manager.allocate(1);
+    ASSERT_EQ(allocated.size(), 1u);
+    Block block = std::move(allocated.front());
     EXPECT_EQ(block.ref_count(), 1);
     EXPECT_EQ(block.is_shared(), false);
     // test copy constructor
@@ -251,7 +259,9 @@ TEST(BlockManagerTest, Basic) {
 
     // test assignment operator
     {
-      Block block4 = manager.allocate();
+      std::vector<Block> more = manager.allocate(1);
+      ASSERT_EQ(more.size(), 1u);
+      Block block4 = std::move(more.front());
       block4 = block;
       EXPECT_EQ(block.ref_count(), 2);
       EXPECT_EQ(block.is_shared(), true);
@@ -1545,6 +1555,54 @@ TEST(BlockManagerImplTest, RefcountZeroEntersFreeListAndCacheOnlyIsEvictable) {
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   EXPECT_EQ(manager.num_free_blocks(), total);
   EXPECT_EQ(manager.num_available_blocks(), total);
+}
+
+// Block ids restart on every leaf. Caching one leaf's block into another
+// records that numeric id in the wrong prefix cache and increments the wrong
+// refcount. The owner's later free then sees the id still registered.
+TEST(ConcurrentBlockManagerImplTest,
+     ForeignBlockIsNotInsertedIntoAnotherCache) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true);
+  auto owner = std::make_unique<ConcurrentBlockManagerImpl>(
+      std::make_unique<BlockManagerImpl>(options));
+  auto other = std::make_unique<ConcurrentBlockManagerImpl>(
+      std::make_unique<BlockManagerImpl>(options));
+
+  const size_t total = owner->num_total_blocks();
+  std::vector<Block> blocks = owner->allocate(1);
+  ASSERT_EQ(blocks.size(), 1u);
+  const int32_t block_id = blocks[0].id();
+  EXPECT_EQ(blocks[0].ref_count(), 1u);
+
+  uint8_t hash[XXH3_128BITS_HASH_VALUE_LEN] = {};
+  hash[0] = 1;
+  blocks[0].set_hash_value(hash);
+  other->cache(blocks);
+
+  EXPECT_EQ(other->num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(owner->num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(blocks[0].ref_count(), 1u);
+  blocks.clear();
+  EXPECT_EQ(owner->num_free_blocks(), total);
+
+  std::vector<Block> owned = owner->allocate(1);
+  ASSERT_EQ(owned.size(), 1u);
+  const int32_t owned_id = owned[0].id();
+  owned[0].set_hash_value(hash);
+  owner->cache(owned);
+  EXPECT_EQ(owner->num_blocks_in_prefix_cache(), 1u);
+  EXPECT_EQ(owned[0].ref_count(), 2u);
+  owned.clear();
+  EXPECT_EQ(owner->num_free_blocks(), total - 1);
+
+  std::vector<Block> again = owner->allocate(1);
+  ASSERT_EQ(again.size(), 1u);
+  EXPECT_NE(again[0].id(), owned_id);
+  EXPECT_NE(again[0].id(), block_id);
+
+  owner->reset_prefix_cache();
+  other->reset_prefix_cache();
 }
 
 }  // namespace xllm

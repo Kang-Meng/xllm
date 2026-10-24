@@ -44,15 +44,6 @@ class EmbeddingBlockManager final : public BlockManagerImpl {
       KVCacheState& kv_state,
       size_t num_tokens) override;
 
-  // Single-block allocate: reuses the base free list but reports exhaustion
-  // with this resource's name / message. Only this leaf calls it directly (the
-  // base ctor's padding reservation runs before the vtable points here, so it
-  // still uses BlockManagerImpl::allocate()). Bring the base allocate(size_t)
-  // overload back into scope: declaring the zero-arg allocate() here would
-  // otherwise hide it (name hiding).
-  using BlockManagerImpl::allocate;
-  Block allocate() override;
-
   // EMBEDDING never serves prefix cache; these must not be reached.
   std::vector<Block> allocate_shared(
       const Slice<int32_t>& token_ids,

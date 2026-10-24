@@ -125,7 +125,13 @@ class BlockManager {
   explicit BlockManager(Options options) : options_(options) {}
   virtual ~BlockManager() = default;
 
+  // num_blocks defaults to 1. The default lives only on this declaration;
+  // overrides must not repeat it.
   virtual std::vector<Block> allocate(size_t num_blocks) = 0;
+
+  // Wrapper calls this after it owns the leaf. BlockManagerImpl and
+  // XTensorBlockManagerImpl route their own allocate calls through it.
+  virtual void set_block_allocator(BlockManager* /*allocator*/) {}
 
   // Returns the shared-prefix vector for the caller's Sequence. The vector's
   // shape is leaf-defined:
@@ -202,12 +208,6 @@ class BlockManager {
   // XTensor has no prefix cache and recycles only the last alias.
   // The leaf then calls release_block_ref(), which calls dec_ref_count().
   virtual void free(Block* block) = 0;
-
-  // allocate a list of blocks, used for unit test
-  // virtual std::vector<Block> allocate(uint32_t n_blocks) = 0;
-
-  // allocate a block, used for unit test
-  virtual Block allocate() = 0;
 
   // get number of total blocks
   virtual size_t num_total_blocks() const = 0;

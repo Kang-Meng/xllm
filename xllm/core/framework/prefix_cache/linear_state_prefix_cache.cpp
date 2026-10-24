@@ -174,6 +174,10 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
       lru_lst_.remove_node(iter->second);
       node_list.push_front(iter->second);
     } else {
+      // A new hash must name a block that is not already registered under
+      // another hash. One physical block, one chain key.
+      CHECK(blocks_by_id_.find(blocks[block_idx].id()) == blocks_by_id_.end())
+          << "Duplicate block id " << blocks[block_idx].id();
       Node* new_node = new Node();
 
       new_node->block = blocks[block_idx];

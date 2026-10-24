@@ -101,8 +101,9 @@ class XTensorBlockManagerImpl : public BlockManager {
   uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
   void free(Block* block) override;
 
-  // Allocate a single block
-  Block allocate() override;
+  void set_block_allocator(BlockManager* allocator) override {
+    block_allocator_ = allocator;
+  }
 
   // Get total number of blocks
   size_t num_total_blocks() const override;
@@ -142,6 +143,12 @@ class XTensorBlockManagerImpl : public BlockManager {
   size_t available_size_internal() const;
 
  private:
+  BlockManager* block_allocator() const {
+    return block_allocator_ == nullptr
+               ? const_cast<XTensorBlockManagerImpl*>(this)
+               : block_allocator_;
+  }
+
   // Model ID (from options_.model_id())
   std::string model_id_;
 
@@ -174,6 +181,8 @@ class XTensorBlockManagerImpl : public BlockManager {
 
   // Mutex for thread safety
   mutable std::mutex mtx_;
+
+  BlockManager* block_allocator_ = nullptr;
 };
 
 }  // namespace xllm

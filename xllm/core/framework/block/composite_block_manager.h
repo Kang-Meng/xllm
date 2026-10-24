@@ -143,7 +143,6 @@ class CompositeBlockManager : public BlockManager {
   double kv_cache_utilization() const override;
   std::unordered_map<BlockType, double> block_utilization_by_type() const;
   void free(Block* block) override;
-  Block allocate() override;
   size_t num_total_blocks() const override;
 
   void reserve_xtensor_padding_blocks() override;

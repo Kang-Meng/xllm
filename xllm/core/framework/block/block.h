@@ -187,10 +187,9 @@ class Block final {
   // owner manager that allocated this block.
   BlockManager* manager() const { return manager_; }
 
-  // Reassign this block's owning manager. Used by concurrency wrappers (e.g.
-  // ConcurrentBlockManagerImpl) to route Block dtor -> free() through the
-  // wrapper layer so the wrapper's lock covers the free path too. Must not be
-  // used to transfer ownership across pools.
+  // Reassign this block's owning manager. Used by the concurrency wrapper to
+  // route Block dtor -> free() through the wrapper lock. The shared refcount
+  // stays with this alias; do not use this to move a block onto another leaf.
   void set_manager(BlockManager* manager) { manager_ = manager; }
 
   // NOTE: Below block `hash_value_` is used for prefix cache and

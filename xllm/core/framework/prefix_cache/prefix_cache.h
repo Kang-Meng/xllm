@@ -102,11 +102,11 @@ class PrefixCache {
   // Cache nodes whose block refcount is 1. Those nodes are the only owner.
   size_t num_evictable() const { return num_evictable_; }
 
-  // Called from BlockManagerImpl::free before that alias's refcount is
-  // dropped. A resident whose refcount is 2 has this alias plus the cache
-  // node; after the drop the cache is the only owner and the block becomes
-  // evictable.
-  void update_evictable(const Block* block);
+  // Called from BlockManagerImpl::free after that alias's refcount is
+  // dropped. True when this id is still registered in the prefix cache.
+  // A resident whose refcount is 1 after the drop has the cache node as its
+  // only owner and becomes evictable.
+  bool update_evictable(const Block* block);
 
   float block_match_rate() {
     if (total_blocks_.load() == 0) {

@@ -40,7 +40,6 @@ class ConcurrentBlockManagerImpl : public BlockManager {
 
   // Block-level primitives.
   std::vector<Block> allocate(size_t num_blocks) override;
-  Block allocate() override;
   void incr_ref_count(std::atomic<uint32_t>* ref_count) override;
   uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
   void free(Block* block) override;

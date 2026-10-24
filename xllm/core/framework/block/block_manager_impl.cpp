@@ -75,7 +75,11 @@ BlockManagerImpl::BlockManagerImpl(const Options& options)
 
   // reserve block 0 for padding. It stays off the free list for the manager's
   // lifetime, and free() rejects id 0, so this block must not call free.
-  padding_block_ = allocate();
+  // Padding is taken before a wrapper is attached. The qualified call stays
+  // on this free list and does not enter block_allocator_.
+  std::vector<Block> padding = BlockManagerImpl::allocate(1);
+  CHECK_EQ(padding.size(), 1u);
+  padding_block_ = std::move(padding[0]);
   CHECK_EQ(padding_block_.id(), 0) << "Padding block id should be 0";
   padding_block_.set_manager(nullptr);
 }
@@ -193,6 +197,7 @@ void BlockManagerImpl::cache(const Slice<int32_t>& token_ids,
                              const MMData& mm_data,
                              const Slice<XXH3Key>& block_hashes) {
   if (options_.enable_prefix_cache()) {
+    check_owned(blocks);
     AUTO_COUNTER(prefix_cache_latency_seconds_insert);
     // Add the kv cache to the prefix cache
     prefix_cache_->insert(
@@ -200,20 +205,27 @@ void BlockManagerImpl::cache(const Slice<int32_t>& token_ids,
   }
 }
 
-void BlockManagerImpl::cache(const std::vector<Block>& blocks) {
-  if (options_.enable_prefix_cache()) {
-    AUTO_COUNTER(prefix_cache_latency_seconds_insert);
-    // Add the kv cache to the prefix cache
-    prefix_cache_->insert(blocks);
+void BlockManagerImpl::check_owned(const std::vector<Block>& blocks) const {
+  for (const Block& block : blocks) {
+    if (!block.is_valid()) {
+      continue;
+    }
+    const BlockManager* manager = block.manager();
+    // Block ids are per leaf. Another leaf's block would record that id in
+    // this prefix cache and increment the other leaf's refcount.
+    CHECK(manager == this || manager == block_allocator_)
+        << "Prefix cache insert of block " << block.id()
+        << " manager=" << manager << " leaf=" << this;
   }
 }
 
-// allocate a block id
-Block BlockManagerImpl::allocate() {
-  CHECK(num_free_blocks_ > 0) << "No more blocks available";
-  size_t prev_count = num_free_blocks_.fetch_sub(1, std::memory_order_relaxed);
-  const int32_t block_id = free_blocks_[prev_count - 1];
-  return {block_id, this};
+void BlockManagerImpl::cache(const std::vector<Block>& blocks) {
+  if (!options_.enable_prefix_cache()) {
+    return;
+  }
+  check_owned(blocks);
+  AUTO_COUNTER(prefix_cache_latency_seconds_insert);
+  prefix_cache_->insert(blocks);
 }
 
 void BlockManagerImpl::incr_ref_count(std::atomic<uint32_t>* ref_count) {
@@ -232,7 +244,12 @@ void BlockManagerImpl::free(Block* block) {
   release_block_ref(block);
 
   if (prefix_cache_ != nullptr) {
-    prefix_cache_->update_evictable(block);
+    const bool in_prefix_cache = prefix_cache_->update_evictable(block);
+    // A prefix-cache node shares this block's refcount. After the last
+    // external alias drops, the cache copy must still hold one. Refcount 0
+    // while the id is registered means the node did not own the counter.
+    CHECK(!in_prefix_cache || block->ref_count() != 0)
+        << "Block " << block->id() << " is in the prefix cache with refcount 0";
   }
   if (block->ref_count() == 0) {
     const int32_t block_id = block->id();
@@ -266,7 +283,7 @@ std::optional<std::vector<Block>> BlockManagerImpl::allocate_for_sequence(
     return std::vector<Block>{};
   }
   const size_t num_additional = num_blocks_needed - held;
-  std::vector<Block> blocks = allocate(num_additional);
+  std::vector<Block> blocks = block_allocator()->allocate(num_additional);
   if (blocks.size() != num_additional) {
     return std::nullopt;
   }
@@ -295,9 +312,10 @@ bool BlockManagerImpl::allocate_for_prefetch(Sequence* seq, size_t num_tokens) {
   CHECK_GE(hashes.size(), target_blocks);
 
   const size_t needed = target_blocks - cached_blocks;
-  std::vector<Block> allocated = allocate(needed);
+  std::vector<Block> allocated = block_allocator()->allocate(needed);
   if (allocated.empty()) {
-    allocated = allocate(std::min(needed, num_free_blocks()));
+    allocated =
+        block_allocator()->allocate(std::min(needed, num_free_blocks()));
   }
 
   for (size_t index = 0; index < allocated.size(); ++index) {

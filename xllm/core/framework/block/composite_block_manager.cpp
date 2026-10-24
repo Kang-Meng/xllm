@@ -1119,11 +1119,6 @@ void CompositeBlockManager::free(Block* /*block*/) {
   LOG(FATAL) << "CompositeBlockManager::free should not be called";
 }
 
-Block CompositeBlockManager::allocate() {
-  LOG(FATAL) << "CompositeBlockManager::allocate should not be called";
-  return Block();
-}
-
 size_t CompositeBlockManager::num_total_blocks() const {
   size_t total_blocks = std::numeric_limits<size_t>::max();
   for (const auto& [type, entry] : leaves_) {

@@ -88,7 +88,7 @@ SlidingWindowBlockManager::allocate_for_sequence(Sequence* seq,
   }
 
   const size_t missing = needed - held;
-  std::vector<Block> allocated = allocate(missing);
+  std::vector<Block> allocated = block_allocator()->allocate(missing);
   if (allocated.size() != missing) {
     return std::nullopt;
   }
@@ -124,9 +124,10 @@ bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
   const size_t units = (target_blocks - cached_blocks) / blocks_per_unit;
   const size_t needed = units * valid_per_unit;
 
-  std::vector<Block> allocated = allocate(needed);
+  std::vector<Block> allocated = block_allocator()->allocate(needed);
   if (allocated.empty()) {
-    allocated = allocate(std::min(needed, num_free_blocks()));
+    allocated =
+        block_allocator()->allocate(std::min(needed, num_free_blocks()));
   }
 
   KVCacheState& host_state = seq->host_kv_state();

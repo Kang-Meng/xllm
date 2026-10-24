@@ -58,9 +58,10 @@ TEST(EmbeddingBlockManagerTest, AllocateSingleDiesWhenExhausted) {
   // id 0 is reserved internally, so 2 physical slots expose a single usable
   // block, whose id is 1.
   EmbeddingBlockManager manager(2, "single");
-  Block block = manager.allocate();
-  EXPECT_EQ(block.id(), 1);
-  EXPECT_DEATH(manager.allocate(), "No more single blocks available");
+  std::vector<Block> allocated = manager.allocate(1);
+  ASSERT_EQ(allocated.size(), 1u);
+  EXPECT_EQ(allocated.front().id(), 1);
+  EXPECT_TRUE(manager.allocate(1).empty());
 }
 
 TEST(EmbeddingBlockManagerTest, PrefixCacheApisAreNotImplemented) {
@@ -91,7 +92,9 @@ TEST(EmbeddingBlockManagerTest, UsedBlocksAccountingRoundTrips) {
   EXPECT_EQ(manager.num_free_blocks(), 1u);
 
   {
-    Block block = manager.allocate();
+    std::vector<Block> allocated = manager.allocate(1);
+    ASSERT_EQ(allocated.size(), 1u);
+    Block block = std::move(allocated.front());
     EXPECT_EQ(manager.num_used_blocks(), 1u);
     EXPECT_EQ(manager.num_free_blocks(), 0u);
 

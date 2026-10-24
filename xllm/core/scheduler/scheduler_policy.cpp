@@ -367,12 +367,15 @@ void SchedulerPolicy::schedule_prefill_from_queue(
           static_cast<size_t>(state.kv_cache_manager->num_blocks());
       const size_t full_footprint =
           (request->sequences()[0]->num_tokens() + block_size - 1) / block_size;
-      // Predict and pre-assign the target DP rank so that the subsequent
-      // allocation reuses the same rank. This keeps the admission check
-      // consistent with the allocation path (same available-blocks metric
-      // and round-robin tie-break, see KVCacheManager::select_dp_rank).
-      const int32_t dp_rank = state.kv_cache_manager->select_dp_rank();
-      request->sequences()[0]->set_dp_rank(dp_rank);
+      // Blocks pin the sequence to the DP manager that owns them. A sequence
+      // with no blocks can be placed here, using the same available-blocks
+      // metric and round-robin tie-break as KVCacheManager::select_dp_rank.
+      Sequence* sequence = request->sequences()[0].get();
+      int32_t dp_rank = sequence->dp_rank();
+      if (!sequence->has_any_blocks()) {
+        dp_rank = state.kv_cache_manager->select_dp_rank();
+        sequence->set_dp_rank(dp_rank);
+      }
       if (reserved_full_footprint[dp_rank] + full_footprint > total_blocks) {
         blocks_exhausted = true;
         break;

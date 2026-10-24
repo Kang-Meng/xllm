@@ -314,6 +314,13 @@ class Sequence final {
   // rebuilds the whole chain. LINEAR checkpoints use this same table.
   void update_block_hashes(uint32_t block_size, BlockHasherType hasher_type);
 
+  // Extend the chain for `block_size`, then return the hash at `block_index`.
+  // Empty when that block is not complete yet. The reference stays valid until
+  // this stride is invalidated or the hasher type changes.
+  const std::optional<const XXH3Key*> block_hash_at(BlockHasherType hasher_type,
+                                                    size_t block_index,
+                                                    uint32_t block_size);
+
   // Whether the prefill stage has been cached.
   bool if_cache_block_for_prefill() {
     bool if_cache =

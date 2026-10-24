@@ -175,19 +175,12 @@ XTensorBlockManagerImpl::allocate_for_sequence(Sequence* seq,
     return std::vector<Block>{};
   }
   const size_t num_additional = num_blocks_needed - held;
-  std::vector<Block> blocks = allocate(num_additional);  // VMM page alloc
+  std::vector<Block> blocks =
+      block_allocator()->allocate(num_additional);  // VMM page alloc
   if (blocks.size() != num_additional) {
     return std::nullopt;
   }
   return blocks;
-}
-
-Block XTensorBlockManagerImpl::allocate() {
-  auto blocks = allocate(1);
-  if (blocks.empty()) {
-    return Block();  // Invalid block
-  }
-  return std::move(blocks[0]);
 }
 
 void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {

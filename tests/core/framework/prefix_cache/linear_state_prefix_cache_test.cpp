@@ -40,10 +40,11 @@ int32_t insert_checkpoint(LinearStateBlockManager& cache, const XXH3Key& hash) {
     Block matched = BlockManagerPoolTestPeer::match(&cache, hash);
     return matched.is_valid() ? matched.id() : -1;
   }
-  Block slot_block = cache.allocate();
-  if (!slot_block.is_valid()) {
+  std::vector<Block> allocated = cache.allocate(1);
+  if (allocated.empty()) {
     return -1;
   }
+  Block slot_block = std::move(allocated.front());
   const int32_t slot = slot_block.id();
   slot_block.set_hash_value(hash.data);
   std::vector<Block> checkpoint;
@@ -66,8 +67,12 @@ TEST(LinearStatePrefixCacheTest, PaddingSlotReservedAndLiveSlotsExhaust) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/3, /*block_size=*/16));
 
-  Block first = cache.allocate();
-  Block second = cache.allocate();
+  std::vector<Block> first_blocks = cache.allocate(1);
+  std::vector<Block> second_blocks = cache.allocate(1);
+  ASSERT_EQ(first_blocks.size(), 1u);
+  ASSERT_EQ(second_blocks.size(), 1u);
+  Block first = std::move(first_blocks.front());
+  Block second = std::move(second_blocks.front());
   ASSERT_TRUE(first.is_valid());
   ASSERT_TRUE(second.is_valid());
   EXPECT_GE(first.id(), 1);
@@ -75,8 +80,7 @@ TEST(LinearStatePrefixCacheTest, PaddingSlotReservedAndLiveSlotsExhaust) {
   EXPECT_NE(first.id(), second.id());
 
   // No free slot and no checkpoint to reclaim -> invalid handle.
-  Block third = cache.allocate();
-  EXPECT_FALSE(third.is_valid());
+  EXPECT_TRUE(cache.allocate(1).empty());
 }
 
 // A live slot returns to the cache when its handle is dropped.
@@ -85,16 +89,18 @@ TEST(LinearStatePrefixCacheTest, DroppingLiveHandleReleasesSlot) {
       linear_options(/*num_slots=*/2, /*block_size=*/16));
   int32_t reused_id = -1;
   {
-    Block live = cache.allocate();
+    std::vector<Block> live_blocks = cache.allocate(1);
+    ASSERT_EQ(live_blocks.size(), 1u);
+    Block live = std::move(live_blocks.front());
     ASSERT_TRUE(live.is_valid());
     reused_id = live.id();
     // Only one usable slot; it is now live.
-    EXPECT_FALSE(cache.allocate().is_valid());
+    EXPECT_TRUE(cache.allocate(1).empty());
   }
   // Handle dropped: the slot is free again.
-  Block live_again = cache.allocate();
-  ASSERT_TRUE(live_again.is_valid());
-  EXPECT_EQ(live_again.id(), reused_id);
+  std::vector<Block> again = cache.allocate(1);
+  ASSERT_EQ(again.size(), 1u);
+  EXPECT_EQ(again.front().id(), reused_id);
 }
 
 // insert() pins a slot that match()/contains() can find, and reusing the same
@@ -129,7 +135,9 @@ TEST(LinearStatePrefixCacheTest, ReserveDoesNotInsertUntilReady) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/3, /*block_size=*/16));
   const XXH3Key h1 = make_hash(1);
-  Block slot_block = cache.allocate();
+  std::vector<Block> allocated = cache.allocate(1);
+  ASSERT_EQ(allocated.size(), 1u);
+  Block slot_block = std::move(allocated.front());
   ASSERT_TRUE(slot_block.is_valid());
   const int32_t slot = slot_block.id();
   ASSERT_GE(slot, 1);
@@ -155,7 +163,9 @@ TEST(LinearStatePrefixCacheTest, DroppedReservationReleasesSlot) {
   int32_t reserved_slot = -1;
 
   {
-    Block slot_block = cache.allocate();
+    std::vector<Block> allocated = cache.allocate(1);
+    ASSERT_EQ(allocated.size(), 1u);
+    Block slot_block = std::move(allocated.front());
     ASSERT_TRUE(slot_block.is_valid());
     reserved_slot = slot_block.id();
     ASSERT_GE(reserved_slot, 1);
@@ -237,7 +247,9 @@ TEST(LinearStatePrefixCacheTest, AcquireLiveSlotReclaimsCheckpoint) {
 
   // The only usable slot holds a checkpoint; acquiring a live slot must reclaim
   // it.
-  Block live = cache.allocate();
+  std::vector<Block> live_blocks = cache.allocate(1);
+  ASSERT_EQ(live_blocks.size(), 1u);
+  Block live = std::move(live_blocks.front());
   ASSERT_TRUE(live.is_valid());
   EXPECT_EQ(live.id(), checkpoint_slot);
   EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h1));
@@ -258,7 +270,9 @@ TEST(LinearStatePrefixCacheTest, AcquireLiveSlotSkipsPinnedCheckpoint) {
   const int32_t reclaimable_slot = insert_checkpoint(cache, h2);
   ASSERT_GE(reclaimable_slot, 1);
 
-  Block live = cache.allocate();
+  std::vector<Block> live_blocks = cache.allocate(1);
+  ASSERT_EQ(live_blocks.size(), 1u);
+  Block live = std::move(live_blocks.front());
   ASSERT_TRUE(live.is_valid());
   EXPECT_EQ(live.id(), reclaimable_slot);
   EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
@@ -269,7 +283,9 @@ TEST(LinearStatePrefixCacheTest, AcquireLiveSlotSkipsPinnedCheckpoint) {
 TEST(LinearStatePrefixCacheTest, InsertCannotReclaimLiveSlots) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/2, /*block_size=*/16));
-  Block live = cache.allocate();
+  std::vector<Block> live_blocks = cache.allocate(1);
+  ASSERT_EQ(live_blocks.size(), 1u);
+  Block live = std::move(live_blocks.front());
   ASSERT_TRUE(live.is_valid());
 
   // The only usable slot is live, so no checkpoint slot can be reserved.

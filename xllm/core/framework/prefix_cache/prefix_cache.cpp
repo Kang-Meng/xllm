@@ -47,14 +47,15 @@ void PrefixCache::check_cached_block_count() const {
   CHECK_EQ(blocks_by_id_.size(), cached_blocks_.size());
 }
 
-void PrefixCache::update_evictable(const Block* block) {
-  if (block == nullptr || block->id() < 0 || block->ref_count() != 1) {
-    return;
+bool PrefixCache::update_evictable(const Block* block) {
+  if (block == nullptr || block->id() < 0) {
+    return false;
   }
-  if (blocks_by_id_.find(block->id()) == blocks_by_id_.end()) {
-    return;
+  const bool resident = blocks_by_id_.find(block->id()) != blocks_by_id_.end();
+  if (resident && block->ref_count() == 1) {
+    ++num_evictable_;
   }
-  ++num_evictable_;
+  return resident;
 }
 
 void PrefixCache::release_evictable_slot() {
@@ -209,6 +210,10 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
       lru_lst_.remove_node(iter->second);
       node_list.push_front(iter->second);
     } else {
+      // A new hash must name a block that is not already registered under
+      // another hash. One physical block, one chain key.
+      CHECK(blocks_by_id_.find(blocks[block_idx].id()) == blocks_by_id_.end())
+          << "Duplicate block id " << blocks[block_idx].id();
       Node* new_node = new Node();
 
       new_node->block = blocks[block_idx];
@@ -257,6 +262,10 @@ size_t PrefixCache::insert(Slice<Block>& blocks) {
       lru_lst_.remove_node(iter->second);
       node_list.push_front(iter->second);
     } else {
+      // A new hash must name a block that is not already registered under
+      // another hash. One physical block, one chain key.
+      CHECK(blocks_by_id_.find(blocks[i].id()) == blocks_by_id_.end())
+          << "Duplicate block id " << blocks[i].id();
       Node* new_node = new Node();
 
       new_node->block = blocks[i];

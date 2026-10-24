@@ -198,7 +198,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
 
   if (seq->kv_cache_tokens_num() > kv_state.kv_cache_tokens_num()) {
     kv_state.erase_blocks(BlockType::LINEAR);
-    std::vector<Block> allocated = BlockManagerImpl::allocate(2);
+    std::vector<Block> allocated = block_allocator()->allocate(2);
     if (allocated.size() != 2) {
       return std::nullopt;
     }
@@ -210,7 +210,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
     blocks->erase(blocks->begin());
   }
 
-  std::vector<Block> allocated = BlockManagerImpl::allocate(1);
+  std::vector<Block> allocated = block_allocator()->allocate(1);
   if (allocated.empty()) {
     if (blocks->empty()) {
       VLOG(1)
@@ -281,7 +281,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
   }
 
   if (blocks->empty()) {
-    std::vector<Block> allocated = BlockManagerImpl::allocate(1);
+    std::vector<Block> allocated = block_allocator()->allocate(1);
     return allocated.empty()
                ? std::nullopt
                : std::optional<std::vector<Block>>(std::move(allocated));
@@ -297,7 +297,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
     return std::vector<Block>{};
   }
 
-  std::vector<Block> allocated = BlockManagerImpl::allocate(1);
+  std::vector<Block> allocated = block_allocator()->allocate(1);
   if (allocated.empty()) {
     // The extra slot only preserves a checkpoint for the future offload path;
     // recurrent decode itself supports reading and writing the live slot in
@@ -306,14 +306,6 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
     return std::vector<Block>{};
   }
   return allocated;
-}
-
-Block LinearStateBlockManager::allocate() {
-  std::vector<Block> blocks = BlockManagerImpl::allocate(1);
-  if (blocks.empty()) {
-    return Block();
-  }
-  return std::move(blocks[0]);
 }
 
 void LinearStateBlockManager::cache(const Slice<int32_t>& token_ids,
