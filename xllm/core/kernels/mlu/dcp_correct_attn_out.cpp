@@ -78,12 +78,12 @@ void launch_correction(const torch::Tensor& src,
   }
   const torch::DeviceGuard guard(src.device());
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-  const bool fast = base_e && n == 4 && h == 64 && v == 512 &&
+  const bool fast = base_e && n == 4 && (h == 32 || h == 64) && v == 512 &&
                     src.scalar_type() == torch::kBFloat16 &&
                     lse.scalar_type() == torch::kFloat32 &&
                     src.is_contiguous() && lse.is_contiguous();
   using xllm::triton_jit::JITKernel;
-  if (fast && (b <= 128 || (!transpose && b >= 256))) {
+  if (fast && ((h == 64 && b <= 128) || (!transpose && b >= 256))) {
     const torch_mlu::DeviceProp* prop =
         torch_mlu::getDeviceProperties(torch_mlu::current_device());
     CHECK(prop != nullptr);

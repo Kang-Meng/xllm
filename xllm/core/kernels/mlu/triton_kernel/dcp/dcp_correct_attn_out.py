@@ -146,7 +146,10 @@ def tmo_dcp_prefill_kernel(
         diff = local - global_lse
         diff = tl.where(~(diff < float("inf")), -float("inf"), diff)
         factor = tl.exp(diff) if E else tl.exp2(diff)
-        padding = tl.full((G,), tl.load(S + tile * G // H) < 0, tl.int1)
+        if H == 64:
+            padding = tl.full((G,), tl.load(S + tile * G // H) < 0, tl.int1)
+        else:
+            padding = tl.load(S + rows // H, rows < B * H, other=-1) < 0
         d = tl.arange(0, 512)
         offsets = rows[:, None] * 512 + d[None, :]
         output = tl.load(output_ptr + offsets, rows[:, None] < B * H, other=0).to(tl.float32)

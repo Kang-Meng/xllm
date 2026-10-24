@@ -191,6 +191,57 @@ TEST_F(DcpCorrectionTest, Prefill8192MatchesReference) {
   }
 }
 
+TEST_F(DcpCorrectionTest, ShardedHeadPrefillBoundariesAndPadding) {
+  const auto opts = torch::TensorOptions().device(device);
+  for (int64_t b : {0, 1, 128, 129, 255, 256, 257, 513}) {
+    const torch::Tensor src =
+        torch::randn({b, 32, 512}, opts.dtype(torch::kBFloat16));
+    const torch::Tensor lse =
+        torch::randn({4, b, 32}, opts.dtype(torch::kFloat32)) * 3;
+    const torch::Tensor rows = torch::arange(b, opts.dtype(torch::kInt32));
+    // Each 64-head tile spans two tokens with independent padding states.
+    const torch::Tensor slots = torch::where(
+        (rows % 4 == 0) | (rows % 4 == 3), torch::full_like(rows, -1), rows);
+    check_case(src, lse, slots);
+  }
+}
+
+TEST_F(DcpCorrectionTest, ShardedHeadPrefill8192MatchesReference) {
+  const auto opts = torch::TensorOptions().device(device);
+  const torch::Tensor src =
+      torch::randn({8192, 32, 512}, opts.dtype(torch::kBFloat16));
+  const torch::Tensor lse =
+      torch::randn({4, 8192, 32}, opts.dtype(torch::kFloat32));
+  torch::Tensor slots = torch::arange(8192, opts.dtype(torch::kInt32));
+  slots.slice(0, 1, 8192, 2).fill_(-1);
+  const torch::Tensor cpu_src = src.cpu();
+  const torch::Tensor cpu_lse = lse.cpu();
+  const torch::Tensor cpu_slots = slots.cpu();
+  for (int64_t rank = 0; rank < 4; ++rank) {
+    SCOPED_TRACE(::testing::Message() << "rank=" << rank);
+    torch::Tensor out = src.clone();
+    dcp_correct_attn_out(out, lse, slots, rank);
+    check_close(out, reference(cpu_src, cpu_lse, cpu_slots, rank, true));
+  }
+}
+
+TEST_F(DcpCorrectionTest, ShardedHeadPrefillZeroWeightsAndNonfiniteValues) {
+  const auto opts = torch::TensorOptions().device(device);
+  torch::Tensor src =
+      torch::randn({257, 32, 512}, opts.dtype(torch::kBFloat16));
+  torch::Tensor lse = torch::zeros({4, 257, 32}, opts.dtype(torch::kFloat32));
+  torch::Tensor slots = torch::arange(257, opts.dtype(torch::kInt32));
+  lse.select(2, 0).fill_(NAN);
+  lse.select(2, 1).fill_(INFINITY);
+  lse.select(2, 2).fill_(-INFINITY);
+  lse[0].select(1, 3).fill_(-INFINITY);
+  src.slice(1, 0, 4).fill_(NAN);
+  lse[0].select(1, 4).fill_(-102);
+  src.select(1, 4).fill_(INFINITY);
+  slots.slice(0, 1, 257, 2).fill_(-1);
+  check_case(src, lse, slots);
+}
+
 TEST_F(DcpCorrectionTest, NonfinitePaddingAndSubnormalWeights) {
   const auto opts = torch::TensorOptions().device(device);
   for (int64_t b : {1, 32, 128, 129, 256}) {
