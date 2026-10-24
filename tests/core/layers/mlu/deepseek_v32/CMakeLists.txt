@@ -88,3 +88,33 @@ cc_test(
   ENVIRONMENT
     "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
 )
+
+# Forks eight ranks before MLU initialization; keep independent of layer_test.
+cc_test(
+  NAME
+    glm53_indexer_dcp_multi_device_test
+  SRCS
+    glm53_indexer_dcp_multi_device_test.cpp
+  DEPS
+    :config
+    :mlu_layers
+    :parallel_state
+    :state_dict
+    :util
+    GTest::gtest_main
+    torch
+    glog::glog
+  ENVIRONMENT
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
+)
+
+# Each distributed scenario consumes all eight cards, including under ctest -j.
+if(TARGET glm53_indexer_dcp_multi_device_test)
+  set_tests_properties(
+    Glm53IndexerDcpMultiDeviceTest.ChunkedBatch1
+    Glm53IndexerDcpMultiDeviceTest.ChunkedBatch16
+    Glm53IndexerDcpMultiDeviceTest.PrefillBatch1
+    Glm53IndexerDcpMultiDeviceTest.PrefillBatch16
+    PROPERTIES RUN_SERIAL TRUE
+  )
+endif()
