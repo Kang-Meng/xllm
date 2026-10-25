@@ -15,25 +15,37 @@ limitations under the License.
 
 #include "api_service/call.h"
 
+#include <utility>
+
 #include "api_service/http_request_body.h"
 #include "api_service/request_id.h"
+#include "api_service/rpc_request_metrics.h"
 #include "core/common/constants.h"
 #include "core/common/metrics.h"
 #include "core/util/verbose_trace_logger.h"
 
 namespace xllm {
-void Call::record_error() {
+void Call::record_error(Status status) {
   response_complete_ = false;
+  error_status_ = std::move(status);
   // RateLimiter counts admission rejections; rendering the error must not
   // count the same request again.
 }
 
-void Call::record_result(bool connected) const {
+void Call::record_result(bool connected,
+                         bool stream_disconnected,
+                         bool controller_released) const {
   if (response_complete_ && connected) {
     COUNTER_INC(server_request_total_ok);
   } else {
     COUNTER_INC(server_request_total_fail);
   }
+  record_api_request_terminal(controller_,
+                              response_complete_ && connected,
+                              error_status_ ? &*error_status_ : nullptr,
+                              stream_disconnected,
+                              x_request_id_,
+                              controller_released);
 }
 
 Call::Call(brpc::Controller* controller,

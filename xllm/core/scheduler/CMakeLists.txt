@@ -44,6 +44,7 @@ cc_library(
     :pd_topology_guard
     glog::glog
     Folly::folly
+    absl::strings
     absl::time
     absl::synchronization
 )

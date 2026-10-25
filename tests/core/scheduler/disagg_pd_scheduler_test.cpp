@@ -2147,6 +2147,100 @@ TEST_F(ReservationTest, ReleaseNeverConsumesAnotherReservation) {
             (std::vector<size_t>{0, 0}));
 }
 
+TEST_F(ReservationTest, ReleaseBeforeLateAllocationPreventsReservation) {
+  EXPECT_FALSE(decode_.release_reservation("late", "expired-reservation"));
+  auto expired = make_request({1, 2, 3, 4, 5, 6, 7, 8}, "late");
+  expired->state().pd_reservation_id = "expired-reservation";
+  ASSERT_EQ(decode_.try_admit(expired), DecodeAdmissionResult::ADMITTED);
+  EXPECT_FALSE(decode_.decode_schedule(expired, "prefill"));
+  EXPECT_TRUE(decode_.reservations_empty());
+  EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks(),
+            (std::vector<size_t>{0, 0}));
+
+  reserve("late", "fresh-reservation");
+  EXPECT_TRUE(decode_.release_reservation("late", "fresh-reservation"));
+  auto replayed = make_request({1, 2, 3, 4, 5, 6, 7, 8}, "late");
+  replayed->state().pd_reservation_id = "fresh-reservation";
+  ASSERT_EQ(decode_.try_admit(replayed), DecodeAdmissionResult::ADMITTED);
+  EXPECT_FALSE(decode_.decode_schedule(replayed, "prefill"));
+  EXPECT_TRUE(decode_.reservations_empty());
+  EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks(),
+            (std::vector<size_t>{0, 0}));
+}
+
+TEST_F(ReservationTest, RepeatedLateAllocationsRemainCancelled) {
+  auto released = reserve(/*id=*/"late", /*identity=*/"released-reservation");
+  const Request& released_request = *released;
+  EXPECT_EQ(released_request.state().pd_reservation_id, "released-reservation");
+  ASSERT_TRUE(
+      decode_.release_reservation(released_request.request_id(),
+                                  released_request.state().pd_reservation_id));
+
+  for (int32_t attempt = 0; attempt < 2; ++attempt) {
+    SCOPED_TRACE(attempt);
+    auto replayed = make_request(/*prompt_token_ids=*/{1, 2, 3, 4, 5, 6, 7, 8},
+                                 /*req_id=*/"late");
+    replayed->state().pd_reservation_id =
+        released_request.state().pd_reservation_id;
+    ASSERT_EQ(decode_.try_admit(replayed), DecodeAdmissionResult::ADMITTED);
+    EXPECT_FALSE(
+        decode_.decode_schedule(replayed, /*prefill_instance_name=*/"prefill"));
+    EXPECT_TRUE(decode_.reservations_empty());
+    EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks(),
+              (std::vector<size_t>{0, 0}));
+    EXPECT_EQ(first_cache_size(*engine_.block_manager_pool()), 0u);
+  }
+
+  reserve(/*id=*/"late", /*identity=*/"fresh-reservation");
+  EXPECT_TRUE(
+      decode_.release_reservation(/*req_id=*/"late",
+                                  /*reservation_id=*/"fresh-reservation"));
+}
+
+TEST(ReservationOOC, ChannelFailureReleasesUncomputedBlocksWithoutCaching) {
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  set_metrics_model(engine);
+  TestPDOOCScheduler decode(&engine, make_decode_options());
+  decode.set_prefill_channel("prefill", nullptr);
+  auto request = make_request({1, 2, 3, 4}, "channel-failure");
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  ASSERT_GT(engine.block_manager_pool()->num_used_blocks()[0], 0u);
+  EXPECT_FALSE(decode.decode_schedule(request, "prefill"));
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
+  EXPECT_EQ(first_cache_size(*engine.block_manager_pool()), 0u);
+}
+
+TEST(ReservationOOC, ReleaseBeforeLateAllocationPreventsReservation) {
+  FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+  set_metrics_model(engine);
+  TestPDOOCScheduler decode(&engine, make_decode_options());
+  proto::DisaggPDService_Stub stub(nullptr);
+  decode.set_prefill_channel("prefill", &stub);
+
+  EXPECT_FALSE(decode.release_reservation("late", "expired-reservation"));
+  auto expired = make_request({1, 2}, "late");
+  expired->state().pd_reservation_id = "expired-reservation";
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(expired->sequences()[0].get()));
+  EXPECT_FALSE(decode.decode_schedule(expired, "prefill"));
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
+  EXPECT_FALSE(decode.release_reservation("late", "expired-reservation"));
+
+  auto fresh = make_request({1, 2}, "late");
+  fresh->state().pd_reservation_id = "fresh-reservation";
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(fresh->sequences()[0].get()));
+  ASSERT_TRUE(decode.decode_schedule(fresh, "prefill"));
+  EXPECT_TRUE(decode.release_reservation("late", "fresh-reservation"));
+  auto replayed = make_request({1, 2}, "late");
+  replayed->state().pd_reservation_id = "fresh-reservation";
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(replayed->sequences()[0].get()));
+  EXPECT_FALSE(decode.decode_schedule(replayed, "prefill"));
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
+}
+
 TEST_F(ReservationTest, UnlinkClearsOnlyMatchingReservationMetrics) {
   auto first = reserve();
   auto other = make_request({11, 12}, "other");

@@ -123,7 +123,8 @@ RequestTerminalOutcome Request::claim_terminal_outcome(
     return outcome;
   }
   RequestTerminalOutcome expected = RequestTerminalOutcome::NONE;
-  if (!terminal_outcome_.compare_exchange_strong(expected, outcome)) {
+  if (!terminal_outcome_.compare_exchange_strong(
+          expected, outcome, std::memory_order_relaxed)) {
     return RequestTerminalOutcome::NONE;
   }
   return outcome;
@@ -134,12 +135,10 @@ void Request::log_terminal_statistic(RequestTerminalOutcome outcome,
                                      double total_latency) {
   // Client-side cancellation can leave the output status OK. Normalize the
   // terminal log without changing the status sent to the caller.
-  std::optional<Status> cancelled_status;
-  if (outcome == RequestTerminalOutcome::CANCELLED && status.ok()) {
-    cancelled_status.emplace(StatusCode::CANCELLED, "Cancelled");
-  }
-  const Status& logged_status =
-      cancelled_status.has_value() ? *cancelled_status : status;
+  const Status logged_status =
+      (outcome == RequestTerminalOutcome::CANCELLED && status.ok())
+          ? Status(StatusCode::CANCELLED, "Cancelled")
+          : status;
   const char* outcome_name =
       outcome == RequestTerminalOutcome::SUCCESS     ? "success"
       : outcome == RequestTerminalOutcome::CANCELLED ? "cancelled"
@@ -157,7 +156,7 @@ void Request::log_terminal_statistic(RequestTerminalOutcome outcome,
 }
 
 void Request::log_prefill_statistic(double total_latency) {
-  if (prefill_statistic_logged_.exchange(true)) {
+  if (prefill_statistic_logged_.exchange(true, std::memory_order_relaxed)) {
     return;
   }
   log_statistic(total_latency, /*prefill_stage=*/true);

@@ -550,6 +550,8 @@ class StreamHttpTest : public ::testing::Test {
 TEST_F(StreamHttpTest, SuccessfulStreamStillEndsWithDone) {
   const double successes = COUNTER_VALUE(server_request_total_ok);
   const double failures = COUNTER_VALUE(server_request_total_fail);
+  const double terminal_successes =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "success");
   brpc::Controller controller;
   send(&controller);
 
@@ -562,12 +564,16 @@ TEST_F(StreamHttpTest, SuccessfulStreamStillEndsWithDone) {
   EXPECT_EQ(body.find("rate_limit_exceeded"), std::string::npos);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes + 1);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "success"),
+            terminal_successes + 1);
 }
 
 TEST_F(StreamHttpTest, ErrorPreservesResponseCommitState) {
   for (const std::string& mode : {"before", "after"}) {
     const double successes = COUNTER_VALUE(server_request_total_ok);
     const double failures = COUNTER_VALUE(server_request_total_fail);
+    const double invalid_requests =
+        MULTI_COUNTER_VALUE(api_request_terminal_total, "invalid_request");
     brpc::Controller controller;
     controller.request_attachment().append(mode);
     send(&controller);
@@ -579,6 +585,9 @@ TEST_F(StreamHttpTest, ErrorPreservesResponseCommitState) {
     EXPECT_EQ(body.find("data: [DONE]") != std::string::npos, started);
     EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes);
     EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures + 1);
+    EXPECT_EQ(
+        MULTI_COUNTER_VALUE(api_request_terminal_total, "invalid_request"),
+        invalid_requests + 1);
   }
 }
 
@@ -589,11 +598,13 @@ TEST(RequestMetricsTest, HandoffDoesNotCountAsCompletion) {
   NoopClosure done;
   const double successes = COUNTER_VALUE(server_request_total_ok);
   const double failures = COUNTER_VALUE(server_request_total_fail);
-  ClosureGuard guard(
-      &done,
-      [](void* context) { request_in_metric(context); },
-      [&controller](void*) { request_out_metric(&controller); });
+  const double unavailable =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "unavailable");
   {
+    ClosureGuard guard(
+        &done,
+        [](void* context) { request_in_metric(context); },
+        [&controller](void*) { request_out_metric(&controller); });
     CompletionCallForTest call(&controller,
                                guard.release(),
                                &request,
@@ -605,6 +616,8 @@ TEST(RequestMetricsTest, HandoffDoesNotCountAsCompletion) {
   }
   EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures + 1);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "unavailable"),
+            unavailable + 1);
 }
 
 TEST(RequestMetricsTest, EarlyHttpErrorIsNotSuccessful) {

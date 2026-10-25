@@ -1752,16 +1752,24 @@ bool PDOOCScheduler::decode_schedule(std::shared_ptr<Request>& request,
   if (!stub) {
     LOG(ERROR) << "Failed to create rpc channel for prefill instance: "
                << prefill_instance_name;
-    kv_cache_manager_->deallocate(request.get());
+    release_unscheduled_request(request);
     return false;
   }
 
-  // TODO: check request_id, duplicate ids are not allowed
   {
-    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
-    if (received_request_map_.find(request->request_id()) !=
-        received_request_map_.end()) {
-      LOG(FATAL) << "Decode receive same request_id from prefill.";
+    std::unique_lock<std::mutex> lock(received_request_map_mutex_);
+    const bool cancelled = is_cancelled_reservation(*request);
+    const bool duplicate =
+        received_request_map_.contains(request->request_id());
+    if (cancelled || duplicate) {
+      if (duplicate) {
+        // A retried RPC may reuse the ID; keep the accepted reservation.
+        LOG(ERROR) << "Decode receive duplicate request_id from prefill: "
+                   << request->request_id();
+      }
+      lock.unlock();
+      release_unscheduled_request(request);
+      return false;
     }
     received_request_map_[request->request_id()] = request;
     reservation_waiting_requests_.store(received_request_map_.size(),

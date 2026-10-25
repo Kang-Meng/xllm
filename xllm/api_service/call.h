@@ -18,6 +18,7 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <butil/iobuf.h>
 
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -65,8 +66,10 @@ class Call {
 
  protected:
   void init(std::string body_x_request_id, bool is_http_request);
-  void record_result(bool connected) const;
-  void record_error();
+  void record_result(bool connected,
+                     bool stream_disconnected = false,
+                     bool controller_released = false) const;
+  void record_error(Status status);
 
  protected:
   brpc::Controller* controller_;
@@ -79,6 +82,7 @@ class Call {
 
   butil::IOBuf request_payload_;
   Status request_payload_status_;
+  std::optional<Status> error_status_;
 };
 
 }  // namespace xllm

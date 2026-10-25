@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <absl/time/time.h>
 #include <brpc/channel.h>
 
 #include <cstddef>
@@ -217,6 +218,13 @@ class DisaggPDScheduler : public ContinuousScheduler {
 
   // Caller holds received_request_map_mutex_. Deallocation stays outside it.
   std::shared_ptr<Request> take_waiting_request(const std::string& req_id);
+  // Caller must not hold received_request_map_mutex_.
+  void release_unscheduled_request(const std::shared_ptr<Request>& request);
+  // Caller holds received_request_map_mutex_.
+  void prune_cancelled_reservations(absl::Time now);
+  // Caller holds received_request_map_mutex_; check and insertion must be
+  // atomic with respect to release_reservation.
+  bool is_cancelled_reservation(const Request& request);
 
   void do_permanent_rejection(const std::shared_ptr<Request>& request);
 
@@ -306,6 +314,9 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // request_id -> Request object
   std::unordered_map<std::string, std::shared_ptr<Request>>
       received_request_map_;
+  // A release can arrive before a timed-out AddNewRequests finishes on Decode.
+  std::unordered_map<std::string, absl::Time> cancelled_reservations_;
+  absl::Time next_cancellation_prune_ = absl::InfinitePast();
   std::atomic<size_t> reservation_waiting_requests_{0};
   // prefill_instance_name -> set of request_ids.
   // Used for bulk cleanup when a prefill instance is unlinked.

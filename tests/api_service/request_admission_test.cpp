@@ -45,6 +45,240 @@ class CountingClosure final : public google::protobuf::Closure {
   int32_t count_ = 0;
 };
 
+class ReleasedStreamCall final
+    : public StreamCall<proto::CompletionRequest, proto::CompletionResponse> {
+ public:
+  using StreamCall::StreamCall;
+
+  void simulate_handoff_and_finish(bool disconnected) {
+    stream_started_ = true;
+    response_complete_ = !disconnected;
+    connection_status_ = disconnected ? -1 : 0;
+    controller_ = nullptr;
+  }
+};
+
+class CanceledController final : public brpc::Controller {
+ public:
+  bool IsCanceled() const override { return true; }
+};
+
+class ConnectedController final : public brpc::Controller {
+ public:
+  // A bare brpc Controller has no peer socket and reports IsCanceled().
+  // This fixture models the live connection owned by a normal server call.
+  bool IsCanceled() const override { return false; }
+};
+
+TEST(ApiTerminalMetricsTest, SuccessfulHandoffCountsOnceAfterGuardDestruction) {
+  ConnectedController controller;
+  ASSERT_FALSE(controller.Failed());
+  ASSERT_FALSE(controller.IsCanceled());
+  proto::CompletionRequest request;
+  proto::CompletionResponse response;
+  CountingClosure done;
+  const double successes = COUNTER_VALUE(server_request_total_ok);
+  const double failures = COUNTER_VALUE(server_request_total_fail);
+  const double terminal_successes =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "success");
+  {
+    ClosureGuard guard(
+        &done,
+        [](void* context) { request_in_metric(context); },
+        [&controller](void* /*unused*/) { request_out_metric(&controller); });
+    {
+      NonStreamCall<proto::CompletionRequest, proto::CompletionResponse> call(
+          &controller,
+          guard.release(),
+          &request,
+          &response,
+          /*use_arena=*/true,
+          /*is_http_request=*/true);
+      ASSERT_TRUE(call.write_and_finish(response));
+      EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "success"),
+                terminal_successes);
+    }
+    EXPECT_EQ(done.count(), 1);
+  }
+  EXPECT_EQ(done.count(), 1);
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes + 1);
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "success"),
+            terminal_successes + 1);
+}
+
+TEST(ApiTerminalMetricsTest, DisconnectedStreamRetainsTransportOutcome) {
+  const Status status(StatusCode::DEADLINE_EXCEEDED);
+  const double cancelled =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "cancelled");
+  const double timeouts =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "timeout");
+  record_api_request_terminal(nullptr,
+                              /*response_complete=*/false,
+                              &status,
+                              /*stream_disconnected=*/true,
+                              "disconnected-error-stream",
+                              /*controller_released=*/true);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "cancelled"),
+            cancelled + 1);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "timeout"),
+            timeouts);
+}
+
+TEST(ApiTerminalMetricsTest, ClassifiesExplicitFailuresWithoutHttpState) {
+  struct FailureCase {
+    Status status;
+    const char* outcome;
+  };
+  const FailureCase cases[] = {
+      {Status(StatusCode::UNKNOWN, "", FailureReason::UNAUTHENTICATED),
+       "authentication"},
+      {Status(StatusCode::UNKNOWN, "", FailureReason::PERMISSION_DENIED),
+       "authentication"},
+      {Status(StatusCode::UNKNOWN, "", FailureReason::MODEL_NOT_FOUND),
+       "model_not_found"},
+      {Status(StatusCode::RESOURCE_EXHAUSTED,
+              "",
+              FailureReason::CONCURRENCY_LIMIT_REACHED),
+       "rate_limited"},
+      {Status(StatusCode::RESOURCE_EXHAUSTED,
+              "",
+              FailureReason::TEMPORARY_OVERLOAD),
+       "unavailable"},
+      {Status::invalid_parameter("invalid value", "temperature"),
+       "invalid_request"},
+      {Status(StatusCode::INVALID_ARGUMENT, "", FailureReason::PROMPT_TOO_LONG),
+       "invalid_request"},
+      {Status(StatusCode::CANCELLED), "cancelled"},
+      {Status(StatusCode::DEADLINE_EXCEEDED), "timeout"},
+      {Status(StatusCode::INVALID_ARGUMENT), "invalid_request"},
+      {Status(StatusCode::UNAVAILABLE), "unavailable"},
+      {Status(StatusCode::RESOURCE_EXHAUSTED), "internal_error"},
+      {Status(StatusCode::UNKNOWN), "internal_error"},
+      {Status(
+           StatusCode::INVALID_ARGUMENT, "", static_cast<FailureReason>(999)),
+       "internal_error"}};
+  for (const FailureCase& test_case : cases) {
+    SCOPED_TRACE(test_case.outcome);
+    const double before =
+        MULTI_COUNTER_VALUE(api_request_terminal_total, test_case.outcome);
+    // After SSE handoff the controller may already have been destroyed.
+    record_api_request_terminal(nullptr,
+                                /*response_complete=*/false,
+                                &test_case.status,
+                                /*stream_disconnected=*/false,
+                                "released-error-stream",
+                                /*controller_released=*/true);
+    EXPECT_EQ(
+        MULTI_COUNTER_VALUE(api_request_terminal_total, test_case.outcome),
+        before + 1);
+  }
+}
+
+TEST(ApiTerminalMetricsTest, UnknownPublicCodeRetainsHttpClassification) {
+  struct ResponseCase {
+    int32_t status_code;
+    const char* outcome;
+  };
+  const ResponseCase cases[] = {{400, "invalid_request"},
+                                {404, "invalid_request"},
+                                {401, "authentication"},
+                                {403, "authentication"},
+                                {429, "rate_limited"},
+                                {503, "unavailable"},
+                                {504, "timeout"},
+                                {500, "internal_error"}};
+  for (const ResponseCase& test_case : cases) {
+    SCOPED_TRACE(test_case.status_code);
+    CanceledController controller;
+    controller.http_response().set_status_code(test_case.status_code);
+    controller.http_response().SetHeader("X-Xllm-Error-Code", "future_code");
+    const double before =
+        MULTI_COUNTER_VALUE(api_request_terminal_total, test_case.outcome);
+    // A committed HTTP error must win over cancellation at teardown.
+    request_out_metric(&controller);
+    EXPECT_EQ(
+        MULTI_COUNTER_VALUE(api_request_terminal_total, test_case.outcome),
+        before + 1);
+  }
+}
+
+TEST(ApiTerminalMetricsTest, UnclassifiedResourceExhaustionIsInternalError) {
+  const double before =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "internal_error");
+  brpc::Controller controller;
+  proto::CompletionRequest request;
+  proto::CompletionResponse response;
+  CountingClosure done;
+  {
+    NonStreamCall<proto::CompletionRequest, proto::CompletionResponse> call(
+        &controller,
+        &done,
+        &request,
+        &response,
+        /*use_arena=*/true,
+        /*is_http_request=*/true);
+    EXPECT_TRUE(call.finish_with_error(
+        Status(StatusCode::RESOURCE_EXHAUSTED, "capacity exhausted")));
+    EXPECT_EQ(controller.http_response().status_code(), 500);
+  }
+  EXPECT_EQ(done.count(), 1);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "internal_error"),
+            before + 1);
+}
+
+TEST(ApiTerminalMetricsTest, NonStreamCancellationWinsOverBrpcFailure) {
+  const double before =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "cancelled");
+  CanceledController controller;
+  controller.SetFailed("client disconnected");
+  ASSERT_TRUE(controller.Failed());
+  ASSERT_TRUE(controller.IsCanceled());
+  ASSERT_LT(controller.http_response().status_code(), 400);
+  proto::CompletionRequest request;
+  proto::CompletionResponse response;
+  CountingClosure done;
+  {
+    NonStreamCall<proto::CompletionRequest, proto::CompletionResponse> call(
+        &controller,
+        &done,
+        &request,
+        &response,
+        /*use_arena=*/true,
+        /*is_http_request=*/true);
+  }
+  EXPECT_EQ(done.count(), 1);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "cancelled"),
+            before + 1);
+}
+
+TEST(ApiTerminalMetricsTest, StreamExitDoesNotReadReleasedController) {
+  for (bool disconnected : {false, true}) {
+    const char* outcome = disconnected ? "cancelled" : "success";
+    const double before =
+        MULTI_COUNTER_VALUE(api_request_terminal_total, outcome);
+    brpc::Controller controller;
+    controller.http_request().SetHeader("x-request-id", "released-stream");
+    proto::CompletionRequest request;
+    request.set_stream(true);
+    proto::CompletionResponse response;
+    CountingClosure done;
+    {
+      ReleasedStreamCall call(&controller,
+                              &done,
+                              &request,
+                              &response,
+                              /*use_arena=*/true,
+                              /*is_http_request=*/true);
+      done.Run();  // Opening SSE hands the RPC controller back to brpc.
+      call.simulate_handoff_and_finish(disconnected);
+    }
+    EXPECT_EQ(done.count(), 1);
+    EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, outcome),
+              before + 1);
+  }
+}
+
 class RateLimitMetricsTest : public testing::Test {
  protected:
   void SetUp() override {
@@ -67,6 +301,8 @@ class RateLimitMetricsTest : public testing::Test {
     const double limited_before = COUNTER_VALUE(server_request_total_limit);
     const double failed_before = COUNTER_VALUE(server_request_total_fail);
     const double ok_before = COUNTER_VALUE(server_request_total_ok);
+    const double terminal_before =
+        MULTI_COUNTER_VALUE(api_request_terminal_total, "rate_limited");
     ClosureGuard guard(
         &done,
         [](void* context) { request_in_metric(context); },
@@ -94,6 +330,10 @@ class RateLimitMetricsTest : public testing::Test {
     EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
     EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failed_before + 1);
     EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), ok_before);
+    if (status.reason() == FailureReason::CONCURRENCY_LIMIT_REACHED) {
+      EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "rate_limited"),
+                terminal_before + 1);
+    }
   }
 
  private:
@@ -179,6 +419,8 @@ TEST_F(RateLimitMetricsTest, EarlyHttp429WithoutCallCountsOnce) {
   CountingClosure done;
   const double limited_before = COUNTER_VALUE(server_request_total_limit);
   const double failed_before = COUNTER_VALUE(server_request_total_fail);
+  const double terminal_before =
+      MULTI_COUNTER_VALUE(api_request_terminal_total, "rate_limited");
   {
     ClosureGuard guard(
         &done,
@@ -193,6 +435,38 @@ TEST_F(RateLimitMetricsTest, EarlyHttp429WithoutCallCountsOnce) {
   EXPECT_EQ(done.count(), 1);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before + 1);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failed_before + 1);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "rate_limited"),
+            terminal_before + 1);
+}
+
+TEST(RequestAdmissionTest, EarlyHttpErrorsHaveOneClassifiedApiTerminal) {
+  const api_service::HttpBearerAuthenticator authenticator("expected-key");
+  const Status model_not_found(
+      StatusCode::UNKNOWN, "missing model", FailureReason::MODEL_NOT_FOUND);
+  for (const std::string& outcome :
+       {"authentication", "invalid_request", "model_not_found"}) {
+    brpc::Controller controller;
+    CountingClosure done;
+    const double before =
+        MULTI_COUNTER_VALUE(api_request_terminal_total, outcome);
+    {
+      ClosureGuard guard(
+          &done,
+          [](void* context) { request_in_metric(context); },
+          [&controller](void* /*unused*/) { request_out_metric(&controller); });
+      if (outcome == "authentication") {
+        EXPECT_FALSE(authenticator.prepare_request(&controller));
+      } else if (outcome == "invalid_request") {
+        api_service::write_bad_request(&controller, "malformed JSON");
+      } else {
+        api_service::write_http_error(&controller, model_not_found);
+      }
+    }
+    EXPECT_EQ(done.count(), 1);
+    EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, outcome),
+              before + 1);
+    EXPECT_NE(controller.http_response().GetHeader("x-request-id"), nullptr);
+  }
 }
 
 TEST(RequestAdmissionTest, UnsupportedModelDoesNotConsumeConcurrencySlot) {

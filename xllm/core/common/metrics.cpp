@@ -284,6 +284,9 @@ DEFINE_COUNTER(server_request_total_limit,
                "Total number of limit request that server processed");
 DEFINE_COUNTER(server_request_total_fail,
                "Total number of fail request that server processed");
+DEFINE_MULTI_COUNTER(api_request_terminal_total,
+                     "outcome",
+                     "Terminal outcome of inference API entries");
 
 DEFINE_GAUGE(num_concurrent_requests,
              "Number of concurrent requests in server");

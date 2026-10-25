@@ -313,6 +313,9 @@ DECLARE_COUNTER(server_request_in_total);
 DECLARE_COUNTER(server_request_total_ok);
 DECLARE_COUNTER(server_request_total_limit);
 DECLARE_COUNTER(server_request_total_fail);
+// One terminal per inference API entry (including failures before Request).
+// PD hops and retries have separate entries; this is not a client success rate.
+DECLARE_MULTI_COUNTER(api_request_terminal_total);
 
 DECLARE_GAUGE(num_concurrent_requests);
 

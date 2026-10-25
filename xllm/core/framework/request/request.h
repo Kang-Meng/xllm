@@ -168,6 +168,7 @@ class Request : public RequestBase {
   bool is_starved() const { return starved_; }
 
   RequestState& state() { return state_; }
+  const RequestState& state() const { return state_; }
   size_t best_of() const { return state_.best_of; }
   void update_connection_status();
 

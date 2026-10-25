@@ -65,7 +65,9 @@ class StreamCall : public Call {
   ~StreamCall() override {
     record_result(stream_started_
                       ? connection_status_ == 0
-                      : !controller_->Failed() && !controller_->IsCanceled());
+                      : !controller_->Failed() && !controller_->IsCanceled(),
+                  connection_status_ != 0,
+                  stream_started_);
     // A stream is opened only on the first successful event. A rejection before
     // that point is a regular HTTP JSON response and still needs its done Run.
     if (!stream_started_) {
@@ -112,7 +114,7 @@ class StreamCall : public Call {
     if (stream_ && stream_finished_) {
       return false;
     }
-    record_error();
+    record_error(status);
     if (!is_http_request_) {
       controller_->SetFailed(status.message());
       return true;

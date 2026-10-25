@@ -18,9 +18,22 @@ limitations under the License.
 #include <brpc/server.h>
 #include <google/protobuf/service.h>
 
+#include <string>
+
 #include "core/common/metrics.h"
+#include "core/common/types.h"
 
 namespace xllm {
+
+// Called exactly once by the owner of an inference API entry: the entry guard
+// before handoff, or Call at the end of its lifetime (not at SSE first write).
+// A released SSE controller may be nullptr; its Call must supply x_request_id.
+void record_api_request_terminal(brpc::Controller* controller,
+                                 bool response_complete,
+                                 const Status* error_status = nullptr,
+                                 bool stream_disconnected = false,
+                                 const std::string& x_request_id = "",
+                                 bool controller_released = false);
 
 inline void request_in_metric(void* /*context*/) {
   COUNTER_INC(server_request_in_total);
@@ -33,8 +46,9 @@ inline void request_out_metric(void* context) {
     return;
   }
 
-  if (!ctrl->Failed() && !ctrl->IsCanceled() &&
-      ctrl->http_response().status_code() < 400) {
+  const bool request_ok = !ctrl->Failed() && !ctrl->IsCanceled() &&
+                          ctrl->http_response().status_code() < 400;
+  if (request_ok) {
     COUNTER_INC(server_request_total_ok);
   } else {
     COUNTER_INC(server_request_total_fail);
@@ -43,6 +57,7 @@ inline void request_out_metric(void* context) {
       COUNTER_INC(server_request_total_limit);
     }
   }
+  record_api_request_terminal(ctrl, request_ok);
 }
 
 }  // namespace xllm

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "scheduler/disagg_pd_scheduler.h"
 
+#include <absl/strings/str_cat.h>
+#include <absl/strings/string_view.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <brpc/errno.pb.h>
@@ -61,6 +63,14 @@ namespace xllm {
 namespace {
 
 using RequestPtr = std::shared_ptr<Request>;
+
+std::string reservation_key(const std::string& req_id,
+                            const std::string& reservation_id) {
+  return absl::StrCat(req_id, absl::string_view("\0", 1), reservation_id);
+}
+
+constexpr absl::Duration kCancellationTombstoneTtl = absl::Minutes(5);
+constexpr absl::Duration kCancellationPruneInterval = absl::Minutes(1);
 
 Status rpc_failure_status(const brpc::Controller& controller) {
   switch (controller.ErrorCode()) {
@@ -608,7 +618,8 @@ void DisaggPDScheduler::dispatch_requests() {
 
     const InstanceInfo remote_info =
         xservice_client_->get_instance_info(selected_instance);
-    if (remote_info.name.empty()) {
+    // Cleanup still needs this address if allocation times out before connect.
+    if (remote_info.name.empty() || remote_info.rpc_address.empty()) {
       response_processor_->process_failed_request(
           request,
           {StatusCode::UNAVAILABLE,
@@ -773,14 +784,16 @@ void DisaggPDScheduler::dispatch_requests() {
     if (cntl.Failed()) {
       LOG(ERROR) << "Failed to add new requests to decode instance : "
                  << selected_instance << ", error text : " << cntl.ErrorText();
+      const std::string allocation_peer =
+          cntl.remote_side().port == 0
+              ? remote_info.rpc_address
+              : butil::endpoint2str(cntl.remote_side()).c_str();
       for (auto& request : requests) {
+        // The RPC may have allocated Decode blocks before its reply was lost.
+        request->state().decode_rpc_address = allocation_peer;
+        release_failed_request(request);
         response_processor_->process_failed_request(request,
                                                     rpc_failure_status(cntl));
-
-        {
-          std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
-          req_to_channel_map_.erase(request->request_id());
-        }
       }
       continue;
     }
@@ -1227,21 +1240,57 @@ std::shared_ptr<Request> DisaggPDScheduler::take_waiting_request(
   return request;
 }
 
+void DisaggPDScheduler::prune_cancelled_reservations(absl::Time now) {
+  if (now < next_cancellation_prune_) {
+    return;
+  }
+  for (auto it = cancelled_reservations_.begin();
+       it != cancelled_reservations_.end();) {
+    if (it->second <= now) {
+      it = cancelled_reservations_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  next_cancellation_prune_ = now + kCancellationPruneInterval;
+}
+
+bool DisaggPDScheduler::is_cancelled_reservation(const Request& request) {
+  prune_cancelled_reservations(absl::Now());
+  return cancelled_reservations_.contains(
+      reservation_key(request.request_id(), request.state().pd_reservation_id));
+}
+
+void DisaggPDScheduler::release_unscheduled_request(
+    const std::shared_ptr<Request>& request) {
+  for (const auto& sequence : request->sequences()) {
+    engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+  }
+}
+
 bool DisaggPDScheduler::release_reservation(const std::string& req_id,
                                             const std::string& reservation_id) {
+  if (req_id.empty() || reservation_id.empty()) {
+    return false;
+  }
   std::shared_ptr<Request> request;
   {
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    const absl::Time now = absl::Now();
+    prune_cancelled_reservations(now);
+    // Release may arrive before AddNewRequests registers the reservation.
+    // Tombstone this attempt even if it is absent or a different attempt is
+    // waiting; a late AddNewRequests must not resurrect a released allocation.
+    cancelled_reservations_[reservation_key(req_id, reservation_id)] =
+        now + kCancellationTombstoneTtl;
     auto it = received_request_map_.find(req_id);
-    if (it == received_request_map_.end() || reservation_id.empty() ||
+    if (it == received_request_map_.end() ||
         it->second->state().pd_reservation_id != reservation_id) {
       return false;
     }
     request = take_waiting_request(req_id);
   }
-  for (const auto& sequence : request->sequences()) {
-    engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
-  }
+  release_unscheduled_request(request);
   return true;
 }
 
@@ -1254,14 +1303,17 @@ bool DisaggPDScheduler::decode_schedule(
 
   {
     std::unique_lock<std::mutex> lock(received_request_map_mutex_);
+    if (is_cancelled_reservation(*request)) {
+      lock.unlock();
+      release_unscheduled_request(request);
+      return false;
+    }
     if (received_request_map_.find(request->request_id()) !=
         received_request_map_.end()) {
       LOG(ERROR) << "Decode receive duplicate request_id from prefill: "
                  << request->request_id();
       lock.unlock();
-      for (const auto& sequence : request->sequences()) {
-        engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
-      }
+      release_unscheduled_request(request);
       return false;
     }
     received_request_map_[request->request_id()] = request;

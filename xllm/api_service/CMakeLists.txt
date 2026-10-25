@@ -46,6 +46,7 @@ cc_library(
     call.cpp
     request_id.cpp
     request_admission.cpp
+    rpc_request_metrics.cpp
     completion_service_impl.cpp
     rec_completion_service_impl.cpp
     chat_service_impl.cpp
