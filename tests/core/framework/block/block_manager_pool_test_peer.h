@@ -48,6 +48,14 @@ class BlockManagerPoolTestPeer final {
     return composite.leaf_of(type);
   }
 
+  static BlockManager* leaf_of(BlockManagerPool& pool,
+                               int32_t dp_rank,
+                               BlockType type) {
+    auto* composite = static_cast<CompositeBlockManager*>(
+        pool.block_managers_[dp_rank].get());
+    return composite->leaf_of(type);
+  }
+
   // Assert by-hash checkpoint presence/lookup directly against the LINEAR
   // leaf's inherited prefix_cache_. Production has no by-hash probe on the leaf
   // (restore sources are mounted through allocate_shared); the peer is a friend

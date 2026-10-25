@@ -261,6 +261,7 @@ class FakePrefetchEngine final : public Engine {
     CHECK(request != nullptr);
     dp_rank_ = dp_rank;
     ++request_count_;
+    workers_ended_.assign(worker_count_, false);
     request_ = std::move(request);
     result_ = std::make_shared<PrefetchResult>(worker_count_,
                                                *request_,
@@ -299,6 +300,7 @@ class FakePrefetchEngine final : public Engine {
       }
     }
     CHECK_EQ(remaining_hits, 0u);
+    workers_ended_.at(worker_index) = true;
     result_->mark_worker_ended(worker_index, worker_ok);
   }
 
@@ -342,7 +344,20 @@ class FakePrefetchEngine final : public Engine {
       }
     }
     CHECK_EQ(logical_index, logical_hits.size());
+    workers_ended_.at(worker_index) = true;
     result_->mark_worker_ended(worker_index, worker_ok);
+  }
+
+  void drain_workers() {
+    if (result_ == nullptr) {
+      return;
+    }
+    for (size_t index = 0; index < worker_count_; ++index) {
+      if (!workers_ended_[index]) {
+        workers_ended_[index] = true;
+        result_->mark_worker_ended(index, /*worker_ok=*/false);
+      }
+    }
   }
 
  private:
@@ -351,6 +366,7 @@ class FakePrefetchEngine final : public Engine {
   size_t batch_size_ = 2;
   uint32_t dp_rank_ = 0;
   size_t request_count_ = 0;
+  std::vector<bool> workers_ended_;
   std::shared_ptr<const StoragePrefetchRequest> request_;
   std::shared_ptr<PrefetchResult> result_;
 };
@@ -3012,6 +3028,10 @@ TEST(HierarchyBlockManagerPoolTest,
 
   const int32_t original_chunk_stride =
       SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const auto restore_chunk_stride = folly::makeGuard([original_chunk_stride] {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
       static_cast<int32_t>(kChunkStride);
 
@@ -3035,6 +3055,10 @@ TEST(HierarchyBlockManagerPoolTest,
   std::shared_ptr<Request> request = make_test_request(tokens);
   Sequence* sequence = request->sequences().front().get();
   bool completed = false;
+  const auto cleanup = folly::makeGuard([&pool, sequence] {
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
   pool.prefetch_from_storage(
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
@@ -3048,10 +3072,6 @@ TEST(HierarchyBlockManagerPoolTest,
   ASSERT_EQ(sequence->host_kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_TRUE(
       sequence->host_kv_state().blocks(BlockType::LINEAR).front().is_valid());
-
-  pool.deallocate(sequence);
-  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
-      original_chunk_stride;
 }
 
 TEST(HierarchyBlockManagerPoolTest,
@@ -3085,6 +3105,13 @@ TEST(HierarchyBlockManagerPoolTest,
       make_test_request(std::vector<int32_t>(kPromptTokens, 17));
   Sequence* sequence = request->sequences().front().get();
   bool completed = false;
+  const auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
+    // Fatal assertions must not leave the pool holding unfinished callbacks.
+    // Unfinished workers are failed, never reported as successful transfers.
+    engine.drain_workers();
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
 
   pool.prefetch_from_storage(
       request,
@@ -3134,7 +3161,6 @@ TEST(HierarchyBlockManagerPoolTest,
       sequence->host_kv_state().blocks(BlockType::LINEAR);
   ASSERT_EQ(linear_blocks.size(), 1u);
   EXPECT_TRUE(linear_blocks.front().is_valid());
-  pool.deallocate(sequence);
 }
 
 // A FLAT_KV_LINEAR unit hits only when its KV block and its LINEAR block both
@@ -3311,6 +3337,13 @@ TEST(HierarchyBlockManagerPoolTest,
       make_test_request(std::vector<int32_t>(kPromptTokens, 17));
   Sequence* sequence = request->sequences().front().get();
   bool completed = false;
+  const auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
+    // Fatal assertions must not leave the pool holding unfinished callbacks.
+    // Unfinished workers are failed, never reported as successful transfers.
+    engine.drain_workers();
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
   pool.prefetch_from_storage(
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
@@ -3319,7 +3352,7 @@ TEST(HierarchyBlockManagerPoolTest,
   ASSERT_EQ(engine.request().units.size(), 1u);
   EXPECT_EQ(engine.request().units.front().gated_blocks.size() * kKvBlockSize,
             kTargetTailTokens - kMatchedTailTokens);
-  EXPECT_EQ(engine.request().units.front().non_gated_blocks.size(), 1u);
+  ASSERT_EQ(engine.request().units.front().non_gated_blocks.size(), 1u);
 
   const size_t transfer_count =
       engine.request().batch_transfer_count(0, engine.request().units.size());
@@ -3390,6 +3423,13 @@ TEST_P(LinearTailHostPrefetchTest,
   std::shared_ptr<Request> request = make_test_request(tokens);
   Sequence* sequence = request->sequences().front().get();
   bool completed = false;
+  auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
+    // Fatal assertions must not leave the pool holding unfinished callbacks.
+    // Unfinished workers are failed, never reported as successful transfers.
+    engine.drain_workers();
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
   pool.prefetch_from_storage(
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
@@ -3407,6 +3447,7 @@ TEST_P(LinearTailHostPrefetchTest,
               hash_sequence.block_hashes(
                   test_case.kv_block_size)[tail_tokens / kv_block_size - 1]);
   pool.deallocate(sequence);
+  cleanup.dismiss();
 
   // Each shorter prompt ends one token beyond a regular boundary, so a hit
   // must restore that exact checkpoint rather than the deeper tail state.
@@ -3418,6 +3459,10 @@ TEST_P(LinearTailHostPrefetchTest,
     const std::vector<int32_t> shorter_tokens(tokens.begin(),
                                               tokens.begin() + boundary + 1);
     Sequence shorter = make_test_sequence(/*index=*/1, shorter_tokens);
+    const auto cleanup_shorter = folly::makeGuard([&pool, &shorter] {
+      pool.deallocate(&shorter);
+      HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+    });
     host_manager->allocate_shared_for_sequence(&shorter,
                                                shorter.host_kv_state());
     const Slice<Block> source =
@@ -3437,7 +3482,6 @@ TEST_P(LinearTailHostPrefetchTest,
       EXPECT_EQ(shorter.host_kv_state().kv_cache_tokens_num(), 0u);
       EXPECT_TRUE(source.empty());
     }
-    pool.deallocate(&shorter);
   }
 }
 
@@ -3567,6 +3611,10 @@ TEST(HierarchyBlockManagerPoolTest,
 
   const int32_t original_chunk_stride =
       SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const auto restore_chunk_stride = folly::makeGuard([original_chunk_stride] {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
       kPrefillChunkSize;
 
@@ -3575,6 +3623,10 @@ TEST(HierarchyBlockManagerPoolTest,
                                  /*dp_size=*/1);
   Sequence sequence =
       make_test_sequence(/*index=*/0, std::vector<int32_t>(9, 103));
+  const auto cleanup = folly::makeGuard([&pool, &sequence] {
+    pool.deallocate(&sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
   ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/9));
   // Cover the prompt before appending. A second prefill allocate would move
   // the host front into an offload pair and leave that slot invalid.
@@ -3898,6 +3950,10 @@ TEST(HierarchyBlockManagerPoolTest,
 
   const int32_t original_chunk_stride =
       SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const auto restore_chunk_stride = folly::makeGuard([original_chunk_stride] {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() = 128;
 
   FakePrefetchEngine engine(/*worker_count=*/1,
@@ -3908,12 +3964,20 @@ TEST(HierarchyBlockManagerPoolTest,
   std::shared_ptr<Request> request = make_test_request(tokens);
   Sequence* sequence = request->sequences().front().get();
   bool completed = false;
+  const auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
+    // Fatal assertions must not leave the pool holding unfinished callbacks.
+    // Unfinished workers are failed, never reported as successful transfers.
+    engine.drain_workers();
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
 
   pool.prefetch_from_storage(
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
   ASSERT_NE(engine.result(), nullptr);
   ASSERT_EQ(engine.request().units.size(), 4u);
+  ASSERT_EQ(engine.request().units.back().non_gated_blocks.size(), 1u);
 
   std::vector<uint8_t> logical_hits;
   logical_hits.reserve(engine.request().batch_transfer_count(0, 4));
@@ -3936,10 +4000,6 @@ TEST(HierarchyBlockManagerPoolTest,
       pool.select_host_cache_restore(sequence, /*max_copy_units=*/4);
   EXPECT_EQ(restore.restore_target_tokens, 512u);
   EXPECT_EQ(restore.copy_units, 4u);
-  pool.deallocate(sequence);
-
-  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
-      original_chunk_stride;
 }
 
 TEST(HierarchyBlockManagerPoolTest,
@@ -3979,6 +4039,13 @@ TEST(HierarchyBlockManagerPoolTest,
                      sequence->block_hashes(/*block_size=*/128));
   linear_leaf->deallocate(std::move(checkpoints));
   bool completed = false;
+  auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
+    // Fatal assertions must not leave the pool holding unfinished callbacks.
+    // Unfinished workers are failed, never reported as successful transfers.
+    engine.drain_workers();
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
   pool.prefetch_from_storage(
       request,
       [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
@@ -4029,6 +4096,7 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
   HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
   pool.deallocate(sequence);
+  cleanup.dismiss();
   EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
   HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
 }

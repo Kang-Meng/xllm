@@ -57,8 +57,9 @@ class CompositeBlockManager : public BlockManager {
   //   FLAT_KV        Plain KV. No cross-leaf trim.
   //   FLAT_KV_LINEAR KV + LINEAR restore. Clamp KV to LINEAR's recoverable
   //                  budget and select its deepest checkpoint.
-  //   SWA_COMPRESSED SWA + C4 + C128. Cross-leaf min, C128-stride clamp,
-  //                  SWA tail-continuity, exact-repeat pop.
+  //   SWA_COMPRESSED SWA + C4/C128 (V4) or C1/C2 (V4.1). Cross-leaf min,
+  //                  largest-block clamp, SWA tail-continuity, exact-repeat
+  //                  pop.
   //   UNSUPPORTED    Prefix cache off (xtensor / --enable_prefix_cache=false).
   enum class LeafCombination : int8_t {
     FLAT_KV,

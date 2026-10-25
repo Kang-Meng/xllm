@@ -1298,6 +1298,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
 
     def bind_kv_caches(self, kv_caches: list[Any]) -> None:
         super().bind_kv_caches(kv_caches)
+        if self._kv_caches and self._kv_caches[0].swa is not None:
+            block_size = int(self._kv_caches[0].swa.size(1))
+            # SWA pages use the bound physical width, not the attention window.
+            # Replace descriptors in the lists already held by the builder;
+            # TOKEN descriptors and matching-width bindings stay unchanged.
+            for index, group in enumerate(self.group_infos):
+                if group.cache_type == DSA_CACHE_SLIDING_WINDOW and group.block_size != block_size:
+                    self.group_infos[index] = replace(group, block_size=block_size)
+            for layer_caches in self.caches_info:
+                for index, cache in enumerate(layer_caches):
+                    if cache.cache_type == DSA_CACHE_SLIDING_WINDOW and cache.block_size != block_size:
+                        layer_caches[index] = replace(cache, block_size=block_size)
         self._swa_ring_blocks = self._compute_swa_ring_blocks()
 
     def reset_forward(self, metadata: Any | None = None) -> None:

@@ -446,6 +446,8 @@ void BlockManagerPool::deallocate_without_cache(Sequence* sequence) {
   // Release every leaf's blocks directly (no prefix-cache final flush).
   for (const BlockType type : {BlockType::KV,
                                BlockType::SWA,
+                               BlockType::C1,
+                               BlockType::C2,
                                BlockType::C4,
                                BlockType::C128,
                                BlockType::EMBEDDING,
