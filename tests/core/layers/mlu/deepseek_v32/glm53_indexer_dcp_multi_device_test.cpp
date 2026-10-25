@@ -628,7 +628,7 @@ DsaTopkState merge_reference(const torch::Tensor& scores,
   return DsaTopkState(output, selected_valid.sum(/*dim=*/1).to(torch::kInt32));
 }
 
-// FP32 merge ties may reorder or exchange equal-scoring candidates. Require
+// BF16 merge ties may reorder or exchange equal-scoring candidates. Require
 // every score above the cutoff, descending score order and exact valid tails.
 void compare_merge(const DsaTopkState& actual,
                    const torch::Tensor& gathered_scores,
@@ -641,8 +641,12 @@ void compare_merge(const DsaTopkState& actual,
   CHECK(actual.context_lens().sizes() == torch::IntArrayRef({kTokens}));
   CHECK(torch::equal(actual.context_lens().cpu(), reference.context_lens()));
   auto output = actual.block_tables().cpu().contiguous();
-  auto score_cpu =
-      gathered_scores.cpu().permute({1, 0, 2}).contiguous().view({kTokens, -1});
+  auto score_cpu = gathered_scores.to(torch::kBFloat16)
+                       .to(torch::kFloat32)
+                       .cpu()
+                       .permute({1, 0, 2})
+                       .contiguous()
+                       .view({kTokens, -1});
   auto slot_cpu =
       gathered_slots.cpu().permute({1, 0, 2}).contiguous().view({kTokens, -1});
   const auto out = output.accessor<int32_t, 2>();
@@ -852,8 +856,8 @@ void run_case(int32_t rank,
   const DsaTopkState merged_cpu(merged.block_tables().cpu(),
                                 merged.context_lens().cpu());
   const auto mapping = pages.new_slots();
-  const auto same_scores =
-      merge_reference(witness_scores_cpu, witness_slots_cpu, mapping);
+  const auto same_scores = merge_reference(
+      witness_scores_cpu.to(torch::kBFloat16), witness_slots_cpu, mapping);
   compare_merge(
       merged_cpu, witness_scores_cpu, witness_slots_cpu, pages, same_scores);
   auto packed = v32_cp::reorder_to_local_shard(merged.block_tables(), *context);

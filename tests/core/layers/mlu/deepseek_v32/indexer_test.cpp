@@ -1155,10 +1155,8 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
   KVCacheConfig::get_instance().block_size(1);
 
   test_config_.index_n_heads = 32;
-
-  test_config_.index_n_heads = 32;
-  parallel_args_.world_size() = 2;
-  parallel_args_.kv_split_size() = 2;
+  parallel_args_.world_size() = 4;
+  parallel_args_.kv_split_size() = 4;
   rotary_emb_ = std::make_shared<RotaryEmbeddingImpl>(
       test_config_.qk_rope_head_dim,
       test_config_.max_position_embeddings,
@@ -1178,13 +1176,13 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
   pre_out.weights.index_put_({1, 1}, 2);
   std::vector<torch::Tensor> rank_scores;
   std::vector<torch::Tensor> rank_slots;
-  rank_scores.reserve(2);
-  rank_slots.reserve(2);
-  for (int32_t rank = 0; rank < 2; ++rank) {
+  rank_scores.reserve(4);
+  rank_slots.reserve(4);
+  for (int32_t rank = 0; rank < 4; ++rank) {
     SCOPED_TRACE(rank);
     parallel_args_.rank() = rank;
     const KVShardLayout layout(
-        /*physical_block_size=*/1, /*dcp_size=*/2, rank);
+        /*physical_block_size=*/1, /*dcp_size=*/4, rank);
     TestInputs inputs;
     DeepseekV32Indexer indexer = idx_create_indexer(parallel_args_,
                                                     test_config_,
@@ -1192,10 +1190,10 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
                                                     rotary_emb_,
                                                     inputs,
                                                     /*enable_fused_qk=*/true);
-    const int32_t ctx_len = 1025 - rank;
+    const int32_t ctx_len = 512 + (rank == 0 ? 1 : 0);
     torch::Tensor keys = torch::zeros({ctx_len, 1, 1, 128}, options_);
     keys.select(/*dim=*/3, /*index=*/0).fill_(20);
-    keys.index_put_({0, 0, 0, 0}, rank == 0 ? 10 : 6);
+    keys.index_put_({0, 0, 0, 0}, rank == 0 ? 10 : (rank == 1 ? 6 : 20));
     keys.index_put_({0, 0, 0, 1}, rank == 0 ? -9 : 0);
     std::optional<torch::Tensor> scales = std::nullopt;
     AttentionMetadata prefill;
@@ -1216,7 +1214,7 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
   gathered.gathered_scores = torch::stack(rank_scores);
   gathered.gathered_global_slots = torch::stack(rank_slots);
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/1, /*dcp_size=*/2, /*dcp_rank=*/0),
+      KVShardLayout(/*physical_block_size=*/1, /*dcp_size=*/4, /*dcp_rank=*/0),
       /*dcp_group=*/nullptr);
   const DsaTopkState merged = context.finish_indexer_candidate_merge(
       std::move(gathered), /*topk=*/2048, torch::zeros({2}, int_option_));

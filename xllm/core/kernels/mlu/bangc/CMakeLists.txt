@@ -57,10 +57,16 @@ set(XLLM_DFLASH2_CONV_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/dflash2_grouped_conv/kernel.mlu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/dflash2_conv_norm/conv_norm.mlu")
 list(REMOVE_ITEM XLLM_BANGC_KERNEL_SOURCES ${XLLM_DFLASH2_CONV_SOURCES})
+set(XLLM_DCP_MERGE_SOURCE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dcp_merge_topk/kernel.mlu")
+list(REMOVE_ITEM XLLM_BANGC_KERNEL_SOURCES "${XLLM_DCP_MERGE_SOURCE}")
+bang_add_library(xllm_mlu_dcp_merge_kernel STATIC "${XLLM_DCP_MERGE_SOURCE}"
+  OPTIONS RELEASE -O2 RELWITHDEBINFO -O2 MINSIZEREL -O2)
 bang_add_library(xllm_mlu_bangc_kernels STATIC ${XLLM_BANGC_KERNEL_SOURCES})
 bang_add_library(xllm_mlu_dflash2_conv_kernels STATIC ${XLLM_DFLASH2_CONV_SOURCES}
   OPTIONS -Xbang-cnas -fno-instruction-combine)
-foreach(bangc_target xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels)
+foreach(bangc_target xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels
+    xllm_mlu_dcp_merge_kernel)
   target_include_directories(${bangc_target} PRIVATE
     "${PROJECT_SOURCE_DIR}/xllm/core" "${NEUWARE_HOME}/include")
   set_target_properties(${bangc_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -77,7 +83,8 @@ target_compile_definitions(xllm_mlu_ops PUBLIC
   "_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}")
 target_link_libraries(xllm_mlu_ops
   PUBLIC torch
-  PRIVATE xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels torch_mlu glog::glog
+  PRIVATE xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels
+    xllm_mlu_dcp_merge_kernel torch_mlu glog::glog
     ${XLLM_BANGC_CNRT_LIBRARY})
 # Keep private archive symbols local, including glog/gflags registries that
 # may also be linked statically into the executable loading this library.

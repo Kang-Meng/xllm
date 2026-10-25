@@ -1,0 +1,508 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang_device_functions_extra.h>
+#include <mlu.h>
+
+#include "kernels/mlu/bangc/src/dcp_merge_topk/launch.h"
+
+namespace xllm::kernel::mlu::bangc {
+namespace {
+constexpr int32_t kCandidates = 8192;
+constexpr int32_t kTopk = 2048;
+constexpr int32_t kInvalidRank = 0xffc0;
+
+// Keys are stored complemented in their low 29 bits, nk = key ^ kKeyMask.
+// A zero key bit is then a nonzero nk bit; __bang_filter accepts any nonzero
+// index bit pattern, so a single integer AND produces the selection mask.
+constexpr int32_t kKeyMask = 0x1fffffff;
+
+__mlu_func__ void zero_bit_mask(int32_t* dst,
+                                const int32_t* src,
+                                int32_t n,
+                                int32_t bit) {
+  __bang_band_scalar(dst, src, 1 << bit, n);
+}
+
+// Converts a zero-bit mask in place into the complementary one-bit mask.
+__mlu_func__ void flip_bit_mask(int32_t* mask, int32_t n, int32_t bit) {
+  __bang_bxor_scalar(mask, mask, 1 << bit, n);
+}
+
+constexpr int32_t kRowStageBytes = 2 * kCandidates * sizeof(int32_t);
+
+// All four shard segments of a query can be issued as one external DMA.
+// A padded on-chip pitch retains the logical last-dimension stride for packing.
+template <typename T>
+__mlu_func__ void load_candidate_row(T* dst,
+                                     const T* src,
+                                     int64_t shard_stride,
+                                     int64_t col_stride,
+                                     int32_t* row_stage,
+                                     int32_t* small_stage,
+                                     const void* bitmask) {
+  constexpr int32_t kBytes = sizeof(T);
+  const int64_t span = ((kTopk - 1) * col_stride + 1) * kBytes;
+  const int64_t pitch = kTopk * col_stride * kBytes;
+  const bool shard_dma_fits = shard_stride <= 0x7fffffffLL / kBytes;
+  if (col_stride == 1 && shard_dma_fits) {
+    __memcpy(dst,
+             src,
+             kTopk * kBytes,
+             GDRAM2NRAM,
+             kTopk * kBytes,
+             shard_stride * kBytes,
+             3);
+    return;
+  }
+  if (pitch <= kRowStageBytes / 4 && shard_dma_fits) {
+    __memcpy(row_stage, src, span, GDRAM2NRAM, pitch, shard_stride * kBytes, 3);
+    if (col_stride == 2) {
+      for (int32_t d = 0; d < 4; ++d) {
+        T* block = reinterpret_cast<T*>(reinterpret_cast<char*>(row_stage) +
+                                        d * pitch);
+        __bang_write_value(block + 2 * kTopk - 1, 1, static_cast<T>(0));
+        __bang_filter_bitindex(dst + d * kTopk, block, bitmask, 2 * kTopk);
+      }
+    } else {
+      __memcpy(dst,
+               row_stage,
+               kBytes,
+               NRAM2NRAM,
+               kBytes,
+               col_stride * kBytes,
+               kCandidates - 1);
+    }
+    return;
+  }
+  // Very large source shard strides or per-row spans keep a generic path.
+  for (int32_t d = 0; d < 4; ++d) {
+    const T* source = src + d * shard_stride;
+    if (col_stride == 1) {
+      __memcpy(dst + d * kTopk, source, kTopk * kBytes, GDRAM2NRAM);
+    } else if (span <= kCandidates * sizeof(int32_t)) {
+      __memcpy(small_stage, source, span, GDRAM2NRAM);
+      if (col_stride == 2) {
+        T* block = reinterpret_cast<T*>(small_stage);
+        __bang_write_value(block + 2 * kTopk - 1, 1, static_cast<T>(0));
+        __bang_filter_bitindex(dst + d * kTopk, block, bitmask, 2 * kTopk);
+      } else {
+        __memcpy(dst + d * kTopk,
+                 small_stage,
+                 kBytes,
+                 NRAM2NRAM,
+                 kBytes,
+                 col_stride * kBytes,
+                 kTopk - 1);
+      }
+    } else {
+      __memcpy(dst + d * kTopk,
+               source,
+               kBytes,
+               GDRAM2NRAM,
+               kBytes,
+               col_stride * kBytes,
+               kTopk - 1);
+    }
+  }
+}
+
+// Integer normalization in the 16-bit source domain. Descending BF16 rank:
+// r = b ^ 0x7fff for sign 0, b for sign 1. NaN or negative slot -> invalid.
+// Valid r <= 0xff80 < kInvalidRank, so min(max(r, invalid * kInvalidRank),
+// kInvalidRank) selects the canonical invalid rank. nk = kKeyMask - key.
+__mlu_func__ void prepare_keys(int32_t* keys,
+                               int32_t* invalid,
+                               int32_t* rank,
+                               const int32_t* complemented_index,
+                               const int16_t* raw,
+                               const int32_t* values) {
+  __asm__ volatile(
+      "fuse.nram.s32.u16 [%[dst]], %[n], [%[src]], .and(%[sign]), "
+      ".eq(%[zero]), .mul(%[flip]), .xor([%[src]]);\n\t" ::[dst] "r"(rank),
+      [n] "r"(kCandidates),
+      [src] "r"(raw),
+      [sign] "r"(0x8000),
+      [zero] "r"(0),
+      [flip] "r"(0x7fff)
+      : "memory");
+  __asm__ volatile(
+      "fuse.nram.s32.u16 [%[dst]], %[n], [%[src]], .and(%[abs]), "
+      ".lt(%[limit]), .eq(%[zero]);\n\t" ::[dst] "r"(invalid),
+      [n] "r"(kCandidates),
+      [src] "r"(raw),
+      [abs] "r"(0x7fff),
+      [limit] "r"(0x7f81),
+      [zero] "r"(0)
+      : "memory");
+  __asm__ volatile(
+      "fuse.nram.s32 [%[dst]], %[n], [%[src]], .lt(%[zero]), "
+      ".or([%[nan]]), .mul(%[bad]);\n\t" ::[dst] "r"(invalid),
+      [n] "r"(kCandidates),
+      [src] "r"(values),
+      [zero] "r"(0),
+      [nan] "r"(invalid),
+      [bad] "r"(kInvalidRank)
+      : "memory");
+  __asm__ volatile(
+      "fuse.nram.s32 [%[dst]], %[n], [%[src]], .max([%[rank]]), "
+      ".min(%[bad]), .mul(%[width]), .add([%[index]]);\n\t" ::[dst] "r"(keys),
+      [n] "r"(kCandidates),
+      [src] "r"(invalid),
+      [rank] "r"(rank),
+      [bad] "r"(kInvalidRank),
+      [width] "r"(-kCandidates),
+      [index] "r"(complemented_index)
+      : "memory");
+}
+
+// Both shard-coalesced input DMAs are asynchronous; consumers __sync_io().
+__mlu_func__ void load_dense_row(int16_t* raw,
+                                 int32_t* values,
+                                 const int16_t* scores,
+                                 const int32_t* slots,
+                                 int64_t q,
+                                 int64_t sq,
+                                 int64_t sd,
+                                 int64_t vq,
+                                 int64_t vd) {
+  __memcpy_async(raw,
+                 scores + q * sq,
+                 kTopk * sizeof(int16_t),
+                 GDRAM2NRAM,
+                 kTopk * sizeof(int16_t),
+                 sd * sizeof(int16_t),
+                 3);
+  __memcpy_async(values,
+                 slots + q * vq,
+                 kTopk * sizeof(int32_t),
+                 GDRAM2NRAM,
+                 kTopk * sizeof(int32_t),
+                 vd * sizeof(int32_t),
+                 3);
+}
+
+// MSD selection only refines the boundary bin. Accepted bins preserve
+// candidate order internally; equal ranks never cross accepted bins. Then a
+// stable LSD pass orders the valid selected keys. Returns the valid count and
+// the buffer holding the sorted keys.
+__mlu_func__ int32_t select_and_sort(int32_t* keys_a,
+                                     int32_t* keys_b,
+                                     int32_t* scratch,
+                                     int32_t* selected,
+                                     int32_t** sorted) {
+  int32_t* src = keys_a;
+  int32_t* dst = keys_b;
+  int32_t n = kCandidates;
+  int32_t accepted = 0;
+  int32_t quota = kTopk;
+  int32_t highest_sort_bit = 28;
+  // Invalid keys have nk >> 19 == 0 and every valid key has nk >> 19 >= 1.
+  // While all boundary bits taken from 28 down are zero, the boundary bin may
+  // hold invalid keys; once bit 19 is reached that way it holds only them.
+  bool boundary_invalid_prefix = true;
+  bool boundary_all_invalid = false;
+  for (int32_t bit = 28; bit >= 13 && quota > 0; --bit) {
+    zero_bit_mask(scratch, src, n, bit);
+    int32_t zero_count = __bang_filter(reinterpret_cast<float*>(dst),
+                                       reinterpret_cast<float*>(src),
+                                       reinterpret_cast<float*>(scratch),
+                                       n);
+    // Before accepting a lower bin, every selected key is still in this
+    // boundary bin. A zero-only or one-only selected side fixes this bit.
+    if (accepted == 0 && (zero_count == 0 || zero_count >= quota)) {
+      highest_sort_bit = bit - 1;
+    }
+    if (zero_count >= quota) {
+      if (zero_count == quota) {
+        __memcpy(selected + accepted, dst, quota * sizeof(int32_t), NRAM2NRAM);
+        accepted += quota;
+        quota = 0;
+        break;
+      }
+      boundary_invalid_prefix = false;
+      if (zero_count != n) {
+        n = zero_count;
+        int32_t* tmp = src;
+        src = dst;
+        dst = tmp;
+      }
+    } else if (zero_count > 0) {
+      __memcpy(
+          selected + accepted, dst, zero_count * sizeof(int32_t), NRAM2NRAM);
+      accepted += zero_count;
+      quota -= zero_count;
+      flip_bit_mask(scratch, n, bit);
+      __bang_filter(reinterpret_cast<float*>(dst),
+                    reinterpret_cast<float*>(src),
+                    reinterpret_cast<float*>(scratch),
+                    n);
+      n -= zero_count;
+      int32_t* tmp = src;
+      src = dst;
+      dst = tmp;
+    }
+    if (bit == 19 && boundary_invalid_prefix) {
+      // Lower bits cannot separate the remaining invalid keys.
+      boundary_all_invalid = true;
+      break;
+    }
+  }
+  int32_t valid_selected = kTopk;
+  if (boundary_all_invalid) {
+    valid_selected = accepted;
+  } else if (quota > 0) {
+    // All remaining candidates have identical BF16 rank. Select first
+    // indices; the synchronous copy also makes the boundary key ALU-visible.
+    __memcpy(selected + accepted, src, quota * sizeof(int32_t), NRAM2NRAM);
+    if (((selected[accepted] ^ kKeyMask) >> 13) == kInvalidRank) {
+      valid_selected = accepted;
+    }
+  }
+  // With kCandidates=4K, fewer than kTopk valid keys leaves an invalid group
+  // larger than kTopk. That group cannot end selection at an exact quota before
+  // this tail.
+  src = selected;
+  dst = keys_a;
+  if (valid_selected > 0) {
+    for (int32_t bit = 13; bit <= highest_sort_bit; ++bit) {
+      zero_bit_mask(scratch, src, valid_selected, bit);
+      int32_t zero_count = __bang_filter(reinterpret_cast<float*>(dst),
+                                         reinterpret_cast<float*>(src),
+                                         reinterpret_cast<float*>(scratch),
+                                         valid_selected);
+      flip_bit_mask(scratch, valid_selected, bit);
+      __bang_filter(reinterpret_cast<float*>(dst + zero_count),
+                    reinterpret_cast<float*>(src),
+                    reinterpret_cast<float*>(scratch),
+                    valid_selected);
+      int32_t* tmp = src;
+      src = dst;
+      dst = tmp;
+    }
+  }
+  *sorted = src;
+  return valid_selected;
+}
+
+// Neighbouring lengths share a 64-byte line but come from different cores.
+// Plain scalar or DMA partial-line stores from many cores at once serialize
+// (measured up to ~8us for 32 rows); a memory-side atomic exchange does not.
+__mlu_func__ void store_length(int32_t* lengths,
+                               int64_t row,
+                               int32_t length,
+                               int32_t* previous) {
+  __bang_atomic_exch(previous, lengths + row, length);
+}
+
+// Integer promotion retains every BF16 bit, including signed zero/subnormals.
+// A stable partition of candidate-index order implements CNNL
+// lower_index_first.
+__mlu_global__ void merge_rows(const int16_t* scores,
+                               const int32_t* slots,
+                               const int32_t* mapping,
+                               int32_t* output,
+                               int32_t* lengths,
+                               int64_t rows,
+                               int64_t sd,
+                               int64_t sq,
+                               int64_t sc,
+                               int64_t vd,
+                               int64_t vq,
+                               int64_t vc,
+                               int64_t ms) {
+  // Union launches also start the cluster memory cores; all work is IPU work.
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ int16_t raw[kCandidates + kTopk];
+  __nram__ int32_t values[kCandidates + kTopk];
+  __nram__ int16_t raw_next[kCandidates];
+  __nram__ int32_t values_next[kCandidates];
+  __nram__ int32_t keys_a[kCandidates];
+  __nram__ int32_t keys_b[kCandidates];
+  __nram__ int32_t mask[kCandidates];
+  __nram__ int32_t scratch[kCandidates];
+  __nram__ int32_t selected[kTopk];
+  __nram__ int32_t offsets[kTopk];
+  __nram__ int32_t staged_output[2][kTopk];
+  __nram__ int32_t row_stage[2 * kCandidates];
+  __nram__ int32_t complemented_index[kCandidates];
+  __nram__ int32_t exchanged[16];
+  // 364 KiB plus the compiler's extra buffer; below 512 KiB/IPU.
+  __bang_incseq(complemented_index, kCandidates);
+  __asm__ volatile(
+      "fuse.nram.s32 [%[dst]], %[n], [%[dst]], .mul(%[neg]), "
+      ".add(%[key]);\n\t" ::[dst] "r"(complemented_index),
+      [n] "r"(kCandidates),
+      [neg] "r"(-1),
+      [key] "r"(kKeyMask)
+      : "memory");
+  // Dense rows are double buffered: row q+taskDim is prefetched on IO while
+  // row q computes, and the slot gather/output store of row q overlap row
+  // q+taskDim. Other strides keep synchronous staging into raw/values.
+  const bool dense =
+      sc == 1 && vc == 1 && sd <= 0x7fffffffLL / 2 && vd <= 0x7fffffffLL / 4;
+  int64_t pending_row = -1;
+  int32_t pending_length = 0;
+  int32_t* pending_output = staged_output[0];
+  int32_t buffer = 0;
+  if (dense && taskId < rows) {
+    // Issued before the scalar mapping read so both latencies overlap; a
+    // padding row simply leaves its loaded inputs unused.
+    load_dense_row(raw, values, scores, slots, taskId, sq, sd, vq, vd);
+  }
+  bool row_valid = taskId < rows && mapping[taskId * ms] >= 0;
+  for (int64_t q = taskId; q < rows; q += taskDim, buffer ^= 1) {
+    int16_t* row_raw = buffer ? raw_next : raw;
+    int32_t* row_values = buffer ? values_next : values;
+    int32_t* row_output = staged_output[buffer];
+    const int64_t next = q + taskDim;
+    const bool next_valid = next < rows && mapping[next * ms] >= 0;
+    // Completes this row's prefetch and the store that last used row_output.
+    __sync_io();
+    if (!dense && pending_row >= 0) {
+      // Synchronous staging below rewrites values read by the pending gather.
+      __sync_move();
+      __memcpy_async(output + pending_row * kTopk,
+                     pending_output,
+                     kTopk * sizeof(int32_t),
+                     NRAM2GDRAM);
+      store_length(lengths, pending_row, pending_length, exchanged);
+      pending_row = -1;
+    }
+    if (row_valid && !dense) {
+      row_raw = raw;
+      row_values = values;
+      if (sc == 2 || vc == 2) {
+        // Native bitindex filtering selects every even source element.
+        // Buffers raw/values reserve the full filter input capacity.
+        __bang_write_value(
+            reinterpret_cast<uint32_t*>(mask), kCandidates / 16, 0x55555555u);
+      }
+      load_candidate_row(raw, scores + q * sq, sd, sc, row_stage, keys_b, mask);
+      load_candidate_row(
+          values, slots + q * vq, vd, vc, row_stage, keys_b, mask);
+    }
+    if (row_valid) {
+      prepare_keys(
+          keys_a, mask, keys_b, complemented_index, row_raw, row_values);
+    }
+    if (pending_row >= 0) {
+      // The previous gather read the other slot buffer and offsets, and wrote
+      // the other staged output; retire it before either is reused.
+      __sync_move();
+      __memcpy_async(output + pending_row * kTopk,
+                     pending_output,
+                     kTopk * sizeof(int32_t),
+                     NRAM2GDRAM);
+      store_length(lengths, pending_row, pending_length, exchanged);
+      pending_row = -1;
+    }
+    if (dense && next_valid) {
+      load_dense_row(buffer ? raw : raw_next,
+                     buffer ? values : values_next,
+                     scores,
+                     slots,
+                     next,
+                     sq,
+                     sd,
+                     vq,
+                     vd);
+    }
+    int32_t valid_selected = 0;
+    int32_t* sorted = selected;
+    if (row_valid) {
+      valid_selected =
+          select_and_sort(keys_a, keys_b, scratch, selected, &sorted);
+    }
+    if (valid_selected > 0) {
+      // Byte offset of candidate index (nk & (kCandidates - 1)) ^ (kCandidates
+      // - 1).
+      __asm__ volatile(
+          "fuse.nram.s32 [%[dst]], %[n], [%[src]], .and(%[low]), "
+          ".xor(%[low]), .mul(%[bytes]);\n\t" ::[dst] "r"(offsets),
+          [n] "r"(valid_selected),
+          [src] "r"(sorted),
+          [low] "r"(kCandidates - 1),
+          [bytes] "r"(4)
+          : "memory");
+    }
+    if (valid_selected < kTopk) {
+      __bang_write_value(
+          row_output + valid_selected, kTopk - valid_selected, -1);
+    }
+    // Offsets and the invalid tail are complete before Move/IO consume them.
+    __sync_compute();
+    if (valid_selected > 0) {
+      __gather_async(row_output,
+                     row_values,
+                     reinterpret_cast<uint32_t*>(offsets),
+                     sizeof(int32_t),
+                     NRAM2NRAM,
+                     sizeof(int32_t),
+                     valid_selected);
+    }
+    pending_row = q;
+    pending_length = valid_selected;
+    pending_output = row_output;
+    row_valid = next_valid;
+  }
+  if (pending_row >= 0) {
+    __sync_move();
+    __memcpy_async(output + pending_row * kTopk,
+                   pending_output,
+                   kTopk * sizeof(int32_t),
+                   NRAM2GDRAM);
+    store_length(lengths, pending_row, pending_length, exchanged);
+  }
+  __sync_io();
+}
+}  // namespace
+void launch_dcp_merge_topk(const void* scores,
+                           const int32_t* slots,
+                           const int32_t* mapping,
+                           int32_t* output,
+                           int32_t* lengths,
+                           int64_t rows,
+                           int64_t sd,
+                           int64_t sq,
+                           int64_t sc,
+                           int64_t vd,
+                           int64_t vq,
+                           int64_t vc,
+                           int64_t ms,
+                           cnrtQueue_t queue) {
+  // A two-cluster union is dispatched as a gang. Block or single-cluster tasks
+  // spanning many clusters measured up to ~5us extra dispatch latency after
+  // some prior device workloads. Rows beyond Q are skipped by the row loop.
+  const int64_t cores = rows < 32 ? (rows + 7) / 8 * 8 : 32;
+  cnrtDim3_t dim = {static_cast<uint32_t>(cores), 1, 1};
+  merge_rows<<<dim, cnrtFuncTypeUnion2, queue>>>(
+      static_cast<const int16_t*>(scores),
+      slots,
+      mapping,
+      output,
+      lengths,
+      rows,
+      sd,
+      sq,
+      sc,
+      vd,
+      vq,
+      vc,
+      ms);
+}
+}  // namespace xllm::kernel::mlu::bangc

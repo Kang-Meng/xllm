@@ -1245,7 +1245,10 @@ void run_prefill_case(const PrefillCase& config,
   single.single_rank_group_ = groups.self.get();
   single.kv_split_size() = 1;
   const int32_t shard_rank = sharded ? parallel.dcp_group_->rank() : -1;
-  const ModelArgs args = prefill_args(config.variant);
+  ModelArgs args = prefill_args(config.variant);
+  if (sharded) {
+    args.index_topk() = 2048;
+  }
   StateDict weights(centered_weights(
       create_seeded_mla_weights(
           args, DsaWeightFormat::BF16, options.device(torch::kCPU)),
@@ -1649,7 +1652,9 @@ std::vector<PrefillCase> prefill_cases() {
   std::vector<PrefillCase> result;
   result.reserve(40);
   const std::array<std::string, 4> topology_names = {
-      "CP2", "CP2TP2", "DCP2", "CP2DCP2"};
+      "CP2", "CP2TP2", "DCP4", "CP2TP2DCP4"};
+  const std::array<Topology, 4> topologies = {
+      Topology::CP, Topology::CPTP, Topology::DCP4, Topology::CPTPDCP4};
   const std::array<std::string, 5> shape_names = {
       "Prefill", "Chunks3", "Boundary15", "Boundary16", "Boundary33"};
   for (DsaModelVariant variant :
@@ -1659,10 +1664,8 @@ std::vector<PrefillCase> prefill_cases() {
         const std::string name =
             (variant == DsaModelVariant::V32 ? "V32_" : "Glm5_") +
             topology_names[topology] + "_" + shape_names[shape];
-        result.emplace_back(PrefillCase{variant,
-                                        static_cast<Topology>(topology),
-                                        static_cast<Shape>(shape),
-                                        name});
+        result.emplace_back(PrefillCase{
+            variant, topologies[topology], static_cast<Shape>(shape), name});
       }
     }
   }
@@ -1676,12 +1679,17 @@ void run_prefill_cases(const std::vector<PrefillCase>& cases) {
                      config.topology == Topology::CPTPDCP2 ||
                      config.topology == Topology::CPTPDCP4;
     const int32_t ranks =
-        config.topology == Topology::CP4TP2DCP4 ? 8 : (tp2 ? 4 : 2);
+        config.topology == Topology::CP4TP2DCP4
+            ? 8
+            : ((tp2 || config.topology == Topology::DCP4) ? 4 : 2);
     const int32_t port =
         parallel_base_port(ranks,
                            config.topology == Topology::CP4TP2DCP4
                                ? 4
-                               : (config.topology == Topology::DCP ? 1 : 2));
+                               : (config.topology == Topology::DCP ||
+                                          config.topology == Topology::DCP4
+                                      ? 1
+                                      : 2));
     LOG(INFO) << config.name << " base_port=" << port;
 
     const int32_t child_count = ranks;
@@ -1992,10 +2000,6 @@ TEST(AttentionPrefillParallelTest,
 
 TEST(AttentionCpTpDcpTest, HistoryMatchesSingleRankAndPreservesUnwrittenSlots) {
   run_prefill_cases({
-      {DsaModelVariant::GLM5,
-       Topology::CPTPDCP2,
-       Shape::CHUNKS,
-       "Glm5_CP2TP2DCP2_Chunks3"},
       {DsaModelVariant::GLM5,
        Topology::CPTPDCP4,
        Shape::CHUNKS,

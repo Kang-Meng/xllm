@@ -19,8 +19,8 @@ limitations under the License.
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
-#include <tuple>
 
+#include "kernels/mlu/bangc/include/dcp_merge_topk.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "triton_jit/include/jit_kernel.h"
 
@@ -78,80 +78,7 @@ void dcp_merge_topk(const torch::Tensor& scores,
                     int64_t topk,
                     torch::Tensor& output,
                     torch::Tensor& lengths) {
-  CHECK(scores.defined());
-  CHECK(scores.device().is_privateuseone());
-  const torch::Device device = scores.device();
-  check_tensor(scores, torch::kFloat32, 3, device);
-  check_tensor(slots, torch::kInt32, 3, device);
-  check_tensor(mapping, torch::kInt32, 1, device);
-  CHECK(scores.sizes() == slots.sizes());
-  const int64_t d = scores.size(0);
-  const int64_t q = scores.size(1);
-  const int64_t c = scores.size(2);
-  CHECK_GT(d, 0);
-  CHECK_GT(c, 0);
-  CHECK_LE(d, std::numeric_limits<int32_t>::max() / c);
-  CHECK_GT(topk, 0);
-  CHECK_LE(topk, d * c);
-  CHECK_EQ(mapping.size(0), q);
-  check_outputs(output, lengths, q, topk, device, {scores, slots, mapping});
-  if (q == 0) {
-    return;
-  }
-
-  const torch::DeviceGuard guard(device);
-  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-  const int64_t width = d * c;
-  // Ascending negated scores put canonical NaN padding after valid -inf.
-  torch::Tensor sortable_scores = torch::empty({q, width}, scores.options());
-  torch::Tensor prepared_slots = torch::empty({q, width}, slots.options());
-  int64_t candidate_block = 1;
-  while (candidate_block < c) {
-    candidate_block *= 2;
-  }
-  JITKernel::get("xllm.core.kernels.mlu.triton_kernel.dcp.dcp_indexer_merge",
-                 "tmo_dcp_prepare_indexer_merge_kernel")
-      .launch(static_cast<void*>(queue),
-              {static_cast<uint32_t>(d), static_cast<uint32_t>(q), 1},
-              {/*num_warps=*/1, /*num_stages=*/1},
-              scores,
-              slots,
-              sortable_scores,
-              prepared_slots,
-              scores.stride(0),
-              scores.stride(1),
-              scores.stride(2),
-              slots.stride(0),
-              slots.stride(1),
-              slots.stride(2),
-              width,
-              c,
-              candidate_block);
-
-  torch::Tensor score_order = std::get<1>(torch::topk(
-      sortable_scores, topk, /*dim=*/1, /*largest=*/false, /*sorted=*/true));
-  int64_t topk_block = 1;
-  while (topk_block < topk) {
-    topk_block *= 2;
-  }
-  JITKernel::get("xllm.core.kernels.mlu.triton_kernel.dcp.dcp_indexer_merge",
-                 "tmo_dcp_finalize_indexer_merge_kernel")
-      .launch(static_cast<void*>(queue),
-              {static_cast<uint32_t>(q), 1, 1},
-              {/*num_warps=*/1, /*num_stages=*/1},
-              prepared_slots,
-              score_order,
-              mapping,
-              output,
-              lengths,
-              width,
-              score_order.stride(0),
-              mapping.stride(0),
-              output.stride(0),
-              output.stride(1),
-              lengths.stride(0),
-              topk,
-              topk_block);
+  bangc::dcp_merge_topk(scores, slots, mapping, topk, output, lengths);
 }
 
 void dcp_localize_topk(const torch::Tensor& slots,

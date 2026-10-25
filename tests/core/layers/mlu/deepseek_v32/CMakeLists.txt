@@ -118,3 +118,20 @@ if(TARGET glm53_indexer_dcp_multi_device_test)
     PROPERTIES RUN_SERIAL TRUE
   )
 endif()
+
+# Forks ranks before device initialization; kernel maintenance remains single-card.
+cc_test(
+  NAME glm53_dcp_merge_topk_multi_device_test
+  SRCS glm53_dcp_merge_topk_multi_device_test.cpp
+  DEPS :config :mlu_kernels :parallel_state :util torch glog::glog GTest::gtest_main
+  ENVIRONMENT "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
+)
+set_tests_properties(
+  Glm53DcpMergeTopkMultiDeviceTest.Bf16CandidatesQ8192
+  Glm53DcpMergeTopkMultiDeviceTest.Bf16EdgesAndStrides
+  Glm53DcpMergeTopkMultiDeviceTest.PrefillLongHistoryBatch1
+  Glm53DcpMergeTopkMultiDeviceTest.PrefillLongHistoryBatch8
+  Glm53DcpMergeTopkMultiDeviceTest.DecodeDp2Batch16
+  Glm53DcpMergeTopkMultiDeviceTest.DecodeDp2Batch32
+  PROPERTIES RUN_SERIAL TRUE
+)

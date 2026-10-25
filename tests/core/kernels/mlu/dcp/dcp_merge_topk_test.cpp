@@ -13,374 +13,257 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <framework/core/stream_guard.h>
+#include <framework/graphs/MLUGraph.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
-#include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstdint>
-#include <limits>
-#include <tuple>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
+#include "core/kernels/mlu/dcp/dcp_merge_test_utils.h"
 #include "core/kernels/mlu/dcp/dcp_topk_test_utils.h"
+#include "core/platform/platform.h"
 #include "kernels/mlu/mlu_ops_api.h"
 
 namespace xllm {
 namespace {
-
-using kernel::mlu::dcp_localize_topk;
+using dcp_test::Candidates;
 using kernel::mlu::dcp_merge_topk;
+constexpr int64_t kDcp = 4;
+constexpr int64_t kTopk = 2048;
 
-TopkResult merge_reference(const torch::Tensor& scores,
-                           const torch::Tensor& slots,
-                           const torch::Tensor& mapping,
-                           int64_t k) {
-  const int64_t d = scores.size(0);
-  const int64_t q = scores.size(1);
-  const int64_t c = scores.size(2);
-  auto output = torch::full({q, k}, -1, torch::kInt32);
-  auto lengths = torch::zeros({q}, torch::kInt32);
-  const auto values = scores.accessor<float, 3>();
-  const auto src = slots.accessor<int32_t, 3>();
-  const auto map = mapping.accessor<int32_t, 1>();
-  auto dst = output.accessor<int32_t, 2>();
-  auto lens = lengths.accessor<int32_t, 1>();
-  for (int64_t row = 0; row < q; ++row) {
-    if (map[row] < 0) {
-      continue;
-    }
-    std::vector<int64_t> candidates;
-    candidates.reserve(d * c);
-    for (int64_t index = 0; index < d * c; ++index) {
-      if (src[index / c][row][index % c] < 0 ||
-          std::isnan(values[index / c][row][index % c])) {
-        continue;
-      }
-      candidates.emplace_back(index);
-    }
-    std::stable_sort(
-        candidates.begin(), candidates.end(), [&](int64_t left, int64_t right) {
-          return values[left / c][row][left % c] >
-                 values[right / c][row][right % c];
-        });
-    lens[row] = static_cast<int32_t>(std::min<int64_t>(k, candidates.size()));
-    for (int64_t col = 0; col < lens[row]; ++col) {
-      const int64_t index = candidates[col];
-      dst[row][col] = src[index / c][row][index % c];
-    }
+Candidates make_input(int32_t rows, bool edges = false) {
+  std::vector<torch::Tensor> scores;
+  std::vector<torch::Tensor> slots;
+  scores.reserve(kDcp);
+  slots.reserve(kDcp);
+  torch::Tensor mapping;
+  for (int32_t shard = 0; shard < kDcp; ++shard) {
+    auto input = dcp_test::make_candidates(rows,
+                                           shard,
+                                           /*tp_rank=*/0,
+                                           /*seed=*/42,
+                                           edges);
+    scores.emplace_back(std::move(input.scores));
+    slots.emplace_back(std::move(input.slots));
+    mapping = std::move(input.mapping);
   }
-  return {output, lengths};
+  const torch::Device device{torch::kPrivateUse1, 0};
+  return {torch::stack(scores).to(device),
+          torch::stack(slots).to(device),
+          mapping.to(device)};
 }
 
-std::pair<torch::Tensor, torch::Tensor> score_templates(int64_t d, int64_t c) {
-  auto scores = torch::empty({d, 10, c}, torch::kFloat32);
-  auto slots = torch::empty({d, 10, c}, torch::kInt32);
-  auto values = scores.accessor<float, 3>();
-  auto ids = slots.accessor<int32_t, 3>();
-  const std::vector<uint32_t> bits{0,
-                                   0x80000000,
-                                   1,
-                                   2,
-                                   0x80000001,
-                                   0x80000002,
-                                   0x3f800000,
-                                   0x3f800001,
-                                   0xbf800000,
-                                   0xbf800001,
-                                   0x7f7fffff,
-                                   0xff7fffff,
-                                   0x7f800000,
-                                   0xff800000,
-                                   0x7fc00001,
-                                   0xffc00001};
-  for (int64_t rank = 0; rank < d; ++rank) {
-    for (int64_t col = 0; col < c; ++col) {
-      const int64_t index = rank * c + col;
-      for (int64_t row = 0; row < 10; ++row) {
-        ids[rank][row][col] = static_cast<int32_t>((index * 37) % 131072);
-      }
-      values[rank][0][col] = std::bit_cast<float>(bits[index % bits.size()]);
-      values[rank][1][col] = index % 2 ? -0.0f : 0.0f;
-      values[rank][2][col] = INFINITY;
-      values[rank][3][col] = NAN;
-      values[rank][4][col] = -INFINITY;
-      ids[rank][4][col] = index < 5 ? static_cast<int32_t>(index) : -1;
-      values[rank][5][col] = index < c - 1 ? 1.0f : -1.0f;
-      values[rank][6][col] = index < c ? 1.0f : -1.0f;
-      values[rank][7][col] = index < c + 1 ? 1.0f : -1.0f;
-      values[rank][8][col] = static_cast<float>((index * 7919) % (d * c));
-      uint32_t random_bits = static_cast<uint32_t>(index + 72317);
-      random_bits ^= random_bits << 13;
-      random_bits ^= random_bits >> 17;
-      random_bits ^= random_bits << 5;
-      values[rank][9][col] = std::bit_cast<float>(random_bits);
-      ids[rank][9][col] = index % 11 == 0 ? -1 : static_cast<int32_t>(index);
-    }
-  }
-  return {scores, slots};
+torch::Tensor storage_bits(const torch::Tensor& tensor) {
+  const int64_t count =
+      static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size());
+  auto storage = tensor.as_strided({count}, {1}, /*storage_offset=*/0);
+  return (tensor.scalar_type() == torch::kBFloat16 ? storage.view(torch::kInt16)
+                                                   : storage)
+      .cpu()
+      .clone();
 }
 
-// Compare selected scores and candidate membership, allowing arbitrary choices
-// within a tied score band. The templates use unique slots within each row.
-void check_selection(const TopkResult& actual,
-                     const TopkResult& expected,
-                     const torch::Tensor& scores,
-                     const torch::Tensor& slots) {
-  ASSERT_TRUE(torch::equal(actual.second, expected.second));
-  const auto src_scores = scores.accessor<float, 3>();
-  const auto src_slots = slots.accessor<int32_t, 3>();
-  std::vector<std::unordered_map<int32_t, float>> candidates(scores.size(1));
-  for (int64_t row = 0; row < scores.size(1); ++row) {
-    candidates[row].reserve(scores.size(0) * scores.size(2));
-    for (int64_t rank = 0; rank < scores.size(0); ++rank) {
-      for (int64_t col = 0; col < scores.size(2); ++col) {
-        const int32_t slot = src_slots[rank][row][col];
-        const float score = src_scores[rank][row][col];
-        if (slot < 0 || std::isnan(score)) {
-          continue;
-        }
-        ASSERT_TRUE(candidates[row].emplace(slot, score).second);
-      }
-    }
+void check_input(Candidates input, bool compose = false) {
+  const int64_t rows = input.scores.size(1);
+  const auto scores_before = storage_bits(input.scores);
+  const auto slots_before = storage_bits(input.slots);
+  const auto mapping_before = storage_bits(input.mapping);
+  const auto reference = dcp_test::merge_reference(
+      input.scores, input.slots, input.mapping, kTopk);
+  GuardedTopk out(rows, kTopk, input.scores.device());
+  for (int32_t repeat = 0; repeat < 2; ++repeat) {
+    out.output.fill_(kSentinel);
+    out.lengths.fill_(kSentinel);
+    dcp_merge_topk(input.scores,
+                   input.slots,
+                   input.mapping,
+                   kTopk,
+                   out.output,
+                   out.lengths);
+    out.check({reference.first.cpu(), reference.second.cpu()});
   }
-  const auto got = actual.first.accessor<int32_t, 2>();
-  const auto want = expected.first.accessor<int32_t, 2>();
-  const auto lengths = expected.second.accessor<int32_t, 1>();
-  for (int64_t row = 0; row < actual.first.size(0); ++row) {
-    SCOPED_TRACE(::testing::Message() << "row=" << row);
-    const auto& valid = candidates[row % scores.size(1)];
-    std::unordered_set<int32_t> seen;
-    seen.reserve(lengths[row]);
-    for (int64_t col = 0; col < lengths[row]; ++col) {
-      const auto found = valid.find(got[row][col]);
-      ASSERT_NE(found, valid.end());
-      ASSERT_TRUE(seen.emplace(got[row][col]).second);
-      ASSERT_EQ(found->second, valid.at(want[row][col]));
-    }
-    for (int64_t col = lengths[row]; col < actual.first.size(1); ++col) {
-      ASSERT_EQ(got[row][col], -1);
-    }
+  EXPECT_TRUE(torch::equal(storage_bits(input.scores), scores_before));
+  EXPECT_TRUE(torch::equal(storage_bits(input.slots), slots_before));
+  EXPECT_TRUE(torch::equal(storage_bits(input.mapping), mapping_before));
+  if (!compose) {
+    return;
+  }
+  GuardedTopk local(rows, kTopk, input.scores.device());
+  for (int32_t rank = 0; rank < kDcp; ++rank) {
+    kernel::mlu::dcp_localize_topk(out.output,
+                                   out.lengths,
+                                   rank,
+                                   /*size=*/kDcp,
+                                   /*interleave=*/16,
+                                   local.output,
+                                   local.lengths);
+    local.check(local_reference(reference.first.cpu(),
+                                reference.second.cpu(),
+                                rank,
+                                /*size=*/kDcp,
+                                /*interleave=*/16));
   }
 }
 
 class DcpMergeTopkTest : public ::testing::Test {
  protected:
-  const torch::Device device{torch::kPrivateUse1, 0};
-
-  void check_case(int64_t q,
-                  int64_t d,
-                  int64_t c,
-                  int64_t k,
-                  int32_t layout = 0,
-                  bool compose = false) {
-    SCOPED_TRACE(::testing::Message() << "Q=" << q << " D=" << d << " C=" << c
-                                      << " K=" << k << " layout=" << layout);
-    const torch::DeviceGuard guard(device);
-    const auto templates = score_templates(d, c);
-    const auto selector = torch::arange(q, torch::kInt64).remainder(10);
-    const auto cpu_scores = templates.first.index_select(1, selector);
-    const auto cpu_slots = templates.second.index_select(1, selector);
-    auto cpu_mapping = torch::zeros({q}, torch::kInt32);
-    cpu_mapping.slice(0, 8, q, 11).fill_(-1);
-    const auto reference = merge_reference(templates.first,
-                                           templates.second,
-                                           torch::zeros({10}, torch::kInt32),
-                                           k);
-    TopkResult expected{reference.first.index_select(0, selector),
-                        reference.second.index_select(0, selector)};
-    expected.first.index_put_({cpu_mapping < 0}, -1);
-    expected.second.index_put_({cpu_mapping < 0}, 0);
-    auto scores = cpu_scores.to(device);
-    auto slots = cpu_slots.to(device);
-    auto mapping = cpu_mapping.to(device);
-    if (layout == 1) {
-      scores = torch::empty({d, q * 2, c * 2}, scores.options())
-                   .slice(1, 0, q * 2, 2)
-                   .slice(2, 0, c * 2, 2);
-      slots = torch::empty({d, q * 3, c * 3}, slots.options())
-                  .slice(1, 0, q * 3, 3)
-                  .slice(2, 1, c * 3, 3);
-    } else if (layout == 2) {
-      scores = torch::empty({c, q, d}, scores.options()).permute({2, 1, 0});
-      slots = torch::empty({c, q, d}, slots.options()).permute({2, 1, 0});
+  void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "Requires an MLU device";
     }
-    scores.copy_(cpu_scores);
-    slots.copy_(cpu_slots);
-    if (layout != 0) {
-      mapping = torch::full({q * 3}, kSentinel, mapping.options())
-                    .slice(0, 0, q * 3, 3);
-      mapping.copy_(cpu_mapping);
-    }
-    GuardedTopk out(q,
-                    k,
-                    device,
-                    /*strided=*/layout != 0,
-                    /*strided_lens=*/layout != 0);
-    dcp_merge_topk(scores, slots, mapping, k, out.output, out.lengths);
-    TopkResult actual{out.output.cpu(), out.lengths.cpu()};
-    check_selection(actual, expected, templates.first, templates.second);
-    out.check(actual);
-    EXPECT_TRUE(torch::equal(scores.cpu().contiguous().view(torch::kInt32),
-                             cpu_scores.contiguous().view(torch::kInt32)));
-    EXPECT_TRUE(torch::equal(slots.cpu(), cpu_slots));
-    EXPECT_TRUE(torch::equal(mapping.cpu(), cpu_mapping));
-    if (compose) {
-      GuardedTopk local(q, k, device);
-      // Reuse the same global state and local buffer across every KV rank.
-      for (int32_t rank = 0; rank < d; ++rank) {
-        dcp_localize_topk(out.output,
-                          out.lengths,
-                          rank,
-                          static_cast<int32_t>(d),
-                          /*interleave=*/16,
-                          local.output,
-                          local.lengths);
-        local.check(local_reference(actual.first,
-                                    actual.second,
-                                    rank,
-                                    static_cast<int32_t>(d),
-                                    /*interleave=*/16));
-      }
-      out.check(actual);
-    }
-    // A formerly full destination must be overwritten when all queries pad.
-    mapping.fill_(-1);
-    dcp_merge_topk(scores, slots, mapping, k, out.output, out.lengths);
-    out.check({torch::full({q, k}, -1, torch::kInt32),
-               torch::zeros({q}, torch::kInt32)});
-    mapping.copy_(cpu_mapping);
-    dcp_merge_topk(scores, slots, mapping, k, out.output, out.lengths);
-    actual = {out.output.cpu(), out.lengths.cpu()};
-    check_selection(actual, expected, templates.first, templates.second);
-    out.check(actual);
   }
 };
 
-TEST_F(DcpMergeTopkTest, GenericShapesAndEmptyQueries) {
-  for (const auto& [d, q, c, k] :
-       std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>{
-           {1, 0, 3, 2},
-           {1, 3, 1, 1},
-           {4, 8, 13, 17},
-           {8, 8, 5, 40},
-           {4, 8, 65, 129},
-           {4, 8, 2048, 1},
-           {4, 8, 2048, 17},
-           {4, 8, 2048, 2047},
-           {4, 128, 17, 68}}) {
-    check_case(q, d, c, k);
+TEST_F(DcpMergeTopkTest, EmptyAndQueryBoundaries) {
+  for (int32_t rows : {0,  1,  7,  8,   9,   16,  24,  31,  32,  33,
+                       63, 64, 65, 127, 128, 129, 255, 256, 257, 8192}) {
+    SCOPED_TRACE(rows);
+    check_input(make_input(rows));
   }
 }
 
-TEST_F(DcpMergeTopkTest, QueryBandsAndIEEEOrdering) {
-  for (int64_t q :
-       {1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 259, 260, 261}) {
-    check_case(q, /*d=*/4, /*c=*/2048, /*k=*/2048);
+TEST_F(DcpMergeTopkTest, ExactTiesSpecialValuesAndInvalidCandidates) {
+  check_input(make_input(/*rows=*/16, /*edges=*/true), /*compose=*/true);
+}
+
+TEST_F(DcpMergeTopkTest, StridesOffsetsAndTransposedInputs) {
+  for (int32_t rows : {1, 16, 33, 65, 129, 257}) {
+    auto input = make_input(rows, /*edges=*/rows == 16);
+    input.scores = dcp_test::strided_copy(input.scores);
+    input.slots = dcp_test::strided_copy(input.slots);
+    input.mapping = dcp_test::strided_copy(input.mapping);
+    check_input(std::move(input));
+  }
+  auto input = make_input(/*rows=*/33);
+  input.scores = input.scores.transpose(0, 1).contiguous().transpose(0, 1);
+  input.slots = input.slots.transpose(1, 2).contiguous().transpose(1, 2);
+  check_input(std::move(input));
+}
+
+TEST_F(DcpMergeTopkTest, RawBf16BitsAndDuplicateSlots) {
+  auto input = make_input(/*rows=*/65);
+  torch::manual_seed(/*seed=*/2026);
+  auto bits =
+      torch::randint(-32768, 32768, input.scores.sizes(), torch::kInt16);
+  input.scores.copy_(bits.view(torch::kBFloat16));
+  input.slots.copy_(input.slots.abs().remainder(17));
+  input.mapping.fill_(0);
+  check_input(std::move(input));
+}
+
+TEST_F(DcpMergeTopkTest, FullCandidatesAtDecodeAndVerificationSizes) {
+  for (int32_t rows : {8, 16, 32, 64}) {
+    auto input = make_input(rows);
+    input.slots.copy_(torch::arange(input.slots.numel(), input.slots.options())
+                          .view(input.slots.sizes()));
+    input.mapping.fill_(0);
+    check_input(std::move(input));
   }
 }
 
-TEST_F(DcpMergeTopkTest, StridedAndTransposedBands) {
-  for (int32_t layout : {1, 2}) {
-    for (int64_t q : {63, 64, 127, 128, 129, 255, 256, 257, 259, 260, 261}) {
-      check_case(q, /*d=*/4, /*c=*/2048, /*k=*/2048, layout);
-    }
+TEST_F(DcpMergeTopkTest, NonDefaultStreamAndGraphReplay) {
+  auto input = make_input(/*rows=*/16, /*edges=*/true);
+  GuardedTopk out(/*q=*/16, kTopk, input.scores.device());
+  auto run = [&] {
+    dcp_merge_topk(input.scores,
+                   input.slots,
+                   input.mapping,
+                   kTopk,
+                   out.output,
+                   out.lengths);
+  };
+  run();
+  torch_mlu::synchronize();
+  torch_mlu::MLUGraph graph;
+  {
+    torch_mlu::mlu::MLUStreamGuard guard(
+        torch_mlu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0));
+    run();
+    graph.capture_begin();
+    run();
+    graph.capture_end();
+  }
+  torch_mlu::synchronize();
+  for (int32_t round = 0; round < 3; ++round) {
+    input.mapping.copy_(input.mapping.flip({0}));
+    input.scores.copy_(input.scores.flip({2}));
+    const auto expected = dcp_test::merge_reference(
+        input.scores, input.slots, input.mapping, kTopk);
+    graph.replay();
+    torch_mlu::synchronize();
+    out.check({expected.first.cpu(), expected.second.cpu()});
   }
 }
 
-TEST_F(DcpMergeTopkTest, LargeQueriesPreserveAllRows) {
-  for (int64_t q :
-       {511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 8191, 8192, 8193}) {
-    check_case(q, /*d=*/4, /*c=*/2048, /*k=*/2048);
-  }
-}
-
-TEST_F(DcpMergeTopkTest, GlobalStateSupportsRepeatedOwnershipProjection) {
-  for (int64_t q : {5, 64, 128, 257}) {
-    check_case(q,
-               /*d=*/4,
-               /*c=*/2048,
-               /*k=*/2048,
-               /*layout=*/0,
-               /*compose=*/true);
-  }
-}
-
-TEST_F(DcpMergeTopkTest, ValidNegativeInfinityPrecedesInvalidTail) {
-  const torch::DeviceGuard guard(device);
-  // Duplicate valid slots remain separate candidates, including slot zero.
-  auto scores = torch::tensor({NAN,
-                               -INFINITY,
-                               -INFINITY,
-                               -INFINITY,
-                               1.0f,
-                               -INFINITY,
-                               NAN,
-                               -INFINITY})
-                    .view({2, 1, 4})
-                    .to(device);
-  auto slots = torch::tensor({7, 0, -1, 0, -1, 16, 32, -1}, torch::kInt32)
-                   .view({2, 1, 4})
-                   .to(device);
-  auto mapping = torch::zeros({1}, slots.options());
-  for (int64_t k : {1, 2, 3, 5, 8}) {
-    GuardedTopk out(/*q=*/1, k, device);
-    dcp_merge_topk(scores, slots, mapping, k, out.output, out.lengths);
-    const int64_t count = std::min<int64_t>(k, 3);
-    const auto cpu_output = out.output.cpu();
-    ASSERT_EQ(out.lengths.cpu().item<int32_t>(), count);
-    const auto selected = cpu_output[0].slice(0, 0, count);
-    EXPECT_TRUE(((selected == 0) | (selected == 16)).all().item<bool>());
-    EXPECT_LE((selected == 0).sum().item<int64_t>(), 2);
-    EXPECT_LE((selected == 16).sum().item<int64_t>(), 1);
-    EXPECT_TRUE((cpu_output[0].slice(0, count) == -1).all().item<bool>());
-    out.check({cpu_output, torch::full({1}, count, torch::kInt32)});
-    GuardedTopk local(/*q=*/1, k, device);
-    for (int32_t rank : {0, 1}) {
-      dcp_localize_topk(out.output,
-                        out.lengths,
-                        rank,
-                        /*size=*/2,
-                        /*interleave=*/16,
-                        local.output,
-                        local.lengths);
-      local.check(local_reference(cpu_output,
-                                  out.lengths.cpu(),
-                                  rank,
-                                  /*size=*/2,
-                                  /*interleave=*/16));
-    }
-  }
-}
-
-TEST(DcpMergeTopkDeathTest, RejectsInvalidContracts) {
+TEST(DcpMergeTopkDeathTest, RejectsUnsupportedContractsAndAliasing) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
-  const torch::Device device{torch::kPrivateUse1, 0};
-  const auto opts = torch::TensorOptions().device(device);
-  auto scores = torch::zeros({1, 2, 3}, opts.dtype(torch::kFloat32));
-  auto slots = torch::zeros({1, 2, 3}, opts.dtype(torch::kInt32));
-  auto mapping = torch::zeros({2}, slots.options());
-  auto output = torch::empty({2, 3}, slots.options());
-  auto lengths = torch::empty({2}, slots.options());
-  EXPECT_DEATH(dcp_merge_topk(scores, slots, mapping, 4, output, lengths),
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "Requires an MLU device";
+  }
+  auto input = make_input(/*rows=*/2);
+  GuardedTopk out(/*q=*/2, kTopk, input.scores.device());
+  EXPECT_DEATH(dcp_merge_topk(input.scores.to(torch::kFloat32),
+                              input.slots,
+                              input.mapping,
+                              kTopk,
+                              out.output,
+                              out.lengths),
+               "scalar_type");
+  EXPECT_DEATH(dcp_merge_topk(input.scores.slice(0, 0, 2),
+                              input.slots.slice(0, 0, 2),
+                              input.mapping,
+                              kTopk,
+                              out.output,
+                              out.lengths),
+               "scores.size");
+  EXPECT_DEATH(dcp_merge_topk(input.scores.slice(2, 0, 1024),
+                              input.slots.slice(2, 0, 1024),
+                              input.mapping,
+                              kTopk,
+                              out.output,
+                              out.lengths),
+               "scores.size");
+  EXPECT_DEATH(dcp_merge_topk(input.scores,
+                              input.slots,
+                              input.mapping,
+                              1024,
+                              out.output,
+                              out.lengths),
                "topk");
+  EXPECT_DEATH(dcp_merge_topk(input.scores,
+                              input.slots,
+                              input.mapping.slice(0, 0, 1),
+                              kTopk,
+                              out.output,
+                              out.lengths),
+               "mapping.size");
+  auto alias = input.slots[0];
   EXPECT_DEATH(
       dcp_merge_topk(
-          scores.to(torch::kFloat64), slots, mapping, 3, output, lengths),
-      "scalar_type");
-  EXPECT_DEATH(
-      dcp_merge_topk(scores, slots, mapping.slice(0, 0, 1), 3, output, lengths),
-      "mapping.size");
-  auto alias = slots[0];
-  EXPECT_DEATH(dcp_merge_topk(scores, slots, mapping, 3, alias, lengths),
+          input.scores, input.slots, input.mapping, kTopk, alias, out.lengths),
+      "alias");
+  auto strided = dcp_test::strided_copy(out.output);
+  EXPECT_DEATH(dcp_merge_topk(input.scores,
+                              input.slots,
+                              input.mapping,
+                              kTopk,
+                              strided,
+                              out.lengths),
+               "contiguous");
+  EXPECT_DEATH(dcp_merge_topk(input.scores,
+                              input.slots,
+                              input.mapping,
+                              kTopk,
+                              out.output,
+                              input.mapping),
                "alias");
-  auto overlap = output.as_strided({2, 3}, {1, 1});
-  EXPECT_DEATH(dcp_merge_topk(scores, slots, mapping, 3, overlap, lengths),
-               "stride");
+  auto expanded = input.scores.slice(0, 0, 1).expand({4, 2, kTopk});
+  EXPECT_DEATH(
+      dcp_merge_topk(
+          expanded, input.slots, input.mapping, kTopk, out.output, out.lengths),
+      "stride");
 }
-
 }  // namespace
 }  // namespace xllm

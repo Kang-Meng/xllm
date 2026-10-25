@@ -635,7 +635,8 @@ std::pair<torch::Tensor, torch::Tensor> fused_gdn_gating(
     const torch::Tensor& dt_bias,
     float beta = 1.0f,
     float threshold = 20.0f);
-// Global TopK: score descending; tied candidates follow torch::topk ordering.
+// BF16 scores[4,Q,2048], topk=2048; INT32 slots/mapping and contiguous outputs.
+// Global TopK: score descending; tied candidates follow device torch::topk.
 // Invalid slots/NaNs are excluded. Valid slots occupy the output prefix;
 // unused output slots are -1, including all slots of padding queries.
 void dcp_merge_topk(const torch::Tensor& scores,
