@@ -24,9 +24,8 @@ namespace xllm::layer {
 std::pair<torch::Tensor, torch::Tensor> build_prefill_slot_order(
     const torch::Tensor& source_slots);
 
-KVShardCausalSelectorMetadata build_kv_shard_causal_selector_metadata(
-    const AttentionMetadata& attention_metadata,
-    const KVShardLayout& layout);
+KVShardIndexerMetadata build_kv_shard_indexer_metadata(
+    const AttentionMetadata& attention_metadata);
 
 // Prepare MLU-only derived tensors once per batch, before layer execution.
 std::shared_ptr<const KVShardBatchMetadata> build_mlu_shard_metadata(

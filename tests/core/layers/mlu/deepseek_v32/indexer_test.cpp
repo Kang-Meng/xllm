@@ -23,6 +23,7 @@ limitations under the License.
 #include <unordered_map>
 
 #include "core/framework/config/kv_cache_config.h"
+#include "core/kernels/mlu/dcp/dcp_precision_test_utils.h"
 #include "core/layers/mlu/deepseek_v32/dcp_batch_metadata.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/parallel_args.h"
@@ -531,23 +532,11 @@ void idx_expect_dcp_local_prefill_candidates(
       static_cast<int32_t>(KVCacheConfig::get_instance().block_size()),
       /*dcp_size=*/2,
       kDcpRank);
-  const KVShardCausalSelectorMetadata causal_selector =
-      build_kv_shard_causal_selector_metadata(inputs.metadata, layout);
-
+  const KVShardIndexerMetadata selector_metadata =
+      build_kv_shard_indexer_metadata(inputs.metadata);
   AttentionMetadata prefill_metadata = inputs.metadata;
   prefill_metadata.slot_mapping =
       localize_kv_shard_slots(inputs.metadata.slot_mapping, layout);
-  AttentionMetadata selector_metadata = prefill_metadata;
-  selector_metadata.q_cu_seq_lens = causal_selector.q_cu_seq_lens;
-  selector_metadata.kv_cu_seq_lens = causal_selector.q_cu_seq_lens;
-  selector_metadata.kv_seq_lens = causal_selector.local_context_lens;
-  selector_metadata.block_table = causal_selector.block_table;
-  selector_metadata.max_query_len = 1;
-  selector_metadata.max_seq_len = test_config_.index_topk;
-  selector_metadata.total_kv_len = 0;
-  selector_metadata.is_prefill = false;
-  selector_metadata.is_chunked_prefill = false;
-
   DeepseekV32Indexer indexer = idx_create_indexer(parallel_args_,
                                                   test_config_,
                                                   options_,
@@ -570,7 +559,9 @@ void idx_expect_dcp_local_prefill_candidates(
   torch::Tensor columns =
       torch::arange(test_config_.index_topk, options_.dtype(torch::kInt32));
   torch::Tensor invalid_columns =
-      columns.unsqueeze(0) >= causal_selector.local_context_lens.unsqueeze(1);
+      columns.unsqueeze(0) >= localize_kv_shard_context_lens(
+                                  selector_metadata.query_positions + 1, layout)
+                                  .unsqueeze(1);
   EXPECT_TRUE(candidates.global_slots.masked_select(invalid_columns)
                   .eq(KVShardLayout::kInvalidSlot)
                   .all()
@@ -882,8 +873,7 @@ void idx_expect_scores(const DcpIndexerLocalCandidates& candidates,
                        const IndexerCPPreOut& pre_out,
                        const torch::Tensor& cache,
                        const std::optional<torch::Tensor>& cache_scale,
-                       const KVShardLayout& layout,
-                       double tolerance = 1e-4);
+                       const KVShardLayout& layout);
 void idx_expect_entry_scores(ParallelArgs& parallel_args_,
                              TestConfig& test_config_,
                              torch::TensorOptions& options_,
@@ -895,54 +885,17 @@ void idx_expect_scores(const DcpIndexerLocalCandidates& candidates,
                        const IndexerCPPreOut& pre_out,
                        const torch::Tensor& cache,
                        const std::optional<torch::Tensor>& cache_scale,
-                       const KVShardLayout& layout,
-                       double tolerance) {
-  torch::Tensor q = pre_out.q.cpu().to(torch::kFloat32);
-  if (pre_out.q_scale.has_value()) {
-    q *= pre_out.q_scale->cpu().unsqueeze(-1);
-  }
-  torch::Tensor weights = pre_out.weights.cpu().to(torch::kFloat32);
-  torch::Tensor keys = cache.cpu().flatten(0, 2).to(torch::kFloat32);
-  if (cache_scale.has_value()) {
-    keys *= cache_scale->cpu().flatten().unsqueeze(-1);
-  }
-  torch::Tensor slots =
-      localize_kv_shard_slots(candidates.global_slots.cpu(), layout);
-  torch::Tensor scores = candidates.scores.cpu();
-  const auto q_data = q.accessor<float, 3>();
-  const auto weight_data = weights.accessor<float, 2>();
-  const auto key_data = keys.accessor<float, 2>();
-  const auto slot_data = slots.accessor<int32_t, 2>();
-  const auto score_data = scores.accessor<float, 2>();
-  int64_t valid_count = 0;
-  int64_t invalid_count = 0;
-  for (int64_t row = 0; row < slots.size(0); ++row) {
-    for (int64_t col = 0; col < slots.size(1); ++col) {
-      const int32_t slot = slot_data[row][col];
-      if (slot < 0) {
-        EXPECT_TRUE(std::isinf(score_data[row][col]));
-        EXPECT_LT(score_data[row][col], 0);
-        ++invalid_count;
-        continue;
-      }
-      double expected = 0;
-      for (int64_t head = 0; head < q.size(1); ++head) {
-        double dot = 0;
-        for (int64_t dim = 0; dim < q.size(2); ++dim) {
-          dot +=
-              static_cast<double>(q_data[row][head][dim]) * key_data[slot][dim];
-        }
-        expected += std::max(dot, 0.0) * weight_data[row][head];
-      }
-      ASSERT_NEAR(score_data[row][col],
-                  expected,
-                  tolerance * (1.0 + std::abs(expected)))
-          << "row=" << row << " slot=" << slot;
-      ++valid_count;
-    }
-  }
-  EXPECT_GT(valid_count, 0);
-  EXPECT_GT(invalid_count, 0);
+                       const KVShardLayout& layout) {
+  CHECK(!cache_scale.has_value() && !pre_out.q_scale.has_value());
+  const torch::Tensor golden = dcp_test::aligned_golden(pre_out.q,
+                                                        pre_out.weights,
+                                                        cache,
+                                                        candidates.global_slots,
+                                                        layout.dcp_size());
+  EXPECT_TRUE(dcp_test::score_precision(
+      candidates.scores, golden.to(torch::kBFloat16), golden));
+  EXPECT_TRUE((candidates.global_slots >= 0).any().item<bool>());
+  EXPECT_TRUE((candidates.global_slots < 0).any().item<bool>());
 }
 void idx_expect_entry_scores(ParallelArgs& parallel_args_,
                              TestConfig& test_config_,
@@ -962,11 +915,11 @@ void idx_expect_entry_scores(ParallelArgs& parallel_args_,
                                         /*history_len=*/chunked ? 8 : 0,
                                         /*use_default_rope=*/true,
                                         /*quantized_cache=*/false,
-                                        /*cache_block_size=*/1);
+                                        /*cache_block_size=*/16);
   parallel_args_.world_size() = 2;
   parallel_args_.kv_split_size() = 2;
   const KVShardLayout layout(
-      /*physical_block_size=*/1, /*dcp_size=*/2, /*dcp_rank=*/0);
+      /*physical_block_size=*/16, /*dcp_size=*/2, /*dcp_rank=*/0);
   // The single packed prompt starts at zero, including chunked prefill;
   // decode uses position zero in both fused and eager rotary paths.
   inputs.positions = inputs.metadata.is_prefill
@@ -992,16 +945,8 @@ void idx_expect_entry_scores(ParallelArgs& parallel_args_,
       inputs.x, inputs.q_norm, inputs.positions, inputs.metadata);
   DcpIndexerLocalCandidates candidates;
   if (is_prefill) {
-    const KVShardCausalSelectorMetadata causal =
-        build_kv_shard_causal_selector_metadata(inputs.metadata, layout);
-    AttentionMetadata selector = inputs.metadata;
-    selector.q_cu_seq_lens = causal.q_cu_seq_lens;
-    selector.kv_cu_seq_lens = causal.q_cu_seq_lens;
-    selector.kv_seq_lens = causal.local_context_lens;
-    selector.block_table = causal.block_table;
-    selector.max_query_len = 1;
-    selector.is_prefill = false;
-    selector.is_chunked_prefill = false;
+    const KVShardIndexerMetadata selector =
+        build_kv_shard_indexer_metadata(inputs.metadata);
     inputs.metadata.slot_mapping =
         localize_kv_shard_slots(inputs.metadata.slot_mapping, layout);
     candidates = indexer->forward_dcp_local_prefill(inputs.x,
@@ -1014,18 +959,16 @@ void idx_expect_entry_scores(ParallelArgs& parallel_args_,
     // Include cached history with both signs in the decode score check.
     inputs.metadata.kv_seq_lens.fill_(8);
     inputs.metadata.block_table = torch::arange(8, int_option_).view({1, 8});
-    candidates = indexer->forward_dcp_local(inputs.x,
-                                            inputs.q_norm,
-                                            inputs.positions,
-                                            inputs.k_cache,
-                                            inputs.metadata);
+    candidates = indexer->forward_dcp_local(
+        inputs.x,
+        inputs.q_norm,
+        inputs.positions,
+        inputs.k_cache,
+        inputs.metadata,
+        build_kv_shard_indexer_metadata(inputs.metadata));
   }
-  idx_expect_scores(candidates,
-                    reference,
-                    inputs.k_cache,
-                    inputs.k_cache_scale,
-                    layout,
-                    /*tolerance=*/1e-4);
+  idx_expect_scores(
+      candidates, reference, inputs.k_cache, inputs.k_cache_scale, layout);
 }
 }  // namespace
 
@@ -1050,7 +993,7 @@ TEST(DcpIndexerScoreTest, DecodeMatchesReluReference) {
   int_option_ = options_.dtype(torch::kInt32);
 
   parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
+  KVCacheConfig::get_instance().block_size(16);
 
   test_config_.index_n_heads = 32;
 
@@ -1084,7 +1027,7 @@ TEST(DcpIndexerScoreTest, PrefillMatchesReluReference) {
   int_option_ = options_.dtype(torch::kInt32);
 
   parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
+  KVCacheConfig::get_instance().block_size(16);
 
   test_config_.index_n_heads = 32;
 
@@ -1118,7 +1061,7 @@ TEST(DcpIndexerScoreTest, ChunkedPrefillMatchesReluReference) {
   int_option_ = options_.dtype(torch::kInt32);
 
   parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
+  KVCacheConfig::get_instance().block_size(16);
 
   test_config_.index_n_heads = 32;
 
@@ -1152,7 +1095,7 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
   int_option_ = options_.dtype(torch::kInt32);
 
   parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
+  KVCacheConfig::get_instance().block_size(16);
 
   test_config_.index_n_heads = 32;
   parallel_args_.world_size() = 4;
@@ -1182,7 +1125,7 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
     SCOPED_TRACE(rank);
     parallel_args_.rank() = rank;
     const KVShardLayout layout(
-        /*physical_block_size=*/1, /*dcp_size=*/4, rank);
+        /*physical_block_size=*/16, /*dcp_size=*/4, rank);
     TestInputs inputs;
     DeepseekV32Indexer indexer = idx_create_indexer(parallel_args_,
                                                     test_config_,
@@ -1190,18 +1133,18 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
                                                     rotary_emb_,
                                                     inputs,
                                                     /*enable_fused_qk=*/true);
-    const int32_t ctx_len = 512 + (rank == 0 ? 1 : 0);
-    torch::Tensor keys = torch::zeros({ctx_len, 1, 1, 128}, options_);
+    torch::Tensor keys = torch::zeros({33, 1, 16, 128}, options_);
     keys.select(/*dim=*/3, /*index=*/0).fill_(20);
     keys.index_put_({0, 0, 0, 0}, rank == 0 ? 10 : (rank == 1 ? 6 : 20));
     keys.index_put_({0, 0, 0, 1}, rank == 0 ? -9 : 0);
     std::optional<torch::Tensor> scales = std::nullopt;
     AttentionMetadata prefill;
     prefill.slot_mapping = torch::full({2}, -1, int_option_);
-    AttentionMetadata selector;
+    KVShardIndexerMetadata selector;
     selector.block_table =
-        torch::arange(ctx_len, int_option_).unsqueeze(0).repeat({2, 1});
-    selector.kv_seq_lens = torch::full({2}, ctx_len, int_option_);
+        torch::arange(33, int_option_).unsqueeze(0).repeat({2, 1});
+    selector.kv_seq_lens = torch::full({2}, 2049, int_option_);
+    selector.query_positions = selector.kv_seq_lens - 1;
     selector.q_cu_seq_lens = torch::arange(3, int_option_);
     const DcpIndexerLocalCandidates candidates =
         indexer->forward_dcp_local_prefill_from_cp(
@@ -1214,16 +1157,16 @@ TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
   gathered.gathered_scores = torch::stack(rank_scores);
   gathered.gathered_global_slots = torch::stack(rank_slots);
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/1, /*dcp_size=*/4, /*dcp_rank=*/0),
+      KVShardLayout(/*physical_block_size=*/16, /*dcp_size=*/4, /*dcp_rank=*/0),
       /*dcp_group=*/nullptr);
   const DsaTopkState merged = context.finish_indexer_candidate_merge(
       std::move(gathered), /*topk=*/2048, torch::zeros({2}, int_option_));
   torch::Tensor selected = merged.block_tables()[0].cpu();
   torch::Tensor expected = torch::arange(2049, torch::kInt32);
-  expected = expected.masked_select(expected.ne(1));
+  expected = expected.masked_select(expected.ne(16));
   EXPECT_TRUE(torch::equal(std::get<0>(selected.sort()), expected));
   EXPECT_TRUE(selected.eq(0).any().item<bool>());
-  EXPECT_FALSE(selected.eq(1).any().item<bool>());
+  EXPECT_FALSE(selected.eq(16).any().item<bool>());
   EXPECT_EQ(merged.context_lens()[0].item<int32_t>(), 2048);
 }
 

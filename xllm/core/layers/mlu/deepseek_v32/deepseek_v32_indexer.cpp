@@ -14,28 +14,23 @@ limitations under the License.
 ==============================================================================*/
 #include "core/layers/mlu/deepseek_v32/deepseek_v32_indexer.h"
 
-#include <framework/core/MLUStream.h>
-#include <framework/core/device.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 
-#include <algorithm>
 #include <cmath>
 #include <tuple>
+#include <utility>
 
 #include "core/framework/config/kv_cache_config.h"
-#include "kernels/mlu/dcp_score_policy.h"
+#include "kernels/mlu/bangc/include/dcp_indexer.h"
 #include "kernels/ops_api.h"
 #include "layers/common/kv_shard_batch_metadata.h"
-#include "triton_jit/include/jit_kernel.h"
 #include "util/linalg.h"
 
 namespace xllm {
 namespace layer {
 
 namespace {
-
-using xllm::triton_jit::JITKernel;
 
 void check_index_cache(const torch::Tensor& k_cache,
                        const std::optional<torch::Tensor>& k_cache_scale) {
@@ -106,6 +101,9 @@ DeepseekV32IndexerImpl::DeepseekV32IndexerImpl(
         << "MLU DCP indexer requires BF16, 32 heads and head dimension 128";
     CHECK_NE(KVCacheConfig::get_instance().indexer_cache_dtype(), "int8")
         << "MLU DCP indexer does not support INT8";
+    CHECK_EQ(KVCacheConfig::get_instance().block_size(), 16)
+        << "MLU DCP indexer requires page size 16";
+    CHECK_EQ(index_topk_, 2048) << "MLU DCP indexer requires TopK 2048";
     dcp_indexer_layout_.emplace(KVCacheConfig::get_instance().block_size(),
                                 parallel_args.kv_split_size_effective(),
                                 parallel_args.kv_split_rank());
@@ -820,134 +818,26 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV32IndexerImpl::forward(
   return run_indexer_select_kernel(attn_metadata, is_prefill, ctx);
 }
 
-DcpIndexerLocalCandidates DeepseekV32IndexerImpl::finalize_local_candidates(
+DcpIndexerLocalCandidates DeepseekV32IndexerImpl::select_dcp_candidates(
     const torch::Tensor& q,
     const torch::Tensor& weights,
     const torch::Tensor& k_cache,
-    const torch::Tensor& local_slots,
-    const torch::Tensor& context_lens) const {
+    const KVShardIndexerMetadata& metadata,
+    bool is_prefill) const {
   CHECK(dcp_indexer_layout_.has_value());
   const KVShardLayout& layout = *dcp_indexer_layout_;
-  CHECK_EQ(local_slots.dim(), 2);
-  const int64_t rows = local_slots.size(0);
-  const int64_t width = local_slots.size(1);
-  CHECK_EQ(context_lens.dim(), 1);
-  CHECK_EQ(context_lens.size(0), rows);
-  CHECK(local_slots.scalar_type() == torch::kInt32);
-  CHECK(context_lens.scalar_type() == torch::kInt32);
-  for (const torch::Tensor& input : {q, weights, k_cache}) {
-    CHECK(input.scalar_type() == torch::kBFloat16)
-        << "MLU DCP indexer requires BF16 inputs";
-  }
-  for (const torch::Tensor& input :
-       {weights, k_cache, local_slots, context_lens}) {
-    CHECK(input.device() == q.device());
-  }
-  CHECK_GE(q.dim(), 3);
-  CHECK_EQ(q.size(-2), 32);
-  CHECK_EQ(q.size(-1), 128);
-  CHECK_GE(weights.dim(), 2);
-  CHECK_EQ(weights.size(-1), 32);
-  CHECK_EQ(k_cache.dim(), 4);
-  CHECK_EQ(k_cache.size(1), 1);
-  CHECK_EQ(k_cache.size(2), layout.physical_block_size());
-  CHECK_EQ(k_cache.size(3), 128);
-  // view rejects layouts that would require an implicit device copy.
-  torch::Tensor query = q.view({rows, 32, 128});
-  torch::Tensor head_weights = weights.view({rows, 32});
-  torch::Tensor cache = k_cache.view({-1, 128});
-  const int64_t cache_slots = cache.size(0);
-  CHECK_GT(cache_slots, 0);
-  torch::Tensor scores =
-      torch::empty({rows, width}, q.options().dtype(torch::kFloat32));
-  torch::Tensor global_slots =
-      torch::empty({rows, width}, q.options().dtype(torch::kInt32));
-  if (rows == 0 || width == 0) {
-    return {scores, global_slots};
-  }
-  const auto* properties = torch_mlu::getDeviceProperties(q.device().index());
-  const int64_t cores =
-      properties->cluster_count * properties->core_num_per_cluster;
-  int64_t block_n = 512;
-  int32_t stages = 99;
-  if (query.stride(-1) != 1 || head_weights.stride(-1) != 1 ||
-      cache.stride(-1) != 1 || local_slots.stride(-1) != 1 ||
-      context_lens.stride(-1) != 1) {
-    block_n = 32;
-    stages = 3;
-  } else if (width < 256) {
-    block_n = 128;
-    stages = 3;
-  } else if (rows < cores || rows <= 128) {
-    block_n = 256;
-    stages = rows < cores || width <= 4096 ? 5 : 99;
-  }
-  int64_t slot_cap = 1;
-  while (slot_cap < width) {
-    slot_cap *= 2;
-  }
-  int64_t page_shift = 0;
-  for (int64_t page = layout.physical_block_size(); page > 1; page >>= 1) {
-    ++page_shift;
-  }
-  const uint32_t programs = static_cast<uint32_t>(
-      std::min(cores, rows * ((width + block_n - 1) / block_n)));
-  triton_jit::LaunchCfg cfg;
-  cfg.num_warps = 1;
-  cfg.num_stages = stages;
-  cfg.enable_fp_fusion = false;
-  cfg.enable_soft_i64 = true;
-  cfg.force_use_shared_memory = true;
-  JITKernel& kernel = JITKernel::get(
-      "xllm.core.kernels.mlu.triton_kernel.dcp.dcp_candidate_score",
-      "tmo_dcp_score_candidates_kernel");
-  const auto policy = kernel::dcp_score_policy(query,
-                                               head_weights,
-                                               cache,
-                                               local_slots,
-                                               context_lens,
-                                               cores,
-                                               block_n,
-                                               slot_cap);
-  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-  kernel.launch(static_cast<void*>(queue),
-                {programs, 1, 1},
-                cfg,
-                query,
-                head_weights,
-                cache,
-                local_slots,
-                context_lens,
-                scores,
-                global_slots,
-                rows,
-                policy.row_cap,
-                policy.row_owned,
-                policy.small_rows,
-                policy.preload_counts,
-                policy.prefetch_rows,
-                policy.program_proof,
-                policy.narrow,
-                width,
-                cache_slots,
-                query.stride(0),
-                query.stride(1),
-                query.stride(2),
-                head_weights.stride(0),
-                head_weights.stride(1),
-                cache.stride(0),
-                cache.stride(1),
-                local_slots.stride(0),
-                local_slots.stride(1),
-                context_lens.stride(0),
-                layout.dcp_size(),
-                layout.dcp_rank(),
-                layout.physical_block_size(),
-                page_shift,
-                block_n,
-                cores,
-                slot_cap);
-  return {scores, global_slots};
+  auto [scores, slots] =
+      kernel::mlu::bangc::dcp_indexer(q.view({-1, n_heads_, head_dim_}),
+                                      k_cache,
+                                      weights.view({-1, n_heads_}),
+                                      metadata.block_table,
+                                      metadata.q_cu_seq_lens,
+                                      metadata.query_positions,
+                                      metadata.kv_seq_lens,
+                                      layout.dcp_rank(),
+                                      layout.dcp_size(),
+                                      is_prefill);
+  return {std::move(scores), std::move(slots)};
 }
 
 DcpIndexerLocalCandidates DeepseekV32IndexerImpl::forward_dcp_local(
@@ -955,12 +845,10 @@ DcpIndexerLocalCandidates DeepseekV32IndexerImpl::forward_dcp_local(
     const torch::Tensor& q_norm,
     const torch::Tensor& positions,
     torch::Tensor& k_cache,
-    const AttentionMetadata& attn_metadata) {
+    const AttentionMetadata& attn_metadata,
+    const KVShardIndexerMetadata& indexer_metadata) {
   check_dcp_cache(k_cache);
-  CHECK(dcp_indexer_layout_.has_value())
-      << "DCP local indexer candidates require a DCP layout";
-  CHECK(!attn_metadata.is_prefill)
-      << "DCP local indexer candidates currently support decode only";
+  CHECK(!attn_metadata.is_prefill);
   torch::Tensor q, k, weights;
   std::tie(q, k, weights, std::ignore, std::ignore) =
       preprocess_indexer_inputs(x,
@@ -972,22 +860,11 @@ DcpIndexerLocalCandidates DeepseekV32IndexerImpl::forward_dcp_local(
                                 /*use_prompt_rope=*/attn_metadata.is_prefill,
                                 /*write_k_cache=*/true,
                                 /*k_cache_scale=*/std::nullopt);
-  IndexerRuntimeContext ctx =
-      prepare_runtime_context(k,
-                              k_cache,
-                              q,
-                              weights,
-                              attn_metadata,
-                              /*is_prefill=*/false,
-                              x.size(0),
-                              /*q_scale=*/std::nullopt,
-                              /*k_cache_scale=*/std::nullopt);
-  torch::Tensor local_slots;
-  torch::Tensor context_lens;
-  std::tie(local_slots, context_lens) =
-      run_indexer_select_kernel(attn_metadata, /*is_prefill=*/false, ctx);
-  return finalize_local_candidates(
-      ctx.q, ctx.weights, k_cache, local_slots, context_lens);
+  return select_dcp_candidates(q,
+                               weights,
+                               k_cache,
+                               indexer_metadata,
+                               /*is_prefill=*/false);
 }
 
 DcpIndexerLocalCandidates DeepseekV32IndexerImpl::forward_dcp_local_prefill(
@@ -996,7 +873,7 @@ DcpIndexerLocalCandidates DeepseekV32IndexerImpl::forward_dcp_local_prefill(
     const torch::Tensor& positions,
     torch::Tensor& k_cache,
     const AttentionMetadata& prefill_metadata,
-    const AttentionMetadata& selector_metadata) {
+    const KVShardIndexerMetadata& indexer_metadata) {
   check_dcp_cache(k_cache);
   torch::Tensor q, k, weights;
   std::tie(q, k, weights, std::ignore, std::ignore) =
@@ -1009,27 +886,11 @@ DcpIndexerLocalCandidates DeepseekV32IndexerImpl::forward_dcp_local_prefill(
                                 /*use_prompt_rope=*/prefill_metadata.is_prefill,
                                 /*write_k_cache=*/true,
                                 /*k_cache_scale=*/std::nullopt);
-
-  const int64_t token_count = x.size(0);
-  IndexerRuntimeContext ctx;
-  ctx.q = q.view({token_count, 1, n_heads_, head_dim_});
-  ctx.weights = weights.view({token_count, 1, n_heads_});
-  ctx.new_block_tables = torch::empty({token_count, 1, index_topk_},
-                                      selector_metadata.block_table.options());
-  ctx.new_context_lens =
-      torch::empty({token_count}, selector_metadata.kv_seq_lens.options());
-  ctx.cu_seq_q_lens = std::nullopt;
-  ctx.cu_seq_k_lens = selector_metadata.q_cu_seq_lens;
-  ctx.k_context_lens = selector_metadata.kv_seq_lens;
-  ctx.k_block_table = selector_metadata.block_table;
-  ctx.k_cache_tensor = k_cache;
-
-  torch::Tensor local_slots;
-  torch::Tensor context_lens;
-  std::tie(local_slots, context_lens) =
-      run_indexer_select_kernel(selector_metadata, /*is_prefill=*/false, ctx);
-  return finalize_local_candidates(
-      q, weights, k_cache, local_slots, context_lens);
+  return select_dcp_candidates(q,
+                               weights,
+                               k_cache,
+                               indexer_metadata,
+                               /*is_prefill=*/true);
 }
 
 DcpIndexerLocalCandidates
@@ -1037,34 +898,17 @@ DeepseekV32IndexerImpl::forward_dcp_local_prefill_from_cp(
     const IndexerCPPreOut& pre_out,
     torch::Tensor& k_cache,
     const AttentionMetadata& prefill_metadata,
-    const AttentionMetadata& selector_metadata) {
+    const KVShardIndexerMetadata& indexer_metadata) {
   check_dcp_cache(k_cache);
   CHECK(!pre_out.q_scale.has_value())
       << "MLU DCP indexer does not support INT8";
-  torch::Tensor q = pre_out.q;
   write_prefill_k_cache(
       pre_out.k_local, k_cache, prefill_metadata.slot_mapping, std::nullopt);
-
-  const int64_t token_count = q.size(0);
-  IndexerRuntimeContext ctx;
-  ctx.q = q.view({token_count, 1, n_heads_, head_dim_});
-  ctx.weights = pre_out.weights.view({token_count, 1, n_heads_});
-  ctx.new_block_tables = torch::empty({token_count, 1, index_topk_},
-                                      selector_metadata.block_table.options());
-  ctx.new_context_lens =
-      torch::empty({token_count}, selector_metadata.kv_seq_lens.options());
-  ctx.cu_seq_q_lens = std::nullopt;
-  ctx.cu_seq_k_lens = selector_metadata.q_cu_seq_lens;
-  ctx.k_context_lens = selector_metadata.kv_seq_lens;
-  ctx.k_block_table = selector_metadata.block_table;
-  ctx.k_cache_tensor = k_cache;
-
-  torch::Tensor local_slots;
-  torch::Tensor context_lens;
-  std::tie(local_slots, context_lens) =
-      run_indexer_select_kernel(selector_metadata, /*is_prefill=*/false, ctx);
-  return finalize_local_candidates(
-      q, pre_out.weights, k_cache, local_slots, context_lens);
+  return select_dcp_candidates(pre_out.q,
+                               pre_out.weights,
+                               k_cache,
+                               indexer_metadata,
+                               /*is_prefill=*/true);
 }
 
 // load the weight from the checkpoint

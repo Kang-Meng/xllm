@@ -83,13 +83,9 @@ DsaTopkState merge_indexer_candidates(const torch::Tensor& scores,
       torch::empty({query_count, topk}, global_slots.options());
   torch::Tensor context_lens =
       torch::empty({query_count}, global_slots.options());
-  torch::Tensor merge_scores = scores.to(torch::kBFloat16);
-  kernel::mlu::dcp_merge_topk(merge_scores,
-                              global_slots,
-                              slot_mapping,
-                              topk,
-                              output_slots,
-                              context_lens);
+  CHECK_EQ(scores.scalar_type(), torch::kBFloat16);
+  kernel::mlu::dcp_merge_topk(
+      scores, global_slots, slot_mapping, topk, output_slots, context_lens);
   return DsaTopkState(std::move(output_slots), std::move(context_lens));
 }
 

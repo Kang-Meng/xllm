@@ -1,0 +1,115 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "kernels/mlu/bangc/src/dcp_indexer/device.mluh"
+#include "kernels/mlu/bangc/src/dcp_indexer/host.h"
+#include "kernels/mlu/bangc/src/dcp_indexer/params.h"
+
+namespace xllm::kernel::mlu::bangc::detail {
+namespace {
+
+int32_t cluster_count() {
+  int32_t device = 0;
+  int32_t clusters = 0;
+  if (cnrtGetDevice(&device) != cnrtSuccess ||
+      cnrtDeviceGetAttribute(&clusters, cnrtAttrClusterCount, device) !=
+          cnrtSuccess ||
+      clusters <= 0) {
+    return 0;
+  }
+  return clusters;
+}
+
+}  // namespace
+
+// Few query rows (prefill or decode): split the K range across cores (two
+// kernels, one workspace row per token) when the workspace stays bounded.
+constexpr int64_t kSplitRows = 2048;
+constexpr int64_t kSplitWorkspaceLimit = int64_t{512} << 20;
+
+bool use_split(int32_t num_tokens, int32_t table_width) {
+  const int64_t row_bytes = static_cast<int64_t>(table_width) * kPage * 2;
+  return num_tokens < kSplitRows &&
+         static_cast<int64_t>(num_tokens) * row_bytes <= kSplitWorkspaceLimit;
+}
+
+size_t workspace_bytes(int32_t num_tokens, int32_t table_width) {
+  if (static_cast<int64_t>(table_width) * kPage <= kTopk) {
+    return 0;
+  }
+  const size_t row_bytes = static_cast<size_t>(table_width) * kPage * 2;
+  if (use_split(num_tokens, table_width)) {
+    return static_cast<size_t>(num_tokens) * row_bytes;
+  }
+  const size_t cores = static_cast<size_t>(cluster_count()) * 4;
+  return cores * kTileQ * row_bytes;
+}
+
+device::KernelArgs to_kernel_args(const IndexerArgs& args) {
+  device::KernelArgs a;
+  a.query = static_cast<const bfloat16_t*>(args.query);
+  a.k_cache = static_cast<const bfloat16_t*>(args.k_cache);
+  a.weights = static_cast<const bfloat16_t*>(args.weights);
+  a.block_table = static_cast<const int32_t*>(args.block_table);
+  a.q_cu_seq_lens = static_cast<const int32_t*>(args.q_cu_seq_lens);
+  a.query_positions = static_cast<const int32_t*>(args.query_positions);
+  a.kv_seq_lens = static_cast<const int32_t*>(args.kv_seq_lens);
+  a.scores = static_cast<bfloat16_t*>(args.scores);
+  a.slots = static_cast<int32_t*>(args.slots);
+  a.workspace = static_cast<bfloat16_t*>(args.workspace);
+  a.num_tokens = args.num_tokens;
+  a.batch = args.batch;
+  a.table_width = args.table_width;
+  a.num_pages = args.num_pages;
+  a.dcp_rank = args.dcp_rank;
+  a.dcp_size = args.dcp_size;
+  return a;
+}
+
+cnrtRet_t launch_prefill(cnrtQueue_t queue, const IndexerArgs& args) {
+  const int32_t clusters = cluster_count();
+  if (clusters == 0) {
+    return cnrtErrorNoDevice;
+  }
+  cnrtDim3_t dim{4, static_cast<uint32_t>(clusters), 1};
+  const device::KernelArgs a = to_kernel_args(args);
+  if (static_cast<int64_t>(args.table_width) * kPage > kTopk &&
+      use_split(args.num_tokens, args.table_width)) {
+    device::split_score_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(a);
+    device::split_select_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(a);
+  } else {
+    device::prefill_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(a);
+  }
+  return cnrtGetLastError();
+}
+
+cnrtRet_t launch_decode(cnrtQueue_t queue, const IndexerArgs& args) {
+  const int32_t clusters = cluster_count();
+  if (clusters == 0) {
+    return cnrtErrorNoDevice;
+  }
+  cnrtDim3_t dim{4, static_cast<uint32_t>(clusters), 1};
+  const device::KernelArgs a = to_kernel_args(args);
+  if (static_cast<int64_t>(args.table_width) * kPage > kTopk &&
+      use_split(args.num_tokens, args.table_width)) {
+    device::decode_score_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(a);
+    device::split_select_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(a);
+  } else {
+    device::decode_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(a);
+  }
+  return cnrtGetLastError();
+}
+
+}  // namespace xllm::kernel::mlu::bangc::detail

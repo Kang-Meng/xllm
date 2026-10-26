@@ -36,8 +36,8 @@ struct Candidates {
   torch::Tensor mapping;
 };
 
-// Equal keys deliberately use the same device TopK ordering as dcp_merge_topk.
-// Adding a slot-based tie break would change the bitwise regression contract.
+// CPU integer keys order BF16 scores descending, then physical slots ascending.
+// Keep signed zeros and subnormals distinct, and exclude all NaN payloads.
 inline TopkResult merge_reference(const torch::Tensor& scores,
                                   const torch::Tensor& slots,
                                   const torch::Tensor& mapping,
@@ -57,29 +57,33 @@ inline TopkResult merge_reference(const torch::Tensor& scores,
     return {output, lengths};
   }
 
-  auto flat_scores = scores.to(torch::kFloat32)
+  auto flat_scores = scores.cpu()
+                         .to(torch::kFloat32)
                          .permute({1, 0, 2})
                          .contiguous()
                          .view({rows, -1});
-  auto flat_slots = slots.permute({1, 0, 2}).reshape({rows, -1});
-  auto bits = flat_scores.view(torch::kInt32);
+  auto flat_slots = slots.cpu().permute({1, 0, 2}).reshape({rows, -1});
+  auto bits = flat_scores.view(torch::kInt32).to(torch::kInt64);
   auto valid = (flat_slots >= 0) &
                (bits.bitwise_and(/*other=*/0x7fffffff) <= 0x7f800000);
-  // Bitwise negation preserves signed zero and subnormals. Positive canonical
-  // NaNs sort after valid keys, including the key of a valid -infinity score.
-  auto key_bits = bits.bitwise_xor(std::numeric_limits<int32_t>::min());
-  key_bits.masked_fill_(~valid, /*value=*/0x7fc00000);
-  auto prepared_slots = flat_slots.masked_fill(~valid, /*value=*/-1);
-  auto order = std::get<1>(torch::topk(key_bits.view(torch::kFloat32),
+  auto ordered = torch::where(bits < 0,
+                              bits.bitwise_not().bitwise_and(0xffffffffLL),
+                              bits.bitwise_or(0x80000000LL));
+  auto keys = ordered * (int64_t{1} << 31) +
+              std::numeric_limits<int32_t>::max() -
+              flat_slots.to(torch::kInt64);
+  keys.masked_fill_(~valid, -1);
+  auto prepared_slots = flat_slots.masked_fill(~valid, -1);
+  auto order = std::get<1>(torch::topk(keys,
                                        topk,
                                        /*dim=*/1,
-                                       /*largest=*/false,
+                                       /*largest=*/true,
                                        /*sorted=*/true));
   output = prepared_slots.gather(/*dim=*/1, order);
-  auto selected = (output >= 0) & (mapping.unsqueeze(/*dim=*/1) >= 0);
+  auto selected = (output >= 0) & (mapping.cpu().unsqueeze(/*dim=*/1) >= 0);
   output.masked_fill_(~selected, /*value=*/-1);
   lengths = selected.sum(/*dim=*/1).to(torch::kInt32);
-  return {output, lengths};
+  return {output.to(slots.device()), lengths.to(slots.device())};
 }
 
 inline torch::Tensor bf16_pattern(const std::vector<uint16_t>& bits) {

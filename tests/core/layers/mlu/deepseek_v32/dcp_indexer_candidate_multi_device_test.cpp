@@ -29,10 +29,12 @@ limitations under the License.
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "framework/parallel_state/context_parallel_topology.h"
 #include "framework/parallel_state/process_group.h"
@@ -131,7 +133,7 @@ void verify_gathered_candidates(const DcpIndexerGatheredCandidates& gathered,
                                 int32_t world_size,
                                 const torch::Device& device) {
   const torch::TensorOptions score_options =
-      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   const torch::TensorOptions slot_options =
       torch::TensorOptions().dtype(torch::kInt32).device(device);
   CHECK_EQ(gathered.scores.sizes(), (torch::IntArrayRef{world_size, 1, 2}));
@@ -172,12 +174,12 @@ int32_t run_candidate_collective_child(int32_t rank,
     CHECK(process_group) << "Failed to create DCP candidate process group";
 
     torch::Tensor rendezvous = torch::ones(
-        {1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        {1}, torch::TensorOptions().dtype(torch::kBFloat16).device(device));
     process_group->allreduce(rendezvous);
     CHECK_EQ(rendezvous.item<float>(), static_cast<float>(world_size));
 
     const torch::TensorOptions score_options =
-        torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        torch::TensorOptions().dtype(torch::kBFloat16).device(device);
     const torch::TensorOptions slot_options =
         torch::TensorOptions().dtype(torch::kInt32).device(device);
 
@@ -225,12 +227,12 @@ int32_t run_candidate_async_collective_child(int32_t rank,
     CHECK(process_group) << "Failed to create DCP candidate process group";
 
     torch::Tensor rendezvous = torch::ones(
-        {1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        {1}, torch::TensorOptions().dtype(torch::kBFloat16).device(device));
     process_group->allreduce(rendezvous);
     CHECK_EQ(rendezvous.item<float>(), static_cast<float>(world_size));
 
     const torch::TensorOptions score_options =
-        torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        torch::TensorOptions().dtype(torch::kBFloat16).device(device);
     const torch::TensorOptions slot_options =
         torch::TensorOptions().dtype(torch::kInt32).device(device);
 
@@ -253,6 +255,99 @@ int32_t run_candidate_async_collective_child(int32_t rank,
     return 0;
   } catch (const std::exception& error) {
     LOG(ERROR) << "DCP candidate rank " << rank << " failed: " << error.what();
+    return 1;
+  }
+}
+
+int32_t run_candidate_bits_child(int32_t rank,
+                                 int32_t world_size,
+                                 int32_t port,
+                                 const std::string& host) {
+  try {
+    if (Platform::device_count() < world_size) {
+      return kExitCodeSkip;
+    }
+    Device xllm_device(rank);
+    xllm_device.set_device();
+    const torch::Device device = xllm_device.unwrap();
+    auto group = create_process_group(rank,
+                                      world_size,
+                                      world_size,
+                                      port,
+                                      /*use_dp_master=*/false,
+                                      host,
+                                      "dcp_bf16_wire_bits_test",
+                                      device);
+    CHECK(group);
+    const std::array<std::pair<int32_t, int32_t>, 4> shapes{
+        {{16, 2048}, {32, 2048}, {64, 2048}, {1, 3}}};
+    const std::array<int32_t, 4> slot_masks{std::numeric_limits<int32_t>::min(),
+                                            std::numeric_limits<int32_t>::max(),
+                                            0x40000001,
+                                            -1};
+    for (const auto& [rows, cols] : shapes) {
+      const int32_t count = rows * cols;
+      const torch::Tensor bits = (torch::arange(count, torch::kInt32) + rank)
+                                     .to(torch::kInt16)
+                                     .reshape({rows, cols});
+      for (const bool adjacent : {false, true}) {
+        torch::Tensor scores = bits.to(device).view(torch::kBFloat16);
+        torch::Tensor slots =
+            (torch::arange(count, torch::kInt32) + rank * count)
+                .bitwise_xor(slot_masks[rank % 4])
+                .reshape({rows, cols})
+                .to(device);
+        if (adjacent) {
+          const int64_t score_bytes = static_cast<int64_t>(count) * 2;
+          const int64_t slot_offset = (score_bytes + 3) / 4 * 4;
+          torch::Tensor packet =
+              torch::empty({8 + slot_offset + static_cast<int64_t>(count) * 4},
+                           scores.options().dtype(torch::kUInt8));
+          torch::Tensor packed_scores = packet.narrow(0, 8, score_bytes)
+                                            .view(torch::kBFloat16)
+                                            .view({rows, cols});
+          torch::Tensor packed_slots =
+              packet.narrow(0, 8 + slot_offset, static_cast<int64_t>(count) * 4)
+                  .view(torch::kInt32)
+                  .view({rows, cols});
+          packed_scores.copy_(scores);
+          packed_slots.copy_(slots);
+          scores = std::move(packed_scores);
+          slots = std::move(packed_slots);
+        }
+        const torch::Tensor input_slots = slots.cpu();
+        auto ctx =
+            launch_dcp_indexer_candidate_gather(scores, slots, group.get());
+        CHECK_EQ(ctx.local_packet.is_alias_of(scores),
+                 adjacent && count % 2 == 0);
+        const auto gathered =
+            finish_dcp_indexer_candidate_gather(std::move(ctx));
+        CHECK_EQ(gathered.scores.scalar_type(), torch::kBFloat16);
+        CHECK(gathered.scores.sizes() ==
+              torch::IntArrayRef({world_size, rows, cols}));
+        for (int32_t source_rank = 0; source_rank < world_size; ++source_rank) {
+          const torch::Tensor expected_bits =
+              (torch::arange(count, torch::kInt32) + source_rank)
+                  .to(torch::kInt16)
+                  .reshape({rows, cols});
+          const torch::Tensor expected_slots =
+              (torch::arange(count, torch::kInt32) + source_rank * count)
+                  .bitwise_xor(slot_masks[source_rank % 4])
+                  .reshape({rows, cols});
+          CHECK(torch::equal(
+              gathered.scores[source_rank].view(torch::kInt16).cpu(),
+              expected_bits));
+          CHECK(torch::equal(gathered.global_slots[source_rank].cpu(),
+                             expected_slots));
+        }
+        CHECK(torch::equal(scores.view(torch::kInt16).cpu(), bits));
+        CHECK(torch::equal(slots.cpu(), input_slots));
+      }
+    }
+    return 0;
+  } catch (const std::exception& error) {
+    LOG(ERROR) << "DCP candidate bits rank " << rank
+               << " failed: " << error.what();
     return 1;
   }
 }
@@ -326,6 +421,10 @@ TEST(DcpIndexerCandidateMultiDeviceTest,
      OverlapsComputeWithLaunchedCandidateGather) {
   run_candidate_collective_test(/*world_size=*/2,
                                 run_candidate_async_collective_child);
+}
+
+TEST(DcpIndexerCandidateMultiDeviceTest, PreservesEveryBf16BitPattern) {
+  run_candidate_collective_test(/*world_size=*/4, run_candidate_bits_child);
 }
 
 }  // namespace

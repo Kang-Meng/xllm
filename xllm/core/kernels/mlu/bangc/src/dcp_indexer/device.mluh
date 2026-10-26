@@ -1,0 +1,2026 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <bang.h>
+
+#include <cstdint>
+
+#include "kernels/mlu/bangc/src/dcp_indexer/params.h"
+
+namespace xllm::kernel::mlu::bangc::detail {
+namespace device {
+
+struct KernelArgs {
+  const bfloat16_t* query;
+  const bfloat16_t* k_cache;
+  const bfloat16_t* weights;
+  const int32_t* block_table;
+  const int32_t* q_cu_seq_lens;
+  const int32_t* query_positions;
+  const int32_t* kv_seq_lens;
+  bfloat16_t* scores;
+  int32_t* slots;
+  bfloat16_t* workspace;
+  int32_t num_tokens;
+  int32_t batch;
+  int32_t table_width;
+  int32_t num_pages;
+  int32_t dcp_rank;
+  int32_t dcp_size;
+  static constexpr int32_t kDiag = 0;
+};
+
+constexpr int32_t kLt16Stride = kWramBytes / 16;
+constexpr int32_t kQRowBytes = kDim * 2;
+constexpr int32_t kPageElems = kPage * kDim;
+
+__nram__ int8_t nram_buf[kNramBytes];
+__wram__ int8_t wram_buf[kWramBytes];
+
+__mlu_func__ int32_t round_up(int32_t x, int32_t a) {
+  return (x + a - 1) / a * a;
+}
+
+__mlu_func__ bfloat16_t neg_inf() {
+  return static_cast<bfloat16_t>((-__builtin_inff()));
+}
+
+// Order-preserving 16-bit key of a BF16 value: larger key, larger value.
+__mlu_func__ bfloat16_t key_to_value(uint32_t key) {
+  uint32_t bits = key >= 0x8000 ? key ^ 0x8000 : (~key) & 0xFFFF;
+  union {
+    uint32_t u;
+    float f;
+  } v;
+  v.u = bits << 16;
+  return static_cast<bfloat16_t>(v.f);
+}
+
+// key = bits ^ (negative ? 0xFFFF : 0x8000)
+__mlu_func__ void value_to_key(int16_t* key,
+                               const bfloat16_t* value,
+                               int16_t* mask,
+                               int32_t count) {
+  int16_t sign = static_cast<int16_t>(0x8000);
+  __asm__ volatile(
+      "fuse.nram.s16 [%[dst]], %[num], [%[src]], .and(%[a]), .eq(%[e]), "
+      ".mul(%[m]), .or(%[o]);\n\t" ::[dst] "r"(mask),
+      [num] "r"(count),
+      [src] "r"(reinterpret_cast<const int16_t*>(value)),
+      [a] "r"(sign),
+      [e] "r"(sign),
+      [m] "r"(0x7fff),
+      [o] "r"(sign));
+  __bang_bxor(reinterpret_cast<int8_t*>(key),
+              reinterpret_cast<const int8_t*>(value),
+              reinterpret_cast<int8_t*>(mask),
+              count * 2);
+}
+
+// Inverse of value_to_key: bits = key ^ (key >= 0x8000 ? 0x8000 : 0xFFFF).
+__mlu_func__ void key_to_values(bfloat16_t* value,
+                                const int16_t* key,
+                                int16_t* mask,
+                                int32_t count) {
+  int16_t sign = static_cast<int16_t>(0x8000);
+  int16_t zero = 0;
+  __asm__ volatile(
+      "fuse.nram.s16 [%[dst]], %[num], [%[src]], .and(%[a]), .eq(%[e]), "
+      ".mul(%[m]), .or(%[o]);\n\t" ::[dst] "r"(mask),
+      [num] "r"(count),
+      [src] "r"(key),
+      [a] "r"(sign),
+      [e] "r"(zero),
+      [m] "r"(0x7fff),
+      [o] "r"(sign));
+  __bang_bxor(reinterpret_cast<int8_t*>(value),
+              reinterpret_cast<const int8_t*>(key),
+              reinterpret_cast<int8_t*>(mask),
+              count * 2);
+}
+
+// Writes rows [first, first + count) of a row-major [co, ci] filter into the
+// conv.nram WRAM layout: 16 LTs, four output channels per LT in each block of
+// 64 channels. first and count are multiples of 4.
+template <mluMemcpyDirection_t Direction>
+__mlu_func__ void load_filter_rows(int8_t* wram,
+                                   const int8_t* src,
+                                   int32_t first,
+                                   int32_t count,
+                                   int32_t ci_bytes) {
+  int32_t c = first;
+  const int32_t end = first + count;
+  while (c < end) {
+    int32_t block = c / 64;
+    int32_t in_block = c % 64;
+    int32_t rows = 64 - in_block < end - c ? 64 - in_block : end - c;
+    __memcpy(wram + (in_block / 4) * kLt16Stride + block * 4 * ci_bytes,
+             src + (c - first) * ci_bytes,
+             ci_bytes,
+             Direction,
+             ci_bytes,
+             3,
+             kLt16Stride,
+             rows / 4 - 1,
+             ci_bytes,
+             rows - 1,
+             0,
+             0);
+    c += rows;
+  }
+}
+
+// Tiles of at most kWideChannels conv channels (decode runs) step through K
+// in kWideTileK keys: one 16-page gather and one sync round per step, and
+// the QK output still fits the 512-channel qk buffer.
+constexpr int32_t kWideChannels = 128;
+constexpr int32_t kWideTileK = 256;
+static_assert(kWideTileK * kWideChannels <= kTileK * kQkChannels, "qk fits");
+
+// Conv channels of a tile: its query heads, padded to the 64-channel block.
+__mlu_func__ int32_t tile_channels(int32_t rows) {
+  return round_up(rows * kHeads, 64);
+}
+
+// qk[k, q*32+h] = BF16(ReLU(sum_d K[k,d] * Q[q,h,d])), FP32 accumulation;
+// `channels` (tile_channels) output channels.
+__mlu_func__ void conv_qk(bfloat16_t* qk,
+                          const bfloat16_t* keys,
+                          const int8_t* filter,
+                          int32_t width,
+                          int32_t channels) {
+  __asm__ volatile(
+      "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[kernel]], %[ci], 1, "
+      "%[wi], 1, 1, 1, 1, %[co], .relu(), .cvt.dst.rn.bf16();\n\t" ::[dst] "r"(
+          qk),
+      [src] "r"(keys),
+      [kernel] "r"(filter),
+      [ci] "r"(kDim),
+      [wi] "r"(width),
+      [co] "r"(channels));
+}
+
+// score[k, q] = BF16(sum_h qk[k, q*32+h] * w[q,h]); block-diagonal filter,
+// exact BF16 products accumulated in FP32.
+__mlu_func__ void conv_heads(bfloat16_t* score,
+                             const bfloat16_t* qk,
+                             const int8_t* filter,
+                             int32_t width,
+                             int32_t channels) {
+  __asm__ volatile(
+      "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[kernel]], %[ci], 1, "
+      "%[wi], 1, 1, 1, 1, %[co], .cvt.dst.rn.bf16();\n\t" ::[dst] "r"(score),
+      [src] "r"(qk),
+      [kernel] "r"(filter),
+      [ci] "r"(channels),
+      [wi] "r"(width),
+      [co] "r"(kScoreChannels));
+}
+
+// Number of local keys visible to a query: logical t < len, t <= pos, owned
+// by this rank in the striped page mapping.
+__mlu_func__ int32_t local_visible(int32_t pos,
+                                   int32_t len,
+                                   int32_t rank,
+                                   int32_t size) {
+  if (pos < 0) {
+    return 0;
+  }
+  int32_t t = pos + 1 < len ? pos + 1 : len;
+  int32_t span = kPage * size;
+  int32_t tail = t % span - rank * kPage;
+  tail = tail < 0 ? 0 : (tail > kPage ? kPage : tail);
+  return t / span * kPage + tail;
+}
+
+// dst[g*16 + o] = base[g] + o, using tmp [16, count].
+__mlu_func__ void expand_pages(int32_t* dst,
+                               const int32_t* base,
+                               int32_t* tmp,
+                               int32_t count) {
+  for (int32_t o = 0; o < kPage; ++o) {
+    __bang_add_scalar(tmp + o * count, base, o, count);
+  }
+  __bang_transpose(dst, tmp, kPage, count);
+}
+
+struct Buffers {
+  // Persistent across a work item.
+  int32_t* pages;
+  bfloat16_t* ninf;
+  int32_t* neg1;
+  int32_t* prefix_slots;
+  int32_t* positions;
+  int32_t* visible;
+  int32_t* cu;    // q_cu_seq_lens chunk, kMetaChunk + 1 entries
+  int32_t* lens;  // kv_seq_lens chunk, kMetaChunk entries
+  float* weights_f;
+  bfloat16_t* weights_b;
+  int8_t* scratch;  // union of the compute and selection phases
+  // Compute phase.
+  bfloat16_t* keys[3];  // K tiles: t computes while t+1 and t+2 load
+  bfloat16_t* qk;
+  bfloat16_t* score;
+  bfloat16_t* score_t[2];  // ping-pong score tiles (io1 store)
+  uint32_t* page_offsets;  // K-cache byte offsets of the buf.pages window
+  uint32_t* pick_offsets;  // wide tiles: score[k, r] byte offsets, r-major
+  // WRAM filters.
+  int8_t* q_filter;
+  int8_t* w_filter;
+};
+
+constexpr int32_t kMetaChunk = 512;
+constexpr int32_t kPersistBytes =
+    kMaxPages * 4 + kTopk * 2 + kTopk * 4 + kTopk * 4 + 2 * 64 * 4 +
+    (2 * kMetaChunk + 64) * 4 + kQkChannels * 4 + kQkChannels * 2;
+
+__mlu_func__ Buffers carve_buffers() {
+  Buffers b;
+  int8_t* p = nram_buf;
+  b.pages = reinterpret_cast<int32_t*>(p);
+  p += kMaxPages * 4;
+  b.ninf = reinterpret_cast<bfloat16_t*>(p);
+  p += kTopk * 2;
+  b.neg1 = reinterpret_cast<int32_t*>(p);
+  p += kTopk * 4;
+  b.prefix_slots = reinterpret_cast<int32_t*>(p);
+  p += kTopk * 4;
+  b.positions = reinterpret_cast<int32_t*>(p);
+  p += 64 * 4;
+  b.visible = reinterpret_cast<int32_t*>(p);
+  p += 64 * 4;
+  b.cu = reinterpret_cast<int32_t*>(p);
+  p += (kMetaChunk + 64) * 4;
+  b.lens = reinterpret_cast<int32_t*>(p);
+  p += kMetaChunk * 4;
+  b.weights_f = reinterpret_cast<float*>(p);
+  p += kQkChannels * 4;
+  b.weights_b = reinterpret_cast<bfloat16_t*>(p);
+  p += kQkChannels * 2;
+  b.scratch = p;
+  for (int32_t i = 0; i < 3; ++i) {
+    b.keys[i] = reinterpret_cast<bfloat16_t*>(p);
+    p += kWideTileK * kDim * 2;
+  }
+  b.qk = reinterpret_cast<bfloat16_t*>(p);
+  p += kTileK * kQkChannels * 2;
+  b.score = reinterpret_cast<bfloat16_t*>(p);
+  p += kWideTileK * kScoreChannels * 2;
+  for (int32_t i = 0; i < 2; ++i) {
+    b.score_t[i] = reinterpret_cast<bfloat16_t*>(p);
+    p += kWideTileK * kScoreChannels * 2;
+  }
+  b.page_offsets = reinterpret_cast<uint32_t*>(p);
+  p += kMaxPages * 4;
+  b.pick_offsets = reinterpret_cast<uint32_t*>(p);
+  b.q_filter = wram_buf;
+  b.w_filter = wram_buf + (kQkChannels / 64) * 4 * kQRowBytes;
+  return b;
+}
+
+// Selection-phase layout inside Buffers::scratch for n local candidates.
+struct SelectBuffers {
+  bfloat16_t* values;  // n, physical slot order
+  bfloat16_t* mask;    // n
+  int32_t* slots;      // n, physical slot order
+  uint32_t* offsets;   // cached page permutation, preserved between rows
+  int32_t* picked;     // n compaction output (+ expansion scratch)
+  float* hist;         // histogram scratch in the picked tail
+  int8_t* gt_bits;     // n / 8
+  int8_t* eq_bits;     // n / 8
+  int16_t* key[2];     // kTopk each; only the strict-greater set is sorted
+  int32_t* sorted[2];  // kTopk each
+  int16_t* tmp16;      // kTopk
+  half* tmp_half;      // kTopk
+  int8_t* zero_bits;   // kTopk / 8
+  int8_t* one_bits;    // kTopk / 8
+  bfloat16_t* out_values;
+  int32_t* out_slots;
+  // Page-sort work aliases values/mask and retires before row selection.
+  int32_t* page[2];  // 2 * kMaxPages each
+  int32_t* group[2];
+  int32_t* tmp_i;
+  float* tmp_f;
+  int8_t* page_zero;
+  int8_t* page_one;
+  int32_t* base;
+};
+
+constexpr int32_t kSelectScratchElems = 1024;
+constexpr int32_t kSelectBytes = kMaxLocal * (2 + 2 + 4 + 4) +
+                                 kSelectScratchElems * 4 + 2 * (kMaxLocal / 8) +
+                                 2 * (kTopk * 2) + 2 * (kTopk * 4) +
+                                 2 * (kTopk / 8) + kMaxPages * 4;
+constexpr int32_t kPageSortBytes =
+    4 * (2 * kMaxPages * 4) + 3 * kMaxPages * 4 + 2 * (kMaxPages / 8 + 64);
+constexpr int32_t kComputeBytes =
+    3 * kWideTileK * kDim * 2 + kTileK * kQkChannels * 2 +
+    3 * kWideTileK * kScoreChannels * 2 + kMaxPages * 4 +
+    kWideChannels / kHeads * kWideTileK * 4;
+static_assert(kPersistBytes + kSelectBytes <= kNramBytes, "NRAM overflow");
+static_assert(kPersistBytes + kComputeBytes <= kNramBytes, "NRAM overflow");
+static_assert(kPageSortBytes <= kMaxLocal * 4, "page scratch fits values/mask");
+static_assert(kTopk * 10 <= kMaxLocal * 2, "output scratch fits mask");
+static_assert(kTopk % 64 == 0, "strict-greater padding fits TopK buffers");
+
+__mlu_func__ SelectBuffers carve_select(int8_t* p) {
+  SelectBuffers s;
+  s.values = reinterpret_cast<bfloat16_t*>(p);
+  p += kMaxLocal * 2;
+  s.mask = reinterpret_cast<bfloat16_t*>(p);
+  p += kMaxLocal * 2;
+  s.slots = reinterpret_cast<int32_t*>(p);
+  p += kMaxLocal * 4;
+  s.offsets = reinterpret_cast<uint32_t*>(p);
+  p += kMaxPages * 4;
+  s.picked = reinterpret_cast<int32_t*>(p);
+  s.hist = reinterpret_cast<float*>(s.picked + kMaxLocal);
+  p += kMaxLocal * 4 + kSelectScratchElems * 4;
+  s.gt_bits = p;
+  p += kMaxLocal / 8;
+  s.eq_bits = p;
+  p += kMaxLocal / 8;
+  s.key[0] = reinterpret_cast<int16_t*>(p);
+  p += kTopk * 2;
+  s.key[1] = reinterpret_cast<int16_t*>(p);
+  p += kTopk * 2;
+  s.sorted[0] = reinterpret_cast<int32_t*>(p);
+  p += kTopk * 4;
+  s.sorted[1] = reinterpret_cast<int32_t*>(p);
+  p += kTopk * 4;
+  // The histogram no longer reads mask when final sorting/output starts.
+  int8_t* output_scratch = reinterpret_cast<int8_t*>(s.mask);
+  s.tmp16 = reinterpret_cast<int16_t*>(output_scratch);
+  s.tmp_half = reinterpret_cast<half*>(output_scratch + kTopk * 2);
+  s.out_values = reinterpret_cast<bfloat16_t*>(output_scratch + kTopk * 4);
+  s.out_slots = reinterpret_cast<int32_t*>(output_scratch + kTopk * 6);
+  s.zero_bits = p;
+  p += kTopk / 8;
+  s.one_bits = p;
+  p += kTopk / 8;
+  // Cached slots/offsets are separate from both overlapping work phases.
+  p = reinterpret_cast<int8_t*>(s.values);
+  for (int32_t i = 0; i < 2; ++i) {
+    s.page[i] = reinterpret_cast<int32_t*>(p);
+    p += 2 * kMaxPages * 4;
+    s.group[i] = reinterpret_cast<int32_t*>(p);
+    p += 2 * kMaxPages * 4;
+  }
+  s.tmp_i = reinterpret_cast<int32_t*>(p);
+  p += kMaxPages * 4;
+  s.tmp_f = reinterpret_cast<float*>(p);
+  p += kMaxPages * 4;
+  s.page_zero = p;
+  p += kMaxPages / 8 + 64;
+  s.page_one = p;
+  p += kMaxPages / 8 + 64;
+  s.base = reinterpret_cast<int32_t*>(p);
+  return s;
+}
+
+// Stable LSD radix sort of `count` int32 page ids (ascending), carrying the
+// logical group index. Returns the buffer index holding the result.
+__mlu_func__ int32_t sort_pages(SelectBuffers& s,
+                                const int32_t* pages,
+                                int32_t count,
+                                int32_t num_pages) {
+  const int32_t n = round_up(count, 64);
+  __memcpy(s.page[0], pages, count * 4, NRAM2NRAM);
+  __bang_incseq(s.group[0], n);
+  if (n > count) {
+    __bang_write_value(
+        s.page[0] + count, n - count, static_cast<int32_t>(0x7FFFFFFF));
+  }
+  int32_t bits = 1;
+  while (bits < 31 && (1 << bits) < num_pages) {
+    ++bits;
+  }
+  int32_t cur = 0;
+  for (int32_t b = 0; b < bits; ++b) {
+    __bang_band_scalar(s.tmp_i, s.page[cur], static_cast<int32_t>((1 << b)), n);
+    __bang_int322float(s.tmp_f, s.tmp_i, n, 0);
+    uint32_t ones = __bang_count(s.tmp_f, n);
+    if (ones == 0 || ones == static_cast<uint32_t>(n)) {
+      continue;
+    }
+    __bang_eq_bitindex(reinterpret_cast<float*>(s.page_zero), s.tmp_f, 0.0f, n);
+    __bang_bnot(s.page_one, s.page_zero, n / 8);
+    const int32_t nxt = 1 - cur;
+    uint32_t zeros =
+        __bang_filter_bitindex(s.page[nxt], s.page[cur], s.page_zero, n);
+    __bang_filter_bitindex(s.page[nxt] + zeros, s.page[cur], s.page_one, n);
+    __bang_filter_bitindex(s.group[nxt], s.group[cur], s.page_zero, n);
+    __bang_filter_bitindex(s.group[nxt] + zeros, s.group[cur], s.page_one, n);
+    cur = nxt;
+  }
+  return cur;
+}
+
+// Radix select of the kTopk-th largest BF16 key in three rounds of 6, 6 and
+// 4 key bits: a 64-bin __bang_histogram per round, its prefix sum by
+// __bang_integral, and the first bin whose running count reaches the need.
+// The bin and integral kernels live at the base of WRAM in the conv filter
+// layout; they overwrite the conv filters, which every prefill tile reloads
+// before its next conv.
+constexpr int32_t kRadixRounds = 3;
+constexpr int32_t kHistBins = 64;
+constexpr int32_t kHistChunk = 16384;  // per-call element cap for histogram
+constexpr int32_t kIntegralOffset = 4 * kHistBins;  // after bin rows 0..3
+constexpr int32_t kIntegralSide = 64 / sizeof(float);
+
+__mlu_func__ int32_t radix_shift(int32_t round) {
+  return round == 0 ? 10 : round == 1 ? 4 : 0;
+}
+
+__mlu_func__ int32_t radix_width(int32_t round) { return round < 2 ? 6 : 4; }
+
+// tmp: at least 64 * 64 + 4 * 1024 bytes of NRAM.
+__mlu_func__ void load_radix_kernels(int8_t* tmp) {
+  // Row i of the bin kernel holds 63 - i, so bin i counts digit 63 - i and
+  // the prefix sum counts digits >= 63 - i.
+  for (int32_t i = 0; i < kHistBins; ++i) {
+    __bang_write_value(
+        tmp + i * kHistBins, kHistBins, static_cast<int8_t>((63 - i)));
+  }
+  float* tri = reinterpret_cast<float*>((tmp + kHistBins * kHistBins));
+  __bang_write_value(tri, kIntegralSide * kIntegralSide, 0.0f);
+  for (int32_t r = 0; r < kIntegralSide; ++r) {
+    __bang_write_value(tri + r * kIntegralSide, r + 1, 1.0f);
+  }
+  __sync_compute();
+  // Both kernels use the conv filter layout (4 rows of 64 bytes per LT).
+  load_filter_rows<NRAM2WRAM>(wram_buf, tmp, 0, kHistBins, kHistBins);
+  load_filter_rows<NRAM2WRAM>(wram_buf + kIntegralOffset,
+                              reinterpret_cast<int8_t*>(tri),
+                              0,
+                              kIntegralSide,
+                              64);
+}
+
+// Adds the digit histogram of `count` keys (rebased by `base`) into hist; the
+// keys buffer is rebased in place. digits holds round_up(count, 64) bytes.
+__mlu_func__ void add_digit_histogram(float* hist,
+                                      float* part,
+                                      int16_t* keys,
+                                      int8_t* digits,
+                                      int32_t count,
+                                      int16_t base,
+                                      int32_t round,
+                                      bool first) {
+  const int32_t m = round_up(count, 64);
+  if (base != 0) {
+    __bang_sub_scalar(keys, keys, base, m);
+  }
+  __asm__ volatile(
+      "cvt.nram.dn.s8.s16 [%[dst]], [%[src]], %[num], .dstpos(0), "
+      ".srcpos(%[pos]);\n\t" ::[dst] "r"(digits),
+      [src] "r"(keys),
+      [num] "r"(m),
+      [pos] "r"(-radix_shift(round)));
+  __bang_band_scalar(
+      digits, digits, static_cast<int8_t>(((1 << radix_width(round)) - 1)), m);
+  for (int32_t off = 0; off < count; off += kHistChunk) {
+    const int32_t len = count - off < kHistChunk ? count - off : kHistChunk;
+    if (first && off == 0) {
+      __bang_histogram(hist, digits, reinterpret_cast<int8_t*>(wram_buf), len);
+    } else {
+      __bang_histogram(
+          part, digits + off, reinterpret_cast<int8_t*>(wram_buf), len);
+      __bang_add(hist, hist, part, kHistBins);
+    }
+  }
+}
+
+// Picks the bin holding the need-th largest candidate: lowers need by the
+// candidates in higher bins and returns the bin's digit.
+__mlu_func__ int32_t pick_bin(const float* hist,
+                              float* cum,
+                              float* flag,
+                              int32_t& need) {
+  __bang_integral(cum,
+                  const_cast<float*>(hist),
+                  reinterpret_cast<float*>((wram_buf + kIntegralOffset)),
+                  kHistBins);
+  __bang_ge_scalar(flag, cum, static_cast<float>(need), kHistBins);
+  const uint32_t j = __bang_findfirst1(flag, kHistBins);
+  need -= j > 0 ? static_cast<int32_t>(cum[j - 1]) : 0;
+  return 63 - static_cast<int32_t>(j);
+}
+
+// Key range [lo, hi] of the current bin after `round` with prefix bits.
+__mlu_func__ uint32_t bin_low_key(uint32_t prefix, int32_t round) {
+  return prefix << radix_shift(round);
+}
+
+__mlu_func__ uint32_t bin_high_key(uint32_t prefix, int32_t round) {
+  return bin_low_key(prefix, round) + (1u << radix_shift(round)) - 1;
+}
+
+// bits = lo_value <= v <= hi_value over m (multiple of 64) values.
+__mlu_func__ void range_bits(int8_t* bits,
+                             int8_t* tmp_bits,
+                             const bfloat16_t* v,
+                             uint32_t lo_key,
+                             uint32_t hi_key,
+                             int32_t m) {
+  // Keys outside [-inf, +inf] are NaN patterns; clamp so the compares hold.
+  lo_key = lo_key < 0x007F ? 0x007F : lo_key;
+  hi_key = hi_key > 0xFF80 ? 0xFF80 : hi_key;
+  __bang_ge_bitindex(
+      reinterpret_cast<bfloat16_t*>(bits), v, key_to_value(lo_key), m);
+  __bang_le_bitindex(
+      reinterpret_cast<bfloat16_t*>(tmp_bits), v, key_to_value(hi_key), m);
+  __bang_band(bits, bits, tmp_bits, m / 8);
+}
+
+// Selects the local TopK of one row (more than kTopk visible), ordered by
+// score descending then physical slot ascending.
+__mlu_func__ void select_row(SelectBuffers& s,
+                             const Buffers& buf,
+                             int32_t diag,
+                             const bfloat16_t* ws_row,
+                             int32_t pages,
+                             int32_t n,
+                             bfloat16_t* out_scores,
+                             int32_t* out_slots) {
+  const int32_t local = pages * kPage;
+  // One contiguous row load, then the slot-order permutation on chip; 32 B
+  // GDRAM gather segments are far below IO efficiency.
+  __memcpy(s.mask, ws_row, local * 2, GDRAM2NRAM);
+  if (diag & kDiagNoGather) {
+    __memcpy(s.values, s.mask, local * 2, NRAM2NRAM);
+  } else {
+    __gather(
+        s.values, s.mask, s.offsets, kPage * 2, NRAM2NRAM, kPage * 2, pages);
+  }
+  if (n > local) {
+    __bang_write_value(s.values + local, n - local, neg_inf());
+  }
+  __sync();
+
+  // Key of the kTopk-th largest value (-inf padding sorts lowest). Round 0
+  // sees all n values; later rounds only the previous bin, compacted into
+  // the pool and histogrammed without its -inf padding.
+  int16_t* keys = reinterpret_cast<int16_t*>(s.picked) + kMaxLocal;
+  bfloat16_t* pool = reinterpret_cast<bfloat16_t*>(s.picked);
+  int8_t* digits = reinterpret_cast<int8_t*>(s.mask);
+  static_assert(4 * kHistBins <= kSelectScratchElems,
+                "histogram fits picked tail");
+  float* hist = s.hist;
+  float* part = hist + kHistBins;
+  float* cum = part + kHistBins;
+  float* flag = cum + kHistBins;
+  const bfloat16_t* cand = s.values;
+  int32_t cn = n;
+  int32_t live = n;
+  int32_t rank_left = kTopk;
+  uint32_t prefix = 0;
+  for (int32_t round = 0; round < kRadixRounds; ++round) {
+    value_to_key(keys, cand, reinterpret_cast<int16_t*>(s.mask), cn);
+    const int16_t base =
+        round == 0 ? 0
+                   : static_cast<int16_t>((prefix << radix_shift(round - 1)));
+    add_digit_histogram(hist, part, keys, digits, live, base, round, true);
+    prefix =
+        (prefix << radix_width(round)) | pick_bin(hist, cum, flag, rank_left);
+    if (round + 1 < kRadixRounds) {
+      range_bits(s.gt_bits,
+                 s.eq_bits,
+                 cand,
+                 bin_low_key(prefix, round),
+                 bin_high_key(prefix, round),
+                 cn);
+      live = __bang_filter_bitindex(pool, cand, s.gt_bits, cn);
+      cn = round_up(live, 64);
+      if (cn > live) {
+        __bang_write_value(pool + live, cn - live, neg_inf());
+      }
+      cand = pool;
+    }
+  }
+  const uint32_t lo = prefix;
+  const bfloat16_t threshold = key_to_value(lo);
+  __bang_gt_bitindex(
+      reinterpret_cast<bfloat16_t*>(s.gt_bits), s.values, threshold, n);
+  __bang_eq_bitindex(
+      reinterpret_cast<bfloat16_t*>(s.eq_bits), s.values, threshold, n);
+  // s.slots is shared by every row of the tile; compact into copies only.
+  const int32_t greater =
+      __bang_filter_bitindex(s.picked, s.slots, s.gt_bits, n);
+  if (greater > 0) {
+    __memcpy(s.sorted[0], s.picked, greater * 4, NRAM2NRAM);
+  }
+  __bang_filter_bitindex(s.values, s.values, s.gt_bits, n);
+  __bang_filter_bitindex(s.picked, s.slots, s.eq_bits, n);
+  const int32_t need = kTopk - greater;
+
+  // Stable sort of the greater set by key descending; inputs are already in
+  // ascending physical slot order, so ties keep the slot order.
+  int32_t cur = 0;
+  if (greater > 0) {
+    const int32_t m = round_up(greater, 64);
+    __bang_add_scalar(
+        s.values, s.values, static_cast<bfloat16_t>(0.0f), greater);
+    value_to_key(s.key[0], s.values, s.tmp16, m);
+    // Sort key - T: greater entries are >= 1 and use fewer low bits than the
+    // raw keys; padding gets 0 and sorts last.
+    __bang_sub_scalar(s.key[0], s.key[0], static_cast<int16_t>(lo), m);
+    if (m > greater) {
+      __bang_write_value(
+          s.key[0] + greater, m - greater, static_cast<int16_t>(0));
+    }
+    for (int32_t b = 0; b < 16 && greater > 1 && !(diag & kDiagNoSort); ++b) {
+      __bang_band_scalar(
+          s.tmp16, s.key[cur], static_cast<int16_t>((1 << b)), m);
+      __bang_int162half(s.tmp_half, s.tmp16, m, 0);
+      uint32_t ones = __bang_count(s.tmp_half, m);
+      if (ones == 0 || ones == static_cast<uint32_t>(m)) {
+        continue;
+      }
+      __bang_eq_bitindex(reinterpret_cast<half*>(s.zero_bits),
+                         s.tmp_half,
+                         static_cast<half>(0.0f),
+                         m);
+      __bang_bnot(s.one_bits, s.zero_bits, m / 8);
+      const int32_t nxt = 1 - cur;
+      uint32_t first =
+          __bang_filter_bitindex(s.key[nxt], s.key[cur], s.one_bits, m);
+      // Filter bounds cover m inputs even when only a short tail is written.
+      // Retired output scratch keeps both filter destinations large enough.
+      const uint32_t zeros =
+          __bang_filter_bitindex(s.tmp16, s.key[cur], s.zero_bits, m);
+      __bang_add_scalar(
+          s.key[nxt] + first, s.tmp16, static_cast<int16_t>(0), zeros);
+      __bang_filter_bitindex(s.sorted[nxt], s.sorted[cur], s.one_bits, m);
+      __bang_filter_bitindex(s.out_slots, s.sorted[cur], s.zero_bits, m);
+      __bang_add_scalar(
+          s.sorted[nxt] + first, s.out_slots, static_cast<int32_t>(0), zeros);
+      cur = nxt;
+    }
+    __bang_add_scalar(s.key[cur], s.key[cur], static_cast<int16_t>(lo), m);
+    key_to_values(s.out_values, s.key[cur], s.tmp16, m);
+    __memcpy(s.out_slots, s.sorted[cur], greater * 4, NRAM2NRAM);
+  }
+  if (need > 0) {
+    __bang_write_value(s.out_values + greater, need, threshold);
+    __memcpy(s.out_slots + greater, s.picked, need * 4, NRAM2NRAM);
+  }
+  __sync();
+  __memcpy(out_scores, s.out_values, kTopk * 2, NRAM2GDRAM);
+  __memcpy(out_slots, s.out_slots, kTopk * 4, NRAM2GDRAM);
+}
+
+// Streaming selection for rows longer than kMaxLocal: the row stays in the
+// GDRAM workspace in logical order and is read in kChunk slices.
+constexpr int32_t kChunk = 4096;
+constexpr int32_t kPoolCap = 32768;
+constexpr int32_t kEqCap = 16384;
+
+struct StreamBuffers {
+  bfloat16_t* vals;     // kChunk
+  bfloat16_t* cmp;      // kChunk
+  float* cmp_f;         // kChunk
+  float* sel_f;         // kChunk
+  int32_t* slots;       // kChunk
+  int32_t* tmp_i;       // kChunk
+  int32_t* pages;       // kChunk / kPage
+  int8_t* bits[2];      // kChunk / 8 each
+  bfloat16_t* pool;     // kPoolCap + kChunk
+  bfloat16_t* gt_vals;  // kTopk + kChunk
+  int32_t* gt_slots;    // kTopk + kChunk
+  int32_t* eq_slots;    // kEqCap + kChunk
+  int16_t* key[2];      // 2 * kTopk each
+  int32_t* sorted[2];   // 2 * kTopk each
+  int16_t* tmp16;       // kTopk
+  half* tmp_half;       // kTopk
+  float* sort_f;        // kTopk
+  int32_t* sort_i;      // kTopk
+  int8_t* zero_bits;    // kTopk / 8
+  int8_t* one_bits;     // kTopk / 8
+  bfloat16_t* out_values;
+  int32_t* out_slots;
+};
+
+constexpr int32_t kStreamBytes =
+    kChunk * (2 + 2 + 4 + 4 + 4 + 4) + kChunk / kPage * 4 + 2 * (kChunk / 8) +
+    (kPoolCap + kChunk) * 2 + (kTopk + kChunk) * (2 + 4) +
+    (kEqCap + kChunk) * 4 + 2 * (2 * kTopk * 2) + 2 * (2 * kTopk * 4) +
+    kTopk * (2 + 2 + 4 + 4) + 2 * (kTopk / 8) + kTopk * (2 + 4) + 64 * 24;
+static_assert(kPersistBytes + kStreamBytes <= kNramBytes, "NRAM overflow");
+
+__mlu_func__ StreamBuffers carve_stream(int8_t* p) {
+  StreamBuffers t;
+  t.vals = reinterpret_cast<bfloat16_t*>(p);
+  p += kChunk * 2;
+  t.cmp = reinterpret_cast<bfloat16_t*>(p);
+  p += kChunk * 2;
+  t.cmp_f = reinterpret_cast<float*>(p);
+  p += kChunk * 4;
+  t.sel_f = reinterpret_cast<float*>(p);
+  p += kChunk * 4;
+  t.slots = reinterpret_cast<int32_t*>(p);
+  p += kChunk * 4;
+  t.tmp_i = reinterpret_cast<int32_t*>(p);
+  p += kChunk * 4;
+  t.pages = reinterpret_cast<int32_t*>(p);
+  p += kChunk / kPage * 4 + 64;
+  for (int32_t i = 0; i < 2; ++i) {
+    t.bits[i] = p;
+    p += kChunk / 8 + 64;
+  }
+  t.pool = reinterpret_cast<bfloat16_t*>(p);
+  p += (kPoolCap + kChunk) * 2;
+  t.gt_vals = reinterpret_cast<bfloat16_t*>(p);
+  p += (kTopk + kChunk) * 2;
+  t.gt_slots = reinterpret_cast<int32_t*>(p);
+  p += (kTopk + kChunk) * 4;
+  t.eq_slots = reinterpret_cast<int32_t*>(p);
+  p += (kEqCap + kChunk) * 4;
+  for (int32_t i = 0; i < 2; ++i) {
+    t.key[i] = reinterpret_cast<int16_t*>(p);
+    p += 2 * kTopk * 2;
+    t.sorted[i] = reinterpret_cast<int32_t*>(p);
+    p += 2 * kTopk * 4;
+  }
+  t.tmp16 = reinterpret_cast<int16_t*>(p);
+  p += kTopk * 2;
+  t.tmp_half = reinterpret_cast<half*>(p);
+  p += kTopk * 2;
+  t.sort_f = reinterpret_cast<float*>(p);
+  p += kTopk * 4;
+  t.sort_i = reinterpret_cast<int32_t*>(p);
+  p += kTopk * 4;
+  t.zero_bits = p;
+  p += kTopk / 8 + 64;
+  t.one_bits = p;
+  p += kTopk / 8 + 64;
+  t.out_values = reinterpret_cast<bfloat16_t*>(p);
+  p += kTopk * 2;
+  t.out_slots = reinterpret_cast<int32_t*>(p);
+  return t;
+}
+
+// Loads row[c0, c0 + count) into t.vals, padded with -inf to a multiple of
+// 64; returns the padded length.
+__mlu_func__ int32_t stream_load(StreamBuffers& t,
+                                 const bfloat16_t* row,
+                                 int32_t c0,
+                                 int32_t count) {
+  __memcpy(t.vals, row + c0, count * 2, GDRAM2NRAM);
+  const int32_t m = round_up(count, 64);
+  if (m > count) {
+    __bang_write_value(t.vals + count, m - count, neg_inf());
+  }
+  __sync();
+  return m;
+}
+
+// Physical slots of local keys [c0, c0 + m), c0 a multiple of kChunk.
+__mlu_func__ void stream_slots(StreamBuffers& t,
+                               const int32_t* table_row,
+                               int32_t pages,
+                               int32_t c0,
+                               int32_t m,
+                               int32_t span,
+                               int32_t rank_offset) {
+  const int32_t g0 = c0 / kPage;
+  const int32_t groups = m / kPage;
+  const int32_t avail = pages - g0 < groups ? pages - g0 : groups;
+  __memcpy(t.pages, table_row + g0, avail * 4, GDRAM2NRAM);
+  if (groups > avail) {
+    __bang_write_value(
+        t.pages + avail, groups - avail, static_cast<int32_t>(0));
+  }
+  __sync();
+  __bang_mul_scalar(t.pages, t.pages, span, groups);
+  __bang_add_scalar(t.pages, t.pages, rank_offset, groups);
+  expand_pages(t.slots, t.pages, t.tmp_i, groups);
+  __sync();
+}
+
+// Count of int32 values <= bound in data[0, n) (n a multiple of 64).
+__mlu_func__ uint32_t count_le(StreamBuffers& t,
+                               const int32_t* data,
+                               int32_t n,
+                               int32_t bound) {
+  uint32_t total = 0;
+  for (int32_t off = 0; off < n; off += kChunk) {
+    const int32_t len = n - off < kChunk ? n - off : kChunk;
+    __bang_le_scalar(t.tmp_i, data + off, bound, len);
+    __bang_int322float(t.sel_f, t.tmp_i, len, 0);
+    total += __bang_count(t.sel_f, len);
+  }
+  return total;
+}
+
+// bits[0] = (mask != 0); compare results are only relied on to be nonzero.
+__mlu_func__ void nonzero_bits(StreamBuffers& t, const float* mask, int32_t m) {
+  __bang_eq_bitindex(reinterpret_cast<float*>(t.bits[1]), mask, 0.0f, m);
+  __bang_bnot(t.bits[0], t.bits[1], m / 8);
+}
+
+// sel_f[i] != 0 where vals[i] == value and slots[i] <= bound, else 0.
+__mlu_func__ void eq_slot_mask(StreamBuffers& t,
+                               bfloat16_t value,
+                               int32_t bound,
+                               int32_t m) {
+  __bang_eq_scalar(t.cmp, t.vals, value, m);
+  __bang_bfloat162float(t.cmp_f, t.cmp, m);
+  __bang_le_scalar(t.tmp_i, t.slots, bound, m);
+  __bang_int322float(t.sel_f, t.tmp_i, m, 0);
+  __bang_mul(t.sel_f, t.sel_f, t.cmp_f, m);
+}
+
+// One stable LSD partition step over m (multiple of 64) key/slot pairs on
+// `mask` (0 or nonzero float per element); `ones_first` orders bit=1 first.
+__mlu_func__ int32_t radix_pass(StreamBuffers& t,
+                                int32_t cur,
+                                int32_t m,
+                                bool ones_first) {
+  __bang_eq_bitindex(reinterpret_cast<float*>(t.zero_bits), t.sort_f, 0.0f, m);
+  __bang_bnot(t.one_bits, t.zero_bits, m / 8);
+  const int8_t* first = ones_first ? t.one_bits : t.zero_bits;
+  const int8_t* second = ones_first ? t.zero_bits : t.one_bits;
+  const int32_t nxt = 1 - cur;
+  const uint32_t lead =
+      __bang_filter_bitindex(t.key[nxt], t.key[cur], first, m);
+  __bang_filter_bitindex(t.key[nxt] + lead, t.key[cur], second, m);
+  __bang_filter_bitindex(t.sorted[nxt], t.sorted[cur], first, m);
+  __bang_filter_bitindex(t.sorted[nxt] + lead, t.sorted[cur], second, m);
+  return nxt;
+}
+
+__mlu_func__ void select_row_stream(StreamBuffers& t,
+                                    int32_t diag,
+                                    const bfloat16_t* row,
+                                    const int32_t* table_row,
+                                    int32_t pages,
+                                    int32_t span,
+                                    int32_t rank_offset,
+                                    bfloat16_t* out_scores,
+                                    int32_t* out_slots) {
+  const int32_t local = pages * kPage;
+  // Radix select as in select_row, one row pass per round. From round 1 the
+  // pass also copies the previous bin into the pool; once a bin fits, the
+  // remaining rounds read the pool (filtered by bin range) instead of the row.
+  int16_t* keys = reinterpret_cast<int16_t*>(t.tmp_i);
+  int8_t* digits = reinterpret_cast<int8_t*>(t.cmp_f);
+  float* hist = t.sort_f;
+  float* part = hist + kHistBins;
+  float* cum = part + kHistBins;
+  float* flag = cum + kHistBins;
+  int32_t rank_left = kTopk;
+  uint32_t prefix = 0;
+  int32_t pool_n = -1;  // live pool entries; -1 while the row is the source
+  for (int32_t round = 0; round < kRadixRounds; ++round) {
+    const uint32_t lo_key = round == 0 ? 0 : prefix << radix_shift(round - 1);
+    const uint32_t hi_key =
+        round == 0 ? 0xFFFF : lo_key + (1u << radix_shift(round - 1)) - 1;
+    const bool from_pool = pool_n >= 0;
+    const int32_t total = from_pool ? pool_n : local;
+    int32_t kept = 0;
+    bool fits = round > 0 && !from_pool;
+    bool first = true;
+    for (int32_t c0 = 0; c0 < total; c0 += kChunk) {
+      const int32_t len = total - c0 < kChunk ? total - c0 : kChunk;
+      const bfloat16_t* v;
+      int32_t m;
+      if (from_pool) {
+        v = t.pool + c0;
+        m = round_up(len, 64);
+      } else {
+        m = stream_load(t, row, c0, len);
+        v = t.vals;
+      }
+      int32_t live = len;
+      if (round > 0) {
+        // Keep the previous bin only; padding never falls inside it.
+        range_bits(t.bits[0], t.bits[1], v, lo_key, hi_key, m);
+        live = __bang_filter_bitindex(t.cmp, v, t.bits[0], m);
+        v = t.cmp;
+        if (live == 0) {
+          continue;  // zero-byte copies are invalid
+        }
+        if (fits) {
+          if (kept + live <= kPoolCap) {
+            __memcpy(t.pool + kept, t.cmp, live * 2, NRAM2NRAM);
+          } else {
+            fits = false;
+          }
+        }
+        kept += live;
+        m = round_up(live, 64);
+      }
+      value_to_key(keys, v, reinterpret_cast<int16_t*>(t.sel_f), m);
+      add_digit_histogram(hist,
+                          part,
+                          keys,
+                          digits,
+                          live,
+                          static_cast<int16_t>(lo_key),
+                          round,
+                          first);
+      first = false;
+    }
+    if (fits) {
+      pool_n = kept;
+      const int32_t padded = round_up(kept, 64);
+      if (padded > kept) {
+        __bang_write_value(t.pool + kept, padded - kept, neg_inf());
+      }
+    }
+    prefix =
+        (prefix << radix_width(round)) | pick_bin(hist, cum, flag, rank_left);
+  }
+  const uint32_t lo = prefix;
+  const bfloat16_t threshold = key_to_value(lo);
+
+  // Collect > T (always < kTopk) and, if they fit, the == T slots.
+  int32_t greater = 0;
+  int32_t equal = 0;
+  for (int32_t c0 = 0; c0 < local; c0 += kChunk) {
+    const int32_t m =
+        stream_load(t, row, c0, local - c0 < kChunk ? local - c0 : kChunk);
+    stream_slots(t, table_row, pages, c0, m, span, rank_offset);
+    __bang_gt_bitindex(
+        reinterpret_cast<bfloat16_t*>(t.bits[0]), t.vals, threshold, m);
+    __bang_eq_bitindex(
+        reinterpret_cast<bfloat16_t*>(t.bits[1]), t.vals, threshold, m);
+    const int32_t g =
+        __bang_filter_bitindex(t.gt_vals + greater, t.vals, t.bits[0], m);
+    __bang_filter_bitindex(t.gt_slots + greater, t.slots, t.bits[0], m);
+    greater += g;
+    if (equal <= kEqCap) {
+      equal +=
+          __bang_filter_bitindex(t.eq_slots + equal, t.slots, t.bits[1], m);
+    }
+  }
+  // Value-space count (+0 and -0 share a value but not a key).
+  const int32_t ties = equal;
+  const int32_t need = kTopk - greater;
+
+  // The `need` smallest physical slots among the == T entries.
+  if (ties > need) {
+    // int64 bounds: hi - lo starts at 2^31 and would overflow int32.
+    int64_t lo_slot = -1;  // count(<= lo_slot) < need
+    int64_t hi_slot = 0x7FFFFFFF;
+    if (ties <= kEqCap) {
+      const int32_t n = round_up(ties, 64);
+      if (n > ties) {
+        __bang_write_value(
+            t.eq_slots + ties, n - ties, static_cast<int32_t>(0x7FFFFFFF));
+      }
+      while (hi_slot - lo_slot > 1) {
+        const int32_t mid =
+            static_cast<int32_t>((lo_slot + (hi_slot - lo_slot) / 2));
+        if (count_le(t, t.eq_slots, n, mid) >= static_cast<uint32_t>(need)) {
+          hi_slot = mid;
+        } else {
+          lo_slot = mid;
+        }
+      }
+      int32_t kept = 0;
+      for (int32_t off = 0; off < n; off += kChunk) {
+        const int32_t len = n - off < kChunk ? n - off : kChunk;
+        __bang_le_scalar(
+            t.tmp_i, t.eq_slots + off, static_cast<int32_t>(hi_slot), len);
+        __bang_int322float(t.sel_f, t.tmp_i, len, 0);
+        nonzero_bits(t, t.sel_f, len);
+        kept += __bang_filter_bitindex(
+            t.eq_slots + kept, t.eq_slots + off, t.bits[0], len);
+      }
+    } else {
+      while (hi_slot - lo_slot > 1) {
+        const int32_t mid =
+            static_cast<int32_t>((lo_slot + (hi_slot - lo_slot) / 2));
+        uint32_t count = 0;
+        for (int32_t c0 = 0; c0 < local; c0 += kChunk) {
+          const int32_t m = stream_load(
+              t, row, c0, local - c0 < kChunk ? local - c0 : kChunk);
+          stream_slots(t, table_row, pages, c0, m, span, rank_offset);
+          eq_slot_mask(t, threshold, mid, m);
+          count += __bang_count(t.sel_f, m);
+        }
+        if (count >= static_cast<uint32_t>(need)) {
+          hi_slot = mid;
+        } else {
+          lo_slot = mid;
+        }
+      }
+      int32_t kept = 0;
+      for (int32_t c0 = 0; c0 < local; c0 += kChunk) {
+        const int32_t m =
+            stream_load(t, row, c0, local - c0 < kChunk ? local - c0 : kChunk);
+        stream_slots(t, table_row, pages, c0, m, span, rank_offset);
+        eq_slot_mask(t, threshold, static_cast<int32_t>(hi_slot), m);
+        nonzero_bits(t, t.sel_f, m);
+        kept +=
+            __bang_filter_bitindex(t.eq_slots + kept, t.slots, t.bits[0], m);
+      }
+    }
+  }
+
+  // kTopk candidates in logical order; LSD by slot ascending, then by score
+  // key descending, gives (score desc, slot asc).
+  if (greater > 0) {
+    __bang_add_scalar(
+        t.gt_vals, t.gt_vals, static_cast<bfloat16_t>(0.0f), greater);
+    value_to_key(t.key[0], t.gt_vals, t.tmp16, round_up(greater, 64));
+    // Relative keys (key - T) need fewer radix bits; == T entries get 0.
+    __bang_sub_scalar(
+        t.key[0], t.key[0], static_cast<int16_t>(lo), round_up(greater, 64));
+    __memcpy(t.sorted[0], t.gt_slots, greater * 4, NRAM2NRAM);
+  }
+  if (need > 0) {
+    __bang_write_value(t.key[0] + greater, need, static_cast<int16_t>(0));
+    __memcpy(t.sorted[0] + greater, t.eq_slots, need * 4, NRAM2NRAM);
+  }
+  __sync();
+  int32_t cur = 0;
+  for (int32_t b = 0; b < 31 && !(diag & kDiagNoSort); ++b) {
+    __bang_band_scalar(
+        t.sort_i, t.sorted[cur], static_cast<int32_t>((1 << b)), kTopk);
+    __bang_int322float(t.sort_f, t.sort_i, kTopk, 0);
+    const uint32_t ones = __bang_count(t.sort_f, kTopk);
+    if (ones != 0 && ones != static_cast<uint32_t>(kTopk)) {
+      cur = radix_pass(t, cur, kTopk, false);
+    }
+  }
+  for (int32_t b = 0; b < 16 && !(diag & kDiagNoSort); ++b) {
+    __bang_band_scalar(
+        t.tmp16, t.key[cur], static_cast<int16_t>((1 << b)), kTopk);
+    __bang_int162half(t.tmp_half, t.tmp16, kTopk, 0);
+    __bang_half2float(t.sort_f, t.tmp_half, kTopk);
+    const uint32_t ones = __bang_count(t.sort_f, kTopk);
+    if (ones != 0 && ones != static_cast<uint32_t>(kTopk)) {
+      cur = radix_pass(t, cur, kTopk, true);
+    }
+  }
+  __bang_add_scalar(t.key[cur], t.key[cur], static_cast<int16_t>(lo), kTopk);
+  key_to_values(t.out_values, t.key[cur], t.tmp16, kTopk);
+  __sync();
+  __memcpy(out_scores, t.out_values, kTopk * 2, NRAM2GDRAM);
+  __memcpy(out_slots, t.sorted[cur], kTopk * 4, NRAM2GDRAM);
+}
+
+__mlu_func__ void load_query_and_weights(const KernelArgs& a,
+                                         const Buffers& buf,
+                                         int64_t first_row,
+                                         int32_t rows) {
+  const int32_t channels = rows * kHeads;
+  const int32_t padded = tile_channels(rows);
+  if (channels < padded) {
+    const int32_t pad = padded - channels;
+    __bang_write_value(reinterpret_cast<bfloat16_t*>(buf.qk),
+                       pad * kDim,
+                       static_cast<bfloat16_t>(0.0f));
+    __sync_compute();
+    load_filter_rows<NRAM2WRAM>(buf.q_filter,
+                                reinterpret_cast<const int8_t*>(buf.qk),
+                                channels,
+                                pad,
+                                kQRowBytes);
+    __sync();
+  }
+  load_filter_rows<GDRAM2WRAM>(
+      buf.q_filter,
+      reinterpret_cast<const int8_t*>((a.query + first_row * kHeads * kDim)),
+      0,
+      channels,
+      kQRowBytes);
+  __memcpy(
+      buf.weights_b, a.weights + first_row * kHeads, channels * 2, GDRAM2NRAM);
+  __sync();
+  // w = BF16(FP32(weights) * (1/64))
+  __bang_bfloat162float(buf.weights_f, buf.weights_b, channels);
+  __bang_mul_scalar(buf.weights_f, buf.weights_f, 1.0f / 64.0f, channels);
+  __bang_float2bfloat16_rn(buf.weights_b, buf.weights_f, channels);
+  bfloat16_t* dense = buf.qk;
+  __bang_write_value(
+      dense, kScoreChannels * padded, static_cast<bfloat16_t>(0.0f));
+  __sync_compute();
+  // Row q of the dense [64, padded] filter holds w[q, :] at columns
+  // q*32..q*32+31.
+  __memcpy(dense,
+           buf.weights_b,
+           kHeads * 2,
+           NRAM2NRAM,
+           (padded + kHeads) * 2,
+           kHeads * 2,
+           rows - 1);
+  __sync();
+  load_filter_rows<NRAM2WRAM>(buf.w_filter,
+                              reinterpret_cast<const int8_t*>(dense),
+                              0,
+                              kScoreChannels,
+                              padded * 2);
+  __sync();
+}
+
+// buf.pages caches block-table entries [window, window + kMaxPages) of the
+// current request; slides forward for contexts longer than the cache.
+__mlu_func__ void load_page_window(const Buffers& buf,
+                                   const int32_t* table_row,
+                                   int32_t pages,
+                                   int32_t window) {
+  const int32_t count = pages - window < kMaxPages ? pages - window : kMaxPages;
+  __memcpy(buf.pages, table_row + window, count * 4, GDRAM2NRAM);
+}
+
+// K-cache byte offsets fit the int32 offset math of the page gather.
+__mlu_func__ bool gather_keys(const KernelArgs& a) {
+  return static_cast<int64_t>(a.num_pages) * kPageElems * 2 <= 0x7FFFFFFF;
+}
+
+// Issues loads (on io1 when `io1`, else io0) of the 16-token pages covering
+// local keys
+// [k0, min(k0 + tile, end)); buf.pages holds entries from `window`, and
+// buf.page_offsets their byte offsets when gather_keys(a): one gather then
+// keeps the tile's page reads in flight together.
+__mlu_func__ void load_keys(const KernelArgs& a,
+                            const Buffers& buf,
+                            int32_t window,
+                            bfloat16_t* keys,
+                            int32_t k0,
+                            int32_t end,
+                            int32_t tile,
+                            bool io1) {
+  const int32_t kn = end - k0 < tile ? end - k0 : tile;
+  const int32_t groups =
+      KernelArgs::kDiag & kDiagNoKeyLoad ? 0 : (kn + kPage - 1) / kPage;
+  if (groups > 0 && gather_keys(a)) {
+    const uint32_t* offsets = buf.page_offsets + k0 / kPage - window;
+    if (io1) {
+      __gather_io1_async(keys,
+                         a.k_cache,
+                         offsets,
+                         kPageElems * 2,
+                         GDRAM2NRAM,
+                         kPageElems * 2,
+                         groups);
+    } else {
+      __gather_io0_async(keys,
+                         a.k_cache,
+                         offsets,
+                         kPageElems * 2,
+                         GDRAM2NRAM,
+                         kPageElems * 2,
+                         groups);
+    }
+    return;
+  }
+  for (int32_t g = 0; g < groups; ++g) {
+    const int64_t page = buf.pages[k0 / kPage + g - window];
+    if (io1) {
+      __memcpy_io1_async(keys + g * kPageElems,
+                         a.k_cache + page * kPageElems,
+                         kPageElems * 2,
+                         GDRAM2NRAM);
+    } else {
+      __memcpy_io0_async(keys + g * kPageElems,
+                         a.k_cache + page * kPageElems,
+                         kPageElems * 2,
+                         GDRAM2NRAM);
+    }
+  }
+}
+
+// Waits on compute for the IO queue of tile t (io1 for odd t): its K load
+// and the score store issued two tiles earlier.
+__mlu_func__ void wait_tile_queue(int32_t t) {
+  if (t & 1) {
+    __asm__ volatile("sync.pio1.csimd.cmv;\n\t");
+  } else {
+    __asm__ volatile("sync.pio0.csimd.cmv;\n\t");
+  }
+}
+
+// Holds the IO queue of tile t until the compute and moves issued so far
+// complete (the score tile is written by both).
+__mlu_func__ void release_tile_store(int32_t t) {
+  if (t & 1) {
+    __asm__ volatile("sync.psimd.pmv.cio1;\n\t");
+  } else {
+    __asm__ volatile("sync.psimd.pmv.cio0;\n\t");
+  }
+}
+
+// Holds the IO queue of tile t until the compute issued so far completes.
+__mlu_func__ void release_tile_queue(int32_t t) {
+  if (t & 1) {
+    __asm__ volatile("sync.psimd.cio1;\n\t");
+  } else {
+    __asm__ volatile("sync.psimd.cio0;\n\t");
+  }
+}
+
+// Scores local keys [k_lo, k_hi) of the tile's rows into dst (row stride
+// dst_stride), -inf beyond each row's visible count. Query/weight filters and
+// buf.visible must be loaded. Long ranges run in segments of kMaxPages pages
+// so the page window is reloaded outside the pipelined loop. Within a segment
+// tile t loads and stores on io(t & 1): while tile t computes, tiles t+1 and
+// t+2 load on both queues, so a wait for tile t never waits for tile t+1.
+__mlu_func__ void compute_range(const KernelArgs& a,
+                                const Buffers& buf,
+                                const int32_t* table_row,
+                                int32_t pages,
+                                int32_t rows,
+                                int32_t k_lo,
+                                int32_t k_hi,
+                                bfloat16_t* dst,
+                                int64_t dst_stride,
+                                int32_t& window) {
+  constexpr int32_t kSegment = kMaxPages * kPage;
+  static_assert(kSegment % kWideTileK == 0, "segments hold whole K tiles");
+  // Tiles below every row's visible count need no -inf masking; skipping the
+  // per-row scalar reads there keeps the mask off the compute stream.
+  const int32_t channels = tile_channels(rows);
+  const bool wide = channels <= kWideChannels;
+  const int32_t tile = wide ? kWideTileK : kTileK;
+  if (wide) {
+    // pick_offsets[r * tile + k] = (k * kScoreChannels + r) * 2.
+    for (int32_t r = 0; r < rows; ++r) {
+      uint32_t* o = buf.pick_offsets + r * tile;
+      __bang_incseq(reinterpret_cast<int32_t*>(o), tile);
+      __bang_mul_scalar(reinterpret_cast<int32_t*>(o),
+                        reinterpret_cast<int32_t*>(o),
+                        kScoreChannels * 2,
+                        tile);
+      __bang_add_scalar(reinterpret_cast<int32_t*>(o),
+                        reinterpret_cast<int32_t*>(o),
+                        r * 2,
+                        tile);
+    }
+  }
+  int32_t vmin = buf.visible[0];
+  for (int32_t r = 1; r < rows; ++r) {
+    vmin = buf.visible[r] < vmin ? buf.visible[r] : vmin;
+  }
+  for (int32_t seg = k_lo; seg < k_hi; seg += kSegment) {
+    const int32_t end = k_hi - seg < kSegment ? k_hi - seg : kSegment;
+    const int32_t seg_end = seg + end;
+    if (seg / kPage != window) {
+      window = seg / kPage;
+      load_page_window(buf, table_row, pages, window);
+      __sync();
+    }
+    if (gather_keys(a)) {
+      // The previous segment's gathers drained at its closing __sync().
+      const int32_t count =
+          pages - window < kMaxPages ? pages - window : kMaxPages;
+      if (KernelArgs::kDiag & kDiagContigKeys) {
+        // Sequential pages from 0 (wrong scores): IO rate of contiguous K.
+        __bang_incseq(reinterpret_cast<int32_t*>(buf.page_offsets),
+                      round_up(count, 64));
+        __bang_mul_scalar(reinterpret_cast<int32_t*>(buf.page_offsets),
+                          reinterpret_cast<int32_t*>(buf.page_offsets),
+                          kPageElems * 2,
+                          count);
+      } else {
+        __bang_mul_scalar(reinterpret_cast<int32_t*>(buf.page_offsets),
+                          buf.pages,
+                          kPageElems * 2,
+                          count);
+      }
+      __asm__ volatile("sync.psimd.cio0;\n\t");
+      __asm__ volatile("sync.psimd.cio1;\n\t");
+    }
+    const int32_t tiles = (end + tile - 1) / tile;
+    load_keys(a, buf, window, buf.keys[0], seg, seg_end, tile, false);
+    if (tiles > 1) {
+      load_keys(a, buf, window, buf.keys[1], seg + tile, seg_end, tile, true);
+    }
+    for (int32_t t = 0; t < tiles; ++t) {
+      const int32_t k0 = seg + t * tile;
+      const int32_t kn = seg_end - k0 < tile ? seg_end - k0 : tile;
+      // Row stride of score_t: wide picks always fill whole tile rows.
+      const int32_t stride = wide ? tile : kn;
+      bfloat16_t* keys = buf.keys[t % 3];
+      bfloat16_t* score_t = buf.score_t[t & 1];
+      // K tile t and the store of tile t-2 (score_t[t & 1]) are done.
+      wait_tile_queue(t);
+      if (t + 2 < tiles) {
+        // keys[(t+2)%3] was last read by tile t-1's conv.
+        release_tile_queue(t);
+        load_keys(a,
+                  buf,
+                  window,
+                  buf.keys[(t + 2) % 3],
+                  k0 + 2 * tile,
+                  seg_end,
+                  tile,
+                  t & 1);
+      }
+      if (!(KernelArgs::kDiag & kDiagNoQk)) {
+        conv_qk(buf.qk, keys, buf.q_filter, kn, channels);
+      }
+      if (wide) {
+        // buf.score was last read by tile t-1's pick on the Move queue.
+        __asm__ volatile("sync.pmv.csimd;\n\t");
+      }
+      if (!(KernelArgs::kDiag & kDiagNoHeads)) {
+        conv_heads(buf.score, buf.qk, buf.w_filter, kn, channels);
+      }
+      if (wide) {
+        // Pick the rows' channels into [rows, tile] on the Move queue, off
+        // the compute stream (a full [kn, 64] transpose there otherwise).
+        __asm__ volatile("sync.psimd.cmv;\n\t");
+        if (!(KernelArgs::kDiag & kDiagNoTranspose)) {
+          __gather_async(score_t,
+                         buf.score,
+                         buf.pick_offsets,
+                         2,
+                         NRAM2NRAM,
+                         2,
+                         rows * tile);
+        }
+      } else if (!(KernelArgs::kDiag & kDiagNoTranspose)) {
+        __bang_transpose(score_t, buf.score, kn, kScoreChannels);
+      }
+      const bool masked = k0 + kn > vmin && !(KernelArgs::kDiag & kDiagNoMask);
+      if (wide && masked) {
+        __asm__ volatile("sync.pmv.csimd;\n\t");
+      }
+      for (int32_t r = 0; r < rows && masked; ++r) {
+        const int32_t start = buf.visible[r] - k0;
+        if (start < kn) {
+          const int32_t from = start > 0 ? start : 0;
+          __bang_write_value(score_t + r * stride + from, kn - from, neg_inf());
+        }
+      }
+      release_tile_store(t);
+      if (!(KernelArgs::kDiag & kDiagNoStore)) {
+        if (t & 1) {
+          __memcpy_io1_async(dst + k0,
+                             score_t,
+                             kn * 2,
+                             NRAM2GDRAM,
+                             dst_stride * 2,
+                             stride * 2,
+                             rows - 1);
+        } else {
+          __memcpy_io0_async(dst + k0,
+                             score_t,
+                             kn * 2,
+                             NRAM2GDRAM,
+                             dst_stride * 2,
+                             stride * 2,
+                             rows - 1);
+        }
+      }
+    }
+    __sync();
+  }
+}
+
+__mlu_func__ void process_tile(const KernelArgs& a,
+                               const Buffers& buf,
+                               int32_t req,
+                               int64_t first_row,
+                               int32_t rows,
+                               int32_t len) {
+  const int32_t pages = (len + kPage * a.dcp_size - 1) / (kPage * a.dcp_size);
+  const int32_t local = pages * kPage;
+  const int64_t ws_stride = static_cast<int64_t>(a.table_width) * kPage;
+  bfloat16_t* ws =
+      a.workspace + static_cast<int64_t>(taskId) * kTileQ * ws_stride;
+
+  __memcpy(buf.positions, a.query_positions + first_row, rows * 4, GDRAM2NRAM);
+  __sync();
+  int32_t vmax = 0;
+  bool any_select = false;
+  bool any_prefix = false;
+  for (int32_t r = 0; r < rows; ++r) {
+    int32_t v = local_visible(buf.positions[r], len, a.dcp_rank, a.dcp_size);
+    buf.visible[r] = v;
+    vmax = v > vmax ? v : vmax;
+    any_select |= v > kTopk;
+    any_prefix |= v > 0 && v <= kTopk;
+  }
+  const bool direct = vmax <= kTopk;
+  bfloat16_t* dst = direct ? a.scores + first_row * kTopk : ws;
+  const int64_t dst_stride = direct ? kTopk : ws_stride;
+
+  const int32_t* table_row =
+      a.block_table + static_cast<int64_t>(req) * a.table_width;
+  int32_t window = 0;
+  if (vmax > 0) {
+    load_page_window(buf, table_row, pages, window);
+    load_query_and_weights(a, buf, first_row, rows);
+    compute_range(
+        a, buf, table_row, pages, rows, 0, vmax, dst, dst_stride, window);
+  }
+
+  if (window != 0) {
+    window = 0;
+    load_page_window(buf, table_row, pages, window);
+    __sync();
+  }
+  if (any_prefix) {
+    const int32_t count = pages < kTopk / kPage ? pages : kTopk / kPage;
+    int32_t* base = reinterpret_cast<int32_t*>(buf.scratch);
+    int32_t* tmp = base + kTopk;
+    __bang_mul_scalar(base, buf.pages, kPage * a.dcp_size, count);
+    __bang_add_scalar(base, base, kPage * a.dcp_rank, count);
+    expand_pages(buf.prefix_slots, base, tmp, count);
+    __sync();
+  }
+  for (int32_t r = 0; r < rows; ++r) {
+    const int32_t v = buf.visible[r];
+    if (v > kTopk) {
+      continue;
+    }
+    bfloat16_t* srow = a.scores + (first_row + r) * kTopk;
+    int32_t* irow = a.slots + (first_row + r) * kTopk;
+    if (!direct && v > 0) {
+      __memcpy(srow, ws + r * ws_stride, v * 2, GDRAM2GDRAM);
+    }
+    // Async stores: ninf/neg1 are constant and prefix_slots is only rewritten
+    // after the __sync() that opens the next tile (or ends the kernel).
+    const int32_t filled = direct ? vmax : v;
+    if (filled < kTopk) {
+      __memcpy_async(srow + filled, buf.ninf, (kTopk - filled) * 2, NRAM2GDRAM);
+    }
+    if (v > 0) {
+      __memcpy_async(irow, buf.prefix_slots, v * 4, NRAM2GDRAM);
+    }
+    if (v < kTopk) {
+      __memcpy_async(irow + v, buf.neg1, (kTopk - v) * 4, NRAM2GDRAM);
+    }
+  }
+  if (!any_select || (KernelArgs::kDiag & kDiagNoSelect)) {
+    return;
+  }
+
+  // Unwritten tails of selection rows must read as -inf.
+  for (int32_t r = 0; r < rows; ++r) {
+    if (buf.visible[r] <= kTopk) {
+      continue;
+    }
+    for (int32_t k = vmax; k < local; k += kTopk) {
+      const int32_t len_fill = local - k < kTopk ? local - k : kTopk;
+      __memcpy(ws + r * ws_stride + k, buf.ninf, len_fill * 2, NRAM2GDRAM);
+    }
+  }
+#ifdef DCP_FORCE_STREAM_SELECT
+  const bool stream = true;
+#else
+  const bool stream = local > kMaxLocal;
+#endif
+  if (stream) {
+    StreamBuffers t = carve_stream(buf.scratch);
+    load_radix_kernels(reinterpret_cast<int8_t*>(t.pool));
+    for (int32_t r = 0; r < rows; ++r) {
+      if (buf.visible[r] <= kTopk) {
+        continue;
+      }
+      select_row_stream(t,
+                        KernelArgs::kDiag,
+                        ws + r * ws_stride,
+                        table_row,
+                        pages,
+                        kPage * a.dcp_size,
+                        kPage * a.dcp_rank,
+                        a.scores + (first_row + r) * kTopk,
+                        a.slots + (first_row + r) * kTopk);
+    }
+    return;
+  }
+  SelectBuffers s = carve_select(buf.scratch);
+  load_radix_kernels(reinterpret_cast<int8_t*>(s.picked));
+  const int32_t sorted = sort_pages(s, buf.pages, pages, a.num_pages);
+  __bang_mul_scalar(
+      reinterpret_cast<int32_t*>(s.offsets), s.group[sorted], kPage * 2, pages);
+  __bang_mul_scalar(s.base, s.page[sorted], kPage * a.dcp_size, pages);
+  __bang_add_scalar(s.base, s.base, kPage * a.dcp_rank, pages);
+  expand_pages(s.slots, s.base, s.picked, pages);
+  __sync();
+  const int32_t n = round_up(local, 64);
+  for (int32_t r = 0; r < rows; ++r) {
+    if (buf.visible[r] <= kTopk) {
+      continue;
+    }
+    select_row(s,
+               buf,
+               KernelArgs::kDiag,
+               ws + r * ws_stride,
+               pages,
+               n,
+               a.scores + (first_row + r) * kTopk,
+               a.slots + (first_row + r) * kTopk);
+  }
+}
+
+// Loads request metadata [first, first + kMetaChunk) into NRAM.
+__mlu_func__ void load_meta(const KernelArgs& a,
+                            const Buffers& buf,
+                            int32_t first) {
+  const int32_t count =
+      a.batch - first < kMetaChunk ? a.batch - first : kMetaChunk;
+  __memcpy(buf.cu, a.q_cu_seq_lens + first, (count + 1) * 4, GDRAM2NRAM);
+  __memcpy(buf.lens, a.kv_seq_lens + first, count * 4, GDRAM2NRAM);
+  __sync();
+}
+
+__mlu_global__ void prefill_kernel(KernelArgs a) {
+  if (__is_mpu()) {
+    return;
+  }
+  Buffers buf = carve_buffers();
+  __bang_write_value(buf.ninf, kTopk, neg_inf());
+  __bang_write_value(buf.neg1, kTopk, static_cast<int32_t>(-1));
+  __sync();
+  int32_t item = 0;
+  for (int32_t req = 0; req < a.batch; ++req) {
+    if (req % kMetaChunk == 0) {
+      load_meta(a, buf, req);
+    }
+    const int32_t begin = buf.cu[req % kMetaChunk];
+    const int32_t rows = buf.cu[req % kMetaChunk + 1] - begin;
+    const int32_t len = buf.lens[req % kMetaChunk];
+    for (int32_t q0 = 0; q0 < rows; q0 += kTileQ, ++item) {
+      if (item % taskDim != taskId) {
+        continue;
+      }
+      const int32_t count = rows - q0 < kTileQ ? rows - q0 : kTileQ;
+      process_tile(a, buf, req, static_cast<int64_t>(begin) + q0, count, len);
+    }
+  }
+  __sync();  // drain async row stores
+}
+
+// Two-phase path for few query rows (fewer row tiles than cores): phase 1
+// scores (request, row tile, K segment) items into one workspace row per
+// token; phase 2 distributes the tokens over the cores for output/selection.
+constexpr int32_t kSplitSegment = 4096;
+
+__mlu_func__ void score_segment(const KernelArgs& a,
+                                const Buffers& buf,
+                                int32_t req,
+                                int64_t first_row,
+                                int32_t rows,
+                                int32_t len,
+                                int32_t k_lo,
+                                int32_t seg_len) {
+  const int32_t pages = (len + kPage * a.dcp_size - 1) / (kPage * a.dcp_size);
+  const int32_t local = pages * kPage;
+  const int32_t k_hi = local - k_lo < seg_len ? local : k_lo + seg_len;
+  const int64_t ws_stride = static_cast<int64_t>(a.table_width) * kPage;
+  bfloat16_t* dst = a.workspace + first_row * ws_stride;
+  __memcpy(buf.positions, a.query_positions + first_row, rows * 4, GDRAM2NRAM);
+  __sync();
+  int32_t vmax = 0;
+  for (int32_t r = 0; r < rows; ++r) {
+    const int32_t v =
+        local_visible(buf.positions[r], len, a.dcp_rank, a.dcp_size);
+    buf.visible[r] = v;
+    vmax = v > vmax ? v : vmax;
+  }
+  if (k_lo < vmax) {
+    const int32_t* table_row =
+        a.block_table + static_cast<int64_t>(req) * a.table_width;
+    int32_t window = -1;
+    load_query_and_weights(a, buf, first_row, rows);
+    compute_range(a,
+                  buf,
+                  table_row,
+                  pages,
+                  rows,
+                  k_lo,
+                  k_hi < vmax ? k_hi : vmax,
+                  dst,
+                  ws_stride,
+                  window);
+  }
+  // Keys no row of the tile can see still have to read as -inf.
+  for (int32_t k = k_lo > vmax ? k_lo : vmax; k < k_hi; k += kTopk) {
+    const int32_t n = k_hi - k < kTopk ? k_hi - k : kTopk;
+    for (int32_t r = 0; r < rows; ++r) {
+      __memcpy(dst + r * ws_stride + k, buf.ninf, n * 2, NRAM2GDRAM);
+    }
+  }
+}
+
+__mlu_global__ void split_score_kernel(KernelArgs a) {
+  if (__is_mpu()) {
+    return;
+  }
+  Buffers buf = carve_buffers();
+  __bang_write_value(buf.ninf, kTopk, neg_inf());
+  __bang_write_value(buf.neg1, kTopk, static_cast<int32_t>(-1));
+  __sync();
+  int32_t item = 0;
+  for (int32_t req = 0; req < a.batch; ++req) {
+    if (req % kMetaChunk == 0) {
+      load_meta(a, buf, req);
+    }
+    const int32_t begin = buf.cu[req % kMetaChunk];
+    const int32_t rows = buf.cu[req % kMetaChunk + 1] - begin;
+    const int32_t len = buf.lens[req % kMetaChunk];
+    const int32_t local =
+        (len + kPage * a.dcp_size - 1) / (kPage * a.dcp_size) * kPage;
+    for (int32_t q0 = 0; q0 < rows; q0 += kTileQ) {
+      const int32_t count = rows - q0 < kTileQ ? rows - q0 : kTileQ;
+      for (int32_t k_lo = 0; k_lo < local; k_lo += kSplitSegment, ++item) {
+        if (item % taskDim != taskId) {
+          continue;
+        }
+        score_segment(a,
+                      buf,
+                      req,
+                      static_cast<int64_t>(begin) + q0,
+                      count,
+                      len,
+                      k_lo,
+                      kSplitSegment);
+      }
+    }
+  }
+}
+
+__mlu_global__ void split_select_kernel(KernelArgs a) {
+  if (__is_mpu()) {
+    return;
+  }
+  Buffers buf = carve_buffers();
+  __bang_write_value(buf.ninf, kTopk, neg_inf());
+  __bang_write_value(buf.neg1, kTopk, static_cast<int32_t>(-1));
+  __sync();
+  // Contiguous token blocks keep each core on few requests, so the prefix
+  // slots and the page sort are reused across its rows.
+  const int32_t per = (a.num_tokens + taskDim - 1) / taskDim;
+  const int32_t n0 = taskId * per;
+  const int32_t n1 = n0 + per < a.num_tokens ? n0 + per : a.num_tokens;
+  const int64_t ws_stride = static_cast<int64_t>(a.table_width) * kPage;
+  int32_t req = 0;
+  int32_t prefix_req = -1;
+  int32_t sorted_req = -1;
+  int32_t sorted = 0;
+  int32_t sorted_pages = 0;
+  int32_t pages_req = -1;  // request whose table fills buf.pages[0, pages)
+  SelectBuffers s = carve_select(buf.scratch);
+  load_radix_kernels(reinterpret_cast<int8_t*>(s.picked));
+  load_meta(a, buf, 0);
+  for (int32_t n = n0; n < n1; ++n) {
+    while (n >= buf.cu[req % kMetaChunk + 1]) {
+      ++req;
+      if (req % kMetaChunk == 0) {
+        load_meta(a, buf, req);
+      }
+    }
+    const int32_t len = buf.lens[req % kMetaChunk];
+    const int32_t pages = (len + kPage * a.dcp_size - 1) / (kPage * a.dcp_size);
+    const int32_t local = pages * kPage;
+    const int32_t* table_row =
+        a.block_table + static_cast<int64_t>(req) * a.table_width;
+    __memcpy(buf.positions, a.query_positions + n, 4, GDRAM2NRAM);
+    __sync();
+    const int32_t v =
+        local_visible(buf.positions[0], len, a.dcp_rank, a.dcp_size);
+    const bfloat16_t* ws_row =
+        a.workspace + static_cast<int64_t>(n) * ws_stride;
+    bfloat16_t* srow = a.scores + static_cast<int64_t>(n) * kTopk;
+    int32_t* irow = a.slots + static_cast<int64_t>(n) * kTopk;
+    if (v <= kTopk) {
+      if (v > 0 && prefix_req != req) {
+        const int32_t count = pages < kTopk / kPage ? pages : kTopk / kPage;
+        load_page_window(buf, table_row, count, 0);
+        __sync();
+        int32_t* base = reinterpret_cast<int32_t*>(buf.scratch);
+        __bang_mul_scalar(base, buf.pages, kPage * a.dcp_size, count);
+        __bang_add_scalar(base, base, kPage * a.dcp_rank, count);
+        expand_pages(buf.prefix_slots, base, base + kTopk, count);
+        __sync();
+        prefix_req = req;
+        pages_req = -1;
+      }
+      if (v > 0) {
+        __memcpy(srow, ws_row, v * 2, GDRAM2GDRAM);
+        __memcpy(irow, buf.prefix_slots, v * 4, NRAM2GDRAM);
+      }
+      if (v < kTopk) {
+        __memcpy(srow + v, buf.ninf, (kTopk - v) * 2, NRAM2GDRAM);
+        __memcpy(irow + v, buf.neg1, (kTopk - v) * 4, NRAM2GDRAM);
+      }
+      continue;
+    }
+    if (KernelArgs::kDiag & kDiagNoSelect) {
+      continue;
+    }
+    if (local > kMaxLocal) {
+      StreamBuffers t = carve_stream(buf.scratch);
+      select_row_stream(t,
+                        KernelArgs::kDiag,
+                        ws_row,
+                        table_row,
+                        pages,
+                        kPage * a.dcp_size,
+                        kPage * a.dcp_rank,
+                        srow,
+                        irow);
+      sorted_req = -1;  // the stream buffers overlap the cached page sort
+      continue;
+    }
+    // Rows of another request with the same block-table entries (expanded
+    // MTP rows) reuse the cached page sort; s.picked is free between rows.
+    bool reuse = false;
+    if (sorted_req != req && sorted_req >= 0 && pages_req == sorted_req &&
+        pages == sorted_pages) {
+      int32_t* fresh = s.picked;
+      float* diff = reinterpret_cast<float*>((fresh + kMaxPages));
+      const int32_t m = round_up(pages, 64);
+      __memcpy(fresh, table_row, pages * 4, GDRAM2NRAM);
+      __sync();
+      if (m > pages) {
+        __bang_write_value(fresh + pages, m - pages, static_cast<int32_t>(0));
+        __bang_write_value(
+            buf.pages + pages, m - pages, static_cast<int32_t>(0));
+      }
+      __bang_sub(fresh, fresh, buf.pages, m);
+      __bang_int322float(diff, fresh, m, 0);
+      reuse = __bang_count(diff, m) == 0;
+    }
+    if (sorted_req != req && !reuse) {
+      load_page_window(buf, table_row, pages, 0);
+      __sync();
+      sorted =
+          sort_pages(s,
+                     buf.pages,
+                     pages,
+                     KernelArgs::kDiag & kDiagNoPageSort ? 1 : a.num_pages);
+      __bang_mul_scalar(reinterpret_cast<int32_t*>(s.offsets),
+                        s.group[sorted],
+                        kPage * 2,
+                        pages);
+      __bang_mul_scalar(s.base, s.page[sorted], kPage * a.dcp_size, pages);
+      __bang_add_scalar(s.base, s.base, kPage * a.dcp_rank, pages);
+      expand_pages(s.slots, s.base, s.picked, pages);
+      __sync();
+      sorted_pages = pages;
+    }
+    sorted_req = req;
+    pages_req = req;
+    // Prefix temporaries only overlap s.values, which select_row reloads.
+    select_row(s,
+               buf,
+               KernelArgs::kDiag,
+               ws_row,
+               pages,
+               round_up(local, 64),
+               srow,
+               irow);
+  }
+}
+
+// Decode phase 1. Work items are (block of g consecutive rows, K segment of
+// seg keys), sized so the items cover the cores with about
+// total_row_keys / taskDim keys each; g grows (up to kTileQ) only while the
+// per-row segment stays at least kDecodeMinSegment keys. Inside an item, rows
+// whose block-table entries over the segment match share one K load and one
+// conv (MTP rows of a request, or expanded rows with a repeated table); other
+// rows are scored as separate runs. split_select_kernel is phase 2.
+constexpr int32_t kDecodeMinSegment = 8192;
+constexpr int32_t kCompareChunk = 4096;
+
+// Loads the meta chunk holding request `req` unless it is the loaded one.
+__mlu_func__ void seek_meta(const KernelArgs& a,
+                            const Buffers& buf,
+                            int32_t& chunk,
+                            int32_t req) {
+  if (req / kMetaChunk != chunk) {
+    chunk = req / kMetaChunk;
+    load_meta(a, buf, chunk * kMetaChunk);
+  }
+}
+
+// Whether requests ra and rb map local pages [p0, p1) to the same physical
+// pages; buf.qk is scratch.
+__mlu_func__ bool tables_equal(const KernelArgs& a,
+                               const Buffers& buf,
+                               int32_t ra,
+                               int32_t rb,
+                               int32_t p0,
+                               int32_t p1) {
+  int32_t* x = reinterpret_cast<int32_t*>(buf.qk);
+  int32_t* y = x + kCompareChunk;
+  float* diff = reinterpret_cast<float*>((y + kCompareChunk));
+  for (int32_t p = p0; p < p1; p += kCompareChunk) {
+    const int32_t n = p1 - p < kCompareChunk ? p1 - p : kCompareChunk;
+    const int32_t m = round_up(n, 64);
+    __memcpy(x,
+             a.block_table + static_cast<int64_t>(ra) * a.table_width + p,
+             n * 4,
+             GDRAM2NRAM);
+    __memcpy(y,
+             a.block_table + static_cast<int64_t>(rb) * a.table_width + p,
+             n * 4,
+             GDRAM2NRAM);
+    __sync();
+    if (m > n) {
+      __bang_write_value(x + n, m - n, static_cast<int32_t>(0));
+      __bang_write_value(y + n, m - n, static_cast<int32_t>(0));
+    }
+    __bang_sub(x, x, y, m);
+    __bang_int322float(diff, x, m, 0);
+    if (__bang_count(diff, m) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Scores keys [k_lo, k_hi) of rows [first_row, first_row + rows) (row r of
+// KV length lens[r]) through the block table of request ref_req into their
+// workspace rows; k_hi <= the local length of ref_req.
+__mlu_func__ void score_run(const KernelArgs& a,
+                            const Buffers& buf,
+                            int32_t ref_req,
+                            int32_t ref_len,
+                            int64_t first_row,
+                            int32_t rows,
+                            const int32_t* lens,
+                            int32_t k_lo,
+                            int32_t k_hi) {
+  const int32_t pages =
+      (ref_len + kPage * a.dcp_size - 1) / (kPage * a.dcp_size);
+  const int64_t ws_stride = static_cast<int64_t>(a.table_width) * kPage;
+  bfloat16_t* dst = a.workspace + first_row * ws_stride;
+  __memcpy(buf.positions, a.query_positions + first_row, rows * 4, GDRAM2NRAM);
+  __sync();
+  int32_t vmax = 0;
+  for (int32_t r = 0; r < rows; ++r) {
+    const int32_t v =
+        local_visible(buf.positions[r], lens[r], a.dcp_rank, a.dcp_size);
+    buf.visible[r] = v;
+    vmax = v > vmax ? v : vmax;
+  }
+  if (k_lo < vmax) {
+    const int32_t* table_row =
+        a.block_table + static_cast<int64_t>(ref_req) * a.table_width;
+    int32_t window = -1;
+    load_query_and_weights(a, buf, first_row, rows);
+    compute_range(a,
+                  buf,
+                  table_row,
+                  pages,
+                  rows,
+                  k_lo,
+                  k_hi < vmax ? k_hi : vmax,
+                  dst,
+                  ws_stride,
+                  window);
+  }
+  // Keys no row of the run can see still have to read as -inf.
+  for (int32_t k = k_lo > vmax ? k_lo : vmax; k < k_hi; k += kTopk) {
+    const int32_t n = k_hi - k < kTopk ? k_hi - k : kTopk;
+    for (int32_t r = 0; r < rows; ++r) {
+      __memcpy(dst + r * ws_stride + k, buf.ninf, n * 2, NRAM2GDRAM);
+    }
+  }
+}
+
+__mlu_global__ void decode_score_kernel(KernelArgs a) {
+  if (__is_mpu()) {
+    return;
+  }
+  Buffers buf = carve_buffers();
+  __bang_write_value(buf.ninf, kTopk, neg_inf());
+  __bang_write_value(buf.neg1, kTopk, static_cast<int32_t>(-1));
+  __sync();
+  const int32_t span = kPage * a.dcp_size;
+  int32_t chunk = -1;
+  int64_t total = 0;
+  int32_t lmax = 0;
+  for (int32_t req = 0; req < a.batch; ++req) {
+    seek_meta(a, buf, chunk, req);
+    const int32_t rows =
+        buf.cu[req % kMetaChunk + 1] - buf.cu[req % kMetaChunk];
+    const int32_t local =
+        (buf.lens[req % kMetaChunk] + span - 1) / span * kPage;
+    total += static_cast<int64_t>(rows) * local;
+    lmax = rows > 0 && local > lmax ? local : lmax;
+  }
+  if (lmax == 0) {
+    return;
+  }
+  const int64_t target = (total + taskDim - 1) / taskDim;
+  int32_t g = 1;
+  while (g * 2 <= kTileQ &&
+         static_cast<int64_t>(g) * 2 * kDecodeMinSegment <= target) {
+    g *= 2;
+  }
+  const int32_t blocks = (a.num_tokens + g - 1) / g;
+  int32_t splits = (taskDim + blocks - 1) / blocks;
+  const int32_t seg = round_up((lmax + splits - 1) / splits, kTileK);
+  splits = (lmax + seg - 1) / seg;
+
+  int32_t row_req[kTileQ];
+  int32_t row_len[kTileQ];
+  int32_t req = 0;  // request of the current block's first row
+  for (int32_t item = taskId; item < blocks * splits; item += taskDim) {
+    const int32_t b = item / splits;
+    const int32_t k_lo = item % splits * seg;
+    const int32_t seg_end = k_lo + seg;
+    const int32_t n0 = b * g;
+    const int32_t count = a.num_tokens - n0 < g ? a.num_tokens - n0 : g;
+    seek_meta(a, buf, chunk, req);
+    for (; n0 >= buf.cu[req % kMetaChunk + 1];
+         seek_meta(a, buf, chunk, ++req)) {
+    }
+    int32_t r = req;
+    for (int32_t i = 0; i < count; ++i) {
+      seek_meta(a, buf, chunk, r);
+      for (; n0 + i >= buf.cu[r % kMetaChunk + 1];
+           seek_meta(a, buf, chunk, ++r)) {
+      }
+      row_req[i] = r;
+      row_len[i] = buf.lens[r % kMetaChunk];
+    }
+    // Runs of rows sharing the pages of the longest member (ref) so far: a
+    // row joins when its table matches ref's over their common keys.
+    int32_t first = 0;
+    int32_t ref = 0;
+    int32_t local0 = (row_len[0] + span - 1) / span * kPage;
+    int32_t ref_end = local0 < seg_end ? local0 : seg_end;
+    for (int32_t x = 1; x <= count; ++x) {
+      bool joins = false;
+      int32_t end_x = 0;
+      if (x < count) {
+        const int32_t local = (row_len[x] + span - 1) / span * kPage;
+        end_x = local < seg_end ? local : seg_end;
+        const int32_t common = end_x < ref_end ? end_x : ref_end;
+        joins = row_req[x] == row_req[ref] || common <= k_lo ||
+                tables_equal(a,
+                             buf,
+                             row_req[ref],
+                             row_req[x],
+                             k_lo / kPage,
+                             (common + kPage - 1) / kPage);
+      }
+      if (!joins) {
+        if (ref_end > k_lo) {
+          score_run(a,
+                    buf,
+                    row_req[ref],
+                    row_len[ref],
+                    n0 + first,
+                    x - first,
+                    row_len + first,
+                    k_lo,
+                    ref_end);
+        }
+        first = x;
+        ref = x;
+        ref_end = end_x;
+      } else if (end_x > ref_end) {
+        ref = x;
+        ref_end = end_x;
+      }
+    }
+  }
+}
+
+// Decode: one query token per work item, spread across every core; decode
+// batches hold few tokens per request, so per-token items balance the cores.
+__mlu_global__ void decode_kernel(KernelArgs a) {
+  if (__is_mpu()) {
+    return;
+  }
+  Buffers buf = carve_buffers();
+  __bang_write_value(buf.ninf, kTopk, neg_inf());
+  __bang_write_value(buf.neg1, kTopk, static_cast<int32_t>(-1));
+  __sync();
+  int32_t item = 0;
+  for (int32_t req = 0; req < a.batch; ++req) {
+    if (req % kMetaChunk == 0) {
+      load_meta(a, buf, req);
+    }
+    const int32_t begin = buf.cu[req % kMetaChunk];
+    const int32_t rows = buf.cu[req % kMetaChunk + 1] - begin;
+    const int32_t len = buf.lens[req % kMetaChunk];
+    for (int32_t q = 0; q < rows; ++q, ++item) {
+      if (item % taskDim != taskId) {
+        continue;
+      }
+      process_tile(a, buf, req, static_cast<int64_t>(begin) + q, 1, len);
+    }
+  }
+  __sync();  // drain async row stores
+}
+
+}  // namespace device
+}  // namespace xllm::kernel::mlu::bangc::detail

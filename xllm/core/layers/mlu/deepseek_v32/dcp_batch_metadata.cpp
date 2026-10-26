@@ -43,59 +43,43 @@ std::pair<torch::Tensor, torch::Tensor> build_prefill_slot_order(
   return {std::move(slots), std::move(rows)};
 }
 
-KVShardCausalSelectorMetadata build_kv_shard_causal_selector_metadata(
-    const AttentionMetadata& attention_metadata,
-    const KVShardLayout& layout) {
-  CHECK(attention_metadata.q_cu_seq_lens.defined())
-      << "cache-shard causal selector requires query cumulative lengths";
-  CHECK(attention_metadata.kv_cu_seq_lens.defined())
-      << "cache-shard causal selector requires KV cumulative lengths";
-  CHECK(attention_metadata.block_table.defined())
-      << "cache-shard causal selector requires a block table";
-  CHECK(attention_metadata.slot_mapping.defined())
-      << "cache-shard causal selector requires slot mapping";
-  CHECK_EQ(attention_metadata.q_cu_seq_lens.dim(), 1)
-      << "cache-shard causal selector query lengths must be one-dimensional";
-  CHECK_EQ(attention_metadata.kv_cu_seq_lens.dim(), 1)
-      << "cache-shard causal selector KV lengths must be one-dimensional";
-  CHECK_EQ(attention_metadata.q_cu_seq_lens.numel(),
-           attention_metadata.kv_cu_seq_lens.numel())
-      << "cache-shard causal selector query and KV batches must match";
-  CHECK_EQ(attention_metadata.block_table.size(0),
-           attention_metadata.q_cu_seq_lens.numel() - 1)
-      << "cache-shard causal selector block-table batch must match lengths";
-  CHECK_EQ(attention_metadata.q_cu_seq_lens.scalar_type(), torch::kInt32)
-      << "cache-shard causal selector query lengths must be int32";
-  CHECK_EQ(attention_metadata.kv_cu_seq_lens.scalar_type(), torch::kInt32)
-      << "cache-shard causal selector KV lengths must be int32";
-
-  torch::Tensor query_lens = torch::diff(attention_metadata.q_cu_seq_lens);
-  torch::Tensor kv_lens = torch::diff(attention_metadata.kv_cu_seq_lens);
-  torch::Tensor prefix_lens = kv_lens - query_lens;
-  const int64_t token_count = attention_metadata.slot_mapping.numel();
-
-  torch::Tensor token_prefix_lens =
-      torch::repeat_interleave(prefix_lens, query_lens, /*dim=*/0);
-  torch::Tensor token_query_starts = torch::repeat_interleave(
-      attention_metadata.q_cu_seq_lens.slice(/*dim=*/0,
-                                             /*start=*/0,
-                                             /*end=*/-1),
-      query_lens,
-      /*dim=*/0);
-  torch::Tensor token_offsets =
-      torch::arange(token_count, attention_metadata.q_cu_seq_lens.options());
-  torch::Tensor global_context_lens =
-      token_prefix_lens + token_offsets - token_query_starts + 1;
-  torch::Tensor query_block_table = attention_metadata.block_table
-                                        .repeat_interleave(query_lens,
-                                                           /*dim=*/0)
-                                        .contiguous();
-  torch::Tensor selector_q_cu_seq_lens = torch::arange(
-      token_count + 1, attention_metadata.q_cu_seq_lens.options());
-  return KVShardCausalSelectorMetadata{
-      std::move(query_block_table),
-      localize_kv_shard_context_lens(global_context_lens, layout),
-      std::move(selector_q_cu_seq_lens)};
+KVShardIndexerMetadata build_kv_shard_indexer_metadata(
+    const AttentionMetadata& attention_metadata) {
+  const torch::Tensor& cu = attention_metadata.q_cu_seq_lens;
+  const torch::Tensor& table = attention_metadata.block_table;
+  CHECK(cu.defined() && table.defined());
+  CHECK(attention_metadata.slot_mapping.defined());
+  CHECK_EQ(cu.dim(), 1);
+  CHECK_EQ(cu.scalar_type(), torch::kInt32);
+  CHECK_EQ(table.dim(), 2);
+  const int64_t batch = table.size(0);
+  CHECK_EQ(cu.numel(), batch + 1);
+  torch::Tensor lens = attention_metadata.kv_seq_lens;
+  if (!lens.defined()) {
+    CHECK(attention_metadata.kv_cu_seq_lens.defined());
+    lens = torch::diff(attention_metadata.kv_cu_seq_lens);
+  }
+  CHECK_EQ(lens.dim(), 1);
+  CHECK_EQ(lens.numel(), batch);
+  lens = lens.to(torch::kInt32).contiguous();
+  const int64_t rows = attention_metadata.slot_mapping.numel();
+  torch::Tensor positions = torch::full({rows}, -1, cu.options());
+  if (rows > 0 && batch > 0) {
+    torch::Tensor row = torch::arange(rows, cu.options());
+    torch::Tensor ends = cu.slice(/*dim=*/0, /*start=*/1).contiguous();
+    torch::Tensor requests =
+        torch::searchsorted(ends, row, /*out_int32=*/false, /*right=*/true);
+    torch::Tensor safe_requests = requests.clamp_max(batch - 1);
+    torch::Tensor starts = cu.index_select(0, safe_requests);
+    torch::Tensor query_lens = torch::diff(cu).index_select(0, safe_requests);
+    positions = lens.index_select(0, safe_requests) - query_lens + row - starts;
+    positions.masked_fill_(
+        (attention_metadata.slot_mapping < 0) | (requests >= batch), -1);
+  }
+  return KVShardIndexerMetadata{table.contiguous(),
+                                std::move(lens),
+                                cu.contiguous(),
+                                std::move(positions)};
 }
 
 std::shared_ptr<const KVShardBatchMetadata> build_mlu_shard_metadata(
@@ -106,27 +90,17 @@ std::shared_ptr<const KVShardBatchMetadata> build_mlu_shard_metadata(
   if (attention_metadata.is_dummy) {
     return metadata;
   }
-  if (attention_metadata.kv_seq_lens.defined()) {
-    metadata->local_indexer_context_lens =
-        localize_kv_shard_context_lens(attention_metadata.kv_seq_lens, layout);
-  }
   if (attention_metadata.is_prefill && !attention_metadata.is_dummy) {
     std::tie(metadata->prefill_sorted_slots, metadata->prefill_sorted_rows) =
         build_prefill_slot_order(attention_metadata.slot_mapping);
     metadata->prefill_sorted_slots =
         metadata->prefill_sorted_slots.to(torch::kInt64);
   }
-  // The causal selector is consumed only by DCP prefill paths. Decode graph
-  // buckets pad sequence metadata independently of token rows, so building it
-  // there is both unnecessary and can produce a non-token-shaped selector.
-  if ((attention_metadata.is_prefill ||
-       attention_metadata.is_chunked_prefill) &&
-      attention_metadata.q_cu_seq_lens.defined() &&
-      attention_metadata.kv_cu_seq_lens.defined() &&
+  if (attention_metadata.q_cu_seq_lens.defined() &&
       attention_metadata.block_table.defined() &&
-      attention_metadata.slot_mapping.defined()) {
-    metadata->causal_selector =
-        build_kv_shard_causal_selector_metadata(attention_metadata, layout);
+      (attention_metadata.kv_seq_lens.defined() ||
+       attention_metadata.kv_cu_seq_lens.defined())) {
+    metadata->indexer = build_kv_shard_indexer_metadata(attention_metadata);
   }
   return metadata;
 }

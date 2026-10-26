@@ -27,12 +27,12 @@ namespace xllm::layer {
 
 struct AttentionMetadata;
 
-// Per-query metadata for running prefill selection through the rank-local
-// paged-cache decode kernel. Every row represents one causal query position.
-struct KVShardCausalSelectorMetadata {
+// Request-level pages and global causal positions for local fused selection.
+struct KVShardIndexerMetadata {
   torch::Tensor block_table;
-  torch::Tensor local_context_lens;
+  torch::Tensor kv_seq_lens;
   torch::Tensor q_cu_seq_lens;
+  torch::Tensor query_positions;
 };
 
 // Derived once for a batch and reused by every cache-sharded attention layer.
@@ -42,8 +42,7 @@ struct KVShardBatchMetadata {
   // Global token order, not the CP gather order. Ordinary prefill only.
   torch::Tensor prefill_sorted_slots;
   torch::Tensor prefill_sorted_rows;
-  torch::Tensor local_indexer_context_lens;
-  KVShardCausalSelectorMetadata causal_selector;
+  KVShardIndexerMetadata indexer;
   int32_t kv_split_size = 1;
   int32_t kv_split_rank = 0;
 };

@@ -60,8 +60,7 @@ TEST(DcpIndexerCandidateTest, CountsPartialPrefixesForEightRankTopology) {
                    torch::tensor({0, 0, 1, 2, 2, 2, 4, 4, 4}, torch::kInt32)));
 }
 
-TEST(DcpIndexerCandidateTest,
-     ExpandsPrefillQueriesIntoRankLocalCausalSelectorRows) {
+TEST(DcpIndexerCandidateTest, KeepsRequestPagesAndGlobalCausalPositions) {
   const KVShardLayout layout(
       /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   AttentionMetadata metadata{};
@@ -70,21 +69,18 @@ TEST(DcpIndexerCandidateTest,
   metadata.block_table = torch::tensor({{5, 6}, {9, 10}}, torch::kInt32);
   metadata.slot_mapping = torch::arange(5, torch::kInt32);
 
-  const KVShardCausalSelectorMetadata causal_metadata =
-      build_kv_shard_causal_selector_metadata(metadata, layout);
+  const KVShardIndexerMetadata causal_metadata =
+      build_kv_shard_indexer_metadata(metadata);
 
-  EXPECT_TRUE(
-      torch::equal(causal_metadata.block_table,
-                   torch::tensor({{5, 6}, {5, 6}, {5, 6}, {9, 10}, {9, 10}},
-                                 torch::kInt32)));
-  EXPECT_TRUE(torch::equal(causal_metadata.local_context_lens,
-                           torch::tensor({0, 0, 1, 2, 2}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(causal_metadata.block_table,
+                           torch::tensor({{5, 6}, {9, 10}}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(causal_metadata.query_positions,
+                           torch::tensor({0, 1, 2, 4, 5}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(causal_metadata.q_cu_seq_lens,
-                           torch::tensor({0, 1, 2, 3, 4, 5}, torch::kInt32)));
+                           torch::tensor({0, 3, 5}, torch::kInt32)));
 }
 
-TEST(DcpIndexerCandidateTest,
-     DoesNotBuildPrefillOnlyCausalSelectorForDecodeMetadata) {
+TEST(DcpIndexerCandidateTest, BuildsGlobalDecodeIndexerMetadata) {
   const KVShardLayout layout(
       /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   AttentionMetadata metadata{};
@@ -100,11 +96,13 @@ TEST(DcpIndexerCandidateTest,
       build_mlu_shard_metadata(metadata, layout);
 
   EXPECT_TRUE(shard_metadata->local_slot_mapping.defined());
-  EXPECT_TRUE(shard_metadata->local_indexer_context_lens.defined());
-  EXPECT_FALSE(shard_metadata->causal_selector.block_table.defined());
+  EXPECT_TRUE(shard_metadata->indexer.kv_seq_lens.defined());
+  EXPECT_TRUE(shard_metadata->indexer.block_table.defined());
+  EXPECT_TRUE(torch::equal(shard_metadata->indexer.query_positions,
+                           torch::tensor({8, 8}, torch::kInt32)));
 }
 
-TEST(DcpIndexerCandidateTest, BuildsRequestedPrefillCausalSelector) {
+TEST(DcpIndexerCandidateTest, BuildsRequestedPrefillIndexerMetadata) {
   const KVShardLayout layout(
       /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   AttentionMetadata metadata{};
@@ -116,10 +114,10 @@ TEST(DcpIndexerCandidateTest, BuildsRequestedPrefillCausalSelector) {
 
   const auto shard_metadata = build_mlu_shard_metadata(metadata, layout);
 
-  EXPECT_TRUE(torch::equal(shard_metadata->causal_selector.block_table,
-                           torch::tensor({{5}, {5}, {5}}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(shard_metadata->causal_selector.local_context_lens,
-                           torch::tensor({0, 0, 1}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(shard_metadata->indexer.block_table,
+                           torch::tensor({{5}}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(shard_metadata->indexer.query_positions,
+                           torch::tensor({0, 1, 2}, torch::kInt32)));
 }
 
 TEST(DcpIndexerCandidateTest,
@@ -141,14 +139,14 @@ TEST(DcpIndexerCandidateTest,
 
     EXPECT_TRUE(torch::equal(shard_metadata->local_slot_mapping,
                              torch::tensor({-1, -1, 10}, torch::kInt32)));
-    EXPECT_FALSE(shard_metadata->local_indexer_context_lens.defined());
+    EXPECT_FALSE(shard_metadata->indexer.kv_seq_lens.defined());
     EXPECT_FALSE(shard_metadata->prefill_sorted_slots.defined());
     EXPECT_FALSE(shard_metadata->prefill_sorted_rows.defined());
     EXPECT_EQ(shard_metadata->kv_split_size, 2);
     EXPECT_EQ(shard_metadata->kv_split_rank, 1);
-    EXPECT_FALSE(shard_metadata->causal_selector.block_table.defined());
-    EXPECT_FALSE(shard_metadata->causal_selector.local_context_lens.defined());
-    EXPECT_FALSE(shard_metadata->causal_selector.q_cu_seq_lens.defined());
+    EXPECT_FALSE(shard_metadata->indexer.block_table.defined());
+    EXPECT_FALSE(shard_metadata->indexer.query_positions.defined());
+    EXPECT_FALSE(shard_metadata->indexer.q_cu_seq_lens.defined());
     EXPECT_EQ(metadata.kv_cu_seq_lens.scalar_type(), torch::kInt64);
   }
 }
@@ -182,8 +180,8 @@ TEST(DcpIndexerCandidateTest, MluPrefillSortAllowsRepeatedPadding) {
   metadata.is_dummy = true;
   const auto dummy = build_mlu_shard_metadata(metadata, layout);
   EXPECT_FALSE(dummy->prefill_sorted_slots.defined());
-  EXPECT_FALSE(dummy->local_indexer_context_lens.defined());
-  EXPECT_FALSE(dummy->causal_selector.block_table.defined());
+  EXPECT_FALSE(dummy->indexer.kv_seq_lens.defined());
+  EXPECT_FALSE(dummy->indexer.block_table.defined());
 }
 
 TEST(DcpIndexerCandidateTest, DecodeGraphRefreshesSlotsAndLengthsOnReplay) {
@@ -193,6 +191,8 @@ TEST(DcpIndexerCandidateTest, DecodeGraphRefreshesSlotsAndLengthsOnReplay) {
   AttentionMetadata metadata{};
   metadata.slot_mapping = torch::tensor({2, 3, -1, -1}, options);
   metadata.kv_seq_lens = torch::tensor({3, 4, 0, 0}, options);
+  metadata.q_cu_seq_lens = torch::arange(5, options);
+  metadata.block_table = torch::zeros({4, 2}, options);
   const KVShardLayout layout(/*physical_block_size=*/2,
                              /*dcp_size=*/2,
                              /*dcp_rank=*/1);
@@ -213,23 +213,25 @@ TEST(DcpIndexerCandidateTest, DecodeGraphRefreshesSlotsAndLengthsOnReplay) {
   torch_mlu::synchronize();
   EXPECT_TRUE(torch::equal(captured->local_slot_mapping,
                            torch::tensor({2, -1, -1, -1}, options)));
-  EXPECT_TRUE(torch::equal(captured->local_indexer_context_lens,
-                           torch::tensor({3, 0, 0, 0}, options)));
+  EXPECT_TRUE(torch::equal(captured->indexer.kv_seq_lens,
+                           torch::tensor({7, 0, 0, 0}, options)));
   metadata.slot_mapping.copy_(torch::tensor({2, 3, 6, 7}, options));
   metadata.kv_seq_lens.copy_(torch::tensor({3, 4, 7, 8}, options));
   graph.replay();
   torch_mlu::synchronize();
   EXPECT_TRUE(torch::equal(captured->local_slot_mapping,
                            torch::tensor({0, 1, 2, 3}, options)));
-  EXPECT_TRUE(torch::equal(captured->local_indexer_context_lens,
-                           torch::tensor({1, 2, 3, 4}, options)));
+  EXPECT_TRUE(torch::equal(captured->indexer.kv_seq_lens,
+                           torch::tensor({3, 4, 7, 8}, options)));
   EXPECT_FALSE(captured->prefill_sorted_slots.defined());
-  EXPECT_FALSE(captured->causal_selector.block_table.defined());
+  EXPECT_TRUE(captured->indexer.block_table.defined());
+  EXPECT_TRUE(torch::equal(captured->indexer.query_positions,
+                           torch::tensor({2, 3, 6, 7}, options)));
 }
 
 TEST(DcpIndexerCandidateTest, PreservesLocalCandidateWireFormatWithoutDcp) {
   const torch::Tensor local_scores =
-      torch::tensor({{0.8f, 0.4f}, {0.7f, 0.1f}}, torch::kFloat32);
+      torch::tensor({{0.8f, 0.4f}, {0.7f, 0.1f}}, torch::kBFloat16);
   const torch::Tensor local_global_slots =
       torch::tensor({{4, 12}, {5, 13}}, torch::kInt32);
 

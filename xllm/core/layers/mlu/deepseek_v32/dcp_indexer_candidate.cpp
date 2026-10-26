@@ -15,8 +15,11 @@ limitations under the License.
 
 #include "core/layers/mlu/deepseek_v32/dcp_indexer_candidate.h"
 
+#include <glog/logging.h>
+
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 #include "framework/parallel_state/process_group.h"
 
@@ -34,27 +37,57 @@ DcpIndexerGatherAsyncCtx launch_dcp_indexer_candidate_gather(
   }
 
   const int32_t world_size = dcp_group->world_size();
+  CHECK_EQ(local_scores.dim(), 2);
+  CHECK_EQ(local_scores.scalar_type(), torch::kBFloat16);
+  CHECK_EQ(local_global_slots.scalar_type(), torch::kInt32);
+  CHECK(local_scores.sizes() == local_global_slots.sizes());
+  CHECK(local_scores.device() == local_global_slots.device());
   std::vector<int64_t> gathered_shape = local_scores.sizes().vec();
   gathered_shape.insert(gathered_shape.begin(),
                         static_cast<int64_t>(world_size));
   DcpIndexerGatherAsyncCtx ctx;
-  ctx.gathered_scores = torch::empty(gathered_shape, local_scores.options());
+  const torch::Tensor score_bytes =
+      local_scores.contiguous().view(torch::kInt8).flatten();
+  const torch::Tensor slot_bytes =
+      local_global_slots.contiguous().view(torch::kInt8).flatten();
+  const int64_t score_size = score_bytes.numel();
+  const int64_t slot_offset = (score_size + 3) / 4 * 4;
+  if (slot_offset == score_size && score_bytes.is_alias_of(slot_bytes) &&
+      slot_bytes.storage_offset() ==
+          score_bytes.storage_offset() + score_size) {
+    ctx.local_packet = score_bytes.as_strided(
+        {score_size + slot_bytes.numel()}, {1}, score_bytes.storage_offset());
+  } else {
+    std::vector<torch::Tensor> parts;
+    parts.reserve(3);
+    parts.emplace_back(score_bytes);
+    if (slot_offset > score_size) {
+      parts.emplace_back(
+          torch::zeros({slot_offset - score_size}, score_bytes.options()));
+    }
+    parts.emplace_back(slot_bytes);
+    ctx.local_packet = torch::cat(parts);
+  }
+  torch::Tensor gathered_packet = torch::empty(
+      {world_size, ctx.local_packet.numel()}, ctx.local_packet.options());
+  ctx.gathered_scores = gathered_packet.narrow(1, 0, score_size)
+                            .view(torch::kBFloat16)
+                            .view(gathered_shape);
   ctx.gathered_global_slots =
-      torch::empty(gathered_shape, local_global_slots.options());
-  ctx.score_work =
-      dcp_group->allgather_base_async(local_scores, ctx.gathered_scores);
-  ctx.slot_work = dcp_group->allgather_base_async(local_global_slots,
-                                                  ctx.gathered_global_slots);
+      gathered_packet.narrow(1, slot_offset, slot_bytes.numel())
+          .view(torch::kInt32)
+          .view(gathered_shape);
+  // All-gather copies opaque words; the field views retain BF16 and int32.
+  torch::Tensor wire_input = ctx.local_packet.view(torch::kFloat32);
+  torch::Tensor wire_output = gathered_packet.view(torch::kFloat32);
+  ctx.gather_work = dcp_group->allgather_base_async(wire_input, wire_output);
   return ctx;
 }
 
 DcpIndexerGatheredCandidates finish_dcp_indexer_candidate_gather(
     DcpIndexerGatherAsyncCtx&& ctx) {
-  if (ctx.score_work.defined()) {
-    ctx.score_work->wait();
-  }
-  if (ctx.slot_work.defined()) {
-    ctx.slot_work->wait();
+  if (ctx.gather_work.defined()) {
+    ctx.gather_work->wait();
   }
   return DcpIndexerGatheredCandidates{std::move(ctx.gathered_scores),
                                       std::move(ctx.gathered_global_slots)};

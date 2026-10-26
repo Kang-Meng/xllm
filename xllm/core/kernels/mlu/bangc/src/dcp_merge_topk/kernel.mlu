@@ -24,19 +24,22 @@ constexpr int32_t kCandidates = 8192;
 constexpr int32_t kTopk = 2048;
 constexpr int32_t kInvalidRank = 0xffc0;
 
-// Keys are stored complemented in their low 29 bits, nk = key ^ kKeyMask.
-// A zero key bit is then a nonzero nk bit; __bang_filter accepts any nonzero
-// index bit pattern, so a single integer AND produces the selection mask.
-constexpr int32_t kKeyMask = 0x1fffffff;
+constexpr int32_t kSlotBits = 31;
+constexpr int32_t kSlotMask = 0x7fffffff;
+constexpr int32_t kPriorityBits = kSlotBits + 16;
+// Every valid BF16 rank is at most 0xff80, leaving six low invalid bits.
+constexpr int32_t kInvalidBoundaryBit = kSlotBits + 6;
+static_assert(kInvalidRank - 0xff80 == (1 << 6));
 
-__mlu_func__ void zero_bit_mask(int32_t* dst,
+// Native filtering accepts any nonzero mask bit pattern.
+__mlu_func__ void priority_mask(int32_t* dst,
                                 const int32_t* src,
                                 int32_t n,
                                 int32_t bit) {
   __bang_band_scalar(dst, src, 1 << bit, n);
 }
 
-// Converts a zero-bit mask in place into the complementary one-bit mask.
+// Complements the mask within the current priority bit.
 __mlu_func__ void flip_bit_mask(int32_t* mask, int32_t n, int32_t bit) {
   __bang_bxor_scalar(mask, mask, 1 << bit, n);
 }
@@ -122,11 +125,12 @@ __mlu_func__ void load_candidate_row(T* dst,
 // Integer normalization in the 16-bit source domain. Descending BF16 rank:
 // r = b ^ 0x7fff for sign 0, b for sign 1. NaN or negative slot -> invalid.
 // Valid r <= 0xff80 < kInvalidRank, so min(max(r, invalid * kInvalidRank),
-// kInvalidRank) selects the canonical invalid rank. nk = kKeyMask - key.
+// kInvalidRank) selects the canonical invalid rank. Higher priorities win;
+// the low word reverses the full nonnegative int32 physical slot range.
 __mlu_func__ void prepare_keys(int32_t* keys,
+                               int32_t* slots,
                                int32_t* invalid,
                                int32_t* rank,
-                               const int32_t* complemented_index,
                                const int16_t* raw,
                                const int32_t* values) {
   __asm__ volatile(
@@ -158,13 +162,21 @@ __mlu_func__ void prepare_keys(int32_t* keys,
       : "memory");
   __asm__ volatile(
       "fuse.nram.s32 [%[dst]], %[n], [%[src]], .max([%[rank]]), "
-      ".min(%[bad]), .mul(%[width]), .add([%[index]]);\n\t" ::[dst] "r"(keys),
+      ".min(%[bad]), .mul(%[neg]), .add(%[bad]);\n\t" ::[dst] "r"(keys),
       [n] "r"(kCandidates),
       [src] "r"(invalid),
       [rank] "r"(rank),
       [bad] "r"(kInvalidRank),
-      [width] "r"(-kCandidates),
-      [index] "r"(complemented_index)
+      [neg] "r"(-1)
+      : "memory");
+  __asm__ volatile(
+      "fuse.nram.s32 [%[dst]], %[n], [%[src]], .max(%[zero]), "
+      ".mul(%[neg]), .add(%[max]);\n\t" ::[dst] "r"(slots),
+      [n] "r"(kCandidates),
+      [src] "r"(values),
+      [zero] "r"(0),
+      [neg] "r"(-1),
+      [max] "r"(kSlotMask)
       : "memory");
 }
 
@@ -194,107 +206,277 @@ __mlu_func__ void load_dense_row(int16_t* raw,
                  3);
 }
 
-// MSD selection only refines the boundary bin. Accepted bins preserve
-// candidate order internally; equal ranks never cross accepted bins. Then a
-// stable LSD pass orders the valid selected keys. Returns the valid count and
-// the buffer holding the sorted keys.
-__mlu_func__ int32_t select_and_sort(int32_t* keys_a,
-                                     int32_t* keys_b,
-                                     int32_t* scratch,
-                                     int32_t* selected,
-                                     int32_t** sorted) {
+__mlu_func__ void swap_words(int32_t*& hi,
+                             int32_t*& lo,
+                             int32_t*& next_hi,
+                             int32_t*& next_lo) {
+  int32_t* tmp = hi;
+  hi = next_hi;
+  next_hi = tmp;
+  tmp = lo;
+  lo = next_lo;
+  next_lo = tmp;
+}
+
+__mlu_func__ int32_t bit_width(uint32_t value) {
+  int32_t bits = 0;
+  while (value != 0) {
+    ++bits;
+    value >>= 1;
+  }
+  return bits;
+}
+
+// Every input is valid. Constant prefixes are absent from the packed key.
+__mlu_func__ int32_t* select_words(int32_t* keys_a,
+                                   int32_t* keys_b,
+                                   int32_t* mask,
+                                   int32_t* selected,
+                                   uint32_t varying,
+                                   int32_t highest_bit) {
   int32_t* src = keys_a;
   int32_t* dst = keys_b;
   int32_t n = kCandidates;
   int32_t accepted = 0;
   int32_t quota = kTopk;
-  int32_t highest_sort_bit = 28;
-  // Invalid keys have nk >> 19 == 0 and every valid key has nk >> 19 >= 1.
-  // While all boundary bits taken from 28 down are zero, the boundary bin may
-  // hold invalid keys; once bit 19 is reached that way it holds only them.
-  bool boundary_invalid_prefix = true;
-  bool boundary_all_invalid = false;
-  for (int32_t bit = 28; bit >= 13 && quota > 0; --bit) {
-    zero_bit_mask(scratch, src, n, bit);
-    int32_t zero_count = __bang_filter(reinterpret_cast<float*>(dst),
-                                       reinterpret_cast<float*>(src),
-                                       reinterpret_cast<float*>(scratch),
-                                       n);
-    // Before accepting a lower bin, every selected key is still in this
-    // boundary bin. A zero-only or one-only selected side fixes this bit.
-    if (accepted == 0 && (zero_count == 0 || zero_count >= quota)) {
+  int32_t highest_sort_bit = highest_bit;
+  for (int32_t bit = highest_bit; bit >= 0 && quota > 0; --bit) {
+    if ((varying & (uint32_t{1} << bit)) == 0) {
+      continue;
+    }
+    priority_mask(mask, src, n, bit);
+    const int32_t higher = __bang_filter(reinterpret_cast<float*>(dst),
+                                         reinterpret_cast<float*>(src),
+                                         reinterpret_cast<float*>(mask),
+                                         n);
+    if (accepted == 0 && (higher == 0 || higher >= quota)) {
       highest_sort_bit = bit - 1;
     }
-    if (zero_count >= quota) {
-      if (zero_count == quota) {
-        __memcpy(selected + accepted, dst, quota * sizeof(int32_t), NRAM2NRAM);
-        accepted += quota;
-        quota = 0;
-        break;
-      }
-      boundary_invalid_prefix = false;
-      if (zero_count != n) {
-        n = zero_count;
+    if (higher == quota) {
+      __bang_add_scalar(selected + accepted, dst, 0, quota);
+      quota = 0;
+    } else if (higher > quota) {
+      if (higher != n) {
+        n = higher;
         int32_t* tmp = src;
         src = dst;
         dst = tmp;
       }
-    } else if (zero_count > 0) {
-      __memcpy(
-          selected + accepted, dst, zero_count * sizeof(int32_t), NRAM2NRAM);
-      accepted += zero_count;
-      quota -= zero_count;
-      flip_bit_mask(scratch, n, bit);
+    } else if (higher > 0) {
+      __bang_add_scalar(selected + accepted, dst, 0, higher);
+      accepted += higher;
+      quota -= higher;
+      flip_bit_mask(mask, n, bit);
       __bang_filter(reinterpret_cast<float*>(dst),
                     reinterpret_cast<float*>(src),
-                    reinterpret_cast<float*>(scratch),
+                    reinterpret_cast<float*>(mask),
                     n);
-      n -= zero_count;
+      n -= higher;
       int32_t* tmp = src;
       src = dst;
       dst = tmp;
     }
-    if (bit == 19 && boundary_invalid_prefix) {
-      // Lower bits cannot separate the remaining invalid keys.
-      boundary_all_invalid = true;
+  }
+  if (quota > 0) {
+    __bang_add_scalar(selected + accepted, src, 0, quota);
+  }
+  __bang_add_scalar(keys_a, selected, 0, kTopk);
+  src = keys_a;
+  dst = keys_b;
+  for (int32_t bit = 0; bit <= highest_sort_bit; ++bit) {
+    if ((varying & (uint32_t{1} << bit)) == 0) {
+      continue;
+    }
+    priority_mask(mask, src, kTopk, bit);
+    const int32_t higher = __bang_filter(reinterpret_cast<float*>(dst),
+                                         reinterpret_cast<float*>(src),
+                                         reinterpret_cast<float*>(mask),
+                                         kTopk);
+    if (higher == 0 || higher == kTopk) {
+      continue;
+    }
+    flip_bit_mask(mask, kTopk, bit);
+    __bang_filter(reinterpret_cast<float*>(dst + higher),
+                  reinterpret_cast<float*>(src),
+                  reinterpret_cast<float*>(mask),
+                  kTopk);
+    int32_t* tmp = src;
+    src = dst;
+    dst = tmp;
+  }
+  return src;
+}
+
+// MSD selection refines the boundary of the exact (score, physical slot)
+// priority. Only the selected TopK pairs enter the final stable LSD sort.
+__mlu_func__ int32_t select_pairs(int32_t* hi_a,
+                                  int32_t* hi_b,
+                                  int32_t* lo_a,
+                                  int32_t* lo_b,
+                                  int32_t* mask,
+                                  int32_t* reduction,
+                                  int32_t* selected_hi,
+                                  int32_t* selected_lo,
+                                  int32_t** sorted_lo) {
+  // Inactive destination buffers hold reductions until partitioning starts.
+  __bang_bor(mask, hi_a, hi_a + kCandidates / 2, kCandidates / 2);
+  __bang_band(reduction, hi_a, hi_a + kCandidates / 2, kCandidates / 2);
+  __bang_bor(hi_b, lo_a, lo_a + kCandidates / 2, kCandidates / 2);
+  __bang_band(lo_b, lo_a, lo_a + kCandidates / 2, kCandidates / 2);
+  for (int32_t span = kCandidates / 4; span > 0; span /= 2) {
+    __bang_bor(mask, mask, mask + span, span);
+    __bang_band(reduction, reduction, reduction + span, span);
+    __bang_bor(hi_b, hi_b, hi_b + span, span);
+    __bang_band(lo_b, lo_b, lo_b + span, span);
+  }
+  __sync_compute();
+  const uint32_t varying_hi = static_cast<uint32_t>(mask[0] ^ reduction[0]);
+  const uint32_t varying_lo = static_cast<uint32_t>(hi_b[0] ^ lo_b[0]);
+  const int32_t common_hi = reduction[0];
+  const int32_t common_lo = lo_b[0];
+  const int32_t hi_bits = bit_width(varying_hi);
+  const int32_t lo_bits = bit_width(varying_lo);
+  if (common_hi != 0 && hi_bits + lo_bits <= kSlotBits) {
+    const int32_t hi_mask = static_cast<int32_t>((uint32_t{1} << hi_bits) - 1);
+    const int32_t lo_mask = static_cast<int32_t>((uint32_t{1} << lo_bits) - 1);
+    if (hi_bits == 0) {
+      __bang_band_scalar(hi_a, lo_a, lo_mask, kCandidates);
+    } else {
+      __bang_band_scalar(hi_a, hi_a, hi_mask, kCandidates);
+      __bang_mul_scalar(hi_a, hi_a, 1 << lo_bits, kCandidates);
+      __bang_band_scalar(lo_a, lo_a, lo_mask, kCandidates);
+      __bang_bor(hi_a, hi_a, lo_a, kCandidates);
+    }
+    int32_t* packed = select_words(hi_a,
+                                   hi_b,
+                                   mask,
+                                   selected_hi,
+                                   (varying_hi << lo_bits) | varying_lo,
+                                   hi_bits + lo_bits - 1);
+    __bang_band_scalar(packed, packed, lo_mask, kTopk);
+    __bang_bor_scalar(packed, packed, common_lo & ~lo_mask, kTopk);
+    *sorted_lo = packed;
+    return kTopk;
+  }
+  int32_t* src_hi = hi_a;
+  int32_t* dst_hi = hi_b;
+  int32_t* src_lo = lo_a;
+  int32_t* dst_lo = lo_b;
+  int32_t n = kCandidates;
+  int32_t accepted = 0;
+  int32_t quota = kTopk;
+  int32_t highest_sort_bit = kPriorityBits - 1;
+  bool invalid_prefix = common_hi == 0;
+  bool invalid_boundary = false;
+  for (int32_t bit = kPriorityBits - 1; bit >= 0 && quota > 0; --bit) {
+    const int32_t local_bit = bit >= kSlotBits ? bit - kSlotBits : bit;
+    const uint32_t varying = bit >= kSlotBits ? varying_hi : varying_lo;
+    if ((varying & (uint32_t{1} << local_bit)) == 0) {
+      if (bit == kInvalidBoundaryBit && invalid_prefix) {
+        invalid_boundary = true;
+        break;
+      }
+      continue;
+    }
+    priority_mask(mask, bit >= kSlotBits ? src_hi : src_lo, n, local_bit);
+    const int32_t higher = __bang_filter(reinterpret_cast<float*>(dst_hi),
+                                         reinterpret_cast<float*>(src_hi),
+                                         reinterpret_cast<float*>(mask),
+                                         n);
+    if (accepted == 0 && (higher == 0 || higher >= quota)) {
+      highest_sort_bit = bit - 1;
+    }
+    if (higher > 0) {
+      __bang_filter(reinterpret_cast<float*>(dst_lo),
+                    reinterpret_cast<float*>(src_lo),
+                    reinterpret_cast<float*>(mask),
+                    n);
+    }
+    if (higher >= quota) {
+      if (higher == quota) {
+        __bang_add_scalar(selected_hi + accepted, dst_hi, 0, quota);
+        __bang_add_scalar(selected_lo + accepted, dst_lo, 0, quota);
+        accepted += quota;
+        quota = 0;
+        break;
+      }
+      invalid_prefix = false;
+      if (higher != n) {
+        n = higher;
+        swap_words(src_hi, src_lo, dst_hi, dst_lo);
+      }
+    } else if (higher > 0) {
+      __bang_add_scalar(selected_hi + accepted, dst_hi, 0, higher);
+      __bang_add_scalar(selected_lo + accepted, dst_lo, 0, higher);
+      accepted += higher;
+      quota -= higher;
+      flip_bit_mask(mask, n, local_bit);
+      __bang_filter(reinterpret_cast<float*>(dst_hi),
+                    reinterpret_cast<float*>(src_hi),
+                    reinterpret_cast<float*>(mask),
+                    n);
+      __bang_filter(reinterpret_cast<float*>(dst_lo),
+                    reinterpret_cast<float*>(src_lo),
+                    reinterpret_cast<float*>(mask),
+                    n);
+      n -= higher;
+      swap_words(src_hi, src_lo, dst_hi, dst_lo);
+    }
+    if (bit == kInvalidBoundaryBit && invalid_prefix) {
+      invalid_boundary = true;
       break;
     }
   }
-  int32_t valid_selected = kTopk;
-  if (boundary_all_invalid) {
-    valid_selected = accepted;
-  } else if (quota > 0) {
-    // All remaining candidates have identical BF16 rank. Select first
-    // indices; the synchronous copy also makes the boundary key ALU-visible.
-    __memcpy(selected + accepted, src, quota * sizeof(int32_t), NRAM2NRAM);
-    if (((selected[accepted] ^ kKeyMask) >> 13) == kInvalidRank) {
-      valid_selected = accepted;
-    }
+  if (!invalid_boundary && quota > 0) {
+    // Identical complete priorities may repeat the same physical slot.
+    __bang_add_scalar(selected_hi + accepted, src_hi, 0, quota);
+    __bang_add_scalar(selected_lo + accepted, src_lo, 0, quota);
+    accepted += quota;
   }
-  // With kCandidates=4K, fewer than kTopk valid keys leaves an invalid group
-  // larger than kTopk. That group cannot end selection at an exact quota before
-  // this tail.
-  src = selected;
-  dst = keys_a;
-  if (valid_selected > 0) {
-    for (int32_t bit = 13; bit <= highest_sort_bit; ++bit) {
-      zero_bit_mask(scratch, src, valid_selected, bit);
-      int32_t zero_count = __bang_filter(reinterpret_cast<float*>(dst),
-                                         reinterpret_cast<float*>(src),
-                                         reinterpret_cast<float*>(scratch),
-                                         valid_selected);
-      flip_bit_mask(scratch, valid_selected, bit);
-      __bang_filter(reinterpret_cast<float*>(dst + zero_count),
-                    reinterpret_cast<float*>(src),
-                    reinterpret_cast<float*>(scratch),
-                    valid_selected);
-      int32_t* tmp = src;
-      src = dst;
-      dst = tmp;
-    }
+  *sorted_lo = selected_lo;
+  if (accepted == 0) {
+    return 0;
   }
-  *sorted = src;
-  return valid_selected;
+  // Full-size ping-pong buffers also cover the input-span bounds checked by
+  // filtering a compacted tail at an offset.
+  __bang_add_scalar(hi_a, selected_hi, 0, accepted);
+  __bang_add_scalar(lo_a, selected_lo, 0, accepted);
+  src_hi = hi_a;
+  dst_hi = hi_b;
+  src_lo = lo_a;
+  dst_lo = lo_b;
+  for (int32_t bit = 0; bit <= highest_sort_bit; ++bit) {
+    const int32_t local_bit = bit >= kSlotBits ? bit - kSlotBits : bit;
+    const uint32_t varying = bit >= kSlotBits ? varying_hi : varying_lo;
+    if ((varying & (uint32_t{1} << local_bit)) == 0) {
+      continue;
+    }
+    priority_mask(
+        mask, bit >= kSlotBits ? src_hi : src_lo, accepted, local_bit);
+    const int32_t higher = __bang_filter(reinterpret_cast<float*>(dst_hi),
+                                         reinterpret_cast<float*>(src_hi),
+                                         reinterpret_cast<float*>(mask),
+                                         accepted);
+    if (higher == 0 || higher == accepted) {
+      continue;
+    }
+    __bang_filter(reinterpret_cast<float*>(dst_lo),
+                  reinterpret_cast<float*>(src_lo),
+                  reinterpret_cast<float*>(mask),
+                  accepted);
+    flip_bit_mask(mask, accepted, local_bit);
+    __bang_filter(reinterpret_cast<float*>(dst_hi + higher),
+                  reinterpret_cast<float*>(src_hi),
+                  reinterpret_cast<float*>(mask),
+                  accepted);
+    __bang_filter(reinterpret_cast<float*>(dst_lo + higher),
+                  reinterpret_cast<float*>(src_lo),
+                  reinterpret_cast<float*>(mask),
+                  accepted);
+    swap_words(src_hi, src_lo, dst_hi, dst_lo);
+  }
+  *sorted_lo = src_lo;
+  return accepted;
 }
 
 // Neighbouring lengths share a 64-byte line but come from different cores.
@@ -308,8 +490,8 @@ __mlu_func__ void store_length(int32_t* lengths,
 }
 
 // Integer promotion retains every BF16 bit, including signed zero/subnormals.
-// A stable partition of candidate-index order implements CNNL
-// lower_index_first.
+// Physical slot ordering makes equal-score selection independent of the
+// all-gather rank order and local candidate order.
 __mlu_global__ void merge_rows(const int16_t* scores,
                                const int32_t* slots,
                                const int32_t* mapping,
@@ -335,23 +517,14 @@ __mlu_global__ void merge_rows(const int16_t* scores,
   __nram__ int32_t keys_b[kCandidates];
   __nram__ int32_t mask[kCandidates];
   __nram__ int32_t scratch[kCandidates];
-  __nram__ int32_t selected[kTopk];
-  __nram__ int32_t offsets[kTopk];
+  __nram__ int32_t selected_hi[kTopk];
+  __nram__ int32_t selected_lo[kTopk];
   __nram__ int32_t staged_output[2][kTopk];
   __nram__ int32_t row_stage[2 * kCandidates];
-  __nram__ int32_t complemented_index[kCandidates];
   __nram__ int32_t exchanged[16];
-  // 364 KiB plus the compiler's extra buffer; below 512 KiB/IPU.
-  __bang_incseq(complemented_index, kCandidates);
-  __asm__ volatile(
-      "fuse.nram.s32 [%[dst]], %[n], [%[dst]], .mul(%[neg]), "
-      ".add(%[key]);\n\t" ::[dst] "r"(complemented_index),
-      [n] "r"(kCandidates),
-      [neg] "r"(-1),
-      [key] "r"(kKeyMask)
-      : "memory");
+  // 332 KiB plus the compiler's extra buffer; below 512 KiB/IPU.
   // Dense rows are double buffered: row q+taskDim is prefetched on IO while
-  // row q computes, and the slot gather/output store of row q overlap row
+  // row q computes, and the output store of row q overlaps row
   // q+taskDim. Other strides keep synchronous staging into raw/values.
   const bool dense =
       sc == 1 && vc == 1 && sd <= 0x7fffffffLL / 2 && vd <= 0x7fffffffLL / 4;
@@ -373,16 +546,6 @@ __mlu_global__ void merge_rows(const int16_t* scores,
     const bool next_valid = next < rows && mapping[next * ms] >= 0;
     // Completes this row's prefetch and the store that last used row_output.
     __sync_io();
-    if (!dense && pending_row >= 0) {
-      // Synchronous staging below rewrites values read by the pending gather.
-      __sync_move();
-      __memcpy_async(output + pending_row * kTopk,
-                     pending_output,
-                     kTopk * sizeof(int32_t),
-                     NRAM2GDRAM);
-      store_length(lengths, pending_row, pending_length, exchanged);
-      pending_row = -1;
-    }
     if (row_valid && !dense) {
       row_raw = raw;
       row_values = values;
@@ -395,15 +558,14 @@ __mlu_global__ void merge_rows(const int16_t* scores,
       load_candidate_row(raw, scores + q * sq, sd, sc, row_stage, keys_b, mask);
       load_candidate_row(
           values, slots + q * vq, vd, vc, row_stage, keys_b, mask);
+      // Stride-dependent staging may produce data on IO, Move or Compute.
+      __sync();
     }
     if (row_valid) {
-      prepare_keys(
-          keys_a, mask, keys_b, complemented_index, row_raw, row_values);
+      prepare_keys(keys_a, row_stage, mask, keys_b, row_raw, row_values);
     }
     if (pending_row >= 0) {
-      // The previous gather read the other slot buffer and offsets, and wrote
-      // the other staged output; retire it before either is reused.
-      __sync_move();
+      // The preceding row completed its staged output before queuing IO.
       __memcpy_async(output + pending_row * kTopk,
                      pending_output,
                      kTopk * sizeof(int32_t),
@@ -423,45 +585,40 @@ __mlu_global__ void merge_rows(const int16_t* scores,
                      vd);
     }
     int32_t valid_selected = 0;
-    int32_t* sorted = selected;
+    int32_t* sorted_slots = selected_lo;
     if (row_valid) {
-      valid_selected =
-          select_and_sort(keys_a, keys_b, scratch, selected, &sorted);
+      valid_selected = select_pairs(keys_a,
+                                    keys_b,
+                                    row_stage,
+                                    row_stage + kCandidates,
+                                    scratch,
+                                    mask,
+                                    selected_hi,
+                                    selected_lo,
+                                    &sorted_slots);
     }
     if (valid_selected > 0) {
-      // Byte offset of candidate index (nk & (kCandidates - 1)) ^ (kCandidates
-      // - 1).
       __asm__ volatile(
-          "fuse.nram.s32 [%[dst]], %[n], [%[src]], .and(%[low]), "
-          ".xor(%[low]), .mul(%[bytes]);\n\t" ::[dst] "r"(offsets),
+          "fuse.nram.s32 [%[dst]], %[n], [%[src]], .mul(%[neg]), "
+          ".add(%[max]);\n\t" ::[dst] "r"(row_output),
           [n] "r"(valid_selected),
-          [src] "r"(sorted),
-          [low] "r"(kCandidates - 1),
-          [bytes] "r"(4)
+          [src] "r"(sorted_slots),
+          [neg] "r"(-1),
+          [max] "r"(kSlotMask)
           : "memory");
     }
     if (valid_selected < kTopk) {
       __bang_write_value(
           row_output + valid_selected, kTopk - valid_selected, -1);
     }
-    // Offsets and the invalid tail are complete before Move/IO consume them.
+    // Both the selected slots and invalid tail are complete before IO.
     __sync_compute();
-    if (valid_selected > 0) {
-      __gather_async(row_output,
-                     row_values,
-                     reinterpret_cast<uint32_t*>(offsets),
-                     sizeof(int32_t),
-                     NRAM2NRAM,
-                     sizeof(int32_t),
-                     valid_selected);
-    }
     pending_row = q;
     pending_length = valid_selected;
     pending_output = row_output;
     row_valid = next_valid;
   }
   if (pending_row >= 0) {
-    __sync_move();
     __memcpy_async(output + pending_row * kTopk,
                    pending_output,
                    kTopk * sizeof(int32_t),

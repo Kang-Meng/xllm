@@ -96,37 +96,24 @@ torch::Tensor DeepseekV32AttentionImpl::forward_cp(
       AttentionMetadata local_indexer_metadata = attn_metadata;
       const std::shared_ptr<const KVShardBatchMetadata>& shard_metadata =
           attn_metadata.kv_shard_batch_metadata;
-      KVShardCausalSelectorMetadata causal_selector;
       if (shard_metadata != nullptr) {
-        CHECK(shard_metadata->local_slot_mapping.defined())
-            << "cache-sharded CP requires localized indexer slots";
-        CHECK(shard_metadata->causal_selector.block_table.defined())
-            << "cache-sharded CP requires causal selector metadata";
+        CHECK(shard_metadata->local_slot_mapping.defined());
         local_indexer_metadata.slot_mapping =
             shard_metadata->local_slot_mapping;
-        causal_selector = shard_metadata->causal_selector;
       } else {
         local_indexer_metadata.slot_mapping =
             dcp_decode_context_->localize_slots(attn_metadata.slot_mapping);
-        causal_selector = build_kv_shard_causal_selector_metadata(
-            attn_metadata, dcp_decode_context_->layout());
       }
-
-      AttentionMetadata selector_metadata = local_indexer_metadata;
-      selector_metadata.q_cu_seq_lens = causal_selector.q_cu_seq_lens;
-      selector_metadata.kv_cu_seq_lens = causal_selector.q_cu_seq_lens;
-      selector_metadata.kv_seq_lens = causal_selector.local_context_lens;
-      selector_metadata.block_table = causal_selector.block_table;
-      selector_metadata.max_query_len = 1;
-      selector_metadata.max_seq_len = index_topk_;
-      selector_metadata.total_kv_len = 0;
-      selector_metadata.is_prefill = false;
-      selector_metadata.is_chunked_prefill = false;
+      const KVShardIndexerMetadata indexer_metadata =
+          shard_metadata != nullptr &&
+                  shard_metadata->indexer.block_table.defined()
+              ? shard_metadata->indexer
+              : build_kv_shard_indexer_metadata(attn_metadata);
       DcpIndexerLocalCandidates candidates =
           indexer_->forward_dcp_local_prefill_from_cp(global_pre,
                                                       index_cache,
                                                       local_indexer_metadata,
-                                                      selector_metadata);
+                                                      indexer_metadata);
       candidate_gather = dcp_decode_context_->launch_indexer_candidate_gather(
           candidates.scores, candidates.global_slots);
       candidate_topk = candidates.global_slots.size(1);

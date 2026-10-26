@@ -21,7 +21,8 @@ limitations under the License.
 
 namespace xllm::kernel::mlu::bangc {
 // BF16 scores[4,Q,2048], INT32 slots/mapping, topk=2048; contiguous outputs.
-// Positive input strides are supported. Outputs cannot alias any input.
+// Equal scores use ascending global physical slots. Positive input strides
+// are supported. Outputs cannot alias any input.
 void dcp_merge_topk(const torch::Tensor& scores,
                     const torch::Tensor& slots,
                     const torch::Tensor& mapping,

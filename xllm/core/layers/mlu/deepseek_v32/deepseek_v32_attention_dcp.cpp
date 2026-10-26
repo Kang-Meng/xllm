@@ -349,47 +349,25 @@ torch::Tensor DeepseekV32AttentionImpl::forward_dcp(
     local_indexer_metadata.block_table = attn_metadata.block_table;
     torch::Tensor index_cache = kv_cache.get_index_cache();
     DcpIndexerLocalCandidates candidates;
+    const KVShardIndexerMetadata indexer_metadata =
+        shard_metadata != nullptr &&
+                shard_metadata->indexer.block_table.defined()
+            ? shard_metadata->indexer
+            : build_kv_shard_indexer_metadata(attn_metadata);
     if (enable_dcp_decode) {
-      if (shard_metadata != nullptr &&
-          shard_metadata->local_indexer_context_lens.defined()) {
-        local_indexer_metadata.kv_seq_lens =
-            shard_metadata->local_indexer_context_lens;
-      } else {
-        local_indexer_metadata.kv_seq_lens = localize_kv_shard_context_lens(
-            attn_metadata.kv_seq_lens, dcp_decode_context_->layout());
-      }
       candidates = indexer_->forward_dcp_local(hidden_states,
                                                q_norm,
                                                positions,
                                                index_cache,
-                                               local_indexer_metadata);
+                                               local_indexer_metadata,
+                                               indexer_metadata);
     } else {
-      KVShardCausalSelectorMetadata causal_selector;
-      if (shard_metadata != nullptr &&
-          shard_metadata->causal_selector.block_table.defined()) {
-        causal_selector = shard_metadata->causal_selector;
-      } else {
-        causal_selector = build_kv_shard_causal_selector_metadata(
-            attn_metadata, dcp_decode_context_->layout());
-      }
-      AttentionMetadata selector_metadata = local_indexer_metadata;
-      selector_metadata.q_cu_seq_lens = causal_selector.q_cu_seq_lens;
-      selector_metadata.kv_cu_seq_lens = causal_selector.q_cu_seq_lens;
-      selector_metadata.kv_seq_lens = causal_selector.local_context_lens;
-      selector_metadata.block_table = causal_selector.block_table;
-      selector_metadata.max_query_len = 1;
-      selector_metadata.max_seq_len = index_topk_;
-      // The decode-view selector does not consume total_kv_len. Keeping this
-      // host metadata scalar avoids a device-to-host synchronization here.
-      selector_metadata.total_kv_len = 0;
-      selector_metadata.is_prefill = false;
-      selector_metadata.is_chunked_prefill = false;
       candidates = indexer_->forward_dcp_local_prefill(hidden_states,
                                                        q_norm,
                                                        positions,
                                                        index_cache,
                                                        local_indexer_metadata,
-                                                       selector_metadata);
+                                                       indexer_metadata);
     }
     candidate_gather = dcp_decode_context_->launch_indexer_candidate_gather(
         candidates.scores, candidates.global_slots);

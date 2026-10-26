@@ -1538,20 +1538,10 @@ void run_prefill_case(const PrefillCase& config,
           v32_cp::restore_gathered_to_global_order(gathered_keys, *cp);
     }
     if (sharded) {
-      const auto& causal = metadata.kv_shard_batch_metadata->causal_selector;
+      const auto& selector = metadata.kv_shard_batch_metadata->indexer;
       AttentionMetadata local_metadata = metadata;
       local_metadata.slot_mapping =
           metadata.kv_shard_batch_metadata->local_slot_mapping;
-      AttentionMetadata selector = local_metadata;
-      selector.q_cu_seq_lens = causal.q_cu_seq_lens;
-      selector.kv_cu_seq_lens = causal.q_cu_seq_lens;
-      selector.kv_seq_lens = causal.local_context_lens;
-      selector.block_table = causal.block_table;
-      selector.max_query_len = 1;
-      selector.max_seq_len = args.index_topk();
-      selector.total_kv_len = 0;
-      selector.is_prefill = false;
-      selector.is_chunked_prefill = false;
       const auto candidates =
           cp ? diagnostic->forward_dcp_local_prefill_from_cp(
                    pre, diagnostic_cache, local_metadata, selector)
@@ -2786,7 +2776,8 @@ void run_dummy_attention(int32_t rank, int32_t port) {
   parallel.dcp_group_ = groups.world.get();
   for (DsaModelVariant variant :
        {DsaModelVariant::V32, DsaModelVariant::GLM5}) {
-    const ModelArgs args = prefill_args(variant);
+    ModelArgs args = prefill_args(variant);
+    args.index_topk() = 2048;
     for (bool shared : {false, true}) {
       DeepseekV32Attention attention(
           ModelContext(parallel, args, QuantArgs(), options),

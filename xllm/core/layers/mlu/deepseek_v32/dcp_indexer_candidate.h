@@ -33,18 +33,18 @@ struct DcpIndexerGatheredCandidates {
 };
 
 // In-flight DCP candidate all-gather. Holds the gathered buffers alive until
-// both collectives retire; the caller enqueues independent compute between
+// the collective retires; the caller enqueues independent compute between
 // the launch and the finish to overlap it with the communication.
 struct DcpIndexerGatherAsyncCtx {
   torch::Tensor gathered_scores;
   torch::Tensor gathered_global_slots;
-  c10::intrusive_ptr<c10d::Work> score_work;
-  c10::intrusive_ptr<c10d::Work> slot_work;
+  torch::Tensor local_packet;
+  c10::intrusive_ptr<c10d::Work> gather_work;
 };
 
 // Submits the rank-local candidate tuples for the DCP all-gather without
-// waiting. The score and slot collectives intentionally remain separate so
-// global int32 token ids are never cast to fp32 for transport.
+// waiting. A byte packet preserves BF16 scores and int32 ids without numeric
+// conversion; the returned views retain each field's dtype.
 DcpIndexerGatherAsyncCtx launch_dcp_indexer_candidate_gather(
     const torch::Tensor& local_scores,
     const torch::Tensor& local_global_slots,

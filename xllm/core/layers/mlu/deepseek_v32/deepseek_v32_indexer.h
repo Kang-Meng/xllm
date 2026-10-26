@@ -29,6 +29,7 @@ limitations under the License.
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
 #include "framework/state_dict/utils.h"
+#include "layers/common/kv_shard_batch_metadata.h"
 #include "layers/common/linear.h"
 #include "layers/common/rms_norm.h"
 #include "layers/common/rotary_embedding.h"
@@ -65,6 +66,7 @@ struct IndexerCPPreOut {
   std::optional<torch::Tensor> q_scale;
 };
 
+// Scaled BF16 scores and INT32 global physical slots, both [N,2048].
 struct DcpIndexerLocalCandidates {
   torch::Tensor scores;
   torch::Tensor global_slots;
@@ -100,7 +102,8 @@ class DeepseekV32IndexerImpl : public torch::nn::Module {
       const torch::Tensor& q_norm,
       const torch::Tensor& positions,
       torch::Tensor& k_cache,
-      const AttentionMetadata& attn_metadata);
+      const AttentionMetadata& attn_metadata,
+      const KVShardIndexerMetadata& indexer_metadata);
 
   DcpIndexerLocalCandidates forward_dcp_local_prefill(
       const torch::Tensor& x,
@@ -108,13 +111,13 @@ class DeepseekV32IndexerImpl : public torch::nn::Module {
       const torch::Tensor& positions,
       torch::Tensor& k_cache,
       const AttentionMetadata& prefill_metadata,
-      const AttentionMetadata& selector_metadata);
+      const KVShardIndexerMetadata& indexer_metadata);
 
   DcpIndexerLocalCandidates forward_dcp_local_prefill_from_cp(
       const IndexerCPPreOut& pre_out,
       torch::Tensor& k_cache,
       const AttentionMetadata& prefill_metadata,
-      const AttentionMetadata& selector_metadata);
+      const KVShardIndexerMetadata& indexer_metadata);
 
   IndexerCPPreOut cp_pre(const torch::Tensor& x,
                          const torch::Tensor& q_norm,
@@ -242,12 +245,12 @@ class DeepseekV32IndexerImpl : public torch::nn::Module {
       const AttentionMetadata& attn_metadata,
       const v32_cp::DeepseekV32CPContext& cp_ctx);
 
-  DcpIndexerLocalCandidates finalize_local_candidates(
+  DcpIndexerLocalCandidates select_dcp_candidates(
       const torch::Tensor& q,
       const torch::Tensor& weights,
       const torch::Tensor& k_cache,
-      const torch::Tensor& local_slots,
-      const torch::Tensor& context_lens) const;
+      const KVShardIndexerMetadata& metadata,
+      bool is_prefill) const;
 };
 
 TORCH_MODULE(DeepseekV32Indexer);

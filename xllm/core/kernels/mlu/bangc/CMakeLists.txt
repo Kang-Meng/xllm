@@ -62,11 +62,16 @@ set(XLLM_DCP_MERGE_SOURCE
 list(REMOVE_ITEM XLLM_BANGC_KERNEL_SOURCES "${XLLM_DCP_MERGE_SOURCE}")
 bang_add_library(xllm_mlu_dcp_merge_kernel STATIC "${XLLM_DCP_MERGE_SOURCE}"
   OPTIONS RELEASE -O2 RELWITHDEBINFO -O2 MINSIZEREL -O2)
+set(XLLM_DCP_INDEXER_SOURCE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dcp_indexer/host.mlu")
+list(REMOVE_ITEM XLLM_BANGC_KERNEL_SOURCES "${XLLM_DCP_INDEXER_SOURCE}")
+bang_add_library(xllm_mlu_dcp_indexer_kernel STATIC "${XLLM_DCP_INDEXER_SOURCE}"
+  OPTIONS RELEASE -O2 RELWITHDEBINFO -O2 MINSIZEREL -O2)
 bang_add_library(xllm_mlu_bangc_kernels STATIC ${XLLM_BANGC_KERNEL_SOURCES})
 bang_add_library(xllm_mlu_dflash2_conv_kernels STATIC ${XLLM_DFLASH2_CONV_SOURCES}
   OPTIONS -Xbang-cnas -fno-instruction-combine)
 foreach(bangc_target xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels
-    xllm_mlu_dcp_merge_kernel)
+    xllm_mlu_dcp_merge_kernel xllm_mlu_dcp_indexer_kernel)
   target_include_directories(${bangc_target} PRIVATE
     "${PROJECT_SOURCE_DIR}/xllm/core" "${NEUWARE_HOME}/include")
   set_target_properties(${bangc_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -84,7 +89,7 @@ target_compile_definitions(xllm_mlu_ops PUBLIC
 target_link_libraries(xllm_mlu_ops
   PUBLIC torch
   PRIVATE xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels
-    xllm_mlu_dcp_merge_kernel torch_mlu glog::glog
+    xllm_mlu_dcp_merge_kernel xllm_mlu_dcp_indexer_kernel torch_mlu glog::glog
     ${XLLM_BANGC_CNRT_LIBRARY})
 # Keep private archive symbols local, including glog/gflags registries that
 # may also be linked statically into the executable loading this library.

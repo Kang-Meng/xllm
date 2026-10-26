@@ -19,6 +19,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "core/kernels/mlu/dcp/dcp_merge_test_utils.h"
@@ -265,5 +266,72 @@ TEST(DcpMergeTopkDeathTest, RejectsUnsupportedContractsAndAliasing) {
           expanded, input.slots, input.mapping, kTopk, out.output, out.lengths),
       "stride");
 }
+TEST_F(DcpMergeTopkTest, TiesUsePhysicalSlotsAcrossCandidatePermutations) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const auto options = torch::TensorOptions().device(device);
+  auto scores = torch::ones({4, 1, 2048}, options.dtype(torch::kBFloat16));
+  torch::manual_seed(42);
+  auto slots = (torch::randperm(8192, torch::kInt32) + (1 << 30))
+                   .reshape({4, 1, 2048})
+                   .to(device);
+  auto mapping = torch::zeros({1}, options.dtype(torch::kInt32));
+  auto output = torch::empty({1, 2048}, slots.options());
+  auto lengths = torch::empty({1}, slots.options());
+  auto expected = (torch::arange(2048, torch::kInt32) + (1 << 30)).unsqueeze(0);
+  for (int32_t repeat = 0; repeat < 2; ++repeat) {
+    dcp_merge_topk(scores, slots, mapping, /*topk=*/2048, output, lengths);
+    EXPECT_TRUE(torch::equal(output.cpu(), expected));
+    EXPECT_EQ(lengths[0].item<int32_t>(), 2048);
+    slots = slots.flip({0, 2});
+  }
+}
+
+TEST_F(DcpMergeTopkTest, OrdersEveryPhysicalSlotBit) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  auto slots = torch::empty({kDcp, 32, kTopk}, torch::kInt32);
+  const auto pattern = torch::arange(kTopk, torch::kInt32).remainder(2);
+  for (int32_t bit = 0; bit < 32; ++bit) {
+    const int32_t value =
+        bit < 31 ? static_cast<int32_t>(uint32_t{1} << bit) : 0x7fffffff;
+    slots.select(1, bit).copy_(pattern.mul(value).expand({kDcp, kTopk}));
+  }
+  check_input({torch::ones({kDcp, 32, kTopk}, torch::kBFloat16).to(device),
+               slots.to(device),
+               torch::zeros({32}, torch::kInt32).to(device)});
+}
+
+TEST_F(DcpMergeTopkTest, ConstantScoresAndSparseValidSlots) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  auto scores = torch::full({kDcp, 5, kTopk},
+                            -std::numeric_limits<float>::infinity(),
+                            torch::kBFloat16);
+  auto slots = torch::arange(kDcp * kTopk, torch::kInt32)
+                   .reshape({kDcp, 1, kTopk})
+                   .repeat({1, 5, 1});
+  slots.select(1, 1).fill_(-1);
+  slots.select(1, 2).fill_(-1);
+  slots[0][2][0] = std::numeric_limits<int32_t>::max();
+  scores.select(1, 3).fill_(std::numeric_limits<float>::quiet_NaN());
+  slots.select(1, 4).fill_(17);
+  check_input({scores.to(device),
+               slots.to(device),
+               torch::zeros({5}, torch::kInt32).to(device)});
+}
+
+TEST_F(DcpMergeTopkTest, PreservesNarrowAndWidePriorityRanges) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  torch::manual_seed(2026);
+  const auto order = torch::randperm(kDcp * kTopk, torch::kInt32);
+  const auto signed_scores = torch::where(order.remainder(2) == 0, 1.0f, -1.0f)
+                                 .to(torch::kBFloat16)
+                                 .reshape({kDcp, 1, kTopk});
+  for (const int32_t stride : {4, 8}) {
+    const auto slots = (order * stride + (1 << 30)).reshape({kDcp, 1, kTopk});
+    check_input({signed_scores.to(device),
+                 slots.to(device),
+                 torch::zeros({1}, torch::kInt32).to(device)});
+  }
+}
+
 }  // namespace
 }  // namespace xllm
