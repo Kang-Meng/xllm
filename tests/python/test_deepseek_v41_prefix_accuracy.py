@@ -673,6 +673,7 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(pref
     torch.testing.assert_close(actual, golden, atol=0.02, rtol=0)
     draft_config = _config_dict(
         hidden_size=config["hidden_size"],
+        vocab_size=config["vocab_size"],
         window_size=_BLOCK_SIZE,
         sliding_window=_BLOCK_SIZE,
         max_position_embeddings=1024,
@@ -723,6 +724,7 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(pref
     # after a warm target prefill and predicts the anchor-first block once.
     query_start = total - 1
     block = draft.model.anchor_first_query_block(ids[-1:]).reshape(-1)
+    assert torch.all((block >= 0) & (block < draft.cfg.vocab_size))
     query_positions = torch.arange(query_start, query_start + block.numel(), device="npu:0")
 
     def draft_logits(caches: list[LayerCache], tables: list[torch.Tensor]) -> torch.Tensor:
