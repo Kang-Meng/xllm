@@ -196,6 +196,33 @@ std::shared_ptr<Request> make_mtp_request(const std::vector<int32_t>& tokens) {
 
 }  // namespace
 
+TEST(BlockManagerPoolTest, RejectsPrefillWithoutStateAndAllowsRetry) {
+  BlockManagerPool::Options options;
+  options.num_blocks(16)
+      .block_size(16)
+      .enable_prefix_cache(false)
+      .enable_linear_state(true)
+      .linear_state_num_slots(2);
+  BlockManagerPool pool(options);
+  Sequence first = make_mtp_sequence(std::vector<int32_t>(16, 7));
+  Sequence second = make_mtp_sequence(std::vector<int32_t>(16, 8));
+
+  ASSERT_TRUE(pool.allocate(&first));
+  ASSERT_EQ(first.kv_state().num_blocks(BlockType::LINEAR), 1u);
+  const std::vector<size_t> free_blocks = pool.num_free_blocks();
+
+  ASSERT_FALSE(pool.allocate(&second));
+  EXPECT_FALSE(second.has_any_blocks());
+  EXPECT_EQ(pool.num_free_blocks(), free_blocks);
+  EXPECT_EQ(first.kv_state().num_blocks(BlockType::LINEAR), 1u);
+
+  first.reset();
+  ASSERT_TRUE(pool.allocate(&second));
+  ASSERT_EQ(second.kv_state().num_blocks(BlockType::LINEAR), 1u);
+  EXPECT_TRUE(second.kv_state().blocks(BlockType::LINEAR).front().is_valid());
+  second.reset();
+}
+
 TEST(SequenceMtpPrefixCacheTest, BoundaryRewriteInvalidatesEveryStride) {
   std::vector<int32_t> tokens(65, 7);
   Sequence sequence = make_mtp_sequence(tokens);

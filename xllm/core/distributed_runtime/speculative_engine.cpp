@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 #include "common/metrics.h"
 #include "core/framework/config/model_config.h"
@@ -214,6 +215,16 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
            draft_engine_->allocate_kv_cache(draft_kv_cache_cap);
   }
 
+  if (share_device_ && target_kv_cache_cap.kpool_tail_slot_size() > 0 &&
+      draft_kv_cache_cap.kpool_tail_slot_size() > 0) {
+    const SharedKPoolPlan plan =
+        plan_shared_kpool(std::move(target_kv_cache_cap),
+                          std::move(draft_kv_cache_cap),
+                          draft_engine_->model_args());
+    return engine_->allocate_kv_cache(plan.target) &&
+           draft_engine_->allocate_kv_cache(plan.draft);
+  }
+
   const int64_t kv_cache_size =
       std::min(target_kv_cache_cap.cache_size_in_bytes(),
                draft_kv_cache_cap.cache_size_in_bytes());
@@ -276,12 +287,6 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
 
   const int64_t block_size = target_kv_cache_cap.block_size();
   CHECK_GT(block_size, 0) << "kv cache block size must be greater than 0";
-
-  if (target_kv_cache_cap.kpool_tail_slot_size() > 0 &&
-      draft_kv_cache_cap.kpool_tail_slot_size() > 0) {
-    return estimate_shared_kpool_blocks(
-        target_kv_cache_cap, draft_kv_cache_cap, draft_engine_->model_args());
-  }
 
   const int64_t cache_size_in_bytes =
       std::min(target_kv_cache_cap.cache_size_in_bytes(),

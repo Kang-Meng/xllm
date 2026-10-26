@@ -1944,7 +1944,7 @@ TEST_P(LinearStateWindowTest, DecodeReceiverAllocationIsOwnedByLeaf) {
   }
 }
 
-TEST_P(LinearStateWindowTest, DecodeReceiverNeedsOnlyOneAvailableSlot) {
+TEST_P(LinearStateWindowTest, PrefillReceiverRejectsMissingStateAndRetries) {
   BlockManager::Options options;
   options.num_blocks(32)
       .block_size(2)
@@ -1968,9 +1968,11 @@ TEST_P(LinearStateWindowTest, DecodeReceiverNeedsOnlyOneAvailableSlot) {
   held_slots.pop_back();
   EXPECT_EQ(linear_leaf->num_free_blocks(), 1u);
   EXPECT_EQ(sequence.get_linear_state_slot_id(), -1);
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, 12));
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 6u);
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
   finish_input(sequence, 12);
   sequence.append_token(8);
-  // The freed slot becomes the live decode slot.
   EXPECT_TRUE(manager.allocate_sequence(&sequence, 13));
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_GE(sequence.get_linear_state_slot_id(), 0);

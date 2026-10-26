@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "core/layers/common/dsa_topk_share_plan.h"
@@ -912,23 +913,27 @@ void init_standard_counts(const ModelArgs& model_args,
 
 }  // namespace
 
-int64_t estimate_shared_kpool_blocks(const KVCacheCapacity& target_cap,
-                                     const KVCacheCapacity& draft_cap,
-                                     const ModelArgs& draft_args) {
+SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,
+                                  KVCacheCapacity draft_cap,
+                                  const ModelArgs& draft_args) {
   CHECK_EQ(target_cap.block_size(), draft_cap.block_size());
   CHECK_GT(target_cap.kpool_tail_slot_size(), 0);
   CHECK_GT(draft_cap.kpool_tail_slot_size(), 0);
   CHECK_EQ(draft_cap.num_linear_attention_layers(), 0);
-  // Draft request slots and the verify window are inherited from the target
-  // shape, rather than from the draft's standalone capacity estimate.
+  // Draft serves the target's requests and must retain the target's verify
+  // window, even when its standalone estimate needs fewer slots or tokens.
   const int64_t draft_tail_len =
       std::max<int64_t>(target_cap.kpool_tail_len(), draft_args.index_kpool());
-  const int64_t draft_state_bytes =
-      draft_cap.num_indexer_layers() * target_cap.num_linear_state_blocks() *
-      2 * static_cast<int64_t>(sizeof(uint16_t)) * draft_tail_len *
-      draft_args.index_head_dim();
-  const int64_t state_bytes =
-      target_cap.linear_cache_size_in_bytes() + draft_state_bytes;
+  const int64_t draft_slot_bytes = 2 * static_cast<int64_t>(sizeof(uint16_t)) *
+                                   draft_tail_len * draft_args.index_head_dim();
+  draft_cap.num_linear_state_blocks(target_cap.num_linear_state_blocks())
+      .kpool_tail_len(draft_tail_len)
+      .kpool_tail_slot_size(draft_slot_bytes)
+      .linear_cache_size_in_bytes(draft_cap.num_indexer_layers() *
+                                  target_cap.num_linear_state_blocks() *
+                                  draft_slot_bytes);
+  const int64_t state_bytes = target_cap.linear_cache_size_in_bytes() +
+                              draft_cap.linear_cache_size_in_bytes();
   const int64_t budget = std::min(target_cap.cache_size_in_bytes(),
                                   draft_cap.cache_size_in_bytes());
   CHECK_GT(budget, state_bytes)
@@ -938,7 +943,9 @@ int64_t estimate_shared_kpool_blocks(const KVCacheCapacity& target_cap,
       standard_full_cache_block_size_in_bytes(draft_cap);
   const int64_t n_blocks = (budget - state_bytes) / block_bytes;
   CHECK_GT(n_blocks, 0) << "no memory for a shared KPool block";
-  return n_blocks;
+  target_cap.n_blocks(n_blocks).cache_size_in_bytes(budget);
+  draft_cap.n_blocks(n_blocks).cache_size_in_bytes(budget);
+  return {std::move(target_cap), std::move(draft_cap)};
 }
 
 std::vector<bool> resolve_indexer_cache_enabled_layers(

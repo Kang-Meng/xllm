@@ -114,8 +114,8 @@ bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
   CHECK_EQ(compressed_unit_tokens % block_size, 0);
   const size_t blocks_per_unit =
       static_cast<size_t>(compressed_unit_tokens / block_size);
-  const size_t valid_per_unit =
-      static_cast<size_t>(options_.swa_blocks_per_seq());
+  const size_t valid_per_unit = std::min(
+      blocks_per_unit, static_cast<size_t>(options_.swa_blocks_per_seq()));
   const size_t placeholders_per_unit = blocks_per_unit - valid_per_unit;
   // Host admission ends on a compressed-unit boundary, and the prefetch target
   // does too, so the tail is a whole number of units.
