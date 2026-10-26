@@ -112,13 +112,13 @@ inline constexpr bool is_prefetch_gate_block_type(BlockType type) {
     case BlockType::KV:
     case BlockType::C4:
     case BlockType::C128:
+    case BlockType::C1:
+    case BlockType::C2:
       return true;
     case BlockType::SWA:
     case BlockType::EMBEDDING:
     case BlockType::LINEAR:
-    case BlockType::C1:
-    case BlockType::C2:
-      return false;  // PD prefetch deferred for the V4.1 TOKEN groups.
+      return false;
   }
   return false;
 }

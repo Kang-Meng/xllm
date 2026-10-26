@@ -37,6 +37,7 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_tensor_allocator.h"
 #include "framework/kv_cache/kv_cache_utils.h"
+#include "framework/kv_cache_transfer/scoped_environment_variable.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 #include "worker.pb.h"
@@ -1141,6 +1142,127 @@ TEST_F(HostKVCacheTest, HostKVCacheDeepSeekV4PerBlockType) {
             c128_physical_dim);
 }
 
+TEST_F(HostKVCacheTest, HostKVCacheV41UsesTokenSpansAndIndexScale) {
+  KVCacheCapacity capacity;
+  capacity.block_size(128).swa_count(10).c2_count(4).c1_count(8);
+  ModelArgs args;
+  args.model_type("deepseek_v41");
+  const KVCacheShape shape(capacity, args, /*world_size=*/1);
+  KVCacheCreateOptions options;
+  options.model_type("deepseek_v41")
+      .compress_ratios({0, 0, 2, 2, 1, 1})
+      .dtype(torch::kBFloat16)
+      .block_size(128)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(512)
+      .host_blocks_factor(3.0);
+  KVCache swa(shape, options, BlockType::SWA, /*layer_count=*/6);
+  EXPECT_EQ(swa.get_swa_cache().size(0), 24);
+  EXPECT_EQ(swa.get_swa_cache().size(1), 6);
+  EXPECT_FALSE(swa.get_compress_kv_state().defined());
+  // The engine clamps its window to max_model_len; Host tensors use the
+  // semantic model window. Extra rows are safe, but the pool must fit.
+  for (const int64_t effective_window : {128, 256, 512}) {
+    const int64_t host_blocks =
+        dsv4_host_swa_block_count(capacity.c2_count(),
+                                  options.host_blocks_factor(),
+                                  effective_window,
+                                  options.block_size(),
+                                  /*cache_unit_size=*/256);
+    EXPECT_LE(host_blocks, swa.get_swa_cache().size(0));
+    EXPECT_EQ(host_blocks, effective_window == 128 ? 12 : 24);
+  }
+  for (const BlockType type : {BlockType::C1, BlockType::C2}) {
+    KVCache cache(shape, options, type, /*layer_count=*/1);
+    const auto roles = cache.get_block_type_tensors(type);
+    ASSERT_EQ(roles.count(KVCacheTensorRole::KEY), 1u);
+    ASSERT_EQ(roles.count(KVCacheTensorRole::INDEX), 1u);
+    const int64_t count = type == BlockType::C1 ? 24 : 12;
+    auto expected_key = dsv4_block_shape(count, 128, 1, 16);
+    expected_key.insert(expected_key.begin() + 1, 1);
+    EXPECT_EQ(shape_vec(cache.get_k_cache()), expected_key);
+    EXPECT_EQ(cache.get_index_cache().scalar_type(),
+              get_dsv4_cache_policy(options.dtype()).index_dtype);
+    if (get_dsv4_cache_policy(options.dtype()).has_indexer_cache_scale) {
+      ASSERT_EQ(roles.count(KVCacheTensorRole::INDEX_SCALE), 1u);
+      EXPECT_EQ(shape_vec(roles.at(KVCacheTensorRole::INDEX_SCALE)),
+                (std::vector<int64_t>{count, 1, 128, 1}));
+      EXPECT_EQ(roles.at(KVCacheTensorRole::INDEX_SCALE).scalar_type(),
+                torch::kFloat16);
+    }
+    EXPECT_TRUE(cache.get_block_type_tensors(BlockType::C4).empty());
+    EXPECT_TRUE(cache
+                    .get_block_type_tensors(
+                        type == BlockType::C1 ? BlockType::C2 : BlockType::C1)
+                    .empty());
+  }
+}
+
+TEST_F(HostKVCacheConfigTest,
+       V41HostSwaCapacityClampedWindowFitsSemanticWindow) {
+  for (const int64_t checkpoint_span : {128, 256}) {
+    const int64_t tensor_rows = dsv4_host_swa_block_count(
+        /*checkpoint_block_count=*/4,
+        /*host_blocks_factor=*/3.0,
+        /*window_size=*/512,
+        /*block_size=*/128,
+        checkpoint_span);
+    for (const int64_t effective_window : {128, 256, 512}) {
+      const int64_t pool_blocks = dsv4_host_swa_block_count(
+          /*checkpoint_block_count=*/4,
+          /*host_blocks_factor=*/3.0,
+          effective_window,
+          /*block_size=*/128,
+          checkpoint_span);
+      EXPECT_LE(pool_blocks, tensor_rows);
+      EXPECT_EQ(pool_blocks,
+                checkpoint_span == 128 || effective_window == 128 ? 12 : 24);
+    }
+  }
+}
+
+TEST(KVCacheUtilsTest, DeepSeekV41CacheUnitUsesLargestCompressionRatio) {
+  const std::vector<int32_t> layer_ratios{0, 1, 3};
+  const std::vector<uint32_t> manager_ratios{0, 3, 1};
+  EXPECT_EQ(dsv41_cache_unit_tokens(
+                /*is_v41=*/false, /*block_size=*/128, layer_ratios),
+            0);
+  EXPECT_EQ(dsv41_cache_unit_tokens(
+                /*is_v41=*/true, /*block_size=*/128, layer_ratios),
+            384);
+  EXPECT_EQ(dsv41_cache_unit_tokens(
+                /*is_v41=*/true, /*block_size=*/128, manager_ratios),
+            384);
+  EXPECT_EQ(
+      dsv41_cache_unit_tokens(
+          /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0, 2, 1}),
+      256);
+  EXPECT_EQ(
+      dsv41_cache_unit_tokens(
+          /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0, 2}),
+      256);
+  EXPECT_EQ(
+      dsv41_cache_unit_tokens(
+          /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0, 1}),
+      128);
+  EXPECT_EQ(dsv41_cache_unit_tokens(
+                /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0}),
+            128);
+  EXPECT_EQ(dsv41_cache_unit_tokens(
+                /*is_v41=*/false, /*block_size=*/0, std::vector<int32_t>{}),
+            0);
+}
+
+TEST(KVCacheUtilsTest, DeepSeekV41CacheUnitRejectsMissingGeometry) {
+  EXPECT_DEATH(dsv41_cache_unit_tokens(
+                   /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{}),
+               "compress_ratios.empty");
+  EXPECT_DEATH(dsv41_cache_unit_tokens(
+                   /*is_v41=*/true, /*block_size=*/0, std::vector<int32_t>{1}),
+               "block_size");
+}
+
 TEST_F(HostKVCacheTest, DeepSeekV4HostSwaCapacityTracksCheckpointWindow) {
   constexpr int64_t kBlockSize = 128;
   constexpr int64_t kC128Blocks = 4;
@@ -1312,6 +1434,47 @@ TEST_F(HostKVCacheConfigTest, RejectsUnsupportedGroupedCacheLayout) {
   EXPECT_NE(error->find("grouped cache layout"), std::string::npos);
 }
 
+TEST_F(HostKVCacheConfigTest, V41GroupedHostCacheRequiresExperimentalOptIn) {
+  tests::ScopedEnvironmentVariable env(
+      "XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE");
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.has_grouped_cache_layout = true;
+  options.supports_grouped_cache_offload = true;
+  options.model_type = "deepseek_v41";
+  for (bool store_enabled : {false, true}) {
+    SCOPED_TRACE(store_enabled);
+    options.enable_kvcache_store = store_enabled;
+    ASSERT_EQ(unsetenv("XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE"), 0);
+    EXPECT_FALSE(v41_experimental_prefix_cache_enabled());
+    const std::optional<std::string> missing =
+        validate_host_cache_options(options);
+    ASSERT_TRUE(missing.has_value());
+    EXPECT_NE(missing->find(kV41ExperimentalPrefixCacheRequired),
+              std::string::npos);
+    for (const char* disabled : {"0", "false"}) {
+      ASSERT_TRUE(env.set(disabled));
+      EXPECT_FALSE(v41_experimental_prefix_cache_enabled());
+      EXPECT_TRUE(validate_host_cache_options(options).has_value());
+    }
+    for (const char* enabled : {"1", "true"}) {
+      ASSERT_TRUE(env.set(enabled));
+      EXPECT_TRUE(v41_experimental_prefix_cache_enabled());
+      EXPECT_FALSE(validate_host_cache_options(options).has_value());
+    }
+  }
+  ASSERT_EQ(unsetenv("XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE"), 0);
+  options.model_type = "deepseek_v4";
+  EXPECT_FALSE(validate_host_cache_options(options).has_value());
+  options.model_type = "deepseek_v41";
+  options.host_blocks_factor = 0.0;
+  EXPECT_FALSE(validate_host_cache_options(options).has_value());
+  options.host_blocks_factor = 1.0;
+  EXPECT_FALSE(validate_host_cache_options(options).has_value());
+}
+
 TEST_F(HostKVCacheConfigTest, AcceptsSupportedGroupedCacheLayout) {
   HostCacheValidationOptions options;
   options.host_blocks_factor = 2.0;
@@ -1323,6 +1486,48 @@ TEST_F(HostKVCacheConfigTest, AcceptsSupportedGroupedCacheLayout) {
   options.model_type = "deepseek_v4";
 
   EXPECT_FALSE(validate_host_cache_options(options).has_value());
+}
+
+TEST_F(HostKVCacheConfigTest, V41GroupedHostCacheRejectsDecodeRole) {
+  tests::ScopedEnvironmentVariable experimental(
+      "XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE");
+  ASSERT_TRUE(experimental.set("1"));
+  HostCacheValidationOptions options;
+  options.host_blocks_factor = 2.0;
+  options.device_block_count = 128;
+  options.supports_host_kv_offload = true;
+  options.has_grouped_cache_layout = true;
+  options.supports_grouped_cache_offload = true;
+  options.model_type = "deepseek_v41";
+  options.enable_disagg_pd = true;
+  for (bool store_enabled : {false, true}) {
+    SCOPED_TRACE(store_enabled);
+    options.enable_kvcache_store = store_enabled;
+    for (bool prefix_enabled : {false, true}) {
+      SCOPED_TRACE(prefix_enabled);
+      options.enable_prefix_cache = prefix_enabled;
+      options.instance_role = InstanceRole::DECODE;
+      const std::optional<std::string> error =
+          validate_host_cache_options(options);
+      ASSERT_TRUE(error.has_value());
+      EXPECT_NE(error->find("V4.1 grouped host offload/Store"),
+                std::string::npos);
+      EXPECT_NE(error->find("DECODE"), std::string::npos);
+    }
+    options.enable_prefix_cache = true;
+    for (const InstanceRole role :
+         {InstanceRole::DEFAULT, InstanceRole::PREFILL}) {
+      options.instance_role = role;
+      EXPECT_FALSE(validate_host_cache_options(options).has_value());
+    }
+    options.instance_role = InstanceRole::DECODE;
+    options.model_type = "deepseek_v4";
+    EXPECT_FALSE(validate_host_cache_options(options).has_value());
+    options.model_type = "deepseek_v41";
+    options.host_blocks_factor = 1.0;
+    EXPECT_FALSE(validate_host_cache_options(options).has_value());
+    options.host_blocks_factor = 2.0;
+  }
 }
 
 TEST_F(HostKVCacheConfigTest, RejectsFractalNzPoolWithTransferFolding) {

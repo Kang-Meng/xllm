@@ -831,6 +831,10 @@ struct ModelEmbeddingInput {
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
 
+  // V4.1 Engram history, newest token first per request. Host KV restore
+  // does not restore the Python-side compressed-token slot cache.
+  std::vector<int32_t> engram_lookback_token_ids;
+
   // chunked prefill case of speculative decoding
   // extra token ids for each sequence, and -1 for last chunk
   std::vector<int32_t> extra_token_ids;
@@ -856,6 +860,7 @@ struct ModelEmbeddingInput {
     out.linear_state_read_indices =
         safe_to(linear_state_read_indices, device, true);
     out.request_ids = request_ids;
+    out.engram_lookback_token_ids = engram_lookback_token_ids;
     out.extra_token_ids = extra_token_ids;
     out.engram_history = engram_history;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);

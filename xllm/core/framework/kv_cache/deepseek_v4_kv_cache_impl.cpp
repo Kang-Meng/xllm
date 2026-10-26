@@ -170,9 +170,13 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
     const KVCacheShape& kv_cache_shape,
     const KVCacheCreateOptions& create_options,
     BlockType type,
-    int64_t layer_count) {
+    int64_t layer_count)
+    : compressed_block_type_(type) {
+  // HierarchyKVCacheTransfer creates one Host cache per BlockType; C1/C2
+  // use separate instances, so this identity must not match another group.
   CHECK(kv_cache_shape.has_key_cache_shape())
       << "DeepSeek V4 host kv cache shape must contain pool counts.";
+  // Shape contract: V4 [SWA, C4, C128]; V4.1 [SWA, C2, C1].
   const std::vector<int64_t>& pool_counts = kv_cache_shape.key_cache_shape();
   CHECK_GE(pool_counts.size(), 3) << "DeepSeek V4 host kv cache shape must be "
                                   << "[swa_count, c4_count, c128_count].";
@@ -183,6 +187,8 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
   CHECK_GT(layer_count, 0)
       << "DeepSeek V4 host prefix cache layer count must be positive.";
 
+  const bool is_v41 =
+      util::is_deepseek_v41_model_type(create_options.model_type());
   const double factor = create_options.host_blocks_factor();
   const int64_t block_size = create_options.block_size();
   const int64_t head_dim = create_options.head_dim();
@@ -190,7 +196,11 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
       std::max<int64_t>(create_options.index_head_dim(), 1);
   const Dsv4CacheGeometry& geometry =
       KVCacheConfig::get_instance().dsv4_cache_geometry();
-  const int64_t c4_physical_dim = geometry.c4_physical_dim();
+  // V4.1 C1/C2 each store block_size entries. C2 covers twice as many
+  // source tokens, not a larger physical tensor. Both reuse the C4 branch
+  // below; V4 keeps its geometry-defined physical dimension.
+  const int64_t indexed_physical_dim =
+      is_v41 ? block_size : geometry.c4_physical_dim();
   const int64_t c128_physical_dim = geometry.c128_physical_dim();
   const int64_t n_heads = 1;
   const int64_t index_n_heads = 1;
@@ -219,15 +229,22 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
       // Host restore resumes at a C128 boundary, so every stored C128 unit
       // needs exactly one corresponding persistent SWA window. MTP drafts
       // without compressed layers still offload their standalone SWA cache.
+      // V4.1 checkpoints use the largest registered TOKEN span (C2/C1).
       const int64_t swa_source_count =
-          pool_counts[2] > 0 ? pool_counts[2] : pool_counts[0];
-      const int64_t host_swa_count =
-          pool_counts[2] > 0
-              ? dsv4_host_swa_block_count(swa_source_count,
-                                          factor,
-                                          create_options.window_size(),
-                                          block_size)
-              : scale_host_block_count(swa_source_count, factor);
+          is_v41 && pool_counts[1] > 0 ? pool_counts[1] : pool_counts[2];
+      int64_t host_swa_count = create_options.host_swa_block_count();
+      if (host_swa_count <= 0) {
+        host_swa_count =
+            swa_source_count > 0
+                ? dsv4_host_swa_block_count(
+                      swa_source_count,
+                      factor,
+                      create_options.window_size(),
+                      block_size,
+                      dsv41_cache_unit_tokens(
+                          is_v41, block_size, create_options.compress_ratios()))
+                : scale_host_block_count(pool_counts[0], factor);
+      }
       host_page_aligned_regions_.reserve(1);
       create_host_tensor(
           host_group_shape(host_swa_count, block_size, n_heads, head_dim),
@@ -236,25 +253,30 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
           nullptr);
       break;
     }
+    case BlockType::C1:
+    case BlockType::C2:
     case BlockType::C4: {
-      const int64_t host_c4_count =
-          scale_host_block_count(pool_counts[1], factor);
+      const int64_t host_indexed_count = scale_host_block_count(
+          pool_counts[type == BlockType::C1 ? 2 : 1], factor);
       host_page_aligned_regions_.reserve(3);
       create_host_tensor(
-          host_group_shape(host_c4_count, c4_physical_dim, n_heads, head_dim),
+          host_group_shape(
+              host_indexed_count, indexed_physical_dim, n_heads, head_dim),
           create_options.dtype(),
           &key_cache_,
           nullptr);
-      create_host_tensor(
-          host_group_shape(
-              host_c4_count, c4_physical_dim, index_n_heads, index_head_dim),
-          cache_policy.index_dtype,
-          &index_cache_,
-          nullptr);
-      // C4 indexer values are int8; the fp16 per-token scale must travel with
-      // them for correct dequantization on H2D restore.
+      create_host_tensor(host_group_shape(host_indexed_count,
+                                          indexed_physical_dim,
+                                          index_n_heads,
+                                          index_head_dim),
+                         cache_policy.index_dtype,
+                         &index_cache_,
+                         nullptr);
+      // Quantized index values and their per-token scale must travel together
+      // for correct dequantization on H2D restore.
       if (cache_policy.has_indexer_cache_scale) {
-        std::vector<int64_t> scale_shape = {host_c4_count, c4_physical_dim, 1};
+        std::vector<int64_t> scale_shape = {
+            host_indexed_count, indexed_physical_dim, 1};
         scale_shape.insert(scale_shape.begin() + 1, layer_count);
         create_host_tensor(scale_shape,
                            cache_policy.scale_dtype,
@@ -275,15 +297,6 @@ DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
           nullptr);
       break;
     }
-    case BlockType::C1:
-    case BlockType::C2:
-      // TODO(V4.1): host prefix-cache offload for the V4.1 TOKEN groups is
-      // deferred; the V4.1 milestone runs with prefix cache and host offload
-      // disabled, and validate_host_cache_options() already rejects the
-      // combination. Fail loudly if a future caller reaches this path.
-      LOG(FATAL) << "DeepSeek V4.1 host prefix cache offload for block type "
-                 << static_cast<int32_t>(type) << " is not implemented yet";
-      break;
     default:
       LOG(FATAL) << "Unsupported DeepSeek V4 host block type: "
                  << static_cast<int32_t>(type);
@@ -381,9 +394,12 @@ BlockTypeTensorMap DeepSeekV4KVCacheImpl::get_block_type_tensors(
         tensor_map.emplace(KVCacheTensorRole::SWA, swa_cache_);
       }
       break;
+    case BlockType::C1:
+    case BlockType::C2:
     case BlockType::C4:
-      if (key_cache_.defined() && key_cache_.numel() > 0 &&
-          index_cache_.defined() && index_cache_.numel() > 0) {
+      if (type == compressed_block_type_ && key_cache_.defined() &&
+          key_cache_.numel() > 0 && index_cache_.defined() &&
+          index_cache_.numel() > 0) {
         tensor_map.emplace(KVCacheTensorRole::KEY, key_cache_);
         tensor_map.emplace(KVCacheTensorRole::INDEX, index_cache_);
         if (indexer_cache_scale_.defined() &&
@@ -394,25 +410,10 @@ BlockTypeTensorMap DeepSeekV4KVCacheImpl::get_block_type_tensors(
       }
       break;
     case BlockType::C128:
-      if (key_cache_.defined() && key_cache_.numel() > 0 &&
+      if (type == compressed_block_type_ && key_cache_.defined() &&
+          key_cache_.numel() > 0 &&
           (!index_cache_.defined() || index_cache_.numel() == 0)) {
         tensor_map.emplace(KVCacheTensorRole::KEY, key_cache_);
-      }
-      break;
-    case BlockType::C1:
-    case BlockType::C2:
-      // V4.1 TOKEN groups: key + index, plus the optional per-token index
-      // scale (allocated on NPU, absent on MLU). Only reached by PD /
-      // kvcache-store transfer paths today.
-      if (key_cache_.defined() && key_cache_.numel() > 0 &&
-          index_cache_.defined() && index_cache_.numel() > 0) {
-        tensor_map.emplace(KVCacheTensorRole::KEY, key_cache_);
-        tensor_map.emplace(KVCacheTensorRole::INDEX, index_cache_);
-        if (indexer_cache_scale_.defined() &&
-            indexer_cache_scale_.numel() > 0) {
-          tensor_map.emplace(KVCacheTensorRole::INDEX_SCALE,
-                             indexer_cache_scale_);
-        }
       }
       break;
     default:
@@ -467,8 +468,6 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
       << "DeepSeek V4 window_size must be positive.";
 
   const int64_t swa_count = pool_counts[0];
-  const int64_t c4_count = pool_counts[1];
-  const int64_t c128_count = pool_counts[2];
   const int64_t block_size = create_options.block_size();
   const int64_t head_dim = create_options.head_dim();
   const int64_t index_head_dim =
@@ -601,6 +600,9 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
     }
     return tensors;
   }
+
+  const int64_t c4_count = pool_counts[1];
+  const int64_t c128_count = pool_counts[2];
 
   DeepSeekV4KVCacheTensors tensors;
   if (compress_ratio == 1) {

@@ -63,6 +63,7 @@ class PyAttentionMetadataView final {
                           int32_t dummy_token_count = 1);
 
   const torch::Tensor& slot_mapping() const;
+  pybind11::object engram_lookback_token_ids() const;
   pybind11::object local_slot_mapping() const;
   // Tokens covered by one block-table column: block_size * kv_split_size.
   // With kv_split a block-table column is a logical block, so Python-side
@@ -151,6 +152,7 @@ class PyAttentionMetadataView final {
   torch::Tensor linear_state_indices_;
   torch::Tensor linear_state_read_indices_;
   torch::Tensor num_accepted_tokens_;
+  torch::Tensor engram_lookback_token_ids_;
   std::vector<int32_t> dp_execution_token_counts_;
   std::vector<int32_t> raw_dp_execution_token_counts_;
   std::vector<int32_t> dp_global_kv_max_seq_lens_;

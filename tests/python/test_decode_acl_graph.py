@@ -2216,3 +2216,88 @@ def test_v41_compressor_admits_capacity_wide_graph_swa_table() -> None:
     assert reason == "swa ring blocks per sequence 2 != 1"
     _, reason = _v41_compressor_swa_gate(dsa, -1, 0, 1)
     assert reason == "no swa block table"
+
+
+def test_v41_engram_lookback_refreshes_graph_buffer_without_changing_address() -> None:
+    runner = _runner()
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.engram_lookback_token_ids = torch.tensor([[4, 3], [8, 7], [12, 11], [16, 15]], dtype=torch.int32)
+    input_ids = torch.arange(4, dtype=torch.int32)
+    entry = runner._allocate_entry(8, input_ids, input_ids, metadata)
+    history = entry.static_metadata.engram_lookback_token_ids
+    assert history is not None
+    address = history.data_ptr()
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+        torch.testing.assert_close(history[:4], metadata.engram_lookback_token_ids)
+        assert torch.all(history[4:] == -1)
+        metadata.engram_lookback_token_ids = torch.full((4, 2), 42, dtype=torch.int32)
+        runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+        assert torch.all(history[:4] == 42)
+        assert torch.all(history[4:] == -1)
+    assert history.data_ptr() == address
+
+
+@pytest.mark.parametrize("rows", [8, 9])
+def test_v41_engram_graph_replay_checks_history_batch_capacity(rows: int) -> None:
+    runner = _runner()
+    runner.model.cfg = SimpleNamespace(engram_layer_ids=[1], engram_max_ngram_size=3)
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    input_ids = torch.arange(4, dtype=torch.int32)
+    entry = runner._allocate_entry(8, input_ids, input_ids, metadata)
+    metadata.engram_lookback_token_ids = torch.full((rows, 2), 42, dtype=torch.int32)
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        if rows > 8:
+            with pytest.raises(ValueError, match="Engram lookback batch exceeds the captured graph batch"):
+                runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+        else:
+            runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+            torch.testing.assert_close(entry.static_metadata.engram_lookback_token_ids, metadata.engram_lookback_token_ids)
+
+
+@pytest.mark.parametrize("engram_enabled", [False, True])
+def test_v41_engram_graph_warmup_without_history_allocates_only_when_enabled(engram_enabled: bool) -> None:
+    runner = _runner()
+    runner.model.cfg = SimpleNamespace(engram_layer_ids=[1] if engram_enabled else [], engram_max_ngram_size=3)
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    input_ids = torch.arange(4, dtype=torch.int32)
+    entry = runner._allocate_entry(8, input_ids, input_ids, metadata)
+    history = entry.static_metadata.engram_lookback_token_ids
+    if not engram_enabled:
+        assert history is None
+        return
+    assert history is not None and history.shape == (8, 2)
+    address = history.data_ptr()
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+        assert torch.all(history == -1)
+        metadata.engram_lookback_token_ids = torch.full((4, 2), 42, dtype=torch.int32)
+        runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+        assert torch.all(history[:4] == 42) and torch.all(history[4:] == -1)
+    assert history.data_ptr() == address
+
+
+@pytest.mark.parametrize("shape", [(4,), (4, 1), (4, 3)])
+def test_v41_engram_graph_allocation_rejects_invalid_history_shape(shape: tuple[int, ...]) -> None:
+    runner = _runner()
+    runner.model.cfg = SimpleNamespace(engram_layer_ids=[1], engram_max_ngram_size=3)
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.engram_lookback_token_ids = torch.zeros(shape, dtype=torch.int32)
+    input_ids = torch.arange(4, dtype=torch.int32)
+    with pytest.raises(ValueError, match="Engram lookback"):
+        runner._allocate_entry(8, input_ids, input_ids, metadata)
+
+
+@pytest.mark.parametrize("shape", [(4,), (4, 1), (4, 3)])
+def test_v41_engram_graph_replay_rejects_invalid_history_shape(shape: tuple[int, ...]) -> None:
+    runner = _runner()
+    runner.model.cfg = SimpleNamespace(engram_layer_ids=[1], engram_max_ngram_size=3)
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    input_ids = torch.arange(4, dtype=torch.int32)
+    entry = runner._allocate_entry(8, input_ids, input_ids, metadata)
+    metadata.engram_lookback_token_ids = torch.zeros(shape, dtype=torch.int32)
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True),
+        pytest.raises(ValueError, match="Engram lookback depth"),
+    ):
+        runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)

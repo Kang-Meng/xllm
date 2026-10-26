@@ -84,6 +84,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context_or_none,
     in_acl_graph,
     record_layer_event,
+    wait_for_layer_load,
 )
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
@@ -2513,6 +2514,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        wait_for_layer_load(self.layer_id)
         if pre_mix is None:
             pre_mix = DeepseekV41HyperConnection.make_identity_pre_mix(hidden, self.hc.hc_mult)
         # Engram injection happens between the previous sublayer's post and
@@ -2782,7 +2784,7 @@ class DeepseekV41Model(nn.Module):
             positions,
             q_cu,
             dead,
-            None,
+            getattr(metadata, "engram_lookback_token_ids", None),
             swa_group.slot_mapping,
             swa_group.block_table,
             swa_group.block_size,

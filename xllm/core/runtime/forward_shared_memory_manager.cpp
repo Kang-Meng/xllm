@@ -115,7 +115,8 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // misparsing the tail of every TransferKVInfo.
 // v3: embedding.engram_history follows extra_token_ids and precedes the
 // root and embedding mtp_shifted_token_ids tensors.
-constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000003ULL;
+// v4: V4.1 request lookback ids precede extra_token_ids and engram_history.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000004ULL;
 
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
@@ -2628,6 +2629,7 @@ inline void deserialize_forward_input_payload(
     }
   }
   read_string_vector(context, input_params.embedding.request_ids);
+  read_vector(context, input_params.embedding.engram_lookback_token_ids);
   read_vector(context, input_params.embedding.extra_token_ids);
   read_vector(context, input_params.embedding.engram_history);
   // Keep upstream's root mtp_shifted_token_ids serialization (consumed by
@@ -3123,6 +3125,8 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor,
                input_params.embedding.linear_state_read_ids);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
+  write_vector(context.descriptor,
+               input_params.embedding.engram_lookback_token_ids);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);
   write_vector(context.descriptor, input_params.embedding.engram_history);
   // Mirror the read_* layout: write root + embedding mtp paths so the

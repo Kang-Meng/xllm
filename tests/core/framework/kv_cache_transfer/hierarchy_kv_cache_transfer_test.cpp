@@ -17,8 +17,13 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "core/framework/config/scheduler_config.h"
@@ -30,6 +35,275 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+class V41HierarchyTransferTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP()
+        << "A healthy accelerator is required for hierarchy KV transfer";
+  }
+  const char* master = std::getenv("XLLM_TEST_STORE_MASTER");
+  if (GetParam() && master == nullptr) {
+    GTEST_SKIP()
+        << "Set XLLM_TEST_STORE_MASTER to a Mooncake master with an active "
+           "TCP storage node; host-only coverage is the /0 case";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  KVCacheCapacity capacity;
+  capacity.block_size(128).swa_count(4).c2_count(4).c1_count(8);
+  ModelArgs args;
+  args.model_type("deepseek_v41");
+  const KVCacheShape shape(capacity, args, /*world_size=*/1);
+  KVCacheCreateOptions options;
+  options.device(device.unwrap())
+      .dtype(torch::kBFloat16)
+      .num_layers(6)
+      .model_type("deepseek_v41")
+      .block_size(128)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(128)
+      .compress_ratios({0, 0, 2, 2, 1, 1})
+      .kv_source_layer_ids({2, 4});
+  std::vector<KVCache> caches;
+  allocate_kv_caches(caches, shape, options);
+  HierarchyKVCacheTransfer::Options transfer_options;
+  transfer_options.layers(6)
+      .tp_rank(0)
+      .tp_size(1)
+      .host_blocks_factor(2.0)
+      .layers_wise_copy_batchs(2);
+  if (GetParam()) {
+    transfer_options.enable_kvcache_store(true)
+        .store_protocol("tcp")
+        .store_master_server_address(master)
+        .store_metadata_server("P2PHANDSHAKE")
+        .store_namespace(
+            "v41-hierarchy-" +
+            std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+  }
+  std::unique_ptr<Stream> compute_stream = device.current_stream();
+  HierarchyKVCacheTransfer transfer(transfer_options,
+                                    device.unwrap(),
+                                    compute_stream.get(),
+                                    &caches,
+                                    shape,
+                                    options);
+  ASSERT_TRUE(transfer.supports_block_type(BlockType::C1));
+  ASSERT_TRUE(transfer.supports_block_type(BlockType::C2));
+  EXPECT_FALSE(transfer.supports_block_type(BlockType::C4));
+  for (const BlockType type : {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+    for (KVCache& cache : caches) {
+      for (const auto& [role, tensor] : cache.get_block_type_tensors(type)) {
+        tensor[1].fill_(static_cast<int32_t>(role) + 1);
+        tensor[2].zero_();
+      }
+    }
+    ASSERT_EQ(device.synchronize_default_stream(), 0);
+    std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN> hash{};
+    hash.fill(static_cast<uint8_t>(type));
+    BlockTransferInfo offload(
+        /*src_id=*/1, /*dst_id=*/0, hash.data(), TransferType::D2H2G, type);
+    ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/81, {offload}), 1u);
+    if (GetParam()) {
+      std::vector<BlockTransferInfo> infos;
+      infos.emplace_back(-1, 1, hash.data(), TransferType::G2H, type);
+      Slice<BlockTransferInfo> slice(infos);
+      // Read into a different Host block; H2D cannot reuse the D2H buffer.
+      EXPECT_EQ(transfer.prefetch_kv_blocks(slice, /*stats=*/nullptr),
+                (std::vector<uint8_t>{1}));
+    }
+    BlockTransferInfo load(/*src_id=*/GetParam() ? 1 : 0,
+                           /*dst_id=*/2,
+                           hash.data(),
+                           TransferType::H2D,
+                           type);
+    ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/81, {load}), 1u);
+    ModelInputParams params;
+    params.meta.batch_id = 81;
+    params.meta.requires_host_restore = true;
+    transfer.set_layer_synchronizer(params);
+    for (int32_t layer = 0; layer < 6; ++layer) {
+      ASSERT_TRUE(params.synchronize_layer(layer));
+    }
+    for (KVCache& cache : caches) {
+      for (const auto& [role, tensor] : cache.get_block_type_tensors(type)) {
+        EXPECT_TRUE(torch::equal(tensor[1], tensor[2]))
+            << static_cast<int32_t>(role);
+      }
+    }
+  }
+}
+
+TEST_P(V41HierarchyTransferTest,
+       DSparkRestoresTargetAndDraftFromOneCheckpoint) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An accelerator is required for hierarchy KV transfer";
+  }
+  const char* master = std::getenv("XLLM_TEST_STORE_MASTER");
+  if (GetParam() && master == nullptr) {
+    GTEST_SKIP()
+        << "Set XLLM_TEST_STORE_MASTER to an active TCP Mooncake Store";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  std::unique_ptr<Stream> compute_stream = device.current_stream();
+  for (const int64_t window : {128, 512}) {
+    for (const bool has_c1 : {false, true}) {
+      SCOPED_TRACE(window);
+      SCOPED_TRACE(has_c1);
+      KVCacheCapacity capacity;
+      capacity.block_size(128).swa_count(4).c2_count(4).c1_count(has_c1 ? 8
+                                                                        : 0);
+      ModelArgs args;
+      args.model_type("deepseek_v41");
+      const KVCacheShape shape(capacity, args, /*world_size=*/1);
+      KVCacheCreateOptions target_options;
+      target_options.device(device.unwrap())
+          .dtype(torch::kBFloat16)
+          .num_layers(6)
+          .model_type("deepseek_v41")
+          .block_size(128)
+          .head_dim(16)
+          .index_head_dim(8)
+          .window_size(window)
+          .compress_ratios(has_c1 ? std::vector<int32_t>{0, 0, 2, 2, 1, 1}
+                                  : std::vector<int32_t>{0, 0, 2, 2, 0, 0})
+          .kv_source_layer_ids(has_c1 ? std::vector<int32_t>{2, 4}
+                                      : std::vector<int32_t>{2});
+      KVCacheCreateOptions draft_options = target_options;
+      draft_options.model_type("deepseek_v41_dspark")
+          .num_layers(3)
+          .compress_ratios({0, 0, 0})
+          .kv_source_layer_ids({});
+      std::vector<KVCache> target_caches;
+      std::vector<KVCache> draft_caches;
+      allocate_kv_caches(target_caches, shape, target_options);
+      allocate_kv_caches(draft_caches, shape, draft_options);
+      HierarchyKVCacheTransfer::Options transfer_options;
+      transfer_options.layers(6)
+          .tp_rank(0)
+          .tp_size(1)
+          .host_blocks_factor(2.0)
+          .layers_wise_copy_batchs(2);
+      if (GetParam()) {
+        transfer_options.enable_kvcache_store(true)
+            .store_protocol("tcp")
+            .store_master_server_address(master)
+            .store_metadata_server("P2PHANDSHAKE")
+            .store_namespace("v41-dspark-" +
+                             std::to_string(std::chrono::steady_clock::now()
+                                                .time_since_epoch()
+                                                .count()));
+      }
+      auto make_transfer = [&](const std::string& draft_component) {
+        auto transfer = std::make_unique<HierarchyKVCacheTransfer>(
+            transfer_options, device.unwrap());
+        HierarchyKVCacheTransfer::CacheRegistration registration;
+        registration.role = HierarchyKVCacheTransfer::CacheRole::DRAFT;
+        registration.device_kv_caches = &draft_caches;
+        registration.kv_cache_shape = shape;
+        registration.create_options = draft_options;
+        registration.producer_stream = compute_stream.get();
+        registration.store_key_component = draft_component;
+        transfer->register_cache(registration);
+        registration.role = HierarchyKVCacheTransfer::CacheRole::TARGET;
+        registration.device_kv_caches = &target_caches;
+        registration.create_options = target_options;
+        registration.store_key_component = "main";
+        transfer->register_cache(registration);
+        CHECK(transfer->finalize_registration());
+        return transfer;
+      };
+      auto transfer = make_transfer("spec_draft::dspark::v41-test");
+      EXPECT_TRUE(transfer->supports_block_type(
+          HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::SWA));
+      EXPECT_FALSE(transfer->supports_block_type(
+          HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::C2));
+      EXPECT_FALSE(transfer->supports_block_type(
+          HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::C1));
+      std::vector<BlockType> block_types = {BlockType::SWA, BlockType::C2};
+      if (has_c1) {
+        block_types.emplace_back(BlockType::C1);
+      }
+      std::vector<BlockTransferInfo> offloads;
+      std::vector<BlockTransferInfo> gets;
+      std::vector<BlockTransferInfo> loads;
+      for (const BlockType type : block_types) {
+        for (size_t layer = 0; layer < target_caches.size(); ++layer) {
+          for (const auto& [role, tensor] :
+               target_caches[layer].get_block_type_tensors(type)) {
+            tensor[1].fill_(static_cast<int32_t>(role) + layer + 1);
+            tensor[2].zero_();
+          }
+        }
+        for (size_t layer = 0; layer < draft_caches.size(); ++layer) {
+          for (const auto& [role, tensor] :
+               draft_caches[layer].get_block_type_tensors(type)) {
+            tensor[1].fill_(static_cast<int32_t>(role) + layer + 31);
+            tensor[2].zero_();
+          }
+        }
+        std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN> hash{};
+        hash.fill(static_cast<uint8_t>(type));
+        const int64_t host_row =
+            type == BlockType::SWA ? 8 * std::min<int64_t>(window / 128, 2) - 1
+                                   : 7;
+        offloads.emplace_back(
+            1, host_row, hash.data(), TransferType::D2H2G, type);
+        gets.emplace_back(-1, 0, hash.data(), TransferType::G2H, type);
+        loads.emplace_back(
+            GetParam() ? 0 : host_row, 2, hash.data(), TransferType::H2D, type);
+      }
+      ASSERT_EQ(device.synchronize_default_stream(), 0);
+      ASSERT_EQ(transfer->transfer_kv_blocks(91, offloads), block_types.size());
+      if (GetParam()) {
+        transfer.reset();
+        transfer = make_transfer("spec_draft::dspark::different-weights");
+        Slice<BlockTransferInfo> missing_draft(gets);
+        std::vector<uint8_t> expected(block_types.size(), 1);
+        expected[0] = 0;
+        EXPECT_EQ(transfer->prefetch_kv_blocks(missing_draft, nullptr),
+                  expected);
+        transfer.reset();
+        transfer = make_transfer("spec_draft::dspark::v41-test");
+        Slice<BlockTransferInfo> slice(gets);
+        ASSERT_EQ(transfer->prefetch_kv_blocks(slice, nullptr),
+                  std::vector<uint8_t>(block_types.size(), 1));
+      }
+      ASSERT_EQ(transfer->transfer_kv_blocks(92, loads), block_types.size());
+      ModelInputParams params;
+      params.meta.batch_id = 92;
+      params.meta.requires_host_restore = true;
+      transfer->set_layer_synchronizer(params);
+      for (int32_t layer = 0; layer < 6; ++layer) {
+        ASSERT_TRUE(params.synchronize_layer(layer));
+      }
+      ASSERT_TRUE(params.synchronize_draft_layer());
+      for (const BlockType type : block_types) {
+        for (const auto* caches : {&target_caches, &draft_caches}) {
+          for (const KVCache& cache : *caches) {
+            for (const auto& [role, tensor] :
+                 cache.get_block_type_tensors(type)) {
+              EXPECT_TRUE(torch::equal(tensor[1], tensor[2]))
+                  << static_cast<int32_t>(type) << ":"
+                  << static_cast<int32_t>(role);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Transport,
+                         V41HierarchyTransferTest,
+                         ::testing::Bool());
 
 TEST(HierarchyKVCacheTransferTest,
      RoundTripPublishesStrategyLayerReadyGranularity) {

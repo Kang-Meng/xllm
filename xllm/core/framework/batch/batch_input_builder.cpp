@@ -251,6 +251,12 @@ BatchInputBuilder::BatchInputBuilder(
   state_.mtp_bootstrap_row_idxes.reserve(sequences.size());
   if (args_ != nullptr) {
     use_mrope_ = (args_->rope_scaling_rope_type() == "mrope");
+    if (util::is_deepseek_v41_model_type(args_->model_type()) &&
+        !args_->engram_layer_ids().empty()) {
+      const size_t depth =
+          static_cast<size_t>(std::max(args_->engram_max_ngram_size() - 1, 0));
+      state_.engram_lookback_token_ids.reserve(sequences.size() * depth);
+    }
   }
   write_block_ids_.clear();
   state_.batch_forward_type = batch_forward_type;
@@ -492,6 +498,10 @@ void BatchInputBuilder::process_sequences_multithreaded() {
       const size_t depth =
           static_cast<size_t>(std::max(args_->engram_max_ngram_size() - 1, 0));
       max_engram_history_per_sequence = 2 * depth;
+      if (util::is_deepseek_v41_model_type(args_->model_type())) {
+        thread_state.engram_lookback_token_ids.reserve(sequences_per_thread *
+                                                       depth);
+      }
     }
     thread_state.engram_history.reserve(sequences_per_thread *
                                         max_engram_history_per_sequence);
@@ -545,12 +555,14 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   size_t total_slots = 0;
   size_t total_paged_indices = 0;
   size_t total_engram_history = 0;
+  size_t total_engram_lookback = 0;
   for (const auto& state : thread_builder_states) {
     total_tokens += state.flatten_tokens_vec.size();
     total_seqs += state.block_tables_vec.size();
     total_slots += state.new_token_slot_ids.size();
     total_paged_indices += state.paged_kv_indices.size();
     total_engram_history += state.engram_history.size();
+    total_engram_lookback += state.engram_lookback_token_ids.size();
   }
   state_.flatten_tokens_vec.reserve(total_tokens);
   if (!use_mrope_) {
@@ -574,6 +586,7 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   state_.request_ids.reserve(total_seqs);
   state_.extra_token_ids.reserve(total_seqs);
   state_.engram_history.reserve(total_engram_history);
+  state_.engram_lookback_token_ids.reserve(total_engram_lookback);
   state_.paged_kv_indices.reserve(total_paged_indices);
   state_.paged_kv_indptr.reserve(total_seqs + 1);
   state_.paged_kv_last_page_len.reserve(total_seqs);
@@ -643,6 +656,10 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.num_computed_tokens.insert(state_.num_computed_tokens.end(),
                                       state.num_computed_tokens.begin(),
                                       state.num_computed_tokens.end());
+    state_.engram_lookback_token_ids.insert(
+        state_.engram_lookback_token_ids.end(),
+        state.engram_lookback_token_ids.begin(),
+        state.engram_lookback_token_ids.end());
     state_.is_prefilling.insert(state_.is_prefilling.end(),
                                 state.is_prefilling.begin(),
                                 state.is_prefilling.end());
@@ -783,6 +800,18 @@ void BatchInputBuilder::process_single_sequence(
   state.num_scheduled_tokens.emplace_back(static_cast<int32_t>(q_seq_len));
   state.num_computed_tokens.emplace_back(
       static_cast<int32_t>(n_kv_cache_tokens));
+  if (args_ != nullptr &&
+      util::is_deepseek_v41_model_type(args_->model_type()) &&
+      !args_->engram_layer_ids().empty()) {
+    CHECK_LE(n_kv_cache_tokens, n_tokens);
+    const int32_t depth = std::max(args_->engram_max_ngram_size() - 1, 0);
+    for (int32_t shift = 1; shift <= depth; ++shift) {
+      state.engram_lookback_token_ids.emplace_back(
+          n_kv_cache_tokens >= static_cast<uint32_t>(shift)
+              ? token_ids[n_kv_cache_tokens - shift]
+              : -1);
+    }
+  }
   state.is_prefilling.emplace_back(
       static_cast<uint8_t>(sequence->is_prefill_stage()));
   state.kv_cache_tokens_nums.emplace_back(n_kv_cache_tokens);
@@ -1241,6 +1270,8 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
       input_params.execution_batch.query_start_loc.back();
   input_params.execution_batch.num_computed_tokens =
       std::move(state_.num_computed_tokens);
+  input_params.embedding.engram_lookback_token_ids =
+      std::move(state_.engram_lookback_token_ids);
   CHECK_EQ(input_params.execution_batch.num_computed_tokens.size(),
            static_cast<size_t>(num_reqs));
   input_params.execution_batch.is_prefilling = std::move(state_.is_prefilling);

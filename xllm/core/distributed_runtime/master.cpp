@@ -608,17 +608,12 @@ Master::Master(const Options& options, EngineType type)
        options_.num_speculative_tokens() > 0)) {
     model_type = util::get_model_type(model_path, options_.backend());
   }
-  // V4.1 does not support KV cache Store (the grouped-KV C1/C2 restore is not
-  // implemented). Disaggregated PD is supported through Mooncake. Speculative
-  // decoding is implemented only for the python-path DSpark draft; every
-  // other V4.1 speculative setup is rejected before any engine/worker is
-  // built. Prefix-cache support is a property of the cache groups and is
-  // resolved in the block layer (leaf_participates_in_prefix_cache), not
-  // here.
+  // V4.1 speculative decoding is implemented
+  // only for the python-path DSpark draft; every other V4.1 speculative setup
+  // is rejected before any engine/worker is built. Prefix-cache support is a
+  // property of the cache groups and is resolved in the block layer
+  // (leaf_participates_in_prefix_cache), not here.
   if (util::is_deepseek_v41_model_type(model_type)) {
-    CHECK(!options_.enable_kvcache_store())
-        << "DeepSeek-V4.1 does not support KV cache Store: restore for the "
-           "grouped KV (C1/C2) is not implemented.";
     const bool v41_speculative_requested =
         options_.num_speculative_tokens() > 0 ||
         !options_.draft_model_path().value_or("").empty();

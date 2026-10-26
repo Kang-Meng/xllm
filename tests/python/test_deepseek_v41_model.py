@@ -3760,3 +3760,27 @@ def test_v41_compressor_swa_table_column0_matches_across_widths() -> None:
     # Layer 1's SWA read table is cache entry 2 (key, index, swa, kv_state, ...).
     assert eager.block_tables[1][2][:, 0].tolist() == [7, 9]
     assert graph.block_tables[1][2][:, 0].tolist() == [7, 9]
+
+
+def test_v41_decoder_waits_for_host_load_before_any_layer_compute() -> None:
+    layer = DeepseekV41DecoderLayer.__new__(DeepseekV41DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.layer_id = 3
+    waited: list[int] = []
+
+    def synchronize(layer_id: int) -> None:
+        waited.append(layer_id)
+        raise RuntimeError("host restore failed")
+
+    context = ForwardContext(
+        attention_backend=None,
+        device=torch.device("cpu"),
+        metadata=None,
+        layer_caches=[],
+        layer_load_context=SimpleNamespace(synchronize_layer=synchronize),
+    )
+    # No attention/Engram/HC modules are installed: a failed load must stop
+    # before accessing any of them or mutating restored cache tensors.
+    with forward_context(context), pytest.raises(RuntimeError, match="host restore failed"):
+        layer(torch.ones(1, 4), torch.zeros(1), torch.zeros(1))
+    assert waited == [3]

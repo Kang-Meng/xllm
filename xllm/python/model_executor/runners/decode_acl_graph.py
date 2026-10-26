@@ -159,6 +159,7 @@ class _StaticAttentionMetadata:
     kv_seq_lens_host: torch.Tensor | None = None
     kv_seq_lens_host_values: list[int] | None = None
     new_cache_slots_host_values: list[int] | None = None
+    engram_lookback_token_ids: torch.Tensor | None = None
     paged_kv_indptr_host: torch.Tensor | None = None
     paged_kv_last_page_len_host: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
@@ -2084,6 +2085,15 @@ class DecodeAclGraphRunner(BaseRunner):
                 for cache in self.layer_caches
             )
         )
+        lookback = getattr(metadata, "engram_lookback_token_ids", None)
+        cfg = getattr(self.model, "cfg", None)
+        if lookback is not None and lookback.ndim != 2:
+            raise ValueError("Engram lookback must have shape [num_reqs, history_depth]")
+        history_depth = lookback.shape[1] if lookback is not None else 0
+        if getattr(cfg, "engram_layer_ids", ()):
+            history_depth = max(cfg.engram_max_ngram_size - 1, 0)
+            if lookback is not None and lookback.shape[1] != history_depth:
+                raise ValueError("Engram lookback depth does not match the model configuration")
         entry.static_metadata = _StaticAttentionMetadata(
             slot_mapping=torch.zeros(
                 padded_batch_size,
@@ -2113,6 +2123,11 @@ class DecodeAclGraphRunner(BaseRunner):
             kv_seq_lens_host_values=[1] * padded_batch_size,
             # DSA consumes live scheduler slots on the host before capture.
             new_cache_slots_host_values=[],
+            engram_lookback_token_ids=(
+                torch.full((padded_batch_size, history_depth), -1, dtype=torch.int32, device=device)
+                if history_depth > 0
+                else None
+            ),
             block_table=static_block_table,
             # KDA (linear-attention) decode reads per-sequence conv/ssm state
             # slots from these buffers.  Static so the captured graph indexes a
@@ -2393,6 +2408,16 @@ class DecodeAclGraphRunner(BaseRunner):
                     )
             if padded_batch_size > batch_size:
                 static_metadata.linear_state_indices[batch_size:].zero_()
+        if static_metadata.engram_lookback_token_ids is not None:
+            history = static_metadata.engram_lookback_token_ids
+            history.fill_(-1)
+            source_history = getattr(metadata, "engram_lookback_token_ids", None)
+            if source_history is not None:
+                if source_history.ndim != 2 or source_history.shape[1] != history.shape[1]:
+                    raise ValueError("Engram lookback depth does not match the captured graph buffer")
+                if source_history.shape[0] > history.shape[0]:
+                    raise ValueError("Engram lookback batch exceeds the captured graph batch")
+                history[: source_history.shape[0]].copy_(source_history)
         src_accepted = getattr(metadata, "num_accepted_tokens", None)
         static_accepted = static_metadata.num_accepted_tokens
         if static_accepted is not None:

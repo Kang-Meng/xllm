@@ -695,6 +695,68 @@ TEST(BatchInputBuilderTest, RecordsPrefillStageBeforeAdvancingKvCount) {
             (std::vector<uint8_t>{1, 1}));
 }
 
+TEST(BatchInputBuilderTest, V41EngramHistoryComesFromRequestBeforeKvAdvance) {
+  for (const bool engram_enabled : {false, true}) {
+    BlockManager::Options options;
+    options.num_blocks(4).block_size(4);
+    BlockManagerImpl manager(options);
+    Sequence cold = make_basic_sequence({11, 12, 13, 14});
+    cold.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
+    Sequence restored =
+        make_basic_sequence({21, 22, 23, 24, 25, 26, 27, 28}, 1);
+    restored.kv_state().add_blocks(BlockType::KV, manager.allocate(2));
+    restored.kv_state().incr_kv_cache_tokens_num(4);
+    ModelArgs args;
+    args.model_type("deepseek_v41")
+        .engram_layer_ids(engram_enabled ? std::vector<int32_t>{1}
+                                         : std::vector<int32_t>{})
+        .engram_max_ngram_size(3);
+    std::vector<Sequence*> sequences = {&cold, &restored};
+    std::vector<uint32_t> budgets = {4, 4};
+    BatchInputBuilder builder(sequences,
+                              budgets,
+                              {},
+                              {},
+                              nullptr,
+                              0,
+                              &args,
+                              BatchForwardType::PREFILL);
+    const ForwardInput input = builder.build_forward_input(1, 0);
+    EXPECT_EQ(input.input_params.embedding.engram_lookback_token_ids,
+              engram_enabled ? (std::vector<int32_t>{-1, -1, 24, 23})
+                             : std::vector<int32_t>{});
+    EXPECT_EQ(input.input_params.to(torch::Device(torch::kCPU))
+                  .embedding.engram_lookback_token_ids,
+              input.input_params.embedding.engram_lookback_token_ids);
+  }
+}
+
+TEST(BatchInputBuilderTest, V41EngramRejectsHistoryBeyondRequestTokens) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(4);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_basic_sequence({11, 12, 13, 14});
+  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(2));
+  sequence.kv_state().set_kv_cache_tokens_num(5);
+  ModelArgs args;
+  args.model_type("deepseek_v41")
+      .engram_layer_ids({1})
+      .engram_max_ngram_size(3);
+  const std::vector<Sequence*> sequences{&sequence};
+  const std::vector<uint32_t> budgets{1};
+  const std::vector<torch::Tensor> embeddings;
+  BatchInputBuilder builder(sequences,
+                            budgets,
+                            embeddings,
+                            {},
+                            nullptr,
+                            0,
+                            &args,
+                            BatchForwardType::PREFILL);
+  EXPECT_DEATH(builder.build_forward_input(1, 0),
+               "n_kv_cache_tokens.*n_tokens");
+}
+
 TEST(BatchInputBuilderTest, MultithreadedBuildMatchesSingleThreaded) {
   // The builder only parallelizes batches with at least thread-pool-size
   // sequences and 65536 query tokens, so build a prefill batch above both.
@@ -727,6 +789,10 @@ TEST(BatchInputBuilderTest, MultithreadedBuildMatchesSingleThreaded) {
       allowed_max_tokens.emplace_back(kNumTokens - cached_tokens);
     }
 
+    ModelArgs args;
+    args.model_type("deepseek_v41")
+        .engram_layer_ids({1})
+        .engram_max_ngram_size(3);
     std::vector<torch::Tensor> input_embeddings;
     std::vector<MMData> mm_data;
     BatchInputBuilder builder(sequence_ptrs,
@@ -735,7 +801,7 @@ TEST(BatchInputBuilderTest, MultithreadedBuildMatchesSingleThreaded) {
                               mm_data,
                               /*swap_block_transfer_infos=*/nullptr,
                               /*batch_id=*/0,
-                              /*args=*/nullptr,
+                              /*args=*/&args,
                               BatchForwardType::PREFILL,
                               /*cp_size=*/1,
                               thread_pool);
@@ -766,6 +832,10 @@ TEST(BatchInputBuilderTest, MultithreadedBuildMatchesSingleThreaded) {
             single_params.execution_batch.num_computed_tokens);
   EXPECT_EQ(multi_params.embedding.linear_state_ids,
             single_params.embedding.linear_state_ids);
+  EXPECT_EQ(multi_params.embedding.engram_lookback_token_ids,
+            (std::vector<int32_t>{-1, -1, 7, 7, 7, 7, 7, 7}));
+  EXPECT_EQ(multi_params.embedding.engram_lookback_token_ids,
+            single_params.embedding.engram_lookback_token_ids);
   EXPECT_TRUE(torch::equal(multi.token_ids, single.token_ids));
   EXPECT_TRUE(torch::equal(multi.positions, single.positions));
 }
@@ -2159,6 +2229,7 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   input.input_params.parallel.dp_global_batch_generations = {3, 7};
   input.input_params.embedding.mtp_bootstrap_row_idxes = {0};
   input.input_params.embedding.engram_history = {129, 21, 130, 22, 131, 23};
+  input.input_params.embedding.engram_lookback_token_ids = {23, 22, 21};
   input.input_params.embedding.mtp_bootstrap_embeddings =
       torch::tensor({{3.0f, 4.0f}});
   input.sample_sequence_ids = {"req-packed#0"};
@@ -2203,6 +2274,8 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
             std::vector<int32_t>{0});
   EXPECT_EQ(round_trip.input_params.embedding.engram_history,
             (std::vector<int32_t>{129, 21, 130, 22, 131, 23}));
+  EXPECT_EQ(round_trip.input_params.embedding.engram_lookback_token_ids,
+            (std::vector<int32_t>{23, 22, 21}));
   EXPECT_EQ(round_trip.input_params.parallel.dp_global_batch_generations,
             (std::vector<uint64_t>{3, 7}));
   EXPECT_EQ(round_trip.sample_sequence_ids,

@@ -40,6 +40,7 @@ limitations under the License.
 #include "framework/sampling/sampling_params.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "tests/core/framework/kv_cache_transfer/scoped_environment_variable.h"
 
 namespace xllm {
 
@@ -847,6 +848,29 @@ TEST(CompositeBlockManagerTest, SlidingWindowReleasesSkippedPhysicalBlocks) {
   }
 
   manager.deallocate_for_sequence(&seq);
+}
+
+TEST(CompositeBlockManagerTest, SlidingWindowV4PrefetchKeepsGeometryUnit) {
+  BlockManager::Options options;
+  options.model_type("deepseek_v4")
+      .num_blocks(8)
+      .block_size(kBaseBlockSize)
+      .block_type(BlockType::SWA)
+      .sliding_window_size(kBaseBlockSize)
+      .swa_blocks_per_seq(1)
+      .compress_ratios({0})
+      .enable_prefix_cache(false);
+  SlidingWindowBlockManager manager(options);
+  Sequence sequence = MakeTestSequence(
+      /*index=*/0, std::vector<int32_t>(kCompressedBlockTokenSize + 1, 7));
+  ASSERT_TRUE(
+      manager.allocate_for_prefetch(&sequence, kCompressedBlockTokenSize));
+  const Slice<Block> blocks = sequence.host_kv_state().blocks(BlockType::SWA);
+  ASSERT_EQ(blocks.size(), kCompressedBlockTokenSize / kBaseBlockSize);
+  for (size_t index = 0; index < blocks.size(); ++index) {
+    EXPECT_EQ(blocks[index].is_valid(), index + 1 == blocks.size());
+  }
+  sequence.host_kv_state().erase_blocks(BlockType::SWA);
 }
 
 TEST(CompositeBlockManagerTest,
@@ -3163,6 +3187,17 @@ TEST_F(V41PrefixCacheTest, V41PressureEvictsPrefixAndAllowsRepublication) {
   EXPECT_EQ(manager.num_used_blocks(), initial_usage);
 }
 
+TEST_F(V41PrefixCacheTest, V41HostAndStoreLeavesUseValidatedOptions) {
+  tests::ScopedEnvironmentVariable env{
+      "XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE"};
+  ASSERT_EQ(unsetenv("XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE"), 0);
+  BlockManager::Options options = make_v41_prefix_options();
+  options.enable_host_offload(true);
+  EXPECT_NO_FATAL_FAILURE(build_composite_leaves(options));
+  options.enable_host_offload(false).enable_kvcache_store(true);
+  EXPECT_NO_FATAL_FAILURE(build_composite_leaves(options));
+}
+
 TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsMultimodalHasher) {
   BlockManager::Options options = make_v41_prefix_options();
   options.hasher_type(BlockHasherType::MM);
@@ -3200,11 +3235,35 @@ TEST_F(V41SpecPrefixCacheTest, SpecKeepsAllPrefixLeavesEnabled) {
 }
 
 TEST_F(V41SpecPrefixCacheTest, SpecRejectsNonTextHasher) {
+  tests::ScopedEnvironmentVariable env{
+      "XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE"};
+  ASSERT_TRUE(env.set("1"));
   BlockManager::Options options = make_v41_prefix_options();
   options.num_speculative_tokens(5).hasher_type(BlockHasherType::MTP_TEXT);
   EXPECT_DEATH(build_composite_leaves(options), "text prompts only");
   options.hasher_type(BlockHasherType::MM);
   EXPECT_DEATH(build_composite_leaves(options), "text prompts only");
+}
+
+TEST_F(V41SpecPrefixCacheTest, SpecSupportsHostOffloadAndStore) {
+  tests::ScopedEnvironmentVariable env{
+      "XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE"};
+  ASSERT_TRUE(env.set("1"));
+  for (const bool use_store : {false, true}) {
+    BlockManager::Options options = make_v41_prefix_options();
+    options.num_speculative_tokens(5)
+        .enable_host_offload(true)
+        .enable_kvcache_store(use_store);
+    CompositeBlockManager manager(build_composite_leaves(options), options);
+    EXPECT_EQ(manager.leaf_combination(),
+              CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
+    for (const BlockType type :
+         {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+      EXPECT_TRUE(BlockManagerPoolTestPeer::leaf_of(manager, type)
+                      ->options()
+                      .enable_prefix_cache());
+    }
+  }
 }
 
 TEST_F(V41SpecPrefixCacheTest, EnableSwitchDisablesSpecPrefix) {

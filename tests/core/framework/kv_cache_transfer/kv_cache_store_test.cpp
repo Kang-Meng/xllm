@@ -24,6 +24,7 @@ limitations under the License.
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1588,6 +1589,71 @@ TEST(MooncakeStoreBackendTest, ValidatesRegistrationRangesBeforeSetup) {
                    {{reinterpret_cast<void*>(UINTPTR_MAX - 7), 8}})
                    .has_value());
 }
+
+class V41TokenStoreTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(V41TokenStoreTest, RestoresIndexScaleWithoutAliasing) {
+  const char* master = std::getenv("XLLM_TEST_STORE_MASTER");
+  if (GetParam() && master == nullptr) {
+    GTEST_SKIP()
+        << "Set XLLM_TEST_STORE_MASTER for real Mooncake TCP validation";
+  }
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCPU);
+  DeepSeekV4KVCacheTensors tensors;
+  tensors.key_cache = torch::zeros({3, 1, 128, 1, 16}, options);
+  tensors.index_cache =
+      torch::zeros({3, 1, 128, 1, 8}, options.dtype(torch::kInt8));
+  tensors.indexer_cache_scale =
+      torch::zeros({3, 1, 128, 1}, options.dtype(torch::kFloat16));
+  tensors.compressed_block_type = BlockType::C1;
+  KVCache c1(tensors);
+  tensors.key_cache = torch::zeros_like(tensors.key_cache);
+  tensors.index_cache = torch::zeros_like(tensors.index_cache);
+  tensors.indexer_cache_scale = torch::zeros_like(tensors.indexer_cache_scale);
+  tensors.compressed_block_type = BlockType::C2;
+  KVCache c2(tensors);
+  HostCacheStoreIndex index;
+  index[BlockType::C1].emplace_back(HostCacheStoreEntry{
+      /*cache_handle=*/0, "main", &c1, std::nullopt, /*is_target=*/true});
+  index[BlockType::C2].emplace_back(HostCacheStoreEntry{
+      /*cache_handle=*/0, "main", &c2, std::nullopt, /*is_target=*/true});
+  KVCacheStore store;
+  auto objects = std::make_shared<StoreObjects>();
+  KVCacheStoreInitConfig config = make_store_config("deepseek-v41");
+  if (GetParam()) {
+    config.model_id += ":" + std::to_string(getpid());
+    config.master_server_address = master;
+    config.metadata_server = "P2PHANDSHAKE";
+    ASSERT_TRUE(store.init(config, std::move(index)));
+  } else {
+    KVCacheStoreTestPeer::initialize_index(&store, config, std::move(index));
+    KVCacheStoreTestPeer::attach_transport(
+        &store, std::make_unique<MemoryStoreTransport>(objects));
+  }
+  for (const auto& [type, cache] : std::map<BlockType, KVCache*>{
+           {BlockType::C1, &c1}, {BlockType::C2, &c2}}) {
+    const auto roles = cache->get_block_type_tensors(type);
+    ASSERT_EQ(roles.size(), 3u);
+    for (const auto& [role, tensor] : roles) {
+      tensor[0].fill_(static_cast<int32_t>(type) + static_cast<int32_t>(role));
+    }
+    ASSERT_EQ(store.batch_put({make_block_info(44, type)}), 1u);
+    std::vector<BlockTransferInfo> infos = {make_block_info(44, type, 2)};
+    Slice<BlockTransferInfo> slice(infos);
+    ASSERT_EQ(store.batch_get_with_status(slice), (std::vector<uint8_t>{1}));
+    for (const auto& [role, tensor] : roles) {
+      EXPECT_TRUE(torch::equal(tensor[0], tensor[2]))
+          << static_cast<int32_t>(role);
+    }
+  }
+  // Identical hashes and physical spans still name separate TOKEN objects.
+  if (!GetParam()) {
+    EXPECT_EQ(objects->size(), 2u);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Transport, V41TokenStoreTest, ::testing::Bool());
 
 TEST(KVCacheStoreTest, RestoresRoleBytesAndRequiresEveryRegisteredShard) {
   const torch::TensorOptions options =

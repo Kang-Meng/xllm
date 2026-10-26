@@ -392,6 +392,25 @@ TEST(MtpAsyncInputBuilderTest, RejectsPageCountBeyondBlockTableWidth) {
                "Expanded KV length exceeds block-table capacity");
 }
 
+TEST(MtpAsyncInputBuilderTest, V41EngramLookbackViewOwnsRequestRows) {
+  if (!Py_IsInitialized()) {
+    setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", /*overwrite=*/1);
+    Py_InitializeEx(/*initsigs=*/0);
+  }
+  py::gil_scoped_acquire gil;
+  auto metadata = std::make_shared<layer::AttentionMetadata>();
+  metadata->slot_mapping = torch::zeros({2}, torch::kInt32);
+  ModelInputParams params;
+  params.execution_batch.num_reqs = 2;
+  params.embedding.engram_lookback_token_ids = {24, 23, 34, 33};
+  PyAttentionMetadataView view(metadata, params);
+  params.embedding.engram_lookback_token_ids.clear();
+  const torch::Tensor history =
+      view.engram_lookback_token_ids().cast<torch::Tensor>();
+  EXPECT_TRUE(torch::equal(history,
+                           torch::tensor({{24, 23}, {34, 33}}, torch::kInt32)));
+}
+
 TEST(MtpAsyncInputBuilderTest, PybindViewOwnsGlobalDpKvMaxSequenceLengths) {
   if (!Py_IsInitialized()) {
     setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", /*overwrite=*/1);

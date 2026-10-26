@@ -23,6 +23,7 @@ limitations under the License.
 #include <iomanip>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,6 +31,7 @@ limitations under the License.
 #include "block_manager_impl.h"
 #include "composite_block_manager.h"
 #include "concurrent_block_manager_impl.h"
+#include "core/framework/block/block_utils.h"
 #include "core/framework/config/scheduler_config.h"
 #include "linear_state_block_manager.h"
 #include "sliding_window_block_manager.h"
@@ -88,6 +90,16 @@ bool has_valid_swa_window(size_t tokens,
   return true;
 }
 
+BlockType checkpoint_block_type(const CompositeBlockManager::LeafMap& leaves) {
+  if (leaves.contains(BlockType::C128)) {
+    return BlockType::C128;
+  }
+  if (leaves.contains(BlockType::C2)) {
+    return BlockType::C2;
+  }
+  return BlockType::C1;
+}
+
 size_t prefetch_unit_size(CompositeBlockManager::LeafCombination combination,
                           const CompositeBlockManager::LeafMap& leaves) {
   // FLAT_KV_LINEAR builds one Store unit per KV block. The LINEAR checkpoint
@@ -95,7 +107,7 @@ size_t prefetch_unit_size(CompositeBlockManager::LeafCombination combination,
   // would skip every KV block inside a larger checkpoint.
   BlockType unit_type = BlockType::KV;
   if (combination == CompositeBlockManager::LeafCombination::SWA_COMPRESSED) {
-    unit_type = BlockType::C128;
+    unit_type = checkpoint_block_type(leaves);
   }
   const auto unit_leaf = leaves.find(unit_type);
   CHECK(unit_leaf != leaves.end());
@@ -196,68 +208,68 @@ StoragePrefetchRequest build_flat_kv_linear_prefetch_request(
 
 StoragePrefetchRequest build_swa_compressed_prefetch_request(
     const Sequence* sequence,
-    size_t swa_blocks_per_window) {
+    const CompositeBlockManager::LeafMap& leaves) {
   CHECK(sequence != nullptr);
   const KVCacheState& host_state = sequence->host_kv_state();
-  const Slice<Block> swa_blocks = host_state.blocks(BlockType::SWA);
-  const Slice<Block> c4_blocks = host_state.blocks(BlockType::C4);
-  const Slice<Block> c128_blocks = host_state.blocks(BlockType::C128);
-  size_t swa_block_size = valid_block_size(swa_blocks);
-  const size_t c4_block_size = valid_block_size(c4_blocks);
-  size_t unit_size = valid_block_size(c128_blocks);
-  // C4/C128 are allocated to the same target range. This keeps unit
-  // construction possible when C128 has only invalid capacity placeholders.
-  if (unit_size == 0 && !c128_blocks.empty() &&
-      c4_blocks.size() % c128_blocks.size() == 0) {
-    unit_size = c4_block_size * (c4_blocks.size() / c128_blocks.size());
-  }
-  if (swa_block_size == 0 && !swa_blocks.empty() && c128_blocks.size() != 0 &&
-      swa_blocks.size() % c128_blocks.size() == 0 && unit_size != 0) {
-    swa_block_size = unit_size / (swa_blocks.size() / c128_blocks.size());
-  }
-  if (c4_block_size == 0 || unit_size == 0 || c128_blocks.empty() ||
-      unit_size % c4_block_size != 0 ||
-      (swa_block_size != 0 && unit_size % swa_block_size != 0)) {
-    return {};
-  }
+  const BlockType checkpoint_type = checkpoint_block_type(leaves);
+  const BlockType companion_type =
+      checkpoint_type == BlockType::C128 ? BlockType::C4 : BlockType::C1;
+  const Slice<Block> checkpoint_blocks = host_state.blocks(checkpoint_type);
+  const auto& swa_options = leaves.at(BlockType::SWA).leaf->options();
+  const size_t swa_block_size = swa_options.block_size();
+  const size_t swa_blocks_per_window = swa_options.swa_blocks_per_seq();
+  const size_t unit_size = leaves.at(checkpoint_type).leaf->block_size();
+  const auto companion_leaf = leaves.find(companion_type);
+  const bool has_companion =
+      companion_type != checkpoint_type && companion_leaf != leaves.end();
+  const size_t companion_block_size =
+      has_companion ? companion_leaf->second.leaf->block_size() : unit_size;
+  CHECK_GT(swa_block_size, 0u);
+  CHECK_GT(companion_block_size, 0u);
+  CHECK_GT(unit_size, 0u);
+  CHECK_EQ(unit_size % companion_block_size, 0u);
+  CHECK_EQ(unit_size % swa_block_size, 0u);
   const size_t base_units = host_state.shared_tokens_num() / unit_size;
-  if (base_units >= c128_blocks.size()) {
+  if (base_units >= checkpoint_blocks.size()) {
     return {};
   }
 
   StoragePrefetchRequest request;
-  request.units.reserve(c128_blocks.size() - base_units);
-  for (size_t unit = base_units; unit < c128_blocks.size(); ++unit) {
+  request.units.reserve(checkpoint_blocks.size() - base_units);
+  for (size_t unit = base_units; unit < checkpoint_blocks.size(); ++unit) {
     PrefetchUnit prefetch_unit;
     prefetch_unit.has_non_gated = true;
-    if (swa_block_size != 0) {
-      const size_t swa_end = (unit + 1) * unit_size / swa_block_size;
-      const size_t swa_begin =
-          swa_end > swa_blocks_per_window ? swa_end - swa_blocks_per_window : 0;
-      bool complete_window = swa_end >= swa_blocks_per_window;
-      for (size_t block_index = swa_begin; block_index < swa_end;
-           ++block_index) {
-        complete_window =
-            append_prefetch_transfer(
-                &prefetch_unit, BlockType::SWA, block_index, host_state) &&
-            complete_window;
-      }
-      if (!complete_window) {
-        prefetch_unit.non_gated_blocks.clear();
-      }
+    const size_t swa_end = (unit + 1) * unit_size / swa_block_size;
+    const size_t swa_begin =
+        swa_end - swa_tail_blocks(swa_end, swa_blocks_per_window);
+    // V4.1 can checkpoint before filling its entire SWA window.
+    bool complete_window =
+        checkpoint_type != BlockType::C128 || swa_end >= swa_blocks_per_window;
+    for (size_t block_index = swa_begin; block_index < swa_end; ++block_index) {
+      complete_window =
+          append_prefetch_transfer(
+              &prefetch_unit, BlockType::SWA, block_index, host_state) &&
+          complete_window;
+    }
+    if (!complete_window) {
+      prefetch_unit.non_gated_blocks.clear();
     }
 
     bool gate_available = true;
-    const size_t c4_begin = unit * unit_size / c4_block_size;
-    const size_t c4_end = (unit + 1) * unit_size / c4_block_size;
-    for (size_t block_index = c4_begin; block_index < c4_end; ++block_index) {
-      const bool available = append_prefetch_transfer(
-          &prefetch_unit, BlockType::C4, block_index, host_state);
-      gate_available = gate_available && available;
+    if (has_companion) {
+      const size_t companion_begin = unit * unit_size / companion_block_size;
+      const size_t companion_end =
+          (unit + 1) * unit_size / companion_block_size;
+      for (size_t block_index = companion_begin; block_index < companion_end;
+           ++block_index) {
+        const bool available = append_prefetch_transfer(
+            &prefetch_unit, companion_type, block_index, host_state);
+        gate_available = gate_available && available;
+      }
     }
-    const bool c128_available = append_prefetch_transfer(
-        &prefetch_unit, BlockType::C128, unit, host_state);
-    gate_available = gate_available && c128_available;
+    const bool checkpoint_available = append_prefetch_transfer(
+        &prefetch_unit, checkpoint_type, unit, host_state);
+    gate_available = gate_available && checkpoint_available;
     if (!gate_available) {
       break;
     }
@@ -276,9 +288,7 @@ StoragePrefetchRequest build_prefetch_request(
     case CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR:
       return build_flat_kv_linear_prefetch_request(sequence);
     case CompositeBlockManager::LeafCombination::SWA_COMPRESSED:
-      return build_swa_compressed_prefetch_request(
-          sequence,
-          leaves.at(BlockType::SWA).leaf->options().swa_blocks_per_seq());
+      return build_swa_compressed_prefetch_request(sequence, leaves);
     case CompositeBlockManager::LeafCombination::UNSUPPORTED:
       return {};
   }
@@ -451,10 +461,18 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
       case CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR:
       case CompositeBlockManager::LeafCombination::SWA_COMPRESSED:
         break;
-      case CompositeBlockManager::LeafCombination::UNSUPPORTED:
+      case CompositeBlockManager::LeafCombination::UNSUPPORTED: {
+        std::ostringstream leaf_summary;
+        for (const auto& [type, entry] : composite->leaf_entries()) {
+          leaf_summary << static_cast<int32_t>(type)
+                       << ":prefix=" << entry.supports_prefix_cache << ",";
+        }
         CHECK(!options_.enable_prefix_cache())
-            << "Unsupported prefix-cache leaf combination";
+            << "Unsupported prefix-cache leaf combination: instance_is_decode="
+            << options_.instance_is_decode() << ", leaves=["
+            << leaf_summary.str() << "]";
         break;
+      }
       default:
         LOG(FATAL) << "HierarchyBlockManagerPool supports only FLAT_KV, "
                       "FLAT_KV_LINEAR and SWA_COMPRESSED cache layouts; got "
@@ -564,9 +582,10 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
   const size_t host_cached_tokens = host_state.kv_cache_tokens_num();
   size_t completed_tokens = hbm_state.kv_cache_tokens_num();
   size_t cache_unit_size = 0;
-  const auto c128_entry = host_manager->leaf_entries().find(BlockType::C128);
-  if (c128_entry != host_manager->leaf_entries().end()) {
-    cache_unit_size = c128_entry->second.leaf->block_size();
+  const auto checkpoint_entry = host_manager->leaf_entries().find(
+      checkpoint_block_type(host_manager->leaf_entries()));
+  if (checkpoint_entry != host_manager->leaf_entries().end()) {
+    cache_unit_size = checkpoint_entry->second.leaf->block_size();
     CHECK_GT(cache_unit_size, 0u);
     for (const auto& [type, entry] : host_manager->leaf_entries()) {
       const size_t block_size = entry.leaf->block_size();
@@ -683,15 +702,17 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
         sequence->block_hashes(static_cast<uint32_t>(block_size)).size());
     const size_t comparable_blocks =
         std::min({hbm_blocks->size(), host_blocks->size(), completed_blocks});
+    const size_t blocks_per_unit = unit_size / block_size;
+    const size_t placeholders_per_unit =
+        type == BlockType::SWA && cache_unit_size > 0
+            ? blocks_per_unit -
+                  swa_tail_blocks(blocks_per_unit,
+                                  entry.leaf->options().swa_blocks_per_seq())
+            : 0;
     for (size_t i = first_block; i < comparable_blocks; ++i) {
-      if (type == BlockType::SWA && cache_unit_size > 0) {
-        CHECK_EQ(cache_unit_size % block_size, 0u);
-        const size_t blocks_per_unit = cache_unit_size / block_size;
-        const size_t blocks_per_window = std::min<size_t>(
-            blocks_per_unit, entry.leaf->options().swa_blocks_per_seq());
-        if (i % blocks_per_unit < blocks_per_unit - blocks_per_window) {
-          continue;
-        }
+      if (placeholders_per_unit > 0 &&
+          i % blocks_per_unit < placeholders_per_unit) {
+        continue;
       }
       Block& hbm_block = (*hbm_blocks)[i];
       Block& host_block = (*host_blocks)[i];
@@ -804,10 +825,11 @@ bool HierarchyBlockManagerPool::try_allocate(Sequence* sequence) {
     return false;
   }
   // Prefill already offloaded this prompt. Advance the Host cursor to the
-  // last complete KV or C128 block so the first compute step does not collect
-  // that span again. A partial trailing block stays below the cursor.
+  // last complete KV or grouped history block so the first compute step does
+  // not collect that span again. A partial trailing block stays below the
+  // cursor.
   const auto& host_leaves = host_manager->leaf_entries();
-  auto unit_leaf = host_leaves.find(BlockType::C128);
+  auto unit_leaf = host_leaves.find(checkpoint_block_type(host_leaves));
   if (unit_leaf == host_leaves.end()) {
     unit_leaf = host_leaves.find(BlockType::KV);
   }
@@ -1032,7 +1054,8 @@ HostCacheRestorePoint HierarchyBlockManagerPool::select_host_cache_restore(
       composite->leaf_combination() ==
       CompositeBlockManager::LeafCombination::SWA_COMPRESSED;
   const BlockType unit_type =
-      is_swa_compressed ? BlockType::C128 : BlockType::KV;
+      !is_swa_compressed ? BlockType::KV
+                         : checkpoint_block_type(composite->leaf_entries());
   const auto unit_leaf = composite->leaf_entries().find(unit_type);
   CHECK(unit_leaf != composite->leaf_entries().end());
   const size_t copy_unit_tokens = unit_leaf->second.leaf->block_size();
@@ -1065,9 +1088,17 @@ HostCacheRestorePoint HierarchyBlockManagerPool::select_host_cache_restore(
 
   const Slice<Block> host_swa =
       sequence->host_kv_state().blocks(BlockType::SWA);
+  // V4.1 may checkpoint before the window fills; require every existing
+  // tail block, while V4 retains its full-window admission rule.
   while (selected_copy_units > 0 &&
          !has_valid_swa_window(
-             selected_tokens, swa_block_size, blocks_per_window, host_swa)) {
+             selected_tokens,
+             swa_block_size,
+             unit_type == BlockType::C1 || unit_type == BlockType::C2
+                 ? swa_tail_blocks(selected_tokens / swa_block_size,
+                                   blocks_per_window)
+                 : blocks_per_window,
+             host_swa)) {
     --selected_copy_units;
     selected_tokens -= copy_unit_tokens;
   }

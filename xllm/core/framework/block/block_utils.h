@@ -15,10 +15,13 @@ limitations under the License.
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace xllm {
 
 int64_t get_swa_blocks_per_seq(int64_t window_size, int64_t block_size);
+
+size_t swa_tail_blocks(size_t available_blocks, size_t blocks_per_window);
 
 }  // namespace xllm

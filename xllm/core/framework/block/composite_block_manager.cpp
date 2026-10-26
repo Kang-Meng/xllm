@@ -99,8 +99,10 @@ bool leaf_participates_in_prefix_cache(BlockType type,
       return !instance_is_decode;
     case BlockType::EMBEDDING:
       return false;
-    // V4.1 TOKEN groups are restored only together with their SWA window.
-    // PD transfer and host offload remain unsupported for this layout.
+    // V4.1 TOKEN groups must be restored with SWA, which does not participate
+    // on DECODE instances. Unlike V4's full-history anchors, C1/C2 therefore
+    // stay disabled there until V4.1 disaggregated PD supports this restore.
+    // DEFAULT serving (including decode steps) still participates.
     case BlockType::C1:
     case BlockType::C2:
       return !instance_is_decode;

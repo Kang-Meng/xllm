@@ -2633,6 +2633,53 @@ class HostRestoreConfig final {
 
 }  // namespace
 
+TEST(SchedulerPolicyTest, ChunkedAdmissionPreservesPrefetchDpRank) {
+  for (int32_t dp_rank : {0, 1}) {
+    SCOPED_TRACE(dp_rank);
+    HostRestoreBlockPool pool(/*num_blocks=*/16, /*dp_size=*/2);
+    HostRestoreBlockPool host_pool(/*num_blocks=*/16, /*dp_size=*/2);
+    ContinuousScheduler::Options options = create_scheduler_options(
+        /*max_tokens_per_batch=*/16,
+        /*max_seqs_per_batch=*/16,
+        /*num_speculative_tokens=*/0,
+        /*max_tokens_per_chunk_for_prefill=*/16,
+        /*dp_size=*/2);
+    options.enable_chunked_prefill() = true;
+    options.enable_disagg_pd() = true;
+    options.instance_role() = InstanceRole::PREFILL;
+    BatchMode mode{.enable_mix_batch = false,
+                   .enable_chunked_prefill = true,
+                   .priority_strategy = "fcfs"};
+    PrefillFirstPolicy policy(mode, options);
+    RestoreHarness harness(&pool, options);
+    auto held = hold_blocks(pool, /*num_blocks=*/1, dp_rank);
+    ASSERT_EQ(pool.select_dp_rank(), 1 - dp_rank);
+    auto request =
+        generate_request({32}, {1}, std::nullopt, std::nullopt, 4096).front();
+    Sequence* sequence = request->sequences().front().get();
+    sequence->set_dp_rank(dp_rank);
+    auto prefetched = hold_blocks(host_pool, /*num_blocks=*/1, dp_rank);
+    const auto host_blocks =
+        prefetched->sequences().front()->kv_state().blocks(BlockType::KV);
+    sequence->host_kv_state().add_blocks(
+        BlockType::KV,
+        std::vector<Block>(host_blocks.begin(), host_blocks.end()));
+    ASSERT_TRUE(sequence->host_kv_state().has_any_blocks());
+    ASSERT_FALSE(sequence->kv_state().has_any_blocks());
+    ASSERT_EQ(sequence->kv_state().kv_cache_tokens_num(), 0u);
+    harness.state().prefill_queue.push(request);
+
+    harness.schedule(policy, /*token_budget=*/16);
+
+    ASSERT_EQ(harness.running_sequences(), (std::vector<Sequence*>{sequence}));
+    EXPECT_EQ(sequence->dp_rank(), dp_rank);
+    EXPECT_EQ(pool.num_used_blocks()[dp_rank], 2u);
+    EXPECT_EQ(pool.num_used_blocks()[1 - dp_rank], 0u);
+    pool.deallocate(held.get());
+    pool.deallocate(request.get());
+  }
+}
+
 TEST(DecodeRestoreTest, BatchesRestoresAlongsideRunningDecodes) {
   HostRestoreConfig config;
   HostRestoreBlockPool pool(/*num_blocks=*/64, /*dp_size=*/1);

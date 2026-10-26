@@ -31,6 +31,7 @@ limitations under the License.
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "util/env_var.h"
 #include "util/utils.h"
 #if defined(USE_MLU)
 #include "platform/mlu/mlu_host_memory.h"
@@ -606,22 +607,30 @@ int64_t prefill_host_linear_block_count(int64_t host_kv_block_count,
   return linear_blocks;
 }
 
-int64_t dsv4_host_swa_block_count(int64_t c128_block_count,
+int64_t dsv4_host_swa_block_count(int64_t checkpoint_block_count,
                                   double host_blocks_factor,
                                   int64_t window_size,
-                                  int64_t block_size) {
-  const int64_t unit_size = Dsv4CacheGeometry{}.compressed_block_token_size();
+                                  int64_t block_size,
+                                  int64_t cache_unit_size) {
+  const int64_t unit_size =
+      cache_unit_size > 0 ? cache_unit_size
+                          : Dsv4CacheGeometry{}.compressed_block_token_size();
   CHECK_GT(block_size, 0);
   CHECK_EQ(unit_size % block_size, 0);
   const int64_t window_blocks = get_swa_blocks_per_seq(window_size, block_size);
   const int64_t blocks_per_unit = unit_size / block_size;
   const int64_t blocks_per_checkpoint =
       std::min(window_blocks, blocks_per_unit);
-  const int64_t host_c128_blocks =
-      scale_host_block_count(c128_block_count, host_blocks_factor);
-  CHECK_LE(host_c128_blocks,
+  const int64_t host_checkpoint_blocks =
+      scale_host_block_count(checkpoint_block_count, host_blocks_factor);
+  CHECK_LE(host_checkpoint_blocks,
            std::numeric_limits<int64_t>::max() / blocks_per_checkpoint);
-  return host_c128_blocks * blocks_per_checkpoint;
+  return host_checkpoint_blocks * blocks_per_checkpoint;
+}
+
+bool v41_experimental_prefix_cache_enabled() {
+  return util::get_bool_env("XLLM_ENABLE_EXPERIMENTAL_V41_PREFIX_CACHE",
+                            /*defaultValue=*/false);
 }
 
 std::optional<std::string> validate_host_cache_options(
@@ -686,6 +695,19 @@ std::optional<std::string> validate_host_cache_options(
   }
   if (!options.has_key_cache_shape) {
     violations.emplace_back("KV cache has no key-cache tensor to offload");
+  }
+  if (options.has_grouped_cache_layout &&
+      util::is_deepseek_v41_model_type(options.model_type)) {
+    if (!v41_experimental_prefix_cache_enabled()) {
+      violations.emplace_back(kV41ExperimentalPrefixCacheRequired);
+    }
+    if (options.instance_role == InstanceRole::DECODE) {
+      violations.emplace_back(
+          "V4.1 grouped host offload/Store is not supported on DECODE "
+          "instances; "
+          "C1/C2 and SWA prefix restore is not implemented for this role; "
+          "disable host offload and Store on DECODE instances");
+    }
   }
   if (options.has_grouped_cache_layout &&
       !options.supports_grouped_cache_offload) {

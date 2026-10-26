@@ -114,6 +114,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
       builder.build_forward_input(/*num_decoding_tokens=*/1,
                                   /*min_decoding_batch_size=*/0);
   ASSERT_EQ(input.input_params.meta.num_sequences, 2);
+  input.input_params.embedding.engram_lookback_token_ids = {24, 23, 34, 33};
   input.input_params.embedding.linear_state_ids = {7, 8};
   input.input_params.embedding.linear_state_indices =
       torch::tensor({7, 8}, torch::kInt32);
@@ -137,6 +138,8 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
                                                     torch::kFloat32,
                                                     unpacked_input,
                                                     false));
+  EXPECT_EQ(unpacked_input.input_params.embedding.engram_lookback_token_ids,
+            (std::vector<int32_t>{24, 23, 34, 33}));
   EXPECT_FALSE(unpacked_input.input_params.dit_forward_input.has_value());
   EXPECT_EQ(unpacked_input.input_params.embedding.linear_state_ids,
             std::vector<int32_t>({7, 8}));
@@ -146,6 +149,8 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
                    .defined());
   ModelInputParams device_params =
       unpacked_input.input_params.to(torch::Device(torch::kCPU));
+  EXPECT_EQ(device_params.embedding.engram_lookback_token_ids,
+            (std::vector<int32_t>{24, 23, 34, 33}));
   EXPECT_TRUE(torch::equal(device_params.embedding.linear_state_read_indices,
                            torch::tensor({3, 4}, torch::kInt32)));
 }

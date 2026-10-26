@@ -122,7 +122,9 @@ def _shared_prefix_views(cache: LayerCache, prefix: int, ratio: int) -> dict[str
     return views
 
 
-def _tables(total: int, *, prefix: int = 0, retain_swa_history: bool = False) -> list[torch.Tensor]:
+def _tables(
+    total: int, *, prefix: int = 0, retain_swa_history: bool = False, window_blocks: int = 1
+) -> list[torch.Tensor]:
     tables = []
     for ratio in (1, 2, 1):
         span = _BLOCK_SIZE * ratio
@@ -136,7 +138,7 @@ def _tables(total: int, *, prefix: int = 0, retain_swa_history: bool = False) ->
     if prefix and not retain_swa_history:
         # SWA readers need only the last window; logical placeholders keep
         # absolute positions stable, matching the composite export contract.
-        tables[0][0, : prefix // _BLOCK_SIZE - 1] = -1
+        tables[0][0, : max(0, prefix // _BLOCK_SIZE - window_blocks)] = -1
     return tables
 
 
@@ -170,6 +172,29 @@ def _short_prefix_tables(total: int, ratios: list[int], *, prefix: int = 0) -> l
     return tables if 2 in ratios else [tables[0], tables[2]]
 
 
+def _host_round_trip_prefix(
+    model: DeepseekV41ForCausalLM,
+    caches: list[LayerCache],
+    tables: list[torch.Tensor],
+    prefix: int,
+) -> tuple[list[LayerCache], list[torch.Tensor]]:
+    restored = _caches(model, int(tables[0].numel()) * _BLOCK_SIZE)
+    restored_tables = [table.clone() for table in tables]
+    for table, ratio in zip(restored_tables, (1, 2, 1), strict=True):
+        count = prefix // (_BLOCK_SIZE * ratio)
+        table[0, :count] = torch.where(table[0, :count] >= 0, table[0, :count] + 1, table[0, :count])
+    swa_count = prefix // _BLOCK_SIZE
+    window_blocks = (model.cfg.window_size + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    first = max(0, swa_count - window_blocks)
+    for layer, (source, target) in enumerate(zip(caches, restored, strict=True)):
+        target.swa[first + 2 : swa_count + 2].copy_(source.swa[first + 1 : swa_count + 1].cpu())
+        if layer in model.cfg.kv_source_layer_ids:
+            count = prefix // (_BLOCK_SIZE * model.cfg.compress_ratios[layer])
+            for name in ("key", "index", "indexer_scale"):
+                getattr(target, name)[2 : count + 2].copy_(getattr(source, name)[1 : count + 1].cpu())
+    return restored, restored_tables
+
+
 def _step(
     model: DeepseekV41ForCausalLM,
     backend: Csa2AttentionBackend,
@@ -181,6 +206,7 @@ def _step(
     spec_verify: bool = False,
     captured: list[torch.Tensor] | None = None,
     new_cache_slots: list[int] | None = None,
+    lookback: torch.Tensor | None = None,
 ) -> torch.Tensor:
     metadata = SimpleNamespace(
         is_prefill=start == 0 and not spec_verify,
@@ -193,6 +219,7 @@ def _step(
         q_seq_lens_host=torch.tensor([ids.numel()], dtype=torch.int32),
         dsa_metadata=None,
         new_cache_slots_host_values=new_cache_slots,
+        engram_lookback_token_ids=lookback,
     )
     context = ForwardContext(backend, torch.device("npu:0"), metadata, caches)
     positions = torch.arange(start, start + ids.numel(), device=ids.device)
@@ -207,15 +234,19 @@ def _step(
         return model.compute_logits(hidden, None).float()
 
 
+@pytest.mark.parametrize("window_blocks", [1, 2, 4])
+@pytest.mark.parametrize("host_restore", [False, True])
 @pytest.mark.parametrize("engram_enabled", [False, True])
 @pytest.mark.parametrize("prefix", [256, 512])
 @pytest.mark.parametrize("suffix", [1, 3, 129])
 @npu_only
-def test_prefix_alias_logits_match_full_prefill(prefix: int, suffix: int, engram_enabled: bool) -> None:
+def test_prefix_alias_logits_match_full_prefill(
+    prefix: int, suffix: int, engram_enabled: bool, host_restore: bool, window_blocks: int
+) -> None:
     config = {
         **_DEEPSEEK_V41_FORWARD_CONFIG,
-        "window_size": _BLOCK_SIZE,
-        "sliding_window": _BLOCK_SIZE,
+        "window_size": _BLOCK_SIZE * window_blocks,
+        "sliding_window": _BLOCK_SIZE * window_blocks,
         "max_position_embeddings": 1024,
         "device": "npu:0",
         "dtype": torch.bfloat16,
@@ -233,8 +264,25 @@ def test_prefix_alias_logits_match_full_prefill(prefix: int, suffix: int, engram
     baseline_backend.bind_kv_caches(baseline_caches)
     cached_backend.bind_kv_caches(cached_caches)
     ids = (torch.arange(prefix + suffix, device="npu:0", dtype=torch.int64) * 7) % 63 + 1
-    golden = _step(baseline_model, baseline_backend, baseline_caches, ids, 0, _tables(prefix + suffix))[prefix:]
-    _step(cached_model, cached_backend, cached_caches, ids[:prefix], 0, _tables(prefix))
+    full_tables, source_tables = _tables(prefix + suffix), _tables(prefix)
+    golden = _step(
+        baseline_model,
+        baseline_backend,
+        baseline_caches,
+        ids,
+        0,
+        full_tables,
+        new_cache_slots=_swa_slots(full_tables[0], 0, ids.numel()),
+    )[prefix:]
+    _step(
+        cached_model,
+        cached_backend,
+        cached_caches,
+        ids[:prefix],
+        0,
+        source_tables,
+        new_cache_slots=_swa_slots(source_tables[0], 0, prefix),
+    )
 
     shared_views = [
         _shared_prefix_views(cache, prefix, cached_model.cfg.compress_ratios[layer])
@@ -257,10 +305,39 @@ def test_prefix_alias_logits_match_full_prefill(prefix: int, suffix: int, engram
         views = _shared_prefix_views(restored, prefix, cached_model.cfg.compress_ratios[layer])
         for name, tensor in shared_views[layer].items():
             assert views[name].data_ptr() == tensor.data_ptr(), f"layer {layer} lost shared {name} alias"
+    restored_tables = _tables(prefix + suffix, prefix=prefix, window_blocks=window_blocks)
+    depth = max(cached_model.cfg.engram_max_ngram_size - 1, 0)
+    # The production builder supplies request history for both alias and Host
+    # restoration, independently of Python's window-sized SWA cache specs.
+    lookback = ids[prefix - depth : prefix].flip(0).reshape(1, -1).to(torch.int32) if engram_enabled else None
+    if host_restore:
+        # Host restore allocates NEW blocks; copy only the persistent planes,
+        # not compressor scratch or the Python Engram compressed-id cache.
+        restored_caches = _caches(cached_model, prefix + suffix)
+        for table in restored_tables:
+            table[table >= 0] += 1
+        swa_end = prefix // _BLOCK_SIZE + 1
+        swa_begin = max(1, swa_end - window_blocks)
+        for source, restored in zip(cached_caches, restored_caches, strict=True):
+            restored.swa[swa_begin + 1 : swa_end + 1].copy_(source.swa[swa_begin:swa_end].cpu().to("npu:0"))
+            assert torch.equal(restored.swa[swa_begin + 1 : swa_end + 1], source.swa[swa_begin:swa_end])
+        for layer, (source, restored) in enumerate(zip(cached_caches, restored_caches, strict=True)):
+            if layer not in cached_model.cfg.kv_source_layer_ids:
+                continue
+            blocks = prefix // (_BLOCK_SIZE * cached_model.cfg.compress_ratios[layer])
+            for name in ("key", "index", "indexer_scale"):
+                getattr(restored, name)[2 : blocks + 2].copy_(getattr(source, name)[1 : blocks + 1].cpu().to("npu:0"))
     restored_backend = _make_csa2_backend(cached_model.cfg, torch.device("npu:0"))
     restored_backend.bind_kv_caches(restored_caches)
     actual = _step(
-        cached_model, restored_backend, restored_caches, ids[prefix:], prefix, _tables(prefix + suffix, prefix=prefix)
+        cached_model,
+        restored_backend,
+        restored_caches,
+        ids[prefix:],
+        prefix,
+        restored_tables,
+        new_cache_slots=_swa_slots(restored_tables[0], prefix, suffix),
+        lookback=lookback,
     )
     assert torch.isfinite(actual).all()
     error = (actual - golden).abs().max().item()
@@ -270,10 +347,11 @@ def test_prefix_alias_logits_match_full_prefill(prefix: int, suffix: int, engram
         source_views = _shared_prefix_views(source, prefix, cached_model.cfg.compress_ratios[layer])
         restored_views = _shared_prefix_views(restored, prefix, cached_model.cfg.compress_ratios[layer])
         for name, tensor in before.items():
-            assert restored_views[name].data_ptr() == source_views[name].data_ptr()
             assert torch.equal(source_views[name], tensor), f"layer {layer} mutated shared {name}"
-            assert torch.equal(restored_views[name], tensor), f"layer {layer} changed restored {name}"
-    if hash_history is not None:
+            if not host_restore:
+                assert restored_views[name].data_ptr() == source_views[name].data_ptr()
+                assert torch.equal(restored_views[name], tensor), f"layer {layer} changed restored {name}"
+    if hash_history is not None and not host_restore:
         count = (1 + prefix // _BLOCK_SIZE) * _BLOCK_SIZE
         assert torch.equal(cached_model.model.engram_hash._cache[:count], hash_history[:count])
 
@@ -552,8 +630,11 @@ def test_short_prefix_shared_swa_alias_logits_match_full_prefill(
 @pytest.mark.parametrize("prefix", [256, 512])
 @pytest.mark.parametrize("accepted", [1, 2, 6])
 @pytest.mark.parametrize("engram_enabled", [False, True])
+@pytest.mark.parametrize("host_restore", [False, True])
 @npu_only
-def test_prefix_verify_rejection_replays_only_committed_rows(prefix: int, accepted: int, engram_enabled: bool) -> None:
+def test_prefix_verify_rejection_replays_only_committed_rows(
+    prefix: int, accepted: int, engram_enabled: bool, host_restore: bool
+) -> None:
     """Actual CSA2 verify writes followed by rollback, not mocked acceptance.
 
     The six-layer synthetic target uses C1/C2 and the ring-32 residual state.
@@ -589,34 +670,76 @@ def test_prefix_verify_rejection_replays_only_committed_rows(prefix: int, accept
         for layer, cache in enumerate(restored_caches)
     ]
     private_tables = _tables(total, prefix=prefix)
+    source_caches = restored_caches
+    if host_restore:
+        restored_caches, private_tables = _host_round_trip_prefix(restored, source_caches, private_tables, prefix)
+        restored_backend = _make_csa2_backend(restored.cfg, torch.device("npu:0"))
+        restored_backend.bind_kv_caches(restored_caches)
+        if engram_enabled:
+            with torch.inference_mode():
+                restored.model.engram_hash._cache.zero_()
+
+    def lookback(start: int) -> torch.Tensor | None:
+        if not engram_enabled:
+            return None
+        depth = restored.cfg.engram_max_ngram_size - 1
+        return ids[start - depth : start].flip(0).reshape(1, -1).to(torch.int32)
+
     # Complete the prompt through an odd C2 boundary, at the end of an SWA
     # block. The next verify spans both a block boundary and a ring wrap.
     start = prefix + 127
     _step(full, full_backend, full_caches, ids[:start], 0, _tables(start))
-    _step(restored, restored_backend, restored_caches, ids[prefix:start], prefix, private_tables)
+    _step(
+        restored,
+        restored_backend,
+        restored_caches,
+        ids[prefix:start],
+        prefix,
+        private_tables,
+        lookback=lookback(prefix),
+    )
     proposal = ids[start : start + 6].clone()
     proposal[accepted:] = proposal[accepted:].roll(1) + 1
     expected_verify = _step(full, full_backend, full_caches, ids[start : start + accepted], start, _tables(total))
     actual_verify = _step(
-        restored, restored_backend, restored_caches, proposal, start, private_tables, spec_verify=True
+        restored,
+        restored_backend,
+        restored_caches,
+        proposal,
+        start,
+        private_tables,
+        spec_verify=True,
+        lookback=lookback(start),
     )
     torch.testing.assert_close(actual_verify[:accepted], expected_verify, atol=0.02, rtol=0)
     # Roll back the logical cursor exactly as the V4 accepted-token path does.
     # Rejected rows can stay in private planes, but must never affect replay.
     resume = start + accepted
     expected = _step(full, full_backend, full_caches, ids[resume : resume + 2], resume, _tables(total))
-    actual = _step(restored, restored_backend, restored_caches, ids[resume : resume + 2], resume, private_tables)
+    actual = _step(
+        restored,
+        restored_backend,
+        restored_caches,
+        ids[resume : resume + 2],
+        resume,
+        private_tables,
+        lookback=lookback(resume),
+    )
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0)
     assert torch.equal(actual.argmax(-1), expected.argmax(-1))
-    for layer, (cache, before) in enumerate(zip(restored_caches, saved, strict=True)):
+    for layer, (cache, before) in enumerate(zip(source_caches, saved, strict=True)):
         current = _shared_prefix_views(cache, prefix, restored.cfg.compress_ratios[layer])
         for name, value in before.items():
             assert torch.equal(current[name], value), f"verify mutated shared layer {layer} {name}"
 
 
 @pytest.mark.parametrize("prefix", [256, 512])
+@pytest.mark.parametrize("host_restore", [False, True])
+@pytest.mark.parametrize("engram_enabled", [False, True])
 @npu_only
-def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(prefix: int) -> None:
+def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(
+    prefix: int, host_restore: bool, engram_enabled: bool
+) -> None:
     """Real target capture -> existing draft context projection -> SWA aliases.
 
     Reuses V4's joint block-ID convention. Neither source hidden states nor
@@ -627,14 +750,15 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(pref
         "window_size": _BLOCK_SIZE,
         "sliding_window": _BLOCK_SIZE,
         "max_position_embeddings": 1024,
-        "engram_layer_ids": [],
-        "engram_num_embeddings": [],
         "layers_to_capture": [4, 5],
         "enable_graph_aux_hidden_states": False,
         "device": "npu:0",
         "dtype": torch.bfloat16,
         "num_nextn_predict_layers": 0,
     }
+    if not engram_enabled:
+        config["engram_layer_ids"] = []
+        config["engram_num_embeddings"] = []
     total = prefix + 3
     target, cold_target = _model(config), _model(config)
     cold_target.load_state_dict(target.state_dict())
@@ -651,8 +775,15 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(pref
     # this test isolates alias restoration and draft context ownership.
     _step(cold_target, cold_backend, cold_caches, ids[:prefix], 0, _tables(prefix), captured=cold_prefix_aux)
     _step(target, source_backend, source_caches, ids[:prefix], 0, _tables(prefix), captured=prefix_aux)
+    restored_caches = source_caches
+    restored_tables = _tables(total, prefix=prefix)
+    if host_restore:
+        restored_caches, restored_tables = _host_round_trip_prefix(target, source_caches, restored_tables, prefix)
+        if engram_enabled:
+            with torch.inference_mode():
+                target.model.engram_hash._cache.zero_()
     restored_backend = _make_csa2_backend(target.cfg, torch.device("npu:0"))
-    restored_backend.bind_kv_caches(source_caches)
+    restored_backend.bind_kv_caches(restored_caches)
     suffix_aux: list[torch.Tensor] = []
     cold_suffix_aux: list[torch.Tensor] = []
     golden = _step(
@@ -661,11 +792,14 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(pref
     actual = _step(
         target,
         restored_backend,
-        source_caches,
+        restored_caches,
         ids[prefix:],
         prefix,
-        _tables(total, prefix=prefix),
+        restored_tables,
         captured=suffix_aux,
+        lookback=(ids[prefix - target.cfg.engram_max_ngram_size + 1 : prefix].flip(0).reshape(1, -1).to(torch.int32))
+        if engram_enabled
+        else None,
     )
     assert len(cold_prefix_aux) == len(prefix_aux) == len(suffix_aux) == len(cold_suffix_aux) == 1
     torch.testing.assert_close(prefix_aux[0], cold_prefix_aux[0], atol=0, rtol=0)
@@ -706,11 +840,16 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(pref
         )
         saved = [cache.swa[1 : 1 + prefix // _BLOCK_SIZE].clone() for cache in draft_caches]
         restored = [replace(cache) for cache in draft_caches]
+        if host_restore:
+            restored = [replace(cache, swa=torch.zeros_like(cache.swa)) for cache in draft_caches]
+            for source, destination in zip(draft_caches, restored, strict=True):
+                last = prefix // _BLOCK_SIZE
+                destination.swa[last + 1].copy_(source.swa[last].cpu())
         draft.model.write_context_kv(
-            suffix_aux[0], positions[prefix:], slots(_tables(total, prefix=prefix)[0], prefix, total), restored
+            suffix_aux[0], positions[prefix:], slots(restored_tables[0], prefix, total), restored
         )
     for source, alias, cold, before in zip(draft_caches, restored, cold_draft_caches, saved, strict=True):
-        assert alias.swa.data_ptr() == source.swa.data_ptr()
+        assert (alias.swa.data_ptr() == source.swa.data_ptr()) is (not host_restore)
         assert torch.equal(source.swa[1 : 1 + prefix // _BLOCK_SIZE], before)
         # The prefix shared ID is identical for target and draft; only the
         # suffix uses the next private block, as in V4's joint pool.
@@ -747,7 +886,9 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(pref
             return draft.compute_logits(hidden, None).float()
 
     cold_logits = draft_logits(cold_draft_caches, _tables(total + 3))
-    restored_logits = draft_logits(restored, _tables(total + 3, prefix=prefix))
+    draft_tables = _tables(total + 3, prefix=prefix)
+    draft_tables[0] = restored_tables[0]
+    restored_logits = draft_logits(restored, draft_tables)
     torch.testing.assert_close(restored_logits, cold_logits, atol=0.02, rtol=0)
     assert torch.equal(restored_logits.argmax(-1), cold_logits.argmax(-1))
     for source, before in zip(draft_caches, saved, strict=True):

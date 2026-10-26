@@ -99,6 +99,7 @@ class BatchInputBuilder {
     // from backend-specific attention layouts such as q_seq_lens.
     std::vector<int32_t> num_scheduled_tokens;
     std::vector<int32_t> num_computed_tokens;
+    std::vector<int32_t> engram_lookback_token_ids;
     std::vector<uint8_t> is_prefilling;
     // Tracking token counts in KV cache for linear-attention state setup.
     std::vector<int32_t> kv_cache_tokens_nums;

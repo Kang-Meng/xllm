@@ -23,7 +23,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from xllm.python.models.deepseek_v41_engram import EngramHashState, EngramLayout
+from xllm.python.models.deepseek_v41_engram import (
+    ENGRAM_IMAGE_PAD_ID,
+    ENGRAM_IMAGE_SENTINEL_BASE_ID,
+    EngramHashState,
+    EngramLayout,
+    image_sentinel_mask,
+)
 
 
 def _state() -> EngramHashState:
@@ -205,6 +211,83 @@ def test_model_restore_uses_receiver_table() -> None:
     DeepseekV41Model.restore_engram_history(model, backend, metadata)
     assert state._cache[3 * 8 + 2 : 3 * 8 + 4].tolist() == [9, 12]
     DeepseekV41Model.restore_engram_history(model, backend, SimpleNamespace())
+
+
+@pytest.mark.parametrize("prefix", [1, 3, 7, 127, 128, 129, 1323])
+@pytest.mark.parametrize("width", [1, 6])
+@pytest.mark.parametrize("lanes", [1, 4])
+@pytest.mark.parametrize("history_token", [9, ENGRAM_IMAGE_SENTINEL_BASE_ID, ENGRAM_IMAGE_PAD_ID])
+@pytest.mark.parametrize("device", ["cpu", "npu:0"])
+def test_pd_restored_slot_cache_and_explicit_lookback_are_equivalent(
+    prefix: int, width: int, lanes: int, history_token: int, device: str
+) -> None:
+    from xllm.python.models.deepseek_v41 import DeepseekV41Model
+
+    if device.startswith("npu") and (not hasattr(torch, "npu") or not torch.npu.is_available()):
+        pytest.skip("NPU unavailable")
+    window = 128
+    states = [_state().to(device), _state().to(device)]
+    caches = [torch.zeros((lanes + 2, window, 8), device=device) for _ in states]
+    table = torch.arange(lanes + 1, 1, -1, dtype=torch.int32, device=device).view(-1, 1)
+    histories = [[(index * 7 + lane * 11) % 63 + 1 for index in range(prefix + width + 2)] for lane in range(lanes)]
+    for history in histories:
+        history[prefix - 1] = history_token
+    pairs = [
+        value
+        for lane, history in enumerate(histories)
+        for index in range(max(0, prefix - 3), prefix)
+        for value in (int(table[lane, 0]) * window + index % window, history[index])
+    ]
+    for state, cache in zip(states, caches, strict=True):
+        backend = SimpleNamespace(swa_history_cache=lambda cache=cache: cache)
+        DeepseekV41Model.restore_engram_history(
+            SimpleNamespace(engram_hash=state), backend, SimpleNamespace(engram_history=pairs)
+        )
+    for start, count in [(prefix, width), (prefix + width, 1), (prefix + width + 1, 1)]:
+        ids = torch.tensor([history[start : start + count] for history in histories], device=device).flatten()
+        positions = torch.arange(start, start + count, device=device).repeat(lanes)
+        slots = torch.cat(
+            [
+                int(table[lane, 0]) * window + torch.arange(start, start + count, device=device) % window
+                for lane in range(lanes)
+            ]
+        )
+        lookback = torch.tensor(
+            [[history[start - shift] if start >= shift else -1 for shift in range(1, 4)] for history in histories],
+            dtype=torch.int32,
+            device=device,
+        )
+        hashes = [
+            state(
+                ids,
+                positions,
+                torch.arange(lanes + 1, device=device) * count,
+                image_sentinel_mask(ids),
+                explicit,
+                slots,
+                table,
+                window,
+            )
+            for state, explicit in zip(states, [None, lookback], strict=True)
+        ]
+        expected = []
+        for history in histories:
+            full_ids = torch.tensor(history[: start + count], device=device)
+            oracle = _state().to(device)
+            expected.append(
+                oracle(
+                    full_ids,
+                    torch.arange(start + count, device=device),
+                    torch.tensor([0, start + count], device=device),
+                    image_sentinel_mask(full_ids),
+                    None,
+                    None,
+                    None,
+                    window,
+                )[start:]
+            )
+        torch.testing.assert_close(hashes[0], torch.cat(expected), atol=0, rtol=0)
+        torch.testing.assert_close(hashes[1], hashes[0], atol=0, rtol=0)
 
 
 def test_expanded_verify_reads_current_candidate_history() -> None:

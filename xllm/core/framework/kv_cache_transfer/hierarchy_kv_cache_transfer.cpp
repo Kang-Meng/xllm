@@ -26,6 +26,7 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/kv_cache_store.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
+#include "util/utils.h"
 
 namespace xllm {
 namespace {
@@ -143,26 +144,14 @@ BlockTypeTensorMap build_block_type_tensor_map(const KVCache& kv_cache,
         tensors.emplace(KVCacheTensorRole::SWA, swa_cache);
       }
       return tensors;
+    case BlockType::C1:
+    case BlockType::C2:
     case BlockType::C4:
-      if (!has_tensor(swa_cache) || has_tensor(value_cache) ||
-          !has_tensor(key_cache) || !has_tensor(index_cache)) {
-        return {};
-      }
-      tensors.emplace(KVCacheTensorRole::KEY, key_cache);
-      tensors.emplace(KVCacheTensorRole::INDEX, index_cache);
-      if (index_cache_scale.has_value() &&
-          has_tensor(index_cache_scale.value())) {
-        tensors.emplace(KVCacheTensorRole::INDEX_SCALE,
-                        index_cache_scale.value());
-      }
-      return tensors;
     case BlockType::C128:
-      if (!has_tensor(swa_cache) || has_tensor(value_cache) ||
-          !has_tensor(key_cache) || has_tensor(index_cache)) {
+      if (!has_tensor(swa_cache) || has_tensor(value_cache)) {
         return {};
       }
-      tensors.emplace(KVCacheTensorRole::KEY, key_cache);
-      return tensors;
+      return kv_cache.get_block_type_tensors(type);
     default:
       return {};
   }
@@ -257,7 +246,15 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
     std::vector<HostKVGroupLayout> combined_groups;
     for (CacheDomain& domain : cache_domains_) {
       domain.device_caches_by_type = build_device_groups(&domain);
-      create_host_cache(&domain);
+    }
+    for (CacheRole role : {CacheRole::TARGET, CacheRole::DRAFT}) {
+      for (CacheDomain& domain : cache_domains_) {
+        if (domain.role == role) {
+          create_host_cache(&domain);
+        }
+      }
+    }
+    for (CacheDomain& domain : cache_domains_) {
       domain.host_layout =
           std::make_unique<HostKVLayout>(create_host_kv_layout(domain));
       max_layer_count = std::max<int64_t>(
@@ -398,18 +395,14 @@ HierarchyKVCacheTransfer::GroupedCaches
 HierarchyKVCacheTransfer::build_device_groups(CacheDomain* domain) const {
   CHECK(domain != nullptr);
   CHECK(domain->device_kv_caches != nullptr);
-  // TODO(V4.1): PD / hierarchy migration for the V4.1 TOKEN groups (C1/C2)
-  // is deferred — the milestone runs with PD off. C1/C2 caches are skipped
-  // here and in build_block_type_tensor_map below; extending this list also
-  // requires wiring their tensor roles in build_block_type_tensor_map.
-  // (domain_group_id stays collision-free: kBlockTypeCount is the maximum
-  // cache_group_id across all enumerators, appended ones included.)
   GroupedCaches device_groups;
   const std::vector<BlockType> block_types = {BlockType::KV,
                                               BlockType::LINEAR,
                                               BlockType::SWA,
                                               BlockType::C4,
-                                              BlockType::C128};
+                                              BlockType::C128,
+                                              BlockType::C1,
+                                              BlockType::C2};
   for (int64_t layer_id = 0;
        layer_id < static_cast<int64_t>(domain->device_kv_caches->size());
        ++layer_id) {
@@ -444,6 +437,24 @@ void HierarchyKVCacheTransfer::create_host_cache(CacheDomain* domain) {
 #if defined(USE_NPU)
     host_options.enable_kv_cache_huge_page_allocator(false);
 #endif
+    if (domain->role == CacheRole::DRAFT && block_type == BlockType::SWA &&
+        util::is_deepseek_v41_dspark_model_type(host_options.model_type())) {
+      const auto target = std::find_if(
+          cache_domains_.begin(), cache_domains_.end(), [](const auto& entry) {
+            return entry.role == CacheRole::TARGET;
+          });
+      CHECK(target != cache_domains_.end())
+          << "V4.1 DSpark Host cache requires a registered target";
+      CHECK_EQ(host_options.block_size(), target->create_options.block_size());
+      CHECK_LE(host_options.window_size(), target->create_options.window_size())
+          << "V4.1 DSpark Host restore requires a draft window no wider than "
+             "the target window";
+      const auto target_swa = target->host_caches_by_type.find(BlockType::SWA);
+      CHECK(target_swa != target->host_caches_by_type.end())
+          << "V4.1 DSpark Host cache requires target SWA storage";
+      host_options.host_swa_block_count(
+          target_swa->second->get_swa_cache().size(0));
+    }
     domain->host_caches_by_type[block_type] =
         std::make_unique<KVCache>(domain->kv_cache_shape,
                                   host_options,

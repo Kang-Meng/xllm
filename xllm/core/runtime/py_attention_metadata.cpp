@@ -68,6 +68,9 @@ void register_attention_metadata_views(py::module_& module) {
   py::class_<PyAttentionMetadataView>(module, "AttentionMetadataView")
       .def_property_readonly("slot_mapping",
                              &PyAttentionMetadataView::slot_mapping)
+      .def_property_readonly(
+          "engram_lookback_token_ids",
+          &PyAttentionMetadataView::engram_lookback_token_ids)
       .def_property_readonly("local_slot_mapping",
                              &PyAttentionMetadataView::local_slot_mapping)
       .def_property_readonly("logical_block_size",
@@ -257,6 +260,13 @@ PyAttentionMetadataView::PyAttentionMetadataView(
   engram_history_ = params.embedding.engram_history;
   linear_state_indices_ = params.embedding.linear_state_indices;
   num_accepted_tokens_ = params.num_accepted_tokens;
+  if (!params.embedding.engram_lookback_token_ids.empty()) {
+    CHECK_GT(params.execution_batch.num_reqs, 0);
+    engram_lookback_token_ids_ =
+        torch::tensor(params.embedding.engram_lookback_token_ids, torch::kInt32)
+            .reshape({params.execution_batch.num_reqs, -1})
+            .to(metadata_->slot_mapping.device());
+  }
   if (!params.embedding.linear_state_read_ids.empty() &&
       (metadata_->is_prefill || metadata_->is_chunked_prefill) &&
       params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) {
@@ -291,6 +301,10 @@ PyAttentionMetadataView::PyAttentionMetadataView(
   // builder exports the packed rows-per-sequence here, so a non-expanded
   // verify batch is never confused with a plain decode of the same row count.
   spec_verify_width_ = std::max(1, params.meta.spec_verify_width);
+}
+
+py::object PyAttentionMetadataView::engram_lookback_token_ids() const {
+  return optional_tensor(engram_lookback_token_ids_);
 }
 
 const torch::Tensor& PyAttentionMetadataView::slot_mapping() const {

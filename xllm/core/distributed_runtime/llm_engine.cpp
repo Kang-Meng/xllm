@@ -658,14 +658,8 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .instance_role = options_.instance_role(),
       .has_key_cache_shape = kv_cache_shape.has_key_cache_shape(),
       .has_grouped_cache_layout = kv_cache_shape.has_grouped_cache_layout(),
-      // TODO(V4.1): grouped host offload for the V4.1 TOKEN groups (C1/C2)
-      // is deferred; keep it rejected so the unextended host paths cannot be
-      // reached. The V4.1 milestone keeps prefix cache and grouped host
-      // offload disabled; disaggregated PD is supported separately
-      // (master.cpp).
       .supports_grouped_cache_offload =
-          util::is_deepseek_v4_model_type(args_.model_type()) &&
-          !util::is_deepseek_v41_model_type(args_.model_type()),
+          util::is_deepseek_v4_model_type(args_.model_type()),
       .has_conv_cache_shape = kv_cache_shape.has_conv_cache_shape(),
       .has_ssm_cache_shape = kv_cache_shape.has_ssm_cache_shape(),
       .kv_cache_dtype = options_.kv_cache_dtype(),
@@ -840,30 +834,42 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
         host_capacities.emplace(BlockType::LINEAR,
                                 static_cast<uint32_t>(host_linear_blocks));
       }
-      uint32_t host_c128_blocks = 0;
-      if (kv_cache_cap.c128_count() > 0) {
-        host_c128_blocks = static_cast<uint32_t>(scale_host_block_count(
-            kv_cache_cap.c128_count(), options_.host_blocks_factor()));
-        host_capacities.emplace(BlockType::C128, host_c128_blocks);
+      const bool is_v41 = util::is_deepseek_v41_model_type(args_.model_type());
+      // Keep concrete BlockTypes distinct while sharing Host pool sizing.
+      const int64_t indexed_group_count =
+          is_v41 ? kv_cache_cap.c2_count() : kv_cache_cap.c4_count();
+      const int64_t history_group_count =
+          is_v41 ? kv_cache_cap.c1_count() : kv_cache_cap.c128_count();
+      if (history_group_count > 0) {
+        host_capacities.emplace(
+            is_v41 ? BlockType::C1 : BlockType::C128,
+            static_cast<uint32_t>(scale_host_block_count(
+                history_group_count, options_.host_blocks_factor())));
       }
       if (kv_cache_cap.swa_count() > 0) {
-        CHECK_GT(host_c128_blocks, 0u)
-            << "DSV4 Host SWA capacity requires a positive C128 capacity.";
-        const int64_t host_swa_blocks =
-            dsv4_host_swa_block_count(kv_cache_cap.c128_count(),
-                                      options_.host_blocks_factor(),
-                                      options.sliding_window_size(),
-                                      block_size);
+        // V4.1 uses C2 as the largest checkpoint, or C1 if C2 is absent.
+        const int64_t swa_source_count = is_v41 && indexed_group_count > 0
+                                             ? indexed_group_count
+                                             : history_group_count;
+        CHECK_GT(swa_source_count, 0)
+            << "DSV4 Host SWA capacity requires a positive history capacity.";
+        const int64_t host_swa_blocks = dsv4_host_swa_block_count(
+            swa_source_count,
+            options_.host_blocks_factor(),
+            options.sliding_window_size(),
+            block_size,
+            dsv41_cache_unit_tokens(
+                is_v41, block_size, options.compress_ratios()));
         CHECK_LE(host_swa_blocks,
                  static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
         host_capacities.emplace(BlockType::SWA,
                                 static_cast<uint32_t>(host_swa_blocks));
       }
-      if (kv_cache_cap.c4_count() > 0) {
+      if (indexed_group_count > 0) {
         host_capacities.emplace(
-            BlockType::C4,
+            is_v41 ? BlockType::C2 : BlockType::C4,
             static_cast<uint32_t>(scale_host_block_count(
-                kv_cache_cap.c4_count(), options_.host_blocks_factor())));
+                indexed_group_count, options_.host_blocks_factor())));
       }
       options.host_num_blocks_by_type(std::move(host_capacities));
     }
