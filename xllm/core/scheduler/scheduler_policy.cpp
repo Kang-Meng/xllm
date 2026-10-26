@@ -269,6 +269,8 @@ void SchedulerPolicy::drain_request_queue(
       state.prefill_queue.push(queued, /*if_back=*/true);
     } else {
       // Request from prefill instance in disagg PD mode -- already has KV.
+      // It joins the running batch directly, skipping the prefill queue.
+      queued->record_first_batched_time();
       state.running_requests.emplace_back(queued);
     }
   }
@@ -491,6 +493,7 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     budget.remaining_seq_budget -= allocated_seqs;
     budget.estimate_latency += allocated_estimate_latency;
     queue->pop_top();
+    request->record_first_batched_time();
     state.running_requests.emplace_back(request);
     request->record_num_prefix_cache_tokens();
     state.running_sequences.insert(state.running_sequences.end(),

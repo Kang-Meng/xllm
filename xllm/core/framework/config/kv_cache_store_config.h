@@ -43,6 +43,7 @@ class KVCacheStoreConfig final {
         "KV CACHE STORE OPTIONS",
         {"prefetch_timeout",
          "prefetch_batch_size",
+         "prefetch_valid_blocks_per_batch",
          "layers_wise_copy_batchs",
          "host_blocks_factor",
          "enable_kvcache_store",
@@ -57,8 +58,16 @@ class KVCacheStoreConfig final {
 
   PROPERTY(uint32_t, prefetch_timeout) = 120000;
 
+  // initialize() stores max(1, value).
   PROPERTY(uint32_t, prefetch_batch_size) = 2;
 
+  // Valid LINEAR blocks placed in one prefetch batch. initialize() stores
+  // max(min(prefetch_batch_size, value), 1) rounded down to a divisor of
+  // prefetch_batch_size.
+  PROPERTY(uint32_t, prefetch_valid_blocks_per_batch) = 1;
+
+  // Eager mode copies this many layers per H2D event. initialize() stores 1
+  // when graph execution is enabled.
   PROPERTY(uint32_t, layers_wise_copy_batchs) = 4;
 
   PROPERTY(double, host_blocks_factor) = 0.0;

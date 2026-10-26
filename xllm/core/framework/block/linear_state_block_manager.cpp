@@ -101,17 +101,72 @@ bool LinearStateBlockManager::allocate_for_prefetch(Sequence* seq,
   if (matched_blocks == 0) {
     CHECK(blocks.empty());
   } else {
-    // Host admission keeps one restore source. Place matched_blocks - 1
-    // invalid placeholders before it, then let the base fill the tail.
+    // Host admission keeps one restore source. It stays at its logical
+    // position and is not part of the reused prefetch pool.
     CHECK_EQ(blocks.size(), 1u);
     CHECK(blocks.front().is_valid());
     blocks.insert(blocks.begin(), matched_blocks - 1, Block());
-    host_state.replace_composite_blocks(BlockType::LINEAR,
-                                        std::move(blocks),
-                                        /*num_shared_blocks=*/0,
-                                        /*cache_publish_cursor=*/0);
   }
-  return BlockManagerImpl::allocate_for_prefetch(seq, num_tokens);
+  blocks.resize(target_blocks);
+
+  const size_t prefetch_blocks = target_blocks - matched_blocks;
+  const uint32_t batch_size = std::max(options_.prefetch_batch_size(), 1u);
+  uint32_t valid_per_batch =
+      std::min(options_.prefetch_valid_blocks_per_batch(), batch_size);
+  // Published LINEAR checkpoints are evictable. Counting only the free list
+  // shrinks to one group once earlier requests fill the host prefix cache,
+  // and the next batch then overwrites the only copy of the previous batch.
+  const uint32_t reusable_slots = static_cast<uint32_t>(num_available_blocks());
+  // Keep the largest valid count that divides the batch. Use two groups when
+  // they fit; otherwise keep one group and leave later batches empty.
+  while (valid_per_batch > 0 && (batch_size % valid_per_batch != 0 ||
+                                 valid_per_batch > reusable_slots)) {
+    --valid_per_batch;
+  }
+  const uint32_t groups =
+      valid_per_batch == 0 ? 0 : (reusable_slots < valid_per_batch * 2 ? 1 : 2);
+
+  const uint32_t stride =
+      valid_per_batch == 0 ? 0 : batch_size / valid_per_batch;
+  const size_t pool_size = static_cast<size_t>(groups) * valid_per_batch;
+  std::vector<Block> pool = block_allocator()->allocate(pool_size);
+  if (pool.size() != pool_size) {
+    pool.clear();
+  }
+
+  seq->update_block_hashes(static_cast<uint32_t>(block_size()),
+                           options_.hasher_type());
+  const Slice<XXH3Key> hashes =
+      seq->block_hashes(static_cast<uint32_t>(block_size()));
+  CHECK_GE(hashes.size(), target_blocks);
+
+  size_t placed = 0;
+  if (!pool.empty() && stride > 0) {
+    const size_t placeable = prefetch_blocks / stride * stride;
+    for (size_t offset = 0; offset < placeable; ++offset) {
+      const size_t batch = (matched_blocks + offset) / batch_size;
+      const size_t group = groups == 0 ? 0 : batch % groups;
+      const size_t in_batch = offset % batch_size;
+      if ((in_batch + 1) % stride != 0) {
+        continue;
+      }
+      const size_t slot = group * valid_per_batch + in_batch / stride;
+      Block alias = pool[slot];
+      alias.set_hash_value(hashes[matched_blocks + offset].data);
+      blocks[matched_blocks + offset] = std::move(alias);
+      ++placed;
+    }
+    // A partial stride has no LINEAR checkpoint. Store writes one checkpoint
+    // per full stride (batch_size / V KV blocks). Pinning the last KV block
+    // onto that page asks for a hash the prefill never published.
+  }
+
+  host_state.replace_composite_blocks(BlockType::LINEAR,
+                                      std::move(blocks),
+                                      /*num_shared_blocks=*/0,
+                                      /*cache_publish_cursor=*/0);
+  const size_t aligned = stride == 0 ? 0 : prefetch_blocks / stride;
+  return placed == aligned;
 }
 
 void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
@@ -166,17 +221,18 @@ void LinearStateBlockManager::trim_prefetch_blocks(Sequence* seq,
 
   VLOG(10) << "[trim_prefetch_blocks] retaining source, publishing to cache";
 
+  // Publish only the last hit checkpoint. Earlier valid blocks in the
+  // accepted range are released with the temporary vector below.
   // LinearStatePrefixCache needs the absolute checkpoint index to derive the
-  // chained key. Publish through a sparse logical vector, then collapse the
-  // sequence-owned view to the single restore source required by Linear
-  // runtime allocation.
+  // chained key, so the published vector stays sparse up to that index.
   seq->update_block_hashes(static_cast<uint32_t>(block_size()),
                            options_.hasher_type());
   const Slice<XXH3Key> hashes =
       seq->block_hashes(static_cast<uint32_t>(block_size()));
   CHECK_GT(hashes.size(), source_index);
   std::vector<Block> publish(source_index + 1);
-  publish[source_index] = source;
+  publish[source_index] = std::move(source);
+  source = publish[source_index];
   BlockManagerImpl::cache(seq->hash_tokens(options_.hasher_type()),
                           publish,
                           /*existed_shared_blocks_num=*/0,

@@ -46,6 +46,9 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(bool, enable_disagg_pd) = false;
     PROPERTY(bool, enable_kvcache_store) = false;
     PROPERTY(uint32_t, prefetch_batch_size) = 2;
+    // Valid LINEAR blocks placed in one prefetch batch. Forwarded only to the
+    // host LINEAR leaf.
+    PROPERTY(uint32_t, prefetch_valid_blocks_per_batch) = 1;
     // Host prefix-cache offload (host_blocks_factor > 1). Wraps composite
     // leaves in ConcurrentBlockManagerImpl so the async D2H offload callback
     // can free blocks off-thread safely.

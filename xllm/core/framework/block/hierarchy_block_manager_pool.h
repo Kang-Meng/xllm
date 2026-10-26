@@ -29,6 +29,18 @@ namespace xllm {
 
 class Engine;
 
+// Last LINEAR checkpoint that every rank still holds. Indexes are absolute
+// block positions. hit_counts covers the prefetched tail and starts at
+// base_blocks. The host prefix below base_blocks is not inspected. Returns
+// the exclusive block count to retain. Incomplete prefetch tails stay
+// invalid at allocate time, so selection only reads is_valid(), hit counts,
+// and overwritten block ids.
+size_t last_reusable_linear_checkpoint(const Slice<Block>& linear_blocks,
+                                       size_t base_blocks,
+                                       size_t kv_common_blocks,
+                                       const std::vector<uint8_t>& hit_counts,
+                                       uint8_t rank_count);
+
 // OffloadBlockPair carries the src/dst blocks (device + host) plus the block
 // type so the completion callback can publish success to the correct Host leaf.
 struct OffloadBlockPair {

@@ -154,6 +154,7 @@ void FixedStepsScheduler::handle_prefill_requests(
     remaining_token_budget -= allocated_tokens;
     remaining_seq_budget -= allocated_seqs;
     prefill_queue_->pop_top();
+    request->record_first_batched_time();
     running_requests_.emplace_back(request);
     running_sequences_.insert(running_sequences_.end(),
                               prefill_sequences.begin(),
@@ -196,6 +197,7 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
       prefill_queue_->push(request);
     } else {
       // request from prefill instance in disagge pd mode.
+      request->record_first_batched_time();
       running_requests_.emplace_back(request);
     }
   };

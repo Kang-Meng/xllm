@@ -697,6 +697,8 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_kvcache_store(options_.enable_kvcache_store())
       .prefetch_batch_size(options_.prefetch_batch_size())
+      .prefetch_valid_blocks_per_batch(
+          options_.prefetch_valid_blocks_per_batch())
       .enable_xtensor(kv_cache_config.enable_xtensor())
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size())

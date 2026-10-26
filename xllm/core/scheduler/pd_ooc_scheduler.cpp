@@ -398,6 +398,7 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
       }
     } else {
       // request from prefill instance in disagge pd mode.
+      request->record_first_batched_time();
       running_requests_.emplace_back(request);
     }
   }
@@ -802,6 +803,7 @@ void PDOOCScheduler::handle_prefill_requests_impl(
     remaining_seq_budget -= allocated_seqs;
     estimate_latency += allocated_estimate_latency;
     waiting_priority_queue->pop_top();
+    request->record_first_batched_time();
     running_requests_.emplace_back(request);
     request->record_num_prefix_cache_tokens();
     running_sequences_.insert(running_sequences_.end(),

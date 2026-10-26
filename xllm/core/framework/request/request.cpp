@@ -172,6 +172,19 @@ void Request::log_prefill_statistic(double total_latency) {
   log_statistic(total_latency, /*prefill_stage=*/true);
 }
 
+void Request::record_first_batched_time() {
+  if (first_batched_time_ == absl::InfinitePast()) {
+    first_batched_time_ = absl::Now();
+  }
+}
+
+double Request::queue_to_batch_latency_ms() const {
+  if (first_batched_time_ == absl::InfinitePast()) {
+    return -1.0;
+  }
+  return absl::ToDoubleMilliseconds(first_batched_time_ - created_time_);
+}
+
 void Request::log_statistic(double total_latency, bool prefill_stage) {
   // log the request statistics
   int idx = 0;
@@ -184,6 +197,13 @@ void Request::log_statistic(double total_latency, bool prefill_stage) {
       const double generation_latency = total_latency - ttft;
       tpot = (generation_latency * 1000.0) / (gen_tokens - 1);
       gen_speed = gen_tokens / generation_latency;
+    }
+    std::string queue_to_batch_log;
+    {
+      std::ostringstream stream;
+      stream << std::fixed << std::setprecision(1)
+             << "queue_to_batch: " << queue_to_batch_latency_ms() << "ms, ";
+      queue_to_batch_log = stream.str();
     }
     std::string speculative_stats_log;
     if (speculative_token_stats_->proposed_tokens > 0) {
@@ -222,8 +242,9 @@ void Request::log_statistic(double total_latency, bool prefill_stage) {
               << seq->finish_reason().to_string().value_or("") << ", "
               << "prompt_tokens: " << seq->num_prompt_tokens() << ", "
               << "num_prefix_cache_tokens: " << num_prefix_cache_tokens_ << ", "
-              << "generated_tokens: " << gen_tokens << ", " << std::fixed
-              << std::setprecision(1) << "ttft: " << ttft * 1000 << "ms, "
+              << "generated_tokens: " << gen_tokens << ", "
+              << queue_to_batch_log << std::fixed << std::setprecision(1)
+              << "ttft: " << ttft * 1000 << "ms, "
               << "total_latency: " << total_latency * 1000 << "ms, "
               << "avg tpot: " << tpot << "ms, "
               << "generation speed: " << gen_speed << " tokens/s"

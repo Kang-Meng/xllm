@@ -101,6 +101,10 @@ class BlockManager {
     // for the unified slot pool. Both are ignored unless linear state is on.
     PROPERTY(bool, enable_linear_state) = false;
     PROPERTY(int32_t, linear_state_num_slots) = 0;
+    // Prefetch batch shape for the host LINEAR leaf. Placement does not read
+    // these yet.
+    PROPERTY(uint32_t, prefetch_batch_size) = 2;
+    PROPERTY(uint32_t, prefetch_valid_blocks_per_batch) = 1;
     // Keep a completed Decode LINEAR checkpoint until the hierarchy pool can
     // pair it with a Host LINEAR destination.
     PROPERTY(bool, preserve_decode_checkpoint) = false;
@@ -125,8 +129,6 @@ class BlockManager {
   explicit BlockManager(Options options) : options_(options) {}
   virtual ~BlockManager() = default;
 
-  // num_blocks defaults to 1. The default lives only on this declaration;
-  // overrides must not repeat it.
   virtual std::vector<Block> allocate(size_t num_blocks) = 0;
 
   // Wrapper calls this after it owns the leaf. BlockManagerImpl and

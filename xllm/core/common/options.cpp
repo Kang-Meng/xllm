@@ -117,6 +117,8 @@ std::string Options::to_string() const {
      << ", enable_kvcache_store: " << enable_kvcache_store()
      << ", prefetch_timeout: " << prefetch_timeout()
      << ", prefetch_batch_size: " << prefetch_batch_size()
+     << ", prefetch_valid_blocks_per_batch: "
+     << prefetch_valid_blocks_per_batch()
      << ", layers_wise_copy_batchs: " << layers_wise_copy_batchs()
      << ", store_protocol: " << store_protocol()
      << ", store_rdma_devices: " << store_rdma_devices()

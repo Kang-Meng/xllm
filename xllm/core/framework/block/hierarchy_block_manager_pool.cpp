@@ -25,6 +25,7 @@ limitations under the License.
 #include <optional>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "block_manager_impl.h"
 #include "composite_block_manager.h"
@@ -309,25 +310,38 @@ size_t finalize_prefetch_tokens(
     CompositeBlockManager::LeafCombination combination,
     const CompositeBlockManager::LeafMap& leaves,
     size_t base_tokens,
-    const PrefetchSummary& summary) {
+    const PrefetchSummary& summary,
+    const Slice<Block>& linear_blocks) {
   const size_t unit_size = prefetch_unit_size(combination, leaves);
+  const uint8_t rank_count = summary.rank_count;
   size_t gated_units = 0;
   while (gated_units < summary.gated_hits.size() &&
-         summary.gated_hits[gated_units] != 0) {
+         summary.gated_hits[gated_units] == rank_count) {
     ++gated_units;
   }
   if (combination == CompositeBlockManager::LeafCombination::FLAT_KV) {
     return base_tokens + gated_units * unit_size;
   }
+  if (combination == CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR) {
+    if (unit_size == 0) {
+      return base_tokens;
+    }
+    const size_t base_blocks = base_tokens / unit_size;
+    const size_t kept_blocks =
+        last_reusable_linear_checkpoint(linear_blocks,
+                                        base_blocks,
+                                        base_blocks + gated_units,
+                                        summary.non_gated_hits,
+                                        rank_count);
+    return kept_blocks * unit_size;
+  }
 
-  // A unit counts only when its KV blocks and its LINEAR or SWA block all
-  // hit. Publish through the deepest such unit inside the contiguous KV
-  // prefix. A missing checkpoint drops that unit. The leaf trim releases
-  // every other temporary block.
+  // SWA publishes the deepest fully hit optional unit inside the contiguous
+  // KV prefix. A missing checkpoint drops that unit.
   size_t deepest_optional_unit = 0;
   const size_t inspect = std::min(gated_units, summary.non_gated_hits.size());
   for (size_t index = 0; index < inspect; ++index) {
-    if (summary.non_gated_hits[index] != 0) {
+    if (summary.non_gated_hits[index] == rank_count) {
       deepest_optional_unit = index + 1;
     }
   }
@@ -359,7 +373,64 @@ void log_prefetch_summary(const Request& request,
             << summary.latency_ms << "ms";
 }
 
+uint8_t prefetch_hit_count(size_t position,
+                           size_t base_blocks,
+                           const std::vector<uint8_t>& hit_counts) {
+  if (position < base_blocks) {
+    return 0;
+  }
+  const size_t unit = position - base_blocks;
+  if (unit >= hit_counts.size()) {
+    return 0;
+  }
+  return hit_counts[unit];
+}
+
 }  // namespace
+
+// A hit past the KV common prefix has overwritten that host page. Incomplete
+// prefetch tails stay invalid at allocate time, so they never enter the
+// overwrite set. Indexes are absolute block positions. hit_counts covers the
+// prefetched tail and starts at base_blocks. Positions below base_blocks are
+// the existing host prefix and are not inspected.
+size_t last_reusable_linear_checkpoint(const Slice<Block>& linear_blocks,
+                                       size_t base_blocks,
+                                       size_t kv_common_blocks,
+                                       const std::vector<uint8_t>& hit_counts,
+                                       uint8_t rank_count) {
+  if (rank_count == 0 || linear_blocks.empty()) {
+    return base_blocks;
+  }
+  const size_t common_end = std::min(kv_common_blocks, linear_blocks.size());
+  const size_t selectable_begin = std::min(base_blocks, common_end);
+  std::unordered_set<int32_t> overwritten_ids;
+  for (size_t index = linear_blocks.size(); index > common_end; --index) {
+    const size_t position = index - 1;
+    const Block& block = linear_blocks[position];
+    if (!block.is_valid()) {
+      continue;
+    }
+    if (prefetch_hit_count(position, base_blocks, hit_counts) == 0) {
+      continue;
+    }
+    overwritten_ids.insert(block.id());
+  }
+  for (size_t index = common_end; index > selectable_begin; --index) {
+    const size_t position = index - 1;
+    const Block& block = linear_blocks[position];
+    if (!block.is_valid()) {
+      continue;
+    }
+    if (prefetch_hit_count(position, base_blocks, hit_counts) < rank_count) {
+      continue;
+    }
+    if (overwritten_ids.find(block.id()) != overwritten_ids.end()) {
+      continue;
+    }
+    return position + 1;
+  }
+  return base_blocks;
+}
 
 HierarchyBlockManagerPool::HierarchyBlockManagerPool(
     const BlockManagerPool::Options& options,
@@ -423,6 +494,9 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
       } else if (type == BlockType::LINEAR) {
         host_options.num_blocks(num_blocks);
         host_options.block_type(BlockType::LINEAR);
+        host_options.prefetch_batch_size(options_.prefetch_batch_size());
+        host_options.prefetch_valid_blocks_per_batch(
+            options_.prefetch_valid_blocks_per_batch());
         host_options.preserve_decode_checkpoint(
             host_options.instance_is_decode() &&
             options_.enable_host_offload());
@@ -1116,11 +1190,12 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
         summary.gated_hits.size() == storage_request_ptr->units.size();
     const bool publish =
         transfer_ok && !request->finished() && !request->cancelled();
-    const size_t final_tokens =
-        finalize_prefetch_tokens(combination,
-                                 host_block_managers_[dp_rank]->leaf_entries(),
-                                 base_tokens,
-                                 summary);
+    const size_t final_tokens = finalize_prefetch_tokens(
+        combination,
+        host_block_managers_[dp_rank]->leaf_entries(),
+        base_tokens,
+        summary,
+        sequence->host_kv_state().blocks(BlockType::LINEAR));
     if (util::store_prefetch_stats_enabled() &&
         !storage_request_ptr->units.empty()) {
       const size_t fetched_tokens =

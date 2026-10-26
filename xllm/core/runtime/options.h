@@ -239,6 +239,9 @@ struct Options {
   // Prefetch from kvcache store copy batch size
   PROPERTY(uint32_t, prefetch_batch_size) = 2;
 
+  // Valid LINEAR blocks placed in one prefetch batch.
+  PROPERTY(uint32_t, prefetch_valid_blocks_per_batch) = 1;
+
   // Maximum idle time for a Store prefetch stream. Zero disables the timeout.
   PROPERTY(uint32_t, prefetch_timeout) = 120000;
 

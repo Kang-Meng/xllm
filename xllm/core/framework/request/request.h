@@ -189,6 +189,14 @@ class Request : public RequestBase {
 
   size_t num_prefix_cache_tokens() const { return num_prefix_cache_tokens_; }
 
+  // First time this request is selected into a batch. Later steps and
+  // preemption restores keep the original timestamp.
+  void record_first_batched_time();
+
+  // Milliseconds from request creation to the first batch selection.
+  // Negative when the request never entered a batch.
+  double queue_to_batch_latency_ms() const;
+
   // Recorded by Mooncake Store prefetch admission when
   // XLLM_STORE_PREFETCH_STATS is enabled.
   void record_store_prefetch(size_t tokens, double latency_ms) {
@@ -230,6 +238,10 @@ class Request : public RequestBase {
   bool prefix_cache_hit_metrics_recorded_ = false;
 
   double end_to_end_latency_offset_seconds_ = 0.0;
+
+  // InfinitePast until the request is selected into a batch for the first
+  // time.
+  absl::Time first_batched_time_ = absl::InfinitePast();
 
   void create_sequences_group();
 

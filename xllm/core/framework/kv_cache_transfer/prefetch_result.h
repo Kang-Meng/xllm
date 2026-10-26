@@ -133,9 +133,10 @@ inline const char* prefetch_stop_reason_name(PrefetchStopReason reason) {
 }
 
 struct PrefetchSummary final {
-  // Per-unit AND across all workers. gated_hits is used for the contiguous
-  // full-cache prefix; non_gated_hits selects the deepest optional checkpoint
-  // inside that prefix.
+  // Per-unit sum across all workers. A unit is a full hit when its value
+  // equals rank_count. gated_hits is the contiguous full-cache prefix;
+  // non_gated_hits selects the deepest optional checkpoint inside that prefix.
+  uint8_t rank_count = 0;
   std::vector<uint8_t> gated_hits;
   std::vector<uint8_t> non_gated_hits;
 
@@ -266,18 +267,19 @@ class PrefetchResult final {
       CHECK_GT(remaining_workers_, 0u);
       --remaining_workers_;
       if (remaining_workers_ == 0) {
-        summary.gated_hits.assign(request_.unit_count(), 1);
-        summary.non_gated_hits.assign(request_.unit_count(), 1);
+        const size_t unit_count = request_.unit_count();
+        summary.rank_count = static_cast<uint8_t>(workers_.size());
+        summary.gated_hits.assign(unit_count, 0);
+        summary.non_gated_hits.assign(unit_count, 0);
         for (const WorkerProgress& progress : workers_) {
-          for (size_t index = 0; index < request_.unit_count(); ++index) {
-            summary.gated_hits[index] =
-                summary.gated_hits[index] && progress.gated_hits[index];
-            summary.non_gated_hits[index] =
-                summary.non_gated_hits[index] && progress.non_gated_hits[index];
+          for (size_t index = 0; index < unit_count; ++index) {
+            summary.gated_hits[index] += progress.gated_hits[index];
+            summary.non_gated_hits[index] += progress.non_gated_hits[index];
           }
         }
         fill_measurement(&summary);
         if (failed_) {
+          summary.rank_count = 0;
           summary.gated_hits.clear();
           summary.non_gated_hits.clear();
         }

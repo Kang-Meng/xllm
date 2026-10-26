@@ -270,6 +270,9 @@ class Options {
   // Prefetch from kvcache store copy batch size
   PROPERTY(uint32_t, prefetch_batch_size) = 2;
 
+  // Valid LINEAR blocks placed in one prefetch batch.
+  PROPERTY(uint32_t, prefetch_valid_blocks_per_batch) = 1;
+
   // Host KV layer-wise copy batches.
   PROPERTY(uint32_t, layers_wise_copy_batchs) = 4;
 

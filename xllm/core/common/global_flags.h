@@ -256,6 +256,8 @@ DECLARE_uint32(prefetch_timeout);
 
 DECLARE_uint32(prefetch_batch_size);
 
+DECLARE_uint32(prefetch_valid_blocks_per_batch);
+
 DECLARE_uint32(layers_wise_copy_batchs);
 
 DECLARE_double(host_blocks_factor);

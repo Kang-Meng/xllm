@@ -15,8 +15,13 @@ limitations under the License.
 
 #include "core/framework/config/kv_cache_store_config.h"
 
+#include <glog/logging.h>
+
+#include <algorithm>
+
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
+#include "core/framework/config/execution_config.h"
 
 DEFINE_uint32(
     prefetch_timeout,
@@ -28,7 +33,16 @@ DEFINE_uint32(prefetch_batch_size,
               2,
               "Prefetch from kvcache store copy batch size.");
 
-DEFINE_uint32(layers_wise_copy_batchs, 4, "Layer wise H2D copy batchs.");
+DEFINE_uint32(prefetch_valid_blocks_per_batch,
+              1,
+              "Valid LINEAR blocks placed in one prefetch batch. At startup "
+              "this is clamped to max(min(prefetch_batch_size, value), 1) "
+              "and then to the largest divisor of prefetch_batch_size.");
+
+DEFINE_uint32(layers_wise_copy_batchs,
+              4,
+              "Layer wise H2D copy batches. Graph mode waits for every copy "
+              "before replay and initializes this to 1.");
 
 DEFINE_double(host_blocks_factor,
               0.0,
@@ -63,10 +77,60 @@ DEFINE_bool(enable_control_h2d_block_num,
             "Whether to control h2d copy block num.");
 
 namespace xllm {
+namespace {
+
+// prefetch_batch_size is max(1, value). prefetch_valid_blocks_per_batch is
+// max(min(batch, requested), 1). A value that already divides the batch stays;
+// otherwise it walks down to the nearest divisor.
+void normalize_prefetch_batch_shape() {
+  const uint32_t requested_batch = FLAGS_prefetch_batch_size;
+  const uint32_t batch_size = std::max(requested_batch, 1u);
+  if (batch_size != requested_batch) {
+    LOG(WARNING) << "prefetch_batch_size=" << requested_batch
+                 << " is below 1; using max(1, prefetch_batch_size)="
+                 << batch_size << ".";
+    FLAGS_prefetch_batch_size = batch_size;
+  }
+
+  const uint32_t requested_valid = FLAGS_prefetch_valid_blocks_per_batch;
+  uint32_t valid_per_batch =
+      std::max(std::min(batch_size, requested_valid), 1u);
+  while (valid_per_batch > 1 && batch_size % valid_per_batch != 0) {
+    --valid_per_batch;
+  }
+  if (valid_per_batch != requested_valid) {
+    LOG(WARNING) << "prefetch_valid_blocks_per_batch=" << requested_valid
+                 << " with prefetch_batch_size=" << batch_size
+                 << " does not match max(min(prefetch_batch_size, "
+                    "prefetch_valid_blocks_per_batch), 1) rounded down to a "
+                    "divisor of prefetch_batch_size; using "
+                 << valid_per_batch << ".";
+    FLAGS_prefetch_valid_blocks_per_batch = valid_per_batch;
+  }
+}
+
+// Graph replay cannot wait between layers. One event covers the whole H2D
+// copy, and both the Python and C++ graph paths wait for it before replay.
+void normalize_layers_wise_copy_batchs() {
+  if (!ExecutionConfig::get_instance().enable_graph()) {
+    return;
+  }
+  const uint32_t requested = FLAGS_layers_wise_copy_batchs;
+  if (requested == 1) {
+    return;
+  }
+  LOG(WARNING) << "layers_wise_copy_batchs=" << requested
+               << " is not compatible with enable_graph; using 1 so the "
+                  "whole Host load finishes before graph replay.";
+  FLAGS_layers_wise_copy_batchs = 1;
+}
+
+}  // namespace
 
 void KVCacheStoreConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(prefetch_timeout);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(prefetch_batch_size);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(prefetch_valid_blocks_per_batch);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(layers_wise_copy_batchs);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(host_blocks_factor);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_kvcache_store);
@@ -81,6 +145,7 @@ void KVCacheStoreConfig::from_flags() {
 void KVCacheStoreConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(prefetch_timeout);
   XLLM_CONFIG_ASSIGN_FROM_JSON(prefetch_batch_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(prefetch_valid_blocks_per_batch);
   XLLM_CONFIG_ASSIGN_FROM_JSON(layers_wise_copy_batchs);
   XLLM_CONFIG_ASSIGN_FROM_JSON(host_blocks_factor);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_kvcache_store);
@@ -99,6 +164,8 @@ void KVCacheStoreConfig::append_config_json(
       config_json, default_config, prefetch_timeout);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, prefetch_batch_size);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, prefetch_valid_blocks_per_batch);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, layers_wise_copy_batchs);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -125,6 +192,8 @@ KVCacheStoreConfig& KVCacheStoreConfig::get_instance() {
 }
 
 void KVCacheStoreConfig::initialize() {
+  normalize_prefetch_batch_shape();
+  normalize_layers_wise_copy_batchs();
   from_flags();
   if (const auto& json_config = config::get_parsed_json_config()) {
     from_json(*json_config);

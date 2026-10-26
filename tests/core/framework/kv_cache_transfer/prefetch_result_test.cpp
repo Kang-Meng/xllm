@@ -83,7 +83,8 @@ TEST(PrefetchResultTest, CompleteRunReportsComplete) {
   ASSERT_TRUE(harness.summary().has_value());
   const PrefetchSummary& summary = *harness.summary();
   EXPECT_EQ(summary.stop_reason, PrefetchStopReason::COMPLETE);
-  EXPECT_EQ(summary.gated_hits, std::vector<uint8_t>({1, 1, 1}));
+  EXPECT_EQ(summary.rank_count, 2u);
+  EXPECT_EQ(summary.gated_hits, std::vector<uint8_t>({2, 2, 2}));
   EXPECT_GE(summary.latency_ms, 0.0);
 }
 
@@ -97,6 +98,7 @@ TEST(PrefetchResultTest, GatedMissIsReported) {
 
   ASSERT_TRUE(harness.summary().has_value());
   EXPECT_EQ(harness.summary()->stop_reason, PrefetchStopReason::MISS);
+  EXPECT_EQ(harness.summary()->rank_count, 1u);
   EXPECT_EQ(harness.summary()->gated_hits, std::vector<uint8_t>({1, 0, 0, 0}));
 }
 

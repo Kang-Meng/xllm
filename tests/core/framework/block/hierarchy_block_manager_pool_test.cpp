@@ -2412,7 +2412,7 @@ TEST(PrefetchResultTest, UsesMinimumContiguousUnitPrefixAcrossWorkers) {
       [&common_hit_units](PrefetchSummary summary) {
         common_hit_units = 0;
         while (common_hit_units < summary.gated_hits.size() &&
-               summary.gated_hits[common_hit_units] != 0) {
+               summary.gated_hits[common_hit_units] == summary.rank_count) {
           ++common_hit_units;
         }
       });
@@ -2517,11 +2517,12 @@ TEST(PrefetchResultTest, OptionalMissDoesNotStopGatePrefix) {
   EXPECT_EQ(*control, PrefetchControl::STOP);
   result.mark_worker_ended(/*worker_index=*/0, /*worker_ok=*/true);
 
+  EXPECT_EQ(summary.rank_count, 1u);
   EXPECT_EQ(summary.gated_hits, (std::vector<uint8_t>{1, 1}));
   EXPECT_EQ(summary.non_gated_hits, (std::vector<uint8_t>{0, 0}));
 }
 
-TEST(PrefetchResultTest, LogicalHitsAreAndedAcrossWorkers) {
+TEST(PrefetchResultTest, LogicalHitsAreSummedAcrossWorkers) {
   StoragePrefetchRequest request;
   for (size_t unit_index = 0; unit_index < 2; ++unit_index) {
     PrefetchUnit unit;
@@ -2561,8 +2562,9 @@ TEST(PrefetchResultTest, LogicalHitsAreAndedAcrossWorkers) {
           .has_value());
   result.mark_worker_ended(1, /*worker_ok=*/true);
 
-  EXPECT_EQ(summary.gated_hits, (std::vector<uint8_t>{1, 1}));
-  EXPECT_EQ(summary.non_gated_hits, (std::vector<uint8_t>{0, 0}));
+  EXPECT_EQ(summary.rank_count, 2u);
+  EXPECT_EQ(summary.gated_hits, (std::vector<uint8_t>{2, 2}));
+  EXPECT_EQ(summary.non_gated_hits, (std::vector<uint8_t>{1, 1}));
 }
 
 TEST(PrefetchResultTest, WorkerFailureMarksSummaryUnsuccessful) {
@@ -2626,6 +2628,7 @@ TEST(StoragePrefetchRequestTest, SwaMissPreservesCompressedGatePrefix) {
                       0, std::vector<uint8_t>{1, 1}, std::vector<uint8_t>{0, 0})
                   .has_value());
   result.mark_worker_ended(0, true);
+  EXPECT_EQ(summary.rank_count, 1u);
   EXPECT_EQ(summary.gated_hits, (std::vector<uint8_t>{1, 1}));
   EXPECT_EQ(summary.non_gated_hits, (std::vector<uint8_t>{0, 0}));
 }
@@ -2652,7 +2655,7 @@ TEST(PrefetchResultTest, StopsAfterCancellationOrTimeout) {
       [&common_hit_units](PrefetchSummary summary) {
         common_hit_units = 0;
         while (common_hit_units < summary.gated_hits.size() &&
-               summary.gated_hits[common_hit_units] != 0) {
+               summary.gated_hits[common_hit_units] == summary.rank_count) {
           ++common_hit_units;
         }
       });
@@ -4394,6 +4397,135 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_EQ(c128_pairs, 1u);
 
   pool.deallocate(&sequence);
+}
+
+namespace {
+
+Block linear_block(int32_t id) { return Block(id, nullptr); }
+
+}  // namespace
+
+TEST(LinearPrefetchSelectionTest, KeepsLatestUnwrittenFullHit) {
+  std::vector<Block> blocks = {linear_block(1),
+                               linear_block(2),
+                               linear_block(3),
+                               linear_block(4),
+                               linear_block(1),
+                               linear_block(2)};
+  const std::vector<uint8_t> hits = {2, 2, 2, 2, 0, 2};
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/4, hits, 2),
+            4u);
+}
+
+TEST(LinearPrefetchSelectionTest, CompletedNextGroupOverwritesEarlierAlias) {
+  std::vector<Block> blocks(4);
+  blocks[0] = linear_block(1);
+  blocks[1] = linear_block(2);
+  blocks[2] = linear_block(1);
+  blocks[3] = linear_block(2);
+  const std::vector<uint8_t> hits = {2, 2, 2, 2};
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/4, hits, 2),
+            4u);
+  // The second batch rewrites both pages and sits past the KV prefix.
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/2, hits, 2),
+            0u);
+}
+
+TEST(LinearPrefetchSelectionTest, HitPastKvPrefixOverwritesEarlierAlias) {
+  std::vector<Block> blocks(2, linear_block(1));
+  const std::vector<uint8_t> hits = {2, 2};
+  // The second batch rewrites the only page and sits past the KV prefix.
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/1, hits, 2),
+            0u);
+}
+
+TEST(LinearPrefetchSelectionTest, HostPrefixIsNotAPrefetchHit) {
+  std::vector<Block> blocks = {linear_block(7), linear_block(1)};
+  const std::vector<uint8_t> hits = {0};
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/1, /*kv_common_blocks=*/1, hits, 2),
+            1u);
+}
+
+// The host prefix shares a page with a later prefetch hit. Selection stops
+// at base_blocks, so that prefix is neither selected nor treated as written.
+TEST(LinearPrefetchSelectionTest, HostPrefixIsNotInspected) {
+  std::vector<Block> blocks = {
+      linear_block(1), linear_block(9), linear_block(1)};
+  const std::vector<uint8_t> hits = {2, 2};
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/1, /*kv_common_blocks=*/2, hits, 2),
+            2u);
+}
+
+// Later aliases reuse some earlier pages but leave one unpolluted id, so the
+// deepest full hit stays selectable.
+TEST(LinearPrefetchSelectionTest, PartialGroupReuseKeepsEarlierBatch) {
+  std::vector<Block> blocks(16);
+  blocks[3] = linear_block(1);
+  blocks[7] = linear_block(2);
+  blocks[11] = linear_block(1);
+  blocks[15] = linear_block(3);
+  std::vector<uint8_t> hits(16, 2);
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/16, hits, 2),
+            16u);
+}
+
+// Deepest full hit inside the KV prefix wins when nothing past the prefix
+// rewrites its page.
+TEST(LinearPrefetchSelectionTest, TailCheckpointInsidePrefixIsKept) {
+  std::vector<Block> blocks(15);
+  blocks[3] = linear_block(1);
+  blocks[7] = linear_block(2);
+  blocks[11] = linear_block(3);
+  blocks[14] = linear_block(1);
+  std::vector<uint8_t> hits(15, 2);
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/15, hits, 2),
+            15u);
+}
+
+TEST(LinearPrefetchSelectionTest, KeepsDeepestFullHitInsideKvPrefix) {
+  std::vector<Block> blocks(15);
+  blocks[3] = linear_block(1);
+  blocks[7] = linear_block(2);
+  blocks[11] = linear_block(1);
+  std::vector<uint8_t> hits(15, 2);
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/15, hits, 2),
+            12u);
+}
+
+// A miss past the KV prefix does not pollute. The full hit at position 4
+// stays reusable even though an earlier alias shared its page id.
+TEST(LinearPrefetchSelectionTest, MissPastKvPrefixDoesNotOverwrite) {
+  std::vector<Block> blocks(6);
+  blocks[0] = linear_block(1);
+  blocks[1] = linear_block(2);
+  blocks[4] = linear_block(1);
+  const std::vector<uint8_t> hits = {2, 2, 0, 0, 2, 0};
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/5, hits, 2),
+            5u);
+}
+
+// Invalid slots past the KV prefix never enter the overwrite set, matching
+// allocate_for_prefetch leaving incomplete tails empty.
+TEST(LinearPrefetchSelectionTest, InvalidPastKvPrefixDoesNotOverwrite) {
+  std::vector<Block> blocks(20);
+  blocks[3] = linear_block(1);
+  blocks[7] = linear_block(2);
+  blocks[11] = linear_block(1);
+  // Positions 16-19 stay default-invalid.
+  std::vector<uint8_t> hits(20, 2);
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/17, hits, 2),
+            12u);
 }
 
 }  // namespace xllm

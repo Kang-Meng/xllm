@@ -277,6 +277,7 @@ void UnifiedPolicy::schedule_from_unified_queue(
 
     if (!blocks_exhausted && !budget_exhausted) {
       unified.pop_front();
+      request->record_first_batched_time();
       request->record_num_prefix_cache_tokens();
       state.running_requests.emplace_back(request);
       state.running_sequences.insert(state.running_sequences.end(),

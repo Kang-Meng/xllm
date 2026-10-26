@@ -184,7 +184,7 @@ TEST_P(EngineHostTransferTest, PrefetchWaitsForEveryShardAndStopsAtFirstMiss) {
         ++callbacks;
         common_prefix = 0;
         while (common_prefix < summary.gated_hits.size() &&
-               summary.gated_hits[common_prefix] != 0) {
+               summary.gated_hits[common_prefix] == summary.rank_count) {
           ++common_prefix;
         }
       });

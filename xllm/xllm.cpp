@@ -218,6 +218,8 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .enable_kvcache_store(kv_cache_store_config.enable_kvcache_store())
       .prefetch_timeout(kv_cache_store_config.prefetch_timeout())
       .prefetch_batch_size(kv_cache_store_config.prefetch_batch_size())
+      .prefetch_valid_blocks_per_batch(
+          kv_cache_store_config.prefetch_valid_blocks_per_batch())
       .layers_wise_copy_batchs(kv_cache_store_config.layers_wise_copy_batchs())
       .store_protocol(kv_cache_store_config.store_protocol())
       .store_rdma_devices(kv_cache_store_config.store_rdma_devices())

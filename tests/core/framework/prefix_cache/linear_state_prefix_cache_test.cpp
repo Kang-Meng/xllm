@@ -20,6 +20,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/request/sequence.h"
 #include "framework/block/block_manager_pool_test_peer.h"
 #include "framework/block/linear_state_block_manager.h"
 #include "util/hash_util.h"
@@ -57,6 +58,44 @@ BlockManager::Options linear_options(uint32_t num_slots, int32_t block_size) {
   BlockManager::Options options;
   options.num_blocks(num_slots).block_size(block_size);
   return options;
+}
+
+Sequence make_prefetch_sequence(size_t num_tokens) {
+  static RequestSamplingParam sampling_param;
+  static StoppingChecker stopping_checker(/*max_generated_tokens=*/16,
+                                          /*max_context_len=*/0,
+                                          /*eos_token=*/-1,
+                                          /*ignore_eos=*/false,
+                                          /*stop_tokens=*/{},
+                                          /*stop_sequences=*/{});
+  SequenceParams seq_params;
+  seq_params.seq_capacity = num_tokens + 16;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.skip_special_tokens = true;
+  IncrementalDecoder decoder("", num_tokens, false, false);
+  return Sequence(/*index=*/0,
+                  std::vector<int32_t>(num_tokens, 7),
+                  torch::Tensor(),
+                  MMData(),
+                  std::move(decoder),
+                  seq_params);
+}
+
+std::vector<int32_t> placed_ids(const Sequence& sequence,
+                                size_t target_blocks) {
+  const Slice<Block> blocks =
+      sequence.host_kv_state().blocks(BlockType::LINEAR);
+  std::vector<int32_t> ids;
+  ids.reserve(target_blocks);
+  for (size_t index = 0; index < target_blocks; ++index) {
+    if (index < blocks.size() && blocks[index].is_valid()) {
+      ids.push_back(blocks[index].id());
+    } else {
+      ids.push_back(-1);
+    }
+  }
+  return ids;
 }
 
 }  // namespace
@@ -372,6 +411,113 @@ TEST(LinearStatePrefixCacheTest, ReleasedPinAllowsCheckpointReclaim) {
   EXPECT_EQ(insert_checkpoint(cache, h2), slot);
   EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h1));
   EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h2));
+}
+
+// batch 8, V 2, stride 4, two groups. Valid slots sit at the end of each
+// stride and batch n reuses batch n-2. A short tail that cannot fill one
+// stride stays invalid.
+TEST(LinearStatePrefixCacheTest, PrefetchCyclesTwoGroupsPastTheFirstPair) {
+  BlockManager::Options options =
+      linear_options(/*num_slots=*/8, /*block_size=*/128);
+  options.enable_prefix_cache(true)
+      .prefetch_batch_size(8)
+      .prefetch_valid_blocks_per_batch(2);
+  LinearStateBlockManager cache(options);
+  Sequence sequence = make_prefetch_sequence(/*num_tokens=*/20 * 128);
+
+  ASSERT_TRUE(cache.allocate_for_prefetch(&sequence, /*num_tokens=*/20 * 128));
+  const std::vector<int32_t> ids = placed_ids(sequence, /*target_blocks=*/20);
+  ASSERT_EQ(ids.size(), 20u);
+
+  std::vector<int32_t> group0;
+  std::vector<int32_t> group1;
+  group0.reserve(2);
+  group1.reserve(2);
+  for (size_t index = 0; index < ids.size(); ++index) {
+    const bool slot_end = (index + 1) % 4 == 0;
+    if (!slot_end) {
+      EXPECT_EQ(ids[index], -1) << "index " << index;
+      continue;
+    }
+    EXPECT_GE(ids[index], 1) << "index " << index;
+    const size_t batch = index / 8;
+    if (batch % 2 == 0) {
+      group0.push_back(ids[index]);
+    } else {
+      group1.push_back(ids[index]);
+    }
+  }
+  ASSERT_EQ(group0.size(), 3u);
+  ASSERT_EQ(group1.size(), 2u);
+  EXPECT_EQ(group0[0], ids[3]);
+  EXPECT_EQ(group0[1], ids[7]);
+  EXPECT_EQ(group0[2], ids[19]);
+  EXPECT_EQ(group0[2], group0[0]);
+  EXPECT_EQ(group1[0], ids[11]);
+  EXPECT_EQ(group1[1], ids[15]);
+  EXPECT_NE(group0[0], group0[1]);
+  EXPECT_NE(group1[0], group1[1]);
+  EXPECT_NE(group0[0], group1[0]);
+  EXPECT_NE(group0[1], group1[0]);
+}
+
+// A full host prefix cache is still reusable. Two groups must be allocated by
+// evicting published checkpoints instead of collapsing onto one page.
+TEST(LinearStatePrefixCacheTest, PrefetchReclaimsCachedSlotsForBothGroups) {
+  BlockManager::Options options =
+      linear_options(/*num_slots=*/5, /*block_size=*/128);
+  options.enable_prefix_cache(true)
+      .prefetch_batch_size(8)
+      .prefetch_valid_blocks_per_batch(2);
+  LinearStateBlockManager cache(options);
+  // Padding occupies slot 0. Publish the other four so the free list is empty.
+  for (uint8_t tag = 1; tag <= 4; ++tag) {
+    ASSERT_GE(insert_checkpoint(cache, make_hash(tag)), 1);
+  }
+  EXPECT_EQ(cache.num_free_blocks(), 0u);
+  EXPECT_GE(cache.num_available_blocks(), 4u);
+
+  Sequence sequence = make_prefetch_sequence(/*num_tokens=*/16 * 128);
+  ASSERT_TRUE(cache.allocate_for_prefetch(&sequence, /*num_tokens=*/16 * 128));
+  const std::vector<int32_t> ids = placed_ids(sequence, /*target_blocks=*/16);
+  ASSERT_GE(ids[3], 1);
+  ASSERT_GE(ids[7], 1);
+  ASSERT_GE(ids[11], 1);
+  ASSERT_GE(ids[15], 1);
+  EXPECT_NE(ids[3], ids[7]);
+  EXPECT_NE(ids[3], ids[11]);
+  EXPECT_NE(ids[7], ids[11]);
+  // Absolute batch 1 reuses nothing from batch 0. The next even batch would.
+  EXPECT_NE(ids[11], ids[3]);
+  EXPECT_NE(ids[15], ids[7]);
+  EXPECT_NE(ids[11], ids[15]);
+}
+
+// 15 KV blocks end inside a stride. Checkpoints stay on the stride grid, so
+// the last partial stride is left empty. With stride 4 that is 512 tokens.
+TEST(LinearStatePrefixCacheTest, IncompleteStrideStaysEmpty) {
+  BlockManager::Options options =
+      linear_options(/*num_slots=*/8, /*block_size=*/128);
+  options.enable_prefix_cache(true)
+      .prefetch_batch_size(8)
+      .prefetch_valid_blocks_per_batch(2);
+  LinearStateBlockManager cache(options);
+  Sequence sequence = make_prefetch_sequence(/*num_tokens=*/15 * 128);
+
+  ASSERT_TRUE(cache.allocate_for_prefetch(&sequence, /*num_tokens=*/15 * 128));
+  const std::vector<int32_t> ids = placed_ids(sequence, /*target_blocks=*/15);
+  for (size_t index = 0; index < ids.size(); ++index) {
+    const bool checkpoint = index == 3 || index == 7 || index == 11;
+    if (!checkpoint) {
+      EXPECT_EQ(ids[index], -1) << "index " << index;
+    }
+  }
+  ASSERT_GE(ids[3], 1);
+  ASSERT_GE(ids[7], 1);
+  ASSERT_GE(ids[11], 1);
+  EXPECT_NE(ids[3], ids[7]);
+  EXPECT_NE(ids[3], ids[11]);
+  EXPECT_NE(ids[7], ids[11]);
 }
 
 }  // namespace xllm
