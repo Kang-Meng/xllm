@@ -97,6 +97,16 @@ bool Request::expand_sequences(bool share_prefix) {
   return sequences_group_->expand_sequences(share_prefix);
 }
 
+void Request::reset() {
+  // These blocks never entered a forward, so they must not be published.
+  // Sequence::reset drops the aliases without the pool's prefix-cache flush.
+  for (const auto& sequence : sequences()) {
+    if (sequence != nullptr) {
+      sequence->reset();
+    }
+  }
+}
+
 void Request::set_upstream_latency_seconds(double upstream_latency_seconds) {
   const double latency_offset = upstream_latency_seconds - elapsed_seconds();
   end_to_end_latency_offset_seconds_ =

@@ -1888,7 +1888,7 @@ TEST(ContinuousSchedulerTest, PDDecodeBestOfOneSkipsExpansionAndShares) {
 
   // prepare_batch may allocate extra decode blocks; release them before engine
   // teardown (BlockManagerImpl checks all blocks are on the free list).
-  block_manager_pool->deallocate_without_cache(seq0);
+  seq0->reset();
   (void)engine.release();
 }
 

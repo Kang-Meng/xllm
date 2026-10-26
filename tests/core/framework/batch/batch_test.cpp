@@ -3589,7 +3589,7 @@ TEST(BatchTest, CancelledOverlapOutputDoesNotUpdateReleasedSequence) {
       const std::vector<int32_t> cancelled_tokens(cancelled.tokens());
       const size_t free_blocks_before_release = pool.num_free_blocks().front();
       cancelled.set_cancel();
-      pool.deallocate_without_cache(&cancelled);
+      cancelled.reset();
       EXPECT_GT(pool.num_free_blocks().front(), free_blocks_before_release);
       EXPECT_FALSE(cancelled.has_any_blocks());
       EXPECT_FALSE(cancelled.has_linear_state_slot());
@@ -3617,7 +3617,7 @@ TEST(BatchTest, CancelledOverlapOutputDoesNotUpdateReleasedSequence) {
                                torch::tensor({3.0f, 4.0f})));
       EXPECT_EQ(stats->accepted_tokens, 2);
       EXPECT_EQ(stats->proposed_tokens, 3);
-      pool.deallocate_without_cache(&running);
+      running.reset();
     }
   }
 }

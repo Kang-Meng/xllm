@@ -47,14 +47,6 @@ class LinearStateBlockManager final : public BlockManagerImpl {
   bool allocate_for_prefetch(Sequence* seq, size_t num_tokens) override;
   void trim_prefetch_blocks(Sequence* seq, size_t max_hit_tokens) override;
 
-  using BlockManagerImpl::allocate;
-  Block allocate() override;
-
-  std::vector<Block> allocate_shared(
-      const Slice<int32_t>& token_ids,
-      const Slice<Block>& existed_shared_blocks = {},
-      const MMData& mm_data = MMData(),
-      const Slice<XXH3Key>& block_hashes = {}) override;
   void cache(const Slice<int32_t>& token_ids,
              std::vector<Block>& blocks,
              size_t existed_shared_blocks_num = 0,

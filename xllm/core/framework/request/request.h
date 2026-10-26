@@ -60,6 +60,9 @@ class Request : public RequestBase {
 
   bool cancelled() const { return cancelled_.load(std::memory_order_relaxed); }
 
+  // Drop blocks that never entered a forward. The Request stays alive.
+  void reset();
+
   std::optional<Status> error_status() const;
 
   RequestOutput generate_output(const Tokenizer& tokenizer,

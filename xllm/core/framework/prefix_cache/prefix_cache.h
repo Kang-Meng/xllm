@@ -24,6 +24,7 @@ limitations under the License.
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "block_hasher.h"
@@ -61,7 +62,7 @@ class PrefixCache {
                        BlockHasherType hasher_type = BlockHasherType::TEXT)
       : block_size_(block_size), hasher_type_(hasher_type), num_blocks_(0) {}
 
-  virtual ~PrefixCache() = default;
+  virtual ~PrefixCache();
 
   // Solid-prefix probe: walks the chain per block position, stops on the
   // first miss. Reach in tokens is `returned.size() * block_size_`.
@@ -90,12 +91,6 @@ class PrefixCache {
   virtual size_t insert(Slice<Block>& blocks);
   virtual size_t insert(const std::vector<Block>& blocks);
 
-  // Point-lookup by chained hash key. `find` hits refresh LRU recency and
-  // return the block; `contains` is LRU-neutral. Both return an invalid
-  // Block / false on miss.
-  Block find(const XXH3Key& hash);
-  bool contains(const XXH3Key& hash) const;
-
   // Evict up to `n_blocks` LRU-oldest entries. Returns the number evicted.
   virtual size_t evict(size_t n_blocks);
 
@@ -103,6 +98,15 @@ class PrefixCache {
     CHECK(num_blocks_ == cached_blocks_.size()) << "check block num failed";
     return num_blocks_;
   }
+
+  // Cache nodes whose block refcount is 1. Those nodes are the only owner.
+  size_t num_evictable() const { return num_evictable_; }
+
+  // Called from BlockManagerImpl::free after that alias's refcount is
+  // dropped. True when this id is still registered in the prefix cache.
+  // A resident whose refcount is 1 after the drop has the cache node as its
+  // only owner and becomes evictable.
+  bool update_evictable(const Block* block);
 
   float block_match_rate() {
     if (total_blocks_.load() == 0) {
@@ -123,6 +127,17 @@ class PrefixCache {
     Node* prev = nullptr;
     Node* next = nullptr;
   };
+
+  // A prefix hit is about to copy this node. A refcount of 1 means the cache
+  // was the only owner, so the hit takes it out of the evictable set.
+  void claim_matched_block(Node* node);
+
+  // Undo one update_evictable() increment. A PrefixCache that is not the
+  // owning manager's cache never receives that increment.
+  void release_evictable_slot();
+
+  // blocks_by_id_ and cached_blocks_ describe the same residents.
+  void check_cached_block_count() const;
 
   struct DNodeList {
     DNodeList() {
@@ -189,10 +204,17 @@ class PrefixCache {
   uint32_t block_size_;
   BlockHasherType hasher_type_;
   size_t num_blocks_ = 0;
+  size_t num_evictable_ = 0;
   std::unordered_map<XXH3Key, Node*, FixedStringKeyHash, FixedStringKeyEqual>
       cached_blocks_;
+  // Block ids currently resident in this cache. Membership is a set lookup.
+  // Its size matches cached_blocks_ across insert and evict.
+  std::unordered_set<int32_t> blocks_by_id_;
 
   std::atomic<uint64_t> total_blocks_{0}, matched_blocks_{0};
+
+  // Tests probe a resident by hash. Production match/insert do not.
+  friend class BlockManagerPoolTestPeer;
 };
 
 }  // namespace xllm

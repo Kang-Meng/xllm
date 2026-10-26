@@ -56,6 +56,16 @@ struct XXH3Key {
 
     return rt;
   }
+
+  std::string to_hex() const {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string hex(XXH3_128BITS_HASH_VALUE_LEN * 2, '0');
+    for (uint32_t i = 0; i < XXH3_128BITS_HASH_VALUE_LEN; ++i) {
+      hex[i * 2] = kHex[data[i] >> 4];
+      hex[i * 2 + 1] = kHex[data[i] & 0x0f];
+    }
+    return hex;
+  }
 };
 
 struct FixedStringKeyHash {

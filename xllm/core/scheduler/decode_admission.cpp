@@ -122,7 +122,7 @@ DecodeAdmissionResult DecodeAdmission::admit(
   if (decode_headroom_blocks(*block_manager_pool_, dp_rank) <
       reserved_blocks_[dp_rank] + reserve_blocks) {
     // The blocks hold no KV yet, so they must not enter the prefix cache.
-    block_manager_pool_->deallocate_without_cache(sequence);
+    sequence->reset();
     return DecodeAdmissionResult::RETRY_LATER;
   }
   reserved_blocks_[dp_rank] += reserve_blocks;

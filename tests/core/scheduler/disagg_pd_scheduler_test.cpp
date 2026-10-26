@@ -1967,8 +1967,7 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   if (queued == nullptr) {
     decode.pop_decode_request_for_test(&queued);
   }
-  decode_engine.block_manager_pool()->deallocate_without_cache(
-      remote_healthy->sequences()[0].get());
+  remote_healthy->sequences()[0]->reset();
   server.Stop(0);
   server.Join();
 }
@@ -2296,8 +2295,7 @@ TEST_F(ReservationTest, HandoffPreventsReleaseOfRunningResources) {
   ASSERT_TRUE(decode_.pop_decode_request_for_test(&queued));
   EXPECT_EQ(queued, request);
   EXPECT_TRUE(decode_.reservations_empty());
-  engine_.block_manager_pool()->deallocate_without_cache(
-      queued->sequences()[0].get());
+  queued->sequences()[0]->reset();
 }
 
 TEST_F(ReservationTest, ConcurrentHandoffAndReleaseHaveOneOwner) {
@@ -2315,8 +2313,7 @@ TEST_F(ReservationTest, ConcurrentHandoffAndReleaseHaveOneOwner) {
   std::shared_ptr<Request> queued;
   EXPECT_EQ(decode_.pop_decode_request_for_test(&queued), handed_off);
   if (handed_off) {
-    engine_.block_manager_pool()->deallocate_without_cache(
-        queued->sequences()[0].get());
+    queued->sequences()[0]->reset();
   }
   EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks(),
             (std::vector<size_t>{0, 0}));
@@ -2347,7 +2344,7 @@ TEST_F(ReservationTest, ReleasePreservesValidPrefixOnly) {
   pool->allocate_shared(probe->sequences()[0].get());
   EXPECT_EQ(probe->sequences()[0]->kv_state().shared_blocks_num(BlockType::KV),
             2u);
-  pool->deallocate_without_cache(probe->sequences()[0].get());
+  probe->sequences()[0]->reset();
 }
 
 TEST_F(ReservationTest, RejectedAllocationRollsBackWithoutReservation) {
@@ -2427,8 +2424,7 @@ TEST_P(ChunkReservationTest,
   EXPECT_TRUE(decode_.reservations_empty());
   EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks(),
             (std::vector<size_t>{0, 0}));
-  engine.block_manager_pool()->deallocate_without_cache(
-      blocker->sequences()[0].get());
+  blocker->sequences()[0]->reset();
 }
 INSTANTIATE_TEST_SUITE_P(OverlapModes, ChunkReservationTest, ::testing::Bool());
 

@@ -58,9 +58,6 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Allocate num_blocks blocks
   std::vector<Block> allocate(size_t num_blocks) override;
 
-  // Deallocate blocks
-  void deallocate(std::vector<Block>&& blocks) override;
-
   // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
   // (physical allocate() maps VMM pages) and return them; the
   // CompositeBlockManager commits them under BlockType::KV. std::nullopt on
@@ -99,11 +96,14 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Get KV cache utilization
   double kv_cache_utilization() const override;
 
-  // Free a single block by id
-  void free(int32_t block_id) override;
+  // XTensor has no prefix cache. Recycle the page only when refcount is 1.
+  void incr_ref_count(std::atomic<uint32_t>* ref_count) override;
+  uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
+  void free(Block* block) override;
 
-  // Allocate a single block
-  Block allocate() override;
+  void set_block_allocator(BlockManager* allocator) override {
+    block_allocator_ = allocator;
+  }
 
   // Get total number of blocks
   size_t num_total_blocks() const override;
@@ -143,6 +143,12 @@ class XTensorBlockManagerImpl : public BlockManager {
   size_t available_size_internal() const;
 
  private:
+  BlockManager* block_allocator() const {
+    return block_allocator_ == nullptr
+               ? const_cast<XTensorBlockManagerImpl*>(this)
+               : block_allocator_;
+  }
+
   // Model ID (from options_.model_id())
   std::string model_id_;
 
@@ -175,6 +181,8 @@ class XTensorBlockManagerImpl : public BlockManager {
 
   // Mutex for thread safety
   mutable std::mutex mtx_;
+
+  BlockManager* block_allocator_ = nullptr;
 };
 
 }  // namespace xllm

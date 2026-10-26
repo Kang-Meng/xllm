@@ -218,8 +218,6 @@ class DisaggPDScheduler : public ContinuousScheduler {
 
   // Caller holds received_request_map_mutex_. Deallocation stays outside it.
   std::shared_ptr<Request> take_waiting_request(const std::string& req_id);
-  // Caller must not hold received_request_map_mutex_.
-  void release_unscheduled_request(const std::shared_ptr<Request>& request);
   // Caller holds received_request_map_mutex_.
   void prune_cancelled_reservations(absl::Time now);
   // Caller holds received_request_map_mutex_; check and insertion must be

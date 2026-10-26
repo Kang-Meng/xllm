@@ -268,7 +268,7 @@ TEST_F(DecodeAdmissionConcurrencyTest, PublishKeepsConcurrentAdmissionReserve) {
   auto too_large = make_request({11, 12, 13, 14, 15, 16});
   too_large->sequences()[0]->set_dp_rank(0);
   EXPECT_EQ(admission_->admit(too_large), DecodeAdmissionResult::RETRY_LATER);
-  pool_->deallocate_without_cache(too_large->sequences()[0].get());
+  too_large->sequences()[0]->reset();
   EXPECT_EQ(pool_->num_used_blocks()[0], 1u);
 
   // Scheduler ownership replaces the pending reserve instead of adding it.
@@ -279,8 +279,8 @@ TEST_F(DecodeAdmissionConcurrencyTest, PublishKeepsConcurrentAdmissionReserve) {
   auto fits = make_request({21, 22, 23, 24});
   fits->sequences()[0]->set_dp_rank(0);
   EXPECT_EQ(admission_->admit(fits), DecodeAdmissionResult::ADMITTED);
-  pool_->deallocate_without_cache(fits->sequences()[0].get());
-  pool_->deallocate_without_cache(request->sequences()[0].get());
+  fits->sequences()[0]->reset();
+  request->sequences()[0]->reset();
 }
 
 TEST_F(DecodeAdmissionConcurrencyTest,
@@ -311,11 +311,11 @@ TEST_F(DecodeAdmissionConcurrencyTest,
   EXPECT_EQ(admission_->admit(probe), DecodeAdmissionResult::RETRY_LATER);
   EXPECT_EQ(pool_->allocation_calls(), 1);
   EXPECT_EQ(pool_->num_used_blocks()[0], 1u);
-  pool_->deallocate_without_cache(probe->sequences()[0].get());
-  pool_->deallocate_without_cache(request->sequences()[0].get());
+  probe->sequences()[0]->reset();
+  request->sequences()[0]->reset();
   admission_->reopen();
   EXPECT_EQ(admission_->admit(probe), DecodeAdmissionResult::ADMITTED);
-  pool_->deallocate_without_cache(probe->sequences()[0].get());
+  probe->sequences()[0]->reset();
 }
 
 template <typename T>
@@ -499,8 +499,7 @@ TEST_F(HostRestoreSchedulerTest, RestoreDoesNotWaitForOtherRankReservations) {
   EXPECT_TRUE(batches[1].empty());
   EXPECT_TRUE(scheduler_->release_reservation(
       accepted->request_id(), accepted->state().pd_reservation_id));
-  engine_->block_manager_pool()->deallocate_without_cache(
-      allocated->sequences()[0].get());
+  allocated->sequences()[0]->reset();
 }
 
 TEST_F(HostRestoreSchedulerTest, WaitsWhileRankHoldsForeignBlocks) {
@@ -816,8 +815,7 @@ TEST_F(HostRestoreSchedulerTest, DecodeReserveGatesAdmission) {
                                    : DecodeAdmissionResult::RETRY_LATER)
         << "reserved_tokens=" << reserved_tokens;
     if (admission == DecodeAdmissionResult::ADMITTED) {
-      engine_->block_manager_pool()->deallocate_without_cache(
-          probe->sequences()[0].get());
+      probe->sequences()[0]->reset();
     }
     EXPECT_EQ(engine_->block_manager_pool()->num_used_blocks(), used);
     first->set_cancel();
@@ -856,13 +854,11 @@ TEST_F(HostRestoreSchedulerTest, AdmittedRequestKeepsReserveUntilScheduled) {
   EXPECT_EQ(scheduler_->try_admit(probe), DecodeAdmissionResult::RETRY_LATER);
 
   // Once the admitted request is dropped, its reserve goes with it.
-  engine_->block_manager_pool()->deallocate_without_cache(
-      admitted->sequences()[0].get());
+  admitted->sequences()[0]->reset();
   admitted.reset();
   scheduler_->prepare_batch_test();
   EXPECT_EQ(scheduler_->try_admit(probe), DecodeAdmissionResult::ADMITTED);
-  engine_->block_manager_pool()->deallocate_without_cache(
-      probe->sequences()[0].get());
+  probe->sequences()[0]->reset();
 }
 
 TEST_F(HostRestoreSchedulerTest, IdleRankKeepsRoomForNextMtpStep) {
@@ -879,8 +875,7 @@ TEST_F(HostRestoreSchedulerTest, IdleRankKeepsRoomForNextMtpStep) {
   auto fits = make_request(std::vector<int32_t>(4, 1), "fits");
   fits->sequences()[0]->set_dp_rank(0);
   EXPECT_EQ(scheduler_->try_admit(fits), DecodeAdmissionResult::ADMITTED);
-  engine_->block_manager_pool()->deallocate_without_cache(
-      fits->sequences()[0].get());
+  fits->sequences()[0]->reset();
 }
 
 class HostRestoreReadyTest

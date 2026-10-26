@@ -64,11 +64,19 @@ class BlockManagerPoolTestPeer final {
   // (refcount+1, LRU-promoted); contains() only reports presence.
   static bool contains(const LinearStateBlockManager* leaf,
                        const XXH3Key& prefix_hash) {
-    return leaf->prefix_cache_->contains(prefix_hash);
+    const auto& cached = leaf->prefix_cache_->cached_blocks_;
+    return cached.find(prefix_hash) != cached.end();
   }
   static Block match(LinearStateBlockManager* leaf,
                      const XXH3Key& prefix_hash) {
-    return leaf->prefix_cache_->find(prefix_hash);
+    PrefixCache& cache = *leaf->prefix_cache_;
+    auto iter = cache.cached_blocks_.find(prefix_hash);
+    if (iter == cache.cached_blocks_.end()) {
+      return Block();
+    }
+    cache.claim_matched_block(iter->second);
+    cache.lru_lst_.move_back(iter->second);
+    return iter->second->block;
   }
 };
 

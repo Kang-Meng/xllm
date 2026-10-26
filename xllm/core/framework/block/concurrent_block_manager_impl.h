@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
@@ -38,9 +40,10 @@ class ConcurrentBlockManagerImpl : public BlockManager {
 
   // Block-level primitives.
   std::vector<Block> allocate(size_t num_blocks) override;
-  Block allocate() override;
-  void deallocate(std::vector<Block>&& blocks) override;
-  void free(int32_t block_id) override;
+  void incr_ref_count(std::atomic<uint32_t>* ref_count) override;
+  uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
+  void free(Block* block) override;
+  size_t num_evictable_blocks() const override;
 
   std::vector<Block> allocate_shared(
       const Slice<int32_t>& token_ids,
@@ -74,10 +77,6 @@ class ConcurrentBlockManagerImpl : public BlockManager {
 
  private:
   std::unique_ptr<BlockManager> inner_;  // always a leaf, never a composite
-  // Recursive: Block dtors call free() through this wrapper (we rewrite each
-  // returned Block's manager_ to this), and inner_->allocate() may trigger
-  // prefix-cache eviction which destroys cached Blocks while we still hold the
-  // lock from the outer wrapper call.
   mutable std::recursive_mutex mutex_;
 };
 

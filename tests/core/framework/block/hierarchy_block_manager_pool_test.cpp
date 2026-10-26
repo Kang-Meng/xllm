@@ -182,12 +182,12 @@ class HierarchyPoolTestPeer final {
       device_blocks.emplace_back(std::move(pair->src));
       pair.reset();
     }
-    pool.block_managers_.front()->deallocate(std::move(device_blocks));
+    device_blocks.clear();
     for (auto& [type, blocks] : host_blocks) {
       auto* leaf =
           pool.host_block_managers_.front()->leaf_entries().at(type).leaf.get();
       leaf->cache(blocks);
-      leaf->deallocate(std::move(blocks));
+      blocks.clear();
     }
     return stored_keys;
   }
@@ -512,7 +512,7 @@ void seed_host_prefix(BlockManager* leaf, const std::vector<int32_t>& tokens) {
   std::vector<Block> blocks = leaf->allocate(block_count);
   ASSERT_EQ(blocks.size(), block_count);
   leaf->cache(tokens, blocks);
-  leaf->deallocate(std::move(blocks));
+  blocks.clear();
   blocks.clear();
 }
 
@@ -1240,7 +1240,7 @@ TEST(HierarchyBlockManagerPoolTest, HbmAllocationFailureDoesNotQueueH2d) {
   EXPECT_TRUE(sequence.host_kv_state().has_any_blocks());
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
 
-  device->deallocate(std::move(exhausted_c128));
+  exhausted_c128.clear();
   exhausted_c128.clear();
 }
 
@@ -1365,7 +1365,7 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_LT(sequence.host_kv_state().current_max_tokens_capacity(),
             kFailedChunk);
 
-  host_leaf->deallocate(std::move(held));
+  held.clear();
   held.clear();
   ASSERT_TRUE(pool.allocate(&sequence, kFailedChunk));
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), kSecondChunk);
@@ -1431,7 +1431,7 @@ TEST(HierarchyBlockManagerPoolTest,
   // Preempting another request returns its privately held HBM blocks. Prefix
   // cache pins are not returned here, so the test releases the occupied blocks
   // directly and retries the mounted decode request.
-  hbm_leaf->deallocate(std::move(held));
+  held.clear();
   held.clear();
   ASSERT_TRUE(pool.allocate(&sequence, kFailedChunk));
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV),
@@ -1542,7 +1542,7 @@ TEST_P(HostOffloadCompletionTest,
             initial_free - (outcome.publish_ ? 1U : 0U));
   std::vector<Block> matched = host_leaf->allocate_shared(tokens);
   EXPECT_EQ(matched.size(), outcome.publish_ ? 1U : 0U);
-  host_leaf->deallocate(std::move(matched));
+  matched.clear();
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -3050,7 +3050,7 @@ TEST(HierarchyBlockManagerPoolTest,
       hash_sequence.block_hashes(kKvBlockSize)[kTailTokens / kKvBlockSize - 1]
           .data);
   host.at(BlockType::LINEAR).leaf->cache(tail_blocks);
-  host.at(BlockType::LINEAR).leaf->deallocate(std::move(tail_blocks));
+  tail_blocks.clear();
 
   std::shared_ptr<Request> request = make_test_request(tokens);
   Sequence* sequence = request->sequences().front().get();
@@ -3331,7 +3331,7 @@ TEST(HierarchyBlockManagerPoolTest,
           .block_hashes(kKvBlockSize)[kMatchedTailTokens / kKvBlockSize - 1]
           .data);
   host.at(BlockType::LINEAR).leaf->cache(tail_blocks);
-  host.at(BlockType::LINEAR).leaf->deallocate(std::move(tail_blocks));
+  tail_blocks.clear();
 
   std::shared_ptr<Request> request =
       make_test_request(std::vector<int32_t>(kPromptTokens, 17));
@@ -3406,7 +3406,7 @@ TEST_P(LinearTailHostPrefetchTest,
                        /*existed_shared_blocks_num=*/0,
                        hash_sequence.mm_data(),
                        hash_sequence.block_hashes(test_case.kv_block_size));
-    linear_leaf->deallocate(std::move(regular_blocks));
+    regular_blocks.clear();
   }
 
   std::vector<Block> tail_blocks = linear_leaf->allocate(1);
@@ -3418,7 +3418,7 @@ TEST_P(LinearTailHostPrefetchTest,
               test_case.kv_block_size)[tail_tokens / kv_block_size - 1]
           .data);
   linear_leaf->cache(tail_blocks);
-  linear_leaf->deallocate(std::move(tail_blocks));
+  tail_blocks.clear();
 
   std::shared_ptr<Request> request = make_test_request(tokens);
   Sequence* sequence = request->sequences().front().get();
@@ -4037,7 +4037,7 @@ TEST(HierarchyBlockManagerPoolTest,
                      /*existed_shared_blocks_num=*/0,
                      MMData(),
                      sequence->block_hashes(/*block_size=*/128));
-  linear_leaf->deallocate(std::move(checkpoints));
+  checkpoints.clear();
   bool completed = false;
   auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
     // Fatal assertions must not leave the pool holding unfinished callbacks.

@@ -50,6 +50,7 @@ std::vector<Block> LinearStatePrefixCache::match(
       blocks.emplace_back();
       return false;
     }
+    claim_matched_block(iter->second);
     blocks.emplace_back(iter->second->block);
     lru_lst_.remove_node(iter->second);
     node_list.push_front(iter->second);
@@ -110,6 +111,7 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
                                       size_t existed_shared_blocks_num,
                                       const MMData& mm_data,
                                       const Slice<XXH3Key>& block_hashes) {
+  check_cached_block_count();
   const int64_t now = absl::ToUnixMicros(absl::Now());
   // align tokens to block boundary
   const size_t n_blocks =
@@ -117,6 +119,7 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
                blocks.size());
 
   if (n_blocks <= existed_shared_blocks_num) {
+    check_cached_block_count();
     return n_blocks * block_size_;
   }
 
@@ -171,6 +174,10 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
       lru_lst_.remove_node(iter->second);
       node_list.push_front(iter->second);
     } else {
+      // A new hash must name a block that is not already registered under
+      // another hash. One physical block, one chain key.
+      CHECK(blocks_by_id_.find(blocks[block_idx].id()) == blocks_by_id_.end())
+          << "Duplicate block id " << blocks[block_idx].id();
       Node* new_node = new Node();
 
       new_node->block = blocks[block_idx];
@@ -179,6 +186,7 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
       node_list.push_front(new_node);
 
       cached_blocks_.emplace(std::make_pair(token_hash_key, new_node));
+      blocks_by_id_.insert(new_node->block.id());
 
       num_blocks_++;
     }
@@ -190,6 +198,7 @@ size_t LinearStatePrefixCache::insert(const Slice<int32_t>& token_ids,
     lru_lst_.push_back(node);
   }
 
+  check_cached_block_count();
   return n_tokens;
 }
 

@@ -1040,6 +1040,21 @@ void Sequence::update_block_hashes(uint32_t block_size,
                        block_hashes_by_stride_[block_size]);
 }
 
+const std::optional<const XXH3Key*> Sequence::block_hash_at(
+    BlockHasherType hasher_type,
+    size_t block_index,
+    uint32_t block_size) {
+  if (block_size == 0) {
+    return std::nullopt;
+  }
+  update_block_hashes(block_size, hasher_type);
+  const auto it = block_hashes_by_stride_.find(block_size);
+  if (it == block_hashes_by_stride_.end() || block_index >= it->second.size()) {
+    return std::nullopt;
+  }
+  return &it->second[block_index];
+}
+
 void Sequence::invalidate_block_hashes_from(size_t token_index) {
   const size_t lookahead = block_hash_lookahead(hash_type_);
   const size_t stale_token =

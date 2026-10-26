@@ -1752,7 +1752,7 @@ bool PDOOCScheduler::decode_schedule(std::shared_ptr<Request>& request,
   if (!stub) {
     LOG(ERROR) << "Failed to create rpc channel for prefill instance: "
                << prefill_instance_name;
-    release_unscheduled_request(request);
+    request->reset();
     return false;
   }
 
@@ -1768,7 +1768,7 @@ bool PDOOCScheduler::decode_schedule(std::shared_ptr<Request>& request,
                    << request->request_id();
       }
       lock.unlock();
-      release_unscheduled_request(request);
+      request->reset();
       return false;
     }
     received_request_map_[request->request_id()] = request;

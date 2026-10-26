@@ -916,12 +916,12 @@ void DisaggPDScheduler::dispatch_requests() {
         request_queue_.write(requests[i]);
       }
     }
-    VLOG(1) << "Prefill Decode allocation request_id="
-            << requests.front()->request_id()
-            << ", request_count=" << requests.size()
-            << ", prepare_ms=" << allocation_prepare_seconds * 1000.0
-            << ", rpc_ms=" << allocation_rpc_seconds * 1000.0 << ", total_ms="
-            << decode_allocation_timer.elapsed_seconds() * 1000.0;
+    VLOG(20) << "Prefill Decode allocation request_id="
+             << requests.front()->request_id()
+             << ", request_count=" << requests.size()
+             << ", prepare_ms=" << allocation_prepare_seconds * 1000.0
+             << ", rpc_ms=" << allocation_rpc_seconds * 1000.0 << ", total_ms="
+             << decode_allocation_timer.elapsed_seconds() * 1000.0;
   }
 }
 
@@ -1261,13 +1261,6 @@ bool DisaggPDScheduler::is_cancelled_reservation(const Request& request) {
       reservation_key(request.request_id(), request.state().pd_reservation_id));
 }
 
-void DisaggPDScheduler::release_unscheduled_request(
-    const std::shared_ptr<Request>& request) {
-  for (const auto& sequence : request->sequences()) {
-    engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
-  }
-}
-
 bool DisaggPDScheduler::release_reservation(const std::string& req_id,
                                             const std::string& reservation_id) {
   if (req_id.empty() || reservation_id.empty()) {
@@ -1290,7 +1283,9 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
     }
     request = take_waiting_request(req_id);
   }
-  release_unscheduled_request(request);
+  if (request != nullptr) {
+    request->reset();
+  }
   return true;
 }
 
@@ -1305,7 +1300,7 @@ bool DisaggPDScheduler::decode_schedule(
     std::unique_lock<std::mutex> lock(received_request_map_mutex_);
     if (is_cancelled_reservation(*request)) {
       lock.unlock();
-      release_unscheduled_request(request);
+      request->reset();
       return false;
     }
     if (received_request_map_.find(request->request_id()) !=
@@ -1313,7 +1308,7 @@ bool DisaggPDScheduler::decode_schedule(
       LOG(ERROR) << "Decode receive duplicate request_id from prefill: "
                  << request->request_id();
       lock.unlock();
-      release_unscheduled_request(request);
+      request->reset();
       return false;
     }
     received_request_map_[request->request_id()] = request;

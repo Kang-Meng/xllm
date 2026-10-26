@@ -175,19 +175,12 @@ XTensorBlockManagerImpl::allocate_for_sequence(Sequence* seq,
     return std::vector<Block>{};
   }
   const size_t num_additional = num_blocks_needed - held;
-  std::vector<Block> blocks = allocate(num_additional);  // VMM page alloc
+  std::vector<Block> blocks =
+      block_allocator()->allocate(num_additional);  // VMM page alloc
   if (blocks.size() != num_additional) {
     return std::nullopt;
   }
   return blocks;
-}
-
-Block XTensorBlockManagerImpl::allocate() {
-  auto blocks = allocate(1);
-  if (blocks.empty()) {
-    return Block();  // Invalid block
-  }
-  return std::move(blocks[0]);
 }
 
 void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {
@@ -257,14 +250,26 @@ void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {
   }
 }
 
-void XTensorBlockManagerImpl::deallocate(std::vector<Block>&& blocks) {
-  // Block destructors call free() when the last reference is released.
-  // Prefix cache is not supported in XTensor mode.
-  blocks.clear();
+void XTensorBlockManagerImpl::incr_ref_count(std::atomic<uint32_t>* ref_count) {
+  CHECK(ref_count != nullptr);
+  ref_count->fetch_add(1, std::memory_order_relaxed);
 }
 
-void XTensorBlockManagerImpl::free(int32_t block_id) {
-  free_blocks({block_id});
+uint32_t XTensorBlockManagerImpl::dec_ref_count(
+    std::atomic<uint32_t>* ref_count) {
+  CHECK(ref_count != nullptr);
+  return ref_count->fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void XTensorBlockManagerImpl::free(Block* block) {
+  CHECK(block != nullptr && block->id() != 0);
+  // No prefix cache. refcount 1 is the last alias. The drop goes through the
+  // block so ConcurrentBlockManagerImpl::dec_ref_count runs under the same
+  // lock that covers this read.
+  release_block_ref(block);
+  if (block->ref_count() == 0) {
+    free_blocks({block->id()});
+  }
 }
 
 std::vector<Block> XTensorBlockManagerImpl::allocate_shared(

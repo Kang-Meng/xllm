@@ -104,8 +104,6 @@ class BlockManagerPool : public KVCacheManager {
   void deallocate(std::vector<Sequence*>& sequences) override;
   void deallocate(Sequence* sequence) override;
 
-  void deallocate_without_cache(Sequence* sequence);
-
   void allocate_shared(Sequence* sequence) override;
   void cache(Sequence* sequence) override;
   void cache(Sequence* sequence, size_t num_tokens) override;
@@ -122,6 +120,7 @@ class BlockManagerPool : public KVCacheManager {
   void reset_prefix_cache() override;
   std::vector<size_t> num_blocks_in_prefix_cache() const override;
   std::vector<size_t> num_free_blocks() const override;
+  std::vector<size_t> num_available_blocks() const override;
   std::vector<size_t> num_used_blocks() const override;
   double kv_cache_utilization() const override;
   std::vector<double> kv_cache_utilization_per_dp() const override;

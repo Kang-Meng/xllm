@@ -56,7 +56,7 @@ std::optional<std::vector<Block>> EmbeddingBlockManager::allocate_for_sequence(
   if (kv_state.num_blocks(block_type()) > 0) {
     return std::vector<Block>{};
   }
-  std::vector<Block> blocks = allocate(1);
+  std::vector<Block> blocks = block_allocator()->allocate(1);
   if (blocks.empty()) {
     LOG(ERROR) << "Failed to allocate " << resource_name_
                << "! free=" << num_free_blocks()
@@ -67,21 +67,6 @@ std::optional<std::vector<Block>> EmbeddingBlockManager::allocate_for_sequence(
     return std::nullopt;
   }
   return blocks;
-}
-
-Block EmbeddingBlockManager::allocate() {
-  // Surface exhaustion with this resource's identity instead of the generic
-  // base message, then delegate to the counting allocate(1) path (the base
-  // zero-arg allocate() skips num_used accounting -- it exists for padding).
-  // The base ctor's padding reservation runs before this vtable entry is
-  // active, so it still uses BlockManagerImpl::allocate().
-  CHECK_GT(num_free_blocks(), 0u)
-      << (exhaustion_message_.empty()
-              ? "No more " + resource_name_ + " blocks available"
-              : exhaustion_message_);
-  std::vector<Block> blocks = BlockManagerImpl::allocate(1);
-  CHECK_EQ(blocks.size(), 1u);
-  return std::move(blocks[0]);
 }
 
 std::vector<Block> EmbeddingBlockManager::allocate_shared(

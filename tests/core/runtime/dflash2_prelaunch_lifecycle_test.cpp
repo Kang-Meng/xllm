@@ -709,7 +709,7 @@ TEST_P(DFlash2PrelaunchLifecycleTest,
   ASSERT_FALSE(continuing.finished());
   for (size_t i = 0; i < kBlockTypes.size(); ++i) {
     SCOPED_TRACE(static_cast<int32_t>(kBlockTypes[i]));
-    manager.deallocate(ending.kv_state().take_blocks(kBlockTypes[i]));
+    (void)ending.kv_state().take_blocks(kBlockTypes[i]);
     auto blocks = manager.allocate(1);
     ASSERT_EQ(blocks.size(), 1u);
     ASSERT_EQ(blocks.front().id(), ending_ids[i]);
@@ -732,8 +732,8 @@ TEST_P(DFlash2PrelaunchLifecycleTest,
     SCOPED_TRACE(static_cast<int32_t>(kBlockTypes[i]));
     EXPECT_TRUE(host_cache[ending_ids[i]].eq(23).all().item<bool>());
     EXPECT_TRUE(host_cache[continuing_ids[i]].eq(9).all().item<bool>());
-    manager.deallocate(continuing.kv_state().take_blocks(kBlockTypes[i]));
-    manager.deallocate(replacement.kv_state().take_blocks(kBlockTypes[i]));
+    (void)continuing.kv_state().take_blocks(kBlockTypes[i]);
+    (void)replacement.kv_state().take_blocks(kBlockTypes[i]);
   }
   EXPECT_EQ(manager.num_free_blocks(), 12u);
 }

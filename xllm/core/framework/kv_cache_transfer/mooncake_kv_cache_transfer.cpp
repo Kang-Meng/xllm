@@ -826,9 +826,9 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
     results.push_back(
         {merged_kv_infos.at(key).request_ids, KVTransferErrorCode::FAILED});
   }
-  VLOG(1) << "[Mooncake][PDTransfer] direction=push, destinations="
-          << keys.size() << ", layers=" << num_layers
-          << ", failed_tasks=" << results.size();
+  VLOG(10) << "[Mooncake][PDTransfer] direction=push, destinations="
+           << keys.size() << ", layers=" << num_layers
+           << ", failed_tasks=" << results.size();
   return results;
 }
 

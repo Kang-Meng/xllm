@@ -595,7 +595,7 @@ class AclGraphExecutorTest : public ::testing::Test {
     for (auto& sequence : sequences_) {
       auto blocks = sequence.kv_state().take_blocks(BlockType::KV);
       if (!blocks.empty()) {
-        block_manager_->deallocate(std::move(blocks));
+        blocks.clear();
       }
     }
   }

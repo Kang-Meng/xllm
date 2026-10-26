@@ -125,12 +125,13 @@ class BlockManager {
   explicit BlockManager(Options options) : options_(options) {}
   virtual ~BlockManager() = default;
 
-  // Release ownership of these blocks. The caller must move the vector so
-  // that the manager can account for the ownership transition exactly once.
-  // The vector is empty on return, including any invalid placeholders.
-  virtual void deallocate(std::vector<Block>&& blocks) = 0;
-
+  // num_blocks defaults to 1. The default lives only on this declaration;
+  // overrides must not repeat it.
   virtual std::vector<Block> allocate(size_t num_blocks) = 0;
+
+  // Wrapper calls this after it owns the leaf. BlockManagerImpl and
+  // XTensorBlockManagerImpl route their own allocate calls through it.
+  virtual void set_block_allocator(BlockManager* /*allocator*/) {}
 
   // Returns the shared-prefix vector for the caller's Sequence. The vector's
   // shape is leaf-defined:
@@ -164,6 +165,12 @@ class BlockManager {
   virtual size_t num_blocks_in_prefix_cache() const = 0;
   virtual size_t num_free_blocks() const = 0;
   virtual size_t num_used_blocks() const = 0;
+  // Prefix-cache residents whose only remaining reference is the cache node.
+  virtual size_t num_evictable_blocks() const { return 0; }
+  // Physically free blocks plus evictable prefix-cache residents.
+  virtual size_t num_available_blocks() const {
+    return num_free_blocks() + num_evictable_blocks();
+  }
   virtual double kv_cache_utilization() const = 0;
 
   // Evict all entries from the prefix cache (returning their blocks to the free
@@ -184,14 +191,23 @@ class BlockManager {
   // this type. Carried via Options by the spec builder.
   BlockType block_type() const { return options_.block_type(); }
 
-  // call BlockManager to free block used by Block.
-  virtual void free(int32_t block_id) = 0;
+  // BlockManagerImpl performs the atomic update. ConcurrentBlockManagerImpl
+  // holds its recursive mutex and forwards here, including the re-entry from
+  // free(). CompositeBlockManager does not override these.
+  virtual void incr_ref_count(std::atomic<uint32_t>* /*ref_count*/) {
+    NOT_IMPLEMENTED();
+  }
+  virtual uint32_t dec_ref_count(std::atomic<uint32_t>* /*ref_count*/) {
+    NOT_IMPLEMENTED();
+    return 0;
+  }
 
-  // allocate a list of blocks, used for unit test
-  // virtual std::vector<Block> allocate(uint32_t n_blocks) = 0;
-
-  // allocate a block, used for unit test
-  virtual Block allocate() = 0;
+  // Called with this alias still counted. refcount 2 and membership in the
+  // prefix cache means the cache will be the only owner after the drop.
+  // refcount 1 is the last alias and may return the id to the free list.
+  // XTensor has no prefix cache and recycles only the last alias.
+  // The leaf then calls release_block_ref(), which calls dec_ref_count().
+  virtual void free(Block* block) = 0;
 
   // get number of total blocks
   virtual size_t num_total_blocks() const = 0;
@@ -231,6 +247,9 @@ class BlockManager {
   virtual void reserve_xtensor_padding_blocks() {}
 
  protected:
+  // Drops the alias after free() has read the pre-drop refcount.
+  void release_block_ref(Block* block) { block->dec_ref_count(); }
+
   // the options for the block manager
   Options options_;
 };

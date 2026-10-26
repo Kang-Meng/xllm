@@ -516,11 +516,11 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
     for (auto& sequence : sequences_) {
       auto kv_blocks = sequence.kv_state().take_blocks(BlockType::KV);
       if (!kv_blocks.empty()) {
-        block_manager_->deallocate(std::move(kv_blocks));
+        kv_blocks.clear();
       }
       auto linear_blocks = sequence.kv_state().take_blocks(BlockType::LINEAR);
       if (!linear_blocks.empty()) {
-        block_manager_->deallocate(std::move(linear_blocks));
+        linear_blocks.clear();
       }
     }
     sequences_.clear();

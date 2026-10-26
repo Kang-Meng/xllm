@@ -25,6 +25,7 @@ limitations under the License.
 #include "block_manager_impl.h"
 #include "block_manager_pool.h"
 #include "common/global_flags.h"
+#include "concurrent_block_manager_impl.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/block/block_manager_pool_test_peer.h"
@@ -91,10 +92,11 @@ int32_t insert_linear_state_checkpoint(LinearStateBlockManager* cache,
     Block matched = BlockManagerPoolTestPeer::match(cache, hash);
     return matched.is_valid() ? matched.id() : -1;
   }
-  Block slot_block = cache->allocate();
-  if (!slot_block.is_valid()) {
+  std::vector<Block> allocated = cache->allocate(1);
+  if (allocated.empty()) {
     return -1;
   }
+  Block slot_block = std::move(allocated.front());
   const int32_t slot = slot_block.id();
   slot_block.set_hash_value(hash.data);
   std::vector<Block> checkpoint;
@@ -196,7 +198,9 @@ TEST(BlockManagerTest, Basic) {
 
   // Allocate a block
   {
-    Block block = manager.allocate();
+    std::vector<Block> allocated = manager.allocate(1);
+    ASSERT_EQ(allocated.size(), 1u);
+    Block block = std::move(allocated.front());
     EXPECT_EQ(block.id(), 1);
     EXPECT_EQ(block.size(), block_size);
     EXPECT_EQ(block.is_shared(), false);
@@ -211,7 +215,9 @@ TEST(BlockManagerTest, Basic) {
   {
     std::vector<Block> blocks;
     for (uint32_t i = 1; i < n_blocks; ++i) {
-      auto block = manager.allocate();
+      auto allocated = manager.allocate(1);
+      ASSERT_EQ(allocated.size(), 1u);
+      Block block = std::move(allocated.front());
       EXPECT_EQ(block.id(), i);
       EXPECT_EQ(block.size(), block_size);
       EXPECT_EQ(block.is_shared(), false);
@@ -225,7 +231,7 @@ TEST(BlockManagerTest, Basic) {
     }
 
     // Test CHECK failure
-    EXPECT_DEATH(manager.allocate(), "No more blocks available");
+    EXPECT_TRUE(manager.allocate(1).empty());
   }
 
   // all blocks should be freed after the scope
@@ -233,7 +239,9 @@ TEST(BlockManagerTest, Basic) {
 
   // Test shared blocks
   {
-    Block block = manager.allocate();
+    std::vector<Block> allocated = manager.allocate(1);
+    ASSERT_EQ(allocated.size(), 1u);
+    Block block = std::move(allocated.front());
     EXPECT_EQ(block.ref_count(), 1);
     EXPECT_EQ(block.is_shared(), false);
     // test copy constructor
@@ -251,7 +259,9 @@ TEST(BlockManagerTest, Basic) {
 
     // test assignment operator
     {
-      Block block4 = manager.allocate();
+      std::vector<Block> more = manager.allocate(1);
+      ASSERT_EQ(more.size(), 1u);
+      Block block4 = std::move(more.front());
       block4 = block;
       EXPECT_EQ(block.ref_count(), 2);
       EXPECT_EQ(block.is_shared(), true);
@@ -368,10 +378,10 @@ TEST_F(BlockManagerPoolTest, DpLinearStateAndPrefixCachesAreIsolated) {
   EXPECT_FALSE(BlockManagerPoolTestPeer::contains(
       second_linear, XXH3Key(first_only_hash.data())));
 
-  pool.deallocate_without_cache(&first);
+  first.reset();
   EXPECT_EQ(second.dp_rank(), 1);
   EXPECT_EQ(second.get_linear_state_slot_id(), second_output_id);
-  pool.deallocate_without_cache(&second);
+  second.reset();
 }
 
 TEST_F(BlockManagerPoolTest, DpSelectionCountsEvictablePrefixBlocks) {
@@ -777,7 +787,7 @@ TEST_F(BlockManagerPoolTest, LinearStateMatchesOnlyCheckpointHashes) {
   const LinearStatePrefixHash checkpoint_hash =
       compute_linear_state_prefix_hash_for_test(
           cached_seq.tokens(), options.block_size(), /*boundary_tokens=*/8);
-  pool.deallocate_without_cache(&cached_seq);
+  cached_seq.reset();
 
   // Without a linear-state checkpoint for the prefix boundary, prefix reuse is
   // trimmed away: the recurrent state cannot be restored, so a hit would be
@@ -787,7 +797,7 @@ TEST_F(BlockManagerPoolTest, LinearStateMatchesOnlyCheckpointHashes) {
   const std::vector<size_t> used_blocks_before_miss = pool.num_used_blocks();
   ASSERT_TRUE(allocate_next_linear_chunk(pool, miss_seq));
   EXPECT_EQ(miss_seq.kv_state().shared_blocks_num(BlockType::KV), 0u);
-  pool.deallocate_without_cache(&miss_seq);
+  miss_seq.reset();
   EXPECT_EQ(pool.num_used_blocks(), used_blocks_before_miss);
 
   // Pin a checkpoint for the boundary hash directly in the slot pool, the same
@@ -805,7 +815,7 @@ TEST_F(BlockManagerPoolTest, LinearStateMatchesOnlyCheckpointHashes) {
                     /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
   ASSERT_TRUE(allocate_next_linear_chunk(pool, hit_seq));
   EXPECT_EQ(hit_seq.kv_state().shared_blocks_num(BlockType::KV), 2u);
-  pool.deallocate_without_cache(&hit_seq);
+  hit_seq.reset();
 }
 
 // Test removed: LinearCheckpointPublishesAndMatchesAcrossChunkBoundaries
@@ -838,7 +848,7 @@ TEST_F(BlockManagerPoolTest,
   ASSERT_EQ(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_TRUE(hit_seq.kv_state().blocks(BlockType::LINEAR).front().is_valid());
   EXPECT_EQ(hit_seq.kv_state().kv_cache_tokens_num(), 4u);
-  pool.deallocate_without_cache(&hit_seq);
+  hit_seq.reset();
 }
 
 TEST_F(BlockManagerPoolTest,
@@ -864,7 +874,7 @@ TEST_F(BlockManagerPoolTest,
   const LinearStatePrefixHash tail_hash =
       compute_linear_state_prefix_hash_for_test(
           cached_seq.tokens(), options.block_size(), /*boundary_tokens=*/8064);
-  pool.deallocate_without_cache(&cached_seq);
+  cached_seq.reset();
 
   LinearStateBlockManager* prefix_cache =
       BlockManagerPoolTestPeer::linear_leaf(pool, /*dp_rank=*/0);
@@ -878,7 +888,7 @@ TEST_F(BlockManagerPoolTest,
   ASSERT_EQ(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_TRUE(hit_seq.kv_state().blocks(BlockType::LINEAR).front().is_valid());
   EXPECT_EQ(hit_seq.kv_state().kv_cache_tokens_num(), 8064u);
-  pool.deallocate_without_cache(&hit_seq);
+  hit_seq.reset();
 }
 
 TEST_F(BlockManagerPoolTest,
@@ -904,13 +914,13 @@ TEST_F(BlockManagerPoolTest,
   ASSERT_TRUE(allocate_kv_prefix_for_test(pool, cached_seq));
   cached_seq.kv_state().set_kv_cache_tokens_num(cached_seq.num_tokens());
   pool.cache(&cached_seq);
-  pool.deallocate_without_cache(&cached_seq);
+  cached_seq.reset();
 
   Sequence no_state_seq = make_sequence(1, prompt_tokens);
   pool.allocate_shared(&no_state_seq);
   EXPECT_EQ(no_state_seq.kv_state().shared_blocks_num(BlockType::KV), 0u);
   EXPECT_EQ(no_state_seq.kv_state().shared_blocks_num(BlockType::LINEAR), 0u);
-  pool.deallocate_without_cache(&no_state_seq);
+  no_state_seq.reset();
 
   // Publishing the actual 8192-token state enables reuse only through that
   // checkpoint. The KV hash at 8320 is not sufficient to restore Linear.
@@ -930,7 +940,7 @@ TEST_F(BlockManagerPoolTest,
   EXPECT_TRUE(
       checkpoint_seq.kv_state().blocks(BlockType::LINEAR).front().is_valid());
   EXPECT_EQ(checkpoint_seq.kv_state().kv_cache_tokens_num(), 8192u);
-  pool.deallocate_without_cache(&checkpoint_seq);
+  checkpoint_seq.reset();
 }
 
 TEST_F(BlockManagerPoolTest,
@@ -966,7 +976,7 @@ TEST_F(BlockManagerPoolTest,
   ASSERT_EQ(intermediate_seq.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_TRUE(
       intermediate_seq.kv_state().blocks(BlockType::LINEAR).front().is_valid());
-  pool.deallocate_without_cache(&intermediate_seq);
+  intermediate_seq.reset();
 
   // The next regular checkpoint was published while extending the producer
   // from 8192 to 12288, so a request beyond that boundary may restore it.
@@ -978,7 +988,7 @@ TEST_F(BlockManagerPoolTest,
   EXPECT_TRUE(
       checkpoint_seq.kv_state().blocks(BlockType::LINEAR).front().is_valid());
   EXPECT_EQ(checkpoint_seq.kv_state().kv_cache_tokens_num(), 8192u);
-  pool.deallocate_without_cache(&checkpoint_seq);
+  checkpoint_seq.reset();
 }
 
 // Test removed: FullRegularPrefillPublishesLinearCheckpoint
@@ -1020,7 +1030,7 @@ TEST_F(BlockManagerPoolTest,
   ASSERT_EQ(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_TRUE(hit_seq.kv_state().blocks(BlockType::LINEAR).front().is_valid());
   EXPECT_EQ(hit_seq.kv_state().kv_cache_tokens_num(), 8064u);
-  pool.deallocate_without_cache(&hit_seq);
+  hit_seq.reset();
 }
 
 TEST_F(BlockManagerPoolTest,
@@ -1033,7 +1043,7 @@ TEST_F(BlockManagerPoolTest,
   ASSERT_TRUE(allocate_kv_prefix_for_test(pool, cached_seq));
   cached_seq.kv_state().set_kv_cache_tokens_num(cached_seq.num_tokens());
   pool.cache(&cached_seq);
-  pool.deallocate_without_cache(&cached_seq);
+  cached_seq.reset();
 
   LinearStateBlockManager* prefix_cache =
       BlockManagerPoolTestPeer::linear_leaf(pool, /*dp_rank=*/0);
@@ -1056,7 +1066,7 @@ TEST_F(BlockManagerPoolTest,
   EXPECT_EQ(hit_seq.kv_state().shared_blocks_num(BlockType::LINEAR), 0u);
   ASSERT_EQ(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_TRUE(hit_seq.kv_state().blocks(BlockType::LINEAR).front().is_valid());
-  pool.deallocate_without_cache(&hit_seq);
+  hit_seq.reset();
 }
 
 // An exact prompt match must leave at least one token for the current forward.
@@ -1084,7 +1094,7 @@ TEST_F(BlockManagerPoolTest, ExactPromptCannotReuseUncheckpointedTailBoundary) {
   const LinearStatePrefixHash tail_hash =
       compute_linear_state_prefix_hash_for_test(
           cached_seq.tokens(), options.block_size(), /*boundary_tokens=*/8);
-  pool.deallocate_without_cache(&cached_seq);
+  cached_seq.reset();
 
   LinearStateBlockManager* prefix_cache =
       BlockManagerPoolTestPeer::linear_leaf(pool, /*dp_rank=*/0);
@@ -1097,7 +1107,7 @@ TEST_F(BlockManagerPoolTest, ExactPromptCannotReuseUncheckpointedTailBoundary) {
       make_sequence(1, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8});
   ASSERT_TRUE(allocate_next_linear_chunk(pool, exact_seq));
   EXPECT_EQ(exact_seq.kv_state().shared_blocks_num(BlockType::KV), 0u);
-  pool.deallocate_without_cache(&exact_seq);
+  exact_seq.reset();
 }
 
 // One token past the checkpoint boundary leaves work for the current forward,
@@ -1123,7 +1133,7 @@ TEST_F(BlockManagerPoolTest, PromptPastCheckpointReusesCheckpointBoundary) {
   const LinearStatePrefixHash tail_hash =
       compute_linear_state_prefix_hash_for_test(
           cached_seq.tokens(), options.block_size(), /*boundary_tokens=*/8);
-  pool.deallocate_without_cache(&cached_seq);
+  cached_seq.reset();
 
   LinearStateBlockManager* prefix_cache =
       BlockManagerPoolTestPeer::linear_leaf(pool, /*dp_rank=*/0);
@@ -1138,7 +1148,7 @@ TEST_F(BlockManagerPoolTest, PromptPastCheckpointReusesCheckpointBoundary) {
   EXPECT_EQ(hit_seq.kv_state().shared_blocks_num(BlockType::KV), 2u);
   ASSERT_EQ(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_TRUE(hit_seq.kv_state().blocks(BlockType::LINEAR)[0].is_valid());
-  pool.deallocate_without_cache(&hit_seq);
+  hit_seq.reset();
 }
 
 TEST_F(BlockManagerPoolTest, LinearAllocationEvictsOnlyUnpinnedCheckpoint) {
@@ -1173,7 +1183,7 @@ TEST_F(BlockManagerPoolTest, LinearAllocationEvictsOnlyUnpinnedCheckpoint) {
   sequence.update_block_hashes(4, BlockHasherType::TEXT);
   EXPECT_TRUE(
       BlockManagerPoolTestPeer::contains(leaf, sequence.block_hashes(4)[0]));
-  pool.deallocate_without_cache(&sequence);
+  sequence.reset();
 }
 
 TEST_F(BlockManagerPoolTest, PrefixMountSurvivesAllocationFailureAndRetry) {
@@ -1191,7 +1201,7 @@ TEST_F(BlockManagerPoolTest, PrefixMountSurvivesAllocationFailureAndRetry) {
   const int32_t source_id =
       insert_linear_state_checkpoint(leaf, cached.block_hashes(4)[1]);
   ASSERT_GE(source_id, 1);
-  pool.deallocate_without_cache(&cached);
+  cached.reset();
   std::vector<Block> occupied = leaf->allocate(1);
   ASSERT_EQ(occupied.size(), 1u);
   Sequence consumer = make_sequence(1, {1, 2, 3, 4, 5, 6, 7, 8, 9});
@@ -1205,14 +1215,14 @@ TEST_F(BlockManagerPoolTest, PrefixMountSurvivesAllocationFailureAndRetry) {
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
   pool.allocate_shared(&consumer);
   EXPECT_EQ(consumer.get_linear_state_slot_id(), source_id);
-  leaf->deallocate(std::move(occupied));
+  occupied.clear();
   occupied.clear();
   // The freed slot is the write slot. The mounted source stays in front.
   ASSERT_TRUE(pool.allocate(&consumer, 9));
   ASSERT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(consumer.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
   EXPECT_NE(consumer.get_linear_state_slot_id(), source_id);
-  pool.deallocate_without_cache(&consumer);
+  consumer.reset();
 }
 
 TEST_F(BlockManagerPoolTest, PrefixUsesDeepestSparseLinearStateCheckpoint) {
@@ -1242,7 +1252,7 @@ TEST_F(BlockManagerPoolTest, PrefixUsesDeepestSparseLinearStateCheckpoint) {
     cached_seq.kv_state().set_kv_cache_tokens_num(cached_seq.num_tokens());
     // Cache KV blocks through normal flow.
     pool.cache(&cached_seq);
-    pool.deallocate_without_cache(&cached_seq);
+    cached_seq.reset();
 
     // Manually insert LINEAR checkpoints at the requested positions.
     // Note: pool.cache() above may have already cached some LINEAR state;
@@ -1272,7 +1282,7 @@ TEST_F(BlockManagerPoolTest, PrefixUsesDeepestSparseLinearStateCheckpoint) {
     // Linear blocks structure is implementation detail; only verify allocation
     // succeeded.
     EXPECT_GE(hit_seq.kv_state().num_blocks(BlockType::LINEAR), 1u);
-    pool.deallocate_without_cache(&hit_seq);
+    hit_seq.reset();
   };
 
   check_prefix({384}, 384);
@@ -1299,7 +1309,7 @@ TEST_F(BlockManagerPoolTest, LinearStateCheckpointCannotExceedKVMatch) {
   short_cached_seq.kv_state().set_kv_cache_tokens_num(
       short_cached_seq.num_tokens());
   pool.cache(&short_cached_seq);
-  pool.deallocate_without_cache(&short_cached_seq);
+  short_cached_seq.reset();
 
   Sequence long_cached_seq =
       make_sequence(1,
@@ -1314,7 +1324,7 @@ TEST_F(BlockManagerPoolTest, LinearStateCheckpointCannotExceedKVMatch) {
       compute_linear_state_prefix_hash_for_test(long_cached_seq.tokens(),
                                                 /*block_size=*/4,
                                                 /*boundary_tokens=*/16);
-  pool.deallocate_without_cache(&long_cached_seq);
+  long_cached_seq.reset();
 
   LinearStateBlockManager* prefix_cache =
       BlockManagerPoolTestPeer::linear_leaf(pool, /*dp_rank=*/0);
@@ -1327,7 +1337,7 @@ TEST_F(BlockManagerPoolTest, LinearStateCheckpointCannotExceedKVMatch) {
       make_sequence(2, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 17});
   ASSERT_TRUE(allocate_next_linear_chunk(pool, hit_seq));
   EXPECT_EQ(hit_seq.kv_state().shared_blocks_num(BlockType::KV), 2u);
-  pool.deallocate_without_cache(&hit_seq);
+  hit_seq.reset();
 }
 
 TEST_F(BlockManagerPoolTest, ExactPromptStopsAtEarlierCheckpoint) {
@@ -1356,7 +1366,7 @@ TEST_F(BlockManagerPoolTest, ExactPromptStopsAtEarlierCheckpoint) {
   const LinearStatePrefixHash tail_hash =
       compute_linear_state_prefix_hash_for_test(
           cached_seq.tokens(), options.block_size(), /*boundary_tokens=*/16);
-  pool.deallocate_without_cache(&cached_seq);
+  cached_seq.reset();
 
   LinearStateBlockManager* prefix_cache =
       BlockManagerPoolTestPeer::linear_leaf(pool, /*dp_rank=*/0);
@@ -1373,7 +1383,7 @@ TEST_F(BlockManagerPoolTest, ExactPromptStopsAtEarlierCheckpoint) {
                         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
   ASSERT_TRUE(allocate_next_linear_chunk(pool, exact_seq));
   EXPECT_EQ(exact_seq.kv_state().shared_blocks_num(BlockType::KV), 2u);
-  pool.deallocate_without_cache(&exact_seq);
+  exact_seq.reset();
 }
 
 namespace {
@@ -1490,6 +1500,109 @@ TEST_F(BlockManagerPoolTest, CachePrefixClampsOverestimatedTokenBudget) {
   // sequence tokens, so only the single full block (tokens [0, 4)) is cached.
   EXPECT_NO_FATAL_FAILURE(pool->cache(&seq, /*num_tokens=*/8));
   EXPECT_EQ(pool->num_blocks_in_prefix_cache()[0], 1u);
+}
+
+TEST(BlockManagerImplTest, RefcountZeroEntersFreeListAndCacheOnlyIsEvictable) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true);
+  BlockManagerImpl manager(options);
+
+  const size_t total = manager.num_total_blocks();
+  EXPECT_EQ(manager.num_free_blocks(), total);
+  EXPECT_EQ(manager.num_used_blocks(), 0u);
+  EXPECT_EQ(manager.num_evictable_blocks(), 0u);
+  EXPECT_EQ(manager.num_available_blocks(), total);
+
+  std::vector<int32_t> token_ids = {1, 2, 3, 4, 5, 6, 7, 8};
+  const Slice<int32_t> tokens(token_ids);
+  int32_t first_id = -1;
+  {
+    std::vector<Block> blocks = manager.allocate(2);
+    ASSERT_EQ(blocks.size(), 2u);
+    first_id = blocks[0].id();
+    EXPECT_EQ(manager.num_free_blocks(), total - 2);
+    EXPECT_EQ(manager.num_used_blocks(), 2u);
+    EXPECT_EQ(manager.num_evictable_blocks(), 0u);
+
+    manager.cache(tokens, blocks);
+    EXPECT_EQ(manager.num_blocks_in_prefix_cache(), 2u);
+    EXPECT_EQ(manager.num_evictable_blocks(), 0u);
+    EXPECT_EQ(manager.num_used_blocks(), 2u);
+  }
+
+  EXPECT_EQ(manager.num_blocks_in_prefix_cache(), 2u);
+  EXPECT_EQ(manager.num_evictable_blocks(), 2u);
+  EXPECT_EQ(manager.num_used_blocks(), 0u);
+  EXPECT_EQ(manager.num_free_blocks(), total - 2);
+  EXPECT_EQ(manager.num_available_blocks(), total);
+
+  {
+    std::vector<Block> matched = manager.allocate_shared(tokens);
+    ASSERT_EQ(matched.size(), 2u);
+    EXPECT_EQ(matched[0].id(), first_id);
+    EXPECT_EQ(manager.num_evictable_blocks(), 0u);
+    EXPECT_EQ(manager.num_used_blocks(), 2u);
+    EXPECT_EQ(manager.num_free_blocks(), total - 2);
+    EXPECT_EQ(manager.num_available_blocks(), total - 2);
+  }
+
+  EXPECT_EQ(manager.num_evictable_blocks(), 2u);
+  EXPECT_EQ(manager.num_used_blocks(), 0u);
+
+  manager.reset_prefix_cache();
+  EXPECT_EQ(manager.num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(manager.num_evictable_blocks(), 0u);
+  EXPECT_EQ(manager.num_used_blocks(), 0u);
+  EXPECT_EQ(manager.num_free_blocks(), total);
+  EXPECT_EQ(manager.num_available_blocks(), total);
+}
+
+// Block ids restart on every leaf. Caching one leaf's block into another
+// records that numeric id in the wrong prefix cache and increments the wrong
+// refcount. The owner's later free then sees the id still registered.
+TEST(ConcurrentBlockManagerImplTest,
+     ForeignBlockIsNotInsertedIntoAnotherCache) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true);
+  auto owner = std::make_unique<ConcurrentBlockManagerImpl>(
+      std::make_unique<BlockManagerImpl>(options));
+  auto other = std::make_unique<ConcurrentBlockManagerImpl>(
+      std::make_unique<BlockManagerImpl>(options));
+
+  const size_t total = owner->num_total_blocks();
+  std::vector<Block> blocks = owner->allocate(1);
+  ASSERT_EQ(blocks.size(), 1u);
+  const int32_t block_id = blocks[0].id();
+  EXPECT_EQ(blocks[0].ref_count(), 1u);
+
+  uint8_t hash[XXH3_128BITS_HASH_VALUE_LEN] = {};
+  hash[0] = 1;
+  blocks[0].set_hash_value(hash);
+  other->cache(blocks);
+
+  EXPECT_EQ(other->num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(owner->num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(blocks[0].ref_count(), 1u);
+  blocks.clear();
+  EXPECT_EQ(owner->num_free_blocks(), total);
+
+  std::vector<Block> owned = owner->allocate(1);
+  ASSERT_EQ(owned.size(), 1u);
+  const int32_t owned_id = owned[0].id();
+  owned[0].set_hash_value(hash);
+  owner->cache(owned);
+  EXPECT_EQ(owner->num_blocks_in_prefix_cache(), 1u);
+  EXPECT_EQ(owned[0].ref_count(), 2u);
+  owned.clear();
+  EXPECT_EQ(owner->num_free_blocks(), total - 1);
+
+  std::vector<Block> again = owner->allocate(1);
+  ASSERT_EQ(again.size(), 1u);
+  EXPECT_NE(again[0].id(), owned_id);
+  EXPECT_NE(again[0].id(), block_id);
+
+  owner->reset_prefix_cache();
+  other->reset_prefix_cache();
 }
 
 }  // namespace xllm

@@ -19,7 +19,6 @@ limitations under the License.
 #include <iterator>
 
 #include "framework/config/kv_cache_config.h"
-#include "framework/prefix_cache/prefix_cache.h"
 
 namespace xllm {
 
@@ -89,9 +88,8 @@ SlidingWindowBlockManager::allocate_for_sequence(Sequence* seq,
   }
 
   const size_t missing = needed - held;
-  std::vector<Block> allocated = allocate(missing);
+  std::vector<Block> allocated = block_allocator()->allocate(missing);
   if (allocated.size() != missing) {
-    deallocate(std::move(allocated));
     return std::nullopt;
   }
   return allocated;
@@ -126,9 +124,10 @@ bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
   const size_t units = (target_blocks - cached_blocks) / blocks_per_unit;
   const size_t needed = units * valid_per_unit;
 
-  std::vector<Block> allocated = allocate(needed);
+  std::vector<Block> allocated = block_allocator()->allocate(needed);
   if (allocated.empty()) {
-    allocated = allocate(std::min(needed, num_free_blocks()));
+    allocated =
+        block_allocator()->allocate(std::min(needed, num_free_blocks()));
   }
 
   KVCacheState& host_state = seq->host_kv_state();
@@ -144,7 +143,6 @@ bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
     }
     used += take;
   }
-  allocated.clear();
 
   seq->update_block_hashes(static_cast<uint32_t>(block_size),
                            options_.hasher_type());
@@ -176,16 +174,11 @@ void SlidingWindowBlockManager::trim_prefetch_blocks(Sequence* seq,
                                   ? keep - options_.swa_blocks_per_seq()
                                   : 0;
 
-  std::vector<Block> to_release;
-  to_release.reserve(blocks.size());
-  for (size_t index = 0; index < blocks.size(); ++index) {
-    if (!blocks[index].is_valid() || (index >= window_begin && index < keep)) {
+  for (size_t index = 0; index < keep; ++index) {
+    if (!blocks[index].is_valid() || index >= window_begin) {
       continue;
     }
-    to_release.emplace_back(std::move(blocks[index]));
-  }
-  if (!to_release.empty()) {
-    deallocate(std::move(to_release));
+    blocks[index] = Block();
   }
   blocks.resize(keep);
   std::vector<Block> retained(keep);
@@ -226,18 +219,13 @@ void SlidingWindowBlockManager::release_out_of_window(Sequence* seq,
   if (release_blocks == 0) {
     return;
   }
-  // Move slid-out blocks out (leaving invalid placeholders so positional
-  // indexing stays stable). Cache alias still pins the physical block, so
-  // deallocate walks the ref<=2u branch and only clears usage bookkeeping.
-  std::vector<Block> blocks_to_release;
-  blocks_to_release.reserve(release_blocks);
+  // Replace slid-out blocks with invalid placeholders so positional indexing
+  // stays stable. The assignment releases the sequence reference; a cache
+  // alias stays evictable when it is the only owner.
   for (size_t j = 0; j < release_blocks; ++j) {
     if (swa_blocks[j].is_valid()) {
-      blocks_to_release.emplace_back(std::move(swa_blocks[j]));
+      swa_blocks[j] = Block();
     }
-  }
-  if (!blocks_to_release.empty()) {
-    deallocate(std::move(blocks_to_release));
   }
 }
 
@@ -261,37 +249,6 @@ size_t SlidingWindowBlockManager::num_out_of_window_blocks(
   const size_t window_start_token = cached_tokens - sliding_window_tokens;
   const size_t first_live_block = window_start_token / block_size;
   return std::min(first_live_block, held);
-}
-
-std::vector<Block> SlidingWindowBlockManager::allocate_shared(
-    const Slice<int32_t>& token_ids,
-    const Slice<Block>& /*existed_shared_blocks*/,
-    const MMData& mm_data,
-    const Slice<XXH3Key>& block_hashes) {
-  if (!options_.enable_prefix_cache() || options_.block_size() == 0 ||
-      prefix_cache_ == nullptr) {
-    return {};
-  }
-  AUTO_COUNTER(prefix_cache_latency_seconds_match);
-  std::vector<Block> result = prefix_cache_->match(token_ids,
-                                                   /*existed_shared_blocks=*/{},
-                                                   mm_data,
-                                                   block_hashes);
-  if (result.empty()) {
-    return {};
-  }
-
-  // Bookkeeping: mark_used only for valid positions. mark_used is idempotent
-  // per block id, so blocks shared across sequences are only counted once.
-  size_t added = 0;
-  for (const auto& b : result) {
-    if (b.is_valid() && mark_used(&usage_accounted_ids_, b.id())) {
-      ++added;
-    }
-  }
-  num_used_blocks_.fetch_add(added, std::memory_order_relaxed);
-
-  return result;
 }
 
 }  // namespace xllm

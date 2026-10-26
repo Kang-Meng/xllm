@@ -47,38 +47,39 @@ const char* block_type_label(BlockType type) {
   return "";
 }
 
-Block::Block(int32_t id, BlockManager* manager)
-    : id_(id), ref_count_(new std::atomic<uint32_t>(1)), manager_(manager) {
-  // get the block size from the manager
-  size_ = manager_ == nullptr ? 0 : manager_->block_size();
+Block::Block(int32_t id, BlockManager* manager) : id_(id), manager_(manager) {
+  // A block with no manager is an id holder. It has no shared refcount.
+  if (manager_ != nullptr) {
+    ref_count_ = new std::atomic<uint32_t>(1);
+    size_ = manager_->block_size();
+  }
 }
 
-Block::~Block() {
-  // decrease reference count
-  dec_ref_count();
-}
+Block::~Block() { release(); }
 
 // copy constructor
 Block::Block(const Block& other)
     : id_(other.id_),
       size_(other.size_),
-      ref_count_(other.ref_count_),
+      ref_count_(other.manager_ == nullptr ? nullptr : other.ref_count_),
       manager_(other.manager_) {
   memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
 
-  // increase reference count
   inc_ref_count();
 }
 
 // copy assignment
 Block& Block::operator=(const Block& other) {
   if (this != &other) {
-    dec_ref_count();
+    release();
 
     id_ = other.id_;
     size_ = other.size_;
     manager_ = other.manager_;
-    ref_count_ = other.ref_count_;
+    // A manager-less alias does not share the source counter. Padding is the
+    // only manager-less block that still owns one, and copying it must not
+    // alias that counter.
+    ref_count_ = manager_ == nullptr ? nullptr : other.ref_count_;
 
     memcpy(hash_value_, other.hash_value_, XXH3_128BITS_HASH_VALUE_LEN);
 
@@ -103,7 +104,7 @@ Block::Block(Block&& other) noexcept
 
 Block& Block::operator=(Block&& other) noexcept {
   if (this != &other) {
-    dec_ref_count();
+    release();
 
     id_ = other.id_;
     size_ = other.size_;
@@ -122,28 +123,40 @@ Block& Block::operator=(Block&& other) noexcept {
 }
 
 void Block::inc_ref_count() {
-  if (ref_count_ != nullptr) {
-    // Another alias appearing only needs atomicity, not ordering, so relaxed.
-    ref_count_->fetch_add(1, std::memory_order_relaxed);
+  // No manager means this alias does not share a refcount.
+  if (ref_count_ == nullptr || manager_ == nullptr) {
+    return;
   }
+  manager_->incr_ref_count(ref_count_);
 }
 
 void Block::dec_ref_count() {
+  // No manager means this alias does not share a refcount.
+  if (ref_count_ == nullptr || manager_ == nullptr) {
+    return;
+  }
+  // The manager fetch_subs. previous == 1 means this alias was the last one.
+  const uint32_t previous = manager_->dec_ref_count(ref_count_);
+  if (previous == 1) {
+    delete ref_count_;
+    ref_count_ = nullptr;
+  }
+}
+
+void Block::release() {
   if (ref_count_ == nullptr) {
     return;
   }
-  // acq_rel pairs the releasing decrements with the acquiring final one, so the
-  // thread that drives the count to zero observes all prior alias writes before
-  // it frees. fetch_sub returns the previous value; == 1 means we just hit
-  // zero.
-  if (ref_count_->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-    // release the reference count memory
-    delete ref_count_;
-    // return the block id to the manager
-    if (manager_ != nullptr) {
-      manager_->free(id_);
-    }
+  // free() reads this alias and calls dec_ref_count() before returning.
+  if (manager_ != nullptr) {
+    manager_->free(this);
+    return;
   }
+  // Padding keeps a sole counter and set_manager(nullptr), so it must not
+  // enter free() (that checks id != 0) and does not call dec_ref_count().
+  // Copies of a manager-less block do not alias this counter.
+  delete ref_count_;
+  ref_count_ = nullptr;
 }
 
 }  // namespace xllm

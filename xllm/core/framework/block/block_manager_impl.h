@@ -30,10 +30,9 @@ class BlockManagerImpl : public BlockManager {
   };
 
   // Try to allocate blocks with num_blocks,
-  // return {} if not enough blocks
-  std::vector<Block> allocate(size_t num_blocks) override;
-
-  void deallocate(std::vector<Block>&& blocks) override;
+  // return {} if not enough blocks. final: a derived leaf must not route
+  // this back through block_allocator(), or the wrapper recurses forever.
+  std::vector<Block> allocate(size_t num_blocks) final;
 
   // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
   // and return them (does not insert into the sequence). The shared default for
@@ -77,48 +76,47 @@ class BlockManagerImpl : public BlockManager {
   // free blocks num
   size_t num_free_blocks() const override { return num_free_blocks_; }
 
-  // used blocks num
-  size_t num_used_blocks() const override { return num_used_blocks_; }
+  // Sequence-held blocks: the usable pool fixed at init, minus free blocks,
+  // minus prefix-cache residents that can be evicted.
+  size_t num_used_blocks() const override;
+
+  size_t num_evictable_blocks() const override;
 
   // current kv cache utilization.
-  double kv_cache_utilization() const override {
-    return static_cast<double>(num_used_blocks_) / num_total_blocks();
-  }
+  double kv_cache_utilization() const override;
 
-  // call BlockManager to free block used by Block.
-  void free(int32_t block_id) override;
-
-  // allocate a list of blocks
-  // std::vector<Block> allocate(uint32_t n_blocks) override;
-
-  // allocate a block
-  Block allocate() override;
+  // Atomic refcount update. ConcurrentBlockManagerImpl holds its lock and
+  // forwards here.
+  void incr_ref_count(std::atomic<uint32_t>* ref_count) override;
+  uint32_t dec_ref_count(std::atomic<uint32_t>* ref_count) override;
+  void free(Block* block) override;
 
   // total blocks num
   size_t num_total_blocks() const override { return free_blocks_.size() - 1; }
 
- protected:
-  // Flip a block's entry in `usage_ids` from 0 to 1. Returns true if the flip
-  // happened; false if the entry was already 1 (i.e. block was already marked
-  // used). Shared with subclasses (e.g. SlidingWindowBlockManager) that need
-  // to reproduce the base allocate_shared refcount bookkeeping over their own
-  // custom probe path. Static-friendly signature keeps callers free of `this`.
-  static bool mark_used(std::vector<uint8_t>* usage_ids, int32_t block_id);
+  void set_block_allocator(BlockManager* allocator) override {
+    block_allocator_ = allocator;
+  }
 
  private:
+  // Every valid block must belong to this leaf. A wrapper's allocate() stamps
+  // itself as the manager, and that wrapper is block_allocator_.
+  void check_owned(const std::vector<Block>& blocks) const;
   // check if has enough slots, if not, try to evict some blocks
   // from the prefix cache
   bool has_enough_blocks(uint32_t num_blocks);
 
  protected:
+  BlockManager* block_allocator() const {
+    return block_allocator_ == nullptr ? const_cast<BlockManagerImpl*>(this)
+                                       : block_allocator_;
+  }
+
   // prefix cache
   std::unique_ptr<PrefixCache> prefix_cache_;
 
   // reserved block id for padding
   Block padding_block_;
-
-  // number of used blocks
-  std::atomic<size_t> num_used_blocks_{0};
 
   // free block count
   std::atomic<size_t> num_free_blocks_{0};
@@ -129,7 +127,11 @@ class BlockManagerImpl : public BlockManager {
   // free block list
   std::vector<int32_t> free_blocks_;
 
-  // Whether a block is already counted in num_used_blocks_.
+  // Null until a wrapper claims the allocate path.
+  BlockManager* block_allocator_ = nullptr;
+
+  // 1 once a block id has been handed out and not yet returned to the free
+  // list.
   std::vector<uint8_t> usage_accounted_ids_;
 };
 

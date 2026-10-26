@@ -89,17 +89,14 @@ TEST(KVCacheStateTest, ResetClearsBeamSourceState) {
   KVCacheState state;
   Block block(/*id=*/1, /*allocator=*/nullptr);
   const std::vector<Block> src_blocks{block};
-  const uint32_t external_ref_count = block.ref_count();
 
   state.set_src_blocks(src_blocks, /*need_swap=*/true);
   EXPECT_FALSE(state.src_blocks().empty());
   EXPECT_TRUE(state.need_swap());
-  EXPECT_EQ(block.ref_count(), external_ref_count + 1);
 
   state.reset();
   EXPECT_TRUE(state.src_blocks().empty());
   EXPECT_FALSE(state.need_swap());
-  EXPECT_EQ(block.ref_count(), external_ref_count);
 }
 
 TEST(KVCacheStateTest, PrefixMatchStateIsIndependentAndMovable) {
@@ -137,8 +134,6 @@ TEST(KVCacheStateTest, ReusingConsumedVectorDoesNotAppendMovedFromSlots) {
   EXPECT_EQ(owned[0].id(), 7);
   EXPECT_FALSE(owned[1].is_valid());
   EXPECT_EQ(owned[2].id(), 8);
-  EXPECT_EQ(owned[0].ref_count(), 1u);
-  EXPECT_EQ(owned[2].ref_count(), 1u);
 }
 
 // Finding 2 regression: has_any_blocks() must report true for ANY

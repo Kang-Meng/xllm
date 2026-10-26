@@ -33,7 +33,7 @@ void release_prefix_cache(ConcurrentBlockManagerImpl* manager) {
   CHECK(manager != nullptr);
   std::vector<Block> blocks = manager->allocate(manager->num_total_blocks());
   EXPECT_EQ(blocks.size(), manager->num_total_blocks());
-  manager->deallocate(std::move(blocks));
+  blocks.clear();
 }
 
 }  // namespace
@@ -55,14 +55,14 @@ TEST(ConcurrentBlockManagerTest,
   ASSERT_EQ(second.front().ref_count(), 3u);
   EXPECT_EQ(manager.num_used_blocks(), 1u);
 
-  manager.deallocate(std::move(first));
+  first.clear();
   EXPECT_TRUE(first.empty());
   EXPECT_EQ(second.front().ref_count(), 2u);
   EXPECT_EQ(manager.num_used_blocks(), 1u);
   EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 0.5);
   EXPECT_TRUE(manager.allocate(manager.num_total_blocks()).empty());
 
-  manager.deallocate(std::move(second));
+  second.clear();
   EXPECT_TRUE(second.empty());
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   release_prefix_cache(&manager);
@@ -92,7 +92,7 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
   tail_blocks.reserve(1);
   tail_blocks.emplace_back(std::move(seed_blocks[1]));
   manager.cache(tail_blocks);
-  manager.deallocate(std::move(tail_blocks));
+  tail_blocks.clear();
   tail_blocks.clear();
   seed_blocks.clear();
 
@@ -107,8 +107,8 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
     EXPECT_EQ(matched_blocks[1].id(), second_block_id);
   }
 
-  manager.deallocate(std::move(matched_blocks));
-  manager.deallocate(std::move(existed_blocks));
+  matched_blocks.clear();
+  existed_blocks.clear();
   matched_blocks.clear();
   existed_blocks.clear();
   release_prefix_cache(&manager);
@@ -142,7 +142,7 @@ TEST(ConcurrentBlockManagerTest, AllocatesWhileBlocksReleaseConcurrently) {
           continue;
         }
 
-        manager.deallocate(std::move(blocks));
+        blocks.clear();
         blocks.clear();
       }
     });
@@ -198,7 +198,7 @@ TEST_P(LinearConcurrentAllocationTest, KeepsLiveSlotsUniqueUntilFinalRelease) {
         ASSERT_LE(block_id, kNumSlots);
         EXPECT_EQ(live_ids[block_id].fetch_add(1), 0);
         Block inflight = blocks.front();
-        manager->deallocate(std::move(blocks));
+        blocks.clear();
         blocks.clear();
         EXPECT_EQ(live_ids[block_id].fetch_sub(1), 1);
         inflight = Block();
@@ -216,84 +216,6 @@ TEST_P(LinearConcurrentAllocationTest, KeepsLiveSlotsUniqueUntilFinalRelease) {
 INSTANTIATE_TEST_SUITE_P(ConcurrentModes,
                          LinearConcurrentAllocationTest,
                          ::testing::Values(0, 1, 2));
-
-// Root-cause repro for the disagg-PD prefix-cache block leak.
-//
-// Block::ref_count_ is a plain non-atomic uint32_t mutated by the Block copy
-// constructor / destructor (inc_ref_count / dec_ref_count). In the disagg-PD
-// prefill path the SAME physical block -- a prefix-cache entry -- is copied by
-// the scheduler thread (allocate_shared -> PrefixCache::match) while a finished
-// sequence's alias is destroyed on the prefill_threadpool_ thread
-// (cache_prefill_blocks + deallocate + sequence->reset()). Those inc/dec run on
-// the same counter without a shared lock, so updates are lost. A lost decrement
-// pins the block as is_shared() forever, so PrefixCache::evict() skips it
-// permanently -- the observed deadlock (prefix cache full, num_free starved,
-// num_used == 0).
-//
-// Build this target with -fsanitize=thread for a deterministic data-race
-// verdict on inc_ref_count/dec_ref_count. Without TSan it asserts the counter
-// returns to its baseline after every transient alias is gone; the non-atomic
-// counter drifts under contention and the assertion fails on the buggy code and
-// passes once ref_count_ is made atomic (or every copy/dtor is serialized).
-TEST(ConcurrentBlockManagerTest, SharedBlockRefCountRacesAcrossThreads) {
-  constexpr int32_t kNumThreads = 8;
-  constexpr int32_t kNumIterations = 4000;
-  constexpr int32_t kBurst = 32;
-  constexpr int32_t kBaselineHolders = 4096;
-
-  // A standalone block (no owning manager) so a stray ref_count == 0 cannot
-  // corrupt a free list. Both the block and its permanent holders are heap
-  // allocated and intentionally leaked: if the race nets lost increments the
-  // stored counter ends below the live alias count, and running the holders'
-  // destructors would drive it through zero (delete ref_count_) and then
-  // use-after-free. Never destructing them keeps the read below clean.
-  Block* shared = new Block(/*id=*/1, /*allocator=*/nullptr);
-  // A large permanent baseline keeps ref_count far above zero for the whole run
-  // (observed drift is in the hundreds), so a lost decrement cannot reach the
-  // ==0 free path mid-run; the only observable defect is the non-zero drift.
-  auto* holders =
-      new std::vector<Block>(static_cast<size_t>(kBaselineHolders), *shared);
-  const uint32_t baseline = shared->ref_count();
-  ASSERT_EQ(baseline, static_cast<uint32_t>(kBaselineHolders + 1));
-
-  std::atomic<bool> start{false};
-  std::vector<std::thread> workers;
-  workers.reserve(static_cast<size_t>(kNumThreads));
-  for (int32_t i = 0; i < kNumThreads; ++i) {
-    workers.emplace_back([shared, &start]() {
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-      // Bursts of copies (inc) then a clear (dec) widen each thread's inc/dec
-      // phases so they overlap across threads -- concurrent non-atomic ++/-- on
-      // the SAME counter, exactly like scheduler-side match (inc) overlapping
-      // threadpool-side sequence teardown (dec) on a shared prefix-cache block.
-      std::vector<Block> local;
-      local.reserve(static_cast<size_t>(kBurst));
-      for (int32_t iter = 0; iter < kNumIterations; ++iter) {
-        for (int32_t j = 0; j < kBurst; ++j) {
-          local.push_back(*shared);  // copy ctor: ++(*ref_count_), non-atomic
-        }
-        local.clear();  // dtors: --(*ref_count_), non-atomic -- races others
-      }
-    });
-  }
-  start.store(true, std::memory_order_release);
-  for (std::thread& worker : workers) {
-    worker.join();
-  }
-
-  // Every transient alias is destroyed; a correct (atomic) counter returns to
-  // baseline. The non-atomic counter loses updates under concurrent copy/dtor,
-  // so the final value drifts away from baseline (positive drift = leaked
-  // increments = a block pinned is_shared() forever -> the prefix-cache leak).
-  EXPECT_EQ(shared->ref_count(), baseline)
-      << "Block::ref_count_ lost updates under concurrent copy/destroy; this "
-         "is "
-         "the prefix-cache block-leak root cause.";
-
-  // shared and holders are intentionally leaked (see above).
-}
 
 // End-to-end repro of the production signature through the real
 // ConcurrentBlockManagerImpl + PrefixCache: blocks that live only in the prefix
@@ -336,7 +258,7 @@ TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
   ASSERT_EQ(seed.size(), 4u);
   PrefixCache::compute_hash_keys(token_ids, seed);
   manager->cache(seed);
-  manager->deallocate(std::move(seed));
+  seed.clear();
   seed.clear();
   ASSERT_EQ(manager->num_blocks_in_prefix_cache(), 4u);
 
@@ -359,7 +281,7 @@ TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
           continue;
         }
         // Finish: deallocate exactly the sequence's blocks (under lock) ...
-        manager->deallocate(std::move(seq_blocks));
+        seq_blocks.clear();
         // ... then sequence->reset() drops the alias OUTSIDE the manager lock
         // -- the dec that races other threads' matches on the same cached
         // block.
