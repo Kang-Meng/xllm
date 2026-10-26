@@ -101,10 +101,10 @@ void configure_deepseek_v4_dspark_args(ModelArgs& args,
     compress_ratios_from_ckpt = true;
   } else if (!ckpt_compress_ratios.empty()) {
     LOG(WARNING) << "DSpark draft compress_ratios size "
-                << ckpt_compress_ratios.size() << " != decoder_layers("
-                << decoder_layers << ") + draft_layers(" << draft_layer_count
-                << "); falling back to the family default ("
-                << (v41_draft ? 0 : 1) << ") for all draft layers.";
+                 << ckpt_compress_ratios.size() << " != decoder_layers("
+                 << decoder_layers << ") + draft_layers(" << draft_layer_count
+                 << "); falling back to the family default ("
+                 << (v41_draft ? 0 : 1) << ") for all draft layers.";
   }
   LOG(INFO) << "DSpark draft compress_ratios=["
             << absl::StrJoin(draft_compress_ratios, ",") << "] over "
@@ -161,32 +161,8 @@ std::vector<int32_t> read_capture_layer_ids(
     return {};
   }
 
-  // Legacy xLLM/vLLM draft configs already use 0-based post-layer output
-  // indices, which match ModelArgs::layers_to_capture directly. The
-  // ``text_config.*`` variants cover checkpoints that nest the draft keys under
-  // a multimodal-style wrapper; a root-level key wins because it is listed
-  // first, so the deployment-side config patch stays idempotent.
   std::vector<int32_t> capture_layer_ids =
-      reader.value_or<std::vector<int32_t>>(
-          std::vector<std::string>{"dspark_target_layer_ids",
-                                   "target_layer_ids",
-                                   "dflash_config.target_layer_ids",
-                                   "text_config.dspark_target_layer_ids",
-                                   "text_config.target_layer_ids"},
-          std::vector<int32_t>{});
-  if (!capture_layer_ids.empty()) {
-    return capture_layer_ids;
-  }
-
-  // Speculators-format keys are hidden-state boundary indices (0=embedding
-  // output, v=output of layer v-1); shift them to the post-layer contract.
-  capture_layer_ids = reader.value_or<std::vector<int32_t>>(
-      std::vector<std::string>{"aux_hidden_state_layer_ids",
-                               "eagle_aux_hidden_state_layer_ids",
-                               "text_config.aux_hidden_state_layer_ids"},
-      std::vector<int32_t>{});
-  capture_layer_ids =
-      AuxHiddenCapture::boundary_to_post_layer_ids(capture_layer_ids);
+      AuxHiddenCapture::read_capture_layer_ids(reader);
   CHECK(!required || !capture_layer_ids.empty())
       << "Block-diffusion draft config requires dspark_target_layer_ids, "
          "target_layer_ids, dflash_config.target_layer_ids, "

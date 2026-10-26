@@ -27,9 +27,35 @@ limitations under the License.
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/speculative/spec_input_builder.h"
 #include "platform/device.h"
+#include "runtime/dflash/dflash2_worker_impl.h"
 #include "runtime/dspark_worker_impl.h"
+#include "runtime/llm_worker_impl.h"
 
 namespace xllm {
+
+class DFlashWorkerImplTestPeer final {
+ public:
+  static ForwardInput prepare_query(DFlashWorkerImpl& worker,
+                                    const ForwardInput& input) {
+    worker.mask_token_id_ = 4;
+    ForwardInput query;
+    worker.prepare_query_inputs(input, query);
+    CHECK_EQ(worker.prepare_stream_->synchronize(), 0);
+    return query;
+  }
+
+  static ForwardInput prepare_json_states(DFlashWorkerImpl& worker,
+                                          const ForwardInput& input,
+                                          const torch::Tensor& tokens_host,
+                                          const StreamEventPtr& ready) {
+    auto guard = worker.compute_stream_->set_stream_guard();
+    ForwardInput validation;
+    worker.prepare_json_validation_states(
+        input, tokens_host, ready, validation);
+    CHECK_EQ(worker.compute_stream_->synchronize(), 0);
+    return validation;
+  }
+};
 
 class DSparkWorkerImplTestPeer final {
  public:
@@ -55,6 +81,17 @@ class DSparkWorkerImplTestPeer final {
     worker.prepare_validate_output_async(input);
     CHECK(worker.compute_stream_->wait_event(worker.prepared_context_ready_));
     return worker.prepared_context_block_table_;
+  }
+
+  static ForwardOutput finalize_output(DSparkWorkerImpl& worker,
+                                       const ForwardInput& input,
+                                       const SampleOutput& sample,
+                                       std::unique_ptr<LLMWorkerImpl> draft) {
+    worker.draft_impl_ = std::move(draft);
+    worker.prepare_validate_output_async(input);
+    ForwardOutput output;
+    worker.finalize_validate_output_async(input, sample, output);
+    return output;
   }
 
   static bool async_output_enabled(const DSparkWorkerImpl& worker) {
@@ -781,6 +818,235 @@ TEST(DSparkDecodeStepTest, JsonDecodePreparationHonorsPrelaunchFlag) {
   ASSERT_EQ(processed.json_object_states.size(), 1);
   EXPECT_TRUE(processed.json_object_states.front().initialized());
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(disabled));
+}
+
+class ContextOnlyModel final : public CausalLM {
+ public:
+  explicit ContextOnlyModel(torch::TensorOptions options)
+      : options_(std::move(options)) {}
+
+  ModelOutput forward(const torch::Tensor&,
+                      const torch::Tensor&,
+                      std::vector<KVCache>&,
+                      const ModelInputParams&) override {
+    LOG(FATAL) << "Forward is outside the async output test.";
+    return {};
+  }
+  torch::Tensor logits(const torch::Tensor&, const torch::Tensor&) override {
+    LOG(FATAL) << "Logits are outside the async output test.";
+    return {};
+  }
+  void load_model(std::unique_ptr<ModelLoader>) override {}
+  torch::Device device() const override { return options_.device(); }
+  const torch::TensorOptions& options() const override { return options_; }
+  void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
+  void update_expert_weight(int32_t) override {}
+  ModelOutput write_context_kv(const torch::Tensor& hidden,
+                               const torch::Tensor&,
+                               const torch::Tensor&,
+                               std::vector<KVCache>&,
+                               const ModelInputParams&) override {
+    ModelOutput output;
+    output.hidden_states = hidden;
+    return output;
+  }
+
+ private:
+  torch::TensorOptions options_;
+};
+
+class ContextOnlyWorker final : public LLMWorkerImpl {
+ public:
+  ContextOnlyWorker(const ParallelArgs& parallel_args,
+                    const torch::Device& device,
+                    const runtime::Options& options)
+      : LLMWorkerImpl(parallel_args, device, options) {
+    model_ = std::make_unique<ContextOnlyModel>(
+        torch::TensorOptions().device(device).dtype(torch::kFloat));
+  }
+};
+
+TEST(DSparkDecodeStepTest, AsyncAcceptedOutputReplaysJsonForMixedRows) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).num_speculative_tokens(2).block_size(
+      128);
+  auto grammar = std::make_shared<JsonObjectGrammar>(
+      std::vector<std::string>{"{", "}", "x", "stop"},
+      std::unordered_set<int32_t>{3});
+  ForwardInput input;
+  input.positions_host = torch::tensor({0, 0, 0}, torch::kInt32);
+  input.input_params.meta.num_sequences = 3;
+  input.input_params.attention.device.block_tables =
+      torch::tensor({{0}, {1}, {2}}, torch::kInt32).to(device.unwrap());
+  input.json_object_states = {grammar->initial_state(),
+                              grammar->initial_state(),
+                              JsonObjectGrammarState()};
+  input.sample_sequence_ids = {"valid", "invalid", "plain"};
+  const torch::Tensor accepted =
+      torch::tensor({{0, 1, -1}, {0, 2, -1}, {2, 2, -1}}, torch::kLong);
+  for (const auto dtype : {torch::kInt32, torch::kInt64}) {
+    DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+    SampleOutput sample;
+    sample.next_tokens = accepted.to(device.unwrap(), dtype);
+    sample.embeddings =
+        torch::zeros({3, 3, 4}, torch::TensorOptions().device(device.unwrap()));
+    ForwardOutput output = DSparkWorkerImplTestPeer::finalize_output(
+        worker,
+        input,
+        sample,
+        std::make_unique<ContextOnlyWorker>(
+            parallel_args, device.unwrap(), options));
+    ASSERT_EQ(output.json_object_errors.size(), 1);
+    EXPECT_EQ(output.json_object_errors.front().sample_sequence_id, "invalid");
+    ASSERT_NE(output.ready_event, nullptr);
+    ASSERT_TRUE(output.ready_event->synchronize());
+    EXPECT_TRUE(torch::equal(output.sample_output.next_tokens.to(torch::kLong),
+                             accepted));
+    EXPECT_TRUE(output.requires_host_retirement);
+    EXPECT_TRUE(DSparkWorkerImplTestPeer::has_pending(worker));
+    // Replaying the accepted block must not commit the input grammar state.
+    EXPECT_FALSE(input.json_object_states.front().is_complete());
+  }
+}
+
+TEST(DSparkDecodeStepTest, DraftQueryPreservesNonJsonSamplingMasks) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  auto grammar = std::make_shared<JsonObjectGrammar>(
+      std::vector<std::string>{"{", "}", "x", "stop"},
+      std::unordered_set<int32_t>{3});
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  for (const std::string& algorithm : {"DFlash2", "DSpark"}) {
+    SCOPED_TRACE(algorithm);
+    runtime::Options options;
+    options.speculative_algorithm(algorithm)
+        .num_speculative_tokens(2)
+        .block_size(16);
+    std::unique_ptr<DFlashWorkerImpl> worker;
+    if (algorithm == "DSpark") {
+      worker = std::make_unique<DSparkWorkerImpl>(
+          parallel_args, device.unwrap(), options);
+    } else {
+      worker = std::make_unique<DFlash2WorkerImpl>(
+          parallel_args, device.unwrap(), options);
+    }
+    ForwardInput input;
+    input.input_params.meta.num_sequences = 1;
+    input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+    input.token_ids_host = torch::tensor({0}, torch::kInt32);
+    input.positions_host = torch::tensor({3}, torch::kInt32);
+    input.token_ids = input.token_ids_host.to(device.unwrap());
+    input.positions = input.positions_host.to(device.unwrap());
+    input.input_params.attention.host.q_seq_lens = {1};
+    input.input_params.attention.host.kv_seq_lens = {4};
+    input.input_params.attention.host.block_tables =
+        torch::arange(8, torch::kInt32).reshape({1, 8});
+    input.sampling_params.all_greedy_sample = true;
+    input.sampling_params.filter_mask =
+        torch::tensor({{0.0f, 1.0f, 0.0f, 1.0f}});
+    input.sampling_params.filter_bitmask = torch::tensor({{10}}, torch::kInt32);
+    ForwardInput plain =
+        DFlashWorkerImplTestPeer::prepare_query(*worker, input);
+    EXPECT_TRUE(plain.sampling_params.filter_mask.is_same(
+        input.sampling_params.filter_mask));
+    EXPECT_TRUE(plain.sampling_params.filter_bitmask.is_same(
+        input.sampling_params.filter_bitmask));
+    input.json_object_states = {grammar->initial_state()};
+    ForwardInput constrained =
+        DFlashWorkerImplTestPeer::prepare_query(*worker, input);
+    EXPECT_FALSE(constrained.sampling_params.filter_mask.defined());
+    EXPECT_FALSE(constrained.sampling_params.filter_bitmask.defined());
+    EXPECT_TRUE(input.sampling_params.filter_mask.defined());
+    EXPECT_TRUE(input.sampling_params.filter_bitmask.defined());
+  }
+}
+
+TEST(DSparkDecodeStepTest,
+     SharedJsonReplayWaitsForCopyAndHandlesStridedTokens) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  auto grammar = std::make_shared<JsonObjectGrammar>(
+      std::vector<std::string>{"{", "}", "x", "stop"},
+      std::unordered_set<int32_t>{3});
+  ForwardInput input;
+  input.input_params.meta.num_sequences = 3;
+  input.json_object_states = {grammar->initial_state(),
+                              grammar->initial_state(),
+                              JsonObjectGrammarState()};
+  JsonObjectGrammarState open = grammar->initial_state();
+  ASSERT_TRUE(open.accept_token(0));
+  JsonObjectGrammarState complete = open;
+  ASSERT_TRUE(complete.accept_token(1));
+  const std::vector<uint64_t> expected_fingerprints = {
+      input.json_object_states[0].fingerprint(),
+      open.fingerprint(),
+      complete.fingerprint(),
+      input.json_object_states[1].fingerprint(),
+      open.fingerprint(),
+      open.fingerprint()};
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  for (const std::string& algorithm : {"DFlash2", "DSpark"}) {
+    for (const auto dtype : {torch::kInt32, torch::kInt64}) {
+      SCOPED_TRACE(algorithm);
+      runtime::Options options;
+      options.speculative_algorithm(algorithm).num_speculative_tokens(2);
+      std::unique_ptr<DFlashWorkerImpl> worker;
+      if (algorithm == "DSpark") {
+        worker = std::make_unique<DSparkWorkerImpl>(
+            parallel_args, device.unwrap(), options);
+      } else {
+        worker = std::make_unique<DFlash2WorkerImpl>(
+            parallel_args, device.unwrap(), options);
+      }
+      // A transposed pinned destination exercises both dtype conversion and
+      // contiguous normalization, without relying on the usual staging layout.
+      torch::Tensor host =
+          torch::full({2, 3},
+                      3,
+                      torch::TensorOptions().dtype(dtype).pinned_memory(true))
+              .transpose(0, 1);
+      ASSERT_FALSE(host.is_contiguous());
+      const torch::Tensor drafted =
+          torch::tensor({{0, 1}, {0, 2}, {2, 2}}, torch::kLong)
+              .to(device.unwrap(), dtype);
+      auto copy_stream = device.get_stream_from_pool();
+      StreamEventPtr ready;
+      {
+        auto guard = copy_stream->set_stream_guard();
+        torch::Tensor matrix = torch::ones({2048, 2048},
+                                           torch::TensorOptions()
+                                               .dtype(torch::kFloat16)
+                                               .device(device.unwrap()));
+        for (int32_t iteration = 0; iteration < 16; ++iteration) {
+          matrix = torch::matmul(matrix, matrix);
+        }
+        host.copy_(drafted, true);
+        ready = copy_stream->record_event();
+      }
+      ASSERT_NE(ready, nullptr);
+      ForwardInput validation = DFlashWorkerImplTestPeer::prepare_json_states(
+          *worker, input, host, ready);
+      ASSERT_EQ(validation.json_object_states.size(), 9);
+      EXPECT_EQ(validation.json_object_invalid_draft,
+                (std::vector<uint8_t>{0, 0, 0, 1, 0, 0}));
+      for (size_t row = 0; row < expected_fingerprints.size(); ++row) {
+        EXPECT_EQ(validation.json_object_states[row].fingerprint(),
+                  expected_fingerprints[row]);
+      }
+      for (size_t row = 6; row < 9; ++row) {
+        EXPECT_FALSE(validation.json_object_states[row].initialized());
+      }
+      EXPECT_TRUE(validation.sampling_params.filter_bitmask.defined());
+      EXPECT_FALSE(validation.sampling_params.filter_mask.defined());
+      EXPECT_FALSE(input.json_object_states.front().is_complete());
+    }
+  }
 }
 
 TEST(DSparkDecodeStepTest, JsonConsumesHostTokensOnlyAfterReadyEvent) {

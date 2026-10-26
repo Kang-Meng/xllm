@@ -334,6 +334,8 @@ REGISTER_MODEL_ARGS(qwen3, [&] {
   LOAD_ARG_OR(dflash2_conv_kernel_size, "dflash_config.conv_kernel_size", 0);
   LOAD_ARG_OR(dflash2_selector_rank, "dflash_config.selector_rank", 0);
   LOAD_ARG_OR(dflash2_selector_top_k, "dflash_config.selector_top_k", 0);
+  SET_ARG(dflash2_target_layer_ids,
+          AuxHiddenCapture::read_capture_layer_ids(json));
 
   LOAD_ARG_OR_FUNC(head_dim, "head_dim", [&] {
     return args->hidden_size() / args->n_heads();

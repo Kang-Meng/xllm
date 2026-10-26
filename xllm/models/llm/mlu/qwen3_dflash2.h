@@ -141,11 +141,18 @@ class DFlash2Qwen3ModelImpl final
     const auto& tensor_options = context.get_tensor_options();
     block_size_ = args.dflash2_block_size();
 
-    fc_ = register_module("fc",
-                          layer::AddMatmul(args.hidden_size() * args.n_layers(),
-                                           args.hidden_size(),
-                                           /*with_bias=*/false,
-                                           tensor_options));
+    const int64_t num_fused_target_layers =
+        static_cast<int64_t>(args.dflash2_target_layer_ids().size());
+    CHECK_GT(num_fused_target_layers, 0)
+        << "DFlash2 requires dflash_config.target_layer_ids in the draft "
+           "config.";
+
+    fc_ = register_module(
+        "fc",
+        layer::AddMatmul(args.hidden_size() * num_fused_target_layers,
+                         args.hidden_size(),
+                         /*with_bias=*/false,
+                         tensor_options));
     hidden_norm_ = register_module(
         "hidden_norm",
         layer::RMSNorm(

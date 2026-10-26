@@ -47,6 +47,7 @@ limitations under the License.
 #include "core/layers/npu_torch/deepseek_sparse_attention.h"
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
 #endif
+#include "core/framework/speculative/mtp_json_object_state.h"
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/platform/platform.h"
@@ -131,6 +132,24 @@ void repeat_sampling_params(SamplingParameters& sampling_params,
   repeat_sampling_tensor(sampling_params.unique_token_counts, repeats);
   repeat_sampling_tensor(sampling_params.unique_token_ids_lens, repeats);
   repeat_sampling_tensor(sampling_params.do_sample, repeats);
+}
+
+// Stages the drafted block to pinned host memory with an async copy on the
+// current compute stream. The JSON grammar replay needs the draft tokens on
+// the host to advance per-sequence grammar states; issuing the copy right
+// after the draft forward lets the validate-input host prep overlap with it.
+// The caller must record a copy-completion event and wait before reading.
+torch::Tensor stage_draft_tokens_to_pinned_host(
+    const torch::Tensor& draft_token_ids) {
+  CHECK_EQ(draft_token_ids.dim(), 2)
+      << "DFlash JSON grammar replay requires [batch, block] draft ids";
+  torch::Tensor pinned = torch::empty(draft_token_ids.sizes(),
+                                      torch::TensorOptions()
+                                          .dtype(draft_token_ids.dtype())
+                                          .device(torch::kCPU)
+                                          .pinned_memory(true));
+  pinned.copy_(draft_token_ids, /*non_blocking=*/true);
+  return pinned;
 }
 
 #if defined(USE_NPU)
@@ -978,8 +997,23 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   const int32_t batch_size = input.input_params.meta.num_sequences;
 
   DraftBlock draft_block = draft_block_in;
+  // JSON grammar rows need per-sequence, per-position validation states on a
+  // uniform (N+1)-wide layout, which the adaptive per-seq varlen pruning does
+  // not model (same stance as MTP). Disable pruning for grammar-constrained
+  // batches and validate the full block.
+  const bool has_json_states = !input.json_object_states.empty();
+  torch::Tensor json_draft_tokens_host;
+  StreamEventPtr json_draft_tokens_ready;
+  if (has_json_states) {
+    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    json_draft_tokens_host =
+        stage_draft_tokens_to_pinned_host(draft_block.proposal.token_ids());
+    json_draft_tokens_ready = compute_stream_->record_event();
+    CHECK(json_draft_tokens_ready != nullptr);
+  }
   std::vector<int32_t> prefix_lengths =
-      compute_adaptive_prefix_lengths(draft_block, input);
+      has_json_states ? std::vector<int32_t>()
+                      : compute_adaptive_prefix_lengths(draft_block, input);
   std::vector<int32_t> per_seq_val_tokens;
   bool did_prune = false;
   int32_t max_val_tokens = default_val_tokens;
@@ -1028,6 +1062,10 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   }
   sync_dp_global_token_nums_after_prune(validate_input.input_params,
                                         local_total_val_tokens);
+  if (has_json_states) {
+    prepare_json_validation_states(
+        input, json_draft_tokens_host, json_draft_tokens_ready, validate_input);
+  }
   // Stage host-originating template data before target launch: a nominally
   // asynchronous pageable H2D can otherwise drain target's execution stream.
   CHECK(!async_output || !did_prune)
@@ -1043,6 +1081,11 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
           .value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
+  if (has_json_states) {
+    CHECK(target_output.filter_bitmask_applied_to_logits)
+        << "DFlash target logits must be filtered by the target sampler for "
+           "JSON grammar rows";
+  }
 
   // Scatter varlen target output back to dense [B, max_val_tokens] layout so
   // the rejection sampler (dense API) can consume it. Pad next_tokens with -1
@@ -1165,6 +1208,12 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
         std::make_move_iterator(failed_request_ids.begin()),
         std::make_move_iterator(failed_request_ids.end()));
   }
+  if (has_json_states) {
+    check_json_accepted_tokens(
+        input,
+        val_output.next_tokens.to(torch::kInt64).contiguous(),
+        target_output);
+  }
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
     if (target_output.failed_request_ids.empty()) {
@@ -1252,6 +1301,108 @@ SampleOutput DFlashWorkerImpl::validate(
       target_output,
       bonus_token_ids,
       enable_fused_kernel_);
+}
+
+void DFlashWorkerImpl::prepare_json_validation_states(
+    const ForwardInput& input,
+    const torch::Tensor& draft_tokens_host,
+    const StreamEventPtr& draft_tokens_ready,
+    ForwardInput& validate_input) {
+  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  CHECK_EQ(draft_tokens_host.dim(), 2)
+      << "DFlash JSON grammar replay requires [batch, block] draft ids";
+  const int64_t batch_size = draft_tokens_host.size(0);
+  CHECK_EQ(draft_tokens_host.size(1), num_speculative_tokens)
+      << "DFlash JSON draft block width mismatch";
+  CHECK_EQ(input.input_params.meta.num_sequences, batch_size)
+      << "DFlash JSON draft rows must match input sequences";
+  CHECK_EQ(input.json_object_states.size(), static_cast<size_t>(batch_size))
+      << "DFlash JSON grammar states must match input sequences";
+
+  CHECK(draft_tokens_host.device().is_cpu());
+  CHECK(draft_tokens_ready != nullptr);
+  // Later compute-stream work may still use draft inputs. Only the D2H copy
+  // must finish before reading this pinned buffer on the host.
+  CHECK(draft_tokens_ready->synchronize())
+      << "failed to wait for DFlash draft tokens for JSON grammar replay";
+
+  // Advance each sequence's grammar state position by position across the
+  // drafted block. append_json_draft_step freezes a state at the first token
+  // the grammar rejects; the frozen-state masks keep the target's resampled
+  // tokens legal at and beyond that position, and the illegal draft token
+  // itself can never be accepted (its target probability is zero under the
+  // mask). The halt flag is intentionally ignored: the whole block was
+  // already drafted in one forward, so there is nothing left to stop.
+  std::vector<JsonObjectGrammarState> current_states = input.json_object_states;
+  std::vector<uint8_t> invalid_suffix(static_cast<size_t>(batch_size), 0);
+  detail::JsonDraftValidationScratch scratch;
+  scratch.states_after.reserve(static_cast<size_t>(num_speculative_tokens));
+  const torch::Tensor draft_tokens_cpu =
+      draft_tokens_host.to(torch::kInt64).contiguous();
+  const int64_t* const draft_token_ids =
+      draft_tokens_cpu.const_data_ptr<int64_t>();
+  std::vector<int32_t> position_tokens;
+  position_tokens.reserve(static_cast<size_t>(batch_size));
+  for (int32_t draft_idx = 0; draft_idx < num_speculative_tokens; ++draft_idx) {
+    position_tokens.clear();
+    for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+      position_tokens.emplace_back(static_cast<int32_t>(
+          draft_token_ids[seq_idx * num_speculative_tokens + draft_idx]));
+    }
+    detail::append_json_draft_step(
+        current_states, invalid_suffix, position_tokens, scratch);
+  }
+
+  // One validation state per target verify row (anchor + N draft positions),
+  // sequence-major. The TARGET-phase bitmask replaces the sequence-level mask
+  // the generic builder tiles across all rows, which would otherwise
+  // constrain every position with the step-initial state.
+  validate_input.json_object_states = detail::build_json_validation_states(
+      input.json_object_states,
+      scratch,
+      validate_input.json_object_invalid_draft);
+  CHECK_EQ(validate_input.json_object_states.size(),
+           static_cast<size_t>(batch_size) * (num_speculative_tokens + 1))
+      << "DFlash JSON validation states must cover every verify row";
+  validate_input.sampling_params.filter_bitmask =
+      build_json_object_filter_bitmask(validate_input.json_object_states,
+                                       device_,
+                                       JsonObjectMaskBuildPhase::TARGET);
+  validate_input.sampling_params.filter_mask = torch::Tensor();
+}
+
+void DFlashWorkerImpl::check_json_accepted_tokens(
+    const ForwardInput& input,
+    const torch::Tensor& accepted_tokens_cpu,
+    ForwardOutput& output) {
+  CHECK_EQ(accepted_tokens_cpu.dim(), 2)
+      << "DFlash JSON accepted tokens must be [batch, num_val_tokens]";
+  const int64_t batch_size = accepted_tokens_cpu.size(0);
+  const int64_t row_width = accepted_tokens_cpu.size(1);
+  CHECK_EQ(input.json_object_states.size(), static_cast<size_t>(batch_size))
+      << "DFlash JSON accepted rows must match grammar state rows";
+  CHECK_EQ(input.sample_sequence_ids.size(), static_cast<size_t>(batch_size))
+      << "DFlash JSON accepted rows must match sampled sequence ids";
+
+  const std::vector<detail::JsonAcceptedTokenMismatch> mismatches =
+      detail::find_json_accepted_token_mismatches(
+          input.json_object_states,
+          accepted_tokens_cpu.const_data_ptr<int64_t>(),
+          static_cast<size_t>(batch_size),
+          static_cast<size_t>(row_width));
+  for (const detail::JsonAcceptedTokenMismatch& mismatch : mismatches) {
+    const std::string& sequence_id =
+        input.sample_sequence_ids[mismatch.sequence_index];
+    LOG(ERROR) << "DFlash JSON accepted output replay mismatch: sequence_id="
+               << sequence_id << ", token_offset=" << mismatch.token_offset
+               << ", token_id=" << mismatch.token_id
+               << ", committed_tokens=" << mismatch.committed_tokens
+               << ", state_fingerprint=" << mismatch.state_fingerprint;
+    output.json_object_errors.push_back(
+        {sequence_id,
+         "accepted DFlash output violates json_object grammar, token_id=" +
+             std::to_string(mismatch.token_id)});
+  }
 }
 
 void DFlashWorkerImpl::process_draft_sample_output(
@@ -1413,6 +1564,13 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   // before rebuilding the draft query geometry.
   input_params.clear_linear_attention_state();
   input_params.embedding.input_embedding = torch::Tensor();
+  if (!input.json_object_states.empty()) {
+    // The sequence-level JSON mask does not model expanded draft positions.
+    // Enforce grammar on target verify rows instead, while preserving other
+    // sampling masks for inputs without JSON grammar states.
+    query_input.sampling_params.filter_bitmask = torch::Tensor();
+    query_input.sampling_params.filter_mask = torch::Tensor();
+  }
   dflash_detail::invalidate_draft_model_geometry(input_params);
   // The draft addresses its own pool, so both the row builder below and the
   // draft's attention must see this rank's expanded block table. Expand before

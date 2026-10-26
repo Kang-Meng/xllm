@@ -150,11 +150,20 @@ class DFlash2Qwen3ModelImpl final : public ::xllm::QWen3ModelImpl {
     tp_size_ = parallel_args.world_size() / (dp_size * cp_size);
     tp_rank_ = parallel_args.rank() % tp_size_;
 
-    fc_ = register_module("fc",
-                          layer::AddMatmul(args.hidden_size() * args.n_layers(),
-                                           args.hidden_size(),
-                                           /*with_bias=*/false,
-                                           tensor_options_));
+    // fc fuses the target's captured hidden states (dflash_config.
+    // target_layer_ids), not the draft's own layers: its input width is
+    // hidden_size * len(target_layer_ids), which can differ from n_layers.
+    const int64_t num_fused_target_layers =
+        static_cast<int64_t>(args.dflash2_target_layer_ids().size());
+    CHECK_GT(num_fused_target_layers, 0)
+        << "DFlash2 requires dflash_config.target_layer_ids in the draft "
+           "config.";
+    fc_ = register_module(
+        "fc",
+        layer::AddMatmul(args.hidden_size() * num_fused_target_layers,
+                         args.hidden_size(),
+                         /*with_bias=*/false,
+                         tensor_options_));
     hidden_norm_ = register_module(
         "hidden_norm",
         layer::RMSNorm(

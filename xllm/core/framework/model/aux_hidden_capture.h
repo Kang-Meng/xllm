@@ -22,10 +22,12 @@ limitations under the License.
 #include <cstdint>
 #include <iterator>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_output.h"
+#include "core/util/json_reader.h"
 
 namespace xllm {
 
@@ -59,6 +61,26 @@ class AuxHiddenCapture final {
       post_layer_ids.push_back(boundary_id - 1);
     }
     return post_layer_ids;
+  }
+
+  // Legacy keys store post-layer indices and take priority over boundary keys.
+  // Keep model projection sizing and runtime capture selection on one contract.
+  static std::vector<int32_t> read_capture_layer_ids(const JsonReader& reader) {
+    std::vector<int32_t> layer_ids = reader.value_or<std::vector<int32_t>>(
+        std::vector<std::string>{"dspark_target_layer_ids",
+                                 "target_layer_ids",
+                                 "dflash_config.target_layer_ids",
+                                 "text_config.dspark_target_layer_ids",
+                                 "text_config.target_layer_ids"},
+        std::vector<int32_t>{});
+    if (!layer_ids.empty()) {
+      return layer_ids;
+    }
+    return boundary_to_post_layer_ids(reader.value_or<std::vector<int32_t>>(
+        std::vector<std::string>{"aux_hidden_state_layer_ids",
+                                 "eagle_aux_hidden_state_layer_ids",
+                                 "text_config.aux_hidden_state_layer_ids"},
+        std::vector<int32_t>{}));
   }
 
   // Number of aux hidden-state chunks the target produces and the draft

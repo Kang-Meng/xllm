@@ -20,6 +20,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/types.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/service_config.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "distributed_runtime/llm_engine.h"
 #include "framework/request/request_output.h"
@@ -154,15 +155,29 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
   req_state.include_stop_str_in_output = req.include_stop_str_in_output();
 
   if (json_object) {
-    std::string grammar_error;
-    req_state.json_object_grammar =
-        get_json_object_grammar(req.json_reasoning_enabled(), &grammar_error);
-    if (req_state.json_object_grammar == nullptr) {
-      LOG(ERROR) << "Failed to initialize json_object constraint: "
-                 << grammar_error << ", request_id=" << req.req_id();
-      return nullptr;
+    if (!ServiceConfig::get_instance().enable_json_object_output()) {
+      // Match the single-instance flag semantics: json_object requests are
+      // accepted without the constraint when this instance disables it.
+      // Without this gate the sequence-level grammar tracker would stay
+      // active while forward inputs carry no grammar masks (the batch input
+      // builder respects the same flag), surfacing as random mid-generation
+      // grammar violations.
+      LOG(WARNING)
+          << "json_object request " << req.req_id()
+          << " arrives at a decode instance with enable_json_object_output="
+             "false; accepting without the constraint. Enable the flag on "
+             "every PD instance for constrained decoding.";
+    } else {
+      std::string grammar_error;
+      req_state.json_object_grammar =
+          get_json_object_grammar(req.json_reasoning_enabled(), &grammar_error);
+      if (req_state.json_object_grammar == nullptr) {
+        LOG(ERROR) << "Failed to initialize json_object constraint: "
+                   << grammar_error << ", request_id=" << req.req_id();
+        return nullptr;
+      }
+      req_state.json_reasoning_enabled = req.json_reasoning_enabled();
     }
-    req_state.json_reasoning_enabled = req.json_reasoning_enabled();
   }
 
   req_state.pd_reservation_id = req.reservation_id();

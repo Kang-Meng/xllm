@@ -262,5 +262,78 @@ TEST(MtpJsonObjectStateTest, CopiesContiguousHostDraftTokensInBulk) {
   EXPECT_TRUE(detail::copy_json_draft_token_ids(nullptr, 0).empty());
 }
 
+// DFlash drafts the whole block in one forward and replays it position by
+// position through these helpers; the tests below pin the invariants the
+// DFlash JSON validation relies on.
+TEST(DFlashJsonObjectStateTest, BlockDraftFreezesAtMidBlockInvalid) {
+  JsonObjectGrammar grammar = make_mtp_grammar();
+  const std::vector<JsonObjectGrammarState> initial_states = {
+      grammar.initial_state()};
+  std::vector<JsonObjectGrammarState> current_states = initial_states;
+  std::vector<uint8_t> invalid_suffix(1, 0);
+  detail::JsonDraftValidationScratch scratch;
+  // Drafted block: "{" `"a"` "stop"(illegal mid-object) ":" "}".
+  const std::vector<int32_t> draft_block = {0, 1, 5, 3, 4};
+
+  for (size_t draft_idx = 0; draft_idx < draft_block.size(); ++draft_idx) {
+    detail::append_json_draft_step(
+        current_states, invalid_suffix, {draft_block[draft_idx]}, scratch);
+  }
+
+  std::vector<uint8_t> invalid_draft;
+  const std::vector<JsonObjectGrammarState> validation_states =
+      detail::build_json_validation_states(
+          initial_states, scratch, invalid_draft);
+
+  ASSERT_EQ(validation_states.size(), 6u);
+  EXPECT_EQ(invalid_draft, std::vector<uint8_t>({0, 0, 1, 1, 1}));
+  // Rows 0..2 reflect the legal prefix (initial, after "{", after `"a"`).
+  JsonObjectGrammarState committed_state = initial_states[0];
+  ASSERT_TRUE(committed_state.accept_token(0));
+  EXPECT_EQ(validation_states[1].fingerprint(), committed_state.fingerprint());
+  ASSERT_TRUE(committed_state.accept_token(1));
+  EXPECT_EQ(validation_states[2].fingerprint(), committed_state.fingerprint());
+  // Rows at and beyond the invalid draft freeze at the last legal prefix,
+  // which is exactly the state the sequence tracker will be in when the
+  // target resamples at the rejection point.
+  for (size_t row = 3; row < validation_states.size(); ++row) {
+    EXPECT_EQ(validation_states[row].fingerprint(),
+              committed_state.fingerprint());
+  }
+}
+
+TEST(DFlashJsonObjectStateTest, MaskedResampleAtRejectionReplaysCleanly) {
+  JsonObjectGrammar grammar = make_mtp_grammar();
+  const std::vector<JsonObjectGrammarState> initial_states = {
+      grammar.initial_state()};
+  // Rejection sampling under the frozen-state mask accepts the legal prefix,
+  // resamples the illegal position from the target's masked distribution
+  // (":" here), and pads the rest of the row with -1.
+  const int64_t accepted_tokens[] = {0, 1, 2, -1, -1, -1};
+
+  const std::vector<detail::JsonAcceptedTokenMismatch> mismatches =
+      detail::find_json_accepted_token_mismatches(
+          initial_states, accepted_tokens, /*num_rows=*/1, /*row_width=*/6);
+
+  EXPECT_TRUE(mismatches.empty());
+}
+
+TEST(DFlashJsonObjectStateTest, IllegalAcceptedTokenReportsMismatch) {
+  JsonObjectGrammar grammar = make_mtp_grammar();
+  const std::vector<JsonObjectGrammarState> initial_states = {
+      grammar.initial_state()};
+  // An accepted row that (incorrectly) keeps the illegal draft token must be
+  // reported at the exact offset and token id.
+  const int64_t accepted_tokens[] = {0, 1, 5, 3, 4, -1};
+
+  const std::vector<detail::JsonAcceptedTokenMismatch> mismatches =
+      detail::find_json_accepted_token_mismatches(
+          initial_states, accepted_tokens, /*num_rows=*/1, /*row_width=*/6);
+
+  ASSERT_EQ(mismatches.size(), 1u);
+  EXPECT_EQ(mismatches[0].token_offset, 2u);
+  EXPECT_EQ(mismatches[0].token_id, 5);
+}
+
 }  // namespace
 }  // namespace xllm

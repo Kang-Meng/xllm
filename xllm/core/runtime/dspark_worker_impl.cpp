@@ -604,6 +604,17 @@ void DSparkWorkerImpl::finalize_validate_output_async(
   pending.context_ready = compute_stream_->record_event();
   CHECK(pending.context_ready != nullptr);
 
+  if (!input.json_object_states.empty()) {
+    // Replay only after the asynchronous accepted-token copy is visible on
+    // host. The context KV write can finish independently through
+    // context_ready.
+    CHECK(pending.d2h_ready->synchronize());
+    check_json_accepted_tokens(
+        input,
+        pending.accepted_host.to(torch::kInt64).contiguous(),
+        target_output);
+  }
+
   auto retained = std::make_shared<ForwardInput>(input);
   retained->retained_device_tensors.reserve(
       retained->retained_device_tensors.size() + 6 +

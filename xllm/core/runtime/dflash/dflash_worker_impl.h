@@ -262,7 +262,26 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
       const ForwardInput& input,
       const SampleOutput& validate_output);
 
+  // Builds per-position JSON grammar validation states for the target verify
+  // rows from the sequence-level states and the drafted block: advances each
+  // state across the block (freezing at the first illegal draft token) and
+  // attaches the resulting TARGET-phase bitmask to `validate_input`.
+  // `draft_tokens_host` is a CPU copy of the [batch, N] drafted block;
+  // draft_tokens_ready fences its D2H copy without draining later work.
+  void prepare_json_validation_states(const ForwardInput& input,
+                                      const torch::Tensor& draft_tokens_host,
+                                      const StreamEventPtr& draft_tokens_ready,
+                                      ForwardInput& validate_input);
+
  protected:
+  // Replays the accepted block through the sequence-level grammar states and
+  // records json_object_errors for sequences whose accepted tokens violate
+  // the grammar. Defense in depth on top of the per-position masks.
+  // `accepted_tokens_cpu` is [batch, num_val_tokens] with -1 padding.
+  void check_json_accepted_tokens(const ForwardInput& input,
+                                  const torch::Tensor& accepted_tokens_cpu,
+                                  ForwardOutput& output);
+
   int32_t mask_token_id_ = -1;
   int64_t expected_context_hidden_size_ = 0;
   // Whether the target model owns recurrent (linear attention) layers.
