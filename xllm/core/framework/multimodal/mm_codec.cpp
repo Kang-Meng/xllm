@@ -923,10 +923,18 @@ class MemoryVideoWriter final : public MemoryMediaWriter {
                  << video.sizes();
       return false;
     }
-    if (video.scalar_type() != torch::kFloat32 || !video.device().is_cpu()) {
-      LOG(ERROR) << "MemoryVideoWriter: expects cpu float32 tensor";
+    if (!video.device().is_cpu() || (video.scalar_type() != torch::kUInt8 &&
+                                     video.scalar_type() != torch::kFloat32)) {
+      LOG(ERROR) << "MemoryVideoWriter: expects cpu float32 or uint8 tensor";
       return false;
     }
+    if (video.scalar_type() == torch::kUInt8 && !video.is_contiguous()) {
+      LOG(ERROR) << "MemoryVideoWriter: expects contiguous uint8 tensor";
+      return false;
+    }
+    const AVPixelFormat src_pix_fmt = video.scalar_type() == torch::kUInt8
+                                          ? AV_PIX_FMT_GBRP
+                                          : AV_PIX_FMT_RGB24;
 
     const int64_t T = video.size(0);
     const int64_t H = video.size(2);
@@ -951,10 +959,15 @@ class MemoryVideoWriter final : public MemoryMediaWriter {
         codec_id = x264_codec->id;
         pix_fmt = AV_PIX_FMT_YUV420P;
         av_dict_set(&opts, "crf", "18", 0);
-        av_dict_set(&opts, "preset", "medium", 0);
+        av_dict_set(&opts, "preset", "veryfast", 0);
         av_dict_set(&opts, "profile", "high", 0);
         av_dict_set(&opts, "level", "4.1", 0);
-        LOG(INFO) << "Using libx264 H.264 encoder with CRF=18";
+        LOG(INFO) << "Using libx264 H.264 encoder with CRF=18 preset=veryfast"
+                  << " input_dtype="
+                  << (video.scalar_type() == torch::kUInt8 ? "uint8"
+                                                           : "float32")
+                  << " source_pix_fmt="
+                  << (video.scalar_type() == torch::kUInt8 ? "gbrp" : "rgb24");
       } else {
         codec_id = AV_CODEC_ID_MPEG4;
         pix_fmt = AV_PIX_FMT_YUV420P;
@@ -977,7 +990,7 @@ class MemoryVideoWriter final : public MemoryMediaWriter {
 
     sws_ctx_ = sws_getContext(static_cast<int32_t>(W),
                               static_cast<int32_t>(H),
-                              AV_PIX_FMT_RGB24,
+                              src_pix_fmt,
                               static_cast<int32_t>(W),
                               static_cast<int32_t>(H),
                               pix_fmt,
@@ -1001,43 +1014,67 @@ class MemoryVideoWriter final : public MemoryMediaWriter {
       return false;
     }
 
-    auto video_acc = video.accessor<float, 4>();
-    const int64_t stride = W * 3;
-    std::vector<uint8_t> rgb_buf(static_cast<size_t>(H * stride));
-    int64_t pts = 0;
-
-    for (int64_t t = 0; t < T; ++t) {
-      for (int64_t y = 0; y < H; ++y) {
-        for (int64_t x = 0; x < W; ++x) {
-          rgb_buf[static_cast<size_t>(y * stride + x * 3 + 0)] =
-              static_cast<uint8_t>(
-                  std::clamp(video_acc[t][0][y][x] * 255.0f, 0.0f, 255.0f));
-          rgb_buf[static_cast<size_t>(y * stride + x * 3 + 1)] =
-              static_cast<uint8_t>(
-                  std::clamp(video_acc[t][1][y][x] * 255.0f, 0.0f, 255.0f));
-          rgb_buf[static_cast<size_t>(y * stride + x * 3 + 2)] =
-              static_cast<uint8_t>(
-                  std::clamp(video_acc[t][2][y][x] * 255.0f, 0.0f, 255.0f));
-        }
-      }
-
-      const uint8_t* src_data[1] = {rgb_buf.data()};
-      int32_t src_linesize[1] = {static_cast<int32_t>(stride)};
-
+    const auto encode_frame = [this, H](const uint8_t* const* src_data,
+                                        const int32_t* src_linesize,
+                                        int64_t pts) -> bool {
       if (av_frame_make_writable(yuv_frame_) < 0) {
         return false;
       }
       sws_scale(sws_ctx_,
                 src_data,
                 src_linesize,
-                0,
+                /*src_slice_y=*/0,
                 static_cast<int32_t>(H),
                 yuv_frame_->data,
                 yuv_frame_->linesize);
-      yuv_frame_->pts = pts++;
+      yuv_frame_->pts = pts;
+      return send_frame(yuv_frame_);
+    };
 
-      if (!send_frame(yuv_frame_)) {
-        return false;
+    if (video.scalar_type() == torch::kUInt8) {
+      const int64_t plane_size = H * W;
+      const uint8_t* video_data = video.const_data_ptr<uint8_t>();
+      const int32_t src_linesize[AV_NUM_DATA_POINTERS] = {
+          static_cast<int32_t>(W),
+          static_cast<int32_t>(W),
+          static_cast<int32_t>(W),
+          0};
+      const uint8_t* src_data[AV_NUM_DATA_POINTERS] = {};
+      for (int64_t t = 0; t < T; ++t) {
+        const uint8_t* frame_data = video_data + t * 3 * plane_size;
+        // GBRP planes are G/B/R; the tensor channels are R/G/B.
+        src_data[0] = frame_data + plane_size;
+        src_data[1] = frame_data + 2 * plane_size;
+        src_data[2] = frame_data;
+        if (!encode_frame(src_data, src_linesize, t)) {
+          return false;
+        }
+      }
+    } else {
+      const auto video_acc = video.accessor<float, 4>();
+      const int64_t stride = W * 3;
+      std::vector<uint8_t> rgb_buf(static_cast<size_t>(H * stride));
+      const uint8_t* src_data[AV_NUM_DATA_POINTERS] = {
+          rgb_buf.data(), nullptr, nullptr, nullptr};
+      const int32_t src_linesize[AV_NUM_DATA_POINTERS] = {
+          static_cast<int32_t>(stride), 0, 0, 0};
+      for (int64_t t = 0; t < T; ++t) {
+        for (int64_t y = 0; y < H; ++y) {
+          for (int64_t x = 0; x < W; ++x) {
+            rgb_buf[static_cast<size_t>(y * stride + x * 3 + 0)] =
+                static_cast<uint8_t>(
+                    std::clamp(video_acc[t][0][y][x] * 255.0f, 0.0f, 255.0f));
+            rgb_buf[static_cast<size_t>(y * stride + x * 3 + 1)] =
+                static_cast<uint8_t>(
+                    std::clamp(video_acc[t][1][y][x] * 255.0f, 0.0f, 255.0f));
+            rgb_buf[static_cast<size_t>(y * stride + x * 3 + 2)] =
+                static_cast<uint8_t>(
+                    std::clamp(video_acc[t][2][y][x] * 255.0f, 0.0f, 255.0f));
+          }
+        }
+        if (!encode_frame(src_data, src_linesize, t)) {
+          return false;
+        }
       }
     }
 

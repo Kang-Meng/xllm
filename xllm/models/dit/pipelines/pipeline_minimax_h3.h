@@ -458,6 +458,8 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     // Convert decoded video to RGB pixels.
     video = torch::clamp(
                 video.to(torch::kFloat32) * pixel_std_ + pixel_mean_, 0.0, 1.0)
+                .mul_(255.0)
+                .to(torch::kUInt8)
                 .permute({0, 2, 1, 3, 4})
                 .contiguous();
     torch::Tensor audio = audio_vae_->decode(audio_latent.to(torch::kFloat32));
