@@ -23,12 +23,14 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <string>
 
+#include "api_service/api_service.h"
 #include "api_service/http_auth.h"
 #include "api_service/non_stream_call.h"
 #include "api_service/rpc_request_metrics.h"
 #include "api_service/stream_call.h"
 #include "completion.pb.h"
 #include "core/common/metrics.h"
+#include "core/framework/config/distributed_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/util/closure_guard.h"
 
@@ -69,6 +71,70 @@ class ConnectedController final : public brpc::Controller {
   // This fixture models the live connection owned by a normal server call.
   bool IsCanceled() const override { return false; }
 };
+
+class EmbeddingsEntryMetricsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    previous_node_rank_ = DistributedConfig::get_instance().node_rank();
+    previous_api_key_ = ServiceConfig::get_instance().api_key();
+    // A non-master rank skips backend construction for the no-service path.
+    DistributedConfig::get_instance().node_rank(1);
+  }
+
+  void TearDown() override {
+    DistributedConfig::get_instance().node_rank(previous_node_rank_);
+    ServiceConfig::get_instance().api_key(previous_api_key_);
+  }
+
+ private:
+  int32_t previous_node_rank_ = 0;
+  std::string previous_api_key_;
+};
+
+TEST_F(EmbeddingsEntryMetricsTest, NoServiceEarlyExitsCountOnce) {
+  for (bool authentication : {false, true}) {
+    SCOPED_TRACE(authentication);
+    ServiceConfig::get_instance().api_key(authentication ? "test-key" : "");
+    APIService service(/*master=*/nullptr,
+                       /*model_names=*/{"test"},
+                       /*model_repository_names=*/{"test"},
+                       /*model_versions=*/{"1"});
+    ConnectedController controller;
+    controller.http_request().uri() = "/v1/embeddings";
+    proto::HttpRequest request;
+    proto::HttpResponse response;
+    CountingClosure done;
+    const char* outcome = authentication ? "authentication" : "invalid_request";
+    const double incoming = COUNTER_VALUE(server_request_in_total);
+    const double successes = COUNTER_VALUE(server_request_total_ok);
+    const double failures = COUNTER_VALUE(server_request_total_fail);
+    const double classified =
+        MULTI_COUNTER_VALUE(api_request_terminal_total, outcome);
+
+    service.EmbeddingsHttp(&controller, &request, &response, &done);
+
+    EXPECT_EQ(controller.http_response().status_code(),
+              authentication ? 401 : 400);
+    EXPECT_EQ(done.count(), 1);
+    EXPECT_EQ(COUNTER_VALUE(server_request_in_total), incoming + 1);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures + 1);
+    EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, outcome),
+              classified + 1);
+
+    ::testing::internal::CaptureStderr();
+    service.EmbeddingsHttp(nullptr, &request, &response, &done);
+    const std::string error_log = ::testing::internal::GetCapturedStderr();
+    EXPECT_NE(error_log.find("brpc controller is null"), std::string::npos);
+    EXPECT_EQ(error_log.find("ctrl is nullptr"), std::string::npos);
+    EXPECT_EQ(done.count(), 2);
+    EXPECT_EQ(COUNTER_VALUE(server_request_in_total), incoming + 2);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes);
+    EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures + 1);
+    EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, outcome),
+              classified + 1);
+  }
+}
 
 TEST(ApiTerminalMetricsTest, SuccessfulHandoffCountsOnceAfterGuardDestruction) {
   ConnectedController controller;

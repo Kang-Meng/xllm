@@ -738,7 +738,14 @@ void APIService::EmbeddingsHttp(::google::protobuf::RpcController* controller,
         response,
         done);
   } else {
-    brpc::ClosureGuard done_guard(done);
+    xllm::ClosureGuard done_guard(
+        done,
+        [](void* /*unused*/) { request_in_metric(nullptr); },
+        [controller](void* /*unused*/) {
+          if (controller != nullptr) {
+            request_out_metric(static_cast<void*>(controller));
+          }
+        });
     if (controller == nullptr) {
       LOG(ERROR) << "brpc controller is null";
       return;

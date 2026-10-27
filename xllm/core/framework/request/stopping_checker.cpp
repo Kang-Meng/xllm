@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "stopping_checker.h"
+#include "core/framework/request/stopping_checker.h"
 
 #include <absl/strings/match.h>
 #include <gflags/gflags_declare.h>
@@ -59,15 +59,12 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
 
   // if enable_schedule_overlap, there might be pre scheduled fake token -1
   // need to figure out the valid token to check finish.
-  size_t last_token_id;
-  size_t total_tokens;
-  for (auto i = token_ids.size() - 1; i >= 0; --i) {
-    if (token_ids[i] >= 0) {
-      last_token_id = token_ids[i];
-      total_tokens = i + 1;
-      break;
-    }
+  size_t total_tokens = token_ids.size();
+  while (total_tokens > 0 && token_ids[total_tokens - 1] < 0) {
+    --total_tokens;
   }
+  CHECK_GT(total_tokens, 0) << "No committed token to check";
+  const int32_t last_token_id = token_ids[total_tokens - 1];
 
   // check eos token
   if (!ignore_eos_ && last_token_id == eos_token_) {
@@ -91,9 +88,10 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
     return FinishReason::STOP;
   }
 
-  // check stop sequences
+  // Match only committed tokens; overlap may append placeholder tokens.
   for (const auto& seq : stop_sequences_) {
-    if (seq.back() == last_token_id && util::match_suffix(token_ids, seq)) {
+    if (seq.back() == last_token_id &&
+        util::match_suffix(token_ids.slice(/*start=*/0, total_tokens), seq)) {
       if (matched_stop_token_count != nullptr) {
         // A stop sequence may begin in the prompt and end in generated output.
         // Never hide prompt tokens, including when prompt echo is enabled.

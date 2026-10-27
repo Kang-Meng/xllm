@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "disagg_pd_service.h"
+#include "core/distributed_runtime/disagg_pd_service.h"
 
 #include <brpc/closure_guard.h>
 #include <glog/logging.h>
@@ -32,6 +32,15 @@ void DisaggPDService::ReleaseReservation(
     ::google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   disagg_pd_service_impl_->release_reservation(request, response);
+}
+
+void DisaggPDService::CancelRequest(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::CancelRequestRequest* request,
+    proto::CancelRequestResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  disagg_pd_service_impl_->cancel_request(request, response);
 }
 
 void DisaggPDService::AddNewRequests(

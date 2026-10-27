@@ -590,7 +590,9 @@ void ContinuousScheduler::apply_cancel_requests() {
   std::vector<std::shared_ptr<Request>> requests =
       cancel_request_queue_->take_all();
   for (const std::shared_ptr<Request>& request : requests) {
-    request->set_cancel();
+    if (!request->has_terminal_outcome()) {
+      request->set_cancel();
+    }
   }
 }
 

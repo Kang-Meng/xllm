@@ -505,8 +505,13 @@ class StreamTestService final : public proto::XllmAPIService {
       if (mode == "after") {
         call.finish_with_error(rejected);
         EXPECT_FALSE(call.write(chunk));
+        EXPECT_FALSE(call.finish_with_error(rejected));
+        call.finish();
       } else {
         call.finish();
+        call.finish();
+        EXPECT_FALSE(call.write(chunk));
+        EXPECT_FALSE(call.finish_with_error(rejected));
       }
     }
   }
@@ -561,6 +566,7 @@ TEST_F(StreamHttpTest, SuccessfulStreamStillEndsWithDone) {
   const std::string body = controller.response_attachment().to_string();
   EXPECT_NE(body.find("\"test-chunk\""), std::string::npos);
   EXPECT_NE(body.find("data: [DONE]\n\n"), std::string::npos);
+  EXPECT_EQ(body.find("data: [DONE]\n\n"), body.rfind("data: [DONE]\n\n"));
   EXPECT_EQ(body.find("rate_limit_exceeded"), std::string::npos);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes + 1);
   EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures);
@@ -581,6 +587,7 @@ TEST_F(StreamHttpTest, ErrorPreservesResponseCommitState) {
     EXPECT_EQ(controller.http_response().status_code(), started ? 200 : 400);
     const std::string body = controller.response_attachment().to_string();
     EXPECT_NE(body.find("invalid_parameter"), std::string::npos);
+    EXPECT_EQ(body.find("invalid_parameter"), body.rfind("invalid_parameter"));
     EXPECT_NE(body.find("temperature"), std::string::npos);
     EXPECT_EQ(body.find("data: [DONE]") != std::string::npos, started);
     EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes);

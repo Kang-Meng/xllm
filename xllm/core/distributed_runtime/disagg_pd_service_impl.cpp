@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "disagg_pd_service_impl.h"
+#include "core/distributed_runtime/disagg_pd_service_impl.h"
 
 #include <glog/logging.h>
 
@@ -190,6 +190,12 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
 
   // add one sequence, rest will be added by scheduler
   return new_request;
+}
+
+void DisaggPDServiceImpl::cancel_request(
+    const proto::CancelRequestRequest* request,
+    proto::CancelRequestResponse* response) {
+  response->set_result(scheduler_->cancel_request(*request));
 }
 
 void DisaggPDServiceImpl::release_reservation(

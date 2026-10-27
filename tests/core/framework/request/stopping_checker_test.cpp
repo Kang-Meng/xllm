@@ -24,6 +24,36 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(StoppingCheckerDeathTest, RejectsOnlyPlaceholderTokens) {
+  StoppingChecker checker(
+      /*max_generated_tokens=*/1,
+      /*max_context_len=*/0,
+      /*eos_token=*/2,
+      /*ignore_eos=*/false,
+      /*stop_tokens=*/std::unordered_set<int32_t>{},
+      /*stop_sequences=*/std::vector<std::vector<int32_t>>{});
+  const std::vector<int32_t> token_ids = {-1, -1};
+
+  EXPECT_DEATH(checker.check(token_ids, /*num_prompt_tokens=*/0),
+               "No committed token to check");
+}
+
+TEST(StoppingCheckerTest, ChecksFirstTokenBeforeTrailingPlaceholders) {
+  StoppingChecker checker(
+      /*max_generated_tokens=*/1,
+      /*max_context_len=*/0,
+      /*eos_token=*/2,
+      /*ignore_eos=*/false,
+      /*stop_tokens=*/std::unordered_set<int32_t>{},
+      /*stop_sequences=*/std::vector<std::vector<int32_t>>{});
+  const std::vector<int32_t> token_ids = {1, -1, -1};
+  size_t matched = 99;
+
+  EXPECT_EQ(checker.check(token_ids, /*num_prompt_tokens=*/0, &matched),
+            FinishReason::LENGTH);
+  EXPECT_EQ(matched, 0u);
+}
+
 TEST(StoppingCheckerTest, IgnoreEosSkipsOnlyEosToken) {
   StoppingChecker checker(
       /*max_generated_tokens=*/10,
@@ -87,6 +117,16 @@ TEST(StoppingCheckerTest, IgnoreEosStillStopsOnStopSequence) {
 
   EXPECT_EQ(checker.check(token_ids, /*num_prompt_tokens=*/1),
             FinishReason::STOP);
+  // Overlap placeholders must not prevent matching the committed suffix.
+  const std::vector<int32_t> tokens = {1, 4, 5, -1, -1};
+  size_t matched = 0;
+  EXPECT_EQ(checker.check(tokens, /*num_prompt_tokens=*/1, &matched),
+            FinishReason::STOP);
+  EXPECT_EQ(matched, 2);
+  // When the marker starts in the prompt, only its generated suffix is hidden.
+  EXPECT_EQ(checker.check(tokens, /*num_prompt_tokens=*/2, &matched),
+            FinishReason::STOP);
+  EXPECT_EQ(matched, 1);
 }
 
 }  // namespace

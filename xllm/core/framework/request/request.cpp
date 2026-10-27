@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "request.h"
+#include "core/framework/request/request.h"
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
@@ -25,17 +25,47 @@ limitations under the License.
 #include <cstdint>
 #include <iomanip>
 #include <limits>
+#include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "api_service/call.h"
-#include "common/metrics.h"
-#include "sequence.h"
-#include "util/env_var.h"
-#include "util/timer.h"
+#include "core/common/metrics.h"
+#include "core/framework/request/sequence.h"
+#include "core/util/env_var.h"
+#include "core/util/timer.h"
 
 namespace xllm {
+namespace {
+
+// Write optional fields directly into the log stream without allocating a
+// concatenated string. The label includes its separator.
+class OptionalLogField final {
+ public:
+  OptionalLogField(std::string_view label, std::string_view value)
+      : label_(label), value_(value) {}
+
+  friend std::ostream& operator<<(std::ostream& stream,
+                                  const OptionalLogField& field) {
+    if (!field.value_.empty()) {
+      stream << field.label_ << field.value_;
+    }
+    return stream;
+  }
+
+ private:
+  std::string_view label_;
+  std::string_view value_;
+};
+
+OptionalLogField optional_field(std::string_view label,
+                                std::string_view value) {
+  return OptionalLogField(label, value);
+}
+
+}  // namespace
 
 Request::Request(const std::string& request_id,
                  const std::string& x_request_id,
@@ -153,11 +183,11 @@ void Request::log_terminal_statistic(RequestTerminalOutcome outcome,
       outcome == RequestTerminalOutcome::SUCCESS     ? "success"
       : outcome == RequestTerminalOutcome::CANCELLED ? "cancelled"
                                                      : "failure";
-  LOG(INFO) << "x-request-id: " << x_request_id_ << ", "
-            << "x-request-time: " << x_request_time_ << ", "
-            << "request_id: " << request_id_ << ", "
-            << "record_type: request_terminal, outcome: " << outcome_name
-            << ", status_code: " << static_cast<int32_t>(logged_status.code());
+  LOG(INFO) << "record_type: request_terminal, request_id: " << request_id_
+            << optional_field(", x-request-id: ", x_request_id_)
+            << ", outcome: " << outcome_name
+            << ", status_code: " << static_cast<int32_t>(logged_status.code())
+            << optional_field(", x-request-time: ", x_request_time_);
   if (outcome == RequestTerminalOutcome::SUCCESS) {
     log_statistic(total_latency, /*prefill_stage=*/false);
   } else {
@@ -186,8 +216,11 @@ double Request::queue_to_batch_latency_ms() const {
 }
 
 void Request::log_statistic(double total_latency, bool prefill_stage) {
-  // log the request statistics
-  int idx = 0;
+  // Keep the client ID on every record for grep; request time belongs to the
+  // request terminal or the non-terminal PD prefill stage, not each sequence.
+  const std::string_view request_time =
+      prefill_stage ? std::string_view(x_request_time_) : std::string_view();
+  int32_t idx = 0;
   for (const auto& seq : sequences()) {
     double ttft = seq->time_to_first_token_latency_seconds();
     const size_t gen_tokens = seq->num_committed_generated_tokens();
@@ -228,27 +261,28 @@ void Request::log_statistic(double total_latency, bool prefill_stage) {
              << "ms";
       store_prefetch_log = stream.str();
     }
-    LOG(INFO) << "x-request-id: " << x_request_id_ << ", "
-              << "x-request-time: " << x_request_time_ << ", "
-              << "request_id: " << request_id_ << ", "
-              << "sequence " << idx++ << ", "
-              << "record_type: "
-              << (prefill_stage ? "pd_prefill_stage" : "terminal_sequence")
-              << ", "
-              << "max_tokens: "
-              << seq->stopping_checker()->get_max_generated_tokens() << ", "
-              << "temperature: " << seq->sampling_param()->temperature << ", "
-              << "finish_reason: "
-              << seq->finish_reason().to_string().value_or("") << ", "
-              << "prompt_tokens: " << seq->num_prompt_tokens() << ", "
-              << "num_prefix_cache_tokens: " << num_prefix_cache_tokens_ << ", "
+    const std::string finish_reason =
+        seq->finish_reason().to_string().value_or("");
+    LOG(INFO) << "record_type: "
+              << (prefill_stage ? "pd_prefill_stage" : "sequence_terminal")
+              << ", request_id: " << request_id_
+              << optional_field(", x-request-id: ", x_request_id_)
+              << ", sequence: " << idx++
+              << optional_field(", finish_reason: ", finish_reason)
+              << ", prompt_tokens: " << seq->num_prompt_tokens() << ", "
               << "generated_tokens: " << gen_tokens << ", "
               << queue_to_batch_log << std::fixed << std::setprecision(1)
               << "ttft: " << ttft * 1000 << "ms, "
               << "total_latency: " << total_latency * 1000 << "ms, "
               << "avg tpot: " << tpot << "ms, "
               << "generation speed: " << gen_speed << " tokens/s"
-              << speculative_stats_log << store_prefetch_log;
+              << ", max_tokens: "
+              << seq->stopping_checker()->get_max_generated_tokens()
+              << ", temperature: " << std::defaultfloat << std::setprecision(6)
+              << seq->sampling_param()->temperature
+              << ", num_prefix_cache_tokens: " << num_prefix_cache_tokens_
+              << speculative_stats_log << store_prefetch_log
+              << optional_field(", x-request-time: ", request_time);
     // only log once when beam search is enabled
     if (check_beam_search()) {
       break;
@@ -259,20 +293,18 @@ void Request::log_statistic(double total_latency, bool prefill_stage) {
 void Request::log_error_statistic(const Status& status,
                                   const char* outcome_name) {
   // log the request statistics
-  int idx = 0;
+  int32_t idx = 0;
   for (const auto& seq : sequences()) {
-    LOG(INFO) << "x-request-id: " << x_request_id_ << ", "
-              << "x-request-time: " << x_request_time_ << ", "
-              << "request_id: " << request_id_ << ", "
-              << "sequence " << idx++ << ", "
-              << "record_type: terminal_sequence, "
+    LOG(INFO) << "record_type: sequence_terminal, request_id: " << request_id_
+              << optional_field(", x-request-id: ", x_request_id_)
+              << ", sequence: " << idx++ << ", "
               << "outcome: " << outcome_name << ", "
+              << "status_code: " << static_cast<int32_t>(status.code())
+              << optional_field(", status_msg: ", status.message())
+              << ", prompt_tokens: " << seq->num_prompt_tokens() << ", "
               << "max_tokens: "
               << seq->stopping_checker()->get_max_generated_tokens() << ", "
-              << "temperature: " << seq->sampling_param()->temperature << ", "
-              << "prompt_tokens: " << seq->num_prompt_tokens() << ", "
-              << "status_code : " << static_cast<int32_t>(status.code()) << ", "
-              << "status_msg : " << status.message();
+              << "temperature: " << seq->sampling_param()->temperature;
   }
 }
 

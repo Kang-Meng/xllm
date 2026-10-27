@@ -51,6 +51,9 @@ class DisaggPDServiceImpl {
   void release_reservation(const proto::ReleaseReservationRequest* request,
                            proto::ReleaseReservationResponse* response);
 
+  void cancel_request(const proto::CancelRequestRequest* request,
+                      proto::CancelRequestResponse* response);
+
  protected:
   std::shared_ptr<Request> generate_request(const proto::DisaggRequest& req);
 

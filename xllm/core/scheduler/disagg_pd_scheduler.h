@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -135,6 +136,11 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // Only consumes a matching waiting reservation, never a running request.
   bool release_reservation(const std::string& req_id,
                            const std::string& reservation_id);
+
+  // Only cancels Decode requests after KV restore/handoff, on the scheduler
+  // thread. Never frees a reservation that Prefill may still be writing.
+  proto::CancelRequestResponse::Result cancel_request(
+      const proto::CancelRequestRequest& request);
 
   // Decode admits a request from Prefill and allocates its prompt blocks
   // with prefix cache.
@@ -309,9 +315,22 @@ class DisaggPDScheduler : public ContinuousScheduler {
   int current_decode_idx_ = 0;
 
   // for decode
-  // request_id -> Request object
+  // Waiting reservations only; removed before FirstGeneration restores KV.
   std::unordered_map<std::string, std::shared_ptr<Request>>
       received_request_map_;
+  struct DecodeCancellationEntry {
+    std::weak_ptr<Request> request;
+    bool ready = false;
+    bool cancel_requested = false;
+  };
+  // Covers waiting, restoring and handed-off requests under the same lock as
+  // received_request_map_. Taking a waiting request must preserve this entry:
+  // ready stays false through restore/enqueue, then becomes true after enqueue.
+  // Release/unlink retire only waiting entries; enqueue failure erases its
+  // entry. Weak entries do not retain finished requests and are pruned after
+  // expiry.
+  std::unordered_map<std::string, DecodeCancellationEntry>
+      decode_cancellation_entries_;
   // A release can arrive before a timed-out AddNewRequests finishes on Decode.
   std::unordered_map<std::string, absl::Time> cancelled_reservations_;
   absl::Time next_cancellation_prune_ = absl::InfinitePast();

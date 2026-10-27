@@ -312,7 +312,31 @@ message ReleaseReservationResponse {
   Result result = 1;
 }
 
+// Internal Service -> Decode control RPC, not an external API request.
+// req_id is the engine ID reported by Prefill, not the client x-request-id.
+message CancelRequestRequest {
+  string req_id = 1;
+  string service_req_id = 2;
+  string source_xservice_addr = 3;
+}
+
+message CancelRequestResponse {
+  enum Result {
+    UNKNOWN = 0;
+    // Queued for the scheduler; completion may win a concurrent cancellation.
+    ACCEPTED = 1;
+    NOT_FOUND = 2;
+    // Decode still owns a reservation/restore. Retry after FirstGeneration.
+    NOT_READY = 3;
+    ALREADY_FINISHED = 4;
+    INVALID_ARGUMENT = 5;
+    NOT_SUPPORTED = 6;
+  }
+  Result result = 1;
+}
+
 service DisaggPDService {
+  rpc CancelRequest(CancelRequestRequest) returns (CancelRequestResponse) {}
   rpc ReleaseReservation(ReleaseReservationRequest)
       returns (ReleaseReservationResponse) {}
   rpc AddNewRequests(DisaggRequests) returns (DisaggResponses) {}

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "scheduler/disagg_pd_scheduler.h"
+#include "core/scheduler/disagg_pd_scheduler.h"
 
 #include <absl/strings/str_cat.h>
 #include <absl/strings/string_view.h>
@@ -40,7 +40,6 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "disagg_pd.pb.h"
-#include "disagg_pd_scheduler.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
 #include "framework/block/block_manager_pool.h"
@@ -1244,6 +1243,14 @@ void DisaggPDScheduler::prune_cancelled_reservations(absl::Time now) {
   if (now < next_cancellation_prune_) {
     return;
   }
+  for (auto it = decode_cancellation_entries_.begin();
+       it != decode_cancellation_entries_.end();) {
+    if (it->second.request.expired()) {
+      it = decode_cancellation_entries_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   for (auto it = cancelled_reservations_.begin();
        it != cancelled_reservations_.end();) {
     if (it->second <= now) {
@@ -1282,11 +1289,57 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
       return false;
     }
     request = take_waiting_request(req_id);
+    decode_cancellation_entries_.erase(req_id);
   }
   if (request != nullptr) {
     request->reset();
   }
   return true;
+}
+
+proto::CancelRequestResponse::Result DisaggPDScheduler::cancel_request(
+    const proto::CancelRequestRequest& cancellation) {
+  using Response = proto::CancelRequestResponse;
+  if (cancellation.req_id().empty() || cancellation.service_req_id().empty() ||
+      cancellation.source_xservice_addr().empty()) {
+    return Response::INVALID_ARGUMENT;
+  }
+  if (options_.instance_role() != InstanceRole::DECODE ||
+      options_.enable_pd_ooc()) {
+    return Response::NOT_SUPPORTED;
+  }
+  std::shared_ptr<Request> request;
+  {
+    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    auto it = decode_cancellation_entries_.find(cancellation.req_id());
+    if (it == decode_cancellation_entries_.end()) {
+      return Response::NOT_FOUND;
+    }
+    request = it->second.request.lock();
+    if (request == nullptr) {
+      decode_cancellation_entries_.erase(it);
+      return Response::NOT_FOUND;
+    }
+    if (request->service_request_id() != cancellation.service_req_id() ||
+        request->source_xservice_addr() !=
+            cancellation.source_xservice_addr()) {
+      return Response::NOT_FOUND;
+    }
+    if (request->has_terminal_outcome()) {
+      return Response::ALREADY_FINISHED;
+    }
+    if (!it->second.ready) {
+      return Response::NOT_READY;
+    }
+    if (it->second.cancel_requested) {
+      return Response::ACCEPTED;
+    }
+    // Claim the submission before unlocking so concurrent retries share it.
+    it->second.cancel_requested = true;
+  }
+  // Scheduler-side apply_cancel_requests() skips requests finished meanwhile.
+  cancel_request_queue_->submit(std::move(request));
+  return Response::ACCEPTED;
 }
 
 // request is received from prefill
@@ -1303,8 +1356,10 @@ bool DisaggPDScheduler::decode_schedule(
       request->reset();
       return false;
     }
-    if (received_request_map_.find(request->request_id()) !=
-        received_request_map_.end()) {
+    const auto cancellation_it =
+        decode_cancellation_entries_.find(request->request_id());
+    if (cancellation_it != decode_cancellation_entries_.end() &&
+        !cancellation_it->second.request.expired()) {
       LOG(ERROR) << "Decode receive duplicate request_id from prefill: "
                  << request->request_id();
       lock.unlock();
@@ -1312,6 +1367,8 @@ bool DisaggPDScheduler::decode_schedule(
       return false;
     }
     received_request_map_[request->request_id()] = request;
+    decode_cancellation_entries_[request->request_id()] = {
+        request, /*ready=*/false, /*cancel_requested=*/false};
     instance_to_received_requests_map_[prefill_instance_name].insert(
         request->request_id());
     request_to_instance_map_[request->request_id()] = prefill_instance_name;
@@ -1503,10 +1560,21 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
 
   Timer enqueue_timer;
-  if (!request_queue_.write(request)) {
-    LOG(ERROR) << "Failed to enqueue decode request, request_id: " << req_id;
-    kv_cache_manager_->deallocate(request.get());
-    return false;
+  // Until ready is published, concurrent cancellation returns NOT_READY.
+  const bool enqueued = request_queue_.write(request);
+  {
+    std::unique_lock<std::mutex> lock(received_request_map_mutex_);
+    if (!enqueued) {
+      decode_cancellation_entries_.erase(req_id);
+      lock.unlock();
+      LOG(ERROR) << "Failed to enqueue decode request, request_id: " << req_id;
+      kv_cache_manager_->deallocate(request.get());
+      return false;
+    }
+    auto cancellation_it = decode_cancellation_entries_.find(req_id);
+    if (cancellation_it != decode_cancellation_entries_.end()) {
+      cancellation_it->second.ready = true;
+    }
   }
   VLOG(1) << "Decode first-generation request_id=" << req_id
           << ", prepare_ms=" << prepare_seconds * 1000.0
@@ -1755,9 +1823,11 @@ bool DisaggPDScheduler::unlink_instance(
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
     auto it = instance_to_received_requests_map_.find(instance_name);
     if (it != instance_to_received_requests_map_.end()) {
+      // This reverse index excludes preparing and handed-off requests.
       for (const auto& req_id : it->second) {
         received_request_map_.erase(req_id);
         request_to_instance_map_.erase(req_id);
+        decode_cancellation_entries_.erase(req_id);
       }
       instance_to_received_requests_map_.erase(it);
     }

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "scheduler/disagg_pd_scheduler.h"
+#include "core/scheduler/disagg_pd_scheduler.h"
 
 #include <brpc/closure_guard.h>
 #include <brpc/server.h>
@@ -43,6 +43,7 @@ limitations under the License.
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/config/rec_config.h"
 #include "framework/config/scheduler_config.h"
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "framework/model/model_args.h"
@@ -272,6 +273,10 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
   }
 
   void wait_responses() { response_processor_->wait_completion(); }
+
+  std::shared_ptr<CancelRequestQueue> cancel_queue_for_test() {
+    return cancel_request_queue_;
+  }
 
   std::future<void> prefill_completion() {
     std::promise<void> done;
@@ -548,7 +553,9 @@ DisaggPDScheduler::Options make_decode_options() {
 std::shared_ptr<Request> make_request(
     const std::vector<int32_t>& prompt_token_ids,
     const std::string& req_id = "req",
-    size_t num_sequences = 1) {
+    size_t num_sequences = 1,
+    const std::string& x_request_id = "x-request-id",
+    const std::string& x_request_time = "x-request-time") {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
 
@@ -574,10 +581,11 @@ std::shared_ptr<Request> make_request(
                      /*service_request_id=*/nullptr);
 
   return std::make_shared<Request>(req_id,
-                                   "x-request-id",
-                                   "x-request-time",
+                                   x_request_id,
+                                   x_request_time,
                                    std::move(state),
-                                   "service-req");
+                                   "service-req",
+                                   /*source_xservice_addr=*/"service-source");
 }
 
 void finish_prefill(Sequence* sequence) {
@@ -1056,6 +1064,68 @@ TEST(RequestTerminalOutcomeTest, FirstTerminalEventWins) {
             RequestTerminalOutcome::NONE);
 }
 
+TEST(RequestTerminalOutcomeTest, IdentityPrecedesResultsAndParameters) {
+  TerminalLogSink sink;
+  auto request = make_request({11, 12}, "readable", /*num_sequences=*/2);
+  request->state().sampling_param.temperature = 0.123456;
+  ASSERT_TRUE(request->expand_sequences(/*share_prefix=*/false));
+  for (const auto& sequence : request->sequences()) {
+    finish_prefill(sequence.get());
+    for (int32_t i = 1; i < 4; ++i) {
+      sequence->append_token(Token(100 + i));
+    }
+  }
+  ASSERT_EQ(request->claim_terminal_outcome(Status(StatusCode::OK)),
+            RequestTerminalOutcome::SUCCESS);
+  request->log_terminal_statistic(
+      RequestTerminalOutcome::SUCCESS, Status(StatusCode::OK), 0.01);
+  const std::string logged = sink.messages();
+  EXPECT_EQ(std::count(logged.begin(), logged.end(), '\n'), 3);
+  EXPECT_EQ(logged.find("record_type: request_terminal, request_id: readable, "
+                        "x-request-id: x-request-id, outcome: success, "
+                        "status_code: 0"),
+            0u);
+  for (int32_t i = 0; i < 2; ++i) {
+    EXPECT_NE(
+        logged.find("record_type: sequence_terminal, request_id: readable, "
+                    "x-request-id: x-request-id, sequence: " +
+                    std::to_string(i) +
+                    ", finish_reason: "
+                    "length, prompt_tokens: 2, generated_tokens: 4, "
+                    "queue_to_batch: -1.0ms, ttft: "),
+        std::string::npos);
+  }
+  EXPECT_NE(logged.find("temperature: 0.123456, num_prefix_cache_tokens: 0\n"),
+            std::string::npos);
+  const size_t time = logged.find("x-request-time: x-request-time");
+  ASSERT_NE(time, std::string::npos);
+  EXPECT_EQ(logged.find("x-request-time:", time + 1), std::string::npos);
+}
+
+TEST(RequestTerminalOutcomeTest, ErrorsStayVisibleWithoutEmptyMetadata) {
+  TerminalLogSink sink;
+  auto request = make_request({11, 12},
+                              "empty-metadata",
+                              /*num_sequences=*/1,
+                              /*x_request_id=*/"",
+                              /*x_request_time=*/"");
+  request->log_terminal_statistic(
+      RequestTerminalOutcome::CANCELLED, Status(StatusCode::OK), 0.01);
+  const std::string logged = sink.messages();
+  EXPECT_NE(logged.find("record_type: request_terminal, request_id: "
+                        "empty-metadata, outcome: cancelled, status_code: 1\n"),
+            std::string::npos);
+  EXPECT_NE(
+      logged.find("record_type: sequence_terminal, request_id: empty-metadata, "
+                  "sequence: 0, outcome: cancelled, "
+                  "status_code: 1, status_msg: Cancelled, prompt_tokens: 2"),
+      std::string::npos);
+  EXPECT_EQ(logged.find("x-request-id:"), std::string::npos);
+  EXPECT_EQ(logged.find("x-request-time:"), std::string::npos);
+  EXPECT_EQ(logged.find("finish_reason:"), std::string::npos);
+  EXPECT_EQ(logged.find("generated_tokens:"), std::string::npos);
+}
+
 TEST(AsyncResponseProcessorTest,
      BatchedDuplicatePreservesValidRequestIdentity) {
   FakeTokenizer tokenizer;
@@ -1119,19 +1189,30 @@ TEST(DisaggPDSchedulerTest, NonStreamHandoffFailureHasOneTerminalOutcome) {
   EXPECT_TRUE(request->has_terminal_outcome());
   EXPECT_FALSE(prefill.has_channel(request->request_id()));
   const std::string logged = sink.messages();
-  const std::string terminal_record =
-      "request_id: failed-nonstream-handoff, record_type: request_terminal";
+  const std::string terminal_record = "record_type: request_terminal";
   const size_t first = logged.find(terminal_record);
   ASSERT_NE(first, std::string::npos) << logged;
   EXPECT_EQ(logged.find(terminal_record, first + 1), std::string::npos)
       << logged;
-  EXPECT_NE(logged.find(terminal_record + ", outcome: failure"),
-            std::string::npos)
-      << logged;
-  EXPECT_NE(logged.find("request_id: failed-nonstream-handoff, sequence 0, "
-                        "record_type: pd_prefill_stage"),
-            std::string::npos)
-      << logged;
+  const std::string terminal_log =
+      logged.substr(first, logged.find('\n', first) - first);
+  EXPECT_NE(terminal_log.find("outcome: failure"), std::string::npos);
+  EXPECT_NE(terminal_log.find("request_id: failed-nonstream-handoff"),
+            std::string::npos);
+  const size_t prefill_record = logged.find("record_type: pd_prefill_stage");
+  ASSERT_NE(prefill_record, std::string::npos);
+  const std::string prefill_log = logged.substr(
+      prefill_record, logged.find('\n', prefill_record) - prefill_record);
+  EXPECT_EQ(prefill_log.find("record_type: pd_prefill_stage, request_id: "
+                             "failed-nonstream-handoff, "
+                             "x-request-id: x-request-id, sequence: 0"),
+            0u);
+  EXPECT_NE(prefill_log.find("sequence: 0"), std::string::npos);
+  EXPECT_NE(prefill_log.find("request_id: failed-nonstream-handoff"),
+            std::string::npos);
+  EXPECT_NE(prefill_log.find("x-request-time: x-request-time"),
+            std::string::npos);
+  EXPECT_EQ(prefill_log.find("finish_reason:"), std::string::npos);
 }
 
 TEST(DisaggPDSchedulerTest, CachesPrefillBlocksBeforeRelease) {
@@ -2255,6 +2336,12 @@ TEST_F(ReservationTest, UnlinkClearsOnlyMatchingReservationMetrics) {
   decode_.report_queues();
   EXPECT_DOUBLE_EQ(reservations->get_value(), 1.0);
   EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
+  // An unlinked waiting request must not block retries while still alive.
+  auto replacement = reserve(/*id=*/"req", /*identity=*/"replacement");
+  EXPECT_GE(first->sequences()[0]->get_embedding_block_id(), 0);
+  EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
+  EXPECT_GE(replacement->sequences()[0]->get_embedding_block_id(), 0);
+  EXPECT_TRUE(decode_.release_reservation("req", "replacement"));
   engine_.block_manager_pool()->deallocate(first.get());
   EXPECT_TRUE(decode_.release_reservation("other", "other_reservation"));
   decode_.report_queues();
@@ -2296,6 +2383,130 @@ TEST_F(ReservationTest, HandoffPreventsReleaseOfRunningResources) {
   EXPECT_EQ(queued, request);
   EXPECT_TRUE(decode_.reservations_empty());
   queued->sequences()[0]->reset();
+}
+
+TEST(DisaggPDSchedulerTest, FullFirstGenerationQueueRollsBackOnlyTarget) {
+  int32_t& queue_capacity = RecConfig::get_instance().request_queue_size();
+  const int32_t previous_capacity = queue_capacity;
+  ScopeGuard restore_capacity([&] { queue_capacity = previous_capacity; });
+  queue_capacity = 1;
+
+  FakeEngine engine(/*num_blocks=*/16,
+                    /*block_size=*/2,
+                    /*num_speculative_tokens=*/1);
+  auto options = make_mtp_decode_options();
+  options.enable_pd_ooc(false);
+  TestDisaggPDScheduler decode(&engine, options, /*start_services=*/false);
+  auto blocker = make_request({11, 12, 13, 14}, "blocker");
+  ASSERT_EQ(decode.try_admit(blocker), DecodeAdmissionResult::ADMITTED);
+  decode.admit_prefill(blocker);
+  decode.report_queues();
+  auto* ingress =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"ingress", "0"});
+  ASSERT_NE(ingress, nullptr);
+  ASSERT_DOUBLE_EQ(ingress->get_value(), 1.0);
+  auto* pool = engine.block_manager_pool();
+  const auto used_with_blocker = pool->num_used_blocks();
+  const int32_t blocker_embedding =
+      blocker->sequences()[0]->get_embedding_block_id();
+
+  auto request = make_request({1, 2, 3, 4});
+  request->state().pd_reservation_id = "reservation";
+  ASSERT_EQ(decode.try_admit(request), DecodeAdmissionResult::ADMITTED);
+  ASSERT_TRUE(decode.decode_schedule(request, "prefill"));
+  EXPECT_FALSE(decode.reservations_empty());
+  proto::CancelRequestRequest cancellation;
+  cancellation.set_req_id(request->request_id());
+  cancellation.set_service_req_id(request->service_request_id());
+  cancellation.set_source_xservice_addr(request->source_xservice_addr());
+  EXPECT_EQ(decode.cancel_request(cancellation),
+            proto::CancelRequestResponse::NOT_READY);
+
+  EXPECT_FALSE(recv_first_generation(&decode, torch::tensor({1.0f})));
+  EXPECT_TRUE(decode.reservations_empty());
+  EXPECT_EQ(decode.cancel_request(cancellation),
+            proto::CancelRequestResponse::NOT_FOUND);
+  EXPECT_EQ(request->sequences()[0]->get_embedding_block_id(), -1);
+  EXPECT_EQ(request->sequences()[0]->kv_state().num_blocks(BlockType::KV), 0u);
+  // Restored prompt KV may remain in the evictable prefix cache.
+  EXPECT_EQ(pool->num_used_blocks(), used_with_blocker);
+  EXPECT_EQ(blocker->sequences()[0]->get_embedding_block_id(),
+            blocker_embedding);
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(decode.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(queued, blocker);
+  EXPECT_FALSE(decode.pop_decode_request_for_test(&queued));
+
+  auto retry = make_request({1, 2, 3, 4});
+  retry->state().pd_reservation_id = "reservation";
+  ASSERT_EQ(decode.try_admit(retry), DecodeAdmissionResult::ADMITTED);
+  ASSERT_TRUE(decode.decode_schedule(retry, "prefill"));
+  EXPECT_TRUE(recv_first_generation(&decode, torch::tensor({1.0f})));
+  EXPECT_TRUE(decode.reservations_empty());
+  ASSERT_TRUE(decode.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(queued, retry);
+  pool->deallocate(retry.get());
+  pool->deallocate(blocker.get());
+  EXPECT_EQ(pool->num_used_blocks(), (std::vector<size_t>{0}));
+}
+
+TEST(DisaggPDSchedulerTest, CancelAfterHandoffUsesSchedulerAndOneTerminal) {
+  using Response = proto::CancelRequestResponse;
+  FakeEngine engine(/*num_blocks=*/16,
+                    /*block_size=*/2,
+                    /*num_speculative_tokens=*/1);
+  auto options = make_mtp_decode_options();
+  options.enable_pd_ooc(false);
+  TestDisaggPDScheduler decode(&engine, options, /*start_services=*/false);
+  auto request = make_request({1, 2, 3, 4, 5, 6, 7, 8});
+  ASSERT_EQ(decode.try_admit(request), DecodeAdmissionResult::ADMITTED);
+  ASSERT_TRUE(decode.decode_schedule(request, "prefill"));
+  std::atomic<int32_t> callbacks{0};
+  request->state().output_func = [&callbacks](const RequestOutput& output) {
+    EXPECT_EQ(output.status->code(), StatusCode::CANCELLED);
+    ++callbacks;
+    return true;
+  };
+  proto::CancelRequestRequest cancellation;
+  EXPECT_EQ(decode.cancel_request(cancellation), Response::INVALID_ARGUMENT);
+  cancellation.set_req_id(request->request_id());
+  cancellation.set_service_req_id(request->service_request_id());
+  cancellation.set_source_xservice_addr("wrong-service");
+  EXPECT_EQ(decode.cancel_request(cancellation), Response::NOT_FOUND);
+  cancellation.set_source_xservice_addr(request->source_xservice_addr());
+  EXPECT_EQ(decode.cancel_request(cancellation), Response::NOT_READY);
+  ASSERT_TRUE(recv_first_generation(&decode, torch::tensor({1.0f})));
+  ASSERT_TRUE(decode.unlink_instance(/*instance_name=*/"prefill",
+                                     /*cluster_ids=*/{},
+                                     /*addrs=*/{},
+                                     /*ports=*/{},
+                                     /*dp_size=*/1,
+                                     /*src_kv_split_size=*/1));
+  EXPECT_FALSE(decode.release_reservation(/*req_id=*/"req",
+                                          /*reservation_id=*/"old-attempt"));
+  cancellation.set_service_req_id("wrong-request");
+  EXPECT_EQ(decode.cancel_request(cancellation), Response::NOT_FOUND);
+  cancellation.set_service_req_id(request->service_request_id());
+  auto concurrent_cancellation = std::async(
+      std::launch::async, [&] { return decode.cancel_request(cancellation); });
+  EXPECT_EQ(decode.cancel_request(cancellation), Response::ACCEPTED);
+  EXPECT_EQ(concurrent_cancellation.get(), Response::ACCEPTED);
+  EXPECT_EQ(decode.cancel_request(cancellation), Response::ACCEPTED);
+  auto cancellation_queue = decode.cancel_queue_for_test();
+  auto queued_cancellations = cancellation_queue->take_all();
+  ASSERT_EQ(queued_cancellations.size(), 1);
+  EXPECT_EQ(queued_cancellations.front(), request);
+  cancellation_queue->submit(std::move(queued_cancellations.front()));
+  EXPECT_FALSE(request->cancelled());
+  EXPECT_GE(request->sequences()[0]->get_embedding_block_id(), 0);
+  decode.step(absl::ZeroDuration());
+  decode.wait_responses();
+  EXPECT_TRUE(request->cancelled());
+  EXPECT_TRUE(request->has_terminal_outcome());
+  EXPECT_EQ(callbacks.load(), 1);
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(),
+            (std::vector<size_t>{0}));
+  EXPECT_EQ(decode.cancel_request(cancellation), Response::ALREADY_FINISHED);
 }
 
 TEST_F(ReservationTest, ConcurrentHandoffAndReleaseHaveOneOwner) {
@@ -2468,6 +2679,28 @@ TEST_F(ReservationTest, DuplicateAdmissionRollsBackUncomputedResources) {
             (std::vector<size_t>{0, 0}));
   EXPECT_GE(original->sequences()[0]->get_embedding_block_id(), 0);
   EXPECT_TRUE(decode_.release_reservation("req", "reservation"));
+
+  // Handoff removes the waiting entry but must still reject the active ID.
+  auto handed_off = reserve(/*id=*/"req", /*identity=*/"handed-off");
+  ASSERT_TRUE(recv_first_generation(&decode_, torch::tensor({1.0f})));
+  EXPECT_TRUE(decode_.reservations_empty());
+  auto handed_off_duplicate = make_request({11, 12, 13, 14});
+  ASSERT_EQ(decode_.try_admit(handed_off_duplicate),
+            DecodeAdmissionResult::ADMITTED);
+  EXPECT_FALSE(decode_.decode_schedule(handed_off_duplicate, "prefill"));
+  EXPECT_GE(handed_off->sequences()[0]->get_embedding_block_id(), 0);
+  EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
+
+  // An expired cancellation entry must not reject a new request with that ID.
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(decode_.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(queued, handed_off);
+  engine_.block_manager_pool()->deallocate(queued.get());
+  queued.reset();
+  handed_off.reset();
+  auto retry = reserve(/*id=*/"req", /*identity=*/"retry");
+  EXPECT_GE(retry->sequences()[0]->get_embedding_block_id(), 0);
+  EXPECT_TRUE(decode_.release_reservation("req", "retry"));
 }
 TEST(DisaggPDSchedulerTest, MtpExhaustionRollsBackKvReservation) {
   FakeEngine engine(/*num_blocks=*/8,
