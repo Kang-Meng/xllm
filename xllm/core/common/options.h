@@ -44,6 +44,10 @@ class Options {
   // model backend
   PROPERTY(std::string, backend);
 
+  // Model executor: "native" runs the built-in C++ models, "python"
+  // runs them through the embedded Python graph backend.
+  PROPERTY(std::string, model_impl) = "native";
+
   // max image num per prompt, default 8
   PROPERTY(int32_t, limit_image_per_prompt) = 8;
 

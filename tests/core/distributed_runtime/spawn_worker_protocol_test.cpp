@@ -88,5 +88,41 @@ TEST(SpawnWorkerProtocolTest, PreservesExplicitEmptyDtype) {
   EXPECT_TRUE(indexer_cache_dtype->empty());
 }
 
+TEST(SpawnWorkerProtocolTest, PreservesPythonModelImplementation) {
+  for (const std::string model_impl : {"python", "py"}) {
+    std::vector<std::string> arguments(kArgumentCount, "unused");
+    arguments[kModelImplArgumentIndex] = model_impl;
+    std::vector<char*> argv = mutable_argv(&arguments);
+    EXPECT_EQ(parse_model_impl(kArgumentCount, argv.data()), "python");
+  }
+}
+
+TEST(SpawnWorkerProtocolTest, DefaultsLegacyModelImplementationToNative) {
+  std::vector<std::string> arguments(kModelImplArgumentIndex, "unused");
+  std::vector<char*> argv = mutable_argv(&arguments);
+  EXPECT_EQ(parse_model_impl(kModelImplArgumentIndex, argv.data()), "native");
+  EXPECT_EQ(parse_model_impl(kMinimumArgumentCount, argv.data()), "native");
+}
+
+TEST(SpawnWorkerProtocolTest, AcceptsNativeModelImplementation) {
+  for (const std::string model_impl : {"native", ""}) {
+    std::vector<std::string> arguments(kArgumentCount, "unused");
+    arguments[kModelImplArgumentIndex] = model_impl;
+    std::vector<char*> argv = mutable_argv(&arguments);
+    EXPECT_EQ(parse_model_impl(kArgumentCount, argv.data()), "native");
+  }
+}
+
+TEST(SpawnWorkerProtocolTest, RejectsInvalidModelImplementation) {
+  std::vector<std::string> arguments(kArgumentCount, "unused");
+  std::vector<char*> argv = mutable_argv(&arguments);
+  EXPECT_FALSE(parse_model_impl(kArgumentCount, argv.data()).has_value());
+  argv[kModelImplArgumentIndex] = nullptr;
+  EXPECT_FALSE(parse_model_impl(kArgumentCount, argv.data()).has_value());
+  EXPECT_FALSE(parse_model_impl(kArgumentCount, nullptr).has_value());
+  EXPECT_FALSE(
+      parse_model_impl(kMinimumArgumentCount - 1, argv.data()).has_value());
+}
+
 }  // namespace
 }  // namespace xllm::spawn_worker_protocol

@@ -81,6 +81,7 @@ limitations under the License.
 #include "core/framework/parallel_state/context_parallel_topology.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/draft_model_config.h"
+#include "core/runtime/py_runtime_module.h"
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/eplb/eplb_utils.h"
 #include "framework/kv_cache/kv_cache.h"
@@ -97,6 +98,7 @@ limitations under the License.
 #include "layers/common/kv_shard_batch_metadata.h"
 #include "models/llm/deepseek_v41_dspark_graph_policy.h"
 #include "models/model_registry.h"
+#include "models/py_model_helper.h"
 #include "runtime/forward_params.h"
 #if defined(USE_NPU)
 #include "layers/npu/loader/rolling_weight_buffer.h"
@@ -2266,6 +2268,12 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   context_.set_flash_comm1_options(flash_comm1_options);
 
   // init model, create model executor
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    ensure_python_interpreter();
+    ensure_xllm_runtime_module();
+  }
+
   bool status = this->init_model(context_);
   if (!status) {
     LOG(ERROR) << "init_model failed";

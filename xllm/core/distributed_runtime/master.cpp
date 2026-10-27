@@ -36,6 +36,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/types.h"
 #include "core/common/xllm_build_info.h"
+#include "core/framework/config/distributed_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
@@ -566,6 +567,13 @@ Master::Master(const Options& options, EngineType type)
     : options_(options),
       engine_type_(type),
       master_status_(options.master_status()) {
+  // Offline inference enters through pybind and never parses flags, so the
+  // option is the authoritative source here; the serving binary already filled
+  // it from --model_impl.
+  const std::optional<std::string> model_impl =
+      ModelConfig::normalize_model_impl(options_.model_impl());
+  CHECK(model_impl.has_value()) << "model_impl must be native, python, or py";
+  ModelConfig::get_instance().model_impl(model_impl.value());
   const auto model_path =
       std::filesystem::path(options_.model_path()).lexically_normal();
   if (options_.host_blocks_factor() > 1.0) {
@@ -577,16 +585,38 @@ Master::Master(const Options& options, EngineType type)
         << "Basic host KV cache offload supports the LLM engine and "
            "model-based speculative engines only.";
   }
-  // Multi-process serving runs one worker per process. Select one runtime
-  // logical device from the process-visible devices while keeping node_rank as
-  // the global distributed identity.
-  const int32_t visible_device_count = Platform::device_count();
-  const int32_t device_idx = DeviceNameUtils::get_device_idx(
-      options_.node_rank(), options_.nnodes(), visible_device_count);
   const auto visible_devices = DeviceNameUtils::parse_devices("auto");
-  const std::vector<torch::Device> devices = {visible_devices[device_idx]};
-  // World size is the node count (one worker per process).
-  const int32_t global_world_size = options_.nnodes();
+  // parse_devices("auto") answers {kCPU} on a host with no visible
+  // accelerator; serving still catches that inside get_device_idx, but the
+  // offline branch takes the set as-is, so require a real device for both
+  // paths here.
+  CHECK(!visible_devices.empty() && !visible_devices.front().is_cpu())
+      << "At least one accelerator device must be visible.";
+  CHECK(!(options_.enable_offline_inference() && options_.nnodes() > 1))
+      << "Offline inference drives every device of a single node through "
+         "spawned workers; multi-node offline inference is not supported. "
+         "Use online serving for nnodes > 1.";
+  std::vector<torch::Device> devices;
+  if (options_.enable_offline_inference()) {
+    // A single offline process drives every visible device: rank 0 runs here
+    // and the remaining ranks are spawned workers, so the device set is the
+    // whole visible set.
+    devices = visible_devices;
+  } else {
+    // Serving runs one worker per process: take this process's own device and
+    // keep node_rank as the distributed identity.
+    const int32_t visible_device_count =
+        static_cast<int32_t>(visible_devices.size());
+    const int32_t device_idx = DeviceNameUtils::get_device_idx(
+        options_.node_rank(), options_.nnodes(), visible_device_count);
+    devices = {visible_devices[device_idx]};
+  }
+  // Every device hosts one worker and every node contributes its own devices.
+  // Offline is pinned to nnodes == 1 by the CHECK above (spawned workers do
+  // not propagate the topology), so devices here is always the single node's
+  // visible set; revisit this product if multi-node offline ever lands.
+  const int32_t global_world_size =
+      static_cast<int32_t>(devices.size()) * options_.nnodes();
   const int32_t kv_split_size =
       ParallelConfig::get_instance().kv_split_size_effective();
   const bool npu_dcp_requested =

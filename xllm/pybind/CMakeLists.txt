@@ -15,6 +15,7 @@ pybind_extension(
     :config
     :master
     :request
+    :runtime
     :util
     absl::strings
     brpc

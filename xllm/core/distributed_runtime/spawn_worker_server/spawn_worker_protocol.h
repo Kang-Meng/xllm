@@ -19,9 +19,11 @@ limitations under the License.
 #include <optional>
 #include <string>
 
+#include "core/framework/config/model_config.h"
+
 namespace xllm::spawn_worker_protocol {
 
-inline constexpr int32_t kArgumentCount = 40;
+inline constexpr int32_t kArgumentCount = 41;
 inline constexpr int32_t kMinimumArgumentCount = 34;
 inline constexpr int32_t kIndexerCacheDtypeArgumentIndex = 34;
 inline constexpr int32_t kEnableMtpDraftBodyTp1ArgumentIndex = 35;
@@ -29,6 +31,7 @@ inline constexpr int32_t kTextEncoderTpSizeArgumentIndex = 36;
 inline constexpr int32_t kDraftSamplingModeArgumentIndex = 37;
 inline constexpr int32_t kKvSplitSizeArgumentIndex = 38;
 inline constexpr int32_t kCommBufferOffsetArgumentIndex = 39;
+inline constexpr int32_t kModelImplArgumentIndex = 40;
 inline constexpr char kDefaultIndexerCacheDtype[] = "auto";
 inline constexpr char kDefaultDraftSamplingMode[] = "greedy";
 
@@ -55,6 +58,24 @@ inline std::string parse_draft_sampling_mode(int32_t argc, char* const argv[]) {
     return std::string(kDefaultDraftSamplingMode);
   }
   return std::string(argv[kDraftSamplingModeArgumentIndex]);
+}
+
+inline std::optional<std::string> parse_model_impl(int32_t argc,
+                                                   char* const argv[]) {
+  if (argc < kMinimumArgumentCount || argv == nullptr) {
+    return std::nullopt;
+  }
+  if (argc <= kModelImplArgumentIndex) {
+    // Pre-protocol-worker images never carry this argument; they predate the
+    // python model implementation entirely, so native is the only answer.
+    return std::string("native");
+  }
+  if (argv[kModelImplArgumentIndex] == nullptr) {
+    return std::nullopt;
+  }
+  // Alias handling and the canonical values live in ModelConfig so the
+  // worker accepts exactly what the Master constructor accepts.
+  return ModelConfig::normalize_model_impl(argv[kModelImplArgumentIndex]);
 }
 
 }  // namespace xllm::spawn_worker_protocol

@@ -25,6 +25,7 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
     py_executor_impl.h
+    py_runtime_module.h
     py_multimodal_executor.h
     py_attention_metadata.h
     py_input_batch.h
@@ -67,6 +68,7 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
     py_executor_impl.cpp
+    py_runtime_module.cpp
     py_multimodal_executor.cpp
     py_attention_metadata.cpp
     py_input_batch.cpp

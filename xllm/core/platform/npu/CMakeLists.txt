@@ -9,10 +9,12 @@ cc_library(
     device_capture_lock.h
     acl_graph_task_update_context.h
     npu_profiler.h
+    npu_python_runtime.h
   SRCS
     npu_layer_synchronizer.cpp
     npu_batch_memcpy.cpp
     npu_profiler.cpp
+    npu_python_runtime.cpp
   DEPS
     torch_npu
     glog::glog

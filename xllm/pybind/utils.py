@@ -50,6 +50,93 @@ def get_free_port() -> int:
     return port
 
 
+def _normalize_model_impl(model_impl: str) -> str:
+    # Keep in lockstep with ModelConfig::normalize_model_impl (the C++ owner of
+    # these aliases): ""/"native" -> "native", "python"/"py" -> "python".
+    if model_impl in ("", "native"):
+        return "native"
+    if model_impl in ("python", "py"):
+        return "python"
+    raise ValueError(f"unsupported model_impl: {model_impl}; expected native, python, or py")
+
+
+def _normalize_offline_nnodes(nnodes: int) -> int:
+    # Offline inference drives every visible device of a single node through
+    # spawned workers, so multi-node offline requests are rejected here as a
+    # Python exception instead of aborting inside the Master constructor.
+    if nnodes <= 0:
+        raise ValueError(f"nnodes must be positive, got {nnodes}")
+    if nnodes > 1:
+        raise ValueError(
+            "offline inference does not support nnodes > 1; it drives every "
+            "visible device of a single node. Use online serving for "
+            "multi-node deployment."
+        )
+    return nnodes
+
+
+def _configure_python_model_path() -> None:
+    # The Python model executor imports the 'xllm.python' subpackage in an
+    # embedded interpreter: rank 0 reuses the one xllm_export lives in, while
+    # spawned workers create their own and therefore do not inherit this
+    # process's sys.path. Publish the directory that holds the 'xllm' package
+    # in the environment the workers inherit.
+    #
+    # __file__ resolves both shapes the package ships in, because utils.py
+    # always sits at '<prefix>/xllm/pybind/utils.py': an installed wheel keeps
+    # the package in site-packages, an in-tree build in the build directory,
+    # and a source checkout in the repository. A pre-set value still wins, but
+    # every published value is verified to hold the package, so a wrong path
+    # fails here instead of in a spawned worker's import.
+    path = os.environ.get("XLLM_PYTHON_MODEL_PATH")
+    if not path:
+        # utils.py lives three levels below the package root; verify the
+        # result actually holds the package instead of trusting the layout,
+        # so a relocated file fails loudly rather than handing workers a
+        # wrong directory.
+        path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    if not os.path.isdir(os.path.join(path, "xllm")):
+        raise RuntimeError(
+            f"XLLM_PYTHON_MODEL_PATH {path!r} does not contain the 'xllm' "
+            "package; set it to the directory holding the package."
+        )
+    os.environ.setdefault("XLLM_PYTHON_MODEL_PATH", path)
+
+
+def _configure_npu_runtime(device_index: int = 0) -> None:
+    # Offline inference runs inside the caller's interpreter, so the
+    # accelerator belongs to the host: bring torch_npu up on the device this
+    # process uses. Native processes xLLM starts do the same from C++
+    # (xllm/core/platform/npu/npu_python_runtime.cpp) because they have no
+    # interpreter until xLLM creates one. No-op without torch_npu.
+    try:
+        import torch_npu
+    except ImportError:
+        return
+    try:
+        torch_npu._C._npu_init()
+    except RuntimeError as error:
+        if "already initialized" not in str(error).lower():
+            raise
+    # Bypassing torch_npu's lazy init leaves its bookkeeping stale: without
+    # these flags a later torch.npu.* entry re-runs _npu_init() (harmless but
+    # noisy) and, worse, a fork with a stale pid looks like a fresh process to
+    # _after_fork. Keep this in sync with the C++ bootstrap script.
+    import torch_npu.npu as npu_module
+
+    npu_module._initialized = True
+    npu_module._original_pid = os.getpid()
+    torch_npu._C._npu_setDevice(device_index)
+
+
+def _configure_python_runtime() -> None:
+    # Everything the Python model executor needs from the caller's process: the
+    # package root spawned workers import from, plus the accelerator state rank
+    # 0 runs with (offline is single node, so rank 0 owns device 0).
+    _configure_python_model_path()
+    _configure_npu_runtime(0)
+
+
 def _read_json(path: str) -> dict[str, object]:
     with open(path, encoding="utf-8") as f:
         return json.load(f)

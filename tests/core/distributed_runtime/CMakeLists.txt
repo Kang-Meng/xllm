@@ -21,6 +21,7 @@ cc_test(
   SRCS
     spawn_worker_protocol_test.cpp
   DEPS
+    :config
     GTest::gtest_main
 )
 

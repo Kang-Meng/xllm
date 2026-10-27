@@ -16,6 +16,12 @@ limitations under the License.
 #pragma once
 
 #include <pybind11/pybind11.h>
+// Required by PyDictVisitor below: its inline `visit(vector<T>)` overrides are
+// emitted in every translation unit that includes this header, and the linker
+// keeps one copy of that inline group. Every such unit therefore needs the STL
+// casters, or std::vector<int64_t> properties raise "Unregistered type" when
+// they are visited.
+#include <pybind11/stl.h>
 #include <torch/torch.h>
 
 #include <string>

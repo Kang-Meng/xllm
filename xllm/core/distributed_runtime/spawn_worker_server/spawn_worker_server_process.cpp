@@ -23,6 +23,10 @@ limitations under the License.
 
 #include "core/distributed_runtime/spawn_worker_server/spawn_worker_protocol.h"
 #include "core/distributed_runtime/spawn_worker_server/spawn_worker_server.h"
+#include "core/framework/config/model_config.h"
+#if defined(USE_NPU)
+#include "core/platform/npu/npu_python_runtime.h"
+#endif
 
 // Worker argv from engine process:
 // @master_node_addr
@@ -63,7 +67,16 @@ limitations under the License.
 // @text_encoder_tp_size
 // @draft_sampling_mode
 // @kv_split_size
+// @comm_buffer_offset
+// @model_impl
 int main(int argc, char* argv[]) {
+  const std::optional<std::string> model_impl =
+      xllm::spawn_worker_protocol::parse_model_impl(argc, argv);
+  if (!model_impl.has_value()) {
+    LOG(ERROR) << "Spawn worker received invalid model_impl or arguments";
+    return 1;
+  }
+  xllm::ModelConfig::get_instance().model_impl(model_impl.value());
   const std::optional<std::string> parsed_indexer_cache_dtype =
       xllm::spawn_worker_protocol::parse_indexer_cache_dtype(argc, argv);
   if (!parsed_indexer_cache_dtype.has_value()) {
@@ -84,6 +97,13 @@ int main(int argc, char* argv[]) {
   int32_t global_rank = static_cast<int32_t>(atoi(argv[3]));
   int32_t world_size = static_cast<int32_t>(atoi(argv[4]));
   int32_t device_idx = static_cast<int32_t>(atoi(argv[5]));
+#if defined(USE_NPU)
+  // Offline inference runs every rank beyond 0 in this spawned worker instead
+  // of the serving binary, so it cannot rely on main()'s bootstrap. torch_npu
+  // needs a live interpreter before the device is initialized, so prepare it
+  // here, on the main thread.
+  xllm::npu::initialize_python_runtime(device_idx);
+#endif
   int32_t num_decoding_tokens = static_cast<int32_t>(atoi(argv[6]));
   int32_t block_size = static_cast<int32_t>(atoi(argv[7]));
   int32_t max_tokens_per_batch = static_cast<int32_t>(atoi(argv[8]));
@@ -167,6 +187,7 @@ int main(int argc, char* argv[]) {
       << ", cp_size = " << cp_size << ", ep_size = " << ep_size
       << ", instance_role = " << instance_role.to_string()
       << ", task_type = " << task_type << ", worker_type = " << worker_type
+      << ", model_impl = " << model_impl.value()
       << ", enable_speculative_decode = " << (enable_speculative_decode > 0)
       << ", num_speculative_tokens = " << num_speculative_tokens
       << ", speculative_algorithm = " << speculative_algorithm
@@ -229,5 +250,15 @@ int main(int argc, char* argv[]) {
 
   worker.run();
 
+#if defined(USE_NPU)
+  // initialize_python_runtime() above created a process-lifetime interpreter.
+  // Returning from main would destroy global pybind11 type objects during
+  // static teardown without holding the GIL and abort (same failure the
+  // serving binary documents in exit_without_python_teardown); bypass static
+  // teardown and let the OS reclaim everything.
+  google::FlushLogFiles(google::GLOG_INFO);
+  fflush(nullptr);
+  std::_Exit(0);
+#endif
   return 0;
 }

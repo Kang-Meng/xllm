@@ -39,9 +39,9 @@ DEFINE_string(
     "'vlm' for multimodal (text and images), 'dit' for diffusion models.");
 
 DEFINE_string(model_impl,
-              "",
-              "Model executor implementation. Empty/'native' uses the built-in "
-              "C++ model; 'python' runs the graph via the embedded Python "
+              "native",
+              "Model executor implementation. 'native' uses the built-in C++ "
+              "model; 'python' runs the graph via the embedded Python "
               "interpreter ('python' model package).");
 
 DEFINE_string(task,
@@ -135,6 +135,21 @@ bool ModelConfig::is_python_model_impl(std::string_view model_impl) {
   // their model_impl comparison through here, so the raw config value is never
   // normalized: no separate canonicalization step is needed.
   return model_impl == "python" || model_impl == "py";
+}
+
+std::optional<std::string> ModelConfig::normalize_model_impl(
+    std::string_view model_impl) {
+  // Owner of the accepted aliases and of the canonical values stored in this
+  // config: every writer (Master constructor, spawn worker argv parsing,
+  // pybind entry points) funnels through here so the aliases, the default and
+  // the error surface cannot drift apart.
+  if (model_impl.empty() || model_impl == "native") {
+    return std::string("native");
+  }
+  if (is_python_model_impl(model_impl)) {
+    return std::string("python");
+  }
+  return std::nullopt;
 }
 
 std::optional<std::string> ModelConfig::validate_python_speculative_decode(

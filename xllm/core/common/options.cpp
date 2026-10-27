@@ -39,7 +39,7 @@ std::string Options::to_string() const {
   ss << "Options: [";
   ss << "model_path: " << model_path() << ", model_id: " << model_id()
      << ", draft_model_path: " << draft_model_path().value_or("null")
-     << ", backend: " << backend()
+     << ", backend: " << backend() << ", model_impl: " << model_impl()
      << ", limit_image_per_prompt: " << limit_image_per_prompt()
      << ", block_size: " << block_size()
      << ", max_cache_size: " << max_cache_size()

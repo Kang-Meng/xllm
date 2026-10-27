@@ -66,7 +66,7 @@ del _OrigLibrary, _SafeLibrary
 # ---------------------------------------------------------------------------
 # Secondary OPP registration: ensure fla_npu's embedded OPP
 # (ASCEND_CUSTOM_OPP_PATH) is on the path before torch_npu use. The primary
-# registration happens in xllm.cpp init_npu_python_runtime() before aclInit
+# registration happens in npu_python_runtime.cpp initialize_python_runtime() before aclInit
 # (which caches the OPP scan); this is a best-effort guard for any process that
 # reaches this bootstrap without having run that path, e.g. an already-initialized
 # interpreter re-importing the package. load_ascendc_opapi_libraries() is

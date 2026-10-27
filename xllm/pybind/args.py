@@ -42,6 +42,13 @@ class ArgumentParser:
             default=None,
             help="Optional runner mode for LLM. Currently supports: pooling.",
         )
+        self.parser.add_argument(
+            "--model_impl",
+            type=str,
+            choices=["native", "python", "py"],
+            default="native",
+            help="Model implementation: native C++ or Python.",
+        )
         self.parser.add_argument("--draft_model", type=str, default="", help="draft hf model path to the model file.")
         self.parser.add_argument(
             "--limit_image_per_prompt", type=int, default=8, help="Maximum number of images per prompt."

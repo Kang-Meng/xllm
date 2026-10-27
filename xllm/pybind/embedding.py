@@ -59,6 +59,7 @@ class Embedding:
         input_shm_size: int = 1024,
         output_shm_size: int = 128,
         use_cpp_chat_template: bool = True,
+        model_impl: str = "native",
         **kwargs: Any,
     ) -> None:
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
@@ -73,8 +74,12 @@ class Embedding:
 
         model_type = utils._infer_model_type(model)
 
+        model_impl = utils._normalize_model_impl(model_impl)
+        if model_impl == "python":
+            utils._configure_python_runtime()
         options = Options()
         options.model_path = model
+        options.model_impl = model_impl
         options.task_type = "embed"
         options.draft_model_path = None
         options.backend = "llm"
@@ -94,7 +99,7 @@ class Embedding:
         options.enable_chunked_prefill = enable_chunked_prefill
         free_port = utils.get_free_port()
         options.master_node_addr = "127.0.0.1:" + str(free_port)
-        options.nnodes = nnodes
+        options.nnodes = utils._normalize_offline_nnodes(nnodes)
         options.node_rank = node_rank
         options.dp_size = dp_size
         options.cp_size = cp_size

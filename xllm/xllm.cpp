@@ -16,13 +16,7 @@ limitations under the License.
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <pybind11/embed.h>
-namespace py = pybind11;
 #include <torch/torch.h>
-
-#if defined(USE_NPU)
-#include <acl/acl.h>
-#endif
 
 #include <csignal>
 #include <cstdio>
@@ -65,6 +59,9 @@ namespace py = pybind11;
 #include "core/framework/xtensor/options.h"
 #include "core/framework/xtensor/xtensor_allocator.h"
 #include "core/platform/device_name_utils.h"
+#if defined(USE_NPU)
+#include "core/platform/npu/npu_python_runtime.h"
+#endif
 #include "core/util/net.h"
 #include "core/util/utils.h"
 #include "core/util/verbose_trace_logger.h"
@@ -139,6 +136,7 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .task_type(model_config.task())
       .draft_model_path(speculative_config.draft_model())
       .backend(model_config.backend())
+      .model_impl(model_config.model_impl())
       .limit_image_per_prompt(mm_config.limit_image_per_prompt())
       .max_encoder_cache_size(mm_config.max_encoder_cache_size())
       .max_processor_cache_items(mm_config.max_processor_cache_items())
@@ -262,78 +260,22 @@ Options create_options(const std::string& instance_name, bool is_local) {
 
 #if defined(USE_NPU)
 namespace {
-// Initialize Python interpreter and torch_npu runtime early, before any NPU
-// tensor allocation. torch_npu (post4+) calls PyGILState_Ensure inside
-// empty_with_format(), so Python must be alive before the first NPU op.
-// All NPU processes go through this path for consistency — the build system
-// links against the pip-installed torch_npu .so directly.
-void init_npu_python_runtime() {
-  bool we_initialized_python = false;
-  if (!Py_IsInitialized()) {
-    py::initialize_interpreter(/*init_signal_handlers=*/false);
-    we_initialized_python = true;
-  }
 
-  // Select the same logical device this process's worker will run on. Multi-
-  // process single-card serving lets every process see all TP cards and picks
-  // its own via node_rank (see Master ctor). Using .front() here would pin an
-  // extra context on logical device 0 for every node_rank != 0 process, piling
-  // small allocations onto die0. Mirror master.cpp's get_device_idx instead.
+// Select the device this process's worker runs on. Multi-process serving gives
+// every process all visible cards and identifies its own through node_rank, so
+// resolving from node_rank keeps each process on a single card. Mirrors
+// master.cpp.
+int32_t resolve_python_runtime_device_index() {
   const auto& distributed_config = DistributedConfig::get_instance();
   const int32_t visible_device_count =
       DeviceNameUtils::parse_devices("auto").size();
-  const int32_t device_index =
-      DeviceNameUtils::get_device_idx(distributed_config.node_rank(),
-                                      distributed_config.nnodes(),
-                                      visible_device_count);
+  return DeviceNameUtils::get_device_idx(distributed_config.node_rank(),
+                                         distributed_config.nnodes(),
+                                         visible_device_count);
+}
 
-  // Register fla_npu's embedded AscendC opapi (libcust_opapi) + OPP vendor
-  // dir before aclInit. The KDA forward op (aclnnChunkKdaFwd) and its kernels
-  // live in fla_npu's embedded OPP; without this registration the opapi cannot
-  // locate the kernel binary and aclnnChunkKdaFwdGetWorkspaceSize returns
-  // ACLNN_ERR_INNER_NULLPTR (561103), breaking GLM-5.3-Flash's KDA layers.
-  // Guarded so non-KDA builds without fla_npu stay unaffected.
-  {
-    py::gil_scoped_acquire gil;
-    py::exec(
-        "try:\n"
-        "    import fla_npu\n"
-        "    fla_npu.load_ascendc_opapi_libraries()\n"
-        "except (ImportError, RuntimeError):\n"
-        "    pass\n");
-  }
-
-  auto acl_ret = aclInit(nullptr);
-  CHECK(acl_ret == ACL_SUCCESS || acl_ret == 500000)
-      << "aclInit failed with error " << acl_ret;
-
-  {
-    py::gil_scoped_acquire gil;
-    py::exec(
-        "import os, sys\n"
-        "os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'\n"
-        "import torch\n"
-        "orig = torch._C._get_accelerator\n"
-        "try:\n"
-        "    torch._C._get_accelerator = lambda: torch.device('cpu')\n"
-        "    import torch_npu\n"
-        "finally:\n"
-        "    torch._C._get_accelerator = orig\n"
-        "import torch_npu.npu as _npu_mod\n"
-        "try:\n"
-        "    torch_npu._C._npu_init()\n"
-        "except RuntimeError as e:\n"
-        "    if 'already initialized' not in str(e).lower():\n"
-        "        raise\n"
-        "_npu_mod._initialized = True\n"
-        "_npu_mod._original_pid = os.getpid()\n"
-        "torch_npu._C._npu_setDevice(" +
-        std::to_string(device_index) + ")\n");
-  }
-
-  if (we_initialized_python) {
-    PyEval_SaveThread();
-  }
+void init_npu_python_runtime() {
+  npu::initialize_python_runtime(resolve_python_runtime_device_index());
 }
 
 }  // namespace

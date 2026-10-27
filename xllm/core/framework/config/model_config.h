@@ -42,6 +42,11 @@ class ModelConfig final {
   void normalize_cpp_chat_template(const std::string& model_type);
 
   [[nodiscard]] static bool is_python_model_impl(std::string_view model_impl);
+  // Single normalization point for the model_impl option: maps ""/"native" to
+  // "native" and "python"/"py" to "python". Returns std::nullopt for anything
+  // else so callers can reject with their own error channel (CHECK, LOG, ...).
+  [[nodiscard]] static std::optional<std::string> normalize_model_impl(
+      std::string_view model_impl);
   [[nodiscard]] static std::optional<std::string>
   validate_python_speculative_decode(std::string_view model_impl,
                                      std::string_view model_type,

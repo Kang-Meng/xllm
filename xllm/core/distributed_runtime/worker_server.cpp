@@ -40,6 +40,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -344,6 +345,7 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
   const char* draft_sampling_mode_ptr = draft_sampling_mode_str.c_str();
   const std::string comm_buffer_offset_str =
       std::to_string(options.comm_buffer_offset());
+  const std::string& model_impl = ModelConfig::get_instance().model_impl();
   const char* worker_type_ptr = worker_type.to_string();
   std::string spawn_worker_bin_path =
       options.spawn_worker_path() + "/spawn_worker";
@@ -398,6 +400,7 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
                         draft_sampling_mode_ptr,
                         kv_split_size_ptr,
                         comm_buffer_offset_str.c_str(),
+                        model_impl.c_str(),
                         nullptr};
   static_assert(std::size(argv) == spawn_worker_protocol::kArgumentCount + 1);
   pid_t pid;

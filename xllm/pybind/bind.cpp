@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/framework/request/request_output.h"
 #include "core/framework/request/request_params.h"
 #include "core/framework/request/sample_slot.h"
+#include "core/runtime/py_runtime_module.h"
 #include "core/util/pybind_helper.h"
 #include "models/model_registry.h"
 
@@ -37,12 +38,15 @@ namespace py = pybind11;
 using namespace pybind11::literals;
 
 PYBIND11_MODULE(xllm_export, m) {
+  ensure_xllm_runtime_module();
+
   // 1. export Options
   py::class_<Options>(m, "Options")
       .def(py::init())
       .def_readwrite("model_path", &Options::model_path_)
       .def_readwrite("draft_model_path", &Options::draft_model_path_)
       .def_readwrite("backend", &Options::backend_)
+      .def_readwrite("model_impl", &Options::model_impl_)
       .def_readwrite("limit_image_per_prompt",
                      &Options::limit_image_per_prompt_)
       .def_readwrite("block_size", &Options::block_size_)

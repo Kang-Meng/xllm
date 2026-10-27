@@ -1,5 +1,21 @@
 include(cc_test)
 
+if(USE_NPU)
+  cc_test(
+    NAME py_runtime_module_test
+    CPU_ONLY
+    SRCS py_runtime_module_test.cpp
+    DEPS :runtime :models :state_dict torch_python Python::Python GTest::gtest_main
+    ENVIRONMENT "TORCH_DEVICE_BACKEND_AUTOLOAD=0"
+  )
+  target_link_libraries(py_runtime_module_test PRIVATE
+    torch_npu ascendcl hccl c_sec nnopbase)
+  target_link_options(py_runtime_module_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+endif()
+
 cc_test(
   NAME
     encoder_executor_test
