@@ -2233,6 +2233,9 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   }
 #endif
 
+  options_.block_table_token_span(static_cast<int64_t>(options_.block_size()) *
+                                  parallel_args_.kv_split_size_effective());
+
   // create model context
   dtype_ = dtype;
   auto tensor_options = torch::dtype(dtype_).device(device_);

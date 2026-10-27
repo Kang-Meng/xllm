@@ -31,7 +31,6 @@ limitations under the License.
 #include "core/runtime/decode_graph_bucket.h"
 
 namespace {
-using xllm::mlu::get_block_capacity;
 using xllm::mlu::GraphLayout;
 
 // Producer steps have no shared state and use the reserved empty schema. Reuse
@@ -196,21 +195,6 @@ bool supports_grouped_graph(const xllm::runtime::Options& options,
          params.attention.device.new_cache_slots.defined();
 }
 
-bool supports_graph_history(const xllm::ModelInputParams& params,
-                            int64_t graph_max_kv_seq_len,
-                            int32_t block_size) {
-  if (!params.attention.device.block_tables.defined()) {
-    return true;
-  }
-  if (graph_max_kv_seq_len <= 0 || params.meta.kv_max_seq_len < 0 ||
-      params.meta.kv_max_seq_len > graph_max_kv_seq_len) {
-    return false;
-  }
-  return params.meta.kv_max_seq_len == 0 ||
-         params.attention.device.block_tables.size(1) >=
-             get_block_capacity(params.meta.kv_max_seq_len, block_size);
-}
-
 std::optional<GraphLayout> get_graph_layout(
     int64_t tokens,
     const xllm::ModelInputParams& params,
@@ -301,12 +285,6 @@ std::optional<GraphLayout> get_graph_layout(
 
 namespace xllm::mlu {
 
-int64_t get_block_capacity(int64_t max_kv_seq_len, int32_t block_size) {
-  CHECK_GT(max_kv_seq_len, 0);
-  CHECK_GT(block_size, 0);
-  return (max_kv_seq_len + block_size - 1) / block_size;
-}
-
 std::size_t get_key_size(const GraphKey& key) {
   std::size_t size = 0;
   visit_graph_key(key, [&size](int64_t /*value*/) { ++size; });
@@ -328,9 +306,7 @@ std::size_t GraphKeyHash::operator()(const GraphKey& key) const {
 }
 
 MluGraphPlanner::MluGraphPlanner(GraphPlannerConfig config)
-    : config_(std::move(config)) {
-  CHECK_GT(config_.options.block_size(), 0);
-}
+    : config_(std::move(config)) {}
 
 GraphDecision MluGraphPlanner::plan(const GraphStepMetadata& step) const {
   const ModelInputParams& params = step.params;
@@ -358,15 +334,8 @@ GraphDecision MluGraphPlanner::plan(const GraphStepMetadata& step) const {
   if (layout->padded_num_tokens > config_.max_tokens) {
     return EagerReason::TOKEN_LIMIT;
   }
-  if (config_.capabilities.graph_history ==
-      MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION) {
-    layout->cache_pad_slot = -1;
-  }
-  const int64_t capacity = params.attention.device.block_tables.defined()
-                               ? config_.history_capacity
-                               : 0;
-  if (!supports_graph_history(params, capacity, options.block_size())) {
-    return EagerReason::HISTORY_LIMIT;
+  if (layout->cache_pad_slot == 0) {
+    layout->cache_pad_slot = config_.capabilities.graph_cache_pad_slot;
   }
   GraphKey key;
   key.padded_num_tokens = layout->padded_num_tokens;
@@ -382,14 +351,7 @@ GraphDecision MluGraphPlanner::plan(const GraphStepMetadata& step) const {
   if (get_key_size(key) > kMaxGraphKeyFields) {
     return EagerReason::UNSUPPORTED_INPUT;
   }
-  const int64_t main_columns =
-      capacity > 0 ? get_block_capacity(capacity, options.block_size()) +
-                         (config_.capabilities.graph_history ==
-                                  MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION
-                              ? 1
-                              : 0)
-                   : 0;
-  return GraphPlan{*layout, std::move(key), capacity, main_columns};
+  return GraphPlan{*layout, std::move(key)};
 }
 
 }  // namespace xllm::mlu

@@ -21,7 +21,6 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -42,6 +41,7 @@ limitations under the License.
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/word_embedding.h"
+#include "core/layers/mlu/attention.h"
 #include "mlu_graph_executor_impl.h"
 #include "models/llm/mlu/glm5_next_graph.h"
 #include "models/llm/mlu/mtp_topk_state.h"
@@ -73,29 +73,6 @@ class ScopedConfigSnapshot final {
  private:
   int32_t max_tokens_for_graph_mode_;
   bool enable_graph_mode_decode_no_padding_;
-};
-
-class ScopedEnvVar final {
- public:
-  ScopedEnvVar(std::string name, std::string value) : name_(std::move(name)) {
-    const char* old_value = std::getenv(name_.c_str());
-    if (old_value != nullptr) {
-      old_value_ = old_value;
-    }
-    CHECK_EQ(setenv(name_.c_str(), value.c_str(), /*overwrite=*/1), 0);
-  }
-
-  ~ScopedEnvVar() {
-    if (old_value_.has_value()) {
-      CHECK_EQ(setenv(name_.c_str(), old_value_->c_str(), /*overwrite=*/1), 0);
-      return;
-    }
-    CHECK_EQ(unsetenv(name_.c_str()), 0);
-  }
-
- private:
-  std::string name_;
-  std::optional<std::string> old_value_;
 };
 
 class CompatibilityShapeEngine final : public Engine {
@@ -212,6 +189,75 @@ class MockCausalLM : public CausalLM {
   int64_t last_block_table_width_ = 0;
   std::vector<int32_t> last_dp_token_nums_;
 };
+
+namespace {
+class BlockTableModel final : public MockCausalLM {
+ public:
+  explicit BlockTableModel(const torch::TensorOptions& options)
+      : MockCausalLM(options) {}
+
+  ModelOutput forward(const torch::Tensor& tokens,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>& caches,
+                      const ModelInputParams& params) override {
+    ModelOutput output =
+        MockCausalLM::forward(tokens, positions, caches, params);
+    const auto metadata =
+        layer::AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
+    const auto table = metadata.block_table.to(torch::kFloat32);
+    const auto columns = torch::arange(
+        /*start=*/1, table.size(1) + 1, table.options());
+    output.hidden_states = output.hidden_states.to(torch::kFloat32) +
+                           (table * columns).sum(1, /*keepdim=*/true);
+    return output;
+  }
+};
+
+class DecodeAttentionModel final : public MockCausalLM {
+ public:
+  explicit DecodeAttentionModel(const torch::TensorOptions& options,
+                                int64_t required_capacity = 0)
+      : MockCausalLM(options),
+        required_capacity_(required_capacity),
+        attention_(/*num_heads=*/2,
+                   /*head_size=*/128,
+                   /*scale=*/0.08838835f,
+                   /*num_kv_heads=*/1,
+                   /*sliding_window=*/-1) {}
+
+  ModelOutput forward(const torch::Tensor& tokens,
+                      const torch::Tensor& /*positions*/,
+                      std::vector<KVCache>& caches,
+                      const ModelInputParams& params) override {
+    ++calls_;
+    const auto metadata =
+        layer::AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
+    // A positive captured maximum must cover every supported replay length.
+    EXPECT_TRUE(metadata.max_seq_len <= 0 ||
+                metadata.max_seq_len >= required_capacity_)
+        << "Captured maximum " << metadata.max_seq_len
+        << " does not cover replay capacity " << required_capacity_;
+    auto query = torch::zeros({tokens.size(0), 256},
+                              params.embedding.input_embedding.options());
+    auto output = torch::empty_like(query);
+    std::optional<torch::Tensor> lse;
+    attention_->decoder_forward(query,
+                                output,
+                                lse,
+                                caches[0].get_k_cache(),
+                                caches[0].get_v_cache(),
+                                metadata);
+    return ModelOutput(output.reshape({tokens.size(0), 256}));
+  }
+
+  int32_t calls() const { return calls_; }
+
+ private:
+  int64_t required_capacity_;
+  layer::Attention attention_;
+  int32_t calls_ = 0;
+};
+}  // namespace
 
 // An input-dependent producer and consumer make missing graph output copies,
 // stale input addresses, and accidental producer replay observable.
@@ -515,7 +561,7 @@ class StatefulVerifyModel final : public GroupedCausalLM {
       history = history + metadata->has_initial_states;
     }
     auto next = state_.index_select(0, ids) + params.num_accepted_tokens +
-                history + params.attention.device.block_tables.select(1, 0);
+                history + params.attention.device.block_tables.sum(1);
     state_.index_copy_(
         0, ids, torch::where(ids > 0, next + 1, state_.index_select(0, ids)));
     ModelOutput output((value + next.unsqueeze(1)).reshape({-1, 1}));
@@ -550,6 +596,7 @@ TEST(MluSpecVerifyGraphTest, ReplaysUpdatedInputsAndAdvancesStateExactlyOnce) {
       .max_position_embeddings(4096);
   runtime::Options options;
   options.block_size(16)
+      .block_table_token_span(/*value=*/64)
       .num_decoding_tokens(4)
       .dp_size(1)
       .cp_size(1)
@@ -568,7 +615,8 @@ TEST(MluSpecVerifyGraphTest, ReplaysUpdatedInputsAndAdvancesStateExactlyOnce) {
     for (int32_t round = 0; round < 4; ++round) {
       const int32_t requests = round == 1 ? 7 : 5;
       params.meta.num_sequences = requests;
-      params.meta.kv_max_seq_len = round == 2 ? 100 : 32;
+      const int32_t histories[] = {46, 64, 65, 46};
+      params.meta.kv_max_seq_len = histories[round];
       params.attention.host.q_seq_lens.resize(requests + 1);
       for (int32_t i = 0; i <= requests; ++i) {
         params.attention.host.q_seq_lens[i] = i * width;
@@ -587,10 +635,10 @@ TEST(MluSpecVerifyGraphTest, ReplaysUpdatedInputsAndAdvancesStateExactlyOnce) {
       params.num_accepted_tokens =
           torch::full({requests}, round % width + 1, ints);
       params.attention.device.kv_seq_lens =
-          torch::arange(requests + 1, ints) * (16 + round);
+          torch::arange(requests + 1, ints) * histories[round];
       params.attention.device.new_cache_slots = tokens + 32 * round;
       params.attention.device.block_tables =
-          torch::full({requests, round == 2 ? 8 : 3}, round + 1, ints);
+          torch::full({requests, round == 2 ? 2 : 1}, round + 1, ints);
       // Both sources are legal. When supplied, the device mask must win even
       // when its values differ from the host mask used for metadata shape.
       params.linear_state_validity_mask_tensor =
@@ -611,7 +659,6 @@ TEST(MluSpecVerifyGraphTest, ReplaysUpdatedInputsAndAdvancesStateExactlyOnce) {
 }
 
 TEST(MluSpecVerifyGraphTest, Dflash2B16RefreshesAcceptedStateAndAuxAt64k) {
-  ScopedEnvVar graph_kv_cap("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "73728");
   const torch::NoGradGuard no_grad;
   const torch::Device device("mlu:0");
   const auto floats =
@@ -767,9 +814,14 @@ class MluGraphExecutorTest : public ::testing::Test {
     Device device(tensor_options_.device());
     device.set_seed(seed);
     const int64_t max_seq_len = model_args_.max_position_embeddings();
-    const uint32_t block_size = options_.block_size();
+    const int64_t token_span = options_.block_table_token_span() > 0
+                                   ? options_.block_table_token_span()
+                                   : options_.block_size();
+    const auto capabilities =
+        ModelRegistry::get_mtp_capabilities(model_args_.model_type());
     const int64_t num_blocks_per_req =
-        (max_seq_len + block_size - 1) / block_size + 1;
+        (max_seq_len + token_span - 1) / token_span +
+        capabilities.graph_block_table_extra_columns;
     auto int_tensor_options = tensor_options_.dtype(torch::kInt32);
     auto token_ids = torch::full({batch_size}, 1, int_tensor_options);
     auto positions = torch::full({batch_size}, 1, int_tensor_options);
@@ -820,7 +872,7 @@ class MluGraphExecutorTest : public ::testing::Test {
         model_args_.index_kpool() > 0) {
       MtpModelCapabilities capabilities;
       capabilities.supports_grouped_mtp_graph = true;
-      capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
+      capabilities.graph_block_table_extra_columns = 0;
       ModelRegistry::register_mtp_capabilities("test_grouped_model",
                                                capabilities);
       model_args_.model_type("test_grouped_model");
@@ -1013,12 +1065,12 @@ TEST_F(MluGraphExecutorTest, RejectsInputContractChangesBeforeBufferUpdates) {
   layout.num_reqs = 2;
   layout.padded_num_reqs = 2;
   layout.padded_num_tokens = 2;
-  mlu::GraphPersistentParam buffers(input.token_ids,
-                                    input.positions,
-                                    params,
-                                    layout,
-                                    /*graph_max_kv_seq_len=*/2048,
-                                    options_.block_size());
+  mlu::GraphPersistentParam buffers(
+      input.token_ids,
+      input.positions,
+      params,
+      layout,
+      params.attention.device.block_tables.size(1));
   ModelInputParams missing = params;
   missing.embedding.input_embedding = torch::Tensor();
   torch_mlu::synchronize();
@@ -1073,12 +1125,8 @@ TEST_F(MluGraphExecutorTest, CaptureValidatesExternalEmbeddingLayout) {
   ModelInputParams params = input.input_params;
   params.embedding.input_embedding =
       torch::ones({2, 64}, tensor_options_.dtype(torch::kFloat32));
-  mlu::GraphPersistentParam valid(input.token_ids,
-                                  input.positions,
-                                  params,
-                                  layout,
-                                  /*graph_max_kv_seq_len=*/2048,
-                                  options_.block_size());
+  mlu::GraphPersistentParam valid(
+      input.token_ids, input.positions, params, layout, options_.block_size());
   EXPECT_TRUE(valid.params_.embedding.input_embedding.defined());
   EXPECT_EQ(valid.params_.embedding.input_embedding.size(1), 64);
   EXPECT_EQ(valid.params_.embedding.input_embedding.scalar_type(),
@@ -1090,7 +1138,6 @@ TEST_F(MluGraphExecutorTest, CaptureValidatesExternalEmbeddingLayout) {
                                          input.positions,
                                          params,
                                          layout,
-                                         /*graph_max_kv_seq_len=*/2048,
                                          options_.block_size()),
                "input_embedding graph input rank changed");
   params.embedding.input_embedding = torch::ones({1, 64}, tensor_options_);
@@ -1098,7 +1145,6 @@ TEST_F(MluGraphExecutorTest, CaptureValidatesExternalEmbeddingLayout) {
                                          input.positions,
                                          params,
                                          layout,
-                                         /*graph_max_kv_seq_len=*/2048,
                                          options_.block_size()),
                "input_embedding graph input row count changed");
   params.embedding.input_embedding = torch::ones({2, 64});
@@ -1106,7 +1152,6 @@ TEST_F(MluGraphExecutorTest, CaptureValidatesExternalEmbeddingLayout) {
                                          input.positions,
                                          params,
                                          layout,
-                                         /*graph_max_kv_seq_len=*/2048,
                                          options_.block_size()),
                "input_embedding graph input device changed");
   EXPECT_DEATH(impl_->run(input.token_ids, input.positions, kv_caches_, params),
@@ -1141,7 +1186,6 @@ TEST_F(MluGraphExecutorTest, PersistentInputsClearShrunkTailsAndDefaults) {
                                     full.positions,
                                     full_params,
                                     layout,
-                                    /*graph_max_kv_seq_len=*/2048,
                                     /*main_block_table_columns=*/5);
   buffers.update_input_buffer(
       full.token_ids, full.positions, full_params, layout);
@@ -1223,6 +1267,12 @@ TEST_F(MluGraphExecutorTest, PersistentInputsClearShrunkTailsAndDefaults) {
                                torch::zeros({2, 1024}, tensor_options_)})));
 
   short_params.attention.device.block_tables = torch::full({2, 7}, 6, ints);
+  torch_mlu::synchronize();
+  EXPECT_DEATH(
+      buffers.update_input_buffer(
+          short_input.token_ids, short_input.positions, short_params, layout),
+      "block_tables graph input exceeds column capacity");
+  short_params.attention.device.block_tables = torch::full({2, 5}, 6, ints);
   short_params.embedding.linear_state_indices = torch::Tensor();
   short_params.embedding.linear_state_ids.clear();
   short_params.linear_state_validity_mask_tensor = torch::Tensor();
@@ -1503,76 +1553,35 @@ TEST_F(MluGraphExecutorTest, Glm52DecodeReusesGraphAcrossBlockTableWidths) {
   EXPECT_EQ(model_->forward_cnt(), 1);
 }
 
-TEST_F(MluGraphExecutorTest,
-       ModelContextHistoryFallsBackAboveCapacityThenReplays) {
-  model_args_.index_kpool(4).index_kpool_compress(true).max_position_embeddings(
-      64);
-  model_ = std::make_unique<GroupedCausalLM>(tensor_options_);
-  options_.is_draft_engine(false);
+TEST_F(MluGraphExecutorTest, KvSplitDecodeReplaysAcrossLogicalBlocks) {
+  model_ = std::make_unique<BlockTableModel>(tensor_options_);
+  model_args_.model_type("glm_moe_dsa");
+  options_.block_table_token_span(/*value=*/64)
+      .is_draft_engine(/*value=*/false);
   rebuild_impl();
-
-  const auto set_request_metadata = [&](ForwardInput& input) {
-    input.input_params.embedding.linear_state_ids = {1, 2, 3, 4, 5};
-    input.input_params.embedding.linear_state_indices =
-        torch::tensor(input.input_params.embedding.linear_state_ids,
-                      tensor_options_.dtype(torch::kInt32));
-  };
-  const int32_t batch_size = 5;
-  auto short_history = prepare_inputs(batch_size, /*seed=*/41);
-  set_request_metadata(short_history);
-  short_history.input_params.attention.device.block_tables =
-      short_history.input_params.attention.device.block_tables.narrow(
-          /*dim=*/1, /*start=*/0, /*length=*/2);
-  short_history.input_params.meta.kv_max_seq_len = 32;
-
-  auto at_cap = prepare_inputs(batch_size, /*seed=*/43);
-  set_request_metadata(at_cap);
-  at_cap.input_params.attention.device.block_tables =
-      at_cap.input_params.attention.device.block_tables.narrow(
-          /*dim=*/1, /*start=*/0, /*length=*/4);
-  at_cap.input_params.meta.kv_max_seq_len = 64;
-
-  auto over_cap = prepare_inputs(batch_size, /*seed=*/47);
-  set_request_metadata(over_cap);
-  over_cap.input_params.attention.device.block_tables =
-      over_cap.input_params.attention.device.block_tables.narrow(
-          /*dim=*/1, /*start=*/0, /*length=*/5);
-  over_cap.input_params.meta.kv_max_seq_len = 65;
-
-  const torch::Tensor first = impl_
-                                  ->run(short_history.token_ids,
-                                        short_history.positions,
-                                        kv_caches_,
-                                        short_history.input_params)
-                                  .hidden_states.clone();
-  EXPECT_EQ(model_->forward_cnt(), 2);
-  EXPECT_EQ(model_->last_kv_max_seq_len(), 64);
-  EXPECT_EQ(model_->last_block_table_width(), 4);
-
-  impl_->run({at_cap.token_ids},
-             {at_cap.positions},
-             kv_caches_,
-             {at_cap.input_params});
-  EXPECT_EQ(model_->forward_cnt(), 2);
-
-  impl_->run({over_cap.token_ids},
-             {over_cap.positions},
-             kv_caches_,
-             {over_cap.input_params});
-  impl_->run({over_cap.token_ids},
-             {over_cap.positions},
-             kv_caches_,
-             {over_cap.input_params});
-  EXPECT_EQ(model_->forward_cnt(), 4);
-
-  const torch::Tensor again = impl_
-                                  ->run(short_history.token_ids,
-                                        short_history.positions,
-                                        kv_caches_,
-                                        short_history.input_params)
-                                  .hidden_states.clone();
-  EXPECT_EQ(model_->forward_cnt(), 4);
-  EXPECT_TRUE(torch::equal(first, again));
+  const std::vector<int32_t> histories = {46, 64, 65, 129, 129, 46};
+  for (std::size_t step = 0; step < histories.size(); ++step) {
+    auto input = prepare_inputs(/*batch_size=*/3, 41 + step);
+    input.input_params.meta.kv_max_seq_len = histories[step];
+    input.input_params.attention.device.block_tables =
+        torch::full({3, (histories[step] + 63) / 64},
+                    static_cast<int64_t>(step + 1),
+                    tensor_options_.dtype(torch::kInt32));
+    auto actual = impl_
+                      ->run(input.token_ids,
+                            input.positions,
+                            kv_caches_,
+                            input.input_params)
+                      .hidden_states.clone();
+    EXPECT_EQ(model_->forward_cnt(), step + 1);
+    if (step == 0) {
+      EXPECT_EQ(model_->last_kv_max_seq_len(), 46);
+      EXPECT_EQ(model_->last_block_table_width(), 33);
+    }
+    auto expected = model_->forward(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_TRUE(torch::equal(actual, expected.hidden_states));
+  }
 }
 
 TEST_F(MluGraphExecutorTest, UnsupportedVerifyUsesEagerAndDecodeCaptures) {
@@ -1851,6 +1860,7 @@ TEST_F(MluGraphExecutorTest, FixedInputFormatsCaptureOncePerDeployment) {
 }
 
 TEST_F(MluGraphExecutorTest, QwenHistoryWithinContextReusesOneGraph) {
+  model_ = std::make_unique<BlockTableModel>(tensor_options_);
   model_args_.model_type("qwen3_5_text").max_position_embeddings(8192);
   rebuild_impl();
   const std::vector<int32_t> histories = {
@@ -1858,8 +1868,11 @@ TEST_F(MluGraphExecutorTest, QwenHistoryWithinContextReusesOneGraph) {
   for (size_t i = 0; i < histories.size(); ++i) {
     auto input = prepare_inputs(/*batch_size=*/3, 230 + i);
     input.input_params.meta.kv_max_seq_len = histories[i];
+    const int64_t columns = (histories[i] + 15) / 16 + 1;
     input.input_params.attention.device.block_tables =
-        torch::zeros({3, 513}, tensor_options_.dtype(torch::kInt32));
+        torch::arange(columns, tensor_options_.dtype(torch::kInt32))
+            .repeat({3, 1}) +
+        static_cast<int64_t>(i + 1);
     input.input_params.attention.device.kv_seq_lens =
         torch::arange(4, tensor_options_.dtype(torch::kInt32)) * histories[i];
     auto actual = impl_
@@ -1870,7 +1883,7 @@ TEST_F(MluGraphExecutorTest, QwenHistoryWithinContextReusesOneGraph) {
                       .hidden_states.clone();
     EXPECT_EQ(model_->forward_cnt(), 1 + static_cast<int32_t>(i));
     if (i == 0) {
-      EXPECT_EQ(model_->last_kv_max_seq_len(), 8192);
+      EXPECT_EQ(model_->last_kv_max_seq_len(), histories[0]);
       EXPECT_EQ(model_->last_block_table_width(), 513);
     }
     auto expected = model_->forward(
@@ -1884,32 +1897,80 @@ TEST_F(MluGraphExecutorTest, QwenRequiresPositiveDeclaredContext) {
   EXPECT_DEATH(rebuild_impl(), "positive max_position_embeddings");
 }
 
-TEST_F(MluGraphExecutorTest, QwenHistoryBeyondContextFallsBackThenReplays) {
+TEST_F(MluGraphExecutorTest,
+       DecodeAttentionReplaysGrowingHistoryAndPageRemaps) {
+  const torch::NoGradGuard no_grad;
+  model_args_.model_type("qwen3_5_text").max_position_embeddings(8192);
+  options_.is_draft_engine(false).enable_graph_mode_decode_no_padding(false);
+  auto model =
+      std::make_unique<DecodeAttentionModel>(tensor_options_,
+                                             /*required_capacity=*/8192);
+  DecodeAttentionModel* attention_model = model.get();
+  DecodeAttentionModel eager_model(tensor_options_);
+  model_ = std::move(model);
+  rebuild_impl();
+
+  const auto cpu_options =
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32);
+  const auto page_values = torch::arange(544, cpu_options).remainder(23) / 8;
+  const auto k_cache = torch::zeros({544, 1, 16, 128}, tensor_options_);
+  const auto v_cache = page_values.to(tensor_options_)
+                           .reshape({544, 1, 1, 1})
+                           .expand({544, 1, 16, 128})
+                           .contiguous();
+  const std::vector<int32_t> histories = {16, 17, 1025, 4097, 8192, 17, 16};
+  for (std::size_t step = 0; step < histories.size(); ++step) {
+    SCOPED_TRACE(step);
+    auto input = prepare_inputs(/*batch_size=*/3, /*seed=*/313);
+    const int32_t history = histories[step];
+    const int64_t columns = (history + 15) / 16;
+    auto table = torch::arange(columns, cpu_options.dtype(torch::kInt64))
+                     .repeat({3, 1}) +
+                 1;
+    // Remap the final page even when history and table shape repeat.
+    table.select(/*dim=*/1, columns - 1)
+        .copy_(torch::arange(3, table.options()) + 513 +
+               static_cast<int64_t>(step) * 3);
+    input.input_params.meta.kv_max_seq_len = history;
+    input.input_params.attention.device.block_tables =
+        table.to(tensor_options_.dtype(torch::kInt32));
+    input.input_params.attention.host.kv_seq_lens = {
+        0, history, 2 * history, 3 * history};
+    input.input_params.attention.device.kv_seq_lens =
+        torch::tensor(input.input_params.attention.host.kv_seq_lens,
+                      tensor_options_.dtype(torch::kInt32));
+    kv_caches_[0] = KVCache(KVCacheTensors{k_cache, v_cache});
+    const auto expected = eager_model.forward(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    const auto actual = impl_->run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_TRUE(torch::allclose(
+        actual.hidden_states, expected.hidden_states, 0.01, 0.01));
+    // Zero queries/keys give uniform attention over the addressed tokens.
+    const auto reference = page_values.index_select(0, table.reshape({-1}))
+                               .reshape({3, columns})
+                               .repeat_interleave(/*repeats=*/16, /*dim=*/1)
+                               .narrow(/*dim=*/1, /*start=*/0, history)
+                               .mean(/*dim=*/1, /*keepdim=*/true)
+                               .expand({3, 256});
+    EXPECT_TRUE(torch::allclose(
+        actual.hidden_states.to(cpu_options), reference, 0.01, 0.01));
+    EXPECT_EQ(attention_model->calls(), 1);
+  }
+}
+
+TEST_F(MluGraphExecutorTest, QwenHistoryGrowthReplaysWithoutRecapture) {
   model_args_.model_type("qwen3_5_text").max_position_embeddings(8192);
   rebuild_impl();
-  auto input = prepare_inputs(/*batch_size=*/3, 239);
-  input.input_params.attention.device.block_tables =
-      torch::zeros({3, 514}, tensor_options_.dtype(torch::kInt32));
-  input.input_params.meta.kv_max_seq_len = 8192;
-  auto first =
-      impl_
-          ->run(
-              input.token_ids, input.positions, kv_caches_, input.input_params)
-          .hidden_states.clone();
-  EXPECT_EQ(model_->forward_cnt(), 1);
-
-  input.input_params.meta.kv_max_seq_len = 8193;
-  impl_->run(input.token_ids, input.positions, kv_caches_, input.input_params);
-  EXPECT_EQ(model_->forward_cnt(), 2);
-
-  input.input_params.meta.kv_max_seq_len = 8192;
-  auto again =
-      impl_
-          ->run(
-              input.token_ids, input.positions, kv_caches_, input.input_params)
-          .hidden_states.clone();
-  EXPECT_EQ(model_->forward_cnt(), 2);
-  EXPECT_TRUE(torch::equal(first, again));
+  auto input = prepare_inputs(/*batch_size=*/3, /*seed=*/239);
+  for (const int32_t history : {16, 4097, 8192, 16}) {
+    input.input_params.meta.kv_max_seq_len = history;
+    input.input_params.attention.device.block_tables = torch::zeros(
+        {3, (history + 15) / 16 + 1}, tensor_options_.dtype(torch::kInt32));
+    impl_->run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_EQ(model_->forward_cnt(), 1);
+  }
 }
 
 class GraphPeerGroup final : public ProcessGroup {
@@ -1945,7 +2006,7 @@ class GraphPeerGroup final : public ProcessGroup {
     } else if (state_ == PeerState::CACHE_MISS) {
       values[1] = 0;
     } else if (state_ == PeerState::INCOMPATIBLE) {
-      values[5] += 1;
+      values[3] += 1;
     }
     return torch::stack({local, peer});
   }
@@ -1987,10 +2048,10 @@ TEST_F(MluGraphExecutorTest, DpRanksAgreeOnEagerCaptureAndReplay) {
   EXPECT_EQ(model_->forward_cnt(), 4);
 
   group.peer_state(GraphPeerGroup::PeerState::SUPPORTED_PEER);
-  input.input_params.meta.kv_max_seq_len = 8193;
+  input.input_params.meta.batch_forward_type = BatchForwardType::PREFILL;
   impl_->run(input.token_ids, input.positions, kv_caches_, input.input_params);
   EXPECT_EQ(model_->forward_cnt(), 5);
-  input.input_params.meta.kv_max_seq_len = 1;
+  input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
   group.peer_state(GraphPeerGroup::PeerState::MATCHED);
   impl_->run(input.token_ids, input.positions, kv_caches_, input.input_params);
   EXPECT_EQ(model_->forward_cnt(), 5);
@@ -2241,8 +2302,7 @@ TEST_F(MluGraphExecutorTest, PersistentTensorBytesIncludeLazyAux) {
                                   input.positions,
                                   input.input_params,
                                   layout,
-                                  /*block_capacity=*/256,
-                                  options_.block_size());
+                                  /*main_block_table_columns=*/256);
   const std::size_t base_bytes = param.get_persistent_tensor_bytes();
   param.aux_hidden_states_ = torch::zeros({4, 1024}, tensor_options_);
   const std::size_t aux_bytes = param.aux_hidden_states_.numel() *
@@ -2750,17 +2810,17 @@ TEST_F(MluGraphExecutorTest,
   EXPECT_EQ(model_->forward_cnt(), 5);
 }
 
-TEST_F(MluGraphExecutorTest,
-       DraftSharedSelectionCapturesBothModesAndReplaysNewRows) {
+TEST_F(MluGraphExecutorTest, GlmMtpDraftCapturesBothModesAndReplaysNewRows) {
+  const auto capabilities =
+      ModelRegistry::get_mtp_capabilities("glm_moe_dsa_mtp");
+  ASSERT_TRUE(capabilities.supports_grouped_mtp_graph);
+  ASSERT_TRUE(capabilities.supports_native_index_share_for_iteration);
+  ASSERT_FALSE(capabilities.enable_piecewise_graph);
+  model_args_.model_type("glm_moe_dsa_mtp").index_share_for_mtp_iteration(true);
+  options_.is_draft_engine(true);
   for (bool has_state : {false, true}) {
+    SCOPED_TRACE(has_state);
     model_ = std::make_unique<MtpSelectionModel>(tensor_options_);
-    MtpModelCapabilities capabilities;
-    capabilities.supports_grouped_mtp_graph = true;
-    capabilities.supports_native_index_share_for_iteration = true;
-    ModelRegistry::register_mtp_capabilities("test_shared_selection",
-                                             capabilities);
-    model_args_.model_type("test_shared_selection");
-    options_.is_draft_engine(true);
     rebuild_impl();
     auto input = prepare_inputs(/*batch_size=*/3, /*seed=*/29);
     if (has_state) {
@@ -2778,6 +2838,12 @@ TEST_F(MluGraphExecutorTest,
     ASSERT_NE(first_native, nullptr);
     const torch::Tensor first_selection =
         first_native->layer_states()[0]->block_tables().clone();
+    EXPECT_TRUE(torch::equal(first_selection,
+                             input.token_ids.unsqueeze(1).repeat({1, 2})));
+    EXPECT_TRUE(
+        torch::equal(first.hidden_states,
+                     first_selection.to(torch::kFloat32) +
+                         input.positions.to(torch::kFloat32).unsqueeze(1)));
     const torch::Tensor reorder =
         torch::tensor({2, 0, 1}, input.token_ids.options().dtype(torch::kLong));
     input.input_params.mtp_topk_state =
@@ -2800,6 +2866,8 @@ TEST_F(MluGraphExecutorTest,
     input.token_ids.add_(100);
     auto next = impl_->run(
         input.token_ids, input.positions, kv_caches_, input.input_params);
+    EXPECT_TRUE(torch::equal(next.hidden_states,
+                             first_selection.to(torch::kFloat32) + 107));
     input.input_params.mtp_topk_state = next.mtp_topk_state;
     input.positions.fill_(9);
     auto next_reuse = impl_->run(
@@ -2934,7 +3002,7 @@ class PiecewiseHistoryModel final : public MockCausalLM {
 
 TEST_F(MluGraphExecutorTest, PiecewiseReplayRefreshesHistoryAndPreservesOrder) {
   MtpModelCapabilities capabilities;
-  capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
+  capabilities.graph_block_table_extra_columns = 0;
   capabilities.enable_piecewise_graph = true;
   ModelRegistry::register_mtp_capabilities("test_piecewise_history",
                                            capabilities);
@@ -2975,7 +3043,6 @@ TEST_F(MluGraphExecutorTest, MultilayerPiecewiseReplayPreservesDependencies) {
       input.positions,
       input.input_params,
       layout,
-      /*graph_max_kv_seq_len=*/2048,
       input.input_params.attention.device.block_tables.size(1));
   mlu::MluGraph graph(std::move(persistent), /*piecewise=*/true);
   const auto pool = torch_mlu::graph_pool_handle();
@@ -3002,34 +3069,6 @@ TEST_F(MluGraphExecutorTest, MultilayerPiecewiseReplayPreservesDependencies) {
     EXPECT_EQ(model.eager_calls(), (step + 1) * kNumLayers);
     EXPECT_EQ(model.calls(), 1);
   }
-}
-
-TEST_F(MluGraphExecutorTest,
-       ModelContextHistoryUsesFullGraphUnlessPiecewiseIsEnabled) {
-  MtpModelCapabilities capabilities;
-  capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
-  ModelRegistry::register_mtp_capabilities("test_model_context_history",
-                                           capabilities);
-  model_args_.model_type("test_model_context_history")
-      .max_position_embeddings(8192);
-  auto model = std::make_unique<PiecewiseHistoryModel>(tensor_options_);
-  options_.enable_graph_mode_decode_no_padding(false);
-  mlu::MluGraphExecutorImpl executor(
-      model.get(), model_args_, tensor_options_.device(), options_);
-  for (const int32_t history : {16, 4097}) {
-    auto input = prepare_inputs(/*batch_size=*/3, /*seed=*/303);
-    input.input_params.meta.kv_max_seq_len = history;
-    auto expected =
-        (input.input_params.embedding.input_embedding.to(torch::kFloat32) * 2 +
-         8192) *
-        3;
-    auto actual = executor.run(
-        input.token_ids, input.positions, kv_caches_, input.input_params);
-    EXPECT_TRUE(torch::equal(actual.hidden_states, expected));
-  }
-  // Model-context history alone keeps the selection inside the captured graph.
-  EXPECT_EQ(model->calls(), 1);
-  EXPECT_EQ(model->eager_calls(), 1);
 }
 
 namespace {
@@ -3104,7 +3143,6 @@ TEST(MluSpecVerifyGraphTest,
      GlmPiecewiseIndexerCrosses32KAnd64KWithoutRecapture) {
   const torch::NoGradGuard no_grad;
   // The legacy fixed-workspace limit must no longer bound GLM graph replay.
-  ScopedEnvVar graph_kv_cap("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "32768");
   ScopedConfigSnapshot config_snapshot;
   ExecutionConfig::get_instance().max_tokens_for_graph_mode(64);
   const int64_t old_block_size = KVCacheConfig::get_instance().block_size();
@@ -3204,7 +3242,7 @@ TEST(MluSpecVerifyGraphTest,
       EXPECT_EQ(graph_model.tail()[0].count_nonzero().item<int64_t>(), 0);
     }
     // One request bucket: warmup advances state once, capture records once,
-    // and every later request replays even when history exceeds the old limit.
+    // and every later request replays across changing history lengths.
     EXPECT_EQ(graph_model.calls(), 2);
   }
   KVCacheConfig::get_instance().block_size(old_block_size);

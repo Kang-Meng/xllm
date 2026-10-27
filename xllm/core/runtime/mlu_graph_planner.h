@@ -28,8 +28,6 @@ limitations under the License.
 
 namespace xllm::mlu {
 
-int64_t get_block_capacity(int64_t max_kv_seq_len, int32_t block_size);
-
 struct GraphLayout {
   int64_t num_reqs = 0;
   int64_t padded_num_reqs = 0;
@@ -100,14 +98,11 @@ enum class EagerReason : int8_t {
   UNSUPPORTED_INPUT,
   INVALID_LAYOUT,
   TOKEN_LIMIT,
-  HISTORY_LIMIT,
 };
 
 struct GraphPlan {
   GraphLayout layout;
   GraphKey key;
-  int64_t history_capacity = 0;
-  int64_t main_block_table_columns = 0;
 };
 
 using GraphDecision = std::variant<GraphPlan, EagerReason>;
@@ -116,7 +111,6 @@ struct GraphPlannerConfig {
   runtime::Options options;
   MtpModelCapabilities capabilities;
   bool state_required = false;
-  int64_t history_capacity = 0;
   int64_t max_tokens = 0;
 };
 

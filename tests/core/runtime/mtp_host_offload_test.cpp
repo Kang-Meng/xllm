@@ -530,6 +530,20 @@ class ContextPolicyMTPWorker final : public MTPWorkerImpl {
     prepare_draft_inputs(input, draft_input, /*position_offset=*/0);
     return draft_input;
   }
+
+  ForwardInput prepare_first_draft(const ForwardInput& input) {
+    std::vector<EmbeddingCache::DecodeState> states(1);
+    states.front().valid = true;
+    states.front().token_id = input.token_ids_host.item<int32_t>();
+    states.front().embedding = torch::zeros({2}, torch::kFloat32);
+    ForwardInput draft_input;
+    prepare_draft_extend_inputs(input,
+                                states,
+                                draft_input,
+                                /*force_two_rows=*/true,
+                                /*wait_for_compute_stream=*/false);
+    return draft_input;
+  }
 };
 
 class MTPContextPolicyTest : public MTPHostOffloadTest {
@@ -667,20 +681,26 @@ TEST_F(MTPContextPolicyTest, FullAttentionDraftDropsTargetState) {
   auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND);
   ASSERT_TRUE(worker->init_model(
       model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
+  ASSERT_TRUE(worker->allocate_kv_cache(cache_shape()));
   const ForwardInput input = make_decode_input();
 
-  const ForwardInput draft = worker->prepare_next_draft(input);
-  const ModelInputParams& params = draft.input_params;
-  EXPECT_TRUE(params.embedding.linear_state_ids.empty());
-  EXPECT_FALSE(params.embedding.linear_state_indices.defined());
-  EXPECT_TRUE(params.embedding.linear_state_read_ids.empty());
-  EXPECT_FALSE(params.embedding.linear_state_read_indices.defined());
-  EXPECT_TRUE(params.linear_state_validity_mask.empty());
-  EXPECT_FALSE(params.linear_state_validity_mask_tensor.defined());
-  EXPECT_FALSE(params.num_accepted_tokens.defined());
-  EXPECT_TRUE(params.num_accepted_tokens_host.empty());
-  EXPECT_EQ(input.input_params.embedding.linear_state_ids,
-            (std::vector<int32_t>{5}));
+  for (bool first_draft : {false, true}) {
+    SCOPED_TRACE(first_draft);
+    const ForwardInput draft = first_draft ? worker->prepare_first_draft(input)
+                                           : worker->prepare_next_draft(input);
+    const ModelInputParams& params = draft.input_params;
+    EXPECT_EQ(draft.token_ids.numel(), first_draft ? 2 : 1);
+    EXPECT_TRUE(params.embedding.linear_state_ids.empty());
+    EXPECT_FALSE(params.embedding.linear_state_indices.defined());
+    EXPECT_TRUE(params.embedding.linear_state_read_ids.empty());
+    EXPECT_FALSE(params.embedding.linear_state_read_indices.defined());
+    EXPECT_TRUE(params.linear_state_validity_mask.empty());
+    EXPECT_FALSE(params.linear_state_validity_mask_tensor.defined());
+    EXPECT_FALSE(params.num_accepted_tokens.defined());
+    EXPECT_TRUE(params.num_accepted_tokens_host.empty());
+    EXPECT_EQ(input.input_params.embedding.linear_state_ids,
+              (std::vector<int32_t>{5}));
+  }
 }
 
 TEST_F(MTPContextPolicyTest, StatefulDraftRetainsRequestState) {

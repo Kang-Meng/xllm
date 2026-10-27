@@ -4016,6 +4016,9 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     return;
   }
   auto& input_params = extend_input.input_params;
+  if (!draft_impl_->has_request_state_cache()) {
+    clear_draft_state(input_params);
+  }
   const int32_t num_sequences = input_params.meta.num_sequences;
 
   const bool dp_enabled = parallel_args_.dp_size() > 1;

@@ -995,6 +995,8 @@ struct ExpertInput {
 
 struct GraphInput {
   GraphEagerContext* eager_context = nullptr;
+  // Stable upper bound for captured attention; zero uses the batch length.
+  int64_t kv_seq_len_capacity = 0;
   torch::Tensor attn_mask;
   torch::Tensor tiling_data;
   torch::Tensor num_valid_token_rows;
@@ -1028,6 +1030,7 @@ struct GraphInput {
 
   GraphInput to(const torch::Device& device) const {
     GraphInput out;
+    out.kv_seq_len_capacity = kv_seq_len_capacity;
     out.attn_mask = safe_to(attn_mask, device, true);
     out.tiling_data = safe_to(tiling_data, device, true);
     out.num_valid_token_rows = safe_to(num_valid_token_rows, device, true);

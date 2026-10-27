@@ -47,6 +47,9 @@ struct Options {
   // the number of slots per block, default 128, value must be multiple of 16
   PROPERTY(int32_t, block_size) = 128;
 
+  // Global tokens covered by one main block-table column. Zero uses block_size.
+  PROPERTY(int64_t, block_table_token_span) = 0;
+
   // 0 means that cache size is calculated by available memory
   PROPERTY(int64_t, max_cache_size) = 0;
 

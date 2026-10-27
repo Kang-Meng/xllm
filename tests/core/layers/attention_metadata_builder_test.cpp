@@ -79,6 +79,23 @@ TEST(AttentionMetadataBuilderTest, LinearDecodeDoesNotRequirePrefillLengths) {
   EXPECT_FALSE(metadata.chunk_indices.defined());
 }
 
+TEST(AttentionMetadataBuilderTest, GraphCapacityPreservesBatchHistory) {
+  ModelInputParams params = make_params();
+  EXPECT_EQ(
+      AttentionMetadataBuilder::build(params, /*enable_mla=*/false).max_seq_len,
+      8);
+
+  params.graph.kv_seq_len_capacity = 8192;
+  params = params.to(torch::kCPU);
+  for (const int32_t history : {16, 4097, 8192, 16}) {
+    params.meta.kv_max_seq_len = history;
+    const auto metadata =
+        AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
+    EXPECT_EQ(metadata.max_seq_len, 8192);
+    EXPECT_EQ(params.meta.kv_max_seq_len, history);
+  }
+}
+
 TEST(AttentionMetadataBuilderTest, MaterializesCanonicalInitialStateMask) {
   ModelInputParams params = make_params();
 

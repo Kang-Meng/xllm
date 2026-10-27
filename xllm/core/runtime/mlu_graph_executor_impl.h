@@ -45,7 +45,6 @@ class GraphPersistentParam final {
                        const torch::Tensor& positions,
                        ModelInputParams params,
                        const GraphLayout& layout,
-                       int64_t graph_max_kv_seq_len,
                        int64_t main_block_table_columns);
 
   void update_input_buffer(const torch::Tensor& tokens,
@@ -157,6 +156,7 @@ class MluGraphExecutorImpl final : public ExecutorImpl {
   std::unique_ptr<MluGraphPlanner> planner_;
   ProcessGroup* dp_group_ = nullptr;  // owned by the worker context
   MtpModelCapabilities mtp_capabilities_;
+  int64_t main_block_table_columns_ = 0;
   std::size_t last_pool_reserved_bytes_ = 0;
   std::size_t peak_pool_reserved_bytes_ = 0;
 

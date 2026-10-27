@@ -55,7 +55,7 @@ enum class Scenario : int8_t {
   ALL_SUPPORTED,
   ONE_REJECTED,
   PLAN_MISMATCH,
-  HISTORY_MISMATCH,
+  CONTEXT_DIFFERENCE,
   EMBEDDING_MISMATCH,
   PARTIAL_HIT,
   MTP_MODE_MISMATCH,
@@ -378,7 +378,7 @@ int32_t run_child(Scenario scenario, int32_t rank, int32_t port) {
         .dtype("bfloat16")
         .hidden_size(kHiddenSize)
         .max_position_embeddings(
-            scenario == Scenario::HISTORY_MISMATCH ? 8192 + rank * 16 : 8192);
+            scenario == Scenario::CONTEXT_DIFFERENCE ? 8192 + rank * 16 : 8192);
     runtime::Options options;
     options.block_size(16).dp_size(kWorldSize).world_size(kWorldSize);
     if (scenario == Scenario::VLM_ALL_SUPPORTED ||
@@ -444,8 +444,7 @@ int32_t run_child(Scenario scenario, int32_t rank, int32_t port) {
       return 0;
     }
 
-    if (scenario == Scenario::PLAN_MISMATCH ||
-        scenario == Scenario::HISTORY_MISMATCH) {
+    if (scenario == Scenario::PLAN_MISMATCH) {
       if (scenario == Scenario::PLAN_MISMATCH && rank == 1) {
         const auto ints =
             torch::TensorOptions().dtype(torch::kInt32).device(device);
@@ -589,8 +588,8 @@ TEST(MluGraphDpCollectiveTest, DifferentPlansMakeAllRunEager) {
   run_scenario(Scenario::PLAN_MISMATCH);
 }
 
-TEST(MluGraphDpCollectiveTest, DifferentHistoryCapacityMakesAllRunEager) {
-  run_scenario(Scenario::HISTORY_MISMATCH);
+TEST(MluGraphDpCollectiveTest, DifferentStorageContextsStillCaptureAndReplay) {
+  run_scenario(Scenario::CONTEXT_DIFFERENCE);
 }
 
 TEST(MluGraphDpCollectiveTest, DifferentEmbeddingPresenceMakesAllRunEager) {

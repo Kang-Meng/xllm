@@ -39,6 +39,14 @@ class Glm5MtpForCausalLMImpl : public LlmForCausalLMImplBase<DeepseekMtpModel> {
 };
 TORCH_MODULE(Glm5MtpForCausalLM);
 
+const bool glm5_mtp_capabilities_registered = []() {
+  MtpModelCapabilities capabilities;
+  capabilities.supports_grouped_mtp_graph = true;
+  capabilities.supports_native_index_share_for_iteration = true;
+  ModelRegistry::register_mtp_capabilities("glm_moe_dsa_mtp", capabilities);
+  return true;
+}();
+
 // register the causal model
 REGISTER_CAUSAL_MODEL(glm_moe_dsa_mtp, Glm5MtpForCausalLM);
 

@@ -324,7 +324,8 @@ AttentionMetadata build_attention_metadata(
   }
 #endif
   attn_metadata.max_query_len = params.meta.q_max_seq_len;
-  attn_metadata.max_seq_len = params.meta.kv_max_seq_len;
+  attn_metadata.max_seq_len = std::max<int64_t>(
+      params.meta.kv_max_seq_len, params.graph.kv_seq_len_capacity);
   if (!params.attention.host.kv_seq_lens.empty()) {
     const bool is_cu_seq_lens =
         params.attention.host.kv_seq_lens.size() ==

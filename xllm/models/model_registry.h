@@ -63,13 +63,6 @@ enum class MtpReplayFamily : int8_t {
   QWEN35,
 };
 
-enum class MtpGraphHistoryPolicy : int8_t {
-  MAX_CONTEXT,
-  QWEN_FULL_ATTENTION,
-  // Exact model context capacity; block tables reserve no extra padding column.
-  MODEL_CONTEXT,
-};
-
 struct MtpModelCapabilities {
   // A platform-native implementation must explicitly opt out until its cache
   // updates and graph execution support cross-step index sharing.
@@ -80,7 +73,8 @@ struct MtpModelCapabilities {
   bool supports_causal_replay_target = false;
   bool supports_expanded_replay_target = false;
   bool supports_grouped_mtp_graph = false;
-  MtpGraphHistoryPolicy graph_history = MtpGraphHistoryPolicy::MAX_CONTEXT;
+  int64_t graph_block_table_extra_columns = 1;
+  int64_t graph_cache_pad_slot = 0;
   bool enable_piecewise_graph = false;
   bool native_draft_owns_embedding_and_lm_head = false;
   bool python_draft_owns_embedding_and_lm_head = false;

@@ -36,7 +36,6 @@ limitations under the License.
 #include "core/triton_jit/include/jit_kernel.h"
 
 namespace {
-using xllm::mlu::get_block_capacity;
 using xllm::mlu::GraphLayout;
 struct GraphPoolMemoryUsage {
   std::size_t reserved_bytes = 0;
@@ -103,16 +102,6 @@ xllm::ModelOutput make_graph_output(const torch::Tensor& hidden_states,
   return xllm::ModelOutput(hidden_states);
 }
 
-int64_t ordinary_graph_capacity(const xllm::ModelArgs& args,
-                                int32_t block_size) {
-  if (args.max_position_embeddings() <= 0) {
-    return 0;
-  }
-  const int64_t block_capacity =
-      get_block_capacity(args.max_position_embeddings(), block_size) + 1;
-  return block_capacity * block_size;
-}
-
 enum class GraphAction : int8_t { EAGER, CAPTURE, REPLAY };
 
 // A fixed-size packet keeps admission, layout, and cache state in one
@@ -132,8 +121,6 @@ GraphAction agree_graph_action(const xllm::mlu::GraphDecision& decision,
         1,
         cache_hit ? 1 : 0,
         plan->layout.cache_pad_slot,
-        plan->history_capacity,
-        plan->main_block_table_columns,
     };
     static_assert(std::size(fields) + xllm::mlu::kMaxGraphKeyFields <=
                   static_cast<std::size_t>(kGraphPacketSize));
@@ -216,7 +203,6 @@ GraphPersistentParam::GraphPersistentParam(const torch::Tensor& tokens,
                                            const torch::Tensor& positions,
                                            ModelInputParams params,
                                            const GraphLayout& layout,
-                                           int64_t graph_max_kv_seq_len,
                                            int64_t main_block_table_columns)
     : params_(std::move(params)) {
   const torch::Tensor& input_embedding = params_.embedding.input_embedding;
@@ -260,9 +246,6 @@ GraphPersistentParam::GraphPersistentParam(const torch::Tensor& tokens,
   params_.graph.num_valid_token_rows = torch::empty(
       {1}, torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
   params_.attn_metadata.reset();
-  if (graph_max_kv_seq_len > 0) {
-    params_.meta.kv_max_seq_len = graph_max_kv_seq_len;
-  }
   auto& attention = params_.attention.device;
   attention.q_seq_lens = allocate_rows(
       attention.q_seq_lens, attention.q_seq_lens.numel() + extra_rows);
@@ -306,9 +289,7 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
                                                const torch::Tensor& positions,
                                                const ModelInputParams& params,
                                                const GraphLayout& layout) {
-  if (params_.graph.eager_context != nullptr) {
-    params_.meta.kv_max_seq_len = params.meta.kv_max_seq_len;
-  }
+  params_.meta.kv_max_seq_len = params.meta.kv_max_seq_len;
   if (mtp_topk_input_ != nullptr) {
     CHECK(params.mtp_topk_state != nullptr);
     mtp_topk_input_->update(*params.mtp_topk_state);
@@ -323,9 +304,13 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
   check_graph_tensor(buffer.kv_seq_lens, source.kv_seq_lens, "kv_seq_lens");
   check_graph_tensor(
       buffer.new_cache_slots, source.new_cache_slots, "new_cache_slots");
-  // Main block-table columns are padded/truncated to the selected KV capacity.
   if (source.block_tables.defined()) {
+    CHECK(buffer.block_tables.defined());
     CHECK_EQ(source.block_tables.dim(), 2);
+    CHECK(buffer.block_tables.device() == source.block_tables.device())
+        << "block_tables graph input device changed";
+    CHECK_LE(source.block_tables.size(1), buffer.block_tables.size(1))
+        << "block_tables graph input exceeds column capacity";
     CHECK(buffer.block_tables.scalar_type() ==
           source.block_tables.scalar_type())
         << "block_tables graph input dtype changed";
@@ -441,16 +426,13 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
       .copy_(params.attention.device.new_cache_slots);
   if (attention.block_tables.defined()) {
     const int64_t block_rows = params.attention.device.block_tables.size(0);
-    const int64_t copy_width =
-        std::min(attention.block_tables.size(1),
-                 params.attention.device.block_tables.size(1));
+    const int64_t copy_width = params.attention.device.block_tables.size(1);
     if (padded_reqs) {
       attention.block_tables.zero_();
       if (block_rows > 0 && copy_width > 0) {
         attention.block_tables.narrow(0, 0, block_rows)
             .narrow(1, 0, copy_width)
-            .copy_(
-                params.attention.device.block_tables.narrow(1, 0, copy_width));
+            .copy_(params.attention.device.block_tables);
       }
     } else {
       const bool has_right = copy_width < attention.block_tables.size(1);
@@ -462,8 +444,7 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
       if (block_rows > 0 && copy_width > 0) {
         attention.block_tables.narrow(0, 0, block_rows)
             .narrow(1, 0, copy_width)
-            .copy_(
-                params.attention.device.block_tables.narrow(1, 0, copy_width));
+            .copy_(params.attention.device.block_tables);
       }
       if (block_rows > 0 && has_right && !has_bottom) {
         attention.block_tables.narrow(0, 0, block_rows)
@@ -749,15 +730,16 @@ MluGraphExecutorImpl::MluGraphExecutorImpl(CausalLM* model,
       options_(options),
       graph_pool_(torch_mlu::graph_pool_handle()) {
   mtp_capabilities_ = ModelRegistry::get_mtp_capabilities(args_.model_type());
-  int64_t history_capacity =
-      ordinary_graph_capacity(args_, options_.block_size());
-  if (mtp_capabilities_.graph_history ==
-          MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION ||
-      mtp_capabilities_.graph_history == MtpGraphHistoryPolicy::MODEL_CONTEXT) {
-    CHECK_GT(args_.max_position_embeddings(), 0)
-        << "Context-bounded graph requires positive max_position_embeddings";
-    history_capacity = args_.max_position_embeddings();
-  }
+  CHECK_GT(args_.max_position_embeddings(), 0)
+      << "Graph storage requires positive max_position_embeddings";
+  const int64_t token_span = options_.block_table_token_span() > 0
+                                 ? options_.block_table_token_span()
+                                 : options_.block_size();
+  CHECK_GT(token_span, 0);
+  CHECK_GE(mtp_capabilities_.graph_block_table_extra_columns, 0);
+  main_block_table_columns_ =
+      (args_.max_position_embeddings() + token_span - 1) / token_span +
+      mtp_capabilities_.graph_block_table_extra_columns;
   const int64_t max_tokens = std::max<int64_t>(
       ::xllm::ExecutionConfig::get_instance().max_tokens_for_graph_mode(),
       options_.max_seqs_per_batch());
@@ -765,7 +747,6 @@ MluGraphExecutorImpl::MluGraphExecutorImpl(CausalLM* model,
   planner_config.options = options_;
   planner_config.capabilities = mtp_capabilities_;
   planner_config.state_required = model_->requires_graph_forward_metadata();
-  planner_config.history_capacity = history_capacity;
   planner_config.max_tokens = max_tokens;
   planner_ = std::make_unique<MluGraphPlanner>(std::move(planner_config));
 }
@@ -865,7 +846,6 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
   const GraphLayout& layout = plan->layout;
   const uint32_t actual_tokens = static_cast<uint32_t>(tokens.size(0));
   const uint32_t graph_tokens = static_cast<uint32_t>(layout.padded_num_tokens);
-  const int64_t graph_max_kv_seq_len = plan->history_capacity;
   const bool canonical_model =
       mtp_capabilities_.replay_family == MtpReplayFamily::GLM5 ||
       mtp_capabilities_.replay_family == MtpReplayFamily::QWEN35;
@@ -882,6 +862,7 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
     // Normalize unused model inputs only when allocating a new graph. Replay
     // copies directly into its active buffers without cloning ModelInputParams.
     auto graph_params = params;
+    graph_params.graph.kv_seq_len_capacity = args_.max_position_embeddings();
     if (canonical_model) {
       if (!params.is_spec_verify) {
         graph_params.num_accepted_tokens = torch::Tensor();
@@ -897,8 +878,7 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
                                                positions,
                                                std::move(graph_params),
                                                layout,
-                                               graph_max_kv_seq_len,
-                                               plan->main_block_table_columns);
+                                               main_block_table_columns_);
     auto graph = std::make_unique<MluGraph>(
         std::move(buffers), mtp_capabilities_.enable_piecewise_graph);
     active_graph = graph.get();
@@ -934,6 +914,19 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
               << ", eager_segments=" << active_graph->num_eager_segments();
     log_memory_after_capture();
   }
+  VLOG(1) << "MLU graph executed: action="
+          << (action == GraphAction::REPLAY ? "replay" : "capture")
+          << ", draft=" << options_.is_draft_engine()
+          << ", verify=" << params.is_spec_verify
+          << ", tokens=" << actual_tokens
+          << ", tokens_per_request=" << layout.tokens_per_request
+          << ", attention_row_query_len=" << layout.attention_row_query_len
+          << ", padded_num_tokens=" << graph_tokens
+          << ", kv_max_seq_len=" << params.meta.kv_max_seq_len
+          << ", block_columns="
+          << (params.attention.device.block_tables.defined()
+                  ? params.attention.device.block_tables.size(1)
+                  : 0);
   ModelOutput output = make_graph_output(
       result.hidden_states.slice(0, 0, actual_tokens),
       result.aux_hidden_states.defined()

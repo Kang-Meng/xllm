@@ -34,9 +34,7 @@ namespace {
 GraphPlannerConfig qwen_config() {
   GraphPlannerConfig config;
   config.options.block_size(16).num_decoding_tokens(1);
-  config.capabilities.graph_history =
-      MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION;
-  config.history_capacity = 32;
+  config.capabilities.graph_cache_pad_slot = -1;
   config.max_tokens = 64;
   return config;
 }
@@ -134,7 +132,6 @@ TEST(MtpTopkGraphBufferDeathTest, RejectsMissingBufferFromGraphContract) {
                                     tokens,
                                     params,
                                     layout,
-                                    /*graph_max_kv_seq_len=*/32,
                                     /*main_block_table_columns=*/2),
                "graph contract must return a buffer");
 }
@@ -149,7 +146,6 @@ TEST(MtpTopkGraphBufferDeathTest, RejectsProducerWithoutGraphContract) {
                                tokens,
                                grouped_input(),
                                layout,
-                               /*graph_max_kv_seq_len=*/32,
                                /*main_block_table_columns=*/2);
   const auto state = std::make_shared<PlannerTopkState>();
   EXPECT_DEATH(buffers.store_topk_output(state),
@@ -472,7 +468,7 @@ TEST(MluGraphPlannerTest, GroupedPaddingKeepsRequestsAndTpAlignment) {
   EXPECT_EQ(std::get<GraphPlan>(no_padding).layout.padded_num_tokens, 12);
 }
 
-TEST(MluGraphPlannerTest, HistoryAtCapacityReusesLayoutAcrossSteps) {
+TEST(MluGraphPlannerTest, HistoryGrowthReusesLayoutAcrossSteps) {
   MluGraphPlanner planner(qwen_config());
   ModelInputParams first = decode_input(16);
   ModelInputParams boundary = decode_input(32);
@@ -480,8 +476,6 @@ TEST(MluGraphPlannerTest, HistoryAtCapacityReusesLayoutAcrossSteps) {
   GraphDecision boundary_decision = planner.plan({3, boundary});
   ASSERT_TRUE(std::holds_alternative<GraphPlan>(first_decision));
   ASSERT_TRUE(std::holds_alternative<GraphPlan>(boundary_decision));
-  EXPECT_EQ(std::get<GraphPlan>(first_decision).history_capacity, 32);
-  EXPECT_EQ(std::get<GraphPlan>(first_decision).main_block_table_columns, 3);
   EXPECT_TRUE(std::get<GraphPlan>(first_decision).key ==
               std::get<GraphPlan>(boundary_decision).key);
   EXPECT_EQ(std::get<GraphPlan>(first_decision).layout.padded_num_tokens, 4);
@@ -507,12 +501,11 @@ TEST(MluGraphPlannerTest, ExternalEmbeddingGetsSeparateGraphKey) {
               std::get<GraphPlan>(planner.plan({3, external})).key);
 }
 
-TEST(MluGraphPlannerTest, HistoryAboveCapacityFallsBackAndCanReturn) {
+TEST(MluGraphPlannerTest, HistoryDoesNotChangeAdmission) {
   MluGraphPlanner planner(qwen_config());
   ModelInputParams over = decode_input(33);
   ModelInputParams back = decode_input(16);
-  EXPECT_EQ(std::get<EagerReason>(planner.plan({3, over})),
-            EagerReason::HISTORY_LIMIT);
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({3, over})));
   EXPECT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({3, back})));
 }
 
@@ -552,8 +545,7 @@ TEST(MluGraphPlannerTest, DraftAndVerifyUseCurrentStageMetadata) {
   params.attention.device.new_cache_slots = torch::zeros({3}, torch::kInt32);
   EXPECT_TRUE(std::holds_alternative<GraphPlan>(draft.plan({3, params})));
   params.meta.kv_max_seq_len = 33;
-  EXPECT_EQ(std::get<EagerReason>(draft.plan({3, params})),
-            EagerReason::HISTORY_LIMIT);
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(draft.plan({3, params})));
 
   GraphPlannerConfig verify_config = qwen_config();
   verify_config.options.enable_speculative_decode(true).speculative_algorithm(
@@ -604,28 +596,26 @@ TEST(MluGraphPlannerTest, NativeDraftSharingSeparatesProducerAndReuseGraphs) {
       MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
 }
 
-TEST(MluGraphPlannerTest, ModelContextHistoryReusesKeyAcrossContextLengths) {
+TEST(MluGraphPlannerTest, KvSplitHistoryReusesKeyAcrossLogicalBlocks) {
   auto config = qwen_config();
-  config.history_capacity = 32768;
-  config.capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
+  config.capabilities.graph_block_table_extra_columns = 0;
   MluGraphPlanner planner(config);
   std::optional<GraphKey> first_key;
-  for (int64_t history : {1, 2048, 2049, 4097, 32768, 16}) {
+  for (int64_t history : {46, 64, 65, 2049, 4097, 32768, 16}) {
     auto params = decode_input(history);
     params.attention.device.block_tables =
-        torch::zeros({3, (history + 15) / 16}, torch::kInt32);
+        torch::zeros({3, (history + 63) / 64}, torch::kInt32);
     const auto decision = planner.plan({3, params});
     ASSERT_TRUE(std::holds_alternative<GraphPlan>(decision));
     const auto& plan = std::get<GraphPlan>(decision);
-    EXPECT_EQ(plan.history_capacity, config.history_capacity);
-    EXPECT_EQ(plan.main_block_table_columns, 2048);
     if (first_key.has_value()) {
       EXPECT_TRUE(*first_key == plan.key);
     } else {
       first_key = plan.key;
     }
   }
-  expect_eager(planner, 3, decode_input(32769), EagerReason::HISTORY_LIMIT);
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(
+      planner.plan({3, decode_input(32769)})));
 }
 
 TEST(MluGraphPlannerTest, Dflash2VerifyPreservesB16GroupsAt64kHistory) {
@@ -636,9 +626,7 @@ TEST(MluGraphPlannerTest, Dflash2VerifyPreservesB16GroupsAt64kHistory) {
       .world_size(8);
   config.capabilities.supports_grouped_mtp_graph = true;
   config.capabilities.replay_family = MtpReplayFamily::GLM5;
-  config.capabilities.graph_history = MtpGraphHistoryPolicy::MAX_CONTEXT;
   config.state_required = true;
-  config.history_capacity = 73728;
   config.max_tokens = 64;
   ModelInputParams params = grouped_input(/*rows=*/16);
   params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
@@ -666,13 +654,12 @@ TEST(MluGraphPlannerTest, Dflash2VerifyPreservesB16GroupsAt64kHistory) {
   EXPECT_EQ(plan.layout.num_reqs, 16);
   EXPECT_EQ(plan.layout.tokens_per_request, 4);
   EXPECT_EQ(plan.layout.padded_num_tokens, 64);
-  EXPECT_EQ(plan.main_block_table_columns, 4608);
   params.meta.kv_max_seq_len = 73728;
   const GraphDecision boundary = planner.plan({64, params});
   ASSERT_TRUE(std::holds_alternative<GraphPlan>(boundary));
   EXPECT_TRUE(plan.key == std::get<GraphPlan>(boundary).key);
   params.meta.kv_max_seq_len = 73729;
-  expect_eager(planner, 64, params, EagerReason::HISTORY_LIMIT);
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({64, params})));
   params.meta.kv_max_seq_len = 65536;
   params.num_accepted_tokens = torch::Tensor();
   expect_eager(planner, 64, params, EagerReason::INVALID_LAYOUT);

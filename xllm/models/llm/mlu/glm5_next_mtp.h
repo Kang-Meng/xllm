@@ -91,7 +91,7 @@ const bool glm5_next_mtp_capabilities_registered = []() {
   capabilities.replay_family = MtpReplayFamily::GLM5;
   capabilities.supports_causal_replay_target = true;
   capabilities.supports_grouped_mtp_graph = true;
-  capabilities.graph_history = MtpGraphHistoryPolicy::MODEL_CONTEXT;
+  capabilities.graph_block_table_extra_columns = 0;
   capabilities.enable_piecewise_graph = true;
   capabilities.python_draft_owns_embedding_and_lm_head = true;
   ModelRegistry::register_mtp_capabilities("glm5_next", capabilities);

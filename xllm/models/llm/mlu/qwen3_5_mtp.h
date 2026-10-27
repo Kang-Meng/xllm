@@ -94,13 +94,13 @@ const bool qwen3_5_mtp_contract_registered = []() {
   target.replay_family = MtpReplayFamily::QWEN35;
   target.supports_expanded_replay_target = true;
   target.supports_grouped_mtp_graph = true;
-  target.graph_history = MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION;
+  target.graph_cache_pad_slot = -1;
   MtpModelCapabilities draft;
   draft.replay_family = MtpReplayFamily::QWEN35;
   draft.supports_accepted_span_replay = true;
   draft.allow_tail_fallback = true;
   draft.supports_grouped_mtp_graph = true;
-  draft.graph_history = MtpGraphHistoryPolicy::QWEN_FULL_ATTENTION;
+  draft.graph_cache_pad_slot = -1;
   for (const char* name :
        {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}) {
     ModelRegistry::register_mtp_capabilities(name, target);
