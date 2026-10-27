@@ -21,10 +21,17 @@ limitations under the License.
 #include <brpc/server.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -437,6 +444,125 @@ TEST(RequestIdTest, ExtractsIdFromSupportedRequestBodies) {
 using CompletionStreamCall =
     StreamCall<proto::CompletionRequest, proto::CompletionResponse>;
 
+class TestableCompletionStreamCall final : public CompletionStreamCall {
+ public:
+  using CompletionStreamCall::CompletionStreamCall;
+  using CompletionStreamCall::start_stream;
+};
+
+class CallbackClosure final : public google::protobuf::Closure {
+ public:
+  explicit CallbackClosure(std::function<void()> callback)
+      : callback_(std::move(callback)) {}
+
+  void Run() override { callback_(); }
+
+ private:
+  std::function<void()> callback_;
+};
+
+class BlockingCancelController final : public brpc::Controller {
+ public:
+  bool IsCanceled() const override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    checking_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [this] { return released_; });
+    return false;
+  }
+
+  bool wait_for_check() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(
+        lock, std::chrono::seconds(5), [this] { return checking_; });
+  }
+
+  void release_check() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  mutable std::condition_variable condition_;
+  mutable bool checking_ = false;
+  bool released_ = false;
+};
+
+TEST(StreamCallTest, StreamStartWaitsForInFlightDisconnectCheck) {
+  BlockingCancelController controller;
+  proto::CompletionRequest request;
+  request.set_stream(true);
+  proto::CompletionResponse response;
+  std::promise<void> done_called;
+  auto done_future = done_called.get_future();
+  CallbackClosure done([&done_called] { done_called.set_value(); });
+  TestableCompletionStreamCall call(&controller,
+                                    &done,
+                                    &request,
+                                    &response,
+                                    /*use_arena=*/true,
+                                    /*is_http_request=*/true);
+
+  bool disconnected = true;
+  std::thread checker([&] { disconnected = call.is_disconnected(); });
+  const bool checking = controller.wait_for_check();
+  if (!checking) {
+    controller.release_check();
+    checker.join();
+    FAIL() << "Disconnect check did not enter IsCanceled";
+  }
+  std::promise<void> starting;
+  auto starting_future = starting.get_future();
+  std::thread writer([&] {
+    starting.set_value();
+    // No SSE writes are needed here: a standalone Controller has no socket.
+    call.start_stream();
+  });
+  EXPECT_EQ(starting_future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_EQ(done_future.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::timeout);
+  controller.release_check();
+  checker.join();
+  writer.join();
+
+  EXPECT_FALSE(disconnected);
+  EXPECT_EQ(done_future.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_FALSE(call.is_disconnected());
+}
+
+TEST(StreamCallTest, DoneCanReleaseControllerAndReenterDisconnectCheck) {
+  std::unique_ptr<brpc::Controller> controller =
+      std::make_unique<brpc::Controller>();
+  proto::CompletionRequest request;
+  request.set_stream(true);
+  proto::CompletionResponse response;
+  TestableCompletionStreamCall* active_call = nullptr;
+  int32_t done_count = 0;
+  CallbackClosure done([&] {
+    controller.reset();
+    ++done_count;
+    EXPECT_FALSE(active_call->is_disconnected());
+  });
+  {
+    TestableCompletionStreamCall call(controller.get(),
+                                      &done,
+                                      &request,
+                                      &response,
+                                      /*use_arena=*/true,
+                                      /*is_http_request=*/true);
+    active_call = &call;
+    call.start_stream();
+    EXPECT_EQ(controller, nullptr);
+    EXPECT_FALSE(call.is_disconnected());
+    call.start_stream();
+  }
+  EXPECT_EQ(done_count, 1);
+}
+
 TEST(StreamCallTest, InvalidPayloadLengthRejectsBeforeOpeningSse) {
   brpc::Controller controller;
   controller.http_request().SetHeader("Infer-Content-Length", "not-a-number");
@@ -497,6 +623,31 @@ class StreamTestService final : public proto::XllmAPIService {
         Status::invalid_parameter("invalid value", "temperature");
     if (mode == "before") {
       call.finish_with_error(rejected);
+      return;
+    }
+    if (mode == "concurrent") {
+      std::atomic<bool> polling{true};
+      bool disconnected = false;
+      std::promise<void> checked;
+      auto checked_future = checked.get_future();
+      std::thread checker([&] {
+        disconnected = call.is_disconnected();
+        checked.set_value();
+        while (polling.load(std::memory_order_acquire)) {
+          disconnected = call.is_disconnected() || disconnected;
+        }
+      });
+      EXPECT_EQ(checked_future.wait_for(std::chrono::seconds(5)),
+                std::future_status::ready);
+      proto::CompletionResponse chunk;
+      chunk.set_id("concurrent-chunk");
+      for (int32_t index = 0; index < 128; ++index) {
+        EXPECT_TRUE(call.write(chunk));
+      }
+      EXPECT_TRUE(call.finish());
+      polling.store(false, std::memory_order_release);
+      checker.join();
+      EXPECT_FALSE(disconnected);
       return;
     }
     proto::CompletionResponse chunk;
@@ -572,6 +723,20 @@ TEST_F(StreamHttpTest, SuccessfulStreamStillEndsWithDone) {
   EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures);
   EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, "success"),
             terminal_successes + 1);
+}
+
+TEST_F(StreamHttpTest, DisconnectPollingCanOverlapStreamWrites) {
+  brpc::Controller controller;
+  controller.request_attachment().append("concurrent");
+  send(&controller);
+
+  EXPECT_FALSE(controller.Failed());
+  EXPECT_EQ(controller.http_response().status_code(), 200);
+  EXPECT_EQ(controller.http_response().content_type(),
+            "text/event-stream; charset=utf-8");
+  const std::string body = controller.response_attachment().to_string();
+  EXPECT_NE(body.find("\"concurrent-chunk\""), std::string::npos);
+  EXPECT_NE(body.find("data: [DONE]\n\n"), std::string::npos);
 }
 
 TEST_F(StreamHttpTest, ErrorPreservesResponseCommitState) {

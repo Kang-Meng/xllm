@@ -21,7 +21,10 @@ limitations under the License.
 #include <google/protobuf/message.h>
 #include <json2pb/pb_to_json.h>
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -63,10 +66,11 @@ class StreamCall : public Call {
   }
 
   ~StreamCall() override {
+    const bool connected = stream_connected();
     record_result(stream_started_
-                      ? connection_status_ == 0
+                      ? connected
                       : !controller_->Failed() && !controller_->IsCanceled(),
-                  connection_status_ != 0,
+                  !connected,
                   stream_started_);
     // A stream is opened only on the first successful event. A rejection before
     // that point is a regular HTTP JSON response and still needs its done Run.
@@ -133,10 +137,10 @@ class StreamCall : public Call {
       } else {
         io_buf_.append(api_service::openai_error_sse_event(error));
       }
-      connection_status_ |= pa_->Write(io_buf_);
+      publish();
     }
     stream_finished_ = stream_;
-    return connection_status_ == 0;
+    return stream_connected();
   }
 
   // Writes one SSE event ("data: {json}\n\n"). Stream chunks may use a
@@ -159,30 +163,29 @@ class StreamCall : public Call {
     io_buf_.append("\n\n");
 
     start_stream();
-    connection_status_ |= pa_->Write(io_buf_);
-    return connection_status_ == 0;
+    return publish();
   }
 
   // For stream response
   bool finish() {
     if (stream_finished_) {
-      return connection_status_ == 0;
+      return stream_connected();
     }
     start_stream();
     stream_finished_ = true;
     io_buf_.clear();
     io_buf_.append("data: [DONE]\n\n");
 
-    connection_status_ |= pa_->Write(io_buf_);
+    response_complete_ = publish();
     XLLM_VERBOSE_TRACE() << "event=stream_closed x-request-id="
                          << x_request_id_;
-    response_complete_ = connection_status_ == 0;
-    return connection_status_ == 0;
+    return response_complete_;
   }
 
   bool is_disconnected() const override {
     if (stream_) {
-      return connection_status_ != 0 ||
+      std::lock_guard<std::mutex> lock(stream_mutex_);
+      return !stream_connected() ||
              (!stream_started_ && controller_->IsCanceled());
     } else {
       if (controller_) {
@@ -197,17 +200,35 @@ class StreamCall : public Call {
   ::google::protobuf::Closure* done() { return done_; }
 
  protected:
+  bool stream_connected() const {
+    return connection_status_.load(std::memory_order_relaxed) == 0;
+  }
+
+  // Writes the staged io_buf_ to the progressive attachment and folds the
+  // result into the monotonic connection status. Callers must have opened the
+  // stream (pa_ is valid) via start_stream() first.
+  bool publish() {
+    connection_status_.fetch_or(pa_->Write(io_buf_), std::memory_order_relaxed);
+    return stream_connected();
+  }
+
   void start_stream() {
-    if (stream_started_) {
-      return;
+    {
+      std::lock_guard<std::mutex> lock(stream_mutex_);
+      if (stream_started_) {
+        return;
+      }
+      pa_ = controller_->CreateProgressiveAttachment();
+      controller_->http_response().set_content_type(
+          "text/event-stream; charset=utf-8");
+      controller_->http_response().set_status_code(200);
+      controller_->http_response().SetHeader("Connection", "keep-alive");
+      controller_->http_response().SetHeader("Cache-Control", "no-cache");
+      stream_started_ = true;
     }
-    pa_ = controller_->CreateProgressiveAttachment();
-    controller_->http_response().set_content_type(
-        "text/event-stream; charset=utf-8");
-    controller_->http_response().set_status_code(200);
-    controller_->http_response().SetHeader("Connection", "keep-alive");
-    controller_->http_response().SetHeader("Cache-Control", "no-cache");
-    stream_started_ = true;
+    // The lock drains in-flight IsCanceled calls before done releases the
+    // Controller. Later checks see stream_started_ and never access it. Run
+    // done outside the lock so callbacks may re-enter is_disconnected().
     done_->Run();
   }
 
@@ -217,6 +238,9 @@ class StreamCall : public Call {
   Response* response_ = nullptr;
 
   bool stream_ = false;
+  // Output state is owned by the response worker. Only stream_started_ and
+  // connection_status_ are also read by the scheduler's disconnect polling.
+  mutable std::mutex stream_mutex_;
   bool stream_started_ = false;
   bool stream_finished_ = false;
   bool use_arena_ = false;
@@ -225,7 +249,8 @@ class StreamCall : public Call {
 
   json2pb::Pb2JsonOptions json_options_;
 
-  int connection_status_ = 0;
+  // Monotonic write status; no other state is published through this atomic.
+  std::atomic<int32_t> connection_status_{0};
 };
 
 // Anthropic SSE stream call with custom event formatting
@@ -278,8 +303,7 @@ class AnthropicCall : public StreamCall<proto::AnthropicMessagesRequest,
     this->io_buf_.append("\n\n");
 
     this->start_stream();
-    this->connection_status_ |= this->pa_->Write(this->io_buf_);
-    return this->connection_status_ == 0;
+    return this->publish();
   }
 
   // Write SSE event with proto message
@@ -303,8 +327,7 @@ class AnthropicCall : public StreamCall<proto::AnthropicMessagesRequest,
     this->io_buf_.append(json);
     this->io_buf_.append("\n\n");
     this->start_stream();
-    this->connection_status_ |= this->pa_->Write(this->io_buf_);
-    return this->connection_status_ == 0;
+    return this->publish();
   }
 };
 
