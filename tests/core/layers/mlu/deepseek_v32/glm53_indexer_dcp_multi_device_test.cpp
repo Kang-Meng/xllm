@@ -15,22 +15,13 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 #include <torch/torch.h>
-#include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
-#include <chrono>
 #include <cmath>
-#include <csignal>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -38,7 +29,6 @@ limitations under the License.
 #include <optional>
 #include <random>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -50,8 +40,8 @@ limitations under the License.
 #include "core/kernels/mlu/dcp/dcp_precision_test_utils.h"
 #include "core/layers/mlu/deepseek_v32/dcp_decode_context.h"
 #include "core/layers/mlu/deepseek_v32/deepseek_v32_indexer.h"
+#include "core/layers/mlu/deepseek_v32/multi_device_test_utils.h"
 #include "core/platform/device.h"
-#include "core/platform/platform.h"
 
 namespace xllm::layer {
 namespace {
@@ -68,7 +58,6 @@ constexpr int32_t kHidden = 6144;
 constexpr int32_t kLora = 2048;
 constexpr int32_t kQueryTile = 32;
 constexpr int32_t kKeyTile = 2048;
-constexpr int32_t kSkip = 77;
 constexpr float kScale = 1.0f / 64.0f;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
@@ -1118,117 +1107,10 @@ void run_rank(int32_t rank, int32_t port, int32_t batch, int32_t history) {
   }
 }
 
-// The production communicator uses a contiguous TCPStore port window. Probe it
-// below Linux's ephemeral range, away from the host's reserved 30000..32767.
-int32_t group_port() {
-  for (int32_t attempt = 0; attempt < 100; ++attempt) {
-    const int32_t base = 10000 + (getpid() + attempt * 64) % 15000;
-    std::vector<int32_t> sockets;
-    sockets.reserve(/*new_cap=*/64);
-    bool available = true;
-    for (int32_t offset = 0; offset < 64; ++offset) {
-      const int32_t fd = socket(AF_INET, SOCK_STREAM, /*protocol=*/0);
-      PCHECK(fd >= 0);
-      sockets.emplace_back(fd);
-      sockaddr_in addr{};
-      addr.sin_family = AF_INET;
-      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-      addr.sin_port = htons(static_cast<uint16_t>(base + offset));
-      if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        available = false;
-        break;
-      }
-    }
-    for (int32_t fd : sockets) {
-      PCHECK(close(fd) == 0);
-    }
-    if (available) {
-      return base;
-    }
-  }
-  LOG(FATAL) << "Cannot reserve communicator port window";
-  return -1;
-}
-
-void stop_ranks(const std::vector<pid_t>& pids, const std::vector<bool>& done) {
-  for (size_t i = 0; i < pids.size(); ++i) {
-    if (!done[i]) {
-      kill(pids[i], SIGKILL);
-    }
-  }
-  for (size_t i = 0; i < pids.size(); ++i) {
-    if (done[i]) {
-      continue;
-    }
-    int status = 0;
-    while (waitpid(pids[i], &status, /*options=*/0) < 0 && errno == EINTR) {
-    }
-  }
-}
-
 void run_distributed(int32_t batch, int32_t history) {
-  const int32_t port = group_port();
-  std::vector<pid_t> pids;
-  pids.reserve(kRanks);
-  for (int32_t rank = 0; rank < kRanks; ++rank) {
-    const pid_t pid = fork();
-    if (pid == 0) {
-      try {
-        if (Platform::device_count() < kRanks) {
-          _exit(kSkip);
-        }
-        run_rank(rank, port, batch, history);
-        const bool failed = ::testing::UnitTest::GetInstance()
-                                ->current_test_info()
-                                ->result()
-                                ->Failed();
-        std::fflush(nullptr);
-        _exit(failed ? 1 : 0);
-      } catch (const std::exception& error) {
-        LOG(ERROR) << "rank=" << rank << " exception=" << error.what();
-        _exit(/*status=*/1);
-      }
-    }
-    if (pid < 0) {
-      stop_ranks(pids, std::vector<bool>(pids.size(), /*value=*/false));
-      FAIL() << "fork failed errno=" << errno;
-    }
-    pids.emplace_back(pid);
-  }
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::minutes(/*count=*/30);
-  std::vector<bool> done(kRanks, /*value=*/false);
-  int32_t remaining = kRanks;
-  int32_t skipped = 0;
-  while (remaining > 0 && std::chrono::steady_clock::now() < deadline) {
-    for (int32_t rank = 0; rank < kRanks; ++rank) {
-      if (done[rank]) {
-        continue;
-      }
-      int status = 0;
-      const pid_t result = waitpid(pids[rank], &status, WNOHANG);
-      if (result == 0 || (result < 0 && errno == EINTR)) {
-        continue;
-      }
-      done[rank] = result > 0;
-      if (result < 0 || !WIFEXITED(status) ||
-          (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != kSkip)) {
-        stop_ranks(pids, done);
-        FAIL() << "rank=" << rank << " status=" << status;
-      }
-      --remaining;
-      skipped += WEXITSTATUS(status) == kSkip;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(/*count=*/10));
-  }
-  if (remaining > 0) {
-    stop_ranks(pids, done);
-    FAIL() << "Eight-rank indexer test timed out after 30 minutes";
-  }
-  if (skipped == kRanks) {
-    GTEST_SKIP() << "Requires eight visible MLU devices";
-  }
-  ASSERT_EQ(skipped, 0) << "Inconsistent device visibility";
+  test::run_multi_device(kRanks, [batch, history](int32_t rank, int32_t port) {
+    run_rank(rank, port, batch, history);
+  });
 }
 
 TEST(Glm53IndexerDcpMultiDeviceTest, ChunkedBatch1) {

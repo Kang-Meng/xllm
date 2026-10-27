@@ -15,22 +15,12 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 #include <torch/torch.h>
-#include <unistd.h>
 
 #include <bit>
-#include <cerrno>
-#include <chrono>
-#include <csignal>
 #include <cstdint>
-#include <cstdio>
-#include <exception>
 #include <limits>
 #include <string>
-#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -39,8 +29,8 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/parallel_state/collective_communicator.h"
 #include "core/kernels/mlu/dcp/dcp_merge_test_utils.h"
+#include "core/layers/mlu/deepseek_v32/multi_device_test_utils.h"
 #include "core/platform/device.h"
-#include "core/platform/platform.h"
 #include "kernels/mlu/mlu_ops_api.h"
 
 namespace xllm {
@@ -53,7 +43,6 @@ constexpr int32_t kStripe = kDcp * kPage;
 constexpr int32_t kTopk = 2048;
 constexpr int32_t kQueries = 8192;
 constexpr int32_t kEdgeRows = 16;
-constexpr int32_t kSkip = 77;
 constexpr int32_t kSentinel = 123456789;
 using TopkResult = std::pair<torch::Tensor, torch::Tensor>;
 
@@ -358,118 +347,12 @@ void run_rank(int32_t rank,
   }
 }
 
-// The production communicator uses a contiguous TCPStore port window. Probe it
-// below Linux's ephemeral range, away from the host's reserved 30000..32767.
-int32_t group_port() {
-  for (int32_t attempt = 0; attempt < 100; ++attempt) {
-    const int32_t base = 10000 + (getpid() + attempt * 64) % 15000;
-    std::vector<int32_t> sockets;
-    sockets.reserve(/*new_cap=*/64);
-    bool available = true;
-    for (int32_t offset = 0; offset < 64; ++offset) {
-      const int32_t fd = socket(AF_INET, SOCK_STREAM, /*protocol=*/0);
-      PCHECK(fd >= 0);
-      sockets.emplace_back(fd);
-      sockaddr_in addr{};
-      addr.sin_family = AF_INET;
-      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-      addr.sin_port = htons(static_cast<uint16_t>(base + offset));
-      if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        available = false;
-        break;
-      }
-    }
-    for (int32_t fd : sockets) {
-      PCHECK(close(fd) == 0);
-    }
-    if (available) {
-      return base;
-    }
-  }
-  LOG(FATAL) << "Cannot reserve communicator port window";
-  return -1;
-}
-
-void stop_ranks(const std::vector<pid_t>& pids, const std::vector<bool>& done) {
-  for (size_t i = 0; i < pids.size(); ++i) {
-    if (!done[i]) {
-      kill(pids[i], SIGKILL);
-    }
-  }
-  for (size_t i = 0; i < pids.size(); ++i) {
-    if (done[i]) {
-      continue;
-    }
-    int status = 0;
-    while (waitpid(pids[i], &status, /*options=*/0) < 0 && errno == EINTR) {
-    }
-  }
-}
-
 void run_distributed(Deployment deployment,
                      const std::vector<MergeCase>& cases) {
-  const int32_t port = group_port();
-  std::vector<pid_t> pids;
-  pids.reserve(kRanks);
-  for (int32_t rank = 0; rank < kRanks; ++rank) {
-    const pid_t pid = fork();
-    if (pid == 0) {
-      try {
-        if (Platform::device_count() < kRanks) {
-          _exit(kSkip);
-        }
-        run_rank(rank, port, deployment, cases);
-        const bool failed = ::testing::UnitTest::GetInstance()
-                                ->current_test_info()
-                                ->result()
-                                ->Failed();
-        std::fflush(nullptr);
-        _exit(failed ? 1 : 0);
-      } catch (const std::exception& error) {
-        LOG(ERROR) << "rank=" << rank << " exception=" << error.what();
-        _exit(/*status=*/1);
-      }
-    }
-    if (pid < 0) {
-      stop_ranks(pids, std::vector<bool>(pids.size(), /*value=*/false));
-      FAIL() << "fork failed errno=" << errno;
-    }
-    pids.emplace_back(pid);
-  }
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::minutes(/*count=*/30);
-  std::vector<bool> done(kRanks, /*value=*/false);
-  int32_t remaining = kRanks;
-  int32_t skipped = 0;
-  while (remaining > 0 && std::chrono::steady_clock::now() < deadline) {
-    for (int32_t rank = 0; rank < kRanks; ++rank) {
-      if (done[rank]) {
-        continue;
-      }
-      int status = 0;
-      const pid_t result = waitpid(pids[rank], &status, WNOHANG);
-      if (result == 0 || (result < 0 && errno == EINTR)) {
-        continue;
-      }
-      done[rank] = result > 0;
-      if (result < 0 || !WIFEXITED(status) ||
-          (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != kSkip)) {
-        stop_ranks(pids, done);
-        FAIL() << "rank=" << rank << " status=" << status;
-      }
-      --remaining;
-      skipped += WEXITSTATUS(status) == kSkip;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(/*count=*/10));
-  }
-  if (remaining > 0) {
-    stop_ranks(pids, done);
-    FAIL() << "Eight-rank merge test timed out after 30 minutes";
-  }
-  if (skipped == kRanks) {
-    GTEST_SKIP() << "Requires eight visible MLU devices";
-  }
-  ASSERT_EQ(skipped, 0) << "Inconsistent device visibility";
+  test::run_multi_device(kRanks,
+                         [deployment, &cases](int32_t rank, int32_t port) {
+                           run_rank(rank, port, deployment, cases);
+                         });
 }
 
 TEST(Glm53DcpMergeTopkMultiDeviceTest, Bf16CandidatesQ8192) {
