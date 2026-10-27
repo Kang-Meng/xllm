@@ -34,18 +34,21 @@ using kernel::mlu::dcp_merge_topk;
 constexpr int64_t kDcp = 4;
 constexpr int64_t kTopk = 2048;
 
-Candidates make_input(int32_t rows, bool edges = false) {
+Candidates make_input(int32_t rows,
+                      bool edges = false,
+                      int32_t dcp = static_cast<int32_t>(kDcp)) {
   std::vector<torch::Tensor> scores;
   std::vector<torch::Tensor> slots;
-  scores.reserve(kDcp);
-  slots.reserve(kDcp);
+  scores.reserve(dcp);
+  slots.reserve(dcp);
   torch::Tensor mapping;
-  for (int32_t shard = 0; shard < kDcp; ++shard) {
+  for (int32_t shard = 0; shard < dcp; ++shard) {
     auto input = dcp_test::make_candidates(rows,
                                            shard,
                                            /*tp_rank=*/0,
                                            /*seed=*/42,
-                                           edges);
+                                           edges,
+                                           dcp);
     scores.emplace_back(std::move(input.scores));
     slots.emplace_back(std::move(input.slots));
     mapping = std::move(input.mapping);
@@ -91,19 +94,20 @@ void check_input(Candidates input, bool compose = false) {
   if (!compose) {
     return;
   }
+  const int32_t dcp = static_cast<int32_t>(input.scores.size(0));
   GuardedTopk local(rows, kTopk, input.scores.device());
-  for (int32_t rank = 0; rank < kDcp; ++rank) {
+  for (int32_t rank = 0; rank < dcp; ++rank) {
     kernel::mlu::dcp_localize_topk(out.output,
                                    out.lengths,
                                    rank,
-                                   /*size=*/kDcp,
+                                   /*size=*/dcp,
                                    /*interleave=*/16,
                                    local.output,
                                    local.lengths);
     local.check(local_reference(reference.first.cpu(),
                                 reference.second.cpu(),
                                 rank,
-                                /*size=*/kDcp,
+                                /*size=*/dcp,
                                 /*interleave=*/16));
   }
 }
@@ -212,13 +216,23 @@ TEST(DcpMergeTopkDeathTest, RejectsUnsupportedContractsAndAliasing) {
                               out.output,
                               out.lengths),
                "scalar_type");
-  EXPECT_DEATH(dcp_merge_topk(input.scores.slice(0, 0, 2),
-                              input.slots.slice(0, 0, 2),
-                              input.mapping,
+  for (const int64_t shards : {1, 3}) {
+    EXPECT_DEATH(dcp_merge_topk(input.scores.slice(0, 0, shards),
+                                input.slots.slice(0, 0, shards),
+                                input.mapping,
+                                kTopk,
+                                out.output,
+                                out.lengths),
+                 "power-of-two shard counts");
+  }
+  auto twelve = make_input(/*rows=*/2, /*edges=*/false, /*dcp=*/12);
+  EXPECT_DEATH(dcp_merge_topk(twelve.scores,
+                              twelve.slots,
+                              twelve.mapping,
                               kTopk,
                               out.output,
                               out.lengths),
-               "scores.size");
+               "power-of-two shard counts");
   EXPECT_DEATH(dcp_merge_topk(input.scores.slice(2, 0, 1024),
                               input.slots.slice(2, 0, 1024),
                               input.mapping,
@@ -332,6 +346,127 @@ TEST_F(DcpMergeTopkTest, PreservesNarrowAndWidePriorityRanges) {
                  torch::zeros({1}, torch::kInt32).to(device)});
   }
 }
+
+// Two shards run natively; eight and sixteen reduce groups of four shards
+// before the final native merge.
+class DcpMergeTopkShardTest : public DcpMergeTopkTest,
+                              public ::testing::WithParamInterface<int32_t> {};
+
+TEST_P(DcpMergeTopkShardTest, QueryBoundariesMatchReference) {
+  for (int32_t rows : {0, 1, 7, 9, 33, 129, 257}) {
+    SCOPED_TRACE(rows);
+    check_input(make_input(rows, /*edges=*/false, GetParam()));
+  }
+}
+
+TEST_P(DcpMergeTopkShardTest, ExactTiesSpecialValuesAndInvalidCandidates) {
+  check_input(make_input(/*rows=*/16, /*edges=*/true, GetParam()),
+              /*compose=*/true);
+}
+
+TEST_P(DcpMergeTopkShardTest, StridesOffsetsAndTransposedInputs) {
+  for (int32_t rows : {1, 16, 65}) {
+    auto input = make_input(rows, /*edges=*/rows == 16, GetParam());
+    input.scores = dcp_test::strided_copy(input.scores);
+    input.slots = dcp_test::strided_copy(input.slots);
+    input.mapping = dcp_test::strided_copy(input.mapping);
+    check_input(std::move(input));
+  }
+  auto input = make_input(/*rows=*/33, /*edges=*/false, GetParam());
+  input.scores = input.scores.transpose(0, 1).contiguous().transpose(0, 1);
+  input.slots = input.slots.transpose(1, 2).contiguous().transpose(1, 2);
+  check_input(std::move(input));
+}
+
+TEST_P(DcpMergeTopkShardTest, RawBf16BitsAndDuplicateSlots) {
+  auto input = make_input(/*rows=*/65, /*edges=*/false, GetParam());
+  torch::manual_seed(/*seed=*/2026);
+  auto bits =
+      torch::randint(-32768, 32768, input.scores.sizes(), torch::kInt16);
+  input.scores.copy_(bits.view(torch::kBFloat16));
+  input.slots.copy_(input.slots.abs().remainder(17));
+  input.mapping.fill_(0);
+  check_input(std::move(input));
+}
+
+TEST_P(DcpMergeTopkShardTest, TiesUsePhysicalSlotsAcrossShards) {
+  const int64_t dcp = GetParam();
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const auto options = torch::TensorOptions().device(device);
+  auto scores = torch::ones({dcp, 1, kTopk}, options.dtype(torch::kBFloat16));
+  torch::manual_seed(42);
+  auto slots = (torch::randperm(dcp * kTopk, torch::kInt32) + (1 << 30))
+                   .reshape({dcp, 1, kTopk})
+                   .to(device);
+  auto mapping = torch::zeros({1}, options.dtype(torch::kInt32));
+  auto output = torch::empty({1, kTopk}, slots.options());
+  auto lengths = torch::empty({1}, slots.options());
+  auto expected =
+      (torch::arange(kTopk, torch::kInt32) + (1 << 30)).unsqueeze(0);
+  for (int32_t repeat = 0; repeat < 2; ++repeat) {
+    dcp_merge_topk(scores, slots, mapping, kTopk, output, lengths);
+    EXPECT_TRUE(torch::equal(output.cpu(), expected));
+    EXPECT_EQ(lengths[0].item<int32_t>(), kTopk);
+    slots = slots.flip({0, 2});
+  }
+}
+
+TEST_P(DcpMergeTopkShardTest, ConstantScoresAndSparseValidSlots) {
+  const int64_t dcp = GetParam();
+  const torch::Device device(torch::kPrivateUse1, 0);
+  auto scores = torch::full({dcp, 5, kTopk},
+                            -std::numeric_limits<float>::infinity(),
+                            torch::kBFloat16);
+  auto slots = torch::arange(dcp * kTopk, torch::kInt32)
+                   .reshape({dcp, 1, kTopk})
+                   .repeat({1, 5, 1});
+  slots.select(1, 1).fill_(-1);
+  slots.select(1, 2).fill_(-1);
+  slots[dcp - 1][2][0] = std::numeric_limits<int32_t>::max();
+  scores.select(1, 3).fill_(std::numeric_limits<float>::quiet_NaN());
+  slots.select(1, 4).fill_(17);
+  check_input({scores.to(device),
+               slots.to(device),
+               torch::zeros({5}, torch::kInt32).to(device)});
+}
+
+TEST_P(DcpMergeTopkShardTest, NonDefaultStreamAndGraphReplay) {
+  auto input = make_input(/*rows=*/16, /*edges=*/true, GetParam());
+  GuardedTopk out(/*q=*/16, kTopk, input.scores.device());
+  auto run = [&] {
+    dcp_merge_topk(input.scores,
+                   input.slots,
+                   input.mapping,
+                   kTopk,
+                   out.output,
+                   out.lengths);
+  };
+  run();
+  torch_mlu::synchronize();
+  torch_mlu::MLUGraph graph;
+  {
+    torch_mlu::mlu::MLUStreamGuard guard(
+        torch_mlu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0));
+    run();
+    graph.capture_begin();
+    run();
+    graph.capture_end();
+  }
+  torch_mlu::synchronize();
+  for (int32_t round = 0; round < 3; ++round) {
+    input.mapping.copy_(input.mapping.flip({0}));
+    input.scores.copy_(input.scores.flip({2}));
+    const auto expected = dcp_test::merge_reference(
+        input.scores, input.slots, input.mapping, kTopk);
+    graph.replay();
+    torch_mlu::synchronize();
+    out.check({expected.first.cpu(), expected.second.cpu()});
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(SupportedShardCounts,
+                         DcpMergeTopkShardTest,
+                         ::testing::Values(2, 8, 16));
 
 }  // namespace
 }  // namespace xllm

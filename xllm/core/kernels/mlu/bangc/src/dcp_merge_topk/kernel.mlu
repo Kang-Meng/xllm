@@ -20,8 +20,9 @@ limitations under the License.
 
 namespace xllm::kernel::mlu::bangc {
 namespace {
-constexpr int32_t kCandidates = 8192;
 constexpr int32_t kTopk = 2048;
+template <int32_t Shards>
+constexpr int32_t kCandidates = Shards * kTopk;
 constexpr int32_t kInvalidRank = 0xffc0;
 
 constexpr int32_t kSlotBits = 31;
@@ -44,11 +45,12 @@ __mlu_func__ void flip_bit_mask(int32_t* mask, int32_t n, int32_t bit) {
   __bang_bxor_scalar(mask, mask, 1 << bit, n);
 }
 
-constexpr int32_t kRowStageBytes = 2 * kCandidates * sizeof(int32_t);
+template <int32_t Shards>
+constexpr int32_t kRowStageBytes = 2 * kCandidates<Shards> * sizeof(int32_t);
 
-// All four shard segments of a query can be issued as one external DMA.
+// All shard segments of a query can be issued as one external DMA.
 // A padded on-chip pitch retains the logical last-dimension stride for packing.
-template <typename T>
+template <int32_t Shards, typename T>
 __mlu_func__ void load_candidate_row(T* dst,
                                      const T* src,
                                      int64_t shard_stride,
@@ -67,13 +69,19 @@ __mlu_func__ void load_candidate_row(T* dst,
              GDRAM2NRAM,
              kTopk * kBytes,
              shard_stride * kBytes,
-             3);
+             Shards - 1);
     return;
   }
-  if (pitch <= kRowStageBytes / 4 && shard_dma_fits) {
-    __memcpy(row_stage, src, span, GDRAM2NRAM, pitch, shard_stride * kBytes, 3);
+  if (pitch <= kRowStageBytes<Shards> / Shards && shard_dma_fits) {
+    __memcpy(row_stage,
+             src,
+             span,
+             GDRAM2NRAM,
+             pitch,
+             shard_stride * kBytes,
+             Shards - 1);
     if (col_stride == 2) {
-      for (int32_t d = 0; d < 4; ++d) {
+      for (int32_t d = 0; d < Shards; ++d) {
         T* block = reinterpret_cast<T*>(reinterpret_cast<char*>(row_stage) +
                                         d * pitch);
         __bang_write_value(block + 2 * kTopk - 1, 1, static_cast<T>(0));
@@ -86,16 +94,16 @@ __mlu_func__ void load_candidate_row(T* dst,
                NRAM2NRAM,
                kBytes,
                col_stride * kBytes,
-               kCandidates - 1);
+               kCandidates<Shards> - 1);
     }
     return;
   }
   // Very large source shard strides or per-row spans keep a generic path.
-  for (int32_t d = 0; d < 4; ++d) {
+  for (int32_t d = 0; d < Shards; ++d) {
     const T* source = src + d * shard_stride;
     if (col_stride == 1) {
       __memcpy(dst + d * kTopk, source, kTopk * kBytes, GDRAM2NRAM);
-    } else if (span <= kCandidates * sizeof(int32_t)) {
+    } else if (span <= kCandidates<Shards> * sizeof(int32_t)) {
       __memcpy(small_stage, source, span, GDRAM2NRAM);
       if (col_stride == 2) {
         T* block = reinterpret_cast<T*>(small_stage);
@@ -127,6 +135,7 @@ __mlu_func__ void load_candidate_row(T* dst,
 // Valid r <= 0xff80 < kInvalidRank, so min(max(r, invalid * kInvalidRank),
 // kInvalidRank) selects the canonical invalid rank. Higher priorities win;
 // the low word reverses the full nonnegative int32 physical slot range.
+template <int32_t Shards>
 __mlu_func__ void prepare_keys(int32_t* keys,
                                int32_t* slots,
                                int32_t* invalid,
@@ -136,7 +145,7 @@ __mlu_func__ void prepare_keys(int32_t* keys,
   __asm__ volatile(
       "fuse.nram.s32.u16 [%[dst]], %[n], [%[src]], .and(%[sign]), "
       ".eq(%[zero]), .mul(%[flip]), .xor([%[src]]);\n\t" ::[dst] "r"(rank),
-      [n] "r"(kCandidates),
+      [n] "r"(kCandidates<Shards>),
       [src] "r"(raw),
       [sign] "r"(0x8000),
       [zero] "r"(0),
@@ -145,7 +154,7 @@ __mlu_func__ void prepare_keys(int32_t* keys,
   __asm__ volatile(
       "fuse.nram.s32.u16 [%[dst]], %[n], [%[src]], .and(%[abs]), "
       ".lt(%[limit]), .eq(%[zero]);\n\t" ::[dst] "r"(invalid),
-      [n] "r"(kCandidates),
+      [n] "r"(kCandidates<Shards>),
       [src] "r"(raw),
       [abs] "r"(0x7fff),
       [limit] "r"(0x7f81),
@@ -154,7 +163,7 @@ __mlu_func__ void prepare_keys(int32_t* keys,
   __asm__ volatile(
       "fuse.nram.s32 [%[dst]], %[n], [%[src]], .lt(%[zero]), "
       ".or([%[nan]]), .mul(%[bad]);\n\t" ::[dst] "r"(invalid),
-      [n] "r"(kCandidates),
+      [n] "r"(kCandidates<Shards>),
       [src] "r"(values),
       [zero] "r"(0),
       [nan] "r"(invalid),
@@ -163,7 +172,7 @@ __mlu_func__ void prepare_keys(int32_t* keys,
   __asm__ volatile(
       "fuse.nram.s32 [%[dst]], %[n], [%[src]], .max([%[rank]]), "
       ".min(%[bad]), .mul(%[neg]), .add(%[bad]);\n\t" ::[dst] "r"(keys),
-      [n] "r"(kCandidates),
+      [n] "r"(kCandidates<Shards>),
       [src] "r"(invalid),
       [rank] "r"(rank),
       [bad] "r"(kInvalidRank),
@@ -172,7 +181,7 @@ __mlu_func__ void prepare_keys(int32_t* keys,
   __asm__ volatile(
       "fuse.nram.s32 [%[dst]], %[n], [%[src]], .max(%[zero]), "
       ".mul(%[neg]), .add(%[max]);\n\t" ::[dst] "r"(slots),
-      [n] "r"(kCandidates),
+      [n] "r"(kCandidates<Shards>),
       [src] "r"(values),
       [zero] "r"(0),
       [neg] "r"(-1),
@@ -181,6 +190,7 @@ __mlu_func__ void prepare_keys(int32_t* keys,
 }
 
 // Both shard-coalesced input DMAs are asynchronous; consumers __sync_io().
+template <int32_t Shards>
 __mlu_func__ void load_dense_row(int16_t* raw,
                                  int32_t* values,
                                  const int16_t* scores,
@@ -196,14 +206,14 @@ __mlu_func__ void load_dense_row(int16_t* raw,
                  GDRAM2NRAM,
                  kTopk * sizeof(int16_t),
                  sd * sizeof(int16_t),
-                 3);
+                 Shards - 1);
   __memcpy_async(values,
                  slots + q * vq,
                  kTopk * sizeof(int32_t),
                  GDRAM2NRAM,
                  kTopk * sizeof(int32_t),
                  vd * sizeof(int32_t),
-                 3);
+                 Shards - 1);
 }
 
 __mlu_func__ void swap_words(int32_t*& hi,
@@ -228,6 +238,7 @@ __mlu_func__ int32_t bit_width(uint32_t value) {
 }
 
 // Every input is valid. Constant prefixes are absent from the packed key.
+template <int32_t Shards>
 __mlu_func__ int32_t* select_words(int32_t* keys_a,
                                    int32_t* keys_b,
                                    int32_t* mask,
@@ -236,7 +247,7 @@ __mlu_func__ int32_t* select_words(int32_t* keys_a,
                                    int32_t highest_bit) {
   int32_t* src = keys_a;
   int32_t* dst = keys_b;
-  int32_t n = kCandidates;
+  int32_t n = kCandidates<Shards>;
   int32_t accepted = 0;
   int32_t quota = kTopk;
   int32_t highest_sort_bit = highest_bit;
@@ -309,6 +320,7 @@ __mlu_func__ int32_t* select_words(int32_t* keys_a,
 
 // MSD selection refines the boundary of the exact (score, physical slot)
 // priority. Only the selected TopK pairs enter the final stable LSD sort.
+template <int32_t Shards>
 __mlu_func__ int32_t select_pairs(int32_t* hi_a,
                                   int32_t* hi_b,
                                   int32_t* lo_a,
@@ -318,12 +330,15 @@ __mlu_func__ int32_t select_pairs(int32_t* hi_a,
                                   int32_t* selected_hi,
                                   int32_t* selected_lo,
                                   int32_t** sorted_lo) {
+  constexpr int32_t kCount = kCandidates<Shards>;
+  static_assert((kCount & (kCount - 1)) == 0,
+                "Halving reductions require a power-of-two candidate count");
   // Inactive destination buffers hold reductions until partitioning starts.
-  __bang_bor(mask, hi_a, hi_a + kCandidates / 2, kCandidates / 2);
-  __bang_band(reduction, hi_a, hi_a + kCandidates / 2, kCandidates / 2);
-  __bang_bor(hi_b, lo_a, lo_a + kCandidates / 2, kCandidates / 2);
-  __bang_band(lo_b, lo_a, lo_a + kCandidates / 2, kCandidates / 2);
-  for (int32_t span = kCandidates / 4; span > 0; span /= 2) {
+  __bang_bor(mask, hi_a, hi_a + kCount / 2, kCount / 2);
+  __bang_band(reduction, hi_a, hi_a + kCount / 2, kCount / 2);
+  __bang_bor(hi_b, lo_a, lo_a + kCount / 2, kCount / 2);
+  __bang_band(lo_b, lo_a, lo_a + kCount / 2, kCount / 2);
+  for (int32_t span = kCount / 4; span > 0; span /= 2) {
     __bang_bor(mask, mask, mask + span, span);
     __bang_band(reduction, reduction, reduction + span, span);
     __bang_bor(hi_b, hi_b, hi_b + span, span);
@@ -340,19 +355,19 @@ __mlu_func__ int32_t select_pairs(int32_t* hi_a,
     const int32_t hi_mask = static_cast<int32_t>((uint32_t{1} << hi_bits) - 1);
     const int32_t lo_mask = static_cast<int32_t>((uint32_t{1} << lo_bits) - 1);
     if (hi_bits == 0) {
-      __bang_band_scalar(hi_a, lo_a, lo_mask, kCandidates);
+      __bang_band_scalar(hi_a, lo_a, lo_mask, kCount);
     } else {
-      __bang_band_scalar(hi_a, hi_a, hi_mask, kCandidates);
-      __bang_mul_scalar(hi_a, hi_a, 1 << lo_bits, kCandidates);
-      __bang_band_scalar(lo_a, lo_a, lo_mask, kCandidates);
-      __bang_bor(hi_a, hi_a, lo_a, kCandidates);
+      __bang_band_scalar(hi_a, hi_a, hi_mask, kCount);
+      __bang_mul_scalar(hi_a, hi_a, 1 << lo_bits, kCount);
+      __bang_band_scalar(lo_a, lo_a, lo_mask, kCount);
+      __bang_bor(hi_a, hi_a, lo_a, kCount);
     }
-    int32_t* packed = select_words(hi_a,
-                                   hi_b,
-                                   mask,
-                                   selected_hi,
-                                   (varying_hi << lo_bits) | varying_lo,
-                                   hi_bits + lo_bits - 1);
+    int32_t* packed = select_words<Shards>(hi_a,
+                                           hi_b,
+                                           mask,
+                                           selected_hi,
+                                           (varying_hi << lo_bits) | varying_lo,
+                                           hi_bits + lo_bits - 1);
     __bang_band_scalar(packed, packed, lo_mask, kTopk);
     __bang_bor_scalar(packed, packed, common_lo & ~lo_mask, kTopk);
     *sorted_lo = packed;
@@ -362,7 +377,7 @@ __mlu_func__ int32_t select_pairs(int32_t* hi_a,
   int32_t* dst_hi = hi_b;
   int32_t* src_lo = lo_a;
   int32_t* dst_lo = lo_b;
-  int32_t n = kCandidates;
+  int32_t n = kCount;
   int32_t accepted = 0;
   int32_t quota = kTopk;
   int32_t highest_sort_bit = kPriorityBits - 1;
@@ -492,6 +507,7 @@ __mlu_func__ void store_length(int32_t* lengths,
 // Integer promotion retains every BF16 bit, including signed zero/subnormals.
 // Physical slot ordering makes equal-score selection independent of the
 // all-gather rank order and local candidate order.
+template <int32_t Shards>
 __mlu_global__ void merge_rows(const int16_t* scores,
                                const int32_t* slots,
                                const int32_t* mapping,
@@ -509,20 +525,22 @@ __mlu_global__ void merge_rows(const int16_t* scores,
   if (__is_mpu()) {
     return;
   }
-  __nram__ int16_t raw[kCandidates + kTopk];
-  __nram__ int32_t values[kCandidates + kTopk];
-  __nram__ int16_t raw_next[kCandidates];
-  __nram__ int32_t values_next[kCandidates];
-  __nram__ int32_t keys_a[kCandidates];
-  __nram__ int32_t keys_b[kCandidates];
-  __nram__ int32_t mask[kCandidates];
-  __nram__ int32_t scratch[kCandidates];
+  constexpr int32_t kCount = kCandidates<Shards>;
+  __nram__ int16_t raw[kCount + kTopk];
+  __nram__ int32_t values[kCount + kTopk];
+  __nram__ int16_t raw_next[kCount];
+  __nram__ int32_t values_next[kCount];
+  __nram__ int32_t keys_a[kCount];
+  __nram__ int32_t keys_b[kCount];
+  __nram__ int32_t mask[kCount];
+  __nram__ int32_t scratch[kCount];
   __nram__ int32_t selected_hi[kTopk];
   __nram__ int32_t selected_lo[kTopk];
   __nram__ int32_t staged_output[2][kTopk];
-  __nram__ int32_t row_stage[2 * kCandidates];
+  __nram__ int32_t row_stage[2 * kCount];
   __nram__ int32_t exchanged[16];
-  // 332 KiB plus the compiler's extra buffer; below 512 KiB/IPU.
+  // Four shards use 332 KiB plus the compiler's extra buffer; below 512
+  // KiB/IPU. Two shards use about half of the candidate-sized buffers.
   // Dense rows are double buffered: row q+taskDim is prefetched on IO while
   // row q computes, and the output store of row q overlaps row
   // q+taskDim. Other strides keep synchronous staging into raw/values.
@@ -535,7 +553,7 @@ __mlu_global__ void merge_rows(const int16_t* scores,
   if (dense && taskId < rows) {
     // Issued before the scalar mapping read so both latencies overlap; a
     // padding row simply leaves its loaded inputs unused.
-    load_dense_row(raw, values, scores, slots, taskId, sq, sd, vq, vd);
+    load_dense_row<Shards>(raw, values, scores, slots, taskId, sq, sd, vq, vd);
   }
   bool row_valid = taskId < rows && mapping[taskId * ms] >= 0;
   for (int64_t q = taskId; q < rows; q += taskDim, buffer ^= 1) {
@@ -553,16 +571,18 @@ __mlu_global__ void merge_rows(const int16_t* scores,
         // Native bitindex filtering selects every even source element.
         // Buffers raw/values reserve the full filter input capacity.
         __bang_write_value(
-            reinterpret_cast<uint32_t*>(mask), kCandidates / 16, 0x55555555u);
+            reinterpret_cast<uint32_t*>(mask), kCount / 16, 0x55555555u);
       }
-      load_candidate_row(raw, scores + q * sq, sd, sc, row_stage, keys_b, mask);
-      load_candidate_row(
+      load_candidate_row<Shards>(
+          raw, scores + q * sq, sd, sc, row_stage, keys_b, mask);
+      load_candidate_row<Shards>(
           values, slots + q * vq, vd, vc, row_stage, keys_b, mask);
       // Stride-dependent staging may produce data on IO, Move or Compute.
       __sync();
     }
     if (row_valid) {
-      prepare_keys(keys_a, row_stage, mask, keys_b, row_raw, row_values);
+      prepare_keys<Shards>(
+          keys_a, row_stage, mask, keys_b, row_raw, row_values);
     }
     if (pending_row >= 0) {
       // The preceding row completed its staged output before queuing IO.
@@ -574,28 +594,28 @@ __mlu_global__ void merge_rows(const int16_t* scores,
       pending_row = -1;
     }
     if (dense && next_valid) {
-      load_dense_row(buffer ? raw : raw_next,
-                     buffer ? values : values_next,
-                     scores,
-                     slots,
-                     next,
-                     sq,
-                     sd,
-                     vq,
-                     vd);
+      load_dense_row<Shards>(buffer ? raw : raw_next,
+                             buffer ? values : values_next,
+                             scores,
+                             slots,
+                             next,
+                             sq,
+                             sd,
+                             vq,
+                             vd);
     }
     int32_t valid_selected = 0;
     int32_t* sorted_slots = selected_lo;
     if (row_valid) {
-      valid_selected = select_pairs(keys_a,
-                                    keys_b,
-                                    row_stage,
-                                    row_stage + kCandidates,
-                                    scratch,
-                                    mask,
-                                    selected_hi,
-                                    selected_lo,
-                                    &sorted_slots);
+      valid_selected = select_pairs<Shards>(keys_a,
+                                            keys_b,
+                                            row_stage,
+                                            row_stage + kCount,
+                                            scratch,
+                                            mask,
+                                            selected_hi,
+                                            selected_lo,
+                                            &sorted_slots);
     }
     if (valid_selected > 0) {
       __asm__ volatile(
@@ -627,8 +647,46 @@ __mlu_global__ void merge_rows(const int16_t* scores,
   }
   __sync_io();
 }
+
+template <int32_t Shards>
+void launch_rows(const void* scores,
+                 const int32_t* slots,
+                 const int32_t* mapping,
+                 int32_t* output,
+                 int32_t* lengths,
+                 int64_t rows,
+                 int64_t sd,
+                 int64_t sq,
+                 int64_t sc,
+                 int64_t vd,
+                 int64_t vq,
+                 int64_t vc,
+                 int64_t ms,
+                 cnrtQueue_t queue) {
+  // A two-cluster union is dispatched as a gang. Block or single-cluster tasks
+  // spanning many clusters measured up to ~5us extra dispatch latency after
+  // some prior device workloads. Rows beyond Q are skipped by the row loop.
+  const int64_t cores = rows < 32 ? (rows + 7) / 8 * 8 : 32;
+  cnrtDim3_t dim = {static_cast<uint32_t>(cores), 1, 1};
+  merge_rows<Shards>
+      <<<dim, cnrtFuncTypeUnion2, queue>>>(static_cast<const int16_t*>(scores),
+                                           slots,
+                                           mapping,
+                                           output,
+                                           lengths,
+                                           rows,
+                                           sd,
+                                           sq,
+                                           sc,
+                                           vd,
+                                           vq,
+                                           vc,
+                                           ms);
+}
 }  // namespace
-void launch_dcp_merge_topk(const void* scores,
+
+void launch_dcp_merge_topk(int64_t shards,
+                           const void* scores,
                            const int32_t* slots,
                            const int32_t* mapping,
                            int32_t* output,
@@ -642,24 +700,37 @@ void launch_dcp_merge_topk(const void* scores,
                            int64_t vc,
                            int64_t ms,
                            cnrtQueue_t queue) {
-  // A two-cluster union is dispatched as a gang. Block or single-cluster tasks
-  // spanning many clusters measured up to ~5us extra dispatch latency after
-  // some prior device workloads. Rows beyond Q are skipped by the row loop.
-  const int64_t cores = rows < 32 ? (rows + 7) / 8 * 8 : 32;
-  cnrtDim3_t dim = {static_cast<uint32_t>(cores), 1, 1};
-  merge_rows<<<dim, cnrtFuncTypeUnion2, queue>>>(
-      static_cast<const int16_t*>(scores),
-      slots,
-      mapping,
-      output,
-      lengths,
-      rows,
-      sd,
-      sq,
-      sc,
-      vd,
-      vq,
-      vc,
-      ms);
+  // The torch API validates that shards is either two or four.
+  if (shards == 2) {
+    launch_rows<2>(scores,
+                   slots,
+                   mapping,
+                   output,
+                   lengths,
+                   rows,
+                   sd,
+                   sq,
+                   sc,
+                   vd,
+                   vq,
+                   vc,
+                   ms,
+                   queue);
+    return;
+  }
+  launch_rows<4>(scores,
+                 slots,
+                 mapping,
+                 output,
+                 lengths,
+                 rows,
+                 sd,
+                 sq,
+                 sc,
+                 vd,
+                 vq,
+                 vc,
+                 ms,
+                 queue);
 }
 }  // namespace xllm::kernel::mlu::bangc

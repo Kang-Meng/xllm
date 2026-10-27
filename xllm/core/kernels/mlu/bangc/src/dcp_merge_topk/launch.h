@@ -18,7 +18,9 @@ limitations under the License.
 
 #include <cstdint>
 namespace xllm::kernel::mlu::bangc {
-void launch_dcp_merge_topk(const void* scores,
+// Native shard counts are two and four.
+void launch_dcp_merge_topk(int64_t shards,
+                           const void* scores,
                            const int32_t* slots,
                            const int32_t* mapping,
                            int32_t* output,
@@ -32,4 +34,4 @@ void launch_dcp_merge_topk(const void* scores,
                            int64_t vc,
                            int64_t ms,
                            cnrtQueue_t queue);
-}
+}  // namespace xllm::kernel::mlu::bangc

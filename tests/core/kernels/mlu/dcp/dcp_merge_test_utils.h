@@ -99,14 +99,15 @@ inline Candidates make_candidates(int32_t rows,
                                   int32_t shard,
                                   int32_t tp_rank,
                                   int32_t seed,
-                                  bool edges) {
+                                  bool edges,
+                                  int32_t dcp = kDcp) {
   torch::manual_seed(seed + shard * 101 + tp_rank * 1009);
   auto scores =
       torch::randn({rows, kTopk}, torch::kFloat32).to(torch::kBFloat16);
   auto cols = torch::arange(kTopk, torch::kInt32);
   auto ordinal = cols + shard * kTopk;
   auto ids =
-      (cols.div(/*other=*/16, /*rounding_mode=*/"floor") * kDcp + shard) * 16 +
+      (cols.div(/*other=*/16, /*rounding_mode=*/"floor") * dcp + shard) * 16 +
       cols.remainder(16) + tp_rank * (1 << 24);
   auto slots = ids.unsqueeze(/*dim=*/0).repeat({rows, 1});
   auto mapping = torch::arange(rows, torch::kInt32);

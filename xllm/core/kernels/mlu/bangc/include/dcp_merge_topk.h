@@ -20,7 +20,9 @@ limitations under the License.
 #include <cstdint>
 
 namespace xllm::kernel::mlu::bangc {
-// BF16 scores[4,Q,2048], INT32 slots/mapping, topk=2048; contiguous outputs.
+// BF16 scores[D,Q,2048], INT32 slots/mapping, topk=2048; contiguous outputs.
+// D is a power of two of at least 2. D=2 and D=4 run one native kernel;
+// larger D first reduces each group of four shards, then merges the groups.
 // Equal scores use ascending global physical slots. Positive input strides
 // are supported. Outputs cannot alias any input.
 void dcp_merge_topk(const torch::Tensor& scores,
