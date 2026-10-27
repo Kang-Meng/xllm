@@ -3042,9 +3042,12 @@ TEST(BatchTest, Glm53PrefillUsesCheckpointAsDirectReadSource) {
   ASSERT_EQ(remaining.size(), 1u);
   EXPECT_TRUE(manager.allocate(1).empty());
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().ref_count(),
-            1u);
+            2u);
   release_linear_source_for_test(sequence);
+  EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().ref_count(),
+            1u);
   std::vector<Block> reclaimed = manager.allocate(1);
   ASSERT_EQ(reclaimed.size(), 1u);
   EXPECT_EQ(reclaimed.front().id(), source_id);
@@ -3341,7 +3344,7 @@ TEST(BatchTest, DecodeKeepsSingleTailWithoutRestore) {
             sequence.get_linear_state_slot_id());
 }
 
-TEST(BatchTest, DecodeDestinationIsOwnedOnlyBySequence) {
+TEST(BatchTest, DecodeDestinationIsHeldBySequenceAndBatch) {
   ScopedPrefillChunkStride chunk_stride(4);
   BlockManager::Options options;
   options.num_blocks(3).block_size(4);
@@ -3362,8 +3365,9 @@ TEST(BatchTest, DecodeDestinationIsOwnedOnlyBySequence) {
   EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
   EXPECT_TRUE(manager.allocate(1).empty());
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
-            1u);
+            2u);
   sequence.kv_state().mutable_blocks(BlockType::LINEAR)->clear();
+  EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
   std::vector<Block> reclaimed = manager.allocate(1);
   ASSERT_EQ(reclaimed.size(), 1u);
@@ -3630,6 +3634,7 @@ TEST(BatchTest, CancelledOverlapOutputDoesNotUpdateReleasedSequence) {
           .enable_linear_state(linear_state)
           .linear_state_num_slots(5);
       BlockManagerPool pool(options, 1);
+      const size_t initial_free_blocks = pool.num_free_blocks().front();
       RequestSamplingParam sampling;
       StoppingChecker stopping;
       stopping.set_max_generated_tokens(16);
@@ -3660,10 +3665,8 @@ TEST(BatchTest, CancelledOverlapOutputDoesNotUpdateReleasedSequence) {
       fake.outputs.emplace_back(make_raw_sample_output(-1, std::nullopt));
       batch.process_sample_output(fake, false);
       const std::vector<int32_t> cancelled_tokens(cancelled.tokens());
-      const size_t free_blocks_before_release = pool.num_free_blocks().front();
       cancelled.set_cancel();
       cancelled.reset();
-      EXPECT_GT(pool.num_free_blocks().front(), free_blocks_before_release);
       EXPECT_FALSE(cancelled.has_any_blocks());
       EXPECT_FALSE(cancelled.has_linear_state_slot());
       if (tensor_output) {
@@ -3691,6 +3694,9 @@ TEST(BatchTest, CancelledOverlapOutputDoesNotUpdateReleasedSequence) {
       EXPECT_EQ(stats->accepted_tokens, 2);
       EXPECT_EQ(stats->proposed_tokens, 3);
       running.reset();
+      EXPECT_LT(pool.num_free_blocks().front(), initial_free_blocks);
+      batches.clear();
+      EXPECT_EQ(pool.num_free_blocks().front(), initial_free_blocks);
     }
   }
 }
@@ -3728,7 +3734,7 @@ TEST(BatchTest, OverlapTensorAcceptanceUpdatesCacheProgress) {
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 7u);
 }
 
-TEST(BatchTest, ThreadedInputBuildKeepsLinearOwnershipInSequences) {
+TEST(BatchTest, ThreadedInputBuildPreservesLinearBlockRefs) {
   ScopedPrefillChunkStride chunk_stride(/*chunk_stride=*/32768);
 
   constexpr size_t kQueryTokensPerSequence = 32768;
@@ -3798,14 +3804,15 @@ TEST(BatchTest, ThreadedInputBuildKeepsLinearOwnershipInSequences) {
   EXPECT_TRUE(manager.allocate(1).empty());
   EXPECT_EQ(
       first_sequence.kv_state().blocks(BlockType::LINEAR).front().ref_count(),
-      1u);
+      2u);
   EXPECT_EQ(
       second_sequence.kv_state().blocks(BlockType::LINEAR).front().ref_count(),
-      1u);
+      2u);
   release_linear_source_for_test(first_sequence);
   release_linear_source_for_test(second_sequence);
   first_sequence.kv_state().erase_blocks(BlockType::LINEAR);
   second_sequence.kv_state().erase_blocks(BlockType::LINEAR);
+  EXPECT_TRUE(manager.allocate(1).empty());
   batch.reset();
   std::vector<Block> reclaimed = manager.allocate(4);
   ASSERT_EQ(reclaimed.size(), 4u);

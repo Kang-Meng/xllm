@@ -51,9 +51,7 @@ class Batch {
 
   void add(const std::vector<Sequence*>& sequences);
 
-  void add(SequencesGroup* sequence_group) {
-    sequence_groups_.push_back(sequence_group);
-  }
+  void add(SequencesGroup* sequence_group);
 
   void update_forward_type(Sequence* sequence);
 
@@ -172,6 +170,7 @@ class Batch {
   void dp_balance_shuffle_seqs();
 
   std::vector<Sequence*> sequences_;
+  std::vector<Block> inflight_blocks_;
   std::vector<SequencesGroup*> sequence_groups_;
   std::vector<BlockTransferInfo> swap_block_transfer_infos_;
 

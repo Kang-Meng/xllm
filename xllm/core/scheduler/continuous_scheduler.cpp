@@ -273,6 +273,13 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
 ContinuousScheduler::~ContinuousScheduler() {
   CHECK_EQ(prefetching_requests_.load(std::memory_order_acquire), 0u)
       << "ContinuousScheduler destroyed with pending prefetch callbacks";
+  if (options_.enable_schedule_overlap() && !is_first_step_ &&
+      std::any_of(last_batch_.begin(),
+                  last_batch_.end(),
+                  [](const Batch& batch) { return !batch.empty(); })) {
+    engine_->update_last_step_result(last_batch_);
+    last_batch_.clear();
+  }
   running_requests_.clear();
   for (const auto& [queue_name, metric] : request_queue_metrics_) {
     metric->set_value(0.0);

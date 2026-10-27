@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -196,6 +197,24 @@ void Batch::add(Sequence* sequence, uint32_t allowed_max_token) {
     input_embeddings_vec_.emplace_back(input_embedding);
 
   update_forward_type(sequence);
+
+  std::vector<Block> blocks = sequence->get_inflight_blocks();
+  inflight_blocks_.insert(inflight_blocks_.end(),
+                          std::make_move_iterator(blocks.begin()),
+                          std::make_move_iterator(blocks.end()));
+}
+
+void Batch::add(SequencesGroup* sequence_group) {
+  sequence_groups_.push_back(sequence_group);
+  if (!sequences_.empty()) {
+    return;
+  }
+  for (const auto& sequence : sequence_group->sequences()) {
+    std::vector<Block> blocks = sequence->get_inflight_blocks();
+    inflight_blocks_.insert(inflight_blocks_.end(),
+                            std::make_move_iterator(blocks.begin()),
+                            std::make_move_iterator(blocks.end()));
+  }
 }
 
 void Batch::update_forward_type(Sequence* sequence) {

@@ -296,6 +296,8 @@ class Sequence final {
 
   void add_shared_host_blocks(BlockType type, std::vector<Block>&& blocks);
 
+  std::vector<Block> get_inflight_blocks() const;
+
   // Precomputed chained block hashes used by the prefix cache. Covers all full
   // blocks with available token dependencies; reused by match()/insert() so the
   // hash is computed once per sequence instead of recomputed on every call.

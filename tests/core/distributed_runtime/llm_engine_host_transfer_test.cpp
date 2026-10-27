@@ -315,6 +315,9 @@ TEST(LLMEngineOverlapOwnershipTest, MtpOverlapStepDoesNotCopyCpPrefillBlocks) {
 
   std::vector<Batch> batches;
   batches.emplace_back(sequence);
+  const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
+  ASSERT_FALSE(kv_blocks.empty());
+  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
   engine.step(batches);
 
   // Both CP ranks ran the same batch with byte-identical token inputs.
@@ -324,14 +327,12 @@ TEST(LLMEngineOverlapOwnershipTest, MtpOverlapStepDoesNotCopyCpPrefillBlocks) {
   EXPECT_TRUE(torch::equal(workers[0]->captured_token_ids(),
                            workers[1]->captured_token_ids()));
 
-  // Serial worker execution needs only the sequence's own reference.
-  const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
-  ASSERT_FALSE(kv_blocks.empty());
+  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
+  batches.clear();
   EXPECT_EQ(kv_blocks.front().ref_count(), 1u);
 }
 
-TEST(LLMEngineOverlapOwnershipTest,
-     DFlash2OverlapStepDoesNotCopyCpPrefillBlocks) {
+TEST(LLMEngineOverlapOwnershipTest, DFlash2StepDoesNotCopyCpBlocks) {
   std::vector<std::shared_ptr<WorkerClient>> clients;
   clients.reserve(2);
   for (int32_t worker_rank = 0; worker_rank < 2; ++worker_rank) {
@@ -355,12 +356,12 @@ TEST(LLMEngineOverlapOwnershipTest,
 
   std::vector<Batch> batches;
   batches.emplace_back(sequence);
-  engine.step(batches);
-
-  // DFlash2 follows the same ownership rule: Batch does not copy Blocks.
   const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
   ASSERT_FALSE(kv_blocks.empty());
-  EXPECT_EQ(kv_blocks.front().ref_count(), 1u);
+  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
+  engine.step(batches);
+
+  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
   // Dropping the batch preserves the sequence's owner.
   batches.clear();
   EXPECT_EQ(sequence->kv_state().blocks(BlockType::KV).front().ref_count(), 1u);

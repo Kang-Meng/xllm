@@ -33,7 +33,21 @@ cc_test(
     GTest::gtest_main
     $<$<BOOL:${USE_NPU}>:nnopbase>
 )
-foreach(test_target scheduler_test pd_decode_restore_test)
+cc_test(
+  NAME
+    pd_inflight_lifetime_test
+  CPU_ONLY
+  SRCS
+    pd_inflight_lifetime_test.cpp
+  DEPS
+    :config
+    :scheduler
+    :xllm_server
+    :block
+    GTest::gtest_main
+    $<$<BOOL:${USE_NPU}>:nnopbase>
+)
+foreach(test_target scheduler_test pd_decode_restore_test pd_inflight_lifetime_test)
   target_link_libraries(${test_target}
                         PUBLIC
                         Python::Python

@@ -2037,6 +2037,8 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
     EXPECT_TRUE(decode.pop_decode_request_for_test(&queued));
     EXPECT_EQ(queued, remote_healthy);
     EXPECT_EQ(remote_healthy->sequences()[0]->num_generated_tokens(), 1u);
+    EXPECT_EQ(prefill_engine.block_manager_pool()->num_used_blocks()[0], 1u);
+    batch.clear();
     EXPECT_EQ(prefill_engine.block_manager_pool()->num_used_blocks()[0], 0u);
     EXPECT_FALSE(decode.reservations_empty());
   }

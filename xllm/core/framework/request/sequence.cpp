@@ -955,6 +955,46 @@ void Sequence::fill_ctc_output(const Tokenizer& tokenizer,
   }
 }
 
+std::vector<Block> Sequence::get_inflight_blocks() const {
+  const size_t token_boundary =
+      std::min(kv_state_.kv_cache_tokens_num(), num_valid_tokens());
+  const size_t token_begin = token_boundary > 2 ? token_boundary - 2 : 0;
+  std::vector<Block> retained;
+  retained.reserve(kv_state_.blocks().size());
+  for (const auto& [type, blocks] : kv_state_.blocks()) {
+    size_t first_block = 0;
+    switch (type) {
+      case BlockType::KV:
+      case BlockType::SWA:
+      case BlockType::C1:
+      case BlockType::C2:
+      case BlockType::C4:
+      case BlockType::C128: {
+        const auto owned_block =
+            std::find_if(blocks.begin(), blocks.end(), [](const Block& block) {
+              return block.is_valid() && block.manager() != nullptr;
+            });
+        if (owned_block == blocks.end()) {
+          continue;
+        }
+        first_block = token_begin / owned_block->size();
+        break;
+      }
+      case BlockType::LINEAR:
+      case BlockType::EMBEDDING:
+        break;
+    }
+    for (size_t block_index = first_block; block_index < blocks.size();
+         ++block_index) {
+      const Block& block = blocks[block_index];
+      if (block.is_valid() && block.manager() != nullptr) {
+        retained.emplace_back(block);
+      }
+    }
+  }
+  return retained;
+}
+
 size_t Sequence::num_prefix_cache_tokens() const {
   const size_t cached_tokens = std::max(kv_state_.shared_tokens_num(),
                                         host_kv_state_.shared_tokens_num());

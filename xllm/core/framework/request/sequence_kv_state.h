@@ -41,6 +41,10 @@ class KVCacheState {
   // the "up to" semantics naturally arise from mismatched host/device counters.
   void incr_kv_cache_tokens_num_up_to(size_t new_target);
 
+  const std::map<BlockType, std::vector<Block>>& blocks() const {
+    return composite_blocks_;
+  }
+
   // Blocks held under `type`; empty slice when the type is absent.
   Slice<Block> blocks(BlockType type) const;
   // Mutable block list for `type`, created on demand.

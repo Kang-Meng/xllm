@@ -959,16 +959,6 @@ TEST(ContinuousSchedulerTest, CancelledOverlapRequestReleasesBeforeResult) {
 //               (copied at step N's tail) keeps the request object alive
 //               until this collection completes.
 //
-// The early block free is safe for a non-DFlash2 overlap step because every
-// device access to KV/LINEAR cache tensors is enqueued on the per-worker
-// compute stream in step-task order (single-threaded WorkerImpl task pool,
-// worker_impl.h; LLMWorkerImpl::step_for_schedule_overlap chains the deferred
-// linear-state restore and the step on compute_stream_), so a freed block
-// reallocated into the next batch is only written by device work ordered
-// after the in-flight step. DFlash2's prelaunch enqueues KV writes one
-// additional step ahead, outside this FIFO window, so finish_draft_prelaunch
-// retires those writes before returning accepted tokens. The real-device
-// fence and subsequent reuse are covered by dflash2_prelaunch_lifecycle_test.
 // ===========================================================================
 
 class OverlapFinishEngine final : public FakeEngine {
@@ -1014,8 +1004,6 @@ class OverlapFinishEngine final : public FakeEngine {
         collected_blocks_[sequence->request_id()].emplace_back(
             block_ids(*sequence));
         if (sequence->finished()) {
-          // collect_finished has freed the finished request's blocks. The
-          // scheduler snapshot must still keep the sequence object alive.
           dispatches_at_finished_collection_ = step_calls_;
           EXPECT_EQ(sequence->kv_cache_tokens_num(), 0u);
           EXPECT_FALSE(sequence->has_any_blocks());
@@ -1130,8 +1118,7 @@ TEST(ContinuousSchedulerTest, OverlapFinishedRequestOutlivesInflightResult) {
             initial_free_blocks);
 }
 
-TEST(ContinuousSchedulerTest,
-     OverlapMixedBatchReusesFinishedBlocksBeforeInflightCollection) {
+TEST(ContinuousSchedulerTest, OverlapBatchRetainsFinishedBlocks) {
   ScopedConfigValue<bool> overlap(
       SchedulerConfig::get_instance().enable_schedule_overlap(), true);
   OverlapFinishEngine engine(/*block_size=*/128);
@@ -1185,8 +1172,6 @@ TEST(ContinuousSchedulerTest,
   const std::weak_ptr<Request> replacement_watch = replacement;
   scheduler.add_request(replacement);
   replacement.reset();
-  // Reclaim the ending request's block and dispatch the replacement before
-  // collecting the old mixed batch. Its finished sequence remains readable.
   scheduler.step(absl::ZeroDuration());
 
   const auto& ending_dispatches = engine.dispatched_blocks("ending");
@@ -1198,7 +1183,7 @@ TEST(ContinuousSchedulerTest,
   // The replacement's dispatch must already have happened when the finished
   // row of the previous batch is collected.
   EXPECT_EQ(engine.dispatches_at_finished_collection(), 3u);
-  EXPECT_EQ(replacement_dispatches.front(), ending_dispatches.front());
+  EXPECT_NE(replacement_dispatches.front(), ending_dispatches.front());
   const auto& ending_collections = engine.collected_blocks("ending");
   ASSERT_EQ(ending_collections.size(), 2u);
   EXPECT_EQ(ending_collections.front(), ending_dispatches.front());
@@ -1913,6 +1898,8 @@ TEST(ContinuousSchedulerTest, RejectedStreamCancelsAtSchedulingBoundary) {
   ASSERT_EQ(batch[0].size(), 1u);
   EXPECT_LT(util::max(block_manager_pool->num_free_blocks()),
             initial_free_blocks);
+  const size_t free_blocks_before_cancel =
+      util::max(block_manager_pool->num_free_blocks());
 
   scheduler->reject_stream(request);
 
@@ -1922,6 +1909,9 @@ TEST(ContinuousSchedulerTest, RejectedStreamCancelsAtSchedulingBoundary) {
 
   EXPECT_TRUE(request->cancelled());
   EXPECT_TRUE(scheduler->get_running_requests().empty());
+  EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
+            free_blocks_before_cancel);
+  batch.clear();
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             initial_free_blocks);
 
@@ -1982,6 +1972,8 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
   auto engine = std::make_unique<FakeEngine>(32, 4);
   auto scheduler = std::make_unique<TestContinuousScheduler>(engine.get(), opt);
   BlockManagerPool* block_manager_pool = engine->block_manager_pool();
+  const size_t initial_free_blocks =
+      util::max(block_manager_pool->num_free_blocks());
 
   std::vector<std::shared_ptr<Request>> requests =
       generate_request({4, 4},
@@ -2019,6 +2011,9 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
   EXPECT_FALSE(requests[1]->cancelled());
   ASSERT_EQ(scheduler->get_running_requests().size(), 1u);
   EXPECT_EQ(scheduler->get_running_requests()[0], requests[1]);
+  EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
+            free_blocks_before_cancel);
+  batch.clear();
   EXPECT_GT(util::max(block_manager_pool->num_free_blocks()),
             free_blocks_before_cancel);
 
@@ -2030,6 +2025,8 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
   scheduler->step(absl::ZeroDuration());
   EXPECT_TRUE(requests[1]->cancelled());
   EXPECT_TRUE(scheduler->get_running_requests().empty());
+  EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
+            initial_free_blocks);
 }
 // ============== Async RL training: Pause/Resume tests ==============
 
@@ -2084,15 +2081,19 @@ TEST(ContinuousSchedulerTest, PausePreemptsRunningAndFreesKVCache) {
   update_requests(running_requests);
 
   EXPECT_EQ(scheduler->get_running_requests().size(), 2);
-  int free_blocks_before = util::max(block_manager_pool->num_free_blocks());
+  const size_t free_blocks_before =
+      util::max(block_manager_pool->num_free_blocks());
 
   scheduler->pause();
   scheduler->preempt_all_running_requests_test();
 
-  int free_blocks_after = util::max(block_manager_pool->num_free_blocks());
-  EXPECT_GT(free_blocks_after, free_blocks_before);
+  EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
+            free_blocks_before);
   EXPECT_EQ(scheduler->get_running_requests().size(), 0);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 2);
+  batch.clear();
+  EXPECT_GT(util::max(block_manager_pool->num_free_blocks()),
+            free_blocks_before);
 
   (void)engine.release();
 }
@@ -2171,14 +2172,18 @@ TEST(ContinuousSchedulerTest, PauseAbortCancelsRunningRequests) {
   update_requests(running_requests);
 
   EXPECT_EQ(scheduler->get_running_requests().size(), 2);
-  int free_blocks_before = util::max(block_manager_pool->num_free_blocks());
+  const size_t free_blocks_before =
+      util::max(block_manager_pool->num_free_blocks());
 
   scheduler->abort_all_running_requests_test();
 
-  int free_blocks_after = util::max(block_manager_pool->num_free_blocks());
-  EXPECT_GT(free_blocks_after, free_blocks_before);        // KV cache freed
+  EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
+            free_blocks_before);
   EXPECT_EQ(scheduler->get_running_requests().size(), 0);  // running cleared
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0);     // NOT requeued
+  batch.clear();
+  EXPECT_GT(util::max(block_manager_pool->num_free_blocks()),
+            free_blocks_before);
 
   (void)engine.release();
 }
