@@ -171,10 +171,10 @@ bool supports_block_diffusion_draft(std::string_view algorithm) {
 
 }  // namespace
 
-// Reads a draft config's target-side aux hidden capture layers as 0-based
-// post-layer indices: the legacy target-layer keys are already post-layer, the
-// speculators boundary-index keys are shifted. With `required` an empty result
-// is fatal; otherwise it is returned for the caller to default.
+// Reads a draft config's ordered target-side aux hidden capture layer ids.
+// Legacy target-layer keys keep their model-specific boundary semantics; the
+// speculators boundary-index keys are converted to post-layer ids. With
+// `required` an empty result is fatal; otherwise the caller may default it.
 std::vector<int32_t> read_capture_layer_ids(
     const std::string& model_weights_path,
     bool required) {

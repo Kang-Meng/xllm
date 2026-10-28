@@ -18,7 +18,7 @@ The target that captures aux hidden states for the DSpark drafter is exercised
 at two levels, each merged here from its own test module:
 
 ``[1] Target aux-hidden capture``
-    ``DeepseekV41Model`` buffers the residual stream of ``layers_to_capture``
+    ``DeepseekV41Model`` buffers the residual stream entering ``layers_to_capture``
     into a ``[tokens, n_captured * hidden]`` tensor; ``dspark_target_layer_ids``
     drives the list and the draft's ``main_proj`` fuses the blocks. Capture must
     be free and invisible when the list is empty, and the ``hc_mult`` copies must
@@ -71,11 +71,13 @@ class _HcCollapse:
 
 
 class _HcDeltaLayer(nn.Module):
-    """Writes ``delta + hc_slot`` into every row.
+    """Writes ``delta + hc_slot`` into every row, ignoring its input.
 
     Making the value depend on the ``hc_mult`` slot means the captured tensor
     differs from the raw layer output unless the capture collapses ``hc_mult``
-    with the same mean the native target uses.
+    with the same mean the native target uses. Ignoring the input makes each
+    layer's output identify the layer, so a capture that takes the entering
+    stream of layer ``i`` is distinguishable from one that takes its output.
     """
 
     def __init__(self, delta: float, hc_mult: int) -> None:
@@ -161,8 +163,14 @@ def test_capture_buffers_the_configured_layers_in_config_order(monkeypatch: pyte
     # layer id): layer 2 lands in slot 0 and layer 0 in slot 1.
     assert aux_hidden.shape == (2, len(model.aux_hidden_capture._layers_to_capture) * cfg.hidden_size)
     hc_mean = (cfg.hc_mult - 1) / 2
-    torch.testing.assert_close(aux_hidden[:, : cfg.hidden_size], torch.full((2, cfg.hidden_size), 2.0 + hc_mean))
-    torch.testing.assert_close(aux_hidden[:, cfg.hidden_size :], torch.full((2, cfg.hidden_size), 0.0 + hc_mean))
+    # Each slot holds the stream ENTERING its layer: layer 2 sees layer 1's
+    # output, and layer 0 sees the embedding (identical across hc_mult copies,
+    # so the collapse leaves the per-token value and adds no hc_mean).
+    torch.testing.assert_close(aux_hidden[:, : cfg.hidden_size], torch.full((2, cfg.hidden_size), 1.0 + hc_mean))
+    torch.testing.assert_close(
+        aux_hidden[:, cfg.hidden_size :],
+        torch.tensor([[2.0], [3.0]]).expand(2, cfg.hidden_size),
+    )
 
 
 def test_should_capture_matches_the_configured_layers() -> None:
@@ -189,8 +197,11 @@ def test_graph_flag_switches_the_model_capture_to_persistent(monkeypatch: pytest
     assert buffer is not None
     hc_mean = (cfg.hc_mult - 1) / 2
     assert buffer.shape == (2, 2 * cfg.hidden_size)
-    torch.testing.assert_close(buffer[:, : cfg.hidden_size], torch.full((2, cfg.hidden_size), 2.0 + hc_mean))
-    torch.testing.assert_close(buffer[:, cfg.hidden_size :], torch.full((2, cfg.hidden_size), 0.0 + hc_mean))
+    torch.testing.assert_close(buffer[:, : cfg.hidden_size], torch.full((2, cfg.hidden_size), 1.0 + hc_mean))
+    torch.testing.assert_close(
+        buffer[:, cfg.hidden_size :],
+        torch.tensor([[2.0], [3.0]]).expand(2, cfg.hidden_size),
+    )
 
 
 def test_graph_flag_off_keeps_the_eager_tuple_contract(monkeypatch: pytest.MonkeyPatch) -> None:

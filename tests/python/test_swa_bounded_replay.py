@@ -216,7 +216,9 @@ def test_multiple_requests_keep_each_final_row_and_aux_capture(persistent: bool)
     output, aux = (result, capture.buffer) if persistent else result
     kept = torch.cat((torch.arange(60, 200), torch.arange(200, 203), torch.arange(243, 383)))
     torch.testing.assert_close(output[kept, 0], kept.float() + 19, rtol=0, atol=0)
-    expected_aux = kept.float().unsqueeze(-1) + torch.tensor([17, 18, 19])
+    # Capture takes the stream entering each layer, so layers 37/38/39 see 16/17/18
+    # increments while the output has all 19.
+    expected_aux = kept.float().unsqueeze(-1) + torch.tensor([16, 17, 18])
     torch.testing.assert_close(aux[kept], expected_aux, rtol=0, atol=0)
     for dropped in (slice(0, 60), slice(203, 243)):
         assert torch.count_nonzero(output[dropped]) == 0

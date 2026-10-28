@@ -3087,10 +3087,11 @@ class DeepseekV41Model(nn.Module):
         hidden = hidden.unsqueeze(1).expand(-1, self.cfg.hc_mult, -1).contiguous()
         pre_mix = DeepseekV41HyperConnection.make_identity_pre_mix(hidden, self.cfg.hc_mult)
         # DSpark: buffer the per-layer residual stream the draft's main_proj
-        # fuses, collapsing hc_mult the same way the native V4 target does
-        # (``hidden.mean(dim=1)``). None while capture is disabled, so the mean
-        # and the buffer allocation are skipped entirely off the speculative
-        # path.
+        # fuses, collapsing hc_mult with ``hidden.mean(dim=1)``. A V4.1 target
+        # layer id names the stream ENTERING that layer, where a V4 one names
+        # the layer output, so the capture runs before the layer call. None
+        # while capture is disabled, so the mean and the buffer allocation are
+        # skipped entirely off the speculative path.
         aux_capture = self.aux_hidden_capture
         aux_hidden_buffer = aux_capture.create_buffer(hidden.mean(dim=1)) if aux_capture.enabled else None
         for layer_id, layer in enumerate(self.layers):
@@ -3100,6 +3101,8 @@ class DeepseekV41Model(nn.Module):
                 return run_swa_bounded_consumers(
                     self, context, hidden, pre_mix, positions, input_ids, aux_hidden_buffer
                 )
+            if aux_hidden_buffer is not None and aux_capture.should_capture(layer_id):
+                aux_capture.capture_layer(layer_id, hidden.mean(dim=1), None, aux_hidden_buffer)
             layer_cos_sin_cache = self._layer_rope_cache(self.csa2_plan.mode(layer_id))
             hidden, pre_mix = layer(
                 hidden,
@@ -3110,8 +3113,6 @@ class DeepseekV41Model(nn.Module):
                 engram_hashes,
                 engram_mask,
             )
-            if aux_hidden_buffer is not None and aux_capture.should_capture(layer_id):
-                aux_capture.capture_layer(layer_id, hidden.mean(dim=1), None, aux_hidden_buffer)
             record_layer_event(layer_id)
         # Final merge: the learned weighted sum with the LAST block's ffn_pre.
         merged = self.layers[-1].hc.hc_pre(hidden, pre_mix)

@@ -22,7 +22,7 @@ import torch
 
 
 class AuxHiddenCapture:
-    """Captures selected layer outputs into a buffer in config order.
+    """Captures selected hidden states into a buffer in config order.
 
     Two buffer modes:
 
@@ -43,7 +43,7 @@ class AuxHiddenCapture:
     ) -> None:
         self._layers_to_capture = layers_to_capture
         self._capture_slots = {layer_id: slot_id for slot_id, layer_id in enumerate(layers_to_capture)}
-        # Applied to a captured layer output before writing, only for captured
+        # Applied to a captured hidden state before writing, only for captured
         # layers — defers an expensive per-layer collapse past the slot check.
         self._transform = transform
         self._persistent_buffer = bool(persistent_buffer)
@@ -63,7 +63,7 @@ class AuxHiddenCapture:
     def buffer(self) -> torch.Tensor | None:
         """The most recent persistent capture buffer, if any.
 
-        Out-of-band access to the captured layer outputs when the model output
+        Out-of-band access to the captured hidden states when the model output
         must stay a single Tensor (graph capture/replay).
         """
         return self._buffer

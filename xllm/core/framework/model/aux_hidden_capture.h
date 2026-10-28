@@ -63,8 +63,11 @@ class AuxHiddenCapture final {
     return post_layer_ids;
   }
 
-  // Legacy keys store post-layer indices and take priority over boundary keys.
-  // Keep model projection sizing and runtime capture selection on one contract.
+  // Legacy keys take priority over boundary keys and are passed through for the
+  // target implementation to interpret. Their boundary is model-specific:
+  // DeepSeek V4 captures post-layer outputs, while the V4.1 Python target
+  // captures residuals entering the named layers. Keep projection sizing and
+  // runtime capture selection on the same ordered list.
   static std::vector<int32_t> read_capture_layer_ids(const JsonReader& reader) {
     std::vector<int32_t> layer_ids = reader.value_or<std::vector<int32_t>>(
         std::vector<std::string>{"dspark_target_layer_ids",

@@ -165,6 +165,13 @@ def run_swa_bounded_consumers(
     captured = None
     with forward_context(compact_context):
         for layer_id in range(SWA_BOUNDED_FIRST_CONSUMER, len(model.layers)):
+            # Same capture point as the eager loop: a V4.1 target layer id names
+            # the residual stream entering that layer, so capture before it runs.
+            if aux_hidden_buffer is not None and model.aux_hidden_capture.should_capture(layer_id):
+                if captured is None:
+                    captured = hidden.new_zeros((original_rows, hidden.size(-1)))
+                captured.index_copy_(0, rows, hidden.mean(dim=1))
+                model.aux_hidden_capture.capture_layer(layer_id, captured, None, aux_hidden_buffer)
             hidden, pre_mix = model.layers[layer_id](
                 hidden,
                 positions,
@@ -174,11 +181,6 @@ def run_swa_bounded_consumers(
                 None,
                 None,
             )
-            if aux_hidden_buffer is not None and model.aux_hidden_capture.should_capture(layer_id):
-                if captured is None:
-                    captured = hidden.new_zeros((original_rows, hidden.size(-1)))
-                captured.index_copy_(0, rows, hidden.mean(dim=1))
-                model.aux_hidden_capture.capture_layer(layer_id, captured, None, aux_hidden_buffer)
             record_layer_event(layer_id)
         result = model.norm(model.layers[-1].hc.hc_pre(hidden, pre_mix))
     # Preserve the executor's output indexing. Prefix logits are unsupported
