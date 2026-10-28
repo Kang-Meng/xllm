@@ -2938,8 +2938,7 @@ TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {
 
 class LinearBatchLifetimeTest : public ::testing::TestWithParam<bool> {};
 
-TEST_P(LinearBatchLifetimeTest,
-       SequenceOwnsReadAndWriteSlotsWithoutBatchAliases) {
+TEST_P(LinearBatchLifetimeTest, BatchRetainsReadAndWriteSlotsUntilRetirement) {
   ScopedPrefillChunkStride chunk_stride(4);
   ScopedModelImpl model_impl("native");
   BlockManager::Options options;
@@ -2974,13 +2973,16 @@ TEST_P(LinearBatchLifetimeTest,
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
   EXPECT_TRUE(manager.allocate(1).empty());
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().ref_count(),
-            1u);
+            2u);
   release_linear_source_for_test(sequence);
+  EXPECT_TRUE(manager.allocate(1).empty());
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
-            1u);
+            2u);
   sequence.kv_state().mutable_blocks(BlockType::LINEAR)->clear();
+  EXPECT_TRUE(manager.allocate(1).empty());
   std::optional<Batch> moved_batch(std::move(*batch));
   batch.reset();
+  EXPECT_TRUE(manager.allocate(1).empty());
   moved_batch.reset();
   std::vector<Block> reclaimed = manager.allocate(2);
   ASSERT_EQ(reclaimed.size(), 2u);
