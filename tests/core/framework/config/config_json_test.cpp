@@ -71,63 +71,21 @@ TEST(ModelConfigJsonTest, SwaBoundedReplayIsExplicitOptIn) {
   EXPECT_FALSE(disabled.enable_swa_bounded_replay());
 }
 
-TEST(SpeculativeConfigJsonTest, DsParkPrelaunchIsOptInAndRoundTrips) {
-  google::FlagSaver flag_saver;
-  EXPECT_FALSE(SpeculativeConfig().enable_dspark_prelaunch());
-  {
-    google::FlagSaver enabled_flag_saver;
-    SpeculativeConfig enabled;
-    enabled.from_json(config::parse_json_string(
-        R"json({"enable_dspark_prelaunch":true})json"));
-    EXPECT_TRUE(enabled.enable_dspark_prelaunch());
-    nlohmann::ordered_json output;
-    enabled.append_config_json(output);
-    EXPECT_TRUE(output.at("enable_dspark_prelaunch").get<bool>());
-  }
-  SpeculativeConfig disabled;
-  disabled.from_json(config::parse_json_string(
-      R"json({"enable_dspark_prelaunch":false})json"));
-  EXPECT_FALSE(disabled.enable_dspark_prelaunch());
-}
-
-TEST(SpeculativeConfigValidationTest, DsparkPrelaunchRejectsOtherAlgorithms) {
+TEST(SpeculativeConfigValidationTest, AcceptsSupportedAlgorithms) {
   for (const std::string algorithm :
-       {"MTP", "DFlash", "DFlash2", "Eagle3", "Suffix"}) {
+       {"MTP", "DFlash", "DFlash2", "DSpark", "Eagle3", "Suffix"}) {
     SCOPED_TRACE(algorithm);
     SpeculativeConfig config;
-    config.enable_dspark_prelaunch(true);
-    config.speculative_algorithm(algorithm);
-    EXPECT_DEATH(
-        config.validate(),
-        "--enable_dspark_prelaunch requires speculative_algorithm=DSpark");
-  }
-}
-
-TEST(SpeculativeConfigValidationTest, DsparkPrelaunchAcceptsDspark) {
-  SpeculativeConfig config;
-  config.enable_dspark_prelaunch(true);
-  config.speculative_algorithm("DSpark");
-  EXPECT_NO_FATAL_FAILURE(config.validate());
-}
-
-TEST(SpeculativeConfigValidationTest,
-     DisabledDsparkPrelaunchPreservesOtherAlgorithms) {
-  for (const std::string algorithm :
-       {"MTP", "DFlash", "DFlash2", "Eagle3", "Suffix"}) {
-    SCOPED_TRACE(algorithm);
-    SpeculativeConfig config;
-    config.enable_dspark_prelaunch(false);
     config.speculative_algorithm(algorithm);
     EXPECT_NO_FATAL_FAILURE(config.validate());
   }
 }
 
 TEST(SpeculativeConfigValidationTest,
-     DisabledDsparkPrelaunchAllowsProbabilisticSampling) {
+     AllowsProbabilisticSamplingForSupportedAlgorithms) {
   for (const std::string algorithm : {"MTP", "DFlash2", "Eagle3", "DSpark"}) {
     SCOPED_TRACE(algorithm);
     SpeculativeConfig config;
-    config.enable_dspark_prelaunch(false);
     config.speculative_algorithm(algorithm);
     config.draft_sampling_mode("probabilistic");
     EXPECT_NO_FATAL_FAILURE(config.validate());

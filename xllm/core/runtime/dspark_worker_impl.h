@@ -16,7 +16,6 @@ limitations under the License.
 #pragma once
 
 #include <optional>
-#include <string_view>
 #include <vector>
 
 #include "core/framework/speculative/dflash_async_input_builder.h"
@@ -43,8 +42,6 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
                   MasterStatus master_status) override;
-  void prepare_work_before_execute(const ForwardInput& input,
-                                   ForwardInput& processed_input) override;
 
  protected:
   // N-wide query block: anchor (slot 0) carries the last real token and
@@ -69,10 +66,8 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
  private:
   friend class DSparkWorkerImplTestPeer;
 
-  void validate_draft_prelaunch_config(bool supports_device_inputs) const;
-  void validate_decode_input(const ForwardInput& input) const;
-  std::string_view draft_prelaunch_input_error(const ForwardInput& input) const;
-  bool can_prelaunch_draft(const ForwardInput& input) const;
+  bool can_prelaunch_draft_for_init(bool supports_device_inputs) const;
+  bool can_prelaunch_draft_for_this_step(const ForwardInput& input) const;
   std::vector<int64_t> build_batch_to_pending_row_mapping(
       const ForwardInput& input) const;
   DraftBlock run_decode_draft_from_pending(const ForwardInput& input,
@@ -94,7 +89,7 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
   };
 
   bool async_output_enabled_ = false;
-  bool draft_prelaunch_enabled_ = false;
+  bool draft_prelaunch_enabled_for_init_ = false;
   std::optional<PendingContext> pending_context_;
   torch::Tensor prepared_base_positions_;
   dflash_async::DraftCacheBlockTable prepared_context_block_table_;

@@ -25,7 +25,6 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
-#include "core/framework/config/model_config.h"
 #include "core/framework/model/model_sampling_input.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/dflash_async_input_builder.h"
@@ -64,27 +63,20 @@ bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
   // sampled draft ids can be remapped to target space. Full-vocab drafts have
   // no "d2t"; hot_token_id_ stays undefined and no remapping is applied.
   if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
-#if defined(USE_NPU)
-    async_output_enabled_ =
-        enable_schedule_overlap() && device_.unwrap().is_privateuseone() &&
-        ModelConfig::is_python_model_impl(
-            ModelConfig::get_instance().model_impl()) &&
-        draft_impl_->context_.get_model_args().model_type() ==
-            kDSparkDraftModelType &&
-        options_.num_speculative_tokens() > 0 &&
-        parallel_args_.cp_size() == 1 &&
-        parallel_args_.kv_split_size_effective() == 1 &&
-        !options_.enable_adaptive_speculative_decode();
-#endif
+    CHECK_GT(options_.num_speculative_tokens(), 0)
+        << "DSpark requires num_speculative_tokens > 0.";
+    async_output_enabled_ = enable_schedule_overlap() &&
+                            !options_.enable_adaptive_speculative_decode();
     const bool supports_device_inputs =
         draft_impl_->supports_device_only_decode_inputs();
-    validate_draft_prelaunch_config(supports_device_inputs);
-    draft_prelaunch_enabled_ = options_.enable_dspark_prelaunch();
-    draft_impl_->set_device_only_decode_inputs(draft_prelaunch_enabled_);
+    draft_prelaunch_enabled_for_init_ =
+        can_prelaunch_draft_for_init(supports_device_inputs);
+    draft_impl_->set_device_only_decode_inputs(
+        draft_prelaunch_enabled_for_init_);
     LOG(INFO) << "DSpark async output enabled=" << async_output_enabled_;
     LOG(INFO) << "DSpark device-only decode inputs supported="
-              << supports_device_inputs
-              << ", draft prelaunch enabled=" << draft_prelaunch_enabled_;
+              << supports_device_inputs << ", draft prelaunch enabled="
+              << draft_prelaunch_enabled_for_init_;
     auto model_loader = ModelLoader::create(model_weights_path);
     for (const auto& state_dict : model_loader->get_state_dicts()) {
       torch::Tensor d2t_tensor = state_dict->get_tensor("d2t");
@@ -101,41 +93,14 @@ bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
   return result;
 }
 
-void DSparkWorkerImpl::prepare_work_before_execute(
-    const ForwardInput& input,
-    ForwardInput& processed_input) {
-  // Reject unsupported pre-launch inputs before any device copy. The
-  // constraints live on the scheduler input and do not depend on prepare.
-  validate_decode_input(input);
-  DFlashWorkerImpl::prepare_work_before_execute(input, processed_input);
-}
-
-void DSparkWorkerImpl::validate_draft_prelaunch_config(
+bool DSparkWorkerImpl::can_prelaunch_draft_for_init(
     bool supports_device_inputs) const {
-  if (!options_.enable_dspark_prelaunch()) {
-    return;
-  }
-  CHECK(async_output_enabled_)
-      << "--enable_dspark_prelaunch requires schedule overlap, an NPU Python "
-         "DSpark draft, num_speculative_tokens > 0, CP=1, KV split=1, "
-         "and adaptive speculative decode disabled";
-  CHECK(supports_device_inputs)
-      << "--enable_dspark_prelaunch requires a draft model supporting "
-         "device-only decode inputs";
-  CHECK_EQ(options_.draft_sampling_mode(), "greedy")
-      << "--enable_dspark_prelaunch requires greedy draft sampling";
-}
-
-void DSparkWorkerImpl::validate_decode_input(const ForwardInput& input) const {
-  const auto& meta = input.input_params.meta;
-  if (!meta.batch_forward_type.is_decode() || meta.num_sequences == 0 ||
-      meta.is_graph_warmup) {
-    return;
-  }
-  if (options_.enable_dspark_prelaunch()) {
-    const std::string_view error = draft_prelaunch_input_error(input);
-    CHECK(error.empty()) << "--enable_dspark_prelaunch: " << error;
-  }
+  const bool draft_prelaunch_pending_support_gate =
+      parallel_args_.cp_size() == 1 &&
+      parallel_args_.kv_split_size_effective() == 1;
+  return async_output_enabled_ && draft_prelaunch_pending_support_gate &&
+         draft_sampling_mode_ == DraftSamplingMode::GREEDY &&
+         supports_device_inputs;
 }
 
 std::optional<ForwardOutput> DSparkWorkerImpl::step_decode(
@@ -143,7 +108,7 @@ std::optional<ForwardOutput> DSparkWorkerImpl::step_decode(
   ForwardInput input = raw_input;
   ForwardInput validate_input;
   std::vector<int64_t> pending_rows;
-  if (can_prelaunch_draft(input)) {
+  if (can_prelaunch_draft_for_this_step(input)) {
     pending_rows = build_batch_to_pending_row_mapping(input);
   }
 
@@ -288,47 +253,39 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::execute_draft_query(
 
 bool DSparkWorkerImpl::can_prepare_without_compute_stream_wait(
     const ForwardInput& input) const {
-  return can_prelaunch_draft(input);
+  return can_prelaunch_draft_for_this_step(input);
 }
 
-bool DSparkWorkerImpl::can_prelaunch_draft(const ForwardInput& input) const {
+bool DSparkWorkerImpl::can_prelaunch_draft_for_this_step(
+    const ForwardInput& input) const {
   // Draft sampling consumes JSON grammar state, which is not available before
   // the previous accepted-token D2H and Host state update.
-  return draft_prelaunch_enabled_ && !input.input_params.meta.is_graph_warmup &&
-         input.input_params.meta.batch_forward_type.is_decode() &&
-         input.input_params.meta.num_sequences > 0 &&
-         draft_prelaunch_input_error(input).empty() &&
-         !input.input_params.embedding.embedding_ids.empty() &&
-         input.input_params.embedding.request_ids.size() ==
-             input.input_params.embedding.embedding_ids.size() &&
-         !input.input_params.embedding.mtp_bootstrap_embeddings.defined();
-}
-
-std::string_view DSparkWorkerImpl::draft_prelaunch_input_error(
-    const ForwardInput& input) const {
+  if (!draft_prelaunch_enabled_for_init_ ||
+      input.input_params.meta.is_graph_warmup ||
+      !input.input_params.meta.batch_forward_type.is_decode() ||
+      input.input_params.meta.num_sequences <= 0 ||
+      input.input_params.embedding.embedding_ids.empty() ||
+      input.input_params.embedding.request_ids.size() !=
+          input.input_params.embedding.embedding_ids.size() ||
+      input.input_params.embedding.mtp_bootstrap_embeddings.defined()) {
+    return false;
+  }
   const auto& block_copy = input.input_params.block_copy;
   if (!block_copy.swap_blocks.empty() ||
       (block_copy.src_block_indices.defined() &&
        block_copy.src_block_indices.numel() > 0)) {
-    return "KV swap or copy is not supported";
+    return false;
   }
   if (!input.json_object_states.empty() ||
       !input.json_object_state_snapshots.empty()) {
-    return "JSON grammar sampling requires the previous accepted-token D2H "
-           "and Host state update before draft submission";
+    return false;
   }
-  if (!input.sampling_params.all_greedy_sample) {
-    return "non-greedy target sampling is not supported";
-  }
-  if (input.sampling_params.unique_token_ids.defined() ||
-      input.sampling_params.frequency_penalties.defined() ||
-      input.sampling_params.presence_penalties.defined() ||
-      input.sampling_params.repetition_penalties.defined() ||
-      input.sampling_params.filter_mask.defined() ||
-      input.sampling_params.filter_bitmask.defined()) {
-    return "sampling penalties or token filters require Host sampling state";
-  }
-  return {};
+  const auto& sampling = input.sampling_params;
+  return sampling.all_greedy_sample && !sampling.unique_token_ids.defined() &&
+         !sampling.frequency_penalties.defined() &&
+         !sampling.presence_penalties.defined() &&
+         !sampling.repetition_penalties.defined() &&
+         !sampling.filter_mask.defined() && !sampling.filter_bitmask.defined();
 }
 
 std::vector<int64_t> DSparkWorkerImpl::build_batch_to_pending_row_mapping(

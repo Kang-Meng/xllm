@@ -16,6 +16,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -23,12 +24,15 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/speculative/spec_input_builder.h"
 #include "platform/device.h"
 #include "runtime/dflash/dflash2_worker_impl.h"
 #include "runtime/dspark_worker_impl.h"
+#include "runtime/executor.h"
 #include "runtime/llm_worker_impl.h"
 
 namespace xllm {
@@ -59,14 +63,46 @@ class DFlashWorkerImplTestPeer final {
 
 class DSparkWorkerImplTestPeer final {
  public:
-  static void validate_config(const DSparkWorkerImpl& worker,
-                              bool supports_device_inputs) {
-    worker.validate_draft_prelaunch_config(supports_device_inputs);
+  static void initialize_decode_modes(DSparkWorkerImpl& worker,
+                                      bool supports_device_inputs) {
+    worker.async_output_enabled_ =
+        worker.enable_schedule_overlap() &&
+        !worker.options_.enable_adaptive_speculative_decode();
+    worker.draft_prelaunch_enabled_for_init_ =
+        worker.can_prelaunch_draft_for_init(supports_device_inputs);
   }
 
-  static void validate_input(const DSparkWorkerImpl& worker,
-                             const ForwardInput& input) {
-    worker.validate_decode_input(input);
+  static void set_parallel_sizes(DSparkWorkerImpl& worker,
+                                 int32_t cp_size,
+                                 int32_t kv_split_size) {
+    worker.parallel_args_.cp_size(cp_size);
+    worker.parallel_args_.kv_split_size(kv_split_size);
+  }
+
+  static bool can_prelaunch_draft_for_init(const DSparkWorkerImpl& worker,
+                                           bool supports_device_inputs) {
+    return worker.can_prelaunch_draft_for_init(supports_device_inputs);
+  }
+
+  static void configure_execution(DSparkWorkerImpl& worker,
+                                  std::unique_ptr<LLMWorkerImpl> draft,
+                                  std::unique_ptr<WorkerImpl> target,
+                                  std::shared_ptr<EmbeddingCache> cache) {
+    worker.draft_impl_ = std::move(draft);
+    worker.impl_ = std::move(target);
+    worker.context_ = worker.impl_->context_;
+    worker.dtype_ = worker.impl_->dtype();
+    worker.embedding_cache_ = std::move(cache);
+    worker.mask_token_id_ = 31;
+    worker.draft_sas_mode_ = dflash_detail::DSparkSasMode::NATIVE;
+    worker.enable_fused_kernel_ = false;
+    initialize_decode_modes(worker, true);
+  }
+
+  static std::optional<ForwardOutput> run_decode_step(
+      DSparkWorkerImpl& worker,
+      const ForwardInput& input) {
+    return worker.step_decode(input);
   }
 
   static void install_output(DSparkWorkerImpl& worker, ForwardOutput output) {
@@ -98,18 +134,18 @@ class DSparkWorkerImplTestPeer final {
     return worker.async_output_enabled_;
   }
 
-  static void set_async_output_enabled(DSparkWorkerImpl& worker, bool enabled) {
-    worker.async_output_enabled_ = enabled;
+  static bool draft_prelaunch_enabled_for_init(const DSparkWorkerImpl& worker) {
+    return worker.draft_prelaunch_enabled_for_init_;
   }
 
-  static void set_draft_prelaunch_enabled(DSparkWorkerImpl& worker,
-                                          bool enabled) {
-    worker.draft_prelaunch_enabled_ = enabled;
+  static bool can_prepare_without_wait(const DSparkWorkerImpl& worker,
+                                       const ForwardInput& input) {
+    return worker.can_prepare_without_compute_stream_wait(input);
   }
 
-  static bool can_prelaunch_draft(const DSparkWorkerImpl& worker,
-                                  const ForwardInput& input) {
-    return worker.can_prelaunch_draft(input);
+  static bool can_prelaunch_draft_for_this_step(const DSparkWorkerImpl& worker,
+                                                const ForwardInput& input) {
+    return worker.can_prelaunch_draft_for_this_step(input);
   }
 
   static std::vector<int64_t> pending_rows(const DSparkWorkerImpl& worker,
@@ -129,8 +165,7 @@ class DSparkWorkerImplTestPeer final {
                                       const torch::Tensor& positions,
                                       StreamEventPtr ready,
                                       std::shared_ptr<EmbeddingCache> cache) {
-    worker.async_output_enabled_ = true;
-    worker.draft_prelaunch_enabled_ = true;
+    initialize_decode_modes(worker, true);
     worker.embedding_cache_ = std::move(cache);
     worker.pending_context_.emplace();
     worker.pending_context_->identity = std::move(identity);
@@ -224,7 +259,6 @@ TEST_P(DSparkDraftInputParityTest,
   const ParallelArgs parallel_args(0, 1, nullptr);
   runtime::Options options;
   options.enable_schedule_overlap(true)
-      .enable_dspark_prelaunch(true)
       .speculative_algorithm("dspark")
       .num_speculative_tokens(kQueryWidth)
       .block_size(block_size);
@@ -393,18 +427,21 @@ TEST(DSparkDecodeStepTest, AsyncOutputDoesNotRequireDraftPrelaunch) {
   EXPECT_FALSE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::pending_rows(worker, input).empty());
 
-  DSparkWorkerImplTestPeer::set_async_output_enabled(worker, true);
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input));
+  DSparkWorkerImplTestPeer::initialize_decode_modes(worker, false);
+  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::pending_rows(worker, input).empty());
 
-  DSparkWorkerImplTestPeer::set_draft_prelaunch_enabled(worker, true);
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input));
+  DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
+  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::pending_rows(worker, input).empty());
 
   input.input_params.meta.is_graph_warmup = true;
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input));
+  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
 }
 
@@ -416,8 +453,7 @@ TEST(DSparkDecodeStepTest, SamplingConstraintsDoNotDisableAsyncOutput) {
   runtime::Options options;
   options.enable_schedule_overlap(true).num_speculative_tokens(15);
   DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(worker, true);
-  DSparkWorkerImplTestPeer::set_draft_prelaunch_enabled(worker, true);
+  DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
   ForwardInput input;
   input.input_params.meta.num_sequences = 1;
   input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
@@ -425,16 +461,22 @@ TEST(DSparkDecodeStepTest, SamplingConstraintsDoNotDisableAsyncOutput) {
   input.input_params.embedding.request_ids = {"request"};
   input.sampling_params.all_greedy_sample = false;
 
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input));
+  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
 
   input.sampling_params.all_greedy_sample = true;
   input.sampling_params.repetition_penalties = torch::tensor({1.1f});
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input));
+  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
 }
 
-enum class DSparkDecodeFallback { DRAFT_DISABLED, NEW_REQUEST, BOOTSTRAP };
+enum class DSparkDecodeFallback {
+  DEVICE_INPUTS_UNSUPPORTED,
+  NEW_REQUEST,
+  BOOTSTRAP
+};
 
 class DSparkDecodeStepFallbackTest
     : public ::testing::TestWithParam<DSparkDecodeFallback> {};
@@ -482,8 +524,8 @@ TEST_P(DSparkDecodeStepFallbackTest,
                                                     cache);
   ForwardInput input = previous;
   switch (GetParam()) {
-    case DSparkDecodeFallback::DRAFT_DISABLED:
-      DSparkWorkerImplTestPeer::set_draft_prelaunch_enabled(worker, false);
+    case DSparkDecodeFallback::DEVICE_INPUTS_UNSUPPORTED:
+      DSparkWorkerImplTestPeer::initialize_decode_modes(worker, false);
       break;
 
     case DSparkDecodeFallback::NEW_REQUEST:
@@ -495,7 +537,8 @@ TEST_P(DSparkDecodeStepFallbackTest,
   }
 
   std::vector<int64_t> pending_rows;
-  if (DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input)) {
+  if (DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(worker,
+                                                                  input)) {
     pending_rows = DSparkWorkerImplTestPeer::pending_rows(worker, input);
   }
   EXPECT_TRUE(pending_rows.empty());
@@ -511,42 +554,65 @@ TEST_P(DSparkDecodeStepFallbackTest,
   EXPECT_EQ(DSparkWorkerImplTestPeer::consumed_tensor_count(worker), 3);
 }
 
-INSTANTIATE_TEST_SUITE_P(DraftDisabledAndUnmatched,
-                         DSparkDecodeStepFallbackTest,
-                         ::testing::Values(DSparkDecodeFallback::DRAFT_DISABLED,
+INSTANTIATE_TEST_SUITE_P(
+    DeviceInputsUnsupportedAndUnmatched,
+    DSparkDecodeStepFallbackTest,
+    ::testing::Values(DSparkDecodeFallback::DEVICE_INPUTS_UNSUPPORTED,
 
-                                           DSparkDecodeFallback::NEW_REQUEST,
-                                           DSparkDecodeFallback::BOOTSTRAP));
+                      DSparkDecodeFallback::NEW_REQUEST,
+                      DSparkDecodeFallback::BOOTSTRAP));
 
-TEST(DSparkDecodeStepTest, ExplicitPrelaunchRejectsUnsupportedConfiguration) {
+TEST(DSparkDecodeStepTest, AutomaticDecodeModesRespectConfigAndDeviceInputs) {
   Device device(0);
   device.set_device();
   device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  DSparkWorkerImpl disabled(parallel_args, device.unwrap(), options);
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_config(disabled, false));
-
-  options.enable_dspark_prelaunch(true).draft_sampling_mode("greedy");
-  DSparkWorkerImpl enabled(parallel_args, device.unwrap(), options);
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_config(enabled, true),
-               "requires schedule overlap");
-  DSparkWorkerImplTestPeer::set_async_output_enabled(enabled, true);
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_config(enabled, false),
-               "device-only decode inputs");
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_config(enabled, true));
-
-  options.draft_sampling_mode("probabilistic");
-  DSparkWorkerImpl non_greedy(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(non_greedy, true);
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_config(non_greedy, true),
-               "greedy draft sampling");
+  struct TestCase {
+    std::string name;
+    bool overlap;
+    bool adaptive;
+    int32_t cp_size;
+    int32_t kv_split_size;
+    std::string sampling_mode;
+    bool device_inputs;
+    bool async_output;
+    bool prelaunch;
+  };
+  const std::vector<TestCase> cases = {
+      {"supported", true, false, 1, 1, "greedy", true, true, true},
+      {"async_only", true, false, 1, 1, "greedy", false, true, false},
+      {"no_overlap", false, false, 1, 1, "greedy", true, false, false},
+      {"adaptive", true, true, 1, 1, "greedy", true, false, false},
+      {"context_parallel", true, false, 2, 1, "greedy", true, true, false},
+      {"kv_split", true, false, 1, 2, "greedy", true, true, false},
+      {"probabilistic", true, false, 1, 1, "probabilistic", true, true, false},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    ParallelArgs parallel_args(0, 2, nullptr);
+    runtime::Options options;
+    options.enable_schedule_overlap(test_case.overlap)
+        .enable_adaptive_speculative_decode(test_case.adaptive)
+        .num_speculative_tokens(15)
+        .draft_sampling_mode(test_case.sampling_mode);
+    DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+    DSparkWorkerImplTestPeer::set_parallel_sizes(
+        worker, test_case.cp_size, test_case.kv_split_size);
+    DSparkWorkerImplTestPeer::initialize_decode_modes(worker,
+                                                      test_case.device_inputs);
+    EXPECT_EQ(DSparkWorkerImplTestPeer::async_output_enabled(worker),
+              test_case.async_output);
+    EXPECT_EQ(
+        DSparkWorkerImplTestPeer::draft_prelaunch_enabled_for_init(worker),
+        test_case.prelaunch);
+    EXPECT_FALSE(
+        DSparkWorkerImplTestPeer::can_prelaunch_draft_for_init(worker, false));
+    EXPECT_EQ(
+        DSparkWorkerImplTestPeer::draft_prelaunch_enabled_for_init(worker),
+        test_case.prelaunch);
+  }
 }
 
-TEST(DSparkDecodeStepTest, PdDecodeAllowsKvTransfersWithAndWithoutPrelaunch) {
+TEST(DSparkDecodeStepTest, PdDecodeDoesNotDisableAsyncOutputOrPrelaunch) {
   Device device(0);
   device.set_device();
   device.init_device_context();
@@ -563,73 +629,73 @@ TEST(DSparkDecodeStepTest, PdDecodeAllowsKvTransfersWithAndWithoutPrelaunch) {
   input.input_params.embedding.embedding_ids = {0};
   input.input_params.embedding.request_ids = {"request"};
   input.sampling_params.all_greedy_sample = true;
-  input.transfer_kv_infos.emplace_back();
-
-  for (const bool prelaunch_enabled : {false, true}) {
-    options.enable_dspark_prelaunch(prelaunch_enabled);
+  for (const bool supports_device_inputs : {false, true}) {
     DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
-    DSparkWorkerImplTestPeer::set_async_output_enabled(worker, true);
-    DSparkWorkerImplTestPeer::set_draft_prelaunch_enabled(worker,
-                                                          prelaunch_enabled);
-    EXPECT_NO_FATAL_FAILURE(DSparkWorkerImplTestPeer::validate_config(
-        worker, /*supports_device_inputs=*/true));
-    EXPECT_NO_FATAL_FAILURE(
-        DSparkWorkerImplTestPeer::validate_input(worker, input));
-    EXPECT_EQ(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input),
-              prelaunch_enabled);
+    DSparkWorkerImplTestPeer::initialize_decode_modes(worker,
+                                                      supports_device_inputs);
+    EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
+    EXPECT_EQ(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+                  worker, input),
+              supports_device_inputs);
   }
 }
 
-TEST(DSparkDecodeStepTest, ConstraintsRejectOnlyExplicitPrelaunch) {
+TEST(DSparkDecodeStepTest, BatchConstraintsSelectNormalPathAndAllowRecovery) {
   Device device(0);
   device.set_device();
   device.init_device_context();
   const ParallelArgs parallel_args(0, 1, nullptr);
   runtime::Options options;
   options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  DSparkWorkerImpl disabled(parallel_args, device.unwrap(), options);
-  options.enable_dspark_prelaunch(true);
-  DSparkWorkerImpl enabled(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(disabled, true);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(enabled, true);
+  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+  DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
   ForwardInput input;
   input.input_params.meta.num_sequences = 1;
   input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  input.input_params.embedding.embedding_ids = {0};
+  input.input_params.embedding.request_ids = {"request"};
   input.sampling_params.all_greedy_sample = true;
 
+  auto expect_normal_path = [&]() {
+    EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+        worker, input));
+    EXPECT_FALSE(
+        DSparkWorkerImplTestPeer::can_prepare_without_wait(worker, input));
+    EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
+    EXPECT_TRUE(
+        DSparkWorkerImplTestPeer::draft_prelaunch_enabled_for_init(worker));
+  };
+  auto expect_prelaunch = [&]() {
+    EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+        worker, input));
+    EXPECT_TRUE(
+        DSparkWorkerImplTestPeer::can_prepare_without_wait(worker, input));
+    EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
+  };
+  expect_prelaunch();
   input.json_object_states.emplace_back();
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_input(disabled, input));
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_input(enabled, input),
-               "JSON grammar sampling");
+  expect_normal_path();
   input.json_object_states.clear();
+  expect_prelaunch();
   input.json_object_state_snapshots.emplace_back();
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_input(disabled, input));
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_input(enabled, input),
-               "JSON grammar sampling");
+  expect_normal_path();
   input.json_object_state_snapshots.clear();
+  expect_prelaunch();
 
   input.input_params.block_copy.src_block_indices = torch::tensor({0});
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_input(disabled, input));
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_input(enabled, input),
-               "KV swap or copy");
+  expect_normal_path();
   input.input_params.block_copy.src_block_indices = torch::Tensor();
+  expect_prelaunch();
 
   input.input_params.block_copy.swap_blocks.emplace_back(0, 1);
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_input(disabled, input));
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_input(enabled, input),
-               "KV swap or copy");
+  expect_normal_path();
   input.input_params.block_copy.swap_blocks.clear();
+  expect_prelaunch();
 
   input.sampling_params.all_greedy_sample = false;
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_input(disabled, input));
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_input(enabled, input),
-               "non-greedy target sampling");
+  expect_normal_path();
   input.sampling_params.all_greedy_sample = true;
+  expect_prelaunch();
   for (torch::Tensor* parameter : {&input.sampling_params.unique_token_ids,
                                    &input.sampling_params.frequency_penalties,
                                    &input.sampling_params.presence_penalties,
@@ -637,13 +703,10 @@ TEST(DSparkDecodeStepTest, ConstraintsRejectOnlyExplicitPrelaunch) {
                                    &input.sampling_params.filter_mask,
                                    &input.sampling_params.filter_bitmask}) {
     *parameter = torch::tensor({1.1f});
-    EXPECT_NO_FATAL_FAILURE(
-        DSparkWorkerImplTestPeer::validate_input(disabled, input));
-    EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_input(enabled, input),
-                 "sampling penalties");
+    expect_normal_path();
     *parameter = torch::Tensor();
+    expect_prelaunch();
   }
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(disabled));
 }
 
 TEST(DSparkDecodeStepTest, RestoreAndMultiTableDoNotDisableAsyncOrPrelaunch) {
@@ -652,13 +715,10 @@ TEST(DSparkDecodeStepTest, RestoreAndMultiTableDoNotDisableAsyncOrPrelaunch) {
   device.init_device_context();
   const ParallelArgs parallel_args(0, 1, nullptr);
   runtime::Options options;
-  options.enable_schedule_overlap(true)
-      .enable_dspark_prelaunch(true)
-      .num_speculative_tokens(15)
-      .block_size(4);
+  options.enable_schedule_overlap(true).num_speculative_tokens(15).block_size(
+      4);
   DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(worker, true);
-  DSparkWorkerImplTestPeer::set_draft_prelaunch_enabled(worker, true);
+  DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
   ForwardInput input;
   input.input_params.meta.num_sequences = 2;
   input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
@@ -671,9 +731,8 @@ TEST(DSparkDecodeStepTest, RestoreAndMultiTableDoNotDisableAsyncOrPrelaunch) {
   input.input_params.multi_block_tables = {
       torch::tensor({{7, 3}, {5, 9}}, torch::kInt32),
       torch::tensor({{11}, {13}}, torch::kInt32)};
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_input(worker, input));
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input));
+  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
 
   auto compute = device.current_stream();
@@ -712,7 +771,8 @@ TEST(DSparkDecodeStepTest, RestoreAndMultiTableDoNotDisableAsyncOrPrelaunch) {
   EXPECT_TRUE(input.input_params.meta.requires_host_restore);
 }
 
-TEST(DSparkDecodeStepTest, JsonDecodePreparationHonorsPrelaunchFlag) {
+TEST(DSparkDecodeStepTest,
+     JsonDecodePreparationUsesNormalPathAndAllowsRecovery) {
   Device device(0);
   device.set_device();
   device.init_device_context();
@@ -726,6 +786,8 @@ TEST(DSparkDecodeStepTest, JsonDecodePreparationHonorsPrelaunchFlag) {
   input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
   input.input_params.meta.q_max_seq_len = 1;
   input.input_params.meta.kv_max_seq_len = 1;
+  input.input_params.embedding.embedding_ids = {0};
+  input.input_params.embedding.request_ids = {"request"};
   input.input_params.attention.host.q_seq_lens = {1};
   input.input_params.attention.host.kv_seq_lens = {1};
   input.input_params.attention.host.new_cache_slots = {0};
@@ -735,25 +797,28 @@ TEST(DSparkDecodeStepTest, JsonDecodePreparationHonorsPrelaunchFlag) {
   JsonObjectGrammar grammar({"{", "}", "stop"}, {2});
   input.json_object_states = {grammar.initial_state()};
 
-  // Reject before any device prepare, so the death is the input contract and
-  // not a later NPU failure inside the forked process.
-  options.enable_dspark_prelaunch(true);
-  DSparkWorkerImpl enabled(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(enabled, true);
-  ForwardInput rejected;
-  EXPECT_DEATH(enabled.prepare_work_before_execute(input, rejected),
-               "JSON grammar sampling");
-
-  options.enable_dspark_prelaunch(false);
-  DSparkWorkerImpl disabled(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(disabled, true);
+  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+  DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
+  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
   ForwardInput processed;
-  disabled.prepare_work_before_execute(input, processed);
+  worker.prepare_work_before_execute(input, processed);
   ASSERT_NE(processed.metadata_ready_event, nullptr);
   ASSERT_TRUE(processed.metadata_ready_event->synchronize());
   ASSERT_EQ(processed.json_object_states.size(), 1);
   EXPECT_TRUE(processed.json_object_states.front().initialized());
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(disabled));
+  EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
+  EXPECT_TRUE(
+      DSparkWorkerImplTestPeer::draft_prelaunch_enabled_for_init(worker));
+
+  input.json_object_states.clear();
+  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
+  ForwardInput unconstrained;
+  worker.prepare_work_before_execute(input, unconstrained);
+  ASSERT_NE(unconstrained.metadata_ready_event, nullptr);
+  ASSERT_TRUE(unconstrained.metadata_ready_event->synchronize());
+  EXPECT_TRUE(unconstrained.json_object_states.empty());
 }
 
 class ContextOnlyModel final : public CausalLM {
@@ -801,6 +866,340 @@ class ContextOnlyWorker final : public LLMWorkerImpl {
         torch::TensorOptions().device(device).dtype(torch::kFloat));
   }
 };
+
+struct DecodeStepTrace {
+  std::vector<bool> pending_at_draft;
+  std::vector<torch::Tensor> draft_tokens;
+  std::vector<torch::Tensor> draft_positions;
+  std::vector<torch::Tensor> draft_slots;
+  std::vector<torch::Tensor> context_slots;
+};
+
+class DecodeStepDraftModel final : public CausalLM {
+ public:
+  DecodeStepDraftModel(torch::TensorOptions options,
+                       std::shared_ptr<DecodeStepTrace> trace,
+                       std::function<bool()> has_pending)
+      : options_(std::move(options)),
+        trace_(std::move(trace)),
+        has_pending_(std::move(has_pending)) {}
+
+  ModelOutput forward(const torch::Tensor& token_ids,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>&,
+                      const ModelInputParams& params) override {
+    trace_->pending_at_draft.emplace_back(has_pending_());
+    trace_->draft_tokens.emplace_back(token_ids.clone());
+    trace_->draft_positions.emplace_back(positions.clone());
+    trace_->draft_slots.emplace_back(
+        params.attention.device.new_cache_slots.clone());
+    torch::Tensor anchors =
+        token_ids.view({params.meta.num_sequences, -1}).select(1, 0);
+    ModelOutput output;
+    output.draft_proposal.emplace(
+        torch::stack({anchors + 1, anchors + 2}, 1).to(torch::kLong));
+    return output;
+  }
+
+  torch::Tensor logits(const torch::Tensor&, const torch::Tensor&) override {
+    LOG(FATAL) << "The test draft returns a completed proposal.";
+    return {};
+  }
+
+  ModelOutput write_context_kv(const torch::Tensor& hidden,
+                               const torch::Tensor&,
+                               const torch::Tensor& slots,
+                               std::vector<KVCache>&,
+                               const ModelInputParams&) override {
+    trace_->context_slots.emplace_back(slots.clone());
+    return ModelOutput(hidden);
+  }
+
+  void load_model(std::unique_ptr<ModelLoader>) override {}
+  torch::Device device() const override { return options_.device(); }
+  const torch::TensorOptions& options() const override { return options_; }
+  void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
+  void update_expert_weight(int32_t) override {}
+
+ private:
+  torch::TensorOptions options_;
+  std::shared_ptr<DecodeStepTrace> trace_;
+  std::function<bool()> has_pending_;
+};
+
+class DecodeStepDraftWorker final : public LLMWorkerImpl {
+ public:
+  DecodeStepDraftWorker(const ParallelArgs& parallel_args,
+                        const torch::Device& device,
+                        const runtime::Options& options,
+                        std::shared_ptr<DecodeStepTrace> trace,
+                        std::function<bool()> has_pending)
+      : LLMWorkerImpl(parallel_args, device, options) {
+    dtype_ = torch::kFloat;
+    auto tensor_options = torch::TensorOptions().device(device).dtype(dtype_);
+    ModelArgs args;
+    args.model_type("dspark_decode_step_test")
+        .n_layers(1)
+        .hidden_size(4)
+        .draft_query_uses_decode(true);
+    context_ = ModelContext(parallel_args, args, QuantArgs(), tensor_options);
+    model_ = std::make_unique<DecodeStepDraftModel>(
+        tensor_options, std::move(trace), std::move(has_pending));
+    model_executor_ =
+        std::make_unique<Executor>(model_.get(), args, device, options);
+    is_spec_draft_ = true;
+  }
+
+  bool owns_npu_parallel_input_prepare() const override { return false; }
+};
+
+class DecodeStepTargetWorker final : public LLMWorkerImpl {
+ public:
+  DecodeStepTargetWorker(const ParallelArgs& parallel_args,
+                         const torch::Device& device,
+                         const runtime::Options& options)
+      : LLMWorkerImpl(parallel_args, device, options) {
+    dtype_ = torch::kFloat;
+    ModelArgs args;
+    args.model_type("dspark_decode_step_test").n_layers(1).hidden_size(4);
+    context_ =
+        ModelContext(parallel_args,
+                     args,
+                     QuantArgs(),
+                     torch::TensorOptions().device(device).dtype(dtype_));
+  }
+
+  bool owns_npu_parallel_input_prepare() const override { return false; }
+
+  std::optional<ForwardOutput> execute_no_sync_on_stream(
+      const ForwardInput& input,
+      Stream& compute_stream) override {
+    auto guard = compute_stream.set_stream_guard();
+    CHECK(compute_stream.wait_event(input.metadata_ready_event));
+    ForwardOutput output;
+    output.sample_output.next_tokens = input.token_ids.to(torch::kLong) + 1;
+    output.logits =
+        torch::zeros({input.token_ids.numel(), 64},
+                     input.token_ids.options().dtype(torch::kFloat));
+    output.logits.scatter_(
+        1, output.sample_output.next_tokens.unsqueeze(1), 100.0);
+    output.sample_output.embeddings = input.positions.to(torch::kFloat)
+                                          .unsqueeze(1)
+                                          .expand({-1, 4})
+                                          .contiguous();
+    output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
+    output.ready_event = compute_stream.record_event();
+    return output;
+  }
+};
+
+class DSparkDecodeExecutionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_model_impl_ = ModelConfig::get_instance().model_impl();
+    saved_manual_loader_ = LoadConfig::get_instance().enable_manual_loader();
+    ModelConfig::get_instance().model_impl("native");
+    LoadConfig::get_instance().enable_manual_loader(false);
+    device_.set_device();
+    device_.init_device_context();
+  }
+
+  void TearDown() override {
+    EXPECT_EQ(device_.synchronize_default_stream(), 0);
+    ModelConfig::get_instance().model_impl(saved_model_impl_);
+    LoadConfig::get_instance().enable_manual_loader(saved_manual_loader_);
+  }
+
+  Device device_{0};
+  std::string saved_model_impl_;
+  bool saved_manual_loader_ = false;
+};
+
+TEST_F(DSparkDecodeExecutionTest, PrelaunchFallsBackForPenaltyAndRecovers) {
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_graph(false)
+      .backend("llm")
+      .enable_schedule_overlap(true)
+      .enable_speculative_decode(true)
+      .speculative_algorithm("DSpark")
+      .draft_sampling_mode("greedy")
+      .num_speculative_tokens(2)
+      .block_size(4);
+  DSparkWorkerImpl worker(parallel_args, device_.unwrap(), options);
+  auto cache = std::make_shared<EmbeddingCache>(2, true);
+  auto trace = std::make_shared<DecodeStepTrace>();
+  trace->pending_at_draft.reserve(3);
+  trace->draft_tokens.reserve(3);
+  trace->draft_positions.reserve(3);
+  trace->draft_slots.reserve(3);
+  trace->context_slots.reserve(3);
+  runtime::Options leaf_options = options;
+  leaf_options.enable_schedule_overlap(false);
+  DSparkWorkerImplTestPeer::configure_execution(
+      worker,
+      std::make_unique<DecodeStepDraftWorker>(
+          parallel_args,
+          device_.unwrap(),
+          leaf_options,
+          trace,
+          [&worker]() {
+            return DSparkWorkerImplTestPeer::has_pending(worker);
+          }),
+      std::make_unique<DecodeStepTargetWorker>(
+          parallel_args, device_.unwrap(), leaf_options),
+      cache);
+
+  ForwardInput previous;
+  previous.input_params.meta.num_sequences = 2;
+  previous.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  previous.input_params.embedding.embedding_ids = {0, 1};
+  previous.input_params.embedding.request_ids = {"first", "second"};
+  previous.sample_sequence_ids = {"first-sequence", "second-sequence"};
+  previous.positions_host = torch::tensor({2, 10}, torch::kInt);
+  previous.input_params.attention.host.block_tables = torch::tensor(
+      {{1, 3, 5, 7, 9, 11, 13, 15}, {2, 4, 6, 8, 10, 12, 14, 16}}, torch::kInt);
+  torch::Tensor accepted_host =
+      torch::tensor({{2, 3, 4}, {12, 13, 14}}, torch::kLong);
+  torch::Tensor accepted_device = accepted_host.to(device_.unwrap());
+  torch::Tensor embeddings =
+      torch::zeros({2, 3, 4}, torch::TensorOptions().device(device_.unwrap()));
+  torch::Tensor base_positions = previous.positions_host.to(device_.unwrap());
+  auto ready = device_.current_stream()->record_event();
+  ASSERT_NE(ready, nullptr);
+  DSparkWorkerImplTestPeer::install_pending_context(worker,
+                                                    previous,
+                                                    accepted_device,
+                                                    accepted_host,
+                                                    embeddings,
+                                                    base_positions,
+                                                    ready,
+                                                    cache);
+
+  const std::vector<torch::Tensor> scheduler_positions = {
+      torch::tensor({3, 11}, torch::kInt),
+      torch::tensor({6, 14}, torch::kInt),
+      torch::tensor({17, 9}, torch::kInt)};
+  const std::vector<torch::Tensor> expected_anchors = {
+      torch::tensor({4, 14}, torch::kLong),
+      torch::tensor({7, 17}, torch::kLong),
+      torch::tensor({20, 10}, torch::kLong)};
+  std::vector<ForwardInput> step_inputs;
+  std::vector<ForwardOutput> outputs;
+  step_inputs.reserve(scheduler_positions.size());
+  outputs.reserve(scheduler_positions.size());
+  for (size_t step = 0; step < scheduler_positions.size(); ++step) {
+    SCOPED_TRACE(step);
+    ForwardInput input = previous;
+    input.input_params.meta.batch_id = static_cast<uint64_t>(step + 1);
+    input.token_ids_host = torch::full({2}, -1, torch::kInt);
+    input.positions_host = scheduler_positions[step];
+    input.token_ids = input.token_ids_host.to(device_.unwrap());
+    input.positions = input.positions_host.to(device_.unwrap());
+    input.input_params.attention.host.q_seq_lens = {1, 1};
+    input.input_params.attention.host.kv_seq_lens = {
+        input.positions_host[0].item<int32_t>() + 1,
+        input.positions_host[1].item<int32_t>() + 1};
+    input.input_params.meta.kv_max_seq_len =
+        input.positions_host.max().item<int32_t>() + 1;
+    ExecutionBatchMetadata& execution_batch =
+        input.input_params.execution_batch;
+    execution_batch.num_reqs = 2;
+    execution_batch.num_tokens = 2;
+    execution_batch.num_scheduled_tokens = {1, 1};
+    execution_batch.num_computed_tokens = {
+        input.positions_host[0].item<int32_t>(),
+        input.positions_host[1].item<int32_t>()};
+    execution_batch.query_start_loc = {0, 1, 2};
+    execution_batch.is_prefilling = {0, 0};
+    input.sampling_params.all_greedy_sample = true;
+    input.sampling_params.do_sample =
+        torch::zeros({2}, input.token_ids.options().dtype(torch::kBool));
+    if (step == 1) {
+      input.sampling_params.repetition_penalties = torch::tensor({1.1f, 1.1f});
+    }
+    if (step == 2) {
+      input.input_params.embedding.embedding_ids = {1, 0};
+      input.input_params.embedding.request_ids = {"second", "first"};
+      input.sample_sequence_ids = {"second-sequence", "first-sequence"};
+      input.input_params.attention.host.block_tables =
+          previous.input_params.attention.host.block_tables.flip({0});
+    }
+    input.input_params.attention.device.block_tables =
+        input.input_params.attention.host.block_tables.to(device_.unwrap());
+    input.metadata_ready_event = device_.current_stream()->record_event();
+    EXPECT_EQ(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+                  worker, input),
+              step != 1);
+    auto output = DSparkWorkerImplTestPeer::run_decode_step(worker, input);
+    ASSERT_TRUE(output.has_value());
+    ASSERT_NE(output->ready_event, nullptr);
+    EXPECT_TRUE(output->requires_host_retirement);
+    EXPECT_TRUE(output->sample_output.next_tokens.device().is_cpu());
+    ASSERT_EQ(trace->pending_at_draft.size(), step + 1);
+    EXPECT_EQ(trace->pending_at_draft.back(), step != 1);
+    ASSERT_EQ(trace->context_slots.size(), step + 1);
+    EXPECT_TRUE(DSparkWorkerImplTestPeer::has_pending(worker));
+    EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
+    const auto states =
+        cache->read_decode_states(input.input_params.embedding.embedding_ids,
+                                  input.input_params.embedding.request_ids);
+    ASSERT_EQ(states.size(), 2);
+    for (size_t row = 0; row < states.size(); ++row) {
+      EXPECT_EQ(states[row].token_id,
+                expected_anchors[step][row].item<int64_t>());
+      EXPECT_EQ(states[row].position_offset, 2);
+    }
+    step_inputs.emplace_back(std::move(input));
+    outputs.emplace_back(std::move(*output));
+  }
+  for (size_t step = 0; step < outputs.size(); ++step) {
+    SCOPED_TRACE(step);
+    ASSERT_TRUE(outputs[step].ready_event->synchronize());
+    torch::Tensor actual_tokens = trace->draft_tokens[step].to(torch::kCPU);
+    EXPECT_TRUE(
+        torch::equal(actual_tokens.view({2, 2}).select(1, 0).to(torch::kLong),
+                     expected_anchors[step]));
+    torch::Tensor expected_positions =
+        (scheduler_positions[step] + 2).unsqueeze(1) +
+        torch::arange(2, torch::kInt).unsqueeze(0);
+    EXPECT_TRUE(
+        torch::equal(trace->draft_positions[step].to(torch::kCPU).view({2, 2}),
+                     expected_positions));
+    torch::Tensor block_indices =
+        torch::floor_divide(expected_positions, 4).to(torch::kLong);
+    const torch::Tensor& block_table =
+        step_inputs[step].input_params.attention.host.block_tables;
+    torch::Tensor expected_slots = block_table.gather(1, block_indices) * 4 +
+                                   expected_positions.remainder(4);
+    EXPECT_TRUE(torch::equal(
+        trace->draft_slots[step].to(torch::kCPU).view({2, 2}), expected_slots));
+    torch::Tensor context_positions =
+        (scheduler_positions[step] + 2).unsqueeze(1) +
+        torch::arange(3, torch::kInt).unsqueeze(0);
+    torch::Tensor context_block_indices =
+        torch::floor_divide(context_positions, 4).to(torch::kLong);
+    torch::Tensor expected_context_slots =
+        block_table.gather(1, context_block_indices) * 4 +
+        context_positions.remainder(4);
+    EXPECT_TRUE(
+        torch::equal(trace->context_slots[step].to(torch::kCPU).view({2, 3}),
+                     expected_context_slots));
+    torch::Tensor expected_accepted =
+        expected_anchors[step].unsqueeze(1) + torch::arange(1, 4, torch::kLong);
+    EXPECT_TRUE(
+        torch::equal(outputs[step].sample_output.next_tokens.to(torch::kLong),
+                     expected_accepted));
+  }
+  DSparkWorkerImplTestPeer::commit_pending_context(worker);
+  EXPECT_FALSE(DSparkWorkerImplTestPeer::has_pending(worker));
+  const auto states = cache->read_decode_states({0, 1}, {"first", "second"});
+  ASSERT_EQ(states.size(), 2);
+  EXPECT_EQ(states[0].token_id, 13);
+  EXPECT_EQ(states[1].token_id, 23);
+  DSparkWorkerImplTestPeer::commit_pending_context(worker);
+  EXPECT_EQ(trace->context_slots.size(), 3);
+}
 
 TEST(DSparkDecodeStepTest, AsyncAcceptedOutputReplaysJsonForMixedRows) {
   Device device(0);

@@ -88,7 +88,7 @@ class DSparkWorkerImplTestPeer final {
                               ForwardInput identity,
                               StreamEventPtr ready) {
     worker.async_output_enabled_ = true;
-    worker.draft_prelaunch_enabled_ = true;
+    worker.draft_prelaunch_enabled_for_init_ = true;
     worker.pending_context_.emplace();
     worker.pending_context_->identity = std::move(identity);
     worker.pending_context_->d2h_ready = ready;
@@ -97,7 +97,7 @@ class DSparkWorkerImplTestPeer final {
 
   static bool can_use_step_local(const DSparkWorkerImpl& worker,
                                  const ForwardInput& input) {
-    return worker.can_prelaunch_draft(input);
+    return worker.can_prelaunch_draft_for_this_step(input);
   }
 
   static std::vector<int64_t> pending_rows(const DSparkWorkerImpl& worker,
