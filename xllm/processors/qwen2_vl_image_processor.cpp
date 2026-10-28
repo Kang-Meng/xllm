@@ -15,102 +15,14 @@ limitations under the License.
 
 #include "processors/qwen2_vl_image_processor.h"
 
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <torch/python.h>  // registers the torch::Tensor pybind caster
-// (without it, passing torch::Tensor / vector<Tensor>
-//  to Python compiles but fails at runtime:
-//  "Unable to convert call argument to Python object")
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
-#include <string>
 #include <vector>
 
-#include "core/framework/config/model_config.h"
-#include "core/framework/config/multimodal_config.h"
-#include "core/util/pybind_helper.h"
 #include "processors/transforms.h"
 
-namespace py = pybind11;
-
 namespace xllm {
-
-namespace {
-
-// Delegates image preprocessing to Python (HF AutoImageProcessor via
-// pybind.multimodal.preprocess_tensors) for the Python model-executor path,
-// so no per-model C++ image processor is needed. Lazily initialized on first
-// use (under the GIL acquired by run()).
-class PyImagePreprocess final {
- public:
-  static PyImagePreprocess& instance() {
-    static PyImagePreprocess ins;
-    return ins;
-  }
-
-  bool run(const std::vector<torch::Tensor>& images,
-           std::vector<MMDataItem>& output_items) {
-    py::gil_scoped_acquire gil;
-    try {
-      // Pass the vector directly: pybind11 (pybind11/stl.h) converts
-      // std::vector<torch::Tensor> to a Python list at the call site. (Avoids
-      // both the null-handle default py::list pitfall and an explicit cast.)
-      py::dict res = preprocess_fn_(images, model_path_);
-      // HF returns batched tensors: pixel_values [total_patches, dim],
-      // image_grid_thw [num_images, 3]. Split per image to match the C++
-      // ImageProcessor contract (one MMDataItem per input image).
-      torch::Tensor pixel_values = py::cast<torch::Tensor>(res["pixel_values"]);
-      torch::Tensor grid_thw = py::cast<torch::Tensor>(res["image_grid_thw"]);
-      torch::Tensor grid = grid_thw.cpu().to(torch::kLong);
-      output_items.clear();
-      output_items.reserve(grid.size(0));
-      int64_t offset = 0;
-      for (int64_t i = 0; i < grid.size(0); ++i) {
-        int64_t gt = grid[i][0].item<int64_t>();
-        int64_t gh = grid[i][1].item<int64_t>();
-        int64_t gw = grid[i][2].item<int64_t>();
-        int64_t n = gt * gh * gw;
-        torch::Tensor pv_i =
-            pixel_values.slice(0, offset, offset + n).contiguous();
-        torch::Tensor thw_i = grid_thw[i].unsqueeze(0).contiguous();
-        output_items.emplace_back(
-            MMType::IMAGE,
-            MMDict{{"pixel_values", pv_i}, {"image_grid_thw", thw_i}});
-        offset += n;
-      }
-      return true;
-    } catch (py::error_already_set& e) {
-      LOG(ERROR) << "Python image preprocess failed: " << e.what();
-      return false;
-    } catch (std::exception& e) {
-      LOG(ERROR) << "Python image preprocess failed: " << e.what();
-      return false;
-    }
-  }
-
- private:
-  PyImagePreprocess() {
-    // The constructor runs during the lazy singleton init (called from
-    // process(), outside any GIL scope) — importing a Python module touches
-    // the CPython C API, so the GIL MUST be held here (otherwise segfault).
-    py::gil_scoped_acquire gil;
-    model_path_ = ::xllm::ModelConfig::get_instance().model();
-    // node0 (master+worker) has already imported the `xllm` package via the
-    // Python model, so this submodule import is cheap and safe here.
-    py::module_ mm = py::module_::import("xllm.pybind.multimodal");
-    preprocess_fn_ = mm.attr("preprocess_tensors");
-  }
-
-  ~PyImagePreprocess() { clear_python_object(preprocess_fn_); }
-
-  std::string model_path_;
-  py::object preprocess_fn_;
-};
-
-}  // namespace
 
 namespace {
 
@@ -120,8 +32,7 @@ std::optional<Size> smart_resize(int32_t height,
                                  int32_t width,
                                  int32_t factor = 28,
                                  int32_t min_pixels = 56 * 56,
-                                 int32_t max_pixels = 14 * 14 * 4 * 1280,
-                                 bool enforce_max_pixels = false) {
+                                 int32_t max_pixels = 14 * 14 * 4 * 1280) {
   if (static_cast<double>(std::max(height, width)) / std::min(height, width) >
       200) {
     LOG(ERROR) << "Absolute aspect ratio must be smaller than 200, height: "
@@ -140,12 +51,14 @@ std::optional<Size> smart_resize(int32_t height,
   if (resized_pixels > max_pixels) {
     double beta = std::sqrt((static_cast<int64_t>(height) * width) /
                             static_cast<double>(max_pixels));
-    h_bar = static_cast<int32_t>(
-                std::floor(height / beta / static_cast<double>(factor))) *
-            factor;
-    w_bar = static_cast<int32_t>(
-                std::floor(width / beta / static_cast<double>(factor))) *
-            factor;
+    h_bar = std::max(factor,
+                     static_cast<int32_t>(std::floor(
+                         height / beta / static_cast<double>(factor))) *
+                         factor);
+    w_bar = std::max(factor,
+                     static_cast<int32_t>(std::floor(
+                         width / beta / static_cast<double>(factor))) *
+                         factor);
   } else if (resized_pixels < min_pixels) {
     double beta = std::sqrt(
         min_pixels / static_cast<double>(static_cast<int64_t>(height) * width));
@@ -157,35 +70,6 @@ std::optional<Size> smart_resize(int32_t height,
             factor;
   }
 
-  // Alignment can cross tight pixel bounds or collapse a narrow dimension.
-  // Select the closest aspect ratio among grids that satisfy both bounds.
-  resized_pixels = static_cast<int64_t>(h_bar) * w_bar;
-  if (enforce_max_pixels &&
-      (resized_pixels < min_pixels || resized_pixels > max_pixels)) {
-    const int64_t pixels_per_token = static_cast<int64_t>(factor) * factor;
-    const int64_t min_tokens =
-        (min_pixels + pixels_per_token - 1) / pixels_per_token;
-    const int64_t max_tokens = max_pixels / pixels_per_token;
-    const double aspect = static_cast<double>(width) / height;
-    double best_error = std::numeric_limits<double>::infinity();
-    for (int64_t grid_h = 1; grid_h <= max_tokens; ++grid_h) {
-      const int64_t min_w = (min_tokens + grid_h - 1) / grid_h;
-      const int64_t max_w = max_tokens / grid_h;
-      if (min_w > max_w) {
-        continue;
-      }
-      const int64_t grid_w = std::clamp(
-          static_cast<int64_t>(std::round(grid_h * aspect)), min_w, max_w);
-      const double error =
-          std::abs(std::log(static_cast<double>(grid_w) / grid_h / aspect));
-      if (error >= best_error) {
-        continue;
-      }
-      best_error = error;
-      h_bar = static_cast<int32_t>(grid_h * factor);
-      w_bar = static_cast<int32_t>(grid_w * factor);
-    }
-  }
   return std::make_pair(h_bar, w_bar);
 }
 
@@ -195,9 +79,6 @@ std::optional<Size> smart_resize(int32_t height,
 // patch_size * merge_size``. For a single image HF passes
 // ``num_frames == temporal_factor`` (the image is temporally duplicated), so
 // ``aligned_frames`` is at least ``temporal_factor``; we mirror that here.
-// Used as a fallback for the model_impl=python path when the HF
-// ``Glm5NextImageProcessor`` class is unavailable (stock transformers), so
-// image input no longer requires the dev (patched) transformers.
 std::optional<Size> smart_resize_tokens(int32_t num_frames,
                                         int32_t height,
                                         int32_t width,
@@ -279,11 +160,8 @@ std::optional<Size> smart_resize_tokens(int32_t num_frames,
 
 }  // namespace
 
-Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args)
-    : Qwen2VLImageProcessor(args, /*max_image_tokens=*/0) {}
-
 Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args,
-                                             int32_t max_image_tokens) {
+                                             const ProcessorConfig& config) {
   image_mean_ = torch::tensor(args.mm_image_normalize_mean(),
                               torch::dtype(torch::kFloat32));
   image_std_ = torch::tensor(args.mm_image_normalize_std(),
@@ -307,22 +185,20 @@ Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args,
   min_tokens_ = args.mm_image_min_tokens();
   max_tokens_ = args.mm_image_max_tokens();
 
-  CHECK_GE(max_image_tokens, 0) << "image_max_tokens_num must be nonnegative";
-  if (max_image_tokens > 0) {
+  min_pixels_ =
+      config.value("image.min_pixels",
+                   config.value("image.size.shortest_edge", min_pixels_));
+  max_pixels_ = config.value(
+      "image.max_pixels", config.value("image.size.longest_edge", max_pixels_));
+  if (!config.empty("image")) {
     CHECK(min_tokens_ <= 0 || max_tokens_ <= 0)
-        << "image_max_tokens_num requires pixel-budget resizing";
+        << "Pixel overrides are unsupported for token-budget resizing";
+    CHECK_GT(min_pixels_, 0) << "min_pixels must be positive";
+    CHECK_LE(min_pixels_, max_pixels_)
+        << "min_pixels must not exceed max_pixels after merging defaults";
     const int64_t factor = static_cast<int64_t>(patch_size_) * merge_size_;
-    const int64_t pixel_limit = std::numeric_limits<int32_t>::max();
-    CHECK_LE(factor, pixel_limit / factor)
-        << "image_max_tokens_num pixel budget exceeds int32 range";
-    const int64_t pixels_per_token = factor * factor;
-    CHECK_LE(max_image_tokens, pixel_limit / pixels_per_token)
-        << "image_max_tokens_num pixel budget exceeds int32 range";
-    const int64_t max_pixels = max_image_tokens * pixels_per_token;
-    CHECK_GE(max_pixels, min_pixels_)
-        << "image_max_tokens_num pixel budget is below the model minimum";
-    max_pixels_ = static_cast<int32_t>(max_pixels);
-    enforce_max_pixels_ = true;
+    CHECK_LE(factor, max_pixels_ / factor)
+        << "max_pixels must fit at least one aligned image patch group";
   }
 
   if (do_rescale_ && do_normalize_) {
@@ -330,21 +206,6 @@ Qwen2VLImageProcessor::Qwen2VLImageProcessor(const ModelArgs& args,
     image_std_.mul_(1.0 / rescale_factor_);
     do_rescale_ = false;
   }
-}
-
-Qwen35ImageProcessor::Qwen35ImageProcessor(const ModelArgs& args)
-    : Qwen35ImageProcessor(
-          args,
-          MultimodalConfig::get_instance().image_max_tokens_num()) {}
-
-Qwen35ImageProcessor::Qwen35ImageProcessor(const ModelArgs& args,
-                                           int32_t max_image_tokens)
-    : Qwen2VLImageProcessor(args, max_image_tokens) {
-  LOG(INFO) << "Qwen3.5 image preprocessing: min_pixels=" << min_pixels_
-            << ", max_pixels=" << max_pixels_ << ", patch_size=" << patch_size_
-            << ", merge_size=" << merge_size_ << ", budget_source="
-            << (max_image_tokens > 0 ? "image_max_tokens_num" : "model")
-            << ", image_max_tokens_num=" << max_image_tokens;
 }
 
 bool Qwen2VLImageProcessor::process_image(
@@ -374,8 +235,7 @@ bool Qwen2VLImageProcessor::process_image(
                           static_cast<int32_t>(resized_width),
                           patch_size_ * merge_size_,
                           min_pixels_,
-                          max_pixels_,
-                          enforce_max_pixels_);
+                          max_pixels_);
     }
     if (!size) {
       return false;
@@ -438,24 +298,6 @@ bool Qwen2VLImageProcessor::process_image(
 bool Qwen2VLImageProcessor::process(
     const std::vector<torch::Tensor>& images,
     std::vector<MMDataItem>& output_items) const {
-  // Python model executor: delegate image preprocessing to Python (HF
-  // AutoImageProcessor). model_impl=python => no per-model C++ image
-  // processor; the Python model's encode() consumes the HF output directly.
-  if (::xllm::ModelConfig::is_python_model_impl(
-          ::xllm::ModelConfig::get_instance().model_impl())) {
-    if (PyImagePreprocess::instance().run(images, output_items)) {
-      return true;
-    }
-    // The HF ``Glm5NextImageProcessor`` class only exists in the dev (patched)
-    // transformers. On a stock transformers build ``AutoImageProcessor`` fails
-    // to resolve it; fall back to the C++ token-budget path, whose patchify is
-    // byte-identical to HF's (verified) so the Python model consumes it
-    // unchanged.
-    LOG(WARNING)
-        << "HF AutoImageProcessor unavailable for this model (likely stock "
-           "transformers); falling back to the C++ image processor.";
-  }
-
   std::vector<torch::Tensor> pixel_values;
   std::vector<torch::Tensor> thw;
   if (!process_image(images, pixel_values, thw)) {

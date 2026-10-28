@@ -22,13 +22,16 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/model_args.h"
+#include "processors/processor_config.h"
 #include "processors/prompt_processor.h"
 
 namespace xllm::npu::model {
 
 class MiniCPMPromptProcessor final : public PromptProcessor {
  public:
-  explicit MiniCPMPromptProcessor(const ModelArgs& args);
+  explicit MiniCPMPromptProcessor(
+      const ModelArgs& args,
+      const ProcessorConfig& config = ProcessorConfig());
 
   bool process(std::string& prompt, const MMData& mm_data) override;
   bool find_mm_spans(const std::vector<int32_t>& token_ids,

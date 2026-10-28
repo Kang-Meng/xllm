@@ -678,8 +678,6 @@ class Glm5NextVisionModel(nn.Module):
             pooler_output=merged_hidden_states,
         )
 
-    # -- image preprocessing (via xllm pybind / HF AutoImageProcessor) -----
-
     # -- weight loading ----------------------------------------------------
 
     def load_weights(self, state_dicts: list, prefix: str = "model.visual.") -> None:

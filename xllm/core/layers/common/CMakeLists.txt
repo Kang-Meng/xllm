@@ -84,7 +84,7 @@ cc_library(
 )
 
 if(USE_NPU OR USE_MLU)
-  # Scan the static-library cycle three times to resolve layer symbols introduced
+  # Scan the static-library cycle four times to resolve layer symbols introduced
   # by model registration on later passes (including RoPE and DenseMLP).
-  set_property(TARGET common_layers PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
+  set_property(TARGET common_layers PROPERTY LINK_INTERFACE_MULTIPLICITY 4)
 endif()

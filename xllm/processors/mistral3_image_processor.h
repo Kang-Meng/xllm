@@ -20,13 +20,16 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "image_processor.h"
+#include "processors/image_processor.h"
+#include "processors/processor_config.h"
 
 namespace xllm {
 
 class Mistral3ImageProcessor : public ImageProcessor {
  public:
-  explicit Mistral3ImageProcessor(const ModelArgs& args);
+  explicit Mistral3ImageProcessor(
+      const ModelArgs& args,
+      const ProcessorConfig& config = ProcessorConfig());
   ~Mistral3ImageProcessor() override = default;
 
   bool process(const std::vector<torch::Tensor>& images,

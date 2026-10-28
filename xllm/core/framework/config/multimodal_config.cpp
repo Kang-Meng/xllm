@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "core/framework/config/multimodal_config.h"
 
+#include <glog/logging.h>
+
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
@@ -35,13 +37,11 @@ DEFINE_int32(limit_image_per_prompt,
              "Maximum number of image per prompt. Only applicable for "
              "multimodal models.");
 
-DEFINE_int32(image_max_tokens_num,
-             0,
-             "Maximum image tokens used by image preprocessing. The "
-             "pixel budget is this value multiplied by "
-             "(patch_size * merge_size)^2. Zero uses the model's configured "
-             "max_pixels. Supported by Qwen3.5 (preserves the model minimum) "
-             "and Qwen3-Omni (sets the minimum to 4 tokens).");
+DEFINE_string(mm_args,
+              "{}",
+              "Service-level processor overrides grouped by modality as JSON. "
+              "Fields are interpreted by the selected native processor. "
+              "Example: '{\"image\":{\"max_pixels\":1048576}}'");
 
 DEFINE_int32(fps_min_frames,
              4,
@@ -106,7 +106,7 @@ void MultimodalConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_ctc);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_return_embedding_modality_tags);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(limit_image_per_prompt);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(image_max_tokens_num);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(mm_args);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(fps_min_frames);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(fps_max_frames);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(video_max_token_num);
@@ -124,7 +124,7 @@ void MultimodalConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_ctc);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_return_embedding_modality_tags);
   XLLM_CONFIG_ASSIGN_FROM_JSON(limit_image_per_prompt);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(image_max_tokens_num);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(mm_args);
   XLLM_CONFIG_ASSIGN_FROM_JSON(fps_min_frames);
   XLLM_CONFIG_ASSIGN_FROM_JSON(fps_max_frames);
   XLLM_CONFIG_ASSIGN_FROM_JSON(video_max_token_num);
@@ -146,8 +146,7 @@ void MultimodalConfig::append_config_json(
       config_json, default_config, enable_return_embedding_modality_tags);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, limit_image_per_prompt);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, image_max_tokens_num);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, mm_args);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, fps_min_frames);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -182,6 +181,26 @@ void MultimodalConfig::initialize() {
   if (const auto& json_config = config::get_parsed_json_config()) {
     from_json(*json_config);
   }
+  processor_args_ = nlohmann::json::object();
+  if (mm_args().empty()) {
+    return;
+  }
+  processor_args_ = nlohmann::json::parse(mm_args(), nullptr, false);
+  CHECK(!processor_args_.is_discarded()) << "mm_args must be valid JSON";
+  CHECK(processor_args_.is_object())
+      << "mm_args must be a JSON object, got " << processor_args_.type_name();
+  for (const auto& [modality, values] : processor_args_.items()) {
+    CHECK(modality == "image" || modality == "video" || modality == "audio")
+        << "Unsupported mm_args modality: " << modality;
+    CHECK(values.is_object()) << "mm_args." << modality << " must be an object";
+  }
+}
+
+const nlohmann::json& MultimodalConfig::processor_args(
+    const std::string& modality) const {
+  static const nlohmann::json kEmptyArgs = nlohmann::json::object();
+  const auto found = processor_args_.find(modality);
+  return found == processor_args_.end() ? kEmptyArgs : *found;
 }
 
 }  // namespace xllm

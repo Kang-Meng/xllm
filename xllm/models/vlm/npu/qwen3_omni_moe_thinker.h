@@ -42,8 +42,8 @@ limitations under the License.
 #include "models/vlm/utils/multimodal_utils.h"
 #include "processors/audio_utils.h"
 #include "processors/multimodal_processor.h"
+#include "processors/qwen2_vl_image_processor.h"
 #include "processors/qwen3_omni_audio_processor.h"
-#include "processors/qwen3_omni_image_processor.h"
 #include "processors/qwen3_omni_prompt_processor.h"
 #include "processors/qwen3_omni_video_processor.h"
 #include "qwen2_5_vl.h"
@@ -1250,7 +1250,7 @@ TORCH_MODULE(Qwen3OmniMoe_Thinker_ForConditionalGeneration);
 
 using Qwen3OmniMoeMultimodalProcessor =
     MultimodalProcessor<Qwen3OmniPromptProcessor,
-                        Qwen3OmniImageProcessor,
+                        Qwen2VLImageProcessor,
                         Qwen3OmniVideoProcessor,
                         Qwen3OmniAudioProcessor>;
 REGISTER_MULTIMODAL_PROCESSOR(qwen3_omni_moe, Qwen3OmniMoeMultimodalProcessor);

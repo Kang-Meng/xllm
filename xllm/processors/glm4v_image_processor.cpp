@@ -174,7 +174,8 @@ std::optional<Size> smart_resize_tokens(int32_t num_frames,
 
 }  // namespace
 
-Glm4VImageProcessor::Glm4VImageProcessor(const ModelArgs& args) {
+Glm4VImageProcessor::Glm4VImageProcessor(const ModelArgs& args,
+                                         const ProcessorConfig& config) {
   image_mean_ = torch::tensor(args.mm_image_normalize_mean(),
                               torch::dtype(torch::kFloat32));
   image_std_ = torch::tensor(args.mm_image_normalize_std(),
@@ -193,6 +194,24 @@ Glm4VImageProcessor::Glm4VImageProcessor(const ModelArgs& args) {
   merge_size_ = args.mm_image_merge_size();
   min_tokens_ = args.mm_image_min_tokens();
   max_tokens_ = args.mm_image_max_tokens();
+
+  min_pixels_ =
+      config.value("image.min_pixels",
+                   config.value("image.size.shortest_edge", min_pixels_));
+  max_pixels_ = config.value(
+      "image.max_pixels", config.value("image.size.longest_edge", max_pixels_));
+  if (!config.empty("image")) {
+    CHECK(min_tokens_ <= 0 || max_tokens_ <= 0)
+        << "Pixel overrides are unsupported for token-budget resizing";
+    CHECK_GT(min_pixels_, 0) << "min_pixels must be positive";
+    CHECK_LE(min_pixels_, max_pixels_)
+        << "min_pixels must not exceed max_pixels after merging defaults";
+    const int64_t factor = static_cast<int64_t>(patch_size_) * merge_size_;
+    CHECK_GT(factor, 0);
+    CHECK_GT(temporal_patch_size_, 0);
+    CHECK_LE(factor, max_pixels_ / factor / temporal_patch_size_)
+        << "max_pixels must fit at least one aligned image patch group";
+  }
 
   if (do_rescale_ && do_normalize_) {
     image_mean_.mul_(1.0 / rescale_factor_);

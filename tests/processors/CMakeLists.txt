@@ -17,6 +17,29 @@ include(cc_test)
 
 cc_test(
   NAME
+    image_processor_config_test
+  CPU_ONLY
+  SRCS
+    image_processor_config_test.cpp
+  DEPS
+    :processors
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    processor_config_test
+  CPU_ONLY
+  SRCS
+    processor_config_test.cpp
+  DEPS
+    nlohmann_json::nlohmann_json
+    glog::glog
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     qwen_image_budget_test
   CPU_ONLY
   SRCS
@@ -24,5 +47,4 @@ cc_test(
   DEPS
     :processors
     GTest::gtest_main
-    Python::Python
 )

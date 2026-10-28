@@ -16,7 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 #include <string>
 
 #include "core/common/macros.h"
@@ -37,6 +37,8 @@ class MultimodalConfig final {
   void from_json(const JsonReader& json);
   void append_config_json(nlohmann::ordered_json& config_json) const;
   void initialize();
+  const nlohmann::json& processor_args() const { return processor_args_; }
+  const nlohmann::json& processor_args(const std::string& modality) const;
 
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {
@@ -44,7 +46,7 @@ class MultimodalConfig final {
         {"use_ctc",
          "enable_return_embedding_modality_tags",
          "limit_image_per_prompt",
-         "image_max_tokens_num",
+         "mm_args",
          "fps_min_frames",
          "fps_max_frames",
          "video_max_token_num",
@@ -65,7 +67,7 @@ class MultimodalConfig final {
 
   PROPERTY(int32_t, limit_image_per_prompt) = 8;
 
-  PROPERTY(int32_t, image_max_tokens_num) = 0;
+  PROPERTY(std::string, mm_args) = "{}";
 
   PROPERTY(int32_t, fps_min_frames) = 4;
 
@@ -88,6 +90,9 @@ class MultimodalConfig final {
   PROPERTY(int32_t, audio_max_decode_duration_s) = 600;
 
   PROPERTY(bool, enable_mm_encoder_dp) = false;
+
+ private:
+  nlohmann::json processor_args_ = nlohmann::json::object();
 };
 
 }  // namespace xllm

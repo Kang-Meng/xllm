@@ -25,7 +25,7 @@ set(BASE_DEPS
   :chat_template
   glog::glog
   torch
-  torch_python
+  nlohmann_json::nlohmann_json
 )
 
 
@@ -41,6 +41,7 @@ cc_library(
     audio_processor.h
     image_processor.h
     prompt_processor.h
+    processor_config.h
     clip_image_processor.h
     clip_prompt_processor.h
     glm4v_image_processor.h
@@ -57,7 +58,6 @@ cc_library(
     qwen2_vl_image_processor.h
     qwen2_vl_video_processor.h
     qwen3_omni_video_processor.h
-    qwen3_omni_image_processor.h
     qwen3_vl_prompt_processor.h
     qwen3_vl_video_processor.h
     qwen3_omni_audio_processor.h
@@ -83,7 +83,6 @@ cc_library(
     qwen2_vl_image_processor.cpp
     qwen2_vl_video_processor.cpp
     qwen3_omni_video_processor.cpp
-    qwen3_omni_image_processor.cpp
     qwen3_vl_prompt_processor.cpp
     qwen3_vl_video_processor.cpp
     qwen3_omni_audio_processor.cpp

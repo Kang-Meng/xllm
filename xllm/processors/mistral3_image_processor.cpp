@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "mistral3_image_processor.h"
+#include "processors/mistral3_image_processor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +22,8 @@ limitations under the License.
 
 namespace xllm {
 
-Mistral3ImageProcessor::Mistral3ImageProcessor(const ModelArgs& args) {
+Mistral3ImageProcessor::Mistral3ImageProcessor(const ModelArgs& args,
+                                               const ProcessorConfig& config) {
   image_mean_ =
       torch::tensor(std::vector<double>{0.48145466, 0.4578275, 0.40821073},
                     torch::dtype(torch::kFloat32));
@@ -33,7 +34,12 @@ Mistral3ImageProcessor::Mistral3ImageProcessor(const ModelArgs& args) {
 
   patch_size_ = args.mm_patch_size();
   merge_size_ = args.mm_spatial_merge_size();
-  max_longest_edge_ = args.mm_image_size();
+  max_longest_edge_ =
+      config.value<int64_t>("image.longest_edge", args.mm_image_size());
+  if (!config.empty("image")) {
+    CHECK_GE(max_longest_edge_, patch_size_ * merge_size_)
+        << "longest_edge must fit at least one aligned image patch group";
+  }
 
   // Fuse rescale into normalize: (pixel/255 - mean) / std = pixel * f -
   // mean/std

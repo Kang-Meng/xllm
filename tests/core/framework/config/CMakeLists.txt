@@ -2,6 +2,17 @@ include(cc_test)
 
 cc_test(
   NAME
+    multimodal_config_test
+  CPU_ONLY
+  SRCS
+    multimodal_config_test.cpp
+  DEPS
+    :config
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     config_json_test
   CPU_ONLY
   SRCS

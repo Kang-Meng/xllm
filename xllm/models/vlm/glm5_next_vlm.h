@@ -27,14 +27,6 @@ limitations under the License.
 //      image_end_token_id / image_token_id — identical to GLM-next's config,
 //      and token count per image = grid_thw.prod() / merge_size**2, matching
 //      the GlmOcr ViT's spatial-merge output count).
-//   2. Delegates the actual image preprocessing to Python when
-//      model_impl=python via the PyImagePreprocess branch wired into
-//      Qwen2VLImageProcessor::process (HF AutoImageProcessor, the same
-//      algorithm the Python ViT consumes).
-//
-// Reusing GLM4VPromptProcessor + Qwen2VLImageProcessor (rather than
-// Glm4vMoeMultimodalProcessor) is deliberate: the latter binds
-// Glm4VImageProcessor, which lacks the model_impl=python delegation branch.
 
 #include "models/model_registry.h"
 #include "processors/glm4v_prompt_processor.h"
@@ -44,12 +36,6 @@ limitations under the License.
 
 namespace xllm {
 
-// Image preprocessing delegates to Python (Qwen2VLImageProcessor -> HF
-// AutoImageProcessor); video preprocessing uses the GLM-family
-// Glm4VVideoProcessor (frame sampling / resize / normalize / patchify ->
-// pixel_values_videos + video_grid_thw), which GLM4VPromptProcessor then
-// expands into video_start/video_token/video_end placeholders. The two
-// masks are disjoint, so image and video coexist in one batch.
 using Glm5NextVLMultimodalProcessor = MultimodalProcessor<GLM4VPromptProcessor,
                                                           Qwen2VLImageProcessor,
                                                           Glm4VVideoProcessor>;

@@ -27,12 +27,14 @@ limitations under the License.
 
 #include "core/common/message.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/tokenizer/tokenizer_args.h"
 #include "processors/audio_processor.h"
 #include "processors/image_processor.h"
+#include "processors/processor_config.h"
 #include "processors/processor_util.h"
 #include "processors/prompt_processor.h"
 #include "processors/video_processor.h"
@@ -76,6 +78,18 @@ std::unique_ptr<MultimodalProcessorBase> create_multimodal_processor(
     int64_t max_cache_items,
     const TokenizerArgs& tokenizer_args);
 
+template <typename Processor>
+std::unique_ptr<Processor> create_processor(const ModelArgs& args,
+                                            const ProcessorConfig& config) {
+  if constexpr (std::is_constructible_v<Processor,
+                                        const ModelArgs&,
+                                        const ProcessorConfig&>) {
+    return std::make_unique<Processor>(args, config);
+  } else {
+    return std::make_unique<Processor>(args);
+  }
+}
+
 template <typename PromptProcessor,
           typename ImageProcessor = ImageNoneProcessor,
           typename VideoProcessor = VideoNoneProcessor,
@@ -85,11 +99,18 @@ class MultimodalProcessor final : public MultimodalProcessorBase {
   MultimodalProcessor(const ModelArgs& model_args,
                       std::shared_ptr<Tokenizer> tokenizer,
                       const TokenizerArgs& tokenizer_args)
-      : MultimodalProcessorBase(std::move(tokenizer), tokenizer_args),
-        image_processor_(std::make_unique<ImageProcessor>(model_args)),
-        video_processor_(std::make_unique<VideoProcessor>(model_args)),
-        audio_processor_(std::make_unique<AudioProcessor>(model_args)),
-        prompt_processor_(std::make_unique<PromptProcessor>(model_args)) {}
+      : MultimodalProcessorBase(std::move(tokenizer), tokenizer_args) {
+    const MultimodalConfig& config = MultimodalConfig::get_instance();
+    const ProcessorConfig overrides(config.processor_args(), "mm_args");
+    image_processor_ = create_processor<ImageProcessor>(model_args, overrides);
+    video_processor_ = create_processor<VideoProcessor>(model_args, overrides);
+    audio_processor_ = create_processor<AudioProcessor>(model_args, overrides);
+    prompt_processor_ =
+        create_processor<PromptProcessor>(model_args, overrides);
+    overrides.validate("image");
+    overrides.validate("video");
+    overrides.validate("audio");
+  }
 
   ~MultimodalProcessor() override = default;
 

@@ -23,11 +23,14 @@ limitations under the License.
 
 #include "core/framework/model/model_args.h"
 #include "processors/image_processor.h"
+#include "processors/processor_config.h"
 namespace xllm {
 
 class MiniCPMVImageProcessor final : public ImageProcessor {
  public:
-  explicit MiniCPMVImageProcessor(const ModelArgs& args);
+  explicit MiniCPMVImageProcessor(
+      const ModelArgs& args,
+      const ProcessorConfig& config = ProcessorConfig());
 
   static std::pair<int32_t, int32_t> get_sliced_grid(
       const std::pair<int32_t, int32_t>& original_size,

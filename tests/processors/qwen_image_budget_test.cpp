@@ -13,243 +13,273 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <limits>
+#include <string>
 #include <vector>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/multimodal_config.h"
 #include "processors/qwen2_vl_image_processor.h"
-#include "processors/qwen3_omni_image_processor.h"
-#include "processors/qwen3_vl_video_processor.h"
 
 namespace xllm {
 namespace {
 
 ModelArgs image_args(bool pixel_layout = false) {
   ModelArgs args;
-  args.mm_image_patch_size(/*value=*/16)
-      .mm_image_merge_size(/*value=*/2)
-      .mm_image_temporal_patch_size(/*value=*/2)
-      .mm_image_normalize_mean(/*value=*/{0.5, 0.5, 0.5})
-      .mm_image_normalize_std(/*value=*/{0.5, 0.5, 0.5});
+  args.mm_image_patch_size(16)
+      .mm_image_merge_size(2)
+      .mm_image_temporal_patch_size(2)
+      .mm_image_normalize_mean({0.5, 0.5, 0.5})
+      .mm_image_normalize_std({0.5, 0.5, 0.5});
   if (pixel_layout) {
-    args.mm_image_min_pixels(/*value=*/65536)
-        .mm_image_max_pixels(/*value=*/16777216);
+    args.mm_image_min_pixels(65536).mm_image_max_pixels(16777216);
   } else {
-    args.mm_image_shortest_edge(/*value=*/65536)
-        .mm_image_longest_edge(/*value=*/16777216);
+    args.mm_image_shortest_edge(65536).mm_image_longest_edge(16777216);
   }
   return args;
 }
 
 int64_t image_tokens(const Qwen2VLImageProcessor& processor,
                      int32_t height,
-                     int32_t width,
-                     int32_t patch_size = 16,
-                     int32_t merge_size = 2) {
-  std::vector<torch::Tensor> pixels;
-  std::vector<torch::Tensor> grids;
-  const auto image =
-      torch::zeros(/*size=*/{3, height, width}, /*options=*/torch::kUInt8);
-  EXPECT_TRUE(processor.process_image({image}, pixels, grids));
-  if (grids.size() != 1 || pixels.size() != 1) {
+                     int32_t width) {
+  std::vector<MMDataItem> items;
+  const auto image = torch::zeros({3, height, width}, torch::kUInt8);
+  EXPECT_TRUE(processor.process({image}, items));
+  if (items.size() != 1) {
     ADD_FAILURE() << "Expected one image output";
     return -1;
   }
-  const auto grid = grids[0].reshape(/*shape=*/{3});
+  const auto pixels = items[0].get<torch::Tensor>("pixel_values");
+  const auto grids = items[0].get<torch::Tensor>("image_grid_thw");
+  if (!pixels.has_value() || !grids.has_value()) {
+    ADD_FAILURE() << "Expected pixel_values and image_grid_thw";
+    return -1;
+  }
+  const auto grid = grids->reshape({3});
   const int64_t grid_t = grid[0].item<int64_t>();
   const int64_t grid_h = grid[1].item<int64_t>();
   const int64_t grid_w = grid[2].item<int64_t>();
   EXPECT_EQ(grid_t, 1);
-  EXPECT_EQ(grid_h % merge_size, 0);
-  EXPECT_EQ(grid_w % merge_size, 0);
-  EXPECT_EQ(pixels[0].size(/*dim=*/0), grid_t * grid_h * grid_w);
-  EXPECT_EQ(pixels[0].size(/*dim=*/1), 3 * 2 * patch_size * patch_size);
-  const int64_t tokens = grid_t * grid_h * grid_w / (merge_size * merge_size);
-  EXPECT_EQ(tokens * patch_size * patch_size * merge_size * merge_size,
-            grid_h * patch_size * grid_w * patch_size);
-  return tokens;
+  EXPECT_EQ(grid_h % 2, 0);
+  EXPECT_EQ(grid_w % 2, 0);
+  EXPECT_EQ(pixels->size(0), grid_t * grid_h * grid_w);
+  EXPECT_EQ(pixels->size(1), 3 * 2 * 16 * 16);
+  return grid_t * grid_h * grid_w / 4;
 }
 
 class QwenImageBudgetTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    saved_tokens_ = MultimodalConfig::get_instance().image_max_tokens_num();
-    MultimodalConfig::get_instance().image_max_tokens_num(/*value=*/0);
+    ModelConfig& config = ModelConfig::get_instance();
+    saved_model_impl_ = config.model_impl();
+    saved_model_path_ = config.model();
+    config.model_impl("python").model("/nonexistent/xllm-processor-test");
   }
+
   void TearDown() override {
-    MultimodalConfig::get_instance().image_max_tokens_num(saved_tokens_);
+    ModelConfig::get_instance()
+        .model_impl(saved_model_impl_)
+        .model(saved_model_path_);
   }
 
  private:
-  int32_t saved_tokens_ = 0;
+  std::string saved_model_impl_;
+  std::string saved_model_path_;
 };
 
-TEST_F(QwenImageBudgetTest, ZeroPreservesBothModelLayouts) {
+TEST_F(QwenImageBudgetTest, UsesBothModelPixelBudgetLayouts) {
   for (bool pixel_layout : {false, true}) {
-    const auto args = image_args(pixel_layout);
-    const Qwen35ImageProcessor implicit(args);
-    const Qwen35ImageProcessor zero(args, /*max_image_tokens=*/0);
-    const Qwen2VLImageProcessor original(args);
-    EXPECT_EQ(image_tokens(implicit, /*height=*/512, /*width=*/512), 256);
-    EXPECT_EQ(image_tokens(zero, /*height=*/512, /*width=*/512),
-              image_tokens(original, /*height=*/512, /*width=*/512));
-    EXPECT_EQ(image_tokens(zero, /*height=*/32, /*width=*/32), 64);
+    const Qwen2VLImageProcessor processor(image_args(pixel_layout));
+    EXPECT_EQ(image_tokens(processor, 512, 512), 256);
+    EXPECT_EQ(image_tokens(processor, 32, 32), 64);
   }
 }
 
-TEST_F(QwenImageBudgetTest, OverrideChangesActualGridInBothLayouts) {
-  for (bool pixel_layout : {false, true}) {
-    const auto args = image_args(pixel_layout);
-    const Qwen35ImageProcessor small(args, /*max_image_tokens=*/1024);
-    EXPECT_EQ(image_tokens(small, /*height=*/1536, /*width=*/1536), 1024);
-    EXPECT_EQ(image_tokens(small, /*height=*/32, /*width=*/32), 64);
-    const Qwen35ImageProcessor boundary(args, /*max_image_tokens=*/64);
-    EXPECT_EQ(image_tokens(boundary, /*height=*/1536, /*width=*/1536), 64);
-    EXPECT_EQ(image_tokens(boundary, /*height=*/32, /*width=*/64), 64);
-    EXPECT_EQ(image_tokens(boundary, /*height=*/32, /*width=*/6400), 64);
-    const int64_t rectangular_tokens =
-        image_tokens(small, /*height=*/1024, /*width=*/2048);
-    EXPECT_GT(rectangular_tokens, 64);
-    EXPECT_LE(rectangular_tokens, 1024);
-    auto lower_max_args = args;
-    if (pixel_layout) {
-      lower_max_args.mm_image_max_pixels(/*value=*/262144);
-    } else {
-      lower_max_args.mm_image_longest_edge(/*value=*/262144);
-    }
-    const Qwen35ImageProcessor lower_max(lower_max_args,
-                                         /*max_image_tokens=*/0);
-    const Qwen35ImageProcessor raised(lower_max_args,
-                                      /*max_image_tokens=*/1024);
-    EXPECT_EQ(image_tokens(lower_max, /*height=*/1536, /*width=*/1536), 256);
-    EXPECT_EQ(image_tokens(raised, /*height=*/1536, /*width=*/1536), 1024);
-  }
-}
-
-TEST_F(QwenImageBudgetTest, OverrideCanExceedOriginalMaximum) {
-  const auto args = image_args();
-  const Qwen35ImageProcessor original(args, /*max_image_tokens=*/0);
-  const Qwen35ImageProcessor larger(args, /*max_image_tokens=*/32768);
-  EXPECT_EQ(image_tokens(original, /*height=*/4608, /*width=*/4608), 16384);
-  EXPECT_EQ(image_tokens(larger, /*height=*/4608, /*width=*/4608), 20736);
-}
-
-TEST_F(QwenImageBudgetTest, TightAlignmentIsScopedToExplicitOverride) {
-  auto args = image_args(/*pixel_layout=*/true);
-  args.mm_image_max_pixels(/*value=*/65536);
-  const Qwen2VLImageProcessor shared(args);
-  const Qwen35ImageProcessor zero(args, /*max_image_tokens=*/0);
-  const Qwen35ImageProcessor overridden(args, /*max_image_tokens=*/64);
-  EXPECT_EQ(image_tokens(shared, /*height=*/32, /*width=*/64), 72);
-  EXPECT_EQ(image_tokens(zero, /*height=*/32, /*width=*/64), 72);
-  EXPECT_EQ(image_tokens(overridden, /*height=*/32, /*width=*/64), 64);
-}
-
-TEST_F(QwenImageBudgetTest, UsesConfiguredGeometryAndMinimum) {
-  auto args = image_args(/*pixel_layout=*/true);
-  args.mm_image_patch_size(/*value=*/8)
-      .mm_image_merge_size(/*value=*/2)
-      .mm_image_min_pixels(/*value=*/4096);
-  const Qwen35ImageProcessor processor(args, /*max_image_tokens=*/16);
-  EXPECT_EQ(
-      image_tokens(processor, /*height=*/256, /*width=*/256, /*patch_size=*/8),
-      16);
-}
-
-TEST_F(QwenImageBudgetTest, RejectsInvalidBudgetsBeforeProcessing) {
-  const auto args = image_args();
-  EXPECT_DEATH(Qwen35ImageProcessor(args, /*max_image_tokens=*/-1),
-               "must be nonnegative");
-  EXPECT_DEATH(Qwen35ImageProcessor(args, /*max_image_tokens=*/63),
-               "below the model minimum");
-  EXPECT_DEATH(
-      Qwen35ImageProcessor(
-          args, /*max_image_tokens=*/std::numeric_limits<int32_t>::max()),
-      "exceeds int32 range");
-  EXPECT_DEATH(Qwen35ImageProcessor(args, /*max_image_tokens=*/2097152),
-               "exceeds int32 range");
-  EXPECT_NO_FATAL_FAILURE(
-      Qwen35ImageProcessor(args, /*max_image_tokens=*/2097151));
-  auto huge_geometry = args;
-  huge_geometry
-      .mm_image_patch_size(/*value=*/std::numeric_limits<int32_t>::max())
-      .mm_image_merge_size(/*value=*/std::numeric_limits<int32_t>::max());
-  EXPECT_DEATH(Qwen35ImageProcessor(huge_geometry, /*max_image_tokens=*/64),
-               "exceeds int32 range");
+TEST_F(QwenImageBudgetTest, ModelMaximumControlsActualGrid) {
+  auto args = image_args(true);
+  args.mm_image_max_pixels(262144);
+  const Qwen2VLImageProcessor processor(args);
+  EXPECT_EQ(image_tokens(processor, 1024, 1024), 256);
+  EXPECT_EQ(image_tokens(processor, 32, 32), 64);
 }
 
 TEST_F(QwenImageBudgetTest, PixelLayoutTakesPrecedence) {
   auto args = image_args();
-  args.mm_image_min_pixels(/*value=*/4096)
-      .mm_image_max_pixels(/*value=*/1048576);
-  const Qwen35ImageProcessor processor(args, /*max_image_tokens=*/4);
-  EXPECT_EQ(image_tokens(processor, /*height=*/512, /*width=*/512), 4);
+  args.mm_image_min_pixels(4096).mm_image_max_pixels(65536);
+  const Qwen2VLImageProcessor processor(args);
+  EXPECT_EQ(image_tokens(processor, 512, 512), 64);
+  EXPECT_EQ(image_tokens(processor, 32, 32), 4);
 }
 
-TEST_F(QwenImageBudgetTest, RetainsProcessorDefaultsWithoutModelBounds) {
+TEST_F(QwenImageBudgetTest, RetainsModelTokenBudgetResizing) {
   auto args = image_args();
-  args.mm_image_shortest_edge(/*value=*/0).mm_image_longest_edge(/*value=*/0);
-  const Qwen35ImageProcessor processor(args, /*max_image_tokens=*/4);
-  EXPECT_EQ(image_tokens(processor, /*height=*/512, /*width=*/512), 4);
-  EXPECT_DEATH(Qwen35ImageProcessor(args, /*max_image_tokens=*/3),
-               "below the model minimum");
+  args.mm_image_min_tokens(4).mm_image_max_tokens(16);
+  const Qwen2VLImageProcessor processor(args);
+  EXPECT_EQ(image_tokens(processor, 512, 512), 16);
+  EXPECT_EQ(image_tokens(processor, 32, 32), 4);
 }
 
-TEST_F(QwenImageBudgetTest, OnlyQwen35ConsumesNewOverride) {
+TEST_F(QwenImageBudgetTest, RejectsUnsupportedAspectRatio) {
+  const Qwen2VLImageProcessor processor(image_args());
+  std::vector<MMDataItem> items;
+  EXPECT_FALSE(
+      processor.process({torch::zeros({3, 32, 6432}, torch::kUInt8)}, items));
+}
+
+TEST_F(QwenImageBudgetTest, ServiceOverridesChangeActualImageGrid) {
+  google::FlagSaver flag_saver;
+  google::SetCommandLineOption("config_json_file", "");
+  for (bool pixel_layout : {false, true}) {
+    google::SetCommandLineOption("mm_args",
+                                 R"({"image":{"max_pixels":262144}})");
+    MultimodalConfig config;
+    config.initialize();
+    const auto original = image_args(pixel_layout);
+    const ProcessorConfig image_config(config.processor_args());
+    const Qwen2VLImageProcessor processor(original, image_config);
+    image_config.validate();
+    EXPECT_EQ(image_tokens(processor, 1024, 1024), 256);
+    EXPECT_EQ(image_tokens(processor, 32, 32), 64);
+    EXPECT_EQ(original.mm_image_max_pixels(), pixel_layout ? 16777216 : 0);
+  }
+}
+
+TEST_F(QwenImageBudgetTest, TightPixelBudgetKeepsNarrowDimensionsNonzero) {
+  auto args = image_args(true);
+  args.mm_image_min_pixels(1024).mm_image_max_pixels(1024);
+  const Qwen2VLImageProcessor processor(args);
+  EXPECT_EQ(image_tokens(processor, 32, 6400), 14);
+}
+
+TEST_F(QwenImageBudgetTest, ServicePixelBudgetPreservesNarrowImageAlignment) {
+  google::FlagSaver flag_saver;
+  google::SetCommandLineOption("config_json_file", "");
+  google::SetCommandLineOption(
+      "mm_args", R"({"image":{"min_pixels":1024,"max_pixels":1024}})");
+  MultimodalConfig config;
+  config.initialize();
+  const ProcessorConfig image_config(config.processor_args());
+  const Qwen2VLImageProcessor processor(image_args(), image_config);
+  image_config.validate();
+  EXPECT_EQ(image_tokens(processor, 32, 6400), 14);
+}
+
+TEST_F(QwenImageBudgetTest, SupportsSingleMinimumAndNestedSizeOverrides) {
+  const ProcessorConfig min_config(
+      nlohmann::json{{"image", {{"min_pixels", 4096}}}});
+  const Qwen2VLImageProcessor small_min(image_args(), min_config);
+  min_config.validate();
+  EXPECT_EQ(image_tokens(small_min, 32, 32), 4);
+  const ProcessorConfig size_config(
+      nlohmann::json{{"image", {{"size", {{"longest_edge", 262144}}}}}});
+  const Qwen2VLImageProcessor small_max(image_args(), size_config);
+  size_config.validate();
+  EXPECT_EQ(image_tokens(small_max, 1024, 1024), 256);
+}
+
+TEST_F(QwenImageBudgetTest, RejectsInvalidOverridesBeforeProcessing) {
   const auto args = image_args();
-  MultimodalConfig::get_instance().image_max_tokens_num(/*value=*/64);
-  const Qwen35ImageProcessor qwen35(args);
-  const Qwen2VLImageProcessor shared(args);
-  EXPECT_EQ(image_tokens(qwen35, /*height=*/512, /*width=*/512), 64);
-  EXPECT_EQ(image_tokens(shared, /*height=*/512, /*width=*/512), 256);
-  MultimodalConfig::get_instance().image_max_tokens_num(/*value=*/-1);
-  const Qwen2VLImageProcessor shared_negative(args);
-  EXPECT_EQ(image_tokens(shared_negative, /*height=*/512, /*width=*/512), 256);
+  EXPECT_DEATH(
+      Qwen2VLImageProcessor(
+          args,
+          ProcessorConfig(nlohmann::json{{"image", {{"max_pixels", 1.5}}}})),
+      "must be an integer");
+  EXPECT_DEATH(
+      Qwen2VLImageProcessor(
+          args,
+          ProcessorConfig(nlohmann::json{{"image", {{"min_pixels", 0}}}})),
+      "must be positive");
+  EXPECT_DEATH(
+      Qwen2VLImageProcessor(
+          args,
+          ProcessorConfig(nlohmann::json{{"image", {{"max_pixels", 4096}}}})),
+      "must not exceed max_pixels");
+  EXPECT_DEATH(Qwen2VLImageProcessor(
+                   args,
+                   ProcessorConfig(nlohmann::json{
+                       {"image", {{"min_pixels", 1}, {"max_pixels", 100}}}})),
+               "one aligned image patch group");
+  auto token_args = args;
+  token_args.mm_image_min_tokens(4).mm_image_max_tokens(16);
+  EXPECT_DEATH(
+      Qwen2VLImageProcessor(
+          token_args,
+          ProcessorConfig(nlohmann::json{{"image", {{"max_pixels", 65536}}}})),
+      "token-budget resizing");
 }
 
-TEST_F(QwenImageBudgetTest, OmniRetainsItsMinimumPolicy) {
-  const auto args = image_args();
-  const Qwen3OmniImageProcessor original(args);
-  EXPECT_EQ(image_tokens(original, /*height=*/32, /*width=*/32), 64);
-  MultimodalConfig::get_instance().image_max_tokens_num(/*value=*/16);
-  const Qwen3OmniImageProcessor overridden(args);
-  EXPECT_EQ(image_tokens(overridden, /*height=*/32, /*width=*/32), 4);
-  EXPECT_EQ(image_tokens(overridden, /*height=*/512, /*width=*/512), 16);
-  MultimodalConfig::get_instance().image_max_tokens_num(/*value=*/3);
-  EXPECT_DEATH(Qwen3OmniImageProcessor invalid(args), "must be at least 4");
-}
+TEST_F(QwenImageBudgetTest, NativePixelsPreservePatchOrderAcrossModelImpls) {
+  constexpr int32_t kHeight = 56;
+  constexpr int32_t kWidth = 84;
+  constexpr int32_t kPatchSize = 14;
+  constexpr int32_t kMergeSize = 2;
+  constexpr int32_t kTemporalSize = 2;
+  constexpr int32_t kGridHeight = kHeight / kPatchSize;
+  constexpr int32_t kGridWidth = kWidth / kPatchSize;
+  auto args = image_args(true);
+  args.mm_image_patch_size(kPatchSize)
+      .mm_image_min_pixels(784)
+      .mm_image_max_pixels(65536);
+  const auto image = torch::arange(3 * kHeight * kWidth, torch::kInt64)
+                         .remainder(256)
+                         .to(torch::kUInt8)
+                         .reshape({3, kHeight, kWidth});
 
-TEST_F(QwenImageBudgetTest, TokenResizeRemainsIndependent) {
-  auto args = image_args();
-  args.mm_image_min_tokens(/*value=*/4).mm_image_max_tokens(/*value=*/16);
-  MultimodalConfig::get_instance().image_max_tokens_num(/*value=*/64);
-  const Qwen2VLImageProcessor shared(args);
-  const Qwen35ImageProcessor zero(args, /*max_image_tokens=*/0);
-  EXPECT_EQ(image_tokens(shared, /*height=*/512, /*width=*/512), 16);
-  EXPECT_EQ(image_tokens(zero, /*height=*/512, /*width=*/512), 16);
-  EXPECT_DEATH(Qwen35ImageProcessor(args, /*max_image_tokens=*/64),
-               "requires pixel-budget resizing");
-}
-
-TEST_F(QwenImageBudgetTest, VideoIgnoresImageOverride) {
-  const auto args = image_args();
-  const auto video =
-      torch::zeros(/*size=*/{4, 3, 64, 64}, /*options=*/torch::kUInt8);
-  VideoMetadata metadata;
-  metadata.total_num_frames = 4;
-  metadata.fps = 2.0;
-  MMDataItem original(/*type=*/MMType::VIDEO);
-  MMDataItem overridden(/*type=*/MMType::VIDEO);
-  ASSERT_TRUE(Qwen3VLVideoProcessor(args).process(video, metadata, original));
-  MultimodalConfig::get_instance().image_max_tokens_num(/*value=*/1);
-  ASSERT_TRUE(Qwen3VLVideoProcessor(args).process(video, metadata, overridden));
-  for (const auto& [key, value] : original.data()) {
-    EXPECT_TRUE(
-        torch::equal(std::get<torch::Tensor>(value),
-                     std::get<torch::Tensor>(overridden.data().at(key))));
+  for (const std::string model_impl : {"cpp", "python", "py"}) {
+    ModelConfig::get_instance().model_impl(model_impl);
+    const Qwen2VLImageProcessor processor(args);
+    std::vector<MMDataItem> items;
+    ASSERT_TRUE(processor.process({image, 255 - image}, items));
+    ASSERT_EQ(items.size(), 2);
+    for (size_t image_index = 0; image_index < items.size(); ++image_index) {
+      const auto pixels = items[image_index].get<torch::Tensor>("pixel_values");
+      const auto grid = items[image_index].get<torch::Tensor>("image_grid_thw");
+      ASSERT_TRUE(pixels.has_value());
+      ASSERT_TRUE(grid.has_value());
+      EXPECT_TRUE(torch::equal(
+          *grid, torch::tensor({{1, kGridHeight, kGridWidth}}, torch::kInt64)));
+      ASSERT_EQ(
+          pixels->sizes(),
+          torch::IntArrayRef({kGridHeight * kGridWidth,
+                              3 * kTemporalSize * kPatchSize * kPatchSize}));
+      ASSERT_EQ(pixels->scalar_type(), torch::kFloat32);
+      const auto actual = pixels->accessor<float, 2>();
+      for (int32_t grid_row = 0; grid_row < kGridHeight; ++grid_row) {
+        for (int32_t grid_col = 0; grid_col < kGridWidth; ++grid_col) {
+          const int32_t patch_index =
+              ((grid_row / kMergeSize) * (kGridWidth / kMergeSize) +
+               grid_col / kMergeSize) *
+                  kMergeSize * kMergeSize +
+              (grid_row % kMergeSize) * kMergeSize + grid_col % kMergeSize;
+          for (int32_t channel = 0; channel < 3; ++channel) {
+            for (int32_t temporal = 0; temporal < kTemporalSize; ++temporal) {
+              for (int32_t patch_row = 0; patch_row < kPatchSize; ++patch_row) {
+                for (int32_t patch_col = 0; patch_col < kPatchSize;
+                     ++patch_col) {
+                  const int32_t source_index =
+                      channel * kHeight * kWidth +
+                      (grid_row * kPatchSize + patch_row) * kWidth +
+                      grid_col * kPatchSize + patch_col;
+                  const int32_t pixel = image_index == 0
+                                            ? source_index % 256
+                                            : 255 - source_index % 256;
+                  const int32_t feature_index =
+                      ((channel * kTemporalSize + temporal) * kPatchSize +
+                       patch_row) *
+                          kPatchSize +
+                      patch_col;
+                  const float expected = (pixel - 127.5f) / 127.5f;
+                  EXPECT_FLOAT_EQ(actual[patch_index][feature_index], expected);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 

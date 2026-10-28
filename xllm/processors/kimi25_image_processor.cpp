@@ -109,8 +109,19 @@ torch::Tensor km_normalize(const torch::Tensor& image,
 
 }  // namespace
 
-KimiK25ImageProcessor::KimiK25ImageProcessor(const ModelArgs& args)
-    : config_(make_kimi_k25_media_config(args)) {}
+KimiK25ImageProcessor::KimiK25ImageProcessor(const ModelArgs& args,
+                                             const ProcessorConfig& config)
+    : config_(make_kimi_k25_media_config(args)) {
+  config_.in_patch_limit =
+      config.value("image.in_patch_limit", config_.in_patch_limit);
+  config_.patch_limit_on_one_side = config.value(
+      "image.patch_limit_on_one_side", config_.patch_limit_on_one_side);
+  if (!config.empty("image")) {
+    CHECK_GE(config_.in_patch_limit,
+             config_.merge_kernel_size * config_.merge_kernel_size);
+    CHECK_GE(config_.patch_limit_on_one_side, config_.merge_kernel_size);
+  }
+}
 
 KimiK25VideoProcessor::KimiK25VideoProcessor(const ModelArgs& args)
     : config_(make_kimi_k25_media_config(args)) {}

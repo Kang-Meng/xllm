@@ -24,12 +24,15 @@ limitations under the License.
 
 namespace xllm::npu::model {
 
-MiniCPMPromptProcessor::MiniCPMPromptProcessor(const ModelArgs& args) {
+MiniCPMPromptProcessor::MiniCPMPromptProcessor(const ModelArgs& args,
+                                               const ProcessorConfig& config) {
   image_feature_size_ = args.mm_image_feature_size();
-  max_slice_nums_ = args.vision_max_slice_nums();
+  max_slice_nums_ =
+      config.value("image.max_slice_nums", args.vision_max_slice_nums());
   slice_mode_ = args.mm_slice_mode();
   use_image_id_ = args.mm_use_image_id();
-  scale_resolution_ = args.mm_scale_resolution();
+  scale_resolution_ =
+      config.value("image.scale_resolution", args.mm_scale_resolution());
 }
 
 bool MiniCPMPromptProcessor::process(std::string& prompt,

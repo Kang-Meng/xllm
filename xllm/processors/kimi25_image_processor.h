@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "core/framework/model/model_args.h"
 #include "processors/image_processor.h"
+#include "processors/processor_config.h"
 #include "processors/prompt_processor.h"
 #include "processors/video_processor.h"
 
@@ -74,7 +75,9 @@ struct KimiK25MediaConfig {
 
 class KimiK25ImageProcessor final : public ImageProcessor {
  public:
-  explicit KimiK25ImageProcessor(const ModelArgs& args);
+  explicit KimiK25ImageProcessor(
+      const ModelArgs& args,
+      const ProcessorConfig& config = ProcessorConfig());
   ~KimiK25ImageProcessor() override = default;
 
   bool process(const std::vector<torch::Tensor>& images,

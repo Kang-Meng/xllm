@@ -22,12 +22,15 @@ limitations under the License.
 
 #include "core/framework/model/model_args.h"
 #include "processors/image_processor.h"
+#include "processors/processor_config.h"
 
 namespace xllm {
 
-class Qwen2VLImageProcessor : public ImageProcessor {
+class Qwen2VLImageProcessor final : public ImageProcessor {
  public:
-  explicit Qwen2VLImageProcessor(const ModelArgs& args);
+  explicit Qwen2VLImageProcessor(
+      const ModelArgs& args,
+      const ProcessorConfig& config = ProcessorConfig());
 
   bool process(const std::vector<torch::Tensor>& images,
                std::vector<MMDataItem>& output_items) const override;
@@ -36,23 +39,17 @@ class Qwen2VLImageProcessor : public ImageProcessor {
                      std::vector<torch::Tensor>& pixel_values,
                      std::vector<torch::Tensor>& thw) const;
 
- protected:
-  Qwen2VLImageProcessor(const ModelArgs& args, int32_t max_image_tokens);
-
+ private:
   int32_t max_pixels_ = 12845056;
   int32_t min_pixels_ = 3136;
 
-  // patch geometry shared with subclasses (e.g. Qwen3OmniImageProcessor) that
-  // convert a token budget into pixel bounds in their constructor.
   int32_t merge_size_ = 2;
   int32_t patch_size_ = 14;
 
- private:
   bool do_convert_rgb_ = true;
   bool do_normalize_ = true;
   bool do_rescale_ = true;
   bool do_resize_ = true;
-  bool enforce_max_pixels_ = false;
 
   torch::Tensor image_mean_;
   torch::Tensor image_std_;
@@ -64,12 +61,6 @@ class Qwen2VLImageProcessor : public ImageProcessor {
   double rescale_factor_ = 0.00392156862745098;
 
   int32_t temporal_patch_size_ = 2;
-};
-
-class Qwen35ImageProcessor final : public Qwen2VLImageProcessor {
- public:
-  explicit Qwen35ImageProcessor(const ModelArgs& args);
-  Qwen35ImageProcessor(const ModelArgs& args, int32_t max_image_tokens);
 };
 
 }  // namespace xllm

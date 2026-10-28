@@ -50,8 +50,8 @@ DECLARE_int32(capture_hidden_state_layer);
 DECLARE_bool(enable_return_embedding_modality_tags);
 
 DECLARE_int32(limit_image_per_prompt);
+DECLARE_string(mm_args);
 
-DECLARE_int32(image_max_tokens_num);
 DECLARE_int32(fps_min_frames);
 DECLARE_int32(fps_max_frames);
 DECLARE_int32(video_max_token_num);

@@ -1275,7 +1275,6 @@ if __name__ == "__main__":
             "xllm/pybind/params",
             "xllm/pybind/errors",
             "xllm/pybind/mm_utils",
-            "xllm/pybind/multimodal",
         ],
         python_requires=">=3.10",
     )

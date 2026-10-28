@@ -19,12 +19,19 @@ limitations under the License.
 
 namespace xllm {
 
-MiniCPMVImageProcessor::MiniCPMVImageProcessor(const ModelArgs& args) {
-  max_slice_nums_ = args.vision_max_slice_nums();
-  scale_resolution_ = args.mm_scale_resolution();
+MiniCPMVImageProcessor::MiniCPMVImageProcessor(const ModelArgs& args,
+                                               const ProcessorConfig& config) {
+  max_slice_nums_ =
+      config.value("image.max_slice_nums", args.vision_max_slice_nums());
+  scale_resolution_ =
+      config.value("image.scale_resolution", args.mm_scale_resolution());
   patch_size_ = args.mm_patch_size();
   slice_mode_ = args.mm_slice_mode();
   image_feature_size_ = args.mm_image_feature_size();
+  if (!config.empty("image")) {
+    CHECK_GE(max_slice_nums_, 1);
+    CHECK_GE(scale_resolution_, patch_size_);
+  }
   norm_mean_ = torch::tensor(args.mm_image_normalize_mean(),
                              torch::dtype(torch::kFloat32));
   norm_std_ = torch::tensor(args.mm_image_normalize_std(),

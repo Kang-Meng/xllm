@@ -359,9 +359,6 @@ void validate_config(const std::string& model_type) {
   if (mm_config.max_processor_cache_items() < 0) {
     LOG(FATAL) << "max_processor_cache_items must be >= 0.";
   }
-  if (mm_config.image_max_tokens_num() < 0) {
-    LOG(FATAL) << "image_max_tokens_num must be >= 0.";
-  }
   if (mm_config.fps_min_frames() < 0) {
     LOG(FATAL) << "fps_min_frames must be >= 0.";
   }
