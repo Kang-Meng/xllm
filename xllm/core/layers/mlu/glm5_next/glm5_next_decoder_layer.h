@@ -29,10 +29,10 @@ limitations under the License.
 #include "layers/common/attention_metadata.h"
 #include "layers/common/dense_mlp.h"
 #include "layers/common/rms_norm.h"
-#include "layers/mlu/deepseek_v4/deepseek_v4_sparse_moe_block.h"
 #include "layers/mlu/glm5_next/glm5_next_kda.h"
 #include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
 #include "layers/mlu/hyper_connection.h"
+#include "layers/mlu/sparse_moe_block.h"
 
 namespace xllm {
 namespace layer {
@@ -99,7 +99,7 @@ class Glm5NextDecoderLayerImpl final : public torch::nn::Module {
   Glm5NextKDA kda_{nullptr};
   DeepseekV32Attention dsa_{nullptr};
   DenseMLP dense_mlp_{nullptr};
-  DeepseekV4SparseMoEBlock sparse_moe_{nullptr};
+  SparseMoEBlock sparse_moe_{nullptr};
 };
 
 TORCH_MODULE(Glm5NextDecoderLayer);

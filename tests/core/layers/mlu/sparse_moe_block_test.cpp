@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "layers/mlu/deepseek_v4/deepseek_v4_sparse_moe_block.h"
+#include "layers/mlu/sparse_moe_block.h"
 
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -38,34 +38,32 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-class DeepseekV4SparseMoEBlockTestPeer {
+class SparseMoEBlockTestPeer final {
  public:
-  static FusedMoE moe(DeepseekV4SparseMoEBlockImpl& block) {
-    return block.moe_;
-  }
+  static FusedMoE moe(SparseMoEBlockImpl& block) { return block.moe_; }
 
-  static ProcessGroup* routed_pg(DeepseekV4SparseMoEBlockImpl& block) {
+  static ProcessGroup* routed_pg(SparseMoEBlockImpl& block) {
     return block.routed_pg();
   }
 
-  static bool need_gather(DeepseekV4SparseMoEBlockImpl& block) {
+  static bool need_gather(SparseMoEBlockImpl& block) {
     return block.need_gather();
   }
 
-  static void set_enable_deep_ep(DeepseekV4SparseMoEBlockImpl& block,
+  static void set_enable_deep_ep(SparseMoEBlockImpl& block,
                                  bool enable_deep_ep) {
     block.enable_deep_ep_ = enable_deep_ep;
   }
 
   static std::vector<int32_t> row_dp_tokens(
-      DeepseekV4SparseMoEBlockImpl& block,
+      SparseMoEBlockImpl& block,
       int64_t hidden_rows,
       const ModelInputParams& input_params) {
     return block.get_row_dp_tokens(hidden_rows, input_params);
   }
 };
 
-class DeepseekV4SparseMoEBlockTest : public ::testing::Test {
+class SparseMoEBlockTest : public ::testing::TestWithParam<std::string> {
  protected:
   void SetUp() override {
     options_ = torch::TensorOptions()
@@ -74,7 +72,7 @@ class DeepseekV4SparseMoEBlockTest : public ::testing::Test {
                    .requires_grad(false);
     stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
     model_args_ = test::create_default_model_args();
-    model_args_.model_type() = "deepseek_v4";
+    model_args_.model_type() = GetParam();
     model_args_.hidden_size() = 256;
     model_args_.moe_intermediate_size() = 128;
     model_args_.n_routed_experts() = 4;
@@ -88,6 +86,11 @@ class DeepseekV4SparseMoEBlockTest : public ::testing::Test {
     model_args_.scoring_func() = "sqrtsoftplus";
     model_args_.topk_method() = "noaux_tc";
     model_args_.swiglu_limit() = 10.0f;
+    if (GetParam() == "glm5_next") {
+      model_args_.n_group() = 1;
+      model_args_.topk_group() = 1;
+      model_args_.scoring_func() = "sigmoid";
+    }
     set_tp_ctx(/*world_size=*/1, /*ep_size=*/1);
   }
 
@@ -152,7 +155,7 @@ class DeepseekV4SparseMoEBlockTest : public ::testing::Test {
     for (int64_t expert_id = 0; expert_id < num_experts; ++expert_id) {
       const std::string prefix = "experts." + std::to_string(expert_id) + ".";
       const std::string seed_prefix =
-          "deepseek_v4_sparse_moe_block.expert_" + std::to_string(expert_id);
+          "sparse_moe_block.expert_" + std::to_string(expert_id);
       weight_dict[prefix + "gate_proj.weight"] =
           test::seeded_tensor(seed_prefix + ".gate_proj",
                               {inter_size, hidden_size},
@@ -170,32 +173,40 @@ class DeepseekV4SparseMoEBlockTest : public ::testing::Test {
                               options_.device());
     }
 
-    weight_dict["gate.weight"] =
-        test::seeded_tensor("deepseek_v4_sparse_moe_block.gate",
-                            {num_experts, hidden_size},
+    weight_dict["gate.weight"] = test::seeded_tensor("sparse_moe_block.gate",
+                                                     {num_experts, hidden_size},
+                                                     torch::kBFloat16,
+                                                     options_.device());
+    weight_dict["gate.bias"] = test::seeded_tensor("sparse_moe_block.gate.bias",
+                                                   {num_experts},
+                                                   torch::kFloat32,
+                                                   options_.device());
+    weight_dict["gate.e_score_correction_bias"] =
+        test::seeded_tensor("sparse_moe_block.gate.e_score_correction_bias",
+                            {num_experts},
                             torch::kBFloat16,
                             options_.device());
     const int64_t shared_size = inter_size * model_args_.n_shared_experts();
     weight_dict["shared_experts.gate_proj.weight"] =
-        test::seeded_tensor("deepseek_v4_sparse_moe_block.shared.gate_proj",
+        test::seeded_tensor("sparse_moe_block.shared.gate_proj",
                             {shared_size, hidden_size},
                             torch::kBFloat16,
                             options_.device());
     weight_dict["shared_experts.up_proj.weight"] =
-        test::seeded_tensor("deepseek_v4_sparse_moe_block.shared.up_proj",
+        test::seeded_tensor("sparse_moe_block.shared.up_proj",
                             {shared_size, hidden_size},
                             torch::kBFloat16,
                             options_.device());
     weight_dict["shared_experts.down_proj.weight"] =
-        test::seeded_tensor("deepseek_v4_sparse_moe_block.shared.down_proj",
+        test::seeded_tensor("sparse_moe_block.shared.down_proj",
                             {hidden_size, shared_size},
                             torch::kBFloat16,
                             options_.device());
     return weight_dict;
   }
 
-  DeepseekV4SparseMoEBlock create_block(bool use_hash = false) const {
-    return DeepseekV4SparseMoEBlock(
+  SparseMoEBlock create_block(bool use_hash = false) const {
+    return SparseMoEBlock(
         model_args_,
         quant_args_,
         parallel_args_,
@@ -230,7 +241,7 @@ class DeepseekV4SparseMoEBlockTest : public ::testing::Test {
   torch::Tensor make_hidden(const std::vector<int64_t>& shape) const {
     const int64_t numel = std::accumulate(
         shape.begin(), shape.end(), int64_t{1}, std::multiplies<int64_t>());
-    return test::seeded_tensor("deepseek_v4_sparse_moe_block.hidden",
+    return test::seeded_tensor("sparse_moe_block.hidden",
                                {numel},
                                torch::kFloat32,
                                options_.device())
@@ -254,45 +265,44 @@ class DeepseekV4SparseMoEBlockTest : public ::testing::Test {
   std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
 };
 
-TEST_F(DeepseekV4SparseMoEBlockTest, RoutedPgUsesEpGroupWhenEpEnabled) {
+TEST_P(SparseMoEBlockTest, RoutedPgUsesEpGroupWhenEpEnabled) {
   set_tp_ctx(/*world_size=*/2, /*ep_size=*/2);
-  DeepseekV4SparseMoEBlock block = create_block();
+  SparseMoEBlock block = create_block();
 
-  EXPECT_EQ(DeepseekV4SparseMoEBlockTestPeer::routed_pg(*block), ep_pg_.get());
+  EXPECT_EQ(SparseMoEBlockTestPeer::routed_pg(*block), ep_pg_.get());
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, RoutedPgFallsBackToTpGroup) {
+TEST_P(SparseMoEBlockTest, RoutedPgFallsBackToTpGroup) {
   set_tp_ctx(/*world_size=*/2, /*ep_size=*/1);
-  DeepseekV4SparseMoEBlock block = create_block();
+  SparseMoEBlock block = create_block();
 
-  EXPECT_EQ(DeepseekV4SparseMoEBlockTestPeer::routed_pg(*block), tp_pg_.get());
+  EXPECT_EQ(SparseMoEBlockTestPeer::routed_pg(*block), tp_pg_.get());
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, NeedGatherOnlyForDpEp) {
+TEST_P(SparseMoEBlockTest, NeedGatherOnlyForDpEp) {
   set_dp_ep_ctx(/*dp_size=*/2, /*with_dp_group=*/true);
-  DeepseekV4SparseMoEBlock block = create_block();
-  EXPECT_TRUE(DeepseekV4SparseMoEBlockTestPeer::need_gather(*block));
+  SparseMoEBlock block = create_block();
+  EXPECT_TRUE(SparseMoEBlockTestPeer::need_gather(*block));
 
   set_tp_ctx(/*world_size=*/2, /*ep_size=*/2);
   block = create_block();
-  EXPECT_FALSE(DeepseekV4SparseMoEBlockTestPeer::need_gather(*block));
+  EXPECT_FALSE(SparseMoEBlockTestPeer::need_gather(*block));
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, ConvertsModelTokensToRowTokens) {
+TEST_P(SparseMoEBlockTest, ConvertsModelTokensToRowTokens) {
   set_dp_ep_ctx(/*dp_size=*/2, /*with_dp_group=*/true);
-  DeepseekV4SparseMoEBlock block = create_block();
+  SparseMoEBlock block = create_block();
   ModelInputParams input_params;
   input_params.parallel.dp_global_token_nums = {3, 1};
 
-  std::vector<int32_t> row_tokens =
-      DeepseekV4SparseMoEBlockTestPeer::row_dp_tokens(
-          *block, /*hidden_rows=*/6, input_params);
+  std::vector<int32_t> row_tokens = SparseMoEBlockTestPeer::row_dp_tokens(
+      *block, /*hidden_rows=*/6, input_params);
 
   EXPECT_EQ(row_tokens, std::vector<int32_t>({6, 2}));
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, LoadStateDictAcceptsUnprefixedMoeKeys) {
-  DeepseekV4SparseMoEBlock block = create_block();
+TEST_P(SparseMoEBlockTest, LoadStateDictAcceptsUnprefixedMoeKeys) {
+  SparseMoEBlock block = create_block();
   FusedMoE raw_moe = create_raw_moe();
   StateDict state_dict(create_fp_weights());
   block->load_state_dict(state_dict);
@@ -309,26 +319,34 @@ TEST_F(DeepseekV4SparseMoEBlockTest, LoadStateDictAcceptsUnprefixedMoeKeys) {
   test::verify_tensor_close(actual, expected, 1e-3, 1e-4);
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, SelectedRouteMergesSharedAndRouted) {
-  DeepseekV4SparseMoEBlock block = create_block();
-  FusedMoE raw_moe = create_raw_moe(/*enable_result_reduction=*/true);
+TEST_P(SparseMoEBlockTest, SelectedRouteMergesSharedAndRouted) {
+  SparseMoEBlock block = create_block();
+  FusedMoE raw_moe = create_raw_moe(/*enable_result_reduction=*/false);
   StateDict state_dict(create_fp_weights());
   block->load_state_dict(state_dict);
   raw_moe->load_state_dict(state_dict);
 
   torch::Tensor hidden_states = make_hidden({4, model_args_.hidden_size()});
-  FusedMoEImpl::RouteInfo route = route_for(raw_moe, hidden_states);
+  FusedMoEImpl::RouteInfo expected_route = route_for(raw_moe, hidden_states);
+  FusedMoEImpl::RouteInfo route = block->prep_route(hidden_states);
+  EXPECT_TRUE(torch::equal(route.expert_id, expected_route.expert_id));
+  test::verify_tensor_close(
+      route.reduce_weight, expected_route.reduce_weight, 1e-3, 1e-4);
   torch::Tensor actual = block->forward_selected(
       hidden_states, route.reduce_weight, route.expert_id, ModelInputParams());
-  torch::Tensor expected = raw_moe->forward_experts(
-      hidden_states, /*enable_all2all_communication=*/false, route);
+  torch::Tensor routed = raw_moe->forward_experts(
+      hidden_states, /*enable_all2all_communication=*/false, expected_route);
+  torch::Tensor shared = raw_moe->forward_shared(hidden_states);
+  ASSERT_TRUE(shared.defined());
+  torch::Tensor expected = routed + shared;
 
   sync_dev();
+  EXPECT_EQ(actual.sizes(), hidden_states.sizes());
   test::verify_tensor_close(actual, expected, 1e-3, 1e-4);
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, SelectedRouteRestores3DShape) {
-  DeepseekV4SparseMoEBlock block = create_block();
+TEST_P(SparseMoEBlockTest, SelectedRouteRestores3DShape) {
+  SparseMoEBlock block = create_block();
   FusedMoE raw_moe = create_raw_moe();
   StateDict state_dict(create_fp_weights());
   block->load_state_dict(state_dict);
@@ -346,12 +364,19 @@ TEST_F(DeepseekV4SparseMoEBlockTest, SelectedRouteRestores3DShape) {
   torch::Tensor actual = block->forward_selected(
       hidden_states, topk_weights, topk_ids, ModelInputParams());
 
+  torch::Tensor expected = raw_moe->forward_experts(
+      hidden_states.reshape({-1, model_args_.hidden_size()}),
+      /*enable_all2all_communication=*/false,
+      route);
+
   sync_dev();
   EXPECT_EQ(actual.sizes(), hidden_states.sizes());
+  test::verify_tensor_close(
+      actual, expected.reshape(hidden_states.sizes()), 1e-3, 1e-4);
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, SelectedRouteRejectsInvalidTopkShape) {
-  DeepseekV4SparseMoEBlock block = create_block();
+TEST_P(SparseMoEBlockTest, SelectedRouteRejectsInvalidTopkShape) {
+  SparseMoEBlock block = create_block();
   torch::Tensor hidden_states = make_hidden({3, model_args_.hidden_size()});
   torch::Tensor topk_weights = torch::ones({2, 2}, options_);
   torch::Tensor topk_ids = torch::zeros({3, 2}, options_.dtype(torch::kInt64));
@@ -360,9 +385,9 @@ TEST_F(DeepseekV4SparseMoEBlockTest, SelectedRouteRejectsInvalidTopkShape) {
       hidden_states, topk_weights, topk_ids, ModelInputParams()));
 }
 
-TEST_F(DeepseekV4SparseMoEBlockTest, SelectedRouteRequiresDpTokensForGather) {
+TEST_P(SparseMoEBlockTest, SelectedRouteRequiresDpTokensForGather) {
   set_dp_ep_ctx(/*dp_size=*/2, /*with_dp_group=*/true);
-  DeepseekV4SparseMoEBlock block = create_block();
+  SparseMoEBlock block = create_block();
   torch::Tensor hidden_states = make_hidden({2, model_args_.hidden_size()});
   torch::Tensor topk_weights = torch::ones({2, 2}, options_);
   torch::Tensor topk_ids = torch::zeros({2, 2}, options_.dtype(torch::kInt64));
@@ -371,6 +396,14 @@ TEST_F(DeepseekV4SparseMoEBlockTest, SelectedRouteRequiresDpTokensForGather) {
                    hidden_states, topk_weights, topk_ids, ModelInputParams()),
                "dp_global_token_nums is empty");
 }
+
+INSTANTIATE_TEST_SUITE_P(ModelConfigs,
+                         SparseMoEBlockTest,
+                         ::testing::Values(std::string("deepseek_v4"),
+                                           std::string("glm5_next")),
+                         [](const ::testing::TestParamInfo<std::string>& info) {
+                           return info.param;
+                         });
 
 }  // namespace layer
 }  // namespace xllm

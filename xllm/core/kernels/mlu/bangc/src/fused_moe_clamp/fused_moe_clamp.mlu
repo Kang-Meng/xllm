@@ -1,0 +1,244 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// MoE gate/up clamp, in place on [rows, width]:
+//   gate = min(gate, limit); up = max(min(up, limit), -limit)
+// NaN is preserved, as in the where(x > limit, limit, x) reference form.
+// Rows [0, valid) are clamped, valid = min(sum(token_count), rows), or all
+// rows without token_count. Rows past valid hold no data (group GEMM writes
+// only the counted prefix) and may or may not be clamped.
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/fused_moe_clamp/launcher.h"
+
+namespace {
+constexpr int32_t kTileBytes = 96 * 1024;
+constexpr int32_t kTileBuffers = 3;
+// Inputs of at most kSmallBytes per core take the single-pass path.
+constexpr int32_t kSmallBytes = 12 * 1024;
+constexpr int32_t kCoreMinBytes = 2 * 1024;
+constexpr int32_t kMaxCores = 32;
+
+__nram__ __attribute__((aligned(128))) int8_t tiles[kTileBuffers * kTileBytes];
+__nram__
+    __attribute__((aligned(128))) int8_t pattern_buf[kFusedMoeClampMaxRowBytes];
+__nram__ __attribute__((
+    aligned(128))) int8_t count_buf[kFusedMoeClampMaxCounts * 16];
+__mlu_shared__ __attribute__((
+    aligned(128))) int8_t count_sram[kFusedMoeClampMaxCounts * 8];
+
+// Sum of the counts the cluster's MPU staged in SRAM. Reading them from every
+// core directly stalls for microseconds when they share an allocator segment
+// with the data other cores are already moving.
+__mlu_func__ int32_t valid_rows(int32_t count, int32_t bytes, int64_t rows) {
+  __sync_cluster();
+  int32_t* counts = reinterpret_cast<int32_t*>(count_buf);
+  __memcpy(counts, count_sram, count * bytes, SRAM2NRAM);
+  const int32_t padded = (count + 63) / 64 * 64;
+  if (bytes == 8) {
+    // Counts are below 2^31: [count, 2] words -> [2, count]; row 0 holds the
+    // low words.
+    int32_t* split = counts + kFusedMoeClampMaxCounts * 2;
+    __bang_transpose(split, counts, padded, 2);
+    counts = split;
+  }
+  int64_t sum = 0;
+  if (rows < (1 << 24)) {
+    // Every partial sum of non-negative counts below 2^24 is exact in fp32.
+    float* values =
+        reinterpret_cast<float*>(count_buf + kFusedMoeClampMaxCounts * 12);
+    __bang_write_value(values, padded, 0.0f);
+    __bang_int322float(values, counts, count, /*fix_position=*/0);
+    sum = static_cast<int64_t>(__bang_sum(values, padded));
+  } else {
+    for (int32_t i = 0; i < count; ++i) {
+      sum += counts[i];
+    }
+  }
+  return static_cast<int32_t>(sum < rows ? (sum < 0 ? 0 : sum) : rows);
+}
+
+// Per-row lower bounds: none for gate, -limit for up.
+template <typename T>
+__mlu_func__ void write_pattern(T* pattern, int32_t width, float limit) {
+  __bang_write_value(pattern, width / 2, static_cast<T>(-INFINITY));
+  __bang_write_value(pattern + width / 2, width / 2, static_cast<T>(-limit));
+}
+
+// Both primitives keep NaN inputs.
+template <typename T>
+__mlu_func__ void clamp_rows(T* x,
+                             const T* pattern,
+                             T limit,
+                             int32_t elems,
+                             int32_t width) {
+  __bang_mineq_scalar(x, x, limit, elems);
+  __bang_cycle_maxequal(x, x, pattern, elems, width);
+}
+
+template <typename T>
+__mlu_global__ void fused_moe_clamp_kernel(T* data,
+                                           int64_t rows,
+                                           int32_t width,
+                                           float limit,
+                                           const void* token_count,
+                                           int32_t count,
+                                           int32_t count_bytes) {
+  const int32_t row_bytes = width * static_cast<int32_t>(sizeof(T));
+  // Small inputs clamp a static share of all rows per core, which keeps the
+  // count reduction off their latency path.
+  const bool small =
+      rows * row_bytes <= static_cast<int64_t>(taskDim) * kSmallBytes;
+  const bool counted = token_count != nullptr && !small;
+  if (__is_mpu()) {
+    if (counted) {
+      __memcpy(count_sram, token_count, count * count_bytes, GDRAM2SRAM);
+      __sync_cluster();
+    }
+    return;
+  }
+  const T lim = static_cast<T>(limit);
+  T* pattern = reinterpret_cast<T*>(pattern_buf);
+  if (small) {
+    const int32_t all = static_cast<int32_t>(rows);
+    const int32_t per = all / taskDim;
+    const int32_t rest = all % taskDim;
+    const int32_t first = taskId * per + (taskId < rest ? taskId : rest);
+    const int32_t n = per + (taskId < rest ? 1 : 0);
+    if (n == 0) {
+      return;
+    }
+    T* x = reinterpret_cast<T*>(tiles);
+    __memcpy_async(x,
+                   data + static_cast<int64_t>(first) * width,
+                   n * row_bytes,
+                   GDRAM2NRAM);
+    write_pattern(pattern, width, limit);
+    __sync_io();
+    clamp_rows(x, pattern, lim, n * width, width);
+    __sync_compute();
+    __memcpy(data + static_cast<int64_t>(first) * width,
+             x,
+             n * row_bytes,
+             NRAM2GDRAM);
+    return;
+  }
+  write_pattern(pattern, width, limit);
+  const int32_t valid = counted ? valid_rows(count, count_bytes, rows)
+                                : static_cast<int32_t>(rows);
+  // Tile j goes to core j % taskDim, so all cores sweep memory together; the
+  // tile height gives every core the same number of tiles.
+  const int32_t full_tile = kTileBytes / row_bytes;
+  const int32_t per_core =
+      ((valid + full_tile - 1) / full_tile + taskDim - 1) / taskDim;
+  const int32_t slots = (per_core > 0 ? per_core : 1) * taskDim;
+  const int32_t tile_rows = valid > slots ? (valid + slots - 1) / slots : 1;
+  const int32_t first = taskId * tile_rows;
+  const int32_t stride = taskDim * tile_rows;
+  if (first >= valid) {
+    return;
+  }
+  const int32_t ntiles = (valid - first + stride - 1) / stride;
+  // Three-stage pipeline over rotating buffers: load t, clamp t-1, store t-2.
+  int32_t load_row = first;
+  int32_t compute_row = first;
+  int32_t store_row = first;
+  int32_t load_buf = 0;
+  int32_t compute_buf = 0;
+  int32_t store_buf = 0;
+  for (int32_t t = 0; t < ntiles + 2; ++t) {
+    if (t < ntiles) {
+      const int32_t n =
+          valid - load_row < tile_rows ? valid - load_row : tile_rows;
+      __memcpy_async(tiles + load_buf * kTileBytes,
+                     data + static_cast<int64_t>(load_row) * width,
+                     n * row_bytes,
+                     GDRAM2NRAM);
+      load_row += stride;
+      load_buf = load_buf == kTileBuffers - 1 ? 0 : load_buf + 1;
+    }
+    if (t >= 1 && t <= ntiles) {
+      const int32_t n =
+          valid - compute_row < tile_rows ? valid - compute_row : tile_rows;
+      T* x = reinterpret_cast<T*>(tiles + compute_buf * kTileBytes);
+      clamp_rows(x, pattern, lim, n * width, width);
+      compute_row += stride;
+      compute_buf = compute_buf == kTileBuffers - 1 ? 0 : compute_buf + 1;
+    }
+    if (t >= 2) {
+      const int32_t n =
+          valid - store_row < tile_rows ? valid - store_row : tile_rows;
+      __memcpy_async(data + static_cast<int64_t>(store_row) * width,
+                     tiles + store_buf * kTileBytes,
+                     n * row_bytes,
+                     NRAM2GDRAM);
+      store_row += stride;
+      store_buf = store_buf == kTileBuffers - 1 ? 0 : store_buf + 1;
+    }
+    __sync();
+  }
+}
+}  // namespace
+
+extern "C" void fused_moe_clamp_launch(void* queue,
+                                       void* data,
+                                       int64_t rows,
+                                       int32_t width,
+                                       int32_t dtype,
+                                       float limit,
+                                       const void* token_count,
+                                       int32_t token_count_size,
+                                       int32_t token_count_bytes) {
+  // Tiny inputs launch fewer clusters so that each core moves enough bytes.
+  const int64_t elem_bytes = dtype == 2 ? 4 : 2;
+  const int64_t wanted =
+      (rows * width * elem_bytes + kCoreMinBytes - 1) / kCoreMinBytes;
+  const int32_t cores = wanted >= kMaxCores
+                            ? kMaxCores
+                            : static_cast<int32_t>((wanted + 3) / 4 * 4);
+  const cnrtDim3_t dim = {
+      4, static_cast<uint32_t>(cores < 4 ? 1 : cores / 4), 1};
+  const cnrtQueue_t q = static_cast<cnrtQueue_t>(queue);
+  if (dtype == 0) {
+    fused_moe_clamp_kernel<half>
+        <<<dim, cnrtFuncTypeUnion1, q>>>(static_cast<half*>(data),
+                                         rows,
+                                         width,
+                                         limit,
+                                         token_count,
+                                         token_count_size,
+                                         token_count_bytes);
+  } else if (dtype == 1) {
+    fused_moe_clamp_kernel<bfloat16_t>
+        <<<dim, cnrtFuncTypeUnion1, q>>>(static_cast<bfloat16_t*>(data),
+                                         rows,
+                                         width,
+                                         limit,
+                                         token_count,
+                                         token_count_size,
+                                         token_count_bytes);
+  } else {
+    fused_moe_clamp_kernel<float>
+        <<<dim, cnrtFuncTypeUnion1, q>>>(static_cast<float*>(data),
+                                         rows,
+                                         width,
+                                         limit,
+                                         token_count,
+                                         token_count_size,
+                                         token_count_bytes);
+  }
+}

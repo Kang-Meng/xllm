@@ -30,8 +30,8 @@ limitations under the License.
 #include "framework/config/eplb_config.h"
 #include "framework/parallel_state/process_group.h"
 #include "framework/state_dict/state_dict.h"
-#include "layers/mlu/deepseek_v4/deepseek_v4_sparse_moe_block.h"
 #include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
+#include "layers/mlu/sparse_moe_block.h"
 #include "platform/device.h"
 #include "platform/model_stream_registry.h"
 #include "platform/platform.h"
@@ -118,10 +118,46 @@ ParallelArgs make_parallel_args(int32_t rank,
 void check_output(const torch::Tensor& actual, const torch::Tensor& expected) {
   CHECK_EQ(actual.sizes(), expected.sizes());
   CHECK(torch::isfinite(actual).all().item<bool>());
+  if (expected.numel() == 0) {
+    return;
+  }
   CHECK_GT(expected.abs().max().item<float>(), 1e-4f);
   CHECK(torch::allclose(actual, expected, /*rtol=*/0.02, /*atol=*/2e-4))
       << "Selected MoE differs from the unsharded reference; maximum error: "
       << (actual - expected).abs().max().item<float>();
+}
+
+template <typename Forward, typename Expected, typename Update>
+void check_selected(Device& device,
+                    bool graph_replay,
+                    const Forward& selected,
+                    const Expected& expected,
+                    const Update& update_inputs) {
+  // Warm the real communicator and kernels before capture on a nondefault
+  // stream.
+  for (int32_t iteration = 0; iteration < 3; ++iteration) {
+    check_output(selected(), expected());
+  }
+  torch_mlu::synchronize();
+  if (!graph_replay) {
+    return;
+  }
+
+  auto capture_stream = device.get_stream_from_pool();
+  torch_mlu::MLUGraph graph;
+  torch::Tensor captured;
+  {
+    auto guard = capture_stream->set_stream_guard();
+    graph.capture_begin();
+    captured = selected();
+    graph.capture_end();
+  }
+  for (int32_t iteration = 0; iteration < 3; ++iteration) {
+    update_inputs(iteration);
+    graph.replay();
+    check_output(captured, expected());
+  }
+  torch_mlu::synchronize();
 }
 
 int32_t run_rank(int32_t rank,
@@ -130,7 +166,8 @@ int32_t run_rank(int32_t rank,
                  bool use_ep,
                  bool with_shared,
                  bool graph_replay,
-                 bool use_cp) {
+                 bool use_cp,
+                 bool use_deep_ep) {
   // Bound a failed collective, including a peer that exits during setup.
   ::alarm(180);
   if (Platform::device_count() < world_size) {
@@ -139,7 +176,7 @@ int32_t run_rank(int32_t rank,
   torch::InferenceMode inference_mode;
   Device device(rank);
   device.set_device();
-  EPLBConfig::get_instance().expert_parallel_degree(1);
+  EPLBConfig::get_instance().expert_parallel_degree(use_deep_ep ? 2 : 1);
   auto collective = create_process_group(rank,
                                          world_size,
                                          world_size,
@@ -165,14 +202,13 @@ int32_t run_rank(int32_t rank,
       torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
   const ModelArgs model_args = make_model_args(with_shared);
   ModelStreamRegistry streams(device.unwrap());
-  DeepseekV4SparseMoEBlock block(
-      model_args,
-      QuantArgs(),
-      parallel_args,
-      options,
-      /*use_hash=*/false,
-      streams.get(ExecutionStreamRole::COMMUNICATION),
-      streams.get(ExecutionStreamRole::AUXILIARY_COMPUTE));
+  SparseMoEBlock block(model_args,
+                       QuantArgs(),
+                       parallel_args,
+                       options,
+                       /*use_hash=*/false,
+                       streams.get(ExecutionStreamRole::COMMUNICATION),
+                       streams.get(ExecutionStreamRole::AUXILIARY_COMPUTE));
   // No sharding or collective in this reference: all experts run on each rank.
   FusedMoE reference(
       model_args,
@@ -185,6 +221,53 @@ int32_t run_rank(int32_t rank,
   const StateDict weights = make_weights(model_args, options);
   block->load_state_dict(weights);
   reference->load_state_dict(weights);
+
+  if (use_deep_ep) {
+    for (int64_t row_count : {8, 3, 1, 0}) {
+      torch::Tensor hidden =
+          make_values(row_count, model_args.hidden_size(), 0.5f, options)
+              .mul(10.0f)
+              .reshape({1, row_count, model_args.hidden_size()});
+      torch::Tensor ids =
+          torch::arange(row_count * 2, options.dtype(torch::kInt32))
+              .reshape({row_count, 2})
+              .remainder(model_args.n_routed_experts());
+      torch::Tensor routing_weights =
+          torch::tensor({0.25f, 0.75f}, options.dtype(torch::kFloat32))
+              .repeat({row_count, 1});
+      ModelInputParams input_params;
+      input_params.parallel.dp_is_decode = {1};
+      const auto selected = [&]() {
+        return block->forward_selected(
+            hidden, routing_weights, ids, input_params);
+      };
+      const auto expected = [&]() {
+        if (row_count == 0) {
+          return torch::empty_like(hidden);
+        }
+        FusedMoEImpl::RouteInfo route;
+        route.expert_id = ids;
+        route.reduce_weight = routing_weights;
+        torch::Tensor output = reference->forward_experts(
+            hidden.reshape({row_count, model_args.hidden_size()}),
+            /*enable_all2all_communication=*/false,
+            route);
+        const torch::Tensor shared = reference->forward_shared(
+            hidden.reshape({row_count, model_args.hidden_size()}));
+        if (shared.defined()) {
+          output.add_(shared);
+        }
+        return output.reshape(hidden.sizes());
+      };
+      const auto update_inputs = [&](int32_t /*unused*/) {
+        hidden.mul_(/*other=*/0.8f);
+        ids.add_(/*other=*/1).remainder_(model_args.n_routed_experts());
+        routing_weights.mul_(/*other=*/0.9f);
+      };
+      check_selected(device, graph_replay, selected, expected, update_inputs);
+    }
+    return 0;
+  }
 
   if (use_cp) {
     for (const std::vector<int32_t>& lengths :
@@ -250,30 +333,11 @@ int32_t run_rank(int32_t rank,
     return output.reshape(hidden.sizes());
   };
 
-  // Warm the real communicator and kernels before capture on a nondefault
-  // stream.
-  for (int32_t iteration = 0; iteration < 3; ++iteration) {
-    check_output(selected(), expected());
-  }
-  torch_mlu::synchronize();
-  if (graph_replay) {
-    auto capture_stream = device.get_stream_from_pool();
-    torch_mlu::MLUGraph graph;
-    torch::Tensor captured;
-    {
-      auto guard = capture_stream->set_stream_guard();
-      graph.capture_begin();
-      captured = selected();
-      graph.capture_end();
-    }
-    for (int32_t iteration = 0; iteration < 3; ++iteration) {
-      hidden.mul_(0.8f);
-      ids.fill_(iteration % model_args.n_routed_experts());
-      graph.replay();
-      check_output(captured, expected());
-    }
-    torch_mlu::synchronize();
-  }
+  const auto update_inputs = [&](int32_t iteration) {
+    hidden.mul_(/*other=*/0.8f);
+    ids.fill_(iteration % model_args.n_routed_experts());
+  };
+  check_selected(device, graph_replay, selected, expected, update_inputs);
   return 0;
 }
 
@@ -281,7 +345,8 @@ void run_collective_test(int32_t world_size,
                          bool use_ep,
                          bool with_shared,
                          bool graph_replay,
-                         bool use_cp = false) {
+                         bool use_cp = false,
+                         bool use_deep_ep = false) {
   const int32_t port = net::get_local_free_port();
   std::vector<pid_t> children;
   children.reserve(world_size);
@@ -292,8 +357,14 @@ void run_collective_test(int32_t world_size,
       int32_t result = 1;
       // A child process boundary must report setup or device failures to GTest.
       try {
-        result = run_rank(
-            rank, world_size, port, use_ep, with_shared, graph_replay, use_cp);
+        result = run_rank(rank,
+                          world_size,
+                          port,
+                          use_ep,
+                          with_shared,
+                          graph_replay,
+                          use_cp,
+                          use_deep_ep);
       } catch (const std::exception& error) {
         LOG(ERROR) << "Selected MoE rank " << rank << ": " << error.what();
       }
@@ -324,14 +395,32 @@ void run_collective_test(int32_t world_size,
   }
 }
 
-TEST(DeepseekV4SparseMoECollectiveTest, EpSharedMatchesUnshardedReference) {
+TEST(SparseMoECollectiveTest, EpSharedMatchesUnshardedReference) {
   run_collective_test(/*world_size=*/2,
                       /*use_ep=*/true,
                       /*with_shared=*/true,
                       /*graph_replay=*/false);
 }
 
-TEST(DeepseekV4SparseMoECollectiveTest, CpSharedPreservesRaggedAndEmptyRanks) {
+TEST(SparseMoECollectiveTest, DeepEpTpShardPreservesSelectedRows) {
+  run_collective_test(/*world_size=*/2,
+                      /*use_ep=*/true,
+                      /*with_shared=*/false,
+                      /*graph_replay=*/false,
+                      /*use_cp=*/false,
+                      /*use_deep_ep=*/true);
+}
+
+TEST(SparseMoECollectiveTest, DeepEpTpShardSharedGraphPreservesRows) {
+  run_collective_test(/*world_size=*/2,
+                      /*use_ep=*/true,
+                      /*with_shared=*/true,
+                      /*graph_replay=*/true,
+                      /*use_cp=*/false,
+                      /*use_deep_ep=*/true);
+}
+
+TEST(SparseMoECollectiveTest, CpSharedPreservesRaggedAndEmptyRanks) {
   run_collective_test(/*world_size=*/2,
                       /*use_ep=*/true,
                       /*with_shared=*/true,
@@ -339,7 +428,7 @@ TEST(DeepseekV4SparseMoECollectiveTest, CpSharedPreservesRaggedAndEmptyRanks) {
                       /*use_cp=*/true);
 }
 
-TEST(DeepseekV4SparseMoECollectiveTest, CpWithoutSharedPreservesRaggedRanks) {
+TEST(SparseMoECollectiveTest, CpWithoutSharedPreservesRaggedRanks) {
   run_collective_test(/*world_size=*/2,
                       /*use_ep=*/true,
                       /*with_shared=*/false,
@@ -347,31 +436,28 @@ TEST(DeepseekV4SparseMoECollectiveTest, CpWithoutSharedPreservesRaggedRanks) {
                       /*use_cp=*/true);
 }
 
-TEST(DeepseekV4SparseMoECollectiveTest, TpSharedMatchesUnshardedReference) {
+TEST(SparseMoECollectiveTest, TpSharedMatchesUnshardedReference) {
   run_collective_test(/*world_size=*/2,
                       /*use_ep=*/false,
                       /*with_shared=*/true,
                       /*graph_replay=*/false);
 }
 
-TEST(DeepseekV4SparseMoECollectiveTest,
-     EpWithoutSharedMatchesUnshardedReference) {
+TEST(SparseMoECollectiveTest, EpWithoutSharedMatchesUnshardedReference) {
   run_collective_test(/*world_size=*/2,
                       /*use_ep=*/true,
                       /*with_shared=*/false,
                       /*graph_replay=*/false);
 }
 
-TEST(DeepseekV4SparseMoECollectiveTest,
-     SingleRankWithoutSharedPreservesOutput) {
+TEST(SparseMoECollectiveTest, SingleRankWithoutSharedPreservesOutput) {
   run_collective_test(/*world_size=*/1,
                       /*use_ep=*/false,
                       /*with_shared=*/false,
                       /*graph_replay=*/false);
 }
 
-TEST(DeepseekV4SparseMoECollectiveTest,
-     EpSharedGraphUsesUpdatedInputsAndRoutes) {
+TEST(SparseMoECollectiveTest, EpSharedGraphUsesUpdatedInputsAndRoutes) {
   run_collective_test(/*world_size=*/2,
                       /*use_ep=*/true,
                       /*with_shared=*/true,

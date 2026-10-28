@@ -468,7 +468,11 @@ torch::Tensor FusedMoEImpl::compute_routed_experts(
   }
 
   if (swiglu_limit_.has_value()) {
-    gemm1_out = kernel::mlu::fused_moe_clamp(gemm1_out, swiglu_limit_.value());
+    // Rows past the counted prefix hold no GEMM output; the deep-EP receive
+    // buffer in particular is much larger than the routed tokens.
+    kernel::mlu::fused_moe_clamp(gemm1_out,
+                                 swiglu_limit_.value(),
+                                 selected_expert_info.token_count_slice);
   }
 
   torch::Tensor act_out;

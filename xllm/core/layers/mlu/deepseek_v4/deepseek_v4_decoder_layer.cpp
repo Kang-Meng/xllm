@@ -73,7 +73,7 @@ DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
       context.stream_registry();
   sparse_moe_ = register_module(
       "mlp",
-      DeepseekV4SparseMoEBlock(
+      SparseMoEBlock(
           model_args,
           quant_args,
           parallel_args,
@@ -223,7 +223,10 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
       local_ids =
           mlu_v4_cp::shard_rows(input_ids.value().reshape({-1}), *cp_context);
     }
-    ffn_output = sparse_moe_->forward_cp(ffn_input, local_ids, *cp_context);
+    ffn_output = sparse_moe_->forward_cp(ffn_input,
+                                         local_ids,
+                                         cp_context->geometry.tokens_per_rank,
+                                         cp_context->cp_group);
   } else {
     std::optional<torch::Tensor> ids = route_input_ids(ffn_input, input_ids);
     FusedMoEImpl::RouteInfo route_info =

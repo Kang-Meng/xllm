@@ -245,7 +245,7 @@ cc_test(
     fused_moe_test.cpp
     moe_weight_loader_helper_test.cpp
     deepseek_v32/deepseek_v32_sparse_moe_block_test.cpp
-    deepseek_v4_sparse_moe_block_test.cpp
+    sparse_moe_block_test.cpp
   DEPS
     :tests_utils
     :config
@@ -264,9 +264,9 @@ cc_test(
 # Isolate forked CNCL ranks from tests that initialize MLU in the parent.
 cc_test(
   NAME
-    deepseek_v4_sparse_moe_collective_test
+    sparse_moe_collective_test
   SRCS
-    deepseek_v4_sparse_moe_collective_test.cpp
+    sparse_moe_collective_test.cpp
   DEPS
     :config
     :mlu_layers

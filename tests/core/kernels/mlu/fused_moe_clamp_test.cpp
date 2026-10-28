@@ -19,64 +19,134 @@ limitations under the License.
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <vector>
 
 #include "kernels/mlu/mlu_ops_api.h"
 
 namespace xllm {
 namespace {
 
-TEST(FusedMoeClampTest, MatchesOriginalClampsForDtypesAndTailTiles) {
-  const torch::Device device(torch::kPrivateUse1, 0);
+torch::Tensor reference_clamp(const torch::Tensor& input, float limit) {
+  const auto parts = input.chunk(/*chunks=*/2, /*dim=*/-1);
+  return torch::cat({parts[0].clamp_max(limit), parts[1].clamp(-limit, limit)},
+                    /*dim=*/-1);
+}
+
+torch::Tensor with_specials(torch::Tensor input) {
+  const int64_t width = input.size(-1);
+  const float inf = std::numeric_limits<float>::infinity();
+  const std::vector<float> specials = {
+      -inf, inf, std::numeric_limits<float>::quiet_NaN(), -0.0f, 10.0f, -10.0f};
+  torch::Tensor rows = input.view({-1, width});
+  for (int64_t i = 0; i < static_cast<int64_t>(specials.size()); ++i) {
+    rows[0][i % width] = specials[i];
+    rows[-1][(width / 2 + i) % width] = specials[i];
+  }
+  return input;
+}
+
+// Per-expert counts summing to `total`, spread over `experts` entries.
+torch::Tensor make_counts(int64_t total,
+                          int64_t experts,
+                          torch::ScalarType dtype) {
+  torch::Tensor counts = torch::zeros({experts}, torch::kInt64);
+  for (int64_t i = 0; i < total; ++i) {
+    counts[(i * 7) % experts] += 1;
+  }
+  return counts.to(dtype);
+}
+
+TEST(FusedMoeClampTest, MatchesReferenceForDtypesWidthsAndSpecials) {
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
   for (const torch::ScalarType dtype :
        {torch::kBFloat16, torch::kFloat16, torch::kFloat32}) {
-    for (const int64_t width : {14, 258, 4096}) {
-      torch::Tensor input = torch::randn({9, width}).mul(12).to(dtype);
-      input[0][0] = -std::numeric_limits<float>::infinity();
-      input[0][1] = std::numeric_limits<float>::infinity();
-      input[0][2] = std::numeric_limits<float>::quiet_NaN();
-      input[0][width / 2] = -std::numeric_limits<float>::infinity();
-      input[0][width / 2 + 1] = std::numeric_limits<float>::infinity();
-      input[0][width / 2 + 2] = std::numeric_limits<float>::quiet_NaN();
-      const auto parts = input.chunk(2, -1);
-      const torch::Tensor expected =
-          torch::cat({parts[0].clamp_max(10), parts[1].clamp(-10, 10)}, -1);
-      const torch::Tensor device_input = input.to(device);
-      for (int32_t repeat = 0; repeat < 2; ++repeat) {
-        const torch::Tensor output =
-            kernel::mlu::fused_moe_clamp(device_input, 10);
-        EXPECT_TRUE(torch::allclose(output.cpu(), expected, 0, 0, true));
-        EXPECT_TRUE(torch::allclose(device_input.cpu(), input, 0, 0, true));
-        EXPECT_NE(output.data_ptr(), device_input.data_ptr());
+    for (const int64_t width : {2, 14, 258, 4096, 6144}) {
+      for (const int64_t rows : {1, 9, 257, 4096}) {
+        const torch::Tensor input = with_specials(
+            torch::randn({rows, width}).mul(/*other=*/12).to(dtype));
+        const torch::Tensor expected = reference_clamp(input, /*limit=*/10);
+        torch::Tensor output = input.to(device);
+        kernel::mlu::fused_moe_clamp(output, /*limit=*/10, std::nullopt);
+        EXPECT_TRUE(torch::allclose(
+            output.cpu(), expected, /*rtol=*/0, /*atol=*/0, /*equal_nan=*/true))
+            << "dtype " << dtype << " width " << width << " rows " << rows;
       }
     }
   }
 }
 
-TEST(FusedMoeClampTest, AlignedThreeDimensionalInputAndEmptyBatch) {
-  const torch::Device device(torch::kPrivateUse1, 0);
+TEST(FusedMoeClampTest, ClampsCountedRowPrefix) {
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  torch::DeviceGuard guard(device);
+  // 32 x 512 takes the small-input path; the others the counted path.
+  for (const auto& [rows, width] : std::vector<std::pair<int64_t, int64_t>>{
+           {32, 512}, {4096, 512}, {4096, 4096}, {300, 6144}}) {
+    for (const int64_t total : {int64_t{0}, int64_t{31}, rows - 1, rows * 3}) {
+      for (const torch::ScalarType count_dtype :
+           {torch::kInt32, torch::kInt64}) {
+        const torch::Tensor input = with_specials(
+            torch::randn({rows, width}).mul(/*other=*/12).to(torch::kBFloat16));
+        const torch::Tensor expected = reference_clamp(input, /*limit=*/10);
+        torch::Tensor output = input.to(device);
+        kernel::mlu::fused_moe_clamp(
+            output,
+            /*limit=*/10,
+            make_counts(total, /*experts=*/36, count_dtype).to(device));
+        const torch::Tensor actual = output.cpu();
+        const int64_t valid = std::min(total, rows);
+        EXPECT_TRUE(
+            torch::allclose(actual.slice(/*dim=*/0, /*start=*/0, valid),
+                            expected.slice(/*dim=*/0, /*start=*/0, valid),
+                            /*rtol=*/0,
+                            /*atol=*/0,
+                            /*equal_nan=*/true))
+            << rows << "x" << width << " valid " << valid;
+        // Rows past the counted prefix are either untouched or clamped.
+        for (int64_t row = valid; row < rows; ++row) {
+          EXPECT_TRUE(torch::allclose(actual[row],
+                                      input[row],
+                                      /*rtol=*/0,
+                                      /*atol=*/0,
+                                      /*equal_nan=*/true) ||
+                      torch::allclose(actual[row],
+                                      expected[row],
+                                      /*rtol=*/0,
+                                      /*atol=*/0,
+                                      /*equal_nan=*/true))
+              << rows << "x" << width << " row " << row;
+        }
+      }
+    }
+  }
+}
+
+TEST(FusedMoeClampTest, ThreeDimensionalInputAndEmptyBatch) {
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
   const torch::Tensor input =
-      torch::randn({2, 8, 4096}).mul(12).to(torch::kBFloat16);
-  const auto parts = input.chunk(2, -1);
-  const torch::Tensor expected =
-      torch::cat({parts[0].clamp_max(10), parts[1].clamp(-10, 10)}, -1);
-  const auto output = kernel::mlu::fused_moe_clamp(input.to(device), 10);
-  EXPECT_EQ(output.sizes(), input.sizes());
-  EXPECT_TRUE(torch::equal(output.cpu(), expected));
-  const auto empty = torch::empty({0, 4096}, input.options().device(device));
-  EXPECT_EQ(kernel::mlu::fused_moe_clamp(empty, 10).sizes(), empty.sizes());
+      torch::randn({2, 8, 4096}).mul(/*other=*/12).to(torch::kBFloat16);
+  torch::Tensor output = input.to(device);
+  kernel::mlu::fused_moe_clamp(output, /*limit=*/10, std::nullopt);
+  EXPECT_TRUE(torch::equal(output.cpu(), reference_clamp(input, /*limit=*/10)));
+  torch::Tensor empty = torch::empty({0, 4096}, input.options().device(device));
+  kernel::mlu::fused_moe_clamp(
+      empty,
+      /*limit=*/10,
+      make_counts(/*total=*/0, /*experts=*/36, torch::kInt32).to(device));
+  EXPECT_EQ(empty.numel(), 0);
 }
 
 TEST(FusedMoeClampTest, MatchesOriginalActivationQuantizationChain) {
-  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
-  const torch::Tensor input =
-      torch::randn({16, 4096}).mul(12).to(torch::kBFloat16).to(device);
-  const auto parts = input.chunk(2, -1);
-  const torch::Tensor original =
-      torch::cat({parts[0].clamp_max(10), parts[1].clamp(-10, 10)}, -1);
-  const torch::Tensor fused = kernel::mlu::fused_moe_clamp(input, 10);
+  const torch::Tensor input = torch::randn({16, 4096})
+                                  .mul(/*other=*/12)
+                                  .to(torch::kBFloat16)
+                                  .to(device);
+  const torch::Tensor original = reference_clamp(input, /*limit=*/10);
+  torch::Tensor fused = input.clone();
+  kernel::mlu::fused_moe_clamp(fused, /*limit=*/10, std::nullopt);
   const torch::Tensor smooth =
       torch::ones({2048}, input.options().dtype(torch::kFloat32));
   auto quantize = [&smooth](const torch::Tensor& value) {
@@ -88,7 +158,7 @@ TEST(FusedMoeClampTest, MatchesOriginalActivationQuantizationChain) {
                                         std::nullopt,
                                         std::nullopt,
                                         std::nullopt,
-                                        "silu",
+                                        /*act_mode=*/"silu",
                                         /*active_coef=*/1.0,
                                         /*is_gated=*/true);
   };

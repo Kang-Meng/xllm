@@ -27,40 +27,41 @@ limitations under the License.
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
-#include "layers/mlu/deepseek_v4/deepseek_v4_cp_context.h"
 #include "layers/mlu/fused_moe.h"
 
 namespace xllm {
 namespace layer {
 
-class DeepseekV4SparseMoEBlockTestPeer;
+class SparseMoEBlockTestPeer;
 
-class DeepseekV4SparseMoEBlockImpl final : public torch::nn::Module {
+class SparseMoEBlockImpl final : public torch::nn::Module {
  public:
-  DeepseekV4SparseMoEBlockImpl() = default;
-  DeepseekV4SparseMoEBlockImpl(
-      const ModelArgs& model_args,
-      const QuantArgs& quant_args,
-      const ParallelArgs& parallel_args,
-      const torch::TensorOptions& options,
-      bool use_hash,
-      const std::shared_ptr<Stream>& routed_comm_stream,
-      const std::shared_ptr<Stream>& shared_compute_stream,
-      const std::string& module_prefix = "");
+  SparseMoEBlockImpl() = default;
+  SparseMoEBlockImpl(const ModelArgs& model_args,
+                     const QuantArgs& quant_args,
+                     const ParallelArgs& parallel_args,
+                     const torch::TensorOptions& options,
+                     bool use_hash,
+                     const std::shared_ptr<Stream>& routed_comm_stream,
+                     const std::shared_ptr<Stream>& shared_compute_stream,
+                     const std::string& module_prefix = "");
 
   void load_state_dict(const StateDict& state_dict);
   void verify_loaded_weights() const;
 
+  // Ordinary inputs contain the full token set replicated within TP.
   FusedMoEImpl::RouteInfo prep_route(
       torch::Tensor& hidden_states,
       const std::optional<torch::Tensor>& input_ids = std::nullopt);
+  // Inputs contain the full token set replicated within TP. Internal DP/TP/EP
+  // communication preserves the input shape and row order.
   torch::Tensor forward_selected(const torch::Tensor& hidden_states,
                                  const torch::Tensor& topk_weights,
                                  const torch::Tensor& topk_ids,
                                  const ModelInputParams& input_params);
-  torch::Tensor forward_cp(const torch::Tensor& local_hidden_states,
-                           const std::optional<torch::Tensor>& local_input_ids,
-                           const mlu_v4_cp::DeepseekV4CpContext& cp_context);
+  // Inputs contain this CP rank's tokens, replicated within TP. EP ranks are
+  // ordered by CP rank, then TP rank. Padding, sharding and communication are
+  // internal; the output preserves the caller's local shape and row order.
   torch::Tensor forward_cp(const torch::Tensor& local_hidden_states,
                            const std::optional<torch::Tensor>& local_input_ids,
                            const std::vector<int32_t>& tokens_per_rank,
@@ -80,10 +81,10 @@ class DeepseekV4SparseMoEBlockImpl final : public torch::nn::Module {
   bool enable_deep_ep_ = false;
   FusedMoE moe_{nullptr};
 
-  friend class DeepseekV4SparseMoEBlockTestPeer;
+  friend class SparseMoEBlockTestPeer;
 };
 
-TORCH_MODULE(DeepseekV4SparseMoEBlock);
+TORCH_MODULE(SparseMoEBlock);
 
 }  // namespace layer
 }  // namespace xllm

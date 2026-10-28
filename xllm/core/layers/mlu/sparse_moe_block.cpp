@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "layers/mlu/deepseek_v4/deepseek_v4_sparse_moe_block.h"
+#include "layers/mlu/sparse_moe_block.h"
 
 #include <glog/logging.h>
 
@@ -45,7 +45,7 @@ std::pair<int32_t, int32_t> split_range(int32_t size,
 
 }  // namespace
 
-DeepseekV4SparseMoEBlockImpl::DeepseekV4SparseMoEBlockImpl(
+SparseMoEBlockImpl::SparseMoEBlockImpl(
     const ModelArgs& model_args,
     const QuantArgs& quant_args,
     const ParallelArgs& parallel_args,
@@ -72,31 +72,30 @@ DeepseekV4SparseMoEBlockImpl::DeepseekV4SparseMoEBlockImpl(
                                   shared_compute_stream));
 }
 
-void DeepseekV4SparseMoEBlockImpl::load_state_dict(
-    const StateDict& state_dict) {
+void SparseMoEBlockImpl::load_state_dict(const StateDict& state_dict) {
   moe_->load_state_dict(state_dict);
 }
 
-void DeepseekV4SparseMoEBlockImpl::verify_loaded_weights() const {
+void SparseMoEBlockImpl::verify_loaded_weights() const {
   moe_->verify_loaded_weights();
 }
 
-FusedMoEImpl::RouteInfo DeepseekV4SparseMoEBlockImpl::prep_route(
+FusedMoEImpl::RouteInfo SparseMoEBlockImpl::prep_route(
     torch::Tensor& hidden_states,
     const std::optional<torch::Tensor>& input_ids) {
   return moe_->prep_route(hidden_states, input_ids);
 }
 
-bool DeepseekV4SparseMoEBlockImpl::need_gather() const {
+bool SparseMoEBlockImpl::need_gather() const {
   return need_selected_moe_dp_gather(parallel_args_);
 }
 
-ProcessGroup* DeepseekV4SparseMoEBlockImpl::routed_pg() const {
+ProcessGroup* SparseMoEBlockImpl::routed_pg() const {
   return parallel_args_.ep_size() > 1 ? parallel_args_.moe_ep_group_
                                       : parallel_args_.tp_group_;
 }
 
-FusedMoEImpl::RouteInfo DeepseekV4SparseMoEBlockImpl::make_route(
+FusedMoEImpl::RouteInfo SparseMoEBlockImpl::make_route(
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids,
     int64_t hidden_rows) const {
@@ -113,7 +112,7 @@ FusedMoEImpl::RouteInfo DeepseekV4SparseMoEBlockImpl::make_route(
   return route;
 }
 
-std::vector<int32_t> DeepseekV4SparseMoEBlockImpl::get_row_dp_tokens(
+std::vector<int32_t> SparseMoEBlockImpl::get_row_dp_tokens(
     int64_t hidden_rows,
     const ModelInputParams& input_params) const {
   const std::vector<int32_t>& token_nums =
@@ -144,7 +143,7 @@ std::vector<int32_t> DeepseekV4SparseMoEBlockImpl::get_row_dp_tokens(
   return row_token_nums;
 }
 
-torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_selected(
+torch::Tensor SparseMoEBlockImpl::forward_selected(
     const torch::Tensor& hidden_states,
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids,
@@ -157,10 +156,33 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_selected(
   torch::Tensor topk_ids_2d = reshape_topk(topk_ids, row_count);
 
   if (enable_deep_ep_ && all_dp_ranks_are_decode(input_params)) {
+    ProcessGroup* tp_group = parallel_args_.tp_group_;
+    const int64_t tp_size = tp_group ? tp_group->world_size() : 1;
+    PaddingInfo pad_info;
+    if (tp_size > 1) {
+      // Attention outputs are replicated within TP. Give DeepEP each row only
+      // once, as in the DeepSeek V2 sparse MoE input preparation path.
+      const int64_t padded_rows = std::max(
+          tp_size, get_reduce_scatter_tokens(row_count, parallel_args_));
+      auto padded_hidden = pad_tokens(hidden_rows, padded_rows);
+      hidden_rows = padded_hidden.first;
+      pad_info = padded_hidden.second;
+      topk_weights_2d = pad_tokens(topk_weights_2d, padded_rows).first;
+      topk_ids_2d = pad_tokens(topk_ids_2d, padded_rows).first;
+      const int64_t shard_rows = padded_rows / tp_size;
+      const int64_t offset = tp_group->rank() * shard_rows;
+      hidden_rows = hidden_rows.narrow(/*dim=*/0, offset, shard_rows);
+      topk_weights_2d = topk_weights_2d.narrow(/*dim=*/0, offset, shard_rows);
+      topk_ids_2d = topk_ids_2d.narrow(/*dim=*/0, offset, shard_rows);
+    }
     FusedMoEImpl::RouteInfo route =
-        make_route(topk_weights_2d, topk_ids_2d, /*hidden_rows=*/row_count);
+        make_route(topk_weights_2d, topk_ids_2d, hidden_rows.size(0));
     torch::Tensor output = moe_->forward_experts(
         hidden_rows, /*enable_all2all_communication=*/true, route);
+    if (tp_size > 1) {
+      output = parallel_state::gather(output, tp_group, /*dim=*/0);
+      output = unpad_tokens(std::move(output), pad_info);
+    }
     return output.reshape(hidden_shape);
   }
 
@@ -204,17 +226,7 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_selected(
   return output.reshape(hidden_shape);
 }
 
-torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
-    const torch::Tensor& local_hidden_states,
-    const std::optional<torch::Tensor>& local_input_ids,
-    const mlu_v4_cp::DeepseekV4CpContext& cp_context) {
-  return forward_cp(local_hidden_states,
-                    local_input_ids,
-                    cp_context.geometry.tokens_per_rank,
-                    cp_context.cp_group);
-}
-
-torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
+torch::Tensor SparseMoEBlockImpl::forward_cp(
     const torch::Tensor& local_hidden_states,
     const std::optional<torch::Tensor>& local_input_ids,
     const std::vector<int32_t>& tokens_per_rank,
@@ -227,8 +239,8 @@ torch::Tensor DeepseekV4SparseMoEBlockImpl::forward_cp(
   const int32_t tp_rank = tp_group->rank();
   const int32_t ep_size = ep_group->world_size();
   CHECK_EQ(ep_size, cp_group->world_size() * tp_size)
-      << "DeepSeek V4 CP-aware MoE currently requires dp_size == 1 and a "
-         "world-sized EP group.";
+      << "CP MoE requires ep_size == cp_group size * tp_group size "
+         "with EP ranks ordered by CP rank, then TP rank.";
 
   const int32_t local_tokens =
       static_cast<int32_t>(local_hidden_states.size(0));

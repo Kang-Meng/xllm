@@ -33,6 +33,18 @@ cc_test(
 
 cc_test(
   NAME
+    fused_moe_clamp_mlu_test
+  SRCS
+    fused_moe_clamp_test.cpp
+  DEPS
+    :mlu_kernels
+    torch
+    glog::glog
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     scaled_quantize_mlu_test
   SRCS
     scaled_quantize_test.cpp
@@ -47,7 +59,6 @@ cc_test(
   NAME
     triton_jit_ops_test
   SRCS
-    fused_moe_clamp_test.cpp
     fused_gdn_gating_test.cpp
     causal_conv1d_update_decode_test.cpp
     fused_recurrent_gated_delta_rule_packed_decode_test.cpp

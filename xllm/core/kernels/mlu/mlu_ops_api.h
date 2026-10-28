@@ -526,8 +526,12 @@ void fused_compress_multi_kv(const torch::Tensor& kv,
                              bool overlap,
                              torch::Tensor& compressed_kv);
 
-// Clamp gate/up halves while preserving the layout expected by scaled_quantize.
-torch::Tensor fused_moe_clamp(const torch::Tensor& input, float limit);
+// Clamps gate/up halves in place, preserving the layout expected by
+// scaled_quantize. With token_count (the group GEMM's per-expert row counts),
+// only the counted row prefix is guaranteed to be clamped.
+void fused_moe_clamp(torch::Tensor& input,
+                     float limit,
+                     const std::optional<torch::Tensor>& token_count);
 
 // Optional read_cache_indices selects the initial history independently from
 // cache_indices, which selects final-state destinations. This is ordinary

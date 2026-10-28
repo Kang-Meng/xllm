@@ -123,15 +123,14 @@ Glm5NextDecoderLayerImpl::Glm5NextDecoderLayerImpl(const ModelContext& context,
         context.stream_registry();
     sparse_moe_ = register_module(
         "mlp",
-        DeepseekV4SparseMoEBlock(
-            args,
-            quant_args,
-            parallel_args,
-            options,
-            /*use_hash=*/false,
-            streams->get(ExecutionStreamRole::COMMUNICATION),
-            streams->get(ExecutionStreamRole::AUXILIARY_COMPUTE),
-            "model.layers." + std::to_string(layer_id) + ".mlp"));
+        SparseMoEBlock(args,
+                       quant_args,
+                       parallel_args,
+                       options,
+                       /*use_hash=*/false,
+                       streams->get(ExecutionStreamRole::COMMUNICATION),
+                       streams->get(ExecutionStreamRole::AUXILIARY_COMPUTE),
+                       "model.layers." + std::to_string(layer_id) + ".mlp"));
   }
 }
 
