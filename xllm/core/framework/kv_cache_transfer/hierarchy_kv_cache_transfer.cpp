@@ -577,22 +577,6 @@ uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
   }
 }
 
-uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
-    uint64_t /*batch_id*/,
-    Slice<BlockTransferInfo>& block_transfer_info) {
-  CHECK(registration_finalized_)
-      << "Hierarchy KV cache registration is not finalized.";
-  CHECK(!shutdown_) << "Hierarchy KV cache transfer is shut down.";
-  CHECK(!block_transfer_info.empty());
-  CHECK(kv_cache_store_ != nullptr);
-  if (block_transfer_info[0].transfer_type == TransferType::G2H) {
-    return kv_cache_store_->batch_get(block_transfer_info);
-  }
-  LOG(ERROR) << "Unsupported slice transfer type: "
-             << static_cast<uint32_t>(block_transfer_info[0].transfer_type);
-  return 0;
-}
-
 std::vector<uint8_t> HierarchyKVCacheTransfer::prefetch_kv_blocks(
     Slice<BlockTransferInfo>& block_transfer_info,
     StoreGetStats* stats) {

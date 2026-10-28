@@ -34,7 +34,6 @@ limitations under the License.
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
 
-#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -2453,37 +2452,8 @@ uint32_t WorkerImpl::transfer_kv_blocks(
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
   if (hierarchy_kv_cache_transfer_ != nullptr) {
-    if (!block_transfer_info.empty() &&
-        block_transfer_info.front().transfer_type == TransferType::D2H2G) {
-      // Schedule-overlap can deliver the D2H RPC before the preceding forward
-      // task has enqueued its kernels. Queue D2H on the same single-threaded
-      // worker executor so it runs after that forward; the hierarchy transfer
-      // then makes its copy stream wait on compute_stream_. H2D must remain on
-      // the RPC thread because it is registered before the matching forward.
-      auto result = std::make_shared<std::promise<uint32_t>>();
-      std::future<uint32_t> future = result->get_future();
-      threadpool_.schedule(
-          [this, batch_id, block_transfer_info, result]() mutable {
-            try {
-              result->set_value(
-                  hierarchy_kv_cache_transfer_->transfer_kv_blocks(
-                      batch_id, block_transfer_info));
-            } catch (...) {
-              result->set_exception(std::current_exception());
-            }
-          });
-      return future.get();
-    }
-    return hierarchy_kv_cache_transfer_->transfer_kv_blocks(
-        batch_id, block_transfer_info);
-  }
-  return 0;
-}
-
-uint32_t WorkerImpl::transfer_kv_blocks(
-    const uint64_t batch_id,
-    Slice<BlockTransferInfo>& block_transfer_info) {
-  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    // TransferBlocks is handled outside the model execution executor. Do not
+    // enqueue offload here: it would serialize forward work behind D2H/Store.
     return hierarchy_kv_cache_transfer_->transfer_kv_blocks(
         batch_id, block_transfer_info);
   }

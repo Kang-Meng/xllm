@@ -160,15 +160,6 @@ class RecordingTransferWorker final : public LLMWorkerImpl {
     return transfer_result_;
   }
 
-  uint32_t transfer_kv_blocks(
-      uint64_t batch_id,
-      Slice<BlockTransferInfo>& block_transfer_info) override {
-    last_batch_id_ = batch_id;
-    last_transfer_size_ = block_transfer_info.size();
-    ++slice_transfer_count_;
-    return transfer_result_;
-  }
-
   std::vector<uint8_t> prefetch_kv_blocks(
       Slice<BlockTransferInfo>& block_transfer_info,
       StoreGetStats* /*stats*/) override {
@@ -177,7 +168,6 @@ class RecordingTransferWorker final : public LLMWorkerImpl {
   }
 
   uint32_t vector_transfer_count() const { return vector_transfer_count_; }
-  uint32_t slice_transfer_count() const { return slice_transfer_count_; }
   uint32_t prefetch_count() const { return prefetch_count_; }
   uint64_t last_batch_id() const { return last_batch_id_; }
   size_t last_transfer_size() const { return last_transfer_size_; }
@@ -185,7 +175,6 @@ class RecordingTransferWorker final : public LLMWorkerImpl {
  private:
   uint32_t transfer_result_ = 0;
   uint32_t vector_transfer_count_ = 0;
-  uint32_t slice_transfer_count_ = 0;
   uint32_t prefetch_count_ = 0;
   uint64_t last_batch_id_ = 0;
   size_t last_transfer_size_ = 0;
@@ -1006,33 +995,6 @@ TEST_F(MTPHostOffloadTest, VectorTransferWithoutHierarchyIsNoop) {
   EXPECT_EQ(draft_ptr->vector_transfer_count(), 0);
 }
 
-TEST_F(MTPHostOffloadTest, SliceTransferWithoutHierarchyIsNoop) {
-  constexpr uint64_t kBatchId = 73;
-  const torch::Device device(Platform::type_torch(), /*index=*/0);
-  const ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  const runtime::Options options = make_runtime_options(0.0);
-  TestMTPWorker worker(parallel_args, device, options);
-
-  const std::vector<BlockTransferInfo> transfer_info = {
-      BlockTransferInfo(/*src_block_id=*/5, /*dst_block_id=*/6)};
-  auto target = std::make_unique<RecordingTransferWorker>(
-      parallel_args, device, options, /*transfer_result=*/1);
-  auto draft = std::make_unique<RecordingTransferWorker>(
-      parallel_args, device, options, /*transfer_result=*/0);
-  RecordingTransferWorker* target_ptr = target.get();
-  RecordingTransferWorker* draft_ptr = draft.get();
-  worker.replace_transfer_workers(std::move(target), std::move(draft));
-  Slice<BlockTransferInfo> transfer_slice(transfer_info);
-
-  const uint32_t transferred =
-      worker.transfer_kv_blocks(kBatchId, transfer_slice);
-
-  EXPECT_EQ(transferred, 0);
-  EXPECT_EQ(target_ptr->slice_transfer_count(), 0);
-  EXPECT_EQ(draft_ptr->slice_transfer_count(), 0);
-}
-
 TEST_F(MTPHostOffloadTest, StorePrefetchWithoutHierarchyMisses) {
   const torch::Device device(Platform::type_torch(), /*index=*/0);
   const ParallelArgs parallel_args(
@@ -1338,57 +1300,6 @@ TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {
   ASSERT_TRUE(draft_input_params.synchronize_draft_layer());
   EXPECT_TRUE(target_ptr->blocks_equal(kSourceBlockId, kDestinationBlockId));
   EXPECT_TRUE(draft_ptr->blocks_equal(kSourceBlockId, kDestinationBlockId));
-}
-
-TEST_F(MTPHostOffloadTest, D2HUsesSpeculativeWorkerExecutor) {
-  constexpr uint64_t kBatchId = 84;
-  constexpr int64_t kSourceBlockId = 0;
-  Device device(/*device_index=*/0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  runtime::Options options = make_runtime_options(2.0);
-  options.enable_schedule_overlap(true);
-  const ModelArgs target_model_args =
-      make_model_args("test_target", /*layer_count=*/2, /*head_dim=*/8);
-  const ModelArgs draft_model_args =
-      make_model_args("test_draft", /*layer_count=*/1, /*head_dim=*/4);
-  const KVCacheShape target_shape = make_cache_shape(target_model_args);
-  const KVCacheShape draft_shape = make_cache_shape(draft_model_args);
-  TestMTPWorker worker(parallel_args, device.unwrap(), options);
-  auto target = std::make_unique<ImmediateHierarchyTransferTestWorker>(
-      parallel_args, device.unwrap(), options, target_model_args);
-  auto draft = std::make_unique<HierarchyTransferTestWorker>(
-      parallel_args, device.unwrap(), options, draft_model_args);
-  ImmediateHierarchyTransferTestWorker* target_ptr = target.get();
-  HierarchyTransferTestWorker* draft_ptr = draft.get();
-  worker.replace_transfer_workers(std::move(target), std::move(draft));
-  worker.prepare_hierarchy_transfers();
-  target_ptr->initialize_hierarchy_cache(target_shape);
-  draft_ptr->initialize_hierarchy_cache(draft_shape);
-  worker.finalize_hierarchy_transfers();
-
-  std::promise<void> blocker_started;
-  std::future<void> blocker_started_future = blocker_started.get_future();
-  std::promise<void> release_blocker;
-  worker.block_outer_executor(&blocker_started,
-                              release_blocker.get_future().share());
-  blocker_started_future.get();
-
-  BlockTransferInfo offload_info(kSourceBlockId, /*dst_block_id=*/0);
-  offload_info.block_type = BlockType::KV;
-  offload_info.transfer_type = TransferType::D2H2G;
-  std::future<uint32_t> transfer_future =
-      std::async(std::launch::async, [&worker, offload_info]() {
-        return worker.transfer_kv_blocks(kBatchId, {offload_info});
-      });
-
-  EXPECT_EQ(transfer_future.wait_for(std::chrono::milliseconds(100)),
-            std::future_status::timeout);
-  release_blocker.set_value();
-  EXPECT_EQ(transfer_future.get(), 1U);
-  EXPECT_EQ(target_ptr->vector_transfer_count(), 0U);
 }
 
 TEST_F(MTPHostOffloadTest, Dsv4DraftSkipsUnsupportedCompressedBlockTypes) {

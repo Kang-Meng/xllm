@@ -204,10 +204,6 @@ class WorkerImpl {
       const uint64_t batch_id,
       const std::vector<BlockTransferInfo>& block_transfer_info);
 
-  virtual uint32_t transfer_kv_blocks(
-      const uint64_t batch_id,
-      Slice<BlockTransferInfo>& block_transfer_info);
-
   std::shared_ptr<HierarchyKVCacheTransfer>
   create_hierarchy_kv_cache_transfer();
 

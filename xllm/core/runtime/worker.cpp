@@ -196,12 +196,6 @@ uint32_t Worker::transfer_kv_blocks(
   return impl_->transfer_kv_blocks(batch_id, std::move(block_transfer_info));
 }
 
-uint32_t Worker::transfer_kv_blocks(
-    const uint64_t batch_id,
-    Slice<BlockTransferInfo>& block_transfer_info) {
-  return impl_->transfer_kv_blocks(batch_id, block_transfer_info);
-}
-
 std::vector<uint8_t> Worker::prefetch_kv_blocks(
     Slice<BlockTransferInfo>& block_transfer_info,
     StoreGetStats* stats) {
