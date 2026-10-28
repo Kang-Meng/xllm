@@ -91,7 +91,8 @@ DEFINE_int64(
 
 DEFINE_bool(dit_enable_text_encoder,
             true,
-            "JoyOV2/MiniMax-H3/Qwen-Image-2.1: load in-process Qwen3-VL "
+            "JoyOV2/MiniMax-H3/Qwen-Image-2.1/QwenImageEditPlus: load the "
+            "in-process Qwen3-VL or Qwen2.5-VL encoder for the model "
             "(set --text_encoder_tp_size explicitly). "
             "Off: require external prompt_embed.");
 

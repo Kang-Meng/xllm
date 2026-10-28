@@ -17,6 +17,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
@@ -24,7 +25,6 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
-#include "core/common/global_flags.h"
 #include "core/framework/config/dit_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/dit_cache/dit_cache.h"
@@ -42,7 +42,7 @@ limitations under the License.
 #include "models/dit/transformers/transformer_qwen_image.h"
 #include "models/dit/utils/util.h"
 #include "models/model_registry.h"
-#if defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_DCU)
 #include "models/vlm/qwen2_5_vl.h"
 #endif
 #include "processors/qwen2_vl_image_processor.h"
@@ -52,7 +52,7 @@ limitations under the License.
 
 namespace xllm {
 
-#if defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_DCU)
 using QwenImageEditTextEncoder = Qwen2_5_VLForConditionalGeneration;
 #endif
 
@@ -85,9 +85,6 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
   QwenImageEditPlusPipelineImpl(const DiTModelContext& context)
       : context_(context),
         parallel_args_(context.get_parallel_args()),
-#if defined(USE_DCU)
-        vl_image_processor_(context.get_model_args("processor")),
-#endif
         vae_model_args_(context.get_model_args("vae")) {
     options_ = context.get_tensor_options();
     dtype_ = options_.dtype().toScalarType();
@@ -122,34 +119,61 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
     scheduler_ =
         FlowMatchEulerDiscreteScheduler(context.get_model_context("scheduler"));
 
-#if defined(USE_DCU)
-    const auto& original_parallel_args = context.get_parallel_args();
-    ParallelArgs vlm_parallel_args = original_parallel_args;
-    if (original_parallel_args.tp_group_ == nullptr) {
-      if (original_parallel_args.dit_tp_group_ != nullptr) {
-        vlm_parallel_args.tp_group_ = original_parallel_args.dit_tp_group_;
-      } else {
-        const int32_t vlm_tp_port =
-            get_qwen_image_edit_vlm_tp_port(original_parallel_args.rank());
-        LOG(INFO) << "Creating single-rank Qwen-Image-Edit VLM ProcessGroup on "
-                  << "127.0.0.1:" << vlm_tp_port;
-        vlm_tp_group_ =
-            create_process_group(/*rank=*/0,
-                                 /*world_size=*/1,
-                                 /*rank_size=*/1,
-                                 vlm_tp_port,
-                                 /*trans=*/false,
-                                 /*host=*/"127.0.0.1",
-                                 /*group_name=*/"vlm_tp_group_qwen_image_edit",
-                                 options_.device());
-        vlm_parallel_args.tp_group_ = vlm_tp_group_.get();
+#if defined(USE_NPU) || defined(USE_DCU)
+    if (DiTConfig::get_instance().dit_enable_text_encoder()) {
+#if defined(USE_NPU)
+      ProcessGroup* text_encoder_group =
+          context.get_parallel_args().dit_text_encoder_tp_group_;
+      CHECK(text_encoder_group != nullptr)
+          << "QwenImageEditPlus in-process encoder requires a text encoder TP "
+             "group";
+      ParallelArgs vlm_parallel_args(text_encoder_group->rank(),
+                                     text_encoder_group->world_size(),
+                                     text_encoder_group);
+      vlm_parallel_args.tp_size(text_encoder_group->world_size());
+      vlm_parallel_args.tp_group_ = text_encoder_group;
+#else
+      const auto& original_parallel_args = context.get_parallel_args();
+      ParallelArgs vlm_parallel_args = original_parallel_args;
+      if (original_parallel_args.tp_group_ == nullptr) {
+        if (original_parallel_args.dit_tp_group_ != nullptr) {
+          vlm_parallel_args.tp_group_ = original_parallel_args.dit_tp_group_;
+        } else {
+          const int32_t vlm_tp_port =
+              get_qwen_image_edit_vlm_tp_port(original_parallel_args.rank());
+          LOG(INFO)
+              << "Creating single-rank Qwen-Image-Edit VLM ProcessGroup on "
+              << "127.0.0.1:" << vlm_tp_port;
+          vlm_tp_group_ = create_process_group(
+              /*rank=*/0,
+              /*world_size=*/1,
+              /*rank_size=*/1,
+              vlm_tp_port,
+              /*trans=*/false,
+              /*host=*/"127.0.0.1",
+              /*group_name=*/"vlm_tp_group_qwen_image_edit",
+              options_.device());
+          vlm_parallel_args.tp_group_ = vlm_tp_group_.get();
+        }
       }
+#endif
+      ModelArgs text_encoder_args = context.get_model_args("text_encoder");
+#if defined(USE_NPU)
+      text_encoder_args.encoder_embedding_mode(false);
+      text_encoder_args.embedding_mode(true);
+#endif
+      vl_image_processor_ = std::make_unique<Qwen2VLImageProcessor>(
+          context.get_model_args("processor"));
+      text_encoder_ =
+          register_module("text_encoder",
+                          QwenImageEditTextEncoder(ModelContext(
+                              vlm_parallel_args,
+                              text_encoder_args,
+                              context.get_quant_args("text_encoder"),
+                              context.get_tensor_options())));
+      LOG(INFO) << "QwenImageEditPlus in-process encoder configured: TP="
+                << vlm_parallel_args.tp_group_->world_size();
     }
-    text_encoder_ = QwenImageEditTextEncoder(
-        ModelContext(vlm_parallel_args,
-                     context.get_model_args("text_encoder"),
-                     context.get_quant_args("text_encoder"),
-                     context.get_tensor_options()));
 #endif
 
     vae_image_processor_ =
@@ -165,9 +189,6 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
     register_module("vae", vae_);
     register_module("scheduler", scheduler_);
     register_module("transformer", transformer_);
-#if defined(USE_DCU)
-    register_module("text_encoder", text_encoder_);
-#endif
     register_module("vae_image_processor", vae_image_processor_);
 
     use_layer3d_rope_ = context.get_model_context("transformer")
@@ -194,7 +215,7 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
     }
   }
 
-#if defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_DCU)
   torch::Tensor build_qwen2_5_vl_mrope_positions(
       const torch::Tensor& input_ids,
       const torch::Tensor& attention_mask,
@@ -347,13 +368,25 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
       params.meta.actual_num_sequences = static_cast<int32_t>(batch_size);
       params.meta.q_max_seq_len = max_seq_len;
       params.meta.kv_max_seq_len = max_seq_len;
+#if defined(USE_NPU)
+      CHECK_EQ(batch_size, 1) << "QwenImageEditPlus in-process encoder "
+                                 "requires request batch size 1";
+      const torch::Tensor lengths =
+          torch::tensor(seq_lens, torch::kInt32).to(tokens.device());
+      params.attention.device.q_seq_lens = lengths;
+      params.attention.device.kv_seq_lens = lengths;
+      params.attention.device.q_cu_seq_lens = lengths;
+      params.attention.host.q_cu_seq_lens = seq_lens;
+      params.prefill_without_cache = true;
+#else
       auto cu_seqlens =
           torch::tensor(cu_seqlens_vec, torch::kInt).to(tokens.device());
       params.attention.device.q_seq_lens = cu_seqlens;
       params.attention.device.kv_seq_lens = cu_seqlens;
       params.attention.device.q_cu_seq_lens = cu_seqlens;
-      params.attention.host.q_seq_lens = seq_lens;
       params.attention.host.q_cu_seq_lens = cu_seqlens_vec;
+#endif
+      params.attention.host.q_seq_lens = seq_lens;
       params.attention.host.kv_seq_lens = seq_lens;
       params.meta.batch_forward_type = BatchForwardType::PREFILL;
     }
@@ -402,7 +435,7 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
       const std::vector<torch::Tensor>& image,
       torch::TensorOptions& options,
       int64_t max_sequence_length) {
-#if defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_DCU)
     CHECK(tokenizer_ != nullptr) << "Tokenizer not loaded";
     CHECK(!text_encoder_.is_empty()) << "Text encoder not loaded";
 
@@ -453,7 +486,11 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
       std::vector<torch::Tensor> vl_images;
       vl_images.reserve(per_sample_images[static_cast<size_t>(b)].size());
       for (auto img : per_sample_images[static_cast<size_t>(b)]) {
+#if defined(USE_NPU)
+        img = img.to(torch::kCPU, torch::kFloat32);
+#else
         img = img.to(torch::kFloat32);
+#endif
         float max_val = img.max().item<float>();
         if (max_val <= 1.1f) {
           img = img.clamp(0.0f, 1.0f) * 255.0f;
@@ -464,11 +501,14 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
       }
 
       std::vector<MMDataItem> mm_items;
-      if (!vl_images.empty()) {
-        CHECK(vl_image_processor_.process(vl_images, mm_items))
+      mm_items.reserve(vl_images.size());
+      for (const torch::Tensor& vl_image : vl_images) {
+        std::vector<MMDataItem> image_items;
+        CHECK(vl_image_processor_->process({vl_image}, image_items))
             << "VL image processor failed";
-        CHECK(!mm_items.empty())
-            << "VL image processor produced no image items";
+        CHECK_EQ(image_items.size(), 1)
+            << "VL image processor must produce one item per reference image";
+        mm_items.emplace_back(std::move(image_items.front()));
       }
       std::vector<torch::Tensor> sample_grids;
       sample_grids.reserve(mm_items.size());
@@ -556,6 +596,10 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
     if (batch_tokens.empty()) {
       batch_tokens.resize(static_cast<size_t>(batch_size));
     }
+
+#if defined(USE_NPU)
+    max_sequence_length = static_cast<int64_t>(batch_tokens.front().size());
+#endif
 
     int32_t pad_token_id = text_encoder_args.pad_token_id();
     if (pad_token_id == 0) {
@@ -1179,10 +1223,6 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
               << loader->model_root_path();
     auto transformer_loader = loader->take_component_loader("transformer");
     auto vae_loader = loader->take_component_loader("vae");
-#if defined(USE_DCU)
-    auto clip_loader = loader->take_component_loader("text_encoder");
-    auto tokenizer_loader = loader->take_component_loader("tokenizer");
-#endif
     LOG(INFO) << " QwenImageEditplus model components loaded, start to load "
                  "weights to sub models";
 
@@ -1199,15 +1239,19 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
     transformer_->to(options_.device());
     LOG(INFO) << "QwenImageEditPlusPipeline transformer loaded";
 
-#if defined(USE_DCU)
-    LOG(INFO) << "QwenImageEditPlusPipeline loading text_encoder weights";
-    text_encoder_->load_model(std::move(clip_loader));
-    LOG(INFO) << "QwenImageEditPlusPipeline moving text_encoder to device";
-    text_encoder_->to(options_.device(), dtype_);
-    LOG(INFO) << "QwenImageEditPlusPipeline text_encoder loaded";
+#if defined(USE_NPU) || defined(USE_DCU)
+    if (DiTConfig::get_instance().dit_enable_text_encoder()) {
+      auto text_encoder_loader = loader->take_component_loader("text_encoder");
+      auto tokenizer_loader = loader->take_component_loader("tokenizer");
+      LOG(INFO) << "QwenImageEditPlusPipeline loading text_encoder weights";
+      text_encoder_->load_model(std::move(text_encoder_loader));
+      LOG(INFO) << "QwenImageEditPlusPipeline moving text_encoder to device";
+      text_encoder_->to(options_.device(), dtype_);
+      LOG(INFO) << "QwenImageEditPlusPipeline text_encoder loaded";
 
-    tokenizer_ = tokenizer_loader->tokenizer();
-    LOG(INFO) << "QwenImageEditPlusPipeline tokenizer loaded";
+      tokenizer_ = tokenizer_loader->tokenizer();
+      LOG(INFO) << "QwenImageEditPlusPipeline tokenizer loaded";
+    }
 #endif
   }
 
@@ -1221,10 +1265,12 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
   xllm::VAEImageProcessor vae_image_processor_{nullptr};
   std::unique_ptr<Qwen2VLImageProcessor> qwen_image_processor_{nullptr};
   QwenImageTransformer2DModel transformer_{nullptr};
-#if defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_DCU)
   QwenImageEditTextEncoder text_encoder_{nullptr};
+  std::unique_ptr<Qwen2VLImageProcessor> vl_image_processor_;
+#endif
+#if defined(USE_DCU)
   std::unique_ptr<ProcessGroup> vlm_tp_group_;
-  Qwen2VLImageProcessor vl_image_processor_;
 #endif
   std::unique_ptr<Tokenizer> qwen_tokenizer_;
   std::unique_ptr<Tokenizer> tokenizer_;
