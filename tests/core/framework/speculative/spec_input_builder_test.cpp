@@ -758,6 +758,59 @@ TEST(SpecDecodeInputBuilderTest, MultiBlockDraftSingleRowPerSeq) {
             std::vector<int32_t>({13, 14, 15}));
 }
 
+TEST(SpecDecodeInputBuilderTest, ExportsRowPagingForWrappedMultiBlockQueries) {
+  constexpr int32_t kQueryWidth = 4;
+  constexpr int32_t kBlockSize = 128;
+  ForwardInput input =
+      make_multiblock_forward_input(torch::Tensor(),
+                                    torch::tensor({1020}, torch::kInt),
+                                    {torch::tensor({{2, 5}}, torch::kInt)},
+                                    to_layout_seq_lens({1021}));
+  DecodeRowContext ctx = make_decode_row_context(input);
+  DecodeBuildBuffers buf;
+  for (int32_t token = 0; token < kQueryWidth; ++token) {
+    RowSpec row;
+    row.seq_id = 0;
+    row.position_offset = token;
+    row.kv_len_offset = kQueryWidth - 1;
+    row.append_token = false;
+    row.append_q_len_one = true;
+    row.append_block_table = true;
+    append_decode_row(ctx, row, kBlockSize, buf);
+  }
+
+  std::vector<int32_t> expected_pages;
+  for (int32_t page = 0; page < 32; ++page) {
+    expected_pages.emplace_back(page % 2 == 0 ? 2 : 5);
+  }
+  EXPECT_EQ(buf.out_paged_kv_indptr, std::vector<int32_t>({0, 8, 16, 24, 32}));
+  EXPECT_EQ(buf.out_paged_kv_indices, expected_pages);
+  EXPECT_EQ(buf.out_paged_kv_last_page_len,
+            std::vector<int32_t>(kQueryWidth, kBlockSize));
+  EXPECT_EQ(buf.out_new_cache_slots,
+            std::vector<int32_t>({764, 765, 766, 767}));
+
+  update_input_params(input.input_params,
+                      buf,
+                      1,
+                      std::move(buf.out_q_seq_lens),
+                      std::move(buf.out_q_cu_seq_lens),
+                      buf.meta.kv_max_seq_len,
+                      std::move(buf.out_kv_seq_lens),
+                      true);
+  const auto& params = input.input_params;
+  EXPECT_FALSE(params.attention.host.block_tables.defined());
+  ASSERT_EQ(params.multi_block_tables.size(), 1);
+  EXPECT_EQ(params.multi_block_tables.front().size(0), kQueryWidth);
+  EXPECT_EQ(params.multi_block_tables.front().size(1), 2);
+  EXPECT_EQ(tensor_to_vec_int32(params.attention.device.paged_kv_indptr),
+            std::vector<int32_t>({0, 8, 16, 24, 32}));
+  EXPECT_EQ(tensor_to_vec_int32(params.attention.device.paged_kv_indices),
+            expected_pages);
+  EXPECT_EQ(tensor_to_vec_int32(params.attention.device.paged_kv_last_page_len),
+            std::vector<int32_t>(kQueryWidth, kBlockSize));
+}
+
 TEST(SpecDecodeInputBuilderTest, GroupedPrefillBuildsSwaRingSlots) {
   ForwardInput input;
   input.input_params.meta.num_sequences = 2;

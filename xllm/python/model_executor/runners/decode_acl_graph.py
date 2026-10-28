@@ -32,14 +32,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from scripts.logger import logger
-from xllm.python import kernels
+from xllm.python import distributed, kernels
 from xllm.python.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
@@ -49,6 +49,7 @@ from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
 )
+from xllm.python.model_executor.execution_context import GraphAdmissionMetadataBuilder
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
@@ -116,6 +117,8 @@ def _complete_kpool_groups(padded_num_tokens: int, verify_width: int) -> tuple[i
 
 class _CaptureAttentionMetadata:
     """Keep the batch layout while routing linear state to reserved slot 0."""
+
+    is_graph_capture = True
 
     def __init__(self, metadata: AttentionMetadata) -> None:
         self._metadata = metadata
@@ -306,8 +309,8 @@ class DecodeAclGraphRunner(BaseRunner):
         self.max_model_len = max_model_len
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
         self._is_spec_draft = is_spec_draft
-        # Draft graphs stay width 1. This width only folds token rows into
-        # sequences for the max_seqs_per_batch check.
+        # Draft metadata stays one row per token. Query width defines complete
+        # blocks for sequence-capacity admission and graph padding.
         self._draft_query_width = max(1, int(draft_query_width))
         self._eplv2_graph_token_limit = eplv2_graph_token_limit
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
@@ -358,10 +361,15 @@ class DecodeAclGraphRunner(BaseRunner):
             rows_per_seq = max(rows_per_seq, self._draft_query_width)
         return _decode_bucket(seq_capacity * rows_per_seq)
 
+    def _padded_token_rows(self, token_rows: int) -> int:
+        query_width = self._draft_query_width if self._is_spec_draft else 1
+        num_groups = (token_rows + query_width - 1) // query_width
+        return _decode_bucket(num_groups) * query_width
+
     def _eplv2_graph_admits(self, token_rows: int) -> bool:
         """Keep MC2 capture inside the HCCL window; All-to-AllV stays eager."""
         limit = self._eplv2_graph_token_limit
-        if limit is None or _decode_bucket(token_rows) <= limit:
+        if limit is None or self._padded_token_rows(token_rows) <= limit:
             return True
         # Latch one debug line per runner instead of one per rejected step:
         # the fallback itself is by design (over-capacity buckets run the
@@ -370,7 +378,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if not getattr(self, "_eplv2_reject_logged", False):
             logger.debug(
                 "EPLv2 graph window exceeded: bucket=%d limit=%d -> eager AllToAllV",
-                _decode_bucket(token_rows),
+                self._padded_token_rows(token_rows),
                 limit,
             )
             self._eplv2_reject_logged = True
@@ -388,7 +396,7 @@ class DecodeAclGraphRunner(BaseRunner):
         ``(is_expanded, verify_width, admission_batch)``. ``admission_batch`` is
         ``None`` when active token counts are not whole verify groups. Under DP
         the width comes only from ``is_spec_verify`` and ``num_decoding_tokens``
-        (or the exported DSpark packed width below), so an empty rank and a busy
+        (or the configured draft query width / exported packed width), so an empty rank and a busy
         rank share one graph key. A local expanded layout that is not that
         group-wide verify raises instead of capturing a private graph. Plain
         decode stays width 1.
@@ -421,6 +429,8 @@ class DecodeAclGraphRunner(BaseRunner):
                 # scheduler marking the batch.
                 verify_width = packed_verify_width
                 packed_plan = True
+            elif self._is_spec_draft and local_expanded and getattr(metadata, "is_dflash_proposal", False):
+                verify_width = self._draft_query_width
             else:
                 if local_width > 1:
                     raise RuntimeError(
@@ -468,14 +478,6 @@ class DecodeAclGraphRunner(BaseRunner):
                 )
                 if active_counts and all(count % self._draft_query_width == 0 for count in active_counts):
                     admission_batch = max(active_counts) // self._draft_query_width
-                else:
-                    # ``admission_batch`` is in SEQUENCES. The value inherited
-                    # from the verify fold is the max TOKEN row count (the
-                    # empty shard's dummy row breaks the modulo), and folding a
-                    # token count as a sequence count would inflate the graph
-                    # bucket by up to the query width. Refuse the graph step so
-                    # the caller keeps the eager path.
-                    admission_batch = None
             elif batch_size % self._draft_query_width == 0:
                 admission_batch = batch_size // self._draft_query_width
         return is_expanded, verify_width, admission_batch
@@ -485,9 +487,30 @@ class DecodeAclGraphRunner(BaseRunner):
         input_ids: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
+        *,
+        input_batch: InputBatch | None = None,
     ) -> bool:
         metadata = self._normalize_dsa_metadata(metadata)
-        return self._can_execute_inner(input_ids, metadata, input_embedding)
+        can_execute = self._can_execute_inner(input_ids, metadata, input_embedding)
+        admission_builders = tuple(
+            builder
+            for builder in self.execution_metadata_builders
+            if isinstance(builder, GraphAdmissionMetadataBuilder)
+        )
+        if not admission_builders:
+            return can_execute
+        can_execute = (
+            can_execute
+            and input_batch is not None
+            and all(builder.can_execute_graph(input_batch, metadata) for builder in admission_builders)
+        )
+        if self.dp_size == 1:
+            return can_execute
+        vote = torch.tensor([int(can_execute)], dtype=torch.int32, device=self.device)
+        votes = distributed.dp_all_gather(vote, [1] * self.dp_size, self.dp_rank)
+        if votes.shape != (self.dp_size,):
+            raise RuntimeError(f"DP graph admission requires {self.dp_size} votes, got {tuple(votes.shape)}")
+        return bool(votes.all().item())
 
     def _normalize_dsa_metadata(
         self,
@@ -500,11 +523,11 @@ class DecodeAclGraphRunner(BaseRunner):
         1. Busy DSA batches receive ``multi_block_tables`` only (the C++
            scheduler's multi-block export leaves the flat ``block_table``
            undefined); derive the flat table from the SWA group table.
-        2. Empty DP shards receive a single dummy token and NO multi-block
+        2. Empty DP shards receive dummy tokens and NO multi-block
            tables (the worker's empty-shard fake input is never routed
            through the composite block exporter). Left on the eager runner,
            the shard's fake-token full-model forward dominates every DP step
-           (all ranks wait for the slowest group), so synthesize one-row
+           (all ranks wait for the slowest group), so synthesize row-aligned
            all-zero tables and let the shard replay the bucket graph the
            busy ranks also replay. Block 0 mirrors the eager table-less
            fallback (ring block 0); the dummy row's output is discarded.
@@ -520,13 +543,16 @@ class DecodeAclGraphRunner(BaseRunner):
         if group_infos is None:
             return metadata
         tables = list(getattr(metadata, "multi_block_tables", ()) or ())
+        if self._is_spec_draft and len(group_infos) == 1 and group_infos[0].cache_type == DSA_CACHE_SLIDING_WINDOW:
+            tables = tables[:1]
         if not tables:
             if not bool(getattr(metadata, "is_dummy", False)):
                 # A busy DSA batch must carry manager tables; a table-less
                 # non-dummy batch is an exporter regression, not an empty shard.
                 return metadata
-            tables = [torch.zeros((1, 1), dtype=torch.int32) for _ in group_infos]
-        if len(tables) != len(group_infos) or tables[0].dim() != 2:
+            row_count = metadata.kv_seq_lens.numel() if metadata.kv_seq_lens is not None else 1
+            tables = [torch.zeros((row_count, 1), dtype=torch.int32) for _ in group_infos]
+        elif len(tables) != len(group_infos) or tables[0].dim() != 2:
             return metadata
         block_table = metadata.block_table
         if block_table is None:
@@ -1441,10 +1467,6 @@ class DecodeAclGraphRunner(BaseRunner):
         # ``execute``'s first-capture path; deferring keeps a single capture
         # code path and matches the lazy-capture V3 wiring.
 
-    def _padded_token_rows(self, token_rows: int, admission_batch: int | None) -> int:
-        """Return the static token-row capacity for one admitted graph step."""
-        return _decode_bucket(token_rows)
-
     def execute(
         self,
         input_ids: torch.Tensor,
@@ -1490,6 +1512,9 @@ class DecodeAclGraphRunner(BaseRunner):
                     "by the shared counts so they must agree per rank."
                 )
             max_global_tokens = max(int(c) for c in execution_counts)
+            padded_batch_size = self._padded_token_rows(max_global_tokens)
+        else:
+            padded_batch_size = self._padded_token_rows(batch_size)
         expanded_view = resolve_expanded_decode_metadata(metadata)
         is_expanded, verify_width, admission_batch = self._shared_graph_plan(
             metadata,
@@ -1497,8 +1522,6 @@ class DecodeAclGraphRunner(BaseRunner):
             local_expanded=expanded_view is not None,
             packed_verify_width=self._spec_verify_width(batch_size, metadata),
         )
-        token_rows = max_global_tokens if self.dp_size > 1 else batch_size
-        padded_batch_size = self._padded_token_rows(token_rows, admission_batch)
         # The persistent aux-hidden buffer an ACL-graph replay writes into is
         # the one its captured forward allocated, i.e. the buffer keyed by this
         # bucket's row count. Expose it so the executor can pick that buffer
@@ -1556,9 +1579,12 @@ class DecodeAclGraphRunner(BaseRunner):
             self._replay_done_event = torch.npu.Event()
 
         capture_metadata = None
-        if first_capture and any(
-            getattr(cache, "conv", None) is not None and getattr(cache, "ssm", None) is not None
-            for cache in self.layer_caches
+        if first_capture and (
+            self.execution_metadata_builders
+            or any(
+                getattr(cache, "conv", None) is not None and getattr(cache, "ssm", None) is not None
+                for cache in self.layer_caches
+            )
         ):
             # Both KDA checkpoint tables and model-specific metadata builders
             # must see padding slots before any warmup forward can run.
@@ -1657,7 +1683,11 @@ class DecodeAclGraphRunner(BaseRunner):
         self._stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self._stream):
             entry.graph.replay()
-            output = self._slice_output(entry.static_output, batch_size)
+            output = self._slice_output(
+                entry.static_output,
+                batch_size,
+                num_reqs=input_batch.num_reqs if input_batch is not None else None,
+            )
 
         with torch.npu.stream(self._update_stream):
             self._update_stream.wait_event(self._replay_done_event)
@@ -2033,8 +2063,9 @@ class DecodeAclGraphRunner(BaseRunner):
             # so the flat paged_kv_indices buffer must hold
             # max_batch * num_decoding_tokens * max_blocks entries (item 二);
             # sizing it by sequences alone underflows on expanded-verify copy.
+            rows_per_sequence = max(self.num_decoding_tokens, self._draft_query_width if self._is_spec_draft else 1)
             self._paged_kv_indices_buffer = torch.zeros(
-                self.max_batch * self.num_decoding_tokens * max_blocks_per_sequence,
+                self.max_batch * rows_per_sequence * max_blocks_per_sequence,
                 dtype=paged_kv_indices.dtype,
                 device=device,
             )

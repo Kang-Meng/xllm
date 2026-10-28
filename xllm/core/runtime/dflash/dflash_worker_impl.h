@@ -105,6 +105,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
     std::vector<torch::Tensor> retained_tensors;
     // No-sync draft inputs must outlive validation's stream sync.
     std::vector<std::shared_ptr<ForwardInput>> retained_inputs;
+    std::vector<std::string> failed_request_ids;
   };
 
   // virtual: DSpark overrides the draft sampling (parallel block sample ->
@@ -171,18 +172,16 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // No-op when the draft follows the target's kv_split sharding.
   void expand_draft_block_tables(ModelInputParams& input_params) const;
 
-  // Geometry is selected by the drafter; shared builders consume it without
-  // depending on model-specific execution backends.
-  virtual bool draft_use_block_parallel_rows() const {
+ private:
+  bool draft_use_block_parallel_rows() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
   }
-  virtual BatchForwardType draft_batch_forward_type() const {
-    return draft_sas_mode_ == dflash_detail::DSparkSasMode::NATIVE
+  BatchForwardType draft_batch_forward_type() const {
+    return draft_impl_->context_.get_model_args().draft_query_uses_decode()
                ? BatchForwardType::DECODE
                : BatchForwardType::CHUNKED_PREFILL;
   }
 
- private:
   void fill_validate_input_from_draft_outputs(const DraftBlock& draft_block,
                                               ForwardInput& validate_input,
                                               Stream& compute_stream,

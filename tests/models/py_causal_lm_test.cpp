@@ -19,6 +19,8 @@ limitations under the License.
 #include <pybind11/eval.h>
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "core/framework/kv_cache/kv_cache.h"
@@ -188,6 +190,79 @@ TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {
   EXPECT_EQ(
       bridged_swa.attr("data_ptr")().cast<std::uintptr_t>(),
       reinterpret_cast<std::uintptr_t>(cache_tensors.swa_cache.data_ptr()));
+}
+
+TEST(PyCausalLMTpBridgeTest, InitializesPythonTpWithinEachDpReplica) {
+  py::gil_scoped_acquire gil;
+  register_bridge_test_model();
+  py::object init_patch =
+      py::module_::import("unittest.mock")
+          .attr("patch")("xllm.python.distributed.init_process_group");
+  py::object init_mock = init_patch.attr("__enter__")();
+  py::dict config;
+  try {
+    ProcessGroup world_group(/*rank=*/3,
+                             /*world_size=*/4,
+                             torch::Device(torch::kCPU));
+    ProcessGroup dp_group(/*rank=*/1,
+                          /*world_size=*/2,
+                          torch::Device(torch::kCPU));
+    ProcessGroup tp_group(/*rank=*/1,
+                          /*world_size=*/2,
+                          torch::Device(torch::kCPU));
+    ProcessGroup moe_tp_group(/*rank=*/0,
+                              /*world_size=*/1,
+                              torch::Device(torch::kCPU));
+    ParallelArgs parallel_args(/*rank=*/3, /*world_size=*/4, &world_group);
+    parallel_args.tp_size(2).dp_size(2);
+    parallel_args.tp_group_ = &tp_group;
+    parallel_args.dp_local_process_group_ = &dp_group;
+    parallel_args.moe_tp_group_ = &moe_tp_group;
+    parallel_args.python_rendezvous_host_ = "127.0.0.1";
+    parallel_args.python_rendezvous_port_ = 1;
+
+    ModelArgs model_args;
+    model_args.model_type(kBridgeTestModelType);
+    ModelContext context(
+        parallel_args,
+        model_args,
+        QuantArgs(),
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+        /*context=*/nullptr);
+    PyCausalLM model(context, /*is_vlm=*/false);
+    config = model.config_dict();
+  } catch (...) {
+    init_patch.attr("__exit__")(py::none(), py::none(), py::none());
+    throw;
+  }
+  init_patch.attr("__exit__")(py::none(), py::none(), py::none());
+
+  EXPECT_EQ(config["tp_size"].cast<int32_t>(), 2);
+  EXPECT_EQ(config["tp_rank"].cast<int32_t>(), 1);
+  EXPECT_EQ(config["dp_size"].cast<int32_t>(), 2);
+  py::list calls = init_mock.attr("call_args_list");
+  ASSERT_EQ(py::len(calls), 2);
+  py::tuple tp_args = calls[0].attr("args").cast<py::tuple>();
+  EXPECT_EQ(tp_args[0].cast<std::string>(), "tp");
+  EXPECT_EQ(tp_args[3].cast<int32_t>(), 1);
+  EXPECT_EQ(tp_args[4].cast<int32_t>(), 2);
+  EXPECT_EQ(tp_args[6].cast<int32_t>(), 3);
+  EXPECT_EQ(tp_args[7].cast<int32_t>(), 4);
+  EXPECT_EQ(tp_args[8].cast<int32_t>(), 1);
+}
+
+TEST(PyCausalLMTpBridgeTest, RejectsMissingBackboneTpAtInitialization) {
+  ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/2, /*process_group=*/nullptr);
+  parallel_args.tp_size(2);
+  ModelContext context(
+      parallel_args,
+      ModelArgs(),
+      QuantArgs(),
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+      /*context=*/nullptr);
+
+  EXPECT_THROW(PyCausalLM(context, /*is_vlm=*/false), std::invalid_argument);
 }
 
 TEST(PyCausalLMDcpBridgeTest, ForwardsEffectiveDcpSizeIntoConfigDict) {

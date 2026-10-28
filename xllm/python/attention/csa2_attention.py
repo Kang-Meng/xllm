@@ -44,6 +44,7 @@ from typing import Any, Sequence
 import torch
 
 from scripts.logger import logger
+from xllm.python.attention.csa2_block_metadata import Csa2BlockAttentionMetadata
 from xllm.python.attention.csa_attention import (
     DsaAttentionBackend,
     _CompressedAttentionCacheMapping,
@@ -1205,6 +1206,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         max_model_len: int = 0,
         quant_mode: str = V41_QUANT_NONE,
         acl_graph_enabled: bool = False,
+        block_query_width: int = 0,
     ) -> None:
         self.caches_info, self.group_infos = build_cache_specs_v41(
             compress_ratios,
@@ -1214,6 +1216,12 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             n_layers,
         )
         self._builder = DsaMetadataBuilder(self.caches_info, self.group_infos, read_table_layout=READ_TABLE_LAYOUT_RING)
+        self._block_query_width = block_query_width
+
+        if block_query_width and (
+            len(self.group_infos) != 1 or self.group_infos[0].cache_type != DSA_CACHE_SLIDING_WINDOW
+        ):
+            raise ValueError("CSA2 block attention requires a single SWA cache group")
         self.window_size = window_size
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
@@ -1242,8 +1250,10 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         self.quant_mode = quant_mode
         self.moe_graph_capturable = quant_mode == V41_QUANT_ASCEND
 
-        self.graph_token_capacity_granularity = _derive_graph_token_capacity_granularity(max_model_len)
-        granularity_source = f"derived from max_model_len={max_model_len}"
+        self.graph_token_capacity_granularity = (
+            0 if block_query_width else _derive_graph_token_capacity_granularity(max_model_len)
+        )
+        granularity_source = "fixed SWA window" if block_query_width else f"derived from max_model_len={max_model_len}"
         logger.info(
             f"DeepSeek-V4.1 CSA2 graph_token_capacity_granularity="
             f"{self.graph_token_capacity_granularity} ({granularity_source})"
@@ -1254,11 +1264,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # here at construction instead of at the first captured forward, where
         # the root cause is far from the symptom.
         if acl_graph_enabled and not self.moe_graph_capturable:
+            if self._block_query_width:
+                raise ValueError("CSA2 block graph execution requires a graph-capturable MoE implementation")
             logger.warning(
                 f"DeepSeek-V4.1 quant_mode={quant_mode} serves the torch MoE, which no ACL graph "
                 "can capture; decode-graph admission is disabled and decode stays eager"
             )
-        if acl_graph_enabled and self.moe_graph_capturable and self.graph_token_capacity_granularity <= 0:
+        if (
+            acl_graph_enabled
+            and self.moe_graph_capturable
+            and not block_query_width
+            and self.graph_token_capacity_granularity <= 0
+        ):
             raise RuntimeError(
                 "DeepSeek-V4.1 ACL-graph serving needs a static committed-row capacity, but "
                 "max_model_len was not provided to derive one. Provide "
@@ -1316,6 +1333,13 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         super().reset_forward(metadata)
         self._v41_shared = None
 
+    def prepare(self, metadata: Any, graph_mode: bool = False) -> None:
+        if self._block_query_width:
+            self._metadata = metadata
+            self._v41_shared = None
+        else:
+            super().prepare(metadata, graph_mode=graph_mode)
+
     def refresh_dsa_metadata_for_graph_replay(self, metadata: Any | None = None) -> None:
         """Refresh DSA tensors and the QLI operand buffers outside capture.
 
@@ -1326,6 +1350,8 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         allocate a new state, build one under capture, or read a device value
         back to the host.
         """
+        if self._block_query_width:
+            return
         super().refresh_dsa_metadata_for_graph_replay(metadata)
         resolved = self._metadata if metadata is None else metadata
         dsa = getattr(resolved, "dsa_metadata", None)
@@ -1473,6 +1499,10 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         branch below is expressed as tensor arithmetic so one captured graph
         stays correct across parity / length changes.
         """
+        context = get_forward_context_or_none()
+        block_metadata = context.execution_contexts.get(Csa2BlockAttentionMetadata) if context is not None else None
+        if block_metadata is not None:
+            return self._execute_block_attention(q, kv, layer, block_metadata)
         metadata = self._current_forward_metadata()
         dsa = getattr(metadata, "dsa_metadata", None)
         if dsa is None:
@@ -1555,6 +1585,28 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # the ring and must select the latest write for each slot.
             slots, values = (swa_slot, kv) if dsa.is_acl_graph else last_ring_writes(swa_slot, kv)
             _scatter_by_slot(layer_cache.swa, slots, values)
+        return output
+
+    def _execute_block_attention(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        layer: Any,
+        metadata: Csa2BlockAttentionMetadata,
+    ) -> torch.Tensor:
+        shared = self._shared_runtime()
+        shared.query_layout = Csa2QueryLayout(metadata.query_lens[0], shared_window=True)
+        output = self._csa2_attention(
+            q,
+            kv,
+            layer,
+            metadata,
+            list(metadata.query_lens),
+            metadata.context_lengths,
+            None,
+            shared,
+        )
+        _scatter_by_slot(self._kv_caches[layer.layer_id].swa, metadata.slot_mapping, kv)
         return output
 
     # -- compressor ---------------------------------------------------------
@@ -2552,7 +2604,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         q: torch.Tensor,
         kv: torch.Tensor,
         layer: Any,
-        dsa: DsaMetadata,
+        dsa: DsaMetadata | Csa2BlockAttentionMetadata,
         q_lens: list[int],
         ctx_lens: torch.Tensor,
         topk: torch.Tensor | None,
@@ -2578,12 +2630,15 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         ctx_lens = _ensure_seq_lens_tensor(ctx_lens, q.device)
         layer_cache = self._kv_caches[layer_id]
         mapping = self._resolve_cache_mapping(layer_id, ratio)
-        swa_bt = _get_layer_cache_tensor(dsa.block_tables, layer_id, mapping.ori_cache_idx)
         query_layout = shared.query_layout
         shared_window = query_layout is not None and query_layout.shared_window
-        token_rows = query_layout is not None and (dsa.is_acl_graph or query_layout.token_rows)
-        if token_rows and swa_bt is not None:
-            swa_bt = swa_bt[:: query_layout.query_width]
+        if isinstance(dsa, Csa2BlockAttentionMetadata):
+            swa_bt = dsa.block_table
+        else:
+            swa_bt = _get_layer_cache_tensor(dsa.block_tables, layer_id, mapping.ori_cache_idx)
+            token_rows = query_layout is not None and (dsa.is_acl_graph or query_layout.token_rows)
+            if token_rows and swa_bt is not None:
+                swa_bt = swa_bt[:: query_layout.query_width]
         swa_bs = layer_cache.swa.size(1) if layer_cache.swa is not None else win
         global_q_lens = list(cp_context.global_q_lens) if cp_context is not None else q_lens
         global_ctx_lens = _ensure_seq_lens_tensor(dsa.seq_lens, q.device) if cp_context is not None else ctx_lens

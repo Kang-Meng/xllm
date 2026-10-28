@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python.models.base import PyModelBase
+from xllm.python.models.dspark_pipeline import DSparkPipeline
 
 
 class DSparkMarkovHead(nn.Module):
@@ -65,11 +66,16 @@ class DSparkConfidenceHead(nn.Module):
 
 
 class DSparkForCausalLMBase(PyModelBase):
-    """Owns model-independent DSpark heads and runtime bridge methods."""
+    """Assembles the execution pipeline and exposes the causal-LM bridge."""
+
+    model: DSparkPipeline
 
     def __init__(
         self,
         *,
+        backbone: nn.Module,
+        lm_head: nn.Module | None,
+        query_width: int,
         vocab_size: int,
         draft_vocab_size: int,
         markov_rank: int,
@@ -81,14 +87,14 @@ class DSparkForCausalLMBase(PyModelBase):
         confidence_head_bias: bool = True,
     ) -> None:
         super().__init__()
-        self.markov_head = DSparkMarkovHead(
+        markov_head = DSparkMarkovHead(
             vocab_size,
             draft_vocab_size,
             markov_rank,
             dtype,
             device,
         )
-        self.confidence_head = (
+        confidence_head = (
             DSparkConfidenceHead(
                 hidden_size,
                 markov_rank,
@@ -99,21 +105,36 @@ class DSparkForCausalLMBase(PyModelBase):
             if enable_confidence_head
             else None
         )
+        self.model = DSparkPipeline(
+            backbone=backbone,
+            lm_head=lm_head,
+            markov_head=markov_head,
+            confidence_head=confidence_head,
+            query_width=query_width,
+            target_vocab_size=vocab_size,
+        )
+
+    def compute_logits(self, hidden: torch.Tensor, selected_idxes: torch.Tensor | None) -> torch.Tensor:
+        return self.model.compute_logits(hidden, selected_idxes)
+
+    def get_lm_head(self) -> nn.Module | None:
+        return self.model.get_lm_head()
+
+    def get_token_embedding(self) -> nn.Module | None:
+        return self.model.get_token_embedding()
+
+    def share_weights_from(self, source: PyModelBase) -> None:
+        self.model.share_weights_from(source)
 
     def dspark_markov_bias(self, previous_token_ids: torch.Tensor) -> torch.Tensor:
-        return self.markov_head.bias(previous_token_ids)
+        return self.model.markov_head.bias(previous_token_ids)
 
     def dspark_confidence_probs(
         self,
         hidden_all: torch.Tensor,
         prev_matrix: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.confidence_head is None:
-            raise RuntimeError("DSpark confidence head is not enabled")
-        markov_embedding = None
-        if prev_matrix is not None:
-            markov_embedding = self.markov_head.embed(prev_matrix)
-        return self.confidence_head(hidden_all, markov_embedding)
+        return self.model.confidence_probs(hidden_all, prev_matrix)
 
     def has_dspark_confidence_head(self) -> bool:
-        return self.confidence_head is not None
+        return self.model.confidence_head is not None

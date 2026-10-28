@@ -118,6 +118,8 @@ class DecodeCudaGraphRunner(BaseRunner):
         input_ids: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
+        *,
+        input_batch: InputBatch | None = None,
     ) -> bool:
         graph_key = self._graph_key(input_ids, metadata)
         return (
@@ -190,7 +192,6 @@ class DecodeCudaGraphRunner(BaseRunner):
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
     ) -> ModelExecutionOutput:
-        del input_batch
         batch_size = input_ids.shape[0]
         graph_key = self._graph_key(input_ids, metadata)
         if graph_key is None:
@@ -217,7 +218,12 @@ class DecodeCudaGraphRunner(BaseRunner):
                 )
             ):
                 entry.graph.replay()
-                output = self._slice_output(entry.static_output, batch_size, clone=True)
+                output = self._slice_output(
+                    entry.static_output,
+                    batch_size,
+                    num_reqs=input_batch.num_reqs if input_batch is not None else None,
+                    clone=True,
+                )
 
         torch.cuda.current_stream().wait_stream(self._stream)
         return output

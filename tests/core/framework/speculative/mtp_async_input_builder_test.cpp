@@ -644,18 +644,24 @@ TEST(MtpAsyncInputBuilderTest, PybindViewDecodeStepStaysKvShardFree) {
 
 TEST(MtpAsyncInputBuilderTest, SharedModulesPointToTargetModel) {
   py::gil_scoped_acquire gil;
-  py::module_ types = py::module_::import("types");
-  py::object target_lm_head = py::module_::import("builtins").attr("object")();
-  py::object target_embedding =
-      py::module_::import("builtins").attr("object")();
-  py::object target_body =
-      types.attr("SimpleNamespace")(py::arg("embed_tokens") = target_embedding);
-  py::object target_model = types.attr("SimpleNamespace")(
-      py::arg("lm_head") = target_lm_head, py::arg("model") = target_body);
-  py::object draft_body =
-      types.attr("SimpleNamespace")(py::arg("embed_tokens") = py::none());
-  py::object draft_model = types.attr("SimpleNamespace")(
-      py::arg("lm_head") = py::none(), py::arg("model") = draft_body);
+  prepend_python_model_path();
+  py::module_ nn = py::module_::import("torch.nn");
+  py::object model_class =
+      py::module_::import("xllm.python.models.base").attr("PyModelBase");
+  py::object target_lm_head = nn.attr("Linear")(py::arg("in_features") = 2,
+                                                py::arg("out_features") = 2);
+  py::object target_embedding = nn.attr("Embedding")(
+      py::arg("num_embeddings") = 4, py::arg("embedding_dim") = 2);
+  py::object target_body = nn.attr("Module")();
+  target_body.attr("embed_tokens") = target_embedding;
+  py::object target_model = model_class();
+  target_model.attr("lm_head") = target_lm_head;
+  target_model.attr("model") = target_body;
+  py::object draft_body = nn.attr("Module")();
+  draft_body.attr("embed_tokens") = py::none();
+  py::object draft_model = model_class();
+  draft_model.attr("lm_head") = py::none();
+  draft_model.attr("model") = draft_body;
 
   ::xllm::detail::share_python_model_weights(draft_model, target_model);
 

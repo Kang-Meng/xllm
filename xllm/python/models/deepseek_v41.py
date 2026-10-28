@@ -3309,7 +3309,7 @@ class DeepseekV41ForCausalLM(PyModelBase):
         is_fp8: bool,
     ) -> None:
         """Load gate + bias + stacked experts + shared expert of one torch MoE layer."""
-        mlp = self.model.layers[layer_id].mlp
+        mlp = self.get_submodule(pm + "mlp")
         loader.copy_in(pm + "mlp.gate.weight", loader.load_tensor(ck + "ffn.gate.weight"))
         loader.copy_in(
             pm + "mlp.e_score_correction_bias",

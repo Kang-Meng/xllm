@@ -113,6 +113,7 @@ def test_moe_loader_uses_native_projection_names_and_local_expert_range() -> Non
     owner = SimpleNamespace(
         cfg=SimpleNamespace(moe_intermediate_size=4, hidden_size=3),
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        get_submodule={"model.layers.0.mlp": mlp}.__getitem__,
         get_parameter=lambda name: parameters[name],
         get_buffer=lambda name: buffers[name],
         _load_dsv4_moe_routing=DeepseekV4ForCausalLM._load_dsv4_moe_routing,
@@ -200,6 +201,7 @@ def test_moe_loader_shards_mxfp4_gate_and_up_before_fusion() -> None:
     owner = SimpleNamespace(
         cfg=SimpleNamespace(moe_intermediate_size=256, hidden_size=256, n_shared_experts=1),
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        get_submodule={"model.layers.0.mlp": mlp}.__getitem__,
         get_parameter=parameters.__getitem__,
         get_buffer=buffers.__getitem__,
         _load_dsv4_moe_routing=DeepseekV4ForCausalLM._load_dsv4_moe_routing,
@@ -318,6 +320,7 @@ def test_moe_loader_validates_shared_mxfp8_shapes(
     owner = SimpleNamespace(
         cfg=SimpleNamespace(moe_intermediate_size=256, hidden_size=256, n_shared_experts=1),
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        get_submodule={"model.layers.0.mlp": mlp}.__getitem__,
         get_parameter=lambda _name: torch.empty(0),
         get_buffer=lambda _name: torch.empty(0),
     )
@@ -431,6 +434,7 @@ def test_load_weights_reaches_routed_expert_aliases(
             hidden_size=3,
         ),
         model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention, mlp=mlp)]),
+        get_submodule={"model.layers.0.mlp": mlp}.__getitem__,
         get_parameter=parameters.__getitem__,
         get_buffer=buffers.__getitem__,
         _load_dsv4_attention=_load_attention,
@@ -478,6 +482,7 @@ def _minimal_moe_loader_state(tensors: dict[str, torch.Tensor]) -> tuple[SimpleN
     owner = SimpleNamespace(
         cfg=SimpleNamespace(moe_intermediate_size=4, hidden_size=4),
         model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        get_submodule={"model.layers.0.mlp": mlp}.__getitem__,
         get_parameter=parameters.__getitem__,
         get_buffer=buffers.__getitem__,
         _load_dsv4_moe_routing=DeepseekV4ForCausalLM._load_dsv4_moe_routing,

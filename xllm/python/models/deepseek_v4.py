@@ -2369,7 +2369,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
         if attention_prefix is None:
             raise KeyError(f"DeepSeek-V4 layer {layer_id} attention weights not found")
 
-        attention = self.model.layers[layer_id].self_attn
+        attention = self.get_submodule(parameter_prefix + "self_attn")
         self._load_dsv4_attention_weights(
             loader,
             checkpoint_prefix,
@@ -2707,7 +2707,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
         block scales fused into the MXFP8 MLP projections.
         """
         cfg = self.cfg
-        mlp = self.model.layers[layer_id].mlp
+        mlp = self.get_submodule(parameter_prefix + "mlp")
         tp = mlp.moe_tp_size
         tp_rank = mlp.moe_tp_rank
         start = mlp.start_expert_id
@@ -2869,7 +2869,7 @@ class DeepseekV4ForCausalLM(PyModelBase):
             return loader.has(name)
 
         cfg = self.cfg
-        mlp = self.model.layers[layer_id].mlp
+        mlp = self.get_submodule(pm + "mlp")
         gate_prefix = _find_checkpoint_prefix(
             loader,
             (

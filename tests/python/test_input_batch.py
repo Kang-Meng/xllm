@@ -48,12 +48,39 @@ def test_input_batch_preserves_upstream_request_layout() -> None:
     assert batch.query_start_loc == (0, 4, 6)
 
 
-def test_bind_graph_inputs_only_changes_graph_owned_fields() -> None:
+def test_input_batch_allows_unavailable_host_cached_counts() -> None:
+    batch = InputBatch.from_runtime(
+        torch.arange(6),
+        torch.arange(6),
+        _metadata(num_computed_tokens=[]),
+        is_dummy=False,
+    )
+
+    assert batch.num_computed_tokens == ()
+    assert batch.num_reqs == 2
+    assert batch.num_scheduled_tokens == (4, 2)
+
+
+@pytest.mark.parametrize("cached_counts", [[10], [10, 20, 30], [-1, 20]])
+def test_input_batch_rejects_invalid_provided_cached_counts(cached_counts: list[int]) -> None:
+    with pytest.raises(ValueError, match="inconsistent lengths|num_computed_tokens"):
+        InputBatch.from_runtime(
+            torch.arange(6),
+            torch.arange(6),
+            _metadata(num_computed_tokens=cached_counts),
+            is_dummy=False,
+        )
+
+
+@pytest.mark.parametrize("cached_counts", [[], [10, 20]])
+def test_bind_graph_inputs_only_changes_graph_owned_fields(cached_counts: list[int]) -> None:
+    sampling = SimpleNamespace()
     batch = InputBatch.from_runtime(
         torch.arange(6, dtype=torch.int32),
         torch.arange(6, dtype=torch.int32),
-        _metadata(),
+        _metadata(num_computed_tokens=cached_counts),
         is_dummy=False,
+        sampling=sampling,
     )
     is_padding = torch.tensor([False, False, False, False, False, False, True, True])
 
@@ -68,6 +95,8 @@ def test_bind_graph_inputs_only_changes_graph_owned_fields() -> None:
     assert padded.num_tokens_after_padding == 8
     assert padded.num_scheduled_tokens == (4, 2)
     assert padded.is_padding is is_padding
+    assert padded.num_computed_tokens == tuple(cached_counts)
+    assert padded.sampling is sampling
 
 
 def test_input_batch_rejects_inconsistent_upstream_fields() -> None:

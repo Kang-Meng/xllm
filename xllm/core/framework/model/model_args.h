@@ -105,6 +105,7 @@ struct ModelArgs {
 
   // Worker-stamped for block-diffusion drafts that must run eager.
   PROPERTY(bool, requires_eager_execution) = false;
+  PROPERTY(bool, draft_query_uses_decode) = false;
   // Minimum input rows an idle/empty shard must still materialize.
   PROPERTY(int32_t, dummy_token_count) = 1;
 

@@ -29,17 +29,14 @@ limitations under the License.
 #include "api_service/call.h"
 #include "core/common/metrics.h"
 #include "core/distributed_runtime/speculative_engine.h"
-#include "core/framework/config/model_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/request/request.h"
 #include "core/platform/device_name_utils.h"
-#include "core/platform/platform.h"
 #include "core/runtime/xservice_client.h"
 #include "core/scheduler/scheduler_factory.h"
 #include "core/util/net.h"
 #include "core/util/scope_guard.h"
 #include "core/util/timer.h"
-#include "models/llm/deepseek_v41_dspark_graph_policy.h"
 #include "models/model_registry.h"
 #include "server/xllm_server_registry.h"
 
@@ -136,12 +133,7 @@ LLMMaster::LLMMaster(const Options& options)
       task_type_,
       [this](const std::vector<RequestOutput>& outputs) {
         return handle_rpc_responses(outputs);
-      },
-      deepseek_v41::make_draft_graph_request_validator(
-          options_,
-          engine_->draft_model_args(),
-          ModelConfig::get_instance().model_impl(),
-          Platform::is_npu()));
+      });
 }
 
 LLMMaster::~LLMMaster() {

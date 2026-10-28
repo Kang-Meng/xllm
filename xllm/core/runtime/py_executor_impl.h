@@ -62,7 +62,7 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   bool enable_mla_ = false;
 
   pybind11::object py_executor_;
-  pybind11::object py_draft_proposal_output_type_;
+  pybind11::object py_model_output_type_;
   std::unique_ptr<PyMultimodalExecutor> multimodal_executor_;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;

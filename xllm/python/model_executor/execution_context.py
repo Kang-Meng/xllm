@@ -63,6 +63,17 @@ class RegisteredExecutionMetadataBuilder(ExecutionMetadataBuilder, Protocol):
 
 
 @runtime_checkable
+class GraphAdmissionMetadataBuilder(Protocol):
+    """Optional builder capability for request-dependent graph admission."""
+
+    def can_execute_graph(
+        self,
+        input_batch: InputBatch,
+        metadata: AttentionMetadata,
+    ) -> bool: ...
+
+
+@runtime_checkable
 class LayerCacheAwareExecutionMetadataBuilder(Protocol):
     """Optional builder capability for binding long-lived layer caches."""
 

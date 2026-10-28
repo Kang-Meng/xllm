@@ -128,8 +128,7 @@ class LLMRequestFactoryTest : public ::testing::Test {
   std::unique_ptr<LLMRequestFactory> make_factory(
       int32_t vocab_size = 1000,
       int32_t max_position = 2048,
-      std::string task = "generate",
-      LLMRequestFactory::RequestValidator request_validator = {}) {
+      std::string task = "generate") {
     tokenizer_ = std::make_unique<FakeTokenizer>(vocab_size);
     chat_template_ = std::make_unique<FakeChatTemplate>();
     model_args_.vocab_size(vocab_size)
@@ -145,8 +144,7 @@ class LLMRequestFactoryTest : public ::testing::Test {
         &options_,
         &rate_limiter_,
         std::move(task),
-        [](const std::vector<RequestOutput>&) { return std::vector<bool>{}; },
-        std::move(request_validator));
+        [](const std::vector<RequestOutput>&) { return std::vector<bool>{}; });
   }
 
   std::unique_ptr<FakeTokenizer> tokenizer_;
@@ -173,91 +171,6 @@ TEST_F(LLMRequestFactoryTest, RejectsEmptyPromptAndReleasesRateLimitSlot) {
   EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(), "Prompt is empty");
   // The factory must release the rate-limit slot on every early return.
-  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
-}
-
-TEST_F(LLMRequestFactoryTest,
-       ModelValidatorRejectsBeforeEncodingAndReleasesRateLimitSlot) {
-  auto factory = make_factory(
-      /*vocab_size=*/1000,
-      /*max_position=*/2048,
-      /*task=*/"generate",
-      [](const RequestParams&) -> std::optional<std::string> {
-        return "unsupported model request option";
-      });
-  CallbackCapture capture;
-  RequestParams sp;
-  sp.service_request_id = "service-req";
-  sp.source_xservice_addr = "service-address";
-
-  auto request = factory->create(/*prompt=*/"FAIL encoding",
-                                 /*prompt_tokens=*/std::nullopt,
-                                 sp,
-                                 /*call=*/std::nullopt,
-                                 make_capture_callback(&capture));
-
-  EXPECT_EQ(request, nullptr);
-  ASSERT_TRUE(capture.status.has_value());
-  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
-  EXPECT_EQ(capture.status->message(), "unsupported model request option");
-  EXPECT_EQ(capture.service_request_id, sp.service_request_id);
-  EXPECT_EQ(capture.target_xservice_addr, sp.source_xservice_addr);
-  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
-}
-
-TEST_F(LLMRequestFactoryTest,
-       ModelValidatorAllowsNormalRequestAndKeepsRateLimitSlot) {
-  int32_t validations = 0;
-  auto factory = make_factory(
-      /*vocab_size=*/1000,
-      /*max_position=*/2048,
-      /*task=*/"generate",
-      [&validations](const RequestParams&) -> std::optional<std::string> {
-        ++validations;
-        return std::nullopt;
-      });
-  CallbackCapture capture;
-  RequestParams sp;
-  sp.max_tokens = 16;
-  std::vector<Message> messages;
-  messages.emplace_back("user", std::string("hi"));
-
-  auto request = factory->create(messages,
-                                 /*prompt_tokens=*/std::nullopt,
-                                 sp,
-                                 /*call=*/std::nullopt,
-                                 make_capture_callback(&capture));
-
-  ASSERT_NE(request, nullptr);
-  EXPECT_EQ(validations, 1);
-  EXPECT_FALSE(capture.called);
-  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
-}
-
-TEST_F(LLMRequestFactoryTest,
-       ModelValidatorRejectsChatRequestAndReleasesRateLimitSlot) {
-  auto factory = make_factory(
-      /*vocab_size=*/1000,
-      /*max_position=*/2048,
-      /*task=*/"generate",
-      [](const RequestParams&) -> std::optional<std::string> {
-        return "unsupported model request option";
-      });
-  CallbackCapture capture;
-  RequestParams sp;
-  std::vector<Message> messages;
-  messages.emplace_back("user", std::string("hi"));
-
-  auto request = factory->create(messages,
-                                 /*prompt_tokens=*/std::nullopt,
-                                 sp,
-                                 /*call=*/std::nullopt,
-                                 make_capture_callback(&capture));
-
-  EXPECT_EQ(request, nullptr);
-  ASSERT_TRUE(capture.status.has_value());
-  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
-  EXPECT_EQ(capture.status->message(), "unsupported model request option");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 

@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "core/framework/config/disagg_pd_config.h"
@@ -53,16 +54,7 @@ namespace detail {
 
 void share_python_model_weights(py::object& draft_model,
                                 const py::object& target_model) {
-  // Keep the draft's own head/embedding when the checkpoint ships them (DSpark
-  // carries a trained mask-token basis); borrow the target's only when None.
-  if (draft_model.attr("lm_head").is_none()) {
-    draft_model.attr("lm_head") = target_model.attr("lm_head");
-  }
-  py::object draft_body = draft_model.attr("model");
-  py::object target_body = target_model.attr("model");
-  if (draft_body.attr("embed_tokens").is_none()) {
-    draft_body.attr("embed_tokens") = target_body.attr("embed_tokens");
-  }
+  draft_model.attr("share_weights_from")(target_model);
 }
 
 int64_t python_mega_moe_max_num_tokens_per_rank(int64_t max_seqs_per_batch,
@@ -161,7 +153,15 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
   // own group instead of carving CP back out of tp_group_. TP and CP are
   // orthogonal: a rank can shard both attention heads (TP) and sequence tokens
   // (CP) at once, so both dimensions may be > 1 simultaneously.
-  tp_size_ = (tp_group_ != nullptr) ? tp_group_->world_size() : 1;
+  tp_size_ = (tp_group_ != nullptr) ? tp_group_->world_size()
+                                    : parallel_args.tp_size();
+  if (tp_size_ <= 0) {
+    throw std::invalid_argument("Python model TP size must be positive");
+  }
+  if (tp_group_ == nullptr && tp_size_ > 1) {
+    throw std::invalid_argument(
+        "Python model TP requires a C++ TP group for backbone collectives");
+  }
   tp_rank_ = (tp_group_ != nullptr) ? tp_group_->rank() : 0;
   dp_group_ = parallel_args.dp_local_process_group_;
   dp_size_ = (dp_group_ != nullptr) ? dp_group_->world_size() : 1;
@@ -515,14 +515,11 @@ py::dict PyCausalLM::build_config_dict(
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
   d["layerwise_split_rank"] = layerwise_split_rank_;
-  // Draft graph support is resolved by the model's runtime policy before
-  // construction. The bridge only forwards that decision.
-  const bool eager_draft_model =
-      (model_args_.requires_eager_execution() ||
-       model_args_.model_type() == kDFlashDraftModelType ||
-       model_args_.model_type() == kDSparkDraftModelType ||
-       util::is_deepseek_v4_dspark_model_type(model_args_.model_type())) &&
-      !speculative_runtime_config.draft_graph_enabled;
+  // A *target* whose transient capture cannot ride the graph is pinned to
+  // eager: the plain capture returns a tuple, and that tuple has to survive
+  // the model's graph path. The opt-in flag lets such a target publish the
+  // capture through the runner's persistent aux buffer instead, so the graph
+  // can be captured.
   const bool allow_graph_aux_hidden_states =
       ExecutionConfig::get_instance().enable_graph_aux_hidden_states();
   // That incompatibility is a per-model property, not a universal one: only
@@ -534,9 +531,9 @@ py::dict PyCausalLM::build_config_dict(
   // so the gate never spills onto models whose capture coexists with the
   // graph; the flag alone (or an empty layer set) forces nothing. The family
   // predicate (not a bare string) covers future v41-variant spellings that
-  // share the CSA2 stack. Draft graph admission is resolved separately above.
+  // share the CSA2 stack.
   bool requires_eager_execution =
-      eager_draft_model ||
+      model_args_.requires_eager_execution() ||
       (!model_args_.layers_to_capture().empty() &&
        util::is_deepseek_v41_family_model_type(model_args_.model_type()) &&
        !allow_graph_aux_hidden_states);
@@ -544,9 +541,9 @@ py::dict PyCausalLM::build_config_dict(
   // (graph-capturable) inside the HCCL window; the Python executor gates
   // capture on the same policy and over-capacity steps stay on the
   // variable-length AllToAllV transport, which remains eager-only.
-  d["enable_graph"] = !requires_eager_execution &&
-                      (speculative_runtime_config.draft_graph_enabled ||
-                       ExecutionConfig::get_instance().enable_graph());
+  d["enable_graph"] = requires_eager_execution
+                          ? false
+                          : ExecutionConfig::get_instance().enable_graph();
   d["python_graph_backend"] =
       requires_eager_execution
           ? std::string("off")
@@ -555,7 +552,6 @@ py::dict PyCausalLM::build_config_dict(
   // target reads this to publish its capture through a persistent buffer
   // instead of returning the tuple the graph runner cannot accept.
   d["enable_graph_aux_hidden_states"] = allow_graph_aux_hidden_states;
-  d["draft_graph_enabled"] = speculative_runtime_config.draft_graph_enabled;
   // Engram host-offload switches, forwarded as the raw JSON string; the Python
   // executor parses/validates it (xllm/python/models/engram_config.py).
   d["engram_config"] = ModelConfig::get_instance().engram_config();

@@ -21,18 +21,22 @@ limitations under the License.
 #include <optional>
 
 #include "core/framework/model/mtp_topk_state.h"
+#include "framework/sampling/draft_proposal.h"
 
 namespace xllm {
 struct ModelOutput {
+  // A complete draft proposal lets callers skip LM-head projection and
+  // sampling; hidden_states may be undefined. Otherwise, use the existing
+  // hidden-state path.
+  std::optional<DraftProposal> draft_proposal;
+  // Optional confidence-head probabilities for adaptive draft-prefix pruning.
+  torch::Tensor draft_confidence_probs;
   // [num_tokens, hidden_size]
   torch::Tensor hidden_states;
   // [num_tokens, hidden_size]
   torch::Tensor residual;
   // [num_tokens, ...]
   torch::Tensor aux_hidden_states;
-  // Completed draft proposals, when the model owns proposal generation.
-  // Mutually exclusive with hidden_states.
-  torch::Tensor draft_proposal_token_ids;
   // Backend-neutral state emitted for the next MTP draft step.
   MtpTopkStatePtr mtp_topk_state;
 

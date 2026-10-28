@@ -60,10 +60,6 @@ class Engine {
   // return the model args
   virtual const ModelArgs& model_args() const { return args_; }
 
-  // Non-owning metadata for an initialized external draft, when present.
-  // The reference remains valid for the lifetime of its owning engine.
-  virtual const ModelArgs* draft_model_args() const { return nullptr; }
-
   virtual bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor&) {
     return false;

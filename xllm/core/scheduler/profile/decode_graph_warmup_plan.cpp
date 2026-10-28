@@ -18,7 +18,6 @@ limitations under the License.
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <iterator>
 #include <utility>
 
 #include "platform/platform.h"
@@ -33,29 +32,6 @@ constexpr std::array<int32_t, 5> kCompatibilitySmallBatchSizes = {1,
                                                                   4,
                                                                   8,
                                                                   16};
-
-void merge_additional_batch_sizes(DecodeGraphWarmupPlan& plan,
-                                  int32_t max_global_batch_size,
-                                  int32_t dp_size) {
-  if (dp_size <= 0 || max_global_batch_size < dp_size) {
-    return;
-  }
-  const auto& additional_batch_sizes =
-      plan.warmup_config.additional_batch_sizes;
-  plan.batch_sizes.reserve(plan.batch_sizes.size() +
-                           additional_batch_sizes.size());
-  std::copy_if(additional_batch_sizes.begin(),
-               additional_batch_sizes.end(),
-               std::back_inserter(plan.batch_sizes),
-               [dp_size, max_global_batch_size](int32_t batch_size) {
-                 return batch_size >= dp_size &&
-                        batch_size <= max_global_batch_size;
-               });
-  std::sort(plan.batch_sizes.begin(), plan.batch_sizes.end());
-  plan.batch_sizes.erase(
-      std::unique(plan.batch_sizes.begin(), plan.batch_sizes.end()),
-      plan.batch_sizes.end());
-}
 
 }  // namespace
 
@@ -112,7 +88,6 @@ DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
   // plan does not depend on a device build macro. A backend must not opt in
   // until its graph keying and MTP replay behavior are covered by tests.
   if (!Platform::supports_mtp_decode_graph_warmup()) {
-    merge_additional_batch_sizes(plan, max_global_batch_size, dp_size);
     return plan;
   }
 
@@ -122,7 +97,6 @@ DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
       (!warmup_config.enable_graph_mode_decode_no_padding ||
        warmup_config.max_graph_batch_size > 0);
   if (!use_mtp_batches) {
-    merge_additional_batch_sizes(plan, max_global_batch_size, dp_size);
     return plan;
   }
 
@@ -180,7 +154,6 @@ DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
     batch_sizes.erase(std::unique(batch_sizes.begin(), batch_sizes.end()),
                       batch_sizes.end());
     plan.batch_sizes = std::move(batch_sizes);
-    merge_additional_batch_sizes(plan, max_global_batch_size, dp_size);
     return plan;
   }
 
@@ -204,7 +177,6 @@ DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
     batch_sizes.emplace_back(max_global_batch_size);
   }
   plan.batch_sizes = std::move(batch_sizes);
-  merge_additional_batch_sizes(plan, max_global_batch_size, dp_size);
 
   return plan;
 }

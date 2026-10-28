@@ -41,9 +41,11 @@ from tests.python.test_deepseek_v41_dspark import _build_checkpoint, _config_dic
 from tests.python.test_deepseek_v41_model import _DEEPSEEK_V41_FORWARD_CONFIG, _make_csa2_backend, _random_init_v41
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa2_attention import Csa2AttentionBackend
+from xllm.python.attention.csa2_block_metadata import Csa2BlockAttentionMetadata, Csa2BlockAttentionMetadataBuilder
 from xllm.python.attention.csa_attention import _scatter_by_slot
 from xllm.python.attention.dsa_metadata import DSA_CACHE_SLIDING_WINDOW, DSA_CACHE_TOKEN
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.models.deepseek_v41 import DeepseekV41Config, DeepseekV41ForCausalLM
 from xllm.python.models.deepseek_v41_dspark import DeepseekV41DSparkForCausalLM
 
@@ -817,6 +819,7 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(
     )
     draft = DeepseekV41DSparkForCausalLM(draft_config)
     _load(draft, _build_checkpoint(draft.cfg, lambda key, shape: torch.randn(shape) * 0.05))
+    draft_body = draft.model.backbone
     draft_caches = [
         LayerCache(key=None, value=None, swa=torch.zeros_like(source_caches[0].swa))
         for _ in range(draft.cfg.num_draft_layers)
@@ -829,13 +832,13 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(
         return (table.to(pos.device)[0, pos // _BLOCK_SIZE] * _BLOCK_SIZE + pos % _BLOCK_SIZE).to(torch.int32)
 
     with torch.inference_mode():
-        draft.model.write_context_kv(
+        draft_body.write_context_kv(
             cold_prefix_aux[0], positions[:prefix], slots(_tables(prefix)[0], 0, prefix), cold_draft_caches
         )
-        draft.model.write_context_kv(
+        draft_body.write_context_kv(
             cold_suffix_aux[0], positions[prefix:], slots(_tables(total)[0], prefix, total), cold_draft_caches
         )
-        draft.model.write_context_kv(
+        draft_body.write_context_kv(
             prefix_aux[0], positions[:prefix], slots(_tables(prefix)[0], 0, prefix), draft_caches
         )
         saved = [cache.swa[1 : 1 + prefix // _BLOCK_SIZE].clone() for cache in draft_caches]
@@ -845,7 +848,7 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(
             for source, destination in zip(draft_caches, restored, strict=True):
                 last = prefix // _BLOCK_SIZE
                 destination.swa[last + 1].copy_(source.swa[last].cpu())
-        draft.model.write_context_kv(
+        draft_body.write_context_kv(
             suffix_aux[0], positions[prefix:], slots(restored_tables[0], prefix, total), restored
         )
     for source, alias, cold, before in zip(draft_caches, restored, cold_draft_caches, saved, strict=True):
@@ -862,12 +865,26 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(
     # comparing the context scatter. It consumes the same joint block IDs
     # after a warm target prefill and predicts the anchor-first block once.
     query_start = total - 1
-    block = draft.model.anchor_first_query_block(ids[-1:]).reshape(-1)
+    block = draft_body.anchor_first_query_block(ids[-1:]).reshape(-1)
     assert torch.all((block >= 0) & (block < draft.cfg.vocab_size))
     query_positions = torch.arange(query_start, query_start + block.numel(), device="npu:0")
+    input_batch = InputBatch.from_runtime(
+        block,
+        query_positions,
+        SimpleNamespace(
+            num_reqs=1,
+            num_tokens=block.numel(),
+            num_scheduled_tokens=[block.numel()],
+            num_computed_tokens=[query_start],
+            query_start_loc=[0, block.numel()],
+            is_prefilling=[False],
+        ),
+        is_dummy=False,
+    )
+    builder = Csa2BlockAttentionMetadataBuilder(block.numel(), _BLOCK_SIZE, draft.cfg.max_position_embeddings)
 
     def draft_logits(caches: list[LayerCache], tables: list[torch.Tensor]) -> torch.Tensor:
-        backend = _make_csa2_backend(draft.model.layer_cfg, torch.device("npu:0"))
+        backend = _make_csa2_backend(draft_body.layer_cfg, torch.device("npu:0"))
         backend.bind_kv_caches(caches)
         metadata = SimpleNamespace(
             is_prefill=False,
@@ -880,9 +897,17 @@ def test_dspark_context_prefix_alias_uses_target_capture_and_private_suffix(
             q_seq_lens_host=torch.tensor([block.numel()], dtype=torch.int32),
             dsa_metadata=None,
         )
-        context = ForwardContext(backend, torch.device("npu:0"), metadata, caches)
+        builder.bind_layer_caches(caches)
+        block_metadata = builder.build(input_batch, metadata)
+        context = ForwardContext(
+            backend,
+            torch.device("npu:0"),
+            metadata,
+            caches,
+            execution_contexts={Csa2BlockAttentionMetadata: block_metadata},
+        )
         with torch.inference_mode(), forward_context(context):
-            hidden = draft.model(block, query_positions)
+            hidden = draft_body(block, query_positions)
             return draft.compute_logits(hidden, None).float()
 
     cold_logits = draft_logits(cold_draft_caches, _tables(total + 3))

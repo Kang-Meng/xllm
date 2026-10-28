@@ -165,6 +165,7 @@ def _register_builtin_models() -> None:
         "Qwen3DSparkForCausalLM",
         "DSparkDraftModel",
         "Qwen3DSparkModel",
+        execution_metadata_builders=(("xllm.python.model_executor.sampling_metadata", "ModelSamplingMetadataBuilder"),),
     )
     _register_model_path(
         "xllm.python.models.qwen3_dflash",
@@ -215,6 +216,10 @@ def _register_builtin_models() -> None:
         "xllm.python.models.deepseek_v41_dspark",
         "DeepseekV41DSparkForCausalLM",
         "deepseek_v41_dspark",
+        execution_metadata_builders=(
+            ("xllm.python.attention.csa2_block_metadata", "Csa2BlockAttentionMetadataBuilder"),
+            ("xllm.python.model_executor.sampling_metadata", "ModelSamplingMetadataBuilder"),
+        ),
     )
 
     _register_model_path(
@@ -222,6 +227,7 @@ def _register_builtin_models() -> None:
         "DeepseekV4DSparkForCausalLM",
         "DeepseekV4DSparkForCausalLM",
         "deepseek_v4_dspark",
+        execution_metadata_builders=(("xllm.python.model_executor.sampling_metadata", "ModelSamplingMetadataBuilder"),),
     )
     _register_model_path(
         "xllm.python.models.deepseek_v32_mtp",

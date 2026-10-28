@@ -337,6 +337,13 @@ def _require_group(x: torch.Tensor, group_name: str) -> ProcessGroup:
     return group
 
 
+def tp_group(device: torch.device | str) -> ProcessGroup:
+    group = _groups.get(("tp", str(torch.device(device))))
+    if group is None:
+        raise RuntimeError(f"TP group is not initialized for {device}")
+    return group
+
+
 def tp_rank(device: torch.device | str) -> int:
     """Rank in the TP group for ``device`` (0 when no TP group exists)."""
     group = _groups.get(("tp", str(torch.device(device))))
@@ -1000,6 +1007,7 @@ __all__ = [
     "engram_broadcast_object_list",
     "engram_all_gather_object",
     "engram_barrier",
+    "tp_group",
     "tp_rank",
     "cp_rank",
     "cp_world_size",

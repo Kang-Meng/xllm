@@ -27,8 +27,8 @@ never spill onto models whose capture coexists with the graph.
 The C++ cannot be compiled here (no toolchain), so these tests pin the two
 sides of the contract: the flag wiring in ``execution_config.{h,cpp}`` and the
 predicate structure in ``py_causal_lm.cpp``, plus a truth table for the
-predicate itself (which must reproduce the pre-aux-gate mainline decision for
-every non-v41 model).
+predicate itself. The model's ``requires_eager_execution`` capability is
+independent of the aux gate and must remain authoritative for every model.
 """
 
 from __future__ import annotations
@@ -68,23 +68,18 @@ def _extract_assignment(text: str, marker: str) -> str:
 
 def _requires_eager(
     *,
-    eager_draft_model: bool,
+    model_requires_eager: bool,
     layers_to_capture: bool,
     allow_graph_aux_hidden_states: bool,
     model_type: str,
 ) -> bool:
-    return eager_draft_model or (layers_to_capture and model_type in _V41_FAMILY and not allow_graph_aux_hidden_states)
-
-
-def _mainline_requires_eager(*, eager_draft_model: bool) -> bool:
-    """The pre-aux-gate mainline predicate: the draft set alone decides."""
-    return eager_draft_model
+    return model_requires_eager or (
+        layers_to_capture and model_type in _V41_FAMILY and not allow_graph_aux_hidden_states
+    )
 
 
 # Mirror of util::is_deepseek_v41_family_model_type (core/util/utils.h):
-# the v41 target plus its python-path DSpark draft spelling. The draft member
-# is eager anyway through the draft set, so family membership changes nothing
-# for it; both spellings are kept so the mirror tracks the C++ predicate.
+# the v41 target plus its python-path DSpark draft spelling.
 _V41_FAMILY = frozenset({"deepseek_v41", "deepseek_v41_dspark"})
 
 _MODEL_TYPES = ("deepseek_v41", "deepseek_v41_dspark", "glm5_next", "qwen3", "DFlashDraftModel")
@@ -92,31 +87,34 @@ _MODEL_TYPES = ("deepseek_v41", "deepseek_v41_dspark", "glm5_next", "qwen3", "DF
 
 @pytest.mark.parametrize("model_type", _MODEL_TYPES)
 @pytest.mark.parametrize("allow_graph_aux_hidden_states", [False, True])
-def test_non_v41_models_reproduce_the_mainline_decision(model_type: str, allow_graph_aux_hidden_states: bool) -> None:
+def test_non_v41_models_preserve_the_model_eager_policy(model_type: str, allow_graph_aux_hidden_states: bool) -> None:
     """Every non-v41 model ignores the aux gate entirely (glm5_next graph
     coexistence since #240 must not regress)."""
     if model_type in _V41_FAMILY:
         pytest.skip("covered by the v41-specific tests below")
     for layers_to_capture in (False, True):
-        for eager_draft_model in (False, True):
-            assert _requires_eager(
-                eager_draft_model=eager_draft_model,
-                layers_to_capture=layers_to_capture,
-                allow_graph_aux_hidden_states=allow_graph_aux_hidden_states,
-                model_type=model_type,
-            ) is _mainline_requires_eager(eager_draft_model=eager_draft_model)
+        for model_requires_eager in (False, True):
+            assert (
+                _requires_eager(
+                    model_requires_eager=model_requires_eager,
+                    layers_to_capture=layers_to_capture,
+                    allow_graph_aux_hidden_states=allow_graph_aux_hidden_states,
+                    model_type=model_type,
+                )
+                is model_requires_eager
+            )
 
 
 @pytest.mark.parametrize("model_type", sorted(_V41_FAMILY))
-@pytest.mark.parametrize("eager_draft_model", [False, True])
+@pytest.mark.parametrize("model_requires_eager", [False, True])
 @pytest.mark.parametrize("layers_to_capture", [False, True])
 def test_flag_off_pins_only_the_v41_family_capture_target_eager(
-    model_type: str, eager_draft_model: bool, layers_to_capture: bool
+    model_type: str, model_requires_eager: bool, layers_to_capture: bool
 ) -> None:
-    expected = eager_draft_model or layers_to_capture
+    expected = model_requires_eager or layers_to_capture
     assert (
         _requires_eager(
-            eager_draft_model=eager_draft_model,
+            model_requires_eager=model_requires_eager,
             layers_to_capture=layers_to_capture,
             allow_graph_aux_hidden_states=False,
             model_type=model_type,
@@ -126,15 +124,15 @@ def test_flag_off_pins_only_the_v41_family_capture_target_eager(
 
 
 @pytest.mark.parametrize("model_type", sorted(_V41_FAMILY))
-@pytest.mark.parametrize("eager_draft_model", [False, True])
+@pytest.mark.parametrize("model_requires_eager", [False, True])
 @pytest.mark.parametrize("layers_to_capture", [False, True])
 def test_flag_on_lets_the_v41_family_capture_target_use_the_graph(
-    model_type: str, eager_draft_model: bool, layers_to_capture: bool
+    model_type: str, model_requires_eager: bool, layers_to_capture: bool
 ) -> None:
-    expected = eager_draft_model
+    expected = model_requires_eager
     assert (
         _requires_eager(
-            eager_draft_model=eager_draft_model,
+            model_requires_eager=model_requires_eager,
             layers_to_capture=layers_to_capture,
             allow_graph_aux_hidden_states=True,
             model_type=model_type,
@@ -146,21 +144,28 @@ def test_flag_on_lets_the_v41_family_capture_target_use_the_graph(
 def test_flag_alone_never_forces_eager() -> None:
     for model_type in _MODEL_TYPES:
         assert not _requires_eager(
-            eager_draft_model=False,
+            model_requires_eager=False,
             layers_to_capture=False,
             allow_graph_aux_hidden_states=True,
             model_type=model_type,
         )
 
 
-def test_every_draft_stays_eager() -> None:
-    for model_type in ("DFlashDraftModel", "DSparkDraftModel", "deepseek_v41_dspark"):
-        assert _requires_eager(
-            eager_draft_model=True,
+@pytest.mark.parametrize("model_type", ["DFlashDraftModel", "DSparkDraftModel", "deepseek_v41_dspark"])
+@pytest.mark.parametrize("model_requires_eager", [False, True])
+@pytest.mark.parametrize("allow_graph_aux_hidden_states", [False, True])
+def test_drafts_without_capture_follow_the_model_eager_policy(
+    model_type: str, model_requires_eager: bool, allow_graph_aux_hidden_states: bool
+) -> None:
+    assert (
+        _requires_eager(
+            model_requires_eager=model_requires_eager,
             layers_to_capture=False,
-            allow_graph_aux_hidden_states=True,
+            allow_graph_aux_hidden_states=allow_graph_aux_hidden_states,
             model_type=model_type,
         )
+        is model_requires_eager
+    )
 
 
 # --------------------------------------------------------------------------
@@ -173,7 +178,7 @@ def test_py_causal_lm_scopes_the_aux_gate_to_the_v41_target() -> None:
 
     assert f"ExecutionConfig::get_instance().{_FLAG}()" in text
     expression = _extract_assignment(text, "bool requires_eager_execution =")
-    assert "eager_draft_model" in expression
+    assert "model_args_.requires_eager_execution()" in expression
     assert "!model_args_.layers_to_capture().empty()" in expression
     # The gate must AND the v41 family with the flag, never OR it: an OR
     # spills the eager pin onto every non-v41 capture target (the glm5_next
@@ -185,13 +190,16 @@ def test_py_causal_lm_scopes_the_aux_gate_to_the_v41_target() -> None:
     assert 'model_args_.model_type() == "deepseek_v41" &&' not in expression
 
 
-def test_py_causal_lm_keeps_the_draft_set_unchanged() -> None:
+def test_py_causal_lm_uses_the_model_eager_policy_instead_of_a_draft_type_list() -> None:
     text = _read(_PY_CAUSAL_LM)
-    draft_set = _extract_assignment(text, "const bool eager_draft_model =")
+    expression = _extract_assignment(text, "bool requires_eager_execution =")
 
-    assert "model_args_.model_type() == kDFlashDraftModelType" in draft_set
-    assert "model_args_.model_type() == kDSparkDraftModelType" in draft_set
-    assert "util::is_deepseek_v4_dspark_model_type(model_args_.model_type())" in draft_set
+    assert expression == (
+        "bool requires_eager_execution = model_args_.requires_eager_execution() || "
+        "(!model_args_.layers_to_capture().empty() && "
+        "util::is_deepseek_v41_family_model_type(model_args_.model_type()) && "
+        "!allow_graph_aux_hidden_states)"
+    )
 
 
 def test_py_causal_lm_bridges_the_flag_to_the_python_config() -> None:

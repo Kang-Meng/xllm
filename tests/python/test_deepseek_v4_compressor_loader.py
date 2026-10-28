@@ -115,16 +115,18 @@ def test_load_weights_routes_compressor_aliases_through_loader(
         "W8A8WeightLoader",
         lambda *_args, **_kwargs: loader,
     )
-    attention = SimpleNamespace(
-        indexer=object(),
-        cmp_wkv=object(),
-        process_weights_after_loading=lambda: None,
-    )
-    layer = SimpleNamespace(self_attn=attention, mlp=object())
+    attention = torch.nn.Module()
+    attention.indexer = torch.nn.Module()
+    attention.cmp_wkv = torch.nn.Module()
+    attention.process_weights_after_loading = lambda: None
+    layer = torch.nn.Module()
+    layer.self_attn = attention
+    layer.mlp = torch.nn.Module()
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     torch.nn.Module.__init__(model)
     model.cfg = SimpleNamespace(tp_size=1, tp_rank=0, n_layers=1, n_heads=1)
-    model.model = SimpleNamespace(layers=[layer])
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([layer])
 
     model.load_weights({}, tp_rank=0, tp_size=1)
 

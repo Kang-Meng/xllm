@@ -118,8 +118,14 @@ class Qwen3_5GdnMetadataBuilder:
             return None
         if int(config.get("cp_size", 1)) != 1:
             raise NotImplementedError("Qwen3.5 NPU GDN requires cp_size=1")
-        if int(config.get("num_speculative_tokens", 0)) != 0:
-            raise NotImplementedError("Qwen3.5 NPU GDN does not support speculative decoding")
+        num_speculative_tokens = int(config.get("num_speculative_tokens", 0))
+        if num_speculative_tokens != 0 and not (
+            MEGA_GDN_MTP_MIN_VERIFY_TOKENS <= num_speculative_tokens + 1 <= MEGA_GDN_MTP_MAX_VERIFY_TOKENS
+        ):
+            raise NotImplementedError(
+                f"Qwen3.5 MegaGdnMtpDecode supports {MEGA_GDN_MTP_MIN_VERIFY_TOKENS} "
+                f"to {MEGA_GDN_MTP_MAX_VERIFY_TOKENS} verify tokens"
+            )
 
         tp_size = int(config.get("tp_size", 1))
         if tp_size <= 0:

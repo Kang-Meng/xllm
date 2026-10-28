@@ -37,12 +37,13 @@ class PyModelBase(nn.Module):
     """Base class for causal LMs the C++ ``PyCausalLM`` bridge drives.
 
     Subclass contract:
-      * build ``self.model`` and ``self.lm_head``;
+      * build ``self.model`` as the runner's execution module;
+      * provide logits and shared-weight access, using ``self.lm_head`` by default;
       * implement ``load_weights()``.
     """
 
     model: nn.Module
-    lm_head: nn.Module
+    lm_head: nn.Module | None
 
     @staticmethod
     def resolve_dtype(dtype: object) -> torch.dtype:
@@ -56,9 +57,24 @@ class PyModelBase(nn.Module):
         return resolved
 
     def compute_logits(self, hidden: torch.Tensor, selected_idxes: torch.Tensor | None) -> torch.Tensor:
+        if self.lm_head is None:
+            raise RuntimeError("LM head must be loaded or shared before computing logits")
         if selected_idxes is not None and selected_idxes.numel() > 0:
             hidden = hidden.index_select(0, selected_idxes)
         return self.lm_head(hidden)
+
+    def get_lm_head(self) -> nn.Module | None:
+        return self.lm_head
+
+    def get_token_embedding(self) -> nn.Module | None:
+        return self.model.embed_tokens
+
+    def share_weights_from(self, source: PyModelBase) -> None:
+        """Borrow only missing vocabulary modules, preserving draft-owned weights."""
+        if self.lm_head is None:
+            self.lm_head = source.get_lm_head()
+        if self.model.embed_tokens is None:
+            self.model.embed_tokens = source.get_token_embedding()
 
     # -- weight loading -------------------------------------------------------
     def load_weights(

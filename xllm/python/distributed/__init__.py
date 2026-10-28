@@ -50,6 +50,7 @@ from xllm.python.distributed.collectives import (
     reduce_scatter,
     tp_all_gather,
     tp_all_reduce,
+    tp_group,
     tp_rank,
     world_topology,
 )
@@ -64,6 +65,7 @@ __all__ = [
     "engram_broadcast_object_list",
     "engram_all_gather_object",
     "engram_barrier",
+    "tp_group",
     "tp_rank",
     "cp_rank",
     "cp_world_size",

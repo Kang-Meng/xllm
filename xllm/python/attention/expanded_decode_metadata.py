@@ -15,9 +15,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
+
+if TYPE_CHECKING:
+    from xllm.python.attention.backend import AttentionMetadata
 
 
 class ExpandedDecodeMetadataLike(Protocol):
@@ -48,13 +51,18 @@ class ExpandedDecodeMetadata:
 
 
 def resolve_expanded_decode_metadata(
-    metadata: object,
+    metadata: AttentionMetadata,
     *,
     block_size: int = 0,
 ) -> ExpandedDecodeMetadata | None:
     expanded = getattr(metadata, "expanded_decode_metadata", None)
     if expanded is None or not bool(getattr(expanded, "enabled", True)):
-        return None
+        if not (
+            getattr(metadata, "is_dflash_proposal", False)
+            and getattr(metadata, "is_chunked_prefill", False)
+        ):
+            return None
+        expanded = _expand_draft_proposal(metadata)
 
     required = {
         "kv_seq_lens": expanded.kv_seq_lens,
@@ -88,6 +96,40 @@ def resolve_expanded_decode_metadata(
         ),
     )
     return resolved
+
+
+def _expand_draft_proposal(metadata: AttentionMetadata) -> ExpandedDecodeMetadata:
+    """Give every proposal query the full, shared block's KV visibility."""
+    block_table = metadata.block_table
+    kv_seq_lens = metadata.kv_seq_lens
+    slot_mapping = metadata.slot_mapping
+    if block_table is None or kv_seq_lens is None or slot_mapping is None:
+        raise RuntimeError("draft proposal requires block tables, KV lengths and slots")
+    if block_table.dim() != 2 or kv_seq_lens.dim() != 1 or slot_mapping.dim() != 1:
+        raise RuntimeError("draft proposal has invalid block, KV or slot dimensions")
+    num_sequences = block_table.shape[0]
+    if num_sequences == 0 or kv_seq_lens.numel() != num_sequences:
+        raise RuntimeError("draft proposal requires one KV length per sequence")
+    num_tokens = slot_mapping.numel()
+    if num_tokens == 0 or num_tokens % num_sequences:
+        raise RuntimeError("draft proposal requires complete, uniform query blocks")
+    query_width = num_tokens // num_sequences
+    host_values = getattr(metadata, "kv_seq_lens_host_values", None)
+    if host_values is not None and len(host_values) != num_sequences:
+        raise RuntimeError("draft proposal requires one host KV length per sequence")
+    return ExpandedDecodeMetadata(
+        kv_seq_lens=kv_seq_lens.repeat_interleave(query_width),
+        block_table=block_table.repeat_interleave(query_width, dim=0),
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        paged_attention_tiling_data=None,
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=(
+            [length for length in host_values for _ in range(query_width)]
+            if host_values is not None else None
+        ),
+    )
 
 
 def _validate_expanded_decode_metadata(

@@ -208,6 +208,54 @@ def _mock_process_groups(
     return base_store, tcp_store, init_world, new_group
 
 
+def test_tp_group_reuses_initialized_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, init_world, new_group = _mock_process_groups(monkeypatch, global_rank=2)
+
+    first = collectives.init_process_group("tp", "host", 1234, 0, 2, "cuda:2", 2, 4, 1)
+    second = collectives.init_process_group("tp", "host", 1234, 0, 2, "cuda:2", 2, 4, 1)
+
+    assert first is second
+    assert collectives.tp_group("cuda:2") is first
+    assert collectives._group_ranks[("tp", "cuda:2")] == (2, 3)
+    init_world.assert_called_once()
+    assert new_group.call_count == 2
+
+
+def test_tp_group_requires_initialized_group() -> None:
+    with pytest.raises(RuntimeError, match="TP group is not initialized"):
+        collectives.tp_group("cpu")
+
+
+@pytest.mark.parametrize("global_rank,root_rank", [(0, 0), (1, 0), (2, 2), (3, 2)])
+def test_tp_broadcast_stays_within_each_dp_replica(
+    monkeypatch: pytest.MonkeyPatch, global_rank: int, root_rank: int,
+) -> None:
+    _mock_process_groups(monkeypatch, global_rank=global_rank)
+    monkeypatch.setattr(collectives, "_backend_for", lambda device: "gloo")
+    group = collectives.init_tp_group(
+        "host", 1234, global_rank % 2, 2, "cpu", global_rank, 4, global_rank // 2,
+    )
+    native_op = MagicMock(side_effect=AssertionError("Broadcast must use the Python group"))
+    monkeypatch.setattr(collectives, "_native_runtime_op", native_op)
+    broadcast = MagicMock()
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+    tokens = torch.tensor([2, 3])
+
+    collectives.broadcast_(tokens, src=0, group_name="tp")
+
+    assert group.size() == 2
+    assert collectives._group_ranks[("tp", "cpu")] == (root_rank, root_rank + 1)
+    broadcast.assert_called_once_with(tokens, src=root_rank, group=group)
+    native_op.assert_not_called()
+
+
+def test_tp_group_does_not_reuse_dp_group() -> None:
+    collectives._groups[("dp", "cpu")] = _FakeGroup(rank=0, size=2)
+    collectives._group_ranks[("dp", "cpu")] = (0, 2)
+    with pytest.raises(RuntimeError, match="TP group is not initialized"):
+        collectives.tp_group("cpu")
+
+
 def _run_glm_ep1_tp_collective(global_rank: int, rendezvous_path: str) -> None:
     world_size = 4
     try:

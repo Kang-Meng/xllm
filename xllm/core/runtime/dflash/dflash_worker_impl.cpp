@@ -617,6 +617,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
           *draft_impl_, query_input, *prepare_stream_, *compute_stream_);
 
   ForwardInput validate_input = input;
+  validate_input.input_params.is_dflash_proposal = false;
+  validate_input.input_params.sampling.reset();
   // Idle decode joins the busy ranks' target validate. Mark the same spec
   // verify flag so every rank captures one expanded graph instead of a
   // separate width-1 graph on the dummy row.
@@ -1618,6 +1620,10 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
                                    std::move(buf.out_kv_seq_lens),
                                    /*update_block_tables=*/
                                    use_block_parallel_rows);
+  specBuilder::update_execution_batch_metadata(
+      input_params,
+      std::vector<int32_t>(static_cast<size_t>(num_sequences_query),
+                           query_width));
   scale_speculative_parallel_token_counts(input_params, query_width);
   input_params.attention.rebuild_device_buffer(device_);
 

@@ -71,6 +71,7 @@ _DSPARK_CONFIG = {
     "dspark_block_size": 5,
     "dspark_noise_token_id": 15,
     "dspark_markov_rank": 2,
+    "draft_query_width": 3,
     "tp_size": 1,
     "tp_rank": 0,
     "moe_tp_size": 1,
@@ -132,10 +133,29 @@ def test_dspark_config_builds_only_draft_layers() -> None:
     assert model.cfg.n_hash_layers == 0
     assert model.cfg.compress_ratios == [1, 1, 1]
     assert model.cfg.dspark_use_native_sas is False
-    assert len(model.model.layers) == 3
-    assert model.model.main_proj.in_features == 24
-    assert model.model.main_proj.out_features == 8
+    assert len(model.model.backbone.layers) == 3
+    assert model.model.backbone.main_proj.in_features == 24
+    assert model.model.backbone.main_proj.out_features == 8
 
+
+@pytest.mark.parametrize("query_width", [1, 3, 15])
+def test_pipeline_uses_runtime_query_width(query_width: int) -> None:
+    model = DeepseekV4DSparkForCausalLM(
+        {
+            **_DSPARK_CONFIG,
+            "draft_query_width": query_width,
+            "num_speculative_tokens": 16,
+        }
+    )
+
+    assert model.model._query_width == query_width
+
+def test_pipeline_requires_runtime_query_width() -> None:
+    config = {**_DSPARK_CONFIG, "num_speculative_tokens": 16}
+    del config["draft_query_width"]
+
+    with pytest.raises(KeyError, match="draft_query_width"):
+        DeepseekV4DSparkForCausalLM(config)
 
 def test_dspark_requires_draft_layers_and_markov_rank() -> None:
     with pytest.raises(ValueError, match="dspark_num_layers > 0"):
@@ -164,20 +184,20 @@ def test_dspark_confidence_head_is_biasless() -> None:
         }
     )
 
-    assert model.confidence_head is not None
-    assert model.confidence_head.proj.bias is None
-    assert model.confidence_head.proj.in_features == 10
+    assert model.model.confidence_head is not None
+    assert model.model.confidence_head.proj.bias is None
+    assert model.model.confidence_head.proj.in_features == 10
 
 
 def test_dspark_writes_projected_context_to_every_layer() -> None:
     model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
     layers = nn.ModuleList([_ContextLayer() for _ in range(3)])
-    model.model.layers = layers
-    model.model.main_norm = nn.Identity()
-    model.model.main_proj.resolve_quant(False)
+    model.model.backbone.layers = layers
+    model.model.backbone.main_norm = nn.Identity()
+    model.model.backbone.main_proj.resolve_quant(False)
     with torch.no_grad():
-        model.model.main_proj.weight.zero_()
-        model.model.main_proj.weight[:, :8].copy_(torch.eye(8))
+        model.model.backbone.main_proj.weight.zero_()
+        model.model.backbone.main_proj.weight[:, :8].copy_(torch.eye(8))
 
     target_hidden = torch.arange(48, dtype=torch.float32).view(2, 24)
     positions = torch.tensor([1, 3])
@@ -210,9 +230,9 @@ def test_dspark_writes_projected_context_to_every_layer() -> None:
 def test_dspark_stops_context_write_when_event_recording_fails() -> None:
     model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
     layers = nn.ModuleList([_ContextLayer() for _ in range(3)])
-    model.model.layers = layers
-    model.model.main_norm = nn.Identity()
-    model.model.main_proj.resolve_quant(False)
+    model.model.backbone.layers = layers
+    model.model.backbone.main_norm = nn.Identity()
+    model.model.backbone.main_proj.resolve_quant(False)
     kv_caches = [(None, None, None, None, None, torch.zeros(2, 4)) for _ in range(3)]
     synchronizer = _LayerSynchronizer(failed_layer=1)
 
@@ -266,21 +286,21 @@ def test_dspark_loads_dedicated_vocab_and_heads(monkeypatch: pytest.MonkeyPatch)
 
     model.load_weights([_StateDict(tensors)], tp_rank=0, tp_size=1)
 
-    torch.testing.assert_close(model.model.main_proj.weight, tensors["model.mtp.0.main_proj.weight"])
-    torch.testing.assert_close(model.model.main_norm.weight, tensors["model.mtp.0.main_norm.weight"])
-    torch.testing.assert_close(model.model.embed_tokens.weight, tensors["model.mtp.0.embed.weight"])
-    torch.testing.assert_close(model.model.norm.weight, tensors["model.mtp.2.norm.weight"])
-    torch.testing.assert_close(model.model.hc_head_fn, tensors["model.mtp.2.hc_head_fn"])
+    torch.testing.assert_close(model.model.backbone.main_proj.weight, tensors["model.mtp.0.main_proj.weight"])
+    torch.testing.assert_close(model.model.backbone.main_norm.weight, tensors["model.mtp.0.main_norm.weight"])
+    torch.testing.assert_close(model.model.backbone.embed_tokens.weight, tensors["model.mtp.0.embed.weight"])
+    torch.testing.assert_close(model.model.backbone.norm.weight, tensors["model.mtp.2.norm.weight"])
+    torch.testing.assert_close(model.model.backbone.hc_head_fn, tensors["model.mtp.2.hc_head_fn"])
     torch.testing.assert_close(
-        model.markov_head.markov_w1.weight,
+        model.model.markov_head.markov_w1.weight,
         tensors["model.mtp.2.markov_head.markov_w1.weight"],
     )
-    assert model.confidence_head is not None
+    assert model.model.confidence_head is not None
     torch.testing.assert_close(
-        model.confidence_head.proj.weight,
+        model.model.confidence_head.proj.weight,
         tensors["model.mtp.2.confidence_head.proj.weight"],
     )
-    torch.testing.assert_close(model.lm_head.weight, tensors["model.mtp.2.head.weight"])
+    torch.testing.assert_close(model.model.lm_head.weight, tensors["model.mtp.2.head.weight"])
 
 
 def test_dspark_loads_quantized_main_projection_and_head(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -315,22 +335,22 @@ def test_dspark_loads_quantized_main_projection_and_head(monkeypatch: pytest.Mon
 
     model.load_weights([_StateDict(tensors)], tp_rank=0, tp_size=1)
 
-    assert model.model.main_proj.use_w8a8 is True
-    assert model.model.main_proj.weight is None
-    assert model.model.main_proj._w8a8 is not None
+    assert model.model.backbone.main_proj.use_w8a8 is True
+    assert model.model.backbone.main_proj.weight is None
+    assert model.model.backbone.main_proj._w8a8 is not None
     torch.testing.assert_close(
-        model.model.main_proj._w8a8.weight,
+        model.model.backbone.main_proj._w8a8.weight,
         tensors["model.mtp.0.main_proj.weight"].transpose(0, 1),
     )
     torch.testing.assert_close(
-        model.model.main_proj._w8a8.weight_scale,
+        model.model.backbone.main_proj._w8a8.weight_scale,
         tensors["model.mtp.0.main_proj.weight_scale"].flatten(),
     )
-    assert model.lm_head.use_w8a8 is True
-    assert model.lm_head.weight is None
-    assert model.lm_head._w8a8 is not None
+    assert model.model.lm_head.use_w8a8 is True
+    assert model.model.lm_head.weight is None
+    assert model.model.lm_head._w8a8 is not None
     torch.testing.assert_close(
-        model.lm_head._w8a8.weight_scale,
+        model.model.lm_head._w8a8.weight_scale,
         tensors["model.mtp.2.head.weight_scale"].flatten(),
     )
 
@@ -352,7 +372,7 @@ def test_dspark_attention_loader_requires_weight_scale() -> None:
         model._load_dsv4_decoder_layer(
             loader,
             "mtp.0.",
-            "model.layers.0.",
+            "model.backbone.layers.0.",
             layer_id=0,
         )
 
@@ -362,7 +382,7 @@ def test_dspark_moe_loader_receives_explicit_checkpoint_prefix(
 ) -> None:
     model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
     loader = _StateDict({"mtp.0.ffn.experts.0.w1.weight": torch.ones(1)})
-    attention = model.model.layers[0].self_attn
+    attention = model.model.backbone.layers[0].self_attn
     calls: list[tuple[object, ...]] = []
 
     monkeypatch.setattr(
@@ -372,7 +392,7 @@ def test_dspark_moe_loader_receives_explicit_checkpoint_prefix(
     )
     monkeypatch.setattr(attention, "process_weights_after_loading", lambda: None)
     monkeypatch.setattr(
-        model.model.layers[0].mlp,
+        model.model.backbone.layers[0].mlp,
         "process_weights_after_loading",
         lambda: None,
     )
@@ -381,7 +401,7 @@ def test_dspark_moe_loader_receives_explicit_checkpoint_prefix(
     model._load_dsv4_decoder_layer(
         loader,
         "mtp.0.",
-        "model.layers.0.",
+        "model.backbone.layers.0.",
         layer_id=0,
     )
 
@@ -389,7 +409,7 @@ def test_dspark_moe_loader_receives_explicit_checkpoint_prefix(
         (
             loader,
             "mtp.0.",
-            "model.layers.0.",
+            "model.backbone.layers.0.",
             0,
             "mtp.0.ffn.",
         )
@@ -434,8 +454,8 @@ def test_dspark_loads_moe_from_mlp_checkpoint_prefix(
         tp_rank=0,
         src_prefixes=("", "model."),
     )
-    attention = model.model.layers[0].self_attn
-    mlp = model.model.layers[0].mlp
+    attention = model.model.backbone.layers[0].self_attn
+    mlp = model.model.backbone.layers[0].mlp
     monkeypatch.setattr(
         model,
         "_load_dsv4_attention",
@@ -447,7 +467,7 @@ def test_dspark_loads_moe_from_mlp_checkpoint_prefix(
     model._load_dsv4_decoder_layer(
         loader,
         "mtp.0.",
-        "model.layers.0.",
+        "model.backbone.layers.0.",
         layer_id=0,
     )
 

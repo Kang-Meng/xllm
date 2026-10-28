@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -29,16 +28,9 @@ from xllm.python.attention.backend import (
 from xllm.python.model_executor.execution_context import ExecutionMetadataBuilder
 from xllm.python.model_executor.forward_context import EplbRuntimeState, LayerSynchronizer
 from xllm.python.model_executor.input_batch import InputBatch
+from xllm.python.model_executor.model_output import DraftProposal, ModelOutput
 
-
-@dataclass(frozen=True)
-class DraftProposalOutput:
-    """An explicit proposal result whose rows are token IDs, not hidden states."""
-
-    token_ids: torch.Tensor
-
-
-ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor] | DraftProposalOutput
+ModelExecutionOutput = torch.Tensor | tuple[torch.Tensor, torch.Tensor] | ModelOutput
 
 
 class BaseRunner(ABC):
@@ -68,21 +60,46 @@ class BaseRunner(ABC):
     @staticmethod
     def _slice_output(
         output: ModelExecutionOutput,
-        batch_size: int,
+        num_tokens: int,
         *,
+        num_reqs: int | None = None,
         clone: bool = False,
     ) -> ModelExecutionOutput:
         """Trim graph padding, optionally copying outputs out of graph storage."""
 
-        def _trim(tensor: torch.Tensor) -> torch.Tensor:
-            tensor = tensor[:batch_size]
+        def _trim(tensor: torch.Tensor, count: int) -> torch.Tensor:
+            tensor = tensor[:count]
             return tensor.clone() if clone else tensor
 
-        if isinstance(output, DraftProposalOutput):
-            return DraftProposalOutput(_trim(output.token_ids))
         if isinstance(output, tuple):
-            return _trim(output[0]), _trim(output[1])
-        return _trim(output)
+            return _trim(output[0], num_tokens), _trim(output[1], num_tokens)
+        if isinstance(output, torch.Tensor):
+            return _trim(output, num_tokens)
+        if not isinstance(output, ModelOutput):
+            raise TypeError("Graph output must be a Tensor, a tuple of Tensors, or ModelOutput")
+
+        def _trim_optional(tensor: torch.Tensor | None, count: int) -> torch.Tensor | None:
+            return _trim(tensor, count) if tensor is not None else None
+
+        proposal = None
+        confidence = None
+        if output.draft_proposal is not None or output.draft_confidence_probs is not None:
+            if num_reqs is None:
+                raise ValueError("Pipeline output with request-scoped fields requires num_reqs")
+            if output.draft_proposal is not None:
+                proposal = DraftProposal(
+                    token_ids=_trim(output.draft_proposal.token_ids, num_reqs),
+                    draft_probs=_trim_optional(output.draft_proposal.draft_probs, num_reqs),
+                )
+            confidence = _trim_optional(output.draft_confidence_probs, num_reqs)
+
+        return ModelOutput(
+            draft_proposal=proposal,
+            draft_confidence_probs=confidence,
+            hidden_states=_trim_optional(output.hidden_states, num_tokens),
+            residual=_trim_optional(output.residual, num_tokens),
+            aux_hidden_states=_trim_optional(output.aux_hidden_states, num_tokens),
+        )
 
     @abstractmethod
     def execute(

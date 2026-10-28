@@ -43,16 +43,14 @@ LLMRequestFactory::LLMRequestFactory(const Tokenizer* tokenizer,
                                      const Options* options,
                                      RateLimiter* rate_limiter,
                                      std::string task_type,
-                                     RpcResponseHandler rpc_response_handler,
-                                     RequestValidator request_validator)
+                                     RpcResponseHandler rpc_response_handler)
     : tokenizer_(tokenizer),
       chat_template_(chat_template),
       model_args_(model_args),
       options_(options),
       rate_limiter_(rate_limiter),
       task_type_(std::move(task_type)),
-      rpc_response_handler_(std::move(rpc_response_handler)),
-      request_validator_(std::move(request_validator)) {
+      rpc_response_handler_(std::move(rpc_response_handler)) {
   CHECK(tokenizer_ != nullptr);
   CHECK(chat_template_ != nullptr);
   CHECK(model_args_ != nullptr);
@@ -279,17 +277,6 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   // early return below; we dismiss it right before Request takes ownership.
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
-
-  if (request_validator_) {
-    const std::optional<std::string> error = request_validator_(sp);
-    if (error.has_value()) {
-      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          error.value(),
-                          sp.service_request_id,
-                          sp.source_xservice_addr);
-      return nullptr;
-    }
-  }
 
   const int32_t max_context_len = model_args_->max_position_embeddings();
 

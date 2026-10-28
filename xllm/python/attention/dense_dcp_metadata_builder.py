@@ -143,6 +143,8 @@ class DenseDcpMetadataBuilder:
             if not is_prefill and any(length != 1 for length in query_lengths):
                 raise NotImplementedError("Dense DCP decode requires one query token per request")
             if metadata.is_prefill and not metadata.is_chunked_prefill:
+                if len(input_batch.num_computed_tokens) != input_batch.num_reqs:
+                    raise RuntimeError("Dense DCP prefill requires host cached-token counts")
                 if any(input_batch.num_computed_tokens):
                     raise RuntimeError("Dense DCP prefill with cached context requires chunked-prefill metadata")
                 # Pure prefill attends directly to this step's K/V, not the sharded cache.

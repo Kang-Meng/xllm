@@ -149,7 +149,10 @@ void configure_deepseek_v4_dspark_args(ModelArgs& args,
   args.engram_num_embeddings({});
 
   args.dspark_use_native_sas(
-      KernelConfig::get_instance().enable_dspark_native_sas());
+      KernelConfig::get_instance().enable_dspark_native_sas() &&
+      !python_v41_draft);
+  args.draft_query_uses_decode(args.dspark_use_native_sas() ||
+                               python_v41_draft);
   args.enable_confidence_head(options.enable_adaptive_speculative_decode());
   args.confidence_head_with_markov(true);
 }
@@ -312,6 +315,10 @@ void configure_block_diffusion_model(ModelArgs& args,
   const bool python_model_impl = ModelConfig::is_python_model_impl(
       ModelConfig::get_instance().model_impl());
   const bool python_v41_draft = python_model_impl && is_deepseek_v41_dspark;
+  const bool is_python_qwen3_dspark =
+      is_dspark && args.model_type() == "qwen3" && Platform::is_npu() &&
+      ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl());
   std::string draft_model_type = std::string(kDFlashDraftModelType);
   if (is_dspark) {
     draft_model_type = std::string(kDSparkDraftModelType);
@@ -336,7 +343,14 @@ void configure_block_diffusion_model(ModelArgs& args,
             << " for block-diffusion speculative decoding";
   args.layers_to_capture({});
   args.model_type(draft_model_type);
-  args.requires_eager_execution(!is_deepseek_v4_dspark);
+  args.draft_query_uses_decode(false);
+  args.requires_eager_execution(!is_deepseek_v4_dspark &&
+                                !is_python_qwen3_dspark);
+  if (is_dspark && ModelConfig::is_python_model_impl(
+                       ModelConfig::get_instance().model_impl())) {
+    args.dummy_token_count(
+        std::max<int32_t>(1, options.num_speculative_tokens()));
+  }
 #if defined(USE_NPU)
   if (is_deepseek_v4_dspark) {
     configure_deepseek_v4_dspark_args(args, options, python_v41_draft);

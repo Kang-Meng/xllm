@@ -40,7 +40,7 @@ cc_test(
   DEPS
     :util
     :platform
-    $<$<BOOL:${USE_NPU}>:config>
+    :config
     torch
     glog::glog
     GTest::gtest_main
@@ -69,6 +69,18 @@ cc_test(
 )
 
 if(USE_NPU)
+  cc_test(
+    NAME llm_worker_output_test
+    SRCS llm_worker_output_test.cpp
+    DEPS :runtime :models :batch :block :platform GTest::gtest_main
+  )
+  target_link_libraries(llm_worker_output_test PRIVATE
+    torch_npu torch_python Python::Python ascendcl hccl c_sec nnopbase)
+  target_link_options(llm_worker_output_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
   cc_test(
     NAME dspark_decode_step_test
     SRCS dspark_decode_step_test.cpp

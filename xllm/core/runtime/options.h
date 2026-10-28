@@ -95,8 +95,6 @@ struct Options {
 
   PROPERTY(bool, enable_dspark_prelaunch) = false;
 
-  PROPERTY(bool, enable_dspark_draft_graph) = false;
-
   PROPERTY(bool, enable_adaptive_speculative_decode) = false;
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;

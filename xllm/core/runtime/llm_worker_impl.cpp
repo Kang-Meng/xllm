@@ -304,15 +304,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   if (eplb_executor_ != nullptr) {
     eplb_executor_->finish_eplb_step();
   }
-  const bool has_draft_proposal =
-      model_output.draft_proposal_token_ids.defined();
-  if (has_draft_proposal) {
-    CHECK(options_.is_draft_engine() || is_spec_draft_)
-        << "Only draft workers may publish proposals";
-    CHECK(!model_output.hidden_states.defined())
-        << "Model output cannot contain both hidden states and proposals";
-  }
-  if (!model_output.hidden_states.defined() && !has_draft_proposal) {
+  if (!model_output.hidden_states.defined() &&
+      !model_output.draft_proposal.has_value()) {
     wait_kv_push();
     if (!failed_request_ids.empty()) {
       return make_failed_output(std::move(failed_request_ids));
@@ -320,192 +313,198 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     return std::nullopt;
   }
 
-  torch::Tensor logits;
-  torch::Tensor lm_head_selected_token_idxes;
-  torch::Tensor selected_hidden;
-  if (sampling_params.selected_token_idxes.defined() && !has_draft_proposal) {
-    torch::Tensor selected_token_idxes = choose_lm_head_selected_token_idxes(
-        sampling_params.selected_token_idxes,
-        input.input_params,
-        context_.get_parallel_args(),
-        model_output.hidden_states.size(0),
-        model_output.hidden_states.device());
-    if (model_output.hidden_states.defined() &&
-        selected_token_idxes.device() != model_output.hidden_states.device()) {
-      selected_token_idxes = selected_token_idxes
-                                 .to(model_output.hidden_states.device(),
-                                     /*non_blocking=*/false)
-                                 .contiguous();
-    }
-    lm_head_selected_token_idxes = selected_token_idxes;
-    const bool need_selected_hidden =
-        input.return_selected_hidden ||
-        (options_.cp_size() > 1 && options_.enable_speculative_decode() &&
-         !model_output.aux_hidden_states.defined());
-    if (need_selected_hidden) {
-      // Emit both selected hidden and logits from a single lm_head pass so the
-      // ConfidenceHead and CP speculative paths can consume hidden without a
-      // second projection.
-      logits = model_->logits(
-          model_output.hidden_states, selected_token_idxes, selected_hidden);
-      if (!selected_hidden.defined() && model_output.hidden_states.defined()) {
-        // ATB lm_head backend does not expose a second output tensor
-        // (LmHeadParam::outputHidden is false), so we surface the hidden here.
-        // selected_hidden must align row-for-row with `logits`, which is
-        // produced in selected_token_idxes order. index_select reproduces that
-        // order for any selection. We deliberately do NOT alias the full
-        // hidden_states on a numel match: equal row count does not imply the
-        // idxes are the identity permutation, and a full-but-reordered
-        // selection would silently misalign hidden against logits. The gather
-        // is one [num_selected, hidden] copy per decode step (not per layer),
-        // negligible next to the forward.
-        selected_hidden = model_output.hidden_states.index_select(
-            /*dim=*/0, selected_token_idxes.to(torch::kLong));
-      }
-    } else {
-      logits = model_->logits(model_output.hidden_states, selected_token_idxes);
-    }
-  }
-
   ForwardOutput output;
-  if (has_draft_proposal) {
-    output.draft_proposal_token_ids =
-        std::move(model_output.draft_proposal_token_ids);
-  }
   output.mtp_topk_state = std::move(model_output.mtp_topk_state);
   if (eplb_executor_ != nullptr) {
     output.expert_load_data = expert_load_data_;
     output.prepared_token = eplb_executor_->consume_ready_prepare_token();
   }
 
-  if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
-      !options_.enable_speculative_decode()) {
-    MULTI_MODEL_STEP_UNLOCK();
-    if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-      wait_kv_push();
-      return make_non_driver_forward_output(ForwardOutput{},
-                                            std::move(failed_request_ids),
-                                            /*eplb_enabled=*/false);
-    }
-    int ret = device_.synchronize_default_stream();
-    CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
-    wait_kv_push();
-    return make_non_driver_forward_output(std::move(output),
-                                          std::move(failed_request_ids),
-                                          eplb_executor_ != nullptr);
-  }
-
-  // driver prepare model output
-  // Completed proposals do not require another projection or sampling pass.
-  if (sampling_params.selected_token_idxes.defined() && !has_draft_proposal) {
-    output.selected_hidden = selected_hidden;
-    output.do_sample = sampling_params.do_sample;
-    output.logprobs = sampling_params.logprobs;
-    output.max_top_logprobs = sampling_params.max_top_logprobs;
-    if (!input.skip_sampling_for_logits_only) {
-      auto sample_output = sampler_->forward(logits, sampling_params);
-      // Stochastic sampling under schedule overlap needs a CP-wide
-      // consensus: the overlapped decode replacement
-      // (update_input_by_last_step_output) resolves every rank's negative
-      // placeholders against its own rank-local sample, so all ranks of the
-      // plane must derive the same tokens. Greedy argmax over the
-      // CP-replicated logits is deterministic, but random_sample draws from
-      // the per-process default RNG, which is only seeded identically at
-      // init -- nothing keeps the generators in lockstep afterwards -- so
-      // unify stochastic batches with a root-0 broadcast, mirroring
-      // enable_spec_token_broadcast and DFlash2's noise consensus. The
-      // composition lands on the cohort's dp_driver, the worker whose
-      // output the engine collects. Requiring overlap is what makes the
-      // collective safe: without it only driver ranks sample.
-      //
-      // The tp axis runs where the backend publishes a tp group; the NPU ATB
-      // path builds only the cp group when cp_size > 1 (tp_group_ stays
-      // nullptr), so there the cp-axis broadcast is the operative consensus.
-      // What must never happen is entering this block with no usable group
-      // at all -- that would silently skip every axis -- so fail loudly
-      // instead of degrading. (Deliberately NOT the peers' tp && cp
-      // conjunction from mtp_worker_impl/dflash_worker_impl: under ATB both
-      // process_group_ and tp_group_ are nullptr, and that branch would
-      // broadcast on a null sampling group, skipping the cp axis too.)
-      if (enable_schedule_overlap() && options_.cp_size() > 1 &&
-          !options_.enable_speculative_decode() &&
-          !sampling_params.all_greedy_sample) {
-        CHECK(parallel_args_.tp_group_ != nullptr ||
-              parallel_args_.cp_group_ != nullptr)
-            << "cp_size=" << options_.cp_size()
-            << " but no tp/cp broadcast group is available for the "
-               "schedule-overlap token consensus";
-        speculative_worker::broadcast_tokens_in_group(sample_output.next_tokens,
-                                                      parallel_args_.tp_group_);
-        // Only broadcast the CP axis when it is a genuinely orthogonal
-        // group: backends that publish a single process group alias
-        // cp_group_ to tp_group_, and a second broadcast over the same
-        // group would be a redundant collective per decode step. Mirrors
-        // broadcast_spec_tokens' guard in mtp_worker_impl.
-        if (parallel_args_.cp_group_ != parallel_args_.tp_group_) {
-          speculative_worker::broadcast_tokens_in_group(
-              sample_output.next_tokens, parallel_args_.cp_group_);
+  if (model_output.draft_proposal.has_value()) {
+    output.draft_proposal = std::move(model_output.draft_proposal);
+    output.draft_confidence_probs =
+        std::move(model_output.draft_confidence_probs);
+  } else {
+    torch::Tensor logits;
+    torch::Tensor lm_head_selected_token_idxes;
+    torch::Tensor selected_hidden;
+    if (sampling_params.selected_token_idxes.defined()) {
+      torch::Tensor selected_token_idxes = choose_lm_head_selected_token_idxes(
+          sampling_params.selected_token_idxes,
+          input.input_params,
+          context_.get_parallel_args(),
+          model_output.hidden_states.size(0),
+          model_output.hidden_states.device());
+      if (model_output.hidden_states.defined() &&
+          selected_token_idxes.device() !=
+              model_output.hidden_states.device()) {
+        selected_token_idxes = selected_token_idxes
+                                   .to(model_output.hidden_states.device(),
+                                       /*non_blocking=*/false)
+                                   .contiguous();
+      }
+      lm_head_selected_token_idxes = selected_token_idxes;
+      const bool need_selected_hidden =
+          input.return_selected_hidden ||
+          (options_.cp_size() > 1 && options_.enable_speculative_decode() &&
+           !model_output.aux_hidden_states.defined());
+      if (need_selected_hidden) {
+        // Emit both selected hidden and logits from a single lm_head pass so
+        // the ConfidenceHead and CP speculative paths can consume hidden
+        // without a second projection.
+        logits = model_->logits(
+            model_output.hidden_states, selected_token_idxes, selected_hidden);
+        if (!selected_hidden.defined() &&
+            model_output.hidden_states.defined()) {
+          // ATB lm_head backend does not expose a second output tensor
+          // (LmHeadParam::outputHidden is false), so we surface the hidden
+          // here. selected_hidden must align row-for-row with `logits`, which
+          // is produced in selected_token_idxes order. index_select reproduces
+          // that order for any selection. We deliberately do NOT alias the full
+          // hidden_states on a numel match: equal row count does not imply the
+          // idxes are the identity permutation, and a full-but-reordered
+          // selection would silently misalign hidden against logits. The gather
+          // is one [num_selected, hidden] copy per decode step (not per layer),
+          // negligible next to the forward.
+          selected_hidden = model_output.hidden_states.index_select(
+              /*dim=*/0, selected_token_idxes.to(torch::kLong));
         }
-      }
-      output.filter_bitmask_applied_to_logits =
-          sampling_params.filter_bitmask.defined();
-      output.filter_mask_applied_to_logits =
-          !sampling_params.filter_bitmask.defined() &&
-          sampling_params.filter_mask.defined();
-
-      // beam search kernel
-      BeamSearchOutput beam_search_output;
-      if (sampling_params.use_beam_search &&
-          sampling_params.acc_logprob.defined() &&
-          sampling_params.acc_logprob.numel() > 0) {
-        beam_search_output =
-            beam_searcher_->forward(sampling_params.acc_logprob,
-                                    sample_output.top_tokens,
-                                    sample_output.top_logprobs);
-      }
-
-      // set sample output to output
-      output.sample_output = sample_output;
-      // set beam search output to output
-      output.beam_search_output = beam_search_output;
-    }
-    output.logits = logits;
-  }
-
-  if (options_.enable_speculative_decode() && !has_draft_proposal) {
-    torch::Tensor embeddings;
-    if (model_output.aux_hidden_states.defined()) {
-      embeddings = model_output.aux_hidden_states;
-    } else {
-      embeddings = model_output.hidden_states;
-    }
-    if (!input.input_params.meta.batch_forward_type.is_decode() &&
-        !is_spec_draft_) {
-      // Target prefill: keep full embeddings (global-real under model-side CP).
-      output.sample_output.embeddings = embeddings;
-    } else if (sampling_params.selected_token_idxes.defined()) {
-      if (options_.cp_size() > 1 && !model_output.aux_hidden_states.defined()) {
-        // CP speculative decode without aux capture (e.g. the MTP draft,
-        // which feeds these embeddings back as its input_embedding): reuse
-        // the lm_head's selected hidden rows.
-        CHECK(selected_hidden.defined())
-            << "selected_hidden must be defined when "
-               "selected_token_idxes is defined.";
-        output.sample_output.embeddings = selected_hidden;
       } else {
-        // Aux-hidden-capture algorithms (DFlash/DFlash2/Eagle3/DSpark)
-        // consume the captured columns from the aux embeddings, so select
-        // their rows from that tensor. selected_hidden is not the fallback
-        // here: need_selected_hidden above excludes the aux path (its CP
-        // branch requires !aux_hidden_states.defined()), so unless a caller
-        // separately requested return_selected_hidden the lm_head pass
-        // never produced it -- and even then it would carry the hidden rows
-        // only, without the captured aux columns the draft consumes. Under
-        // CP the decode batch runs without a cp_context (EagerRunner only
-        // builds one for prefill batches), so the rows are already
-        // global-ordered and the selection matches the non-CP path.
-        output.sample_output.embeddings = embeddings.index_select(
-            /*dim=*/0, lm_head_selected_token_idxes);
+        logits =
+            model_->logits(model_output.hidden_states, selected_token_idxes);
+      }
+    }
+
+    if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
+        !options_.enable_speculative_decode()) {
+      MULTI_MODEL_STEP_UNLOCK();
+      if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+        wait_kv_push();
+        return make_non_driver_forward_output(ForwardOutput{},
+                                              std::move(failed_request_ids),
+                                              /*eplb_enabled=*/false);
+      }
+      int ret = device_.synchronize_default_stream();
+      CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
+      wait_kv_push();
+      return make_non_driver_forward_output(std::move(output),
+                                            std::move(failed_request_ids),
+                                            eplb_executor_ != nullptr);
+    }
+
+    // driver prepare model output
+    if (sampling_params.selected_token_idxes.defined()) {
+      output.selected_hidden = selected_hidden;
+      output.do_sample = sampling_params.do_sample;
+      output.logprobs = sampling_params.logprobs;
+      output.max_top_logprobs = sampling_params.max_top_logprobs;
+      if (!input.skip_sampling_for_logits_only) {
+        auto sample_output = sampler_->forward(logits, sampling_params);
+        // Stochastic sampling under schedule overlap needs a CP-wide
+        // consensus: the overlapped decode replacement
+        // (update_input_by_last_step_output) resolves every rank's negative
+        // placeholders against its own rank-local sample, so all ranks of the
+        // plane must derive the same tokens. Greedy argmax over the
+        // CP-replicated logits is deterministic, but random_sample draws from
+        // the per-process default RNG, which is only seeded identically at
+        // init -- nothing keeps the generators in lockstep afterwards -- so
+        // unify stochastic batches with a root-0 broadcast, mirroring
+        // enable_spec_token_broadcast and DFlash2's noise consensus. The
+        // composition lands on the cohort's dp_driver, the worker whose
+        // output the engine collects. Requiring overlap is what makes the
+        // collective safe: without it only driver ranks sample.
+        //
+        // The tp axis runs where the backend publishes a tp group; the NPU ATB
+        // path builds only the cp group when cp_size > 1 (tp_group_ stays
+        // nullptr), so there the cp-axis broadcast is the operative consensus.
+        // What must never happen is entering this block with no usable group
+        // at all -- that would silently skip every axis -- so fail loudly
+        // instead of degrading. (Deliberately NOT the peers' tp && cp
+        // conjunction from mtp_worker_impl/dflash_worker_impl: under ATB both
+        // process_group_ and tp_group_ are nullptr, and that branch would
+        // broadcast on a null sampling group, skipping the cp axis too.)
+        if (enable_schedule_overlap() && options_.cp_size() > 1 &&
+            !options_.enable_speculative_decode() &&
+            !sampling_params.all_greedy_sample) {
+          CHECK(parallel_args_.tp_group_ != nullptr ||
+                parallel_args_.cp_group_ != nullptr)
+              << "cp_size=" << options_.cp_size()
+              << " but no tp/cp broadcast group is available for the "
+                 "schedule-overlap token consensus";
+          speculative_worker::broadcast_tokens_in_group(
+              sample_output.next_tokens, parallel_args_.tp_group_);
+          // Only broadcast the CP axis when it is a genuinely orthogonal
+          // group: backends that publish a single process group alias
+          // cp_group_ to tp_group_, and a second broadcast over the same
+          // group would be a redundant collective per decode step. Mirrors
+          // broadcast_spec_tokens' guard in mtp_worker_impl.
+          if (parallel_args_.cp_group_ != parallel_args_.tp_group_) {
+            speculative_worker::broadcast_tokens_in_group(
+                sample_output.next_tokens, parallel_args_.cp_group_);
+          }
+        }
+        output.filter_bitmask_applied_to_logits =
+            sampling_params.filter_bitmask.defined();
+        output.filter_mask_applied_to_logits =
+            !sampling_params.filter_bitmask.defined() &&
+            sampling_params.filter_mask.defined();
+
+        // beam search kernel
+        BeamSearchOutput beam_search_output;
+        if (sampling_params.use_beam_search &&
+            sampling_params.acc_logprob.defined() &&
+            sampling_params.acc_logprob.numel() > 0) {
+          beam_search_output =
+              beam_searcher_->forward(sampling_params.acc_logprob,
+                                      sample_output.top_tokens,
+                                      sample_output.top_logprobs);
+        }
+
+        // set sample output to output
+        output.sample_output = sample_output;
+        // set beam search output to output
+        output.beam_search_output = beam_search_output;
+      }
+      output.logits = logits;
+    }
+
+    if (options_.enable_speculative_decode()) {
+      torch::Tensor embeddings;
+      if (model_output.aux_hidden_states.defined()) {
+        embeddings = model_output.aux_hidden_states;
+      } else {
+        embeddings = model_output.hidden_states;
+      }
+      if (!input.input_params.meta.batch_forward_type.is_decode() &&
+          !is_spec_draft_) {
+        // Target prefill: keep full embeddings (global-real under model-side
+        // CP).
+        output.sample_output.embeddings = embeddings;
+      } else if (sampling_params.selected_token_idxes.defined()) {
+        if (options_.cp_size() > 1 &&
+            !model_output.aux_hidden_states.defined()) {
+          // CP speculative decode without aux capture (e.g. the MTP draft,
+          // which feeds these embeddings back as its input_embedding): reuse
+          // the lm_head's selected hidden rows.
+          CHECK(selected_hidden.defined())
+              << "selected_hidden must be defined when "
+                 "selected_token_idxes is defined.";
+          output.sample_output.embeddings = selected_hidden;
+        } else {
+          // Aux-hidden-capture algorithms (DFlash/DFlash2/Eagle3/DSpark)
+          // consume the captured columns from the aux embeddings, so select
+          // their rows from that tensor. selected_hidden is not the fallback
+          // here: need_selected_hidden above excludes the aux path (its CP
+          // branch requires !aux_hidden_states.defined()), so unless a caller
+          // separately requested return_selected_hidden the lm_head pass
+          // never produced it -- and even then it would carry the hidden rows
+          // only, without the captured aux columns the draft consumes. Under
+          // CP the decode batch runs without a cp_context (EagerRunner only
+          // builds one for prefill batches), so the rows are already
+          // global-ordered and the selection matches the non-CP path.
+          output.sample_output.embeddings = embeddings.index_select(
+              /*dim=*/0, lm_head_selected_token_idxes);
+        }
       }
     }
   }

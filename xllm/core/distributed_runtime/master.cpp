@@ -889,7 +889,6 @@ Master::Master(const Options& options, EngineType type)
         .speculative_suffix_use_tree_spec(
             options_.speculative_suffix_use_tree_spec())
         .enable_dspark_prelaunch(options_.enable_dspark_prelaunch())
-        .enable_dspark_draft_graph(options_.enable_dspark_draft_graph())
         .enable_adaptive_speculative_decode(
             options_.enable_adaptive_speculative_decode())
         .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())

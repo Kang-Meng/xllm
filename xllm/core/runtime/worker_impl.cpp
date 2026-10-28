@@ -96,7 +96,6 @@ limitations under the License.
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
 #include "layers/common/kv_shard_batch_metadata.h"
-#include "models/llm/deepseek_v41_dspark_graph_policy.h"
 #include "models/model_registry.h"
 #include "models/py_model_helper.h"
 #include "runtime/forward_params.h"
@@ -353,18 +352,42 @@ void disable_layerwise_split_for_draft(ParallelArgs* parallel_args) {
 void apply_idle_block_dummy_input(ModelInputParams& input_params,
                                   int32_t dummy_token_count,
                                   const torch::Device& device) {
-  input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
-  input_params.meta.q_max_seq_len = dummy_token_count;
-  input_params.meta.kv_max_seq_len = dummy_token_count;
+  const bool decode_rows = input_params.is_dflash_proposal &&
+                           input_params.meta.batch_forward_type.is_decode();
+  const int32_t row_count = decode_rows ? dummy_token_count : 1;
+  const int32_t query_len = decode_rows ? 1 : dummy_token_count;
+  if (!decode_rows) {
+    input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  }
+  input_params.meta.q_max_seq_len = query_len;
+  input_params.meta.kv_max_seq_len = query_len;
   input_params.embedding.input_embedding = torch::Tensor();
   input_params.attn_metadata.reset();
   input_params.attention = AttentionInput();
-  input_params.attention.host.q_seq_lens = {dummy_token_count};
-  input_params.attention.host.q_cu_seq_lens = {0, dummy_token_count};
-  input_params.attention.host.kv_seq_lens = {dummy_token_count};
-  input_params.attention.host.kv_cache_tokens_nums = {0};
+  input_params.attention.host.q_seq_lens.assign(row_count, query_len);
+  input_params.attention.host.q_cu_seq_lens.resize(row_count + 1);
+  for (int32_t row = 0; row <= row_count; ++row) {
+    input_params.attention.host.q_cu_seq_lens[row] = row * query_len;
+  }
+  input_params.attention.host.kv_seq_lens.assign(row_count, query_len);
+  input_params.attention.host.kv_cache_tokens_nums.assign(row_count, 0);
   input_params.attention.host.new_cache_slots.assign(dummy_token_count,
                                                      /*value=*/-1);
+  if (input_params.is_dflash_proposal) {
+    const auto options = torch::TensorOptions().dtype(torch::kInt32);
+    input_params.attention.host.block_tables =
+        torch::zeros({row_count, query_len}, options);
+    if (decode_rows) {
+      input_params.embedding.linear_state_indices =
+          input_params.embedding.linear_state_indices.expand({row_count});
+      input_params.attention.device.paged_kv_indptr =
+          torch::arange(row_count + 1, options);
+      input_params.attention.device.paged_kv_indices =
+          torch::zeros({row_count}, options);
+      input_params.attention.device.paged_kv_last_page_len =
+          torch::ones({row_count}, options);
+    }
+  }
   input_params.attention.rebuild_device_buffer(device);
 }
 
@@ -2247,13 +2270,6 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   speculative_runtime_config.is_draft_engine = options_.is_draft_engine();
   speculative_runtime_config.adaptive_enabled =
       options_.enable_adaptive_speculative_decode();
-  speculative_runtime_config.draft_graph_enabled =
-      deepseek_v41::resolve_model_draft_graph(
-          options_,
-          args.model_type(),
-          ModelConfig::get_instance().model_impl(),
-          Platform::is_npu(),
-          parallel_args_.cp_size());
   speculative_runtime_config.draft_query_width =
       std::max<int32_t>(1, options_.draft_graph_query_width());
   speculative_runtime_config.dflash_xfia_enabled =

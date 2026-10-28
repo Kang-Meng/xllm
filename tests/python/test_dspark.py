@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch import nn
+
+from xllm.python.models.base import PyModelBase
 
 from xllm.python.models.dspark import (
     DSparkConfidenceHead,
@@ -26,6 +29,9 @@ from xllm.python.models.dspark import (
 
 def _model(*, enable_confidence_head: bool = True) -> DSparkForCausalLMBase:
     return DSparkForCausalLMBase(
+        backbone=nn.Identity(),
+        lm_head=None,
+        query_width=2,
         vocab_size=4,
         draft_vocab_size=4,
         markov_rank=2,
@@ -81,12 +87,12 @@ def test_confidence_head_supports_batched_markov_features() -> None:
     torch.testing.assert_close(output, expected)
 
 
-def test_base_preserves_dspark_checkpoint_names() -> None:
+def test_pipeline_owns_dspark_head_parameters() -> None:
     assert set(_model().state_dict()) == {
-        "markov_head.markov_w1.weight",
-        "markov_head.markov_w2.weight",
-        "confidence_head.proj.weight",
-        "confidence_head.proj.bias",
+        "model.markov_head.markov_w1.weight",
+        "model.markov_head.markov_w2.weight",
+        "model.confidence_head.proj.weight",
+        "model.confidence_head.proj.bias",
     }
 
 
@@ -97,9 +103,9 @@ def test_base_forwards_confidence_for_batched_hidden() -> None:
 
     output = model.dspark_confidence_probs(hidden, prev_matrix)
 
-    confidence_head = model.confidence_head
+    confidence_head = model.model.confidence_head
     assert confidence_head is not None
-    expected = confidence_head(hidden, model.markov_head.embed(prev_matrix))
+    expected = confidence_head(hidden, model.model.markov_head.embed(prev_matrix))
     torch.testing.assert_close(output, expected)
     assert model.has_dspark_confidence_head()
 
@@ -110,3 +116,42 @@ def test_base_rejects_confidence_without_head() -> None:
     with pytest.raises(RuntimeError, match="not enabled"):
         model.dspark_confidence_probs(torch.ones(1, 1, 3), torch.tensor([[0]]))
     assert not model.has_dspark_confidence_head()
+
+
+@pytest.mark.parametrize("own_head", [False, True])
+@pytest.mark.parametrize("own_embedding", [False, True])
+def test_shared_weights_bind_to_pipeline_components(own_head: bool, own_embedding: bool) -> None:
+    draft = _model()
+    execution_model = draft.model
+    own_lm_head = nn.Linear(3, 4, bias=False) if own_head else None
+    own_token_embedding = nn.Embedding(4, 3) if own_embedding else None
+    execution_model.lm_head = own_lm_head
+    execution_model.backbone.embed_tokens = own_token_embedding
+
+    source = PyModelBase()
+    source.model = nn.Module()
+    source.model.embed_tokens = nn.Embedding(4, 3)
+    source.lm_head = nn.Linear(3, 4, bias=False)
+    draft.share_weights_from(source)
+
+    assert draft.model is execution_model
+    assert draft.get_lm_head() is (own_lm_head if own_head else source.lm_head)
+    assert draft.get_token_embedding() is (own_token_embedding if own_embedding else source.model.embed_tokens)
+    hidden = torch.ones(2, 3)
+    torch.testing.assert_close(draft.compute_logits(hidden, None), execution_model.lm_head(hidden))
+
+
+def test_plain_model_weight_sharing_keeps_existing_layout() -> None:
+    source = PyModelBase()
+    source.model = nn.Module()
+    source.model.embed_tokens = nn.Embedding(4, 3)
+    source.lm_head = nn.Linear(3, 4, bias=False)
+    draft = PyModelBase()
+    draft.model = nn.Module()
+    draft.model.embed_tokens = None
+    draft.lm_head = None
+
+    draft.share_weights_from(source)
+
+    assert draft.lm_head is source.lm_head
+    assert draft.model.embed_tokens is source.model.embed_tokens

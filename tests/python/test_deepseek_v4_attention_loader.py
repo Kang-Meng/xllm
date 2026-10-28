@@ -65,11 +65,15 @@ def test_attention_loader_accepts_supported_prefixes_and_sink_alias(module_name:
         def copy_in(self, name: str, tensor: torch.Tensor) -> None:
             self.loaded[name] = tensor
 
-    attention = SimpleNamespace(attn_sink_loaded=False)
+    attention = torch.nn.Module()
+    attention.attn_sink_loaded = False
+    layer = torch.nn.Module()
+    layer.self_attn = attention
     owner = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     torch.nn.Module.__init__(owner)
     owner.cfg = SimpleNamespace(n_heads=4, tp_size=2, tp_rank=1)
-    owner.model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)])
+    owner.model = torch.nn.Module()
+    owner.model.layers = torch.nn.ModuleList([layer])
     loader = FakeLoader()
 
     loaded_attention, resolved_prefix = DeepseekV4ForCausalLM._load_dsv4_attention(

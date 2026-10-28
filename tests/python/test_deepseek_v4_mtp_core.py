@@ -201,15 +201,20 @@ def test_mtp_decoder_layer_loader_uses_projection_loader_contract() -> None:
         shard=lambda tensor, dim: tensor,
         copy_in=copied.__setitem__,
     )
-    attention = SimpleNamespace(
-        indexer=None,
-        attn_sink_loaded=False,
-        process_weights_after_loading=lambda: None,
-    )
-    mlp = SimpleNamespace(process_weights_after_loading=lambda: None)
+    attention = nn.Module()
+    attention.indexer = None
+    attention.attn_sink_loaded = False
+    attention.process_weights_after_loading = lambda: None
+    mlp = nn.Module()
+    mlp.process_weights_after_loading = lambda: None
+    layer = nn.Module()
+    layer.self_attn = attention
+    layer.mlp = mlp
     owner = DeepseekV4MtpForCausalLM.__new__(DeepseekV4MtpForCausalLM)
+    nn.Module.__init__(owner)
     owner.cfg = SimpleNamespace(n_heads=1, tp_size=1, tp_rank=0, uses_mx_formats=False)
-    owner.model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attention, mlp=mlp)])
+    owner.model = nn.Module()
+    owner.model.layers = nn.ModuleList([layer])
 
     DeepseekV4MtpForCausalLM._load_dsv4_decoder_layer(
         owner,

@@ -29,6 +29,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/kv_cache/kv_shard_layout.h"
+#include "core/framework/model/model_sampling_input.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
@@ -62,21 +63,19 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
+  py_model_output_type_ =
+      py::module_::import("xllm.python.model_executor.model_output")
+          .attr("ModelOutput");
   const bool is_spec_draft =
       options_.is_draft_engine() || (options_.enable_speculative_decode() &&
                                      options_.num_decoding_tokens() == 1);
-  py::object draft_proposal_output_type =
-      py::module_::import("xllm.python.model_executor.runners.base")
-          .attr("DraftProposalOutput");
-  py::object executor = executor_module.attr("ModelExecutor")(
+  py_executor_ = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),
       py_causal_lm_->config_dict(),
       options_.max_seqs_per_batch(),
       options_.num_decoding_tokens(),
       ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit(),
       py::arg("is_spec_draft") = is_spec_draft);
-  py_draft_proposal_output_type_ = std::move(draft_proposal_output_type);
-  py_executor_ = std::move(executor);
 }
 
 PyExecutorImpl::~PyExecutorImpl() {
@@ -84,7 +83,7 @@ PyExecutorImpl::~PyExecutorImpl() {
     PyCausalLM::set_active_instance(nullptr);
   }
   clear_python_object(py_executor_);
-  clear_python_object(py_draft_proposal_output_type_);
+  clear_python_object(py_model_output_type_);
 }
 
 bool PyExecutorImpl::supports_device_only_decode_inputs() const {
@@ -177,6 +176,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       attn_metadata, params, args_.dummy_token_count()));
   py::object py_input_batch_metadata =
       py::cast(PyInputBatchMetadataView(params));
+  py::object sampling_input =
+      params.sampling.has_value() ? py::cast(*params.sampling) : py::none();
   py::object input_embedding =
       optional_tensor(params.embedding.input_embedding);
   torch::Tensor execution_tokens =
@@ -219,7 +220,7 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object eplb_decode_token_mask =
       optional_tensor(params.expert.eplb_decode_token_mask);
 
-  py::object hidden_obj =
+  py::object py_output =
       py_executor_.attr("execute")(execution_tokens,
                                    positions_arg,
                                    py_metadata,
@@ -232,27 +233,39 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    py_load_sync,
                                    params.parallel.layers_per_event,
                                    params.parallel.draft_load_event_index,
-                                   multimodal_inputs);
-  if (py::isinstance(hidden_obj, py_draft_proposal_output_type_)) {
+                                   multimodal_inputs,
+                                   py::arg("sampling_input") = sampling_input);
+  if (py::isinstance(py_output, py_model_output_type_)) {
     ModelOutput output;
-    output.draft_proposal_token_ids =
-        hidden_obj.attr("token_ids").cast<torch::Tensor>();
-    CHECK(options_.is_draft_engine())
-        << "Only a draft model may return completed proposals";
-    CHECK(output.draft_proposal_token_ids.defined());
-    CHECK_EQ(output.draft_proposal_token_ids.scalar_type(), torch::kLong);
-    CHECK_EQ(output.draft_proposal_token_ids.dim(), 1);
+    auto tensor = [&](const char* name) {
+      py::object value = py_output.attr(name);
+      return value.is_none() ? torch::Tensor() : value.cast<torch::Tensor>();
+    };
+    output.hidden_states = tensor("hidden_states");
+    output.residual = tensor("residual");
+    output.aux_hidden_states = tensor("aux_hidden_states");
+    py::object proposal = py_output.attr("draft_proposal");
+    if (!proposal.is_none()) {
+      torch::Tensor tokens = proposal.attr("token_ids").cast<torch::Tensor>();
+      py::object probabilities = proposal.attr("draft_probs");
+      output.draft_proposal.emplace(
+          std::move(tokens),
+          probabilities.is_none()
+              ? std::nullopt
+              : std::make_optional(probabilities.cast<torch::Tensor>()));
+    }
+    output.draft_confidence_probs = tensor("draft_confidence_probs");
     return output;
   }
-  if (py::isinstance<py::tuple>(hidden_obj)) {
-    py::tuple output = hidden_obj.cast<py::tuple>();
+  if (py::isinstance<py::tuple>(py_output)) {
+    py::tuple output = py_output.cast<py::tuple>();
     CHECK_EQ(output.size(), 2) << "Python model tuple output must be "
                                   "(hidden_states, aux_hidden_states)";
     return ModelOutput(output[0].cast<torch::Tensor>(),
                        torch::Tensor(),
                        output[1].cast<torch::Tensor>());
   }
-  return ModelOutput(hidden_obj.cast<torch::Tensor>());
+  return ModelOutput(py_output.cast<torch::Tensor>());
 }
 
 }  // namespace xllm

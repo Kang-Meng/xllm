@@ -16,6 +16,8 @@
 
 import logging
 import os
+from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -24,8 +26,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xllm.python import distributed
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa2_attention import _v41_compressor_swa_gate
+from xllm.python.attention.csa2_block_metadata import (
+    Csa2BlockAttentionMetadata,
+    Csa2BlockAttentionMetadataBuilder,
+)
 from xllm.python.attention.dsa_metadata import (
     READ_TABLE_LAYOUT_RING,
     DsaMetadataBuilder,
@@ -33,10 +40,16 @@ from xllm.python.attention.dsa_metadata import (
     build_cache_specs_v41,
 )
 from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadata
+from xllm.python.model_executor.input_batch import InputBatch
+from xllm.python.model_executor.model_output import DraftProposal, ModelOutput
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
+    _CaptureAttentionMetadata,
 )
-from xllm.python.models.deepseek_v41_dspark_graph import DeepseekV41DSparkGraphRunner
+from xllm.python.model_executor.sampling_metadata import (
+    ModelSamplingMetadata,
+    ModelSamplingMetadataBuilder,
+)
 from xllm.python.models.engram_config import EngramConfig
 
 
@@ -51,7 +64,365 @@ def _runner() -> DecodeAclGraphRunner:
     )
 
 
-def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
+def _query_batch(num_reqs: int, width: int) -> InputBatch:
+    num_tokens = max(1, num_reqs) * width
+    return InputBatch.from_runtime(
+        torch.arange(num_tokens),
+        torch.arange(num_tokens, dtype=torch.int32),
+        SimpleNamespace(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            num_scheduled_tokens=[width] * num_reqs,
+            num_computed_tokens=[],
+            query_start_loc=list(range(0, num_reqs * width + 1, width)),
+            is_prefilling=[False] * num_reqs,
+        ),
+        is_dummy=num_reqs == 0,
+    )
+
+
+@pytest.mark.parametrize("query_width", [3, 5, 15])
+@pytest.mark.parametrize("num_sequences", [1, 2, 3, 5])
+def test_draft_graph_uses_same_whole_block_plan_for_active_and_empty_dp_shards(
+    query_width: int,
+    num_sequences: int,
+) -> None:
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False),
+        torch.device("cpu"),
+        max_batch=16,
+        max_model_len=256,
+        dp_size=2,
+        is_spec_draft=True,
+        draft_query_width=query_width,
+    )
+    num_tokens = num_sequences * query_width
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=False,
+        dp_execution_token_counts=(num_tokens, query_width),
+        raw_dp_execution_token_counts=(num_tokens, 0),
+        dp_is_decode=(True, True),
+    )
+    assert runner._shared_graph_plan(metadata, num_tokens) == (False, 1, num_sequences)
+    runner.dp_rank = 1
+    assert runner._shared_graph_plan(metadata, query_width) == (False, 1, num_sequences)
+    padded_rows = runner._padded_token_rows(max(metadata.dp_execution_token_counts))
+    assert padded_rows >= num_tokens and padded_rows % query_width == 0
+
+
+def test_draft_graph_communication_limit_uses_complete_block_padding() -> None:
+    runner = _runner()
+    runner._is_spec_draft = True
+    runner._draft_query_width = 5
+    runner._eplv2_graph_token_limit = 16
+    assert runner._padded_token_rows(15) == 20
+    assert not runner._eplv2_graph_admits(15)
+    runner._eplv2_graph_token_limit = 20
+    assert runner._eplv2_graph_admits(15)
+
+
+@pytest.mark.parametrize("query_width", [3, 5, 15])
+def test_expanded_draft_proposal_has_shared_plan_with_empty_dp(query_width: int) -> None:
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=256,
+        dp_size=2,
+        is_spec_draft=True,
+        draft_query_width=query_width,
+    )
+    plans = []
+    for dp_rank, num_reqs in ((0, 2), (1, 0)):
+        runner.dp_rank = dp_rank
+        batch = _query_batch(num_reqs, query_width)
+        row_count = batch.num_tokens if num_reqs else 1
+        metadata = _metadata(None if num_reqs else torch.zeros(1, dtype=torch.int32))
+        metadata.is_chunked_prefill = True
+        metadata.is_dflash_proposal = True
+        metadata.is_dummy = batch.is_dummy
+        metadata.num_accepted_tokens = None
+        metadata.block_table = torch.zeros((row_count, query_width), dtype=torch.int32)
+        metadata.kv_seq_lens = torch.full((row_count,), query_width, dtype=torch.int32)
+        metadata.kv_seq_lens_host_values = [query_width] * row_count
+        metadata.q_cu_seq_lens = torch.arange(row_count + 1, dtype=torch.int32) * (1 if num_reqs else query_width)
+        metadata.kv_cu_seq_lens = torch.arange(row_count + 1, dtype=torch.int32) * query_width
+        metadata.slot_mapping = torch.full((batch.num_tokens,), -1, dtype=torch.int32)
+        metadata.dp_execution_token_counts = (2 * query_width, query_width)
+        metadata.raw_dp_execution_token_counts = (2 * query_width, 0)
+        metadata.dp_is_decode = (True, True)
+        assert runner.can_execute(batch.input_ids, metadata)
+        plans.append(runner._shared_graph_plan(metadata, batch.num_tokens))
+    assert plans == [(True, query_width, 2)] * 2
+
+
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+@pytest.mark.parametrize("context_length", [256, 1024, 1025, 8192])
+@pytest.mark.parametrize("extra_target_tables", [False, True])
+def test_csa2_ring_paging_admission_and_dummy_replay(
+    dp_size: int,
+    context_length: int,
+    extra_target_tables: bool,
+) -> None:
+    query_width, page_size = 4, 128
+    _, group_infos = build_cache_specs_v41([0], [], [], page_size, 1)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=page_size, is_mla=False, group_infos=group_infos),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8192,
+        dp_size=dp_size,
+        is_spec_draft=True,
+        draft_query_width=query_width,
+    )
+    builder = Csa2BlockAttentionMetadataBuilder(query_width, page_size, 8192)
+    runner.bind_execution_metadata_builders((builder,))
+    batch = replace(_query_batch(1, query_width), positions=torch.arange(context_length - query_width, context_length))
+    metadata = _metadata(None)
+    metadata.is_dflash_proposal = True
+    metadata.is_dummy = False
+    metadata.num_accepted_tokens = None
+    metadata.block_table = None
+    metadata.multi_block_tables = (torch.tensor([[2, 5]] * query_width, dtype=torch.int32),)
+    if extra_target_tables:
+        metadata.multi_block_tables += (
+            torch.full((query_width, 1), 31, dtype=torch.int32),
+            torch.full((query_width, 1), 41, dtype=torch.int32),
+        )
+    metadata.kv_seq_lens = torch.full((query_width,), context_length, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [context_length] * query_width
+    metadata.kv_cu_seq_lens = torch.arange(query_width + 1, dtype=torch.int32) * context_length
+    page_count = (context_length + page_size - 1) // page_size
+    metadata.paged_kv_indptr = torch.arange(query_width + 1, dtype=torch.int32) * page_count
+    row_pages = [2 if page % 2 == 0 else 5 for page in range(page_count)]
+    metadata.paged_kv_indices = torch.tensor(row_pages * query_width, dtype=torch.int32)
+    metadata.paged_kv_last_page_len = torch.full(
+        (query_width,), (context_length - 1) % page_size + 1, dtype=torch.int32
+    )
+    block_ids = torch.tensor([2, 5], dtype=torch.int32)[batch.positions // page_size % 2]
+    metadata.slot_mapping = block_ids * page_size + batch.positions % page_size
+    metadata.new_cache_slots_host_values = metadata.slot_mapping.tolist()
+    metadata.dp_execution_token_counts = (query_width,) * dp_size
+    metadata.raw_dp_execution_token_counts = (query_width,) + (0,) * (dp_size - 1)
+    metadata.dp_is_decode = (True,) * dp_size
+    assert runner.can_execute(batch.input_ids, metadata)
+    normalized = runner._normalize_dsa_metadata(metadata)
+    assert len(normalized.multi_block_tables) == 1
+    assert normalized.multi_block_tables[0] is metadata.multi_block_tables[0]
+    assert len(metadata.multi_block_tables) == (3 if extra_target_tables else 1)
+    if extra_target_tables:
+        runner._is_spec_draft = False
+        assert runner._normalize_dsa_metadata(metadata) is metadata
+        runner._is_spec_draft = True
+    entry = runner._allocate_entry(8, batch.input_ids, batch.positions, normalized, batch)
+    target = entry.execution_contexts[Csa2BlockAttentionMetadata]
+    addresses = tuple(tensor.data_ptr() for tensor in (target.context_lengths, target.block_table, target.slot_mapping))
+
+    empty_batch = _query_batch(0, query_width)
+    dummy = SimpleNamespace(**vars(metadata))
+    dummy.is_dummy = True
+    dummy.linear_state_indices = torch.zeros(query_width, dtype=torch.int32)
+    dummy.block_table = torch.zeros((query_width, 1), dtype=torch.int32)
+    dummy.multi_block_tables = ()
+    dummy.kv_seq_lens = torch.ones(query_width, dtype=torch.int32)
+    dummy.kv_seq_lens_host_values = [1] * query_width
+    dummy.kv_cu_seq_lens = torch.arange(query_width + 1, dtype=torch.int32)
+    dummy.slot_mapping = torch.full((query_width,), -1, dtype=torch.int32)
+    dummy.new_cache_slots_host_values = [-1] * query_width
+    dummy.paged_kv_indptr = torch.arange(query_width + 1, dtype=torch.int32)
+    dummy.paged_kv_indices = torch.zeros(query_width, dtype=torch.int32)
+    dummy.paged_kv_last_page_len = torch.ones(query_width, dtype=torch.int32)
+    runner.dp_rank = dp_size - 1
+    assert runner.can_execute(empty_batch.input_ids, dummy)
+    assert runner._shared_graph_plan(metadata, query_width) == runner._shared_graph_plan(dummy, query_width)
+    normalized_dummy = runner._normalize_dsa_metadata(dummy)
+    assert normalized_dummy.multi_block_tables[0].shape == (query_width, 1)
+    assert builder.build(empty_batch, dummy).slot_mapping.tolist() == [-1] * query_width
+
+    def copy_legacy_inputs(*args: Any) -> None:
+        for source, destination in ((args[0], args[7]), (args[1], args[8]), (args[2], args[9])):
+            destination.zero_()
+            destination[: source.numel()].copy_(source)
+
+    with patch(
+        "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+        side_effect=copy_legacy_inputs,
+        create=True,
+    ):
+        for current_metadata, current_batch, expected_lengths in (
+            (normalized, batch, [context_length, 0]),
+            (normalized_dummy, empty_batch, [0, 0]),
+            (normalized, batch, [context_length, 0]),
+        ):
+            runner._fill_entry(
+                entry,
+                current_batch.input_ids,
+                current_batch.positions,
+                current_metadata,
+                query_width,
+                None,
+                current_batch,
+            )
+            assert target.context_lengths.tolist() == expected_lengths
+            if current_batch.is_dummy:
+                assert target.slot_mapping.tolist() == [-1] * 8
+                assert not torch.count_nonzero(target.block_table)
+    assert (
+        tuple(tensor.data_ptr() for tensor in (target.context_lengths, target.block_table, target.slot_mapping))
+        == addresses
+    )
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_ordinary_paging_still_rejects_insufficient_history_capacity(dp_size: int) -> None:
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=2048,
+        dp_size=dp_size,
+    )
+    metadata = _metadata(None)
+    metadata.kv_seq_lens = torch.full((4,), 1024, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [1024] * 4
+    metadata.paged_kv_indptr = torch.tensor([0], dtype=torch.int32)
+    metadata.paged_kv_indices = torch.empty(0, dtype=torch.int32)
+    metadata.paged_kv_last_page_len = torch.empty(0, dtype=torch.int32)
+    metadata.dp_execution_token_counts = (4,) * dp_size
+    metadata.dp_is_decode = (True,) * dp_size
+    if dp_size == 1:
+        assert not runner.can_execute(torch.arange(4), metadata)
+    else:
+        with pytest.raises(RuntimeError, match="cannot hold the KV length"):
+            runner.can_execute(torch.arange(4), metadata)
+
+
+def test_draft_graph_key_keeps_whole_query_blocks() -> None:
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=256,
+        is_spec_draft=True,
+        draft_query_width=5,
+    )
+    captured_keys = []
+
+    def capture_key(key: tuple) -> None:
+        captured_keys.append(key)
+        raise LookupError("graph key recorded")
+
+    runner._graphs = SimpleNamespace(get=capture_key)
+    for num_sequences in (2, 3):
+        input_ids = torch.arange(num_sequences * 5, dtype=torch.int32)
+        with pytest.raises(LookupError, match="graph key recorded"):
+            runner.execute(input_ids, input_ids, SimpleNamespace())
+    assert [key[0] for key in captured_keys] == [10, 20]
+
+
+@pytest.mark.parametrize(
+    "is_spec_draft,num_decoding_tokens,query_width,expected_capacity",
+    [(False, 1, 5, 16), (False, 3, 5, 48), (True, 1, 2, 32), (True, 3, 2, 48)],
+)
+def test_legacy_paged_buffer_covers_target_and_draft_token_rows(
+    is_spec_draft: bool,
+    num_decoding_tokens: int,
+    query_width: int,
+    expected_capacity: int,
+) -> None:
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=4, is_mla=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+        num_decoding_tokens=num_decoding_tokens,
+        is_spec_draft=is_spec_draft,
+        draft_query_width=query_width,
+    )
+    input_ids = torch.arange(4, dtype=torch.int32)
+    metadata = _metadata(input_ids)
+    entry = runner._allocate_entry(4, input_ids, input_ids, metadata)
+    assert runner._paged_kv_indices_buffer.numel() == expected_capacity
+    assert entry.static_metadata.paged_kv_indices is runner._paged_kv_indices_buffer
+
+
+def test_csa2_builder_updates_alongside_legacy_buffers_and_protects_capture() -> None:
+    _, group_infos = build_cache_specs_v41([0], [], [], 4, 1)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=4, is_mla=False, group_infos=group_infos),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=8,
+        is_spec_draft=True,
+        draft_query_width=2,
+    )
+    runner.bind_execution_metadata_builders((Csa2BlockAttentionMetadataBuilder(2, 4, 8),))
+    batch = _query_batch(2, 2)
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.linear_state_indices = None
+    metadata.num_accepted_tokens = None
+    metadata.is_dummy = False
+    metadata.multi_block_tables = (torch.tensor([[5], [5], [6], [6]], dtype=torch.int32),)
+    entry = runner._allocate_entry(8, batch.input_ids, batch.positions, metadata, batch)
+    target = entry.execution_contexts[Csa2BlockAttentionMetadata]
+    buffers = (target.context_lengths, target.block_table, target.slot_mapping)
+    addresses = tuple(tensor.data_ptr() for tensor in buffers)
+    assert entry.static_metadata.paged_kv_indices is runner._paged_kv_indices_buffer
+    assert entry.static_metadata.slot_mapping.data_ptr() != target.slot_mapping.data_ptr()
+    assert entry.static_metadata.multi_block_tables[0].data_ptr() != target.block_table.data_ptr()
+
+    def copy_legacy_inputs(*args: Any) -> None:
+        for source, destination in ((args[0], args[7]), (args[1], args[8]), (args[2], args[9])):
+            destination.zero_()
+            destination[: source.numel()].copy_(source)
+
+    with patch(
+        "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+        side_effect=copy_legacy_inputs,
+        create=True,
+    ) as legacy_update:
+        runner._fill_entry(entry, batch.input_ids, batch.positions, _CaptureAttentionMetadata(metadata), 4, None, batch)
+        assert target.context_lengths.tolist() == [0, 0, 0, 0]
+        assert target.block_table.tolist() == [[0, 0]] * 4
+        assert target.slot_mapping.tolist() == [-1] * 8
+        assert not batch.is_dummy
+        assert not entry.static_metadata.is_dummy
+
+        runner._fill_entry(entry, batch.input_ids, batch.positions, metadata, 4, None, batch)
+        assert legacy_update.call_count == 2
+
+    assert target.query_lens == (2, 2, 2, 2)
+    assert target.context_lengths.tolist() == [2, 4, 0, 0]
+    assert target.block_table.tolist() == [[5, 5], [6, 6], [0, 0], [0, 0]]
+    assert target.slot_mapping.tolist() == [20, 21, 26, 27, -1, -1, -1, -1]
+    current_buffers = (target.context_lengths, target.block_table, target.slot_mapping)
+    assert tuple(tensor.data_ptr() for tensor in current_buffers) == addresses
+    assert entry.execution_contexts[Csa2BlockAttentionMetadata] is target
+    assert entry.static_input_ids.tolist() == [0, 1, 2, 3, 0, 0, 0, 0]
+    assert entry.static_positions.tolist() == [0, 1, 2, 3, 0, 0, 0, 0]
+    assert entry.static_metadata.slot_mapping.tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
+    assert entry.static_metadata.kv_seq_lens_host_values == [1, 2, 3, 4, 1, 1, 1, 1]
+    assert entry.static_metadata.multi_block_tables[0].tolist() == [
+        [5, 5],
+        [5, 5],
+        [6, 6],
+        [6, 6],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 0],
+    ]
+
+
+def _metadata(linear_state_indices: torch.Tensor | None) -> SimpleNamespace:
     return SimpleNamespace(
         slot_mapping=torch.arange(4, dtype=torch.int32),
         paged_kv_indptr=torch.arange(5, dtype=torch.int32),
@@ -73,6 +444,151 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
         is_prefill=False,
         is_chunked_prefill=False,
     )
+
+
+@pytest.mark.parametrize("sampling_mode", ["greedy", "filter", "penalty", "probabilities", "confidence", "missing"])
+def test_sampling_graph_admission_checks_request_capability(sampling_mode: str) -> None:
+    runner = _runner()
+    runner.bind_execution_metadata_builders((ModelSamplingMetadataBuilder(),))
+    sampling = SimpleNamespace(
+        is_unconstrained_greedy=sampling_mode not in ("filter", "penalty"),
+        return_probs=sampling_mode == "probabilities",
+        return_confidence=sampling_mode == "confidence",
+    )
+    batch = replace(_query_batch(4, 1), sampling=None if sampling_mode == "missing" else sampling)
+
+    assert runner.can_execute(batch.input_ids, _metadata(None), input_batch=batch) == (sampling_mode == "greedy")
+
+
+@pytest.mark.parametrize("empty_peer", [False, True])
+@pytest.mark.parametrize(
+    ("sampling_allowed", "layout_allowed"),
+    [
+        ((True, True), (True, True)),
+        ((False, True), (True, True)),
+        ((True, False), (True, True)),
+        ((True, True), (False, True)),
+    ],
+)
+def test_sampling_graph_admission_is_unanimous_across_dp(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_peer: bool,
+    sampling_allowed: tuple[bool, bool],
+    layout_allowed: tuple[bool, bool],
+) -> None:
+    votes = [sampling and layout for sampling, layout in zip(sampling_allowed, layout_allowed)]
+    calls = []
+
+    def gather(vote: torch.Tensor, counts: list[int], rank: int) -> torch.Tensor:
+        assert counts == [1, 1]
+        assert vote.dtype == torch.int32
+        assert vote.tolist() == [int(votes[rank])]
+        calls.append(rank)
+        return torch.tensor(votes, dtype=torch.int32)
+
+    monkeypatch.setattr(distributed, "dp_all_gather", gather, raising=False)
+    for rank in range(2):
+        runner = _runner()
+        runner.dp_size = 2
+        runner.dp_rank = rank
+        runner.bind_execution_metadata_builders((ModelSamplingMetadataBuilder(),))
+        monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=layout_allowed[rank]))
+        sampling = SimpleNamespace(
+            is_unconstrained_greedy=sampling_allowed[rank], return_probs=False, return_confidence=False
+        )
+        batch = replace(_query_batch(0 if empty_peer and rank == 1 else 4, 1), sampling=sampling)
+        assert runner.can_execute(batch.input_ids, _metadata(None), input_batch=batch) == all(votes)
+    assert calls == [0, 1]
+
+
+def test_sampling_graph_admission_rejects_incomplete_dp_vote(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _runner()
+    runner.dp_size = 2
+    runner.bind_execution_metadata_builders((ModelSamplingMetadataBuilder(),))
+    monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=True))
+    monkeypatch.setattr(distributed, "dp_all_gather", lambda vote, counts, rank: vote, raising=False)
+    sampling = SimpleNamespace(is_unconstrained_greedy=True, return_probs=False, return_confidence=False)
+    batch = replace(_query_batch(4, 1), sampling=sampling)
+    with pytest.raises(RuntimeError, match="graph admission.*2"):
+        runner.can_execute(batch.input_ids, _metadata(None), input_batch=batch)
+
+
+def test_sampling_graph_admission_does_not_gate_models_without_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    runner.dp_size = 2
+    monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=True))
+    gather = MagicMock(side_effect=AssertionError("unexpected DP admission collective"))
+    monkeypatch.setattr(distributed, "dp_all_gather", gather, raising=False)
+    assert runner.can_execute(torch.arange(4), _metadata(None), input_batch=None)
+    gather.assert_not_called()
+
+
+def test_sampling_graph_metadata_does_not_require_host_cached_counts() -> None:
+    runner = _runner()
+    builder = ModelSamplingMetadataBuilder()
+    runner.bind_execution_metadata_builders((builder,))
+    assert runner.execution_metadata_builders == (builder,)
+
+    first_sampling = SimpleNamespace(
+        parameters=SimpleNamespace(all_greedy_sample=True),
+        is_unconstrained_greedy=True,
+        return_probs=False,
+        return_confidence=False,
+    )
+    next_sampling = SimpleNamespace(
+        parameters=SimpleNamespace(all_greedy_sample=True),
+        is_unconstrained_greedy=True,
+        return_probs=False,
+        return_confidence=False,
+    )
+    input_ids = torch.arange(4)
+    positions = torch.arange(4)
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    batch_metadata = SimpleNamespace(
+        num_reqs=2,
+        num_tokens=4,
+        num_scheduled_tokens=[2, 2],
+        num_computed_tokens=[],
+        query_start_loc=[0, 2, 4],
+        is_prefilling=[False, False],
+    )
+    input_batch = InputBatch.from_runtime(
+        input_ids,
+        positions,
+        batch_metadata,
+        is_dummy=False,
+        sampling=first_sampling,
+    )
+
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        entry = runner._allocate_entry(8, input_ids, positions, metadata, input_batch)
+        persistent = entry.execution_contexts[ModelSamplingMetadata]
+        assert persistent.sampling is first_sampling
+        input_address = entry.static_input_ids.data_ptr()
+
+        for sampling in (first_sampling, next_sampling):
+            input_batch = InputBatch.from_runtime(
+                input_ids,
+                positions,
+                batch_metadata,
+                is_dummy=False,
+                sampling=sampling,
+            )
+            runner._fill_entry(
+                entry,
+                input_ids,
+                positions,
+                metadata,
+                batch_size=4,
+                input_embedding=None,
+                input_batch=input_batch,
+            )
+            assert entry.execution_contexts[ModelSamplingMetadata] is persistent
+            assert persistent.sampling is sampling
+            assert persistent.num_tokens == 4
+            assert entry.static_input_ids.data_ptr() == input_address
 
 
 @pytest.mark.parametrize(
@@ -1027,97 +1543,6 @@ def test_dflash_draft_graph_capacity_uses_sequence_count() -> None:
         assert runners[1].can_execute(torch.zeros(1, dtype=torch.int32), misaligned) is False
 
 
-@pytest.mark.parametrize("dspark", [False, True])
-def test_dspark_draft_graph_uses_leading_swa_table_from_target_metadata(dspark: bool) -> None:
-    _, group_infos = build_cache_specs_v41([0], [], [], 128, 1)
-    model = nn.Identity()
-    runner_class = DeepseekV41DSparkGraphRunner if dspark else DecodeAclGraphRunner
-    runner = runner_class(
-        model,
-        SimpleNamespace(page_size=128, is_mla=False, group_infos=group_infos),
-        torch.device("cpu"),
-        max_batch=8,
-        max_model_len=8,
-        is_spec_draft=True,
-        draft_query_width=5,
-    )
-    metadata = _metadata(torch.empty(0, dtype=torch.int32))
-    swa = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-    metadata.multi_block_tables = (
-        swa,
-        torch.tensor([[30], [40]], dtype=torch.int32),
-        torch.tensor([[50], [60]], dtype=torch.int32),
-    )
-    metadata.block_table = None
-    metadata.slot_mapping = torch.empty(0, dtype=torch.int64)
-    original_tables = metadata.multi_block_tables
-    original_slots = metadata.slot_mapping
-
-    normalized = runner._normalize_dsa_metadata(metadata)
-
-    if not dspark:
-        assert normalized is metadata
-        return
-    assert normalized.block_table is swa
-    assert normalized.multi_block_tables == (swa,)
-    assert normalized.slot_mapping.tolist() == [0, 0]
-    assert metadata.multi_block_tables is original_tables
-    assert metadata.block_table is None
-    assert metadata.slot_mapping is original_slots
-
-
-@pytest.mark.parametrize("group_indices", [[], [1], [0, 1]])
-def test_dspark_draft_graph_rejects_non_swa_cache_groups(group_indices: list[int]) -> None:
-    _, target_groups = build_cache_specs_v41([0, 2], [1], [1], 128, 2)
-    runner = DeepseekV41DSparkGraphRunner(
-        nn.Identity(),
-        SimpleNamespace(page_size=128, is_mla=False, group_infos=[target_groups[i] for i in group_indices]),
-        torch.device("cpu"),
-        max_batch=8,
-        max_model_len=8,
-        is_spec_draft=True,
-        draft_query_width=5,
-    )
-    metadata = _metadata(torch.empty(0, dtype=torch.int32))
-    original_tables = metadata.multi_block_tables
-    with pytest.raises(ValueError, match="exactly one SWA cache group"):
-        runner._normalize_dsa_metadata(metadata)
-    assert metadata.multi_block_tables is original_tables
-
-
-@pytest.mark.parametrize("dspark", [False, True])
-def test_dspark_draft_graph_padding_keeps_complete_query_blocks(dspark: bool) -> None:
-    attention_backend = SimpleNamespace(page_size=4, is_mla=False)
-    model = nn.Identity()
-    runner_class = DeepseekV41DSparkGraphRunner if dspark else DecodeAclGraphRunner
-    runner = runner_class(
-        model,
-        attention_backend,
-        torch.device("cpu"),
-        max_batch=8,
-        max_model_len=8,
-        is_spec_draft=True,
-        draft_query_width=5,
-    )
-    captured_keys = []
-
-    def capture_key(key: tuple) -> None:
-        captured_keys.append(key)
-        raise LookupError("graph key recorded")
-
-    runner._graphs = SimpleNamespace(get=capture_key)
-    metadata = SimpleNamespace()
-    for sequence_count in (2, 3):
-        input_ids = torch.arange(sequence_count * 5, dtype=torch.int32)
-        with pytest.raises(LookupError, match="graph key recorded"):
-            runner.execute(input_ids, input_ids, metadata)
-
-    # Sequence buckets 2 and 4 become 10 and 20 token rows. A raw token
-    # bucket would produce 16 rows for both cases and split a gamma=5 block.
-    assert captured_keys[0][0] == (10 if dspark else 16)
-    assert captured_keys[1][0] == (20 if dspark else 16)
-
-
 def test_dp_uneven_sequences_stay_in_graph_with_full_batch_capacity() -> None:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False)
     runners = [
@@ -1675,6 +2100,39 @@ def test_xfia_graph_accepts_device_only_lengths() -> None:
     assert entry.static_metadata.kv_seq_lens_host_values == [1] * 4
 
 
+@pytest.mark.parametrize("num_sequences", [1, 2, 3, 8])
+def test_xfia_draft_proposal_graph_accepts_request_scoped_metadata(num_sequences: int) -> None:
+    query_width = 15
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False, requires_host_kv_lengths=False),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=256,
+        is_spec_draft=True,
+        draft_query_width=query_width,
+    )
+    num_tokens = num_sequences * query_width
+    metadata = _metadata(torch.arange(num_sequences, dtype=torch.int64))
+    metadata.linear_state_indices = None
+    metadata.is_chunked_prefill = True
+    metadata.is_dflash_proposal = True
+    metadata.slot_mapping = torch.arange(num_tokens, dtype=torch.int32)
+    metadata.block_table = torch.arange(num_sequences * 2, dtype=torch.int32).reshape(num_sequences, 2)
+    metadata.kv_seq_lens = torch.full((num_sequences,), 129, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [143] * num_sequences
+    metadata.q_cu_seq_lens = torch.arange(1, num_sequences + 1, dtype=torch.int32) * query_width
+    metadata.kv_cu_seq_lens = torch.arange(1, num_sequences + 1, dtype=torch.int32) * 129
+    input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+    assert runner.can_execute(input_ids, metadata)
+    table, lengths, host_lengths, *_ = runner._decode_metadata(metadata)
+    assert table.shape == (num_tokens, 2)
+    assert lengths.tolist() == [129] * num_tokens
+    assert host_lengths is None
+    metadata.is_dflash_proposal = False
+    assert not runner.can_execute(input_ids, metadata)
+
+
 # ---------------------------------------------------------------------------
 # Engram graph-visible staging capacity hint
 # ---------------------------------------------------------------------------
@@ -2001,6 +2459,50 @@ def _engram_execute_inputs() -> tuple[torch.Tensor, torch.Tensor, Any]:
     return input_ids, positions, metadata
 
 
+@pytest.mark.parametrize("num_reqs", [0, 3, 4])
+def test_acl_runner_slices_pipeline_replay_output_with_input_batch_counts(
+    num_reqs: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch = _query_batch(num_reqs, 3)
+    runner, _, _, _ = _engram_execute_harness(monkeypatch, staged=True)
+    runner.max_batch = 16
+    runner._stream = MagicMock()
+    runner._update_stream = MagicMock()
+    runner._replay_done_event = MagicMock()
+    token_capacity = runner._padded_token_rows(batch.num_tokens)
+    request_capacity = token_capacity // 3
+    source = ModelOutput(
+        draft_proposal=DraftProposal(torch.arange(request_capacity * 3).reshape(request_capacity, 3)),
+        draft_confidence_probs=torch.ones(request_capacity, 3),
+    )
+    replay = MagicMock()
+
+    def _capture(entry: Any) -> None:
+        entry.graph = SimpleNamespace(replay=replay)
+        entry.graph_tasks = []
+        entry.static_output = source
+
+    monkeypatch.setattr(runner, "_capture", _capture)
+    monkeypatch.setattr(runner, "_update_graph_tasks", MagicMock())
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(current_stream=lambda: runner._stream, stream=lambda stream: nullcontext()),
+        raising=False,
+    )
+    metadata = SimpleNamespace(linear_state_indices=torch.arange(batch.num_tokens, dtype=torch.int32))
+
+    output = runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch)
+
+    replay.assert_called_once()
+    assert torch.equal(output.draft_proposal.token_ids, source.draft_proposal.token_ids[:num_reqs])
+    assert torch.equal(output.draft_confidence_probs, source.draft_confidence_probs[:num_reqs])
+    assert output.hidden_states is None
+    if num_reqs:
+        assert output.draft_proposal.token_ids.data_ptr() == source.draft_proposal.token_ids.data_ptr()
+        assert output.draft_confidence_probs.data_ptr() == source.draft_confidence_probs.data_ptr()
+
+
 def test_acl_runner_execute_refuses_first_capture_when_engram_staging_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2252,7 +2754,9 @@ def test_v41_engram_graph_replay_checks_history_batch_capacity(rows: int) -> Non
                 runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
         else:
             runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
-            torch.testing.assert_close(entry.static_metadata.engram_lookback_token_ids, metadata.engram_lookback_token_ids)
+            torch.testing.assert_close(
+                entry.static_metadata.engram_lookback_token_ids, metadata.engram_lookback_token_ids
+            )
 
 
 @pytest.mark.parametrize("engram_enabled", [False, True])

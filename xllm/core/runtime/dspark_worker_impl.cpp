@@ -26,11 +26,11 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/model/model_sampling_input.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/dflash_async_input_builder.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/process_group.h"
-#include "framework/sampling/sampler.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/timer.h"
 
@@ -74,7 +74,6 @@ bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
         options_.num_speculative_tokens() > 0 &&
         parallel_args_.cp_size() == 1 &&
         parallel_args_.kv_split_size_effective() == 1 &&
-        !options_.enable_disagg_pd() &&
         !options_.enable_adaptive_speculative_decode();
 #endif
     const bool supports_device_inputs =
@@ -97,57 +96,9 @@ bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
         break;
       }
     }
-    if (draft_graph_enabled()) {
-      CHECK(!hot_token_id_.defined()) << "DSpark full graph requires a "
-                                         "full-vocabulary draft (no d2t table)";
-    }
-    if (util::is_deepseek_v41_dspark_model_type(
-            draft_impl_->context_.get_model_args().model_type())) {
-      LOG(INFO) << "DeepSeek-V4.1 DSpark draft query geometry: gamma-wide "
-                   "non-causal block; proposal ACL graph="
-                << draft_graph_enabled();
-    }
   }
 
   return result;
-}
-
-bool DSparkWorkerImpl::draft_graph_enabled() const {
-  return draft_impl_->context_.get_speculative_runtime_config()
-      .draft_graph_enabled;
-}
-
-bool DSparkWorkerImpl::draft_use_block_parallel_rows() const {
-  if (util::is_deepseek_v41_dspark_model_type(
-          draft_impl_->context_.get_model_args().model_type())) {
-    return draft_graph_enabled();
-  }
-  return DFlashWorkerImpl::draft_use_block_parallel_rows();
-}
-
-BatchForwardType DSparkWorkerImpl::draft_batch_forward_type() const {
-  if (util::is_deepseek_v41_dspark_model_type(
-          draft_impl_->context_.get_model_args().model_type())) {
-    return draft_graph_enabled() ? BatchForwardType::DECODE
-                                 : BatchForwardType::CHUNKED_PREFILL;
-  }
-  return DFlashWorkerImpl::draft_batch_forward_type();
-}
-
-void DSparkWorkerImpl::validate_draft_graph_input(
-    const ForwardInput& input) const {
-  if (!draft_graph_enabled()) {
-    return;
-  }
-  const SamplingParameters& sampling = input.sampling_params;
-  CHECK(!sampling.frequency_penalties.defined() &&
-        !sampling.presence_penalties.defined() &&
-        !sampling.repetition_penalties.defined() &&
-        !sampling.filter_mask.defined() && !sampling.filter_bitmask.defined() &&
-        input.json_object_states.empty() &&
-        input.json_object_state_snapshots.empty())
-      << "DSpark full graph does not support sampling penalties or token "
-         "filters; disable --enable_dspark_draft_graph for these requests";
 }
 
 void DSparkWorkerImpl::prepare_work_before_execute(
@@ -164,13 +115,10 @@ void DSparkWorkerImpl::validate_draft_prelaunch_config(
   if (!options_.enable_dspark_prelaunch()) {
     return;
   }
-  CHECK(!draft_graph_enabled())
-      << "--enable_dspark_prelaunch cannot be combined with an active "
-         "--enable_dspark_draft_graph";
   CHECK(async_output_enabled_)
       << "--enable_dspark_prelaunch requires schedule overlap, an NPU Python "
          "DSpark draft, num_speculative_tokens > 0, CP=1, KV split=1, "
-         "PD disabled and adaptive speculative decode disabled";
+         "and adaptive speculative decode disabled";
   CHECK(supports_device_inputs)
       << "--enable_dspark_prelaunch requires a draft model supporting "
          "device-only decode inputs";
@@ -184,14 +132,9 @@ void DSparkWorkerImpl::validate_decode_input(const ForwardInput& input) const {
       meta.is_graph_warmup) {
     return;
   }
-  validate_draft_graph_input(input);
   if (options_.enable_dspark_prelaunch()) {
     const std::string_view error = draft_prelaunch_input_error(input);
     CHECK(error.empty()) << "--enable_dspark_prelaunch: " << error;
-  }
-  if (async_output_enabled_) {
-    CHECK(input.transfer_kv_infos.empty())
-        << "DSpark overlap decode does not support KV transfers";
   }
 }
 
@@ -218,7 +161,13 @@ std::optional<ForwardOutput> DSparkWorkerImpl::step_decode(
 
   const bool async_output =
       async_output_enabled_ && !input.input_params.meta.is_graph_warmup;
-  return run_validate(input, draft_block, validate_input, async_output);
+  auto output = run_validate(input, draft_block, validate_input, async_output);
+  if (output.has_value()) {
+    output->failed_request_ids.insert(output->failed_request_ids.end(),
+                                      draft_block.failed_request_ids.begin(),
+                                      draft_block.failed_request_ids.end());
+  }
+  return output;
 }
 
 DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
@@ -228,141 +177,110 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
   // block N-wide and every position predicts a draft token.
   ForwardInput query_input;
   prepare_query_inputs(input, query_input);
-  if (draft_prelaunch_enabled_ && !input.input_params.meta.is_graph_warmup) {
-    query_input.input_params.is_dflash_proposal = true;
-  }
+  query_input.input_params.is_dflash_proposal = true;
 
-  CHECK(input.token_ids_host.defined())
-      << "DSpark requires host token ids for the anchor.";
-  const int32_t batch_size = input.input_params.meta.num_sequences;
-  CHECK_GE(input.token_ids_host.numel(), batch_size)
-      << "DSpark anchor token count must cover the decode batch.";
-  torch::Tensor anchor_token_ids =
-      input.token_ids_host.slice(/*dim=*/0, /*start=*/0, /*end=*/batch_size)
-          .to(draft_impl_->device(), torch::kLong);
   return execute_draft_query(
-      input, std::move(query_input), anchor_token_ids, false, &validate_input);
+      input, std::move(query_input), false, &validate_input);
 }
 
 DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::execute_draft_query(
     const ForwardInput& input,
     ForwardInput query_input,
-    const torch::Tensor& anchor_token_ids,
     bool prepared,
     ForwardInput* validate_input) {
   Timer timer;
   const int32_t batch_size = input.input_params.meta.num_sequences;
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-
   CHECK_GT(num_speculative_tokens, 0)
       << "DSpark requires num_speculative_tokens > 0.";
-  validate_draft_graph_input(input);
-  ForwardInput logits_input = query_input;
-  logits_input.skip_sampling_for_logits_only = true;
-  // Request pre-lm_head hidden alongside logits so ConfidenceHead can consume
-  // the same [num_reqs*num_spec, hidden] rows without a second projection.
-  // Only pay the cost when adaptive pruning is actually enabled — static
-  // sampling doesn't consume confidence, and asking for selected_hidden
-  // triggers a target-side gather and a downstream linear+sigmoid every
-  // step.
   const bool want_confidence = draft_impl_->has_dspark_confidence_head() &&
                                adaptive_spec_controller_ != nullptr &&
                                adaptive_spec_controller_->enabled();
-  logits_input.return_selected_hidden = want_confidence;
+  query_input.skip_sampling_for_logits_only = true;
+  query_input.return_selected_hidden = want_confidence;
 
   ForwardInput processed_input;
   if (prepared) {
-    processed_input = std::move(logits_input);
+    processed_input = std::move(query_input);
   } else {
     draft_impl_->prepare_work_before_execute_on_stream(
-        logits_input, processed_input, *prepare_stream_);
+        query_input, processed_input, *prepare_stream_);
   }
+  ModelSamplingInput sampling;
+  sampling.parameters = input.sampling_params;
+  if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
+    force_greedy_draft_sampling(sampling.parameters);
+  }
+  sampling.parameters.return_probs = draft_probs_required(
+      draft_sampling_mode_, sampling.parameters.all_greedy_sample);
+  sampling.return_confidence = want_confidence;
+  processed_input.input_params.sampling = std::move(sampling);
+
   std::optional<ForwardOutput> draft_output =
       draft_impl_->execute_no_sync_on_stream(processed_input,
                                              *compute_stream_,
                                              /*record_ready_event=*/false);
   CHECK(draft_output.has_value())
       << "DSpark draft forward must return an output.";
-  if (draft_output->draft_proposal_token_ids.defined()) {
-    // The eager path remaps draft-space ids through hot_token_id_ (d2t); the
-    // graph proposal chain emits draft-space ids directly and has no remap, so
-    // a reduced-vocabulary draft would silently feed draft-space ids to the
-    // target verify. Fail closed instead.
-    CHECK(!hot_token_id_.defined())
-        << "DSpark full graph requires a full-vocabulary draft (no d2t table): "
-           "the captured proposal chain cannot remap hot token ids.";
-    // Completed token proposals do not carry the hidden states or confidence
-    // probabilities needed by adaptive pruning.
-    CHECK(!want_confidence)
-        << "DSpark full graph does not support adaptive confidence pruning.";
-    torch::Tensor proposal_ids = draft_output->draft_proposal_token_ids;
-    CHECK_EQ(proposal_ids.numel(),
-             static_cast<int64_t>(batch_size) * num_speculative_tokens)
-        << "DSpark graph proposal size must match batch * num_spec.";
-    DraftBlock draft_block;
-    draft_block.proposal = DraftProposal(proposal_ids.view(
-        {batch_size, static_cast<int64_t>(num_speculative_tokens)}));
-    draft_block.retained_inputs = take_retained_inputs(*draft_output);
-    if (validate_input != nullptr) {
-      prepare_validate_inputs(input, *validate_input);
-    }
-    COUNTER_ADD(speculative_execution_latency_seconds_draft,
-                timer.elapsed_seconds());
-    return draft_block;
-  }
-  CHECK(draft_output->logits.defined())
-      << "DSpark draft forward must return logits.";
-  // Match DFlash's host/device overlap: validation input construction only
-  // reads the original input, so prepare it after the asynchronous draft
-  // launch instead of delaying that launch.
   if (validate_input != nullptr) {
     prepare_validate_inputs(input, *validate_input);
   }
 
-  const int64_t num_rows = draft_output->logits.size(/*dim=*/0);
-  CHECK_EQ(num_rows % num_speculative_tokens, 0)
-      << "DSpark draft logits rows must be divisible by "
-         "num_speculative_tokens.";
-  CHECK_EQ(num_rows / num_speculative_tokens, batch_size)
-      << "DSpark draft logits batch must match the decode batch.";
-  torch::Tensor base_logits = draft_output->logits.view(
-      {batch_size, num_speculative_tokens, draft_output->logits.size(-1)});
-  torch::Tensor last_hidden;
-  if (want_confidence) {
-    if (draft_output->selected_hidden.defined() &&
-        draft_output->selected_hidden.size(0) == num_rows) {
-      last_hidden = draft_output->selected_hidden.view(
-          {batch_size,
-           num_speculative_tokens,
-           draft_output->selected_hidden.size(-1)});
-    } else {
-      // The current lm_head backend did not surface selected_hidden. Fall
-      // back to sampler-gathered probs as the adaptive signal — ConfidenceHead
-      // stays a nice-to-have; adaptive pruning still works (a little coarser).
-      LOG_FIRST_N(WARNING, 1)
-          << "DSpark: draft did not expose selected_hidden; ConfidenceHead "
-          << "disabled for adaptive pruning, using proposal probs.";
-    }
-  }
-
-  BlockSample sampled = [&]() {
-    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-    SamplingParameters sampling_params_on_device =
-        prepared ? input.sampling_params
-                 : input.sampling_params.to(base_logits.device(),
-                                            base_logits.scalar_type());
-    if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
-      force_greedy_draft_sampling(sampling_params_on_device);
-    }
-    return sample_block(
-        base_logits, last_hidden, anchor_token_ids, sampling_params_on_device);
-  }();
-
   DraftBlock draft_block;
-  draft_block.proposal = std::move(sampled.proposal);
-  draft_block.confidence_probs = std::move(sampled.confidence_probs);
-  draft_block.retained_inputs = take_retained_inputs(*draft_output);
+  if (draft_output->draft_proposal.has_value()) {
+    draft_block.proposal = std::move(*draft_output->draft_proposal);
+    draft_block.confidence_probs =
+        std::move(draft_output->draft_confidence_probs);
+  } else {
+    // Native fallback: the model returns logits, so sample the proposal here.
+    CHECK(draft_output->logits.defined())
+        << "DSpark draft forward must return logits.";
+    const int64_t num_rows = draft_output->logits.size(/*dim=*/0);
+    CHECK_EQ(num_rows % num_speculative_tokens, 0)
+        << "DSpark draft logits rows must be divisible by "
+           "num_speculative_tokens.";
+    CHECK_EQ(num_rows / num_speculative_tokens, batch_size)
+        << "DSpark draft logits batch must match the decode batch.";
+    torch::Tensor base_logits = draft_output->logits.view(
+        {batch_size, num_speculative_tokens, draft_output->logits.size(-1)});
+    torch::Tensor last_hidden;
+    if (want_confidence) {
+      if (draft_output->selected_hidden.defined() &&
+          draft_output->selected_hidden.size(0) == num_rows) {
+        last_hidden = draft_output->selected_hidden.view(
+            {batch_size,
+             num_speculative_tokens,
+             draft_output->selected_hidden.size(-1)});
+      } else {
+        LOG_FIRST_N(WARNING, 1)
+            << "DSpark: draft did not expose selected_hidden; ConfidenceHead "
+            << "disabled for adaptive pruning, using proposal probs.";
+      }
+    }
 
+    BlockSample sampled = [&]() {
+      c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+      torch::Tensor anchor_token_ids =
+          processed_input.token_ids.view({batch_size, num_speculative_tokens})
+              .select(1, 0)
+              .to(device_, torch::kLong);
+      SamplingParameters sampling_params_on_device =
+          prepared ? input.sampling_params
+                   : input.sampling_params.to(base_logits.device(),
+                                              base_logits.scalar_type());
+      if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
+        force_greedy_draft_sampling(sampling_params_on_device);
+      }
+      return sample_block(base_logits,
+                          last_hidden,
+                          anchor_token_ids,
+                          sampling_params_on_device);
+    }();
+    draft_block.proposal = std::move(sampled.proposal);
+    draft_block.confidence_probs = std::move(sampled.confidence_probs);
+  }
+  draft_block.failed_request_ids = std::move(draft_output->failed_request_ids);
+  draft_block.retained_inputs = take_retained_inputs(*draft_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
   return draft_block;
@@ -393,9 +311,6 @@ std::string_view DSparkWorkerImpl::draft_prelaunch_input_error(
       (block_copy.src_block_indices.defined() &&
        block_copy.src_block_indices.numel() > 0)) {
     return "KV swap or copy is not supported";
-  }
-  if (!input.transfer_kv_infos.empty()) {
-    return "KV transfers are not supported";
   }
   if (!input.json_object_states.empty() ||
       !input.json_object_state_snapshots.empty()) {
@@ -538,8 +453,8 @@ DFlashWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft_from_pending(
   prepared.input_params.attn_metadata.reset();
   prepared.metadata_ready_event.reset();
   prepared.device_tensors_ready = true;
-  DraftBlock block = execute_draft_query(
-      device_input, std::move(prepared), next.anchor_tokens, true);
+  DraftBlock block =
+      execute_draft_query(device_input, std::move(prepared), true);
   block.retained_tensors.reserve(block.retained_tensors.size() + 8);
   block.retained_tensors.emplace_back(std::move(block_table.blocks));
   block.retained_tensors.emplace_back(std::move(row_indices));
@@ -656,7 +571,15 @@ std::optional<ForwardOutput> DSparkWorkerImpl::step_prefill(
 std::optional<ForwardOutput> DSparkWorkerImpl::step_empty(
     const ForwardInput& input) {
   commit_pending_context();
-  return DFlashWorkerImpl::step_empty(input);
+  if (!input.input_params.meta.batch_forward_type.is_decode()) {
+    return DFlashWorkerImpl::step_empty(input);
+  }
+  ForwardInput empty_input = input;
+  empty_input.input_params.is_dflash_proposal = true;
+  ModelSamplingInput sampling;
+  force_greedy_draft_sampling(sampling.parameters);
+  empty_input.input_params.sampling = std::move(sampling);
+  return DFlashWorkerImpl::step_empty(empty_input);
 }
 
 DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(

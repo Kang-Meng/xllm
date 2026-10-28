@@ -24,8 +24,11 @@ limitations under the License.
 #include <memory>
 #include <vector>
 
+#include "core/framework/model/model_sampling_input.h"
+#include "core/framework/sampling/sampler.h"
 #include "core/runtime/py_attention_metadata.h"
 #include "core/runtime/py_input_batch.h"
+#include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
 #include "platform/layer_synchronizer.h"
 
@@ -41,7 +44,56 @@ namespace py = pybind11;
 namespace xllm {
 namespace {
 
+bool is_unconstrained_greedy(const ModelSamplingInput& input) {
+  const auto& sampling = input.parameters;
+  return sampling.all_greedy_sample && !sampling.return_probs &&
+         !sampling.unique_token_ids.defined() &&
+         !sampling.frequency_penalties.defined() &&
+         !sampling.presence_penalties.defined() &&
+         !sampling.repetition_penalties.defined() &&
+         !sampling.filter_mask.defined() && !sampling.filter_bitmask.defined();
+}
+
 void register_xllm_runtime_module(py::module_& m) {
+  py::class_<SamplingParameters>(m, "SamplingParameters")
+      .def_readonly("all_greedy_sample", &SamplingParameters::all_greedy_sample)
+      .def_readwrite("selected_token_idxes",
+                     &SamplingParameters::selected_token_idxes)
+      .def_readwrite("sample_idxes", &SamplingParameters::sample_idxes)
+      .def_readwrite("logprobs", &SamplingParameters::logprobs)
+      .def_readwrite("max_top_logprobs", &SamplingParameters::max_top_logprobs)
+      .def_readwrite("use_beam_search", &SamplingParameters::use_beam_search);
+  py::class_<ModelSamplingInput, std::shared_ptr<ModelSamplingInput>>(
+      m, "ModelSamplingInput")
+      .def(py::init<const ModelSamplingInput&>())
+      .def_readwrite("parameters", &ModelSamplingInput::parameters)
+      .def_readonly("return_confidence", &ModelSamplingInput::return_confidence)
+      .def_property_readonly("return_probs",
+                             [](const ModelSamplingInput& input) {
+                               return input.parameters.return_probs;
+                             })
+      .def_property_readonly("is_unconstrained_greedy",
+                             &is_unconstrained_greedy);
+  m.def("sampling_parameters_to",
+        [](const SamplingParameters& parameters, const torch::Tensor& logits) {
+          return parameters.to(logits.device(), logits.scalar_type());
+        });
+  m.def("sample_logits",
+        [](torch::Tensor logits, const ModelSamplingInput& input) -> py::tuple {
+          SampleOutput output;
+          {
+            py::gil_scoped_release release;
+            if (is_unconstrained_greedy(input)) {
+              output.next_tokens =
+                  Sampler::greedy_sample(logits).to(torch::kLong);
+            } else {
+              Sampler sampler;
+              output = sampler.forward(logits, input.parameters);
+            }
+          }
+          return py::make_tuple(output.next_tokens,
+                                optional_tensor(output.probs));
+        });
   register_attention_metadata_views(m);
   register_input_batch_metadata_view(m);
   py::class_<LayerSynchronizer, std::shared_ptr<LayerSynchronizer>>(

@@ -24,7 +24,8 @@ exists.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -35,6 +36,12 @@ from xllm.python.attention.csa2_attention import (
     _block_query_lens,
     apply_interleaved_rope,
 )
+from xllm.python.attention.csa2_block_metadata import (
+    Csa2BlockAttentionMetadata,
+    Csa2BlockAttentionMetadataBuilder,
+)
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+from xllm.python.model_executor.sampling_metadata import ModelSamplingMetadata, ModelSamplingMetadataBuilder
 from xllm.python.models import deepseek_v41_dspark as dsp
 from xllm.python.models.deepseek_v41_dspark import (
     CSA2_MODE_SWA,
@@ -43,9 +50,8 @@ from xllm.python.models.deepseek_v41_dspark import (
     anchor_first_query_block,
     dspark_swa_mode,
 )
-from xllm.python.models.deepseek_v41_dspark_graph import DSparkGreedyGraphModel
-from xllm.python.models.dspark import DSparkMarkovHead
-from xllm.python.registry import get_model_class
+from xllm.python.models.dspark_pipeline import DSparkPipeline
+from xllm.python.registry import get_execution_metadata_builder_classes, get_model_class
 
 # Tiny draft geometry: hidden 32 / head_dim 64 (QDQ group 32) / rope 16 /
 # 2 draft layers over 2 captured target layers.
@@ -227,7 +233,7 @@ def _with_patched_forward_context(monkeypatch: pytest.MonkeyPatch, backend) -> N
     import xllm.python.models.deepseek_v41 as v41
 
     context = SimpleNamespace(attention_backend=backend, metadata=SimpleNamespace(), execution_contexts={})
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
+
     monkeypatch.setattr(v41, "get_forward_context", lambda: context)
 
 
@@ -294,7 +300,7 @@ def test_config_accepts_the_cpp_routed_draft_model_type() -> None:
     assert cfg.num_draft_layers == len(cfg.dspark_target_layer_ids) == 2
     lm = DeepseekV41DSparkForCausalLM(_config_dict(model_type="deepseek_v41_dspark"))
     assert lm.cfg.model_type == "deepseek_v41_dspark"
-    assert len(lm.model.layers) == 2
+    assert len(lm.model.backbone.layers) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +316,8 @@ def test_draft_layers_are_pure_swa_and_moe() -> None:
 
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
     assert lm.quant_mode == "none"
-    assert len(lm.model.layers) == 2
-    for layer in lm.model.layers:
+    assert len(lm.model.backbone.layers) == 2
+    for layer in lm.model.backbone.layers:
         attn = layer.self_attn
         assert attn.mode.mode == CSA2_MODE_SWA
         assert attn.mode.compress_ratio == 0
@@ -322,19 +328,19 @@ def test_draft_layers_are_pure_swa_and_moe() -> None:
         assert layer.mlp.topk == 2
         assert layer.engram is None
     cfg = lm.cfg
-    assert lm.model.main_proj.in_features == cfg.main_proj_in_features
-    assert lm.model.main_proj.linear.weight.shape == (cfg.hidden_size, cfg.main_proj_in_features)
-    assert lm.model.main_norm.weight.shape == (cfg.hidden_size,)
-    assert lm.model.norm.weight.shape == (cfg.hidden_size,)
-    assert lm.model.embed_tokens.weight.shape == (cfg.vocab_size, cfg.hidden_size)
+    assert lm.model.backbone.main_proj.in_features == cfg.main_proj_in_features
+    assert lm.model.backbone.main_proj.linear.weight.shape == (cfg.hidden_size, cfg.main_proj_in_features)
+    assert lm.model.backbone.main_norm.weight.shape == (cfg.hidden_size,)
+    assert lm.model.backbone.norm.weight.shape == (cfg.hidden_size,)
+    assert lm.model.backbone.embed_tokens.weight.shape == (cfg.vocab_size, cfg.hidden_size)
     # V4.1 ships no learned hc_head: the last block's pre_mix collapse is the
     # production head, so the parameters stay unregistered.
-    assert lm.model.hc_head_fn is None and lm.model.hc_head_base is None
-    assert lm.lm_head is None
-    assert tuple(lm.markov_head.markov_w1.weight.shape) == (cfg.vocab_size, cfg.markov_rank)
-    assert tuple(lm.markov_head.markov_w2.weight.shape) == (cfg.vocab_size, cfg.markov_rank)
-    assert lm.confidence_head is not None
-    assert tuple(lm.confidence_head.proj.weight.shape) == (1, cfg.hidden_size + cfg.markov_rank)
+    assert lm.model.backbone.hc_head_fn is None and lm.model.backbone.hc_head_base is None
+    assert lm.model.lm_head is None
+    assert tuple(lm.model.markov_head.markov_w1.weight.shape) == (cfg.vocab_size, cfg.markov_rank)
+    assert tuple(lm.model.markov_head.markov_w2.weight.shape) == (cfg.vocab_size, cfg.markov_rank)
+    assert lm.model.confidence_head is not None
+    assert tuple(lm.model.confidence_head.proj.weight.shape) == (1, cfg.hidden_size + cfg.markov_rank)
     assert lm.has_dspark_confidence_head()
 
 
@@ -347,20 +353,20 @@ def _assert_loaded(lm: DeepseekV41DSparkForCausalLM, tensors: dict[str, torch.Te
     """Every ``mtp.*`` tensor must land in its documented parameter."""
     cfg = lm.cfg
     last = cfg.num_draft_layers - 1
-    assert torch.equal(lm.model.embed_tokens.weight, tensors["mtp.0.embed.weight"])
-    assert torch.equal(lm.model.main_proj.linear.weight, tensors["mtp.0.main_proj.weight"])
-    assert torch.equal(lm.model.main_norm.weight, tensors["mtp.0.main_norm.weight"])
-    assert torch.equal(lm.model.norm.weight, tensors[f"mtp.{last}.norm.weight"])
-    assert lm.lm_head is not None
-    assert torch.equal(lm.lm_head.weight, tensors[f"mtp.{last}.head.weight"])
-    assert torch.equal(lm.markov_head.markov_w1.weight, tensors[f"mtp.{last}.markov_head.markov_w1.weight"])
-    assert torch.equal(lm.markov_head.markov_w2.weight, tensors[f"mtp.{last}.markov_head.markov_w2.weight"])
-    assert lm.confidence_head is not None
-    assert torch.equal(lm.confidence_head.proj.weight, tensors[f"mtp.{last}.confidence_head.proj.weight"])
+    assert torch.equal(lm.model.backbone.embed_tokens.weight, tensors["mtp.0.embed.weight"])
+    assert torch.equal(lm.model.backbone.main_proj.linear.weight, tensors["mtp.0.main_proj.weight"])
+    assert torch.equal(lm.model.backbone.main_norm.weight, tensors["mtp.0.main_norm.weight"])
+    assert torch.equal(lm.model.backbone.norm.weight, tensors[f"mtp.{last}.norm.weight"])
+    assert lm.model.lm_head is not None
+    assert torch.equal(lm.model.lm_head.weight, tensors[f"mtp.{last}.head.weight"])
+    assert torch.equal(lm.model.markov_head.markov_w1.weight, tensors[f"mtp.{last}.markov_head.markov_w1.weight"])
+    assert torch.equal(lm.model.markov_head.markov_w2.weight, tensors[f"mtp.{last}.markov_head.markov_w2.weight"])
+    assert lm.model.confidence_head is not None
+    assert torch.equal(lm.model.confidence_head.proj.weight, tensors[f"mtp.{last}.confidence_head.proj.weight"])
 
     for stage in range(cfg.num_draft_layers):
         ck = f"mtp.{stage}."
-        layer = lm.model.layers[stage]
+        layer = lm.model.backbone.layers[stage]
         attn = layer.self_attn
         assert torch.equal(attn.q_a_proj.weight, tensors[ck + "attn.wq_a.weight"])
         assert torch.equal(attn.q_b_proj.weight, tensors[ck + "attn.wq_b.weight"])
@@ -421,9 +427,9 @@ def test_checkpoint_loads_shared_vocab_fallback() -> None:
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
     tensors = _build_checkpoint(cfg, lambda key, shape: torch.randn(shape), dedicated_vocab=False)
     _load(lm, tensors)
-    assert torch.equal(lm.model.embed_tokens.weight, tensors["embed.weight"])
-    assert lm.lm_head is not None
-    assert torch.equal(lm.lm_head.weight, tensors["head.weight"])
+    assert torch.equal(lm.model.backbone.embed_tokens.weight, tensors["embed.weight"])
+    assert lm.model.lm_head is not None
+    assert torch.equal(lm.model.lm_head.weight, tensors["head.weight"])
 
 
 def test_dedicated_vocab_source_wins_over_fallback() -> None:
@@ -435,17 +441,17 @@ def test_dedicated_vocab_source_wins_over_fallback() -> None:
     tensors["embed.weight"] = torch.full((cfg.vocab_size, cfg.hidden_size), 7.0)
     tensors["head.weight"] = torch.full((cfg.vocab_size, cfg.hidden_size), 9.0)
     _load(lm, tensors)
-    assert torch.equal(lm.model.embed_tokens.weight, tensors["mtp.0.embed.weight"])
-    assert lm.lm_head is not None
-    assert torch.equal(lm.lm_head.weight, tensors[f"mtp.{last}.head.weight"])
+    assert torch.equal(lm.model.backbone.embed_tokens.weight, tensors["mtp.0.embed.weight"])
+    assert lm.model.lm_head is not None
+    assert torch.equal(lm.model.lm_head.weight, tensors[f"mtp.{last}.head.weight"])
 
 
 def test_confidence_head_is_bias_less_in_the_checkpoint() -> None:
     torch.manual_seed(6)
     cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    assert lm.confidence_head is not None
-    head = lm.confidence_head
+    assert lm.model.confidence_head is not None
+    head = lm.model.confidence_head
     with torch.no_grad():
         head.proj.bias.fill_(0.25)  # module-init bias the checkpoint does not own
     tensors = _build_checkpoint(cfg, lambda key, shape: torch.randn(shape))
@@ -459,9 +465,9 @@ def test_confidence_head_bias_loads_when_present() -> None:
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
     tensors = _build_checkpoint(cfg, lambda key, shape: torch.randn(shape), confidence_bias=True)
     _load(lm, tensors)
-    assert lm.confidence_head is not None
+    assert lm.model.confidence_head is not None
     last = cfg.num_draft_layers - 1
-    assert torch.equal(lm.confidence_head.proj.bias, tensors[f"mtp.{last}.confidence_head.proj.bias"])
+    assert torch.equal(lm.model.confidence_head.proj.bias, tensors[f"mtp.{last}.confidence_head.proj.bias"])
 
 
 def test_optional_hc_head_registers_and_collapses() -> None:
@@ -471,17 +477,17 @@ def test_optional_hc_head_registers_and_collapses() -> None:
     tensors = _build_checkpoint(cfg, lambda key, shape: torch.randn(shape), hc_head=True)
     _load(lm, tensors)
     last = cfg.num_draft_layers - 1
-    assert lm.model.hc_head_fn is not None
-    assert torch.equal(lm.model.hc_head_fn, tensors[f"mtp.{last}.hc_head_fn"])
-    assert torch.equal(lm.model.hc_head_scale, tensors[f"mtp.{last}.hc_head_scale"])
+    assert lm.model.backbone.hc_head_fn is not None
+    assert torch.equal(lm.model.backbone.hc_head_fn, tensors[f"mtp.{last}.hc_head_fn"])
+    assert torch.equal(lm.model.backbone.hc_head_scale, tensors[f"mtp.{last}.hc_head_scale"])
 
     hidden = torch.randn(3, cfg.hc_mult, cfg.hidden_size)
     flat = hidden.flatten(1).float()
     rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + cfg.rms_norm_eps)
-    mixes = flat @ lm.model.hc_head_fn.T * rsqrt
-    pre = torch.sigmoid(mixes * lm.model.hc_head_scale + lm.model.hc_head_base) + cfg.hc_eps
+    mixes = flat @ lm.model.backbone.hc_head_fn.T * rsqrt
+    pre = torch.sigmoid(mixes * lm.model.backbone.hc_head_scale + lm.model.backbone.hc_head_base) + cfg.hc_eps
     expected = (pre.unsqueeze(-1) * hidden.float()).sum(1)
-    torch.testing.assert_close(lm.model._collapse_last_hidden(hidden, None), expected)
+    torch.testing.assert_close(lm.model.backbone._collapse_last_hidden(hidden, None), expected)
 
 
 def test_no_hc_head_uses_the_last_block_pre_mix_collapse() -> None:
@@ -490,11 +496,11 @@ def test_no_hc_head_uses_the_last_block_pre_mix_collapse() -> None:
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
     tensors = _build_checkpoint(cfg, lambda key, shape: torch.randn(shape))
     _load(lm, tensors)
-    assert lm.model.hc_head_fn is None
+    assert lm.model.backbone.hc_head_fn is None
     hidden = torch.randn(2, cfg.hc_mult, cfg.hidden_size)
     pre_mix = torch.rand(2, cfg.hc_mult)
-    expected = lm.model.layers[-1].hc.hc_pre(hidden, pre_mix)
-    torch.testing.assert_close(lm.model._collapse_last_hidden(hidden, pre_mix), expected)
+    expected = lm.model.backbone.layers[-1].hc.hc_pre(hidden, pre_mix)
+    torch.testing.assert_close(lm.model.backbone._collapse_last_hidden(hidden, pre_mix), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +588,7 @@ def test_ascend_w8a8_mapping_shards_only_the_projections(
     hidden = cfg.hidden_size
     for stage in range(cfg.num_draft_layers):
         ck = f"mtp.{stage}."
-        attn = lm.model.layers[stage].self_attn
+        attn = lm.model.backbone.layers[stage].self_attn
         # Output-dim shard: rows are the rank's slice of the checkpoint tensor.
         rows = cfg.n_heads * cfg.head_dim // tp_size
         assert attn.q_b_proj.weight.shape == (rows, cfg.q_lora_rank)
@@ -595,16 +601,16 @@ def test_ascend_w8a8_mapping_shards_only_the_projections(
         )
         assert attn.o_b_proj.weight.shape == (hidden, cfg.o_groups * cfg.o_lora_rank // tp_size)
         assert attn.attn_sink.shape == (cfg.n_heads // tp_size,)
-    assert lm.model.main_proj.w8a8 is not None
-    assert torch.equal(lm.model.main_proj.w8a8.weight, tensors["mtp.0.main_proj.weight"][: hidden // tp_size])
+    assert lm.model.backbone.main_proj.w8a8 is not None
+    assert torch.equal(lm.model.backbone.main_proj.w8a8.weight, tensors["mtp.0.main_proj.weight"][: hidden // tp_size])
     # The markov / confidence heads must stay replicated under TP.
-    assert tuple(lm.markov_head.markov_w1.weight.shape) == (cfg.vocab_size, cfg.dspark_markov_rank)
+    assert tuple(lm.model.markov_head.markov_w1.weight.shape) == (cfg.vocab_size, cfg.dspark_markov_rank)
     assert torch.equal(
-        lm.markov_head.markov_w1.weight,
+        lm.model.markov_head.markov_w1.weight,
         tensors[f"mtp.{cfg.num_draft_layers - 1}.markov_head.markov_w1.weight"],
     )
-    assert lm.confidence_head is not None
-    assert tuple(lm.confidence_head.proj.weight.shape) == (
+    assert lm.model.confidence_head is not None
+    assert tuple(lm.model.confidence_head.proj.weight.shape) == (
         1,
         cfg.hidden_size + cfg.dspark_markov_rank,
     )
@@ -650,8 +656,8 @@ def test_ascend_load_implies_a_zero_weight_offset(monkeypatch: pytest.MonkeyPatc
     tensors = _build_w8a8_checkpoint(cfg)
     del tensors["mtp.0.main_proj.weight_offset"]
     lm.load_weights([_FakeStateDict(tensors)], 0, 1)
-    assert lm.model.main_proj.w8a8 is not None
-    assert torch.count_nonzero(lm.model.main_proj.w8a8.weight_offset) == 0
+    assert lm.model.backbone.main_proj.w8a8 is not None
+    assert torch.count_nonzero(lm.model.backbone.main_proj.w8a8.weight_offset) == 0
 
 
 # -- main_proj layout adapts to the checkpoint export ------------------------
@@ -674,23 +680,23 @@ def test_ascend_main_proj_bf16_when_the_export_declares_float(
     cfg = DeepseekV41DSparkConfig.from_dict(config)
     lm = DeepseekV41DSparkForCausalLM(config)
     assert lm.quant_mode == "ascend"
-    assert lm.model.main_proj.quantized is False
-    assert lm.model.main_proj.w8a8 is None
-    assert lm.model.main_proj.linear is not None
+    assert lm.model.backbone.main_proj.quantized is False
+    assert lm.model.backbone.main_proj.w8a8 is None
+    assert lm.model.backbone.main_proj.linear is not None
     tensors = _build_w8a8_checkpoint(cfg, main_proj_float=True)
     lm.load_weights([_FakeStateDict(tensors)], 0, tp_size)
 
     hidden = cfg.hidden_size
     # BF16 path shards the output dim like the W8A8 path did.
     assert torch.equal(
-        lm.model.main_proj.linear.weight,
+        lm.model.backbone.main_proj.linear.weight,
         tensors["mtp.0.main_proj.weight"][: hidden // tp_size],
     )
-    assert torch.equal(lm.model.main_norm.weight, tensors["mtp.0.main_norm.weight"])
+    assert torch.equal(lm.model.backbone.main_norm.weight, tensors["mtp.0.main_norm.weight"])
     # The projections the export does quantize keep the W8A8 path.
-    assert lm.model.layers[0].self_attn.q_a_proj.weight.dtype == torch.int8
+    assert lm.model.backbone.layers[0].self_attn.q_a_proj.weight.dtype == torch.int8
     assert torch.equal(
-        lm.model.layers[0].self_attn.q_a_proj.weight,
+        lm.model.backbone.layers[0].self_attn.q_a_proj.weight,
         tensors["mtp.0.attn.wq_a.weight"],
     )
 
@@ -716,7 +722,7 @@ def test_ascend_main_proj_declared_w8a8_but_exported_bf16_fails_fast(monkeypatch
     config = _config_dict(model_path=str(tmp_path))
     cfg = DeepseekV41DSparkConfig.from_dict(config)
     lm = DeepseekV41DSparkForCausalLM(config)
-    assert lm.model.main_proj.quantized is True
+    assert lm.model.backbone.main_proj.quantized is True
     tensors = _build_w8a8_checkpoint(cfg, main_proj_float=True)
     # Mirror the real export's BF16 storage rather than the tiny test dtype.
     tensors["mtp.0.main_proj.weight"] = tensors["mtp.0.main_proj.weight"].to(torch.bfloat16)
@@ -728,9 +734,9 @@ def test_non_ascend_checkpoint_never_quantizes_main_proj() -> None:
     """The bf16/fp8 modes always build the dense main_proj (no metadata read)."""
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
     assert lm.quant_mode != "ascend"
-    assert lm.model.main_proj.quantized is False
-    assert lm.model.main_proj.linear is not None
-    assert lm.model.main_proj.w8a8 is None
+    assert lm.model.backbone.main_proj.quantized is False
+    assert lm.model.backbone.main_proj.linear is not None
+    assert lm.model.backbone.main_proj.w8a8 is None
 
 
 def test_checkpoint_weight_is_quantized_reads_the_description(tmp_path) -> None:
@@ -755,8 +761,8 @@ def test_markov_head_loads_the_production_export_names(tmp_path) -> None:
     tensors[f"mtp.{last}.markov_head.embed.weight"] = tensors.pop(f"mtp.{last}.markov_head.markov_w1.weight")
     tensors[f"mtp.{last}.markov_head.head.weight"] = tensors.pop(f"mtp.{last}.markov_head.markov_w2.weight")
     _load(lm, tensors)
-    assert torch.equal(lm.markov_head.markov_w1.weight, tensors[f"mtp.{last}.markov_head.embed.weight"])
-    assert torch.equal(lm.markov_head.markov_w2.weight, tensors[f"mtp.{last}.markov_head.head.weight"])
+    assert torch.equal(lm.model.markov_head.markov_w1.weight, tensors[f"mtp.{last}.markov_head.embed.weight"])
+    assert torch.equal(lm.model.markov_head.markov_w2.weight, tensors[f"mtp.{last}.markov_head.head.weight"])
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +783,7 @@ def test_write_context_kv_matches_eager_reference() -> None:
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
     tensors = _build_checkpoint(cfg, lambda key, shape: torch.randn(shape))
     _load(lm, tensors)
-    model = lm.model
+    model = lm.model.backbone
 
     target_hidden = torch.randn(3, cfg.main_proj_in_features)
     positions = torch.tensor([4, 5, 6])
@@ -816,13 +822,13 @@ def test_write_context_kv_accepts_layer_cache_slots_and_tuple_form() -> None:
     slots = torch.tensor([1, 2])
     bare = [torch.zeros(8, cfg.head_dim) for _ in range(cfg.num_draft_layers)]
     named = [LayerCache(key=None, value=None, swa=cache) for cache in bare]
-    lm.model.write_context_kv(hidden, positions, slots, named, None)
+    lm.model.backbone.write_context_kv(hidden, positions, slots, named, None)
     assert torch.count_nonzero(named[0].swa[slots]) > 0
     # A tuple form that does not reach the SWA slot (index 5 of the LayerCache
     # schema) must fail loudly instead of silently dropping the context rows.
     tuples = [(None, None, None, cache) for cache in bare]
     with pytest.raises(RuntimeError, match="missing the SWA pool"):
-        lm.model.write_context_kv(hidden, positions, slots, tuples, None)
+        lm.model.backbone.write_context_kv(hidden, positions, slots, tuples, None)
 
 
 def test_write_context_kv_validates_cache_sizes() -> None:
@@ -835,9 +841,9 @@ def test_write_context_kv_validates_cache_sizes() -> None:
     slots = torch.tensor([1, 2])
     caches = [torch.zeros(8, cfg.head_dim) for _ in range(cfg.num_draft_layers)]
     with pytest.raises(ValueError, match="layer count mismatch"):
-        lm.model.write_context_kv(hidden, positions, slots, caches[:-1], None)
+        lm.model.backbone.write_context_kv(hidden, positions, slots, caches[:-1], None)
     with pytest.raises(ValueError, match="slot count mismatch"):
-        lm.model.write_context_kv(hidden, positions, slots[:1], caches, None)
+        lm.model.backbone.write_context_kv(hidden, positions, slots[:1], caches, None)
 
 
 class _StopAfterFirstLayer:
@@ -853,7 +859,9 @@ def test_write_context_kv_returns_none_when_a_layer_event_fails() -> None:
     hidden = torch.randn(2, cfg.main_proj_in_features)
     caches = [torch.zeros(8, cfg.head_dim) for _ in range(cfg.num_draft_layers)]
     assert (
-        lm.model.write_context_kv(hidden, torch.tensor([1, 2]), torch.tensor([1, 2]), caches, _StopAfterFirstLayer())
+        lm.model.backbone.write_context_kv(
+            hidden, torch.tensor([1, 2]), torch.tensor([1, 2]), caches, _StopAfterFirstLayer()
+        )
         is None
     )
 
@@ -870,9 +878,9 @@ def test_anchor_first_query_block_places_noise_after_the_anchor() -> None:
         anchor_first_query_block(torch.tensor([1]), block_size=0, noise_token_id=7)
     cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    assert lm.model.block_size == cfg.dspark_block_size
-    assert lm.model.noise_token_id == cfg.dspark_noise_token_id
-    assert lm.model.anchor_first_query_block(torch.tensor([5])).tolist() == [[5, 7, 7]]
+    assert lm.model.backbone.block_size == cfg.dspark_block_size
+    assert lm.model.backbone.noise_token_id == cfg.dspark_noise_token_id
+    assert lm.model.backbone.anchor_first_query_block(torch.tensor([5])).tolist() == [[5, 7, 7]]
 
 
 def _draft_group_infos() -> list:
@@ -920,15 +928,14 @@ def test_draft_step_runs_the_block_in_one_parallel_pass(
 
     backend = _DraftStubBackend(on_layer)
     _with_patched_forward_context(monkeypatch, backend)
-    block = lm.model.anchor_first_query_block(torch.tensor([5]))
+    block = lm.model.backbone.anchor_first_query_block(torch.tensor([5]))
     positions = torch.arange(cfg.dspark_block_size, dtype=torch.int64)
-    out = lm.model(block.reshape(-1), positions)
+    out = lm.model.backbone(block.reshape(-1), positions)
 
     block_size = cfg.dspark_block_size
     assert out.shape == (block_size, cfg.hidden_size)
     assert torch.isfinite(out).all()
-    # The draft owns one SWA group, so it consumes exactly the leading manager.
-    assert backend.group_limits == [1]
+    assert backend.group_limits == []
     # One non-causal attention pass per draft layer over the whole block (a
     # serial per-token MTP walk would emit block_size calls per layer).
     head_dim = cfg.head_dim
@@ -945,17 +952,17 @@ def test_draft_forward_uses_the_rotary_and_norm_head(monkeypatch: pytest.MonkeyP
     captured = {}
 
     _with_patched_forward_context(monkeypatch, _DraftStubBackend())
-    original = lm.model._collapse_last_hidden
+    original = lm.model.backbone._collapse_last_hidden
 
     def spy(hidden, pre_mix):
         captured["idden"] = hidden.detach().clone()
         captured["pre_mix"] = pre_mix
         return original(hidden, pre_mix)
 
-    monkeypatch.setattr(lm.model, "_collapse_last_hidden", spy)
-    block = lm.model.anchor_first_query_block(torch.tensor([5]))
-    out = lm.model(block.reshape(-1), torch.arange(cfg.dspark_block_size, dtype=torch.int64))
-    expected = lm.model.norm(original(captured["idden"], captured["pre_mix"]))
+    monkeypatch.setattr(lm.model.backbone, "_collapse_last_hidden", spy)
+    block = lm.model.backbone.anchor_first_query_block(torch.tensor([5]))
+    out = lm.model.backbone(block.reshape(-1), torch.arange(cfg.dspark_block_size, dtype=torch.int64))
+    expected = lm.model.backbone.norm(original(captured["idden"], captured["pre_mix"]))
     torch.testing.assert_close(out, expected)
     assert captured["idden"].shape == (cfg.dspark_block_size, cfg.hc_mult, cfg.hidden_size)
 
@@ -963,103 +970,6 @@ def test_draft_forward_uses_the_rotary_and_norm_head(monkeypatch: pytest.MonkeyP
 # ---------------------------------------------------------------------------
 # Draft cache-group contract (shared request metadata, own manager tables)
 # ---------------------------------------------------------------------------
-
-
-def test_draft_attention_consumes_only_its_own_manager_tables(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The request carries the target's 3 group tables; the draft reads 1."""
-    torch.manual_seed(17)
-    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    _load(lm, _build_checkpoint(cfg, lambda key, shape: torch.randn(shape)))
-
-    seen: dict[str, object] = {}
-
-    class _RecordingBackend(_DraftStubBackend):
-        def prepare_dsa_metadata_for_forward(self, metadata, *, group_limit=None) -> None:
-            seen["group_limit"] = group_limit
-            seen["tables"] = len(metadata.multi_block_tables)
-            super().prepare_dsa_metadata_for_forward(metadata, group_limit=group_limit)
-
-    backend = _RecordingBackend()
-    context = SimpleNamespace(
-        execution_contexts={},
-        attention_backend=backend,
-        metadata=SimpleNamespace(multi_block_tables=[object(), object(), object()]),
-    )
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-    positions = torch.arange(cfg.dspark_block_size, dtype=torch.int64)
-    lm.model._prepare_attention(positions)
-
-    # The request exposes the target's [SWA, C2, C1]; the draft owns one group.
-    assert seen["tables"] == 3
-    assert seen["group_limit"] == 1
-    assert backend.group_limits == [1]
-
-
-def test_draft_attention_marks_acl_graph_and_exports_query_width(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    backend = _DraftStubBackend()
-    metadata = SimpleNamespace(multi_block_tables=[object()])
-    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-    monkeypatch.setattr(dsp, "in_acl_graph", lambda: True)
-
-    lm.model._prepare_attention(torch.arange(cfg.dspark_block_size, dtype=torch.int64))
-
-    assert metadata.dsa_graph_mode is True
-    assert context.execution_contexts[Csa2QueryLayout] == Csa2QueryLayout(cfg.dspark_block_size, shared_window=True)
-
-
-def test_draft_acl_capture_reuses_graph_metadata_built_by_warmup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    backend = _DraftStubBackend()
-    persistent = SimpleNamespace(is_acl_graph=True)
-    metadata = SimpleNamespace(
-        multi_block_tables=[object()],
-        dsa_metadata=persistent,
-        dsa_graph_block_table_cols=4,
-    )
-    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-    monkeypatch.setattr(dsp, "in_acl_graph", lambda: True)
-    positions = torch.arange(cfg.dspark_block_size, dtype=torch.int64)
-
-    lm.model._prepare_attention(positions)
-
-    assert metadata.dsa_metadata is persistent
-    assert metadata.dsa_graph_mode is True
-    assert metadata.dsa_positions is positions
-    assert backend.group_limits == []
-    assert context.execution_contexts[Csa2QueryLayout] == Csa2QueryLayout(cfg.dspark_block_size, shared_window=True)
-
-
-def test_draft_graph_warmup_builds_graph_mode_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    backend = _DraftStubBackend()
-    metadata = SimpleNamespace(
-        multi_block_tables=[object()],
-        dsa_metadata=None,
-        dsa_graph_block_table_cols=4,
-    )
-    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-    monkeypatch.setattr(dsp, "in_acl_graph", lambda: False)
-
-    lm.model._prepare_attention(torch.arange(cfg.dspark_block_size, dtype=torch.int64))
-
-    assert metadata.dsa_graph_mode is True
-    assert backend.group_limits == [1]
 
 
 def test_draft_graph_query_rows_regroup_into_complete_blocks() -> None:
@@ -1290,157 +1200,163 @@ def test_draft_graph_defers_ring_writes_without_dynamic_filter(
     torch.testing.assert_close(case.cache.view(-1, case.kv.size(-1))[case.slots.long()], case.kv)
 
 
-@pytest.mark.parametrize("dummy,chunked,expected", [(False, False, True), (True, False, False), (False, True, False)])
-def test_draft_token_row_contract_is_explicit(
-    monkeypatch: pytest.MonkeyPatch, dummy: bool, chunked: bool, expected: bool
+@pytest.mark.parametrize("persistent", [False, True])
+def test_registered_block_metadata_preserves_attention_and_write_order(
+    _draft_ring_attention: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    persistent: bool,
 ) -> None:
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    backend = _DraftStubBackend()
-    metadata = SimpleNamespace(max_query_len=1, is_prefill=False, is_chunked_prefill=chunked, is_dummy=dummy)
-    context = SimpleNamespace(attention_backend=backend, metadata=metadata, execution_contexts={})
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-    lm.model._prepare_attention(torch.arange(3))
-    assert context.execution_contexts[Csa2QueryLayout].token_rows is expected
+    from xllm.python.attention import csa2_attention as csa2
+    from xllm.python.model_executor.input_batch import InputBatch
 
-
-@pytest.mark.parametrize("capture", [False, True])
-def test_draft_query_layout_uses_forward_context_with_slotted_metadata(capture: bool) -> None:
-    from xllm.python.model_executor.forward_context import ForwardContext, forward_context
-    from xllm.python.model_executor.runners.decode_acl_graph import _StaticAttentionMetadata
-
-    model = DeepseekV41DSparkForCausalLM(_config_dict())
-    metadata = _StaticAttentionMetadata(
-        slot_mapping=torch.empty(0, dtype=torch.int64),
-        paged_kv_indptr=torch.empty(0, dtype=torch.int32),
-        paged_kv_indices=torch.empty(0, dtype=torch.int32),
-        paged_kv_last_page_len=torch.empty(0, dtype=torch.int32),
-        multi_block_tables=(torch.zeros(1, 1, dtype=torch.int32),),
+    case = _draft_ring_attention
+    positions = torch.arange(case.previous, case.previous + case.width)
+    batch = InputBatch.from_runtime(
+        torch.arange(case.width),
+        positions,
+        SimpleNamespace(
+            num_reqs=1,
+            num_tokens=case.width,
+            num_scheduled_tokens=[case.width],
+            num_computed_tokens=[],
+            query_start_loc=[0, case.width],
+            is_prefilling=[False],
+        ),
+        is_dummy=False,
     )
+    builder = Csa2BlockAttentionMetadataBuilder(case.width, case.win, 32)
+    source = SimpleNamespace(multi_block_tables=(case.dsa.block_tables[0][0], object()))
+    if persistent:
+        metadata = builder.allocate_persistent(batch, source)
+        builder.update_persistent(metadata, batch, source)
+    else:
+        metadata = builder.build(batch, source)
+
+    events: list[str] = []
+    attention, scatter = case.backend._csa2_attention, csa2._scatter_by_slot
+
+    def record_attention(*args: object, **kwargs: object) -> torch.Tensor:
+        events.append("attention")
+        return attention(*args, **kwargs)
+
+    def record_scatter(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
+        events.append("scatter")
+        scatter(cache, slots, values)
+
+    def reject_legacy_preparation(*args: object, **kwargs: object) -> None:
+        pytest.fail("registered block metadata must not use legacy DSA preparation or dynamic write filtering")
+
+    monkeypatch.setattr(case.backend, "_csa2_attention", record_attention)
+    monkeypatch.setattr(case.backend, "_current_forward_metadata", reject_legacy_preparation)
+    monkeypatch.setattr(csa2, "_scatter_by_slot", record_scatter)
+    monkeypatch.setattr(csa2, "last_ring_writes", reject_legacy_preparation)
+    context = ForwardContext(
+        case.backend,
+        torch.device("cpu"),
+        SimpleNamespace(),
+        [],
+        execution_contexts={Csa2BlockAttentionMetadata: metadata},
+    )
+    with forward_context(context):
+        actual = case.backend.execute_csa2_layer(case.q, case.kv, case.layer)
+    keys = torch.cat((case.history, case.kv))
+    expected = keys.sum(dim=0) / (case.win + case.width + 1)
+    torch.testing.assert_close(actual, expected.view(1, 1, -1).expand_as(actual))
+    assert events == ["attention", "scatter"]
+    torch.testing.assert_close(case.cache.view(-1, case.kv.size(-1))[metadata.slot_mapping.long()], case.kv)
+
+
+def test_registered_dummy_block_does_not_read_or_modify_live_cache(_draft_ring_attention: SimpleNamespace) -> None:
+    from xllm.python.model_executor.input_batch import InputBatch
+
+    case = _draft_ring_attention
+    batch = InputBatch.from_runtime(
+        torch.zeros(case.width, dtype=torch.int64),
+        torch.zeros(case.width, dtype=torch.int32),
+        SimpleNamespace(
+            num_reqs=0,
+            num_tokens=case.width,
+            num_scheduled_tokens=[],
+            num_computed_tokens=[],
+            query_start_loc=[0],
+            is_prefilling=[],
+        ),
+        is_dummy=True,
+    )
+    builder = Csa2BlockAttentionMetadataBuilder(case.width, case.win, 32)
+    metadata = builder.allocate_persistent(batch, SimpleNamespace())
+    builder.update_persistent(metadata, batch, SimpleNamespace())
+    case.cache[0].fill_(float("nan"))
+    live_cache = case.cache[1:].clone()
+    context = ForwardContext(
+        case.backend,
+        torch.device("cpu"),
+        SimpleNamespace(),
+        [],
+        execution_contexts={Csa2BlockAttentionMetadata: metadata},
+    )
+    with forward_context(context):
+        output = case.backend.execute_csa2_layer(case.q, case.kv, case.layer)
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(case.cache[1:], live_cache)
+
+
+def test_pipeline_checkpoint_without_own_head_can_share_target_head() -> None:
+    model = DeepseekV41DSparkForCausalLM(_config_dict())
+    tensors = _build_checkpoint(model.cfg, lambda key, shape: torch.randn(shape))
+    del tensors[f"mtp.{model.cfg.num_draft_layers - 1}.head.weight"]
+    _load(model, tensors)
+    assert model.model.lm_head is None
+    head = torch.nn.Linear(model.cfg.hidden_size, model.cfg.vocab_size, bias=False)
+    model.share_weights_from(SimpleNamespace(get_lm_head=lambda: head))
+    assert model.model.lm_head is head
+
+
+def test_pipeline_matches_sequential_greedy_markov(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(29)
+    model = DeepseekV41DSparkForCausalLM(_config_dict())
+    _load(model, _build_checkpoint(model.cfg, lambda key, shape: torch.randn(shape)))
+    assert isinstance(model.model, DSparkPipeline)
+    assert ModelSamplingMetadataBuilder in get_execution_metadata_builder_classes("deepseek_v41_dspark")
+    assert Csa2BlockAttentionMetadataBuilder in get_execution_metadata_builder_classes("deepseek_v41_dspark")
+    hidden = torch.randn(6, model.cfg.hidden_size)
+    monkeypatch.setattr(model.model.backbone, "forward", lambda *args: hidden)
+    sampling = SimpleNamespace(
+        is_unconstrained_greedy=True,
+        return_probs=False,
+        return_confidence=False,
+        parameters=SimpleNamespace(all_greedy_sample=True),
+    )
+    runtime = ModuleType("xllm_runtime")
+    runtime.ModelSamplingInput = lambda value: value
+    runtime.sample_logits = lambda logits, sampling_input: (logits.argmax(-1), None)
+    monkeypatch.setitem(sys.modules, "xllm_runtime", runtime)
+    input_ids = torch.tensor([2, 7, 7, 4, 7, 7], dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
     context = ForwardContext(
         _DraftStubBackend(),
         torch.device("cpu"),
-        metadata,
+        SimpleNamespace(),
         [],
-        acl_graph=object() if capture else None,
+        execution_contexts={ModelSamplingMetadata: ModelSamplingMetadata(sampling, 6)},
     )
     with forward_context(context):
-        model.model._prepare_attention(torch.arange(model.cfg.dspark_block_size))
-    assert context.execution_contexts[Csa2QueryLayout] == Csa2QueryLayout(
-        model.cfg.dspark_block_size, shared_window=True
-    )
-    assert not hasattr(metadata, "csa2_query_layout")
-    assert metadata.dsa_graph_mode is capture
-
-
-def test_graph_checkpoint_without_own_head_is_rejected_during_weight_load() -> None:
-    config = {**_config_dict(), "draft_graph_enabled": True}
-    model = DeepseekV41DSparkForCausalLM(config)
-    tensors = _build_checkpoint(model.cfg, lambda key, shape: torch.randn(shape))
-    del tensors[f"mtp.{model.cfg.num_draft_layers - 1}.head.weight"]
-    with pytest.raises(ValueError, match="own LM head"):
-        _load(model, tensors)
-
-
-def test_full_graph_model_matches_sequential_greedy_markov() -> None:
-    class _Body(torch.nn.Module):
-        def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-            del positions
-            return torch.stack((input_ids.float(), torch.ones_like(input_ids).float()), dim=-1)
-
-    owner = torch.nn.Module()
-    owner.model = _Body()
-    owner.lm_head = torch.nn.Linear(2, 7, bias=False)
-    owner.markov_head = DSparkMarkovHead(7, 7, 3, torch.float32, torch.device("cpu"))
-    torch.manual_seed(29)
-    with torch.no_grad():
-        owner.lm_head.weight.normal_()
-        owner.markov_head.markov_w1.weight.normal_()
-        owner.markov_head.markov_w2.weight.normal_()
-
-    model = DSparkGreedyGraphModel(owner, query_width=3)
-    input_ids = torch.tensor([2, 0, 0, 4, 0, 0], dtype=torch.int64)
-    positions = torch.arange(6, dtype=torch.int64)
-    actual = model(input_ids, positions).view(2, 3)
-
-    hidden = owner.model(input_ids, positions)
-    base_logits = owner.lm_head(hidden).view(2, 3, 7)
+        output = model.model(input_ids, positions)
+    base_logits = model.model.lm_head(hidden).view(2, 3, model.cfg.vocab_size)
     previous = input_ids.view(2, 3)[:, 0]
     expected_steps = []
-    for token_idx in range(3):
-        previous = torch.argmax(
-            base_logits[:, token_idx] + owner.markov_head.bias(previous),
-            dim=-1,
-        )
+    for token_index in range(3):
+        previous = torch.argmax(base_logits[:, token_index] + model.model.markov_head.bias(previous), dim=-1)
         expected_steps.append(previous)
-    expected = torch.stack(expected_steps, dim=1)
-
-    torch.testing.assert_close(actual, expected)
-
-
-def test_draft_attention_rejects_a_multi_group_backend(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Prefix selection is only sound while the draft owns a single SWA group."""
-    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-
-    class _TwoGroupBackend(_DraftStubBackend):
-        def __init__(self) -> None:
-            super().__init__()
-            from xllm.python.attention.dsa_metadata import build_cache_specs_v41
-
-            _, self.group_infos = build_cache_specs_v41([0, 2], [1], [1], 8, 2)
-
-    backend = _TwoGroupBackend()
-    assert len(backend.group_infos) == 2
-    context = SimpleNamespace(
-        execution_contexts={},
-        attention_backend=backend,
-        metadata=SimpleNamespace(multi_block_tables=[object(), object(), object()]),
-    )
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-    with pytest.raises(RuntimeError, match="pure-SWA draft.*one cache group, got 2"):
-        lm.model._prepare_attention(torch.arange(cfg.dspark_block_size, dtype=torch.int64))
+    assert output.draft_proposal is not None
+    torch.testing.assert_close(output.draft_proposal.token_ids, torch.stack(expected_steps, dim=1))
+    assert output.hidden_states is None
 
 
-def test_draft_attention_requires_the_backend_groups(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A backend without group_infos cannot resolve the draft's manager tables."""
-    cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-
-    class _NoGroupsBackend:
-        def reset_forward(self, metadata) -> None:
-            pass
-
-        def prepare_dsa_metadata_for_forward(self, metadata, *, group_limit=None) -> None:
-            pass
-
-    context = SimpleNamespace(
-        attention_backend=_NoGroupsBackend(),
-        metadata=SimpleNamespace(multi_block_tables=[object()]),
-    )
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-    with pytest.raises(RuntimeError, match="exposing group_infos"):
-        lm.model._prepare_attention(torch.arange(cfg.dspark_block_size, dtype=torch.int64))
-
-
-def test_draft_attention_rejects_a_single_token_cache_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    from xllm.python.attention.dsa_metadata import DSA_CACHE_TOKEN, build_cache_specs_v41
-
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    backend = _DraftStubBackend()
-    _, target_groups = build_cache_specs_v41([0, 2], [1], [1], 8, 2)
-    backend.group_infos = [group for group in target_groups if group.cache_type == DSA_CACHE_TOKEN]
-    assert len(backend.group_infos) == 1
-    metadata = SimpleNamespace(multi_block_tables=[object()])
-    context = SimpleNamespace(execution_contexts={}, attention_backend=backend, metadata=metadata)
-    monkeypatch.setattr(dsp, "get_forward_context", lambda: context)
-
-    with pytest.raises(RuntimeError, match="only cache group to be SWA"):
-        lm.model._prepare_attention(torch.arange(lm.cfg.dspark_block_size, dtype=torch.int64))
-    assert context.execution_contexts == {}
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_pipeline_rejects_context_parallelism_at_initialization(cp_size: int) -> None:
+    with pytest.raises(ValueError, match="CP=1"):
+        DeepseekV41DSparkForCausalLM({**_config_dict(), "cp_size": cp_size})
 
 
 def test_draft_group_infos_is_a_single_swa_group() -> None:

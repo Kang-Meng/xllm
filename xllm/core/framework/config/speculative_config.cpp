@@ -72,13 +72,6 @@ DEFINE_bool(enable_dspark_prelaunch,
             false,
             "Whether to enable DSpark draft prelaunch.");
 
-DEFINE_bool(enable_dspark_draft_graph,
-            false,
-            "Whether to capture the DeepSeek V4.1 DSpark draft body, LM head "
-            "and Markov proposal chain in one ACL graph. Requires greedy "
-            "draft sampling, CP=1, a full-vocabulary draft with its own LM "
-            "head, and requests without sampling penalties or token filters.");
-
 DEFINE_bool(enable_adaptive_speculative_decode,
             false,
             "Whether to enable adaptive speculative length for MTP decode.");
@@ -105,7 +98,6 @@ void SpeculativeConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_atb_spec_kernel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dspark_prelaunch);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dspark_draft_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_speculative_min_gain);
 }
@@ -124,7 +116,6 @@ void SpeculativeConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_atb_spec_kernel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dspark_prelaunch);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dspark_draft_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_speculative_min_gain);
 }
@@ -159,8 +150,6 @@ void SpeculativeConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dspark_prelaunch);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_dspark_draft_graph);
-  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_adaptive_speculative_decode);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_speculative_min_gain);
@@ -188,16 +177,6 @@ void SpeculativeConfig::validate() const {
         << "--enable_dspark_prelaunch requires speculative_algorithm=DSpark, "
            "got "
         << algorithm;
-  }
-  if (enable_dspark_draft_graph()) {
-    CHECK(is_dspark_algorithm(algorithm))
-        << "--enable_dspark_draft_graph requires speculative_algorithm=DSpark";
-    CHECK_GT(num_speculative_tokens(), 0)
-        << "--enable_dspark_draft_graph requires num_speculative_tokens > 0";
-    CHECK(mode == DraftSamplingMode::GREEDY)
-        << "--enable_dspark_draft_graph requires draft_sampling_mode=greedy";
-    CHECK(!enable_adaptive_speculative_decode())
-        << "--enable_dspark_draft_graph does not support adaptive decoding";
   }
   if (mode == DraftSamplingMode::PROBABILISTIC) {
     CHECK(is_probabilistic_draft_sampling_supported(algorithm))

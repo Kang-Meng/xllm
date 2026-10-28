@@ -40,6 +40,7 @@ limitations under the License.
 #include "platform/dcu/dcu_layer_synchronizer.h"
 #endif
 
+#include "core/framework/model/model_sampling_input.h"
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "framework/batch/batch_forward_type.h"
@@ -1086,6 +1087,7 @@ struct ModelInputParams {
     ModelInputParams params;
     params.meta = meta;
     params.execution_batch = execution_batch;
+    params.sampling = sampling;
     params.attention = attention.to(device);
     params.embedding = embedding.to(device);
     params.block_copy = block_copy.to(device);
@@ -1252,6 +1254,7 @@ struct ModelInputParams {
 
   BatchInputMeta meta;
   ExecutionBatchMetadata execution_batch;
+  std::optional<ModelSamplingInput> sampling;
   AttentionInput attention;
   ModelEmbeddingInput embedding;
   ParallelInput parallel;

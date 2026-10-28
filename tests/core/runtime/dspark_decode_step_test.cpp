@@ -146,39 +146,15 @@ class DSparkWorkerImplTestPeer final {
     return worker.pending_context_.has_value();
   }
 
-  static void configure_v41_geometry(DSparkWorkerImpl& worker,
-                                     bool graph_enabled,
-                                     bool native_sas) {
-    ModelArgs args;
-    args.model_type("deepseek_v41_dspark").dspark_use_native_sas(native_sas);
-    worker.draft_impl_->context_ = ModelContext(
-        worker.parallel_args_,
-        args,
-        QuantArgs(),
-        torch::dtype(torch::kBFloat16).device(worker.device_.unwrap()));
-    SpeculativeRuntimeConfig runtime_config;
-    runtime_config.is_draft_engine = true;
-    runtime_config.draft_graph_enabled = graph_enabled;
-    worker.draft_impl_->context_.set_speculative_runtime_config(runtime_config);
-    worker.draft_sas_mode_ = dflash_detail::classify_dspark_sas_mode(
-        args, /*sample_from_anchor=*/true);
-  }
-
-  static bool uses_block_parallel_rows(const DSparkWorkerImpl& worker) {
-    return worker.draft_use_block_parallel_rows();
-  }
-
-  static BatchForwardType draft_forward_type(const DSparkWorkerImpl& worker) {
-    return worker.draft_batch_forward_type();
-  }
-
-  static void validate_graph_input(const DSparkWorkerImpl& worker,
-                                   const ForwardInput& input) {
-    worker.validate_draft_graph_input(input);
-  }
-
   static void configure_draft_query(DSparkWorkerImpl& worker,
                                     int32_t mask_token_id) {
+    ModelArgs draft_args;
+    draft_args.draft_query_uses_decode(true);
+    worker.draft_impl_->context_ =
+        ModelContext(worker.parallel_args_,
+                     draft_args,
+                     QuantArgs{},
+                     torch::TensorOptions().device(worker.device_));
     worker.mask_token_id_ = mask_token_id;
     worker.draft_sas_mode_ = dflash_detail::DSparkSasMode::NATIVE;
   }
@@ -229,53 +205,6 @@ class DSparkWorkerImplTestPeer final {
 };
 
 namespace {
-
-TEST(DSparkDraftGeometryTest, V41GeometryIgnoresNativeSasAndUsesRuntimePlan) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.speculative_algorithm("DSpark").num_speculative_tokens(5);
-  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
-  for (const bool graph_enabled : {false, true}) {
-    for (const bool native_sas : {false, true}) {
-      DSparkWorkerImplTestPeer::configure_v41_geometry(
-          worker, graph_enabled, native_sas);
-      EXPECT_EQ(DSparkWorkerImplTestPeer::uses_block_parallel_rows(worker),
-                graph_enabled);
-      EXPECT_EQ(DSparkWorkerImplTestPeer::draft_forward_type(worker).value(),
-                graph_enabled ? BatchForwardType::DECODE
-                              : BatchForwardType::CHUNKED_PREFILL);
-    }
-  }
-}
-
-TEST(DSparkDraftGeometryTest, GraphRejectsSamplingConstraintsBeforeExecution) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.speculative_algorithm("DSpark").num_speculative_tokens(5);
-  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::configure_v41_geometry(
-      worker, /*graph_enabled=*/true, /*native_sas=*/false);
-  ForwardInput input;
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_graph_input(worker, input));
-  input.sampling_params.repetition_penalties = torch::tensor({1.2f});
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_graph_input(worker, input),
-               "does not support sampling penalties or token filters");
-  input.sampling_params.repetition_penalties = torch::Tensor();
-  input.sampling_params.filter_bitmask = torch::zeros({1, 1}, torch::kInt);
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_graph_input(worker, input),
-               "does not support sampling penalties or token filters");
-  DSparkWorkerImplTestPeer::configure_v41_geometry(
-      worker, /*graph_enabled=*/false, /*native_sas=*/false);
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_graph_input(worker, input));
-}
 
 class DSparkDraftInputParityTest
     : public ::testing::TestWithParam<std::tuple<int32_t, bool>> {};
@@ -384,10 +313,20 @@ TEST_P(DSparkDraftInputParityTest,
     input.positions = input.positions_host.to(device.unwrap());
     input.input_params.attention.host.q_seq_lens.assign(batch_size, 1);
     input.input_params.attention.host.kv_seq_lens.clear();
+    ExecutionBatchMetadata& execution_batch =
+        input.input_params.execution_batch;
+    execution_batch.num_reqs = batch_size;
+    execution_batch.num_tokens = batch_size;
+    execution_batch.num_scheduled_tokens.assign(batch_size, 1);
+    execution_batch.num_computed_tokens.clear();
+    execution_batch.is_prefilling.assign(batch_size, 0);
+    execution_batch.query_start_loc = {0};
     const auto host_positions = input.positions_host.accessor<int32_t, 1>();
     for (int32_t row = 0; row < batch_size; ++row) {
       input.input_params.attention.host.kv_seq_lens.emplace_back(
           host_positions[row] + 1);
+      execution_batch.num_computed_tokens.emplace_back(host_positions[row]);
+      execution_batch.query_start_loc.emplace_back(row + 1);
     }
     input.input_params.attention.host.block_tables =
         previous.input_params.attention.host.block_tables.index_select(
@@ -407,6 +346,7 @@ TEST_P(DSparkDraftInputParityTest,
     ForwardInput ordinary =
         DSparkWorkerImplTestPeer::prepare_host_corrected_draft_inputs(worker,
                                                                       input);
+    EXPECT_TRUE(ordinary.input_params.meta.batch_forward_type.is_decode());
     EXPECT_TRUE(torch::equal(pending.query_tokens.cpu(),
                              ordinary.token_ids.cpu().to(torch::kLong)));
     EXPECT_TRUE(torch::equal(pending.query_positions.cpu(),
@@ -606,42 +546,38 @@ TEST(DSparkDecodeStepTest, ExplicitPrelaunchRejectsUnsupportedConfiguration) {
                "greedy draft sampling");
 }
 
-TEST(DSparkDecodeStepTest, ExplicitPrelaunchRejectsEffectiveDraftGraph) {
+TEST(DSparkDecodeStepTest, PdDecodeAllowsKvTransfersWithAndWithoutPrelaunch) {
   Device device(0);
   device.set_device();
   device.init_device_context();
   const ParallelArgs parallel_args(0, 1, nullptr);
   runtime::Options options;
   options.enable_schedule_overlap(true)
-      .enable_dspark_prelaunch(true)
-      .enable_dspark_draft_graph(true)
+      .enable_disagg_pd(true)
+      .instance_role(InstanceRole::DECODE)
       .num_speculative_tokens(15)
       .draft_sampling_mode("greedy");
-  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::configure_v41_geometry(
-      worker, /*graph_enabled=*/true, /*native_sas=*/false);
-  EXPECT_DEATH(DSparkWorkerImplTestPeer::validate_config(worker, true),
-               "cannot be combined with an active --enable_dspark_draft_graph");
+  ForwardInput input;
+  input.input_params.meta.num_sequences = 1;
+  input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  input.input_params.embedding.embedding_ids = {0};
+  input.input_params.embedding.request_ids = {"request"};
+  input.sampling_params.all_greedy_sample = true;
+  input.transfer_kv_infos.emplace_back();
 
-  DSparkWorkerImplTestPeer::configure_v41_geometry(
-      worker, /*graph_enabled=*/false, /*native_sas=*/false);
-  DSparkWorkerImplTestPeer::set_async_output_enabled(worker, true);
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_config(worker, true));
-}
-
-TEST(DSparkDecodeStepTest, EffectiveDraftGraphDoesNotRequirePrelaunch) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_dspark_draft_graph(true).num_speculative_tokens(15);
-  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
-  DSparkWorkerImplTestPeer::configure_v41_geometry(
-      worker, /*graph_enabled=*/true, /*native_sas=*/false);
-  EXPECT_NO_FATAL_FAILURE(
-      DSparkWorkerImplTestPeer::validate_config(worker, false));
+  for (const bool prelaunch_enabled : {false, true}) {
+    options.enable_dspark_prelaunch(prelaunch_enabled);
+    DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+    DSparkWorkerImplTestPeer::set_async_output_enabled(worker, true);
+    DSparkWorkerImplTestPeer::set_draft_prelaunch_enabled(worker,
+                                                          prelaunch_enabled);
+    EXPECT_NO_FATAL_FAILURE(DSparkWorkerImplTestPeer::validate_config(
+        worker, /*supports_device_inputs=*/true));
+    EXPECT_NO_FATAL_FAILURE(
+        DSparkWorkerImplTestPeer::validate_input(worker, input));
+    EXPECT_EQ(DSparkWorkerImplTestPeer::can_prelaunch_draft(worker, input),
+              prelaunch_enabled);
+  }
 }
 
 TEST(DSparkDecodeStepTest, ConstraintsRejectOnlyExplicitPrelaunch) {
@@ -938,6 +874,12 @@ TEST(DSparkDecodeStepTest, DraftQueryPreservesNonJsonSamplingMasks) {
     ForwardInput input;
     input.input_params.meta.num_sequences = 1;
     input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+    input.input_params.execution_batch.num_reqs = 1;
+    input.input_params.execution_batch.num_tokens = 1;
+    input.input_params.execution_batch.num_scheduled_tokens = {1};
+    input.input_params.execution_batch.num_computed_tokens = {3};
+    input.input_params.execution_batch.query_start_loc = {0, 1};
+    input.input_params.execution_batch.is_prefilling = {0};
     input.token_ids_host = torch::tensor({0}, torch::kInt32);
     input.positions_host = torch::tensor({3}, torch::kInt32);
     input.token_ids = input.token_ids_host.to(device.unwrap());

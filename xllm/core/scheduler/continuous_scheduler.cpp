@@ -975,11 +975,9 @@ bool ContinuousScheduler::try_complete_pause() {
           return one_batch.empty();
         });
     if (!last_batch_all_empty) {
-      // Drain the one in-flight step scheduled in advance.
       engine_->update_last_step_result(last_batch_);
       process_batch_output(true);
     }
-    // Reset overlap pipeline bookkeeping so resume starts clean.
     last_batch_.clear();
     last_batch_.resize(options_.dp_size());
     last_running_requests_.clear();

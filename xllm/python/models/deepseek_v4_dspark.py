@@ -220,6 +220,16 @@ class DeepseekV4DSparkForCausalLM(
         device = torch.device(config.get("device", "npu:0"))
         DSparkForCausalLMBase.__init__(
             self,
+            backbone=DeepseekV4DSparkModel(cfg, dtype, device),
+            lm_head=_DSparkQuantAwareLinear(
+                cfg.hidden_size,
+                cfg.vocab_size // cfg.tp_size,
+                tp_size=cfg.tp_size,
+                gather_output=True,
+                dtype=dtype,
+                device=device,
+            ),
+            query_width=int(config["draft_query_width"]),
             vocab_size=cfg.vocab_size,
             draft_vocab_size=cfg.vocab_size,
             markov_rank=cfg.markov_rank,
@@ -231,15 +241,6 @@ class DeepseekV4DSparkForCausalLM(
             confidence_head_bias=False,
         )
         self.cfg = cfg
-        self.model = DeepseekV4DSparkModel(cfg, dtype, device)
-        self.lm_head = _DSparkQuantAwareLinear(
-            cfg.hidden_size,
-            cfg.vocab_size // cfg.tp_size,
-            tp_size=cfg.tp_size,
-            gather_output=True,
-            dtype=dtype,
-            device=device,
-        )
 
     def write_context_kv(
         self,
@@ -249,7 +250,7 @@ class DeepseekV4DSparkForCausalLM(
         kv_caches: list[LayerCacheInput],
         layer_synchronizer: LayerSynchronizer | None,
     ) -> torch.Tensor | None:
-        return self.model.write_context_kv(
+        return self.model.backbone.write_context_kv(
             target_hidden,
             positions,
             cache_slots,
@@ -307,7 +308,7 @@ class DeepseekV4DSparkForCausalLM(
         )
         attention.process_weights_after_loading()
 
-        mlp = self.model.layers[layer_id].mlp
+        mlp = self.model.backbone.layers[layer_id].mlp
         if hasattr(mlp, "experts_w13"):
             moe_prefix = _find_checkpoint_prefix(
                 loader,
@@ -396,7 +397,7 @@ class DeepseekV4DSparkForCausalLM(
             self._load_dsv4_decoder_layer(
                 loader,
                 checkpoint_prefix,
-                f"model.layers.{layer_id}.",
+                f"model.backbone.layers.{layer_id}.",
                 layer_id,
             )
 
@@ -411,24 +412,24 @@ class DeepseekV4DSparkForCausalLM(
             load_block_projection_mxfp8(
                 loader,
                 main_proj_key.removesuffix(".weight"),
-                "model.main_proj",
+                "model.backbone.main_proj",
                 None,
                 description="DeepSeek-V4 DSpark FP8 main projection",
             )
-            self.model.main_proj.process_weights_after_loading()
+            self.model.backbone.main_proj.process_weights_after_loading()
         else:
             self._load_quant_aware_linear(
                 loader,
                 main_proj_key.removesuffix(".weight"),
-                "model.main_proj",
-                self.model.main_proj,
+                "model.backbone.main_proj",
+                self.model.backbone.main_proj,
             )
         main_norm_key = _require_checkpoint_key(
             loader,
             (first_prefix + "main_norm.weight",),
             "DeepSeek-V4 DSpark main norm",
         )
-        loader.copy_in("model.main_norm.weight", loader.load_tensor(main_norm_key))
+        loader.copy_in("model.backbone.main_norm.weight", loader.load_tensor(main_norm_key))
 
         embed_key = _require_checkpoint_key(
             loader,
@@ -441,7 +442,7 @@ class DeepseekV4DSparkForCausalLM(
             "DeepSeek-V4 DSpark embedding weight",
         )
         loader.copy_in(
-            "model.embed_tokens.weight",
+            "model.backbone.embed_tokens.weight",
             loader.shard(loader.load_tensor(embed_key), dim=1),
         )
         norm_key = _require_checkpoint_key(
@@ -449,14 +450,14 @@ class DeepseekV4DSparkForCausalLM(
             (last_prefix + "norm.weight", "norm.weight", "final_layernorm.weight"),
             "DeepSeek-V4 DSpark final norm",
         )
-        loader.copy_in("model.norm.weight", loader.load_tensor(norm_key))
+        loader.copy_in("model.backbone.norm.weight", loader.load_tensor(norm_key))
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             key = _require_checkpoint_key(
                 loader,
                 (last_prefix + name,),
                 f"DeepSeek-V4 DSpark {name}",
             )
-            loader.copy_in("model." + name, loader.load_tensor(key))
+            loader.copy_in("model.backbone." + name, loader.load_tensor(key))
 
         for name in ("markov_w1.weight", "markov_w2.weight"):
             key = _require_checkpoint_key(
@@ -464,14 +465,14 @@ class DeepseekV4DSparkForCausalLM(
                 (last_prefix + "markov_head." + name,),
                 f"DeepSeek-V4 DSpark Markov {name}",
             )
-            loader.copy_in("markov_head." + name, loader.load_tensor(key))
-        if self.confidence_head is not None:
+            loader.copy_in("model.markov_head." + name, loader.load_tensor(key))
+        if self.model.confidence_head is not None:
             confidence_key = _require_checkpoint_key(
                 loader,
                 (last_prefix + "confidence_head.proj.weight",),
                 "DeepSeek-V4 DSpark confidence projection",
             )
-            loader.copy_in("confidence_head.proj.weight", loader.load_tensor(confidence_key))
+            loader.copy_in("model.confidence_head.proj.weight", loader.load_tensor(confidence_key))
 
         head_key = _require_checkpoint_key(
             loader,
@@ -481,7 +482,7 @@ class DeepseekV4DSparkForCausalLM(
         self._load_quant_aware_linear(
             loader,
             head_key.removesuffix(".weight"),
-            "lm_head",
-            self.lm_head,
+            "model.lm_head",
+            self.model.lm_head,
             shard_dim=0,
         )

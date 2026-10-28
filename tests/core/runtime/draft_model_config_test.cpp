@@ -21,89 +21,18 @@ limitations under the License.
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "core/common/global_flags.h"
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/runtime/options.h"
 #include "core/util/json_reader.h"
-#include "models/llm/deepseek_v41_dspark_graph_policy.h"
 
 namespace xllm {
 namespace {
-
-#if defined(USE_NPU)
-TEST(DeepseekV41DraftGraphPolicyTest, SharesTargetAndDraftCapability) {
-  runtime::Options options;
-  options.speculative_algorithm("DSpark")
-      .enable_dspark_draft_graph(true)
-      .enable_graph(true)
-      .num_speculative_tokens(5)
-      .draft_sampling_mode("Greedy");
-  for (const std::string_view model_type :
-       {"deepseek_v41", "deepseek_v41_dspark"}) {
-    EXPECT_TRUE(deepseek_v41::resolve_draft_graph(
-        options, model_type, "python", /*is_npu=*/true));
-  }
-  EXPECT_FALSE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v4_dspark", "python", /*is_npu=*/true));
-  EXPECT_FALSE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v41_dspark", "TORCH", /*is_npu=*/true));
-  EXPECT_FALSE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v41_dspark", "python", /*is_npu=*/false));
-}
-
-TEST(DeepseekV41DraftGraphPolicyTest, UsesExplicitRuntimeGraphOptions) {
-  runtime::Options options;
-  options.speculative_algorithm("DSpark")
-      .enable_dspark_draft_graph(true)
-      .enable_graph(true)
-      .num_speculative_tokens(5)
-      .draft_sampling_mode("greedy");
-  EXPECT_TRUE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v41_dspark", "python", /*is_npu=*/true));
-  options.enable_graph(false);
-  EXPECT_FALSE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v41_dspark", "python", /*is_npu=*/true));
-  options.enable_graph(true).enable_dspark_draft_graph(false);
-  EXPECT_FALSE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v41_dspark", "python", /*is_npu=*/true));
-  options.enable_dspark_draft_graph(true).draft_sampling_mode("probabilistic");
-  EXPECT_FALSE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v41_dspark", "python", /*is_npu=*/true));
-  options.draft_sampling_mode("greedy").enable_adaptive_speculative_decode(
-      true);
-  EXPECT_FALSE(deepseek_v41::resolve_draft_graph(
-      options, "deepseek_v41_dspark", "python", /*is_npu=*/true));
-}
-
-TEST(DeepseekV41DraftGraphPolicyTest, RejectsActualDraftContextParallelism) {
-  runtime::Options options;
-  options.is_draft_engine(true)
-      .speculative_algorithm("DSpark")
-      .enable_dspark_draft_graph(true)
-      .enable_graph(true)
-      .num_speculative_tokens(5)
-      .draft_sampling_mode("greedy");
-  EXPECT_DEATH(deepseek_v41::resolve_model_draft_graph(options,
-                                                       "deepseek_v41_dspark",
-                                                       "python",
-                                                       /*is_npu=*/true,
-                                                       /*cp_size=*/2),
-               "does not support context parallelism");
-  EXPECT_FALSE(deepseek_v41::resolve_model_draft_graph(
-      options, "deepseek_v41", "python", /*is_npu=*/true, /*cp_size=*/2));
-  options.is_draft_engine(false);
-  EXPECT_FALSE(deepseek_v41::resolve_model_draft_graph(options,
-                                                       "deepseek_v41_dspark",
-                                                       "python",
-                                                       /*is_npu=*/true,
-                                                       /*cp_size=*/1));
-}
-
-#endif
 
 #if defined(USE_MLU)
 TEST(DraftModelConfigTest, ShortensDFlash2BlockBeforeModelConstruction) {
@@ -327,72 +256,103 @@ TEST_F(DraftCaptureConfigTest, BlockSizeMissingEverywhereStaysZero) {
 }
 
 #if defined(USE_NPU)
-TEST(DraftModelConfigTest, DraftGraphAdmissionUsesLoadedDraftMetadata) {
-  ModelArgs draft_args;
-  draft_args.model_type("deepseek_v41");
+TEST(DraftModelConfigTest, AllowsPythonDSparkGraphsWithoutChangingOtherDrafts) {
+  auto& model_config = ModelConfig::get_instance();
+  const std::string original_model_impl = model_config.model_impl();
+  for (const std::string& model_impl : {"python", "native"}) {
+    model_config.model_impl(model_impl);
+    for (const std::string& algorithm : {"DSpark", "DFlash", "DFlash2"}) {
+      SCOPED_TRACE(model_impl);
+      SCOPED_TRACE(algorithm);
+      ModelArgs args;
+      args.model_type("qwen3").dflash2_block_size(8);
+      runtime::Options options;
+      options.is_draft_engine(true)
+          .speculative_algorithm(algorithm)
+          .num_speculative_tokens(6);
+
+      configure_block_diffusion_model(args, options);
+
+      EXPECT_EQ(args.requires_eager_execution(),
+                model_impl != "python" || algorithm != "DSpark");
+      EXPECT_FALSE(args.draft_query_uses_decode());
+      if (algorithm == "DSpark") {
+        EXPECT_EQ(args.dummy_token_count(), model_impl == "python" ? 6 : 1);
+      }
+    }
+  }
+  model_config.model_impl(original_model_impl);
+}
+
+TEST_F(DraftCaptureConfigTest, PythonV41UsesBlockRowsAndCompleteDummyQueries) {
+  write_config(R"({"dspark_block_size":3})");
+  auto& model_config = ModelConfig::get_instance();
+  auto& kernel_config = KernelConfig::get_instance();
+  const std::string original_model_impl = model_config.model_impl();
+  const bool original_native_sas = kernel_config.enable_dspark_native_sas();
+  model_config.model_impl("python");
+  kernel_config.enable_dspark_native_sas(true);
+  ModelArgs args;
+  args.model_type("deepseek_v41").n_layers(4).dspark_num_layers(2);
   runtime::Options options;
-  options.draft_model_path("/not-read-by-admission")
+  options.is_draft_engine(true)
       .speculative_algorithm("DSpark")
-      .enable_dspark_draft_graph(true)
-      .enable_graph(true)
-      .num_speculative_tokens(5)
-      .draft_sampling_mode("greedy");
-  auto validator = deepseek_v41::make_draft_graph_request_validator(
-      options, &draft_args, "python", /*is_npu=*/true);
-  ASSERT_TRUE(validator);
-  EXPECT_FALSE(validator(RequestParams{}).has_value());
-
-  std::vector<RequestParams> unsupported(4);
-  unsupported[0].repetition_penalty = 1.1f;
-  unsupported[1].frequency_penalty = 0.5f;
-  unsupported[2].presence_penalty = 0.5f;
-  unsupported[3].response_format = ResponseFormatType::JSON_OBJECT;
-  for (const RequestParams& params : unsupported) {
-    const std::optional<std::string> error = validator(params);
-    ASSERT_TRUE(error.has_value());
-    EXPECT_NE(error->find("DSpark draft graph"), std::string::npos);
-  }
-
-  EXPECT_FALSE(deepseek_v41::make_draft_graph_request_validator(
-      options, &draft_args, "TORCH", /*is_npu=*/true));
-  EXPECT_FALSE(deepseek_v41::make_draft_graph_request_validator(
-      options, &draft_args, "python", /*is_npu=*/false));
-  options.enable_graph(false);
-  EXPECT_FALSE(deepseek_v41::make_draft_graph_request_validator(
-      options, &draft_args, "python", /*is_npu=*/true));
-  options.enable_graph(true).enable_dspark_draft_graph(false);
-  EXPECT_FALSE(deepseek_v41::make_draft_graph_request_validator(
-      options, &draft_args, "python", /*is_npu=*/true));
-  // The installed callback does not retain the engine's mutable metadata.
-  draft_args.model_type("deepseek_v4");
-  EXPECT_TRUE(validator(unsupported.front()).has_value());
+      .num_speculative_tokens(3)
+      .model_path(model_path_);
+  configure_block_diffusion_model(args, options);
+  EXPECT_EQ(args.model_type(), "deepseek_v41_dspark");
+  EXPECT_EQ(args.dummy_token_count(), 3);
+  EXPECT_EQ(args.n_layers(), 2);
+  EXPECT_EQ(args.compress_ratios(), (std::vector<int32_t>{0, 0}));
+  EXPECT_FALSE(args.requires_eager_execution());
+  EXPECT_FALSE(args.dspark_use_native_sas());
+  EXPECT_TRUE(args.draft_query_uses_decode());
+  model_config.model_impl(original_model_impl);
+  kernel_config.enable_dspark_native_sas(original_native_sas);
 }
 
-TEST(DraftModelConfigTest, DraftGraphAdmissionRequiresExternalDraftMetadata) {
+class DraftQueryInputConfigTest
+    : public DraftCaptureConfigTest,
+      public ::testing::WithParamInterface<
+          std::tuple<std::string, std::string, bool, bool>> {};
+
+TEST_P(DraftQueryInputConfigTest, PreservesInputContractAcrossGraphModes) {
+  const auto& [model_type, model_impl, native_sas, enable_graph] = GetParam();
+  write_config(R"({"dspark_block_size":3})");
+  auto& model_config = ModelConfig::get_instance();
+  auto& kernel_config = KernelConfig::get_instance();
+  const std::string original_model_impl = model_config.model_impl();
+  const bool original_native_sas = kernel_config.enable_dspark_native_sas();
+  model_config.model_impl(model_impl);
+  kernel_config.enable_dspark_native_sas(native_sas);
+  ModelArgs args;
+  args.model_type(model_type).n_layers(4).dspark_num_layers(2);
   runtime::Options options;
-  options.speculative_algorithm("DSpark")
-      .enable_dspark_draft_graph(true)
-      .enable_graph(true)
-      .num_speculative_tokens(5)
-      .draft_sampling_mode("greedy");
-  EXPECT_FALSE(deepseek_v41::make_draft_graph_request_validator(
-      options, nullptr, "python", /*is_npu=*/true));
+  options.is_draft_engine(true)
+      .speculative_algorithm("DSpark")
+      .num_speculative_tokens(3)
+      .model_path(model_path_)
+      .enable_graph(enable_graph);
 
-  ModelArgs draft_args;
-  for (const std::string& draft_type : {"deepseek_v4", "qwen3"}) {
-    draft_args.model_type(draft_type);
-    EXPECT_FALSE(deepseek_v41::make_draft_graph_request_validator(
-        options, &draft_args, "python", /*is_npu=*/true));
-  }
-  // Admission follows the draft metadata regardless of the target checkpoint.
-  options.model_path("/different-target-checkpoint");
-  for (const std::string& draft_type :
-       {"deepseek_v41", "deepseek_v41_dspark"}) {
-    draft_args.model_type(draft_type);
-    EXPECT_TRUE(deepseek_v41::make_draft_graph_request_validator(
-        options, &draft_args, "python", /*is_npu=*/true));
-  }
+  configure_block_diffusion_model(args, options);
+
+  const bool python_v41_draft =
+      model_type == "deepseek_v41" && model_impl == "python";
+  EXPECT_EQ(args.dspark_use_native_sas(), native_sas && !python_v41_draft);
+  EXPECT_EQ(args.draft_query_uses_decode(), native_sas || python_v41_draft);
+  model_config.model_impl(original_model_impl);
+  kernel_config.enable_dspark_native_sas(original_native_sas);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    DraftImplementations,
+    DraftQueryInputConfigTest,
+    ::testing::Combine(::testing::Values(std::string("deepseek_v4"),
+                                         std::string("deepseek_v41")),
+                       ::testing::Values(std::string("native"),
+                                         std::string("python")),
+                       ::testing::Bool(),
+                       ::testing::Bool()));
 
 TEST(DraftModelConfigTest, PreservesNpuCheckpointBlockGeometry) {
   ModelArgs args;

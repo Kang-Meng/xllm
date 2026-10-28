@@ -947,7 +947,7 @@ TEST(ContinuousSchedulerTest, CancelledOverlapRequestReleasesBeforeResult) {
 // M11.5 scheduler-overlap prework: block-lifecycle ordering when a request
 // finishes inside the deferred output processing of an overlapped step.
 //
-// The timeline this pins (step_with_schedule_overlap, one step scheduled in
+// The non-PD timeline (step_with_schedule_overlap, one step scheduled in
 // advance):
 //   step N    : batch B_N dispatched while B_{N-1} runs on the device; the
 //               deferred processing of B_{N-1} commits the request's last
@@ -1003,10 +1003,10 @@ class OverlapFinishEngine final : public FakeEngine {
       for (Sequence* sequence : batch.get_sequences()) {
         collected_blocks_[sequence->request_id()].emplace_back(
             block_ids(*sequence));
-        if (sequence->finished()) {
+        if (sequence->finished() || sequence->cancelled()) {
           dispatches_at_finished_collection_ = step_calls_;
-          EXPECT_EQ(sequence->kv_cache_tokens_num(), 0u);
           EXPECT_FALSE(sequence->has_any_blocks());
+          EXPECT_EQ(sequence->kv_cache_tokens_num(), 0);
         } else {
           EXPECT_TRUE(sequence->has_any_blocks());
         }
@@ -1118,13 +1118,23 @@ TEST(ContinuousSchedulerTest, OverlapFinishedRequestOutlivesInflightResult) {
             initial_free_blocks);
 }
 
-TEST(ContinuousSchedulerTest, OverlapBatchRetainsFinishedBlocks) {
+class ContinuousSchedulerOverlapRetentionTest
+    : public ::testing::TestWithParam<std::pair<bool, bool>> {};
+
+TEST_P(ContinuousSchedulerOverlapRetentionTest,
+       MixedBatchRetainsBlocksUntilInflightCollection) {
+  const bool pd_decode = GetParam().first;
+  const bool cancel_request = GetParam().second;
   ScopedConfigValue<bool> overlap(
       SchedulerConfig::get_instance().enable_schedule_overlap(), true);
   OverlapFinishEngine engine(/*block_size=*/128);
   ContinuousScheduler::Options options =
       create_scheduler_options(16, 4, 0, 4, 1);
   options.enable_schedule_overlap(true);
+  if (pd_decode) {
+    options.enable_disagg_pd(true);
+    options.instance_role(InstanceRole::DECODE);
+  }
   TestContinuousScheduler scheduler(&engine, options);
   const auto make_request = [](const std::string& id, int32_t max_tokens) {
     const std::vector<int32_t> prompt{1, 2, 3, 4};
@@ -1150,8 +1160,8 @@ TEST(ContinuousSchedulerTest, OverlapBatchRetainsFinishedBlocks) {
         /*outputs_func=*/nullptr);
     return std::make_shared<Request>(id, id, id, std::move(state), id);
   };
-  auto ending = make_request("ending", 1);
-  auto continuing = make_request("continuing", 3);
+  auto ending = make_request("ending", cancel_request ? 32 : 1);
+  auto continuing = make_request("continuing", 2);
   const std::weak_ptr<Request> ending_watch = ending;
   const std::weak_ptr<Request> continuing_watch = continuing;
   const size_t initial_free_blocks =
@@ -1168,6 +1178,9 @@ TEST(ContinuousSchedulerTest, OverlapBatchRetainsFinishedBlocks) {
   scheduler.step(absl::ZeroDuration());
   ASSERT_FALSE(ending_watch.expired());
   ASSERT_FALSE(continuing_watch.expired());
+  if (cancel_request) {
+    ending_watch.lock()->set_cancel();
+  }
   auto replacement = make_request("replacement", 1);
   const std::weak_ptr<Request> replacement_watch = replacement;
   scheduler.add_request(replacement);
@@ -1180,8 +1193,6 @@ TEST(ContinuousSchedulerTest, OverlapBatchRetainsFinishedBlocks) {
   ASSERT_EQ(ending_dispatches.size(), 2u);
   ASSERT_EQ(ending_dispatches.front().size(), 1u);
   ASSERT_EQ(replacement_dispatches.size(), 1u);
-  // The replacement's dispatch must already have happened when the finished
-  // row of the previous batch is collected.
   EXPECT_EQ(engine.dispatches_at_finished_collection(), 3u);
   EXPECT_NE(replacement_dispatches.front(), ending_dispatches.front());
   const auto& ending_collections = engine.collected_blocks("ending");
@@ -1213,6 +1224,13 @@ TEST(ContinuousSchedulerTest, OverlapBatchRetainsFinishedBlocks) {
   EXPECT_EQ(engine.block_manager_pool()->num_free_blocks().front(),
             initial_free_blocks);
 }
+
+INSTANTIATE_TEST_SUITE_P(FinishedAndCancelled,
+                         ContinuousSchedulerOverlapRetentionTest,
+                         ::testing::Values(std::make_pair(false, false),
+                                           std::make_pair(false, true),
+                                           std::make_pair(true, false),
+                                           std::make_pair(true, true)));
 
 TEST(ContinuousSchedulerFactoryTest,
      ChunkedPrefillWithoutSPCreatesContinuousScheduler) {

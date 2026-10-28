@@ -31,10 +31,9 @@ The DSpark draft is the checkpoint's ``mtp.0/1/2`` block drafter (contract:
     ``head``), the replicated markov head (``markov_w1`` embedding +
     ``markov_w2`` low-rank projection) and the replicated confidence head.
 
-Draft forward is eager by default. ``--enable_dspark_draft_graph=true`` lets the
-Python executor capture it in an ACL graph; the heads stay replicated (never
-TP-sharded) so the per-step draft sampling needs no collectives (lessons
-``8e8d1cb28`` / ``beedc8b8d``).
+The execution pipeline includes the draft backbone and proposal heads in both
+eager and ACL graph execution. The Markov and confidence heads are replicated;
+the vocabulary projection retains its checkpoint-specific sharding.
 The draft query block is anchor-first and non-causal; the SWA window semantics
 live in the CSA2 attention backend, this module only feeds the block and the
 pre-injected context rows.
@@ -45,22 +44,16 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 from scripts.logger import logger
 from xllm.python import distributed
-from xllm.python.attention.csa2_attention import Csa2QueryLayout
-from xllm.python.attention.dsa_metadata import DSA_CACHE_SLIDING_WINDOW
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.linear import ColumnParallelLinear
-from xllm.python.model_executor.forward_context import (
-    LayerSynchronizer,
-    get_forward_context,
-    in_acl_graph,
-)
+from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4MoE
 from xllm.python.models.deepseek_v32 import W8A8DynamicLinear
 from xllm.python.models.deepseek_v41 import (
@@ -81,9 +74,6 @@ from xllm.python.models.deepseek_v41 import (
 )
 from xllm.python.models.dspark import DSparkForCausalLMBase
 from xllm.python.models.weight_utils import W8A8WeightLoader
-
-if TYPE_CHECKING:
-    from xllm.python.model_executor.executor import DecodeGraphAdapter
 
 #: Draft stage count when the checkpoint/config does not say otherwise.
 DSPARK_DEFAULT_LAYERS = 3
@@ -229,6 +219,8 @@ class DeepseekV41DSparkConfig(DeepseekV41Config):
         )
 
     def validate(self) -> None:
+        if self.dspark_block_size <= 0:
+            raise ValueError("DeepSeek-V4.1 DSpark requires a positive block size")
         if self.markov_rank <= 0:
             raise ValueError("DeepSeek-V4.1 DSpark requires markov_rank > 0")
         if self.draft_vocab_size != self.vocab_size:
@@ -432,85 +424,23 @@ class DeepseekV41DSparkModel(nn.Module):
 
     # -- forward ---------------------------------------------------------------
 
-    def _prepare_attention(self, positions: torch.Tensor) -> None:
-        """Per-step CSA2 metadata for the draft's own SWA caches.
-
-        The draft shares the request's ``AttentionMetadata`` with the target,
-        whose ``multi_block_tables`` carries the *target's* deduplicated cache
-        groups in the fixed export order (SWA first, see
-        ``kMultiBlockExportOrder``), matching group zero registered by
-        ``build_cache_specs_v41``. The draft owns exactly one SWA group
-        (:func:`dspark_swa_mode`), so it consumes only its own leading manager
-        table; passing the target's full list would trip the builder's
-        ``manager_num <= len(group_infos)`` invariant.
-        """
-        context = get_forward_context()
-        backend = context.attention_backend
-        metadata = context.metadata
-        prepare = getattr(backend, "prepare_dsa_metadata_for_forward", None)
-        if prepare is None:
-            raise RuntimeError("DeepSeek-V4.1 DSpark requires prepare_dsa_metadata_for_forward")
-        group_infos = getattr(backend, "group_infos", None)
-        if group_infos is None:
-            raise RuntimeError("DeepSeek-V4.1 DSpark requires a CSA2 backend exposing group_infos")
-        if len(group_infos) != 1:
-            # The leading-manager selection below is only sound while the draft
-            # owns a single (SWA) group: its group i must be the request's
-            # manager i. Fail loudly if a TOKEN group is ever added to the draft.
-            raise RuntimeError(
-                "DeepSeek-V4.1 DSpark is a pure-SWA draft and must expose exactly "
-                f"one cache group, got {len(group_infos)}"
-            )
-        if group_infos[0].cache_type != DSA_CACHE_SLIDING_WINDOW:
-            raise RuntimeError("DeepSeek-V4.1 DSpark requires its only cache group to be SWA")
-        # Each query sees the same trailing context and the complete block.
-        # The typed context works with both native metadata views and static
-        # graph metadata, without adding attributes to either representation.
-        context.execution_contexts[Csa2QueryLayout] = Csa2QueryLayout(
-            query_width=self.block_size,
-            token_rows=(
-                int(getattr(metadata, "max_query_len", 0)) == 1
-                and not bool(getattr(metadata, "is_prefill", False))
-                and not bool(getattr(metadata, "is_chunked_prefill", False))
-                and not bool(getattr(metadata, "is_dummy", False))
-            ),
-            shared_window=True,
-        )
-        capture = in_acl_graph()
-        existing_dsa = getattr(metadata, "dsa_metadata", None)
-        if capture and existing_dsa is not None:
-            # _capture runs ordinary warmup forwards before entering the NPU
-            # capture context. Those forwards build the fixed-shape graph DSA
-            # metadata once, outside capture where host table reads are legal.
-            # Rebuilding here would call .tolist()/.item() on the captured
-            # stream and fail with aclrtMemcpy 107030. Replay refreshes these
-            # same persistent tensors before launching the graph.
-            if not bool(getattr(existing_dsa, "is_acl_graph", False)):
-                raise RuntimeError("DSpark ACL capture requires graph-mode DSA metadata from warmup")
-            metadata.dsa_graph_mode = True
-            metadata.dsa_positions = positions
-            return
-        backend.reset_forward(metadata)
-        # A pre-capture warmup is not itself inside NPUGraph, but its static
-        # entry advertises graph block-table capacity. Build graph-mode DSA
-        # metadata there so the capture branch above can safely reuse it.
-        metadata.dsa_graph_mode = capture or int(getattr(metadata, "dsa_graph_block_table_cols", 0) or 0) > 0
-        metadata.dsa_positions = positions
-        prepare(metadata, group_limit=len(group_infos))
-
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """One draft block step (eager by default, graph-capturable opt-in).
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_embedding: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """One non-causal draft block step for either execution mode.
 
         ``input_ids`` is the anchor-first query block (see
         :func:`anchor_first_query_block`); the trailing context window comes
         from the rows :meth:`write_context_kv` pre-injected into the draft SWA
-        caches, and ``_prepare_attention`` switches the backend to the block
-        window so every query attends the context plus the whole block,
-        non-causal.
+        caches. The registered attention builder supplies the non-causal
+        block layout and its SWA cache inputs for either execution mode.
         """
-        hidden = self.embed_tokens(input_ids)
+        hidden = self.embed_tokens(input_ids) if input_embedding is None else input_embedding
         positions = positions.to(torch.int64).contiguous()
-        self._prepare_attention(positions)
+
         cos_sin_cache = self.rotary.cos_sin_cache
         # Same mHC stream setup as the target: hc_mult identical copies with a
         # one-hot mix on copy 0 for the first block.
@@ -595,10 +525,18 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
 
     def __init__(self, config: dict) -> None:
         cfg = DeepseekV41DSparkConfig.from_dict(config)
+        cfg = replace(cfg, dspark_block_size=int(config.get("draft_query_width", cfg.dspark_block_size)))
         cfg.validate()
+        if int(config.get("cp_size", 1)) != 1:
+            raise ValueError("DeepSeek-V4.1 DSpark block attention requires CP=1")
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "npu:0"))
+        quant_mode = _detect_v41_quant_mode(config)
+        backbone = DeepseekV41DSparkModel(cfg, dtype, device, quant_mode, config)
         super().__init__(
+            backbone=backbone,
+            lm_head=None,
+            query_width=cfg.dspark_block_size,
             vocab_size=cfg.vocab_size,
             draft_vocab_size=cfg.draft_vocab_size,
             markov_rank=cfg.markov_rank,
@@ -611,24 +549,8 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         self.cfg = cfg
         self.dtype = dtype
         self.device = device
-        self.quant_mode = _detect_v41_quant_mode(config)
-        self.model = DeepseekV41DSparkModel(cfg, dtype, device, self.quant_mode, config)
-        # Built by load_weights from the checkpoint's dedicated ``mtp.<last>.head``
-        # or the shared ``head``; None lets the C++ bridge share the target's.
-        self.lm_head: nn.Module | None = None
+        self.quant_mode = quant_mode
         self._lm_head_source: str | None = None
-        self._draft_graph_enabled = bool(config.get("draft_graph_enabled", False))
-
-    def create_decode_graph_adapter(
-        self,
-        config: dict,
-        graph_backend: str,
-        *,
-        is_spec_draft: bool = False,
-    ) -> DecodeGraphAdapter | None:
-        from xllm.python.models.deepseek_v41_dspark_graph import create_dspark_decode_graph_adapter
-
-        return create_dspark_decode_graph_adapter(self, config, graph_backend, is_spec_draft=is_spec_draft)
 
     # -- names ----------------------------------------------------------------
 
@@ -656,8 +578,6 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         )
         self._load_body(loader)
         self._load_dspark_heads(loader)
-        if self._draft_graph_enabled and self.lm_head is None:
-            raise ValueError("DSpark proposal graph requires the draft checkpoint's own LM head")
 
     def _prepare_own_lm_head(self, state_dicts: list) -> None:
         """Create the draft's own lm_head when the checkpoint ships one."""
@@ -668,7 +588,7 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
                 break
         if head_key is None:
             return
-        self.lm_head = ColumnParallelLinear(
+        self.model.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size,
             self.cfg.vocab_size // self.cfg.tp_size,
             self.cfg.tp_size,
@@ -689,23 +609,23 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         """
         last = self._last_stage
         return {
-            "markov_head.markov_w1.weight": (
+            "model.markov_head.markov_w1.weight": (
                 f"mtp.{last}.markov_head.embed.weight",
                 "markov_head.embed.weight",
                 f"mtp.{last}.markov_head.markov_w1.weight",
                 "markov_head.markov_w1.weight",
             ),
-            "markov_head.markov_w2.weight": (
+            "model.markov_head.markov_w2.weight": (
                 f"mtp.{last}.markov_head.head.weight",
                 "markov_head.head.weight",
                 f"mtp.{last}.markov_head.markov_w2.weight",
                 "markov_head.markov_w2.weight",
             ),
-            "confidence_head.proj.weight": (
+            "model.confidence_head.proj.weight": (
                 f"mtp.{last}.confidence_head.proj.weight",
                 "confidence_head.proj.weight",
             ),
-            "confidence_head.proj.bias": (
+            "model.confidence_head.proj.bias": (
                 f"mtp.{last}.confidence_head.proj.bias",
                 "confidence_head.proj.bias",
             ),
@@ -722,22 +642,22 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         head_source = self._lm_head_source
         if head_source is not None:
             loader.copy_in(
-                "lm_head.weight",
+                "model.lm_head.weight",
                 loader.shard(loader.load_tensor(head_source), dim=0),
             )
         # Low-rank markov head and the (bias-less) confidence head stay
         # replicated: the serial per-position draft sampling must not collect.
-        loader.copy_replicated("markov_head.markov_w1.weight")
-        loader.copy_replicated("markov_head.markov_w2.weight")
-        if self.confidence_head is not None:
-            loader.copy_replicated("confidence_head.proj.weight")
-            if loader.has("confidence_head.proj.bias"):
-                loader.copy_replicated("confidence_head.proj.bias")
+        loader.copy_replicated("model.markov_head.markov_w1.weight")
+        loader.copy_replicated("model.markov_head.markov_w2.weight")
+        if self.model.confidence_head is not None:
+            loader.copy_replicated("model.confidence_head.proj.weight")
+            if loader.has("model.confidence_head.proj.bias"):
+                loader.copy_replicated("model.confidence_head.proj.bias")
             else:
                 # V4.1 ships a bias-less projection; keep the parameter but
                 # neutralise the module-init bias the checkpoint does not own.
                 with torch.no_grad():
-                    self.confidence_head.proj.bias.zero_()
+                    self.model.confidence_head.proj.bias.zero_()
                 logger.info("DeepSeek-V4.1 DSpark confidence head is bias-less; zeroed the bias")
 
     # -- ascend (W8A8 export) body loading --------------------------------------
@@ -745,17 +665,17 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
     def _load_body_ascend(self, loader: W8A8WeightLoader) -> None:
         cfg = self.cfg
         loader.copy_in(
-            "model.embed_tokens.weight",
+            "model.backbone.embed_tokens.weight",
             loader.shard(loader.load_tensor(self._embed_source(loader)), dim=1),
         )
         self._load_main_proj_ascend(loader)
         for stage in range(cfg.num_draft_layers):
             ck = self._stage_prefix(stage)
-            pm = f"model.layers.{stage}."
+            pm = f"model.backbone.layers.{stage}."
             self._load_draft_attn_ascend(loader, ck, pm, stage)
             DeepseekV41ForCausalLM._load_common_layer_norms(self, loader, ck, pm)
-            mlp = self.model.layers[stage].mlp
-            attn = self.model.layers[stage].self_attn
+            mlp = self.model.backbone.layers[stage].mlp
+            attn = self.model.backbone.layers[stage].self_attn
             attn.process_weights_after_loading()
             # The W8A8 export stores the draft MoE block under either the native
             # ``ffn.`` or the legacy ``mlp.`` prefix; resolve it against this
@@ -772,10 +692,10 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
             mlp.process_weights_after_loading()
             self._report_ignored_draft_tensors(loader, ck, mlp)
         loader.copy_in(
-            "model.norm.weight",
+            "model.backbone.norm.weight",
             loader.load_tensor(self._stage_prefix(self._last_stage) + "norm.weight"),
         )
-        self.model.main_proj.process_weights_after_loading()
+        self.model.backbone.main_proj.process_weights_after_loading()
         self._load_hc_head(loader)
 
     def _load_main_proj_ascend(self, loader: W8A8WeightLoader) -> None:
@@ -788,17 +708,17 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         casting int8 into bf16 or vice versa.
         """
         prefix = self._stage_prefix(0) + "main_proj"
-        if self.model.main_proj.quantized:
+        if self.model.backbone.main_proj.quantized:
             self._load_w8a8(
                 loader,
                 prefix,
-                "model.main_proj.w8a8",
+                "model.backbone.main_proj.w8a8",
                 {"weight": 0, "weight_scale": 0, "weight_offset": 0},
             )
         else:
-            self._load_dense_weight(loader, prefix, "model.main_proj.linear", shard_dim=0)
+            self._load_dense_weight(loader, prefix, "model.backbone.main_proj.linear", shard_dim=0)
         loader.copy_in(
-            "model.main_norm.weight",
+            "model.backbone.main_norm.weight",
             loader.load_tensor(self._stage_prefix(0) + "main_norm.weight"),
         )
 
@@ -835,7 +755,7 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         pm: str,
         stage: int,
     ) -> None:
-        attn = self.model.layers[stage].self_attn
+        attn = self.model.backbone.layers[stage].self_attn
         self._load_w8a8(loader, ck + "attn.wq_a", pm + "self_attn.q_a_proj")
         self._load_w8a8(
             loader,
@@ -956,17 +876,17 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
             loader.copy_in(param_prefix + ".weight", weight)
 
         loader.copy_in(
-            "model.embed_tokens.weight",
+            "model.backbone.embed_tokens.weight",
             loader.shard(loader.load_tensor(self._embed_source(loader)), dim=1),
         )
         loader.copy_in(
-            "model.main_proj.linear.weight",
+            "model.backbone.main_proj.linear.weight",
             loader.shard(loader.load_tensor("mtp.0.main_proj.weight"), dim=0),
         )
-        loader.copy_in("model.main_norm.weight", loader.load_tensor("mtp.0.main_norm.weight"))
+        loader.copy_in("model.backbone.main_norm.weight", loader.load_tensor("mtp.0.main_norm.weight"))
         for stage in range(cfg.num_draft_layers):
             ck = self._stage_prefix(stage)
-            pm = f"model.layers.{stage}."
+            pm = f"model.backbone.layers.{stage}."
             for ckpt_name, param_name, shard_dim in (
                 ("attn.wq_a", "self_attn.q_a_proj", None),
                 ("attn.wq_b", "self_attn.q_b_proj", 0),
@@ -983,15 +903,15 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
                 pm + "self_attn.kv_a_layernorm.weight",
                 loader.load_tensor(ck + "attn.kv_norm.weight"),
             )
-            self._load_attn_sink(loader, ck, pm, self.model.layers[stage].self_attn)
+            self._load_attn_sink(loader, ck, pm, self.model.backbone.layers[stage].self_attn)
             DeepseekV41ForCausalLM._load_common_layer_norms(self, loader, ck, pm)
-            mlp = self.model.layers[stage].mlp
+            mlp = self.model.backbone.layers[stage].mlp
             if not isinstance(mlp, DeepseekV41MoE):
                 raise ValueError(f"draft layer {stage} must be a torch MoE layer, got {type(mlp).__name__}")
             DeepseekV41ForCausalLM._load_torch_moe(self, loader, ck, pm, stage, is_fp8)
             self._report_ignored_draft_tensors(loader, ck, mlp)
         loader.copy_in(
-            "model.norm.weight",
+            "model.backbone.norm.weight",
             loader.load_tensor(self._stage_prefix(self._last_stage) + "norm.weight"),
         )
         self._load_hc_head(loader)
@@ -1014,7 +934,7 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
             tensor = loader.load_tensor(key)
             parameter = nn.Parameter(torch.empty(tensor.shape, dtype=torch.float32, device=self.device))
             parameter.data.copy_(tensor.float())
-            setattr(self.model, f"hc_head_{suffix}", parameter)
+            setattr(self.model.backbone, f"hc_head_{suffix}", parameter)
 
     # -- runtime bridge --------------------------------------------------------
 
@@ -1026,7 +946,7 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         kv_caches: list[tuple[torch.Tensor | None, ...]],
         layer_synchronizer: LayerSynchronizer | None = None,
     ) -> torch.Tensor | None:
-        return self.model.write_context_kv(
+        return self.model.backbone.write_context_kv(
             target_hidden,
             positions,
             cache_slots,

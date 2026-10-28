@@ -192,21 +192,31 @@ void fill_multi_block_table_slices(DecodeRowContext& ctx) {
 void append_paged_kv_row(const Slice<int32_t>& block_table,
                          int32_t kv_seq_len,
                          int32_t block_size,
-                         DecodeBuildBuffers& buf) {
+                         DecodeBuildBuffers& buf,
+                         bool ring_layout = false) {
   CHECK_GT(block_size, 0) << "invalid block_size=" << block_size;
   const int32_t effective_kv_seq_len = std::max(kv_seq_len, 1);
   const int32_t page_count =
       (effective_kv_seq_len + block_size - 1) / block_size;
-  CHECK_LE(static_cast<size_t>(page_count), block_table.size())
-      << "row KV length exceeds block-table capacity, kv_seq_len=" << kv_seq_len
-      << ", page_count=" << page_count
-      << ", block_table_size=" << block_table.size();
+  if (!ring_layout) {
+    CHECK_LE(static_cast<size_t>(page_count), block_table.size())
+        << "row KV length exceeds block-table capacity, kv_seq_len="
+        << kv_seq_len << ", page_count=" << page_count
+        << ", block_table_size=" << block_table.size();
+  }
   if (buf.out_paged_kv_indptr.empty()) {
     buf.out_paged_kv_indptr.emplace_back(0);
   }
-  buf.out_paged_kv_indices.insert(buf.out_paged_kv_indices.end(),
-                                  block_table.begin(),
-                                  block_table.begin() + page_count);
+  if (ring_layout) {
+    for (int32_t page = 0; page < page_count; ++page) {
+      buf.out_paged_kv_indices.emplace_back(
+          block_table[page % block_table.size()]);
+    }
+  } else {
+    buf.out_paged_kv_indices.insert(buf.out_paged_kv_indices.end(),
+                                    block_table.begin(),
+                                    block_table.begin() + page_count);
+  }
   buf.out_paged_kv_indptr.emplace_back(buf.out_paged_kv_indptr.back() +
                                        page_count);
   buf.out_paged_kv_last_page_len.emplace_back(
@@ -471,6 +481,13 @@ void append_decode_row(const DecodeRowContext& ctx,
         buf.out_multi_block_tables[m].emplace_back(block_table_slice.begin(),
                                                    block_table_slice.end());
       }
+      if (row_kv_seq_len.has_value()) {
+        append_paged_kv_row(ctx.multi_block_tables.front()[row.seq_id],
+                            *row_kv_seq_len,
+                            block_size,
+                            buf,
+                            true);
+      }
     }
   } else {
     const Slice<int32_t> block_table_slice =
@@ -680,6 +697,12 @@ void update_input_params(ModelInputParams& input_params,
             create_2d_tensor(manager_tables, torch::kInt));
       }
       input_params.attention.host.block_tables = torch::Tensor();
+      input_params.attention.device.paged_kv_indptr =
+          make_cpu_int_tensor(buf.out_paged_kv_indptr);
+      input_params.attention.device.paged_kv_indices =
+          make_cpu_int_tensor(buf.out_paged_kv_indices);
+      input_params.attention.device.paged_kv_last_page_len =
+          make_cpu_int_tensor(buf.out_paged_kv_last_page_len);
     } else {
       input_params.attention.host.block_tables =
           create_flat_2d_tensor(buf.out_block_tables,

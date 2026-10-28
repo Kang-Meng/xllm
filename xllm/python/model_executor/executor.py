@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -41,8 +40,9 @@ from xllm.python.model_executor.input_batch import (
     InputBatch,
     InputBatchMetadata,
 )
-from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
+from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
+from xllm.python.model_executor.sampling_metadata import ModelSamplingInput
 from xllm.python.models.multimodal import MultimodalInputs
 from xllm.python.platform import current_platform
 from xllm.python.registry import get_execution_metadata_builder_classes
@@ -166,6 +166,7 @@ def _create_attention_backend(
                 max_model_len=serving_len,
                 quant_mode=quant_mode,
                 acl_graph_enabled=acl_graph_enabled,
+                block_query_width=int(config.get("draft_query_width", 1)) if model_type == "deepseek_v41_dspark" else 0,
             )
         from xllm.python.attention.dsa_attention import DsaAttentionBackend
 
@@ -280,15 +281,6 @@ def _create_attention_backend(
     raise NotImplementedError(f"No attention backend available for device type '{device.type}'")
 
 
-@dataclass(frozen=True)
-class DecodeGraphAdapter:
-    """Model-owned graph implementation and its token-row geometry."""
-
-    model: nn.Module
-    runner_type: type[BaseRunner]
-    num_decoding_tokens: int
-
-
 class ModelExecutor:
     def __init__(
         self,
@@ -350,22 +342,14 @@ class ModelExecutor:
         first_parameter = next(model.parameters())
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
-        graph_backend = _resolve_graph_backend(config)
-        adapter_factory = getattr(model, "create_decode_graph_adapter", None)
-        graph_adapter = (
-            adapter_factory(config, graph_backend, is_spec_draft=is_spec_draft) if adapter_factory is not None else None
+        num_decoding_tokens = max(
+            int(num_decoding_tokens),
+            1 if is_spec_draft and self._draft_query_width > 1 else int(config.get("num_speculative_tokens", 0)) + 1,
         )
-        # Models may provide explicit draft geometry instead of deriving a
-        # target verify width from the speculative decoding configuration.
-        decode_width = (
-            graph_adapter.num_decoding_tokens
-            if graph_adapter is not None
-            else int(config.get("num_speculative_tokens", 0)) + 1
-        )
-        num_decoding_tokens = max(int(num_decoding_tokens), decode_width)
         # Resolve the graph backend before the attention backend so the V4.1
         # CSA2 backend can validate its ACL-graph capacity at startup (C of
         # 51361671) instead of at the first captured forward.
+        graph_backend = _resolve_graph_backend(config)
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
@@ -395,8 +379,8 @@ class ModelExecutor:
             for builder_class in get_execution_metadata_builder_classes(model_type)
             if (builder := builder_class.from_config(config)) is not None
         )
-        self._execution_metadata_builders = execution_metadata_builders
         self.eager_runner.bind_execution_metadata_builders(execution_metadata_builders)
+        self._execution_metadata_builders = self.eager_runner.execution_metadata_builders
 
         if self.layerwise_split_size > 1 and graph_backend not in _DISABLED_GRAPH_BACKENDS:
             raise NotImplementedError(
@@ -441,10 +425,8 @@ class ModelExecutor:
                 and int(config.get("expert_parallel_degree", 0)) == 2
                 and int(config.get("ep_size", 1)) > 1
             )
-            runner_type = graph_adapter.runner_type if graph_adapter is not None else DecodeAclGraphRunner
-            graph_model = graph_adapter.model if graph_adapter is not None else execution_model
-            self.decode_graph_runner = runner_type(
-                graph_model,
+            self.decode_graph_runner = DecodeAclGraphRunner(
+                execution_model,
                 self.attention_backend,
                 device,
                 max_seqs_per_batch,
@@ -609,6 +591,7 @@ class ModelExecutor:
         layers_per_event: int = 1,
         draft_load_event_index: int | None = None,
         multimodal_inputs: MultimodalInputs | None = None,
+        sampling_input: ModelSamplingInput | None = None,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
@@ -633,6 +616,7 @@ class ModelExecutor:
                 positions,
                 input_batch_metadata,
                 is_dummy=bool(getattr(metadata, "is_dummy", False)),
+                sampling=sampling_input,
             )
 
         layer_load_context = (
@@ -651,7 +635,7 @@ class ModelExecutor:
             graph_runner is not None
             and multimodal_inputs is None
             and (eplb is None or current_platform.is_npu())
-            and graph_runner.can_execute(input_ids, metadata, input_embedding)
+            and graph_runner.can_execute(input_ids, metadata, input_embedding, input_batch=input_batch)
         ):
             # Replay bypasses Python attention calls. Also protect first-capture
             # state snapshots and warmup before entering the graph runner.
@@ -673,12 +657,11 @@ class ModelExecutor:
                 eplb=eplb,
                 input_batch=input_batch,
             )
-            output = self._attach_persistent_aux_hidden_states(
+            return self._attach_persistent_aux_hidden_states(
                 output,
                 rows,
                 graph_rows=getattr(graph_runner, "last_padded_batch_size", None),
             )
-            return output
         if restore_history is not None:
             restore_history(self.attention_backend, metadata)
         if self.inductor_runner is not None:

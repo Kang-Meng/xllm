@@ -28,9 +28,6 @@ struct DecodeGraphWarmupConfig {
   int32_t num_speculative_tokens = 0;
   bool enable_graph_mode_decode_no_padding = false;
   int32_t max_graph_batch_size = 0;
-  // Additional global scheduler batch sizes supplied by the execution owner.
-  // The planner merges entries within its effective warmup capacity.
-  std::vector<int32_t> additional_batch_sizes;
 };
 
 // Returns the padded token-row bucket shared by decode graph executors. When

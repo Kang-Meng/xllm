@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/framework/batch/batch_forward_type.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/platform/device.h"
 
 namespace xllm::layer {
 namespace {
@@ -220,6 +221,58 @@ TEST(AttentionMetadataBuilderTest, MaterializesColdMaskForDummyShard) {
   EXPECT_TRUE(
       torch::equal(metadata.has_initial_states, torch::tensor({false})));
 }
+
+#if defined(USE_NPU)
+TEST(AttentionMetadataBuilderTest, PreservesMaterializedDummyQueryGeometry) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  for (const bool decode_rows : {false, true}) {
+    constexpr int32_t kQueryWidth = 4;
+    const int32_t row_count = decode_rows ? kQueryWidth : 1;
+    const int32_t query_len = decode_rows ? 1 : kQueryWidth;
+    ModelInputParams params;
+    params.meta.batch_forward_type = decode_rows
+                                         ? BatchForwardType::DECODE
+                                         : BatchForwardType::CHUNKED_PREFILL;
+    params.meta.num_sequences = 0;
+    params.meta.q_max_seq_len = query_len;
+    params.meta.kv_max_seq_len = query_len;
+    params.execution_batch.num_tokens = kQueryWidth;
+    params.attention.host.q_seq_lens.assign(row_count, query_len);
+    for (int32_t row = 0; row <= row_count; ++row) {
+      params.attention.host.q_cu_seq_lens.emplace_back(row * query_len);
+    }
+    params.attention.host.kv_seq_lens.assign(row_count, query_len);
+    params.attention.host.new_cache_slots.assign(kQueryWidth, -1);
+    params.attention.host.block_tables =
+        torch::zeros({row_count, query_len}, torch::kInt32);
+    params.attention.rebuild_device_buffer(device.unwrap());
+
+    const AttentionMetadata metadata =
+        AttentionMetadataBuilder::build(params, false);
+    EXPECT_TRUE(metadata.is_dummy);
+    EXPECT_EQ(metadata.is_chunked_prefill, !decode_rows);
+    EXPECT_EQ(metadata.max_query_len, query_len);
+    EXPECT_EQ(metadata.q_seq_lens.numel(), row_count);
+    EXPECT_EQ(metadata.kv_seq_lens.numel(), row_count);
+    EXPECT_EQ(metadata.q_cu_seq_lens.device(), device.unwrap());
+    EXPECT_EQ(metadata.slot_mapping.device(), device.unwrap());
+    EXPECT_TRUE(torch::equal(
+        metadata.q_cu_seq_lens.cpu(),
+        torch::tensor(params.attention.host.q_cu_seq_lens, torch::kInt32)));
+    EXPECT_TRUE(torch::equal(metadata.slot_mapping.cpu(),
+                             torch::full({kQueryWidth}, -1, torch::kInt32)));
+    EXPECT_EQ(metadata.block_table.size(0), row_count);
+    EXPECT_EQ(metadata.block_table.size(1), query_len);
+    EXPECT_EQ(params.execution_batch.num_reqs, 0);
+    EXPECT_TRUE(params.execution_batch.num_scheduled_tokens.empty());
+
+    params.meta.num_sequences = 1;
+    EXPECT_FALSE(AttentionMetadataBuilder::build(params, false).is_dummy);
+  }
+}
+#endif
 
 #if defined(USE_MUSA)
 TEST(AttentionMetadataBuilderTest, BuildsMusaMetadataWithCommonBuilder) {

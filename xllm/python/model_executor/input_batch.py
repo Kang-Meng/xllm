@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
+
+if TYPE_CHECKING:
+    from xllm.python.model_executor.sampling_metadata import ModelSamplingInput
 
 
 class InputBatchMetadata(Protocol):
@@ -39,8 +42,10 @@ class InputBatch:
 
     Request-scoped fields are copied from the C++ producer. Graph padding is
     added later by the graph runner and never changes the actual request or
-    token counts. This initial contract covers non-speculative execution, where
-    rows are packed contiguously by request.
+    token counts. Rows are packed contiguously by request, including expanded
+    speculative query blocks.
+    num_computed_tokens counts the logical cached prefix before each request's query.
+    An empty tuple means these cached-prefix counts are not available on host.
     """
 
     input_ids: torch.Tensor
@@ -54,6 +59,7 @@ class InputBatch:
     is_prefilling: tuple[bool, ...]
     is_padding: torch.Tensor | None
     is_dummy: bool
+    sampling: ModelSamplingInput | None = None
 
     @classmethod
     def from_runtime(
@@ -61,8 +67,8 @@ class InputBatch:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: InputBatchMetadata,
-        *,
         is_dummy: bool,
+        sampling: ModelSamplingInput | None = None,
     ) -> InputBatch:
         """Build an unpadded batch without inferring request semantics."""
         num_reqs = int(metadata.num_reqs)
@@ -95,6 +101,7 @@ class InputBatch:
             is_prefilling=is_prefilling,
             is_padding=None,
             is_dummy=is_dummy,
+            sampling=sampling,
         )
 
     def bind_graph_inputs(
@@ -128,6 +135,7 @@ class InputBatch:
             is_prefilling=self.is_prefilling,
             is_padding=is_padding,
             is_dummy=self.is_dummy,
+            sampling=self.sampling,
         )
 
     @classmethod
@@ -155,11 +163,12 @@ class InputBatch:
 
         request_fields = (
             num_scheduled_tokens,
-            num_computed_tokens,
             is_prefilling,
         )
         if any(len(values) != num_reqs for values in request_fields):
             raise ValueError("request-scoped InputBatch metadata has inconsistent lengths")
+        if num_computed_tokens and len(num_computed_tokens) != num_reqs:
+            raise ValueError("provided num_computed_tokens must contain one value per request")
         if any(value <= 0 for value in num_scheduled_tokens):
             raise ValueError("each non-dummy request must schedule at least one token")
         if any(value < 0 for value in num_computed_tokens):

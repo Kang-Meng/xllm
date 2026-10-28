@@ -54,7 +54,6 @@ from xllm.python.model_executor.execution_context import (  # noqa: E402
     LayerCacheAwareExecutionMetadataBuilder,
 )
 from xllm.python.model_executor.executor import (  # noqa: E402
-    DecodeGraphAdapter,
     ModelExecutor,
     _create_attention_backend,
     _resolve_graph_backend,
@@ -78,6 +77,7 @@ from xllm.python.model_executor.runners.decode_cuda_graph import (  # noqa: E402
     _decode_graph_buckets,
 )
 from xllm.python.model_executor.runners.eager import EagerRunner  # noqa: E402
+from xllm.python.model_executor.sampling_metadata import ModelSamplingMetadataBuilder
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1128,6 +1128,35 @@ class TestModelExecutorConstruction:
         else:
             mock_graph_runner.assert_not_called()
 
+    @pytest.mark.parametrize("graph_backend", ["off", "aclgraph"])
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_block_draft_width_is_independent_of_target_verify_width(
+        self,
+        mock_create: MagicMock,
+        mock_graph_runner: MagicMock,
+        graph_backend: str,
+    ) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+        executor = ModelExecutor(
+            model,
+            {
+                "python_graph_backend": graph_backend,
+                "num_speculative_tokens": 15,
+                "draft_query_width": 15,
+                "max_position_embeddings": 128,
+            },
+            max_seqs_per_batch=4,
+            num_decoding_tokens=1,
+            is_spec_draft=True,
+        )
+        assert mock_create.call_args.kwargs["num_decoding_tokens"] == 1
+        assert executor.eager_runner.model is model.model
+        if graph_backend == "aclgraph":
+            assert mock_graph_runner.call_args.args[0] is model.model
+            assert mock_graph_runner.call_args.kwargs["num_decoding_tokens"] == 1
+
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
         return_value=StubAttentionBackend(),
@@ -1690,21 +1719,6 @@ class TestModelExecutorConstruction:
         )
 
         assert mock_graph_runner.call_args.kwargs["draft_query_width"] == 8
-
-    @patch("xllm.python.model_executor.executor._create_attention_backend")
-    def test_model_provided_graph_runner_keeps_default_execution_contract(self, mock_create: MagicMock) -> None:
-        mock_create.return_value = StubAttentionBackend()
-        model = _FakeModel(num_layers=1)
-        runner_type = MagicMock()
-        model.create_decode_graph_adapter = MagicMock(return_value=DecodeGraphAdapter(model.model, runner_type, 1))
-        executor = ModelExecutor(
-            model,
-            {"max_position_embeddings": 128, "python_graph_backend": "aclgraph"},
-            max_seqs_per_batch=8,
-        )
-        assert runner_type.call_args.args[0] is model.model
-        assert executor.eager_runner.model is model.model
-        assert executor.decode_graph_runner is runner_type.return_value
 
 
 class TestDecodeCudaGraphDataParallelKeys:
@@ -2828,6 +2842,61 @@ def test_eager_runner_rejects_missing_cp_lengths(
 
 
 class TestExecuteRouting:
+    @pytest.mark.parametrize("sampling_mode", ["greedy", "filter", "penalty", "probabilities", "confidence"])
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_sampling_graph_admission_selects_graph_or_eager(
+        self, mock_create: MagicMock, sampling_mode: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
+        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+        builder = ModelSamplingMetadataBuilder()
+        executor._execution_metadata_builders = (builder,)
+        runner = DecodeAclGraphRunner(
+            nn.Identity(), SimpleNamespace(page_size=4, is_mla=False), torch.device("cpu"), 4, 8
+        )
+        runner.bind_execution_metadata_builders((builder,))
+        monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=True))
+        monkeypatch.setattr(runner, "warmup", MagicMock())
+        monkeypatch.setattr(runner, "execute", MagicMock(return_value=torch.zeros(1)))
+        executor.decode_graph_runner = runner
+        executor.eager_runner = MagicMock()
+        executor.eager_runner.execute.return_value = torch.ones(1)
+        mask = torch.tensor([[3]], dtype=torch.int32) if sampling_mode == "filter" else None
+        sampling = SimpleNamespace(
+            parameters=SimpleNamespace(filter_bitmask=mask),
+            is_unconstrained_greedy=sampling_mode not in ("filter", "penalty"),
+            return_probs=sampling_mode == "probabilities",
+            return_confidence=sampling_mode == "confidence",
+        )
+        batch_metadata = SimpleNamespace(
+            num_reqs=1,
+            num_tokens=1,
+            num_scheduled_tokens=[1],
+            num_computed_tokens=[0],
+            query_start_loc=[0, 1],
+            is_prefilling=[False],
+        )
+        output = executor.execute(
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            SimpleNamespace(is_prefill=False, is_chunked_prefill=False, is_dummy=False),
+            input_batch_metadata=batch_metadata,
+            sampling_input=sampling,
+        )
+        selected = runner if sampling_mode == "greedy" else executor.eager_runner
+        selected.execute.assert_called_once()
+        assert selected.execute.call_args.kwargs["input_batch"].sampling is sampling
+        assert sampling.parameters.filter_bitmask is mask
+        if sampling_mode == "greedy":
+            runner.warmup.assert_called_once()
+            executor.eager_runner.execute.assert_not_called()
+            torch.testing.assert_close(output, torch.zeros(1))
+        else:
+            runner.warmup.assert_not_called()
+            runner.execute.assert_not_called()
+            torch.testing.assert_close(output, torch.ones(1))
+
     @pytest.mark.parametrize("runner_name", ["eager_runner", "inductor_runner"])
     @pytest.mark.parametrize("prefill,chunked", [(True, False), (False, True)])
     @patch("xllm.python.model_executor.executor._create_attention_backend")

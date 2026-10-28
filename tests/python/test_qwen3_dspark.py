@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from xllm.python import kernels
+from xllm.python.models.dspark_pipeline import DSparkPipeline
 from xllm.python.models.qwen3_dspark import (
     Qwen3DSparkConfig,
     Qwen3DSparkForCausalLM,
@@ -49,6 +50,7 @@ def _config_dict(**overrides) -> dict:
         "vocab_size": 8,
         "draft_vocab_size": 8,
         "markov_rank": 2,
+        "draft_query_width": 3,
         "tp_size": 1,
         "tp_rank": 0,
         "dp_size": 1,
@@ -74,6 +76,21 @@ class _StateDict:
 def test_config_requires_positive_markov_rank() -> None:
     with pytest.raises(ValueError, match="markov_rank > 0"):
         _config(markov_rank=0)
+
+@pytest.mark.parametrize("query_width", [1, 3, 15])
+def test_pipeline_uses_runtime_query_width(query_width: int) -> None:
+    model = Qwen3DSparkForCausalLM(
+        _config_dict(draft_query_width=query_width, num_speculative_tokens=16)
+    )
+
+    assert model.model._query_width == query_width
+
+def test_pipeline_requires_runtime_query_width() -> None:
+    config = _config_dict(num_speculative_tokens=16)
+    del config["draft_query_width"]
+
+    with pytest.raises(KeyError, match="draft_query_width"):
+        Qwen3DSparkForCausalLM(config)
 
 
 @pytest.mark.parametrize("is_ascend_a3", [False, True])
@@ -129,6 +146,7 @@ def test_checkpoint_loads_dspark_heads(monkeypatch: pytest.MonkeyPatch) -> None:
         )
     )
     tensors = {
+        "d2t": torch.tensor([0, 1, 2, 3, 0, 0, 0, 0]),
         "fc.weight": torch.eye(4),
         "hidden_norm.weight": torch.ones(4),
         "layers.0.input_layernorm.weight": torch.ones(4),
@@ -151,21 +169,25 @@ def test_checkpoint_loads_dspark_heads(monkeypatch: pytest.MonkeyPatch) -> None:
 
     model.load_weights([_StateDict(tensors)], tp_rank=0, tp_size=1)
 
+    assert isinstance(model.model, DSparkPipeline)
+    assert "model.backbone.fc.weight" in dict(model.named_parameters())
+    torch.testing.assert_close(model.model.hot_token_ids, tensors["d2t"] + torch.arange(8))
+
     assert prepare_row_parallel_weight.call_count == 2
     torch.testing.assert_close(
-        model.markov_head.markov_w1.weight,
+        model.model.markov_head.markov_w1.weight,
         tensors["markov_head.markov_w1.weight"],
     )
     torch.testing.assert_close(
-        model.markov_head.markov_w2.weight,
+        model.model.markov_head.markov_w2.weight,
         tensors["markov_head.markov_w2.weight"],
     )
-    assert model.confidence_head is not None
+    assert model.model.confidence_head is not None
     torch.testing.assert_close(
-        model.confidence_head.proj.weight,
+        model.model.confidence_head.proj.weight,
         tensors["confidence_head.proj.weight"],
     )
     torch.testing.assert_close(
-        model.confidence_head.proj.bias,
+        model.model.confidence_head.proj.bias,
         tensors["confidence_head.proj.bias"],
     )

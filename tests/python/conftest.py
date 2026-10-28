@@ -118,8 +118,13 @@ def _scatter_nd_update(
     value.index_copy_(0, flat_indices, updates.to(value.dtype))
 
 
+def _unmocked_platform_operation(*args: object, **kwargs: object) -> None:
+    raise RuntimeError("Platform operation requires an explicit test mock")
+
+
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
+    kernels.update_decode_graph_metadata = _unmocked_platform_operation
     kernels.rms_norm = _rms_norm
     kernels.rms_norm_sigmoid_gated = _rms_norm_sigmoid_gated
     kernels.l2_norm = _l2_norm
@@ -138,6 +143,7 @@ def _install_python_package_stub() -> None:
     package.distributed = distributed
 
     distributed.tp_rank = lambda device: 0
+    distributed.tp_group = _unmocked_platform_operation
     distributed.moe_ep_all_reduce = lambda x: None
     distributed.moe_tp_all_reduce = lambda x: None
     # V4.1 runs tp_size == 1 in the pure-Python tests, so the TP ops are
@@ -161,6 +167,7 @@ def _install_python_package_stub() -> None:
     distributed.init_engram_dp_group = _init_engram_dp_group
     distributed.gather_dp_execution_tokens = lambda *args, **kwargs: None
     distributed.all_reduce_ = lambda *args, **kwargs: None
+    distributed.broadcast_ = _unmocked_platform_operation
 
     sys.modules["xllm.python"] = package
     sys.modules["xllm.python.kernels"] = kernels

@@ -14,6 +14,7 @@
 
 """CPU tests for builder-owned dense DCP local cache slots."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -83,6 +84,21 @@ def _metadata(slots: list[int]) -> SimpleNamespace:
         is_spec_verify=False,
         is_mixed=False,
     )
+
+
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_host_cached_counts_are_required_only_for_pure_prefill(is_prefill: bool) -> None:
+    batch = replace(_batch(2), num_computed_tokens=())
+    metadata = _metadata([-1, 3])
+    metadata.is_prefill = is_prefill
+    builder = _builder()
+
+    if is_prefill:
+        with pytest.raises(RuntimeError, match="prefill requires host cached-token counts"):
+            builder.build(batch, metadata)
+    else:
+        result = builder.build(batch, metadata)
+        assert result.local_slot_mapping is metadata.local_slot_mapping
 
 
 def test_eager_runner_exposes_upstream_slots_without_copying() -> None:

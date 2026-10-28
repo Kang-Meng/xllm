@@ -19,7 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
 
 from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.model_loader import ParallelLoadContext, load_draft_lm_head_if_present
@@ -54,17 +53,13 @@ class Qwen3DSparkConfig(DFlashQwen3Config):
             raise ValueError("sliding-window DSpark drafts are not supported yet")
 
     def _allows_reduced_vocab(self) -> bool:
-        # DSpark remaps draft ids to target ids via the checkpoint's d2t table
-        # in DSparkWorkerImpl, so a reduced draft vocabulary is supported.
         return True
 
 
 class Qwen3DSparkModel(DFlashQwen3Model):
     """DFlash draft backbone used with DSpark-specific output heads."""
 
-
 class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
-    model: Qwen3DSparkModel
 
     def __init__(self, config: dict) -> None:
         cfg = Qwen3DSparkConfig.from_dict(config)
@@ -72,6 +67,9 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "npu"))
         super().__init__(
+            backbone=Qwen3DSparkModel(cfg, dtype, device),
+            lm_head=None,
+            query_width=int(config["draft_query_width"]),
             vocab_size=cfg.vocab_size,
             draft_vocab_size=cfg.draft_vocab_size,
             markov_rank=cfg.markov_rank,
@@ -84,8 +82,6 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         self.cfg = cfg
         self.dtype = dtype
         self.device = device
-        self.model = Qwen3DSparkModel(cfg, dtype, device)  # pyright: ignore[reportIncompatibleVariableOverride]
-        self.lm_head: nn.Module | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
         import xllm_runtime
@@ -101,23 +97,27 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         )
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
-        all_weights = self.model.load_weights(state_dicts, tp_rank, tp_size)
+        pipeline = self.model
+        all_weights = pipeline.backbone.load_weights(state_dicts, tp_rank, tp_size)
+        if all_weights.has("d2t"):
+            offsets = all_weights.get_tensor("d2t").to(device=self.device, dtype=torch.long)
+            pipeline.hot_token_ids = offsets + torch.arange(offsets.numel(), device=self.device)
         load_draft_lm_head_if_present(
-            self,
+            pipeline,
             all_weights,
             context=ParallelLoadContext(tp_rank, tp_size),
         )
-        all_weights.load_tensor(self.markov_head.markov_w1.weight, "markov_head.markov_w1.weight")
-        all_weights.load_tensor(self.markov_head.markov_w2.weight, "markov_head.markov_w2.weight")
-        if self.confidence_head is not None:
-            all_weights.load_tensor(self.confidence_head.proj.weight, "confidence_head.proj.weight")
-            all_weights.load_tensor(self.confidence_head.proj.bias, "confidence_head.proj.bias")
+        all_weights.load_tensor(pipeline.markov_head.markov_w1.weight, "markov_head.markov_w1.weight")
+        all_weights.load_tensor(pipeline.markov_head.markov_w2.weight, "markov_head.markov_w2.weight")
+        if pipeline.confidence_head is not None:
+            all_weights.load_tensor(pipeline.confidence_head.proj.weight, "confidence_head.proj.weight")
+            all_weights.load_tensor(pipeline.confidence_head.proj.bias, "confidence_head.proj.bias")
 
     def adapt_weights_for_reference_model(
         self,
         reference_model_path: str,
     ) -> None:
-        self.model.adapt_weights_for_reference_model(reference_model_path)
+        self.model.backbone.adapt_weights_for_reference_model(reference_model_path)
 
     def write_context_kv(
         self,
@@ -127,7 +127,7 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         kv_caches: list[tuple[torch.Tensor | None, ...]],
         layer_synchronizer: LayerSynchronizer | None,
     ) -> torch.Tensor | None:
-        return self.model.write_context_kv(
+        return self.model.backbone.write_context_kv(
             target_hidden,
             positions,
             cache_slots,
