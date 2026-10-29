@@ -35,6 +35,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "common/types.h"
+#include "core/common/instance_role_util.h"
 #include "core/common/xllm_build_info.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/eplb_config.h"
@@ -336,10 +337,9 @@ std::optional<std::string> validate_model_cp(const Options& options,
         // a different mechanism this gate does not enable. A prefill-only
         // instance is the exact condition, not "role == PREFILL": with
         // enable_disagg_pd=false the continuous scheduler runs prefill and
-        // decode on the same instance whatever the role says.
-        if (kv_split > 1 &&
-            (!options.enable_disagg_pd() ||
-             options.instance_role() != InstanceRole::PREFILL)) {
+        // decode on the same instance whatever the role says
+        // (is_pd_prefill_role spells out that condition).
+        if (kv_split > 1 && !is_pd_prefill_role(options)) {
           return "Python GLM-5 Next CP with kv_split_size > 1 requires "
                  "disaggregated PD with the PREFILL role; set "
                  "enable_disagg_pd=true and instance_role=PREFILL";
@@ -365,8 +365,7 @@ std::optional<std::string> validate_model_cp(const Options& options,
         // validate_host_cache_options requires prefix caching, so without
         // this shape a CP prefill could never set --host_blocks_factor > 1.
         if (KVCacheConfig::get_instance().enable_prefix_cache() &&
-            (!options.enable_disagg_pd() ||
-             options.instance_role() != InstanceRole::PREFILL)) {
+            !is_pd_prefill_role(options)) {
           return "Python GLM-5 Next CP with enable_prefix_cache=true "
                  "requires disaggregated PD with the PREFILL role; a "
                  "standalone CP instance must set enable_prefix_cache=false";
@@ -392,8 +391,7 @@ std::optional<std::string> validate_model_cp(const Options& options,
                "positive divisor of cp_size";
       }
       if (model_type == "glm_moe_dsa" && kv_split > 1 &&
-          (!options.enable_disagg_pd() ||
-           options.instance_role() != InstanceRole::PREFILL)) {
+          !is_pd_prefill_role(options)) {
         return "Python GLM CP with kv_split_size > 1 requires disaggregated "
                "PD with the PREFILL role; set enable_disagg_pd=true and "
                "instance_role=PREFILL";

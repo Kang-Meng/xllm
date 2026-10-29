@@ -27,6 +27,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/metrics.h"
+#include "core/common/instance_role_util.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
@@ -528,7 +529,17 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
           << "DFlash2 runtime block size must match the draft model's "
              "configured dflash_config.block_size.";
 #if defined(USE_NPU)
-      CHECK(!target_is_hybrid_recurrent_ ||
+      // The graph requirement guards the decode-side spec-verify replay, so it
+      // is exempt only for an instance that never receives a decode batch:
+      // is_pd_prefill_only() rather than a bare role comparison. The role flag
+      // alone is not enough -- without enable_disagg_pd the continuous
+      // scheduler still schedules decode on an instance whose role says
+      // PREFILL, and under enable_pd_ooc the PD prefill instance decodes its
+      // offline requests -- either case would silently run the eager
+      // validation this CHECK rejects instead of aborting at startup. Note the
+      // exemption cannot lean on graph warmup: no warmup runs at all when
+      // enable_graph=false, which is the only configuration this CHECK fails.
+      CHECK(!target_is_hybrid_recurrent_ || is_pd_prefill_only(options_) ||
             ::xllm::ExecutionConfig::get_instance().enable_graph())
           << "DFlash2 with a hybrid recurrent target requires ACL Graph: the "
              "expanded spec-verify replay path preserves the accepted GDN "

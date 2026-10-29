@@ -8,6 +8,7 @@ cc_library(
     etcd_client.h
     global_flags.h
     instance_name.h
+    instance_role_util.h
     macros.h
     message.h
     metrics.h

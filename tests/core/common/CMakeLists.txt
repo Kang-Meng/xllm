@@ -6,6 +6,7 @@ cc_test(
   CPU_ONLY
   SRCS
     flash_comm1_context_test.cpp
+    instance_role_util_test.cpp
     metrics_test.cpp
     options_test.cpp
     rate_limiter_test.cpp

@@ -35,6 +35,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/metrics.h"
+#include "core/common/instance_role_util.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -94,10 +95,12 @@ BatchMode resolve_batch_mode(const ContinuousScheduler::Options& options) {
   }
 
   // PD PREFILL instance: always use exclusive batch (PrefillFirstPolicy).
-  // Prefill instances never have local decode requests, so mix batch is
-  // meaningless and PrefillFirstPolicy gives cleaner chunk_queue priority.
-  if (options.enable_disagg_pd() && options.instance_role().has_value() &&
-      options.instance_role().value() == InstanceRole::PREFILL) {
+  // Online decode for these requests runs on the decode instance, so mix batch
+  // buys nothing and PrefillFirstPolicy gives cleaner chunk_queue priority.
+  // This is a PD-topology gate, hence is_pd_prefill_role() and not
+  // is_pd_prefill_only(): under enable_pd_ooc the offline requests that do
+  // decode here keep the same exclusive batching.
+  if (is_pd_prefill_role(options)) {
     mode.enable_mix_batch = false;
   }
 
