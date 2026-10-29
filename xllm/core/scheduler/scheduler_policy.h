@@ -153,10 +153,12 @@ class SchedulerPolicy {
 
  protected:
   // ===== Common phases (internal) =====
+  // Called after policy requeue; reset batch state and append new FCFS decode
+  // handoffs behind all existing waiters and requeued requests.
   void reset_batch_state(SchedulerState& state);
 
   // ===== Running request state update =====
-  void handle_running_requests(std::shared_ptr<Request> request,
+  void handle_running_requests(const std::shared_ptr<Request>& request,
                                SchedulerState& state);
 
   // Adjusts latency budget and reorders queues based on SLO urgency.
@@ -260,6 +262,11 @@ class SchedulerPolicy {
   // The decode the last decode pass could not give blocks to. Freed blocks go
   // to it before any restore starts.
   std::weak_ptr<Request> blocked_decode_;
+
+ private:
+  // Owned between drain and reset_batch_state. collect_finished checks these
+  // requests so termination before requeue uses the same cleanup as running.
+  std::vector<std::shared_ptr<Request>> pending_decode_handoffs_;
 };
 
 // =============================================================================

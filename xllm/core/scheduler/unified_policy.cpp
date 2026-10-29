@@ -41,6 +41,11 @@ void UnifiedPolicy::drain_request_queue(
     if (state.reject_queued_request && state.reject_queued_request(request)) {
       continue;
     }
+    if (request->finished() || request->cancelled()) {
+      // prepare_batch collects terminal requests before policy requeue.
+      state.running_requests.emplace_back(std::move(request));
+      continue;
+    }
     if (!state.enable_prefix_cache) {
       request->expand_sequences(/*force=*/false);
     }

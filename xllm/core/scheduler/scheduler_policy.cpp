@@ -248,6 +248,8 @@ void SchedulerPolicy::drain_request_queue(
   // MPMC drain order is not arrival order across producer threads. Restore
   // FCFS before the waiting queues see the batch.
   if (batch_mode_.priority_strategy == "fcfs") {
+    pending_decode_handoffs_.reserve(pending_decode_handoffs_.size() +
+                                     incoming.size());
     std::stable_sort(incoming.begin(),
                      incoming.end(),
                      create_comparator("fcfs", /*is_reversed=*/true));
@@ -255,6 +257,11 @@ void SchedulerPolicy::drain_request_queue(
 
   for (std::shared_ptr<Request>& queued : incoming) {
     if (state.reject_queued_request && state.reject_queued_request(queued)) {
+      continue;
+    }
+    if (queued->finished() || queued->cancelled()) {
+      // prepare_batch collects terminal requests before policy requeue.
+      state.running_requests.emplace_back(std::move(queued));
       continue;
     }
     if (!state.enable_prefix_cache &&
@@ -266,36 +273,67 @@ void SchedulerPolicy::drain_request_queue(
 
     if (queued->sequences()[0]->kv_state().kv_cache_tokens_num() == 0) {
       // New request goes to waiting queue (back = FIFO from MPMC).
-      state.prefill_queue.push(queued, /*if_back=*/true);
+      state.prefill_queue.push(std::move(queued), /*if_back=*/true);
+      continue;
+    }
+
+    // Request from prefill instance in disagg PD mode -- already has KV.
+    if (batch_mode_.priority_strategy == "fcfs") {
+      pending_decode_handoffs_.emplace_back(std::move(queued));
     } else {
-      // Request from prefill instance in disagg PD mode -- already has KV.
-      // It joins the running batch directly, skipping the prefill queue.
-      queued->record_first_batched_time();
-      state.running_requests.emplace_back(queued);
+      // Other strategies retain admission and preparation by policy requeue.
+      state.running_requests.emplace_back(std::move(queued));
     }
   }
 }
 
 std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
     SchedulerState& state) {
+  const size_t num_decode_waiters =
+      batch_mode_.priority_strategy == "fcfs" ? state.decode_queue.size() : 0;
   std::vector<std::shared_ptr<Request>> finished_requests;
+  finished_requests.reserve(state.running_requests.size() +
+                            pending_decode_handoffs_.size() +
+                            num_decode_waiters);
+  auto collect_request =
+      [this, &state, &finished_requests](std::shared_ptr<Request>& slot) {
+        if (slot == nullptr) {
+          return;
+        }
+        slot->update_connection_status();
+        if (!slot->finished() && !slot->cancelled()) {
+          return;
+        }
+        if (state.release_failed_request) {
+          state.release_failed_request(slot);
+        }
+        clear_mtp_bootstrap(slot.get(), state);
+        state.kv_cache_manager->deallocate(slot.get());
+        // emplace_back(std::move(slot)) leaves slot null, marking it collected.
+        finished_requests.emplace_back(std::move(slot));
+      };
   for (auto it = state.running_requests.rbegin();
        it != state.running_requests.rend();
        ++it) {
-    if (*it == nullptr) {
+    collect_request(*it);
+  }
+  for (auto it = pending_decode_handoffs_.rbegin();
+       it != pending_decode_handoffs_.rend();
+       ++it) {
+    collect_request(*it);
+  }
+  // Handoffs can terminate after joining the FCFS decode queue. Rotate the
+  // original entries once to clean even tail waiters without a decode budget,
+  // preserving live requests' order and reusing the same terminal cleanup.
+  // FCFS uses DequeQueue: this rotation requires FIFO push_back semantics.
+  for (size_t index = 0; index < num_decode_waiters; ++index) {
+    std::shared_ptr<Request> request = state.decode_queue.top();
+    state.decode_queue.pop_top();
+    collect_request(request);
+    if (request == nullptr) {
       continue;
     }
-    std::shared_ptr<Request> request = *it;
-    request->update_connection_status();
-    if (request->finished() || request->cancelled()) {
-      if (state.release_failed_request) {
-        state.release_failed_request(request);
-      }
-      clear_mtp_bootstrap(request.get(), state);
-      state.kv_cache_manager->deallocate(request.get());
-      finished_requests.emplace_back(request);
-      *it = nullptr;
-    }
+    state.decode_queue.push(std::move(request), /*if_back=*/true);
   }
   return finished_requests;
 }
@@ -305,6 +343,19 @@ void SchedulerPolicy::reset_batch_state(SchedulerState& state) {
   state.running_requests.clear();
   state.running_sequences.clear();
   state.running_sequences_budgets.clear();
+  // Policy-specific requeue is complete, including policies that append old
+  // requests at the back. New arrivals cannot bypass either those or waiters.
+  for (std::shared_ptr<Request>& request : pending_decode_handoffs_) {
+    if (request == nullptr) {
+      continue;
+    }
+    // Keep expansion/cache and finished-sequence cleanup in the requeue phase.
+    // Expand here if drain skipped expansion; otherwise expansion is a no-op.
+    handle_running_requests(request, state);
+    state.decode_queue.push(std::move(request), /*if_back=*/true);
+  }
+  // Retain capacity for the next incoming batch.
+  pending_decode_handoffs_.clear();
 }
 
 // =============================================================================
@@ -1073,6 +1124,7 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
         blocked_decode_.reset();
       }
       queue->pop_top();
+      request->record_first_batched_time();
       state.running_requests.emplace_back(request);
       state.running_sequences.insert(state.running_sequences.end(),
                                      candidate_sequences.begin(),
@@ -1216,6 +1268,7 @@ void SchedulerPolicy::handle_abnormal_decode_request(
   if (!candidate_sequences.empty() && !request->check_beam_search()) {
     // Partial schedule: commit the sequences we already allocated.
     queue->pop_top();
+    request->record_first_batched_time();
     state.running_requests.emplace_back(request);
     state.running_sequences.insert(state.running_sequences.end(),
                                    candidate_sequences.begin(),
@@ -1314,8 +1367,9 @@ void SchedulerPolicy::report_metrics(const SchedulerState& state,
 // Helpers
 // =============================================================================
 
-void SchedulerPolicy::handle_running_requests(std::shared_ptr<Request> request,
-                                              SchedulerState& state) {
+void SchedulerPolicy::handle_running_requests(
+    const std::shared_ptr<Request>& request,
+    SchedulerState& state) {
   if (request->finished() || request->cancelled()) {
     LOG(FATAL) << "Unknown error, finished/cancelled request should have been "
                   "handled before. request_id is "

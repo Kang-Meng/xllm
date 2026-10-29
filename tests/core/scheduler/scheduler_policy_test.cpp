@@ -18,6 +18,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -2451,6 +2452,14 @@ class HostRestoreBlockPool final : public BlockManagerPool {
 
   bool supports_host_cache_restore() const override { return true; }
 
+  using BlockManagerPool::cache;
+  void cache(Sequence* sequence) override {
+    ++cache_calls_;
+    BlockManagerPool::cache(sequence);
+  }
+
+  size_t cache_calls() const { return cache_calls_; }
+
  private:
   static BlockManagerPool::Options make_options(int32_t num_blocks) {
     BlockManagerPool::Options options;
@@ -2460,6 +2469,8 @@ class HostRestoreBlockPool final : public BlockManagerPool {
     options.enable_prefix_cache_ = false;
     return options;
   }
+
+  size_t cache_calls_ = 0;
 };
 
 ContinuousScheduler::Options make_restore_options(int32_t token_budget,
@@ -2510,10 +2521,12 @@ class RestoreHarness final {
             .decode_admission = &admission_,
         } {}
 
-  void schedule(SchedulerPolicy& policy, size_t token_budget) {
+  void schedule(SchedulerPolicy& policy,
+                size_t token_budget,
+                size_t seq_budget = 16) {
     ScheduleBudget budget{
         .remaining_token_budget = token_budget,
-        .remaining_seq_budget = 16,
+        .remaining_seq_budget = seq_budget,
         .latency_budget = std::numeric_limits<double>::max(),
         .estimate_latency = 0,
         .num_preempted_requests = 0,
@@ -2631,7 +2644,293 @@ class HostRestoreConfig final {
       0};
 };
 
+std::shared_ptr<Request> make_pd_decode(BlockManagerPool& pool,
+                                        int32_t num_outputs = 1) {
+  StoppingChecker stopping;
+  stopping.set_max_generated_tokens(64);
+  stopping.set_max_context_len(4096);
+  stopping.set_ignore_eos(true);
+  RequestState state("prompt",
+                     std::vector<int32_t>(16, 0),
+                     RequestSamplingParam(),
+                     SchedulerParam(),
+                     stopping,
+                     /*seq_capacity=*/4096,
+                     /*n=*/num_outputs,
+                     /*best_of=*/num_outputs,
+                     /*logprobs=*/false,
+                     /*stream=*/false,
+                     /*echo=*/false,
+                     /*skip_special_tokens=*/false,
+                     /*enable_schedule_overlap=*/false,
+                     nullptr,
+                     nullptr);
+  auto request = std::make_shared<Request>("decode", "", "", std::move(state));
+  Sequence* sequence = request->sequences().front().get();
+  sequence->set_dp_rank(0);
+  EXPECT_TRUE(pool.BlockManagerPool::allocate(sequence, /*num_tokens=*/16));
+  sequence->kv_state().set_kv_cache_tokens_num(16);
+  sequence->append_token(Token(1));
+  return request;
+}
+
+class PdDecodeFcfsTest : public testing::TestWithParam<std::tuple<bool, bool>> {
+ protected:
+  std::unique_ptr<SchedulerPolicy> make_policy(
+      const ContinuousScheduler::Options& options) const {
+    BatchMode mode{.enable_mix_batch = std::get<0>(GetParam()),
+                   .enable_chunked_prefill = true,
+                   .priority_strategy = "fcfs"};
+    return create_scheduler_policy(mode, options);
+  }
+
+  void set_requeue_state(SchedulerState& state) const {
+    state.last_step_prefill = std::get<1>(GetParam());
+  }
+};
+
 }  // namespace
+
+TEST_P(PdDecodeFcfsTest, OlderWaiterIsNotStarvedByRepeatedPdArrivals) {
+  HostRestoreConfig config;
+  // Exclude memory pressure while arrivals continue until natural completion.
+  HostRestoreBlockPool pool(/*num_blocks=*/128, /*dp_size=*/1);
+  auto options = make_restore_options(/*token_budget=*/2, /*dp_size=*/1);
+  options.max_seqs_per_batch() = 2;
+  auto policy = make_policy(options);
+  RestoreHarness harness(&pool, options);
+  set_requeue_state(harness.state());
+  auto active = make_pd_decode(pool);
+  auto old_waiter = make_pd_decode(pool);
+  harness.state().running_requests.emplace_back(active);
+  harness.decode_queue().push(old_waiter);
+  folly::MPMCQueue<std::shared_ptr<Request>> incoming(2);
+
+  for (int32_t round = 0; round < 64 && !old_waiter->finished(); ++round) {
+    SCOPED_TRACE(round);
+    ASSERT_TRUE(incoming.write(make_pd_decode(pool)));
+    policy->drain_request_queue(harness.state(), incoming);
+    harness.schedule(*policy, /*token_budget=*/2, /*seq_budget=*/2);
+    ASSERT_EQ(harness.state().running_requests.size(), 2u);
+    EXPECT_NE(std::find(harness.state().running_requests.begin(),
+                        harness.state().running_requests.end(),
+                        old_waiter),
+              harness.state().running_requests.end());
+    EXPECT_NE(std::find(harness.state().running_requests.begin(),
+                        harness.state().running_requests.end(),
+                        active),
+              harness.state().running_requests.end());
+    EXPECT_EQ(harness.decode_queue().size(), static_cast<size_t>(round + 1));
+    update_requests(harness.state().running_requests);
+  }
+
+  ASSERT_TRUE(old_waiter->finished());
+  ASSERT_TRUE(active->finished());
+  EXPECT_EQ(policy->collect_finished(harness.state()).size(), 2u);
+  EXPECT_FALSE(old_waiter->sequences().front()->has_any_blocks());
+  EXPECT_FALSE(active->sequences().front()->has_any_blocks());
+  harness.schedule(*policy, /*token_budget=*/2, /*seq_budget=*/2);
+  EXPECT_EQ(std::find(harness.state().running_requests.begin(),
+                      harness.state().running_requests.end(),
+                      old_waiter),
+            harness.state().running_requests.end());
+}
+
+TEST_P(PdDecodeFcfsTest, TerminalHandoffsReleaseBlocksAtEveryAdmissionStage) {
+  for (bool enable_prefix_cache : {false, true}) {
+    // Terminate before drain, while staged, or at the decode queue's tail.
+    for (int32_t stage : {0, 1, 2}) {
+      SCOPED_TRACE(enable_prefix_cache);
+      SCOPED_TRACE(stage);
+      HostRestoreBlockPool pool(/*num_blocks=*/16, /*dp_size=*/1);
+      auto options = make_restore_options(/*token_budget=*/2, /*dp_size=*/1);
+      auto policy = make_policy(options);
+      RestoreHarness harness(&pool, options);
+      set_requeue_state(harness.state());
+      harness.state().enable_prefix_cache = enable_prefix_cache;
+      auto live = make_pd_decode(pool);
+      auto finished = make_pd_decode(pool);
+      auto cancelled = make_pd_decode(pool, /*num_outputs=*/2);
+      harness.decode_queue().push(live);
+      auto terminate = [&]() {
+        finished->sequences().front()->finish();
+        cancelled->set_cancel();
+      };
+      if (stage == 0) {
+        terminate();
+      }
+      folly::MPMCQueue<std::shared_ptr<Request>> incoming(2);
+      ASSERT_TRUE(incoming.write(finished));
+      ASSERT_TRUE(incoming.write(cancelled));
+      policy->drain_request_queue(harness.state(), incoming);
+      if (stage == 2) {
+        harness.schedule(*policy, /*token_budget=*/0, /*seq_budget=*/0);
+        ASSERT_EQ(harness.decode_queue().size(), 3u);
+      }
+      const size_t sequence_count = cancelled->sequences().size();
+      const size_t free_before = pool.num_free_blocks()[0];
+      terminate();
+      size_t release_calls = 0;
+      harness.state().release_failed_request =
+          [&release_calls](const std::shared_ptr<Request>& /*request*/) {
+            ++release_calls;
+          };
+
+      EXPECT_EQ(policy->collect_finished(harness.state()).size(), 2u);
+      EXPECT_EQ(release_calls, 2u);
+      EXPECT_EQ(pool.num_free_blocks()[0], free_before + 2);
+      EXPECT_FALSE(finished->sequences()[0]->has_any_blocks());
+      for (const auto& sequence : cancelled->sequences()) {
+        EXPECT_FALSE(sequence->has_any_blocks());
+      }
+      EXPECT_EQ(cancelled->sequences().size(), sequence_count);
+      EXPECT_TRUE(policy->collect_finished(harness.state()).empty());
+      EXPECT_EQ(release_calls, 2u);
+      harness.schedule(*policy, /*token_budget=*/0, /*seq_budget=*/0);
+      EXPECT_TRUE(harness.state().running_requests.empty());
+      EXPECT_TRUE(harness.state().prefill_queue.empty());
+      ASSERT_EQ(harness.decode_queue().size(), 1u);
+      EXPECT_EQ(harness.decode_queue().top(), live);
+      EXPECT_TRUE(live->sequences()[0]->has_any_blocks());
+    }
+  }
+}
+
+TEST_P(PdDecodeFcfsTest, PartiallyFinishedHandoffPreservesLiveBlocks) {
+  for (bool enable_prefix_cache : {false, true}) {
+    SCOPED_TRACE(enable_prefix_cache);
+    HostRestoreBlockPool pool(/*num_blocks=*/16, /*dp_size=*/1);
+    auto options = make_restore_options(/*token_budget=*/1, /*dp_size=*/1);
+    auto policy = make_policy(options);
+    RestoreHarness harness(&pool, options);
+    set_requeue_state(harness.state());
+    harness.state().enable_prefix_cache = enable_prefix_cache;
+    auto request = make_pd_decode(pool, /*num_outputs=*/2);
+    ASSERT_TRUE(request->expand_sequences());
+    Sequence* finished = request->sequences()[0].get();
+    Sequence* live = request->sequences()[1].get();
+    live->set_dp_rank(0);
+    ASSERT_TRUE(pool.BlockManagerPool::allocate(live, /*num_tokens=*/16));
+    live->kv_state().set_kv_cache_tokens_num(16);
+    live->append_token(Token(1));
+    const int32_t live_block_id =
+        live->kv_state().blocks(BlockType::KV)[0].id();
+    const size_t free_before = pool.num_free_blocks()[0];
+    finished->finish();
+    folly::MPMCQueue<std::shared_ptr<Request>> incoming(2);
+    ASSERT_TRUE(incoming.write(request));
+
+    policy->drain_request_queue(harness.state(), incoming);
+    EXPECT_TRUE(finished->has_any_blocks());
+    EXPECT_TRUE(policy->collect_finished(harness.state()).empty());
+    harness.schedule(*policy, /*token_budget=*/0, /*seq_budget=*/0);
+    EXPECT_FALSE(finished->has_any_blocks());
+    ASSERT_TRUE(live->has_any_blocks());
+    EXPECT_EQ(live->kv_state().blocks(BlockType::KV)[0].id(), live_block_id);
+    EXPECT_EQ(pool.num_free_blocks()[0], free_before + 1);
+    harness.schedule(*policy, /*token_budget=*/1, /*seq_budget=*/1);
+    EXPECT_EQ(harness.running_sequences(), (std::vector<Sequence*>{live}));
+    live->finish();
+    EXPECT_EQ(policy->collect_finished(harness.state()),
+              (std::vector<std::shared_ptr<Request>>{request}));
+    EXPECT_FALSE(live->has_any_blocks());
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(AllBatchModes,
+                         PdDecodeFcfsTest,
+                         testing::Combine(testing::Bool(), testing::Bool()));
+
+TEST(SchedulerPolicyTest, PdHandoffsExpandOnceAndPreserveNonFcfsAdmission) {
+  for (bool mix_batch : {false, true}) {
+    for (const std::string strategy : {"fcfs", "priority", "deadline"}) {
+      for (bool enable_prefix_cache : {false, true}) {
+        SCOPED_TRACE(mix_batch);
+        SCOPED_TRACE(strategy);
+        SCOPED_TRACE(enable_prefix_cache);
+        HostRestoreBlockPool pool(/*num_blocks=*/16, /*dp_size=*/1);
+        auto options = make_restore_options(/*token_budget=*/2, /*dp_size=*/1);
+        BatchMode mode{.enable_mix_batch = mix_batch,
+                       .enable_chunked_prefill = true,
+                       .priority_strategy = strategy};
+        auto policy = create_scheduler_policy(mode, options);
+        RestoreHarness harness(&pool, options);
+        harness.state().enable_prefix_cache = enable_prefix_cache;
+        auto request = make_pd_decode(pool, /*num_outputs=*/2);
+        folly::MPMCQueue<std::shared_ptr<Request>> incoming(2);
+        ASSERT_TRUE(incoming.write(request));
+
+        policy->drain_request_queue(harness.state(), incoming);
+        EXPECT_TRUE(harness.decode_queue().empty());
+        EXPECT_EQ(harness.state().running_requests.size(),
+                  strategy == "fcfs" ? 0u : 1u);
+        EXPECT_EQ(request->sequences().size(), enable_prefix_cache ? 1u : 2u);
+        EXPECT_EQ(pool.cache_calls(), 0u);
+        harness.schedule(*policy, /*token_budget=*/0, /*seq_budget=*/0);
+        EXPECT_EQ(request->sequences().size(), 2u);
+        EXPECT_EQ(pool.cache_calls(), enable_prefix_cache ? 1u : 0u);
+        EXPECT_FALSE(request->expand_sequences());
+        ASSERT_EQ(harness.decode_queue().size(), 1u);
+        EXPECT_EQ(harness.decode_queue().top(), request);
+        EXPECT_EQ(request->queue_to_batch_latency_ms(), -1.0);
+        harness.schedule(*policy, /*token_budget=*/1, /*seq_budget=*/1);
+        const double first_batch_latency = request->queue_to_batch_latency_ms();
+        EXPECT_GE(first_batch_latency, 0.0);
+        harness.schedule(*policy, /*token_budget=*/2, /*seq_budget=*/2);
+        EXPECT_EQ(request->queue_to_batch_latency_ms(), first_batch_latency);
+      }
+    }
+  }
+}
+
+TEST(SchedulerPolicyTest, TerminalRequestsBypassExpansionAndAdmission) {
+  for (bool mix_batch : {false, true}) {
+    for (const std::string strategy :
+         {"fcfs", "priority", "deadline", "multi_slo_and_prio"}) {
+      for (bool enable_prefix_cache : {false, true}) {
+        SCOPED_TRACE(mix_batch);
+        SCOPED_TRACE(strategy);
+        SCOPED_TRACE(enable_prefix_cache);
+        HostRestoreBlockPool pool(/*num_blocks=*/16, /*dp_size=*/1);
+        const size_t free_initial = pool.num_free_blocks()[0];
+        auto options = make_restore_options(/*token_budget=*/2, /*dp_size=*/1);
+        BatchMode mode{.enable_mix_batch = mix_batch,
+                       .enable_chunked_prefill = true,
+                       .priority_strategy = strategy};
+        auto policy = create_scheduler_policy(mode, options);
+        RestoreHarness harness(&pool, options);
+        harness.state().enable_prefix_cache = enable_prefix_cache;
+        auto finished = make_pd_decode(pool);
+        auto cancelled = make_pd_decode(pool, /*num_outputs=*/2);
+        finished->sequences()[0]->kv_state().set_kv_cache_tokens_num(0);
+        cancelled->sequences()[0]->kv_state().set_kv_cache_tokens_num(0);
+        finished->sequences()[0]->finish();
+        cancelled->set_cancel();
+        folly::MPMCQueue<std::shared_ptr<Request>> incoming(2);
+        ASSERT_TRUE(incoming.write(finished));
+        ASSERT_TRUE(incoming.write(cancelled));
+        size_t release_calls = 0;
+        harness.state().release_failed_request =
+            [&release_calls](const std::shared_ptr<Request>& /*request*/) {
+              ++release_calls;
+            };
+
+        policy->drain_request_queue(harness.state(), incoming);
+
+        EXPECT_TRUE(harness.state().prefill_queue.empty());
+        EXPECT_TRUE(harness.decode_queue().empty());
+        EXPECT_TRUE(harness.state().unified_queue.empty());
+        EXPECT_EQ(cancelled->sequences().size(), 1u);
+        EXPECT_EQ(pool.cache_calls(), 0u);
+        EXPECT_EQ(policy->collect_finished(harness.state()).size(), 2u);
+        EXPECT_EQ(release_calls, 2u);
+        EXPECT_EQ(pool.num_free_blocks()[0], free_initial);
+        EXPECT_TRUE(policy->collect_finished(harness.state()).empty());
+        EXPECT_EQ(release_calls, 2u);
+      }
+    }
+  }
+}
 
 TEST(SchedulerPolicyTest, ChunkedAdmissionPreservesPrefetchDpRank) {
   for (int32_t dp_rank : {0, 1}) {
