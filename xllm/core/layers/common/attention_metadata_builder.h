@@ -40,7 +40,8 @@ class AttentionMetadataBuilder {
  public:
   // Build convolution scheduling and chunk indices for linear attention.
   static void build_linear_prefill(AttentionMetadata& attn_metadata,
-                                   int64_t block_size);
+                                   int64_t block_size,
+                                   bool build_chunk_indices = true);
 
   // Build AttentionMetadata from ModelInputParams with default compute_dtype
   // ("float").

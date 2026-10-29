@@ -114,6 +114,56 @@ torch::Tensor reference_summary(const ChunkKDAPcpPrepared& prepared,
   return torch::stack(summaries);
 }
 
+// FP64 (I + L)^-1 per chunk and head on CPU, rebuilt from the raw inputs with
+// the prepare activations: L[i][j] = beta_i * sum_c k_ic k_jc
+// exp(G_ic - G_jc) for j < i, normalized keys and in-chunk cumulative gates G.
+torch::Tensor reference_lower_inverse(const torch::Tensor& k,
+                                      const torch::Tensor& raw_gate,
+                                      const torch::Tensor& raw_beta,
+                                      float gate_lower_bound,
+                                      const std::vector<int64_t>& lengths,
+                                      int64_t chunk_size) {
+  const torch::Tensor keys = k.squeeze(0).cpu().to(torch::kFloat64);
+  const torch::Tensor normalized =
+      keys *
+      torch::rsqrt(keys.square().sum(/*dim=*/-1, /*keepdim=*/true) + 1e-6);
+  const torch::Tensor gate =
+      gate_lower_bound * torch::sigmoid(raw_gate.cpu().to(torch::kFloat64));
+  const torch::Tensor beta = torch::sigmoid(raw_beta.cpu().to(torch::kFloat64));
+  std::vector<torch::Tensor> inverses;
+  int64_t begin = 0;
+  for (const int64_t length : lengths) {
+    for (int64_t offset = 0; offset < length; offset += chunk_size) {
+      const int64_t valid = std::min(chunk_size, length - offset);
+      // [heads, valid, dim]
+      const torch::Tensor chunk_keys =
+          normalized.narrow(/*dim=*/0, begin + offset, valid).transpose(0, 1);
+      const torch::Tensor cumulative =
+          gate.narrow(/*dim=*/0, begin + offset, valid)
+              .cumsum(/*dim=*/0)
+              .transpose(0, 1);
+      const torch::Tensor chunk_beta =
+          beta.narrow(/*dim=*/0, begin + offset, valid).transpose(0, 1);
+      const torch::Tensor decayed_left = chunk_keys * cumulative.exp();
+      const torch::Tensor decayed_right = chunk_keys * (-cumulative).exp();
+      const torch::Tensor lower =
+          torch::tril(
+              torch::matmul(decayed_left, decayed_right.transpose(1, 2)),
+              /*diagonal=*/-1) *
+          chunk_beta.unsqueeze(/*dim=*/-1);
+      // Padding rows have L = 0, so their inverse rows stay identity rows.
+      torch::Tensor inverse =
+          torch::eye(chunk_size, lower.options()).repeat({lower.size(0), 1, 1});
+      inverse.narrow(/*dim=*/1, /*start=*/0, valid)
+          .narrow(/*dim=*/2, /*start=*/0, valid)
+          .copy_(torch::linalg_inv(torch::eye(valid, lower.options()) + lower));
+      inverses.emplace_back(inverse);
+    }
+    begin += length;
+  }
+  return torch::stack(inverses);
+}
+
 // Applies S <- S * M_p + E_p for every CP rank before cp_rank on CPU.
 torch::Tensor reference_merge(const torch::Tensor& gathered,
                               const torch::Tensor& prefix,
@@ -288,6 +338,127 @@ TEST(ChunkKDAPcpTest, PackedSequenceSummaryMatchesFp32Reference) {
   }
 }
 
+TEST(ChunkKDAPcpTest, LowerInverseStaysAccurateForCollinearKeys) {
+  torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  torch::DeviceGuard guard(device);
+  torch::manual_seed(20261028);
+  constexpr int64_t kHeads = 2;
+  constexpr int64_t kDim = 128;
+  constexpr float kGateLowerBound = -5.0f;
+  const torch::TensorOptions fp32 =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  const torch::TensorOptions bf16 = fp32.dtype(torch::kBFloat16);
+  const torch::TensorOptions int32 = fp32.dtype(torch::kInt32);
+  const torch::Tensor a_log = torch::zeros({kHeads}, fp32);
+  const torch::Tensor dt_bias = torch::zeros({kHeads * kDim}, fp32);
+  // Nearly equal keys, beta close to one and almost no gate decay make
+  // (I + L)^-1 well conditioned while every power of L has binomial entries.
+  // A single order-64 Neumann product cancels those terms and returned values
+  // near 1e8 instead of O(1).
+  const std::vector<int64_t> lengths{104, 64};
+  const int64_t tokens = 168;
+  for (const float spread : {0.0f, 0.02f}) {
+    const torch::Tensor base = torch::randn({1, 1, kHeads, kDim}, fp32);
+    const torch::Tensor k =
+        (base + torch::randn({1, tokens, kHeads, kDim}, fp32) * spread)
+            .to(bf16);
+    const torch::Tensor q =
+        (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+    const torch::Tensor v =
+        (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+    const torch::Tensor raw_gate =
+        torch::full({tokens, kHeads, kDim}, -30.0f, bf16);
+    const torch::Tensor raw_beta = torch::full({tokens, kHeads}, 10.0f, bf16);
+    for (const int64_t chunk_size : {int64_t{16}, int64_t{64}}) {
+      const ChunkKDAPcpPrepared prepared =
+          chunk_kda_pcp_prepare(q,
+                                k,
+                                v,
+                                raw_gate,
+                                a_log,
+                                dt_bias,
+                                kGateLowerBound,
+                                raw_beta,
+                                make_cu_seqlens(lengths, int32),
+                                make_chunk_indices(lengths, chunk_size, int32),
+                                chunk_size);
+      torch_mlu::synchronize();
+      const torch::Tensor expected = reference_lower_inverse(
+          k, raw_gate, raw_beta, kGateLowerBound, lengths, chunk_size);
+      const torch::Tensor actual =
+          torch::tril(prepared.lower_inverse.cpu()).to(torch::kFloat64);
+      EXPECT_TRUE(torch::allclose(actual,
+                                  expected,
+                                  /*rtol=*/1e-3,
+                                  /*atol=*/2e-3))
+          << "chunk_size=" << chunk_size << " spread=" << spread
+          << " max_error=" << (actual - expected).abs().max().item<double>();
+      EXPECT_TRUE(torch::isfinite(prepared.summary).all().item<bool>())
+          << "chunk_size=" << chunk_size << " spread=" << spread;
+    }
+  }
+}
+
+TEST(ChunkKDAPcpTest, UnlocatableChunkRowsAreSkipped) {
+  torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  torch::DeviceGuard guard(device);
+  torch::manual_seed(20261028);
+  constexpr int64_t kHeads = 2;
+  constexpr int64_t kDim = 128;
+  const torch::TensorOptions fp32 =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  const torch::TensorOptions bf16 = fp32.dtype(torch::kBFloat16);
+  const torch::TensorOptions int32 = fp32.dtype(torch::kInt32);
+  const std::vector<int64_t> lengths{40, 17};
+  const torch::Tensor cu = make_cu_seqlens(lengths, int32);
+  const int64_t tokens = cu[-1].item<int64_t>();
+  const torch::Tensor q =
+      (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+  const torch::Tensor k =
+      (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+  const torch::Tensor v =
+      (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+  const torch::Tensor gate =
+      (torch::randn({tokens, kHeads, kDim}, fp32) - 2.0f).to(bf16);
+  const torch::Tensor beta = torch::randn({tokens, kHeads}, bf16);
+  const torch::Tensor a_log = torch::zeros({kHeads}, fp32);
+  const torch::Tensor dt_bias = torch::zeros({kHeads * kDim}, fp32);
+  const torch::Tensor initial =
+      torch::randn({2, kHeads, kDim, kDim}, fp32) * 0.01f;
+  for (const int64_t chunk_size : {int64_t{16}, int64_t{64}}) {
+    const torch::Tensor indices =
+        make_chunk_indices(lengths, chunk_size, int32);
+    // A row naming no sequence resolves to zero tokens in every kernel.
+    const torch::Tensor padded_indices =
+        torch::cat({indices, torch::tensor({{2, 0}}, int32)}, /*dim=*/0);
+    const auto prepare = [&](const torch::Tensor& chunk_indices) {
+      return chunk_kda_pcp_prepare(q,
+                                   k,
+                                   v,
+                                   gate,
+                                   a_log,
+                                   dt_bias,
+                                   /*gate_lower_bound=*/-5.0f,
+                                   beta,
+                                   cu,
+                                   chunk_indices,
+                                   chunk_size);
+    };
+    const ChunkKDAPcpPrepared expected = prepare(indices);
+    const ChunkKDAPcpPrepared actual = prepare(padded_indices);
+    auto [expected_output, expected_state] =
+        chunk_kda_pcp_replay(expected, initial);
+    auto [actual_output, actual_state] = chunk_kda_pcp_replay(actual, initial);
+    torch_mlu::synchronize();
+    EXPECT_TRUE(torch::equal(actual.summary, expected.summary))
+        << "chunk_size=" << chunk_size;
+    EXPECT_TRUE(torch::equal(actual_output, expected_output))
+        << "chunk_size=" << chunk_size;
+    EXPECT_TRUE(torch::equal(actual_state, expected_state))
+        << "chunk_size=" << chunk_size;
+  }
+}
+
 TEST(ChunkKDAPcpTest, MergeComposesEveryPrecedingRankSummary) {
   torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
@@ -412,6 +583,86 @@ TEST(ChunkKDAPcpTest, LongShardsMatchUnshardedKDA) {
         << "tokens=" << tokens;
     EXPECT_TRUE(torch::allclose(second_state, expected_state, 1e-3, 2e-5))
         << "tokens=" << tokens;
+  }
+}
+
+TEST(ChunkKDAPcpTest, ManyChunksAndSequencesMatchUnshardedKDA) {
+  torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  torch::DeviceGuard guard(device);
+  torch::manual_seed(20261028);
+  constexpr int64_t kHeads = 8;
+  constexpr int64_t kDim = 128;
+  constexpr float kGateLowerBound = -5.0f;
+  const torch::TensorOptions fp32 =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  const torch::TensorOptions bf16 = fp32.dtype(torch::kBFloat16);
+  const torch::TensorOptions int32 = fp32.dtype(torch::kInt32);
+  // More than 512 chunk rows and 128 sequences for either chunk size, so
+  // metadata spans several NRAM windows. Prepare and summary once read such
+  // GDRAM tables as NRAM, skipping chunks or faulting on the address.
+  std::vector<int64_t> lengths;
+  lengths.reserve(161);
+  for (int64_t sequence = 0; sequence < 160; ++sequence) {
+    lengths.emplace_back(1 + (sequence * 37) % 200);
+  }
+  lengths.emplace_back(36000);
+  const torch::Tensor cu = make_cu_seqlens(lengths, int32);
+  const int64_t tokens = cu[-1].item<int64_t>();
+  const auto sequences = static_cast<int64_t>(lengths.size());
+  const torch::Tensor q =
+      (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+  const torch::Tensor k =
+      (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+  const torch::Tensor v =
+      (torch::randn({1, tokens, kHeads, kDim}, fp32) * 0.1f).to(bf16);
+  const torch::Tensor gate =
+      (torch::randn({tokens, kHeads, kDim}, fp32) - 2.0f).to(bf16);
+  const torch::Tensor beta = torch::randn({tokens, kHeads}, bf16);
+  const torch::Tensor a_log = torch::zeros({kHeads}, fp32);
+  const torch::Tensor dt_bias = torch::zeros({kHeads * kDim}, fp32);
+  const torch::Tensor initial =
+      torch::randn({sequences, kHeads, kDim, kDim}, fp32) * 0.01f;
+  ChunkKDA ordinary(kHeads);
+  for (const int64_t chunk_size : {int64_t{16}, int64_t{64}}) {
+    const torch::Tensor indices =
+        make_chunk_indices(lengths, chunk_size, int32);
+    ASSERT_GT(indices.size(0), 512) << "chunk_size=" << chunk_size;
+    auto [expected_output, expected_state] =
+        ordinary->forward_raw_gate(q,
+                                   k,
+                                   v,
+                                   gate,
+                                   a_log,
+                                   dt_bias,
+                                   kGateLowerBound,
+                                   beta,
+                                   initial,
+                                   cu,
+                                   indices,
+                                   /*output_final_state=*/true,
+                                   /*use_qk_l2norm=*/true);
+    const ChunkKDAPcpPrepared prepared = chunk_kda_pcp_prepare(q,
+                                                               k,
+                                                               v,
+                                                               gate,
+                                                               a_log,
+                                                               dt_bias,
+                                                               kGateLowerBound,
+                                                               beta,
+                                                               cu,
+                                                               indices,
+                                                               chunk_size);
+    auto [output, state] = chunk_kda_pcp_replay(prepared, initial);
+    torch_mlu::synchronize();
+    EXPECT_TRUE(torch::allclose(prepared.summary.cpu(),
+                                reference_summary(prepared, lengths),
+                                /*rtol=*/1e-3,
+                                /*atol=*/2e-5))
+        << "chunk_size=" << chunk_size;
+    EXPECT_TRUE(torch::allclose(output, expected_output, 5e-3, 2e-5))
+        << "chunk_size=" << chunk_size;
+    EXPECT_TRUE(torch::allclose(state, expected_state, 1e-3, 2e-5))
+        << "chunk_size=" << chunk_size;
   }
 }
 

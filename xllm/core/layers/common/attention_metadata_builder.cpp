@@ -634,7 +634,8 @@ AttentionMetadata AttentionMetadataBuilder::build(
 
 void AttentionMetadataBuilder::build_linear_prefill(
     AttentionMetadata& attn_metadata,
-    int64_t block_size) {
+    int64_t block_size,
+    bool build_chunk_indices) {
   if (attn_metadata.is_spec_verify ||
       (!attn_metadata.is_prefill && !attn_metadata.is_chunked_prefill)) {
     return;
@@ -681,8 +682,10 @@ void AttentionMetadataBuilder::build_linear_prefill(
       .copy_(token_block_offsets);
 
   attn_metadata.chunk_indices =
-      torch::stack({batch.to(torch::kInt32), token_block_offsets}, /*dim=*/1)
-          .to(torch::kInt32);
+      build_chunk_indices
+          ? torch::stack({batch.to(torch::kInt32), token_block_offsets},
+                         /*dim=*/1)
+          : torch::Tensor();
   attn_metadata.batch = std::move(batch_ptr);
   attn_metadata.token_block_offset = std::move(token_block_offset_ptr);
   attn_metadata.tot = total_blocks;

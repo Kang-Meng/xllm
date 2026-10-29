@@ -1,0 +1,736 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// Software-pipelined prefill KPool score. A window is W consecutive queries
+// (globally aligned); a window whose queries share one request row shares
+// one key gather per pool tile. Only the window's own live pool prefix is
+// tiled: causal prefill and short requests in a long batch no longer pay for
+// the batch's largest context. Pools past a window's live tiles are filled
+// with -inf by strided stores.
+//
+// Scheduling: each window is split into `parts` contiguous tile ranges
+// (parts > 1 only when there are few windows); units (window, part) are
+// dealt round-robin to the IPUs, which balances causal triangles and ragged
+// batches without a prefix pass.
+//
+// Arithmetic: the key tile is the conv filter (WRAM) and the window's query
+// heads are the input pixels, so one bf16 conv yields dot[head, pool]. relu,
+// a multiply by the scaled head weights broadcast along pools, and a sumpool
+// over each query's 32 heads give scores[query, pool] in output order without
+// transposes. Every product and the head summation order equal the grouped
+// (transpose + sumpool) sequence, so scores are bitwise unchanged.
+//
+// Pipeline per IPU: page rows of item i + 3, key gather of item i + 2 and
+// the WRAM load of item i + 1 overlap the arithmetic of item i.
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/kpool/launchers.h"
+
+namespace {
+using AliasInt32 = int32_t __attribute__((__may_alias__));
+
+constexpr int32_t kTokenBlock = 512;  // staged rows/positions per IPU
+constexpr int32_t kFillWidth = 1024;  // -inf source for tail fills
+constexpr int32_t kMinUnits = 64;     // split windows below this count
+
+__mlu_func__ int32_t row_id(const AliasInt32* words, int32_t index) {
+  int32_t low = words[index * 2];
+  int32_t high = words[index * 2 + 1];
+  return high == 0 && low >= 0 ? low : -1;
+}
+
+// Per-query window data, written once per unit into a small ring.
+template <int32_t W>
+struct WindowRows {
+  int32_t live[W];  // per-query live pool prefix
+  int32_t rows[W];  // per-query request row (mixed windows)
+};
+
+// One pipeline item (a pool tile of a window). Kept small: items are
+// copied per tile and kernel stack accesses are slow.
+struct Item {
+  int32_t window;
+  int32_t slot;          // WindowRows ring slot
+  int32_t token;         // first query of the window
+  int32_t count;         // queries in the window
+  int32_t request;       // shared request row, -1 if invalid
+  int32_t first;         // first pool of the tile
+  int32_t store_count;   // pools stored for this tile
+  int32_t gather_pages;  // live pages gathered for this tile
+  int32_t batch;         // page metadata batch slot
+  int32_t page0;         // first page of the tile within its batch
+  bool uniform;          // every query of the window names the same row
+};
+
+constexpr int32_t kBatch = 8;       // tiles per page metadata batch
+constexpr int32_t kBatchSlots = 5;  // batches alive in the 3-item pipeline
+
+template <int32_t W, int32_t TileMax>
+struct Buffers {
+  // Gathered key tiles (NRAM staging for the WRAM filter).
+  bfloat16_t keys[2][TileMax * 128];
+  // dot[head, pool]; also scratch while a window is prepared.
+  float dot[W * 32 * TileMax];
+  // scale * head weights broadcast along pools: [head, pool].
+  float weight_rows[W * 32 * TileMax];
+  bfloat16_t query[2][W * 32 * 128];
+  float weights[2][W * 32];
+  float scaled_weights[W * 32];
+  float ordered[W * TileMax];
+  // Page metadata of up to kBatch consecutive tiles of one window per slot:
+  // pages, present (all ones / zero), sanitized gather offsets, and in
+  // presence[slot][0] the largest of -present over live pages (0: a live
+  // page is missing, masks needed).
+  int32_t pages[kBatchSlots][kBatch * TileMax / 4];
+  int32_t present[kBatchSlots][kBatch * TileMax / 4];
+  uint32_t offsets[kBatchSlots][kBatch * TileMax / 4];
+  float presence[kBatchSlots][64];
+  float page_flags[kBatch * TileMax / 4];
+  int32_t upper[kBatch * TileMax / 4];
+  uint32_t lanes[kBatch * TileMax / 4];
+  // Mixed-row windows: one query's tile at a time.
+  int32_t mixed_pages[TileMax / 4];
+  int32_t mixed_present[TileMax / 4];
+  uint32_t mixed_offsets[TileMax / 4];
+  uint32_t repeated[TileMax];
+  uint32_t valid[TileMax];
+  uint32_t row_valid[TileMax];
+  float neg[kFillWidth];
+  int64_t rows[kTokenBlock];
+  int32_t positions[kTokenBlock];
+};
+
+template <int32_t W, int32_t TileMax>
+class PrefillScore final {
+ public:
+  using B = Buffers<W, TileMax>;
+  using I = Item;
+  static constexpr int32_t kWindowRing = 8;
+  static constexpr int32_t kRing = 8;
+  static constexpr int32_t kBatchPages = kBatch * TileMax / 4;
+  // load_matrix spreads a [TileMax, 128] bf16 tile over the 16 WRAM banks,
+  // TileMax * 256 / 16 bytes per bank; the second slot follows within each
+  // bank (a linear offset of a whole tile would overrun the WRAM window).
+  static constexpr int32_t kFilterSlot = TileMax * 128 / 16;
+
+  __mlu_func__ PrefillScore(B* b,
+                            bfloat16_t* key_filter,
+                            const bfloat16_t* query,
+                            const float* weights,
+                            const bfloat16_t* cache,
+                            const int32_t* table,
+                            const int32_t* positions,
+                            const int64_t* rows,
+                            float* output,
+                            int32_t tokens,
+                            int32_t capacity,
+                            int32_t table_width,
+                            int32_t cache_blocks,
+                            float scale,
+                            int32_t batch,
+                            int32_t parts)
+      : b_(b),
+        key_filter_(key_filter),
+        query_(query),
+        weights_(weights),
+        cache_(cache),
+        table_(table),
+        positions_(positions),
+        rows_(rows),
+        output_(output),
+        tokens_(tokens),
+        capacity_(capacity),
+        table_width_(table_width),
+        cache_blocks_(cache_blocks),
+        scale_(scale),
+        batch_(batch),
+        parts_(parts),
+        block_base_(-1),
+        unit_(taskId - taskDim),
+        tile_(0),
+        tile_end_(0),
+        batch_end_(0),
+        batch_slot_(kBatchSlots - 1),
+        batch_first_(0),
+        issued_(0),
+        finished_(0),
+        synced_(0),
+        finish_slot_(0),
+        generated_(0) {
+    proto_.slot = kWindowRing - 1;
+    int64_t limit = static_cast<int64_t>(table_width) * 4;
+    limit_ = static_cast<int32_t>(limit < capacity ? limit : capacity);
+    units_ = static_cast<int64_t>((tokens + W - 1) / W) * parts;
+  }
+
+  // Rows/positions for [token, token + W) must be NRAM resident. Windows are
+  // visited in increasing token order.
+  __mlu_func__ void ensure_tokens(int32_t token) {
+    if (block_base_ >= 0 && token >= block_base_ &&
+        token + W <= block_base_ + kTokenBlock) {
+      return;
+    }
+    block_base_ = token;
+    int32_t count =
+        tokens_ - token < kTokenBlock ? tokens_ - token : kTokenBlock;
+    __memcpy(b_->rows, rows_ + token, count * sizeof(int64_t), GDRAM2NRAM);
+    __memcpy(
+        b_->positions, positions_ + token, count * sizeof(int32_t), GDRAM2NRAM);
+  }
+
+  // Describes window `window` into proto_ and WindowRows slot `slot`;
+  // returns the window's live tile count.
+  __mlu_func__ int32_t describe_window(int32_t window, int32_t slot) {
+    I& it = proto_;
+    it.slot = slot;
+    WindowRows<W>& w = windows_[slot];
+    it.window = window;
+    it.token = window * W;
+    it.count = tokens_ - it.token < W ? tokens_ - it.token : W;
+    ensure_tokens(it.token);
+    const AliasInt32* words = reinterpret_cast<const AliasInt32*>(b_->rows);
+    int32_t local = it.token - block_base_;
+    int32_t request = row_id(words, local);
+    it.uniform = true;
+    int32_t live_max = 0;
+    for (int32_t q = 0; q < it.count; ++q) {
+      int32_t row = row_id(words, local + q);
+      w.rows[q] = row < batch_ ? row : -1;
+      it.uniform = it.uniform && row == request;
+      int32_t position = b_->positions[local + q];
+      int32_t live =
+          position >= 0 ? (static_cast<int64_t>(position) + 1) / 4 : 0;
+      live = live < limit_ ? live : limit_;
+      w.live[q] = live;
+      live_max = live > live_max ? live : live_max;
+    }
+    it.request = request < batch_ ? request : -1;
+    window_live_ = live_max;
+    return (live_max + TileMax - 1) / TileMax;
+  }
+
+  // -inf for pools [from, capacity) of the window's rows.
+  __mlu_func__ void fill_tail(const I& it, int32_t from) {
+    for (int32_t pool = from; pool < capacity_; pool += kFillWidth) {
+      int32_t width =
+          capacity_ - pool < kFillWidth ? capacity_ - pool : kFillWidth;
+      __memcpy_async(
+          output_ + static_cast<int64_t>(it.token) * capacity_ + pool,
+          b_->neg,
+          width * 4,
+          NRAM2GDRAM,
+          capacity_ * 4,
+          0,
+          it.count - 1);
+    }
+  }
+
+  // Advances to the next unit with at least one live tile. Units with no
+  // live tile, and the last part of every window, fill their tail pools.
+  __mlu_func__ bool next_unit() {
+    // Units without a live tile reuse the slot: queued items may still
+    // reference every other slot.
+    int32_t slot = proto_.slot + 1 < kWindowRing ? proto_.slot + 1 : 0;
+    for (;;) {
+      unit_ += taskDim;
+      if (unit_ >= units_) {
+        return false;
+      }
+      int32_t window = static_cast<int32_t>(unit_ / parts_);
+      int32_t part = static_cast<int32_t>(unit_ % parts_);
+      int32_t tiles = describe_window(window, slot);
+      tile_ = static_cast<int32_t>(static_cast<int64_t>(tiles) * part / parts_);
+      tile_end_ = static_cast<int32_t>(static_cast<int64_t>(tiles) *
+                                       (part + 1) / parts_);
+      if (part == parts_ - 1) {
+        int32_t from = tiles * TileMax;
+        fill_tail(proto_, from < capacity_ ? from : capacity_);
+      }
+      if (tile_ < tile_end_) {
+        batch_end_ = tile_;  // a new unit starts a new batch
+        return true;
+      }
+    }
+  }
+
+  // Starts page metadata for tiles [tile_, tile_ + n) of the current
+  // window: the page rows load asynchronously; finish_batch() runs after the
+  // next pipeline barrier.
+  __mlu_func__ void issue_batch(int32_t n) {
+    batch_slot_ = batch_slot_ + 1 < kBatchSlots ? batch_slot_ + 1 : 0;
+    batch_first_ = tile_;
+    batch_end_ = tile_ + n;
+    int32_t* pages = b_->pages[batch_slot_];
+    int32_t first_page = tile_ * (TileMax / 4);
+    int32_t count = n * (TileMax / 4);
+    int32_t loaded =
+        table_width_ - first_page < count ? table_width_ - first_page : count;
+    loaded = proto_.request < 0 || loaded < 0 ? 0 : loaded;
+    if (loaded < count) {
+      __bang_write_value(pages + loaded, count - loaded, -1);
+    }
+    if (loaded > 0) {
+      __memcpy_async(pages,
+                     table_ +
+                         static_cast<int64_t>(proto_.request) * table_width_ +
+                         first_page,
+                     loaded * 4,
+                     GDRAM2NRAM);
+    }
+    // Live pages of the batch; pages past the window's live prefix are
+    // neither gathered nor unmasked.
+    int32_t live = (window_live_ - tile_ * TileMax + 3) / 4;
+    batch_pages_[batch_slot_] = count;
+    batch_live_[batch_slot_] = live < count ? live : count;
+    ++issued_;
+  }
+
+  // Offsets, presence masks and the missing-page flag of the oldest
+  // unfinished batch (its page rows have arrived).
+  __mlu_func__ void finish_batch() {
+    int32_t slot = finish_slot_;
+    finish_slot_ = slot + 1 < kBatchSlots ? slot + 1 : 0;
+    ++finished_;
+    int32_t count = batch_pages_[slot];
+    int32_t live = batch_live_[slot];
+    prepare_offsets(
+        count, b_->pages[slot], b_->present[slot], b_->offsets[slot]);
+    if (live > 0) {
+      __bang_int322float(b_->page_flags, b_->present[slot], count, 0);
+      __bang_argmax(b_->presence[slot], b_->page_flags, live);
+    } else {
+      __bang_write_value(b_->presence[slot], 64, -1.0f);
+    }
+  }
+
+  __mlu_func__ bool missing(const I& it) const {
+    return b_->presence[it.batch][0] == 0.0f;
+  }
+
+  // Generates items in order into a small ring; at(k) for k < generated_.
+  __mlu_func__ bool generate() {
+    if (tile_ >= tile_end_ && !next_unit()) {
+      return false;
+    }
+    if (tile_ >= batch_end_ || tile_ < batch_first_) {
+      int32_t n = tile_end_ - tile_ < kBatch ? tile_end_ - tile_ : kBatch;
+      issue_batch(n);
+    }
+    I& it = ring_[generated_ % kRing];
+    it = proto_;
+    it.batch = batch_slot_;
+    it.page0 = (tile_ - batch_first_) * (TileMax / 4);
+    it.first = tile_ * TileMax;
+    it.store_count =
+        capacity_ - it.first < TileMax ? capacity_ - it.first : TileMax;
+    int32_t pages = (window_live_ - it.first + 3) / 4;
+    pages = pages < 0 ? 0 : (pages > TileMax / 4 ? TileMax / 4 : pages);
+    pages = it.request < 0 ? 0 : pages;
+    // Mixed-row windows gather per query in compute_mixed; batch offsets
+    // are sanitized only on the window's live pages of its first row.
+    it.gather_pages = it.uniform ? pages : 0;
+    ++tile_;
+    ++generated_;
+    return true;
+  }
+
+  __mlu_func__ bool has(int32_t k) {
+    while (generated_ <= k) {
+      if (!generate()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  __mlu_func__ const I& at(int32_t k) const { return ring_[k % kRing]; }
+
+  // Page table segment of `request` for the tile starting at `first`.
+  __mlu_func__ void load_pages(int32_t* pages,
+                               int32_t request,
+                               int32_t first,
+                               bool async) {
+    int32_t page_count = table_width_ - first / 4 < TileMax / 4
+                             ? table_width_ - first / 4
+                             : TileMax / 4;
+    if (page_count < TileMax / 4 || request < 0) {
+      __bang_write_value(pages, TileMax / 4, -1);
+      __sync_compute();
+    }
+    if (page_count > 0 && request >= 0) {
+      const int32_t* source =
+          table_ + static_cast<int64_t>(request) * table_width_ + first / 4;
+      if (async) {
+        __memcpy_async(pages, source, page_count * 4, GDRAM2NRAM);
+      } else {
+        __memcpy(pages, source, page_count * 4, GDRAM2NRAM);
+      }
+    }
+  }
+
+  // present = page is a valid cache block (all ones / zero); offsets = byte
+  // offsets, missing pages read distinct dummy rows (masked to -inf later).
+  __mlu_func__ void prepare_offsets(int32_t n,
+                                    const int32_t* pages,
+                                    int32_t* present,
+                                    uint32_t* offsets) {
+    __bang_ge_scalar(present, pages, 0, n);
+    __bang_lt_scalar(b_->upper, pages, cache_blocks_, n);
+    __bang_band(present, present, b_->upper, n);
+    __bang_mul_scalar(present, present, -1, n);
+    __bang_band(offsets,
+                reinterpret_cast<uint32_t*>(const_cast<int32_t*>(pages)),
+                reinterpret_cast<uint32_t*>(present),
+                n);
+    __bang_mul_scalar(offsets, offsets, 1024u, n);
+    __bang_bnot(reinterpret_cast<uint32_t*>(b_->upper),
+                reinterpret_cast<uint32_t*>(present),
+                n);
+    __bang_band(reinterpret_cast<uint32_t*>(b_->upper),
+                reinterpret_cast<uint32_t*>(b_->upper),
+                b_->lanes,
+                n);
+    __bang_bor(offsets, offsets, reinterpret_cast<uint32_t*>(b_->upper), n);
+  }
+
+  // valid[pool] = present[pool / 4] for one tile, replicated with Compute
+  // ops.
+  __mlu_func__ void expand_valid(const int32_t* present) {
+    int32_t n = TileMax / 4;
+    for (int32_t k = 0; k < 4; ++k) {
+      __bang_add_scalar(
+          reinterpret_cast<int32_t*>(b_->repeated) + k * n, present, 0, n);
+    }
+    __bang_transpose(b_->valid, b_->repeated, 4, n);
+  }
+
+  // Keys past `pages` stay stale; their pools are masked by the live limit.
+  __mlu_func__ void gather(bfloat16_t* keys,
+                           const uint32_t* offsets,
+                           int32_t pages) {
+    if (pages > 0) {
+      __gather_async(keys, cache_, offsets, 1024, GDRAM2NRAM, 1024, pages);
+    }
+  }
+
+  __mlu_func__ void load_keys(bfloat16_t* filter, const bfloat16_t* keys) {
+    __bang_load_matrix_async(filter, keys, NRAM2WRAM, TileMax, 128, 256, false);
+  }
+
+  __mlu_func__ void load_window(int32_t parity, const I& it) {
+    __memcpy_async(b_->query[parity],
+                   query_ + static_cast<int64_t>(it.token) * 4096,
+                   it.count * 8192,
+                   GDRAM2NRAM);
+    __memcpy_async(b_->weights[parity],
+                   weights_ + static_cast<int64_t>(it.token) * 32,
+                   it.count * 128,
+                   GDRAM2NRAM);
+  }
+
+  // weight_rows for the staged window: [pool, head] built in dot, then
+  // transposed.
+  __mlu_func__ void prepare_window(int32_t parity, int32_t count) {
+    int32_t heads = count * 32;
+    __bang_mul_scalar(b_->scaled_weights, b_->weights[parity], scale_, heads);
+    __bang_write_value(b_->dot, TileMax * heads, 0.0f);
+    __bang_cycle_add(
+        b_->dot, b_->dot, b_->scaled_weights, TileMax * heads, heads);
+    __bang_transpose(b_->weight_rows, b_->dot, TileMax, heads);
+  }
+
+  // dot[head, pool] = q_head . key_pool for `heads` query rows from head0.
+  __mlu_func__ void conv(const bfloat16_t* filter,
+                         int32_t parity,
+                         int32_t head0,
+                         int32_t heads) {
+    __bang_conv(b_->dot + head0 * TileMax,
+                b_->query[parity] + head0 * 128,
+                filter,
+                128,
+                1,
+                heads,
+                1,
+                1,
+                1,
+                1,
+                TileMax);
+  }
+
+  // relu, head weights, head sum, masks, store for queries
+  // [q_begin, q_begin + count) of `it`.
+  __mlu_func__ void reduce_and_store(bool missing,
+                                     const I& it,
+                                     int32_t q_begin,
+                                     int32_t count,
+                                     float* ordered) {
+    float* rows = b_->dot + q_begin * 32 * TileMax;
+    // relu(scale * x) * w == relu(x) * (scale * w) for scale > 0.
+    __bang_relu(rows, rows, count * 32 * TileMax);
+    __bang_mul(rows,
+               rows,
+               b_->weight_rows + q_begin * 32 * TileMax,
+               count * 32 * TileMax);
+    // [query, head, pool] summed over heads in head order.
+    __bang_sumpool(ordered, rows, TileMax, count, 32, 1, 32, 1, 1);
+    if (missing) {
+      // Missing pages are -inf for every query (b_->valid of this tile).
+      __bang_bnot(b_->row_valid, b_->valid, TileMax);
+      __bang_band_scalar(b_->row_valid, b_->row_valid, 0xff800000u, TileMax);
+      uint32_t* bits = reinterpret_cast<uint32_t*>(ordered);
+      __bang_cycle_band(bits, bits, b_->valid, count * TileMax, TileMax);
+      __bang_cycle_bor(bits, bits, b_->row_valid, count * TileMax, TileMax);
+    }
+    for (int32_t q = 0; q < count; ++q) {
+      int32_t active = windows_[it.slot].live[q_begin + q] - it.first;
+      active = active < 0 ? 0 : (active > TileMax ? TileMax : active);
+      if (active < TileMax) {
+        __bang_write_value(
+            ordered + q * TileMax + active, TileMax - active, -INFINITY);
+      }
+    }
+    __sync_compute();
+    __memcpy_async(output_ +
+                       static_cast<int64_t>(it.token + q_begin) * capacity_ +
+                       it.first,
+                   ordered,
+                   it.store_count * 4,
+                   NRAM2GDRAM,
+                   capacity_ * 4,
+                   TileMax * 4,
+                   count - 1);
+  }
+
+  // Mixed-row window: every query gathers its own row's keys synchronously
+  // into the dot scratch, which its conv then overwrites.
+  __mlu_func__ void compute_mixed(bfloat16_t* filter,
+                                  int32_t parity,
+                                  const I& it) {
+    __sync();
+    bfloat16_t* staging = reinterpret_cast<bfloat16_t*>(b_->dot);
+    for (int32_t q = 0; q < it.count; ++q) {
+      load_pages(b_->mixed_pages, windows_[it.slot].rows[q], it.first, false);
+      prepare_offsets(
+          TileMax / 4, b_->mixed_pages, b_->mixed_present, b_->mixed_offsets);
+      __sync_compute();
+      gather(staging, b_->mixed_offsets, TileMax / 4);
+      expand_valid(b_->mixed_present);
+      __sync();
+      load_keys(filter, staging);
+      __sync();
+      conv(filter, parity, q * 32, 32);
+      reduce_and_store(true, it, q, 1, b_->ordered + q * TileMax);
+      __sync();
+    }
+  }
+
+  __mlu_func__ void run() {
+    // lanes[k] = k * 1024 (row k of the cache) when it exists, else 0.
+    uint32_t step = cache_blocks_ >= TileMax / 4 ? 1024u : 0u;
+    for (int32_t k = 0; k < 8; ++k) {
+      b_->lanes[k] = static_cast<uint32_t>(k) * step;
+    }
+    for (int32_t n = 8; n < TileMax / 4; n *= 2) {
+      __bang_add_scalar(b_->lanes + n, b_->lanes, n * step, n);
+    }
+    for (int32_t n = TileMax / 4; n < kBatchPages; n += TileMax / 4) {
+      __bang_add_scalar(b_->lanes + n, b_->lanes, 0, TileMax / 4);
+    }
+    __bang_write_value(b_->neg, kFillWidth, -INFINITY);
+    __sync_compute();
+    if (!has(0)) {
+      __sync_io();
+      return;
+    }
+    // Prologue: metadata of items 0..2 finished, keys of items 0 and 1
+    // gathered, item 0 in WRAM.
+    load_window(0, at(0));
+    has(2);
+    __sync();
+    while (finished_ < issued_) {
+      finish_batch();
+    }
+    synced_ = issued_;
+    __sync_compute();
+    for (int32_t k = 0; k < 2 && has(k); ++k) {
+      const I& it = at(k);
+      gather(b_->keys[k], b_->offsets[it.batch] + it.page0, it.gather_pages);
+    }
+    __sync();
+    load_keys(key_filter_, b_->keys[0]);
+    __sync();
+    int32_t prepared_window = -1;
+    int32_t parity = 0;
+    for (int32_t item = 0; has(item); ++item) {
+      const I& cur = at(item);
+      bool has1 = has(item + 1);
+      bool has2 = has(item + 2);
+      bool has3 = has(item + 3);
+      bool new_window1 = has1 && at(item + 1).window != cur.window;
+      // 1. Compute-side preparation: this window, the valid mask of a tile
+      // with missing pages (batch metadata is built by has()).
+      if (cur.window != prepared_window) {
+        if (prepared_window >= 0) {
+          parity ^= 1;
+        }
+        prepare_window(parity, cur.count);
+        prepared_window = cur.window;
+      }
+      while (finished_ < synced_) {
+        finish_batch();
+      }
+      if (cur.uniform && missing(cur)) {
+        expand_valid(b_->present[cur.batch] + cur.page0);
+      }
+      __sync_compute();
+      // 2. Asynchronous IO/Move: WRAM keys of item + 1, gather of item + 2,
+      // next window's queries.
+      if (has1) {
+        load_keys(key_filter_ + ((item + 1) & 1) * kFilterSlot,
+                  b_->keys[(item + 1) & 1]);
+      }
+      if (has2) {
+        const I& ahead = at(item + 2);
+        gather(b_->keys[item & 1],
+               b_->offsets[ahead.batch] + ahead.page0,
+               ahead.gather_pages);
+      }
+      if (new_window1) {
+        load_window(parity ^ 1, at(item + 1));
+      }
+      // 3. Arithmetic for this item.
+      bfloat16_t* filter = key_filter_ + (item & 1) * kFilterSlot;
+      if (cur.uniform) {
+        conv(filter, parity, 0, cur.count * 32);
+        reduce_and_store(missing(cur), cur, 0, cur.count, b_->ordered);
+      } else {
+        compute_mixed(filter, parity, cur);
+      }
+      __sync();
+      synced_ = issued_;
+    }
+  }
+
+ private:
+  B* b_;
+  bfloat16_t* key_filter_;
+  const bfloat16_t* query_;
+  const float* weights_;
+  const bfloat16_t* cache_;
+  const int32_t* table_;
+  const int32_t* positions_;
+  const int64_t* rows_;
+  float* output_;
+  int32_t tokens_, capacity_, table_width_, cache_blocks_;
+  float scale_;
+  int32_t batch_, parts_, limit_;
+  int64_t units_;
+  int32_t block_base_;
+  int64_t unit_;
+  int32_t tile_, tile_end_, window_live_;
+  int32_t batch_end_, batch_slot_, batch_first_;
+  int32_t issued_, finished_, synced_, finish_slot_;
+  int32_t batch_pages_[kBatchSlots], batch_live_[kBatchSlots];
+  int32_t generated_;
+  I proto_;
+  WindowRows<W> windows_[kWindowRing];
+  I ring_[kRing];
+};
+
+template <int32_t W, int32_t TileMax>
+__mlu_global__ void prefill_score_kernel(const bfloat16_t* query,
+                                         const float* weights,
+                                         const bfloat16_t* cache,
+                                         const int32_t* table,
+                                         const int32_t* positions,
+                                         const int64_t* rows,
+                                         float* output,
+                                         int32_t tokens,
+                                         int32_t capacity,
+                                         int32_t table_width,
+                                         int32_t cache_blocks,
+                                         float scale,
+                                         int32_t batch) {
+  __nram__ __attribute__((
+      aligned(128))) uint8_t storage[sizeof(Buffers<W, TileMax>)];
+  __wram__ bfloat16_t key_filter[2 * TileMax * 128];
+  if (__is_mpu()) {
+    return;
+  }
+  int32_t windows = (tokens + W - 1) / W;
+  int32_t parts =
+      windows >= kMinUnits ? 1 : (kMinUnits + windows - 1) / windows;
+  PrefillScore<W, TileMax> score(
+      reinterpret_cast<Buffers<W, TileMax>*>(storage),
+      key_filter,
+      query,
+      weights,
+      cache,
+      table,
+      positions,
+      rows,
+      output,
+      tokens,
+      capacity,
+      table_width,
+      cache_blocks,
+      scale,
+      batch,
+      parts);
+  score.run();
+  __sync_io();
+}
+}  // namespace
+
+// Prefill score: every query's pools [0, capacity) are written; pools past
+// its live prefix (or on missing pages) are -inf. False: unsupported.
+extern "C" bool kpool_score_prefill(void* queue,
+                                    const void* query,
+                                    const void* weights,
+                                    const void* cache,
+                                    const void* table,
+                                    const void* positions,
+                                    const void* rows,
+                                    void* output,
+                                    int32_t tokens,
+                                    int32_t capacity,
+                                    int32_t table_width,
+                                    int32_t cache_blocks,
+                                    int32_t batch,
+                                    float scale) {
+  if (tokens <= 0 || capacity <= 0 || cache_blocks <= 0 ||
+      cache_blocks > 4194304 || !(scale > 0.0f)) {
+    return false;
+  }
+  cnrtDim3_t dim = {32, 1, 1};
+  prefill_score_kernel<8, 128>
+      <<<dim, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(queue)>>>(
+          static_cast<const bfloat16_t*>(query),
+          static_cast<const float*>(weights),
+          static_cast<const bfloat16_t*>(cache),
+          static_cast<const int32_t*>(table),
+          static_cast<const int32_t*>(positions),
+          static_cast<const int64_t*>(rows),
+          static_cast<float*>(output),
+          tokens,
+          capacity,
+          table_width,
+          cache_blocks,
+          scale,
+          batch);
+  return true;
+}

@@ -58,6 +58,7 @@ cc_test(
 cc_test(
   NAME
     triton_jit_ops_test
+  RUN_SERIAL
   SRCS
     fused_gdn_gating_test.cpp
     causal_conv1d_update_decode_test.cpp
@@ -76,16 +77,7 @@ cc_test(
     glog::glog
     GTest::gtest_main
   ENVIRONMENT
-    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
-)
-
-# These 128K cases use multi-GiB device tensors and must not overlap other
-# device tests when CTest runs in parallel.
-set_tests_properties(
-  ChunkKDATest.LongContextProcessesAllWorkspaceGroupsAt128K
-  ChunkKDATest.Random128KMatchesEightKSegmentedStateChaining
-  PROPERTIES
-    RUN_SERIAL TRUE
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH};OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
 )
 
 add_subdirectory(kpool)

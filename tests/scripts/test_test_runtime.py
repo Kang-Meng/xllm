@@ -91,10 +91,13 @@ class TestRunnerIntegrationTest(unittest.TestCase):
             executable.touch(mode=0o755)
             command.build_cmake_targets(None, [], [], {"PATH": "/bin"}, build_dir, "unused")
             invocation = check_call.call_args
-            self.assertEqual(invocation.args[0], [str(executable)])
+            self.assertEqual(
+                invocation.args[0],
+                ["ctest", "-L", "^target:example_test$", "--no-tests=error", "--verbose"],
+            )
             self.assertTrue(Path(invocation.kwargs["env"]["TORCH_EXTENSIONS_DIR"]).is_dir())
 
-    def test_single_target_ctest_fallback_uses_isolated_cache(self) -> None:
+    def test_single_target_without_executable_uses_ctest(self) -> None:
         command = self.setup_module.ExtBuildSingleTest(Distribution())
         command.test_name = "example_test"
         with (
@@ -104,8 +107,24 @@ class TestRunnerIntegrationTest(unittest.TestCase):
         ):
             command.build_cmake_targets(None, [], [], {"PATH": "/bin"}, build_dir, "unused")
             invocation = check_call.call_args
-            self.assertEqual(invocation.args[0], ["ctest", "-R", "example_test", "--verbose"])
+            self.assertEqual(
+                invocation.args[0],
+                ["ctest", "-L", "^target:example_test$", "--no-tests=error", "--verbose"],
+            )
             self.assertTrue(Path(invocation.kwargs["env"]["TORCH_EXTENSIONS_DIR"]).is_dir())
+
+    def test_single_target_ctest_failure_is_propagated(self) -> None:
+        command = self.setup_module.ExtBuildSingleTest(Distribution())
+        command.test_name = "example_test"
+        failure = self.setup_module.subprocess.CalledProcessError(8, "ctest")
+        with (
+            tempfile.TemporaryDirectory() as build_dir,
+            mock.patch.object(self.setup_module, "get_cmake_dir", return_value=build_dir),
+            mock.patch.object(self.setup_module.subprocess, "check_call", side_effect=[None, None, failure]),
+        ):
+            with self.assertRaises(self.setup_module.subprocess.CalledProcessError) as raised:
+                command.build_cmake_targets(None, [], [], {"PATH": "/bin"}, build_dir, "unused")
+            self.assertEqual(raised.exception.returncode, 8)
 
 
 if __name__ == "__main__":

@@ -55,8 +55,98 @@ endforeach()
             tests = {test["name"]: test for test in json.loads(result.stdout)["tests"]}
             self.assertEqual(set(tests), {"CpuSuite.Basic", "NpuSuite.Basic"})
             properties = {item["name"]: item["value"] for item in tests["CpuSuite.Basic"]["properties"]}
-            self.assertEqual(properties["LABELS"], ["cpu"])
+            self.assertEqual(properties["LABELS"], ["cpu", "target:cpu_test"])
             self.assertEqual(properties["ENVIRONMENT"], ["EXAMPLE=value"])
+
+    def test_target_selection_preserves_runtime_environment_and_serial_policy(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            build = source / "build"
+            (source / "oracle.cpp").write_text(
+                "#include <cstdlib>\n#include <cstring>\n"
+                "#define TEST(...)\nTEST(OracleSuite, Environment)\n"
+                'int main() { const char* value = std::getenv("ORACLE_THREADS"); '
+                'return value && std::strcmp(value, "1") == 0 ? 0 : 1; }\n'
+            )
+            (source / "unrelated.cpp").write_text(
+                "#define TEST(...)\nTEST(OtherSuite, MustNotRun)\nint main() { return 1; }\n"
+            )
+            (source / "CMakeLists.txt").write_text(
+                f"""cmake_minimum_required(VERSION 3.18)
+project(test_runtime_contract LANGUAGES CXX)
+enable_testing()
+include(GoogleTest)
+list(APPEND CMAKE_MODULE_PATH "{repo_root / "cmake"}")
+include(cc_test)
+set(BUILD_TESTING ON)
+add_custom_target(all_tests)
+cc_test(NAME oracle_test CPU_ONLY RUN_SERIAL SRCS oracle.cpp ENVIRONMENT "ORACLE_THREADS=1;OMP_NUM_THREADS=1;MKL_NUM_THREADS=1")
+cc_test(NAME oracle_test_extra SRCS unrelated.cpp)
+"""
+            )
+            subprocess.run(["cmake", "-S", str(source), "-B", str(build)], check=True, capture_output=True, text=True)
+            subprocess.run(["cmake", "--build", str(build)], check=True, capture_output=True, text=True)
+            result = subprocess.run(
+                ["ctest", "--test-dir", str(build), "-L", "^target:oracle_test$", "--no-tests=error", "-V"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("100% tests passed, 0 tests failed out of 1", result.stdout)
+            result = subprocess.run(
+                ["ctest", "--test-dir", str(build), "--show-only=json-v1"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            tests = {test["name"]: test for test in json.loads(result.stdout)["tests"]}
+            properties = {item["name"]: item["value"] for item in tests["OracleSuite.Environment"]["properties"]}
+            self.assertEqual(properties["ENVIRONMENT"], ["ORACLE_THREADS=1", "OMP_NUM_THREADS=1", "MKL_NUM_THREADS=1"])
+            self.assertEqual(properties["LABELS"], ["cpu", "target:oracle_test"])
+            self.assertTrue(properties["RUN_SERIAL"])
+            missing = subprocess.run(
+                ["ctest", "--test-dir", str(build), "-L", "^target:missing$", "--no-tests=error"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing.returncode, 0)
+
+    def test_kpool_cases_have_automatic_runtime_requirements(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir)
+            build = source / "build"
+            (source / "CMakeLists.txt").write_text(
+                f"""cmake_minimum_required(VERSION 3.18)
+project(kpool_runtime_contract LANGUAGES CXX)
+enable_testing()
+include(GoogleTest)
+list(APPEND CMAKE_MODULE_PATH "{repo_root / "cmake"}")
+set(BUILD_TESTING ON)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${{CMAKE_BINARY_DIR}}/package/xllm")
+add_custom_target(all_tests)
+add_library(GTest::gtest_main INTERFACE IMPORTED)
+add_library(glog::glog INTERFACE IMPORTED)
+add_subdirectory("{repo_root / "tests/core/kernels/mlu/kpool"}" kpool)
+"""
+            )
+            subprocess.run(["cmake", "-S", str(source), "-B", str(build)], check=True, capture_output=True, text=True)
+            result = subprocess.run(
+                ["ctest", "--test-dir", str(build), "-L", "^target:kpool_kernel_test$", "--show-only=json-v1"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            tests = json.loads(result.stdout)["tests"]
+            self.assertGreater(len(tests), 4)
+            for test in tests:
+                with self.subTest(test=test["name"]):
+                    properties = {item["name"]: item["value"] for item in test["properties"]}
+                    self.assertTrue(properties["RUN_SERIAL"])
+                    self.assertIn("OMP_NUM_THREADS=1", properties["ENVIRONMENT"])
+                    self.assertIn("MKL_NUM_THREADS=1", properties["ENVIRONMENT"])
+                    self.assertTrue(properties["ENVIRONMENT"][0].startswith(f"PYTHONPATH={build}/package:"))
 
     def test_text_processing_targets_do_not_bootstrap_npu(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -118,7 +208,7 @@ endforeach()
             for test in tests:
                 with self.subTest(test=test["name"]):
                     properties = {item["name"]: item["value"] for item in test["properties"]}
-                    self.assertEqual(properties.get("LABELS"), ["cpu"])
+                    self.assertIn("cpu", properties.get("LABELS", []))
 
     def test_cpu_indices_preserve_serial_rules_and_other_npu_targets(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -192,10 +282,10 @@ file(WRITE "${{CMAKE_BINARY_DIR}}/npu_layers.links" "${{links}}")
                 with self.subTest(test=test["name"]):
                     properties = {item["name"]: item["value"] for item in test["properties"]}
                     if test in indices_tests:
-                        self.assertEqual(properties.get("LABELS"), ["cpu"])
+                        self.assertIn("cpu", properties.get("LABELS", []))
                         self.assertTrue(properties.get("RUN_SERIAL"))
                     elif test["name"].startswith(("DeepseekV4EplbTest.", "DeepseekV4EplbLoadUtilsTest.")):
-                        self.assertEqual(properties.get("LABELS"), ["cpu"])
+                        self.assertIn("cpu", properties.get("LABELS", []))
                         self.assertFalse(properties.get("RUN_SERIAL", False))
                     else:
                         self.assertNotIn("cpu", properties.get("LABELS", []))

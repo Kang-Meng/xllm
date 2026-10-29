@@ -1,0 +1,1872 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// KPool top-k selection: per score row, the IDs torch.topk(min(count, pools))
+// selects (NaN and +inf rank first and become -1; ties prefer lower IDs),
+// read from the row's live prefix only, in unspecified order; -1 elsewhere.
+//
+// Rows below kShortPools go through select_short_kernel (one row per core).
+// Longer rows go through select_hybrid_kernel: a few long rows are selected
+// by the four cores of a cluster (shared group-maxima bound in SRAM), the
+// others by single cores (rows beyond a resident segment are streamed with a
+// running threshold). select_parts_kernel splits rows over grid parts when
+// neither applies. Per row, a lower bound on the count-th largest score from
+// group maxima limits the exact threshold search to a few candidates; the
+// search interpolates on counts (scalar work is as costly as a vector pass).
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/kpool/launchers.h"
+
+namespace {
+constexpr int32_t kChunk = 8192;      // compare/filter chunk (floats)
+constexpr int32_t kMaxPools = 65536;  // resident row capacity (floats)
+constexpr int32_t kMaxCount = 1024;   // selected IDs per row
+constexpr int32_t kCand = 4096;       // bound-filter candidate capacity
+constexpr float kMaxFinite = 3.40282346638528859812e+38f;
+
+__mlu_func__ uint32_t float_bits(float value) {
+  union {
+    float f;
+    uint32_t u;
+  } cast;
+  cast.f = value;
+  return cast.u;
+}
+
+__mlu_func__ float bits_float(uint32_t value) {
+  union {
+    float f;
+    uint32_t u;
+  } cast;
+  cast.u = value;
+  return cast.f;
+}
+
+// Monotonic map from float order to unsigned order.
+__mlu_func__ uint32_t order_key(float value) {
+  uint32_t bits = float_bits(value);
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+__mlu_func__ float key_value(uint32_t key) {
+  return bits_float((key & 0x80000000u) ? (key & 0x7fffffffu) : ~key);
+}
+
+// Piecewise-linear log2 (exponent + mantissa), monotonic, for interpolation.
+__mlu_func__ float fast_log2(float value) {
+  uint32_t bits = float_bits(value);
+  return static_cast<float>(static_cast<int32_t>(bits >> 23) - 127) +
+         bits_float((bits & 0x007fffffu) | 0x3f800000u) - 1.0f;
+}
+
+// Kernel-scoped NRAM (namespace-scope __nram__ would be reserved for every
+// kernel linked into the module).
+struct SelectBuffers {
+  float row_scores[kMaxPools];
+  float compare[kChunk];
+  float upper[kChunk];
+  float iota[kChunk];
+  float picked[kChunk + kMaxCount];
+  float picked_values[kChunk + kMaxCount];
+  int64_t picked_ids[kMaxCount];
+  // Bound-filter candidates (and the group maxima before them).
+  float cand_values[kCand + 64];
+  float cand_ids[kCand + 64];
+};
+
+__mlu_func__ uint32_t count_ge(SelectBuffers* sb,
+                               const float* values,
+                               int32_t padded,
+                               float threshold) {
+  uint32_t total = 0;
+  for (int32_t begin = 0; begin < padded; begin += kChunk) {
+    int32_t length = padded - begin < kChunk ? padded - begin : kChunk;
+    __bang_ge_scalar(sb->compare, values + begin, threshold, length);
+    total += __bang_count(sb->compare, length);
+  }
+  return total;
+}
+
+// Appends IDs whose score satisfies (score > t) or (score == t) to
+// sb->picked (and their scores to sb->picked_values when `values`). IDs are
+// `ids[i]` when given, else id_base + i.
+template <bool Equal, bool OrGreater = false>
+__mlu_func__ int32_t append_ids(SelectBuffers* sb,
+                                const float* row,
+                                int32_t padded,
+                                float threshold,
+                                int32_t offset,
+                                int32_t limit,
+                                const float* ids,
+                                float id_base,
+                                bool values) {
+  for (int32_t begin = 0; begin < padded && offset < limit; begin += kChunk) {
+    int32_t length = padded - begin < kChunk ? padded - begin : kChunk;
+    if (Equal && OrGreater) {
+      __bang_ge_scalar(sb->compare, row + begin, threshold, length);
+    } else if (Equal) {
+      __bang_eq_scalar(sb->compare, row + begin, threshold, length);
+    } else {
+      __bang_gt_scalar(sb->compare, row + begin, threshold, length);
+    }
+    const float* source = sb->iota;
+    float shift = id_base + static_cast<float>(begin);
+    if (ids != nullptr) {
+      source = ids + begin;
+    } else if (shift != 0.0f) {
+      __bang_add_scalar(sb->iota, sb->iota, shift, length);
+    }
+    uint32_t n =
+        __bang_filter(sb->picked + offset, source, sb->compare, length);
+    if (values) {
+      __bang_filter(
+          sb->picked_values + offset, row + begin, sb->compare, length);
+    }
+    if (ids == nullptr && shift != 0.0f) {
+      __bang_add_scalar(sb->iota, sb->iota, -shift, length);
+    }
+    offset += static_cast<int32_t>(n);
+  }
+  return offset < limit ? offset : limit;
+}
+
+// Copies scores in [low, high) to sb->picked; returns the 64-padded length.
+__mlu_func__ int32_t compact_bracket(SelectBuffers* sb,
+                                     const float* row,
+                                     int32_t padded,
+                                     float low,
+                                     float high) {
+  int32_t total = 0;
+  for (int32_t begin = 0; begin < padded; begin += kChunk) {
+    int32_t length = padded - begin < kChunk ? padded - begin : kChunk;
+    __bang_ge_scalar(sb->compare, row + begin, low, length);
+    __bang_lt_scalar(sb->upper, row + begin, high, length);
+    __bang_mul(sb->compare, sb->compare, sb->upper, length);
+    total += static_cast<int32_t>(
+        __bang_filter(sb->picked + total, row + begin, sb->compare, length));
+  }
+  int32_t aligned = (total + 63) / 64 * 64;
+  if (aligned == 0) {
+    aligned = 64;
+  }
+  if (aligned > total) {
+    __bang_write_value(sb->picked + total, aligned - total, -INFINITY);
+  }
+  return aligned;
+}
+
+// Largest and smallest finite score; -inf (and NaN) entries are ignored.
+__mlu_func__ void finite_range(SelectBuffers* sb,
+                               const float* row,
+                               int32_t padded,
+                               float* low,
+                               float* high) {
+  float minimum = INFINITY, maximum = -INFINITY;
+  for (int32_t begin = 0; begin < padded; begin += kChunk) {
+    int32_t length = padded - begin < kChunk ? padded - begin : kChunk;
+    __bang_argmax(sb->picked, row + begin, length);
+    __bang_ge_scalar(sb->compare, row + begin, -kMaxFinite, length);
+    // -inf * 0 is NaN, which argmin ignores.
+    __bang_mul(sb->compare, sb->compare, row + begin, length);
+    __bang_argmin(sb->picked + 64, sb->compare, length);
+    __sync_compute();
+    maximum = sb->picked[0] > maximum ? sb->picked[0] : maximum;
+    minimum = sb->picked[64] < minimum ? sb->picked[64] : minimum;
+  }
+  *low = minimum;
+  *high = maximum;
+}
+
+// Min and max of row[0, length) into range[0], range[1]; true when the min
+// is finite (then every entry of row[0, length) is finite, padding aside).
+__mlu_func__ bool finite_span(SelectBuffers* sb,
+                              const float* row,
+                              int32_t length,
+                              int32_t padded,
+                              float* range) {
+  __bang_argmax(sb->picked, row, padded);
+  __bang_argmin(sb->picked + 64, row, length);
+  __sync_compute();
+  range[0] = sb->picked[64];
+  range[1] = sb->picked[0];
+  return range[0] >= -kMaxFinite;
+}
+
+// torch.topk ranks NaN and +inf above every finite score; their selections
+// become -1. Returns how many such entries row[0, padded) holds and turns
+// +inf into NaN so that neither is ever selected.
+__mlu_func__ int32_t nonfinite_top(SelectBuffers* sb,
+                                   float* row,
+                                   int32_t padded) {
+  uint32_t ordered = 0;
+  for (int32_t begin = 0; begin < padded; begin += kChunk) {
+    int32_t length = padded - begin < kChunk ? padded - begin : kChunk;
+    float* values = row + begin;
+    __bang_ge_scalar(sb->compare, values, INFINITY, length);
+    if (__bang_count(sb->compare, length) > 0) {
+      // +inf * 0 is NaN; every other value is kept.
+      __bang_lt_scalar(sb->upper, values, INFINITY, length);
+      __bang_mul(values, values, sb->upper, length);
+    }
+    __bang_eq(sb->compare, values, values, length);
+    ordered += __bang_count(sb->compare, length);
+  }
+  return padded - static_cast<int32_t>(ordered);
+}
+
+// Search hints carried from row to row (Tuned selections): `hint` is the
+// previous threshold, `bound_hint` the previous group-maxima bound; either is
+// probed first when inside the initial bracket. The selected set does not
+// depend on them.
+struct SelectTuning {
+  float hint = NAN;
+  float bound_hint = NAN;
+};
+
+// Selects the `wanted` largest finite entries of row[0, padded) (padding is
+// -inf) into sb->picked (IDs, see append_ids); returns the count. With
+// Tuned, *threshold_out receives the final threshold.
+
+// Threshold search (scalar work per step costs about as much as a count
+// pass, so steps are kept lean): row[0, padded) (padding -inf) has `finite`
+// finite entries, more than `wanted`, spanning range = {min, max} (scanned
+// when null). Illinois regula falsi on the count from `probe` (if inside the
+// bracket), key bisection every third step after kInterpolateSteps, bracket
+// compaction at <= 256 entries. Returns the largest found t with count(>= t) >=
+// wanted (the wanted-th largest entry, or within `slack` above it);
+// *low_count_out = count(>= t).
+constexpr int32_t kInterpolateSteps = 16;
+
+__mlu_func__ float find_threshold_lean(SelectBuffers* sb,
+                                       const float* row,
+                                       int32_t padded,
+                                       int32_t wanted,
+                                       uint32_t finite,
+                                       const float* range,
+                                       float probe,
+                                       uint32_t* low_count_out,
+                                       int32_t slack = 0) {
+  float low = 0.0f, high = 0.0f;
+  if (range != nullptr) {
+    low = range[0];
+    high = range[1];
+  } else {
+    finite_range(sb, row, padded, &low, &high);
+  }
+  const float target = static_cast<float>(wanted) - 0.5f;
+  float low_count = static_cast<float>(finite);
+  float high_count = static_cast<float>(count_ge(sb, row, padded, high));
+  if (high_count >= static_cast<float>(wanted)) {
+    *low_count_out = static_cast<uint32_t>(high_count);
+    return high;
+  }
+  const float* search = row;
+  int32_t search_length = padded;
+  float base_count = 0.0f;
+  float low_weight = low_count - target, high_weight = high_count - target;
+  int32_t last_side = 0;
+  bool use_probe = probe > low && probe < high;
+  for (int32_t step = 0; step < 96; ++step) {
+    if (search == row && low_count - high_count <= 256.0f) {
+      search_length = compact_bracket(sb, row, padded, low, high);
+      search = sb->picked;
+      base_count = high_count;
+    }
+    if (!use_probe) {
+      // Interpolation converges fast on scores; past kInterpolateSteps every
+      // third probe bisects the keys, which bounds the search.
+      bool bisect = step >= kInterpolateSteps && step % 3 == 2;
+      if (!bisect) {
+        probe = low + (high - low) * (low_weight / (low_weight - high_weight));
+      }
+      if (bisect || !(probe > low && probe < high)) {
+        uint32_t low_key = order_key(low), high_key = order_key(high);
+        if (high_key - low_key <= 1u) {
+          break;
+        }
+        probe = key_value(low_key + (high_key - low_key) / 2u);
+      }
+    }
+    use_probe = false;
+    float probe_count = base_count + static_cast<float>(count_ge(
+                                         sb, search, search_length, probe));
+    if (probe_count >= static_cast<float>(wanted)) {
+      low = probe;
+      low_count = probe_count;
+      low_weight = probe_count - target;
+      if (last_side == 1) {
+        high_weight *= 0.7f;
+      }
+      last_side = 1;
+      if (probe_count - static_cast<float>(wanted) <=
+          static_cast<float>(slack)) {
+        break;
+      }
+    } else {
+      high = probe;
+      high_count = probe_count;
+      high_weight = probe_count - target;
+      if (last_side == -1) {
+        low_weight *= 0.7f;
+      }
+      last_side = -1;
+    }
+  }
+  *low_count_out = static_cast<uint32_t>(low_count);
+  return low;
+}
+
+// First probe without a previous threshold: mean + z * std of row[0, n)
+// (n >= 64 finite entries), z the logistic approximation of the normal
+// (1 - wanted / n) quantile.
+__mlu_func__ float moment_probe(SelectBuffers* sb,
+                                const float* row,
+                                int32_t n,
+                                int32_t wanted) {
+  int32_t length = n / 64 * 64;
+  float mean = __bang_sum(row, length) / static_cast<float>(length);
+  __bang_mul(sb->compare, row, row, length);
+  float var = __bang_sum(sb->compare, length) / static_cast<float>(length) -
+              mean * mean;
+  float p = static_cast<float>(wanted) / static_cast<float>(n);
+  float z = 0.6931472f * (fast_log2(1.0f - p) - fast_log2(p)) / 1.702f;
+  return mean + z * sqrtf(var > 0.0f ? var : 0.0f);
+}
+
+// Appends the `wanted` entries of row[0, padded) above `threshold` (the
+// wanted-th largest, `low_count` = count(>= threshold)): one >= pass when
+// that count is exact, else > then ==.
+__mlu_func__ int32_t append_selected(SelectBuffers* sb,
+                                     const float* row,
+                                     int32_t padded,
+                                     float threshold,
+                                     uint32_t low_count,
+                                     int32_t wanted,
+                                     const float* ids,
+                                     float id_base,
+                                     bool values) {
+  if (static_cast<int32_t>(low_count) == wanted) {
+    return append_ids<true, true>(
+        sb, row, padded, threshold, /*offset=*/0, wanted, ids, id_base, values);
+  }
+  int32_t filled = append_ids<false>(
+      sb, row, padded, threshold, /*offset=*/0, wanted, ids, id_base, values);
+  return append_ids<true>(
+      sb, row, padded, threshold, filled, wanted, ids, id_base, values);
+}
+
+// Rows at least kBoundRatio times longer than `wanted` first bound the
+// wanted-th largest entry from below by the wanted-th largest of nb group
+// maxima (each of those groups holds an entry >= it), then select among the
+// entries >= that bound.
+constexpr int32_t kBoundRatio = 4;
+constexpr int32_t kBoundMin = 4096;
+
+__mlu_func__ int32_t bound_groups(int32_t wanted) {
+  int32_t nb = 64;
+  while (nb < 2 * wanted) {
+    nb *= 2;
+  }
+  return nb;
+}
+
+// Group maxima of row[0, padded) into sb->cand_values (padding the row with
+// -inf to whole groups); NaN-propagating, so NaN or +inf entries show in
+// them. Returns whether every maximum is below +inf (no NaN/+inf entry).
+__mlu_func__ bool group_maxima(SelectBuffers* sb,
+                               float* row,
+                               int32_t padded,
+                               int32_t nb) {
+  int32_t height = (padded + nb - 1) / nb;
+  int32_t grouped = height * nb;
+  if (grouped > padded) {
+    __bang_write_value(row + padded, grouped - padded, -INFINITY);
+  }
+  __bang_nan_maxpool(
+      sb->cand_values, row, nb, height, 1, height, 1, 1, height, 1, 1, 1, 1);
+  __bang_lt_scalar(sb->compare, sb->cand_values, INFINITY, nb);
+  return __bang_count(sb->compare, nb) == static_cast<uint32_t>(nb);
+}
+
+// Bounded selection from the nb group maxima in sb->cand_values (no NaN or
+// +inf in the row). Returns -1 when the candidates exceed kCand.
+template <bool Tuned>
+__mlu_func__ int32_t select_bounded(SelectBuffers* sb,
+                                    float* row,
+                                    int32_t padded,
+                                    int32_t wanted,
+                                    int32_t nb,
+                                    const float* ids,
+                                    float id_base,
+                                    bool values,
+                                    SelectTuning tuning,
+                                    float* threshold_out) {
+  float* maxima = sb->cand_values;
+  float range[2];
+  bool all_finite = finite_span(sb, maxima, nb, nb, range);
+  uint32_t finite_maxima =
+      all_finite ? nb : count_ge(sb, maxima, nb, -kMaxFinite);
+  float bound = -kMaxFinite;
+  if (static_cast<int32_t>(finite_maxima) > wanted) {
+    // Any bound with >= wanted maxima above it is valid; stop within 25%.
+    float probe = tuning.bound_hint;
+    if (!(probe == probe) && all_finite) {
+      probe = moment_probe(sb, maxima, nb, wanted);
+    }
+    uint32_t bound_count = 0;
+    bound = find_threshold_lean(sb,
+                                maxima,
+                                nb,
+                                wanted,
+                                finite_maxima,
+                                all_finite ? range : nullptr,
+                                probe,
+                                &bound_count,
+                                wanted / 4);
+  } else {
+    uint32_t finite = count_ge(sb, row, padded, -kMaxFinite);
+    if (static_cast<int32_t>(finite) <= wanted) {
+      return append_ids<false>(sb,
+                               row,
+                               padded,
+                               /*threshold=*/-INFINITY,
+                               /*offset=*/0,
+                               wanted,
+                               ids,
+                               id_base,
+                               values);
+    }
+  }
+  int32_t total = 0;
+  for (int32_t begin = 0; begin < padded; begin += kChunk) {
+    int32_t length = padded - begin < kChunk ? padded - begin : kChunk;
+    __bang_ge_scalar(sb->compare, row + begin, bound, length);
+    // __bang_filter may write `length` outputs: stage in picked/picked_values
+    // (free until the final append) and copy the kept prefix.
+    int32_t n = static_cast<int32_t>(
+        __bang_filter(sb->picked, row + begin, sb->compare, length));
+    if (total + n > kCand) {
+      return -1;
+    }
+    if (n == 0) {
+      continue;
+    }
+    __bang_filter(sb->picked_values,
+                  ids != nullptr ? ids + begin : sb->iota,
+                  sb->compare,
+                  length);
+    float shift = id_base + static_cast<float>(begin);
+    if (ids == nullptr && shift != 0.0f) {
+      __bang_add_scalar(
+          sb->picked_values, sb->picked_values, shift, (n + 63) / 64 * 64);
+    }
+    __memcpy(sb->cand_values + total, sb->picked, n * sizeof(float), NRAM2NRAM);
+    __memcpy(
+        sb->cand_ids + total, sb->picked_values, n * sizeof(float), NRAM2NRAM);
+    total += n;
+  }
+  int32_t cand_padded = (total + 63) / 64 * 64;
+  if (cand_padded > total) {
+    __bang_write_value(sb->cand_values + total, cand_padded - total, -INFINITY);
+  }
+  float threshold = tuning.hint;
+  int32_t filled = 0;
+  if (total <= wanted) {
+    filled = append_ids<false>(sb,
+                               sb->cand_values,
+                               cand_padded,
+                               -INFINITY,
+                               0,
+                               wanted,
+                               sb->cand_ids,
+                               0.0f,
+                               values);
+  } else {
+    // Candidates are finite (>= a finite bound).
+    uint32_t low_count = 0;
+    finite_span(sb, sb->cand_values, total, cand_padded, range);
+    threshold = find_threshold_lean(sb,
+                                    sb->cand_values,
+                                    cand_padded,
+                                    wanted,
+                                    total,
+                                    range,
+                                    tuning.hint,
+                                    &low_count);
+    filled = append_selected(sb,
+                             sb->cand_values,
+                             cand_padded,
+                             threshold,
+                             low_count,
+                             wanted,
+                             sb->cand_ids,
+                             0.0f,
+                             values);
+  }
+  if constexpr (Tuned) {
+    threshold_out[0] = threshold;
+    threshold_out[1] = bound;
+  }
+  return filled;
+}
+
+// Selects the `wanted` largest finite entries of row[0, padded) (padding is
+// -inf) into sb->picked (IDs, see append_ids); returns the count. With
+// Tuned, threshold_out[0] receives the final threshold (bounded rows also
+// set threshold_out[1] to their group-maxima bound). Rows taking the
+// bounded path need writable padding up to a multiple of the group count.
+template <bool Tuned = false>
+__mlu_func__ int32_t select_loaded(SelectBuffers* sb,
+                                   float* row,
+                                   int32_t padded,
+                                   int32_t wanted,
+                                   const float* ids,
+                                   float id_base,
+                                   bool values,
+                                   SelectTuning tuning = SelectTuning(),
+                                   float* threshold_out = nullptr,
+                                   bool bounded = false) {
+  if (wanted <= 0) {
+    return 0;
+  }
+  uint32_t finite = count_ge(sb, row, padded, -kMaxFinite);
+  if (static_cast<int32_t>(finite) <= wanted) {
+    return append_ids<false>(sb,
+                             row,
+                             padded,
+                             /*threshold=*/-INFINITY,
+                             /*offset=*/0,
+                             wanted,
+                             ids,
+                             id_base,
+                             values);
+  }
+  if (bounded && padded >= kBoundMin && padded >= kBoundRatio * wanted) {
+    // NaN entries (from nonfinite_top) are never selected: plain maxima.
+    int32_t nb = bound_groups(wanted);
+    int32_t height = (padded + nb - 1) / nb;
+    if (height * nb > padded) {
+      __bang_write_value(row + padded, height * nb - padded, -INFINITY);
+    }
+    __bang_maxpool(sb->cand_values, row, nb, height, 1, height, 1);
+    int32_t filled = select_bounded<Tuned>(sb,
+                                           row,
+                                           padded,
+                                           wanted,
+                                           nb,
+                                           ids,
+                                           id_base,
+                                           values,
+                                           tuning,
+                                           threshold_out);
+    if (filled >= 0) {
+      return filled;
+    }
+  }
+  uint32_t low_count = 0;
+  float threshold = find_threshold_lean(sb,
+                                        row,
+                                        padded,
+                                        wanted,
+                                        finite,
+                                        /*range=*/nullptr,
+                                        tuning.hint,
+                                        &low_count);
+  if constexpr (Tuned) {
+    *threshold_out = threshold;
+  }
+  return append_selected(
+      sb, row, padded, threshold, low_count, wanted, ids, id_base, values);
+}
+
+// Short clean rows (no NaN/+inf; `length` entries then -inf padding): the
+// entries' min and max replace the finite count and range scans when the
+// row holds no other -inf.
+template <bool Tuned>
+__mlu_func__ int32_t select_short(SelectBuffers* sb,
+                                  float* row,
+                                  int32_t length,
+                                  int32_t padded,
+                                  int32_t wanted,
+                                  const float* ids,
+                                  float id_base,
+                                  bool values,
+                                  SelectTuning tuning,
+                                  float* threshold_out,
+                                  const float* maxima = nullptr) {
+  float range[2];
+  bool finite = false;
+  if (maxima != nullptr) {
+    // The row max is the max of its 64 group maxima.
+    __bang_argmax(sb->picked, maxima, 64);
+    __bang_argmin(sb->picked + 64, row, length);
+    __sync_compute();
+    range[0] = sb->picked[64];
+    range[1] = sb->picked[0];
+    finite = range[0] >= -kMaxFinite;
+  } else {
+    finite = finite_span(sb, row, length, padded, range);
+  }
+  if (!finite) {
+    return select_loaded<Tuned>(
+        sb, row, padded, wanted, ids, id_base, values, tuning, threshold_out);
+  }
+  if (length <= wanted) {
+    return append_ids<false>(sb,
+                             row,
+                             padded,
+                             /*threshold=*/-INFINITY,
+                             /*offset=*/0,
+                             wanted,
+                             ids,
+                             id_base,
+                             values);
+  }
+  float probe = tuning.hint;
+  if (!(probe == probe) && length >= 64) {
+    probe = moment_probe(sb, row, length, wanted);
+  }
+  uint32_t low_count = 0;
+  float threshold = find_threshold_lean(
+      sb, row, padded, wanted, length, range, probe, &low_count);
+  if constexpr (Tuned) {
+    *threshold_out = threshold;
+  }
+  return append_selected(
+      sb, row, padded, threshold, low_count, wanted, ids, id_base, values);
+}
+
+// select_loaded with NaN/+inf handling: counts NaN/+inf entries (torch.topk
+// ranks them first; they become NaN and are never selected) into
+// *nonfinite_out and, with `subtract`, selects that many fewer. Rows of at
+// least bound_min take the bounded path; they read the count off their group
+// maxima and skip the full scan when clean.
+template <bool Tuned = false>
+__mlu_func__ int32_t select_row(SelectBuffers* sb,
+                                float* row,
+                                int32_t length,
+                                int32_t padded,
+                                int32_t wanted,
+                                bool subtract,
+                                const float* ids,
+                                float id_base,
+                                bool values,
+                                int32_t* nonfinite_out,
+                                SelectTuning tuning = SelectTuning(),
+                                float* threshold_out = nullptr,
+                                int32_t bound_min = kBoundMin) {
+  if (wanted > 0 && padded >= bound_min && padded >= kBoundRatio * wanted) {
+    int32_t nb = bound_groups(wanted);
+    if (group_maxima(sb, row, padded, nb)) {
+      *nonfinite_out = 0;
+      int32_t filled = select_bounded<Tuned>(sb,
+                                             row,
+                                             padded,
+                                             wanted,
+                                             nb,
+                                             ids,
+                                             id_base,
+                                             values,
+                                             tuning,
+                                             threshold_out);
+      if (filled >= 0) {
+        return filled;
+      }
+      return select_loaded<Tuned>(
+          sb, row, padded, wanted, ids, id_base, values, tuning, threshold_out);
+    }
+  }
+  if (wanted > 0 && length > 0) {
+    // NaN-propagating maxima of 64 groups flag NaN/+inf entries.
+    int32_t height = padded / 64;
+    __bang_nan_maxpool(
+        sb->compare + 64, row, 64, height, 1, height, 1, 1, height, 1, 1, 1, 1);
+    __bang_lt_scalar(sb->compare, sb->compare + 64, INFINITY, 64);
+    if (__bang_count(sb->compare, 64) == 64) {
+      *nonfinite_out = 0;
+      // Group maxima move out of compare, which the selection reuses.
+      __bang_move(sb->cand_values, sb->compare + 64, 64 * sizeof(float));
+      return select_short<Tuned>(sb,
+                                 row,
+                                 length,
+                                 padded,
+                                 wanted,
+                                 ids,
+                                 id_base,
+                                 values,
+                                 tuning,
+                                 threshold_out,
+                                 sb->cand_values);
+    }
+  }
+  int32_t nonfinite = nonfinite_top(sb, row, padded);
+  *nonfinite_out = nonfinite;
+  return select_loaded<Tuned>(sb,
+                              row,
+                              padded,
+                              subtract ? wanted - nonfinite : wanted,
+                              ids,
+                              id_base,
+                              values,
+                              tuning,
+                              threshold_out,
+                              /*bounded=*/true);
+}
+
+// sb->iota[0, n) = 0, 1, ..., n - 1 (n <= kChunk).
+__mlu_func__ void init_iota(SelectBuffers* sb, int32_t n) {
+  int32_t* sequence = reinterpret_cast<int32_t*>(sb->compare);
+  int32_t length = (n + 63) / 64 * 64;
+  __bang_incseq(sequence, length);
+  __bang_int322float(sb->iota, sequence, length, 0);
+}
+
+// Live pools of a score row with cache position `position`: scores are
+// finite at most on [0, (position + 1) / 4); -1 marks an inactive row.
+__mlu_func__ int32_t live_pools(int32_t position, int32_t pools) {
+  int64_t live = position >= 0 ? (static_cast<int64_t>(position) + 1) / 4 : 0;
+  return static_cast<int32_t>(live < pools ? live : pools);
+}
+
+// Writes count selected IDs (floats in sb->picked, -1 padded past `filled`)
+// as int64: int32 low words and sign high words, interleaved by a 2 x count
+// transpose (__bang_float2int64 is slow on this ISA).
+__mlu_func__ void ids_to_int64(SelectBuffers* sb,
+                               int32_t filled,
+                               int32_t count) {
+  if (filled < count) {
+    __bang_write_value(sb->picked + filled, count - filled, -1.0f);
+  }
+  int32_t* words = reinterpret_cast<int32_t*>(sb->upper);
+  __bang_float2int32(words, sb->picked, count, 0);
+  __bang_lt_scalar(sb->compare, sb->picked, 0.0f, count);
+  __bang_mul_scalar(sb->compare, sb->compare, -1.0f, count);
+  __bang_float2int32(words + count, sb->compare, count, 0);
+  __bang_transpose(reinterpret_cast<int32_t*>(sb->picked_ids), words, 2, count);
+}
+
+// Unified live selection: task t = (row t % rows, part t / rows) owns
+// scores [part * seg, part * seg + seg) of its row, clipped to the row's live
+// prefix. With one part a task writes the row's IDs directly; otherwise it
+// writes its top min(count, seg) (values, IDs, count, nonfinite) and, after
+// a grid barrier, one core per row selects from the part candidates.
+constexpr int32_t kPartSeg = kMaxPools / 2;  // double-buffered segment
+constexpr int32_t kSpeculate = 4096;         // speculatively loaded scores
+constexpr int32_t kShortPools = 16384;       // short kernel: pools below
+constexpr int32_t kPartRows = 2048;          // staged live counts
+
+__mlu_global__ void select_parts_kernel(const float* scores,
+                                        const int32_t* positions,
+                                        int64_t* output,
+                                        float* workspace,
+                                        int32_t rows,
+                                        int32_t pools,
+                                        int32_t stride,
+                                        int32_t count,
+                                        int32_t parts,
+                                        int32_t seg) {
+  __nram__ __attribute__((aligned(128))) uint8_t storage[sizeof(SelectBuffers)];
+  __nram__ int32_t live[kPartRows];
+  if (__is_mpu()) {
+    return;
+  }
+  SelectBuffers* sb = reinterpret_cast<SelectBuffers*>(storage);
+  const int32_t chunk = seg < kChunk ? seg : kChunk;
+  init_iota(sb, chunk);
+  const int32_t tasks = rows * parts;
+  // Segments longer than half the row buffer load one at a time.
+  const bool double_buffer = seg <= kPartSeg;
+  float* values_out = workspace;
+  float* ids_out = workspace + static_cast<int64_t>(tasks) * count;
+  int32_t* meta_out =
+      reinterpret_cast<int32_t*>(ids_out + static_cast<int64_t>(tasks) * count);
+  const int32_t row_count = count < pools ? count : pools;
+  SelectTuning tuning;
+  int32_t* staged = reinterpret_cast<int32_t*>(sb->cand_ids);
+  // Live pools of this core's rows: all rows (parts > 1, rows <= kPartRows)
+  // or, block by block, rows taskId + i * taskDim (parts == 1).
+  const int32_t mine =
+      taskId < tasks ? (tasks - taskId + taskDim - 1) / taskDim : 0;
+  if (parts > 1 && positions == nullptr) {  // every pool live
+    __bang_write_value(live, (rows + 63) / 64 * 64, pools);
+  } else if (parts > 1) {
+    __memcpy(live, positions, rows * sizeof(int32_t), GDRAM2NRAM);
+    for (int32_t i = 0; i < rows; ++i) {
+      live[i] = live_pools(live[i], pools);
+    }
+  }
+  // Short rows: the first row loads whole while its position is read.
+  const bool speculate = parts == 1 && double_buffer && mine > 0;
+  if (speculate) {
+    __memcpy_async(sb->row_scores,
+                   scores + static_cast<int64_t>(taskId) * stride,
+                   pools * sizeof(float),
+                   GDRAM2NRAM);
+  }
+  for (int32_t block = 0; block < mine; block += kPartRows) {
+    int32_t n = mine - block < kPartRows ? mine - block : kPartRows;
+    if (parts == 1 && positions == nullptr) {
+      __bang_write_value(live, (n + 63) / 64 * 64, pools);
+    } else if (parts == 1) {
+      __memcpy(live,
+               positions + taskId + static_cast<int64_t>(block) * taskDim,
+               sizeof(int32_t),
+               GDRAM2NRAM,
+               sizeof(int32_t),
+               taskDim * sizeof(int32_t),
+               n - 1);
+      for (int32_t i = 0; i < n; ++i) {
+        live[i] = live_pools(live[i], pools);
+      }
+    }
+    auto task_of = [&](int32_t i) { return taskId + (block + i) * taskDim; };
+    auto used_of = [&](int32_t i, int32_t* begin_out) {
+      int32_t task = task_of(i);
+      // Part-major tasks spread each part index over the cores.
+      int32_t begin = (task / rows) * seg;
+      int32_t length = pools - begin < seg ? pools - begin : seg;
+      int32_t row_live = parts == 1 ? live[i] : live[task % rows];
+      int32_t used = row_live - begin < length ? row_live - begin : length;
+      *begin_out = begin;
+      return used > 0 ? used : 0;
+    };
+    auto load = [&](int32_t i) {
+      int32_t begin;
+      int32_t used = used_of(i, &begin);
+      if (used > 0) {
+        int32_t task = task_of(i);
+        __memcpy_async(
+            sb->row_scores + (double_buffer ? (i & 1) * kPartSeg : 0),
+            scores + static_cast<int64_t>(task % rows) * stride + begin,
+            used * sizeof(float),
+            GDRAM2NRAM);
+      }
+    };
+    if (!(speculate && block == 0)) {
+      load(0);
+    }
+    for (int32_t i = 0; i < n; ++i) {
+      int32_t task = task_of(i);
+      float* values = sb->row_scores + (double_buffer ? (i & 1) * kPartSeg : 0);
+      int32_t begin;
+      int32_t used = used_of(i, &begin);
+      // This load and the previous task's stores complete.
+      __sync_io();
+      if (double_buffer && i + 1 < n) {
+        load(i + 1);
+      }
+      int32_t filled = 0;
+      int32_t nonfinite = 0;
+      // A row whose live prefix fits its first part selects directly.
+      const int32_t task_row = parts == 1 ? task : task % rows;
+      const bool direct = parts == 1 || (task < rows && live[task_row] <= seg);
+      if (used > 0) {
+        int32_t padded = (used + 63) / 64 * 64;
+        if (padded > used) {
+          __bang_write_value(values + used, padded - used, -INFINITY);
+        }
+        float threshold[2] = {tuning.hint, tuning.bound_hint};
+        filled =
+            select_row<true>(sb,
+                             values,
+                             used,
+                             padded,
+                             direct ? row_count : (count < used ? count : used),
+                             /*subtract=*/direct,
+                             nullptr,
+                             static_cast<float>(begin),
+                             !direct,
+                             &nonfinite,
+                             tuning,
+                             threshold);
+        tuning.hint = threshold[0];
+        tuning.bound_hint = threshold[1];
+      }
+      if (direct) {
+        ids_to_int64(sb, filled, count);
+        __sync_compute();
+        __memcpy_async(output + static_cast<int64_t>(task_row) * count,
+                       sb->picked_ids,
+                       count * sizeof(int64_t),
+                       NRAM2GDRAM);
+      } else {
+        staged[0] = filled;
+        staged[1] = nonfinite;
+        __sync_compute();
+        int64_t slot = static_cast<int64_t>(task % rows) * parts + task / rows;
+        __memcpy_async(
+            meta_out + 2 * slot, staged, 2 * sizeof(int32_t), NRAM2GDRAM);
+        if (filled > 0) {
+          __memcpy_async(values_out + slot * count,
+                         sb->picked_values,
+                         filled * sizeof(float),
+                         NRAM2GDRAM);
+          __memcpy_async(ids_out + slot * count,
+                         sb->picked,
+                         filled * sizeof(float),
+                         NRAM2GDRAM);
+        }
+      }
+      if (!double_buffer && i + 1 < n) {
+        __sync_io();
+        load(i + 1);
+      }
+    }
+    __sync_io();
+  }
+  if (parts == 1) {
+    return;
+  }
+  // Async GDRAM stores must land before other cores read them.
+  __sync_io_move_compute();
+  __sync_all_ipu();
+  // Candidate IDs live past the searched prefix of row_scores.
+  float* ids = sb->row_scores + kPartSeg;
+  for (int32_t row = taskId; row < rows; row += taskDim) {
+    if (live[row] <= seg) {  // selected directly by its first part
+      continue;
+    }
+    __memcpy(staged,
+             meta_out + 2 * row * parts,
+             2 * parts * sizeof(int32_t),
+             GDRAM2NRAM);
+    int32_t total = 0;
+    int32_t nonfinite = 0;
+    for (int32_t part = 0; part < parts; ++part) {
+      int32_t filled = staged[2 * part];
+      nonfinite += staged[2 * part + 1];
+      if (filled > 0) {
+        int64_t task = static_cast<int64_t>(row) * parts + part;
+        __memcpy_async(sb->row_scores + total,
+                       values_out + task * count,
+                       filled * sizeof(float),
+                       GDRAM2NRAM);
+        __memcpy_async(ids + total,
+                       ids_out + task * count,
+                       filled * sizeof(float),
+                       GDRAM2NRAM);
+        total += filled;
+      }
+    }
+    __sync_io();
+    int32_t filled = 0;
+    if (total > 0) {
+      int32_t padded = (total + 63) / 64 * 64;
+      if (padded > total) {
+        __bang_write_value(sb->row_scores + total, padded - total, -INFINITY);
+      }
+      filled = select_loaded(sb,
+                             sb->row_scores,
+                             padded,
+                             row_count - nonfinite,
+                             ids,
+                             0.0f,
+                             false,
+                             SelectTuning(),
+                             nullptr,
+                             /*bounded=*/true);
+    }
+    ids_to_int64(sb, filled, count);
+    __sync_compute();
+    __memcpy(output + static_cast<int64_t>(row) * count,
+             sb->picked_ids,
+             count * sizeof(int64_t),
+             NRAM2GDRAM);
+  }
+}
+
+// Few long rows: cluster c selects rows c, c + clusterDim, ...; its four
+// cores split the row's live prefix evenly, publish their local top
+// min(count, part) (values, IDs) to SRAM slots, and core 0 selects the row
+// from the slots. Parts longer than one segment stream in segments and keep
+// their running top `count` as candidates.
+constexpr int32_t kCoopCores = 4;
+constexpr int32_t kCoopCand = 2048;  // published candidates per core
+
+__mlu_func__ int32_t local_top(SelectBuffers* sb,
+                               const float* scores,
+                               int32_t begin,
+                               int32_t used,
+                               int32_t count,
+                               int32_t* nonfinite_out,
+                               SelectTuning* tuning) {
+  // Running candidates (values, IDs) live in the upper half of row_scores.
+  float* run_values = sb->row_scores + kPartSeg;
+  float* run_ids = run_values + 2 * kMaxCount;
+  int32_t run = 0;
+  int32_t nonfinite = 0;
+  for (int32_t offset = 0; offset < used; offset += kPartSeg) {
+    int32_t length = used - offset < kPartSeg ? used - offset : kPartSeg;
+    __memcpy(sb->row_scores,
+             scores + begin + offset,
+             length * sizeof(float),
+             GDRAM2NRAM);
+    int32_t padded = (length + 63) / 64 * 64;
+    if (padded > length) {
+      __bang_write_value(sb->row_scores + length, padded - length, -INFINITY);
+    }
+    int32_t wanted = count < length ? count : length;
+    float threshold[2] = {tuning->hint, tuning->bound_hint};
+    int32_t chunk_nonfinite = 0;
+    int32_t filled = select_row<true>(sb,
+                                      sb->row_scores,
+                                      length,
+                                      padded,
+                                      wanted,
+                                      /*subtract=*/false,
+                                      nullptr,
+                                      static_cast<float>(begin + offset),
+                                      true,
+                                      &chunk_nonfinite,
+                                      *tuning,
+                                      threshold);
+    nonfinite += chunk_nonfinite;
+    tuning->hint = threshold[0];
+    tuning->bound_hint = threshold[1];
+    if (filled == 0) {  // zero-size copies fault
+      continue;
+    }
+    __memcpy(
+        run_values + run, sb->picked_values, filled * sizeof(float), NRAM2NRAM);
+    __memcpy(run_ids + run, sb->picked, filled * sizeof(float), NRAM2NRAM);
+    run += filled;
+    if (run > count) {  // keep the running top `count`
+      int32_t padded_run = (run + 63) / 64 * 64;
+      if (padded_run > run) {
+        __bang_write_value(run_values + run, padded_run - run, -INFINITY);
+      }
+      run = select_loaded(sb,
+                          run_values,
+                          padded_run,
+                          count,
+                          run_ids,
+                          /*id_base=*/0.0f,
+                          /*values=*/true);
+      if (run > 0) {
+        __memcpy(run_values, sb->picked_values, run * sizeof(float), NRAM2NRAM);
+        __memcpy(run_ids, sb->picked, run * sizeof(float), NRAM2NRAM);
+      }
+    }
+  }
+  if (used > kPartSeg && run > 0) {
+    __memcpy(sb->picked_values, run_values, run * sizeof(float), NRAM2NRAM);
+    __memcpy(sb->picked, run_ids, run * sizeof(float), NRAM2NRAM);
+  }
+  *nonfinite_out = nonfinite;
+  return run;
+}
+
+// Cluster SRAM slots of the cooperative selection: phase 1 group maxima,
+// phase 2 candidates (values, IDs), and per core 4 int32 meta (maxima,
+// exact flag, candidates, nonfinite count).
+struct CoopSlots {
+  float maxima[kCoopCores][kMaxCount];
+  float values[kCoopCores][kCoopCand];
+  float ids[kCoopCores][kCoopCand];
+  int32_t meta[kCoopCores][4];
+};
+
+// One row selected by the four cores of a cluster (three cluster barriers):
+// the cores split the live prefix evenly, bound the row's row_count-th
+// largest entry by that of all their group maxima, and core 0 selects from
+// the entries above the bound (a core's exact local top `count` instead when
+// it has too many, holds NaN/+inf or is not resident).
+__mlu_func__ void coop_row(SelectBuffers* sb,
+                           CoopSlots* slots,
+                           int32_t* meta,
+                           const float* row_scores,
+                           int64_t* row_output,
+                           int32_t live,
+                           int32_t count,
+                           int32_t row_count,
+                           SelectTuning* tuning) {
+  // Maxima per core: the row holds about 2 * row_count of them.
+  const int32_t nb = (2 * row_count / kCoopCores + 63) / 64 * 64;
+  // Even 64-aligned split of the live prefix.
+  int32_t part = ((live + kCoopCores - 1) / kCoopCores + 63) / 64 * 64;
+  int32_t begin = coreId * part;
+  int32_t used = live - begin < part ? live - begin : part;
+  used = used > 0 ? used : 0;
+  // Resident parts (whole groups fit the row buffer) publish group maxima;
+  // longer ones select exactly.
+  int32_t padded = (used + 63) / 64 * 64;
+  bool resident = (padded + nb - 1) / nb * nb <= kMaxPools;
+  meta[0] = 0;  // maxima published
+  meta[1] = 0;  // NaN/+inf or non-resident: exact mode
+  if (used > 0 && resident) {
+    __memcpy(
+        sb->row_scores, row_scores + begin, used * sizeof(float), GDRAM2NRAM);
+    if (padded > used) {
+      __bang_write_value(sb->row_scores + used, padded - used, -INFINITY);
+    }
+    meta[1] = group_maxima(sb, sb->row_scores, padded, nb) ? 0 : 1;
+    meta[0] = nb;
+    __memcpy(
+        slots->maxima[coreId], sb->cand_values, nb * sizeof(float), NRAM2SRAM);
+  } else if (used > 0) {
+    meta[1] = 1;
+  }
+  __memcpy(slots->meta[coreId], meta, 2 * sizeof(int32_t), NRAM2SRAM);
+  __sync_cluster();
+  __memcpy(meta, slots->meta, 4 * kCoopCores * sizeof(int32_t), SRAM2NRAM);
+  bool exact = false;
+  for (int32_t core = 0; core < kCoopCores; ++core) {
+    exact |= meta[4 * core + 1] != 0;
+  }
+  int32_t published = 0;
+  int32_t nonfinite = 0;
+  if (used > 0 && !exact) {
+    // Bound the row's row_count-th largest by that of all its maxima.
+    float* all_maxima = sb->cand_values;
+    int32_t gathered = 0;
+    for (int32_t core = 0; core < kCoopCores; ++core) {
+      if (meta[4 * core] > 0) {
+        __memcpy_async(all_maxima + gathered,
+                       slots->maxima[core],
+                       meta[4 * core] * sizeof(float),
+                       SRAM2NRAM);
+        gathered += meta[4 * core];
+      }
+    }
+    // SRAM transfers complete on the move queue.
+    __sync_io_move_compute();
+    float bound = -kMaxFinite;
+    float range[2];
+    bool all_finite = finite_span(sb, all_maxima, gathered, gathered, range);
+    uint32_t finite_maxima =
+        all_finite ? gathered : count_ge(sb, all_maxima, gathered, -kMaxFinite);
+    if (static_cast<int32_t>(finite_maxima) > row_count) {
+      uint32_t bound_count = 0;
+      bound = find_threshold_lean(
+          sb,
+          all_maxima,
+          gathered,
+          row_count,
+          finite_maxima,
+          all_finite ? range : nullptr,
+          all_finite ? moment_probe(sb, all_maxima, gathered, row_count) : NAN,
+          &bound_count,
+          row_count / 4);
+    }
+    for (int32_t offset = 0; offset < padded; offset += kChunk) {
+      int32_t length = padded - offset < kChunk ? padded - offset : kChunk;
+      __bang_ge_scalar(sb->compare, sb->row_scores + offset, bound, length);
+      int32_t n = static_cast<int32_t>(__bang_filter(
+          sb->picked, sb->row_scores + offset, sb->compare, length));
+      if (published + n > kCoopCand) {
+        exact = true;
+        break;
+      }
+      if (n == 0) {
+        continue;
+      }
+      __bang_filter(sb->picked_values, sb->iota, sb->compare, length);
+      __bang_add_scalar(sb->picked_values,
+                        sb->picked_values,
+                        static_cast<float>(begin + offset),
+                        (n + 63) / 64 * 64);
+      __memcpy(sb->cand_values + published,
+               sb->picked,
+               n * sizeof(float),
+               NRAM2NRAM);
+      __memcpy(sb->cand_ids + published,
+               sb->picked_values,
+               n * sizeof(float),
+               NRAM2NRAM);
+      published += n;
+    }
+    if (!exact && published > 0) {
+      __memcpy(slots->values[coreId],
+               sb->cand_values,
+               published * sizeof(float),
+               NRAM2SRAM);
+      __memcpy(slots->ids[coreId],
+               sb->cand_ids,
+               published * sizeof(float),
+               NRAM2SRAM);
+    }
+  }
+  if (used > 0 && exact) {
+    // Exact local top min(count, used): its row's top entries are in it.
+    if (resident) {
+      int32_t wanted = count < used ? count : used;
+      published = select_row(sb,
+                             sb->row_scores,
+                             used,
+                             padded,
+                             wanted,
+                             /*subtract=*/false,
+                             nullptr,
+                             static_cast<float>(begin),
+                             true,
+                             &nonfinite);
+    } else {
+      published =
+          local_top(sb, row_scores, begin, used, count, &nonfinite, tuning);
+    }
+    if (published > 0) {
+      __memcpy(slots->values[coreId],
+               sb->picked_values,
+               published * sizeof(float),
+               NRAM2SRAM);
+      __memcpy(
+          slots->ids[coreId], sb->picked, published * sizeof(float), NRAM2SRAM);
+    }
+  }
+  meta[2] = published;
+  meta[3] = nonfinite;
+  __memcpy(&slots->meta[coreId][2], meta + 2, 2 * sizeof(int32_t), NRAM2SRAM);
+  __sync_cluster();
+  if (coreId == 0) {
+    __memcpy(meta, slots->meta, 4 * kCoopCores * sizeof(int32_t), SRAM2NRAM);
+    float* ids = sb->row_scores + kPartSeg;
+    int32_t total = 0;
+    int32_t row_nonfinite = 0;
+    for (int32_t core = 0; core < kCoopCores; ++core) {
+      int32_t n = meta[4 * core + 2];
+      row_nonfinite += meta[4 * core + 3];
+      if (n > 0) {
+        __memcpy_async(sb->row_scores + total,
+                       slots->values[core],
+                       n * sizeof(float),
+                       SRAM2NRAM);
+        __memcpy_async(
+            ids + total, slots->ids[core], n * sizeof(float), SRAM2NRAM);
+        total += n;
+      }
+    }
+    __sync_io_move_compute();
+    int32_t selected = 0;
+    if (total > 0) {
+      int32_t total_padded = (total + 63) / 64 * 64;
+      if (total_padded > total) {
+        __bang_write_value(
+            sb->row_scores + total, total_padded - total, -INFINITY);
+      }
+      int32_t wanted = row_count - row_nonfinite;
+      float range[2];
+      if (total <= wanted) {
+        selected = append_ids<false>(sb,
+                                     sb->row_scores,
+                                     total_padded,
+                                     -INFINITY,
+                                     0,
+                                     wanted,
+                                     ids,
+                                     0.0f,
+                                     false);
+      } else if (finite_span(sb, sb->row_scores, total, total_padded, range)) {
+        // Candidates are finite: their span brackets the search.
+        uint32_t low_count = 0;
+        float threshold = find_threshold_lean(sb,
+                                              sb->row_scores,
+                                              total_padded,
+                                              wanted,
+                                              total,
+                                              range,
+                                              tuning->hint,
+                                              &low_count);
+        tuning->hint = threshold;
+        selected = append_selected(sb,
+                                   sb->row_scores,
+                                   total_padded,
+                                   threshold,
+                                   low_count,
+                                   wanted,
+                                   ids,
+                                   0.0f,
+                                   false);
+      } else {
+        selected = select_loaded(sb,
+                                 sb->row_scores,
+                                 total_padded,
+                                 wanted,
+                                 ids,
+                                 0.0f,
+                                 false,
+                                 SelectTuning(),
+                                 nullptr,
+                                 /*bounded=*/true);
+      }
+    }
+    ids_to_int64(sb, selected, count);
+    __sync_compute();
+    __memcpy(row_output, sb->picked_ids, count * sizeof(int64_t), NRAM2GDRAM);
+  }
+  // Slots are reused by the next row.
+  __sync_cluster();
+}
+
+// Short rows (see kpool_select_topk_short): the parts kernel's
+// one-part path without the bounded and merge code, keeping the hot code
+// small. Row r goes to task r % taskDim.
+__mlu_global__ void select_short_kernel(const float* scores,
+                                        const int32_t* positions,
+                                        int64_t* output,
+                                        int32_t rows,
+                                        int32_t pools,
+                                        int32_t stride,
+                                        int32_t count,
+                                        int32_t bound_min) {
+  __nram__ __attribute__((aligned(128))) uint8_t storage[sizeof(SelectBuffers)];
+  __nram__ int32_t live[kPartRows];
+  SelectBuffers* sb = reinterpret_cast<SelectBuffers*>(storage);
+  const int32_t mine =
+      taskId < rows ? (rows - taskId + taskDim - 1) / taskDim : 0;
+  if (__is_mpu() || mine == 0) {
+    return;
+  }
+  // The first row's first kSpeculate scores load while the positions are
+  // read; the rest of a longer live prefix follows once it is known.
+  const int32_t speculated = pools < kSpeculate ? pools : kSpeculate;
+  __memcpy_async(sb->row_scores,
+                 scores + static_cast<int64_t>(taskId) * stride,
+                 speculated * sizeof(float),
+                 GDRAM2NRAM);
+  const int32_t padded_max = (pools + 63) / 64 * 64;
+  init_iota(sb, padded_max);
+  const int32_t row_count = count < pools ? count : pools;
+  SelectTuning tuning;
+  for (int32_t block = 0; block < mine; block += kPartRows) {
+    int32_t n = mine - block < kPartRows ? mine - block : kPartRows;
+    if (positions == nullptr) {  // every pool live
+      __bang_write_value(live, (n + 63) / 64 * 64, pools);
+    } else {
+      __memcpy(live,
+               positions + taskId + static_cast<int64_t>(block) * taskDim,
+               sizeof(int32_t),
+               GDRAM2NRAM,
+               sizeof(int32_t),
+               taskDim * sizeof(int32_t),
+               n - 1);
+      for (int32_t i = 0; i < n; ++i) {
+        live[i] = live_pools(live[i], pools);
+      }
+    }
+    auto load = [&](int32_t i) {
+      if (live[i] > 0) {
+        __memcpy_async(
+            sb->row_scores + (i & 1) * kPartSeg,
+            scores +
+                (taskId + static_cast<int64_t>(block + i) * taskDim) * stride,
+            live[i] * sizeof(float),
+            GDRAM2NRAM);
+      }
+    };
+    if (block > 0) {
+      load(0);
+    } else if (live[0] > speculated) {
+      __memcpy_async(
+          sb->row_scores + speculated,
+          scores + static_cast<int64_t>(taskId) * stride + speculated,
+          (live[0] - speculated) * sizeof(float),
+          GDRAM2NRAM);
+    }
+    for (int32_t i = 0; i < n; ++i) {
+      int64_t row = taskId + static_cast<int64_t>(block + i) * taskDim;
+      float* values = sb->row_scores + (i & 1) * kPartSeg;
+      int32_t used = live[i];
+      __sync_io();
+      if (i + 1 < n) {
+        load(i + 1);
+      }
+      int32_t filled = 0;
+      if (used > 0) {
+        int32_t padded = (used + 63) / 64 * 64;
+        if (padded > used) {
+          __bang_write_value(values + used, padded - used, -INFINITY);
+        }
+        int32_t nonfinite = 0;
+        float threshold[2] = {tuning.hint, tuning.bound_hint};
+        filled = select_row<true>(sb,
+                                  values,
+                                  used,
+                                  padded,
+                                  row_count,
+                                  /*subtract=*/true,
+                                  /*ids=*/nullptr,
+                                  /*id_base=*/0.0f,
+                                  /*values=*/false,
+                                  &nonfinite,
+                                  tuning,
+                                  threshold,
+                                  bound_min);
+        tuning.hint = threshold[0];
+        tuning.bound_hint = threshold[1];
+      }
+      ids_to_int64(sb, filled, count);
+      __sync_compute();
+      __memcpy_async(output + row * count,
+                     sb->picked_ids,
+                     count * sizeof(int64_t),
+                     NRAM2GDRAM);
+    }
+    __sync_io();
+  }
+}
+
+// Exact top `wanted` of a long row on one core, streamed in double buffered
+// kStreamChunk chunks: the first chunk's top `wanted` start the running
+// candidates; later entries above the running threshold (the wanted-th
+// largest so far) join them, cut back to the top `wanted` at 4 * wanted
+// (at most 4 * kMaxCount + kChunk <= kStreamChunk candidates). IDs land in
+// sb->picked; returns their count, or -1 when a chunk holds NaN/+inf (the
+// caller then selects with full NaN/+inf handling).
+constexpr int32_t kStreamChunk = kPartSeg / 2;
+
+__mlu_func__ int32_t stream_select(SelectBuffers* sb,
+                                   const float* row_scores,
+                                   int32_t used,
+                                   int32_t wanted) {
+  float* run_values = sb->row_scores + kPartSeg;
+  float* run_ids = run_values + kStreamChunk;
+  int32_t run = 0;
+  float threshold = -INFINITY;
+  auto cut = [&](bool keep_values) {
+    int32_t run_padded = (run + 63) / 64 * 64;
+    if (run_padded > run) {
+      __bang_write_value(run_values + run, run_padded - run, -INFINITY);
+    }
+    run = select_loaded(sb,
+                        run_values,
+                        run_padded,
+                        wanted,
+                        run_ids,
+                        /*id_base=*/0.0f,
+                        keep_values);
+  };
+  auto load = [&](int32_t offset) {
+    int32_t length =
+        used - offset < kStreamChunk ? used - offset : kStreamChunk;
+    __memcpy_async(sb->row_scores + (offset / kStreamChunk & 1) * kStreamChunk,
+                   row_scores + offset,
+                   length * sizeof(float),
+                   GDRAM2NRAM);
+  };
+  load(0);
+  for (int32_t offset = 0; offset < used; offset += kStreamChunk) {
+    int32_t length =
+        used - offset < kStreamChunk ? used - offset : kStreamChunk;
+    float* chunk = sb->row_scores + (offset / kStreamChunk & 1) * kStreamChunk;
+    __sync_io();
+    if (offset + kStreamChunk < used) {
+      load(offset + kStreamChunk);
+    }
+    int32_t padded = (length + 63) / 64 * 64;
+    if (padded > length) {
+      __bang_write_value(chunk + length, padded - length, -INFINITY);
+    }
+    // NaN-propagating maxima of 64 groups flag NaN/+inf entries.
+    int32_t height = padded / 64;
+    __bang_nan_maxpool(sb->compare + 64,
+                       chunk,
+                       64,
+                       height,
+                       1,
+                       height,
+                       1,
+                       1,
+                       height,
+                       1,
+                       1,
+                       1,
+                       1);
+    __bang_lt_scalar(sb->compare, sb->compare + 64, INFINITY, 64);
+    if (__bang_count(sb->compare, 64) != 64) {
+      __sync_io();
+      return -1;
+    }
+    if (offset == 0) {
+      // The first chunk's top `wanted` (bounded) sets the threshold.
+      run = select_loaded(sb,
+                          chunk,
+                          padded,
+                          wanted,
+                          /*ids=*/nullptr,
+                          /*id_base=*/0.0f,
+                          /*values=*/true,
+                          /*tuning=*/SelectTuning(),
+                          /*threshold_out=*/nullptr,
+                          /*bounded=*/true);
+      if (run > 0) {
+        __memcpy(run_values, sb->picked_values, run * sizeof(float), NRAM2NRAM);
+        __memcpy(run_ids, sb->picked, run * sizeof(float), NRAM2NRAM);
+        __bang_argmin(sb->upper, run_values, run);
+        __sync_compute();
+        threshold = sb->upper[0];
+      }
+      continue;
+    }
+    for (int32_t begin = 0; begin < padded; begin += kChunk) {
+      int32_t block = padded - begin < kChunk ? padded - begin : kChunk;
+      __bang_gt_scalar(sb->compare, chunk + begin, threshold, block);
+      int32_t n = static_cast<int32_t>(
+          __bang_filter(sb->picked, chunk + begin, sb->compare, block));
+      if (n == 0) {
+        continue;
+      }
+      __bang_filter(sb->picked_values, sb->iota, sb->compare, block);
+      __bang_add_scalar(sb->picked_values,
+                        sb->picked_values,
+                        static_cast<float>(offset + begin),
+                        (n + 63) / 64 * 64);
+      __memcpy(run_values + run, sb->picked, n * sizeof(float), NRAM2NRAM);
+      __memcpy(run_ids + run, sb->picked_values, n * sizeof(float), NRAM2NRAM);
+      run += n;
+      if (run >= 4 * wanted) {
+        cut(true);
+        __memcpy(run_values, sb->picked_values, run * sizeof(float), NRAM2NRAM);
+        __memcpy(run_ids, sb->picked, run * sizeof(float), NRAM2NRAM);
+        __bang_argmin(sb->upper, run_values, run);
+        __sync_compute();
+        threshold = sb->upper[0];
+      }
+    }
+  }
+  if (run > wanted) {
+    cut(false);
+  } else if (run > 0) {
+    __memcpy(sb->picked, run_ids, run * sizeof(float), NRAM2NRAM);
+  }
+  return run;
+}
+
+// Rows per core, exact: resident rows (<= kPartSeg live pools) double
+// buffered, longer rows streamed (running top `count`, then the row).
+// order[0, n) lists the rows (all of this core's).
+__mlu_func__ void core_rows(SelectBuffers* sb,
+                            const float* scores,
+                            int64_t* output,
+                            const int32_t* live,
+                            const int32_t* order,
+                            int32_t n,
+                            int32_t stride,
+                            int32_t count,
+                            int32_t row_count,
+                            SelectTuning* tuning) {
+  auto load = [&](int32_t i) {
+    int32_t row = order[i];
+    if (live[row] > 0 && live[row] <= kPartSeg) {
+      __memcpy_async(sb->row_scores + (i & 1) * kPartSeg,
+                     scores + static_cast<int64_t>(row) * stride,
+                     live[row] * sizeof(float),
+                     GDRAM2NRAM);
+    }
+  };
+  if (n > 0) {
+    load(0);
+  }
+  for (int32_t i = 0; i < n; ++i) {
+    int32_t row = order[i];
+    int32_t used = live[row];
+    float* values = sb->row_scores + (i & 1) * kPartSeg;
+    // This load and the previous row's store complete.
+    __sync_io();
+    bool streamed = used > kPartSeg;
+    if (!streamed && i + 1 < n) {
+      load(i + 1);
+    }
+    int32_t filled = 0;
+    int32_t nonfinite = 0;
+    if (streamed) {
+      filled = stream_select(
+          sb, scores + static_cast<int64_t>(row) * stride, used, row_count);
+    }
+    if (streamed && filled < 0) {
+      filled = 0;
+      int32_t run = local_top(sb,
+                              scores + static_cast<int64_t>(row) * stride,
+                              0,
+                              used,
+                              count,
+                              &nonfinite,
+                              tuning);
+      int32_t wanted = row_count - nonfinite;
+      if (run > 0 && wanted > 0) {
+        __memcpy(
+            sb->cand_values, sb->picked_values, run * sizeof(float), NRAM2NRAM);
+        __memcpy(sb->cand_ids, sb->picked, run * sizeof(float), NRAM2NRAM);
+        int32_t run_padded = (run + 63) / 64 * 64;
+        if (run_padded > run) {
+          __bang_write_value(
+              sb->cand_values + run, run_padded - run, -INFINITY);
+        }
+        filled = select_loaded(
+            sb, sb->cand_values, run_padded, wanted, sb->cand_ids, 0.0f, false);
+      }
+    } else if (!streamed && used > 0) {
+      int32_t padded = (used + 63) / 64 * 64;
+      if (padded > used) {
+        __bang_write_value(values + used, padded - used, -INFINITY);
+      }
+      float threshold[2] = {tuning->hint, tuning->bound_hint};
+      filled = select_row<true>(sb,
+                                values,
+                                used,
+                                padded,
+                                row_count,
+                                /*subtract=*/true,
+                                /*ids=*/nullptr,
+                                /*id_base=*/0.0f,
+                                /*values=*/false,
+                                &nonfinite,
+                                *tuning,
+                                threshold);
+      tuning->hint = threshold[0];
+      tuning->bound_hint = threshold[1];
+    }
+    ids_to_int64(sb, filled, count);
+    __sync_compute();
+    __memcpy_async(output + static_cast<int64_t>(row) * count,
+                   sb->picked_ids,
+                   count * sizeof(int64_t),
+                   NRAM2GDRAM);
+    if (streamed && i + 1 < n) {
+      __sync_io();
+      load(i + 1);
+    }
+  }
+  __sync_io();
+}
+
+// Mixed rows in one launch (Union1 over all clusters): long rows (live >
+// long_pools, up to one per cluster; else live > kPartSeg, up to two per
+// cluster) are selected cooperatively by clusters, the other rows by single
+// cores, first on clusters without a long row. More long rows: every row on
+// a single core.
+constexpr int32_t kHybridRows = 2048;
+
+__mlu_global__ void select_hybrid_kernel(const float* scores,
+                                         const int32_t* positions,
+                                         int64_t* output,
+                                         int32_t rows,
+                                         int32_t pools,
+                                         int32_t stride,
+                                         int32_t count,
+                                         int32_t long_pools) {
+  __nram__ __attribute__((aligned(128))) uint8_t storage[sizeof(SelectBuffers)];
+  __mlu_shared__ CoopSlots slots;
+  __mlu_shared__ int32_t cluster_long[16];
+  __nram__ int32_t meta[4 * kCoopCores];
+  __nram__ int32_t live[kHybridRows];
+  __nram__ int32_t order[kHybridRows];
+  __nram__ int32_t long_rows[2];
+  if (__is_mpu()) {
+    // The memory core joins the barriers of its cluster's long rows.
+    __sync_cluster();
+    int32_t n = cluster_long[0];
+    for (int32_t i = 0; i < 3 * n; ++i) {
+      __sync_cluster();
+    }
+    return;
+  }
+  SelectBuffers* sb = reinterpret_cast<SelectBuffers*>(storage);
+  // Live pools of every row, vectorized (scalar loops cost ~50 ns a row):
+  // clamp(floor((position + 1) / 4), 0, pools); padding rows read -1.
+  const int32_t padded_rows = (rows + 63) / 64 * 64;
+  float* live_f = sb->upper;
+  float* listed = sb->upper + kHybridRows;
+  init_iota(sb, kChunk);
+  if (positions == nullptr) {  // every pool live
+    __bang_write_value(live_f, padded_rows, 0.0f);
+    __bang_write_value(live_f, rows, static_cast<float>(pools));
+  } else {
+    __memcpy(live, positions, rows * sizeof(int32_t), GDRAM2NRAM);
+    if (padded_rows > rows) {
+      __bang_write_value(live + rows, padded_rows - rows, -1);
+    }
+    __bang_int322float(live_f, live, padded_rows, 0);
+    __bang_add_scalar(live_f, live_f, 1.0f, padded_rows);
+    __bang_mul_scalar(live_f, live_f, 0.25f, padded_rows);
+    __bang_float2int32(live, live_f, padded_rows, 0);
+    __bang_int322float(live_f, live, padded_rows, 0);
+    __bang_maxeq_scalar(live_f, live_f, 0.0f, padded_rows);
+    __bang_mineq_scalar(live_f, live_f, static_cast<float>(pools), padded_rows);
+  }
+  __bang_float2int32(live, live_f, padded_rows, 0);
+  // Long rows: up to one per cluster above long_pools; else up to two per
+  // cluster above a resident segment (single cores would have to stream).
+  float long_live = static_cast<float>(long_pools);
+  __bang_gt_scalar(sb->compare, live_f, long_live, padded_rows);
+  int32_t n_long = static_cast<int32_t>(__bang_count(sb->compare, padded_rows));
+  if (n_long > taskDimY) {
+    long_live = static_cast<float>(kPartSeg);
+    __bang_gt_scalar(sb->compare, live_f, long_live, padded_rows);
+    n_long = static_cast<int32_t>(__bang_count(sb->compare, padded_rows));
+  }
+  const bool coop = n_long > 0 && n_long <= 2 * taskDimY;
+  // This cluster's long rows: long rows c, c + taskDimY, ...
+  int32_t mine_long = coop ? (n_long - taskIdY + taskDimY - 1) / taskDimY : 0;
+  mine_long = mine_long > 0 ? mine_long : 0;
+  if (coreId == 0) {
+    meta[0] = mine_long;
+    __memcpy(cluster_long, meta, sizeof(int32_t), NRAM2SRAM);
+  }
+  __sync_cluster();
+  const int32_t row_count = count < pools ? count : pools;
+  // Both row lists are built before coop_row reuses sb->upper and compare.
+  // This cluster's long rows: long rows c, c + taskDimY, ...
+  if (coop) {
+    __bang_filter(listed, sb->iota, sb->compare, padded_rows);
+    for (int32_t j = taskIdY; j < n_long; j += taskDimY) {
+      long_rows[j / taskDimY] = static_cast<int32_t>(listed[j]);
+    }
+    __bang_le_scalar(sb->compare, live_f, long_live, padded_rows);
+    __bang_filter(listed, sb->iota, sb->compare, padded_rows);
+  }
+  // Single-core rows go round-robin, starting on the first cluster without
+  // a long row.
+  const int32_t singles = coop ? rows - n_long : rows;
+  const int32_t cores = taskDim;
+  int32_t first = coop && n_long < taskDimY ? n_long * kCoopCores : 0;
+  int32_t slot = (taskId - first + cores) % cores;
+  int32_t n = 0;
+  for (int32_t index = slot; index < singles; index += cores) {
+    order[n++] = coop ? static_cast<int32_t>(listed[index]) : index;
+  }
+  SelectTuning tuning;
+  for (int32_t i = 0; i < mine_long; ++i) {
+    int32_t row = long_rows[i];
+    coop_row(sb,
+             &slots,
+             meta,
+             scores + static_cast<int64_t>(row) * stride,
+             output + static_cast<int64_t>(row) * count,
+             live[row],
+             count,
+             row_count,
+             &tuning);
+  }
+  core_rows(
+      sb, scores, output, live, order, n, stride, count, row_count, &tuning);
+}
+}  // namespace
+
+// Parts per row and segment length for select_parts_kernel; 0 parts when
+// unsupported. Workspace: 2 * rows * parts * count floats + 2 * rows * parts
+// int32 (none for one part).
+extern "C" int32_t kpool_select_parts(int32_t rows,
+                                      int32_t pools,
+                                      int32_t count,
+                                      int32_t* seg) {
+  if (rows <= 0 || pools <= 0 || count <= 0 || count > kMaxCount) {
+    return 0;
+  }
+  // One resident segment of up to kMaxPools; split rows use double
+  // buffered kPartSeg segments.
+  int32_t parts = pools <= kMaxPools ? 1 : (pools + kPartSeg - 1) / kPartSeg;
+  if (parts > 1 && (rows > kPartRows || parts * count > kPartSeg)) {
+    return 0;
+  }
+  *seg = ((pools + parts - 1) / parts + 63) / 64 * 64;
+  return parts;
+}
+
+extern "C" bool kpool_select_topk_parts(void* queue,
+                                        const void* scores,
+                                        const void* positions,
+                                        void* output,
+                                        void* workspace,
+                                        int32_t rows,
+                                        int32_t pools,
+                                        int32_t stride,
+                                        int32_t count,
+                                        int32_t parts,
+                                        int32_t seg) {
+  // One part per row needs no grid barrier.
+  cnrtDim3_t dim = {32, 1, 1};
+  cnrtFunctionType_t type = cnrtFuncTypeUnion8;
+  if (parts == 1) {
+    // Whole clusters for the rows only (Union1 jitters less than blocks).
+    int32_t clusters = (rows + 3) / 4;
+    dim = {4, static_cast<uint32_t>(clusters < 8 ? clusters : 8), 1};
+    type = cnrtFuncTypeUnion1;
+  }
+  select_parts_kernel<<<dim, type, static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const float*>(scores),
+      static_cast<const int32_t*>(positions),
+      static_cast<int64_t*>(output),
+      static_cast<float*>(workspace),
+      rows,
+      pools,
+      stride,
+      count,
+      parts,
+      seg);
+  return true;
+}
+
+extern "C" bool kpool_select_topk_short(void* queue,
+                                        const void* scores,
+                                        const void* positions,
+                                        void* output,
+                                        int32_t rows,
+                                        int32_t pools,
+                                        int32_t stride,
+                                        int32_t count) {
+  // Rows below kShortPools pools; the bounded path starts at 2 * kBoundMin
+  // with one row per core (no previous row warm-starts it), else at
+  // kBoundMin.
+  if (rows <= 0 || pools <= 0 || pools >= kShortPools || count <= 0 ||
+      count > kMaxCount) {
+    return false;
+  }
+  const int32_t bound_min = rows <= 32 ? 2 * kBoundMin : kBoundMin;
+  // Whole clusters (Union1) launch with less jitter than block tasks.
+  int32_t clusters = (rows + 3) / 4;
+  cnrtDim3_t dim = {4, static_cast<uint32_t>(clusters < 8 ? clusters : 8), 1};
+  select_short_kernel<<<dim,
+                        cnrtFuncTypeUnion1,
+                        static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const float*>(scores),
+      static_cast<const int32_t*>(positions),
+      static_cast<int64_t*>(output),
+      rows,
+      pools,
+      stride,
+      count,
+      bound_min);
+  return true;
+}
+
+extern "C" bool kpool_select_topk_hybrid(void* queue,
+                                         const void* scores,
+                                         const void* positions,
+                                         void* output,
+                                         int32_t rows,
+                                         int32_t pools,
+                                         int32_t stride,
+                                         int32_t count,
+                                         int32_t long_pools) {
+  if (rows <= 0 || rows > kHybridRows || pools <= 0 || count <= 0 ||
+      count > kMaxCount) {
+    return false;
+  }
+  cnrtDim3_t dim = {kCoopCores, 8, 1};
+  select_hybrid_kernel<<<dim,
+                         cnrtFuncTypeUnion1,
+                         static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const float*>(scores),
+      static_cast<const int32_t*>(positions),
+      static_cast<int64_t*>(output),
+      rows,
+      pools,
+      stride,
+      count,
+      long_pools);
+  return true;
+}

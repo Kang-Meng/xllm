@@ -1,0 +1,154 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// KPool cache positions in one launch:
+//   active = tail_ids[rows] > 0 && (slot_mapping undefined || slot_mapping > 0)
+//   cache_positions = active ? positions : -1
+// Rows outside [0, states) are inactive. int64 values are compared through
+// both stored words.
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/kpool/launchers.h"
+
+namespace {
+constexpr int32_t kBlock = 1024;
+
+struct Buffers {
+  int64_t rows[kBlock];
+  int64_t ids[kBlock];
+  int64_t slots[kBlock];
+  int32_t split[2 * kBlock];
+  int32_t low[kBlock], active[kBlock], scratch[kBlock], positions[kBlock];
+  uint32_t offsets[kBlock];
+};
+
+// active &= value > 0, for n int32 or int64 values at `values`.
+__mlu_func__ void and_positive(Buffers* b,
+                               const void* values,
+                               int32_t bits,
+                               int32_t n) {
+  if (bits == 32) {
+    __bang_gt_scalar(b->scratch, static_cast<const int32_t*>(values), 0, n);
+    __bang_band(b->active, b->active, b->scratch, n);
+    return;
+  }
+  // int64 > 0  <=>  high > 0 || (high == 0 && low != 0)
+  __bang_transpose(b->split, static_cast<const int32_t*>(values), n, 2);
+  int32_t* low = b->split;
+  int32_t* high = b->split + n;
+  __bang_ne_scalar(b->scratch, low, 0, n);
+  __bang_eq_scalar(b->low, high, 0, n);
+  __bang_band(b->scratch, b->scratch, b->low, n);
+  __bang_gt_scalar(b->low, high, 0, n);
+  __bang_bor(b->scratch, b->scratch, b->low, n);
+  __bang_band(b->active, b->active, b->scratch, n);
+}
+
+__mlu_global__ void cache_positions_kernel(const int64_t* rows,
+                                           const void* tail_ids,
+                                           int32_t tail_bits,
+                                           int32_t states,
+                                           const int32_t* positions,
+                                           const void* slot_mapping,
+                                           int32_t slot_bits,
+                                           int32_t* output,
+                                           int32_t tokens) {
+  __nram__ __attribute__((aligned(128))) uint8_t storage[sizeof(Buffers)];
+  if (__is_mpu()) {
+    return;
+  }
+  Buffers* b = reinterpret_cast<Buffers*>(storage);
+  int32_t per = tokens / taskDim;
+  int32_t rest = tokens % taskDim;
+  int32_t begin = taskId * per + (taskId < rest ? taskId : rest);
+  int32_t end = begin + per + (taskId < rest ? 1 : 0);
+  int32_t tail_bytes = tail_bits / 8;
+  int32_t slot_bytes = slot_bits / 8;
+  for (int32_t base = begin; base < end; base += kBlock) {
+    int32_t n = end - base < kBlock ? end - base : kBlock;
+    __memcpy_async(b->rows, rows + base, n * 8, GDRAM2NRAM);
+    __memcpy_async(b->positions, positions + base, n * 4, GDRAM2NRAM);
+    if (slot_mapping != nullptr) {
+      __memcpy_async(b->slots,
+                     static_cast<const int8_t*>(slot_mapping) +
+                         static_cast<int64_t>(base) * slot_bytes,
+                     n * slot_bytes,
+                     GDRAM2NRAM);
+    }
+    __sync_io();
+    // Row validity: high word 0 and 0 <= low < states.
+    __bang_transpose(b->split, reinterpret_cast<const int32_t*>(b->rows), n, 2);
+    __bang_eq_scalar(b->active, b->split + n, 0, n);
+    __bang_ge_scalar(b->scratch, b->split, 0, n);
+    __bang_band(b->active, b->active, b->scratch, n);
+    __bang_lt_scalar(b->scratch, b->split, states, n);
+    __bang_band(b->active, b->active, b->scratch, n);
+    // Byte offsets of tail_ids[row]; invalid rows read element 0.
+    __bang_mul_scalar(b->scratch, b->active, -1, n);
+    __bang_band(b->offsets,
+                reinterpret_cast<uint32_t*>(b->split),
+                reinterpret_cast<uint32_t*>(b->scratch),
+                n);
+    __bang_mul_scalar(
+        b->offsets, b->offsets, static_cast<uint32_t>(tail_bytes), n);
+    __sync_compute();
+    __gather(
+        b->ids, tail_ids, b->offsets, tail_bytes, GDRAM2NRAM, tail_bytes, n);
+    and_positive(b, b->ids, tail_bits, n);
+    if (slot_mapping != nullptr) {
+      and_positive(b, b->slots, slot_bits, n);
+    }
+    // active ? position : -1  ==  (position & -active) + (active - 1)
+    __bang_mul_scalar(b->scratch, b->active, -1, n);
+    __bang_band(b->positions, b->positions, b->scratch, n);
+    __bang_sub_scalar(b->active, b->active, 1, n);
+    __bang_add(b->positions, b->positions, b->active, n);
+    __sync_compute();
+    __memcpy(output + base, b->positions, n * 4, NRAM2GDRAM);
+  }
+}
+}  // namespace
+
+extern "C" bool kpool_cache_positions(void* queue,
+                                      const void* rows,
+                                      const void* tail_ids,
+                                      int32_t tail_bits,
+                                      int32_t states,
+                                      const void* positions,
+                                      const void* slot_mapping,
+                                      int32_t slot_bits,
+                                      void* output,
+                                      int32_t tokens) {
+  if (tokens <= 0 || states <= 0 || (tail_bits != 32 && tail_bits != 64) ||
+      (slot_mapping != nullptr && slot_bits != 32 && slot_bits != 64)) {
+    return false;
+  }
+  cnrtDim3_t dim = {static_cast<uint32_t>(tokens < 32 ? 4 : 32), 1, 1};
+  cache_positions_kernel<<<dim,
+                           cnrtFuncTypeBlock,
+                           static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const int64_t*>(rows),
+      tail_ids,
+      tail_bits,
+      states,
+      static_cast<const int32_t*>(positions),
+      slot_mapping,
+      slot_bits,
+      static_cast<int32_t*>(output),
+      tokens);
+  return true;
+}

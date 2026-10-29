@@ -1,0 +1,258 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/kda/launchers.h"
+
+// ---- bangc_kda_norm_gate ----
+
+namespace {
+constexpr int32_t kWidth = 128;
+
+template <int32_t Rows>
+__mlu_global__ void kda_norm_gate_kernel(const bfloat16_t* input,
+                                         const bfloat16_t* gate,
+                                         const bfloat16_t* weight,
+                                         bfloat16_t* output,
+                                         int64_t rows,
+                                         float eps) {
+  __nram__ bfloat16_t input_slots[2][kWidth * Rows];
+  __nram__ bfloat16_t gate_slots[2][kWidth * Rows];
+  __nram__ bfloat16_t weight_bf16[kWidth];
+  __nram__ float x[kWidth * Rows];
+  __nram__ float z[kWidth * Rows];
+  __nram__ float w[kWidth];
+  __nram__ float scratch[kWidth * Rows];
+  __nram__ float transposed[kWidth * Rows];
+  __nram__ float scales[Rows];
+  __wram__ float weight_wram[kWidth * 16];
+  __memcpy(weight_bf16, weight, kWidth * sizeof(bfloat16_t), GDRAM2NRAM);
+  __bang_bfloat162float(w, weight_bf16, kWidth);
+  if constexpr (Rows == 128) {
+    __bang_load_matrix(
+        weight_wram, w, NRAM2WRAM, kWidth, 1, sizeof(float), false);
+  }
+  int64_t first = taskId * Rows;
+  if (first >= rows) {
+    return;
+  }
+  int32_t first_count =
+      static_cast<int32_t>(rows - first < Rows ? rows - first : Rows);
+  __memcpy_async(input_slots[0],
+                 input + first * kWidth,
+                 first_count * kWidth * sizeof(bfloat16_t),
+                 GDRAM2NRAM);
+  __memcpy_io1_async(gate_slots[0],
+                     gate + first * kWidth,
+                     first_count * kWidth * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+  __sync_io();
+  int32_t slot = 0;
+  for (int64_t row = first; row < rows; row += taskDim * Rows) {
+    int32_t count = static_cast<int32_t>(rows - row < Rows ? rows - row : Rows);
+    bfloat16_t* input_bf16 = input_slots[slot];
+    bfloat16_t* gate_bf16 = gate_slots[slot];
+    int64_t next = row + taskDim * Rows;
+    if (next < rows) {
+      int32_t next_count =
+          static_cast<int32_t>(rows - next < Rows ? rows - next : Rows);
+      __memcpy_async(input_slots[1 - slot],
+                     input + next * kWidth,
+                     next_count * kWidth * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+      __memcpy_io1_async(gate_slots[1 - slot],
+                         gate + next * kWidth,
+                         next_count * kWidth * sizeof(bfloat16_t),
+                         GDRAM2NRAM);
+    }
+    if (count < Rows) {
+      __bang_write_value(input_bf16 + count * kWidth,
+                         kWidth * (Rows - count),
+                         static_cast<bfloat16_t>(0));
+    }
+    __bang_bfloat162float(z, gate_bf16, kWidth * Rows);
+    if constexpr (Rows == 128) {
+      __bang_bfloat162float(x, input_bf16, kWidth * Rows);
+      __bang_mul(scratch, x, x, kWidth * Rows);
+      __bang_sumpool(transposed, scratch, 32, Rows, 4, 1, 4, 1, 1);
+      __bang_transpose(scratch, transposed, Rows, 32);
+      __bang_sumpool(scales, scratch, Rows, 1, 32, 1, 32, 1, 1);
+      __bang_fusion(FUSION_FMA, scales, scales, 1.f / kWidth, eps, Rows);
+      __bang_rsqrt(scales, scales, Rows);
+      __bang_conv(
+          transposed, scales, weight_wram, 1, Rows, 1, 1, 1, 1, 1, kWidth);
+      __asm__ volatile(
+          "mult.nram.bf16.f32 [%0], [%1], [%2], %3;"
+          :
+          : "r"(input_bf16), "r"(x), "r"(transposed), "r"(kWidth * Rows));
+    } else {
+      __bang_transpose(gate_bf16, input_bf16, Rows, kWidth);
+      __bang_bfloat162float(transposed, gate_bf16, kWidth * Rows);
+      __bang_mul(scratch, transposed, transposed, kWidth * Rows);
+      __bang_sumpool(scales, scratch, Rows, 1, kWidth, 1, kWidth, 1, 1);
+      __bang_fusion(FUSION_FMA, scales, scales, 1.0f / kWidth, eps, Rows);
+      __bang_rsqrt(scales, scales, Rows);
+      __bang_cycle_mul(transposed, transposed, scales, kWidth * Rows, Rows);
+      __bang_transpose(x, transposed, kWidth, Rows);
+      __asm__ volatile(
+          "mult.cycle.nram.bf16.f32 [%0], [%1], [%2], %3, %4;"
+          :
+          : "r"(input_bf16), "r"(x), "r"(w), "r"(kWidth * Rows), "r"(kWidth));
+    }
+    __bang_bfloat162float(x, input_bf16, kWidth * Rows);
+    __bang_mul_scalar(z, z, -1.4426950408889634f, kWidth * Rows);
+    __bang_pow2(z, z, kWidth * Rows);
+    __bang_add_scalar(z, z, 1.0f, kWidth * Rows);
+    __bang_recip(z, z, kWidth * Rows);
+    __asm__ volatile("mult.nram.bf16.f32 [%0], [%1], [%2], %3;"
+                     :
+                     : "r"(input_bf16), "r"(x), "r"(z), "r"(kWidth * Rows));
+    __asm__ volatile("sync.psimd.cio1;");
+    __memcpy_io1_async(output + row * kWidth,
+                       input_bf16,
+                       count * kWidth * sizeof(bfloat16_t),
+                       NRAM2GDRAM);
+    __sync_io();
+    slot = 1 - slot;
+  }
+}
+template <int32_t Rows>
+__mlu_global__ void kda_norm_gate_simd_kernel(const bfloat16_t* input,
+                                              const bfloat16_t* gate,
+                                              const bfloat16_t* weight,
+                                              bfloat16_t* output,
+                                              int64_t rows,
+                                              float eps) {
+  __nram__ bfloat16_t input_slots[2][kWidth * Rows];
+  __nram__ bfloat16_t gate_slots[2][kWidth * Rows];
+  __nram__ bfloat16_t weight_bf16[kWidth];
+  __nram__ float x[kWidth * Rows];
+  __nram__ float z[kWidth * Rows];
+  __nram__ float w[kWidth];
+  __nram__ float scratch[kWidth * Rows];
+  __nram__ float transposed[kWidth * Rows];
+  __nram__ float scales[Rows];
+  __memcpy(weight_bf16, weight, kWidth * sizeof(bfloat16_t), GDRAM2NRAM);
+  __bang_bfloat162float(w, weight_bf16, kWidth);
+  int64_t first = taskId * Rows;
+  if (first >= rows) {
+    return;
+  }
+  int32_t first_count =
+      static_cast<int32_t>(rows - first < Rows ? rows - first : Rows);
+  __memcpy_async(input_slots[0],
+                 input + first * kWidth,
+                 first_count * kWidth * sizeof(bfloat16_t),
+                 GDRAM2NRAM);
+  __memcpy_io1_async(gate_slots[0],
+                     gate + first * kWidth,
+                     first_count * kWidth * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+  __sync_io();
+  int32_t slot = 0;
+  for (int64_t row = first; row < rows; row += taskDim * Rows) {
+    int32_t count = static_cast<int32_t>(rows - row < Rows ? rows - row : Rows);
+    bfloat16_t* input_bf16 = input_slots[slot];
+    bfloat16_t* gate_bf16 = gate_slots[slot];
+    int64_t next = row + taskDim * Rows;
+    if (next < rows) {
+      int32_t next_count =
+          static_cast<int32_t>(rows - next < Rows ? rows - next : Rows);
+      __memcpy_async(input_slots[1 - slot],
+                     input + next * kWidth,
+                     next_count * kWidth * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+      __memcpy_io1_async(gate_slots[1 - slot],
+                         gate + next * kWidth,
+                         next_count * kWidth * sizeof(bfloat16_t),
+                         GDRAM2NRAM);
+    }
+    if (count < Rows) {
+      __bang_write_value(input_bf16 + count * kWidth,
+                         kWidth * (Rows - count),
+                         static_cast<bfloat16_t>(0));
+    }
+    __bang_bfloat162float(z, gate_bf16, kWidth * Rows);
+    __bang_transpose(gate_bf16, input_bf16, Rows, kWidth);
+    __bang_bfloat162float(transposed, gate_bf16, kWidth * Rows);
+    __bang_mul(scratch, transposed, transposed, kWidth * Rows);
+    __bang_sumpool(scales, scratch, Rows, 1, kWidth, 1, kWidth, 1, 1);
+    __bang_fusion(FUSION_FMA, scales, scales, 1.0f / kWidth, eps, Rows);
+    __bang_rsqrt(scales, scales, Rows);
+    __bang_cycle_mul(transposed, transposed, scales, kWidth * Rows, Rows);
+    __bang_transpose(x, transposed, kWidth, Rows);
+    __asm__ volatile(
+        "mult.cycle.nram.bf16.f32 [%0], [%1], [%2], %3, %4;"
+        :
+        : "r"(input_bf16), "r"(x), "r"(w), "r"(kWidth * Rows), "r"(kWidth));
+    __bang_bfloat162float(x, input_bf16, kWidth * Rows);
+    __bang_mul_scalar(z, z, -1.4426950408889634f, kWidth * Rows);
+    __bang_pow2(z, z, kWidth * Rows);
+    __bang_add_scalar(z, z, 1.0f, kWidth * Rows);
+    __bang_recip(z, z, kWidth * Rows);
+    __asm__ volatile("mult.nram.bf16.f32 [%0], [%1], [%2], %3;"
+                     :
+                     : "r"(input_bf16), "r"(x), "r"(z), "r"(kWidth * Rows));
+    __asm__ volatile("sync.psimd.cio1;");
+    __memcpy_io1_async(output + row * kWidth,
+                       input_bf16,
+                       count * kWidth * sizeof(bfloat16_t),
+                       NRAM2GDRAM);
+    __sync_io();
+    slot = 1 - slot;
+  }
+}
+}  // namespace
+
+extern "C" void kda_norm_gate(void* queue,
+                              const void* input,
+                              const void* gate,
+                              const void* weight,
+                              void* output,
+                              int64_t rows,
+                              float eps) {
+  cnrtDim3_t grid = {32, 1, 1};
+  if (rows >= 4096) {
+    kda_norm_gate_kernel<128>
+        <<<grid, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(input),
+            static_cast<const bfloat16_t*>(gate),
+            static_cast<const bfloat16_t*>(weight),
+            static_cast<bfloat16_t*>(output),
+            rows,
+            eps);
+  } else if (rows <= 256) {
+    kda_norm_gate_simd_kernel<8>
+        <<<grid, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(input),
+            static_cast<const bfloat16_t*>(gate),
+            static_cast<const bfloat16_t*>(weight),
+            static_cast<bfloat16_t*>(output),
+            rows,
+            eps);
+  } else {
+    kda_norm_gate_simd_kernel<32>
+        <<<grid, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(input),
+            static_cast<const bfloat16_t*>(gate),
+            static_cast<const bfloat16_t*>(weight),
+            static_cast<bfloat16_t*>(output),
+            rows,
+            eps);
+  }
+}

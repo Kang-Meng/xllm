@@ -16,32 +16,22 @@ limitations under the License.
 #include "kernels/mlu/chunk_kda.h"
 
 #include <framework/core/MLUStream.h>
-#include <framework/core/device.h>
 #include <glog/logging.h>
 
-#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <tuple>
-#include <vector>
 
-#include "triton_jit/include/jit_kernel.h"
+#include "kernels/mlu/bangc/include/bangc_kda.h"
+#include "kernels/mlu/bangc/include/bangc_kda_tensor.h"
 
 namespace xllm::kernel::mlu {
 namespace {
 
 constexpr int64_t kHeadDim = 128;
-constexpr int64_t kBlockC = 16;
-constexpr int64_t kWorkspaceGroupChunks = 128;
 constexpr int64_t kWorkspaceLimitBytes = 2LL * 1024 * 1024 * 1024;
-constexpr char kKernelPath[] =
-    "xllm.core.kernels.mlu.triton_kernel.chunk_kda_fwd";
-
-uint32_t grid_size(int64_t job_count, int64_t core_count) {
-  CHECK_GT(job_count, 0);
-  CHECK_GT(core_count, 0);
-  return static_cast<uint32_t>(std::min(job_count, core_count));
-}
 
 int64_t configured_prefill_chunk_size() {
   static const int64_t chunk_size = [] {
@@ -69,8 +59,6 @@ int64_t kda_prefill_chunk_size(int64_t num_heads, bool use_qk_l2norm) {
   return configured_prefill_chunk_size();
 }
 
-using xllm::triton_jit::JITKernel;
-
 namespace {
 
 void validate_inputs(const torch::Tensor& q,
@@ -78,7 +66,6 @@ void validate_inputs(const torch::Tensor& q,
                      const torch::Tensor& v,
                      const torch::Tensor& initial_state,
                      const torch::Tensor& cu_seqlens,
-                     const torch::Tensor& chunk_indices,
                      int64_t num_heads) {
   CHECK_EQ(q.dim(), 4) << "Chunk KDA q must be [1,T,H,K]";
   CHECK_EQ(k.sizes(), q.sizes()) << "Chunk KDA q/k shape mismatch";
@@ -105,327 +92,13 @@ void validate_inputs(const torch::Tensor& q,
   CHECK_EQ(initial_state.size(3), q.size(3))
       << "Chunk KDA state key dimension mismatch";
   CHECK_EQ(cu_seqlens.dim(), 1) << "Chunk KDA cu_seqlens must be 1D";
-  CHECK_EQ(chunk_indices.dim(), 2)
-      << "Chunk KDA chunk_indices must be [chunks,2]";
-  CHECK_EQ(chunk_indices.size(1), 2)
-      << "Chunk KDA chunk_indices second dimension must be 2";
   CHECK_GT(q.size(1), 0) << "Chunk KDA requires at least one token";
-  CHECK_GT(chunk_indices.size(0), 0) << "Chunk KDA requires at least one chunk";
-}
-
-class ChunkKDAWorkspace final {
- public:
-  ChunkKDAWorkspace(int64_t slots,
-                    int64_t heads,
-                    int64_t chunk_size,
-                    const torch::TensorOptions& options) {
-    const torch::TensorOptions fp32_options = options.dtype(torch::kFloat32);
-    gate_cumsum_ = torch::empty({slots, heads, kHeadDim}, fp32_options);
-    lower_inverse_ =
-        torch::empty({slots, heads, chunk_size, chunk_size}, fp32_options);
-    aq_ = torch::empty_like(lower_inverse_);
-    const std::vector<int64_t> token_shape = {
-        slots, heads, chunk_size, kHeadDim};
-    w_ = torch::empty(token_shape, fp32_options);
-    // State multiplies value-major U with the transposed chunk inverse.
-    u_ = torch::empty({slots, heads, kHeadDim, chunk_size}, fp32_options);
-    qg_ = torch::empty(token_shape, fp32_options);
-    kg_ = torch::empty(token_shape, fp32_options);
-    normalized_q_ = torch::empty(token_shape, fp32_options);
-    normalized_k_ = torch::empty(token_shape, fp32_options);
-    cumulative_gate_ = torch::empty(token_shape, fp32_options);
-  }
-
-  torch::Tensor gate_cumsum_;
-  torch::Tensor lower_inverse_;
-  torch::Tensor aq_;
-  torch::Tensor w_;
-  torch::Tensor u_;
-  torch::Tensor qg_;
-  torch::Tensor kg_;
-  torch::Tensor normalized_q_;
-  torch::Tensor normalized_k_;
-  torch::Tensor cumulative_gate_;
-};
-
-// Raw (pre-activation) safe-gate inputs for the optimized prefill path. When
-// a group is launched with these, the raw-gate kernel applies the layer's
-// safe-gate formula and the beta sigmoid in-kernel (mirrors
-// glm5_next_safe_gate) and the precomputed log_gate/beta tensors are ignored.
-struct RawGateInputs {
-  torch::Tensor raw_gate;  // [T, H, K], pre-activation
-  torch::Tensor a_log;     // [H]
-  torch::Tensor dt_bias;   // [H * K], flat checkpoint layout
-  torch::Tensor raw_beta;  // [T, H], pre-sigmoid
-  float gate_lower_bound = 0.0f;
-};
-
-void launch_group(const torch::Tensor& q,
-                  const torch::Tensor& k,
-                  const torch::Tensor& v,
-                  const torch::Tensor& log_gate,
-                  const torch::Tensor& beta,
-                  const RawGateInputs* raw_gate_inputs,
-                  const torch::Tensor& input_state,
-                  const torch::Tensor& final_state,
-                  const torch::Tensor& output,
-                  const torch::Tensor& cu_seqlens,
-                  const torch::Tensor& chunk_indices,
-                  const ChunkKDAWorkspace& workspace,
-                  int64_t chunk_base,
-                  int64_t slots,
-                  int64_t num_sequences,
-                  int64_t num_heads,
-                  int64_t chunk_size,
-                  bool use_qk_l2norm,
-                  int64_t core_count) {
-  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-  const int64_t chunk_head_jobs = slots * num_heads;
-  if (raw_gate_inputs == nullptr) {
-    JITKernel::get(kKernelPath, "tmo_chunk_kda_gate_kernel")
-        .launch(static_cast<void*>(queue),
-                /*grid=*/{grid_size(chunk_head_jobs, core_count), 1, 1},
-                /*cfg=*/{/*num_warps=*/1, /*num_stages=*/4},
-                v,
-                beta,
-                workspace.w_,
-                workspace.u_,
-                workspace.qg_,
-                workspace.kg_,
-                log_gate,
-                workspace.gate_cumsum_,
-                q,
-                k,
-                workspace.normalized_q_,
-                workspace.normalized_k_,
-                workspace.cumulative_gate_,
-                cu_seqlens,
-                chunk_indices,
-                chunk_base,
-                slots,
-                /*H=*/static_cast<int32_t>(num_heads),
-                /*BT=*/static_cast<int32_t>(chunk_size),
-                /*D=*/static_cast<int32_t>(kHeadDim),
-                /*BK=*/static_cast<int32_t>(kHeadDim),
-                /*USE_QK_L2NORM=*/use_qk_l2norm ? 1 : 0);
-  } else {
-    JITKernel::get(kKernelPath, "tmo_chunk_kda_optimized_raw_gate_kernel")
-        .launch(static_cast<void*>(queue),
-                /*grid=*/{grid_size(chunk_head_jobs, core_count), 1, 1},
-                /*cfg=*/{/*num_warps=*/1, /*num_stages=*/4},
-                v,
-                raw_gate_inputs->raw_beta,
-                workspace.w_,
-                workspace.u_,
-                workspace.qg_,
-                workspace.kg_,
-                raw_gate_inputs->raw_gate,
-                raw_gate_inputs->a_log,
-                raw_gate_inputs->dt_bias,
-                raw_gate_inputs->gate_lower_bound,
-                workspace.gate_cumsum_,
-                q,
-                k,
-                workspace.normalized_q_,
-                workspace.normalized_k_,
-                workspace.cumulative_gate_,
-                cu_seqlens,
-                chunk_indices,
-                chunk_base,
-                slots,
-                /*H=*/static_cast<int32_t>(num_heads),
-                /*BT=*/static_cast<int32_t>(chunk_size),
-                /*D=*/static_cast<int32_t>(kHeadDim),
-                /*BK=*/static_cast<int32_t>(kHeadDim));
-  }
-
-  JITKernel::get(kKernelPath, "tmo_chunk_kda_kkt_kernel")
-      .launch(static_cast<void*>(queue),
-              /*grid=*/{grid_size(chunk_head_jobs, core_count), 1, 1},
-              /*cfg=*/{/*num_warps=*/1, /*num_stages=*/5},
-              workspace.normalized_q_,
-              workspace.normalized_k_,
-              workspace.cumulative_gate_,
-              raw_gate_inputs == nullptr ? beta : raw_gate_inputs->raw_beta,
-              workspace.lower_inverse_,
-              workspace.aq_,
-              cu_seqlens,
-              chunk_indices,
-              chunk_base,
-              slots,
-              /*H=*/static_cast<int32_t>(num_heads),
-              /*BT=*/static_cast<int32_t>(chunk_size),
-              /*D=*/static_cast<int32_t>(kHeadDim),
-              /*BC=*/static_cast<int32_t>(kBlockC),
-              /*BN=*/static_cast<int32_t>(chunk_size),
-              /*BK=*/static_cast<int32_t>(kHeadDim),
-              /*RAW_BETA=*/raw_gate_inputs != nullptr ? 1 : 0);
-
-  JITKernel::get(kKernelPath, "tmo_chunk_kda_inverse_kernel")
-      .launch(static_cast<void*>(queue),
-              /*grid=*/{grid_size(chunk_head_jobs, core_count), 1, 1},
-              /*cfg=*/{/*num_warps=*/1, /*num_stages=*/4},
-              workspace.lower_inverse_,
-              slots,
-              /*H=*/static_cast<int32_t>(num_heads),
-              /*BT=*/static_cast<int32_t>(chunk_size),
-              /*B0=*/static_cast<int32_t>(kBlockC));
-
-  constexpr int64_t kValueBlock = 32;
-  const bool optimized_state = use_qk_l2norm && num_heads >= 8;
-  const int64_t state_jobs = (optimized_state ? 1 : num_sequences) * num_heads *
-                             (kHeadDim / kValueBlock);
-  JITKernel::get(kKernelPath,
-                 optimized_state ? "tmo_chunk_kda_optimized_state_kernel"
-                                 : "tmo_chunk_kda_state_kernel")
-      .launch(static_cast<void*>(queue),
-              /*grid=*/{grid_size(state_jobs, core_count), 1, 1},
-              /*cfg=*/{/*num_warps=*/1, /*num_stages=*/99},
-              workspace.lower_inverse_,
-              workspace.w_,
-              workspace.u_,
-              workspace.qg_,
-              workspace.kg_,
-              workspace.aq_,
-              workspace.gate_cumsum_,
-              input_state,
-              final_state,
-              output,
-              cu_seqlens,
-              chunk_indices,
-              chunk_base,
-              slots,
-              num_sequences,
-              /*H=*/static_cast<int32_t>(num_heads),
-              /*BT=*/static_cast<int32_t>(chunk_size),
-              /*D=*/static_cast<int32_t>(kHeadDim),
-              /*BK=*/static_cast<int32_t>(kHeadDim),
-              /*BV=*/static_cast<int32_t>(kValueBlock));
-}
-
-std::tuple<torch::Tensor, torch::Tensor> forward_chunks(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& log_gate,
-    const torch::Tensor& beta,
-    const RawGateInputs* raw_gate_inputs,
-    const torch::Tensor& initial_state,
-    const torch::Tensor& cu_seqlens,
-    const torch::Tensor& chunk_indices,
-    bool output_final_state,
-    int64_t num_heads,
-    int64_t chunk_size,
-    bool use_qk_l2norm,
-    int64_t core_count) {
-  const int64_t total_chunks = chunk_indices.size(0);
-  // Seven token tiles, two chunk matrices, and the last cumulative gate.
-  // Budget padded chunks; packed token count excludes tail padding.
-  const int64_t elements_per_chunk_head =
-      7 * chunk_size * kHeadDim + 2 * chunk_size * chunk_size + kHeadDim;
-  const int64_t bytes_per_chunk_head =
-      elements_per_chunk_head * static_cast<int64_t>(sizeof(float));
-  CHECK_LE(num_heads, kWorkspaceLimitBytes / bytes_per_chunk_head)
-      << "A single KDA workspace chunk exceeds the 2 GiB budget";
-  const int64_t budget_slots =
-      kWorkspaceLimitBytes / (num_heads * bytes_per_chunk_head);
-  const int64_t workspace_slots =
-      total_chunks <= budget_slots
-          ? total_chunks
-          : std::min({total_chunks, kWorkspaceGroupChunks, budget_slots});
-
-  ChunkKDAWorkspace workspace(
-      workspace_slots, num_heads, chunk_size, q.options());
-  torch::Tensor output = torch::empty_like(v);
-  torch::Tensor final_state = torch::empty_like(initial_state);
-  torch::Tensor state_source = initial_state;
-  for (int64_t chunk_base = 0; chunk_base < total_chunks;
-       chunk_base += workspace_slots) {
-    const int64_t slots = std::min(workspace_slots, total_chunks - chunk_base);
-    launch_group(q,
-                 k,
-                 v,
-                 log_gate,
-                 beta,
-                 raw_gate_inputs,
-                 state_source,
-                 final_state,
-                 output,
-                 cu_seqlens,
-                 chunk_indices,
-                 workspace,
-                 chunk_base,
-                 slots,
-                 initial_state.size(0),
-                 num_heads,
-                 chunk_size,
-                 use_qk_l2norm,
-                 core_count);
-    state_source = final_state;
-  }
-  return {output, output_final_state ? final_state : torch::Tensor()};
 }
 
 }  // namespace
 
 ChunkKDAImpl::ChunkKDAImpl(int64_t num_heads) : num_heads_(num_heads) {
   CHECK_GT(num_heads_, 0) << "Chunk KDA requires at least one head";
-  torch_mlu::DeviceProp* properties =
-      torch_mlu::getDeviceProperties(torch_mlu::current_device());
-  CHECK(properties != nullptr);
-  total_core_num_ =
-      properties->cluster_count * properties->core_num_per_cluster;
-}
-
-std::tuple<torch::Tensor, torch::Tensor> ChunkKDAImpl::forward(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& log_gate,
-    const torch::Tensor& beta,
-    const torch::Tensor& initial_state,
-    const torch::Tensor& cu_seqlens,
-    const torch::Tensor& chunk_indices,
-    bool output_final_state,
-    bool use_qk_l2norm) {
-  validate_inputs(
-      q, k, v, initial_state, cu_seqlens, chunk_indices, num_heads_);
-
-  torch::Tensor gate =
-      (log_gate.dim() == 3 ? log_gate.unsqueeze(/*dim=*/0) : log_gate)
-          .contiguous()
-          .to(torch::kFloat32);
-  torch::Tensor activated_beta =
-      (beta.dim() == 2 ? beta.unsqueeze(/*dim=*/0) : beta)
-          .contiguous()
-          .to(torch::kFloat32);
-  CHECK_EQ(gate.sizes(), q.sizes()) << "Chunk KDA gate shape mismatch";
-  CHECK_EQ(activated_beta.size(0), 1) << "Chunk KDA beta batch size mismatch";
-  CHECK_EQ(activated_beta.size(1), q.size(1))
-      << "Chunk KDA beta token count mismatch";
-  CHECK_EQ(activated_beta.size(2), num_heads_)
-      << "Chunk KDA beta head count mismatch";
-
-  torch::Tensor q_work = q.contiguous();
-  torch::Tensor k_work = k.contiguous();
-  torch::Tensor v_work = v.contiguous();
-  torch::Tensor cu_seqlens_work = cu_seqlens.contiguous().to(torch::kInt32);
-  torch::Tensor chunk_indices_work =
-      chunk_indices.contiguous().to(torch::kInt32);
-  return forward_chunks(q_work,
-                        k_work,
-                        v_work,
-                        gate,
-                        activated_beta,
-                        /*raw_gate_inputs=*/nullptr,
-                        initial_state.contiguous(),
-                        cu_seqlens_work,
-                        chunk_indices_work,
-                        output_final_state,
-                        num_heads_,
-                        kda_prefill_chunk_size(num_heads_, use_qk_l2norm),
-                        use_qk_l2norm,
-                        total_core_num_);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> ChunkKDAImpl::forward_raw_gate(
@@ -439,11 +112,51 @@ std::tuple<torch::Tensor, torch::Tensor> ChunkKDAImpl::forward_raw_gate(
     const torch::Tensor& raw_beta,
     const torch::Tensor& initial_state,
     const torch::Tensor& cu_seqlens,
-    const torch::Tensor& chunk_indices,
+    const torch::Tensor& /*chunk_indices*/,
     bool output_final_state,
     bool use_qk_l2norm) {
-  validate_inputs(
-      q, k, v, initial_state, cu_seqlens, chunk_indices, num_heads_);
+  const auto forward_bangc = [&]() {
+    CHECK_EQ(q.dim(), 4);
+    CHECK_EQ(v.dim(), 4);
+    CHECK_EQ(q.size(2), num_heads_);
+    CHECK_EQ(v.size(2), num_heads_);
+    BangcKdaTensorParams parameters{};
+    parameters.q = q;
+    parameters.k = k;
+    parameters.v = v;
+    parameters.gate = raw_gate;
+    parameters.beta = raw_beta;
+    parameters.a_log = a_log;
+    parameters.bias = dt_bias;
+    parameters.initial_state = initial_state;
+    parameters.cu = cu_seqlens;
+    parameters.gate_mode = 0;
+    parameters.prefill = true;
+    parameters.output_final_state = output_final_state;
+    parameters.qk_l2norm = use_qk_l2norm;
+    parameters.scale = 1.f / std::sqrt(static_cast<float>(q.size(3)));
+    parameters.lower_bound = gate_lower_bound;
+    auto result = bangc_kda_forward(parameters);
+    return std::make_tuple(result.first, result.second);
+  };
+  // The staged prefill path requires BF16 inputs and FP32 state. Other typed
+  // inputs, including empty packed batches, use the generic BangC path.
+  const bool staged_prefill_shape =
+      q.dim() == 4 && k.sizes() == q.sizes() && v.dim() == 4 &&
+      q.size(0) == 1 && v.size(0) == 1 && q.size(1) > 0 &&
+      v.size(1) == q.size(1) && q.size(2) == num_heads_ &&
+      v.size(2) == num_heads_ && q.size(3) == kHeadDim &&
+      v.size(3) == kHeadDim && q.scalar_type() == torch::kBFloat16 &&
+      k.scalar_type() == torch::kBFloat16 &&
+      v.scalar_type() == torch::kBFloat16 &&
+      initial_state.scalar_type() == torch::kFloat32 &&
+      initial_state.dim() == 4 && cu_seqlens.dim() == 1 &&
+      cu_seqlens.numel() > 1;
+  if (!staged_prefill_shape) {
+    return forward_bangc();
+  }
+
+  validate_inputs(q, k, v, initial_state, cu_seqlens, num_heads_);
   CHECK_LT(gate_lower_bound, 0.0f)
       << "Chunk KDA gate lower bound must be negative";
   torch::Tensor gate_work =
@@ -466,48 +179,77 @@ std::tuple<torch::Tensor, torch::Tensor> ChunkKDAImpl::forward_raw_gate(
   CHECK_EQ(dt_bias.size(0), num_heads_ * kHeadDim)
       << "Chunk KDA dt_bias dimension mismatch";
 
-  if (use_qk_l2norm && num_heads_ >= 8) {
-    RawGateInputs raw_inputs;
-    raw_inputs.raw_gate = gate_work.squeeze(/*dim=*/0);
-    raw_inputs.a_log = a_log.contiguous();
-    raw_inputs.dt_bias = dt_bias.contiguous();
-    raw_inputs.raw_beta = beta_work.squeeze(/*dim=*/0);
-    raw_inputs.gate_lower_bound = gate_lower_bound;
-    return forward_chunks(q.contiguous(),
-                          k.contiguous(),
-                          v.contiguous(),
-                          /*log_gate=*/torch::Tensor(),
-                          /*beta=*/torch::Tensor(),
-                          &raw_inputs,
-                          initial_state.contiguous(),
-                          cu_seqlens.contiguous().to(torch::kInt32),
-                          chunk_indices.contiguous().to(torch::kInt32),
-                          output_final_state,
-                          num_heads_,
-                          kda_prefill_chunk_size(num_heads_, use_qk_l2norm),
-                          use_qk_l2norm,
-                          total_core_num_);
+  const int64_t num_sequences = cu_seqlens.size(0) - 1;
+  // Every native job and normalized CU value must fit the int32 ABI.
+  const int64_t max_native_index = std::numeric_limits<int32_t>::max();
+  const bool native_heads = num_heads_ == 8 || num_heads_ == 16 ||
+                            num_heads_ == 32 || num_heads_ == 64;
+  const bool native_capacity =
+      native_heads && num_sequences > 0 && num_heads_ > 0 &&
+      q.size(1) <= max_native_index && num_heads_ <= max_native_index / 4 &&
+      num_sequences <= max_native_index / (num_heads_ * 4);
+  // The native block recurrence carries FP32 state across arbitrary packed
+  // sequence boundaries; context length does not change its working set.
+  const bool same_device =
+      k.device() == q.device() && v.device() == q.device() &&
+      gate_work.device() == q.device() && beta_work.device() == q.device() &&
+      a_log.device() == q.device() && dt_bias.device() == q.device() &&
+      initial_state.device() == q.device() && cu_seqlens.device() == q.device();
+  const bool use_staged_prefill = same_device && native_capacity &&
+                                  use_qk_l2norm && gate_lower_bound == -5.0f &&
+                                  gate_work.scalar_type() == torch::kBFloat16 &&
+                                  beta_work.scalar_type() == torch::kBFloat16 &&
+                                  a_log.scalar_type() == torch::kFloat32 &&
+                                  dt_bias.scalar_type() == torch::kFloat32;
+  if (use_staged_prefill) {
+    const torch::DeviceGuard device_guard(q.device());
+    torch::Tensor q_work = q.contiguous();
+    torch::Tensor k_work = k.contiguous();
+    torch::Tensor v_work = v.contiguous();
+    torch::Tensor state_work = initial_state.contiguous();
+    torch::Tensor log_work = a_log.contiguous();
+    torch::Tensor bias_work = dt_bias.contiguous();
+    torch::Tensor cu_work = cu_seqlens.contiguous().to(torch::kInt32);
+    torch::Tensor output = torch::empty_like(v_work);
+    torch::Tensor final_state = torch::empty_like(state_work);
+    torch::Tensor workspace;
+    const int64_t total_tokens = q_work.size(1);
+    const bool underfilled_long =
+        num_sequences * num_heads_ <= 16 && total_tokens >= num_sequences * 256;
+    const bool adaptive_long = num_heads_ == 8 && num_sequences >= 3 &&
+                               num_sequences <= 8 &&
+                               total_tokens >= num_sequences * 256;
+    const int64_t slots = (total_tokens + 31) / 32 + num_sequences;
+    if ((underfilled_long || adaptive_long) &&
+        slots <= kWorkspaceLimitBytes / sizeof(float) / num_heads_ /
+                     kBangcKdaWorkspaceFloatsPerHeadBlock) {
+      workspace = torch::empty(
+          {slots * num_heads_ * kBangcKdaWorkspaceFloatsPerHeadBlock},
+          q_work.options().dtype(torch::kFloat32));
+    }
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream(q.device().index());
+    CHECK_EQ(bangc_kda_prefill_staged(
+                 static_cast<void*>(queue),
+                 q_work.data_ptr(),
+                 k_work.data_ptr(),
+                 v_work.data_ptr(),
+                 gate_work.data_ptr(),
+                 beta_work.data_ptr(),
+                 log_work.data_ptr(),
+                 bias_work.data_ptr(),
+                 state_work.data_ptr(),
+                 final_state.data_ptr(),
+                 output.data_ptr(),
+                 cu_work.data_ptr(),
+                 workspace.defined() ? workspace.data_ptr() : nullptr,
+                 static_cast<int32_t>(num_sequences),
+                 static_cast<int32_t>(num_heads_),
+                 static_cast<int32_t>(total_tokens)),
+             0);
+    return {output, output_final_state ? final_state : torch::Tensor()};
   }
-  // Smaller head counts and disabled Q/K normalization retain the generic
-  // kernel path. Activate gate and beta on device before dispatching it.
-  torch::Tensor a_scale =
-      torch::exp(a_log.to(torch::kFloat32)).view({1, 1, num_heads_, 1});
-  torch::Tensor bias =
-      dt_bias.to(torch::kFloat32).view({1, 1, num_heads_, kHeadDim});
-  torch::Tensor log_gate =
-      gate_lower_bound *
-      torch::sigmoid(a_scale * (gate_work.to(torch::kFloat32) + bias));
-  torch::Tensor activated_beta = torch::sigmoid(beta_work.to(torch::kFloat32));
-  return forward(q,
-                 k,
-                 v,
-                 log_gate,
-                 activated_beta,
-                 initial_state,
-                 cu_seqlens,
-                 chunk_indices,
-                 output_final_state,
-                 use_qk_l2norm);
+
+  return forward_bangc();
 }
 
 }  // namespace xllm::kernel::mlu

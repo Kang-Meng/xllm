@@ -1,0 +1,1335 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+
+#include "kernels/mlu/bangc/include/bangc_kda_pcp.h"
+#include "kernels/mlu/bangc/src/kda/bangc_kda_pcp_metadata.mluh"
+
+// ---- bangc_kda_pcp_summary ----
+
+namespace xllm::kernel::mlu {
+using KdaPcpParams = BangcKdaPcpParams;
+
+namespace {
+namespace summary_rows64 {
+constexpr int32_t kDim = 128;
+constexpr int32_t kMaxBlock = 64;
+constexpr int32_t kValueRows = 64;
+constexpr int32_t kSummaryRows = 2 * kDim;
+constexpr int32_t kTiles = kSummaryRows / kValueRows;
+
+// Keep the exact original slot traversal, including empty valid chunks.
+__mlu_func__ int64_t next_slot(const KdaPcpParams& p,
+                               uint32_t* index_window,
+                               int64_t* index_base,
+                               uint32_t* cu_window,
+                               int64_t* cu_base,
+                               int64_t sequence,
+                               int64_t start) {
+  for (int64_t slot = start; slot < p.chunks; ++slot) {
+    // Other sequences' chunks never need their token bounds.
+    slot = kda_pcp_metadata::find_sequence_chunk(
+        p, index_window, index_base, sequence, slot);
+    if (slot < 0) {
+      return -1;
+    }
+    int64_t owner = 0;
+    int64_t begin = 0;
+    int32_t count = 0;
+    if (kda_pcp_metadata::locate(p,
+                                 index_window,
+                                 index_base,
+                                 cu_window,
+                                 cu_base,
+                                 slot,
+                                 &owner,
+                                 &begin,
+                                 &count) &&
+        owner == sequence) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+// All destinations are private to one task and one parity. The caller drains
+// IO before reading them, and Compute before reusing an old parity.
+__mlu_func__ void prefetch_factors(KdaPcpParams p,
+                                   int64_t slot,
+                                   int64_t head,
+                                   int32_t first_channel,
+                                   bool affine,
+                                   float* weights,
+                                   float* keys,
+                                   float* inverse,
+                                   float* decay,
+                                   float* raw) {
+  int64_t factor = (slot * p.heads + head) * p.block * kDim;
+  int64_t square = (slot * p.heads + head) * p.block * p.block;
+  __memcpy_async(
+      weights, p.w + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(
+      keys, p.kg + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(inverse,
+                 p.inverse + square,
+                 p.block * p.block * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(decay,
+                 p.gate_cumsum + (slot * p.heads + head) * kDim,
+                 kDim * sizeof(float),
+                 GDRAM2NRAM);
+  if (!affine) {
+    __memcpy_async(raw,
+                   p.u + (slot * p.heads + head) * kDim * p.block +
+                       first_channel * p.block,
+                   kValueRows * p.block * sizeof(float),
+                   GDRAM2NRAM);
+  }
+}
+
+// V64 arithmetic and task ownership are unchanged from summary003. Only
+// immutable factor IO and independent matrix Move work are pipelined.
+__mlu_global__ void summary_metadata_mirrored_rows(KdaPcpParams p) {
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float state[kValueRows * kDim];
+  __nram__ float projection[kValueRows * kMaxBlock];
+  __nram__ float raw[2][kValueRows * kMaxBlock];
+  __nram__ float resolved[kValueRows * kMaxBlock];
+  __nram__ float update[kValueRows * kDim];
+  __nram__ float weights[2][kMaxBlock * kDim];
+  __nram__ float keys[2][kMaxBlock * kDim];
+  __nram__ float inverse[2][kMaxBlock * kMaxBlock];
+  __nram__ float decay[2][kDim];
+  // load_matrix rounds output channels to64 and CI bytes to64. For BT16/64,
+  // W consumes64*128 floats, Inv at most64*64, transposed Kg128*64.
+  __wram__ float matrix_weights[kDim * kMaxBlock];
+  __wram__ float inverse_weights[kDim * kMaxBlock];
+  // Private metadata windows; see bangc_kda_pcp_metadata.mluh.
+  __nram__ uint32_t index_window[kda_pcp_metadata::kIndexWindowWords];
+  __nram__ uint32_t cu_window[kda_pcp_metadata::kCuWindowWords];
+  int64_t index_base = kda_pcp_metadata::kNoWindow;
+  int64_t cu_base = kda_pcp_metadata::kNoWindow;
+  for (int64_t job = taskId; job < p.sequences * p.heads * kTiles;
+       job += taskDim) {
+    int32_t tile = static_cast<int32_t>(job % kTiles);
+    int64_t head = (job / kTiles) % p.heads;
+    int64_t sequence = job / (kTiles * p.heads);
+    int32_t first_row = tile * kValueRows;
+    bool affine = first_row >= kDim;
+    int32_t first_channel = first_row % kDim;
+    __bang_write_value(state, kValueRows * kDim, 0.0f);
+    __sync_compute();
+    if (affine) {
+      for (int32_t value = 0; value < kValueRows; ++value) {
+        state[value * kDim + first_channel + value] = 1.0f;
+      }
+    }
+    int32_t parity = 0;
+    int64_t slot = next_slot(
+        p, index_window, &index_base, cu_window, &cu_base, sequence, 0);
+    if (slot >= 0) {
+      prefetch_factors(p,
+                       slot,
+                       head,
+                       first_channel,
+                       affine,
+                       weights[parity],
+                       keys[parity],
+                       inverse[parity],
+                       decay[parity],
+                       raw[parity]);
+      __sync_io();
+    }
+    while (slot >= 0) {
+      int32_t following_parity = parity ^ 1;
+      int64_t following_slot = next_slot(p,
+                                         index_window,
+                                         &index_base,
+                                         cu_window,
+                                         &cu_base,
+                                         sequence,
+                                         slot + 1);
+      if (following_slot >= 0) {
+        prefetch_factors(p,
+                         following_slot,
+                         head,
+                         first_channel,
+                         affine,
+                         weights[following_parity],
+                         keys[following_parity],
+                         inverse[following_parity],
+                         decay[following_parity],
+                         raw[following_parity]);
+      }
+      // 64x128 times transpose(BTx128): projection64xBT.
+      __bang_load_matrix_async(matrix_weights,
+                               weights[parity],
+                               NRAM2WRAM,
+                               p.block,
+                               kDim,
+                               kDim * sizeof(float),
+                               false);
+      __sync_move();
+      __bang_conv(projection,
+                  state,
+                  matrix_weights,
+                  kDim,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // raw64xBT times transpose(InvBTxBT): resolved64xBT.
+      __bang_load_matrix_async(inverse_weights,
+                               inverse[parity],
+                               NRAM2WRAM,
+                               p.block,
+                               p.block,
+                               p.block * sizeof(float),
+                               false);
+      __sync_compute();
+      if (affine) {
+        __bang_mul_scalar(raw[parity], projection, -1.0f, kValueRows * p.block);
+      } else {
+        __bang_sub(raw[parity], raw[parity], projection, kValueRows * p.block);
+      }
+      __sync_compute();
+      __sync_move();
+      __bang_conv(resolved,
+                  raw[parity],
+                  inverse_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // resolved64xBT times KgBTx128: update64x128.
+      __bang_load_matrix_async(matrix_weights,
+                               keys[parity],
+                               NRAM2WRAM,
+                               p.block,
+                               kDim,
+                               kDim * sizeof(float),
+                               true);
+
+      __sync_move();
+      __bang_conv(update,
+                  resolved,
+                  matrix_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  kDim);
+      __sync_compute();
+      // One vector exponential per chunk, reused by all64 value rows.
+      __bang_exp(decay[parity], decay[parity], kDim);
+      __bang_cycle_mul(state, state, decay[parity], kValueRows * kDim, kDim);
+      __bang_add(state, state, update, kValueRows * kDim);
+      __sync_compute();
+      __sync_io();
+      parity = following_parity;
+      slot = following_slot;
+    }
+    int64_t destination =
+        ((sequence * p.heads + head) * kSummaryRows + first_row) * kDim;
+    __memcpy(p.summary + destination,
+             state,
+             kValueRows * kDim * sizeof(float),
+             NRAM2GDRAM);
+    __sync_io();
+  }
+}
+}  // namespace summary_rows64
+}  // namespace
+
+extern "C" void bangc_kda_pcp_summary(cnrtQueue_t queue,
+                                      const KdaPcpParams* params) {
+  cnrtDim3_t grid = {32, 1, 1};
+  summary_rows64::
+      summary_metadata_mirrored_rows<<<grid, cnrtFuncTypeBlock, queue>>>(
+          *params);
+}
+
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_pcp_summary_rows128 ----
+
+namespace xllm::kernel::mlu {
+
+namespace {
+namespace summary_rows128 {
+constexpr int32_t kDim = 128;
+constexpr int32_t kMaxBlock = 64;
+constexpr int32_t kValueRows = 128;
+constexpr int32_t kSummaryRows = 2 * kDim;
+constexpr int32_t kTiles = kSummaryRows / kValueRows;
+
+// Keep the exact original slot traversal, including empty valid chunks.
+__mlu_func__ int64_t next_slot(const KdaPcpParams& p,
+                               uint32_t* index_window,
+                               int64_t* index_base,
+                               uint32_t* cu_window,
+                               int64_t* cu_base,
+                               int64_t sequence,
+                               int64_t start) {
+  for (int64_t slot = start; slot < p.chunks; ++slot) {
+    // Other sequences' chunks never need their token bounds.
+    slot = kda_pcp_metadata::find_sequence_chunk(
+        p, index_window, index_base, sequence, slot);
+    if (slot < 0) {
+      return -1;
+    }
+    int64_t owner = 0;
+    int64_t begin = 0;
+    int32_t count = 0;
+    if (kda_pcp_metadata::locate(p,
+                                 index_window,
+                                 index_base,
+                                 cu_window,
+                                 cu_base,
+                                 slot,
+                                 &owner,
+                                 &begin,
+                                 &count) &&
+        owner == sequence) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+// All destinations are private to one task and one parity. The caller drains
+// IO before reading them, and Compute before reusing an old parity.
+__mlu_func__ void prefetch_factors(KdaPcpParams p,
+                                   int64_t slot,
+                                   int64_t head,
+                                   int32_t first_channel,
+                                   bool affine,
+                                   float* weights,
+                                   float* keys,
+                                   float* inverse,
+                                   float* decay,
+                                   float* raw) {
+  int64_t factor = (slot * p.heads + head) * p.block * kDim;
+  int64_t square = (slot * p.heads + head) * p.block * p.block;
+  __memcpy_async(
+      weights, p.w + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(
+      keys, p.kg + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(inverse,
+                 p.inverse + square,
+                 p.block * p.block * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(decay,
+                 p.gate_cumsum + (slot * p.heads + head) * kDim,
+                 kDim * sizeof(float),
+                 GDRAM2NRAM);
+  if (!affine) {
+    __memcpy_async(raw,
+                   p.u + (slot * p.heads + head) * kDim * p.block +
+                       first_channel * p.block,
+                   kValueRows * p.block * sizeof(float),
+                   GDRAM2NRAM);
+  }
+}
+
+// V128 value-row tiling retains the metadata windows and factor pipeline.
+// Per-output arithmetic and all queue completion edges are unchanged.
+__mlu_global__ void summary_metadata_mirrored_rows128(KdaPcpParams p) {
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float state[kValueRows * kDim];
+  __nram__ float projection[kValueRows * kMaxBlock];
+  __nram__ float raw[2][kValueRows * kMaxBlock];
+  __nram__ float resolved[kValueRows * kMaxBlock];
+  __nram__ float update[kValueRows * kDim];
+  __nram__ float weights[2][kMaxBlock * kDim];
+  __nram__ float keys[2][kMaxBlock * kDim];
+  __nram__ float inverse[2][kMaxBlock * kMaxBlock];
+  __nram__ float decay[2][kDim];
+  // load_matrix rounds output channels to64 and CI bytes to64. For BT16/64,
+  // W consumes64*128 floats, Inv at most64*64, transposed Kg128*64.
+  __wram__ float matrix_weights[kDim * kMaxBlock];
+  __wram__ float inverse_weights[kDim * kMaxBlock];
+  // Private metadata windows; see bangc_kda_pcp_metadata.mluh.
+  __nram__ uint32_t index_window[kda_pcp_metadata::kIndexWindowWords];
+  __nram__ uint32_t cu_window[kda_pcp_metadata::kCuWindowWords];
+  int64_t index_base = kda_pcp_metadata::kNoWindow;
+  int64_t cu_base = kda_pcp_metadata::kNoWindow;
+  for (int64_t job = taskId; job < p.sequences * p.heads * kTiles;
+       job += taskDim) {
+    int32_t tile = static_cast<int32_t>(job % kTiles);
+    int64_t head = (job / kTiles) % p.heads;
+    int64_t sequence = job / (kTiles * p.heads);
+    int32_t first_row = tile * kValueRows;
+    bool affine = first_row >= kDim;
+    int32_t first_channel = first_row % kDim;
+    __bang_write_value(state, kValueRows * kDim, 0.0f);
+    __sync_compute();
+    if (affine) {
+      for (int32_t value = 0; value < kValueRows; ++value) {
+        state[value * kDim + first_channel + value] = 1.0f;
+      }
+    }
+    int32_t parity = 0;
+    int64_t slot = next_slot(
+        p, index_window, &index_base, cu_window, &cu_base, sequence, 0);
+    if (slot >= 0) {
+      prefetch_factors(p,
+                       slot,
+                       head,
+                       first_channel,
+                       affine,
+                       weights[parity],
+                       keys[parity],
+                       inverse[parity],
+                       decay[parity],
+                       raw[parity]);
+      __sync_io();
+    }
+    while (slot >= 0) {
+      int32_t following_parity = parity ^ 1;
+      int64_t following_slot = next_slot(p,
+                                         index_window,
+                                         &index_base,
+                                         cu_window,
+                                         &cu_base,
+                                         sequence,
+                                         slot + 1);
+      if (following_slot >= 0) {
+        prefetch_factors(p,
+                         following_slot,
+                         head,
+                         first_channel,
+                         affine,
+                         weights[following_parity],
+                         keys[following_parity],
+                         inverse[following_parity],
+                         decay[following_parity],
+                         raw[following_parity]);
+      }
+      // Vx128 times transpose(BTx128): projection VxBT.
+      __bang_load_matrix_async(matrix_weights,
+                               weights[parity],
+                               NRAM2WRAM,
+                               p.block,
+                               kDim,
+                               kDim * sizeof(float),
+                               false);
+      __sync_move();
+      __bang_conv(projection,
+                  state,
+                  matrix_weights,
+                  kDim,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // Raw VxBT times transpose(InvBTxBT): resolved VxBT.
+      __bang_load_matrix_async(inverse_weights,
+                               inverse[parity],
+                               NRAM2WRAM,
+                               p.block,
+                               p.block,
+                               p.block * sizeof(float),
+                               false);
+      __sync_compute();
+      if (affine) {
+        __bang_mul_scalar(raw[parity], projection, -1.0f, kValueRows * p.block);
+      } else {
+        __bang_sub(raw[parity], raw[parity], projection, kValueRows * p.block);
+      }
+      __sync_compute();
+      __sync_move();
+      __bang_conv(resolved,
+                  raw[parity],
+                  inverse_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // Resolved VxBT times KgBTx128: update Vx128.
+      __bang_load_matrix_async(matrix_weights,
+                               keys[parity],
+                               NRAM2WRAM,
+                               p.block,
+                               kDim,
+                               kDim * sizeof(float),
+                               true);
+
+      __sync_move();
+      __bang_conv(update,
+                  resolved,
+                  matrix_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  kDim);
+      __sync_compute();
+      // One vector exponential per chunk, reused by all value rows.
+      __bang_exp(decay[parity], decay[parity], kDim);
+      __bang_cycle_mul(state, state, decay[parity], kValueRows * kDim, kDim);
+      __bang_add(state, state, update, kValueRows * kDim);
+      __sync_compute();
+      __sync_io();
+      parity = following_parity;
+      slot = following_slot;
+    }
+    int64_t destination =
+        ((sequence * p.heads + head) * kSummaryRows + first_row) * kDim;
+    __memcpy(p.summary + destination,
+             state,
+             kValueRows * kDim * sizeof(float),
+             NRAM2GDRAM);
+    __sync_io();
+  }
+}
+}  // namespace summary_rows128
+}  // namespace
+
+extern "C" void bangc_kda_pcp_summary_rows128(cnrtQueue_t queue,
+                                              const KdaPcpParams* params) {
+  cnrtDim3_t grid = {32, 1, 1};
+  summary_rows128::
+      summary_metadata_mirrored_rows128<<<grid, cnrtFuncTypeBlock, queue>>>(
+          *params);
+}
+
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_pcp_merge ----
+
+namespace xllm::kernel::mlu {
+
+namespace {
+namespace merge_state {
+constexpr int32_t kDim = 128;
+constexpr int32_t kValueRows = 64;
+constexpr int32_t kTiles = kDim / kValueRows;
+
+// Rank-major summaries contain [E; M]. Each task owns disjoint64 rows of
+// the row-state S and applies only earlier ranks, in their original order.
+__mlu_global__ void merge_matrix_rows(KdaPcpParams p) {
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float state[kValueRows * kDim];
+  __nram__ float affine[kDim * kDim];
+  __nram__ float addition[kValueRows * kDim];
+  __nram__ float product[kValueRows * kDim];
+  // Transposed load_matrix output has128 channels and128 FP32 CI values;
+  // both physical padding factors are already aligned to64 bytes/channels.
+  __wram__ float matrix_weights[kDim * kDim];
+  int64_t rank_stride = p.sequences * p.heads * 2 * kDim * kDim;
+  for (int64_t job = taskId; job < p.sequences * p.heads * kTiles;
+       job += taskDim) {
+    int64_t group = job / kTiles;
+    int32_t first_row = static_cast<int32_t>(job % kTiles) * kValueRows;
+    int64_t row_offset = group * kDim * kDim + first_row * kDim;
+    __memcpy(state,
+             p.initial + row_offset,
+             kValueRows * kDim * sizeof(float),
+             GDRAM2NRAM);
+    __sync_io();
+    for (int32_t rank = 0; rank < p.rank; ++rank) {
+      const float* summary =
+          p.gathered + rank * rank_stride + group * 2 * kDim * kDim;
+      __memcpy(affine,
+               summary + kDim * kDim,
+               kDim * kDim * sizeof(float),
+               GDRAM2NRAM);
+      __memcpy(addition,
+               summary + first_row * kDim,
+               kValueRows * kDim * sizeof(float),
+               GDRAM2NRAM);
+      __sync_io();
+      __bang_load_matrix(matrix_weights,
+                         affine,
+                         NRAM2WRAM,
+                         kDim,
+                         kDim,
+                         kDim * sizeof(float),
+                         true);
+      __sync_move();
+      __bang_conv(product,
+                  state,
+                  matrix_weights,
+                  kDim,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  kDim);
+      __sync_compute();
+      __bang_add(state, product, addition, kValueRows * kDim);
+      __sync_compute();
+    }
+    __memcpy(p.final_state + row_offset,
+             state,
+             kValueRows * kDim * sizeof(float),
+             NRAM2GDRAM);
+    __sync_io();
+  }
+}
+}  // namespace merge_state
+}  // namespace
+
+extern "C" void bangc_kda_pcp_merge(cnrtQueue_t queue,
+                                    const KdaPcpParams* params) {
+  cnrtDim3_t grid = {32, 1, 1};
+  merge_state::merge_matrix_rows<<<grid, cnrtFuncTypeBlock, queue>>>(*params);
+}
+
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_pcp_replay_rows32 ----
+
+namespace xllm::kernel::mlu {
+
+namespace {
+namespace replay_rows32 {
+constexpr int32_t kDim = 128;
+constexpr int32_t kMaxBlock = 64;
+constexpr int32_t kValueRows = 32;
+constexpr int32_t kReplayRows = kDim;
+constexpr int32_t kTiles = kReplayRows / kValueRows;
+
+// Preserve the original ordered traversal of valid slots, including count0.
+__mlu_func__ int64_t next_slot(const KdaPcpParams& p,
+                               uint32_t* index_window,
+                               int64_t* index_base,
+                               uint32_t* cu_window,
+                               int64_t* cu_base,
+                               int64_t sequence,
+                               int64_t start,
+                               int64_t* begin,
+                               int32_t* count) {
+  for (int64_t slot = start; slot < p.chunks; ++slot) {
+    // Other sequences' chunks never need their token bounds.
+    slot = kda_pcp_metadata::find_sequence_chunk(
+        p, index_window, index_base, sequence, slot);
+    if (slot < 0) {
+      return -1;
+    }
+    int64_t owner = 0;
+    if (kda_pcp_metadata::locate(p,
+                                 index_window,
+                                 index_base,
+                                 cu_window,
+                                 cu_base,
+                                 slot,
+                                 &owner,
+                                 begin,
+                                 count) &&
+        owner == sequence) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+// Each destination is private to one task and parity. Only the opposite
+// parity may receive IO while current factors or their scratch aliases live.
+__mlu_func__ void prefetch_factors(KdaPcpParams p,
+                                   int64_t slot,
+                                   int64_t head,
+                                   int32_t first_channel,
+                                   float* weights,
+                                   float* keys,
+                                   float* inverse,
+                                   float* causal,
+                                   float* decay,
+                                   float* raw) {
+  int64_t factor = (slot * p.heads + head) * p.block * kDim;
+  int64_t square = (slot * p.heads + head) * p.block * p.block;
+  __memcpy_async(
+      weights, p.w + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(weights + p.block * kDim,
+                 p.qg + factor,
+                 p.block * kDim * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(
+      keys, p.kg + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(inverse,
+                 p.inverse + square,
+                 p.block * p.block * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(
+      causal, p.aq + square, p.block * p.block * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(decay,
+                 p.gate_cumsum + (slot * p.heads + head) * kDim,
+                 kDim * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(
+      raw,
+      p.u + (slot * p.heads + head) * kDim * p.block + first_channel * p.block,
+      kValueRows * p.block * sizeof(float),
+      GDRAM2NRAM);
+}
+
+// One task owns32 consecutive state rows and retains state across chunks.
+// Every factor remains original FP32; matrix reduction order is independently
+// validated before promotion. This TU never overwrites prepared factors.
+__mlu_global__ void replay_prefetched_rows32(KdaPcpParams p) {
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float state[kValueRows * kDim];
+  __nram__ float projection[kValueRows * 2 * kMaxBlock];
+  __nram__ float raw_storage[2][kValueRows * kMaxBlock];
+  __nram__ float resolved[kValueRows * kMaxBlock];
+  __nram__ float update[kValueRows * kDim];
+  __nram__ float weights_storage[2][2 * kMaxBlock * kDim];
+  __nram__ float keys_storage[2][kMaxBlock * kDim];
+  __nram__ float inverse_storage[2][kMaxBlock * kMaxBlock];
+  __nram__ float causal_storage[2][kMaxBlock * kMaxBlock];
+  __nram__ float decay_storage[2][kDim];
+  __nram__ bfloat16_t bf16_output[kValueRows * kMaxBlock];
+  __nram__ half half_output[kValueRows * kMaxBlock];
+  // Combined W/Qg has 2*BT output channels, rounded to 64. The main
+  // workspace is reused for transposed Kg only after the first conv completes.
+  // Inv/Aq each need round_up(BT, 64)*round_up(BT*4, 64) physical bytes.
+  __wram__ float matrix_weights[kDim * 2 * kMaxBlock];
+  // Independent physical symbols avoid any bank-local WRAM offset arithmetic.
+  __wram__ float inverse_weights[kMaxBlock * kMaxBlock];
+  __wram__ float causal_weights[kMaxBlock * kMaxBlock];
+  // Private metadata windows; see bangc_kda_pcp_metadata.mluh.
+  __nram__ uint32_t index_window[kda_pcp_metadata::kIndexWindowWords];
+  __nram__ uint32_t cu_window[kda_pcp_metadata::kCuWindowWords];
+  int64_t index_base = kda_pcp_metadata::kNoWindow;
+  int64_t cu_base = kda_pcp_metadata::kNoWindow;
+  for (int64_t job = taskId; job < p.sequences * p.heads * kTiles;
+       job += taskDim) {
+    int32_t tile = static_cast<int32_t>(job % kTiles);
+    int64_t head = (job / kTiles) % p.heads;
+    int64_t sequence = job / (kTiles * p.heads);
+    int32_t first_row = tile * kValueRows;
+    int32_t first_channel = first_row;
+    int64_t state_offset =
+        ((sequence * p.heads + head) * kDim + first_channel) * kDim;
+    __memcpy(state,
+             p.initial + state_offset,
+             kValueRows * kDim * sizeof(float),
+             GDRAM2NRAM);
+    __sync_io();
+    int32_t parity = 0;
+    int64_t begin = 0;
+    int32_t count = 0;
+    int64_t slot = next_slot(p,
+                             index_window,
+                             &index_base,
+                             cu_window,
+                             &cu_base,
+                             sequence,
+                             0,
+                             &begin,
+                             &count);
+    if (slot >= 0) {
+      prefetch_factors(p,
+                       slot,
+                       head,
+                       first_channel,
+                       weights_storage[parity],
+                       keys_storage[parity],
+                       inverse_storage[parity],
+                       causal_storage[parity],
+                       decay_storage[parity],
+                       raw_storage[parity]);
+      __sync_io();
+    }
+    while (slot >= 0) {
+      float* weights = weights_storage[parity];
+      float* keys = keys_storage[parity];
+      float* inverse = inverse_storage[parity];
+      float* causal = causal_storage[parity];
+      float* decay = decay_storage[parity];
+      float* raw = raw_storage[parity];
+      int32_t following_parity = parity ^ 1;
+      int64_t following_begin = 0;
+      int32_t following_count = 0;
+      int64_t following_slot = next_slot(p,
+                                         index_window,
+                                         &index_base,
+                                         cu_window,
+                                         &cu_base,
+                                         sequence,
+                                         slot + 1,
+                                         &following_begin,
+                                         &following_count);
+      // Both projections read exactly the same old state. Combine their
+      // output channels in one matrix load/conv, preserving128-term dots.
+      __bang_load_matrix(matrix_weights,
+                         weights,
+                         NRAM2WRAM,
+                         2 * p.block,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __sync_move();
+      // The first load_matrix is synchronous and can drain all queues.
+      // Issue next IO only after it completes, before current Compute starts.
+      if (following_slot >= 0) {
+        prefetch_factors(p,
+                         following_slot,
+                         head,
+                         first_channel,
+                         weights_storage[following_parity],
+                         keys_storage[following_parity],
+                         inverse_storage[following_parity],
+                         causal_storage[following_parity],
+                         decay_storage[following_parity],
+                         raw_storage[following_parity]);
+      }
+      __bang_conv(projection,
+                  state,
+                  matrix_weights,
+                  kDim,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  2 * p.block);
+      // Inv has disjoint NRAM/WRAM storage: Move can overlap the old-state
+      // projection without replacing the matrix consumed by Compute.
+      __bang_load_matrix_async(inverse_weights,
+                               inverse,
+                               NRAM2WRAM,
+                               p.block,
+                               p.block,
+                               p.block * sizeof(float),
+                               false);
+      __sync_compute();
+      // Split the combined [32,2*BT] result with Compute-pipeline
+      // transposes. update is dead until the final state update. weights is
+      // dead after the initial matrix load and now retains the Qg projection.
+      // All source/destination arrays are disjoint for each transpose.
+      __bang_transpose(update, projection, kValueRows, 2 * p.block);
+      __bang_transpose(projection, update, p.block, kValueRows);
+      __bang_transpose(
+          weights, update + p.block * kValueRows, p.block, kValueRows);
+      __bang_sub(raw, raw, projection, kValueRows * p.block);
+      __sync_compute();
+      // raw32xBT times transpose(InvBTxBT): resolved32xBT.
+      __sync_move();
+      __bang_conv(resolved,
+                  raw,
+                  inverse_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // The causal matrix was read with the other factors. Its independent
+      // WRAM load overlaps the resolved-state projection on Compute.
+      __bang_load_matrix_async(causal_weights,
+                               causal,
+                               NRAM2WRAM,
+                               p.block,
+                               p.block,
+                               p.block * sizeof(float),
+                               false);
+      __sync_compute();
+      __sync_move();
+      __bang_conv(raw,
+                  resolved,
+                  causal_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // The first projection finished before this main-WRAM reuse. Kg Move
+      // overlaps causal projection, conversion, and output IO on disjoint data.
+      __bang_load_matrix_async(matrix_weights,
+                               keys,
+                               NRAM2WRAM,
+                               p.block,
+                               kDim,
+                               kDim * sizeof(float),
+                               true);
+      __sync_compute();
+      __bang_add(projection, weights, raw, kValueRows * p.block);
+      __bang_transpose(raw, projection, kValueRows, p.block);
+      __sync_compute();
+      if (count > 0) {
+        int64_t output_offset = (begin * p.heads + head) * kDim + first_channel;
+        if (p.v_kind == 0) {
+          __memcpy(static_cast<float*>(p.output) + output_offset,
+                   raw,
+                   kValueRows * sizeof(float),
+                   NRAM2GDRAM,
+                   p.heads * kDim * sizeof(float),
+                   kValueRows * sizeof(float),
+                   count - 1);
+        } else if (p.v_kind == 1) {
+          __bang_float2bfloat16_rn(bf16_output, raw, p.block * kValueRows);
+          __sync_compute();
+          __memcpy(static_cast<bfloat16_t*>(p.output) + output_offset,
+                   bf16_output,
+                   kValueRows * sizeof(bfloat16_t),
+                   NRAM2GDRAM,
+                   p.heads * kDim * sizeof(bfloat16_t),
+                   kValueRows * sizeof(bfloat16_t),
+                   count - 1);
+        } else {
+          __bang_float2half_rn(half_output, raw, p.block * kValueRows);
+          __sync_compute();
+          __memcpy(static_cast<half*>(p.output) + output_offset,
+                   half_output,
+                   kValueRows * sizeof(half),
+                   NRAM2GDRAM,
+                   p.heads * kDim * sizeof(half),
+                   kValueRows * sizeof(half),
+                   count - 1);
+        }
+        // Output buffers are reused on the next chunk only after IO completes.
+        __sync_io();
+      }
+      // resolved32xBT times KgBTx128: update64x128.
+      __sync_move();
+      __bang_conv(update,
+                  resolved,
+                  matrix_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  kDim);
+      __sync_compute();
+      // One vector exponential per chunk, reused by all32 value rows.
+      __bang_exp(decay, decay, kDim);
+      __bang_cycle_mul(state, state, decay, kValueRows * kDim, kDim);
+      __bang_add(state, state, update, kValueRows * kDim);
+      __sync_compute();
+      // Current scratch is dead after Compute; next factors must finish IO
+      // before consumption. This also covers count0 without an output store.
+      __sync_io();
+      parity = following_parity;
+      slot = following_slot;
+      begin = following_begin;
+      count = following_count;
+    }
+    __memcpy(p.final_state + state_offset,
+             state,
+             kValueRows * kDim * sizeof(float),
+             NRAM2GDRAM);
+    __sync_io();
+  }
+}
+}  // namespace replay_rows32
+}  // namespace
+
+extern "C" void bangc_kda_pcp_replay_rows32(cnrtQueue_t queue,
+                                            const KdaPcpParams* params) {
+  cnrtDim3_t grid = {32, 1, 1};
+  replay_rows32::replay_prefetched_rows32<<<grid, cnrtFuncTypeBlock, queue>>>(
+      *params);
+}
+
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_pcp_replay_rows64 ----
+
+namespace xllm::kernel::mlu {
+
+namespace {
+namespace replay_rows64 {
+constexpr int32_t kDim = 128;
+constexpr int32_t kMaxBlock = 64;
+constexpr int32_t kValueRows = 64;
+constexpr int32_t kReplayRows = kDim;
+constexpr int32_t kTiles = kReplayRows / kValueRows;
+
+// Preserve the original ordered traversal of valid slots, including count0.
+__mlu_func__ int64_t next_slot(const KdaPcpParams& p,
+                               uint32_t* index_window,
+                               int64_t* index_base,
+                               uint32_t* cu_window,
+                               int64_t* cu_base,
+                               int64_t sequence,
+                               int64_t start,
+                               int64_t* begin,
+                               int32_t* count) {
+  for (int64_t slot = start; slot < p.chunks; ++slot) {
+    // Other sequences' chunks never need their token bounds.
+    slot = kda_pcp_metadata::find_sequence_chunk(
+        p, index_window, index_base, sequence, slot);
+    if (slot < 0) {
+      return -1;
+    }
+    int64_t owner = 0;
+    if (kda_pcp_metadata::locate(p,
+                                 index_window,
+                                 index_base,
+                                 cu_window,
+                                 cu_base,
+                                 slot,
+                                 &owner,
+                                 begin,
+                                 count) &&
+        owner == sequence) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+// Each destination is private to one task and parity. Only the opposite
+// parity may receive IO while current factors or their scratch aliases live.
+__mlu_func__ void prefetch_factors(KdaPcpParams p,
+                                   int64_t slot,
+                                   int64_t head,
+                                   int32_t first_channel,
+                                   float* weights,
+                                   float* keys,
+                                   float* inverse,
+                                   float* causal,
+                                   float* decay,
+                                   float* raw) {
+  int64_t factor = (slot * p.heads + head) * p.block * kDim;
+  int64_t square = (slot * p.heads + head) * p.block * p.block;
+  __memcpy_async(
+      weights, p.w + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(weights + p.block * kDim,
+                 p.qg + factor,
+                 p.block * kDim * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(
+      keys, p.kg + factor, p.block * kDim * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(inverse,
+                 p.inverse + square,
+                 p.block * p.block * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(
+      causal, p.aq + square, p.block * p.block * sizeof(float), GDRAM2NRAM);
+  __memcpy_async(decay,
+                 p.gate_cumsum + (slot * p.heads + head) * kDim,
+                 kDim * sizeof(float),
+                 GDRAM2NRAM);
+  __memcpy_async(
+      raw,
+      p.u + (slot * p.heads + head) * kDim * p.block + first_channel * p.block,
+      kValueRows * p.block * sizeof(float),
+      GDRAM2NRAM);
+}
+
+// One task owns64 consecutive state rows and retains state across chunks.
+// Every factor remains original FP32; matrix reduction order is independently
+// validated before promotion. This TU never overwrites prepared factors.
+__mlu_global__ void replay_prefetched_rows64(KdaPcpParams p) {
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float state[kValueRows * kDim];
+  __nram__ float projection[kValueRows * 2 * kMaxBlock];
+  __nram__ float raw_storage[2][kValueRows * kMaxBlock];
+  __nram__ float resolved[kValueRows * kMaxBlock];
+  __nram__ float update[kValueRows * kDim];
+  __nram__ float weights_storage[2][2 * kMaxBlock * kDim];
+  __nram__ float keys_storage[2][kMaxBlock * kDim];
+  __nram__ float inverse_storage[2][kMaxBlock * kMaxBlock];
+  __nram__ float causal_storage[2][kMaxBlock * kMaxBlock];
+  __nram__ float decay_storage[2][kDim];
+  __nram__ bfloat16_t bf16_output[kValueRows * kMaxBlock];
+  __nram__ half half_output[kValueRows * kMaxBlock];
+  // Combined W/Qg has 2*BT output channels, rounded to 64. The main
+  // workspace is reused for transposed Kg only after the first conv completes.
+  // Inv/Aq each need round_up(BT, 64)*round_up(BT*4, 64) physical bytes.
+  __wram__ float matrix_weights[kDim * 2 * kMaxBlock];
+  // Independent physical symbols avoid any bank-local WRAM offset arithmetic.
+  __wram__ float inverse_weights[kMaxBlock * kMaxBlock];
+  __wram__ float causal_weights[kMaxBlock * kMaxBlock];
+  // Private metadata windows; see bangc_kda_pcp_metadata.mluh.
+  __nram__ uint32_t index_window[kda_pcp_metadata::kIndexWindowWords];
+  __nram__ uint32_t cu_window[kda_pcp_metadata::kCuWindowWords];
+  int64_t index_base = kda_pcp_metadata::kNoWindow;
+  int64_t cu_base = kda_pcp_metadata::kNoWindow;
+  for (int64_t job = taskId; job < p.sequences * p.heads * kTiles;
+       job += taskDim) {
+    int32_t tile = static_cast<int32_t>(job % kTiles);
+    int64_t head = (job / kTiles) % p.heads;
+    int64_t sequence = job / (kTiles * p.heads);
+    int32_t first_row = tile * kValueRows;
+    int32_t first_channel = first_row;
+    int64_t state_offset =
+        ((sequence * p.heads + head) * kDim + first_channel) * kDim;
+    __memcpy(state,
+             p.initial + state_offset,
+             kValueRows * kDim * sizeof(float),
+             GDRAM2NRAM);
+    __sync_io();
+    int32_t parity = 0;
+    int64_t begin = 0;
+    int32_t count = 0;
+    int64_t slot = next_slot(p,
+                             index_window,
+                             &index_base,
+                             cu_window,
+                             &cu_base,
+                             sequence,
+                             0,
+                             &begin,
+                             &count);
+    if (slot >= 0) {
+      prefetch_factors(p,
+                       slot,
+                       head,
+                       first_channel,
+                       weights_storage[parity],
+                       keys_storage[parity],
+                       inverse_storage[parity],
+                       causal_storage[parity],
+                       decay_storage[parity],
+                       raw_storage[parity]);
+      __sync_io();
+    }
+    while (slot >= 0) {
+      float* weights = weights_storage[parity];
+      float* keys = keys_storage[parity];
+      float* inverse = inverse_storage[parity];
+      float* causal = causal_storage[parity];
+      float* decay = decay_storage[parity];
+      float* raw = raw_storage[parity];
+      int32_t following_parity = parity ^ 1;
+      int64_t following_begin = 0;
+      int32_t following_count = 0;
+      int64_t following_slot = next_slot(p,
+                                         index_window,
+                                         &index_base,
+                                         cu_window,
+                                         &cu_base,
+                                         sequence,
+                                         slot + 1,
+                                         &following_begin,
+                                         &following_count);
+      // Both projections read exactly the same old state. Combine their
+      // output channels in one matrix load/conv, preserving128-term dots.
+      __bang_load_matrix(matrix_weights,
+                         weights,
+                         NRAM2WRAM,
+                         2 * p.block,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __sync_move();
+      // The first load_matrix is synchronous and can drain all queues.
+      // Issue next IO only after it completes, before current Compute starts.
+      if (following_slot >= 0) {
+        prefetch_factors(p,
+                         following_slot,
+                         head,
+                         first_channel,
+                         weights_storage[following_parity],
+                         keys_storage[following_parity],
+                         inverse_storage[following_parity],
+                         causal_storage[following_parity],
+                         decay_storage[following_parity],
+                         raw_storage[following_parity]);
+      }
+      __bang_conv(projection,
+                  state,
+                  matrix_weights,
+                  kDim,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  2 * p.block);
+      // Inv has disjoint NRAM/WRAM storage: Move can overlap the old-state
+      // projection without replacing the matrix consumed by Compute.
+      __bang_load_matrix_async(inverse_weights,
+                               inverse,
+                               NRAM2WRAM,
+                               p.block,
+                               p.block,
+                               p.block * sizeof(float),
+                               false);
+      __sync_compute();
+      // Split the combined [64,2*BT] result with Compute-pipeline
+      // transposes. update is dead until the final state update. weights is
+      // dead after the initial matrix load and now retains the Qg projection.
+      // All source/destination arrays are disjoint for each transpose.
+      __bang_transpose(update, projection, kValueRows, 2 * p.block);
+      __bang_transpose(projection, update, p.block, kValueRows);
+      __bang_transpose(
+          weights, update + p.block * kValueRows, p.block, kValueRows);
+      __bang_sub(raw, raw, projection, kValueRows * p.block);
+      __sync_compute();
+      // raw64xBT times transpose(InvBTxBT): resolved64xBT.
+      __sync_move();
+      __bang_conv(resolved,
+                  raw,
+                  inverse_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // The causal matrix was read with the other factors. Its independent
+      // WRAM load overlaps the resolved-state projection on Compute.
+      __bang_load_matrix_async(causal_weights,
+                               causal,
+                               NRAM2WRAM,
+                               p.block,
+                               p.block,
+                               p.block * sizeof(float),
+                               false);
+      __sync_compute();
+      __sync_move();
+      __bang_conv(raw,
+                  resolved,
+                  causal_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  p.block);
+      // The first projection finished before this main-WRAM reuse. Kg Move
+      // overlaps causal projection, conversion, and output IO on disjoint data.
+      __bang_load_matrix_async(matrix_weights,
+                               keys,
+                               NRAM2WRAM,
+                               p.block,
+                               kDim,
+                               kDim * sizeof(float),
+                               true);
+      __sync_compute();
+      __bang_add(projection, weights, raw, kValueRows * p.block);
+      __bang_transpose(raw, projection, kValueRows, p.block);
+      __sync_compute();
+      if (count > 0) {
+        int64_t output_offset = (begin * p.heads + head) * kDim + first_channel;
+        if (p.v_kind == 0) {
+          __memcpy(static_cast<float*>(p.output) + output_offset,
+                   raw,
+                   kValueRows * sizeof(float),
+                   NRAM2GDRAM,
+                   p.heads * kDim * sizeof(float),
+                   kValueRows * sizeof(float),
+                   count - 1);
+        } else if (p.v_kind == 1) {
+          __bang_float2bfloat16_rn(bf16_output, raw, p.block * kValueRows);
+          __sync_compute();
+          __memcpy(static_cast<bfloat16_t*>(p.output) + output_offset,
+                   bf16_output,
+                   kValueRows * sizeof(bfloat16_t),
+                   NRAM2GDRAM,
+                   p.heads * kDim * sizeof(bfloat16_t),
+                   kValueRows * sizeof(bfloat16_t),
+                   count - 1);
+        } else {
+          __bang_float2half_rn(half_output, raw, p.block * kValueRows);
+          __sync_compute();
+          __memcpy(static_cast<half*>(p.output) + output_offset,
+                   half_output,
+                   kValueRows * sizeof(half),
+                   NRAM2GDRAM,
+                   p.heads * kDim * sizeof(half),
+                   kValueRows * sizeof(half),
+                   count - 1);
+        }
+        // Output buffers are reused on the next chunk only after IO completes.
+        __sync_io();
+      }
+      // resolved64xBT times KgBTx128: update64x128.
+      __sync_move();
+      __bang_conv(update,
+                  resolved,
+                  matrix_weights,
+                  p.block,
+                  kValueRows,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  kDim);
+      __sync_compute();
+      // One vector exponential per chunk, reused by all64 value rows.
+      __bang_exp(decay, decay, kDim);
+      __bang_cycle_mul(state, state, decay, kValueRows * kDim, kDim);
+      __bang_add(state, state, update, kValueRows * kDim);
+      __sync_compute();
+      // Current scratch is dead after Compute; next factors must finish IO
+      // before consumption. This also covers count0 without an output store.
+      __sync_io();
+      parity = following_parity;
+      slot = following_slot;
+      begin = following_begin;
+      count = following_count;
+    }
+    __memcpy(p.final_state + state_offset,
+             state,
+             kValueRows * kDim * sizeof(float),
+             NRAM2GDRAM);
+    __sync_io();
+  }
+}
+}  // namespace replay_rows64
+}  // namespace
+
+extern "C" void bangc_kda_pcp_replay_rows64(cnrtQueue_t queue,
+                                            const KdaPcpParams* params) {
+  cnrtDim3_t grid = {32, 1, 1};
+  replay_rows64::replay_prefetched_rows64<<<grid, cnrtFuncTypeBlock, queue>>>(
+      *params);
+}
+
+}  // namespace xllm::kernel::mlu

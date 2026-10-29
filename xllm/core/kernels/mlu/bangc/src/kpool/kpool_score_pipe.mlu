@@ -1,0 +1,740 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// Software-pipelined decode KPool score. Work items are (window, pool tile):
+// a window is W consecutive queries (W = 1 for ordinary decode, 4 for MTP
+// verify) that share one request row and therefore one key gather. Each IPU
+// owns a contiguous item range and overlaps the key gather of item i + 1 with
+// the arithmetic of item i. The per-tile arithmetic is the original grouped
+// score sequence (conv, scale, relu, head weights, transpose, sumpool, masks).
+//
+// Only pools below the batch's largest live prefix are tiled ("span"); the
+// remaining capacity (graph tables wider than the live context) is filled
+// with -inf by strided stores. Tiles past a window's own live prefix skip the
+// key gather and arithmetic, partially live tiles gather only their live
+// pages, and missing pages read distinct dummy rows so that concurrent cores
+// never serialize on one cache line.
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/kpool/launchers.h"
+
+namespace {
+using AliasInt32 = int32_t __attribute__((__may_alias__));
+
+constexpr int32_t kTokenBlock = 1024;  // preloaded rows/positions per IPU
+
+__mlu_func__ int32_t row_id(const AliasInt32* words, int32_t index) {
+  int32_t low = words[index * 2];
+  int32_t high = words[index * 2 + 1];
+  return high == 0 && low >= 0 ? low : -1;
+}
+
+struct Item {
+  int32_t window;
+  int32_t first;         // first pool of the tile
+  int32_t token;         // first query of the window
+  int32_t count;         // queries in the window
+  int32_t request;       // shared request row, -1 if invalid
+  int32_t store_count;   // pools stored for this tile
+  int32_t gather_pages;  // live pages gathered for this tile
+  bool uniform;          // every query of the window names the same row
+  bool dead;             // uniform window with no live pool in this tile
+};
+
+template <int32_t W, int32_t TileMax>
+struct Buffers {
+  bfloat16_t keys[2][TileMax * 128];
+  float dot[TileMax * W * 32];
+  float transposed[TileMax * W * 32];
+  float scores[W * TileMax];
+  float ordered[W * TileMax];
+  bfloat16_t query[2][W * 32 * 128];
+  float weights[2][W * 32];
+  float scaled_weights[W * 32];
+  int32_t pages[2][TileMax / 4];
+  int32_t present[2][TileMax / 4];
+  int32_t upper[TileMax / 4];
+  uint32_t offsets[2][TileMax / 4];
+  uint32_t repeated[TileMax];
+  uint32_t valid[2][TileMax];
+  uint32_t row_valid[TileMax];
+  int32_t mixed_pages[TileMax / 4];
+  uint32_t lanes[TileMax / 4];
+  float neg[TileMax];
+  int64_t rows[kTokenBlock];
+  int32_t positions[kTokenBlock];
+  int32_t reduce[kTokenBlock];
+};
+
+// Largest live pool prefix over every query, bounded by the table width.
+// Every core computes it redundantly from NRAM-folded position maxima. A
+// single token block also stages the rows/positions the pipeline reads.
+template <int32_t W, int32_t TileMax>
+__mlu_func__ int32_t live_span(Buffers<W, TileMax>* b,
+                               const int32_t* positions,
+                               const int64_t* rows,
+                               int32_t tokens,
+                               int32_t table_width) {
+  int32_t best = -1;
+  for (int32_t base = 0; base < tokens; base += kTokenBlock) {
+    int32_t n = tokens - base < kTokenBlock ? tokens - base : kTokenBlock;
+    int32_t padded = 32;
+    while (padded < n) {
+      padded *= 2;
+    }
+    __memcpy_async(
+        b->reduce, positions + base, n * sizeof(int32_t), GDRAM2NRAM);
+    if (tokens <= kTokenBlock) {
+      __memcpy_async(b->positions, positions, n * sizeof(int32_t), GDRAM2NRAM);
+      __memcpy_async(b->rows, rows, n * sizeof(int64_t), GDRAM2NRAM);
+    }
+    if (padded > n) {
+      __bang_write_value(b->reduce + n, padded - n, -1);
+    }
+    __sync_io();
+    for (int32_t m = padded / 2; m >= 32; m /= 2) {
+      __bang_maxequal(b->reduce, b->reduce, b->reduce + m, m);
+    }
+    __sync_compute();
+    for (int32_t i = 0; i < 32; ++i) {
+      best = b->reduce[i] > best ? b->reduce[i] : best;
+    }
+  }
+  int64_t live = best >= 0 ? (static_cast<int64_t>(best) + 1) / 4 : 0;
+  int64_t limit = static_cast<int64_t>(table_width) * 4;
+  return static_cast<int32_t>(live < limit ? live : limit);
+}
+
+// Largest power-of-two-multiple-of-64 tile <= TileMax giving >= 32 items.
+__mlu_func__ int32_t choose_tile(int32_t windows,
+                                 int32_t span,
+                                 int32_t tile_max) {
+  int32_t tile = tile_max;
+  while (tile > 64 &&
+         static_cast<int64_t>(windows) * ((span + tile - 1) / tile) < 32) {
+    tile /= 2;
+  }
+  return tile;
+}
+
+template <int32_t W, int32_t TileMax>
+class PipeScore final {
+ public:
+  using B = Buffers<W, TileMax>;
+  static constexpr int32_t kHeadsMax = ((W * 32 + 63) / 64) * 64;
+
+  __mlu_func__ PipeScore(B* b,
+                         bfloat16_t* filter,
+                         const bfloat16_t* query,
+                         const float* weights,
+                         const bfloat16_t* cache,
+                         const int32_t* table,
+                         const int32_t* positions,
+                         const int64_t* rows,
+                         float* output,
+                         int32_t tokens,
+                         int32_t capacity,
+                         int32_t span,
+                         int32_t table_width,
+                         int32_t cache_blocks,
+                         float scale,
+                         int32_t batch,
+                         int32_t tile)
+      : b_(b),
+        filter_(filter),
+        query_(query),
+        weights_(weights),
+        cache_(cache),
+        table_(table),
+        positions_(positions),
+        rows_(rows),
+        output_(output),
+        tokens_(tokens),
+        capacity_(capacity),
+        span_(span),
+        table_width_(table_width),
+        cache_blocks_(cache_blocks),
+        scale_(scale),
+        batch_(batch),
+        tile_(tile),
+        tiles_((span + tile - 1) / tile),
+        block_base_(tokens <= kTokenBlock ? 0 : -1),
+        window_(-1) {}
+
+  // Rows/positions for [token, token + W) must be NRAM resident.
+  __mlu_func__ void ensure_tokens(int32_t token) {
+    int32_t last = token + W;
+    if (block_base_ >= 0 && token >= block_base_ &&
+        last <= block_base_ + kTokenBlock) {
+      return;
+    }
+    // Keep the two previous windows resident: the item being computed may
+    // trail the item being described by two windows.
+    int32_t base = token - 2 * W > 0 ? token - 2 * W : 0;
+    block_base_ = base;
+    int32_t count = tokens_ - base < kTokenBlock ? tokens_ - base : kTokenBlock;
+    __memcpy(b_->rows, rows_ + base, count * sizeof(int64_t), GDRAM2NRAM);
+    __memcpy(
+        b_->positions, positions_ + base, count * sizeof(int32_t), GDRAM2NRAM);
+  }
+
+  __mlu_func__ int32_t local_row(int32_t token) const {
+    return row_id(reinterpret_cast<const AliasInt32*>(b_->rows),
+                  token - block_base_);
+  }
+
+  __mlu_func__ int32_t local_position(int32_t token) const {
+    return b_->positions[token - block_base_];
+  }
+
+  __mlu_func__ Item describe(int32_t item) {
+    Item r;
+    r.window = item / tiles_;
+    r.first = (item % tiles_) * tile_;
+    r.token = r.window * W;
+    r.count = tokens_ - r.token < W ? tokens_ - r.token : W;
+    ensure_tokens(r.token);
+    // Row and live prefix are per window; scalar scans run once per window.
+    if (r.window != window_) {
+      window_ = r.window;
+      int32_t request = local_row(r.token);
+      window_uniform_ = true;
+      for (int32_t q = 1; q < r.count; ++q) {
+        window_uniform_ = window_uniform_ && local_row(r.token + q) == request;
+      }
+      window_request_ = request < batch_ ? request : -1;
+      int32_t live = 0;
+      for (int32_t q = 0; q < r.count; ++q) {
+        int32_t position = local_position(r.token + q);
+        int32_t pools =
+            position >= 0 ? (static_cast<int64_t>(position) + 1) / 4 : 0;
+        live = pools > live ? pools : live;
+      }
+      window_live_ = live < table_width_ * 4 ? live : table_width_ * 4;
+    }
+    r.uniform = window_uniform_;
+    r.request = window_request_;
+    r.store_count = span_ - r.first < tile_ ? span_ - r.first : tile_;
+    int32_t pages = (window_live_ - r.first + 3) / 4;
+    pages = pages < 0 ? 0 : (pages > tile_ / 4 ? tile_ / 4 : pages);
+    pages = r.request < 0 ? 0 : pages;
+    r.gather_pages = r.uniform ? pages : tile_ / 4;
+    r.dead = r.uniform && pages == 0;
+    return r;
+  }
+
+  // Page table segment of `request` for the tile starting at `first`.
+  __mlu_func__ void load_pages(int32_t* pages,
+                               int32_t request,
+                               int32_t first,
+                               bool async) {
+    int32_t page_count = table_width_ - first / 4 < tile_ / 4
+                             ? table_width_ - first / 4
+                             : tile_ / 4;
+    if (page_count < tile_ / 4 || request < 0) {
+      __bang_write_value(pages, tile_ / 4, -1);
+      __sync_compute();
+    }
+    if (page_count > 0 && request >= 0) {
+      const int32_t* source =
+          table_ + static_cast<int64_t>(request) * table_width_ + first / 4;
+      if (async) {
+        __memcpy_async(pages, source, page_count * 4, GDRAM2NRAM);
+      } else {
+        __memcpy(pages, source, page_count * 4, GDRAM2NRAM);
+      }
+    }
+  }
+
+  // present = page is a valid cache block; offsets = byte offsets (0 if not).
+  __mlu_func__ void prepare_offsets(int32_t slot, const int32_t* pages) {
+    int32_t n = tile_ / 4;
+    __bang_ge_scalar(b_->present[slot], pages, 0, n);
+    __bang_lt_scalar(b_->upper, pages, cache_blocks_, n);
+    __bang_band(b_->present[slot], b_->present[slot], b_->upper, n);
+    __bang_mul_scalar(b_->present[slot], b_->present[slot], -1, n);
+    __bang_band(b_->offsets[slot],
+                reinterpret_cast<uint32_t*>(const_cast<int32_t*>(pages)),
+                reinterpret_cast<uint32_t*>(b_->present[slot]),
+                n);
+    __bang_mul_scalar(b_->offsets[slot], b_->offsets[slot], 1024u, n);
+    // Missing pages read distinct dummy rows (masked to -inf later).
+    __bang_bnot(reinterpret_cast<uint32_t*>(b_->upper),
+                reinterpret_cast<uint32_t*>(b_->present[slot]),
+                n);
+    __bang_band(reinterpret_cast<uint32_t*>(b_->upper),
+                reinterpret_cast<uint32_t*>(b_->upper),
+                b_->lanes,
+                n);
+    __bang_bor(b_->offsets[slot],
+               b_->offsets[slot],
+               reinterpret_cast<uint32_t*>(b_->upper),
+               n);
+  }
+
+  // valid[pool] = present[pool / 4]. Replicated with Compute ops: an
+  // NRAM2NRAM __memcpy_async here is not ordered by __sync_move.
+  __mlu_func__ void expand_valid(int32_t slot) {
+    int32_t n = tile_ / 4;
+    for (int32_t k = 0; k < 4; ++k) {
+      __bang_add_scalar(reinterpret_cast<int32_t*>(b_->repeated) + k * n,
+                        b_->present[slot],
+                        0,
+                        n);
+    }
+    __bang_transpose(b_->valid[slot], b_->repeated, 4, n);
+  }
+
+  // Keys past `pages` stay stale; their pools are masked by the live limit.
+  __mlu_func__ void gather(int32_t slot, int32_t pages) {
+    if (pages > 0) {
+      __gather_async(b_->keys[slot],
+                     cache_,
+                     b_->offsets[slot],
+                     1024,
+                     GDRAM2NRAM,
+                     1024,
+                     pages);
+    }
+  }
+
+  __mlu_func__ void store_dead(const Item& it) {
+    for (int32_t q = 0; q < it.count; ++q) {
+      __memcpy_async(
+          output_ + static_cast<int64_t>(it.token + q) * capacity_ + it.first,
+          b_->neg,
+          it.store_count * 4,
+          NRAM2GDRAM);
+    }
+  }
+
+  __mlu_func__ void load_window(int32_t parity, const Item& it) {
+    __memcpy_async(b_->query[parity],
+                   query_ + static_cast<int64_t>(it.token) * 4096,
+                   it.count * 8192,
+                   GDRAM2NRAM);
+    __memcpy_async(b_->weights[parity],
+                   weights_ + it.token * 32,
+                   it.count * 128,
+                   GDRAM2NRAM);
+  }
+
+  __mlu_func__ void load_filter(int32_t parity, int32_t heads) {
+#ifdef PIPE_DEBUG_D
+    __bang_load_matrix(
+        filter_, b_->query[parity], NRAM2WRAM, heads, 128, 256, false);
+#else
+    __bang_load_matrix_async(
+        filter_, b_->query[parity], NRAM2WRAM, heads, 128, 256, false);
+#endif
+  }
+
+  // Arithmetic for `count` queries sharing keys[slot]; valid[vslot] masks
+  // missing pages; each query's live prefix masks future pools.
+  __mlu_func__ void compute(int32_t slot,
+                            int32_t vslot,
+                            const float* head_w,
+                            int32_t count,
+                            int32_t token,
+                            int32_t first,
+                            int32_t store_count) {
+    int32_t heads = count * 32;
+    int32_t tile = tile_;
+    __bang_conv(
+        b_->dot, b_->keys[slot], filter_, 128, tile, 1, 1, 1, 1, 1, heads);
+    // relu(scale * x) * w == relu(x) * (scale * w) for scale > 0; exact
+    // when scale is a power of two (the model's 1/64).
+    __bang_mul_scalar(b_->scaled_weights, head_w, scale_, heads);
+    __bang_relu(b_->dot, b_->dot, tile * heads);
+    __bang_cycle_mul(b_->dot, b_->dot, b_->scaled_weights, tile * heads, heads);
+    __bang_transpose(b_->transposed, b_->dot, tile * count, 32);
+    __bang_sumpool(
+        b_->scores, b_->transposed, tile * count, 1, 32, 1, 32, 1, 1);
+    float* ordered = b_->scores;
+    if (count > 1) {
+      __bang_transpose(b_->ordered, b_->scores, tile, count);
+      ordered = b_->ordered;
+    }
+    // Missing pages are -inf for every query of the window; pools past a
+    // query's live prefix are -inf for that query only.
+    __bang_bnot(b_->row_valid, b_->valid[vslot], tile);
+    __bang_band_scalar(b_->row_valid, b_->row_valid, 0xff800000u, tile);
+    uint32_t* bits = reinterpret_cast<uint32_t*>(ordered);
+    __bang_cycle_band(bits, bits, b_->valid[vslot], count * tile, tile);
+    __bang_cycle_bor(bits, bits, b_->row_valid, count * tile, tile);
+    for (int32_t q = 0; q < count; ++q) {
+      int32_t position = local_position(token + q);
+      int32_t live =
+          position >= 0 ? (static_cast<int64_t>(position) + 1) / 4 : 0;
+      live = live < table_width_ * 4 ? live : table_width_ * 4;
+      int32_t active = live - first;
+      active = active < 0 ? 0 : (active > tile ? tile : active);
+      if (active < tile) {
+        __bang_write_value(
+            ordered + q * tile + active, tile - active, -INFINITY);
+      }
+    }
+#ifdef PIPE_DEBUG_DUMP
+    __sync_compute();
+    if (PIPE_DEBUG_DUMP == 1)
+      __memcpy(ordered, b_->valid[vslot], tile * 4, NRAM2NRAM);
+    if (PIPE_DEBUG_DUMP == 2) {
+      __bang_write_value(ordered, tile, 0);
+      __memcpy(ordered, b_->present[vslot], tile, NRAM2NRAM);
+    }
+    if (PIPE_DEBUG_DUMP == 3) {
+      __memcpy(ordered, b_->dot, tile * 4, NRAM2NRAM);
+    }
+    if (PIPE_DEBUG_DUMP == 4) {
+      __memcpy(ordered, b_->keys[slot], tile * 4, NRAM2NRAM);
+    }
+#endif
+    __sync_compute();
+    for (int32_t q = 0; q < count; ++q) {
+      __memcpy_async(
+          output_ + static_cast<int64_t>(token + q) * capacity_ + first,
+          ordered + q * tile,
+          store_count * 4,
+          NRAM2GDRAM);
+    }
+  }
+
+  // Mixed-row window: every query is scored independently and synchronously
+  // from the window's already staged queries/weights.
+  __mlu_func__ void compute_mixed(int32_t slot,
+                                  int32_t parity,
+                                  const Item& it) {
+    __sync();
+    for (int32_t q = 0; q < it.count; ++q) {
+      int32_t token = it.token + q;
+      int32_t request = local_row(token);
+      request = request < batch_ ? request : -1;
+      load_pages(b_->mixed_pages, request, it.first, false);
+      prepare_offsets(slot, b_->mixed_pages);
+      __sync_compute();
+      gather(slot, tile_ / 4);
+      expand_valid(slot);
+      __bang_load_matrix(filter_,
+                         b_->query[parity] + q * 4096,
+                         NRAM2WRAM,
+                         32,
+                         128,
+                         256,
+                         false);
+      __sync();
+      compute(slot,
+              slot,
+              b_->weights[parity] + q * 32,
+              1,
+              token,
+              it.first,
+              it.store_count);
+      __sync();
+    }
+  }
+
+  __mlu_func__ void run(int32_t begin, int32_t end) {
+    // lanes[k] = k * 1024 (row k of the cache) when it exists, else 0.
+    uint32_t step = cache_blocks_ >= TileMax / 4 ? 1024u : 0u;
+    for (int32_t k = 0; k < 8; ++k) {
+      b_->lanes[k] = static_cast<uint32_t>(k) * step;
+    }
+    for (int32_t n = 8; n < TileMax / 4; n *= 2) {
+      __bang_add_scalar(b_->lanes + n, b_->lanes, n * step, n);
+    }
+    Item cur = describe(begin);
+    int32_t window_parity = 0;
+    // Prologue: everything for `begin` is synchronous.
+    load_window(0, cur);
+    if (!cur.dead) {
+      load_pages(b_->pages[0], cur.request, cur.first, false);
+      prepare_offsets(0, b_->pages[0]);
+      __sync_compute();
+      gather(0, cur.gather_pages);
+      expand_valid(0);
+    }
+    __sync();
+    load_filter(0, cur.count * 32);
+    __sync();
+    if (begin + 1 < end) {
+      Item next = describe(begin + 1);
+      if (!next.dead) {
+        load_pages(b_->pages[1], next.request, next.first, false);
+      }
+    }
+    int32_t loaded_window = cur.window;
+    for (int32_t item = begin; item < end; ++item) {
+      int32_t slot = (item - begin) & 1;
+      int32_t nslot = slot ^ 1;
+      bool has_next = item + 1 < end;
+      Item next = has_next ? describe(item + 1) : cur;
+      bool next_new_window = has_next && next.window != cur.window;
+      // 1. Compute-side preparation of item + 1 and this item's filter.
+      if (cur.window != loaded_window) {
+        load_filter(window_parity, cur.count * 32);
+        loaded_window = cur.window;
+#ifdef PIPE_DEBUG_A
+        __sync();
+#endif
+      }
+#ifdef PIPE_DEBUG_PRINT
+      if (taskId == 1)
+        printf(
+            "item %d cur(w%d f%d req%d) next(w%d f%d req%d) pages[n]=%d %d %d "
+            "slot %d\n",
+            item,
+            cur.window,
+            cur.first,
+            cur.request,
+            next.window,
+            next.first,
+            next.request,
+            b_->pages[nslot][0],
+            b_->pages[nslot][1],
+            b_->pages[nslot][2],
+            slot);
+#endif
+      if (has_next && !next.dead) {
+        prepare_offsets(nslot, b_->pages[nslot]);
+        expand_valid(nslot);
+      }
+#ifdef PIPE_DEBUG_B
+      __sync();
+#endif
+      __sync_compute();
+      // 2. Asynchronous IO for item + 1 (and pages for item + 2).
+      if (has_next) {
+        if (!next.dead) {
+          gather(nslot, next.gather_pages);
+        }
+        if (next_new_window) {
+          load_window(window_parity ^ 1, next);
+        }
+        if (item + 2 < end) {
+          Item after = describe(item + 2);
+          if (!after.dead) {
+#ifdef PIPE_DEBUG_C
+            load_pages(b_->pages[slot], after.request, after.first, false);
+#else
+            load_pages(b_->pages[slot], after.request, after.first, true);
+#endif
+          }
+        }
+      }
+#ifdef PIPE_DEBUG_SYNC
+      __sync();
+#endif
+      // 3. Arithmetic for this item.
+      if (cur.dead) {
+        store_dead(cur);
+      } else if (cur.uniform) {
+        __sync_move();
+        compute(slot,
+                slot,
+                b_->weights[window_parity],
+                cur.count,
+                cur.token,
+                cur.first,
+                cur.store_count);
+      } else {
+        compute_mixed(slot, window_parity, cur);
+        loaded_window = -1;
+      }
+      __sync();
+      if (next_new_window) {
+        window_parity ^= 1;
+      }
+      cur = next;
+    }
+  }
+
+ private:
+  B* b_;
+  bfloat16_t* filter_;
+  const bfloat16_t* query_;
+  const float* weights_;
+  const bfloat16_t* cache_;
+  const int32_t* table_;
+  const int32_t* positions_;
+  const int64_t* rows_;
+  float* output_;
+  int32_t tokens_, capacity_, span_, table_width_, cache_blocks_;
+  float scale_;
+  int32_t batch_, tile_, tiles_;
+  int32_t block_base_;
+  int32_t window_, window_request_, window_live_;
+  bool window_uniform_;
+};
+
+template <int32_t W, int32_t TileMax>
+__mlu_global__ void pipe_score_kernel(const bfloat16_t* query,
+                                      const float* weights,
+                                      const bfloat16_t* cache,
+                                      const int32_t* table,
+                                      const int32_t* positions,
+                                      const int64_t* rows,
+                                      float* output,
+                                      int32_t tokens,
+                                      int32_t capacity,
+                                      int32_t table_width,
+                                      int32_t cache_blocks,
+                                      float scale,
+                                      int32_t batch) {
+  __nram__ __attribute__((
+      aligned(128))) uint8_t storage[sizeof(Buffers<W, TileMax>)];
+  __wram__ bfloat16_t filter[PipeScore<W, TileMax>::kHeadsMax * 128];
+  if (__is_mpu()) {
+    return;
+  }
+  auto* b = reinterpret_cast<Buffers<W, TileMax>*>(storage);
+  int32_t span = live_span(b, positions, rows, tokens, table_width);
+  span = span < capacity ? span : capacity;
+  __bang_write_value(b->neg, TileMax, -INFINITY);
+  int32_t windows = (tokens + W - 1) / W;
+  int32_t tile = choose_tile(windows, span, TileMax);
+  int32_t tiles = (span + tile - 1) / tile;
+  int32_t items = windows * tiles;
+  int32_t cores = taskDim;
+  int32_t base = items / cores;
+  int32_t extra = items % cores;
+  int32_t begin = taskId * base + (taskId < extra ? taskId : extra);
+  int32_t end = begin + base + (taskId < extra ? 1 : 0);
+  __sync_compute();
+  if (begin < end) {
+    PipeScore<W, TileMax> pipe(b,
+                               filter,
+                               query,
+                               weights,
+                               cache,
+                               table,
+                               positions,
+                               rows,
+                               output,
+                               tokens,
+                               capacity,
+                               span,
+                               table_width,
+                               cache_blocks,
+                               scale,
+                               batch,
+                               tile);
+    pipe.run(begin, end);
+  }
+  // Pools in [span, capacity) are beyond every query's live prefix.
+  if (span < capacity) {
+    int32_t per = tokens / cores;
+    int32_t rest = tokens % cores;
+    int32_t first = taskId * per + (taskId < rest ? taskId : rest);
+    int32_t count = per + (taskId < rest ? 1 : 0);
+    for (int32_t row = first; row < first + count; row += 1024) {
+      int32_t rows_now =
+          first + count - row < 1024 ? first + count - row : 1024;
+      for (int32_t pool = span; pool < capacity; pool += TileMax) {
+        int32_t width = capacity - pool < TileMax ? capacity - pool : TileMax;
+        __memcpy_async(output + static_cast<int64_t>(row) * capacity + pool,
+                       b->neg,
+                       width * 4,
+                       NRAM2GDRAM,
+                       capacity * 4,
+                       0,
+                       rows_now - 1);
+      }
+    }
+    __sync_io();
+  }
+}
+}  // namespace
+
+namespace {
+template <int32_t W, int32_t TileMax>
+void launch_pipe_score(cnrtQueue_t queue,
+                       const void* query,
+                       const void* weights,
+                       const void* cache,
+                       const void* table,
+                       const void* positions,
+                       const void* rows,
+                       void* output,
+                       int32_t tokens,
+                       int32_t capacity,
+                       int32_t table_width,
+                       int32_t cache_blocks,
+                       int32_t batch,
+                       float scale) {
+  cnrtDim3_t dim = {32, 1, 1};
+  pipe_score_kernel<W, TileMax><<<dim, cnrtFuncTypeBlock, queue>>>(
+      static_cast<const bfloat16_t*>(query),
+      static_cast<const float*>(weights),
+      static_cast<const bfloat16_t*>(cache),
+      static_cast<const int32_t*>(table),
+      static_cast<const int32_t*>(positions),
+      static_cast<const int64_t*>(rows),
+      static_cast<float*>(output),
+      tokens,
+      capacity,
+      table_width,
+      cache_blocks,
+      scale,
+      batch);
+}
+}  // namespace
+
+// window: consecutive queries sharing one key gather (1, 2 or 4). Windows
+// whose queries name different rows are scored per query. False: unsupported.
+extern "C" bool kpool_score_pipelined(void* queue,
+                                      const void* query,
+                                      const void* weights,
+                                      const void* cache,
+                                      const void* table,
+                                      const void* positions,
+                                      const void* rows,
+                                      void* output,
+                                      int32_t tokens,
+                                      int32_t capacity,
+                                      int32_t table_width,
+                                      int32_t cache_blocks,
+                                      int32_t batch,
+                                      float scale,
+                                      int32_t window) {
+  if (tokens <= 0 || capacity <= 0 || cache_blocks <= 0 ||
+      cache_blocks > 4194304) {
+    return false;
+  }
+  cnrtQueue_t q = static_cast<cnrtQueue_t>(queue);
+  const auto launch = window == 4   ? launch_pipe_score<4, 256>
+                      : window == 2 ? launch_pipe_score<2, 256>
+                      : window == 1 ? launch_pipe_score<1, 512>
+                                    : nullptr;
+  if (launch == nullptr) {
+    return false;
+  }
+  launch(q,
+         query,
+         weights,
+         cache,
+         table,
+         positions,
+         rows,
+         output,
+         tokens,
+         capacity,
+         table_width,
+         cache_blocks,
+         batch,
+         scale);
+  return true;
+}

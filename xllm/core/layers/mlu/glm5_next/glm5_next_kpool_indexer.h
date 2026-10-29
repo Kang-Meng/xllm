@@ -43,8 +43,8 @@ void prepare_glm5_next_kpool_metadata(AttentionMetadata& metadata,
 torch::Tensor glm5_next_kpool_normalize_key(torch::Tensor key,
                                             RMSNorm& key_norm);
 
-// Select causal pools with paged Triton scoring and torch::topk. Query chunks
-// reuse bounded scores. Equal-score ordering follows native torch::topk.
+// Select causal pools with paged BangC scoring. Query chunks reuse bounded
+// scores. Selected IDs follow select_kpool set semantics; order is unspecified.
 torch::Tensor glm5_next_kpool_select(
     const torch::Tensor& query,
     const torch::Tensor& head_weights,

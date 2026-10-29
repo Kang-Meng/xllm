@@ -25,8 +25,10 @@ struct KPoolSelection final {
   torch::Tensor context_lens;
 };
 
+// MLU KPool supports BF16 keys with D=128, pool_size=4 and block_size=16.
 // Inputs are request-major, with ascending consecutive active positions.
 // Cache storage is framework-owned; padding positions never mutate state.
+// Positive state IDs and physical page IDs name allocated cache/tail storage.
 void update_kpool(const torch::Tensor& k,
                   const torch::Tensor& gate,
                   const torch::Tensor& ape,
@@ -43,10 +45,15 @@ void update_kpool(const torch::Tensor& k,
                   bool decode = false,
                   const torch::Tensor& read_tail_ids = torch::Tensor());
 
-// Complete the destination ring using surviving source history and new tokens.
-// All pooling reads must finish before this update. Distinct source slots stay
-// immutable; a target must not alias another request's live source. Indices are
-// contiguous integer vectors on the cache device; target slots are unique.
+// Standalone test support for tail layouts and source aliasing. Production
+// prefill updates must use update_kpool, which includes tail stashing after
+// pooling reads; this entry point does not validate that integrated path.
+// Complete unique positive destination states from the immutable initial source
+// ring and new tokens. Sources may equal another request's destination or be
+// shared across requests. Positive IDs name allocated tail slots.
+// Nonpositive state IDs represent missing/padding
+// states. All pooling reads must complete before this operation updates the
+// tail.
 void stash_kpool_from_source(const torch::Tensor& k,
                              const torch::Tensor& gate,
                              torch::Tensor& tail,
@@ -57,11 +64,9 @@ void stash_kpool_from_source(const torch::Tensor& k,
 
 // Writes caller-owned FP32 workspace. Positions are causal, zero-based token
 // positions; -1 masks the whole row. Rows map queries to request page tables.
-// Optional device query_starts describes request-major verify spans bounded by
-// four queries, including shorter live spans during graph replay. Without it,
-// scoring retains the independent-query path. Rows must name the same
-// page-table request throughout each span; the model's batch metadata
-// guarantees this.
+// Score each query using its actual row. query_starts is optional scheduling
+// metadata; spans may be ragged, contain padding, or name different requests.
+// Negative rows/positions produce no live pools and never read the page table.
 void score_kpool(const torch::Tensor& query,
                  const torch::Tensor& weights,
                  const torch::Tensor& cache,
@@ -74,8 +79,24 @@ void score_kpool(const torch::Tensor& query,
                  double scale,
                  const torch::Tensor& query_starts = torch::Tensor());
 
-// Native torch.topk tie ordering; nonfinite selections and missing columns -1.
+// The ID set torch.topk(count) selects per row, in unspecified order;
+// nonfinite selections and missing columns -1.
 torch::Tensor select_kpool(const torch::Tensor& scores, int64_t count);
+
+// Same result as select_kpool for scores written by score_kpool with the
+// given pool_size. Uses live-prefix selection when supported.
+torch::Tensor select_kpool_live(const torch::Tensor& scores,
+                                int64_t count,
+                                const torch::Tensor& positions,
+                                int64_t pool_size);
+
+// active = tail_ids[rows] > padding_id && (slot_mapping undefined ||
+// slot_mapping > 0); returns active ? positions : -1 with positions' dtype.
+torch::Tensor kpool_cache_positions(const torch::Tensor& tail_ids,
+                                    const torch::Tensor& rows,
+                                    const torch::Tensor& positions,
+                                    const torch::Tensor& slot_mapping,
+                                    int64_t padding_id);
 
 KPoolSelection expand_kpool(const torch::Tensor& ids,
                             const torch::Tensor& positions,
@@ -84,5 +105,6 @@ KPoolSelection expand_kpool(const torch::Tensor& ids,
                             int64_t block_size,
                             int64_t token_budget,
                             int64_t pool_size,
-                            bool always_tail);
+                            bool always_tail,
+                            bool prefill = false);
 }  // namespace xllm::kernel::mlu

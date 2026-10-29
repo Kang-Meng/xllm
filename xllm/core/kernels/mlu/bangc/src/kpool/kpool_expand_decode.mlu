@@ -1,0 +1,297 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// Software-pipelined decode KPool expansion. Each IPU owns a contiguous
+// token range (consecutive verify queries share one request and therefore one
+// cached block-table prefix). Positions, rows and lengths are staged per
+// token block; while row i is expanded, the selection and table prefix of
+// row i + 1 load and the slots of row i - 1 store. The per-row arithmetic is
+// the original decode expansion: selected pools within the live prefix whose
+// page exists contribute their complete members in selection order, then the
+// incomplete tail pool's tokens are appended; remaining slots are -1.
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/kpool/launchers.h"
+
+namespace {
+using AliasInt32 = int32_t __attribute__((__may_alias__));
+
+constexpr int32_t kTopk = 512;
+constexpr int32_t kSlots = 2051;
+constexpr int32_t kTablePages = 8192;  // cached block-table prefix per slot
+constexpr int32_t kTokenBlock = 256;   // staged positions/rows/lengths
+
+struct Row {
+  int32_t token;
+  int32_t position;
+  int32_t request;  // -1 if the row expands to nothing
+  int32_t pages;    // live table prefix
+};
+
+struct Buffers {
+  int64_t pools[2][kTopk];
+  int32_t table[2][kTablePages];
+  int32_t slots[2][kSlots + 13];
+  int32_t split[2 * kTopk];  // low words, then high words
+  int32_t valid[kTopk], upper[kTopk], pages[kTopk];
+  uint32_t offsets[kTopk];
+  int32_t mapped[4 * kTopk], interleaved[4 * kTopk], member_mask[4 * kTopk];
+  float mask[4 * kTopk], ordered_mask[4 * kTopk];
+  int64_t rows[kTokenBlock];
+  int32_t positions[kTokenBlock];
+  int32_t lengths[kTokenBlock];
+};
+
+class ExpandDecode final {
+ public:
+  __mlu_func__ ExpandDecode(Buffers* b,
+                            const int64_t* selected,
+                            const int32_t* positions,
+                            const int64_t* rows,
+                            const int32_t* table,
+                            int32_t* output,
+                            int32_t* lengths,
+                            int32_t table_width,
+                            int32_t batch,
+                            bool append_tail)
+      : b_(b),
+        selected_(selected),
+        positions_(positions),
+        rows_(rows),
+        table_(table),
+        output_(output),
+        lengths_(lengths),
+        table_width_(table_width),
+        batch_(batch),
+        append_tail_(append_tail) {
+    cached_[0] = cached_[1] = -1;
+    loaded_[0] = loaded_[1] = 0;
+  }
+
+  // Expands tokens [begin, end); every staged token lies in one block.
+  __mlu_func__ void run(int32_t begin, int32_t end) {
+    __memcpy(b_->positions, positions_ + begin, (end - begin) * 4, GDRAM2NRAM);
+    __memcpy(b_->rows, rows_ + begin, (end - begin) * 8, GDRAM2NRAM);
+    base_ = begin;
+    Row cur = describe(begin);
+    load(0, cur);
+    for (int32_t token = begin; token < end; ++token) {
+      int32_t slot = (token - begin) & 1;
+      __sync_io();
+      if (token > begin) {
+        store(slot ^ 1, token - 1);
+      }
+      Row next = cur;
+      if (token + 1 < end) {
+        next = describe(token + 1);
+        load(slot ^ 1, next);
+      }
+      b_->lengths[token - base_] = expand(slot, cur);
+      __sync_compute();
+      cur = next;
+    }
+    store((end - 1 - begin) & 1, end - 1);
+    __memcpy_async(
+        lengths_ + begin, b_->lengths, (end - begin) * 4, NRAM2GDRAM);
+    __sync_io();
+  }
+
+ private:
+  __mlu_func__ Row describe(int32_t token) {
+    Row r;
+    r.token = token;
+    r.position = b_->positions[token - base_];
+    // Valid request IDs fit signed int32; read both stored words explicitly.
+    const AliasInt32* words = reinterpret_cast<const AliasInt32*>(b_->rows);
+    int32_t low = words[(token - base_) * 2];
+    int32_t high = words[(token - base_) * 2 + 1];
+    bool live = r.position >= 0 && high == 0 && low >= 0 && low < batch_;
+    r.request = live ? low : -1;
+    int32_t pages = r.position / 16 + 1;
+    r.pages = pages < table_width_ ? pages : table_width_;
+    return r;
+  }
+
+  __mlu_func__ void load(int32_t slot, const Row& r) {
+    if (r.request < 0) {
+      return;
+    }
+    __memcpy_async(b_->pools[slot],
+                   selected_ + static_cast<int64_t>(r.token) * kTopk,
+                   kTopk * 8,
+                   GDRAM2NRAM);
+    if (cached_[slot] != r.request || loaded_[slot] < r.pages) {
+      __memcpy_async(b_->table[slot],
+                     table_ + static_cast<int64_t>(r.request) * table_width_,
+                     r.pages * 4,
+                     GDRAM2NRAM);
+      cached_[slot] = r.request;
+      loaded_[slot] = r.pages;
+    }
+  }
+
+  __mlu_func__ void store(int32_t slot, int32_t token) {
+    __memcpy_async(output_ + static_cast<int64_t>(token) * kSlots,
+                   b_->slots[slot],
+                   kSlots * 4,
+                   NRAM2GDRAM);
+  }
+
+  // Writes slots[slot] for row `r`; returns its length.
+  __mlu_func__ int32_t expand(int32_t slot, const Row& r) {
+    int32_t* slots = b_->slots[slot];
+    __bang_write_value(slots, kSlots, -1);
+    if (r.request < 0) {
+      return 0;
+    }
+    int32_t* low = b_->split;
+    int32_t* high = b_->split + kTopk;
+    int32_t* valid = b_->valid;
+    int32_t* upper = b_->upper;
+    int32_t* pages = b_->pages;
+    __bang_transpose(
+        b_->split, reinterpret_cast<int32_t*>(b_->pools[slot]), kTopk, 2);
+    __bang_eq_scalar(valid, high, 0, kTopk);
+    __bang_ge_scalar(upper, low, 0, kTopk);
+    __bang_band(valid, valid, upper, kTopk);
+    int32_t limit = r.position / 4;
+    limit = limit < table_width_ * 4 - 1 ? limit : table_width_ * 4 - 1;
+    __bang_le_scalar(upper, low, limit, kTopk);
+    __bang_band(valid, valid, upper, kTopk);
+    __bang_mul_scalar(upper, valid, -1, kTopk);
+    __bang_band(b_->offsets,
+                reinterpret_cast<uint32_t*>(low),
+                reinterpret_cast<uint32_t*>(upper),
+                kTopk);
+    __bang_band_scalar(b_->offsets, b_->offsets, 0xfffffffcu, kTopk);
+    __gather(pages, b_->table[slot], b_->offsets, 4, NRAM2NRAM, 4, kTopk);
+    __bang_ge_scalar(upper, pages, 0, kTopk);
+    __bang_band(valid, valid, upper, kTopk);
+    __bang_mul_scalar(pages, pages, 16, kTopk);
+    __bang_band_scalar(upper, low, 3, kTopk);
+    __bang_mul_scalar(upper, upper, 4, kTopk);
+    __bang_add(pages, pages, upper, kTopk);
+    __bang_mul_scalar(low, low, 4, kTopk);
+    for (int32_t member = 0; member < 4; ++member) {
+      int32_t* member_mask = b_->member_mask + member * kTopk;
+      __bang_add_scalar(b_->mapped + member * kTopk, pages, member, kTopk);
+      __bang_le_scalar(member_mask, low, r.position - member, kTopk);
+      __bang_band(member_mask, member_mask, valid, kTopk);
+    }
+    __bang_int322float(b_->mask, b_->member_mask, 4 * kTopk, 0);
+    __bang_transpose(b_->interleaved, b_->mapped, 4, kTopk);
+    __bang_transpose(b_->ordered_mask, b_->mask, 4, kTopk);
+    int32_t count = __bang_filter(reinterpret_cast<float*>(slots),
+                                  reinterpret_cast<float*>(b_->interleaved),
+                                  b_->ordered_mask,
+                                  4 * kTopk);
+    if (append_tail_) {
+      // 64-bit: position + 1 overflows int32 at INT32_MAX.
+      int64_t first = (static_cast<int64_t>(r.position) + 1) / 4 * 4;
+      for (int64_t logical = first; logical <= r.position; ++logical) {
+        if (logical / 16 >= table_width_) {
+          continue;
+        }
+        int32_t page = b_->table[slot][logical / 16];
+        if (page >= 0) {
+          slots[count++] = page * 16 + static_cast<int32_t>(logical % 16);
+        }
+      }
+    }
+    return count;
+  }
+
+  Buffers* b_;
+  const int64_t* selected_;
+  const int32_t* positions_;
+  const int64_t* rows_;
+  const int32_t* table_;
+  int32_t* output_;
+  int32_t* lengths_;
+  int32_t table_width_, batch_;
+  bool append_tail_;
+  int32_t base_;
+  int32_t cached_[2], loaded_[2];
+};
+
+__mlu_global__ void expand_decode_kernel(const int64_t* selected,
+                                         const int32_t* positions,
+                                         const int64_t* rows,
+                                         const int32_t* table,
+                                         int32_t* output,
+                                         int32_t* lengths,
+                                         int32_t tokens,
+                                         int32_t table_width,
+                                         int32_t batch,
+                                         int32_t append_tail) {
+  __nram__ __attribute__((aligned(128))) uint8_t storage[sizeof(Buffers)];
+  if (__is_mpu()) {
+    return;
+  }
+  int32_t per = tokens / taskDim;
+  int32_t rest = tokens % taskDim;
+  int32_t begin = taskId * per + (taskId < rest ? taskId : rest);
+  int32_t end = begin + per + (taskId < rest ? 1 : 0);
+  ExpandDecode expand(reinterpret_cast<Buffers*>(storage),
+                      selected,
+                      positions,
+                      rows,
+                      table,
+                      output,
+                      lengths,
+                      table_width,
+                      batch,
+                      append_tail != 0);
+  for (int32_t block = begin; block < end; block += kTokenBlock) {
+    int32_t last = end - block < kTokenBlock ? end : block + kTokenBlock;
+    expand.run(block, last);
+  }
+}
+}  // namespace
+
+// Decode expansion for tables whose live prefix fits the NRAM cache. False:
+// unsupported, use the general kernel.
+extern "C" bool kpool_expand_decode(void* queue,
+                                    const void* selected,
+                                    const void* positions,
+                                    const void* rows,
+                                    const void* table,
+                                    void* output,
+                                    void* lengths,
+                                    int32_t tokens,
+                                    int32_t table_width,
+                                    int32_t batch,
+                                    int32_t append_tail) {
+  if (tokens <= 0 || table_width <= 0 || table_width > kTablePages) {
+    return false;
+  }
+  cnrtDim3_t dim = {32, 1, 1};
+  expand_decode_kernel<<<dim,
+                         cnrtFuncTypeBlock,
+                         static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const int64_t*>(selected),
+      static_cast<const int32_t*>(positions),
+      static_cast<const int64_t*>(rows),
+      static_cast<const int32_t*>(table),
+      static_cast<int32_t*>(output),
+      static_cast<int32_t*>(lengths),
+      tokens,
+      table_width,
+      batch,
+      append_tail);
+  return true;
+}

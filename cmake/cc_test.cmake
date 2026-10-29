@@ -11,6 +11,8 @@ include(CMakeParseArguments)
 # COPTS: List of private compile options
 # LINKOPTS: List of link options
 # ARGS: Command line arguments to test case
+# ENVIRONMENT: Environment entries applied to each registered case
+# RUN_SERIAL: Prevent each case from overlapping other CTest cases
 #
 # Usage:
 # cc_library(
@@ -39,9 +41,9 @@ function(cc_test)
 
   cmake_parse_arguments(
     CC_TEST # prefix
-    "CPU_ONLY" # options
-    "NAME;ENVIRONMENT" # one value args
-    "SRCS;COPTS;LINKOPTS;DEPS;INCLUDES;ARGS;DATA" # multi value args
+    "CPU_ONLY;RUN_SERIAL" # options
+    "NAME" # one value args
+    "SRCS;COPTS;LINKOPTS;DEPS;INCLUDES;ARGS;DATA;ENVIRONMENT" # multi value args
     ${ARGN}
   )
 
@@ -137,5 +139,11 @@ function(cc_test)
     set_tests_properties(${_cc_test_${CC_TEST_NAME}_tests}
       PROPERTIES ENVIRONMENT "${CC_TEST_ENVIRONMENT}")
   endif()
-  #add_test(NAME ${CC_TEST_NAME} COMMAND ${CC_TEST_NAME} ${CC_TEST_ARGS})
+  set_property(TEST ${_cc_test_${CC_TEST_NAME}_tests}
+    APPEND PROPERTY LABELS "target:${CC_TEST_NAME}")
+
+  if(CC_TEST_RUN_SERIAL)
+    set_tests_properties(${_cc_test_${CC_TEST_NAME}_tests}
+      PROPERTIES RUN_SERIAL TRUE)
+  endif()
 endfunction()

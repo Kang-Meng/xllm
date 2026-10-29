@@ -124,6 +124,24 @@ TEST(AttentionMetadataBuilderTest, LinearPrefillSchedulesRespectChunkSize) {
   }
 }
 
+TEST(AttentionMetadataBuilderTest, ConvScheduleDoesNotRequireChunkIndices) {
+  for (const int32_t block_size : {16, 64}) {
+    AttentionMetadata metadata;
+    metadata.is_prefill = true;
+    metadata.q_cu_seq_lens =
+        torch::tensor({0, block_size, 2 * block_size + 1}, torch::kInt32);
+    AttentionMetadataBuilder::build_linear_prefill(metadata, block_size);
+    const torch::Tensor batch = metadata.batch.clone();
+    const torch::Tensor offsets = metadata.token_block_offset.clone();
+    AttentionMetadataBuilder::build_linear_prefill(
+        metadata, block_size, /*build_chunk_indices=*/false);
+    EXPECT_FALSE(metadata.chunk_indices.defined());
+    EXPECT_EQ(metadata.tot, 3);
+    EXPECT_TRUE(torch::equal(metadata.batch, batch));
+    EXPECT_TRUE(torch::equal(metadata.token_block_offset, offsets));
+  }
+}
+
 TEST(AttentionMetadataBuilderTest, LinearDecodeDoesNotRequirePrefillLengths) {
   AttentionMetadata metadata;
   metadata.is_prefill = false;

@@ -1,0 +1,677 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+
+#include <climits>
+#include <cmath>
+#include <cstdint>
+
+#include "kernels/mlu/bangc/src/kda/launchers.h"
+
+// ---- bangc_kda_full ----
+
+namespace xllm::kernel::mlu {
+namespace {
+constexpr int32_t kDim = 128;
+template <int32_t RecurrentValueTile>
+__mlu_global__ void kda_parameterized_v078(const bfloat16_t* q_g,
+                                           const bfloat16_t* k_g,
+                                           const bfloat16_t* v_g,
+                                           const void* a_g,
+                                           const void* b_g,
+                                           const float* log_g,
+                                           const float* bias_g,
+                                           const float* initial_g,
+                                           float* final_g,
+                                           bfloat16_t* out_g,
+                                           const int32_t* cu_g,
+                                           const int32_t* idx_g,
+                                           const int32_t* accepted_g,
+                                           int32_t n,
+                                           int32_t heads,
+                                           int32_t columns,
+                                           int32_t spec,
+                                           int32_t inplace,
+                                           int32_t query_heads,
+                                           int32_t gate_mode,
+                                           int32_t gate_dtype,
+                                           int32_t beta_dtype,
+                                           int32_t qk_l2norm,
+                                           float scale,
+                                           float lower_bound,
+                                           float softplus_beta,
+                                           float softplus_threshold) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float outer_weights[128 * 16];
+  __nram__ float gate_window[4 * kDim], beta_window[4];
+  __nram__ bfloat16_t raw_beta[4];
+  __nram__ bfloat16_t gate_raw[4 * kDim];
+  __nram__ float state[RecurrentValueTile * kDim];
+  __nram__ float tmp[RecurrentValueTile * kDim];
+  __nram__ float trans[RecurrentValueTile * kDim];
+  __nram__ float outer[RecurrentValueTile * kDim];
+  __nram__ float q[kDim], key[kDim], bias[kDim], value[kDim];
+  __nram__ float projection[kDim], delta[kDim], result[kDim], work[kDim];
+  __nram__ bfloat16_t raw_storage[4 * 5 * kDim], out[kDim];
+  __nram__ int32_t cu_cache[129], index_cache[512], accepted_cache[128];
+  const bool cache_metadata =
+      idx_g != nullptr && n <= 128 && columns <= 4 && inplace != 2;
+  if (cache_metadata) {
+    __memcpy(cu_cache, cu_g, (n + 1) * sizeof(int32_t), GDRAM2NRAM);
+    __memcpy(index_cache, idx_g, n * columns * sizeof(int32_t), GDRAM2NRAM);
+    if (spec) {
+      __memcpy(accepted_cache, accepted_g, n * sizeof(int32_t), GDRAM2NRAM);
+    }
+  }
+  int32_t cached_head = -1;
+  float rate = 0.f;
+  const int32_t tiles = kDim / RecurrentValueTile;
+  for (int64_t job = taskId; job < static_cast<int64_t>(n) * heads * tiles;
+       job += taskDim) {
+    const int32_t seq =
+        static_cast<int32_t>(job / (static_cast<int64_t>(heads) * tiles));
+    const int32_t head = static_cast<int32_t>((job / tiles) % heads);
+    const int32_t vt = static_cast<int32_t>(job % tiles);
+    const int32_t query_head = head / (heads / query_heads);
+    const int32_t bos = cache_metadata ? cu_cache[seq] : cu_g[seq],
+                  eos = cache_metadata ? cu_cache[seq + 1] : cu_g[seq + 1];
+    const int32_t accepted_count =
+        spec ? (cache_metadata ? accepted_cache[seq] : accepted_g[seq]) : 1;
+    const int32_t accepted = accepted_count > 0 ? accepted_count - 1 : -1;
+    if (accepted < 0 || accepted >= columns || (bos == eos && inplace != 2)) {
+      continue;
+    }
+    const int32_t slot =
+        inplace == 2
+            ? seq
+            : (idx_g == nullptr
+                   ? bos
+                   : (cache_metadata
+                          ? index_cache[static_cast<int64_t>(seq) * columns +
+                                        accepted]
+                          : idx_g[static_cast<int64_t>(seq) * columns +
+                                  accepted]));
+    if (idx_g != nullptr && inplace != 2 && slot <= 0) {
+      continue;
+    }
+    const int64_t state_offset = static_cast<int64_t>(head) * kDim * kDim +
+                                 vt * RecurrentValueTile * kDim;
+    __memcpy(state,
+             initial_g + static_cast<int64_t>(slot) * heads * kDim * kDim +
+                 state_offset,
+             sizeof(state),
+             GDRAM2NRAM);
+    if (inplace == 2 && bos == eos) {
+      __memcpy(final_g + static_cast<int64_t>(seq) * heads * kDim * kDim +
+                   state_offset,
+               state,
+               sizeof(state),
+               NRAM2GDRAM);
+      continue;
+    }
+    if (head != cached_head) {
+      __memcpy(bias, bias_g + head * kDim, sizeof(bias), GDRAM2NRAM);
+      rate = expf(log_g[head]);
+      cached_head = head;
+    }
+    for (int64_t token = bos; token < eos; ++token) {
+      const int64_t offset =
+          (static_cast<int64_t>(token) * heads + head) * kDim;
+      const int64_t query_offset = (token * query_heads + query_head) * kDim;
+      const int32_t window_index = static_cast<int32_t>((token - bos) % 4);
+      bfloat16_t* raw = raw_storage + window_index * 5 * kDim;
+      if (window_index == 0) {
+        const int32_t window_size =
+            static_cast<int32_t>(eos - token < 4 ? eos - token : 4);
+        __memcpy(raw,
+                 q_g + query_offset,
+                 256,
+                 GDRAM2NRAM,
+                 5 * kDim * 2,
+                 query_heads * kDim * 2,
+                 window_size - 1);
+        __memcpy(raw + kDim,
+                 k_g + query_offset,
+                 256,
+                 GDRAM2NRAM,
+                 5 * kDim * 2,
+                 query_heads * kDim * 2,
+                 window_size - 1);
+        if (gate_dtype == 0) {
+          __memcpy(gate_raw,
+                   static_cast<const bfloat16_t*>(a_g) + offset,
+                   256,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   window_size - 1);
+          __bang_bfloat162float(gate_window, gate_raw, window_size * kDim);
+        } else {
+          __memcpy(gate_window,
+                   static_cast<const float*>(a_g) + offset,
+                   512,
+                   GDRAM2NRAM,
+                   kDim * 4,
+                   heads * kDim * 4,
+                   window_size - 1);
+        }
+        __memcpy(raw + 3 * kDim,
+                 v_g + offset + vt * RecurrentValueTile,
+                 RecurrentValueTile * 2,
+                 GDRAM2NRAM,
+                 5 * kDim * 2,
+                 heads * kDim * 2,
+                 window_size - 1);
+        if (beta_dtype == 0) {
+          __memcpy(raw_beta,
+                   static_cast<const bfloat16_t*>(b_g) + token * heads + head,
+                   2,
+                   GDRAM2NRAM,
+                   2,
+                   heads * 2,
+                   window_size - 1);
+          __bang_bfloat162float(beta_window, raw_beta, window_size);
+        } else {
+          __memcpy(beta_window,
+                   static_cast<const float*>(b_g) + token * heads + head,
+                   4,
+                   GDRAM2NRAM,
+                   4,
+                   heads * 4,
+                   window_size - 1);
+        }
+        __bang_mul_scalar(
+            beta_window, beta_window, -1.4426950408889634f, window_size);
+        __bang_pow2(beta_window, beta_window, window_size);
+        __bang_add_scalar(beta_window, beta_window, 1.f, window_size);
+        __bang_recip(beta_window, beta_window, window_size);
+        const int32_t gate_count = window_size * kDim;
+        if (gate_mode == 0) {
+          __bang_fusion(FUSION_FAM,
+                        gate_window,
+                        gate_window,
+                        bias,
+                        -rate * 1.4426950408889634f,
+                        gate_count,
+                        kDim);
+          __bang_pow2(gate_window, gate_window, gate_count);
+          __bang_add_scalar(gate_window, gate_window, 1.f, gate_count);
+          __bang_recip(gate_window, gate_window, gate_count);
+          __bang_mul_scalar(gate_window,
+                            gate_window,
+                            lower_bound * 1.4426950408889634f,
+                            gate_count);
+        } else {
+          __sync_compute();
+          for (int32_t element = 0; element < gate_count; ++element) {
+            const float x = gate_window[element] + bias[element % kDim];
+            const float bx = softplus_beta * x;
+            const float activated =
+                bx <= softplus_threshold ? log1pf(expf(bx)) / softplus_beta : x;
+            gate_window[element] = -rate * activated * 1.4426950408889634f;
+          }
+        }
+        __bang_pow2(gate_window, gate_window, gate_count);
+      }
+      __bang_bfloat162float(q, raw, kDim);
+      __bang_bfloat162float(key, raw + kDim, kDim);
+      const float* gate = gate_window + window_index * kDim;
+      __bang_bfloat162float(value, raw + 3 * kDim, RecurrentValueTile);
+      float qs = scale;
+      if (qk_l2norm) {
+        __bang_mul(work, q, q, kDim);
+        qs *= 1.f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+        __bang_mul(work, key, key, kDim);
+        const float ks = 1.f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+        __bang_mul_scalar(key, key, ks, kDim);
+      }
+      __bang_mul_scalar(q, q, qs, kDim);
+      __sync_compute();
+      __bang_load_matrix_async(
+          outer_weights, key, NRAM2WRAM, kDim, 1, sizeof(float), false);
+      const float beta = beta_window[window_index];
+      __sync_io();
+      __bang_cycle_mul(state, state, gate, RecurrentValueTile * kDim, kDim);
+      __bang_cycle_mul(tmp, state, key, RecurrentValueTile * kDim, kDim);
+      __bang_sumpool(outer, tmp, 32, RecurrentValueTile, 4, 1, 4, 1, 1);
+      __bang_transpose(trans, outer, RecurrentValueTile, 32);
+      __bang_sumpool(projection, trans, RecurrentValueTile, 1, 32, 1, 32, 1, 1);
+      __bang_fusion(FUSION_FSM,
+                    delta,
+                    value,
+                    projection,
+                    beta,
+                    RecurrentValueTile,
+                    RecurrentValueTile);
+      __sync_move();
+      __bang_conv_partial(state,
+                          delta,
+                          outer_weights,
+                          state,
+                          1,
+                          RecurrentValueTile,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kDim);
+      __bang_cycle_mul(tmp, state, q, RecurrentValueTile * kDim, kDim);
+      __bang_sumpool(outer, tmp, 32, RecurrentValueTile, 4, 1, 4, 1, 1);
+      __bang_transpose(trans, outer, RecurrentValueTile, 32);
+      __bang_sumpool(result, trans, RecurrentValueTile, 1, 32, 1, 32, 1, 1);
+      __bang_float2bfloat16_rn(out, result, RecurrentValueTile);
+      __sync_compute();
+      __memcpy_async(out_g + offset + vt * RecurrentValueTile,
+                     out,
+                     RecurrentValueTile * 2,
+                     NRAM2GDRAM);
+      const int32_t dest =
+          inplace == 2
+              ? seq
+              : (inplace == 3
+                     ? (cache_metadata ? index_cache[seq] : idx_g[seq])
+                     : (inplace
+                            ? (cache_metadata
+                                   ? index_cache[static_cast<int64_t>(seq) *
+                                                     columns +
+                                                 token - bos]
+                                   : idx_g[static_cast<int64_t>(seq) * columns +
+                                           token - bos])
+                            : static_cast<int32_t>(token)));
+      if ((inplace == 2 || inplace == 3) ? token + 1 == eos
+                                         : (!inplace || dest > 0)) {
+        __memcpy_async(final_g +
+                           static_cast<int64_t>(dest) * heads * kDim * kDim +
+                           state_offset,
+                       state,
+                       sizeof(state),
+                       NRAM2GDRAM);
+      }
+    }
+    __sync_io();
+  }
+}
+
+template <int32_t ValueTile>
+void launch_parameterized(void* queue, const BangcKdaFullParams& p) {
+  const cnrtDim3_t grid = {4, 8, 1};
+  kda_parameterized_v078<ValueTile>
+      <<<grid, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+          static_cast<const bfloat16_t*>(p.q),
+          static_cast<const bfloat16_t*>(p.k),
+          static_cast<const bfloat16_t*>(p.v),
+          p.gate,
+          p.beta,
+          p.a_log,
+          p.bias,
+          p.initial_state,
+          p.final_state,
+          static_cast<bfloat16_t*>(p.output),
+          p.cu,
+          p.indices,
+          p.accepted,
+          p.sequences,
+          p.value_heads,
+          p.columns,
+          p.speculative,
+          p.state_mode,
+          p.query_heads,
+          p.gate_mode,
+          p.gate_dtype,
+          p.beta_dtype,
+          p.qk_l2norm,
+          p.scale,
+          p.lower_bound,
+          p.softplus_beta,
+          p.softplus_threshold);
+}
+}  // namespace
+extern "C" int32_t bangc_kda_full_launch(void* queue,
+                                         const BangcKdaFullParams* p) {
+  if (p == nullptr || p->sequences < 0 || p->query_heads <= 0 ||
+      p->value_heads <= 0 || p->value_heads % p->query_heads != 0 ||
+      p->columns <= 0 || p->value_heads > INT32_MAX / 512 ||
+      p->query_heads > INT32_MAX / 512 || p->gate_mode < 0 ||
+      p->gate_mode > 1 || p->gate_dtype < 0 || p->gate_dtype > 1 ||
+      p->beta_dtype < 0 || p->beta_dtype > 1 || p->state_mode < 0 ||
+      p->state_mode > 3 ||
+      (p->speculative && (p->accepted == nullptr || p->indices == nullptr)) ||
+      p->a_log == nullptr || p->bias == nullptr) {
+    return 2;
+  }
+  if (p->sequences == 0) {
+    return 0;
+  }
+  const int64_t head_jobs = static_cast<int64_t>(p->sequences) * p->value_heads;
+  if (head_jobs <= 8) {
+    launch_parameterized<32>(queue, *p);
+  } else if (head_jobs <= 16) {
+    launch_parameterized<64>(queue, *p);
+  } else {
+    launch_parameterized<128>(queue, *p);
+  }
+  return 0;
+}
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_generic ----
+
+namespace xllm::kernel::mlu {
+namespace {
+constexpr int32_t kKeyTile = 128;
+using AliasUint32 = uint32_t __attribute__((__may_alias__));
+// Load complete integer words before any scalar narrowing. Negative sentinels
+// and high-word accepted values cannot wrap into a valid positive index. Legal
+// storage indices and CU offsets name actual dense device allocations, hence
+// fit the device's 48-bit scalar/address domain. Arbitrary 64-bit diagnostic
+// values outside that domain are masked before address construction.
+__mlu_func__ int64_t load_nonnegative(const void* data,
+                                      int64_t index,
+                                      bool wide) {
+  if (!wide) {
+    return static_cast<const int32_t*>(data)[index];
+  }
+  const AliasUint32* words = static_cast<const AliasUint32*>(data) + index * 2;
+  const uint32_t low = words[0];
+  const uint32_t high = words[1];
+  if ((high & 0xffff8000u) != 0) {
+    return -1;
+  }
+  return static_cast<int64_t>(high) * 4294967296LL + low;
+}
+__mlu_func__ void load_tile(float* destination,
+                            const float* source,
+                            int32_t count) {
+  __bang_write_value(destination, kKeyTile, 0.f);
+  __sync_compute();
+  __memcpy(destination, source, count * sizeof(float), GDRAM2NRAM);
+}
+__mlu_global__ void bangc_kda_generic(BangcKdaGenericParams p) {
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float state[kKeyTile], q[kKeyTile], key[kKeyTile];
+  __nram__ float gate[kKeyTile], bias[kKeyTile], work[kKeyTile];
+  float* carry = p.carry + static_cast<int64_t>(taskId) * p.key_dimension;
+  const int64_t rows_per_sequence = p.value_heads * p.value_dimension;
+  for (int64_t job = taskId; job < p.sequences * rows_per_sequence;
+       job += taskDim) {
+    const int64_t sequence = job / rows_per_sequence;
+    const int64_t head = job / p.value_dimension % p.value_heads;
+    const int64_t row = job % p.value_dimension;
+    const int64_t bos =
+        load_nonnegative(p.cu, sequence, (p.metadata_wide_mask & 1) != 0);
+    const int64_t eos =
+        load_nonnegative(p.cu, sequence + 1, (p.metadata_wide_mask & 1) != 0);
+    if (bos < 0 || eos < bos || eos > p.tokens ||
+        (p.state_mode == 1 && eos - bos > p.columns)) {
+      continue;
+    }
+    int64_t accepted_column = 0;
+    if (p.speculative) {
+      const int64_t count = load_nonnegative(
+          p.accepted, sequence, (p.metadata_wide_mask & 4) != 0);
+      if (count <= 0 || count > p.columns) {
+        continue;
+      }
+      accepted_column = count - 1;
+    }
+    const int64_t source_slot =
+        p.state_mode == 2
+            ? sequence
+            : (p.indices == nullptr
+                   ? bos
+                   : load_nonnegative(
+                         p.indices,
+                         sequence * p.index_sequence_stride +
+                             accepted_column * p.index_token_stride,
+                         (p.metadata_wide_mask & 2) != 0));
+    if (source_slot < 0 || source_slot >= p.initial_slots ||
+        (p.indices != nullptr && p.state_mode != 2 && source_slot == 0) ||
+        (bos == eos && p.state_mode != 2)) {
+      continue;
+    }
+    const int64_t row_offset =
+        (head * p.value_dimension + row) * p.key_dimension;
+    const int64_t slot_stride = rows_per_sequence * p.key_dimension;
+    for (int64_t first = 0; first < p.key_dimension; first += kKeyTile) {
+      const int32_t count = static_cast<int32_t>(
+          p.key_dimension - first < kKeyTile ? p.key_dimension - first
+                                             : kKeyTile);
+      __memcpy(state,
+               p.initial_state + source_slot * slot_stride + row_offset + first,
+               count * sizeof(float),
+               GDRAM2NRAM);
+      __sync_compute();
+      __memcpy(carry + first, state, count * sizeof(float), NRAM2GDRAM);
+    }
+    const int64_t query_head = head / (p.value_heads / p.query_heads);
+    const float rate = expf(p.a_log[head]);
+    if (bos == eos) {
+      for (int64_t first = 0; first < p.key_dimension; first += kKeyTile) {
+        const int32_t count = static_cast<int32_t>(
+            p.key_dimension - first < kKeyTile ? p.key_dimension - first
+                                               : kKeyTile);
+        __memcpy(state, carry + first, count * sizeof(float), GDRAM2NRAM);
+        __memcpy(p.final_state + sequence * slot_stride + row_offset + first,
+                 state,
+                 count * sizeof(float),
+                 NRAM2GDRAM);
+      }
+      continue;
+    }
+    for (int64_t token = bos; token < eos; ++token) {
+      const int64_t query_offset =
+          (token * p.query_heads + query_head) * p.key_dimension;
+      const int64_t gate_offset =
+          (token * p.value_heads + head) * p.key_dimension;
+      float q_norm = p.scale;
+      float k_norm = 1.f;
+      if (p.qk_l2norm) {
+        float q_squared = 0.f;
+        float k_squared = 0.f;
+        for (int64_t first = 0; first < p.key_dimension; first += kKeyTile) {
+          const int32_t count = static_cast<int32_t>(
+              p.key_dimension - first < kKeyTile ? p.key_dimension - first
+                                                 : kKeyTile);
+          load_tile(q, p.q + query_offset + first, count);
+          load_tile(key, p.k + query_offset + first, count);
+          __bang_mul(work, q, q, kKeyTile);
+          q_squared += __bang_sum(work, kKeyTile);
+          __bang_mul(work, key, key, kKeyTile);
+          k_squared += __bang_sum(work, kKeyTile);
+        }
+        q_norm *= 1.f / sqrtf(q_squared + 1.e-6f);
+        k_norm = 1.f / sqrtf(k_squared + 1.e-6f);
+      }
+      float projection = 0.f;
+      for (int64_t first = 0; first < p.key_dimension; first += kKeyTile) {
+        const int32_t count = static_cast<int32_t>(
+            p.key_dimension - first < kKeyTile ? p.key_dimension - first
+                                               : kKeyTile);
+        load_tile(state, carry + first, count);
+        load_tile(key, p.k + query_offset + first, count);
+        load_tile(gate, p.gate + gate_offset + first, count);
+        load_tile(bias, p.bias + head * p.key_dimension + first, count);
+        for (int32_t element = 0; element < count; ++element) {
+          float log_gate = gate[element];
+          if (p.gate_mode == 0) {
+            log_gate = p.lower_bound /
+                       (1.f + expf(-rate * (log_gate + bias[element])));
+          } else {
+            const float x = log_gate + bias[element];
+            const float bx = p.softplus_beta * x;
+            log_gate = -rate * (bx <= p.softplus_threshold
+                                    ? log1pf(expf(bx)) / p.softplus_beta
+                                    : x);
+          }
+          gate[element] = expf(log_gate);
+        }
+        __bang_mul(state, state, gate, kKeyTile);
+        __bang_mul_scalar(key, key, k_norm, kKeyTile);
+        __bang_mul(work, state, key, kKeyTile);
+        projection += __bang_sum(work, kKeyTile);
+        __sync_compute();
+        __memcpy(carry + first, state, count * sizeof(float), NRAM2GDRAM);
+      }
+      const float raw_beta = p.beta[token * p.value_heads + head];
+      const float beta = 1.f / (1.f + expf(-raw_beta));
+      const float value =
+          p.v[(token * p.value_heads + head) * p.value_dimension + row];
+      const float delta = (value - projection) * beta;
+      const int64_t destination =
+          p.state_mode == 2
+              ? sequence
+              : (p.state_mode == 0
+                     ? token
+                     : load_nonnegative(
+                           p.indices,
+                           sequence * p.index_sequence_stride +
+                               (p.state_mode == 3 ? 0 : token - bos) *
+                                   p.index_token_stride,
+                           (p.metadata_wide_mask & 2) != 0));
+      const bool store_state =
+          destination >= 0 && destination < p.final_slots &&
+          ((p.state_mode == 2 || p.state_mode == 3) ? token + 1 == eos
+                                                    : true) &&
+          ((p.state_mode == 1 || p.state_mode == 3) ? destination > 0 : true);
+      float result = 0.f;
+      for (int64_t first = 0; first < p.key_dimension; first += kKeyTile) {
+        const int32_t count = static_cast<int32_t>(
+            p.key_dimension - first < kKeyTile ? p.key_dimension - first
+                                               : kKeyTile);
+        load_tile(state, carry + first, count);
+        load_tile(key, p.k + query_offset + first, count);
+        load_tile(q, p.q + query_offset + first, count);
+        __bang_mul_scalar(key, key, k_norm, kKeyTile);
+        __bang_mul_scalar(key, key, delta, kKeyTile);
+        __bang_add(state, state, key, kKeyTile);
+        __bang_mul_scalar(q, q, q_norm, kKeyTile);
+        __bang_mul(work, state, q, kKeyTile);
+        result += __bang_sum(work, kKeyTile);
+        __sync_compute();
+        __memcpy(carry + first, state, count * sizeof(float), NRAM2GDRAM);
+        if (store_state) {
+          __memcpy(
+              p.final_state + destination * slot_stride + row_offset + first,
+              state,
+              count * sizeof(float),
+              NRAM2GDRAM);
+        }
+      }
+      if (store_state && p.written_rows != nullptr) {
+        p.written_rows[destination * rows_per_sequence +
+                       head * p.value_dimension + row] = 1;
+      }
+      p.output[(token * p.value_heads + head) * p.value_dimension + row] =
+          result;
+    }
+  }
+}
+}  // namespace
+extern "C" int32_t bangc_kda_generic_launch(void* queue,
+                                            const BangcKdaGenericParams* p) {
+  if (p == nullptr || p->sequences < 0 || p->tokens < 0 ||
+      p->query_heads <= 0 || p->value_heads <= 0 ||
+      p->value_heads % p->query_heads != 0 || p->key_dimension <= 0 ||
+      p->value_dimension <= 0 || p->columns <= 0 || p->initial_slots < 0 ||
+      p->final_slots < 0 || p->state_mode < 0 || p->state_mode > 3 ||
+      p->gate_mode < 0 || p->gate_mode > 1 || p->carry == nullptr ||
+      ((p->state_mode == 1 || p->state_mode == 3) && p->indices == nullptr) ||
+      (p->speculative && p->accepted == nullptr) || p->a_log == nullptr ||
+      p->bias == nullptr) {
+    return 2;
+  }
+  // The caller owns dense tensors whose numel and byte sizes fit signed host
+  // indexing. Check products before launch rather than overflow in device job
+  // or state-offset expressions. Actual allocations also bound device offsets.
+  const int64_t max = INT64_MAX - 32;
+  if (p->value_heads > max / p->value_dimension ||
+      p->value_heads * p->value_dimension > max / p->key_dimension ||
+      p->sequences > max / (p->value_heads * p->value_dimension) ||
+      p->tokens > max / p->value_heads / p->key_dimension ||
+      p->tokens > max / p->query_heads / p->key_dimension ||
+      p->tokens > max / p->value_heads / p->value_dimension ||
+      p->key_dimension > max / 32 ||
+      p->initial_slots >
+          max / p->value_heads / p->value_dimension / p->key_dimension ||
+      p->final_slots >
+          max / p->value_heads / p->value_dimension / p->key_dimension) {
+    return 2;
+  }
+  const cnrtDim3_t grid = {4, 8, 1};
+  bangc_kda_generic<<<grid,
+                      cnrtFuncTypeUnion1,
+                      static_cast<cnrtQueue_t>(queue)>>>(*p);
+  return 0;
+}
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_copy_written ----
+
+namespace xllm::kernel::mlu {
+namespace {
+__mlu_global__ void copy_written_rows(char* destination,
+                                      const char* source,
+                                      const int32_t* written_rows,
+                                      int64_t rows,
+                                      int64_t row_bytes) {
+  if (__is_mpu()) {
+    return;
+  }
+  constexpr int32_t kCopyBytes = 512;
+  __nram__ char buffer[kCopyBytes];
+  for (int64_t row = taskId; row < rows; row += taskDim) {
+    if (written_rows[row] == 0) {
+      continue;
+    }
+    const int64_t row_start = row * row_bytes;
+    for (int64_t first = 0; first < row_bytes; first += kCopyBytes) {
+      const int32_t count = static_cast<int32_t>(
+          row_bytes - first < kCopyBytes ? row_bytes - first : kCopyBytes);
+      __memcpy(buffer, source + row_start + first, count, GDRAM2NRAM);
+      __memcpy(destination + row_start + first, buffer, count, NRAM2GDRAM);
+    }
+  }
+}
+}  // namespace
+extern "C" int32_t bangc_kda_copy_written(void* queue,
+                                          void* destination,
+                                          const void* source,
+                                          const int32_t* written_rows,
+                                          int64_t rows,
+                                          int64_t row_bytes) {
+  if (rows < 0 || rows > INT64_MAX - 32 || row_bytes <= 0 ||
+      row_bytes > INT64_MAX - 512 || rows > INT64_MAX / row_bytes ||
+      destination == nullptr || source == nullptr || written_rows == nullptr) {
+    return 2;
+  }
+  const cnrtDim3_t grid = {4, 8, 1};
+  copy_written_rows<<<grid,
+                      cnrtFuncTypeUnion1,
+                      static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<char*>(destination),
+      static_cast<const char*>(source),
+      written_rows,
+      rows,
+      row_bytes);
+  return 0;
+}
+}  // namespace xllm::kernel::mlu

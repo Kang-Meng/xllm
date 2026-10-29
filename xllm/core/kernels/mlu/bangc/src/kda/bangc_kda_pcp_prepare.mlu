@@ -1,0 +1,1747 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+
+#include <cmath>
+
+#include "kernels/mlu/bangc/include/bangc_kda_pcp.h"
+#include "kernels/mlu/bangc/src/kda/bangc_kda_inverse.mluh"
+#include "kernels/mlu/bangc/src/kda/bangc_kda_pcp_metadata.mluh"
+
+// ---- bangc_kda_pcp_prepare_canonical ----
+
+namespace xllm::kernel::mlu {
+using KdaPcpParams = BangcKdaPcpParams;
+
+namespace {
+namespace prepare_canonical {
+constexpr int32_t kDim = 128;
+constexpr int32_t kBlock = 64;
+
+__mlu_func__ float dot(float* temporary, const float* a, const float* b) {
+  __bang_mul(temporary, a, b, kDim);
+  return __bang_sum(temporary, kDim);
+}
+
+// A row is loaded and converted once, preserving the original FP32 input
+// interpretation. The source storage and byte strides remain owned by caller.
+__mlu_func__ void load_row(float* destination,
+                           half* staging,
+                           const void* source,
+                           int64_t offset,
+                           int32_t kind) {
+  if (kind == 0) {
+    __memcpy(destination,
+             static_cast<const float*>(source) + offset,
+             kDim * sizeof(float),
+             GDRAM2NRAM);
+    __sync_io();
+  } else {
+    __memcpy(staging,
+             static_cast<const half*>(source) + offset,
+             kDim * sizeof(half),
+             GDRAM2NRAM);
+    __sync_io();
+    if (kind == 1) {
+      __bang_bfloat162float(
+          destination, reinterpret_cast<const bfloat16_t*>(staging), kDim);
+    } else {
+      __bang_half2float(destination, staging, kDim);
+    }
+    // The next row may reuse staging on the IO engine.
+    __sync_compute();
+  }
+}
+
+// Gather one complete request-local time block before consuming its rows.
+// The original per-row loader remains the supported wide-stride path: the
+// two-dimensional IO instruction has a signed 32-bit source stride.
+__mlu_func__ void load_tile(float* destination,
+                            half* staging,
+                            const void* source,
+                            int64_t offset,
+                            int64_t heads,
+                            int32_t count,
+                            int32_t kind) {
+  if (count == 0) {
+    return;
+  }
+  const int64_t element_bytes = kind == 0 ? sizeof(float) : sizeof(half);
+  if (heads > 0x7fffffffLL / (kDim * element_bytes)) {
+    for (int32_t row = 0; row < count; ++row) {
+      load_row(destination + row * kDim,
+               staging,
+               source,
+               offset + static_cast<int64_t>(row) * heads * kDim,
+               kind);
+    }
+    return;
+  }
+  const int64_t source_stride = heads * kDim * element_bytes;
+  if (kind == 0) {
+    __memcpy(destination,
+             static_cast<const float*>(source) + offset,
+             kDim * sizeof(float),
+             GDRAM2NRAM,
+             kDim * sizeof(float),
+             static_cast<int32_t>(source_stride),
+             count - 1);
+    __sync_io();
+  } else {
+    __memcpy(staging,
+             static_cast<const half*>(source) + offset,
+             kDim * sizeof(half),
+             GDRAM2NRAM,
+             kDim * sizeof(half),
+             static_cast<int32_t>(source_stride),
+             count - 1);
+    __sync_io();
+    if (kind == 1) {
+      __bang_bfloat162float(destination,
+                            reinterpret_cast<const bfloat16_t*>(staging),
+                            count * kDim);
+    } else {
+      __bang_half2float(destination, staging, count * kDim);
+    }
+    // Both staging reuse and row-scalar consumers follow conversion completion.
+    __sync_compute();
+  }
+}
+
+// Bulk beta load follows the same full-width source stride rule as Q/K/V.
+__mlu_func__ void load_beta(float* destination,
+                            half* staging,
+                            const void* source,
+                            int64_t begin,
+                            int64_t head,
+                            int64_t heads,
+                            int32_t count,
+                            int32_t kind) {
+  if (count == 0) {
+    return;
+  }
+  const int64_t element_bytes = kind == 0 ? sizeof(float) : sizeof(half);
+  if (heads > 0x7fffffffLL / element_bytes) {
+    for (int32_t row = 0; row < count; ++row) {
+      const int64_t offset = (begin + row) * heads + head;
+      if (kind == 0) {
+        destination[row] = static_cast<const float*>(source)[offset];
+      } else if (kind == 1) {
+        destination[row] =
+            static_cast<float>(static_cast<const bfloat16_t*>(source)[offset]);
+      } else {
+        destination[row] =
+            static_cast<float>(static_cast<const half*>(source)[offset]);
+      }
+    }
+    return;
+  }
+  const int64_t offset = begin * heads + head;
+  const int32_t source_stride = static_cast<int32_t>(heads * element_bytes);
+  if (kind == 0) {
+    __memcpy(destination,
+             static_cast<const float*>(source) + offset,
+             sizeof(float),
+             GDRAM2NRAM,
+             sizeof(float),
+             source_stride,
+             count - 1);
+    __sync_io();
+  } else {
+    __memcpy(staging,
+             static_cast<const half*>(source) + offset,
+             sizeof(half),
+             GDRAM2NRAM,
+             sizeof(half),
+             source_stride,
+             count - 1);
+    __sync_io();
+    if (kind == 1) {
+      __bang_bfloat162float(
+          destination, reinterpret_cast<const bfloat16_t*>(staging), count);
+    } else {
+      __bang_half2float(destination, staging, count);
+    }
+    __sync_compute();
+  }
+}
+
+// Enqueue only positive, representable-stride low-precision tiles. The caller
+// owns a distinct dead scratch buffer per input and drains IO before
+// conversion.
+__mlu_func__ void load_low_tile_async(half* scratch,
+                                      const void* source,
+                                      int64_t offset,
+                                      int64_t heads,
+                                      int32_t count) {
+  __memcpy_async(scratch,
+                 static_cast<const half*>(source) + offset,
+                 kDim * sizeof(half),
+                 GDRAM2NRAM,
+                 kDim * sizeof(half),
+                 static_cast<int32_t>(heads * kDim * sizeof(half)),
+                 count - 1);
+}
+
+__mlu_func__ void convert_low_input(float* destination,
+                                    const half* scratch,
+                                    int32_t elements,
+                                    int32_t kind) {
+  if (kind == 1) {
+    __bang_bfloat162float(
+        destination, reinterpret_cast<const bfloat16_t*>(scratch), elements);
+  } else {
+    __bang_half2float(destination, scratch, elements);
+  }
+}
+
+__mlu_func__ void natural_exp(float* destination,
+                              const float* source,
+                              int32_t elements) {
+  __bang_mul_scalar(destination, source, 1.4426950408889634f, elements);
+  __bang_pow2(destination, destination, elements);
+}
+
+// Integer-bit amplitude checks cannot mistake subnormal values for zero.
+// These are the exact normalized values consumed by either Gram algorithm.
+using AliasUint32 = uint32_t __attribute__((__may_alias__));
+using AliasInt32 = int32_t __attribute__((__may_alias__));
+__mlu_func__ bool matrix_amplitudes_are_safe(
+    const float* input,
+    float* scratch,
+    float* valid,
+    int32_t elements,
+    uint32_t minimum_bits = 0x1f800000U,
+    uint32_t maximum_bits = 0x40000000U) {
+  if (elements == 0) {
+    return true;
+  }
+  const AliasUint32* bits = reinterpret_cast<const AliasUint32*>(input);
+  AliasUint32* magnitudes = reinterpret_cast<AliasUint32*>(scratch);
+  AliasUint32* flags = reinterpret_cast<AliasUint32*>(valid);
+  __bang_band_scalar(magnitudes, bits, 0x7fffffffU, elements);
+  __bang_ge_scalar(flags, magnitudes, minimum_bits, elements);
+  __bang_le_scalar(magnitudes, magnitudes, maximum_bits, elements);
+  __bang_band(flags, flags, magnitudes, elements);
+  __bang_band_scalar(magnitudes, bits, 0x7fffffffU, elements);
+  __bang_eq_scalar(magnitudes, magnitudes, 0U, elements);
+  __bang_bor(flags, flags, magnitudes, elements);
+  __bang_uint322float(scratch, flags, elements, 0);
+  const float count = __bang_sum(scratch, elements);
+  __sync_compute();
+  return count == static_cast<float>(elements);
+}
+
+// BF16 products are exact FP32 when both nonzero inputs are in
+// [2^-32, 2^16]. Seven TwoSum stages retain cancellation residuals before
+// normalization. The same Compute queue orders every rounded add/sub; all
+// scratch tensors are dead until the original normalization/Gram consumers.
+__mlu_func__ void raw_diagonal_dot(float* diagonal,
+                                   const float* queries,
+                                   const float* keys,
+                                   float* high,
+                                   float* low,
+                                   float* total,
+                                   float* virtual_b,
+                                   float* error,
+                                   float* temporary,
+                                   float* low_total,
+                                   int32_t block) {
+  __bang_mul(low, queries, keys, block * kDim);
+  __bang_transpose(high, low, block, kDim);
+  __bang_write_value(low, block * kDim, 0.f);
+  for (int32_t channels = kDim; channels > 1; channels /= 2) {
+    const int32_t elements = channels / 2 * block;
+    __bang_add(total, high, high + elements, elements);
+    __bang_sub(virtual_b, total, high, elements);
+    __bang_sub(error, total, virtual_b, elements);
+    __bang_sub(error, high, error, elements);
+    __bang_sub(temporary, high + elements, virtual_b, elements);
+    __bang_add(error, error, temporary, elements);
+    __bang_add(low_total, low, low + elements, elements);
+    __bang_add(error, error, low_total, elements);
+    __bang_move(high, total, elements * sizeof(float));
+    __bang_move(low, error, elements * sizeof(float));
+  }
+  __bang_add(diagonal, high, low, block);
+}
+
+// All off-diagonal relative exponents are nonpositive. Diagonal16-token
+// microtiles have relative exponent magnitude <=40 for lower in[-5,0].
+// Amplitude bounds keep nonzero diagonal operands normal in FP32.
+__mlu_func__ void microtile_gram(const float* queries,
+                                 const float* keys,
+                                 const float* gates,
+                                 const float* beta,
+                                 float* lower,
+                                 float* attention,
+                                 float* left,
+                                 float* right,
+                                 float* projected,
+                                 float* temporary,
+                                 float* weights,
+                                 int32_t count,
+                                 int32_t block,
+                                 const AliasInt32* strict_mask,
+                                 const AliasInt32* inclusive_mask) {
+  constexpr int32_t kMicro = 16;
+  for (int32_t first = 0; first < count; first += kMicro) {
+    const int32_t rows = count - first < kMicro ? count - first : kMicro;
+    for (int32_t earlier = 0; earlier <= first; earlier += kMicro) {
+      const int32_t columns =
+          count - earlier < kMicro ? count - earlier : kMicro;
+      const bool diagonal = earlier == first;
+      const int32_t anchor =
+          diagonal ? first + (rows - 1) / 2 : earlier + columns - 1;
+      __bang_cycle_sub(
+          left, gates + first * kDim, gates + anchor * kDim, rows * kDim, kDim);
+      natural_exp(left, left, rows * kDim);
+      __bang_mul(right, keys + first * kDim, left, rows * kDim);
+      __bang_mul(left + rows * kDim, queries + first * kDim, left, rows * kDim);
+      __bang_move(left, right, rows * kDim * sizeof(float));
+      __bang_cycle_sub(right,
+                       gates + earlier * kDim,
+                       gates + anchor * kDim,
+                       columns * kDim,
+                       kDim);
+      __bang_mul_scalar(right, right, -1.f, columns * kDim);
+      natural_exp(right, right, columns * kDim);
+      __bang_mul(right, right, keys + earlier * kDim, columns * kDim);
+      __sync_compute();
+      __bang_load_matrix(weights,
+                         right,
+                         NRAM2WRAM,
+                         columns,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __sync_move();
+      __bang_conv(
+          projected, left, weights, kDim, 2 * rows, 1, 1, 1, 1, 1, columns);
+      // Apply beta per later row. The second half contains unscaled Aq.
+      __bang_transpose(temporary, projected, rows, columns);
+      __bang_cycle_mul(
+          temporary, temporary, beta + first, rows * columns, rows);
+      __bang_transpose(projected, temporary, columns, rows);
+      if (diagonal) {
+        if (strict_mask != nullptr && inclusive_mask != nullptr &&
+            rows == kMicro && columns == kMicro) {
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      strict_mask,
+                      rows * columns);
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      inclusive_mask,
+                      rows * columns);
+        } else {
+          __sync_compute();
+          AliasInt32* mask = reinterpret_cast<AliasInt32*>(temporary);
+          for (int32_t row = 0; row < rows; ++row) {
+            for (int32_t col = 0; col < columns; ++col) {
+              mask[row * columns + col] = col < row ? -1 : 0;
+            }
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      mask,
+                      rows * columns);
+          // Complete mask consumption before the scalar mask update.
+          __sync_compute();
+          for (int32_t row = 0; row < rows; ++row) {
+            mask[row * columns + row] = -1;
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      mask,
+                      rows * columns);
+        }
+      }
+      __sync_compute();
+      __memcpy(lower + first * block + earlier,
+               projected,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      __memcpy(attention + first * block + earlier,
+               projected + rows * columns,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      // projected is reused on Compute by the next microtile.
+      __sync_move();
+    }
+  }
+}
+
+__mlu_func__ void microtile_right_weights(const float* keys,
+                                          const float* gates,
+                                          float* right,
+                                          float* weights,
+                                          int32_t earlier,
+                                          int32_t columns,
+                                          int32_t anchor) {
+  __bang_cycle_sub(right,
+                   gates + earlier * kDim,
+                   gates + anchor * kDim,
+                   columns * kDim,
+                   kDim);
+  __bang_mul_scalar(right, right, -1.f, columns * kDim);
+  natural_exp(right, right, columns * kDim);
+  __bang_mul(right, right, keys + earlier * kDim, columns * kDim);
+  __sync_compute();
+  __bang_load_matrix(
+      weights, right, NRAM2WRAM, columns, kDim, kDim * sizeof(float), false);
+  __sync_move();
+}
+
+__mlu_func__ void microtile_gram_reuse(const float* queries,
+                                       const float* keys,
+                                       const float* gates,
+                                       const float* beta,
+                                       float* lower,
+                                       float* attention,
+                                       float* left,
+                                       float* right,
+                                       float* projected,
+                                       float* temporary,
+                                       float* weights,
+                                       int32_t count,
+                                       int32_t block,
+                                       const AliasInt32* strict_mask,
+                                       const AliasInt32* inclusive_mask) {
+  constexpr int32_t kMicro = 16;
+  for (int32_t earlier = 0; earlier < count; earlier += kMicro) {
+    const int32_t columns = count - earlier < kMicro ? count - earlier : kMicro;
+    for (int32_t first = earlier; first < count; first += kMicro) {
+      const int32_t rows = count - first < kMicro ? count - first : kMicro;
+      const bool diagonal = earlier == first;
+      const int32_t anchor =
+          diagonal ? first + (rows - 1) / 2 : earlier + columns - 1;
+      // All off-diagonal later tiles share this earlier tile's end anchor.
+      // The synchronous pack finishes before right is reused as left scratch.
+      if (!diagonal && first == earlier + kMicro) {
+        microtile_right_weights(
+            keys, gates, right, weights, earlier, columns, anchor);
+      }
+      __bang_cycle_sub(
+          left, gates + first * kDim, gates + anchor * kDim, rows * kDim, kDim);
+      natural_exp(left, left, rows * kDim);
+      __bang_mul(right, keys + first * kDim, left, rows * kDim);
+      __bang_mul(left + rows * kDim, queries + first * kDim, left, rows * kDim);
+      __bang_move(left, right, rows * kDim * sizeof(float));
+      if (diagonal) {
+        microtile_right_weights(
+            keys, gates, right, weights, earlier, columns, anchor);
+      }
+      __bang_conv(
+          projected, left, weights, kDim, 2 * rows, 1, 1, 1, 1, 1, columns);
+      // Apply beta per later row. The second half contains unscaled Aq.
+      __bang_transpose(temporary, projected, rows, columns);
+      __bang_cycle_mul(
+          temporary, temporary, beta + first, rows * columns, rows);
+      __bang_transpose(projected, temporary, columns, rows);
+      if (diagonal) {
+        if (strict_mask != nullptr && inclusive_mask != nullptr &&
+            rows == kMicro && columns == kMicro) {
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      strict_mask,
+                      rows * columns);
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      inclusive_mask,
+                      rows * columns);
+        } else {
+          __sync_compute();
+          AliasInt32* mask = reinterpret_cast<AliasInt32*>(temporary);
+          for (int32_t row = 0; row < rows; ++row) {
+            for (int32_t col = 0; col < columns; ++col) {
+              mask[row * columns + col] = col < row ? -1 : 0;
+            }
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      mask,
+                      rows * columns);
+          // Complete mask consumption before the scalar mask update.
+          __sync_compute();
+          for (int32_t row = 0; row < rows; ++row) {
+            mask[row * columns + row] = -1;
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      mask,
+                      rows * columns);
+        }
+      }
+      __sync_compute();
+      __memcpy(lower + first * block + earlier,
+               projected,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      __memcpy(attention + first * block + earlier,
+               projected + rows * columns,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      // projected is reused on Compute by the next microtile.
+      __sync_move();
+    }
+  }
+}
+
+template <int32_t StaticBlock>
+__mlu_global__ void prepare_takeover_metadata_mirror_kernel(KdaPcpParams p) {
+  const int32_t block = StaticBlock == 0 ? p.block : StaticBlock;
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float queries[kBlock * kDim];
+  __nram__ float keys[kBlock * kDim];
+  __nram__ float gates[kBlock * kDim];
+  __nram__ float values[kBlock * kDim];
+  __nram__ float factor[kBlock * kDim];
+  __nram__ float lower[kBlock * kBlock];
+  __nram__ float inverse[kBlock * kBlock];
+  __nram__ float attention[kBlock * kBlock];
+  __nram__ float pair_products[kBlock * kDim];
+  __nram__ float reduction[2 * kBlock * 32];
+  __nram__ float row_dots[kBlock];
+  __nram__ float power_tmp[kBlock * kBlock];
+  __wram__ float matrix_weights[kBlock * kDim];
+  __nram__ float cumulative[kDim];
+  __nram__ float bias[kDim];
+  __nram__ float temporary[kDim];
+  __nram__ float beta[kBlock];
+  __nram__ float norm_q[kBlock], norm_k[kBlock];
+  __nram__ float aq_diagonal[kBlock];
+  __nram__ half staging[kBlock * kDim];
+  __nram__ AliasInt32 strict_diagonal_mask[16 * 16];
+  __nram__ AliasInt32 inclusive_diagonal_mask[16 * 16];
+  // Private metadata windows; see bangc_kda_pcp_metadata.mluh.
+  __nram__ uint32_t index_window[kda_pcp_metadata::kIndexWindowWords];
+  __nram__ uint32_t cu_window[kda_pcp_metadata::kCuWindowWords];
+  int64_t index_base = kda_pcp_metadata::kNoWindow;
+  int64_t cu_base = kda_pcp_metadata::kNoWindow;
+  const bool cache_diagonal_masks =
+      static_cast<int64_t>(taskId) + taskDim < p.chunks * p.heads;
+  if (cache_diagonal_masks) {
+    // Dedicated integer masks are initialized once and remain read-only for
+    // every full diagonal tile in this invocation. Tails use original scratch.
+    for (int32_t row = 0; row < 16; ++row) {
+      for (int32_t col = 0; col < 16; ++col) {
+        strict_diagonal_mask[row * 16 + col] = col < row ? -1 : 0;
+        inclusive_diagonal_mask[row * 16 + col] = col <= row ? -1 : 0;
+      }
+    }
+  }
+  int64_t cached_head = -1;
+  float cached_rate = 0.f;
+  for (int64_t job = taskId; job < p.chunks * p.heads; job += taskDim) {
+    const int64_t slot = job / p.heads;
+    const int64_t head = job % p.heads;
+    int64_t sequence = 0;
+    int64_t begin = 0;
+    int32_t count = 0;
+    if (!kda_pcp_metadata::locate(p,
+                                  index_window,
+                                  &index_base,
+                                  cu_window,
+                                  &cu_base,
+                                  slot,
+                                  &sequence,
+                                  &begin,
+                                  &count)) {
+      count = 0;
+    }
+    __bang_write_value(queries, block * kDim, 0.f);
+    __bang_write_value(keys, block * kDim, 0.f);
+    __bang_write_value(values, block * kDim, 0.f);
+    __bang_write_value(cumulative, kDim, 0.f);
+    __bang_write_value(beta, block, 0.f);
+    if (head != cached_head) {
+      __memcpy(bias, p.dt_bias + head * kDim, kDim * sizeof(float), GDRAM2NRAM);
+      __sync_io();
+      cached_rate = expf(p.a_log[head]);
+      cached_head = head;
+    }
+    const float rate = cached_rate;
+    const int64_t input_base = (begin * p.heads + head) * kDim;
+    // Zero-fill completes before IO writes the same true-token row storage.
+    __sync_compute();
+    const bool batch_low_inputs =
+        count > 0 && p.q_kind != 0 && p.k_kind != 0 && p.v_kind != 0 &&
+        p.gate_kind != 0 && p.beta_kind != 0 &&
+        p.heads <= 0x7fffffffLL / (kDim * sizeof(half));
+    if (batch_low_inputs) {
+      // Previous-job output IO is drained at the loop tail. Its final Compute
+      // producers completed before those stores; the zero-fill completion above
+      // also precedes this IO. These five buffers have no current-job values
+      // yet.
+      half* raw_q = reinterpret_cast<half*>(factor);
+      half* raw_k = reinterpret_cast<half*>(pair_products);
+      half* raw_v = reinterpret_cast<half*>(lower);
+      half* raw_gate = reinterpret_cast<half*>(inverse);
+      half* raw_beta = reinterpret_cast<half*>(attention);
+      load_low_tile_async(raw_q, p.q, input_base, p.heads, count);
+      load_low_tile_async(raw_k, p.k, input_base, p.heads, count);
+      load_low_tile_async(raw_v, p.v, input_base, p.heads, count);
+      load_low_tile_async(raw_gate, p.raw_gate, input_base, p.heads, count);
+      __memcpy_async(
+          raw_beta,
+          static_cast<const half*>(p.raw_beta) + begin * p.heads + head,
+          sizeof(half),
+          GDRAM2NRAM,
+          sizeof(half),
+          static_cast<int32_t>(p.heads * sizeof(half)),
+          count - 1);
+      __sync_io();
+      convert_low_input(queries, raw_q, count * kDim, p.q_kind);
+      convert_low_input(keys, raw_k, count * kDim, p.k_kind);
+      convert_low_input(values, raw_v, count * kDim, p.v_kind);
+      convert_low_input(gates, raw_gate, count * kDim, p.gate_kind);
+      convert_low_input(beta, raw_beta, count, p.beta_kind);
+      // All five original conversions finish before beta consumers or
+      // amplitude/ diagonal/Gram Compute can overwrite these now-dead raw
+      // source buffers.
+      __sync_compute();
+    } else {
+      load_tile(queries, staging, p.q, input_base, p.heads, count, p.q_kind);
+      load_tile(keys, staging, p.k, input_base, p.heads, count, p.k_kind);
+      load_tile(values, staging, p.v, input_base, p.heads, count, p.v_kind);
+      load_tile(
+          gates, staging, p.raw_gate, input_base, p.heads, count, p.gate_kind);
+      load_beta(
+          beta, staging, p.raw_beta, begin, head, p.heads, count, p.beta_kind);
+    }
+    if (count > 0) {
+      __bang_mul_scalar(beta, beta, -1.4426950408889634f, count);
+      __bang_pow2(beta, beta, count);
+      __bang_add_scalar(beta, beta, 1.f, count);
+      __bang_recip(beta, beta, count);
+    }
+    // All other dtypes and amplitudes retain the original general algorithm.
+    // Integer bits reject nonfinite/subnormal/extreme values before products.
+    const bool stable_diagonal =
+        p.q_kind == 1 && p.k_kind == 1 && count > 0 &&
+        matrix_amplitudes_are_safe(queries,
+                                   factor,
+                                   pair_products,
+                                   count * kDim,
+                                   /*minimum_bits=*/0x2f800000U,
+                                   /*maximum_bits=*/0x47800000U) &&
+        matrix_amplitudes_are_safe(keys,
+                                   factor,
+                                   pair_products,
+                                   count * kDim,
+                                   /*minimum_bits=*/0x2f800000U,
+                                   /*maximum_bits=*/0x47800000U);
+    if (stable_diagonal) {
+      raw_diagonal_dot(aq_diagonal,
+                       queries,
+                       keys,
+                       factor,
+                       pair_products,
+                       lower,
+                       inverse,
+                       attention,
+                       power_tmp,
+                       reduction,
+                       block);
+    }
+    // Normalize independent token rows before the ordered gate prefix.
+    // The row reductions use the same 128 channels and epsilon. They remain
+    // entirely on Compute, eliminating two per-row scalar reduction/sqrt
+    // dependencies. Padding rows were zero-filled and stay exactly zero.
+    __bang_mul(pair_products, queries, queries, block * kDim);
+    __bang_sumpool(reduction, pair_products, 32, block, 4, 1, 4, 1, 1);
+    __bang_transpose(reduction + block * 32, reduction, block, 32);
+    __bang_sumpool(norm_q, reduction + block * 32, block, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_q, norm_q, 1.e-6f, block);
+    __bang_rsqrt(norm_q, norm_q, block);
+    __bang_mul_scalar(norm_q, norm_q, 0.08838834764831845f, block);
+    __bang_transpose(factor, queries, block, kDim);
+    __bang_cycle_mul(factor, factor, norm_q, block * kDim, block);
+    __bang_transpose(queries, factor, kDim, block);
+    __bang_mul(pair_products, keys, keys, block * kDim);
+    __bang_sumpool(reduction, pair_products, 32, block, 4, 1, 4, 1, 1);
+    __bang_transpose(reduction + block * 32, reduction, block, 32);
+    __bang_sumpool(norm_k, reduction + block * 32, block, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_k, norm_k, 1.e-6f, block);
+    __bang_rsqrt(norm_k, norm_k, block);
+    __bang_transpose(factor, keys, block, kDim);
+    __bang_cycle_mul(factor, factor, norm_k, block * kDim, block);
+    __bang_transpose(keys, factor, kDim, block);
+    if (stable_diagonal) {
+      __bang_mul(aq_diagonal, aq_diagonal, norm_q, block);
+      __bang_mul(aq_diagonal, aq_diagonal, norm_k, block);
+    }
+    // Activate only true rows in one Compute stream. Keep the original
+    // left-to-right cumulative sum order and hold its last value for padding.
+    if (count > 0) {
+      __bang_cycle_add(gates, gates, bias, count * kDim, kDim);
+      __bang_mul_scalar(
+          gates, gates, -rate * 1.4426950408889634f, count * kDim);
+      __bang_pow2(gates, gates, count * kDim);
+      __bang_add_scalar(gates, gates, 1.f, count * kDim);
+      __bang_recip(gates, gates, count * kDim);
+      __bang_mul_scalar(gates, gates, p.lower_bound, count * kDim);
+    }
+    // The following value multiplication reads beta[row] on scalar control.
+    __sync_compute();
+    for (int32_t row = 0; row < block; ++row) {
+      if (row < count) {
+        __bang_add(cumulative, cumulative, gates + row * kDim, kDim);
+      }
+      __bang_move(gates + row * kDim, cumulative, kDim * sizeof(float));
+      __bang_mul_scalar(
+          values + row * kDim, values + row * kDim, beta[row], kDim);
+    }
+    // Process each entire causal row in one VPU stream. Future entries are
+    // never exponentiated, including padded rows and large negative gates.
+    __bang_write_value(lower, block * block, 0.f);
+    __bang_write_value(attention, block * block, 0.f);
+    const bool stable_matrix_domain =
+        p.lower_bound >= -5.f && p.lower_bound <= 0.f;
+    const bool amplitudes_safe =
+        stable_matrix_domain &&
+        matrix_amplitudes_are_safe(
+            queries, factor, pair_products, count * kDim) &&
+        matrix_amplitudes_are_safe(keys, factor, pair_products, count * kDim);
+    if (amplitudes_safe) {
+      if (block == kBlock && count > 16) {
+        microtile_gram_reuse(
+            queries,
+            keys,
+            gates,
+            beta,
+            lower,
+            attention,
+            factor,
+            pair_products,
+            power_tmp,
+            reduction,
+            matrix_weights,
+            count,
+            block,
+            cache_diagonal_masks ? strict_diagonal_mask : nullptr,
+            cache_diagonal_masks ? inclusive_diagonal_mask : nullptr);
+      } else {
+        microtile_gram(
+            queries,
+            keys,
+            gates,
+            beta,
+            lower,
+            attention,
+            factor,
+            pair_products,
+            power_tmp,
+            reduction,
+            matrix_weights,
+            count,
+            block,
+            cache_diagonal_masks ? strict_diagonal_mask : nullptr,
+            cache_diagonal_masks ? inclusive_diagonal_mask : nullptr);
+      }
+    } else {
+      for (int32_t row = 0; row < count; ++row) {
+        const int32_t causal = row + 1;
+        __bang_cycle_sub(
+            factor, gates, gates + row * kDim, causal * kDim, kDim);
+        __bang_mul_scalar(factor, factor, -1.f, causal * kDim);
+        natural_exp(factor, factor, causal * kDim);
+        __bang_mul(factor, factor, keys, causal * kDim);
+        __bang_cycle_mul(
+            pair_products, factor, queries + row * kDim, causal * kDim, kDim);
+        __bang_sumpool(reduction, pair_products, 32, causal, 4, 1, 4, 1, 1);
+        __bang_transpose(reduction + causal * 32, reduction, causal, 32);
+        __bang_sumpool(
+            row_dots, reduction + causal * 32, causal, 1, 32, 1, 32, 1, 1);
+        __bang_move(attention + row * block, row_dots, causal * sizeof(float));
+        __bang_cycle_mul(
+            pair_products, factor, keys + row * kDim, causal * kDim, kDim);
+        __bang_sumpool(reduction, pair_products, 32, causal, 4, 1, 4, 1, 1);
+        __bang_transpose(reduction + causal * 32, reduction, causal, 32);
+        __bang_sumpool(
+            row_dots, reduction + causal * 32, causal, 1, 32, 1, 32, 1, 1);
+        __bang_mul_scalar(row_dots, row_dots, beta[row], causal);
+        __bang_move(lower + row * block, row_dots, causal * sizeof(float));
+        __sync_compute();
+        lower[row * block + row] = 0.f;
+      }
+    }
+    if (stable_diagonal) {
+      // Both Gram branches have finished every attention writer. Only true
+      // diagonals change; padding and all offdiagonal fields retain010.
+      __sync_compute();
+      for (int32_t row = 0; row < count; ++row) {
+        attention[row * block + row] = aq_diagonal[row];
+      }
+    }
+    // pair_products is dead after Gram and holds the inverse workspace.
+    __bang_mul_scalar(lower, lower, -1.f, block * block);
+    kda_inverse::invert_unit_lower(
+        inverse, lower, power_tmp, pair_products, matrix_weights, block);
+    const int64_t base = job * block * kDim;
+    const int64_t square = job * block * block;
+    __memcpy_async(
+        p.inverse + square, inverse, block * block * sizeof(float), NRAM2GDRAM);
+    __memcpy_async(
+        p.aq + square, attention, block * block * sizeof(float), NRAM2GDRAM);
+    // pair_products is dead after Gram. Keep U in this distinct buffer while
+    // factor computes QG and the unscaled W prefix. Every async source is
+    // complete before IO reads it and remains intact until the matching drain.
+    __bang_transpose(pair_products, values, block, kDim);
+    __sync_compute();
+    __memcpy_async(
+        p.u + base, pair_products, block * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy_async(p.gate_cumsum + job * kDim,
+                   cumulative,
+                   kDim * sizeof(float),
+                   NRAM2GDRAM);
+    natural_exp(factor, gates, block * kDim);
+    __bang_mul(queries, queries, factor, block * kDim);
+    __sync_compute();
+    __memcpy_async(
+        p.qg + base, queries, block * kDim * sizeof(float), NRAM2GDRAM);
+    __bang_mul(factor, factor, keys, block * kDim);
+    // U IO must finish before W's transpose overwrites pair_products. The
+    // intervening exp/QG/unscaled-W Compute never consumes or overwrites U.
+    __sync_io();
+    // Externally visible W keeps the original time-major layout. Transpose
+    // only the multiplication workspace so beta broadcasts over all channels.
+    __bang_transpose(pair_products, factor, block, kDim);
+    __bang_cycle_mul(pair_products, pair_products, beta, block * kDim, block);
+    __bang_transpose(factor, pair_products, kDim, block);
+    __sync_compute();
+    __memcpy_async(
+        p.w + base, factor, block * kDim * sizeof(float), NRAM2GDRAM);
+    // W IO retains factor while Kg uses distinct pair_products. No IO drain
+    // is needed here because Kg does not consume or overwrite factor.
+    // Every row uses the same final cumulative gate. Broadcast it before
+    // subtraction to preserve the original operand order for each element.
+    __bang_write_value(pair_products, block * kDim, 0.f);
+    __bang_cycle_add(
+        pair_products, pair_products, cumulative, block * kDim, kDim);
+    __bang_sub(pair_products, pair_products, gates, block * kDim);
+    natural_exp(pair_products, pair_products, block * kDim);
+    __bang_mul(pair_products, keys, pair_products, block * kDim);
+    __sync_compute();
+    __memcpy_async(
+        p.kg + base, pair_products, block * kDim * sizeof(float), NRAM2GDRAM);
+    // Complete every async output before the next job reuses any source.
+    __sync_io();
+  }
+}
+}  // namespace prepare_canonical
+}  // namespace
+
+extern "C" void bangc_kda_pcp_prepare_canonical(cnrtQueue_t queue,
+                                                const KdaPcpParams* params) {
+  cnrtDim3_t grid = {32, 1, 1};
+  if (params->block == 16) {
+    prepare_canonical::prepare_takeover_metadata_mirror_kernel<16>
+        <<<grid, cnrtFuncTypeBlock, queue>>>(*params);
+  } else if (params->block == 64) {
+    prepare_canonical::prepare_takeover_metadata_mirror_kernel<64>
+        <<<grid, cnrtFuncTypeBlock, queue>>>(*params);
+  } else {
+    prepare_canonical::prepare_takeover_metadata_mirror_kernel<0>
+        <<<grid, cnrtFuncTypeBlock, queue>>>(*params);
+  }
+}
+
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_pcp_prepare_head_affinity ----
+
+namespace xllm::kernel::mlu {
+
+namespace {
+namespace prepare_head_affinity {
+constexpr int32_t kDim = 128;
+constexpr int32_t kBlock = 64;
+
+__mlu_func__ float dot(float* temporary, const float* a, const float* b) {
+  __bang_mul(temporary, a, b, kDim);
+  return __bang_sum(temporary, kDim);
+}
+
+// A row is loaded and converted once, preserving the original FP32 input
+// interpretation. The source storage and byte strides remain owned by caller.
+__mlu_func__ void load_row(float* destination,
+                           half* staging,
+                           const void* source,
+                           int64_t offset,
+                           int32_t kind) {
+  if (kind == 0) {
+    __memcpy(destination,
+             static_cast<const float*>(source) + offset,
+             kDim * sizeof(float),
+             GDRAM2NRAM);
+    __sync_io();
+  } else {
+    __memcpy(staging,
+             static_cast<const half*>(source) + offset,
+             kDim * sizeof(half),
+             GDRAM2NRAM);
+    __sync_io();
+    if (kind == 1) {
+      __bang_bfloat162float(
+          destination, reinterpret_cast<const bfloat16_t*>(staging), kDim);
+    } else {
+      __bang_half2float(destination, staging, kDim);
+    }
+    // The next row may reuse staging on the IO engine.
+    __sync_compute();
+  }
+}
+
+// Gather one complete request-local time block before consuming its rows.
+// The original per-row loader remains the supported wide-stride path: the
+// two-dimensional IO instruction has a signed 32-bit source stride.
+__mlu_func__ void load_tile(float* destination,
+                            half* staging,
+                            const void* source,
+                            int64_t offset,
+                            int64_t heads,
+                            int32_t count,
+                            int32_t kind) {
+  if (count == 0) {
+    return;
+  }
+  const int64_t element_bytes = kind == 0 ? sizeof(float) : sizeof(half);
+  if (heads > 0x7fffffffLL / (kDim * element_bytes)) {
+    for (int32_t row = 0; row < count; ++row) {
+      load_row(destination + row * kDim,
+               staging,
+               source,
+               offset + static_cast<int64_t>(row) * heads * kDim,
+               kind);
+    }
+    return;
+  }
+  const int64_t source_stride = heads * kDim * element_bytes;
+  if (kind == 0) {
+    __memcpy(destination,
+             static_cast<const float*>(source) + offset,
+             kDim * sizeof(float),
+             GDRAM2NRAM,
+             kDim * sizeof(float),
+             static_cast<int32_t>(source_stride),
+             count - 1);
+    __sync_io();
+  } else {
+    __memcpy(staging,
+             static_cast<const half*>(source) + offset,
+             kDim * sizeof(half),
+             GDRAM2NRAM,
+             kDim * sizeof(half),
+             static_cast<int32_t>(source_stride),
+             count - 1);
+    __sync_io();
+    if (kind == 1) {
+      __bang_bfloat162float(destination,
+                            reinterpret_cast<const bfloat16_t*>(staging),
+                            count * kDim);
+    } else {
+      __bang_half2float(destination, staging, count * kDim);
+    }
+    // Both staging reuse and row-scalar consumers follow conversion completion.
+    __sync_compute();
+  }
+}
+
+// Bulk beta load follows the same full-width source stride rule as Q/K/V.
+__mlu_func__ void load_beta(float* destination,
+                            half* staging,
+                            const void* source,
+                            int64_t begin,
+                            int64_t head,
+                            int64_t heads,
+                            int32_t count,
+                            int32_t kind) {
+  if (count == 0) {
+    return;
+  }
+  const int64_t element_bytes = kind == 0 ? sizeof(float) : sizeof(half);
+  if (heads > 0x7fffffffLL / element_bytes) {
+    for (int32_t row = 0; row < count; ++row) {
+      const int64_t offset = (begin + row) * heads + head;
+      if (kind == 0) {
+        destination[row] = static_cast<const float*>(source)[offset];
+      } else if (kind == 1) {
+        destination[row] =
+            static_cast<float>(static_cast<const bfloat16_t*>(source)[offset]);
+      } else {
+        destination[row] =
+            static_cast<float>(static_cast<const half*>(source)[offset]);
+      }
+    }
+    return;
+  }
+  const int64_t offset = begin * heads + head;
+  const int32_t source_stride = static_cast<int32_t>(heads * element_bytes);
+  if (kind == 0) {
+    __memcpy(destination,
+             static_cast<const float*>(source) + offset,
+             sizeof(float),
+             GDRAM2NRAM,
+             sizeof(float),
+             source_stride,
+             count - 1);
+    __sync_io();
+  } else {
+    __memcpy(staging,
+             static_cast<const half*>(source) + offset,
+             sizeof(half),
+             GDRAM2NRAM,
+             sizeof(half),
+             source_stride,
+             count - 1);
+    __sync_io();
+    if (kind == 1) {
+      __bang_bfloat162float(
+          destination, reinterpret_cast<const bfloat16_t*>(staging), count);
+    } else {
+      __bang_half2float(destination, staging, count);
+    }
+    __sync_compute();
+  }
+}
+
+// Enqueue only positive, representable-stride low-precision tiles. The caller
+// owns a distinct dead scratch buffer per input and drains IO before
+// conversion.
+__mlu_func__ void load_low_tile_async(half* scratch,
+                                      const void* source,
+                                      int64_t offset,
+                                      int64_t heads,
+                                      int32_t count) {
+  __memcpy_async(scratch,
+                 static_cast<const half*>(source) + offset,
+                 kDim * sizeof(half),
+                 GDRAM2NRAM,
+                 kDim * sizeof(half),
+                 static_cast<int32_t>(heads * kDim * sizeof(half)),
+                 count - 1);
+}
+
+__mlu_func__ void convert_low_input(float* destination,
+                                    const half* scratch,
+                                    int32_t elements,
+                                    int32_t kind) {
+  if (kind == 1) {
+    __bang_bfloat162float(
+        destination, reinterpret_cast<const bfloat16_t*>(scratch), elements);
+  } else {
+    __bang_half2float(destination, scratch, elements);
+  }
+}
+
+__mlu_func__ void natural_exp(float* destination,
+                              const float* source,
+                              int32_t elements) {
+  __bang_mul_scalar(destination, source, 1.4426950408889634f, elements);
+  __bang_pow2(destination, destination, elements);
+}
+
+// Integer-bit amplitude checks cannot mistake subnormal values for zero.
+// These are the exact normalized values consumed by either Gram algorithm.
+using AliasUint32 = uint32_t __attribute__((__may_alias__));
+using AliasInt32 = int32_t __attribute__((__may_alias__));
+__mlu_func__ bool matrix_amplitudes_are_safe(
+    const float* input,
+    float* scratch,
+    float* valid,
+    int32_t elements,
+    uint32_t minimum_bits = 0x1f800000U,
+    uint32_t maximum_bits = 0x40000000U) {
+  if (elements == 0) {
+    return true;
+  }
+  const AliasUint32* bits = reinterpret_cast<const AliasUint32*>(input);
+  AliasUint32* magnitudes = reinterpret_cast<AliasUint32*>(scratch);
+  AliasUint32* flags = reinterpret_cast<AliasUint32*>(valid);
+  __bang_band_scalar(magnitudes, bits, 0x7fffffffU, elements);
+  __bang_ge_scalar(flags, magnitudes, minimum_bits, elements);
+  __bang_le_scalar(magnitudes, magnitudes, maximum_bits, elements);
+  __bang_band(flags, flags, magnitudes, elements);
+  __bang_band_scalar(magnitudes, bits, 0x7fffffffU, elements);
+  __bang_eq_scalar(magnitudes, magnitudes, 0U, elements);
+  __bang_bor(flags, flags, magnitudes, elements);
+  __bang_uint322float(scratch, flags, elements, 0);
+  const float count = __bang_sum(scratch, elements);
+  __sync_compute();
+  return count == static_cast<float>(elements);
+}
+
+// BF16 products are exact FP32 when both nonzero inputs are in
+// [2^-32, 2^16]. Seven TwoSum stages retain cancellation residuals before
+// normalization. The same Compute queue orders every rounded add/sub; all
+// scratch tensors are dead until the original normalization/Gram consumers.
+__mlu_func__ void raw_diagonal_dot(float* diagonal,
+                                   const float* queries,
+                                   const float* keys,
+                                   float* high,
+                                   float* low,
+                                   float* total,
+                                   float* virtual_b,
+                                   float* error,
+                                   float* temporary,
+                                   float* low_total,
+                                   int32_t block) {
+  __bang_mul(low, queries, keys, block * kDim);
+  __bang_transpose(high, low, block, kDim);
+  __bang_write_value(low, block * kDim, 0.f);
+  for (int32_t channels = kDim; channels > 1; channels /= 2) {
+    const int32_t elements = channels / 2 * block;
+    __bang_add(total, high, high + elements, elements);
+    __bang_sub(virtual_b, total, high, elements);
+    __bang_sub(error, total, virtual_b, elements);
+    __bang_sub(error, high, error, elements);
+    __bang_sub(temporary, high + elements, virtual_b, elements);
+    __bang_add(error, error, temporary, elements);
+    __bang_add(low_total, low, low + elements, elements);
+    __bang_add(error, error, low_total, elements);
+    __bang_move(high, total, elements * sizeof(float));
+    __bang_move(low, error, elements * sizeof(float));
+  }
+  __bang_add(diagonal, high, low, block);
+}
+
+// All off-diagonal relative exponents are nonpositive. Diagonal16-token
+// microtiles have relative exponent magnitude <=40 for lower in[-5,0].
+// Amplitude bounds keep nonzero diagonal operands normal in FP32.
+__mlu_func__ void microtile_gram(const float* queries,
+                                 const float* keys,
+                                 const float* gates,
+                                 const float* beta,
+                                 float* lower,
+                                 float* attention,
+                                 float* left,
+                                 float* right,
+                                 float* projected,
+                                 float* temporary,
+                                 float* weights,
+                                 int32_t count,
+                                 int32_t block,
+                                 const AliasInt32* strict_mask,
+                                 const AliasInt32* inclusive_mask) {
+  constexpr int32_t kMicro = 16;
+  for (int32_t first = 0; first < count; first += kMicro) {
+    const int32_t rows = count - first < kMicro ? count - first : kMicro;
+    for (int32_t earlier = 0; earlier <= first; earlier += kMicro) {
+      const int32_t columns =
+          count - earlier < kMicro ? count - earlier : kMicro;
+      const bool diagonal = earlier == first;
+      const int32_t anchor =
+          diagonal ? first + (rows - 1) / 2 : earlier + columns - 1;
+      __bang_cycle_sub(
+          left, gates + first * kDim, gates + anchor * kDim, rows * kDim, kDim);
+      natural_exp(left, left, rows * kDim);
+      __bang_mul(right, keys + first * kDim, left, rows * kDim);
+      __bang_mul(left + rows * kDim, queries + first * kDim, left, rows * kDim);
+      __bang_move(left, right, rows * kDim * sizeof(float));
+      __bang_cycle_sub(right,
+                       gates + earlier * kDim,
+                       gates + anchor * kDim,
+                       columns * kDim,
+                       kDim);
+      __bang_mul_scalar(right, right, -1.f, columns * kDim);
+      natural_exp(right, right, columns * kDim);
+      __bang_mul(right, right, keys + earlier * kDim, columns * kDim);
+      __sync_compute();
+      __bang_load_matrix(weights,
+                         right,
+                         NRAM2WRAM,
+                         columns,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __sync_move();
+      __bang_conv(
+          projected, left, weights, kDim, 2 * rows, 1, 1, 1, 1, 1, columns);
+      // Apply beta per later row. The second half contains unscaled Aq.
+      __bang_transpose(temporary, projected, rows, columns);
+      __bang_cycle_mul(
+          temporary, temporary, beta + first, rows * columns, rows);
+      __bang_transpose(projected, temporary, columns, rows);
+      if (diagonal) {
+        if (strict_mask != nullptr && inclusive_mask != nullptr &&
+            rows == kMicro && columns == kMicro) {
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      strict_mask,
+                      rows * columns);
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      inclusive_mask,
+                      rows * columns);
+        } else {
+          __sync_compute();
+          AliasInt32* mask = reinterpret_cast<AliasInt32*>(temporary);
+          for (int32_t row = 0; row < rows; ++row) {
+            for (int32_t col = 0; col < columns; ++col) {
+              mask[row * columns + col] = col < row ? -1 : 0;
+            }
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      mask,
+                      rows * columns);
+          // Complete mask consumption before the scalar mask update.
+          __sync_compute();
+          for (int32_t row = 0; row < rows; ++row) {
+            mask[row * columns + row] = -1;
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      mask,
+                      rows * columns);
+        }
+      }
+      __sync_compute();
+      __memcpy(lower + first * block + earlier,
+               projected,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      __memcpy(attention + first * block + earlier,
+               projected + rows * columns,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      // projected is reused on Compute by the next microtile.
+      __sync_move();
+    }
+  }
+}
+
+__mlu_func__ void microtile_right_weights(const float* keys,
+                                          const float* gates,
+                                          float* right,
+                                          float* weights,
+                                          int32_t earlier,
+                                          int32_t columns,
+                                          int32_t anchor) {
+  __bang_cycle_sub(right,
+                   gates + earlier * kDim,
+                   gates + anchor * kDim,
+                   columns * kDim,
+                   kDim);
+  __bang_mul_scalar(right, right, -1.f, columns * kDim);
+  natural_exp(right, right, columns * kDim);
+  __bang_mul(right, right, keys + earlier * kDim, columns * kDim);
+  __sync_compute();
+  __bang_load_matrix(
+      weights, right, NRAM2WRAM, columns, kDim, kDim * sizeof(float), false);
+  __sync_move();
+}
+
+__mlu_func__ void microtile_gram_reuse(const float* queries,
+                                       const float* keys,
+                                       const float* gates,
+                                       const float* beta,
+                                       float* lower,
+                                       float* attention,
+                                       float* left,
+                                       float* right,
+                                       float* projected,
+                                       float* temporary,
+                                       float* weights,
+                                       int32_t count,
+                                       int32_t block,
+                                       const AliasInt32* strict_mask,
+                                       const AliasInt32* inclusive_mask) {
+  constexpr int32_t kMicro = 16;
+  for (int32_t earlier = 0; earlier < count; earlier += kMicro) {
+    const int32_t columns = count - earlier < kMicro ? count - earlier : kMicro;
+    for (int32_t first = earlier; first < count; first += kMicro) {
+      const int32_t rows = count - first < kMicro ? count - first : kMicro;
+      const bool diagonal = earlier == first;
+      const int32_t anchor =
+          diagonal ? first + (rows - 1) / 2 : earlier + columns - 1;
+      // All off-diagonal later tiles share this earlier tile's end anchor.
+      // The synchronous pack finishes before right is reused as left scratch.
+      if (!diagonal && first == earlier + kMicro) {
+        microtile_right_weights(
+            keys, gates, right, weights, earlier, columns, anchor);
+      }
+      __bang_cycle_sub(
+          left, gates + first * kDim, gates + anchor * kDim, rows * kDim, kDim);
+      natural_exp(left, left, rows * kDim);
+      __bang_mul(right, keys + first * kDim, left, rows * kDim);
+      __bang_mul(left + rows * kDim, queries + first * kDim, left, rows * kDim);
+      __bang_move(left, right, rows * kDim * sizeof(float));
+      if (diagonal) {
+        microtile_right_weights(
+            keys, gates, right, weights, earlier, columns, anchor);
+      }
+      __bang_conv(
+          projected, left, weights, kDim, 2 * rows, 1, 1, 1, 1, 1, columns);
+      // Apply beta per later row. The second half contains unscaled Aq.
+      __bang_transpose(temporary, projected, rows, columns);
+      __bang_cycle_mul(
+          temporary, temporary, beta + first, rows * columns, rows);
+      __bang_transpose(projected, temporary, columns, rows);
+      if (diagonal) {
+        if (strict_mask != nullptr && inclusive_mask != nullptr &&
+            rows == kMicro && columns == kMicro) {
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      strict_mask,
+                      rows * columns);
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      inclusive_mask,
+                      rows * columns);
+        } else {
+          __sync_compute();
+          AliasInt32* mask = reinterpret_cast<AliasInt32*>(temporary);
+          for (int32_t row = 0; row < rows; ++row) {
+            for (int32_t col = 0; col < columns; ++col) {
+              mask[row * columns + col] = col < row ? -1 : 0;
+            }
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected),
+                      reinterpret_cast<AliasInt32*>(projected),
+                      mask,
+                      rows * columns);
+          // Complete mask consumption before the scalar mask update.
+          __sync_compute();
+          for (int32_t row = 0; row < rows; ++row) {
+            mask[row * columns + row] = -1;
+          }
+          __bang_band(reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      reinterpret_cast<AliasInt32*>(projected + rows * columns),
+                      mask,
+                      rows * columns);
+        }
+      }
+      __sync_compute();
+      __memcpy(lower + first * block + earlier,
+               projected,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      __memcpy(attention + first * block + earlier,
+               projected + rows * columns,
+               columns * sizeof(float),
+               NRAM2NRAM,
+               block * sizeof(float),
+               columns * sizeof(float),
+               rows - 1);
+      // projected is reused on Compute by the next microtile.
+      __sync_move();
+    }
+  }
+}
+
+template <int32_t StaticBlock>
+__mlu_global__ void prepare_takeover_head_affinity_kernel(KdaPcpParams p) {
+  const int32_t block = StaticBlock == 0 ? p.block : StaticBlock;
+  if (__is_mpu()) {
+    return;
+  }
+  __nram__ float queries[kBlock * kDim];
+  __nram__ float keys[kBlock * kDim];
+  __nram__ float gates[kBlock * kDim];
+  __nram__ float values[kBlock * kDim];
+  __nram__ float factor[kBlock * kDim];
+  __nram__ float lower[kBlock * kBlock];
+  __nram__ float inverse[kBlock * kBlock];
+  __nram__ float attention[kBlock * kBlock];
+  __nram__ float pair_products[kBlock * kDim];
+  __nram__ float reduction[2 * kBlock * 32];
+  __nram__ float row_dots[kBlock];
+  __nram__ float power_tmp[kBlock * kBlock];
+  __wram__ float matrix_weights[kBlock * kDim];
+  __nram__ float cumulative[kDim];
+  __nram__ float bias[kDim];
+  __nram__ float temporary[kDim];
+  __nram__ float beta[kBlock];
+  __nram__ float norm_q[kBlock], norm_k[kBlock];
+  __nram__ float aq_diagonal[kBlock];
+  __nram__ half staging[kBlock * kDim];
+  __nram__ AliasInt32 strict_diagonal_mask[16 * 16];
+  __nram__ AliasInt32 inclusive_diagonal_mask[16 * 16];
+  // Private metadata windows; see bangc_kda_pcp_metadata.mluh.
+  __nram__ uint32_t index_window[kda_pcp_metadata::kIndexWindowWords];
+  __nram__ uint32_t cu_window[kda_pcp_metadata::kCuWindowWords];
+  int64_t index_base = kda_pcp_metadata::kNoWindow;
+  int64_t cu_base = kda_pcp_metadata::kNoWindow;
+  const bool cache_diagonal_masks =
+      static_cast<int64_t>(taskId) + taskDim < p.chunks * p.heads;
+  if (cache_diagonal_masks) {
+    // Dedicated integer masks are initialized once and remain read-only for
+    // every full diagonal tile in this invocation. Tails use original scratch.
+    for (int32_t row = 0; row < 16; ++row) {
+      for (int32_t col = 0; col < 16; ++col) {
+        strict_diagonal_mask[row * 16 + col] = col < row ? -1 : 0;
+        inclusive_diagonal_mask[row * 16 + col] = col <= row ? -1 : 0;
+      }
+    }
+  }
+  int64_t cached_head = -1;
+  float cached_rate = 0.f;
+  const bool head_affine_jobs =
+      p.chunks > 0 && p.heads > taskDim && p.heads % taskDim == 0;
+  int64_t affine_job = taskId;
+  // Keep the original ordinal bound: the affine address counter wraps after
+  // each head's final slot and cannot serve as the loop termination counter.
+  for (int64_t ordinal = taskId; ordinal < p.chunks * p.heads;
+       ordinal += taskDim) {
+    const int64_t job = head_affine_jobs ? affine_job : ordinal;
+    if (head_affine_jobs) {
+      affine_job += p.heads;
+      if (affine_job >= p.chunks * p.heads) {
+        affine_job -= p.chunks * p.heads - taskDim;
+      }
+    }
+    const int64_t slot = job / p.heads;
+    const int64_t head = job % p.heads;
+    int64_t sequence = 0;
+    int64_t begin = 0;
+    int32_t count = 0;
+    if (!kda_pcp_metadata::locate(p,
+                                  index_window,
+                                  &index_base,
+                                  cu_window,
+                                  &cu_base,
+                                  slot,
+                                  &sequence,
+                                  &begin,
+                                  &count)) {
+      count = 0;
+    }
+    __bang_write_value(queries, block * kDim, 0.f);
+    __bang_write_value(keys, block * kDim, 0.f);
+    __bang_write_value(values, block * kDim, 0.f);
+    __bang_write_value(cumulative, kDim, 0.f);
+    __bang_write_value(beta, block, 0.f);
+    if (head != cached_head) {
+      __memcpy(bias, p.dt_bias + head * kDim, kDim * sizeof(float), GDRAM2NRAM);
+      __sync_io();
+      cached_rate = expf(p.a_log[head]);
+      cached_head = head;
+    }
+    const float rate = cached_rate;
+    const int64_t input_base = (begin * p.heads + head) * kDim;
+    // Zero-fill completes before IO writes the same true-token row storage.
+    __sync_compute();
+    const bool batch_low_inputs =
+        count > 0 && p.q_kind != 0 && p.k_kind != 0 && p.v_kind != 0 &&
+        p.gate_kind != 0 && p.beta_kind != 0 &&
+        p.heads <= 0x7fffffffLL / (kDim * sizeof(half));
+    if (batch_low_inputs) {
+      // Previous-job output IO is drained at the loop tail. Its final Compute
+      // producers completed before those stores; the zero-fill completion above
+      // also precedes this IO. These five buffers have no current-job values
+      // yet.
+      half* raw_q = reinterpret_cast<half*>(factor);
+      half* raw_k = reinterpret_cast<half*>(pair_products);
+      half* raw_v = reinterpret_cast<half*>(lower);
+      half* raw_gate = reinterpret_cast<half*>(inverse);
+      half* raw_beta = reinterpret_cast<half*>(attention);
+      load_low_tile_async(raw_q, p.q, input_base, p.heads, count);
+      load_low_tile_async(raw_k, p.k, input_base, p.heads, count);
+      load_low_tile_async(raw_v, p.v, input_base, p.heads, count);
+      load_low_tile_async(raw_gate, p.raw_gate, input_base, p.heads, count);
+      __memcpy_async(
+          raw_beta,
+          static_cast<const half*>(p.raw_beta) + begin * p.heads + head,
+          sizeof(half),
+          GDRAM2NRAM,
+          sizeof(half),
+          static_cast<int32_t>(p.heads * sizeof(half)),
+          count - 1);
+      __sync_io();
+      convert_low_input(queries, raw_q, count * kDim, p.q_kind);
+      convert_low_input(keys, raw_k, count * kDim, p.k_kind);
+      convert_low_input(values, raw_v, count * kDim, p.v_kind);
+      convert_low_input(gates, raw_gate, count * kDim, p.gate_kind);
+      convert_low_input(beta, raw_beta, count, p.beta_kind);
+      // All five original conversions finish before beta consumers or
+      // amplitude/ diagonal/Gram Compute can overwrite these now-dead raw
+      // source buffers.
+      __sync_compute();
+    } else {
+      load_tile(queries, staging, p.q, input_base, p.heads, count, p.q_kind);
+      load_tile(keys, staging, p.k, input_base, p.heads, count, p.k_kind);
+      load_tile(values, staging, p.v, input_base, p.heads, count, p.v_kind);
+      load_tile(
+          gates, staging, p.raw_gate, input_base, p.heads, count, p.gate_kind);
+      load_beta(
+          beta, staging, p.raw_beta, begin, head, p.heads, count, p.beta_kind);
+    }
+    if (count > 0) {
+      __bang_mul_scalar(beta, beta, -1.4426950408889634f, count);
+      __bang_pow2(beta, beta, count);
+      __bang_add_scalar(beta, beta, 1.f, count);
+      __bang_recip(beta, beta, count);
+    }
+    // All other dtypes and amplitudes retain the original general algorithm.
+    // Integer bits reject nonfinite/subnormal/extreme values before products.
+    const bool stable_diagonal =
+        p.q_kind == 1 && p.k_kind == 1 && count > 0 &&
+        matrix_amplitudes_are_safe(queries,
+                                   factor,
+                                   pair_products,
+                                   count * kDim,
+                                   /*minimum_bits=*/0x2f800000U,
+                                   /*maximum_bits=*/0x47800000U) &&
+        matrix_amplitudes_are_safe(keys,
+                                   factor,
+                                   pair_products,
+                                   count * kDim,
+                                   /*minimum_bits=*/0x2f800000U,
+                                   /*maximum_bits=*/0x47800000U);
+    if (stable_diagonal) {
+      raw_diagonal_dot(aq_diagonal,
+                       queries,
+                       keys,
+                       factor,
+                       pair_products,
+                       lower,
+                       inverse,
+                       attention,
+                       power_tmp,
+                       reduction,
+                       block);
+    }
+    // Normalize independent token rows before the ordered gate prefix.
+    // The row reductions use the same 128 channels and epsilon. They remain
+    // entirely on Compute, eliminating two per-row scalar reduction/sqrt
+    // dependencies. Padding rows were zero-filled and stay exactly zero.
+    __bang_mul(pair_products, queries, queries, block * kDim);
+    __bang_sumpool(reduction, pair_products, 32, block, 4, 1, 4, 1, 1);
+    __bang_transpose(reduction + block * 32, reduction, block, 32);
+    __bang_sumpool(norm_q, reduction + block * 32, block, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_q, norm_q, 1.e-6f, block);
+    __bang_rsqrt(norm_q, norm_q, block);
+    __bang_mul_scalar(norm_q, norm_q, 0.08838834764831845f, block);
+    __bang_transpose(factor, queries, block, kDim);
+    __bang_cycle_mul(factor, factor, norm_q, block * kDim, block);
+    __bang_transpose(queries, factor, kDim, block);
+    __bang_mul(pair_products, keys, keys, block * kDim);
+    __bang_sumpool(reduction, pair_products, 32, block, 4, 1, 4, 1, 1);
+    __bang_transpose(reduction + block * 32, reduction, block, 32);
+    __bang_sumpool(norm_k, reduction + block * 32, block, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_k, norm_k, 1.e-6f, block);
+    __bang_rsqrt(norm_k, norm_k, block);
+    __bang_transpose(factor, keys, block, kDim);
+    __bang_cycle_mul(factor, factor, norm_k, block * kDim, block);
+    __bang_transpose(keys, factor, kDim, block);
+    if (stable_diagonal) {
+      __bang_mul(aq_diagonal, aq_diagonal, norm_q, block);
+      __bang_mul(aq_diagonal, aq_diagonal, norm_k, block);
+    }
+    // Activate only true rows in one Compute stream. Keep the original
+    // left-to-right cumulative sum order and hold its last value for padding.
+    if (count > 0) {
+      __bang_cycle_add(gates, gates, bias, count * kDim, kDim);
+      __bang_mul_scalar(
+          gates, gates, -rate * 1.4426950408889634f, count * kDim);
+      __bang_pow2(gates, gates, count * kDim);
+      __bang_add_scalar(gates, gates, 1.f, count * kDim);
+      __bang_recip(gates, gates, count * kDim);
+      __bang_mul_scalar(gates, gates, p.lower_bound, count * kDim);
+    }
+    // The following value multiplication reads beta[row] on scalar control.
+    __sync_compute();
+    for (int32_t row = 0; row < block; ++row) {
+      if (row < count) {
+        __bang_add(cumulative, cumulative, gates + row * kDim, kDim);
+      }
+      __bang_move(gates + row * kDim, cumulative, kDim * sizeof(float));
+      __bang_mul_scalar(
+          values + row * kDim, values + row * kDim, beta[row], kDim);
+    }
+    // Process each entire causal row in one VPU stream. Future entries are
+    // never exponentiated, including padded rows and large negative gates.
+    __bang_write_value(lower, block * block, 0.f);
+    __bang_write_value(attention, block * block, 0.f);
+    const bool stable_matrix_domain =
+        p.lower_bound >= -5.f && p.lower_bound <= 0.f;
+    const bool amplitudes_safe =
+        stable_matrix_domain &&
+        matrix_amplitudes_are_safe(
+            queries, factor, pair_products, count * kDim) &&
+        matrix_amplitudes_are_safe(keys, factor, pair_products, count * kDim);
+    if (amplitudes_safe) {
+      if (block == kBlock && count > 16) {
+        microtile_gram_reuse(
+            queries,
+            keys,
+            gates,
+            beta,
+            lower,
+            attention,
+            factor,
+            pair_products,
+            power_tmp,
+            reduction,
+            matrix_weights,
+            count,
+            block,
+            cache_diagonal_masks ? strict_diagonal_mask : nullptr,
+            cache_diagonal_masks ? inclusive_diagonal_mask : nullptr);
+      } else {
+        microtile_gram(
+            queries,
+            keys,
+            gates,
+            beta,
+            lower,
+            attention,
+            factor,
+            pair_products,
+            power_tmp,
+            reduction,
+            matrix_weights,
+            count,
+            block,
+            cache_diagonal_masks ? strict_diagonal_mask : nullptr,
+            cache_diagonal_masks ? inclusive_diagonal_mask : nullptr);
+      }
+    } else {
+      for (int32_t row = 0; row < count; ++row) {
+        const int32_t causal = row + 1;
+        __bang_cycle_sub(
+            factor, gates, gates + row * kDim, causal * kDim, kDim);
+        __bang_mul_scalar(factor, factor, -1.f, causal * kDim);
+        natural_exp(factor, factor, causal * kDim);
+        __bang_mul(factor, factor, keys, causal * kDim);
+        __bang_cycle_mul(
+            pair_products, factor, queries + row * kDim, causal * kDim, kDim);
+        __bang_sumpool(reduction, pair_products, 32, causal, 4, 1, 4, 1, 1);
+        __bang_transpose(reduction + causal * 32, reduction, causal, 32);
+        __bang_sumpool(
+            row_dots, reduction + causal * 32, causal, 1, 32, 1, 32, 1, 1);
+        __bang_move(attention + row * block, row_dots, causal * sizeof(float));
+        __bang_cycle_mul(
+            pair_products, factor, keys + row * kDim, causal * kDim, kDim);
+        __bang_sumpool(reduction, pair_products, 32, causal, 4, 1, 4, 1, 1);
+        __bang_transpose(reduction + causal * 32, reduction, causal, 32);
+        __bang_sumpool(
+            row_dots, reduction + causal * 32, causal, 1, 32, 1, 32, 1, 1);
+        __bang_mul_scalar(row_dots, row_dots, beta[row], causal);
+        __bang_move(lower + row * block, row_dots, causal * sizeof(float));
+        __sync_compute();
+        lower[row * block + row] = 0.f;
+      }
+    }
+    if (stable_diagonal) {
+      // Both Gram branches have finished every attention writer. Only true
+      // diagonals change; padding and all offdiagonal fields retain010.
+      __sync_compute();
+      for (int32_t row = 0; row < count; ++row) {
+        attention[row * block + row] = aq_diagonal[row];
+      }
+    }
+    // pair_products is dead after Gram and holds the inverse workspace.
+    __bang_mul_scalar(lower, lower, -1.f, block * block);
+    kda_inverse::invert_unit_lower(
+        inverse, lower, power_tmp, pair_products, matrix_weights, block);
+    const int64_t base = job * block * kDim;
+    const int64_t square = job * block * block;
+    __memcpy_async(
+        p.inverse + square, inverse, block * block * sizeof(float), NRAM2GDRAM);
+    __memcpy_async(
+        p.aq + square, attention, block * block * sizeof(float), NRAM2GDRAM);
+    // pair_products is dead after Gram. Keep U in this distinct buffer while
+    // factor computes QG and the unscaled W prefix. Every async source is
+    // complete before IO reads it and remains intact until the matching drain.
+    __bang_transpose(pair_products, values, block, kDim);
+    __sync_compute();
+    __memcpy_async(
+        p.u + base, pair_products, block * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy_async(p.gate_cumsum + job * kDim,
+                   cumulative,
+                   kDim * sizeof(float),
+                   NRAM2GDRAM);
+    natural_exp(factor, gates, block * kDim);
+    __bang_mul(queries, queries, factor, block * kDim);
+    __sync_compute();
+    __memcpy_async(
+        p.qg + base, queries, block * kDim * sizeof(float), NRAM2GDRAM);
+    __bang_mul(factor, factor, keys, block * kDim);
+    // U IO must finish before W's transpose overwrites pair_products. The
+    // intervening exp/QG/unscaled-W Compute never consumes or overwrites U.
+    __sync_io();
+    // Externally visible W keeps the original time-major layout. Transpose
+    // only the multiplication workspace so beta broadcasts over all channels.
+    __bang_transpose(pair_products, factor, block, kDim);
+    __bang_cycle_mul(pair_products, pair_products, beta, block * kDim, block);
+    __bang_transpose(factor, pair_products, kDim, block);
+    __sync_compute();
+    __memcpy_async(
+        p.w + base, factor, block * kDim * sizeof(float), NRAM2GDRAM);
+    // W IO retains factor while Kg uses distinct pair_products. No IO drain
+    // is needed here because Kg does not consume or overwrite factor.
+    // Every row uses the same final cumulative gate. Broadcast it before
+    // subtraction to preserve the original operand order for each element.
+    __bang_write_value(pair_products, block * kDim, 0.f);
+    __bang_cycle_add(
+        pair_products, pair_products, cumulative, block * kDim, kDim);
+    __bang_sub(pair_products, pair_products, gates, block * kDim);
+    natural_exp(pair_products, pair_products, block * kDim);
+    __bang_mul(pair_products, keys, pair_products, block * kDim);
+    __sync_compute();
+    __memcpy_async(
+        p.kg + base, pair_products, block * kDim * sizeof(float), NRAM2GDRAM);
+    // Complete every async output before the next job reuses any source.
+    __sync_io();
+  }
+}
+}  // namespace prepare_head_affinity
+}  // namespace
+
+extern "C" void bangc_kda_pcp_prepare_head_affinity(
+    cnrtQueue_t queue,
+    const KdaPcpParams* params) {
+  cnrtDim3_t grid = {32, 1, 1};
+  if (params->block == 16) {
+    prepare_head_affinity::prepare_takeover_head_affinity_kernel<16>
+        <<<grid, cnrtFuncTypeBlock, queue>>>(*params);
+  } else if (params->block == 64) {
+    prepare_head_affinity::prepare_takeover_head_affinity_kernel<64>
+        <<<grid, cnrtFuncTypeBlock, queue>>>(*params);
+  } else {
+    prepare_head_affinity::prepare_takeover_head_affinity_kernel<0>
+        <<<grid, cnrtFuncTypeBlock, queue>>>(*params);
+  }
+}
+
+}  // namespace xllm::kernel::mlu

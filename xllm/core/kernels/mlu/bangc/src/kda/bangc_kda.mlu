@@ -1,0 +1,4331 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cmath>
+#include <cstdint>
+
+#include "kernels/mlu/bangc/include/bangc_kda.h"
+#include "kernels/mlu/bangc/src/kda/bangc_kda_inverse.mluh"
+
+// ---- bangc_kda ----
+
+namespace xllm::kernel::mlu {
+namespace {
+constexpr int32_t kDim = 128;
+constexpr int32_t kValueTile = 128;
+
+__mlu_global__ void kda_normalize_metadata(const void* cu_source,
+                                           const void* indices_source,
+                                           const void* accepted_source,
+                                           int32_t* cu,
+                                           int32_t* indices,
+                                           int32_t* accepted,
+                                           int32_t n,
+                                           int32_t columns,
+                                           int32_t wide_mask) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int64_t cu_count = static_cast<int64_t>(n) + 1;
+  const int64_t index_count = static_cast<int64_t>(n) * columns;
+  const int64_t accepted_count = accepted_source == nullptr ? 0 : n;
+  for (int64_t job = taskId; job < cu_count + index_count + accepted_count;
+       job += taskDim) {
+    if (job < cu_count) {
+      const int64_t value = (wide_mask & 1) != 0
+                                ? static_cast<const int64_t*>(cu_source)[job]
+                                : static_cast<const int32_t*>(cu_source)[job];
+      cu[job] = static_cast<int32_t>(value);
+      continue;
+    }
+    const int64_t index = job - cu_count;
+    if (index < index_count) {
+      const int64_t value =
+          (wide_mask & 2) != 0
+              ? static_cast<const int64_t*>(indices_source)[index]
+              : static_cast<const int32_t*>(indices_source)[index];
+      // Legal positive slots are bounded by the caller's state allocator.
+      // Preserve every negative sentinel before narrowing to the native ABI.
+      indices[index] =
+          value > 0 && value <= INT32_MAX ? static_cast<int32_t>(value) : 0;
+      continue;
+    }
+    const int64_t sequence = index - index_count;
+    const int64_t value =
+        (wide_mask & 4) != 0
+            ? static_cast<const int64_t*>(accepted_source)[sequence]
+            : static_cast<const int32_t*>(accepted_source)[sequence];
+    accepted[sequence] =
+        value >= 1 && value <= columns ? static_cast<int32_t>(value) : 0;
+  }
+}
+
+template <int32_t RecurrentValueTile>
+__mlu_global__ void kda_recurrent(const bfloat16_t* q_g,
+                                  const bfloat16_t* k_g,
+                                  const bfloat16_t* v_g,
+                                  const bfloat16_t* a_g,
+                                  const bfloat16_t* b_g,
+                                  const float* log_g,
+                                  const float* bias_g,
+                                  const float* initial_g,
+                                  float* final_g,
+                                  bfloat16_t* out_g,
+                                  const int32_t* cu_g,
+                                  const int32_t* idx_g,
+                                  const int32_t* accepted_g,
+                                  int32_t n,
+                                  int32_t heads,
+                                  int32_t columns,
+                                  int32_t spec,
+                                  int32_t inplace) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float outer_weights[128 * 16];
+  __nram__ float gate_window[4 * kDim], beta_window[4];
+  __nram__ bfloat16_t raw_beta[4];
+  __nram__ bfloat16_t gate_raw[4 * kDim];
+  __nram__ float state[RecurrentValueTile * kDim];
+  __nram__ float tmp[RecurrentValueTile * kDim];
+  __nram__ float trans[RecurrentValueTile * kDim];
+  __nram__ float outer[RecurrentValueTile * kDim];
+  __nram__ float q[kDim], key[kDim], bias[kDim], value[kDim];
+  __nram__ float projection[kDim], delta[kDim], result[kDim], work[kDim];
+  __nram__ bfloat16_t raw_storage[4 * 5 * kDim], out[kDim];
+  __nram__ int32_t cu_cache[129], index_cache[512], accepted_cache[128];
+  const bool cache_metadata = n <= 128 && columns <= 4 && inplace != 2;
+  if (cache_metadata) {
+    __memcpy(cu_cache, cu_g, (n + 1) * sizeof(int32_t), GDRAM2NRAM);
+    __memcpy(index_cache, idx_g, n * columns * sizeof(int32_t), GDRAM2NRAM);
+    if (spec) {
+      __memcpy(accepted_cache, accepted_g, n * sizeof(int32_t), GDRAM2NRAM);
+    }
+  }
+  int32_t cached_head = -1;
+  float rate = 0.f;
+  const int32_t tiles = kDim / RecurrentValueTile;
+  for (int32_t job = taskId; job < n * heads * tiles; job += taskDim) {
+    const int32_t seq = job / (heads * tiles), head = (job / tiles) % heads,
+                  vt = job % tiles;
+    const int32_t bos = cache_metadata ? cu_cache[seq] : cu_g[seq],
+                  eos = cache_metadata ? cu_cache[seq + 1] : cu_g[seq + 1];
+    const int32_t accepted_count =
+        spec ? (cache_metadata ? accepted_cache[seq] : accepted_g[seq]) : 1;
+    const int32_t accepted = accepted_count > 0 ? accepted_count - 1 : -1;
+    if (accepted < 0 || accepted >= columns || (bos == eos && inplace != 2)) {
+      continue;
+    }
+    const int32_t slot =
+        inplace == 2 ? seq
+                     : (cache_metadata ? index_cache[seq * columns + accepted]
+                                       : idx_g[seq * columns + accepted]);
+    if (inplace != 2 && slot <= 0) {
+      continue;
+    }
+    const int64_t state_offset = static_cast<int64_t>(head) * kDim * kDim +
+                                 vt * RecurrentValueTile * kDim;
+    __memcpy(state,
+             initial_g + static_cast<int64_t>(slot) * heads * kDim * kDim +
+                 state_offset,
+             sizeof(state),
+             GDRAM2NRAM);
+    if (inplace == 2 && bos == eos) {
+      __memcpy(final_g + static_cast<int64_t>(seq) * heads * kDim * kDim +
+                   state_offset,
+               state,
+               sizeof(state),
+               NRAM2GDRAM);
+      continue;
+    }
+    if (head != cached_head) {
+      __memcpy(bias, bias_g + head * kDim, sizeof(bias), GDRAM2NRAM);
+      rate = expf(log_g[head]);
+      cached_head = head;
+    }
+    for (int32_t token = bos; token < eos; ++token) {
+      const int64_t offset =
+          (static_cast<int64_t>(token) * heads + head) * kDim;
+      const int32_t window_index = (token - bos) % 4;
+      bfloat16_t* raw = raw_storage + window_index * 5 * kDim;
+      if (window_index == 0) {
+        const int32_t window_size = eos - token < 4 ? eos - token : 4;
+        __memcpy(raw,
+                 q_g + offset,
+                 256,
+                 GDRAM2NRAM,
+                 5 * kDim * 2,
+                 heads * kDim * 2,
+                 window_size - 1);
+        __memcpy(raw + kDim,
+                 k_g + offset,
+                 256,
+                 GDRAM2NRAM,
+                 5 * kDim * 2,
+                 heads * kDim * 2,
+                 window_size - 1);
+        __memcpy(gate_raw,
+                 a_g + offset,
+                 256,
+                 GDRAM2NRAM,
+                 kDim * 2,
+                 heads * kDim * 2,
+                 window_size - 1);
+        __memcpy(raw + 3 * kDim,
+                 v_g + offset + vt * RecurrentValueTile,
+                 RecurrentValueTile * 2,
+                 GDRAM2NRAM,
+                 5 * kDim * 2,
+                 heads * kDim * 2,
+                 window_size - 1);
+        if (window_size == 1) {
+          beta_window[0] =
+              1.f /
+              (1.f + expf(-static_cast<float>(b_g[token * heads + head])));
+        } else {
+          __memcpy(raw_beta,
+                   b_g + token * heads + head,
+                   2,
+                   GDRAM2NRAM,
+                   2,
+                   heads * 2,
+                   window_size - 1);
+          __bang_bfloat162float(beta_window, raw_beta, window_size);
+          __bang_mul_scalar(
+              beta_window, beta_window, -1.4426950408889634f, window_size);
+          __bang_pow2(beta_window, beta_window, window_size);
+          __bang_add_scalar(beta_window, beta_window, 1.f, window_size);
+          __bang_recip(beta_window, beta_window, window_size);
+        }
+        const int32_t gate_count = window_size * kDim;
+        __bang_bfloat162float(gate_window, gate_raw, gate_count);
+        // FAM adds the cyclic per-key bias, then multiplies by -rate * log2(e).
+        // dst[i] = (src[i] + bias[i % head_dim]) * (-rate * log2(e)).
+        __bang_fusion(FUSION_FAM,
+                      gate_window,
+                      gate_window,
+                      bias,
+                      -rate * 1.4426950408889634f,
+                      gate_count,
+                      kDim);
+        __bang_pow2(gate_window, gate_window, gate_count);
+        __bang_add_scalar(gate_window, gate_window, 1.f, gate_count);
+        __bang_recip(gate_window, gate_window, gate_count);
+        __bang_mul_scalar(
+            gate_window, gate_window, -5.f * 1.4426950408889634f, gate_count);
+        __bang_pow2(gate_window, gate_window, gate_count);
+      }
+      __bang_bfloat162float(q, raw, kDim);
+      __bang_bfloat162float(key, raw + kDim, kDim);
+      const float* gate = gate_window + window_index * kDim;
+      __bang_bfloat162float(value, raw + 3 * kDim, RecurrentValueTile);
+      __bang_mul(work, q, q, kDim);
+      const float qs =
+          (1.f / sqrtf(__bang_sum(work, kDim) + 1.e-6f)) * 0.08838834764831845f;
+      __bang_mul_scalar(q, q, qs, kDim);
+      __bang_mul(work, key, key, kDim);
+      const float ks = (1.f / sqrtf(__bang_sum(work, kDim) + 1.e-6f));
+      __bang_mul_scalar(key, key, ks, kDim);
+      __sync_compute();
+      __bang_load_matrix_async(
+          outer_weights, key, NRAM2WRAM, kDim, 1, sizeof(float), false);
+      const float beta = beta_window[window_index];
+      __sync_io();
+      __bang_cycle_mul(state, state, gate, RecurrentValueTile * kDim, kDim);
+      __bang_cycle_mul(tmp, state, key, RecurrentValueTile * kDim, kDim);
+      __bang_sumpool(outer, tmp, 32, RecurrentValueTile, 4, 1, 4, 1, 1);
+      __bang_transpose(trans, outer, RecurrentValueTile, 32);
+      __bang_sumpool(projection, trans, RecurrentValueTile, 1, 32, 1, 32, 1, 1);
+      __bang_fusion(FUSION_FSM,
+                    delta,
+                    value,
+                    projection,
+                    beta,
+                    RecurrentValueTile,
+                    RecurrentValueTile);
+      __sync_move();
+      __bang_conv_partial(state,
+                          delta,
+                          outer_weights,
+                          state,
+                          1,
+                          RecurrentValueTile,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kDim);
+      __bang_cycle_mul(tmp, state, q, RecurrentValueTile * kDim, kDim);
+      __bang_sumpool(outer, tmp, 32, RecurrentValueTile, 4, 1, 4, 1, 1);
+      __bang_transpose(trans, outer, RecurrentValueTile, 32);
+      __bang_sumpool(result, trans, RecurrentValueTile, 1, 32, 1, 32, 1, 1);
+      __bang_float2bfloat16_rn(out, result, RecurrentValueTile);
+      __sync_compute();
+      __memcpy_async(out_g + offset + vt * RecurrentValueTile,
+                     out,
+                     RecurrentValueTile * 2,
+                     NRAM2GDRAM);
+      const int32_t dest =
+          inplace == 2
+              ? seq
+              : (inplace == 3
+                     ? (cache_metadata ? index_cache[seq] : idx_g[seq])
+                     : (inplace
+                            ? (cache_metadata
+                                   ? index_cache[seq * columns + token - bos]
+                                   : idx_g[seq * columns + token - bos])
+                            : token));
+      if ((inplace == 2 || inplace == 3) ? token + 1 == eos
+                                         : (!inplace || dest > 0)) {
+        __memcpy_async(final_g +
+                           static_cast<int64_t>(dest) * heads * kDim * kDim +
+                           state_offset,
+                       state,
+                       sizeof(state),
+                       NRAM2GDRAM);
+      }
+    }
+    __sync_io();
+  }
+}
+template <int32_t ValueTile, bool BalanceTail = false>
+__mlu_global__ void kda_chunk4_verify(const bfloat16_t* q_g,
+                                      const bfloat16_t* k_g,
+                                      const bfloat16_t* v_g,
+                                      const bfloat16_t* a_g,
+                                      const bfloat16_t* b_g,
+                                      const float* log_g,
+                                      const float* bias_g,
+                                      const float* initial_g,
+                                      float* final_g,
+                                      bfloat16_t* out_g,
+                                      const int32_t* cu_g,
+                                      const int32_t* idx_g,
+                                      const int32_t* accepted_g,
+                                      int32_t n,
+                                      int32_t heads,
+                                      int32_t columns) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float weights[64 * kDim];
+  __wram__ float update_weights[4 * 128 * 16];
+  __nram__ float state[ValueTile * kDim];
+  __nram__ float snapshots[4 * ValueTile * kDim];
+  __nram__ float query[4 * kDim], key[4 * kDim], value[4 * ValueTile],
+      lam[4 * kDim], step_gate[4 * kDim];
+  __nram__ float km[4 * kDim], combined[8 * kDim];
+  __nram__ float projection[8 * ValueTile], combined_projection[8 * ValueTile];
+  __nram__ float delta[4 * ValueTile], dt[4 * ValueTile], output[4 * ValueTile];
+  __nram__ float gram_k[16], gram_q[16], work[kDim], bias[kDim], beta[4];
+  __nram__ bfloat16_t raw_q[4 * kDim], raw_k[4 * kDim], raw_v[4 * ValueTile],
+      raw_a[4 * kDim], raw_b[4], out[4 * ValueTile];
+  __nram__ int32_t cu_cache[129], index_cache[512], accepted_cache[128];
+  __memcpy(cu_cache, cu_g, (n + 1) * sizeof(int32_t), GDRAM2NRAM);
+  __memcpy(index_cache, idx_g, n * columns * sizeof(int32_t), GDRAM2NRAM);
+  __memcpy(accepted_cache, accepted_g, n * sizeof(int32_t), GDRAM2NRAM);
+  int32_t cached_head = -1;
+  float rate = 0.f;
+  constexpr int32_t kTiles = kDim / ValueTile;
+  const int32_t head_jobs = n * heads;
+  const int32_t full_heads = head_jobs / 32 * 32;
+  const int32_t tail_heads = head_jobs % 32;
+  const int32_t tail_value_tile = tail_heads <= 8 ? 32 : 64;
+  const int32_t tail_tiles = kDim / tail_value_tile;
+  const int32_t jobs =
+      BalanceTail ? full_heads + tail_heads * tail_tiles : head_jobs * kTiles;
+  for (int32_t job = taskId; job < jobs; job += taskDim) {
+    int32_t head_job = job / kTiles;
+    int32_t vt = job % kTiles;
+    int32_t value_tile = ValueTile;
+    if constexpr (BalanceTail) {
+      if (job < full_heads) {
+        head_job = job;
+        vt = 0;
+      } else {
+        const int32_t tail_job = job - full_heads;
+        head_job = full_heads + tail_job / tail_tiles;
+        vt = tail_job % tail_tiles;
+        value_tile = tail_value_tile;
+      }
+    }
+    const int32_t seq = head_job / heads;
+    const int32_t head = head_job % heads;
+    const int32_t bos = cu_cache[seq], eos = cu_cache[seq + 1];
+    const int32_t accepted =
+        accepted_cache[seq] > 0 ? accepted_cache[seq] - 1 : -1;
+    if (bos == eos || accepted < 0 || accepted >= columns) {
+      continue;
+    }
+    const int32_t slot = index_cache[seq * columns + accepted];
+    if (slot <= 0) {
+      continue;
+    }
+    const int64_t state_offset =
+        static_cast<int64_t>(head) * kDim * kDim + vt * value_tile * kDim;
+    __memcpy(state,
+             initial_g + static_cast<int64_t>(slot) * heads * kDim * kDim +
+                 state_offset,
+             value_tile * kDim * sizeof(float),
+             GDRAM2NRAM);
+    if (head != cached_head) {
+      __memcpy(bias, bias_g + head * kDim, sizeof(bias), GDRAM2NRAM);
+      rate = expf(log_g[head]);
+      cached_head = head;
+    }
+    for (int64_t begin = bos; begin < eos; begin += 4) {
+      const int32_t length =
+          static_cast<int32_t>(eos - begin < 4 ? eos - begin : 4);
+      float* kb = combined;
+      float* qs = combined + length * kDim;
+      float* pk = combined_projection;
+      float* pq = combined_projection + length * value_tile;
+      const int64_t offset =
+          (static_cast<int64_t>(begin) * heads + head) * kDim;
+      __memcpy(raw_q,
+               q_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_k,
+               k_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_v,
+               v_g + offset + vt * value_tile,
+               value_tile * 2,
+               GDRAM2NRAM,
+               value_tile * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_a,
+               a_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_b,
+               b_g + begin * heads + head,
+               2,
+               GDRAM2NRAM,
+               2,
+               heads * 2,
+               length - 1);
+      __bang_bfloat162float(query, raw_q, length * kDim);
+      __bang_bfloat162float(key, raw_k, length * kDim);
+      __bang_bfloat162float(value, raw_v, length * value_tile);
+      __bang_bfloat162float(lam, raw_a, length * kDim);
+      __bang_bfloat162float(beta, raw_b, length);
+      __bang_mul_scalar(beta, beta, -1.4426950408889634f, length);
+      __bang_pow2(beta, beta, length);
+      __bang_add_scalar(beta, beta, 1.f, length);
+      __bang_recip(beta, beta, length);
+      __bang_cycle_add(lam, lam, bias, length * kDim, kDim);
+      __bang_mul_scalar(lam, lam, -rate * 1.4426950408889634f, length * kDim);
+      __bang_pow2(lam, lam, length * kDim);
+      __bang_add_scalar(lam, lam, 1.f, length * kDim);
+      __bang_recip(lam, lam, length * kDim);
+      __bang_mul_scalar(lam, lam, -5.f * 1.4426950408889634f, length * kDim);
+      __bang_pow2(lam, lam, length * kDim);
+      __bang_move(step_gate, lam, length * kDim * sizeof(float));
+      for (int32_t t = 0; t < length; ++t) {
+        __bang_mul(work, query + t * kDim, query + t * kDim, kDim);
+        const float norm_q =
+            .08838834764831845f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+        __bang_mul_scalar(query + t * kDim, query + t * kDim, norm_q, kDim);
+        __bang_mul(work, key + t * kDim, key + t * kDim, kDim);
+        const float norm_k = 1.f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+        __bang_mul_scalar(key + t * kDim, key + t * kDim, norm_k, kDim);
+      }
+      __sync_compute();
+      for (int32_t t = 0; t < length; ++t) {
+        __bang_load_matrix_async(update_weights + t * 128 * 16,
+                                 key + t * kDim,
+                                 NRAM2WRAM,
+                                 kDim,
+                                 1,
+                                 sizeof(float),
+                                 false);
+      }
+      for (int32_t t = 1; t < length; ++t) {
+        __bang_mul(lam + t * kDim, lam + t * kDim, lam + (t - 1) * kDim, kDim);
+      }
+      __bang_mul(kb, key, lam, length * kDim);
+      __bang_mul(qs, query, lam, length * kDim);
+      __bang_recip(km, lam, length * kDim);
+      __bang_mul(km, km, key, length * kDim);
+      __bang_load_matrix(
+          weights, km, NRAM2WRAM, length, kDim, kDim * sizeof(float), false);
+      __bang_conv(gram_k, kb, weights, kDim, length, 1, 1, 1, 1, 1, length);
+      __bang_conv(gram_q, qs, weights, kDim, length, 1, 1, 1, 1, 1, length);
+      __bang_load_matrix(weights,
+                         combined,
+                         NRAM2WRAM,
+                         2 * length,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __bang_conv(projection,
+                  state,
+                  weights,
+                  kDim,
+                  value_tile,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  2 * length);
+      __bang_transpose(combined_projection, projection, value_tile, 2 * length);
+      for (int32_t t = 0; t < length; ++t) {
+        __bang_sub(delta + t * value_tile,
+                   value + t * value_tile,
+                   pk + t * value_tile,
+                   value_tile);
+        __bang_mul_scalar(delta + t * value_tile,
+                          delta + t * value_tile,
+                          beta[t],
+                          value_tile);
+        for (int32_t j = 0; j < t; ++j) {
+          const float coefficient = beta[t] * gram_k[t * length + j];
+          __bang_fusion(FUSION_FMA,
+                        delta + t * value_tile,
+                        delta + j * value_tile,
+                        -coefficient,
+                        delta + t * value_tile,
+                        value_tile,
+                        value_tile);
+        }
+        __bang_move(output + t * value_tile,
+                    pq + t * value_tile,
+                    value_tile * sizeof(float));
+        for (int32_t j = 0; j <= t; ++j) {
+          __bang_fusion(FUSION_FMA,
+                        output + t * value_tile,
+                        delta + j * value_tile,
+                        gram_q[t * length + j],
+                        output + t * value_tile,
+                        value_tile,
+                        value_tile);
+        }
+      }
+      __bang_float2bfloat16_rn(out, output, length * value_tile);
+      __memcpy(out_g + offset + vt * value_tile,
+               out,
+               value_tile * 2,
+               NRAM2GDRAM,
+               heads * kDim * 2,
+               value_tile * 2,
+               length - 1);
+      __sync_move();
+      for (int32_t t = 0; t < length; ++t) {
+        __bang_cycle_mul(
+            state, state, step_gate + t * kDim, value_tile * kDim, kDim);
+        __bang_conv_partial(state,
+                            delta + t * value_tile,
+                            update_weights + t * 128 * 16,
+                            state,
+                            1,
+                            value_tile,
+                            1,
+                            1,
+                            1,
+                            1,
+                            1,
+                            kDim);
+        const int32_t column = static_cast<int32_t>(begin - bos) + t;
+        const int32_t dest = index_cache[seq * columns + column];
+        if (dest > 0) {
+          float* snapshot = snapshots + t * value_tile * kDim;
+          __bang_move(snapshot, state, value_tile * kDim * sizeof(float));
+          __sync_compute();
+          __memcpy_async(final_g +
+                             static_cast<int64_t>(dest) * heads * kDim * kDim +
+                             state_offset,
+                         snapshot,
+                         value_tile * kDim * sizeof(float),
+                         NRAM2GDRAM);
+        }
+      }
+      __sync_io();
+    }
+  }
+}
+
+// Pipelined schedule of kda_chunk4_verify<128> for head-aligned batches
+// (heads % taskDim == 0 or taskDim % heads == 0). It owns the same
+// (sequence, head) jobs as the round-robin kernel and keeps its math and its
+// per-token checkpoint writes; only the order and the overlap change:
+//  - each core visits its jobs head-major and computes gate/beta once per
+//    batch of up to kVerifyGateTokens tokens of one head;
+//  - the next window's q/k/v and a/b rows, the next job's initial state (as
+//    conv weights in WRAM) and the state two jobs ahead are prefetched;
+//  - every recurrence step is written straight into its checkpoint buffer,
+//    and one __sync_io per window drains the previous checkpoint stores.
+// A synchronous __memcpy waits for the in-flight checkpoint stores, so every
+// DMA issued between two __sync_io calls is asynchronous.
+constexpr int32_t kVerifyWindow = 4;
+constexpr int32_t kVerifyGateTokens = 32;
+constexpr int32_t kVerifyMaxLocalJobs = 256;
+
+__mlu_global__ void kda_chunk4_verify_pipelined(const bfloat16_t* q_g,
+                                                const bfloat16_t* k_g,
+                                                const bfloat16_t* v_g,
+                                                const bfloat16_t* a_g,
+                                                const bfloat16_t* b_g,
+                                                const float* log_g,
+                                                const float* bias_g,
+                                                const float* initial_g,
+                                                float* final_g,
+                                                bfloat16_t* out_g,
+                                                const int32_t* cu_g,
+                                                const int32_t* idx_g,
+                                                const int32_t* accepted_g,
+                                                int32_t n,
+                                                int32_t heads,
+                                                int32_t columns) {
+  if (__is_mpu()) {
+    return;
+  }
+  constexpr int32_t kTile = kDim * kDim;
+  constexpr int32_t kRawTile = 3 * kVerifyWindow * kDim;
+  __wram__ float weights[64 * kDim];
+  __wram__ float update_weights[4 * 128 * 16];
+  __wram__ float state_weights[kTile];
+  __nram__ float states[2 * kTile];
+  __nram__ float snapshots[kVerifyWindow * kTile];
+  __nram__ float query[kVerifyWindow * kDim], key[kVerifyWindow * kDim],
+      value[kVerifyWindow * kDim], lam[kVerifyWindow * kDim];
+  __nram__ float km[kVerifyWindow * kDim], combined[2 * kVerifyWindow * kDim],
+      combined_projection[2 * kVerifyWindow * kDim];
+  __nram__ float delta[kVerifyWindow * kDim], output[kVerifyWindow * kDim];
+  __nram__ float gram_k[16], gram_q[16], work[kDim], bias[kDim], log_rate[1];
+  __nram__ float gate[kVerifyGateTokens * kDim], beta[kVerifyGateTokens];
+  __nram__ bfloat16_t raw_qkv[2 * kRawTile], out[kVerifyWindow * kDim];
+  __nram__ bfloat16_t raw_a[kVerifyGateTokens * kDim], raw_b[kVerifyGateTokens];
+  __nram__ int32_t cu_cache[129], index_cache[512], accepted_cache[128];
+  __nram__ int32_t job_seq[kVerifyMaxLocalJobs], job_head[kVerifyMaxLocalJobs],
+      job_slot[kVerifyMaxLocalJobs];
+  __memcpy(cu_cache, cu_g, (n + 1) * sizeof(int32_t), GDRAM2NRAM);
+  __memcpy(index_cache, idx_g, n * columns * sizeof(int32_t), GDRAM2NRAM);
+  __memcpy(accepted_cache, accepted_g, n * sizeof(int32_t), GDRAM2NRAM);
+
+  // Round-robin ownership of job = seq * heads + head, listed head-major.
+  const bool split_heads = heads % taskDim == 0;
+  const int32_t head_count = split_heads ? heads / taskDim : 1;
+  const int32_t head_first = split_heads ? taskId : taskId % heads;
+  const int32_t seq_first = split_heads ? 0 : taskId / heads;
+  const int32_t seq_step = split_heads ? 1 : taskDim / heads;
+  int32_t jobs = 0;
+  for (int32_t h = 0; h < head_count; ++h) {
+    for (int32_t seq = seq_first; seq < n; seq += seq_step) {
+      const int32_t accepted =
+          accepted_cache[seq] > 0 ? accepted_cache[seq] - 1 : -1;
+      if (cu_cache[seq] == cu_cache[seq + 1] || accepted < 0 ||
+          accepted >= columns) {
+        continue;
+      }
+      const int32_t slot = index_cache[seq * columns + accepted];
+      if (slot <= 0) {
+        continue;
+      }
+      job_seq[jobs] = seq;
+      job_head[jobs] = head_first + h * taskDim;
+      job_slot[jobs] = slot;
+      ++jobs;
+    }
+  }
+  if (jobs == 0) {
+    return;
+  }
+
+  // A unit of work is one window of at most kVerifyWindow tokens of a job.
+  auto window_length = [&](int32_t job, int32_t begin) {
+    const int32_t eos = cu_cache[job_seq[job] + 1];
+    return eos - begin < kVerifyWindow ? eos - begin : kVerifyWindow;
+  };
+  auto advance = [&](int32_t& job, int32_t& begin) {
+    if (begin + kVerifyWindow < cu_cache[job_seq[job] + 1]) {
+      begin += kVerifyWindow;
+      return;
+    }
+    ++job;
+    begin = job < jobs ? cu_cache[job_seq[job]] : 0;
+  };
+  auto token_offset = [&](int32_t job, int32_t begin) {
+    return (static_cast<int64_t>(begin) * heads + job_head[job]) * kDim;
+  };
+  auto load_state = [&](float* dst, int32_t job) {
+    __memcpy_async(dst,
+                   initial_g + (static_cast<int64_t>(job_slot[job]) * heads +
+                                job_head[job]) *
+                                   kTile,
+                   kTile * sizeof(float),
+                   GDRAM2NRAM);
+  };
+  auto load_qkv = [&](bfloat16_t* raw, int32_t job, int32_t begin) {
+    const int64_t offset = token_offset(job, begin);
+    const int32_t length = window_length(job, begin);
+    __memcpy_async(raw,
+                   q_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw + kVerifyWindow * kDim,
+                   k_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw + 2 * kVerifyWindow * kDim,
+                   v_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+  };
+  // Gathers a/b rows of consecutive windows of one head; returns the number
+  // of windows and the number of tokens in the batch.
+  int32_t gate_tokens = 0;
+  auto gather_gate = [&](int32_t job, int32_t begin) {
+    const int32_t head = job_head[job];
+    __memcpy_async(
+        bias, bias_g + head * kDim, kDim * sizeof(float), GDRAM2NRAM);
+    __memcpy_async(log_rate, log_g + head, sizeof(float), GDRAM2NRAM);
+    int32_t windows = 0;
+    gate_tokens = 0;
+    while (job < jobs && job_head[job] == head) {
+      const int32_t length = window_length(job, begin);
+      if (gate_tokens + length > kVerifyGateTokens) {
+        break;
+      }
+      __memcpy_async(raw_a + gate_tokens * kDim,
+                     a_g + token_offset(job, begin),
+                     kDim * 2,
+                     GDRAM2NRAM,
+                     kDim * 2,
+                     heads * kDim * 2,
+                     length - 1);
+      __memcpy_async(raw_b + gate_tokens,
+                     b_g + static_cast<int64_t>(begin) * heads + head,
+                     2,
+                     GDRAM2NRAM,
+                     2,
+                     heads * 2,
+                     length - 1);
+      gate_tokens += length;
+      ++windows;
+      advance(job, begin);
+    }
+    return windows;
+  };
+
+  int32_t job = 0;
+  int32_t begin = cu_cache[job_seq[0]];
+  load_state(states, /*job=*/0);
+  if (jobs > 1) {
+    load_state(states + kTile, /*job=*/1);
+  }
+  load_qkv(raw_qkv, job, begin);
+  int32_t batch_windows = gather_gate(job, begin);
+  bool new_batch = true;
+  int32_t gate_cursor = 0;
+  __sync_io();
+  __bang_load_matrix(state_weights,
+                     states,
+                     NRAM2WRAM,
+                     kDim,
+                     kDim,
+                     kDim * sizeof(float),
+                     false);
+  int32_t ping = 0;
+  int32_t raw_ping = 0;
+  while (job < jobs) {
+    const int32_t seq = job_seq[job];
+    const int32_t head = job_head[job];
+    const int32_t bos = cu_cache[seq];
+    const int32_t length = window_length(job, begin);
+    const int64_t offset = token_offset(job, begin);
+    const int64_t state_offset = static_cast<int64_t>(head) * kTile;
+    const bool first_window = begin == bos;
+    // Later windows continue from the last checkpoint of the previous one.
+    const float* state = first_window ? states + ping * kTile
+                                      : snapshots + (kVerifyWindow - 1) * kTile;
+    const bfloat16_t* raw = raw_qkv + raw_ping * kRawTile;
+    int32_t next_job = job;
+    int32_t next_begin = begin;
+    advance(next_job, next_begin);
+    const bool has_next = next_job < jobs;
+    const bool next_continues = next_job == job;
+    if (new_batch) {
+      const float rate = expf(log_rate[0]);
+      __bang_bfloat162float(gate, raw_a, gate_tokens * kDim);
+      __bang_bfloat162float(beta, raw_b, gate_tokens);
+      __bang_mul_scalar(beta, beta, -1.4426950408889634f, gate_tokens);
+      __bang_pow2(beta, beta, gate_tokens);
+      __bang_add_scalar(beta, beta, 1.f, gate_tokens);
+      __bang_recip(beta, beta, gate_tokens);
+      __bang_cycle_add(gate, gate, bias, gate_tokens * kDim, kDim);
+      __bang_mul_scalar(
+          gate, gate, -rate * 1.4426950408889634f, gate_tokens * kDim);
+      __bang_pow2(gate, gate, gate_tokens * kDim);
+      __bang_add_scalar(gate, gate, 1.f, gate_tokens * kDim);
+      __bang_recip(gate, gate, gate_tokens * kDim);
+      __bang_mul_scalar(
+          gate, gate, -5.f * 1.4426950408889634f, gate_tokens * kDim);
+      __bang_pow2(gate, gate, gate_tokens * kDim);
+      new_batch = false;
+      gate_cursor = 0;
+    }
+    const float* step_gate = gate + gate_cursor * kDim;
+    const float* step_beta = beta + gate_cursor;
+    float* kb = combined;
+    float* qs = combined + length * kDim;
+    float* pk = combined_projection;
+    float* pq = combined_projection + length * kDim;
+    __bang_bfloat162float(query, raw, length * kDim);
+    __bang_bfloat162float(key, raw + kVerifyWindow * kDim, length * kDim);
+    __bang_bfloat162float(value, raw + 2 * kVerifyWindow * kDim, length * kDim);
+    __bang_move(lam, step_gate, length * kDim * sizeof(float));
+    for (int32_t t = 0; t < length; ++t) {
+      __bang_mul(work, query + t * kDim, query + t * kDim, kDim);
+      const float norm_q =
+          .08838834764831845f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+      __bang_mul_scalar(query + t * kDim, query + t * kDim, norm_q, kDim);
+      __bang_mul(work, key + t * kDim, key + t * kDim, kDim);
+      const float norm_k = 1.f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+      __bang_mul_scalar(key + t * kDim, key + t * kDim, norm_k, kDim);
+    }
+    __sync_compute();
+    for (int32_t t = 0; t < length; ++t) {
+      __bang_load_matrix_async(update_weights + t * 128 * 16,
+                               key + t * kDim,
+                               NRAM2WRAM,
+                               kDim,
+                               1,
+                               sizeof(float),
+                               false);
+    }
+    for (int32_t t = 1; t < length; ++t) {
+      __bang_mul(lam + t * kDim, lam + t * kDim, lam + (t - 1) * kDim, kDim);
+    }
+    __bang_mul(kb, key, lam, length * kDim);
+    __bang_mul(qs, query, lam, length * kDim);
+    __bang_recip(km, lam, length * kDim);
+    __bang_mul(km, km, key, length * kDim);
+    __bang_load_matrix(
+        weights, km, NRAM2WRAM, length, kDim, kDim * sizeof(float), false);
+    __bang_conv(gram_k, kb, weights, kDim, length, 1, 1, 1, 1, 1, length);
+    __bang_conv(gram_q, qs, weights, kDim, length, 1, 1, 1, 1, 1, length);
+    // Rows of [kb; qs] against W[co=v][ci=k] = S give pk/pq row-major.
+    __sync_move();
+    __bang_conv(combined_projection,
+                combined,
+                state_weights,
+                kDim,
+                2 * length,
+                1,
+                1,
+                1,
+                1,
+                1,
+                kDim);
+    for (int32_t t = 0; t < length; ++t) {
+      __bang_sub(delta + t * kDim, value + t * kDim, pk + t * kDim, kDim);
+      __bang_mul_scalar(delta + t * kDim, delta + t * kDim, step_beta[t], kDim);
+      for (int32_t j = 0; j < t; ++j) {
+        const float coefficient = step_beta[t] * gram_k[t * length + j];
+        __bang_fusion(FUSION_FMA,
+                      delta + t * kDim,
+                      delta + j * kDim,
+                      -coefficient,
+                      delta + t * kDim,
+                      kDim,
+                      kDim);
+      }
+      __bang_move(output + t * kDim, pq + t * kDim, kDim * sizeof(float));
+      for (int32_t j = 0; j <= t; ++j) {
+        __bang_fusion(FUSION_FMA,
+                      output + t * kDim,
+                      delta + j * kDim,
+                      gram_q[t * length + j],
+                      output + t * kDim,
+                      kDim,
+                      kDim);
+      }
+    }
+    __bang_float2bfloat16_rn(out, output, length * kDim);
+    __sync_compute();
+    __memcpy_async(out_g + offset,
+                   out,
+                   kDim * 2,
+                   NRAM2GDRAM,
+                   heads * kDim * 2,
+                   kDim * 2,
+                   length - 1);
+    gate_cursor += length;
+    --batch_windows;
+    if (has_next) {
+      load_qkv(raw_qkv + (raw_ping ^ 1) * kRawTile, next_job, next_begin);
+      if (batch_windows == 0) {
+        batch_windows = gather_gate(next_job, next_begin);
+        new_batch = true;
+      }
+    }
+    // Completes the previous checkpoints (rewritten below), this output, the
+    // next window's inputs and the next job's initial state.
+    __sync_io();
+    __sync_move();
+    if (has_next && !next_continues) {
+      __bang_load_matrix_async(state_weights,
+                               states + (ping ^ 1) * kTile,
+                               NRAM2WRAM,
+                               kDim,
+                               kDim,
+                               kDim * sizeof(float),
+                               false);
+    }
+    for (int32_t t = 0; t < length; ++t) {
+      float* snapshot = snapshots + t * kTile;
+      const float* previous = t == 0 ? state : snapshots + (t - 1) * kTile;
+      __bang_cycle_mul(snapshot, previous, step_gate + t * kDim, kTile, kDim);
+      __bang_conv_partial(snapshot,
+                          delta + t * kDim,
+                          update_weights + t * 128 * 16,
+                          snapshot,
+                          1,
+                          kDim,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kDim);
+      // The DMA engines read the snapshot, and step 0 releases the initial
+      // state buffer for the job two ahead.
+      __sync_compute();
+      if (t == 0 && first_window && job + 2 < jobs) {
+        load_state(states + ping * kTile, job + 2);
+      }
+      const int32_t column = begin - bos + t;
+      const int32_t dest = index_cache[seq * columns + column];
+      if (dest > 0) {
+        __memcpy_async(
+            final_g + static_cast<int64_t>(dest) * heads * kTile + state_offset,
+            snapshot,
+            kTile * sizeof(float),
+            NRAM2GDRAM);
+      }
+    }
+    if (next_continues) {
+      __bang_load_matrix(state_weights,
+                         snapshots + (kVerifyWindow - 1) * kTile,
+                         NRAM2WRAM,
+                         kDim,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+    } else {
+      ping ^= 1;
+    }
+    raw_ping ^= 1;
+    job = next_job;
+    begin = next_begin;
+  }
+  __sync_io();
+}
+
+__mlu_global__ void kda_chunk4_verify_tiled128(const bfloat16_t* q_g,
+                                               const bfloat16_t* k_g,
+                                               const bfloat16_t* v_g,
+                                               const bfloat16_t* a_g,
+                                               const bfloat16_t* b_g,
+                                               const float* log_g,
+                                               const float* bias_g,
+                                               const float* initial_g,
+                                               float* final_g,
+                                               bfloat16_t* out_g,
+                                               const int32_t* cu_g,
+                                               const int32_t* idx_g,
+                                               const int32_t* accepted_g,
+                                               int32_t n,
+                                               int32_t heads,
+                                               int32_t columns) {
+  if (__is_mpu()) {
+    return;
+  }
+  constexpr int32_t kTiledValueTile = 128;
+  constexpr int32_t kRequestTile = 128;
+  __wram__ float weights[64 * kDim];
+  __wram__ float update_weights[4 * 128 * 16];
+  __nram__ float state[kTiledValueTile * kDim];
+  __nram__ float snapshots[4 * kTiledValueTile * kDim];
+  __nram__ float query[4 * kDim], key[4 * kDim], value[4 * kTiledValueTile],
+      lam[4 * kDim], step_gate[4 * kDim];
+  __nram__ float km[4 * kDim], combined[8 * kDim];
+  __nram__ float projection[8 * kTiledValueTile],
+      combined_projection[8 * kTiledValueTile];
+  __nram__ float delta[4 * kTiledValueTile], dt[4 * kTiledValueTile],
+      output[4 * kTiledValueTile];
+  __nram__ float gram_k[16], gram_q[16], work[kDim], bias[kDim], beta[4];
+  __nram__ bfloat16_t raw_q[4 * kDim], raw_k[4 * kDim],
+      raw_v[4 * kTiledValueTile], raw_a[4 * kDim], raw_b[4],
+      out[4 * kTiledValueTile];
+  __nram__ int32_t cu_cache[129], index_cache[512], accepted_cache[128];
+  int32_t cached_head = -1;
+  float rate = 0.f;
+  // 128*8 head jobs are a whole number of 32-IPU waves. Local task
+  // striding therefore preserves every IPU's original global job order.
+  for (int64_t base = 0; base < static_cast<int64_t>(n); base += kRequestTile) {
+    const int32_t count =
+        static_cast<int32_t>(static_cast<int64_t>(n) - base < kRequestTile
+                                 ? static_cast<int64_t>(n) - base
+                                 : kRequestTile);
+    // CU values remain absolute token positions. Only metadata rows rebase.
+    __memcpy(cu_cache, cu_g + base, (count + 1) * sizeof(int32_t), GDRAM2NRAM);
+    __memcpy(index_cache,
+             idx_g + base * columns,
+             count * columns * sizeof(int32_t),
+             GDRAM2NRAM);
+    __memcpy(
+        accepted_cache, accepted_g + base, count * sizeof(int32_t), GDRAM2NRAM);
+    const int32_t jobs = count * heads;
+    for (int32_t job = taskId; job < jobs; job += taskDim) {
+      const int32_t seq = job / heads;
+      const int32_t head = job % heads;
+      constexpr int32_t kValueIndex = 0;
+      constexpr int32_t kCurrentValueTile = kTiledValueTile;
+      const int32_t bos = cu_cache[seq], eos = cu_cache[seq + 1];
+      const int32_t accepted =
+          accepted_cache[seq] > 0 ? accepted_cache[seq] - 1 : -1;
+      if (bos == eos || accepted < 0 || accepted >= columns) {
+        continue;
+      }
+      const int32_t slot = index_cache[seq * columns + accepted];
+      if (slot <= 0) {
+        continue;
+      }
+      const int64_t state_offset = static_cast<int64_t>(head) * kDim * kDim +
+                                   kValueIndex * kCurrentValueTile * kDim;
+      __memcpy(state,
+               initial_g + static_cast<int64_t>(slot) * heads * kDim * kDim +
+                   state_offset,
+               kCurrentValueTile * kDim * sizeof(float),
+               GDRAM2NRAM);
+      if (head != cached_head) {
+        __memcpy(bias, bias_g + head * kDim, sizeof(bias), GDRAM2NRAM);
+        rate = expf(log_g[head]);
+        cached_head = head;
+      }
+      for (int64_t begin = bos; begin < eos; begin += 4) {
+        const int32_t length =
+            static_cast<int32_t>(eos - begin < 4 ? eos - begin : 4);
+        float* kb = combined;
+        float* qs = combined + length * kDim;
+        float* pk = combined_projection;
+        float* pq = combined_projection + length * kCurrentValueTile;
+        const int64_t offset =
+            (static_cast<int64_t>(begin) * heads + head) * kDim;
+        __memcpy(raw_q,
+                 q_g + offset,
+                 kDim * 2,
+                 GDRAM2NRAM,
+                 kDim * 2,
+                 heads * kDim * 2,
+                 length - 1);
+        __memcpy(raw_k,
+                 k_g + offset,
+                 kDim * 2,
+                 GDRAM2NRAM,
+                 kDim * 2,
+                 heads * kDim * 2,
+                 length - 1);
+        __memcpy(raw_v,
+                 v_g + offset + kValueIndex * kCurrentValueTile,
+                 kCurrentValueTile * 2,
+                 GDRAM2NRAM,
+                 kCurrentValueTile * 2,
+                 heads * kDim * 2,
+                 length - 1);
+        __memcpy(raw_a,
+                 a_g + offset,
+                 kDim * 2,
+                 GDRAM2NRAM,
+                 kDim * 2,
+                 heads * kDim * 2,
+                 length - 1);
+        __memcpy(raw_b,
+                 b_g + static_cast<int64_t>(begin) * heads + head,
+                 2,
+                 GDRAM2NRAM,
+                 2,
+                 heads * 2,
+                 length - 1);
+        __bang_bfloat162float(query, raw_q, length * kDim);
+        __bang_bfloat162float(key, raw_k, length * kDim);
+        __bang_bfloat162float(value, raw_v, length * kCurrentValueTile);
+        __bang_bfloat162float(lam, raw_a, length * kDim);
+        __bang_bfloat162float(beta, raw_b, length);
+        __bang_mul_scalar(beta, beta, -1.4426950408889634f, length);
+        __bang_pow2(beta, beta, length);
+        __bang_add_scalar(beta, beta, 1.f, length);
+        __bang_recip(beta, beta, length);
+        __bang_cycle_add(lam, lam, bias, length * kDim, kDim);
+        __bang_mul_scalar(lam, lam, -rate * 1.4426950408889634f, length * kDim);
+        __bang_pow2(lam, lam, length * kDim);
+        __bang_add_scalar(lam, lam, 1.f, length * kDim);
+        __bang_recip(lam, lam, length * kDim);
+        __bang_mul_scalar(lam, lam, -5.f * 1.4426950408889634f, length * kDim);
+        __bang_pow2(lam, lam, length * kDim);
+        __bang_move(step_gate, lam, length * kDim * sizeof(float));
+        for (int32_t t = 0; t < length; ++t) {
+          __bang_mul(work, query + t * kDim, query + t * kDim, kDim);
+          const float norm_q =
+              .08838834764831845f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+          __bang_mul_scalar(query + t * kDim, query + t * kDim, norm_q, kDim);
+          __bang_mul(work, key + t * kDim, key + t * kDim, kDim);
+          const float norm_k = 1.f / sqrtf(__bang_sum(work, kDim) + 1.e-6f);
+          __bang_mul_scalar(key + t * kDim, key + t * kDim, norm_k, kDim);
+        }
+        __sync_compute();
+        for (int32_t t = 0; t < length; ++t) {
+          __bang_load_matrix_async(update_weights + t * 128 * 16,
+                                   key + t * kDim,
+                                   NRAM2WRAM,
+                                   kDim,
+                                   1,
+                                   sizeof(float),
+                                   false);
+        }
+        for (int32_t t = 1; t < length; ++t) {
+          __bang_mul(
+              lam + t * kDim, lam + t * kDim, lam + (t - 1) * kDim, kDim);
+        }
+        __bang_mul(kb, key, lam, length * kDim);
+        __bang_mul(qs, query, lam, length * kDim);
+        __bang_recip(km, lam, length * kDim);
+        __bang_mul(km, km, key, length * kDim);
+        __bang_load_matrix(
+            weights, km, NRAM2WRAM, length, kDim, kDim * sizeof(float), false);
+        __bang_conv(gram_k, kb, weights, kDim, length, 1, 1, 1, 1, 1, length);
+        __bang_conv(gram_q, qs, weights, kDim, length, 1, 1, 1, 1, 1, length);
+        __bang_load_matrix(weights,
+                           combined,
+                           NRAM2WRAM,
+                           2 * length,
+                           kDim,
+                           kDim * sizeof(float),
+                           false);
+        __bang_conv(projection,
+                    state,
+                    weights,
+                    kDim,
+                    kCurrentValueTile,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    2 * length);
+        __bang_transpose(
+            combined_projection, projection, kCurrentValueTile, 2 * length);
+        for (int32_t t = 0; t < length; ++t) {
+          __bang_sub(delta + t * kCurrentValueTile,
+                     value + t * kCurrentValueTile,
+                     pk + t * kCurrentValueTile,
+                     kCurrentValueTile);
+          __bang_mul_scalar(delta + t * kCurrentValueTile,
+                            delta + t * kCurrentValueTile,
+                            beta[t],
+                            kCurrentValueTile);
+          for (int32_t j = 0; j < t; ++j) {
+            const float coefficient = beta[t] * gram_k[t * length + j];
+            __bang_fusion(FUSION_FMA,
+                          delta + t * kCurrentValueTile,
+                          delta + j * kCurrentValueTile,
+                          -coefficient,
+                          delta + t * kCurrentValueTile,
+                          kCurrentValueTile,
+                          kCurrentValueTile);
+          }
+          __bang_move(output + t * kCurrentValueTile,
+                      pq + t * kCurrentValueTile,
+                      kCurrentValueTile * sizeof(float));
+          for (int32_t j = 0; j <= t; ++j) {
+            __bang_fusion(FUSION_FMA,
+                          output + t * kCurrentValueTile,
+                          delta + j * kCurrentValueTile,
+                          gram_q[t * length + j],
+                          output + t * kCurrentValueTile,
+                          kCurrentValueTile,
+                          kCurrentValueTile);
+          }
+        }
+        __bang_float2bfloat16_rn(out, output, length * kCurrentValueTile);
+        __memcpy(out_g + offset + kValueIndex * kCurrentValueTile,
+                 out,
+                 kCurrentValueTile * 2,
+                 NRAM2GDRAM,
+                 heads * kDim * 2,
+                 kCurrentValueTile * 2,
+                 length - 1);
+        __sync_move();
+        for (int32_t t = 0; t < length; ++t) {
+          __bang_cycle_mul(state,
+                           state,
+                           step_gate + t * kDim,
+                           kCurrentValueTile * kDim,
+                           kDim);
+          __bang_conv_partial(state,
+                              delta + t * kCurrentValueTile,
+                              update_weights + t * 128 * 16,
+                              state,
+                              1,
+                              kCurrentValueTile,
+                              1,
+                              1,
+                              1,
+                              1,
+                              1,
+                              kDim);
+          const int32_t column = static_cast<int32_t>(begin - bos) + t;
+          const int32_t dest = index_cache[seq * columns + column];
+          if (dest > 0) {
+            float* snapshot = snapshots + t * kCurrentValueTile * kDim;
+            __bang_move(
+                snapshot, state, kCurrentValueTile * kDim * sizeof(float));
+            __sync_compute();
+            __memcpy_async(
+                final_g + static_cast<int64_t>(dest) * heads * kDim * kDim +
+                    state_offset,
+                snapshot,
+                kCurrentValueTile * kDim * sizeof(float),
+                NRAM2GDRAM);
+          }
+        }
+        __sync_io();
+      }
+    }
+    // Complete all final-state reads of snapshots before the next metadata
+    // tile reuses this IPU's buffers. No inter-IPU barrier is introduced.
+    __sync_io();
+  }
+}
+}  // namespace
+
+extern "C" int32_t bangc_kda_normalize_metadata(void* queue,
+                                                const void* cu_source,
+                                                const void* indices_source,
+                                                const void* accepted_source,
+                                                void* cu,
+                                                void* indices,
+                                                void* accepted,
+                                                int32_t n,
+                                                int32_t columns,
+                                                int32_t wide_mask) {
+  if (n <= 0 || columns <= 0 || wide_mask < 0 || wide_mask > 7) {
+    return 1;
+  }
+  cnrtDim3_t dim = {4, 8, 1};
+  kda_normalize_metadata<<<dim,
+                           cnrtFuncTypeUnion1,
+                           static_cast<cnrtQueue_t>(queue)>>>(
+      cu_source,
+      indices_source,
+      accepted_source,
+      static_cast<int32_t*>(cu),
+      static_cast<int32_t*>(indices),
+      static_cast<int32_t*>(accepted),
+      n,
+      columns,
+      wide_mask);
+  return static_cast<int32_t>(cnrtGetLastError());
+}
+
+extern "C" int32_t bangc_kda_recurrent(void* queue,
+                                       const void* q,
+                                       const void* k,
+                                       const void* v,
+                                       const void* a,
+                                       const void* b,
+                                       const void* log,
+                                       const void* bias,
+                                       const void* initial,
+                                       void* final,
+                                       void* out,
+                                       const void* cu,
+                                       const void* idx,
+                                       const void* accepted,
+                                       int32_t n,
+                                       int32_t heads,
+                                       int32_t columns,
+                                       int32_t spec,
+                                       int32_t inplace) {
+  // A valid empty continuous batch has no metadata/state/output to touch.
+  // In particular do not submit zero-byte metadata DMA to the device.
+  if (n == 0) {
+    return 0;
+  }
+  cnrtDim3_t dim = {4, 8, 1};
+  if (spec && inplace == 1 && columns == 4 && n <= 128) {
+    const int64_t head_jobs = static_cast<int64_t>(n) * heads;
+    const int32_t tail_heads = static_cast<int32_t>(head_jobs % 32);
+    if (head_jobs >= 32 && tail_heads > 0 && tail_heads <= 16) {
+      kda_chunk4_verify<128, true>
+          <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+              static_cast<const bfloat16_t*>(q),
+              static_cast<const bfloat16_t*>(k),
+              static_cast<const bfloat16_t*>(v),
+              static_cast<const bfloat16_t*>(a),
+              static_cast<const bfloat16_t*>(b),
+              static_cast<const float*>(log),
+              static_cast<const float*>(bias),
+              static_cast<const float*>(initial),
+              static_cast<float*>(final),
+              static_cast<bfloat16_t*>(out),
+              static_cast<const int32_t*>(cu),
+              static_cast<const int32_t*>(idx),
+              static_cast<const int32_t*>(accepted),
+              n,
+              heads,
+              columns);
+    } else if (static_cast<int64_t>(n) * heads <= 8) {
+      kda_chunk4_verify<32>
+          <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+              static_cast<const bfloat16_t*>(q),
+              static_cast<const bfloat16_t*>(k),
+              static_cast<const bfloat16_t*>(v),
+              static_cast<const bfloat16_t*>(a),
+              static_cast<const bfloat16_t*>(b),
+              static_cast<const float*>(log),
+              static_cast<const float*>(bias),
+              static_cast<const float*>(initial),
+              static_cast<float*>(final),
+              static_cast<bfloat16_t*>(out),
+              static_cast<const int32_t*>(cu),
+              static_cast<const int32_t*>(idx),
+              static_cast<const int32_t*>(accepted),
+              n,
+              heads,
+              columns);
+    } else if (static_cast<int64_t>(n) * heads <= 16) {
+      kda_chunk4_verify<64>
+          <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+              static_cast<const bfloat16_t*>(q),
+              static_cast<const bfloat16_t*>(k),
+              static_cast<const bfloat16_t*>(v),
+              static_cast<const bfloat16_t*>(a),
+              static_cast<const bfloat16_t*>(b),
+              static_cast<const float*>(log),
+              static_cast<const float*>(bias),
+              static_cast<const float*>(initial),
+              static_cast<float*>(final),
+              static_cast<bfloat16_t*>(out),
+              static_cast<const int32_t*>(cu),
+              static_cast<const int32_t*>(idx),
+              static_cast<const int32_t*>(accepted),
+              n,
+              heads,
+              columns);
+    } else if (heads > 0 && (heads % 32 == 0 || 32 % heads == 0) &&
+               head_jobs <= 32 * kVerifyMaxLocalJobs) {
+      kda_chunk4_verify_pipelined<<<dim,
+                                    cnrtFuncTypeUnion1,
+                                    static_cast<cnrtQueue_t>(queue)>>>(
+          static_cast<const bfloat16_t*>(q),
+          static_cast<const bfloat16_t*>(k),
+          static_cast<const bfloat16_t*>(v),
+          static_cast<const bfloat16_t*>(a),
+          static_cast<const bfloat16_t*>(b),
+          static_cast<const float*>(log),
+          static_cast<const float*>(bias),
+          static_cast<const float*>(initial),
+          static_cast<float*>(final),
+          static_cast<bfloat16_t*>(out),
+          static_cast<const int32_t*>(cu),
+          static_cast<const int32_t*>(idx),
+          static_cast<const int32_t*>(accepted),
+          n,
+          heads,
+          columns);
+    } else {
+      kda_chunk4_verify<128>
+          <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+              static_cast<const bfloat16_t*>(q),
+              static_cast<const bfloat16_t*>(k),
+              static_cast<const bfloat16_t*>(v),
+              static_cast<const bfloat16_t*>(a),
+              static_cast<const bfloat16_t*>(b),
+              static_cast<const float*>(log),
+              static_cast<const float*>(bias),
+              static_cast<const float*>(initial),
+              static_cast<float*>(final),
+              static_cast<bfloat16_t*>(out),
+              static_cast<const int32_t*>(cu),
+              static_cast<const int32_t*>(idx),
+              static_cast<const int32_t*>(accepted),
+              n,
+              heads,
+              columns);
+    }
+  } else if (spec && inplace == 1 && columns == 3 && heads == 8 && n >= 32 &&
+             n <= 128) {
+    // Legal 2D checkpoint tables cover every CU token; mode3 stays separate.
+    kda_chunk4_verify<128>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            static_cast<const int32_t*>(idx),
+            static_cast<const int32_t*>(accepted),
+            n,
+            heads,
+            columns);
+  } else if (spec && inplace == 1 && columns == 3 && heads == 8 && n > 128) {
+    kda_chunk4_verify_tiled128<<<dim,
+                                 cnrtFuncTypeUnion1,
+                                 static_cast<cnrtQueue_t>(queue)>>>(
+        static_cast<const bfloat16_t*>(q),
+        static_cast<const bfloat16_t*>(k),
+        static_cast<const bfloat16_t*>(v),
+        static_cast<const bfloat16_t*>(a),
+        static_cast<const bfloat16_t*>(b),
+        static_cast<const float*>(log),
+        static_cast<const float*>(bias),
+        static_cast<const float*>(initial),
+        static_cast<float*>(final),
+        static_cast<bfloat16_t*>(out),
+        static_cast<const int32_t*>(cu),
+        static_cast<const int32_t*>(idx),
+        static_cast<const int32_t*>(accepted),
+        n,
+        heads,
+        columns);
+  } else if (n * heads <= 8) {
+    kda_recurrent<32>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            static_cast<const int32_t*>(idx),
+            static_cast<const int32_t*>(accepted),
+            n,
+            heads,
+            columns,
+            spec,
+            inplace);
+  } else if (n * heads <= 16) {
+    kda_recurrent<64>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            static_cast<const int32_t*>(idx),
+            static_cast<const int32_t*>(accepted),
+            n,
+            heads,
+            columns,
+            spec,
+            inplace);
+  } else {
+    kda_recurrent<128>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            static_cast<const int32_t*>(idx),
+            static_cast<const int32_t*>(accepted),
+            n,
+            heads,
+            columns,
+            spec,
+            inplace);
+  }
+  return static_cast<int32_t>(cnrtGetLastError());
+}
+
+namespace {
+
+// Storage outside packed CU coverage has a defined zero output. Each IPU
+// owns disjoint head vectors; the MPU does not address NRAM or output.
+__mlu_device__ void zero_prefill_suffix(bfloat16_t* output,
+                                        const int32_t* cu,
+                                        int32_t n,
+                                        int32_t heads,
+                                        int32_t total_tokens,
+                                        bfloat16_t* zeros) {
+  if (__is_mpu() || total_tokens < 0) {
+    return;
+  }
+  const int32_t begin = cu[n];
+  if (begin >= total_tokens) {
+    return;
+  }
+  __bang_write_value(zeros, kDim, bfloat16_t(0.f));
+  const int64_t jobs = static_cast<int64_t>(total_tokens - begin) * heads;
+  const int64_t offset = static_cast<int64_t>(begin) * heads * kDim;
+  for (int64_t job = taskId; job < jobs; job += taskDim) {
+    __memcpy(output + offset + job * kDim,
+             zeros,
+             kDim * sizeof(bfloat16_t),
+             NRAM2GDRAM);
+  }
+}
+
+// Thirty-two-token algebraic KDA; all cross-window recurrent state remains
+// FP32.
+template <int32_t PrefillValueTile>
+__mlu_global__ void kda_chunk32_prefill(const bfloat16_t* q_g,
+                                        const bfloat16_t* k_g,
+                                        const bfloat16_t* v_g,
+                                        const bfloat16_t* a_g,
+                                        const bfloat16_t* b_g,
+                                        const float* log_g,
+                                        const float* bias_g,
+                                        const float* initial_g,
+                                        float* final_g,
+                                        bfloat16_t* out_g,
+                                        const int32_t* cu_g,
+                                        int32_t n,
+                                        int32_t heads,
+                                        int32_t total_tokens) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float weights[64 * kDim];
+  __wram__ float update_weights[128 * 32];
+  __nram__ float state[PrefillValueTile * kDim];
+  __nram__ float query[32 * kDim], key[32 * kDim], value[32 * PrefillValueTile],
+      lam[32 * kDim];
+  __nram__ float km[32 * kDim], relative_gate[32 * kDim], combined[64 * kDim];
+  __nram__ float projection[64 * PrefillValueTile],
+      combined_projection[64 * PrefillValueTile];
+  __nram__ float delta[32 * PrefillValueTile], dt[32 * PrefillValueTile],
+      output[32 * PrefillValueTile];
+  __nram__ float gram_k[1024], gram_q[1024], inverse[1024], power[1024],
+      power_tmp[1024], off_diagonal[1024], work[kDim], bias[kDim], beta[32];
+  __nram__ float norm_q[32], norm_k[32];
+  __nram__ int32_t strict_mask[1024], inclusive_mask[1024];
+  __nram__ float prefix_tmp[32 * kDim];
+  int32_t mask_length = 0;
+  __nram__ bfloat16_t raw_q[32 * kDim], raw_k[32 * kDim],
+      raw_v[32 * PrefillValueTile], raw_a[32 * kDim], raw_b[32],
+      out[32 * PrefillValueTile];
+  constexpr int32_t kTiles = kDim / PrefillValueTile;
+  for (int32_t job = taskId; job < n * heads * kTiles; job += taskDim) {
+    const int32_t seq = job / (heads * kTiles), head = job / kTiles % heads,
+                  vt = job % kTiles;
+    const int32_t bos = cu_g[seq], eos = cu_g[seq + 1];
+    const int64_t state_offset =
+        (static_cast<int64_t>(seq) * heads + head) * kDim * kDim +
+        vt * PrefillValueTile * kDim;
+    __memcpy(state, initial_g + state_offset, sizeof(state), GDRAM2NRAM);
+    __memcpy(bias, bias_g + head * kDim, sizeof(bias), GDRAM2NRAM);
+    const float rate = expf(log_g[head]);
+    for (int32_t begin = bos; begin < eos; begin += 32) {
+      const int32_t length = eos - begin < 32 ? eos - begin : 32;
+      float* kb = combined;
+      float* qs = combined + length * kDim;
+      float* pk = combined_projection;
+      float* pq = combined_projection + length * PrefillValueTile;
+      const int64_t offset =
+          (static_cast<int64_t>(begin) * heads + head) * kDim;
+      __memcpy(raw_q,
+               q_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_k,
+               k_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_v,
+               v_g + offset + vt * PrefillValueTile,
+               PrefillValueTile * 2,
+               GDRAM2NRAM,
+               PrefillValueTile * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_a,
+               a_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_b,
+               b_g + begin * heads + head,
+               2,
+               GDRAM2NRAM,
+               2,
+               heads * 2,
+               length - 1);
+      __bang_bfloat162float(query, raw_q, length * kDim);
+      __bang_bfloat162float(key, raw_k, length * kDim);
+      __bang_bfloat162float(value, raw_v, length * PrefillValueTile);
+      __bang_bfloat162float(lam, raw_a, length * kDim);
+      __bang_bfloat162float(beta, raw_b, length);
+      __bang_mul_scalar(beta, beta, -1.4426950408889634f, length);
+      __bang_pow2(beta, beta, length);
+      __bang_add_scalar(beta, beta, 1.f, length);
+      __bang_recip(beta, beta, length);
+      // FAM adds the cyclic per-key bias, then multiplies by -rate * log2(e).
+      // dst[i] = (src[i] + bias[i % head_dim]) * (-rate * log2(e)).
+      __bang_fusion(FUSION_FAM,
+                    lam,
+                    lam,
+                    bias,
+                    -rate * 1.4426950408889634f,
+                    length * kDim,
+                    kDim);
+      __bang_pow2(lam, lam, length * kDim);
+      __bang_add_scalar(lam, lam, 1.f, length * kDim);
+      __bang_recip(lam, lam, length * kDim);
+      __bang_mul_scalar(lam, lam, -5.f * 1.4426950408889634f, length * kDim);
+      __bang_mul(relative_gate, query, query, length * kDim);
+      __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+      __bang_transpose(combined + length * 32, combined, length, 32);
+      __bang_sumpool(
+          norm_q, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+      __bang_add_scalar(norm_q, norm_q, 1.e-6f, length);
+      __bang_rsqrt(norm_q, norm_q, length);
+      __bang_mul_scalar(norm_q, norm_q, .08838834764831845f, length);
+      __bang_mul(relative_gate, key, key, length * kDim);
+      __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+      __bang_transpose(combined + length * 32, combined, length, 32);
+      __bang_sumpool(
+          norm_k, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+      __bang_add_scalar(norm_k, norm_k, 1.e-6f, length);
+      __bang_rsqrt(norm_k, norm_k, length);
+      __bang_transpose(relative_gate, query, length, kDim);
+      __bang_cycle_mul(
+          relative_gate, relative_gate, norm_q, kDim * length, length);
+      __bang_transpose(query, relative_gate, kDim, length);
+      __bang_transpose(relative_gate, key, length, kDim);
+      __bang_cycle_mul(
+          relative_gate, relative_gate, norm_k, kDim * length, length);
+      __bang_transpose(key, relative_gate, kDim, length);
+      float* prefix_src = lam;
+      float* prefix_dst = prefix_tmp;
+      for (int32_t distance = 1; distance < length; distance *= 2) {
+        __bang_move(prefix_dst, prefix_src, distance * kDim * sizeof(float));
+        __bang_add(prefix_dst + distance * kDim,
+                   prefix_src + distance * kDim,
+                   prefix_src,
+                   (length - distance) * kDim);
+        float* previous = prefix_src;
+        prefix_src = prefix_dst;
+        prefix_dst = previous;
+      }
+      if (prefix_src != lam) {
+        __bang_move(lam, prefix_src, length * kDim * sizeof(float));
+      }
+      __bang_cycle_sub(relative_gate,
+                       lam,
+                       lam + ((length - 1) / 2) * kDim,
+                       length * kDim,
+                       kDim);
+      __bang_pow2(relative_gate, relative_gate, length * kDim);
+      __bang_pow2(lam, lam, length * kDim);
+      __bang_mul(kb, key, relative_gate, length * kDim);
+      __bang_mul(qs, query, relative_gate, length * kDim);
+      __bang_recip(km, relative_gate, length * kDim);
+      __bang_mul(km, km, key, length * kDim);
+      __bang_load_matrix(
+          weights, km, NRAM2WRAM, length, kDim, kDim * sizeof(float), false);
+      __bang_conv(gram_k, kb, weights, kDim, length, 1, 1, 1, 1, 1, length);
+      __bang_conv(gram_q, qs, weights, kDim, length, 1, 1, 1, 1, 1, length);
+      __bang_mul(kb, key, lam, length * kDim);
+      __bang_mul(qs, query, lam, length * kDim);
+      __bang_load_matrix(weights,
+                         combined,
+                         NRAM2WRAM,
+                         2 * length,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __bang_conv(projection,
+                  state,
+                  weights,
+                  kDim,
+                  PrefillValueTile,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  2 * length);
+      __bang_transpose(
+          combined_projection, projection, PrefillValueTile, 2 * length);
+      if (mask_length != length) {
+        for (int32_t t = 0; t < length; ++t) {
+          for (int32_t j = 0; j < length; ++j) {
+            strict_mask[t * length + j] = j < t ? -1 : 0;
+            inclusive_mask[t * length + j] = j <= t ? -1 : 0;
+          }
+        }
+        mask_length = length;
+      }
+      for (int32_t t = 0; t < length; ++t) {
+        __bang_fusion(FUSION_FSM,
+                      value + t * PrefillValueTile,
+                      value + t * PrefillValueTile,
+                      pk + t * PrefillValueTile,
+                      beta[t],
+                      PrefillValueTile,
+                      PrefillValueTile);
+        __bang_mul_scalar(
+            power + t * length, gram_k + t * length, -beta[t], length);
+      }
+      __bang_band(reinterpret_cast<int32_t*>(power),
+                  reinterpret_cast<int32_t*>(power),
+                  strict_mask,
+                  length * length);
+      kda_inverse::invert_unit_lower(
+          inverse, power, power_tmp, off_diagonal, weights, length);
+      __bang_load_matrix(update_weights,
+                         value,
+                         NRAM2WRAM,
+                         length,
+                         PrefillValueTile,
+                         PrefillValueTile * sizeof(float),
+                         true);
+      __bang_conv(delta,
+                  inverse,
+                  update_weights,
+                  length,
+                  length,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  PrefillValueTile);
+      __bang_band(reinterpret_cast<int32_t*>(gram_q),
+                  reinterpret_cast<int32_t*>(gram_q),
+                  inclusive_mask,
+                  length * length);
+      __bang_load_matrix(update_weights,
+                         delta,
+                         NRAM2WRAM,
+                         length,
+                         PrefillValueTile,
+                         PrefillValueTile * sizeof(float),
+                         true);
+      __bang_conv_partial(output,
+                          gram_q,
+                          update_weights,
+                          pq,
+                          length,
+                          length,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          PrefillValueTile);
+      __bang_float2bfloat16_rn(out, output, length * PrefillValueTile);
+      __memcpy(out_g + offset + vt * PrefillValueTile,
+               out,
+               PrefillValueTile * 2,
+               NRAM2GDRAM,
+               heads * kDim * 2,
+               PrefillValueTile * 2,
+               length - 1);
+      __bang_transpose(dt, delta, length, PrefillValueTile);
+      __bang_cycle_mul(
+          km, km, relative_gate + (length - 1) * kDim, length * kDim, kDim);
+      __bang_cycle_mul(state,
+                       state,
+                       lam + (length - 1) * kDim,
+                       PrefillValueTile * kDim,
+                       kDim);
+      __bang_load_matrix(update_weights,
+                         km,
+                         NRAM2WRAM,
+                         length,
+                         kDim,
+                         kDim * sizeof(float),
+                         true);
+      __bang_conv_partial(state,
+                          dt,
+                          update_weights,
+                          state,
+                          length,
+                          PrefillValueTile,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kDim);
+    }
+    __memcpy(final_g + state_offset, state, sizeof(state), NRAM2GDRAM);
+  }
+  zero_prefill_suffix(out_g, cu_g, n, heads, total_tokens, out);
+}
+
+int32_t launch_kda_prefill(void* queue,
+                           const void* q,
+                           const void* k,
+                           const void* v,
+                           const void* a,
+                           const void* b,
+                           const void* log,
+                           const void* bias,
+                           const void* initial,
+                           void* final,
+                           void* out,
+                           const void* cu,
+                           int32_t n,
+                           int32_t heads,
+                           int32_t total_tokens) {
+  cnrtDim3_t dim = {4, 8, 1};
+  if (n * heads <= 8) {
+    kda_chunk32_prefill<32>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  } else if (n * heads <= 16) {
+    kda_chunk32_prefill<64>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  } else {
+    kda_chunk32_prefill<128>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  }
+  return static_cast<int32_t>(cnrtGetLastError());
+}
+
+}  // namespace
+
+extern "C" int32_t bangc_kda_prefill(void* queue,
+                                     const void* q,
+                                     const void* k,
+                                     const void* v,
+                                     const void* a,
+                                     const void* b,
+                                     const void* log,
+                                     const void* bias,
+                                     const void* initial,
+                                     void* final,
+                                     void* out,
+                                     const void* cu,
+                                     int32_t n,
+                                     int32_t heads) {
+  return launch_kda_prefill(
+      queue, q, k, v, a, b, log, bias, initial, final, out, cu, n, heads, -1);
+}
+
+namespace {
+constexpr int32_t kStagedBlockFloats = 20608;
+// A slot stores W/P (64x128), U/R (64x128), end-scaled K (32x128),
+// and the final 128-channel decay. Actual tail rows are packed in each region.
+__mlu_global__ void kda_prepare_blocks(const bfloat16_t* q_g,
+                                       const bfloat16_t* k_g,
+                                       const bfloat16_t* v_g,
+                                       const bfloat16_t* a_g,
+                                       const bfloat16_t* b_g,
+                                       const float* log_g,
+                                       const float* bias_g,
+                                       const int32_t* cu_g,
+                                       float* workspace,
+                                       int32_t n,
+                                       int32_t heads,
+                                       int32_t slots) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float weights[64 * kDim], update_weights[128 * 32];
+  __nram__ float query[32 * kDim], key[32 * kDim], value[32 * kDim],
+      lam[32 * kDim];
+  __nram__ float km[32 * kDim], relative_gate[32 * kDim], combined[64 * kDim];
+  __nram__ float delta[32 * kDim], output[32 * kDim];
+  __nram__ float gram_combined[2048], inverse[1024], power[1024],
+      power_tmp[1024], off_diagonal[1024];
+  __nram__ float bias[kDim], beta[32], norm_q[32], norm_k[32];
+  __nram__ int32_t strict_mask[1024], inclusive_mask[1024];
+  __nram__ bfloat16_t raw_q[32 * kDim], raw_k[32 * kDim], raw_v[32 * kDim],
+      raw_a[32 * kDim], raw_b[32];
+  __nram__ int32_t cu_cache[129];
+  const int32_t* cu = cu_g;
+  if (n <= 128) {
+    __memcpy(cu_cache, cu_g, (n + 1) * sizeof(int32_t), GDRAM2NRAM);
+    cu = cu_cache;
+  }
+  __nram__ float prefix_tmp[32 * kDim];
+  int32_t mask_length = 0;
+  int32_t cached_head = -1;
+  float rate = 0.f;
+  for (int32_t job = taskId; job < slots * heads; job += taskDim) {
+    const int32_t slot = job / heads, head = job % heads;
+    int32_t lo = 0, hi = n;
+    while (lo < hi) {
+      const int32_t middle = (lo + hi + 1) / 2;
+      if (cu[middle] / 32 + middle <= slot) {
+        lo = middle;
+      } else {
+        hi = middle - 1;
+      }
+    }
+    const int32_t seq = lo;
+    if (seq >= n) {
+      continue;
+    }
+    const int32_t bos = cu[seq], eos = cu[seq + 1];
+    const int32_t begin = bos + (slot - (bos / 32 + seq)) * 32;
+    if (begin >= eos) {
+      continue;
+    }
+    const int32_t length = eos - begin < 32 ? eos - begin : 32;
+    float* kb = combined;
+    float* qs = combined + length * kDim;
+    float* gram_k = gram_combined;
+    float* gram_q = gram_combined + length * length;
+    const int64_t offset = (static_cast<int64_t>(begin) * heads + head) * kDim;
+    if (head != cached_head) {
+      __memcpy(bias, bias_g + head * kDim, sizeof(bias), GDRAM2NRAM);
+      rate = expf(log_g[head]);
+      cached_head = head;
+    }
+    __memcpy_async(raw_q,
+                   q_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_k,
+                   k_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_v,
+                   v_g + offset + 0,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_a,
+                   a_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_b,
+                   b_g + begin * heads + head,
+                   2,
+                   GDRAM2NRAM,
+                   2,
+                   heads * 2,
+                   length - 1);
+    __sync_io();
+    __bang_bfloat162float(query, raw_q, length * kDim);
+    __bang_bfloat162float(key, raw_k, length * kDim);
+    __bang_bfloat162float(value, raw_v, length * kDim);
+    __bang_bfloat162float(lam, raw_a, length * kDim);
+    __bang_bfloat162float(beta, raw_b, length);
+    __bang_mul_scalar(beta, beta, -1.4426950408889634f, length);
+    __bang_pow2(beta, beta, length);
+    __bang_add_scalar(beta, beta, 1.f, length);
+    __bang_recip(beta, beta, length);
+    // FAM adds the cyclic per-key bias, then multiplies by -rate * log2(e).
+    // dst[i] = (src[i] + bias[i % head_dim]) * (-rate * log2(e)).
+    __bang_fusion(FUSION_FAM,
+                  lam,
+                  lam,
+                  bias,
+                  -rate * 1.4426950408889634f,
+                  length * kDim,
+                  kDim);
+    __bang_pow2(lam, lam, length * kDim);
+    __bang_add_scalar(lam, lam, 1.f, length * kDim);
+    __bang_recip(lam, lam, length * kDim);
+    __bang_mul_scalar(lam, lam, -5.f * 1.4426950408889634f, length * kDim);
+    __bang_mul(relative_gate, query, query, length * kDim);
+    __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+    __bang_transpose(combined + length * 32, combined, length, 32);
+    __bang_sumpool(norm_q, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_q, norm_q, 1.e-6f, length);
+    __bang_rsqrt(norm_q, norm_q, length);
+    __bang_mul_scalar(norm_q, norm_q, .08838834764831845f, length);
+    __bang_mul(relative_gate, key, key, length * kDim);
+    __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+    __bang_transpose(combined + length * 32, combined, length, 32);
+    __bang_sumpool(norm_k, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_k, norm_k, 1.e-6f, length);
+    __bang_rsqrt(norm_k, norm_k, length);
+    __bang_transpose(relative_gate, query, length, kDim);
+    __bang_cycle_mul(
+        relative_gate, relative_gate, norm_q, kDim * length, length);
+    __bang_transpose(query, relative_gate, kDim, length);
+    __bang_transpose(relative_gate, key, length, kDim);
+    __bang_cycle_mul(
+        relative_gate, relative_gate, norm_k, kDim * length, length);
+    __bang_transpose(key, relative_gate, kDim, length);
+    float* prefix_src = lam;
+    float* prefix_dst = prefix_tmp;
+    for (int32_t distance = 1; distance < length; distance *= 2) {
+      __bang_move(prefix_dst, prefix_src, distance * kDim * sizeof(float));
+      __bang_add(prefix_dst + distance * kDim,
+                 prefix_src + distance * kDim,
+                 prefix_src,
+                 (length - distance) * kDim);
+      float* previous = prefix_src;
+      prefix_src = prefix_dst;
+      prefix_dst = previous;
+    }
+    if (prefix_src != lam) {
+      __bang_move(lam, prefix_src, length * kDim * sizeof(float));
+    }
+    __bang_cycle_sub(relative_gate,
+                     lam,
+                     lam + ((length - 1) / 2) * kDim,
+                     length * kDim,
+                     kDim);
+    __bang_pow2(relative_gate, relative_gate, length * kDim);
+    __bang_pow2(lam, lam, length * kDim);
+    __bang_mul(kb, key, relative_gate, length * kDim);
+    __bang_mul(qs, query, relative_gate, length * kDim);
+    __bang_recip(km, relative_gate, length * kDim);
+    __bang_mul(km, km, key, length * kDim);
+    __bang_load_matrix(
+        weights, km, NRAM2WRAM, length, kDim, kDim * sizeof(float), false);
+    __bang_conv(gram_combined,
+                combined,
+                weights,
+                kDim,
+                2 * length,
+                1,
+                1,
+                1,
+                1,
+                1,
+                length);
+    __bang_mul(kb, key, lam, length * kDim);
+    __bang_mul(qs, query, lam, length * kDim);
+    if (mask_length != length) {
+      for (int32_t t = 0; t < length; ++t) {
+        for (int32_t j = 0; j < length; ++j) {
+          strict_mask[t * length + j] = j < t ? -1 : 0;
+          inclusive_mask[t * length + j] = j <= t ? -1 : 0;
+        }
+      }
+      mask_length = length;
+    }
+    __bang_transpose(query, value, length, kDim);
+    __bang_cycle_mul(query, query, beta, length * kDim, length);
+    __bang_transpose(value, query, kDim, length);
+    __bang_transpose(key, kb, length, kDim);
+    __bang_cycle_mul(key, key, beta, length * kDim, length);
+    __bang_transpose(kb, key, kDim, length);
+    __bang_transpose(power_tmp, gram_k, length, length);
+    __bang_cycle_mul(power_tmp, power_tmp, beta, length * length, length);
+    __bang_transpose(power, power_tmp, length, length);
+    __bang_mul_scalar(power, power, -1.f, length * length);
+    __bang_band(reinterpret_cast<int32_t*>(power),
+                reinterpret_cast<int32_t*>(power),
+                strict_mask,
+                length * length);
+    kda_inverse::invert_unit_lower(
+        inverse, power, power_tmp, off_diagonal, weights, length);
+
+    // W = inverse * beta*K*lambda, U = inverse * beta*V.
+    __bang_load_matrix(update_weights,
+                       kb,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        query, inverse, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_load_matrix(update_weights,
+                       value,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        delta, inverse, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_band(reinterpret_cast<int32_t*>(gram_q),
+                reinterpret_cast<int32_t*>(gram_q),
+                inclusive_mask,
+                length * length);
+    __bang_load_matrix(update_weights,
+                       query,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        key, gram_q, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_sub(key, qs, key, length * kDim);
+    __bang_load_matrix(update_weights,
+                       delta,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        output, gram_q, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_cycle_mul(
+        km, km, relative_gate + (length - 1) * kDim, length * kDim, kDim);
+    float* dest = workspace + static_cast<int64_t>(job) * kStagedBlockFloats;
+    __memcpy(dest, query, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(
+        dest + length * kDim, key, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(dest + 8192, delta, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(dest + 8192 + length * kDim,
+             output,
+             length * kDim * sizeof(float),
+             NRAM2GDRAM);
+    __memcpy(dest + 16384, km, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(dest + 20480,
+             lam + (length - 1) * kDim,
+             kDim * sizeof(float),
+             NRAM2GDRAM);
+  }
+}
+
+__mlu_device__ void load_shared_prepared_block(float* combined,
+                                               float* ur,
+                                               float* km,
+                                               float* gate,
+                                               const float* source,
+                                               int32_t length) {
+  __memcpy(combined, source, 2 * length * kDim * sizeof(float), GDRAM2SRAM);
+  __memcpy(ur, source + 8192, 2 * length * kDim * sizeof(float), GDRAM2SRAM);
+  __memcpy(km, source + 16384, length * kDim * sizeof(float), GDRAM2SRAM);
+  __memcpy(gate, source + 20480, kDim * sizeof(float), GDRAM2SRAM);
+}
+
+template <int32_t ValueTile>
+__mlu_global__ void kda_scan_shared(const float* workspace,
+                                    const float* initial_g,
+                                    float* final_g,
+                                    bfloat16_t* out_g,
+                                    const int32_t* cu_g,
+                                    int32_t n,
+                                    int32_t heads,
+                                    int32_t total_tokens) {
+  __wram__ float weights[64 * kDim], update_weights[128 * 32];
+  __nram__ float state[ValueTile * kDim], combined[64 * kDim],
+      projection[ValueTile * 64];
+  __nram__ float projected[64 * ValueTile], ur[64 * ValueTile], km[32 * kDim],
+      endgate[kDim];
+  __nram__ float delta[32 * ValueTile], dt[32 * ValueTile],
+      output[32 * ValueTile];
+  __nram__ bfloat16_t out[32 * ValueTile];
+  static_assert(ValueTile == 32 || ValueTile == 64, "Supported value tiles");
+  constexpr int32_t kTiles = kDim / ValueTile;
+  constexpr int32_t kHeadsPerCluster = 4 / kTiles;
+  __mlu_shared__ float combined_buffers[2][kHeadsPerCluster][64 * kDim],
+      ur_buffers[2][kHeadsPerCluster][64 * kDim],
+      km_buffers[2][kHeadsPerCluster][32 * kDim],
+      gate_buffers[2][kHeadsPerCluster][kDim];
+  const bool memory_core = __is_mpu();
+  for (int32_t job = taskIdY * kHeadsPerCluster; job < n * heads;
+       job += taskDimY * kHeadsPerCluster) {
+    const int32_t head_in_cluster = memory_core ? 0 : coreId / kTiles;
+    const int32_t seq = job / heads, base_head = job % heads;
+    const int32_t head = base_head + head_in_cluster, vt = coreId % kTiles;
+    const int32_t bos = cu_g[seq], eos = cu_g[seq + 1];
+    const int64_t state_offset =
+        (static_cast<int64_t>(seq) * heads + head) * kDim * kDim +
+        vt * ValueTile * kDim;
+    if (!memory_core) {
+      __memcpy(state, initial_g + state_offset, sizeof(state), GDRAM2NRAM);
+    }
+    if (bos < eos) {
+      if (memory_core) {
+        const int32_t length = eos - bos < 32 ? eos - bos : 32;
+        for (int32_t local_head = 0; local_head < kHeadsPerCluster;
+             ++local_head) {
+          const float* source =
+              workspace + (static_cast<int64_t>(bos / 32 + seq) * heads +
+                           base_head + local_head) *
+                              kStagedBlockFloats;
+          load_shared_prepared_block(combined_buffers[0][local_head],
+                                     ur_buffers[0][local_head],
+                                     km_buffers[0][local_head],
+                                     gate_buffers[0][local_head],
+                                     source,
+                                     length);
+        }
+      }
+      __sync();
+      __sync_cluster();
+    }
+    int32_t buffer_index = 0;
+    for (int32_t begin = bos; begin < eos; begin += 32) {
+      const int32_t length = eos - begin < 32 ? eos - begin : 32;
+      float* shared_combined = combined_buffers[buffer_index][head_in_cluster];
+      float* shared_ur = ur_buffers[buffer_index][head_in_cluster];
+      float* shared_km = km_buffers[buffer_index][head_in_cluster];
+      float* shared_gate = gate_buffers[buffer_index][head_in_cluster];
+      if (memory_core && begin + 32 < eos) {
+        const int32_t next_length =
+            eos - begin - 32 < 32 ? eos - begin - 32 : 32;
+        const int32_t next_slot = bos / 32 + seq + (begin + 32 - bos) / 32;
+        for (int32_t local_head = 0; local_head < kHeadsPerCluster;
+             ++local_head) {
+          const float* next_source =
+              workspace + (static_cast<int64_t>(next_slot) * heads + base_head +
+                           local_head) *
+                              kStagedBlockFloats;
+          load_shared_prepared_block(
+              combined_buffers[buffer_index ^ 1][local_head],
+              ur_buffers[buffer_index ^ 1][local_head],
+              km_buffers[buffer_index ^ 1][local_head],
+              gate_buffers[buffer_index ^ 1][local_head],
+              next_source,
+              next_length);
+        }
+      }
+      if (!memory_core) {
+        __memcpy(ur,
+                 shared_ur + vt * ValueTile,
+                 ValueTile * sizeof(float),
+                 SRAM2NRAM,
+                 ValueTile * sizeof(float),
+                 kDim * sizeof(float),
+                 2 * length - 1);
+        __memcpy(endgate, shared_gate, kDim * sizeof(float), SRAM2NRAM);
+        __bang_load_matrix(weights,
+                           shared_combined,
+                           SRAM2WRAM,
+                           2 * length,
+                           kDim,
+                           kDim * sizeof(float),
+                           false);
+        __bang_conv(projection,
+                    state,
+                    weights,
+                    kDim,
+                    ValueTile,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    2 * length);
+        __bang_transpose(projected, projection, ValueTile, 2 * length);
+        __bang_sub(delta, ur, projected, length * ValueTile);
+        __bang_add(output,
+                   ur + length * ValueTile,
+                   projected + length * ValueTile,
+                   length * ValueTile);
+        __bang_float2bfloat16_rn(out, output, length * ValueTile);
+        const int64_t offset =
+            (static_cast<int64_t>(begin) * heads + head) * kDim +
+            vt * ValueTile;
+        __memcpy(out_g + offset,
+                 out,
+                 ValueTile * 2,
+                 NRAM2GDRAM,
+                 heads * kDim * 2,
+                 ValueTile * 2,
+                 length - 1);
+        __bang_transpose(dt, delta, length, ValueTile);
+        __bang_cycle_mul(state, state, endgate, ValueTile * kDim, kDim);
+        __bang_load_matrix(update_weights,
+                           shared_km,
+                           SRAM2WRAM,
+                           length,
+                           kDim,
+                           kDim * sizeof(float),
+                           true);
+        __bang_conv_partial(state,
+                            dt,
+                            update_weights,
+                            state,
+                            length,
+                            ValueTile,
+                            1,
+                            1,
+                            1,
+                            1,
+                            1,
+                            kDim);
+      }
+      __sync();
+      __sync_cluster();
+      buffer_index ^= 1;
+    }
+    if (!memory_core) {
+      __memcpy(final_g + state_offset, state, sizeof(state), NRAM2GDRAM);
+    }
+  }
+  zero_prefill_suffix(out_g, cu_g, n, heads, total_tokens, out);
+}
+
+template <int32_t ValueTile>
+__mlu_global__ void kda_scan_prepared(const float* workspace,
+                                      const float* initial_g,
+                                      float* final_g,
+                                      bfloat16_t* out_g,
+                                      const int32_t* cu_g,
+                                      int32_t n,
+                                      int32_t heads,
+                                      int32_t total_tokens) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float weights[64 * kDim], update_weights[128 * 32];
+  __nram__ float state[ValueTile * kDim], combined[64 * kDim],
+      projection[ValueTile * 64];
+  __nram__ float projected[64 * ValueTile], ur[64 * ValueTile], km[32 * kDim],
+      endgate[kDim];
+  __nram__ float delta[32 * ValueTile], dt[32 * ValueTile],
+      output[32 * ValueTile];
+  __nram__ bfloat16_t out[32 * ValueTile];
+  constexpr int32_t kTiles = kDim / ValueTile;
+  for (int32_t job = taskId; job < n * heads * kTiles; job += taskDim) {
+    const int32_t seq = job / (heads * kTiles), head = job / kTiles % heads,
+                  vt = job % kTiles;
+    const int32_t bos = cu_g[seq], eos = cu_g[seq + 1];
+    const int64_t state_offset =
+        (static_cast<int64_t>(seq) * heads + head) * kDim * kDim +
+        vt * ValueTile * kDim;
+    __memcpy(state, initial_g + state_offset, sizeof(state), GDRAM2NRAM);
+    for (int32_t begin = bos; begin < eos; begin += 32) {
+      const int32_t length = eos - begin < 32 ? eos - begin : 32;
+      const int32_t slot = bos / 32 + seq + (begin - bos) / 32;
+      const float* source =
+          workspace +
+          (static_cast<int64_t>(slot) * heads + head) * kStagedBlockFloats;
+      __memcpy(combined, source, 2 * length * kDim * sizeof(float), GDRAM2NRAM);
+      __memcpy(ur,
+               source + 8192 + vt * ValueTile,
+               ValueTile * sizeof(float),
+               GDRAM2NRAM,
+               ValueTile * sizeof(float),
+               kDim * sizeof(float),
+               2 * length - 1);
+      __memcpy(km, source + 16384, length * kDim * sizeof(float), GDRAM2NRAM);
+      __memcpy(endgate, source + 20480, kDim * sizeof(float), GDRAM2NRAM);
+      __bang_load_matrix(weights,
+                         combined,
+                         NRAM2WRAM,
+                         2 * length,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __bang_conv(projection,
+                  state,
+                  weights,
+                  kDim,
+                  ValueTile,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  2 * length);
+      __bang_transpose(projected, projection, ValueTile, 2 * length);
+      __bang_sub(delta, ur, projected, length * ValueTile);
+      __bang_add(output,
+                 ur + length * ValueTile,
+                 projected + length * ValueTile,
+                 length * ValueTile);
+      __bang_float2bfloat16_rn(out, output, length * ValueTile);
+      const int64_t offset =
+          (static_cast<int64_t>(begin) * heads + head) * kDim + vt * ValueTile;
+      __memcpy(out_g + offset,
+               out,
+               ValueTile * 2,
+               NRAM2GDRAM,
+               heads * kDim * 2,
+               ValueTile * 2,
+               length - 1);
+      __bang_transpose(dt, delta, length, ValueTile);
+      __bang_cycle_mul(state, state, endgate, ValueTile * kDim, kDim);
+      __bang_load_matrix(update_weights,
+                         km,
+                         NRAM2WRAM,
+                         length,
+                         kDim,
+                         kDim * sizeof(float),
+                         true);
+      __bang_conv_partial(state,
+                          dt,
+                          update_weights,
+                          state,
+                          length,
+                          ValueTile,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kDim);
+    }
+    __memcpy(final_g + state_offset, state, sizeof(state), NRAM2GDRAM);
+  }
+  zero_prefill_suffix(out_g, cu_g, n, heads, total_tokens, out);
+}
+struct AdaptiveScratch {
+  float* state;
+  float* query;
+  float* key;
+  float* value;
+  float* lam;
+  float* km;
+  float* relative_gate;
+  float* combined;
+  float* projection;
+  float* combined_projection;
+  float* delta;
+  float* dt;
+  float* output;
+  float* gram_k;
+  float* gram_q;
+  float* inverse;
+  float* power;
+  float* power_tmp;
+  float* off_diagonal;
+  float* work;
+  float* bias;
+  float* beta;
+  float* norm_q;
+  float* norm_k;
+  int32_t* strict_mask;
+  int32_t* inclusive_mask;
+  float* prefix_tmp;
+  bfloat16_t* raw_q;
+  bfloat16_t* raw_k;
+  bfloat16_t* raw_v;
+  bfloat16_t* raw_a;
+  bfloat16_t* raw_b;
+  bfloat16_t* out;
+};
+
+__mlu_device__ void adaptive_direct(const bfloat16_t* q_g,
+                                    const bfloat16_t* k_g,
+                                    const bfloat16_t* v_g,
+                                    const bfloat16_t* a_g,
+                                    const bfloat16_t* b_g,
+                                    const float* log_g,
+                                    const float* bias_g,
+                                    const float* initial_g,
+                                    float* final_g,
+                                    bfloat16_t* out_g,
+                                    const int32_t* cu_g,
+                                    int32_t n,
+                                    int32_t heads,
+                                    int32_t total_tokens,
+                                    const AdaptiveScratch& scratch,
+                                    float* weights,
+                                    float* update_weights) {
+  float* state = scratch.state;
+  float* query = scratch.query;
+  float* key = scratch.key;
+  float* value = scratch.value;
+  float* lam = scratch.lam;
+  float* km = scratch.km;
+  float* relative_gate = scratch.relative_gate;
+  float* combined = scratch.combined;
+  float* projection = scratch.projection;
+  float* combined_projection = scratch.combined_projection;
+  float* delta = scratch.delta;
+  float* dt = scratch.dt;
+  float* output = scratch.output;
+  float* gram_k = scratch.gram_k;
+  float* gram_q = scratch.gram_q;
+  float* inverse = scratch.inverse;
+  float* power = scratch.power;
+  float* power_tmp = scratch.power_tmp;
+  float* off_diagonal = scratch.off_diagonal;
+  float* work = scratch.work;
+  float* bias = scratch.bias;
+  float* beta = scratch.beta;
+  float* norm_q = scratch.norm_q;
+  float* norm_k = scratch.norm_k;
+  int32_t* strict_mask = scratch.strict_mask;
+  int32_t* inclusive_mask = scratch.inclusive_mask;
+  float* prefix_tmp = scratch.prefix_tmp;
+  int32_t mask_length = 0;
+  bfloat16_t* raw_q = scratch.raw_q;
+  bfloat16_t* raw_k = scratch.raw_k;
+  bfloat16_t* raw_v = scratch.raw_v;
+  bfloat16_t* raw_a = scratch.raw_a;
+  bfloat16_t* raw_b = scratch.raw_b;
+  bfloat16_t* out = scratch.out;
+  constexpr int32_t kTiles = kDim / 128;
+  for (int32_t job = taskId; job < n * heads * kTiles; job += taskDim) {
+    const int32_t seq = job / (heads * kTiles), head = job / kTiles % heads,
+                  vt = job % kTiles;
+    const int32_t bos = cu_g[seq], eos = cu_g[seq + 1];
+    const int64_t state_offset =
+        (static_cast<int64_t>(seq) * heads + head) * kDim * kDim +
+        vt * 128 * kDim;
+    __memcpy(state, initial_g + state_offset, 65536, GDRAM2NRAM);
+    __memcpy(bias, bias_g + head * kDim, 512, GDRAM2NRAM);
+    const float rate = expf(log_g[head]);
+    for (int32_t begin = bos; begin < eos; begin += 32) {
+      const int32_t length = eos - begin < 32 ? eos - begin : 32;
+      float* kb = combined;
+      float* qs = combined + length * kDim;
+      float* pk = combined_projection;
+      float* pq = combined_projection + length * 128;
+      const int64_t offset =
+          (static_cast<int64_t>(begin) * heads + head) * kDim;
+      __memcpy(raw_q,
+               q_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_k,
+               k_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_v,
+               v_g + offset + vt * 128,
+               128 * 2,
+               GDRAM2NRAM,
+               128 * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_a,
+               a_g + offset,
+               kDim * 2,
+               GDRAM2NRAM,
+               kDim * 2,
+               heads * kDim * 2,
+               length - 1);
+      __memcpy(raw_b,
+               b_g + begin * heads + head,
+               2,
+               GDRAM2NRAM,
+               2,
+               heads * 2,
+               length - 1);
+      __bang_bfloat162float(query, raw_q, length * kDim);
+      __bang_bfloat162float(key, raw_k, length * kDim);
+      __bang_bfloat162float(value, raw_v, length * 128);
+      __bang_bfloat162float(lam, raw_a, length * kDim);
+      __bang_bfloat162float(beta, raw_b, length);
+      __bang_mul_scalar(beta, beta, -1.4426950408889634f, length);
+      __bang_pow2(beta, beta, length);
+      __bang_add_scalar(beta, beta, 1.f, length);
+      __bang_recip(beta, beta, length);
+      // FAM adds the cyclic per-key bias, then multiplies by -rate * log2(e).
+      // dst[i] = (src[i] + bias[i % head_dim]) * (-rate * log2(e)).
+      __bang_fusion(FUSION_FAM,
+                    lam,
+                    lam,
+                    bias,
+                    -rate * 1.4426950408889634f,
+                    length * kDim,
+                    kDim);
+      __bang_pow2(lam, lam, length * kDim);
+      __bang_add_scalar(lam, lam, 1.f, length * kDim);
+      __bang_recip(lam, lam, length * kDim);
+      __bang_mul_scalar(lam, lam, -5.f * 1.4426950408889634f, length * kDim);
+      __bang_mul(relative_gate, query, query, length * kDim);
+      __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+      __bang_transpose(combined + length * 32, combined, length, 32);
+      __bang_sumpool(
+          norm_q, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+      __bang_add_scalar(norm_q, norm_q, 1.e-6f, length);
+      __bang_rsqrt(norm_q, norm_q, length);
+      __bang_mul_scalar(norm_q, norm_q, .08838834764831845f, length);
+      __bang_mul(relative_gate, key, key, length * kDim);
+      __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+      __bang_transpose(combined + length * 32, combined, length, 32);
+      __bang_sumpool(
+          norm_k, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+      __bang_add_scalar(norm_k, norm_k, 1.e-6f, length);
+      __bang_rsqrt(norm_k, norm_k, length);
+      __bang_transpose(relative_gate, query, length, kDim);
+      __bang_cycle_mul(
+          relative_gate, relative_gate, norm_q, kDim * length, length);
+      __bang_transpose(query, relative_gate, kDim, length);
+      __bang_transpose(relative_gate, key, length, kDim);
+      __bang_cycle_mul(
+          relative_gate, relative_gate, norm_k, kDim * length, length);
+      __bang_transpose(key, relative_gate, kDim, length);
+      float* prefix_src = lam;
+      float* prefix_dst = prefix_tmp;
+      for (int32_t distance = 1; distance < length; distance *= 2) {
+        __bang_move(prefix_dst, prefix_src, distance * kDim * sizeof(float));
+        __bang_add(prefix_dst + distance * kDim,
+                   prefix_src + distance * kDim,
+                   prefix_src,
+                   (length - distance) * kDim);
+        float* previous = prefix_src;
+        prefix_src = prefix_dst;
+        prefix_dst = previous;
+      }
+      if (prefix_src != lam) {
+        __bang_move(lam, prefix_src, length * kDim * sizeof(float));
+      }
+      __bang_cycle_sub(relative_gate,
+                       lam,
+                       lam + ((length - 1) / 2) * kDim,
+                       length * kDim,
+                       kDim);
+      __bang_pow2(relative_gate, relative_gate, length * kDim);
+      __bang_pow2(lam, lam, length * kDim);
+      __bang_mul(kb, key, relative_gate, length * kDim);
+      __bang_mul(qs, query, relative_gate, length * kDim);
+      __bang_recip(km, relative_gate, length * kDim);
+      __bang_mul(km, km, key, length * kDim);
+      __bang_load_matrix(
+          weights, km, NRAM2WRAM, length, kDim, kDim * sizeof(float), false);
+      __bang_conv(gram_k, kb, weights, kDim, length, 1, 1, 1, 1, 1, length);
+      __bang_conv(gram_q, qs, weights, kDim, length, 1, 1, 1, 1, 1, length);
+      __bang_mul(kb, key, lam, length * kDim);
+      __bang_mul(qs, query, lam, length * kDim);
+      __bang_load_matrix(weights,
+                         combined,
+                         NRAM2WRAM,
+                         2 * length,
+                         kDim,
+                         kDim * sizeof(float),
+                         false);
+      __bang_conv(
+          projection, state, weights, kDim, 128, 1, 1, 1, 1, 1, 2 * length);
+      __bang_transpose(combined_projection, projection, 128, 2 * length);
+      if (mask_length != length) {
+        __bang_write_value(
+            strict_mask, length * length, static_cast<int32_t>(0));
+        __bang_write_value(
+            inclusive_mask, length * length, static_cast<int32_t>(0));
+        for (int32_t t = 0; t < length; ++t) {
+          if (t > 0) {
+            __bang_write_value(
+                strict_mask + t * length, t, static_cast<int32_t>(-1));
+          }
+          __bang_write_value(
+              inclusive_mask + t * length, t + 1, static_cast<int32_t>(-1));
+        }
+        mask_length = length;
+      }
+      for (int32_t t = 0; t < length; ++t) {
+        __bang_fusion(FUSION_FSM,
+                      value + t * 128,
+                      value + t * 128,
+                      pk + t * 128,
+                      beta[t],
+                      128,
+                      128);
+        __bang_mul_scalar(
+            power + t * length, gram_k + t * length, -beta[t], length);
+      }
+      __bang_band(reinterpret_cast<int32_t*>(power),
+                  reinterpret_cast<int32_t*>(power),
+                  strict_mask,
+                  length * length);
+      kda_inverse::invert_unit_lower(
+          inverse, power, power_tmp, off_diagonal, weights, length);
+      __bang_load_matrix(update_weights,
+                         value,
+                         NRAM2WRAM,
+                         length,
+                         128,
+                         128 * sizeof(float),
+                         true);
+      __bang_conv(
+          delta, inverse, update_weights, length, length, 1, 1, 1, 1, 1, 128);
+      __bang_band(reinterpret_cast<int32_t*>(gram_q),
+                  reinterpret_cast<int32_t*>(gram_q),
+                  inclusive_mask,
+                  length * length);
+      __bang_load_matrix(update_weights,
+                         delta,
+                         NRAM2WRAM,
+                         length,
+                         128,
+                         128 * sizeof(float),
+                         true);
+      __bang_conv_partial(output,
+                          gram_q,
+                          update_weights,
+                          pq,
+                          length,
+                          length,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          128);
+      __bang_float2bfloat16_rn(out, output, length * 128);
+      __memcpy(out_g + offset + vt * 128,
+               out,
+               128 * 2,
+               NRAM2GDRAM,
+               heads * kDim * 2,
+               128 * 2,
+               length - 1);
+      __bang_transpose(dt, delta, length, 128);
+      __bang_cycle_mul(
+          km, km, relative_gate + (length - 1) * kDim, length * kDim, kDim);
+      __bang_cycle_mul(
+          state, state, lam + (length - 1) * kDim, 128 * kDim, kDim);
+      __bang_load_matrix(update_weights,
+                         km,
+                         NRAM2WRAM,
+                         length,
+                         kDim,
+                         kDim * sizeof(float),
+                         true);
+      __bang_conv_partial(
+          state, dt, update_weights, state, length, 128, 1, 1, 1, 1, 1, kDim);
+    }
+    __memcpy(final_g + state_offset, state, 65536, NRAM2GDRAM);
+  }
+  zero_prefill_suffix(out_g, cu_g, n, heads, total_tokens, out);
+}
+
+__mlu_device__ void adaptive_prepare(const bfloat16_t* q_g,
+                                     const bfloat16_t* k_g,
+                                     const bfloat16_t* v_g,
+                                     const bfloat16_t* a_g,
+                                     const bfloat16_t* b_g,
+                                     const float* log_g,
+                                     const float* bias_g,
+                                     const int32_t* cu_g,
+                                     float* workspace,
+                                     int32_t n,
+                                     int32_t heads,
+                                     int32_t slots,
+                                     const AdaptiveScratch& scratch,
+                                     float* weights,
+                                     float* update_weights) {
+  float* query = scratch.query;
+  float* key = scratch.key;
+  float* value = scratch.value;
+  float* lam = scratch.lam;
+  float* km = scratch.km;
+  float* relative_gate = scratch.relative_gate;
+  float* combined = scratch.combined;
+  float* delta = scratch.delta;
+  float* output = scratch.output;
+  float* gram_combined = scratch.projection;
+  float* inverse = scratch.inverse;
+  float* power = scratch.power;
+  float* power_tmp = scratch.power_tmp;
+  float* off_diagonal = scratch.off_diagonal;
+  float* bias = scratch.bias;
+  float* beta = scratch.beta;
+  float* norm_q = scratch.norm_q;
+  float* norm_k = scratch.norm_k;
+  int32_t* strict_mask = scratch.strict_mask;
+  int32_t* inclusive_mask = scratch.inclusive_mask;
+  bfloat16_t* raw_q = scratch.raw_q;
+  bfloat16_t* raw_k = scratch.raw_k;
+  bfloat16_t* raw_v = scratch.raw_v;
+  bfloat16_t* raw_a = scratch.raw_a;
+  bfloat16_t* raw_b = scratch.raw_b;
+  int32_t* cu_cache = reinterpret_cast<int32_t*>(scratch.state);
+  const int32_t* cu = cu_g;
+  if (n <= 128) {
+    __memcpy(cu_cache, cu_g, (n + 1) * sizeof(int32_t), GDRAM2NRAM);
+    cu = cu_cache;
+  }
+  float* prefix_tmp = scratch.prefix_tmp;
+  int32_t mask_length = 0;
+  int32_t cached_head = -1;
+  float rate = 0.f;
+  for (int32_t job = taskId; job < slots * heads; job += taskDim) {
+    const int32_t slot = job / heads, head = job % heads;
+    int32_t lo = 0, hi = n;
+    while (lo < hi) {
+      const int32_t middle = (lo + hi + 1) / 2;
+      if (cu[middle] / 32 + middle <= slot) {
+        lo = middle;
+      } else {
+        hi = middle - 1;
+      }
+    }
+    const int32_t seq = lo;
+    if (seq >= n) {
+      continue;
+    }
+    const int32_t bos = cu[seq], eos = cu[seq + 1];
+    const int32_t begin = bos + (slot - (bos / 32 + seq)) * 32;
+    if (begin >= eos) {
+      continue;
+    }
+    const int32_t length = eos - begin < 32 ? eos - begin : 32;
+    float* kb = combined;
+    float* qs = combined + length * kDim;
+    float* gram_k = gram_combined;
+    float* gram_q = gram_combined + length * length;
+    const int64_t offset = (static_cast<int64_t>(begin) * heads + head) * kDim;
+    if (head != cached_head) {
+      __memcpy(bias, bias_g + head * kDim, 512, GDRAM2NRAM);
+      rate = expf(log_g[head]);
+      cached_head = head;
+    }
+    __memcpy_async(raw_q,
+                   q_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_k,
+                   k_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_v,
+                   v_g + offset + 0,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_a,
+                   a_g + offset,
+                   kDim * 2,
+                   GDRAM2NRAM,
+                   kDim * 2,
+                   heads * kDim * 2,
+                   length - 1);
+    __memcpy_async(raw_b,
+                   b_g + begin * heads + head,
+                   2,
+                   GDRAM2NRAM,
+                   2,
+                   heads * 2,
+                   length - 1);
+    __sync_io();
+    __bang_bfloat162float(query, raw_q, length * kDim);
+    __bang_bfloat162float(key, raw_k, length * kDim);
+    __bang_bfloat162float(value, raw_v, length * kDim);
+    __bang_bfloat162float(lam, raw_a, length * kDim);
+    __bang_bfloat162float(beta, raw_b, length);
+    __bang_mul_scalar(beta, beta, -1.4426950408889634f, length);
+    __bang_pow2(beta, beta, length);
+    __bang_add_scalar(beta, beta, 1.f, length);
+    __bang_recip(beta, beta, length);
+    // FAM adds the cyclic per-key bias, then multiplies by -rate * log2(e).
+    // dst[i] = (src[i] + bias[i % head_dim]) * (-rate * log2(e)).
+    __bang_fusion(FUSION_FAM,
+                  lam,
+                  lam,
+                  bias,
+                  -rate * 1.4426950408889634f,
+                  length * kDim,
+                  kDim);
+    __bang_pow2(lam, lam, length * kDim);
+    __bang_add_scalar(lam, lam, 1.f, length * kDim);
+    __bang_recip(lam, lam, length * kDim);
+    __bang_mul_scalar(lam, lam, -5.f * 1.4426950408889634f, length * kDim);
+    __bang_mul(relative_gate, query, query, length * kDim);
+    __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+    __bang_transpose(combined + length * 32, combined, length, 32);
+    __bang_sumpool(norm_q, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_q, norm_q, 1.e-6f, length);
+    __bang_rsqrt(norm_q, norm_q, length);
+    __bang_mul_scalar(norm_q, norm_q, .08838834764831845f, length);
+    __bang_mul(relative_gate, key, key, length * kDim);
+    __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+    __bang_transpose(combined + length * 32, combined, length, 32);
+    __bang_sumpool(norm_k, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+    __bang_add_scalar(norm_k, norm_k, 1.e-6f, length);
+    __bang_rsqrt(norm_k, norm_k, length);
+    __bang_transpose(relative_gate, query, length, kDim);
+    __bang_cycle_mul(
+        relative_gate, relative_gate, norm_q, kDim * length, length);
+    __bang_transpose(query, relative_gate, kDim, length);
+    __bang_transpose(relative_gate, key, length, kDim);
+    __bang_cycle_mul(
+        relative_gate, relative_gate, norm_k, kDim * length, length);
+    __bang_transpose(key, relative_gate, kDim, length);
+    float* prefix_src = lam;
+    float* prefix_dst = prefix_tmp;
+    for (int32_t distance = 1; distance < length; distance *= 2) {
+      __bang_move(prefix_dst, prefix_src, distance * kDim * sizeof(float));
+      __bang_add(prefix_dst + distance * kDim,
+                 prefix_src + distance * kDim,
+                 prefix_src,
+                 (length - distance) * kDim);
+      float* previous = prefix_src;
+      prefix_src = prefix_dst;
+      prefix_dst = previous;
+    }
+    if (prefix_src != lam) {
+      __bang_move(lam, prefix_src, length * kDim * sizeof(float));
+    }
+    __bang_cycle_sub(relative_gate,
+                     lam,
+                     lam + ((length - 1) / 2) * kDim,
+                     length * kDim,
+                     kDim);
+    __bang_pow2(relative_gate, relative_gate, length * kDim);
+    __bang_pow2(lam, lam, length * kDim);
+    __bang_mul(kb, key, relative_gate, length * kDim);
+    __bang_mul(qs, query, relative_gate, length * kDim);
+    __bang_recip(km, relative_gate, length * kDim);
+    __bang_mul(km, km, key, length * kDim);
+    __bang_load_matrix(
+        weights, km, NRAM2WRAM, length, kDim, kDim * sizeof(float), false);
+    __bang_conv(gram_combined,
+                combined,
+                weights,
+                kDim,
+                2 * length,
+                1,
+                1,
+                1,
+                1,
+                1,
+                length);
+    __bang_mul(kb, key, lam, length * kDim);
+    __bang_mul(qs, query, lam, length * kDim);
+    if (mask_length != length) {
+      for (int32_t t = 0; t < length; ++t) {
+        for (int32_t j = 0; j < length; ++j) {
+          strict_mask[t * length + j] = j < t ? -1 : 0;
+          inclusive_mask[t * length + j] = j <= t ? -1 : 0;
+        }
+      }
+      mask_length = length;
+    }
+    __bang_transpose(query, value, length, kDim);
+    __bang_cycle_mul(query, query, beta, length * kDim, length);
+    __bang_transpose(value, query, kDim, length);
+    __bang_transpose(key, kb, length, kDim);
+    __bang_cycle_mul(key, key, beta, length * kDim, length);
+    __bang_transpose(kb, key, kDim, length);
+    __bang_transpose(power_tmp, gram_k, length, length);
+    __bang_cycle_mul(power_tmp, power_tmp, beta, length * length, length);
+    __bang_transpose(power, power_tmp, length, length);
+    __bang_mul_scalar(power, power, -1.f, length * length);
+    __bang_band(reinterpret_cast<int32_t*>(power),
+                reinterpret_cast<int32_t*>(power),
+                strict_mask,
+                length * length);
+    kda_inverse::invert_unit_lower(
+        inverse, power, power_tmp, off_diagonal, weights, length);
+
+    // W = inverse * beta*K*lambda, U = inverse * beta*V.
+    __bang_load_matrix(update_weights,
+                       kb,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        query, inverse, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_load_matrix(update_weights,
+                       value,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        delta, inverse, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_band(reinterpret_cast<int32_t*>(gram_q),
+                reinterpret_cast<int32_t*>(gram_q),
+                inclusive_mask,
+                length * length);
+    __bang_load_matrix(update_weights,
+                       query,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        key, gram_q, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_sub(key, qs, key, length * kDim);
+    __bang_load_matrix(update_weights,
+                       delta,
+                       NRAM2WRAM,
+                       length,
+                       kDim,
+                       kDim * sizeof(float),
+                       true);
+    __bang_conv(
+        output, gram_q, update_weights, length, length, 1, 1, 1, 1, 1, kDim);
+    __bang_cycle_mul(
+        km, km, relative_gate + (length - 1) * kDim, length * kDim, kDim);
+    float* dest = workspace + static_cast<int64_t>(job) * kStagedBlockFloats;
+    __memcpy(dest, query, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(
+        dest + length * kDim, key, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(dest + 8192, delta, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(dest + 8192 + length * kDim,
+             output,
+             length * kDim * sizeof(float),
+             NRAM2GDRAM);
+    __memcpy(dest + 16384, km, length * kDim * sizeof(float), NRAM2GDRAM);
+    __memcpy(dest + 20480,
+             lam + (length - 1) * kDim,
+             kDim * sizeof(float),
+             NRAM2GDRAM);
+  }
+}
+
+__mlu_device__ void adaptive_scan(const float* workspace,
+                                  const float* initial_g,
+                                  float* final_g,
+                                  bfloat16_t* out_g,
+                                  const int32_t* cu_g,
+                                  int32_t n,
+                                  int32_t heads,
+                                  int32_t total_tokens,
+                                  const AdaptiveScratch& scratch,
+                                  float* weights,
+                                  float* update_weights) {
+  float* state = scratch.state;
+  float* combined = scratch.combined;
+  float* projection = scratch.projection;
+  float* projected = scratch.combined_projection;
+  float* ur = scratch.value;
+  float* km = scratch.km;
+  float* endgate = scratch.lam;
+  float* delta = scratch.delta;
+  float* dt = scratch.dt;
+  float* output = scratch.output;
+  bfloat16_t* out = scratch.out;
+  static_assert(32 == 32 || 32 == 64, "Supported value tiles");
+  constexpr int32_t kTiles = kDim / 32;
+  constexpr int32_t kHeadsPerCluster = 4 / kTiles;
+  __mlu_shared__ float combined_buffers[2][kHeadsPerCluster][64 * kDim],
+      ur_buffers[2][kHeadsPerCluster][64 * kDim],
+      km_buffers[2][kHeadsPerCluster][32 * kDim],
+      gate_buffers[2][kHeadsPerCluster][kDim];
+  const bool memory_core = __is_mpu();
+  for (int32_t job = clusterId * kHeadsPerCluster; job < n * heads;
+       job += clusterDim * kHeadsPerCluster) {
+    const int32_t head_in_cluster = memory_core ? 0 : coreId / kTiles;
+    const int32_t seq = job / heads, base_head = job % heads;
+    const int32_t head = base_head + head_in_cluster, vt = coreId % kTiles;
+    const int32_t bos = cu_g[seq], eos = cu_g[seq + 1];
+    const int64_t state_offset =
+        (static_cast<int64_t>(seq) * heads + head) * kDim * kDim +
+        vt * 32 * kDim;
+    if (!memory_core) {
+      __memcpy(state, initial_g + state_offset, 16384, GDRAM2NRAM);
+    }
+    if (bos < eos) {
+      if (memory_core) {
+        const int32_t length = eos - bos < 32 ? eos - bos : 32;
+        for (int32_t local_head = 0; local_head < kHeadsPerCluster;
+             ++local_head) {
+          const float* source =
+              workspace + (static_cast<int64_t>(bos / 32 + seq) * heads +
+                           base_head + local_head) *
+                              kStagedBlockFloats;
+          load_shared_prepared_block(combined_buffers[0][local_head],
+                                     ur_buffers[0][local_head],
+                                     km_buffers[0][local_head],
+                                     gate_buffers[0][local_head],
+                                     source,
+                                     length);
+        }
+      }
+      __sync();
+      __sync_cluster();
+    }
+    int32_t buffer_index = 0;
+    for (int32_t begin = bos; begin < eos; begin += 32) {
+      const int32_t length = eos - begin < 32 ? eos - begin : 32;
+      float* shared_combined = combined_buffers[buffer_index][head_in_cluster];
+      float* shared_ur = ur_buffers[buffer_index][head_in_cluster];
+      float* shared_km = km_buffers[buffer_index][head_in_cluster];
+      float* shared_gate = gate_buffers[buffer_index][head_in_cluster];
+      if (memory_core && begin + 32 < eos) {
+        const int32_t next_length =
+            eos - begin - 32 < 32 ? eos - begin - 32 : 32;
+        const int32_t next_slot = bos / 32 + seq + (begin + 32 - bos) / 32;
+        for (int32_t local_head = 0; local_head < kHeadsPerCluster;
+             ++local_head) {
+          const float* next_source =
+              workspace + (static_cast<int64_t>(next_slot) * heads + base_head +
+                           local_head) *
+                              kStagedBlockFloats;
+          load_shared_prepared_block(
+              combined_buffers[buffer_index ^ 1][local_head],
+              ur_buffers[buffer_index ^ 1][local_head],
+              km_buffers[buffer_index ^ 1][local_head],
+              gate_buffers[buffer_index ^ 1][local_head],
+              next_source,
+              next_length);
+        }
+      }
+      if (!memory_core) {
+        __memcpy(ur,
+                 shared_ur + vt * 32,
+                 32 * sizeof(float),
+                 SRAM2NRAM,
+                 32 * sizeof(float),
+                 kDim * sizeof(float),
+                 2 * length - 1);
+        __memcpy(endgate, shared_gate, kDim * sizeof(float), SRAM2NRAM);
+        __bang_load_matrix(weights,
+                           shared_combined,
+                           SRAM2WRAM,
+                           2 * length,
+                           kDim,
+                           kDim * sizeof(float),
+                           false);
+        __bang_conv(
+            projection, state, weights, kDim, 32, 1, 1, 1, 1, 1, 2 * length);
+        __bang_transpose(projected, projection, 32, 2 * length);
+        __bang_sub(delta, ur, projected, length * 32);
+        __bang_add(
+            output, ur + length * 32, projected + length * 32, length * 32);
+        __bang_float2bfloat16_rn(out, output, length * 32);
+        const int64_t offset =
+            (static_cast<int64_t>(begin) * heads + head) * kDim + vt * 32;
+        __memcpy(out_g + offset,
+                 out,
+                 32 * 2,
+                 NRAM2GDRAM,
+                 heads * kDim * 2,
+                 32 * 2,
+                 length - 1);
+        __bang_transpose(dt, delta, length, 32);
+        __bang_cycle_mul(state, state, endgate, 32 * kDim, kDim);
+        __bang_load_matrix(update_weights,
+                           shared_km,
+                           SRAM2WRAM,
+                           length,
+                           kDim,
+                           kDim * sizeof(float),
+                           true);
+        __bang_conv_partial(
+            state, dt, update_weights, state, length, 32, 1, 1, 1, 1, 1, kDim);
+      }
+      __sync();
+      __sync_cluster();
+      buffer_index ^= 1;
+    }
+    if (!memory_core) {
+      __memcpy(final_g + state_offset, state, 16384, NRAM2GDRAM);
+    }
+  }
+  zero_prefill_suffix(out_g, cu_g, n, heads, total_tokens, out);
+}
+__mlu_global__ void kda_adaptive_union8(const bfloat16_t* q,
+                                        const bfloat16_t* k,
+                                        const bfloat16_t* v,
+                                        const bfloat16_t* a,
+                                        const bfloat16_t* b,
+                                        const float* logs,
+                                        const float* bias,
+                                        const float* initial,
+                                        float* final,
+                                        bfloat16_t* out,
+                                        const int32_t* cu,
+                                        float* workspace,
+                                        int32_t n,
+                                        int32_t heads,
+                                        int32_t total_tokens) {
+  __wram__ float weights[64 * kDim];
+  __wram__ float update_weights[128 * 32];
+  __nram__ float state[128 * kDim];
+  __nram__ float query[32 * kDim], key[32 * kDim], value[32 * 128],
+      lam[32 * kDim];
+  __nram__ float km[32 * kDim], relative_gate[32 * kDim], combined[64 * kDim];
+  __nram__ float projection[64 * 128], combined_projection[64 * 128];
+  __nram__ float delta[32 * 128], dt[32 * 128], output[32 * 128];
+  __nram__ float gram_k[1024], gram_q[1024], inverse[1024], power[1024],
+      power_tmp[1024], off_diagonal[1024], work[kDim], scratch_bias[kDim],
+      beta[32];
+  __nram__ float norm_q[32], norm_k[32];
+  __nram__ int32_t strict_mask[1024], inclusive_mask[1024];
+  __nram__ float prefix_tmp[32 * kDim];
+  __nram__ bfloat16_t raw_q[32 * kDim], raw_k[32 * kDim], raw_v[32 * 128],
+      raw_a[32 * kDim], raw_b[32], scratch_out[32 * 128];
+  AdaptiveScratch scratch;
+  scratch.state = state;
+  scratch.query = query;
+  scratch.key = key;
+  scratch.value = value;
+  scratch.lam = lam;
+  scratch.km = km;
+  scratch.relative_gate = relative_gate;
+  scratch.combined = combined;
+  scratch.projection = projection;
+  scratch.combined_projection = combined_projection;
+  scratch.delta = delta;
+  scratch.dt = dt;
+  scratch.output = output;
+  scratch.gram_k = gram_k;
+  scratch.gram_q = gram_q;
+  scratch.inverse = inverse;
+  scratch.power = power;
+  scratch.power_tmp = power_tmp;
+  scratch.off_diagonal = off_diagonal;
+  scratch.work = work;
+  scratch.bias = scratch_bias;
+  scratch.beta = beta;
+  scratch.norm_q = norm_q;
+  scratch.norm_k = norm_k;
+  scratch.strict_mask = strict_mask;
+  scratch.inclusive_mask = inclusive_mask;
+  scratch.prefix_tmp = prefix_tmp;
+  scratch.raw_q = raw_q;
+  scratch.raw_k = raw_k;
+  scratch.raw_v = raw_v;
+  scratch.raw_a = raw_a;
+  scratch.raw_b = raw_b;
+  scratch.out = scratch_out;
+
+  int32_t longest = 0;
+  int32_t total_chunks = 0;
+  int32_t chain_0 = 0, chain_1 = 0, chain_2 = 0, chain_3 = 0;
+  for (int32_t seq = 0; seq < n; ++seq) {
+    const int32_t length = cu[seq + 1] - cu[seq];
+    longest = longest < length ? length : longest;
+    const int32_t chunks =
+        static_cast<int32_t>((static_cast<int64_t>(length) + 31) / 32);
+    total_chunks += chunks;
+    if (seq % 4 == 0) {
+      chain_0 += chunks;
+    } else if (seq % 4 == 1) {
+      chain_1 += chunks;
+    } else if (seq % 4 == 2) {
+      chain_2 += chunks;
+    } else {
+      chain_3 += chunks;
+    }
+  }
+  const int32_t pair_0 = chain_0 > chain_1 ? chain_0 : chain_1;
+  const int32_t pair_1 = chain_2 > chain_3 ? chain_2 : chain_3;
+  const int32_t direct_chain = pair_0 > pair_1 ? pair_0 : pair_1;
+  // H8 gives four independent request chains on32 IPUs. Preparation uses
+  // complete32-head waves; the V32 scan retains the ordered chunk chain.
+  // Require a conservative two-phase budget below the actual direct chain.
+  const int32_t phase_waves = (total_chunks + 3) / 4;
+  const bool staged = longest >= 256 && direct_chain > 2 * phase_waves;
+  const bool memory_core = __is_mpu();
+  if (!staged) {
+    if (!memory_core) {
+      adaptive_direct(q,
+                      k,
+                      v,
+                      a,
+                      b,
+                      logs,
+                      bias,
+                      initial,
+                      final,
+                      out,
+                      cu,
+                      n,
+                      heads,
+                      total_tokens,
+                      scratch,
+                      weights,
+                      update_weights);
+    }
+    return;
+  }
+  const int32_t slots =
+      static_cast<int32_t>((static_cast<int64_t>(total_tokens) + 31) / 32 + n);
+  if (!memory_core) {
+    adaptive_prepare(q,
+                     k,
+                     v,
+                     a,
+                     b,
+                     logs,
+                     bias,
+                     cu,
+                     workspace,
+                     n,
+                     heads,
+                     slots,
+                     scratch,
+                     weights,
+                     update_weights);
+  }
+  __sync();
+  __sync_all();
+  adaptive_scan(workspace,
+                initial,
+                final,
+                out,
+                cu,
+                n,
+                heads,
+                total_tokens,
+                scratch,
+                weights,
+                update_weights);
+}
+
+}  // namespace
+
+extern "C" int32_t bangc_kda_prefill_staged_narrow(void* queue,
+                                                   const void* q,
+                                                   const void* k,
+                                                   const void* v,
+                                                   const void* a,
+                                                   const void* b,
+                                                   const void* log,
+                                                   const void* bias,
+                                                   const void* initial,
+                                                   void* final,
+                                                   void* out,
+                                                   const void* cu,
+                                                   void* workspace,
+                                                   int32_t n,
+                                                   int32_t heads,
+                                                   int32_t total_tokens) {
+  if (workspace != nullptr && n >= 3 && n <= 8 && heads == 8 &&
+      static_cast<int64_t>(total_tokens) >= static_cast<int64_t>(n) * 256) {
+    cnrtDim3_t dim = {32, 1, 1};
+    kda_adaptive_union8<<<dim,
+                          cnrtFuncTypeUnion8,
+                          static_cast<cnrtQueue_t>(queue)>>>(
+        static_cast<const bfloat16_t*>(q),
+        static_cast<const bfloat16_t*>(k),
+        static_cast<const bfloat16_t*>(v),
+        static_cast<const bfloat16_t*>(a),
+        static_cast<const bfloat16_t*>(b),
+        static_cast<const float*>(log),
+        static_cast<const float*>(bias),
+        static_cast<const float*>(initial),
+        static_cast<float*>(final),
+        static_cast<bfloat16_t*>(out),
+        static_cast<const int32_t*>(cu),
+        static_cast<float*>(workspace),
+        n,
+        heads,
+        total_tokens);
+    return static_cast<int32_t>(cnrtGetLastError());
+  }
+  // Eight blocks per sequence amortize the extra launch and block preparation.
+  // Head grids occupying most IPUs favor the direct recurrence instead.
+  const bool underfilled_long =
+      n > 0 && static_cast<int64_t>(n) * heads <= 16 &&
+      static_cast<int64_t>(total_tokens) >= static_cast<int64_t>(n) * 256;
+  if (workspace == nullptr || !underfilled_long) {
+    return launch_kda_prefill(queue,
+                              q,
+                              k,
+                              v,
+                              a,
+                              b,
+                              log,
+                              bias,
+                              initial,
+                              final,
+                              out,
+                              cu,
+                              n,
+                              heads,
+                              total_tokens);
+  }
+  cnrtDim3_t dim = {4, 8, 1};
+  const int32_t slots =
+      static_cast<int32_t>((static_cast<int64_t>(total_tokens) + 31) / 32 + n);
+  kda_prepare_blocks<<<dim,
+                       cnrtFuncTypeUnion1,
+                       static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const bfloat16_t*>(q),
+      static_cast<const bfloat16_t*>(k),
+      static_cast<const bfloat16_t*>(v),
+      static_cast<const bfloat16_t*>(a),
+      static_cast<const bfloat16_t*>(b),
+      static_cast<const float*>(log),
+      static_cast<const float*>(bias),
+      static_cast<const int32_t*>(cu),
+      static_cast<float*>(workspace),
+      n,
+      heads,
+      slots);
+  if (n * heads <= 8) {
+    kda_scan_shared<32>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const float*>(workspace),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  } else if (heads % 2 == 0) {
+    kda_scan_shared<64>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const float*>(workspace),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  } else {
+    kda_scan_prepared<64>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const float*>(workspace),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  }
+  return static_cast<int32_t>(cnrtGetLastError());
+}
+
+}  // namespace xllm::kernel::mlu
+
+// ---- bangc_kda_wide ----
+
+// Wide-address kernels retain their explicit launchers. The staged entry
+// selects the normal or wide-address path without changing either schedule.
+namespace xllm::kernel::mlu {
+namespace {
+constexpr int32_t kWideDim = 128;
+template <int32_t RecurrentValueTile>
+__mlu_global__ void kda_recurrent_wide(const bfloat16_t* q_g,
+                                       const bfloat16_t* k_g,
+                                       const bfloat16_t* v_g,
+                                       const bfloat16_t* a_g,
+                                       const bfloat16_t* b_g,
+                                       const float* log_g,
+                                       const float* bias_g,
+                                       const float* initial_g,
+                                       float* final_g,
+                                       bfloat16_t* out_g,
+                                       const int32_t* cu_g,
+                                       const int32_t* idx_g,
+                                       const int32_t* accepted_g,
+                                       int32_t n,
+                                       int32_t heads,
+                                       int32_t columns,
+                                       int32_t spec,
+                                       int32_t inplace) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float outer_weights[128 * 16];
+  __nram__ float gate_window[4 * kWideDim], beta_window[4];
+  __nram__ bfloat16_t raw_beta[4];
+  __nram__ bfloat16_t gate_raw[4 * kWideDim];
+  __nram__ float state[RecurrentValueTile * kWideDim];
+  __nram__ float tmp[RecurrentValueTile * kWideDim];
+  __nram__ float trans[RecurrentValueTile * kWideDim];
+  __nram__ float outer[RecurrentValueTile * kWideDim];
+  __nram__ float q[kWideDim], key[kWideDim], bias[kWideDim], value[kWideDim];
+  __nram__ float projection[kWideDim], delta[kWideDim], result[kWideDim],
+      work[kWideDim];
+  __nram__ bfloat16_t raw_storage[4 * 5 * kWideDim], out[kWideDim];
+  __nram__ int32_t cu_cache[129], index_cache[512], accepted_cache[128];
+  const bool cache_metadata = n <= 128 && columns <= 4 && inplace != 2;
+  if (cache_metadata) {
+    __memcpy(cu_cache, cu_g, (n + 1) * sizeof(int32_t), GDRAM2NRAM);
+    __memcpy(index_cache, idx_g, n * columns * sizeof(int32_t), GDRAM2NRAM);
+    if (spec) {
+      __memcpy(accepted_cache, accepted_g, n * sizeof(int32_t), GDRAM2NRAM);
+    }
+  }
+  int32_t cached_head = -1;
+  float rate = 0.f;
+  const int32_t tiles = kWideDim / RecurrentValueTile;
+  for (int32_t job = taskId; job < n * heads * tiles; job += taskDim) {
+    const int32_t seq = job / (heads * tiles), head = (job / tiles) % heads,
+                  vt = job % tiles;
+    const int32_t bos = cache_metadata ? cu_cache[seq] : cu_g[seq],
+                  eos = cache_metadata ? cu_cache[seq + 1] : cu_g[seq + 1];
+    const int32_t accepted_count =
+        spec ? (cache_metadata ? accepted_cache[seq] : accepted_g[seq]) : 1;
+    const int32_t accepted = accepted_count > 0 ? accepted_count - 1 : -1;
+    if (accepted < 0 || accepted >= columns || (bos == eos && inplace != 2)) {
+      continue;
+    }
+    const int32_t slot =
+        inplace == 2 ? seq
+                     : (cache_metadata ? index_cache[seq * columns + accepted]
+                                       : idx_g[seq * columns + accepted]);
+    if (inplace != 2 && slot <= 0) {
+      continue;
+    }
+    const int64_t state_offset =
+        static_cast<int64_t>(head) * kWideDim * kWideDim +
+        vt * RecurrentValueTile * kWideDim;
+    __memcpy(state,
+             initial_g +
+                 static_cast<int64_t>(slot) * heads * kWideDim * kWideDim +
+                 state_offset,
+             sizeof(state),
+             GDRAM2NRAM);
+    if (inplace == 2 && bos == eos) {
+      __memcpy(final_g +
+                   static_cast<int64_t>(seq) * heads * kWideDim * kWideDim +
+                   state_offset,
+               state,
+               sizeof(state),
+               NRAM2GDRAM);
+      continue;
+    }
+    if (head != cached_head) {
+      __memcpy(bias, bias_g + head * kWideDim, sizeof(bias), GDRAM2NRAM);
+      rate = expf(log_g[head]);
+      cached_head = head;
+    }
+    for (int64_t token = bos; token < eos; ++token) {
+      const int64_t offset =
+          (static_cast<int64_t>(token) * heads + head) * kWideDim;
+      const int32_t window_index = static_cast<int32_t>((token - bos) % 4);
+      bfloat16_t* raw = raw_storage + window_index * 5 * kWideDim;
+      if (window_index == 0) {
+        const int32_t window_size =
+            static_cast<int32_t>(eos - token < 4 ? eos - token : 4);
+        __memcpy(raw,
+                 q_g + offset,
+                 256,
+                 GDRAM2NRAM,
+                 5 * kWideDim * 2,
+                 heads * kWideDim * 2,
+                 window_size - 1);
+        __memcpy(raw + kWideDim,
+                 k_g + offset,
+                 256,
+                 GDRAM2NRAM,
+                 5 * kWideDim * 2,
+                 heads * kWideDim * 2,
+                 window_size - 1);
+        __memcpy(gate_raw,
+                 a_g + offset,
+                 256,
+                 GDRAM2NRAM,
+                 kWideDim * 2,
+                 heads * kWideDim * 2,
+                 window_size - 1);
+        __memcpy(raw + 3 * kWideDim,
+                 v_g + offset + vt * RecurrentValueTile,
+                 RecurrentValueTile * 2,
+                 GDRAM2NRAM,
+                 5 * kWideDim * 2,
+                 heads * kWideDim * 2,
+                 window_size - 1);
+        if (window_size == 1) {
+          beta_window[0] =
+              1.f /
+              (1.f + expf(-static_cast<float>(b_g[token * heads + head])));
+        } else {
+          __memcpy(raw_beta,
+                   b_g + token * heads + head,
+                   2,
+                   GDRAM2NRAM,
+                   2,
+                   heads * 2,
+                   window_size - 1);
+          __bang_bfloat162float(beta_window, raw_beta, window_size);
+          __bang_mul_scalar(
+              beta_window, beta_window, -1.4426950408889634f, window_size);
+          __bang_pow2(beta_window, beta_window, window_size);
+          __bang_add_scalar(beta_window, beta_window, 1.f, window_size);
+          __bang_recip(beta_window, beta_window, window_size);
+        }
+        const int32_t gate_count = window_size * kWideDim;
+        __bang_bfloat162float(gate_window, gate_raw, gate_count);
+        // FAM adds the cyclic per-key bias, then multiplies by -rate * log2(e).
+        // dst[i] = (src[i] + bias[i % head_dim]) * (-rate * log2(e)).
+        __bang_fusion(FUSION_FAM,
+                      gate_window,
+                      gate_window,
+                      bias,
+                      -rate * 1.4426950408889634f,
+                      gate_count,
+                      kWideDim);
+        __bang_pow2(gate_window, gate_window, gate_count);
+        __bang_add_scalar(gate_window, gate_window, 1.f, gate_count);
+        __bang_recip(gate_window, gate_window, gate_count);
+        __bang_mul_scalar(
+            gate_window, gate_window, -5.f * 1.4426950408889634f, gate_count);
+        __bang_pow2(gate_window, gate_window, gate_count);
+      }
+      __bang_bfloat162float(q, raw, kWideDim);
+      __bang_bfloat162float(key, raw + kWideDim, kWideDim);
+      const float* gate = gate_window + window_index * kWideDim;
+      __bang_bfloat162float(value, raw + 3 * kWideDim, RecurrentValueTile);
+      __bang_mul(work, q, q, kWideDim);
+      const float qs = (1.f / sqrtf(__bang_sum(work, kWideDim) + 1.e-6f)) *
+                       0.08838834764831845f;
+      __bang_mul_scalar(q, q, qs, kWideDim);
+      __bang_mul(work, key, key, kWideDim);
+      const float ks = (1.f / sqrtf(__bang_sum(work, kWideDim) + 1.e-6f));
+      __bang_mul_scalar(key, key, ks, kWideDim);
+      __sync_compute();
+      __bang_load_matrix_async(
+          outer_weights, key, NRAM2WRAM, kWideDim, 1, sizeof(float), false);
+      const float beta = beta_window[window_index];
+      __sync_io();
+      __bang_cycle_mul(
+          state, state, gate, RecurrentValueTile * kWideDim, kWideDim);
+      __bang_cycle_mul(
+          tmp, state, key, RecurrentValueTile * kWideDim, kWideDim);
+      __bang_sumpool(outer, tmp, 32, RecurrentValueTile, 4, 1, 4, 1, 1);
+      __bang_transpose(trans, outer, RecurrentValueTile, 32);
+      __bang_sumpool(projection, trans, RecurrentValueTile, 1, 32, 1, 32, 1, 1);
+      __bang_fusion(FUSION_FSM,
+                    delta,
+                    value,
+                    projection,
+                    beta,
+                    RecurrentValueTile,
+                    RecurrentValueTile);
+      __sync_move();
+      __bang_conv_partial(state,
+                          delta,
+                          outer_weights,
+                          state,
+                          1,
+                          RecurrentValueTile,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kWideDim);
+      __bang_cycle_mul(tmp, state, q, RecurrentValueTile * kWideDim, kWideDim);
+      __bang_sumpool(outer, tmp, 32, RecurrentValueTile, 4, 1, 4, 1, 1);
+      __bang_transpose(trans, outer, RecurrentValueTile, 32);
+      __bang_sumpool(result, trans, RecurrentValueTile, 1, 32, 1, 32, 1, 1);
+      __bang_float2bfloat16_rn(out, result, RecurrentValueTile);
+      __sync_compute();
+      __memcpy_async(out_g + offset + vt * RecurrentValueTile,
+                     out,
+                     RecurrentValueTile * 2,
+                     NRAM2GDRAM);
+      const int32_t dest =
+          inplace == 2
+              ? seq
+              : (inplace == 3
+                     ? (cache_metadata ? index_cache[seq] : idx_g[seq])
+                     : (inplace
+                            ? (cache_metadata
+                                   ? index_cache[seq * columns + token - bos]
+                                   : idx_g[seq * columns + token - bos])
+                            : static_cast<int32_t>(token)));
+      if ((inplace == 2 || inplace == 3) ? token + 1 == eos
+                                         : (!inplace || dest > 0)) {
+        __memcpy_async(
+            final_g + static_cast<int64_t>(dest) * heads * kWideDim * kWideDim +
+                state_offset,
+            state,
+            sizeof(state),
+            NRAM2GDRAM);
+      }
+    }
+    __sync_io();
+  }
+}
+
+__mlu_device__ void zero_prefill_suffix_wide(bfloat16_t* output,
+                                             const int32_t* cu,
+                                             int32_t n,
+                                             int32_t heads,
+                                             int32_t total_tokens,
+                                             bfloat16_t* zeros) {
+  if (__is_mpu() || total_tokens < 0) {
+    return;
+  }
+  const int32_t begin = cu[n];
+  if (begin >= total_tokens) {
+    return;
+  }
+  __bang_write_value(zeros, kWideDim, bfloat16_t(0.f));
+  const int64_t jobs = static_cast<int64_t>(total_tokens - begin) * heads;
+  const int64_t offset = static_cast<int64_t>(begin) * heads * kWideDim;
+  for (int64_t job = taskId; job < jobs; job += taskDim) {
+    __memcpy(output + offset + job * kWideDim,
+             zeros,
+             kWideDim * sizeof(bfloat16_t),
+             NRAM2GDRAM);
+  }
+}
+
+template <int32_t PrefillValueTile>
+__mlu_global__ void kda_chunk32_prefill_wide(const bfloat16_t* q_g,
+                                             const bfloat16_t* k_g,
+                                             const bfloat16_t* v_g,
+                                             const bfloat16_t* a_g,
+                                             const bfloat16_t* b_g,
+                                             const float* log_g,
+                                             const float* bias_g,
+                                             const float* initial_g,
+                                             float* final_g,
+                                             bfloat16_t* out_g,
+                                             const int32_t* cu_g,
+                                             int32_t n,
+                                             int32_t heads,
+                                             int32_t total_tokens) {
+  if (__is_mpu()) {
+    return;
+  }
+  __wram__ float weights[64 * kWideDim];
+  __wram__ float update_weights[128 * 32];
+  __nram__ float state[PrefillValueTile * kWideDim];
+  __nram__ float query[32 * kWideDim], key[32 * kWideDim],
+      value[32 * PrefillValueTile], lam[32 * kWideDim];
+  __nram__ float km[32 * kWideDim], relative_gate[32 * kWideDim],
+      combined[64 * kWideDim];
+  __nram__ float projection[64 * PrefillValueTile],
+      combined_projection[64 * PrefillValueTile];
+  __nram__ float delta[32 * PrefillValueTile], dt[32 * PrefillValueTile],
+      output[32 * PrefillValueTile];
+  __nram__ float gram_k[1024], gram_q[1024], inverse[1024], power[1024],
+      power_tmp[1024], off_diagonal[1024], work[kWideDim], bias[kWideDim],
+      beta[32];
+  __nram__ float norm_q[32], norm_k[32];
+  __nram__ int32_t strict_mask[1024], inclusive_mask[1024];
+  __nram__ float prefix_tmp[32 * kWideDim];
+  int32_t mask_length = 0;
+  __nram__ bfloat16_t raw_q[32 * kWideDim], raw_k[32 * kWideDim],
+      raw_v[32 * PrefillValueTile], raw_a[32 * kWideDim], raw_b[32],
+      out[32 * PrefillValueTile];
+  constexpr int32_t kTiles = kWideDim / PrefillValueTile;
+  for (int32_t job = taskId; job < n * heads * kTiles; job += taskDim) {
+    const int32_t seq = job / (heads * kTiles), head = job / kTiles % heads,
+                  vt = job % kTiles;
+    const int32_t bos = cu_g[seq], eos = cu_g[seq + 1];
+    const int64_t state_offset =
+        (static_cast<int64_t>(seq) * heads + head) * kWideDim * kWideDim +
+        vt * PrefillValueTile * kWideDim;
+    __memcpy(state, initial_g + state_offset, sizeof(state), GDRAM2NRAM);
+    __memcpy(bias, bias_g + head * kWideDim, sizeof(bias), GDRAM2NRAM);
+    const float rate = expf(log_g[head]);
+    for (int64_t begin = bos; begin < eos; begin += 32) {
+      const int32_t length =
+          static_cast<int32_t>(eos - begin < 32 ? eos - begin : 32);
+      float* kb = combined;
+      float* qs = combined + length * kWideDim;
+      float* pk = combined_projection;
+      float* pq = combined_projection + length * PrefillValueTile;
+      const int64_t offset =
+          (static_cast<int64_t>(begin) * heads + head) * kWideDim;
+      __memcpy(raw_q,
+               q_g + offset,
+               kWideDim * 2,
+               GDRAM2NRAM,
+               kWideDim * 2,
+               heads * kWideDim * 2,
+               length - 1);
+      __memcpy(raw_k,
+               k_g + offset,
+               kWideDim * 2,
+               GDRAM2NRAM,
+               kWideDim * 2,
+               heads * kWideDim * 2,
+               length - 1);
+      __memcpy(raw_v,
+               v_g + offset + vt * PrefillValueTile,
+               PrefillValueTile * 2,
+               GDRAM2NRAM,
+               PrefillValueTile * 2,
+               heads * kWideDim * 2,
+               length - 1);
+      __memcpy(raw_a,
+               a_g + offset,
+               kWideDim * 2,
+               GDRAM2NRAM,
+               kWideDim * 2,
+               heads * kWideDim * 2,
+               length - 1);
+      __memcpy(raw_b,
+               b_g + begin * heads + head,
+               2,
+               GDRAM2NRAM,
+               2,
+               heads * 2,
+               length - 1);
+      __bang_bfloat162float(query, raw_q, length * kWideDim);
+      __bang_bfloat162float(key, raw_k, length * kWideDim);
+      __bang_bfloat162float(value, raw_v, length * PrefillValueTile);
+      __bang_bfloat162float(lam, raw_a, length * kWideDim);
+      __bang_bfloat162float(beta, raw_b, length);
+      __bang_mul_scalar(beta, beta, -1.4426950408889634f, length);
+      __bang_pow2(beta, beta, length);
+      __bang_add_scalar(beta, beta, 1.f, length);
+      __bang_recip(beta, beta, length);
+      // FAM adds the cyclic per-key bias, then multiplies by -rate * log2(e).
+      // dst[i] = (src[i] + bias[i % head_dim]) * (-rate * log2(e)).
+      __bang_fusion(FUSION_FAM,
+                    lam,
+                    lam,
+                    bias,
+                    -rate * 1.4426950408889634f,
+                    length * kWideDim,
+                    kWideDim);
+      __bang_pow2(lam, lam, length * kWideDim);
+      __bang_add_scalar(lam, lam, 1.f, length * kWideDim);
+      __bang_recip(lam, lam, length * kWideDim);
+      __bang_mul_scalar(
+          lam, lam, -5.f * 1.4426950408889634f, length * kWideDim);
+      __bang_mul(relative_gate, query, query, length * kWideDim);
+      __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+      __bang_transpose(combined + length * 32, combined, length, 32);
+      __bang_sumpool(
+          norm_q, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+      __bang_add_scalar(norm_q, norm_q, 1.e-6f, length);
+      __bang_rsqrt(norm_q, norm_q, length);
+      __bang_mul_scalar(norm_q, norm_q, .08838834764831845f, length);
+      __bang_mul(relative_gate, key, key, length * kWideDim);
+      __bang_sumpool(combined, relative_gate, 32, length, 4, 1, 4, 1, 1);
+      __bang_transpose(combined + length * 32, combined, length, 32);
+      __bang_sumpool(
+          norm_k, combined + length * 32, length, 1, 32, 1, 32, 1, 1);
+      __bang_add_scalar(norm_k, norm_k, 1.e-6f, length);
+      __bang_rsqrt(norm_k, norm_k, length);
+      __bang_transpose(relative_gate, query, length, kWideDim);
+      __bang_cycle_mul(
+          relative_gate, relative_gate, norm_q, kWideDim * length, length);
+      __bang_transpose(query, relative_gate, kWideDim, length);
+      __bang_transpose(relative_gate, key, length, kWideDim);
+      __bang_cycle_mul(
+          relative_gate, relative_gate, norm_k, kWideDim * length, length);
+      __bang_transpose(key, relative_gate, kWideDim, length);
+      float* prefix_src = lam;
+      float* prefix_dst = prefix_tmp;
+      for (int32_t distance = 1; distance < length; distance *= 2) {
+        __bang_move(
+            prefix_dst, prefix_src, distance * kWideDim * sizeof(float));
+        __bang_add(prefix_dst + distance * kWideDim,
+                   prefix_src + distance * kWideDim,
+                   prefix_src,
+                   (length - distance) * kWideDim);
+        float* previous = prefix_src;
+        prefix_src = prefix_dst;
+        prefix_dst = previous;
+      }
+      if (prefix_src != lam) {
+        __bang_move(lam, prefix_src, length * kWideDim * sizeof(float));
+      }
+      __bang_cycle_sub(relative_gate,
+                       lam,
+                       lam + ((length - 1) / 2) * kWideDim,
+                       length * kWideDim,
+                       kWideDim);
+      __bang_pow2(relative_gate, relative_gate, length * kWideDim);
+      __bang_pow2(lam, lam, length * kWideDim);
+      __bang_mul(kb, key, relative_gate, length * kWideDim);
+      __bang_mul(qs, query, relative_gate, length * kWideDim);
+      __bang_recip(km, relative_gate, length * kWideDim);
+      __bang_mul(km, km, key, length * kWideDim);
+      __bang_load_matrix(weights,
+                         km,
+                         NRAM2WRAM,
+                         length,
+                         kWideDim,
+                         kWideDim * sizeof(float),
+                         false);
+      __bang_conv(gram_k, kb, weights, kWideDim, length, 1, 1, 1, 1, 1, length);
+      __bang_conv(gram_q, qs, weights, kWideDim, length, 1, 1, 1, 1, 1, length);
+      __bang_mul(kb, key, lam, length * kWideDim);
+      __bang_mul(qs, query, lam, length * kWideDim);
+      __bang_load_matrix(weights,
+                         combined,
+                         NRAM2WRAM,
+                         2 * length,
+                         kWideDim,
+                         kWideDim * sizeof(float),
+                         false);
+      __bang_conv(projection,
+                  state,
+                  weights,
+                  kWideDim,
+                  PrefillValueTile,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  2 * length);
+      __bang_transpose(
+          combined_projection, projection, PrefillValueTile, 2 * length);
+      if (mask_length != length) {
+        for (int32_t t = 0; t < length; ++t) {
+          for (int32_t j = 0; j < length; ++j) {
+            strict_mask[t * length + j] = j < t ? -1 : 0;
+            inclusive_mask[t * length + j] = j <= t ? -1 : 0;
+          }
+        }
+        mask_length = length;
+      }
+      for (int32_t t = 0; t < length; ++t) {
+        __bang_fusion(FUSION_FSM,
+                      value + t * PrefillValueTile,
+                      value + t * PrefillValueTile,
+                      pk + t * PrefillValueTile,
+                      beta[t],
+                      PrefillValueTile,
+                      PrefillValueTile);
+        __bang_mul_scalar(
+            power + t * length, gram_k + t * length, -beta[t], length);
+      }
+      __bang_band(reinterpret_cast<int32_t*>(power),
+                  reinterpret_cast<int32_t*>(power),
+                  strict_mask,
+                  length * length);
+      kda_inverse::invert_unit_lower(
+          inverse, power, power_tmp, off_diagonal, weights, length);
+      __bang_load_matrix(update_weights,
+                         value,
+                         NRAM2WRAM,
+                         length,
+                         PrefillValueTile,
+                         PrefillValueTile * sizeof(float),
+                         true);
+      __bang_conv(delta,
+                  inverse,
+                  update_weights,
+                  length,
+                  length,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  PrefillValueTile);
+      __bang_band(reinterpret_cast<int32_t*>(gram_q),
+                  reinterpret_cast<int32_t*>(gram_q),
+                  inclusive_mask,
+                  length * length);
+      __bang_load_matrix(update_weights,
+                         delta,
+                         NRAM2WRAM,
+                         length,
+                         PrefillValueTile,
+                         PrefillValueTile * sizeof(float),
+                         true);
+      __bang_conv_partial(output,
+                          gram_q,
+                          update_weights,
+                          pq,
+                          length,
+                          length,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          PrefillValueTile);
+      __bang_float2bfloat16_rn(out, output, length * PrefillValueTile);
+      __memcpy(out_g + offset + vt * PrefillValueTile,
+               out,
+               PrefillValueTile * 2,
+               NRAM2GDRAM,
+               heads * kWideDim * 2,
+               PrefillValueTile * 2,
+               length - 1);
+      __bang_transpose(dt, delta, length, PrefillValueTile);
+      __bang_cycle_mul(km,
+                       km,
+                       relative_gate + (length - 1) * kWideDim,
+                       length * kWideDim,
+                       kWideDim);
+      __bang_cycle_mul(state,
+                       state,
+                       lam + (length - 1) * kWideDim,
+                       PrefillValueTile * kWideDim,
+                       kWideDim);
+      __bang_load_matrix(update_weights,
+                         km,
+                         NRAM2WRAM,
+                         length,
+                         kWideDim,
+                         kWideDim * sizeof(float),
+                         true);
+      __bang_conv_partial(state,
+                          dt,
+                          update_weights,
+                          state,
+                          length,
+                          PrefillValueTile,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kWideDim);
+    }
+    __memcpy(final_g + state_offset, state, sizeof(state), NRAM2GDRAM);
+  }
+  zero_prefill_suffix_wide(out_g, cu_g, n, heads, total_tokens, out);
+}
+
+}  // namespace
+
+extern "C" int32_t bangc_kda_prefill_staged_narrow(void* queue,
+                                                   const void* q,
+                                                   const void* k,
+                                                   const void* v,
+                                                   const void* a,
+                                                   const void* b,
+                                                   const void* log,
+                                                   const void* bias,
+                                                   const void* initial,
+                                                   void* final,
+                                                   void* out,
+                                                   const void* cu,
+                                                   void* workspace,
+                                                   int32_t n,
+                                                   int32_t heads,
+                                                   int32_t total_tokens);
+
+// Forced-wide internal entry: legal metadata/shape/allocator bounds are the
+// same as the normal ABI. Small-tensor verification calls this explicitly;
+// this is not a runtime benchmark or public small-input dispatch override.
+extern "C" int32_t bangc_kda_recurrent_wide(void* queue,
+                                            const void* q,
+                                            const void* k,
+                                            const void* v,
+                                            const void* a,
+                                            const void* b,
+                                            const void* log,
+                                            const void* bias,
+                                            const void* initial,
+                                            void* final,
+                                            void* out,
+                                            const void* cu,
+                                            const void* idx,
+                                            const void* accepted,
+                                            int32_t n,
+                                            int32_t heads,
+                                            int32_t columns,
+                                            int32_t spec,
+                                            int32_t inplace) {
+  if (spec && inplace == 1 &&
+      ((columns == 4 && n <= 128) || (columns == 3 && heads == 8 && n >= 32))) {
+    // The frozen chunk4 and tiled128 kernels already use int64 global time.
+    return bangc_kda_recurrent(queue,
+                               q,
+                               k,
+                               v,
+                               a,
+                               b,
+                               log,
+                               bias,
+                               initial,
+                               final,
+                               out,
+                               cu,
+                               idx,
+                               accepted,
+                               n,
+                               heads,
+                               columns,
+                               spec,
+                               inplace);
+  }
+  cnrtDim3_t dim = {4, 8, 1};
+  if (static_cast<int64_t>(n) * heads <= 8) {
+    kda_recurrent_wide<32>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            static_cast<const int32_t*>(idx),
+            static_cast<const int32_t*>(accepted),
+            n,
+            heads,
+            columns,
+            spec,
+            inplace);
+  } else if (static_cast<int64_t>(n) * heads <= 16) {
+    kda_recurrent_wide<64>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            static_cast<const int32_t*>(idx),
+            static_cast<const int32_t*>(accepted),
+            n,
+            heads,
+            columns,
+            spec,
+            inplace);
+  } else {
+    kda_recurrent_wide<128>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            static_cast<const int32_t*>(idx),
+            static_cast<const int32_t*>(accepted),
+            n,
+            heads,
+            columns,
+            spec,
+            inplace);
+  }
+  return static_cast<int32_t>(cnrtGetLastError());
+}
+
+extern "C" int32_t bangc_kda_prefill_wide(void* queue,
+                                          const void* q,
+                                          const void* k,
+                                          const void* v,
+                                          const void* a,
+                                          const void* b,
+                                          const void* log,
+                                          const void* bias,
+                                          const void* initial,
+                                          void* final,
+                                          void* out,
+                                          const void* cu,
+                                          void* /*workspace*/,
+                                          int32_t n,
+                                          int32_t heads,
+                                          int32_t total_tokens) {
+  cnrtDim3_t dim = {4, 8, 1};
+  if (static_cast<int64_t>(n) * heads <= 8) {
+    kda_chunk32_prefill_wide<32>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  } else if (static_cast<int64_t>(n) * heads <= 16) {
+    kda_chunk32_prefill_wide<64>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  } else {
+    kda_chunk32_prefill_wide<128>
+        <<<dim, cnrtFuncTypeUnion1, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const bfloat16_t*>(q),
+            static_cast<const bfloat16_t*>(k),
+            static_cast<const bfloat16_t*>(v),
+            static_cast<const bfloat16_t*>(a),
+            static_cast<const bfloat16_t*>(b),
+            static_cast<const float*>(log),
+            static_cast<const float*>(bias),
+            static_cast<const float*>(initial),
+            static_cast<float*>(final),
+            static_cast<bfloat16_t*>(out),
+            static_cast<const int32_t*>(cu),
+            n,
+            heads,
+            total_tokens);
+  }
+  return static_cast<int32_t>(cnrtGetLastError());
+}
+
+// Same raw staged ABI: wide physical-T inputs never reach narrow preparation
+// or scan. The caller retains its original shape and valid-pointer contract.
+extern "C" int32_t bangc_kda_prefill_staged(void* queue,
+                                            const void* q,
+                                            const void* k,
+                                            const void* v,
+                                            const void* a,
+                                            const void* b,
+                                            const void* log,
+                                            const void* bias,
+                                            const void* initial,
+                                            void* final,
+                                            void* out,
+                                            const void* cu,
+                                            void* workspace,
+                                            int32_t n,
+                                            int32_t heads,
+                                            int32_t total_tokens) {
+  if (heads > 0 && total_tokens >= 0 && total_tokens <= INT32_MAX / heads) {
+    return bangc_kda_prefill_staged_narrow(queue,
+                                           q,
+                                           k,
+                                           v,
+                                           a,
+                                           b,
+                                           log,
+                                           bias,
+                                           initial,
+                                           final,
+                                           out,
+                                           cu,
+                                           workspace,
+                                           n,
+                                           heads,
+                                           total_tokens);
+  }
+  return bangc_kda_prefill_wide(queue,
+                                q,
+                                k,
+                                v,
+                                a,
+                                b,
+                                log,
+                                bias,
+                                initial,
+                                final,
+                                out,
+                                cu,
+                                workspace,
+                                n,
+                                heads,
+                                total_tokens);
+}
+}  // namespace xllm::kernel::mlu

@@ -30,18 +30,13 @@ limitations under the License.
 #include "common/constants.h"
 #include "core/framework/model/graph_eager_context.h"
 #include "framework/config/kv_cache_config.h"
-#include "framework/core/MLUStream.h"
+#include "kernels/mlu/bangc/include/kpool_bangc.h"
 #include "kernels/mlu/kpool.h"
-#include "triton_jit/include/jit_kernel.h"
 #include "util/linalg.h"
 
 namespace xllm::layer {
 namespace {
 
-constexpr char kKPoolKernelPath[] =
-    "xllm.core.kernels.mlu.triton_kernel.glm5_next_kpool";
-constexpr char kKPoolExpandKernelPath[] =
-    "xllm.core.kernels.mlu.triton_kernel.glm5_next_kpool_expand";
 constexpr int64_t kWorkspaceBytes = 64 * 1024 * 1024;
 
 int32_t max_sequence_length(const std::vector<int32_t>& lengths) {
@@ -104,31 +99,17 @@ torch::Tensor make_row_batch(const std::vector<int32_t>& q_seq_lens,
       .to(device);
 }
 
-int64_t next_power_of_two(int64_t value) {
-  int64_t result = 1;
-  while (result < value) {
-    result <<= 1;
-  }
-  return result;
-}
-
 torch::Tensor make_kpool_rows(const torch::Tensor& starts, int64_t tokens) {
-  torch::Tensor rows = torch::empty({tokens}, starts.options());
+  CHECK_EQ(starts.dim(), 1);
+  CHECK(starts.scalar_type() == torch::kInt32 ||
+        starts.scalar_type() == torch::kInt64);
+  const torch::Tensor offsets = starts.to(torch::kInt64).contiguous();
+  torch::Tensor rows = torch::empty({tokens}, offsets.options());
   if (tokens == 0) {
     return rows;
   }
-  const int64_t requests = starts.numel() - 1;
-  CHECK_GT(requests, 0);
-  triton_jit::JITKernel::get(kKPoolKernelPath, "kpool_rows")
-      .launch(static_cast<void*>(torch_mlu::getCurMLUStream()),
-              {static_cast<uint32_t>((tokens + 63) / 64), 1, 1},
-              {/*num_warps=*/1, /*num_stages=*/1},
-              starts,
-              rows,
-              tokens,
-              /*N=*/static_cast<int32_t>(requests),
-              /*BN=*/static_cast<int32_t>(next_power_of_two(requests)),
-              /*BT=*/64);
+  CHECK(kernel::mlu::bangc_kpool_rows(offsets, rows))
+      << "Unsupported MLU KPool request offsets";
   return rows;
 }
 
@@ -214,144 +195,21 @@ void update_prefill(const torch::Tensor& key,
                     int64_t block_size,
                     int64_t pool_size,
                     const torch::Tensor& read_tail_indices) {
-  if (key.size(0) == 0) {
-    return;
-  }
-  const torch::Tensor raw = key.contiguous();
-  const torch::Tensor gates = gate.contiguous();
-  const torch::Tensor a = ape.to(raw.device(), torch::kFloat32).contiguous();
-  const torch::Tensor matrix = hadamard.contiguous();
-  const torch::Tensor ids = tail_ids.contiguous();
-  const torch::Tensor read_ids =
-      read_tail_indices.defined() ? read_tail_indices.contiguous() : ids;
-  CHECK_EQ(read_ids.numel(), ids.numel());
-  const torch::Tensor table = block_table.contiguous();
-  const torch::Tensor pos = positions.contiguous();
-  const torch::Tensor rows = row_batch.contiguous();
-  const torch::Tensor offsets = starts.contiguous();
-  CHECK_EQ(tail.dim(), 4);
-  CHECK_EQ(tail.size(1), 2);
-  CHECK_GE(tail.size(2), pool_size);
-  CHECK_EQ(tail.size(3), key.size(1));
-  CHECK_EQ(starts.numel(), tail_ids.numel() + 1);
-  CHECK(tail.is_contiguous());
-  const int64_t tail_length = tail.size(2);
-  const int64_t dimension = raw.size(1);
-  void* queue = static_cast<void*>(torch_mlu::getCurMLUStream());
-  triton_jit::JITKernel::get(kKPoolKernelPath, "kpool_prefill_complete")
-      .launch(queue,
-              {static_cast<uint32_t>(raw.size(0)), 1, 1},
-              {/*num_warps=*/1, /*num_stages=*/1},
-              raw,
-              gates,
-              a,
-              matrix,
-              cache,
-              tail,
-              read_ids,
-              table,
-              pos,
-              rows,
-              offsets,
-              raw.stride(0),
-              gates.stride(0),
-              table.stride(0),
-              /*P=*/static_cast<int32_t>(pool_size),
-              /*T=*/static_cast<int32_t>(tail_length),
-              /*D=*/static_cast<int32_t>(dimension),
-              /*BLOCK_P=*/static_cast<int32_t>(next_power_of_two(pool_size)),
-              /*BLOCK_D=*/static_cast<int32_t>(next_power_of_two(dimension)),
-              /*POOL_BLOCK=*/static_cast<int32_t>(block_size / pool_size));
-  // Complete all old-tail reads before overwriting the request rings.
-  if (read_tail_indices.defined()) {
-    kernel::mlu::stash_kpool_from_source(
-        raw, gates, tail, ids, read_ids, pos, offsets);
-    return;
-  }
-  triton_jit::JITKernel::get(kKPoolKernelPath, "kpool_prefill_stash")
-      .launch(queue,
-              {static_cast<uint32_t>(ids.numel()), 1, 1},
-              {/*num_warps=*/1, /*num_stages=*/1},
-              raw,
-              gates,
-              tail,
-              ids,
-              pos,
-              offsets,
-              raw.stride(0),
-              gates.stride(0),
-              /*T=*/static_cast<int32_t>(tail_length),
-              /*D=*/static_cast<int32_t>(dimension),
-              /*BLOCK_P=*/static_cast<int32_t>(next_power_of_two(tail_length)),
-              /*BLOCK_D=*/static_cast<int32_t>(next_power_of_two(dimension)));
-}
-
-kernel::mlu::KPoolSelection expand_prefill(const torch::Tensor& pool_ids,
-                                           const torch::Tensor& positions,
-                                           const torch::Tensor& row_batch,
-                                           const torch::Tensor& block_table,
-                                           int64_t block_size,
-                                           int64_t token_budget,
-                                           int64_t pool_size,
-                                           bool always_select_tail) {
-  CHECK_LE(pool_ids.size(1), token_budget / pool_size);
-  const int64_t queries = pool_ids.size(0);
-  const int64_t selected_pools = pool_ids.size(1);
-  const int64_t width = token_budget + pool_size - 1;
-  const auto options = pool_ids.options().dtype(torch::kInt32);
-  kernel::mlu::KPoolSelection result{torch::empty({queries, width}, options),
-                                     torch::empty({queries}, options)};
-  if (queries == 0) {
-    return result;
-  }
-  int64_t pool_tile =
-      pool_size > 16
-          ? 16
-          : std::min<int64_t>(
-                selected_pools >= 1024 ? 1024 : 512,
-                next_power_of_two(std::max<int64_t>(selected_pools, 1)));
-  if (block_size % pool_size != 0) {
-    pool_tile = std::min<int64_t>(pool_tile, 256);
-  }
-  const int64_t member_tile = std::min<int64_t>(pool_size > 16 ? 128 : 16,
-                                                next_power_of_two(pool_size));
-  const int64_t table_tile =
-      block_table.size(1) <= 2048
-          ? next_power_of_two(std::max<int64_t>(block_table.size(1), 1))
-          : 0;
-  const bool local_i32 =
-      block_size % pool_size == 0 &&
-      block_table.size(1) <= std::numeric_limits<int32_t>::max() / block_size;
-  const int32_t tail_tile = local_i32 ? 1024 : 256;
-  triton_jit::JITKernel::get(kKPoolExpandKernelPath, "kpool_prefill_expand")
-      .launch(static_cast<void*>(torch_mlu::getCurMLUStream()),
-              {static_cast<uint32_t>(std::min<int64_t>(queries, 65535)), 1, 1},
-              {/*num_warps=*/1, /*num_stages=*/local_i32 ? 3 : 1},
-              pool_ids,
-              positions,
-              row_batch,
-              block_table,
-              result.physical_slots,
-              result.context_lens,
-              pool_ids.stride(0),
-              pool_ids.stride(1),
-              positions.stride(0),
-              row_batch.stride(0),
-              block_table.stride(0),
-              block_table.stride(1),
-              block_table.size(1),
-              queries,
-              /*K=*/selected_pools,
-              /*P=*/pool_size,
-              /*B=*/block_size,
-              /*W=*/width,
-              /*BP=*/static_cast<int32_t>(pool_tile),
-              /*BM=*/static_cast<int32_t>(member_tile),
-              /*BT=*/static_cast<int32_t>(table_tile),
-              /*TAIL=*/always_select_tail ? 1 : 0,
-              /*BTAIL=*/tail_tile,
-              /*LOCAL_I32=*/local_i32 ? 1 : 0);
-  return result;
+  kernel::mlu::update_kpool(key,
+                            gate,
+                            ape,
+                            hadamard,
+                            cache,
+                            tail,
+                            tail_ids,
+                            block_table,
+                            positions,
+                            row_batch,
+                            starts,
+                            block_size,
+                            pool_size,
+                            /*decode=*/false,
+                            read_tail_indices);
 }
 
 }  // namespace
@@ -381,20 +239,41 @@ torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
   CHECK_LE((max_kv_seq_len + block_size - 1) / block_size, block_table.size(1));
   const int64_t count = index_topk / index_kpool;
   const int64_t pools = (max_kv_seq_len + index_kpool - 1) / index_kpool;
-  torch::Tensor result = torch::full(
-      {query.size(0), count}, -1, query.options().dtype(torch::kInt64));
   if (pools == 0 || query.size(0) == 0 || count == 0) {
-    return result;
+    return torch::full(
+        {query.size(0), count}, -1, query.options().dtype(torch::kInt64));
   }
   CHECK_GE(workspace_bytes, pools * static_cast<int64_t>(sizeof(float)));
   const int64_t chunk = std::min<int64_t>(
       query.size(0), workspace_bytes / (pools * sizeof(float)));
   torch::Tensor workspace =
       torch::empty({chunk, pools}, query.options().dtype(torch::kFloat32));
+  // Scores are finite at most on each row's live prefix: every shape searches
+  // only that prefix.
+  const auto select = [&](const torch::Tensor& scores,
+                          const torch::Tensor& score_positions) {
+    return kernel::mlu::select_kpool_live(
+        scores, count, score_positions, index_kpool);
+  };
+  if (chunk == query.size(0)) {
+    // select_kpool fully writes its result; no fill and copy are needed.
+    kernel::mlu::score_kpool(query,
+                             head_weights,
+                             index_cache,
+                             block_table,
+                             positions,
+                             row_batch,
+                             workspace,
+                             block_size,
+                             index_kpool,
+                             softmax_scale,
+                             query_starts);
+    return select(workspace, positions);
+  }
+  torch::Tensor result = torch::empty({query.size(0), count},
+                                      query.options().dtype(torch::kInt64));
   // Request offsets address the complete query tensor. Smaller workspaces use
   // the existing independent-query path instead of slicing request metadata.
-  const torch::Tensor verify_starts =
-      chunk == query.size(0) ? query_starts : torch::Tensor();
   for (int64_t start = 0; start < query.size(0); start += chunk) {
     const int64_t rows = std::min(chunk, query.size(0) - start);
     torch::Tensor scores = workspace.narrow(0, 0, rows);
@@ -408,9 +287,9 @@ torch::Tensor glm5_next_kpool_select(const torch::Tensor& query,
                              block_size,
                              index_kpool,
                              softmax_scale,
-                             verify_starts);
+                             torch::Tensor());
     result.narrow(0, start, rows)
-        .copy_(kernel::mlu::select_kpool(scores, count));
+        .copy_(select(scores, positions.narrow(0, start, rows)));
   }
   return result;
 }
@@ -441,19 +320,11 @@ Glm5NextKPoolIndexerImpl::Glm5NextKPoolIndexerImpl(
       rotary_emb_(rotary_emb) {
   CHECK(options.device().is_privateuseone()) << "KPool requires MLU.";
   CHECK(options.dtype() == torch::kBFloat16) << "KPool requires BF16.";
-  CHECK_GE(head_dim_, 16) << "Paged KPool scoring requires D >= 16.";
-  CHECK_LE(head_dim_, 128);
-  CHECK_EQ(head_dim_ & (head_dim_ - 1), 0);
-  CHECK_GT(index_kpool_, 0);
-  CHECK_GE(index_topk_, 0);
-  CHECK_LE(index_topk_,
-           static_cast<int64_t>(std::numeric_limits<int32_t>::max()) -
-               index_kpool_ + 1)
-      << "KPool context lengths must fit int32.";
-  CHECK_EQ(index_topk_ % index_kpool_, 0);
-  CHECK_GT(n_heads_, 0);
-  CHECK_GT(block_size_, 0);
-  CHECK_EQ(block_size_ % index_kpool_, 0);
+  CHECK_EQ(n_heads_, 32) << "MLU KPool requires index_n_heads=32";
+  CHECK_EQ(head_dim_, 128) << "MLU KPool requires index_head_dim=128";
+  CHECK_EQ(index_kpool_, 4) << "MLU KPool requires index_kpool=4";
+  CHECK_EQ(index_topk_, 2048) << "MLU KPool requires index_topk=2048";
+  CHECK_EQ(block_size_, 16) << "MLU KPool requires block_size=16";
   CHECK_EQ(parallel_args.kv_split_size_effective(), 1)
       << "KPool does not support DCP cache sharding.";
 
@@ -562,6 +433,26 @@ Glm5NextKPoolIndexerImpl::Execution Glm5NextKPoolIndexerImpl::prepare_execution(
                  ? metadata.max_seq_len
                  : execution.batch->block_table.size(1) * block_size_)
           : execution.batch->max_kv_len;
+  // Reject unsupported work before update_cache mutates persistent state.
+  constexpr int64_t kMaxInt32 = std::numeric_limits<int32_t>::max();
+  CHECK_LE(positions.numel(), kMaxInt32 / output_width());
+  CHECK_EQ(positions.dim(), 1);
+  CHECK(positions.scalar_type() == torch::kInt32 ||
+        positions.scalar_type() == torch::kInt64);
+  const torch::Tensor& table = execution.batch->block_table;
+  CHECK_EQ(table.dim(), 2);
+  CHECK_GT(table.size(0), 0);
+  CHECK_GT(table.size(1), 0);
+  CHECK_LE(table.size(1), kMaxInt32 / block_size_);
+  CHECK_LE(table.numel(), kMaxInt32);
+  CHECK(table.scalar_type() == torch::kInt32 ||
+        table.scalar_type() == torch::kInt64);
+  CHECK_EQ(table.device(), positions.device());
+  CHECK_GE(execution.score_capacity, 0);
+  CHECK_LE(execution.score_capacity, table.size(1) * block_size_);
+  const int64_t pools =
+      (execution.score_capacity + index_kpool_ - 1) / index_kpool_;
+  CHECK_LE(pools, kWorkspaceBytes / static_cast<int64_t>(sizeof(float)));
   return execution;
 }
 
@@ -725,14 +616,12 @@ std::tuple<torch::Tensor, torch::Tensor> Glm5NextKPoolIndexerImpl::forward(
              tail_cache.size(2) - index_kpool_)
         << "KPool tail capacity does not cover the speculative write window.";
   }
-  torch::Tensor active =
-      execution.batch->tail_indices.index_select(
-          0, execution.batch->row_batch) > kPaddingLinearStateId;
-  if (attn_metadata.slot_mapping.defined()) {
-    active = active & (attn_metadata.slot_mapping.reshape({-1}) > 0);
-  }
   const torch::Tensor cache_positions =
-      torch::where(active, positions, torch::full_like(positions, -1));
+      kernel::mlu::kpool_cache_positions(execution.batch->tail_indices,
+                                         execution.batch->row_batch,
+                                         positions,
+                                         attn_metadata.slot_mapping,
+                                         kPaddingLinearStateId);
   update_cache(raw_k,
                gate_bf16,
                cache_positions,
@@ -749,23 +638,15 @@ std::tuple<torch::Tensor, torch::Tensor> Glm5NextKPoolIndexerImpl::forward(
                                            attn_metadata,
                                            execution);
   kernel::mlu::KPoolSelection selection =
-      use_prefill_expand
-          ? expand_prefill(pools,
-                           cache_positions,
-                           execution.batch->row_batch,
-                           execution.batch->block_table,
-                           block_size_,
-                           index_topk_,
-                           index_kpool_,
-                           always_select_tail_)
-          : kernel::mlu::expand_kpool(pools,
-                                      cache_positions,
-                                      execution.batch->row_batch,
-                                      execution.batch->block_table,
-                                      block_size_,
-                                      index_topk_,
-                                      index_kpool_,
-                                      always_select_tail_);
+      kernel::mlu::expand_kpool(pools,
+                                cache_positions,
+                                execution.batch->row_batch,
+                                execution.batch->block_table,
+                                block_size_,
+                                index_topk_,
+                                index_kpool_,
+                                always_select_tail_,
+                                use_prefill_expand);
   return {std::move(selection.physical_slots),
           std::move(selection.context_lens)};
 }

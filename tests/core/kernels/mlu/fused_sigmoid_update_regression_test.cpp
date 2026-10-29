@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -760,7 +761,8 @@ TEST(FusedSigmoidUpdateTest, FourTokenKdaEightHeadsMatchesReference) {
 }
 
 void expect_kda_batch_matches_sequential(
-    const std::vector<int32_t>& sequence_lengths) {
+    const std::vector<int32_t>& sequence_lengths,
+    bool use_int64_metadata = false) {
   torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
   torch::manual_seed(20260907);
@@ -781,7 +783,10 @@ void expect_kda_batch_matches_sequential(
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   auto fp32_options =
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
-  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto int_options =
+      torch::TensorOptions()
+          .dtype(use_int64_metadata ? torch::kInt64 : torch::kInt32)
+          .device(device);
 
   auto a_log = torch::randn({kNumHeads}, fp32_options) * 0.1;
   auto dt_bias = torch::randn({kNumHeads * kHeadDim}, fp32_options) * 0.1;
@@ -898,9 +903,17 @@ TEST(FusedSigmoidUpdateTest,
   expect_kda_batch_matches_sequential({0, 1, 2, 3, 0, 3, 2, 1});
 }
 
+TEST(FusedSigmoidUpdateTest, Int64KdaMetadataPreservesEveryCheckpoint) {
+  expect_kda_batch_matches_sequential(
+      std::vector<int32_t>(/*count=*/16, /*value=*/4),
+      /*use_int64_metadata=*/true);
+}
+
 void expect_tp4_decode_graph_matches_reference(int64_t bucket,
                                                int64_t live_sequences,
-                                               bool include_empty_query) {
+                                               bool include_empty_query,
+                                               bool remap_requests = false,
+                                               int32_t rounds = 3) {
   torch::Device device(torch::kPrivateUse1, /*index=*/0);
   torch::DeviceGuard guard(device);
   torch::manual_seed(20261008);
@@ -981,8 +994,21 @@ void expect_tp4_decode_graph_matches_reference(int64_t bucket,
     graph.capture_end();
   }
   state.copy_(original_state);
-  for (int32_t round = 0; round < 3; ++round) {
+  for (int32_t round = 0; round < rounds; ++round) {
     SCOPED_TRACE(round);
+    if (remap_requests) {
+      // Evict a request, recycle its slot with clean state, and change both
+      // active request count and row order while graph addresses stay fixed.
+      live_sequences = bucket - round % 3;
+      for (int64_t row = 0; row < bucket; ++row) {
+        slots[row] = row < live_sequences
+                         ? static_cast<int32_t>((row + round) % bucket + 1)
+                         : -1;
+      }
+      indices.copy_(torch::tensor(slots, ints));
+      state[1].zero_();
+      expected_state[1].zero_();
+    }
     // Change inputs while keeping graph addresses fixed, and carry recurrent
     // state across replays instead of resetting it before each comparison.
     q_cpu = torch::randn_like(q_cpu);
@@ -1057,6 +1083,495 @@ TEST(FusedSigmoidUpdateTest, Tp4DecodeGraphPaddingAndEmptyRowsPreserveState) {
   expect_tp4_decode_graph_matches_reference(/*bucket=*/8,
                                             /*live_sequences=*/5,
                                             /*include_empty_query=*/true);
+}
+
+TEST(FusedSigmoidUpdateTest, EverySmallBatchPreservesFourTokenCheckpoints) {
+  for (int32_t batch = 1; batch <= 16; ++batch) {
+    for (const int64_t heads : {8, 16, 32, 64}) {
+      SCOPED_TRACE(batch);
+      SCOPED_TRACE(heads);
+      const std::vector<int32_t> lengths(batch, 4);
+      std::vector<int32_t> accepted;
+      accepted.reserve(batch);
+      for (int32_t sequence = 0; sequence < batch; ++sequence) {
+        accepted.emplace_back(sequence % 4 + 1);
+      }
+      expect_sparse_kda_matches_reference(lengths,
+                                          accepted,
+                                          /*inplace_final_state=*/true,
+                                          /*include_invalid_slots=*/false,
+                                          /*checkpoint_capacity=*/4,
+                                          heads);
+    }
+  }
+}
+
+TEST(FusedSigmoidUpdateTest,
+     HeadAlignedVerifyKeepsCheckpointsAcrossHeadsAndGateBatches) {
+  // Forty four-column rows put more than 32 tokens of one head on a core for
+  // every local head count, so gate batches and head switches repeat inside
+  // a core; empty, short and invalid rows break the state prefetch chain.
+  constexpr int32_t kBatch = 40;
+  std::vector<int32_t> lengths(kBatch, 4);
+  std::vector<int32_t> accepted;
+  accepted.reserve(kBatch);
+  for (int32_t row = 0; row < kBatch; ++row) {
+    accepted.emplace_back(row % 4 + 1);
+  }
+  for (const int32_t row : {0, 9, 21}) {
+    lengths[row] = 0;
+  }
+  for (const int32_t row : {3, 14, 30}) {
+    lengths[row] = 1;
+  }
+  for (const int32_t row : {6, 25}) {
+    lengths[row] = 3;
+  }
+  for (const int64_t heads : {8, 16, 32, 64}) {
+    SCOPED_TRACE(heads);
+    expect_sparse_kda_matches_reference(lengths,
+                                        accepted,
+                                        /*inplace_final_state=*/true,
+                                        /*include_invalid_slots=*/true,
+                                        /*checkpoint_capacity=*/4,
+                                        heads,
+                                        /*padded_token_count=*/kBatch * 4 + 8);
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, LowTpLongQueriesPreserveMaskedWindowBoundaries) {
+  for (const int64_t heads : {16, 32, 64}) {
+    for (const int32_t query : {5, 6, 7, 8}) {
+      SCOPED_TRACE(heads);
+      SCOPED_TRACE(query);
+      expect_sparse_kda_matches_reference({query, 0, query - 1, 2, query},
+                                          {1, 1, 2, 1, 3},
+                                          /*inplace_final_state=*/true,
+                                          /*include_invalid_slots=*/true,
+                                          /*checkpoint_capacity=*/8,
+                                          heads,
+                                          /*padded_token_count=*/40);
+    }
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, EverySmallDecodeBatchUsesLiveGraphMetadata) {
+  for (int64_t batch = 1; batch <= 16; ++batch) {
+    SCOPED_TRACE(batch);
+    expect_tp4_decode_graph_matches_reference(batch,
+                                              batch,
+                                              /*include_empty_query=*/false);
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, WideNegativeMetadataCannotAliasValidStateSlots) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  constexpr int64_t kHeads = 8;
+  constexpr int64_t kDim = 128;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kDim));
+  torch::manual_seed(20261020);
+  const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
+  const auto fp32 = torch::TensorOptions().dtype(torch::kFloat32);
+  torch::Tensor q = torch::randn({1, 3, kHeads, kDim}, bf16).to(device);
+  torch::Tensor k = torch::randn_like(q);
+  torch::Tensor v = torch::randn_like(q);
+  torch::Tensor gate = torch::randn({3, kHeads * kDim}, bf16).to(device);
+  torch::Tensor beta = torch::randn({3, kHeads}, bf16).to(device);
+  torch::Tensor log = torch::zeros({kHeads}, fp32).to(device);
+  torch::Tensor bias = torch::zeros({kHeads * kDim}, fp32).to(device);
+  torch::Tensor initial = torch::randn({2, kHeads, kDim, kDim}, fp32);
+  torch::Tensor cu = torch::tensor({0, 1, 2, 3}, torch::kInt64).to(device);
+  torch::Tensor negative_slots =
+      torch::tensor({std::numeric_limits<int64_t>::min(),
+                     -(int64_t{1} << 32) + 1,
+                     int64_t{-1}},
+                    torch::kInt64);
+  torch::Tensor invalid_accepted =
+      torch::tensor({-(int64_t{1} << 32) + 1,
+                     (int64_t{1} << 32) + 1,
+                     std::numeric_limits<int64_t>::min()},
+                    torch::kInt64);
+  for (const int64_t mode : {0, 1, 2}) {
+    SCOPED_TRACE(mode);
+    torch::Tensor indices =
+        (mode == 2 ? torch::ones({3, 1}, torch::kInt64)
+                   : (mode == 1 ? negative_slots.view({3, 1}) : negative_slots))
+            .to(device);
+    const std::optional<torch::Tensor> accepted =
+        mode == 2 ? std::make_optional(invalid_accepted.to(device))
+                  : std::nullopt;
+    torch::Tensor state = initial.to(device);
+    const auto result =
+        fused_sigmoid_gating_delta_rule_update(log,
+                                               gate,
+                                               beta,
+                                               bias,
+                                               q,
+                                               k,
+                                               v,
+                                               state,
+                                               indices,
+                                               cu,
+                                               scale,
+                                               /*use_qk_l2norm_in_kernel=*/true,
+                                               /*softplus_beta=*/1.0f,
+                                               /*softplus_threshold=*/20.0f,
+                                               accepted,
+                                               /*inplace_final_state=*/true,
+                                               /*is_kda=*/true,
+                                               /*kda_use_safe_gate=*/true,
+                                               /*kda_gate_lower_bound=*/-5.0f);
+    torch_mlu::synchronize();
+    EXPECT_TRUE(torch::equal(result.first.cpu(),
+                             torch::zeros_like(result.first.cpu())));
+    EXPECT_TRUE(torch::equal(state.cpu(), initial));
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, Int32AcceptedCountsOutsideQueryWindowSkipWrites) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  torch::manual_seed(20261022);
+  constexpr int64_t kDim = 128;
+  const auto bf16 =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const auto fp32 = bf16.dtype(torch::kFloat32);
+  const auto integer = bf16.dtype(torch::kInt32);
+  for (const int64_t heads : {8, 32}) {
+    for (const int64_t columns : {1, 4}) {
+      SCOPED_TRACE(heads);
+      SCOPED_TRACE(columns);
+      const int64_t tokens = 3 * columns;
+      torch::Tensor q = torch::randn({1, tokens, heads, kDim}, bf16);
+      torch::Tensor k = torch::randn_like(q), v = torch::randn_like(q);
+      torch::Tensor gate = torch::randn({tokens, heads * kDim}, bf16);
+      torch::Tensor beta = torch::randn({tokens, heads}, bf16);
+      torch::Tensor log = torch::zeros({heads}, fp32);
+      torch::Tensor bias = torch::zeros({heads * kDim}, fp32);
+      torch::Tensor initial =
+          torch::randn({tokens + 1, heads, kDim, kDim}, fp32);
+      torch::Tensor state = initial.clone();
+      torch::Tensor slots =
+          torch::arange(1, tokens + 1, integer).view({3, columns});
+      torch::Tensor cu = torch::arange(0, tokens + 1, columns, integer);
+      torch::Tensor accepted =
+          torch::tensor({std::numeric_limits<int32_t>::min(),
+                         int32_t{0},
+                         static_cast<int32_t>(columns + 1)},
+                        torch::kInt32)
+              .to(device);
+      auto result = fused_sigmoid_gating_delta_rule_update(
+          log,
+          gate,
+          beta,
+          bias,
+          q,
+          k,
+          v,
+          state,
+          slots,
+          cu,
+          1.0 / std::sqrt(static_cast<double>(kDim)),
+          true,
+          1.0f,
+          20.0f,
+          accepted,
+          true,
+          true,
+          true,
+          -5.0f);
+      torch_mlu::synchronize();
+      EXPECT_TRUE(torch::equal(result.first.cpu(),
+                               torch::zeros_like(result.first.cpu())));
+      EXPECT_TRUE(torch::equal(state.cpu(), initial.cpu()));
+    }
+  }
+}
+
+TEST(FusedSigmoidUpdateTest,
+     NoncontiguousWideMetadataRemainsLiveOnCapturedStream) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  torch_mlu::mlu::MLUStreamGuard stream(
+      torch_mlu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0));
+  constexpr int64_t kHeads = 8;
+  constexpr int64_t kDim = 128;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kDim));
+  torch::manual_seed(20261021);
+  const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
+  const auto fp32 = torch::TensorOptions().dtype(torch::kFloat32);
+  const torch::Tensor q_cpu = torch::randn({1, 3, kHeads, kDim}, bf16);
+  const torch::Tensor k_cpu = torch::randn_like(q_cpu);
+  const torch::Tensor v_cpu = torch::randn_like(q_cpu);
+  const torch::Tensor gate_cpu = torch::randn({3, kHeads * kDim}, bf16);
+  const torch::Tensor beta_cpu = torch::randn({3, kHeads}, bf16);
+  const torch::Tensor log_cpu = torch::zeros({kHeads}, fp32);
+  const torch::Tensor bias_cpu = torch::zeros({kHeads, kDim}, fp32);
+  const torch::Tensor initial = torch::randn({5, kHeads, kDim, kDim}, fp32);
+  torch::Tensor q = q_cpu.to(device), k = k_cpu.to(device);
+  torch::Tensor v = v_cpu.to(device), gate = gate_cpu.to(device);
+  torch::Tensor beta = beta_cpu.to(device), log = log_cpu.to(device);
+  torch::Tensor bias = bias_cpu.flatten().to(device);
+  torch::Tensor state = initial.to(device);
+  torch::Tensor cu_backing =
+      torch::tensor({0, 91, 1, 92, 2, 93, 3, 94}, torch::kInt64).to(device);
+  torch::Tensor cu = cu_backing.slice(0, 0, 8, 2);
+  torch::Tensor indices_backing =
+      torch::tensor({1, 91, 2, 92, 3, 93}, torch::kInt64)
+          .view({3, 2})
+          .to(device);
+  torch::Tensor indices = indices_backing.slice(1, 0, 1);
+  torch::Tensor accepted_backing =
+      torch::ones({3, 2}, torch::kInt64).to(device);
+  torch::Tensor accepted = accepted_backing.select(1, 0);
+  ASSERT_FALSE(cu.is_contiguous());
+  ASSERT_FALSE(indices.is_contiguous());
+  ASSERT_FALSE(accepted.is_contiguous());
+  const auto run = [&]() {
+    return fused_sigmoid_gating_delta_rule_update(log,
+                                                  gate,
+                                                  beta,
+                                                  bias,
+                                                  q,
+                                                  k,
+                                                  v,
+                                                  state,
+                                                  indices,
+                                                  cu,
+                                                  scale,
+                                                  true,
+                                                  1.0f,
+                                                  20.0f,
+                                                  accepted,
+                                                  true,
+                                                  true,
+                                                  true,
+                                                  -5.0f);
+  };
+  auto warmup = run();
+  torch_mlu::synchronize();
+  torch_mlu::MLUGraph graph;
+  graph.capture_begin();
+  torch::Tensor output = run().first;
+  graph.capture_end();
+  for (int64_t round = 0; round < 6; ++round) {
+    SCOPED_TRACE(round);
+    torch::Tensor slots = torch::tensor({1, 2, 3}, torch::kInt64);
+    torch::Tensor counts = torch::ones({3}, torch::kInt64);
+    torch::Tensor offsets = torch::tensor({0, 1, 2, 3}, torch::kInt64);
+    if (round == 1) {
+      counts[1] = -(int64_t{1} << 32) + 1;
+      offsets = torch::tensor({0, 0, 1, 2}, torch::kInt64);
+    } else if (round == 2) {
+      slots[0] = std::numeric_limits<int64_t>::min();
+      offsets = torch::tensor({0, 1, 1, 2}, torch::kInt64);
+    } else if (round == 3) {
+      slots = torch::tensor({3, 1, 2}, torch::kInt64);
+      offsets = torch::zeros({4}, torch::kInt64);
+    } else if (round == 4) {
+      counts[2] = std::numeric_limits<int64_t>::min();
+    } else if (round == 5) {
+      slots[1] = -(int64_t{1} << 32) + 1;
+      offsets = torch::tensor({0, 1, 2, 2}, torch::kInt64);
+    }
+    cu.copy_(offsets);
+    indices.copy_(slots.view({3, 1}));
+    accepted.copy_(counts);
+    state.copy_(initial);
+    torch::Tensor expected_state = initial.clone();
+    torch::Tensor expected_output = torch::zeros({1, 3, kHeads, kDim}, fp32);
+    for (int64_t row = 0; row < 3; ++row) {
+      const int64_t slot = slots[row].item<int64_t>();
+      const int64_t token = offsets[row].item<int64_t>();
+      if (token == offsets[row + 1].item<int64_t>() || slot <= 0 ||
+          counts[row].item<int64_t>() != 1) {
+        continue;
+      }
+      torch::Tensor recurrence = initial[slot].clone();
+      expected_output[0][token].copy_(kda_reference_step(
+          q_cpu[0][token].to(torch::kFloat32),
+          k_cpu[0][token].to(torch::kFloat32),
+          v_cpu[0][token].to(torch::kFloat32),
+          gate_cpu[token].to(torch::kFloat32).view({kHeads, kDim}),
+          beta_cpu[token].to(torch::kFloat32),
+          log_cpu,
+          bias_cpu,
+          recurrence,
+          scale,
+          -5.0f));
+      expected_state[slot].copy_(recurrence);
+    }
+    graph.replay();
+    torch_mlu::synchronize();
+    EXPECT_TRUE(torch::allclose(
+        output.cpu().to(torch::kFloat32), expected_output, 0.03, 0.003));
+    EXPECT_TRUE(torch::allclose(state.cpu(), expected_state, 5e-4, 5e-5));
+    EXPECT_TRUE(torch::equal(state[0].cpu(), initial[0]));
+    EXPECT_TRUE(torch::equal(state[4].cpu(), initial[4]));
+    EXPECT_TRUE(torch::equal(indices.cpu(), slots.view({3, 1})));
+    EXPECT_TRUE(torch::equal(accepted.cpu(), counts));
+    EXPECT_TRUE(torch::equal(cu.cpu(), offsets));
+    EXPECT_TRUE(torch::equal(cu_backing.slice(0, 1, 8, 2).cpu(),
+                             torch::tensor({91, 92, 93, 94}, torch::kInt64)));
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, OneDimensionalSlotsKeepRaggedFinalStates) {
+  torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  torch::DeviceGuard guard(device);
+  torch::manual_seed(20261019);
+  constexpr int64_t kDim = 128;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kDim));
+  const auto fp32 = torch::TensorOptions().dtype(torch::kFloat32);
+  const auto ints = torch::TensorOptions().dtype(torch::kInt64);
+  for (int64_t heads : {8, 16, 32, 64}) {
+    SCOPED_TRACE(heads);
+    // The total token count equals N, but one request is empty and another has
+    // two tokens. A 1D table names one final state slot per request.
+    const std::vector<int64_t> offsets = {0, 0, 2, 3};
+    const std::vector<int64_t> slots = {3, 1, 2};
+    torch::Tensor q_cpu =
+        torch::randn({1, 3, heads, kDim}, fp32).to(torch::kBFloat16);
+    torch::Tensor k_cpu = torch::randn_like(q_cpu);
+    torch::Tensor v_cpu = torch::randn_like(q_cpu);
+    torch::Tensor gate_cpu =
+        torch::randn({3, heads * kDim}, fp32).to(torch::kBFloat16);
+    torch::Tensor beta_cpu =
+        torch::randn({3, heads}, fp32).to(torch::kBFloat16);
+    torch::Tensor log_cpu = torch::randn({heads}, fp32) * 0.1;
+    torch::Tensor bias_cpu = torch::randn({heads * kDim}, fp32) * 0.1;
+    torch::Tensor initial = torch::randn({5, heads, kDim, kDim}, fp32) * 0.05;
+    torch::Tensor expected_state = initial.clone();
+    torch::Tensor q = q_cpu.to(device);
+    torch::Tensor k = k_cpu.to(device);
+    torch::Tensor v = v_cpu.to(device);
+    torch::Tensor gate = gate_cpu.to(device);
+    torch::Tensor beta = beta_cpu.to(device);
+    torch::Tensor log = log_cpu.to(device);
+    torch::Tensor bias = bias_cpu.to(device);
+    torch::Tensor state = initial.to(device);
+    torch::Tensor indices = torch::tensor(slots, ints).to(device);
+    torch::Tensor cu = torch::tensor(offsets, ints).to(device);
+    for (int32_t repeat = 0; repeat < 3; ++repeat) {
+      SCOPED_TRACE(repeat);
+      torch::Tensor expected_output = torch::zeros({1, 3, heads, kDim}, fp32);
+      for (int64_t sequence = 0; sequence < 3; ++sequence) {
+        torch::Tensor current = expected_state[slots[sequence]].clone();
+        for (int64_t token = offsets[sequence]; token < offsets[sequence + 1];
+             ++token) {
+          expected_output[0][token].copy_(kda_reference_step(
+              q_cpu[0][token].to(torch::kFloat32),
+              k_cpu[0][token].to(torch::kFloat32),
+              v_cpu[0][token].to(torch::kFloat32),
+              gate_cpu[token].to(torch::kFloat32).view({heads, kDim}),
+              beta_cpu[token].to(torch::kFloat32),
+              log_cpu,
+              bias_cpu.view({heads, kDim}),
+              current,
+              scale,
+              /*gate_lower_bound=*/-5.0f));
+        }
+        expected_state[slots[sequence]].copy_(current);
+      }
+      auto result = fused_sigmoid_gating_delta_rule_update(
+          log,
+          gate,
+          beta,
+          bias,
+          q,
+          k,
+          v,
+          state,
+          indices,
+          cu,
+          scale,
+          /*use_qk_l2norm_in_kernel=*/true,
+          /*softplus_beta=*/1.0f,
+          /*softplus_threshold=*/20.0f,
+          /*num_accepted_tokens_opt=*/std::nullopt,
+          /*inplace_final_state=*/true,
+          /*is_kda=*/true,
+          /*kda_use_safe_gate=*/true,
+          /*kda_gate_lower_bound=*/-5.0f);
+      torch_mlu::synchronize();
+      EXPECT_EQ(result.second.data_ptr(), state.data_ptr());
+      EXPECT_TRUE(
+          torch::allclose(result.first.to(torch::kCPU).to(torch::kFloat32),
+                          expected_output,
+                          /*rtol=*/0.03,
+                          /*atol=*/0.003));
+      const torch::Tensor actual_state = state.to(torch::kCPU);
+      EXPECT_TRUE(torch::allclose(actual_state,
+                                  expected_state,
+                                  /*rtol=*/5e-4,
+                                  /*atol=*/5e-5));
+      EXPECT_TRUE(torch::equal(actual_state[0], initial[0]));
+      EXPECT_TRUE(torch::equal(actual_state[3], initial[3]));
+      EXPECT_TRUE(torch::equal(actual_state[4], initial[4]));
+    }
+  }
+}
+
+// Sweep effective requests, not the packed tensor's leading dimension.
+TEST(FusedSigmoidUpdateTest, DecodeAndVerifyCoverEveryBatchThrough128) {
+  for (int32_t batch = 1; batch <= 128; ++batch) {
+    for (const int32_t query : {1, 4}) {
+      SCOPED_TRACE(::testing::Message() << batch << ":" << query);
+      std::vector<int32_t> accepted;
+      accepted.reserve(batch);
+      for (int32_t row = 0; row < batch; ++row) {
+        accepted.emplace_back(row % query + 1);
+      }
+      expect_sparse_kda_matches_reference(std::vector<int32_t>(batch, query),
+                                          accepted,
+                                          /*inplace_final_state=*/true,
+                                          /*include_invalid_slots=*/false,
+                                          /*checkpoint_capacity=*/query,
+                                          /*num_heads=*/8);
+    }
+  }
+}
+
+TEST(FusedSigmoidUpdateTest,
+     VerifySupportsLargerBatchesAndSixEightTokenWindows) {
+  for (const int32_t batch : {1, 17, 64, 128, 129, 160}) {
+    for (const int32_t query : {1, 4, 6, 8}) {
+      SCOPED_TRACE(::testing::Message() << batch << ":" << query);
+      std::vector<int32_t> accepted;
+      accepted.reserve(batch);
+      for (int32_t row = 0; row < batch; ++row) {
+        accepted.emplace_back(row % query + 1);
+      }
+      expect_sparse_kda_matches_reference(std::vector<int32_t>(batch, query),
+                                          accepted,
+                                          /*inplace_final_state=*/true,
+                                          /*include_invalid_slots=*/false,
+                                          /*checkpoint_capacity=*/query,
+                                          /*num_heads=*/8);
+    }
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, LargeDecodeGraphsPreserveStateAcrossRounds) {
+  for (const int64_t batch : {64, 127, 128, 129, 160}) {
+    SCOPED_TRACE(batch);
+    expect_tp4_decode_graph_matches_reference(batch,
+                                              batch - 1,
+                                              /*include_empty_query=*/true);
+  }
+}
+
+TEST(FusedSigmoidUpdateTest, DraftQ1StepsPreserveReorderedAndReusedStateSlots) {
+  for (const int32_t steps : {3, 5, 7}) {
+    SCOPED_TRACE(steps);
+    expect_tp4_decode_graph_matches_reference(
+        /*bucket=*/17,
+        /*live_sequences=*/17,
+        /*include_empty_query=*/false,
+        /*remap_requests=*/true,
+        steps);
+  }
 }
 
 }  // namespace

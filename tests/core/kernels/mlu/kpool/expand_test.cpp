@@ -16,15 +16,97 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <limits>
+#include <vector>
+
 #include "kernels/mlu/kpool.h"
 #include "platform/platform.h"
 
 namespace xllm::kernel::mlu {
 namespace {
 
+TEST(KPoolConfigDeathTest, RejectsUnsupportedExpansionBeforeAllocation) {
+  const torch::Tensor ids = torch::full({1, 512}, -1, torch::kInt64);
+  const torch::Tensor positions = torch::zeros({1}, torch::kInt32);
+  const torch::Tensor rows = torch::zeros({1}, torch::kInt64);
+  const torch::Tensor table = torch::zeros({1, 1}, torch::kInt32);
+  EXPECT_DEATH(expand_kpool(ids, positions, rows, table, 64, 2048, 4, true),
+               "block_size=16");
+  EXPECT_DEATH(expand_kpool(ids, positions, rows, table, 16, 1024, 4, true),
+               "token_budget=2048");
+  EXPECT_DEATH(expand_kpool(ids, positions, rows, table, 16, 2048, 8, true),
+               "pool_size=4");
+  EXPECT_DEATH(
+      expand_kpool(
+          ids.narrow(1, 0, 256), positions, rows, table, 16, 2048, 4, true),
+      "512 selected pools");
+  const int64_t too_many = std::numeric_limits<int32_t>::max() / 2051 + 1;
+  EXPECT_DEATH(expand_kpool(ids.expand({too_many, 512}),
+                            positions,
+                            rows,
+                            table,
+                            16,
+                            2048,
+                            4,
+                            true),
+               "kMaxInt32 / 2051");
+}
+
+TEST(KPoolKernelTest, ExpansionRejectsNonemptyQueriesWithoutBlockTableRows) {
+  const torch::Tensor selected = torch::full({1, 512}, -1, torch::kInt64);
+  const torch::Tensor positions = torch::tensor({3}, torch::kInt32);
+  const torch::Tensor rows = torch::zeros({1}, torch::kInt64);
+  const torch::Tensor table = torch::empty({0, 4}, torch::kInt32);
+  EXPECT_DEATH(
+      expand_kpool(selected, positions, rows, table, 16, 2048, 4, true),
+      "Nonempty KPool queries require a nonempty block table");
+}
+
+TEST(KPoolKernelTest, ExpansionMasksWideInvalidRowsBeforeTableLoads) {
+  const torch::Device device(Platform::type_torch(), 0);
+  const torch::Tensor table = torch::tensor({{3, 5}, {7, 11}}, torch::kInt32);
+  const torch::Tensor rows =
+      torch::tensor(std::vector<int64_t>{-1,
+                                         -(int64_t{1} << 32),
+                                         int64_t{1} << 32,
+                                         std::numeric_limits<int64_t>::min(),
+                                         std::numeric_limits<int64_t>::max(),
+                                         0,
+                                         1,
+                                         2},
+                    torch::kInt64);
+  torch::Tensor selected = torch::full({8, 512}, -1, torch::kInt64);
+  selected.slice(1, 0, 3).copy_(torch::tensor(
+      std::vector<int64_t>{0, 4, std::numeric_limits<int64_t>::max()},
+      torch::kInt64));
+  const torch::Tensor positions =
+      torch::full({8}, std::numeric_limits<int32_t>::max(), torch::kInt32);
+  torch::Tensor expected = torch::full({8, 2051}, -1, torch::kInt32);
+  torch::Tensor lengths = torch::zeros({8}, torch::kInt32);
+  for (const int64_t token : {5, 6}) {
+    for (int64_t member = 0; member < 4; ++member) {
+      expected[token][member] =
+          table[token - 5][0].item<int32_t>() * 16 + member;
+      expected[token][member + 4] =
+          table[token - 5][1].item<int32_t>() * 16 + member;
+    }
+    lengths[token] = 8;
+  }
+  const auto actual = expand_kpool(selected.to(device),
+                                   positions.to(device),
+                                   rows.to(device),
+                                   table.to(device),
+                                   16,
+                                   2048,
+                                   4,
+                                   true);
+  EXPECT_TRUE(torch::equal(actual.physical_slots.cpu(), expected));
+  EXPECT_TRUE(torch::equal(actual.context_lens.cpu(), lengths));
+}
+
 TEST(KPoolKernelTest, ExpansionMapsLogicalTokensAndAllTailLengths) {
   const torch::Device device(Platform::type_torch(), 0);
-  for (const int64_t block_size : {16, 32}) {
+  for (const int64_t block_size : {16}) {
     const torch::Tensor table = torch::tensor({{3, 1, 4, 0, 2}}, torch::kInt64);
     torch::Tensor ids = torch::full({4, 512}, -1, torch::kInt64);
     ids.narrow(1, 0, 3).copy_(torch::tensor(
@@ -146,6 +228,90 @@ TEST(KPoolKernelTest, ExpansionSupportsWideTablesAndPartialPools) {
   }
 }
 
+TEST(KPoolKernelTest, ExpansionPreservesOrderAcrossRequestWaveBoundaries) {
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  constexpr int64_t kTableWidth = 513;
+  for (const int64_t tokens :
+       {127, 128, 129, 131, 132, 255, 256, 257, 383, 384, 385, 395, 396}) {
+    const int64_t query = tokens >= 383 ? 6 : 4;
+    const int64_t batch = (tokens + query - 1) / query;
+    torch::Tensor table = torch::arange(batch * kTableWidth, torch::kInt32)
+                              .view({batch, kTableWidth})
+                              .flip({1});
+    table.slice(1, 1, kTableWidth, 3).fill_(-1);
+    torch::Tensor ids = torch::full({tokens, 512}, -1, torch::kInt64);
+    ids.narrow(1, 0, 6).copy_(
+        torch::tensor(
+            std::vector<int64_t>{0, 4, 127, 2047, 2048, int64_t{1} << 40},
+            torch::kInt64)
+            .repeat({tokens, 1}));
+    const torch::Tensor positions =
+        (8191 - torch::arange(tokens, torch::kInt32).remainder(19));
+    const torch::Tensor rows =
+        torch::floor_divide(torch::arange(tokens, torch::kInt64), query);
+    for (const bool masked_prefix : {false, true}) {
+      torch::Tensor active_rows = rows.clone();
+      torch::Tensor active_positions = positions.clone();
+      if (masked_prefix) {
+        active_rows.slice(0, 0, 7).fill_(-1);
+        active_positions.slice(0, 0, 7).fill_(-1);
+      }
+      for (const bool always_tail : {false, true}) {
+        torch::Tensor expected = torch::full({tokens, 2051}, -1, torch::kInt32);
+        torch::Tensor lengths = torch::zeros({tokens}, torch::kInt32);
+        const auto input_ids = ids.accessor<int64_t, 2>();
+        const auto input_positions = active_positions.accessor<int32_t, 1>();
+        const auto input_rows = active_rows.accessor<int64_t, 1>();
+        const auto pages = table.accessor<int32_t, 2>();
+        auto slots = expected.accessor<int32_t, 2>();
+        auto expected_lengths = lengths.accessor<int32_t, 1>();
+        for (int64_t row = 0; row < tokens; ++row) {
+          const int64_t position = input_positions[row];
+          if (position < 0) {
+            continue;
+          }
+          int32_t written = 0;
+          const auto append_token = [&](int64_t token) {
+            if (token < 0 || token > position || token / 16 >= kTableWidth) {
+              return;
+            }
+            const int32_t page = pages[input_rows[row]][token / 16];
+            if (page >= 0) {
+              slots[row][written++] =
+                  page * 16 + static_cast<int32_t>(token % 16);
+            }
+          };
+          for (int64_t column = 0; column < 6; ++column) {
+            for (int64_t member = 0; member < 4; ++member) {
+              append_token(input_ids[row][column] * 4 + member);
+            }
+          }
+          if (always_tail) {
+            for (int64_t token = (position + 1) / 4 * 4; token <= position;
+                 ++token) {
+              append_token(token);
+            }
+          }
+          expected_lengths[row] = written;
+        }
+        SCOPED_TRACE(::testing::Message()
+                     << "tokens=" << tokens << " prefix=" << masked_prefix
+                     << " tail=" << always_tail);
+        const auto actual = expand_kpool(ids.to(device),
+                                         active_positions.to(device),
+                                         active_rows.to(device),
+                                         table.to(device),
+                                         /*block_size=*/16,
+                                         /*token_budget=*/2048,
+                                         /*pool_size=*/4,
+                                         always_tail);
+        EXPECT_TRUE(torch::equal(actual.physical_slots.cpu(), expected));
+        EXPECT_TRUE(torch::equal(actual.context_lens.cpu(), lengths));
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace xllm::kernel::mlu
 
@@ -181,7 +347,8 @@ TEST(KPoolKernelTest, PrefillExpansionCompactsAcrossScanGroups) {
       16,
       2048,
       4,
-      true);
+      true,
+      /*prefill=*/true);
   EXPECT_TRUE(
       torch::equal(actual.physical_slots.cpu(), expected.repeat({512, 1})));
   EXPECT_TRUE(actual.context_lens.eq(written).all().item<bool>());

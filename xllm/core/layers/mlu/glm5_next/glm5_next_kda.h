@@ -129,6 +129,7 @@ class Glm5NextKDAImpl final : public torch::nn::Module {
   int64_t rank_ = 0;
   int32_t conv_kernel_size_ = 0;
   float gate_lower_bound_ = -5.0f;
+  double norm_eps_ = 1e-5;
 
   Glm5NextKDAInputProjection in_proj_qkvbfg_a_{nullptr};
   ColumnParallelLinear f_b_proj_{nullptr};

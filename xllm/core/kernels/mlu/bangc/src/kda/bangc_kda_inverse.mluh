@@ -1,0 +1,110 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <bang.h>
+
+#include <cstdint>
+
+// Unit lower-triangular inverse shared by the KDA chunk kernels.
+namespace xllm::kernel::mlu::kda_inverse {
+
+constexpr int32_t kDiagonalBlock = 16;
+
+// Writes (I - P)^-1 for the strictly lower-triangular P = -L in power, a
+// row-major size x size matrix (size <= 64) that is clobbered. Each 16-row
+// diagonal block uses the nilpotent doubling product
+// (I + P)(I + P^2)(I + P^4)(I + P^8), whose power terms stay representable at
+// that order. Wider matrices then apply block forward substitution
+// X = D^-1 + D^-1 B X, where D is the block-diagonal part of I - P and B the
+// strictly block-lower part of P; every sweep finalizes one more 16-row band.
+// A single order-32 or order-64 product would form binomial-sized powers whose
+// cancellation loses every FP32 digit when keys are similar, beta is near one
+// and gates barely decay.
+//
+// power_tmp and off_diagonal are size x size NRAM scratch; weights is WRAM
+// scratch for one size x size matrix.
+__mlu_func__ inline void invert_unit_lower(float* inverse,
+                                           float* power,
+                                           float* power_tmp,
+                                           float* off_diagonal,
+                                           float* weights,
+                                           int32_t size) {
+  const int32_t elements = size * size;
+  if (size > kDiagonalBlock) {
+    __bang_write_value(off_diagonal, elements, 0.f);
+    __sync_compute();
+    for (int32_t band = kDiagonalBlock; band < size; band += kDiagonalBlock) {
+      const int32_t rows =
+          size - band < kDiagonalBlock ? size - band : kDiagonalBlock;
+      __memcpy(off_diagonal + band * size,
+               power + band * size,
+               band * sizeof(float),
+               NRAM2NRAM,
+               size * sizeof(float),
+               size * sizeof(float),
+               rows - 1);
+    }
+    __sync_move();
+    // Exact subtraction leaves only the block-diagonal part of P.
+    __bang_sub(power, power, off_diagonal, elements);
+  }
+  __bang_write_value(inverse, elements, 0.f);
+  __sync_compute();
+  for (int32_t row = 0; row < size; ++row) {
+    inverse[row * size + row] = 1.f;
+  }
+  __bang_add(inverse, inverse, power, elements);
+  const int32_t order = size < kDiagonalBlock ? size : kDiagonalBlock;
+  for (int32_t distance = 1; distance < order; distance *= 2) {
+    if (distance > 1) {
+      __bang_load_matrix(
+          weights, inverse, NRAM2WRAM, size, size, size * sizeof(float), true);
+      __sync_move();
+      __bang_conv_partial(
+          inverse, power, weights, inverse, size, size, 1, 1, 1, 1, 1, size);
+      __sync_compute();
+    }
+    if (distance * 2 < order) {
+      __bang_load_matrix(
+          weights, power, NRAM2WRAM, size, size, size * sizeof(float), true);
+      __sync_move();
+      __bang_conv(power_tmp, power, weights, size, size, 1, 1, 1, 1, 1, size);
+      __bang_move(power, power_tmp, elements * sizeof(float));
+      __sync_compute();
+    }
+  }
+  if (size <= kDiagonalBlock) {
+    return;
+  }
+  // power_tmp = D^-1 B; power keeps D^-1 as the substitution constant.
+  __bang_load_matrix(
+      weights, off_diagonal, NRAM2WRAM, size, size, size * sizeof(float), true);
+  __sync_move();
+  __bang_conv(power_tmp, inverse, weights, size, size, 1, 1, 1, 1, 1, size);
+  __bang_move(power, inverse, elements * sizeof(float));
+  __sync_compute();
+  for (int32_t band = kDiagonalBlock; band < size; band += kDiagonalBlock) {
+    __bang_load_matrix(
+        weights, inverse, NRAM2WRAM, size, size, size * sizeof(float), true);
+    __sync_move();
+    __bang_conv_partial(
+        inverse, power_tmp, weights, power, size, size, 1, 1, 1, 1, 1, size);
+    __sync_compute();
+  }
+}
+
+}  // namespace xllm::kernel::mlu::kda_inverse

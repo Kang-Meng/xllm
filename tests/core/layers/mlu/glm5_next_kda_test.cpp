@@ -33,6 +33,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "kernels/mlu/bangc/include/bangc_kda_norm_gate_api.h"
 #include "kernels/mlu/chunk_kda.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
@@ -576,6 +577,63 @@ TEST(Glm5NextKDATest, OutputGateUsesSigmoidRatherThanSilu) {
   EXPECT_FALSE(torch::allclose(actual, silu_gated, 1e-6, 1e-6));
 }
 
+TEST(Glm5NextKDATest, BangcNormGatePreservesBfloat16NormalizationBoundary) {
+  torch::InferenceMode inference_guard;
+  torch::manual_seed(20261019);
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const torch::Tensor weight = torch::randn({128}, options);
+  for (const int64_t rows : {0, 1, 7, 255, 257, 4097}) {
+    SCOPED_TRACE(rows);
+    const torch::Tensor input = torch::randn({rows, 128}, options);
+    const torch::Tensor gate = torch::randn({rows, 128}, options) * 3;
+    for (const double eps : {1e-5, 1e-3}) {
+      auto actual = kernel::mlu::bangc_kda_norm_gate(input, gate, weight, eps);
+      ASSERT_TRUE(actual.has_value());
+      EXPECT_EQ(actual->sizes(), input.sizes());
+      EXPECT_EQ(actual->scalar_type(), torch::kBFloat16);
+      if (rows == 0) {
+        continue;
+      }
+      const torch::Tensor x = input.cpu().to(torch::kFloat64);
+      const torch::Tensor normalized =
+          (x *
+           torch::rsqrt(x.square().mean(/*dim=*/-1, /*keepdim=*/true) + eps) *
+           weight.cpu().to(torch::kFloat64))
+              .to(torch::kBFloat16);
+      const torch::Tensor expected = (normalized.to(torch::kFloat64) *
+                                      gate.cpu().to(torch::kFloat64).sigmoid())
+                                         .to(torch::kBFloat16);
+      EXPECT_TRUE(torch::allclose(
+          actual->cpu(), expected, /*rtol=*/0.016, /*atol=*/0.008));
+    }
+  }
+}
+
+TEST(Glm5NextKDATest, BangcNormGateRejectsUnsupportedMetadataBeforeLaunch) {
+  const torch::Tensor input = torch::zeros({2, 128}, torch::kBFloat16);
+  const torch::Tensor weight = torch::ones({128}, torch::kBFloat16);
+  EXPECT_FALSE(
+      kernel::mlu::bangc_kda_norm_gate(input, input, weight, 1e-5).has_value());
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::Tensor mlu_input = input.to(device);
+  const torch::Tensor mlu_weight = weight.to(device);
+  EXPECT_FALSE(kernel::mlu::bangc_kda_norm_gate(
+                   mlu_input.to(torch::kFloat32), mlu_input, mlu_weight, 1e-5)
+                   .has_value());
+  EXPECT_FALSE(
+      kernel::mlu::bangc_kda_norm_gate(mlu_input, mlu_input, mlu_weight, -1.0)
+          .has_value());
+  EXPECT_FALSE(
+      kernel::mlu::bangc_kda_norm_gate(
+          mlu_input.slice(/*dim=*/1, /*start=*/0, /*end=*/128, /*step=*/2),
+          mlu_input,
+          mlu_weight,
+          1e-5)
+          .has_value());
+}
+
 TEST(Glm5NextKDATest, EagerRecurrencePreservesStateAcrossSegments) {
   torch::manual_seed(20260827);
   constexpr int64_t kTokens = 5;
@@ -669,7 +727,6 @@ TEST(Glm5NextKDATest, ChunkPrefillMatchesPackedEagerAcrossBoundaries) {
   torch::Tensor log_gate = glm5_next_safe_gate(raw_gate, a_log, dt_bias, -5.0f);
   torch::Tensor raw_beta =
       torch::randn({total_tokens, kNumHeads}, fp32_options) * 0.1f;
-  torch::Tensor activated_beta = torch::sigmoid(raw_beta);
   torch::Tensor initial_state =
       torch::randn({static_cast<int64_t>(sequence_lengths.size()),
                     kNumHeads,
@@ -708,31 +765,37 @@ TEST(Glm5NextKDATest, ChunkPrefillMatchesPackedEagerAcrossBoundaries) {
   kernel::mlu::ChunkKDA chunk_kda(kNumHeads);
   chunk_kda->to(device);
   auto [warmup_output, warmup_state] =
-      chunk_kda->forward(q,
-                         k,
-                         v,
-                         log_gate,
-                         activated_beta,
-                         initial_state,
-                         cu_seqlens,
-                         chunk_indices,
-                         /*output_final_state=*/true,
-                         /*use_qk_l2norm=*/true);
+      chunk_kda->forward_raw_gate(q,
+                                  k,
+                                  v,
+                                  raw_gate,
+                                  a_log,
+                                  dt_bias,
+                                  /*gate_lower_bound=*/-5.0f,
+                                  raw_beta,
+                                  initial_state,
+                                  cu_seqlens,
+                                  chunk_indices,
+                                  /*output_final_state=*/true,
+                                  /*use_qk_l2norm=*/true);
   (void)warmup_output;
   (void)warmup_state;
   torch_mlu::synchronize();
   const auto chunk_begin = std::chrono::steady_clock::now();
   auto [actual_output, actual_state] =
-      chunk_kda->forward(q,
-                         k,
-                         v,
-                         log_gate,
-                         activated_beta,
-                         initial_state,
-                         cu_seqlens,
-                         chunk_indices,
-                         /*output_final_state=*/true,
-                         /*use_qk_l2norm=*/true);
+      chunk_kda->forward_raw_gate(q,
+                                  k,
+                                  v,
+                                  raw_gate,
+                                  a_log,
+                                  dt_bias,
+                                  /*gate_lower_bound=*/-5.0f,
+                                  raw_beta,
+                                  initial_state,
+                                  cu_seqlens,
+                                  chunk_indices,
+                                  /*output_final_state=*/true,
+                                  /*use_qk_l2norm=*/true);
   torch_mlu::synchronize();
   const auto chunk_elapsed =
       std::chrono::duration_cast<std::chrono::microseconds>(
@@ -801,10 +864,15 @@ TEST(Glm5NextKDATest,
           (torch::randn(input_shape, fp32_options) * 0.1f).to(torch::kBFloat16);
       torch::Tensor v =
           (torch::randn(input_shape, fp32_options) * 0.1f).to(torch::kBFloat16);
-      torch::Tensor log_gate =
-          -(torch::rand({total_tokens, num_heads, kHeadDim}, fp32_options) *
-                0.02f +
-            0.005f);
+      const torch::Tensor raw_gate =
+          torch::randn({total_tokens, num_heads, kHeadDim}, fp32_options) *
+              0.1f -
+          6.0f;
+      const torch::Tensor a_log = torch::zeros({num_heads}, fp32_options);
+      const torch::Tensor dt_bias =
+          torch::zeros({num_heads * kHeadDim}, fp32_options);
+      const torch::Tensor log_gate =
+          glm5_next_safe_gate(raw_gate, a_log, dt_bias, /*lower_bound=*/-5.0f);
       torch::Tensor raw_beta =
           torch::randn({total_tokens, num_heads}, fp32_options) * 0.1f;
       torch::Tensor initial_state =
@@ -841,16 +909,19 @@ TEST(Glm5NextKDATest,
       kernel::mlu::ChunkKDA chunk_kda(num_heads);
       chunk_kda->to(device);
       auto [actual_output, actual_state] =
-          chunk_kda->forward(q,
-                             k,
-                             v,
-                             log_gate,
-                             torch::sigmoid(raw_beta),
-                             initial_state,
-                             cu_seqlens,
-                             chunk_indices,
-                             /*output_final_state=*/true,
-                             use_qk_l2norm);
+          chunk_kda->forward_raw_gate(q,
+                                      k,
+                                      v,
+                                      raw_gate,
+                                      a_log,
+                                      dt_bias,
+                                      /*gate_lower_bound=*/-5.0f,
+                                      raw_beta,
+                                      initial_state,
+                                      cu_seqlens,
+                                      chunk_indices,
+                                      /*output_final_state=*/true,
+                                      use_qk_l2norm);
       torch_mlu::synchronize();
 
       EXPECT_TRUE(torch::allclose(actual_output.squeeze(/*dim=*/0),
@@ -922,13 +993,15 @@ TEST(Glm5NextKDATest, ChunkPrefillStateFeedsExistingDecodeKernel) {
                                           /*use_qk_l2norm=*/true));
   kernel::mlu::ChunkKDA chunk_kda(kNumHeads);
   chunk_kda->to(device);
-  auto [prefill_output, prefill_state] = chunk_kda->forward(
+  auto [prefill_output, prefill_state] = chunk_kda->forward_raw_gate(
       q.slice(/*dim=*/1, /*start=*/0, /*end=*/kPrefillTokens),
       k.slice(/*dim=*/1, /*start=*/0, /*end=*/kPrefillTokens),
       v.slice(/*dim=*/1, /*start=*/0, /*end=*/kPrefillTokens),
-      log_gate.slice(/*dim=*/0, /*start=*/0, /*end=*/kPrefillTokens),
-      torch::sigmoid(
-          raw_beta.slice(/*dim=*/0, /*start=*/0, /*end=*/kPrefillTokens)),
+      raw_gate.slice(/*dim=*/0, /*start=*/0, /*end=*/kPrefillTokens),
+      a_log,
+      dt_bias,
+      /*gate_lower_bound=*/-5.0f,
+      raw_beta.slice(/*dim=*/0, /*start=*/0, /*end=*/kPrefillTokens),
       initial_state,
       prefill_cu_seqlens,
       chunk_indices,
@@ -996,11 +1069,12 @@ TEST(Glm5NextKDATest, CorrelatedKeysRemainStableAcrossSafeGateRange) {
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
   const auto bf16_options = fp32_options.dtype(torch::kBFloat16);
   const auto int_options = fp32_options.dtype(torch::kInt32);
+  const torch::Tensor a_log = torch::zeros({kNumHeads}, fp32_options);
+  const torch::Tensor dt_bias =
+      torch::zeros({kNumHeads * kHeadDim}, fp32_options);
   kernel::mlu::ChunkKDA chunk_kda(kNumHeads);
 
-  // Correlated keys expose cancellation; strong decay exposes exponential
-  // overflow. A full-chunk inverse must preserve this well-conditioned
-  // recurrence.
+  // Correlated keys and extreme gate logits stress cancellation and decay.
   for (const int64_t tokens : {64, 128}) {
     SCOPED_TRACE(tokens);
     const torch::Tensor q =
@@ -1014,15 +1088,16 @@ TEST(Glm5NextKDATest, CorrelatedKeysRemainStableAcrossSafeGateRange) {
     const torch::Tensor chunk_indices = make_chunk_indices(
         cu_seqlens,
         kernel::mlu::kda_prefill_chunk_size(kNumHeads, /*use_qk_l2norm=*/true));
-    for (const float decay : {0.0f, -1.0e-4f, -5.0f}) {
-      SCOPED_TRACE(decay);
+    for (const float gate_logit : {-100.0f, -10.0f, 100.0f}) {
+      SCOPED_TRACE(gate_logit);
+      const torch::Tensor raw_gate =
+          torch::full({tokens, kNumHeads, kHeadDim}, gate_logit, fp32_options);
       const torch::Tensor log_gate =
-          torch::full({tokens, kNumHeads, kHeadDim}, decay, fp32_options);
+          glm5_next_safe_gate(raw_gate, a_log, dt_bias, /*lower_bound=*/-5.0f);
       for (const float beta_logit : {100.0f, std::log(99.0f)}) {
         SCOPED_TRACE(beta_logit);
         const torch::Tensor raw_beta =
             torch::full({tokens, kNumHeads}, beta_logit, fp32_options);
-        const torch::Tensor beta = torch::sigmoid(raw_beta);
         auto [expected_output, expected_state] =
             glm5_next_kda_eager_recurrence(q,
                                            k,
@@ -1032,16 +1107,19 @@ TEST(Glm5NextKDATest, CorrelatedKeysRemainStableAcrossSafeGateRange) {
                                            initial_state,
                                            /*l2norm_qk=*/true);
         auto [actual_output, actual_state] =
-            chunk_kda->forward(q,
-                               k,
-                               v,
-                               log_gate,
-                               beta,
-                               initial_state,
-                               cu_seqlens,
-                               chunk_indices,
-                               /*output_final_state=*/true,
-                               /*use_qk_l2norm=*/true);
+            chunk_kda->forward_raw_gate(q,
+                                        k,
+                                        v,
+                                        raw_gate,
+                                        a_log,
+                                        dt_bias,
+                                        /*gate_lower_bound=*/-5.0f,
+                                        raw_beta,
+                                        initial_state,
+                                        cu_seqlens,
+                                        chunk_indices,
+                                        /*output_final_state=*/true,
+                                        /*use_qk_l2norm=*/true);
         EXPECT_TRUE(torch::isfinite(actual_output).all().item<bool>());
         EXPECT_TRUE(torch::isfinite(actual_state).all().item<bool>());
         EXPECT_TRUE(torch::allclose(
@@ -1079,10 +1157,8 @@ TEST(Glm5NextKDATest, PrefillFeedsIndexedMtpCheckpointsAcrossRaggedRequests) {
   const torch::Tensor prefill_v = torch::randn_like(prefill_q);
   const torch::Tensor prefill_raw_gate =
       torch::randn({kSequences, kNumHeads, kHeadDim}, bf16_options);
-  const torch::Tensor prefill_gate =
-      glm5_next_safe_gate(prefill_raw_gate, a_log, bias, /*lower_bound=*/-5.0f);
-  const torch::Tensor prefill_beta =
-      torch::sigmoid(torch::randn({kSequences, kNumHeads}, fp32_options));
+  const torch::Tensor prefill_raw_beta =
+      torch::randn({kSequences, kNumHeads}, bf16_options);
   const torch::Tensor initial_state =
       torch::randn({kSequences, kNumHeads, kHeadDim, kHeadDim}, fp32_options) *
       0.03f;
@@ -1092,16 +1168,19 @@ TEST(Glm5NextKDATest, PrefillFeedsIndexedMtpCheckpointsAcrossRaggedRequests) {
       kernel::mlu::kda_prefill_chunk_size(kNumHeads, /*use_qk_l2norm=*/true));
   kernel::mlu::ChunkKDA chunk_kda(kNumHeads);
   auto [prefill_output, prefill_state] =
-      chunk_kda->forward(prefill_q,
-                         prefill_k,
-                         prefill_v,
-                         prefill_gate,
-                         prefill_beta,
-                         initial_state,
-                         prefill_cu,
-                         chunk_indices,
-                         /*output_final_state=*/true,
-                         /*use_qk_l2norm=*/true);
+      chunk_kda->forward_raw_gate(prefill_q,
+                                  prefill_k,
+                                  prefill_v,
+                                  prefill_raw_gate,
+                                  a_log,
+                                  bias,
+                                  /*gate_lower_bound=*/-5.0f,
+                                  prefill_raw_beta,
+                                  initial_state,
+                                  prefill_cu,
+                                  chunk_indices,
+                                  /*output_final_state=*/true,
+                                  /*use_qk_l2norm=*/true);
   ASSERT_TRUE(torch::isfinite(prefill_output).all().item<bool>());
   ASSERT_TRUE(torch::isfinite(prefill_state).all().item<bool>());
 

@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "core/common/constants.h"
 #include "framework/state_dict/utils.h"
+#include "kernels/mlu/bangc/include/bangc_kda_norm_gate_api.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
 #include "layers/mlu/qwen3_5/qwen3_5_gated_delta_net.h"
@@ -268,7 +269,7 @@ Glm5NextKDAImpl::Glm5NextKDAImpl(const ModelArgs& args,
                                  const ParallelArgs& parallel_args,
                                  const torch::TensorOptions& options,
                                  float gate_lower_bound)
-    : gate_lower_bound_(gate_lower_bound) {
+    : gate_lower_bound_(gate_lower_bound), norm_eps_(args.rms_norm_eps()) {
   (void)quant_args;
   CHECK(parallel_args.tp_group_ != nullptr);
   tp_size_ = parallel_args.tp_group_->world_size();
@@ -629,10 +630,7 @@ torch::Tensor Glm5NextKDAImpl::forward(
     torch::Tensor initial_state = ssm_cache.index({read_base_indices});
     initial_state.index_put_(
         {~attn_metadata.has_initial_states, torch::indexing::Ellipsis}, 0.0f);
-    CHECK(attn_metadata.chunk_indices.defined())
-        << "GLM5-Next KDA prefill requires chunk indices";
     torch::Tensor cu_seqlens = attn_metadata.q_cu_seq_lens.contiguous();
-    torch::Tensor chunk_indices = attn_metadata.chunk_indices.contiguous();
     torch::Tensor final_state;
     // Feed the pre-activation gate/beta so the optimized chunk path applies
     // the safe-gate formula and the beta sigmoid inside its kernels instead
@@ -648,7 +646,7 @@ torch::Tensor Glm5NextKDAImpl::forward(
                                      beta,
                                      initial_state,
                                      cu_seqlens,
-                                     chunk_indices,
+                                     /*chunk_indices=*/torch::Tensor(),
                                      /*output_final_state=*/true,
                                      /*use_qk_l2norm=*/true);
     core_output = core_output.squeeze(/*dim=*/0).contiguous();
@@ -689,8 +687,15 @@ torch::Tensor Glm5NextKDAImpl::forward(
 
   core_output = core_output.view({-1, head_dim_});
   output_gate = output_gate.view({-1, head_dim_});
-  torch::Tensor normalized = o_norm_->forward(core_output);
-  normalized = glm5_next_kda_apply_output_gate(normalized, output_gate);
+  auto fused_output = kernel::mlu::bangc_kda_norm_gate(
+      core_output, output_gate, o_norm_->weight(), norm_eps_);
+  torch::Tensor normalized;
+  if (fused_output.has_value()) {
+    normalized = std::move(*fused_output);
+  } else {
+    normalized = o_norm_->forward(core_output);
+    normalized = glm5_next_kda_apply_output_gate(normalized, output_gate);
+  }
   normalized = normalized.view({num_tokens, local_projection_size_});
   return o_proj_->forward(normalized);
 }

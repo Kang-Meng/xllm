@@ -42,6 +42,7 @@ cc_test(
 cc_test(
   NAME
     glm5_next_kda_test
+  RUN_SERIAL
   SRCS
     glm5_next_kda_test.cpp
   DEPS
@@ -57,12 +58,13 @@ cc_test(
     torch
     GTest::gtest_main
   ENVIRONMENT
-    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH};OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
 )
 
 cc_test(
   NAME
     glm5_next_decoder_layer_test
+  RUN_SERIAL
   SRCS
     glm5_next_decoder_layer_test.cpp
   DEPS
@@ -78,6 +80,8 @@ cc_test(
     glog::glog
     torch
     GTest::gtest_main
+  ENVIRONMENT
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH};OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
 )
 
 cc_test(
@@ -95,6 +99,7 @@ cc_test(
 cc_test(
   NAME
     glm5_next_kpool_indexer_test
+  RUN_SERIAL
   SRCS
     glm5_next_kpool_indexer_test.cpp
   DEPS
@@ -112,7 +117,7 @@ cc_test(
     torch
     GTest::gtest_main
   ENVIRONMENT
-    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
+    "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH};OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
 )
 
 # Add test for MLU layers

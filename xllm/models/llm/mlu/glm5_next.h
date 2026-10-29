@@ -102,8 +102,10 @@ inline std::optional<layer::glm5_next_pcp::Context> prepare_context(
   context.local_metadata.max_query_len = context.local_max_query_len;
   context.local_metadata.slot_mapping =
       layer::glm5_next_pcp::shard_rows(metadata.slot_mapping, context);
-  layer::AttentionMetadataBuilder::build_linear_prefill(context.local_metadata,
-                                                        chunk_size);
+  layer::AttentionMetadataBuilder::build_linear_prefill(
+      context.local_metadata,
+      chunk_size,
+      /*build_chunk_indices=*/false);
   hidden_states = layer::glm5_next_pcp::shard_rows(hidden_states, context);
   positions = layer::glm5_next_pcp::shard_rows(positions, context);
   return context;
@@ -340,7 +342,8 @@ class Glm5NextModelImpl final
       layer::AttentionMetadataBuilder::build_linear_prefill(
           metadata,
           kernel::mlu::kda_prefill_chunk_size(local_linear_heads_,
-                                              /*use_qk_l2norm=*/true));
+                                              /*use_qk_l2norm=*/true),
+          /*build_chunk_indices=*/false);
     }
   }
 

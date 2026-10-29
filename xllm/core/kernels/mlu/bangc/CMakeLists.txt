@@ -67,17 +67,19 @@ set(XLLM_DCP_INDEXER_SOURCE
 list(REMOVE_ITEM XLLM_BANGC_KERNEL_SOURCES "${XLLM_DCP_INDEXER_SOURCE}")
 bang_add_library(xllm_mlu_dcp_indexer_kernel STATIC "${XLLM_DCP_INDEXER_SOURCE}"
   OPTIONS RELEASE -O2 RELWITHDEBINFO -O2 MINSIZEREL -O2)
-bang_add_library(xllm_mlu_bangc_kernels STATIC ${XLLM_BANGC_KERNEL_SOURCES})
 bang_add_library(xllm_mlu_dflash2_conv_kernels STATIC ${XLLM_DFLASH2_CONV_SOURCES}
   OPTIONS -Xbang-cnas -fno-instruction-combine)
-foreach(bangc_target xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels
+foreach(bangc_target xllm_mlu_dflash2_conv_kernels
     xllm_mlu_dcp_merge_kernel xllm_mlu_dcp_indexer_kernel)
   target_include_directories(${bangc_target} PRIVATE
     "${PROJECT_SOURCE_DIR}/xllm/core" "${NEUWARE_HOME}/include")
   set_target_properties(${bangc_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
-add_library(xllm_mlu_ops SHARED ${XLLM_BANGC_API_SOURCES})
+# KDA's C++ callers also use its public queue-based launchers. Compile native
+# objects directly into this library so --exclude-libs does not hide them.
+bang_add_library(xllm_mlu_ops SHARED
+  ${XLLM_BANGC_API_SOURCES} ${XLLM_BANGC_KERNEL_SOURCES})
 add_library(xllm::mlu_ops ALIAS xllm_mlu_ops)
 target_include_directories(xllm_mlu_ops
   PUBLIC
@@ -88,7 +90,7 @@ target_compile_definitions(xllm_mlu_ops PUBLIC
   "_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}")
 target_link_libraries(xllm_mlu_ops
   PUBLIC torch
-  PRIVATE xllm_mlu_bangc_kernels xllm_mlu_dflash2_conv_kernels
+  PRIVATE xllm_mlu_dflash2_conv_kernels
     xllm_mlu_dcp_merge_kernel xllm_mlu_dcp_indexer_kernel torch_mlu glog::glog
     ${XLLM_BANGC_CNRT_LIBRARY})
 # Keep private archive symbols local, including glog/gflags registries that

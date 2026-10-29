@@ -754,49 +754,19 @@ class ExtBuildSingleTest(ExtBuild):
         build_args += ["--target", self.test_name]
         subprocess.check_call(["cmake", "--build", ".", "--verbose"] + build_args, cwd=cmake_dir)
 
-        # Find test executable
-        # CMake usually places executables in CMAKE_RUNTIME_OUTPUT_DIRECTORY or build directory
-        test_executable: str | None = None
-        possible_paths: list[str] = [
-            os.path.join(cmake_dir, self.test_name),
-            os.path.join(extdir, self.test_name),
-            os.path.join(cmake_dir, "xllm", "core", self.test_name),
-        ]
-
-        # Check possible paths first
-        for path in possible_paths:
-            if os.path.exists(path) and os.access(path, os.X_OK):
-                test_executable = path
-                break
-
-        # If not found, try recursive search in build directory
-        if not test_executable:
-            for root, dirs, files in os.walk(cmake_dir):
-                if self.test_name in files:
-                    candidate = os.path.join(root, self.test_name)
-                    if os.access(candidate, os.X_OK):
-                        test_executable = candidate
-                        break
-
         env = prepare_test_environment(env, cmake_dir)
         logger.info(f"Test Torch extensions cache: {env['TORCH_EXTENSIONS_DIR']}")
-        if not test_executable:
-            # If not found, try using ctest to run
-            logger.warning(f"⚠️  Could not find test executable {self.test_name}, trying ctest...")
-            try:
-                subprocess.check_call(["ctest", "-R", self.test_name, "--verbose"], cwd=cmake_dir, env=env)
-                logger.info(f"✅ Test {self.test_name} passed!")
-            except subprocess.CalledProcessError:
-                logger.exception(f"❌ Failed to run test {self.test_name}")
-                raise
-        else:
-            logger.info(f"🚀 Running test: {test_executable}")
-            try:
-                subprocess.check_call([test_executable], cwd=os.path.dirname(test_executable), env=env)
-                logger.info(f"✅ Test {self.test_name} passed!")
-            except subprocess.CalledProcessError as e:
-                logger.exception(f"❌ Test {self.test_name} failed with exit code {e.returncode}")
-                raise
+        logger.info(f"Running CTest cases for target: {self.test_name}")
+        try:
+            subprocess.check_call(
+                ["ctest", "-L", f"^target:{re.escape(self.test_name)}$", "--no-tests=error", "--verbose"],
+                cwd=cmake_dir,
+                env=env,
+            )
+            logger.info(f"✅ Test {self.test_name} passed!")
+        except subprocess.CalledProcessError as e:
+            logger.exception(f"❌ Test {self.test_name} failed with exit code {e.returncode}")
+            raise
 
 
 class BuildDistWheel(bdist_wheel):
