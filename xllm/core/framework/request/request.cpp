@@ -84,6 +84,19 @@ Request::Request(const std::string& request_id,
   create_sequences_group();
 }
 
+Request::~Request() {
+  if (!VLOG_IS_ON(1)) {
+    return;
+  }
+  const RequestTokenCounts counts = request_tokens_.snapshot();
+  if (counts.enabled) {
+    VLOG(1) << "record_type: request_token_summary, request_id: " << request_id_
+            << ", service_request_id: " << service_request_id_
+            << ", input_tokens: " << counts.input_tokens
+            << ", output_tokens: " << counts.output_tokens;
+  }
+}
+
 void Request::create_sequences_group() {
   SequenceParams sequence_params;
   sequence_params.seq_capacity = state_.seq_capacity;
@@ -134,6 +147,59 @@ void Request::reset() {
     if (sequence != nullptr) {
       sequence->reset();
     }
+  }
+}
+
+void Request::record_token_admission() {
+  if (offline() || state_.is_graph_warmup) {
+    return;
+  }
+  const uint64_t delta = request_tokens_.admit(state_.prompt_tokens.size());
+  COUNTER_ADD(request_input_tokens_total, delta);
+  if (delta > 0) {
+    VLOG(1) << "record_type: request_tokens, request_id: " << request_id_
+            << ", event: admission, input_delta: " << delta
+            << ", output_delta: 0";
+  }
+}
+
+void Request::enable_forwarded_token_output() {
+  request_tokens_.forward(state_.stream);
+}
+
+void Request::record_token_output(const RequestOutput& output, bool submitted) {
+  if (!request_tokens_.enabled()) {
+    return;
+  }
+  if (output.cancelled || (output.status.has_value() && !output.status->ok()) ||
+      (!state_.stream && output.finished_on_prefill_instance)) {
+    return;
+  }
+  const bool per_sequence_submission = output.token_submission_tracked;
+  if (!per_sequence_submission) {
+    // Custom/batch callbacks acknowledge the whole output via their bool.
+    // Successfully submitting an error response is not a token submission.
+    if (!submitted || (state_.call_.has_value() &&
+                       state_.call_.value()->has_response_error())) {
+      return;
+    }
+  }
+  // HTTP streaming acknowledges each sequence separately. A later write may
+  // return false without invalidating earlier confirmed deltas.
+  token_progress_buf_.clear();
+  token_progress_buf_.reserve(output.outputs.size());
+  for (const SequenceOutput& sequence : output.outputs) {
+    if (per_sequence_submission && !sequence.token_submission_confirmed) {
+      continue;
+    }
+    token_progress_buf_.emplace_back(
+        OutputTokenProgress{sequence.index, sequence.generated_token_count});
+  }
+  const uint64_t delta = request_tokens_.commit(token_progress_buf_);
+  COUNTER_ADD(request_output_tokens_total, delta);
+  if (delta > 0) {
+    VLOG(1) << "record_type: request_tokens, request_id: " << request_id_
+            << ", event: submission, input_delta: 0, output_delta: " << delta;
   }
 }
 

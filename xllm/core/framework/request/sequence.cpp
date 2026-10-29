@@ -675,6 +675,7 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
   const auto ids = Slice<int32_t>(tokens_, size);
 
   SequenceOutput output;
+  output.generated_token_count = num_committed_generated_tokens();
   if (is_onerec_model()) {
     generate_onerec_streaming_output(ids, size, output);
     return output;
@@ -775,6 +776,8 @@ void Sequence::generate_sample_outputs(std::vector<SequenceOutput>& outputs,
     }
 
     output.text = output.logprobs->front().token;
+    // Sample slots are one-shot outputs keyed by sample_id, not decode steps.
+    output.generated_token_count = 1;
     fill_ctc_output(tokenizer, output);
     outputs.push_back(std::move(output));
   }
@@ -857,6 +860,8 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   // we need to ignore these '-1' tokens.
   const auto ids = tokens();
   const size_t size = num_valid_tokens();
+
+  output.generated_token_count = num_committed_generated_tokens();
 
   // 3. generate onerec output
   if (is_onerec_model()) {
@@ -958,7 +963,12 @@ void Sequence::fill_ctc_output(const Tokenizer& tokenizer,
 std::vector<Block> Sequence::get_inflight_blocks() const {
   const size_t token_boundary =
       std::min(kv_state_.kv_cache_tokens_num(), num_valid_tokens());
-  const size_t token_begin = token_boundary > 2 ? token_boundary - 2 : 0;
+  // Allow one token for overlap advancing the KV cursor past an in-flight
+  // write and one for MTP's preceding draft row; retain all future slots.
+  constexpr size_t kInflightTokenLookback = 2;
+  const size_t token_begin = token_boundary > kInflightTokenLookback
+                                 ? token_boundary - kInflightTokenLookback
+                                 : 0;
   std::vector<Block> retained;
   retained.reserve(kv_state_.blocks().size());
   for (const auto& [type, blocks] : kv_state_.blocks()) {

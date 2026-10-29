@@ -504,6 +504,7 @@ bool send_delta_to_client(
     const std::string& model,
     const RequestOutput& output,
     std::shared_ptr<StreamOutputParser> stream_parser = nullptr) {
+  output.token_submission_tracked = true;
   if (stream_parser && output.outputs.size() > 0) {
     stream_parser->check_resize_for_index(output.outputs.size() - 1);
   }
@@ -511,6 +512,7 @@ bool send_delta_to_client(
   std::string finish_reason = "";
   bool has_tool_call = false;
   for (const auto& seq_output : output.outputs) {
+    auto submission = call->token_submission();
     const auto& index = seq_output.index;
     std::string cur_text = seq_output.text;
 
@@ -568,6 +570,10 @@ bool send_delta_to_client(
     }
 
     // Handle finish reason
+    if (!submission.commit()) {
+      return false;
+    }
+    seq_output.token_submission_confirmed = true;
     if (seq_output.finish_reason.has_value()) {
       // Check for unstreamed tool args before sending finish reason
       if (stream_parser && stream_parser->get_has_tool_call(index)) {

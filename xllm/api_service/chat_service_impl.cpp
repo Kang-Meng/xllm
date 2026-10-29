@@ -224,12 +224,16 @@ bool send_delta_to_client_brpc(
     const RequestOutput& output,
     std::shared_ptr<StreamOutputParser> stream_parser = nullptr) {
   auto& response = call->response();
+  output.token_submission_tracked = true;
 
   if (stream_parser && output.outputs.size() > 0) {
     stream_parser->check_resize_for_index(output.outputs.size() - 1);
   }
   // send delta to client
   for (const auto& seq_output : output.outputs) {
+    auto submission = call->token_submission();
+    // Writes stage SSE here; checks still catch serialization/closed-stream
+    // failures. Transport submission is acknowledged only by commit().
     const auto& index = seq_output.index;
     std::string cur_text = seq_output.text;
 
@@ -261,12 +265,14 @@ bool send_delta_to_client_brpc(
           cur_text = "";
         }
         if (result.reasoning_text.has_value()) {
-          send_reasoning_text_chunk(call,
-                                    index,
-                                    result.reasoning_text.value(),
-                                    request_id,
-                                    created_time,
-                                    model);
+          if (!send_reasoning_text_chunk(call,
+                                         index,
+                                         result.reasoning_text.value(),
+                                         request_id,
+                                         created_time,
+                                         model)) {
+            return false;
+          }
         }
       }
     }
@@ -299,6 +305,11 @@ bool send_delta_to_client_brpc(
         }
       }
     }
+
+    if (!submission.commit()) {
+      return false;
+    }
+    seq_output.token_submission_confirmed = true;
 
     // Handle finish reason
     if (seq_output.finish_reason.has_value()) {

@@ -707,6 +707,8 @@ void DisaggPDScheduler::dispatch_requests() {
       // proto::DisaggRequest req;
       auto req = reqs.mutable_reqs()->Add();
       req->set_req_id(requests[i]->request_id());
+      req->set_request_token_accounting(
+          requests[i]->token_accounting_enabled());
       req->set_reservation_id(requests[i]->state().pd_reservation_id);
       req->set_service_req_id(requests[i]->service_request_id());
       req->set_source_xservice_addr(requests[i]->source_xservice_addr());

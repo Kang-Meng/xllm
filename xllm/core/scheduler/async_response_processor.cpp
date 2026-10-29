@@ -152,7 +152,8 @@ void AsyncResponseProcessor::process_completed_request(
             *request, terminal, &generate_output_threadpool_, &req_output)) {
       return;
     }
-    request->state().output_func(req_output);
+    const bool submitted = request->state().output_func(req_output);
+    request->record_token_output(req_output, submitted);
   };
   if (request->state().response_thread_id < 0) {
     request->state().response_thread_id =
@@ -209,20 +210,32 @@ void AsyncResponseProcessor::batch_process_completed_requests(
         if (std::all_of(valid_outputs.begin(),
                         valid_outputs.end(),
                         [](uint8_t valid) { return valid != 0; })) {
-          resp_callback(request_outputs);
+          const std::vector<bool> submitted = resp_callback(request_outputs);
+          CHECK_EQ(submitted.size(), request_outputs.size());
+          for (size_t i = 0; i < requests.size(); ++i) {
+            requests[i]->record_token_output(request_outputs[i], submitted[i]);
+          }
           return;
         }
         std::vector<RequestOutput> outputs;
         outputs.reserve(request_outputs.size());
+        std::vector<size_t> request_indexes;
+        request_indexes.reserve(request_outputs.size());
         for (size_t i = 0; i < request_outputs.size(); ++i) {
           if (valid_outputs[i] != 0) {
             outputs.emplace_back(std::move(request_outputs[i]));
+            request_indexes.emplace_back(i);
           }
         }
         if (outputs.empty()) {
           return;
         }
-        resp_callback(outputs);
+        const std::vector<bool> submitted = resp_callback(outputs);
+        CHECK_EQ(submitted.size(), outputs.size());
+        for (size_t i = 0; i < outputs.size(); ++i) {
+          requests[request_indexes[i]]->record_token_output(outputs[i],
+                                                            submitted[i]);
+        }
       });
 }
 
@@ -292,7 +305,9 @@ void AsyncResponseProcessor::process_stream_request(
           req_output.outputs.push_back(std::move(seq_output.value()));
         }
       }
-      if (!request->state().output_func(req_output)) {
+      const bool submitted = request->state().output_func(req_output);
+      request->record_token_output(req_output, submitted);
+      if (!submitted) {
         cancel_request(request);
       }
     };
@@ -397,6 +412,7 @@ void AsyncResponseProcessor::batch_process_stream_requests(
         absl::ToDoubleMilliseconds(absl::Now() - wait_start_time);
     const absl::Time rpc_start_time = absl::Now();
     std::vector<bool> status_set = resp_callback(request_outputs);
+    CHECK_EQ(status_set.size(), request_outputs.size());
     if (!request_outputs.empty() &&
         request_outputs[0].finished_on_prefill_instance) {
       VLOG(1) << "Prefill response RPC request_id=" << requests[0]->request_id()
@@ -404,6 +420,7 @@ void AsyncResponseProcessor::batch_process_stream_requests(
               << absl::ToDoubleMilliseconds(absl::Now() - rpc_start_time);
     }
     for (size_t i = 0; i < requests.size(); ++i) {
+      requests[i]->record_token_output(request_outputs[i], status_set[i]);
       if (!status_set[i]) {
         cancel_request(requests[i]);
       }

@@ -15,14 +15,17 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
 
+#include "core/framework/request/request_token_accounting.h"
 #include "framework/request/incremental_decoder.h"
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
@@ -30,6 +33,39 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+TEST(RequestTokenAccountingTest, AdmissionAndCommitsAreIdempotent) {
+  RequestTokenAccounting accounting;
+  EXPECT_EQ(accounting.commit({{0, 5}}), 0u);
+  EXPECT_EQ(accounting.admit(/*input_tokens=*/17), 17u);
+  EXPECT_EQ(accounting.admit(/*input_tokens=*/17), 0u);
+  EXPECT_EQ(accounting.commit({{0, 2}, {1, 3}}), 5u);
+  EXPECT_EQ(accounting.commit({{0, 5}, {1, 3}}), 3u);
+  EXPECT_EQ(accounting.commit({{0, 5}, {1, 2}}), 0u);
+  EXPECT_EQ(accounting.commit({{0, 9}}), 4u);
+  EXPECT_EQ(accounting.snapshot().output_tokens, 12u);
+  EXPECT_EQ(accounting.snapshot().input_tokens, 17u);
+}
+
+TEST(RequestTokenAccountingTest, ConcurrentCommitCountsOnce) {
+  RequestTokenAccounting accounting;
+  std::atomic<uint64_t> input{0};
+  std::atomic<uint64_t> output{0};
+  std::vector<std::thread> threads;
+  threads.reserve(8);
+  for (uint64_t i = 1; i <= 8; ++i) {
+    threads.emplace_back([&accounting, &input, &output, i] {
+      input.fetch_add(accounting.admit(/*input_tokens=*/17));
+      output.fetch_add(accounting.commit({{0, i}}));
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(input.load(), 17u);
+  EXPECT_EQ(output.load(), 8u);
+  EXPECT_EQ(accounting.snapshot().output_tokens, 8u);
+}
 
 Sequence make_decode_ready_sequence(bool enable_schedule_overlap) {
   static RequestSamplingParam sampling_param;

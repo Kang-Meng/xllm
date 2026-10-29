@@ -316,6 +316,8 @@ bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
     return false;
   }
 
+  // Input counts admission, including requests that later fail or cancel.
+  request->record_token_admission();
   kv_cache_manager_->prefetch_from_storage(
       request, [this](std::shared_ptr<Request> completed) {
         const bool cancelled = completed->finished() || completed->cancelled();

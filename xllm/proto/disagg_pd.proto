@@ -91,6 +91,10 @@ message DisaggRequest {
   // Identifies this reservation even when callers reuse a request ID.
   string reservation_id = 42;
 
+  // Transfer output accounting only. Decode never counts forwarded input.
+  // False from older senders disables request token accounting on Decode.
+  bool request_token_accounting = 43;
+
 }
 
 // response for DisaggRequests from decode instance.

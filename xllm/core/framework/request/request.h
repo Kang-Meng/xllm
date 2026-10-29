@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "common.pb.h"
+#include "core/framework/request/request_token_accounting.h"
 #include "request_base.h"
 #include "request_state.h"
 #include "sequences_group.h"
@@ -47,6 +48,8 @@ class Request : public RequestBase {
           const std::string& source_xservice_addr = "",
           RateLimiter* rate_limiter = nullptr);
 
+  ~Request() override;
+
   bool finished() const;
 
   std::vector<std::unique_ptr<Sequence>>& sequences() {
@@ -62,6 +65,17 @@ class Request : public RequestBase {
 
   // Drop blocks that never entered a forward. The Request stays alive.
   void reset();
+
+  // Called after reserving ingress capacity, before publishing the request.
+  void record_token_admission();
+
+  // Response dispatch serializes callbacks and accounting for each Request.
+  void record_token_output(const RequestOutput& output, bool submitted);
+
+  // Only for Decode reconstructing an admitted PD request; no new input charge.
+  void enable_forwarded_token_output();
+
+  bool token_accounting_enabled() const { return request_tokens_.enabled(); }
 
   std::optional<Status> error_status() const;
 
@@ -205,6 +219,9 @@ class Request : public RequestBase {
   }
 
  private:
+  RequestTokenAccounting request_tokens_;
+  // Reuse capacity across the serialized response deltas of this request.
+  std::vector<OutputTokenProgress> token_progress_buf_;
   RequestState state_;
   std::shared_ptr<RequestFailureState> failure_state_ =
       std::make_shared<RequestFailureState>();

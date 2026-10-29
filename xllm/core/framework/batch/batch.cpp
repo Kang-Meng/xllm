@@ -206,6 +206,8 @@ void Batch::add(Sequence* sequence, uint32_t allowed_max_token) {
 
 void Batch::add(SequencesGroup* sequence_group) {
   sequence_groups_.push_back(sequence_group);
+  // BatchFactory adds active beam sequences first, already retaining their
+  // blocks; REC adds groups only and must retain their sequences here.
   if (!sequences_.empty()) {
     return;
   }

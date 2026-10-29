@@ -88,6 +88,16 @@ struct SequenceOutput {
   // Decoded CTC text and mean confidence (omni-duplex only).
   std::optional<std::string> text_ctc;
   std::optional<float> confidence_ctc;
+
+  // Request-lifetime cumulative snapshot per sequence; one-shot sample slots
+  // use 0 or 1. Excludes prompt, drafts and overlap placeholders, but includes
+  // confirmed tokens hidden by decoding or stop rules. Internal only.
+  uint64_t generated_token_count = 0;
+
+  // HTTP streaming handlers acknowledge each completed sequence delta, so a
+  // later write failure does not discard earlier deltas in the same callback.
+  // Same-thread receipt; see RequestOutput's callback-scoped contract below.
+  mutable bool token_submission_confirmed = false;
 };
 
 struct RequestOutput {
@@ -132,11 +142,22 @@ struct RequestOutput {
 
   // whether the request is cancelled.
   bool cancelled = false;
+
+  // Callback-scoped receipts are non-atomic: HTTP writes and accounting reads
+  // must run synchronously on the same thread; the payload stays read-only.
+  // Custom callbacks use their bool return instead. Internal, not on the wire.
+  mutable bool token_submission_tracked = false;
 };
 
-// callback function for output, return true to continue, false to stop/cancel
-using OutputCallback = std::function<bool(RequestOutput output)>;
+// Borrow the response so HTTP receipts survive the OutputFunc adapter without
+// copying. Callbacks retaining/moving the payload must make their own copy.
+// Value-taking callbacks remain valid: std::function copies for them.
+// C++ clients must rebuild against this callback signature.
+// Return true to continue, false to stop/cancel.
+using OutputCallback = std::function<bool(const RequestOutput& output)>;
 
+// Custom batch callbacks intentionally receive a copy: accounting uses their
+// aggregate bool, not HTTP per-sequence receipts written into that copy.
 using BatchOutputCallback =
     std::function<bool(size_t index, RequestOutput output)>;
 

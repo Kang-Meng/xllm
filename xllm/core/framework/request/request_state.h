@@ -36,6 +36,10 @@ limitations under the License.
 namespace xllm {
 
 using OutputFunc = std::function<bool(const RequestOutput& output)>;
+// One submission result per input, in input order. Response processors CHECK
+// this contract because a size mismatch cannot be mapped safely to requests.
+// Custom callbacks must also return outputs.size() entries, using false for
+// individual failures rather than shortening the result vector.
 using OutputsFunc =
     std::function<std::vector<bool>(const std::vector<RequestOutput>& outputs)>;
 

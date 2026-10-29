@@ -64,6 +64,8 @@ class Call {
 
   virtual bool is_disconnected() const = 0;
 
+  bool has_response_error() const { return error_status_.has_value(); }
+
  protected:
   void init(std::string body_x_request_id, bool is_http_request);
   void record_result(bool connected,

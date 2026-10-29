@@ -249,6 +249,11 @@ DEFINE_COUNTER(num_processing_tokens_total_prompt,
                "Total number of processing prompt tokens");
 DEFINE_COUNTER(num_processing_tokens_total_generated,
                "Total number of processing generated tokens");
+DEFINE_COUNTER(request_input_tokens_total,
+               "Prompt tokens counted once at online request admission");
+DEFINE_COUNTER(request_output_tokens_total,
+               "Confirmed generated tokens in accepted online response deltas, "
+               "including tokens hidden by decoding or stop rules");
 
 DEFINE_HISTOGRAM(num_prompt_tokens_per_request,
                  "Histogram of the prompt token number per request");

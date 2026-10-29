@@ -5,6 +5,7 @@ cc_library(
   NAME 
     request
   HDRS
+    request_token_accounting.h
     dit_request.h
     dit_input_sources.h
     dit_source_decoder.h

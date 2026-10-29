@@ -65,8 +65,10 @@ bool send_delta_to_client_brpc(std::shared_ptr<CompletionCall> call,
                                const std::string& model,
                                const RequestOutput& output) {
   auto& response = call->response();
+  output.token_submission_tracked = true;
 
   for (const auto& seq_output : output.outputs) {
+    auto submission = call->token_submission();
     if (!seq_output.text.empty()) {
       response.Clear();
       response.set_object("text_completion");
@@ -81,6 +83,11 @@ bool send_delta_to_client_brpc(std::shared_ptr<CompletionCall> call,
         return false;
       }
     }
+
+    if (!submission.commit()) {
+      return false;
+    }
+    seq_output.token_submission_confirmed = true;
 
     if (seq_output.finish_reason.has_value()) {
       response.Clear();

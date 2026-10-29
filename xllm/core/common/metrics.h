@@ -295,6 +295,12 @@ DECLARE_COUNTER(scheduling_latency_seconds);
 DECLARE_COUNTER(num_processing_tokens_total_prompt);
 DECLARE_COUNTER(num_processing_tokens_total_generated);
 
+// Online, non-warmup request tokens, not per-batch processing work. Count input
+// once and confirmed output in accepted response deltas (including hidden
+// tokens). PD instances hold separate counters; sum Prefill and Decode.
+DECLARE_COUNTER(request_input_tokens_total);
+DECLARE_COUNTER(request_output_tokens_total);
+
 DECLARE_HISTOGRAM(num_prompt_tokens_per_request);
 DECLARE_HISTOGRAM(num_generated_tokens_per_request);
 

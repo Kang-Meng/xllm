@@ -34,6 +34,7 @@ limitations under the License.
 #include "api_service/call.h"
 #include "api_service/public_error.h"
 #include "core/common/types.h"
+#include "core/util/scope_guard.h"
 #include "core/util/verbose_trace_logger.h"
 
 namespace xllm {
@@ -43,6 +44,58 @@ class StreamCall : public Call {
  public:
   using ReqType = Request;
   using ResType = Response;
+
+  // One model delta may become several SSE events after reasoning/tool parsing.
+  // Stage them until the entire delta is ready, then submit with one Write.
+  class TokenSubmission final {
+   public:
+    explicit TokenSubmission(StreamCall& call) : call_(call) {
+      CHECK(call_.active_token_submission_ == nullptr);
+      call_.active_token_submission_ = this;
+    }
+    ~TokenSubmission() {
+      if (call_.active_token_submission_ == this) {
+        call_.abort_token_submission();
+      }
+    }
+    // Scope-bound and intentionally immovable; C++20 guarantees return elision.
+    TokenSubmission(const TokenSubmission&) = delete;
+    TokenSubmission& operator=(const TokenSubmission&) = delete;
+
+    bool commit() {
+      CHECK(!commit_called_);
+      commit_called_ = true;
+      // An abort revokes ownership, even if this scope has not ended yet.
+      if (call_.active_token_submission_ != this) {
+        return false;
+      }
+      // Keep ownership through stream opening/publish; clear staged bytes on
+      // every exit, including exceptions, without swallowing the failure.
+      ScopeGuard submission_guard([this] {
+        if (call_.active_token_submission_ == this) {
+          call_.abort_token_submission();
+        }
+      });
+      if (call_.stream_finished_ || call_.is_disconnected() ||
+          call_.has_response_error()) {
+        return false;
+      }
+      if (call_.token_submission_buf_.empty()) {
+        // A delta with held-back/hidden text is accepted without an SSE write;
+        // acknowledgement tracks confirmed generation, not visible byte count.
+        return true;
+      }
+      call_.start_stream();
+      const bool connected = call_.publish(call_.token_submission_buf_);
+      return connected;
+    }
+
+   private:
+    StreamCall& call_;  // Non-owning; the call encloses the submission scope.
+    bool commit_called_ = false;
+  };
+
+  TokenSubmission token_submission() { return TokenSubmission(*this); }
 
   StreamCall(brpc::Controller* controller,
              ::google::protobuf::Closure* done,
@@ -113,6 +166,7 @@ class StreamCall : public Call {
   }
 
   bool finish_with_error(const Status& status) {
+    abort_token_submission();
     XLLM_VERBOSE_TRACE() << "event=request_error x-request-id=" << x_request_id_
                          << " message=" << status.message();
     if (stream_ && stream_finished_) {
@@ -145,7 +199,9 @@ class StreamCall : public Call {
 
   // Writes one SSE event ("data: {json}\n\n"). Stream chunks may use a
   // different proto type from the non-streaming response. Returns false on
-  // serialization failure or client disconnect.
+  // serialization failure or client disconnect. Inside TokenSubmission,
+  // success means staged; commit() acknowledges the entire response delta,
+  // including confirmed tokens whose text is held back or hidden.
   bool write(const google::protobuf::Message& message) {
     if (stream_finished_) {
       return false;
@@ -162,8 +218,7 @@ class StreamCall : public Call {
     }
     io_buf_.append("\n\n");
 
-    start_stream();
-    return publish();
+    return write_sse_event();
   }
 
   // For stream response
@@ -204,12 +259,28 @@ class StreamCall : public Call {
     return connection_status_.load(std::memory_order_relaxed) == 0;
   }
 
-  // Writes the staged io_buf_ to the progressive attachment and folds the
+  // Writes the staged buffer to the progressive attachment and folds the
   // result into the monotonic connection status. Callers must have opened the
   // stream (pa_ is valid) via start_stream() first.
-  bool publish() {
-    connection_status_.fetch_or(pa_->Write(io_buf_), std::memory_order_relaxed);
+  bool publish(butil::IOBuf& buf) {
+    connection_status_.fetch_or(pa_->Write(buf), std::memory_order_relaxed);
     return stream_connected();
+  }
+
+  bool publish() { return publish(io_buf_); }
+
+  bool write_sse_event() {
+    if (active_token_submission_ != nullptr) {
+      token_submission_buf_.append(io_buf_);
+      return true;
+    }
+    start_stream();
+    return publish();
+  }
+
+  void abort_token_submission() {
+    token_submission_buf_.clear();
+    active_token_submission_ = nullptr;
   }
 
   void start_stream() {
@@ -246,6 +317,9 @@ class StreamCall : public Call {
   bool use_arena_ = false;
   butil::intrusive_ptr<brpc::ProgressiveAttachment> pa_;
   butil::IOBuf io_buf_;
+  butil::IOBuf token_submission_buf_;
+  // Non-owning; submissions are immovable and stay within this call's lifetime.
+  TokenSubmission* active_token_submission_ = nullptr;
 
   json2pb::Pb2JsonOptions json_options_;
 
@@ -302,8 +376,7 @@ class AnthropicCall : public StreamCall<proto::AnthropicMessagesRequest,
     this->io_buf_.append(json_data);
     this->io_buf_.append("\n\n");
 
-    this->start_stream();
-    return this->publish();
+    return this->write_sse_event();
   }
 
   // Write SSE event with proto message
@@ -326,8 +399,7 @@ class AnthropicCall : public StreamCall<proto::AnthropicMessagesRequest,
     }
     this->io_buf_.append(json);
     this->io_buf_.append("\n\n");
-    this->start_stream();
-    return this->publish();
+    return this->write_sse_event();
   }
 };
 

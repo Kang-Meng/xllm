@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "api_service/call.h"
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -474,8 +475,12 @@ std::shared_ptr<Request> generate_request_with_best_of(
     int32_t max_tokens,
     int32_t max_context_len,
     size_t n,
-    size_t best_of) {
+    size_t best_of,
+    bool stream = false,
+    bool overlap = false,
+    const OutputCallback& callback = nullptr) {
   RequestSamplingParam sampling_param;
+  sampling_param.logprobs = best_of > n;
   SchedulerParam scheduler_param;
 
   StoppingChecker stopping_checker;
@@ -492,11 +497,11 @@ std::shared_ptr<Request> generate_request_with_best_of(
                          n,
                          best_of,
                          false,
+                         stream,
                          false,
                          false,
-                         false,
-                         false,
-                         nullptr,
+                         overlap,
+                         callback,
                          nullptr);
 
   return std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
@@ -523,6 +528,233 @@ void make_request_decode_ready(const std::shared_ptr<Request>& request) {
     Token token(1);
     seq->append_token(token);
   }
+}
+
+namespace {
+class ResponseErrorCall final : public Call {
+ public:
+  explicit ResponseErrorCall(brpc::Controller* controller) : Call(controller) {
+    record_error(Status(StatusCode::UNKNOWN, "response serialization failed"));
+  }
+
+  bool is_disconnected() const override { return false; }
+};
+
+class RequestTokenResponseTest : public ::testing::Test {
+ protected:
+  FakeTokenizer tokenizer_;
+  AsyncResponseProcessor processor_{
+      &tokenizer_,
+      std::nullopt,
+      /*enable_service_routing=*/true,
+      /*disable_log_stats=*/true,
+      [](std::shared_ptr<Request> request) { request->set_cancel(); }};
+};
+}  // namespace
+
+TEST_F(RequestTokenResponseTest, CountsOnlySubmittedSelectedTokens) {
+  enum class Admission { ONLINE, WARMUP, OFFLINE };
+  struct TestCase {
+    bool stream;
+    size_t best_of;
+    bool submitted;
+    bool partial;
+    bool cancel;
+    uint64_t expected;
+    Admission admission = Admission::ONLINE;
+    bool response_error = false;
+  };
+  const TestCase cases[] = {
+      {false, 2, false, false, false, 0},
+      {false, 3, true, false, false, 6},
+      {true, 2, true, false, false, 6},
+      {true, 2, false, true, false, 3},
+      {true, 2, true, false, true, 6},
+      {false, 2, true, false, false, 0, Admission::WARMUP},
+      {false, 2, true, false, false, 0, Admission::OFFLINE},
+      {false, 2, true, false, false, 0, Admission::ONLINE, true}};
+  for (const TestCase& test_case : cases) {
+    SCOPED_TRACE(test_case.expected);
+    // Use the production callback alias at the RequestState conversion
+    // boundary.
+    OutputCallback callback = [&test_case](const RequestOutput& output) {
+      if (test_case.partial && !output.outputs.empty()) {
+        output.token_submission_tracked = true;
+        output.outputs.front().token_submission_confirmed = true;
+      }
+      return test_case.submitted;
+    };
+    auto request = generate_request_with_best_of({1, 2, 3},
+                                                 /*max_tokens=*/64,
+                                                 /*max_context_len=*/128,
+                                                 /*n=*/2,
+                                                 test_case.best_of,
+                                                 test_case.stream,
+                                                 /*overlap=*/test_case.stream,
+                                                 callback);
+    brpc::Controller controller;
+    ResponseErrorCall error_call(&controller);
+    if (test_case.response_error) {
+      request->state().call_ = &error_call;
+    }
+    const double input_before = COUNTER_VALUE(request_input_tokens_total);
+    const double output_before = COUNTER_VALUE(request_output_tokens_total);
+    request->state().is_graph_warmup = test_case.admission == Admission::WARMUP;
+    request->state().scheduler_param.offline =
+        test_case.admission == Admission::OFFLINE;
+    request->record_token_admission();
+    request->reset();
+    request->record_token_admission();
+    request->expand_sequences(/*share_prefix=*/false);
+    for (int32_t i = 0; i < 3; ++i) {
+      make_request_decode_ready(request);
+    }
+    if (!test_case.cancel) {
+      for (const auto& sequence : request->sequences()) {
+        sequence->append_token(/*token_id=*/-1);
+        sequence->append_token(/*token_id=*/-1);
+      }
+    }
+    if (test_case.stream) {
+      processor_.process_stream_request(request);
+      processor_.wait_completion();
+      request->reset();
+      request->record_token_admission();
+      for (const auto& sequence : request->sequences()) {
+        EXPECT_EQ(sequence->num_committed_generated_tokens(), 3u);
+        // Simulate KV restoration before the next decode after preemption.
+        sequence->kv_state().set_kv_cache_tokens_num(sequence->num_tokens());
+      }
+    }
+    if (test_case.cancel) {
+      request->state().output_func = [](const RequestOutput&) { return false; };
+      for (const auto& sequence : request->sequences()) {
+        sequence->kv_state().set_kv_cache_tokens_num(sequence->num_tokens());
+        const Token token(/*token_id=*/1);
+        sequence->append_token(token);
+      }
+      processor_.process_stream_request(request);
+      processor_.wait_completion();
+      EXPECT_TRUE(request->cancelled());
+    }
+    for (const auto& sequence : request->sequences()) {
+      sequence->finish();
+    }
+    processor_.process_completed_request(request);
+    processor_.wait_completion();
+    EXPECT_EQ(COUNTER_VALUE(request_input_tokens_total) - input_before,
+              test_case.admission == Admission::ONLINE ? 3 : 0);
+    EXPECT_EQ(COUNTER_VALUE(request_output_tokens_total) - output_before,
+              test_case.expected);
+  }
+}
+
+TEST_F(RequestTokenResponseTest, BatchStreamingUsesEachSubmissionStatus) {
+  std::vector<std::shared_ptr<Request>> requests;
+  requests.reserve(2);
+  const double input_before = COUNTER_VALUE(request_input_tokens_total);
+  const double output_before = COUNTER_VALUE(request_output_tokens_total);
+  for (int32_t index = 0; index < 2; ++index) {
+    auto request = generate_request_with_best_of({1, 2, 3},
+                                                 /*max_tokens=*/64,
+                                                 /*max_context_len=*/128,
+                                                 /*n=*/1,
+                                                 /*best_of=*/1,
+                                                 /*stream=*/true);
+    request->record_token_admission();
+    for (int32_t token = 0; token < index + 2; ++token) {
+      make_request_decode_ready(request);
+    }
+    request->state().outputs_func =
+        [](const std::vector<RequestOutput>& outputs) {
+          EXPECT_EQ(outputs.size(), 2u);
+          for (const RequestOutput& output : outputs) {
+            EXPECT_FALSE(output.finished_on_prefill_instance);
+          }
+          return std::vector<bool>{true, false};
+        };
+    requests.emplace_back(std::move(request));
+  }
+  std::vector<std::shared_ptr<Request>> pending = requests;
+  processor_.batch_process_stream_requests(pending);
+  processor_.wait_completion();
+  EXPECT_EQ(COUNTER_VALUE(request_input_tokens_total) - input_before, 6);
+  EXPECT_EQ(COUNTER_VALUE(request_output_tokens_total) - output_before, 2);
+  EXPECT_FALSE(requests[0]->cancelled());
+  EXPECT_TRUE(requests[1]->cancelled());
+}
+
+TEST_F(RequestTokenResponseTest, PDCountsPromptAndCompletionOnce) {
+  for (const size_t n : {1u, 2u}) {
+    for (const bool stream : {false, true}) {
+      auto prefill = generate_request_with_best_of(
+          {1, 2, 3}, /*max_tokens=*/64, /*max_context_len=*/128, n, n, stream);
+      auto decode = generate_request_with_best_of(
+          {1, 2, 3}, /*max_tokens=*/64, /*max_context_len=*/128, n, n, stream);
+      prefill->state().output_func = decode->state().output_func =
+          [](const RequestOutput&) { return true; };
+      const double input_before = COUNTER_VALUE(request_input_tokens_total);
+      const double output_before = COUNTER_VALUE(request_output_tokens_total);
+      prefill->record_token_admission();
+      decode->enable_forwarded_token_output();
+      decode->record_token_admission();
+      // Prefill hands off index 0 only; Decode generates the other outputs.
+      ASSERT_EQ(prefill->sequences().size(), 1u);
+      decode->expand_sequences(/*share_prefix=*/false);
+      make_request_decode_ready(prefill);
+      for (int32_t i = 0; i < 6; ++i) {
+        make_request_decode_ready(decode);
+      }
+      if (stream) {
+        processor_.process_stream_request(prefill);
+        processor_.wait_completion();
+        decode->sequences()[0]->enable_checking_prefill_token();
+        processor_.process_stream_request(decode);
+      } else {
+        processor_.process_completed_request(prefill, /*terminal=*/false);
+        processor_.wait_completion();
+        for (const auto& sequence : decode->sequences()) {
+          sequence->finish();
+        }
+        processor_.process_completed_request(decode);
+      }
+      processor_.wait_completion();
+      EXPECT_EQ(COUNTER_VALUE(request_input_tokens_total) - input_before, 3);
+      EXPECT_EQ(COUNTER_VALUE(request_output_tokens_total) - output_before,
+                6 * n);
+    }
+  }
+}
+
+TEST_F(RequestTokenResponseTest, FilteredBatchUsesTheMatchingSubmissionStatus) {
+  auto requests = generate_request({3, 3, 3},
+                                   {64, 64, 64},
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   /*max_context_len=*/128);
+  // Distinct lengths expose status/index mixups after filtering.
+  make_request_decode_ready(requests[1]);
+  make_request_decode_ready(requests[2]);
+  make_request_decode_ready(requests[2]);
+  for (const auto& request : requests) {
+    make_request_decode_ready(request);
+    request->sequences()[0]->finish();
+    request->record_token_admission();
+  }
+  requests[0]->state().output_func = [](const RequestOutput&) { return true; };
+  requests[0]->state().outputs_func =
+      [](const std::vector<RequestOutput>& outputs) {
+        EXPECT_EQ(outputs.size(), 2u);
+        return std::vector<bool>{true, false};
+      };
+  processor_.process_completed_request(requests[0]);
+  processor_.wait_completion();
+  const double before = COUNTER_VALUE(request_output_tokens_total);
+  processor_.batch_process_completed_requests(requests);
+  processor_.wait_completion();
+  EXPECT_EQ(COUNTER_VALUE(request_output_tokens_total) - before, 2);
 }
 
 void set_chunk_kv(const std::shared_ptr<Request>& request, size_t kv_tokens) {
@@ -1294,6 +1526,7 @@ TEST(ContinuousSchedulerTest,
 }
 
 TEST(ContinuousSchedulerTest, PrefetchCompletesBeforeSchedulerQueueAdmission) {
+  const double input_before = COUNTER_VALUE(request_input_tokens_total);
   ContinuousScheduler::Options options =
       create_scheduler_options(64, 4, 0, 64, 1);
   auto engine = std::make_unique<FakeEngine>(64, 32);
@@ -1310,6 +1543,7 @@ TEST(ContinuousSchedulerTest, PrefetchCompletesBeforeSchedulerQueueAdmission) {
                        /*max_context_len=*/30000)[0];
 
   ASSERT_TRUE(scheduler->add_request(request));
+  EXPECT_EQ(COUNTER_VALUE(request_input_tokens_total) - input_before, 8);
   scheduler->report_queues();
   auto* prefetch_gauge =
       MULTI_GAUGE_scheduler_queue_requests.get_stats({"prefetch", "0"});
@@ -1523,6 +1757,7 @@ TEST(ContinuousSchedulerTest,
 }
 
 TEST(ContinuousSchedulerTest, QueueCapacityRejectsBeforePrefetchStarts) {
+  const double input_before = COUNTER_VALUE(request_input_tokens_total);
   ScopedConfigValue<int32_t> request_queue_size(
       RecConfig::get_instance().request_queue_size(), 1);
   ContinuousScheduler::Options options =
@@ -1546,6 +1781,7 @@ TEST(ContinuousSchedulerTest, QueueCapacityRejectsBeforePrefetchStarts) {
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 1u);
 
   EXPECT_FALSE(scheduler->add_request(requests[1]));
+  EXPECT_EQ(COUNTER_VALUE(request_input_tokens_total) - input_before, 8);
   EXPECT_EQ(engine->prefetch_calls(), 1u);
   engine->set_prefetch_ready(true);
   EXPECT_EQ(scheduler->scheduler_queue_size(), 1u);

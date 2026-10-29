@@ -30,6 +30,8 @@ limitations under the License.
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -42,6 +44,8 @@ limitations under the License.
 #include "api_service/stream_call.h"
 #include "chat.pb.h"
 #include "completion.pb.h"
+#include "core/common/metrics.h"
+#include "core/framework/request/request.h"
 #include "core/runtime/xservice_client.h"
 #include "core/util/closure_guard.h"
 #include "xllm_service.pb.h"
@@ -444,10 +448,33 @@ TEST(RequestIdTest, ExtractsIdFromSupportedRequestBodies) {
 using CompletionStreamCall =
     StreamCall<proto::CompletionRequest, proto::CompletionResponse>;
 
+class BufferedAttachment final : public brpc::ProgressiveAttachment {
+ public:
+  explicit BufferedAttachment(brpc::SocketUniquePtr& socket)
+      : brpc::ProgressiveAttachment(socket, /*before_http_1_1=*/false) {}
+
+  // Test-only brpc implementation dependency: force real Write() failure on
+  // this socketless attachment. Revisit when upgrading brpc; no public
+  // failure-injection hook is exposed by ProgressiveAttachment.
+  void fail_writes() { _pause_from_mark_rpc_as_done = true; }
+};
+
 class TestableCompletionStreamCall final : public CompletionStreamCall {
  public:
+  using CompletionStreamCall::abort_token_submission;
   using CompletionStreamCall::CompletionStreamCall;
   using CompletionStreamCall::start_stream;
+
+  void use_buffered_stream() {
+    // Accept real Write calls without requiring a live client socket.
+    brpc::SocketUniquePtr socket;
+    pa_.reset(new BufferedAttachment(socket));
+    stream_started_ = true;
+  }
+
+  void fail_writes() {
+    static_cast<BufferedAttachment*>(pa_.get())->fail_writes();
+  }
 };
 
 class CallbackClosure final : public google::protobuf::Closure {
@@ -561,6 +588,162 @@ TEST(StreamCallTest, DoneCanReleaseControllerAndReenterDisconnectCheck) {
     call.start_stream();
   }
   EXPECT_EQ(done_count, 1);
+}
+
+TEST(TokenSubmissionTest, AbortedAndFailedDeltasNeverLeak) {
+  class ConnectedController final : public brpc::Controller {
+   public:
+    bool IsCanceled() const override { return false; }
+  } controller;
+  int32_t done_count = 0;
+  CountingClosure done(&done_count);
+  proto::CompletionRequest request;
+  request.set_stream(true);
+  proto::CompletionResponse response;
+  {
+    CompletionStreamCall call(&controller,
+                              &done,
+                              &request,
+                              &response,
+                              /*use_arena=*/true,
+                              /*is_http_request=*/true);
+    {
+      auto submission = call.token_submission();
+      response.add_choices()->set_text("partial-token-event");
+      EXPECT_TRUE(call.write(response));
+      EXPECT_TRUE(call.write(response));
+    }
+    auto empty = call.token_submission();
+    EXPECT_TRUE(empty.commit());
+    EXPECT_EQ(done_count, 0);
+    auto submission = call.token_submission();
+    EXPECT_TRUE(call.write(response));
+    EXPECT_TRUE(call.finish_with_error(
+        Status::invalid_parameter("invalid", "temperature")));
+    EXPECT_FALSE(submission.commit());
+    EXPECT_EQ(done_count, 0);
+    EXPECT_EQ(controller.response_attachment().to_string().find(
+                  "partial-token-event"),
+              std::string::npos);
+  }
+  EXPECT_EQ(done_count, 1);
+}
+
+TEST(TokenSubmissionTest, ConfirmedDeltasSurviveALaterSequenceFailure) {
+  for (const bool empty_text : {false, true}) {
+    brpc::Controller controller;
+    NoopClosure done;
+    proto::CompletionRequest http_request;
+    http_request.set_stream(true);
+    proto::CompletionResponse response;
+    TestableCompletionStreamCall call(&controller,
+                                      &done,
+                                      &http_request,
+                                      &response,
+                                      /*use_arena=*/true);
+    call.use_buffered_stream();
+    // The first delta may contain only confirmed tokens held back by decoding.
+    RequestOutput output;
+    output.outputs.resize(2);
+    output.outputs[0].generated_token_count = 3;
+    output.outputs[1].index = 1;
+    output.outputs[1].generated_token_count = 2;
+    OutputCallback callback = [&](const RequestOutput& delta) {
+      delta.token_submission_tracked = true;
+      for (const SequenceOutput& sequence : delta.outputs) {
+        auto submission = call.token_submission();
+        response.Clear();
+        response.add_choices()->set_index(sequence.index);
+        response.mutable_choices(0)->set_text("confirmed-token");
+        if ((!empty_text || sequence.index != 0) && !call.write(response)) {
+          return false;
+        }
+        if (!submission.commit()) {
+          return false;
+        }
+        sequence.token_submission_confirmed = true;
+        call.fail_writes();
+      }
+      return true;
+    };
+    RequestState state;
+    state.prompt_tokens = {1};
+    state.seq_capacity = 8;
+    state.n = state.best_of = 2;
+    state.logprobs = false;
+    state.stream = true;
+    state.output_func = callback;
+    Request request("partial", "", "", std::move(state), "");
+    request.record_token_admission();
+    const double before = COUNTER_VALUE(request_output_tokens_total);
+    const bool submitted = request.state().output_func(output);
+    EXPECT_FALSE(submitted);
+    EXPECT_TRUE(output.token_submission_tracked);
+    EXPECT_TRUE(output.outputs[0].token_submission_confirmed);
+    EXPECT_FALSE(output.outputs[1].token_submission_confirmed);
+    request.record_token_output(output, submitted);
+    EXPECT_EQ(COUNTER_VALUE(request_output_tokens_total) - before, 3);
+  }
+}
+
+TEST(TokenSubmissionTest, AbortedOwnerCannotAffectNewSubmission) {
+  for (const bool commit_aborted : {false, true}) {
+    SCOPED_TRACE(commit_aborted);
+    brpc::Controller controller;
+    NoopClosure done;
+    proto::CompletionRequest request;
+    request.set_stream(true);
+    proto::CompletionResponse response;
+    TestableCompletionStreamCall call(&controller,
+                                      &done,
+                                      &request,
+                                      &response,
+                                      /*use_arena=*/true);
+    call.use_buffered_stream();
+    std::optional<CompletionStreamCall::TokenSubmission> aborted;
+    aborted.emplace(call);
+    call.abort_token_submission();
+    auto current = call.token_submission();
+    response.add_choices()->set_text("new-submission");
+    EXPECT_TRUE(call.write(response));
+    if (commit_aborted) {
+      EXPECT_FALSE(aborted->commit());
+    }
+    aborted.reset();
+    call.fail_writes();
+    // The new delta must still attempt Write, rather than accept an empty
+    // buffer that the old owner's destructor or commit silently cleared.
+    EXPECT_FALSE(current.commit());
+    EXPECT_TRUE(call.is_disconnected());
+  }
+}
+
+TEST(TokenSubmissionTest, CommitExceptionClearsStagedDelta) {
+  class ConnectedController final : public brpc::Controller {
+   public:
+    bool IsCanceled() const override { return false; }
+  } controller;
+  CallbackClosure done([] { throw std::runtime_error("stream-open failure"); });
+  proto::CompletionRequest request;
+  request.set_stream(true);
+  proto::CompletionResponse response;
+  TestableCompletionStreamCall call(&controller,
+                                    &done,
+                                    &request,
+                                    &response,
+                                    /*use_arena=*/true);
+  auto submission = call.token_submission();
+  response.add_choices()->set_text("uncommitted-token");
+  ASSERT_TRUE(call.write(response));
+  EXPECT_THROW(submission.commit(), std::runtime_error);
+
+  call.use_buffered_stream();
+  call.fail_writes();
+  // An empty delta must not attempt Write with the failed submission's bytes,
+  // even while that submission's scope is still alive.
+  auto empty = call.token_submission();
+  EXPECT_TRUE(empty.commit());
+  EXPECT_FALSE(call.is_disconnected());
 }
 
 TEST(StreamCallTest, InvalidPayloadLengthRejectsBeforeOpeningSse) {

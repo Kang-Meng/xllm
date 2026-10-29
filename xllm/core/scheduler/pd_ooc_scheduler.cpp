@@ -2341,6 +2341,7 @@ void PDOOCScheduler::build_disagg_requests(
   for (size_t i = 0; i < requests.size(); ++i) {
     auto req = reqs.mutable_reqs()->Add();
     req->set_req_id(requests[i]->request_id());
+    req->set_request_token_accounting(requests[i]->token_accounting_enabled());
     if (requests[i]->state().pd_reservation_id.empty()) {
       requests[i]->state().pd_reservation_id = ShortUUID().random();
     }

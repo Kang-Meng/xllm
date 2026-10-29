@@ -483,6 +483,7 @@ void SequencesGroup::generate_multi_round_output(
     out.text = tokenizer.decode(Slice<int32_t>{gen_ids.data(), gen_ids.size()},
                                 sequence_params_.skip_special_tokens);
     out.token_ids = std::move(gen_ids);
+    out.generated_token_count = out.token_ids.size();
     std::vector<LogProb> log_probs;
     log_probs.resize(1);
     log_probs[0].logprob = rank[i].first;

@@ -189,6 +189,9 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
                                                req.source_xservice_addr());
 
   // add one sequence, rest will be added by scheduler
+  if (req.request_token_accounting()) {
+    new_request->enable_forwarded_token_output();
+  }
   return new_request;
 }
 
