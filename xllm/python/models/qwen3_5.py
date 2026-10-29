@@ -217,6 +217,44 @@ class Qwen3_5Config:
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
         )
 
+    @classmethod
+    def prepare_execution_config(cls, config: dict, device: torch.device) -> Qwen3_5Config:
+        """Resolve the Qwen3.5 parallel execution policy for one host.
+
+        Every host that embeds the Qwen3.5 stack (the causal LM itself and
+        wrappers such as JoyTalker) must derive the EPLv2 checks and the
+        sequence-parallel state the same way. The resolved
+        ``sequence_parallel_enabled`` is written back into ``config`` because
+        the execution metadata builders consume it from that shared dict.
+        """
+        cfg = cls.from_dict(config)
+        decoder_layer_cls = get_qwen3_5_decoder_layer_class(device)
+        ordinary_lv2 = (
+            device.type in ("npu", "privateuseone")
+            and cfg.num_experts > 0
+            and cfg.expert_parallel_degree == 2
+            and not cfg.enable_mega_moe
+        )
+        if ordinary_lv2:
+            if int(config.get("cp_size", 1)) != 1 or int(config.get("num_speculative_tokens", 0)) != 0:
+                raise NotImplementedError("Qwen3.5 EPLv2 requires CP=1 and no speculative decoding")
+            if bool(config.get("is_draft_engine", False)):
+                raise NotImplementedError("Qwen3.5 EPLv2 does not support draft engines")
+            # Python BF16 EP does not use the C++ fused-MC2 mode.
+            if bool(config.get("enable_eplb", False)):
+                raise NotImplementedError("Qwen3.5 EPLv2 requires EPLB to be disabled")
+            if cfg.moe_tp_size != 1 or cfg.ep_size <= 1:
+                raise ValueError("Qwen3.5 EPLv2 requires MoE-TP=1 and EP>1")
+            if cfg.ep_rank != cfg.dp_rank * cfg.tp_size + cfg.tp_rank:
+                raise ValueError("Qwen3.5 EPLv2 EP rank must match the DP/TP coordinates")
+            # Explicit Lv2 owns the token layout for every instance role.
+            cfg.sequence_parallel_enabled = cfg.eplv2_sequence_parallel and cfg.tp_size > 1
+        else:
+            cfg.sequence_parallel_enabled = resolve_sequence_parallel(config, decoder_layer_cls)
+        config["sequence_parallel_enabled"] = cfg.sequence_parallel_enabled
+        cfg.validate()
+        return cfg
+
     def validate(self) -> None:
         if self.hidden_size <= 0 or self.n_heads <= 0 or self.n_kv_heads <= 0 or self.n_layers <= 0:
             raise ValueError("invalid Qwen3.5 model dimensions")
@@ -353,10 +391,8 @@ class Qwen3_5Model(nn.Module):
             raise TypeError(f"unsupported Qwen3.5 execution inputs: {sorted(kwargs)}")
         if intermediate_tensors is not None:
             raise NotImplementedError("Qwen3.5 does not support pipeline parallelism")
-        if inputs_embeds is not None:
-            raise NotImplementedError("Qwen3.5 does not support inputs_embeds")
-        if input_ids is None:
-            raise ValueError("input_ids must be provided")
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("input_ids or inputs_embeds must be provided")
 
         if self._comm_policy is not None:
             self.layers[0].validate_ep_level2(self._comm_policy, force_mc2=self.cfg.eplv2_comm_mode == "mc2")
@@ -365,10 +401,6 @@ class Qwen3_5Model(nn.Module):
         num_tokens = positions.shape[0] if positions.ndim == 1 else positions.shape[-1]
         sp_layout: SpMetadata | None = None
         if sequence_parallel_enabled:
-            if input_ids.ndim != 1:
-                raise ValueError("Qwen3.5 SP requires flattened token inputs")
-            if num_tokens != input_ids.shape[0]:
-                raise ValueError("Qwen3.5 SP positions must match the input token rows")
             sp_layout = get_execution_context(SpMetadata)
             if sp_layout is None:
                 raise RuntimeError("Qwen3.5 SP layout metadata is unavailable")
@@ -379,10 +411,15 @@ class Qwen3_5Model(nn.Module):
             if first_moe_layer is not None:
                 first_moe_layer.validate_sp(sp_layout, device=self.embed_tokens.weight.device)
 
-        hidden = self.embed_tokens(input_ids)
+        hidden = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
 
         residual: torch.Tensor | None = None
         if sequence_parallel_enabled:
+            # Validate the rows actually sharded on both input paths.
+            if hidden.ndim != 2:
+                raise ValueError(f"Qwen3.5 SP requires flattened token inputs, got shape {tuple(hidden.shape)}")
+            if num_tokens != hidden.shape[0]:
+                raise ValueError("Qwen3.5 SP positions must match the input token rows")
             hidden = sp_shard(hidden, sp_layout)
         aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         for layer_id, layer in enumerate(self.layers):
@@ -405,32 +442,7 @@ class Qwen3_5ForCausalLM(PyModelBase):
         super().__init__()
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "cuda"))
-        decoder_layer_cls = get_qwen3_5_decoder_layer_class(device)
-        self.cfg = Qwen3_5Config.from_dict(config)
-        ordinary_lv2 = (
-            device.type in ("npu", "privateuseone")
-            and self.cfg.num_experts > 0
-            and self.cfg.expert_parallel_degree == 2
-            and not self.cfg.enable_mega_moe
-        )
-        if ordinary_lv2:
-            if int(config.get("cp_size", 1)) != 1 or int(config.get("num_speculative_tokens", 0)) != 0:
-                raise NotImplementedError("Qwen3.5 EPLv2 requires CP=1 and no speculative decoding")
-            if bool(config.get("is_draft_engine", False)):
-                raise NotImplementedError("Qwen3.5 EPLv2 does not support draft engines")
-            # Python BF16 EP does not use the C++ fused-MC2 mode.
-            if bool(config.get("enable_eplb", False)):
-                raise NotImplementedError("Qwen3.5 EPLv2 requires EPLB to be disabled")
-            if self.cfg.moe_tp_size != 1 or self.cfg.ep_size <= 1:
-                raise ValueError("Qwen3.5 EPLv2 requires MoE-TP=1 and EP>1")
-            if self.cfg.ep_rank != self.cfg.dp_rank * self.cfg.tp_size + self.cfg.tp_rank:
-                raise ValueError("Qwen3.5 EPLv2 EP rank must match the DP/TP coordinates")
-            # Explicit Lv2 owns the token layout for every instance role.
-            self.cfg.sequence_parallel_enabled = self.cfg.eplv2_sequence_parallel and self.cfg.tp_size > 1
-        else:
-            self.cfg.sequence_parallel_enabled = resolve_sequence_parallel(config, decoder_layer_cls)
-        config["sequence_parallel_enabled"] = self.cfg.sequence_parallel_enabled
-        self.cfg.validate()
+        self.cfg = Qwen3_5Config.prepare_execution_config(config, device)
         self.dtype = dtype
         self.device = device
         self.model = Qwen3_5Model(self.cfg, dtype, device)  # pyright: ignore[reportIncompatibleVariableOverride]

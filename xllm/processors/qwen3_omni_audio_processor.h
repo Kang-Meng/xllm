@@ -28,7 +28,8 @@ limitations under the License.
 namespace xllm {
 
 // Whisper-style log-mel audio frontend for the Qwen3-Omni-Thinker.
-class Qwen3OmniAudioProcessor final : public AudioProcessor {
+// JoyTalker derives from it to add its waveform prepass.
+class Qwen3OmniAudioProcessor : public AudioProcessor {
  public:
   explicit Qwen3OmniAudioProcessor(const ModelArgs& args);
 

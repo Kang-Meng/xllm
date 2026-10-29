@@ -39,4 +39,5 @@ MODEL_PLATFORM_SUPPORT: dict[str, dict[str, bool]] = {
     "glm5_next_mtp": {"cuda": False, "npu": True},
     "deepseek_v32_mtp": {"cuda": False, "npu": True},
     "joyai_asr": {"cuda": False, "npu": True},
+    "joytalker": {"cuda": False, "npu": True},
 }

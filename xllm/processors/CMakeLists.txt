@@ -49,6 +49,7 @@ cc_library(
     glm4v_image_processor.h
     joyai_asr_audio_processor.h
     joyai_asr_prompt_processor.h
+    joytalker_audio_processor.h
     kimi25_image_processor.h
     glm4v_prompt_processor.h
     glm4v_video_processor.h
@@ -76,6 +77,7 @@ cc_library(
     glm4v_image_processor.cpp
     joyai_asr_audio_processor.cpp
     joyai_asr_prompt_processor.cpp
+    joytalker_audio_processor.cpp
     kimi25_image_processor.cpp
     glm4v_prompt_processor.cpp
     glm4v_video_processor.cpp

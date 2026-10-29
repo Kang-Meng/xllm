@@ -1473,8 +1473,12 @@ bool HFModelLoader::load_audio_preprocessor_args(
   }
   LOG(INFO) << "Success to parse audio preprocess args file: "
             << used_file_path;
+  // Respect a model registration's mel-bin default when the config omits both.
+  const int64_t registered_mel_bins =
+      args_.mm_audio_num_mel_bins() > 0 ? args_.mm_audio_num_mel_bins() : 80;
   args_.mm_audio_num_mel_bins() = audio_preprocess_reader.value_or<int>(
-      std::vector<std::string>{"num_mel_bins", "feature_size"}, 80);
+      std::vector<std::string>{"num_mel_bins", "feature_size"},
+      registered_mel_bins);
   args_.mm_audio_max_frames() =
       audio_preprocess_reader.value_or<int>("max_length", 3000);
   // The model-args registration runs first; an absent key must not clobber it.
@@ -1517,14 +1521,21 @@ bool HFModelLoader::load_audio_preprocessor_args(
   }
   // Qwen3-Omni whisper feature-extraction params (same
   // preprocessor_config.json family).
-  args_.mm_audio_feature_size() =
-      audio_preprocess_reader.value_or<int64_t>("feature_size", 80);
+  // Use the model's num_mel_bins; front-end mel rows must match the conv width.
+  const int64_t registered_feature_size =
+      args_.mm_audio_feature_size() > 0 ? args_.mm_audio_feature_size() : 80;
+  args_.mm_audio_feature_size() = audio_preprocess_reader.value_or<int64_t>(
+      std::vector<std::string>{"num_mel_bins", "feature_size"},
+      registered_feature_size);
 
   args_.mm_audio_hop_length() =
       audio_preprocess_reader.value_or<int64_t>("hop_length", 160);
 
-  args_.mm_audio_chunk_length() =
-      audio_preprocess_reader.value_or<int64_t>("chunk_length", 300);
+  // Keep a pinned chunk length (JoyTalker: 30s); else fall back to 300s.
+  const int64_t registered_chunk_length = args_.mm_audio_chunk_length();
+  args_.mm_audio_chunk_length() = audio_preprocess_reader.value_or<int64_t>(
+      "chunk_length",
+      registered_chunk_length > 0 ? registered_chunk_length : 300);
 
   args_.mm_audio_n_fft() =
       audio_preprocess_reader.value_or<int64_t>("n_fft", 400);

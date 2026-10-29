@@ -450,10 +450,13 @@ struct ModelArgs {
   PROPERTY(int64_t, mm_audio_n_window_infer) = 0;
   PROPERTY(int64_t, mm_audio_conv_chunksize) = 0;
   PROPERTY(int64_t, mm_audio_encoder_layers) = 0;
+  PROPERTY(int64_t, mm_audio_encoder_ffn_dim) = 0;
   PROPERTY(int64_t, mm_audio_output_dim) = 0;
 
   // VLM model projector's mm_projector_type
   PROPERTY(std::string, mm_projector_type);
+  // VLM model projector's mm_projector_bias
+  PROPERTY(bool, mm_projector_bias) = false;
 
   //
   PROPERTY(int64_t, mm_num_position_embeddings);

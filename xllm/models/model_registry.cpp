@@ -127,11 +127,9 @@ bool resolve_model_registration(const std::string& model_type,
   } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
              model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
              model_type == "qwen3_vl" || model_type == "deepseek_v32_mtp" ||
-             model_type == "glm5_next" || model_type == "joyai_asr") {
-    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl/deepseek_v32_mtp/glm5_next
-    // support both backends. glm5_next is served via --model_impl=python,
-    // which forces npu_kernel_backend=TORCH; the python graph owns all
-    // attention. joyai_asr likewise runs on the Python model executor.
+             model_type == "glm5_next" || model_type == "joyai_asr" ||
+             model_type == "joytalker") {
+    // Both-backend models; python-executor hosts force the TORCH backend.
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {

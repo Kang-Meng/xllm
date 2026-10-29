@@ -67,6 +67,7 @@ limitations under the License.
 #include "vlm/deepseek_v41_vlm.h"                        // IWYU pragma: keep
 #include "vlm/glm5_next_vlm.h"                           // IWYU pragma: keep
 #include "vlm/joyai_asr.h"                               // IWYU pragma: keep
+#include "vlm/joytalker.h"                               // IWYU pragma: keep
 #include "vlm/kimi_k3_vlm.h"                             // IWYU pragma: keep
 #include "vlm/npu/glm4v.h"                               // IWYU pragma: keep
 #include "vlm/npu/glm4v_moe.h"                           // IWYU pragma: keep

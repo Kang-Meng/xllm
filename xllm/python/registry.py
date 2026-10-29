@@ -111,6 +111,30 @@ def get_model_class(name: str) -> type[nn.Module]:
     return model_cls
 
 
+_QWEN3_5_EXECUTION_METADATA_BUILDERS: tuple[_ImportPath, ...] = (
+    (
+        "xllm.python.attention.dense_dcp_metadata_builder",
+        "DenseDcpMetadataBuilder",
+    ),
+    (
+        "xllm.python.layers.npu.mega_moe_metadata_builder",
+        "TokenOwnerMegaMoeMetadataBuilder",
+    ),
+    (
+        "xllm.python.layers.sequence_parallel",
+        "SpMetadataBuilder",
+    ),
+    (
+        "xllm.python.layers.npu.qwen3_5.moe_metadata_builder",
+        "Qwen3_5MoeMetadataBuilder",
+    ),
+    (
+        "xllm.python.layers.npu.qwen3_5.gdn_metadata_builder",
+        "Qwen3_5GdnMetadataBuilder",
+    ),
+)
+
+
 def _register_builtin_models() -> None:
     _register_model_path(
         "xllm.python.models.kimi_k3",
@@ -137,28 +161,14 @@ def _register_builtin_models() -> None:
         "Qwen3_5MoeForCausalLM",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
-        execution_metadata_builders=(
-            (
-                "xllm.python.attention.dense_dcp_metadata_builder",
-                "DenseDcpMetadataBuilder",
-            ),
-            (
-                "xllm.python.layers.npu.mega_moe_metadata_builder",
-                "TokenOwnerMegaMoeMetadataBuilder",
-            ),
-            (
-                "xllm.python.layers.sequence_parallel",
-                "SpMetadataBuilder",
-            ),
-            (
-                "xllm.python.layers.npu.qwen3_5.moe_metadata_builder",
-                "Qwen3_5MoeMetadataBuilder",
-            ),
-            (
-                "xllm.python.layers.npu.qwen3_5.gdn_metadata_builder",
-                "Qwen3_5GdnMetadataBuilder",
-            ),
-        ),
+        execution_metadata_builders=_QWEN3_5_EXECUTION_METADATA_BUILDERS,
+    )
+    _register_model_path(
+        "xllm.python.models.joytalker",
+        "JoyTalkerForConditionalGeneration",
+        "joytalker",
+        "JoyTalkerForConditionalGeneration",
+        execution_metadata_builders=_QWEN3_5_EXECUTION_METADATA_BUILDERS,
     )
     _register_model_path(
         "xllm.python.models.qwen3_dspark",
