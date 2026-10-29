@@ -1329,6 +1329,10 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                         layer_caches[index] = replace(cache, block_size=block_size)
         self._swa_ring_blocks = self._compute_swa_ring_blocks()
 
+    def set_device_only_decode_inputs(self, enabled: bool, query_width: int) -> None:
+        if enabled and query_width != self._block_query_width:
+            raise ValueError("Device-only decode requires the configured CSA2 block pipeline")
+
     def reset_forward(self, metadata: Any | None = None) -> None:
         super().reset_forward(metadata)
         self._v41_shared = None

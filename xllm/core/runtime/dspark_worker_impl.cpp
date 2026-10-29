@@ -371,13 +371,35 @@ DFlashWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft_from_pending(
   dflash_async::DraftCacheBlockTable block_table;
   torch::Tensor row_indices;
   torch::Tensor host_row_indices;
+  const bool block_parallel_rows =
+      draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
   {
     c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
+    // A block-parallel proposal exports one metadata row per query token.
+    // Device preparation consumes one ring table per logical sequence.
+    std::vector<torch::Tensor> tables =
+        prepared.input_params.multi_block_tables;
+    if (block_parallel_rows) {
+      const int32_t width = options_.num_speculative_tokens();
+      for (torch::Tensor& table : tables) {
+        table = table.slice(/*dim=*/0, /*start=*/0, table.size(0), width);
+      }
+    }
     block_table = dflash_async::prepare_draft_cache_block_table(
         prepared.input_params.attention.device.block_tables,
-        prepared.input_params.multi_block_tables,
-        prepared.input_params.meta.num_sequences,
+        tables,
+        input.input_params.meta.num_sequences,
         device_);
+    if (block_parallel_rows) {
+      // Reuse the staged SWA table for Python graph refresh. A CPU table
+      // would introduce a blocking H2D copy on the compute stream while
+      // submitting the proposal, serializing it behind the target verify.
+      CHECK(!prepared.input_params.multi_block_tables.empty());
+      prepared.input_params.multi_block_tables.front() =
+          block_table.blocks.repeat_interleave(
+              options_.num_speculative_tokens(),
+              /*dim=*/0);
+    }
     device_input.sampling_params =
         input.sampling_params.to(draft_impl_->device(), torch::kFloat32);
     force_greedy_draft_sampling(device_input.sampling_params);
@@ -406,7 +428,13 @@ DFlashWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft_from_pending(
   prepared.positions.copy_(next.query_positions);
   prepared.input_params.attention.device.new_cache_slots.copy_(
       next.query_slots);
-  prepared.input_params.attention.device.kv_seq_lens.copy_(next.kv_lengths);
+  if (block_parallel_rows) {
+    // Match build_query_rows: every query row sees the whole block.
+    prepared.input_params.attention.device.kv_seq_lens.copy_(
+        next.kv_lengths.repeat_interleave(options_.num_speculative_tokens()));
+  } else {
+    prepared.input_params.attention.device.kv_seq_lens.copy_(next.kv_lengths);
+  }
   prepared.input_params.attn_metadata.reset();
   prepared.metadata_ready_event.reset();
   prepared.device_tensors_ready = true;

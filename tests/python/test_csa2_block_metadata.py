@@ -232,3 +232,17 @@ def test_block_attention_builder_rejects_context_parallelism_at_initialization()
                 "cp_size": 2,
             }
         )
+
+
+@pytest.mark.parametrize("query_width", [0, 3])
+def test_device_only_decode_mode_requires_the_block_pipeline(query_width: int) -> None:
+    from xllm.python.attention.csa2_attention import Csa2AttentionBackend
+
+    backend = Csa2AttentionBackend.__new__(Csa2AttentionBackend)
+    backend._block_query_width = query_width
+    backend.set_device_only_decode_inputs(False, 3)
+    if query_width == 0:
+        with pytest.raises(ValueError, match="configured CSA2 block pipeline"):
+            backend.set_device_only_decode_inputs(True, 3)
+    else:
+        backend.set_device_only_decode_inputs(True, 3)

@@ -552,6 +552,11 @@ class DeepseekV41DSparkForCausalLM(DSparkForCausalLMBase):
         self.quant_mode = quant_mode
         self._lm_head_source: str | None = None
 
+    def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
+        """The pipeline derives block attention metadata from device inputs."""
+        del kv_page_size
+        return True
+
     # -- names ----------------------------------------------------------------
 
     def _stage_prefix(self, stage: int) -> str:

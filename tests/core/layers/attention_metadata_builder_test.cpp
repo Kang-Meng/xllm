@@ -47,6 +47,59 @@ ModelInputParams make_params() {
   return params;
 }
 
+class DummyAttentionMetadataTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(DummyAttentionMetadataTest, ConstantsMatchLegacyValues) {
+  torch::Device destination(torch::kCPU);
+#if defined(USE_NPU)
+  if (GetParam()) {
+    Device device(0);
+    device.set_device();
+    device.init_device_context();
+    destination = device.unwrap();
+  }
+#endif
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  auto metadata =
+      AttentionMetadataBuilder::build(params, false, {}, destination);
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kInt32).device(destination);
+  AttentionMetadata expected;
+  expected.slot_mapping = torch::tensor({0}, options);
+  expected.q_cu_seq_lens = torch::tensor({0, 1}, options);
+  expected.kv_cu_seq_lens = torch::tensor({0, 1}, options);
+  expected.q_seq_lens = torch::tensor({1}, options);
+  expected.kv_seq_lens = torch::tensor({1}, options);
+  expected.paged_kv_indptr = torch::tensor({0, 1}, options);
+  expected.paged_kv_indices = torch::tensor({0}, options);
+  expected.paged_kv_last_page_len = torch::tensor({1}, options);
+  for (const auto member : {&AttentionMetadata::slot_mapping,
+                            &AttentionMetadata::q_cu_seq_lens,
+                            &AttentionMetadata::kv_cu_seq_lens,
+                            &AttentionMetadata::q_seq_lens,
+                            &AttentionMetadata::kv_seq_lens,
+                            &AttentionMetadata::paged_kv_indptr,
+                            &AttentionMetadata::paged_kv_indices,
+                            &AttentionMetadata::paged_kv_last_page_len}) {
+    const torch::Tensor& actual_tensor = metadata.*member;
+    const torch::Tensor& expected_tensor = expected.*member;
+    EXPECT_EQ(actual_tensor.scalar_type(), expected_tensor.scalar_type());
+    EXPECT_EQ(actual_tensor.device(), expected_tensor.device());
+    EXPECT_EQ(actual_tensor.sizes(), expected_tensor.sizes());
+    EXPECT_TRUE(torch::equal(actual_tensor.cpu(), expected_tensor.cpu()));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(SupportedDevices,
+                         DummyAttentionMetadataTest,
+#if defined(USE_NPU)
+                         ::testing::Values(false, true)
+#else
+                         ::testing::Values(false)
+#endif
+);
+
 TEST(AttentionMetadataBuilderTest, LinearPrefillSchedulesRespectChunkSize) {
   for (const int32_t block_size : {16, 64}) {
     for (const bool chunked : {false, true}) {

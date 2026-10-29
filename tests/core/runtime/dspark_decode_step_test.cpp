@@ -63,6 +63,13 @@ class DFlashWorkerImplTestPeer final {
 
 class DSparkWorkerImplTestPeer final {
  public:
+  static SamplingParameters prepare_sampling_indices(DSparkWorkerImpl& worker,
+                                                     int32_t num_tokens) {
+    SamplingParameters parameters;
+    worker.update_sampling_params(parameters, 1, num_tokens);
+    return parameters;
+  }
+
   static void initialize_decode_modes(DSparkWorkerImpl& worker,
                                       bool supports_device_inputs) {
     worker.async_output_enabled_ =
@@ -819,6 +826,35 @@ TEST(DSparkDecodeStepTest,
   ASSERT_NE(unconstrained.metadata_ready_event, nullptr);
   ASSERT_TRUE(unconstrained.metadata_ready_event->synchronize());
   EXPECT_TRUE(unconstrained.json_object_states.empty());
+}
+
+TEST(DSparkDecodeStepTest,
+     DeviceSamplingIndicesPreserveValuesWithoutPrelaunch) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).num_speculative_tokens(15);
+  DSparkWorkerImpl worker(parallel_args, device.unwrap(), options);
+  for (const int32_t num_tokens : {0, 1, 4, 64}) {
+    SCOPED_TRACE(num_tokens);
+    std::vector<int32_t> legacy_indices;
+    legacy_indices.reserve(num_tokens);
+    for (int32_t i = 0; i < num_tokens; i++) {
+      legacy_indices.emplace_back(i);
+    }
+    torch::Tensor expected = torch::tensor(legacy_indices);
+    SamplingParameters parameters =
+        DSparkWorkerImplTestPeer::prepare_sampling_indices(worker, num_tokens);
+    EXPECT_EQ(parameters.selected_token_idxes.scalar_type(),
+              expected.scalar_type());
+    EXPECT_EQ(parameters.selected_token_idxes.sizes(), expected.sizes());
+    EXPECT_EQ(parameters.selected_token_idxes.device(), device.unwrap());
+    EXPECT_TRUE(torch::equal(parameters.selected_token_idxes.cpu(), expected));
+    EXPECT_TRUE(
+        parameters.sample_idxes.is_same(parameters.selected_token_idxes));
+  }
 }
 
 class ContextOnlyModel final : public CausalLM {

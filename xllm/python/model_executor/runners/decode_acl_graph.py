@@ -864,10 +864,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if block_table is None or kv_seq_lens is None:
             raise RuntimeError("decode graph requires block and KV metadata")
         kv_seq_lens = kv_seq_lens.to(torch.int32)
-        block_table = block_table.to(
-            device=kv_seq_lens.device,
-            dtype=torch.int32,
-        ).contiguous()
+        block_table = self._stage_metadata_tensor(block_table, kv_seq_lens.device, torch.int32)
         is_mla = getattr(self.attention_backend, "is_mla", False)
         requires_host_kv_lengths = getattr(
             self.attention_backend,
@@ -1198,7 +1195,7 @@ class DecodeAclGraphRunner(BaseRunner):
         """Resolve scheduler cache slots when DSV4 omits the top-level tensor."""
         slot_mapping = getattr(metadata, "slot_mapping", None)
         if slot_mapping is not None and slot_mapping.dim() == 1 and slot_mapping.numel() == token_count:
-            return slot_mapping.to(device=device, dtype=torch.int32).contiguous()
+            return DecodeAclGraphRunner._stage_metadata_tensor(slot_mapping, device, torch.int32)
         host_slots = getattr(metadata, "new_cache_slots_host_values", None)
         if host_slots is not None and len(host_slots) == token_count:
             return torch.tensor(host_slots, dtype=torch.int32, device=device)
@@ -2519,6 +2516,19 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_positions,
             entry.is_padding,
         )
+
+    @staticmethod
+    def _stage_metadata_tensor(
+        source: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Stage metadata on the caller's stream without blocking H2D copies."""
+        if device.type == "cpu":
+            return source.to(device=device, dtype=dtype).contiguous()
+        if source.device.type == "cpu":
+            source = source.to(dtype=dtype).contiguous().pin_memory(device=device.type)
+        return source.to(device=device, dtype=dtype, non_blocking=True).contiguous()
 
     def _fill_dsa_block_tables(
         self,

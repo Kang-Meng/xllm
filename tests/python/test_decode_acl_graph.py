@@ -2805,3 +2805,49 @@ def test_v41_engram_graph_replay_rejects_invalid_history_shape(shape: tuple[int,
         pytest.raises(ValueError, match="Engram lookback depth"),
     ):
         runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+
+
+def test_metadata_uses_async_upload() -> None:
+    runner = _runner()
+    source = MagicMock()
+    source.device = torch.device("cpu")
+    source.to.return_value = source
+    source.contiguous.return_value = source
+    source.pin_memory.return_value = source
+    device = torch.device("npu")
+
+    runner._stage_metadata_tensor(source, device, torch.int32)
+    source.pin_memory.assert_called_once_with(device="npu")
+    source.to.assert_any_call(device=device, dtype=torch.int32, non_blocking=True)
+
+
+def test_metadata_staging_preserves_values_dtype_and_layout_on_cpu() -> None:
+    runner = _runner()
+    source = torch.arange(12, dtype=torch.int64).reshape(3, 4).t()
+    expected = source.to(dtype=torch.int32).contiguous()
+    with patch.object(torch.Tensor, "pin_memory", side_effect=AssertionError("CPU copies do not need pinning")):
+        actual = runner._stage_metadata_tensor(source, torch.device("cpu"), torch.int32)
+    assert actual.is_contiguous()
+    assert actual.device == expected.device
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_graph_admission_preserves_short_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+    dp_size: int,
+) -> None:
+    runner = _runner()
+    runner.dp_size = dp_size
+    builder = ModelSamplingMetadataBuilder()
+    runner.bind_execution_metadata_builders((builder,))
+    monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=False))
+    admission = MagicMock(side_effect=AssertionError("Rejected geometry must skip sampling admission"))
+    monkeypatch.setattr(builder, "can_execute_graph", admission)
+    gather = MagicMock(return_value=torch.zeros(dp_size, dtype=torch.int32))
+    monkeypatch.setattr(distributed, "dp_all_gather", gather, raising=False)
+    batch = _query_batch(4, 1)
+
+    assert not runner.can_execute(batch.input_ids, _metadata(None), input_batch=batch)
+    admission.assert_not_called()
+    assert gather.call_count == (1 if dp_size > 1 else 0)
